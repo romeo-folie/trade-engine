@@ -45,6 +45,11 @@ markets:
         min_volume: 10000
         max_contracts: 10
 
+  news:
+    provider: finnhub             # finnhub | benzinga
+    api_key_env: FINNHUB_API_KEY
+    fetch_every_min: 15           # Fetch news every N minutes per ticker
+
 strategies:
   trend_following:
     enabled: true

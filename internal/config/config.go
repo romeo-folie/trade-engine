@@ -63,6 +63,15 @@ type ConsensusConfig struct {
 type MarketsConfig struct {
 	Stocks      StocksConfig      `yaml:"stocks"`
 	Predictions PredictionsConfig `yaml:"predictions"`
+	News        NewsAPIConfig     `yaml:"news"`
+}
+
+// NewsAPIConfig configures the news data provider (Finnhub or Benzinga).
+type NewsAPIConfig struct {
+	Provider      string `yaml:"provider"`       // finnhub | benzinga
+	APIKeyEnv     string `yaml:"api_key_env"`    // env var name holding the API key
+	APIKey        string `yaml:"-"`              // resolved at runtime
+	FetchEveryMin int    `yaml:"fetch_every_min"` // cadence in minutes (default 15)
 }
 
 type StocksConfig struct {
@@ -310,6 +319,7 @@ func resolveEnvVars(cfg *Config) {
 	cfg.Models.Primary.APIKey = resolveEnv(cfg.Models.Primary.APIKeyEnv)
 	cfg.Markets.Stocks.APIKey = resolveEnv(cfg.Markets.Stocks.APIKeyEnv)
 	cfg.Markets.Stocks.Secret = resolveEnv(cfg.Markets.Stocks.SecretEnv)
+	cfg.Markets.News.APIKey = resolveEnv(cfg.Markets.News.APIKeyEnv)
 	cfg.Notifications.Telegram.BotToken = resolveEnv(cfg.Notifications.Telegram.BotTokenEnv)
 	for k, p := range cfg.Markets.Predictions.Platforms {
 		p.APIKey = resolveEnv(p.APIKeyEnv)

@@ -53,6 +53,11 @@ func Defaults() *Config {
 					},
 				},
 			},
+			News: NewsAPIConfig{
+				Provider:      "finnhub",
+				APIKeyEnv:     "FINNHUB_API_KEY",
+				FetchEveryMin: 15,
+			},
 		},
 		Strategies: StrategiesConfig{
 			TrendFollowing: TrendFollowingConfig{
