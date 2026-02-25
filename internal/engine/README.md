@@ -26,7 +26,7 @@ type Engine struct {
 
 **`BackfillHistory(ctx, ticker)`** — called on `te watchlist add`. Fetches 2 years of daily + 30 days of hourly candles from Alpaca and upserts into the database.
 
-## Per-Tick Pipeline (Phase 2)
+## Per-Tick Pipeline (Phase 3)
 
 ```mermaid
 sequenceDiagram
@@ -35,6 +35,7 @@ sequenceDiagram
     participant A as AlpacaClient
     participant F as FinnhubClient
     participant I as indicators
+    participant L as analysis.Analyzer
 
     E->>DB: GetWatchlistItems(activeOnly=true)
     loop Each active stock ticker (parallel, ≤5 goroutines)
@@ -49,6 +50,11 @@ sequenceDiagram
         E->>F: FetchNews(ticker, 48h ago) [max once per 15min]
         F-->>E: []NewsItem
         E->>DB: UpsertNewsItems(items)
+        E->>DB: GetRecentNews(ticker, now-48h)
+        E->>E: Build analysis request (candles + indicators + news)
+        E->>L: Analyzer.Analyze(request)
+        L-->>E: action/confidence/reasoning + metadata
+        E->>DB: InsertAnalysis(...)
     end
 ```
 

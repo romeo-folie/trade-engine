@@ -56,23 +56,6 @@ var _ = func() bool {
 	return true
 }()
 
-// ── Models ────────────────────────────────────────────────────────────────────
-
-var modelsCmd = &cobra.Command{
-	Use:   "models",
-	Short: "Manage and test AI model configuration",
-}
-
-var _ = func() bool {
-	modelsCmd.AddCommand(
-		&cobra.Command{Use: "list", Short: "List configured models", RunE: stub("te models list")},
-		&cobra.Command{Use: "test", Short: "Test model connectivity", RunE: stub("te models test")},
-		&cobra.Command{Use: "performance", Short: "Show model performance stats", RunE: stub("te models performance")},
-		&cobra.Command{Use: "set-primary <provider:model>", Short: "Set primary model", RunE: stub("te models set-primary")},
-	)
-	return true
-}()
-
 // ── Backtesting ───────────────────────────────────────────────────────────────
 
 var backtestCmd = &cobra.Command{
