@@ -58,8 +58,6 @@ func upsertNewsBatch(ctx context.Context, items []data.NewsItem) error {
 
 	_, err := GetDB().Exec(ctx, q, args...)
 	if err != nil {
-		// Fall back: conflict on url (handles items with no external_id).
-		// This is a belt-and-suspenders approach — the unique constraint on url handles the rest.
 		return err
 	}
 	return nil

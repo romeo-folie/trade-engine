@@ -1,9 +1,11 @@
 package data
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sync"
@@ -51,20 +53,31 @@ func NewAlpacaClient(apiKey, secret, dataURL string) *AlpacaClient {
 
 // ── Rate limiter ─────────────────────────────────────────────────────────────
 
-func (c *AlpacaClient) throttle() {
+// throttle enforces the per-client rate limit. It returns ctx.Err() immediately
+// if the context is cancelled while waiting, so callers can honour graceful shutdown
+// without being blocked for up to minInterval by a plain time.Sleep.
+func (c *AlpacaClient) throttle(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	since := time.Since(c.lastRequest)
 	if since < c.minInterval {
-		time.Sleep(c.minInterval - since)
+		remaining := c.minInterval - since
+		select {
+		case <-time.After(remaining):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	c.lastRequest = time.Now()
+	return nil
 }
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
 func (c *AlpacaClient) get(ctx context.Context, path string, params url.Values) (*http.Response, error) {
-	c.throttle()
+	if err := c.throttle(ctx); err != nil {
+		return nil, err
+	}
 	u := c.dataURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
@@ -81,8 +94,9 @@ func (c *AlpacaClient) get(ctx context.Context, path string, params url.Values) 
 		return nil, err
 	}
 	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		resp.Body.Close()
-		return nil, fmt.Errorf("alpaca API %s %d", path, resp.StatusCode)
+		return nil, fmt.Errorf("alpaca API %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body))
 	}
 	return resp, nil
 }

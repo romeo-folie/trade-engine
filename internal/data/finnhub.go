@@ -33,14 +33,22 @@ func NewFinnhubClient(apiKey string) *FinnhubClient {
 	}
 }
 
-func (c *FinnhubClient) throttle() {
+// throttle enforces the per-client rate limit. Returns ctx.Err() if the context
+// is cancelled during the wait rather than blocking until the interval elapses.
+func (c *FinnhubClient) throttle(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	since := time.Since(c.lastRequest)
 	if since < c.minInterval {
-		time.Sleep(c.minInterval - since)
+		remaining := c.minInterval - since
+		select {
+		case <-time.After(remaining):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	c.lastRequest = time.Now()
+	return nil
 }
 
 // finnhubArticle is the raw JSON article shape from Finnhub's /company-news endpoint.
@@ -63,7 +71,9 @@ type finnhubArticle struct {
 // FetchNews retrieves company news from Finnhub for a single ticker published after 'since'.
 // Finnhub returns articles in reverse-chronological order.
 func (c *FinnhubClient) FetchNews(ctx context.Context, ticker string, since time.Time) ([]NewsItem, error) {
-	c.throttle()
+	if err := c.throttle(ctx); err != nil {
+		return nil, err
+	}
 
 	now := time.Now()
 	params := url.Values{}

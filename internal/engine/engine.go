@@ -133,13 +133,12 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 	}
 
 	// Compute indicators on the primary timeframe (prefer "1d", fall back to first).
-	primaryTF := data.Timeframe1Day
+	primaryTF := data.Timeframe(timeframes[0])
 	for _, tf := range timeframes {
 		if tf == string(data.Timeframe1Day) {
 			primaryTF = data.Timeframe1Day
 			break
 		}
-		primaryTF = data.Timeframe(timeframes[0])
 	}
 
 	candles, err := store.GetCandles(ctx, ticker, primaryTF,
