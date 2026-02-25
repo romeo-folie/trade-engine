@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
@@ -75,6 +77,27 @@ Modes:
 		)
 		fmt.Printf("TradeEngine started in %s mode. Press Ctrl+C to stop.\n", mode)
 
+		// Build market data and news providers from config.
+		var marketProvider data.MarketDataProvider
+		if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.APIKey != "" {
+			marketProvider = data.NewAlpacaClient(
+				cfg.Markets.Stocks.APIKey,
+				cfg.Markets.Stocks.Secret,
+				cfg.Markets.Stocks.DataURL,
+			)
+		} else {
+			logger.Warn("Alpaca API key not set — market data fetching disabled")
+		}
+
+		var newsProvider data.NewsProvider
+		if cfg.Markets.News.APIKey != "" {
+			newsProvider = data.NewFinnhubClient(cfg.Markets.News.APIKey)
+		} else {
+			logger.Warn("news API key not set — news fetching disabled")
+		}
+
+		eng := engine.New(cfg, marketProvider, newsProvider, mode)
+
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -82,21 +105,18 @@ Modes:
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 
-		ticker := time.NewTicker(time.Duration(cfg.Engine.TickIntervalSec) * time.Second)
-		defer ticker.Stop()
+		go func() {
+			sig := <-sigs
+			logger.Info("received signal, shutting down", "signal", sig.String())
+			fmt.Println("\nTradeEngine stopping...")
+			cancel()
+		}()
 
-		for {
-			select {
-			case <-ticker.C:
-				logger.Info(fmt.Sprintf("Engine running in %s mode", mode))
-			case sig := <-sigs:
-				logger.Info("received signal, shutting down", "signal", sig.String())
-				fmt.Println("\nTradeEngine stopped.")
-				return nil
-			case <-ctx.Done():
-				return nil
-			}
+		if err := eng.Run(ctx); err != nil {
+			return err
 		}
+		fmt.Println("TradeEngine stopped.")
+		return nil
 	},
 }
 

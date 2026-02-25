@@ -18,6 +18,8 @@ func stub(name string) func(cmd *cobra.Command, args []string) error {
 }
 
 // ── Watchlist ─────────────────────────────────────────────────────────────────
+// Watchlist commands are implemented in watchlist.go (Phase 2).
+// watchlistCmd is populated by init() in watchlist.go.
 
 var watchlistCmd = &cobra.Command{
 	Use:   "watchlist",
@@ -25,10 +27,9 @@ var watchlistCmd = &cobra.Command{
 }
 
 var _ = func() bool {
+	// Real subcommands: add, remove, show (in watchlist.go).
+	// Remaining stubs for commands coming in later phases:
 	watchlistCmd.AddCommand(
-		&cobra.Command{Use: "list", Short: "List watchlist items", RunE: stub("te watchlist list")},
-		&cobra.Command{Use: "add <ticker>", Short: "Add a ticker to the watchlist", RunE: stub("te watchlist add")},
-		&cobra.Command{Use: "remove <ticker>", Short: "Remove a ticker from the watchlist", RunE: stub("te watchlist remove")},
 		&cobra.Command{Use: "enable <ticker>", Short: "Enable a watchlist item", RunE: stub("te watchlist enable")},
 		&cobra.Command{Use: "disable <ticker>", Short: "Disable a watchlist item", RunE: stub("te watchlist disable")},
 		&cobra.Command{Use: "sync", Short: "Sync watchlist from config file", RunE: stub("te watchlist sync")},
