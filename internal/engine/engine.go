@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
@@ -27,11 +28,12 @@ const (
 )
 
 // Engine is the core trading loop. It polls market data, computes indicators,
-// fetches news, and (in later phases) runs analysis and executes orders.
+// fetches news, and dispatches to the analysis engine on each tick.
 type Engine struct {
 	cfg          *config.Config
 	marketData   data.MarketDataProvider
 	newsProvider data.NewsProvider
+	analyzer     *analysis.Analyzer
 
 	// newsLastFetched tracks when news was last fetched per ticker, to avoid
 	// hammering the news API on every 5-min tick.
@@ -47,6 +49,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	return &Engine{
 		cfg:             cfg,
 		marketData:      market,
+		analyzer:        analysis.NewAnalyzer(cfg.Models),
 		newsProvider:    news,
 		newsLastFetched: make(map[string]time.Time),
 		mode:            mode,
@@ -171,6 +174,126 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 
 	// Fetch news (rate-limited to newsFetchInterval cadence).
 	e.fetchAndStoreNews(ctx, ticker)
+
+	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
+	e.runAnalysis(ctx, ticker, string(primaryTF), candles, set)
+}
+
+// runAnalysis builds the analysis request, calls the configured model, stores
+// the result, and logs the recommendation summary.
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, candles []data.Candle, set *indicators.IndicatorSet) {
+	if set == nil {
+		return
+	}
+	if e.analyzer == nil || !e.analyzer.Primary().IsAvailable() {
+		logger.Debug("analysis skipped — primary model not available", "ticker", ticker)
+		return
+	}
+
+	strategy := "default"
+	if e.cfg.Engine.Mode != "" {
+		strategy = e.cfg.Engine.Mode
+	}
+
+	// Build candle snapshots (last 10 bars for prompt).
+	limit := len(candles)
+	if limit > 10 {
+		limit = 10
+	}
+	snaps := make([]analysis.CandleSnapshot, limit)
+	for i, c := range candles[:limit] {
+		snaps[i] = analysis.CandleSnapshot{
+			Timestamp: c.Timestamp,
+			Open:      c.Open,
+			High:      c.High,
+			Low:       c.Low,
+			Close:     c.Close,
+			Volume:    c.Volume,
+			VWAP:      c.VWAP,
+		}
+	}
+
+	// Load recent news from the store for prompt inclusion.
+	newsItems, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	snippets := make([]analysis.NewsSnippet, 0, len(newsItems))
+	for _, n := range newsItems {
+		snippets = append(snippets, analysis.NewsSnippet{
+			Headline:    n.Headline,
+			Source:      n.Source,
+			PublishedAt: n.PublishedAt,
+			Sentiment:   sentimentLabel(n.SentimentScore),
+		})
+	}
+
+	req := analysis.AnalysisRequest{
+		Ticker:        ticker,
+		Strategy:      strategy,
+		Timeframe:     timeframe,
+		RecentCandles: snaps,
+		Indicators: analysis.IndicatorSnapshot{
+			EMA20: set.EMA20, EMA50: set.EMA50, EMA200: set.EMA200,
+			SMA20: set.SMA20, SMA50: set.SMA50, SMA200: set.SMA200,
+			RSI:           set.RSI,
+			MACDLine:      set.MACDLine,
+			MACDSignal:    set.MACDSignal,
+			MACDHistogram: set.MACDHistogram,
+			BBUpper:       set.BBUpper,
+			BBMiddle:      set.BBMiddle,
+			BBLower:       set.BBLower,
+			ADX:           set.ADX, ATR: set.ATR, OBV: set.OBV,
+			StochK: set.StochK, StochD: set.StochD,
+			VWAP:     set.VWAP,
+			VolSMA20: set.VolumeSMA20,
+			VolRatio: volRatio(candles, set.VolumeSMA20),
+		},
+		News:      snippets,
+		Portfolio: analysis.PortfolioContext{}, // Phase 4
+	}
+
+	resp, meta, err := e.analyzer.Analyze(ctx, req)
+	if err != nil {
+		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
+		return
+	}
+
+	logger.Info("analysis complete",
+		"ticker", ticker,
+		"action", string(resp.Action),
+		"confidence", fmt.Sprintf("%.2f", resp.Confidence),
+		"size_pct", fmt.Sprintf("%.1f%%", resp.SizePct),
+		"reasoning", resp.Reasoning[:min(120, len(resp.Reasoning))],
+	)
+
+	if err := store.InsertAnalysis(ctx, ticker, strategy, resp, meta); err != nil {
+		logger.Warn("store analysis", "ticker", ticker, "err", err.Error())
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// volRatio returns current volume / VolSMA20, or 1.0 if data is unavailable.
+func volRatio(candles []data.Candle, volSMA float64) float64 {
+	if len(candles) == 0 || volSMA == 0 {
+		return 1.0
+	}
+	return float64(candles[0].Volume) / volSMA
+}
+
+// sentimentLabel converts a numeric sentiment score (0.0–1.0 bullish) to a label.
+func sentimentLabel(score float64) string {
+	switch {
+	case score >= 0.55:
+		return "bullish"
+	case score <= 0.45:
+		return "bearish"
+	default:
+		return "neutral"
+	}
 }
 
 // fetchAndStoreCandles fetches recent candles from the market data provider and

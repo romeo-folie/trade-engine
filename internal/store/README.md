@@ -11,6 +11,7 @@ All PostgreSQL interactions. Each file owns one table or a related group of tabl
 | `candles.go` | `candles` | OHLCV bar storage and retrieval |
 | `watchlist.go` | `watchlist` | Watchlist CRUD |
 | `news.go` | `news_items` | News article storage and retrieval |
+| `analyses.go` | `analyses` | LLM analysis persistence and retrieval |
 
 ## Architecture
 
@@ -43,6 +44,12 @@ The pool is a package-level singleton initialized by `Connect(ctx)`. All other f
 - `UpsertNewsItems` deduplicates on `external_id` (Finnhub article ID)
 - URL uniqueness is enforced by the `UNIQUE` constraint on the `news_items.url` column
 - `GetRecentNews(ticker, since)` uses a GIN index on `tickers[]` for efficient array lookup
+
+**Analyses (`analyses.go`)**
+- `InsertAnalysis` writes the full model output + metadata (`raw_prompt`, `raw_response`, token usage, latency)
+- `prompt_hash` stores SHA-256 of the exact prompt text for reproducibility/caching
+- `indicators` stores a JSONB snapshot of technical inputs used for the recommendation
+- `GetAnalysesByTicker` and `GetAnalysisByID` support audit/review tooling
 
 **Overrides (`overrides.go`)**
 - All engine settings (mode, tick interval, etc.) can be overridden at runtime via `te config set --runtime`
