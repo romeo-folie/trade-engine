@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 )
 
@@ -103,10 +104,7 @@ func GetAnalysisByID(ctx context.Context, id string) (*StoredAnalysis, error) {
 	return &results[0], nil
 }
 
-func scanAnalyses(rows interface {
-	Next() bool
-	Scan(...any) error
-}) ([]StoredAnalysis, error) {
+func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	var out []StoredAnalysis
 	for rows.Next() {
 		var a StoredAnalysis
@@ -121,6 +119,9 @@ func scanAnalyses(rows interface {
 			return nil, err
 		}
 		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

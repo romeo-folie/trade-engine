@@ -195,14 +195,15 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		strategy = e.cfg.Engine.Mode
 	}
 
-	// Build candle snapshots (last 10 bars for prompt).
+	// Build candle snapshots (most-recent-first for prompt context).
 	limit := len(candles)
 	if limit > 10 {
 		limit = 10
 	}
-	snaps := make([]analysis.CandleSnapshot, limit)
-	for i, c := range candles[:limit] {
-		snaps[i] = analysis.CandleSnapshot{
+	snaps := make([]analysis.CandleSnapshot, 0, limit)
+	for i := len(candles) - 1; i >= 0 && len(snaps) < limit; i-- {
+		c := candles[i]
+		snaps = append(snaps, analysis.CandleSnapshot{
 			Timestamp: c.Timestamp,
 			Open:      c.Open,
 			High:      c.High,
@@ -210,7 +211,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 			Close:     c.Close,
 			Volume:    c.Volume,
 			VWAP:      c.VWAP,
-		}
+		})
 	}
 
 	// Load recent news from the store for prompt inclusion.
@@ -281,7 +282,8 @@ func volRatio(candles []data.Candle, volSMA float64) float64 {
 	if len(candles) == 0 || volSMA == 0 {
 		return 1.0
 	}
-	return float64(candles[0].Volume) / volSMA
+	latest := candles[len(candles)-1]
+	return float64(latest.Volume) / volSMA
 }
 
 // sentimentLabel converts a numeric sentiment score (0.0–1.0 bullish) to a label.
