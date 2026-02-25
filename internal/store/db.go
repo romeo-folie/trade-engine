@@ -1,0 +1,141 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+var pool *pgxpool.Pool
+
+// Connect initialises the global connection pool from DATABASE_URL.
+func Connect(ctx context.Context) error {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		return fmt.Errorf("DATABASE_URL environment variable is not set")
+	}
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	cfg.MaxConns = 10
+	cfg.MinConns = 2
+	cfg.MaxConnLifetime = time.Hour
+	cfg.MaxConnIdleTime = 30 * time.Minute
+
+	pool, err = pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("open pool: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping database: %w", err)
+	}
+	return nil
+}
+
+// GetDB returns the global pool. Panics if Connect was not called.
+func GetDB() *pgxpool.Pool {
+	if pool == nil {
+		panic("store.Connect() must be called before GetDB()")
+	}
+	return pool
+}
+
+// Close shuts down the pool gracefully.
+func Close() {
+	if pool != nil {
+		pool.Close()
+	}
+}
+
+// Migrate applies all pending SQL migration files from the given directory.
+// Migration state is tracked in the schema_migrations table.
+func Migrate(ctx context.Context, migrationsDir string) error {
+	db := GetDB()
+
+	// Ensure schema_migrations exists.
+	_, err := db.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			filename   TEXT        PRIMARY KEY,
+			applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("create schema_migrations: %w", err)
+	}
+
+	// Load applied migrations.
+	rows, err := db.Query(ctx, `SELECT filename FROM schema_migrations ORDER BY filename`)
+	if err != nil {
+		return fmt.Errorf("query schema_migrations: %w", err)
+	}
+	applied := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[name] = true
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate schema_migrations: %w", err)
+	}
+
+	// Find and sort migration files.
+	entries, err := os.ReadDir(migrationsDir)
+	if err != nil {
+		return fmt.Errorf("read migrations dir %q: %w", migrationsDir, err)
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".sql") {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+
+	// Apply pending migrations.
+	for _, name := range files {
+		if applied[name] {
+			continue
+		}
+		sql, err := os.ReadFile(filepath.Join(migrationsDir, name))
+		if err != nil {
+			return fmt.Errorf("read migration %s: %w", name, err)
+		}
+
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin tx for %s: %w", name, err)
+		}
+
+		if _, err := tx.Exec(ctx, string(sql)); err != nil {
+			tx.Rollback(ctx) //nolint:errcheck
+			return fmt.Errorf("apply migration %s: %w", name, err)
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
+		); err != nil {
+			tx.Rollback(ctx) //nolint:errcheck
+			return fmt.Errorf("record migration %s: %w", name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit migration %s: %w", name, err)
+		}
+		fmt.Printf("  applied: %s\n", name)
+	}
+	return nil
+}
+
+// Ping checks database connectivity.
+func Ping(ctx context.Context) error {
+	return GetDB().Ping(ctx)
+}

@@ -1,0 +1,123 @@
+package config
+
+// Defaults returns a Config pre-filled with sensible defaults.
+// These are overridden by YAML, DB overrides, and CLI flags.
+func Defaults() *Config {
+	return &Config{
+		Engine: EngineConfig{
+			Mode:            "manual",
+			TickIntervalSec: 300,
+			MaxWatchlist:    50,
+			DryRun:          false,
+		},
+		Models: ModelsConfig{
+			Primary: ModelConfig{
+				Provider:    "anthropic",
+				Model:       "claude-sonnet-4-5",
+				APIKeyEnv:   "ANTHROPIC_API_KEY",
+				MaxTokens:   4096,
+				Temperature: 0.1,
+				TimeoutSec:  60,
+			},
+			Secondary: []ModelConfig{},
+			Consensus: ConsensusConfig{
+				Enabled:  false,
+				Strategy: "majority",
+			},
+		},
+		Markets: MarketsConfig{
+			Stocks: StocksConfig{
+				Enabled:   true,
+				Paper:     true,
+				APIKeyEnv: "ALPACA_API_KEY",
+				SecretEnv: "ALPACA_API_SECRET",
+				BaseURL:   "https://paper-api.alpaca.markets",
+				DataURL:   "https://data.alpaca.markets",
+			},
+			Predictions: PredictionsConfig{
+				Enabled: false,
+				Platforms: map[string]PredictionPlatform{
+					"polymarket": {
+						Enabled:      false,
+						APIKeyEnv:    "POLYMARKET_API_KEY",
+						Categories:   []string{"politics", "crypto"},
+						MinVolume:    50000,
+						MaxContracts: 20,
+					},
+					"kalshi": {
+						Enabled:      false,
+						APIKeyEnv:    "KALSHI_API_KEY",
+						Categories:   []string{"politics"},
+						MinVolume:    10000,
+						MaxContracts: 10,
+					},
+				},
+			},
+		},
+		Strategies: StrategiesConfig{
+			TrendFollowing: TrendFollowingConfig{
+				Enabled:   true,
+				EMAPeriod: 20,
+				ADXMin:    25,
+				RSIMin:    45,
+				RSIMax:    65,
+			},
+			MeanReversion: MeanReversionConfig{
+				Enabled:       true,
+				BBPeriod:      20,
+				BBStdDev:      2.0,
+				RSIOversold:   30,
+				RSIOverbought: 70,
+			},
+			Momentum: MomentumConfig{
+				Enabled:        true,
+				MACDFast:       12,
+				MACDSlow:       26,
+				MACDSignal:     9,
+				VolumeMultiple: 1.5,
+			},
+			NewsSentiment: NewsSentimentConfig{
+				Enabled:      false,
+				MinSentiment: 0.6,
+				MaxAgeHours:  48,
+			},
+			PredictionMispricing: PredictionMispricingConfig{
+				Enabled:   false,
+				MinEdge:   0.05,
+				MinVolume: 50000,
+			},
+		},
+		Risk: RiskConfig{
+			ConfidenceThreshold:  0.65,
+			MinRiskReward:        1.5,
+			MaxPositionPct:       5.0,
+			MaxOpenPositions:     10,
+			DailyLossLimitPct:    3.0,
+			MaxDrawdownPct:       15.0,
+			CooldownAfterLoss:    60,
+			DefaultStopLossPct:   2.0,
+			DefaultTakeProfitPct: 4.0,
+			SignalExpiryMin:      30,
+			StalePriceMovePct:    2.0,
+		},
+		Notifications: NotificationsConfig{
+			Telegram: TelegramConfig{
+				Enabled:     false,
+				BotTokenEnv: "TELEGRAM_BOT_TOKEN",
+				ChatID:      "",
+				NotifyOn:    []string{"signal", "trade", "error", "daily_summary"},
+			},
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
+		},
+		Database: DatabaseConfig{
+			URLEnv: "DATABASE_URL",
+		},
+		Reports: ReportsConfig{
+			OutputDir:       "~/.tradeengine/reports",
+			AutoOpenBrowser: true,
+		},
+	}
+}
