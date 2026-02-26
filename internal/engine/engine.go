@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -46,6 +47,7 @@ type Engine struct {
 	analyzer     *analysis.Analyzer
 	executor     execution.Executor
 	portfolio    *portfolio.Tracker
+	bus          *events.Bus
 
 	// newsLastFetched tracks when news was last fetched per ticker, to avoid
 	// hammering the news API on every 5-min tick.
@@ -70,6 +72,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		newsProvider:    news,
 		executor:        exec,
 		portfolio:       portfolio.NewTracker(time.Hour),
+		bus:             events.New(),
 		newsLastFetched: make(map[string]time.Time),
 		mode:            mode,
 	}
@@ -200,6 +203,9 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 		"atr", fmt.Sprintf("%.4f", set.ATR),
 		"obv", fmt.Sprintf("%.0f", set.OBV),
 	)
+	e.bus.Publish(events.IndicatorsComputed, events.IndicatorsComputedPayload{
+		Ticker: ticker, RSI: set.RSI, EMA20: set.EMA20, MACD: set.MACDLine, ADX: set.ADX,
+	})
 
 	// Fetch news (rate-limited to newsFetchInterval cadence).
 	e.fetchAndStoreNews(ctx, ticker)
@@ -293,6 +299,10 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		"size_pct", fmt.Sprintf("%.1f%%", resp.SizePct),
 		"reasoning", resp.Reasoning[:min(120, len(resp.Reasoning))],
 	)
+	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
+		Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
+		Reasoning: resp.Reasoning, Provider: meta.Provider, Model: meta.Model, LatencyMs: meta.LatencyMs,
+	})
 
 	analysisID, err := store.InsertAnalysis(ctx, ticker, strategy, resp, meta)
 	if err != nil {
@@ -347,6 +357,9 @@ func (e *Engine) fetchAndStoreCandles(ctx context.Context, ticker string, tf dat
 		return
 	}
 	logger.Info("candles upserted", "ticker", ticker, "tf", string(tf), "count", len(candles))
+	e.bus.Publish(events.DataFetched, events.DataFetchedPayload{
+		Ticker: ticker, Timeframe: string(tf), Count: len(candles),
+	})
 }
 
 // fetchAndStoreNews fetches recent news for a ticker (respecting the cadence limit)
@@ -432,6 +445,9 @@ func (e *Engine) Mode() string {
 // Portfolio returns the portfolio tracker for external reads (e.g. CLI status).
 func (e *Engine) Portfolio() *portfolio.Tracker { return e.portfolio }
 
+// Bus returns the event bus for external subscribers (TUI, Telegram).
+func (e *Engine) Bus() *events.Bus { return e.bus }
+
 // ─── Phase 4: Signal generation ───────────────────────────────────────────────
 
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
@@ -506,6 +522,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 			logger.Warn("store blocked signal", "ticker", ticker, "err", err)
 		}
 		logger.Warn("signal blocked", "ticker", ticker, "reason", sig.BlockReason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
+			BlockReason: sig.BlockReason, FailedCheck: risk.BlockReason(results),
+		})
 		return
 	}
 
@@ -521,6 +541,12 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		"mode", e.Mode(),
 	)
 
+	e.bus.Publish(events.SignalGenerated, events.SignalGeneratedPayload{
+		SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
+		Confidence: resp.Confidence, SignalPrice: signalPrice,
+		StopLoss: resp.StopLoss, TakeProfit: resp.TakeProfit, Mode: e.Mode(),
+	})
+
 	// Route based on mode.
 	mode := e.Mode()
 	switch mode {
@@ -529,6 +555,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 	case "manual":
 		// Signal stays pending — user approves via CLI or Telegram.
 		logger.Info("signal queued for manual approval", "id", sigID, "ticker", ticker)
+		e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
+			SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
+			Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+		})
 	default:
 		logger.Warn("unknown mode, defaulting to manual", "mode", mode)
 	}
@@ -613,6 +643,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		"entry_price", result.FilledPrice,
 		"qty", result.FilledQty,
 	)
+	e.bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
+		TradeID: tradeID, SignalID: sigID, Ticker: sig.Ticker,
+		Direction: direction, EntryPrice: result.FilledPrice,
+		Quantity: result.FilledQty, Strategy: sig.Strategy,
+	})
 }
 
 // ApproveSignal approves a pending signal and executes it. Called from CLI / Telegram.
@@ -794,6 +829,11 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			"pnl", fmt.Sprintf("%.2f", pnl),
 			"pnl_pct", fmt.Sprintf("%.2f%%", pnlPct),
 		)
+		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
+			TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
+			EntryPrice: t.EntryPrice, ExitPrice: result.FilledPrice,
+			PnL: pnl, PnLPct: pnlPct, Reason: exitReason,
+		})
 	}
 
 	// Update portfolio state after monitoring.

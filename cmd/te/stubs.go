@@ -84,8 +84,8 @@ var _ = func() bool {
 var dashboardCmd = &cobra.Command{
 	Use:     "dashboard",
 	Aliases: []string{"ui", "tui"},
-	Short:   "Open the terminal dashboard (Phase 5)",
-	RunE:    stub("te dashboard"),
+	Short:   "Open the terminal dashboard",
+	RunE:    runDashboard,
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

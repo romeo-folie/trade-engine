@@ -127,6 +127,35 @@ func scanSignals(rows interface {
 	return out, rows.Err()
 }
 
+// GetRecentSignals returns the most recent signals regardless of ticker or status.
+func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
+	rows, err := GetDB().Query(ctx,
+		`SELECT id, ticker, action, strategy, signal_price, stop_loss, take_profit,
+		        confidence, size_pct, status, COALESCE(block_reason,''),
+		        expires_at, stale_price_move_pct, created_at, updated_at
+		 FROM signals ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Signal
+	for rows.Next() {
+		var s Signal
+		if err := rows.Scan(
+			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
+			&s.StopLoss, &s.TakeProfit,
+			&s.Confidence, &s.SizePct, &s.Status,
+			&s.BlockReason, &s.ExpiresAt, &s.StalePriceMovePct,
+			&s.CreatedAt, &s.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
 func nullableString(s string) any {
 	if s == "" {
 		return nil
