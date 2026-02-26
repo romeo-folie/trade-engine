@@ -39,15 +39,15 @@ func TestRenderDashboard_ContainsAllSections(t *testing.T) {
 	out := RenderDashboard(d, 120, 40, 0)
 
 	sections := []string{
-		"PAPER",        // mode header
-		"Portfolio",    // portfolio section
+		"PAPER",              // mode header
+		"Portfolio",          // portfolio section
 		"Open Positions (2)", // positions header
-		"AAPL",         // position ticker
+		"AAPL",               // position ticker
 		"TSLA",
 		"Pending Approvals", // pending section
 		"MSFT",
-		"Signal Feed",  // signal feed
-		"Risk:",        // risk bar
+		"Signal Feed", // signal feed
+		"Risk:",       // risk bar
 	}
 
 	for _, s := range sections {

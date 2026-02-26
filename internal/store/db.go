@@ -40,6 +40,11 @@ func Connect(ctx context.Context) error {
 }
 
 // GetDB returns the global pool. Panics if Connect was not called.
+// IsConnected returns true if the database pool has been initialized.
+func IsConnected() bool {
+	return pool != nil
+}
+
 func GetDB() *pgxpool.Pool {
 	if pool == nil {
 		panic("store.Connect() must be called before GetDB()")

@@ -38,6 +38,9 @@ func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
 	if limit == 0 {
 		limit = 50
 	}
+	if !store.IsConnected() {
+		return SignalFeedData{LastUpdate: time.Now()}
+	}
 
 	// Fetch signals across multiple tickers. We'll query per-status to get a good mix.
 	var allSignals []SignalFeedRow

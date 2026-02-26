@@ -30,12 +30,9 @@ type PositionDetail struct {
 
 // FetchPositionDetail loads full detail for a trade by ID.
 func FetchPositionDetail(ctx context.Context, tradeID string) (d PositionDetail, ok bool) {
-	defer func() {
-		if r := recover(); r != nil {
-			ok = false
-		}
-	}()
-
+	if !store.IsConnected() {
+		return d, false
+	}
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil {
 		return d, false
@@ -200,6 +197,6 @@ func wrapText(s string, width int) string {
 
 var (
 	detailLabel = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("117"))
+		Bold(true).
+		Foreground(lipgloss.Color("117"))
 )

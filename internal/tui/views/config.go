@@ -62,6 +62,16 @@ func FetchConfigData(ctx context.Context, currentMode string) ConfigData {
 	}
 
 	// Load current values from DB overrides, fall back to defaults.
+	if !store.IsConnected() {
+		// Set defaults when no DB.
+		for i := range items {
+			items[i].Value = ""
+		}
+		if len(items) > 0 {
+			items[0].Value = currentMode
+		}
+		return ConfigData{Items: items, LastUpdate: time.Now()}
+	}
 	defaults := map[string]string{
 		"engine.mode":                  currentMode,
 		"risk.confidence_threshold":    "0.65",

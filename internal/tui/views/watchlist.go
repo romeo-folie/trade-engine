@@ -29,6 +29,9 @@ type WatchlistData struct {
 
 // FetchWatchlistData loads all watchlist items (active and inactive).
 func FetchWatchlistData(ctx context.Context) WatchlistData {
+	if !store.IsConnected() {
+		return WatchlistData{LastUpdate: time.Now()}
+	}
 	items, err := store.GetWatchlistItems(ctx, false) // include inactive
 	if err != nil {
 		return WatchlistData{LastUpdate: time.Now()}

@@ -16,8 +16,8 @@ import (
 // Populated by polling the DB or derived from events.
 type DashboardData struct {
 	// Header
-	Mode        string
-	PaperMode   bool
+	Mode          string
+	PaperMode     bool
 	EngineRunning bool
 
 	// Portfolio summary
@@ -80,12 +80,11 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		LastUpdate: time.Now(),
 	}
 
-	// Guard against missing DB connection.
-	defer func() {
-		if r := recover(); r != nil {
-			// DB not connected — return whatever we have so far.
-		}
-	}()
+	// All store calls below handle errors gracefully (skip section on error).
+	// No recover() — real panics should surface.
+	if !store.IsConnected() {
+		return d
+	}
 
 	// Open trades → positions
 	trades, err := store.GetOpenTrades(ctx)

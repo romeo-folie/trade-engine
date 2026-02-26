@@ -93,6 +93,19 @@ type Model struct {
 	OnApprove func(ctx context.Context, signalID string) error
 	OnReject  func(ctx context.Context, signalID string) error
 
+	// View data (refreshed on poll ticks)
+	tradeData     views.TradeHistoryData
+	signalData    views.SignalFeedData
+	watchlistData views.WatchlistData
+	configData    views.ConfigData
+
+	// Selection state for sub-views
+	selectedTrade     int
+	selectedSignal    int
+	selectedWatchlist int
+	selectedConfig    int
+	showTradeDetail   bool
+
 	// Status message (briefly shown after actions)
 	statusMsg     string
 	statusMsgTime time.Time
@@ -106,18 +119,24 @@ func New(bus *events.Bus, mode string) Model {
 	if mode == "" {
 		mode = "paper"
 	}
-	return Model{
+	m := Model{
 		activeView: ViewDashboard,
 		bus:        bus,
 		mode:       mode,
 	}
+	// Subscribe eagerly in New() so the subscription is part of the model value
+	// returned to Bubble Tea — Init() has a value receiver, so setting fields
+	// there would be lost.
+	if bus != nil {
+		m.sub = bus.SubscribeAll()
+	}
+	return m
 }
 
-// Init subscribes to the event bus and starts the poll ticker.
+// Init starts the poll ticker and event listener.
 func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{pollTicker()}
-	if m.bus != nil {
-		m.sub = m.bus.SubscribeAll()
+	if m.sub != nil {
 		cmds = append(cmds, waitForEvent(m.sub))
 	}
 	return tea.Batch(cmds...)
@@ -259,7 +278,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pollTickMsg:
 		m.lastPoll = time.Time(msg)
-		m.dashData = views.FetchDashboardData(context.Background(), m.mode)
+		ctx := context.Background()
+		m.dashData = views.FetchDashboardData(ctx, m.mode)
+		m.tradeData = views.FetchTradeHistory(ctx, 50)
+		m.tradeData.Selected = m.selectedTrade
+		m.signalData = views.FetchSignalFeed(ctx, 50)
+		m.signalData.Selected = m.selectedSignal
+		m.watchlistData = views.FetchWatchlistData(ctx)
+		m.watchlistData.Selected = m.selectedWatchlist
+		m.configData = views.FetchConfigData(ctx, m.mode)
+		m.configData.Selected = m.selectedConfig
 		return m, pollTicker()
 	}
 
@@ -289,11 +317,11 @@ func (m Model) View() string {
 	return fmt.Sprintf("%s\n%s\n%s", header, bodyStyle.Render(body), statusBar)
 }
 
-// cleanup unsubscribes from the bus.
-func (m *Model) cleanup() {
+// cleanup unsubscribes from the bus. Uses value receiver for consistency
+// with Bubble Tea's Model interface (Update returns value, not pointer).
+func (m Model) cleanup() {
 	if m.bus != nil && m.sub != nil {
 		m.bus.Unsubscribe(m.sub)
-		m.sub = nil
 	}
 }
 
@@ -351,13 +379,20 @@ func (m Model) renderBody() string {
 	case ViewDashboard:
 		return views.RenderDashboard(m.dashData, m.width, m.height, m.selectedPending)
 	case ViewTrades:
-		return m.renderPlaceholder("Trade History", "All trades with P&L, strategy, timing")
+		if m.showTradeDetail && m.selectedTrade < len(m.tradeData.Trades) {
+			tradeID := m.tradeData.Trades[m.selectedTrade].ID
+			detail, ok := views.FetchTradeDetail(context.Background(), tradeID)
+			if ok {
+				return views.RenderTradeDetail(detail)
+			}
+		}
+		return views.RenderTradeHistory(m.tradeData, m.width)
 	case ViewWatchlist:
-		return m.renderPlaceholder("Watchlist", "Active tickers, indicators, last analysis")
+		return views.RenderWatchlist(m.watchlistData, m.width)
 	case ViewSignals:
-		return m.renderPlaceholder("Signal Feed", "Pending, executed, blocked, expired signals")
+		return views.RenderSignalFeed(m.signalData, m.width)
 	case ViewConfig:
-		return m.renderPlaceholder("Configuration", "Engine mode, risk params, model config")
+		return views.RenderConfig(m.configData, m.width)
 	default:
 		return "unknown view"
 	}

@@ -62,6 +62,9 @@ func FetchTradeHistory(ctx context.Context, limit int) TradeHistoryData {
 	if limit == 0 {
 		limit = 50
 	}
+	if !store.IsConnected() {
+		return TradeHistoryData{LastUpdate: time.Now()}
+	}
 	trades, err := store.GetRecentTrades(ctx, limit)
 	if err != nil {
 		return TradeHistoryData{LastUpdate: time.Now()}
@@ -89,6 +92,9 @@ func FetchTradeHistory(ctx context.Context, limit int) TradeHistoryData {
 
 // FetchTradeDetail loads full detail for a single trade by ID.
 func FetchTradeDetail(ctx context.Context, tradeID string) (d TradeDetailData, ok bool) {
+	if !store.IsConnected() {
+		return d, false
+	}
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil {
 		return d, false
