@@ -104,7 +104,7 @@ func TestTradeExecutedNotification(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := len(*msgs)
 
-	bus.Publish(events.TradeExecuted, &events.TradeExecutedPayload{
+	bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
 		TradeID:    "t1",
 		Ticker:     "AAPL",
 		Direction:  "buy",
@@ -139,7 +139,7 @@ func TestTradeClosedNotification(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := len(*msgs)
 
-	bus.Publish(events.TradeClosed, &events.TradeClosedPayload{
+	bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 		TradeID:    "t1",
 		Ticker:     "TSLA",
 		Direction:  "buy",
@@ -179,7 +179,7 @@ func TestSignalQueuedWithInlineButtons(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := len(*msgs)
 
-	bus.Publish(events.SignalQueued, &events.SignalQueuedPayload{
+	bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 		SignalID:   "sig1",
 		Ticker:     "GOOG",
 		Action:     "BUY",
@@ -218,7 +218,7 @@ func TestErrorNotification(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	startCount := len(*msgs)
 
-	bus.Publish(events.ErrorOccurred, &events.ErrorPayload{
+	bus.Publish(events.ErrorOccurred, events.ErrorPayload{
 		Component: "data",
 		Ticker:    "MSFT",
 		Message:   "API rate limit exceeded",
@@ -252,7 +252,7 @@ func TestNotifyOnFiltering(t *testing.T) {
 	startCount := len(*msgs)
 
 	// Signal event should be filtered out.
-	bus.Publish(events.SignalGenerated, &events.SignalGeneratedPayload{
+	bus.Publish(events.SignalGenerated, events.SignalGeneratedPayload{
 		SignalID: "sig1",
 		Ticker:   "NVDA",
 		Action:   "BUY",

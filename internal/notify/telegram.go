@@ -46,6 +46,7 @@ type TelegramBot struct {
 	callbackHandler CallbackHandler
 
 	client *http.Client
+	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -74,6 +75,7 @@ func (b *TelegramBot) SetCallbackHandler(h CallbackHandler) {
 // Start subscribes to events and begins the polling loop for callbacks.
 func (b *TelegramBot) Start(ctx context.Context) error {
 	ctx, b.cancel = context.WithCancel(ctx)
+	b.ctx = ctx
 
 	// Send startup message.
 	if err := b.sendMessage("🟢 *TradeEngine online*\nMode: notifications active", nil); err != nil {
@@ -117,7 +119,6 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 		{events.SignalQueued, b.handleSignalQueued},
 		{events.SignalBlocked, b.handleSignalBlocked},
 		{events.ErrorOccurred, b.handleError},
-		{events.PortfolioSnapshotTaken, b.handlePortfolioSnapshot},
 	}
 
 	for _, bind := range bindings {
@@ -148,7 +149,7 @@ func (b *TelegramBot) handleTradeExecuted(ev events.Event) {
 	if !b.notifyOn["trade"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.TradeExecutedPayload)
+	p, ok := ev.Payload.(events.TradeExecutedPayload)
 	if !ok {
 		return
 	}
@@ -170,7 +171,7 @@ func (b *TelegramBot) handleTradeClosed(ev events.Event) {
 	if !b.notifyOn["trade"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.TradeClosedPayload)
+	p, ok := ev.Payload.(events.TradeClosedPayload)
 	if !ok {
 		return
 	}
@@ -198,7 +199,7 @@ func (b *TelegramBot) handleSignalGenerated(ev events.Event) {
 	if !b.notifyOn["signal"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.SignalGeneratedPayload)
+	p, ok := ev.Payload.(events.SignalGeneratedPayload)
 	if !ok {
 		return
 	}
@@ -222,7 +223,7 @@ func (b *TelegramBot) handleSignalQueued(ev events.Event) {
 	if !b.notifyOn["signal"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.SignalQueuedPayload)
+	p, ok := ev.Payload.(events.SignalQueuedPayload)
 	if !ok {
 		return
 	}
@@ -245,7 +246,7 @@ func (b *TelegramBot) handleSignalBlocked(ev events.Event) {
 	if !b.notifyOn["signal"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.SignalBlockedPayload)
+	p, ok := ev.Payload.(events.SignalBlockedPayload)
 	if !ok {
 		return
 	}
@@ -267,7 +268,7 @@ func (b *TelegramBot) handleError(ev events.Event) {
 	if !b.notifyOn["error"] {
 		return
 	}
-	p, ok := ev.Payload.(*events.ErrorPayload)
+	p, ok := ev.Payload.(events.ErrorPayload)
 	if !ok {
 		return
 	}
@@ -281,11 +282,6 @@ func (b *TelegramBot) handleError(ev events.Event) {
 	if err := b.sendMessage(msg, nil); err != nil {
 		logger.Warn("telegram: send error alert failed", "error", err)
 	}
-}
-
-func (b *TelegramBot) handlePortfolioSnapshot(ev events.Event) {
-	// Portfolio snapshots are used for daily summaries; we don't notify on every snapshot.
-	// Daily summary is handled by SendDailySummary called from the engine scheduler.
 }
 
 // ── Daily summary ─────────────────────────────────────────────────────────────
@@ -385,8 +381,10 @@ func (b *TelegramBot) pollUpdates(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			logger.Warn("telegram: getUpdates failed", "error", err)
-			time.Sleep(5 * time.Second)
+			logger.Warn("telegram: getUpdates failed", "error", sanitizeError(err))
+			if !b.retrySleep(5 * time.Second) {
+				return
+			}
 			continue
 		}
 		for _, u := range updates {
@@ -467,7 +465,7 @@ func (b *TelegramBot) answerCallback(callbackID, text string) {
 	data, _ := json.Marshal(body)
 	resp, err := b.client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
-		logger.Warn("telegram: answerCallbackQuery failed", "error", err)
+		logger.Warn("telegram: answerCallbackQuery failed", "error", sanitizeError(err))
 		return
 	}
 	resp.Body.Close()
@@ -491,23 +489,54 @@ func (b *TelegramBot) sendMessage(text string, replyMarkup []byte) error {
 	for attempt := range maxRetries {
 		resp, err := b.client.Post(url, "application/json", bytes.NewReader(data))
 		if err != nil {
-			lastErr = err
-			time.Sleep(retryDelay * time.Duration(attempt+1))
+			lastErr = fmt.Errorf("send failed: %v", sanitizeError(err))
+			if !b.retrySleep(retryDelay * time.Duration(attempt+1)) {
+				return lastErr
+			}
 			continue
 		}
-		respBody, _ := io.ReadAll(resp.Body)
+		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			return nil
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
-			time.Sleep(retryDelay * time.Duration(attempt+1))
-			lastErr = fmt.Errorf("rate limited: %s", string(respBody))
+			lastErr = fmt.Errorf("rate limited (status %d)", resp.StatusCode)
+			if !b.retrySleep(retryDelay * time.Duration(attempt+1)) {
+				return lastErr
+			}
 			continue
 		}
-		return fmt.Errorf("telegram API error %d: %s", resp.StatusCode, string(respBody))
+		return fmt.Errorf("telegram API error %d", resp.StatusCode)
 	}
 	return fmt.Errorf("telegram: max retries exceeded: %w", lastErr)
+}
+
+// retrySleep waits for d or until the bot's context is cancelled.
+// Returns true if the sleep completed, false if cancelled.
+func (b *TelegramBot) retrySleep(d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-b.ctx.Done():
+		return false
+	}
+}
+
+// sanitizeError strips URL query parameters (which may contain tokens) from error messages.
+func sanitizeError(err error) string {
+	s := err.Error()
+	// Remove anything after '?' in URLs to avoid leaking tokens.
+	if idx := strings.Index(s, "?"); idx != -1 {
+		if end := strings.IndexAny(s[idx:], " \"'"); end != -1 {
+			s = s[:idx] + "<redacted>" + s[idx+end:]
+		} else {
+			s = s[:idx] + "<redacted>"
+		}
+	}
+	return s
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
