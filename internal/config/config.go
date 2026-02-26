@@ -29,28 +29,29 @@ type Config struct {
 // ── Engine ────────────────────────────────────────────────────────────────────
 
 type EngineConfig struct {
-	Mode            string `yaml:"mode"`              // manual | auto | paper
-	TickIntervalSec int    `yaml:"tick_interval_sec"` // default 300 (5 min)
-	MaxWatchlist    int    `yaml:"max_watchlist"`
-	DryRun          bool   `yaml:"dry_run"`
+	Mode            string  `yaml:"mode"`              // manual | auto | paper
+	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 300 (5 min)
+	MaxWatchlist    int     `yaml:"max_watchlist"`
+	DryRun          bool    `yaml:"dry_run"`
+	InitialCapital  float64 `yaml:"initial_capital"` // starting cash for paper trading (default 100000)
 }
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
 type ModelsConfig struct {
-	Primary   ModelConfig   `yaml:"primary"`
-	Secondary []ModelConfig `yaml:"secondary"`
+	Primary   ModelConfig     `yaml:"primary"`
+	Secondary []ModelConfig   `yaml:"secondary"`
 	Consensus ConsensusConfig `yaml:"consensus"`
 }
 
 type ModelConfig struct {
-	Provider   string  `yaml:"provider"`    // anthropic | openai | ollama
-	Model      string  `yaml:"model"`
-	APIKeyEnv  string  `yaml:"api_key_env"` // env var name
-	APIKey     string  `yaml:"-"`           // resolved at runtime, never serialised
-	MaxTokens  int     `yaml:"max_tokens"`
+	Provider    string  `yaml:"provider"` // anthropic | openai | ollama
+	Model       string  `yaml:"model"`
+	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
+	APIKey      string  `yaml:"-"`           // resolved at runtime, never serialised
+	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
-	TimeoutSec int     `yaml:"timeout_sec"`
+	TimeoutSec  int     `yaml:"timeout_sec"`
 }
 
 type ConsensusConfig struct {
@@ -68,9 +69,9 @@ type MarketsConfig struct {
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).
 type NewsAPIConfig struct {
-	Provider      string `yaml:"provider"`       // finnhub | benzinga
-	APIKeyEnv     string `yaml:"api_key_env"`    // env var name holding the API key
-	APIKey        string `yaml:"-"`              // resolved at runtime
+	Provider      string `yaml:"provider"`        // finnhub | benzinga
+	APIKeyEnv     string `yaml:"api_key_env"`     // env var name holding the API key
+	APIKey        string `yaml:"-"`               // resolved at runtime
 	FetchEveryMin int    `yaml:"fetch_every_min"` // cadence in minutes (default 15)
 }
 
@@ -102,10 +103,10 @@ type PredictionPlatform struct {
 // ── Strategies ────────────────────────────────────────────────────────────────
 
 type StrategiesConfig struct {
-	TrendFollowing   TrendFollowingConfig   `yaml:"trend_following"`
-	MeanReversion    MeanReversionConfig    `yaml:"mean_reversion"`
-	Momentum         MomentumConfig         `yaml:"momentum"`
-	NewsSentiment    NewsSentimentConfig    `yaml:"news_sentiment"`
+	TrendFollowing       TrendFollowingConfig       `yaml:"trend_following"`
+	MeanReversion        MeanReversionConfig        `yaml:"mean_reversion"`
+	Momentum             MomentumConfig             `yaml:"momentum"`
+	NewsSentiment        NewsSentimentConfig        `yaml:"news_sentiment"`
 	PredictionMispricing PredictionMispricingConfig `yaml:"prediction_mispricing"`
 }
 
@@ -118,11 +119,11 @@ type TrendFollowingConfig struct {
 }
 
 type MeanReversionConfig struct {
-	Enabled          bool    `yaml:"enabled"`
-	BBPeriod         int     `yaml:"bb_period"`
-	BBStdDev         float64 `yaml:"bb_std_dev"`
-	RSIOversold      float64 `yaml:"rsi_oversold"`
-	RSIOverbought    float64 `yaml:"rsi_overbought"`
+	Enabled       bool    `yaml:"enabled"`
+	BBPeriod      int     `yaml:"bb_period"`
+	BBStdDev      float64 `yaml:"bb_std_dev"`
+	RSIOversold   float64 `yaml:"rsi_oversold"`
+	RSIOverbought float64 `yaml:"rsi_overbought"`
 }
 
 type MomentumConfig struct {
@@ -148,17 +149,17 @@ type PredictionMispricingConfig struct {
 // ── Risk ─────────────────────────────────────────────────────────────────────
 
 type RiskConfig struct {
-	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
-	MinRiskReward       float64 `yaml:"min_risk_reward"`
-	MaxPositionPct      float64 `yaml:"max_position_pct"`
-	MaxOpenPositions    int     `yaml:"max_open_positions"`
-	DailyLossLimitPct   float64 `yaml:"daily_loss_limit_pct"`
-	MaxDrawdownPct      float64 `yaml:"max_drawdown_pct"`
-	CooldownAfterLoss   int     `yaml:"cooldown_after_loss_min"`
-	DefaultStopLossPct  float64 `yaml:"default_stop_loss_pct"`
+	ConfidenceThreshold  float64 `yaml:"confidence_threshold"`
+	MinRiskReward        float64 `yaml:"min_risk_reward"`
+	MaxPositionPct       float64 `yaml:"max_position_pct"`
+	MaxOpenPositions     int     `yaml:"max_open_positions"`
+	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
+	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
+	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`
+	DefaultStopLossPct   float64 `yaml:"default_stop_loss_pct"`
 	DefaultTakeProfitPct float64 `yaml:"default_take_profit_pct"`
-	SignalExpiryMin     int     `yaml:"signal_expiry_min"`
-	StalePriceMovePct   float64 `yaml:"stale_price_move_pct"`
+	SignalExpiryMin      int     `yaml:"signal_expiry_min"`
+	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

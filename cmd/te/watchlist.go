@@ -66,7 +66,7 @@ var watchlistAddCmd = &cobra.Command{
 		}
 
 		alpaca := data.NewAlpacaClient(cfg.Markets.Stocks.APIKey, cfg.Markets.Stocks.Secret, cfg.Markets.Stocks.DataURL)
-		eng := engine.New(cfg, alpaca, nil, cfg.Engine.Mode)
+		eng := engine.New(cfg, alpaca, nil, nil, cfg.Engine.Mode)
 
 		fmt.Printf("Backfilling history for %s (2y daily + 30d hourly)...\n", ticker)
 		if err := eng.BackfillHistory(ctx, ticker); err != nil {

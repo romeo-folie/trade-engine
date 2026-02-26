@@ -31,8 +31,8 @@ type StoredAnalysis struct {
 	CreatedAt     time.Time
 }
 
-// InsertAnalysis persists a completed analysis record.
-func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta) error {
+// InsertAnalysis persists a completed analysis record and returns its UUID.
+func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta) (string, error) {
 	q := `
 		INSERT INTO analyses (
 			ticker, strategy, action, confidence, size_pct,
@@ -48,16 +48,17 @@ func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.
 			$12, $13,
 			$14, $15, $16,
 			$17
-		)`
-	_, err := GetDB().Exec(ctx, q,
+		) RETURNING id`
+	var id string
+	err := GetDB().QueryRow(ctx, q,
 		ticker, strategy, string(resp.Action), resp.Confidence, resp.SizePct,
 		nullableFloat(resp.StopLoss), nullableFloat(resp.TakeProfit), resp.Reasoning,
 		meta.RawResponse, meta.RawPrompt, meta.PromptHash,
 		meta.Provider, meta.Model,
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
 		meta.IndicatorJSON,
-	)
-	return err
+	).Scan(&id)
+	return id, err
 }
 
 // GetAnalysesByTicker retrieves the most recent `limit` analyses for a ticker.
