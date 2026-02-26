@@ -15,6 +15,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -107,6 +108,19 @@ Modes:
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		// Start Telegram notifications if enabled.
+		var tgBot *notify.TelegramBot
+		if cfg.Notifications.Telegram.Enabled && cfg.Notifications.Telegram.BotToken != "" {
+			tgBot = notify.NewTelegramBot(cfg.Notifications.Telegram, eng.Bus())
+			tgBot.SetCallbackHandler(notify.NewEngineCallbackHandler(eng))
+			if err := tgBot.Start(ctx); err != nil {
+				logger.Warn("telegram bot failed to start", "error", err)
+			} else {
+				defer tgBot.Stop()
+				logger.Info("telegram notifications enabled")
+			}
+		}
 
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)

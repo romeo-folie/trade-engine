@@ -89,15 +89,10 @@ var dashboardCmd = &cobra.Command{
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
-
-var notifyCmd = &cobra.Command{
-	Use:   "notify",
-	Short: "Manage notifications",
-}
+// notifyCmd is defined in notify.go (Phase 6 implementation).
 
 var _ = func() bool {
 	notifyCmd.AddCommand(
-		&cobra.Command{Use: "test", Short: "Send a test notification", RunE: stub("te notify test")},
 		&cobra.Command{Use: "history", Short: "View notification history", RunE: stub("te notify history")},
 	)
 	return true
