@@ -80,6 +80,10 @@ type Model struct {
 	// dashData is the cached dashboard data (refreshed on poll ticks).
 	dashData views.DashboardData
 	mode     string // engine mode for dashboard header
+
+	// Position detail overlay
+	showDetail    bool
+	selectedPos   int // index into dashData.Positions
 }
 
 const maxRecentEvents = 50
@@ -119,18 +123,54 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
+			if m.showDetail {
+				m.showDetail = false
+				return m, nil
+			}
 			m.cleanup()
 			return m, tea.Quit
+		case "esc":
+			if m.showDetail {
+				m.showDetail = false
+				return m, nil
+			}
+		case "enter":
+			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.Positions) > 0 {
+				m.showDetail = true
+				return m, nil
+			}
+		case "j", "down":
+			if m.showDetail {
+				return m, nil
+			}
+			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
+				m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
+				return m, nil
+			}
+		case "k", "up":
+			if m.showDetail {
+				return m, nil
+			}
+			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
+				m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
+				return m, nil
+			}
 		case "tab":
-			m.activeView = (m.activeView + 1) % View(len(allViews))
+			if !m.showDetail {
+				m.activeView = (m.activeView + 1) % View(len(allViews))
+			}
 			return m, nil
 		case "shift+tab":
-			m.activeView = (m.activeView - 1 + View(len(allViews))) % View(len(allViews))
+			if !m.showDetail {
+				m.activeView = (m.activeView - 1 + View(len(allViews))) % View(len(allViews))
+			}
 			return m, nil
 		default:
-			if v, ok := viewKeys[msg.String()]; ok {
-				m.activeView = v
-				return m, nil
+			if !m.showDetail {
+				if v, ok := viewKeys[msg.String()]; ok {
+					m.activeView = v
+					return m, nil
+				}
 			}
 		}
 
@@ -230,6 +270,11 @@ func (m Model) renderHeader() string {
 }
 
 func (m Model) renderBody() string {
+	// Position detail overlay
+	if m.showDetail && m.activeView == ViewDashboard && m.selectedPos < len(m.dashData.Positions) {
+		return views.RenderPositionDetailStatic(m.dashData.Positions[m.selectedPos], m.width, m.height)
+	}
+
 	switch m.activeView {
 	case ViewDashboard:
 		return views.RenderDashboard(m.dashData, m.width, m.height)
