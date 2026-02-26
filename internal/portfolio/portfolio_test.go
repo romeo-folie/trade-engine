@@ -7,7 +7,7 @@ import (
 
 func TestTrackerUpdate_BasicState(t *testing.T) {
 	tr := NewTracker(time.Hour)
-	positions := []position{
+	positions := []ExecPosition{
 		{Ticker: "AAPL", CurrentValue: 5000, UnrealizedPL: 200},
 		{Ticker: "TSLA", CurrentValue: 3000, UnrealizedPL: -100},
 	}
@@ -35,19 +35,19 @@ func TestTrackerPeakValue(t *testing.T) {
 	tr := NewTracker(time.Hour)
 
 	// First update: peak = 10000
-	tr.Update([]position{{CurrentValue: 8000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 8000}}, 2000, 0)
 	if tr.CurrentState().PeakValue != 10000 {
 		t.Fatalf("PeakValue = %.2f, want 10000", tr.CurrentState().PeakValue)
 	}
 
 	// Lower value: peak stays at 10000
-	tr.Update([]position{{CurrentValue: 6000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 6000}}, 2000, 0)
 	if tr.CurrentState().PeakValue != 10000 {
 		t.Fatalf("PeakValue = %.2f, want 10000 (unchanged)", tr.CurrentState().PeakValue)
 	}
 
 	// New high: peak = 12000
-	tr.Update([]position{{CurrentValue: 10000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 10000}}, 2000, 0)
 	if tr.CurrentState().PeakValue != 12000 {
 		t.Fatalf("PeakValue = %.2f, want 12000", tr.CurrentState().PeakValue)
 	}
@@ -63,12 +63,21 @@ func TestRecordLoss(t *testing.T) {
 	}
 }
 
-func TestToPositions(t *testing.T) {
-	eps := []ExecPosition{
-		{Ticker: "AAPL", CurrentValue: 5000, UnrealizedPL: 200},
+func TestConcurrentAccess(t *testing.T) {
+	tr := NewTracker(time.Hour)
+	done := make(chan struct{})
+
+	// Writer goroutine.
+	go func() {
+		for i := 0; i < 100; i++ {
+			tr.Update([]ExecPosition{{CurrentValue: float64(i * 100)}}, 1000, 0)
+		}
+		close(done)
+	}()
+
+	// Reader goroutine (concurrent).
+	for i := 0; i < 100; i++ {
+		_ = tr.CurrentState()
 	}
-	ps := ToPositions(eps)
-	if len(ps) != 1 || ps[0].Ticker != "AAPL" {
-		t.Fatal("ToPositions conversion failed")
-	}
+	<-done
 }

@@ -617,17 +617,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 // ApproveSignal approves a pending signal and executes it. Called from CLI / Telegram.
 func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {
-	signals, err := store.GetPendingSignals(ctx)
+	sig, err := store.GetSignalByID(ctx, sigID)
 	if err != nil {
-		return fmt.Errorf("get pending signals: %w", err)
+		return fmt.Errorf("get signal: %w", err)
 	}
-	for _, sig := range signals {
-		if sig.ID == sigID {
-			e.executeSignal(ctx, sigID, sig)
-			return nil
-		}
+	if sig == nil {
+		return fmt.Errorf("signal %s not found", sigID)
 	}
-	return fmt.Errorf("signal %s not found or not pending", sigID)
+	if sig.Status != "pending" && sig.Status != "approved" {
+		return fmt.Errorf("signal %s has status %q — cannot approve", sigID, sig.Status)
+	}
+	e.executeSignal(ctx, sigID, *sig)
+	return nil
 }
 
 // RejectSignal marks a pending signal as rejected.
@@ -635,10 +636,56 @@ func (e *Engine) RejectSignal(ctx context.Context, sigID string) error {
 	return store.UpdateSignalStatus(ctx, sigID, "rejected", "manually rejected")
 }
 
+// ─── Phase 4: Portfolio refresh ───────────────────────────────────────────────
+
+// refreshPortfolio fetches current positions from the executor and updates the
+// portfolio tracker. This ensures risk checks and signal sizing use live data.
+func (e *Engine) refreshPortfolio(ctx context.Context) {
+	positions, err := e.executor.GetPositions(ctx)
+	if err != nil {
+		logger.Warn("get positions for portfolio refresh", "err", err)
+		return
+	}
+
+	eps := make([]portfolio.ExecPosition, 0, len(positions))
+	for _, p := range positions {
+		eps = append(eps, portfolio.ExecPosition{
+			Ticker:       p.Ticker,
+			CurrentValue: p.CurrentValue,
+			UnrealizedPL: p.UnrealizedPL,
+		})
+	}
+
+	// Compute realized P&L today from closed trades.
+	var realizedToday float64
+	closedTrades, _ := store.GetRecentTrades(ctx, 100)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	for _, t := range closedTrades {
+		if t.Status == "closed" && t.ClosedAt.After(today) {
+			realizedToday += t.PnL
+		}
+	}
+
+	// Cash = initial capital - invested. For paper trading without a real broker
+	// account, estimate from config or use a default.
+	cash := e.cfg.Engine.InitialCapital
+	for _, p := range positions {
+		cash -= p.CurrentValue - p.UnrealizedPL // subtract cost basis
+	}
+	if cash < 0 {
+		cash = 0
+	}
+
+	e.portfolio.Update(eps, cash, realizedToday)
+}
+
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
 func (e *Engine) monitorPositions(ctx context.Context) {
+	// Refresh portfolio state from executor positions.
+	e.refreshPortfolio(ctx)
+
 	trades, err := store.GetOpenTrades(ctx)
 	if err != nil {
 		logger.Warn("get open trades for monitoring", "err", err)
@@ -649,11 +696,19 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	for _, t := range trades {
-		latest, err := store.GetLatestCandle(ctx, t.Ticker, data.Timeframe1Day)
-		if err != nil || latest == nil {
+		// Try intraday candles first for more responsive SL/TP detection,
+		// then fall back to daily.
+		var currentPrice float64
+		for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe1Day} {
+			latest, err := store.GetLatestCandle(ctx, t.Ticker, tf)
+			if err == nil && latest != nil {
+				currentPrice = latest.Close
+				break
+			}
+		}
+		if currentPrice == 0 {
 			continue
 		}
-		currentPrice := latest.Close
 
 		var shouldClose bool
 		var exitReason string

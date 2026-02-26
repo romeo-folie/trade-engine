@@ -11,7 +11,7 @@ type Signal struct {
 	Ticker            string
 	Action            string // BUY | SELL
 	Strategy          string
-	SignalPrice        float64
+	SignalPrice       float64
 	StopLoss          float64
 	TakeProfit        float64
 	Confidence        float64
@@ -83,6 +83,26 @@ func GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]Signal
 	}
 	defer rows.Close()
 	return scanSignals(rows)
+}
+
+// GetSignalByID retrieves a single signal by UUID.
+func GetSignalByID(ctx context.Context, id string) (*Signal, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, ticker, action, strategy, signal_price,
+		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       confidence, COALESCE(size_pct,0), status,
+		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
+		       created_at, updated_at
+		FROM signals WHERE id=$1`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	results, err := scanSignals(rows)
+	if err != nil || len(results) == 0 {
+		return nil, err
+	}
+	return &results[0], nil
 }
 
 func scanSignals(rows interface {

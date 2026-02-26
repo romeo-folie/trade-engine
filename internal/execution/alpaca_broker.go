@@ -7,10 +7,20 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
+
+// parseFloat safely converts a numeric string from the Alpaca API.
+// Returns 0 on empty string; returns error on malformed input.
+func parseFloat(s string) (float64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	return strconv.ParseFloat(s, 64)
+}
 
 // AlpacaBroker implements Executor against the Alpaca paper (or live) trading API.
 type AlpacaBroker struct {
@@ -57,9 +67,14 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: %w", err)
 	}
 
-	var filledPrice, filledQty float64
-	fmt.Sscanf(resp.FilledAvgPx, "%f", &filledPrice)
-	fmt.Sscanf(resp.FilledQty, "%f", &filledQty)
+	filledPrice, err := parseFloat(resp.FilledAvgPx)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse filled_avg_price %q: %w", resp.FilledAvgPx, err)
+	}
+	filledQty, err := parseFloat(resp.FilledQty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse filled_qty %q: %w", resp.FilledQty, err)
+	}
 
 	return OrderResult{
 		BrokerOrderID: resp.ID,
@@ -86,9 +101,14 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: %w", err)
 	}
 
-	var filledPrice, filledQty float64
-	fmt.Sscanf(resp.FilledAvgPx, "%f", &filledPrice)
-	fmt.Sscanf(resp.FilledQty, "%f", &filledQty)
+	filledPrice, err := parseFloat(resp.FilledAvgPx)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse filled_avg_price %q: %w", resp.FilledAvgPx, err)
+	}
+	filledQty, err := parseFloat(resp.FilledQty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse filled_qty %q: %w", resp.FilledQty, err)
+	}
 
 	return OrderResult{
 		BrokerOrderID: resp.ID,
@@ -113,11 +133,22 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 
 	out := make([]Position, 0, len(resp))
 	for _, p := range resp {
-		var qty, avg, mv, upl float64
-		fmt.Sscanf(p.Qty, "%f", &qty)
-		fmt.Sscanf(p.AvgEntryPx, "%f", &avg)
-		fmt.Sscanf(p.MarketValue, "%f", &mv)
-		fmt.Sscanf(p.UnrealizedPL, "%f", &upl)
+		qty, err := parseFloat(p.Qty)
+		if err != nil {
+			return nil, fmt.Errorf("alpaca GetPositions: parse qty %q: %w", p.Qty, err)
+		}
+		avg, err := parseFloat(p.AvgEntryPx)
+		if err != nil {
+			return nil, fmt.Errorf("alpaca GetPositions: parse avg_entry_price %q: %w", p.AvgEntryPx, err)
+		}
+		mv, err := parseFloat(p.MarketValue)
+		if err != nil {
+			return nil, fmt.Errorf("alpaca GetPositions: parse market_value %q: %w", p.MarketValue, err)
+		}
+		upl, err := parseFloat(p.UnrealizedPL)
+		if err != nil {
+			return nil, fmt.Errorf("alpaca GetPositions: parse unrealized_pl %q: %w", p.UnrealizedPL, err)
+		}
 		out = append(out, Position{
 			Ticker:       p.Symbol,
 			Quantity:     qty,

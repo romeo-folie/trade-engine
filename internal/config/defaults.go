@@ -9,6 +9,7 @@ func Defaults() *Config {
 			TickIntervalSec: 300,
 			MaxWatchlist:    50,
 			DryRun:          false,
+			InitialCapital:  100000,
 		},
 		Models: ModelsConfig{
 			Primary: ModelConfig{

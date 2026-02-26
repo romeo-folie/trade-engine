@@ -24,14 +24,16 @@ func CleanupIntradayCandles(ctx context.Context) (int64, error) {
 	return n, nil
 }
 
-// CleanupPromptCache removes analysis rows where prompt_hash is older than 6 months
-// and no associated trade exists (i.e., pure analysis-only records).
-// This targets stale prompt cache that bloats the analyses table.
+// CleanupPromptCache removes analysis rows older than 6 months that have no
+// associated signal or trade (preserving the audit trail for executed trades).
 func CleanupPromptCache(ctx context.Context) (int64, error) {
 	cutoff := time.Now().AddDate(0, -6, 0)
 	tag, err := GetDB().Exec(ctx, `
-		DELETE FROM analyses
-		WHERE created_at < $1`, cutoff)
+		DELETE FROM analyses a
+		WHERE a.created_at < $1
+		  AND NOT EXISTS (
+		    SELECT 1 FROM signals s WHERE a.id = ANY(s.analysis_ids)
+		  )`, cutoff)
 	if err != nil {
 		return 0, err
 	}

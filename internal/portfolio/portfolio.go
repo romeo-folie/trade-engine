@@ -3,6 +3,7 @@ package portfolio
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -21,8 +22,9 @@ type State struct {
 	LastLossAt     time.Time
 }
 
-// Tracker manages portfolio state and persistence.
+// Tracker manages portfolio state and persistence. All methods are thread-safe.
 type Tracker struct {
+	mu               sync.RWMutex
 	state            State
 	snapshotEvery    time.Duration
 	lastSnapshot     time.Time
@@ -37,16 +39,28 @@ func NewTracker(snapshotInterval time.Duration) *Tracker {
 	return &Tracker{snapshotEvery: snapshotInterval}
 }
 
-// Update refreshes the in-memory state from the executor positions + realized P&L today.
-func (t *Tracker) Update(positions []position, cashBalance, realizedPnLDay float64) {
+// ExecPosition is the external-facing adapter type callers use to pass position
+// data without importing execution package internals.
+type ExecPosition struct {
+	Ticker       string
+	CurrentValue float64
+	UnrealizedPL float64
+}
+
+// Update refreshes the in-memory state from executor positions + realized P&L today.
+func (t *Tracker) Update(positions []ExecPosition, cashBalance, realizedPnLDay float64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	var invested, unrealizedPnL float64
 	for _, p := range positions {
 		invested += p.CurrentValue
 		unrealizedPnL += p.UnrealizedPL
 	}
 	total := cashBalance + invested
-	if total > t.state.PeakValue {
-		t.state.PeakValue = total
+	peak := t.state.PeakValue
+	if total > peak {
+		peak = total
 	}
 	t.state = State{
 		TotalValue:     total,
@@ -55,25 +69,35 @@ func (t *Tracker) Update(positions []position, cashBalance, realizedPnLDay float
 		UnrealizedPnL:  unrealizedPnL,
 		RealizedPnLDay: realizedPnLDay,
 		OpenPositions:  len(positions),
-		PeakValue:      t.state.PeakValue,
+		PeakValue:      peak,
 		LastLossAt:     t.state.LastLossAt,
 	}
 }
 
 // RecordLoss marks the timestamp of the most-recent losing trade close.
 func (t *Tracker) RecordLoss() {
+	t.mu.Lock()
 	t.state.LastLossAt = time.Now()
+	t.mu.Unlock()
 }
 
-// CurrentState returns a copy of the current portfolio state.
-func (t *Tracker) CurrentState() State { return t.state }
+// CurrentState returns a copy of the current portfolio state (safe for concurrent reads).
+func (t *Tracker) CurrentState() State {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.state
+}
 
 // MaybeSnapshot writes a snapshot if the interval has elapsed.
 func (t *Tracker) MaybeSnapshot(ctx context.Context) {
-	if time.Since(t.lastSnapshot) < t.snapshotEvery {
+	t.mu.RLock()
+	s := t.state
+	elapsed := time.Since(t.lastSnapshot)
+	t.mu.RUnlock()
+
+	if elapsed < t.snapshotEvery {
 		return
 	}
-	s := t.state
 	_, err := store.GetDB().Exec(ctx, `
 		INSERT INTO portfolio_snapshots
 		  (total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions)
@@ -84,7 +108,9 @@ func (t *Tracker) MaybeSnapshot(ctx context.Context) {
 		logger.Warn("portfolio snapshot failed", "err", err)
 		return
 	}
+	t.mu.Lock()
 	t.lastSnapshot = time.Now()
+	t.mu.Unlock()
 	logger.Debug("portfolio snapshot written", "total", s.TotalValue)
 }
 
@@ -94,10 +120,14 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	tokIn, tokOut int64,
 ) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
-	if today.Equal(t.lastDailySummary) {
+	t.mu.RLock()
+	alreadyWritten := today.Equal(t.lastDailySummary)
+	s := t.state
+	t.mu.RUnlock()
+
+	if alreadyWritten {
 		return
 	}
-	s := t.state
 	pnlPct := 0.0
 	if startingValue > 0 {
 		pnlPct = ((s.TotalValue - startingValue) / startingValue) * 100
@@ -124,35 +154,8 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 		logger.Warn("daily summary failed", "err", err)
 		return
 	}
+	t.mu.Lock()
 	t.lastDailySummary = today
+	t.mu.Unlock()
 	logger.Info("daily summary written", "date", today.Format("2006-01-02"), "pnl_pct", pnlPct)
-}
-
-// position is a local alias so this package doesn't import execution directly.
-type position struct {
-	Ticker       string
-	CurrentValue float64
-	UnrealizedPL float64
-}
-
-// FromExecutionPositions converts execution.Position slice → local position slice.
-// Call site: portfolio.FromExecutionPositions(executionPositions) before Update().
-func FromExecutionPositions(eps interface{ toLocalPositions() []position }) []position {
-	return eps.toLocalPositions()
-}
-
-// ExecPosition is an external-facing adapter type so callers don't need to import this package's internals.
-type ExecPosition struct {
-	Ticker       string
-	CurrentValue float64
-	UnrealizedPL float64
-}
-
-// ToPositions converts a slice of ExecPosition to the internal type for Update().
-func ToPositions(eps []ExecPosition) []position {
-	out := make([]position, len(eps))
-	for i, ep := range eps {
-		out[i] = position{Ticker: ep.Ticker, CurrentValue: ep.CurrentValue, UnrealizedPL: ep.UnrealizedPL}
-	}
-	return out
 }
