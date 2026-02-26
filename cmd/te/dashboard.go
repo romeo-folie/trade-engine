@@ -15,7 +15,7 @@ func runDashboard(cmd *cobra.Command, args []string) error {
 	// for now the dashboard works in standalone mode with DB polling.
 	bus := events.New()
 
-	model := tui.New(bus)
+	model := tui.New(bus, "paper")
 	p := tea.NewProgram(model, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("dashboard: %w", err)

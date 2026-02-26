@@ -9,14 +9,14 @@ import (
 )
 
 func TestNew_DefaultView(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	if m.activeView != ViewDashboard {
 		t.Errorf("expected ViewDashboard, got %d", m.activeView)
 	}
 }
 
 func TestViewSwitching_NumberKeys(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 
@@ -41,7 +41,7 @@ func TestViewSwitching_NumberKeys(t *testing.T) {
 }
 
 func TestViewSwitching_Tab(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 
@@ -57,7 +57,7 @@ func TestViewSwitching_Tab(t *testing.T) {
 }
 
 func TestEventMsgAccumulation(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 
@@ -79,7 +79,7 @@ func TestEventMsgAccumulation(t *testing.T) {
 }
 
 func TestEventMsgCap(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 
@@ -95,7 +95,7 @@ func TestEventMsgCap(t *testing.T) {
 }
 
 func TestWindowSizeMsg(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 200, Height: 50})
 	m = updated.(Model)
 	if m.width != 200 || m.height != 50 {
@@ -104,7 +104,7 @@ func TestWindowSizeMsg(t *testing.T) {
 }
 
 func TestViewRender_NoWidth(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	out := m.View()
 	if out != "loading..." {
 		t.Errorf("expected loading screen, got %q", out)
@@ -112,7 +112,7 @@ func TestViewRender_NoWidth(t *testing.T) {
 }
 
 func TestViewRender_WithSize(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 	out := m.View()
@@ -122,7 +122,7 @@ func TestViewRender_WithSize(t *testing.T) {
 }
 
 func TestPollTickMsg(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 
@@ -139,13 +139,13 @@ func TestPollTickMsg(t *testing.T) {
 }
 
 func TestCleanup_NilBus(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.cleanup() // should not panic
 }
 
 func TestCleanup_WithBus(t *testing.T) {
 	bus := events.New()
-	m := New(bus)
+	m := New(bus, "paper")
 	m.sub = bus.SubscribeAll()
 
 	before := bus.SubscriberCount()
@@ -174,7 +174,7 @@ func TestViewLabels(t *testing.T) {
 }
 
 func TestQuitKey(t *testing.T) {
-	m := New(nil)
+	m := New(nil, "paper")
 	m.width = 120
 	m.height = 40
 

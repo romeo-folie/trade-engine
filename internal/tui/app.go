@@ -4,12 +4,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/tui/views"
 )
 
 // View represents the active screen in the TUI.
@@ -74,15 +76,24 @@ type Model struct {
 	// recentEvents holds the last N events for the status line.
 	recentEvents []events.Event
 	lastPoll     time.Time
+
+	// dashData is the cached dashboard data (refreshed on poll ticks).
+	dashData views.DashboardData
+	mode     string // engine mode for dashboard header
 }
 
 const maxRecentEvents = 50
 
 // New creates a new TUI Model. The event bus may be nil (DB-only fallback).
-func New(bus *events.Bus) Model {
+// mode is the current engine mode (manual/auto/paper).
+func New(bus *events.Bus, mode string) Model {
+	if mode == "" {
+		mode = "paper"
+	}
 	return Model{
 		activeView: ViewDashboard,
 		bus:        bus,
+		mode:       mode,
 	}
 }
 
@@ -136,6 +147,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case pollTickMsg:
 		m.lastPoll = time.Time(msg)
+		m.dashData = views.FetchDashboardData(context.Background(), m.mode)
 		return m, pollTicker()
 	}
 
@@ -220,7 +232,7 @@ func (m Model) renderHeader() string {
 func (m Model) renderBody() string {
 	switch m.activeView {
 	case ViewDashboard:
-		return m.renderPlaceholder("Dashboard", "Portfolio overview, open positions, recent signals")
+		return views.RenderDashboard(m.dashData, m.width, m.height)
 	case ViewTrades:
 		return m.renderPlaceholder("Trade History", "All trades with P&L, strategy, timing")
 	case ViewWatchlist:
