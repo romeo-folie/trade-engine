@@ -67,6 +67,7 @@ type SignalRow struct {
 	Status     string
 	Reasoning  string
 	CreatedAt  time.Time
+	ExpiresAt  time.Time
 }
 
 // FetchDashboardData loads dashboard data from the database.
@@ -140,6 +141,7 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 				Confidence: s.Confidence,
 				Status:     s.Status,
 				CreatedAt:  s.CreatedAt,
+				ExpiresAt:  s.ExpiresAt,
 			})
 		}
 	}
@@ -210,7 +212,8 @@ var (
 )
 
 // RenderDashboard renders the main dashboard view.
-func RenderDashboard(d DashboardData, width, height int) string {
+// selectedPending is the index of the currently highlighted pending signal (-1 for none).
+func RenderDashboard(d DashboardData, width, height, selectedPending int) string {
 	var b strings.Builder
 
 	// Header bar
@@ -227,7 +230,7 @@ func RenderDashboard(d DashboardData, width, height int) string {
 
 	// Pending approvals (only in manual mode or when signals exist)
 	if len(d.PendingSignals) > 0 {
-		b.WriteString(renderPendingApprovals(d.PendingSignals, width))
+		b.WriteString(renderPendingApprovals(d.PendingSignals, width, selectedPending))
 		b.WriteString("\n")
 	}
 
@@ -298,18 +301,34 @@ func renderPositionsTable(positions []PositionRow, width int) string {
 	return rows.String()
 }
 
-func renderPendingApprovals(signals []SignalRow, width int) string {
+func renderPendingApprovals(signals []SignalRow, width int, selected int) string {
 	header := sectionTitle.Render(fmt.Sprintf("⏳ Pending Approvals (%d)", len(signals)))
 	var b strings.Builder
 	b.WriteString(header + "\n")
 
-	for _, s := range signals {
+	for i, s := range signals {
 		action := actionStyle(s.Action).Render(s.Action)
-		b.WriteString(fmt.Sprintf("  [%s] %s %-6s  conf:%.0f%%  %s\n",
-			dimText.Render(s.ID[:8]), action, s.Ticker, s.Confidence*100,
-			dimText.Render(s.CreatedAt.Format("15:04"))))
+		marker := " "
+		if i == selected {
+			marker = "▶"
+		}
+		id := s.ID
+		if len(id) > 8 {
+			id = id[:8]
+		}
+		expires := ""
+		if !s.ExpiresAt.IsZero() {
+			left := time.Until(s.ExpiresAt).Round(time.Second)
+			if left < 0 {
+				left = 0
+			}
+			expires = "  exp:" + left.String()
+		}
+		b.WriteString(fmt.Sprintf(" %s[%s] %s %-6s  conf:%.0f%%  %s%s\n",
+			marker, dimText.Render(id), action, s.Ticker, s.Confidence*100,
+			dimText.Render(s.CreatedAt.Format("15:04")), dimText.Render(expires)))
 	}
-	b.WriteString(dimText.Render("  [a]pprove  [r]eject  [d]etails") + "\n")
+	b.WriteString(dimText.Render("  [a]pprove  [r]eject  [d]etails  [j/k] select") + "\n")
 
 	return b.String()
 }

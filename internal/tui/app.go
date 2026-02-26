@@ -11,6 +11,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tui/views"
 )
 
@@ -82,8 +83,19 @@ type Model struct {
 	mode     string // engine mode for dashboard header
 
 	// Position detail overlay
-	showDetail    bool
-	selectedPos   int // index into dashData.Positions
+	showDetail  bool
+	selectedPos int // index into dashData.Positions
+
+	// Pending signal navigation
+	selectedPending int
+
+	// Signal approval callback (set by caller if engine is available)
+	OnApprove func(ctx context.Context, signalID string) error
+	OnReject  func(ctx context.Context, signalID string) error
+
+	// Status message (briefly shown after actions)
+	statusMsg     string
+	statusMsgTime time.Time
 }
 
 const maxRecentEvents = 50
@@ -143,6 +155,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showDetail {
 				return m, nil
 			}
+			if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 {
+				m.selectedPending = (m.selectedPending + 1) % len(m.dashData.PendingSignals)
+				return m, nil
+			}
 			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
 				m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
 				return m, nil
@@ -151,8 +167,64 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showDetail {
 				return m, nil
 			}
+			if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 {
+				m.selectedPending = (m.selectedPending - 1 + len(m.dashData.PendingSignals)) % len(m.dashData.PendingSignals)
+				return m, nil
+			}
 			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
 				m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
+				return m, nil
+			}
+		case "a":
+			// Approve pending signal
+			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+				idx := m.selectedPending % len(m.dashData.PendingSignals)
+				sig := m.dashData.PendingSignals[idx]
+				if m.OnApprove != nil {
+					if err := m.OnApprove(context.Background(), sig.ID); err != nil {
+						m.statusMsg = fmt.Sprintf("Approve failed: %s", err)
+					} else {
+						m.statusMsg = fmt.Sprintf("✓ Approved %s %s", sig.Action, sig.Ticker)
+					}
+				} else {
+					// Fallback: update store directly
+					if err := store.UpdateSignalStatus(context.Background(), sig.ID, "approved", ""); err != nil {
+						m.statusMsg = fmt.Sprintf("Approve failed: %s", err)
+					} else {
+						m.statusMsg = fmt.Sprintf("✓ Approved %s %s (execution requires running engine)", sig.Action, sig.Ticker)
+					}
+				}
+				m.statusMsgTime = time.Now()
+				return m, nil
+			}
+		case "r":
+			// Reject pending signal
+			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+				idx := m.selectedPending % len(m.dashData.PendingSignals)
+				sig := m.dashData.PendingSignals[idx]
+				if m.OnReject != nil {
+					if err := m.OnReject(context.Background(), sig.ID); err != nil {
+						m.statusMsg = fmt.Sprintf("Reject failed: %s", err)
+					} else {
+						m.statusMsg = fmt.Sprintf("✗ Rejected %s %s", sig.Action, sig.Ticker)
+					}
+				} else {
+					if err := store.UpdateSignalStatus(context.Background(), sig.ID, "rejected", "manually rejected via TUI"); err != nil {
+						m.statusMsg = fmt.Sprintf("Reject failed: %s", err)
+					} else {
+						m.statusMsg = fmt.Sprintf("✗ Rejected %s %s", sig.Action, sig.Ticker)
+					}
+				}
+				m.statusMsgTime = time.Now()
+				if m.selectedPending > 0 {
+					m.selectedPending--
+				}
+				return m, nil
+			}
+		case "d":
+			// Show detail for pending signal — handled like position detail
+			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+				m.showDetail = true
 				return m, nil
 			}
 		case "tab":
@@ -277,7 +349,7 @@ func (m Model) renderBody() string {
 
 	switch m.activeView {
 	case ViewDashboard:
-		return views.RenderDashboard(m.dashData, m.width, m.height)
+		return views.RenderDashboard(m.dashData, m.width, m.height, m.selectedPending)
 	case ViewTrades:
 		return m.renderPlaceholder("Trade History", "All trades with P&L, strategy, timing")
 	case ViewWatchlist:
@@ -316,6 +388,13 @@ func (m Model) renderPlaceholder(title, desc string) string {
 
 func (m Model) renderStatusBar() string {
 	left := " [1-5] switch view  [tab] next  [q] quit"
+	if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 && !m.showDetail {
+		left = " [a]pprove [r]eject [d]etail  [j/k] nav  [enter] position  [q] quit"
+	}
+	// Show status message for 5 seconds
+	if m.statusMsg != "" && time.Since(m.statusMsgTime) < 5*time.Second {
+		left = " " + m.statusMsg
+	}
 
 	lastEvent := "no events"
 	if len(m.recentEvents) > 0 {
