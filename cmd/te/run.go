@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
@@ -96,7 +97,12 @@ Modes:
 			logger.Warn("news API key not set — news fetching disabled")
 		}
 
-		eng := engine.New(cfg, marketProvider, newsProvider, mode)
+		// Wire Alpaca broker if API key is set; otherwise PaperExecutor is used as fallback.
+		var broker execution.Executor
+		if cfg.Markets.Stocks.APIKey != "" {
+			broker = execution.NewAlpacaBroker(cfg.Markets.Stocks)
+		}
+		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
 
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())

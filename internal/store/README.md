@@ -12,6 +12,10 @@ All PostgreSQL interactions. Each file owns one table or a related group of tabl
 | `watchlist.go` | `watchlist` | Watchlist CRUD |
 | `news.go` | `news_items` | News article storage and retrieval |
 | `analyses.go` | `analyses` | LLM analysis persistence and retrieval |
+| `signals.go` | `signals` | Signal CRUD (pending/blocked/executed/expired/stale) |
+| `trades.go` | `trades` | Trade lifecycle CRUD (open/closed) |
+| `orders.go` | `orders` | Broker order records linked to trades |
+| `retention.go` | `candles`, `analyses` | Data retention cleanup (intraday candles, prompt cache) |
 
 ## Architecture
 
@@ -54,6 +58,27 @@ The pool is a package-level singleton initialized by `Connect(ctx)`. All other f
 **Overrides (`overrides.go`)**
 - All engine settings (mode, tick interval, etc.) can be overridden at runtime via `te config set --runtime`
 - Overrides are read on each tick and on `te status`
+
+**Signals (`signals.go`)**
+- `InsertSignal` returns the UUID of the created signal
+- `UpdateSignalStatus` sets status + optional block reason, updates `updated_at`
+- `GetPendingSignals` returns signals with status `pending` or `approved`
+
+**Trades (`trades.go`)**
+- `InsertTrade` creates an open trade linked to a signal (via `signal_id`)
+- `CloseTrade` sets exit price, P&L, status=closed, and `closed_at`
+- `GetOpenTrades` returns all trades with status=open (used by position monitor)
+- `GetRecentTrades` returns most-recent trades regardless of status (CLI display)
+
+**Orders (`orders.go`)**
+- `InsertOrder` records an entry or exit order with broker linkage
+- `UpdateOrderFill` updates filled price/qty/status after broker confirmation
+- `GetOrdersByTrade` returns all orders linked to a trade (for `te trades show`)
+
+**Retention (`retention.go`)**
+- `CleanupIntradayCandles` deletes 1m/5m/15m candles older than 90 days
+- `CleanupPromptCache` deletes analysis records older than 6 months
+- Both return the number of rows deleted for logging
 
 ## Error Handling
 

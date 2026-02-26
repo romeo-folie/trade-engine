@@ -38,23 +38,13 @@ var _ = func() bool {
 }()
 
 // ── Trades & signals ──────────────────────────────────────────────────────────
+// Implemented in trades.go (Phase 4). tradesCmd is defined here; subcommands are
+// registered by trades.go init().
 
 var tradesCmd = &cobra.Command{
 	Use:   "trades",
 	Short: "View and manage trades and signals",
 }
-
-var _ = func() bool {
-	tradesCmd.AddCommand(
-		&cobra.Command{Use: "list", Short: "List trades", RunE: stub("te trades list")},
-		&cobra.Command{Use: "show <id>", Short: "Show trade details", RunE: stub("te trades show")},
-		&cobra.Command{Use: "close <id>", Short: "Manually close a trade", RunE: stub("te trades close")},
-		&cobra.Command{Use: "signals", Short: "List pending signals", RunE: stub("te trades signals")},
-		&cobra.Command{Use: "approve <signal-id>", Short: "Approve a pending signal", RunE: stub("te trades approve")},
-		&cobra.Command{Use: "reject <signal-id>", Short: "Reject a pending signal", RunE: stub("te trades reject")},
-	)
-	return true
-}()
 
 // ── Backtesting ───────────────────────────────────────────────────────────────
 
