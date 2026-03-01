@@ -457,9 +457,14 @@ func buildRequest(opts RunOptions, window []data.Candle) (analysis.AnalysisReque
 	}, nil
 }
 
-// query checks the prompt cache (unless NoCache) and calls the analyzer on miss.
+// query checks the prompt cache (unless noCache) and calls the analyzer on miss.
+// Cache hits that fail to unmarshal are treated as misses — the live call heals
+// the entry on the next Put.
 func (r *Runner) query(ctx context.Context, req analysis.AnalysisRequest, provider, model string, noCache bool) (analysis.AnalysisResponse, error) {
-	hash := RequestHash(req)
+	hash, err := RequestHash(req)
+	if err != nil {
+		return analysis.AnalysisResponse{}, err
+	}
 
 	if !noCache {
 		entry, hit, err := r.cache.Get(ctx, hash, provider, model)
@@ -467,31 +472,30 @@ func (r *Runner) query(ctx context.Context, req analysis.AnalysisRequest, provid
 			return analysis.AnalysisResponse{}, err
 		}
 		if hit {
-			var resp analysis.AnalysisResponse
-			if err := json.Unmarshal([]byte(entry.Response), &resp); err != nil {
-				// Corrupt cache entry — fall through to live call.
-				goto live
+			var cached analysis.AnalysisResponse
+			if json.Unmarshal([]byte(entry.Response), &cached) == nil {
+				return cached, nil
 			}
-			return resp, nil
+			// Corrupt cache entry — fall through to live call.
 		}
 	}
 
-live:
 	resp, meta, err := r.analyzer.Analyze(ctx, req)
 	if err != nil {
 		return analysis.AnalysisResponse{}, err
 	}
 
 	if !noCache {
-		raw, _ := json.Marshal(resp)
-		_ = r.cache.Put(ctx, PromptCacheEntry{
-			PromptHash:   hash,
-			Provider:     meta.Provider,
-			Model:        meta.Model,
-			Response:     string(raw),
-			InputTokens:  meta.InputTokens,
-			OutputTokens: meta.OutputTokens,
-		})
+		if raw, err := json.Marshal(resp); err == nil {
+			_ = r.cache.Put(ctx, PromptCacheEntry{
+				PromptHash:   hash,
+				Provider:     meta.Provider,
+				Model:        meta.Model,
+				Response:     string(raw),
+				InputTokens:  meta.InputTokens,
+				OutputTokens: meta.OutputTokens,
+			})
+		}
 	}
 	return resp, nil
 }

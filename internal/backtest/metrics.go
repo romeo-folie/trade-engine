@@ -141,8 +141,11 @@ func maxDrawdown(trades []SimulatedTrade, startCash float64) float64 {
 	return maxDD
 }
 
-// dailyReturns builds a slice of daily portfolio returns (as fractions, not %).
-// Trades are bucketed by exit date; days with no exits carry 0 return.
+// dailyReturns builds a slice of trading-day portfolio returns (as fractions, not %).
+// Only Monday–Friday are included; weekends are skipped so the resulting slice
+// has ~252 observations per year — matching the √252 annualisation factor used
+// in Sharpe and Sortino. Including weekends (~365/yr) would systematically
+// dilute mean daily return by ~31% and distort the volatility denominator.
 func dailyReturns(trades []SimulatedTrade, startCash float64, from, to time.Time) []float64 {
 	// Build a map of date → cumulative P&L on that day.
 	pnlByDay := make(map[string]float64)
@@ -154,6 +157,11 @@ func dailyReturns(trades []SimulatedTrade, startCash float64, from, to time.Time
 	var returns []float64
 	equity := startCash
 	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+		// Skip weekends — stock markets are closed; including them would add
+		// zero-return days that dilute Sharpe/Sortino vs the √252 convention.
+		if wd := d.Weekday(); wd == time.Saturday || wd == time.Sunday {
+			continue
+		}
 		key := d.Format("2006-01-02")
 		if equity == 0 {
 			returns = append(returns, 0)

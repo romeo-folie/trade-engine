@@ -39,10 +39,16 @@ func NewPromptCache() *PromptCache {
 // RequestHash computes a deterministic SHA-256 digest of an AnalysisRequest.
 // The hash is computed from the JSON-serialised request, so any change to
 // the ticker, strategy, candles, indicators, or news produces a distinct key.
-func RequestHash(req analysis.AnalysisRequest) string {
-	data, _ := json.Marshal(req)
+// Returns an error if the request cannot be serialised (should never happen for
+// well-formed requests, but callers must not silently swallow the failure, as a
+// zero-length hash would produce spurious cache collisions).
+func RequestHash(req analysis.AnalysisRequest) (string, error) {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("request hash: marshal failed: %w", err)
+	}
 	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // Get looks up a cached response by (hash, provider, model).

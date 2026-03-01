@@ -56,28 +56,26 @@ type BacktestTrade struct {
 	CreatedAt     time.Time
 }
 
-// ── Label sequencing ──────────────────────────────────────────────────────────
-
-// NextBacktestLabel returns the next sequential BT-NNNNN label.
-func NextBacktestLabel(ctx context.Context) (string, error) {
-	var count int
-	err := GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM backtest_runs`).Scan(&count)
-	if err != nil {
-		return "", fmt.Errorf("count backtest runs: %w", err)
-	}
-	return fmt.Sprintf("BT-%05d", count+1), nil
-}
-
 // ── Insert ────────────────────────────────────────────────────────────────────
 
 // InsertRun persists a completed backtest run and returns its assigned label.
+//
+// The BT-NNNNN label is generated atomically inside the INSERT using a CTE that
+// reads MAX(label) and increments it, eliminating the COUNT→INSERT race that
+// exists when label generation and insertion are separate statements.
 func InsertRun(ctx context.Context, r BacktestRun) (string, error) {
-	label, err := NextBacktestLabel(ctx)
-	if err != nil {
-		return "", err
-	}
-
-	_, err = GetDB().Exec(ctx, `
+	var label string
+	err := GetDB().QueryRow(ctx, `
+		WITH next_label AS (
+			SELECT 'BT-' || LPAD(
+				(COALESCE(
+					MAX(SUBSTRING(label FROM 4)::INTEGER),
+					0
+				) + 1)::TEXT,
+				5, '0'
+			) AS label
+			FROM backtest_runs
+		)
 		INSERT INTO backtest_runs (
 			label, ticker, strategy, model_provider, model_name,
 			from_date, to_date, config_snapshot,
@@ -86,19 +84,21 @@ func InsertRun(ctx context.Context, r BacktestRun) (string, error) {
 			max_drawdown_pct, win_rate_pct, profit_factor,
 			expectancy, total_trades, avg_hold_hours,
 			best_trade_pct, worst_trade_pct, cache_hit_rate
-		) VALUES (
-			$1,$2,$3,$4,$5,$6,$7,$8,
-			$9,$10,$11,$12,$13,$14,$15,$16,
-			$17,$18,$19,$20,$21,$22
-		)`,
-		label, r.Ticker, r.Strategy, r.ModelProvider, r.ModelName,
+		)
+		SELECT
+			next_label.label, $1,$2,$3,$4,$5,$6,$7,
+			$8,$9,$10,$11,$12,$13,$14,$15,
+			$16,$17,$18,$19,$20,$21
+		FROM next_label
+		RETURNING label`,
+		r.Ticker, r.Strategy, r.ModelProvider, r.ModelName,
 		r.FromDate.UTC(), r.ToDate.UTC(), r.ConfigSnapshot,
 		r.TotalReturnPct, r.AnnualizedReturnPct,
 		r.SharpeRatio, r.SortinoRatio, r.CalmarRatio,
 		r.MaxDrawdownPct, r.WinRatePct, r.ProfitFactor,
 		r.Expectancy, r.TotalTrades, r.AvgHoldHours,
 		r.BestTradePct, r.WorstTradePct, r.CacheHitRate,
-	)
+	).Scan(&label)
 	if err != nil {
 		return "", fmt.Errorf("insert backtest run: %w", err)
 	}

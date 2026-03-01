@@ -135,6 +135,20 @@ func TestComputeMixed(t *testing.T) {
 	}
 }
 
+// TestDailyReturnsSkipsWeekends verifies that the dailyReturns helper only
+// produces observations for trading days (Mon–Fri). Including weekends would
+// inflate the sample count by ~31%, diluting mean returns and distorting
+// Sharpe/Sortino vs the industry-standard √252 annualisation factor.
+func TestDailyReturnsSkipsWeekends(t *testing.T) {
+	// 2024-01-01 (Mon) to 2024-01-07 (Sun) = 7 calendar days, 5 trading days.
+	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2024, 1, 7, 0, 0, 0, 0, time.UTC)
+	returns := dailyReturns(nil, 100000, from, to)
+	if len(returns) != 5 {
+		t.Errorf("expected 5 trading-day observations, got %d (weekends not skipped?)", len(returns))
+	}
+}
+
 func TestComputeOpenTradesIgnored(t *testing.T) {
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, 6, 30, 0, 0, 0, 0, time.UTC)
