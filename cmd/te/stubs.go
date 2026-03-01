@@ -46,23 +46,6 @@ var tradesCmd = &cobra.Command{
 	Short: "View and manage trades and signals",
 }
 
-// ── Backtesting ───────────────────────────────────────────────────────────────
-
-var backtestCmd = &cobra.Command{
-	Use:   "backtest",
-	Short: "Run and manage backtests",
-}
-
-var _ = func() bool {
-	backtestCmd.AddCommand(
-		&cobra.Command{Use: "run", Short: "Run a new backtest", RunE: stub("te backtest run")},
-		&cobra.Command{Use: "list", Short: "List backtest runs", RunE: stub("te backtest list")},
-		&cobra.Command{Use: "show <label>", Short: "Show backtest results", RunE: stub("te backtest show")},
-		&cobra.Command{Use: "compare <label1> <label2>", Short: "Compare two backtest runs", RunE: stub("te backtest compare")},
-	)
-	return true
-}()
-
 // ── Reports ───────────────────────────────────────────────────────────────────
 
 var reportCmd = &cobra.Command{

@@ -66,7 +66,11 @@ func DeleteOverride(ctx context.Context, key string) error {
 	return err
 }
 
-// isNoRows checks if the error is pgx's no-rows sentinel.
-func isNoRows(err error) bool {
+// isNoRows checks if the error is pgx's no-rows sentinel (unexported convenience).
+func isNoRows(err error) bool { return IsNoRows(err) }
+
+// IsNoRows reports whether err is the pgx "no rows in result set" sentinel.
+// Exported for use by packages that query the store directly.
+func IsNoRows(err error) bool {
 	return err != nil && err.Error() == "no rows in result set"
 }
