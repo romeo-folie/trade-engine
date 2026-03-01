@@ -46,22 +46,6 @@ var tradesCmd = &cobra.Command{
 	Short: "View and manage trades and signals",
 }
 
-// ── Reports ───────────────────────────────────────────────────────────────────
-
-var reportCmd = &cobra.Command{
-	Use:   "report",
-	Short: "Generate performance reports",
-}
-
-var _ = func() bool {
-	reportCmd.AddCommand(
-		&cobra.Command{Use: "daily", Short: "Generate daily summary report", RunE: stub("te report daily")},
-		&cobra.Command{Use: "portfolio", Short: "Generate portfolio report", RunE: stub("te report portfolio")},
-		&cobra.Command{Use: "strategy", Short: "Generate per-strategy report", RunE: stub("te report strategy")},
-	)
-	return true
-}()
-
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 var dashboardCmd = &cobra.Command{
