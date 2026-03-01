@@ -55,12 +55,19 @@ func (c *AnthropicClient) IsAvailable() bool    { return c.apiKey != "" }
 // Analyze sends a structured market analysis request to Claude and returns
 // a parsed AnalysisResponse.
 func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
-	systemPrompt, userMessage := prompts.BuildStockPrompt(req.Ticker, req.Strategy, req.Timeframe,
-		toPromptCandles(req.RecentCandles),
-		toPromptIndicators(req.Indicators),
-		toPromptNews(req.News),
-		toPromptPortfolio(req.Portfolio),
-	)
+	var systemPrompt, userMessage string
+	if req.CustomSystemPrompt != "" || req.CustomUserMessage != "" {
+		// Prediction market (or other custom) analysis — use pre-built prompts directly.
+		systemPrompt = req.CustomSystemPrompt
+		userMessage = req.CustomUserMessage
+	} else {
+		systemPrompt, userMessage = prompts.BuildStockPrompt(req.Ticker, req.Strategy, req.Timeframe,
+			toPromptCandles(req.RecentCandles),
+			toPromptIndicators(req.Indicators),
+			toPromptNews(req.News),
+			toPromptPortfolio(req.Portfolio),
+		)
+	}
 
 	rawPrompt := systemPrompt + "\n\n---\n\n" + userMessage
 	promptHash := hashPrompt(rawPrompt)
