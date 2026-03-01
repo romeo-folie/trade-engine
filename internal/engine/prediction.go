@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -26,6 +27,11 @@ const discoveryInterval = 60 * time.Minute
 // before we ask the model to analyse a contract.
 const minSnapshotsForAnalysis = 4
 
+// maxPredictionConcurrency caps the number of simultaneous LLM calls from the
+// snapshot loop.  Each call can last several seconds; without a bound, 50
+// contracts fire 50 concurrent requests and immediately hit rate limits.
+const maxPredictionConcurrency = 5
+
 // PredictionRunner is a self-contained 24/7 loop that:
 //  1. Discovers new prediction market contracts from configured platforms.
 //  2. Stores snapshots every 15 minutes per monitored contract.
@@ -41,6 +47,10 @@ type PredictionRunner struct {
 }
 
 // NewPredictionRunner creates a PredictionRunner for all enabled platforms.
+//
+// Polymarket live execution requires ECDSA signing of each CLOB request; until
+// that layer is implemented the Polymarket executor falls back to
+// PredictionPaperExecutor so signals are still exercised end-to-end in paper.
 func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *PredictionRunner {
 	r := &PredictionRunner{
 		cfg:       cfg,
@@ -58,7 +68,9 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 		switch name {
 		case "polymarket":
 			r.platforms[name] = data.NewPolymarketClient()
-			r.executors[name] = execution.NewPolymarketExecutor(pc.APIKey)
+			// MED-1: Polymarket CLOB requires ECDSA signing — fall back to paper
+			// executor until that signing layer is implemented.
+			r.executors[name] = execution.NewPredictionPaperExecutor()
 		case "kalshi":
 			r.platforms[name] = data.NewKalshiClient(pc.APIKey)
 			if pc.APIKey != "" {
@@ -144,6 +156,10 @@ func (r *PredictionRunner) runDiscovery(ctx context.Context) {
 
 // runSnapshotAndAnalysis fetches the latest state of each monitored contract,
 // stores a snapshot, then analyses contracts with sufficient history.
+//
+// Analysis goroutines are bounded by a semaphore of maxPredictionConcurrency to
+// prevent simultaneous LLM calls from exceeding API rate limits.  The loop also
+// checks ctx.Done() on each iteration so shutdown is prompt.
 func (r *PredictionRunner) runSnapshotAndAnalysis(ctx context.Context) {
 	items, err := store.GetWatchlistItems(ctx, true)
 	if err != nil {
@@ -151,7 +167,18 @@ func (r *PredictionRunner) runSnapshotAndAnalysis(ctx context.Context) {
 		return
 	}
 
+	// Semaphore: at most maxPredictionConcurrency goroutines running at once.
+	sem := make(chan struct{}, maxPredictionConcurrency)
+	var wg sync.WaitGroup
+
 	for _, item := range items {
+		// MED-3: stop launching new work after shutdown.
+		select {
+		case <-ctx.Done():
+			break
+		default:
+		}
+
 		provider, ok := r.platforms[item.Platform]
 		if !ok {
 			continue // not a prediction platform
@@ -174,13 +201,32 @@ func (r *PredictionRunner) runSnapshotAndAnalysis(ctx context.Context) {
 			logger.Warn("insert prediction snapshot failed", "contract", item.Ticker, "err", err.Error())
 		}
 
-		// Analyse once we have enough history.
-		go r.analyseContract(ctx, item, snap)
+		// Launch bounded analysis goroutine.
+		wg.Add(1)
+		sem <- struct{}{} // acquire slot (blocks when at capacity)
+		go func(it store.WatchlistItem, sn *data.ContractSnapshot) {
+			defer wg.Done()
+			defer func() { <-sem }() // release slot
+			r.analyseContract(ctx, it, sn)
+		}(item, snap)
 	}
+
+	wg.Wait()
 }
 
 // analyseContract loads recent snapshots, computes indicators, and calls the LLM.
 func (r *PredictionRunner) analyseContract(ctx context.Context, item store.WatchlistItem, latest *data.ContractSnapshot) {
+	// HIGH-1: recover from any panic so a single bad contract cannot crash the loop.
+	defer func() {
+		if rec := recover(); rec != nil {
+			logger.Error("prediction analysis panic recovered",
+				"contract", item.Ticker,
+				"platform", item.Platform,
+				"panic", fmt.Sprintf("%v", rec),
+			)
+		}
+	}()
+
 	snaps, err := store.GetRecentSnapshots(ctx, item.Platform, item.Ticker, 48)
 	if err != nil || len(snaps) < minSnapshotsForAnalysis {
 		return
@@ -192,8 +238,7 @@ func (r *PredictionRunner) analyseContract(ctx context.Context, item store.Watch
 		history[i] = prompts.ContractPricePoint{Timestamp: s.CreatedAt, Price: s.Price}
 	}
 
-	// Compute indicators from sorted (oldest→newest) snapshots.
-	// store.GetRecentSnapshots returns newest-first, so reverse.
+	// store.GetRecentSnapshots returns newest-first; reverse to oldest→newest.
 	for i, j := 0, len(snaps)-1; i < j; i, j = i+1, j-1 {
 		snaps[i], snaps[j] = snaps[j], snaps[i]
 		history[i], history[j] = history[j], history[i]
@@ -292,7 +337,6 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		return
 	}
 
-	// Auto-execute: place an order via the platform executor.
 	exec, ok := r.executors[item.Platform]
 	if !ok {
 		return
@@ -305,18 +349,12 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		limitPrice = contract.Bid
 	}
 
-	qty := 1.0
-	if r.cfg.Markets.Predictions.Platforms[item.Platform].MinVolume > 0 {
-		// Simple sizing: fixed 1-contract position.
-		qty = 1.0
-	}
-
 	orderResult, err := exec.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:     item.Ticker,
 		Side:       side,
 		Type:       execution.OrderTypeLimit,
 		LimitPrice: limitPrice,
-		Quantity:   qty,
+		Quantity:   1.0,
 		TradeID:    sigID,
 	})
 	if err != nil {

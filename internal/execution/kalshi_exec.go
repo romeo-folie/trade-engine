@@ -90,7 +90,11 @@ func (k *KalshiExecutor) CancelOrder(ctx context.Context, brokerOrderID string) 
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("kalshi CancelOrder HTTP %d: %s", resp.StatusCode, truncateStr(string(body), 200))
+		errBody := string(body)
+		if len(errBody) > 200 {
+			errBody = errBody[:200] + "…"
+		}
+		return fmt.Errorf("kalshi CancelOrder HTTP %d: %s", resp.StatusCode, errBody)
 	}
 	return nil
 }
@@ -200,16 +204,13 @@ func (k *KalshiExecutor) post(ctx context.Context, endpoint string, body interfa
 		return err
 	}
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncateStr(string(respBody), 200))
+		errBody := string(respBody)
+		if len(errBody) > 200 {
+			errBody = errBody[:200] + "…"
+		}
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, errBody)
 	}
 	return json.Unmarshal(respBody, out)
-}
-
-func truncateStr(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "…"
 }
 
 // ── Kalshi API types ──────────────────────────────────────────────────────────

@@ -35,13 +35,18 @@ func NewPredictionPaperExecutor() *PredictionPaperExecutor {
 // PlaceOrder simulates immediate fill at the provided limit price (or 0.5
 // as a fallback for market orders).
 func (p *PredictionPaperExecutor) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, error) {
-	p.nextID++
-	id := fmt.Sprintf("PRED-PAPER-%06d", p.nextID)
-
 	fillPrice := req.LimitPrice
 	if fillPrice <= 0 || req.Type == OrderTypeMarket {
 		fillPrice = 0.50 // neutral assumption for market orders
 	}
+
+	// nextID++ is inside the lock to prevent a data race when PlaceOrder is
+	// called concurrently from analysis goroutines.
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.nextID++
+	id := fmt.Sprintf("PRED-PAPER-%06d", p.nextID)
 
 	result := OrderResult{
 		BrokerOrderID: id,
@@ -50,8 +55,6 @@ func (p *PredictionPaperExecutor) PlaceOrder(_ context.Context, req OrderRequest
 		FilledQty:     req.Quantity,
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	p.orders[id] = result
 
 	// Update paper position.

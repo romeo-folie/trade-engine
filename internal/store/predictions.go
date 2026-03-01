@@ -63,7 +63,7 @@ func GetRecentSnapshots(ctx context.Context, platform, contractID string, limit 
 		       price, COALESCE(yes_price,0), COALESCE(no_price,0),
 		       COALESCE(volume_24h,0), COALESCE(open_interest,0),
 		       COALESCE(bid,0), COALESCE(ask,0),
-		       COALESCE(resolution_deadline, NOW()), resolved,
+		       COALESCE(resolution_deadline, '2099-01-01 00:00:00+00'::timestamptz), resolved,
 		       resolution_value, COALESCE(categories, '{}'), created_at
 		FROM prediction_snapshots
 		WHERE platform = $1 AND contract_id = $2
@@ -99,7 +99,7 @@ func GetSnapshotsSince(ctx context.Context, platform, contractID string, since t
 		       price, COALESCE(yes_price,0), COALESCE(no_price,0),
 		       COALESCE(volume_24h,0), COALESCE(open_interest,0),
 		       COALESCE(bid,0), COALESCE(ask,0),
-		       COALESCE(resolution_deadline, NOW()), resolved,
+		       COALESCE(resolution_deadline, '2099-01-01 00:00:00+00'::timestamptz), resolved,
 		       resolution_value, COALESCE(categories, '{}'), created_at
 		FROM prediction_snapshots
 		WHERE platform = $1 AND contract_id = $2 AND created_at > $3
