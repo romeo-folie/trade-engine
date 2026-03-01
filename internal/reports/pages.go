@@ -1,6 +1,7 @@
 package reports
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -196,7 +197,7 @@ func BuildBacktestPage(d BacktestData) (bodyPrefix string, page *components.Page
 	sb.WriteString(`<div class="section-title">Charts</div>`)
 
 	p := AssemblePage("Backtest — " + d.Run.Label)
-	initialCash := 100_000.0 // default; real config not available here
+	initialCash := initialCashFromSnapshot(d.Run.ConfigSnapshot)
 	pts := BuildBacktestEquityCurve(d.Trades, initialCash)
 	if len(pts) > 1 {
 		p.AddCharts(
@@ -234,8 +235,8 @@ func BuildBacktestComparePage(a, b BacktestData) (bodyPrefix string, page *compo
 	sb.WriteString(`<div class="section-title">Equity Curves</div>`)
 
 	// Overlaid equity curves.
-	ptsA := BuildBacktestEquityCurve(a.Trades, 100_000)
-	ptsB := BuildBacktestEquityCurve(b.Trades, 100_000)
+	ptsA := BuildBacktestEquityCurve(a.Trades, initialCashFromSnapshot(a.Run.ConfigSnapshot))
+	ptsB := BuildBacktestEquityCurve(b.Trades, initialCashFromSnapshot(b.Run.ConfigSnapshot))
 
 	p := AssemblePage(fmt.Sprintf("Compare %s vs %s", a.Run.Label, b.Run.Label))
 	if len(ptsA) > 1 || len(ptsB) > 1 {
@@ -248,6 +249,25 @@ func BuildBacktestComparePage(a, b BacktestData) (bodyPrefix string, page *compo
 		p.AddCharts(TradeScatterFromBacktest(b.Run.Label+" Trades", b.Trades))
 	}
 	return sb.String(), p, nil
+}
+
+// ── Config snapshot helpers ───────────────────────────────────────────────────
+
+// initialCashFromSnapshot extracts backtest.initial_cash from the JSON config
+// snapshot stored in BacktestRun. Falls back to 100 000 on missing/invalid data.
+func initialCashFromSnapshot(snapshot json.RawMessage) float64 {
+	if len(snapshot) == 0 {
+		return 100_000
+	}
+	var cfg struct {
+		Backtest struct {
+			InitialCash float64 `json:"initial_cash"`
+		} `json:"backtest"`
+	}
+	if err := json.Unmarshal(snapshot, &cfg); err != nil || cfg.Backtest.InitialCash <= 0 {
+		return 100_000
+	}
+	return cfg.Backtest.InitialCash
 }
 
 // ── Data helpers ──────────────────────────────────────────────────────────────

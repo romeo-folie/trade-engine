@@ -3,7 +3,9 @@ package reports
 import (
 	"bytes"
 	"fmt"
+	"html"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/go-echarts/go-echarts/v2/charts"
@@ -396,11 +398,15 @@ type MetricRow struct {
 }
 
 // RenderMetricsTable returns an HTML table for the given metric rows.
+// Metric names and values are HTML-escaped to prevent injection.
 func RenderMetricsTable(title string, rows []MetricRow) string {
 	var buf bytes.Buffer
-	fmt.Fprintf(&buf, `<div class="metrics-block"><h3>%s</h3><table class="metrics-table">`, title)
+	fmt.Fprintf(&buf, `<div class="metrics-block"><h3>%s</h3><table class="metrics-table">`,
+		html.EscapeString(title))
 	for _, r := range rows {
-		fmt.Fprintf(&buf, `<tr><td class="metric-name">%s</td><td class="metric-value">%s</td></tr>`, r.Name, r.Value)
+		fmt.Fprintf(&buf,
+			`<tr><td class="metric-name">%s</td><td class="metric-value">%s</td></tr>`,
+			html.EscapeString(r.Name), html.EscapeString(r.Value))
 	}
 	buf.WriteString("</table></div>")
 	return buf.String()
@@ -453,7 +459,14 @@ func BuildBacktestEquityCurve(trades []store.BacktestTrade, initialCash float64)
 
 // OverlayEquityCurve builds a single line chart with two equity-curve series
 // overlaid for side-by-side backtest comparison.
+//
+// Alignment guarantee: both series share a single unified date axis (union of
+// all trade-exit dates from A and B, sorted chronologically). Each series uses
+// carry-forward for dates where it has no trade exit (last known value held),
+// and nil gaps before its first data point or after its last.
 func OverlayEquityCurve(labelA, labelB string, ptsA, ptsB []BacktestPoint) *charts.Line {
+	xLabels, yDataA, yDataB := unifiedEquityAxis(ptsA, ptsB)
+
 	line := charts.NewLine()
 	line.SetGlobalOptions(
 		charts.WithInitializationOpts(darkInit("100%", "360px")),
@@ -471,10 +484,9 @@ func OverlayEquityCurve(labelA, labelB string, ptsA, ptsB []BacktestPoint) *char
 			AxisLine:  &opts.AxisLine{LineStyle: &opts.LineStyle{Color: gridColor}},
 		}),
 		charts.WithYAxisOpts(opts.YAxis{
-			Name:          "Portfolio Value ($)",
-
-			AxisLabel:     &opts.AxisLabel{Color: textColor, Formatter: "${value}"},
-			SplitLine:     &opts.SplitLine{LineStyle: &opts.LineStyle{Color: gridColor}},
+			Name:      "Portfolio Value ($)",
+			AxisLabel: &opts.AxisLabel{Color: textColor, Formatter: "${value}"},
+			SplitLine: &opts.SplitLine{LineStyle: &opts.LineStyle{Color: gridColor}},
 		}),
 		charts.WithLegendOpts(opts.Legend{
 			Show:      opts.Bool(true),
@@ -482,37 +494,101 @@ func OverlayEquityCurve(labelA, labelB string, ptsA, ptsB []BacktestPoint) *char
 		}),
 	)
 
-	if len(ptsA) > 0 {
-		xData := make([]string, len(ptsA))
-		yData := make([]opts.LineData, len(ptsA))
-		for i, v := range ptsA {
-			xData[i] = v.Date.Format("2006-01-02")
-			yData[i] = opts.LineData{Value: math.Round(v.Value*100) / 100}
-		}
-		line.SetXAxis(xData).AddSeries(labelA, yData,
+	line.SetXAxis(xLabels)
+	if len(yDataA) > 0 {
+		line.AddSeries(labelA, yDataA,
 			charts.WithLineStyleOpts(opts.LineStyle{Color: colorCyan, Width: 2}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Color: colorCyan}),
 		)
 	}
-
-	if len(ptsB) > 0 {
-		xData := make([]string, len(ptsB))
-		yData := make([]opts.LineData, len(ptsB))
-		for i, v := range ptsB {
-			xData[i] = v.Date.Format("2006-01-02")
-			yData[i] = opts.LineData{Value: math.Round(v.Value*100) / 100}
-		}
-		// If A has no data, set the X axis here.
-		if len(ptsA) == 0 {
-			line.SetXAxis(xData)
-		}
-		line.AddSeries(labelB, yData,
+	if len(yDataB) > 0 {
+		line.AddSeries(labelB, yDataB,
 			charts.WithLineStyleOpts(opts.LineStyle{Color: colorAmber, Width: 2}),
 			charts.WithItemStyleOpts(opts.ItemStyle{Color: colorAmber}),
 		)
 	}
-
 	return line
+}
+
+// unifiedEquityAxis aligns two sparse BacktestPoint series onto a single sorted
+// date axis. Each series uses last-value-carried-forward within its active range
+// and nil gaps before its first data point or after its last.
+func unifiedEquityAxis(ptsA, ptsB []BacktestPoint) (xLabels []string, yA, yB []opts.LineData) {
+	if len(ptsA) == 0 && len(ptsB) == 0 {
+		return nil, nil, nil
+	}
+
+	// Build a sorted union of all date labels.
+	dateSet := make(map[string]struct{})
+	for _, p := range ptsA {
+		dateSet[p.Date.Format("2006-01-02")] = struct{}{}
+	}
+	for _, p := range ptsB {
+		dateSet[p.Date.Format("2006-01-02")] = struct{}{}
+	}
+	xLabels = make([]string, 0, len(dateSet))
+	for k := range dateSet {
+		xLabels = append(xLabels, k)
+	}
+	sort.Strings(xLabels)
+
+	// Build lookup maps.
+	mapA := make(map[string]float64, len(ptsA))
+	for _, p := range ptsA {
+		mapA[p.Date.Format("2006-01-02")] = p.Value
+	}
+	mapB := make(map[string]float64, len(ptsB))
+	for _, p := range ptsB {
+		mapB[p.Date.Format("2006-01-02")] = p.Value
+	}
+
+	// Last-date boundary for each series (carry-forward stops after this).
+	lastDateA := ""
+	if len(ptsA) > 0 {
+		lastDateA = ptsA[len(ptsA)-1].Date.Format("2006-01-02")
+	}
+	lastDateB := ""
+	if len(ptsB) > 0 {
+		lastDateB = ptsB[len(ptsB)-1].Date.Format("2006-01-02")
+	}
+
+	yA = make([]opts.LineData, len(xLabels))
+	yB = make([]opts.LineData, len(xLabels))
+
+	var lastA, lastB float64
+	hasA, hasB := false, false
+	endedA, endedB := false, false
+
+	for i, d := range xLabels {
+		// Series A
+		if v, ok := mapA[d]; ok {
+			lastA = v
+			hasA = true
+			yA[i] = opts.LineData{Value: math.Round(lastA*100) / 100}
+		} else if hasA && !endedA {
+			yA[i] = opts.LineData{Value: math.Round(lastA*100) / 100}
+		} else {
+			yA[i] = opts.LineData{Value: nil}
+		}
+		if d == lastDateA {
+			endedA = true
+		}
+
+		// Series B
+		if v, ok := mapB[d]; ok {
+			lastB = v
+			hasB = true
+			yB[i] = opts.LineData{Value: math.Round(lastB*100) / 100}
+		} else if hasB && !endedB {
+			yB[i] = opts.LineData{Value: math.Round(lastB*100) / 100}
+		} else {
+			yB[i] = opts.LineData{Value: nil}
+		}
+		if d == lastDateB {
+			endedB = true
+		}
+	}
+	return xLabels, yA, yB
 }
 
 // ── Page helpers ──────────────────────────────────────────────────────────────

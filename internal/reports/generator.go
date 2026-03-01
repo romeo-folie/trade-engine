@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -108,56 +109,45 @@ func (g *Generator) OutputDir() string { return g.outputDir }
 
 // ── Asset inlining ────────────────────────────────────────────────────────────
 
-// scriptSrcPattern matches <script src="..."></script> tags.
-const scriptSrcPattern = `<script src="`
+// scriptTagRe matches a complete <script src="URL"></script> element, tolerating
+// varying whitespace between the closing `"` and `>` (e.g. `" >` or `">`).
+var scriptTagRe = regexp.MustCompile(`(?i)<script\s+src="([^"]+)"\s*></script>`)
 
 // inlineScripts replaces remote <script src="..."> tags with inline <script>
 // blocks so that the resulting HTML works without any internet connection.
-func (g *Generator) inlineScripts(html string) string {
-	var result strings.Builder
-	remaining := html
-	for {
-		idx := strings.Index(remaining, scriptSrcPattern)
-		if idx < 0 {
-			result.WriteString(remaining)
-			break
+// Uses regexp so the replacement is robust to minor go-echarts template changes
+// (whitespace variations, attribute ordering). Non-HTTP/HTTPS URLs are left as-is.
+func (g *Generator) inlineScripts(page string) string {
+	return scriptTagRe.ReplaceAllStringFunc(page, func(tag string) string {
+		m := scriptTagRe.FindStringSubmatch(tag)
+		if len(m) < 2 {
+			return tag
 		}
-		result.WriteString(remaining[:idx])
-		after := remaining[idx+len(scriptSrcPattern):]
-
-		end := strings.Index(after, `"></script>`)
-		if end < 0 {
-			result.WriteString(scriptSrcPattern)
-			remaining = after
-			continue
+		url := m[1]
+		if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
+			return tag // leave relative or data: URLs untouched
 		}
-		url := after[:end]
-		remaining = after[end+len(`"></script>`):]
-
 		content, err := g.fetchScript(url)
 		if err != nil {
-			// Fall back to original CDN tag on failure.
-			result.WriteString(scriptSrcPattern)
-			result.WriteString(url)
-			result.WriteString(`"></script>`)
-			continue
+			return tag // fall back to CDN on fetch failure
 		}
-		result.WriteString("<script>\n")
-		result.WriteString(content)
-		result.WriteString("\n</script>")
-	}
-	return result.String()
+		return "<script>\n" + content + "\n</script>"
+	})
 }
 
 // fetchScript returns JS content for the given URL, caching after first fetch.
+// The mutex is held only for cache reads/writes; the HTTP round-trip is unlocked
+// so concurrent report generation doesn't serialise on a slow CDN fetch.
 func (g *Generator) fetchScript(url string) (string, error) {
+	// Fast path: cache hit (read-locked).
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	if content, ok := g.scriptMap[url]; ok {
+		g.mu.Unlock()
 		return content, nil
 	}
+	g.mu.Unlock()
 
+	// Slow path: fetch without holding the lock.
 	client := &http.Client{Timeout: 20 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -173,9 +163,14 @@ func (g *Generator) fetchScript(url string) (string, error) {
 	if _, err := io.Copy(&buf, resp.Body); err != nil {
 		return "", err
 	}
-
 	content := buf.String()
+
+	// Store in cache (another goroutine may have fetched the same URL concurrently;
+	// overwriting with an identical value is harmless).
+	g.mu.Lock()
 	g.scriptMap[url] = content
+	g.mu.Unlock()
+
 	return content, nil
 }
 
