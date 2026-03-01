@@ -24,6 +24,7 @@ type Config struct {
 	Logging       LoggingConfig       `yaml:"logging"`
 	Database      DatabaseConfig      `yaml:"database"`
 	Reports       ReportsConfig       `yaml:"reports"`
+	Backtest      BacktestConfig      `yaml:"backtest"`
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -194,6 +195,16 @@ type DatabaseConfig struct {
 type ReportsConfig struct {
 	OutputDir       string `yaml:"output_dir"`
 	AutoOpenBrowser bool   `yaml:"auto_open_browser"`
+}
+
+// ── Backtest ──────────────────────────────────────────────────────────────────
+
+type BacktestConfig struct {
+	// InitialCash is the virtual starting portfolio value for each backtest run.
+	InitialCash float64 `yaml:"initial_cash"`
+	// RiskFreeRate is the annual risk-free rate used for Sharpe/Sortino/Calmar.
+	// Default 0.04 (4%, approximate US Treasury yield).
+	RiskFreeRate float64 `yaml:"risk_free_rate"`
 }
 
 // ── Loader ────────────────────────────────────────────────────────────────────

@@ -125,5 +125,9 @@ func Defaults() *Config {
 			OutputDir:       "~/.tradeengine/reports",
 			AutoOpenBrowser: true,
 		},
+		Backtest: BacktestConfig{
+			InitialCash:  100_000,
+			RiskFreeRate: 0.04,
+		},
 	}
 }
