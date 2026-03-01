@@ -1,0 +1,60 @@
+# ─── Compiled binaries ────────────────────────────────────────────────────────
+# Main binary (see Makefile: BINARY := te)
+te
+
+# ─── Secrets & local config ───────────────────────────────────────────────────
+# Never commit real credentials. Keep config.example.yaml as the tracked template.
+.env
+.env.*
+!.env.example
+
+config.yaml
+!config.example.yaml
+
+# Local override files (convention for per-machine settings)
+*.local.yaml
+*.local.toml
+*.local.env
+
+# ─── Go build artifacts ───────────────────────────────────────────────────────
+# Test binaries (go test -c)
+*.test
+
+# Test coverage and profiling output
+coverage.out
+coverage.html
+*.prof
+*.pprof
+cpu.out
+mem.out
+
+# Vendor directory (if go mod vendor is ever used)
+vendor/
+
+# ─── Database & runtime ───────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# Log files
+*.log
+logs/
+
+# ─── macOS ────────────────────────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# ─── IDEs & editors ───────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ─── Misc ─────────────────────────────────────────────────────────────────────
+# Temporary files
+tmp/
+.tmp/
