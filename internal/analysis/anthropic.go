@@ -66,6 +66,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			toPromptIndicators(req.Indicators),
 			toPromptNews(req.News),
 			toPromptPortfolio(req.Portfolio),
+			req.KnowledgeContext,
 		)
 	}
 

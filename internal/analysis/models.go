@@ -42,6 +42,11 @@ type AnalysisRequest struct {
 	// If either is non-empty the adapter must use them directly.
 	CustomSystemPrompt string
 	CustomUserMessage  string
+
+	// KnowledgeContext is a pre-formatted knowledge-graph context block for
+	// injection into the stock prompt's KNOWLEDGE GRAPH section.
+	// Empty string causes the prompt to emit a "not available" placeholder.
+	KnowledgeContext string
 }
 
 // AnalysisResponse is the structured output the model must return.

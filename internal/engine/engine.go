@@ -16,6 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
+	"github.com/romeo-folie/trade-engine/internal/knowledge"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/risk"
@@ -48,6 +49,7 @@ type Engine struct {
 	executor     execution.Executor
 	portfolio    *portfolio.Tracker
 	bus          *events.Bus
+	enricher     *knowledge.Enricher // nil if no LLM configured
 
 	// newsLastFetched tracks when news was last fetched per ticker, to avoid
 	// hammering the news API on every 5-min tick.
@@ -65,14 +67,34 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	if exec == nil {
 		exec = execution.NewPaperExecutor()
 	}
+	az := analysis.NewAnalyzer(cfg.Models)
+
+	// Build an enricher that reuses the primary LLM for relationship extraction.
+	// We piggyback on CustomSystemPrompt/CustomUserMessage + RawResponse so no
+	// new interface methods are required.
+	callFn := knowledge.ExtractionCallFn(func(ctx context.Context, system, user string) (string, error) {
+		_, meta, _ := az.Analyze(ctx, analysis.AnalysisRequest{
+			Ticker:             "__extraction__",
+			CustomSystemPrompt: system,
+			CustomUserMessage:  user,
+		})
+		// meta.RawResponse is populated even when the JSON parse step fails
+		// (extraction output is a JSON array, not an AnalysisResponse).
+		if meta.RawResponse != "" {
+			return meta.RawResponse, nil
+		}
+		return "", fmt.Errorf("enricher: empty model response")
+	})
+
 	return &Engine{
 		cfg:             cfg,
 		marketData:      market,
-		analyzer:        analysis.NewAnalyzer(cfg.Models),
+		analyzer:        az,
 		newsProvider:    news,
 		executor:        exec,
 		portfolio:       portfolio.NewTracker(time.Hour),
 		bus:             events.New(),
+		enricher:        knowledge.NewEnricher(cfg, callFn),
 		newsLastFetched: make(map[string]time.Time),
 		mode:            mode,
 	}
@@ -261,11 +283,18 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		})
 	}
 
+	// Build knowledge graph context for this ticker (best-effort; non-fatal).
+	var knowledgeCtx string
+	if gc, err := knowledge.BuildContext(ctx, ticker, nil); err == nil {
+		knowledgeCtx = gc.Format()
+	}
+
 	req := analysis.AnalysisRequest{
-		Ticker:        ticker,
-		Strategy:      strategy,
-		Timeframe:     timeframe,
-		RecentCandles: snaps,
+		Ticker:           ticker,
+		Strategy:         strategy,
+		Timeframe:        timeframe,
+		RecentCandles:    snaps,
+		KnowledgeContext: knowledgeCtx,
 		Indicators: analysis.IndicatorSnapshot{
 			EMA20: set.EMA20, EMA50: set.EMA50, EMA200: set.EMA200,
 			SMA20: set.SMA20, SMA50: set.SMA50, SMA200: set.SMA200,
@@ -389,6 +418,16 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 		return
 	}
 	logger.Info("news fetched", "ticker", ticker, "count", len(items))
+
+	// Kick off relationship extraction for each article in the background.
+	// EnrichNewsItem is non-blocking — it fires a goroutine and returns.
+	if e.enricher != nil {
+		for _, item := range items {
+			// Use the URL as a stable surrogate ID for entity mention bookkeeping
+			// when the DB news_item UUID isn't readily available here.
+			e.enricher.EnrichNewsItem(ctx, item.URL, item.Headline, item.Summary)
+		}
+	}
 }
 
 // BackfillHistory fetches and stores 2 years of daily + 30 days of hourly candles

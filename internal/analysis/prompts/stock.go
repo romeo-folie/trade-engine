@@ -67,9 +67,10 @@ func BuildStockPrompt(
 	ind Indicators,
 	news []NewsItem,
 	portfolio Portfolio,
+	knowledgeContext string,
 ) (systemPrompt, userMessage string) {
 	systemPrompt = buildSystem(strategy)
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio)
+	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext)
 	return
 }
 
@@ -103,6 +104,7 @@ func buildUser(
 	ind Indicators,
 	news []NewsItem,
 	portfolio Portfolio,
+	knowledgeContext string,
 ) string {
 	var b strings.Builder
 
@@ -164,9 +166,13 @@ func buildUser(
 		}
 	}
 
-	// Knowledge graph placeholder (Phase 10)
+	// Knowledge graph context (populated by Phase 10 knowledge.BuildContext).
 	b.WriteString("\n### KNOWLEDGE GRAPH\n")
-	b.WriteString("No relationship data available yet.\n")
+	if knowledgeContext != "" {
+		b.WriteString(knowledgeContext)
+	} else {
+		b.WriteString("No relationship data available.\n")
+	}
 
 	// Similar past analyses placeholder (Phase 11)
 	b.WriteString("\n### SIMILAR PAST ANALYSES\n")

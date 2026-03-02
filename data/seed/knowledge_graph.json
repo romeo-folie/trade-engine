@@ -1,0 +1,140 @@
+{
+  "_comment": "Seed data for the TradeEngine knowledge graph. Entities are upserted first, then relationships. 'ref' keys are local aliases used only in this file.",
+  "entities": [
+    {"ref": "sector_tech",       "entity_type": "sector", "name": "Technology",            "description": "Software, hardware, semiconductors, internet services"},
+    {"ref": "sector_finance",    "entity_type": "sector", "name": "Finance",               "description": "Banks, asset managers, insurance, fintech"},
+    {"ref": "sector_healthcare", "entity_type": "sector", "name": "Healthcare",            "description": "Pharmaceuticals, biotech, medical devices, health services"},
+    {"ref": "sector_energy",     "entity_type": "sector", "name": "Energy",               "description": "Oil & gas, renewables, utilities"},
+    {"ref": "sector_consumer",   "entity_type": "sector", "name": "Consumer Discretionary","description": "Retail, autos, entertainment, hospitality"},
+    {"ref": "sector_staples",    "entity_type": "sector", "name": "Consumer Staples",      "description": "Food, beverages, tobacco, household products"},
+    {"ref": "sector_industrial", "entity_type": "sector", "name": "Industrials",           "description": "Aerospace, defence, machinery, logistics"},
+    {"ref": "sector_comms",      "entity_type": "sector", "name": "Communication Services","description": "Telecom, media, internet communications"},
+    {"ref": "sector_materials",  "entity_type": "sector", "name": "Materials",             "description": "Mining, chemicals, metals, packaging"},
+    {"ref": "sector_realestate", "entity_type": "sector", "name": "Real Estate",           "description": "REITs, real estate development and services"},
+
+    {"ref": "aapl",  "entity_type": "company", "name": "Apple Inc.",              "ticker": "AAPL",  "sector": "Technology",     "country": "US", "description": "Consumer electronics, software, and services"},
+    {"ref": "msft",  "entity_type": "company", "name": "Microsoft Corporation",   "ticker": "MSFT",  "sector": "Technology",     "country": "US", "description": "Cloud computing, productivity software, gaming"},
+    {"ref": "googl", "entity_type": "company", "name": "Alphabet Inc.",           "ticker": "GOOGL", "sector": "Technology",     "country": "US", "description": "Search, advertising, cloud, autonomous vehicles"},
+    {"ref": "amzn",  "entity_type": "company", "name": "Amazon.com Inc.",         "ticker": "AMZN",  "sector": "Consumer Discretionary", "country": "US", "description": "E-commerce, cloud (AWS), advertising, logistics"},
+    {"ref": "meta",  "entity_type": "company", "name": "Meta Platforms Inc.",     "ticker": "META",  "sector": "Communication Services", "country": "US", "description": "Social media (Facebook, Instagram, WhatsApp), VR/AR"},
+    {"ref": "nflx",  "entity_type": "company", "name": "Netflix Inc.",            "ticker": "NFLX",  "sector": "Communication Services", "country": "US", "description": "Streaming video on demand"},
+    {"ref": "nvda",  "entity_type": "company", "name": "NVIDIA Corporation",      "ticker": "NVDA",  "sector": "Technology",     "country": "US", "description": "GPUs, AI accelerators, data centre chips"},
+    {"ref": "amd",   "entity_type": "company", "name": "Advanced Micro Devices",  "ticker": "AMD",   "sector": "Technology",     "country": "US", "description": "CPUs and GPUs for PC, data centre, embedded"},
+    {"ref": "intc",  "entity_type": "company", "name": "Intel Corporation",       "ticker": "INTC",  "sector": "Technology",     "country": "US", "description": "CPUs, data centre chips, foundry services"},
+    {"ref": "tsm",   "entity_type": "company", "name": "TSMC",                    "ticker": "TSM",   "sector": "Technology",     "country": "TW", "description": "World's largest dedicated semiconductor foundry"},
+    {"ref": "qcom",  "entity_type": "company", "name": "Qualcomm Inc.",           "ticker": "QCOM",  "sector": "Technology",     "country": "US", "description": "Mobile SoCs (Snapdragon), wireless IP licensing"},
+    {"ref": "avgo",  "entity_type": "company", "name": "Broadcom Inc.",           "ticker": "AVGO",  "sector": "Technology",     "country": "US", "description": "Networking semiconductors, software (VMware)"},
+    {"ref": "txn",   "entity_type": "company", "name": "Texas Instruments",       "ticker": "TXN",   "sector": "Technology",     "country": "US", "description": "Analog and embedded processors"},
+    {"ref": "asml",  "entity_type": "company", "name": "ASML Holding",            "ticker": "ASML",  "sector": "Technology",     "country": "NL", "description": "EUV lithography machines — sole global supplier"},
+    {"ref": "arm",   "entity_type": "company", "name": "Arm Holdings",            "ticker": "ARM",   "sector": "Technology",     "country": "GB", "description": "CPU architecture IP licensor; used in most mobile chips"},
+    {"ref": "orcl",  "entity_type": "company", "name": "Oracle Corporation",      "ticker": "ORCL",  "sector": "Technology",     "country": "US", "description": "Database software, cloud ERP, health IT"},
+    {"ref": "crm",   "entity_type": "company", "name": "Salesforce Inc.",         "ticker": "CRM",   "sector": "Technology",     "country": "US", "description": "Cloud CRM, marketing and analytics software"},
+    {"ref": "adbe",  "entity_type": "company", "name": "Adobe Inc.",              "ticker": "ADBE",  "sector": "Technology",     "country": "US", "description": "Creative software (Photoshop, Acrobat), digital marketing"},
+    {"ref": "now",   "entity_type": "company", "name": "ServiceNow Inc.",         "ticker": "NOW",   "sector": "Technology",     "country": "US", "description": "IT workflow automation platform"},
+    {"ref": "snow",  "entity_type": "company", "name": "Snowflake Inc.",          "ticker": "SNOW",  "sector": "Technology",     "country": "US", "description": "Cloud data warehousing and analytics"},
+
+    {"ref": "jpm",   "entity_type": "company", "name": "JPMorgan Chase",          "ticker": "JPM",   "sector": "Finance",        "country": "US", "description": "Largest US bank; investment banking, consumer, asset management"},
+    {"ref": "gs",    "entity_type": "company", "name": "Goldman Sachs Group",     "ticker": "GS",    "sector": "Finance",        "country": "US", "description": "Investment banking, trading, asset management"},
+    {"ref": "ms",    "entity_type": "company", "name": "Morgan Stanley",          "ticker": "MS",    "sector": "Finance",        "country": "US", "description": "Investment banking, wealth management, trading"},
+    {"ref": "bac",   "entity_type": "company", "name": "Bank of America",         "ticker": "BAC",   "sector": "Finance",        "country": "US", "description": "Retail banking, investment banking, Merrill Lynch"},
+    {"ref": "brkb",  "entity_type": "company", "name": "Berkshire Hathaway",      "ticker": "BRK.B", "sector": "Finance",        "country": "US", "description": "Diversified holding company (Buffett); major insurer and investor"},
+    {"ref": "v",     "entity_type": "company", "name": "Visa Inc.",               "ticker": "V",     "sector": "Finance",        "country": "US", "description": "Global payment network"},
+    {"ref": "ma",    "entity_type": "company", "name": "Mastercard Inc.",         "ticker": "MA",    "sector": "Finance",        "country": "US", "description": "Global payment network; competes with Visa"},
+
+    {"ref": "unh",   "entity_type": "company", "name": "UnitedHealth Group",      "ticker": "UNH",   "sector": "Healthcare",     "country": "US", "description": "Health insurance (UnitedHealthcare) and Optum services"},
+    {"ref": "jnj",   "entity_type": "company", "name": "Johnson & Johnson",       "ticker": "JNJ",   "sector": "Healthcare",     "country": "US", "description": "Pharmaceuticals, medical devices"},
+    {"ref": "lly",   "entity_type": "company", "name": "Eli Lilly and Company",   "ticker": "LLY",   "sector": "Healthcare",     "country": "US", "description": "GLP-1 drugs (Mounjaro, Zepbound), oncology"},
+    {"ref": "mrna",  "entity_type": "company", "name": "Moderna Inc.",            "ticker": "MRNA",  "sector": "Healthcare",     "country": "US", "description": "mRNA vaccines and therapeutics"},
+    {"ref": "pfe",   "entity_type": "company", "name": "Pfizer Inc.",             "ticker": "PFE",   "sector": "Healthcare",     "country": "US", "description": "Pharmaceuticals; COVID vaccine, oncology"},
+
+    {"ref": "xom",   "entity_type": "company", "name": "ExxonMobil Corporation",  "ticker": "XOM",   "sector": "Energy",         "country": "US", "description": "Largest US integrated oil and gas company"},
+    {"ref": "cvx",   "entity_type": "company", "name": "Chevron Corporation",     "ticker": "CVX",   "sector": "Energy",         "country": "US", "description": "Integrated oil and gas; competes with ExxonMobil"},
+
+    {"ref": "tsla",  "entity_type": "company", "name": "Tesla Inc.",              "ticker": "TSLA",  "sector": "Consumer Discretionary", "country": "US", "description": "Electric vehicles, energy storage, solar, Autopilot/FSD"},
+    {"ref": "amzn_aws", "entity_type": "company", "name": "Amazon Web Services",  "sector": "Technology", "country": "US", "description": "Cloud computing subsidiary of Amazon; largest cloud provider"},
+
+    {"ref": "idx_sp500", "entity_type": "index", "name": "S&P 500", "description": "Market-cap-weighted index of the 500 largest US public companies"},
+    {"ref": "idx_nasdaq","entity_type": "index", "name": "NASDAQ Composite", "description": "Index of all stocks listed on the NASDAQ exchange; tech-heavy"}
+  ],
+
+  "relationships": [
+    {"from_ref": "tsm",  "to_ref": "aapl",  "type": "manufactures_for", "strength": 0.95, "description": "TSMC fabricates Apple's A- and M-series chips exclusively"},
+    {"from_ref": "tsm",  "to_ref": "nvda",  "type": "manufactures_for", "strength": 0.90, "description": "TSMC produces NVIDIA's Hopper and Blackwell GPUs"},
+    {"from_ref": "tsm",  "to_ref": "amd",   "type": "manufactures_for", "strength": 0.85, "description": "TSMC manufactures AMD Ryzen and EPYC processors"},
+    {"from_ref": "tsm",  "to_ref": "qcom",  "type": "manufactures_for", "strength": 0.80, "description": "TSMC produces Qualcomm Snapdragon SoCs"},
+    {"from_ref": "tsm",  "to_ref": "arm",   "type": "manufactured_by",  "strength": 0.70, "description": "Many ARM-designed chips are fabricated at TSMC"},
+
+    {"from_ref": "asml", "to_ref": "tsm",   "type": "supplies_to",      "strength": 0.99, "description": "ASML is the sole supplier of EUV lithography machines used by TSMC"},
+    {"from_ref": "asml", "to_ref": "intc",  "type": "supplies_to",      "strength": 0.90, "description": "ASML supplies EUV machines to Intel Foundry"},
+    {"from_ref": "asml", "to_ref": "amd",   "type": "supplies_to",      "strength": 0.70, "description": "AMD's wafers (made at TSMC) require ASML EUV tools"},
+
+    {"from_ref": "arm",  "to_ref": "aapl",  "type": "supplies_to",      "strength": 0.95, "description": "Apple's chips are ARM-architecture based"},
+    {"from_ref": "arm",  "to_ref": "qcom",  "type": "supplies_to",      "strength": 0.95, "description": "Qualcomm Snapdragon uses ARM CPU cores"},
+    {"from_ref": "arm",  "to_ref": "nvda",  "type": "supplies_to",      "strength": 0.60, "description": "NVIDIA uses ARM CPU cores in some SoCs (Grace)"},
+
+    {"from_ref": "qcom", "to_ref": "aapl",  "type": "supplies_to",      "strength": 0.60, "description": "Qualcomm supplies cellular modems for some iPhone models"},
+
+    {"from_ref": "nvda", "to_ref": "msft",  "type": "supplies_to",      "strength": 0.80, "description": "NVIDIA GPUs power Azure AI clusters"},
+    {"from_ref": "nvda", "to_ref": "googl", "type": "supplies_to",      "strength": 0.75, "description": "Google cloud uses NVIDIA GPUs alongside its TPUs"},
+    {"from_ref": "nvda", "to_ref": "amzn",  "type": "supplies_to",      "strength": 0.75, "description": "AWS is a major NVIDIA GPU cloud customer"},
+    {"from_ref": "nvda", "to_ref": "meta",  "type": "supplies_to",      "strength": 0.85, "description": "Meta deployed 350k+ NVIDIA H100 GPUs for AI training"},
+
+    {"from_ref": "nvda", "to_ref": "amd",   "type": "competes_with",    "strength": 0.90, "description": "AMD Instinct MI300 series competes with NVIDIA H-series in AI compute"},
+    {"from_ref": "intc", "to_ref": "amd",   "type": "competes_with",    "strength": 0.85, "description": "Intel Core vs. AMD Ryzen CPU competition"},
+    {"from_ref": "intc", "to_ref": "nvda",  "type": "competes_with",    "strength": 0.60, "description": "Intel Gaudi AI accelerators compete with NVIDIA GPUs"},
+    {"from_ref": "v",    "to_ref": "ma",    "type": "competes_with",    "strength": 0.90, "description": "Visa and Mastercard compete globally in payment networks"},
+    {"from_ref": "googl","to_ref": "msft",  "type": "competes_with",    "strength": 0.85, "description": "Google Cloud vs Azure; Google Workspace vs Microsoft 365"},
+    {"from_ref": "amzn", "to_ref": "msft",  "type": "competes_with",    "strength": 0.85, "description": "AWS vs Azure in cloud infrastructure"},
+    {"from_ref": "amzn", "to_ref": "googl", "type": "competes_with",    "strength": 0.80, "description": "AWS vs Google Cloud in cloud infrastructure"},
+    {"from_ref": "xom",  "to_ref": "cvx",   "type": "competes_with",    "strength": 0.80, "description": "ExxonMobil and Chevron compete in integrated oil and gas"},
+
+    {"from_ref": "msft", "to_ref": "amzn_aws", "type": "competes_with", "strength": 0.90, "description": "Azure competes directly with AWS for enterprise cloud workloads"},
+    {"from_ref": "amzn_aws","to_ref": "amzn","type": "subsidiary_of",   "strength": 1.00, "description": "AWS is a wholly owned subsidiary of Amazon"},
+
+    {"from_ref": "aapl", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "msft", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "googl","to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "nvda", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "amd",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "intc", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "tsm",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "qcom", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "asml", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "arm",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "avgo", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "txn",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "orcl", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "crm",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "adbe", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "now",  "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+    {"from_ref": "snow", "to_ref": "sector_tech",       "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "amzn", "to_ref": "sector_consumer",   "type": "sector_member", "strength": 1.0},
+    {"from_ref": "tsla", "to_ref": "sector_consumer",   "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "meta", "to_ref": "sector_comms",      "type": "sector_member", "strength": 1.0},
+    {"from_ref": "nflx", "to_ref": "sector_comms",      "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "jpm",  "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "gs",   "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "ms",   "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "bac",  "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "brkb", "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "v",    "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+    {"from_ref": "ma",   "to_ref": "sector_finance",    "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "unh",  "to_ref": "sector_healthcare", "type": "sector_member", "strength": 1.0},
+    {"from_ref": "jnj",  "to_ref": "sector_healthcare", "type": "sector_member", "strength": 1.0},
+    {"from_ref": "lly",  "to_ref": "sector_healthcare", "type": "sector_member", "strength": 1.0},
+    {"from_ref": "mrna", "to_ref": "sector_healthcare", "type": "sector_member", "strength": 1.0},
+    {"from_ref": "pfe",  "to_ref": "sector_healthcare", "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "xom",  "to_ref": "sector_energy",     "type": "sector_member", "strength": 1.0},
+    {"from_ref": "cvx",  "to_ref": "sector_energy",     "type": "sector_member", "strength": 1.0},
+
+    {"from_ref": "jpm",  "to_ref": "gs",    "type": "competes_with", "strength": 0.75, "description": "JPMorgan and Goldman compete in investment banking and trading"},
+    {"from_ref": "gs",   "to_ref": "ms",    "type": "competes_with", "strength": 0.80, "description": "Goldman Sachs and Morgan Stanley compete in investment banking"},
+    {"from_ref": "lly",  "to_ref": "pfe",   "type": "competes_with", "strength": 0.65, "description": "Eli Lilly and Pfizer compete in therapeutic drug markets"},
+    {"from_ref": "mrna", "to_ref": "pfe",   "type": "competes_with", "strength": 0.70, "description": "Moderna and Pfizer compete in mRNA vaccine technology"}
+  ]
+}
