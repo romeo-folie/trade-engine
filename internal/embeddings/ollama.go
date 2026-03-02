@@ -19,8 +19,14 @@ type ollamaEmbedder struct {
 	dim     int
 }
 
-func newOllamaEmbedder(baseURL, model string) *ollamaEmbedder {
-	dim := 768 // nomic-embed-text default
+// defaultOllamaDim is the dimension for nomic-embed-text, used when
+// config.Dimension is 0 (not explicitly set).
+const defaultOllamaDim = 768
+
+func newOllamaEmbedder(baseURL, model string, dim int) *ollamaEmbedder {
+	if dim <= 0 {
+		dim = defaultOllamaDim
+	}
 	return &ollamaEmbedder{
 		baseURL: baseURL,
 		model:   model,

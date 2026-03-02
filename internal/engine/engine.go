@@ -310,9 +310,9 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	// Semantic search for similar past setups (best-effort).
 	var similarSetups []analysis.SimilarSetup
 	if e.embedder != nil && e.cfg.Embeddings.SimilarAnalysesEnabled {
-		// Embed a compact description of current conditions for similarity search.
-		searchText := fmt.Sprintf("%s RSI:%.1f EMA20:%.2f MACD:%.4f ADX:%.1f",
-			ticker, set.RSI, set.EMA20, set.MACDLine, set.ADX)
+		// Use the same compact indicator format as the worker uses at index time
+		// so search query and stored vectors occupy the same embedding space.
+		searchText := embeddings.AnalysisEmbedText(ticker, set.RSI, set.EMA20, set.MACDLine, set.ADX)
 		if queryVec, err := e.embedder.Embed(ctx, searchText); err == nil {
 			threshold := e.cfg.Embeddings.SimilarAnalysesThreshold
 			limit := e.cfg.Embeddings.SimilarAnalysesLimit

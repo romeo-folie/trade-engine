@@ -11,9 +11,9 @@ import (
 
 // AnalysisForEmbedding holds the minimal fields needed for embedding generation.
 type AnalysisForEmbedding struct {
-	ID        string
-	Reasoning string
-	RawPrompt string
+	ID             string
+	Ticker         string
+	IndicatorsJSON []byte // raw JSONB — parsed by worker into compact indicator string
 }
 
 // NewsForEmbedding holds fields used to build the embedding text for a news item.
@@ -45,9 +45,10 @@ type SimilarAnalysis struct {
 // ── Fetch without embedding ───────────────────────────────────────────────────
 
 // GetAnalysesWithoutEmbedding returns up to limit analyses that have a NULL embedding.
+// IndicatorsJSON holds the raw JSONB snapshot used to build the compact embedding text.
 func GetAnalysesWithoutEmbedding(ctx context.Context, limit int) ([]AnalysisForEmbedding, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, COALESCE(reasoning,''), COALESCE(raw_prompt,'')
+		SELECT id, ticker, COALESCE(indicators, '{}')
 		FROM analyses
 		WHERE embedding IS NULL
 		ORDER BY created_at DESC
@@ -59,7 +60,7 @@ func GetAnalysesWithoutEmbedding(ctx context.Context, limit int) ([]AnalysisForE
 	var out []AnalysisForEmbedding
 	for rows.Next() {
 		var r AnalysisForEmbedding
-		if err := rows.Scan(&r.ID, &r.Reasoning, &r.RawPrompt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Ticker, &r.IndicatorsJSON); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -153,24 +154,29 @@ func UpdateEntityEmbedding(ctx context.Context, id string, vec []float32) error 
 // FindSimilarAnalyses returns past analyses ranked by cosine similarity to the
 // given query vector.  Only analyses with similarity >= threshold are returned.
 // Results are joined with trades to surface the outcome when available.
+// The distance expression is computed once via a subquery (avoids double <=> eval).
 func FindSimilarAnalyses(ctx context.Context, queryVec []float32, threshold float64, limit int) ([]SimilarAnalysis, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT
-			a.id, a.ticker, a.action::text, a.confidence,
-			COALESCE(a.reasoning,''),
-			TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI'),
-			t.pnl_pct
-		FROM analyses a
-		LEFT JOIN LATERAL (
-			SELECT pnl_pct
-			FROM trades
-			WHERE a.id = ANY(analysis_ids) AND status = 'closed'
-			ORDER BY closed_at DESC
-			LIMIT 1
-		) t ON TRUE
-		WHERE a.embedding IS NOT NULL
-		  AND 1 - (a.embedding <=> $1::vector) >= $2
-		ORDER BY a.embedding <=> $1::vector
+		SELECT id, ticker, action, confidence, reasoning, created_at, pnl_pct
+		FROM (
+			SELECT
+				a.id, a.ticker, a.action::text, a.confidence,
+				COALESCE(a.reasoning,'') AS reasoning,
+				TO_CHAR(a.created_at, 'YYYY-MM-DD HH24:MI') AS created_at,
+				t.pnl_pct,
+				a.embedding <=> $1::vector AS distance
+			FROM analyses a
+			LEFT JOIN LATERAL (
+				SELECT pnl_pct
+				FROM trades
+				WHERE a.id = ANY(analysis_ids) AND status = 'closed'
+				ORDER BY closed_at DESC
+				LIMIT 1
+			) t ON TRUE
+			WHERE a.embedding IS NOT NULL
+		) sub
+		WHERE 1 - sub.distance >= $2
+		ORDER BY sub.distance
 		LIMIT $3`,
 		pgvector.NewVector(queryVec), threshold, limit)
 	if err != nil {
@@ -195,11 +201,15 @@ func FindSimilarAnalyses(ctx context.Context, queryVec []float32, threshold floa
 // FindSimilarNews returns news items ranked by cosine similarity to queryVec.
 func FindSimilarNews(ctx context.Context, queryVec []float32, threshold float64, limit int) ([]NewsForEmbedding, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, headline, COALESCE(summary,'')
-		FROM news_items
-		WHERE embedding IS NOT NULL
-		  AND 1 - (embedding <=> $1::vector) >= $2
-		ORDER BY embedding <=> $1::vector
+		SELECT id, headline, summary
+		FROM (
+			SELECT id, headline, COALESCE(summary,'') AS summary,
+				embedding <=> $1::vector AS distance
+			FROM news_items
+			WHERE embedding IS NOT NULL
+		) sub
+		WHERE 1 - sub.distance >= $2
+		ORDER BY sub.distance
 		LIMIT $3`,
 		pgvector.NewVector(queryVec), threshold, limit)
 	if err != nil {
@@ -220,11 +230,15 @@ func FindSimilarNews(ctx context.Context, queryVec []float32, threshold float64,
 // FindSimilarEntities returns entities ranked by cosine similarity to queryVec.
 func FindSimilarEntities(ctx context.Context, queryVec []float32, threshold float64, limit int) ([]EntityForEmbedding, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, name, COALESCE(description,'')
-		FROM entities
-		WHERE embedding IS NOT NULL
-		  AND 1 - (embedding <=> $1::vector) >= $2
-		ORDER BY embedding <=> $1::vector
+		SELECT id, name, description
+		FROM (
+			SELECT id, name, COALESCE(description,'') AS description,
+				embedding <=> $1::vector AS distance
+			FROM entities
+			WHERE embedding IS NOT NULL
+		) sub
+		WHERE 1 - sub.distance >= $2
+		ORDER BY sub.distance
 		LIMIT $3`,
 		pgvector.NewVector(queryVec), threshold, limit)
 	if err != nil {

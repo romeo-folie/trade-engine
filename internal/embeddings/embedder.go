@@ -43,7 +43,7 @@ func New(cfg config.EmbeddingsConfig) (Embedder, error) {
 		if model == "" {
 			model = "text-embedding-3-small"
 		}
-		return newOpenAIEmbedder(cfg.APIKey, model), nil
+		return newOpenAIEmbedder(cfg.APIKey, model, cfg.Dimension), nil
 
 	case "ollama":
 		model := cfg.Model
@@ -54,7 +54,7 @@ func New(cfg config.EmbeddingsConfig) (Embedder, error) {
 		if base == "" {
 			base = "http://localhost:11434"
 		}
-		return newOllamaEmbedder(base, model), nil
+		return newOllamaEmbedder(base, model, cfg.Dimension), nil
 
 	default:
 		return nil, fmt.Errorf("embeddings: unknown provider %q (valid: openai, ollama)", cfg.Provider)

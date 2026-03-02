@@ -20,12 +20,19 @@ type openAIEmbedder struct {
 	dim    int
 }
 
-func newOpenAIEmbedder(apiKey, model string) *openAIEmbedder {
+// defaultOpenAIDim is the dimension for text-embedding-3-small, used when
+// config.Dimension is 0 (not explicitly set).
+const defaultOpenAIDim = 1536
+
+func newOpenAIEmbedder(apiKey, model string, dim int) *openAIEmbedder {
+	if dim <= 0 {
+		dim = defaultOpenAIDim
+	}
 	return &openAIEmbedder{
 		apiKey: apiKey,
 		model:  model,
 		client: &http.Client{Timeout: 30 * time.Second},
-		dim:    1536, // text-embedding-3-small fixed dimension
+		dim:    dim,
 	}
 }
 
