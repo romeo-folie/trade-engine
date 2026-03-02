@@ -65,22 +65,6 @@ var _ = func() bool {
 	return true
 }()
 
-// ── Knowledge graph ───────────────────────────────────────────────────────────
-
-var graphCmd = &cobra.Command{
-	Use:   "graph",
-	Short: "Manage the knowledge graph (Phase 8)",
-}
-
-var _ = func() bool {
-	graphCmd.AddCommand(
-		&cobra.Command{Use: "enrich", Short: "Run knowledge graph enrichment", RunE: stub("te graph enrich")},
-		&cobra.Command{Use: "show <entity>", Short: "Show entity graph context", RunE: stub("te graph show")},
-		&cobra.Command{Use: "list", Short: "List entities in the graph", RunE: stub("te graph list")},
-	)
-	return true
-}()
-
 // ── Embeddings ────────────────────────────────────────────────────────────────
 
 var embeddingsCmd = &cobra.Command{
