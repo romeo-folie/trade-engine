@@ -2,29 +2,16 @@ package knowledge
 
 import (
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
-	"runtime"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-// seedFile returns the absolute path to the bundled knowledge_graph.json.
-// It resolves relative to the Go source tree so the CLI binary can locate the
-// file regardless of the working directory at runtime.
-//
-// For production binaries the file is embedded via go:embed; for development
-// builds we walk up from the caller's source file.
-func seedFilePath() string {
-	_, callerFile, _, _ := runtime.Caller(0)
-	// callerFile = .../internal/knowledge/seed.go
-	// project root = two directories up from internal/knowledge/
-	root := filepath.Join(filepath.Dir(callerFile), "..", "..", "data", "seed", "knowledge_graph.json")
-	abs, _ := filepath.Abs(root)
-	return abs
-}
+//go:embed seed_data/knowledge_graph.json
+var bundledSeedJSON []byte
 
 // seedDoc is the in-memory representation of knowledge_graph.json.
 type seedDoc struct {
@@ -56,21 +43,26 @@ type SeedStats struct {
 	RelationshipsUpserted int
 }
 
-// Seed loads knowledge_graph.json and idempotently upserts all entities and
-// relationships.  It returns a summary of what was processed.
+// Seed loads the bundled knowledge_graph.json (embedded at compile time) and
+// idempotently upserts all entities and relationships.
 func Seed(ctx context.Context) (SeedStats, error) {
-	return SeedFromFile(ctx, seedFilePath())
+	return seedFromBytes(ctx, bundledSeedJSON)
 }
 
-// SeedFromFile is like Seed but accepts an explicit path — useful for testing.
+// SeedFromFile reads the given path and upserts its contents.  Useful for
+// loading a custom seed file or for tests.
 func SeedFromFile(ctx context.Context, path string) (SeedStats, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return SeedStats{}, fmt.Errorf("read seed file %s: %w", path, err)
 	}
+	return seedFromBytes(ctx, raw)
+}
+
+func seedFromBytes(ctx context.Context, raw []byte) (SeedStats, error) {
 	var doc seedDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return SeedStats{}, fmt.Errorf("parse seed file: %w", err)
+		return SeedStats{}, fmt.Errorf("parse seed JSON: %w", err)
 	}
 
 	// Pass 1 — upsert entities, build ref→ID map.

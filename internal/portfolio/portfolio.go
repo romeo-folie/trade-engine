@@ -26,6 +26,7 @@ type State struct {
 type Tracker struct {
 	mu               sync.RWMutex
 	state            State
+	positions        []ExecPosition // last set passed to Update; used by PositionMap
 	snapshotEvery    time.Duration
 	lastSnapshot     time.Time
 	lastDailySummary time.Time
@@ -47,10 +48,29 @@ type ExecPosition struct {
 	UnrealizedPL float64
 }
 
+// PositionMap returns a snapshot of current open positions as ticker→currentValue.
+// Returns nil if no positions have been recorded yet.  Safe for concurrent use.
+func (t *Tracker) PositionMap() map[string]float64 {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if len(t.positions) == 0 {
+		return nil
+	}
+	out := make(map[string]float64, len(t.positions))
+	for _, p := range t.positions {
+		out[p.Ticker] = p.CurrentValue
+	}
+	return out
+}
+
 // Update refreshes the in-memory state from executor positions + realized P&L today.
 func (t *Tracker) Update(positions []ExecPosition, cashBalance, realizedPnLDay float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
+	// Snapshot for PositionMap.
+	t.positions = make([]ExecPosition, len(positions))
+	copy(t.positions, positions)
 
 	var invested, unrealizedPnL float64
 	for _, p := range positions {

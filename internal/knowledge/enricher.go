@@ -12,6 +12,11 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// maxEnricherConcurrency caps the number of simultaneous LLM extraction calls
+// fired by the enricher.  Without a bound, 10 tickers × 30 articles = 300
+// concurrent calls, immediately exhausting the rate limit.
+const maxEnricherConcurrency = 5
+
 // Enricher extracts entity relationships from news headlines and summaries and
 // writes them to the knowledge graph as auto-generated edges.
 //
@@ -20,8 +25,9 @@ import (
 // relationships are stored with auto_generated=TRUE so they can be reviewed and
 // confirmed (or rejected) via `te graph review`.
 type Enricher struct {
-	cfg     *config.Config
-	callFn  ExtractionCallFn
+	cfg    *config.Config
+	callFn ExtractionCallFn
+	sem    chan struct{} // bounds concurrent LLM calls
 }
 
 // ExtractionCallFn is the function the enricher calls to run the extraction
@@ -34,16 +40,34 @@ type ExtractionCallFn func(ctx context.Context, system, user string) (string, er
 
 // NewEnricher creates an Enricher with the given LLM call function.
 func NewEnricher(cfg *config.Config, callFn ExtractionCallFn) *Enricher {
-	return &Enricher{cfg: cfg, callFn: callFn}
+	return &Enricher{
+		cfg:    cfg,
+		callFn: callFn,
+		sem:    make(chan struct{}, maxEnricherConcurrency),
+	}
 }
 
 // EnrichNewsItem runs relationship extraction on a single news article
-// (identified by newsItemID for entity-mention bookkeeping).
+// (identified by newsItemID for entity-mention bookkeeping; pass empty string
+// to skip entity-mention recording).
 //
-// Errors are logged but not returned — enrichment is best-effort and must
-// never block the main news ingestion pipeline.
+// The call is non-blocking: work is dispatched to a bounded goroutine pool
+// (maxEnricherConcurrency slots).  If all slots are occupied the call blocks
+// only until a slot is free, preventing unbounded goroutine creation.
+// Each goroutine has a defer/recover so a panic in one article cannot
+// propagate to the calling pipeline.
 func (en *Enricher) EnrichNewsItem(ctx context.Context, newsItemID, headline, summary string) {
+	en.sem <- struct{}{} // acquire slot (blocks if at capacity)
 	go func() {
+		defer func() { <-en.sem }() // release slot
+		defer func() {
+			if rec := recover(); rec != nil {
+				logger.Error("knowledge enrichment panic",
+					"news_id", newsItemID,
+					"panic", fmt.Sprintf("%v", rec),
+				)
+			}
+		}()
 		if err := en.enrich(ctx, newsItemID, headline, summary); err != nil {
 			logger.Warn("knowledge enrichment failed",
 				"news_id", newsItemID,
@@ -180,10 +204,13 @@ func (en *Enricher) persistExtractedRelationship(ctx context.Context, newsItemID
 		return fmt.Errorf("upsert relationship: %w", err)
 	}
 
-	// Record entity mentions linking each entity to this news item.
-	rel := r.Confidence
-	_ = store.UpsertEntityMention(ctx, fromID, newsItemID, &rel)
-	_ = store.UpsertEntityMention(ctx, toID, newsItemID, &rel)
+	// Record entity mentions only when a valid news_item UUID is provided.
+	// Passing an empty string (no UUID available) skips this to avoid FK violations.
+	if newsItemID != "" {
+		rel := r.Confidence
+		_ = store.UpsertEntityMention(ctx, fromID, newsItemID, &rel)
+		_ = store.UpsertEntityMention(ctx, toID, newsItemID, &rel)
+	}
 
 	logger.Info("knowledge enrichment: new relationship extracted",
 		"from", r.FromEntity, "to", r.ToEntity,

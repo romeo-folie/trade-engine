@@ -73,15 +73,20 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	// We piggyback on CustomSystemPrompt/CustomUserMessage + RawResponse so no
 	// new interface methods are required.
 	callFn := knowledge.ExtractionCallFn(func(ctx context.Context, system, user string) (string, error) {
-		_, meta, _ := az.Analyze(ctx, analysis.AnalysisRequest{
+		_, meta, err := az.Analyze(ctx, analysis.AnalysisRequest{
 			Ticker:             "__extraction__",
 			CustomSystemPrompt: system,
 			CustomUserMessage:  user,
 		})
-		// meta.RawResponse is populated even when the JSON parse step fails
-		// (extraction output is a JSON array, not an AnalysisResponse).
+		// meta.RawResponse is populated before the JSON-parse step.  The parse
+		// step fails for extraction output (JSON array ≠ AnalysisResponse), which
+		// is expected — we want the raw text, not the parsed struct.
 		if meta.RawResponse != "" {
 			return meta.RawResponse, nil
+		}
+		// No raw response means the HTTP/auth/rate-limit layer failed.
+		if err != nil {
+			return "", fmt.Errorf("enricher: model call failed: %w", err)
 		}
 		return "", fmt.Errorf("enricher: empty model response")
 	})
@@ -285,7 +290,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 
 	// Build knowledge graph context for this ticker (best-effort; non-fatal).
 	var knowledgeCtx string
-	if gc, err := knowledge.BuildContext(ctx, ticker, nil); err == nil {
+	if gc, err := knowledge.BuildContext(ctx, ticker, e.portfolio.PositionMap()); err == nil {
 		knowledgeCtx = gc.Format()
 	}
 
@@ -420,12 +425,13 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 	logger.Info("news fetched", "ticker", ticker, "count", len(items))
 
 	// Kick off relationship extraction for each article in the background.
-	// EnrichNewsItem is non-blocking — it fires a goroutine and returns.
+	// EnrichNewsItem is semaphore-bounded and non-blocking from the caller's
+	// perspective (blocks only if all extraction slots are full).
+	// newsItemID is passed as "" because we don't have the DB UUID here;
+	// entity-mention recording is skipped when no UUID is provided.
 	if e.enricher != nil {
 		for _, item := range items {
-			// Use the URL as a stable surrogate ID for entity mention bookkeeping
-			// when the DB news_item UUID isn't readily available here.
-			e.enricher.EnrichNewsItem(ctx, item.URL, item.Headline, item.Summary)
+			e.enricher.EnrichNewsItem(ctx, "", item.Headline, item.Summary)
 		}
 	}
 }

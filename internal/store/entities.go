@@ -30,14 +30,17 @@ type Entity struct {
 // ticker, and updated_at are overwritten with the supplied values.
 func UpsertEntity(ctx context.Context, e Entity) (string, error) {
 	var id string
+	// ON CONFLICT: use COALESCE so an auto-generated upsert (with sparse fields)
+	// never overwrites rich seed/manual data with NULLs.  The new value wins only
+	// when the existing column is already NULL.
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO entities (entity_type, name, ticker, description, sector, country)
 		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (name, entity_type) DO UPDATE
-		  SET ticker      = EXCLUDED.ticker,
-		      description = EXCLUDED.description,
-		      sector      = EXCLUDED.sector,
-		      country     = EXCLUDED.country,
+		  SET ticker      = COALESCE(entities.ticker,      EXCLUDED.ticker),
+		      description = COALESCE(entities.description, EXCLUDED.description),
+		      sector      = COALESCE(entities.sector,      EXCLUDED.sector),
+		      country     = COALESCE(entities.country,     EXCLUDED.country),
 		      updated_at  = NOW()
 		RETURNING id`,
 		e.EntityType,
