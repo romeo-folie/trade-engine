@@ -67,6 +67,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			toPromptNews(req.News),
 			toPromptPortfolio(req.Portfolio),
 			req.KnowledgeContext,
+			toPromptSimilarSetups(req.SimilarAnalyses),
 		)
 	}
 
@@ -268,6 +269,21 @@ func toPromptPortfolio(p PortfolioContext) prompts.Portfolio {
 		CashAvailable: p.CashAvailable,
 		OpenPositions: pos,
 	}
+}
+
+func toPromptSimilarSetups(setups []SimilarSetup) []prompts.SimilarPastSetup {
+	out := make([]prompts.SimilarPastSetup, len(setups))
+	for i, s := range setups {
+		out[i] = prompts.SimilarPastSetup{
+			Ticker:          s.Ticker,
+			Action:          s.Action,
+			Confidence:      s.Confidence,
+			Reasoning:       s.Reasoning,
+			CreatedAt:       s.CreatedAt,
+			TradeOutcomePct: s.TradeOutcomePct,
+		}
+	}
+	return out
 }
 
 func min(a, b int) int {

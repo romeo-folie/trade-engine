@@ -65,21 +65,6 @@ var _ = func() bool {
 	return true
 }()
 
-// ── Embeddings ────────────────────────────────────────────────────────────────
-
-var embeddingsCmd = &cobra.Command{
-	Use:   "embeddings",
-	Short: "Manage embedding generation (Phase 8)",
-}
-
-var _ = func() bool {
-	embeddingsCmd.AddCommand(
-		&cobra.Command{Use: "sync", Short: "Sync pending embeddings", RunE: stub("te embeddings sync")},
-		&cobra.Command{Use: "status", Short: "Show embedding pipeline status", RunE: stub("te embeddings status")},
-	)
-	return true
-}()
-
 // ── Web visualisation ─────────────────────────────────────────────────────────
 
 var webCmd = &cobra.Command{

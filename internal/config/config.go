@@ -25,6 +25,66 @@ type Config struct {
 	Database      DatabaseConfig      `yaml:"database"`
 	Reports       ReportsConfig       `yaml:"reports"`
 	Backtest      BacktestConfig      `yaml:"backtest"`
+	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
+}
+
+// ── Embeddings ─────────────────────────────────────────────────────────────────
+//
+// Embedding dimension decision (Phase 11):
+//
+//   Provider "openai" uses text-embedding-3-small (1536 dimensions).
+//   Provider "ollama" uses nomic-embed-text (768 dimensions).
+//
+//   The vector columns in migrations/003_market_data.sql, 004_knowledge_graph.sql,
+//   and 005_analysis.sql are all created as vector(1536), matching the OpenAI model.
+//
+//   To switch providers and re-dimension:
+//     1. Update EmbeddingsConfig.Provider and EmbeddingsConfig.Dimension.
+//     2. Write a new migration: ALTER TABLE … ALTER COLUMN embedding TYPE vector(N).
+//     3. Run `te embeddings reindex` to regenerate all stored embeddings.
+
+type EmbeddingsConfig struct {
+	// Enabled controls whether the background embedding worker runs at all.
+	Enabled bool `yaml:"enabled"`
+
+	// Provider selects the embedding backend: "openai" (default) or "ollama".
+	Provider string `yaml:"provider"`
+
+	// Dimension is the vector size produced by the chosen model.
+	// Must match the vector() column size in the migrations.
+	// Default: 1536 (text-embedding-3-small). Ollama nomic-embed-text: 768.
+	Dimension int `yaml:"dimension"`
+
+	// APIKeyEnv is the environment variable name holding the OpenAI API key.
+	// Only required when provider = "openai".
+	APIKeyEnv string `yaml:"api_key_env"`
+	APIKey    string `yaml:"-"` // resolved from APIKeyEnv at load time
+
+	// OllamaBaseURL is the Ollama server URL (default: http://localhost:11434).
+	OllamaBaseURL string `yaml:"ollama_base_url"`
+
+	// Model overrides the default embedding model for the chosen provider.
+	// Leave empty to use the provider default.
+	Model string `yaml:"model"`
+
+	// WorkerIntervalSec is how often the background worker polls for unembedded rows.
+	// Default: 30 seconds.
+	WorkerIntervalSec int `yaml:"worker_interval_sec"`
+
+	// BatchSize is the max number of rows the worker processes per poll cycle.
+	// Default: 50.
+	BatchSize int `yaml:"batch_size"`
+
+	// SimilarAnalysesEnabled gates the "Similar Past Setups" section in prompts.
+	SimilarAnalysesEnabled bool `yaml:"similar_analyses_enabled"`
+
+	// SimilarAnalysesThreshold is the minimum cosine similarity score (0–1) for
+	// a past analysis to be included. Default: 0.80.
+	SimilarAnalysesThreshold float64 `yaml:"similar_analyses_threshold"`
+
+	// SimilarAnalysesLimit caps how many past analyses are injected per prompt.
+	// Default: 3.
+	SimilarAnalysesLimit int `yaml:"similar_analyses_limit"`
 }
 
 // ── Engine ────────────────────────────────────────────────────────────────────
@@ -333,6 +393,7 @@ func resolveEnvVars(cfg *Config) {
 	cfg.Markets.Stocks.Secret = resolveEnv(cfg.Markets.Stocks.SecretEnv)
 	cfg.Markets.News.APIKey = resolveEnv(cfg.Markets.News.APIKeyEnv)
 	cfg.Notifications.Telegram.BotToken = resolveEnv(cfg.Notifications.Telegram.BotTokenEnv)
+	cfg.Embeddings.APIKey = resolveEnv(cfg.Embeddings.APIKeyEnv)
 	for k, p := range cfg.Markets.Predictions.Platforms {
 		p.APIKey = resolveEnv(p.APIKeyEnv)
 		cfg.Markets.Predictions.Platforms[k] = p

@@ -47,6 +47,24 @@ type AnalysisRequest struct {
 	// injection into the stock prompt's KNOWLEDGE GRAPH section.
 	// Empty string causes the prompt to emit a "not available" placeholder.
 	KnowledgeContext string
+
+	// SimilarAnalyses is a list of semantically similar past setups to inject
+	// into the SIMILAR PAST ANALYSES section.  Populated from pgvector search
+	// when embeddings.similar_analyses_enabled = true.
+	// Empty slice causes the prompt to emit a "not available" placeholder.
+	SimilarAnalyses []SimilarSetup
+}
+
+// SimilarSetup describes a past analysis that resembles the current one,
+// used for prompt injection.  Mirrors store.SimilarAnalysis without importing
+// the store package into the analysis layer.
+type SimilarSetup struct {
+	Ticker          string
+	Action          string
+	Confidence      float64
+	Reasoning       string
+	CreatedAt       string
+	TradeOutcomePct *float64
 }
 
 // AnalysisResponse is the structured output the model must return.

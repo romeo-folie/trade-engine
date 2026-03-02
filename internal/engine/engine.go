@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
@@ -49,7 +50,8 @@ type Engine struct {
 	executor     execution.Executor
 	portfolio    *portfolio.Tracker
 	bus          *events.Bus
-	enricher     *knowledge.Enricher // nil if no LLM configured
+	enricher     *knowledge.Enricher  // nil if no LLM configured
+	embedder     embeddings.Embedder  // nil if embeddings disabled
 
 	// newsLastFetched tracks when news was last fetched per ticker, to avoid
 	// hammering the news API on every 5-min tick.
@@ -91,6 +93,16 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		return "", fmt.Errorf("enricher: empty model response")
 	})
 
+	// Create embedder for similar-analysis search (best-effort; disabled if not configured).
+	var emb embeddings.Embedder
+	if cfg.Embeddings.Enabled && cfg.Embeddings.SimilarAnalysesEnabled {
+		if e, err := embeddings.New(cfg.Embeddings); err == nil {
+			emb = e
+		} else {
+			logger.Warn("embeddings disabled", "err", err.Error())
+		}
+	}
+
 	return &Engine{
 		cfg:             cfg,
 		marketData:      market,
@@ -100,6 +112,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		portfolio:       portfolio.NewTracker(time.Hour),
 		bus:             events.New(),
 		enricher:        knowledge.NewEnricher(cfg, callFn),
+		embedder:        emb,
 		newsLastFetched: make(map[string]time.Time),
 		mode:            mode,
 	}
@@ -294,12 +307,37 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		knowledgeCtx = gc.Format()
 	}
 
+	// Semantic search for similar past setups (best-effort).
+	var similarSetups []analysis.SimilarSetup
+	if e.embedder != nil && e.cfg.Embeddings.SimilarAnalysesEnabled {
+		// Embed a compact description of current conditions for similarity search.
+		searchText := fmt.Sprintf("%s RSI:%.1f EMA20:%.2f MACD:%.4f ADX:%.1f",
+			ticker, set.RSI, set.EMA20, set.MACDLine, set.ADX)
+		if queryVec, err := e.embedder.Embed(ctx, searchText); err == nil {
+			threshold := e.cfg.Embeddings.SimilarAnalysesThreshold
+			limit := e.cfg.Embeddings.SimilarAnalysesLimit
+			if past, err := store.FindSimilarAnalyses(ctx, queryVec, threshold, limit); err == nil {
+				for _, p := range past {
+					similarSetups = append(similarSetups, analysis.SimilarSetup{
+						Ticker:          p.Ticker,
+						Action:          p.Action,
+						Confidence:      p.Confidence,
+						Reasoning:       p.Reasoning,
+						CreatedAt:       p.CreatedAt,
+						TradeOutcomePct: p.TradeOutcomePct,
+					})
+				}
+			}
+		}
+	}
+
 	req := analysis.AnalysisRequest{
 		Ticker:           ticker,
 		Strategy:         strategy,
 		Timeframe:        timeframe,
 		RecentCandles:    snaps,
 		KnowledgeContext: knowledgeCtx,
+		SimilarAnalyses:  similarSetups,
 		Indicators: analysis.IndicatorSnapshot{
 			EMA20: set.EMA20, EMA50: set.EMA50, EMA200: set.EMA200,
 			SMA20: set.SMA20, SMA50: set.SMA50, SMA200: set.SMA200,
