@@ -12,6 +12,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -114,6 +115,16 @@ Modes:
 		if predRunner.Enabled() {
 			go predRunner.Run(ctx)
 			logger.Info("prediction market runner started")
+		}
+
+		// Start background embedding worker if enabled.
+		if cfg.Embeddings.Enabled {
+			if worker, err := embeddings.NewWorker(cfg.Embeddings); err != nil {
+				logger.Warn("embedding worker disabled", "err", err.Error())
+			} else {
+				go worker.Run(ctx)
+				logger.Info("embedding worker started")
+			}
 		}
 
 		// Start Telegram notifications if enabled.

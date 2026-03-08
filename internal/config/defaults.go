@@ -129,5 +129,18 @@ func Defaults() *Config {
 			InitialCash:  100_000,
 			RiskFreeRate: 0.04,
 		},
+		Embeddings: EmbeddingsConfig{
+			Enabled:                  false,
+			Provider:                 "openai",
+			Dimension:                1536,
+			APIKeyEnv:                "OPENAI_API_KEY",
+			OllamaBaseURL:            "http://localhost:11434",
+			Model:                    "", // uses provider default
+			WorkerIntervalSec:        30,
+			BatchSize:                50,
+			SimilarAnalysesEnabled:   false,
+			SimilarAnalysesThreshold: 0.80,
+			SimilarAnalysesLimit:     3,
+		},
 	}
 }

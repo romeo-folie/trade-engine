@@ -50,6 +50,17 @@ type Position struct {
 	Quantity, AvgCostBasis, CurrentValue, UnrealizedPL float64
 }
 
+// SimilarPastSetup represents a past analysis included in the "Similar Past
+// Analyses" prompt section.  Nil TradeOutcomePct means no closed trade is linked.
+type SimilarPastSetup struct {
+	Ticker          string
+	Action          string
+	Confidence      float64
+	Reasoning       string
+	CreatedAt       string
+	TradeOutcomePct *float64
+}
+
 // ─── Prompt builder ───────────────────────────────────────────────────────────
 
 // BuildStockPrompt returns (systemPrompt, userMessage) for a stock analysis request.
@@ -68,9 +79,10 @@ func BuildStockPrompt(
 	news []NewsItem,
 	portfolio Portfolio,
 	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
 ) (systemPrompt, userMessage string) {
 	systemPrompt = buildSystem(strategy)
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext)
+	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups)
 	return
 }
 
@@ -105,6 +117,7 @@ func buildUser(
 	news []NewsItem,
 	portfolio Portfolio,
 	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
 ) string {
 	var b strings.Builder
 
@@ -174,10 +187,34 @@ func buildUser(
 		b.WriteString("No relationship data available.\n")
 	}
 
-	// Similar past analyses placeholder (Phase 11)
+	// Similar past setups (populated by Phase 11 semantic search).
 	b.WriteString("\n### SIMILAR PAST ANALYSES\n")
-	b.WriteString("No historical comparisons available yet.\n")
+	if len(similarSetups) > 0 {
+		for _, s := range similarSetups {
+			outcome := "outcome unknown"
+			if s.TradeOutcomePct != nil {
+				if *s.TradeOutcomePct >= 0 {
+					outcome = fmt.Sprintf("trade resulted in +%.2f%%", *s.TradeOutcomePct)
+				} else {
+					outcome = fmt.Sprintf("trade resulted in %.2f%%", *s.TradeOutcomePct)
+				}
+			}
+			b.WriteString(fmt.Sprintf("- %s [%s] — %s at confidence %.0f%%. %s. Reasoning: %s\n",
+				s.CreatedAt, s.Ticker, s.Action, s.Confidence*100, outcome, truncateStr(s.Reasoning, 200)))
+		}
+	} else {
+		b.WriteString("No similar past setups found.\n")
+	}
 
 	b.WriteString("\nRespond with ONLY the JSON object.")
 	return b.String()
+}
+
+// truncateStr truncates s to at most n runes, appending "…" if truncated.
+func truncateStr(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }
