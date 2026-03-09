@@ -61,6 +61,88 @@ func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.
 	return id, err
 }
 
+// EnsembleRecord carries Phase 12 ensemble-specific fields for storage.
+type EnsembleRecord struct {
+	EnsembleResults []byte // JSON-serialised []AnalystResult
+	ArbiterResponse []byte // JSON-serialised ArbiterResult; nil if fast-pathed
+	FastPathed      bool
+	DissentSummary  string
+}
+
+// InsertEnsembleAnalysis persists an ensemble analysis record (Phase 12).
+func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta, ensemble EnsembleRecord) (string, error) {
+	q := `
+		INSERT INTO analyses (
+			ticker, strategy, action, confidence, size_pct,
+			stop_loss, take_profit, reasoning,
+			raw_response, raw_prompt, prompt_hash,
+			model_provider, model_name,
+			token_count_input, token_count_output, latency_ms,
+			indicators,
+			ensemble_results, arbiter_response, fast_pathed, dissent_summary
+		) VALUES (
+			$1, $2, $3, $4, $5,
+			$6, $7, $8,
+			$9, $10, $11,
+			$12, $13,
+			$14, $15, $16,
+			$17,
+			$18, $19, $20, $21
+		) RETURNING id`
+	var id string
+	err := GetDB().QueryRow(ctx, q,
+		ticker, strategy, string(resp.Action), resp.Confidence, resp.SizePct,
+		nullableFloat(resp.StopLoss), nullableFloat(resp.TakeProfit), resp.Reasoning,
+		meta.RawResponse, meta.RawPrompt, meta.PromptHash,
+		meta.Provider, meta.Model,
+		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
+		meta.IndicatorJSON,
+		ensemble.EnsembleResults, ensemble.ArbiterResponse, ensemble.FastPathed,
+		nullableString(ensemble.DissentSummary),
+	).Scan(&id)
+	return id, err
+}
+
+// ModelPerformanceRow is a row from the model_performance_detail view.
+type ModelPerformanceRow struct {
+	Provider             string
+	Model                string
+	TotalRecommendations int
+	AvgConfidence        float64
+	TradeCount           int
+	AvgPnLPct            *float64
+	WinningTrades        int
+	LosingTrades         int
+	WinRate              *float64
+}
+
+// GetModelPerformance returns per-model accuracy stats (Phase 12.6).
+func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformanceRow, error) {
+	q := `
+		SELECT provider, model,
+		       total_recommendations, avg_confidence,
+		       trade_count, avg_pnl_pct,
+		       winning_trades, losing_trades, win_rate
+		FROM model_performance_detail
+		WHERE trade_count >= $1
+		ORDER BY win_rate DESC NULLS LAST, avg_pnl_pct DESC NULLS LAST`
+	rows, err := GetDB().Query(ctx, q, minTrades)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ModelPerformanceRow
+	for rows.Next() {
+		var r ModelPerformanceRow
+		if err := rows.Scan(&r.Provider, &r.Model, &r.TotalRecommendations, &r.AvgConfidence,
+			&r.TradeCount, &r.AvgPnLPct, &r.WinningTrades, &r.LosingTrades, &r.WinRate); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // GetAnalysesByTicker retrieves the most recent `limit` analyses for a ticker.
 func GetAnalysesByTicker(ctx context.Context, ticker string, limit int) ([]StoredAnalysis, error) {
 	q := `

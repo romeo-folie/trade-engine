@@ -176,3 +176,25 @@ type PositionSummary struct {
 	CurrentValue float64
 	UnrealizedPL float64
 }
+
+// ─── Phase 12 types ───────────────────────────────────────────────────────────
+
+// AnalystResult holds the outcome of one analyst model call (Phase 12).
+type AnalystResult struct {
+	Provider  string
+	Model     string
+	Response  AnalysisResponse
+	Meta      ModelCallMeta
+	Err       error
+	LatencyMs int64
+}
+
+// AnalyzeResult is the richer return type for Analyzer.AnalyzeFull.
+// In single-analyst mode AnalystResults has one entry and Arbiter is nil.
+type AnalyzeResult struct {
+	Response       AnalysisResponse
+	Meta           ModelCallMeta
+	AnalystResults []AnalystResult
+	Arbiter        *ArbiterResult // nil when fast-pathed or single-model
+	FastPathed     bool
+}

@@ -5,6 +5,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sync"
@@ -358,17 +359,19 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		Portfolio: analysis.PortfolioContext{}, // Phase 4
 	}
 
-	resp, meta, err := e.analyzer.Analyze(ctx, req)
+	result, err := e.analyzer.AnalyzeFull(ctx, req)
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
 		return
 	}
+	resp, meta := result.Response, result.Meta
 
 	logger.Info("analysis complete",
 		"ticker", ticker,
 		"action", string(resp.Action),
 		"confidence", fmt.Sprintf("%.2f", resp.Confidence),
-		"size_pct", fmt.Sprintf("%.1f%%", resp.SizePct),
+		"analysts", len(result.AnalystResults),
+		"fast_pathed", result.FastPathed,
 		"reasoning", resp.Reasoning[:min(120, len(resp.Reasoning))],
 	)
 	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
@@ -376,7 +379,25 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		Reasoning: resp.Reasoning, Provider: meta.Provider, Model: meta.Model, LatencyMs: meta.LatencyMs,
 	})
 
-	analysisID, err := store.InsertAnalysis(ctx, ticker, strategy, resp, meta)
+	// Persist — use ensemble variant when multiple analysts were queried.
+	var analysisID string
+	if len(result.AnalystResults) > 1 {
+		ensembleJSON, _ := json.Marshal(result.AnalystResults)
+		var arbJSON []byte
+		var dissentSummary string
+		if result.Arbiter != nil {
+			arbJSON, _ = json.Marshal(result.Arbiter)
+			dissentSummary = result.Arbiter.DissentSummary
+		}
+		analysisID, err = store.InsertEnsembleAnalysis(ctx, ticker, strategy, resp, meta, store.EnsembleRecord{
+			EnsembleResults: ensembleJSON,
+			ArbiterResponse: arbJSON,
+			FastPathed:      result.FastPathed,
+			DissentSummary:  dissentSummary,
+		})
+	} else {
+		analysisID, err = store.InsertAnalysis(ctx, ticker, strategy, resp, meta)
+	}
 	if err != nil {
 		logger.Warn("store analysis", "ticker", ticker, "err", err.Error())
 	}
