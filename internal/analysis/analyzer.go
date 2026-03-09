@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/sync/errgroup"
-
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
@@ -154,10 +152,12 @@ func (a *Analyzer) AnalyzeEnsemble(ctx context.Context, req AnalysisRequest) ([]
 	mu := &sync.Mutex{}
 	results := make([]AnalystResult, 0, len(available))
 
-	eg, _ := errgroup.WithContext(ctx)
+	var wg sync.WaitGroup
 	for _, p := range available {
 		p := p
-		eg.Go(func() error {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
 			timeout := modelTimeout(p, a.cfg)
 			mctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
@@ -173,10 +173,9 @@ func (a *Analyzer) AnalyzeEnsemble(ctx context.Context, req AnalysisRequest) ([]
 				Response: resp, Meta: meta, Err: err, LatencyMs: lat,
 			})
 			mu.Unlock()
-			return nil
-		})
+		}()
 	}
-	_ = eg.Wait()
+	wg.Wait()
 
 	successes := 0
 	for _, r := range results {

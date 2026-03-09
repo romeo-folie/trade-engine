@@ -80,12 +80,14 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	if model == "" {
 		model = "gemini-pro"
 	}
-	url := fmt.Sprintf("%s/%s:generateContent?key=%s", geminiAPIBaseURL, model, c.apiKey)
+	// Key in header — never in URL (prevents leaking via access logs, proxies, referers).
+	url := fmt.Sprintf("%s/%s:generateContent", geminiAPIBaseURL, model)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
 	}
 	httpReq.Header.Set("content-type", "application/json")
+	httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)

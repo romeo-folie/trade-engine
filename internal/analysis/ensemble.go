@@ -53,14 +53,39 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 		return AnalysisResponse{}, false
 	}
 	avg := math.Round(sum/float64(len(confs))*1000) / 1000
-	ref := successes[0].Response
+
+	// Average SizePct, StopLoss, TakeProfit across all analysts so that risk
+	// parameters are not determined by whichever analyst happened to respond fastest.
+	var sumSizePct, sumSL, sumTP float64
+	var countSL, countTP int
+	for _, r := range successes {
+		sumSizePct += r.Response.SizePct
+		if r.Response.StopLoss > 0 {
+			sumSL += r.Response.StopLoss
+			countSL++
+		}
+		if r.Response.TakeProfit > 0 {
+			sumTP += r.Response.TakeProfit
+			countTP++
+		}
+	}
+	n := float64(len(successes))
+	avgSizePct := math.Round(sumSizePct/n*100) / 100
+	var avgSL, avgTP float64
+	if countSL > 0 {
+		avgSL = math.Round(sumSL/float64(countSL)*10000) / 10000
+	}
+	if countTP > 0 {
+		avgTP = math.Round(sumTP/float64(countTP)*10000) / 10000
+	}
+
 	return AnalysisResponse{
 		Action:     action,
 		Confidence: avg,
-		SizePct:    ref.SizePct,
-		StopLoss:   ref.StopLoss,
-		TakeProfit: ref.TakeProfit,
-		Reasoning:  "[fast-path] All analysts unanimous — averaged confidence applied.",
+		SizePct:    avgSizePct,
+		StopLoss:   avgSL,
+		TakeProfit: avgTP,
+		Reasoning:  "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
 	}, true
 }
 
@@ -135,11 +160,13 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 		counts[r.Response.Action]++
 		confSum[r.Response.Action] += r.Response.Confidence
 	}
+	// Iterate in explicit priority order so ties are deterministic: BUY > SELL > HOLD.
+	// Map iteration order is random; ranging over a fixed slice is not.
 	var winner Action = ActionHold
 	maxCount := 0
-	for action, count := range counts {
-		if count > maxCount || (count == maxCount && action == ActionHold) {
-			maxCount = count
+	for _, action := range []Action{ActionBuy, ActionSell, ActionHold} {
+		if counts[action] > maxCount {
+			maxCount = counts[action]
 			winner = action
 		}
 	}

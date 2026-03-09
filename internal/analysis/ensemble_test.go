@@ -93,14 +93,27 @@ func TestMajorityVote_ClearMajority(t *testing.T) {
 	}
 }
 
-func TestMajorityVote_TieFavorsHold(t *testing.T) {
+func TestMajorityVote_TieBuyBeatsHold(t *testing.T) {
+	// Priority order is BUY > SELL > HOLD; BUY wins any tie against HOLD.
 	results := []AnalystResult{makeResult(ActionBuy, 0.80, nil), makeResult(ActionHold, 0.80, nil)}
 	resp, ok := majorityVote(results)
 	if !ok {
 		t.Fatal("majorityVote should succeed")
 	}
-	if resp.Action != ActionHold {
-		t.Fatalf("action = %q, want HOLD on tie", resp.Action)
+	if resp.Action != ActionBuy {
+		t.Fatalf("action = %q, want BUY on BUY-HOLD tie (BUY > HOLD priority)", resp.Action)
+	}
+}
+
+func TestMajorityVote_TieBuyBeatsSell(t *testing.T) {
+	// BUY > SELL in tie — deterministic, no map iteration randomness.
+	results := []AnalystResult{makeResult(ActionBuy, 0.80, nil), makeResult(ActionSell, 0.80, nil)}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionBuy {
+		t.Fatalf("action = %q, want BUY on BUY-SELL tie (BUY > SELL priority)", resp.Action)
 	}
 }
 
