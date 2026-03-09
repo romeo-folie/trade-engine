@@ -99,14 +99,22 @@ type EngineConfig struct {
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
+// ModelsConfig holds Phase 12 ensemble configuration.
+// Legacy primary/secondary keys are auto-migrated to analysts[] on load.
 type ModelsConfig struct {
-	Primary   ModelConfig     `yaml:"primary"`
-	Secondary []ModelConfig   `yaml:"secondary"`
+	// Phase 12 fields.
+	Analysts []ModelConfig `yaml:"analysts,omitempty"`
+	Arbiter  ModelConfig   `yaml:"arbiter,omitempty"`
+
+	// Legacy fields (pre-Phase 12) — kept for backward compatibility.
+	Primary   ModelConfig   `yaml:"primary,omitempty"`
+	Secondary []ModelConfig `yaml:"secondary,omitempty"`
+
 	Consensus ConsensusConfig `yaml:"consensus"`
 }
 
 type ModelConfig struct {
-	Provider    string  `yaml:"provider"` // anthropic | openai | ollama
+	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
 	Model       string  `yaml:"model"`
 	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
 	APIKey      string  `yaml:"-"`           // resolved at runtime, never serialised
@@ -116,8 +124,14 @@ type ModelConfig struct {
 }
 
 type ConsensusConfig struct {
-	Enabled  bool   `yaml:"enabled"`
-	Strategy string `yaml:"strategy"` // majority | unanimous | primary-with-veto
+	Enabled bool `yaml:"enabled"`
+
+	// Phase 12: fast-path fires when all analysts agree, minConf & spread met.
+	FastPathConfidence float64 `yaml:"fast_path_confidence"` // default 0.80
+	FastPathMaxSpread  float64 `yaml:"fast_path_max_spread"`  // default 0.15
+
+	// Legacy field.
+	Strategy string `yaml:"strategy,omitempty"` // majority | unanimous | primary-with-veto
 }
 
 // ── Markets ───────────────────────────────────────────────────────────────────
@@ -305,9 +319,21 @@ func Load() (*Config, error) {
 		}
 	}
 
+	migrateModelsConfig(cfg)
 	resolveEnvVars(cfg)
 	current = cfg
 	return cfg, nil
+}
+
+// migrateModelsConfig auto-migrates legacy primary/secondary to Phase 12 analysts/arbiter.
+func migrateModelsConfig(cfg *Config) {
+	m := &cfg.Models
+	if len(m.Analysts) > 0 {
+		return // already using new format
+	}
+	if m.Primary.Provider != "" {
+		m.Analysts = append([]ModelConfig{m.Primary}, m.Secondary...)
+	}
 }
 
 // Get returns the current config. Panics if Load was not called.
@@ -355,12 +381,19 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
 	}
 
-	validStrategies := map[string]bool{"majority": true, "unanimous": true, "primary-with-veto": true}
-	if cfg.Models.Consensus.Enabled && !validStrategies[cfg.Models.Consensus.Strategy] {
-		errs = append(errs, fmt.Sprintf("models.consensus.strategy must be one of majority|unanimous|primary-with-veto, got %q", cfg.Models.Consensus.Strategy))
+	// Phase 12: validate analysts list.
+	if len(cfg.Models.Analysts) == 0 {
+		errs = append(errs, "models.analysts must contain at least one entry (or use legacy models.primary)")
+	} else if len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
+		errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
 	}
-
-	if cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
+	for i, a := range cfg.Models.Analysts {
+		if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
+			errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
+		}
+	}
+	// Legacy single-model validation.
+	if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
 		errs = append(errs, fmt.Sprintf("env var %s (models.primary.api_key_env) is not set", cfg.Models.Primary.APIKeyEnv))
 	}
 
@@ -388,7 +421,13 @@ func Validate(cfg *Config) []string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func resolveEnvVars(cfg *Config) {
+	// Legacy primary field.
 	cfg.Models.Primary.APIKey = resolveEnv(cfg.Models.Primary.APIKeyEnv)
+	// Phase 12: analysts + arbiter.
+	for i := range cfg.Models.Analysts {
+		cfg.Models.Analysts[i].APIKey = resolveEnv(cfg.Models.Analysts[i].APIKeyEnv)
+	}
+	cfg.Models.Arbiter.APIKey = resolveEnv(cfg.Models.Arbiter.APIKeyEnv)
 	cfg.Markets.Stocks.APIKey = resolveEnv(cfg.Markets.Stocks.APIKeyEnv)
 	cfg.Markets.Stocks.Secret = resolveEnv(cfg.Markets.Stocks.SecretEnv)
 	cfg.Markets.News.APIKey = resolveEnv(cfg.Markets.News.APIKeyEnv)
