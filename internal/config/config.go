@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -359,7 +360,7 @@ func SetField(dotPath, value string) error {
 		}
 	}
 
-	parts := strings.SplitN(dotPath, ".", 2)
+	parts := strings.Split(dotPath, ".")
 	if len(node.Content) == 0 {
 		node = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{{Kind: yaml.MappingNode}}}
 	}
@@ -457,6 +458,22 @@ func save(cfg *Config, path string) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+func scalarNode(value string) *yaml.Node {
+	if b, err := strconv.ParseBool(value); err == nil {
+		if b {
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"}
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "false"}
+	}
+	if i, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.FormatInt(i, 10)}
+	}
+	if f, err := strconv.ParseFloat(value, 64); err == nil {
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(f, 'f', -1, 64)}
+	}
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
+}
+
 // setYAMLNode sets a dotted-path key in a YAML mapping node tree.
 func setYAMLNode(node *yaml.Node, parts []string, value string) {
 	if node.Kind != yaml.MappingNode {
@@ -466,7 +483,7 @@ func setYAMLNode(node *yaml.Node, parts []string, value string) {
 	for i := 0; i < len(node.Content)-1; i += 2 {
 		if node.Content[i].Value == key {
 			if len(parts) == 1 {
-				node.Content[i+1].Value = value
+				node.Content[i+1] = scalarNode(value)
 			} else {
 				setYAMLNode(node.Content[i+1], parts[1:], value)
 			}
@@ -476,8 +493,7 @@ func setYAMLNode(node *yaml.Node, parts []string, value string) {
 	// Key not found — append.
 	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
 	if len(parts) == 1 {
-		valNode := &yaml.Node{Kind: yaml.ScalarNode, Value: value}
-		node.Content = append(node.Content, keyNode, valNode)
+		node.Content = append(node.Content, keyNode, scalarNode(value))
 	} else {
 		child := &yaml.Node{Kind: yaml.MappingNode}
 		node.Content = append(node.Content, keyNode, child)

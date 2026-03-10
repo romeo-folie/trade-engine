@@ -30,6 +30,7 @@ func sampleData() DashboardData {
 		},
 		OpenPositionCnt: 2,
 		LargestPosPct:   46.25,
+		Watchlist:       []string{"AAPL", "TSLA", "MSFT"},
 		LastUpdate:      time.Now(),
 	}
 }
@@ -44,6 +45,7 @@ func TestRenderDashboard_ContainsAllSections(t *testing.T) {
 		"Open Positions (2)", // positions header
 		"AAPL",               // position ticker
 		"TSLA",
+		"Watchlist (3)",    // watchlist section
 		"Pending Approvals", // pending section
 		"MSFT",
 		"Signal Feed", // signal feed
