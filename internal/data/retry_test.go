@@ -25,7 +25,7 @@ func TestIsRetryable(t *testing.T) {
 		{"401 not retryable", &httpError{status: 401, msg: "unauthorized"}, false},
 		{"403 not retryable", &httpError{status: 403, msg: "forbidden"}, false},
 		{"404 not retryable", &httpError{status: 404, msg: "not found"}, false},
-		{"429 not retryable", &httpError{status: 429, msg: "rate limited"}, false},
+		{"429 retryable", &httpError{status: 429, msg: "rate limited"}, true},
 		{"generic error not retryable", errors.New("some error"), false},
 	}
 	for _, tc := range tests {
@@ -167,6 +167,42 @@ func TestWithRetry_ExhaustsAttempts(t *testing.T) {
 	}
 }
 
+
+
+func TestParseRetryAfterHeader(t *testing.T) {
+	now := time.Date(2026, 3, 10, 16, 0, 0, 0, time.UTC)
+	if d, ok := parseRetryAfterHeader("2", now); !ok || d != 2*time.Second {
+		t.Fatalf("seconds parse failed: ok=%v d=%v", ok, d)
+	}
+	h := now.Add(3 * time.Second).Format(http.TimeFormat)
+	if d, ok := parseRetryAfterHeader(h, now); !ok || d < 2*time.Second || d > 3*time.Second {
+		t.Fatalf("http-date parse failed: ok=%v d=%v", ok, d)
+	}
+	if _, ok := parseRetryAfterHeader("", now); ok {
+		t.Fatal("expected empty header to fail")
+	}
+}
+
+func TestWithRetry_RespectsRetryAfterOn429(t *testing.T) {
+	var calls int32
+	start := time.Now()
+	_, err := withRetry(context.Background(), func() (*http.Response, error) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			return nil, &httpError{status: 429, msg: "rate limited", retryAfter: 60 * time.Millisecond}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody}, nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+	if elapsed := time.Since(start); elapsed < 60*time.Millisecond {
+		t.Fatalf("expected to wait at least Retry-After, elapsed=%v", elapsed)
+	}
+}
 func TestWithRetry_RespectsContextCancellation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)

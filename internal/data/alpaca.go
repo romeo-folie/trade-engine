@@ -96,10 +96,12 @@ func (c *AlpacaClient) get(ctx context.Context, path string, params url.Values) 
 		}
 		if resp.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
 			resp.Body.Close()
 			return nil, &httpError{
-				status: resp.StatusCode,
-				msg:    fmt.Sprintf("alpaca API %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)),
+				status:     resp.StatusCode,
+				msg:        fmt.Sprintf("alpaca API %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)),
+				retryAfter: retryAfter,
 			}
 		}
 		return resp, nil

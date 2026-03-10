@@ -128,10 +128,11 @@ func (c *KalshiClient) get(ctx context.Context, endpoint string, out interface{}
 		if err != nil {
 			return nil, err
 		}
-		if r.StatusCode >= 500 && r.StatusCode <= 504 {
+		if r.StatusCode >= 400 {
 			body, _ := io.ReadAll(io.LimitReader(r.Body, 512))
+			retryAfter, _ := parseRetryAfterHeader(r.Header.Get("Retry-After"), time.Now())
 			r.Body.Close()
-			return nil, &httpError{status: r.StatusCode, msg: fmt.Sprintf("kalshi HTTP %d: %s", r.StatusCode, truncate(string(body), 200))}
+			return nil, &httpError{status: r.StatusCode, msg: fmt.Sprintf("kalshi HTTP %d: %s", r.StatusCode, truncate(string(body), 200)), retryAfter: retryAfter}
 		}
 		return r, nil
 	})
