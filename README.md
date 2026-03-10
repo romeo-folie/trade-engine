@@ -94,6 +94,20 @@ Check DB health:
 docker compose ps
 ```
 
+If port `5432` is already in use, override the host port in `.env`:
+
+```bash
+cp .env.example .env
+# then edit .env
+POSTGRES_PORT=5434
+```
+
+And use matching `DATABASE_URL`:
+
+```bash
+export DATABASE_URL="postgres://postgres:postgres@localhost:5434/tradeengine?sslmode=disable"
+```
+
 ## CLI Reference
 
 ```
