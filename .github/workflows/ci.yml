@@ -37,7 +37,7 @@ jobs:
 
     services:
       postgres:
-        image: timescale/timescaledb-ha:pg15-latest
+        image: pgvector/pgvector:pg15
         env:
           POSTGRES_DB: tradeengine_test
           POSTGRES_USER: postgres
