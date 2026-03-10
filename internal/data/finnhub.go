@@ -83,23 +83,28 @@ func (c *FinnhubClient) FetchNews(ctx context.Context, ticker string, since time
 	params.Set("token", c.apiKey)
 
 	reqURL := finnhubBaseURL + "/company-news?" + params.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("finnhub request: %w", err)
-	}
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := withRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			resp.Body.Close()
+			return nil, &httpError{
+				status: resp.StatusCode,
+				msg:    fmt.Sprintf("finnhub API error %d for %s", resp.StatusCode, ticker),
+			}
+		}
+		return resp, nil
+	})
 	if err != nil {
 		return nil, fmt.Errorf("finnhub get: %w", err)
 	}
 	defer resp.Body.Close()
-
-	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("finnhub rate limit exceeded")
-	}
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("finnhub API error %d for %s", resp.StatusCode, ticker)
-	}
 
 	var articles []finnhubArticle
 	if err := json.NewDecoder(resp.Body).Decode(&articles); err != nil {
