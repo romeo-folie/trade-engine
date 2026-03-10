@@ -87,7 +87,7 @@ func TestAnalysis_EnsembleInsertAndQuery(t *testing.T) {
 	ctx := context.Background()
 
 	ensResults, _ := json.Marshal([]map[string]any{
-		{"model": "claude-test", "action": "BUY", "confidence": 0.85},
+		{"provider": "anthropic", "model": "claude-test", "action": "BUY", "confidence": 0.85},
 	})
 	arbResult, _ := json.Marshal(map[string]any{"action": "BUY", "reasoning": "test"})
 
@@ -133,13 +133,14 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 
 	label := "INTG-BACKTEST-" + time.Now().Format("150405")
 	run := store.BacktestRun{
-		Label:         label,
-		Ticker:        "TEST_BT_SPY",
-		Strategy:      "momentum",
-		ModelProvider: "anthropic",
-		ModelName:     "claude-test",
-		FromDate:      time.Now().Add(-30 * 24 * time.Hour),
-		ToDate:        time.Now(),
+		Label:          label,
+		Ticker:         "TEST_BT_SPY",
+		Strategy:       "momentum",
+		ModelProvider:  "anthropic",
+		ModelName:      "claude-test",
+		FromDate:       time.Now().Add(-30 * 24 * time.Hour),
+		ToDate:         time.Now(),
+		ConfigSnapshot: json.RawMessage(`{}`),
 	}
 
 	id, err := store.InsertRun(ctx, run)
@@ -349,7 +350,7 @@ func TestRelationship_LifecycleAndMentions(t *testing.T) {
 
 	db := store.GetDB()
 	var newsDBID string
-	if err := db.QueryRow(ctx, `SELECT id FROM news WHERE external_id=$1`, newsExtID).Scan(&newsDBID); err != nil {
+	if err := db.QueryRow(ctx, `SELECT id FROM news_items WHERE external_id=$1`, newsExtID).Scan(&newsDBID); err != nil {
 		t.Fatalf("news ID lookup: %v", err)
 	}
 
@@ -441,11 +442,11 @@ func TestOrder_InsertAndUpdate(t *testing.T) {
 
 	// Insert a trade to attach the order to.
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
-		Ticker:    "TEST_ORD_NVDA",
-		Direction: "buy",
-		Strategy:  "momentum",
+		Ticker:     "TEST_ORD_NVDA",
+		Direction:  "long",
+		Strategy:   "momentum",
 		EntryPrice: 800.0,
-		Quantity:  5.0,
+		Quantity:   5.0,
 	})
 	if err != nil {
 		t.Fatalf("InsertTrade for order test: %v", err)
@@ -580,7 +581,7 @@ func TestTrade_LifecycleAndQuery(t *testing.T) {
 
 	id, err := store.InsertTrade(ctx, store.Trade{
 		Ticker:     "TEST_TR_GOOG",
-		Direction:  "buy",
+		Direction:  "long",
 		Strategy:   "momentum",
 		EntryPrice: 175.0,
 		Quantity:   20.0,
@@ -683,7 +684,7 @@ func TestPortfolio_GetClosedTradesByDateRange(t *testing.T) {
 	// Insert a trade and close it.
 	id, err := store.InsertTrade(ctx, store.Trade{
 		Ticker:     "TEST_PF_AMZN",
-		Direction:  "buy",
+		Direction:  "long",
 		Strategy:   "momentum",
 		EntryPrice: 200.0,
 		Quantity:   10.0,
