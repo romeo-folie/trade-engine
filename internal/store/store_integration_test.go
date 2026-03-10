@@ -143,15 +143,15 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 		ConfigSnapshot: json.RawMessage(`{}`),
 	}
 
-	id, err := store.InsertRun(ctx, run)
+	runLabel, err := store.InsertRun(ctx, run)
 	if err != nil {
 		t.Fatalf("InsertRun: %v", err)
 	}
-	if id == "" {
-		t.Fatal("InsertRun: empty ID")
+	if runLabel == "" {
+		t.Fatal("InsertRun: empty label")
 	}
 
-	got, err := store.GetRunByLabel(ctx, label)
+	got, err := store.GetRunByLabel(ctx, runLabel)
 	if err != nil {
 		t.Fatalf("GetRunByLabel: %v", err)
 	}
@@ -168,9 +168,9 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 	pnl := 5.0
 	pnlPct := 1.0
 	bt := store.BacktestTrade{
-		RunID:      id,
+		RunID:      got.ID,
 		Ticker:     "TEST_BT_SPY",
-		Direction:  "buy",
+		Direction:  "long",
 		EntryTS:    time.Now().Add(-10 * time.Hour),
 		ExitTS:     &exitTS,
 		EntryPrice: 500.0,
@@ -184,7 +184,7 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 		t.Fatalf("InsertBacktestTrade: %v", err)
 	}
 
-	trades, err := store.ListTradesForRun(ctx, id)
+	trades, err := store.ListTradesForRun(ctx, got.ID)
 	if err != nil {
 		t.Fatalf("ListTradesForRun: %v", err)
 	}
@@ -199,13 +199,13 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 	}
 	found := false
 	for _, r := range runs {
-		if r.ID == id {
+		if r.ID == got.ID {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Errorf("ListRuns: run %q not found", id)
+		t.Errorf("ListRuns: run %q not found", got.ID)
 	}
 }
 
