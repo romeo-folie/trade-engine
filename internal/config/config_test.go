@@ -114,6 +114,37 @@ func TestResolveEnvSet(t *testing.T) {
 	}
 }
 
+func TestSetField_NestedPathAndBool(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	path := ConfigPath()
+	if err := save(Defaults(), path); err != nil {
+		t.Fatalf("save defaults: %v", err)
+	}
+
+	if err := SetField("notifications.telegram.enabled", "true"); err != nil {
+		t.Fatalf("SetField: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Notifications.Telegram.Enabled {
+		t.Fatal("expected notifications.telegram.enabled=true")
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "telegram.enabled") {
+		t.Fatalf("unexpected flattened key in YAML: %s", s)
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func containsStr(slice []string, sub string) bool {

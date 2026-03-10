@@ -42,6 +42,9 @@ type DashboardData struct {
 	OpenPositionCnt int
 	LargestPosPct   float64 // largest position as % of portfolio
 
+	// Watchlist summary
+	Watchlist []string
+
 	LastUpdate time.Time
 }
 
@@ -180,6 +183,15 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		}
 	}
 
+	// Active watchlist summary
+	watchlist, err := store.GetWatchlistItems(ctx, true)
+	if err == nil {
+		d.Watchlist = make([]string, 0, len(watchlist))
+		for _, item := range watchlist {
+			d.Watchlist = append(d.Watchlist, item.Ticker)
+		}
+	}
+
 	return d
 }
 
@@ -225,7 +237,11 @@ func RenderDashboard(d DashboardData, width, height, selectedPending int) string
 
 	// Open positions
 	b.WriteString(renderPositionsTable(d.Positions, width))
-	b.WriteString("\n")
+	b.WriteString("\n\n")
+
+	// Active watchlist
+	b.WriteString(renderWatchlistSummary(d.Watchlist))
+	b.WriteString("\n\n")
 
 	// Pending approvals (only in manual mode or when signals exist)
 	if len(d.PendingSignals) > 0 {
@@ -330,6 +346,14 @@ func renderPendingApprovals(signals []SignalRow, width int, selected int) string
 	b.WriteString(dimText.Render("  [a]pprove  [r]eject  [d]etails  [j/k] select") + "\n")
 
 	return b.String()
+}
+
+func renderWatchlistSummary(items []string) string {
+	header := sectionTitle.Render(fmt.Sprintf("Watchlist (%d)", len(items)))
+	if len(items) == 0 {
+		return header + "\n" + dimText.Render("  No active watchlist items")
+	}
+	return header + "\n  " + strings.Join(items, ", ")
 }
 
 func renderSignalFeed(signals []SignalRow, width int) string {
