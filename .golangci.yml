@@ -1,0 +1,28 @@
+run:
+  timeout: 5m
+
+linters:
+  disable-all: true
+  enable:
+    - govet        # go vet checks (misused Printf verbs, etc.)
+    - staticcheck  # SA-class static analysis
+    - errcheck     # unchecked errors
+    - gosimple     # simplification suggestions
+    - ineffassign  # ineffectual assignments
+    - unused       # unused code (vars, funcs, types)
+
+linters-settings:
+  errcheck:
+    # Don't flag Close() and Rollback() — callers intentionally ignore these
+    exclude-functions:
+      - (io.Closer).Close
+      - (*github.com/jackc/pgx/v5.Tx).Rollback
+      - (*github.com/jackc/pgx/v5/pgxpool.Pool).Ping
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 50
+  max-same-issues: 10
+  # Exclude generated or vendor files
+  exclude-dirs:
+    - vendor
