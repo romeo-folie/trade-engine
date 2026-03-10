@@ -93,10 +93,12 @@ func (c *FinnhubClient) FetchNews(ctx context.Context, ticker string, since time
 			return nil, err
 		}
 		if resp.StatusCode >= 400 {
+			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
 			resp.Body.Close()
 			return nil, &httpError{
-				status: resp.StatusCode,
-				msg:    fmt.Sprintf("finnhub API error %d for %s", resp.StatusCode, ticker),
+				status:     resp.StatusCode,
+				msg:        fmt.Sprintf("finnhub API error %d for %s", resp.StatusCode, ticker),
+				retryAfter: retryAfter,
 			}
 		}
 		return resp, nil
