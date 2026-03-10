@@ -53,7 +53,14 @@ func isRetryable(err error) bool {
 
 // jitteredDelay returns an exponentially increasing delay with up to 50%
 // random jitter for attempt n (0-indexed). Caps at retryMaxDelay.
-
+func jitteredDelay(attempt int) time.Duration {
+	base := retryBaseDelay * (1 << uint(attempt)) // 500ms, 1s, 2s, ...
+	if base > retryMaxDelay {
+		base = retryMaxDelay
+	}
+	jitter := time.Duration(rand.Int63n(int64(base / 2)))
+	return base + jitter
+}
 
 // parseRetryAfterHeader parses Retry-After header values:
 //   - integer seconds (e.g. "3")
@@ -83,17 +90,12 @@ func parseRetryAfterHeader(raw string, now time.Time) (time.Duration, bool) {
 func retryDelay(err error, attempt int) time.Duration {
 	var httpErr *httpError
 	if errors.As(err, &httpErr) && httpErr.status == 429 && httpErr.retryAfter > 0 {
+		if httpErr.retryAfter > retryMaxDelay {
+			return retryMaxDelay
+		}
 		return httpErr.retryAfter
 	}
 	return jitteredDelay(attempt)
-}
-func jitteredDelay(attempt int) time.Duration {
-	base := retryBaseDelay * (1 << uint(attempt)) // 500ms, 1s, 2s, ...
-	if base > retryMaxDelay {
-		base = retryMaxDelay
-	}
-	jitter := time.Duration(rand.Int63n(int64(base / 2)))
-	return base + jitter
 }
 
 // withRetry executes fn up to retryMaxAttempts times, backing off between

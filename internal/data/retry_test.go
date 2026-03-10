@@ -167,8 +167,6 @@ func TestWithRetry_ExhaustsAttempts(t *testing.T) {
 	}
 }
 
-
-
 func TestParseRetryAfterHeader(t *testing.T) {
 	now := time.Date(2026, 3, 10, 16, 0, 0, 0, time.UTC)
 	if d, ok := parseRetryAfterHeader("2", now); !ok || d != 2*time.Second {
@@ -203,6 +201,14 @@ func TestWithRetry_RespectsRetryAfterOn429(t *testing.T) {
 		t.Fatalf("expected to wait at least Retry-After, elapsed=%v", elapsed)
 	}
 }
+
+func TestRetryDelay_CapsRetryAfterToMaxDelay(t *testing.T) {
+	d := retryDelay(&httpError{status: 429, msg: "rate limited", retryAfter: 5 * time.Minute}, 0)
+	if d != retryMaxDelay {
+		t.Fatalf("expected retry delay to be capped at %v, got %v", retryMaxDelay, d)
+	}
+}
+
 func TestWithRetry_RespectsContextCancellation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
