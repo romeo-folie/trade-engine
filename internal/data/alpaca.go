@@ -82,23 +82,28 @@ func (c *AlpacaClient) get(ctx context.Context, path string, params url.Values) 
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("APCA-API-KEY-ID", c.apiKey)
-	req.Header.Set("APCA-API-SECRET-KEY", c.secret)
-	req.Header.Set("Accept", "application/json")
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		resp.Body.Close()
-		return nil, fmt.Errorf("alpaca API %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body))
-	}
-	return resp, nil
+	return withRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("APCA-API-KEY-ID", c.apiKey)
+		req.Header.Set("APCA-API-SECRET-KEY", c.secret)
+		req.Header.Set("Accept", "application/json")
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+			resp.Body.Close()
+			return nil, &httpError{
+				status: resp.StatusCode,
+				msg:    fmt.Sprintf("alpaca API %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)),
+			}
+		}
+		return resp, nil
+	})
 }
 
 // ── Alpaca response types ─────────────────────────────────────────────────────

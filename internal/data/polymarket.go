@@ -99,13 +99,23 @@ func (c *PolymarketClient) fetchMarketsByTag(ctx context.Context, tagSlug string
 }
 
 func (c *PolymarketClient) get(ctx context.Context, endpoint string, out interface{}) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := c.httpClient.Do(req)
+	resp, err := withRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "application/json")
+		r, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if r.StatusCode >= 500 && r.StatusCode <= 504 {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 512))
+			r.Body.Close()
+			return nil, &httpError{status: r.StatusCode, msg: fmt.Sprintf("polymarket HTTP %d: %s", r.StatusCode, truncate(string(body), 200))}
+		}
+		return r, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -116,7 +126,7 @@ func (c *PolymarketClient) get(ctx context.Context, endpoint string, out interfa
 		return err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
+		return fmt.Errorf("polymarket HTTP %d: %s", resp.StatusCode, truncate(string(body), 200))
 	}
 	return json.Unmarshal(body, out)
 }
