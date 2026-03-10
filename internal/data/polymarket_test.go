@@ -203,3 +203,47 @@ func TestCategoryToTagSlug(t *testing.T) {
 		}
 	}
 }
+
+func TestPolymarketGet_RetriesOn5xx(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusBadGateway) // 502 — retryable
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode([]polymarketMarket{makePolymarketMarket("RETRY-PM", 5000)})
+	}))
+	defer srv.Close()
+
+	c := newTestPolymarketClient(srv.URL)
+	contracts, err := c.FetchContracts(context.Background(), []string{"finance"}, 0, 10)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if len(contracts) != 1 || contracts[0].ID != "RETRY-PM" {
+		t.Fatalf("unexpected contracts: %+v", contracts)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts (2 retries), got %d", attempts)
+	}
+}
+
+func TestPolymarketGet_NoRetryOn4xx(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusForbidden) // 403 — not retryable
+	}))
+	defer srv.Close()
+
+	c := newTestPolymarketClient(srv.URL)
+	_, err := c.FetchContracts(context.Background(), []string{"finance"}, 0, 10)
+	if err == nil {
+		t.Fatal("expected error on 403")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected exactly 1 attempt (no retry on 4xx), got %d", attempts)
+	}
+}

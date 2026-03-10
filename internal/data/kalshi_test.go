@@ -250,3 +250,49 @@ func TestCentToProb(t *testing.T) {
 		}
 	}
 }
+
+func TestKalshiGet_RetriesOn5xx(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable) // 503 — retryable
+			return
+		}
+		page := kalshiMarketsPage{Markets: []kalshiMarket{makeKalshiMarket("RETRY-A", 1000)}}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(page)
+	}))
+	defer srv.Close()
+
+	c := newTestKalshiClient(srv.URL)
+	// categories=["finance"] drives at least one HTTP call; minVolume=0 keeps the contract
+	contracts, err := c.FetchContracts(context.Background(), []string{"finance"}, 0, 10)
+	if err != nil {
+		t.Fatalf("expected success after retries, got: %v", err)
+	}
+	if len(contracts) != 1 || contracts[0].ID != "RETRY-A" {
+		t.Fatalf("unexpected contracts: %+v", contracts)
+	}
+	if attempts != 3 {
+		t.Fatalf("expected 3 attempts (2 retries), got %d", attempts)
+	}
+}
+
+func TestKalshiGet_NoRetryOn4xx(t *testing.T) {
+	attempts := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusUnauthorized) // 401 — not retryable
+	}))
+	defer srv.Close()
+
+	c := newTestKalshiClient(srv.URL)
+	_, err := c.FetchContracts(context.Background(), []string{"finance"}, 0, 10)
+	if err == nil {
+		t.Fatal("expected error on 401")
+	}
+	if attempts != 1 {
+		t.Fatalf("expected exactly 1 attempt (no retry on 4xx), got %d", attempts)
+	}
+}
