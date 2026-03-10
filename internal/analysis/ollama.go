@@ -70,7 +70,8 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 
 	body := map[string]any{
 		"model":  c.cfg.Model,
-		"prompt": combinedPrompt,
+		"system": systemPrompt,
+		"prompt": userMessage,
 		"stream": false,
 		"options": map[string]any{
 			"temperature": temperature,
@@ -86,7 +87,7 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama build request: %w", err)
 	}
-	httpReq.Header.Set("content-type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
 
 	start := time.Now()
 	resp, err := c.httpClient.Do(httpReq)
@@ -96,7 +97,7 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(resp.Body)
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("ollama read response: %w", err)
 	}

@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,19 @@ func TestOllamaAnalyze_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/generate" {
 			t.Fatalf("path=%s want /api/generate", r.URL.Path)
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			t.Fatalf("content-type=%q want application/json", ct)
+		}
+		var reqBody map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&reqBody); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if reqBody["system"] != "You are an analyst" {
+			t.Fatalf("system=%v want 'You are an analyst'", reqBody["system"])
+		}
+		if reqBody["prompt"] != "Return JSON only" {
+			t.Fatalf("prompt=%v want 'Return JSON only'", reqBody["prompt"])
 		}
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"response":"{\"action\":\"BUY\",\"confidence\":0.82,\"size_pct\":2.0,\"stop_loss\":100.0,\"take_profit\":110.0,\"reasoning\":\"test\"}","prompt_eval_count":100,"eval_count":40}`)
