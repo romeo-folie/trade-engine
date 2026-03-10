@@ -4,22 +4,60 @@
 
 engine:
   mode: paper                  # manual | auto | paper
-  tick_interval_sec: 300       # Analysis interval (seconds). Default: 300 (5 min)
+  tick_interval_sec: 3600      # Analysis interval (seconds). 3600=1h recommended for daily-candle strategy; 300=5min for intraday
   max_watchlist: 50            # Maximum concurrent watchlist items
   dry_run: false               # If true, no orders placed regardless of mode
 
 models:
-  primary:
+  # ── Phase 12: Multi-model ensemble (recommended) ─────────────────────────────
+  # Three analysts run in parallel every tick. If all agree above the fast-path
+  # thresholds, the signal is accepted immediately (no arbiter call).
+  # If they disagree, the arbiter synthesises a final signal.
+  analysts:
+    - provider: anthropic
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY    # export ANTHROPIC_API_KEY=sk-ant-...
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 60
+    - provider: openai
+      model: gpt-4o
+      api_key_env: OPENAI_API_KEY       # export OPENAI_API_KEY=sk-...
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 60
+    - provider: google
+      model: gemini-2.0-flash
+      api_key_env: GEMINI_API_KEY       # export GEMINI_API_KEY=... (aistudio.google.com)
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 60
+
+  # Arbiter: called only when analysts disagree. Use a powerful model here.
+  arbiter:
     provider: anthropic
-    model: claude-sonnet-4-6
-    api_key_env: ANTHROPIC_API_KEY    # export ANTHROPIC_API_KEY=sk-ant-...
+    model: claude-opus-4-6
+    api_key_env: ANTHROPIC_API_KEY
     max_tokens: 4096
     temperature: 0.1
-    timeout_sec: 60
-  secondary: []                # Add additional models for consensus
+    timeout_sec: 90
+
   consensus:
-    enabled: false
-    strategy: majority         # majority | unanimous | primary-with-veto
+    enabled: true
+    fast_path_confidence: 0.80   # All analysts must meet this min confidence to fast-path
+    fast_path_max_spread: 0.15   # Max confidence spread across analysts to fast-path
+
+  # ── Legacy single-model mode (simpler / cheaper for testing) ─────────────────
+  # Uncomment and remove the analysts/arbiter block above to run single-model.
+  # primary:
+  #   provider: anthropic
+  #   model: claude-sonnet-4-6
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   max_tokens: 4096
+  #   temperature: 0.1
+  #   timeout_sec: 60
+  # consensus:
+  #   enabled: false
 
 markets:
   stocks:
