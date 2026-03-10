@@ -167,10 +167,12 @@ func FindSimilarAnalyses(ctx context.Context, queryVec []float32, threshold floa
 				a.embedding <=> $1::vector AS distance
 			FROM analyses a
 			LEFT JOIN LATERAL (
-				SELECT pnl_pct
-				FROM trades
-				WHERE a.id = ANY(analysis_ids) AND status = 'closed'
-				ORDER BY closed_at DESC
+				SELECT t2.pnl_pct
+				FROM signals s2
+				JOIN trades t2 ON t2.signal_id = s2.id
+				WHERE a.id = ANY(s2.analysis_ids)
+				  AND t2.status = 'closed'
+				ORDER BY t2.closed_at DESC
 				LIMIT 1
 			) t ON TRUE
 			WHERE a.embedding IS NOT NULL
