@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -24,6 +25,7 @@ import (
 var (
 	runMode   string
 	runDryRun bool
+	runDetach bool
 )
 
 var runCmd = &cobra.Command{
@@ -39,6 +41,10 @@ Modes:
   auto    — signals that pass risk checks execute automatically
   paper   — paper trades on Alpaca paper API (default)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if runDetach {
+			return startDetachedRun()
+		}
+
 		cfg, err := config.Load()
 		if err != nil {
 			return err
@@ -156,6 +162,40 @@ Modes:
 		fmt.Println("TradeEngine stopped.")
 		return nil
 	},
+}
+
+func startDetachedRun() error {
+	logPath := logger.LogFilePath()
+	if err := os.MkdirAll(filepath.Dir(logPath), 0750); err != nil {
+		return fmt.Errorf("create log directory: %w", err)
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
+	if err != nil {
+		return fmt.Errorf("open log file: %w", err)
+	}
+	defer f.Close()
+
+	args := []string{"run"}
+	if runMode != "" {
+		args = append(args, "--mode", runMode)
+	}
+	if runDryRun {
+		args = append(args, "--dry-run")
+	}
+
+	child := exec.Command(os.Args[0], args...)
+	child.Stdout = f
+	child.Stderr = f
+	child.Stdin = nil
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+
+	if err := child.Start(); err != nil {
+		return fmt.Errorf("start detached engine: %w", err)
+	}
+	fmt.Printf("TradeEngine started in background (PID %d).\n", child.Process.Pid)
+	fmt.Printf("Logs: %s\n", logPath)
+	fmt.Println("Use 'te status' to check health and 'te stop' to stop it.")
+	return nil
 }
 
 var stopCmd = &cobra.Command{
@@ -311,4 +351,5 @@ func removePID() {
 func init() {
 	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
+	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")
 }
