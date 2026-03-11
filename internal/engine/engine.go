@@ -72,26 +72,40 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	}
 	az := analysis.NewAnalyzer(cfg.Models)
 
-	// Build an enricher that reuses the primary LLM for relationship extraction.
-	// We piggyback on CustomSystemPrompt/CustomUserMessage + RawResponse so no
-	// new interface methods are required.
+	// Build an enricher call that executes extraction against a single available
+	// analyst at a time (instead of full ensemble mode).
+	//
+	// Why: extraction prompts intentionally return a JSON array, which does not
+	// match AnalysisResponse. Provider analyzers may therefore return a parse error
+	// while still exposing the raw model text in meta.RawResponse. We treat that
+	// as success for enrichment and only fail when no provider returns raw output.
 	callFn := knowledge.ExtractionCallFn(func(ctx context.Context, system, user string) (string, error) {
-		_, meta, err := az.Analyze(ctx, analysis.AnalysisRequest{
+		req := analysis.AnalysisRequest{
 			Ticker:             "__extraction__",
 			CustomSystemPrompt: system,
 			CustomUserMessage:  user,
-		})
-		// meta.RawResponse is populated before the JSON-parse step.  The parse
-		// step fails for extraction output (JSON array ≠ AnalysisResponse), which
-		// is expected — we want the raw text, not the parsed struct.
-		if meta.RawResponse != "" {
-			return meta.RawResponse, nil
 		}
-		// No raw response means the HTTP/auth/rate-limit layer failed.
-		if err != nil {
-			return "", fmt.Errorf("enricher: model call failed: %w", err)
+
+		var errs []error
+		for _, p := range az.Providers() {
+			if p == nil || !p.IsAvailable() {
+				continue
+			}
+			_, meta, err := p.Analyze(ctx, req)
+			if meta.RawResponse != "" {
+				return meta.RawResponse, nil
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s/%s: %w", p.ProviderName(), p.ModelName(), err))
+				continue
+			}
+			errs = append(errs, fmt.Errorf("%s/%s: empty model response", p.ProviderName(), p.ModelName()))
 		}
-		return "", fmt.Errorf("enricher: empty model response")
+
+		if len(errs) == 0 {
+			return "", fmt.Errorf("enricher: no available analysts")
+		}
+		return "", fmt.Errorf("enricher: all analyst calls failed: %v", errs)
 	})
 
 	// Create embedder for similar-analysis search (best-effort; disabled if not configured).
