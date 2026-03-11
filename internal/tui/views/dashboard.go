@@ -150,19 +150,18 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		}
 	}
 
-	// Recent signals (last 20)
-	recent, err := store.GetRecentSignals(ctx, 20)
-	if err == nil {
-		for _, s := range recent {
-			d.RecentSignals = append(d.RecentSignals, SignalRow{
-				ID:         s.ID,
-				Ticker:     s.Ticker,
-				Action:     s.Action,
-				Confidence: s.Confidence,
-				Status:     s.Status,
-				CreatedAt:  s.CreatedAt,
-			})
-		}
+	// Recent signals summary (aligned with Signals tab data source)
+	feed := FetchSignalFeed(ctx, 20)
+	for _, s := range feed.Signals {
+		d.RecentSignals = append(d.RecentSignals, SignalRow{
+			ID:         s.ID,
+			Ticker:     s.Ticker,
+			Action:     s.Action,
+			Confidence: s.Confidence,
+			Status:     s.Status,
+			CreatedAt:  s.CreatedAt,
+			ExpiresAt:  s.ExpiresAt,
+		})
 	}
 
 	// Risk: daily P&L from closed trades today
