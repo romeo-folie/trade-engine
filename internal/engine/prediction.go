@@ -74,7 +74,9 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 			r.executors[name] = execution.NewPredictionPaperExecutor()
 		case "kalshi":
 			r.platforms[name] = data.NewKalshiClient(pc.APIKey)
-			if pc.APIKey != "" {
+			if mode == "paper" {
+				r.executors[name] = execution.NewPredictionPaperExecutor()
+			} else if pc.APIKey != "" {
 				r.executors[name] = execution.NewKalshiExecutor(pc.APIKey)
 			} else {
 				r.executors[name] = execution.NewPredictionPaperExecutor()
@@ -382,7 +384,11 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		logger.Warn("prediction signal status update failed", "signal_id", sigID, "err", err.Error())
 	}
 
-	direction := strings.ToLower(string(resp.Action))
+	direction := "long"
+	eventDirection := strings.ToLower(string(resp.Action))
+	if resp.Action == analysis.ActionSell {
+		direction = "short"
+	}
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
 		SignalID:   sigID,
 		Ticker:     item.Ticker,
@@ -401,7 +407,7 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		TradeID:    tradeID,
 		Ticker:     item.Ticker,
 		SignalID:   sigID,
-		Direction:  direction,
+		Direction:  eventDirection,
 		EntryPrice: orderResult.FilledPrice,
 		Quantity:   orderResult.FilledQty,
 		Strategy:   "prediction_mispricing",
