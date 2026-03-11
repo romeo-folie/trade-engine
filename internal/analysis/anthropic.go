@@ -160,11 +160,13 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
-		logger.Warn("failed to extract JSON from model response",
-			"ticker", req.Ticker,
-			"err", err.Error(),
-			"raw", rawText[:min(200, len(rawText))],
-		)
+		if req.Ticker != "__extraction__" {
+			logger.Warn("failed to extract JSON from model response",
+				"ticker", req.Ticker,
+				"err", err.Error(),
+				"raw", rawText[:min(200, len(rawText))],
+			)
+		}
 		return AnalysisResponse{}, meta, fmt.Errorf("extract JSON: %w", err)
 	}
 

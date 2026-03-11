@@ -132,7 +132,9 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
-		logger.Warn("openai: failed to extract JSON", "ticker", req.Ticker, "err", err.Error(), "raw", rawText[:min(200, len(rawText))])
+		if req.Ticker != "__extraction__" {
+			logger.Warn("openai: failed to extract JSON", "ticker", req.Ticker, "err", err.Error(), "raw", rawText[:min(200, len(rawText))])
+		}
 		return AnalysisResponse{}, meta, fmt.Errorf("openai extract JSON: %w", err)
 	}
 	return analysis, meta, nil

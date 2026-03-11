@@ -88,6 +88,13 @@ markets:
     api_key_env: FINNHUB_API_KEY
     fetch_every_min: 15           # Fetch news every N minutes per ticker
 
+    # Knowledge extraction controls (cost/rate guardrails)
+    extraction_enabled: true
+    extraction_provider: openai    # use a single provider for extraction path
+    extraction_model: gpt-4o       # optional; leave empty to use configured provider model
+    extraction_max_articles_per_tick: 10
+    extraction_rpm: 20             # global extraction requests/minute cap
+
 strategies:
   trend_following:
     enabled: true

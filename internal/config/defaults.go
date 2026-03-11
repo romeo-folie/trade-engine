@@ -55,9 +55,14 @@ func Defaults() *Config {
 				},
 			},
 			News: NewsAPIConfig{
-				Provider:      "finnhub",
-				APIKeyEnv:     "FINNHUB_API_KEY",
-				FetchEveryMin: 15,
+				Provider:                     "finnhub",
+				APIKeyEnv:                    "FINNHUB_API_KEY",
+				FetchEveryMin:                15,
+				ExtractionEnabled:            true,
+				ExtractionProvider:           "openai",
+				ExtractionModel:              "gpt-4o",
+				ExtractionMaxArticlesPerTick: 10,
+				ExtractionRPM:                20,
 			},
 		},
 		Strategies: StrategiesConfig{

@@ -149,6 +149,13 @@ type NewsAPIConfig struct {
 	APIKeyEnv     string `yaml:"api_key_env"`     // env var name holding the API key
 	APIKey        string `yaml:"-"`               // resolved at runtime
 	FetchEveryMin int    `yaml:"fetch_every_min"` // cadence in minutes (default 15)
+
+	// Extraction controls knowledge-graph enrichment LLM calls.
+	ExtractionEnabled            bool   `yaml:"extraction_enabled"`
+	ExtractionProvider           string `yaml:"extraction_provider"`              // anthropic | openai | google | ollama
+	ExtractionModel              string `yaml:"extraction_model"`                 // optional provider model override
+	ExtractionMaxArticlesPerTick int    `yaml:"extraction_max_articles_per_tick"` // cap per ticker per engine tick
+	ExtractionRPM                int    `yaml:"extraction_rpm"`                   // global requests/minute cap
 }
 
 type StocksConfig struct {

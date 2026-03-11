@@ -86,26 +86,18 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 			CustomUserMessage:  user,
 		}
 
-		var errs []error
-		for _, p := range az.Providers() {
-			if p == nil || !p.IsAvailable() {
-				continue
-			}
-			_, meta, err := p.Analyze(ctx, req)
-			if meta.RawResponse != "" {
-				return meta.RawResponse, nil
-			}
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s/%s: %w", p.ProviderName(), p.ModelName(), err))
-				continue
-			}
-			errs = append(errs, fmt.Errorf("%s/%s: empty model response", p.ProviderName(), p.ModelName()))
+		provider := pickExtractionProvider(az, cfg)
+		if provider == nil || !provider.IsAvailable() {
+			return "", fmt.Errorf("enricher: extraction provider unavailable")
 		}
-
-		if len(errs) == 0 {
-			return "", fmt.Errorf("enricher: no available analysts")
+		_, meta, err := provider.Analyze(ctx, req)
+		if meta.RawResponse != "" {
+			return meta.RawResponse, nil
 		}
-		return "", fmt.Errorf("enricher: all analyst calls failed: %v", errs)
+		if err != nil {
+			return "", fmt.Errorf("enricher: %s/%s: %w", provider.ProviderName(), provider.ModelName(), err)
+		}
+		return "", fmt.Errorf("enricher: %s/%s: empty model response", provider.ProviderName(), provider.ModelName())
 	})
 
 	// Create embedder for similar-analysis search (best-effort; disabled if not configured).
@@ -427,6 +419,33 @@ func min(a, b int) int {
 	return b
 }
 
+func pickExtractionProvider(az *analysis.Analyzer, cfg *config.Config) analysis.ModelProvider {
+	providers := az.Providers()
+	if len(providers) == 0 {
+		return nil
+	}
+	wantProvider := cfg.Markets.News.ExtractionProvider
+	wantModel := cfg.Markets.News.ExtractionModel
+	for _, p := range providers {
+		if p == nil {
+			continue
+		}
+		if wantProvider != "" && p.ProviderName() != wantProvider {
+			continue
+		}
+		if wantModel != "" && p.ModelName() != wantModel {
+			continue
+		}
+		return p
+	}
+	for _, p := range providers {
+		if p != nil && p.IsAvailable() {
+			return p
+		}
+	}
+	return nil
+}
+
 // volRatio returns current volume / VolSMA20, or 1.0 if data is unavailable.
 func volRatio(candles []data.Candle, volSMA float64) float64 {
 	if len(candles) == 0 || volSMA == 0 {
@@ -497,15 +516,16 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 	}
 	logger.Info("news fetched", "ticker", ticker, "count", len(items))
 
-	// Kick off relationship extraction for each article in the background.
-	// EnrichNewsItem is semaphore-bounded and non-blocking from the caller's
-	// perspective (blocks only if all extraction slots are full).
-	// newsItemID is passed as "" because we don't have the DB UUID here;
-	// entity-mention recording is skipped when no UUID is provided.
-	if e.enricher != nil {
-		for _, item := range items {
-			e.enricher.EnrichNewsItem(ctx, "", item.Headline, item.Summary)
-		}
+	if e.enricher == nil || !e.cfg.Markets.News.ExtractionEnabled {
+		return
+	}
+	maxItems := e.cfg.Markets.News.ExtractionMaxArticlesPerTick
+	if maxItems <= 0 || maxItems > len(items) {
+		maxItems = len(items)
+	}
+	for i := 0; i < maxItems; i++ {
+		item := items[i]
+		e.enricher.EnrichNewsItem(ctx, "", item.Headline, item.Summary)
 	}
 }
 
