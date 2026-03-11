@@ -150,3 +150,16 @@ database:
 reports:
   output_dir: ~/.tradeengine/reports
   auto_open_browser: true
+
+embeddings:
+  enabled: false
+  provider: openai             # openai | ollama
+  dimension: 1536              # Must match DB vector dimension (default migration: 1536)
+  api_key_env: OPENAI_API_KEY  # Required when provider=openai
+  ollama_base_url: http://localhost:11434
+  model: ""                    # Required when provider=ollama (e.g. nomic-embed-text)
+  worker_interval_sec: 30
+  batch_size: 50
+  similar_analyses_enabled: false
+  similar_analyses_threshold: 0.8
+  similar_analyses_limit: 3
