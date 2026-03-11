@@ -27,6 +27,17 @@ func TestExtractAnalysisJSON_MarkdownFence(t *testing.T) {
 	}
 }
 
+func TestExtractAnalysisJSON_UnclosedFence(t *testing.T) {
+	raw := "```json\n{\n  \"action\": \"BUY\",\n  \"confidence\": 0.65,\n  \"size_pct\": 2.5,\n  \"stop_loss\": 179.00,\n  \"take_profit\": 195.00,\n  \"reasoning\": \"x\"\n}"
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionBuy {
+		t.Fatalf("action = %q, want BUY", got.Action)
+	}
+}
+
 func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
 	raw := `{"action":"WAIT","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
 	if _, err := extractAnalysisJSON(raw); err == nil {

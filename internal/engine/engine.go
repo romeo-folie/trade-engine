@@ -144,17 +144,28 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err := e.tick(ctx); err != nil {
 		logger.Warn("tick error", "err", err.Error())
 	}
+	logger.Info("engine cycle complete",
+		"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+		"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+	)
 
 	for {
 		select {
 		case <-ticker.C:
 			if !IsMarketOpen(time.Now()) {
-				logger.Info("market closed — skipping tick")
+				logger.Info("market closed — skipping tick",
+					"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+					"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+				)
 				continue
 			}
 			if err := e.tick(ctx); err != nil {
 				logger.Warn("tick error", "err", err.Error())
 			}
+			logger.Info("engine cycle complete",
+				"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+				"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+			)
 		case <-ctx.Done():
 			logger.Info("engine loop stopping")
 			return nil
@@ -372,13 +383,16 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	}
 	resp, meta := result.Response, result.Meta
 
+	reasoningPreview := resp.Reasoning[:min(120, len(resp.Reasoning))]
 	logger.Info("analysis complete",
 		"ticker", ticker,
 		"action", string(resp.Action),
 		"confidence", fmt.Sprintf("%.2f", resp.Confidence),
 		"analysts", len(result.AnalystResults),
 		"fast_pathed", result.FastPathed,
-		"reasoning", resp.Reasoning[:min(120, len(resp.Reasoning))],
+		"reasoning_preview", reasoningPreview,
+		"reasoning_len", len(resp.Reasoning),
+		"reasoning_truncated", len(resp.Reasoning) > len(reasoningPreview),
 	)
 	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
 		Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
@@ -531,6 +545,10 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 	maxItems := e.cfg.Markets.News.ExtractionMaxArticlesPerTick
 	if maxItems <= 0 || maxItems > len(items) {
 		maxItems = len(items)
+	}
+	deferred := len(items) - maxItems
+	if deferred > 0 {
+		logger.Info("news extraction deferred", "ticker", ticker, "scheduled", maxItems, "deferred", deferred)
 	}
 	for i := 0; i < maxItems; i++ {
 		item := items[i]
