@@ -144,17 +144,28 @@ func (e *Engine) Run(ctx context.Context) error {
 	if err := e.tick(ctx); err != nil {
 		logger.Warn("tick error", "err", err.Error())
 	}
+	logger.Info("engine cycle complete",
+		"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+		"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+	)
 
 	for {
 		select {
 		case <-ticker.C:
 			if !IsMarketOpen(time.Now()) {
-				logger.Info("market closed — skipping tick")
+				logger.Info("market closed — skipping tick",
+					"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+					"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+				)
 				continue
 			}
 			if err := e.tick(ctx); err != nil {
 				logger.Warn("tick error", "err", err.Error())
 			}
+			logger.Info("engine cycle complete",
+				"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
+				"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
+			)
 		case <-ctx.Done():
 			logger.Info("engine loop stopping")
 			return nil
