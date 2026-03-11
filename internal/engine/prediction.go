@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -308,14 +309,9 @@ func (r *PredictionRunner) analyseContract(ctx context.Context, item store.Watch
 
 // emitSignal records a signal and optionally executes it.
 func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistItem, contract prompts.ContractInfo, resp analysis.AnalysisResponse) {
-	direction := "buy"
-	if resp.Action == analysis.ActionSell {
-		direction = "sell"
-	}
-
 	sigID, err := store.InsertSignal(ctx, store.Signal{
 		Ticker:     item.Ticker,
-		Action:     direction,
+		Action:     string(resp.Action), // signal_action enum expects BUY|SELL|HOLD
 		Strategy:   "prediction_mispricing",
 		Confidence: resp.Confidence,
 		Status:     "pending",
@@ -369,6 +365,7 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		"filled_price", orderResult.FilledPrice,
 	)
 
+	direction := strings.ToLower(string(resp.Action))
 	r.bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
 		Ticker:     item.Ticker,
 		SignalID:   sigID,
