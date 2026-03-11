@@ -50,6 +50,72 @@ Reduce model and notification operating cost by **60–90%** while maintaining a
 - If unchanged, reuse prior analysis for a configurable TTL.
 - Track cache hit rates and skip-call savings.
 
+#### 5.5.1 Cache key/fingerprint specification
+For each analysis candidate, build a stable fingerprint from:
+- market identity: `ticker`, `asset_class`, `timeframe`
+- strategy identity: `strategy_name`, `strategy_version`
+- model profile identity: `cost.profile`, analyst set, arbiter model, prompt template version
+- indicator snapshot (rounded): RSI, EMA gap %, MACD sign/magnitude bucket, ADX bucket, ATR% bucket
+- price regime bucket: return over lookback bucketed (e.g., <-2%, -2..-0.5, -0.5..0.5, 0.5..2, >2)
+- news digest hash: hash of normalized top-N headlines/entities/sentiment summary
+- risk context: open-position count bucket, current exposure bucket
+
+Fingerprint implementation notes:
+- canonical JSON serialization (sorted keys)
+- rounded/bucketed numeric values to avoid cache misses from tiny noise
+- SHA-256 fingerprint key
+
+#### 5.5.2 Cache storage schema (proposed)
+Table: `analysis_cache`
+- `id` UUID PK
+- `fingerprint` TEXT UNIQUE NOT NULL
+- `ticker` TEXT NOT NULL
+- `timeframe` TEXT NOT NULL
+- `strategy` TEXT NOT NULL
+- `model_profile` TEXT NOT NULL
+- `analysis_json` JSONB NOT NULL
+- `decision` TEXT NOT NULL (`BUY|SELL|HOLD`)
+- `confidence` DOUBLE PRECISION NOT NULL
+- `reason_code` TEXT NULL (`CACHE_HIT`, `FORCED_REFRESH`, etc.)
+- `created_at` TIMESTAMPTZ NOT NULL
+- `expires_at` TIMESTAMPTZ NOT NULL
+- `last_used_at` TIMESTAMPTZ NOT NULL
+- `use_count` INT NOT NULL DEFAULT 0
+
+Indexes:
+- `UNIQUE(fingerprint)`
+- `(ticker, timeframe, expires_at DESC)`
+- `(expires_at)` for cleanup jobs
+
+#### 5.5.3 Invalidation rules
+Immediate invalidate (force fresh analysis) when any of:
+- absolute price move since cached state >= `analysis.cache.invalidate_price_move_pct`
+- indicator regime flip (trend/momentum class change)
+- new high-impact news item (novelty/relevance above threshold)
+- active risk event (drawdown gate near trigger, daily loss close to cap)
+- order/trade lifecycle event for ticker (position opened/closed/partially filled)
+
+Time-based invalidate:
+- TTL by profile:
+  - budget: 180 min
+  - balanced: 120 min
+  - pro: 60 min
+- forced refresh every `N` cycles even if unchanged (anti-staleness)
+
+#### 5.5.4 Cache read/write flow
+1. Build fingerprint from current state.
+2. Lookup cache by fingerprint and unexpired TTL.
+3. If hit and no invalidation trigger: reuse cached analysis, tag decision as `CACHE_HIT`.
+4. If miss/invalid: run inference, persist result in cache, emit `CACHE_MISS` metric.
+5. Update `last_used_at`, `use_count` on hits.
+
+#### 5.5.5 Observability metrics
+- `analysis_cache_hit_ratio`
+- `analysis_cache_miss_ratio`
+- `analysis_cache_invalidation_count{reason}`
+- `token_spend_saved_estimate`
+- `avg_latency_saved_ms`
+
 ### 5.6 News enrichment throttling
 - Extract entities/relationships only for top-N relevant articles.
 - Keep existing RPM and article caps; make profile-aware defaults.
@@ -146,3 +212,53 @@ notifications:
 2. Should budget guardrails fail-closed (skip trading) or degrade-only?
 3. Which markets/tickers should always bypass cheap-filter stage?
 4. What confidence/uncertainty thresholds trigger arbiter escalation?
+
+## 12) Implementation Tasks (cache-focused)
+
+### Task C1 — DB migration + storage layer
+- Add `analysis_cache` migration with schema/indexes in §5.5.2.
+- Add store methods:
+  - `GetCachedAnalysis(fingerprint)`
+  - `UpsertCachedAnalysis(entry)`
+  - `TouchCachedAnalysis(fingerprint)`
+  - `DeleteExpiredCachedAnalyses(now)`
+- Add migration test coverage + integration tests.
+
+### Task C2 — Fingerprint builder
+- Implement `analysis/cache/fingerprint.go` with canonical serialization + SHA-256.
+- Include all fields listed in §5.5.1.
+- Add unit tests for:
+  - deterministic output
+  - bucket/rounding stability
+  - version/profile changes invalidating keys.
+
+### Task C3 — Invalidation engine
+- Implement `ShouldInvalidate(cacheEntry, liveState)` with rules in §5.5.3.
+- Add reason codes (`PRICE_MOVE`, `REGIME_FLIP`, `NEWS_NOVELTY`, `RISK_EVENT`, `TTL_EXPIRED`, `FORCED_REFRESH`).
+- Add unit tests for each invalidation trigger.
+
+### Task C4 — Engine integration
+- Insert cache lookup before expensive analysis call.
+- Reuse cached result on valid hit; annotate event/log with `CACHE_HIT`.
+- On miss/invalidate, run normal analysis and cache result.
+- Ensure existing risk checks still run on reused result.
+
+### Task C5 — Metrics + reporting
+- Emit metrics in §5.5.5.
+- Add TUI/report counters:
+  - hit rate
+  - estimated tokens saved
+  - cache invalidation reason distribution.
+
+### Task C6 — Profile wiring
+- Add config keys:
+  - `analysis.cache.enabled`
+  - `analysis.cache.ttl_min`
+  - `analysis.cache.force_refresh_cycles`
+  - `analysis.cache.invalidate_price_move_pct`
+- Set defaults by cost profile.
+
+### Task C7 — Safety guardrails
+- If cache subsystem errors, fail open to fresh analysis (never block trading loop).
+- Add max cache row retention + cleanup job.
+- Add migration rollback note and operational runbook.
