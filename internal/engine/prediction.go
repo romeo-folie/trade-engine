@@ -309,12 +309,25 @@ func (r *PredictionRunner) analyseContract(ctx context.Context, item store.Watch
 
 // emitSignal records a signal and optionally executes it.
 func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistItem, contract prompts.ContractInfo, resp analysis.AnalysisResponse) {
+	expiryMin := r.cfg.Risk.SignalExpiryMin
+	if expiryMin <= 0 {
+		expiryMin = 30
+	}
+	stalePct := r.cfg.Risk.StalePriceMovePct
+	if stalePct <= 0 {
+		stalePct = 2.0
+	}
+
 	sigID, err := store.InsertSignal(ctx, store.Signal{
-		Ticker:     item.Ticker,
-		Action:     string(resp.Action), // signal_action enum expects BUY|SELL|HOLD
-		Strategy:   "prediction_mispricing",
-		Confidence: resp.Confidence,
-		Status:     "pending",
+		Ticker:            item.Ticker,
+		Action:            string(resp.Action), // signal_action enum expects BUY|SELL|HOLD
+		Strategy:          "prediction_mispricing",
+		SignalPrice:       contract.MarketPrice,
+		Confidence:        resp.Confidence,
+		SizePct:           1.0,
+		Status:            "pending",
+		ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
+		StalePriceMovePct: stalePct,
 	})
 	if err != nil {
 		logger.Warn("prediction signal insert failed", "err", err.Error())
@@ -329,7 +342,7 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		Mode:       r.mode,
 	})
 
-	if r.mode != "auto" {
+	if r.mode != "auto" && r.mode != "paper" {
 		return
 	}
 
@@ -365,8 +378,27 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		"filled_price", orderResult.FilledPrice,
 	)
 
+	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
+		logger.Warn("prediction signal status update failed", "signal_id", sigID, "err", err.Error())
+	}
+
 	direction := strings.ToLower(string(resp.Action))
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		SignalID:   sigID,
+		Ticker:     item.Ticker,
+		Direction:  direction,
+		Strategy:   "prediction_mispricing",
+		EntryPrice: orderResult.FilledPrice,
+		Quantity:   orderResult.FilledQty,
+		Status:     "open",
+	})
+	if err != nil {
+		logger.Warn("prediction trade insert failed", "signal_id", sigID, "err", err.Error())
+		return
+	}
+
 	r.bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
+		TradeID:    tradeID,
 		Ticker:     item.Ticker,
 		SignalID:   sigID,
 		Direction:  direction,
