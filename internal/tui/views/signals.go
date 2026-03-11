@@ -42,44 +42,17 @@ func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
 		return SignalFeedData{LastUpdate: time.Now()}
 	}
 
-	// Fetch signals across multiple tickers. We'll query per-status to get a good mix.
-	var allSignals []SignalFeedRow
-
-	// Pending/approved first.
-	pending, _ := store.GetPendingSignals(ctx)
-	for _, s := range pending {
-		allSignals = append(allSignals, toFeedRow(s))
+	recent, err := store.GetRecentSignals(ctx, limit)
+	if err != nil {
+		return SignalFeedData{LastUpdate: time.Now()}
 	}
-
-	// Then recent signals for watchlist tickers (get from recent trades for tickers).
-	// Simplified: query signals by recent tickers. For now, use a broad approach.
-	items, _ := store.GetWatchlistItems(ctx, false)
-	seen := make(map[string]bool)
-	for _, s := range allSignals {
-		seen[s.ID] = true
-	}
-
-	remaining := limit - len(allSignals)
-	for _, item := range items {
-		if remaining <= 0 {
-			break
-		}
-		signals, _ := store.GetSignalsByTicker(ctx, item.Ticker, 10)
-		for _, s := range signals {
-			if seen[s.ID] {
-				continue
-			}
-			seen[s.ID] = true
-			allSignals = append(allSignals, toFeedRow(s))
-			remaining--
-			if remaining <= 0 {
-				break
-			}
-		}
+	rows := make([]SignalFeedRow, 0, len(recent))
+	for _, s := range recent {
+		rows = append(rows, toFeedRow(s))
 	}
 
 	return SignalFeedData{
-		Signals:    allSignals,
+		Signals:    rows,
 		LastUpdate: time.Now(),
 	}
 }
@@ -158,11 +131,15 @@ func RenderSignalFeed(data SignalFeedData, width int) string {
 		case "blocked":
 			detail = s.BlockReason
 		case "pending", "approved":
-			remaining := time.Until(s.ExpiresAt).Round(time.Second)
-			if remaining > 0 {
-				detail = fmt.Sprintf("expires in %s", formatDuration(remaining))
+			if s.ExpiresAt.IsZero() {
+				detail = "pending"
 			} else {
-				detail = "expiring"
+				remaining := time.Until(s.ExpiresAt).Round(time.Second)
+				if remaining > 0 {
+					detail = fmt.Sprintf("expires in %s", formatDuration(remaining))
+				} else {
+					detail = "expiring"
+				}
 			}
 		case "executed":
 			detail = fmt.Sprintf("SL=%.2f TP=%.2f", s.StopLoss, s.TakeProfit)

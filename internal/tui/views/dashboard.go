@@ -150,7 +150,7 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		}
 	}
 
-	// Recent signals (last 20)
+	// Recent signals summary (last 20, global across all tickers/statuses)
 	recent, err := store.GetRecentSignals(ctx, 20)
 	if err == nil {
 		for _, s := range recent {
@@ -161,6 +161,7 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 				Confidence: s.Confidence,
 				Status:     s.Status,
 				CreatedAt:  s.CreatedAt,
+				ExpiresAt:  s.ExpiresAt,
 			})
 		}
 	}

@@ -380,10 +380,6 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		"filled_price", orderResult.FilledPrice,
 	)
 
-	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
-		logger.Warn("prediction signal status update failed", "signal_id", sigID, "err", err.Error())
-	}
-
 	direction := "long"
 	eventDirection := strings.ToLower(string(resp.Action))
 	if resp.Action == analysis.ActionSell {
@@ -399,8 +395,16 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 		Status:     "open",
 	})
 	if err != nil {
-		logger.Warn("prediction trade insert failed", "signal_id", sigID, "err", err.Error())
+		reason := fmt.Sprintf("order placed (broker_id=%s) but trade persistence failed", orderResult.BrokerOrderID)
+		if uerr := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); uerr != nil {
+			logger.Warn("prediction signal status update failed after trade insert error", "signal_id", sigID, "err", uerr.Error())
+		}
+		logger.Warn("prediction trade insert failed", "signal_id", sigID, "err", err.Error(), "broker_id", orderResult.BrokerOrderID)
 		return
+	}
+
+	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
+		logger.Warn("prediction signal status update failed", "signal_id", sigID, "err", err.Error())
 	}
 
 	r.bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
