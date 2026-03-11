@@ -176,7 +176,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.configInput = ""
 					return m, nil
 				}
-				if err := views.SetConfigValue(context.Background(), item.Key, v); err != nil {
+				if !store.IsConnected() {
+					m.statusMsg = "Config update unavailable: database not connected"
+				} else if err := views.SetConfigValue(context.Background(), item.Key, v); err != nil {
 					m.statusMsg = fmt.Sprintf("Config update failed: %s", err)
 				} else {
 					m.configData.Items[m.selectedConfig].Value = v
@@ -236,7 +238,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else {
 						next = views.CycleMode(item.Value)
 					}
-					if err := views.SetConfigValue(context.Background(), item.Key, next); err != nil {
+					if !store.IsConnected() {
+						m.statusMsg = "Config update unavailable: database not connected"
+					} else if err := views.SetConfigValue(context.Background(), item.Key, next); err != nil {
 						m.statusMsg = fmt.Sprintf("Config update failed: %s", err)
 					} else {
 						m.configData.Items[m.selectedConfig].Value = next
