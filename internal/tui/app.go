@@ -174,7 +174,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showDetail {
 				return m, nil
 			}
-			if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 {
+			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
 				m.selectedPending = (m.selectedPending + 1) % len(m.dashData.PendingSignals)
 				return m, nil
 			}
@@ -186,7 +186,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.showDetail {
 				return m, nil
 			}
-			if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 {
+			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
 				m.selectedPending = (m.selectedPending - 1 + len(m.dashData.PendingSignals)) % len(m.dashData.PendingSignals)
 				return m, nil
 			}
@@ -196,7 +196,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "a":
 			// Approve pending signal
-			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
 				idx := m.selectedPending % len(m.dashData.PendingSignals)
 				sig := m.dashData.PendingSignals[idx]
 				if m.OnApprove != nil {
@@ -218,7 +218,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "r":
 			// Reject pending signal
-			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
 				idx := m.selectedPending % len(m.dashData.PendingSignals)
 				sig := m.dashData.PendingSignals[idx]
 				if m.OnReject != nil {
@@ -242,7 +242,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "d":
 			// Show detail for pending signal — handled like position detail
-			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
+			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
 				m.showDetail = true
 				return m, nil
 			}
@@ -423,7 +423,7 @@ func (m Model) renderPlaceholder(title, desc string) string {
 
 func (m Model) renderStatusBar() string {
 	left := " [1-5] switch view  [tab] next  [q] quit"
-	if m.activeView == ViewDashboard && len(m.dashData.PendingSignals) > 0 && !m.showDetail {
+	if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 && !m.showDetail {
 		left = " [a]pprove [r]eject [d]etail  [j/k] nav  [enter] position  [q] quit"
 	}
 	// Show status message for 5 seconds

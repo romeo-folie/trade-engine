@@ -132,19 +132,21 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		}
 	}
 
-	// Pending signals
-	pending, err := store.GetPendingSignals(ctx)
-	if err == nil {
-		for _, s := range pending {
-			d.PendingSignals = append(d.PendingSignals, SignalRow{
-				ID:         s.ID,
-				Ticker:     s.Ticker,
-				Action:     s.Action,
-				Confidence: s.Confidence,
-				Status:     s.Status,
-				CreatedAt:  s.CreatedAt,
-				ExpiresAt:  s.ExpiresAt,
-			})
+	// Pending signals (manual mode only)
+	if mode == "manual" {
+		pending, err := store.GetPendingSignals(ctx)
+		if err == nil {
+			for _, s := range pending {
+				d.PendingSignals = append(d.PendingSignals, SignalRow{
+					ID:         s.ID,
+					Ticker:     s.Ticker,
+					Action:     s.Action,
+					Confidence: s.Confidence,
+					Status:     s.Status,
+					CreatedAt:  s.CreatedAt,
+					ExpiresAt:  s.ExpiresAt,
+				})
+			}
 		}
 	}
 
@@ -243,7 +245,7 @@ func RenderDashboard(d DashboardData, width, height, selectedPending int) string
 	b.WriteString(renderWatchlistSummary(d.Watchlist))
 	b.WriteString("\n\n")
 
-	// Pending approvals (only in manual mode or when signals exist)
+	// Pending approvals (manual mode only)
 	if len(d.PendingSignals) > 0 {
 		b.WriteString(renderPendingApprovals(d.PendingSignals, width, selectedPending))
 		b.WriteString("\n")

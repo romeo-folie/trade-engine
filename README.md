@@ -151,6 +151,29 @@ And use matching `DATABASE_URL`:
 export DATABASE_URL="postgres://postgres:postgres@localhost:5434/tradeengine?sslmode=disable"
 ```
 
+### Manual approvals (TUI / CLI / Telegram)
+
+Manual approval actions are available **only when `engine.mode=manual`**.
+
+- In `paper` or `auto` mode, signals should execute automatically (subject to risk checks).
+- If a signal is created but execution logs show `signal execution skipped — zero quantity`, that is a sizing/cash outcome, not an approval failure.
+
+Approve/reject options:
+
+```bash
+# list pending manual-approval signals
+te trades pending
+
+# approve / reject by signal id
+te trades approve <signal-id>
+te trades reject <signal-id>
+```
+
+When Telegram is enabled (`notifications.telegram.enabled: true`), pending manual signals include inline buttons:
+- ✅ Approve
+- ❌ Reject
+- 📋 Full Analysis
+
 ## CLI Reference
 
 ```
