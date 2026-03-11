@@ -55,3 +55,17 @@ func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
 		t.Fatal("expected error for invalid action")
 	}
 }
+
+func TestExtractAnalysisJSON_RecoversTruncatedJSON(t *testing.T) {
+	raw := "{\n \"action\": \"buy\",\n \"confidence\": 0.75,\n \"size_pct\": 2.0,\n \"stop_loss\": 100,\n \"take_profit\": 110,\n \"reasoning\": \"truncated"
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionBuy {
+		t.Fatalf("action = %q, want BUY", got.Action)
+	}
+	if got.Confidence != 0.75 {
+		t.Fatalf("confidence = %v, want 0.75", got.Confidence)
+	}
+}
