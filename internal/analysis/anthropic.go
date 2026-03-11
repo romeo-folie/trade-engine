@@ -212,6 +212,10 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 		return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 	}
 
+	// Normalize action to canonical enum form (models sometimes emit lowercase).
+	normAction := Action(strings.ToUpper(strings.TrimSpace(string(result.Action))))
+	result.Action = normAction
+
 	// Validate required fields.
 	switch result.Action {
 	case ActionBuy, ActionSell, ActionHold:

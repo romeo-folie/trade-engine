@@ -38,6 +38,17 @@ func TestExtractAnalysisJSON_UnclosedFence(t *testing.T) {
 	}
 }
 
+func TestExtractAnalysisJSON_NormalizesLowercaseAction(t *testing.T) {
+	raw := `{"action":"hold","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"x"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionHold {
+		t.Fatalf("action = %q, want HOLD", got.Action)
+	}
+}
+
 func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
 	raw := `{"action":"WAIT","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
 	if _, err := extractAnalysisJSON(raw); err == nil {
