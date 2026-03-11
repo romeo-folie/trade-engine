@@ -93,6 +93,30 @@ curl -s http://localhost:11434/api/embeddings \
 
 > `nomic-embed-text` is 768-dim. Ensure your vector schema dimension matches before enabling.
 
+### Extraction throttling (news → knowledge graph)
+
+Extraction now has dedicated guardrails under `markets.news`:
+
+- `extraction_enabled`
+- `extraction_provider`
+- `extraction_model`
+- `extraction_max_articles_per_tick`
+- `extraction_rpm`
+
+Recommended defaults for cost control:
+
+```yaml
+markets:
+  news:
+    extraction_enabled: true
+    extraction_provider: openai
+    extraction_model: gpt-4o
+    extraction_max_articles_per_tick: 10
+    extraction_rpm: 20
+```
+
+This keeps extraction on a single provider and prevents burst traffic from tripping RPM limits.
+
 ### Docker notes
 
 If you previously started a container named `tradeengine-db` manually and see:

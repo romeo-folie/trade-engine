@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -13,10 +14,9 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-// maxEnricherConcurrency caps the number of simultaneous LLM extraction calls
-// fired by the enricher.  Without a bound, 10 tickers × 30 articles = 300
-// concurrent calls, immediately exhausting the rate limit.
-const maxEnricherConcurrency = 5
+// maxEnricherConcurrency caps simultaneous LLM extraction calls.
+// Keep this low to avoid bursty provider RPM spikes.
+const maxEnricherConcurrency = 2
 
 // Enricher extracts entity relationships from news headlines and summaries and
 // writes them to the knowledge graph as auto-generated edges.
@@ -29,6 +29,10 @@ type Enricher struct {
 	cfg    *config.Config
 	callFn ExtractionCallFn
 	sem    chan struct{} // bounds concurrent LLM calls
+
+	rateMu      sync.Mutex
+	minInterval time.Duration
+	lastCall    time.Time
 }
 
 // ExtractionCallFn is the function the enricher calls to run the extraction
@@ -41,10 +45,15 @@ type ExtractionCallFn func(ctx context.Context, system, user string) (string, er
 
 // NewEnricher creates an Enricher with the given LLM call function.
 func NewEnricher(cfg *config.Config, callFn ExtractionCallFn) *Enricher {
+	rpm := cfg.Markets.News.ExtractionRPM
+	if rpm <= 0 {
+		rpm = 20
+	}
 	return &Enricher{
-		cfg:    cfg,
-		callFn: callFn,
-		sem:    make(chan struct{}, maxEnricherConcurrency),
+		cfg:         cfg,
+		callFn:      callFn,
+		sem:         make(chan struct{}, maxEnricherConcurrency),
+		minInterval: time.Minute / time.Duration(rpm),
 	}
 }
 
@@ -81,8 +90,12 @@ func (en *Enricher) EnrichNewsItem(ctx context.Context, newsItemID, headline, su
 func (en *Enricher) enrich(ctx context.Context, newsItemID, headline, summary string) error {
 	system, user := buildExtractionPrompt(headline, summary)
 
+	en.acquireRateLimit(ctx)
 	raw, err := en.callFn(ctx, system, user)
 	if err != nil {
+		if isRateLimitErr(err) {
+			en.applyBackoff()
+		}
 		return fmt.Errorf("extraction call: %w", err)
 	}
 
@@ -137,6 +150,42 @@ func buildExtractionPrompt(headline, summary string) (system, user string) {
 		b.WriteString(summary)
 	}
 	return extractionSystem, b.String()
+}
+
+func (en *Enricher) acquireRateLimit(ctx context.Context) {
+	en.rateMu.Lock()
+	wait := time.Until(en.lastCall.Add(en.minInterval))
+	en.rateMu.Unlock()
+	if wait > 0 {
+		t := time.NewTimer(wait)
+		defer t.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+	en.rateMu.Lock()
+	en.lastCall = time.Now().Add(100 * time.Millisecond) // small jitter against burst alignment
+	en.rateMu.Unlock()
+}
+
+func (en *Enricher) applyBackoff() {
+	en.rateMu.Lock()
+	if en.minInterval < 2*time.Second {
+		en.lastCall = time.Now().Add(2 * time.Second)
+	} else {
+		en.lastCall = time.Now().Add(en.minInterval * 2)
+	}
+	en.rateMu.Unlock()
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") || strings.Contains(s, "rate limit") || strings.Contains(s, "rate_limit")
 }
 
 // ── Response parsing ──────────────────────────────────────────────────────────
