@@ -69,7 +69,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	body := map[string]any{
 		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": systemPrompt}}},
 		"contents":          []map[string]any{{"role": "user", "parts": []map[string]any{{"text": userMessage}}}},
-		"generationConfig":  map[string]any{"maxOutputTokens": maxTokens, "temperature": temperature},
+		"generationConfig":  map[string]any{"maxOutputTokens": maxTokens, "temperature": temperature, "responseMimeType": "application/json"},
 	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
@@ -86,7 +86,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
 	}
-	httpReq.Header.Set("content-type", "application/json")
+	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
 	start := time.Now()
