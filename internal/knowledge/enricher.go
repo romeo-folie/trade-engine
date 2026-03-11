@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"html"
 	"strings"
 	"sync"
 	"time"
@@ -322,9 +323,19 @@ func normalizeTicker(s string) string {
 }
 
 func normalizeEntityName(s string) string {
-	s = strings.TrimSpace(s)
+	s = html.UnescapeString(strings.TrimSpace(s))
 	if s == "" {
 		return s
 	}
-	return strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) })
+	s = strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) })
+	s = strings.Join(strings.Fields(s), " ")
+
+	// light canonicalization to reduce fragmentation from legal suffix variance
+	for _, suffix := range []string{", Inc.", " Inc.", ", Inc", " Inc", ", Corporation", " Corporation", ", Corp.", " Corp.", ", Corp", " Corp"} {
+		if strings.HasSuffix(s, suffix) {
+			s = strings.TrimSuffix(s, suffix)
+			break
+		}
+	}
+	return strings.TrimSpace(s)
 }

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -161,10 +162,13 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
 		if req.Ticker != "__extraction__" {
+			preview := rawText[:min(200, len(rawText))]
 			logger.Warn("failed to extract JSON from model response",
 				"ticker", req.Ticker,
 				"err", err.Error(),
-				"raw", rawText[:min(200, len(rawText))],
+				"raw_preview", preview,
+				"raw_len", len(rawText),
+				"raw_truncated", len(rawText) > len(preview),
 			)
 		}
 		return AnalysisResponse{}, meta, fmt.Errorf("extract JSON: %w", err)
@@ -182,6 +186,13 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 	if m := jsonFenceRe.FindStringSubmatch(text); len(m) == 2 {
 		text = strings.TrimSpace(m[1])
 	}
+	// Tolerate unfinished fenced output like "```json\n{..." with missing closing ```.
+	if strings.HasPrefix(text, "```") {
+		text = strings.TrimPrefix(text, "```json")
+		text = strings.TrimPrefix(text, "```")
+		text = strings.TrimSuffix(text, "```")
+		text = strings.TrimSpace(text)
+	}
 
 	// Fall back to finding the outermost { } block.
 	if !strings.HasPrefix(text, "{") {
@@ -194,7 +205,11 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 
 	var result AnalysisResponse
 	if err := json.Unmarshal([]byte(text), &result); err != nil {
-		return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, text[:min(120, len(text))])
+		preview := text
+		if utf8.RuneCountInString(preview) > 120 {
+			preview = string([]rune(preview)[:120])
+		}
+		return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 	}
 
 	// Validate required fields.

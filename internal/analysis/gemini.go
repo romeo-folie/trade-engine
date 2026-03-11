@@ -139,7 +139,14 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
 		if req.Ticker != "__extraction__" {
-			logger.Warn("gemini: failed to extract JSON", "ticker", req.Ticker, "err", err.Error(), "raw", rawText[:min(200, len(rawText))])
+			preview := rawText[:min(200, len(rawText))]
+			logger.Warn("gemini: failed to extract JSON",
+				"ticker", req.Ticker,
+				"err", err.Error(),
+				"raw_preview", preview,
+				"raw_len", len(rawText),
+				"raw_truncated", len(rawText) > len(preview),
+			)
 		}
 		return AnalysisResponse{}, meta, fmt.Errorf("gemini extract JSON: %w", err)
 	}
