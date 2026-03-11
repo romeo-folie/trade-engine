@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -23,6 +24,12 @@ const anthropicVersion = "2023-06-01"
 
 // jsonFenceRe matches ```json ... ``` blocks that models sometimes emit.
 var jsonFenceRe = regexp.MustCompile("(?s)```(?:json)?\\s*(\\{.*?\\})\\s*```")
+var actionFieldRe = regexp.MustCompile(`"action"\s*:\s*"([^"]+)"`)
+var confidenceFieldRe = regexp.MustCompile(`"confidence"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
+var sizePctFieldRe = regexp.MustCompile(`"size_pct"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
+var stopLossFieldRe = regexp.MustCompile(`"stop_loss"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
+var takeProfitFieldRe = regexp.MustCompile(`"take_profit"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
+var reasoningFieldRe = regexp.MustCompile(`"reasoning"\s*:\s*"([^"]*)`)
 
 // AnthropicClient implements ModelProvider using the Anthropic Messages API.
 type AnthropicClient struct {
@@ -205,11 +212,25 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 
 	var result AnalysisResponse
 	if err := json.Unmarshal([]byte(text), &result); err != nil {
-		preview := text
-		if utf8.RuneCountInString(preview) > 120 {
-			preview = string([]rune(preview)[:120])
+		// Recovery path for truncated model output (common with long reasoning):
+		// best-effort extraction of required fields from partial JSON text.
+		if strings.Contains(err.Error(), "unexpected end of JSON input") {
+			if recovered, ok := recoverPartialAnalysis(text); ok {
+				result = recovered
+			} else {
+				preview := text
+				if utf8.RuneCountInString(preview) > 120 {
+					preview = string([]rune(preview)[:120])
+				}
+				return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
+			}
+		} else {
+			preview := text
+			if utf8.RuneCountInString(preview) > 120 {
+				preview = string([]rune(preview)[:120])
+			}
+			return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 		}
-		return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 	}
 
 	// Normalize action to canonical enum form (models sometimes emit lowercase).
@@ -227,6 +248,40 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 	}
 
 	return result, nil
+}
+
+func recoverPartialAnalysis(text string) (AnalysisResponse, bool) {
+	var out AnalysisResponse
+	mAction := actionFieldRe.FindStringSubmatch(text)
+	mConf := confidenceFieldRe.FindStringSubmatch(text)
+	if len(mAction) < 2 || len(mConf) < 2 {
+		return AnalysisResponse{}, false
+	}
+	conf, err := strconv.ParseFloat(mConf[1], 64)
+	if err != nil {
+		return AnalysisResponse{}, false
+	}
+	out.Action = Action(strings.TrimSpace(mAction[1]))
+	out.Confidence = conf
+	if m := sizePctFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			out.SizePct = v
+		}
+	}
+	if m := stopLossFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			out.StopLoss = v
+		}
+	}
+	if m := takeProfitFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		if v, err := strconv.ParseFloat(m[1], 64); err == nil {
+			out.TakeProfit = v
+		}
+	}
+	if m := reasoningFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		out.Reasoning = strings.TrimSpace(m[1])
+	}
+	return out, true
 }
 
 // ─── Conversion helpers ───────────────────────────────────────────────────────
