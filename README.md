@@ -74,6 +74,25 @@ te watchlist add AAPL --strategies=trend_following --timeframes=1h,1d
 te run
 ```
 
+### Embeddings provider (API vs local)
+
+Embeddings are always stored in your Postgres/pgvector DB. The provider only changes
+where vectors are computed:
+
+- `openai` → cloud embedding inference (counts toward API usage)
+- `ollama` → local embedding inference (no embedding API usage)
+
+For local embeddings with Ollama:
+
+```bash
+ollama serve
+ollama pull nomic-embed-text
+curl -s http://localhost:11434/api/embeddings \
+  -d '{"model":"nomic-embed-text","prompt":"hello world"}' | jq .
+```
+
+> `nomic-embed-text` is 768-dim. Ensure your vector schema dimension matches before enabling.
+
 ### Docker notes
 
 If you previously started a container named `tradeengine-db` manually and see:

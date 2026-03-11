@@ -153,11 +153,14 @@ reports:
 
 embeddings:
   enabled: false
-  provider: openai             # openai | ollama
-  dimension: 1536              # Must match DB vector dimension (default migration: 1536)
-  api_key_env: OPENAI_API_KEY  # Required when provider=openai
+  # Local-first setup (no embedding API usage): ollama + nomic-embed-text.
+  # Note: nomic-embed-text is 768-dim, so if you enable this provider you must
+  # use a 768-dim vector schema (or migrate from 1536 before enabling).
+  provider: ollama             # ollama | openai
+  dimension: 768               # Must match DB vector dimension
+  model: nomic-embed-text      # Required when provider=ollama
   ollama_base_url: http://localhost:11434
-  model: ""                    # Required when provider=ollama (e.g. nomic-embed-text)
+  api_key_env: OPENAI_API_KEY  # Used only when provider=openai
   worker_interval_sec: 30
   batch_size: 50
   similar_analyses_enabled: false
