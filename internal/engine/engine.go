@@ -744,7 +744,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	positionValue := pState.Cash * (sig.SizePct / 100)
 	qty := positionValue / sig.SignalPrice
 	if qty <= 0 {
-		logger.Warn("signal execution skipped — zero quantity", "ticker", sig.Ticker)
+		reason := fmt.Sprintf("zero quantity (cash=%.2f size_pct=%.2f signal_price=%.4f)", pState.Cash, sig.SizePct, sig.SignalPrice)
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Warn("signal execution skipped — zero quantity",
+			"ticker", sig.Ticker,
+			"cash", pState.Cash,
+			"size_pct", sig.SizePct,
+			"signal_price", sig.SignalPrice,
+		)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "position sizing",
+		})
 		return
 	}
 
