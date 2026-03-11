@@ -6,6 +6,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -105,6 +106,8 @@ type Model struct {
 	selectedWatchlist int
 	selectedConfig    int
 	showTradeDetail   bool
+	configEditing     bool
+	configInput       string
 
 	// Status message (briefly shown after actions)
 	statusMsg     string
@@ -152,6 +155,56 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.activeView == ViewConfig && m.configEditing {
+			switch msg.String() {
+			case "esc":
+				m.configEditing = false
+				m.configInput = ""
+				return m, nil
+			case "enter":
+				if m.selectedConfig < 0 || m.selectedConfig >= len(m.configData.Items) {
+					m.configEditing = false
+					m.configInput = ""
+					return m, nil
+				}
+				item := m.configData.Items[m.selectedConfig]
+				v := strings.TrimSpace(m.configInput)
+				if v == "" {
+					m.statusMsg = "Config edit cancelled (empty value)"
+					m.statusMsgTime = time.Now()
+					m.configEditing = false
+					m.configInput = ""
+					return m, nil
+				}
+				if err := views.SetConfigValue(context.Background(), item.Key, v); err != nil {
+					m.statusMsg = fmt.Sprintf("Config update failed: %s", err)
+				} else {
+					m.configData.Items[m.selectedConfig].Value = v
+					m.statusMsg = fmt.Sprintf("✓ Updated %s=%s", item.Key, v)
+				}
+				m.statusMsgTime = time.Now()
+				m.configEditing = false
+				m.configInput = ""
+				return m, nil
+			case "backspace", "ctrl+h":
+				if len(m.configInput) > 0 {
+					m.configInput = m.configInput[:len(m.configInput)-1]
+				}
+				return m, nil
+			default:
+				// Accept raw numeric/text input for number fields.
+				r := msg.String()
+				if len(r) == 1 {
+					ch := r[0]
+					if (ch >= '0' && ch <= '9') || ch == '.' || ch == '-' {
+						m.configInput += r
+						return m, nil
+					}
+				}
+				return m, nil
+			}
+		}
+
 		switch msg.String() {
 		case "q", "ctrl+c":
 			if m.showDetail {
@@ -166,12 +219,53 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "enter":
+			if m.activeView == ViewConfig && len(m.configData.Items) > 0 {
+				item := m.configData.Items[m.selectedConfig]
+				switch item.Kind {
+				case "select", "toggle":
+					var next string
+					if len(item.Options) > 0 {
+						idx := 0
+						for i, o := range item.Options {
+							if o == item.Value {
+								idx = i
+								break
+							}
+						}
+						next = item.Options[(idx+1)%len(item.Options)]
+					} else {
+						next = views.CycleMode(item.Value)
+					}
+					if err := views.SetConfigValue(context.Background(), item.Key, next); err != nil {
+						m.statusMsg = fmt.Sprintf("Config update failed: %s", err)
+					} else {
+						m.configData.Items[m.selectedConfig].Value = next
+						if item.Key == "engine.mode" {
+							m.mode = next
+						}
+						m.statusMsg = fmt.Sprintf("✓ Updated %s=%s", item.Key, next)
+					}
+					m.statusMsgTime = time.Now()
+					return m, nil
+				case "number":
+					m.configEditing = true
+					m.configInput = item.Value
+					m.statusMsg = fmt.Sprintf("Editing %s (Enter to save, Esc to cancel)", item.Key)
+					m.statusMsgTime = time.Now()
+					return m, nil
+				}
+			}
 			if m.activeView == ViewDashboard && !m.showDetail && len(m.dashData.Positions) > 0 {
 				m.showDetail = true
 				return m, nil
 			}
 		case "j", "down":
 			if m.showDetail {
+				return m, nil
+			}
+			if m.activeView == ViewConfig && len(m.configData.Items) > 0 {
+				m.selectedConfig = (m.selectedConfig + 1) % len(m.configData.Items)
+				m.configData.Selected = m.selectedConfig
 				return m, nil
 			}
 			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
@@ -184,6 +278,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case "k", "up":
 			if m.showDetail {
+				return m, nil
+			}
+			if m.activeView == ViewConfig && len(m.configData.Items) > 0 {
+				m.selectedConfig = (m.selectedConfig - 1 + len(m.configData.Items)) % len(m.configData.Items)
+				m.configData.Selected = m.selectedConfig
 				return m, nil
 			}
 			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
@@ -423,6 +522,13 @@ func (m Model) renderPlaceholder(title, desc string) string {
 
 func (m Model) renderStatusBar() string {
 	left := " [1-5] switch view  [tab] next  [q] quit"
+	if m.activeView == ViewConfig {
+		if m.configEditing {
+			left = fmt.Sprintf(" editing value: %s", m.configInput)
+		} else {
+			left = " [j/k] nav  [enter] edit/toggle  [q] quit"
+		}
+	}
 	if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 && !m.showDetail {
 		left = " [a]pprove [r]eject [d]etail  [j/k] nav  [enter] position  [q] quit"
 	}
