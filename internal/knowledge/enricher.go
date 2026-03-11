@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -151,40 +152,74 @@ type extractedRelationship struct {
 }
 
 func parseExtractionResponse(raw string) ([]extractedRelationship, error) {
-	// Strip potential markdown code fences.
+	raw = sanitizeJSONPayload(raw)
+	if raw == "" {
+		return nil, nil
+	}
+
+	// Expected path: JSON array.
+	var rels []extractedRelationship
+	if err := json.Unmarshal([]byte(raw), &rels); err == nil {
+		return rels, nil
+	}
+
+	// Tolerate single object payloads.
+	var single extractedRelationship
+	if err := json.Unmarshal([]byte(raw), &single); err == nil {
+		return []extractedRelationship{single}, nil
+	}
+
+	// Last-resort: parse line-delimited or concatenated objects.
+	dec := json.NewDecoder(strings.NewReader(raw))
+	out := make([]extractedRelationship, 0, 4)
+	for {
+		var item extractedRelationship
+		if err := dec.Decode(&item); err != nil {
+			break
+		}
+		out = append(out, item)
+	}
+	if len(out) > 0 {
+		return out, nil
+	}
+
+	return nil, fmt.Errorf("unmarshal extraction payload (raw: %.200s)", raw)
+}
+
+func sanitizeJSONPayload(raw string) string {
 	raw = strings.TrimSpace(raw)
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")
 	raw = strings.TrimSpace(raw)
 
-	var rels []extractedRelationship
-	if err := json.Unmarshal([]byte(raw), &rels); err != nil {
-		return nil, fmt.Errorf("unmarshal: %w (raw: %.200s)", err, raw)
+	// Sometimes models prepend prose before JSON; keep from first JSON token.
+	if i := strings.IndexFunc(raw, func(r rune) bool { return r == '[' || r == '{' }); i > 0 {
+		raw = raw[i:]
 	}
-	return rels, nil
+	return strings.TrimSpace(raw)
 }
 
 // ── Persistence ───────────────────────────────────────────────────────────────
 
 func (en *Enricher) persistExtractedRelationship(ctx context.Context, newsItemID string, r extractedRelationship) error {
-	// Upsert source entity (auto-generated entities have only name + ticker;
-	// a human can later enrich description/sector/country via `te graph review`).
-	fromID, err := store.UpsertEntity(ctx, store.Entity{
-		EntityType: "company",
-		Name:       r.FromEntity,
-		Ticker:     r.FromTicker,
-	})
+	r.FromEntity = normalizeEntityName(r.FromEntity)
+	r.ToEntity = normalizeEntityName(r.ToEntity)
+	r.FromTicker = normalizeTicker(r.FromTicker)
+	r.ToTicker = normalizeTicker(r.ToTicker)
+	r.RelationshipType = strings.TrimSpace(r.RelationshipType)
+	if r.RelationshipType == "" {
+		return fmt.Errorf("empty relationship_type")
+	}
+	if r.FromEntity == "" || r.ToEntity == "" {
+		return fmt.Errorf("empty entity name(s)")
+	}
+
+	fromID, err := resolveEntityID(ctx, r.FromEntity, r.FromTicker)
 	if err != nil {
 		return fmt.Errorf("upsert from_entity %q: %w", r.FromEntity, err)
 	}
-
-	// Upsert destination entity.
-	toID, err := store.UpsertEntity(ctx, store.Entity{
-		EntityType: "company",
-		Name:       r.ToEntity,
-		Ticker:     r.ToTicker,
-	})
+	toID, err := resolveEntityID(ctx, r.ToEntity, r.ToTicker)
 	if err != nil {
 		return fmt.Errorf("upsert to_entity %q: %w", r.ToEntity, err)
 	}
@@ -221,3 +256,26 @@ func (en *Enricher) persistExtractedRelationship(ctx context.Context, newsItemID
 }
 
 func timePtr(t time.Time) *time.Time { return &t }
+
+func resolveEntityID(ctx context.Context, name, ticker string) (string, error) {
+	if ticker != "" {
+		existing, err := store.GetEntityByTicker(ctx, ticker)
+		if err == nil && existing != nil {
+			return existing.ID, nil
+		}
+	}
+	return store.UpsertEntity(ctx, store.Entity{EntityType: "company", Name: name, Ticker: ticker})
+}
+
+func normalizeTicker(s string) string {
+	s = strings.TrimSpace(strings.ToUpper(s))
+	return strings.Trim(s, " ")
+}
+
+func normalizeEntityName(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	return strings.TrimFunc(s, func(r rune) bool { return unicode.IsSpace(r) })
+}
