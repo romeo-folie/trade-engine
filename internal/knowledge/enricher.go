@@ -93,6 +93,9 @@ func (en *Enricher) enrich(ctx context.Context, newsItemID, headline, summary st
 	en.acquireRateLimit(ctx)
 	raw, err := en.callFn(ctx, system, user)
 	if err != nil {
+		if isRateLimitErr(err) {
+			en.applyBackoff()
+		}
 		return fmt.Errorf("extraction call: %w", err)
 	}
 
@@ -163,8 +166,26 @@ func (en *Enricher) acquireRateLimit(ctx context.Context) {
 		}
 	}
 	en.rateMu.Lock()
-	en.lastCall = time.Now()
+	en.lastCall = time.Now().Add(100 * time.Millisecond) // small jitter against burst alignment
 	en.rateMu.Unlock()
+}
+
+func (en *Enricher) applyBackoff() {
+	en.rateMu.Lock()
+	if en.minInterval < 2*time.Second {
+		en.lastCall = time.Now().Add(2 * time.Second)
+	} else {
+		en.lastCall = time.Now().Add(en.minInterval * 2)
+	}
+	en.rateMu.Unlock()
+}
+
+func isRateLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "429") || strings.Contains(s, "rate limit") || strings.Contains(s, "rate_limit")
 }
 
 // ── Response parsing ──────────────────────────────────────────────────────────

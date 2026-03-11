@@ -114,6 +114,18 @@ func TestResolveEnvSet(t *testing.T) {
 	}
 }
 
+func TestValidateExtractionProviderMustExistInConfiguredModels(t *testing.T) {
+	cfg := Defaults()
+	cfg.Markets.News.ExtractionEnabled = true
+	cfg.Markets.News.ExtractionProvider = "openai"
+	cfg.Markets.News.ExtractionModel = "gpt-4o"
+	cfg.Models.Analysts = []ModelConfig{{Provider: "anthropic", Model: "claude-sonnet-4-6", APIKeyEnv: "ANTHROPIC_API_KEY"}}
+	errs := Validate(cfg)
+	if !containsStr(errs, "markets.news.extraction_provider/model") {
+		t.Fatalf("expected extraction provider/model validation error, got: %v", errs)
+	}
+}
+
 func TestSetField_NestedPathAndBool(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

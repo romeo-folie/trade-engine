@@ -409,6 +409,18 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("env var %s (markets.stocks.api_key_env) is not set", cfg.Markets.Stocks.APIKeyEnv))
 	}
 
+	if cfg.Markets.News.ExtractionEnabled {
+		if cfg.Markets.News.ExtractionRPM <= 0 {
+			errs = append(errs, "markets.news.extraction_rpm must be > 0 when extraction is enabled")
+		}
+		if cfg.Markets.News.ExtractionMaxArticlesPerTick <= 0 {
+			errs = append(errs, "markets.news.extraction_max_articles_per_tick must be > 0 when extraction is enabled")
+		}
+		if cfg.Markets.News.ExtractionProvider != "" && !hasConfiguredModel(cfg, cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel) {
+			errs = append(errs, fmt.Sprintf("markets.news.extraction_provider/model (%s/%s) not found in configured model clients", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel))
+		}
+	}
+
 	if cfg.Notifications.Telegram.Enabled && cfg.Notifications.Telegram.BotTokenEnv != "" {
 		if os.Getenv(cfg.Notifications.Telegram.BotTokenEnv) == "" {
 			errs = append(errs, fmt.Sprintf("env var %s (notifications.telegram.bot_token_env) is not set", cfg.Notifications.Telegram.BotTokenEnv))
@@ -452,6 +464,36 @@ func resolveEnv(key string) string {
 		return ""
 	}
 	return os.Getenv(key)
+}
+
+func hasConfiguredModel(cfg *Config, provider, model string) bool {
+	match := func(m ModelConfig) bool {
+		if m.Provider == "" {
+			return false
+		}
+		if m.Provider != provider {
+			return false
+		}
+		if model != "" && m.Model != model {
+			return false
+		}
+		return true
+	}
+
+	for _, m := range cfg.Models.Analysts {
+		if match(m) {
+			return true
+		}
+	}
+	if match(cfg.Models.Primary) || match(cfg.Models.Arbiter) {
+		return true
+	}
+	for _, m := range cfg.Models.Secondary {
+		if match(m) {
+			return true
+		}
+	}
+	return false
 }
 
 func save(cfg *Config, path string) error {

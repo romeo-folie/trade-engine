@@ -88,7 +88,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 
 		provider := pickExtractionProvider(az, cfg)
 		if provider == nil || !provider.IsAvailable() {
-			return "", fmt.Errorf("enricher: extraction provider unavailable")
+			return "", fmt.Errorf("enricher: extraction provider unavailable (provider=%q model=%q)", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel)
 		}
 		_, meta, err := provider.Analyze(ctx, req)
 		if meta.RawResponse != "" {
@@ -436,8 +436,17 @@ func pickExtractionProvider(az *analysis.Analyzer, cfg *config.Config) analysis.
 		if wantModel != "" && p.ModelName() != wantModel {
 			continue
 		}
-		return p
+		if p.IsAvailable() {
+			return p
+		}
 	}
+
+	// If extraction provider/model was explicitly configured, do NOT silently
+	// fall back to another provider — that can reintroduce surprise cost spikes.
+	if wantProvider != "" || wantModel != "" {
+		return nil
+	}
+
 	for _, p := range providers {
 		if p != nil && p.IsAvailable() {
 			return p
