@@ -573,15 +573,7 @@ func predictionsVisible() bool {
 	if err != nil {
 		return true
 	}
-	if cfg.Markets.Predictions.Enabled {
-		return true
-	}
-	for _, p := range cfg.Markets.Predictions.Platforms {
-		if p.Enabled {
-			return true
-		}
-	}
-	return false
+	return cfg.Markets.Predictions.Enabled
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
