@@ -92,7 +92,8 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 	return r
 }
 
-// Enabled returns true if at least one prediction platform is configured.
+// Enabled returns true if prediction markets are globally enabled and at least
+// one platform is configured.
 func (r *PredictionRunner) Enabled() bool {
 	if !r.cfg.Markets.Predictions.Enabled {
 		return false
