@@ -29,6 +29,7 @@ func TestIsMarketOpen(t *testing.T) {
 		{name: "sunday", ts: "2024-03-17T12:00:00-04:00", want: false},
 		{name: "holiday new year", ts: "2024-01-01T12:00:00-05:00", want: false},
 		{name: "holiday christmas", ts: "2024-12-25T12:00:00-05:00", want: false},
+		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00-05:00", want: false},
 	}
 
 	for _, tt := range tests {

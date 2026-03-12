@@ -71,10 +71,15 @@ func isUSHoliday(t time.Time) bool {
 	day := et.Day()
 	d := time.Date(year, month, day, 0, 0, 0, 0, nyLoc)
 
-	holidays := usHolidays(year)
-	for _, h := range holidays {
-		if h.Equal(d) {
-			return true
+	// A Friday observed holiday for a Saturday New Year might fall on 12-31 of year-1.
+	// A Monday observed holiday for a Sunday New Year might fall on 01-02 of year.
+	// We check the target year, previous year, and next year to catch observed shifts.
+	for _, y := range []int{year - 1, year, year + 1} {
+		holidays := usHolidays(y)
+		for _, h := range holidays {
+			if h.Equal(d) {
+				return true
+			}
 		}
 	}
 	return false
