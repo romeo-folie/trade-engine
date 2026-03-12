@@ -43,20 +43,14 @@ func FetchSignalFeed(ctx context.Context, limit int, includePredictions bool) Si
 		return SignalFeedData{LastUpdate: time.Now()}
 	}
 
-	// Fetch more to ensure we have enough after filtering
-	recent, err := store.GetRecentSignals(ctx, limit*5)
+	// Fetch only what we need; DB handles filtering
+	recent, err := store.GetRecentSignals(ctx, limit, includePredictions)
 	if err != nil {
 		return SignalFeedData{LastUpdate: time.Now()}
 	}
 	rows := make([]SignalFeedRow, 0, limit)
 	for _, s := range recent {
-		if !includePredictions && s.Strategy == "prediction_mispricing" {
-			continue
-		}
 		rows = append(rows, toFeedRow(s))
-		if len(rows) >= limit {
-			break
-		}
 	}
 
 	return SignalFeedData{

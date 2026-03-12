@@ -93,6 +93,8 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	}
 
 	// Open trades → positions
+	var visibleInvested float64
+	var largestVisiblePosValue float64
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
 		for _, t := range trades {
@@ -122,6 +124,11 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 
 			if !includePredictions && t.Strategy == "prediction_mispricing" {
 				continue
+			}
+
+			visibleInvested += posValue
+			if posValue > largestVisiblePosValue {
+				largestVisiblePosValue = posValue
 			}
 
 			d.OpenPositionCnt++
@@ -161,13 +168,9 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	}
 
 	// Recent signals summary (last 20, global across all tickers/statuses)
-	// Fetch more to ensure we have enough after filtering
-	recent, err := store.GetRecentSignals(ctx, 100)
+	recent, err := store.GetRecentSignals(ctx, 20, includePredictions)
 	if err == nil {
 		for _, s := range recent {
-			if !includePredictions && s.Strategy == "prediction_mispricing" {
-				continue
-			}
 			d.RecentSignals = append(d.RecentSignals, SignalRow{
 				ID:         s.ID,
 				Ticker:     s.Ticker,
@@ -177,9 +180,6 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 				CreatedAt:  s.CreatedAt,
 				ExpiresAt:  s.ExpiresAt,
 			})
-			if len(d.RecentSignals) >= 20 {
-				break
-			}
 		}
 	}
 
@@ -192,15 +192,9 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 		}
 	}
 
-	// Largest position %
-	if d.Invested > 0 {
-		for _, p := range d.Positions {
-			posVal := p.CurrentPrice * p.Quantity
-			pct := (posVal / (d.Invested + d.Cash)) * 100
-			if pct > d.LargestPosPct {
-				d.LargestPosPct = pct
-			}
-		}
+	// Largest visible position % (kept consistent with displayed rows)
+	if visibleInvested > 0 {
+		d.LargestPosPct = (largestVisiblePosValue / (visibleInvested + d.Cash)) * 100
 	}
 
 	// Active watchlist summary
