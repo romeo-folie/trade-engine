@@ -96,10 +96,6 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
 		for _, t := range trades {
-			if !includePredictions && t.Strategy == "prediction_mispricing" {
-				continue
-			}
-			d.OpenPositionCnt++
 			// Get latest price for unrealized P&L
 			var currentPrice float64
 			if c, err := store.GetLatestCandle(ctx, t.Ticker, "1d"); err == nil && c != nil {
@@ -124,6 +120,11 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			d.Invested += posValue
 			d.UnrealizedPnL += pnl
 
+			if !includePredictions && t.Strategy == "prediction_mispricing" {
+				continue
+			}
+
+			d.OpenPositionCnt++
 			d.Positions = append(d.Positions, PositionRow{
 				Ticker:       t.Ticker,
 				EntryPrice:   t.EntryPrice,
@@ -160,7 +161,8 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	}
 
 	// Recent signals summary (last 20, global across all tickers/statuses)
-	recent, err := store.GetRecentSignals(ctx, 20)
+	// Fetch more to ensure we have enough after filtering
+	recent, err := store.GetRecentSignals(ctx, 100)
 	if err == nil {
 		for _, s := range recent {
 			if !includePredictions && s.Strategy == "prediction_mispricing" {
@@ -175,6 +177,9 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 				CreatedAt:  s.CreatedAt,
 				ExpiresAt:  s.ExpiresAt,
 			})
+			if len(d.RecentSignals) >= 20 {
+				break
+			}
 		}
 	}
 
