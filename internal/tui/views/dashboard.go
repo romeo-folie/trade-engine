@@ -95,11 +95,11 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	// Open trades → positions
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
-		d.OpenPositionCnt = len(trades)
 		for _, t := range trades {
 			if !includePredictions && t.Strategy == "prediction_mispricing" {
 				continue
 			}
+			d.OpenPositionCnt++
 			// Get latest price for unrealized P&L
 			var currentPrice float64
 			if c, err := store.GetLatestCandle(ctx, t.Ticker, "1d"); err == nil && c != nil {
