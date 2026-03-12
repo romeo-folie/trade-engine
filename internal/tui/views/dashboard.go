@@ -76,7 +76,10 @@ type SignalRow struct {
 // FetchDashboardData loads dashboard data from the database.
 // Returns zero-value DashboardData on errors (TUI stays functional).
 // Safe to call when no database is connected — returns defaults.
-func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
+//
+// includePredictions controls visibility of prediction strategy rows in
+// dashboard positions + signal feeds (used by issue #145).
+func FetchDashboardData(ctx context.Context, mode string, includePredictions bool) (d DashboardData) {
 	d = DashboardData{
 		Mode:       mode,
 		PaperMode:  mode == "paper",
@@ -90,9 +93,10 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 	}
 
 	// Open trades → positions
+	var visibleInvested float64
+	var largestVisiblePosValue float64
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
-		d.OpenPositionCnt = len(trades)
 		for _, t := range trades {
 			// Get latest price for unrealized P&L
 			var currentPrice float64
@@ -118,6 +122,16 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 			d.Invested += posValue
 			d.UnrealizedPnL += pnl
 
+			if !includePredictions && t.Strategy == "prediction_mispricing" {
+				continue
+			}
+
+			visibleInvested += posValue
+			if posValue > largestVisiblePosValue {
+				largestVisiblePosValue = posValue
+			}
+
+			d.OpenPositionCnt++
 			d.Positions = append(d.Positions, PositionRow{
 				Ticker:       t.Ticker,
 				EntryPrice:   t.EntryPrice,
@@ -137,6 +151,9 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		pending, err := store.GetPendingSignals(ctx)
 		if err == nil {
 			for _, s := range pending {
+				if !includePredictions && s.Strategy == "prediction_mispricing" {
+					continue
+				}
 				d.PendingSignals = append(d.PendingSignals, SignalRow{
 					ID:         s.ID,
 					Ticker:     s.Ticker,
@@ -151,7 +168,7 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 	}
 
 	// Recent signals summary (last 20, global across all tickers/statuses)
-	recent, err := store.GetRecentSignals(ctx, 20)
+	recent, err := store.GetRecentSignals(ctx, 20, includePredictions)
 	if err == nil {
 		for _, s := range recent {
 			d.RecentSignals = append(d.RecentSignals, SignalRow{
@@ -175,15 +192,9 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		}
 	}
 
-	// Largest position %
-	if d.Invested > 0 {
-		for _, p := range d.Positions {
-			posVal := p.CurrentPrice * p.Quantity
-			pct := (posVal / (d.Invested + d.Cash)) * 100
-			if pct > d.LargestPosPct {
-				d.LargestPosPct = pct
-			}
-		}
+	// Largest visible position % (kept consistent with displayed rows)
+	if visibleInvested > 0 {
+		d.LargestPosPct = (largestVisiblePosValue / (visibleInvested + d.Cash)) * 100
 	}
 
 	// Active watchlist summary

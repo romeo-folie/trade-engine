@@ -34,7 +34,8 @@ type SignalFeedRow struct {
 }
 
 // FetchSignalFeed loads recent signals from the database (all statuses).
-func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
+// includePredictions controls visibility of prediction strategy rows.
+func FetchSignalFeed(ctx context.Context, limit int, includePredictions bool) SignalFeedData {
 	if limit == 0 {
 		limit = 50
 	}
@@ -42,11 +43,12 @@ func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
 		return SignalFeedData{LastUpdate: time.Now()}
 	}
 
-	recent, err := store.GetRecentSignals(ctx, limit)
+	// Fetch only what we need; DB handles filtering
+	recent, err := store.GetRecentSignals(ctx, limit, includePredictions)
 	if err != nil {
 		return SignalFeedData{LastUpdate: time.Now()}
 	}
-	rows := make([]SignalFeedRow, 0, len(recent))
+	rows := make([]SignalFeedRow, 0, limit)
 	for _, s := range recent {
 		rows = append(rows, toFeedRow(s))
 	}
