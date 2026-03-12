@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tui/views"
@@ -382,10 +383,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pollTickMsg:
 		m.lastPoll = time.Time(msg)
 		ctx := context.Background()
-		m.dashData = views.FetchDashboardData(ctx, m.mode)
+		includePredictions := predictionsVisible()
+		m.dashData = views.FetchDashboardData(ctx, m.mode, includePredictions)
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
 		m.tradeData.Selected = m.selectedTrade
-		m.signalData = views.FetchSignalFeed(ctx, 50)
+		m.signalData = views.FetchSignalFeed(ctx, 50, includePredictions)
 		m.signalData.Selected = m.selectedSignal
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.watchlistData.Selected = m.selectedWatchlist
@@ -559,6 +561,27 @@ func (m Model) renderStatusBar() string {
 	}
 
 	return statusBarStyle.Width(m.width).Render(left + padding + right)
+}
+
+// predictionsVisible returns whether prediction strategy rows should be shown
+// in TUI signal feeds and open positions.
+//
+// If config cannot be loaded, default to true (show) to avoid accidentally
+// hiding data due to a transient config load issue.
+func predictionsVisible() bool {
+	cfg, err := config.Load()
+	if err != nil {
+		return true
+	}
+	if cfg.Markets.Predictions.Enabled {
+		return true
+	}
+	for _, p := range cfg.Markets.Predictions.Platforms {
+		if p.Enabled {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────

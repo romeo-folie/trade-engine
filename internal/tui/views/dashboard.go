@@ -76,7 +76,10 @@ type SignalRow struct {
 // FetchDashboardData loads dashboard data from the database.
 // Returns zero-value DashboardData on errors (TUI stays functional).
 // Safe to call when no database is connected — returns defaults.
-func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
+//
+// includePredictions controls visibility of prediction strategy rows in
+// dashboard positions + signal feeds (used by issue #145).
+func FetchDashboardData(ctx context.Context, mode string, includePredictions bool) (d DashboardData) {
 	d = DashboardData{
 		Mode:       mode,
 		PaperMode:  mode == "paper",
@@ -94,6 +97,9 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 	if err == nil {
 		d.OpenPositionCnt = len(trades)
 		for _, t := range trades {
+			if !includePredictions && t.Strategy == "prediction_mispricing" {
+				continue
+			}
 			// Get latest price for unrealized P&L
 			var currentPrice float64
 			if c, err := store.GetLatestCandle(ctx, t.Ticker, "1d"); err == nil && c != nil {
@@ -137,6 +143,9 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 		pending, err := store.GetPendingSignals(ctx)
 		if err == nil {
 			for _, s := range pending {
+				if !includePredictions && s.Strategy == "prediction_mispricing" {
+					continue
+				}
 				d.PendingSignals = append(d.PendingSignals, SignalRow{
 					ID:         s.ID,
 					Ticker:     s.Ticker,
@@ -154,6 +163,9 @@ func FetchDashboardData(ctx context.Context, mode string) (d DashboardData) {
 	recent, err := store.GetRecentSignals(ctx, 20)
 	if err == nil {
 		for _, s := range recent {
+			if !includePredictions && s.Strategy == "prediction_mispricing" {
+				continue
+			}
 			d.RecentSignals = append(d.RecentSignals, SignalRow{
 				ID:         s.ID,
 				Ticker:     s.Ticker,

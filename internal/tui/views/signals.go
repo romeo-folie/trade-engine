@@ -34,7 +34,8 @@ type SignalFeedRow struct {
 }
 
 // FetchSignalFeed loads recent signals from the database (all statuses).
-func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
+// includePredictions controls visibility of prediction strategy rows.
+func FetchSignalFeed(ctx context.Context, limit int, includePredictions bool) SignalFeedData {
 	if limit == 0 {
 		limit = 50
 	}
@@ -48,6 +49,9 @@ func FetchSignalFeed(ctx context.Context, limit int) SignalFeedData {
 	}
 	rows := make([]SignalFeedRow, 0, len(recent))
 	for _, s := range recent {
+		if !includePredictions && s.Strategy == "prediction_mispricing" {
+			continue
+		}
 		rows = append(rows, toFeedRow(s))
 	}
 
