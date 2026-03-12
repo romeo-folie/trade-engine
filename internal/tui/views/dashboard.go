@@ -202,11 +202,23 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	if err == nil {
 		d.Watchlist = make([]string, 0, len(watchlist))
 		for _, item := range watchlist {
+			if !includePredictions && (item.Platform == "polymarket" || item.Platform == "kalshi" || containsStrategy(item.Strategies, "prediction_mispricing")) {
+				continue
+			}
 			d.Watchlist = append(d.Watchlist, item.Ticker)
 		}
 	}
 
 	return d
+}
+
+func containsStrategy(strategies []string, target string) bool {
+	for _, s := range strategies {
+		if s == target {
+			return true
+		}
+	}
+	return false
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
