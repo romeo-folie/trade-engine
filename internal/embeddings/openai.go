@@ -14,10 +14,11 @@ const openAIEmbeddingURL = "https://api.openai.com/v1/embeddings"
 
 // openAIEmbedder calls the OpenAI Embeddings API.
 type openAIEmbedder struct {
-	apiKey string
-	model  string
-	client *http.Client
-	dim    int
+	apiKey  string
+	model   string
+	baseURL string
+	client  *http.Client
+	dim     int
 }
 
 // defaultOpenAIDim is the dimension for text-embedding-3-small, used when
@@ -29,10 +30,11 @@ func newOpenAIEmbedder(apiKey, model string, dim int) *openAIEmbedder {
 		dim = defaultOpenAIDim
 	}
 	return &openAIEmbedder{
-		apiKey: apiKey,
-		model:  model,
-		client: &http.Client{Timeout: 30 * time.Second},
-		dim:    dim,
+		apiKey:  apiKey,
+		model:   model,
+		baseURL: openAIEmbeddingURL,
+		client:  &http.Client{Timeout: 30 * time.Second},
+		dim:     dim,
 	}
 }
 
@@ -56,7 +58,7 @@ func (e *openAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		return nil, fmt.Errorf("openai embed marshal: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIEmbeddingURL, bytes.NewReader(bodyBytes))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.baseURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return nil, fmt.Errorf("openai embed request: %w", err)
 	}
