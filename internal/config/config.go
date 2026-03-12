@@ -129,7 +129,7 @@ type ConsensusConfig struct {
 
 	// Phase 12: fast-path fires when all analysts agree, minConf & spread met.
 	FastPathConfidence float64 `yaml:"fast_path_confidence"` // default 0.80
-	FastPathMaxSpread  float64 `yaml:"fast_path_max_spread"`  // default 0.15
+	FastPathMaxSpread  float64 `yaml:"fast_path_max_spread"` // default 0.15
 
 	// Legacy field.
 	Strategy string `yaml:"strategy,omitempty"` // majority | unanimous | primary-with-veto
@@ -407,6 +407,14 @@ func Validate(cfg *Config) []string {
 
 	if cfg.Markets.Stocks.APIKeyEnv != "" && os.Getenv(cfg.Markets.Stocks.APIKeyEnv) == "" {
 		errs = append(errs, fmt.Sprintf("env var %s (markets.stocks.api_key_env) is not set", cfg.Markets.Stocks.APIKeyEnv))
+	}
+
+	if !cfg.Markets.Predictions.Enabled {
+		for name, p := range cfg.Markets.Predictions.Platforms {
+			if p.Enabled {
+				errs = append(errs, fmt.Sprintf("markets.predictions.platforms.%s.enabled=true while markets.predictions.enabled=false", name))
+			}
+		}
 	}
 
 	if cfg.Markets.News.ExtractionEnabled {

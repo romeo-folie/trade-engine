@@ -62,6 +62,10 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 		mode:      mode,
 	}
 
+	if !cfg.Markets.Predictions.Enabled {
+		return r
+	}
+
 	for name, pc := range cfg.Markets.Predictions.Platforms {
 		if !pc.Enabled {
 			continue
@@ -88,13 +92,23 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 	return r
 }
 
-// Enabled returns true if at least one prediction platform is configured.
-func (r *PredictionRunner) Enabled() bool { return len(r.platforms) > 0 }
+// Enabled returns true if prediction markets are globally enabled and at least
+// one platform is configured.
+func (r *PredictionRunner) Enabled() bool {
+	if !r.cfg.Markets.Predictions.Enabled {
+		return false
+	}
+	return len(r.platforms) > 0
+}
 
 // Run starts the prediction market loop. Blocks until ctx is cancelled.
 func (r *PredictionRunner) Run(ctx context.Context) {
 	if !r.Enabled() {
-		logger.Info("prediction markets disabled (no platforms configured)")
+		if !r.cfg.Markets.Predictions.Enabled {
+			logger.Info("prediction markets disabled (markets.predictions.enabled=false)")
+		} else {
+			logger.Info("prediction markets disabled (no platforms configured)")
+		}
 		return
 	}
 	logger.Info("prediction runner started", "platforms", len(r.platforms))
