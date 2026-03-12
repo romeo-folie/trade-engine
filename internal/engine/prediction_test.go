@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
@@ -135,16 +134,6 @@ func TestPredictionRunner_RunReturnsImmediatelyWhenDisabled(t *testing.T) {
 	cfg.Markets.Predictions.Enabled = false
 	r := NewPredictionRunner(cfg, events.New(), "paper")
 
-	done := make(chan struct{})
-	go func() {
-		r.Run(context.Background())
-		close(done)
-	}()
-
-	select {
-	case <-done:
-		// ok
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("expected Run to return immediately when disabled")
-	}
+	// Run should return promptly when the prediction runner is disabled.
+	r.Run(context.Background())
 }

@@ -5,9 +5,10 @@ import (
 	"time"
 )
 
-func mustParseRFC3339(t *testing.T, s string) time.Time {
+func mustParseNY(t *testing.T, s string) time.Time {
 	t.Helper()
-	ts, err := time.Parse(time.RFC3339, s)
+	// Parse without zone, then attach nyLoc.
+	ts, err := time.ParseInLocation("2006-01-02T15:04:05", s, nyLoc)
 	if err != nil {
 		t.Fatalf("failed to parse time %q: %v", s, err)
 	}
@@ -20,21 +21,21 @@ func TestIsMarketOpen(t *testing.T) {
 		ts   string
 		want bool
 	}{
-		{name: "weekday open", ts: "2024-03-11T10:00:00-04:00", want: true},
-		{name: "opening bell inclusive", ts: "2024-03-11T09:30:00-04:00", want: true},
-		{name: "close exclusive", ts: "2024-03-11T16:00:00-04:00", want: false},
-		{name: "pre-market", ts: "2024-03-11T09:00:00-04:00", want: false},
-		{name: "after-hours", ts: "2024-03-11T20:00:00-04:00", want: false},
-		{name: "saturday", ts: "2024-03-16T12:00:00-04:00", want: false},
-		{name: "sunday", ts: "2024-03-17T12:00:00-04:00", want: false},
-		{name: "holiday new year", ts: "2024-01-01T12:00:00-05:00", want: false},
-		{name: "holiday christmas", ts: "2024-12-25T12:00:00-05:00", want: false},
-		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00-05:00", want: false},
+		{name: "weekday open", ts: "2024-03-11T10:00:00", want: true},
+		{name: "opening bell inclusive", ts: "2024-03-11T09:30:00", want: true},
+		{name: "close exclusive", ts: "2024-03-11T16:00:00", want: false},
+		{name: "pre-market", ts: "2024-03-11T09:00:00", want: false},
+		{name: "after-hours", ts: "2024-03-11T20:00:00", want: false},
+		{name: "saturday", ts: "2024-03-16T12:00:00", want: false},
+		{name: "sunday", ts: "2024-03-17T12:00:00", want: false},
+		{name: "holiday new year", ts: "2024-01-01T12:00:00", want: false},
+		{name: "holiday christmas", ts: "2024-12-25T12:00:00", want: false},
+		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00", want: false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := IsMarketOpen(mustParseRFC3339(t, tt.ts))
+			got := IsMarketOpen(mustParseNY(t, tt.ts))
 			if got != tt.want {
 				t.Errorf("IsMarketOpen(%s) = %v, want %v", tt.ts, got, tt.want)
 			}
@@ -46,7 +47,7 @@ func TestNextTickTime(t *testing.T) {
 	interval := 5 * time.Minute
 
 	t.Run("during market hours adds interval", func(t *testing.T) {
-		now := mustParseRFC3339(t, "2024-03-11T10:00:00-04:00")
+		now := mustParseNY(t, "2024-03-11T10:00:00")
 		got := NextTickTime(now, interval)
 		want := now.Add(interval)
 		if !got.Equal(want) {
@@ -55,18 +56,18 @@ func TestNextTickTime(t *testing.T) {
 	})
 
 	t.Run("after close goes to next session open", func(t *testing.T) {
-		now := mustParseRFC3339(t, "2024-03-11T16:05:00-04:00")
+		now := mustParseNY(t, "2024-03-11T16:05:00")
 		got := NextTickTime(now, interval)
-		want := mustParseRFC3339(t, "2024-03-12T09:30:00-04:00")
+		want := mustParseNY(t, "2024-03-12T09:30:00")
 		if !got.Equal(want) {
 			t.Errorf("NextTickTime = %v, want %v", got, want)
 		}
 	})
 
 	t.Run("friday after close skips weekend", func(t *testing.T) {
-		now := mustParseRFC3339(t, "2024-03-15T16:05:00-04:00")
+		now := mustParseNY(t, "2024-03-15T16:05:00")
 		got := NextTickTime(now, interval)
-		want := mustParseRFC3339(t, "2024-03-18T09:30:00-04:00")
+		want := mustParseNY(t, "2024-03-18T09:30:00")
 		if !got.Equal(want) {
 			t.Errorf("NextTickTime = %v, want %v", got, want)
 		}
