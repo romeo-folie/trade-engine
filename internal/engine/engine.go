@@ -64,8 +64,16 @@ type Engine struct {
 	tickerState   map[string]*TickerState
 	tickerStateMu sync.Mutex
 
+	// batchFlusher is called at the end of each tick to flush the Telegram batch.
+	batchFlusher BatchFlusher
+
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
+}
+
+// BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
+type BatchFlusher interface {
+	FlushBatch()
 }
 
 // New creates a new Engine instance with the given providers.
@@ -216,6 +224,11 @@ func (e *Engine) tick(ctx context.Context) error {
 
 	// Monitor open positions for stop/TP breaches after all tickers processed.
 	e.monitorPositions(ctx)
+
+	// Flush Telegram batch at the end of each tick (sends per-tick summary).
+	if e.batchFlusher != nil {
+		e.batchFlusher.FlushBatch()
+	}
 
 	return nil
 }
@@ -680,6 +693,12 @@ func (e *Engine) BackfillHistory(ctx context.Context, ticker string) error {
 	logger.Info("hourly backfill complete", "ticker", ticker, "candles", len(hourly))
 
 	return nil
+}
+
+// SetBatchFlusher registers a BatchFlusher (e.g. TelegramBot) to be called
+// at the end of each tick. Called from cmd/te/run.go after bot setup.
+func (e *Engine) SetBatchFlusher(f BatchFlusher) {
+	e.batchFlusher = f
 }
 
 // SetMode updates the engine's active trading mode at runtime.

@@ -142,7 +142,9 @@ Modes:
 				logger.Warn("telegram bot failed to start", "error", err)
 			} else {
 				defer tgBot.Stop()
-				logger.Info("telegram notifications enabled")
+				// Register batch flusher so the engine calls FlushBatch() at tick end.
+				eng.SetBatchFlusher(tgBot)
+				logger.Info("telegram notifications enabled", "batch_enabled", cfg.Notifications.Telegram.BatchEnabled)
 			}
 		}
 

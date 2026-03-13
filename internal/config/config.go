@@ -449,6 +449,13 @@ type TelegramConfig struct {
 	BotToken    string   `yaml:"-"`
 	ChatID      string   `yaml:"chat_id"`
 	NotifyOn    []string `yaml:"notify_on"`
+
+	// Batching config (Epic 1 cost reduction).
+	BatchEnabled          bool    `yaml:"batch_enabled"`
+	BatchWindowSec        int     `yaml:"batch_window_sec"`
+	MaxItemsPerBatch      int     `yaml:"max_items_per_batch"`
+	IncludeHolds          bool    `yaml:"include_holds"`
+	MinConfidenceForAlert float64 `yaml:"min_confidence_for_alert"`
 }
 
 // ── Logging ───────────────────────────────────────────────────────────────────

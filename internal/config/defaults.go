@@ -204,10 +204,15 @@ func Defaults() *Config {
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{
-				Enabled:     false,
-				BotTokenEnv: "TELEGRAM_BOT_TOKEN",
-				ChatID:      "",
-				NotifyOn:    []string{"signal", "trade", "error", "daily_summary"},
+				Enabled:               false,
+				BotTokenEnv:           "TELEGRAM_BOT_TOKEN",
+				ChatID:                "",
+				NotifyOn:              []string{"signal", "trade", "error", "daily_summary"},
+				BatchEnabled:          true,
+				BatchWindowSec:        60,
+				MaxItemsPerBatch:      25,
+				IncludeHolds:          false,
+				MinConfidenceForAlert: 0.65,
 			},
 		},
 		Logging: LoggingConfig{
