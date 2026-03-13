@@ -59,8 +59,21 @@ type Engine struct {
 	newsLastFetched map[string]time.Time
 	newsMu          sync.Mutex
 
+	// tickerState holds the last-seen indicator snapshot per ticker.
+	// Used by the material-change gate (Epic 1 cost reduction).
+	tickerState   map[string]*TickerState
+	tickerStateMu sync.Mutex
+
+	// batchFlusher is called at the end of each tick to flush the Telegram batch.
+	batchFlusher BatchFlusher
+
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
+}
+
+// BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
+type BatchFlusher interface {
+	FlushBatch()
 }
 
 // New creates a new Engine instance with the given providers.
@@ -121,6 +134,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		enricher:        knowledge.NewEnricher(cfg, callFn),
 		embedder:        emb,
 		newsLastFetched: make(map[string]time.Time),
+		tickerState:     make(map[string]*TickerState),
 		mode:            mode,
 	}
 }
@@ -197,13 +211,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes []string) {
+		go func(ticker string, timeframes, strategies []string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes)
-		}(item.Ticker, item.Timeframes)
+			e.processStock(ctx, ticker, timeframes, strategies)
+		}(item.Ticker, item.Timeframes, item.Strategies)
 	}
 
 	wg.Wait()
@@ -211,11 +225,22 @@ func (e *Engine) tick(ctx context.Context) error {
 	// Monitor open positions for stop/TP breaches after all tickers processed.
 	e.monitorPositions(ctx)
 
+	// Flush Telegram batch at the end of each tick (sends per-tick summary).
+	// Runs in a goroutine so Telegram retries/sleeps don't block the engine loop.
+	// Note: bus event delivery is asynchronous; events published late in the tick
+	// may arrive after FlushBatch() runs and appear in the next batch. A
+	// deterministic per-tick fence would require an explicit "tick done" event.
+	if e.batchFlusher != nil {
+		flusher := e.batchFlusher
+		go flusher.FlushBatch()
+	}
+
 	return nil
 }
 
 // processStock fetches candles, computes indicators, and fetches news for a single stock.
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []string) {
+// strategies is the ticker's configured strategy list (from the watchlist item).
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -234,8 +259,18 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 		}
 	}
 
+	// Determine the ticker's primary strategy for prompt-context capping.
+	// NOTE: HistoryWindowByStrategy caps how many candles reach the prompt
+	// (applied in runAnalysis), NOT the DB fetch window. We always fetch 2 years
+	// to ensure indicators like EMA200/ADX have sufficient warmup history.
+	primaryStrategy := "trend_following"
+	if len(strategies) > 0 {
+		primaryStrategy = strategies[0]
+	}
+
+	historyFrom := time.Now().AddDate(-2, 0, 0)
 	candles, err := store.GetCandles(ctx, ticker, primaryTF,
-		time.Now().AddDate(-2, 0, 0), time.Now())
+		historyFrom, time.Now())
 	if err != nil {
 		logger.Warn("get candles for indicators", "ticker", ticker, "err", err.Error())
 		return
@@ -268,13 +303,69 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 	// Fetch news (rate-limited to newsFetchInterval cadence).
 	e.fetchAndStoreNews(ctx, ticker)
 
+	// Material-change gate: skip LLM analysis when nothing has changed.
+	// Only query news when news_novelty_enabled — avoids a per-ticker DB round-trip
+	// when the feature is disabled.
+	var newsItems []data.NewsItem
+	var newsHash string
+	if e.cfg.Analysis.NewsNoveltyEnabled {
+		var newsErr error
+		newsItems, newsErr = store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+		if newsErr != nil {
+			// On error treat as "news unknown" — unique hash prevents wrongly skipping.
+			logger.Warn("news query failed — treating as changed for material-change gate",
+				"ticker", ticker, "err", newsErr.Error())
+			newsHash = fmt.Sprintf("error:%d", time.Now().UnixNano())
+		} else {
+			headlines := make([]string, 0, len(newsItems))
+			for _, n := range newsItems {
+				headlines = append(headlines, n.Headline)
+			}
+			newsHash = NewsDigestHash(headlines)
+		}
+	}
+
+	e.tickerStateMu.Lock()
+	prev := e.tickerState[ticker]
+	e.tickerStateMu.Unlock()
+
+	latestClose := 0.0
+	if len(candles) > 0 {
+		latestClose = candles[len(candles)-1].Close
+	}
+	mcIn := MaterialChangeInput{
+		RSI:      set.RSI,
+		EMA20:    set.EMA20,
+		Price:    latestClose,
+		NewsHash: newsHash,
+		Now:      time.Now(),
+	}
+
+	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, e.cfg.Analysis)
+	if skip {
+		msg := "analysis skipped — no material change"
+		if skipReason == SkipReasonHoldCooldown {
+			msg = "analysis skipped — HOLD cooldown active"
+		}
+		logger.Info(msg,
+			"ticker", ticker,
+			"reason", string(skipReason),
+			"rsi_delta", fmt.Sprintf("%.2f", deltas["rsi_delta"]),
+			"ema_gap_delta_pct", fmt.Sprintf("%.2f", deltas["ema_gap_delta_pct"]),
+			"price_move_pct", fmt.Sprintf("%.2f", deltas["price_move_pct"]),
+			"hold_elapsed_min", fmt.Sprintf("%.1f", deltas["hold_elapsed_min"]),
+			"hold_cooldown_min", fmt.Sprintf("%.0f", deltas["hold_cooldown_min"]),
+		)
+		return
+	}
+
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), candles, set)
+	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash)
 }
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, candles []data.Candle, set *indicators.IndicatorSet) {
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string) {
 	if set == nil {
 		return
 	}
@@ -283,15 +374,30 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		return
 	}
 
-	strategy := "default"
-	if e.cfg.Engine.Mode != "" {
-		strategy = e.cfg.Engine.Mode
+	if strategy == "" {
+		strategy = "trend_following"
 	}
 
 	// Build candle snapshots (most-recent-first for prompt context).
+	// Precedence: strategy window sets the cap (strategy-specific tuning);
+	// MaxCandlesPerPrompt acts as an absolute hard upper bound.
+	// The DB fetch always covers 2 years for indicator warmup; these caps
+	// only limit what reaches the prompt to bound token usage.
+	candleCap := e.cfg.Analysis.MaxCandlesPerPrompt
+	if candleCap <= 0 {
+		candleCap = 20
+	}
+	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
+		if n, ok := windows[strategy]; ok && n > 0 {
+			candleCap = n // strategy window overrides; MaxCandlesPerPrompt clamps below
+		}
+	}
+	if max := e.cfg.Analysis.MaxCandlesPerPrompt; max > 0 && candleCap > max {
+		candleCap = max // hard upper bound
+	}
 	limit := len(candles)
-	if limit > 10 {
-		limit = 10
+	if limit > candleCap {
+		limit = candleCap
 	}
 	snaps := make([]analysis.CandleSnapshot, 0, limit)
 	for i := len(candles) - 1; i >= 0 && len(snaps) < limit; i-- {
@@ -308,9 +414,19 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	}
 
 	// Load recent news from the store for prompt inclusion.
-	newsItems, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
-	snippets := make([]analysis.NewsSnippet, 0, len(newsItems))
-	for _, n := range newsItems {
+	// Note: newsItems also fetched by processStock for the material-change gate;
+	// this second query is a lightweight store read (no API call).
+	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
+	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
+	if newsCap <= 0 {
+		newsCap = 5
+	}
+	snippets := make([]analysis.NewsSnippet, 0, newsCap)
+	for i, n := range recentNews {
+		if i >= newsCap {
+			break
+		}
 		snippets = append(snippets, analysis.NewsSnippet{
 			Headline:    n.Headline,
 			Source:      n.Source,
@@ -424,6 +540,22 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
 	e.generateSignal(ctx, ticker, strategy, candles, resp, analysisID)
+
+	// Update material-change gate state for next tick.
+	latestClose := 0.0
+	if len(candles) > 0 {
+		latestClose = candles[len(candles)-1].Close
+	}
+	e.tickerStateMu.Lock()
+	e.tickerState[ticker] = &TickerState{
+		LastRSI:        set.RSI,
+		LastEMAGapPct:  emaGapPct(latestClose, set.EMA20),
+		LastPrice:      latestClose,
+		LastNewsHash:   newsHash,
+		LastDecision:   string(resp.Action),
+		LastAnalysedAt: time.Now(),
+	}
+	e.tickerStateMu.Unlock()
 }
 
 func min(a, b int) int {
@@ -590,6 +722,12 @@ func (e *Engine) BackfillHistory(ctx context.Context, ticker string) error {
 	logger.Info("hourly backfill complete", "ticker", ticker, "candles", len(hourly))
 
 	return nil
+}
+
+// SetBatchFlusher registers a BatchFlusher (e.g. TelegramBot) to be called
+// at the end of each tick. Called from cmd/te/run.go after bot setup.
+func (e *Engine) SetBatchFlusher(f BatchFlusher) {
+	e.batchFlusher = f
 }
 
 // SetMode updates the engine's active trading mode at runtime.

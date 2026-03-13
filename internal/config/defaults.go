@@ -6,24 +6,112 @@ func Defaults() *Config {
 	return &Config{
 		Engine: EngineConfig{
 			Mode:            "manual",
-			TickIntervalSec: 300,
+			TickIntervalSec: 3600, // 60 min default (cost-reduction Epic 1)
 			MaxWatchlist:    50,
 			DryRun:          false,
 			InitialCapital:  100000,
 		},
 		Models: ModelsConfig{
-			Primary: ModelConfig{
-				Provider:    "anthropic",
-				Model:       "claude-sonnet-4-5",
-				APIKeyEnv:   "ANTHROPIC_API_KEY",
-				MaxTokens:   4096,
-				Temperature: 0.1,
-				TimeoutSec:  60,
+			Registry: ModelRegistry{
+				"analyst_cheap": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"analyst_mid": {
+					ModelConfig: ModelConfig{
+						Provider:    "google",
+						Model:       "gemini-3.1-pro-preview",
+						APIKeyEnv:   "GEMINI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+					Fallback: "gemini_flash",
+				},
+				"gemini_flash": {
+					ModelConfig: ModelConfig{
+						Provider:    "google",
+						Model:       "gemini-2.5-flash",
+						APIKeyEnv:   "GEMINI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"analyst_frontier": {
+					ModelConfig: ModelConfig{
+						Provider:    "anthropic",
+						Model:       "claude-sonnet-4-6",
+						APIKeyEnv:   "ANTHROPIC_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"arbiter": {
+					ModelConfig: ModelConfig{
+						Provider:    "anthropic",
+						Model:       "claude-sonnet-4-6",
+						APIKeyEnv:   "ANTHROPIC_API_KEY",
+						MaxTokens:   4096,
+						Temperature: 0.1,
+						TimeoutSec:  90,
+					},
+				},
+				"classifier": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o-mini",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   256,
+						Temperature: 0.0,
+						TimeoutSec:  15,
+					},
+				},
+				"news_enricher": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o-mini",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"embedder": {
+					ModelConfig: ModelConfig{
+						Provider:    "ollama",
+						Model:       "nomic-embed-text",
+						MaxTokens:   0,
+						Temperature: 0,
+						TimeoutSec:  30,
+					},
+				},
 			},
+			Roles: ModelRoles{
+				Analysts:     []string{"analyst_cheap", "analyst_mid", "analyst_frontier"},
+				Arbiter:      "arbiter",
+				Classifier:   "classifier",
+				NewsEnricher: "news_enricher",
+				Embedder:     "embedder",
+			},
+			// Legacy fields kept for backward compatibility with existing configs.
+			Primary:   ModelConfig{},
 			Secondary: []ModelConfig{},
+			// Consensus disabled by default: AnalyzeEnsemble requires >=2 working
+			// analysts. Users with only one API key configured would get failures
+			// on every tick. Enable explicitly once multiple analysts are set up.
 			Consensus: ConsensusConfig{
-				Enabled:  false,
-				Strategy: "majority",
+				Enabled:            false,
+				FastPathConfidence: 0.80,
+				FastPathMaxSpread:  0.15,
+				Strategy:           "majority",
 			},
 		},
 		Markets: MarketsConfig{
@@ -119,10 +207,15 @@ func Defaults() *Config {
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{
-				Enabled:     false,
-				BotTokenEnv: "TELEGRAM_BOT_TOKEN",
-				ChatID:      "",
-				NotifyOn:    []string{"signal", "trade", "error", "daily_summary"},
+				Enabled:               false,
+				BotTokenEnv:           "TELEGRAM_BOT_TOKEN",
+				ChatID:                "",
+				NotifyOn:              []string{"signal", "trade", "error", "daily_summary"},
+				BatchEnabled:          true,
+				BatchWindowSec:        60,
+				MaxItemsPerBatch:      25,
+				IncludeHolds:          false,
+				MinConfidenceForAlert: 0.65,
 			},
 		},
 		Logging: LoggingConfig{
@@ -139,6 +232,21 @@ func Defaults() *Config {
 		Backtest: BacktestConfig{
 			InitialCash:  100_000,
 			RiskFreeRate: 0.04,
+		},
+		Analysis: AnalysisConfig{
+			MaterialChangeOnly:    true,
+			HoldCooldownMin:       120,
+			RSIDeltaThreshold:     3.0,
+			EMAGapDeltaPct:        0.5,
+			PriceMoveThresholdPct: 0.75,
+			NewsNoveltyEnabled:    true,
+			MaxNewsArticlesPerPrompt: 5,
+			MaxCandlesPerPrompt:      20, // must be >= largest HistoryWindowByStrategy value
+			HistoryWindowByStrategy: map[string]int{
+				"trend_following": 20,
+				"mean_reversion":  20,
+				"momentum":        14,
+			},
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,

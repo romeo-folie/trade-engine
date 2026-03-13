@@ -38,11 +38,13 @@ type TelegramBot struct {
 	token   string
 	chatID  string
 	apiBase string
+	cfg     config.TelegramConfig
 
 	notifyOn map[string]bool
 	bus      *events.Bus
 	subs     []*events.Subscription
 
+	batcher         *TickBatcher
 	callbackHandler CallbackHandler
 
 	client *http.Client
@@ -57,13 +59,28 @@ func NewTelegramBot(cfg config.TelegramConfig, bus *events.Bus) *TelegramBot {
 	for _, n := range cfg.NotifyOn {
 		notifyOn[n] = true
 	}
-	return &TelegramBot{
+	bot := &TelegramBot{
 		token:    cfg.BotToken,
 		chatID:   cfg.ChatID,
 		apiBase:  telegramAPIBase,
+		cfg:      cfg,
 		notifyOn: notifyOn,
 		bus:      bus,
 		client:   &http.Client{Timeout: 60 * time.Second},
+	}
+	if cfg.BatchEnabled {
+		bot.batcher = NewTickBatcher(cfg, func(text string) error {
+			return bot.sendMessage(text, nil)
+		})
+	}
+	return bot
+}
+
+// FlushBatch flushes any pending batched notifications immediately.
+// Called by the engine at the end of each tick.
+func (b *TelegramBot) FlushBatch() {
+	if b.batcher != nil {
+		b.batcher.Flush()
 	}
 }
 
@@ -153,6 +170,15 @@ func (b *TelegramBot) handleTradeExecuted(ev events.Event) {
 	if !ok {
 		return
 	}
+	if b.batcher != nil {
+		b.batcher.Add(BatchItem{
+			Kind:   "trade",
+			Ticker: p.Ticker,
+			Action: strings.ToUpper(p.Direction),
+			Note:   fmt.Sprintf("$%.2f qty=%.4f", p.EntryPrice, p.Quantity),
+		})
+		return
+	}
 	msg := fmt.Sprintf(
 		"📈 *Trade Executed*\n"+
 			"Ticker: `%s` | %s\n"+
@@ -203,6 +229,15 @@ func (b *TelegramBot) handleSignalGenerated(ev events.Event) {
 	if !ok {
 		return
 	}
+	if b.batcher != nil {
+		b.batcher.Add(BatchItem{
+			Kind:       "signal",
+			Ticker:     p.Ticker,
+			Action:     p.Action,
+			Confidence: p.Confidence,
+		})
+		return
+	}
 	msg := fmt.Sprintf(
 		"🔔 *New Signal*\n"+
 			"Ticker: `%s` | %s\n"+
@@ -248,6 +283,15 @@ func (b *TelegramBot) handleSignalBlocked(ev events.Event) {
 	}
 	p, ok := ev.Payload.(events.SignalBlockedPayload)
 	if !ok {
+		return
+	}
+	if b.batcher != nil {
+		b.batcher.Add(BatchItem{
+			Kind:   "blocked",
+			Ticker: p.Ticker,
+			Action: p.Action,
+			Note:   p.BlockReason,
+		})
 		return
 	}
 	msg := fmt.Sprintf(

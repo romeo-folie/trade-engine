@@ -20,10 +20,13 @@ type Analyzer struct {
 }
 
 // NewAnalyzer constructs an Analyzer from the models config section.
-// Uses cfg.Analysts (Phase 12). Falls back to cfg.Primary if Analysts is empty.
+// Uses registry roles when present (models.registry + models.roles.analysts).
+// Falls back to legacy cfg.Analysts[], then cfg.Primary.
 func NewAnalyzer(cfg config.ModelsConfig) *Analyzer {
 	var analysts []ModelProvider
-	for _, ac := range cfg.Analysts {
+	// Registry path: AnalystConfigs() transparently returns registry entries
+	// when available, falling back to legacy Analysts[] otherwise.
+	for _, ac := range cfg.AnalystConfigs() {
 		analysts = append(analysts, buildProvider(ac))
 	}
 	// Legacy fallback: old primary/secondary config.
@@ -34,8 +37,9 @@ func NewAnalyzer(cfg config.ModelsConfig) *Analyzer {
 		}
 	}
 	var arbiter ModelProvider
-	if cfg.Arbiter.Provider != "" {
-		arbiter = buildProvider(cfg.Arbiter)
+	// ArbiterConfig() transparently returns registry entry when available.
+	if ac := cfg.ArbiterConfig(); ac.Provider != "" {
+		arbiter = buildProvider(ac)
 	}
 	return &Analyzer{analysts: analysts, arbiter: arbiter, cfg: cfg}
 }
@@ -192,7 +196,7 @@ func (a *Analyzer) AnalyzeEnsemble(ctx context.Context, req AnalysisRequest) ([]
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func modelTimeout(p ModelProvider, cfg config.ModelsConfig) time.Duration {
-	for _, ac := range cfg.Analysts {
+	for _, ac := range cfg.AnalystConfigs() {
 		if ac.Provider == p.ProviderName() && ac.Model == p.ModelName() && ac.TimeoutSec > 0 {
 			return time.Duration(ac.TimeoutSec) * time.Second
 		}

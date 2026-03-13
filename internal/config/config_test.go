@@ -16,8 +16,8 @@ func TestDefaultsEngineMode(t *testing.T) {
 
 func TestDefaultsTickInterval(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Engine.TickIntervalSec != 300 {
-		t.Errorf("default tick_interval_sec = %d, want 300", cfg.Engine.TickIntervalSec)
+	if cfg.Engine.TickIntervalSec != 3600 {
+		t.Errorf("default tick_interval_sec = %d, want 3600", cfg.Engine.TickIntervalSec)
 	}
 }
 
@@ -92,8 +92,11 @@ func TestValidateMissingDBURL(t *testing.T) {
 }
 
 func TestValidateMissingAPIKey(t *testing.T) {
+	// With registry present, validate missing env var in a registry entry.
 	cfg := Defaults()
-	cfg.Models.Primary.APIKeyEnv = "TE_TEST_KEY_NOTSET_XYZ"
+	entry := cfg.Models.Registry["analyst_cheap"]
+	entry.ModelConfig.APIKeyEnv = "TE_TEST_KEY_NOTSET_XYZ"
+	cfg.Models.Registry["analyst_cheap"] = entry
 	os.Unsetenv("TE_TEST_KEY_NOTSET_XYZ")
 	errs := Validate(cfg)
 	if !containsStr(errs, "TE_TEST_KEY_NOTSET_XYZ") {
@@ -115,10 +118,15 @@ func TestResolveEnvSet(t *testing.T) {
 }
 
 func TestValidateExtractionProviderMustExistInConfiguredModels(t *testing.T) {
+	// When registry is absent, extraction_provider/model must match a configured model.
 	cfg := Defaults()
+	cfg.Models.Registry = nil
+	cfg.Models.Roles = ModelRoles{}
 	cfg.Markets.News.ExtractionEnabled = true
 	cfg.Markets.News.ExtractionProvider = "openai"
 	cfg.Markets.News.ExtractionModel = "gpt-4o"
+	cfg.Markets.News.ExtractionRPM = 10
+	cfg.Markets.News.ExtractionMaxArticlesPerTick = 5
 	cfg.Models.Analysts = []ModelConfig{{Provider: "anthropic", Model: "claude-sonnet-4-6", APIKeyEnv: "ANTHROPIC_API_KEY"}}
 	errs := Validate(cfg)
 	if !containsStr(errs, "markets.news.extraction_provider/model") {
@@ -168,6 +176,180 @@ func TestSetField_NestedPathAndBool(t *testing.T) {
 	s := string(data)
 	if strings.Contains(s, "telegram.enabled") {
 		t.Fatalf("unexpected flattened key in YAML: %s", s)
+	}
+}
+
+// ── Registry tests ────────────────────────────────────────────────────────────
+
+func TestDefaultsRegistryPresent(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Models.Registry == nil {
+		t.Fatal("default config: models.registry is nil")
+	}
+	expectedKeys := []string{"analyst_cheap", "analyst_mid", "analyst_frontier", "arbiter", "classifier", "news_enricher", "embedder", "gemini_flash"}
+	for _, key := range expectedKeys {
+		if _, ok := cfg.Models.Registry[key]; !ok {
+			t.Errorf("models.registry missing expected key %q", key)
+		}
+	}
+}
+
+func TestDefaultsRolesPresent(t *testing.T) {
+	cfg := Defaults()
+	roles := cfg.Models.Roles
+	if len(roles.Analysts) != 3 {
+		t.Errorf("models.roles.analysts: want 3 entries, got %d", len(roles.Analysts))
+	}
+	if roles.Arbiter == "" {
+		t.Error("models.roles.arbiter is empty")
+	}
+	if roles.Classifier == "" {
+		t.Error("models.roles.classifier is empty")
+	}
+	if roles.NewsEnricher == "" {
+		t.Error("models.roles.news_enricher is empty")
+	}
+	if roles.Embedder == "" {
+		t.Error("models.roles.embedder is empty")
+	}
+}
+
+func TestResolveKnownKey(t *testing.T) {
+	cfg := Defaults()
+	mc, err := cfg.Models.Resolve("analyst_cheap")
+	if err != nil {
+		t.Fatalf("Resolve(analyst_cheap): %v", err)
+	}
+	if mc.Provider != "openai" {
+		t.Errorf("analyst_cheap.provider = %q, want openai", mc.Provider)
+	}
+	if mc.Model != "gpt-4o" {
+		t.Errorf("analyst_cheap.model = %q, want gpt-4o", mc.Model)
+	}
+}
+
+func TestResolveUnknownKey(t *testing.T) {
+	cfg := Defaults()
+	_, err := cfg.Models.Resolve("does_not_exist")
+	if err == nil {
+		t.Fatal("expected error for unknown registry key, got nil")
+	}
+}
+
+func TestResolveRoleClassifier(t *testing.T) {
+	cfg := Defaults()
+	mc, err := cfg.Models.ResolveRole("classifier")
+	if err != nil {
+		t.Fatalf("ResolveRole(classifier): %v", err)
+	}
+	if mc.Model != "gpt-4o-mini" {
+		t.Errorf("classifier model = %q, want gpt-4o-mini", mc.Model)
+	}
+	if mc.MaxTokens != 256 {
+		t.Errorf("classifier max_tokens = %d, want 256", mc.MaxTokens)
+	}
+}
+
+func TestResolveRoleUnknownRole(t *testing.T) {
+	cfg := Defaults()
+	_, err := cfg.Models.ResolveRole("nonexistent_role")
+	if err == nil {
+		t.Fatal("expected error for unknown role, got nil")
+	}
+}
+
+func TestResolveFallbackPresent(t *testing.T) {
+	cfg := Defaults()
+	fb, ok := cfg.Models.ResolveFallback("analyst_mid")
+	if !ok {
+		t.Fatal("analyst_mid should have a fallback (gemini_flash)")
+	}
+	if fb.Model != "gemini-2.5-flash" {
+		t.Errorf("fallback model = %q, want gemini-2.5-flash", fb.Model)
+	}
+}
+
+func TestResolveFallbackAbsent(t *testing.T) {
+	cfg := Defaults()
+	_, ok := cfg.Models.ResolveFallback("analyst_cheap")
+	if ok {
+		t.Error("analyst_cheap should have no fallback")
+	}
+}
+
+func TestAnalystConfigsFromRegistry(t *testing.T) {
+	cfg := Defaults()
+	analysts := cfg.Models.AnalystConfigs()
+	if len(analysts) != 3 {
+		t.Fatalf("AnalystConfigs() returned %d, want 3", len(analysts))
+	}
+	// Ordered: cheap → mid → frontier
+	if analysts[0].Model != "gpt-4o" {
+		t.Errorf("analysts[0].model = %q, want gpt-4o", analysts[0].Model)
+	}
+	if analysts[1].Model != "gemini-3.1-pro-preview" {
+		t.Errorf("analysts[1].model = %q, want gemini-3.1-pro-preview", analysts[1].Model)
+	}
+	if analysts[2].Model != "claude-sonnet-4-6" {
+		t.Errorf("analysts[2].model = %q, want claude-sonnet-4-6", analysts[2].Model)
+	}
+}
+
+func TestArbiterConfigFromRegistry(t *testing.T) {
+	cfg := Defaults()
+	arbiter := cfg.Models.ArbiterConfig()
+	if arbiter.Provider != "anthropic" {
+		t.Errorf("arbiter.provider = %q, want anthropic", arbiter.Provider)
+	}
+	if arbiter.MaxTokens != 4096 {
+		t.Errorf("arbiter.max_tokens = %d, want 4096", arbiter.MaxTokens)
+	}
+}
+
+func TestValidateRegistryMissingFallbackKey(t *testing.T) {
+	cfg := Defaults()
+	entry := cfg.Models.Registry["analyst_mid"]
+	entry.Fallback = "nonexistent_fallback_key"
+	cfg.Models.Registry["analyst_mid"] = entry
+	// Clear env vars to avoid unrelated errors.
+	errs := Validate(cfg)
+	if !containsStr(errs, "nonexistent_fallback_key") {
+		t.Errorf("expected fallback key error, got: %v", errs)
+	}
+}
+
+func TestValidateRegistryUnresolvedAnalystRole(t *testing.T) {
+	cfg := Defaults()
+	cfg.Models.Roles.Analysts = []string{"analyst_cheap", "ghost_key"}
+	errs := Validate(cfg)
+	if !containsStr(errs, "ghost_key") {
+		t.Errorf("expected unresolved analyst role error, got: %v", errs)
+	}
+}
+
+func TestValidateRegistryUnresolvedNamedRole(t *testing.T) {
+	cfg := Defaults()
+	cfg.Models.Roles.Arbiter = "missing_arbiter"
+	errs := Validate(cfg)
+	if !containsStr(errs, "missing_arbiter") {
+		t.Errorf("expected unresolved arbiter role error, got: %v", errs)
+	}
+}
+
+func TestLegacyAnalystsFallback(t *testing.T) {
+	// When registry is nil, AnalystConfigs() returns legacy Analysts[].
+	cfg := Defaults()
+	cfg.Models.Registry = nil
+	cfg.Models.Roles = ModelRoles{}
+	cfg.Models.Analysts = []ModelConfig{
+		{Provider: "anthropic", Model: "claude-sonnet-4-5"},
+	}
+	analysts := cfg.Models.AnalystConfigs()
+	if len(analysts) != 1 {
+		t.Fatalf("expected 1 legacy analyst, got %d", len(analysts))
+	}
+	if analysts[0].Model != "claude-sonnet-4-5" {
+		t.Errorf("legacy analyst model = %q, want claude-sonnet-4-5", analysts[0].Model)
 	}
 }
 
