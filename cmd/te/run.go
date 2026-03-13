@@ -117,7 +117,7 @@ Modes:
 		defer cancel()
 
 		// Start prediction market runner (24/7, runs in parallel with stock engine).
-		predRunner := engine.NewPredictionRunner(cfg, eng.Bus(), mode)
+		predRunner := engine.NewPredictionRunner(cfg, eng.Bus(), mode, eng.Portfolio())
 		if predRunner.Enabled() {
 			go predRunner.Run(ctx)
 			logger.Info("prediction market runner started")

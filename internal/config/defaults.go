@@ -110,6 +110,12 @@ func Defaults() *Config {
 			DefaultTakeProfitPct: 4.0,
 			SignalExpiryMin:      30,
 			StalePriceMovePct:    2.0,
+			Prediction: PredictionRiskConfig{
+				ConfidenceThreshold:      0.70, // stricter than stock default (0.65)
+				MaxSpread:                0.05, // 5% bid-ask spread cap
+				MinLiquidity:             1000, // $1k 24h volume minimum
+				MinTimeToResolutionHours: 4,    // at least 4h to resolution
+			},
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{

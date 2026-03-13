@@ -232,17 +232,40 @@ type PredictionMispricingConfig struct {
 // ── Risk ─────────────────────────────────────────────────────────────────────
 
 type RiskConfig struct {
-	ConfidenceThreshold  float64 `yaml:"confidence_threshold"`
-	MinRiskReward        float64 `yaml:"min_risk_reward"`
-	MaxPositionPct       float64 `yaml:"max_position_pct"`
-	MaxOpenPositions     int     `yaml:"max_open_positions"`
-	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
-	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
-	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`
-	DefaultStopLossPct   float64 `yaml:"default_stop_loss_pct"`
-	DefaultTakeProfitPct float64 `yaml:"default_take_profit_pct"`
-	SignalExpiryMin      int     `yaml:"signal_expiry_min"`
-	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
+	ConfidenceThreshold  float64              `yaml:"confidence_threshold"`
+	MinRiskReward        float64              `yaml:"min_risk_reward"`
+	MaxPositionPct       float64              `yaml:"max_position_pct"`
+	MaxOpenPositions     int                  `yaml:"max_open_positions"`
+	DailyLossLimitPct    float64              `yaml:"daily_loss_limit_pct"`
+	MaxDrawdownPct       float64              `yaml:"max_drawdown_pct"`
+	CooldownAfterLoss    int                  `yaml:"cooldown_after_loss_min"`
+	DefaultStopLossPct   float64              `yaml:"default_stop_loss_pct"`
+	DefaultTakeProfitPct float64              `yaml:"default_take_profit_pct"`
+	SignalExpiryMin      int                  `yaml:"signal_expiry_min"`
+	StalePriceMovePct    float64              `yaml:"stale_price_move_pct"`
+	Prediction           PredictionRiskConfig `yaml:"prediction"`
+}
+
+// PredictionRiskConfig holds risk thresholds specific to prediction market signals.
+// Baseline checks (confidence, position size, open positions, daily loss, drawdown,
+// cooldown) reuse the parent RiskConfig values; this block adds prediction-specific gates.
+type PredictionRiskConfig struct {
+	// ConfidenceThreshold overrides RiskConfig.ConfidenceThreshold for prediction
+	// signals.  Zero means fall back to the parent threshold.
+	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
+
+	// MaxSpread is the maximum acceptable bid-ask spread as a fraction of mid-price
+	// (e.g. 0.05 = 5%).  Zero disables the check.
+	MaxSpread float64 `yaml:"max_spread"`
+
+	// MinLiquidity is the minimum 24h volume required for a contract to be traded.
+	// Zero disables the check.
+	MinLiquidity float64 `yaml:"min_liquidity"`
+
+	// MinTimeToResolutionHours is the minimum time remaining before contract
+	// resolution, in hours.  Contracts expiring sooner than this are blocked.
+	// Zero disables the check.
+	MinTimeToResolutionHours float64 `yaml:"min_time_to_resolution_hours"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
