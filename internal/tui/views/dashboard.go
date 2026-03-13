@@ -73,6 +73,24 @@ type SignalRow struct {
 	ExpiresAt  time.Time
 }
 
+// deriveCashAndTotal computes the estimated cash balance and total portfolio
+// value from the configured initial capital, the accumulated cost basis of all
+// open positions, and their current mark-to-market value (invested).
+//
+// cash      = max(0, initialCapital - costBasis)
+// total     = cash + invested
+//
+// Cost basis must be accumulated per-trade as entryPrice×qty (not derived from
+// aggregated Invested/UnrealizedPnL, which breaks for short positions).
+func deriveCashAndTotal(initialCapital, costBasis, invested float64) (cash, total float64) {
+	cash = initialCapital - costBasis
+	if cash < 0 {
+		cash = 0
+	}
+	total = cash + invested
+	return
+}
+
 // FetchDashboardData loads dashboard data from the database.
 // Returns zero-value DashboardData on errors (TUI stays functional).
 // Safe to call when no database is connected — returns defaults.
@@ -98,6 +116,7 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	// Open trades → positions
 	var visibleInvested float64
 	var largestVisiblePosValue float64
+	var totalCostBasis float64
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
 		for _, t := range trades {
@@ -124,6 +143,8 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			posValue := currentPrice * t.Quantity
 			d.Invested += posValue
 			d.UnrealizedPnL += pnl
+			// Cost basis is always entryPrice×qty regardless of direction.
+			totalCostBasis += t.EntryPrice * t.Quantity
 
 			if !includePredictions && t.Strategy == "prediction_mispricing" {
 				continue
@@ -150,14 +171,9 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	}
 
 	// Cash = initial_capital minus the cost basis of all open positions.
-	// Cost basis per position = CurrentValue - UnrealizedPL.
+	// Cost basis is accumulated per-trade as entryPrice×qty (direction-agnostic).
 	// TotalValue = Cash + Invested (mark-to-market).
-	costBasis := d.Invested - d.UnrealizedPnL
-	d.Cash = initialCapital - costBasis
-	if d.Cash < 0 {
-		d.Cash = 0
-	}
-	d.TotalValue = d.Cash + d.Invested
+	d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
 
 	// Pending signals (manual mode only)
 	if mode == "manual" {

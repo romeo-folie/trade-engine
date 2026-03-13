@@ -383,11 +383,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pollTickMsg:
 		m.lastPoll = time.Time(msg)
 		ctx := context.Background()
-		includePredictions := predictionsVisible()
-		m.dashData = views.FetchDashboardData(ctx, m.mode, includePredictions, initialCapital())
+		dc := loadDisplayConfig()
+		m.dashData = views.FetchDashboardData(ctx, m.mode, dc.includePredictions, dc.initialCapital)
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
 		m.tradeData.Selected = m.selectedTrade
-		m.signalData = views.FetchSignalFeed(ctx, 50, includePredictions)
+		m.signalData = views.FetchSignalFeed(ctx, 50, dc.includePredictions)
 		m.signalData.Selected = m.selectedSignal
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.watchlistData.Selected = m.selectedWatchlist
@@ -563,28 +563,23 @@ func (m Model) renderStatusBar() string {
 	return statusBarStyle.Width(m.width).Render(left + padding + right)
 }
 
-// predictionsVisible returns whether prediction strategy rows should be shown
-// in TUI signal feeds and open positions.
-//
-// If config cannot be loaded, default to true (show) to avoid accidentally
-// hiding data due to a transient config load issue.
-func predictionsVisible() bool {
-	cfg, err := config.Load()
-	if err != nil {
-		return true
-	}
-	return cfg.Markets.Predictions.Enabled
+// displayConfig holds per-tick config values needed by the TUI poll loop.
+type displayConfig struct {
+	includePredictions bool
+	initialCapital     float64
 }
 
-// initialCapital returns the engine.initial_capital config value for portfolio
-// cash/total derivation in the dashboard.
-// Returns 0 on config load failure (cash/total display gracefully as $0).
-func initialCapital() float64 {
+// loadDisplayConfig loads the config once and returns all TUI display settings.
+// On error, safe defaults are returned: predictions visible, initial capital 0.
+func loadDisplayConfig() displayConfig {
 	cfg, err := config.Load()
 	if err != nil {
-		return 0
+		return displayConfig{includePredictions: true, initialCapital: 0}
 	}
-	return cfg.Engine.InitialCapital
+	return displayConfig{
+		includePredictions: cfg.Markets.Predictions.Enabled,
+		initialCapital:     cfg.Engine.InitialCapital,
+	}
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
