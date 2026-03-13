@@ -73,13 +73,34 @@ type SignalRow struct {
 	ExpiresAt  time.Time
 }
 
+// deriveCashAndTotal computes the estimated cash balance and total portfolio
+// value from the configured initial capital, the accumulated cost basis of all
+// open positions, and their current mark-to-market value (invested).
+//
+// cash      = max(0, initialCapital - costBasis)
+// total     = cash + invested
+//
+// Cost basis must be accumulated per-trade as entryPrice×qty (not derived from
+// aggregated Invested/UnrealizedPnL, which breaks for short positions).
+func deriveCashAndTotal(initialCapital, costBasis, invested float64) (cash, total float64) {
+	cash = initialCapital - costBasis
+	if cash < 0 {
+		cash = 0
+	}
+	total = cash + invested
+	return
+}
+
 // FetchDashboardData loads dashboard data from the database.
 // Returns zero-value DashboardData on errors (TUI stays functional).
 // Safe to call when no database is connected — returns defaults.
 //
 // includePredictions controls visibility of prediction strategy rows in
 // dashboard positions + signal feeds (used by issue #145).
-func FetchDashboardData(ctx context.Context, mode string, includePredictions bool) (d DashboardData) {
+//
+// initialCapital is the engine.initial_capital config value; it is used to
+// derive Cash (initial_capital minus open position cost bases) and TotalValue.
+func FetchDashboardData(ctx context.Context, mode string, includePredictions bool, initialCapital float64) (d DashboardData) {
 	d = DashboardData{
 		Mode:       mode,
 		PaperMode:  mode == "paper",
@@ -95,6 +116,7 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	// Open trades → positions
 	var visibleInvested float64
 	var largestVisiblePosValue float64
+	var totalCostBasis float64
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
 		for _, t := range trades {
@@ -121,6 +143,8 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			posValue := currentPrice * t.Quantity
 			d.Invested += posValue
 			d.UnrealizedPnL += pnl
+			// Cost basis is always entryPrice×qty regardless of direction.
+			totalCostBasis += t.EntryPrice * t.Quantity
 
 			if !includePredictions && t.Strategy == "prediction_mispricing" {
 				continue
@@ -145,6 +169,11 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			})
 		}
 	}
+
+	// Cash = initial_capital minus the cost basis of all open positions.
+	// Cost basis is accumulated per-trade as entryPrice×qty (direction-agnostic).
+	// TotalValue = Cash + Invested (mark-to-market).
+	d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
 
 	// Pending signals (manual mode only)
 	if mode == "manual" {
