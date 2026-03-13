@@ -1,154 +1,266 @@
 # TradeEngine Cost Reduction PRD
 
+> **Status:** Agreed — ready for implementation
+> **Last updated:** 2026-03-13 (reflects design decisions from planning session)
+> **Version:** v2 (supersedes original draft)
+
+---
+
 ## 1) Context
-TradeEngine token usage is too high for mainstream users in continuous operation. Current testing indicates burn rates that can exceed practical monthly budgets for solo founders and retail users.
+
+TradeEngine token usage is too high for continuous operation. Current testing indicates burn rates that can exceed practical monthly budgets for solo founders and retail users.
+
+Current config runs a full 3-analyst ensemble + arbiter on every tick for every ticker. At 30-minute intervals with 50 tickers, this generates significant API spend regardless of market activity.
+
+---
 
 ## 2) Goal
+
 Reduce model and notification operating cost by **60–90%** while maintaining acceptable signal quality and safety.
 
+---
+
 ## 3) Non-Goals
+
 - No removal of risk checks.
 - No forced single-model strategy for all users.
 - No quality guarantees equal to full premium ensemble in all conditions.
 
+---
+
 ## 4) Product Principles
+
 1. **Budget first**: default paths should be affordable.
 2. **Escalate quality only when needed**.
 3. **Explainability over verbosity**: concise structured outputs.
 4. **User control**: explicit cost profiles and budget limits.
 
-## 5) Cost Reduction Strategies
+---
 
-### 5.1 Reduce call frequency (largest lever)
-- Default tick interval: move from 30m to 60m for swing mode.
-- Optional 90m/120m profile for strict budget users.
-- Per-ticker cooldown after HOLD (e.g., 2–4h) unless breakout condition.
-- Re-analysis only on material state change:
-  - indicator delta thresholds
-  - price move threshold
-  - meaningful news novelty
+## 5) Scope
 
-### 5.2 Two-stage model routing
-- **Stage A (cheap classifier/filter)**: decide `skip | analyze`.
-- **Stage B (full analysis)** only if Stage A passes gates.
-- Skip path must produce deterministic reason for observability.
+### IN scope
 
-### 5.3 Adaptive ensemble depth
-- Low-impact context: 1 analyst only.
-- Medium-impact context: 2 analysts.
-- High-impact/uncertain context: 3 analysts + arbiter.
-- Arbiter should be exception path, not default path.
+| # | Strategy |
+|---|----------|
+| 5.1 | Frequency reduction + material-change gating |
+| 5.2 | Two-stage classifier routing |
+| 5.3 | Adaptive ensemble depth |
+| 5.4 | Prompt/token optimization |
+| 5.5 | Context caching (full) |
+| 5.6 | News entity deduplication (store-level only — no throttling) |
+| 5.7 | Telegram batching |
+| 5.8 | Runtime budget guardrails |
+| — | Named model registry |
+| — | Cost profiles (budget / balanced / pro) |
 
-### 5.4 Prompt/token optimization
-- Cap history window sizes per strategy.
-- Use summarized/news-digest input, not raw article dumps.
-- Enforce short structured JSON schema and concise reasoning.
-- Hard max output tokens by model role.
+### OUT of scope
 
-### 5.5 Caching and reuse
-- Context hash: ticker + timeframe + indicator snapshot + news digest hash.
-- If unchanged, reuse prior analysis for a configurable TTL.
-- Track cache hit rates and skip-call savings.
+- News enrichment throttling (article-level limits). The system must remain fully aware of entity relationships. Deduplication prevents storage bloat without reducing enrichment coverage.
+- A/B testing infrastructure (deferred).
 
-#### 5.5.1 Cache key/fingerprint specification
-For each analysis candidate, build a stable fingerprint from:
-- market identity: `ticker`, `asset_class`, `timeframe`
-- strategy identity: `strategy_name`, `strategy_version`
-- model profile identity: `cost.profile`, analyst set, arbiter model, prompt template version
-- indicator snapshot (rounded): RSI, EMA gap %, MACD sign/magnitude bucket, ADX bucket, ATR% bucket
-- price regime bucket: return over lookback bucketed (e.g., <-2%, -2..-0.5, -0.5..0.5, 0.5..2, >2)
-- news digest hash: hash of normalized top-N headlines/entities/sentiment summary
-- risk context: open-position count bucket, current exposure bucket
+---
 
-Fingerprint implementation notes:
-- canonical JSON serialization (sorted keys)
-- rounded/bucketed numeric values to avoid cache misses from tiny noise
-- SHA-256 fingerprint key
+## 6) Model Registry
 
-#### 5.5.2 Cache storage schema (proposed)
-Table: `analysis_cache`
-- `id` UUID PK
-- `fingerprint` TEXT UNIQUE NOT NULL
-- `ticker` TEXT NOT NULL
-- `timeframe` TEXT NOT NULL
-- `strategy` TEXT NOT NULL
-- `model_profile` TEXT NOT NULL
-- `analysis_json` JSONB NOT NULL
-- `decision` TEXT NOT NULL (`BUY|SELL|HOLD`)
-- `confidence` DOUBLE PRECISION NOT NULL
-- `reason_code` TEXT NULL (`CACHE_HIT`, `FORCED_REFRESH`, etc.)
-- `created_at` TIMESTAMPTZ NOT NULL
-- `expires_at` TIMESTAMPTZ NOT NULL
-- `last_used_at` TIMESTAMPTZ NOT NULL
-- `use_count` INT NOT NULL DEFAULT 0
+All models used anywhere in the system are declared in a central `models.registry`. Components reference **role names**, not raw model strings. The engine resolves roles to providers at startup; unknown roles are a fatal error.
 
-Indexes:
-- `UNIQUE(fingerprint)`
-- `(ticker, timeframe, expires_at DESC)`
-- `(expires_at)` for cleanup jobs
-
-#### 5.5.3 Invalidation rules
-Immediate invalidate (force fresh analysis) when any of:
-- absolute price move since cached state >= `analysis.cache.invalidate_price_move_pct`
-- indicator regime flip (trend/momentum class change)
-- new high-impact news item (novelty/relevance above threshold)
-- active risk event (drawdown gate near trigger, daily loss close to cap)
-- order/trade lifecycle event for ticker (position opened/closed/partially filled)
-
-Time-based invalidate:
-- TTL by profile:
-  - budget: 180 min
-  - balanced: 120 min
-  - pro: 60 min
-- forced refresh every `N` cycles even if unchanged (anti-staleness)
-
-#### 5.5.4 Cache read/write flow
-1. Build fingerprint from current state.
-2. Lookup cache by fingerprint and unexpired TTL.
-3. If hit and no invalidation trigger: reuse cached analysis, tag decision as `CACHE_HIT`.
-4. If miss/invalid: run inference, persist result in cache, emit `CACHE_MISS` metric.
-5. Update `last_used_at`, `use_count` on hits.
-
-#### 5.5.5 Observability metrics
-- `analysis_cache_hit_ratio`
-- `analysis_cache_miss_ratio`
-- `analysis_cache_invalidation_count{reason}`
-- `token_spend_saved_estimate`
-- `avg_latency_saved_ms`
-
-### 5.6 News enrichment throttling
-- Extract entities/relationships only for top-N relevant articles.
-- Keep existing RPM and article caps; make profile-aware defaults.
-
-### 5.7 Telegram batching (notification cost + UX)
-- Replace per-ticker serial messages with per-tick summary batch.
-- Immediate sends only for critical failures.
-- Batch content:
-  - analyzed count
-  - executed / blocked / pending
-  - top actionable signals
-- Optional daily digest for non-urgent metrics.
-
-### 5.8 Runtime budget guardrails
-- Daily token budget cap.
-- Weekly token budget cap.
-- Auto-degrade profile when threshold crossed.
-- Expose `cost_per_signal` and `cost_per_executed_trade` in TUI/reports.
-
-## 6) Configuration Additions
+### Registry definition
 
 ```yaml
-cost:
-  profile: budget               # budget | balanced | pro
-  daily_token_budget: 200000
-  weekly_token_budget: 1200000
-  auto_degrade_on_budget_hit: true
+models:
+  registry:
+    analyst_cheap:
+      provider: openai
+      model: gpt-4o
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
 
-analysis:
-  material_change_only: true
-  hold_cooldown_min: 120
-  context_cache_ttl_min: 180
+    analyst_mid:
+      provider: google
+      model: gemini-3.1-pro-preview
+      api_key_env: GEMINI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+      fallback: gemini_flash       # used on 429/503
 
+    gemini_flash:
+      provider: google
+      model: gemini-2.5-flash
+      api_key_env: GEMINI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+
+    analyst_frontier:
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+
+    arbiter:
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 90
+
+    classifier:
+      provider: openai
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 256
+      temperature: 0.0
+      timeout_sec: 15
+
+    news_enricher:
+      provider: openai
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+
+    embedder:
+      provider: ollama
+      model: nomic-embed-text
+      ollama_base_url: http://localhost:11434
+      dimension: 768
+
+  roles:
+    analysts: [analyst_cheap, analyst_mid, analyst_frontier]
+    arbiter: arbiter
+    classifier: classifier
+    news_enricher: news_enricher
+    embedder: embedder
+```
+
+### Migration notes
+
+The following legacy config fields are **removed** and resolved through `roles` instead:
+- `models.analysts[]` → `roles.analysts`
+- `models.arbiter` → `roles.arbiter`
+- `models.primary` → removed (superseded by adaptive depth tier selection)
+- `news.extraction_provider` + `news.extraction_model` → `roles.news_enricher`
+- `embeddings.provider` + `embeddings.model` → `roles.embedder`
+
+### Fallback logic
+
+When a model returns 429 or 503, the model client resolver checks the registry entry for a `fallback` key and retries once with that model. Logged as `FALLBACK_USED{from, to, reason}`. One hop only — no cascading chains.
+
+---
+
+## 7) Cost Reduction Strategies (Detailed)
+
+### 7.1 Frequency reduction + material-change gating (largest lever)
+
+Default tick interval moves from 30m to 60m for swing mode.
+
+Re-analysis only triggers when at least one material change is detected (pure code, no LLM):
+
+| Signal | Threshold (default) |
+|--------|-------------------|
+| RSI delta | ≥ 3.0 pts |
+| EMA gap delta | ≥ 0.5% |
+| Price move since last analysis | ≥ 0.75% |
+| News digest hash | changed |
+| HOLD cooldown elapsed | 120 min post-HOLD decision |
+
+All thresholds are configurable. If none of the above are met → automatic skip with `reason_code: NO_MATERIAL_CHANGE`. Zero LLM calls.
+
+### 7.2 Two-stage classifier routing
+
+A classifier gate runs before any analyst call.
+
+**Layer 1 — Rule-based (zero tokens):**
+Evaluates the material-change conditions above deterministically. Skip if all below threshold.
+
+**Layer 2 — LLM fallback (only when Layer 1 is ambiguous):**
+When one or more indicators are marginally changed, a minimal prompt is sent to `roles.classifier` (gpt-4o-mini):
+
+```
+You are a trading signal filter.
+Ticker: {ticker} | Timeframe: {timeframe}
+RSI: {prev} → {curr} ({delta})
+EMA gap: {prev}% → {curr}% ({delta}%)
+MACD: {sign}, magnitude {bucket}
+News: {novelty_summary}
+Last decision: {decision} ({elapsed}h ago)
+
+Reply SKIP or ANALYZE with a reason in 10 words max.
+```
+
+Output: `SKIP <reason>` or `ANALYZE <reason>`. ~100 input / ~20 output tokens.
+
+Skip path emits: `reason_code`, delta values, metrics increment (`analysis_skips_total{reason}`).
+
+Classifier operates in two modes controlled by config:
+- `shadow`: classifies but does not block — logs `WOULD_SKIP` / `WOULD_ANALYZE` for threshold tuning
+- `active`: live gating
+
+Default: `shadow` (safe rollout).
+
+### 7.3 Adaptive ensemble depth
+
+Context is scored for impact complexity before invoking analysts. The score determines how many analysts run.
+
+**Impact score inputs (weighted):**
+
+| Signal | Weight |
+|--------|--------|
+| ATR% (volatility) | 0.30 |
+| News novelty | 0.25 |
+| Risk proximity (distance to stop/drawdown limits) | 0.25 |
+| Trend strength (ADX) | 0.20 |
+
+**Depth tiers:**
+
+| Score | Depth | Analysts | Arbiter |
+|-------|-------|----------|---------|
+| < 0.3 | 1 | gpt-4o only | Never |
+| 0.3–0.65 | 2 | gpt-4o + Gemini 3.1 Pro | Only on disagreement |
+| ≥ 0.65 | 3 | All three | Standard rules |
+
+Thresholds and weights are configurable. Arbiter rules (fast-path confidence, spread) are unchanged.
+
+### 7.4 Prompt/token optimization
+
+- Hard `max_tokens` caps by role: classifier=256, news_enricher=2048, analyst=2048, arbiter=4096.
+- News enrichment input: top-N article digest (summarized), not raw dumps.
+- History window capped per strategy type.
+- Structured JSON schema output enforced for all analyst responses.
+
+### 7.5 Context caching
+
+Full cache implementation. See original PRD §5.5 for complete schema — retained as-is.
+
+**Summary:**
+- Fingerprint: ticker + timeframe + strategy + bucketed indicators + price regime + news digest hash + risk context → SHA-256
+- Storage: `analysis_cache` table (PostgreSQL)
+- TTL by profile: budget=180m, balanced=120m, pro=60m
+- Invalidation triggers: price move ≥ threshold, indicator regime flip, high-impact news, risk event, trade lifecycle event
+- Cache flow: `Classify → CacheCheck → LLMCall`
+- Fail-open: cache errors never block the trading loop
+
+### 7.6 News entity deduplication
+
+No change to enrichment logic or article limits. Store layer uses `UPSERT` to prevent duplicate writes:
+- Entities: upsert on `(name, type)`
+- Relationships: upsert on `(subject_id, object_id, relationship_type)`
+
+No throttling. Full relationship graph maintained.
+
+### 7.7 Telegram batching
+
+Per-tick summary batch replaces per-ticker serial messages.
+
+```yaml
 notifications:
   telegram:
     batch_enabled: true
@@ -158,107 +270,101 @@ notifications:
     min_confidence_for_alert: 0.65
 ```
 
-## 7) Cost Profiles
+Immediate sends retained for: errors, critical failures only.
 
-### Budget
-- 60–120m tick
-- 1 cheap analyst default
-- arbiter rare/disabled except uncertain high-impact cases
-- strict batching and cache
+Batch content: analyzed count, executed/blocked/pending, top actionable signals.
 
-### Balanced
-- 60m tick
-- adaptive 1–2 analysts
-- arbiter on disagreement/high impact
+### 7.8 Runtime budget guardrails
 
-### Pro
-- current near-full ensemble behavior
-- minimal degradation, highest cost
+- Daily + weekly token budget caps.
+- Auto-degrade profile when threshold crossed (pro → balanced → budget).
+- `cost_per_signal` and `cost_per_executed_trade` exposed in TUI and reports.
 
-## 8) Rollout Plan
+---
 
-### Phase 1: Immediate (low risk)
-- Telegram batching
-- prompt/token caps
-- HOLD cooldown + material-change gate
+## 8) Cost Profiles
 
-### Phase 2: Core optimization
-- two-stage routing
-- adaptive ensemble depth
-- context-hash cache
+```yaml
+cost:
+  profile: balanced             # budget | balanced | pro
+  daily_token_budget: 200000
+  weekly_token_budget: 1200000
+  auto_degrade_on_budget_hit: true
+```
 
-### Phase 3: Productization
-- cost profiles
-- budget guardrails + auto-degrade
-- cost telemetry in TUI/report
+| Profile | Tick | Depth default | Arbiter | Cache TTL | Batching |
+|---------|------|--------------|---------|-----------|---------|
+| budget | 90–120m | 1 | disabled | 180m | strict |
+| balanced | 60m | adaptive 1–2 | on disagreement | 120m | enabled |
+| pro | 60m | adaptive 1–3 | standard | 60m | optional |
 
-## 9) Success Metrics
+---
+
+## 9) Implementation Plan
+
+Delivered as **3 sequential epics**. One branch per epic, one PR per epic (opened only when all tasks in the epic are complete).
+
+### Epic 1 — Foundation & Quick Wins
+
+Low-risk, no new LLM paths. Shippable independently.
+
+| Task | Description |
+|------|-------------|
+| E1-T1 | Model registry — new config schema, migrate all legacy model fields, startup validation, fallback resolver |
+| E1-T2 | Tick interval + HOLD cooldown + material-change gate — configurable tick (default 60m), 120m HOLD cooldown, indicator delta checks, news hash; pure code |
+| E1-T3 | Prompt/token caps — `max_tokens` by role, news digest summarizer, history window caps |
+| E1-T4 | Telegram batching — per-tick summary, immediate-only for errors, config keys |
+| E1-T5 | News entity deduplication — UPSERT on canonical keys in entity/relationship store methods |
+
+### Epic 2 — Intelligence Layer
+
+Core cost reduction machinery. Depends on Epic 1 (model registry must be in place).
+
+| Task | Description |
+|------|-------------|
+| E2-T1 | Classifier — Layer 1 rule-based (`analysis/classifier/rule_based.go`), skip path, reason codes, metrics |
+| E2-T2 | Classifier — Layer 2 LLM fallback (`analysis/classifier/llm_classifier.go`), shadow/active mode config |
+| E2-T3 | Adaptive ensemble depth — impact scorer, tier selection, analyst invocation by depth |
+| E2-T4 | Cache — DB migration + store methods (`GetCachedAnalysis`, `UpsertCachedAnalysis`, `TouchCachedAnalysis`, `DeleteExpired`) + fingerprint builder |
+| E2-T5 | Cache — invalidation engine (`ShouldInvalidate`) + engine integration (`Classify → CacheCheck → LLMCall`), fail-open |
+| E2-T6 | Cache observability — Prometheus metrics, TUI/report counters |
+
+### Epic 3 — Productization
+
+User-facing cost controls. Depends on Epic 2.
+
+| Task | Description |
+|------|-------------|
+| E3-T1 | Cost profiles — `budget/balanced/pro` config, profile-aware defaults wired into all subsystems |
+| E3-T2 | Budget guardrails — daily/weekly token caps, auto-degrade, `cost_per_signal` + `cost_per_executed_trade` in TUI/report |
+
+---
+
+## 10) Success Metrics
+
 - 7-day average token spend reduction (%).
 - Cost per executed trade.
 - Signal quality deltas vs baseline (paper PnL, win rate, drawdown).
 - Message volume reduction (Telegram sends/tick).
-- User-reported notification clarity.
+- Cache hit rate.
+- Classifier skip rate (shadow mode first, then active).
 
-## 10) Risks & Mitigations
-- **Risk**: over-pruning lowers signal quality.
-  - Mitigation: staged rollout + A/B profile comparison.
-- **Risk**: cache stale decisions.
-  - Mitigation: TTL + forced refresh triggers on volatility/news shock.
-- **Risk**: hidden degradation from budget mode.
-  - Mitigation: explicit active profile + auto-degrade notices.
+---
 
-## 11) Open Questions
-1. Default profile for first-run users?
-2. Should budget guardrails fail-closed (skip trading) or degrade-only?
-3. Which markets/tickers should always bypass cheap-filter stage?
-4. What confidence/uncertainty thresholds trigger arbiter escalation?
+## 11) Risks & Mitigations
 
-## 12) Implementation Tasks (cache-focused)
+| Risk | Mitigation |
+|------|-----------|
+| Classifier over-prunes, misses signals | Shadow mode first; tunable thresholds; skip-rate monitoring |
+| Cache returns stale decisions | TTL + forced refresh on volatility/news shock; fail-open |
+| Gemini 3.1 Pro Preview unavailable | Registry fallback to gemini-2.5-flash on 429/503 |
+| Budget mode degrades quality silently | Active profile displayed in TUI; auto-degrade sends Telegram notice |
 
-### Task C1 — DB migration + storage layer
-- Add `analysis_cache` migration with schema/indexes in §5.5.2.
-- Add store methods:
-  - `GetCachedAnalysis(fingerprint)`
-  - `UpsertCachedAnalysis(entry)`
-  - `TouchCachedAnalysis(fingerprint)`
-  - `DeleteExpiredCachedAnalyses(now)`
-- Add migration test coverage + integration tests.
+---
 
-### Task C2 — Fingerprint builder
-- Implement `analysis/cache/fingerprint.go` with canonical serialization + SHA-256.
-- Include all fields listed in §5.5.1.
-- Add unit tests for:
-  - deterministic output
-  - bucket/rounding stability
-  - version/profile changes invalidating keys.
+## 12) Open Questions
 
-### Task C3 — Invalidation engine
-- Implement `ShouldInvalidate(cacheEntry, liveState)` with rules in §5.5.3.
-- Add reason codes (`PRICE_MOVE`, `REGIME_FLIP`, `NEWS_NOVELTY`, `RISK_EVENT`, `TTL_EXPIRED`, `FORCED_REFRESH`).
-- Add unit tests for each invalidation trigger.
-
-### Task C4 — Engine integration
-- Insert cache lookup before expensive analysis call.
-- Reuse cached result on valid hit; annotate event/log with `CACHE_HIT`.
-- On miss/invalidate, run normal analysis and cache result.
-- Ensure existing risk checks still run on reused result.
-
-### Task C5 — Metrics + reporting
-- Emit metrics in §5.5.5.
-- Add TUI/report counters:
-  - hit rate
-  - estimated tokens saved
-  - cache invalidation reason distribution.
-
-### Task C6 — Profile wiring
-- Add config keys:
-  - `analysis.cache.enabled`
-  - `analysis.cache.ttl_min`
-  - `analysis.cache.force_refresh_cycles`
-  - `analysis.cache.invalidate_price_move_pct`
-- Set defaults by cost profile.
-
-### Task C7 — Safety guardrails
-- If cache subsystem errors, fail open to fresh analysis (never block trading loop).
-- Add max cache row retention + cleanup job.
-- Add migration rollback note and operational runbook.
+1. Default profile for first-run users? (Proposed: `balanced`)
+2. Budget guardrails: fail-closed (skip trading) or degrade-only? (Proposed: degrade-only, never block)
+3. Which tickers/conditions should always force depth-3 regardless of score?
+4. Arbiter escalation confidence threshold for depth-2? (Proposed: reuse existing `fast_path_max_spread`)
