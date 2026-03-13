@@ -21,6 +21,7 @@ const geminiAPIBaseURL = "https://generativelanguage.googleapis.com/v1beta/model
 type GeminiClient struct {
 	cfg        config.ModelConfig
 	apiKey     string
+	baseURL    string // overridable for tests; defaults to geminiAPIBaseURL
 	httpClient *http.Client
 }
 
@@ -33,7 +34,7 @@ func NewGeminiClient(cfg config.ModelConfig) *GeminiClient {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	return &GeminiClient{cfg: cfg, apiKey: apiKey, httpClient: &http.Client{Timeout: timeout}}
+	return &GeminiClient{cfg: cfg, apiKey: apiKey, baseURL: geminiAPIBaseURL, httpClient: &http.Client{Timeout: timeout}}
 }
 
 func (c *GeminiClient) ProviderName() string { return "google" }
@@ -81,7 +82,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		model = "gemini-pro"
 	}
 	// Key in header — never in URL (prevents leaking via access logs, proxies, referers).
-	url := fmt.Sprintf("%s/%s:generateContent", geminiAPIBaseURL, model)
+	url := fmt.Sprintf("%s/%s:generateContent", c.baseURL, model)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
