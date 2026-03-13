@@ -125,10 +125,11 @@ func checkPredictionSpread(in PredictionCheckInput) CheckResult {
 	if maxSpread <= 0 {
 		return pass(name) // check disabled
 	}
-	// Reject invalid spreads: negative spread indicates inverted quotes (Bid > Ask),
-	// which could silently pass the <= maxSpread gate. Treat as a hard failure.
+	// Reject invalid spreads: a negative sentinel is used by the engine for any
+	// missing, zero, or inverted-quote state. Use a generic reason to avoid
+	// implying a specific cause (the engine may set -1 for missing quotes too).
 	if in.Spread < 0 {
-		return fail(name, fmt.Sprintf("invalid spread %.4f (inverted quotes: Bid > Ask)", in.Spread))
+		return fail(name, "missing or invalid quotes (spread sentinel < 0)")
 	}
 	if in.Spread <= maxSpread {
 		return pass(name)

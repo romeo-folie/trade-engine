@@ -353,24 +353,46 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 
 	openTrades, err := store.GetOpenTrades(ctx)
 	if err != nil {
-		// Fail closed: treat open positions as unknown/max to avoid bypassing
-		// the max-open-positions check on a DB error.
+		// Fail closed on DB error: persist a blocked signal for observability
+		// (mirrors the risk-gate block path) then return.
 		logger.Warn("prediction risk gate: GetOpenTrades failed — blocking signal (fail closed)", "err", err.Error())
+		blockMsg := fmt.Sprintf("GetOpenTrades error: %s", err.Error())
+		if _, insErr := store.InsertSignal(ctx, store.Signal{
+			Ticker:            item.Ticker,
+			Action:            string(resp.Action),
+			Strategy:          "prediction_mispricing",
+			SignalPrice:       contract.MarketPrice,
+			Confidence:        resp.Confidence,
+			SizePct:           1.0,
+			Status:            "blocked",
+			BlockReason:       blockMsg,
+			ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
+			StalePriceMovePct: stalePct,
+		}); insErr != nil {
+			logger.Warn("prediction blocked signal insert failed (open-trades error path)", "contract", item.Ticker, "err", insErr.Error())
+		}
+		r.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker:      item.Ticker,
+			Action:      string(resp.Action),
+			Confidence:  resp.Confidence,
+			BlockReason: blockMsg,
+			FailedCheck: "open_trades_lookup",
+		})
 		return
 	}
 
 	// Compute bid-ask spread as a fraction of mid-price.
-	// Require both Bid and Ask > 0 and Ask >= Bid to guard against inverted
-	// or zero quotes producing a negative/zero spread that bypasses the gate.
+	// Use a sentinel of -1 for any invalid quote state (missing, zero, or
+	// inverted) so checkPredictionSpread can reject it explicitly rather than
+	// silently passing a zero spread or placing an order with a zero limit price.
 	var spreadFrac float64
 	if contract.Ask > 0 && contract.Bid > 0 && contract.Ask >= contract.Bid {
 		mid := (contract.Ask + contract.Bid) / 2
 		if mid > 0 {
 			spreadFrac = (contract.Ask - contract.Bid) / mid
 		}
-	} else if contract.Ask > 0 || contract.Bid > 0 {
-		// One side is missing or quotes are inverted — set a sentinel negative
-		// value so checkPredictionSpread rejects it explicitly.
+	} else {
+		// Missing, zero, or inverted quotes — sentinel triggers explicit rejection.
 		spreadFrac = -1
 	}
 
