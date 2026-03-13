@@ -36,9 +36,11 @@ func (r *RuleBased) Classify(_ context.Context, s TickState) (Result, error) {
 	}
 
 	// HOLD cooldown takes priority: if we're still in cooldown → SKIP.
-	if s.LastDecision == "HOLD" && s.ElapsedMin < s.HoldCooldown {
+	// Cooldown is sourced from config, not TickState, to avoid silent misconfiguration.
+	holdCooldown := float64(r.cfg.HoldCooldownMin)
+	if s.LastDecision == "HOLD" && s.ElapsedMin < holdCooldown {
 		deltas["hold_elapsed_min"] = s.ElapsedMin
-		deltas["hold_cooldown_min"] = s.HoldCooldown
+		deltas["hold_cooldown_min"] = holdCooldown
 		return Result{
 			Decision:   DecisionSkip,
 			ReasonCode: "HOLD_COOLDOWN",

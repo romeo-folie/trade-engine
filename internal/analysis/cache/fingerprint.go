@@ -24,7 +24,8 @@ type FingerprintInput struct {
 	StrategyVersion string // bumped when prompt template changes
 	ModelProfile    string // "budget" | "balanced" | "pro"
 
-	// Analyst set — sorted slice of "provider/model" strings.
+	// Analyst set — "provider/model" strings. Order is significant: different
+	// orderings produce different fingerprints. Callers MUST sort before calling Build.
 	Analysts []string
 	// Arbiter model — "provider/model".
 	Arbiter string
@@ -104,8 +105,8 @@ func bucketRSI(rsi float64) int {
 	return int(math.Round(rsi/5.0)) * 5
 }
 
-// bucketEMAGap rounds the EMA gap percentage to the nearest 0.5 step,
-// then multiplies by 10 to yield an integer key.
+// bucketEMAGap rounds the EMA gap percentage to the nearest 0.5 step.
+// Returns the rounded bucket index (e.g. 2.25% → bucket 4, representing 2.0%).
 func bucketEMAGap(pct float64) int {
-	return int(math.Round(pct/0.5)) // 0.5 % steps
+	return int(math.Round(pct / 0.5)) // 0.5 % steps
 }

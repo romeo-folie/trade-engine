@@ -36,7 +36,9 @@ type TickState struct {
 	LastNewsHash  string  // prior-tick news digest hash
 	LastDecision  string  // BUY | SELL | HOLD | ""
 	ElapsedMin    float64 // minutes since last analysis
-	HoldCooldown  float64 // configured hold cooldown in minutes
+	// HoldCooldown is deprecated: L1 now sources cooldown from ClassifierConfig.HoldCooldownMin.
+	// Field retained for API compatibility; it is no longer read by RuleBased.Classify.
+	HoldCooldown float64
 }
 
 // Classifier evaluates a tick state and returns a routing decision.

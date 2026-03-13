@@ -56,7 +56,16 @@ type LLMClassifier struct {
 
 // NewLLMClassifier creates a Layer-2 classifier. modelCfg is the resolved
 // registry entry for the "classifier" role.
+//
+// Note: the LLM classifier uses the OpenAI Chat Completions API format directly.
+// Only "openai" provider registry entries are supported; other providers will
+// cause all L2 calls to fail-open. If a non-openai provider is configured, a
+// warning is logged at construction time.
 func NewLLMClassifier(cfg config.ClassifierConfig, modelCfg config.ModelConfig) *LLMClassifier {
+	if modelCfg.Provider != "openai" {
+		logger.Warn("LLMClassifier: unsupported provider — L2 classifier will always fail-open",
+			"provider", modelCfg.Provider, "expected", "openai")
+	}
 	return &LLMClassifier{
 		cfg:        cfg,
 		modelCfg:   modelCfg,
@@ -86,7 +95,10 @@ func (l *LLMClassifier) Classify(ctx context.Context, s TickState) (Result, erro
 		MaxTokens: 64,
 		Messages:  []llmMessage{{Role: "user", Content: prompt}},
 	}
-	body, _ := json.Marshal(reqBody)
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return failOpen("marshal failed", err), nil
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, l.baseURL, bytes.NewReader(body))
 	if err != nil {

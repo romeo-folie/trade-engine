@@ -3,7 +3,7 @@
 -- See cost-reduction PRD §7.5.
 
 CREATE TABLE IF NOT EXISTS analysis_cache (
-    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    id              UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
     fingerprint     TEXT        UNIQUE NOT NULL,
     ticker          TEXT        NOT NULL,
     timeframe       TEXT        NOT NULL,
@@ -18,10 +18,6 @@ CREATE TABLE IF NOT EXISTS analysis_cache (
     last_used_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     use_count       INT         NOT NULL DEFAULT 0
 );
-
--- Fast fingerprint lookups (covered by UNIQUE index, but named for clarity).
-CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_cache_fingerprint
-    ON analysis_cache(fingerprint);
 
 -- Ticker + timeframe + expiry index for range queries.
 CREATE INDEX IF NOT EXISTS idx_analysis_cache_ticker_expires

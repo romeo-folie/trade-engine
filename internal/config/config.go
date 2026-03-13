@@ -159,7 +159,7 @@ type ClassifierConfig struct {
 	RSIDeltaThreshold     float64 `yaml:"rsi_delta_threshold"`
 	EMAGapDeltaPct        float64 `yaml:"ema_gap_delta_pct"`
 	PriceMoveThresholdPct float64 `yaml:"price_move_threshold_pct"`
-	HoldCooldownMin       float64 `yaml:"hold_cooldown_min"`
+	HoldCooldownMin       int     `yaml:"hold_cooldown_min"`
 	NewsNoveltyEnabled    bool    `yaml:"news_novelty_enabled"`
 
 	// Layer 2 — LLM fallback for ambiguous cases.

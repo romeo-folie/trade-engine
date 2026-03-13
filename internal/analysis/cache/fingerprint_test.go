@@ -108,14 +108,13 @@ func TestFingerprintStrategyVersionChange(t *testing.T) {
 }
 
 func TestFingerprintAnalystOrderMatters(t *testing.T) {
-	// Analyst list is stored as-is; callers must sort before calling Build.
-	// Different order → different fingerprint (by design — callers sort).
-	in1 := baseInput()
+	// Analyst list is order-sensitive by design: callers must sort before calling Build.
+	// Different order → different fingerprint (regression guard).
+	in1 := baseInput() // ["openai/gpt-4o", "google/gemini-1.5-pro"] (sorted)
 	in2 := baseInput()
-	in2.Analysts = []string{"google/gemini-1.5-pro", "openai/gpt-4o"}
-	// Reversed — different serialisation.
+	in2.Analysts = []string{"google/gemini-1.5-pro", "openai/gpt-4o"} // reversed
 	if cache.Build(in1) == cache.Build(in2) {
-		t.Log("note: analyst order changes fingerprint — callers must sort")
+		t.Errorf("expected different fingerprints for different analyst orderings, got same: %s", cache.Build(in1))
 	}
 }
 

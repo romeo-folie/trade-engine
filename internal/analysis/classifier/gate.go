@@ -26,7 +26,9 @@ func NewGate(mode string, layer1 *RuleBased, layer2 *LLMClassifier) *Gate {
 }
 
 // Classify runs the gate and returns whether analysis should proceed.
-// Returns (true, nil) when analysis should proceed, (false, nil) to skip.
+// Returns (proceed bool, res Result, err error). err is always nil — errors
+// are absorbed internally (fail-open). When proceed is true, analysis runs;
+// when false, the tick is skipped. res always contains the classifier result.
 func (g *Gate) Classify(ctx context.Context, s TickState) (proceed bool, res Result, err error) {
 	if g.mode == "disabled" {
 		return true, Result{Decision: DecisionAnalyze, ReasonCode: "CLASSIFIER_DISABLED"}, nil
@@ -34,6 +36,7 @@ func (g *Gate) Classify(ctx context.Context, s TickState) (proceed bool, res Res
 
 	res, err = g.layer1.Classify(ctx, s)
 	if err != nil {
+		logger.Warn("classifier L1 error — failing open", "ticker", s.Ticker, "err", err.Error())
 		return true, Result{Decision: DecisionAnalyze, ReasonCode: "L1_ERROR_FAIL_OPEN"}, nil
 	}
 

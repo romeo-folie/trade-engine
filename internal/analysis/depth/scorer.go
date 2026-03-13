@@ -65,6 +65,10 @@ func Score(tc TickContext, cfg config.AdaptiveDepthConfig) ImpactScore {
 		w.NewsNovelty*newsNovelty +
 		w.RiskProximity*riskProximity +
 		w.TrendStrength*trendStrength
+	// Clamp to [0,1] — misconfigured weights (summing > 1) must not break downstream.
+	if score > 1.0 {
+		score = 1.0
+	}
 
 	inputs := map[string]float64{
 		"volatility":     volatility,

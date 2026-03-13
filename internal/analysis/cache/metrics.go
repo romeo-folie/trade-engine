@@ -12,7 +12,9 @@ import (
 // If Prometheus is added to go.mod in a future phase, these can be bridged
 // to prometheus.Counter via a thin adapter without changing call sites.
 //
-// Metrics is exported so tests can reset the global with `cache.Global = cache.Metrics{}`.
+// Metrics is exported so tests can reset individual counters via .Store(0) on each field.
+// Do NOT reset by assigning a new zero-value struct (e.g. `cache.Global = cache.Metrics{}`):
+// atomic.Int64 must not be copied after first use.
 type Metrics struct {
 	Hits         atomic.Int64
 	Misses       atomic.Int64

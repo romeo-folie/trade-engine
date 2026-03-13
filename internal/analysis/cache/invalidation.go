@@ -110,8 +110,10 @@ func (s *Sweeper) Run(ctx context.Context) {
 			n, err := store.DeleteExpiredCachedAnalyses(ctx, t)
 			if err != nil {
 				logger.Warn("cache sweep failed", "err", err.Error())
+				RecordError()
 			} else if n > 0 {
 				logger.Info("cache sweep: deleted expired entries", "count", n)
+				RecordEviction(int64(n))
 			}
 		}
 	}
