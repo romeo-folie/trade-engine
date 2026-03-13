@@ -247,6 +247,27 @@ func Defaults() *Config {
 				"mean_reversion":  20,
 				"momentum":        14,
 			},
+			Classifier: ClassifierConfig{
+				Mode:                  "shadow",
+				RSIDeltaThreshold:     3.0,
+				EMAGapDeltaPct:        0.5,
+				PriceMoveThresholdPct: 0.75,
+				HoldCooldownMin:       120,
+				NewsNoveltyEnabled:    true,
+				LLMFallbackEnabled:    false,
+				LLMFallbackModel:      "classifier",
+			},
+			AdaptiveDepth: AdaptiveDepthConfig{
+				Enabled:       false, // opt-in; requires analyst tier roles configured
+				LowThreshold:  0.30,
+				HighThreshold: 0.65,
+				Weights: AdaptiveDepthWeights{
+					Volatility:    0.30,
+					NewsNovelty:   0.25,
+					RiskProximity: 0.25,
+					TrendStrength: 0.20,
+				},
+			},
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,
