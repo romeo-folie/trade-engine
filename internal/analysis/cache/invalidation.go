@@ -12,12 +12,14 @@ import (
 type InvalidationTrigger string
 
 const (
-	TriggerPriceMove     InvalidationTrigger = "price_move"
-	TriggerIndicatorFlip InvalidationTrigger = "indicator_regime_flip"
+	TriggerPriceMove      InvalidationTrigger = "price_move"
+	TriggerIndicatorFlip  InvalidationTrigger = "indicator_regime_flip"
 	TriggerHighImpactNews InvalidationTrigger = "high_impact_news"
-	TriggerRiskEvent     InvalidationTrigger = "risk_event"
+	TriggerRiskEvent      InvalidationTrigger = "risk_event"
 	TriggerTradeLifecycle InvalidationTrigger = "trade_lifecycle"
-	TriggerTTLExpiry     InvalidationTrigger = "ttl_expiry"
+	// Note: TTL expiry is handled by Sweeper.Run() + DeleteExpiredCachedAnalyses,
+	// not by ShouldInvalidate. There is no TriggerTTLExpiry here because
+	// this file doesn't have expiry timestamp context.
 )
 
 // InvalidationInput carries the signals checked against an existing cache entry.

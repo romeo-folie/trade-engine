@@ -2,6 +2,8 @@
 -- Fingerprint-keyed cache with TTL, use tracking, and expiry cleanup.
 -- See cost-reduction PRD §7.5.
 
+-- uuid_generate_v4() from uuid-ossp, consistent with all other migrations
+-- (see 001_extensions.sql: CREATE EXTENSION IF NOT EXISTS "uuid-ossp").
 CREATE TABLE IF NOT EXISTS analysis_cache (
     id              UUID        PRIMARY KEY DEFAULT uuid_generate_v4(),
     fingerprint     TEXT        UNIQUE NOT NULL,

@@ -22,12 +22,13 @@ func NewRuleBased(cfg config.ClassifierConfig) *RuleBased {
 // Classify returns DecisionAnalyze if any threshold is exceeded, otherwise
 // DecisionSkip with the first matching reason code.
 //
-// Rule precedence (any one above threshold → ANALYZE):
-//  1. price_move_threshold_pct
-//  2. rsi_delta_threshold
-//  3. ema_gap_delta_pct
-//  4. news_novelty (hash changed)
-//  5. hold_cooldown_min elapsed since HOLD
+// Evaluation order:
+//  1. HOLD cooldown — if still active, return SKIP immediately (no further checks).
+//  2. price_move_threshold_pct — if exceeded, return ANALYZE.
+//  3. rsi_delta_threshold       — if exceeded, return ANALYZE.
+//  4. ema_gap_delta_pct         — if exceeded, return ANALYZE.
+//  5. news_novelty (hash changed and non-empty) — if true, return ANALYZE.
+//  6. All below threshold       — return SKIP/NO_MATERIAL_CHANGE.
 func (r *RuleBased) Classify(_ context.Context, s TickState) (Result, error) {
 	deltas := map[string]float64{
 		"rsi_delta":         math.Abs(s.RSIDelta),

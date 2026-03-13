@@ -25,8 +25,9 @@ type FingerprintInput struct {
 	StrategyVersion string // bumped when prompt template changes
 	ModelProfile    string // "budget" | "balanced" | "pro"
 
-	// Analyst set — "provider/model" strings. Order is significant: different
-	// orderings produce different fingerprints. Callers MUST sort before calling Build.
+	// Analyst set — "provider/model" strings.
+	// Build() sorts this slice internally, so order is irrelevant at the call site.
+	// Equivalent analyst sets always produce the same fingerprint.
 	Analysts []string
 	// Arbiter model — "provider/model".
 	Arbiter string

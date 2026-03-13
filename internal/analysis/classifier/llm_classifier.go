@@ -58,20 +58,29 @@ type LLMClassifier struct {
 // registry entry for the "classifier" role.
 //
 // Note: the LLM classifier uses the OpenAI Chat Completions API format directly.
-// Only "openai" provider registry entries are supported; other providers will
-// cause all L2 calls to fail-open. If a non-openai provider is configured, a
-// warning is logged at construction time.
+// Only "openai" provider registry entries are supported.
+//
+// Unsupported providers (anything other than "openai") or missing API keys return
+// a stub LLMClassifier whose Classify always fails open without making HTTP calls.
+// Use IsSupported() to check before wiring into the gate.
 func NewLLMClassifier(cfg config.ClassifierConfig, modelCfg config.ModelConfig) *LLMClassifier {
-	if modelCfg.Provider != "openai" {
-		logger.Warn("LLMClassifier: unsupported provider — L2 classifier will always fail-open",
-			"provider", modelCfg.Provider, "expected", "openai")
+	timeout := 15 * time.Second
+	if modelCfg.TimeoutSec > 0 {
+		timeout = time.Duration(modelCfg.TimeoutSec) * time.Second
 	}
 	return &LLMClassifier{
 		cfg:        cfg,
 		modelCfg:   modelCfg,
-		httpClient: &http.Client{Timeout: 15 * time.Second},
+		httpClient: &http.Client{Timeout: timeout},
 		baseURL:    "https://api.openai.com/v1/chat/completions",
 	}
+}
+
+// IsSupported returns false when the configured provider or API key is
+// incompatible with the LLM classifier. The gate should skip wiring Layer 2
+// when this returns false.
+func (l *LLMClassifier) IsSupported() bool {
+	return l.modelCfg.Provider == "openai" && l.modelCfg.APIKey != ""
 }
 
 // SetBaseURL overrides the API endpoint. Used in tests to inject a test server.
@@ -79,7 +88,11 @@ func (l *LLMClassifier) SetBaseURL(u string) { l.baseURL = u }
 
 // Classify sends a minimal prompt and parses SKIP or ANALYZE.
 // Always fails open on error (proceed to analysis, log warning).
+// Immediately fails open when the provider is not supported or the API key is absent.
 func (l *LLMClassifier) Classify(ctx context.Context, s TickState) (Result, error) {
+	if !l.IsSupported() {
+		return failOpen("unsupported provider or missing API key", nil), nil
+	}
 	// Mirror Layer-1 novelty logic: only treat as "changed" when the current
 	// hash is non-empty; an empty hash means no news data, not novel news.
 	noveltyStr := "unchanged"

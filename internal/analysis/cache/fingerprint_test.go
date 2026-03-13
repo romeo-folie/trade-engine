@@ -41,13 +41,9 @@ func TestFingerprintDeterministic(t *testing.T) {
 func TestFingerprintRSIBucketingAbsorbsNoise(t *testing.T) {
 	in1 := baseInput()
 	in2 := baseInput()
-	// RSI 52.3 and 53.9 both bucket to 55 (nearest multiple of 5 ×0.5 rounding)
-	// Actually: round(52.3/5)*5 = round(10.46)*5 = 10*5 = 50
-	//           round(53.9/5)*5 = round(10.78)*5 = 11*5 = 55 — different bucket
-	// Use values that are in the same bucket: 52.0 and 53.9 → both round to 50 or 55?
-	// round(52/5)=round(10.4)=10 → bucket 50
-	// round(53/5)=round(10.6)=11 → bucket 55
-	// Use 51.0 and 52.0: round(10.2)=10 and round(10.4)=10 → both bucket 50
+	// 51.0 and 52.0 are both in the bucket-50 range:
+	//   round(51/5) = round(10.2) = 10 → bucket 50
+	//   round(52/5) = round(10.4) = 10 → bucket 50
 	in1.RSI = 51.0
 	in2.RSI = 52.0
 	f1 := cache.Build(in1)

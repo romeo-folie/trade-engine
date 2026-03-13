@@ -96,7 +96,7 @@ func TestGateLLMSkipInActiveMode(t *testing.T) {
 	srv := newTestLLMServer("SKIP low activity consolidation", http.StatusOK)
 	defer srv.Close()
 
-	modelCfg := config.ModelConfig{Model: "gpt-4o-mini", APIKey: "test"}
+	modelCfg := config.ModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test"}
 	llm := classifier.NewLLMClassifier(testCfg(), modelCfg)
 	llm.SetBaseURL(srv.URL)
 
@@ -119,7 +119,7 @@ func TestGateLLMErrorFailOpen(t *testing.T) {
 	srv := newTestLLMServer("", http.StatusInternalServerError)
 	defer srv.Close()
 
-	modelCfg := config.ModelConfig{Model: "gpt-4o-mini", APIKey: "test"}
+	modelCfg := config.ModelConfig{Provider: "openai", Model: "gpt-4o-mini", APIKey: "test"}
 	llm := classifier.NewLLMClassifier(testCfg(), modelCfg)
 	llm.SetBaseURL(srv.URL)
 
