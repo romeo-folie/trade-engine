@@ -15,6 +15,8 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
+	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -45,6 +47,7 @@ type PredictionRunner struct {
 	analyzer  *analysis.Analyzer
 	bus       *events.Bus
 	mode      string
+	portfolio *portfolio.Tracker
 }
 
 // NewPredictionRunner creates a PredictionRunner for all enabled platforms.
@@ -52,7 +55,7 @@ type PredictionRunner struct {
 // Polymarket live execution requires ECDSA signing of each CLOB request; until
 // that layer is implemented the Polymarket executor falls back to
 // PredictionPaperExecutor so signals are still exercised end-to-end in paper.
-func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *PredictionRunner {
+func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string, pt *portfolio.Tracker) *PredictionRunner {
 	r := &PredictionRunner{
 		cfg:       cfg,
 		platforms: make(map[string]data.PredictionDataProvider),
@@ -60,6 +63,7 @@ func NewPredictionRunner(cfg *config.Config, bus *events.Bus, mode string) *Pred
 		analyzer:  analysis.NewAnalyzer(cfg.Models),
 		bus:       bus,
 		mode:      mode,
+		portfolio: pt,
 	}
 
 	if !cfg.Markets.Predictions.Enabled {
@@ -323,7 +327,8 @@ func (r *PredictionRunner) analyseContract(ctx context.Context, item store.Watch
 	r.emitSignal(ctx, item, contract, resp)
 }
 
-// emitSignal records a signal and optionally executes it.
+// emitSignal runs the full prediction risk gate, records a signal, and
+// optionally executes it according to engine mode.
 func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistItem, contract prompts.ContractInfo, resp analysis.AnalysisResponse) {
 	expiryMin := r.cfg.Risk.SignalExpiryMin
 	if expiryMin <= 0 {
@@ -333,6 +338,134 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 	if stalePct <= 0 {
 		stalePct = 2.0
 	}
+
+	// ── Risk gate ──────────────────────────────────────────────────────────────
+	// Build portfolio state for baseline checks.
+	var pState portfolio.State
+	if r.portfolio != nil {
+		pState = r.portfolio.CurrentState()
+	} else {
+		// No portfolio tracker: portfolio-based checks (daily loss, drawdown,
+		// cooldown) will see zero values and effectively be skipped. Log a
+		// warning so operators know this risk gate is partially disabled.
+		logger.Warn("prediction risk gate: no portfolio tracker — portfolio-based checks will use zero values")
+	}
+
+	openTrades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		// Fail closed on DB error: persist a blocked signal for observability
+		// (mirrors the risk-gate block path) then return.
+		logger.Warn("prediction risk gate: GetOpenTrades failed — blocking signal (fail closed)", "err", err.Error())
+		blockMsg := fmt.Sprintf("GetOpenTrades error: %s", err.Error())
+		if _, insErr := store.InsertSignal(ctx, store.Signal{
+			Ticker:            item.Ticker,
+			Action:            string(resp.Action),
+			Strategy:          "prediction_mispricing",
+			SignalPrice:       contract.MarketPrice,
+			Confidence:        resp.Confidence,
+			SizePct:           1.0,
+			Status:            "blocked",
+			BlockReason:       blockMsg,
+			ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
+			StalePriceMovePct: stalePct,
+		}); insErr != nil {
+			logger.Warn("prediction blocked signal insert failed (open-trades error path)", "contract", item.Ticker, "err", insErr.Error())
+		}
+		r.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker:      item.Ticker,
+			Action:      string(resp.Action),
+			Confidence:  resp.Confidence,
+			BlockReason: blockMsg,
+			FailedCheck: "open_trades_lookup",
+		})
+		return
+	}
+
+	// Compute bid-ask spread as a fraction of mid-price.
+	// Use a sentinel of -1 for any invalid quote state (missing, zero, or
+	// inverted) so checkPredictionSpread can reject it explicitly rather than
+	// silently passing a zero spread or placing an order with a zero limit price.
+	var spreadFrac float64
+	if contract.Ask > 0 && contract.Bid > 0 && contract.Ask >= contract.Bid {
+		mid := (contract.Ask + contract.Bid) / 2
+		if mid > 0 {
+			spreadFrac = (contract.Ask - contract.Bid) / mid
+		}
+	} else {
+		// Missing, zero, or inverted quotes — sentinel triggers explicit rejection.
+		spreadFrac = -1
+	}
+
+	riskIn := risk.PredictionCheckInput{
+		Cfg:                r.cfg.Risk,
+		Action:             string(resp.Action),
+		Confidence:         resp.Confidence,
+		SizePct:            1.0,
+		PortfolioValue:     pState.TotalValue,
+		Cash:               pState.Cash,
+		OpenPositions:      len(openTrades),
+		DailyPnL:           pState.RealizedPnLDay,
+		PeakValue:          pState.PeakValue,
+		LastLossAt:         pState.LastLossAt,
+		Spread:             spreadFrac,
+		Volume24h:          contract.Volume24h,
+		ResolutionDeadline: contract.ResolutionDeadline,
+	}
+
+	results, passed := risk.CheckAllPrediction(riskIn)
+	for _, chk := range results {
+		level := "INFO"
+		if !chk.Passed {
+			level = "WARN"
+		}
+		logger.Info("prediction risk check",
+			"contract", item.Ticker,
+			"check", chk.Name,
+			"level", level,
+			"passed", chk.Passed,
+			"reason", chk.Reason,
+		)
+	}
+
+	if !passed {
+		blockReason := risk.BlockReason(results)
+		// Find the name of the first failing check for structured reporting.
+		failedCheckName := blockReason
+		for _, chk := range results {
+			if !chk.Passed {
+				failedCheckName = chk.Name
+				break
+			}
+		}
+		logger.Warn("prediction signal blocked",
+			"contract", item.Ticker,
+			"reason", blockReason,
+		)
+		// Persist a blocked signal for observability — log a WARN if the DB write fails.
+		if _, err := store.InsertSignal(ctx, store.Signal{
+			Ticker:            item.Ticker,
+			Action:            string(resp.Action),
+			Strategy:          "prediction_mispricing",
+			SignalPrice:       contract.MarketPrice,
+			Confidence:        resp.Confidence,
+			SizePct:           1.0,
+			Status:            "blocked",
+			BlockReason:       blockReason,
+			ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
+			StalePriceMovePct: stalePct,
+		}); err != nil {
+			logger.Warn("prediction blocked signal insert failed", "contract", item.Ticker, "err", err.Error())
+		}
+		r.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker:      item.Ticker,
+			Action:      string(resp.Action),
+			Confidence:  resp.Confidence,
+			BlockReason: blockReason,
+			FailedCheck: failedCheckName,
+		})
+		return
+	}
+	// ── End risk gate ──────────────────────────────────────────────────────────
 
 	sigID, err := store.InsertSignal(ctx, store.Signal{
 		Ticker:            item.Ticker,

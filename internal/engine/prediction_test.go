@@ -16,7 +16,7 @@ func TestPredictionRunner_DisabledWhenGlobalToggleOff(t *testing.T) {
 		"polymarket": {Enabled: true},
 	}
 
-	r := NewPredictionRunner(cfg, events.New(), "paper")
+	r := NewPredictionRunner(cfg, events.New(), "paper", nil)
 	if r.Enabled() {
 		t.Fatal("expected prediction runner to be disabled when markets.predictions.enabled=false")
 	}
@@ -29,7 +29,7 @@ func TestPredictionRunner_EnabledWhenGlobalToggleOnAndPlatformEnabled(t *testing
 		"polymarket": {Enabled: true},
 	}
 
-	r := NewPredictionRunner(cfg, events.New(), "paper")
+	r := NewPredictionRunner(cfg, events.New(), "paper", nil)
 	if !r.Enabled() {
 		t.Fatal("expected prediction runner to be enabled when global toggle is on and platform enabled")
 	}
@@ -43,7 +43,7 @@ func TestPredictionRunner_NoEnabledPlatforms(t *testing.T) {
 		"kalshi":     {Enabled: false},
 	}
 
-	r := NewPredictionRunner(cfg, events.New(), "paper")
+	r := NewPredictionRunner(cfg, events.New(), "paper", nil)
 	if r.Enabled() {
 		t.Fatal("expected prediction runner to be disabled when no platform is enabled")
 	}
@@ -56,7 +56,7 @@ func TestPredictionRunner_PolymarketUsesPaperExecutor(t *testing.T) {
 		"polymarket": {Enabled: true},
 	}
 
-	r := NewPredictionRunner(cfg, events.New(), "auto")
+	r := NewPredictionRunner(cfg, events.New(), "auto", nil)
 
 	exec, ok := r.executors["polymarket"]
 	if !ok {
@@ -78,7 +78,7 @@ func TestPredictionRunner_KalshiExecutorSelection(t *testing.T) {
 			},
 		}
 
-		r := NewPredictionRunner(cfg, events.New(), "paper")
+		r := NewPredictionRunner(cfg, events.New(), "paper", nil)
 		exec, ok := r.executors["kalshi"]
 		if !ok {
 			t.Fatal("expected kalshi executor to be configured")
@@ -98,7 +98,7 @@ func TestPredictionRunner_KalshiExecutorSelection(t *testing.T) {
 			},
 		}
 
-		r := NewPredictionRunner(cfg, events.New(), "auto")
+		r := NewPredictionRunner(cfg, events.New(), "auto", nil)
 		exec, ok := r.executors["kalshi"]
 		if !ok {
 			t.Fatal("expected kalshi executor to be configured")
@@ -118,7 +118,7 @@ func TestPredictionRunner_KalshiExecutorSelection(t *testing.T) {
 			},
 		}
 
-		r := NewPredictionRunner(cfg, events.New(), "auto")
+		r := NewPredictionRunner(cfg, events.New(), "auto", nil)
 		exec, ok := r.executors["kalshi"]
 		if !ok {
 			t.Fatal("expected kalshi executor to be configured")
@@ -132,7 +132,7 @@ func TestPredictionRunner_KalshiExecutorSelection(t *testing.T) {
 func TestPredictionRunner_RunReturnsImmediatelyWhenDisabled(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.Markets.Predictions.Enabled = false
-	r := NewPredictionRunner(cfg, events.New(), "paper")
+	r := NewPredictionRunner(cfg, events.New(), "paper", nil)
 
 	// Run should return promptly when the prediction runner is disabled.
 	r.Run(context.Background())
