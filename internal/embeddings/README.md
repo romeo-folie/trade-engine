@@ -18,14 +18,14 @@ Generates vector embeddings for past analyses, news items, and entities. Embeddi
 | `openai` | `text-embedding-3-small` | **1536** (default) |
 | `ollama` | `nomic-embed-text` | 768 |
 
-> **All `vector()` columns are sized to 1536.** Switching to Ollama requires an `ALTER TABLE ... ALTER COLUMN ... TYPE vector(768)` migration plus a full `te embeddings reindex`.
+> **All `vector()` columns are sized to 1536.** Switching to Ollama requires an `ALTER TABLE ... ALTER COLUMN ... TYPE vector(768)` migration plus a full `te embeddings reindex --force`.
 
 ## Architecture
 
 ```
 Worker (background goroutine)
   │
-  ├── every poll interval: query NULL-embedding rows (analyses, news, entities)
+  ├── every worker_interval_sec: query NULL-embedding rows (analyses, news, entities)
   │
   ├── embed each row via Embedder.EmbedBatch()
   │      │
@@ -48,21 +48,22 @@ AAPL RSI:62.3 EMA20:183.4 MACD:1.2 ADX:28.7
 ## CLI
 
 ```bash
-te embeddings status          # show counts (total, embedded, pending) per table
-te embeddings reindex         # clear all embeddings and rebuild from scratch
-te embeddings reindex --force # skip confirmation prompt
+te embeddings status           # show counts (total, embedded, pending) per table
+te embeddings reindex          # fill NULL embeddings (skips rows that already have embeddings)
+te embeddings reindex --force  # clear all embeddings first, then rebuild from scratch
 ```
 
 ## Configuration
 
 ```yaml
 embeddings:
-  provider: openai              # openai | ollama
+  provider: openai                  # openai | ollama
   model: text-embedding-3-small
   api_key_env: OPENAI_API_KEY
   dimension: 1536
-  poll_interval_sec: 60
+  worker_interval_sec: 60           # polling interval for the background worker
   batch_size: 50
   similar_analyses_enabled: true
-  top_k: 5
+  similar_analyses_threshold: 0.8   # cosine similarity threshold
+  similar_analyses_limit: 5         # top-N results injected into prompt
 ```

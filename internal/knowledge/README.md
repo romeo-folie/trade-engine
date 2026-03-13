@@ -50,11 +50,10 @@ The formatted block includes:
 ## CLI
 
 ```bash
-te graph list [--type company]          # list entities
-te graph add --ticker AAPL --name "Apple Inc." --sector Technology --country US
-te graph relate --from AAPL --to QCOM --type supplies_to
-te graph remove --id <uuid>
-te graph review                         # review auto-generated relationships
+te graph seed                       # seed the graph with built-in entity data
+te graph entities [--type company]  # list entities (optionally filter by type)
+te graph relationships <ticker>     # show relationships for a ticker
+te graph review                     # review and approve/reject auto-generated relationships
 ```
 
 ## Relationship Types

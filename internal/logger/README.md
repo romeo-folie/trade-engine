@@ -1,6 +1,6 @@
 # internal/logger — Structured Logger
 
-A thin wrapper around Go's standard `log/slog` that writes to **both stdout and a rotating log file** simultaneously.
+A thin wrapper around Go's standard `log/slog` that writes to **both stdout and a log file** simultaneously.
 
 ## Log Location
 
@@ -8,16 +8,17 @@ A thin wrapper around Go's standard `log/slog` that writes to **both stdout and 
 ~/.tradeengine/logs/engine.log
 ```
 
-The directory is created automatically on `Init()`.
+The directory is created automatically on `Init()`. The file is opened in append mode; rotation is not handled by this package.
 
 ## Usage
 
 ```go
 import "github.com/romeo-folie/trade-engine/internal/logger"
 
-// Initialise once at startup (main.go / cobra PersistentPreRun).
+// Initialise once at startup (called automatically by `te run` via config).
 if err := logger.Init("info", "text"); err != nil {
-    log.Fatal(err)
+    logger.Error("logger init failed", "err", err)
+    os.Exit(1)
 }
 defer logger.Close()
 
@@ -45,11 +46,15 @@ logger.Error("trade failed", "ticker", "AAPL", "err", err)
 
 ## Configuration
 
-Controlled via CLI flags (set in `cmd/te/root.go`):
+Logging level and format are set in `config.yaml` and loaded via `config.Logging`:
 
-```bash
-te run --log-level debug --log-format json
+```yaml
+logging:
+  level: info    # debug | info | warn | error
+  format: text   # text | json
 ```
+
+`te run` calls `logger.Init(cfg.Logging.Level, cfg.Logging.Format)` automatically at startup.
 
 ## Convenience Wrappers
 

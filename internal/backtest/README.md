@@ -1,6 +1,8 @@
 # internal/backtest — Historical Replay Engine
 
-Implements the backtest pipeline: load candles → run analysis via the LLM pipeline (with prompt caching) → simulate entry/exit using `PaperExecutor` → compute performance metrics → persist the completed run.
+Implements the backtest pipeline: load candles → run analysis via the LLM pipeline (with prompt caching) → simulate entry/exit internally (SL/TP, signal deferred close) → compute performance metrics → persist the completed run.
+
+> **Note:** The runner simulates trades entirely in memory; it does not use `execution.PaperExecutor`.
 
 ## Components
 
@@ -13,7 +15,7 @@ Implements the backtest pipeline: load candles → run analysis via the LLM pipe
 ## Data Flow
 
 ```
-te backtest run --ticker AAPL --from 2024-01-01 --to 2024-06-30
+te backtest run AAPL --from 2024-01-01 --to 2024-06-30
       │
       ▼
 Runner.Run(ctx, RunOptions, progressFn)
