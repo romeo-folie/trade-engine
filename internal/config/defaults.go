@@ -241,7 +241,7 @@ func Defaults() *Config {
 			PriceMoveThresholdPct: 0.75,
 			NewsNoveltyEnabled:    true,
 			MaxNewsArticlesPerPrompt: 5,
-			MaxCandlesPerPrompt:      10,
+			MaxCandlesPerPrompt:      20, // must be >= largest HistoryWindowByStrategy value
 			HistoryWindowByStrategy: map[string]int{
 				"trend_following": 20,
 				"mean_reversion":  20,

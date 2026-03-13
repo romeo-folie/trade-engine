@@ -135,18 +135,22 @@ func TestBatcherMaxItemsEnforced(t *testing.T) {
 func TestBatcherAutoFlushOnTimer(t *testing.T) {
 	cfg := testCfg(true)
 	cfg.BatchWindowSec = 1
-	var callCount int32
+	flushed := make(chan struct{}, 1)
 	b := NewTickBatcher(cfg, func(_ string) error {
-		atomic.AddInt32(&callCount, 1)
+		select {
+		case flushed <- struct{}{}:
+		default:
+		}
 		return nil
 	})
 
 	b.Add(BatchItem{Kind: "signal", Ticker: "AAPL", Action: "BUY", Confidence: 0.90})
-	// Wait for timer auto-flush.
-	time.Sleep(1500 * time.Millisecond)
 
-	if atomic.LoadInt32(&callCount) != 1 {
-		t.Errorf("expected auto-flush after window, got %d sends", atomic.LoadInt32(&callCount))
+	select {
+	case <-flushed:
+		// auto-flush fired as expected
+	case <-time.After(3 * time.Second):
+		t.Error("expected auto-flush within 3s, timed out")
 	}
 }
 
