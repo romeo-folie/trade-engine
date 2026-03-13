@@ -20,7 +20,7 @@ graph TD
     Risk --> Executor[Order Executor<br/>internal/execution/]
     Executor -->|paper / live| AlpacaBroker[Alpaca Broker API]
     Engine --> Backtest[Backtesting Engine<br/>internal/backtest/]
-    Engine --> Predictions[Prediction Markets<br/>Polymarket · Kalshi]
+    Engine --> Predictions[Prediction Markets<br/>Polymarket · Kalshi<br/>engine/ + store/ + execution/]
     Engine --> Knowledge[Knowledge Graph<br/>internal/knowledge/]
     Engine --> Embeddings[Vector Embeddings<br/>internal/embeddings/]
     Engine --> TUI[Terminal Dashboard<br/>internal/tui/]
@@ -49,7 +49,6 @@ internal/
   embeddings/        — pgvector embedding pipeline (OpenAI / Ollama)
   knowledge/         — Entity relationship graph + news enrichment
   reports/           — Self-contained HTML report generation (go-echarts)
-  prediction/        — Prediction market integration (Polymarket, Kalshi)
 migrations/          — SQL migration files (001–013)
 docs/                — PRD + implementation plan + local-first embeddings guide
 ```
