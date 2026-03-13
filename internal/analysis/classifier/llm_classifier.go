@@ -146,18 +146,25 @@ func (l *LLMClassifier) Classify(ctx context.Context, s TickState) (Result, erro
 
 	var decision Decision
 	var reason string
-	if strings.HasPrefix(upper, "SKIP") {
+	switch {
+	case strings.HasPrefix(upper, "SKIP"):
 		decision = DecisionSkip
 		reason = "LLM_SKIP"
 		if len(content) > 5 {
 			reason = strings.TrimSpace(content[5:])
 		}
-	} else {
+	case strings.HasPrefix(upper, "ANALYZE"):
 		decision = DecisionAnalyze
 		reason = "LLM_ANALYZE"
 		if len(content) > 8 {
 			reason = strings.TrimSpace(content[8:])
 		}
+	default:
+		// Unexpected prefix — fail open so analysis always proceeds on
+		// ambiguous or malformed model output.
+		logger.Warn("classifier LLM: unexpected response format — failing open",
+			"content", content)
+		return failOpen("unexpected response format", nil), nil
 	}
 
 	return Result{

@@ -636,6 +636,13 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
 	}
 
+	// Validate classifier mode — unknown values silently default to "shadow" at
+	// runtime (Gate.NewGate), but an explicit validation error is clearer.
+	validClassifierModes := map[string]bool{"disabled": true, "shadow": true, "active": true}
+	if mode := cfg.Analysis.Classifier.Mode; mode != "" && !validClassifierModes[mode] {
+		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
+	}
+
 	// ── Registry validation ──────────────────────────────────────────────────
 	// When models.registry is present, validate that all declared roles resolve
 	// to known registry keys, and that all registry entries have required fields.

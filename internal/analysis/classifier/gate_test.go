@@ -135,3 +135,16 @@ func TestGateLLMErrorFailOpen(t *testing.T) {
 		t.Error("LLM error must fail open (proceed to analysis)")
 	}
 }
+
+func TestGateUnknownModeNormalisedToShadow(t *testing.T) {
+	// A typo like "actve" must not silently become active gating — it should
+	// fall back to shadow (never blocks) with a warning.
+	g := makeGate("actve", nil) // intentional typo
+	s := base()
+	s.RSIDelta = 0 // all below threshold → WOULD_SKIP in shadow
+
+	proceed, _, _ := g.Classify(context.Background(), s)
+	if !proceed {
+		t.Error("unknown mode must normalise to shadow and never block analysis")
+	}
+}

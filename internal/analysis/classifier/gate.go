@@ -20,8 +20,22 @@ type Gate struct {
 	layer2 *LLMClassifier // nil when LLM fallback is disabled
 }
 
+// validModes lists the supported classifier modes.
+var validModes = map[string]struct{}{
+	"disabled": {},
+	"shadow":   {},
+	"active":   {},
+}
+
 // NewGate builds the two-stage gate. layer2 may be nil.
+// Unknown mode values are normalised to "shadow" with a warning to prevent
+// accidental active gating from a configuration typo.
 func NewGate(mode string, layer1 *RuleBased, layer2 *LLMClassifier) *Gate {
+	if _, ok := validModes[mode]; !ok {
+		logger.Warn("classifier gate: unknown mode — defaulting to shadow",
+			"mode", mode, "valid", []string{"disabled", "shadow", "active"})
+		mode = "shadow"
+	}
 	return &Gate{mode: mode, layer1: layer1, layer2: layer2}
 }
 
