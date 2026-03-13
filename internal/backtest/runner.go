@@ -111,7 +111,8 @@ func (r *Runner) LoadCandles(ctx context.Context, ticker string, tf data.Timefra
 
 // coversRange returns true when the cached candle slice spans the full [from,to]
 // window with no obvious gaps. Uses a simple check: first and last candle
-// timestamps are within one trading day of the requested boundaries.
+// timestamps are within two candle-durations of the requested boundaries
+// (tolerance = candleDuration(tf) * 2).
 func coversRange(candles []data.Candle, from, to time.Time, tf data.Timeframe) bool {
 	if len(candles) == 0 {
 		return false
