@@ -52,14 +52,16 @@ const maxATRPct = 5.0
 func Score(tc TickContext, cfg config.AdaptiveDepthConfig) ImpactScore {
 	w := cfg.Weights
 
-	// Normalise each signal to [0, 1].
-	volatility := math.Min(tc.ATRPct/maxATRPct, 1.0)
+	// Normalise each signal to [0, 1]. Both Min and Max clamps are required:
+	// negative ATRPct or ADX (invalid but possible from bad data) must not
+	// produce a negative score that breaks depth-tier logic.
+	volatility := math.Min(math.Max(tc.ATRPct/maxATRPct, 0), 1.0)
 	newsNovelty := 0.0
 	if tc.NewsChanged {
 		newsNovelty = 1.0
 	}
 	riskProximity := math.Min(math.Max(tc.RiskProximityPct, 0), 1.0)
-	trendStrength := math.Min(tc.ADX/50.0, 1.0)
+	trendStrength := math.Min(math.Max(tc.ADX/50.0, 0), 1.0)
 
 	score := w.Volatility*volatility +
 		w.NewsNovelty*newsNovelty +

@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 )
 
 // FingerprintInput carries all dimensions that contribute to the cache key.
@@ -79,7 +80,7 @@ func Build(in FingerprintInput) string {
 		StrategyName:    in.StrategyName,
 		StrategyVersion: in.StrategyVersion,
 		ModelProfile:    in.ModelProfile,
-		Analysts:        in.Analysts,
+		Analysts:        sortedCopy(in.Analysts),
 		Arbiter:         in.Arbiter,
 		RSIBucket:       bucketRSI(in.RSI),
 		EMAGapBucket:    bucketEMAGap(in.EMAGapPct),
@@ -105,8 +106,24 @@ func bucketRSI(rsi float64) int {
 	return int(math.Round(rsi/5.0)) * 5
 }
 
-// bucketEMAGap rounds the EMA gap percentage to the nearest 0.5 step.
-// Returns the rounded bucket index (e.g. 2.25% → bucket 4, representing 2.0%).
+// bucketEMAGap rounds the EMA gap percentage to the nearest 0.5-step bucket index.
+// The bucket index is math.Round(pct / 0.5); for example:
+//   - 1.1% → Round(2.2) = 2   (representing the 1.0% bucket)
+//   - 1.25% → Round(2.5) = 2  (rounds to even → 1.0% bucket)
+//   - 2.25% → Round(4.5) = 4  (rounds to even → 2.0% bucket)
+//   - 2.75% → Round(5.5) = 6  (rounds to even → 3.0% bucket)
 func bucketEMAGap(pct float64) int {
 	return int(math.Round(pct / 0.5)) // 0.5 % steps
+}
+
+// sortedCopy returns a sorted copy of a string slice, leaving the original
+// unmodified. Used to normalise analyst lists before hashing.
+func sortedCopy(ss []string) []string {
+	if len(ss) == 0 {
+		return ss
+	}
+	cp := make([]string, len(ss))
+	copy(cp, ss)
+	sort.Strings(cp)
+	return cp
 }

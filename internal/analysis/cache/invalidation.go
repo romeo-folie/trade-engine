@@ -99,8 +99,15 @@ func NewSweeper(interval time.Duration) *Sweeper {
 }
 
 // Run starts the expiry sweep loop. Blocks until ctx is cancelled.
+// Falls back to a 15-minute interval when the configured interval is <= 0
+// to prevent a panic from time.NewTicker.
 func (s *Sweeper) Run(ctx context.Context) {
-	ticker := time.NewTicker(s.interval)
+	interval := s.interval
+	if interval <= 0 {
+		interval = 15 * time.Minute
+		logger.Warn("cache sweeper: invalid interval, defaulting to 15m", "configured", s.interval)
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

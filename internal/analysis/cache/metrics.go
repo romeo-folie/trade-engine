@@ -8,7 +8,7 @@ import (
 // All fields are updated atomically; safe for concurrent use.
 // Counters are process-lifetime monotonic values — reset only on restart.
 //
-// These counters are exposed to the TUI and reports layers via Snapshot().
+// These counters are exposed to the TUI and reports layers via TakeSnapshot().
 // If Prometheus is added to go.mod in a future phase, these can be bridged
 // to prometheus.Counter via a thin adapter without changing call sites.
 //

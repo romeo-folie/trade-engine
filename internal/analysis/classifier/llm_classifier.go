@@ -80,8 +80,10 @@ func (l *LLMClassifier) SetBaseURL(u string) { l.baseURL = u }
 // Classify sends a minimal prompt and parses SKIP or ANALYZE.
 // Always fails open on error (proceed to analysis, log warning).
 func (l *LLMClassifier) Classify(ctx context.Context, s TickState) (Result, error) {
+	// Mirror Layer-1 novelty logic: only treat as "changed" when the current
+	// hash is non-empty; an empty hash means no news data, not novel news.
 	noveltyStr := "unchanged"
-	if s.NewsHash != s.LastNewsHash {
+	if s.NewsHash != "" && s.NewsHash != s.LastNewsHash {
 		noveltyStr = "changed"
 	}
 	prompt := fmt.Sprintf(classifierPromptTemplate,
