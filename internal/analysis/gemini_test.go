@@ -135,7 +135,9 @@ func TestGeminiClient_Analyze_CustomPrompt(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
 		bodyCh <- body
 		json.NewEncoder(w).Encode(validGeminiResp(payload))
 	}))

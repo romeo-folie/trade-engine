@@ -49,6 +49,10 @@ func TestOpenAIClient_Analyze_Success(t *testing.T) {
 	payload := `{"action":"SELL","confidence":0.78,"size_pct":1.5,"stop_loss":155.0,"take_profit":135.0,"reasoning":"bearish reversal"}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// verify endpoint path
+		if r.URL.Path != "/v1/chat/completions" {
+			t.Errorf("path = %q, want /v1/chat/completions", r.URL.Path)
+		}
 		// verify auth header
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
@@ -60,7 +64,9 @@ func TestOpenAIClient_Analyze_Success(t *testing.T) {
 		}
 		// verify model in request body
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
 		if body["model"] != "gpt-4o" {
 			t.Errorf("model = %v, want gpt-4o", body["model"])
 		}
@@ -70,7 +76,7 @@ func TestOpenAIClient_Analyze_Success(t *testing.T) {
 
 	cfg := config.ModelConfig{Model: "gpt-4o", APIKey: "test-key"}
 	c := NewOpenAIClient(cfg)
-	c.baseURL = srv.URL
+	c.baseURL = srv.URL + "/v1/chat/completions"
 
 	resp, meta, err := c.Analyze(context.Background(), AnalysisRequest{
 		Ticker:    "TSLA",
@@ -136,7 +142,9 @@ func TestOpenAIClient_Analyze_CustomPrompt(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
-		json.NewDecoder(r.Body).Decode(&body)
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
 		bodyCh <- body
 		json.NewEncoder(w).Encode(validOpenAIResp(payload))
 	}))
