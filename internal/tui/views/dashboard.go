@@ -79,7 +79,10 @@ type SignalRow struct {
 //
 // includePredictions controls visibility of prediction strategy rows in
 // dashboard positions + signal feeds (used by issue #145).
-func FetchDashboardData(ctx context.Context, mode string, includePredictions bool) (d DashboardData) {
+//
+// initialCapital is the engine.initial_capital config value; it is used to
+// derive Cash (initial_capital minus open position cost bases) and TotalValue.
+func FetchDashboardData(ctx context.Context, mode string, includePredictions bool, initialCapital float64) (d DashboardData) {
 	d = DashboardData{
 		Mode:       mode,
 		PaperMode:  mode == "paper",
@@ -145,6 +148,16 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			})
 		}
 	}
+
+	// Cash = initial_capital minus the cost basis of all open positions.
+	// Cost basis per position = CurrentValue - UnrealizedPL.
+	// TotalValue = Cash + Invested (mark-to-market).
+	costBasis := d.Invested - d.UnrealizedPnL
+	d.Cash = initialCapital - costBasis
+	if d.Cash < 0 {
+		d.Cash = 0
+	}
+	d.TotalValue = d.Cash + d.Invested
 
 	// Pending signals (manual mode only)
 	if mode == "manual" {

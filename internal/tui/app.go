@@ -384,7 +384,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastPoll = time.Time(msg)
 		ctx := context.Background()
 		includePredictions := predictionsVisible()
-		m.dashData = views.FetchDashboardData(ctx, m.mode, includePredictions)
+		m.dashData = views.FetchDashboardData(ctx, m.mode, includePredictions, initialCapital())
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
 		m.tradeData.Selected = m.selectedTrade
 		m.signalData = views.FetchSignalFeed(ctx, 50, includePredictions)
@@ -574,6 +574,17 @@ func predictionsVisible() bool {
 		return true
 	}
 	return cfg.Markets.Predictions.Enabled
+}
+
+// initialCapital returns the engine.initial_capital config value for portfolio
+// cash/total derivation in the dashboard.
+// Returns 0 on config load failure (cash/total display gracefully as $0).
+func initialCapital() float64 {
+	cfg, err := config.Load()
+	if err != nil {
+		return 0
+	}
+	return cfg.Engine.InitialCapital
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
