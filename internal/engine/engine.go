@@ -226,10 +226,11 @@ func (e *Engine) tick(ctx context.Context) error {
 	e.monitorPositions(ctx)
 
 	// Flush Telegram batch at the end of each tick (sends per-tick summary).
-	// Give asynchronous event subscribers a brief moment to process events into
-	// the batcher before flushing.
+	// Note: bus event delivery is asynchronous, so events published late in the
+	// tick may arrive after FlushBatch() runs and appear in the next batch.
+	// A deterministic per-tick fence would require an explicit "tick done" event;
+	// this best-effort flush is sufficient for current observability needs.
 	if e.batchFlusher != nil {
-		time.Sleep(100 * time.Millisecond)
 		e.batchFlusher.FlushBatch()
 	}
 
@@ -257,21 +258,16 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 		}
 	}
 
-	// Determine history window: use strategy-specific cap from config if set,
-	// otherwise fall back to the global 2-year window.
-	// Use the ticker's primary strategy (first in watchlist strategies list).
+	// Determine the ticker's primary strategy for prompt-context capping.
+	// NOTE: HistoryWindowByStrategy caps how many candles reach the prompt
+	// (applied in runAnalysis), NOT the DB fetch window. We always fetch 2 years
+	// to ensure indicators like EMA200/ADX have sufficient warmup history.
 	primaryStrategy := "trend_following"
 	if len(strategies) > 0 {
 		primaryStrategy = strategies[0]
 	}
 
 	historyFrom := time.Now().AddDate(-2, 0, 0)
-	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n, ok := windows[primaryStrategy]; ok && n > 0 {
-			// n candles at daily frequency ≈ n trading days
-			historyFrom = time.Now().AddDate(0, 0, -n)
-		}
-	}
 	candles, err := store.GetCandles(ctx, ticker, primaryTF,
 		historyFrom, time.Now())
 	if err != nil {
@@ -307,12 +303,21 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	e.fetchAndStoreNews(ctx, ticker)
 
 	// Material-change gate: skip LLM analysis when nothing has changed.
-	newsItems, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
-	headlines := make([]string, 0, len(newsItems))
-	for _, n := range newsItems {
-		headlines = append(headlines, n.Headline)
+	// On news query error treat as "news unknown" — use a unique hash so the
+	// gate never wrongly fires NO_MATERIAL_CHANGE due to a transient DB failure.
+	newsItems, newsErr := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	var newsHash string
+	if newsErr != nil {
+		logger.Warn("news query failed — treating as changed for material-change gate",
+			"ticker", ticker, "err", newsErr.Error())
+		newsHash = fmt.Sprintf("error:%d", time.Now().UnixNano())
+	} else {
+		headlines := make([]string, 0, len(newsItems))
+		for _, n := range newsItems {
+			headlines = append(headlines, n.Headline)
+		}
+		newsHash = NewsDigestHash(headlines)
 	}
-	newsHash := NewsDigestHash(headlines)
 
 	e.tickerStateMu.Lock()
 	prev := e.tickerState[ticker]
@@ -368,10 +373,18 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	// Build candle snapshots (most-recent-first for prompt context).
-	// Cap to MaxCandlesPerPrompt (default 10) to bound token usage.
+	// Apply the tighter of: MaxCandlesPerPrompt (global cap) and
+	// HistoryWindowByStrategy[strategy] (per-strategy cap).
+	// The DB fetch always covers 2 years for indicator warmup; these caps
+	// only limit what reaches the prompt to bound token usage.
 	candleCap := e.cfg.Analysis.MaxCandlesPerPrompt
 	if candleCap <= 0 {
 		candleCap = 10
+	}
+	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
+		if n, ok := windows[strategy]; ok && n > 0 && n < candleCap {
+			candleCap = n
+		}
 	}
 	limit := len(candles)
 	if limit > candleCap {

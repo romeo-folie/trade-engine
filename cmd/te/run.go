@@ -49,6 +49,12 @@ Modes:
 		if err != nil {
 			return err
 		}
+		if errs := config.Validate(cfg); len(errs) > 0 {
+			for _, e := range errs {
+				fmt.Fprintf(os.Stderr, "config error: %s\n", e)
+			}
+			return fmt.Errorf("invalid configuration (%d error(s)); fix config before starting", len(errs))
+		}
 		if err := logger.Init(cfg.Logging.Level, cfg.Logging.Format); err != nil {
 			return err
 		}

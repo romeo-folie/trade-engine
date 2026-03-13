@@ -104,8 +104,11 @@ func Defaults() *Config {
 			// Legacy fields kept for backward compatibility with existing configs.
 			Primary:   ModelConfig{},
 			Secondary: []ModelConfig{},
+			// Consensus disabled by default: AnalyzeEnsemble requires >=2 working
+			// analysts. Users with only one API key configured would get failures
+			// on every tick. Enable explicitly once multiple analysts are set up.
 			Consensus: ConsensusConfig{
-				Enabled:            true,
+				Enabled:            false,
 				FastPathConfidence: 0.80,
 				FastPathMaxSpread:  0.15,
 				Strategy:           "majority",

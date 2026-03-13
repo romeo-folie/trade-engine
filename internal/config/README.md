@@ -111,4 +111,6 @@ Explicit config values always override profile defaults.
 
 The legacy `models.analysts[]`, `models.arbiter`, and `models.primary` fields continue to work when `models.registry` is absent. `AnalystConfigs()` and `ArbiterConfig()` are transparent: they return registry entries when available, legacy fields otherwise.
 
-Legacy `news.extraction_provider/model` and `embeddings.provider/model` are resolved via `models.roles.news_enricher` and `models.roles.embedder` when registry is present.
+Legacy `embeddings.provider/model` resolution via `models.roles.embedder` is not yet implemented; the embeddings worker uses `cfg.Embeddings.Provider/Model` directly.
+
+Legacy `news.extraction_provider/model` is **not** yet resolved via `models.roles.news_enricher`. The engine's `pickExtractionProvider()` still reads `cfg.Markets.News.ExtractionProvider/ExtractionModel` directly. The `news_enricher` role is reserved for a future wiring pass.

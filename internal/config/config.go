@@ -677,11 +677,12 @@ func Validate(cfg *Config) []string {
 		if cfg.Markets.News.ExtractionMaxArticlesPerTick <= 0 {
 			errs = append(errs, "markets.news.extraction_max_articles_per_tick must be > 0 when extraction is enabled")
 		}
-		// When registry is present, news_enricher role is used instead of ExtractionProvider/Model.
-		if cfg.Models.Registry == nil {
-			if cfg.Markets.News.ExtractionProvider != "" && !hasConfiguredModel(cfg, cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel) {
-				errs = append(errs, fmt.Sprintf("markets.news.extraction_provider/model (%s/%s) not found in configured model clients", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel))
-			}
+		// Always validate legacy extraction_provider/model: the engine still uses
+		// cfg.Markets.News.ExtractionProvider/ExtractionModel via pickExtractionProvider()
+		// regardless of whether a model registry is present. The news_enricher registry
+		// role is not yet wired into the extraction path.
+		if cfg.Markets.News.ExtractionProvider != "" && !hasConfiguredModel(cfg, cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel) {
+			errs = append(errs, fmt.Sprintf("markets.news.extraction_provider/model (%s/%s) not found in configured model clients", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel))
 		}
 	}
 
