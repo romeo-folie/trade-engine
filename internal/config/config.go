@@ -273,11 +273,12 @@ func (m *ModelsConfig) AnalystConfigs() []ModelConfig {
 		for _, key := range m.Roles.Analysts {
 			if entry, ok := m.Registry[key]; ok {
 				out = append(out, entry.ModelConfig)
+			} else {
+				// Preserve slice length even on registry miss to alert downstream.
+				out = append(out, ModelConfig{})
 			}
 		}
-		if len(out) > 0 {
-			return out
-		}
+		return out
 	}
 	return m.Analysts
 }

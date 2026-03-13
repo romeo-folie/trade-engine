@@ -32,20 +32,20 @@ type TickerState struct {
 
 // MaterialChangeInput carries current-tick values for the gate check.
 type MaterialChangeInput struct {
-	RSI       float64
-	EMA20     float64
-	Price     float64 // latest close
-	NewsHash  string  // SHA-256 digest of current news headlines
-	Decision  string  // last known decision for this ticker (empty = unknown)
-	Now       time.Time
+	RSI      float64
+	EMA20    float64
+	Price    float64 // latest close
+	NewsHash string  // SHA-256 digest of current news headlines
+	Now      time.Time
 }
 
 // NewsDigestHash returns a SHA-256 hex hash of the concatenated news headlines.
-// Used for fast novelty detection.
+// Headlines are separated by a NUL byte to avoid collision ambiguity.
 func NewsDigestHash(headlines []string) string {
 	h := sha256.New()
 	for _, hl := range headlines {
-		_, _ = fmt.Fprint(h, hl)
+		_, _ = h.Write([]byte(hl))
+		_, _ = h.Write([]byte{0})
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }

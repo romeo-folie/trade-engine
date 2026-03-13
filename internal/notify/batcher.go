@@ -31,10 +31,9 @@ type TickBatcher struct {
 	cfg    config.TelegramConfig
 	sendFn func(text string) error
 
-	mu      sync.Mutex
-	items   []BatchItem
-	timer   *time.Timer
-	flushed bool
+	mu    sync.Mutex
+	items []BatchItem
+	timer *time.Timer
 }
 
 // NewTickBatcher creates a batcher. sendFn is called with the formatted summary text.
@@ -86,7 +85,6 @@ func (b *TickBatcher) Flush() {
 	b.mu.Lock()
 	items := b.items
 	b.items = nil
-	b.flushed = false
 	if b.timer != nil {
 		b.timer.Stop()
 		b.timer = nil

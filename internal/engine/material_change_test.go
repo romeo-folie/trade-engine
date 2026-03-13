@@ -41,7 +41,6 @@ func TestCheckMaterialChange(t *testing.T) {
 				LastAnalysedAt: now.Add(-60 * time.Minute),
 			},
 			in: MaterialChangeInput{
-				Decision: "HOLD",
 				Now:      now,
 			},
 			wantSkip:   true,

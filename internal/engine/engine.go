@@ -211,13 +211,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes []string) {
+		go func(ticker string, timeframes, strategies []string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes)
-		}(item.Ticker, item.Timeframes)
+			e.processStock(ctx, ticker, timeframes, strategies)
+		}(item.Ticker, item.Timeframes, item.Strategies)
 	}
 
 	wg.Wait()
@@ -226,7 +226,10 @@ func (e *Engine) tick(ctx context.Context) error {
 	e.monitorPositions(ctx)
 
 	// Flush Telegram batch at the end of each tick (sends per-tick summary).
+	// Give asynchronous event subscribers a brief moment to process events into
+	// the batcher before flushing.
 	if e.batchFlusher != nil {
+		time.Sleep(100 * time.Millisecond)
 		e.batchFlusher.FlushBatch()
 	}
 
@@ -234,7 +237,8 @@ func (e *Engine) tick(ctx context.Context) error {
 }
 
 // processStock fetches candles, computes indicators, and fetches news for a single stock.
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []string) {
+// strategies is the ticker's configured strategy list (from the watchlist item).
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -255,14 +259,15 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 
 	// Determine history window: use strategy-specific cap from config if set,
 	// otherwise fall back to the global 2-year window.
+	// Use the ticker's primary strategy (first in watchlist strategies list).
+	primaryStrategy := "trend_following"
+	if len(strategies) > 0 {
+		primaryStrategy = strategies[0]
+	}
+
 	historyFrom := time.Now().AddDate(-2, 0, 0)
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		// Determine active strategy from engine mode; default to trend_following.
-		activeStrategy := "trend_following"
-		if e.cfg.Engine.Mode == "mean_reversion" || e.cfg.Engine.Mode == "momentum" {
-			activeStrategy = e.cfg.Engine.Mode
-		}
-		if n, ok := windows[activeStrategy]; ok && n > 0 {
+		if n, ok := windows[primaryStrategy]; ok && n > 0 {
 			// n candles at daily frequency ≈ n trading days
 			historyFrom = time.Now().AddDate(0, 0, -n)
 		}
@@ -324,29 +329,32 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 		NewsHash: newsHash,
 		Now:      time.Now(),
 	}
-	if prev != nil {
-		mcIn.Decision = prev.LastDecision
-	}
 
 	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, e.cfg.Analysis)
 	if skip {
-		logger.Info("analysis skipped — no material change",
+		msg := "analysis skipped — no material change"
+		if skipReason == SkipReasonHoldCooldown {
+			msg = "analysis skipped — HOLD cooldown active"
+		}
+		logger.Info(msg,
 			"ticker", ticker,
 			"reason", string(skipReason),
 			"rsi_delta", fmt.Sprintf("%.2f", deltas["rsi_delta"]),
 			"ema_gap_delta_pct", fmt.Sprintf("%.2f", deltas["ema_gap_delta_pct"]),
 			"price_move_pct", fmt.Sprintf("%.2f", deltas["price_move_pct"]),
+			"hold_elapsed_min", fmt.Sprintf("%.1f", deltas["hold_elapsed_min"]),
+			"hold_cooldown_min", fmt.Sprintf("%.0f", deltas["hold_cooldown_min"]),
 		)
 		return
 	}
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), candles, set, newsHash)
+	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash)
 }
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string) {
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string) {
 	if set == nil {
 		return
 	}
@@ -355,9 +363,8 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 		return
 	}
 
-	strategy := "default"
-	if e.cfg.Engine.Mode != "" {
-		strategy = e.cfg.Engine.Mode
+	if strategy == "" {
+		strategy = "trend_following"
 	}
 
 	// Build candle snapshots (most-recent-first for prompt context).
