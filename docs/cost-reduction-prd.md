@@ -144,11 +144,11 @@ models:
 ### Migration notes
 
 The following legacy config fields are **removed** and resolved through `roles` instead:
-- `models.analysts[]` → `roles.analysts`
-- `models.arbiter` → `roles.arbiter`
+- `models.analysts[]` → `models.roles.analysts`
+- `models.arbiter` → `models.roles.arbiter`
 - `models.primary` → removed (superseded by adaptive depth tier selection)
-- `news.extraction_provider` + `news.extraction_model` → `roles.news_enricher`
-- `embeddings.provider` + `embeddings.model` → `roles.embedder`
+- `news.extraction_provider` + `news.extraction_model` → `models.roles.news_enricher`
+- `embeddings.provider` + `embeddings.model` → `models.roles.embedder`
 
 ### Fallback logic
 
@@ -182,7 +182,7 @@ A classifier gate runs before any analyst call.
 Evaluates the material-change conditions above deterministically. Skip if all below threshold.
 
 **Layer 2 — LLM fallback (only when Layer 1 is ambiguous):**
-When one or more indicators are marginally changed, a minimal prompt is sent to `roles.classifier` (gpt-4o-mini):
+When one or more indicators are marginally changed, a minimal prompt is sent to `models.roles.classifier` (gpt-4o-mini):
 
 ```
 You are a trading signal filter.
@@ -357,7 +357,7 @@ User-facing cost controls. Depends on Epic 2.
 |------|-----------|
 | Classifier over-prunes, misses signals | Shadow mode first; tunable thresholds; skip-rate monitoring |
 | Cache returns stale decisions | TTL + forced refresh on volatility/news shock; fail-open |
-| Gemini 3.1 Pro Preview unavailable | Registry fallback to gemini-2.5-flash on 429/503 |
+| Gemini 3.1 Pro Preview unavailable | Registry fallback to `gemini_flash` registry entry on 429/503 |
 | Budget mode degrades quality silently | Active profile displayed in TUI; auto-degrade sends Telegram notice |
 
 ---
