@@ -2,7 +2,6 @@ package backtest
 
 import (
 	"sync"
-	"sync/atomic"
 	"testing"
 )
 
@@ -72,5 +71,4 @@ func TestPromptCache_ConcurrentCounters(t *testing.T) {
 	}
 }
 
-// suppress unused import
-var _ = atomic.Int64{}
+

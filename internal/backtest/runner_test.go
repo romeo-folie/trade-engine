@@ -32,7 +32,7 @@ func TestCoversRange_ExactBoundary(t *testing.T) {
 }
 
 func TestCoversRange_WithinTolerance(t *testing.T) {
-	// tolerance for 1d is 2 days; shift boundaries by 1 day — should still cover
+	// tolerance for 1d is 2 × 24h = 48h; shift boundaries by 12h — should still cover
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC)
 	candles := []data.Candle{
@@ -95,7 +95,7 @@ func TestCandleDuration(t *testing.T) {
 func newPos(sl, tp float64) *openPos {
 	return &openPos{
 		ticker:     "TEST",
-		direction:  "long",
+		direction:  "buy",
 		entryTS:    time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC),
 		entryPrice: 100,
 		quantity:   10,
