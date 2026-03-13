@@ -21,6 +21,7 @@ const openAIAPIURL = "https://api.openai.com/v1/chat/completions"
 type OpenAIClient struct {
 	cfg        config.ModelConfig
 	apiKey     string
+	baseURL    string // overrideable for tests; defaults to openAIAPIURL
 	httpClient *http.Client
 }
 
@@ -33,7 +34,7 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	return &OpenAIClient{cfg: cfg, apiKey: apiKey, httpClient: &http.Client{Timeout: timeout}}
+	return &OpenAIClient{cfg: cfg, apiKey: apiKey, baseURL: openAIAPIURL, httpClient: &http.Client{Timeout: timeout}}
 }
 
 func (c *OpenAIClient) ProviderName() string { return "openai" }
@@ -80,7 +81,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("openai marshal: %w", err)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, openAIAPIURL, bytes.NewReader(bodyBytes))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("openai build request: %w", err)
 	}
