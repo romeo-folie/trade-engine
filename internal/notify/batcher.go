@@ -61,7 +61,11 @@ func (b *TickBatcher) Add(item BatchItem) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if len(b.items) >= b.cfg.MaxItemsPerBatch {
+	maxItems := b.cfg.MaxItemsPerBatch
+	if maxItems <= 0 {
+		maxItems = 20 // safe default if not configured
+	}
+	if len(b.items) >= maxItems {
 		return // cap enforced
 	}
 

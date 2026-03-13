@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -39,13 +40,18 @@ type MaterialChangeInput struct {
 	Now      time.Time
 }
 
-// NewsDigestHash returns a SHA-256 hex hash of the concatenated news headlines.
-// Headlines are separated by a NUL byte to avoid collision ambiguity.
+// NewsDigestHash returns a SHA-256 hex hash of the sorted, NUL-delimited
+// headlines. Sorting makes the hash order-independent so identical headline
+// sets always produce the same digest regardless of DB query row order.
 func NewsDigestHash(headlines []string) string {
+	sorted := make([]string, len(headlines))
+	copy(sorted, headlines)
+	sort.Strings(sorted)
+
 	h := sha256.New()
-	for _, hl := range headlines {
+	for _, hl := range sorted {
 		_, _ = h.Write([]byte(hl))
-		_, _ = h.Write([]byte{0})
+		_, _ = h.Write([]byte{0}) // NUL delimiter prevents ["ab","c"] == ["a","bc"]
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))
 }

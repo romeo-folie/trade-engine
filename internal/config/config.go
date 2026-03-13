@@ -593,6 +593,33 @@ func Validate(cfg *Config) []string {
 	// When models.registry is present, validate that all declared roles resolve
 	// to known registry keys, and that all registry entries have required fields.
 	if cfg.Models.Registry != nil {
+		// Collect registry keys that are actually referenced by roles (+ their fallbacks).
+		// Only these need api_key_env set; unused registry entries may intentionally
+		// lack keys (e.g. template entries or future models).
+		referencedKeys := make(map[string]struct{})
+		addWithFallback := func(key string) {
+			for key != "" {
+				if _, seen := referencedKeys[key]; seen {
+					break
+				}
+				referencedKeys[key] = struct{}{}
+				if e, ok := cfg.Models.Registry[key]; ok {
+					key = e.Fallback
+				} else {
+					break
+				}
+			}
+		}
+		for _, k := range cfg.Models.Roles.Analysts {
+			addWithFallback(k)
+		}
+		for _, k := range []string{
+			cfg.Models.Roles.Arbiter, cfg.Models.Roles.Classifier,
+			cfg.Models.Roles.NewsEnricher, cfg.Models.Roles.Embedder,
+		} {
+			addWithFallback(k)
+		}
+
 		// Validate all registry entries have provider + model.
 		for key, entry := range cfg.Models.Registry {
 			if entry.Provider == "" {
@@ -607,9 +634,11 @@ func Validate(cfg *Config) []string {
 					errs = append(errs, fmt.Sprintf("models.registry.%s: fallback key %q not found in registry", key, entry.Fallback))
 				}
 			}
-			// Validate env var is set.
-			if entry.APIKeyEnv != "" && os.Getenv(entry.APIKeyEnv) == "" {
-				errs = append(errs, fmt.Sprintf("env var %s (models.registry.%s.api_key_env) is not set", entry.APIKeyEnv, key))
+			// Only require api_key_env for keys actually used by a configured role.
+			if _, referenced := referencedKeys[key]; referenced {
+				if entry.APIKeyEnv != "" && os.Getenv(entry.APIKeyEnv) == "" {
+					errs = append(errs, fmt.Sprintf("env var %s (models.registry.%s.api_key_env) is not set", entry.APIKeyEnv, key))
+				}
 			}
 		}
 		// Validate analyst roles resolve.
@@ -750,6 +779,7 @@ func hasConfiguredModel(cfg *Config, provider, model string) bool {
 		return true
 	}
 
+	// Check legacy fields.
 	for _, m := range cfg.Models.Analysts {
 		if match(m) {
 			return true
@@ -762,6 +792,17 @@ func hasConfiguredModel(cfg *Config, provider, model string) bool {
 		if match(m) {
 			return true
 		}
+	}
+
+	// Also check registry-derived configs so validation works when the registry
+	// is the sole source of model configuration.
+	for _, m := range cfg.Models.AnalystConfigs() {
+		if match(m) {
+			return true
+		}
+	}
+	if arbiter := cfg.Models.ArbiterConfig(); match(arbiter) {
+		return true
 	}
 	return false
 }

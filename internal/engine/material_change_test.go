@@ -154,12 +154,23 @@ func TestCheckMaterialChange(t *testing.T) {
 func TestNewsDigestHash(t *testing.T) {
 	h1 := NewsDigestHash([]string{"A", "B"})
 	h2 := NewsDigestHash([]string{"A", "B"})
-	h3 := NewsDigestHash([]string{"B", "A"})
+	h3 := NewsDigestHash([]string{"B", "A"}) // same set, different order
+	h4 := NewsDigestHash([]string{"ab", "c"})
+	h5 := NewsDigestHash([]string{"a", "bc"}) // different split, same bytes without delimiter
 
+	// Identical input → identical hash.
 	if h1 != h2 {
 		t.Errorf("identical headlines produced different hashes")
 	}
-	if h1 == h3 {
-		t.Errorf("different headline order produced same hash")
+	// Order-independent: ["A","B"] == ["B","A"].
+	if h1 != h3 {
+		t.Errorf("same headline set in different order should produce same hash (sort-stable)")
 	}
+	// NUL delimiter prevents hash collisions between different splits.
+	if h4 == h5 {
+		t.Errorf("different headline splits should produce different hashes (NUL delimiter)")
+	}
+	// Empty list should not panic.
+	_ = NewsDigestHash(nil)
+	_ = NewsDigestHash([]string{})
 }
