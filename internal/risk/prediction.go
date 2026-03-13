@@ -29,7 +29,7 @@ type PredictionCheckInput struct {
 
 	// Prediction-specific market data
 	Spread             float64   // bid-ask spread as fraction of mid-price (0.05 = 5%)
-	Volume24h          float64   // 24-hour trading volume (USD)
+	Volume24h          float64   // 24-hour volume; units are provider-dependent (e.g. Kalshi = raw contract count, not USD)
 	ResolutionDeadline time.Time // when the contract resolves (zero = unknown)
 }
 
@@ -115,7 +115,8 @@ func checkPredictionLiquidity(in PredictionCheckInput) CheckResult {
 	if in.Volume24h >= minLiq {
 		return pass(name)
 	}
-	return fail(name, fmt.Sprintf("24h volume $%.0f < minimum $%.0f", in.Volume24h, minLiq))
+	// Avoid implying USD units — volume unit is provider-dependent.
+	return fail(name, fmt.Sprintf("24h volume %.0f < minimum %.0f", in.Volume24h, minLiq))
 }
 
 func checkPredictionSpread(in PredictionCheckInput) CheckResult {
@@ -123,6 +124,11 @@ func checkPredictionSpread(in PredictionCheckInput) CheckResult {
 	maxSpread := in.Cfg.Prediction.MaxSpread
 	if maxSpread <= 0 {
 		return pass(name) // check disabled
+	}
+	// Reject invalid spreads: negative spread indicates inverted quotes (Bid > Ask),
+	// which could silently pass the <= maxSpread gate. Treat as a hard failure.
+	if in.Spread < 0 {
+		return fail(name, fmt.Sprintf("invalid spread %.4f (inverted quotes: Bid > Ask)", in.Spread))
 	}
 	if in.Spread <= maxSpread {
 		return pass(name)

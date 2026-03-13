@@ -344,16 +344,34 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 	var pState portfolio.State
 	if r.portfolio != nil {
 		pState = r.portfolio.CurrentState()
+	} else {
+		// No portfolio tracker: portfolio-based checks (daily loss, drawdown,
+		// cooldown) will see zero values and effectively be skipped. Log a
+		// warning so operators know this risk gate is partially disabled.
+		logger.Warn("prediction risk gate: no portfolio tracker — portfolio-based checks will use zero values")
 	}
-	openTrades, _ := store.GetOpenTrades(ctx)
+
+	openTrades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		// Fail closed: treat open positions as unknown/max to avoid bypassing
+		// the max-open-positions check on a DB error.
+		logger.Warn("prediction risk gate: GetOpenTrades failed — blocking signal (fail closed)", "err", err.Error())
+		return
+	}
 
 	// Compute bid-ask spread as a fraction of mid-price.
+	// Require both Bid and Ask > 0 and Ask >= Bid to guard against inverted
+	// or zero quotes producing a negative/zero spread that bypasses the gate.
 	var spreadFrac float64
-	if contract.Ask > 0 && contract.Bid >= 0 {
+	if contract.Ask > 0 && contract.Bid > 0 && contract.Ask >= contract.Bid {
 		mid := (contract.Ask + contract.Bid) / 2
 		if mid > 0 {
 			spreadFrac = (contract.Ask - contract.Bid) / mid
 		}
+	} else if contract.Ask > 0 || contract.Bid > 0 {
+		// One side is missing or quotes are inverted — set a sentinel negative
+		// value so checkPredictionSpread rejects it explicitly.
+		spreadFrac = -1
 	}
 
 	riskIn := risk.PredictionCheckInput{
