@@ -12,18 +12,103 @@ func Defaults() *Config {
 			InitialCapital:  100000,
 		},
 		Models: ModelsConfig{
-			Primary: ModelConfig{
-				Provider:    "anthropic",
-				Model:       "claude-sonnet-4-5",
-				APIKeyEnv:   "ANTHROPIC_API_KEY",
-				MaxTokens:   4096,
-				Temperature: 0.1,
-				TimeoutSec:  60,
+			Registry: ModelRegistry{
+				"analyst_cheap": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"analyst_mid": {
+					ModelConfig: ModelConfig{
+						Provider:    "google",
+						Model:       "gemini-3.1-pro-preview",
+						APIKeyEnv:   "GEMINI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+					Fallback: "gemini_flash",
+				},
+				"gemini_flash": {
+					ModelConfig: ModelConfig{
+						Provider:    "google",
+						Model:       "gemini-2.5-flash",
+						APIKeyEnv:   "GEMINI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"analyst_frontier": {
+					ModelConfig: ModelConfig{
+						Provider:    "anthropic",
+						Model:       "claude-sonnet-4-6",
+						APIKeyEnv:   "ANTHROPIC_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"arbiter": {
+					ModelConfig: ModelConfig{
+						Provider:    "anthropic",
+						Model:       "claude-sonnet-4-6",
+						APIKeyEnv:   "ANTHROPIC_API_KEY",
+						MaxTokens:   4096,
+						Temperature: 0.1,
+						TimeoutSec:  90,
+					},
+				},
+				"classifier": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o-mini",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   256,
+						Temperature: 0.0,
+						TimeoutSec:  15,
+					},
+				},
+				"news_enricher": {
+					ModelConfig: ModelConfig{
+						Provider:    "openai",
+						Model:       "gpt-4o-mini",
+						APIKeyEnv:   "OPENAI_API_KEY",
+						MaxTokens:   2048,
+						Temperature: 0.1,
+						TimeoutSec:  60,
+					},
+				},
+				"embedder": {
+					ModelConfig: ModelConfig{
+						Provider:    "ollama",
+						Model:       "nomic-embed-text",
+						MaxTokens:   0,
+						Temperature: 0,
+						TimeoutSec:  30,
+					},
+				},
 			},
+			Roles: ModelRoles{
+				Analysts:     []string{"analyst_cheap", "analyst_mid", "analyst_frontier"},
+				Arbiter:      "arbiter",
+				Classifier:   "classifier",
+				NewsEnricher: "news_enricher",
+				Embedder:     "embedder",
+			},
+			// Legacy fields kept for backward compatibility with existing configs.
+			Primary:   ModelConfig{},
 			Secondary: []ModelConfig{},
 			Consensus: ConsensusConfig{
-				Enabled:  false,
-				Strategy: "majority",
+				Enabled:            true,
+				FastPathConfidence: 0.80,
+				FastPathMaxSpread:  0.15,
+				Strategy:           "majority",
 			},
 		},
 		Markets: MarketsConfig{

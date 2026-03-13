@@ -156,8 +156,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 
 	cash := r.cfg.Backtest.InitialCash
 	rfRate := r.cfg.Backtest.RiskFreeRate
-	provider := r.cfg.Models.Primary.Provider
-	modelName := r.cfg.Models.Primary.Model
+	// Use first analyst from registry (or legacy Primary) for backtest model metadata.
+	primaryCfg := r.cfg.Models.Primary
+	if analysts := r.cfg.Models.AnalystConfigs(); len(analysts) > 0 {
+		primaryCfg = analysts[0]
+	}
+	provider := primaryCfg.Provider
+	modelName := primaryCfg.Model
 	if opts.Model != "" {
 		modelName = opts.Model
 	}

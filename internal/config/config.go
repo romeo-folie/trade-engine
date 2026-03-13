@@ -100,10 +100,56 @@ type EngineConfig struct {
 
 // ── Models ────────────────────────────────────────────────────────────────────
 
-// ModelsConfig holds Phase 12 ensemble configuration.
-// Legacy primary/secondary keys are auto-migrated to analysts[] on load.
+// ModelConfig describes a single model endpoint.
+type ModelConfig struct {
+	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
+	Model       string  `yaml:"model"`
+	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
+	APIKey      string  `yaml:"-"`           // resolved at runtime, never serialised
+	MaxTokens   int     `yaml:"max_tokens"`
+	Temperature float64 `yaml:"temperature"`
+	TimeoutSec  int     `yaml:"timeout_sec"`
+}
+
+// ModelRegistryEntry extends ModelConfig with an optional fallback registry key.
+// The fallback key is used when the primary model returns HTTP 429 or 503.
+type ModelRegistryEntry struct {
+	ModelConfig `yaml:",inline"`
+	// Fallback is the registry key to use on 429/503. One hop only — no chains.
+	Fallback string `yaml:"fallback,omitempty"`
+}
+
+// ModelRegistry is a named map of model entries. Keys are role-agnostic labels
+// (e.g. "analyst_cheap", "gemini_flash") that can be referenced by ModelRoles.
+type ModelRegistry map[string]ModelRegistryEntry
+
+// ModelRoles maps system roles to registry keys.
+// Each role is resolved to a ModelConfig via ModelRegistry at runtime.
+type ModelRoles struct {
+	// Analysts is an ordered list of registry keys used as ensemble analysts.
+	// Ordering determines adaptive depth tier: [cheap, mid, frontier].
+	Analysts []string `yaml:"analysts,omitempty"`
+	// Arbiter is the registry key for the arbiter model.
+	Arbiter string `yaml:"arbiter,omitempty"`
+	// Classifier is the registry key for the two-stage classifier LLM.
+	Classifier string `yaml:"classifier,omitempty"`
+	// NewsEnricher is the registry key for knowledge-graph entity extraction.
+	NewsEnricher string `yaml:"news_enricher,omitempty"`
+	// Embedder is the registry key for the embedding model.
+	Embedder string `yaml:"embedder,omitempty"`
+}
+
+// ModelsConfig holds all model configuration.
+// When models.registry + models.roles are present they take precedence.
+// Legacy analysts[]/arbiter/primary fields are kept for backward compatibility
+// and are auto-migrated to analysts[] on load if registry is absent.
 type ModelsConfig struct {
-	// Phase 12 fields.
+	// Registry declares all named model entries used anywhere in the system.
+	Registry ModelRegistry `yaml:"registry,omitempty"`
+	// Roles maps system roles to registry keys.
+	Roles ModelRoles `yaml:"roles,omitempty"`
+
+	// Phase 12 fields (legacy — used when registry is absent).
 	Analysts []ModelConfig `yaml:"analysts,omitempty"`
 	Arbiter  ModelConfig   `yaml:"arbiter,omitempty"`
 
@@ -114,14 +160,92 @@ type ModelsConfig struct {
 	Consensus ConsensusConfig `yaml:"consensus"`
 }
 
-type ModelConfig struct {
-	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
-	Model       string  `yaml:"model"`
-	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
-	APIKey      string  `yaml:"-"`           // resolved at runtime, never serialised
-	MaxTokens   int     `yaml:"max_tokens"`
-	Temperature float64 `yaml:"temperature"`
-	TimeoutSec  int     `yaml:"timeout_sec"`
+// Resolve returns the ModelConfig for the given registry key.
+// Returns an error if the key is not found in the registry.
+func (m *ModelsConfig) Resolve(key string) (ModelConfig, error) {
+	if m.Registry == nil {
+		return ModelConfig{}, fmt.Errorf("models.registry is not configured (key %q)", key)
+	}
+	entry, ok := m.Registry[key]
+	if !ok {
+		return ModelConfig{}, fmt.Errorf("registry key %q not found in models.registry", key)
+	}
+	return entry.ModelConfig, nil
+}
+
+// ResolveRole returns the ModelConfig for the given role name (e.g. "classifier").
+// It looks up the role in models.roles, then resolves the key in models.registry.
+func (m *ModelsConfig) ResolveRole(role string) (ModelConfig, error) {
+	key := m.roleKey(role)
+	if key == "" {
+		return ModelConfig{}, fmt.Errorf("role %q is not defined in models.roles", role)
+	}
+	return m.Resolve(key)
+}
+
+// ResolveFallback returns the fallback ModelConfig for a registry key, if one is defined.
+// Used by model clients when the primary model returns HTTP 429 or 503.
+func (m *ModelsConfig) ResolveFallback(key string) (ModelConfig, bool) {
+	if m.Registry == nil {
+		return ModelConfig{}, false
+	}
+	entry, ok := m.Registry[key]
+	if !ok || entry.Fallback == "" {
+		return ModelConfig{}, false
+	}
+	fallbackEntry, ok := m.Registry[entry.Fallback]
+	if !ok {
+		return ModelConfig{}, false
+	}
+	return fallbackEntry.ModelConfig, true
+}
+
+// RegistryKeyForRole returns the registry key for a given role name.
+func (m *ModelsConfig) RegistryKeyForRole(role string) string {
+	return m.roleKey(role)
+}
+
+func (m *ModelsConfig) roleKey(role string) string {
+	switch role {
+	case "arbiter":
+		return m.Roles.Arbiter
+	case "classifier":
+		return m.Roles.Classifier
+	case "news_enricher":
+		return m.Roles.NewsEnricher
+	case "embedder":
+		return m.Roles.Embedder
+	default:
+		return ""
+	}
+}
+
+// AnalystConfigs returns the ordered list of analyst ModelConfigs.
+// Uses registry roles when available; falls back to legacy Analysts[] field.
+func (m *ModelsConfig) AnalystConfigs() []ModelConfig {
+	if m.Registry != nil && len(m.Roles.Analysts) > 0 {
+		out := make([]ModelConfig, 0, len(m.Roles.Analysts))
+		for _, key := range m.Roles.Analysts {
+			if entry, ok := m.Registry[key]; ok {
+				out = append(out, entry.ModelConfig)
+			}
+		}
+		if len(out) > 0 {
+			return out
+		}
+	}
+	return m.Analysts
+}
+
+// ArbiterConfig returns the arbiter ModelConfig.
+// Uses registry roles when available; falls back to legacy Arbiter field.
+func (m *ModelsConfig) ArbiterConfig() ModelConfig {
+	if m.Registry != nil && m.Roles.Arbiter != "" {
+		if entry, ok := m.Registry[m.Roles.Arbiter]; ok {
+			return entry.ModelConfig
+		}
+	}
+	return m.Arbiter
 }
 
 type ConsensusConfig struct {
@@ -412,20 +536,73 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
 	}
 
-	// Phase 12: validate analysts list.
-	if len(cfg.Models.Analysts) == 0 {
-		errs = append(errs, "models.analysts must contain at least one entry (or use legacy models.primary)")
-	} else if len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
-		errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
-	}
-	for i, a := range cfg.Models.Analysts {
-		if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
-			errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
+	// ── Registry validation ──────────────────────────────────────────────────
+	// When models.registry is present, validate that all declared roles resolve
+	// to known registry keys, and that all registry entries have required fields.
+	if cfg.Models.Registry != nil {
+		// Validate all registry entries have provider + model.
+		for key, entry := range cfg.Models.Registry {
+			if entry.Provider == "" {
+				errs = append(errs, fmt.Sprintf("models.registry.%s: provider is required", key))
+			}
+			if entry.Model == "" {
+				errs = append(errs, fmt.Sprintf("models.registry.%s: model is required", key))
+			}
+			// Validate fallback key exists if specified.
+			if entry.Fallback != "" {
+				if _, ok := cfg.Models.Registry[entry.Fallback]; !ok {
+					errs = append(errs, fmt.Sprintf("models.registry.%s: fallback key %q not found in registry", key, entry.Fallback))
+				}
+			}
+			// Validate env var is set.
+			if entry.APIKeyEnv != "" && os.Getenv(entry.APIKeyEnv) == "" {
+				errs = append(errs, fmt.Sprintf("env var %s (models.registry.%s.api_key_env) is not set", entry.APIKeyEnv, key))
+			}
 		}
-	}
-	// Legacy single-model validation.
-	if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
-		errs = append(errs, fmt.Sprintf("env var %s (models.primary.api_key_env) is not set", cfg.Models.Primary.APIKeyEnv))
+		// Validate analyst roles resolve.
+		for i, key := range cfg.Models.Roles.Analysts {
+			if _, ok := cfg.Models.Registry[key]; !ok {
+				errs = append(errs, fmt.Sprintf("models.roles.analysts[%d]: key %q not found in models.registry", i, key))
+			}
+		}
+		// Validate named roles resolve.
+		namedRoles := map[string]string{
+			"arbiter":      cfg.Models.Roles.Arbiter,
+			"classifier":   cfg.Models.Roles.Classifier,
+			"news_enricher": cfg.Models.Roles.NewsEnricher,
+			"embedder":     cfg.Models.Roles.Embedder,
+		}
+		for role, key := range namedRoles {
+			if key == "" {
+				continue // optional roles may be unset
+			}
+			if _, ok := cfg.Models.Registry[key]; !ok {
+				errs = append(errs, fmt.Sprintf("models.roles.%s: key %q not found in models.registry", role, key))
+			}
+		}
+		// Registry path: analyst list comes from roles.
+		analysts := cfg.Models.AnalystConfigs()
+		if len(analysts) == 0 {
+			errs = append(errs, "models.roles.analysts must contain at least one registry key")
+		} else if len(analysts) < 3 && cfg.Models.Consensus.Enabled {
+			errs = append(errs, fmt.Sprintf("models.roles.analysts has %d entries; ensemble works best with 3+", len(analysts)))
+		}
+	} else {
+		// ── Legacy validation (no registry) ─────────────────────────────────
+		if len(cfg.Models.Analysts) == 0 {
+			errs = append(errs, "models.analysts must contain at least one entry (or use models.registry)")
+		} else if len(cfg.Models.Analysts) < 3 && cfg.Models.Consensus.Enabled {
+			errs = append(errs, fmt.Sprintf("models.analysts has %d entries; ensemble works best with 3+ analysts", len(cfg.Models.Analysts)))
+		}
+		for i, a := range cfg.Models.Analysts {
+			if a.APIKeyEnv != "" && os.Getenv(a.APIKeyEnv) == "" {
+				errs = append(errs, fmt.Sprintf("env var %s (models.analysts[%d].api_key_env) is not set", a.APIKeyEnv, i))
+			}
+		}
+		// Legacy single-model validation.
+		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
+			errs = append(errs, fmt.Sprintf("env var %s (models.primary.api_key_env) is not set", cfg.Models.Primary.APIKeyEnv))
+		}
 	}
 
 	if cfg.Markets.Stocks.APIKeyEnv != "" && os.Getenv(cfg.Markets.Stocks.APIKeyEnv) == "" {
@@ -447,8 +624,11 @@ func Validate(cfg *Config) []string {
 		if cfg.Markets.News.ExtractionMaxArticlesPerTick <= 0 {
 			errs = append(errs, "markets.news.extraction_max_articles_per_tick must be > 0 when extraction is enabled")
 		}
-		if cfg.Markets.News.ExtractionProvider != "" && !hasConfiguredModel(cfg, cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel) {
-			errs = append(errs, fmt.Sprintf("markets.news.extraction_provider/model (%s/%s) not found in configured model clients", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel))
+		// When registry is present, news_enricher role is used instead of ExtractionProvider/Model.
+		if cfg.Models.Registry == nil {
+			if cfg.Markets.News.ExtractionProvider != "" && !hasConfiguredModel(cfg, cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel) {
+				errs = append(errs, fmt.Sprintf("markets.news.extraction_provider/model (%s/%s) not found in configured model clients", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel))
+			}
 		}
 	}
 
@@ -472,6 +652,11 @@ func Validate(cfg *Config) []string {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 func resolveEnvVars(cfg *Config) {
+	// Registry entries.
+	for key, entry := range cfg.Models.Registry {
+		entry.ModelConfig.APIKey = resolveEnv(entry.ModelConfig.APIKeyEnv)
+		cfg.Models.Registry[key] = entry
+	}
 	// Legacy primary field.
 	cfg.Models.Primary.APIKey = resolveEnv(cfg.Models.Primary.APIKeyEnv)
 	// Phase 12: analysts + arbiter.
