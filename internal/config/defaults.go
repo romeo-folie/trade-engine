@@ -6,7 +6,7 @@ func Defaults() *Config {
 	return &Config{
 		Engine: EngineConfig{
 			Mode:            "manual",
-			TickIntervalSec: 300,
+			TickIntervalSec: 3600, // 60 min default (cost-reduction Epic 1)
 			MaxWatchlist:    50,
 			DryRun:          false,
 			InitialCapital:  100000,
@@ -224,6 +224,14 @@ func Defaults() *Config {
 		Backtest: BacktestConfig{
 			InitialCash:  100_000,
 			RiskFreeRate: 0.04,
+		},
+		Analysis: AnalysisConfig{
+			MaterialChangeOnly:    true,
+			HoldCooldownMin:       120,
+			RSIDeltaThreshold:     3.0,
+			EMAGapDeltaPct:        0.5,
+			PriceMoveThresholdPct: 0.75,
+			NewsNoveltyEnabled:    true,
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,

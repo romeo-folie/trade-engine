@@ -59,6 +59,11 @@ type Engine struct {
 	newsLastFetched map[string]time.Time
 	newsMu          sync.Mutex
 
+	// tickerState holds the last-seen indicator snapshot per ticker.
+	// Used by the material-change gate (Epic 1 cost reduction).
+	tickerState   map[string]*TickerState
+	tickerStateMu sync.Mutex
+
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
 }
@@ -121,6 +126,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		enricher:        knowledge.NewEnricher(cfg, callFn),
 		embedder:        emb,
 		newsLastFetched: make(map[string]time.Time),
+		tickerState:     make(map[string]*TickerState),
 		mode:            mode,
 	}
 }
@@ -268,13 +274,52 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 	// Fetch news (rate-limited to newsFetchInterval cadence).
 	e.fetchAndStoreNews(ctx, ticker)
 
+	// Material-change gate: skip LLM analysis when nothing has changed.
+	newsItems, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	headlines := make([]string, 0, len(newsItems))
+	for _, n := range newsItems {
+		headlines = append(headlines, n.Headline)
+	}
+	newsHash := NewsDigestHash(headlines)
+
+	e.tickerStateMu.Lock()
+	prev := e.tickerState[ticker]
+	e.tickerStateMu.Unlock()
+
+	latestClose := 0.0
+	if len(candles) > 0 {
+		latestClose = candles[len(candles)-1].Close
+	}
+	mcIn := MaterialChangeInput{
+		RSI:      set.RSI,
+		EMA20:    set.EMA20,
+		Price:    latestClose,
+		NewsHash: newsHash,
+		Now:      time.Now(),
+	}
+	if prev != nil {
+		mcIn.Decision = prev.LastDecision
+	}
+
+	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, e.cfg.Analysis)
+	if skip {
+		logger.Info("analysis skipped — no material change",
+			"ticker", ticker,
+			"reason", string(skipReason),
+			"rsi_delta", fmt.Sprintf("%.2f", deltas["rsi_delta"]),
+			"ema_gap_delta_pct", fmt.Sprintf("%.2f", deltas["ema_gap_delta_pct"]),
+			"price_move_pct", fmt.Sprintf("%.2f", deltas["price_move_pct"]),
+		)
+		return
+	}
+
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), candles, set)
+	e.runAnalysis(ctx, ticker, string(primaryTF), candles, set, newsHash)
 }
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, candles []data.Candle, set *indicators.IndicatorSet) {
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string) {
 	if set == nil {
 		return
 	}
@@ -308,9 +353,11 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	}
 
 	// Load recent news from the store for prompt inclusion.
-	newsItems, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
-	snippets := make([]analysis.NewsSnippet, 0, len(newsItems))
-	for _, n := range newsItems {
+	// Note: newsItems also fetched by processStock for the material-change gate;
+	// this second query is a lightweight store read (no API call).
+	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
+	snippets := make([]analysis.NewsSnippet, 0, len(recentNews))
+	for _, n := range recentNews {
 		snippets = append(snippets, analysis.NewsSnippet{
 			Headline:    n.Headline,
 			Source:      n.Source,
@@ -424,6 +471,22 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
 	e.generateSignal(ctx, ticker, strategy, candles, resp, analysisID)
+
+	// Update material-change gate state for next tick.
+	latestClose := 0.0
+	if len(candles) > 0 {
+		latestClose = candles[len(candles)-1].Close
+	}
+	e.tickerStateMu.Lock()
+	e.tickerState[ticker] = &TickerState{
+		LastRSI:        set.RSI,
+		LastEMAGapPct:  emaGapPct(latestClose, set.EMA20),
+		LastPrice:      latestClose,
+		LastNewsHash:   newsHash,
+		LastDecision:   string(resp.Action),
+		LastAnalysedAt: time.Now(),
+	}
+	e.tickerStateMu.Unlock()
 }
 
 func min(a, b int) int {

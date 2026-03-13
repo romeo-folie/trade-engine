@@ -27,6 +27,7 @@ type Config struct {
 	Reports       ReportsConfig       `yaml:"reports"`
 	Backtest      BacktestConfig      `yaml:"backtest"`
 	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
+	Analysis      AnalysisConfig      `yaml:"analysis"`
 }
 
 // ── Embeddings ─────────────────────────────────────────────────────────────────
@@ -92,10 +93,40 @@ type EmbeddingsConfig struct {
 
 type EngineConfig struct {
 	Mode            string  `yaml:"mode"`              // manual | auto | paper
-	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 300 (5 min)
+	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 3600 (60 min)
 	MaxWatchlist    int     `yaml:"max_watchlist"`
 	DryRun          bool    `yaml:"dry_run"`
 	InitialCapital  float64 `yaml:"initial_capital"` // starting cash for paper trading (default 100000)
+}
+
+// ── Analysis (cost-reduction gates) ──────────────────────────────────────────
+
+// AnalysisConfig controls the material-change gate and classifier (Epic 1–2).
+type AnalysisConfig struct {
+	// MaterialChangeOnly skips LLM analysis when no material change is detected.
+	// Default: true.
+	MaterialChangeOnly bool `yaml:"material_change_only"`
+
+	// HoldCooldownMin is the minimum minutes to wait before re-analyzing a ticker
+	// whose last decision was HOLD. Default: 120.
+	HoldCooldownMin int `yaml:"hold_cooldown_min"`
+
+	// RSIDeltaThreshold: minimum absolute RSI change to trigger re-analysis.
+	// Default: 3.0.
+	RSIDeltaThreshold float64 `yaml:"rsi_delta_threshold"`
+
+	// EMAGapDeltaPct: minimum change in (price-EMA20)/EMA20 percentage to trigger
+	// re-analysis. Default: 0.5.
+	EMAGapDeltaPct float64 `yaml:"ema_gap_delta_pct"`
+
+	// PriceMoveThresholdPct: minimum price change percentage since last analysis
+	// to trigger re-analysis. Default: 0.75.
+	PriceMoveThresholdPct float64 `yaml:"price_move_threshold_pct"`
+
+	// NewsNoveltyEnabled enables news digest hash comparison. When the hash
+	// is unchanged no new articles have arrived — treated as no material change.
+	// Default: true.
+	NewsNoveltyEnabled bool `yaml:"news_novelty_enabled"`
 }
 
 // ── Models ────────────────────────────────────────────────────────────────────
