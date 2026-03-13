@@ -127,6 +127,20 @@ type AnalysisConfig struct {
 	// is unchanged no new articles have arrived — treated as no material change.
 	// Default: true.
 	NewsNoveltyEnabled bool `yaml:"news_novelty_enabled"`
+
+	// MaxNewsArticlesPerPrompt caps the number of news snippets injected into
+	// the analysis prompt. Articles are ordered newest-first; excess are dropped.
+	// Default: 5.
+	MaxNewsArticlesPerPrompt int `yaml:"max_news_articles_per_prompt"`
+
+	// MaxCandlesPerPrompt caps the number of recent candle snapshots injected
+	// into the analysis prompt. Default: 10.
+	MaxCandlesPerPrompt int `yaml:"max_candles_per_prompt"`
+
+	// HistoryWindowByStrategy defines the maximum candle history window for
+	// each strategy type. Overrides the global historyCandles constant.
+	// Keys match strategy names: trend_following, mean_reversion, momentum.
+	HistoryWindowByStrategy map[string]int `yaml:"history_window_by_strategy"`
 }
 
 // ── Models ────────────────────────────────────────────────────────────────────

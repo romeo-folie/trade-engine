@@ -232,6 +232,13 @@ func Defaults() *Config {
 			EMAGapDeltaPct:        0.5,
 			PriceMoveThresholdPct: 0.75,
 			NewsNoveltyEnabled:    true,
+			MaxNewsArticlesPerPrompt: 5,
+			MaxCandlesPerPrompt:      10,
+			HistoryWindowByStrategy: map[string]int{
+				"trend_following": 20,
+				"mean_reversion":  20,
+				"momentum":        14,
+			},
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,

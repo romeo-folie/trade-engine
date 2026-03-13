@@ -16,8 +16,8 @@ func TestDefaultsEngineMode(t *testing.T) {
 
 func TestDefaultsTickInterval(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Engine.TickIntervalSec != 300 {
-		t.Errorf("default tick_interval_sec = %d, want 300", cfg.Engine.TickIntervalSec)
+	if cfg.Engine.TickIntervalSec != 3600 {
+		t.Errorf("default tick_interval_sec = %d, want 3600", cfg.Engine.TickIntervalSec)
 	}
 }
 

@@ -240,8 +240,22 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes []s
 		}
 	}
 
+	// Determine history window: use strategy-specific cap from config if set,
+	// otherwise fall back to the global 2-year window.
+	historyFrom := time.Now().AddDate(-2, 0, 0)
+	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
+		// Determine active strategy from engine mode; default to trend_following.
+		activeStrategy := "trend_following"
+		if e.cfg.Engine.Mode == "mean_reversion" || e.cfg.Engine.Mode == "momentum" {
+			activeStrategy = e.cfg.Engine.Mode
+		}
+		if n, ok := windows[activeStrategy]; ok && n > 0 {
+			// n candles at daily frequency ≈ n trading days
+			historyFrom = time.Now().AddDate(0, 0, -n)
+		}
+	}
 	candles, err := store.GetCandles(ctx, ticker, primaryTF,
-		time.Now().AddDate(-2, 0, 0), time.Now())
+		historyFrom, time.Now())
 	if err != nil {
 		logger.Warn("get candles for indicators", "ticker", ticker, "err", err.Error())
 		return
@@ -334,9 +348,14 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	}
 
 	// Build candle snapshots (most-recent-first for prompt context).
+	// Cap to MaxCandlesPerPrompt (default 10) to bound token usage.
+	candleCap := e.cfg.Analysis.MaxCandlesPerPrompt
+	if candleCap <= 0 {
+		candleCap = 10
+	}
 	limit := len(candles)
-	if limit > 10 {
-		limit = 10
+	if limit > candleCap {
+		limit = candleCap
 	}
 	snaps := make([]analysis.CandleSnapshot, 0, limit)
 	for i := len(candles) - 1; i >= 0 && len(snaps) < limit; i-- {
@@ -356,8 +375,16 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe string, cand
 	// Note: newsItems also fetched by processStock for the material-change gate;
 	// this second query is a lightweight store read (no API call).
 	recentNews, _ := store.GetRecentNews(ctx, ticker, time.Now().Add(-48*time.Hour))
-	snippets := make([]analysis.NewsSnippet, 0, len(recentNews))
-	for _, n := range recentNews {
+	// Cap news articles to MaxNewsArticlesPerPrompt — newest first, excess dropped.
+	newsCap := e.cfg.Analysis.MaxNewsArticlesPerPrompt
+	if newsCap <= 0 {
+		newsCap = 5
+	}
+	snippets := make([]analysis.NewsSnippet, 0, newsCap)
+	for i, n := range recentNews {
+		if i >= newsCap {
+			break
+		}
 		snippets = append(snippets, analysis.NewsSnippet{
 			Headline:    n.Headline,
 			Source:      n.Source,
