@@ -7,7 +7,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
 
-// defaultPredCfg returns a PredictionRiskConfig with all checks enabled.
+// defaultPredCfg returns a RiskConfig with all prediction checks enabled.
 func defaultPredCfg() config.RiskConfig {
 	return config.RiskConfig{
 		ConfidenceThreshold: 0.65,

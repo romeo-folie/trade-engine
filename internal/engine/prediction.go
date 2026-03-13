@@ -389,12 +389,20 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 
 	if !passed {
 		blockReason := risk.BlockReason(results)
+		// Find the name of the first failing check for structured reporting.
+		failedCheckName := blockReason
+		for _, chk := range results {
+			if !chk.Passed {
+				failedCheckName = chk.Name
+				break
+			}
+		}
 		logger.Warn("prediction signal blocked",
 			"contract", item.Ticker,
 			"reason", blockReason,
 		)
-		// Persist a blocked signal for observability.
-		_, _ = store.InsertSignal(ctx, store.Signal{
+		// Persist a blocked signal for observability — log a WARN if the DB write fails.
+		if _, err := store.InsertSignal(ctx, store.Signal{
 			Ticker:            item.Ticker,
 			Action:            string(resp.Action),
 			Strategy:          "prediction_mispricing",
@@ -405,13 +413,15 @@ func (r *PredictionRunner) emitSignal(ctx context.Context, item store.WatchlistI
 			BlockReason:       blockReason,
 			ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
 			StalePriceMovePct: stalePct,
-		})
+		}); err != nil {
+			logger.Warn("prediction blocked signal insert failed", "contract", item.Ticker, "err", err.Error())
+		}
 		r.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 			Ticker:      item.Ticker,
 			Action:      string(resp.Action),
 			Confidence:  resp.Confidence,
 			BlockReason: blockReason,
-			FailedCheck: blockReason,
+			FailedCheck: failedCheckName,
 		})
 		return
 	}
