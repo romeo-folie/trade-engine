@@ -130,11 +130,13 @@ func TestGeminiClient_Analyze_InvalidJSON(t *testing.T) {
 }
 
 func TestGeminiClient_Analyze_CustomPrompt(t *testing.T) {
-	var capturedBody map[string]any
+	bodyCh := make(chan map[string]any, 1)
 	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"custom"}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&capturedBody)
+		var body map[string]any
+		json.NewDecoder(r.Body).Decode(&body)
+		bodyCh <- body
 		json.NewEncoder(w).Encode(validGeminiResp(payload))
 	}))
 	defer srv.Close()
@@ -151,6 +153,7 @@ func TestGeminiClient_Analyze_CustomPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
+	capturedBody := <-bodyCh
 	// verify system instruction came from CustomSystemPrompt
 	si, _ := capturedBody["systemInstruction"].(map[string]any)
 	parts, _ := si["parts"].([]any)

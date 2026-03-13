@@ -21,7 +21,7 @@ const geminiAPIBaseURL = "https://generativelanguage.googleapis.com/v1beta/model
 type GeminiClient struct {
 	cfg        config.ModelConfig
 	apiKey     string
-	baseURL    string // overrideable for tests; defaults to geminiAPIBaseURL
+	baseURL    string // overridable for tests; defaults to geminiAPIBaseURL
 	httpClient *http.Client
 }
 

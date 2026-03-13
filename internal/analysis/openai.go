@@ -21,7 +21,7 @@ const openAIAPIURL = "https://api.openai.com/v1/chat/completions"
 type OpenAIClient struct {
 	cfg        config.ModelConfig
 	apiKey     string
-	baseURL    string // overrideable for tests; defaults to openAIAPIURL
+	baseURL    string // overridable for tests; defaults to openAIAPIURL
 	httpClient *http.Client
 }
 
