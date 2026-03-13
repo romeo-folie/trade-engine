@@ -2,7 +2,7 @@
 
 LLM-powered algorithmic trading system. Monitors stock and prediction markets, runs AI analysis via Claude (and optionally other models), manages a paper or live portfolio, and delivers signals via a terminal dashboard and Telegram.
 
-**Status:** Phase 2 complete — data pipeline live (market data + indicators + news).
+**Status:** Phases 1–13 complete — full trading system live, paper trading in progress ahead of live deployment.
 
 ## Architecture
 
@@ -13,14 +13,19 @@ graph TD
     DataPipeline -->|candles| Alpaca[Alpaca API]
     DataPipeline -->|news| Finnhub[Finnhub API]
     Engine --> Indicators[Indicator Engine<br/>internal/indicators/]
-    Engine --> Store[PostgreSQL Store<br/>internal/store/]
-    Engine --> Analysis[Analysis Engine<br/>internal/analysis/ — Phase 3]
-    Analysis --> LLM[Claude / GPT / Ollama]
-    Analysis --> Risk[Risk Manager<br/>internal/risk/ — Phase 4]
-    Risk --> Executor[Order Executor<br/>internal/execution/ — Phase 4]
-    Executor -->|paper| AlpacaPaper[Alpaca Paper API]
-    Engine --> TUI[Terminal Dashboard<br/>internal/tui/ — Phase 5]
-    Engine --> Notify[Telegram Bot<br/>internal/notify/ — Phase 6]
+    Engine --> Store[PostgreSQL + pgvector<br/>internal/store/]
+    Engine --> Analysis[Ensemble Analysis<br/>internal/analysis/]
+    Analysis --> LLM[Claude · GPT-4o · Gemini · Ollama]
+    Analysis --> Risk[Risk Manager<br/>internal/risk/]
+    Risk --> Executor[Order Executor<br/>internal/execution/]
+    Executor -->|paper / live| AlpacaBroker[Alpaca Broker API]
+    Engine --> Backtest[Backtesting Engine<br/>internal/backtest/]
+    Engine --> Predictions[Prediction Markets<br/>Polymarket · Kalshi<br/>engine/ + store/ + execution/]
+    Engine --> Knowledge[Knowledge Graph<br/>internal/knowledge/]
+    Engine --> Embeddings[Vector Embeddings<br/>internal/embeddings/]
+    Engine --> TUI[Terminal Dashboard<br/>internal/tui/]
+    Engine --> Notify[Telegram Notifications<br/>internal/notify/]
+    Engine --> Reports[HTML Reports<br/>internal/reports/]
 ```
 
 ## Project Layout
@@ -30,23 +35,22 @@ cmd/te/              — CLI entry point (Cobra commands)
 internal/
   config/            — YAML + env var + DB-override config system
   data/              — Market data providers (Alpaca) + news (Finnhub)
-  engine/            — Core engine loop + market hours scheduler
-  indicators/        — 11 technical indicators (EMA, RSI, MACD, Bollinger, ADX, ATR, OBV, Stochastic, VWAP, ...)
-  store/             — PostgreSQL access layer (pgx/v5)
+  engine/            — Core engine loop, scheduler, prediction runner
+  indicators/        — 20 technical indicators (EMA, RSI, MACD, Bollinger, ADX, ATR, OBV, Stochastic, VWAP, …)
+  store/             — PostgreSQL + pgvector access layer (pgx/v5)
   logger/            — Structured slog dual-output (stdout + file)
-  analysis/          — LLM prompt engine (Phase 3)
-  risk/              — Risk manager (Phase 4)
-  execution/         — Order execution (Phase 4)
-  portfolio/         — Portfolio tracking (Phase 4)
-  tui/               — Bubble Tea dashboard (Phase 5)
-  notify/            — Telegram bot (Phase 6)
-  embeddings/        — pgvector embedding pipeline (Phase 8)
-  knowledge/         — Knowledge graph (Phase 8)
-  backtest/          — Backtesting engine (Phase 7)
-  reports/           — HTML/chart report generation (Phase 13)
-  web/               — Data-flow visualisation server (Phase 14)
-migrations/          — SQL migration files (001–012)
-docs/                — PRD + implementation plan
+  analysis/          — Multi-model ensemble analysis (Claude · GPT-4o · Gemini · Ollama)
+  risk/              — 7-check risk manager (confidence, R/R, position size, drawdown, …)
+  execution/         — PaperExecutor + AlpacaBroker live executor
+  portfolio/         — Portfolio tracker + position monitoring
+  tui/               — Bubble Tea terminal dashboard
+  notify/            — Telegram notifications + signal approval buttons
+  backtest/          — Historical replay engine + prompt cache + metrics
+  embeddings/        — pgvector embedding pipeline (OpenAI / Ollama)
+  knowledge/         — Entity relationship graph + news enrichment
+  reports/           — Self-contained HTML report generation (go-echarts)
+migrations/          — SQL migration files (001–013)
+docs/                — PRD + implementation plan + local-first embeddings guide
 ```
 
 ## Quick Start
@@ -199,14 +203,18 @@ te logs search <query>              Search log file
 |-------|-------------|--------|
 | 1 | Foundation (scaffold, config, migrations, CLI) | ✅ Complete |
 | 2 | Data pipeline (market data, indicators, news) | ✅ Complete |
-| 3 | Analysis engine (LLM integration, prompt engineering) | 🔜 Next |
-| 4 | Trading core (signals, risk, execution, portfolio) | ⏳ Planned |
-| 5 | Terminal dashboard (Bubble Tea TUI) | ⏳ Planned |
-| 6 | Telegram bot + approval flow | ⏳ Planned |
-| 7 | Backtesting engine | ⏳ Planned |
-| 8 | Knowledge graph + embeddings | ⏳ Planned |
-| 9 | Prediction markets (Polymarket + Kalshi) | ⏳ Planned |
-| 10–14 | Consensus, web viz, live trading | ⏳ Planned |
+| 3 | Analysis engine (LLM integration, prompt engineering) | ✅ Complete |
+| 4 | Trading core (signals, risk, execution, portfolio) | ✅ Complete |
+| 5 | Terminal dashboard (Bubble Tea TUI) | ✅ Complete |
+| 6 | Telegram notifications + signal approval flow | ✅ Complete |
+| 7 | Backtesting engine + prompt cache + metrics | ✅ Complete |
+| 8 | HTML reports (go-echarts, offline self-contained) | ✅ Complete |
+| 9 | Prediction markets (Polymarket + Kalshi) | ✅ Complete |
+| 10 | Knowledge graph (entity relationships + news enrichment) | ✅ Complete |
+| 11 | Vector embeddings (pgvector, similar-setup injection) | ✅ Complete |
+| 12 | Multi-model ensemble deliberation (Claude · GPT-4o · Gemini · Ollama) | ✅ Complete |
+| 13 | Go-live operational (paper trading run → live switch) | 🔄 In progress |
+| 14 | Web visualisation dashboard | ⏳ Planned |
 
 ## Module READMEs
 
@@ -215,3 +223,9 @@ te logs search <query>              Search log file
 - [`internal/indicators/`](internal/indicators/) — technical analysis engine
 - [`internal/engine/`](internal/engine/) — core engine loop + scheduler
 - [`internal/store/`](internal/store/) — database access layer
+- [`internal/analysis/`](internal/analysis/) — multi-model ensemble analysis
+- [`internal/backtest/`](internal/backtest/) — historical replay engine
+- [`internal/embeddings/`](internal/embeddings/) — vector embedding pipeline
+- [`internal/knowledge/`](internal/knowledge/) — entity relationship graph
+- [`internal/logger/`](internal/logger/) — structured logger
+- [`internal/reports/`](internal/reports/) — HTML report generation
