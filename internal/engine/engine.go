@@ -159,6 +159,9 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 // On each tick it processes all active watchlist items in parallel.
 // Background goroutines handle signal expiry and data retention.
 func (e *Engine) Run(ctx context.Context) error {
+	if e.cfg.Engine.TickIntervalSec <= 0 {
+		return fmt.Errorf("engine: tick_interval_sec must be > 0, got %d", e.cfg.Engine.TickIntervalSec)
+	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
 
 	// Background: signal expiry + staleness checks.
@@ -200,8 +203,9 @@ func (e *Engine) Run(ctx context.Context) error {
 					logger.Warn("tick error", "err", err.Error())
 				}
 			} else {
-				// Shouldn't normally fire when closed (timer targets nextMarketOpen),
-				// but guard defensively in case of clock skew or DST transitions.
+				// Shouldn't normally fire when closed — NextTickTime routes to
+				// nextMarketOpen() when the market is closed, and to now+interval
+				// when it's open. Guard defensively for clock skew / DST edge cases.
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
 			nextTick = NextTickTime(time.Now(), interval)
