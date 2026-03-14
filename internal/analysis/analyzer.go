@@ -215,6 +215,13 @@ func primaryMeta(results []AnalystResult) ModelCallMeta {
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
+// NewProviderFromConfig builds a standalone ModelProvider from a ModelConfig.
+// Useful for callers outside this package (e.g. the engine's extraction path)
+// that need a provider that is not part of the analyst ensemble.
+func NewProviderFromConfig(cfg config.ModelConfig) ModelProvider {
+	return buildProvider(cfg)
+}
+
 func buildProvider(cfg config.ModelConfig) ModelProvider {
 	switch cfg.Provider {
 	case "anthropic":

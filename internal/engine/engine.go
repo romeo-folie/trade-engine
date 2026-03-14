@@ -86,12 +86,21 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	az := analysis.NewAnalyzer(cfg.Models)
 
 	// Build an enricher call that executes extraction against a single available
-	// analyst at a time (instead of full ensemble mode).
+	// provider (instead of full ensemble mode).
 	//
-	// Why: extraction prompts intentionally return a JSON array, which does not
-	// match AnalysisResponse. Provider analyzers may therefore return a parse error
-	// while still exposing the raw model text in meta.RawResponse. We treat that
-	// as success for enrichment and only fail when no provider returns raw output.
+	// Provider resolution order:
+	//   1. models.roles.news_enricher (registry path) — allows any model to be
+	//      used for extraction independent of the analyst list. This is the
+	//      preferred path when a registry is configured.
+	//   2. pickExtractionProvider (legacy path) — scans analysts for a provider
+	//      matching markets.news.extraction_provider / extraction_model. Used
+	//      when no registry role is configured.
+	//
+	// Why raw response: extraction prompts return a JSON array, which does not
+	// match AnalysisResponse. Provider analyzers may return a parse error while
+	// still exposing the raw model text in meta.RawResponse. We treat that as
+	// success and only fail when no raw output is returned.
+	enricherProvider := resolveEnricherProvider(az, cfg)
 	callFn := knowledge.ExtractionCallFn(func(ctx context.Context, system, user string) (string, error) {
 		req := analysis.AnalysisRequest{
 			Ticker:             "__extraction__",
@@ -99,9 +108,10 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 			CustomUserMessage:  user,
 		}
 
-		provider := pickExtractionProvider(az, cfg)
+		provider := enricherProvider
 		if provider == nil || !provider.IsAvailable() {
-			return "", fmt.Errorf("enricher: extraction provider unavailable (provider=%q model=%q)", cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel)
+			return "", fmt.Errorf("enricher: extraction provider unavailable (provider=%q model=%q)",
+				cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel)
 		}
 		_, meta, err := provider.Analyze(ctx, req)
 		if meta.RawResponse != "" {
@@ -565,6 +575,31 @@ func min(a, b int) int {
 	return b
 }
 
+// resolveEnricherProvider returns the ModelProvider to use for knowledge
+// enrichment/extraction calls.
+//
+// Registry path (preferred): if models.roles.news_enricher is set, resolve it
+// from the registry and build a standalone provider. This decouples extraction
+// from the analyst list — any model can be used regardless of whether it is
+// also configured as an analyst.
+//
+// Legacy fallback: scan analysts for a provider matching
+// markets.news.extraction_provider / extraction_model.
+func resolveEnricherProvider(az *analysis.Analyzer, cfg *config.Config) analysis.ModelProvider {
+	if mc, err := cfg.Models.ResolveRole("news_enricher"); err == nil && mc.Provider != "" {
+		p := analysis.NewProviderFromConfig(mc)
+		if p.IsAvailable() {
+			return p
+		}
+		logger.Warn("news_enricher registry role resolved but provider unavailable — falling back to analyst scan",
+			"provider", mc.Provider, "model", mc.Model)
+	}
+	return pickExtractionProvider(az, cfg)
+}
+
+// pickExtractionProvider scans the analyst providers for one matching the
+// legacy markets.news.extraction_provider / extraction_model fields.
+// Used as a fallback when no models.roles.news_enricher is configured.
 func pickExtractionProvider(az *analysis.Analyzer, cfg *config.Config) analysis.ModelProvider {
 	providers := az.Providers()
 	if len(providers) == 0 {
