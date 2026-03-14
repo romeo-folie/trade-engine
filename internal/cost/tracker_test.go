@@ -113,3 +113,52 @@ func TestTrackerConcurrentSafe(t *testing.T) {
 		t.Errorf("concurrent daily tokens: want 1500, got %d", tr.DailyTokens())
 	}
 }
+
+// TestTrackerRecordInt64Overflow verifies that token addition does not overflow
+// when inputTokens+outputTokens would overflow a 32-bit int.  On 64-bit hosts
+// with int=64 bits this would not overflow anyway, but the cast is now explicit
+// to be safe on 32-bit platforms.
+func TestTrackerRecordInt64Overflow(t *testing.T) {
+	tr := cost.NewTracker()
+	// Use values that would overflow int32 (> 2^31-1 combined).
+	const big = 1<<30 + 1 // 1_073_741_825 each; sum = 2_147_483_650 > MaxInt32
+	tr.Record("openai", "gpt-4o", big, big)
+	want := int64(big)*2
+	if got := tr.DailyTokens(); got != want {
+		t.Errorf("daily tokens: want %d, got %d (possible int32 overflow)", want, got)
+	}
+}
+
+// TestTrackerNewModelEntryNotVisibleAtZero verifies that a concurrent
+// TakeSnapshot cannot observe a brand-new ModelSpend entry with zero tokens.
+// The fix holds t.mu through the first increment for new entries, so any
+// snapshot taken while Record holds the lock either sees the full tokens or
+// does not see the entry at all.
+func TestTrackerNewModelEntryNotVisibleAtZero(t *testing.T) {
+	const iterations = 2000
+	for i := 0; i < iterations; i++ {
+		tr := cost.NewTracker()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			tr.Record("openai", "gpt-4o", 100, 50)
+		}()
+
+		// Spin taking snapshots until the goroutine is done; if we ever see
+		// the model entry with total==0 that is the race condition.
+		for {
+			select {
+			case <-done:
+				goto next
+			default:
+				s := tr.TakeSnapshot()
+				for _, e := range s.ModelBreakdown {
+					if e.Total == 0 {
+						t.Fatalf("iteration %d: observed zero-total ModelBreakdownEntry — new entry visible before increment", i)
+					}
+				}
+			}
+		}
+	next:
+	}
+}

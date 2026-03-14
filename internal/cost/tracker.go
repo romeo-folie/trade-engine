@@ -61,18 +61,28 @@ func NewTracker() *Tracker {
 func (t *Tracker) Record(provider, model string, inputTokens, outputTokens int) {
 	key := provider + "/" + model
 
+	// Hold the mutex across the map lookup *and* the first increment so that
+	// a concurrent TakeSnapshot can never observe a newly added ModelSpend entry
+	// with zero tokens.  For existing entries the mutex is released before
+	// incrementing; that is safe because the entry is already visible with its
+	// accumulated (non-zero) prior values.
 	t.mu.Lock()
 	ms, ok := t.models[key]
 	if !ok {
 		ms = &ModelSpend{Provider: provider, Model: model}
 		t.models[key] = ms
+		ms.InputTokens.Add(int64(inputTokens))
+		ms.OutputTokens.Add(int64(outputTokens))
+		t.mu.Unlock()
+	} else {
+		t.mu.Unlock()
+		ms.InputTokens.Add(int64(inputTokens))
+		ms.OutputTokens.Add(int64(outputTokens))
 	}
-	t.mu.Unlock()
 
-	ms.InputTokens.Add(int64(inputTokens))
-	ms.OutputTokens.Add(int64(outputTokens))
-
-	total := int64(inputTokens + outputTokens)
+	// Cast each operand to int64 before addition to avoid int overflow on
+	// 32-bit platforms or with unexpectedly large token counts.
+	total := int64(inputTokens) + int64(outputTokens)
 	t.dailyTokens.Add(total)
 	t.weeklyTokens.Add(total)
 }

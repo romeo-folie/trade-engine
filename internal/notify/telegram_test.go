@@ -14,11 +14,40 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/events"
 )
 
-// captureServer returns a test HTTP server that captures sent messages.
-func captureServer(t *testing.T) (*httptest.Server, *[]map[string]any) {
+// capturedMsgs is a thread-safe container for messages captured by captureServer.
+// The HTTP handler goroutine appends via add(); the test goroutine reads via Len()/At().
+type capturedMsgs struct {
+	mu   sync.Mutex
+	msgs []map[string]any
+}
+
+func (c *capturedMsgs) add(m map[string]any) {
+	c.mu.Lock()
+	c.msgs = append(c.msgs, m)
+	c.mu.Unlock()
+}
+
+// Len returns the current number of captured messages.
+func (c *capturedMsgs) Len() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.msgs)
+}
+
+// At returns the message at index i.  The caller must ensure i < Len().
+func (c *capturedMsgs) At(i int) map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.msgs[i]
+}
+
+// captureServer returns a test HTTP server that captures sent messages in a
+// thread-safe container.  Using *capturedMsgs (instead of *[]map[string]any)
+// prevents data races when the HTTP handler goroutine appends while the test
+// goroutine reads.
+func captureServer(t *testing.T) (*httptest.Server, *capturedMsgs) {
 	t.Helper()
-	var mu sync.Mutex
-	var messages []map[string]any
+	msgs := &capturedMsgs{}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/sendMessage") {
@@ -26,9 +55,7 @@ func captureServer(t *testing.T) (*httptest.Server, *[]map[string]any) {
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode body: %v", err)
 			}
-			mu.Lock()
-			messages = append(messages, body)
-			mu.Unlock()
+			msgs.add(body)
 			w.WriteHeader(http.StatusOK)
 			w.Write([]byte(`{"ok":true}`))
 			return
@@ -46,7 +73,7 @@ func captureServer(t *testing.T) (*httptest.Server, *[]map[string]any) {
 		}
 		w.WriteHeader(http.StatusNotFound)
 	}))
-	return srv, &messages
+	return srv, msgs
 }
 
 func testBot(t *testing.T, srv *httptest.Server, notifyOn []string) (*TelegramBot, *events.Bus) {
@@ -78,10 +105,10 @@ func TestStartupMessage(t *testing.T) {
 
 	// Wait for startup message.
 	time.Sleep(100 * time.Millisecond)
-	if len(*msgs) < 1 {
+	if msgs.Len() < 1 {
 		t.Fatal("expected startup message")
 	}
-	text := (*msgs)[0]["text"].(string)
+	text := msgs.At(0)["text"].(string)
 	if !strings.Contains(text, "TradeEngine online") {
 		t.Errorf("startup message = %q, want TradeEngine online", text)
 	}
@@ -102,7 +129,7 @@ func TestTradeExecutedNotification(t *testing.T) {
 
 	// Clear startup message.
 	time.Sleep(100 * time.Millisecond)
-	startCount := len(*msgs)
+	startCount := msgs.Len()
 
 	bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
 		TradeID:    "t1",
@@ -114,10 +141,10 @@ func TestTradeExecutedNotification(t *testing.T) {
 	})
 
 	time.Sleep(200 * time.Millisecond)
-	if len(*msgs) <= startCount {
+	if msgs.Len() <= startCount {
 		t.Fatal("expected trade executed message")
 	}
-	text := (*msgs)[startCount]["text"].(string)
+	text := msgs.At(startCount)["text"].(string)
 	if !strings.Contains(text, "AAPL") || !strings.Contains(text, "Trade Executed") {
 		t.Errorf("trade msg = %q", text)
 	}
@@ -137,7 +164,7 @@ func TestTradeClosedNotification(t *testing.T) {
 	defer bot.Stop()
 
 	time.Sleep(100 * time.Millisecond)
-	startCount := len(*msgs)
+	startCount := msgs.Len()
 
 	bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 		TradeID:    "t1",
@@ -151,10 +178,10 @@ func TestTradeClosedNotification(t *testing.T) {
 	})
 
 	time.Sleep(200 * time.Millisecond)
-	if len(*msgs) <= startCount {
+	if msgs.Len() <= startCount {
 		t.Fatal("expected trade closed message")
 	}
-	text := (*msgs)[startCount]["text"].(string)
+	text := msgs.At(startCount)["text"].(string)
 	if !strings.Contains(text, "Trade Closed") || !strings.Contains(text, "TSLA") {
 		t.Errorf("trade closed msg = %q", text)
 	}
@@ -177,7 +204,7 @@ func TestSignalQueuedWithInlineButtons(t *testing.T) {
 	defer bot.Stop()
 
 	time.Sleep(100 * time.Millisecond)
-	startCount := len(*msgs)
+	startCount := msgs.Len()
 
 	bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 		SignalID:   "sig1",
@@ -188,10 +215,10 @@ func TestSignalQueuedWithInlineButtons(t *testing.T) {
 	})
 
 	time.Sleep(200 * time.Millisecond)
-	if len(*msgs) <= startCount {
+	if msgs.Len() <= startCount {
 		t.Fatal("expected signal queued message")
 	}
-	msg := (*msgs)[startCount]
+	msg := msgs.At(startCount)
 	text := msg["text"].(string)
 	if !strings.Contains(text, "Awaiting Approval") || !strings.Contains(text, "GOOG") {
 		t.Errorf("queued msg = %q", text)
@@ -216,7 +243,7 @@ func TestErrorNotification(t *testing.T) {
 	defer bot.Stop()
 
 	time.Sleep(100 * time.Millisecond)
-	startCount := len(*msgs)
+	startCount := msgs.Len()
 
 	bus.Publish(events.ErrorOccurred, events.ErrorPayload{
 		Component: "data",
@@ -225,10 +252,10 @@ func TestErrorNotification(t *testing.T) {
 	})
 
 	time.Sleep(200 * time.Millisecond)
-	if len(*msgs) <= startCount {
+	if msgs.Len() <= startCount {
 		t.Fatal("expected error message")
 	}
-	text := (*msgs)[startCount]["text"].(string)
+	text := msgs.At(startCount)["text"].(string)
 	if !strings.Contains(text, "Error") || !strings.Contains(text, "rate limit") {
 		t.Errorf("error msg = %q", text)
 	}
@@ -249,7 +276,7 @@ func TestNotifyOnFiltering(t *testing.T) {
 	defer bot.Stop()
 
 	time.Sleep(100 * time.Millisecond)
-	startCount := len(*msgs)
+	startCount := msgs.Len()
 
 	// Signal event should be filtered out.
 	bus.Publish(events.SignalGenerated, events.SignalGeneratedPayload{
@@ -259,8 +286,8 @@ func TestNotifyOnFiltering(t *testing.T) {
 	})
 
 	time.Sleep(200 * time.Millisecond)
-	if len(*msgs) != startCount {
-		t.Errorf("expected no signal notification when trade-only, got %d new messages", len(*msgs)-startCount)
+	if msgs.Len() != startCount {
+		t.Errorf("expected no signal notification when trade-only, got %d new messages", msgs.Len()-startCount)
 	}
 }
 
@@ -284,10 +311,10 @@ func TestDailySummary(t *testing.T) {
 		SignalsBlocked:    1,
 	})
 
-	if len(*msgs) < 1 {
+	if msgs.Len() < 1 {
 		t.Fatal("expected daily summary message")
 	}
-	text := (*msgs)[0]["text"].(string)
+	text := msgs.At(0)["text"].(string)
 	if !strings.Contains(text, "Daily Summary") {
 		t.Errorf("daily summary msg = %q", text)
 	}
@@ -305,10 +332,10 @@ func TestDrawdownWarning(t *testing.T) {
 
 	bot.SendDrawdownWarning(8.5, 10.0)
 
-	if len(*msgs) < 1 {
+	if msgs.Len() < 1 {
 		t.Fatal("expected drawdown warning")
 	}
-	text := (*msgs)[0]["text"].(string)
+	text := msgs.At(0)["text"].(string)
 	if !strings.Contains(text, "Drawdown Warning") || !strings.Contains(text, "8.50") {
 		t.Errorf("drawdown msg = %q", text)
 	}
