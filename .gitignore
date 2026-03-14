@@ -1,6 +1,6 @@
 # ─── Compiled binaries ────────────────────────────────────────────────────────
 # Main binary (see Makefile: BINARY := te)
-te
+/te
 
 # ─── Secrets & local config ───────────────────────────────────────────────────
 # Never commit real credentials. Keep config.example.yaml as the tracked template.
