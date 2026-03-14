@@ -141,6 +141,53 @@ type AnalysisConfig struct {
 	// each strategy type. Overrides the global historyCandles constant.
 	// Keys match strategy names: trend_following, mean_reversion, momentum.
 	HistoryWindowByStrategy map[string]int `yaml:"history_window_by_strategy"`
+
+	// Classifier configures the two-stage analysis gate (PRD §7.2).
+	Classifier ClassifierConfig `yaml:"classifier"`
+
+	// AdaptiveDepth configures impact-score-driven analyst tier routing (PRD §7.3).
+	AdaptiveDepth AdaptiveDepthConfig `yaml:"adaptive_depth"`
+}
+
+// ClassifierConfig controls the two-stage classifier gate.
+type ClassifierConfig struct {
+	// Mode: "disabled" | "shadow" | "active". Default: "shadow".
+	// shadow = classifies but does not block; active = gates analysis.
+	Mode string `yaml:"mode"`
+
+	// Layer 1 thresholds — mirror AnalysisConfig for classifier-specific tuning.
+	RSIDeltaThreshold     float64 `yaml:"rsi_delta_threshold"`
+	EMAGapDeltaPct        float64 `yaml:"ema_gap_delta_pct"`
+	PriceMoveThresholdPct float64 `yaml:"price_move_threshold_pct"`
+	HoldCooldownMin       int     `yaml:"hold_cooldown_min"`
+	NewsNoveltyEnabled    bool    `yaml:"news_novelty_enabled"`
+
+	// Layer 2 — LLM fallback for ambiguous cases.
+	LLMFallbackEnabled bool   `yaml:"llm_fallback_enabled"`
+	LLMFallbackModel   string `yaml:"llm_fallback_model"` // registry role key
+}
+
+// AdaptiveDepthConfig controls impact-score-driven analyst tier routing.
+type AdaptiveDepthConfig struct {
+	// Enabled: when false the engine always uses all configured analysts.
+	Enabled bool `yaml:"enabled"`
+
+	// LowThreshold: scores below this → depth 1 (cheapest analyst only).
+	LowThreshold float64 `yaml:"low_threshold"`
+
+	// HighThreshold: scores at or above this → depth 3 (all analysts).
+	HighThreshold float64 `yaml:"high_threshold"`
+
+	// Weights for each impact score input.
+	Weights AdaptiveDepthWeights `yaml:"weights"`
+}
+
+// AdaptiveDepthWeights holds the per-signal weights summing to 1.0.
+type AdaptiveDepthWeights struct {
+	Volatility    float64 `yaml:"volatility"`    // ATR%
+	NewsNovelty   float64 `yaml:"news_novelty"`  // binary or normalised
+	RiskProximity float64 `yaml:"risk_proximity"` // distance to stop/drawdown
+	TrendStrength float64 `yaml:"trend_strength"` // ADX normalised
 }
 
 // ── Models ────────────────────────────────────────────────────────────────────
@@ -587,6 +634,13 @@ func Validate(cfg *Config) []string {
 	validModes := map[string]bool{"manual": true, "auto": true, "paper": true}
 	if !validModes[cfg.Engine.Mode] {
 		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
+	}
+
+	// Validate classifier mode — unknown values silently default to "shadow" at
+	// runtime (Gate.NewGate), but an explicit validation error is clearer.
+	validClassifierModes := map[string]bool{"disabled": true, "shadow": true, "active": true}
+	if mode := cfg.Analysis.Classifier.Mode; mode != "" && !validClassifierModes[mode] {
+		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
 	}
 
 	// ── Registry validation ──────────────────────────────────────────────────
