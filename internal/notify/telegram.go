@@ -391,6 +391,34 @@ func (b *TelegramBot) SendDrawdownWarning(currentDrawdown, maxAllowed float64) {
 	}
 }
 
+// SendImmediate delivers message directly to Telegram, bypassing any batch
+// queue. It satisfies cost.DegradeNotifier for guardrail auto-degrade alerts.
+// ctx is honoured for cancellation — the underlying HTTP call inherits it.
+func (b *TelegramBot) SendImmediate(ctx context.Context, message string) error {
+	url := fmt.Sprintf("%s%s/sendMessage", b.apiBase, b.token)
+	body := map[string]any{
+		"chat_id":    b.chatID,
+		"text":       message,
+		"parse_mode": "Markdown",
+	}
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return fmt.Errorf("telegram SendImmediate: build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("telegram SendImmediate: %s", sanitizeError(err))
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("telegram SendImmediate: API status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 // ── Inline keyboard for approvals ─────────────────────────────────────────────
 
 func inlineKeyboard(signalID string) []byte {

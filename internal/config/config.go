@@ -695,9 +695,11 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
 	}
 
-	// Validate cost profile.
+	// Validate cost profile. Empty string is not valid — Defaults() always sets
+	// "balanced", so an empty Profile at validation time means an explicit blank
+	// was written in YAML, which would break downstream profile logic.
 	validCostProfiles := map[string]bool{"budget": true, "balanced": true, "pro": true}
-	if p := cfg.Cost.Profile; p != "" && !validCostProfiles[p] {
+	if p := cfg.Cost.Profile; !validCostProfiles[p] {
 		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
 	}
 

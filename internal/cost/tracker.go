@@ -28,8 +28,8 @@ type Tracker struct {
 	models map[string]*ModelSpend // key = "provider/model"
 
 	// Lifecycle counters for cost-per-unit calculations.
-	signalsGenerated  atomic.Int64
-	tradesExecuted    atomic.Int64
+	signalsGenerated atomic.Int64
+	tradesExecuted   atomic.Int64
 
 	// Rolling daily/weekly totals (tokens), reset by the guardrail on day/week boundary.
 	dailyTokens  atomic.Int64
@@ -131,22 +131,22 @@ func (t *Tracker) WeekStart() time.Time {
 
 // Snapshot returns a point-in-time telemetry snapshot.
 type Snapshot struct {
-	DailyTokens        int64
-	WeeklyTokens       int64
-	SignalsGenerated    int64
-	TradesExecuted     int64
-	CostPerSignal      float64 // tokens per signal (proxy for cost)
-	CostPerTrade       float64 // tokens per executed trade
-	ModelBreakdown     []ModelBreakdownEntry
+	DailyTokens      int64
+	WeeklyTokens     int64
+	SignalsGenerated int64
+	TradesExecuted   int64
+	CostPerSignal    float64 // tokens per signal (proxy for cost)
+	CostPerTrade     float64 // tokens per executed trade
+	ModelBreakdown   []ModelBreakdownEntry
 }
 
 // ModelBreakdownEntry is one row in the per-model spend summary.
 type ModelBreakdownEntry struct {
-	Provider    string
-	Model       string
-	InputTokens int64
+	Provider     string
+	Model        string
+	InputTokens  int64
 	OutputTokens int64
-	Total       int64
+	Total        int64
 }
 
 // TakeSnapshot returns a consistent Snapshot.
@@ -183,13 +183,13 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 	t.mu.Unlock()
 
 	return Snapshot{
-		DailyTokens:     daily,
-		WeeklyTokens:    weekly,
+		DailyTokens:      daily,
+		WeeklyTokens:     weekly,
 		SignalsGenerated: signals,
-		TradesExecuted:  trades,
-		CostPerSignal:   costPerSignal,
-		CostPerTrade:    costPerTrade,
-		ModelBreakdown:  breakdown,
+		TradesExecuted:   trades,
+		CostPerSignal:    costPerSignal,
+		CostPerTrade:     costPerTrade,
+		ModelBreakdown:   breakdown,
 	}
 }
 

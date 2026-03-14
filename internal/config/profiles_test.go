@@ -111,6 +111,25 @@ func TestProfileUnknownValidation(t *testing.T) {
 	}
 }
 
+// TestProfileEmptyStringIsInvalid verifies that an explicit blank profile (e.g.
+// cost.profile: "" in YAML) is rejected. Defaults() always sets "balanced", so
+// empty means a user intentionally cleared the field, which breaks profile logic.
+func TestProfileEmptyStringIsInvalid(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Cost.Profile = "" // simulate user writing `profile: ""` in YAML
+
+	errs := config.Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.HasPrefix(e, "cost.profile") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected cost.profile validation error for empty string, got: %v", errs)
+	}
+}
+
 func TestProfileDefaultIsBalanced(t *testing.T) {
 	cfg := config.Defaults()
 	if cfg.Cost.Profile != "balanced" {

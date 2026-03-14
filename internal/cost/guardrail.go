@@ -10,7 +10,8 @@ import (
 )
 
 // DegradeNotifier is implemented by any subsystem that can send an immediate
-// (batcher-bypassing) alert on profile degrade. TelegramBot satisfies this.
+// (batcher-bypassing) alert on profile degrade.
+// notify.TelegramBot satisfies this interface via its SendImmediate method.
 type DegradeNotifier interface {
 	SendImmediate(ctx context.Context, message string) error
 }
@@ -20,21 +21,30 @@ var ProfileOrder = []string{"pro", "balanced", "budget"}
 
 // Guardrail checks token spend against configured budgets and triggers
 // auto-degrade when thresholds are crossed. Safe for concurrent use.
+//
+// Degrade fires at most once per budget period: the exceeded flags are set on
+// first threshold crossing and cleared when rollPeriods resets the counters,
+// preventing repeated step-downs on every tick while the budget stays over cap.
 type Guardrail struct {
 	mu       sync.Mutex
 	cfg      *config.CostConfig
 	tracker  *Tracker
 	notifier DegradeNotifier // may be nil
 	profile  string          // active profile, may differ from cfg.Profile after degrade
+
+	// transition-guard: prevents re-firing degrade on every tick while spend
+	// stays above the threshold. Cleared by rollPeriods when counters reset.
+	dailyBudgetExceeded  bool
+	weeklyBudgetExceeded bool
 }
 
 // NewGuardrail creates a guardrail wired to tracker. notifier may be nil.
 func NewGuardrail(cfg *config.CostConfig, tracker *Tracker, notifier DegradeNotifier) *Guardrail {
 	return &Guardrail{
-		cfg:     cfg,
-		tracker: tracker,
+		cfg:      cfg,
+		tracker:  tracker,
 		notifier: notifier,
-		profile: cfg.Profile,
+		profile:  cfg.Profile,
 	}
 }
 
@@ -60,12 +70,17 @@ func (g *Guardrail) Check(ctx context.Context, now time.Time) {
 	daily := g.tracker.DailyTokens()
 	weekly := g.tracker.WeeklyTokens()
 
+	// Only degrade on first threshold crossing — not on every subsequent tick
+	// while spend remains above cap. Flags are cleared by rollPeriods when
+	// counters reset at the next day/week boundary.
 	var reason string
 	switch {
-	case g.cfg.DailyTokenBudget > 0 && daily >= int64(g.cfg.DailyTokenBudget):
+	case g.cfg.DailyTokenBudget > 0 && daily >= int64(g.cfg.DailyTokenBudget) && !g.dailyBudgetExceeded:
 		reason = "daily token budget exceeded"
-	case g.cfg.WeeklyTokenBudget > 0 && weekly >= int64(g.cfg.WeeklyTokenBudget):
+		g.dailyBudgetExceeded = true
+	case g.cfg.WeeklyTokenBudget > 0 && weekly >= int64(g.cfg.WeeklyTokenBudget) && !g.weeklyBudgetExceeded:
 		reason = "weekly token budget exceeded"
+		g.weeklyBudgetExceeded = true
 	default:
 		g.mu.Unlock()
 		return
@@ -98,12 +113,16 @@ func (g *Guardrail) Check(ctx context.Context, now time.Time) {
 }
 
 // rollPeriods resets counters when the day or week has rolled over.
+// The exceeded flags are cleared alongside the counters so the next
+// threshold crossing in the new period triggers a fresh degrade step.
 func (g *Guardrail) rollPeriods(now time.Time) {
 	if truncateDay(now).After(g.tracker.DayStart()) {
 		g.tracker.ResetDaily(now)
+		g.dailyBudgetExceeded = false
 	}
 	if truncateWeek(now).After(g.tracker.WeekStart()) {
 		g.tracker.ResetWeekly(now)
+		g.weeklyBudgetExceeded = false
 	}
 }
 
