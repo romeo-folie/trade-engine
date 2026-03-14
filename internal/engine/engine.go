@@ -160,8 +160,6 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 // Background goroutines handle signal expiry and data retention.
 func (e *Engine) Run(ctx context.Context) error {
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 
 	// Background: signal expiry + staleness checks.
 	go e.runSignalExpiryLoop(ctx)
@@ -170,37 +168,62 @@ func (e *Engine) Run(ctx context.Context) error {
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
 
-	// Run immediately on start, then on every tick.
-	if err := e.tick(ctx); err != nil {
-		logger.Warn("tick error", "err", err.Error())
+	// Startup tick: only run if the market is currently open.
+	// Prior behaviour ran unconditionally, causing a full analysis cycle
+	// on weekends, holidays, and outside trading hours the moment te run
+	// was invoked.
+	if IsMarketOpen(time.Now()) {
+		if err := e.tick(ctx); err != nil {
+			logger.Warn("tick error", "err", err.Error())
+		}
+	} else {
+		nextOpen := nextMarketOpen(time.Now())
+		logger.Info("market closed on startup — skipping initial tick",
+			"next_open_at", nextOpen.In(nyLoc).Format(time.RFC3339),
+		)
 	}
-	logger.Info("engine cycle complete",
-		"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
-		"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
-	)
+
+	// Use a one-shot timer instead of a fixed ticker so the engine sleeps
+	// until the actual next trading time rather than waking every interval
+	// all weekend to log "market closed" and immediately go back to sleep.
+	nextTick := NextTickTime(time.Now(), interval)
+	e.logNextCycle(nextTick)
+	timer := time.NewTimer(time.Until(nextTick))
+	defer timer.Stop()
 
 	for {
 		select {
-		case <-ticker.C:
-			if !IsMarketOpen(time.Now()) {
-				logger.Info("market closed — skipping tick",
-					"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
-					"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
-				)
-				continue
+		case <-timer.C:
+			now := time.Now()
+			if IsMarketOpen(now) {
+				if err := e.tick(ctx); err != nil {
+					logger.Warn("tick error", "err", err.Error())
+				}
+			} else {
+				// Shouldn't normally fire when closed (timer targets nextMarketOpen),
+				// but guard defensively in case of clock skew or DST transitions.
+				logger.Info("market closed — skipping tick (clock skew?)")
 			}
-			if err := e.tick(ctx); err != nil {
-				logger.Warn("tick error", "err", err.Error())
-			}
-			logger.Info("engine cycle complete",
-				"next_cycle_in_sec", e.cfg.Engine.TickIntervalSec,
-				"next_cycle_at", time.Now().Add(interval).Format(time.RFC3339),
-			)
+			nextTick = NextTickTime(time.Now(), interval)
+			e.logNextCycle(nextTick)
+			// Safe to call Reset directly: timer.C was just consumed above.
+			timer.Reset(time.Until(nextTick))
 		case <-ctx.Done():
 			logger.Info("engine loop stopping")
 			return nil
 		}
 	}
+}
+
+// logNextCycle logs the next scheduled tick time and the seconds until it fires.
+// Uses the actual computed next tick (which may be next market open) rather than
+// the fixed tick interval, so logs are accurate over weekends and holidays.
+func (e *Engine) logNextCycle(nextTick time.Time) {
+	wait := time.Until(nextTick)
+	logger.Info("engine cycle complete",
+		"next_cycle_in_sec", int(wait.Seconds()),
+		"next_cycle_at", nextTick.In(nyLoc).Format(time.RFC3339),
+	)
 }
 
 // tick processes all active watchlist items for a single engine cycle.

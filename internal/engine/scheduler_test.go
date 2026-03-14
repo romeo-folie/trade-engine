@@ -72,6 +72,37 @@ func TestNextTickTime(t *testing.T) {
 			t.Errorf("NextTickTime = %v, want %v", got, want)
 		}
 	})
+
+	t.Run("saturday mid-day skips to monday open", func(t *testing.T) {
+		// Regression: prior loop used time.NewTicker (fixed interval) so a
+		// tick scheduled during market hours would fire on Saturday if the
+		// interval bridged the weekend. NextTickTime must jump to Monday 09:30.
+		now := mustParseNY(t, "2024-03-16T12:00:00") // Saturday
+		got := NextTickTime(now, interval)
+		want := mustParseNY(t, "2024-03-18T09:30:00") // Monday
+		if !got.Equal(want) {
+			t.Errorf("NextTickTime(saturday) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("sunday mid-day skips to monday open", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-17T10:00:00") // Sunday
+		got := NextTickTime(now, interval)
+		want := mustParseNY(t, "2024-03-18T09:30:00") // Monday
+		if !got.Equal(want) {
+			t.Errorf("NextTickTime(sunday) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("holiday skips to next trading day", func(t *testing.T) {
+		// 2024-01-15 is MLK Day (observed). Timer should jump to 2024-01-16 09:30.
+		now := mustParseNY(t, "2024-01-15T11:00:00")
+		got := NextTickTime(now, interval)
+		want := mustParseNY(t, "2024-01-16T09:30:00")
+		if !got.Equal(want) {
+			t.Errorf("NextTickTime(holiday) = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestHolidayHelpers(t *testing.T) {
