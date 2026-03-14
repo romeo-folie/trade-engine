@@ -28,6 +28,33 @@ type Config struct {
 	Backtest      BacktestConfig      `yaml:"backtest"`
 	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
 	Analysis      AnalysisConfig      `yaml:"analysis"`
+	Cost          CostConfig          `yaml:"cost"`
+}
+
+// CostConfig controls the user-facing cost profile and budget guardrails.
+type CostConfig struct {
+	// Profile is the active cost profile: "budget" | "balanced" | "pro".
+	// Profile defaults are applied at startup before explicit config values,
+	// so any explicit value in this file always takes precedence.
+	// Default: "balanced".
+	Profile string `yaml:"profile"`
+
+	// DailyTokenBudget is the maximum tokens allowed per calendar day across
+	// all model calls. 0 disables the daily cap. Default: 200000.
+	DailyTokenBudget int `yaml:"daily_token_budget"`
+
+	// WeeklyTokenBudget is the maximum tokens allowed per calendar week. 0
+	// disables the weekly cap. Default: 1200000.
+	WeeklyTokenBudget int `yaml:"weekly_token_budget"`
+
+	// AutoDegradeOnBudgetHit: when true, crossing a budget cap steps the
+	// active profile down one tier (pro → balanced → budget) and sends a
+	// Telegram notification immediately (bypasses the batcher).
+	AutoDegradeOnBudgetHit bool `yaml:"auto_degrade_on_budget_hit"`
+
+	// CacheTTLMin is the analysis cache TTL in minutes. Set by ApplyProfile
+	// (180/120/60 for budget/balanced/pro) and overridable per-user.
+	CacheTTLMin int `yaml:"cache_ttl_min"`
 }
 
 // ── Embeddings ─────────────────────────────────────────────────────────────────
@@ -184,8 +211,8 @@ type AdaptiveDepthConfig struct {
 
 // AdaptiveDepthWeights holds the per-signal weights summing to 1.0.
 type AdaptiveDepthWeights struct {
-	Volatility    float64 `yaml:"volatility"`    // ATR%
-	NewsNovelty   float64 `yaml:"news_novelty"`  // binary or normalised
+	Volatility    float64 `yaml:"volatility"`     // ATR%
+	NewsNovelty   float64 `yaml:"news_novelty"`   // binary or normalised
 	RiskProximity float64 `yaml:"risk_proximity"` // distance to stop/drawdown
 	TrendStrength float64 `yaml:"trend_strength"` // ADX normalised
 }
@@ -551,6 +578,14 @@ func ConfigPath() string {
 
 // Load reads config.yaml (creating from defaults if absent), resolves env vars,
 // and stores the result as the current global config.
+//
+// Load order (guarantees user explicit values always win over profile defaults):
+//  1. Defaults()           — baseline safe values
+//  2. peek cost.profile    — extract profile key only from YAML
+//  3. ApplyProfile()       — overlay profile-specific defaults
+//  4. yaml.Unmarshal()     — user's explicit values overwrite profile defaults
+//  5. migrateModelsConfig  — legacy field migration
+//  6. resolveEnvVars       — substitute environment variables
 func Load() (*Config, error) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -561,7 +596,9 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// First run — create from defaults.
+			// First run: apply profile defaults before saving so the written
+			// file contains the correct profile-driven values.
+			ApplyProfile(cfg)
 			if err := save(cfg, path); err != nil {
 				return nil, fmt.Errorf("create default config: %w", err)
 			}
@@ -569,6 +606,21 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
 	} else {
+		// Peek the cost.profile value from YAML so we can apply profile
+		// defaults before the full unmarshal, ensuring user values win.
+		var peek struct {
+			Cost struct {
+				Profile string `yaml:"profile"`
+			} `yaml:"cost"`
+		}
+		// Ignore peek errors — invalid YAML caught by full unmarshal below.
+		_ = yaml.Unmarshal(data, &peek)
+		if peek.Cost.Profile != "" {
+			cfg.Cost.Profile = peek.Cost.Profile
+		}
+
+		ApplyProfile(cfg)
+
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
@@ -643,6 +695,24 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
 	}
 
+	// Validate cost profile. Empty string is not valid — Defaults() always sets
+	// "balanced", so an empty Profile at validation time means an explicit blank
+	// was written in YAML, which would break downstream profile logic.
+	validCostProfiles := map[string]bool{"budget": true, "balanced": true, "pro": true}
+	if p := cfg.Cost.Profile; !validCostProfiles[p] {
+		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
+	}
+
+	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative
+	// values would silently disable enforcement rather than error.  Zero is
+	// valid (means "no budget cap for this period").
+	if cfg.Cost.DailyTokenBudget < 0 {
+		errs = append(errs, fmt.Sprintf("cost.daily_token_budget must be >= 0, got %d", cfg.Cost.DailyTokenBudget))
+	}
+	if cfg.Cost.WeeklyTokenBudget < 0 {
+		errs = append(errs, fmt.Sprintf("cost.weekly_token_budget must be >= 0, got %d", cfg.Cost.WeeklyTokenBudget))
+	}
+
 	// ── Registry validation ──────────────────────────────────────────────────
 	// When models.registry is present, validate that all declared roles resolve
 	// to known registry keys, and that all registry entries have required fields.
@@ -703,10 +773,10 @@ func Validate(cfg *Config) []string {
 		}
 		// Validate named roles resolve.
 		namedRoles := map[string]string{
-			"arbiter":      cfg.Models.Roles.Arbiter,
-			"classifier":   cfg.Models.Roles.Classifier,
+			"arbiter":       cfg.Models.Roles.Arbiter,
+			"classifier":    cfg.Models.Roles.Classifier,
 			"news_enricher": cfg.Models.Roles.NewsEnricher,
-			"embedder":     cfg.Models.Roles.Embedder,
+			"embedder":      cfg.Models.Roles.Embedder,
 		}
 		for role, key := range namedRoles {
 			if key == "" {

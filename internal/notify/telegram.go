@@ -391,6 +391,15 @@ func (b *TelegramBot) SendDrawdownWarning(currentDrawdown, maxAllowed float64) {
 	}
 }
 
+// SendImmediate delivers message directly to Telegram, bypassing any batch
+// queue. It satisfies cost.DegradeNotifier for guardrail auto-degrade alerts.
+// ctx is honoured for cancellation and is forwarded to the underlying HTTP
+// requests. Retries and 429 back-off are handled via sendMessageCtx, matching
+// the behaviour of the regular sendMessage path.
+func (b *TelegramBot) SendImmediate(ctx context.Context, message string) error {
+	return b.sendMessageCtx(ctx, message, nil)
+}
+
 // ── Inline keyboard for approvals ─────────────────────────────────────────────
 
 func inlineKeyboard(signalID string) []byte {
@@ -426,7 +435,7 @@ func (b *TelegramBot) pollUpdates(ctx context.Context) {
 				return
 			}
 			logger.Warn("telegram: getUpdates failed", "error", sanitizeError(err))
-			if !b.retrySleep(5 * time.Second) {
+			if !sleepWithContext(ctx, 5*time.Second) {
 				return
 			}
 			continue
@@ -518,7 +527,18 @@ func (b *TelegramBot) answerCallback(callbackID, text string) {
 // ── Telegram API helpers ──────────────────────────────────────────────────────
 
 func (b *TelegramBot) sendMessage(text string, replyMarkup []byte) error {
-	url := fmt.Sprintf("%s%s/sendMessage", b.apiBase, b.token)
+	ctx := b.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return b.sendMessageCtx(ctx, text, replyMarkup)
+}
+
+// sendMessageCtx is the canonical send path, shared by sendMessage and
+// SendImmediate. It retries on transient errors and 429s, using ctx for
+// request cancellation so callers can impose their own deadline.
+func (b *TelegramBot) sendMessageCtx(ctx context.Context, text string, replyMarkup []byte) error {
+	apiURL := fmt.Sprintf("%s%s/sendMessage", b.apiBase, b.token)
 	body := map[string]any{
 		"chat_id":    b.chatID,
 		"text":       text,
@@ -531,10 +551,21 @@ func (b *TelegramBot) sendMessage(text string, replyMarkup []byte) error {
 
 	var lastErr error
 	for attempt := range maxRetries {
-		resp, err := b.client.Post(url, "application/json", bytes.NewReader(data))
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewReader(data))
 		if err != nil {
+			return fmt.Errorf("telegram: build request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := b.client.Do(req)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			lastErr = fmt.Errorf("send failed: %v", sanitizeError(err))
-			if !b.retrySleep(retryDelay * time.Duration(attempt+1)) {
+			if !sleepWithContext(ctx, retryDelay*time.Duration(attempt+1)) {
 				return lastErr
 			}
 			continue
@@ -546,7 +577,7 @@ func (b *TelegramBot) sendMessage(text string, replyMarkup []byte) error {
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			lastErr = fmt.Errorf("rate limited (status %d)", resp.StatusCode)
-			if !b.retrySleep(retryDelay * time.Duration(attempt+1)) {
+			if !sleepWithContext(ctx, retryDelay*time.Duration(attempt+1)) {
 				return lastErr
 			}
 			continue
@@ -556,15 +587,15 @@ func (b *TelegramBot) sendMessage(text string, replyMarkup []byte) error {
 	return fmt.Errorf("telegram: max retries exceeded: %w", lastErr)
 }
 
-// retrySleep waits for d or until the bot's context is cancelled.
+// sleepWithContext waits for d or until ctx is cancelled.
 // Returns true if the sleep completed, false if cancelled.
-func (b *TelegramBot) retrySleep(d time.Duration) bool {
+func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {
 	case <-t.C:
 		return true
-	case <-b.ctx.Done():
+	case <-ctx.Done():
 		return false
 	}
 }
