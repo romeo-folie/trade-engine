@@ -29,8 +29,8 @@ func TestTrackerCostPerSignal(t *testing.T) {
 
 	s := tr.TakeSnapshot()
 	// weekly=1500, weeklySignals=2 → 750.0
-	if s.CostPerSignal != 750.0 {
-		t.Errorf("cost_per_signal: want 750, got %.2f", s.CostPerSignal)
+	if s.TokensPerSignal != 750.0 {
+		t.Errorf("cost_per_signal: want 750, got %.2f", s.TokensPerSignal)
 	}
 }
 
@@ -49,8 +49,8 @@ func TestTrackerCostPerSignalAfterWeeklyReset(t *testing.T) {
 
 	s := tr.TakeSnapshot()
 	// weeklySignals reset to 0 → CostPerSignal must be 0, not near-zero drift.
-	if s.CostPerSignal != 0 {
-		t.Errorf("cost_per_signal after reset: want 0 (no weekly signals), got %.2f", s.CostPerSignal)
+	if s.TokensPerSignal != 0 {
+		t.Errorf("cost_per_signal after reset: want 0 (no weekly signals), got %.2f", s.TokensPerSignal)
 	}
 	// Lifetime signals still visible.
 	if s.SignalsGenerated != 2 {
@@ -62,8 +62,8 @@ func TestTrackerCostPerTradeZeroWhenNoTrades(t *testing.T) {
 	tr := cost.NewTracker()
 	tr.Record("openai", "gpt-4o", 500, 250)
 	s := tr.TakeSnapshot()
-	if s.CostPerTrade != 0 {
-		t.Errorf("cost_per_trade should be 0 when no trades, got %.2f", s.CostPerTrade)
+	if s.TokensPerTrade != 0 {
+		t.Errorf("cost_per_trade should be 0 when no trades, got %.2f", s.TokensPerTrade)
 	}
 }
 

@@ -16,8 +16,10 @@ type DegradeNotifier interface {
 	SendImmediate(ctx context.Context, message string) error
 }
 
-// ProfileOrder defines the degrade step sequence (most expensive → cheapest).
-var ProfileOrder = []string{"pro", "balanced", "budget"}
+// profileOrder defines the degrade step sequence (most expensive → cheapest).
+// Unexported to prevent external mutation that would make guardrail behaviour
+// unpredictable. Use nextProfile to traverse the sequence.
+var profileOrder = []string{"pro", "balanced", "budget"}
 
 // Guardrail checks token spend against configured budgets and triggers
 // auto-degrade when thresholds are crossed. Safe for concurrent use.
@@ -129,9 +131,9 @@ func (g *Guardrail) rollPeriods(now time.Time) {
 // nextProfile returns the next cheaper profile, or the same profile when
 // already at minimum.
 func nextProfile(current string) string {
-	for i, p := range ProfileOrder {
-		if p == current && i+1 < len(ProfileOrder) {
-			return ProfileOrder[i+1]
+	for i, p := range profileOrder {
+		if p == current && i+1 < len(profileOrder) {
+			return profileOrder[i+1]
 		}
 	}
 	return current // already at "budget"

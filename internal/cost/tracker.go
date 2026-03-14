@@ -36,7 +36,7 @@ type Tracker struct {
 	weeklyTokens atomic.Int64
 
 	// Rolling weekly signal/trade counters — reset with weeklyTokens so that
-	// CostPerSignal/CostPerTrade remain meaningful after the first week boundary.
+	// TokensPerSignal/TokensPerTrade remain meaningful after the first week boundary.
 	weeklySignals atomic.Int64
 	weeklyTrades  atomic.Int64
 
@@ -104,7 +104,7 @@ func (t *Tracker) ResetDaily(now time.Time) {
 }
 
 // ResetWeekly resets the weekly counter (called at week boundary by the guardrail).
-// Weekly signal/trade counters are reset alongside tokens so CostPerSignal/CostPerTrade
+// Weekly signal/trade counters are reset alongside tokens so TokensPerSignal/TokensPerTrade
 // remain meaningful after the first week boundary.
 func (t *Tracker) ResetWeekly(now time.Time) {
 	t.weeklyTokens.Store(0)
@@ -135,8 +135,8 @@ type Snapshot struct {
 	WeeklyTokens     int64
 	SignalsGenerated int64
 	TradesExecuted   int64
-	CostPerSignal    float64 // tokens per signal (proxy for cost)
-	CostPerTrade     float64 // tokens per executed trade
+	TokensPerSignal float64 // average weekly tokens consumed per signal generated
+	TokensPerTrade  float64 // average weekly tokens consumed per trade executed
 	ModelBreakdown   []ModelBreakdownEntry
 }
 
@@ -172,12 +172,17 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 	t.mu.Lock()
 	breakdown := make([]ModelBreakdownEntry, 0, len(t.models))
 	for _, ms := range t.models {
+		// Load atomics once into locals so Total is always equal to
+		// InputTokens+OutputTokens in the returned entry, even under
+		// concurrent Record calls between the two atomic reads.
+		inp := ms.InputTokens.Load()
+		out := ms.OutputTokens.Load()
 		breakdown = append(breakdown, ModelBreakdownEntry{
 			Provider:     ms.Provider,
 			Model:        ms.Model,
-			InputTokens:  ms.InputTokens.Load(),
-			OutputTokens: ms.OutputTokens.Load(),
-			Total:        ms.TotalTokens(),
+			InputTokens:  inp,
+			OutputTokens: out,
+			Total:        inp + out,
 		})
 	}
 	t.mu.Unlock()
@@ -187,8 +192,8 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 		WeeklyTokens:     weekly,
 		SignalsGenerated: signals,
 		TradesExecuted:   trades,
-		CostPerSignal:    costPerSignal,
-		CostPerTrade:     costPerTrade,
+		TokensPerSignal: costPerSignal,
+		TokensPerTrade:  costPerTrade,
 		ModelBreakdown:   breakdown,
 	}
 }
