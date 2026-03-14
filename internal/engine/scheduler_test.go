@@ -103,6 +103,64 @@ func TestNextTickTime(t *testing.T) {
 			t.Errorf("NextTickTime(holiday) = %v, want %v", got, want)
 		}
 	})
+
+	t.Run("pre-market with large interval overshoots open", func(t *testing.T) {
+		// Regression: NextTickTime(09:00, 1h) = 10:00 (IsMarketOpen(10:00)=true).
+		// This is the correct NextTickTime result — the function does not snap to
+		// the opening bell. The caller (nextEngineWake) is responsible for choosing
+		// nextMarketOpen when no tick was run.
+		now := mustParseNY(t, "2024-03-11T09:00:00") // pre-market Monday
+		got := NextTickTime(now, time.Hour)
+		want := mustParseNY(t, "2024-03-11T10:00:00") // now+1h is open — correct
+		if !got.Equal(want) {
+			t.Errorf("NextTickTime(pre-market, 1h) = %v, want %v", got, want)
+		}
+	})
+}
+
+// TestNextEngineWake verifies that nextEngineWake selects the right strategy:
+// - after a tick (ranTick=true):  now+interval, routed to next open if needed
+// - after a skip (ranTick=false): nextMarketOpen(now), ignoring interval
+func TestNextEngineWake(t *testing.T) {
+	oneHour := time.Hour
+
+	t.Run("after tick during market hours uses interval", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-11T10:00:00")
+		got := nextEngineWake(now, oneHour, true)
+		want := now.Add(oneHour) // 11:00 — still open
+		if !got.Equal(want) {
+			t.Errorf("nextEngineWake(ranTick=true) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("after tick near close routes to next open", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-11T15:30:00")
+		got := nextEngineWake(now, oneHour, true)
+		want := mustParseNY(t, "2024-03-12T09:30:00") // 16:30 is after close
+		if !got.Equal(want) {
+			t.Errorf("nextEngineWake(ranTick=true, near-close) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("after skip pre-market wakes at opening bell not now+interval", func(t *testing.T) {
+		// Key regression: 09:00 + 1h = 10:00 via NextTickTime, but after a skip
+		// the engine must wake at 09:30 so it doesn't miss the opening bell.
+		now := mustParseNY(t, "2024-03-11T09:00:00")
+		got := nextEngineWake(now, oneHour, false)
+		want := mustParseNY(t, "2024-03-11T09:30:00")
+		if !got.Equal(want) {
+			t.Errorf("nextEngineWake(ranTick=false, pre-market) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("after skip on saturday wakes monday open", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-16T12:00:00") // Saturday
+		got := nextEngineWake(now, oneHour, false)
+		want := mustParseNY(t, "2024-03-18T09:30:00") // Monday
+		if !got.Equal(want) {
+			t.Errorf("nextEngineWake(ranTick=false, saturday) = %v, want %v", got, want)
+		}
+	})
 }
 
 func TestHolidayHelpers(t *testing.T) {

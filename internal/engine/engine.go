@@ -189,7 +189,15 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Use a one-shot timer instead of a fixed ticker so the engine sleeps
 	// until the actual next trading time rather than waking every interval
 	// all weekend to log "market closed" and immediately go back to sleep.
-	nextTick := NextTickTime(time.Now(), interval)
+	//
+	// nextEngineWake distinguishes two cases:
+	//   ranTick=true  → interval from now (NextTickTime); routes to nextMarketOpen
+	//                    if now+interval falls outside market hours.
+	//   ranTick=false → nextMarketOpen(now) directly, so a pre-market or weekend
+	//                    startup reliably wakes at the opening bell regardless of
+	//                    how large the tick interval is.
+	startedTick := IsMarketOpen(time.Now())
+	nextTick := nextEngineWake(time.Now(), interval, startedTick)
 	e.logNextCycle(nextTick)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
@@ -198,17 +206,19 @@ func (e *Engine) Run(ctx context.Context) error {
 		select {
 		case <-timer.C:
 			now := time.Now()
+			ranTick := false
 			if IsMarketOpen(now) {
+				ranTick = true
 				if err := e.tick(ctx); err != nil {
 					logger.Warn("tick error", "err", err.Error())
 				}
 			} else {
-				// Shouldn't normally fire when closed — NextTickTime routes to
-				// nextMarketOpen() when the market is closed, and to now+interval
-				// when it's open. Guard defensively for clock skew / DST edge cases.
+				// Defensive guard: timer should only fire when open (it targets
+				// nextMarketOpen on skip, now+interval on tick). A fire here
+				// indicates clock skew or a DST transition — skip and re-target.
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
-			nextTick = NextTickTime(time.Now(), interval)
+			nextTick = nextEngineWake(time.Now(), interval, ranTick)
 			e.logNextCycle(nextTick)
 			// Safe to call Reset directly: timer.C was just consumed above.
 			timer.Reset(time.Until(nextTick))
@@ -217,6 +227,20 @@ func (e *Engine) Run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+// nextEngineWake returns when the engine loop should next wake up.
+//
+//   - ranTick=true:  engine ran a tick; next wake = now+interval (routed to
+//     nextMarketOpen if that interval lands outside market hours).
+//   - ranTick=false: engine skipped (pre-market, weekend, holiday); next wake =
+//     nextMarketOpen(now) so the opening bell is never missed regardless of
+//     how large the tick interval is.
+func nextEngineWake(now time.Time, interval time.Duration, ranTick bool) time.Time {
+	if ranTick {
+		return NextTickTime(now, interval)
+	}
+	return nextMarketOpen(now)
 }
 
 // logNextCycle logs the next scheduled tick time and the seconds until it fires.
