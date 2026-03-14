@@ -9,47 +9,84 @@ engine:
   dry_run: false               # If true, no orders placed regardless of mode
   initial_capital: 100000      # Starting cash for paper trading / position sizing
 
+# ── Model configuration ───────────────────────────────────────────────────────
+# Use the registry+roles block (recommended) to name models and reference them
+# by role. This allows the engine to apply fallbacks, cost profiles, and adaptive
+# depth without hard-coding provider/model pairs throughout config.
 models:
-  # ── Phase 12: Multi-model ensemble (recommended) ─────────────────────────────
-  # Three analysts run in parallel every tick. If all agree above the fast-path
-  # thresholds, the signal is accepted immediately (no arbiter call).
-  # If they disagree, the arbiter synthesises a final signal.
-  analysts:
-    - provider: anthropic
-      model: claude-sonnet-4-6
-      api_key_env: ANTHROPIC_API_KEY    # export ANTHROPIC_API_KEY=sk-ant-...
-      max_tokens: 4096
-      temperature: 0.1
-      timeout_sec: 60
-    - provider: openai
+  registry:
+    analyst_cheap:
+      provider: openai
       model: gpt-4o
       api_key_env: OPENAI_API_KEY       # export OPENAI_API_KEY=sk-...
-      max_tokens: 4096
+      max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
-    - provider: google
-      model: gemini-2.0-flash
+    analyst_mid:
+      provider: google
+      model: gemini-3.1-pro-preview
       api_key_env: GEMINI_API_KEY       # export GEMINI_API_KEY=... (aistudio.google.com)
-      max_tokens: 4096
+      max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
+      fallback: gemini_flash            # fallback registry key on 429/503
+    gemini_flash:
+      provider: google
+      model: gemini-2.5-flash
+      api_key_env: GEMINI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+    analyst_frontier:
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY    # export ANTHROPIC_API_KEY=sk-ant-...
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+    arbiter:
+      provider: anthropic
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 90
+    classifier:
+      provider: openai
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 256
+      temperature: 0.0
+      timeout_sec: 15
+    news_enricher:
+      provider: openai
+      model: gpt-4o-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 2048
+      temperature: 0.1
+      timeout_sec: 60
+    embedder:
+      provider: ollama
+      model: nomic-embed-text
+      timeout_sec: 30
 
-  # Arbiter: called only when analysts disagree. Use a powerful model here.
-  arbiter:
-    provider: anthropic
-    model: claude-opus-4-6
-    api_key_env: ANTHROPIC_API_KEY
-    max_tokens: 4096
-    temperature: 0.1
-    timeout_sec: 90
+  roles:
+    analysts: [analyst_cheap, analyst_mid, analyst_frontier]
+    arbiter: arbiter
+    classifier: classifier
+    news_enricher: news_enricher
+    embedder: embedder
 
   consensus:
     enabled: true
     fast_path_confidence: 0.80   # All analysts must meet this min confidence to fast-path
     fast_path_max_spread: 0.15   # Max confidence spread across analysts to fast-path
 
-  # ── Legacy single-model mode (simpler / cheaper for testing) ─────────────────
-  # Uncomment and remove the analysts/arbiter block above to run single-model.
+  # ── Legacy single-model / inline-ensemble mode ────────────────────────────
+  # If you have not migrated to registry+roles, you can still use the old format.
+  # Remove the registry/roles blocks above and uncomment one of these instead.
+  #
+  # Single model (cheapest):
   # primary:
   #   provider: anthropic
   #   model: claude-sonnet-4-6
@@ -59,6 +96,34 @@ models:
   #   timeout_sec: 60
   # consensus:
   #   enabled: false
+  #
+  # Inline ensemble (pre-registry style):
+  # analysts:
+  #   - provider: anthropic
+  #     model: claude-sonnet-4-6
+  #     api_key_env: ANTHROPIC_API_KEY
+  #     max_tokens: 4096
+  #     temperature: 0.1
+  #     timeout_sec: 60
+  #   - provider: openai
+  #     model: gpt-4o
+  #     api_key_env: OPENAI_API_KEY
+  #     max_tokens: 4096
+  #     temperature: 0.1
+  #     timeout_sec: 60
+  #   - provider: google
+  #     model: gemini-2.0-flash
+  #     api_key_env: GEMINI_API_KEY
+  #     max_tokens: 4096
+  #     temperature: 0.1
+  #     timeout_sec: 60
+  # arbiter:
+  #   provider: anthropic
+  #   model: claude-opus-4-6
+  #   api_key_env: ANTHROPIC_API_KEY
+  #   max_tokens: 4096
+  #   temperature: 0.1
+  #   timeout_sec: 90
 
 markets:
   stocks:
@@ -137,6 +202,77 @@ risk:
   signal_expiry_min: 30        # Discard pending signals older than this
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
 
+  # Prediction-market-specific risk thresholds (PR #157).
+  # Baseline checks (confidence, position size, open positions, daily loss,
+  # drawdown, cooldown) fall through to parent risk values above.
+  # Set any threshold to 0 to disable that check individually.
+  prediction:
+    confidence_threshold: 0.70        # Stricter than stock default (0.65)
+    max_spread: 0.05                  # 5% bid-ask spread cap
+    min_liquidity: 1000               # Min 24h volume (provider units vary)
+    min_time_to_resolution_hours: 4   # Must be ≥4h from contract expiry
+
+# ── Analysis gate (cost-reduction Epics 1 & 2) ───────────────────────────────
+# Controls the pre-LLM material-change gate (zero token cost) and the optional
+# two-stage classifier and adaptive ensemble depth scorer.
+analysis:
+  material_change_only: true         # Skip LLM call if nothing significant changed
+  hold_cooldown_min: 120             # Don't re-analyze a HOLD ticker for N minutes
+  rsi_delta_threshold: 3.0          # Min RSI change to count as material
+  ema_gap_delta_pct: 0.5            # Min EMA-gap change (%) to count as material
+  price_move_threshold_pct: 0.75    # Min price move (%) to count as material
+  news_novelty_enabled: true        # Treat new unseen news as always material
+  max_news_articles_per_prompt: 5   # Cap news items injected into the LLM prompt
+  max_candles_per_prompt: 20        # Cap OHLCV candles injected into the LLM prompt
+  history_window_by_strategy:       # Per-strategy lookback (candles)
+    trend_following: 20
+    mean_reversion: 20
+    momentum: 14
+
+  # Classifier: two-stage gate that can block an analysis call before any
+  # expensive model is invoked.
+  # mode: disabled — always proceed to analysis
+  #        shadow   — log what would have been skipped, but never block (safe for tuning)
+  #        active   — enforce skips; llm_fallback_enabled adds a cheap LLM second opinion
+  classifier:
+    mode: shadow
+    rsi_delta_threshold: 3.0
+    ema_gap_delta_pct: 0.5
+    price_move_threshold_pct: 0.75
+    hold_cooldown_min: 120
+    news_novelty_enabled: true
+    llm_fallback_enabled: false      # If true, a SKIP from rules is confirmed by LLM
+    llm_fallback_model: classifier   # Role name (from models.roles) for the LLM fallback — not a direct registry key
+
+  # Adaptive depth: scores each tick and routes to fewer analysts when the
+  # situation is low-volatility / low-novelty. Requires analyst tier roles
+  # (analyst_cheap, analyst_mid, analyst_frontier) in models.registry.
+  adaptive_depth:
+    enabled: false                   # Opt-in; disable to always use all analysts
+    low_threshold: 0.30              # Score < low → cheapest analyst only, no arbiter
+    high_threshold: 0.65             # Score ≥ high → all analysts, standard rules
+    weights:
+      volatility: 0.30              # ATR% contribution
+      news_novelty: 0.25            # News novelty contribution
+      risk_proximity: 0.25          # Distance to stop/drawdown contribution
+      trend_strength: 0.20          # ADX normalised contribution
+
+# ── Cost profiles & budget guardrails (cost-reduction Epic 3) ────────────────
+# profile sets a named preset for tick_interval, hold_cooldown, classifier mode,
+# adaptive_depth, and cache TTL. Explicit values in this file always override the
+# profile. Unknown profiles are rejected at startup.
+#   budget   — 90-min ticks, classifier active, adaptive_depth off, 3h cache TTL
+#   balanced — 60-min ticks, classifier active, adaptive_depth on, 2h cache TTL
+#   pro      — 60-min ticks, classifier active, adaptive_depth on, 1h cache TTL
+cost:
+  profile: balanced
+  daily_token_budget: 200000        # Auto-degrade profile if crossed (tokens/day)
+  weekly_token_budget: 1200000      # Auto-degrade profile if crossed (tokens/week)
+  auto_degrade_on_budget_hit: true  # Step down profile tier on budget breach
+  # cache_ttl_min is owned by the cost profile (budget=180, balanced=120, pro=60).
+  # Uncomment to override the profile-driven default with an explicit value.
+  # cache_ttl_min: 120
+
 notifications:
   telegram:
     enabled: false
@@ -147,6 +283,13 @@ notifications:
       - trade
       - error
       - daily_summary
+    # Batching (Epic 1): accumulate events per tick and flush a single summary.
+    # Error events always bypass the batcher and are sent immediately.
+    batch_enabled: true
+    batch_window_sec: 60          # Flush after N seconds of accumulation
+    max_items_per_batch: 25       # Hard cap per flush
+    include_holds: false          # Include HOLD signals in batch summary
+    min_confidence_for_alert: 0.65  # Suppress signals below this confidence
 
 logging:
   level: info                  # debug | info | warn | error
