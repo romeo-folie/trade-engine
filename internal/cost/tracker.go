@@ -145,8 +145,8 @@ type Snapshot struct {
 	WeeklyTokens     int64
 	SignalsGenerated int64
 	TradesExecuted   int64
-	TokensPerSignal float64 // average weekly tokens consumed per signal generated
-	TokensPerTrade  float64 // average weekly tokens consumed per trade executed
+	TokensPerSignal  float64 // average weekly tokens consumed per signal generated
+	TokensPerTrade   float64 // average weekly tokens consumed per trade executed
 	ModelBreakdown   []ModelBreakdownEntry
 }
 
@@ -160,9 +160,21 @@ type ModelBreakdownEntry struct {
 }
 
 // TakeSnapshot returns a consistent Snapshot.
+//
+// All counters that contribute to the same snapshot are read while t.mu is
+// held so that DailyTokens/WeeklyTokens and ModelBreakdown reflect the same
+// logical instant.  The lifetime signal/trade counters (SignalsGenerated,
+// TradesExecuted) are read outside the lock because they are append-only and
+// only directionally associated with token spend; slight lag here is
+// acceptable and avoids extending the critical section.
 func (t *Tracker) TakeSnapshot() Snapshot {
+	// Lifetime counters — read outside lock (acceptable slight lag; see above).
 	signals := t.signalsGenerated.Load()
 	trades := t.tradesExecuted.Load()
+
+	// Hold t.mu for the remainder so that token totals and model breakdown
+	// reflect the same instant (no concurrent Record can interleave).
+	t.mu.Lock()
 	daily := t.dailyTokens.Load()
 	weekly := t.weeklyTokens.Load()
 
@@ -171,15 +183,6 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 	weeklySignals := t.weeklySignals.Load()
 	weeklyTrades := t.weeklyTrades.Load()
 
-	var costPerSignal, costPerTrade float64
-	if weeklySignals > 0 {
-		costPerSignal = float64(weekly) / float64(weeklySignals)
-	}
-	if weeklyTrades > 0 {
-		costPerTrade = float64(weekly) / float64(weeklyTrades)
-	}
-
-	t.mu.Lock()
 	breakdown := make([]ModelBreakdownEntry, 0, len(t.models))
 	for _, ms := range t.models {
 		// Load atomics once into locals so Total is always equal to
@@ -197,13 +200,21 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 	}
 	t.mu.Unlock()
 
+	var costPerSignal, costPerTrade float64
+	if weeklySignals > 0 {
+		costPerSignal = float64(weekly) / float64(weeklySignals)
+	}
+	if weeklyTrades > 0 {
+		costPerTrade = float64(weekly) / float64(weeklyTrades)
+	}
+
 	return Snapshot{
 		DailyTokens:      daily,
 		WeeklyTokens:     weekly,
 		SignalsGenerated: signals,
 		TradesExecuted:   trades,
-		TokensPerSignal: costPerSignal,
-		TokensPerTrade:  costPerTrade,
+		TokensPerSignal:  costPerSignal,
+		TokensPerTrade:   costPerTrade,
 		ModelBreakdown:   breakdown,
 	}
 }

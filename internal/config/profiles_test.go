@@ -136,3 +136,51 @@ func TestProfileDefaultIsBalanced(t *testing.T) {
 		t.Errorf("default cost profile should be balanced, got %q", cfg.Cost.Profile)
 	}
 }
+
+// TestNegativeBudgetIsInvalid verifies that negative DailyTokenBudget or
+// WeeklyTokenBudget values are rejected by Validate. Guardrail.Check gates on
+// budget > 0, so a negative value would silently disable enforcement.
+func TestNegativeDailyBudgetIsInvalid(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Cost.DailyTokenBudget = -1
+
+	errs := config.Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.HasPrefix(e, "cost.daily_token_budget") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected cost.daily_token_budget validation error for negative value, got: %v", errs)
+	}
+}
+
+func TestNegativeWeeklyBudgetIsInvalid(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Cost.WeeklyTokenBudget = -100
+
+	errs := config.Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.HasPrefix(e, "cost.weekly_token_budget") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected cost.weekly_token_budget validation error for negative value, got: %v", errs)
+	}
+}
+
+func TestZeroBudgetIsValid(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Cost.DailyTokenBudget = 0
+	cfg.Cost.WeeklyTokenBudget = 0
+
+	errs := config.Validate(cfg)
+	for _, e := range errs {
+		if strings.HasPrefix(e, "cost.daily_token_budget") || strings.HasPrefix(e, "cost.weekly_token_budget") {
+			t.Errorf("zero budget should be valid, got error: %s", e)
+		}
+	}
+}

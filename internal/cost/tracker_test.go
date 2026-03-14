@@ -123,7 +123,7 @@ func TestTrackerRecordInt64Overflow(t *testing.T) {
 	// Use values that would overflow int32 (> 2^31-1 combined).
 	const big = 1<<30 + 1 // 1_073_741_825 each; sum = 2_147_483_650 > MaxInt32
 	tr.Record("openai", "gpt-4o", big, big)
-	want := int64(big)*2
+	want := int64(big) * 2
 	if got := tr.DailyTokens(); got != want {
 		t.Errorf("daily tokens: want %d, got %d (possible int32 overflow)", want, got)
 	}
@@ -160,5 +160,51 @@ func TestTrackerNewModelEntryNotVisibleAtZero(t *testing.T) {
 			}
 		}
 	next:
+	}
+}
+
+// TestTakeSnapshotTokensConsistentWithBreakdown verifies that DailyTokens and
+// WeeklyTokens in a snapshot are read while t.mu is held alongside the model
+// breakdown, preventing a race where token totals and per-model entries
+// reflect different instants.
+func TestTakeSnapshotTokensConsistentWithBreakdown(t *testing.T) {
+	const iterations = 3000
+	tr := cost.NewTracker()
+
+	stop := make(chan struct{})
+	defer close(stop)
+
+	// Continuous writer goroutine.
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				tr.Record("openai", "gpt-4o", 100, 50)
+			}
+		}
+	}()
+
+	// TakeSnapshot should never return a snapshot where WeeklyTokens is
+	// non-zero but ModelBreakdown is empty (or vice-versa), because both are
+	// now read under the same mutex.
+	for i := 0; i < iterations; i++ {
+		s := tr.TakeSnapshot()
+		breakdownTotal := int64(0)
+		for _, e := range s.ModelBreakdown {
+			breakdownTotal += e.Total
+		}
+		// If weekly > 0 but breakdown is empty the reads were inconsistent.
+		if s.WeeklyTokens > 0 && len(s.ModelBreakdown) == 0 {
+			t.Fatalf("iteration %d: WeeklyTokens=%d but ModelBreakdown is empty — snapshot inconsistency", i, s.WeeklyTokens)
+		}
+		// WeeklyTokens must never exceed the sum of all per-model totals by
+		// more than one in-flight Record (which adds to totals atomically, but
+		// the breakdown entry may lag by one record).  A large discrepancy
+		// indicates the reads were taken at different instants.
+		if breakdownTotal > 0 && s.WeeklyTokens > breakdownTotal*2 {
+			t.Fatalf("iteration %d: WeeklyTokens=%d >> breakdownTotal=%d — likely inconsistent snapshot reads", i, s.WeeklyTokens, breakdownTotal)
+		}
 	}
 }

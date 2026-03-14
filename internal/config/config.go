@@ -211,8 +211,8 @@ type AdaptiveDepthConfig struct {
 
 // AdaptiveDepthWeights holds the per-signal weights summing to 1.0.
 type AdaptiveDepthWeights struct {
-	Volatility    float64 `yaml:"volatility"`    // ATR%
-	NewsNovelty   float64 `yaml:"news_novelty"`  // binary or normalised
+	Volatility    float64 `yaml:"volatility"`     // ATR%
+	NewsNovelty   float64 `yaml:"news_novelty"`   // binary or normalised
 	RiskProximity float64 `yaml:"risk_proximity"` // distance to stop/drawdown
 	TrendStrength float64 `yaml:"trend_strength"` // ADX normalised
 }
@@ -703,6 +703,16 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
 	}
 
+	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative
+	// values would silently disable enforcement rather than error.  Zero is
+	// valid (means "no budget cap for this period").
+	if cfg.Cost.DailyTokenBudget < 0 {
+		errs = append(errs, fmt.Sprintf("cost.daily_token_budget must be >= 0, got %d", cfg.Cost.DailyTokenBudget))
+	}
+	if cfg.Cost.WeeklyTokenBudget < 0 {
+		errs = append(errs, fmt.Sprintf("cost.weekly_token_budget must be >= 0, got %d", cfg.Cost.WeeklyTokenBudget))
+	}
+
 	// ── Registry validation ──────────────────────────────────────────────────
 	// When models.registry is present, validate that all declared roles resolve
 	// to known registry keys, and that all registry entries have required fields.
@@ -763,10 +773,10 @@ func Validate(cfg *Config) []string {
 		}
 		// Validate named roles resolve.
 		namedRoles := map[string]string{
-			"arbiter":      cfg.Models.Roles.Arbiter,
-			"classifier":   cfg.Models.Roles.Classifier,
+			"arbiter":       cfg.Models.Roles.Arbiter,
+			"classifier":    cfg.Models.Roles.Classifier,
 			"news_enricher": cfg.Models.Roles.NewsEnricher,
-			"embedder":     cfg.Models.Roles.Embedder,
+			"embedder":      cfg.Models.Roles.Embedder,
 		}
 		for role, key := range namedRoles {
 			if key == "" {
