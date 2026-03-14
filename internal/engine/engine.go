@@ -179,6 +179,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	// for scheduling the first timer. Multiple time.Now() calls here could
 	// flip across a session boundary (e.g. 15:59:59 → 16:00:00), causing
 	// startedTick and the base time passed to nextEngineWake to disagree.
+	// Capture the market-open decision and run (or skip) the startup tick.
+	// startupNow is used only for the IsMarketOpen check; the timer base is
+	// captured *after* the tick completes (see timerBase below) so that a
+	// long-running startup tick doesn't produce a negative time.Until and
+	// cause an immediate back-to-back fire.
 	startupNow := time.Now()
 	ranStartupTick := false
 	if IsMarketOpen(startupNow) {
@@ -203,7 +208,11 @@ func (e *Engine) Run(ctx context.Context) error {
 	//   ranTick=false → nextMarketOpen(now) directly, so a pre-market or weekend
 	//                    startup reliably wakes at the opening bell regardless of
 	//                    how large the tick interval is.
-	nextTick := nextEngineWake(startupNow, interval, ranStartupTick)
+	//
+	// timerBase is captured after the startup work completes so the first
+	// interval is measured from when the engine finished, not when it started.
+	timerBase := time.Now()
+	nextTick := nextEngineWake(timerBase, interval, ranStartupTick)
 	e.logNextCycle(nextTick)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
@@ -211,6 +220,10 @@ func (e *Engine) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-timer.C:
+			// Capture a single timestamp for both the open/closed decision and
+			// the subsequent nextEngineWake call. A boundary straddle (two
+			// separate time.Now() calls crossing 09:30 or 16:00) would pick
+			// the wrong scheduling path and mis-schedule the next wake.
 			now := time.Now()
 			ranTick := false
 			if IsMarketOpen(now) {
@@ -224,7 +237,10 @@ func (e *Engine) Run(ctx context.Context) error {
 				// indicates clock skew or a DST transition — skip and re-target.
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
-			nextTick = nextEngineWake(time.Now(), interval, ranTick)
+			// Capture base after work completes; avoids negative time.Until
+			// if the tick duration exceeds the configured interval.
+			loopBase := time.Now()
+			nextTick = nextEngineWake(loopBase, interval, ranTick)
 			e.logNextCycle(nextTick)
 			// Safe to call Reset directly: timer.C was just consumed above.
 			timer.Reset(time.Until(nextTick))
