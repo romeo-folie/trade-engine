@@ -110,6 +110,12 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 
 		provider := enricherProvider
 		if provider == nil || !provider.IsAvailable() {
+			// Report the actual provider identity when available so logs reflect
+			// what was tried. Fall back to legacy config fields when provider is nil.
+			if provider != nil {
+				return "", fmt.Errorf("enricher: extraction provider unavailable (provider=%q model=%q)",
+					provider.ProviderName(), provider.ModelName())
+			}
 			return "", fmt.Errorf("enricher: extraction provider unavailable (provider=%q model=%q)",
 				cfg.Markets.News.ExtractionProvider, cfg.Markets.News.ExtractionModel)
 		}
