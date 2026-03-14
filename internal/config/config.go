@@ -28,6 +28,33 @@ type Config struct {
 	Backtest      BacktestConfig      `yaml:"backtest"`
 	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
 	Analysis      AnalysisConfig      `yaml:"analysis"`
+	Cost          CostConfig          `yaml:"cost"`
+}
+
+// CostConfig controls the user-facing cost profile and budget guardrails.
+type CostConfig struct {
+	// Profile is the active cost profile: "budget" | "balanced" | "pro".
+	// Profile defaults are applied at startup before explicit config values,
+	// so any explicit value in this file always takes precedence.
+	// Default: "balanced".
+	Profile string `yaml:"profile"`
+
+	// DailyTokenBudget is the maximum tokens allowed per calendar day across
+	// all model calls. 0 disables the daily cap. Default: 200000.
+	DailyTokenBudget int `yaml:"daily_token_budget"`
+
+	// WeeklyTokenBudget is the maximum tokens allowed per calendar week. 0
+	// disables the weekly cap. Default: 1200000.
+	WeeklyTokenBudget int `yaml:"weekly_token_budget"`
+
+	// AutoDegradeOnBudgetHit: when true, crossing a budget cap steps the
+	// active profile down one tier (pro → balanced → budget) and sends a
+	// Telegram notification immediately (bypasses the batcher).
+	AutoDegradeOnBudgetHit bool `yaml:"auto_degrade_on_budget_hit"`
+
+	// CacheTTLMin is the analysis cache TTL in minutes. Set by ApplyProfile
+	// (180/120/60 for budget/balanced/pro) and overridable per-user.
+	CacheTTLMin int `yaml:"cache_ttl_min"`
 }
 
 // ── Embeddings ─────────────────────────────────────────────────────────────────
@@ -575,6 +602,7 @@ func Load() (*Config, error) {
 	}
 
 	migrateModelsConfig(cfg)
+	ApplyProfile(cfg)
 	resolveEnvVars(cfg)
 	current = cfg
 	return cfg, nil
@@ -641,6 +669,12 @@ func Validate(cfg *Config) []string {
 	validClassifierModes := map[string]bool{"disabled": true, "shadow": true, "active": true}
 	if mode := cfg.Analysis.Classifier.Mode; mode != "" && !validClassifierModes[mode] {
 		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
+	}
+
+	// Validate cost profile.
+	validCostProfiles := map[string]bool{"budget": true, "balanced": true, "pro": true}
+	if p := cfg.Cost.Profile; p != "" && !validCostProfiles[p] {
+		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
 	}
 
 	// ── Registry validation ──────────────────────────────────────────────────

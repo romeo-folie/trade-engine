@@ -282,5 +282,12 @@ func Defaults() *Config {
 			SimilarAnalysesThreshold: 0.80,
 			SimilarAnalysesLimit:     3,
 		},
+		Cost: CostConfig{
+			Profile:                "balanced",
+			DailyTokenBudget:       200000,
+			WeeklyTokenBudget:      1200000,
+			AutoDegradeOnBudgetHit: true,
+			CacheTTLMin:            0, // set by ApplyProfile after Defaults()
+		},
 	}
 }
