@@ -162,6 +162,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	if e.cfg.Engine.TickIntervalSec <= 0 {
 		return fmt.Errorf("engine: tick_interval_sec must be > 0, got %d", e.cfg.Engine.TickIntervalSec)
 	}
+	// Guard against time.Duration overflow: time.Duration is int64 nanoseconds.
+	// MaxInt64 / 1e9 ≈ 9.2 × 10^9 seconds (≈292 years) — anything beyond that
+	// wraps to a negative duration and breaks scheduling.
+	const maxTickIntervalSec = int(math.MaxInt64 / int64(time.Second))
+	if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
+		return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
+	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
 
 	// Background: signal expiry + staleness checks.
