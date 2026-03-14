@@ -35,6 +35,11 @@ type Tracker struct {
 	dailyTokens  atomic.Int64
 	weeklyTokens atomic.Int64
 
+	// Rolling weekly signal/trade counters — reset with weeklyTokens so that
+	// CostPerSignal/CostPerTrade remain meaningful after the first week boundary.
+	weeklySignals atomic.Int64
+	weeklyTrades  atomic.Int64
+
 	// Period boundaries — protected by periodMu (separate from models mu to
 	// avoid holding the broad lock during period resets).
 	periodMu  sync.RWMutex
@@ -72,11 +77,17 @@ func (t *Tracker) Record(provider, model string, inputTokens, outputTokens int) 
 	t.weeklyTokens.Add(total)
 }
 
-// RecordSignal increments the signals-generated counter.
-func (t *Tracker) RecordSignal() { t.signalsGenerated.Add(1) }
+// RecordSignal increments the signals-generated counter (lifetime + weekly).
+func (t *Tracker) RecordSignal() {
+	t.signalsGenerated.Add(1)
+	t.weeklySignals.Add(1)
+}
 
-// RecordTrade increments the trades-executed counter.
-func (t *Tracker) RecordTrade() { t.tradesExecuted.Add(1) }
+// RecordTrade increments the trades-executed counter (lifetime + weekly).
+func (t *Tracker) RecordTrade() {
+	t.tradesExecuted.Add(1)
+	t.weeklyTrades.Add(1)
+}
 
 // DailyTokens returns total tokens used today.
 func (t *Tracker) DailyTokens() int64 { return t.dailyTokens.Load() }
@@ -93,8 +104,12 @@ func (t *Tracker) ResetDaily(now time.Time) {
 }
 
 // ResetWeekly resets the weekly counter (called at week boundary by the guardrail).
+// Weekly signal/trade counters are reset alongside tokens so CostPerSignal/CostPerTrade
+// remain meaningful after the first week boundary.
 func (t *Tracker) ResetWeekly(now time.Time) {
 	t.weeklyTokens.Store(0)
+	t.weeklySignals.Store(0)
+	t.weeklyTrades.Store(0)
 	t.periodMu.Lock()
 	t.weekStart = truncateWeek(now)
 	t.periodMu.Unlock()
@@ -141,12 +156,17 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 	daily := t.dailyTokens.Load()
 	weekly := t.weeklyTokens.Load()
 
+	// Use rolling weekly signal/trade counters (not lifetime totals) so
+	// cost-per-unit stays meaningful after week boundaries.
+	weeklySignals := t.weeklySignals.Load()
+	weeklyTrades := t.weeklyTrades.Load()
+
 	var costPerSignal, costPerTrade float64
-	if signals > 0 {
-		costPerSignal = float64(weekly) / float64(signals)
+	if weeklySignals > 0 {
+		costPerSignal = float64(weekly) / float64(weeklySignals)
 	}
-	if trades > 0 {
-		costPerTrade = float64(weekly) / float64(trades)
+	if weeklyTrades > 0 {
+		costPerTrade = float64(weekly) / float64(weeklyTrades)
 	}
 
 	t.mu.Lock()

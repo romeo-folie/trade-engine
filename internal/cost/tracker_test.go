@@ -28,9 +28,33 @@ func TestTrackerCostPerSignal(t *testing.T) {
 	tr.RecordSignal()
 
 	s := tr.TakeSnapshot()
-	// weekly=1500, signals=2 → 750.0
+	// weekly=1500, weeklySignals=2 → 750.0
 	if s.CostPerSignal != 750.0 {
 		t.Errorf("cost_per_signal: want 750, got %.2f", s.CostPerSignal)
+	}
+}
+
+func TestTrackerCostPerSignalAfterWeeklyReset(t *testing.T) {
+	tr := cost.NewTracker()
+	// Week 1 activity.
+	tr.Record("openai", "gpt-4o", 1000, 500)
+	tr.RecordSignal()
+	tr.RecordSignal()
+
+	// Simulate week boundary.
+	tr.ResetWeekly(tr.WeekStart().AddDate(0, 0, 7))
+
+	// Week 2: new tokens but no new signals yet.
+	tr.Record("openai", "gpt-4o", 200, 100)
+
+	s := tr.TakeSnapshot()
+	// weeklySignals reset to 0 → CostPerSignal must be 0, not near-zero drift.
+	if s.CostPerSignal != 0 {
+		t.Errorf("cost_per_signal after reset: want 0 (no weekly signals), got %.2f", s.CostPerSignal)
+	}
+	// Lifetime signals still visible.
+	if s.SignalsGenerated != 2 {
+		t.Errorf("lifetime signals: want 2, got %d", s.SignalsGenerated)
 	}
 }
 
