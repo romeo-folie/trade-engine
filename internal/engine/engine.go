@@ -175,12 +175,19 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Prior behaviour ran unconditionally, causing a full analysis cycle
 	// on weekends, holidays, and outside trading hours the moment te run
 	// was invoked.
-	if IsMarketOpen(time.Now()) {
+	// Capture a single consistent timestamp for the startup market check and
+	// for scheduling the first timer. Multiple time.Now() calls here could
+	// flip across a session boundary (e.g. 15:59:59 → 16:00:00), causing
+	// startedTick and the base time passed to nextEngineWake to disagree.
+	startupNow := time.Now()
+	ranStartupTick := false
+	if IsMarketOpen(startupNow) {
+		ranStartupTick = true
 		if err := e.tick(ctx); err != nil {
 			logger.Warn("tick error", "err", err.Error())
 		}
 	} else {
-		nextOpen := nextMarketOpen(time.Now())
+		nextOpen := nextMarketOpen(startupNow)
 		logger.Info("market closed on startup — skipping initial tick",
 			"next_open_at", nextOpen.In(nyLoc).Format(time.RFC3339),
 		)
@@ -196,8 +203,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	//   ranTick=false → nextMarketOpen(now) directly, so a pre-market or weekend
 	//                    startup reliably wakes at the opening bell regardless of
 	//                    how large the tick interval is.
-	startedTick := IsMarketOpen(time.Now())
-	nextTick := nextEngineWake(time.Now(), interval, startedTick)
+	nextTick := nextEngineWake(startupNow, interval, ranStartupTick)
 	e.logNextCycle(nextTick)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
