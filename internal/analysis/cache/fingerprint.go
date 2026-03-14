@@ -108,11 +108,11 @@ func bucketRSI(rsi float64) int {
 }
 
 // bucketEMAGap rounds the EMA gap percentage to the nearest 0.5-step bucket index.
-// The bucket index is math.Round(pct / 0.5); for example:
-//   - 1.1% → Round(2.2) = 2   (representing the 1.0% bucket)
-//   - 1.25% → Round(2.5) = 2  (rounds to even → 1.0% bucket)
-//   - 2.25% → Round(4.5) = 4  (rounds to even → 2.0% bucket)
-//   - 2.75% → Round(5.5) = 6  (rounds to even → 3.0% bucket)
+// Uses math.Round which rounds half away from zero (not banker's rounding). Examples:
+//   - 1.1%  → Round(2.2) = 2  (1.0% bucket)
+//   - 1.4%  → Round(2.8) = 3  (1.5% bucket)
+//   - 2.25% → Round(4.5) = 5  (2.5% bucket)
+//   - 2.75% → Round(5.5) = 6  (3.0% bucket)
 func bucketEMAGap(pct float64) int {
 	return int(math.Round(pct / 0.5)) // 0.5 % steps
 }

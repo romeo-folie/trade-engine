@@ -1,6 +1,9 @@
 -- Migration 014: analysis_cache table for context-aware LLM result reuse.
 -- Fingerprint-keyed cache with TTL, use tracking, and expiry cleanup.
 -- See cost-reduction PRD §7.5.
+--
+-- UUID generation: uses uuid_generate_v4() from the uuid-ossp extension
+-- (enabled in 001_extensions.sql). Does NOT require pgcrypto / gen_random_uuid().
 
 -- uuid_generate_v4() from uuid-ossp, consistent with all other migrations
 -- (see 001_extensions.sql: CREATE EXTENSION IF NOT EXISTS "uuid-ossp").
