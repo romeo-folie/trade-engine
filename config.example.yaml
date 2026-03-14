@@ -242,7 +242,7 @@ analysis:
     hold_cooldown_min: 120
     news_novelty_enabled: true
     llm_fallback_enabled: false      # If true, a SKIP from rules is confirmed by LLM
-    llm_fallback_model: classifier   # Registry key for the LLM fallback model
+    llm_fallback_model: classifier   # Role name (from models.roles) for the LLM fallback — not a direct registry key
 
   # Adaptive depth: scores each tick and routes to fewer analysts when the
   # situation is low-volatility / low-novelty. Requires analyst tier roles
@@ -269,6 +269,9 @@ cost:
   daily_token_budget: 200000        # Auto-degrade profile if crossed (tokens/day)
   weekly_token_budget: 1200000      # Auto-degrade profile if crossed (tokens/week)
   auto_degrade_on_budget_hit: true  # Step down profile tier on budget breach
+  # cache_ttl_min is owned by the cost profile (budget=180, balanced=120, pro=60).
+  # Uncomment to override the profile-driven default with an explicit value.
+  # cache_ttl_min: 120
 
 notifications:
   telegram:
