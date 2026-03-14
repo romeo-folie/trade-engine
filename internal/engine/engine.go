@@ -211,8 +211,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	//
 	// timerBase is captured after the startup work completes so the first
 	// interval is measured from when the engine finished, not when it started.
+	//
+	// However, if we skipped the tick (ranStartupTick=false), we MUST use the
+	// same startupNow timestamp for scheduling. If we used a fresh time.Now()
+	// that crossed the 09:30 boundary, nextMarketOpen would jump to tomorrow,
+	// missing the entire today's session.
 	timerBase := time.Now()
-	nextTick := nextEngineWake(timerBase, interval, ranStartupTick)
+	base := timerBase
+	if !ranStartupTick {
+		base = startupNow
+	}
+	nextTick := nextEngineWake(base, interval, ranStartupTick)
 	e.logNextCycle(nextTick)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
@@ -220,10 +229,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-timer.C:
-			// Capture a single timestamp for both the open/closed decision and
-			// the subsequent nextEngineWake call. A boundary straddle (two
-			// separate time.Now() calls crossing 09:30 or 16:00) would pick
-			// the wrong scheduling path and mis-schedule the next wake.
+			// Capture a single timestamp for the open/closed decision.
 			now := time.Now()
 			ranTick := false
 			if IsMarketOpen(now) {
@@ -232,15 +238,19 @@ func (e *Engine) Run(ctx context.Context) error {
 					logger.Warn("tick error", "err", err.Error())
 				}
 			} else {
-				// Defensive guard: timer should only fire when open (it targets
-				// nextMarketOpen on skip, now+interval on tick). A fire here
-				// indicates clock skew or a DST transition — skip and re-target.
+				// Defensive guard for clock skew / DST transitions.
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
-			// Capture base after work completes; avoids negative time.Until
-			// if the tick duration exceeds the configured interval.
+
+			// Capture base after work completes to avoid negative time.Until.
+			// Same boundary logic as startup: if we skipped, use the decision
+			// timestamp 'now' to avoid skipping a whole session on a 1ms flip.
 			loopBase := time.Now()
-			nextTick = nextEngineWake(loopBase, interval, ranTick)
+			base := loopBase
+			if !ranTick {
+				base = now
+			}
+			nextTick = nextEngineWake(base, interval, ranTick)
 			e.logNextCycle(nextTick)
 			// Safe to call Reset directly: timer.C was just consumed above.
 			timer.Reset(time.Until(nextTick))
