@@ -578,6 +578,14 @@ func ConfigPath() string {
 
 // Load reads config.yaml (creating from defaults if absent), resolves env vars,
 // and stores the result as the current global config.
+//
+// Load order (guarantees user explicit values always win over profile defaults):
+//  1. Defaults()           — baseline safe values
+//  2. peek cost.profile    — extract profile key only from YAML
+//  3. ApplyProfile()       — overlay profile-specific defaults
+//  4. yaml.Unmarshal()     — user's explicit values overwrite profile defaults
+//  5. migrateModelsConfig  — legacy field migration
+//  6. resolveEnvVars       — substitute environment variables
 func Load() (*Config, error) {
 	mu.Lock()
 	defer mu.Unlock()
@@ -588,7 +596,9 @@ func Load() (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			// First run — create from defaults.
+			// First run: apply profile defaults before saving so the written
+			// file contains the correct profile-driven values.
+			ApplyProfile(cfg)
 			if err := save(cfg, path); err != nil {
 				return nil, fmt.Errorf("create default config: %w", err)
 			}
@@ -596,13 +606,27 @@ func Load() (*Config, error) {
 			return nil, fmt.Errorf("read config: %w", err)
 		}
 	} else {
+		// Peek the cost.profile value from YAML so we can apply profile
+		// defaults before the full unmarshal, ensuring user values win.
+		var peek struct {
+			Cost struct {
+				Profile string `yaml:"profile"`
+			} `yaml:"cost"`
+		}
+		// Ignore peek errors — invalid YAML caught by full unmarshal below.
+		_ = yaml.Unmarshal(data, &peek)
+		if peek.Cost.Profile != "" {
+			cfg.Cost.Profile = peek.Cost.Profile
+		}
+
+		ApplyProfile(cfg)
+
 		if err := yaml.Unmarshal(data, cfg); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
 		}
 	}
 
 	migrateModelsConfig(cfg)
-	ApplyProfile(cfg)
 	resolveEnvVars(cfg)
 	current = cfg
 	return cfg, nil

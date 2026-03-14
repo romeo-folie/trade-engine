@@ -1,11 +1,12 @@
 package config
 
-// ApplyProfile overlays profile-driven defaults onto cfg. In Load(), this is
-// called AFTER Defaults() but BEFORE yaml.Unmarshal, so:
+// ApplyProfile overlays profile-driven defaults onto cfg. In Load(), the call
+// sequence is:
 //
 //  1. Defaults()       — baseline safe values
-//  2. ApplyProfile()   — profile-specific values (overwrites baseline)
-//  3. yaml.Unmarshal() — user's explicit values (always win, overwrite profile)
+//  2. peek profile key — extract cost.profile from YAML without full parse
+//  3. ApplyProfile()   — profile-specific values (overwrites baseline)
+//  4. yaml.Unmarshal() — user's explicit values (always win, overwrite profile)
 //
 // ApplyProfile always sets profile-owned fields so the profile contract is
 // guaranteed when no explicit value exists in the user's config file.

@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -71,15 +72,20 @@ func TestProfilePro(t *testing.T) {
 }
 
 func TestProfileExplicitOverrideWins(t *testing.T) {
-	// In Load(), yaml.Unmarshal runs AFTER ApplyProfile so explicit user values
-	// overwrite profile values. We simulate that here.
+	// The correct Load() order is: Defaults → ApplyProfile → yaml.Unmarshal.
+	// Simulate it: apply profile first, then overwrite with "user values".
 	cfg := config.Defaults()
 	cfg.Cost.Profile = "budget"
 	config.ApplyProfile(cfg)
 
-	// Simulate yaml.Unmarshal writing user's explicit values on top.
-	cfg.Engine.TickIntervalSec = 1800 // user override
-	cfg.Analysis.HoldCooldownMin = 90 // user override
+	// After ApplyProfile the profile values are set (e.g. tick=5400).
+	if cfg.Engine.TickIntervalSec != 5400 {
+		t.Errorf("budget profile should set tick=5400 before override, got %d", cfg.Engine.TickIntervalSec)
+	}
+
+	// yaml.Unmarshal runs after — user's explicit values win.
+	cfg.Engine.TickIntervalSec = 1800
+	cfg.Analysis.HoldCooldownMin = 90
 
 	if cfg.Engine.TickIntervalSec != 1800 {
 		t.Errorf("user explicit tick_interval_sec should win over profile, got %d", cfg.Engine.TickIntervalSec)
@@ -96,11 +102,8 @@ func TestProfileUnknownValidation(t *testing.T) {
 	errs := config.Validate(cfg)
 	found := false
 	for _, e := range errs {
-		if len(e) > 0 {
-			// Look for cost.profile error.
-			if e[0:12] == "cost.profile" {
-				found = true
-			}
+		if strings.HasPrefix(e, "cost.profile") {
+			found = true
 		}
 	}
 	if !found {

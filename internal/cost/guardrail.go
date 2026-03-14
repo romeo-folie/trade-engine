@@ -50,11 +50,10 @@ func (g *Guardrail) ActiveProfile() string {
 // Call once per tick. Fires auto-degrade if a threshold is crossed.
 func (g *Guardrail) Check(ctx context.Context, now time.Time) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
-
 	g.rollPeriods(now)
 
 	if !g.cfg.AutoDegradeOnBudgetHit {
+		g.mu.Unlock()
 		return
 	}
 
@@ -68,31 +67,31 @@ func (g *Guardrail) Check(ctx context.Context, now time.Time) {
 	case g.cfg.WeeklyTokenBudget > 0 && weekly >= int64(g.cfg.WeeklyTokenBudget):
 		reason = "weekly token budget exceeded"
 	default:
+		g.mu.Unlock()
 		return
 	}
 
-	g.degrade(ctx, reason)
-}
+	// Capture degrade event under lock, then release before I/O.
+	prev, next := g.profile, nextProfile(g.profile)
+	if next != prev {
+		g.profile = next
+	}
+	notifier := g.notifier
+	g.mu.Unlock()
 
-// degrade steps the active profile down one tier and notifies. Must be called
-// with g.mu held.
-func (g *Guardrail) degrade(ctx context.Context, reason string) {
-	next := nextProfile(g.profile)
-	if next == g.profile {
+	if next == prev {
 		logger.Warn("cost guardrail: already at minimum profile, cannot degrade further",
-			"profile", g.profile, "reason", reason)
+			"profile", prev, "reason", reason)
 		return
 	}
-
-	prev := g.profile
-	g.profile = next
 
 	logger.Warn("cost guardrail: auto-degrade triggered",
 		"from", prev, "to", next, "reason", reason)
 
-	if g.notifier != nil {
+	// Notify outside the critical section — SendImmediate may block on I/O.
+	if notifier != nil {
 		msg := "⚠️ *Cost guardrail*: " + reason + "\nProfile degraded " + prev + " → " + next
-		if err := g.notifier.SendImmediate(ctx, msg); err != nil {
+		if err := notifier.SendImmediate(ctx, msg); err != nil {
 			logger.Warn("cost guardrail: failed to send degrade notification", "err", err.Error())
 		}
 	}

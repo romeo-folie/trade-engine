@@ -35,7 +35,9 @@ type Tracker struct {
 	dailyTokens  atomic.Int64
 	weeklyTokens atomic.Int64
 
-	// Period boundaries.
+	// Period boundaries — protected by periodMu (separate from models mu to
+	// avoid holding the broad lock during period resets).
+	periodMu  sync.RWMutex
 	dayStart  time.Time
 	weekStart time.Time
 }
@@ -85,20 +87,32 @@ func (t *Tracker) WeeklyTokens() int64 { return t.weeklyTokens.Load() }
 // ResetDaily resets the daily counter (called at day boundary by the guardrail).
 func (t *Tracker) ResetDaily(now time.Time) {
 	t.dailyTokens.Store(0)
+	t.periodMu.Lock()
 	t.dayStart = truncateDay(now)
+	t.periodMu.Unlock()
 }
 
 // ResetWeekly resets the weekly counter (called at week boundary by the guardrail).
 func (t *Tracker) ResetWeekly(now time.Time) {
 	t.weeklyTokens.Store(0)
+	t.periodMu.Lock()
 	t.weekStart = truncateWeek(now)
+	t.periodMu.Unlock()
 }
 
 // DayStart returns the start of the current tracking day.
-func (t *Tracker) DayStart() time.Time { return t.dayStart }
+func (t *Tracker) DayStart() time.Time {
+	t.periodMu.RLock()
+	defer t.periodMu.RUnlock()
+	return t.dayStart
+}
 
 // WeekStart returns the start of the current tracking week.
-func (t *Tracker) WeekStart() time.Time { return t.weekStart }
+func (t *Tracker) WeekStart() time.Time {
+	t.periodMu.RLock()
+	defer t.periodMu.RUnlock()
+	return t.weekStart
+}
 
 // Snapshot returns a point-in-time telemetry snapshot.
 type Snapshot struct {
@@ -160,10 +174,12 @@ func (t *Tracker) TakeSnapshot() Snapshot {
 }
 
 func truncateDay(t time.Time) time.Time {
+	t = t.UTC() // normalise before extracting components
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
 func truncateWeek(t time.Time) time.Time {
+	t = t.UTC()
 	d := t.Weekday()
 	if d == time.Sunday {
 		d = 7

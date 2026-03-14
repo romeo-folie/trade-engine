@@ -287,7 +287,9 @@ func Defaults() *Config {
 			DailyTokenBudget:       200000,
 			WeeklyTokenBudget:      1200000,
 			AutoDegradeOnBudgetHit: true,
-			CacheTTLMin:            0, // set by ApplyProfile after Defaults()
+			// CacheTTLMin is set by ApplyProfile (called before yaml.Unmarshal
+			// in Load) so first-run saves write the correct profile-driven value.
+			CacheTTLMin: 0,
 		},
 	}
 }
