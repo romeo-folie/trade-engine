@@ -206,8 +206,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	// expires_at column set at insert time. The fixed cadence is intentionally
 	// independent of CacheTTLMin to avoid coupling sweep frequency to
 	// profile-driven config changes.
-	const cacheSweepInterval = 15 * time.Minute
-	go cache.NewSweeper(cacheSweepInterval).Run(ctx)
+	// Only start the cache sweeper when the database is connected.
+	// cmd/te/run.go can start the engine without a DB (e.g. dry-run mode);
+	// the sweeper calls store.DeleteExpiredCachedAnalyses which panics on
+	// an uninitialised pool.
+	if store.IsConnected() {
+		const cacheSweepInterval = 15 * time.Minute
+		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
+	}
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
 
@@ -689,7 +695,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	// Guard: only record when provider is non-empty and at least one token count
 	// is positive, to avoid creating noisy "/" model keys or zero-token entries.
 	{
-		if len(result.AnalystResults) > 1 {
+		// Prefer AnalystResults (covers both ensemble and single-analyst partial
+		// results). Only fall back to result.Meta when AnalystResults is empty
+		// (pure single-model path). This ensures a single partial ensemble result
+		// (len==1, e.g. when only one analyst is available) still gets recorded
+		// rather than falling into the Meta branch which is unpopulated in
+		// ensemble mode.
+		if len(result.AnalystResults) > 0 {
 			for _, ar := range result.AnalystResults {
 				if ar.Meta.Provider != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
 					e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
