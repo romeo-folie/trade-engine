@@ -211,7 +211,7 @@ function renderNodeContent(nodeId: string, data: unknown): ReactNode {
       return <ModelsPanel data={(data as { model_performance: ModelPerf[] }).model_performance} />;
     default:
       // Ticker nodes fall through here.
-      if (isTicker(data)) return <TickerPanel data={data as TickerData} />;
+      if (isTicker(nodeId, data)) return <TickerPanel data={data as TickerData} />;
       return <RawPanel data={data} />;
   }
 }
@@ -604,8 +604,17 @@ function accuracyColor(n?: number): string {
   return '#ef4444';
 }
 
-function isTicker(data: unknown): boolean {
-  return typeof data === 'object' && data !== null && 'ticker' in data;
+// Pipeline node IDs that route to dedicated panels — must NOT fall through to TickerPanel
+// even though /api/node/ticker/:nodeId is the fetch fallback for unknown IDs.
+const PIPELINE_NODE_IDS = new Set(Object.keys(NODE_LABELS));
+
+function isTicker(nodeId: string, data: unknown): boolean {
+  // Only treat as a ticker if the node is NOT a known pipeline node AND
+  // the response carries a `ticker` key (i.e. it came from the ticker endpoint).
+  return !PIPELINE_NODE_IDS.has(nodeId)
+    && typeof data === 'object'
+    && data !== null
+    && 'ticker' in data;
 }
 
 // ── Node display names ───────────────────────────────────────────────────────
