@@ -8,24 +8,28 @@ import {
 import '@xyflow/react/dist/style.css';
 import { useCallback, useMemo } from 'react';
 import type { NodeState, WebEvent } from '../types/protocol';
+import { particleColor } from '../types/protocol';
+import type { NodeMetrics } from '../hooks/useEngineSocket';
 import { PipelineNode } from './PipelineNode';
 import { AnimatedEdge, GlowDefs } from './AnimatedEdge';
+import type { ParticleInfo } from './AnimatedEdge';
 
 // ── Layout constants ──────────────────────────────────────────────────────────
-const COL = { source: 0, processing: 380, output: 760 };
+const COL = { source: 0, processing: 400, output: 820 };
 const ROW_GAP = 110;
 
 interface PipelineGraphProps {
   nodes: NodeState[];
   events: WebEvent[];
+  nodeMetrics: Record<string, NodeMetrics>;
   onNodeClick: (nodeId: string) => void;
 }
 
 const nodeTypes = { pipeline: PipelineNode };
 const edgeTypes = { animated: AnimatedEdge };
 
-export function PipelineGraph({ nodes, events, onNodeClick }: PipelineGraphProps) {
-  // Assign y positions per column.
+export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: PipelineGraphProps) {
+  // Assign positions per column.
   const flowNodes: Node[] = useMemo(() => {
     const byKind: Record<string, NodeState[]> = { source: [], processing: [], output: [] };
     for (const n of nodes) byKind[n.kind]?.push(n);
@@ -37,28 +41,58 @@ export function PipelineGraph({ nodes, events, onNodeClick }: PipelineGraphProps
           id: n.id,
           type: 'pipeline',
           position: { x: COL[kind as keyof typeof COL], y: i * ROW_GAP + 60 },
-          data: { nodeState: n, isActive: isRecentlyActive(n, events) },
+          data: {
+            nodeState: n,
+            isActive: isRecentlyActive(n, events),
+            metrics: nodeMetrics[n.id],
+          },
         });
       });
     }
     return result;
-  }, [nodes, events]);
+  }, [nodes, events, nodeMetrics]);
 
-  // Build edges from the static edge map + highlight active ones.
+  // Build edges with particle data from recent events.
   const flowEdges: Edge[] = useMemo(() => {
-    const activeEdges = new Set(
-      events.slice(0, 20).map(e => `${e.source}-${e.target}`)
-    );
-    return STATIC_EDGES.map(e => ({
-      ...e,
-      type: 'animated',
-      animated: activeEdges.has(`${e.source}-${e.target}`),
-      data: { active: activeEdges.has(`${e.source}-${e.target}`) },
-      style: {
-        stroke: activeEdges.has(`${e.source}-${e.target}`) ? '#00f5ff' : '#2d2b45',
-        strokeWidth: activeEdges.has(`${e.source}-${e.target}`) ? 2 : 1,
-      },
-    }));
+    // Collect recent particles per edge.
+    const edgeParticles: Record<string, ParticleInfo[]> = {};
+    const edgeColors: Record<string, string> = {};
+    const recentEvents = events.slice(0, 30);
+
+    for (const ev of recentEvents) {
+      const edgeKey = `${ev.source}-${ev.target}`;
+      if (!edgeParticles[edgeKey]) edgeParticles[edgeKey] = [];
+      // Limit particles per edge to avoid visual clutter.
+      if (edgeParticles[edgeKey].length < 4) {
+        edgeParticles[edgeKey].push({
+          id: `${ev.type}-${ev.timestamp}-${edgeParticles[edgeKey].length}`,
+          color: particleColor(ev.type),
+          timestamp: new Date(ev.timestamp).getTime(),
+        });
+      }
+      // Edge color follows the most recent event type.
+      if (!edgeColors[edgeKey]) {
+        edgeColors[edgeKey] = particleColor(ev.type);
+      }
+    }
+
+    const activeEdges = new Set(recentEvents.map(e => `${e.source}-${e.target}`));
+
+    return STATIC_EDGES.map(e => {
+      const key = `${e.source}-${e.target}`;
+      const isActive = activeEdges.has(key);
+      const color = edgeColors[key] ?? (isActive ? '#00f5ff' : '#2d2b45');
+      return {
+        ...e,
+        type: 'animated' as const,
+        animated: false, // we handle animation via particles
+        data: {
+          active: isActive,
+          particles: edgeParticles[key] ?? [],
+          edgeColor: color,
+        },
+      };
+    });
   }, [events]);
 
   const handleNodeClick = useCallback(
@@ -76,7 +110,7 @@ export function PipelineGraph({ nodes, events, onNodeClick }: PipelineGraphProps
         edgeTypes={edgeTypes}
         onNodeClick={handleNodeClick}
         fitView
-        fitViewOptions={{ padding: 0.2 }}
+        fitViewOptions={{ padding: 0.15 }}
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
       >
@@ -108,5 +142,5 @@ const STATIC_EDGES: Edge[] = [
 ];
 
 function isRecentlyActive(node: NodeState, events: WebEvent[]): boolean {
-  return events.slice(0, 10).some(e => e.source === node.id || e.target === node.id);
+  return events.slice(0, 15).some(e => e.source === node.id || e.target === node.id);
 }

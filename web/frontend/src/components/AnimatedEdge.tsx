@@ -1,17 +1,23 @@
 import { memo } from 'react';
 import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react';
-import { motion } from 'framer-motion';
+import { motion, AnimatePresence } from 'framer-motion';
+
+export interface ParticleInfo {
+  id: string;
+  color: string;
+  timestamp: number;
+}
 
 interface AnimatedEdgeData {
   active?: boolean;
+  particles?: ParticleInfo[];
+  edgeColor?: string;
   [key: string]: unknown;
 }
 
 /**
- * GlowFilter renders the shared SVG <filter> used by all animated edges.
- * Mount this once inside the React Flow <svg> (e.g. via a custom SVG layer
- * or a single invisible edge). Using a shared id avoids the invalid-SVG
- * problem of duplicating the same id="glow" across every edge element.
+ * GlowDefs renders the shared SVG <defs> for edge glow and particle bloom.
+ * Mount once at the top level.
  */
 export function GlowDefs() {
   return (
@@ -21,6 +27,14 @@ export function GlowDefs() {
           <feGaussianBlur stdDeviation="2" result="coloredBlur" />
           <feMerge>
             <feMergeNode in="coloredBlur" />
+            <feMergeNode in="SourceGraphic" />
+          </feMerge>
+        </filter>
+        <filter id="particle-bloom">
+          <feGaussianBlur stdDeviation="3" result="blur" />
+          <feMerge>
+            <feMergeNode in="blur" />
+            <feMergeNode in="blur" />
             <feMergeNode in="SourceGraphic" />
           </feMerge>
         </filter>
@@ -37,19 +51,52 @@ export const AnimatedEdge = memo(function AnimatedEdge({
   style,
 }: EdgeProps) {
   const [edgePath] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
-  const isActive = (data as AnimatedEdgeData | undefined)?.active ?? false;
+  const edgeData = data as AnimatedEdgeData | undefined;
+  const isActive = edgeData?.active ?? false;
+  const particles = edgeData?.particles ?? [];
+  const edgeColor = edgeData?.edgeColor ?? (isActive ? '#00f5ff' : '#2d2b45');
 
   return (
     <>
-      <BaseEdge id={id} path={edgePath} style={style} />
-      {isActive && (
+      <BaseEdge id={id} path={edgePath} style={{
+        ...style,
+        stroke: edgeColor,
+        strokeWidth: isActive ? 2 : 1,
+        filter: isActive ? 'url(#edge-glow)' : undefined,
+        transition: 'stroke 0.3s, stroke-width 0.3s',
+      }} />
+
+      {/* Color-coded particles flowing along the edge */}
+      <AnimatePresence>
+        {particles.map((p, i) => (
+          <motion.circle
+            key={p.id}
+            r={isActive ? 5 : 4}
+            fill={p.color}
+            filter="url(#particle-bloom)"
+            style={{ offsetPath: `path("${edgePath}")` } as React.CSSProperties}
+            initial={{ offsetDistance: '0%', opacity: 0 }}
+            animate={{ offsetDistance: '100%', opacity: [0, 1, 1, 0] }}
+            exit={{ opacity: 0 }}
+            transition={{
+              duration: 1.2,
+              delay: i * 0.15,
+              ease: 'easeInOut',
+            }}
+          />
+        ))}
+      </AnimatePresence>
+
+      {/* Persistent dim particle for active edges (ambient flow feel) */}
+      {isActive && particles.length === 0 && (
         <motion.circle
-          r={4}
-          fill="#00f5ff"
+          r={3}
+          fill={edgeColor}
+          opacity={0.4}
           filter="url(#edge-glow)"
           style={{ offsetPath: `path("${edgePath}")` } as React.CSSProperties}
           animate={{ offsetDistance: ['0%', '100%'] }}
-          transition={{ duration: 0.9, ease: 'linear', repeat: Infinity }}
+          transition={{ duration: 2, ease: 'linear', repeat: Infinity }}
         />
       )}
     </>

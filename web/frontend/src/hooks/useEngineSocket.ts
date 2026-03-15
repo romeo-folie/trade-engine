@@ -8,6 +8,12 @@ interface UseEngineSocketOptions {
   reconnectDelayMs?: number;
 }
 
+export interface NodeMetrics {
+  eventCount: number;
+  lastEventAt: number | null; // epoch ms
+  recentLatencies: number[];  // last N latency values in ms
+}
+
 interface EngineSocketState {
   status: ConnectionStatus;
   nodes: NodeState[];
@@ -15,6 +21,7 @@ interface EngineSocketState {
   eventsPerSecond: number;
   paused: boolean;
   setPaused: (p: boolean) => void;
+  nodeMetrics: Record<string, NodeMetrics>;
 }
 
 const MAX_EVENTS = 200;
@@ -29,6 +36,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [events, setEvents] = useState<WebEvent[]>([]);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [paused, setPaused] = useState(false);
+  const [nodeMetrics, setNodeMetrics] = useState<Record<string, NodeMetrics>>({});
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -36,7 +44,6 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
 
-  // Keep pausedRef in sync without recreating the socket effect.
   useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   // Rolling event-rate calculation.
@@ -64,8 +71,27 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setNodes((msg as SnapshotEvent).nodes);
           return;
         }
-        recentTimestamps.current.push(Date.now());
-        setEvents(prev => [msg as WebEvent, ...prev].slice(0, MAX_EVENTS));
+
+        const webEv = msg as WebEvent;
+        const now = Date.now();
+        recentTimestamps.current.push(now);
+
+        setEvents(prev => [webEv, ...prev].slice(0, MAX_EVENTS));
+
+        // Update per-node metrics for source and target nodes.
+        setNodeMetrics(prev => {
+          const next = { ...prev };
+          for (const nodeId of [webEv.source, webEv.target]) {
+            if (!nodeId) continue;
+            const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null, recentLatencies: [] };
+            next[nodeId] = {
+              eventCount: existing.eventCount + 1,
+              lastEventAt: now,
+              recentLatencies: existing.recentLatencies,
+            };
+          }
+          return next;
+        });
       } catch {
         // Malformed message — ignore.
       }
@@ -86,7 +112,6 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     shouldReconnectRef.current = true;
     connect();
     return () => {
-      // Prevent onclose from scheduling a zombie reconnect after unmount.
       shouldReconnectRef.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
@@ -94,7 +119,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics };
 }
 
 function buildWsUrl(): string {
