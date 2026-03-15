@@ -199,8 +199,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Background: analysis cache sweep — deletes rows whose expires_at has passed.
 	// The sweep interval is a fixed 15-minute cadence (how often the cleanup job
 	// runs), NOT the cache TTL itself. Entry expiry is determined by the
-	// expires_at column set at insert time (driven by CacheTTLMin). A fixed
-	// cadence avoids coupling sweep frequency to profile-driven TTL changes.
+	// expires_at column set at insert time. The fixed cadence is intentionally
+	// independent of CacheTTLMin to avoid coupling sweep frequency to
+	// profile-driven config changes.
 	const cacheSweepInterval = 15 * time.Minute
 	go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 
@@ -666,32 +667,40 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	result, err := e.analyzer.AnalyzeFull(ctx, req)
+
+	// Record token usage for cost tracking (#177) — BEFORE checking err.
+	// AnalyzeFull can return a non-nil result alongside a non-nil error (e.g.
+	// JSON extraction failures in single-analyst mode). Providers consume tokens
+	// before erroring, so skipping recording on error would undercount spend and
+	// delay guardrail enforcement.
+	//
+	// In ensemble mode each analyst result carries independent token counts;
+	// in single-model mode the primary meta carries all tokens.
+	// Guard: only record when provider is non-empty and at least one token count
+	// is positive, to avoid creating noisy "/" model keys or zero-token entries.
+	{
+		if len(result.AnalystResults) > 1 {
+			for _, ar := range result.AnalystResults {
+				if ar.Meta.Provider != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
+					e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
+				}
+			}
+			if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" &&
+				(result.Arbiter.Meta.InputTokens > 0 || result.Arbiter.Meta.OutputTokens > 0) {
+				e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
+					result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
+			}
+		} else if result.Meta.Provider != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
+			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
+				result.Meta.InputTokens, result.Meta.OutputTokens)
+		}
+	}
+
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
 		return
 	}
 	resp, meta := result.Response, result.Meta
-
-	// Record token usage for cost tracking (#177).
-	// In ensemble mode each analyst result carries independent token counts;
-	// in single-model mode the primary meta carries all tokens.
-	// Token usage is recorded regardless of per-analyst errors: providers can
-	// return non-zero Meta token counts even when analysis ultimately fails
-	// (e.g. JSON extraction errors). Skipping errored results would undercount
-	// spend and delay guardrail enforcement.
-	if len(result.AnalystResults) > 1 {
-		for _, ar := range result.AnalystResults {
-			if ar.Meta.Provider != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
-				e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
-			}
-		}
-		if result.Arbiter != nil {
-			e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
-				result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
-		}
-	} else {
-		e.costTracker.Record(meta.Provider, meta.Model, meta.InputTokens, meta.OutputTokens)
-	}
 
 	reasoningPreview := resp.Reasoning[:min(120, len(resp.Reasoning))]
 	logger.Info("analysis complete",
