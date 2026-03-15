@@ -36,6 +36,11 @@ var frontendFS embed.FS
 // Config holds web-server configuration.
 type Config struct {
 	Port string // e.g. "8080"
+	Host string // e.g. "127.0.0.1" (defaults to 127.0.0.1 for local-only safety)
+
+	// InsecureAllowAllOrigins disables WebSocket origin verification.
+	// Set to true only in development; never enable in production.
+	InsecureAllowAllOrigins bool
 }
 
 // Server is the TradeEngine observability web server.
@@ -64,10 +69,15 @@ func NewServer(cfg Config, bus *events.Bus) *Server {
 // It blocks until the listener is up, then runs async in background goroutines.
 // The caller must call Stop() or cancel ctx to shut down.
 func (s *Server) Start(ctx context.Context) error {
-	addr := ":" + s.cfg.Port
-	if s.cfg.Port == "" {
-		addr = ":8080"
+	host := s.cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
 	}
+	port := s.cfg.Port
+	if port == "" {
+		port = "8080"
+	}
+	addr := host + ":" + port
 
 	mux := http.NewServeMux()
 
@@ -120,17 +130,22 @@ func (s *Server) Stop() {
 
 // Addr returns the configured address (not the bound address — use for display).
 func (s *Server) Addr() string {
-	if s.cfg.Port == "" {
-		return ":8080"
+	host := s.cfg.Host
+	if host == "" {
+		host = "127.0.0.1"
 	}
-	return ":" + s.cfg.Port
+	port := s.cfg.Port
+	if port == "" {
+		port = "8080"
+	}
+	return host + ":" + port
 }
 
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: true, // allow any origin for local dev
+		InsecureSkipVerify: s.cfg.InsecureAllowAllOrigins,
 	})
 	if err != nil {
 		logger.Warn("web: ws accept failed", "err", err.Error())
@@ -203,8 +218,10 @@ func (h *clientHub) add(conn *websocket.Conn) *wsClient {
 
 func (h *clientHub) remove(c *wsClient) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	delete(h.clients, c.id)
+	h.mu.Unlock()
+	// Close the connection after releasing the lock to avoid blocking hub
+	// operations (add/broadcast/remove) if Close blocks on network I/O.
 	_ = c.conn.Close(websocket.StatusNormalClosure, "")
 }
 
@@ -216,12 +233,13 @@ func (h *clientHub) broadcast(ctx context.Context, msg any) {
 	}
 	h.mu.Unlock()
 
-	writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
 	for _, conn := range conns {
-		// Fire-and-forget per client; slow/dead clients are dropped silently.
+		// Each goroutine owns its own timeout context so that broadcast
+		// returning does not cancel an in-flight write (deferred cancel on
+		// a shared context would fire before the goroutines finish).
 		go func(c *websocket.Conn) {
+			writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
 			_ = wsjson.Write(writeCtx, c, msg)
 		}(conn)
 	}

@@ -42,10 +42,15 @@ func runWebCmd(cmd *cobra.Command, _ []string) error {
 	if err := store.Connect(ctx); err != nil {
 		return fmt.Errorf("database connection failed: %w\n(Is DATABASE_URL set?)", err)
 	}
+	defer store.Close()
 
 	bus := events.New()
 
-	srv := web.NewServer(web.Config{Port: webPort}, bus)
+	srv := web.NewServer(web.Config{
+		Port:                    webPort,
+		Host:                    "127.0.0.1",
+		InsecureAllowAllOrigins: true, // local-only dev server; safe because Host=127.0.0.1
+	}, bus)
 	if err := srv.Start(ctx); err != nil {
 		return fmt.Errorf("web server failed to start: %w", err)
 	}
