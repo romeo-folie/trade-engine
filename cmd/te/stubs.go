@@ -65,10 +65,4 @@ var _ = func() bool {
 	return true
 }()
 
-// ── Web visualisation ─────────────────────────────────────────────────────────
-
-var webCmd = &cobra.Command{
-	Use:   "web",
-	Short: "Start the web data-flow visualisation server (Phase 14)",
-	RunE:  stub("te web"),
-}
+// webCmd is implemented in web.go (Phase 14).
