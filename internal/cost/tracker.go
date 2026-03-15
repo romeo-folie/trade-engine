@@ -159,14 +159,20 @@ type ModelBreakdownEntry struct {
 	Total        int64
 }
 
-// TakeSnapshot returns a consistent Snapshot.
+// TakeSnapshot returns a best-effort point-in-time telemetry snapshot.
 //
-// All counters that contribute to the same snapshot are read while t.mu is
-// held so that DailyTokens/WeeklyTokens and ModelBreakdown reflect the same
-// logical instant.  The lifetime signal/trade counters (SignalsGenerated,
-// TradesExecuted) are read outside the lock because they are append-only and
-// only directionally associated with token spend; slight lag here is
-// acceptable and avoids extending the critical section.
+// DailyTokens/WeeklyTokens and ModelBreakdown are read while t.mu is held,
+// so they reflect the same logical instant relative to each other.
+// The lifetime signal/trade counters (SignalsGenerated, TradesExecuted) are
+// read outside the lock because they are append-only and only directionally
+// associated with token spend; under high concurrency a concurrent Record
+// call may complete between the counter reads and the lock acquisition,
+// producing a snapshot where counters are slightly ahead of token totals.
+//
+// This snapshot is suitable for observability (dashboards, reports, logs).
+// It is NOT suitable for billing or hard spend enforcement — for that, use
+// Tracker.DailyTokens() / Tracker.WeeklyTokens() directly (atomic reads)
+// as the guardrail's Check() method does.
 func (t *Tracker) TakeSnapshot() Snapshot {
 	// Lifetime counters — read outside lock (acceptable slight lag; see above).
 	signals := t.signalsGenerated.Load()

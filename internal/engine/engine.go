@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/events"
@@ -26,6 +28,11 @@ import (
 )
 
 const (
+	// maxTickIntervalSec is the upper bound for TickIntervalSec before the
+	// time.Duration conversion overflows. Values above ~9.2×10⁹ seconds would
+	// wrap to a negative duration.
+	maxTickIntervalSec = math.MaxInt64 / int64(time.Second)
+
 	// historyCandles is the number of candles fetched per watchlist item per tick.
 	// 200 daily bars covers ~10 months; enough for EMA200 and ADX warmup.
 	historyCandles = 200
@@ -66,6 +73,19 @@ type Engine struct {
 
 	// batchFlusher is called at the end of each tick to flush the Telegram batch.
 	batchFlusher BatchFlusher
+
+	// costTracker accumulates per-model token spend and lifecycle counters.
+	// Populated from AnalyzeFull results on every tick. Used for cost telemetry
+	// and to feed the budget guardrail's period checks.
+	costTracker *cost.Tracker
+
+	// costGuardrail checks token spend against configured budgets and triggers
+	// auto-degrade when thresholds are crossed. Check() is called once per tick.
+	costGuardrail *cost.Guardrail
+
+	// activeCostProfile tracks the profile most recently applied to e.cfg.Cost.
+	// When the guardrail degrades the profile, this field drives the re-apply.
+	activeCostProfile string
 
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
@@ -139,19 +159,25 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		}
 	}
 
+	tracker := cost.NewTracker()
+	guardrail := cost.NewGuardrail(&cfg.Cost, tracker, nil) // notifier set later via SetCostNotifier
+
 	return &Engine{
-		cfg:             cfg,
-		marketData:      market,
-		analyzer:        az,
-		newsProvider:    news,
-		executor:        exec,
-		portfolio:       portfolio.NewTracker(time.Hour),
-		bus:             events.New(),
-		enricher:        knowledge.NewEnricher(cfg, callFn),
-		embedder:        emb,
-		newsLastFetched: make(map[string]time.Time),
-		tickerState:     make(map[string]*TickerState),
-		mode:            mode,
+		cfg:               cfg,
+		marketData:        market,
+		analyzer:          az,
+		newsProvider:      news,
+		executor:          exec,
+		portfolio:         portfolio.NewTracker(time.Hour),
+		bus:               events.New(),
+		enricher:          knowledge.NewEnricher(cfg, callFn),
+		embedder:          emb,
+		newsLastFetched:   make(map[string]time.Time),
+		tickerState:       make(map[string]*TickerState),
+		mode:              mode,
+		costTracker:       tracker,
+		costGuardrail:     guardrail,
+		activeCostProfile: cfg.Cost.Profile,
 	}
 }
 
@@ -165,8 +191,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Guard against time.Duration overflow: time.Duration is int64 nanoseconds.
 	// MaxInt64 / 1e9 ≈ 9.2 × 10^9 seconds (≈292 years) — anything beyond that
 	// wraps to a negative duration and breaks scheduling.
-	const maxTickIntervalSec = int(math.MaxInt64 / int64(time.Second))
-	if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
+	if int64(e.cfg.Engine.TickIntervalSec) > maxTickIntervalSec {
 		return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
 	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
@@ -175,6 +200,20 @@ func (e *Engine) Run(ctx context.Context) error {
 	go e.runSignalExpiryLoop(ctx)
 	// Background: daily data retention cleanup.
 	go e.runRetentionLoop(ctx)
+	// Background: analysis cache sweep — deletes rows whose expires_at has passed.
+	// The sweep interval is a fixed 15-minute cadence (how often the cleanup job
+	// runs), NOT the cache TTL itself. Entry expiry is determined by the
+	// expires_at column set at insert time. The fixed cadence is intentionally
+	// independent of CacheTTLMin to avoid coupling sweep frequency to
+	// profile-driven config changes.
+	// Only start the cache sweeper when the database is connected.
+	// cmd/te/run.go can start the engine without a DB (e.g. dry-run mode);
+	// the sweeper calls store.DeleteExpiredCachedAnalyses which panics on
+	// an uninitialised pool.
+	if store.IsConnected() {
+		const cacheSweepInterval = 15 * time.Minute
+		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
+	}
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
 
@@ -192,6 +231,12 @@ func (e *Engine) Run(ctx context.Context) error {
 	// long-running startup tick doesn't produce a negative time.Until and
 	// cause an immediate back-to-back fire.
 	startupNow := time.Now()
+
+	// Cost guardrail: roll any period boundaries that passed since last run
+	// and check budgets before the first tick fires.
+	e.costGuardrail.Check(ctx, startupNow)
+	e.applyDegradedProfile(&interval)
+
 	ranStartupTick := false
 	if IsMarketOpen(startupNow) {
 		ranStartupTick = true
@@ -238,6 +283,13 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-timer.C:
 			// Capture a single timestamp for the open/closed decision.
 			now := time.Now()
+
+			// Cost guardrail: roll period boundaries BEFORE the tick so
+			// counters are fresh. Run outside the IsMarketOpen gate so
+			// period boundaries roll even on days when the market is closed.
+			e.costGuardrail.Check(ctx, now)
+			e.applyDegradedProfile(&interval)
+
 			ranTick := false
 			if IsMarketOpen(now) {
 				ranTick = true
@@ -249,10 +301,18 @@ func (e *Engine) Run(ctx context.Context) error {
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
 
+			// Post-tick guardrail check: the tick just recorded token usage,
+			// so re-check budgets BEFORE scheduling the next wake. This ensures
+			// a profile degrade applies immediately to the next interval rather
+			// than executing one extra tick at the higher-cost profile.
+			postTickNow := time.Now()
+			e.costGuardrail.Check(ctx, postTickNow)
+			e.applyDegradedProfile(&interval)
+
 			// Capture base after work completes to avoid negative time.Until.
 			// Same boundary logic as startup: if we skipped, use the decision
 			// timestamp 'now' to avoid skipping a whole session on a 1ms flip.
-			loopBase := time.Now()
+			loopBase := postTickNow
 			base := loopBase
 			if !ranTick {
 				base = now
@@ -285,6 +345,40 @@ func nextEngineWake(now time.Time, interval time.Duration, ranTick bool) time.Ti
 // logNextCycle logs the next scheduled tick time and the seconds until it fires.
 // Uses the actual computed next tick (which may be next market open) rather than
 // the fixed tick interval, so logs are accurate over weekends and holidays.
+// applyDegradedProfile checks if the guardrail has changed the active profile
+// and, if so, applies the new profile config and recomputes the tick interval.
+// interval is updated in-place via pointer. If the degraded profile produces an
+// invalid TickIntervalSec, a warning is logged and the previous interval is kept.
+func (e *Engine) applyDegradedProfile(interval *time.Duration) {
+	active := e.costGuardrail.ActiveProfile()
+	if active == e.activeCostProfile {
+		return
+	}
+	e.cfg.Cost.Profile = active
+	// Snapshot fields that ApplyProfile mutates but the engine cannot
+	// re-wire at runtime (e.g. Telegram batch settings, which are
+	// configured once at startup in cmd/te/run.go).
+	savedBatchEnabled := e.cfg.Notifications.Telegram.BatchEnabled
+	savedBatchWindowSec := e.cfg.Notifications.Telegram.BatchWindowSec
+	savedMaxItemsPerBatch := e.cfg.Notifications.Telegram.MaxItemsPerBatch
+	config.ApplyProfile(e.cfg)
+	// Restore un-reactable fields to avoid cfg/runtime inconsistency.
+	e.cfg.Notifications.Telegram.BatchEnabled = savedBatchEnabled
+	e.cfg.Notifications.Telegram.BatchWindowSec = savedBatchWindowSec
+	e.cfg.Notifications.Telegram.MaxItemsPerBatch = savedMaxItemsPerBatch
+	e.activeCostProfile = active
+	logger.Info("cost profile degraded — config updated", "profile", active)
+
+	newTIS := e.cfg.Engine.TickIntervalSec
+	if newTIS <= 0 || int64(newTIS) > maxTickIntervalSec {
+		logger.Warn("degraded profile produced invalid tick_interval_sec — keeping previous interval",
+			"tick_interval_sec", newTIS, "previous_interval_sec", int(interval.Seconds()))
+	} else {
+		*interval = time.Duration(newTIS) * time.Second
+		logger.Info("tick interval updated after profile degrade", "interval_sec", newTIS)
+	}
+}
+
 func (e *Engine) logNextCycle(nextTick time.Time) {
 	wait := time.Until(nextTick)
 	logger.Info("engine cycle complete",
@@ -599,6 +693,41 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	result, err := e.analyzer.AnalyzeFull(ctx, req)
+
+	// Record token usage for cost tracking (#177) — BEFORE checking err.
+	// AnalyzeFull can return a non-nil result alongside a non-nil error (e.g.
+	// JSON extraction failures in single-analyst mode). Providers consume tokens
+	// before erroring, so skipping recording on error would undercount spend and
+	// delay guardrail enforcement.
+	//
+	// In ensemble mode each analyst result carries independent token counts;
+	// in single-model mode the primary meta carries all tokens.
+	// Guard: only record when provider is non-empty and at least one token count
+	// is positive, to avoid creating noisy "/" model keys or zero-token entries.
+	{
+		// Prefer AnalystResults (covers both ensemble and single-analyst partial
+		// results). Only fall back to result.Meta when AnalystResults is empty
+		// (pure single-model path). This ensures a single partial ensemble result
+		// (len==1, e.g. when only one analyst is available) still gets recorded
+		// rather than falling into the Meta branch which is unpopulated in
+		// ensemble mode.
+		if len(result.AnalystResults) > 0 {
+			for _, ar := range result.AnalystResults {
+				if ar.Meta.Provider != "" && ar.Meta.Model != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
+					e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
+				}
+			}
+			if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" && result.Arbiter.Meta.Model != "" &&
+				(result.Arbiter.Meta.InputTokens > 0 || result.Arbiter.Meta.OutputTokens > 0) {
+				e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
+					result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
+			}
+		} else if result.Meta.Provider != "" && result.Meta.Model != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
+			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
+				result.Meta.InputTokens, result.Meta.OutputTokens)
+		}
+	}
+
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
 		return
@@ -882,6 +1011,16 @@ func (e *Engine) Portfolio() *portfolio.Tracker { return e.portfolio }
 // Bus returns the event bus for external subscribers (TUI, Telegram).
 func (e *Engine) Bus() *events.Bus { return e.bus }
 
+// CostTracker returns the engine's token-spend tracker for external reads (TUI, reports).
+func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
+
+// SetCostNotifier wires a DegradeNotifier into the cost guardrail so that
+// auto-degrade alerts are delivered immediately (bypassing batch queues).
+// Call this after the notifier is initialised — typically after TelegramBot.Start.
+func (e *Engine) SetCostNotifier(n cost.DegradeNotifier) {
+	e.costGuardrail.SetNotifier(n)
+}
+
 // ─── Phase 4: Signal generation ───────────────────────────────────────────────
 
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
@@ -968,6 +1107,9 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		logger.Warn("store signal", "ticker", ticker, "err", err)
 		return
 	}
+
+	// Cost tracking: a live signal was generated (#177).
+	e.costTracker.RecordSignal()
 
 	logger.Info("signal created",
 		"id", sigID, "ticker", ticker,
@@ -1066,6 +1208,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("insert trade", "ticker", sig.Ticker, "err", err)
 		return
 	}
+
+	// Cost tracking: a trade was executed (#177).
+	e.costTracker.RecordTrade()
 
 	// Record the entry order.
 	entryOrder := store.Order{
