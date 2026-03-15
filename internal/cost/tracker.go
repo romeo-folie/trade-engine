@@ -165,12 +165,14 @@ type ModelBreakdownEntry struct {
 // so they reflect the same logical instant relative to each other.
 // The lifetime signal/trade counters (SignalsGenerated, TradesExecuted) are
 // read outside the lock because they are append-only and only directionally
-// associated with token spend; they may lag by one Record call under high
-// concurrency.
+// associated with token spend; under high concurrency a concurrent Record
+// call may complete between the counter reads and the lock acquisition,
+// producing a snapshot where counters are slightly ahead of token totals.
 //
 // This snapshot is suitable for observability (dashboards, reports, logs).
-// It is NOT suitable for billing or hard spend enforcement — use the
-// guardrail's atomic DailyTokens/WeeklyTokens reads for that.
+// It is NOT suitable for billing or hard spend enforcement — for that, use
+// Tracker.DailyTokens() / Tracker.WeeklyTokens() directly (atomic reads)
+// as the guardrail's Check() method does.
 func (t *Tracker) TakeSnapshot() Snapshot {
 	// Lifetime counters — read outside lock (acceptable slight lag; see above).
 	signals := t.signalsGenerated.Load()

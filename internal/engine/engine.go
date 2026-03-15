@@ -196,9 +196,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	go e.runSignalExpiryLoop(ctx)
 	// Background: daily data retention cleanup.
 	go e.runRetentionLoop(ctx)
-	// Background: analysis cache TTL sweeper — deletes expired entries per CacheTTLMin.
-	// Falls back to 15 min when CacheTTLMin is zero (un-profiled or disabled).
-	go cache.NewSweeper(time.Duration(e.cfg.Cost.CacheTTLMin) * time.Minute).Run(ctx)
+	// Background: analysis cache sweep — deletes rows whose expires_at has passed.
+	// The sweep interval is a fixed 15-minute cadence (how often the cleanup job
+	// runs), NOT the cache TTL itself. Entry expiry is determined by the
+	// expires_at column set at insert time (driven by CacheTTLMin). A fixed
+	// cadence avoids coupling sweep frequency to profile-driven TTL changes.
+	const cacheSweepInterval = 15 * time.Minute
+	go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
 
@@ -225,6 +229,15 @@ func (e *Engine) Run(ctx context.Context) error {
 		config.ApplyProfile(e.cfg)
 		e.activeCostProfile = active
 		logger.Info("cost profile degraded on startup — config updated", "profile", active)
+
+		// Recompute interval: ApplyProfile may change TickIntervalSec.
+		if e.cfg.Engine.TickIntervalSec <= 0 {
+			return fmt.Errorf("engine: tick_interval_sec must be > 0 after profile degrade, got %d", e.cfg.Engine.TickIntervalSec)
+		}
+		if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
+			return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration after profile degrade (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
+		}
+		interval = time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
 	}
 
 	ranStartupTick := false
@@ -283,6 +296,13 @@ func (e *Engine) Run(ctx context.Context) error {
 				config.ApplyProfile(e.cfg)
 				e.activeCostProfile = active
 				logger.Info("cost profile degraded — config updated", "profile", active)
+
+				// Recompute interval: ApplyProfile may change TickIntervalSec.
+				// Validate the new value with the same guards as startup.
+				if e.cfg.Engine.TickIntervalSec > 0 && e.cfg.Engine.TickIntervalSec <= maxTickIntervalSec {
+					interval = time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
+					logger.Info("tick interval updated after profile degrade", "interval_sec", e.cfg.Engine.TickIntervalSec)
+				}
 			}
 
 			ranTick := false
@@ -655,9 +675,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	// Record token usage for cost tracking (#177).
 	// In ensemble mode each analyst result carries independent token counts;
 	// in single-model mode the primary meta carries all tokens.
+	// Token usage is recorded regardless of per-analyst errors: providers can
+	// return non-zero Meta token counts even when analysis ultimately fails
+	// (e.g. JSON extraction errors). Skipping errored results would undercount
+	// spend and delay guardrail enforcement.
 	if len(result.AnalystResults) > 1 {
 		for _, ar := range result.AnalystResults {
-			if ar.Err == nil {
+			if ar.Meta.Provider != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
 				e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
 			}
 		}
