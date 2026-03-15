@@ -150,6 +150,9 @@ Modes:
 				defer tgBot.Stop()
 				// Register batch flusher so the engine calls FlushBatch() at tick end.
 				eng.SetBatchFlusher(tgBot)
+				// Wire TelegramBot as the cost guardrail's degrade notifier (#178).
+				// Auto-degrade alerts bypass the batch queue via SendImmediate.
+				eng.SetCostNotifier(tgBot)
 				logger.Info("telegram notifications enabled", "batch_enabled", cfg.Notifications.Telegram.BatchEnabled)
 			}
 		}

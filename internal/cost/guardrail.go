@@ -58,6 +58,14 @@ func (g *Guardrail) ActiveProfile() string {
 	return g.profile
 }
 
+// SetNotifier replaces the DegradeNotifier used for auto-degrade alerts.
+// Safe to call after construction — used to wire in TelegramBot once it starts.
+func (g *Guardrail) SetNotifier(n DegradeNotifier) {
+	g.mu.Lock()
+	g.notifier = n
+	g.mu.Unlock()
+}
+
 // Check evaluates current token spend against the configured budgets.
 // Call once per tick. Fires auto-degrade if a threshold is crossed.
 func (g *Guardrail) Check(ctx context.Context, now time.Time) {

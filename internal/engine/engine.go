@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/events"
@@ -66,6 +68,19 @@ type Engine struct {
 
 	// batchFlusher is called at the end of each tick to flush the Telegram batch.
 	batchFlusher BatchFlusher
+
+	// costTracker accumulates per-model token spend and lifecycle counters.
+	// Populated from AnalyzeFull results on every tick. Used for cost telemetry
+	// and to feed the budget guardrail's period checks.
+	costTracker *cost.Tracker
+
+	// costGuardrail checks token spend against configured budgets and triggers
+	// auto-degrade when thresholds are crossed. Check() is called once per tick.
+	costGuardrail *cost.Guardrail
+
+	// activeCostProfile tracks the profile most recently applied to e.cfg.Cost.
+	// When the guardrail degrades the profile, this field drives the re-apply.
+	activeCostProfile string
 
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
@@ -139,19 +154,25 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		}
 	}
 
+	tracker := cost.NewTracker()
+	guardrail := cost.NewGuardrail(&cfg.Cost, tracker, nil) // notifier set later via SetCostNotifier
+
 	return &Engine{
-		cfg:             cfg,
-		marketData:      market,
-		analyzer:        az,
-		newsProvider:    news,
-		executor:        exec,
-		portfolio:       portfolio.NewTracker(time.Hour),
-		bus:             events.New(),
-		enricher:        knowledge.NewEnricher(cfg, callFn),
-		embedder:        emb,
-		newsLastFetched: make(map[string]time.Time),
-		tickerState:     make(map[string]*TickerState),
-		mode:            mode,
+		cfg:               cfg,
+		marketData:        market,
+		analyzer:          az,
+		newsProvider:      news,
+		executor:          exec,
+		portfolio:         portfolio.NewTracker(time.Hour),
+		bus:               events.New(),
+		enricher:          knowledge.NewEnricher(cfg, callFn),
+		embedder:          emb,
+		newsLastFetched:   make(map[string]time.Time),
+		tickerState:       make(map[string]*TickerState),
+		mode:              mode,
+		costTracker:       tracker,
+		costGuardrail:     guardrail,
+		activeCostProfile: cfg.Cost.Profile,
 	}
 }
 
@@ -175,6 +196,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	go e.runSignalExpiryLoop(ctx)
 	// Background: daily data retention cleanup.
 	go e.runRetentionLoop(ctx)
+	// Background: analysis cache TTL sweeper — deletes expired entries per CacheTTLMin.
+	// Falls back to 15 min when CacheTTLMin is zero (un-profiled or disabled).
+	go cache.NewSweeper(time.Duration(e.cfg.Cost.CacheTTLMin) * time.Minute).Run(ctx)
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
 
@@ -192,6 +216,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	// long-running startup tick doesn't produce a negative time.Until and
 	// cause an immediate back-to-back fire.
 	startupNow := time.Now()
+
+	// Cost guardrail: roll any period boundaries that passed since last run
+	// and check budgets before the first tick fires.
+	e.costGuardrail.Check(ctx, startupNow)
+	if active := e.costGuardrail.ActiveProfile(); active != e.activeCostProfile {
+		e.cfg.Cost.Profile = active
+		config.ApplyProfile(e.cfg)
+		e.activeCostProfile = active
+		logger.Info("cost profile degraded on startup — config updated", "profile", active)
+	}
+
 	ranStartupTick := false
 	if IsMarketOpen(startupNow) {
 		ranStartupTick = true
@@ -238,6 +273,18 @@ func (e *Engine) Run(ctx context.Context) error {
 		case <-timer.C:
 			// Capture a single timestamp for the open/closed decision.
 			now := time.Now()
+
+			// Cost guardrail: check budgets, auto-degrade profile if exceeded.
+			// Run outside the IsMarketOpen gate so period boundaries roll even
+			// on days when the market is closed.
+			e.costGuardrail.Check(ctx, now)
+			if active := e.costGuardrail.ActiveProfile(); active != e.activeCostProfile {
+				e.cfg.Cost.Profile = active
+				config.ApplyProfile(e.cfg)
+				e.activeCostProfile = active
+				logger.Info("cost profile degraded — config updated", "profile", active)
+			}
+
 			ranTick := false
 			if IsMarketOpen(now) {
 				ranTick = true
@@ -605,6 +652,23 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 	resp, meta := result.Response, result.Meta
 
+	// Record token usage for cost tracking (#177).
+	// In ensemble mode each analyst result carries independent token counts;
+	// in single-model mode the primary meta carries all tokens.
+	if len(result.AnalystResults) > 1 {
+		for _, ar := range result.AnalystResults {
+			if ar.Err == nil {
+				e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
+			}
+		}
+		if result.Arbiter != nil {
+			e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
+				result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
+		}
+	} else {
+		e.costTracker.Record(meta.Provider, meta.Model, meta.InputTokens, meta.OutputTokens)
+	}
+
 	reasoningPreview := resp.Reasoning[:min(120, len(resp.Reasoning))]
 	logger.Info("analysis complete",
 		"ticker", ticker,
@@ -882,6 +946,16 @@ func (e *Engine) Portfolio() *portfolio.Tracker { return e.portfolio }
 // Bus returns the event bus for external subscribers (TUI, Telegram).
 func (e *Engine) Bus() *events.Bus { return e.bus }
 
+// CostTracker returns the engine's token-spend tracker for external reads (TUI, reports).
+func (e *Engine) CostTracker() *cost.Tracker { return e.costTracker }
+
+// SetCostNotifier wires a DegradeNotifier into the cost guardrail so that
+// auto-degrade alerts are delivered immediately (bypassing batch queues).
+// Call this after the notifier is initialised — typically after TelegramBot.Start.
+func (e *Engine) SetCostNotifier(n cost.DegradeNotifier) {
+	e.costGuardrail.SetNotifier(n)
+}
+
 // ─── Phase 4: Signal generation ───────────────────────────────────────────────
 
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
@@ -968,6 +1042,9 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		logger.Warn("store signal", "ticker", ticker, "err", err)
 		return
 	}
+
+	// Cost tracking: a live signal was generated (#177).
+	e.costTracker.RecordSignal()
 
 	logger.Info("signal created",
 		"id", sigID, "ticker", ticker,
@@ -1066,6 +1143,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("insert trade", "ticker", sig.Ticker, "err", err)
 		return
 	}
+
+	// Cost tracking: a trade was executed (#177).
+	e.costTracker.RecordTrade()
 
 	// Record the entry order.
 	entryOrder := store.Order{
