@@ -234,12 +234,12 @@ func Defaults() *Config {
 			RiskFreeRate: 0.04,
 		},
 		Analysis: AnalysisConfig{
-			MaterialChangeOnly:    true,
-			HoldCooldownMin:       120,
-			RSIDeltaThreshold:     3.0,
-			EMAGapDeltaPct:        0.5,
-			PriceMoveThresholdPct: 0.75,
-			NewsNoveltyEnabled:    true,
+			MaterialChangeOnly:       true,
+			HoldCooldownMin:          120,
+			RSIDeltaThreshold:        3.0,
+			EMAGapDeltaPct:           0.5,
+			PriceMoveThresholdPct:    0.75,
+			NewsNoveltyEnabled:       true,
 			MaxNewsArticlesPerPrompt: 5,
 			MaxCandlesPerPrompt:      20, // must be >= largest HistoryWindowByStrategy value
 			HistoryWindowByStrategy: map[string]int{

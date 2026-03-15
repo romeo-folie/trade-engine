@@ -110,7 +110,7 @@ func TestGuardrailStepsDownAcrossDayBoundaries(t *testing.T) {
 	// Simulate day rollover: advance time by 25 h and record new spend.
 	day2 := day1.Add(25 * time.Hour)
 	tr.Record("openai", "gpt-4o", 60, 50) // additional 110 tokens (after reset these are the new day's tokens)
-	g.Check(context.Background(), day2)    // rollPeriods resets counter + flag
+	g.Check(context.Background(), day2)   // rollPeriods resets counter + flag
 	// dailyTokens is reset to 0 before the new tokens are recorded via Record,
 	// so the recorded tokens above may not exceed the cap yet on day2.
 	// The important thing is the flag was cleared — a fresh breach on day2

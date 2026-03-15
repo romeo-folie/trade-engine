@@ -29,7 +29,7 @@ func ApplyProfile(cfg *Config) {
 }
 
 func applyBudgetProfile(cfg *Config) {
-	cfg.Engine.TickIntervalSec = 5400      // 90m
+	cfg.Engine.TickIntervalSec = 5400 // 90m
 	cfg.Analysis.HoldCooldownMin = 240
 	cfg.Analysis.Classifier.Mode = "active"
 	cfg.Analysis.AdaptiveDepth.Enabled = false // depth always 1
@@ -38,7 +38,7 @@ func applyBudgetProfile(cfg *Config) {
 }
 
 func applyBalancedProfile(cfg *Config) {
-	cfg.Engine.TickIntervalSec = 3600      // 60m
+	cfg.Engine.TickIntervalSec = 3600 // 60m
 	cfg.Analysis.HoldCooldownMin = 120
 	cfg.Analysis.Classifier.Mode = "active"
 	cfg.Analysis.AdaptiveDepth.Enabled = true // depth 1–2 adaptive
@@ -47,7 +47,7 @@ func applyBalancedProfile(cfg *Config) {
 }
 
 func applyProProfile(cfg *Config) {
-	cfg.Engine.TickIntervalSec = 3600      // 60m
+	cfg.Engine.TickIntervalSec = 3600 // 60m
 	cfg.Analysis.HoldCooldownMin = 60
 	cfg.Analysis.Classifier.Mode = "active"
 	cfg.Analysis.AdaptiveDepth.Enabled = true // full depth 1–3
