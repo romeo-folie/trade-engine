@@ -11,7 +11,6 @@ interface UseEngineSocketOptions {
 export interface NodeMetrics {
   eventCount: number;
   lastEventAt: number | null; // epoch ms
-  recentLatencies: number[];  // last N latency values in ms
 }
 
 interface EngineSocketState {
@@ -83,11 +82,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           const next = { ...prev };
           for (const nodeId of [webEv.source, webEv.target]) {
             if (!nodeId) continue;
-            const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null, recentLatencies: [] };
+            const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
             next[nodeId] = {
               eventCount: existing.eventCount + 1,
               lastEventAt: now,
-              recentLatencies: existing.recentLatencies,
             };
           }
           return next;

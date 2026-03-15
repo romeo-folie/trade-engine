@@ -1,55 +1,72 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useState, useRef, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ── Types for API responses ──────────────────────────────────────────────────
+// ── Types aligned with Go struct JSON serialization (PascalCase, no json tags) ──
 
 interface RiskData {
-  open_trades: Array<{ ticker: string; direction: string; pnl_pct?: number }>;
+  open_trades: Array<{
+    Ticker: string;
+    Direction: string;
+    PnLPct: number;
+    EntryPrice: number;
+    Status: string;
+  }>;
   open_trade_count: number;
 }
 
 interface PortfolioData {
-  total_value?: number;
-  cash?: number;
-  positions?: Array<{ ticker: string; qty: number; market_value: number; unrealized_pnl: number }>;
-  daily_pnl?: number;
-  daily_return_pct?: number;
+  TotalValue?: number;
+  Cash?: number;
+  Invested?: number;
+  UnrealizedPnL?: number;
+  RealizedPnLToday?: number;
+  OpenPositions?: number;
 }
 
 interface ModelPerf {
-  provider: string;
-  model: string;
-  accuracy_pct?: number;
-  total_trades: number;
-  avg_latency_ms?: number;
+  Provider: string;
+  Model: string;
+  TotalRecommendations: number;
+  AvgConfidence: number;
+  TradeCount: number;
+  AvgPnLPct?: number;
+  WinningTrades: number;
+  LosingTrades: number;
+  WinRate?: number;
 }
 
 interface TickerData {
   ticker: string;
   analysis?: {
-    direction: string;
-    confidence: number;
-    reasoning?: string;
-    created_at?: string;
+    Direction: string;
+    Confidence: number;
+    Reasoning?: string;
+    CreatedAt?: string;
   };
-  signals?: Array<{ direction: string; confidence: number; status: string; created_at: string }>;
+  signals?: Array<{
+    Ticker: string;
+    Action: string;
+    Confidence: number;
+    Status: string;
+    CreatedAt: string;
+  }>;
 }
 
 interface SignalItem {
-  ticker: string;
-  direction: string;
-  confidence: number;
-  status: string;
-  created_at: string;
+  Ticker: string;
+  Action: string;
+  Confidence: number;
+  Status: string;
+  CreatedAt: string;
 }
 
 interface TradeItem {
-  ticker: string;
-  direction: string;
-  quantity: number;
-  price: number;
-  pnl_pct?: number;
-  created_at: string;
+  Ticker: string;
+  Direction: string;
+  Quantity: number;
+  EntryPrice: number;
+  PnLPct: number;
+  CreatedAt: string;
 }
 
 // ── Panel component ──────────────────────────────────────────────────────────
@@ -63,20 +80,35 @@ export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
   const [data, setData] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!nodeId) { setData(null); return; }
+
+    // Abort any in-flight request from previous nodeId.
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
     setLoading(true);
     setError(null);
-    fetchNodeData(nodeId)
-      .then(d => { setData(d); setLoading(false); })
-      .catch(e => { setError(String(e)); setLoading(false); });
+
+    fetchNodeData(nodeId, controller.signal)
+      .then(d => { if (!controller.signal.aborted) { setData(d); setLoading(false); } })
+      .catch(e => { if (!controller.signal.aborted) { setError(String(e)); setLoading(false); } });
 
     // Auto-refresh every 10s while panel is open.
     const iv = setInterval(() => {
-      fetchNodeData(nodeId).then(d => setData(d)).catch(() => {});
+      const refreshController = new AbortController();
+      fetchNodeData(nodeId, refreshController.signal)
+        .then(d => { if (!controller.signal.aborted) { setData(d); setError(null); } })
+        .catch(e => { if (!controller.signal.aborted) { setError(String(e)); } });
     }, 10_000);
-    return () => clearInterval(iv);
+
+    return () => {
+      controller.abort();
+      clearInterval(iv);
+    };
   }, [nodeId]);
 
   return (
@@ -182,7 +214,7 @@ function RiskPanel({ data }: { data: RiskData }) {
         <div style={{ marginTop: 16 }}>
           <SectionLabel>Active Trades</SectionLabel>
           {data.open_trades.map((t, i) => (
-            <TradeRow key={i} ticker={t.ticker} direction={t.direction} pnl={t.pnl_pct} />
+            <TradeRow key={i} ticker={t.Ticker} direction={t.Direction} pnl={t.PnLPct} price={t.EntryPrice} />
           ))}
         </div>
       )}
@@ -196,34 +228,17 @@ function PortfolioPanel({ data }: { data: PortfolioData }) {
   return (
     <div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
-        <StatCard label="Total Value" value={fmt$(data.total_value)} color="#22c55e" />
-        <StatCard label="Cash" value={fmt$(data.cash)} color="#00b4ff" />
-        <StatCard label="Daily P&L" value={fmtPnl(data.daily_pnl)} color={pnlColor(data.daily_pnl)} />
-        <StatCard label="Daily Return" value={fmtPct(data.daily_return_pct)} color={pnlColor(data.daily_return_pct)} />
+        <StatCard label="Total Value" value={fmt$(data.TotalValue)} color="#22c55e" />
+        <StatCard label="Cash" value={fmt$(data.Cash)} color="#00b4ff" />
+        <StatCard label="Invested" value={fmt$(data.Invested)} color="#a855f7" />
+        <StatCard label="Unrealized P&L" value={fmtPnl(data.UnrealizedPnL)} color={pnlColor(data.UnrealizedPnL)} />
       </div>
-      {data.positions && data.positions.length > 0 && (
-        <div style={{ marginTop: 16 }}>
-          <SectionLabel>Positions</SectionLabel>
-          {data.positions.map((p, i) => (
-            <div key={i} style={{
-              display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              padding: '8px 0',
-              borderBottom: '1px solid #1e1b3510',
-            }}>
-              <div>
-                <span style={{ color: '#e2e0ff', fontSize: 12, fontWeight: 600 }}>{p.ticker}</span>
-                <span style={{ color: '#6b6b8f', fontSize: 10, marginLeft: 8 }}>×{p.qty}</span>
-              </div>
-              <div style={{ textAlign: 'right' }}>
-                <div style={{ color: '#6b6b8f', fontSize: 10 }}>{fmt$(p.market_value)}</div>
-                <div style={{ color: pnlColor(p.unrealized_pnl), fontSize: 10 }}>
-                  {fmtPnl(p.unrealized_pnl)}
-                </div>
-              </div>
-            </div>
-          ))}
+      <div style={{ marginTop: 10 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
+          <StatCard label="Realized Today" value={fmtPnl(data.RealizedPnLToday)} color={pnlColor(data.RealizedPnLToday)} />
+          <StatCard label="Open Positions" value={data.OpenPositions ?? 0} color="#6b6b8f" />
         </div>
-      )}
+      </div>
     </div>
   );
 }
@@ -234,47 +249,54 @@ function ModelsPanel({ data }: { data: ModelPerf[] }) {
   if (!data?.length) return <EmptyState text="No model performance data yet" />;
   return (
     <div>
-      {data.map((m, i) => (
-        <div key={i} style={{
-          background: '#12103a',
-          border: '1px solid #2d2b45',
-          borderRadius: 8,
-          padding: '12px 14px',
-          marginBottom: 10,
-        }}>
-          <div style={{ color: '#e2e0ff', fontSize: 12, fontWeight: 600 }}>
-            {m.provider}/{m.model}
-          </div>
-          <div style={{ display: 'flex', gap: 16, marginTop: 8 }}>
-            <MiniStat label="Accuracy" value={fmtPct(m.accuracy_pct)} color={accuracyColor(m.accuracy_pct)} />
-            <MiniStat label="Trades" value={String(m.total_trades)} color="#6b6b8f" />
-            {m.avg_latency_ms != null && (
-              <MiniStat label="Latency" value={`${m.avg_latency_ms.toFixed(0)}ms`} color="#6b6b8f" />
+      {data.map((m, i) => {
+        const winRate = m.WinRate != null ? m.WinRate * 100 : undefined;
+        return (
+          <div key={i} style={{
+            background: '#12103a',
+            border: '1px solid #2d2b45',
+            borderRadius: 8,
+            padding: '12px 14px',
+            marginBottom: 10,
+          }}>
+            <div style={{ color: '#e2e0ff', fontSize: 12, fontWeight: 600 }}>
+              {m.Provider}/{m.Model}
+            </div>
+            <div style={{ display: 'flex', gap: 16, marginTop: 8 }}>
+              <MiniStat label="Win Rate" value={fmtPct(winRate)} color={accuracyColor(winRate)} />
+              <MiniStat label="Trades" value={String(m.TradeCount)} color="#6b6b8f" />
+              <MiniStat label="Avg Conf" value={`${(m.AvgConfidence * 100).toFixed(0)}%`} color="#a855f7" />
+            </div>
+            <div style={{ display: 'flex', gap: 16, marginTop: 4 }}>
+              <MiniStat label="W/L" value={`${m.WinningTrades}/${m.LosingTrades}`} color="#6b6b8f" />
+              {m.AvgPnLPct != null && (
+                <MiniStat label="Avg P&L" value={fmtPct(m.AvgPnLPct)} color={pnlColor(m.AvgPnLPct)} />
+              )}
+            </div>
+            {/* Win rate bar */}
+            {winRate != null && (
+              <div style={{
+                marginTop: 8,
+                height: 4,
+                background: '#1e1b35',
+                borderRadius: 2,
+                overflow: 'hidden',
+              }}>
+                <motion.div
+                  initial={{ width: 0 }}
+                  animate={{ width: `${Math.min(100, winRate)}%` }}
+                  transition={{ duration: 0.8, ease: 'easeOut' }}
+                  style={{
+                    height: '100%',
+                    background: accuracyColor(winRate),
+                    borderRadius: 2,
+                  }}
+                />
+              </div>
             )}
           </div>
-          {/* Accuracy bar */}
-          {m.accuracy_pct != null && (
-            <div style={{
-              marginTop: 8,
-              height: 4,
-              background: '#1e1b35',
-              borderRadius: 2,
-              overflow: 'hidden',
-            }}>
-              <motion.div
-                initial={{ width: 0 }}
-                animate={{ width: `${Math.min(100, m.accuracy_pct)}%` }}
-                transition={{ duration: 0.8, ease: 'easeOut' }}
-                style={{
-                  height: '100%',
-                  background: accuracyColor(m.accuracy_pct),
-                  borderRadius: 2,
-                }}
-              />
-            </div>
-          )}
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -294,19 +316,19 @@ function TickerPanel({ data }: { data: TickerData }) {
         }}>
           <SectionLabel>Latest Analysis</SectionLabel>
           <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
-            <DirectionBadge direction={data.analysis.direction} />
+            <DirectionBadge direction={data.analysis.Direction} />
             <div>
               <div style={{ color: '#e2e0ff', fontSize: 11 }}>
-                Confidence: <span style={{ color: '#a855f7' }}>{(data.analysis.confidence * 100).toFixed(0)}%</span>
+                Confidence: <span style={{ color: '#a855f7' }}>{(data.analysis.Confidence * 100).toFixed(0)}%</span>
               </div>
-              {data.analysis.created_at && (
+              {data.analysis.CreatedAt && (
                 <div style={{ color: '#4b4b6f', fontSize: 10, marginTop: 2 }}>
-                  {new Date(data.analysis.created_at).toLocaleString()}
+                  {new Date(data.analysis.CreatedAt).toLocaleString()}
                 </div>
               )}
             </div>
           </div>
-          {data.analysis.reasoning && (
+          {data.analysis.Reasoning && (
             <div style={{
               color: '#8b8aaf',
               fontSize: 10,
@@ -315,7 +337,7 @@ function TickerPanel({ data }: { data: TickerData }) {
               maxHeight: 120,
               overflow: 'auto',
             }}>
-              {data.analysis.reasoning}
+              {data.analysis.Reasoning}
             </div>
           )}
         </div>
@@ -331,10 +353,10 @@ function TickerPanel({ data }: { data: TickerData }) {
               borderBottom: '1px solid #1e1b3520',
             }}>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                <DirectionBadge direction={s.direction} small />
-                <span style={{ color: '#6b6b8f', fontSize: 10 }}>{(s.confidence * 100).toFixed(0)}%</span>
+                <DirectionBadge direction={s.Action} small />
+                <span style={{ color: '#6b6b8f', fontSize: 10 }}>{(s.Confidence * 100).toFixed(0)}%</span>
               </div>
-              <StatusBadge status={s.status} />
+              <StatusBadge status={s.Status} />
             </div>
           ))}
         </div>
@@ -350,7 +372,7 @@ function TradesPanel({ data }: { data: TradeItem[] }) {
   return (
     <div>
       {data.map((t, i) => (
-        <TradeRow key={i} ticker={t.ticker} direction={t.direction} pnl={t.pnl_pct} price={t.price} qty={t.quantity} />
+        <TradeRow key={i} ticker={t.Ticker} direction={t.Direction} pnl={t.PnLPct} price={t.EntryPrice} qty={t.Quantity} />
       ))}
     </div>
   );
@@ -369,12 +391,12 @@ function SignalsPanel({ data }: { data: SignalItem[] }) {
           borderBottom: '1px solid #1e1b3520',
         }}>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <span style={{ color: '#e2e0ff', fontSize: 12, fontWeight: 600 }}>{s.ticker}</span>
-            <DirectionBadge direction={s.direction} small />
+            <span style={{ color: '#e2e0ff', fontSize: 12, fontWeight: 600 }}>{s.Ticker}</span>
+            <DirectionBadge direction={s.Action} small />
           </div>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            <span style={{ color: '#6b6b8f', fontSize: 10 }}>{(s.confidence * 100).toFixed(0)}%</span>
-            <StatusBadge status={s.status} />
+            <span style={{ color: '#6b6b8f', fontSize: 10 }}>{(s.Confidence * 100).toFixed(0)}%</span>
+            <StatusBadge status={s.Status} />
           </div>
         </div>
       ))}
@@ -446,7 +468,8 @@ function SectionLabel({ children }: { children: ReactNode }) {
 }
 
 function DirectionBadge({ direction, small }: { direction: string; small?: boolean }) {
-  const isBuy = direction?.toLowerCase() === 'buy' || direction?.toLowerCase() === 'long';
+  const d = direction?.toLowerCase();
+  const isBuy = d === 'buy' || d === 'long';
   return (
     <span style={{
       background: isBuy ? '#22c55e20' : '#ef444420',
@@ -606,7 +629,7 @@ const NODE_DESCRIPTIONS: Record<string, string> = {
 
 // ── API ──────────────────────────────────────────────────────────────────────
 
-async function fetchNodeData(nodeId: string): Promise<unknown> {
+async function fetchNodeData(nodeId: string, signal?: AbortSignal): Promise<unknown> {
   const endpointMap: Record<string, string> = {
     risk_manager:    '/api/node/risk',
     portfolio:       '/api/node/portfolio',
@@ -617,7 +640,7 @@ async function fetchNodeData(nodeId: string): Promise<unknown> {
     consensus:       '/api/node/models',
   };
   const url = endpointMap[nodeId] ?? `/api/node/ticker/${nodeId}`;
-  const res = await fetch(url);
+  const res = await fetch(url, { signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
