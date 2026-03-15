@@ -31,7 +31,7 @@ const (
 	// maxTickIntervalSec is the upper bound for TickIntervalSec before the
 	// time.Duration conversion overflows. Values above ~9.2×10⁹ seconds would
 	// wrap to a negative duration.
-	maxTickIntervalSec = int(math.MaxInt64 / int64(time.Second))
+	maxTickIntervalSec = math.MaxInt64 / int64(time.Second)
 
 	// historyCandles is the number of candles fetched per watchlist item per tick.
 	// 200 daily bars covers ~10 months; enough for EMA200 and ADX warmup.
@@ -191,7 +191,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Guard against time.Duration overflow: time.Duration is int64 nanoseconds.
 	// MaxInt64 / 1e9 ≈ 9.2 × 10^9 seconds (≈292 years) — anything beyond that
 	// wraps to a negative duration and breaks scheduling.
-	if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
+	if int64(e.cfg.Engine.TickIntervalSec) > maxTickIntervalSec {
 		return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
 	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
@@ -355,12 +355,22 @@ func (e *Engine) applyDegradedProfile(interval *time.Duration) {
 		return
 	}
 	e.cfg.Cost.Profile = active
+	// Snapshot fields that ApplyProfile mutates but the engine cannot
+	// re-wire at runtime (e.g. Telegram batch settings, which are
+	// configured once at startup in cmd/te/run.go).
+	savedBatchEnabled := e.cfg.Notifications.Telegram.BatchEnabled
+	savedBatchWindowSec := e.cfg.Notifications.Telegram.BatchWindowSec
+	savedMaxItemsPerBatch := e.cfg.Notifications.Telegram.MaxItemsPerBatch
 	config.ApplyProfile(e.cfg)
+	// Restore un-reactable fields to avoid cfg/runtime inconsistency.
+	e.cfg.Notifications.Telegram.BatchEnabled = savedBatchEnabled
+	e.cfg.Notifications.Telegram.BatchWindowSec = savedBatchWindowSec
+	e.cfg.Notifications.Telegram.MaxItemsPerBatch = savedMaxItemsPerBatch
 	e.activeCostProfile = active
 	logger.Info("cost profile degraded — config updated", "profile", active)
 
 	newTIS := e.cfg.Engine.TickIntervalSec
-	if newTIS <= 0 || newTIS > maxTickIntervalSec {
+	if newTIS <= 0 || int64(newTIS) > maxTickIntervalSec {
 		logger.Warn("degraded profile produced invalid tick_interval_sec — keeping previous interval",
 			"tick_interval_sec", newTIS, "previous_interval_sec", int(interval.Seconds()))
 	} else {
@@ -703,16 +713,16 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		// ensemble mode.
 		if len(result.AnalystResults) > 0 {
 			for _, ar := range result.AnalystResults {
-				if ar.Meta.Provider != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
+				if ar.Meta.Provider != "" && ar.Meta.Model != "" && (ar.Meta.InputTokens > 0 || ar.Meta.OutputTokens > 0) {
 					e.costTracker.Record(ar.Meta.Provider, ar.Meta.Model, ar.Meta.InputTokens, ar.Meta.OutputTokens)
 				}
 			}
-			if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" &&
+			if result.Arbiter != nil && result.Arbiter.Meta.Provider != "" && result.Arbiter.Meta.Model != "" &&
 				(result.Arbiter.Meta.InputTokens > 0 || result.Arbiter.Meta.OutputTokens > 0) {
 				e.costTracker.Record(result.Arbiter.Meta.Provider, result.Arbiter.Meta.Model,
 					result.Arbiter.Meta.InputTokens, result.Arbiter.Meta.OutputTokens)
 			}
-		} else if result.Meta.Provider != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
+		} else if result.Meta.Provider != "" && result.Meta.Model != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
 			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
 				result.Meta.InputTokens, result.Meta.OutputTokens)
 		}
