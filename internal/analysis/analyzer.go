@@ -96,7 +96,11 @@ func (a *Analyzer) analyzeSingle(ctx context.Context, req AnalysisRequest) (Anal
 func (a *Analyzer) analyzeEnsembleResult(ctx context.Context, req AnalysisRequest) (AnalyzeResult, error) {
 	results, err := a.AnalyzeEnsemble(ctx, req)
 	if err != nil {
-		return AnalyzeResult{}, err
+		// Return partial results alongside the error so callers can still
+		// record token usage from analyst Metas. Providers consume tokens
+		// before erroring (e.g. JSON extraction failures), so discarding
+		// results would undercount spend and delay guardrail enforcement.
+		return AnalyzeResult{AnalystResults: results}, err
 	}
 
 	fpConf := a.cfg.Consensus.FastPathConfidence

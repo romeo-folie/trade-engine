@@ -28,6 +28,11 @@ import (
 )
 
 const (
+	// maxTickIntervalSec is the upper bound for TickIntervalSec before the
+	// time.Duration conversion overflows. Values above ~9.2×10⁹ seconds would
+	// wrap to a negative duration.
+	maxTickIntervalSec = int(math.MaxInt64 / int64(time.Second))
+
 	// historyCandles is the number of candles fetched per watchlist item per tick.
 	// 200 daily bars covers ~10 months; enough for EMA200 and ADX warmup.
 	historyCandles = 200
@@ -186,7 +191,6 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Guard against time.Duration overflow: time.Duration is int64 nanoseconds.
 	// MaxInt64 / 1e9 ≈ 9.2 × 10^9 seconds (≈292 years) — anything beyond that
 	// wraps to a negative duration and breaks scheduling.
-	const maxTickIntervalSec = int(math.MaxInt64 / int64(time.Second))
 	if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
 		return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
 	}
@@ -225,21 +229,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	// Cost guardrail: roll any period boundaries that passed since last run
 	// and check budgets before the first tick fires.
 	e.costGuardrail.Check(ctx, startupNow)
-	if active := e.costGuardrail.ActiveProfile(); active != e.activeCostProfile {
-		e.cfg.Cost.Profile = active
-		config.ApplyProfile(e.cfg)
-		e.activeCostProfile = active
-		logger.Info("cost profile degraded on startup — config updated", "profile", active)
-
-		// Recompute interval: ApplyProfile may change TickIntervalSec.
-		if e.cfg.Engine.TickIntervalSec <= 0 {
-			return fmt.Errorf("engine: tick_interval_sec must be > 0 after profile degrade, got %d", e.cfg.Engine.TickIntervalSec)
-		}
-		if e.cfg.Engine.TickIntervalSec > maxTickIntervalSec {
-			return fmt.Errorf("engine: tick_interval_sec %d overflows time.Duration after profile degrade (max %d)", e.cfg.Engine.TickIntervalSec, maxTickIntervalSec)
-		}
-		interval = time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
-	}
+	e.applyDegradedProfile(&interval)
 
 	ranStartupTick := false
 	if IsMarketOpen(startupNow) {
@@ -288,23 +278,11 @@ func (e *Engine) Run(ctx context.Context) error {
 			// Capture a single timestamp for the open/closed decision.
 			now := time.Now()
 
-			// Cost guardrail: check budgets, auto-degrade profile if exceeded.
-			// Run outside the IsMarketOpen gate so period boundaries roll even
-			// on days when the market is closed.
+			// Cost guardrail: roll period boundaries BEFORE the tick so
+			// counters are fresh. Run outside the IsMarketOpen gate so
+			// period boundaries roll even on days when the market is closed.
 			e.costGuardrail.Check(ctx, now)
-			if active := e.costGuardrail.ActiveProfile(); active != e.activeCostProfile {
-				e.cfg.Cost.Profile = active
-				config.ApplyProfile(e.cfg)
-				e.activeCostProfile = active
-				logger.Info("cost profile degraded — config updated", "profile", active)
-
-				// Recompute interval: ApplyProfile may change TickIntervalSec.
-				// Validate the new value with the same guards as startup.
-				if e.cfg.Engine.TickIntervalSec > 0 && e.cfg.Engine.TickIntervalSec <= maxTickIntervalSec {
-					interval = time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
-					logger.Info("tick interval updated after profile degrade", "interval_sec", e.cfg.Engine.TickIntervalSec)
-				}
-			}
+			e.applyDegradedProfile(&interval)
 
 			ranTick := false
 			if IsMarketOpen(now) {
@@ -317,10 +295,18 @@ func (e *Engine) Run(ctx context.Context) error {
 				logger.Info("market closed — skipping tick (clock skew?)")
 			}
 
+			// Post-tick guardrail check: the tick just recorded token usage,
+			// so re-check budgets BEFORE scheduling the next wake. This ensures
+			// a profile degrade applies immediately to the next interval rather
+			// than executing one extra tick at the higher-cost profile.
+			postTickNow := time.Now()
+			e.costGuardrail.Check(ctx, postTickNow)
+			e.applyDegradedProfile(&interval)
+
 			// Capture base after work completes to avoid negative time.Until.
 			// Same boundary logic as startup: if we skipped, use the decision
 			// timestamp 'now' to avoid skipping a whole session on a 1ms flip.
-			loopBase := time.Now()
+			loopBase := postTickNow
 			base := loopBase
 			if !ranTick {
 				base = now
@@ -353,6 +339,30 @@ func nextEngineWake(now time.Time, interval time.Duration, ranTick bool) time.Ti
 // logNextCycle logs the next scheduled tick time and the seconds until it fires.
 // Uses the actual computed next tick (which may be next market open) rather than
 // the fixed tick interval, so logs are accurate over weekends and holidays.
+// applyDegradedProfile checks if the guardrail has changed the active profile
+// and, if so, applies the new profile config and recomputes the tick interval.
+// interval is updated in-place via pointer. If the degraded profile produces an
+// invalid TickIntervalSec, a warning is logged and the previous interval is kept.
+func (e *Engine) applyDegradedProfile(interval *time.Duration) {
+	active := e.costGuardrail.ActiveProfile()
+	if active == e.activeCostProfile {
+		return
+	}
+	e.cfg.Cost.Profile = active
+	config.ApplyProfile(e.cfg)
+	e.activeCostProfile = active
+	logger.Info("cost profile degraded — config updated", "profile", active)
+
+	newTIS := e.cfg.Engine.TickIntervalSec
+	if newTIS <= 0 || newTIS > maxTickIntervalSec {
+		logger.Warn("degraded profile produced invalid tick_interval_sec — keeping previous interval",
+			"tick_interval_sec", newTIS, "previous_interval_sec", int(interval.Seconds()))
+	} else {
+		*interval = time.Duration(newTIS) * time.Second
+		logger.Info("tick interval updated after profile degrade", "interval_sec", newTIS)
+	}
+}
+
 func (e *Engine) logNextCycle(nextTick time.Time) {
 	wait := time.Until(nextTick)
 	logger.Info("engine cycle complete",
