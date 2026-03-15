@@ -1,10 +1,12 @@
 import { useEffect, useState, useRef, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ── Types aligned with Go API wire format.
-// PipelineNode/Portfolio/Models endpoints return PascalCase (Go default JSON serialization).
-// Risk/Ticker endpoints use mixed casing: top-level envelope keys are snake_case,
-// nested struct fields are PascalCase (matching Go struct defaults with no json tags).
+// ── Types aligned with the actual Go API wire format ──────────────────────────
+// Envelope keys (open_trades, open_trade_count, model_performance, ticker, signals)
+// are snake_case — explicitly set by the Go handlers in handlers.go.
+// Nested struct fields are PascalCase — Go's default JSON serialization for
+// exported fields with no json struct tags (e.g. Trade, Signal, ModelPerformanceRow,
+// PortfolioSnapshot).
 // ──────────────────────────────────────────────────────────────────────────────
 
 interface RiskData {
@@ -41,20 +43,20 @@ interface ModelPerf {
 
 interface TickerData {
   ticker: string;
-  // Go handler always emits this key; value is null when no analysis exists yet.
-  analysis?: {
+  // Go handler always emits these keys; values are null when no data exists yet.
+  analysis: {
     Direction: string;
     Confidence: number;
     Reasoning?: string;
     CreatedAt?: string;
   } | null;
-  signals?: Array<{
+  signals: Array<{
     Ticker: string;
     Action: string;
     Confidence: number;
     Status: string;
     CreatedAt: string;
-  }>;
+  }> | null;
 }
 
 interface SignalItem {

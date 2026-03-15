@@ -78,9 +78,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         setEvents(prev => [webEv, ...prev].slice(0, MAX_EVENTS));
 
         // Update per-node metrics for source and target nodes.
+        // Use a Set to avoid double-counting self-loop events (source === target).
         setNodeMetrics(prev => {
           const next = { ...prev };
-          for (const nodeId of [webEv.source, webEv.target]) {
+          for (const nodeId of new Set([webEv.source, webEv.target])) {
             if (!nodeId) continue;
             const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
             next[nodeId] = {

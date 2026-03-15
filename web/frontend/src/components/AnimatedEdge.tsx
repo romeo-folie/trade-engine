@@ -94,7 +94,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
           fill={edgeColor}
           opacity={0.4}
           filter="url(#edge-glow)"
-          style={{ offsetPath: `path("${edgePath}")` } as React.CSSProperties}
+          style={{ offsetPath: `path("${edgePath}")` } as CSSProperties}
           animate={{ offsetDistance: ['0%', '100%'] }}
           transition={{ duration: 2, ease: 'linear', repeat: Infinity }}
         />

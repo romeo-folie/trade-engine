@@ -139,6 +139,8 @@ const STATIC_EDGES: Edge[] = [
   { id: 'risk-approvals', source: 'risk_manager', target: 'approvals' },
   // Executor → portfolio
   { id: 'executor-portfolio', source: 'executor', target: 'portfolio' },
+  // portfolio self-loop: Go emits PortfolioSnapshot events as portfolio→portfolio
+  { id: 'portfolio-portfolio', source: 'portfolio', target: 'portfolio' },
 ];
 
 function isRecentlyActive(node: NodeState, events: WebEvent[]): boolean {
