@@ -1,7 +1,11 @@
 import { useEffect, useState, useRef, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
-// ── Types aligned with Go struct JSON serialization (PascalCase, no json tags) ──
+// ── Types aligned with Go API wire format.
+// PipelineNode/Portfolio/Models endpoints return PascalCase (Go default JSON serialization).
+// Risk/Ticker endpoints use mixed casing: top-level envelope keys are snake_case,
+// nested struct fields are PascalCase (matching Go struct defaults with no json tags).
+// ──────────────────────────────────────────────────────────────────────────────
 
 interface RiskData {
   open_trades: Array<{
@@ -37,12 +41,13 @@ interface ModelPerf {
 
 interface TickerData {
   ticker: string;
+  // Go handler always emits this key; value is null when no analysis exists yet.
   analysis?: {
     Direction: string;
     Confidence: number;
     Reasoning?: string;
     CreatedAt?: string;
-  };
+  } | null;
   signals?: Array<{
     Ticker: string;
     Action: string;
@@ -81,6 +86,7 @@ export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const refreshAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (!nodeId) { setData(null); return; }
@@ -98,15 +104,19 @@ export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
       .catch(e => { if (!controller.signal.aborted) { setError(String(e)); setLoading(false); } });
 
     // Auto-refresh every 10s while panel is open.
+    // Each tick: abort the previous refresh request before starting a new one.
     const iv = setInterval(() => {
+      refreshAbortRef.current?.abort();
       const refreshController = new AbortController();
+      refreshAbortRef.current = refreshController;
       fetchNodeData(nodeId, refreshController.signal)
-        .then(d => { if (!controller.signal.aborted) { setData(d); setError(null); } })
-        .catch(e => { if (!controller.signal.aborted) { setError(String(e)); } });
+        .then(d => { if (!refreshController.signal.aborted) { setData(d); setError(null); } })
+        .catch(e => { if (!refreshController.signal.aborted) { setError(String(e)); } });
     }, 10_000);
 
     return () => {
       controller.abort();
+      refreshAbortRef.current?.abort();
       clearInterval(iv);
     };
   }, [nodeId]);

@@ -1,4 +1,4 @@
-import { memo } from 'react';
+import { memo, type CSSProperties } from 'react';
 import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -74,7 +74,7 @@ export const AnimatedEdge = memo(function AnimatedEdge({
             r={isActive ? 5 : 4}
             fill={p.color}
             filter="url(#particle-bloom)"
-            style={{ offsetPath: `path("${edgePath}")` } as React.CSSProperties}
+            style={{ offsetPath: `path("${edgePath}")` } as CSSProperties}
             initial={{ offsetDistance: '0%', opacity: 0 }}
             animate={{ offsetDistance: '100%', opacity: [0, 1, 1, 0] }}
             exit={{ opacity: 0 }}
