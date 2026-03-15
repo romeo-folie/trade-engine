@@ -332,13 +332,13 @@ func (b *TelegramBot) handleError(ev events.Event) {
 
 // DailySummaryData holds the data needed for a daily summary notification.
 type DailySummaryData struct {
-	TotalValue    float64
-	DailyChange   float64
-	DailyChangePct float64
-	TradesOpened  int
-	TradesClosed  int
-	Wins          int
-	Losses        int
+	TotalValue       float64
+	DailyChange      float64
+	DailyChangePct   float64
+	TradesOpened     int
+	TradesClosed     int
+	Wins             int
+	Losses           int
 	SignalsGenerated int
 	SignalsBlocked   int
 }
