@@ -24,17 +24,52 @@ export interface SnapshotEvent {
   nodes: NodeState[];
 }
 
-// Particle color by event type (matches PRD §14.6)
+// ── Particle colors by event type (PRD §14.6) ──────────────────────────────
+
 export const PARTICLE_COLORS: Record<string, string> = {
-  DataFetched: '#00b4ff',       // blue — market data
-  NewsIngested: '#f59e0b',      // amber — news
-  SignalGenerated: '#a855f7',   // purple — LLM / signal
-  TradeExecuted: '#22c55e',     // green — buy
-  TradeClosed: '#ef4444',       // red — sell/close
-  SignalBlocked: '#6b7280',     // gray — blocked
-  default: '#00f5ff',           // cyan — fallback
+  // Market data
+  DataFetched:          '#00b4ff',
+  IndicatorsComputed:   '#00b4ff',
+  // News
+  NewsIngested:         '#f59e0b',
+  // LLM / analysis
+  AnalysisCompleted:    '#a855f7',
+  // Signal flow
+  SignalGenerated:      '#a855f7',
+  RiskCheckCompleted:   '#a855f7',
+  SignalQueued:         '#f59e0b',
+  // Execution
+  TradeExecuted:        '#22c55e',
+  TradeSimulated:       '#22c55e',
+  TradeClosed:          '#ef4444',
+  PositionUpdated:      '#22c55e',
+  PortfolioSnapshot:    '#22c55e',
+  // Blocked / expired
+  SignalBlocked:        '#6b7280',
+  SignalExpired:        '#6b7280',
+  // Errors
+  ErrorOccurred:        '#ef4444',
 };
 
 export function particleColor(eventType: string): string {
-  return PARTICLE_COLORS[eventType] ?? PARTICLE_COLORS.default;
+  return PARTICLE_COLORS[eventType] ?? '#00f5ff';
 }
+
+// ── Event type → human label ─────────────────────────────────────────────────
+
+export const EVENT_LABELS: Record<string, string> = {
+  DataFetched:        'Market Data',
+  IndicatorsComputed: 'Indicators',
+  AnalysisCompleted:  'Analysis',
+  SignalGenerated:    'Signal',
+  SignalBlocked:      'Blocked',
+  SignalExpired:      'Expired',
+  SignalQueued:       'Queued',
+  RiskCheckCompleted: 'Risk OK',
+  TradeExecuted:      'Trade',
+  TradeSimulated:     'Simulated',
+  TradeClosed:        'Closed',
+  PositionUpdated:    'Position',
+  PortfolioSnapshot:  'Portfolio',
+  ErrorOccurred:      'Error',
+};
