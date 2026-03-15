@@ -9,7 +9,7 @@ import '@xyflow/react/dist/style.css';
 import { useCallback, useMemo } from 'react';
 import type { NodeState, WebEvent } from '../types/protocol';
 import { PipelineNode } from './PipelineNode';
-import { AnimatedEdge } from './AnimatedEdge';
+import { AnimatedEdge, GlowDefs } from './AnimatedEdge';
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 const COL = { source: 0, processing: 380, output: 760 };
@@ -68,6 +68,7 @@ export function PipelineGraph({ nodes, events, onNodeClick }: PipelineGraphProps
 
   return (
     <div style={{ height: '100%', background: '#07060f' }}>
+      <GlowDefs />
       <ReactFlow
         nodes={flowNodes}
         edges={flowEdges}

@@ -1,1 +1,0 @@
-{"root":["./src/app.tsx","./src/main.tsx","./src/components/animatededge.tsx","./src/components/drilldownpanel.tsx","./src/components/pipelinegraph.tsx","./src/components/pipelinenode.tsx","./src/components/statusbar.tsx","./src/hooks/useenginesocket.ts","./src/types/protocol.ts"],"version":"5.8.3"}

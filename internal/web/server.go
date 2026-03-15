@@ -2,8 +2,8 @@
 //
 // Usage:
 //
-//	srv := web.NewServer(cfg, bus, store, portfolioStore)
-//	if err := srv.Start(ctx, ":8080"); err != nil { ... }
+//	srv := web.NewServer(web.Config{Port: "8080", Host: "127.0.0.1"}, bus)
+//	if err := srv.Start(ctx); err != nil { ... }
 //	defer srv.Stop()
 package web
 
@@ -27,8 +27,14 @@ import (
 // frontendFS holds the compiled React app embedded at build time.
 // The embed path is relative to this file (internal/web/), so the frontend
 // dist must be copied here before go build. The Makefile handles this.
-// If the dist directory is absent (dev mode), the server falls back to a
-// placeholder HTML page and the frontend is served via `npm run dev` instead.
+//
+// NOTE: //go:embed requires the "dist" directory to exist at compile time.
+// For dev builds without a frontend, either:
+//   - Run `cd web/frontend && npm run build` first, or
+//   - Use the `nofrontend` build tag (planned) to skip embedding.
+//
+// At runtime, fs.Sub failing is not expected — it would indicate a build
+// toolchain issue, not a missing directory.
 //
 //go:embed all:dist
 var frontendFS embed.FS
@@ -38,9 +44,9 @@ type Config struct {
 	Port string // e.g. "8080"
 	Host string // e.g. "127.0.0.1" (defaults to 127.0.0.1 for local-only safety)
 
-	// InsecureAllowAllOrigins disables WebSocket origin verification.
-	// Set to true only in development; never enable in production.
-	InsecureAllowAllOrigins bool
+	// AllowedOrigins lists the origins permitted to open WebSocket connections.
+	// If empty, only same-origin requests are accepted (the nhooyr/websocket default).
+	AllowedOrigins []string
 }
 
 // Server is the TradeEngine observability web server.
@@ -144,9 +150,11 @@ func (s *Server) Addr() string {
 // ── WebSocket handler ─────────────────────────────────────────────────────────
 
 func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		InsecureSkipVerify: s.cfg.InsecureAllowAllOrigins,
-	})
+	opts := &websocket.AcceptOptions{}
+	if len(s.cfg.AllowedOrigins) > 0 {
+		opts.OriginPatterns = s.cfg.AllowedOrigins
+	}
+	conn, err := websocket.Accept(w, r, opts)
 	if err != nil {
 		logger.Warn("web: ws accept failed", "err", err.Error())
 		return
@@ -193,9 +201,16 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 // ── Client hub ────────────────────────────────────────────────────────────────
 
 type wsClient struct {
-	conn *websocket.Conn
-	id   int
+	conn   *websocket.Conn
+	id     int
+	sendCh chan any // buffered send channel; single writer goroutine drains this
+	done   chan struct{}
 }
+
+// clientSendBuffer is the per-client outbound message buffer size.
+// Messages are dropped (with a log) when the buffer is full, applying
+// backpressure instead of spawning unbounded goroutines.
+const clientSendBuffer = 64
 
 type clientHub struct {
 	mu      sync.Mutex
@@ -211,37 +226,58 @@ func (h *clientHub) add(conn *websocket.Conn) *wsClient {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.nextID++
-	c := &wsClient{conn: conn, id: h.nextID}
+	c := &wsClient{
+		conn:   conn,
+		id:     h.nextID,
+		sendCh: make(chan any, clientSendBuffer),
+		done:   make(chan struct{}),
+	}
 	h.clients[c.id] = c
+
+	// Single writer goroutine per client — serializes writes and bounds
+	// goroutine count to O(clients) instead of O(clients × events).
+	go c.writePump()
+
 	return c
+}
+
+// writePump drains the client's send channel and writes each message to the
+// WebSocket connection. It exits when sendCh is closed (via hub.remove).
+func (c *wsClient) writePump() {
+	defer close(c.done)
+	for msg := range c.sendCh {
+		writeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := wsjson.Write(writeCtx, c.conn, msg); err != nil {
+			cancel()
+			logger.Warn("web: write failed, dropping client", "client", c.id, "err", err.Error())
+			return
+		}
+		cancel()
+	}
 }
 
 func (h *clientHub) remove(c *wsClient) {
 	h.mu.Lock()
 	delete(h.clients, c.id)
 	h.mu.Unlock()
-	// Close the connection after releasing the lock to avoid blocking hub
-	// operations (add/broadcast/remove) if Close blocks on network I/O.
+
+	// Close the send channel to stop the write pump, then close the conn.
+	close(c.sendCh)
+	<-c.done // wait for writePump to exit
 	_ = c.conn.Close(websocket.StatusNormalClosure, "")
 }
 
-func (h *clientHub) broadcast(ctx context.Context, msg any) {
+func (h *clientHub) broadcast(_ context.Context, msg any) {
 	h.mu.Lock()
-	conns := make([]*websocket.Conn, 0, len(h.clients))
-	for _, c := range h.clients {
-		conns = append(conns, c.conn)
-	}
-	h.mu.Unlock()
+	defer h.mu.Unlock()
 
-	for _, conn := range conns {
-		// Each goroutine owns its own timeout context so that broadcast
-		// returning does not cancel an in-flight write (deferred cancel on
-		// a shared context would fire before the goroutines finish).
-		go func(c *websocket.Conn) {
-			writeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			defer cancel()
-			_ = wsjson.Write(writeCtx, c, msg)
-		}(conn)
+	for _, c := range h.clients {
+		select {
+		case c.sendCh <- msg:
+		default:
+			// Buffer full — drop message for this client (backpressure).
+			logger.Warn("web: send buffer full, dropping message", "client", c.id)
+		}
 	}
 }
 
@@ -266,7 +302,13 @@ func toWebEvent(ev events.Event) *WebEvent {
 	if evType == "" {
 		return nil
 	}
-	payload, _ := json.Marshal(ev.Payload)
+	payload, err := json.Marshal(ev.Payload)
+	if err != nil {
+		logger.Warn("web: failed to marshal event payload",
+			"type", string(ev.Type), "err", err.Error())
+		// Send event without payload so the UI still sees pipeline activity.
+		payload = nil
+	}
 	return &WebEvent{
 		Type:      evType,
 		Timestamp: ev.Timestamp,

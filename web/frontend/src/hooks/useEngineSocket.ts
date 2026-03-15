@@ -34,6 +34,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const pausedRef = useRef(paused);
   const recentTimestamps = useRef<number[]>([]);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shouldReconnectRef = useRef(true);
 
   // Keep pausedRef in sync without recreating the socket effect.
   useEffect(() => { pausedRef.current = paused; }, [paused]);
@@ -71,6 +72,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
 
     ws.onclose = () => {
+      if (!shouldReconnectRef.current) return;
       setStatus('reconnecting');
       reconnectTimer.current = setTimeout(connect, reconnectDelay);
     };
@@ -81,8 +83,11 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   }, [url, reconnectDelay]);
 
   useEffect(() => {
+    shouldReconnectRef.current = true;
     connect();
     return () => {
+      // Prevent onclose from scheduling a zombie reconnect after unmount.
+      shouldReconnectRef.current = false;
       if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
       wsRef.current?.close();
       setStatus('disconnected');

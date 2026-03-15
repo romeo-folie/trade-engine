@@ -54,18 +54,42 @@ type NodeState struct {
 // means the event is not forwarded to clients.
 func mapEventEdge(t events.Type) (source, target, eventType string) {
 	switch t {
-	case events.TradeExecuted:
-		return "risk_manager", "executor", "TradeExecuted"
-	case events.TradeClosed:
-		return "executor", "portfolio", "TradeClosed"
+	// ── Data pipeline ────────────────────────────────────────────────────
+	case events.DataFetched:
+		return "data_enrichment", "indicator_engine", "DataFetched"
+	case events.IndicatorsComputed:
+		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
+	case events.AnalysisCompleted:
+		return "llm_analysis", "consensus", "AnalysisCompleted"
+
+	// ── Signal flow ──────────────────────────────────────────────────────
 	case events.SignalGenerated:
 		return "consensus", "risk_manager", "SignalGenerated"
-	case events.SignalQueued:
-		return "risk_manager", "approvals", "SignalQueued"
 	case events.SignalBlocked:
 		return "risk_manager", "blocked_signals", "SignalBlocked"
+	case events.SignalExpired:
+		return "risk_manager", "blocked_signals", "SignalExpired"
+	case events.SignalQueued:
+		return "risk_manager", "approvals", "SignalQueued"
+	case events.RiskCheckCompleted:
+		return "risk_manager", "executor", "RiskCheckCompleted"
+
+	// ── Execution & portfolio ────────────────────────────────────────────
+	case events.TradeExecuted:
+		return "risk_manager", "executor", "TradeExecuted"
+	case events.TradeSimulated:
+		return "risk_manager", "executor", "TradeSimulated"
+	case events.TradeClosed:
+		return "executor", "portfolio", "TradeClosed"
+	case events.PositionUpdated:
+		return "executor", "portfolio", "PositionUpdated"
+	case events.PortfolioSnapshotTaken:
+		return "portfolio", "portfolio", "PortfolioSnapshot"
+
+	// ── System ───────────────────────────────────────────────────────────
 	case events.ErrorOccurred:
 		return "engine", "error_bus", "ErrorOccurred"
+
 	default:
 		return "", "", ""
 	}
@@ -108,5 +132,9 @@ func pipelineNodes() []NodeState {
 		{ID: "blocked_signals", Label: "Blocked Signals", Kind: "output"},
 		{ID: "approvals", Label: "Queued Approvals", Kind: "output"},
 		{ID: "portfolio", Label: "Portfolio", Kind: "output"},
+
+		// ── System nodes ─────────────────────────────────────────────────
+		{ID: "engine", Label: "Engine Core", Kind: "processing"},
+		{ID: "error_bus", Label: "Error Bus", Kind: "output"},
 	}
 }

@@ -22,9 +22,11 @@ var webCmd = &cobra.Command{
 Opening http://localhost:<port> in a browser shows a live, animated data-flow
 graph visualizing activity flowing through the engine pipeline in real time.
 
-The server connects to the same database as 'te run'. If 'te run' is also
-active on this machine the WebSocket feed will carry live engine events;
-otherwise the REST API surfaces historical data from the database.`,
+The server creates its own in-process event bus and connects to the same
+database as 'te run'. The REST API surfaces historical data from the database.
+Note: events emitted by a separate 'te run' process are NOT forwarded over
+the WebSocket — only events generated within this process are streamed live.
+Cross-process event bridging is planned for a future release.`,
 	RunE: runWebCmd,
 }
 
@@ -47,9 +49,9 @@ func runWebCmd(cmd *cobra.Command, _ []string) error {
 	bus := events.New()
 
 	srv := web.NewServer(web.Config{
-		Port:                    webPort,
-		Host:                    "127.0.0.1",
-		InsecureAllowAllOrigins: true, // local-only dev server; safe because Host=127.0.0.1
+		Port:           webPort,
+		Host:           "127.0.0.1",
+		AllowedOrigins: []string{"http://localhost:" + webPort, "http://127.0.0.1:" + webPort},
 	}, bus)
 	if err := srv.Start(ctx); err != nil {
 		return fmt.Errorf("web server failed to start: %w", err)
