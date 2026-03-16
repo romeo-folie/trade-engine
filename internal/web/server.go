@@ -293,6 +293,12 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 		// Try to open the requested path in the embedded FS.
 		cleaned := path.Clean(r.URL.Path)
 
+		// Guard against unusual requests (e.g. "OPTIONS *", empty path)
+		// where path.Clean returns non-/-prefixed values like "*" or ".".
+		if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+			cleaned = "/"
+		}
+
 		// API and WebSocket paths must never fall through to the SPA;
 		// let them 404 normally so typos don't return 200 HTML.
 		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || strings.HasPrefix(cleaned, "/ws") {
@@ -306,12 +312,14 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 		}
 		// Strip leading slash for fs.Stat (fs.FS paths must not start with /).
 		fsPath := strings.TrimPrefix(cleaned, "/")
-		if _, err := fs.Stat(root, fsPath); err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
+		info, err := fs.Stat(root, fsPath)
+		if err != nil || info.IsDir() {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}
-			// File not found — serve index.html for SPA client-side routing.
+			// File not found or directory — serve index.html for SPA client-side routing.
+			// Directories are treated as not-found to prevent directory listings.
 			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)
 			return
