@@ -332,7 +332,7 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 			}
 			// File not found or directory — serve index.html for SPA client-side routing.
 			// Directories are treated as not-found to prevent directory listings.
-			r.URL.Path = "/"
+			r.URL.Path = "/index.html"
 			fileServer.ServeHTTP(w, r)
 			return
 		}
