@@ -330,8 +330,10 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 				http.NotFound(w, r)
 				return
 			}
-			// File not found or directory — serve index.html for SPA client-side routing.
-			// Directories are treated as not-found to prevent directory listings.
+			// File not found or extension-less directory — treat as a client-side
+			// route and serve index.html so React Router can handle it.
+			// Directories with no extension (e.g. /assets) fall through here too;
+			// this prevents FileServer from generating a directory listing.
 			r.URL.Path = "/index.html"
 			fileServer.ServeHTTP(w, r)
 			return
