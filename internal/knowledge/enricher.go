@@ -310,8 +310,8 @@ func (en *Enricher) persistExtractedRelationship(ctx context.Context, newsItemID
 	if !validRelationshipTypes[r.RelationshipType] {
 		logger.Warn("skipping relationship: unknown type not in enum",
 			"type", r.RelationshipType,
-			"source_entity", r.FromEntity,
-			"target_entity", r.ToEntity,
+			"from", r.FromEntity,
+			"to", r.ToEntity,
 		)
 		return nil
 	}
