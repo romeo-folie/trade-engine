@@ -1,4 +1,4 @@
-import styles from './Portfolio.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function PortfolioScreen() {
   return (

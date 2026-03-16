@@ -321,6 +321,7 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 		info, err := fs.Stat(root, fsPath)
 		if err != nil || info.IsDir() {
 			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				logger.Error("web: unexpected fs.Stat error", "path", fsPath, "err", err.Error())
 				http.Error(w, "internal server error", http.StatusInternalServerError)
 				return
 			}

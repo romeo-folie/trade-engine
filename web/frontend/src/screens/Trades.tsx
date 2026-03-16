@@ -1,4 +1,4 @@
-import styles from './Trades.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function TradesScreen() {
   return (

@@ -21,7 +21,7 @@ The goal is a terminal-aesthetic, production-grade monitoring interface that mat
 ### Core aesthetic
 - **Background:** near-black (`#07060f` or equivalent)
 - **Primary accent:** acid green (`#00ff41` / `#39ff14`) — monochrome terminal green
-- **Typography:** monospace throughout (JetBrains Mono or Geist Mono via Google Fonts / CDN)
+- **Typography:** monospace throughout (JetBrains Mono, self-hosted via `@font-face` in `index.html`)
 - **Visual motif:** chamfered corners on all cards/panels (CSS `clip-path: polygon()`)
 - **Grid:** scanline overlay at low opacity (CSS repeating-linear-gradient)
 - **No rounded corners.** No drop shadows. Hard edges only.

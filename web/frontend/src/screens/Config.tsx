@@ -1,4 +1,4 @@
-import styles from './Config.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function ConfigScreen() {
   return (

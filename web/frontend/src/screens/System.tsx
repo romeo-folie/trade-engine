@@ -1,4 +1,4 @@
-import styles from './System.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function SystemScreen() {
   return (

@@ -1,4 +1,4 @@
-import styles from './Signals.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function SignalsScreen() {
   return (

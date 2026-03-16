@@ -1,4 +1,4 @@
-import styles from './Analysis.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function AnalysisScreen() {
   return (

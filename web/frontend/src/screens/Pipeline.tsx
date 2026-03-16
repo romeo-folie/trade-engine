@@ -1,4 +1,4 @@
-import styles from './Pipeline.module.css';
+import styles from './ScreenStub.module.css';
 
 export default function PipelineScreen() {
   return (
