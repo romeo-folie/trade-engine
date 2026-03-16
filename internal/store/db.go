@@ -183,10 +183,12 @@ func applyNoTxMigration(ctx context.Context, db *pgxpool.Pool, name, sql string)
 			return nil
 		}
 		if attempt < 3 {
+			backoff := time.NewTimer(time.Duration(attempt) * 100 * time.Millisecond)
 			select {
 			case <-ctx.Done():
+				backoff.Stop()
 				return fmt.Errorf("record no-tx migration %s: %w", name, ctx.Err())
-			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			case <-backoff.C:
 			}
 		}
 	}
