@@ -145,7 +145,12 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 					break
 				}
 				if attempt < 3 {
-					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+					select {
+					case <-ctx.Done():
+						recordErr = ctx.Err()
+						break
+					case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+					}
 				}
 			}
 			conn.Release()
@@ -163,7 +168,7 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 				return fmt.Errorf("apply migration %s: %w", name, err)
 			}
 			if _, err := tx.Exec(ctx,
-				`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
+				`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
 			); err != nil {
 				tx.Rollback(ctx) //nolint:errcheck
 				return fmt.Errorf("record migration %s: %w", name, err)
