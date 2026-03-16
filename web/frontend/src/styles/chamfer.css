@@ -1,0 +1,65 @@
+/* Chamfer utility — clip-path polygon for hard-cut corners */
+/* Usage: add class .chamfer-sm / .chamfer / .chamfer-lg to any element */
+
+/* 4px chamfer */
+.chamfer-sm {
+  clip-path: polygon(
+    4px 0%, calc(100% - 4px) 0%,
+    100% 4px, 100% calc(100% - 4px),
+    calc(100% - 4px) 100%, 4px 100%,
+    0% calc(100% - 4px), 0% 4px
+  );
+}
+
+/* 8px chamfer — default for cards/panels */
+.chamfer {
+  clip-path: polygon(
+    8px 0%, calc(100% - 8px) 0%,
+    100% 8px, 100% calc(100% - 8px),
+    calc(100% - 8px) 100%, 8px 100%,
+    0% calc(100% - 8px), 0% 8px
+  );
+}
+
+/* 12px chamfer — large panels */
+.chamfer-lg {
+  clip-path: polygon(
+    12px 0%, calc(100% - 12px) 0%,
+    100% 12px, 100% calc(100% - 12px),
+    calc(100% - 12px) 100%, 12px 100%,
+    0% calc(100% - 12px), 0% 12px
+  );
+}
+
+/* 16px chamfer — modals / hero elements */
+.chamfer-xl {
+  clip-path: polygon(
+    16px 0%, calc(100% - 16px) 0%,
+    100% 16px, 100% calc(100% - 16px),
+    calc(100% - 16px) 100%, 16px 100%,
+    0% calc(100% - 16px), 0% 16px
+  );
+}
+
+/*
+ * Chamfer border trick:
+ * clip-path clips the element including its border, so standard border
+ * doesn't show on cut corners. Use this wrapper pattern instead:
+ *
+ *   <div class="chamfer-border-wrap chamfer">
+ *     <div class="chamfer-inner chamfer">content</div>
+ *   </div>
+ *
+ * .chamfer-border-wrap { background: var(--border); padding: 1px; }
+ * .chamfer-inner        { background: var(--surface); }
+ */
+
+.chamfer-border-wrap {
+  background: var(--border);
+  padding: 1px;
+}
+
+.chamfer-border-wrap-accent {
+  background: var(--accent);
+  padding: 1px;
+}
