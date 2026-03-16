@@ -1,5 +1,5 @@
 /* Chamfer utility — clip-path polygon for hard-cut corners */
-/* Usage: add class .chamfer-sm / .chamfer / .chamfer-lg to any element */
+/* Usage: add class .chamfer-sm / .chamfer / .chamfer-lg / .chamfer-xl to any element */
 
 /* 4px chamfer */
 .chamfer-sm {

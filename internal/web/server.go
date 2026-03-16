@@ -93,7 +93,7 @@ func (s *Server) Start(ctx context.Context) error {
 		// Frontend assets not embedded (pre-build). Serve a placeholder page.
 		mux.HandleFunc("/", serveNoFrontend)
 	} else {
-		mux.Handle("/", http.FileServer(http.FS(distFS)))
+		mux.Handle("/", spaFallback(http.FileServer(http.FS(distFS)), distFS))
 	}
 
 	mux.HandleFunc("/ws", s.handleWebSocket)
@@ -282,6 +282,30 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// spaFallback wraps an http.FileServer so that requests for paths that don't
+// match a real file are served index.html, enabling HTML5 history-based routing.
+func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try to open the requested path in the embedded FS.
+		path := r.URL.Path
+		if path == "/" {
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		// Strip leading slash for fs.Open.
+		if len(path) > 0 && path[0] == '/' {
+			path = path[1:]
+		}
+		if _, err := fs.Stat(root, path); err != nil {
+			// File not found — serve index.html for SPA client-side routing.
+			r.URL.Path = "/"
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+}
 
 func serveNoFrontend(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
