@@ -125,8 +125,8 @@ type EngineConfig struct {
 	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 3600 (60 min)
 	MaxWatchlist    int     `yaml:"max_watchlist"`
 	DryRun          bool    `yaml:"dry_run"`
-	InitialCapital  float64 `yaml:"initial_capital"`  // starting cash for paper trading (default 100000)
-	LogTimezone     string  `yaml:"log_timezone"`     // IANA timezone for display (default "UTC")
+	InitialCapital  float64 `yaml:"initial_capital"` // starting cash for paper trading (default 100000)
+	LogTimezone     string  `yaml:"log_timezone"`    // IANA timezone for display (default "UTC")
 }
 
 // ── Analysis (cost-reduction gates) ──────────────────────────────────────────
