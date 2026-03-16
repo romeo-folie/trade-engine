@@ -185,7 +185,7 @@ Rules:
 - Do NOT invent relationships not present in the text.`
 }
 
-var extractionSystem = sync.OnceValue(buildExtractionSystemPrompt)()
+var extractionSystem = buildExtractionSystemPrompt()
 
 func buildExtractionPrompt(headline, summary string) (system, user string) {
 	var b strings.Builder

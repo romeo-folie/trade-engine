@@ -129,9 +129,9 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 			if err != nil {
 				return fmt.Errorf("acquire conn for no-tx migration %s: %w", name, err)
 			}
+			defer conn.Release()
 
 			if _, err := conn.Exec(ctx, string(sql)); err != nil {
-				conn.Release()
 				return fmt.Errorf("apply migration %s: %w", name, err)
 			}
 
@@ -147,13 +147,11 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 				if attempt < 3 {
 					select {
 					case <-ctx.Done():
-						recordErr = ctx.Err()
-						break
+						return fmt.Errorf("record no-tx migration %s: %w", name, ctx.Err())
 					case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
 					}
 				}
 			}
-			conn.Release()
 			if recordErr != nil {
 				return fmt.Errorf("record no-tx migration %s: %w", name, recordErr)
 			}
