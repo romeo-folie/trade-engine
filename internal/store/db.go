@@ -119,14 +119,15 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 
 		// Check for "-- no-transaction" directive: some DDL statements
 		// (e.g. ALTER TYPE … ADD VALUE) cannot run inside a transaction.
-		noTx := strings.HasPrefix(string(sql), "-- no-transaction\n")
+		noTx := hasNoTransactionDirective(string(sql))
 
 		if noTx {
 			if _, err := db.Exec(ctx, string(sql)); err != nil {
 				return fmt.Errorf("apply migration %s: %w", name, err)
 			}
+			// Note: -- no-transaction migrations must be idempotent; schema_migrations insert uses ON CONFLICT DO NOTHING for safety
 			if _, err := db.Exec(ctx,
-				`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
+				`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT DO NOTHING`, name,
 			); err != nil {
 				return fmt.Errorf("record migration %s: %w", name, err)
 			}
@@ -153,6 +154,24 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 		fmt.Printf("  applied: %s\n", name)
 	}
 	return nil
+}
+
+// hasNoTransactionDirective checks whether the first non-empty line of a
+// migration file is the "-- no-transaction" directive. It handles UTF-8 BOM,
+// CRLF line endings, and leading whitespace.
+func hasNoTransactionDirective(content string) bool {
+	// Strip UTF-8 BOM if present
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
+	// Find first non-empty line
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimRight(line, "\r")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return line == "-- no-transaction"
+	}
+	return false
 }
 
 // Ping checks database connectivity.
