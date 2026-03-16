@@ -157,9 +157,10 @@ func (en *Enricher) enrich(ctx context.Context, newsItemID, headline, summary st
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
 
-// extractionSystemPrompt builds the extraction system prompt, injecting the
+// buildExtractionSystemPrompt builds the extraction system prompt, injecting the
 // allowed relationship types from validRelationshipTypes so the prompt and the
-// validator can never drift.  Called once via sync.OnceValue.
+// validator can never drift.  Called once at package init via the
+// extractionSystem package-level var.
 func buildExtractionSystemPrompt() string {
 	return `You are a financial knowledge-graph extraction engine.
 Given a news headline and optional summary, extract any company relationships

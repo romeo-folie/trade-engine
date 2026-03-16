@@ -122,40 +122,8 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 		noTx := hasNoTransactionDirective(string(sql))
 
 		if noTx {
-			// NOTE: -- no-transaction migrations MUST be idempotent; re-application on startup is possible if recording fails.
-			// Acquire a single connection so both the migration and the recording
-			// share the same conn, avoiding pool-level failures between the two calls.
-			conn, err := db.Acquire(ctx)
-			if err != nil {
-				return fmt.Errorf("acquire conn for no-tx migration %s: %w", name, err)
-			}
-			defer conn.Release()
-
-			if _, err := conn.Exec(ctx, string(sql)); err != nil {
-				return fmt.Errorf("apply migration %s: %w", name, err)
-			}
-
-			// Record migration with retry; returns an error if all attempts fail.
-			// no-tx migrations must be idempotent: if recording fails here, the
-			// migration will be re-applied on the next startup run.
-			var recordErr error
-			for attempt := 1; attempt <= 3; attempt++ {
-				_, recordErr = conn.Exec(ctx,
-					`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
-				)
-				if recordErr == nil {
-					break
-				}
-				if attempt < 3 {
-					select {
-					case <-ctx.Done():
-						return fmt.Errorf("record no-tx migration %s: %w", name, ctx.Err())
-					case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
-					}
-				}
-			}
-			if recordErr != nil {
-				return fmt.Errorf("record no-tx migration %s: %w", name, recordErr)
+			if err := applyNoTxMigration(ctx, db, name, string(sql)); err != nil {
+				return err
 			}
 		} else {
 			tx, err := db.Begin(ctx)
@@ -180,6 +148,47 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 		fmt.Printf("  applied: %s\n", name)
 	}
 	return nil
+}
+
+// applyNoTxMigration runs a single -- no-transaction migration on a dedicated
+// connection. The connection is released when the function returns, preventing
+// pool exhaustion when multiple no-tx migrations run in sequence.
+//
+// NOTE: no-tx migrations MUST be idempotent. If recording the migration in
+// schema_migrations fails after all retries, the migration will be re-applied
+// on the next startup run.
+func applyNoTxMigration(ctx context.Context, db *pgxpool.Pool, name, sql string) error {
+	// Acquire a dedicated connection; release it on function exit (not deferred
+	// to the outer Migrate loop, which would hold connections until Migrate returns).
+	conn, err := db.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn for no-tx migration %s: %w", name, err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("apply migration %s: %w", name, err)
+	}
+
+	// Record the migration with retry. A failure here is non-fatal for the DB
+	// (the DDL already applied) but causes re-application on the next run.
+	var recordErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		_, recordErr = conn.Exec(ctx,
+			`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
+		)
+		if recordErr == nil {
+			return nil
+		}
+		if attempt < 3 {
+			select {
+			case <-ctx.Done():
+				return fmt.Errorf("record no-tx migration %s: %w", name, ctx.Err())
+			case <-time.After(time.Duration(attempt) * 100 * time.Millisecond):
+			}
+		}
+	}
+	return fmt.Errorf("record no-tx migration %s after retries: %w", name, recordErr)
 }
 
 // hasNoTransactionDirective checks whether the first non-empty line of a
