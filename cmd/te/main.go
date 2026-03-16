@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	_ "time/tzdata" // Embed IANA timezone database so LoadLocation works in minimal/container environments.
 
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
