@@ -135,7 +135,9 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 				return fmt.Errorf("apply migration %s: %w", name, err)
 			}
 
-			// Best-effort insert with retry; no-tx migrations must be idempotent.
+			// Record migration with retry; returns an error if all attempts fail.
+			// no-tx migrations must be idempotent: if recording fails here, the
+			// migration will be re-applied on the next startup run.
 			var recordErr error
 			for attempt := 1; attempt <= 3; attempt++ {
 				_, recordErr = conn.Exec(ctx,
