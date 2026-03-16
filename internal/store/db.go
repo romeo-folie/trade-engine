@@ -122,14 +122,35 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 		noTx := hasNoTransactionDirective(string(sql))
 
 		if noTx {
-			if _, err := db.Exec(ctx, string(sql)); err != nil {
+			// NOTE: -- no-transaction migrations MUST be idempotent; re-application on startup is possible if recording fails.
+			// Acquire a single connection so both the migration and the recording
+			// share the same conn, avoiding pool-level failures between the two calls.
+			conn, err := db.Acquire(ctx)
+			if err != nil {
+				return fmt.Errorf("acquire conn for no-tx migration %s: %w", name, err)
+			}
+
+			if _, err := conn.Exec(ctx, string(sql)); err != nil {
+				conn.Release()
 				return fmt.Errorf("apply migration %s: %w", name, err)
 			}
-			// Note: -- no-transaction migrations must be idempotent; schema_migrations insert uses ON CONFLICT DO NOTHING for safety
-			if _, err := db.Exec(ctx,
-				`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT DO NOTHING`, name,
-			); err != nil {
-				return fmt.Errorf("record migration %s: %w", name, err)
+
+			// Best-effort insert with retry; no-tx migrations must be idempotent.
+			var recordErr error
+			for attempt := 1; attempt <= 3; attempt++ {
+				_, recordErr = conn.Exec(ctx,
+					`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
+				)
+				if recordErr == nil {
+					break
+				}
+				if attempt < 3 {
+					time.Sleep(time.Duration(attempt) * 100 * time.Millisecond)
+				}
+			}
+			conn.Release()
+			if recordErr != nil {
+				return fmt.Errorf("record no-tx migration %s: %w", name, recordErr)
 			}
 		} else {
 			tx, err := db.Begin(ctx)
