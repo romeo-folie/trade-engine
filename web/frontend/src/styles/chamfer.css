@@ -59,6 +59,10 @@
   padding: 1px;
 }
 
+.chamfer-inner {
+  background: var(--surface);
+}
+
 .chamfer-border-wrap-accent {
   background: var(--accent);
   padding: 1px;

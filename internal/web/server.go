@@ -290,15 +290,15 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 // match a real file are served index.html, enabling HTML5 history-based routing.
 func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try to open the requested path in the embedded FS.
+		cleaned := path.Clean(r.URL.Path)
+
 		// API and WebSocket paths must never fall through to the SPA;
 		// let them 404 normally so typos don't return 200 HTML.
-		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws") {
+		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || strings.HasPrefix(cleaned, "/ws") {
 			http.NotFound(w, r)
 			return
 		}
-
-		// Try to open the requested path in the embedded FS.
-		cleaned := path.Clean(r.URL.Path)
 		if cleaned == "/" {
 			r.URL.Path = cleaned
 			fileServer.ServeHTTP(w, r)
