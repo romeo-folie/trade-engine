@@ -312,7 +312,7 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 			return
 		}
 		if cleaned == "/" {
-			r.URL.Path = cleaned
+			r.URL.Path = "/index.html"
 			fileServer.ServeHTTP(w, r)
 			return
 		}
