@@ -196,6 +196,17 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	interval := time.Duration(e.cfg.Engine.TickIntervalSec) * time.Second
 
+	// Load display timezone for log formatting (internal scheduling remains in nyLoc).
+	displayTZ := e.cfg.Engine.LogTimezone
+	if displayTZ == "" {
+		displayTZ = "UTC"
+	}
+	displayLoc, err := time.LoadLocation(displayTZ)
+	if err != nil {
+		displayLoc = time.UTC
+		logger.Warn("invalid log_timezone, falling back to UTC", "log_timezone", displayTZ)
+	}
+
 	// Background: signal expiry + staleness checks.
 	go e.runSignalExpiryLoop(ctx)
 	// Background: daily data retention cleanup.
@@ -246,7 +257,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	} else {
 		nextOpen := nextMarketOpen(startupNow)
 		logger.Info("market closed on startup — skipping initial tick",
-			"next_open_at", nextOpen.In(nyLoc).Format(time.RFC3339),
+			"next_open_at", nextOpen.In(displayLoc).Format(time.RFC3339),
 		)
 	}
 
@@ -274,7 +285,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		base = startupNow
 	}
 	nextTick := nextEngineWake(base, interval, ranStartupTick)
-	e.logNextCycle(nextTick)
+	e.logNextCycle(nextTick, displayLoc)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
 
@@ -318,7 +329,7 @@ func (e *Engine) Run(ctx context.Context) error {
 				base = now
 			}
 			nextTick = nextEngineWake(base, interval, ranTick)
-			e.logNextCycle(nextTick)
+			e.logNextCycle(nextTick, displayLoc)
 			// Safe to call Reset directly: timer.C was just consumed above.
 			timer.Reset(time.Until(nextTick))
 		case <-ctx.Done():
@@ -379,11 +390,11 @@ func (e *Engine) applyDegradedProfile(interval *time.Duration) {
 	}
 }
 
-func (e *Engine) logNextCycle(nextTick time.Time) {
+func (e *Engine) logNextCycle(nextTick time.Time, displayLoc *time.Location) {
 	wait := time.Until(nextTick)
 	logger.Info("engine cycle complete",
 		"next_cycle_in_sec", int(wait.Seconds()),
-		"next_cycle_at", nextTick.In(nyLoc).Format(time.RFC3339),
+		"next_cycle_at", nextTick.In(displayLoc).Format(time.RFC3339),
 	)
 }
 

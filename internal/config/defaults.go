@@ -10,6 +10,7 @@ func Defaults() *Config {
 			MaxWatchlist:    50,
 			DryRun:          false,
 			InitialCapital:  100000,
+			LogTimezone:     "UTC",
 		},
 		Models: ModelsConfig{
 			Registry: ModelRegistry{
