@@ -170,8 +170,10 @@ func applyNoTxMigration(ctx context.Context, db *pgxpool.Pool, name, sql string)
 		return fmt.Errorf("apply migration %s: %w", name, err)
 	}
 
-	// Record the migration with retry. A failure here is non-fatal for the DB
-	// (the DDL already applied) but causes re-application on the next run.
+	// Record the migration with retry. The DDL already applied, so a failure
+	// here won't leave the DB in a broken state, but we still abort startup so
+	// the operator notices. The migration is idempotent and will be re-applied
+	// on the next run.
 	var recordErr error
 	for attempt := 1; attempt <= 3; attempt++ {
 		_, recordErr = conn.Exec(ctx,
