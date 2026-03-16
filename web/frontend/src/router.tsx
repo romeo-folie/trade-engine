@@ -1,4 +1,4 @@
-import { createBrowserRouter } from 'react-router-dom';
+import { createBrowserRouter, Navigate } from 'react-router-dom';
 import PipelineScreen   from './screens/Pipeline';
 import PortfolioScreen  from './screens/Portfolio';
 import SignalsScreen    from './screens/Signals';
@@ -18,4 +18,5 @@ export const router = createBrowserRouter([
   { path: '/backtests',  element: <BacktestsScreen /> },
   { path: '/config',     element: <ConfigScreen /> },
   { path: '/system',     element: <SystemScreen /> },
+  { path: '*',           element: <Navigate to="/pipeline" replace /> },
 ]);

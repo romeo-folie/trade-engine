@@ -290,6 +290,12 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 // match a real file are served index.html, enabling HTML5 history-based routing.
 func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// SPA fallback only applies to navigational requests.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+
 		// Try to open the requested path in the embedded FS.
 		cleaned := path.Clean(r.URL.Path)
 
@@ -316,6 +322,12 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 		if err != nil || info.IsDir() {
 			if err != nil && !errors.Is(err, fs.ErrNotExist) {
 				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			// Asset-like paths (containing a file extension) should 404 rather than
+			// returning index.html, which would cause confusing runtime errors.
+			if path.Ext(cleaned) != "" {
+				http.NotFound(w, r)
 				return
 			}
 			// File not found or directory — serve index.html for SPA client-side routing.
