@@ -14,6 +14,8 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -287,22 +289,29 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 // match a real file are served index.html, enabling HTML5 history-based routing.
 func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// API and WebSocket paths must never fall through to the SPA;
+		// let them 404 normally so typos don't return 200 HTML.
+		if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/ws") {
+			http.NotFound(w, r)
+			return
+		}
+
 		// Try to open the requested path in the embedded FS.
-		path := r.URL.Path
-		if path == "/" {
+		cleaned := path.Clean(r.URL.Path)
+		if cleaned == "/" {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
-		// Strip leading slash for fs.Open.
-		if len(path) > 0 && path[0] == '/' {
-			path = path[1:]
-		}
-		if _, err := fs.Stat(root, path); err != nil {
+		// Strip leading slash for fs.Stat (fs.FS paths must not start with /).
+		fsPath := strings.TrimPrefix(cleaned, "/")
+		if _, err := fs.Stat(root, fsPath); err != nil {
 			// File not found — serve index.html for SPA client-side routing.
 			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)
 			return
 		}
+		// Serve the file with the cleaned path.
+		r.URL.Path = cleaned
 		fileServer.ServeHTTP(w, r)
 	})
 }

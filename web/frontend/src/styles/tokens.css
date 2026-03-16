@@ -4,7 +4,7 @@
   /* ── Colours ─────────────────────────────────────────────────────────── */
   --bg:              #07060f;
   --surface:         #0d0c17;
-  --surface-hover:   #13122100;
+  --surface-hover:   rgba(19, 18, 33, 0.08);
   --border:          #1a1830;
   --border-active:   #2a2850;
 
