@@ -1,6 +1,40 @@
 import { useEffect, useState, useRef, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
+// ── Node display names (hoisted — used before function definitions below) ─────
+
+const NODE_LABELS: Record<string, string> = {
+  alpaca: 'Alpaca',
+  polymarket: 'Polymarket',
+  kalshi: 'Kalshi',
+  news_api: 'News Feed',
+  data_enrichment: 'Data Enrichment',
+  indicator_engine: 'Indicator Computation',
+  prompt_assembly: 'Prompt Assembly',
+  llm_analysis: 'LLM Analysis',
+  consensus: 'Consensus Resolution',
+  risk_manager: 'Risk Manager',
+  executor: 'Trade Executor',
+  blocked_signals: 'Blocked Signals',
+  approvals: 'Queued Approvals',
+  portfolio: 'Portfolio',
+  engine: 'Engine Core',
+  error_bus: 'Error Bus',
+};
+
+const NODE_DESCRIPTIONS: Record<string, string> = {
+  risk_manager: 'Active risk checks — daily loss, drawdown, position limits',
+  portfolio: 'Current portfolio value, positions, and P&L',
+  llm_analysis: 'Model performance — accuracy, latency, trade count',
+  consensus: 'Multi-model consensus resolution statistics',
+  executor: 'Recent executed trades and fills',
+  blocked_signals: 'Signals blocked by risk checks',
+  approvals: 'Signals queued for manual approval',
+};
+
+// Pipeline node IDs that route to dedicated panels — must NOT fall through to TickerPanel
+const PIPELINE_NODE_IDS = new Set(Object.keys(NODE_LABELS));
+
 // ── Types aligned with the actual Go API wire format ──────────────────────────
 // Envelope keys (open_trades, open_trade_count, model_performance, ticker, signals)
 // are snake_case — explicitly set by the Go handlers in handlers.go.
@@ -604,10 +638,6 @@ function accuracyColor(n?: number): string {
   return '#ef4444';
 }
 
-// Pipeline node IDs that route to dedicated panels — must NOT fall through to TickerPanel
-// even though /api/node/ticker/:nodeId is the fetch fallback for unknown IDs.
-const PIPELINE_NODE_IDS = new Set(Object.keys(NODE_LABELS));
-
 function isTicker(nodeId: string, data: unknown): boolean {
   // Only treat as a ticker if the node is NOT a known pipeline node AND
   // the response carries a `ticker` key (i.e. it came from the ticker endpoint).
@@ -616,37 +646,6 @@ function isTicker(nodeId: string, data: unknown): boolean {
     && data !== null
     && 'ticker' in data;
 }
-
-// ── Node display names ───────────────────────────────────────────────────────
-
-const NODE_LABELS: Record<string, string> = {
-  alpaca: 'Alpaca',
-  polymarket: 'Polymarket',
-  kalshi: 'Kalshi',
-  news_api: 'News Feed',
-  data_enrichment: 'Data Enrichment',
-  indicator_engine: 'Indicator Computation',
-  prompt_assembly: 'Prompt Assembly',
-  llm_analysis: 'LLM Analysis',
-  consensus: 'Consensus Resolution',
-  risk_manager: 'Risk Manager',
-  executor: 'Trade Executor',
-  blocked_signals: 'Blocked Signals',
-  approvals: 'Queued Approvals',
-  portfolio: 'Portfolio',
-  engine: 'Engine Core',
-  error_bus: 'Error Bus',
-};
-
-const NODE_DESCRIPTIONS: Record<string, string> = {
-  risk_manager: 'Active risk checks — daily loss, drawdown, position limits',
-  portfolio: 'Current portfolio value, positions, and P&L',
-  llm_analysis: 'Model performance — accuracy, latency, trade count',
-  consensus: 'Multi-model consensus resolution statistics',
-  executor: 'Recent executed trades and fills',
-  blocked_signals: 'Signals blocked by risk checks',
-  approvals: 'Signals queued for manual approval',
-};
 
 // ── API ──────────────────────────────────────────────────────────────────────
 

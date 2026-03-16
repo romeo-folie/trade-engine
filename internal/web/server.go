@@ -11,9 +11,12 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net"
 	"net/http"
+	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -93,7 +96,7 @@ func (s *Server) Start(ctx context.Context) error {
 		// Frontend assets not embedded (pre-build). Serve a placeholder page.
 		mux.HandleFunc("/", serveNoFrontend)
 	} else {
-		mux.Handle("/", http.FileServer(http.FS(distFS)))
+		mux.Handle("/", spaFallback(http.FileServer(http.FS(distFS)), distFS))
 	}
 
 	mux.HandleFunc("/ws", s.handleWebSocket)
@@ -282,6 +285,65 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// spaFallback wraps an http.FileServer so that requests for paths that don't
+// match a real file are served index.html, enabling HTML5 history-based routing.
+func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// SPA fallback only applies to navigational requests.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Try to open the requested path in the embedded FS.
+		cleaned := path.Clean(r.URL.Path)
+
+		// Guard against unusual requests (e.g. "OPTIONS *", empty path)
+		// where path.Clean returns non-/-prefixed values like "*" or ".".
+		if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+			cleaned = "/"
+		}
+
+		// API and WebSocket paths must never fall through to the SPA;
+		// let them 404 normally so typos don't return 200 HTML.
+		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || cleaned == "/ws" || strings.HasPrefix(cleaned, "/ws/") {
+			http.NotFound(w, r)
+			return
+		}
+		if cleaned == "/" {
+			r.URL.Path = "/index.html"
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		// Strip leading slash for fs.Stat (fs.FS paths must not start with /).
+		fsPath := strings.TrimPrefix(cleaned, "/")
+		info, err := fs.Stat(root, fsPath)
+		if err != nil || info.IsDir() {
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				logger.Error("web: unexpected fs.Stat error", "path", fsPath, "err", err.Error())
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
+			// Asset-like paths (containing a file extension) should 404 rather than
+			// returning index.html, which would cause confusing runtime errors.
+			if path.Ext(cleaned) != "" {
+				http.NotFound(w, r)
+				return
+			}
+			// File not found or extension-less directory — treat as a client-side
+			// route and serve index.html so React Router can handle it.
+			// Directories with no extension (e.g. /assets) fall through here too;
+			// this prevents FileServer from generating a directory listing.
+			r.URL.Path = "/index.html"
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+		// Serve the file with the cleaned path.
+		r.URL.Path = cleaned
+		fileServer.ServeHTTP(w, r)
+	})
+}
 
 func serveNoFrontend(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
