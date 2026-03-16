@@ -11,6 +11,7 @@ import (
 	"context"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"net"
 	"net/http"
@@ -299,12 +300,17 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 		// Try to open the requested path in the embedded FS.
 		cleaned := path.Clean(r.URL.Path)
 		if cleaned == "/" {
+			r.URL.Path = cleaned
 			fileServer.ServeHTTP(w, r)
 			return
 		}
 		// Strip leading slash for fs.Stat (fs.FS paths must not start with /).
 		fsPath := strings.TrimPrefix(cleaned, "/")
 		if _, err := fs.Stat(root, fsPath); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				http.Error(w, "internal server error", http.StatusInternalServerError)
+				return
+			}
 			// File not found — serve index.html for SPA client-side routing.
 			r.URL.Path = "/"
 			fileServer.ServeHTTP(w, r)

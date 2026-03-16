@@ -189,4 +189,4 @@ The following existing files are **infrastructure, not UI** and must not be modi
 - `web/frontend/src/types/protocol.ts`
 - `vite.config.ts`
 - `tsconfig.json`
-- Go web server code (`internal/web/`)
+- Go web server code (`internal/web/`) — **exception:** `internal/web/server.go` was modified in Task 1 to add SPA history-mode fallback routing, which is required for the React Router v6 scaffold

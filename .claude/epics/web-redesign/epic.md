@@ -13,7 +13,7 @@ Tasks are sequential. Each task is a sub-issue under this epic.
 
 ### Task 1 — Design system foundation
 **Scope:** Install new deps, set up CSS custom properties (design tokens), global reset, scanline overlay, chamfer utility, typography (JetBrains Mono), router v6 scaffold (8 route stubs).
-**Files touched:** `package.json`, `src/styles/tokens.css`, `src/styles/global.css`, `src/styles/chamfer.css`, `src/router.tsx`, `src/main.tsx`, `src/App.tsx`
+**Files touched:** `package.json`, `src/styles/tokens.css`, `src/styles/global.css`, `src/styles/chamfer.css`, `src/router.tsx`, `src/main.tsx`, `src/App.tsx`, `internal/web/server.go` (SPA fallback)
 **No visual output yet** — sets up the foundation every other task builds on.
 
 ### Task 2 — App shell: top bar + sidebar navigation

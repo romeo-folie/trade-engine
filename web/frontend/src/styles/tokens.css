@@ -55,6 +55,12 @@
   --space-10: 2.5rem;
   --space-12: 3rem;
 
+  /* ── Chamfer ─────────────────────────────────────────────────────────── */
+  --chamfer-sm:  4px;
+  --chamfer:     8px;
+  --chamfer-lg:  12px;
+  --chamfer-xl:  16px;
+
   /* ── Layout ──────────────────────────────────────────────────────────── */
   --topbar-height:      40px;
   --sidebar-collapsed:  64px;
