@@ -204,7 +204,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	displayLoc, err := time.LoadLocation(displayTZ)
 	if err != nil {
 		displayLoc = time.UTC
-		logger.Warn("invalid log_timezone, falling back to UTC", "log_timezone", displayTZ)
+		logger.Warn("invalid log_timezone, falling back to UTC", "log_timezone", displayTZ, "err", err)
 	}
 
 	// Background: signal expiry + staleness checks.

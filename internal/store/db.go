@@ -117,23 +117,38 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
 
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin tx for %s: %w", name, err)
-		}
+		// Check for "-- no-transaction" directive: some DDL statements
+		// (e.g. ALTER TYPE … ADD VALUE) cannot run inside a transaction.
+		noTx := strings.HasPrefix(string(sql), "-- no-transaction\n")
 
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
-		); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return fmt.Errorf("record migration %s: %w", name, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %s: %w", name, err)
+		if noTx {
+			if _, err := db.Exec(ctx, string(sql)); err != nil {
+				return fmt.Errorf("apply migration %s: %w", name, err)
+			}
+			if _, err := db.Exec(ctx,
+				`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
+			); err != nil {
+				return fmt.Errorf("record migration %s: %w", name, err)
+			}
+		} else {
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("begin tx for %s: %w", name, err)
+			}
+
+			if _, err := tx.Exec(ctx, string(sql)); err != nil {
+				tx.Rollback(ctx) //nolint:errcheck
+				return fmt.Errorf("apply migration %s: %w", name, err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
+			); err != nil {
+				tx.Rollback(ctx) //nolint:errcheck
+				return fmt.Errorf("record migration %s: %w", name, err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit migration %s: %w", name, err)
+			}
 		}
 		fmt.Printf("  applied: %s\n", name)
 	}

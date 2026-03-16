@@ -150,7 +150,7 @@ Respond with ONLY a valid JSON array.  Each element must match this schema:
     "from_ticker":       "<stock ticker or empty string>",
     "to_entity":         "<full company name>",
     "to_ticker":         "<stock ticker or empty string>",
-    "relationship_type": "<one of: supplies_to | supplied_by | competes_with | subsidiary_of | parent_of | partner_of | manufactures_for | manufactured_by | regulates | regulated_by | affects_contract | affected_by_event | invests_in | invested_in_by>",
+    "relationship_type": "<one of: supplies_to | supplied_by | competes_with | subsidiary_of | parent_of | partner_of | manufactures_for | manufactured_by | regulates | regulated_by | affects_contract | affected_by_event | invests_in | invested_in_by | sector_member>",
     "confidence":        <float 0.0–1.0>,
     "description":       "<one-sentence explanation>"
   }
