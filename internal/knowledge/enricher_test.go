@@ -1,6 +1,9 @@
 package knowledge
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseExtractionResponse_ArrayAndFencedJSON(t *testing.T) {
 	raw := "```json\n[{\"from_entity\":\"A\",\"to_entity\":\"B\",\"relationship_type\":\"partner_of\",\"confidence\":0.9}]\n```"
@@ -13,6 +16,14 @@ func TestParseExtractionResponse_ArrayAndFencedJSON(t *testing.T) {
 	}
 	if rels[0].FromEntity != "A" || rels[0].ToEntity != "B" {
 		t.Fatalf("unexpected relationship: %+v", rels[0])
+	}
+}
+
+func TestValidRelationshipTypesInPrompt(t *testing.T) {
+	for _, rt := range validRelationshipTypes {
+		if !strings.Contains(extractionSystem, rt) {
+			t.Errorf("relationship type %q missing from extraction prompt", rt)
+		}
 	}
 }
 

@@ -19,6 +19,18 @@ import (
 // Keep this low to avoid bursty provider RPM spikes.
 const maxEnricherConcurrency = 2
 
+// validRelationshipTypes is the single source of truth for relationship type
+// values accepted by the DB enum and used in the extraction prompt.
+var validRelationshipTypes = []string{
+	"affected_by_event", "affects_contract",
+	"competes_with",
+	"manufactures_for", "manufactured_by",
+	"parent_of", "partner_of",
+	"regulated_by", "regulates",
+	"sector_member",
+	"subsidiary_of", "supplied_by", "supplies_to",
+}
+
 // Enricher extracts entity relationships from news headlines and summaries and
 // writes them to the knowledge graph as auto-generated edges.
 //
@@ -130,7 +142,7 @@ Respond with ONLY a valid JSON array.  Each element must match this schema:
     "from_ticker":       "<stock ticker or empty string>",
     "to_entity":         "<full company name>",
     "to_ticker":         "<stock ticker or empty string>",
-    "relationship_type": "<one of: supplies_to | supplied_by | competes_with | subsidiary_of | parent_of | partner_of | manufactures_for | manufactured_by | regulates | regulated_by | affects_contract | affected_by_event>",
+    "relationship_type": "<one of: ` + strings.Join(validRelationshipTypes, " | ") + `>",
     "confidence":        <float 0.0–1.0>,
     "description":       "<one-sentence explanation>"
   }
