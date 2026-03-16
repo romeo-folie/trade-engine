@@ -307,7 +307,7 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 
 		// API and WebSocket paths must never fall through to the SPA;
 		// let them 404 normally so typos don't return 200 HTML.
-		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || strings.HasPrefix(cleaned, "/ws") {
+		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || cleaned == "/ws" || strings.HasPrefix(cleaned, "/ws/") {
 			http.NotFound(w, r)
 			return
 		}

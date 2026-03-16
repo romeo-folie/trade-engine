@@ -9,7 +9,7 @@ import ConfigScreen     from './screens/Config';
 import SystemScreen     from './screens/System';
 
 export const router = createBrowserRouter([
-  { path: '/',           element: <PipelineScreen /> },
+  { path: '/',           element: <Navigate to="/pipeline" replace /> },
   { path: '/pipeline',   element: <PipelineScreen /> },
   { path: '/portfolio',  element: <PortfolioScreen /> },
   { path: '/signals',    element: <SignalsScreen /> },
