@@ -117,27 +117,100 @@ func Migrate(ctx context.Context, migrationsDir string) error {
 			return fmt.Errorf("read migration %s: %w", name, err)
 		}
 
-		tx, err := db.Begin(ctx)
-		if err != nil {
-			return fmt.Errorf("begin tx for %s: %w", name, err)
-		}
+		// Check for "-- no-transaction" directive: some DDL statements
+		// (e.g. ALTER TYPE … ADD VALUE) cannot run inside a transaction.
+		noTx := hasNoTransactionDirective(string(sql))
 
-		if _, err := tx.Exec(ctx, string(sql)); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return fmt.Errorf("apply migration %s: %w", name, err)
-		}
-		if _, err := tx.Exec(ctx,
-			`INSERT INTO schema_migrations(filename) VALUES($1)`, name,
-		); err != nil {
-			tx.Rollback(ctx) //nolint:errcheck
-			return fmt.Errorf("record migration %s: %w", name, err)
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit migration %s: %w", name, err)
+		if noTx {
+			if err := applyNoTxMigration(ctx, db, name, string(sql)); err != nil {
+				return err
+			}
+		} else {
+			tx, err := db.Begin(ctx)
+			if err != nil {
+				return fmt.Errorf("begin tx for %s: %w", name, err)
+			}
+
+			if _, err := tx.Exec(ctx, string(sql)); err != nil {
+				tx.Rollback(ctx) //nolint:errcheck
+				return fmt.Errorf("apply migration %s: %w", name, err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
+			); err != nil {
+				tx.Rollback(ctx) //nolint:errcheck
+				return fmt.Errorf("record migration %s: %w", name, err)
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return fmt.Errorf("commit migration %s: %w", name, err)
+			}
 		}
 		fmt.Printf("  applied: %s\n", name)
 	}
 	return nil
+}
+
+// applyNoTxMigration runs a single -- no-transaction migration on a dedicated
+// connection. The connection is released when the function returns, preventing
+// pool exhaustion when multiple no-tx migrations run in sequence.
+//
+// NOTE: no-tx migrations MUST be idempotent. If recording the migration in
+// schema_migrations fails after all retries, the migration will be re-applied
+// on the next startup run.
+func applyNoTxMigration(ctx context.Context, db *pgxpool.Pool, name, sql string) error {
+	// Acquire a dedicated connection; release it on function exit (not deferred
+	// to the outer Migrate loop, which would hold connections until Migrate returns).
+	conn, err := db.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire conn for no-tx migration %s: %w", name, err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("apply migration %s: %w", name, err)
+	}
+
+	// Record the migration with retry. The DDL already applied, so a failure
+	// here won't leave the DB in a broken state, but we still abort startup so
+	// the operator notices. The migration is idempotent and will be re-applied
+	// on the next run.
+	var recordErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		_, recordErr = conn.Exec(ctx,
+			`INSERT INTO schema_migrations(filename) VALUES($1) ON CONFLICT (filename) DO NOTHING`, name,
+		)
+		if recordErr == nil {
+			return nil
+		}
+		if attempt < 3 {
+			backoff := time.NewTimer(time.Duration(attempt) * 100 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				backoff.Stop()
+				return fmt.Errorf("record no-tx migration %s: %w", name, ctx.Err())
+			case <-backoff.C:
+			}
+		}
+	}
+	return fmt.Errorf("record no-tx migration %s after retries: %w", name, recordErr)
+}
+
+// hasNoTransactionDirective checks whether the first non-empty line of a
+// migration file is the "-- no-transaction" directive. It handles UTF-8 BOM,
+// CRLF line endings, and leading whitespace.
+func hasNoTransactionDirective(content string) bool {
+	// Strip UTF-8 BOM if present
+	content = strings.TrimPrefix(content, "\xef\xbb\xbf")
+	// Find first non-empty line
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimRight(line, "\r")
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		return line == "-- no-transaction"
+	}
+	return false
 }
 
 // Ping checks database connectivity.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"html"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,43 @@ import (
 // maxEnricherConcurrency caps simultaneous LLM extraction calls.
 // Keep this low to avoid bursty provider RPM spikes.
 const maxEnricherConcurrency = 2
+
+// validRelationshipTypes is the canonical set of relationship_type enum values.
+// Must be kept in sync with the Postgres relationship_type enum in migrations/.
+// The extraction prompt's "one of:" list is generated from this map (sorted) so
+// the two never drift.
+var validRelationshipTypes = map[string]bool{
+	"supplies_to":       true,
+	"supplied_by":       true,
+	"competes_with":     true,
+	"subsidiary_of":     true,
+	"parent_of":         true,
+	"partner_of":        true,
+	"sector_member":     true,
+	"manufactures_for":  true,
+	"manufactured_by":   true,
+	"regulates":         true,
+	"regulated_by":      true,
+	"affects_contract":  true,
+	"affected_by_event": true,
+	"invests_in":        true,
+	"invested_in_by":    true,
+}
+
+// relationshipTypeList returns a sorted, pipe-delimited string of all valid
+// relationship types, used to build the extraction prompt.
+// Derived from validRelationshipTypes so the two never drift.
+func relationshipTypeList() string {
+	types := make([]string, 0, len(validRelationshipTypes))
+	for t := range validRelationshipTypes {
+		types = append(types, t)
+	}
+	sort.Strings(types)
+	return strings.Join(types, " | ")
+}
+
+// allowedRelationshipTypesOnce builds the prompt fragment once at startup.
+var allowedRelationshipTypesOnce = sync.OnceValue(relationshipTypeList)
 
 // Enricher extracts entity relationships from news headlines and summaries and
 // writes them to the knowledge graph as auto-generated edges.
@@ -119,7 +157,12 @@ func (en *Enricher) enrich(ctx context.Context, newsItemID, headline, summary st
 
 // ── Prompt ────────────────────────────────────────────────────────────────────
 
-var extractionSystem = `You are a financial knowledge-graph extraction engine.
+// buildExtractionSystemPrompt builds the extraction system prompt, injecting the
+// allowed relationship types from validRelationshipTypes so the prompt and the
+// validator can never drift.  Called once at package init via the
+// extractionSystem package-level var.
+func buildExtractionSystemPrompt() string {
+	return `You are a financial knowledge-graph extraction engine.
 Given a news headline and optional summary, extract any company relationships
 described in the text.
 
@@ -130,7 +173,7 @@ Respond with ONLY a valid JSON array.  Each element must match this schema:
     "from_ticker":       "<stock ticker or empty string>",
     "to_entity":         "<full company name>",
     "to_ticker":         "<stock ticker or empty string>",
-    "relationship_type": "<one of: supplies_to | supplied_by | competes_with | subsidiary_of | parent_of | partner_of | manufactures_for | manufactured_by | regulates | regulated_by | affects_contract | affected_by_event>",
+    "relationship_type": "<one of: ` + allowedRelationshipTypesOnce() + `>",
     "confidence":        <float 0.0–1.0>,
     "description":       "<one-sentence explanation>"
   }
@@ -141,6 +184,9 @@ Rules:
 - If no relationships are found, return an empty array: [].
 - Confidence >= 0.7 for stated facts; 0.5–0.7 for strong implication; < 0.5 for inference.
 - Do NOT invent relationships not present in the text.`
+}
+
+var extractionSystem = buildExtractionSystemPrompt()
 
 func buildExtractionPrompt(headline, summary string) (system, user string) {
 	var b strings.Builder
@@ -260,6 +306,14 @@ func (en *Enricher) persistExtractedRelationship(ctx context.Context, newsItemID
 	r.RelationshipType = strings.TrimSpace(r.RelationshipType)
 	if r.RelationshipType == "" {
 		return fmt.Errorf("empty relationship_type")
+	}
+	if !validRelationshipTypes[r.RelationshipType] {
+		logger.Warn("skipping relationship: unknown type not in enum",
+			"type", r.RelationshipType,
+			"from", r.FromEntity,
+			"to", r.ToEntity,
+		)
+		return nil
 	}
 	if r.FromEntity == "" || r.ToEntity == "" {
 		return fmt.Errorf("empty entity name(s)")

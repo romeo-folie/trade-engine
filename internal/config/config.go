@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -124,6 +125,7 @@ type EngineConfig struct {
 	MaxWatchlist    int     `yaml:"max_watchlist"`
 	DryRun          bool    `yaml:"dry_run"`
 	InitialCapital  float64 `yaml:"initial_capital"` // starting cash for paper trading (default 100000)
+	LogTimezone     string  `yaml:"log_timezone"`    // IANA timezone for display (default "UTC")
 }
 
 // ── Analysis (cost-reduction gates) ──────────────────────────────────────────
@@ -686,6 +688,12 @@ func Validate(cfg *Config) []string {
 	validModes := map[string]bool{"manual": true, "auto": true, "paper": true}
 	if !validModes[cfg.Engine.Mode] {
 		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
+	}
+
+	if cfg.Engine.LogTimezone != "" {
+		if _, err := time.LoadLocation(cfg.Engine.LogTimezone); err != nil {
+			errs = append(errs, fmt.Sprintf("engine.log_timezone %q is not a valid IANA timezone: %v", cfg.Engine.LogTimezone, err))
+		}
 	}
 
 	// Validate classifier mode — unknown values silently default to "shadow" at
