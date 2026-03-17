@@ -14,7 +14,8 @@
   overflow: hidden;
 }
 
-.sidebar:hover {
+.sidebar:hover,
+.sidebar:focus-within {
   width: var(--sidebar-expanded);
 }
 
@@ -64,6 +65,7 @@
   transition: opacity var(--transition-base);
 }
 
-.sidebar:hover .label {
+.sidebar:hover .label,
+.sidebar:focus-within .label {
   opacity: 1;
 }

@@ -57,6 +57,11 @@
   box-shadow: 0 0 6px var(--accent);
 }
 
+.dotIntermediate {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
 .dotDisconnected {
   background: var(--red);
   box-shadow: 0 0 6px var(--red);
@@ -64,6 +69,10 @@
 
 .statusConnected {
   color: var(--accent);
+}
+
+.statusIntermediate {
+  color: var(--amber);
 }
 
 .statusDisconnected {

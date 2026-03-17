@@ -38,6 +38,7 @@ export default function Sidebar() {
         <NavLink
           key={path}
           to={path}
+          aria-label={label}
           className={({ isActive }) =>
             `${styles.navItem}${isActive ? ` ${styles.active}` : ''}`
           }
