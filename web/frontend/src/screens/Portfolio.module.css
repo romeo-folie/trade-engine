@@ -9,6 +9,15 @@
   padding: var(--space-6);
 }
 
+/* Error banner — full-width above the KPI row */
+.fetchErrorBanner {
+  width: 100%;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-2);
+}
+
 /* Header KPI row */
 .kpiRow {
   display: flex;
@@ -19,6 +28,17 @@
 /* Equity curve section */
 .curveSection {
   margin-bottom: var(--space-6);
+}
+
+/* Shown before first successful fetch or on load failure */
+.curvePlaceholder {
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-faint);
 }
 
 /* Performance metrics — two-column layout */

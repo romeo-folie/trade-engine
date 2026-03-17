@@ -155,12 +155,12 @@ export default function PortfolioScreen() {
   return (
     <div className={styles.screen}>
       {/* ── KPI Cards ─────────────────────────────────────────────────────── */}
+      {fetchError && (
+        <div className={styles.fetchErrorBanner}>
+          {hasData ? '⚠ Data may be stale' : '⚠ Failed to load portfolio data'}
+        </div>
+      )}
       <div className={styles.kpiRow}>
-        {fetchError && (
-          <div className={styles.fetchErrorBanner}>
-            ⚠ Data may be stale
-          </div>
-        )}
         <KpiCard label="TOTAL VALUE" value={hasData ? fmt$(totalValue) : '—'} />
         <KpiCard label="CASH" value={hasData ? fmt$(cash) : '—'} />
         <KpiCard label="INVESTED" value={hasData ? fmt$(invested) : '—'} />
@@ -182,7 +182,9 @@ export default function PortfolioScreen() {
         {hasData ? (
           <EquityCurve data={equityData} />
         ) : (
-          <div className={styles.curvePlaceholder}>Loading equity data…</div>
+          <div className={styles.curvePlaceholder}>
+            {fetchError ? 'Unable to load equity data' : 'Loading equity data…'}
+          </div>
         )}
       </div>
 
