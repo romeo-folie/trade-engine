@@ -31,8 +31,8 @@ export default function PipelineScreen() {
     for (const ev of events) {
       const parsed = ev.timestamp ? new Date(ev.timestamp).getTime() : NaN;
       const ts = Number.isFinite(parsed) ? parsed : 0;
-      if (!result[ev.source]) result[ev.source] = { type: ev.type, ts };
-      if (!result[ev.target]) result[ev.target] = { type: ev.type, ts };
+      if (ev.source && !result[ev.source]) result[ev.source] = { type: ev.type, ts };
+      if (ev.target && !result[ev.target]) result[ev.target] = { type: ev.type, ts };
     }
     return result;
   }, [events]);

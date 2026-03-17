@@ -181,8 +181,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
   // Sync external state changes into React Flow
-  useEffect(() => { setRfNodes(rfNodes); }, [rfNodes]); // eslint-disable-line react-hooks/exhaustive-deps
-  useEffect(() => { setRfEdges(rfEdges); }, [rfEdges]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setRfNodes(rfNodes); }, [rfNodes, setRfNodes]);
+  useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
 
   // ── Node click handler ──────────────────────────────────────────────────
 

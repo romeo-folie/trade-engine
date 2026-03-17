@@ -94,7 +94,6 @@ function PipelineNodeCard({ data }: NodeProps) {
     return (
       <div
         className={styles.hub}
-        aria-label="ENGINE hub node"
       >
         <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
         <Handle type="target" position={Position.Left}  style={{ opacity: 0 }} />
