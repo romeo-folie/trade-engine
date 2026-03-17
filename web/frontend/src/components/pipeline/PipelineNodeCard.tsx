@@ -9,7 +9,7 @@
  *   - Hub (ENGINE): acid green border, larger card, centre label
  */
 import { memo } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
+import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import styles from './PipelineNodeCard.module.css';
 
@@ -78,12 +78,12 @@ export interface PipelineNodeData {
   [key: string]: unknown;
 }
 
-// ReactFlow's NodeProps generic expects a Node type, not a data type.
-// We type the component as NodeProps (base) and extract data with a cast.
-// ReactFlow custom nodes receive generic NodeProps; PipelineNodeData is carried
-// in the `data` field and accessed via a typed cast (standard ReactFlow pattern).
-function PipelineNodeCard({ data }: NodeProps) {
-  const d = data as PipelineNodeData;
+// NodeProps<Node<PipelineNodeData>> gives TypeScript full visibility into `data`
+// without an unsafe cast, following @xyflow/react's typed custom node pattern.
+type PipelineNodeType = Node<PipelineNodeData>;
+
+function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
+  const d = data;
   const { stripColor, bracketColor } = getNodeColour(d.nodeId);
   const isBypassed = BYPASS_IDS.has(d.nodeId) && d.eventCount === 0;
 
