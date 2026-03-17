@@ -7,7 +7,7 @@
  *
  * Task 4 of the web redesign (closes #204).
  */
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import EquityCurve from '../components/portfolio/EquityCurve';
@@ -110,12 +110,18 @@ function pnlColor(n: number): string {
 
 export default function PortfolioScreen() {
   const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
-  const [_trades, setTrades] = useState<Trade[]>([]);
+  // trades state reserved for future trades table rendering
+  const [, setTrades] = useState<Trade[]>([]);
+  // Per-tick AbortController ref — aborts previous in-flight request before starting new one
+  const fetchControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
-    const controller = new AbortController();
-
     async function load() {
+      // Abort any prior in-flight request before starting a new one
+      fetchControllerRef.current?.abort();
+      const controller = new AbortController();
+      fetchControllerRef.current = controller;
+
       try {
         const [snapRes, tradeRes] = await Promise.all([
           fetch('/api/node/portfolio', { signal: controller.signal }),
@@ -141,7 +147,7 @@ export default function PortfolioScreen() {
     load();
     const interval = setInterval(load, 15_000);
     return () => {
-      controller.abort();
+      fetchControllerRef.current?.abort();
       clearInterval(interval);
     };
   }, []);

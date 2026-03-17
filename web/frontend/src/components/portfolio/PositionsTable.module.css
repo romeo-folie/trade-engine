@@ -85,8 +85,8 @@
 }
 
 @keyframes pulse {
-  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6); }
-  50% { opacity: 0.7; box-shadow: 0 0 6px 2px rgba(245, 158, 11, 0.3); }
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 var(--amber); }
+  50% { opacity: 0.7; box-shadow: 0 0 6px 2px var(--amber-dim); }
 }
 
 .positive { color: var(--emerald); }

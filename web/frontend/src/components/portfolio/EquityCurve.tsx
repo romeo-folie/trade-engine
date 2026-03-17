@@ -96,7 +96,7 @@ export default function EquityCurve({ data }: EquityCurveProps) {
             dataKey="value"
             stroke={TOKENS.acidGreen}
             strokeWidth={2}
-            fill="rgba(57, 255, 20, 0.08)"
+            fill={TOKENS.accentGlowLg}
             filter={`url(#${glowFilterId})`}
             isAnimationActive={false}
           />
