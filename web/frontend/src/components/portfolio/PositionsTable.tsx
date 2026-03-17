@@ -68,11 +68,8 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
       <th aria-sort={col === sortKey ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
         <button
           type="button"
+          className={styles.sortBtn}
           onClick={() => handleSort(col)}
-          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit',
-            fontFamily: 'inherit', fontSize: 'inherit', fontWeight: 'inherit',
-            letterSpacing: 'inherit', textTransform: 'inherit', padding: 0, display: 'flex',
-            alignItems: 'center', gap: 2 }}
         >
           {children}
         </button>

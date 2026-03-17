@@ -36,7 +36,9 @@ export default function EquityCurve({ data }: EquityCurveProps) {
 
   const formatDate = (d: string) => {
     try {
-      return new Date(d).toLocaleDateString('en-US', { month: 'short', day: '2-digit' }).toUpperCase();
+      // Append T00:00:00 so YYYY-MM-DD is parsed as local time, not UTC midnight
+      // (avoids off-by-one day shift for non-UTC timezones)
+      return new Date(`${d}T00:00:00`).toLocaleDateString('en-US', { month: 'short', day: '2-digit' }).toUpperCase();
     } catch {
       return d;
     }
