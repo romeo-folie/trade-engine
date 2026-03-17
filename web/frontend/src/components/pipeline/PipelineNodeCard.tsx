@@ -31,31 +31,34 @@ const COLORS = {
   textDim:    '#6B7280',
 };
 
-// Node identity → strip/bracket colour
+// Node identity → strip/bracket colour.
+// Keyed on stable nodeId (from backend protocol.go), NOT on display label.
 type NodeKindLabel = 'hub' | 'source' | 'processing' | 'output';
 
-const STRIP_COLORS: Record<string, string> = {
-  // Structural nodes with left strips
-  'SIGNAL SOURCE': COLORS.slate,
-  'ARBITER':       COLORS.acidGreen,
-  'SYNTHESIS':     COLORS.amber,
-  'EXECUTION':     COLORS.emerald, // status-driven; default emerald
-  // Hub
-  '__hub__':       COLORS.acidGreen,
+// Structural nodes: left colour strip
+const STRIP_BY_ID: Record<string, string> = {
+  '__hub__':          COLORS.acidGreen,
+  'data_enrichment':  COLORS.slate,
+  'indicator_engine': COLORS.slate,
+  'prompt_assembly':  COLORS.slate,
+  'risk_manager':     COLORS.amber,
+  'consensus':        COLORS.acidGreen,
+  'executor':         COLORS.emerald,
 };
 
-// Analyst bracket colours (no strips)
-const ANALYST_COLORS: Record<string, string> = {
-  'TECHNICAL':  COLORS.indigo,
-  'MOMENTUM':   COLORS.amber,
-  'SENTIMENT':  COLORS.violet,
-  'MACRO':      COLORS.sky,
+// Analyst/bracket nodes: corner bracket colour (no strip)
+const BRACKET_BY_ID: Record<string, string> = {
+  'llm_analysis':     COLORS.indigo,
+  'blocked_signals':  COLORS.textDim,
+  'approvals':        COLORS.amber,
 };
 
-function getNodeColour(label: string): { stripColor: string | null; bracketColor: string | null } {
-  const upper = label.toUpperCase();
-  if (STRIP_COLORS[upper]) return { stripColor: STRIP_COLORS[upper], bracketColor: null };
-  if (ANALYST_COLORS[upper]) return { stripColor: null, bracketColor: ANALYST_COLORS[upper] };
+// Nodes that display as "bypassed" when they have zero events
+const BYPASS_IDS = new Set(['news_api']);
+
+function getNodeColour(nodeId: string): { stripColor: string | null; bracketColor: string | null } {
+  if (STRIP_BY_ID[nodeId]) return { stripColor: STRIP_BY_ID[nodeId], bracketColor: null };
+  if (BRACKET_BY_ID[nodeId]) return { stripColor: null, bracketColor: BRACKET_BY_ID[nodeId] };
   return { stripColor: null, bracketColor: COLORS.textDim };
 }
 
@@ -87,8 +90,8 @@ export interface PipelineNodeData {
 
 function PipelineNodeCard({ data }: NodeProps) {
   const d = data as PipelineNodeData;
-  const { stripColor, bracketColor } = getNodeColour(d.label);
-  const isBypassed = d.label.toUpperCase() === 'MACRO' && d.eventCount === 0;
+  const { stripColor, bracketColor } = getNodeColour(d.nodeId);
+  const isBypassed = BYPASS_IDS.has(d.nodeId) && d.eventCount === 0;
 
   if (d.isHub) {
     return (
