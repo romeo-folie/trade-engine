@@ -161,7 +161,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   const rfEdges = useMemo<Edge[]>(() => {
     return nodes.map(n => {
-      const isActive = (nodeMetrics[n.id]?.lastEventAt ?? 0) > Date.now() - 5000;
+      const metricsTs = nodeMetrics[n.id]?.lastEventAt ?? 0;
+      const snapshotTs = n.last_event_at ? Date.parse(n.last_event_at) : 0;
+      const isActive = Math.max(metricsTs, snapshotTs) > Date.now() - 5000;
       return {
         id: `hub-${n.id}`,
         source: '__hub__',
@@ -267,6 +269,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   useAnimationFrame((time) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+
+    // Skip render loop when no particles exist (idle optimization)
+    if (particlesRef.current.length === 0) {
+      lastFrameRef.current = 0;
+      return;
+    }
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
