@@ -1,11 +1,14 @@
 /**
  * DrillDownPanel — right-edge slide-in panel for node inspection.
  *
- * Opens when a node is clicked. Shows live node state from REST API.
+ * Opens when a node is clicked. Displays live node state from the
+ * EngineSocketContext (snapshot nodes + incremental nodeMetrics) —
+ * no separate REST fetch required.
  * Design spec §2: 320px wide, #0D0D11 bg, chamfer top-left only.
  */
-import { useEffect, useState, memo } from 'react';
+import { memo, useMemo } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
+import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import styles from './DrillDownPanel.module.css';
 
 interface DrillDownPanelProps {
@@ -13,51 +16,26 @@ interface DrillDownPanelProps {
   onClose: () => void;
 }
 
-interface NodeDetail {
-  id: string;
-  label: string;
-  kind: string;
-  event_count: number;
-  last_event_at?: string;
-  avg_latency_ms?: number;
-  meta?: Record<string, unknown>;
-}
-
-async function fetchNodeDetail(nodeId: string, signal?: AbortSignal): Promise<NodeDetail | null> {
-  try {
-    const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}`, { signal });
-    if (!resp.ok) return null;
-    return await resp.json() as NodeDetail;
-  } catch {
-    return null;
-  }
-}
-
 function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
-  const [detail, setDetail] = useState<NodeDetail | null>(null);
-  const [loading, setLoading] = useState(false);
+  const { nodes, nodeMetrics } = useEngineSocketContext();
 
-  useEffect(() => {
-    if (!nodeId) { setDetail(null); return; }
-
-    const ac = new AbortController();
-    setLoading(true);
-    fetchNodeDetail(nodeId, ac.signal).then(d => {
-      if (ac.signal.aborted) return;
-      setDetail(d);
-      setLoading(false);
-    });
-
-    // Re-fetch every 5s while open
-    const iv = setInterval(() => {
-      fetchNodeDetail(nodeId, ac.signal).then(d => {
-        if (ac.signal.aborted) return;
-        setDetail(d);
-      });
-    }, 5000);
-
-    return () => { ac.abort(); clearInterval(iv); };
-  }, [nodeId]);
+  const detail = useMemo(() => {
+    if (!nodeId) return null;
+    const node = nodes.find(n => n.id === nodeId);
+    if (!node) return null;
+    const metrics = nodeMetrics[nodeId] ?? null;
+    return {
+      id: node.id,
+      label: node.label,
+      kind: node.kind,
+      event_count: node.event_count,
+      last_event_at: metrics?.lastEventAt
+        ? new Date(metrics.lastEventAt).toISOString()
+        : (node.last_event_at ?? null),
+      avg_latency_ms: node.avg_latency_ms ?? null,
+      meta: node.meta ?? null,
+    };
+  }, [nodeId, nodes, nodeMetrics]);
 
   return (
     <AnimatePresence>
@@ -81,10 +59,6 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
           </div>
 
           <div className={styles.body}>
-            {loading && !detail && (
-              <p className={styles.muted}>Loading…</p>
-            )}
-
             {detail && (
               <>
                 <Row label="KIND"         value={detail.kind.toUpperCase()} />
@@ -108,7 +82,7 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
               </>
             )}
 
-            {!loading && !detail && (
+            {!detail && (
               <p className={styles.muted}>No data available.</p>
             )}
           </div>

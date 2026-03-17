@@ -129,8 +129,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       group.forEach((n, i) => {
         const pos = radialPosition(i, group.length, radius);
         const metrics = nodeMetrics[n.id] ?? null;
-        // Prefer live metrics over snapshot values so counts/timestamps stay current
-        const liveEventCount = (n.event_count ?? 0) + (metrics?.eventCount ?? 0);
+        // Snapshot event_count is the authoritative total; metrics is used only
+        // for live activity indicators (lastEventAt / status dot).
         const liveLastEventAt = metrics?.lastEventAt
           ? new Date(metrics.lastEventAt).toISOString()
           : (n.last_event_at ?? null);
@@ -142,7 +142,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
             nodeId: n.id,
             label: n.label,
             kind: n.kind,
-            eventCount: liveEventCount,
+            eventCount: n.event_count,
             lastEventAt: liveLastEventAt,
             metrics,
             isHub: false,

@@ -2,8 +2,8 @@
  * Pipeline screen — hub-and-spoke live data-flow graph.
  *
  * Replaces the Task 1 stub. Wires useEngineSocket → HubGraph + EventFeed + DrillDownPanel.
- * Socket is owned by Shell; this screen consumes it via props passed from Shell
- * via the EngineSocketContext.
+ * Socket is owned by Shell; this screen consumes it via useEngineSocketContext()
+ * (context provider/consumer pattern).
  *
  * Task 3 of the web redesign (closes #203).
  */
