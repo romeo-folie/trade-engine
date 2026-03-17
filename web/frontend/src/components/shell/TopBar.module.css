@@ -1,0 +1,90 @@
+.topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--topbar-height);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  z-index: var(--z-topbar);
+}
+
+.left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-6);
+}
+
+.wordmark {
+  color: var(--accent);
+  font-weight: 700;
+  font-size: var(--font-size-md);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  text-transform: uppercase;
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.08em;
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dotConnected {
+  background: var(--accent);
+  box-shadow: 0 0 6px var(--accent);
+}
+
+.dotIntermediate {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
+.dotDisconnected {
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
+}
+
+.statusConnected {
+  color: var(--accent);
+}
+
+.statusIntermediate {
+  color: var(--amber);
+}
+
+.statusDisconnected {
+  color: var(--red);
+}
+
+.clock {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.rate {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
