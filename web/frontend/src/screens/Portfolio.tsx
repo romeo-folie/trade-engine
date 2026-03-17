@@ -1,9 +1,9 @@
 /**
  * Portfolio screen — equity curve, KPI cards, positions table, performance metrics.
  *
- * Fetches live portfolio snapshot from GET /api/node/portfolio and recent trades
- * from GET /api/trades/recent. Open positions use mock data until a dedicated
- * backend endpoint is available.
+ * Fetches live portfolio snapshot from GET /api/node/portfolio.
+ * Trades fetch (GET /api/trades/recent) is deferred until the trades table UI
+ * is implemented. Open positions use mock data until a dedicated endpoint.
  *
  * Task 4 of the web redesign (closes #204).
  */
