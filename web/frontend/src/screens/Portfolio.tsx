@@ -112,12 +112,16 @@ export default function PortfolioScreen() {
 
       try {
         const res = await fetch('/api/node/portfolio', { signal: controller.signal });
-        if (res.ok) {
-          const data = await res.json();
-          if (data && typeof data.TotalValue === 'number') {
-            setSnapshot(data);
-            setFetchError(null);
-          }
+        if (!res.ok) {
+          setFetchError(`${res.status} ${res.statusText}`);
+          return;
+        }
+        const data = await res.json();
+        if (data && typeof data.TotalValue === 'number') {
+          setSnapshot(data);
+          setFetchError(null);
+        } else {
+          setFetchError('Unexpected response shape');
         }
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
@@ -137,11 +141,14 @@ export default function PortfolioScreen() {
   }, []);
 
   // Use real snapshot data if available, else sensible defaults
-  const totalValue = snapshot?.TotalValue ?? 104821.50;
-  const cash = snapshot?.Cash ?? 41230.00;
-  const invested = snapshot?.Invested ?? 63591.50;
-  const unrealizedPnl = snapshot?.UnrealizedPnL ?? 3241.20;
-  const dayPnl = snapshot?.RealizedPnLToday ?? 1580.00;
+  // Use real snapshot data only — no hardcoded fallbacks for financial values.
+  // Display placeholder dashes until the first successful fetch.
+  const hasData = snapshot !== null;
+  const totalValue = snapshot?.TotalValue ?? 0;
+  const cash = snapshot?.Cash ?? 0;
+  const invested = snapshot?.Invested ?? 0;
+  const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
+  const dayPnl = snapshot?.RealizedPnLToday ?? 0;
 
   const equityData = useMemo(() => generateMockEquityData(totalValue), [totalValue]);
 
@@ -154,19 +161,19 @@ export default function PortfolioScreen() {
             ⚠ Data may be stale
           </div>
         )}
-        <KpiCard label="TOTAL VALUE" value={fmt$(totalValue)} />
-        <KpiCard label="CASH" value={fmt$(cash)} />
-        <KpiCard label="INVESTED" value={fmt$(invested)} />
+        <KpiCard label="TOTAL VALUE" value={hasData ? fmt$(totalValue) : '—'} />
+        <KpiCard label="CASH" value={hasData ? fmt$(cash) : '—'} />
+        <KpiCard label="INVESTED" value={hasData ? fmt$(invested) : '—'} />
         <KpiCard
           label="UNREALIZED P&L"
-          value={fmtPnl(unrealizedPnl)}
-          valueColor={pnlColor(unrealizedPnl)}
+          value={hasData ? fmtPnl(unrealizedPnl) : '—'}
+          valueColor={hasData ? pnlColor(unrealizedPnl) : undefined}
           prominent
         />
         <KpiCard
           label="DAY P&L"
-          value={fmtPnl(dayPnl)}
-          valueColor={pnlColor(dayPnl)}
+          value={hasData ? fmtPnl(dayPnl) : '—'}
+          valueColor={hasData ? pnlColor(dayPnl) : undefined}
         />
       </div>
 
