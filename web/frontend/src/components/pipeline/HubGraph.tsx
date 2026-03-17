@@ -1,0 +1,302 @@
+/**
+ * HubGraph — hub-and-spoke pipeline visualisation.
+ *
+ * ENGINE sits at centre. Nodes radiate outward by kind:
+ *   output (closest) → processing (mid) → source (outermost)
+ *
+ * Animated particles travel along edges powered by framer-motion.
+ * Clicking a node opens the DrillDownPanel.
+ */
+import { useCallback, useMemo, useEffect, useRef } from 'react';
+import {
+  ReactFlow,
+  Background,
+  useNodesState,
+  useEdgesState,
+  type Node,
+  type Edge,
+  type NodeMouseHandler,
+  BackgroundVariant,
+} from '@xyflow/react';
+import '@xyflow/react/dist/style.css';
+import { useAnimationFrame } from 'framer-motion';
+import type { NodeState } from '../../types/protocol';
+import type { NodeMetrics } from '../../hooks/useEngineSocket';
+import PipelineNodeCard from './PipelineNodeCard';
+import { particleColor } from '../../types/protocol';
+import styles from './HubGraph.module.css';
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const NODE_TYPES = { pipelineNode: PipelineNodeCard };
+
+// Radial ring radii (px, from centre)
+const RADII = { output: 180, processing: 320, source: 460 };
+
+// Canvas centre (React Flow uses a virtual coordinate system)
+const CX = 600;
+const CY = 400;
+
+// Node dimensions per spec
+const NODE_W = 220;
+const NODE_H = 120;
+const HUB_W  = 160;
+const HUB_H  = 80;
+
+// Edge styling
+const EDGE_ACTIVE   = '#39FF14';
+const EDGE_INACTIVE = '#1A1A22';
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function kindOrder(kind: NodeState['kind']): 'output' | 'processing' | 'source' {
+  if (kind === 'output')     return 'output';
+  if (kind === 'processing') return 'processing';
+  return 'source';
+}
+
+function radialPosition(index: number, total: number, radius: number): { x: number; y: number } {
+  const angle = (2 * Math.PI * index) / total - Math.PI / 2;
+  return {
+    x: CX + radius * Math.cos(angle) - NODE_W / 2,
+    y: CY + radius * Math.sin(angle) - NODE_H / 2,
+  };
+}
+
+// ── Types ────────────────────────────────────────────────────────────────────
+
+interface HubGraphProps {
+  nodes: NodeState[];
+  nodeMetrics: Record<string, NodeMetrics>;
+  recentEventTypes: Record<string, string>; // nodeId → last event type
+  onNodeClick: (nodeId: string) => void;
+}
+
+// ── Particle layer ───────────────────────────────────────────────────────────
+
+interface Particle {
+  id: string;
+  fromX: number; fromY: number;
+  toX: number;   toY: number;
+  color: string;
+  progress: number; // 0→1
+  speed: number;    // progress units/ms
+}
+
+// Particle canvas is rendered as a sibling overlay in CSS.
+// Uses imperative canvas API for performance.
+
+// ── Component ────────────────────────────────────────────────────────────────
+
+export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeClick }: HubGraphProps) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const particlesRef = useRef<Particle[]>([]);
+  const lastFrameRef = useRef<number>(0);
+
+  // ── Build React Flow nodes ──────────────────────────────────────────────
+
+  const rfNodes = useMemo<Node[]>(() => {
+    // Group by kind
+    const groups: Record<'output' | 'processing' | 'source', NodeState[]> = {
+      output: [], processing: [], source: [],
+    };
+    for (const n of nodes) groups[kindOrder(n.kind)].push(n);
+
+    const result: Node[] = [
+      {
+        id: '__hub__',
+        type: 'pipelineNode',
+        position: { x: CX - HUB_W / 2, y: CY - HUB_H / 2 },
+        data: {
+          nodeId: '__hub__',
+          label: 'ENGINE',
+          kind: 'hub',
+          eventCount: 0,
+          lastEventAt: null,
+          metrics: null,
+          isHub: true,
+          lastEventType: null,
+          onNodeClick,
+        },
+        draggable: false,
+        selectable: true,
+      },
+    ];
+
+    for (const [kindKey, group] of Object.entries(groups) as [keyof typeof groups, NodeState[]][]) {
+      const radius = RADII[kindKey];
+      group.forEach((n, i) => {
+        const pos = radialPosition(i, group.length, radius);
+        result.push({
+          id: n.id,
+          type: 'pipelineNode',
+          position: pos,
+          data: {
+            nodeId: n.id,
+            label: n.label,
+            kind: n.kind,
+            eventCount: n.event_count,
+            lastEventAt: n.last_event_at ?? null,
+            metrics: nodeMetrics[n.id] ?? null,
+            isHub: false,
+            lastEventType: recentEventTypes[n.id] ?? null,
+            onNodeClick,
+          },
+          draggable: false,
+          selectable: true,
+        });
+      });
+    }
+    return result;
+  }, [nodes, nodeMetrics, recentEventTypes, onNodeClick]);
+
+  // ── Build React Flow edges ──────────────────────────────────────────────
+
+  const rfEdges = useMemo<Edge[]>(() => {
+    return nodes.map(n => {
+      const isActive = (nodeMetrics[n.id]?.lastEventAt ?? 0) > Date.now() - 5000;
+      return {
+        id: `hub-${n.id}`,
+        source: '__hub__',
+        target: n.id,
+        animated: false, // particles handled by canvas overlay
+        style: {
+          stroke: isActive ? EDGE_ACTIVE : EDGE_INACTIVE,
+          strokeWidth: 1,
+          strokeDasharray: isActive ? '4 4' : undefined,
+        },
+        type: 'straight',
+      };
+    });
+  }, [nodes, nodeMetrics]);
+
+  const [rfN, , onNodesChange] = useNodesState(rfNodes);
+  const [rfE, , onEdgesChange] = useEdgesState(rfEdges);
+
+  // Sync external state changes into React Flow
+  useEffect(() => {
+    onNodesChange(rfNodes.map(n => ({ type: 'replace' as const, id: n.id, item: n })));
+  }, [rfNodes]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    onEdgesChange(rfEdges.map(e => ({ type: 'replace' as const, id: e.id, item: e })));
+  }, [rfEdges]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── Node click handler ──────────────────────────────────────────────────
+
+  const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
+    if (node.id !== '__hub__') onNodeClick(node.id);
+  }, [onNodeClick]);
+
+  // ── Particle spawning ───────────────────────────────────────────────────
+
+  // Each node in recentEventTypes spawns a particle toward/from hub.
+  const prevEventTypes = useRef<Record<string, string>>({});
+  useEffect(() => {
+    const hubX = CX;
+    const hubY = CY;
+
+    for (const [nodeId, evType] of Object.entries(recentEventTypes)) {
+      if (prevEventTypes.current[nodeId] === evType) continue; // no new event
+      prevEventTypes.current[nodeId] = evType;
+
+      const node = rfNodes.find(n => n.id === nodeId);
+      if (!node) continue;
+
+      const nX = node.position.x + NODE_W / 2;
+      const nY = node.position.y + NODE_H / 2;
+
+      // source nodes: particle flows inward (source → hub)
+      // output nodes: particle flows outward (hub → output)
+      const [fromX, fromY, toX, toY] = node.data.kind === 'source'
+        ? [nX, nY, hubX, hubY]
+        : [hubX, hubY, nX, nY];
+
+      particlesRef.current.push({
+        id: `${nodeId}-${Date.now()}-${Math.random()}`,
+        fromX, fromY, toX, toY,
+        color: particleColor(evType),
+        progress: 0,
+        speed: 0.0008 + Math.random() * 0.0004, // ~1.2–2s per edge
+      });
+
+      // Cap to avoid memory blowup
+      if (particlesRef.current.length > 80) {
+        particlesRef.current = particlesRef.current.slice(-60);
+      }
+    }
+  }, [recentEventTypes, rfNodes]);
+
+  // ── Canvas particle render loop ─────────────────────────────────────────
+
+  useAnimationFrame((time) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const dt = lastFrameRef.current ? time - lastFrameRef.current : 16;
+    lastFrameRef.current = time;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    particlesRef.current = particlesRef.current.filter(p => {
+      p.progress = Math.min(1, p.progress + p.speed * dt);
+
+      const x = p.fromX + (p.toX - p.fromX) * p.progress;
+      const y = p.fromY + (p.toY - p.fromY) * p.progress;
+
+      // Glow
+      ctx.beginPath();
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, 6);
+      grad.addColorStop(0, p.color + 'ff');
+      grad.addColorStop(1, p.color + '00');
+      ctx.fillStyle = grad;
+      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Core dot
+      ctx.beginPath();
+      ctx.fillStyle = p.color;
+      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      return p.progress < 1;
+    });
+  });
+
+  return (
+    <div className={styles.wrapper}>
+      <ReactFlow
+        nodes={rfN}
+        edges={rfE}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onNodeClick={handleNodeClick}
+        nodeTypes={NODE_TYPES}
+        fitView
+        fitViewOptions={{ padding: 0.15, maxZoom: 1.2 }}
+        minZoom={0.4}
+        maxZoom={2}
+        proOptions={{ hideAttribution: true }}
+        panOnDrag
+        zoomOnScroll
+      >
+        <Background
+          variant={BackgroundVariant.Dots}
+          gap={20}
+          size={1}
+          color="#1A1A22"
+          style={{ opacity: 0.2 }}
+        />
+      </ReactFlow>
+      <canvas
+        ref={canvasRef}
+        className={styles.particleCanvas}
+        width={CX * 2}
+        height={CY * 2}
+        style={{ pointerEvents: 'none' }}
+      />
+    </div>
+  );
+}

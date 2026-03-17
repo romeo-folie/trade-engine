@@ -1,0 +1,26 @@
+.wrapper {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background-color: #0A0A0D;
+}
+
+/* React Flow canvas */
+.wrapper :global(.react-flow) {
+  background: transparent;
+}
+.wrapper :global(.react-flow__edge-path) {
+  transition: stroke 0.3s;
+}
+.wrapper :global(.react-flow__attribution) {
+  display: none;
+}
+
+/* Particle overlay — full canvas, positioned absolute over React Flow */
+.particleCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}

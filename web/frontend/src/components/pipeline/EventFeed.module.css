@@ -1,0 +1,48 @@
+.feed {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 280px;
+  height: 100%;
+  padding: 12px 8px;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 10;
+  /* Fade mask — newest at top, vanishes at bottom */
+  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 56px 72px 1fr;
+  gap: 4px;
+  align-items: center;
+  padding: 2px 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ts {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: #4B5563;
+  flex-shrink: 0;
+}
+
+.evType {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.route {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  color: #6B7280;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

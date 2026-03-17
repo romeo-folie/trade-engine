@@ -1,0 +1,180 @@
+/* Hub node — ENGINE centre */
+.hub {
+  width: 160px;
+  height: 80px;
+  background: #0D0D11;
+  border: 1px solid #39FF14;
+  box-shadow: 0 0 12px rgba(57, 255, 20, 0.35), inset 0 0 8px rgba(57, 255, 20, 0.05);
+  /* Chamfer top-right 6px */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    0 100%
+  );
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  outline: none;
+  transition: box-shadow 0.2s;
+}
+.hub:hover {
+  box-shadow: 0 0 20px rgba(57, 255, 20, 0.55), inset 0 0 12px rgba(57, 255, 20, 0.08);
+}
+.hub:focus-visible {
+  box-shadow: 0 0 0 2px #39FF14;
+}
+
+.hubLabel {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 13px;
+  font-weight: 700;
+  color: #39FF14;
+  letter-spacing: 0.12em;
+  text-shadow: 0 0 6px rgba(57, 255, 20, 0.4);
+  text-transform: uppercase;
+}
+
+/* Pipeline node card */
+.card {
+  position: relative;
+  width: 220px;
+  height: 120px;
+  background: #111115;
+  border: 1px solid #2A2A35;
+  /* Chamfer top-right 6px */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    0 100%
+  );
+  cursor: pointer;
+  outline: none;
+  overflow: hidden;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+  border-color: #39FF14;
+  box-shadow: 0 0 8px rgba(57, 255, 20, 0.2);
+}
+.card:focus-visible {
+  box-shadow: 0 0 0 2px #39FF14;
+}
+.card.bypassed {
+  opacity: 0.35;
+}
+
+/* Left colour strip (structural nodes) */
+.strip {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 3px;
+  height: 100%;
+}
+
+/* Corner bracket glyphs */
+.bracketTL {
+  position: absolute;
+  top: 4px;
+  left: 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1;
+  user-select: none;
+  pointer-events: none;
+}
+.bracketBR {
+  position: absolute;
+  bottom: 4px;
+  right: 5px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Inner content (padded away from strip) */
+.inner {
+  padding: 10px 10px 10px 14px;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.nodeLabel {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: #F0F0F0;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+/* Status dot */
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dotGreen {
+  background: #39FF14;
+  box-shadow: 0 0 6px rgba(57, 255, 20, 0.8);
+  animation: pulse 1.5s ease-in-out infinite;
+}
+.dotAmber {
+  background: #F59E0B;
+  box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
+}
+.dotGrey {
+  background: #4B5563;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.meta {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 18px;
+  font-weight: 700;
+  color: #F0F0F0;
+  line-height: 1;
+}
+.metaValue {
+  color: #F0F0F0;
+}
+.metaLabel {
+  font-size: 10px;
+  color: #6B7280;
+  margin-left: 2px;
+}
+
+.timestamp {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+  color: #4B5563;
+}
+
+.bypassedLabel {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 9px;
+  letter-spacing: 0.15em;
+  color: #6B7280;
+  text-transform: uppercase;
+  margin-top: auto;
+}
