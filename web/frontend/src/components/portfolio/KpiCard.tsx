@@ -3,7 +3,7 @@ import styles from './KpiCard.module.css';
 interface KpiCardProps {
   label: string;
   value: string;
-  /** CSS color for the value text (use var(--*) tokens) */
+  /** CSS color for the value text (CSS variable or TOKENS.* hex value) */
   valueColor?: string;
   /** Prominent card gets acid-green border + larger font */
   prominent?: boolean;

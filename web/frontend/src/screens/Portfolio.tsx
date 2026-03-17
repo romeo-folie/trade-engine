@@ -28,19 +28,7 @@ interface PortfolioSnapshot {
   CreatedAt: string;
 }
 
-interface Trade {
-  ID: string;
-  Ticker: string;
-  Direction: string;
-  Strategy: string;
-  EntryPrice: number;
-  ExitPrice: number;
-  PnL: number;
-  PnLPct: number;
-  Status: string;
-  OpenedAt: string;
-  ClosedAt: string;
-}
+// Trade interface deferred — will be added when trades table is rendered
 
 /* ── Mock data ──────────────────────────────────────────────────────────────── */
 
@@ -110,8 +98,6 @@ function pnlColor(n: number): string {
 
 export default function PortfolioScreen() {
   const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
-  // trades state reserved for future trades table rendering
-  const [, setTrades] = useState<Trade[]>([]);
   // Per-tick AbortController ref — aborts previous in-flight request before starting new one
   const fetchControllerRef = useRef<AbortController | null>(null);
 
@@ -122,25 +108,14 @@ export default function PortfolioScreen() {
       const controller = new AbortController();
       fetchControllerRef.current = controller;
 
-      // Fetch independently so a failing trades endpoint doesn't block the portfolio snapshot
-      const [snapResult, tradeResult] = await Promise.allSettled([
-        fetch('/api/node/portfolio', { signal: controller.signal }),
-        fetch('/api/trades/recent?limit=50', { signal: controller.signal }),
-      ]);
-
-      if (snapResult.status === 'fulfilled' && snapResult.value.ok) {
-        try {
-          const data = await snapResult.value.json();
+      try {
+        const res = await fetch('/api/node/portfolio', { signal: controller.signal });
+        if (res.ok) {
+          const data = await res.json();
           if (data && typeof data.TotalValue === 'number') setSnapshot(data);
-        } catch { /* malformed JSON */ }
-      }
-
-      if (tradeResult.status === 'fulfilled' && tradeResult.value.ok) {
-        try {
-          const data = await tradeResult.value.json();
-          if (data?.trades) setTrades(data.trades);
-        } catch { /* malformed JSON */ }
-      }
+        }
+      } catch { /* fetch aborted or network error */ }
+      // Trades fetch deferred until trades table is rendered in a future task
     }
 
     load();

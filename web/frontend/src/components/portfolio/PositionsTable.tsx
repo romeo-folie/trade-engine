@@ -1,4 +1,5 @@
 import { useState, useMemo } from 'react';
+import type React from 'react';
 import { TOKENS } from '../../styles/tokens';
 import styles from './PositionsTable.module.css';
 
@@ -16,7 +17,7 @@ interface PositionsTableProps {
   positions: Position[];
 }
 
-type SortKey = 'ticker' | 'entry' | 'current' | 'unrealizedPnl' | 'pnlPct';
+type SortKey = keyof Pick<Position, 'ticker' | 'entry' | 'current' | 'unrealizedPnl' | 'pnlPct'>;
 type SortDir = 'asc' | 'desc';
 
 function fmt$(n: number): string {
@@ -62,12 +63,20 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
     });
   }, [positions, sortKey, sortDir]);
 
-  function thProps(col: SortKey) {
-    return {
-      onClick: () => handleSort(col),
-      style: { cursor: 'pointer', userSelect: 'none' as const },
-      'aria-sort': col === sortKey ? (sortDir === 'asc' ? 'ascending' : 'descending') as 'ascending' | 'descending' : 'none' as const,
-    };
+  function SortTh({ col, children }: { col: SortKey; children: React.ReactNode }) {
+    return (
+      <th aria-sort={col === sortKey ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+        <button
+          onClick={() => handleSort(col)}
+          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'inherit',
+            fontFamily: 'inherit', fontSize: 'inherit', fontWeight: 'inherit',
+            letterSpacing: 'inherit', textTransform: 'inherit', padding: 0, display: 'flex',
+            alignItems: 'center', gap: 2 }}
+        >
+          {children}
+        </button>
+      </th>
+    );
   }
 
   return (
@@ -76,23 +85,23 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
       <table className={styles.table}>
         <thead>
           <tr>
-            <th {...thProps('ticker')}>
+            <SortTh col="ticker">
               TICKER <SortIndicator col="ticker" sortKey={sortKey} sortDir={sortDir} />
-            </th>
+            </SortTh>
             <th>DIR</th>
             <th>STRATEGY</th>
-            <th {...thProps('entry')}>
+            <SortTh col="entry">
               ENTRY <SortIndicator col="entry" sortKey={sortKey} sortDir={sortDir} />
-            </th>
-            <th {...thProps('current')}>
+            </SortTh>
+            <SortTh col="current">
               CURRENT <SortIndicator col="current" sortKey={sortKey} sortDir={sortDir} />
-            </th>
-            <th {...thProps('unrealizedPnl')}>
+            </SortTh>
+            <SortTh col="unrealizedPnl">
               UNREAL P&amp;L <SortIndicator col="unrealizedPnl" sortKey={sortKey} sortDir={sortDir} />
-            </th>
-            <th {...thProps('pnlPct')}>
+            </SortTh>
+            <SortTh col="pnlPct">
               P&amp;L % <SortIndicator col="pnlPct" sortKey={sortKey} sortDir={sortDir} />
-            </th>
+            </SortTh>
             <th>STATUS</th>
           </tr>
         </thead>
