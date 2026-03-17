@@ -68,6 +68,9 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         const msg = JSON.parse(ev.data as string) as WebEvent | SnapshotEvent;
         if (msg.type === 'snapshot') {
           setNodes((msg as SnapshotEvent).nodes);
+          // Reset incremental metrics on snapshot (e.g. reconnect) to avoid
+          // double-counting with the snapshot's event_count baseline.
+          setNodeMetrics({});
           return;
         }
 
