@@ -26,13 +26,13 @@ export default function PipelineScreen() {
 
   // Build map of nodeId → event signature for particle spawning.
   // Uses type + timestamp so back-to-back events of the same type still spawn particles.
+  // Build map of nodeId → event signature for particle spawning.
+  // Uses _seqId (monotonic) so back-to-back events with identical timestamps still spawn particles.
   const recentEventSignatures = useMemo<Record<string, { type: string; ts: number }>>(() => {
     const result: Record<string, { type: string; ts: number }> = {};
     for (const ev of events) {
-      const parsed = ev.timestamp ? new Date(ev.timestamp).getTime() : NaN;
-      const ts = Number.isFinite(parsed) ? parsed : 0;
-      if (ev.source && !result[ev.source]) result[ev.source] = { type: ev.type, ts };
-      if (ev.target && !result[ev.target]) result[ev.target] = { type: ev.type, ts };
+      if (ev.source && !result[ev.source]) result[ev.source] = { type: ev.type, ts: ev._seqId };
+      if (ev.target && !result[ev.target]) result[ev.target] = { type: ev.type, ts: ev._seqId };
     }
     return result;
   }, [events]);

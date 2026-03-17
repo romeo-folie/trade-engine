@@ -44,8 +44,10 @@ const HUB_W  = 160;
 const HUB_H  = 80;
 
 // Edge styling
-const EDGE_ACTIVE   = '#39FF14';
-const EDGE_INACTIVE = '#1A1A22';
+import { TOKENS } from '../../styles/tokens';
+
+const EDGE_ACTIVE   = TOKENS.acidGreen;
+const EDGE_INACTIVE = '#1A1A22'; // border-muted — not in TOKENS (CSS-only token)
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

@@ -13,23 +13,13 @@ import { Handle, Position, type NodeProps } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import styles from './PipelineNodeCard.module.css';
 
-// ── Colour constants (from design spec tokens) ───────────────────────────────
+// ── Colour constants — mirrors tokens.css (single source of truth) ────────────
+// These are used in JS for dynamic inline styles (strip/bracket colours per node).
+// If you change a value in tokens.css, update it here too.
+// TODO: consider reading CSS custom properties at runtime if theming is added.
 
-const COLORS = {
-  acidGreen:  '#39FF14',
-  amber:      '#F59E0B',
-  red:        '#EF4444',
-  slate:      '#4A5568',
-  indigo:     '#6366F1',
-  violet:     '#8B5CF6',
-  sky:        '#0EA5E9',
-  emerald:    '#22C55E',
-  border:     '#2A2A35',
-  cardBg:     '#111115',
-  textPrimary:'#F0F0F0',
-  textMuted:  '#9CA3AF',
-  textDim:    '#6B7280',
-};
+import { TOKENS } from '../../styles/tokens';
+const COLORS = TOKENS;
 
 // Node identity → strip/bracket colour.
 // Keyed on stable nodeId (from backend protocol.go), NOT on display label.
