@@ -30,7 +30,7 @@ function EventFeed({ events }: EventFeedProps) {
 
         return (
           <div
-            key={`${ev.timestamp}-${i}`}
+            key={`${ev.timestamp}-${ev.type}-${ev.source}-${ev.target}`}
             className={styles.row}
             style={{ opacity }}
           >

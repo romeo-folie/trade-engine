@@ -22,6 +22,6 @@ export const EngineSocketContext = createContext<EngineSocketContextValue | null
 
 export function useEngineSocketContext(): EngineSocketContextValue {
   const ctx = useContext(EngineSocketContext);
-  if (!ctx) throw new Error('useEngineSocketContext must be used within Shell');
+  if (!ctx) throw new Error('useEngineSocketContext must be used within EngineSocketContext.Provider');
   return ctx;
 }

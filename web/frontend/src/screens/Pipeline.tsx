@@ -29,7 +29,8 @@ export default function PipelineScreen() {
   const recentEventSignatures = useMemo<Record<string, { type: string; ts: number }>>(() => {
     const result: Record<string, { type: string; ts: number }> = {};
     for (const ev of events) {
-      const ts = ev.timestamp ? new Date(ev.timestamp).getTime() : Date.now();
+      const parsed = ev.timestamp ? new Date(ev.timestamp).getTime() : NaN;
+      const ts = Number.isFinite(parsed) ? parsed : 0;
       if (!result[ev.source]) result[ev.source] = { type: ev.type, ts };
       if (!result[ev.target]) result[ev.target] = { type: ev.type, ts };
     }

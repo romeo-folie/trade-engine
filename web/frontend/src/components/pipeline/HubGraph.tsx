@@ -128,6 +128,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const radius = RADII[kindKey];
       group.forEach((n, i) => {
         const pos = radialPosition(i, group.length, radius);
+        const metrics = nodeMetrics[n.id] ?? null;
+        // Prefer live metrics over snapshot values so counts/timestamps stay current
+        const liveEventCount = (n.event_count ?? 0) + (metrics?.eventCount ?? 0);
+        const liveLastEventAt = metrics?.lastEventAt
+          ? new Date(metrics.lastEventAt).toISOString()
+          : (n.last_event_at ?? null);
         result.push({
           id: n.id,
           type: 'pipelineNode',
@@ -136,9 +142,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
             nodeId: n.id,
             label: n.label,
             kind: n.kind,
-            eventCount: n.event_count,
-            lastEventAt: n.last_event_at ?? null,
-            metrics: nodeMetrics[n.id] ?? null,
+            eventCount: liveEventCount,
+            lastEventAt: liveLastEventAt,
+            metrics,
             isHub: false,
             lastEventType: recentEventSignatures[n.id]?.type ?? null,
             onNodeClick,
