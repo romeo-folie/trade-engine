@@ -68,7 +68,7 @@ function radialPosition(index: number, total: number, radius: number): { x: numb
 interface HubGraphProps {
   nodes: NodeState[];
   nodeMetrics: Record<string, NodeMetrics>;
-  recentEventTypes: Record<string, string>; // nodeId → last event type
+  recentEventSignatures: Record<string, { type: string; ts: number }>; // nodeId → event signature
   onNodeClick: (nodeId: string) => void;
 }
 
@@ -88,8 +88,9 @@ interface Particle {
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeClick }: HubGraphProps) {
+export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, onNodeClick }: HubGraphProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const particlesRef = useRef<Particle[]>([]);
   const lastFrameRef = useRef<number>(0);
 
@@ -139,7 +140,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
             lastEventAt: n.last_event_at ?? null,
             metrics: nodeMetrics[n.id] ?? null,
             isHub: false,
-            lastEventType: recentEventTypes[n.id] ?? null,
+            lastEventType: recentEventSignatures[n.id]?.type ?? null,
             onNodeClick,
           },
           draggable: false,
@@ -148,7 +149,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
       });
     }
     return result;
-  }, [nodes, nodeMetrics, recentEventTypes, onNodeClick]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
@@ -170,17 +171,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
     });
   }, [nodes, nodeMetrics]);
 
-  const [rfN, , onNodesChange] = useNodesState(rfNodes);
-  const [rfE, , onEdgesChange] = useEdgesState(rfEdges);
+  const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
+  const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
   // Sync external state changes into React Flow
-  useEffect(() => {
-    onNodesChange(rfNodes.map(n => ({ type: 'replace' as const, id: n.id, item: n })));
-  }, [rfNodes]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    onEdgesChange(rfEdges.map(e => ({ type: 'replace' as const, id: e.id, item: e })));
-  }, [rfEdges]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setRfNodes(rfNodes); }, [rfNodes]); // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { setRfEdges(rfEdges); }, [rfEdges]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Node click handler ──────────────────────────────────────────────────
 
@@ -190,15 +186,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
 
   // ── Particle spawning ───────────────────────────────────────────────────
 
-  // Each node in recentEventTypes spawns a particle toward/from hub.
-  const prevEventTypes = useRef<Record<string, string>>({});
+  // Each node in recentEventSignatures spawns a particle toward/from hub.
+  // Track signature (type + timestamp) so back-to-back same-type events still spawn.
+  const prevSignatures = useRef<Record<string, { type: string; ts: number }>>({});
   useEffect(() => {
     const hubX = CX;
     const hubY = CY;
 
-    for (const [nodeId, evType] of Object.entries(recentEventTypes)) {
-      if (prevEventTypes.current[nodeId] === evType) continue; // no new event
-      prevEventTypes.current[nodeId] = evType;
+    for (const [nodeId, sig] of Object.entries(recentEventSignatures)) {
+      const prev = prevSignatures.current[nodeId];
+      if (prev && prev.type === sig.type && prev.ts === sig.ts) continue; // no new event
+      prevSignatures.current[nodeId] = sig;
 
       const node = rfNodes.find(n => n.id === nodeId);
       if (!node) continue;
@@ -215,7 +213,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
       particlesRef.current.push({
         id: `${nodeId}-${Date.now()}-${Math.random()}`,
         fromX, fromY, toX, toY,
-        color: particleColor(evType),
+        color: particleColor(sig.type),
         progress: 0,
         speed: 0.0008 + Math.random() * 0.0004, // ~1.2–2s per edge
       });
@@ -225,7 +223,38 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
         particlesRef.current = particlesRef.current.slice(-60);
       }
     }
-  }, [recentEventTypes, rfNodes]);
+  }, [recentEventSignatures, rfNodes]);
+
+  // ── Viewport tracking for particle canvas ────────────────────────────────
+
+  const viewportRef = useRef({ x: 0, y: 0, zoom: 1 });
+  const handleViewportChange = useCallback((vp: { x: number; y: number; zoom: number }) => {
+    viewportRef.current = vp;
+  }, []);
+
+  // ── HiDPI canvas sizing ─────────────────────────────────────────────────
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const wrapper = wrapperRef.current;
+    if (!canvas || !wrapper) return;
+
+    const resizeCanvas = () => {
+      const rect = wrapper.getBoundingClientRect();
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+
+    resizeCanvas();
+    const observer = new ResizeObserver(resizeCanvas);
+    observer.observe(wrapper);
+    return () => observer.disconnect();
+  }, []);
 
   // ── Canvas particle render loop ─────────────────────────────────────────
 
@@ -238,27 +267,37 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
     const dt = lastFrameRef.current ? time - lastFrameRef.current : 16;
     lastFrameRef.current = time;
 
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+
+    const vp = viewportRef.current;
 
     particlesRef.current = particlesRef.current.filter(p => {
       p.progress = Math.min(1, p.progress + p.speed * dt);
 
-      const x = p.fromX + (p.toX - p.fromX) * p.progress;
-      const y = p.fromY + (p.toY - p.fromY) * p.progress;
+      // Map flow-space coordinates to screen-space using viewport transform
+      const flowX = p.fromX + (p.toX - p.fromX) * p.progress;
+      const flowY = p.fromY + (p.toY - p.fromY) * p.progress;
+      const x = flowX * vp.zoom + vp.x;
+      const y = flowY * vp.zoom + vp.y;
+
+      const radius = 6 * vp.zoom;
+      const dotRadius = 2.5 * vp.zoom;
 
       // Glow
       ctx.beginPath();
-      const grad = ctx.createRadialGradient(x, y, 0, x, y, 6);
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
       grad.addColorStop(0, p.color + 'ff');
       grad.addColorStop(1, p.color + '00');
       ctx.fillStyle = grad;
-      ctx.arc(x, y, 6, 0, Math.PI * 2);
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.fill();
 
       // Core dot
       ctx.beginPath();
       ctx.fillStyle = p.color;
-      ctx.arc(x, y, 2.5, 0, Math.PI * 2);
+      ctx.arc(x, y, dotRadius, 0, Math.PI * 2);
       ctx.fill();
 
       return p.progress < 1;
@@ -266,13 +305,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
   });
 
   return (
-    <div className={styles.wrapper}>
+    <div ref={wrapperRef} className={styles.wrapper}>
       <ReactFlow
         nodes={rfN}
         edges={rfE}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={handleNodeClick}
+        onViewportChange={handleViewportChange}
         nodeTypes={NODE_TYPES}
         fitView
         fitViewOptions={{ padding: 0.15, maxZoom: 1.2 }}
@@ -293,8 +333,6 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventTypes, onNodeC
       <canvas
         ref={canvasRef}
         className={styles.particleCanvas}
-        width={CX * 2}
-        height={CY * 2}
         style={{ pointerEvents: 'none' }}
       />
     </div>

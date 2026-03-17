@@ -2,7 +2,7 @@
  * DrillDownPanel — right-edge slide-in panel for node inspection.
  *
  * Opens when a node is clicked. Shows live node state from REST API.
- * Design spec §2: 380px wide, #0D0D11 bg, chamfer top-left only.
+ * Design spec §2: 320px wide, #0D0D11 bg, chamfer top-left only.
  */
 import { useEffect, useState, memo } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
@@ -23,9 +23,9 @@ interface NodeDetail {
   meta?: Record<string, unknown>;
 }
 
-async function fetchNodeDetail(nodeId: string): Promise<NodeDetail | null> {
+async function fetchNodeDetail(nodeId: string, signal?: AbortSignal): Promise<NodeDetail | null> {
   try {
-    const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}`);
+    const resp = await fetch(`/api/nodes/${encodeURIComponent(nodeId)}`, { signal });
     if (!resp.ok) return null;
     return await resp.json() as NodeDetail;
   } catch {
@@ -39,17 +39,24 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
 
   useEffect(() => {
     if (!nodeId) { setDetail(null); return; }
+
+    const ac = new AbortController();
     setLoading(true);
-    fetchNodeDetail(nodeId).then(d => {
+    fetchNodeDetail(nodeId, ac.signal).then(d => {
+      if (ac.signal.aborted) return;
       setDetail(d);
       setLoading(false);
     });
 
     // Re-fetch every 5s while open
     const iv = setInterval(() => {
-      fetchNodeDetail(nodeId).then(d => setDetail(d));
+      fetchNodeDetail(nodeId, ac.signal).then(d => {
+        if (ac.signal.aborted) return;
+        setDetail(d);
+      });
     }, 5000);
-    return () => clearInterval(iv);
+
+    return () => { ac.abort(); clearInterval(iv); };
   }, [nodeId]);
 
   return (

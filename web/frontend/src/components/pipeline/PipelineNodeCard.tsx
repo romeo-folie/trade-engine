@@ -94,10 +94,6 @@ function PipelineNodeCard({ data }: NodeProps) {
     return (
       <div
         className={styles.hub}
-        onClick={() => d.onNodeClick(d.nodeId)}
-        role="button"
-        tabIndex={0}
-        onKeyDown={e => e.key === 'Enter' && d.onNodeClick(d.nodeId)}
         aria-label="ENGINE hub node"
       >
         <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
@@ -110,10 +106,14 @@ function PipelineNodeCard({ data }: NodeProps) {
   return (
     <div
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
-      onClick={() => d.onNodeClick(d.nodeId)}
       role="button"
       tabIndex={0}
-      onKeyDown={e => e.key === 'Enter' && d.onNodeClick(d.nodeId)}
+      onKeyDown={e => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          d.onNodeClick(d.nodeId);
+        }
+      }}
       aria-label={`${d.label} pipeline node`}
       style={{
         opacity: isBypassed ? 0.35 : 1,
@@ -130,8 +130,8 @@ function PipelineNodeCard({ data }: NodeProps) {
       {/* Corner brackets (analyst nodes only) */}
       {bracketColor && !stripColor && (
         <>
-          <span className={styles.bracketTL} style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>⌐</span>
-          <span className={styles.bracketBR} style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>¬</span>
+          <span className={styles.bracketTL} aria-hidden="true" style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true" style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>¬</span>
         </>
       )}
 

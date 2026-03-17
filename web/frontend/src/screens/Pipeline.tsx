@@ -24,13 +24,14 @@ export default function PipelineScreen() {
 
   const handleClose = useCallback(() => setSelectedNodeId(null), []);
 
-  // Build map of nodeId → most recent event type for particle spawning
-  const recentEventTypes = useMemo<Record<string, string>>(() => {
-    // Rebuild only when events array changes length (new event arrived)
-    const result: Record<string, string> = {};
+  // Build map of nodeId → event signature for particle spawning.
+  // Uses type + timestamp so back-to-back events of the same type still spawn particles.
+  const recentEventSignatures = useMemo<Record<string, { type: string; ts: number }>>(() => {
+    const result: Record<string, { type: string; ts: number }> = {};
     for (const ev of events) {
-      if (!result[ev.source]) result[ev.source] = ev.type;
-      if (!result[ev.target]) result[ev.target] = ev.type;
+      const ts = ev.timestamp ? new Date(ev.timestamp).getTime() : Date.now();
+      if (!result[ev.source]) result[ev.source] = { type: ev.type, ts };
+      if (!result[ev.target]) result[ev.target] = { type: ev.type, ts };
     }
     return result;
   }, [events]);
@@ -40,7 +41,7 @@ export default function PipelineScreen() {
       <HubGraph
         nodes={nodes}
         nodeMetrics={nodeMetrics}
-        recentEventTypes={recentEventTypes}
+        recentEventSignatures={recentEventSignatures}
         onNodeClick={handleNodeClick}
       />
       <EventFeed events={events} />
