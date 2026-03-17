@@ -270,9 +270,18 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const canvas = canvasRef.current;
     if (!canvas) return;
 
-    // Skip render loop when no particles exist (idle optimization)
+    // Skip render loop when no particles exist (idle optimization).
+    // Clear canvas once when particles drain to zero, then no-op subsequent frames.
     if (particlesRef.current.length === 0) {
-      lastFrameRef.current = 0;
+      if (lastFrameRef.current !== 0) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          const dpr = window.devicePixelRatio || 1;
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
+        }
+        lastFrameRef.current = 0;
+      }
       return;
     }
 

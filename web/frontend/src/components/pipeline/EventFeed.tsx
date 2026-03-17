@@ -7,14 +7,14 @@
  *   - Right-edge overlay, not a separate panel
  */
 import { memo } from 'react';
-import type { WebEvent } from '../../types/protocol';
+import type { IndexedWebEvent } from '../../hooks/useEngineSocket';
 import { EVENT_LABELS, particleColor } from '../../types/protocol';
 import styles from './EventFeed.module.css';
 
 const MAX_ROWS = 50;
 
 interface EventFeedProps {
-  events: WebEvent[];
+  events: IndexedWebEvent[];
 }
 
 function EventFeed({ events }: EventFeedProps) {
@@ -30,7 +30,7 @@ function EventFeed({ events }: EventFeedProps) {
 
         return (
           <div
-            key={`${ev.timestamp}-${ev.type}-${ev.source}-${ev.target}-${i}`}
+            key={ev._seqId}
             className={styles.row}
             style={{ opacity }}
           >

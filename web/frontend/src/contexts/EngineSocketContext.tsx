@@ -6,12 +6,13 @@
  */
 import { createContext, useContext } from 'react';
 import type { ConnectionStatus, NodeMetrics } from '../hooks/useEngineSocket';
-import type { NodeState, WebEvent } from '../types/protocol';
+import type { NodeState } from '../types/protocol';
+import type { IndexedWebEvent } from '../hooks/useEngineSocket';
 
 export interface EngineSocketContextValue {
   status: ConnectionStatus;
   nodes: NodeState[];
-  events: WebEvent[];
+  events: IndexedWebEvent[];
   eventsPerSecond: number;
   paused: boolean;
   setPaused: (p: boolean) => void;
