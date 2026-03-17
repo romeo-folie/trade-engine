@@ -100,7 +100,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
           {sorted.map((p) => {
             const pnlCls = p.unrealizedPnl >= 0 ? styles.positive : styles.negative;
             return (
-              <tr key={p.ticker + p.strategy}>
+              <tr key={`${p.ticker}-${p.strategy}-${p.entry}`}>
                 <td style={{ fontWeight: 700 }}>{p.ticker}</td>
                 <td>
                   <span

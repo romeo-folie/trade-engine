@@ -98,8 +98,8 @@ function fmt$(n: number): string {
 }
 
 function fmtPnl(n: number): string {
-  const sign = n >= 0 ? '+' : '';
-  return sign + fmt$(n);
+  const sign = n >= 0 ? '+' : '-';
+  return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function pnlColor(n: number): string {
@@ -122,25 +122,24 @@ export default function PortfolioScreen() {
       const controller = new AbortController();
       fetchControllerRef.current = controller;
 
-      try {
-        const [snapRes, tradeRes] = await Promise.all([
-          fetch('/api/node/portfolio', { signal: controller.signal }),
-          fetch('/api/trades/recent?limit=50', { signal: controller.signal }),
-        ]);
+      // Fetch independently so a failing trades endpoint doesn't block the portfolio snapshot
+      const [snapResult, tradeResult] = await Promise.allSettled([
+        fetch('/api/node/portfolio', { signal: controller.signal }),
+        fetch('/api/trades/recent?limit=50', { signal: controller.signal }),
+      ]);
 
-        if (snapRes.ok) {
-          const data = await snapRes.json();
-          if (data && typeof data.TotalValue === 'number') {
-            setSnapshot(data);
-          }
-        }
+      if (snapResult.status === 'fulfilled' && snapResult.value.ok) {
+        try {
+          const data = await snapResult.value.json();
+          if (data && typeof data.TotalValue === 'number') setSnapshot(data);
+        } catch { /* malformed JSON */ }
+      }
 
-        if (tradeRes.ok) {
-          const data = await tradeRes.json();
+      if (tradeResult.status === 'fulfilled' && tradeResult.value.ok) {
+        try {
+          const data = await tradeResult.value.json();
           if (data?.trades) setTrades(data.trades);
-        }
-      } catch {
-        // fetch aborted or network error — use fallback/mock data
+        } catch { /* malformed JSON */ }
       }
     }
 

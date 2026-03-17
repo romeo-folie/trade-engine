@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useId } from 'react';
 import {
   AreaChart,
   Area,
@@ -44,8 +44,9 @@ export default function EquityCurve({ data }: EquityCurveProps) {
 
   const formatValue = (v: number) => `$${(v / 1000).toFixed(0)}K`;
 
-  /* SVG glow filter for the area line */
-  const glowFilterId = 'equity-glow';
+  /* SVG glow filter — unique id per instance to avoid collisions if rendered multiple times */
+  const uid = useId();
+  const glowFilterId = `equity-glow-${uid.replace(/:/g, '')}`;
 
   return (
     <div className={styles.wrapper}>
