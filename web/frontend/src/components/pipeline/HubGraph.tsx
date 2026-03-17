@@ -24,6 +24,7 @@ import type { NodeState } from '../../types/protocol';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import PipelineNodeCard from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
+import { TOKENS } from '../../styles/tokens';
 import styles from './HubGraph.module.css';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -42,9 +43,6 @@ const NODE_W = 220;
 const NODE_H = 120;
 const HUB_W  = 160;
 const HUB_H  = 80;
-
-// Edge styling
-import { TOKENS } from '../../styles/tokens';
 
 const EDGE_ACTIVE   = TOKENS.acidGreen;
 const EDGE_INACTIVE = TOKENS.borderMuted;
@@ -70,7 +68,7 @@ function radialPosition(index: number, total: number, radius: number): { x: numb
 interface HubGraphProps {
   nodes: NodeState[];
   nodeMetrics: Record<string, NodeMetrics>;
-  recentEventSignatures: Record<string, { type: string; ts: number }>; // nodeId → event signature
+  recentEventSignatures: Record<string, { type: string; seqId: number }>; // nodeId → event signature
   onNodeClick: (nodeId: string) => void;
 }
 
@@ -198,14 +196,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   // Each node in recentEventSignatures spawns a particle toward/from hub.
   // Track signature (type + timestamp) so back-to-back same-type events still spawn.
-  const prevSignatures = useRef<Record<string, { type: string; ts: number }>>({});
+  const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
   useEffect(() => {
     const hubX = CX;
     const hubY = CY;
 
     for (const [nodeId, sig] of Object.entries(recentEventSignatures)) {
       const prev = prevSignatures.current[nodeId];
-      if (prev && prev.type === sig.type && prev.ts === sig.ts) continue; // no new event
+      if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue; // no new event
       prevSignatures.current[nodeId] = sig;
 
       const node = rfNodes.find(n => n.id === nodeId);

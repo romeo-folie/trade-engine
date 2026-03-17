@@ -78,6 +78,9 @@ export interface PipelineNodeData {
   [key: string]: unknown;
 }
 
+// ReactFlow's NodeProps generic expects a Node type, not a data type.
+// We type the component as NodeProps (base) and extract data with a cast.
+// This is the idiomatic ReactFlow pattern for typed custom nodes.
 function PipelineNodeCard({ data }: NodeProps) {
   const d = data as PipelineNodeData;
   const { stripColor, bracketColor } = getNodeColour(d.nodeId);
