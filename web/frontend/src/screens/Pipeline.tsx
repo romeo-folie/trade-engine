@@ -25,8 +25,6 @@ export default function PipelineScreen() {
   const handleClose = useCallback(() => setSelectedNodeId(null), []);
 
   // Build map of nodeId → event signature for particle spawning.
-  // Uses type + timestamp so back-to-back events of the same type still spawn particles.
-  // Build map of nodeId → event signature for particle spawning.
   // Uses _seqId (monotonic) so back-to-back events with identical timestamps still spawn particles.
   const recentEventSignatures = useMemo<Record<string, { type: string; ts: number }>>(() => {
     const result: Record<string, { type: string; ts: number }> = {};

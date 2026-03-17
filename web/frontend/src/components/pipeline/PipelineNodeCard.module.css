@@ -2,14 +2,14 @@
 .hub {
   width: 160px;
   height: 80px;
-  background: #0D0D11;
-  border: 1px solid #39FF14;
+  background: var(--panel-bg);
+  border: 1px solid var(--accent);
   box-shadow: 0 0 12px rgba(57, 255, 20, 0.35), inset 0 0 8px rgba(57, 255, 20, 0.05);
   /* Chamfer top-right 6px */
   clip-path: polygon(
     0 0,
-    calc(100% - 6px) 0,
-    100% 6px,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
     100% 100%,
     0 100%
   );
@@ -21,14 +21,14 @@
   transition: box-shadow 0.2s;
 }
 .hub:focus-visible {
-  box-shadow: 0 0 0 2px #39FF14;
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 .hubLabel {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
   font-weight: 700;
-  color: #39FF14;
+  color: var(--accent);
   letter-spacing: 0.12em;
   text-shadow: 0 0 6px rgba(57, 255, 20, 0.4);
   text-transform: uppercase;
@@ -39,13 +39,13 @@
   position: relative;
   width: 220px;
   height: 120px;
-  background: #111115;
-  border: 1px solid #2A2A35;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
   /* Chamfer top-right 6px */
   clip-path: polygon(
     0 0,
-    calc(100% - 6px) 0,
-    100% 6px,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
     100% 100%,
     0 100%
   );
@@ -55,11 +55,11 @@
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 .card:hover {
-  border-color: #39FF14;
-  box-shadow: 0 0 8px rgba(57, 255, 20, 0.2);
+  border-color: var(--accent);
+  box-shadow: 0 0 8px var(--accent-glow);
 }
 .card:focus-visible {
-  box-shadow: 0 0 0 2px #39FF14;
+  box-shadow: 0 0 0 2px var(--accent);
 }
 .card.bypassed {
   opacity: 0.35;
@@ -79,7 +79,7 @@
   position: absolute;
   top: 4px;
   left: 5px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1;
   user-select: none;
@@ -89,7 +89,7 @@
   position: absolute;
   bottom: 4px;
   right: 5px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 14px;
   line-height: 1;
   user-select: none;
@@ -113,9 +113,9 @@
 
 .nodeLabel {
   font-family: var(--font-sans);
-  font-size: 11px;
+  font-size: var(--font-size-sm);
   font-weight: 500;
-  color: #F0F0F0;
+  color: var(--text-primary);
   letter-spacing: 0.1em;
   text-transform: uppercase;
 }
@@ -128,16 +128,16 @@
   flex-shrink: 0;
 }
 .dotGreen {
-  background: #39FF14;
+  background: var(--accent);
   box-shadow: 0 0 6px rgba(57, 255, 20, 0.8);
   animation: pulse 1.5s ease-in-out infinite;
 }
 .dotAmber {
-  background: #F59E0B;
+  background: var(--amber);
   box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
 }
 .dotGrey {
-  background: #4B5563;
+  background: var(--text-faint);
 }
 
 @keyframes pulse {
@@ -146,32 +146,32 @@
 }
 
 .meta {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 18px;
   font-weight: 700;
-  color: #F0F0F0;
+  color: var(--text-primary);
   line-height: 1;
 }
 .metaValue {
-  color: #F0F0F0;
+  color: var(--text-primary);
 }
 .metaLabel {
-  font-size: 10px;
-  color: #6B7280;
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
   margin-left: 2px;
 }
 
 .timestamp {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 10px;
-  color: #4B5563;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
 }
 
 .bypassedLabel {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-mono);
   font-size: 9px;
   letter-spacing: 0.15em;
-  color: #6B7280;
+  color: var(--text-dim);
   text-transform: uppercase;
   margin-top: auto;
 }

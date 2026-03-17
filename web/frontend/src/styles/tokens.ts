@@ -19,6 +19,7 @@ export const TOKENS = {
 
   // Surfaces
   border:      '#2A2A35',
+  borderMuted: '#1A1A22',
   cardBg:      '#111115',
 
   // Text
