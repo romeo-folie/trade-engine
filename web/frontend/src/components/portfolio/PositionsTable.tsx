@@ -74,7 +74,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
 
   function SortTh({ col, children }: { col: SortKey; children: React.ReactNode }) {
     const isActive = col === sortKey;
-    const ariaLabel = `${SORT_LABELS[col]}, sort ${isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'ascending'}`;
+    const ariaLabel = `${SORT_LABELS[col]}, sort ${isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'descending'}`;
     return (
       <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
         <button
