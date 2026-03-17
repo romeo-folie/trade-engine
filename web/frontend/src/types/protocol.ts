@@ -56,7 +56,7 @@ export const PARTICLE_COLORS: Record<string, string> = {
 };
 
 export function particleColor(eventType: string): string {
-  return PARTICLE_COLORS[eventType] ?? '#00f5ff';
+  return PARTICLE_COLORS[eventType] ?? TOKENS.blue; // fallback: blue for unknown event types
 }
 
 // ── Event type → human label ─────────────────────────────────────────────────
