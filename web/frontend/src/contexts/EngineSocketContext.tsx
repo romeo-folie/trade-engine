@@ -5,9 +5,8 @@
  * Screens consume via useEngineSocketContext() — no duplicate connections.
  */
 import { createContext, useContext } from 'react';
-import type { ConnectionStatus, NodeMetrics } from '../hooks/useEngineSocket';
+import type { ConnectionStatus, NodeMetrics, IndexedWebEvent } from '../hooks/useEngineSocket';
 import type { NodeState } from '../types/protocol';
-import type { IndexedWebEvent } from '../hooks/useEngineSocket';
 
 export interface EngineSocketContextValue {
   status: ConnectionStatus;

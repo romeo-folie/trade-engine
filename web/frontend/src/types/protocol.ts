@@ -26,29 +26,33 @@ export interface SnapshotEvent {
 
 // ── Particle colors by event type (PRD §14.6) ──────────────────────────────
 
+// Particle colours sourced from design tokens (tokens.css / tokens.ts).
+// Update here when the token palette changes to keep particles in sync.
+import { TOKENS } from '../styles/tokens';
+
 export const PARTICLE_COLORS: Record<string, string> = {
   // Market data
-  DataFetched:          '#00b4ff',
-  IndicatorsComputed:   '#00b4ff',
+  DataFetched:          TOKENS.blue,
+  IndicatorsComputed:   TOKENS.blue,
   // News
-  NewsIngested:         '#f59e0b',
+  NewsIngested:         TOKENS.amber,
   // LLM / analysis
-  AnalysisCompleted:    '#a855f7',
+  AnalysisCompleted:    TOKENS.violet,
   // Signal flow
-  SignalGenerated:      '#a855f7',
-  RiskCheckCompleted:   '#a855f7',
-  SignalQueued:         '#f59e0b',
+  SignalGenerated:      TOKENS.violet,
+  RiskCheckCompleted:   TOKENS.violet,
+  SignalQueued:         TOKENS.amber,
   // Execution
-  TradeExecuted:        '#22c55e',
-  TradeSimulated:       '#22c55e',
-  TradeClosed:          '#ef4444',
-  PositionUpdated:      '#22c55e',
-  PortfolioSnapshot:    '#22c55e',
+  TradeExecuted:        TOKENS.emerald,
+  TradeSimulated:       TOKENS.emerald,
+  TradeClosed:          TOKENS.red,
+  PositionUpdated:      TOKENS.emerald,
+  PortfolioSnapshot:    TOKENS.emerald,
   // Blocked / expired
-  SignalBlocked:        '#6b7280',
-  SignalExpired:        '#6b7280',
+  SignalBlocked:        TOKENS.textDim,
+  SignalExpired:        TOKENS.textDim,
   // Errors
-  ErrorOccurred:        '#ef4444',
+  ErrorOccurred:        TOKENS.red,
 };
 
 export function particleColor(eventType: string): string {
