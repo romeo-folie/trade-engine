@@ -1,59 +1,55 @@
-/* Chamfer utility — clip-path polygon for hard-cut corners */
-/* Usage: add class .chamfer-sm / .chamfer / .chamfer-lg / .chamfer-xl to any element */
+/* Chamfer utility — top-right corner cut at 45°
+ * Usage: .chamfer-sm / .chamfer / .chamfer-lg on any element */
 
-/* 4px chamfer */
+/* 6px cut — badges, tags */
 .chamfer-sm {
   clip-path: polygon(
-    var(--chamfer-sm) 0%, calc(100% - var(--chamfer-sm)) 0%,
-    100% var(--chamfer-sm), 100% calc(100% - var(--chamfer-sm)),
-    calc(100% - var(--chamfer-sm)) 100%, var(--chamfer-sm) 100%,
-    0% calc(100% - var(--chamfer-sm)), 0% var(--chamfer-sm)
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
   );
+  border-radius: 4px 0 4px 4px;
 }
 
-/* 8px chamfer — default for cards/panels */
+/* 12px cut — cards, panels */
 .chamfer {
   clip-path: polygon(
-    var(--chamfer) 0%, calc(100% - var(--chamfer)) 0%,
-    100% var(--chamfer), 100% calc(100% - var(--chamfer)),
-    calc(100% - var(--chamfer)) 100%, var(--chamfer) 100%,
-    0% calc(100% - var(--chamfer)), 0% var(--chamfer)
+    0 0,
+    calc(100% - var(--chamfer)) 0,
+    100% var(--chamfer),
+    100% 100%,
+    0 100%
   );
+  border-radius: 4px 0 4px 4px;
 }
 
-/* 12px chamfer — large panels */
+/* 16px cut — large cards */
 .chamfer-lg {
   clip-path: polygon(
-    var(--chamfer-lg) 0%, calc(100% - var(--chamfer-lg)) 0%,
-    100% var(--chamfer-lg), 100% calc(100% - var(--chamfer-lg)),
-    calc(100% - var(--chamfer-lg)) 100%, var(--chamfer-lg) 100%,
-    0% calc(100% - var(--chamfer-lg)), 0% var(--chamfer-lg)
+    0 0,
+    calc(100% - var(--chamfer-lg)) 0,
+    100% var(--chamfer-lg),
+    100% 100%,
+    0 100%
   );
+  border-radius: 4px 0 4px 4px;
 }
 
-/* 16px chamfer — modals / hero elements */
-.chamfer-xl {
+/* Panel from right — chamfer top-LEFT only (exposed inner edge) */
+.chamfer-panel-right {
   clip-path: polygon(
-    var(--chamfer-xl) 0%, calc(100% - var(--chamfer-xl)) 0%,
-    100% var(--chamfer-xl), 100% calc(100% - var(--chamfer-xl)),
-    calc(100% - var(--chamfer-xl)) 100%, var(--chamfer-xl) 100%,
-    0% calc(100% - var(--chamfer-xl)), 0% var(--chamfer-xl)
+    var(--chamfer) 0,
+    100% 0,
+    100% 100%,
+    0 100%,
+    0 var(--chamfer)
   );
+  border-radius: 0 4px 4px 4px;
 }
 
-/*
- * Chamfer border trick:
- * clip-path clips the element including its border, so standard border
- * doesn't show on cut corners. Use this wrapper pattern instead:
- *
- *   <div class="chamfer-border-wrap chamfer">
- *     <div class="chamfer-inner chamfer">content</div>
- *   </div>
- *
- * .chamfer-border-wrap { background: var(--border); padding: 1px; }
- * .chamfer-inner        { background: var(--surface); }
- */
-
+/* Corner bracket helper — wrapper adds padding for bracket glyphs */
 .chamfer-border-wrap {
   background: var(--border);
   padding: 1px;
@@ -61,9 +57,4 @@
 
 .chamfer-inner {
   background: var(--surface);
-}
-
-.chamfer-border-wrap-accent {
-  background: var(--accent);
-  padding: 1px;
 }

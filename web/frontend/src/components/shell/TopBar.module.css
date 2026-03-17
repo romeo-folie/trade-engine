@@ -30,7 +30,7 @@
 .wordmark {
   color: var(--accent);
   font-weight: 700;
-  font-size: var(--font-size-md);
+  font-size: 14px;
   letter-spacing: 0.05em;
   text-transform: uppercase;
   white-space: nowrap;
@@ -80,11 +80,11 @@
 }
 
 .clock {
-  color: var(--text-secondary);
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }
 
 .rate {
-  color: var(--text-secondary);
+  color: var(--text-muted);
   font-variant-numeric: tabular-nums;
 }

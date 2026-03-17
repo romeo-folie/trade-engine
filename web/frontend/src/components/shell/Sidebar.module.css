@@ -25,7 +25,7 @@
   gap: var(--space-3);
   height: 40px;
   padding: 0 var(--space-4);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   text-decoration: none;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
@@ -40,13 +40,13 @@
 }
 
 .navItem:hover {
-  background: var(--surface-hover);
+  background: rgba(13, 13, 17, 0.08);
   color: var(--text-primary);
 }
 
 .navItem.active {
   border-left-color: var(--accent);
-  background: var(--surface-hover);
+  background: rgba(13, 13, 17, 0.08);
   color: var(--accent);
 }
 
