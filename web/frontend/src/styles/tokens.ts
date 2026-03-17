@@ -1,9 +1,10 @@
 /**
- * Design tokens (JS mirror of tokens.css).
+ * Design tokens — JS mirror of tokens.css.
  *
- * Single source of truth for colours used in JS runtime logic
+ * tokens.css is the authoritative source of truth.
+ * This file provides the same values for JS runtime logic
  * (inline styles, dynamic class selection, canvas drawing).
- * Keep in sync with tokens.css — any change there must be reflected here.
+ * When tokens.css changes, update this file to match.
  */
 export const TOKENS = {
   // Accents — matches tokens.css

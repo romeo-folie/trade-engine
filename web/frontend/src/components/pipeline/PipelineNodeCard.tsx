@@ -13,10 +13,9 @@ import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import styles from './PipelineNodeCard.module.css';
 
-// ── Colour constants — mirrors tokens.css (single source of truth) ────────────
+// ── Colour constants — sourced from tokens.ts (JS mirror of tokens.css) ────────
 // These are used in JS for dynamic inline styles (strip/bracket colours per node).
-// If you change a value in tokens.css, update it here too.
-// TODO: consider reading CSS custom properties at runtime if theming is added.
+// To change a colour: update tokens.css, then keep tokens.ts in sync.
 
 import { TOKENS } from '../../styles/tokens';
 const COLORS = TOKENS;

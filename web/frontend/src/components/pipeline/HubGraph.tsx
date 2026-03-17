@@ -195,7 +195,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Particle spawning ───────────────────────────────────────────────────
 
   // Each node in recentEventSignatures spawns a particle toward/from hub.
-  // Track signature (type + timestamp) so back-to-back same-type events still spawn.
+  // Track signature (type + seqId) so back-to-back same-type events still spawn.
+  // Precompute nodeId→node map to avoid O(n) find() on every event.
+  const rfNodeMap = useMemo(() => {
+    const m = new Map<string, typeof rfNodes[number]>();
+    for (const n of rfNodes) m.set(n.id, n);
+    return m;
+  }, [rfNodes]);
+
   const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
   useEffect(() => {
     const hubX = CX;
@@ -206,7 +213,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue; // no new event
       prevSignatures.current[nodeId] = sig;
 
-      const node = rfNodes.find(n => n.id === nodeId);
+      const node = rfNodeMap.get(nodeId);
       if (!node) continue;
 
       const nX = node.position.x + NODE_W / 2;
