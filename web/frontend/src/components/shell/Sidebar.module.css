@@ -1,0 +1,69 @@
+.sidebar {
+  position: fixed;
+  top: var(--topbar-height);
+  left: 0;
+  bottom: 0;
+  width: var(--sidebar-collapsed);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-2) 0;
+  z-index: var(--z-panel);
+  transition: width var(--transition-base);
+  overflow: hidden;
+}
+
+.sidebar:hover {
+  width: var(--sidebar-expanded);
+}
+
+.navItem {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: 40px;
+  padding: 0 var(--space-4);
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  border-left: 3px solid transparent;
+  transition:
+    background var(--transition-fast),
+    color var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.navItem:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.navItem.active {
+  border-left-color: var(--accent);
+  background: var(--surface-hover);
+  color: var(--accent);
+}
+
+.icon {
+  flex-shrink: 0;
+  width: var(--sidebar-collapsed);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* offset the parent padding + border so icon stays centred in collapsed state */
+  margin-left: calc(-1 * var(--space-4) + -3px);
+}
+
+.label {
+  opacity: 0;
+  transition: opacity var(--transition-base);
+}
+
+.sidebar:hover .label {
+  opacity: 1;
+}
