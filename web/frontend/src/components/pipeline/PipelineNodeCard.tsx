@@ -110,6 +110,7 @@ function PipelineNodeCard({ data }: NodeProps) {
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
       role="button"
       tabIndex={0}
+      onClick={() => d.onNodeClick(d.nodeId)}
       onKeyDown={e => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
@@ -164,6 +165,7 @@ function PipelineNodeCard({ data }: NodeProps) {
 
 function formatRelative(iso: string): string {
   const ms = Date.now() - new Date(iso).getTime();
+  if (!Number.isFinite(ms)) return '--';
   if (ms < 60_000) return `${Math.floor(ms / 1000)}s ago`;
   if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
   return `${Math.floor(ms / 3_600_000)}h ago`;
