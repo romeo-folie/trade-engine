@@ -39,6 +39,15 @@ function SortIndicator({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortK
   return <span aria-hidden="true" style={{ color: TOKENS.acidGreen, marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
 }
 
+// Human-readable labels for sort keys — used in aria-labels for screen readers
+const SORT_LABELS: Record<SortKey, string> = {
+  ticker:       'Ticker',
+  entry:        'Entry Price',
+  current:      'Current Price',
+  unrealizedPnl:'Unrealized P&L',
+  pnlPct:       'P&L Percent',
+};
+
 export default function PositionsTable({ positions }: PositionsTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('unrealizedPnl');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -65,7 +74,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
 
   function SortTh({ col, children }: { col: SortKey; children: React.ReactNode }) {
     const isActive = col === sortKey;
-    const ariaLabel = `${col}, sort ${isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'ascending'}`;
+    const ariaLabel = `${SORT_LABELS[col]}, sort ${isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'ascending'}`;
     return (
       <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
         <button
