@@ -110,7 +110,7 @@ function PipelineNodeCard({ data }: NodeProps) {
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
       role="button"
       tabIndex={0}
-      onClick={() => d.onNodeClick(d.nodeId)}
+      onClick={e => { e.stopPropagation(); d.onNodeClick(d.nodeId); }}
       onKeyDown={e => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
