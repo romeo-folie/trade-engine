@@ -1,9 +1,10 @@
 /**
  * Portfolio screen — equity curve, KPI cards, positions table, performance metrics.
  *
- * Fetches live portfolio snapshot from GET /api/node/portfolio.
- * Trades fetch (GET /api/trades/recent) is deferred until the trades table UI
- * is implemented. Open positions use mock data until a dedicated endpoint.
+ * Fetches live portfolio snapshot from GET /api/node/portfolio every 15s.
+ * Trades fetch (GET /api/trades/recent) is intentionally deferred — will be
+ * added when the trades table is implemented in a future task.
+ * Open positions use mock data until a dedicated endpoint.
  *
  * Task 4 of the web redesign (closes #204).
  */
@@ -53,7 +54,7 @@ function generateMockEquityData(currentValue: number): { date: string; value: nu
     const noise = (Math.sin(i * 1.7) * 0.015) + (Math.cos(i * 0.8) * 0.008);
     const value = startValue + (currentValue - startValue) * progress + currentValue * noise;
     points.push({
-      date: d.toISOString().slice(0, 10),
+      date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
       value: Math.round(value * 100) / 100,
     });
   }
@@ -98,6 +99,7 @@ function pnlColor(n: number): string {
 
 export default function PortfolioScreen() {
   const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   // Per-tick AbortController ref — aborts previous in-flight request before starting new one
   const fetchControllerRef = useRef<AbortController | null>(null);
 
@@ -112,9 +114,17 @@ export default function PortfolioScreen() {
         const res = await fetch('/api/node/portfolio', { signal: controller.signal });
         if (res.ok) {
           const data = await res.json();
-          if (data && typeof data.TotalValue === 'number') setSnapshot(data);
+          if (data && typeof data.TotalValue === 'number') {
+            setSnapshot(data);
+            setFetchError(null);
+          }
         }
-      } catch { /* fetch aborted or network error */ }
+      } catch (err) {
+        if (err instanceof Error && err.name !== 'AbortError') {
+          console.warn('[PortfolioScreen] snapshot fetch error:', err);
+          setFetchError(err.message);
+        }
+      }
       // Trades fetch deferred until trades table is rendered in a future task
     }
 
@@ -139,6 +149,11 @@ export default function PortfolioScreen() {
     <div className={styles.screen}>
       {/* ── KPI Cards ─────────────────────────────────────────────────────── */}
       <div className={styles.kpiRow}>
+        {fetchError && (
+          <div style={{ width: '100%', color: TOKENS.textFaint, fontSize: 12, marginBottom: 4 }}>
+            ⚠ Data may be stale
+          </div>
+        )}
         <KpiCard label="TOTAL VALUE" value={fmt$(totalValue)} />
         <KpiCard label="CASH" value={fmt$(cash)} />
         <KpiCard label="INVESTED" value={fmt$(invested)} />

@@ -20,13 +20,13 @@ interface PositionsTableProps {
 type SortKey = keyof Pick<Position, 'ticker' | 'entry' | 'current' | 'unrealizedPnl' | 'pnlPct'>;
 type SortDir = 'asc' | 'desc';
 
-function fmt$(n: number): string {
+function fmtPrice(n: number): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function fmtPnl(n: number): string {
   const sign = n >= 0 ? '+' : '-';
-  return `${sign}$${fmt$(Math.abs(n))}`;
+  return `${sign}$${fmtPrice(Math.abs(n))}`;
 }
 
 function fmtPct(n: number): string {
@@ -35,8 +35,8 @@ function fmtPct(n: number): string {
 }
 
 function SortIndicator({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; sortDir: SortDir }) {
-  if (col !== sortKey) return <span style={{ color: 'var(--text-faint)', marginLeft: 4 }}>⇅</span>;
-  return <span style={{ color: TOKENS.acidGreen, marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
+  if (col !== sortKey) return <span aria-hidden="true" style={{ color: 'var(--text-faint)', marginLeft: 4 }}>⇅</span>;
+  return <span aria-hidden="true" style={{ color: TOKENS.acidGreen, marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
 }
 
 export default function PositionsTable({ positions }: PositionsTableProps) {
@@ -64,12 +64,15 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
   }, [positions, sortKey, sortDir]);
 
   function SortTh({ col, children }: { col: SortKey; children: React.ReactNode }) {
+    const isActive = col === sortKey;
+    const ariaLabel = `${col}, sort ${isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'ascending'}`;
     return (
-      <th aria-sort={col === sortKey ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+      <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
         <button
           type="button"
           className={styles.sortBtn}
           onClick={() => handleSort(col)}
+          aria-label={ariaLabel}
         >
           {children}
         </button>
@@ -117,8 +120,8 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
                   </span>
                 </td>
                 <td style={{ color: 'var(--text-muted)' }}>{p.strategy}</td>
-                <td>{fmt$(p.entry)}</td>
-                <td>{fmt$(p.current)}</td>
+                <td>{fmtPrice(p.entry)}</td>
+                <td>{fmtPrice(p.current)}</td>
                 <td className={pnlCls}>{fmtPnl(p.unrealizedPnl)}</td>
                 <td className={pnlCls}>{fmtPct(p.pnlPct)}</td>
                 <td>
