@@ -2,7 +2,7 @@
   position: relative;
   width: 100%;
   height: 100%;
-  background-color: #0A0A0D;
+  background-color: var(--canvas-bg);
 }
 
 /* React Flow canvas */

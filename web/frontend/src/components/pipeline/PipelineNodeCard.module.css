@@ -20,9 +20,7 @@
   outline: none;
   transition: box-shadow 0.2s;
 }
-.hub:focus-visible {
-  box-shadow: 0 0 0 2px var(--accent);
-}
+/* Hub is not interactive (tabIndex not set); focus-visible rule removed */
 
 .hubLabel {
   font-family: var(--font-mono);

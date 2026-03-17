@@ -4,7 +4,7 @@
   right: 0;
   width: 280px;
   height: 100%;
-  padding: 12px 8px;
+  padding: var(--space-3) var(--space-2);
   overflow: hidden;
   pointer-events: none;
   z-index: 10;
@@ -16,7 +16,7 @@
 .row {
   display: grid;
   grid-template-columns: 56px 72px 1fr;
-  gap: 4px;
+  gap: var(--space-1);
   align-items: center;
   padding: 2px 0;
   white-space: nowrap;
@@ -24,15 +24,15 @@
 }
 
 .ts {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9px;
-  color: #4B5563;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
   flex-shrink: 0;
 }
 
 .evType {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -40,9 +40,9 @@
 }
 
 .route {
-  font-family: 'JetBrains Mono', monospace;
-  font-size: 9px;
-  color: #6B7280;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
 }
