@@ -13,6 +13,7 @@ export const TOKENS = {
   red:         '#EF4444',
   emerald:     '#22C55E',
   blue:        '#0EA5E9',   // --blue
+  cyan:        '#00F5FF',   // particle default / neon cyan (used as fallback)
   indigo:      '#6366F1',
   violet:      '#8B5CF6',
   slate:       '#4A5568',

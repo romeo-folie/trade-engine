@@ -26,6 +26,7 @@
 
   /* ── Semantic ───────────────────────────────────────────────────────── */
   --emerald:        #22C55E;
+  --cyan:           #00F5FF;   /* particle default / neon cyan */
   --amber:          #F59E0B;
   --amber-dim:      rgba(245, 158, 11, 0.15);
   --red:            #EF4444;
