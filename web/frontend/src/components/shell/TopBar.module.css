@@ -30,7 +30,7 @@
 .wordmark {
   color: var(--accent);
   font-weight: 700;
-  font-size: 14px;
+  font-size: var(--font-size-md);
   letter-spacing: 0.05em;
   text-transform: uppercase;
   white-space: nowrap;

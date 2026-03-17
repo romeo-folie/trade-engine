@@ -8,6 +8,7 @@
   --card-bg-alt:    #141418;
   --bg:             #0A0A0D;   /* alias for --canvas-bg */
   --surface:        #0D0D11;   /* alias for --panel-bg */
+  --surface-hover:  rgba(13, 13, 17, 0.08);
   --border:         #2A2A35;
   --border-muted:   #1A1A22;
 

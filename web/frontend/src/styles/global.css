@@ -1,4 +1,11 @@
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap');
+/* Space Grotesk — self-hosted variable font (no external CDN dependency) */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/SpaceGrotesk-Variable.woff2') format('woff2');
+}
 
 /* ── Reset ───────────────────────────────────────────────────────────────── */
 *, *::before, *::after {
@@ -96,6 +103,7 @@ a:hover {
 /* ── Utility classes ─────────────────────────────────────────────────────── */
 .text-accent    { color: var(--accent); }
 .text-muted     { color: var(--text-muted); }
+.text-secondary { color: var(--text-muted); } /* alias — used by stub screens */
 .text-red       { color: var(--red); }
 .text-amber     { color: var(--amber); }
 .text-green     { color: var(--emerald); }

@@ -40,13 +40,13 @@
 }
 
 .navItem:hover {
-  background: rgba(13, 13, 17, 0.08);
+  background: var(--surface-hover);
   color: var(--text-primary);
 }
 
 .navItem.active {
   border-left-color: var(--accent);
-  background: rgba(13, 13, 17, 0.08);
+  background: var(--surface-hover);
   color: var(--accent);
 }
 
