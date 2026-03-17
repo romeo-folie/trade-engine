@@ -25,7 +25,7 @@
   gap: var(--space-3);
   height: 40px;
   padding: 0 var(--space-4);
-  color: var(--text-secondary);
+  color: var(--text-muted);
   text-decoration: none;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);

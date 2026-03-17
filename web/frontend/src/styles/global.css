@@ -1,3 +1,12 @@
+/* Space Grotesk — self-hosted variable font (no external CDN dependency) */
+@font-face {
+  font-family: 'Space Grotesk';
+  font-style: normal;
+  font-weight: 400 700;
+  font-display: swap;
+  src: url('/fonts/SpaceGrotesk-Variable.woff2') format('woff2');
+}
+
 /* ── Reset ───────────────────────────────────────────────────────────────── */
 *, *::before, *::after {
   box-sizing: border-box;
@@ -57,7 +66,8 @@ a {
 }
 
 a:hover {
-  color: var(--accent-dim);
+  color: var(--text-primary);
+  text-decoration: underline;
 }
 
 /* ── Scrollbars ──────────────────────────────────────────────────────────── */
@@ -71,12 +81,12 @@ a:hover {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border-active);
+  background: var(--border);
   border-radius: 0;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--text-tertiary);
+  background: var(--text-dim);
 }
 
 /* ── Selection ───────────────────────────────────────────────────────────── */
@@ -93,10 +103,11 @@ a:hover {
 
 /* ── Utility classes ─────────────────────────────────────────────────────── */
 .text-accent    { color: var(--accent); }
-.text-secondary { color: var(--text-secondary); }
+.text-muted     { color: var(--text-muted); }
+.text-secondary { color: var(--text-muted); } /* alias — used by stub screens */
 .text-red       { color: var(--red); }
 .text-amber     { color: var(--amber); }
-.text-green     { color: var(--green); }
+.text-green     { color: var(--emerald); }
 .text-blue      { color: var(--blue); }
 .text-purple    { color: var(--purple); }
 

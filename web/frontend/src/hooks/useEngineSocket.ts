@@ -1,6 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { WebEvent, SnapshotEvent, NodeState } from '../types/protocol';
 
+/** WebEvent with a stable monotonic ID for React keys. */
+export interface IndexedWebEvent extends WebEvent {
+  _seqId: number;
+}
+
 export type ConnectionStatus = 'connecting' | 'connected' | 'reconnecting' | 'disconnected';
 
 interface UseEngineSocketOptions {
@@ -16,7 +21,7 @@ export interface NodeMetrics {
 interface EngineSocketState {
   status: ConnectionStatus;
   nodes: NodeState[];
-  events: WebEvent[];
+  events: IndexedWebEvent[];
   eventsPerSecond: number;
   paused: boolean;
   setPaused: (p: boolean) => void;
@@ -32,7 +37,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
 
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [nodes, setNodes] = useState<NodeState[]>([]);
-  const [events, setEvents] = useState<WebEvent[]>([]);
+  const [events, setEvents] = useState<IndexedWebEvent[]>([]);
+  const seqRef = useRef(0);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [paused, setPaused] = useState(false);
   const [nodeMetrics, setNodeMetrics] = useState<Record<string, NodeMetrics>>({});
@@ -68,6 +74,9 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         const msg = JSON.parse(ev.data as string) as WebEvent | SnapshotEvent;
         if (msg.type === 'snapshot') {
           setNodes((msg as SnapshotEvent).nodes);
+          // Reset incremental metrics on snapshot (e.g. reconnect) to avoid
+          // double-counting with the snapshot's event_count baseline.
+          setNodeMetrics({});
           return;
         }
 
@@ -75,7 +84,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         const now = Date.now();
         recentTimestamps.current.push(now);
 
-        setEvents(prev => [webEv, ...prev].slice(0, MAX_EVENTS));
+        const indexed: IndexedWebEvent = { ...webEv, _seqId: ++seqRef.current };
+        setEvents(prev => [indexed, ...prev].slice(0, MAX_EVENTS));
 
         // Update per-node metrics for source and target nodes.
         // Use a Set to avoid double-counting self-loop events (source === target).

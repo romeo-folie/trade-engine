@@ -1,0 +1,48 @@
+.feed {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 280px;
+  height: 100%;
+  padding: var(--space-3) var(--space-2);
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 10;
+  /* Fade mask — newest at top, vanishes at bottom */
+  mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black 60%, transparent 100%);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 56px 72px 1fr;
+  gap: var(--space-1);
+  align-items: center;
+  padding: 2px 0;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ts {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  flex-shrink: 0;
+}
+
+.evType {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  flex-shrink: 0;
+}
+
+.route {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
