@@ -48,6 +48,31 @@ const SORT_LABELS: Record<SortKey, string> = {
   pnlPct:       'P&L Percent',
 };
 
+function SortTh({ col, sortKey, sortDir, onSort, children }: {
+  col: SortKey;
+  sortKey: SortKey;
+  sortDir: SortDir;
+  onSort: (col: SortKey) => void;
+  children: React.ReactNode;
+}) {
+  const isActive = col === sortKey;
+  // For an active column the next direction toggles; for an inactive column clicking always starts with desc.
+  const nextDir = isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'descending';
+  const ariaLabel = `${SORT_LABELS[col]}, sort ${nextDir}`;
+  return (
+    <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+      <button
+        type="button"
+        className={styles.sortBtn}
+        onClick={() => onSort(col)}
+        aria-label={ariaLabel}
+      >
+        {children}
+      </button>
+    </th>
+  );
+}
+
 export default function PositionsTable({ positions }: PositionsTableProps) {
   const [sortKey, setSortKey] = useState<SortKey>('unrealizedPnl');
   const [sortDir, setSortDir] = useState<SortDir>('desc');
@@ -72,46 +97,27 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
     });
   }, [positions, sortKey, sortDir]);
 
-  function SortTh({ col, children }: { col: SortKey; children: React.ReactNode }) {
-    const isActive = col === sortKey;
-    // For an active column the next direction toggles; for an inactive column clicking always starts with desc.
-    const nextDir = isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'descending';
-    const ariaLabel = `${SORT_LABELS[col]}, sort ${nextDir}`;
-    return (
-      <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
-        <button
-          type="button"
-          className={styles.sortBtn}
-          onClick={() => handleSort(col)}
-          aria-label={ariaLabel}
-        >
-          {children}
-        </button>
-      </th>
-    );
-  }
-
   return (
     <div className={styles.section}>
       <div className={styles.sectionLabel}>OPEN POSITIONS</div>
-      <table className={styles.table}>
+      <table className={styles.table} aria-label="Open positions">
         <thead>
           <tr>
-            <SortTh col="ticker">
+            <SortTh col="ticker" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               TICKER <SortIndicator col="ticker" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
             <th>DIR</th>
             <th>STRATEGY</th>
-            <SortTh col="entry">
+            <SortTh col="entry" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               ENTRY <SortIndicator col="entry" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
-            <SortTh col="current">
+            <SortTh col="current" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               CURRENT <SortIndicator col="current" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
-            <SortTh col="unrealizedPnl">
+            <SortTh col="unrealizedPnl" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               UNREAL P&amp;L <SortIndicator col="unrealizedPnl" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
-            <SortTh col="pnlPct">
+            <SortTh col="pnlPct" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               P&amp;L % <SortIndicator col="pnlPct" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
             <th>STATUS</th>

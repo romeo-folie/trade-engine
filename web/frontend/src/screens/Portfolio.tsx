@@ -157,7 +157,7 @@ export default function PortfolioScreen() {
       {/* ── KPI Cards ─────────────────────────────────────────────────────── */}
       <div className={styles.kpiRow}>
         {fetchError && (
-          <div style={{ width: '100%', color: TOKENS.textFaint, fontSize: 12, marginBottom: 4 }}>
+          <div className={styles.fetchErrorBanner}>
             ⚠ Data may be stale
           </div>
         )}
@@ -179,7 +179,11 @@ export default function PortfolioScreen() {
 
       {/* ── Equity Curve ──────────────────────────────────────────────────── */}
       <div className={styles.curveSection}>
-        <EquityCurve data={equityData} />
+        {hasData ? (
+          <EquityCurve data={equityData} />
+        ) : (
+          <div className={styles.curvePlaceholder}>Loading equity data…</div>
+        )}
       </div>
 
       {/* ── Open Positions ────────────────────────────────────────────────── */}
