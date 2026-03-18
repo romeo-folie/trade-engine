@@ -16,7 +16,7 @@
 .bracketBR {
   position: absolute;
   font-family: var(--font-mono);
-  font-size: 1rem;
+  font-size: 14px;
   line-height: 1;
   color: var(--accent);
   opacity: 0.5;
