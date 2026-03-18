@@ -85,6 +85,7 @@ export default function ConfigScreen() {
   );
 
   const showToast = useCallback((msg: string) => {
+    clearTimeout(toastTimerRef.current);
     setToast(msg);
     toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   }, []);

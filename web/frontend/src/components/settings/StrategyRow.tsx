@@ -24,13 +24,13 @@ export default function StrategyRow({
       <div className={styles.row}>
         <span className={styles.name}>{name}</span>
         <button
-          className={`${styles.chevron} ${expanded ? styles.open : ''}`}
+          type="button" className={`${styles.chevron} ${expanded ? styles.open : ''}`}
           onClick={() => setExpanded(!expanded)}
           aria-label={expanded ? 'Collapse' : 'Expand'}
         >
           ›
         </button>
-        <Toggle checked={enabled} onChange={onToggle} />
+        <Toggle checked={enabled} onChange={onToggle} aria-label={`${name} strategy`} />
       </div>
       {expanded && params && (
         <div className={styles.params}>{params}</div>

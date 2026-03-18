@@ -29,6 +29,7 @@
   --cyan:           #00F5FF;   /* particle default / neon cyan */
   --amber:          #F59E0B;
   --amber-dim:      rgba(245, 158, 11, 0.15);
+  --overlay-bg:     rgba(0, 0, 0, 0.7);
   --red:            #EF4444;
   --red-dim:        rgba(239, 68, 68, 0.15);
   --blue:           #0EA5E9;
