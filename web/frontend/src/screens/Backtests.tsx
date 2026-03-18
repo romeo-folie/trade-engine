@@ -28,6 +28,8 @@ export interface BacktestRun {
   SharpeRatio: number | null;
   TotalTrades: number;
   CreatedAt: string;
+  /** Parsed config snapshot — contains initial_cash used to seed the equity curve. */
+  ConfigSnapshot: { initial_cash?: number } | null;
 }
 
 export interface BacktestTrade {
@@ -48,6 +50,12 @@ export interface BacktestTrade {
 function fmtPct(v: number | null): string {
   if (v == null) return '—';
   return `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
+}
+
+/** MaxDrawdownPct is stored as a positive magnitude — always render as a loss. */
+function fmtDrawdown(v: number | null): string {
+  if (v == null) return '—';
+  return `-${Math.abs(v).toFixed(2)}%`;
 }
 
 function fmtSharpe(v: number | null): string {
@@ -150,7 +158,7 @@ export default function BacktestsScreen() {
                       {fmtPct(run.TotalReturnPct)}
                     </td>
                     <td>{fmtPct(run.WinRatePct)}</td>
-                    <td className={styles.red}>{fmtPct(run.MaxDrawdownPct)}</td>
+                    <td className={styles.red}>{fmtDrawdown(run.MaxDrawdownPct)}</td>
                     <td>{fmtSharpe(run.SharpeRatio)}</td>
                     <td>{run.TotalTrades}</td>
                     <td className={styles.dimText}>{fmtDate(run.CreatedAt)}</td>

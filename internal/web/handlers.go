@@ -151,6 +151,64 @@ func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/backtests/runs?limit=N
+// backteststRunSummary is a list-safe projection of BacktestRun that omits
+// ConfigSnapshot (which may contain API keys from the persisted config).
+type backteststRunSummary struct {
+	ID                  string   `json:"ID"`
+	Label               string   `json:"Label"`
+	Ticker              string   `json:"Ticker"`
+	Strategy            string   `json:"Strategy"`
+	ModelProvider       string   `json:"ModelProvider"`
+	ModelName           string   `json:"ModelName"`
+	FromDate            string   `json:"FromDate"`
+	ToDate              string   `json:"ToDate"`
+	TotalReturnPct      *float64 `json:"TotalReturnPct"`
+	AnnualizedReturnPct *float64 `json:"AnnualizedReturnPct"`
+	SharpeRatio         *float64 `json:"SharpeRatio"`
+	SortinoRatio        *float64 `json:"SortinoRatio"`
+	CalmarRatio         *float64 `json:"CalmarRatio"`
+	MaxDrawdownPct      *float64 `json:"MaxDrawdownPct"`
+	WinRatePct          *float64 `json:"WinRatePct"`
+	ProfitFactor        *float64 `json:"ProfitFactor"`
+	Expectancy          *float64 `json:"Expectancy"`
+	TotalTrades         int      `json:"TotalTrades"`
+	AvgHoldHours        *float64 `json:"AvgHoldHours"`
+	BestTradePct        *float64 `json:"BestTradePct"`
+	WorstTradePct       *float64 `json:"WorstTradePct"`
+	CacheHitRate        *float64 `json:"CacheHitRate"`
+	CreatedAt           string   `json:"CreatedAt"`
+}
+
+func toRunSummary(r store.BacktestRun) backteststRunSummary {
+	return backteststRunSummary{
+		ID:                  r.ID,
+		Label:               r.Label,
+		Ticker:              r.Ticker,
+		Strategy:            r.Strategy,
+		ModelProvider:       r.ModelProvider,
+		ModelName:           r.ModelName,
+		FromDate:            r.FromDate.Format("2006-01-02"),
+		ToDate:              r.ToDate.Format("2006-01-02"),
+		TotalReturnPct:      r.TotalReturnPct,
+		AnnualizedReturnPct: r.AnnualizedReturnPct,
+		SharpeRatio:         r.SharpeRatio,
+		SortinoRatio:        r.SortinoRatio,
+		CalmarRatio:         r.CalmarRatio,
+		MaxDrawdownPct:      r.MaxDrawdownPct,
+		WinRatePct:          r.WinRatePct,
+		ProfitFactor:        r.ProfitFactor,
+		Expectancy:          r.Expectancy,
+		TotalTrades:         r.TotalTrades,
+		AvgHoldHours:        r.AvgHoldHours,
+		BestTradePct:        r.BestTradePct,
+		WorstTradePct:       r.WorstTradePct,
+		CacheHitRate:        r.CacheHitRate,
+		CreatedAt:           r.CreatedAt.Format(time.RFC3339),
+	}
+}
+
+// GET /api/backtests/runs?limit=N
+// Returns runs without ConfigSnapshot to avoid leaking API keys.
 func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 20)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -161,32 +219,62 @@ func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "backtest runs query failed", err)
 		return
 	}
-	if runs == nil {
-		runs = []store.BacktestRun{}
+	summaries := make([]backteststRunSummary, 0, len(runs))
+	for _, r := range runs {
+		summaries = append(summaries, toRunSummary(r))
 	}
-	jsonResponse(w, map[string]any{"runs": runs})
+	jsonResponse(w, map[string]any{"runs": summaries})
 }
 
-// GET /api/backtests/runs/:id/trades
+// GET /api/backtests/runs/:id         → run metadata including ConfigSnapshot.initial_cash
+// GET /api/backtests/runs/:id/trades  → trade list for equity curve
 func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
-	// Path: /api/backtests/runs/<id>/trades
 	path := r.URL.Path[len("/api/backtests/runs/"):]
-	// Strip trailing "/trades" suffix
-	id := strings.TrimSuffix(path, "/trades")
-	if id == "" || id == path {
-		http.Error(w, "expected /api/backtests/runs/{id}/trades", http.StatusBadRequest)
+
+	if strings.HasSuffix(path, "/trades") {
+		// Trade list sub-resource
+		id := strings.TrimSuffix(path, "/trades")
+		if id == "" {
+			http.Error(w, "expected /api/backtests/runs/{id}/trades", http.StatusBadRequest)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		trades, err := store.ListTradesForRun(ctx, id)
+		if err != nil {
+			apiError(w, "backtest trades query failed", err)
+			return
+		}
+		if trades == nil {
+			trades = []store.BacktestTrade{}
+		}
+		jsonResponse(w, map[string]any{"trades": trades})
 		return
 	}
 
+	// Run metadata — includes ConfigSnapshot so the frontend can read initial_cash.
+	// Only the summary fields + ConfigSnapshot are returned (no raw_prompt/raw_response).
+	id := path
+	if id == "" {
+		http.Error(w, "expected /api/backtests/runs/{id}", http.StatusBadRequest)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-
-	trades, err := store.ListTradesForRun(ctx, id)
+	run, err := store.GetRun(ctx, id)
 	if err != nil {
-		apiError(w, "backtest trades query failed", err)
+		apiError(w, "backtest run query failed", err)
 		return
 	}
-	jsonResponse(w, map[string]any{"trades": trades})
+	// Return summary + ConfigSnapshot (needed for initial_cash in equity curve).
+	type runWithSnapshot struct {
+		backteststRunSummary
+		ConfigSnapshot json.RawMessage `json:"ConfigSnapshot"`
+	}
+	jsonResponse(w, runWithSnapshot{
+		backteststRunSummary: toRunSummary(run),
+		ConfigSnapshot:       run.ConfigSnapshot,
+	})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

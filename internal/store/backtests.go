@@ -128,6 +128,24 @@ func InsertBacktestTrade(ctx context.Context, t BacktestTrade) error {
 // ── Retrieve ──────────────────────────────────────────────────────────────────
 
 // GetRunByLabel fetches a backtest run by its sequential label (e.g. "BT-00001").
+// GetRun returns a single backtest run by its UUID.
+func GetRun(ctx context.Context, id string) (BacktestRun, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT id, label, ticker, strategy, model_provider, model_name,
+		       from_date, to_date, config_snapshot,
+		       total_return_pct, annualized_return_pct,
+		       sharpe_ratio, sortino_ratio, calmar_ratio,
+		       max_drawdown_pct, win_rate_pct, profit_factor,
+		       expectancy, total_trades, avg_hold_hours,
+		       best_trade_pct, worst_trade_pct, cache_hit_rate, created_at
+		FROM backtest_runs WHERE id = $1`, id)
+	r, err := scanRun(row)
+	if err != nil {
+		return BacktestRun{}, err
+	}
+	return *r, nil
+}
+
 func GetRunByLabel(ctx context.Context, label string) (*BacktestRun, error) {
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, label, ticker, strategy, model_provider, model_name,

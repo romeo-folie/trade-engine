@@ -20,15 +20,26 @@ function fmtPct(v: number | null): string {
   return `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
 }
 
+/** MaxDrawdownPct is stored as a positive magnitude — always render as a loss. */
+function fmtDrawdown(v: number | null): string {
+  if (v == null) return '—';
+  return `-${Math.abs(v).toFixed(2)}%`;
+}
+
+const DEFAULT_INITIAL_CASH = 100_000; // matches internal/config/defaults.go
+
 /**
  * Build equity curve from trades using cumulative dollar PnL.
  * Uses t.PnL (absolute dollar gain/loss per position) not t.PnLPct (position return %),
  * so the curve reflects actual portfolio-level performance, not per-position %.
- * Starting equity is 10,000 (arbitrary base for visual comparison).
+ * Starting equity is seeded from the run's ConfigSnapshot.initial_cash (default 100,000).
  */
-function buildEquityCurve(trades: BacktestTrade[]): { date: string; value: number }[] {
+function buildEquityCurve(
+  trades: BacktestTrade[],
+  initialCash: number,
+): { date: string; value: number }[] {
   if (trades.length === 0) return [];
-  let equity = 10_000;
+  let equity = initialCash;
   const points: { date: string; value: number }[] = [
     { date: trades[0].EntryTS.slice(0, 10), value: equity },
   ];
@@ -53,13 +64,19 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     setTradesLoading(true);
     setTradesError(null);
 
-    fetch(`/api/backtests/runs/${run.ID}/trades`, { signal: controller.signal })
-      .then(res => {
-        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        return res.json();
-      })
-      .then(data => {
-        setTrades(Array.isArray(data.trades) ? data.trades : []);
+    // Fetch run metadata (for ConfigSnapshot.initial_cash) + trades in parallel.
+    Promise.all([
+      fetch(`/api/backtests/runs/${run.ID}`, { signal: controller.signal })
+        .then(res => res.ok ? res.json() : Promise.reject(new Error(`${res.status} ${res.statusText}`))),
+      fetch(`/api/backtests/runs/${run.ID}/trades`, { signal: controller.signal })
+        .then(res => res.ok ? res.json() : Promise.reject(new Error(`${res.status} ${res.statusText}`))),
+    ])
+      .then(([runData, tradesData]) => {
+        // Merge ConfigSnapshot from the detail endpoint into the run prop reference.
+        if (runData?.ConfigSnapshot) {
+          run.ConfigSnapshot = runData.ConfigSnapshot as { initial_cash?: number };
+        }
+        setTrades(Array.isArray(tradesData.trades) ? tradesData.trades : []);
       })
       .catch(err => {
         if (err instanceof Error && err.name !== 'AbortError') {
@@ -69,7 +86,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
       .finally(() => setTradesLoading(false));
 
     return () => controller.abort();
-  }, [run.ID]);
+  }, [run.ID, run]);
 
   const handleKey = useCallback((e: KeyboardEvent) => {
     if (e.key === 'Escape') onClose();
@@ -94,7 +111,8 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     return () => document.removeEventListener('keydown', handleKey);
   }, [handleKey]);
 
-  const equityData = buildEquityCurve(trades);
+  const initialCash = run.ConfigSnapshot?.initial_cash ?? DEFAULT_INITIAL_CASH;
+  const equityData = buildEquityCurve(trades, initialCash);
 
   return (
     <>
@@ -136,7 +154,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
             </div>
             <div className={`${styles.statCard} chamfer-sm`}>
               <span className={styles.statLabel}>Max DD</span>
-              <span className={`${styles.statValue} ${styles.red}`}>{fmtPct(run.MaxDrawdownPct)}</span>
+              <span className={`${styles.statValue} ${styles.red}`}>{fmtDrawdown(run.MaxDrawdownPct)}</span>
             </div>
             <div className={`${styles.statCard} chamfer-sm`}>
               <span className={styles.statLabel}>Sharpe</span>
