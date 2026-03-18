@@ -1,5 +1,6 @@
 import { createBrowserRouter, Navigate } from 'react-router-dom';
 import Shell from './components/shell/Shell';
+import BootScreen       from './screens/Boot';
 import PipelineScreen   from './screens/Pipeline';
 import PortfolioScreen  from './screens/Portfolio';
 import SignalsScreen    from './screens/Signals';
@@ -10,6 +11,8 @@ import ConfigScreen     from './screens/Config';
 import SystemScreen     from './screens/System';
 
 export const router = createBrowserRouter([
+  /* Boot screen — standalone, no Shell wrapper */
+  { path: '/boot', element: <BootScreen /> },
   {
     path: '/',
     element: <Shell />,

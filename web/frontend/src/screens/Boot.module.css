@@ -1,0 +1,116 @@
+.boot {
+  background: #000000;
+  width: 100vw;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding-left: calc((100vw - 600px) / 2);
+  font-family: var(--font-mono);
+  position: relative;
+  overflow: hidden;
+}
+
+/* CRT scanline overlay */
+.boot::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: repeating-linear-gradient(
+    0deg,
+    transparent 0px,
+    transparent 1px,
+    rgba(0, 0, 0, 0.03) 1px,
+    rgba(0, 0, 0, 0.03) 2px
+  );
+  z-index: 1;
+}
+
+.column {
+  width: 600px;
+  max-height: 90vh;
+  overflow-y: auto;
+}
+
+.line {
+  opacity: 0;
+  animation: fadeIn 0.05s forwards;
+  white-space: pre;
+  line-height: 1.6;
+  font-size: 13px;
+}
+
+.title {
+  color: #39FF14;
+  font-size: 16px;
+  font-weight: 700;
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.6);
+}
+
+.hr {
+  color: #1A1A22;
+}
+
+.timestamp {
+  color: #4B5563;
+}
+
+.tagOk {
+  color: #22C55E;
+  font-weight: 700;
+}
+
+.tagInfo {
+  color: #39FF14;
+  font-weight: 700;
+}
+
+.tagWait {
+  color: #F59E0B;
+  font-weight: 700;
+}
+
+.tagErr {
+  color: #EF4444;
+  font-weight: 700;
+}
+
+.tagWarn {
+  color: #F59E0B;
+  font-weight: 700;
+}
+
+.message {
+  color: #9CA3AF;
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.6);
+}
+
+.numericValue {
+  color: #F0F0F0;
+}
+
+.prompt {
+  color: #39FF14;
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.6);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.cursor {
+  display: inline-block;
+  width: 10px;
+  height: 1.2em;
+  background: #39FF14;
+  vertical-align: middle;
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes fadeIn {
+  to { opacity: 1; }
+}
