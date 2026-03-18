@@ -25,6 +25,7 @@ export default function SegmentSelect({
       {options.map((opt) => (
         <button
           key={opt.value}
+          type="button"
           className={`${styles.segment} ${opt.value === value ? styles.active : ''} ${
             color === 'emerald' ? styles.emerald : ''
           }`}

@@ -22,7 +22,7 @@
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: #fff;
+  background: var(--text-primary);
   transition: transform var(--transition-fast);
 }
 

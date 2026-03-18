@@ -1,9 +1,11 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
 import styles from './Config.module.css';
+
+const ENGINE_VERSION = 'v2.1.0';
 
 /* ── Default config values ── */
 const DEFAULTS = {
@@ -26,7 +28,7 @@ const DEFAULTS = {
     newsSentiment: false,
   },
   analystCheap: 'gpt-4o',
-  analystMid: 'gemini-3.1-pro',
+  analystMid: 'gemini-2.5-flash',
   analystFrontier: 'claude-sonnet',
   arbiter: 'claude-sonnet',
   classifier: 'gpt-4o-mini',
@@ -62,6 +64,10 @@ export default function ConfigScreen() {
   const savedRef = useRef<Config>({ ...DEFAULTS });
   const [toast, setToast] = useState<string | null>(null);
   const [showRestartModal, setShowRestartModal] = useState(false);
+  const [rawInput, setRawInput] = useState<Record<string, string>>({});
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => () => clearTimeout(toastTimerRef.current), []);
 
   const set = useCallback(
     <K extends keyof Config>(key: K, value: Config[K]) =>
@@ -80,7 +86,7 @@ export default function ConfigScreen() {
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
-    setTimeout(() => setToast(null), 3000);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   }, []);
 
   const handleSave = useCallback(() => {
@@ -99,8 +105,7 @@ export default function ConfigScreen() {
 
   const handleReset = useCallback(() => {
     setConfig({ ...DEFAULTS });
-    savedRef.current = { ...DEFAULTS };
-    showToast('All settings reset to defaults.');
+    showToast('Reset to defaults. Use Save Changes to persist, or Discard to restore your last saved config.');
   }, [showToast]);
 
   return (
@@ -110,7 +115,7 @@ export default function ConfigScreen() {
         <span className={styles.headerTitle}>TradeEngine</span>
         <span className={styles.headerSub}>System Configuration</span>
         <div className={styles.headerRight}>
-          <span>v2.1.0</span>
+          <span>{ENGINE_VERSION}</span>
           <span className={styles.statusDot} />
           <span>ALL SYSTEMS NOMINAL</span>
         </div>
@@ -154,7 +159,7 @@ export default function ConfigScreen() {
             <div>
               <div className={styles.row}>
                 <span className={styles.label}>dry_run</span>
-                <Toggle checked={config.dryRun} onChange={(v) => set('dryRun', v)} />
+                <Toggle checked={config.dryRun} onChange={(v) => set('dryRun', v)} aria-label="Dry run mode" />
               </div>
               {config.dryRun && (
                 <div className={styles.annotation}>NO ORDERS PLACED</div>
@@ -165,8 +170,10 @@ export default function ConfigScreen() {
               <span className={styles.label}>initial_capital</span>
               <input
                 className={styles.input}
-                value={formatNumber(config.initialCapital)}
-                onChange={(e) => set('initialCapital', parseFormattedNumber(e.target.value))}
+                value={rawInput.initialCapital ?? formatNumber(config.initialCapital)}
+                onFocus={() => setRawInput((prev) => ({ ...prev, initialCapital: String(config.initialCapital) }))}
+                onChange={(e) => setRawInput((prev) => ({ ...prev, initialCapital: e.target.value }))}
+                onBlur={() => { set('initialCapital', parseFormattedNumber(rawInput.initialCapital ?? '')); setRawInput((prev) => { const { initialCapital: _, ...rest } = prev; return rest; }); }}
               />
             </div>
           </SettingsSection>
@@ -267,7 +274,7 @@ export default function ConfigScreen() {
                 <span className={styles.label}>{label}</span>
                 <span className={styles.modelName}>
                   {config[key]}
-                  <span className={styles.swapIcon}>⇄</span>
+                  <button type="button" className={styles.swapIcon} onClick={() => { /* TODO: open model selector modal */ }}>⇄</button>
                 </span>
               </div>
             ))}
@@ -289,21 +296,25 @@ export default function ConfigScreen() {
               <span className={styles.label}>Daily Token Budget</span>
               <input
                 className={styles.input}
-                value={formatNumber(config.dailyTokenBudget)}
-                onChange={(e) => set('dailyTokenBudget', parseFormattedNumber(e.target.value))}
+                value={rawInput.dailyTokenBudget ?? formatNumber(config.dailyTokenBudget)}
+                onFocus={() => setRawInput((prev) => ({ ...prev, dailyTokenBudget: String(config.dailyTokenBudget) }))}
+                onChange={(e) => setRawInput((prev) => ({ ...prev, dailyTokenBudget: e.target.value }))}
+                onBlur={() => { set('dailyTokenBudget', parseFormattedNumber(rawInput.dailyTokenBudget ?? '')); setRawInput((prev) => { const { dailyTokenBudget: _, ...rest } = prev; return rest; }); }}
               />
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Weekly Token Budget</span>
               <input
                 className={styles.input}
-                value={formatNumber(config.weeklyTokenBudget)}
-                onChange={(e) => set('weeklyTokenBudget', parseFormattedNumber(e.target.value))}
+                value={rawInput.weeklyTokenBudget ?? formatNumber(config.weeklyTokenBudget)}
+                onFocus={() => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: String(config.weeklyTokenBudget) }))}
+                onChange={(e) => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: e.target.value }))}
+                onBlur={() => { set('weeklyTokenBudget', parseFormattedNumber(rawInput.weeklyTokenBudget ?? '')); setRawInput((prev) => { const { weeklyTokenBudget: _, ...rest } = prev; return rest; }); }}
               />
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Auto-degrade on budget hit</span>
-              <Toggle checked={config.autoDegradeBudget} onChange={(v) => set('autoDegradeBudget', v)} />
+              <Toggle checked={config.autoDegradeBudget} onChange={(v) => set('autoDegradeBudget', v)} aria-label="Auto-degrade on budget hit" />
             </div>
           </SettingsSection>
 
@@ -311,7 +322,7 @@ export default function ConfigScreen() {
           <SettingsSection title="Notifications">
             <div className={styles.row}>
               <span className={styles.label}>Telegram</span>
-              <Toggle checked={config.telegram} onChange={(v) => set('telegram', v)} />
+              <Toggle checked={config.telegram} onChange={(v) => set('telegram', v)} aria-label="Telegram notifications" />
             </div>
 
             <div>
@@ -338,7 +349,7 @@ export default function ConfigScreen() {
 
             <div className={styles.row}>
               <span className={styles.label}>Batch Enabled</span>
-              <Toggle checked={config.batchEnabled} onChange={(v) => set('batchEnabled', v)} />
+              <Toggle checked={config.batchEnabled} onChange={(v) => set('batchEnabled', v)} aria-label="Batch enabled" />
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Batch Window</span>
@@ -353,7 +364,7 @@ export default function ConfigScreen() {
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Include HOLDs</span>
-              <Toggle checked={config.includeHolds} onChange={(v) => set('includeHolds', v)} />
+              <Toggle checked={config.includeHolds} onChange={(v) => set('includeHolds', v)} aria-label="Include HOLDs" />
             </div>
           </SettingsSection>
 
@@ -372,7 +383,7 @@ export default function ConfigScreen() {
               Reset to Defaults
             </button>
             <span className={styles.versionText}>
-              TradeEngine v2.1.0 — Build 20260318
+              TradeEngine {ENGINE_VERSION} — Build 20260318
             </span>
           </SettingsSection>
         </div>

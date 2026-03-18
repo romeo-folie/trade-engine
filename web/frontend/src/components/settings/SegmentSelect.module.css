@@ -32,10 +32,10 @@
 
 .segment.active {
   background: var(--accent);
-  color: #000;
+  color: var(--canvas-bg);
 }
 
 .segment.emerald.active {
   background: var(--emerald);
-  color: #000;
+  color: var(--canvas-bg);
 }
