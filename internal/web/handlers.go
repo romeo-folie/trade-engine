@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -20,7 +21,8 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/signals/recent", handleRecentSignals)
 	mux.HandleFunc("/api/trades/recent", handleRecentTrades)
 	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
-	mux.HandleFunc("/api/backtests/recent", handleRecentBacktests)
+	mux.HandleFunc("/api/backtests/runs", handleBacktestRuns)
+	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -145,9 +147,40 @@ func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, map[string]any{"analyses": analyses})
 }
 
-// GET /api/backtests/recent?limit=N
-func handleRecentBacktests(w http.ResponseWriter, r *http.Request) {
-	jsonResponse(w, map[string]any{"backtests": []any{}})
+// GET /api/backtests/runs?limit=N
+func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
+	limit := queryInt(r, "limit", 20)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	runs, err := store.ListRuns(ctx, limit)
+	if err != nil {
+		apiError(w, "backtest runs query failed", err)
+		return
+	}
+	jsonResponse(w, map[string]any{"runs": runs})
+}
+
+// GET /api/backtests/runs/:id/trades
+func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
+	// Path: /api/backtests/runs/<id>/trades
+	path := r.URL.Path[len("/api/backtests/runs/"):]
+	// Strip trailing "/trades" suffix
+	id := strings.TrimSuffix(path, "/trades")
+	if id == "" || id == path {
+		http.Error(w, "expected /api/backtests/runs/{id}/trades", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	trades, err := store.ListTradesForRun(ctx, id)
+	if err != nil {
+		apiError(w, "backtest trades query failed", err)
+		return
+	}
+	jsonResponse(w, map[string]any{"trades": trades})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
