@@ -1,0 +1,20 @@
+/* EquityCurve — full-width area chart with acid-green glow */
+
+.wrapper {
+  width: 100%;
+  height: 200px;
+  background: var(--bg);
+  border: 1px solid var(--border-muted);
+  position: relative;
+}
+
+/* Peak label */
+.peakLabel {
+  position: absolute;
+  top: var(--space-2);
+  right: var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  pointer-events: none;
+}

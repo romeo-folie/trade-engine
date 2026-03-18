@@ -8,7 +8,9 @@
  */
 export const TOKENS = {
   // Accents — matches tokens.css
-  acidGreen:   '#39FF14',
+  acidGreen:      '#39FF14',
+  accentGlow:     'rgba(57, 255, 20, 0.15)',  // --accent-glow
+  accentGlowLg:   'rgba(57, 255, 20, 0.08)',  // --accent-glow-lg
   amber:       '#F59E0B',
   red:         '#EF4444',
   emerald:     '#22C55E',

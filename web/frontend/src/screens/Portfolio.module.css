@@ -1,0 +1,96 @@
+/* Portfolio screen — full panel view */
+
+.screen {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--canvas-bg);
+  padding: var(--space-6);
+}
+
+/* Error banner — full-width above the KPI row */
+.fetchErrorBanner {
+  width: 100%;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-1);
+}
+
+/* Header KPI row */
+.kpiRow {
+  display: flex;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+/* Equity curve section */
+.curveSection {
+  margin-bottom: var(--space-6);
+}
+
+/* Shown before first successful fetch or on load failure */
+.curvePlaceholder {
+  height: 200px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-faint);
+  text-align: center;
+}
+
+/* Performance metrics — two-column layout */
+.metricsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+
+.metricsSection {
+  /* no extra styling needed */
+}
+
+.sectionLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-3);
+}
+
+.metricRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.metricLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.metricValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.metricSub {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  margin-left: var(--space-2);
+}
+
+.positive { color: var(--emerald); }
+.negative { color: var(--red); }
