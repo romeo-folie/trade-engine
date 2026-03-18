@@ -1,4 +1,4 @@
-/* Analysis screen */
+/* Analysis screen — reworked to match Desire's spec */
 
 .screen {
   width: 100%;
@@ -9,15 +9,59 @@
   padding: var(--space-6);
 }
 
-.sectionLabel {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 400;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
+/* ── Header row: breadcrumb + auto-refresh ────────────────────────────────── */
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
   margin-bottom: var(--space-4);
 }
+
+.breadcrumb {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  letter-spacing: 0.06em;
+}
+
+.breadcrumbBrand {
+  color: #4FD1C5;
+}
+
+.breadcrumbSep,
+.breadcrumbPage {
+  color: var(--text-dim);
+}
+
+.autoRefresh {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  color: var(--text-dim);
+}
+
+.greenDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--emerald);
+  flex-shrink: 0;
+}
+
+/* ── Page title ───────────────────────────────────────────────────────────── */
+
+.pageTitle {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-stat);
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0 0 var(--space-5) 0;
+  letter-spacing: 0.02em;
+}
+
+/* ── Error / loading ──────────────────────────────────────────────────────── */
 
 .fetchErrorBanner {
   width: 100%;
@@ -36,88 +80,119 @@
   padding: var(--space-3) var(--space-4);
 }
 
-/* Filter row: ticker search + model search */
+/* ── Filter row: search inputs ────────────────────────────────────────────── */
+
 .filterRow {
   display: flex;
   gap: var(--space-3);
-  align-items: flex-end;
+  align-items: center;
   margin-bottom: var(--space-3);
 }
 
-.filterRow > :first-child {
-  flex: 1;
-  margin-bottom: 0;
-}
-
-.modelSearchWrap {
+.searchInput {
   display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-}
-
-.modelSearchLabel {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 400;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-}
-
-.modelSearchInput {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  background: var(--panel-bg);
+  align-items: center;
+  gap: var(--space-2);
+  background: var(--card-bg);
   border: 1px solid var(--border);
-  color: var(--text-primary);
-  padding: var(--space-1) var(--space-3);
-  min-width: 160px;
-  transition: border-color var(--transition-fast);
+  padding: 8px 16px;
 }
 
-.modelSearchInput::placeholder {
+.searchLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.searchField {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-md);
+  color: var(--text-primary);
+  background: transparent;
+  border: none;
+  outline: none;
+  min-width: 100px;
+}
+
+.searchField::placeholder {
   color: var(--text-faint);
 }
 
-.modelSearchInput:focus {
-  outline: none;
-  border-color: var(--accent);
-}
+/* ── Filter pill tabs ─────────────────────────────────────────────────────── */
 
-/* Filter pill tabs */
 .filterPills {
   display: flex;
   gap: var(--space-2);
-  margin-bottom: var(--space-4);
+  margin-bottom: var(--space-5);
   flex-wrap: wrap;
 }
 
 .filterPill {
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  font-weight: 400;
+  font-size: var(--font-size-md);
+  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
+  padding: 6px 20px;
+  border: 1px solid;
   background: transparent;
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.filterPillActive {
-  background: var(--accent);
-  color: var(--canvas-bg);
-  font-weight: 700;
-  border-color: var(--accent);
+/* Green (ALL / BUY) */
+.pillGreenOutline {
+  color: var(--emerald);
+  border-color: var(--emerald);
 }
 
-/* Card grid */
+.pillGreen {
+  background: var(--emerald);
+  color: #0A0A0D;
+  border-color: var(--emerald);
+}
+
+/* Red (SELL) */
+.pillRedOutline {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.pillRed {
+  background: var(--red);
+  color: #0A0A0D;
+  border-color: var(--red);
+}
+
+/* Amber (HOLD) */
+.pillAmberOutline {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.pillAmber {
+  background: var(--amber);
+  color: #0A0A0D;
+  border-color: var(--amber);
+}
+
+.filterPillActive {
+  font-weight: 700;
+}
+
+/* ── Card grid — 3 columns ────────────────────────────────────────────────── */
+
 .grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: var(--space-4);
+}
+
+@media (max-width: 1200px) {
+  .grid {
+    grid-template-columns: 1fr 1fr;
+  }
 }
 
 @media (max-width: 767px) {

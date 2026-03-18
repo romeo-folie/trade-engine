@@ -7,7 +7,6 @@
  * Task 8 of the web redesign (closes #206).
  */
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import FilterBar from '../components/table/FilterBar';
 import AnalysisCard from '../components/analysis/AnalysisCard';
 import AnalysisModal from '../components/analysis/AnalysisModal';
 import styles from './Analysis.module.css';
@@ -34,7 +33,7 @@ export interface AnalysisRecord {
 
 /* ── Filter tabs ───────────────────────────────────────────────────────────── */
 
-const ACTION_TABS = ['', 'BUY', 'SELL', 'HOLD'];
+const ACTION_TABS = ['', 'BUY', 'SELL', 'HOLD'] as const;
 const ACTION_LABELS: Record<string, string> = {
   '': 'ALL', 'BUY': 'BUY', 'SELL': 'SELL', 'HOLD': 'HOLD',
 };
@@ -113,7 +112,20 @@ export default function AnalysisScreen() {
 
   return (
     <div className={styles.screen}>
-      <div className={styles.sectionLabel}>ANALYSIS</div>
+      {/* Breadcrumb + auto-refresh */}
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>ANALYSIS</span>
+        </div>
+        <div className={styles.autoRefresh}>
+          <span className={styles.greenDot} />
+          AUTO-REFRESH 30s
+        </div>
+      </div>
+
+      <h1 className={styles.pageTitle}>ANALYSIS</h1>
 
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
@@ -127,39 +139,61 @@ export default function AnalysisScreen() {
         </div>
       )}
 
+      {/* Filter row 1: search inputs */}
       <div className={styles.filterRow}>
-        <FilterBar
-          searchValue={tickerSearch}
-          onSearchChange={setTickerSearch}
-          searchPlaceholder="Ticker…"
-        />
-        <div className={styles.modelSearchWrap}>
-          <label className={styles.modelSearchLabel} htmlFor="model-filter">MODEL</label>
+        <div className={styles.searchInput}>
+          <span className={styles.searchLabel}>TICKER</span>
           <input
-            id="model-filter"
             type="text"
-            className={styles.modelSearchInput}
+            className={styles.searchField}
+            value={tickerSearch}
+            onChange={e => setTickerSearch(e.target.value)}
+            placeholder="BTC/USDT"
+          />
+        </div>
+        <div className={styles.searchInput}>
+          <span className={styles.searchLabel}>MODEL</span>
+          <input
+            type="text"
+            className={styles.searchField}
             value={modelSearch}
             onChange={e => setModelSearch(e.target.value)}
-            placeholder="Model…"
+            placeholder="claude-sonnet"
           />
         </div>
       </div>
 
+      {/* Filter row 2: action tabs */}
       <div className={styles.filterPills} role="group" aria-label="Action filter">
-        {ACTION_TABS.map(tab => (
-          <button
-            key={tab}
-            type="button"
-            aria-pressed={actionFilter === tab}
-            className={`${styles.filterPill} ${actionFilter === tab ? styles.filterPillActive : ''}`}
-            onClick={() => setActionFilter(tab)}
-          >
-            {ACTION_LABELS[tab]}
-          </button>
-        ))}
+        {ACTION_TABS.map(tab => {
+          const label = ACTION_LABELS[tab];
+          const isActive = actionFilter === tab;
+          let pillClass = styles.filterPill;
+          if (isActive) {
+            pillClass += ' ' + styles.filterPillActive;
+            if (tab === 'BUY' || tab === '') pillClass += ' ' + styles.pillGreen;
+            else if (tab === 'SELL') pillClass += ' ' + styles.pillRed;
+            else if (tab === 'HOLD') pillClass += ' ' + styles.pillAmber;
+          } else {
+            if (tab === 'BUY' || tab === '') pillClass += ' ' + styles.pillGreenOutline;
+            else if (tab === 'SELL') pillClass += ' ' + styles.pillRedOutline;
+            else if (tab === 'HOLD') pillClass += ' ' + styles.pillAmberOutline;
+          }
+          return (
+            <button
+              key={tab}
+              type="button"
+              aria-pressed={isActive}
+              className={pillClass}
+              onClick={() => setActionFilter(tab)}
+            >
+              {label}
+            </button>
+          );
+        })}
       </div>
 
+      {/* Card grid — 3 columns */}
       {!(isLoading && analyses.length === 0) && (
         <div className={styles.grid}>
           {filtered.length === 0 ? (

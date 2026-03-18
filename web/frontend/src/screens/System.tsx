@@ -1,9 +1,394 @@
-import styles from './ScreenStub.module.css';
+/**
+ * System screen — KPI strip, Model Performance table, Prompt Cache stats,
+ * and live Engine Activity log from WebSocket events.
+ *
+ * Task 8 of the web redesign (closes #206).
+ */
+import { useState, useEffect, useRef } from 'react';
+import { useEngineSocketContext } from '../contexts/EngineSocketContext';
+import { EVENT_LABELS } from '../types/protocol';
+import type { IndexedWebEvent } from '../hooks/useEngineSocket';
+import styles from './System.module.css';
+
+/* ── Types ─────────────────────────────────────────────────────────────────── */
+
+interface SystemStatus {
+  mode: string;
+  tick_interval_sec: number;
+  tick_interval_min: number;
+  uptime_seconds: number;
+}
+
+interface CacheStats {
+  hits: number;
+  misses: number;
+  evictions: number;
+  errors: number;
+}
+
+interface ModelPerfRow {
+  ModelName: string;
+  ModelProvider: string;
+  TradeCount: number;
+  WinRate: number | null;
+  AvgPnl: number | null;
+  AvgLatencyMs: number | null;
+  AvgTokens: number | null;
+}
+
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
+
+function fmtUptime(sec: number): string {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  return `${String(h).padStart(2, '0')}h ${String(m).padStart(2, '0')}m ${String(s).padStart(2, '0')}s`;
+}
+
+function fmtPct(v: number | null): string {
+  if (v == null) return '—';
+  return v.toFixed(1) + '%';
+}
+
+function fmtPnl(v: number | null): string {
+  if (v == null) return '—';
+  const prefix = v >= 0 ? '+' : '';
+  return `${prefix}$${v.toFixed(2)}`;
+}
+
+function fmtMs(v: number | null): string {
+  if (v == null) return '—';
+  return `${Math.round(v).toLocaleString()}ms`;
+}
+
+function fmtTokens(v: number | null): string {
+  if (v == null) return '—';
+  return Math.round(v).toLocaleString();
+}
+
+function fmtTime(iso: string): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
+/** Map event type to a badge label for the activity log */
+function badgeLabel(ev: IndexedWebEvent): string {
+  if (EVENT_LABELS[ev.type]) {
+    const label = EVENT_LABELS[ev.type];
+    if (label === 'Signal' || label === 'Queued') return 'SIGNAL';
+    if (label === 'Analysis' || label === 'Indicators') return 'MODEL';
+    if (label === 'Trade' || label === 'Simulated' || label === 'Closed' || label === 'Position') return 'TRADE';
+    if (label === 'Risk OK') return 'RISK';
+    if (label === 'Blocked' || label === 'Expired') return 'BLOCKED';
+    if (label === 'Error') return 'ERROR';
+    if (label === 'Market Data') return 'DATA';
+    if (label === 'Portfolio') return 'TRADE';
+    return label.toUpperCase();
+  }
+  if (ev.type.toLowerCase().includes('cache')) return 'CACHE';
+  return ev.type.toUpperCase().slice(0, 10);
+}
+
+/** Map badge label to CSS class */
+function badgeClass(label: string): string {
+  switch (label) {
+    case 'SIGNAL': return styles.badgeSignal;
+    case 'MODEL': return styles.badgeModel;
+    case 'CACHE': return styles.badgeCache;
+    case 'TRADE': return styles.badgeTrade;
+    case 'RISK': return styles.badgeRisk;
+    case 'BLOCKED':
+    case 'ERROR': return styles.badgeBlocked;
+    default: return styles.badgeDefault;
+  }
+}
+
+/** Build a human-readable description for an engine event */
+function eventDescription(ev: IndexedWebEvent): string {
+  const p = ev.payload as Record<string, unknown> | undefined;
+  const parts: string[] = [];
+
+  const label = EVENT_LABELS[ev.type] ?? ev.type;
+  parts.push(label);
+
+  if (ev.source) parts.push('—', ev.source);
+  if (ev.target && ev.target !== ev.source) parts.push('·', ev.target);
+
+  if (p) {
+    if (p.ticker) parts.push('·', String(p.ticker));
+    if (p.direction) parts.push(String(p.direction));
+    if (p.strategy) parts.push('·', String(p.strategy));
+    if (p.confidence != null) parts.push('·', `confidence ${Math.round(Number(p.confidence) * 100)}%`);
+    if (p.latency_ms != null) parts.push('·', `${Number(p.latency_ms).toLocaleString()}ms`);
+    if (p.tokens != null) parts.push('·', `${Number(p.tokens).toLocaleString()} tokens`);
+    if (p.reason) parts.push('·', String(p.reason));
+    if (p.entry_price != null) parts.push('·', `entry ${Number(p.entry_price).toLocaleString()}`);
+    if (p.drawdown != null) parts.push('·', `drawdown ${(Number(p.drawdown) * 100).toFixed(1)}%`);
+  }
+
+  return parts.join(' ');
+}
+
+/* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function SystemScreen() {
+  const { status: wsStatus, events } = useEngineSocketContext();
+
+  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
+  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
+  const [modelPerf, setModelPerf] = useState<ModelPerfRow[]>([]);
+  const [signalCount, setSignalCount] = useState<number | null>(null);
+  const [riskData, setRiskData] = useState<{ open_trade_count: number } | null>(null);
+  const [uptime, setUptime] = useState(0);
+  const baseUptime = useRef(0);
+  const loadedAt = useRef(Date.now());
+
+  useEffect(() => {
+    async function fetchAll() {
+      const [statusRes, cacheRes, modelsRes, signalsRes, riskRes] = await Promise.allSettled([
+        fetch('/api/system/status'),
+        fetch('/api/system/cache'),
+        fetch('/api/node/models'),
+        fetch('/api/signals/recent?limit=200'),
+        fetch('/api/node/risk'),
+      ]);
+
+      if (statusRes.status === 'fulfilled' && statusRes.value.ok) {
+        const data = await statusRes.value.json();
+        setSystemStatus(data);
+        baseUptime.current = data.uptime_seconds;
+        loadedAt.current = Date.now();
+      }
+      if (cacheRes.status === 'fulfilled' && cacheRes.value.ok) {
+        setCacheStats(await cacheRes.value.json());
+      }
+      if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
+        const data = await modelsRes.value.json();
+        if (data?.model_performance) setModelPerf(data.model_performance);
+      }
+      if (signalsRes.status === 'fulfilled' && signalsRes.value.ok) {
+        const data = await signalsRes.value.json();
+        if (data?.signals) setSignalCount(data.signals.length);
+      }
+      if (riskRes.status === 'fulfilled' && riskRes.value.ok) {
+        setRiskData(await riskRes.value.json());
+      }
+    }
+
+    fetchAll();
+    const interval = setInterval(fetchAll, 30_000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Tick uptime every second
+  useEffect(() => {
+    const id = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - loadedAt.current) / 1000);
+      setUptime(baseUptime.current + elapsed);
+    }, 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  const mode = systemStatus?.mode ?? '—';
+  const tickMin = systemStatus?.tick_interval_min ?? null;
+  const cacheHitRate = cacheStats && (cacheStats.hits + cacheStats.misses) > 0
+    ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
+    : '—';
+
+  const modeClass = mode === 'PAPER' ? styles.kpiAmber
+    : mode === 'LIVE' || mode === 'AUTO' ? styles.kpiGreen
+    : mode === 'MANUAL' ? styles.kpiRed
+    : '';
+
+  const openPositions = riskData?.open_trade_count ?? '—';
+
+  const activityEvents = events.slice(0, 50);
+
   return (
     <div className={styles.screen}>
-      <span className="text-secondary uppercase">System</span>
+      {/* Breadcrumb */}
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>SYSTEM</span>
+        </div>
+        <div className={styles.versionStatus}>
+          v2.1.0 <span className={styles.greenDot} /> ALL SYSTEMS NOMINAL
+        </div>
+      </div>
+
+      {/* Title row */}
+      <div className={styles.titleRow}>
+        <div>
+          <h1 className={styles.pageTitle}>SYSTEM</h1>
+          <div className={styles.uptimeLabel}>UPTIME {fmtUptime(uptime)}</div>
+        </div>
+        <div className={styles.titleRight}>
+          <button type="button" className={styles.paperModeBtn}>PAPER MODE</button>
+          <span className={styles.wsStatus}>
+            <span className={wsStatus === 'connected' ? styles.greenDot : styles.redDot} />
+            {wsStatus === 'connected' ? 'WS CONNECTED' : 'WS ' + wsStatus.toUpperCase()}
+          </span>
+        </div>
+      </div>
+
+      {/* KPI Strip — 6 cards */}
+      <div className={styles.kpiStrip}>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>ENGINE MODE</span>
+          <span className={`${styles.kpiValue} ${modeClass}`}>{mode}</span>
+        </div>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>TICK INTERVAL</span>
+          <span className={styles.kpiValue}>{tickMin != null ? `${tickMin}m` : '—'}</span>
+        </div>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>SIGNALS TODAY</span>
+          <span className={styles.kpiValue}>{signalCount ?? '—'}</span>
+        </div>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>CACHE HIT RATE</span>
+          <span className={`${styles.kpiValue} ${styles.kpiGreen}`}>{cacheHitRate}</span>
+        </div>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>DRAWDOWN</span>
+          <span className={`${styles.kpiValue} ${styles.kpiAmber}`}>—</span>
+        </div>
+        <div className={styles.kpiCard}>
+          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+          <span className={styles.bracketBR} aria-hidden="true">¬</span>
+          <span className={styles.kpiLabel}>OPEN POSITIONS</span>
+          <span className={styles.kpiValue}>{openPositions}</span>
+        </div>
+      </div>
+
+      {/* Two-column main area */}
+      <div className={styles.mainColumns}>
+        {/* Left column */}
+        <div className={styles.leftCol}>
+          <div className={styles.sectionHeader}>
+            <span className={styles.sectionTitle}>MODEL PERFORMANCE</span>
+            <span className={styles.sectionAnnotation}>min 5 trades</span>
+          </div>
+
+          <div className={styles.tableWrap}>
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th className={styles.th}>MODEL</th>
+                  <th className={styles.th}>TRADES</th>
+                  <th className={styles.th}>WIN RATE</th>
+                  <th className={styles.th}>AVG P&amp;L</th>
+                  <th className={styles.th}>AVG LATENCY</th>
+                  <th className={styles.th}>TOKENS/CALL</th>
+                </tr>
+              </thead>
+              <tbody>
+                {modelPerf.length === 0 ? (
+                  <tr>
+                    <td className={styles.td} colSpan={6}>
+                      <span className={styles.emptyText}>No model data available</span>
+                    </td>
+                  </tr>
+                ) : (
+                  modelPerf.map(row => (
+                    <tr key={`${row.ModelProvider}-${row.ModelName}`}>
+                      <td className={styles.td}>{row.ModelName}</td>
+                      <td className={styles.td}>{row.TradeCount}</td>
+                      <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate)}</td>
+                      <td className={`${styles.td} ${(row.AvgPnl ?? 0) >= 0 ? styles.green : styles.red}`}>
+                        {fmtPnl(row.AvgPnl)}
+                      </td>
+                      <td className={styles.td}>{fmtMs(row.AvgLatencyMs)}</td>
+                      <td className={styles.td}>{fmtTokens(row.AvgTokens)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Prompt Cache */}
+          <div className={styles.sectionHeader} style={{ marginTop: 24 }}>
+            <span className={styles.sectionTitle}>PROMPT CACHE</span>
+            <span className={styles.sectionAnnotation}>process lifetime</span>
+          </div>
+
+          <div className={styles.cacheStrip}>
+            <div className={styles.cacheCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+              <span className={styles.kpiLabel}>HITS</span>
+              <span className={`${styles.kpiValue} ${styles.kpiGreen}`}>
+                {cacheStats?.hits.toLocaleString() ?? '—'}
+              </span>
+            </div>
+            <div className={styles.cacheCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+              <span className={styles.kpiLabel}>MISSES</span>
+              <span className={styles.kpiValue}>
+                {cacheStats?.misses.toLocaleString() ?? '—'}
+              </span>
+            </div>
+            <div className={styles.cacheCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+              <span className={styles.kpiLabel}>EVICTIONS</span>
+              <span className={styles.kpiValue}>
+                {cacheStats?.evictions.toLocaleString() ?? '—'}
+              </span>
+            </div>
+            <div className={styles.cacheCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+              <span className={styles.kpiLabel}>ERRORS</span>
+              <span className={`${styles.kpiValue} ${(cacheStats?.errors ?? 0) > 0 ? styles.kpiRed : ''}`}>
+                {cacheStats?.errors.toLocaleString() ?? '—'}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Right column — Engine Activity */}
+        <div className={styles.rightCol}>
+          <div className={styles.sectionHeader}>
+            <span className={styles.sectionTitle}>ENGINE ACTIVITY</span>
+            <span className={styles.liveIndicator}>
+              <span className={styles.pulseDot} /> LIVE
+            </span>
+          </div>
+
+          <div className={styles.activityLog}>
+            {activityEvents.length === 0 ? (
+              <div className={styles.emptyText}>No events yet</div>
+            ) : (
+              activityEvents.map(ev => {
+                const label = badgeLabel(ev);
+                return (
+                  <div key={ev._seqId} className={styles.logRow}>
+                    <span className={styles.logTime}>{fmtTime(ev.timestamp)}</span>
+                    <span className={`${styles.logBadge} ${badgeClass(label)}`}>{label}</span>
+                    <span className={styles.logDesc}>{eventDescription(ev)}</span>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

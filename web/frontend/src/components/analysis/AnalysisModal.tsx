@@ -1,5 +1,4 @@
 import { useEffect, useRef } from 'react';
-import { fmtDate, fmtPrice } from '../../utils/format';
 import type { AnalysisRecord } from '../../screens/Analysis';
 import styles from './AnalysisModal.module.css';
 
@@ -8,11 +7,42 @@ interface AnalysisModalProps {
   onClose: () => void;
 }
 
-function dirClass(action: string): string {
+function actionClass(action: string): string {
   const a = action.toUpperCase();
-  if (a === 'BUY') return styles.dirBuy;
-  if (a === 'SELL') return styles.dirSell;
-  return styles.dirHold;
+  if (a === 'BUY') return styles.badgeBuy;
+  if (a === 'SELL') return styles.badgeSell;
+  return styles.badgeHold;
+}
+
+function confClass(action: string): string {
+  const a = action.toUpperCase();
+  if (a === 'BUY') return styles.confBuy;
+  if (a === 'SELL') return styles.confSell;
+  return styles.confHold;
+}
+
+function barClass(action: string): string {
+  const a = action.toUpperCase();
+  if (a === 'BUY') return styles.barBuy;
+  if (a === 'SELL') return styles.barSell;
+  return styles.barHold;
+}
+
+function fmtDateTime(iso: string): string {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  const y = d.getFullYear();
+  const mo = String(d.getMonth() + 1).padStart(2, '0');
+  const da = String(d.getDate()).padStart(2, '0');
+  const h = String(d.getHours()).padStart(2, '0');
+  const mi = String(d.getMinutes()).padStart(2, '0');
+  const s = String(d.getSeconds()).padStart(2, '0');
+  return `${y}-${mo}-${da} ${h}:${mi}:${s}`;
+}
+
+function fmtPrice(v: number): string {
+  if (!v) return '—';
+  return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps) {
@@ -44,12 +74,13 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
   }, [onClose]);
 
   const confPct = (analysis.Confidence * 100).toFixed(0);
+  const action = analysis.Action.toUpperCase();
 
   return (
     <>
       <div className={styles.backdrop} onClick={onClose} />
       <div
-        className={`${styles.panel} chamfer-panel-right`}
+        className={styles.panel}
         ref={panelRef}
         tabIndex={-1}
         role="dialog"
@@ -61,81 +92,92 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div className={styles.headerLeft}>
             <div className={styles.headerTopRow}>
               <span className={styles.title}>{analysis.Ticker}</span>
-              <span className={`${styles.dirBadge} ${dirClass(analysis.Action)}`}>
-                {analysis.Action.toUpperCase()}
+              <span className={`${styles.badge} ${actionClass(analysis.Action)}`}>
+                {action}
               </span>
             </div>
             <span className={styles.headerMeta}>
-              {fmtDate(analysis.CreatedAt)} · {analysis.Strategy}
+              {fmtDateTime(analysis.CreatedAt)} · {analysis.Strategy.replace(/_/g, ' ')} · {analysis.ModelProvider} / {analysis.ModelName}
             </span>
           </div>
           <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close panel">
-            ESC
+            ×
           </button>
+        </div>
+
+        {/* Confidence */}
+        <div className={styles.confSection}>
+          <span className={styles.confLabel}>CONFIDENCE</span>
+          <span className={`${styles.confValue} ${confClass(analysis.Action)}`}>{confPct}%</span>
+          <div className={styles.confBarTrack}>
+            <div
+              className={`${styles.confBarFill} ${barClass(analysis.Action)}`}
+              style={{ width: `${Math.min(Number(confPct), 100)}%` }}
+            />
+          </div>
         </div>
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Full reasoning */}
-          <div>
-            <div className={styles.sectionLabel}>REASONING</div>
+          {/* Full Reasoning */}
+          <div className={styles.section}>
+            <div className={styles.sectionLabel}>FULL REASONING</div>
             <div className={styles.reasoning}>{analysis.Reasoning}</div>
           </div>
 
-          {/* Metrics grid 2×2 */}
-          <div>
-            <div className={styles.sectionLabel}>METRICS</div>
-            <div className={styles.metricsGrid}>
-              <div className={styles.metricCard}>
-                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-                <span className={styles.bracketBR} aria-hidden="true">¬</span>
-                <span className={styles.metricLabel}>Confidence</span>
-                <span className={styles.metricValue}>{confPct}%</span>
+          {/* Signal Parameters */}
+          <div className={styles.section}>
+            <div className={styles.sectionLabel}>SIGNAL PARAMETERS</div>
+            <div className={styles.kvList}>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Action</span>
+                <span className={`${styles.kvVal} ${actionClass(analysis.Action)}`}>{action}</span>
               </div>
-              <div className={styles.metricCard}>
-                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-                <span className={styles.bracketBR} aria-hidden="true">¬</span>
-                <span className={styles.metricLabel}>Size %</span>
-                <span className={styles.metricValue}>{analysis.SizePct.toFixed(1)}%</span>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Stop Loss</span>
+                <span className={`${styles.kvVal} ${styles.valRed}`}>
+                  {analysis.StopLoss ? fmtPrice(analysis.StopLoss) : '—'}
+                </span>
               </div>
-              <div className={styles.metricCard}>
-                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-                <span className={styles.bracketBR} aria-hidden="true">¬</span>
-                <span className={styles.metricLabel}>Stop Loss</span>
-                <span className={styles.metricValue}>{analysis.StopLoss ? fmtPrice(analysis.StopLoss) : '—'}</span>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Take Profit</span>
+                <span className={`${styles.kvVal} ${styles.valGreen}`}>
+                  {analysis.TakeProfit ? fmtPrice(analysis.TakeProfit) : '—'}
+                </span>
               </div>
-              <div className={styles.metricCard}>
-                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-                <span className={styles.bracketBR} aria-hidden="true">¬</span>
-                <span className={styles.metricLabel}>Take Profit</span>
-                <span className={styles.metricValue}>{analysis.TakeProfit ? fmtPrice(analysis.TakeProfit) : '—'}</span>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Size %</span>
+                <span className={styles.kvVal}>{analysis.SizePct.toFixed(1)}%</span>
+              </div>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Strategy</span>
+                <span className={styles.kvVal}>{analysis.Strategy}</span>
               </div>
             </div>
           </div>
 
-          {/* Model info */}
-          <div>
-            <div className={styles.sectionLabel}>MODEL</div>
-            <div className={styles.modelInfo}>
-              <span className={styles.kvLabel}>Provider</span>
-              <span className={styles.kvValue}>{analysis.ModelProvider}</span>
-              <span className={styles.kvLabel}>Name</span>
-              <span className={styles.kvValue}>{analysis.ModelName}</span>
-              <span className={styles.kvLabel}>Input Tokens</span>
-              <span className={styles.kvValue}>{analysis.InputTokens.toLocaleString()}</span>
-              <span className={styles.kvLabel}>Output Tokens</span>
-              <span className={styles.kvValue}>{analysis.OutputTokens.toLocaleString()}</span>
-              <span className={styles.kvLabel}>Latency</span>
-              <span className={styles.kvValue}>{analysis.LatencyMs.toLocaleString()}ms</span>
+          {/* Model Info */}
+          <div className={styles.section}>
+            <div className={styles.sectionLabel}>MODEL INFO</div>
+            <div className={styles.kvList}>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Model</span>
+                <span className={styles.kvVal}>{analysis.ModelName}</span>
+              </div>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Input tokens</span>
+                <span className={styles.kvVal}>{analysis.InputTokens.toLocaleString()}</span>
+              </div>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Output tokens</span>
+                <span className={styles.kvVal}>{analysis.OutputTokens.toLocaleString()}</span>
+              </div>
+              <div className={styles.kvRow}>
+                <span className={styles.kvKey}>Latency</span>
+                <span className={styles.kvVal}>{analysis.LatencyMs.toLocaleString()}ms</span>
+              </div>
             </div>
           </div>
-        </div>
-
-        {/* Footer */}
-        <div className={styles.footer}>
-          <button type="button" className={styles.btnClose} onClick={onClose}>
-            CLOSE
-          </button>
         </div>
       </div>
     </>

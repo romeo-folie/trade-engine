@@ -8,9 +8,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+// processStart records the time this process was loaded, used for uptime.
+var processStart = time.Now()
 
 // registerAPIHandlers mounts the REST drill-down endpoints on mux.
 func registerAPIHandlers(mux *http.ServeMux) {
@@ -23,6 +27,8 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
 	mux.HandleFunc("/api/backtests/runs", handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
+	mux.HandleFunc("/api/system/cache", handleSystemCache)
+	mux.HandleFunc("/api/system/status", handleSystemStatus)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -287,6 +293,34 @@ func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, runDetail{
 		backteststRunSummary: toRunSummary(run),
 		InitialCash:          initialCash,
+	})
+}
+
+// GET /api/system/cache
+func handleSystemCache(w http.ResponseWriter, _ *http.Request) {
+	// TODO: wire up live engine prompt cache stats when available.
+	// The PromptCache in internal/backtest/cache.go is per-backtest-run,
+	// not a global singleton, so there are no live stats to expose yet.
+	jsonResponse(w, map[string]any{
+		"hits": 0, "misses": 0, "evictions": 0, "errors": 0,
+	})
+}
+
+// GET /api/system/status
+func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
+	cfg := config.Get()
+	uptimeSec := int(time.Since(processStart).Seconds())
+
+	tickMin := cfg.Engine.TickIntervalSec / 60
+	if tickMin < 1 {
+		tickMin = cfg.Engine.TickIntervalSec
+	}
+
+	jsonResponse(w, map[string]any{
+		"mode":              strings.ToUpper(cfg.Engine.Mode),
+		"tick_interval_sec": cfg.Engine.TickIntervalSec,
+		"tick_interval_min": tickMin,
+		"uptime_seconds":    uptimeSec,
 	})
 }
 
