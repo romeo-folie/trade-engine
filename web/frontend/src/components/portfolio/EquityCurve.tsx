@@ -51,7 +51,7 @@ export default function EquityCurve({ data }: EquityCurveProps) {
   const glowFilterId = `equity-glow-${uid.replace(/:/g, '')}`;
 
   return (
-    <div className={styles.wrapper} role="img" aria-label="Equity curve chart">
+    <div className={styles.wrapper} aria-label="Equity curve chart">
       {peakValue > 0 && (
         <span className={styles.peakLabel}>PEAK</span>
       )}

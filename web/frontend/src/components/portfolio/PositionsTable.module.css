@@ -108,3 +108,12 @@
   align-items: center;
   gap: 2px;
 }
+
+@media (prefers-reduced-motion: reduce) {
+  .statusDot { animation: none; }
+}
+
+.sortBtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
