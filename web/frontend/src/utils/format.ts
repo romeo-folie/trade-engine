@@ -1,5 +1,6 @@
 /** Format a number as a USD price string (e.g. 83241.50 → "$83,241.50") */
 export function fmtPrice(n: number): string {
+  if (!Number.isFinite(n)) return '—';
   return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 

@@ -188,6 +188,7 @@ export default function TradesScreen() {
   const [dateFilter, setDateFilter] = useState('');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
     async function load() {
@@ -226,6 +227,8 @@ export default function TradesScreen() {
     };
   }, []);
 
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
   const filtered = useMemo(() => {
     let rows = trades;
     if (tickerSearch) {
@@ -260,15 +263,15 @@ export default function TradesScreen() {
     const csv = tradesToCsv(filtered);
     if (!navigator.clipboard) {
       setToastMsg('Clipboard not available (requires HTTPS)');
-      setTimeout(() => setToastMsg(null), 2000);
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
       return;
     }
     navigator.clipboard.writeText(csv).then(() => {
       setToastMsg('CSV copied to clipboard');
-      setTimeout(() => setToastMsg(null), 2000);
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
     }).catch(() => {
       setToastMsg('Failed to copy');
-      setTimeout(() => setToastMsg(null), 2000);
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
     });
   }, [filtered]);
 

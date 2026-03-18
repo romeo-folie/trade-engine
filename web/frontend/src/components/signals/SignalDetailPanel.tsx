@@ -61,6 +61,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
         const focusable = panelRef.current.querySelectorAll<HTMLElement>(
           'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
         );
+        if (focusable.length === 0) return;
         const first = focusable[0];
         const last = focusable[focusable.length - 1];
         if (e.shiftKey) {

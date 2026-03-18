@@ -206,3 +206,12 @@
   font-weight: 700;
   border-color: var(--accent);
 }
+
+.loadingBanner {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: var(--space-3) var(--space-4);
+}
