@@ -143,6 +143,9 @@ func GetRun(ctx context.Context, id string) (BacktestRun, error) {
 	if err != nil {
 		return BacktestRun{}, err
 	}
+	if r == nil {
+		return BacktestRun{}, fmt.Errorf("backtest run not found: %s", id)
+	}
 	return *r, nil
 }
 

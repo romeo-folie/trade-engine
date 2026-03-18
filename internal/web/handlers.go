@@ -266,14 +266,27 @@ func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "backtest run query failed", err)
 		return
 	}
-	// Return summary + ConfigSnapshot (needed for initial_cash in equity curve).
-	type runWithSnapshot struct {
+	// Return summary + extracted InitialCash only.
+	// ConfigSnapshot contains live env-resolved secrets (APIKey, Secret, BotToken)
+	// so we never send it raw to the browser — we parse out only the fields we need.
+	type runDetail struct {
 		backteststRunSummary
-		ConfigSnapshot json.RawMessage `json:"ConfigSnapshot"`
+		InitialCash float64 `json:"InitialCash"`
 	}
-	jsonResponse(w, runWithSnapshot{
+	var initialCash float64
+	if len(run.ConfigSnapshot) > 0 {
+		var snap struct {
+			Backtest struct {
+				InitialCash float64 `json:"initial_cash"`
+			} `json:"backtest"`
+		}
+		if err := json.Unmarshal(run.ConfigSnapshot, &snap); err == nil && snap.Backtest.InitialCash > 0 {
+			initialCash = snap.Backtest.InitialCash
+		}
+	}
+	jsonResponse(w, runDetail{
 		backteststRunSummary: toRunSummary(run),
-		ConfigSnapshot:       run.ConfigSnapshot,
+		InitialCash:          initialCash,
 	})
 }
 

@@ -72,9 +72,10 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
         .then(res => res.ok ? res.json() : Promise.reject(new Error(`${res.status} ${res.statusText}`))),
     ])
       .then(([runData, tradesData]) => {
-        // Merge ConfigSnapshot from the detail endpoint into the run prop reference.
-        if (runData?.ConfigSnapshot) {
-          run.ConfigSnapshot = runData.ConfigSnapshot as { initial_cash?: number };
+        // Read InitialCash from the sanitised detail response (server strips ConfigSnapshot
+        // to prevent credential exposure; only InitialCash scalar is returned).
+        if (typeof runData?.InitialCash === 'number' && runData.InitialCash > 0) {
+          run.ConfigSnapshot = { initial_cash: runData.InitialCash };
         }
         setTrades(Array.isArray(tradesData.trades) ? tradesData.trades : []);
       })
