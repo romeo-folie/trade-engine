@@ -60,7 +60,7 @@ function SortTh({ col, sortKey, sortDir, onSort, children }: {
   const nextDir = isActive ? (sortDir === 'asc' ? 'descending' : 'ascending') : 'descending';
   const ariaLabel = `${SORT_LABELS[col]}, sort ${nextDir}`;
   return (
-    <th aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
+    <th scope="col" aria-sort={isActive ? (sortDir === 'asc' ? 'ascending' : 'descending') : 'none'}>
       <button
         type="button"
         className={styles.sortBtn}
@@ -106,8 +106,8 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
             <SortTh col="ticker" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               TICKER <SortIndicator col="ticker" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
-            <th>DIR</th>
-            <th>STRATEGY</th>
+            <th scope="col">DIR</th>
+            <th scope="col">STRATEGY</th>
             <SortTh col="entry" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               ENTRY <SortIndicator col="entry" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
@@ -120,14 +120,17 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
             <SortTh col="pnlPct" sortKey={sortKey} sortDir={sortDir} onSort={handleSort}>
               P&amp;L % <SortIndicator col="pnlPct" sortKey={sortKey} sortDir={sortDir} />
             </SortTh>
-            <th>STATUS</th>
+            <th scope="col">STATUS</th>
           </tr>
         </thead>
         <tbody>
-          {sorted.map((p) => {
+          {sorted.map((p, i) => {
             const pnlCls = p.unrealizedPnl >= 0 ? styles.positive : styles.negative;
+            // Use index as tiebreaker — the backend provides no stable row id.
+            // Positions for the same ticker+strategy+entry are indistinguishable without one.
+            const rowKey = `${p.ticker}-${p.strategy}-${p.entry}-${i}`;
             return (
-              <tr key={`${p.ticker}-${p.strategy}-${p.entry}`}>
+              <tr key={rowKey}>
                 <td style={{ fontWeight: 700 }}>{p.ticker}</td>
                 <td>
                   <span
