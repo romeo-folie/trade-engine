@@ -20,7 +20,7 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
 
   return (
     <div
-      className={`${styles.card} chamfer`}
+      className={styles.card}
       onClick={onClick}
       onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
       tabIndex={0}
@@ -40,7 +40,7 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
       </div>
 
       <div className={styles.recRow}>
-        <span className={`${styles.chip} ${chip} chamfer-sm`}>
+        <span className={`${styles.chip} ${chip}`}>
           {analysis.Action.toUpperCase()}
         </span>
         <span className={`${styles.confidence} ${conf}`}>{confPct}%</span>

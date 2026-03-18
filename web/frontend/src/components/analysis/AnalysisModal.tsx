@@ -61,7 +61,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div className={styles.headerLeft}>
             <div className={styles.headerTopRow}>
               <span className={styles.title}>{analysis.Ticker}</span>
-              <span className={`${styles.dirBadge} ${dirClass(analysis.Action)} chamfer-sm`}>
+              <span className={`${styles.dirBadge} ${dirClass(analysis.Action)}`}>
                 {analysis.Action.toUpperCase()}
               </span>
             </div>
@@ -69,7 +69,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
               {fmtDate(analysis.CreatedAt)} · {analysis.Strategy}
             </span>
           </div>
-          <button type="button" className={`${styles.closeBtn} chamfer-sm`} onClick={onClose} aria-label="Close panel">
+          <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close panel">
             ESC
           </button>
         </div>
@@ -86,19 +86,27 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div>
             <div className={styles.sectionLabel}>METRICS</div>
             <div className={styles.metricsGrid}>
-              <div className={`${styles.metricCard} chamfer-sm`}>
+              <div className={styles.metricCard}>
+                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+                <span className={styles.bracketBR} aria-hidden="true">¬</span>
                 <span className={styles.metricLabel}>Confidence</span>
                 <span className={styles.metricValue}>{confPct}%</span>
               </div>
-              <div className={`${styles.metricCard} chamfer-sm`}>
+              <div className={styles.metricCard}>
+                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+                <span className={styles.bracketBR} aria-hidden="true">¬</span>
                 <span className={styles.metricLabel}>Size %</span>
                 <span className={styles.metricValue}>{analysis.SizePct.toFixed(1)}%</span>
               </div>
-              <div className={`${styles.metricCard} chamfer-sm`}>
+              <div className={styles.metricCard}>
+                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+                <span className={styles.bracketBR} aria-hidden="true">¬</span>
                 <span className={styles.metricLabel}>Stop Loss</span>
                 <span className={styles.metricValue}>{analysis.StopLoss ? fmtPrice(analysis.StopLoss) : '—'}</span>
               </div>
-              <div className={`${styles.metricCard} chamfer-sm`}>
+              <div className={styles.metricCard}>
+                <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+                <span className={styles.bracketBR} aria-hidden="true">¬</span>
                 <span className={styles.metricLabel}>Take Profit</span>
                 <span className={styles.metricValue}>{analysis.TakeProfit ? fmtPrice(analysis.TakeProfit) : '—'}</span>
               </div>
@@ -125,7 +133,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Footer */}
         <div className={styles.footer}>
-          <button type="button" className={`${styles.btnClose} chamfer-sm`} onClick={onClose}>
+          <button type="button" className={styles.btnClose} onClick={onClose}>
             CLOSE
           </button>
         </div>

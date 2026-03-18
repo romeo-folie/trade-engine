@@ -133,7 +133,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
               {run.Ticker} · {run.Strategy} · {run.ModelProvider}/{run.ModelName}
             </span>
           </div>
-          <button type="button" className={`${styles.closeBtn} chamfer-sm`} onClick={onClose} aria-label="Close panel">
+          <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close panel">
             ESC
           </button>
         </div>
@@ -142,21 +142,29 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
         <div className={styles.body}>
           {/* Stats grid */}
           <div className={styles.statsGrid}>
-            <div className={`${styles.statCard} chamfer-sm`}>
+            <div className={styles.statCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
               <span className={styles.statLabel}>Return</span>
               <span className={`${styles.statValue} ${run.TotalReturnPct != null && run.TotalReturnPct >= 0 ? styles.emerald : styles.red}`}>
                 {fmtPct(run.TotalReturnPct)}
               </span>
             </div>
-            <div className={`${styles.statCard} chamfer-sm`}>
+            <div className={styles.statCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
               <span className={styles.statLabel}>Win Rate</span>
               <span className={styles.statValue}>{fmtPct(run.WinRatePct)}</span>
             </div>
-            <div className={`${styles.statCard} chamfer-sm`}>
+            <div className={styles.statCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
               <span className={styles.statLabel}>Max DD</span>
               <span className={`${styles.statValue} ${styles.red}`}>{fmtDrawdown(run.MaxDrawdownPct)}</span>
             </div>
-            <div className={`${styles.statCard} chamfer-sm`}>
+            <div className={styles.statCard}>
+              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+              <span className={styles.bracketBR} aria-hidden="true">¬</span>
               <span className={styles.statLabel}>Sharpe</span>
               <span className={styles.statValue}>{run.SharpeRatio != null ? run.SharpeRatio.toFixed(2) : '—'}</span>
             </div>
@@ -221,7 +229,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
 
         {/* Footer */}
         <div className={styles.footer}>
-          <button type="button" className={`${styles.btnClose} chamfer-sm`} onClick={onClose}>
+          <button type="button" className={styles.btnClose} onClick={onClose}>
             CLOSE
           </button>
         </div>

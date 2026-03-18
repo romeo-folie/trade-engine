@@ -152,7 +152,7 @@ export default function AnalysisScreen() {
             key={tab}
             type="button"
             aria-pressed={actionFilter === tab}
-            className={`${styles.filterPill} ${actionFilter === tab ? styles.filterPillActive : ''} chamfer-sm`}
+            className={`${styles.filterPill} ${actionFilter === tab ? styles.filterPillActive : ''}`}
             onClick={() => setActionFilter(tab)}
           >
             {ACTION_LABELS[tab]}

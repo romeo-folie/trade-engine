@@ -104,12 +104,35 @@
 }
 
 .statCard {
+  position: relative;
   background: var(--card-bg);
   border: 1px solid var(--border-muted);
   padding: var(--space-3) var(--space-4);
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+}
+
+.bracketTL,
+.bracketBR {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1;
+  color: var(--accent);
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+
+.bracketTL {
+  top: 5px;
+  left: 6px;
+}
+
+.bracketBR {
+  bottom: 5px;
+  right: 6px;
 }
 
 .statLabel {
