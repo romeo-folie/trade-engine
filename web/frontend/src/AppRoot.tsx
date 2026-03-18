@@ -16,7 +16,7 @@ export default function AppRoot() {
   const socket = useEngineSocket();
 
   // Show boot screen until first successful connection.
-  const booting = socket.status === 'connecting';
+  const booting = socket.status === 'connecting' || socket.status === 'reconnecting';
 
   if (booting) {
     return <BootScreen status={socket.status} />;

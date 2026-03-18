@@ -52,15 +52,24 @@ interface BootScreenProps {
   status: ConnectionStatus;
 }
 
-export default function BootScreen(_props: BootScreenProps) {
-  const cursorDelay = `${BOOT_LINES.length * LINE_DELAY_MS}ms`;
+export default function BootScreen({ status }: BootScreenProps) {
+  const showError = status === 'reconnecting';
+
+  const lines: LogLine[] = showError
+    ? [
+        ...BOOT_LINES,
+        { tag: 'ERR', text: 'engine socket lost — reconnecting...' },
+      ]
+    : BOOT_LINES;
+
+  const cursorDelay = `${lines.length * LINE_DELAY_MS}ms`;
 
   return (
     <div className={styles.screen} role="status" aria-label="System initialising">
       <div className={styles.scanlines} aria-hidden="true" />
 
       <div className={styles.terminal}>
-        {BOOT_LINES.map((line, i) => (
+        {lines.map((line, i) => (
           <BootLine key={i} line={line} index={i} />
         ))}
         <div
