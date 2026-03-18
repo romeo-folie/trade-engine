@@ -2,7 +2,7 @@
  * Signals screen — filterable table of trading signals with detail panel.
  *
  * Fetches live signals from GET /api/signals/recent?limit=100 every 15s.
- * Ticker search + status dropdown filter. Row click opens SignalDetailPanel.
+ * Ticker search + status pill tab filter. Row click opens SignalDetailPanel.
  *
  * Task 5 of the web redesign (closes #205).
  */
