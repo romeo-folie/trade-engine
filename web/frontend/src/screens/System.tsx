@@ -15,7 +15,7 @@ import styles from './System.module.css';
 interface SystemStatus {
   mode: string;
   tick_interval_sec: number;
-  tick_interval_min: number;
+  tick_interval_min: number; // float: e.g. 0.5 for 30s, 1.0 for 60s
   uptime_seconds: number;
 }
 
@@ -27,8 +27,8 @@ interface CacheStats {
 }
 
 interface ModelPerfRow {
-  ModelName: string;
-  ModelProvider: string;
+  Model: string;
+  Provider: string;
   TradeCount: number;
   WinRate: number | null;
   AvgPnl: number | null;
@@ -53,7 +53,7 @@ function fmtPct(v: number | null): string {
 function fmtPnl(v: number | null): string {
   if (v == null) return '—';
   const prefix = v >= 0 ? '+' : '';
-  return `${prefix}$${v.toFixed(2)}`;
+  return `${prefix}${v.toFixed(2)}%`;
 }
 
 function fmtMs(v: number | null): string {
@@ -191,7 +191,10 @@ export default function SystemScreen() {
   }, []);
 
   const mode = systemStatus?.mode ?? '—';
-  const tickMin = systemStatus?.tick_interval_min ?? null;
+  const tickSec = systemStatus?.tick_interval_sec ?? null;
+  const tickDisplay = tickSec == null ? '—'
+    : tickSec < 60 ? `${tickSec}s`
+    : `${Math.round(tickSec / 60)}m`;
   const cacheHitRate = cacheStats && (cacheStats.hits + cacheStats.misses) > 0
     ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
     : '—';
@@ -246,12 +249,12 @@ export default function SystemScreen() {
           <span className={styles.bracketTL} aria-hidden="true">⌐</span>
           <span className={styles.bracketBR} aria-hidden="true">¬</span>
           <span className={styles.kpiLabel}>TICK INTERVAL</span>
-          <span className={styles.kpiValue}>{tickMin != null ? `${tickMin}m` : '—'}</span>
+          <span className={styles.kpiValue}>{tickDisplay}</span>
         </div>
         <div className={styles.kpiCard}>
           <span className={styles.bracketTL} aria-hidden="true">⌐</span>
           <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>SIGNALS TODAY</span>
+          <span className={styles.kpiLabel}>RECENT SIGNALS</span>
           <span className={styles.kpiValue}>{signalCount ?? '—'}</span>
         </div>
         <div className={styles.kpiCard}>
@@ -304,8 +307,8 @@ export default function SystemScreen() {
                   </tr>
                 ) : (
                   modelPerf.map(row => (
-                    <tr key={`${row.ModelProvider}-${row.ModelName}`}>
-                      <td className={styles.td}>{row.ModelName}</td>
+                    <tr key={`${row.Provider}-${row.Model}`}>
+                      <td className={styles.td}>{row.Model}</td>
                       <td className={styles.td}>{row.TradeCount}</td>
                       <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
                       <td className={`${styles.td} ${(row.AvgPnl ?? 0) >= 0 ? styles.green : styles.red}`}>

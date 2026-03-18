@@ -57,6 +57,11 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
   const [trades, setTrades] = useState<BacktestTrade[]>([]);
   const [tradesLoading, setTradesLoading] = useState(true);
   const [tradesError, setTradesError] = useState<string | null>(null);
+  // initialCash is fetched from the server detail response and stored in local state
+  // to avoid mutating the `run` prop (immutability contract).
+  const [initialCash, setInitialCash] = useState<number>(
+    run.ConfigSnapshot?.initial_cash ?? DEFAULT_INITIAL_CASH,
+  );
   const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -74,8 +79,9 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
       .then(([runData, tradesData]) => {
         // Read InitialCash from the sanitised detail response (server strips ConfigSnapshot
         // to prevent credential exposure; only InitialCash scalar is returned).
+        // Store in local state — do NOT mutate the `run` prop.
         if (typeof runData?.InitialCash === 'number' && runData.InitialCash > 0) {
-          run.ConfigSnapshot = { initial_cash: runData.InitialCash };
+          setInitialCash(runData.InitialCash);
         }
         setTrades(Array.isArray(tradesData.trades) ? tradesData.trades : []);
       })
@@ -87,7 +93,10 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
       .finally(() => setTradesLoading(false));
 
     return () => controller.abort();
-  }, [run.ID, run]);
+  // Depend only on run.ID — the object reference changes on every parent render
+  // (BacktestsScreen re-renders on its 30s poll), which would cause repeated fetches.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [run.ID]);
 
   const handleKey = useCallback((e: KeyboardEvent) => {
     if (e.key === 'Escape') onClose();
@@ -112,7 +121,6 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     return () => document.removeEventListener('keydown', handleKey);
   }, [handleKey]);
 
-  const initialCash = run.ConfigSnapshot?.initial_cash ?? DEFAULT_INITIAL_CASH;
   const equityData = buildEquityCurve(trades, initialCash);
 
   return (

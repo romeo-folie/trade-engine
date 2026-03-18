@@ -104,10 +104,11 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
-// JSON tags match the TypeScript ModelPerfRow interface in web/frontend/src/screens/System.tsx.
+// JSON tags use Provider/Model to preserve the shared /api/node/models contract consumed by
+// both DrillDownPanel (llm_analysis, consensus tabs) and the System screen model-performance table.
 type ModelPerformanceRow struct {
-	Provider             string   `json:"ModelProvider"`
-	Model                string   `json:"ModelName"`
+	Provider             string   `json:"Provider"`
+	Model                string   `json:"Model"`
 	TotalRecommendations int      `json:"TotalRecommendations"`
 	AvgConfidence        float64  `json:"AvgConfidence"`
 	TradeCount           int      `json:"TradeCount"`

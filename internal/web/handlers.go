@@ -313,15 +313,10 @@ func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
 	cfg := config.Get()
 	uptimeSec := int(time.Since(processStart).Seconds())
 
-	tickMin := cfg.Engine.TickIntervalSec / 60
-	if tickMin < 1 {
-		tickMin = cfg.Engine.TickIntervalSec
-	}
-
 	jsonResponse(w, map[string]any{
 		"mode":              strings.ToUpper(cfg.Engine.Mode),
 		"tick_interval_sec": cfg.Engine.TickIntervalSec,
-		"tick_interval_min": tickMin,
+		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
 		"uptime_seconds":    uptimeSec,
 	})
 }
