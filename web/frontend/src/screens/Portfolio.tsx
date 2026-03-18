@@ -140,7 +140,6 @@ export default function PortfolioScreen() {
     };
   }, []);
 
-  // Use real snapshot data if available, else sensible defaults
   // Use real snapshot data only — no hardcoded fallbacks for financial values.
   // Display placeholder dashes until the first successful fetch.
   const hasData = snapshot !== null;
