@@ -104,16 +104,17 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
+// JSON tags match the TypeScript ModelPerfRow interface in web/frontend/src/screens/System.tsx.
 type ModelPerformanceRow struct {
-	Provider             string
-	Model                string
-	TotalRecommendations int
-	AvgConfidence        float64
-	TradeCount           int
-	AvgPnLPct            *float64
-	WinningTrades        int
-	LosingTrades         int
-	WinRate              *float64
+	Provider             string   `json:"ModelProvider"`
+	Model                string   `json:"ModelName"`
+	TotalRecommendations int      `json:"TotalRecommendations"`
+	AvgConfidence        float64  `json:"AvgConfidence"`
+	TradeCount           int      `json:"TradeCount"`
+	AvgPnLPct            *float64 `json:"AvgPnl"`
+	WinningTrades        int      `json:"WinningTrades"`
+	LosingTrades         int      `json:"LosingTrades"`
+	WinRate              *float64 `json:"WinRate"`
 }
 
 // GetModelPerformance returns per-model accuracy stats (Phase 12.6).

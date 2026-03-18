@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -298,11 +299,12 @@ func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/system/cache
 func handleSystemCache(w http.ResponseWriter, _ *http.Request) {
-	// TODO: wire up live engine prompt cache stats when available.
-	// The PromptCache in internal/backtest/cache.go is per-backtest-run,
-	// not a global singleton, so there are no live stats to expose yet.
+	s := cache.TakeSnapshot()
 	jsonResponse(w, map[string]any{
-		"hits": 0, "misses": 0, "evictions": 0, "errors": 0,
+		"hits":      s.Hits,
+		"misses":    s.Misses,
+		"evictions": s.Evictions,
+		"errors":    s.Errors,
 	})
 }
 

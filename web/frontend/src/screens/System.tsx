@@ -307,7 +307,7 @@ export default function SystemScreen() {
                     <tr key={`${row.ModelProvider}-${row.ModelName}`}>
                       <td className={styles.td}>{row.ModelName}</td>
                       <td className={styles.td}>{row.TradeCount}</td>
-                      <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate)}</td>
+                      <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
                       <td className={`${styles.td} ${(row.AvgPnl ?? 0) >= 0 ? styles.green : styles.red}`}>
                         {fmtPnl(row.AvgPnl)}
                       </td>
