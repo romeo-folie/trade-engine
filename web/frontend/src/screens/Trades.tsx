@@ -10,6 +10,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import type { Column } from '../components/table/DataTable';
+import { fmtPrice, fmtDate } from '../utils/format';
 import styles from './Trades.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -34,10 +35,6 @@ interface Trade {
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
-function fmtPrice(n: number): string {
-  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
 function fmtPnl(n: number): string {
   const sign = n > 0 ? '+' : n < 0 ? '-' : '';
   return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -46,14 +43,6 @@ function fmtPnl(n: number): string {
 function fmtPct(n: number): string {
   const sign = n > 0 ? '+' : '';
   return `${sign}${n.toFixed(2)}%`;
-}
-
-function fmtDate(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-  });
 }
 
 function pnlClass(n: number): string {
@@ -170,17 +159,18 @@ const COLUMNS: Column<Trade>[] = [
 /* ── CSV export ────────────────────────────────────────────────────────────── */
 
 function tradesToCsv(trades: Trade[]): string {
+  const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
   const header = 'ticker,direction,entry,exit,pnl,pnl_pct,status,opened';
   const rows = trades.map(t =>
     [
-      t.Ticker,
-      t.Direction,
+      escape(t.Ticker),
+      escape(t.Direction),
       t.EntryPrice.toFixed(2),
       t.ExitPrice ? t.ExitPrice.toFixed(2) : '',
       t.PnL.toFixed(2),
       t.PnLPct.toFixed(2),
-      t.Status,
-      t.OpenedAt,
+      escape(t.Status),
+      escape(t.OpenedAt),
     ].join(',')
   );
   return [header, ...rows].join('\n');
@@ -257,6 +247,11 @@ export default function TradesScreen() {
 
   const handleExport = useCallback(() => {
     const csv = tradesToCsv(filtered);
+    if (!navigator.clipboard) {
+      setToastMsg('Clipboard not available (requires HTTPS)');
+      setTimeout(() => setToastMsg(null), 2000);
+      return;
+    }
     navigator.clipboard.writeText(csv).then(() => {
       setToastMsg('CSV copied to clipboard');
       setTimeout(() => setToastMsg(null), 2000);

@@ -12,21 +12,10 @@ import FilterBar from '../components/table/FilterBar';
 import SignalDetailPanel from '../components/signals/SignalDetailPanel';
 import type { Signal } from '../components/signals/SignalDetailPanel';
 import type { Column } from '../components/table/DataTable';
+import { fmtPrice, fmtDate } from '../utils/format';
 import styles from './Signals.module.css';
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
-
-function fmtPrice(n: number): string {
-  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function fmtDate(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-  });
-}
 
 function statusBadgeClass(status: string): string {
   const s = status.toLowerCase();
@@ -97,7 +86,7 @@ const COLUMNS: Column<Signal>[] = [
     ),
   },
   {
-    key: 'Confidence' as keyof Signal,
+    key: 'Consensus' as keyof Signal,
     label: 'CONSENSUS',
     render: () => (
       <div className={styles.consensusWrap}>
@@ -205,7 +194,7 @@ export default function SignalsScreen() {
       {/* Stats row */}
       <div className={styles.statsRow}>
         <div className={styles.statCard}>
-          <span className={styles.statLabel}>TOTAL TODAY</span>
+          <span className={styles.statLabel}>TOTAL</span>
           <span className={styles.statValue}>{stats.total}</span>
         </div>
         <div className={styles.statCard}>

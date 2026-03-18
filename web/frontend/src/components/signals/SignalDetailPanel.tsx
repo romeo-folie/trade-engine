@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { fmtPrice, fmtDate } from '../../utils/format';
 import styles from './SignalDetailPanel.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -26,18 +27,6 @@ interface SignalDetailPanelProps {
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
 
-function fmtPrice(n: number): string {
-  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function fmtDate(iso: string): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return d.toLocaleString('en-US', {
-    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
-  });
-}
-
 function statusClass(status: string): string {
   const s = status.toLowerCase();
   if (s === 'pending') return styles.statusPending;
@@ -63,7 +52,23 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose();
+      if (e.key === 'Escape') {
+        onClose();
+        return;
+      }
+      // Focus trap: keep Tab/Shift+Tab within the panel
+      if (e.key === 'Tab' && panelRef.current) {
+        const focusable = panelRef.current.querySelectorAll<HTMLElement>(
+          'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+        );
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+        if (e.shiftKey) {
+          if (document.activeElement === first) { e.preventDefault(); last?.focus(); }
+        } else {
+          if (document.activeElement === last) { e.preventDefault(); first?.focus(); }
+        }
+      }
     }
     document.addEventListener('keydown', handleKey);
     panelRef.current?.focus();
@@ -80,6 +85,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
         ref={panelRef}
         tabIndex={-1}
         role="dialog"
+        aria-modal="true"
         aria-label={`Signal detail for ${signal.Ticker}`}
       >
         {/* Header */}
@@ -195,7 +201,13 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
           {/* Action buttons */}
           <div className={styles.actionRow}>
-            <button type="button" className={`${styles.btnOverride} chamfer-sm`}>OVERRIDE</button>
+            {/* TODO: wire to manual override API when endpoint is available */}
+            <button
+              type="button"
+              className={`${styles.btnOverride} chamfer-sm`}
+              disabled
+              title="Manual override — not yet implemented"
+            >OVERRIDE</button>
             <button type="button" className={`${styles.btnDismiss} chamfer-sm`} onClick={onClose}>DISMISS</button>
           </div>
         </div>
