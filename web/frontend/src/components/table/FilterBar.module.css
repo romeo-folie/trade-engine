@@ -1,0 +1,111 @@
+/* FilterBar — terminal-aesthetic search + dropdown filters */
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+  flex-wrap: wrap;
+}
+
+.searchWrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.searchLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.searchInput {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  padding: var(--space-1) var(--space-2);
+  outline: none;
+  min-width: 140px;
+  transition: border-color var(--transition-fast);
+}
+
+.searchInput::placeholder {
+  color: var(--text-faint);
+}
+
+.searchInput:focus {
+  border-color: var(--accent);
+}
+
+.filterWrap {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.filterLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.filterSelect {
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  padding: var(--space-1) var(--space-2);
+  outline: none;
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+
+.filterSelect:focus {
+  border-color: var(--accent);
+}
+
+.filterSelect option {
+  background: var(--panel-bg);
+  color: var(--text-primary);
+}
+
+.actions {
+  margin-left: auto;
+  display: flex;
+  gap: var(--space-3);
+}
+
+.actionBtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: var(--space-1) var(--space-3);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.actionBtn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.actionBtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}

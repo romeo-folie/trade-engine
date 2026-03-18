@@ -1,0 +1,79 @@
+/* DataTable — generic sortable table, terminal aesthetic */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+}
+
+.table th {
+  text-align: left;
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.table td {
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.table tbody tr:nth-child(odd) {
+  background: var(--canvas-bg);
+}
+
+.table tbody tr:nth-child(even) {
+  background: var(--panel-bg);
+}
+
+.clickable {
+  cursor: pointer;
+}
+
+.clickable:hover {
+  background: var(--card-bg) !important;
+}
+
+.sortBtn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+  font-size: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  text-transform: inherit;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.sortBtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.sortIndicator {
+  margin-left: 4px;
+  color: var(--text-faint);
+}
+
+.sortIndicatorActive {
+  margin-left: 4px;
+  color: var(--accent);
+}
+
+.emptyRow td {
+  text-align: center;
+  color: var(--text-faint);
+  padding: var(--space-6) var(--space-3);
+  font-size: var(--font-size-sm);
+}
