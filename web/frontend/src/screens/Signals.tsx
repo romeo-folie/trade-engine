@@ -226,13 +226,12 @@ export default function SignalsScreen() {
         searchPlaceholder="Ticker…"
       />
 
-      <div className={styles.filterPills} role="tablist" aria-label="Signal status filter">
+      <div className={styles.filterPills} role="group" aria-label="Signal status filter">
         {STATUS_TABS.map(tab => (
           <button
             key={tab}
             type="button"
-            role="tab"
-            aria-selected={statusFilter === tab}
+            aria-pressed={statusFilter === tab}
             className={`${styles.filterPill} ${statusFilter === tab ? styles.filterPillActive : ''} chamfer-sm`}
             onClick={() => setStatusFilter(tab)}
           >
@@ -241,15 +240,17 @@ export default function SignalsScreen() {
         ))}
       </div>
 
-      <DataTable<Signal>
-        columns={COLUMNS}
-        data={filtered}
-        rowKey={(s) => s.ID}
-        onRowClick={setSelectedSignal}
-        defaultSortKey="CreatedAt"
-        defaultSortDir="desc"
-        ariaLabel="Trading signals"
-      />
+      {!(isLoading && signals.length === 0) && (
+        <DataTable<Signal>
+          columns={COLUMNS}
+          data={filtered}
+          rowKey={(s) => s.ID}
+          onRowClick={setSelectedSignal}
+          defaultSortKey="CreatedAt"
+          defaultSortDir="desc"
+          ariaLabel="Trading signals"
+        />
+      )}
 
       {selectedSignal && (
         <SignalDetailPanel signal={selectedSignal} onClose={handleClosePanel} />
