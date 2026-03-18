@@ -1,0 +1,41 @@
+.group {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.segment {
+  padding: 6px 16px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: var(--card-bg);
+  border: none;
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.segment + .segment {
+  border-left: 1px solid var(--border);
+}
+
+.segment:hover:not(.active) {
+  background: var(--panel-bg);
+}
+
+.segment.active {
+  background: var(--accent);
+  color: #000;
+}
+
+.segment.emerald.active {
+  background: var(--emerald);
+  color: #000;
+}
