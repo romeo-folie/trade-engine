@@ -1,0 +1,226 @@
+/* AnalysisModal — slide-in detail panel from right, 520px */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: var(--z-panel);
+}
+
+.panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 520px;
+  max-width: 90vw;
+  background: var(--panel-bg);
+  border-left: 1px solid var(--border);
+  z-index: var(--z-modal);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  animation: slideIn var(--transition-slow) ease-out;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.headerLeft {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.headerTopRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.title {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.dirBadge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid;
+}
+
+.dirBuy {
+  color: var(--emerald);
+  border-color: var(--emerald);
+}
+
+.dirSell {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+.dirHold {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
+}
+
+.headerMeta {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.closeBtn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.closeBtn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.closeBtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Body */
+.body {
+  padding: var(--space-5);
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+/* Reasoning section */
+.sectionLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-2);
+}
+
+.reasoning {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+/* Metrics grid — 2x2 chamfered cards */
+.metricsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.metricCard {
+  background: var(--card-bg);
+  border: 1px solid var(--border-muted);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.metricLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.metricValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Model info KV */
+.modelInfo {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+}
+
+.kvLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.kvValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Footer */
+.footer {
+  padding: var(--space-4) var(--space-5);
+  border-top: 1px solid var(--border-muted);
+}
+
+.btnClose {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  background: transparent;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.btnClose:hover {
+  border-color: var(--text-muted);
+}
+
+.btnClose:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}

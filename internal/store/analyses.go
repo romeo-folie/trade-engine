@@ -187,6 +187,26 @@ func GetAnalysisByID(ctx context.Context, id string) (*StoredAnalysis, error) {
 	return &results[0], nil
 }
 
+// GetRecentAnalyses retrieves the most recent limit analyses across all tickers.
+func GetRecentAnalyses(ctx context.Context, limit int) ([]StoredAnalysis, error) {
+	q := `
+		SELECT id, ticker, strategy, action, confidence, size_pct,
+		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
+		       COALESCE(raw_response, ''), COALESCE(raw_prompt, ''), prompt_hash,
+		       model_provider, model_name,
+		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
+		       COALESCE(indicators, '{}'), created_at
+		FROM analyses
+		ORDER BY created_at DESC
+		LIMIT $1`
+	rows, err := GetDB().Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAnalyses(rows)
+}
+
 func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	var out []StoredAnalysis
 	for rows.Next() {

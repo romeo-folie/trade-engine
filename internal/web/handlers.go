@@ -19,6 +19,8 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/node/models", handleModels)
 	mux.HandleFunc("/api/signals/recent", handleRecentSignals)
 	mux.HandleFunc("/api/trades/recent", handleRecentTrades)
+	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
+	mux.HandleFunc("/api/backtests/recent", handleRecentBacktests)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -127,6 +129,25 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{"trades": trades})
+}
+
+// GET /api/analyses/recent?limit=N
+func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
+	limit := queryInt(r, "limit", 50)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	analyses, err := store.GetRecentAnalyses(ctx, limit)
+	if err != nil {
+		apiError(w, "analyses query failed", err)
+		return
+	}
+	jsonResponse(w, map[string]any{"analyses": analyses})
+}
+
+// GET /api/backtests/recent?limit=N
+func handleRecentBacktests(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, map[string]any{"backtests": []any{}})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
