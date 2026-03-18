@@ -63,7 +63,7 @@ function statusBadgeClass(status: string): string {
 const DATE_OPTIONS = [
   { label: 'All', value: '' },
   { label: 'Today', value: 'today' },
-  { label: 'Week', value: 'week' },
+  { label: '7D', value: 'week' },
   { label: 'Month', value: 'month' },
 ];
 

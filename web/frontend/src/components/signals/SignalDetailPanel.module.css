@@ -173,6 +173,11 @@
   border-color: rgba(239, 68, 68, 0.3);
 }
 
+.statusExpired {
+  color: var(--text-dim);
+  border-color: var(--border-muted);
+}
+
 /* Analyst routing */
 .routingLabel {
   font-family: var(--font-mono);

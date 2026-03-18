@@ -33,6 +33,7 @@ function statusClass(status: string): string {
   if (s === 'approved') return styles.statusApproved;
   if (s === 'executed') return styles.statusExecuted;
   if (s === 'blocked') return styles.statusBlocked;
+  if (s === 'expired') return styles.statusExpired;
   return styles.statusBlocked;
 }
 

@@ -141,6 +141,9 @@ export default function SignalsScreen() {
         const data = await res.json();
         if (data && Array.isArray(data.signals)) {
           setSignals(data.signals);
+          setSelectedSignal(sel =>
+            sel ? data.signals.find((s: Signal) => s.ID === sel.ID) ?? sel : null
+          );
           setFetchError(null);
         } else {
           setFetchError('Unexpected response shape');
