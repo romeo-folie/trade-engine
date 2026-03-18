@@ -1,0 +1,109 @@
+/* Boot Screen — terminal-style loading view */
+
+.screen {
+  position: fixed;
+  inset: 0;
+  background: #000000;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  padding: 0 0 0 clamp(2rem, 8vw, 6rem);
+  overflow: hidden;
+  z-index: 9999;
+}
+
+/* CRT scanline overlay — 3% opacity */
+.scanlines {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(255, 255, 255, 0.03) 2px,
+    rgba(255, 255, 255, 0.03) 4px
+  );
+  z-index: 1;
+}
+
+.terminal {
+  position: relative;
+  z-index: 2;
+  width: min(600px, 80vw);
+  font-family: 'JetBrains Mono', var(--font-mono);
+  font-size: 13px;
+  line-height: 1.75;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+/* Each line fades in with staggered animation-delay */
+.line {
+  white-space: pre;
+  overflow-x: hidden;
+  opacity: 0;
+  animation: fadeIn 0.05s ease-out forwards;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Title line */
+.title {
+  color: #39FF14;
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.5);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+/* Horizontal rule / separator */
+.separator {
+  color: #374151;
+}
+
+/* Tag colours */
+.tagOk     { color: #22C55E; }
+.tagWait   { color: #F59E0B; }
+.tagErr    { color: #EF4444; }
+.tagInfo   { color: #39FF14; }
+.tagSystem { color: #39FF14; }
+
+/* Log text */
+.text {
+  color: #9CA3AF;
+}
+
+/* Blinking cursor */
+.cursor {
+  color: #39FF14;
+  animation: blink 1s step-end infinite;
+  font-size: 14px;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Accessibility: disable animations for reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  .line {
+    animation: none;
+    opacity: 1;
+  }
+
+  .cursor {
+    animation: none;
+    opacity: 1;
+  }
+}

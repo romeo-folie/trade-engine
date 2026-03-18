@@ -1,7 +1,7 @@
 /**
  * EngineSocketContext — provides single shared WebSocket state to all consumers.
  *
- * Shell calls useEngineSocket() once and publishes state here.
+ * AppRoot calls useEngineSocket() once and publishes state here.
  * Screens consume via useEngineSocketContext() — no duplicate connections.
  */
 import { createContext, useContext } from 'react';

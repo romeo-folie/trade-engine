@@ -1,22 +1,25 @@
 import { Outlet } from 'react-router-dom';
-import { useEngineSocket } from '../../hooks/useEngineSocket';
-import { EngineSocketContext } from '../../contexts/EngineSocketContext';
+import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import TopBar from './TopBar';
 import Sidebar from './Sidebar';
 import styles from './Shell.module.css';
 
+/**
+ * Shell — main application chrome (TopBar + Sidebar + content area).
+ *
+ * The WebSocket is initialised in AppRoot and published via EngineSocketContext.
+ * Shell consumes it here — no duplicate connections.
+ */
 export default function Shell() {
-  const socket = useEngineSocket();
+  const socket = useEngineSocketContext();
 
   return (
-    <EngineSocketContext.Provider value={socket}>
-      <div className={styles.shell}>
-        <TopBar status={socket.status} eventsPerSecond={socket.eventsPerSecond} />
-        <Sidebar />
-        <main className={styles.content}>
-          <Outlet />
-        </main>
-      </div>
-    </EngineSocketContext.Provider>
+    <div className={styles.shell}>
+      <TopBar status={socket.status} eventsPerSecond={socket.eventsPerSecond} />
+      <Sidebar />
+      <main className={styles.content}>
+        <Outlet />
+      </main>
+    </div>
   );
 }
