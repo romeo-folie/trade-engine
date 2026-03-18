@@ -2,7 +2,7 @@
  * BacktestDetailPanel — slide-in panel from right showing run stats + trade list.
  *
  * Fetches trades via /api/backtests/runs/{id}/trades on open.
- * Includes equity curve (mock data since no history endpoint), stats, and trade table.
+ * Includes equity curve derived from trade PnL, stats, and trade table.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { fmtPrice } from '../../utils/format';
@@ -21,24 +21,20 @@ function fmtPct(v: number | null): string {
 }
 
 /**
- * Generate equity curve from trades using cumulative dollar PnL.
+ * Build equity curve from trades using cumulative dollar PnL.
  * Uses t.PnL (absolute dollar gain/loss per position) not t.PnLPct (position return %),
  * so the curve reflects actual portfolio-level performance, not per-position %.
  * Starting equity is 10,000 (arbitrary base for visual comparison).
  */
-function mockEquityCurve(trades: BacktestTrade[]): { date: string; value: number }[] {
+function buildEquityCurve(trades: BacktestTrade[]): { date: string; value: number }[] {
   if (trades.length === 0) return [];
-  const BASE = 10_000;
-  let equity = BASE;
+  let equity = 10_000;
   const points: { date: string; value: number }[] = [
     { date: trades[0].EntryTS.slice(0, 10), value: equity },
   ];
   for (const t of trades) {
     if (t.PnL != null) {
-      // Scale dollar PnL relative to BASE so the curve is comparable across runs
-      // regardless of actual position size. This avoids the 20x overstatement
-      // from compounding raw PnLPct (position return) as if it were portfolio return.
-      equity += (t.PnL / BASE) * BASE;
+      equity += t.PnL;
     }
     const dateStr = (t.ExitTS ?? t.EntryTS).slice(0, 10);
     points.push({ date: dateStr, value: Math.round(equity * 100) / 100 });
@@ -98,7 +94,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     return () => document.removeEventListener('keydown', handleKey);
   }, [handleKey]);
 
-  const equityData = mockEquityCurve(trades);
+  const equityData = buildEquityCurve(trades);
 
   return (
     <>
