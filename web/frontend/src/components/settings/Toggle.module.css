@@ -1,0 +1,31 @@
+.track {
+  position: relative;
+  width: 44px;
+  height: 22px;
+  border-radius: 11px;
+  background: var(--border);
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: background var(--transition-fast);
+}
+
+.track.on {
+  background: var(--emerald);
+}
+
+.knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--text-primary);
+  transition: transform var(--transition-fast);
+}
+
+.track.on .knob {
+  transform: translateX(22px);
+}
