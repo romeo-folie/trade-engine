@@ -308,7 +308,7 @@ export default function SystemScreen() {
                       <td className={styles.td}>{row.TradeCount}</td>
                       <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
                       <td className={`${styles.td} ${(row.AvgPnLPct ?? 0) >= 0 ? styles.green : styles.red}`}>
-                        {fmtPct(row.AvgPnLPct)}
+                        {fmtPct(row.AvgPnLPct != null ? row.AvgPnLPct * 100 : null)}
                       </td>
                       <td className={styles.td}>{row.TotalRecommendations}</td>
                       <td className={styles.td}>{fmtPct(row.AvgConfidence != null ? row.AvgConfidence * 100 : null)}</td>
