@@ -146,6 +146,11 @@ const COLUMNS: Column<Trade>[] = [
     render: (t) => <span className={pnlClass(t.PnLPct)}>{fmtPct(t.PnLPct)}</span>,
   },
   {
+    key: 'ModelName',
+    label: 'MODEL',
+    render: (t) => <span style={{ color: 'var(--text-muted)' }}>{t.ModelName || '—'}</span>,
+  },
+  {
     key: 'Status',
     label: 'STATUS',
     render: (t) => (
@@ -273,21 +278,21 @@ export default function TradesScreen() {
 
       {/* Summary row */}
       <div className={styles.summaryRow}>
-        <div className={`${styles.summaryCard} chamfer-sm`}>
+        <div className={styles.summaryCard}>
           <span className={styles.summaryLabel}>TOTAL</span>
           <span className={styles.summaryValue}>{summary.total}</span>
         </div>
-        <div className={`${styles.summaryCard} chamfer-sm`}>
+        <div className={styles.summaryCard}>
           <span className={styles.summaryLabel}>OPEN</span>
           <span className={styles.summaryValue}>{summary.openCount}</span>
         </div>
-        <div className={`${styles.summaryCard} chamfer-sm`}>
+        <div className={styles.summaryCard}>
           <span className={styles.summaryLabel}>WIN RATE</span>
           <span className={`${styles.summaryValue} ${summary.winRate >= 50 ? styles.positive : styles.negative}`}>
             {summary.winRate.toFixed(1)}%
           </span>
         </div>
-        <div className={`${styles.summaryCard} chamfer-sm`}>
+        <div className={styles.summaryCard}>
           <span className={styles.summaryLabel}>AVG P&amp;L</span>
           <span className={`${styles.summaryValue} ${pnlClass(summary.avgPnl)}`}>
             {fmtPnl(summary.avgPnl)}

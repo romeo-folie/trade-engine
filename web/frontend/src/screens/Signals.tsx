@@ -35,15 +35,13 @@ function statusBadgeClass(status: string): string {
   return styles.badgeBlocked;
 }
 
-/* ── Status filter options ─────────────────────────────────────────────────── */
+/* ── Status pill tabs ─────────────────────────────────────────────────────── */
 
-const STATUS_OPTIONS = [
-  { label: 'All', value: '' },
-  { label: 'Pending', value: 'pending' },
-  { label: 'Executed', value: 'executed' },
-  { label: 'Blocked', value: 'blocked' },
-  { label: 'Expired', value: 'expired' },
-];
+const STATUS_TABS = ['', 'pending', 'approved', 'executed', 'blocked', 'expired'];
+const STATUS_LABELS: Record<string, string> = {
+  '': 'ALL', 'pending': 'PENDING', 'approved': 'APPROVED',
+  'executed': 'EXECUTED', 'blocked': 'BLOCKED', 'expired': 'EXPIRED',
+};
 
 /* ── Columns ───────────────────────────────────────────────────────────────── */
 
@@ -56,12 +54,13 @@ const COLUMNS: Column<Signal>[] = [
   },
   {
     key: 'Action',
-    label: 'ACTION',
-    render: (s) => (
-      <span className={s.Action.toUpperCase() === 'BUY' ? styles.actionBuy : styles.actionSell}>
-        {s.Action.toUpperCase()}
-      </span>
-    ),
+    label: 'DIR',
+    render: (s) => {
+      const a = s.Action.toUpperCase();
+      if (a === 'BUY') return <span className={styles.dirLong}>▲ LONG</span>;
+      if (a === 'SELL') return <span className={styles.dirShort}>▼ SHORT</span>;
+      return <span className={styles.dirNeut}>◆ NEUT</span>;
+    },
   },
   {
     key: 'Strategy',
@@ -171,15 +170,22 @@ export default function SignalsScreen() {
         searchValue={tickerSearch}
         onSearchChange={setTickerSearch}
         searchPlaceholder="Ticker…"
-        filters={[
-          {
-            label: 'STATUS',
-            value: statusFilter,
-            onChange: setStatusFilter,
-            options: STATUS_OPTIONS,
-          },
-        ]}
       />
+
+      <div className={styles.filterPills} role="tablist" aria-label="Signal status filter">
+        {STATUS_TABS.map(tab => (
+          <button
+            key={tab}
+            type="button"
+            role="tab"
+            aria-selected={statusFilter === tab}
+            className={`${styles.filterPill} ${statusFilter === tab ? styles.filterPillActive : ''} chamfer-sm`}
+            onClick={() => setStatusFilter(tab)}
+          >
+            {STATUS_LABELS[tab]}
+          </button>
+        ))}
+      </div>
 
       <DataTable<Signal>
         columns={COLUMNS}
