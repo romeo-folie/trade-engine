@@ -199,7 +199,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
                       <th>DIR</th>
                       <th>ENTRY</th>
                       <th>EXIT</th>
-                      <th>P&L</th>
+                      <th>P&amp;L %</th>
                       <th>REASON</th>
                     </tr>
                   </thead>
