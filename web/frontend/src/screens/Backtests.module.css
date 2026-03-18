@@ -1,0 +1,138 @@
+/* Backtests screen */
+
+.screen {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--canvas-bg);
+  padding: var(--space-6);
+}
+
+.sectionLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-4);
+}
+
+.fetchErrorBanner {
+  width: 100%;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-1);
+}
+
+.loadingBanner {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: var(--space-3) var(--space-4);
+}
+
+/* Table */
+.tableWrap {
+  width: 100%;
+  overflow-x: auto;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+}
+
+.table th {
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-muted);
+  white-space: nowrap;
+}
+
+.table td {
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-primary);
+  border-bottom: 1px solid var(--border-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.table tbody tr:nth-child(even) {
+  background: var(--panel-bg);
+}
+
+.table tbody tr:nth-child(odd) {
+  background: var(--canvas-bg);
+}
+
+/* Clickable rows */
+.row {
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.row:hover {
+  background: var(--card-bg) !important;
+}
+
+.row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.rowSelected {
+  background: var(--card-bg) !important;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Cell helpers */
+.mono {
+  font-weight: 700;
+}
+
+.dimText {
+  color: var(--text-dim);
+}
+
+.emerald {
+  color: var(--emerald);
+  font-weight: 700;
+}
+
+.red {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* Empty state */
+.emptyState {
+  text-align: center;
+  padding: var(--space-8) var(--space-4);
+}
+
+.emptyTitle {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-2);
+}
+
+.emptySub {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+}

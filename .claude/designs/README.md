@@ -37,3 +37,10 @@ mcporter call pencil.get_screenshot filePath="~/Desktop/trade-engine-ui/ui.pen" 
 - **Card borders**: 1px thin green (`#00FF66` at low opacity)
 - **Corner motif**: L-shaped bracket accents on cards (top-left + bottom-right)
 - **Background grid**: Very faint subtle scan-line / grid texture
+
+## 2026-03-18 additions (Desire)
+- `analysis-screen.png` — Analysis card grid (YfRfG)
+- `analysis-modal.png` — Analysis detail slide-in panel (TY3UZ)
+- `system-screen.png` — System screen: KPI strip + model perf table + live event log (P599c)
+- `backtests-list.png` — Backtests list view (3TCnv)
+- `backtests-detail.png` — Backtests detail panel (K0rnc)

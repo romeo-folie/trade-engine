@@ -104,16 +104,18 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
+// JSON tags use Provider/Model to preserve the shared /api/node/models contract consumed by
+// both DrillDownPanel (llm_analysis, consensus tabs) and the System screen model-performance table.
 type ModelPerformanceRow struct {
-	Provider             string
-	Model                string
-	TotalRecommendations int
-	AvgConfidence        float64
-	TradeCount           int
-	AvgPnLPct            *float64
-	WinningTrades        int
-	LosingTrades         int
-	WinRate              *float64
+	Provider             string   `json:"Provider"`
+	Model                string   `json:"Model"`
+	TotalRecommendations int      `json:"TotalRecommendations"`
+	AvgConfidence        float64  `json:"AvgConfidence"`
+	TradeCount           int      `json:"TradeCount"`
+	AvgPnLPct            *float64 `json:"AvgPnLPct"`
+	WinningTrades        int      `json:"WinningTrades"`
+	LosingTrades         int      `json:"LosingTrades"`
+	WinRate              *float64 `json:"WinRate"`
 }
 
 // GetModelPerformance returns per-model accuracy stats (Phase 12.6).
@@ -187,6 +189,26 @@ func GetAnalysisByID(ctx context.Context, id string) (*StoredAnalysis, error) {
 	return &results[0], nil
 }
 
+// GetRecentAnalyses retrieves the most recent limit analyses across all tickers.
+func GetRecentAnalyses(ctx context.Context, limit int) ([]StoredAnalysis, error) {
+	q := `
+		SELECT id, ticker, strategy, action, confidence, size_pct,
+		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
+		       COALESCE(raw_response, ''), COALESCE(raw_prompt, ''), prompt_hash,
+		       model_provider, model_name,
+		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
+		       COALESCE(indicators, '{}'), created_at
+		FROM analyses
+		ORDER BY created_at DESC
+		LIMIT $1`
+	rows, err := GetDB().Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAnalyses(rows)
+}
+
 func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	var out []StoredAnalysis
 	for rows.Next() {
@@ -215,4 +237,62 @@ func nullableFloat(f float64) any {
 		return nil
 	}
 	return f
+}
+
+// AnalysisSummary is a lightweight projection of StoredAnalysis for list views.
+// It omits raw_response, raw_prompt, prompt_hash, and indicators to keep
+// the /api/analyses/recent payload small.
+// AnalysisSummary uses PascalCase JSON keys to match the TypeScript AnalysisRecord interface
+// defined in web/frontend/src/screens/Analysis.tsx.
+type AnalysisSummary struct {
+	ID            string    `json:"ID"`
+	Ticker        string    `json:"Ticker"`
+	Strategy      string    `json:"Strategy"`
+	Action        string    `json:"Action"`
+	Confidence    float64   `json:"Confidence"`
+	SizePct       float64   `json:"SizePct"`
+	StopLoss      float64   `json:"StopLoss"`
+	TakeProfit    float64   `json:"TakeProfit"`
+	Reasoning     string    `json:"Reasoning"`
+	ModelProvider string    `json:"ModelProvider"`
+	ModelName     string    `json:"ModelName"`
+	InputTokens   int       `json:"InputTokens"`
+	OutputTokens  int       `json:"OutputTokens"`
+	LatencyMs     int       `json:"LatencyMs"`
+	CreatedAt     time.Time `json:"CreatedAt"`
+}
+
+// GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.
+// It does not fetch raw_response, raw_prompt, prompt_hash, or indicators.
+func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary, error) {
+	q := `
+		SELECT id, ticker, strategy, action, confidence, size_pct,
+		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
+		       model_provider, model_name,
+		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
+		       created_at
+		FROM analyses
+		ORDER BY created_at DESC
+		LIMIT $1`
+	rows, err := GetDB().Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AnalysisSummary
+	for rows.Next() {
+		var a AnalysisSummary
+		if err := rows.Scan(
+			&a.ID, &a.Ticker, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
+			&a.StopLoss, &a.TakeProfit, &a.Reasoning,
+			&a.ModelProvider, &a.ModelName,
+			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
+			&a.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
 }
