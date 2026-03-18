@@ -1,44 +1,74 @@
 /**
- * Backtests screen — table of backtest runs with empty state.
+ * Backtests screen — table of backtest runs with slide-in detail panel.
  *
- * Fetches from GET /api/backtests/recent?limit=50 on mount.
- * Currently returns empty array (backtests not yet implemented in engine).
+ * Fetches from GET /api/backtests/runs?limit=50 on mount.
+ * Row click opens detail panel with equity curve + trade list.
  *
  * Task 8 of the web redesign (closes #206).
  */
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { fmtDate } from '../utils/format';
+import BacktestDetailPanel from '../components/backtests/BacktestDetailPanel';
 import styles from './Backtests.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
 export interface BacktestRun {
   ID: string;
+  Label: string;
+  Ticker: string;
   Strategy: string;
-  Period: string;
-  Trades: number;
-  WinRate: number;
-  NetPnL: number;
-  Status: string;
+  ModelProvider: string;
+  ModelName: string;
+  FromDate: string;
+  ToDate: string;
+  TotalReturnPct: number | null;
+  WinRatePct: number | null;
+  MaxDrawdownPct: number | null;
+  SharpeRatio: number | null;
+  TotalTrades: number;
+  CreatedAt: string;
+}
+
+export interface BacktestTrade {
+  ID: string;
+  Ticker: string;
+  Direction: string;
+  EntryTS: string;
+  ExitTS: string | null;
+  EntryPrice: number;
+  ExitPrice: number | null;
+  PnL: number | null;
+  PnLPct: number | null;
+  ExitReason: string;
+}
+
+/* ── Helpers ───────────────────────────────────────────────────────────────── */
+
+function fmtPct(v: number | null): string {
+  if (v == null) return '—';
+  return `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
+}
+
+function fmtSharpe(v: number | null): string {
+  if (v == null) return '—';
+  return v.toFixed(2);
 }
 
 /* ── Table columns ─────────────────────────────────────────────────────────── */
 
 const COLUMNS = [
-  'RUN ID',
-  'STRATEGY',
-  'PERIOD',
-  'TRADES',
-  'WIN RATE',
-  'NET P&L',
-  'STATUS',
+  'LABEL', 'TICKER', 'STRATEGY', 'MODEL',
+  'RETURN%', 'WIN RATE', 'MAX DD', 'SHARPE', 'TRADES', 'DATE',
 ];
 
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function BacktestsScreen() {
-  const [backtests, setBacktests] = useState<BacktestRun[]>([]);
+  const [runs, setRuns] = useState<BacktestRun[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<BacktestRun | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
@@ -48,14 +78,14 @@ export default function BacktestsScreen() {
       fetchControllerRef.current = controller;
 
       try {
-        const res = await fetch('/api/backtests/recent?limit=50', { signal: controller.signal });
+        const res = await fetch('/api/backtests/runs?limit=50', { signal: controller.signal });
         if (!res.ok) {
           setFetchError(`${res.status} ${res.statusText}`);
           return;
         }
         const data = await res.json();
-        if (data && Array.isArray(data.backtests)) {
-          setBacktests(data.backtests);
+        if (data && Array.isArray(data.runs)) {
+          setRuns(data.runs);
           setFetchError(null);
         } else {
           setFetchError('Unexpected response shape');
@@ -74,17 +104,19 @@ export default function BacktestsScreen() {
     return () => { fetchControllerRef.current?.abort(); };
   }, []);
 
+  const handleClose = useCallback(() => setSelected(null), []);
+
   return (
     <div className={styles.screen}>
       <div className={styles.sectionLabel}>BACKTESTS</div>
 
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
-          {backtests.length > 0 ? '⚠ Data may be stale' : '⚠ Failed to load backtests'}
+          {runs.length > 0 ? '⚠ Data may be stale' : '⚠ Failed to load backtests'}
         </div>
       )}
 
-      {isLoading && backtests.length === 0 && (
+      {isLoading && runs.length === 0 && (
         <div className={styles.loadingBanner} role="status" aria-label="Loading backtests">
           Loading…
         </div>
@@ -102,22 +134,33 @@ export default function BacktestsScreen() {
                 </tr>
               </thead>
               <tbody>
-                {backtests.map(bt => (
-                  <tr key={bt.ID}>
-                    <td>{bt.ID}</td>
-                    <td>{bt.Strategy}</td>
-                    <td>{bt.Period}</td>
-                    <td>{bt.Trades}</td>
-                    <td>{(bt.WinRate * 100).toFixed(1)}%</td>
-                    <td>{bt.NetPnL >= 0 ? '+' : ''}{bt.NetPnL.toFixed(2)}%</td>
-                    <td>{bt.Status}</td>
+                {runs.map(run => (
+                  <tr
+                    key={run.ID}
+                    className={`${styles.row} ${selected?.ID === run.ID ? styles.rowSelected : ''}`}
+                    onClick={() => setSelected(run)}
+                    tabIndex={0}
+                    onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelected(run); } }}
+                  >
+                    <td className={styles.mono}>{run.Label}</td>
+                    <td className={styles.mono}>{run.Ticker}</td>
+                    <td>{run.Strategy}</td>
+                    <td className={styles.dimText}>{run.ModelProvider}/{run.ModelName}</td>
+                    <td className={run.TotalReturnPct != null && run.TotalReturnPct >= 0 ? styles.emerald : styles.red}>
+                      {fmtPct(run.TotalReturnPct)}
+                    </td>
+                    <td>{fmtPct(run.WinRatePct)}</td>
+                    <td className={styles.red}>{fmtPct(run.MaxDrawdownPct)}</td>
+                    <td>{fmtSharpe(run.SharpeRatio)}</td>
+                    <td>{run.TotalTrades}</td>
+                    <td className={styles.dimText}>{fmtDate(run.CreatedAt)}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
 
-          {backtests.length === 0 && (
+          {runs.length === 0 && (
             <div className={styles.emptyState}>
               <div className={styles.emptyTitle}>NO BACKTEST RUNS YET</div>
               <div className={styles.emptySub}>
@@ -126,6 +169,10 @@ export default function BacktestsScreen() {
             </div>
           )}
         </>
+      )}
+
+      {selected && (
+        <BacktestDetailPanel run={selected} onClose={handleClose} />
       )}
     </div>
   );

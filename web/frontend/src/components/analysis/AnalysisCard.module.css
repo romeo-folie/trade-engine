@@ -52,7 +52,7 @@
 }
 
 .ticker {
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
   font-size: 15px;
   font-weight: 700;
   color: var(--text-primary);
@@ -117,6 +117,22 @@
 .confBuy { color: var(--emerald); }
 .confSell { color: var(--red); }
 .confHold { color: var(--text-dim); }
+
+/* Confidence bar */
+.confBarTrack {
+  flex: 1;
+  height: 4px;
+  background: var(--border-muted);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.confBarFill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width var(--transition-fast);
+}
 
 /* Reasoning excerpt */
 .reasoning {

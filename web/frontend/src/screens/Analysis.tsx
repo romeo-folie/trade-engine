@@ -46,6 +46,7 @@ export default function AnalysisScreen() {
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
+  const [modelSearch, setModelSearch] = useState('');
   const [actionFilter, setActionFilter] = useState('');
   const [selected, setSelected] = useState<AnalysisRecord | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
@@ -96,11 +97,17 @@ export default function AnalysisScreen() {
       const q = tickerSearch.toLowerCase();
       rows = rows.filter(a => a.Ticker.toLowerCase().includes(q));
     }
+    if (modelSearch) {
+      const mq = modelSearch.toLowerCase();
+      rows = rows.filter(a =>
+        a.ModelName.toLowerCase().includes(mq) || a.ModelProvider.toLowerCase().includes(mq)
+      );
+    }
     if (actionFilter) {
       rows = rows.filter(a => a.Action.toUpperCase() === actionFilter);
     }
     return rows;
-  }, [analyses, tickerSearch, actionFilter]);
+  }, [analyses, tickerSearch, modelSearch, actionFilter]);
 
   const handleClose = useCallback(() => setSelected(null), []);
 
@@ -120,11 +127,24 @@ export default function AnalysisScreen() {
         </div>
       )}
 
-      <FilterBar
-        searchValue={tickerSearch}
-        onSearchChange={setTickerSearch}
-        searchPlaceholder="Ticker…"
-      />
+      <div className={styles.filterRow}>
+        <FilterBar
+          searchValue={tickerSearch}
+          onSearchChange={setTickerSearch}
+          searchPlaceholder="Ticker…"
+        />
+        <div className={styles.modelSearchWrap}>
+          <label className={styles.modelSearchLabel} htmlFor="model-filter">MODEL</label>
+          <input
+            id="model-filter"
+            type="text"
+            className={styles.modelSearchInput}
+            value={modelSearch}
+            onChange={e => setModelSearch(e.target.value)}
+            placeholder="Model…"
+          />
+        </div>
+      </div>
 
       <div className={styles.filterPills} role="group" aria-label="Action filter">
         {ACTION_TABS.map(tab => (

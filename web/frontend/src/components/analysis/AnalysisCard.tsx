@@ -44,6 +44,12 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
           {analysis.Action.toUpperCase()}
         </span>
         <span className={`${styles.confidence} ${conf}`}>{confPct}%</span>
+        <div className={styles.confBarTrack}>
+          <div
+            className={styles.confBarFill}
+            style={{ width: `${Math.min(Number(confPct), 100)}%` }}
+          />
+        </div>
       </div>
 
       <div className={styles.reasoning}>{analysis.Reasoning}</div>

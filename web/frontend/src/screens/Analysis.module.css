@@ -36,6 +36,54 @@
   padding: var(--space-3) var(--space-4);
 }
 
+/* Filter row: ticker search + model search */
+.filterRow {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-end;
+  margin-bottom: var(--space-3);
+}
+
+.filterRow > :first-child {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.modelSearchWrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.modelSearchLabel {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.modelSearchInput {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  padding: var(--space-1) var(--space-3);
+  min-width: 160px;
+  transition: border-color var(--transition-fast);
+}
+
+.modelSearchInput::placeholder {
+  color: var(--text-faint);
+}
+
+.modelSearchInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* Filter pill tabs */
 .filterPills {
   display: flex;

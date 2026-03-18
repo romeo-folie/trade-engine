@@ -36,7 +36,7 @@
   padding: var(--space-3) var(--space-4);
 }
 
-/* Table header */
+/* Table */
 .tableWrap {
   width: 100%;
   overflow-x: auto;
@@ -66,6 +66,7 @@
   color: var(--text-primary);
   border-bottom: 1px solid var(--border-muted);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .table tbody tr:nth-child(even) {
@@ -74,6 +75,45 @@
 
 .table tbody tr:nth-child(odd) {
   background: var(--canvas-bg);
+}
+
+/* Clickable rows */
+.row {
+  cursor: pointer;
+  transition: background var(--transition-fast);
+}
+
+.row:hover {
+  background: var(--card-bg) !important;
+}
+
+.row:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.rowSelected {
+  background: var(--card-bg) !important;
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+/* Cell helpers */
+.mono {
+  font-weight: 700;
+}
+
+.dimText {
+  color: var(--text-dim);
+}
+
+.emerald {
+  color: var(--emerald);
+  font-weight: 700;
+}
+
+.red {
+  color: var(--red);
+  font-weight: 700;
 }
 
 /* Empty state */
