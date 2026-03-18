@@ -9,12 +9,19 @@ interface KpiCardProps {
   prominent?: boolean;
 }
 
+/**
+ * KPI card — matches portfolio-overview.png design.
+ * Uses corner bracket accents (⌐ top-left / ¬ bottom-right) per the design system,
+ * consistent with PipelineNodeCard analyst nodes. NOT chamfer clip-path.
+ */
 export default function KpiCard({ label, value, valueColor, prominent }: KpiCardProps) {
-  const cls = [styles.card, 'chamfer'];
+  const cls = [styles.card];
   if (prominent) cls.push(styles.prominent);
 
   return (
     <div className={cls.join(' ')}>
+      <span className={styles.bracketTL} aria-hidden="true">⌐</span>
+      <span className={styles.bracketBR} aria-hidden="true">¬</span>
       <span className={styles.label}>{label}</span>
       <span className={styles.value} style={valueColor ? { color: valueColor } : undefined}>
         {value}
