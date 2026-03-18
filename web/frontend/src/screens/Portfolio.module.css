@@ -15,7 +15,7 @@
   color: var(--text-faint);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  margin-bottom: var(--space-2);
+  margin-bottom: var(--space-1);
 }
 
 /* Header KPI row */
@@ -39,6 +39,7 @@
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   color: var(--text-faint);
+  text-align: center;
 }
 
 /* Performance metrics — two-column layout */
@@ -89,23 +90,6 @@
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   margin-left: var(--space-2);
-}
-
-/* Fetch-error banner */
-.fetchErrorBanner {
-  width: 100%;
-  color: var(--text-faint);
-  font-size: var(--font-size-xs);
-  margin-bottom: var(--space-1);
-}
-
-/* Equity curve loading placeholder */
-.curvePlaceholder {
-  color: var(--text-faint);
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  padding: var(--space-6) 0;
-  text-align: center;
 }
 
 .positive { color: var(--emerald); }
