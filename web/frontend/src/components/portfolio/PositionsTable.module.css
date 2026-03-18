@@ -92,6 +92,17 @@
 .positive { color: var(--emerald); }
 .negative { color: var(--red); }
 
+/* Sort indicator glyphs — inactive (⇅) and active (↑/↓) */
+.sortIndicator {
+  margin-left: 4px;
+  color: var(--text-faint);
+}
+
+.sortIndicatorActive {
+  margin-left: 4px;
+  color: var(--accent);
+}
+
 /* Sort header button — unstyled, inherits th typography */
 .sortBtn {
   background: none;

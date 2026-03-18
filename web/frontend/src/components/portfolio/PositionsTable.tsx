@@ -1,6 +1,5 @@
 import { useState, useMemo } from 'react';
 import type React from 'react';
-import { TOKENS } from '../../styles/tokens';
 import styles from './PositionsTable.module.css';
 
 export interface Position {
@@ -35,8 +34,8 @@ function fmtPct(n: number): string {
 }
 
 function SortIndicator({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; sortDir: SortDir }) {
-  if (col !== sortKey) return <span aria-hidden="true" style={{ color: 'var(--text-faint)', marginLeft: 4 }}>⇅</span>;
-  return <span aria-hidden="true" style={{ color: TOKENS.acidGreen, marginLeft: 4 }}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
+  if (col !== sortKey) return <span aria-hidden="true" className={styles.sortIndicator}>⇅</span>;
+  return <span aria-hidden="true" className={styles.sortIndicatorActive}>{sortDir === 'asc' ? '↑' : '↓'}</span>;
 }
 
 // Human-readable labels for sort keys — used in aria-labels for screen readers
