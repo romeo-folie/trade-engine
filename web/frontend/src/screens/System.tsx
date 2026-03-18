@@ -31,9 +31,9 @@ interface ModelPerfRow {
   Provider: string;
   TradeCount: number;
   WinRate: number | null;
-  AvgPnl: number | null;
-  AvgLatencyMs: number | null;
-  AvgTokens: number | null;
+  AvgPnLPct: number | null;
+  TotalRecommendations: number;
+  AvgConfidence: number;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -50,21 +50,6 @@ function fmtPct(v: number | null): string {
   return v.toFixed(1) + '%';
 }
 
-function fmtPnl(v: number | null): string {
-  if (v == null) return '—';
-  const prefix = v >= 0 ? '+' : '';
-  return `${prefix}${v.toFixed(2)}%`;
-}
-
-function fmtMs(v: number | null): string {
-  if (v == null) return '—';
-  return `${Math.round(v).toLocaleString()}ms`;
-}
-
-function fmtTokens(v: number | null): string {
-  if (v == null) return '—';
-  return Math.round(v).toLocaleString();
-}
 
 function fmtTime(iso: string): string {
   if (!iso) return '—';
@@ -169,7 +154,14 @@ export default function SystemScreen() {
       }
       if (signalsRes.status === 'fulfilled' && signalsRes.value.ok) {
         const data = await signalsRes.value.json();
-        if (data?.signals) setSignalCount(data.signals.length);
+        // Best-effort count from last 200 signals; may undercount if >200 signals today.
+        if (data?.signals && Array.isArray(data.signals)) {
+          const todayPrefix = new Date().toISOString().slice(0, 10);
+          const todayCount = data.signals.filter((s: { CreatedAt: string }) =>
+            s.CreatedAt.startsWith(todayPrefix)
+          ).length;
+          setSignalCount(todayCount);
+        }
       }
       if (riskRes.status === 'fulfilled' && riskRes.value.ok) {
         setRiskData(await riskRes.value.json());
@@ -229,7 +221,11 @@ export default function SystemScreen() {
           <div className={styles.uptimeLabel}>UPTIME {fmtUptime(uptime)}</div>
         </div>
         <div className={styles.titleRight}>
-          <button type="button" className={styles.paperModeBtn}>PAPER MODE</button>
+          <button type="button" className={
+            mode === 'AUTO' ? `${styles.modeBtn} ${styles.modeBtnAuto}`
+              : mode === 'MANUAL' ? `${styles.modeBtn} ${styles.modeBtnManual}`
+              : `${styles.modeBtn} ${styles.modeBtnPaper}`
+          }>{mode} MODE</button>
           <span className={styles.wsStatus}>
             <span className={wsStatus === 'connected' ? styles.greenDot : styles.redDot} />
             {wsStatus === 'connected' ? 'WS CONNECTED' : 'WS ' + wsStatus.toUpperCase()}
@@ -254,7 +250,7 @@ export default function SystemScreen() {
         <div className={styles.kpiCard}>
           <span className={styles.bracketTL} aria-hidden="true">⌐</span>
           <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>RECENT SIGNALS</span>
+          <span className={styles.kpiLabel}>SIGNALS TODAY</span>
           <span className={styles.kpiValue}>{signalCount ?? '—'}</span>
         </div>
         <div className={styles.kpiCard}>
@@ -293,9 +289,9 @@ export default function SystemScreen() {
                   <th className={styles.th}>MODEL</th>
                   <th className={styles.th}>TRADES</th>
                   <th className={styles.th}>WIN RATE</th>
-                  <th className={styles.th}>AVG P&amp;L</th>
-                  <th className={styles.th}>AVG LATENCY</th>
-                  <th className={styles.th}>TOKENS/CALL</th>
+                  <th className={styles.th}>AVG P&amp;L %</th>
+                  <th className={styles.th}>RECOMMENDATIONS</th>
+                  <th className={styles.th}>AVG CONFIDENCE</th>
                 </tr>
               </thead>
               <tbody>
@@ -311,11 +307,11 @@ export default function SystemScreen() {
                       <td className={styles.td}>{row.Model}</td>
                       <td className={styles.td}>{row.TradeCount}</td>
                       <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
-                      <td className={`${styles.td} ${(row.AvgPnl ?? 0) >= 0 ? styles.green : styles.red}`}>
-                        {fmtPnl(row.AvgPnl)}
+                      <td className={`${styles.td} ${(row.AvgPnLPct ?? 0) >= 0 ? styles.green : styles.red}`}>
+                        {fmtPct(row.AvgPnLPct)}
                       </td>
-                      <td className={styles.td}>{fmtMs(row.AvgLatencyMs)}</td>
-                      <td className={styles.td}>{fmtTokens(row.AvgTokens)}</td>
+                      <td className={styles.td}>{row.TotalRecommendations}</td>
+                      <td className={styles.td}>{fmtPct(row.AvgConfidence != null ? row.AvgConfidence * 100 : null)}</td>
                     </tr>
                   ))
                 )}

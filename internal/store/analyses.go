@@ -112,7 +112,7 @@ type ModelPerformanceRow struct {
 	TotalRecommendations int      `json:"TotalRecommendations"`
 	AvgConfidence        float64  `json:"AvgConfidence"`
 	TradeCount           int      `json:"TradeCount"`
-	AvgPnLPct            *float64 `json:"AvgPnl"`
+	AvgPnLPct            *float64 `json:"AvgPnLPct"`
 	WinningTrades        int      `json:"WinningTrades"`
 	LosingTrades         int      `json:"LosingTrades"`
 	WinRate              *float64 `json:"WinRate"`

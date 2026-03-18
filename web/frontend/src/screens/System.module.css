@@ -91,22 +91,43 @@
   gap: var(--space-4);
 }
 
-.paperModeBtn {
+.modeBtn {
   font-family: var(--font-mono);
   font-size: var(--font-size-md);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 6px 20px;
-  border: 1px solid var(--amber);
-  color: var(--amber);
   background: transparent;
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast);
 }
 
-.paperModeBtn:hover {
+.modeBtnPaper {
+  border: 1px solid var(--amber);
+  color: var(--amber);
+}
+
+.modeBtnPaper:hover {
   background: var(--amber-dim);
+}
+
+.modeBtnAuto {
+  border: 1px solid var(--red);
+  color: var(--red);
+}
+
+.modeBtnAuto:hover {
+  background: rgba(220, 38, 38, 0.1);
+}
+
+.modeBtnManual {
+  border: 1px solid var(--text-dim);
+  color: var(--text-dim);
+}
+
+.modeBtnManual:hover {
+  background: rgba(255, 255, 255, 0.05);
 }
 
 .wsStatus {
