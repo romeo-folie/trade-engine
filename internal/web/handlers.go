@@ -139,10 +139,13 @@ func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	analyses, err := store.GetRecentAnalyses(ctx, limit)
+	analyses, err := store.GetRecentAnalysesSummary(ctx, limit)
 	if err != nil {
 		apiError(w, "analyses query failed", err)
 		return
+	}
+	if analyses == nil {
+		analyses = []store.AnalysisSummary{}
 	}
 	jsonResponse(w, map[string]any{"analyses": analyses})
 }
@@ -157,6 +160,9 @@ func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		apiError(w, "backtest runs query failed", err)
 		return
+	}
+	if runs == nil {
+		runs = []store.BacktestRun{}
 	}
 	jsonResponse(w, map[string]any{"runs": runs})
 }

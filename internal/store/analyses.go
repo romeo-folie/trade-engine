@@ -236,3 +236,59 @@ func nullableFloat(f float64) any {
 	}
 	return f
 }
+
+// AnalysisSummary is a lightweight projection of StoredAnalysis for list views.
+// It omits raw_response, raw_prompt, prompt_hash, and indicators to keep
+// the /api/analyses/recent payload small.
+type AnalysisSummary struct {
+	ID            string    `json:"id"`
+	Ticker        string    `json:"ticker"`
+	Strategy      string    `json:"strategy"`
+	Action        string    `json:"action"`
+	Confidence    float64   `json:"confidence"`
+	SizePct       float64   `json:"size_pct"`
+	StopLoss      float64   `json:"stop_loss"`
+	TakeProfit    float64   `json:"take_profit"`
+	Reasoning     string    `json:"reasoning"`
+	ModelProvider string    `json:"model_provider"`
+	ModelName     string    `json:"model_name"`
+	InputTokens   int       `json:"input_tokens"`
+	OutputTokens  int       `json:"output_tokens"`
+	LatencyMs     int       `json:"latency_ms"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
+// GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.
+// It does not fetch raw_response, raw_prompt, prompt_hash, or indicators.
+func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary, error) {
+	q := `
+		SELECT id, ticker, strategy, action, confidence, size_pct,
+		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
+		       model_provider, model_name,
+		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
+		       created_at
+		FROM analyses
+		ORDER BY created_at DESC
+		LIMIT $1`
+	rows, err := GetDB().Query(ctx, q, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []AnalysisSummary
+	for rows.Next() {
+		var a AnalysisSummary
+		if err := rows.Scan(
+			&a.ID, &a.Ticker, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
+			&a.StopLoss, &a.TakeProfit, &a.Reasoning,
+			&a.ModelProvider, &a.ModelName,
+			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
+			&a.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
