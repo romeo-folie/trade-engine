@@ -1,0 +1,432 @@
+/* ── Config / Settings screen ─────────────────────────────────────── */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-6);
+  padding: var(--space-6);
+  overflow-y: auto;
+  flex: 1;
+}
+
+/* ── Section ─────────────────────────────────────────────────────── */
+
+.section {
+  margin-bottom: var(--space-6);
+}
+
+.sectionHeader {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  letter-spacing: 0.08em;
+  margin-bottom: var(--space-4);
+  padding-bottom: var(--space-2);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+/* ── Toggle group (3-way / segmented) ────────────────────────────── */
+
+.toggleGroup {
+  display: flex;
+  gap: 2px;
+  margin-bottom: var(--space-4);
+}
+
+.toggleBtn {
+  flex: 1;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: var(--card-bg);
+  color: var(--text-dim);
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: all var(--transition-fast);
+  text-align: center;
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+}
+
+.toggleBtn:hover {
+  color: var(--text-muted);
+}
+
+.toggleBtnActiveGreen {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--card-bg);
+}
+
+.toggleBtnActiveAmber {
+  background: var(--amber);
+  color: #000;
+  border-color: var(--amber);
+}
+
+.toggleBtnActiveRed {
+  border-color: var(--red);
+  color: var(--red);
+  background: var(--card-bg);
+}
+
+.warningDot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+  margin-right: 4px;
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* ── Field rows ──────────────────────────────────────────────────── */
+
+.fieldRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.fieldLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+.fieldLabelDanger {
+  color: var(--red);
+}
+
+.fieldInput {
+  width: 100px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  text-align: right;
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+}
+
+.fieldInput:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.fieldInputDanger {
+  color: var(--red);
+  border-color: var(--red);
+}
+
+/* ── ON/OFF toggle switch ────────────────────────────────────────── */
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.toggleSwitch {
+  width: 36px;
+  height: 18px;
+  background: var(--text-faint);
+  border-radius: 9px;
+  position: relative;
+  cursor: pointer;
+  transition: background var(--transition-fast);
+  border: none;
+  padding: 0;
+}
+
+.toggleSwitch::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  background: #000;
+  border-radius: 50%;
+  transition: transform var(--transition-fast);
+}
+
+.toggleSwitchOn {
+  background: var(--accent);
+}
+
+.toggleSwitchOn::after {
+  transform: translateX(18px);
+}
+
+.toggleLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+/* ── Warning badge ───────────────────────────────────────────────── */
+
+.warningBadge {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-transform: uppercase;
+  color: var(--amber);
+  background: var(--amber-dim);
+  padding: 2px 6px;
+  margin-left: var(--space-2);
+  clip-path: polygon(
+    0 0,
+    calc(100% - 4px) 0,
+    100% 4px,
+    100% 100%,
+    0 100%
+  );
+}
+
+/* ── Strategy rows ───────────────────────────────────────────────── */
+
+.strategyRow {
+  border-bottom: 1px solid var(--border-muted);
+  padding: var(--space-2) 0;
+}
+
+.strategyHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+}
+
+.strategyName {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  color: var(--text-primary);
+  flex: 1;
+}
+
+.strategyChevron {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  margin-left: var(--space-2);
+  transition: transform var(--transition-fast);
+  user-select: none;
+}
+
+.strategyChevronOpen {
+  transform: rotate(90deg);
+}
+
+.strategyParams {
+  padding: var(--space-3) 0 var(--space-1) var(--space-4);
+}
+
+/* ── Model role rows ─────────────────────────────────────────────── */
+
+.modelRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.modelRole {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  color: var(--text-muted);
+  flex: 1;
+}
+
+.modelName {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-base);
+  color: var(--text-primary);
+  margin-right: var(--space-3);
+}
+
+.swapBtn {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  cursor: pointer;
+  clip-path: polygon(
+    0 0,
+    calc(100% - 4px) 0,
+    100% 4px,
+    100% 100%,
+    0 100%
+  );
+}
+
+.swapBtn:hover {
+  border-color: var(--text-muted);
+  color: var(--text-muted);
+}
+
+/* ── Checkbox rows ───────────────────────────────────────────────── */
+
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
+}
+
+.checkbox {
+  width: 16px;
+  height: 16px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--accent);
+  clip-path: polygon(
+    0 0,
+    calc(100% - 3px) 0,
+    100% 3px,
+    100% 100%,
+    0 100%
+  );
+  flex-shrink: 0;
+}
+
+.checkboxOn {
+  border-color: var(--accent);
+}
+
+.checkboxLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-muted);
+}
+
+/* ── System action buttons ───────────────────────────────────────── */
+
+.actionBtn {
+  width: 100%;
+  padding: var(--space-2) var(--space-4);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: transparent;
+  cursor: pointer;
+  margin-bottom: var(--space-3);
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+}
+
+.actionBtnAmber {
+  color: var(--amber);
+  border: 1px solid var(--amber);
+}
+
+.actionBtnRed {
+  color: var(--red);
+  border: 1px solid var(--red);
+}
+
+.versionString {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  text-align: right;
+  margin-top: var(--space-2);
+}
+
+/* ── Footer ──────────────────────────────────────────────────────── */
+
+.footer {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-6);
+  background: var(--panel-bg);
+  border-top: 1px solid var(--border);
+  z-index: 10;
+}
+
+.saveBtn {
+  flex: 1;
+  padding: var(--space-3) var(--space-6);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--accent);
+  color: #000;
+  border: none;
+  cursor: pointer;
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+}
+
+.discardBtn {
+  padding: var(--space-3) var(--space-6);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+}
