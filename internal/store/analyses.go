@@ -240,22 +240,24 @@ func nullableFloat(f float64) any {
 // AnalysisSummary is a lightweight projection of StoredAnalysis for list views.
 // It omits raw_response, raw_prompt, prompt_hash, and indicators to keep
 // the /api/analyses/recent payload small.
+// AnalysisSummary uses PascalCase JSON keys to match the TypeScript AnalysisRecord interface
+// defined in web/frontend/src/screens/Analysis.tsx.
 type AnalysisSummary struct {
-	ID            string    `json:"id"`
-	Ticker        string    `json:"ticker"`
-	Strategy      string    `json:"strategy"`
-	Action        string    `json:"action"`
-	Confidence    float64   `json:"confidence"`
-	SizePct       float64   `json:"size_pct"`
-	StopLoss      float64   `json:"stop_loss"`
-	TakeProfit    float64   `json:"take_profit"`
-	Reasoning     string    `json:"reasoning"`
-	ModelProvider string    `json:"model_provider"`
-	ModelName     string    `json:"model_name"`
-	InputTokens   int       `json:"input_tokens"`
-	OutputTokens  int       `json:"output_tokens"`
-	LatencyMs     int       `json:"latency_ms"`
-	CreatedAt     time.Time `json:"created_at"`
+	ID            string    `json:"ID"`
+	Ticker        string    `json:"Ticker"`
+	Strategy      string    `json:"Strategy"`
+	Action        string    `json:"Action"`
+	Confidence    float64   `json:"Confidence"`
+	SizePct       float64   `json:"SizePct"`
+	StopLoss      float64   `json:"StopLoss"`
+	TakeProfit    float64   `json:"TakeProfit"`
+	Reasoning     string    `json:"Reasoning"`
+	ModelProvider string    `json:"ModelProvider"`
+	ModelName     string    `json:"ModelName"`
+	InputTokens   int       `json:"InputTokens"`
+	OutputTokens  int       `json:"OutputTokens"`
+	LatencyMs     int       `json:"LatencyMs"`
+	CreatedAt     time.Time `json:"CreatedAt"`
 }
 
 // GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.

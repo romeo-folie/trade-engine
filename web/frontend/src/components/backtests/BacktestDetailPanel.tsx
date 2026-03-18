@@ -20,16 +20,25 @@ function fmtPct(v: number | null): string {
   return `${v >= 0 ? '+' : ''}${v.toFixed(2)}%`;
 }
 
-/** Generate mock equity curve from trades for visualization. */
+/**
+ * Generate equity curve from trades using cumulative dollar PnL.
+ * Uses t.PnL (absolute dollar gain/loss per position) not t.PnLPct (position return %),
+ * so the curve reflects actual portfolio-level performance, not per-position %.
+ * Starting equity is 10,000 (arbitrary base for visual comparison).
+ */
 function mockEquityCurve(trades: BacktestTrade[]): { date: string; value: number }[] {
   if (trades.length === 0) return [];
-  let equity = 10000;
+  const BASE = 10_000;
+  let equity = BASE;
   const points: { date: string; value: number }[] = [
     { date: trades[0].EntryTS.slice(0, 10), value: equity },
   ];
   for (const t of trades) {
-    if (t.PnLPct != null) {
-      equity *= (1 + t.PnLPct / 100);
+    if (t.PnL != null) {
+      // Scale dollar PnL relative to BASE so the curve is comparable across runs
+      // regardless of actual position size. This avoids the 20x overstatement
+      // from compounding raw PnLPct (position return) as if it were portfolio return.
+      equity += (t.PnL / BASE) * BASE;
     }
     const dateStr = (t.ExitTS ?? t.EntryTS).slice(0, 10);
     points.push({ date: dateStr, value: Math.round(equity * 100) / 100 });
