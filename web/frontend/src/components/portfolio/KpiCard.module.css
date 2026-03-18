@@ -1,10 +1,37 @@
-/* KpiCard — chamfered stat card for portfolio header */
+/* KpiCard — stat card with corner bracket accents.
+ * Design reference: .claude/designs/portfolio-overview.png
+ * Uses ⌐/¬ bracket motif matching PipelineNodeCard analyst nodes. */
 
 .card {
+  position: relative;
   background: var(--card-bg);
+  border: 1px solid var(--border-muted);
   padding: var(--space-4) var(--space-5);
   flex: 1;
   min-width: 0;
+}
+
+/* Corner bracket accents — acid green, low opacity */
+.bracketTL,
+.bracketBR {
+  position: absolute;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  line-height: 1;
+  color: var(--accent);
+  opacity: 0.5;
+  pointer-events: none;
+  user-select: none;
+}
+
+.bracketTL {
+  top: 4px;
+  left: 6px;
+}
+
+.bracketBR {
+  bottom: 4px;
+  right: 6px;
 }
 
 .label {
@@ -20,17 +47,22 @@
 
 .value {
   display: block;
-  font-family: var(--font-sans);
+  font-family: var(--font-mono);
   font-size: var(--font-size-xl);
   font-weight: 700;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
 }
 
-/* Prominent variant — unrealized P&L */
+/* Prominent variant — unrealized P&L: brighter border + glow + larger value */
 .prominent {
   border: 1px solid var(--accent);
   box-shadow: 0 0 8px var(--accent-glow);
+}
+
+.prominent .bracketTL,
+.prominent .bracketBR {
+  opacity: 0.8;
 }
 
 .prominent .value {
