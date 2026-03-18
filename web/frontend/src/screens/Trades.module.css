@@ -84,6 +84,12 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Numeric column right-alignment */
+.numericCell {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 /* P&L coloring */
 .positive { color: var(--emerald); }
 .negative { color: var(--red); }

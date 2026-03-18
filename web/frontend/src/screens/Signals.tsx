@@ -31,9 +31,15 @@ function fmtDate(iso: string): string {
 function statusBadgeClass(status: string): string {
   const s = status.toLowerCase();
   if (s === 'pending') return styles.badgePending;
-  if (s === 'executed' || s === 'approved') return styles.badgeExecuted;
+  if (s === 'approved') return styles.badgeApproved;
+  if (s === 'executed') return styles.badgeExecuted;
+  if (s === 'blocked') return styles.badgeBlocked;
+  if (s === 'expired') return styles.badgeExpired;
   return styles.badgeBlocked;
 }
+
+// TODO: Replace with real consensus weights once API issue #217 ships
+const CONSENSUS_WEIGHTS = { tech: 0.4, mom: 0.35, sent: 0.25 };
 
 /* ── Status pill tabs ─────────────────────────────────────────────────────── */
 
@@ -81,7 +87,30 @@ const COLUMNS: Column<Signal>[] = [
     key: 'Confidence',
     label: 'CONFIDENCE',
     sortable: true,
-    render: (s) => `${(s.Confidence * 100).toFixed(0)}%`,
+    render: (s) => (
+      <div className={styles.confidenceCell}>
+        <span>{(s.Confidence * 100).toFixed(0)}%</span>
+        <div className={styles.confidenceBar}>
+          <div className={styles.confidenceFill} style={{ width: `${Math.round(s.Confidence * 100)}%` }} />
+        </div>
+      </div>
+    ),
+  },
+  {
+    key: 'Confidence' as keyof Signal,
+    label: 'CONSENSUS',
+    render: () => (
+      <div className={styles.consensusWrap}>
+        <div className={styles.consensusBar}>
+          <div style={{ flex: CONSENSUS_WEIGHTS.tech, background: 'var(--blue)' }} />
+          <div style={{ flex: CONSENSUS_WEIGHTS.mom, background: 'var(--amber)' }} />
+          <div style={{ flex: CONSENSUS_WEIGHTS.sent, background: 'var(--violet)' }} />
+        </div>
+        <div className={styles.consensusLabels}>
+          <span>T</span><span>M</span><span>S</span>
+        </div>
+      </div>
+    ),
   },
   {
     key: 'SignalPrice',
@@ -154,6 +183,13 @@ export default function SignalsScreen() {
     return rows;
   }, [signals, tickerSearch, statusFilter]);
 
+  const stats = useMemo(() => ({
+    total: signals.length,
+    pending: signals.filter(s => s.Status.toLowerCase() === 'pending').length,
+    executed: signals.filter(s => s.Status.toLowerCase() === 'executed').length,
+    blocked: signals.filter(s => s.Status.toLowerCase() === 'blocked').length,
+  }), [signals]);
+
   const handleClosePanel = useCallback(() => setSelectedSignal(null), []);
 
   return (
@@ -165,6 +201,26 @@ export default function SignalsScreen() {
           {signals.length > 0 ? '⚠ Data may be stale' : '⚠ Failed to load signals'}
         </div>
       )}
+
+      {/* Stats row */}
+      <div className={styles.statsRow}>
+        <div className={styles.statCard}>
+          <span className={styles.statLabel}>TOTAL TODAY</span>
+          <span className={styles.statValue}>{stats.total}</span>
+        </div>
+        <div className={styles.statCard}>
+          <span className={styles.statLabel}>PENDING</span>
+          <span className={`${styles.statValue} ${styles.statAmber}`}>{stats.pending}</span>
+        </div>
+        <div className={styles.statCard}>
+          <span className={styles.statLabel}>EXECUTED</span>
+          <span className={`${styles.statValue} ${styles.statGreen}`}>{stats.executed}</span>
+        </div>
+        <div className={styles.statCard}>
+          <span className={styles.statLabel}>BLOCKED</span>
+          <span className={`${styles.statValue} ${styles.statRed}`}>{stats.blocked}</span>
+        </div>
+      </div>
 
       <FilterBar
         searchValue={tickerSearch}
