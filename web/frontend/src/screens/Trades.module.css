@@ -1,0 +1,121 @@
+/* Trades screen */
+
+.screen {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--canvas-bg);
+  padding: var(--space-6);
+}
+
+.fetchErrorBanner {
+  width: 100%;
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  margin-bottom: var(--space-1);
+}
+
+.sectionLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-4);
+}
+
+/* Summary KPI row */
+.summaryRow {
+  display: flex;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.summaryCard {
+  background: var(--card-bg);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 120px;
+}
+
+.summaryLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+
+.summaryValue {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* P&L coloring */
+.positive { color: var(--emerald); }
+.negative { color: var(--red); }
+
+/* Status badges */
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid;
+}
+
+.badgeOpen {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.badgeClosed {
+  color: var(--emerald);
+  border-color: var(--emerald);
+}
+
+.badgeCancelled {
+  color: var(--text-dim);
+  border-color: var(--border-muted);
+}
+
+.dirBuy {
+  color: var(--emerald);
+  font-weight: 700;
+}
+
+.dirSell {
+  color: var(--red);
+  font-weight: 700;
+}
+
+/* Clipboard toast */
+.toast {
+  position: fixed;
+  bottom: var(--space-6);
+  right: var(--space-6);
+  background: var(--card-bg);
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  padding: var(--space-2) var(--space-4);
+  z-index: var(--z-overlay);
+  animation: fadeIn var(--transition-fast) ease-out;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}

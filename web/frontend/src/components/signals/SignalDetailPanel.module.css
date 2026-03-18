@@ -1,0 +1,209 @@
+/* SignalDetailPanel — slide-in panel from right */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: var(--z-panel);
+}
+
+.panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 380px;
+  max-width: 90vw;
+  background: var(--panel-bg);
+  border-left: 1px solid var(--border);
+  z-index: var(--z-modal);
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+  animation: slideIn var(--transition-slow) ease-out;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.title {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-lg);
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.closeBtn {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  cursor: pointer;
+  padding: var(--space-1) var(--space-2);
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.closeBtn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.closeBtn:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.body {
+  padding: var(--space-5);
+  flex: 1;
+}
+
+/* Key-value grid */
+.kvGrid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--space-2) var(--space-4);
+  align-items: baseline;
+}
+
+.kvLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.kvValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Confidence bar */
+.confidenceSection {
+  margin-top: var(--space-5);
+}
+
+.confidenceLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-2);
+}
+
+.confidenceBar {
+  height: 6px;
+  background: var(--border-muted);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.confidenceFill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width var(--transition-base);
+}
+
+.confidenceValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--accent);
+  margin-top: var(--space-1);
+}
+
+/* Price range */
+.priceRange {
+  margin-top: var(--space-5);
+}
+
+.priceRangeLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  margin-bottom: var(--space-2);
+}
+
+.priceRangeBar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+}
+
+.priceRangeTrack {
+  flex: 1;
+  height: 4px;
+  background: var(--border-muted);
+  position: relative;
+  border-radius: 2px;
+}
+
+.priceRangeFill {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  border-radius: 2px;
+}
+
+.priceRangeSl {
+  color: var(--red);
+}
+
+.priceRangeTp {
+  color: var(--emerald);
+}
+
+/* Status badge in panel */
+.statusBadge {
+  display: inline-block;
+  padding: 2px 8px;
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  border: 1px solid;
+}
+
+.statusPending {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+
+.statusExecuted {
+  color: var(--emerald);
+  border-color: var(--emerald);
+}
+
+.statusBlocked {
+  color: var(--text-dim);
+  border-color: var(--border-muted);
+}
+
+.actionBuy {
+  color: var(--emerald);
+}
+
+.actionSell {
+  color: var(--red);
+}
