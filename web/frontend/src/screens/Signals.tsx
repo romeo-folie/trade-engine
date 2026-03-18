@@ -86,7 +86,7 @@ const COLUMNS: Column<Signal>[] = [
     ),
   },
   {
-    key: 'Consensus' as keyof Signal,
+    key: 'Consensus',
     label: 'CONSENSUS',
     render: () => (
       <div className={styles.consensusWrap}>
@@ -119,6 +119,7 @@ const COLUMNS: Column<Signal>[] = [
 
 export default function SignalsScreen() {
   const [signals, setSignals] = useState<Signal[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -149,6 +150,8 @@ export default function SignalsScreen() {
           console.warn('[SignalsScreen] fetch error:', err);
           setFetchError(err.message);
         }
+      } finally {
+        setIsLoading(false);
       }
     }
 
@@ -188,6 +191,12 @@ export default function SignalsScreen() {
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
           {signals.length > 0 ? '⚠ Data may be stale' : '⚠ Failed to load signals'}
+        </div>
+      )}
+
+      {isLoading && signals.length === 0 && (
+        <div className={styles.loadingBanner} role="status" aria-label="Loading signals">
+          Loading…
         </div>
       )}
 

@@ -160,11 +160,13 @@ const COLUMNS: Column<Trade>[] = [
 
 function tradesToCsv(trades: Trade[]): string {
   const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
-  const header = 'ticker,direction,entry,exit,pnl,pnl_pct,status,opened';
+  const header = 'ticker,direction,strategy,model,entry,exit,pnl,pnl_pct,status,opened';
   const rows = trades.map(t =>
     [
       escape(t.Ticker),
       escape(t.Direction),
+      escape(t.Strategy),
+      escape(t.ModelName || ''),
       t.EntryPrice.toFixed(2),
       t.ExitPrice ? t.ExitPrice.toFixed(2) : '',
       t.PnL.toFixed(2),
@@ -180,6 +182,7 @@ function tradesToCsv(trades: Trade[]): string {
 
 export default function TradesScreen() {
   const [trades, setTrades] = useState<Trade[]>([]);
+  const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
   const [dateFilter, setDateFilter] = useState('');
@@ -210,6 +213,8 @@ export default function TradesScreen() {
           console.warn('[TradesScreen] fetch error:', err);
           setFetchError(err.message);
         }
+      } finally {
+        setIsLoading(false);
       }
     }
 
@@ -268,6 +273,12 @@ export default function TradesScreen() {
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
           {trades.length > 0 ? '⚠ Data may be stale' : '⚠ Failed to load trades'}
+        </div>
+      )}
+
+      {isLoading && trades.length === 0 && (
+        <div className={styles.loadingBanner} role="status" aria-label="Loading trades">
+          Loading…
         </div>
       )}
 

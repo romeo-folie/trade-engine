@@ -1,3 +1,4 @@
+import { useId } from 'react';
 import type React from 'react';
 import styles from './FilterBar.module.css';
 
@@ -32,12 +33,15 @@ export default function FilterBar({
   filters,
   actions,
 }: FilterBarProps) {
+  const uid = useId();
+  const searchId = `${uid}-search`;
+
   return (
     <div className={styles.bar}>
       <div className={styles.searchWrap}>
-        <label className={styles.searchLabel} htmlFor="filter-search">SEARCH</label>
+        <label className={styles.searchLabel} htmlFor={searchId}>SEARCH</label>
         <input
-          id="filter-search"
+          id={searchId}
           type="text"
           className={styles.searchInput}
           value={searchValue}
@@ -46,11 +50,13 @@ export default function FilterBar({
         />
       </div>
 
-      {filters?.map(f => (
+      {filters?.map(f => {
+        const filterId = `${uid}-filter-${f.label}`;
+        return (
         <div key={f.label} className={styles.filterWrap}>
-          <label className={styles.filterLabel} htmlFor={`filter-${f.label}`}>{f.label}</label>
+          <label className={styles.filterLabel} htmlFor={filterId}>{f.label}</label>
           <select
-            id={`filter-${f.label}`}
+            id={filterId}
             className={styles.filterSelect}
             value={f.value}
             onChange={(e: React.ChangeEvent<HTMLSelectElement>) => f.onChange(e.target.value)}
@@ -60,7 +66,8 @@ export default function FilterBar({
             ))}
           </select>
         </div>
-      ))}
+        );
+      })}
 
       {actions && actions.length > 0 && (
         <div className={styles.actions}>

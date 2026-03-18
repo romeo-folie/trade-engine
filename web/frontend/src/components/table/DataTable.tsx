@@ -63,7 +63,9 @@ export default function DataTable<T>({
       if (typeof av === 'string' && typeof bv === 'string') {
         return sortDir === 'asc' ? av.localeCompare(bv) : bv.localeCompare(av);
       }
-      return sortDir === 'asc' ? (av as number) - (bv as number) : (bv as number) - (av as number);
+      const an = Number(av); const bn = Number(bv);
+      if (isNaN(an) || isNaN(bn)) return 0;
+      return sortDir === 'asc' ? an - bn : bn - an;
     });
   }, [data, sortKey, sortDir]);
 
