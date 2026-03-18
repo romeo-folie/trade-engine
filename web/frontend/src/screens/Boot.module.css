@@ -42,6 +42,7 @@
 /* Each line fades in with staggered animation-delay */
 .line {
   white-space: pre;
+  overflow-x: hidden;
   opacity: 0;
   animation: fadeIn 0.05s ease-out forwards;
 }
@@ -67,7 +68,7 @@
 
 /* Horizontal rule / separator */
 .separator {
-  color: #1A1A22;
+  color: #374151;
 }
 
 /* Tag colours */

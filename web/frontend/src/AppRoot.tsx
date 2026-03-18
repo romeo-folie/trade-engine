@@ -16,6 +16,9 @@ export default function AppRoot() {
   const socket = useEngineSocket();
 
   // Show boot screen until first successful connection.
+  // Boot screen shows on both initial connect and reconnect attempts.
+  // The animation replays on reconnect — intentional: signals a state reset to the user.
+  // TODO: consider a lighter reconnect overlay if full replay feels jarring in prod.
   const booting = socket.status === 'connecting' || socket.status === 'reconnecting';
 
   if (booting) {

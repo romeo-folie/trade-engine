@@ -42,7 +42,7 @@ const TAG_CLASS: Record<string, string> = {
 };
 
 function formatTag(tag: string): string {
-  if (tag === 'SYSTEM') return '[2026-03-18 SYSTEM]';
+  if (tag === 'SYSTEM') { const d = new Date().toISOString().slice(0, 10); return `[${d} SYSTEM]`; }
   return `[ ${tag.padEnd(4)} ]`;
 }
 
