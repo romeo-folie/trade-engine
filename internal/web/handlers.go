@@ -114,7 +114,7 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/signals/recent?limit=N
 func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 50)
+	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -128,7 +128,7 @@ func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/trades/recent?limit=N
 func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 50)
+	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -142,7 +142,7 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/analyses/recent?limit=N
 func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 50)
+	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -217,7 +217,7 @@ func toRunSummary(r store.BacktestRun) backteststRunSummary {
 // GET /api/backtests/runs?limit=N
 // Returns runs without ConfigSnapshot to avoid leaking API keys.
 func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
-	limit := queryInt(r, "limit", 20)
+	limit := queryInt(r, "limit", 20, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -270,7 +270,11 @@ func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	run, err := store.GetRun(ctx, id)
 	if err != nil {
-		apiError(w, "backtest run query failed", err)
+		if isNotFound(err) {
+			apiNotFound(w, "backtest run not found")
+		} else {
+			apiError(w, "backtest run query failed", err)
+		}
 		return
 	}
 	// Return summary + extracted InitialCash only.
@@ -337,14 +341,40 @@ func apiError(w http.ResponseWriter, msg string, err error) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
-func queryInt(r *http.Request, key string, def int) int {
+// apiNotFound writes a 404 JSON response. Used when a resource is missing
+// rather than when a query fails — not-found is not a 500.
+func apiNotFound(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusNotFound)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
+}
+
+// isNotFound returns true when err signals a missing row rather than a
+// database/network failure. Store functions return a sentinel message
+// ("... not found: <id>") for the no-row case.
+func isNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "not found")
+}
+
+// queryInt parses an integer query parameter, falling back to def when absent
+// or invalid. If max > 0 the returned value is capped at max.
+func queryInt(r *http.Request, key string, def, max int) int {
 	v := r.URL.Query().Get(key)
 	if v == "" {
+		if max > 0 && def > max {
+			return max
+		}
 		return def
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil || n <= 0 {
+		if max > 0 && def > max {
+			return max
+		}
 		return def
+	}
+	if max > 0 && n > max {
+		return max
 	}
 	return n
 }
