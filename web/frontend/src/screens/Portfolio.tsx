@@ -87,7 +87,7 @@ function fmt$(n: number): string {
 }
 
 function fmtPnl(n: number): string {
-  const sign = n >= 0 ? '+' : '-';
+  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
   return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
@@ -156,7 +156,7 @@ export default function PortfolioScreen() {
     <div className={styles.screen}>
       {/* ── KPI Cards ─────────────────────────────────────────────────────── */}
       {fetchError && (
-        <div className={styles.fetchErrorBanner}>
+        <div className={styles.fetchErrorBanner} role="alert">
           {hasData ? '⚠ Data may be stale' : '⚠ Failed to load portfolio data'}
         </div>
       )}

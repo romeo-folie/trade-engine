@@ -25,12 +25,12 @@ function fmtPrice(n: number): string {
 }
 
 function fmtPnl(n: number): string {
-  const sign = n >= 0 ? '+' : '-';
+  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
   return `${sign}$${fmtPrice(Math.abs(n))}`;
 }
 
 function fmtPct(n: number): string {
-  const sign = n >= 0 ? '+' : '';
+  const sign = n > 0 ? '+' : '';
   return `${sign}${n.toFixed(2)}%`;
 }
 
