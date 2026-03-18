@@ -32,7 +32,6 @@
 .bracketBR {
   bottom: 4px;
   right: 6px;
-  transform: rotate(180deg);
 }
 
 .label {
