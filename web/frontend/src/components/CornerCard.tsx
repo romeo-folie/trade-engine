@@ -1,11 +1,11 @@
 /**
  * CornerCard — shared wrapper that renders a card with CSS corner brackets.
  *
- * Design spec: 4 L-shaped corner marks (┌ ┐ └ ┘) at the outer boundary of the card.
+ * Design spec: TL + BR diagonal bracket pair (┌ … ┘) at the outer boundary of the card.
  * NO separate outer border — the brackets ARE the card edge definition.
  *
  * `active` variant: full perimeter green border (replaces brackets).
- * `bracketColor` prop: override the bracket colour (default: var(--accent) at 40% opacity).
+ * `bracketColor` prop: override the bracket colour (default: #39FF14).
  */
 import { type HTMLAttributes, type CSSProperties } from 'react';
 import styles from './CornerCard.module.css';
