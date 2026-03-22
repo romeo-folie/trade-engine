@@ -1,11 +1,10 @@
-/* Hub node — ENGINE centre */
+/* ── Hub node — ENGINE centre ──────────────────────────────────────────── */
 .hub {
   width: 160px;
   height: 80px;
   background: var(--panel-bg);
-  border: 1px solid var(--accent);
+  border: 2px solid var(--accent);
   box-shadow: 0 0 12px rgba(57, 255, 20, 0.35), inset 0 0 8px rgba(57, 255, 20, 0.05);
-  /* Chamfer top-right 6px */
   clip-path: polygon(
     0 0,
     calc(100% - var(--chamfer-sm)) 0,
@@ -20,7 +19,6 @@
   outline: none;
   transition: box-shadow 0.2s;
 }
-/* Hub is not interactive (tabIndex not set); focus-visible rule removed */
 
 .hubLabel {
   font-family: var(--font-mono);
@@ -32,12 +30,103 @@
   text-transform: uppercase;
 }
 
-/* Pipeline node card — no outer border; CornerCard provides bracket marks */
+/* ── Analyst node card — plain border, no brackets, no strip ─────────── */
+.analystCard {
+  width: 180px;
+  min-height: 110px;
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  clip-path: polygon(
+    0 0,
+    calc(100% - var(--chamfer-sm)) 0,
+    100% var(--chamfer-sm),
+    100% 100%,
+    0 100%
+  );
+  cursor: pointer;
+  outline: none;
+  position: relative;
+  transition: border-color 200ms, box-shadow 200ms;
+}
+
+.analystCard:hover {
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+.analystCard:focus-visible {
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.analystActive {
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(57, 255, 20, 0.3);
+}
+
+.analystInner {
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.analystHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.analystName {
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  line-height: 1.2;
+}
+
+.signalDesc {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-top: 2px;
+}
+
+.signalDirection {
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+  margin-top: 4px;
+}
+
+.dirLong    { color: var(--accent); }
+.dirShort   { color: var(--red); }
+.dirNeutral { color: var(--amber); }
+
+.analystConfidence {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  letter-spacing: 0.06em;
+}
+
+/* ── Category label — shared between analyst and structural ──────────── */
+.categoryLabel {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  color: var(--text-faint);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* ── Structural node card — CornerCard wrapper, with left strip ───────── */
 .card {
   width: 220px;
-  height: 120px;
+  min-height: 120px;
   background: var(--card-bg);
-  /* Chamfer top-right 6px */
   clip-path: polygon(
     0 0,
     calc(100% - var(--chamfer-sm)) 0,
@@ -50,13 +139,16 @@
   overflow: hidden;
   transition: box-shadow 0.2s;
 }
+
 .card:hover {
   box-shadow: 0 0 8px var(--accent-glow);
 }
+
 .card:focus-visible {
   box-shadow: 0 0 0 2px var(--accent);
 }
-.card.bypassed {
+
+.bypassed {
   opacity: 0.35;
 }
 
@@ -69,15 +161,13 @@
   height: 100%;
 }
 
-/* (brackets suppressed via hideBrackets prop on structural nodes) */
-
 /* Inner content (padded away from strip) */
 .inner {
-  padding: 10px 10px 10px 14px;
+  padding: 12px 12px 12px 14px;
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .header {
@@ -89,7 +179,7 @@
 .nodeLabel {
   font-family: var(--font-sans);
   font-size: var(--font-size-sm);
-  font-weight: 500;
+  font-weight: 600;
   color: var(--text-primary);
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -102,15 +192,18 @@
   border-radius: 50%;
   flex-shrink: 0;
 }
+
 .dotGreen {
   background: var(--accent);
   box-shadow: 0 0 6px rgba(57, 255, 20, 0.8);
   animation: pulse 1.5s ease-in-out infinite;
 }
+
 .dotAmber {
   background: var(--amber);
   box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
 }
+
 .dotGrey {
   background: var(--text-faint);
 }
@@ -126,10 +219,13 @@
   font-weight: 700;
   color: var(--text-primary);
   line-height: 1;
+  margin-top: 4px;
 }
+
 .metaValue {
   color: var(--text-primary);
 }
+
 .metaLabel {
   font-size: var(--font-size-xs);
   color: var(--text-dim);

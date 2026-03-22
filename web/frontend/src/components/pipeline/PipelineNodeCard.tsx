@@ -1,12 +1,16 @@
 /**
  * PipelineNodeCard — single node in the hub-and-spoke graph.
  *
- * Design spec (designer-tradeengine-frontend-spec-20260316.md §2):
- *   - Chamfered rectangle, top-right corner only (6px cut)
- *   - Left strip: structural nodes (SIGNAL SOURCE, ARBITER, SYNTHESIS) only
- *   - Analyst nodes: corner bracket colour, no left strip
+ * Design spec:
+ *   - Analyst nodes (TECHNICAL, MOMENTUM, SENTIMENT, MACRO):
+ *     uniform 1px border, no brackets, no left strip.
+ *     Active: accent border + glow. Shows category label, name,
+ *     signal description, direction (colour-coded), confidence.
+ *   - Structural nodes (SIGNAL SOURCE, ARBITER, CONSENSUS, EXECUTOR etc):
+ *     left colour strip, corner brackets via CornerCard.
+ *   - Hub (ENGINE): acid green border, larger card, centre label.
  *   - Status dot: green <5s, amber <30s, grey ≥30s
- *   - Hub (ENGINE): acid green border, larger card, centre label
+ *   - Chamfer top-right 6px on all cards.
  */
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
@@ -14,18 +18,37 @@ import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import CornerCard from '../CornerCard';
 import styles from './PipelineNodeCard.module.css';
 
-// ── Colour constants — sourced from tokens.ts (JS mirror of tokens.css) ────────
-// These are used in JS for dynamic inline styles (strip/bracket colours per node).
-// To change a colour: update tokens.css, then keep tokens.ts in sync.
-
 import { TOKENS } from '../../styles/tokens';
 const COLORS = TOKENS;
 
-// Node identity → strip/bracket colour.
-// Keyed on stable nodeId (from backend protocol.go), NOT on display label.
 type NodeKindLabel = 'hub' | 'source' | 'processing' | 'output';
 
-// Structural nodes: left colour strip
+// ── Node classification ─────────────────────────────────────────────────────
+
+// Analyst node IDs — these get the analyst card layout (no strip, no brackets)
+const ANALYST_IDS = new Set([
+  'technical', 'momentum', 'sentiment', 'macro',
+  // Fallback: any node whose label contains these
+]);
+
+// Category labels per node kind (shown as small category text above name)
+const CATEGORY_BY_ID: Record<string, string> = {
+  'technical':  'ANALYST',
+  'momentum':   'ANALYST',
+  'sentiment':  'ANALYST',
+  'macro':      'ANALYST',
+  'llm_analysis': 'ARBITER',
+  'consensus':    'SYNTHESIS',
+  'executor':     'EXECUTION',
+  'data_enrichment':  'PROCESSING',
+  'indicator_engine': 'PROCESSING',
+  'prompt_assembly':  'PROCESSING',
+  'risk_manager':     'PROCESSING',
+  'blocked_signals':  'OUTPUT',
+  'approvals':        'OUTPUT',
+};
+
+// Structural nodes: left colour strip + brackets
 const STRIP_BY_ID: Record<string, string> = {
   '__hub__':          COLORS.acidGreen,
   'data_enrichment':  COLORS.slate,
@@ -34,10 +57,6 @@ const STRIP_BY_ID: Record<string, string> = {
   'risk_manager':     COLORS.amber,
   'consensus':        COLORS.acidGreen,
   'executor':         COLORS.emerald,
-};
-
-// Analyst/bracket nodes: corner bracket colour (no strip)
-const BRACKET_BY_ID: Record<string, string> = {
   'llm_analysis':     COLORS.indigo,
   'blocked_signals':  COLORS.textDim,
   'approvals':        COLORS.amber,
@@ -46,13 +65,19 @@ const BRACKET_BY_ID: Record<string, string> = {
 // Nodes that display as "bypassed" when they have zero events
 const BYPASS_IDS = new Set(['news_api']);
 
-function getNodeColour(nodeId: string): { stripColor: string | null; bracketColor: string | null } {
-  if (STRIP_BY_ID[nodeId]) return { stripColor: STRIP_BY_ID[nodeId], bracketColor: null };
-  if (BRACKET_BY_ID[nodeId]) return { stripColor: null, bracketColor: BRACKET_BY_ID[nodeId] };
-  return { stripColor: null, bracketColor: COLORS.textDim };
+function isAnalystNode(nodeId: string, label: string): boolean {
+  if (ANALYST_IDS.has(nodeId)) return true;
+  const l = label.toLowerCase();
+  return l === 'technical' || l === 'momentum' || l === 'sentiment' || l === 'macro';
 }
 
-// ── Status dot ───────────────────────────────────────────────────────────────
+function isActive(lastEventAt: string | null | number): boolean {
+  if (!lastEventAt) return false;
+  const ms = typeof lastEventAt === 'string' ? new Date(lastEventAt).getTime() : lastEventAt;
+  return Date.now() - ms < 5_000;
+}
+
+// ── Status dot ──────────────────────────────────────────────────────────────
 
 function statusDotClass(lastEventAt: string | null | number): string {
   if (!lastEventAt) return styles.dotGrey;
@@ -63,7 +88,39 @@ function statusDotClass(lastEventAt: string | null | number): string {
   return styles.dotGrey;
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+// ── Signal direction helpers ────────────────────────────────────────────────
+
+function getSignalDirection(d: PipelineNodeData): string | null {
+  // Try metrics payload first, then lastEventType
+  const m = d.metrics as NodeMetrics | null;
+  if (m && typeof (m as unknown as Record<string, unknown>).direction === 'string') {
+    return ((m as unknown as Record<string, unknown>).direction as string).toUpperCase();
+  }
+  // Try lastEventType as a direction hint
+  if (d.lastEventType) {
+    const t = d.lastEventType.toUpperCase();
+    if (t.includes('LONG') || t.includes('BUY')) return 'LONG';
+    if (t.includes('SHORT') || t.includes('SELL')) return 'SHORT';
+    if (t.includes('NEUTRAL') || t.includes('HOLD')) return 'NEUTRAL';
+  }
+  return null;
+}
+
+function getSignalDescription(d: PipelineNodeData): string {
+  // Use lastEventType for a descriptive label
+  if (d.lastEventType) {
+    return d.lastEventType.replace(/_/g, ' ').toUpperCase();
+  }
+  return 'MONITORING';
+}
+
+function directionClass(dir: string): string {
+  if (dir === 'LONG') return styles.dirLong;
+  if (dir === 'SHORT') return styles.dirShort;
+  return styles.dirNeutral;
+}
+
+// ── Component ───────────────────────────────────────────────────────────────
 
 export interface PipelineNodeData {
   nodeId: string;
@@ -78,20 +135,17 @@ export interface PipelineNodeData {
   [key: string]: unknown;
 }
 
-// NodeProps<Node<PipelineNodeData>> gives TypeScript full visibility into `data`
-// without an unsafe cast, following @xyflow/react's typed custom node pattern.
 type PipelineNodeType = Node<PipelineNodeData>;
 
 function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   const d = data;
-  const { stripColor, bracketColor } = getNodeColour(d.nodeId);
   const isBypassed = BYPASS_IDS.has(d.nodeId) && d.eventCount === 0;
+  const nodeActive = isActive(d.lastEventAt);
 
+  // Hub
   if (d.isHub) {
     return (
-      <div
-        className={styles.hub}
-      >
+      <div className={styles.hub}>
         <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
         <Handle type="target" position={Position.Left}  style={{ opacity: 0 }} />
         <span className={styles.hubLabel}>ENGINE</span>
@@ -99,14 +153,61 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
     );
   }
 
-  // Analyst nodes: corner brackets at card edges. bracketColor drives bracket colour.
-  // Structural nodes: left strip (no brackets).
-  const showBrackets = bracketColor && !stripColor;
+  const analyst = isAnalystNode(d.nodeId, d.label);
+  const category = CATEGORY_BY_ID[d.nodeId] ?? (analyst ? 'ANALYST' : d.kind.toUpperCase());
+  const stripColor = STRIP_BY_ID[d.nodeId] ?? null;
 
+  // Analyst nodes: plain border card, no brackets, no strip
+  if (analyst) {
+    const direction = getSignalDirection(d);
+    const signalDesc = getSignalDescription(d);
+
+    return (
+      <div
+        className={`${styles.analystCard} ${nodeActive ? styles.analystActive : ''} ${isBypassed ? styles.bypassed : ''}`}
+        role="button"
+        tabIndex={0}
+        onClick={e => { e.stopPropagation(); d.onNodeClick(d.nodeId); }}
+        onKeyDown={e => {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); d.onNodeClick(d.nodeId); }
+        }}
+        aria-label={`${d.label} pipeline node`}
+        style={{ opacity: isBypassed ? 0.5 : 1 }}
+      >
+        <Handle type="target" position={Position.Left}  style={{ opacity: 0 }} />
+        <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
+
+        <div className={styles.analystInner}>
+          <div className={styles.analystHeader}>
+            <span className={styles.categoryLabel}>{category}</span>
+            <span className={`${styles.dot} ${statusDotClass(d.lastEventAt)}`} />
+          </div>
+
+          <span className={styles.analystName}>{d.label}</span>
+
+          <span className={styles.signalDesc}>{signalDesc}</span>
+
+          {direction && (
+            <span className={`${styles.signalDirection} ${directionClass(direction)}`}>
+              {direction}
+            </span>
+          )}
+
+          {d.eventCount > 0 && (
+            <span className={styles.analystConfidence}>
+              {d.eventCount.toLocaleString()} events
+            </span>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // Structural nodes: CornerCard with left strip and brackets
   return (
     <CornerCard
-      bracketColor={showBrackets ? (isBypassed ? `rgba(${hexToRgb(bracketColor)},0.2)` : bracketColor) : undefined}
-      hideBrackets={!showBrackets}
+      bracketColor={stripColor ?? 'var(--border)'}
+      hideBrackets={false}
       bracketSize={10}
       bracketWidth={1}
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
@@ -114,27 +215,25 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
       tabIndex={0}
       onClick={e => { e.stopPropagation(); d.onNodeClick(d.nodeId); }}
       onKeyDown={e => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          d.onNodeClick(d.nodeId);
-        }
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); d.onNodeClick(d.nodeId); }
       }}
       aria-label={`${d.label} pipeline node`}
       style={{ opacity: isBypassed ? 0.35 : 1 }}
     >
-      <Handle type="target" position={Position.Left}   style={{ opacity: 0 }} />
-      <Handle type="source" position={Position.Right}  style={{ opacity: 0 }} />
+      <Handle type="target" position={Position.Left}  style={{ opacity: 0 }} />
+      <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
 
-      {/* Left colour strip (structural nodes only) */}
       {stripColor && (
         <div className={styles.strip} style={{ background: stripColor }} />
       )}
 
       <div className={styles.inner}>
         <div className={styles.header}>
-          <span className={styles.nodeLabel}>{d.label}</span>
+          <span className={styles.categoryLabel}>{category}</span>
           <span className={`${styles.dot} ${statusDotClass(d.lastEventAt)}`} />
         </div>
+
+        <span className={styles.nodeLabel}>{d.label}</span>
 
         <div className={styles.meta}>
           <span className={styles.metaValue}>{d.eventCount.toLocaleString()}</span>
@@ -153,15 +252,6 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
       </div>
     </CornerCard>
   );
-}
-
-/** Convert #RRGGBB to "R,G,B" for use in rgba() */
-function hexToRgb(hex: string): string {
-  const h = hex.replace('#', '');
-  const r = parseInt(h.substring(0, 2), 16);
-  const g = parseInt(h.substring(2, 4), 16);
-  const b = parseInt(h.substring(4, 6), 16);
-  return `${r},${g},${b}`;
 }
 
 function formatRelative(iso: string): string {
