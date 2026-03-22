@@ -131,15 +131,21 @@ func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Batch-fetch all analyst results in one query (avoids N+1).
+	analystBatch, err := store.GetAnalystResultsBatchForSignals(ctx, sigs)
+	if err != nil {
+		logger.Warn("web: batch analyst results lookup failed", "err", err.Error())
+		// Non-fatal — enrich what we can (map will be nil/empty)
+	}
+
 	enriched := make([]signalWithAnalysts, len(sigs))
 	for i, sig := range sigs {
 		enriched[i].Signal = sig
-		raw, err := store.GetAnalystResultsForSignal(ctx, sig.AnalysisIDs)
-		if err != nil {
-			logger.Warn("web: analyst results lookup failed", "signal_id", sig.ID, "err", err.Error())
-			continue
+		if analystBatch != nil {
+			if raw, ok := analystBatch[i]; ok {
+				enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
+			}
 		}
-		enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
 	}
 	jsonResponse(w, map[string]any{"signals": enriched})
 }
@@ -163,15 +169,20 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Batch-fetch all analyst results in one query (avoids N+1).
+	tradeBatch, err := store.GetAnalystResultsBatchForTrades(ctx, trades)
+	if err != nil {
+		logger.Warn("web: batch analyst results lookup failed for trades", "err", err.Error())
+	}
+
 	enriched := make([]tradeWithAnalysts, len(trades))
 	for i, t := range trades {
 		enriched[i].Trade = t
-		raw, err := store.GetAnalystResultsForTrade(ctx, t.SignalID)
-		if err != nil {
-			logger.Warn("web: analyst results lookup failed", "trade_id", t.ID, "err", err.Error())
-			continue
+		if tradeBatch != nil {
+			if raw, ok := tradeBatch[i]; ok {
+				enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
+			}
 		}
-		enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
 	}
 	jsonResponse(w, map[string]any{"trades": enriched})
 }

@@ -160,15 +160,31 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 		counts[r.Response.Action]++
 		confSum[r.Response.Action] += r.Response.Confidence
 	}
-	// Iterate in explicit priority order so ties are deterministic: BUY > SELL > HOLD.
-	// Map iteration order is random; ranging over a fixed slice is not.
-	var winner Action = ActionHold
+	// Find the maximum vote count across all actions.
 	maxCount := 0
 	for _, action := range []Action{ActionBuy, ActionSell, ActionHold} {
 		if counts[action] > maxCount {
 			maxCount = counts[action]
-			winner = action
 		}
+	}
+	// Collect all actions that share the maximum vote count.
+	var leaders []Action
+	for _, action := range []Action{ActionBuy, ActionSell, ActionHold} {
+		if counts[action] == maxCount {
+			leaders = append(leaders, action)
+		}
+	}
+	// If BUY and SELL are both tied for the lead, the directional signal is
+	// ambiguous — return HOLD (neutral) rather than favouring BUY by iteration order.
+	var winner Action
+	if len(leaders) == 1 {
+		winner = leaders[0]
+	} else {
+		// Multiple actions tied: always prefer HOLD over a directional bias.
+		winner = ActionHold
+	}
+	if maxCount == 0 {
+		winner = ActionHold
 	}
 	avgConf := math.Round(confSum[winner]/float64(counts[winner])*1000) / 1000
 	var ref AnalysisResponse

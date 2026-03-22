@@ -154,6 +154,14 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
             </span>
           </div>
           <span className={styles.confidenceHeader}>CONFIDENCE {(signal.Confidence * 100).toFixed(0)}%</span>
+          <button
+            type="button"
+            className={styles.closeBtn}
+            onClick={onClose}
+            aria-label="Close signal detail panel"
+          >
+            ✕
+          </button>
         </div>
 
         {/* Sub-header: timestamp + strategy */}

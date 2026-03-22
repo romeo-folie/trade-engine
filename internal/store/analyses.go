@@ -231,48 +231,6 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	return out, nil
 }
 
-// GetAnalystResultsForSignal fetches the ensemble_results JSON for the first
-// analysis linked to a signal (via analysis_ids). Returns nil if no analysis found.
-func GetAnalystResultsForSignal(ctx context.Context, analysisIDs []string) ([]byte, error) {
-	if len(analysisIDs) == 0 {
-		return nil, nil
-	}
-	var ensembleResults []byte
-	err := GetDB().QueryRow(ctx, `
-		SELECT ensemble_results FROM analyses WHERE id = $1
-	`, analysisIDs[0]).Scan(&ensembleResults)
-	if err != nil {
-		if IsNoRows(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return ensembleResults, nil
-}
-
-// GetAnalystResultsForTrade fetches ensemble_results JSON for the signal
-// linked to a trade. Returns nil if no analysis found.
-func GetAnalystResultsForTrade(ctx context.Context, signalID string) ([]byte, error) {
-	if signalID == "" {
-		return nil, nil
-	}
-	var ensembleResults []byte
-	err := GetDB().QueryRow(ctx, `
-		SELECT a.ensemble_results
-		FROM analyses a
-		JOIN signals s ON a.id = ANY(s.analysis_ids)
-		WHERE s.id = $1
-		LIMIT 1
-	`, signalID).Scan(&ensembleResults)
-	if err != nil {
-		if IsNoRows(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	return ensembleResults, nil
-}
-
 // nullableFloat returns nil for zero values (stop_loss / take_profit on HOLD).
 func nullableFloat(f float64) any {
 	if f == 0 {
@@ -337,4 +295,121 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// GetAnalystResultsBatchForSignals fetches ensemble_results for a batch of signals
+// in a single query (one roundtrip). Returns a map from signal array-index to
+// ensemble_results JSON. Signals with no linked analysis are absent from the map.
+func GetAnalystResultsBatchForSignals(ctx context.Context, sigs []Signal) (map[int][]byte, error) {
+	// Collect the first analysis ID per signal; remember original index.
+	type entry struct {
+		sigIdx     int
+		analysisID string
+	}
+	var entries []entry
+	for i, sig := range sigs {
+		if len(sig.AnalysisIDs) > 0 && sig.AnalysisIDs[0] != "" {
+			entries = append(entries, entry{i, sig.AnalysisIDs[0]})
+		}
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]string, len(entries))
+	for i, e := range entries {
+		ids[i] = e.analysisID
+	}
+
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, ensemble_results
+		FROM analyses
+		WHERE id = ANY($1)
+	`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	// Build analysis-id → JSON map
+	byAnalysisID := make(map[string][]byte, len(entries))
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			return nil, err
+		}
+		byAnalysisID[id] = raw
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Map back to signal index
+	out := make(map[int][]byte, len(entries))
+	for _, e := range entries {
+		if raw, ok := byAnalysisID[e.analysisID]; ok {
+			out[e.sigIdx] = raw
+		}
+	}
+	return out, nil
+}
+
+// GetAnalystResultsBatchForTrades fetches ensemble_results for a batch of trades
+// in a single query (one roundtrip). Returns a map from trade array-index to
+// ensemble_results JSON. Trades with no linked signal/analysis are absent from the map.
+func GetAnalystResultsBatchForTrades(ctx context.Context, trades []Trade) (map[int][]byte, error) {
+	type entry struct {
+		tradeIdx int
+		signalID string
+	}
+	var entries []entry
+	for i, t := range trades {
+		if t.SignalID != "" {
+			entries = append(entries, entry{i, t.SignalID})
+		}
+	}
+	if len(entries) == 0 {
+		return nil, nil
+	}
+
+	signalIDs := make([]string, len(entries))
+	for i, e := range entries {
+		signalIDs[i] = e.signalID
+	}
+
+	rows, err := GetDB().Query(ctx, `
+		SELECT s.id AS signal_id, a.ensemble_results
+		FROM signals s
+		JOIN analyses a ON a.id = ANY(s.analysis_ids)
+		WHERE s.id = ANY($1)
+	`, signalIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	bySignalID := make(map[string][]byte, len(entries))
+	for rows.Next() {
+		var signalID string
+		var raw []byte
+		if err := rows.Scan(&signalID, &raw); err != nil {
+			return nil, err
+		}
+		// Keep first result per signal (same as the old single-row query)
+		if _, seen := bySignalID[signalID]; !seen {
+			bySignalID[signalID] = raw
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make(map[int][]byte, len(entries))
+	for _, e := range entries {
+		if raw, ok := bySignalID[e.signalID]; ok {
+			out[e.tradeIdx] = raw
+		}
+	}
+	return out, nil
 }
