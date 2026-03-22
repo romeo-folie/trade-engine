@@ -393,28 +393,28 @@ export default function TradesScreen() {
         </div>
       )}
 
-      {/* Summary row */}
+      {/* Summary row — CornerCard, fills full width */}
       <div className={styles.summaryRow}>
-        <div className={styles.summaryCard}>
+        <CornerCard className={styles.summaryCard}>
           <span className={styles.summaryLabel}>TOTAL{periodLabel}</span>
           <span className={styles.summaryValue}>{summary.total}</span>
-        </div>
-        <div className={styles.summaryCard}>
+        </CornerCard>
+        <CornerCard className={styles.summaryCard}>
           <span className={styles.summaryLabel}>OPEN{periodLabel}</span>
           <span className={styles.summaryValue}>{summary.openCount}</span>
-        </div>
-        <div className={styles.summaryCard}>
+        </CornerCard>
+        <CornerCard className={styles.summaryCard}>
           <span className={styles.summaryLabel}>WIN RATE{periodLabel}</span>
           <span className={`${styles.summaryValue} ${summary.winRate >= 50 ? styles.positive : styles.negative}`}>
             {summary.winRate.toFixed(1)}%
           </span>
-        </div>
-        <div className={styles.summaryCard}>
+        </CornerCard>
+        <CornerCard className={styles.summaryCard}>
           <span className={styles.summaryLabel}>AVG P&amp;L{periodLabel}</span>
           <span className={`${styles.summaryValue} ${pnlClass(summary.avgPnl)}`}>
             {fmtPnl(summary.avgPnl)}
           </span>
-        </div>
+        </CornerCard>
       </div>
 
       <FilterBar
