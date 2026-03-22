@@ -24,11 +24,12 @@ export default function StrategyRow({
       <div className={styles.row}>
         <span className={styles.name}>{name}</span>
         <button
-          type="button" className={`${styles.chevron} ${expanded ? styles.open : ''}`}
+          type="button"
+          className={styles.chevron}
           onClick={() => setExpanded(!expanded)}
           aria-label={expanded ? 'Collapse' : 'Expand'}
         >
-          ›
+          {expanded ? '▼' : '▶'}
         </button>
         <Toggle checked={enabled} onChange={onToggle} aria-label={`${name} strategy`} />
       </div>
