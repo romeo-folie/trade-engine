@@ -384,10 +384,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastPoll = time.Time(msg)
 		ctx := context.Background()
 		dc := loadDisplayConfig()
-		m.dashData = views.FetchDashboardData(ctx, m.mode, dc.includePredictions, dc.initialCapital)
+		m.dashData = views.FetchDashboardData(ctx, m.mode, dc.initialCapital)
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
 		m.tradeData.Selected = m.selectedTrade
-		m.signalData = views.FetchSignalFeed(ctx, 50, dc.includePredictions)
+		m.signalData = views.FetchSignalFeed(ctx, 50)
 		m.signalData.Selected = m.selectedSignal
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.watchlistData.Selected = m.selectedWatchlist
@@ -565,20 +565,18 @@ func (m Model) renderStatusBar() string {
 
 // displayConfig holds per-tick config values needed by the TUI poll loop.
 type displayConfig struct {
-	includePredictions bool
-	initialCapital     float64
+	initialCapital float64
 }
 
 // loadDisplayConfig loads the config once and returns all TUI display settings.
-// On error, safe defaults are returned: predictions visible, initial capital 0.
+// On error, safe defaults are returned: initial capital 0.
 func loadDisplayConfig() displayConfig {
 	cfg, err := config.Load()
 	if err != nil {
-		return displayConfig{includePredictions: true, initialCapital: 0}
+		return displayConfig{initialCapital: 0}
 	}
 	return displayConfig{
-		includePredictions: cfg.Markets.Predictions.Enabled,
-		initialCapital:     cfg.Engine.InitialCapital,
+		initialCapital: cfg.Engine.InitialCapital,
 	}
 }
 

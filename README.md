@@ -1,6 +1,8 @@
 # TradeEngine
 
-LLM-powered algorithmic trading system. Monitors stock and prediction markets, runs AI analysis via Claude (and optionally other models), manages a paper or live portfolio, and delivers signals via a terminal dashboard and Telegram.
+LLM-powered algorithmic trading system. Monitors stock markets, runs AI analysis via Claude (and optionally other models), manages a paper or live portfolio, and delivers signals via a terminal dashboard and Telegram.
+
+> **Note:** Prediction market functionality (Polymarket, Kalshi) has been moved to [`polymarket-geopolitical-agent`](https://github.com/romeo-folie/polymarket-geopolitical-agent).
 
 **Status:** Phases 1–13 complete — full trading system live, paper trading in progress ahead of live deployment.
 
@@ -20,7 +22,6 @@ graph TD
     Risk --> Executor[Order Executor<br/>internal/execution/]
     Executor -->|paper / live| AlpacaBroker[Alpaca Broker API]
     Engine --> Backtest[Backtesting Engine<br/>internal/backtest/]
-    Engine --> Predictions[Prediction Markets<br/>Polymarket · Kalshi<br/>engine/ + store/ + execution/]
     Engine --> Knowledge[Knowledge Graph<br/>internal/knowledge/]
     Engine --> Embeddings[Vector Embeddings<br/>internal/embeddings/]
     Engine --> TUI[Terminal Dashboard<br/>internal/tui/]
@@ -35,7 +36,7 @@ cmd/te/              — CLI entry point (Cobra commands)
 internal/
   config/            — YAML + env var + DB-override config system
   data/              — Market data providers (Alpaca) + news (Finnhub)
-  engine/            — Core engine loop, scheduler, prediction runner
+  engine/            — Core engine loop, scheduler
   indicators/        — 20 technical indicators (EMA, RSI, MACD, Bollinger, ADX, ATR, OBV, Stochastic, VWAP, …)
   store/             — PostgreSQL + pgvector access layer (pgx/v5)
   logger/            — Structured slog dual-output (stdout + file)
@@ -209,7 +210,7 @@ te logs search <query>              Search log file
 | 6 | Telegram notifications + signal approval flow | ✅ Complete |
 | 7 | Backtesting engine + prompt cache + metrics | ✅ Complete |
 | 8 | HTML reports (go-echarts, offline self-contained) | ✅ Complete |
-| 9 | Prediction markets (Polymarket + Kalshi) | ✅ Complete |
+| 9 | ~~Prediction markets~~ (moved to `polymarket-geopolitical-agent`) | ➡️ Moved |
 | 10 | Knowledge graph (entity relationships + news enrichment) | ✅ Complete |
 | 11 | Vector embeddings (pgvector, similar-setup injection) | ✅ Complete |
 | 12 | Multi-model ensemble deliberation (Claude · GPT-4o · Gemini · Ollama) | ✅ Complete |

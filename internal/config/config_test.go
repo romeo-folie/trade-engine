@@ -134,20 +134,6 @@ func TestValidateExtractionProviderMustExistInConfiguredModels(t *testing.T) {
 	}
 }
 
-func TestValidatePredictionsGlobalToggleConsistency(t *testing.T) {
-	cfg := Defaults()
-	cfg.Markets.Predictions.Enabled = false
-	cfg.Markets.Predictions.Platforms = map[string]PredictionPlatform{
-		"polymarket": {
-			Enabled: true,
-		},
-	}
-	errs := Validate(cfg)
-	if !containsStr(errs, "markets.predictions.platforms.polymarket.enabled=true while markets.predictions.enabled=false") {
-		t.Fatalf("expected global/platform predictions toggle inconsistency error, got: %v", errs)
-	}
-}
-
 func TestSetField_NestedPathAndBool(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

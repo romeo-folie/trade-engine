@@ -125,7 +125,7 @@ func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	sigs, err := store.GetRecentSignals(ctx, limit, true)
+	sigs, err := store.GetRecentSignals(ctx, limit)
 	if err != nil {
 		apiError(w, "signals query failed", err)
 		return

@@ -122,13 +122,6 @@ Modes:
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Start prediction market runner (24/7, runs in parallel with stock engine).
-		predRunner := engine.NewPredictionRunner(cfg, eng.Bus(), mode, eng.Portfolio())
-		if predRunner.Enabled() {
-			go predRunner.Run(ctx)
-			logger.Info("prediction market runner started")
-		}
-
 		// Start background embedding worker if enabled.
 		if cfg.Embeddings.Enabled {
 			if worker, err := embeddings.NewWorker(cfg.Embeddings); err != nil {

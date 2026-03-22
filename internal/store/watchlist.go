@@ -9,7 +9,7 @@ import (
 type WatchlistItem struct {
 	ID            string
 	Ticker        string
-	Platform      string // "stock" | "polymarket" | "kalshi"
+	Platform      string // "stock"
 	Strategies    []string
 	Timeframes    []string
 	MinConfidence float64
