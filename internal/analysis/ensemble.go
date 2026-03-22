@@ -186,7 +186,10 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 	if maxCount == 0 {
 		winner = ActionHold
 	}
-	avgConf := math.Round(confSum[winner]/float64(counts[winner])*1000) / 1000
+	var avgConf float64
+	if counts[winner] > 0 {
+		avgConf = math.Round(confSum[winner]/float64(counts[winner])*1000) / 1000
+	}
 	var ref AnalysisResponse
 	for _, r := range successes {
 		if r.Response.Action == winner {
