@@ -472,8 +472,15 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		if s.executor != nil {
 			for ticker, orderID := range s.orderIDs {
 				// Best-effort cancel; already-filled orders return an error which is fine.
-				if err := CancelOrder(ctx, s.executor, orderID); err != nil {
-					fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, err)
+				cancelErr := CancelOrder(ctx, s.executor, orderID)
+				if cancelErr != nil {
+					fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, cancelErr)
+				}
+				// Update trade status to "cancelled" regardless of broker response.
+				// If the order was already filled, the status will only update rows
+				// still in "pending" state (WHERE status='pending' guard in SQL).
+				if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
+					fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
 				}
 			}
 		}

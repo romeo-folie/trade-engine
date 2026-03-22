@@ -51,12 +51,17 @@ func CreateORBSession(ctx context.Context, db *pgxpool.Pool, date time.Time) (*O
 	return &s, nil
 }
 
-// UpdateORBSession updates an ORB session's status, candidates, and selected tickers.
+// UpdateORBSession updates an ORB session's status and optionally its candidates
+// and selected tickers. When candidates or selected are nil, the existing DB values
+// are preserved via COALESCE — preventing audit data from being erased on completion.
 func UpdateORBSession(ctx context.Context, db *pgxpool.Pool, id, status string, candidates json.RawMessage, selected []string) error {
 	_, err := db.Exec(ctx, `
 		UPDATE orb_sessions
-		SET status=$1, candidates=$2, selected=$3, updated_at=NOW()
-		WHERE id=$4`,
+		SET status     = $1,
+		    candidates = COALESCE($2::jsonb, candidates),
+		    selected   = COALESCE($3, selected),
+		    updated_at = NOW()
+		WHERE id = $4`,
 		status, candidates, selected, id)
 	return err
 }
@@ -83,6 +88,17 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) error
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
 		trade.Qty, nullableString(trade.OrderID), trade.Status,
 	)
+	return err
+}
+
+// CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
+// Used by tickDone to update the DB after best-effort cancel calls.
+func CancelORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='cancelled', closed_at=NOW()
+		WHERE order_id=$1 AND status='pending'`,
+		orderID)
 	return err
 }
 
