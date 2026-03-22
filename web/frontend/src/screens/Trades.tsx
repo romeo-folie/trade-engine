@@ -395,21 +395,21 @@ export default function TradesScreen() {
 
       {/* Summary row — CornerCard, fills full width */}
       <div className={styles.summaryRow}>
-        <CornerCard className={styles.summaryCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
           <span className={styles.summaryLabel}>TOTAL{periodLabel}</span>
           <span className={styles.summaryValue}>{summary.total}</span>
         </CornerCard>
-        <CornerCard className={styles.summaryCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
           <span className={styles.summaryLabel}>OPEN{periodLabel}</span>
           <span className={styles.summaryValue}>{summary.openCount}</span>
         </CornerCard>
-        <CornerCard className={styles.summaryCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
           <span className={styles.summaryLabel}>WIN RATE{periodLabel}</span>
           <span className={`${styles.summaryValue} ${summary.winRate >= 50 ? styles.positive : styles.negative}`}>
             {summary.winRate.toFixed(1)}%
           </span>
         </CornerCard>
-        <CornerCard className={styles.summaryCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
           <span className={styles.summaryLabel}>AVG P&amp;L{periodLabel}</span>
           <span className={`${styles.summaryValue} ${pnlClass(summary.avgPnl)}`}>
             {fmtPnl(summary.avgPnl)}

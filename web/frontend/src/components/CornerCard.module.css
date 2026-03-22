@@ -13,7 +13,7 @@
 .card {
   position: relative;
   /* default bracket token values (overridable via inline style) */
-  --bracket-color:  #39FF14;
+  --bracket-color:  var(--border);
   --bracket-size:   10px;
   --bracket-width:  1px;
 }

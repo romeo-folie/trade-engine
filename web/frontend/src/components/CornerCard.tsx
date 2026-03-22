@@ -5,7 +5,7 @@
  * NO separate outer border — the brackets ARE the card edge definition.
  *
  * `active` variant: full perimeter green border (replaces brackets).
- * `bracketColor` prop: override the bracket colour (default: #39FF14).
+ * `bracketColor` prop: override the bracket colour (default: var(--border)).
  */
 import { type HTMLAttributes, type CSSProperties } from 'react';
 import styles from './CornerCard.module.css';
@@ -42,7 +42,7 @@ export default function CornerCard({
 
   // CSS custom props drive bracket size/colour so all 4 spans share one rule
   const cssVars: CSSProperties = {
-    '--bracket-color': bracketColor ?? '#39FF14',
+    '--bracket-color': bracketColor ?? 'var(--border)',
     '--bracket-size': `${bracketSize}px`,
     '--bracket-width': `${bracketWidth}px`,
     ...style,

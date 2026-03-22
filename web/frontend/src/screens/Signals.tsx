@@ -206,19 +206,19 @@ export default function SignalsScreen() {
 
       {/* Stats row — cards fill full width, corner brackets only (no outer border) */}
       <div className={styles.statsRow}>
-        <CornerCard className={styles.statCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.statCard}>
           <span className={styles.statLabel}>TOTAL</span>
           <span className={styles.statValue}>{stats.total}</span>
         </CornerCard>
-        <CornerCard className={styles.statCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.statCard}>
           <span className={styles.statLabel}>PENDING</span>
           <span className={`${styles.statValue} ${styles.statAmber}`}>{stats.pending}</span>
         </CornerCard>
-        <CornerCard className={styles.statCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.statCard}>
           <span className={styles.statLabel}>EXECUTED</span>
           <span className={`${styles.statValue} ${styles.statGreen}`}>{stats.executed}</span>
         </CornerCard>
-        <CornerCard className={styles.statCard}>
+        <CornerCard bracketColor="var(--border)" className={styles.statCard}>
           <span className={styles.statLabel}>BLOCKED</span>
           <span className={`${styles.statValue} ${styles.statRed}`}>{stats.blocked}</span>
         </CornerCard>
