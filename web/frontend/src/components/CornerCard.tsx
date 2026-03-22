@@ -50,7 +50,7 @@ export default function CornerCard({
 
   return (
     <div className={cls} style={cssVars} {...rest}>
-      {/* Four corner brackets: TL, TR, BL, BR — omitted when hideBrackets or active */}
+      {/* Diagonal corner bracket pair: TL + BR — omitted when hideBrackets or active */}
       {!hideBrackets && !active && (
         <>
           <span className={`${styles.b} ${styles.bTL}`} aria-hidden="true" />
