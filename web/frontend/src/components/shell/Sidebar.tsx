@@ -1,3 +1,4 @@
+import { useRef } from 'react';
 import { NavLink } from 'react-router-dom';
 import {
   Activity,
@@ -32,13 +33,25 @@ const NAV_ITEMS: NavItem[] = [
 const ICON_SIZE = 16;
 
 export default function Sidebar() {
+  const navRef = useRef<HTMLElement>(null);
+
+  function handleNavClick() {
+    // Blur the nav so :focus-within no longer matches → sidebar collapses
+    navRef.current?.blur();
+    // Also blur any focused child (the NavLink itself)
+    if (document.activeElement instanceof HTMLElement) {
+      document.activeElement.blur();
+    }
+  }
+
   return (
-    <nav className={styles.sidebar}>
+    <nav className={styles.sidebar} ref={navRef} tabIndex={-1}>
       {NAV_ITEMS.map(({ label, icon: Icon, path }) => (
         <NavLink
           key={path}
           to={path}
           aria-label={label}
+          onClick={handleNavClick}
           className={({ isActive }) =>
             `${styles.navItem}${isActive ? ` ${styles.active}` : ''}`
           }
