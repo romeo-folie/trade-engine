@@ -45,6 +45,8 @@
   overflow-x: hidden;
   opacity: 0;
   animation: fadeIn 0.05s ease-out forwards;
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.4);
 }
 
 @keyframes fadeIn {
@@ -60,7 +62,7 @@
 
 /* Title line */
 .title {
-  color: #39FF14;
+  color: var(--accent);
   text-shadow: 0 0 8px rgba(57, 255, 20, 0.5);
   font-size: 14px;
   font-weight: 600;
@@ -68,24 +70,53 @@
 
 /* Horizontal rule / separator */
 .separator {
-  color: #374151;
+  color: var(--border-muted);
+  text-shadow: none;
+}
+
+/* "All systems nominal" summary line */
+.nominal {
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.4);
+  margin-top: var(--space-4);
 }
 
 /* Tag colours */
-.tagOk     { color: #22C55E; }
-.tagWait   { color: #F59E0B; }
-.tagErr    { color: #EF4444; }
-.tagInfo   { color: #39FF14; }
-.tagSystem { color: #39FF14; }
+.tagOk     { color: var(--emerald); text-shadow: none; }
+.tagWait   { color: var(--amber);   text-shadow: none; }
+.tagErr    { color: var(--red);     text-shadow: none; }
+.tagInfo   { color: var(--accent);  text-shadow: none; }
+.tagSystem { color: var(--accent);  text-shadow: none; }
 
-/* Log text */
+/* Boot line text (non-tag portion) */
 .text {
-  color: #9CA3AF;
+  color: var(--accent);
+  text-shadow: 0 0 8px rgba(57, 255, 20, 0.4);
 }
 
-/* Blinking cursor */
+/* ── Live log entries ── */
+.logEntry {
+  white-space: pre;
+  overflow-x: hidden;
+  line-height: 1.75;
+}
+
+.logTimestamp {
+  color: var(--text-faint);
+}
+
+.logMessage {
+  color: var(--text-muted);
+}
+
+/* ── Blinking cursor ── */
+.cursorLine {
+  white-space: pre;
+  line-height: 1.75;
+}
+
 .cursor {
-  color: #39FF14;
+  color: var(--accent);
   animation: blink 1s step-end infinite;
   font-size: 14px;
 }
