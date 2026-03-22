@@ -9,11 +9,27 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
+import CornerCard from '../components/CornerCard';
 import type { Column } from '../components/table/DataTable';
 import { fmtPrice, fmtDate } from '../utils/format';
 import styles from './Trades.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
+
+interface AnalystData {
+  name: string;
+  verdict: string;
+  confidence: number;
+  description: string;
+  weight: number;
+  active: boolean;
+  model: string;
+}
+
+interface EnsembleData {
+  verdict: string;
+  confidence: number;
+}
 
 interface Trade {
   ID: string;
@@ -31,6 +47,10 @@ interface Trade {
   ModelName: string;
   OpenedAt: string;
   ClosedAt: string;
+  StopLoss?: number;
+  TakeProfit?: number;
+  Analysts?: AnalystData[];
+  Ensemble?: EnsembleData;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -56,6 +76,21 @@ function statusBadgeClass(status: string): string {
   if (s === 'open') return styles.badgeOpen;
   if (s === 'closed') return styles.badgeClosed;
   return styles.badgeCancelled;
+}
+
+/* ── Analyst colour map ───────────────────────────────────────────────────── */
+
+const ANALYST_PILL_COLORS: Record<string, string> = {
+  Technical: 'var(--indigo)',
+  Momentum:  'var(--amber)',
+  Sentiment: 'var(--violet)',
+  Macro:     'var(--blue)',
+};
+
+function verdictColor(v: string): string {
+  if (v === 'LONG') return 'var(--accent)';
+  if (v === 'SHORT') return 'var(--red)';
+  return 'var(--amber)';
 }
 
 /* ── Date filter helpers ───────────────────────────────────────────────────── */
@@ -187,6 +222,7 @@ export default function TradesScreen() {
   const [tickerSearch, setTickerSearch] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [expandedRow, setExpandedRow] = useState<string | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
 
@@ -228,6 +264,72 @@ export default function TradesScreen() {
   }, []);
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  // Close expanded row on Escape
+  useEffect(() => {
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === 'Escape') setExpandedRow(null);
+    }
+    document.addEventListener('keydown', handleKey);
+    return () => document.removeEventListener('keydown', handleKey);
+  }, []);
+
+  const handleRowClick = useCallback((trade: Trade) => {
+    setExpandedRow(prev => prev === trade.ID ? null : trade.ID);
+  }, []);
+
+  const renderExpandedRow = useCallback((trade: Trade) => {
+    const analysts = trade.Analysts;
+    const ensemble = trade.Ensemble;
+
+    return (
+      <CornerCard bracketColor="var(--violet)" className={styles.expandedInset}>
+        {/* Analyst routing */}
+        <div className={styles.expandedRouting}>
+          <span className={styles.expandedLabel}>Analysts:</span>
+          {analysts && analysts.length > 0 ? (
+            analysts.filter(a => a.active).map(a => (
+              <span
+                key={a.name}
+                className={`${styles.analystPill} chamfer-sm`}
+                style={{ borderColor: ANALYST_PILL_COLORS[a.name] ?? 'var(--border)' }}
+              >
+                <span style={{ color: ANALYST_PILL_COLORS[a.name] ?? 'var(--text-muted)' }}>{a.name.toUpperCase()}</span>
+                <span style={{ color: verdictColor(a.verdict) }}>{a.verdict}</span>
+              </span>
+            ))
+          ) : (
+            <span className={styles.expandedMuted}>—</span>
+          )}
+        </div>
+
+        {/* Ensemble + Strategy */}
+        <div className={styles.expandedMeta}>
+          {ensemble ? (
+            <span>
+              ENSEMBLE: <strong style={{ color: verdictColor(ensemble.verdict) }}>{ensemble.verdict}</strong>{' '}
+              <span className={styles.expandedMuted}>{ensemble.confidence.toFixed(2)}</span>
+            </span>
+          ) : (
+            <span className={styles.expandedMuted}>Ensemble data pending</span>
+          )}
+          <span className={styles.expandedSep}>|</span>
+          <span>Strategy: <strong>{trade.Strategy}</strong></span>
+        </div>
+
+        {/* Signal + Fill */}
+        <div className={styles.expandedMeta}>
+          <span>Signal: <span className={styles.expandedMuted}>{trade.SignalID?.slice(0, 8) ?? '—'}</span></span>
+          <span className={styles.expandedSep}>|</span>
+          <span>
+            Entry @ <strong>{fmtPrice(trade.EntryPrice)}</strong>
+            {trade.StopLoss ? <> | SL <span className={styles.negative}>{fmtPrice(trade.StopLoss)}</span></> : null}
+            {trade.TakeProfit ? <> | TP <span className={styles.positive}>{fmtPrice(trade.TakeProfit)}</span></> : null}
+          </span>
+        </div>
+      </CornerCard>
+    );
+  }, []);
 
   const filtered = useMemo(() => {
     let rows = trades;
@@ -337,6 +439,9 @@ export default function TradesScreen() {
           columns={COLUMNS}
           data={filtered}
           rowKey={(t) => t.ID}
+          onRowClick={handleRowClick}
+          expandedRowKey={expandedRow}
+          renderExpandedRow={renderExpandedRow}
           defaultSortKey="OpenedAt"
           defaultSortDir="desc"
           ariaLabel="Trade history"
