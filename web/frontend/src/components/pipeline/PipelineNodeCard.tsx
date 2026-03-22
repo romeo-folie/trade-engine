@@ -207,7 +207,6 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   return (
     <CornerCard
       bracketColor={stripColor ?? 'var(--border)'}
-      hideBrackets={false}
       bracketSize={10}
       bracketWidth={1}
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
