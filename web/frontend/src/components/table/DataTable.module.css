@@ -77,3 +77,12 @@
   padding: var(--space-6) var(--space-3);
   font-size: var(--font-size-sm);
 }
+
+/* Expanded row inset */
+.expandedRow {
+  background: var(--card-bg) !important;
+}
+
+.expandedRow td {
+  padding: 0;
+}

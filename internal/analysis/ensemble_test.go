@@ -93,27 +93,28 @@ func TestMajorityVote_ClearMajority(t *testing.T) {
 	}
 }
 
-func TestMajorityVote_TieBuyBeatsHold(t *testing.T) {
-	// Priority order is BUY > SELL > HOLD; BUY wins any tie against HOLD.
+func TestMajorityVote_TieBuyVsHoldReturnsHold(t *testing.T) {
+	// BUY and HOLD tied → HOLD wins (neutral on ambiguous signal).
 	results := []AnalystResult{makeResult(ActionBuy, 0.80, nil), makeResult(ActionHold, 0.80, nil)}
 	resp, ok := majorityVote(results)
 	if !ok {
 		t.Fatal("majorityVote should succeed")
 	}
-	if resp.Action != ActionBuy {
-		t.Fatalf("action = %q, want BUY on BUY-HOLD tie (BUY > HOLD priority)", resp.Action)
+	if resp.Action != ActionHold {
+		t.Fatalf("action = %q, want HOLD on BUY-HOLD tie (neutral on ambiguous signal)", resp.Action)
 	}
 }
 
-func TestMajorityVote_TieBuyBeatsSell(t *testing.T) {
-	// BUY > SELL in tie — deterministic, no map iteration randomness.
+func TestMajorityVote_TieBuyVsSellReturnsHold(t *testing.T) {
+	// BUY and SELL tied → HOLD (neutral) rather than favouring BUY by iteration order.
+	// Prevents directional bias when analysts are evenly split.
 	results := []AnalystResult{makeResult(ActionBuy, 0.80, nil), makeResult(ActionSell, 0.80, nil)}
 	resp, ok := majorityVote(results)
 	if !ok {
 		t.Fatal("majorityVote should succeed")
 	}
-	if resp.Action != ActionBuy {
-		t.Fatalf("action = %q, want BUY on BUY-SELL tie (BUY > SELL priority)", resp.Action)
+	if resp.Action != ActionHold {
+		t.Fatalf("action = %q, want HOLD on BUY-SELL tie (no directional bias)", resp.Action)
 	}
 }
 

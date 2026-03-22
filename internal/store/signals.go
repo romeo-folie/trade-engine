@@ -132,7 +132,8 @@ func GetRecentSignals(ctx context.Context, limit int, includePredictions bool) (
 	query := `SELECT id, ticker, action, strategy, signal_price,
 		        COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		        confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
-		        expires_at, stale_threshold_pct, created_at, updated_at
+		        COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
+		        created_at, updated_at
 		 FROM signals `
 
 	if !includePredictions {
@@ -153,7 +154,7 @@ func GetRecentSignals(ctx context.Context, limit int, includePredictions bool) (
 			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
-			&s.BlockReason, &s.ExpiresAt, &s.StalePriceMovePct,
+			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
 			&s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
 			return nil, err

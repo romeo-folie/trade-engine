@@ -1,5 +1,4 @@
-import { useState, useMemo } from 'react';
-import type React from 'react';
+import React, { useState, useMemo } from 'react';
 import styles from './DataTable.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -17,6 +16,8 @@ interface DataTableProps<T> {
   data: T[];
   rowKey: (row: T, idx: number) => string;
   onRowClick?: (row: T) => void;
+  expandedRowKey?: string | null;
+  renderExpandedRow?: (row: T) => React.ReactNode;
   defaultSortKey?: keyof T;
   defaultSortDir?: 'asc' | 'desc';
   ariaLabel?: string;
@@ -38,6 +39,8 @@ export default function DataTable<T>({
   data,
   rowKey,
   onRowClick,
+  expandedRowKey,
+  renderExpandedRow,
   defaultSortKey,
   defaultSortDir = 'desc',
   ariaLabel = 'Data table',
@@ -106,24 +109,36 @@ export default function DataTable<T>({
             <td colSpan={columns.length}>No data</td>
           </tr>
         ) : (
-          sorted.map((row, i) => (
-            <tr
-              key={rowKey(row, i)}
-              className={onRowClick ? styles.clickable : undefined}
-              onClick={onRowClick ? () => onRowClick(row) : undefined}
-              tabIndex={onRowClick ? 0 : undefined}
-              onKeyDown={onRowClick ? (e) => {
-                if (e.key === 'Enter' || e.key === ' ') {
-                  e.preventDefault();
-                  onRowClick(row);
-                }
-              } : undefined}
-            >
-              {columns.map(col => (
-                <td key={col.key}>{col.render(row)}</td>
-              ))}
-            </tr>
-          ))
+          sorted.map((row, i) => {
+            const key = rowKey(row, i);
+            const isExpanded = expandedRowKey != null && key === expandedRowKey;
+            return (
+              <React.Fragment key={key}>
+                <tr
+                  className={onRowClick ? styles.clickable : undefined}
+                  onClick={onRowClick ? () => onRowClick(row) : undefined}
+                  tabIndex={onRowClick ? 0 : undefined}
+                  onKeyDown={onRowClick ? (e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      onRowClick(row);
+                    }
+                  } : undefined}
+                >
+                  {columns.map(col => (
+                    <td key={col.key}>{col.render(row)}</td>
+                  ))}
+                </tr>
+                {isExpanded && renderExpandedRow && (
+                  <tr className={styles.expandedRow}>
+                    <td colSpan={columns.length}>
+                      {renderExpandedRow(row)}
+                    </td>
+                  </tr>
+                )}
+              </React.Fragment>
+            );
+          })
         )}
       </tbody>
     </table>
