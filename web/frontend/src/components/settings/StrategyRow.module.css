@@ -20,16 +20,11 @@
 .chevron {
   background: none;
   border: none;
-  color: var(--text-muted);
-  font-size: 16px;
+  color: var(--accent);
+  font-size: 10px;
   cursor: pointer;
   padding: 0 var(--space-1);
-  transition: transform var(--transition-fast);
   line-height: 1;
-}
-
-.chevron.open {
-  transform: rotate(90deg);
 }
 
 .params {

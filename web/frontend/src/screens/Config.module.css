@@ -79,15 +79,15 @@
   color: var(--text-primary);
 }
 
-.labelAmber {
+.labelRed {
   composes: label;
-  color: var(--amber);
+  color: var(--red);
 }
 
 .annotation {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--emerald);
+  color: var(--amber);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   text-align: right;
@@ -154,18 +154,44 @@
   gap: var(--space-2);
 }
 
-.swapIcon {
+.swapBtn {
   color: var(--text-dim);
   cursor: pointer;
-  font-size: 14px;
-  background: none;
-  border: none;
-  padding: 0;
-  transition: color var(--transition-fast);
+  font-size: 13px;
+  background: transparent;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+  clip-path: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    0 100%
+  );
 }
 
-.swapIcon:hover {
+.swapBtn:hover {
   color: var(--text-muted);
+  border-color: var(--text-dim);
+}
+
+/* Model selector dropdown (inline replacement for swap modal) */
+.modelSelect {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  outline: none;
+  cursor: pointer;
+  transition: border-color var(--transition-fast);
+}
+
+.modelSelect:focus {
+  border-color: var(--accent);
 }
 
 /* ── Checkboxes ── */
@@ -187,10 +213,26 @@
 }
 
 .checkbox {
+  appearance: none;
+  -webkit-appearance: none;
   width: 16px;
   height: 16px;
-  accent-color: var(--emerald);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
   cursor: pointer;
+  position: relative;
+  clip-path: polygon(
+    0 0,
+    calc(100% - 4px) 0,
+    100% 4px,
+    100% 100%,
+    0 100%
+  );
+}
+
+.checkbox:checked {
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 /* ── Notify On sub-label ── */
@@ -236,22 +278,24 @@
 .versionText {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--text-dim);
+  color: var(--text-faint);
   margin-top: var(--space-2);
+  text-align: center;
+  display: block;
+  width: 100%;
 }
 
 /* ── Footer ── */
 .footer {
   display: flex;
-  justify-content: flex-end;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-6);
+  padding: var(--space-4) var(--space-6);
   border-top: 1px solid var(--border-muted);
-  flex-shrink: 0;
 }
 
 .discardBtn {
-  padding: 8px 24px;
+  flex: 1;
+  padding: 10px 24px;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -259,9 +303,16 @@
   letter-spacing: 0.04em;
   color: var(--text-muted);
   background: transparent;
-  border: 1px solid var(--text-muted);
+  border: 1px solid var(--border);
   cursor: pointer;
   transition: opacity var(--transition-fast);
+  clip-path: polygon(
+    0 0,
+    calc(100% - 12px) 0,
+    100% 12px,
+    100% 100%,
+    0 100%
+  );
 }
 
 .discardBtn:hover {
@@ -269,17 +320,25 @@
 }
 
 .saveBtn {
-  padding: 8px 24px;
+  flex: 1;
+  padding: 10px 24px;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--canvas-bg);
+  color: #111;
   background: var(--accent);
   border: 1px solid var(--accent);
   cursor: pointer;
   transition: opacity var(--transition-fast);
+  clip-path: polygon(
+    0 0,
+    calc(100% - 12px) 0,
+    100% 12px,
+    100% 100%,
+    0 100%
+  );
 }
 
 .saveBtn:hover {

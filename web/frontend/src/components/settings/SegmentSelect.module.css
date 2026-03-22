@@ -39,3 +39,8 @@
   background: var(--emerald);
   color: var(--canvas-bg);
 }
+
+.segment.amber.active {
+  background: var(--amber);
+  color: var(--canvas-bg);
+}

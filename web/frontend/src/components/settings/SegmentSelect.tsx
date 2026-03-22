@@ -5,14 +5,21 @@ interface SegmentOption {
   value: string;
   /** Optional prefix element (e.g. warning dot) */
   prefix?: React.ReactNode;
+  /** Per-option active colour override */
+  activeColor?: 'accent' | 'emerald' | 'amber';
 }
 
 interface SegmentSelectProps {
   options: SegmentOption[];
   value: string;
   onChange: (value: string) => void;
-  color?: 'accent' | 'emerald';
+  color?: 'accent' | 'emerald' | 'amber';
 }
+
+const COLOR_CLASS: Record<string, string | undefined> = {
+  emerald: styles.emerald,
+  amber: styles.amber,
+};
 
 export default function SegmentSelect({
   options,
@@ -22,19 +29,22 @@ export default function SegmentSelect({
 }: SegmentSelectProps) {
   return (
     <div className={styles.group}>
-      {options.map((opt) => (
-        <button
-          key={opt.value}
-          type="button"
-          className={`${styles.segment} ${opt.value === value ? styles.active : ''} ${
-            color === 'emerald' ? styles.emerald : ''
-          }`}
-          onClick={() => onChange(opt.value)}
-        >
-          {opt.prefix}
-          {opt.label}
-        </button>
-      ))}
+      {options.map((opt) => {
+        const isActive = opt.value === value;
+        const activeVariant = opt.activeColor ?? color;
+        const colorCls = isActive ? (COLOR_CLASS[activeVariant] ?? '') : '';
+        return (
+          <button
+            key={opt.value}
+            type="button"
+            className={`${styles.segment} ${isActive ? styles.active : ''} ${colorCls}`}
+            onClick={() => onChange(opt.value)}
+          >
+            {opt.prefix}
+            {opt.label}
+          </button>
+        );
+      })}
     </div>
   );
 }

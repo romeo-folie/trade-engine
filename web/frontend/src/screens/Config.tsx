@@ -7,6 +7,15 @@ import styles from './Config.module.css';
 
 const ENGINE_VERSION = 'v2.1.0';
 
+const MODEL_OPTIONS = [
+  'gpt-4o',
+  'gpt-4o-mini',
+  'claude-opus-4-6',
+  'claude-sonnet-4-6',
+  'gemini-2.0-flash',
+  'gemini-2.5-pro',
+];
+
 /* ── Default config values ── */
 const DEFAULTS = {
   mode: 'paper',
@@ -65,6 +74,7 @@ export default function ConfigScreen() {
   const [toast, setToast] = useState<string | null>(null);
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [rawInput, setRawInput] = useState<Record<string, string>>({});
+  const [openModelSelect, setOpenModelSelect] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => () => clearTimeout(toastTimerRef.current), []);
@@ -133,12 +143,11 @@ export default function ConfigScreen() {
               <SegmentSelect
                 options={[
                   { label: 'MANUAL', value: 'manual' },
-                  { label: 'PAPER', value: 'paper' },
-                  { label: 'AUTO', value: 'auto', prefix: <span style={{ color: 'var(--amber)' }}>●{' '}</span> },
+                  { label: 'PAPER', value: 'paper', activeColor: 'amber' },
+                  { label: 'AUTO', value: 'auto', prefix: <span style={{ color: 'var(--red)', fontSize: 8 }}>●{' '}</span> },
                 ]}
                 value={config.mode}
                 onChange={(v) => set('mode', v)}
-                color="emerald"
               />
             </div>
 
@@ -208,7 +217,7 @@ export default function ConfigScreen() {
               </div>
             </div>
             <div className={styles.row}>
-              <span className={styles.labelAmber}>max_drawdown_pct</span>
+              <span className={styles.labelRed}>max_drawdown_pct</span>
               <div className={styles.inputWithUnit}>
                 <input className={styles.input} type="number" step="0.1" value={config.maxDrawdownPct} onChange={(e) => set('maxDrawdownPct', +e.target.value)} />
                 <span className={styles.unit}>%</span>
@@ -275,8 +284,28 @@ export default function ConfigScreen() {
                 <span className={styles.label}>{label}</span>
                 <span className={styles.modelName}>
                   {config[key]}
-                  <button type="button" className={styles.swapIcon} onClick={() => { /* TODO: open model selector modal */ }}>⇄</button>
+                  <button
+                    type="button"
+                    className={styles.swapBtn}
+                    onClick={() => setOpenModelSelect(openModelSelect === key ? null : key)}
+                  >
+                    ⇄
+                  </button>
                 </span>
+                {openModelSelect === key && (
+                  <select
+                    className={styles.modelSelect}
+                    value={config[key]}
+                    onChange={(e) => {
+                      set(key, e.target.value);
+                      setOpenModelSelect(null);
+                    }}
+                  >
+                    {MODEL_OPTIONS.map((m) => (
+                      <option key={m} value={m}>{m}</option>
+                    ))}
+                  </select>
+                )}
               </div>
             ))}
           </SettingsSection>
@@ -291,7 +320,6 @@ export default function ConfigScreen() {
               ]}
               value={config.costProfile}
               onChange={(v) => set('costProfile', v)}
-              color="emerald"
             />
             <div className={styles.row}>
               <span className={styles.label}>Daily Token Budget</span>
