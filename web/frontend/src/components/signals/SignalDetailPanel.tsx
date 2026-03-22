@@ -5,6 +5,21 @@ import styles from './SignalDetailPanel.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
+export interface AnalystData {
+  name: string;
+  verdict: string;       // 'LONG' | 'SHORT' | 'NEUTRAL'
+  confidence: number;    // 0–1
+  description: string;
+  weight: number;
+  active: boolean;
+  model: string;
+}
+
+export interface EnsembleData {
+  verdict: string;
+  confidence: number;
+}
+
 export interface Signal {
   ID: string;
   Ticker: string;
@@ -19,6 +34,8 @@ export interface Signal {
   BlockReason: string;
   ExpiresAt: string;
   CreatedAt: string;
+  Analysts?: AnalystData[];
+  Ensemble?: EnsembleData;
 }
 
 interface SignalDetailPanelProps {
@@ -38,14 +55,45 @@ function statusClass(status: string): string {
   return styles.statusBlocked;
 }
 
-/* ── Stub analyst data — replace with real API data once #217 ships ──────── */
+/* ── Stub analyst data — fallback when API data is absent ────────────────── */
 
-const STUB_ANALYSTS = [
-  { name: 'Technical', verdict: 'LONG', verdictColor: 'var(--accent)', bracketColor: 'var(--blue)', barColor: 'var(--blue)', confidence: 0.87, description: 'RSI 68, MACD crossover confirmed', bypassed: false },
-  { name: 'Momentum', verdict: 'LONG', verdictColor: 'var(--accent)', bracketColor: 'var(--amber)', barColor: 'var(--amber)', confidence: 0.92, description: 'Volume spike 2.1x, price breakout', bypassed: false },
-  { name: 'Sentiment', verdict: 'NEUTRAL', verdictColor: 'var(--amber)', bracketColor: 'var(--violet)', barColor: 'var(--violet)', confidence: 0.55, description: 'Mixed news sentiment, no clear bias', bypassed: false },
-  { name: 'Macro', verdict: 'BYPASSED', verdictColor: 'var(--text-faint)', bracketColor: 'var(--border)', barColor: 'var(--border)', confidence: 0, description: 'Not routed this cycle', bypassed: true },
+const STUB_ANALYSTS: AnalystData[] = [
+  { name: 'Technical', verdict: 'LONG', confidence: 0.87, description: 'RSI 68, MACD crossover confirmed', weight: 0.25, active: true, model: '' },
+  { name: 'Momentum', verdict: 'LONG', confidence: 0.92, description: 'Volume spike 2.1x, price breakout', weight: 0.25, active: true, model: '' },
+  { name: 'Sentiment', verdict: 'NEUTRAL', confidence: 0.55, description: 'Mixed news sentiment, no clear bias', weight: 0.25, active: true, model: '' },
+  { name: 'Macro', verdict: 'NEUTRAL', confidence: 0, description: 'Not routed this cycle', weight: 0.25, active: false, model: '' },
 ];
+
+/* ── Colour maps ────────────────────────────────────────────────────────── */
+
+const ANALYST_COLORS: Record<string, string> = {
+  Technical: 'var(--indigo)',
+  Momentum:  'var(--amber)',
+  Sentiment: 'var(--violet)',
+  Macro:     'var(--blue)',
+};
+
+function analystBracketColor(name: string, active: boolean): string {
+  if (!active) return 'var(--border)';
+  return ANALYST_COLORS[name] ?? 'var(--border)';
+}
+
+function analystBarColor(name: string): string {
+  return ANALYST_COLORS[name] ?? 'var(--border)';
+}
+
+function verdictColor(verdict: string): string {
+  if (verdict === 'LONG') return 'var(--accent)';
+  if (verdict === 'SHORT') return 'var(--red)';
+  return 'var(--amber)';
+}
+
+function executionLabel(status: string): { label: string; dotClass: string } {
+  const s = status.toLowerCase();
+  if (s === 'executed') return { label: 'EXECUTED', dotClass: styles.armedDot };
+  if (s === 'blocked') return { label: 'BLOCKED', dotClass: styles.blockedDot };
+  return { label: 'ARMED', dotClass: styles.armedDot };
+}
 
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
@@ -80,6 +128,12 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
   const dirIsLong = signal.Action.toUpperCase() === 'BUY';
 
+  // Use real analyst data when available, fall back to stubs
+  const analysts = signal.Analysts && signal.Analysts.length > 0 ? signal.Analysts : STUB_ANALYSTS;
+  const ensemble = signal.Ensemble ?? null;
+  const activeAnalysts = analysts.filter(a => a.active);
+  const exec = executionLabel(signal.Status);
+
   return (
     <>
       <div className={styles.backdrop} onClick={onClose} />
@@ -98,50 +152,39 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
             <span className={`${styles.dirBadge} ${dirIsLong ? styles.dirLong : styles.dirShort} chamfer-sm`}>
               {dirIsLong ? '▲ LONG' : '▼ SHORT'}
             </span>
-            <span className={`${styles.statusBadge} ${statusClass(signal.Status)} chamfer-sm`}>
-              {signal.Status.toUpperCase()}
-            </span>
           </div>
-          <button type="button" className={`${styles.closeBtn} chamfer-sm`} onClick={onClose} aria-label="Close panel">
-            ESC
-          </button>
+          <span className={styles.confidenceHeader}>CONFIDENCE {(signal.Confidence * 100).toFixed(0)}%</span>
         </div>
 
-        {/* Confidence */}
-        <div className={styles.confidenceRow}>
-          <span className={styles.confidenceLabel}>CONFIDENCE</span>
-          <span className={styles.confidenceValue}>{(signal.Confidence * 100).toFixed(0)}%</span>
-          <div className={styles.confidenceBar}>
-            <div
-              className={styles.confidenceFill}
-              style={{ width: `${Math.round(signal.Confidence * 100)}%` }}
-            />
-          </div>
+        {/* Sub-header: timestamp + strategy */}
+        <div className={styles.subHeader}>
+          <span className={styles.subHeaderText}>{fmtDate(signal.CreatedAt)}</span>
+          <span className={styles.subHeaderText}>STRATEGY: {signal.Strategy}</span>
         </div>
 
         <div className={styles.body}>
           {/* Analyst routing */}
           <div className={styles.routingLabel}>
-            ROUTED: {STUB_ANALYSTS.filter(a => !a.bypassed).length} of {STUB_ANALYSTS.length} ANALYSTS
+            ROUTED: {activeAnalysts.length} of {analysts.length} ANALYSTS
           </div>
           <div className={styles.analystCards}>
-            {STUB_ANALYSTS.map(analyst => (
+            {analysts.map(analyst => (
               <CornerCard
                 key={analyst.name}
-                bracketColor={analyst.bracketColor}
+                bracketColor={analystBracketColor(analyst.name, analyst.active)}
                 bracketSize={10}
                 bracketWidth={1}
-                className={`${styles.analystCard} ${analyst.bypassed ? styles.bypassed : ''}`}
+                className={`${styles.analystCard} ${!analyst.active ? styles.bypassed : ''}`}
               >
                 <div className={styles.analystHeader}>
                   <span className={styles.analystName}>{analyst.name}</span>
-                  <span className={styles.analystVerdict} style={{ color: analyst.verdictColor }}>
-                    {analyst.verdict}
+                  <span className={styles.analystVerdict} style={{ color: analyst.active ? verdictColor(analyst.verdict) : 'var(--text-faint)' }}>
+                    {analyst.active ? analyst.verdict : 'BYPASSED'}
                   </span>
                 </div>
-                {!analyst.bypassed && (
+                {analyst.active && (
                   <div className={styles.analystBarTrack}>
-                    <div className={styles.analystBar} style={{ background: analyst.barColor, width: `${analyst.confidence * 100}%` }} />
+                    <div className={styles.analystBar} style={{ background: analystBarColor(analyst.name), width: `${analyst.confidence * 100}%` }} />
                   </div>
                 )}
                 <div className={styles.analystDesc}>{analyst.description}</div>
@@ -152,18 +195,20 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           {/* Ensemble synthesis */}
           <div className={styles.ensembleSection}>
             <div className={styles.sectionLabel}>ENSEMBLE SYNTHESIS</div>
-            {STUB_ANALYSTS.filter(a => !a.bypassed).map(a => (
+            {activeAnalysts.map(a => (
               <div key={a.name} className={styles.ensembleRow}>
                 <span className={styles.ensembleLabel}>{a.name}</span>
                 <div className={styles.ensembleTrack}>
-                  <div className={styles.ensembleFill} style={{ width: `${a.confidence * 100}%`, background: a.barColor }} />
+                  <div className={styles.ensembleFill} style={{ width: `${a.weight * 100}%`, background: analystBarColor(a.name) }} />
                 </div>
-                <span className={styles.ensembleWeight}>{a.confidence.toFixed(2)}</span>
+                <span className={styles.ensembleWeight}>{a.weight.toFixed(2)}</span>
               </div>
             ))}
             <div className={styles.ensembleVerdict}>
-              <span className={styles.verdictText}>{dirIsLong ? 'LONG' : 'SHORT'}</span>
-              <span className={styles.verdictScore}>WEIGHTED <strong>{signal.Confidence.toFixed(2)}</strong></span>
+              <span className={styles.verdictText} style={{ color: verdictColor(ensemble?.verdict ?? (dirIsLong ? 'LONG' : 'SHORT')) }}>
+                {ensemble?.verdict ?? (dirIsLong ? 'LONG' : 'SHORT')}
+              </span>
+              <span className={styles.verdictScore}>WEIGHTED <strong>{(ensemble?.confidence ?? signal.Confidence).toFixed(2)}</strong></span>
             </div>
           </div>
 
@@ -171,11 +216,11 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           <div className={styles.executionSection}>
             <div className={styles.sectionLabel}>EXECUTION</div>
             <div className={styles.executionStatus}>
-              <span className={styles.armedDot} />
-              <span className={styles.armedLabel}>ARMED</span>
+              <span className={exec.dotClass} />
+              <span className={styles.armedLabel}>{exec.label}</span>
             </div>
             <div className={styles.executionPrice}>
-              <span className={styles.priceLabel}>ENTRY</span>
+              <span className={styles.priceLabel}>Entry</span>
               <span className={styles.priceValue}>{fmtPrice(signal.SignalPrice)}</span>
             </div>
             <div className={styles.slTp}>
@@ -186,9 +231,6 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
           {/* Key-value details */}
           <div className={styles.kvGrid}>
-            <span className={styles.kvLabel}>Strategy</span>
-            <span className={styles.kvValue}>{signal.Strategy}</span>
-
             <span className={styles.kvLabel}>Size %</span>
             <span className={styles.kvValue}>{signal.SizePct.toFixed(1)}%</span>
 
@@ -199,23 +241,26 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               </>
             )}
 
+            <span className={styles.kvLabel}>Status</span>
+            <span className={styles.kvValue}>
+              <span className={`${styles.statusBadge} ${statusClass(signal.Status)} chamfer-sm`}>
+                {signal.Status.toUpperCase()}
+              </span>
+            </span>
+
             <span className={styles.kvLabel}>Expires</span>
             <span className={styles.kvValue}>{fmtDate(signal.ExpiresAt)}</span>
-
-            <span className={styles.kvLabel}>Created</span>
-            <span className={styles.kvValue}>{fmtDate(signal.CreatedAt)}</span>
           </div>
 
           {/* Action buttons */}
           <div className={styles.actionRow}>
-            {/* TODO: wire to manual override API when endpoint is available */}
             <button
               type="button"
               className={`${styles.btnOverride} chamfer-sm`}
               disabled
               title="Manual override — not yet implemented"
             >OVERRIDE</button>
-            <button type="button" className={`${styles.btnDismiss} chamfer-sm`} onClick={onClose}>DISMISS</button>
+            <button type="button" className={`${styles.btnDismiss} chamfer-sm`} onClick={onClose}>CLOSE</button>
           </div>
         </div>
       </div>

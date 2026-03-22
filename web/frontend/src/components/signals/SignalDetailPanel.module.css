@@ -91,43 +91,40 @@
   outline-offset: 2px;
 }
 
-/* Confidence row below header */
-.confidenceRow {
+/* Confidence in header */
+.confidenceHeader {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/* Sub-header: timestamp + strategy */
+.subHeader {
   display: flex;
-  align-items: center;
   gap: var(--space-3);
-  padding: var(--space-3) var(--space-5);
+  padding: var(--space-2) var(--space-5);
   border-bottom: 1px solid var(--border-muted);
 }
 
-.confidenceLabel {
+.subHeaderText {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 }
 
-.confidenceValue {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-lg);
-  font-weight: 700;
-  color: var(--accent);
-}
-
-.confidenceBar {
-  flex: 1;
-  height: 6px;
-  background: var(--border-muted);
-  border-radius: 3px;
-  overflow: hidden;
-}
-
-.confidenceFill {
-  height: 100%;
-  background: var(--accent);
-  border-radius: 3px;
-  transition: width var(--transition-base);
+/* Blocked dot variant */
+.blockedDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--red);
+  box-shadow: 0 0 6px var(--red);
 }
 
 .body {
