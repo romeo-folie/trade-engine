@@ -112,6 +112,13 @@ func handleModels(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, map[string]any{"model_performance": perf})
 }
 
+// signalWithAnalysts enriches a Signal with analyst routing data.
+type signalWithAnalysts struct {
+	store.Signal
+	Analysts []APIAnalystResult `json:"Analysts,omitempty"`
+	Ensemble *APIEnsembleResult `json:"Ensemble,omitempty"`
+}
+
 // GET /api/signals/recent?limit=N
 func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 	limit := queryInt(r, "limit", 50, 200)
@@ -123,7 +130,25 @@ func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "signals query failed", err)
 		return
 	}
-	jsonResponse(w, map[string]any{"signals": sigs})
+
+	enriched := make([]signalWithAnalysts, len(sigs))
+	for i, sig := range sigs {
+		enriched[i].Signal = sig
+		raw, err := store.GetAnalystResultsForSignal(ctx, sig.AnalysisIDs)
+		if err != nil {
+			logger.Warn("web: analyst results lookup failed", "signal_id", sig.ID, "err", err.Error())
+			continue
+		}
+		enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
+	}
+	jsonResponse(w, map[string]any{"signals": enriched})
+}
+
+// tradeWithAnalysts enriches a Trade with analyst routing data.
+type tradeWithAnalysts struct {
+	store.Trade
+	Analysts []APIAnalystResult `json:"Analysts,omitempty"`
+	Ensemble *APIEnsembleResult `json:"Ensemble,omitempty"`
 }
 
 // GET /api/trades/recent?limit=N
@@ -137,7 +162,18 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "trades query failed", err)
 		return
 	}
-	jsonResponse(w, map[string]any{"trades": trades})
+
+	enriched := make([]tradeWithAnalysts, len(trades))
+	for i, t := range trades {
+		enriched[i].Trade = t
+		raw, err := store.GetAnalystResultsForTrade(ctx, t.SignalID)
+		if err != nil {
+			logger.Warn("web: analyst results lookup failed", "trade_id", t.ID, "err", err.Error())
+			continue
+		}
+		enriched[i].Analysts, enriched[i].Ensemble = mapAnalystResults(raw)
+	}
+	jsonResponse(w, map[string]any{"trades": enriched})
 }
 
 // GET /api/analyses/recent?limit=N

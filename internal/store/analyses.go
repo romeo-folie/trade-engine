@@ -231,6 +231,48 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	return out, nil
 }
 
+// GetAnalystResultsForSignal fetches the ensemble_results JSON for the first
+// analysis linked to a signal (via analysis_ids). Returns nil if no analysis found.
+func GetAnalystResultsForSignal(ctx context.Context, analysisIDs []string) ([]byte, error) {
+	if len(analysisIDs) == 0 {
+		return nil, nil
+	}
+	var ensembleResults []byte
+	err := GetDB().QueryRow(ctx, `
+		SELECT ensemble_results FROM analyses WHERE id = $1
+	`, analysisIDs[0]).Scan(&ensembleResults)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return ensembleResults, nil
+}
+
+// GetAnalystResultsForTrade fetches ensemble_results JSON for the signal
+// linked to a trade. Returns nil if no analysis found.
+func GetAnalystResultsForTrade(ctx context.Context, signalID string) ([]byte, error) {
+	if signalID == "" {
+		return nil, nil
+	}
+	var ensembleResults []byte
+	err := GetDB().QueryRow(ctx, `
+		SELECT a.ensemble_results
+		FROM analyses a
+		JOIN signals s ON a.id = ANY(s.analysis_ids)
+		WHERE s.id = $1
+		LIMIT 1
+	`, signalID).Scan(&ensembleResults)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return ensembleResults, nil
+}
+
 // nullableFloat returns nil for zero values (stop_loss / take_profit on HOLD).
 func nullableFloat(f float64) any {
 	if f == 0 {
