@@ -54,8 +54,6 @@ export default function CornerCard({
       {!hideBrackets && !active && (
         <>
           <span className={`${styles.b} ${styles.bTL}`} aria-hidden="true" />
-          <span className={`${styles.b} ${styles.bTR}`} aria-hidden="true" />
-          <span className={`${styles.b} ${styles.bBL}`} aria-hidden="true" />
           <span className={`${styles.b} ${styles.bBR}`} aria-hidden="true" />
         </>
       )}
