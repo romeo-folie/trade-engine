@@ -118,7 +118,7 @@
   font-size: var(--font-size-sm);
   padding: var(--space-2) var(--space-4);
   z-index: var(--z-overlay);
-  animation: fadeIn var(--transition-fast) ease-out;
+  animation: fadeIn 100ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 @keyframes fadeIn {

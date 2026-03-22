@@ -2,15 +2,15 @@
 
 :root {
   /* ── Base ───────────────────────────────────────────────────────────── */
-  --canvas-bg:      #0A0A0D;
-  --panel-bg:       #0D0D11;
-  --card-bg:        #111115;
-  --card-bg-alt:    #141418;
-  --bg:             #0A0A0D;   /* alias for --canvas-bg */
-  --surface:        #0D0D11;   /* alias for --panel-bg */
-  --surface-hover:  rgba(13, 13, 17, 0.08);
-  --border:         #2A2A35;
-  --border-muted:   #1A1A22;
+  --canvas-bg:      #0D1117;   /* design spec: very dark blue-black */
+  --panel-bg:       #0D1117;
+  --card-bg:        #111820;   /* slightly elevated */
+  --card-bg-alt:    #141E2A;   /* further elevated */
+  --bg:             #0D1117;
+  --surface:        #111820;
+  --surface-hover:  rgba(17, 24, 32, 0.5);
+  --border:         #1E2D2D;   /* dark teal-gray, matches design */
+  --border-muted:   #151E1E;
 
   /* ── Text ───────────────────────────────────────────────────────────── */
   --text-primary:   #F0F0F0;
@@ -77,10 +77,13 @@
   --sidebar-expanded:   200px;
   --panel-width:        320px;
 
+  /* ── Easing ─────────────────────────────────────────────────────────── */
+
+
   /* ── Transitions ────────────────────────────────────────────────────── */
-  --transition-fast:   100ms ease;
-  --transition-base:   200ms ease;
-  --transition-slow:   350ms ease;
+  --transition-fast:   100ms cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-base:   200ms cubic-bezier(0.16, 1, 0.3, 1);
+  --transition-slow:   350ms cubic-bezier(0.16, 1, 0.3, 1);
 
   /* ── Z-index ────────────────────────────────────────────────────────── */
   --z-panel:    100;

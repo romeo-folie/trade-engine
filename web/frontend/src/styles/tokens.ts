@@ -21,11 +21,11 @@ export const TOKENS = {
   slate:       '#4A5568',
 
   // Surfaces — matches tokens.css
-  canvasBg:    '#0A0A0D',   // --canvas-bg / --bg
-  panelBg:     '#0D0D11',   // --panel-bg / --surface
-  cardBg:      '#111115',   // --card-bg
-  border:      '#2A2A35',   // --border
-  borderMuted: '#1A1A22',   // --border-muted
+  canvasBg:    '#0D1117',   // --canvas-bg / --bg
+  panelBg:     '#0D1117',   // --panel-bg
+  cardBg:      '#111820',   // --card-bg
+  border:      '#1E2D2D',   // --border
+  borderMuted: '#151E1E',   // --border-muted
 
   // Text — matches tokens.css
   textPrimary: '#F0F0F0',   // --text-primary
