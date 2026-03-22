@@ -60,7 +60,7 @@
 
 /* Title line */
 .title {
-  color: #39FF14;
+  color: var(--accent);
   text-shadow: 0 0 8px rgba(57, 255, 20, 0.5);
   font-size: 14px;
   font-weight: 600;
@@ -68,24 +68,24 @@
 
 /* Horizontal rule / separator */
 .separator {
-  color: #374151;
+  color: var(--text-faint);
 }
 
 /* Tag colours */
-.tagOk     { color: #22C55E; }
-.tagWait   { color: #F59E0B; }
-.tagErr    { color: #EF4444; }
-.tagInfo   { color: #39FF14; }
-.tagSystem { color: #39FF14; }
+.tagOk     { color: var(--emerald); }
+.tagWait   { color: var(--amber); }
+.tagErr    { color: var(--red); }
+.tagInfo   { color: var(--accent); }
+.tagSystem { color: var(--accent); }
 
 /* Log text */
 .text {
-  color: #9CA3AF;
+  color: var(--text-muted);
 }
 
 /* Blinking cursor */
 .cursor {
-  color: #39FF14;
+  color: var(--accent);
   animation: blink 1s step-end infinite;
   font-size: 14px;
 }

@@ -32,8 +32,8 @@ interface ModelPerfRow {
   TradeCount: number;
   WinRate: number | null;
   AvgPnLPct: number | null;
-  TotalRecommendations: number;
-  AvgConfidence: number;
+  AvgLatencyMs: number | null;
+  TokensPerCall: number | null;
 }
 
 /* ── Helpers ───────────────────────────────────────────────────────────────── */
@@ -50,6 +50,13 @@ function fmtPct(v: number | null): string {
   return v.toFixed(1) + '%';
 }
 
+function winRateClass(wr: number | null): string {
+  if (wr == null) return '';
+  const pct = wr * 100;
+  if (pct >= 65) return styles.green;
+  if (pct >= 55) return styles.amber;
+  return styles.red;
+}
 
 function fmtTime(iso: string): string {
   if (!iso) return '—';
@@ -192,13 +199,13 @@ export default function SystemScreen() {
     : '—';
 
   const modeClass = mode === 'PAPER' ? styles.kpiAmber
-    : mode === 'LIVE' || mode === 'AUTO' ? styles.kpiGreen
+    : mode === 'LIVE' || mode === 'AUTO' ? styles.kpiAccent
     : mode === 'MANUAL' ? styles.kpiRed
     : '';
 
   const openPositions = riskData?.open_trade_count ?? '—';
 
-  const activityEvents = events.slice(0, 50);
+  const activityEvents = events.slice(0, 100);
 
   return (
     <div className={styles.screen}>
@@ -257,7 +264,7 @@ export default function SystemScreen() {
           <span className={styles.bracketTL} aria-hidden="true">⌐</span>
           <span className={styles.bracketBR} aria-hidden="true">¬</span>
           <span className={styles.kpiLabel}>CACHE HIT RATE</span>
-          <span className={`${styles.kpiValue} ${styles.kpiGreen}`}>{cacheHitRate}</span>
+          <span className={`${styles.kpiValue} ${styles.kpiAccent}`}>{cacheHitRate}</span>
         </div>
         <div className={styles.kpiCard}>
           <span className={styles.bracketTL} aria-hidden="true">⌐</span>
@@ -289,9 +296,9 @@ export default function SystemScreen() {
                   <th className={styles.th}>MODEL</th>
                   <th className={styles.th}>TRADES</th>
                   <th className={styles.th}>WIN RATE</th>
-                  <th className={styles.th}>AVG P&amp;L %</th>
-                  <th className={styles.th}>RECOMMENDATIONS</th>
-                  <th className={styles.th}>AVG CONFIDENCE</th>
+                  <th className={styles.th}>AVG P&amp;L</th>
+                  <th className={styles.th}>AVG LATENCY</th>
+                  <th className={styles.th}>TOKENS/CALL</th>
                 </tr>
               </thead>
               <tbody>
@@ -306,12 +313,12 @@ export default function SystemScreen() {
                     <tr key={`${row.Provider}-${row.Model}`}>
                       <td className={styles.td}>{row.Model}</td>
                       <td className={styles.td}>{row.TradeCount}</td>
-                      <td className={`${styles.td} ${styles.green}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
+                      <td className={`${styles.td} ${winRateClass(row.WinRate)}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
                       <td className={`${styles.td} ${(row.AvgPnLPct ?? 0) >= 0 ? styles.green : styles.red}`}>
-                        {fmtPct(row.AvgPnLPct != null ? row.AvgPnLPct * 100 : null)}
+                        {row.AvgPnLPct != null ? (row.AvgPnLPct >= 0 ? '+' : '') + fmtPct(row.AvgPnLPct * 100) : '—'}
                       </td>
-                      <td className={styles.td}>{row.TotalRecommendations}</td>
-                      <td className={styles.td}>{fmtPct(row.AvgConfidence != null ? row.AvgConfidence * 100 : null)}</td>
+                      <td className={styles.td}>{row.AvgLatencyMs != null ? `${row.AvgLatencyMs.toLocaleString()}ms` : '—'}</td>
+                      <td className={styles.td}>{row.TokensPerCall != null ? row.TokensPerCall.toLocaleString() : '—'}</td>
                     </tr>
                   ))
                 )}
@@ -365,8 +372,9 @@ export default function SystemScreen() {
         <div className={styles.rightCol}>
           <div className={styles.sectionHeader}>
             <span className={styles.sectionTitle}>ENGINE ACTIVITY</span>
-            <span className={styles.liveIndicator}>
-              <span className={styles.pulseDot} /> LIVE
+            <span className={wsStatus === 'connected' ? styles.liveIndicator : styles.livePolling}>
+              <span className={styles.pulseDot} style={wsStatus !== 'connected' ? { background: 'var(--amber)' } : undefined} />
+              {wsStatus === 'connected' ? 'LIVE' : 'POLLING'}
             </span>
           </div>
 
