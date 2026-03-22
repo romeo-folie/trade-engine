@@ -30,6 +30,19 @@ type Config struct {
 	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
 	Analysis      AnalysisConfig      `yaml:"analysis"`
 	Cost          CostConfig          `yaml:"cost"`
+	ORB           ORBConfig           `yaml:"orb"`
+}
+
+// ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
+type ORBConfig struct {
+	Enabled           bool    `yaml:"enabled"`
+	Mode              string  `yaml:"mode"`               // "paper" | "live"
+	GapThresholdPct   float64 `yaml:"gap_threshold_pct"`  // minimum gap % (e.g. 3.0)
+	MaxCandidates     int     `yaml:"max_candidates"`     // 1–5
+	RangeMinutes      int     `yaml:"range_minutes"`      // 5 or 15
+	RiskReward        float64 `yaml:"risk_reward"`        // e.g. 2.0
+	MaxRiskPct        float64 `yaml:"max_risk_pct"`       // max loss per trade as % of portfolio
+	NewsLookbackHours int     `yaml:"news_lookback_hours"` // e.g. 24
 }
 
 // CostConfig controls the user-facing cost profile and budget guardrails.
@@ -806,6 +819,28 @@ func Validate(cfg *Config) []string {
 	}
 	if os.Getenv(dbEnv) == "" {
 		errs = append(errs, fmt.Sprintf("env var %s (database.url_env) is not set", dbEnv))
+	}
+
+	// ── ORB validation ──────────────────────────────────────────────────────
+	if cfg.ORB.Enabled {
+		if cfg.ORB.GapThresholdPct <= 0 {
+			errs = append(errs, "orb.gap_threshold_pct must be > 0")
+		}
+		if cfg.ORB.RangeMinutes != 5 && cfg.ORB.RangeMinutes != 15 {
+			errs = append(errs, "orb.range_minutes must be 5 or 15")
+		}
+		if cfg.ORB.MaxCandidates < 1 || cfg.ORB.MaxCandidates > 5 {
+			errs = append(errs, "orb.max_candidates must be 1-5")
+		}
+		if cfg.ORB.RiskReward < 1.5 {
+			errs = append(errs, "orb.risk_reward must be >= 1.5")
+		}
+		if cfg.ORB.MaxRiskPct <= 0 || cfg.ORB.MaxRiskPct > 5.0 {
+			errs = append(errs, "orb.max_risk_pct must be > 0 and <= 5.0")
+		}
+		if cfg.ORB.Mode != "paper" && cfg.ORB.Mode != "live" {
+			errs = append(errs, "orb.mode must be paper or live")
+		}
 	}
 
 	return errs

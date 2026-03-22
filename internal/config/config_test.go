@@ -339,6 +339,123 @@ func TestLegacyAnalystsFallback(t *testing.T) {
 	}
 }
 
+// ── ORB validation tests ──────────────────────────────────────────────────
+
+func TestValidateORBInvalidRangeMinutes(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.RangeMinutes = 10
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.range_minutes") {
+		t.Errorf("expected orb.range_minutes error, got: %v", errs)
+	}
+}
+
+func TestValidateORBInvalidRiskReward(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.RiskReward = 1.0
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.risk_reward") {
+		t.Errorf("expected orb.risk_reward error, got: %v", errs)
+	}
+}
+
+func TestValidateORBInvalidMaxCandidates(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.MaxCandidates = 0
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.max_candidates") {
+		t.Errorf("expected orb.max_candidates error, got: %v", errs)
+	}
+	cfg.ORB.MaxCandidates = 6
+	errs = Validate(cfg)
+	if !containsStr(errs, "orb.max_candidates") {
+		t.Errorf("expected orb.max_candidates error for 6, got: %v", errs)
+	}
+}
+
+func TestValidateORBInvalidMaxRiskPct(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.MaxRiskPct = 0
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.max_risk_pct") {
+		t.Errorf("expected orb.max_risk_pct error, got: %v", errs)
+	}
+	cfg.ORB.MaxRiskPct = 6.0
+	errs = Validate(cfg)
+	if !containsStr(errs, "orb.max_risk_pct") {
+		t.Errorf("expected orb.max_risk_pct error for 6.0, got: %v", errs)
+	}
+}
+
+func TestValidateORBInvalidMode(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.Mode = "invalid"
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.mode") {
+		t.Errorf("expected orb.mode error, got: %v", errs)
+	}
+}
+
+func TestValidateORBInvalidGapThreshold(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	cfg.ORB.GapThresholdPct = -1.0
+	errs := Validate(cfg)
+	if !containsStr(errs, "orb.gap_threshold_pct") {
+		t.Errorf("expected orb.gap_threshold_pct error, got: %v", errs)
+	}
+}
+
+func TestValidateORBValidDefaults(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = true
+	errs := Validate(cfg)
+	for _, e := range errs {
+		if strings.Contains(e, "orb.") {
+			t.Errorf("unexpected ORB validation error with defaults: %s", e)
+		}
+	}
+}
+
+func TestValidateORBDisabledSkipsValidation(t *testing.T) {
+	cfg := Defaults()
+	cfg.ORB.Enabled = false
+	cfg.ORB.RangeMinutes = 99 // invalid but should not matter
+	errs := Validate(cfg)
+	for _, e := range errs {
+		if strings.Contains(e, "orb.") {
+			t.Errorf("ORB disabled but got validation error: %s", e)
+		}
+	}
+}
+
+func TestDefaultsORBConfig(t *testing.T) {
+	cfg := Defaults()
+	if cfg.ORB.Mode != "paper" {
+		t.Errorf("default orb.mode = %q, want paper", cfg.ORB.Mode)
+	}
+	if cfg.ORB.GapThresholdPct != 3.0 {
+		t.Errorf("default orb.gap_threshold_pct = %f, want 3.0", cfg.ORB.GapThresholdPct)
+	}
+	if cfg.ORB.MaxCandidates != 2 {
+		t.Errorf("default orb.max_candidates = %d, want 2", cfg.ORB.MaxCandidates)
+	}
+	if cfg.ORB.RangeMinutes != 15 {
+		t.Errorf("default orb.range_minutes = %d, want 15", cfg.ORB.RangeMinutes)
+	}
+	if cfg.ORB.RiskReward != 2.0 {
+		t.Errorf("default orb.risk_reward = %f, want 2.0", cfg.ORB.RiskReward)
+	}
+	if cfg.ORB.MaxRiskPct != 1.0 {
+		t.Errorf("default orb.max_risk_pct = %f, want 1.0", cfg.ORB.MaxRiskPct)
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func containsStr(slice []string, sub string) bool {

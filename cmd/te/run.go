@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
@@ -18,6 +19,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
+	"github.com/romeo-folie/trade-engine/internal/orb"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -39,7 +41,8 @@ manages signals and trades according to the active mode.
 Modes:
   manual  — signals are queued as pending; require approval
   auto    — signals that pass risk checks execute automatically
-  paper   — paper trades on Alpaca paper API (default)`,
+  paper   — paper trades on Alpaca paper API (default)
+  orb     — Opening Range Breakout mode (LLM-enhanced gap-and-go)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if runDetach {
 			return startDetachedRun()
@@ -159,6 +162,37 @@ Modes:
 			fmt.Println("\nTradeEngine stopping...")
 			cancel()
 		}()
+
+		// ORB mode: run the ORB scheduler instead of the normal engine loop.
+		if mode == "orb" {
+			if !cfg.ORB.Enabled {
+				return fmt.Errorf("ORB mode is disabled in config — set orb.enabled: true")
+			}
+
+			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
+			if !ok || alpacaClient == nil {
+				return fmt.Errorf("ORB mode requires Alpaca market data provider")
+			}
+
+			analyzer := analysis.NewAnalyzer(cfg.Models)
+			var orbNotifier orb.Notifier
+			if tgBot != nil {
+				orbNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
+
+			orbScheduler := orb.NewORBScheduler(
+				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
+				broker, nil, orbNotifier,
+			)
+
+			logger.Info("ORB scheduler starting")
+			fmt.Println("ORB mode active. Waiting for pre-market scan window...")
+			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
+				return fmt.Errorf("orb scheduler: %w", err)
+			}
+			fmt.Println("TradeEngine (ORB) stopped.")
+			return nil
+		}
 
 		if err := eng.Run(ctx); err != nil {
 			return err
@@ -352,8 +386,17 @@ func removePID() {
 	os.Remove(pidFilePath())
 }
 
+// orbTelegramNotifier adapts notify.TelegramBot to the orb.Notifier interface.
+type orbTelegramNotifier struct {
+	bot *notify.TelegramBot
+}
+
+func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
+	return n.bot.SendImmediate(ctx, msg)
+}
+
 func init() {
-	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper)")
+	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")
 }

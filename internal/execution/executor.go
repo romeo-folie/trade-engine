@@ -30,6 +30,12 @@ type OrderRequest struct {
 	LimitPrice float64 // 0 for market orders
 	StopPrice  float64 // for stop orders
 	TradeID    string  // internal trade UUID for linkage
+
+	// Bracket order fields (Phase 15 ORB). When OrderClass is "bracket",
+	// the broker submits a parent + take-profit + stop-loss as one atomic order.
+	OrderClass       string  // "" (simple) | "bracket"
+	TakeProfitPrice  float64 // limit price for take-profit leg
+	StopLossPrice    float64 // stop price for stop-loss leg
 }
 
 // OrderResult is the immediate response from the broker.
