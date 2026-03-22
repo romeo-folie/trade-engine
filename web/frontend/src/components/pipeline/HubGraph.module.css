@@ -1,8 +1,10 @@
+/* Dot grid lives on the wrapper (not the screen) since wrapper covers the full canvas area */
 .wrapper {
-  position: relative;
-  width: 100%;
-  height: 100%;
+  position: absolute;
+  inset: 0;
   background-color: var(--canvas-bg);
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1px);
+  background-size: 20px 20px;
 }
 
 /* React Flow canvas */

@@ -8,5 +8,14 @@
   margin-top: var(--topbar-height);
   margin-left: var(--sidebar-collapsed);
   flex: 1;
-  min-height: calc(100vh - var(--topbar-height));
+  height: calc(100vh - var(--topbar-height));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Outlet target — fill full height so screens with height:100% resolve correctly */
+.content > * {
+  flex: 1;
+  min-height: 0;
 }
