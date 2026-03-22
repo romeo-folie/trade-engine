@@ -338,6 +338,10 @@
   animation: pulse 2s ease-in-out infinite;
 }
 
+.pulseDotAmber {
+  background: var(--amber);
+}
+
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.3; }
@@ -381,13 +385,13 @@
 }
 
 /* Badge colors per event category */
-.badgeSignal { background: var(--amber); color: #111; }
+.badgeSignal { background: var(--amber); color: var(--canvas-bg); }
 .badgeModel { background: var(--blue); color: var(--text-primary); }
-.badgeCache { background: var(--accent); color: #111; }
-.badgeTrade { background: var(--emerald); color: #111; }
-.badgeRisk { background: var(--amber); color: #111; }
+.badgeCache { background: var(--accent); color: var(--canvas-bg); }
+.badgeTrade { background: var(--emerald); color: var(--canvas-bg); }
+.badgeRisk { background: var(--amber); color: var(--canvas-bg); }
 .badgeBlocked { background: var(--red); color: var(--text-primary); }
-.badgeDefault { background: var(--text-dim); color: #111; }
+.badgeDefault { background: var(--text-dim); color: var(--canvas-bg); }
 
 .logDesc {
   font-family: var(--font-mono);

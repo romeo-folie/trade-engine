@@ -21,8 +21,9 @@
   /* ── Accents ────────────────────────────────────────────────────────── */
   --accent:         #39FF14;   /* acid green — THE green */
   --accent-dim:     rgba(57, 255, 20, 0.15);
-  --accent-glow:    rgba(57, 255, 20, 0.15);
-  --accent-glow-lg: rgba(57, 255, 20, 0.08);
+  --accent-glow:        rgba(57, 255, 20, 0.15);
+  --accent-glow-lg:     rgba(57, 255, 20, 0.08);
+  --accent-glow-strong: rgba(57, 255, 20, 0.50); /* boot terminal title glow */
 
   /* ── Semantic ───────────────────────────────────────────────────────── */
   --emerald:        #22C55E;
