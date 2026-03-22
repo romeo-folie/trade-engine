@@ -101,7 +101,7 @@ export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: Pipel
   );
 
   return (
-    <div style={{ height: '100%', background: '#07060f' }}>
+    <div style={{ height: '100%', background: '#0D1117' }}>
       <GlowDefs />
       <ReactFlow
         nodes={flowNodes}
