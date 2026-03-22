@@ -231,6 +231,9 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 	// LLM-score each candidate
 	var scored []ScoredCandidate
 	for _, gap := range gaps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		// News fetching is a future enhancement — for now the LLM scores
 		// based on gap magnitude and pre-market volume alone.
 		var newsItems []prompts.ORBNewsItem
@@ -246,7 +249,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 			newsItems,
 		)
 
-		resp, _, err := s.analyzer.Analyze(ctx, analysis.AnalysisRequest{
+		resp, meta, err := s.analyzer.Analyze(ctx, analysis.AnalysisRequest{
 			Ticker:             gap.Ticker,
 			CustomSystemPrompt: sysPrompt,
 			CustomUserMessage:  userMsg,
@@ -256,11 +259,10 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 			continue
 		}
 
-		result := ORBAnalysisResult{
-			Action:     string(resp.Action),
-			Conviction: resp.Confidence,
-			Reasoning:  resp.Reasoning,
-		}
+		// Parse ORB-specific fields (catalyst_type, catalyst_quality, risks) from
+		// the raw LLM response. The standard AnalysisResponse doesn't carry these
+		// fields — they exist only in the ORB custom prompt schema.
+		result := parseORBResult(meta.RawResponse, resp)
 		scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
 	}
 
@@ -337,10 +339,12 @@ func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) err
 		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.cfg.RangeMinutes)
 	}
 	sessionID := s.session.ID
+	sessionCandidates := s.session.Candidates
+	sessionSelected := s.session.Selected
 	s.mu.Unlock()
 
 	// Only update status — preserve candidates and selected from previous state.
-	if err := store.UpdateORBSession(ctx, s.db, sessionID, "range_watch", s.session.Candidates, s.session.Selected); err != nil {
+	if err := store.UpdateORBSession(ctx, s.db, sessionID, "range_watch", sessionCandidates, sessionSelected); err != nil {
 		return fmt.Errorf("update session to range_watch: %w", err)
 	}
 	s.setState(StateRangeWatch)
@@ -376,8 +380,10 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 	if allLocked && len(s.rangeBuffers) > 0 {
 		s.mu.Lock()
 		sessionID := s.session.ID
+		sessionCandidates := s.session.Candidates
+		sessionSelected := s.session.Selected
 		s.mu.Unlock()
-		if err := store.UpdateORBSession(ctx, s.db, sessionID, "executing", s.session.Candidates, s.session.Selected); err != nil {
+		if err := store.UpdateORBSession(ctx, s.db, sessionID, "executing", sessionCandidates, sessionSelected); err != nil {
 			return fmt.Errorf("update session to executing: %w", err)
 		}
 		s.setState(StateExecuting)
@@ -498,6 +504,48 @@ func (s *ORBScheduler) notify(ctx context.Context, msg string) {
 		return
 	}
 	_ = s.notifier.Notify(ctx, msg)
+}
+
+// orbRawResponse is the full JSON schema returned by the ORB custom system prompt.
+type orbRawResponse struct {
+	Action          string   `json:"action"`
+	Conviction      float64  `json:"conviction"`
+	CatalystType    string   `json:"catalyst_type"`
+	CatalystQuality string   `json:"catalyst_quality"`
+	Reasoning       string   `json:"reasoning"`
+	Risks           []string `json:"risks"`
+}
+
+// parseORBResult extracts the full ORB analysis result from the raw LLM response.
+// Falls back to the standard AnalysisResponse fields when the raw JSON cannot be
+// parsed (e.g. the arbiter returned a transformed response).
+func parseORBResult(rawResponse string, fallback analysis.AnalysisResponse) ORBAnalysisResult {
+	// Strip markdown fences if present
+	raw := strings.TrimSpace(rawResponse)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+
+	var parsed orbRawResponse
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil &&
+		(parsed.Action == "trade" || parsed.Action == "skip") {
+		return ORBAnalysisResult{
+			Action:          parsed.Action,
+			Conviction:      parsed.Conviction,
+			CatalystType:    parsed.CatalystType,
+			CatalystQuality: parsed.CatalystQuality,
+			Reasoning:       parsed.Reasoning,
+			Risks:           parsed.Risks,
+		}
+	}
+
+	// Fallback: map standard AnalysisResponse fields
+	return ORBAnalysisResult{
+		Action:     string(fallback.Action),
+		Conviction: fallback.Confidence,
+		Reasoning:  fallback.Reasoning,
+	}
 }
 
 // IsTradingDay checks if the given time falls on a trading day.
