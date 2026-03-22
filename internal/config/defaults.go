@@ -124,25 +124,6 @@ func Defaults() *Config {
 				BaseURL:   "https://paper-api.alpaca.markets",
 				DataURL:   "https://data.alpaca.markets",
 			},
-			Predictions: PredictionsConfig{
-				Enabled: false,
-				Platforms: map[string]PredictionPlatform{
-					"polymarket": {
-						Enabled:      false,
-						APIKeyEnv:    "POLYMARKET_API_KEY",
-						Categories:   []string{"politics", "crypto"},
-						MinVolume:    50000,
-						MaxContracts: 20,
-					},
-					"kalshi": {
-						Enabled:      false,
-						APIKeyEnv:    "KALSHI_API_KEY",
-						Categories:   []string{"politics"},
-						MinVolume:    10000,
-						MaxContracts: 10,
-					},
-				},
-			},
 			News: NewsAPIConfig{
 				Provider:                     "finnhub",
 				APIKeyEnv:                    "FINNHUB_API_KEY",
@@ -181,11 +162,6 @@ func Defaults() *Config {
 				MinSentiment: 0.6,
 				MaxAgeHours:  48,
 			},
-			PredictionMispricing: PredictionMispricingConfig{
-				Enabled:   false,
-				MinEdge:   0.05,
-				MinVolume: 50000,
-			},
 		},
 		Risk: RiskConfig{
 			ConfidenceThreshold:  0.65,
@@ -199,12 +175,6 @@ func Defaults() *Config {
 			DefaultTakeProfitPct: 4.0,
 			SignalExpiryMin:      30,
 			StalePriceMovePct:    2.0,
-			Prediction: PredictionRiskConfig{
-				ConfidenceThreshold:      0.70, // stricter than stock default (0.65)
-				MaxSpread:                0.05, // 5% bid-ask spread cap
-				MinLiquidity:             1000, // minimum 24h volume (units are provider-dependent; Kalshi passes raw contract count)
-				MinTimeToResolutionHours: 4,    // at least 4h to resolution
-			},
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{

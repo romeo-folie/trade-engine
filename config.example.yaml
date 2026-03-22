@@ -133,21 +133,6 @@ markets:
     secret_env: ALPACA_API_SECRET
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
-  predictions:
-    enabled: false
-    platforms:
-      polymarket:
-        enabled: false
-        api_key_env: POLYMARKET_API_KEY
-        categories: [politics, crypto]
-        min_volume: 50000
-        max_contracts: 20
-      kalshi:
-        enabled: false
-        api_key_env: KALSHI_API_KEY
-        categories: [politics]
-        min_volume: 10000
-        max_contracts: 10
 
   news:
     provider: finnhub             # finnhub | benzinga
@@ -184,11 +169,6 @@ strategies:
     enabled: false
     min_sentiment: 0.6
     max_age_hours: 48
-  prediction_mispricing:
-    enabled: false
-    min_edge: 0.05
-    min_volume: 50000
-
 risk:
   confidence_threshold: 0.65   # Minimum LLM confidence to generate a signal
   min_risk_reward: 1.5         # Minimum R:R ratio required
@@ -201,16 +181,6 @@ risk:
   default_take_profit_pct: 4.0
   signal_expiry_min: 30        # Discard pending signals older than this
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
-
-  # Prediction-market-specific risk thresholds (PR #157).
-  # Baseline checks (confidence, position size, open positions, daily loss,
-  # drawdown, cooldown) fall through to parent risk values above.
-  # Set any threshold to 0 to disable that check individually.
-  prediction:
-    confidence_threshold: 0.70        # Stricter than stock default (0.65)
-    max_spread: 0.05                  # 5% bid-ask spread cap
-    min_liquidity: 1000               # Min 24h volume (provider units vary)
-    min_time_to_resolution_hours: 4   # Must be ≥4h from contract expiry
 
 # ── Analysis gate (cost-reduction Epics 1 & 2) ───────────────────────────────
 # Controls the pre-LLM material-change gate (zero token cost) and the optional

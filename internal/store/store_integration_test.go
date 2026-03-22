@@ -714,67 +714,6 @@ func TestPortfolio_GetClosedTradesByDateRange(t *testing.T) {
 	}
 }
 
-// ─── Predictions ─────────────────────────────────────────────────────────────
-
-func TestPrediction_SnapshotLifecycle(t *testing.T) {
-	ctx := context.Background()
-	const platform = "kalshi"
-	const contractID = "INTG-PRED-TEST-" + "001"
-
-	snap := data.ContractSnapshot{
-		Platform:      platform,
-		ContractID:    contractID,
-		ContractTitle: "Integration test contract",
-		Price:         0.65,
-		YesPrice:      0.65,
-		NoPrice:       0.35,
-		Volume24h:     10000.0,
-		OpenInterest:  50000.0,
-		Bid:           0.64,
-		Ask:           0.66,
-		ResolutionDeadline: time.Now().Add(30 * 24 * time.Hour),
-		Categories:    []string{"politics"},
-		CreatedAt:     time.Now(),
-	}
-
-	if err := store.InsertPredictionSnapshot(ctx, snap); err != nil {
-		t.Fatalf("InsertPredictionSnapshot: %v", err)
-	}
-
-	recent, err := store.GetRecentSnapshots(ctx, platform, contractID, 5)
-	if err != nil {
-		t.Fatalf("GetRecentSnapshots: %v", err)
-	}
-	if len(recent) == 0 {
-		t.Fatal("GetRecentSnapshots: expected at least 1 snapshot")
-	}
-
-	since := time.Now().Add(-1 * time.Minute)
-	sincSnaps, err := store.GetSnapshotsSince(ctx, platform, contractID, since)
-	if err != nil {
-		t.Fatalf("GetSnapshotsSince: %v", err)
-	}
-	if len(sincSnaps) == 0 {
-		t.Error("GetSnapshotsSince: expected at least 1 snapshot")
-	}
-
-	latest, err := store.GetLatestSnapshot(ctx, platform, contractID)
-	if err != nil {
-		t.Fatalf("GetLatestSnapshot: %v", err)
-	}
-	if latest == nil {
-		t.Fatal("GetLatestSnapshot: nil")
-	}
-	if latest.ContractID != contractID {
-		t.Errorf("ContractID: got %q, want %q", latest.ContractID, contractID)
-	}
-
-	resVal := true
-	if err := store.MarkContractResolved(ctx, platform, contractID, resVal); err != nil {
-		t.Fatalf("MarkContractResolved: %v", err)
-	}
-}
-
 // ─── Retention ────────────────────────────────────────────────────────────────
 
 func TestRetention_CleanupNoError(t *testing.T) {

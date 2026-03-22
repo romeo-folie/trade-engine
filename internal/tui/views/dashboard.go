@@ -95,12 +95,9 @@ func deriveCashAndTotal(initialCapital, costBasis, invested float64) (cash, tota
 // Returns zero-value DashboardData on errors (TUI stays functional).
 // Safe to call when no database is connected — returns defaults.
 //
-// includePredictions controls visibility of prediction strategy rows in
-// dashboard positions + signal feeds (used by issue #145).
-//
 // initialCapital is the engine.initial_capital config value; it is used to
 // derive Cash (initial_capital minus open position cost bases) and TotalValue.
-func FetchDashboardData(ctx context.Context, mode string, includePredictions bool, initialCapital float64) (d DashboardData) {
+func FetchDashboardData(ctx context.Context, mode string, initialCapital float64) (d DashboardData) {
 	d = DashboardData{
 		Mode:       mode,
 		PaperMode:  mode == "paper",
@@ -146,10 +143,6 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 			// Cost basis is always entryPrice×qty regardless of direction.
 			totalCostBasis += t.EntryPrice * t.Quantity
 
-			if !includePredictions && t.Strategy == "prediction_mispricing" {
-				continue
-			}
-
 			visibleInvested += posValue
 			if posValue > largestVisiblePosValue {
 				largestVisiblePosValue = posValue
@@ -180,9 +173,6 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 		pending, err := store.GetPendingSignals(ctx)
 		if err == nil {
 			for _, s := range pending {
-				if !includePredictions && s.Strategy == "prediction_mispricing" {
-					continue
-				}
 				d.PendingSignals = append(d.PendingSignals, SignalRow{
 					ID:         s.ID,
 					Ticker:     s.Ticker,
@@ -197,7 +187,7 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	}
 
 	// Recent signals summary (last 20, global across all tickers/statuses)
-	recent, err := store.GetRecentSignals(ctx, 20, includePredictions)
+	recent, err := store.GetRecentSignals(ctx, 20)
 	if err == nil {
 		for _, s := range recent {
 			d.RecentSignals = append(d.RecentSignals, SignalRow{
@@ -231,23 +221,11 @@ func FetchDashboardData(ctx context.Context, mode string, includePredictions boo
 	if err == nil {
 		d.Watchlist = make([]string, 0, len(watchlist))
 		for _, item := range watchlist {
-			if !includePredictions && (item.Platform == "polymarket" || item.Platform == "kalshi" || containsStrategy(item.Strategies, "prediction_mispricing")) {
-				continue
-			}
 			d.Watchlist = append(d.Watchlist, item.Ticker)
 		}
 	}
 
 	return d
-}
-
-func containsStrategy(strategies []string, target string) bool {
-	for _, s := range strategies {
-		if s == target {
-			return true
-		}
-	}
-	return false
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────

@@ -115,8 +115,6 @@ func pipelineNodes() []NodeState {
 	return []NodeState{
 		// ── Source nodes ──────────────────────────────────────────────────
 		{ID: "alpaca", Label: "Alpaca", Kind: "source"},
-		{ID: "polymarket", Label: "Polymarket", Kind: "source"},
-		{ID: "kalshi", Label: "Kalshi", Kind: "source"},
 		{ID: "news_api", Label: "News (Finnhub/Benzinga)", Kind: "source"},
 
 		// ── Processing nodes ──────────────────────────────────────────────

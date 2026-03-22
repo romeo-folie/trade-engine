@@ -384,9 +384,8 @@ type ConsensusConfig struct {
 // ── Markets ───────────────────────────────────────────────────────────────────
 
 type MarketsConfig struct {
-	Stocks      StocksConfig      `yaml:"stocks"`
-	Predictions PredictionsConfig `yaml:"predictions"`
-	News        NewsAPIConfig     `yaml:"news"`
+	Stocks StocksConfig  `yaml:"stocks"`
+	News   NewsAPIConfig `yaml:"news"`
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).
@@ -415,28 +414,13 @@ type StocksConfig struct {
 	DataURL   string `yaml:"data_url"`
 }
 
-type PredictionsConfig struct {
-	Enabled   bool                          `yaml:"enabled"`
-	Platforms map[string]PredictionPlatform `yaml:"platforms"`
-}
-
-type PredictionPlatform struct {
-	Enabled      bool     `yaml:"enabled"`
-	APIKeyEnv    string   `yaml:"api_key_env"`
-	APIKey       string   `yaml:"-"`
-	Categories   []string `yaml:"categories"`
-	MinVolume    float64  `yaml:"min_volume"`
-	MaxContracts int      `yaml:"max_contracts"`
-}
-
 // ── Strategies ────────────────────────────────────────────────────────────────
 
 type StrategiesConfig struct {
-	TrendFollowing       TrendFollowingConfig       `yaml:"trend_following"`
-	MeanReversion        MeanReversionConfig        `yaml:"mean_reversion"`
-	Momentum             MomentumConfig             `yaml:"momentum"`
-	NewsSentiment        NewsSentimentConfig        `yaml:"news_sentiment"`
-	PredictionMispricing PredictionMispricingConfig `yaml:"prediction_mispricing"`
+	TrendFollowing TrendFollowingConfig `yaml:"trend_following"`
+	MeanReversion  MeanReversionConfig  `yaml:"mean_reversion"`
+	Momentum       MomentumConfig       `yaml:"momentum"`
+	NewsSentiment  NewsSentimentConfig  `yaml:"news_sentiment"`
 }
 
 type TrendFollowingConfig struct {
@@ -469,49 +453,20 @@ type NewsSentimentConfig struct {
 	MaxAgeHours  int     `yaml:"max_age_hours"`
 }
 
-type PredictionMispricingConfig struct {
-	Enabled   bool    `yaml:"enabled"`
-	MinEdge   float64 `yaml:"min_edge"`
-	MinVolume float64 `yaml:"min_volume"`
-}
-
 // ── Risk ─────────────────────────────────────────────────────────────────────
 
 type RiskConfig struct {
-	ConfidenceThreshold  float64              `yaml:"confidence_threshold"`
-	MinRiskReward        float64              `yaml:"min_risk_reward"`
-	MaxPositionPct       float64              `yaml:"max_position_pct"`
-	MaxOpenPositions     int                  `yaml:"max_open_positions"`
-	DailyLossLimitPct    float64              `yaml:"daily_loss_limit_pct"`
-	MaxDrawdownPct       float64              `yaml:"max_drawdown_pct"`
-	CooldownAfterLoss    int                  `yaml:"cooldown_after_loss_min"`
-	DefaultStopLossPct   float64              `yaml:"default_stop_loss_pct"`
-	DefaultTakeProfitPct float64              `yaml:"default_take_profit_pct"`
-	SignalExpiryMin      int                  `yaml:"signal_expiry_min"`
-	StalePriceMovePct    float64              `yaml:"stale_price_move_pct"`
-	Prediction           PredictionRiskConfig `yaml:"prediction"`
-}
-
-// PredictionRiskConfig holds risk thresholds specific to prediction market signals.
-// Baseline checks (confidence, position size, open positions, daily loss, drawdown,
-// cooldown) reuse the parent RiskConfig values; this block adds prediction-specific gates.
-type PredictionRiskConfig struct {
-	// ConfidenceThreshold overrides RiskConfig.ConfidenceThreshold for prediction
-	// signals.  Zero means fall back to the parent threshold.
-	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
-
-	// MaxSpread is the maximum acceptable bid-ask spread as a fraction of mid-price
-	// (e.g. 0.05 = 5%).  Zero disables the check.
-	MaxSpread float64 `yaml:"max_spread"`
-
-	// MinLiquidity is the minimum 24h volume required for a contract to be traded.
-	// Zero disables the check.
-	MinLiquidity float64 `yaml:"min_liquidity"`
-
-	// MinTimeToResolutionHours is the minimum time remaining before contract
-	// resolution, in hours.  Contracts expiring sooner than this are blocked.
-	// Zero disables the check.
-	MinTimeToResolutionHours float64 `yaml:"min_time_to_resolution_hours"`
+	ConfidenceThreshold  float64 `yaml:"confidence_threshold"`
+	MinRiskReward        float64 `yaml:"min_risk_reward"`
+	MaxPositionPct       float64 `yaml:"max_position_pct"`
+	MaxOpenPositions     int     `yaml:"max_open_positions"`
+	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
+	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
+	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`
+	DefaultStopLossPct   float64 `yaml:"default_stop_loss_pct"`
+	DefaultTakeProfitPct float64 `yaml:"default_take_profit_pct"`
+	SignalExpiryMin      int     `yaml:"signal_expiry_min"`
+	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
@@ -823,14 +778,6 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("env var %s (markets.stocks.api_key_env) is not set", cfg.Markets.Stocks.APIKeyEnv))
 	}
 
-	if !cfg.Markets.Predictions.Enabled {
-		for name, p := range cfg.Markets.Predictions.Platforms {
-			if p.Enabled {
-				errs = append(errs, fmt.Sprintf("markets.predictions.platforms.%s.enabled=true while markets.predictions.enabled=false", name))
-			}
-		}
-	}
-
 	if cfg.Markets.News.ExtractionEnabled {
 		if cfg.Markets.News.ExtractionRPM <= 0 {
 			errs = append(errs, "markets.news.extraction_rpm must be > 0 when extraction is enabled")
@@ -884,10 +831,6 @@ func resolveEnvVars(cfg *Config) {
 	cfg.Markets.News.APIKey = resolveEnv(cfg.Markets.News.APIKeyEnv)
 	cfg.Notifications.Telegram.BotToken = resolveEnv(cfg.Notifications.Telegram.BotTokenEnv)
 	cfg.Embeddings.APIKey = resolveEnv(cfg.Embeddings.APIKeyEnv)
-	for k, p := range cfg.Markets.Predictions.Platforms {
-		p.APIKey = resolveEnv(p.APIKeyEnv)
-		cfg.Markets.Predictions.Platforms[k] = p
-	}
 }
 
 func resolveEnv(key string) string {

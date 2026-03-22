@@ -13,7 +13,7 @@ import (
 // Entity mirrors the entities table row.
 type Entity struct {
 	ID          string
-	EntityType  string // company | sector | person | country | commodity | event | prediction_contract | index
+	EntityType  string // company | sector | person | country | commodity | event | index
 	Name        string
 	Ticker      string
 	Description string

@@ -38,8 +38,7 @@ type AnalysisRequest struct {
 	Portfolio PortfolioContext
 
 	// CustomSystemPrompt and CustomUserMessage bypass the stock prompt builder
-	// when set (e.g. prediction market analysis uses pre-built prompts).
-	// If either is non-empty the adapter must use them directly.
+	// when set. If either is non-empty the adapter must use them directly.
 	CustomSystemPrompt string
 	CustomUserMessage  string
 

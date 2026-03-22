@@ -19,7 +19,7 @@ import (
 type FingerprintInput struct {
 	// Identity dimensions — exact match required.
 	Ticker          string
-	AssetClass      string // "stock" | "prediction"
+	AssetClass      string // "stock"
 	Timeframe       string
 	StrategyName    string
 	StrategyVersion string // bumped when prompt template changes

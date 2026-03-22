@@ -65,7 +65,7 @@ func (c *AnthropicClient) IsAvailable() bool    { return c.apiKey != "" }
 func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
 	var systemPrompt, userMessage string
 	if req.CustomSystemPrompt != "" || req.CustomUserMessage != "" {
-		// Prediction market (or other custom) analysis — use pre-built prompts directly.
+		// Custom analysis — use pre-built prompts directly.
 		systemPrompt = req.CustomSystemPrompt
 		userMessage = req.CustomUserMessage
 	} else {
