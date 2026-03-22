@@ -95,6 +95,7 @@ export default function BootScreen({ status }: BootScreenProps) {
   >([]);
 
   useEffect(() => {
+    setVisibleLogs([]);
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     let count = 0;
