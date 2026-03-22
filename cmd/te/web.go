@@ -41,10 +41,13 @@ func runWebCmd(cmd *cobra.Command, _ []string) error {
 	defer stop()
 
 	// Connect to the database (needed for REST API drill-down endpoints).
+	// Non-fatal: if DATABASE_URL is unset or unreachable, the UI still loads
+	// but historical data endpoints return empty results.
 	if err := store.Connect(ctx); err != nil {
-		return fmt.Errorf("database connection failed: %w\n(Is DATABASE_URL set?)", err)
+		cmd.PrintErrf("Warning: database unavailable — REST API will return empty results (%v)\n", err)
+	} else {
+		defer store.Close()
 	}
-	defer store.Close()
 
 	bus := events.New()
 

@@ -312,8 +312,16 @@ func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 			return
 		}
 		if cleaned == "/" {
-			r.URL.Path = "/index.html"
-			fileServer.ServeHTTP(w, r)
+			// Serve index.html directly — FileServer would 301-redirect "/" → "./"
+			// when it detects a directory, causing an infinite redirect loop in browsers.
+			data, err := fs.ReadFile(root, "index.html")
+			if err != nil {
+				http.Error(w, "index.html not found", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(data)
 			return
 		}
 		// Strip leading slash for fs.Stat (fs.FS paths must not start with /).
