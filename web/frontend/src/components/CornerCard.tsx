@@ -42,7 +42,7 @@ export default function CornerCard({
 
   // CSS custom props drive bracket size/colour so all 4 spans share one rule
   const cssVars: CSSProperties = {
-    '--bracket-color': bracketColor ?? 'rgba(57,255,20,0.4)',
+    '--bracket-color': bracketColor ?? '#39FF14',
     '--bracket-size': `${bracketSize}px`,
     '--bracket-width': `${bracketWidth}px`,
     ...style,

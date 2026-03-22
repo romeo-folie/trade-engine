@@ -105,7 +105,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
   return (
     <CornerCard
-      bracketColor={showBrackets ? `rgba(${hexToRgb(bracketColor)},${isBypassed ? 0.2 : 0.6})` : undefined}
+      bracketColor={showBrackets ? (isBypassed ? `rgba(${hexToRgb(bracketColor)},0.2)` : bracketColor) : undefined}
       hideBrackets={!showBrackets}
       bracketSize={10}
       bracketWidth={1}
