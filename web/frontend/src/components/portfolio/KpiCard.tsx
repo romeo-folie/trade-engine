@@ -1,3 +1,4 @@
+import CornerCard from '../CornerCard';
 import styles from './KpiCard.module.css';
 
 interface KpiCardProps {
@@ -5,27 +6,32 @@ interface KpiCardProps {
   value: string;
   /** CSS color for the value text (CSS variable or TOKENS.* hex value) */
   valueColor?: string;
-  /** Prominent card gets acid-green border + larger font */
+  /** Prominent card gets acid-green full border + larger font */
   prominent?: boolean;
 }
 
 /**
  * KPI card — matches portfolio-overview.png design.
- * Uses corner bracket accents (⌐ top-left / ¬ bottom-right) per the design system,
- * consistent with PipelineNodeCard analyst nodes. NOT chamfer clip-path.
+ *
+ * Normal state:  4 corner L-bracket marks (no outer border).
+ * Prominent state: full acid-green perimeter border (active variant).
  */
 export default function KpiCard({ label, value, valueColor, prominent }: KpiCardProps) {
-  const cls = [styles.card];
-  if (prominent) cls.push(styles.prominent);
-
   return (
-    <div className={cls.join(' ')}>
-      <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-      <span className={styles.bracketBR} aria-hidden="true">¬</span>
+    <CornerCard
+      active={prominent}
+      bracketColor="#39FF14"
+      bracketSize={10}
+      bracketWidth={1}
+      className={`${styles.card} ${prominent ? styles.prominent : ''}`}
+    >
       <span className={styles.label}>{label}</span>
-      <span className={styles.value} style={valueColor ? { color: valueColor } : undefined}>
+      <span
+        className={styles.value}
+        style={valueColor ? { color: valueColor } : undefined}
+      >
         {value}
       </span>
-    </div>
+    </CornerCard>
   );
 }

@@ -1,0 +1,50 @@
+/**
+ * CornerCard — corner bracket card base.
+ *
+ * Renders a TL + BR diagonal bracket pair (┌ … ┘).
+ * Each arm length and width driven by CSS custom props
+ * --bracket-size (default 10px) and --bracket-width (default 1px).
+ * Bracket colour: --bracket-color (default #39FF14).
+ *
+ * NO outer box-border. The bracket spans alone define the card edge.
+ * `active` state: full green perimeter outline (brackets hidden).
+ */
+
+.card {
+  position: relative;
+  /* default bracket token values (overridable via inline style) */
+  --bracket-color:  #39FF14;
+  --bracket-size:   10px;
+  --bracket-width:  1px;
+}
+
+/* active variant: full green perimeter (brackets not rendered when active=true) */
+.active {
+  outline: 1px solid var(--accent, #39FF14);
+  box-shadow: 0 0 8px rgba(57, 255, 20, 0.2);
+}
+
+/* ── Base span ─────────────────────────────────────────────────────────── */
+.b {
+  position: absolute;
+  width:  var(--bracket-size);
+  height: var(--bracket-size);
+  pointer-events: none;
+  display: block;
+}
+
+/* ── Top-left: ┌  (border-top + border-left) ─────────────────────────── */
+.bTL {
+  top: 0;
+  left: 0;
+  border-top:  var(--bracket-width) solid var(--bracket-color);
+  border-left: var(--bracket-width) solid var(--bracket-color);
+}
+
+/* ── Bottom-right: ┘  (border-bottom + border-right) ─────────────────── */
+.bBR {
+  bottom: 0;
+  right: 0;
+  border-bottom: var(--bracket-width) solid var(--bracket-color);
+  border-right:  var(--bracket-width) solid var(--bracket-color);
+}

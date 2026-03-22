@@ -32,13 +32,11 @@
   text-transform: uppercase;
 }
 
-/* Pipeline node card */
+/* Pipeline node card — no outer border; CornerCard provides bracket marks */
 .card {
-  position: relative;
   width: 220px;
   height: 120px;
   background: var(--card-bg);
-  border: 1px solid var(--border);
   /* Chamfer top-right 6px */
   clip-path: polygon(
     0 0,
@@ -50,10 +48,9 @@
   cursor: pointer;
   outline: none;
   overflow: hidden;
-  transition: border-color 0.2s, box-shadow 0.2s;
+  transition: box-shadow 0.2s;
 }
 .card:hover {
-  border-color: var(--accent);
   box-shadow: 0 0 8px var(--accent-glow);
 }
 .card:focus-visible {
@@ -72,27 +69,7 @@
   height: 100%;
 }
 
-/* Corner bracket glyphs */
-.bracketTL {
-  position: absolute;
-  top: 4px;
-  left: 5px;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  line-height: 1;
-  user-select: none;
-  pointer-events: none;
-}
-.bracketBR {
-  position: absolute;
-  bottom: 4px;
-  right: 5px;
-  font-family: var(--font-mono);
-  font-size: 14px;
-  line-height: 1;
-  user-select: none;
-  pointer-events: none;
-}
+/* (brackets suppressed via hideBrackets prop on structural nodes) */
 
 /* Inner content (padded away from strip) */
 .inner {

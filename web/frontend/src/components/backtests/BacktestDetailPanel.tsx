@@ -7,6 +7,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { fmtPrice } from '../../utils/format';
 import EquityCurve from '../portfolio/EquityCurve';
+import CornerCard from '../CornerCard';
 import type { BacktestRun, BacktestTrade } from '../../screens/Backtests';
 import styles from './BacktestDetailPanel.module.css';
 
@@ -149,34 +150,26 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Stats grid */}
+          {/* Stats grid — corner brackets at card edge, no outer border */}
           <div className={styles.statsGrid}>
-            <div className={styles.statCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+            <CornerCard className={styles.statCard}>
               <span className={styles.statLabel}>Return</span>
               <span className={`${styles.statValue} ${run.TotalReturnPct != null && run.TotalReturnPct >= 0 ? styles.emerald : styles.red}`}>
                 {fmtPct(run.TotalReturnPct)}
               </span>
-            </div>
-            <div className={styles.statCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+            </CornerCard>
+            <CornerCard className={styles.statCard}>
               <span className={styles.statLabel}>Win Rate</span>
               <span className={styles.statValue}>{fmtPct(run.WinRatePct)}</span>
-            </div>
-            <div className={styles.statCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+            </CornerCard>
+            <CornerCard className={styles.statCard}>
               <span className={styles.statLabel}>Max DD</span>
               <span className={`${styles.statValue} ${styles.red}`}>{fmtDrawdown(run.MaxDrawdownPct)}</span>
-            </div>
-            <div className={styles.statCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
+            </CornerCard>
+            <CornerCard className={styles.statCard}>
               <span className={styles.statLabel}>Sharpe</span>
               <span className={styles.statValue}>{run.SharpeRatio != null ? run.SharpeRatio.toFixed(2) : '—'}</span>
-            </div>
+            </CornerCard>
           </div>
 
           {/* Equity curve */}
