@@ -77,7 +77,7 @@
 }
 
 .badgePending {
-  color: #111;
+  color: var(--canvas-bg);
   background: var(--amber);
   border-color: var(--amber);
 }
@@ -89,7 +89,7 @@
 }
 
 .badgeExecuted {
-  color: #111;
+  color: var(--canvas-bg);
   background: var(--accent);
   border-color: var(--accent);
 }
