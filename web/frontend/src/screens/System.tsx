@@ -373,7 +373,7 @@ export default function SystemScreen() {
           <div className={styles.sectionHeader}>
             <span className={styles.sectionTitle}>ENGINE ACTIVITY</span>
             <span className={wsStatus === 'connected' ? styles.liveIndicator : styles.livePolling}>
-              <span className={styles.pulseDot} style={wsStatus !== 'connected' ? { background: 'var(--amber)' } : undefined} />
+              <span className={`${styles.pulseDot}${wsStatus !== 'connected' ? ` ${styles.pulseDotAmber}` : ''}`} />
               {wsStatus === 'connected' ? 'LIVE' : 'POLLING'}
             </span>
           </div>
