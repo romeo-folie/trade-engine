@@ -3,7 +3,7 @@
 .screen {
   position: fixed;
   inset: 0;
-  background: #000000;
+  background: var(--canvas-bg);
   display: flex;
   align-items: center;
   justify-content: flex-start;

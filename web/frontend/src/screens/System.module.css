@@ -25,7 +25,7 @@
 }
 
 .breadcrumbBrand {
-  color: #4FD1C5;
+  color: var(--cyan);
 }
 
 .breadcrumbSep,
@@ -199,6 +199,8 @@
 .kpiGreen { color: var(--emerald); }
 .kpiAmber { color: var(--amber); }
 .kpiRed { color: var(--red); }
+.kpiAccent { color: var(--accent); }
+.amber { color: var(--amber); }
 
 /* ── Two-column main ──────────────────────────────────────────────────────── */
 
@@ -314,7 +316,17 @@
   gap: 6px;
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--emerald);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.livePolling {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--amber);
   font-weight: 700;
 }
 
@@ -322,7 +334,7 @@
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--emerald);
+  background: var(--accent);
   animation: pulse 2s ease-in-out infinite;
 }
 
@@ -363,20 +375,19 @@
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #fff;
   white-space: nowrap;
   min-width: 60px;
   text-align: center;
 }
 
 /* Badge colors per event category */
-.badgeSignal { background: #CA8A04; }
-.badgeModel { background: #3B82F6; }
-.badgeCache { background: #0D9488; }
-.badgeTrade { background: #16A34A; }
-.badgeRisk { background: #D97706; }
-.badgeBlocked { background: #DC2626; }
-.badgeDefault { background: var(--text-dim); }
+.badgeSignal { background: var(--amber); color: #111; }
+.badgeModel { background: var(--blue); color: var(--text-primary); }
+.badgeCache { background: var(--accent); color: #111; }
+.badgeTrade { background: var(--emerald); color: #111; }
+.badgeRisk { background: var(--amber); color: #111; }
+.badgeBlocked { background: var(--red); color: var(--text-primary); }
+.badgeDefault { background: var(--text-dim); color: #111; }
 
 .logDesc {
   font-family: var(--font-mono);

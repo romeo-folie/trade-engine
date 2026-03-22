@@ -25,7 +25,7 @@
 }
 
 .breadcrumbBrand {
-  color: #4FD1C5;
+  color: var(--cyan);
 }
 
 .breadcrumbSep,
@@ -149,7 +149,7 @@
 
 .pillGreen {
   background: var(--emerald);
-  color: #0A0A0D;
+  color: var(--canvas-bg);
   border-color: var(--emerald);
 }
 
@@ -161,7 +161,7 @@
 
 .pillRed {
   background: var(--red);
-  color: #0A0A0D;
+  color: var(--canvas-bg);
   border-color: var(--red);
 }
 
@@ -173,7 +173,7 @@
 
 .pillAmber {
   background: var(--amber);
-  color: #0A0A0D;
+  color: var(--canvas-bg);
   border-color: var(--amber);
 }
 
