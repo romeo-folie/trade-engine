@@ -262,5 +262,14 @@ func Defaults() *Config {
 			// in Load) so first-run saves write the correct profile-driven value.
 			CacheTTLMin: 0,
 		},
+		ORB: ORBConfig{
+			Mode:              "paper",
+			GapThresholdPct:   3.0,
+			MaxCandidates:     2,
+			RangeMinutes:      15,
+			RiskReward:        2.0,
+			MaxRiskPct:        1.0,
+			NewsLookbackHours: 24,
+		},
 	}
 }

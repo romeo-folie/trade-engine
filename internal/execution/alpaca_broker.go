@@ -56,6 +56,15 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if req.StopPrice > 0 {
 		body["stop_price"] = fmt.Sprintf("%.4f", req.StopPrice)
 	}
+	if req.OrderClass == "bracket" {
+		body["order_class"] = "bracket"
+		body["take_profit"] = map[string]string{
+			"limit_price": fmt.Sprintf("%.4f", req.TakeProfitPrice),
+		}
+		body["stop_loss"] = map[string]string{
+			"stop_price": fmt.Sprintf("%.4f", req.StopLossPrice),
+		}
+	}
 
 	var resp struct {
 		ID          string `json:"id"`

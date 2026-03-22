@@ -1,0 +1,563 @@
+package orb
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
+)
+
+// nyLoc is the US/Eastern timezone for ORB time gates.
+var nyLoc = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		loc = time.FixedZone("EST", -5*60*60)
+	}
+	return loc
+}()
+
+// State represents the ORB scheduler's current phase.
+type State string
+
+const (
+	StateIdle           State = "idle"
+	StateScanning       State = "scanning"
+	StateCandidateReady State = "candidate_ready"
+	StateRangeWatch     State = "range_watch"
+	StateExecuting      State = "executing"
+	StateDone           State = "done"
+)
+
+// ScoredCandidate pairs a gap mover with its LLM analysis result.
+type ScoredCandidate struct {
+	Gap   data.GapCandidate `json:"gap"`
+	Score ORBAnalysisResult `json:"score"`
+}
+
+// PortfolioValuer provides the current portfolio value for position sizing.
+type PortfolioValuer interface {
+	PortfolioValue() float64
+}
+
+// Notifier delivers ORB notifications (e.g. Telegram).
+type Notifier interface {
+	Notify(ctx context.Context, msg string) error
+}
+
+// ORBScheduler implements the time-gated ORB state machine.
+type ORBScheduler struct {
+	cfg        config.ORBConfig
+	db         *pgxpool.Pool
+	marketData *data.AlpacaClient
+	analyzer   *analysis.Analyzer
+	executor   execution.Executor
+	portfolio  PortfolioValuer
+	notifier   Notifier
+	now        func() time.Time // injectable for tests
+
+	mu           sync.Mutex // protects state, session, candidates for TUI reads
+	state        State
+	session      *store.ORBSession
+	candidates   []ScoredCandidate
+	rangeBuffers map[string]*RangeBuffer
+	orderIDs     map[string]string // ticker → orderID
+}
+
+// NewORBScheduler creates a new ORB scheduler.
+func NewORBScheduler(
+	cfg config.ORBConfig,
+	db *pgxpool.Pool,
+	marketData *data.AlpacaClient,
+	analyzer *analysis.Analyzer,
+	executor execution.Executor,
+	portfolio PortfolioValuer,
+	notifier Notifier,
+) *ORBScheduler {
+	return &ORBScheduler{
+		cfg:          cfg,
+		db:           db,
+		marketData:   marketData,
+		analyzer:     analyzer,
+		executor:     executor,
+		portfolio:    portfolio,
+		notifier:     notifier,
+		now:          time.Now,
+		state:        StateIdle,
+		rangeBuffers: make(map[string]*RangeBuffer),
+		orderIDs:     make(map[string]string),
+	}
+}
+
+// Run starts the ORB scheduler loop. Blocks until ctx is cancelled.
+func (s *ORBScheduler) Run(ctx context.Context) error {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if err := s.tick(ctx); err != nil {
+				fmt.Printf("orb tick error: %v\n", err)
+			}
+		}
+	}
+}
+
+// CurrentState returns the current scheduler state (thread-safe for TUI reads).
+func (s *ORBScheduler) CurrentState() State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state
+}
+
+// Session returns the current session (thread-safe for TUI reads).
+func (s *ORBScheduler) Session() *store.ORBSession {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.session
+}
+
+// Candidates returns the current scored candidates (thread-safe for TUI reads).
+func (s *ORBScheduler) Candidates() []ScoredCandidate {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]ScoredCandidate, len(s.candidates))
+	copy(out, s.candidates)
+	return out
+}
+
+func (s *ORBScheduler) tick(ctx context.Context) error {
+	s.mu.Lock()
+	state := s.state
+	s.mu.Unlock()
+
+	now := s.now()
+	et := now.In(nyLoc)
+
+	switch state {
+	case StateIdle:
+		return s.tickIdle(ctx, et)
+	case StateScanning:
+		return s.tickScanning(ctx)
+	case StateCandidateReady:
+		return s.tickCandidateReady(ctx, et)
+	case StateRangeWatch:
+		return s.tickRangeWatch(ctx, et)
+	case StateExecuting:
+		return s.tickExecuting(ctx)
+	case StateDone:
+		return s.tickDone(ctx, et)
+	}
+	return nil
+}
+
+func (s *ORBScheduler) setState(state State) {
+	s.mu.Lock()
+	s.state = state
+	s.mu.Unlock()
+}
+
+func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
+	if et.Weekday() == time.Saturday || et.Weekday() == time.Sunday {
+		return nil
+	}
+	h, m, _ := et.Clock()
+	etMinutes := h*60 + m
+	if etMinutes < 6*60 {
+		return nil
+	}
+
+	today := time.Date(et.Year(), et.Month(), et.Day(), 0, 0, 0, 0, nyLoc)
+	existing, err := store.GetORBSessionByDate(ctx, s.db, today)
+	if err == nil && existing != nil {
+		if existing.Status == "done" || existing.Status == "skipped" {
+			return nil
+		}
+		s.mu.Lock()
+		s.session = existing
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	hasSession := s.session != nil
+	s.mu.Unlock()
+
+	if !hasSession {
+		session, err := store.CreateORBSession(ctx, s.db, today)
+		if err != nil {
+			return fmt.Errorf("create orb session: %w", err)
+		}
+		s.mu.Lock()
+		s.session = session
+		s.mu.Unlock()
+	}
+
+	s.setState(StateScanning)
+	return nil
+}
+
+func (s *ORBScheduler) tickScanning(ctx context.Context) error {
+	gaps, err := data.FetchGapMovers(ctx, s.marketData, s.cfg.GapThresholdPct)
+	if err != nil {
+		return fmt.Errorf("scan gap movers: %w", err)
+	}
+
+	if len(gaps) == 0 {
+		s.notify(ctx, "ORB: No qualifying gap candidates today. Engine idle until tomorrow.")
+		s.setState(StateDone)
+		s.mu.Lock()
+		session := s.session
+		s.mu.Unlock()
+		if session != nil {
+			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
+				return fmt.Errorf("update session to skipped: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// LLM-score each candidate
+	var scored []ScoredCandidate
+	for _, gap := range gaps {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// News fetching is a future enhancement — for now the LLM scores
+		// based on gap magnitude and pre-market volume alone.
+		var newsItems []prompts.ORBNewsItem
+
+		sysPrompt, userMsg := prompts.BuildORBPrompt(
+			prompts.ORBCandidate{
+				Ticker:        gap.Ticker,
+				GapPct:        gap.GapPct,
+				PreMarketVol:  gap.PreMarketVol,
+				PreMarketLast: gap.PreMarketLast,
+				PriorClose:    gap.PriorClose,
+			},
+			newsItems,
+		)
+
+		resp, meta, err := s.analyzer.Analyze(ctx, analysis.AnalysisRequest{
+			Ticker:             gap.Ticker,
+			CustomSystemPrompt: sysPrompt,
+			CustomUserMessage:  userMsg,
+		})
+		if err != nil {
+			fmt.Printf("orb: LLM scoring %s failed: %v\n", gap.Ticker, err)
+			continue
+		}
+
+		// Parse ORB-specific fields (catalyst_type, catalyst_quality, risks) from
+		// the raw LLM response. The standard AnalysisResponse doesn't carry these
+		// fields — they exist only in the ORB custom prompt schema.
+		result := parseORBResult(meta.RawResponse, resp)
+		scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
+	}
+
+	// Filter to "trade" or "BUY" actions, sort by conviction, take top N
+	var selected []ScoredCandidate
+	for _, sc := range scored {
+		if strings.EqualFold(sc.Score.Action, "trade") || strings.EqualFold(sc.Score.Action, "BUY") {
+			selected = append(selected, sc)
+		}
+	}
+
+	// Sort by conviction descending
+	for i := 0; i < len(selected); i++ {
+		for j := i + 1; j < len(selected); j++ {
+			if selected[j].Score.Conviction > selected[i].Score.Conviction {
+				selected[i], selected[j] = selected[j], selected[i]
+			}
+		}
+	}
+
+	if len(selected) > s.cfg.MaxCandidates {
+		selected = selected[:s.cfg.MaxCandidates]
+	}
+
+	s.mu.Lock()
+	sessionID := s.session.ID
+	s.mu.Unlock()
+
+	candidatesJSON, _ := json.Marshal(scored)
+
+	if len(selected) == 0 {
+		s.notify(ctx, "ORB: Scanned candidates but none passed LLM catalyst filter. Engine idle until tomorrow.")
+		s.setState(StateDone)
+		if err := store.UpdateORBSession(ctx, s.db, sessionID, "skipped", candidatesJSON, nil); err != nil {
+			return fmt.Errorf("update session to skipped: %w", err)
+		}
+		return nil
+	}
+
+	s.mu.Lock()
+	s.candidates = selected
+	s.mu.Unlock()
+
+	var selectedTickers []string
+	for _, sc := range selected {
+		selectedTickers = append(selectedTickers, sc.Gap.Ticker)
+	}
+	if err := store.UpdateORBSession(ctx, s.db, sessionID, "candidate_ready", candidatesJSON, selectedTickers); err != nil {
+		return fmt.Errorf("update session to candidate_ready: %w", err)
+	}
+
+	var sb strings.Builder
+	sb.WriteString("ORB Scan Complete:\n")
+	for _, sc := range selected {
+		sb.WriteString(fmt.Sprintf("  %s: gap %+.1f%%, conviction %.0f%%, %s\n",
+			sc.Gap.Ticker, sc.Gap.GapPct, sc.Score.Conviction*100, sc.Score.Reasoning))
+	}
+	s.notify(ctx, sb.String())
+
+	s.setState(StateCandidateReady)
+	return nil
+}
+
+func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) error {
+	h, m, _ := et.Clock()
+	etMinutes := h*60 + m
+	if etMinutes < 9*60+30 {
+		return nil
+	}
+
+	s.mu.Lock()
+	s.rangeBuffers = make(map[string]*RangeBuffer)
+	for _, sc := range s.candidates {
+		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.cfg.RangeMinutes)
+	}
+	sessionID := s.session.ID
+	sessionCandidates := s.session.Candidates
+	sessionSelected := s.session.Selected
+	s.mu.Unlock()
+
+	// Only update status — preserve candidates and selected from previous state.
+	if err := store.UpdateORBSession(ctx, s.db, sessionID, "range_watch", sessionCandidates, sessionSelected); err != nil {
+		return fmt.Errorf("update session to range_watch: %w", err)
+	}
+	s.setState(StateRangeWatch)
+	return nil
+}
+
+func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
+	marketOpen := time.Date(et.Year(), et.Month(), et.Day(), 9, 30, 0, 0, nyLoc)
+	now := s.now()
+
+	allLocked := true
+	for ticker, buf := range s.rangeBuffers {
+		if buf.Range() != nil {
+			continue // already locked
+		}
+		candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, marketOpen, now)
+		if err != nil {
+			fmt.Printf("orb: fetch candles %s: %v\n", ticker, err)
+			allLocked = false
+			continue
+		}
+		for _, c := range candles {
+			locked, _ := buf.Add(c)
+			if locked {
+				break
+			}
+		}
+		if buf.Range() == nil {
+			allLocked = false
+		}
+	}
+
+	if allLocked && len(s.rangeBuffers) > 0 {
+		s.mu.Lock()
+		sessionID := s.session.ID
+		sessionCandidates := s.session.Candidates
+		sessionSelected := s.session.Selected
+		s.mu.Unlock()
+		if err := store.UpdateORBSession(ctx, s.db, sessionID, "executing", sessionCandidates, sessionSelected); err != nil {
+			return fmt.Errorf("update session to executing: %w", err)
+		}
+		s.setState(StateExecuting)
+	}
+	return nil
+}
+
+func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
+	if s.executor == nil {
+		s.notify(ctx, "ORB: No broker configured — cannot place bracket orders.")
+		s.setState(StateDone)
+		return nil
+	}
+
+	portfolioVal := 100000.0 // default fallback
+	if s.portfolio != nil {
+		portfolioVal = s.portfolio.PortfolioValue()
+	}
+
+	s.mu.Lock()
+	sessionID := s.session.ID
+	candidates := s.candidates
+	s.mu.Unlock()
+
+	var msgs []string
+	for ticker, buf := range s.rangeBuffers {
+		r := buf.Range()
+		if r == nil {
+			continue
+		}
+
+		// Reject flat/near-flat ranges to avoid unbounded order quantity
+		if r.High-r.Low < 0.01 {
+			fmt.Printf("orb: skipping %s — opening range too narrow (high=%.4f, low=%.4f)\n", ticker, r.High, r.Low)
+			continue
+		}
+
+		side := "buy"
+		for _, sc := range candidates {
+			if sc.Gap.Ticker == ticker && sc.Gap.GapPct < 0 {
+				side = "sell"
+			}
+		}
+
+		params := ComputeBracket(r, side, portfolioVal, s.cfg)
+
+		orderID, err := PlaceBracket(ctx, s.executor, params)
+		if err != nil {
+			fmt.Printf("orb: place bracket %s: %v\n", ticker, err)
+			continue
+		}
+		s.orderIDs[ticker] = orderID
+
+		if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+			SessionID:  sessionID,
+			Ticker:     ticker,
+			Side:       side,
+			EntryStop:  params.EntryStop,
+			StopLoss:   params.StopLoss,
+			TakeProfit: params.TakeProfit,
+			Qty:        params.Qty,
+			OrderID:    orderID,
+			Status:     "pending",
+		}); err != nil {
+			fmt.Printf("orb: store trade %s: %v\n", ticker, err)
+		}
+
+		msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.2f stop=%.2f target=%.2f qty=%d",
+			strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
+	}
+
+	if len(msgs) > 0 {
+		s.notify(ctx, "ORB Brackets Placed:\n"+strings.Join(msgs, "\n"))
+	}
+
+	s.setState(StateDone)
+	return nil
+}
+
+func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
+	h, m, _ := et.Clock()
+	etMinutes := h*60 + m
+
+	// After 10:30 ET, cancel unfilled orders and wrap up
+	if etMinutes >= 10*60+30 {
+		if s.executor != nil {
+			for ticker, orderID := range s.orderIDs {
+				// Best-effort cancel; already-filled orders return an error which is fine.
+				cancelErr := CancelOrder(ctx, s.executor, orderID)
+				if cancelErr != nil {
+					fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, cancelErr)
+				}
+				// Update trade status to "cancelled" regardless of broker response.
+				// If the order was already filled, the status will only update rows
+				// still in "pending" state (WHERE status='pending' guard in SQL).
+				if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
+					fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
+				}
+			}
+		}
+
+		s.mu.Lock()
+		sessionID := s.session.ID
+		s.mu.Unlock()
+
+		if err := store.UpdateORBSession(ctx, s.db, sessionID, "done", nil, nil); err != nil {
+			fmt.Printf("orb: update session to done: %v\n", err)
+		}
+		s.notify(ctx, "ORB: Session complete for today.")
+
+		// Reset for next day
+		s.mu.Lock()
+		s.session = nil
+		s.candidates = nil
+		s.rangeBuffers = make(map[string]*RangeBuffer)
+		s.orderIDs = make(map[string]string)
+		s.state = StateIdle
+		s.mu.Unlock()
+	}
+	return nil
+}
+
+func (s *ORBScheduler) notify(ctx context.Context, msg string) {
+	if s.notifier == nil {
+		return
+	}
+	_ = s.notifier.Notify(ctx, msg)
+}
+
+// orbRawResponse is the full JSON schema returned by the ORB custom system prompt.
+type orbRawResponse struct {
+	Action          string   `json:"action"`
+	Conviction      float64  `json:"conviction"`
+	CatalystType    string   `json:"catalyst_type"`
+	CatalystQuality string   `json:"catalyst_quality"`
+	Reasoning       string   `json:"reasoning"`
+	Risks           []string `json:"risks"`
+}
+
+// parseORBResult extracts the full ORB analysis result from the raw LLM response.
+// Falls back to the standard AnalysisResponse fields when the raw JSON cannot be
+// parsed (e.g. the arbiter returned a transformed response).
+func parseORBResult(rawResponse string, fallback analysis.AnalysisResponse) ORBAnalysisResult {
+	// Strip markdown fences if present
+	raw := strings.TrimSpace(rawResponse)
+	raw = strings.TrimPrefix(raw, "```json")
+	raw = strings.TrimPrefix(raw, "```")
+	raw = strings.TrimSuffix(raw, "```")
+	raw = strings.TrimSpace(raw)
+
+	var parsed orbRawResponse
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil &&
+		(parsed.Action == "trade" || parsed.Action == "skip") {
+		return ORBAnalysisResult{
+			Action:          parsed.Action,
+			Conviction:      parsed.Conviction,
+			CatalystType:    parsed.CatalystType,
+			CatalystQuality: parsed.CatalystQuality,
+			Reasoning:       parsed.Reasoning,
+			Risks:           parsed.Risks,
+		}
+	}
+
+	// Fallback: map standard AnalysisResponse fields
+	return ORBAnalysisResult{
+		Action:     string(fallback.Action),
+		Conviction: fallback.Confidence,
+		Reasoning:  fallback.Reasoning,
+	}
+}
+
+// IsTradingDay checks if the given time falls on a trading day.
+func IsTradingDay(t time.Time) bool {
+	et := t.In(nyLoc)
+	noon := time.Date(et.Year(), et.Month(), et.Day(), 12, 0, 0, 0, nyLoc)
+	return engine.IsMarketOpen(noon)
+}
