@@ -378,11 +378,15 @@ func GetAnalystResultsBatchForTrades(ctx context.Context, trades []Trade) (map[i
 		signalIDs[i] = e.signalID
 	}
 
+	// DISTINCT ON (s.id) ensures one row per signal even when analysis_ids contains
+	// multiple entries — picks the first analysis deterministically and avoids the
+	// "keep first" dedup in Go. Ordered by s.id so DISTINCT ON is well-defined.
 	rows, err := GetDB().Query(ctx, `
-		SELECT s.id AS signal_id, a.ensemble_results
+		SELECT DISTINCT ON (s.id) s.id AS signal_id, a.ensemble_results
 		FROM signals s
 		JOIN analyses a ON a.id = ANY(s.analysis_ids)
 		WHERE s.id = ANY($1)
+		ORDER BY s.id
 	`, signalIDs)
 	if err != nil {
 		return nil, err

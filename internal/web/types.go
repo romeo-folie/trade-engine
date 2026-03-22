@@ -24,6 +24,11 @@ type APIEnsembleResult struct {
 }
 
 // analystNames maps index → human-readable analyst label.
+// The order matches the analyst slots wired in internal/analysis/ensemble.go.
+// If the analyst roster changes (new analysts added, order reordered), update
+// both this slice and ensemble.go in the same commit — they are coupled.
+// Long-term fix: have AnalystResult carry its own Name field so this mapping
+// is unnecessary (tracked as a follow-up task).
 var analystNames = []string{"Technical", "Momentum", "Sentiment", "Macro"}
 
 func analystName(idx int) string {
@@ -70,6 +75,9 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 	}
 
 	n := len(results)
+	// Equal-weight assumption: all analysts contribute equally to the ensemble.
+	// When Phase 12 weighted ensembles land, replace this with per-analyst weights
+	// stored in the EnsembleRecord (internal/store/analyses.go EnsembleRecord.Weights).
 	weight := 1.0 / float64(n)
 	analysts := make([]APIAnalystResult, n)
 
