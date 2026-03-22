@@ -156,6 +156,29 @@ func TestMapAnalystResults_inactiveAnalyst(t *testing.T) {
 	}
 }
 
+func TestMapAnalystResults_tieBreakLongShort(t *testing.T) {
+	// When LONG and SHORT have equal votes, ensemble should be NEUTRAL (not LONG).
+	results := []analysis.AnalystResult{
+		{
+			Response: analysis.AnalysisResponse{Action: analysis.ActionBuy, Confidence: 0.80, Reasoning: "Bullish"},
+			Meta:     analysis.ModelCallMeta{Model: "model-a"},
+		},
+		{
+			Response: analysis.AnalysisResponse{Action: analysis.ActionSell, Confidence: 0.75, Reasoning: "Bearish"},
+			Meta:     analysis.ModelCallMeta{Model: "model-b"},
+		},
+	}
+	raw, _ := json.Marshal(results)
+	_, ensemble := mapAnalystResults(raw)
+
+	if ensemble == nil {
+		t.Fatal("expected non-nil ensemble")
+	}
+	if ensemble.Verdict != "NEUTRAL" {
+		t.Errorf("expected tie-break verdict NEUTRAL, got %s", ensemble.Verdict)
+	}
+}
+
 func TestTruncate(t *testing.T) {
 	short := "hello"
 	if got := truncate(short, 120); got != short {

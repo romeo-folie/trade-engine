@@ -117,6 +117,10 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 			ensembleVerdict = v
 		}
 	}
+	// Tie-break: if LONG and SHORT have equal non-zero votes, return NEUTRAL
+	if votes["LONG"] > 0 && votes["LONG"] == votes["SHORT"] {
+		ensembleVerdict = "NEUTRAL"
+	}
 
 	var ensembleConf float64
 	if activeCount > 0 {
