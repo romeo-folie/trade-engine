@@ -19,7 +19,9 @@ export default function AppRoot() {
   // Boot screen shows on both initial connect and reconnect attempts.
   // The animation replays on reconnect — intentional: signals a state reset to the user.
   // TODO: consider a lighter reconnect overlay if full replay feels jarring in prod.
-  const booting = socket.status === 'connecting' || socket.status === 'reconnecting';
+  // VITE_SKIP_BOOT=true bypasses the boot gate for design preview without a running backend.
+  const skipBoot = import.meta.env.VITE_SKIP_BOOT === 'true';
+  const booting = !skipBoot && (socket.status === 'connecting' || socket.status === 'reconnecting');
 
   if (booting) {
     return <BootScreen status={socket.status} />;

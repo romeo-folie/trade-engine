@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { fmtPrice, fmtDate } from '../../utils/format';
+import CornerCard from '../CornerCard';
 import styles from './SignalDetailPanel.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -125,9 +126,13 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           </div>
           <div className={styles.analystCards}>
             {STUB_ANALYSTS.map(analyst => (
-              <div key={analyst.name} className={`${styles.analystCard} ${analyst.bypassed ? styles.bypassed : ''}`}>
-                <span className={styles.bracketTL} style={{ color: analyst.bracketColor }}>⌐</span>
-                <span className={styles.bracketBR} style={{ color: analyst.bracketColor }}>¬</span>
+              <CornerCard
+                key={analyst.name}
+                bracketColor={analyst.bracketColor}
+                bracketSize={10}
+                bracketWidth={1}
+                className={`${styles.analystCard} ${analyst.bypassed ? styles.bypassed : ''}`}
+              >
                 <div className={styles.analystHeader}>
                   <span className={styles.analystName}>{analyst.name}</span>
                   <span className={styles.analystVerdict} style={{ color: analyst.verdictColor }}>
@@ -140,7 +145,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
                   </div>
                 )}
                 <div className={styles.analystDesc}>{analyst.description}</div>
-              </div>
+              </CornerCard>
             ))}
           </div>
 

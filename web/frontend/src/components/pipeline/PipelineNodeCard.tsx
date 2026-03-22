@@ -11,6 +11,7 @@
 import { memo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
+import CornerCard from '../CornerCard';
 import styles from './PipelineNodeCard.module.css';
 
 // ── Colour constants — sourced from tokens.ts (JS mirror of tokens.css) ────────
@@ -98,8 +99,16 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
     );
   }
 
+  // Analyst nodes: corner brackets at card edges. bracketColor drives bracket colour.
+  // Structural nodes: left strip (no brackets).
+  const showBrackets = bracketColor && !stripColor;
+
   return (
-    <div
+    <CornerCard
+      bracketColor={showBrackets ? `rgba(${hexToRgb(bracketColor)},${isBypassed ? 0.2 : 0.6})` : undefined}
+      hideBrackets={!showBrackets}
+      bracketSize={10}
+      bracketWidth={1}
       className={`${styles.card} ${isBypassed ? styles.bypassed : ''}`}
       role="button"
       tabIndex={0}
@@ -111,9 +120,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         }
       }}
       aria-label={`${d.label} pipeline node`}
-      style={{
-        opacity: isBypassed ? 0.35 : 1,
-      }}
+      style={{ opacity: isBypassed ? 0.35 : 1 }}
     >
       <Handle type="target" position={Position.Left}   style={{ opacity: 0 }} />
       <Handle type="source" position={Position.Right}  style={{ opacity: 0 }} />
@@ -121,14 +128,6 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
       {/* Left colour strip (structural nodes only) */}
       {stripColor && (
         <div className={styles.strip} style={{ background: stripColor }} />
-      )}
-
-      {/* Corner brackets (analyst nodes only) */}
-      {bracketColor && !stripColor && (
-        <>
-          <span className={styles.bracketTL} aria-hidden="true" style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true" style={{ color: bracketColor, opacity: isBypassed ? 0.35 : 0.6 }}>¬</span>
-        </>
       )}
 
       <div className={styles.inner}>
@@ -152,8 +151,17 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           <div className={styles.bypassedLabel}>BYPASSED</div>
         )}
       </div>
-    </div>
+    </CornerCard>
   );
+}
+
+/** Convert #RRGGBB to "R,G,B" for use in rgba() */
+function hexToRgb(hex: string): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `${r},${g},${b}`;
 }
 
 function formatRelative(iso: string): string {

@@ -194,9 +194,7 @@
 }
 
 .analystCard {
-  position: relative;
   background: var(--card-bg);
-  border: 1px solid var(--border-muted);
   padding: var(--space-3) var(--space-4);
   display: flex;
   flex-direction: column;
@@ -205,24 +203,6 @@
 
 .analystCard.bypassed {
   opacity: 0.45;
-}
-
-.bracketTL {
-  position: absolute;
-  top: -2px;
-  left: 4px;
-  font-size: 14px;
-  opacity: 0.7;
-  line-height: 1;
-}
-
-.bracketBR {
-  position: absolute;
-  bottom: -2px;
-  right: 4px;
-  font-size: 14px;
-  opacity: 0.7;
-  line-height: 1;
 }
 
 .analystHeader {

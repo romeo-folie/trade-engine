@@ -9,6 +9,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
+import CornerCard from '../components/CornerCard';
 import SignalDetailPanel from '../components/signals/SignalDetailPanel';
 import type { Signal } from '../components/signals/SignalDetailPanel';
 import type { Column } from '../components/table/DataTable';
@@ -203,24 +204,24 @@ export default function SignalsScreen() {
         </div>
       )}
 
-      {/* Stats row */}
+      {/* Stats row — cards fill full width, corner brackets only (no outer border) */}
       <div className={styles.statsRow}>
-        <div className={styles.statCard}>
+        <CornerCard className={styles.statCard}>
           <span className={styles.statLabel}>TOTAL</span>
           <span className={styles.statValue}>{stats.total}</span>
-        </div>
-        <div className={styles.statCard}>
+        </CornerCard>
+        <CornerCard className={styles.statCard}>
           <span className={styles.statLabel}>PENDING</span>
           <span className={`${styles.statValue} ${styles.statAmber}`}>{stats.pending}</span>
-        </div>
-        <div className={styles.statCard}>
+        </CornerCard>
+        <CornerCard className={styles.statCard}>
           <span className={styles.statLabel}>EXECUTED</span>
           <span className={`${styles.statValue} ${styles.statGreen}`}>{stats.executed}</span>
-        </div>
-        <div className={styles.statCard}>
+        </CornerCard>
+        <CornerCard className={styles.statCard}>
           <span className={styles.statLabel}>BLOCKED</span>
           <span className={`${styles.statValue} ${styles.statRed}`}>{stats.blocked}</span>
-        </div>
+        </CornerCard>
       </div>
 
       <FilterBar
