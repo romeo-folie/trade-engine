@@ -180,7 +180,7 @@ Modes:
 				orbNotifier = &orbTelegramNotifier{bot: tgBot}
 			}
 
-			orbPortfolio := &dbPortfolioValuer{defaultValue: 100_000}
+			orbPortfolio := newDBPortfolioValuer(100_000)
 			orbScheduler := orb.NewORBScheduler(
 				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
 				broker, orbPortfolio, orbNotifier,
@@ -387,23 +387,46 @@ func removePID() {
 	os.Remove(pidFilePath())
 }
 
-// dbPortfolioValuer reads the latest portfolio snapshot from the DB.
-// Falls back to defaultValue when no snapshot exists yet (e.g. fresh install).
+// dbPortfolioValuer reads the latest portfolio snapshot using an injected fetch
+// function. Constructor injection keeps the package-level store import out of
+// the hot path and makes the type easily testable.
 type dbPortfolioValuer struct {
 	defaultValue float64
+	// fetchSnapshot is the function used to read the latest portfolio value.
+	// Injected at construction time — defaults to store.GetLatestPortfolioSnapshot.
+	fetchSnapshot func(ctx context.Context) (*store.PortfolioSnapshot, error)
+}
+
+// newDBPortfolioValuer creates a dbPortfolioValuer backed by the real DB store.
+func newDBPortfolioValuer(defaultValue float64) *dbPortfolioValuer {
+	return &dbPortfolioValuer{
+		defaultValue:  defaultValue,
+		fetchSnapshot: store.GetLatestPortfolioSnapshot,
+	}
 }
 
 func (p *dbPortfolioValuer) PortfolioValue() float64 {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	snap, err := store.GetLatestPortfolioSnapshot(ctx)
-	if err != nil || snap == nil {
+	snap, err := p.fetchSnapshot(ctx)
+	if err != nil {
+		// Warn loudly — position sizing will fall back to the default value.
+		// In a live trading context this could lead to oversized positions.
+		logger.Warn("orb: portfolio snapshot fetch failed — using default value for position sizing",
+			"default", p.defaultValue, "err", err.Error())
 		return p.defaultValue
 	}
-	if snap.TotalValue > 0 {
-		return snap.TotalValue
+	if snap == nil {
+		logger.Warn("orb: no portfolio snapshot found — using default value for position sizing",
+			"default", p.defaultValue)
+		return p.defaultValue
 	}
-	return p.defaultValue
+	if snap.TotalValue <= 0 {
+		logger.Warn("orb: portfolio snapshot has non-positive TotalValue — using default value for position sizing",
+			"total_value", snap.TotalValue, "default", p.defaultValue)
+		return p.defaultValue
+	}
+	return snap.TotalValue
 }
 
 // orbTelegramNotifier adapts notify.TelegramBot to the orb.Notifier interface.
