@@ -44,6 +44,19 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 		qty = 1
 	}
 
+	// Hard notional cap: qty × entry price must not exceed MaxPositionPct% of portfolio.
+	// Without this, a narrow range on a cheap stock can produce an outsized position
+	// that exceeds total portfolio value.
+	if cfg.MaxPositionPct > 0 && entryStop > 0 {
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entryStop))
+		if maxQtyByNotional < 1 {
+			maxQtyByNotional = 1
+		}
+		if qty > maxQtyByNotional {
+			qty = maxQtyByNotional
+		}
+	}
+
 	return BracketParams{
 		Ticker:     r.Ticker,
 		Side:       side,
