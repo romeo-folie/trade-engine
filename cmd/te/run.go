@@ -180,9 +180,10 @@ Modes:
 				orbNotifier = &orbTelegramNotifier{bot: tgBot}
 			}
 
+			orbPortfolio := &dbPortfolioValuer{defaultValue: 100_000}
 			orbScheduler := orb.NewORBScheduler(
 				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
-				broker, nil, orbNotifier,
+				broker, orbPortfolio, orbNotifier,
 			)
 
 			logger.Info("ORB scheduler starting")
@@ -384,6 +385,25 @@ func readPID() (int, error) {
 
 func removePID() {
 	os.Remove(pidFilePath())
+}
+
+// dbPortfolioValuer reads the latest portfolio snapshot from the DB.
+// Falls back to defaultValue when no snapshot exists yet (e.g. fresh install).
+type dbPortfolioValuer struct {
+	defaultValue float64
+}
+
+func (p *dbPortfolioValuer) PortfolioValue() float64 {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil || snap == nil {
+		return p.defaultValue
+	}
+	if snap.TotalValue > 0 {
+		return snap.TotalValue
+	}
+	return p.defaultValue
 }
 
 // orbTelegramNotifier adapts notify.TelegramBot to the orb.Notifier interface.

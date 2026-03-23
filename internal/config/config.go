@@ -42,6 +42,7 @@ type ORBConfig struct {
 	RangeMinutes      int     `yaml:"range_minutes"`      // 5 or 15
 	RiskReward        float64 `yaml:"risk_reward"`        // e.g. 2.0
 	MaxRiskPct        float64 `yaml:"max_risk_pct"`       // max loss per trade as % of portfolio
+	MaxPositionPct    float64 `yaml:"max_position_pct"`   // max notional per trade as % of portfolio (e.g. 10.0)
 	NewsLookbackHours int     `yaml:"news_lookback_hours"` // e.g. 24
 }
 
@@ -834,6 +835,9 @@ func Validate(cfg *Config) []string {
 		}
 		if cfg.ORB.RiskReward < 1.5 {
 			errs = append(errs, "orb.risk_reward must be >= 1.5")
+		}
+		if cfg.ORB.MaxPositionPct <= 0 || cfg.ORB.MaxPositionPct > 50.0 {
+			errs = append(errs, fmt.Sprintf("orb.max_position_pct must be > 0 and <= 50 (got %.1f)", cfg.ORB.MaxPositionPct))
 		}
 		if cfg.ORB.MaxRiskPct <= 0 || cfg.ORB.MaxRiskPct > 5.0 {
 			errs = append(errs, "orb.max_risk_pct must be > 0 and <= 5.0")
