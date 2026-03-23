@@ -112,16 +112,18 @@ export default function PortfolioScreen() {
 
       try {
         const res = await fetch('/api/node/portfolio', { signal: controller.signal });
-        if (!res.ok) {
-          setFetchError(`${res.status} ${res.statusText}`);
-          return;
-        }
-        const data = await res.json();
-        if (data && typeof data.TotalValue === 'number') {
-          setSnapshot(data);
-          setFetchError(null);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && typeof data.TotalValue === 'number') {
+            setSnapshot(data);
+            setFetchError(null);
+          } else {
+            console.warn('[PortfolioScreen] unexpected payload shape:', data);
+            setFetchError('Unexpected response shape from /api/node/portfolio');
+          }
         } else {
-          setFetchError('Unexpected response shape');
+          console.warn('[PortfolioScreen] non-2xx response:', res.status, res.statusText);
+          setFetchError(`API error: ${res.status} ${res.statusText}`);
         }
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
@@ -149,10 +151,27 @@ export default function PortfolioScreen() {
   const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
   const dayPnl = snapshot?.RealizedPnLToday ?? 0;
 
-  const equityData = useMemo(() => generateMockEquityData(totalValue), [totalValue]);
+  const equityData = useMemo(
+    () => (totalValue !== null ? generateMockEquityData(totalValue) : []),
+    [totalValue],
+  );
 
   return (
     <div className={styles.screen}>
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>PORTFOLIO</span>
+        </div>
+        <div className={styles.autoRefresh}>
+          <span className={styles.greenDot} />
+          AUTO-REFRESH 15s
+        </div>
+      </div>
+
+      <h1 className={styles.pageTitle}>PORTFOLIO</h1>
+
       {/* ── KPI Cards ─────────────────────────────────────────────────────── */}
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
@@ -160,9 +179,9 @@ export default function PortfolioScreen() {
         </div>
       )}
       <div className={styles.kpiRow}>
-        <KpiCard label="TOTAL VALUE" value={hasData ? fmt$(totalValue) : '—'} />
-        <KpiCard label="CASH" value={hasData ? fmt$(cash) : '—'} />
-        <KpiCard label="INVESTED" value={hasData ? fmt$(invested) : '—'} />
+        <KpiCard label="TOTAL VALUE" value={hasData ? fmt$(totalValue) : '—'} valueColor="var(--text-primary)" />
+        <KpiCard label="CASH" value={hasData ? fmt$(cash) : '—'} valueColor="var(--text-primary)" />
+        <KpiCard label="INVESTED" value={hasData ? fmt$(invested) : '—'} valueColor="var(--text-primary)" />
         <KpiCard
           label="UNREALIZED P&L"
           value={hasData ? fmtPnl(unrealizedPnl) : '—'}

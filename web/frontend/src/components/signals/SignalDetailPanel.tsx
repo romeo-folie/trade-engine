@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { fmtPrice, fmtDate } from '../../utils/format';
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import CornerCard from '../CornerCard';
 import styles from './SignalDetailPanel.module.css';
 
@@ -43,17 +45,7 @@ interface SignalDetailPanelProps {
   onClose: () => void;
 }
 
-/* ── Helpers ───────────────────────────────────────────────────────────────── */
 
-function statusClass(status: string): string {
-  const s = status.toLowerCase();
-  if (s === 'pending') return styles.statusPending;
-  if (s === 'approved') return styles.statusApproved;
-  if (s === 'executed') return styles.statusExecuted;
-  if (s === 'blocked') return styles.statusBlocked;
-  if (s === 'expired' || s === 'stale') return styles.statusExpired;
-  return styles.statusBlocked;
-}
 
 /* ── Stub analyst data — fallback when API data is absent ────────────────── */
 
@@ -149,9 +141,16 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
         <div className={styles.header}>
           <div className={styles.headerLeft}>
             <span className={styles.title}>{signal.Ticker}</span>
-            <span className={`${styles.dirBadge} ${dirIsLong ? styles.dirLong : styles.dirShort} chamfer-sm`}>
-              {dirIsLong ? '▲ LONG' : '▼ SHORT'}
-            </span>
+            <ChamferedBox
+              chamfer={6}
+              backgroundColor={dirIsLong ? colors.emerald : colors.red}
+              borderColor={dirIsLong ? colors.emerald : colors.red}
+              style={{ display: 'inline-block', padding: '2px 8px', marginLeft: '12px' }}
+            >
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#FFFFFF' }}>
+                {dirIsLong ? 'LONG' : 'SHORT'}
+              </span>
+            </ChamferedBox>
           </div>
           <span className={styles.confidenceHeader}>CONFIDENCE {(signal.Confidence * 100).toFixed(0)}%</span>
           <button
@@ -239,6 +238,25 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
           {/* Key-value details */}
           <div className={styles.kvGrid}>
+            <span className={styles.kvLabel}>Action</span>
+            <span className={styles.kvValue}>
+               <ChamferedBox
+                chamfer={4}
+                backgroundColor={dirIsLong ? colors.emerald : colors.red}
+                borderColor={dirIsLong ? colors.emerald : colors.red}
+                style={{ 
+                  display: 'inline-flex', 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  padding: '1px 6px' 
+                }}
+              >
+                <span style={{ fontSize: 9, fontWeight: 700, color: '#111' }}>
+                  {dirIsLong ? 'BUY' : 'SELL'}
+                </span>
+              </ChamferedBox>
+            </span>
+
             <span className={styles.kvLabel}>Size %</span>
             <span className={styles.kvValue}>{signal.SizePct.toFixed(1)}%</span>
 
@@ -251,9 +269,21 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
             <span className={styles.kvLabel}>Status</span>
             <span className={styles.kvValue}>
-              <span className={`${styles.statusBadge} ${statusClass(signal.Status)} chamfer-sm`}>
-                {signal.Status.toUpperCase()}
-              </span>
+              <ChamferedBox
+                chamfer={4}
+                backgroundColor={signal.Status.toLowerCase() === 'executed' ? colors.acidGreen : colors.borderMuted}
+                borderColor={signal.Status.toLowerCase() === 'executed' ? colors.acidGreen : colors.borderMuted}
+                style={{ 
+                  display: 'inline-flex', 
+                  alignItems: 'center', 
+                  justifyContent: 'center',
+                  padding: '1px 8px' 
+                }}
+              >
+                <span style={{ fontSize: 9, fontWeight: 700, color: signal.Status.toLowerCase() === 'executed' ? '#0D0D11' : 'var(--text-dim)' }}>
+                  {signal.Status.toUpperCase()}
+                </span>
+              </ChamferedBox>
             </span>
 
             <span className={styles.kvLabel}>Expires</span>
@@ -262,13 +292,39 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
           {/* Action buttons */}
           <div className={styles.actionRow}>
-            <button
-              type="button"
-              className={`${styles.btnOverride} chamfer-sm`}
-              disabled
+            <ChamferedBox
+              chamfer={6}
+              backgroundColor="transparent"
+              borderColor={colors.borderMuted}
+              className={styles.btnOverride}
               title="Manual override — not yet implemented"
-            >OVERRIDE</button>
-            <button type="button" className={`${styles.btnDismiss} chamfer-sm`} onClick={onClose}>CLOSE</button>
+              style={{
+                padding: '10px 0',
+                flex: 1,
+                backgroundColor: colors.borderMuted,
+                textAlign: 'center',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}
+            >
+              OVERRIDE
+            </ChamferedBox>
+            <ChamferedBox
+              chamfer={6}
+              backgroundColor="transparent"
+              borderColor={colors.borderMuted}
+              onClick={onClose}
+              className={styles.btnDismiss}
+              style={{
+              padding: '2px 8px',
+              display: 'inline-flex',
+              alignItems: 'center',
+              justifyContent: 'center'
+            }}
+            >
+              CLOSE
+            </ChamferedBox>
           </div>
         </div>
       </div>

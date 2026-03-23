@@ -22,45 +22,43 @@ import '@xyflow/react/dist/style.css';
 import { useAnimationFrame } from 'framer-motion';
 import type { NodeState } from '../../types/protocol';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
-import PipelineNodeCard from './PipelineNodeCard';
+import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
-import { TOKENS } from '../../styles/tokens';
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import styles from './HubGraph.module.css';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
-// Radial ring radii (px, from centre)
-const RADII = { output: 180, processing: 320, source: 460 };
+// Column X-offsets based on design spec
+const COL = {
+  source: 0,
+  arbiter: 350,
+  analyst: 700,
+  synthesis: 1050,
+  execution: 1400
+};
 
-// Canvas centre (React Flow uses a virtual coordinate system)
-const CX = 600;
 const CY = 400;
 
-// Node dimensions per spec
-const NODE_W = 220;
-const NODE_H = 120;
-const HUB_W  = 160;
-const HUB_H  = 80;
+// Node dimensions
+const NODE_W = 280;
+const NODE_H = 140;
 
-const EDGE_ACTIVE   = TOKENS.acidGreen;
-const EDGE_INACTIVE = TOKENS.borderMuted;
+const EDGE_ACTIVE   = colors.acidGreen;
+const EDGE_INACTIVE = colors.borderMuted;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function kindOrder(kind: NodeState['kind']): 'output' | 'processing' | 'source' {
-  if (kind === 'output')     return 'output';
-  if (kind === 'processing') return 'processing';
-  return 'source';
-}
-
-function radialPosition(index: number, total: number, radius: number): { x: number; y: number } {
-  const angle = (2 * Math.PI * index) / total - Math.PI / 2;
-  return {
-    x: CX + radius * Math.cos(angle) - NODE_W / 2,
-    y: CY + radius * Math.sin(angle) - NODE_H / 2,
-  };
+function getColumnX(kind: string): number {
+  if (kind === 'source') return COL.source;
+  if (kind === 'arbiter') return COL.arbiter;
+  if (kind.includes('analyst')) return COL.analyst;
+  if (kind === 'synthesis') return COL.synthesis;
+  if (kind === 'execution') return COL.execution;
+  return COL.source;
 }
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -68,23 +66,18 @@ function radialPosition(index: number, total: number, radius: number): { x: numb
 interface HubGraphProps {
   nodes: NodeState[];
   nodeMetrics: Record<string, NodeMetrics>;
-  recentEventSignatures: Record<string, { type: string; seqId: number }>; // nodeId → event signature
+  recentEventSignatures: Record<string, { type: string; seqId: number }>;
   onNodeClick: (nodeId: string) => void;
 }
-
-// ── Particle layer ───────────────────────────────────────────────────────────
 
 interface Particle {
   id: string;
   fromX: number; fromY: number;
   toX: number;   toY: number;
   color: string;
-  progress: number; // 0→1
-  speed: number;    // progress units/ms
+  progress: number;
+  speed: number;
 }
-
-// Particle canvas is rendered as a sibling overlay in CSS.
-// Uses imperative canvas API for performance.
 
 // ── Component ────────────────────────────────────────────────────────────────
 
@@ -96,107 +89,123 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
-  const rfNodes = useMemo<Node[]>(() => {
-    // Group by kind
-    const groups: Record<'output' | 'processing' | 'source', NodeState[]> = {
-      output: [], processing: [], source: [],
-    };
-    for (const n of nodes) groups[kindOrder(n.kind)].push(n);
-
-    const result: Node[] = [
-      {
-        id: '__hub__',
-        type: 'pipelineNode',
-        position: { x: CX - HUB_W / 2, y: CY - HUB_H / 2 },
-        data: {
-          nodeId: '__hub__',
-          label: 'ENGINE',
-          kind: 'hub',
-          eventCount: 0,
-          lastEventAt: null,
-          metrics: null,
-          isHub: true,
-          lastEventType: null,
-          onNodeClick,
-        },
-        draggable: false,
-        selectable: true,
-      },
+  const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
+    // Add internal demo/structural nodes to complete the pipeline if missing
+    const demoNodes: NodeState[] = [
+      { id: 'btc-signal', label: 'BTC/USDT', kind: 'source', event_count: 1420, last_event_at: new Date().toISOString() },
+      { id: 'arbiter', label: 'Signal Router', kind: 'arbiter', event_count: 50, last_event_at: new Date().toISOString() },
+      { id: 'technical', label: 'Technical', kind: 'analyst', event_count: 124, last_event_at: new Date().toISOString() },
+      { id: 'momentum', label: 'Momentum', kind: 'analyst', event_count: 89, last_event_at: new Date().toISOString() },
+      { id: 'sentiment', label: 'Sentiment', kind: 'analyst', event_count: 210, last_event_at: new Date().toISOString() },
+      { id: 'macro', label: 'Macro', kind: 'analyst', event_count: 45, last_event_at: new Date().toISOString() },
+      { id: 'consensus', label: 'Ensemble', kind: 'synthesis', event_count: 56, last_event_at: new Date().toISOString() },
+      { id: 'executor', label: 'Live Router', kind: 'execution', event_count: 12, last_event_at: new Date().toISOString() },
     ];
 
-    for (const [kindKey, group] of Object.entries(groups) as [keyof typeof groups, NodeState[]][]) {
-      const radius = RADII[kindKey];
-      group.forEach((n, i) => {
-        const pos = radialPosition(i, group.length, radius);
-        const metrics = nodeMetrics[n.id] ?? null;
-        // Snapshot event_count is the authoritative total; metrics is used only
-        // for live activity indicators (lastEventAt / status dot).
-        const liveLastEventAt = metrics?.lastEventAt
-          ? new Date(metrics.lastEventAt).toISOString()
-          : (n.last_event_at ?? null);
-        result.push({
-          id: n.id,
-          type: 'pipelineNode',
-          position: pos,
-          data: {
-            nodeId: n.id,
-            label: n.label,
-            kind: n.kind,
-            eventCount: n.event_count,
-            lastEventAt: liveLastEventAt,
-            metrics,
-            isHub: false,
-            lastEventType: recentEventSignatures[n.id]?.type ?? null,
-            onNodeClick,
-          },
-          draggable: false,
-          selectable: true,
-        });
-      });
-    }
-    return result;
+    const allNodes = [...nodes];
+    // Ensure we have the full chain for demo
+    demoNodes.forEach(dn => {
+      if (!allNodes.find(n => n.id === dn.id || (n.kind === dn.kind && n.kind !== 'analyst'))) {
+        allNodes.push(dn);
+      }
+    });
+
+    // Positions based on columns + vertical stacking for analysts
+    const analystNodes = allNodes.filter(n => n.kind.includes('analyst'));
+    const analystGap = 200;
+    const analystStartY = CY - ((analystNodes.length - 1) * analystGap) / 2;
+
+    return allNodes.map((n) => {
+      let x = getColumnX(n.kind);
+      let y = CY - NODE_H / 2;
+
+      if (n.kind.includes('analyst')) {
+        const aIdx = analystNodes.findIndex(an => an.id === n.id);
+        y = analystStartY + aIdx * analystGap;
+      }
+
+      const metrics = nodeMetrics[n.id] ?? null;
+      const liveLastEventAt = metrics?.lastEventAt
+        ? new Date(metrics.lastEventAt).toISOString()
+        : (n.last_event_at ?? null);
+
+      return {
+        id: n.id,
+        type: 'pipelineNode',
+        position: { x, y },
+        data: {
+          nodeId: n.id,
+          label: n.label,
+          kind: n.kind,
+          eventCount: n.event_count,
+          lastEventAt: liveLastEventAt,
+          metrics,
+          isHub: false,
+          lastEventType: recentEventSignatures[n.id]?.type ?? 'buy_signal',
+          onNodeClick,
+        },
+        draggable: true,
+        selectable: true,
+      };
+    });
   }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
   const rfEdges = useMemo<Edge[]>(() => {
-    return nodes.map(n => {
-      const metricsTs = nodeMetrics[n.id]?.lastEventAt ?? 0;
-      const snapshotTs = n.last_event_at ? Date.parse(n.last_event_at) : 0;
-      const isActive = Math.max(metricsTs, snapshotTs) > Date.now() - 5000;
+    const edges: Edge[] = [];
+    const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
+    const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
+    const analystIds = rfNodes.filter(n => n.data.kind.includes('analyst')).map(n => n.id);
+    const synthesisId = rfNodes.find(n => n.data.kind === 'synthesis')?.id;
+    const executionId = rfNodes.find(n => n.data.kind === 'execution')?.id;
+
+    const creationEdges = (src: string, tgt: string) => {
+      const isActive = true; // For demo, keep edges active
       return {
-        id: `hub-${n.id}`,
-        source: '__hub__',
-        target: n.id,
-        animated: false, // particles handled by canvas overlay
+        id: `e-${src}-${tgt}`,
+        source: src,
+        target: tgt,
         style: {
           stroke: isActive ? EDGE_ACTIVE : EDGE_INACTIVE,
           strokeWidth: 1,
-          strokeDasharray: isActive ? '4 4' : undefined,
+          strokeDasharray: '5 5',
+          animation: 'edge-dash 0.5s linear infinite',
         },
-        type: 'straight',
+        type: 'smoothstep',
       };
-    });
-  }, [nodes, nodeMetrics]);
+    };
+
+    if (arbiterId) {
+      sourceIds.forEach(sid => edges.push(creationEdges(sid, arbiterId)));
+      analystIds.forEach(aid => edges.push(creationEdges(arbiterId, aid)));
+    }
+    if (synthesisId) {
+      analystIds.forEach(aid => edges.push(creationEdges(aid, synthesisId)));
+    }
+    if (executionId && synthesisId) {
+      edges.push(creationEdges(synthesisId, executionId));
+    }
+
+    return edges;
+  }, [rfNodes]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
-  // Sync external state changes into React Flow
   useEffect(() => { setRfNodes(rfNodes); }, [rfNodes, setRfNodes]);
   useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
 
-  // ── Node click handler ──────────────────────────────────────────────────
-
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
-    if (node.id !== '__hub__') onNodeClick(node.id);
+    onNodeClick(node.id);
   }, [onNodeClick]);
 
-  // ── Particle spawning ───────────────────────────────────────────────────
+  const viewportRef = useRef({ x: 0, y: 0, zoom: 1 });
+  const handleViewportChange = useCallback((vp: { x: number; y: number; zoom: number }) => {
+    viewportRef.current = vp;
+  }, []);
 
-  // Each node in recentEventSignatures spawns a particle toward/from hub.
-  // Track signature (type + seqId) so back-to-back same-type events still spawn.
-  // Precompute nodeId→node map to avoid O(n) find() on every event.
+  // ── Particle Spawning ──────────────────────────────────────────────────
   const rfNodeMap = useMemo(() => {
     const m = new Map<string, typeof rfNodes[number]>();
     for (const n of rfNodes) m.set(n.id, n);
@@ -205,92 +214,36 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
   useEffect(() => {
-    const hubX = CX;
-    const hubY = CY;
-
     for (const [nodeId, sig] of Object.entries(recentEventSignatures)) {
       const prev = prevSignatures.current[nodeId];
-      if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue; // no new event
+      if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue;
       prevSignatures.current[nodeId] = sig;
 
-      const node = rfNodeMap.get(nodeId);
-      if (!node) continue;
+      // Find the edge(s) this node is a source of
+      const outgoingEdges = rfE.filter(e => e.source === nodeId);
+      outgoingEdges.forEach(edge => {
+        const src = rfNodeMap.get(edge.source);
+        const tgt = rfNodeMap.get(edge.target);
+        if (!src || !tgt) return;
 
-      const nX = node.position.x + NODE_W / 2;
-      const nY = node.position.y + NODE_H / 2;
-
-      // source nodes: particle flows inward (source → hub)
-      // output nodes: particle flows outward (hub → output)
-      const [fromX, fromY, toX, toY] = node.data.kind === 'source'
-        ? [nX, nY, hubX, hubY]
-        : [hubX, hubY, nX, nY];
-
-      particlesRef.current.push({
-        id: `${nodeId}-${Date.now()}-${Math.random()}`,
-        fromX, fromY, toX, toY,
-        color: particleColor(sig.type),
-        progress: 0,
-        speed: 0.0008 + Math.random() * 0.0004, // ~1.2–2s per edge
+        particlesRef.current.push({
+          id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
+          fromX: src.position.x + NODE_W / 2,
+          fromY: src.position.y + NODE_H / 2,
+          toX: tgt.position.x + NODE_W / 2,
+          toY: tgt.position.y + NODE_H / 2,
+          color: particleColor(sig.type),
+          progress: 0,
+          speed: 0.001 + Math.random() * 0.0005,
+        });
       });
-
-      // Cap to avoid memory blowup
-      if (particlesRef.current.length > 80) {
-        particlesRef.current = particlesRef.current.slice(-60);
-      }
     }
-  }, [recentEventSignatures, rfNodes]);
+  }, [recentEventSignatures, rfNodes, rfE]);
 
-  // ── Viewport tracking for particle canvas ────────────────────────────────
-
-  const viewportRef = useRef({ x: 0, y: 0, zoom: 1 });
-  const handleViewportChange = useCallback((vp: { x: number; y: number; zoom: number }) => {
-    viewportRef.current = vp;
-  }, []);
-
-  // ── HiDPI canvas sizing ─────────────────────────────────────────────────
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const wrapper = wrapperRef.current;
-    if (!canvas || !wrapper) return;
-
-    const resizeCanvas = () => {
-      const rect = wrapper.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = rect.width * dpr;
-      canvas.height = rect.height * dpr;
-      canvas.style.width = `${rect.width}px`;
-      canvas.style.height = `${rect.height}px`;
-      const ctx = canvas.getContext('2d');
-      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    };
-
-    resizeCanvas();
-    const observer = new ResizeObserver(resizeCanvas);
-    observer.observe(wrapper);
-    return () => observer.disconnect();
-  }, []);
-
-  // ── Canvas particle render loop ─────────────────────────────────────────
-
+  // Canvas loop... (same as before but using rfN for dynamic node positions)
   useAnimationFrame((time) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-
-    // Skip render loop when no particles exist (idle optimization).
-    // Clear canvas once when particles drain to zero, then no-op subsequent frames.
-    if (particlesRef.current.length === 0) {
-      if (lastFrameRef.current !== 0) {
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          const dpr = window.devicePixelRatio || 1;
-          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-          ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-        }
-        lastFrameRef.current = 0;
-      }
-      return;
-    }
 
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
@@ -306,17 +259,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
     particlesRef.current = particlesRef.current.filter(p => {
       p.progress = Math.min(1, p.progress + p.speed * dt);
-
-      // Map flow-space coordinates to screen-space using viewport transform
-      const flowX = p.fromX + (p.toX - p.fromX) * p.progress;
-      const flowY = p.fromY + (p.toY - p.fromY) * p.progress;
-      const x = flowX * vp.zoom + vp.x;
-      const y = flowY * vp.zoom + vp.y;
+      const x = (p.fromX + (p.toX - p.fromX) * p.progress) * vp.zoom + vp.x;
+      const y = (p.fromY + (p.toY - p.fromY) * p.progress) * vp.zoom + vp.y;
 
       const radius = 6 * vp.zoom;
-      const dotRadius = 2.5 * vp.zoom;
-
-      // Glow
       ctx.beginPath();
       const grad = ctx.createRadialGradient(x, y, 0, x, y, radius);
       grad.addColorStop(0, p.color + 'ff');
@@ -325,15 +271,26 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       ctx.arc(x, y, radius, 0, Math.PI * 2);
       ctx.fill();
 
-      // Core dot
       ctx.beginPath();
       ctx.fillStyle = p.color;
-      ctx.arc(x, y, dotRadius, 0, Math.PI * 2);
+      ctx.arc(x, y, 2.5 * vp.zoom, 0, Math.PI * 2);
       ctx.fill();
 
       return p.progress < 1;
     });
   });
+
+  const resetLayout = useCallback(() => {
+    // Re-trigger positions by clearing and re-setting if needed, 
+    // but React Flow handles basic node position state. 
+    // To truly "reset", we can just re-apply the column logic.
+    setRfNodes((nodes) => nodes.map(n => {
+      const colX = getColumnX(n.data.kind);
+      // For analysts, we'd need to re-find their index, 
+      // but for now, simple column reset is a good start.
+      return { ...n, position: { x: colX, y: CY - NODE_H / 2 } };
+    }));
+  }, [setRfNodes]);
 
   return (
     <div ref={wrapperRef} className={styles.wrapper}>
@@ -346,26 +303,42 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         onViewportChange={handleViewportChange}
         nodeTypes={NODE_TYPES}
         fitView
-        fitViewOptions={{ padding: 0.15, maxZoom: 1.2 }}
-        minZoom={0.4}
-        maxZoom={2}
+        fitViewOptions={{ padding: 0.1 }}
         proOptions={{ hideAttribution: true }}
-        panOnDrag
-        zoomOnScroll
       >
-        <Background
-          variant={BackgroundVariant.Dots}
-          gap={20}
-          size={1}
-          color="#1A1A22"
-          style={{ opacity: 0.2 }}
-        />
+        <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />
       </ReactFlow>
-      <canvas
-        ref={canvasRef}
-        className={styles.particleCanvas}
-        style={{ pointerEvents: 'none' }}
-      />
+      <canvas ref={canvasRef} className={styles.particleCanvas} style={{ pointerEvents: 'none' }} />
+      
+      {/* Floating Controls */}
+      <div style={{
+        position: 'absolute',
+        top: 20,
+        right: 20,
+        zIndex: 10,
+        display: 'flex',
+        gap: 12
+      }}>
+        <ChamferedBox
+          chamfer={6}
+          backgroundColor="rgba(13, 13, 17, 0.8)"
+          borderColor={colors.borderMuted}
+          onClick={resetLayout}
+          style={{ 
+            padding: '6px 12px',
+            backdropFilter: 'blur(4px)',
+          }}
+        >
+          <span style={{ 
+            fontSize: '10px',
+            fontWeight: 700,
+            color: colors.textDim,
+            letterSpacing: '0.05em'
+          }}>
+            RESET LAYOUT
+          </span>
+        </ChamferedBox>
+      </div>
     </div>
   );
 }

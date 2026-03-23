@@ -22,6 +22,7 @@
   padding: var(--space-2) var(--space-3);
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
+  border-bottom: 1px solid var(--border-muted);
 }
 
 .table tbody tr:nth-child(odd) {

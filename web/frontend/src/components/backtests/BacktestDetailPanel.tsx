@@ -152,7 +152,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
         <div className={styles.body}>
           {/* Stats grid — corner brackets at card edge, no outer border */}
           <div className={styles.statsGrid}>
-            <CornerCard bracketColor="var(--border)" className={styles.statCard}>
+            <CornerCard bracketColor={run.TotalReturnPct != null && run.TotalReturnPct >= 0 ? 'var(--accent)' : 'var(--red)'} className={styles.statCard}>
               <span className={styles.statLabel}>Return</span>
               <span className={`${styles.statValue} ${run.TotalReturnPct != null && run.TotalReturnPct >= 0 ? styles.emerald : styles.red}`}>
                 {fmtPct(run.TotalReturnPct)}
@@ -162,7 +162,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
               <span className={styles.statLabel}>Win Rate</span>
               <span className={styles.statValue}>{fmtPct(run.WinRatePct)}</span>
             </CornerCard>
-            <CornerCard bracketColor="var(--border)" className={styles.statCard}>
+            <CornerCard bracketColor="var(--red)" className={styles.statCard}>
               <span className={styles.statLabel}>Max DD</span>
               <span className={`${styles.statValue} ${styles.red}`}>{fmtDrawdown(run.MaxDrawdownPct)}</span>
             </CornerCard>

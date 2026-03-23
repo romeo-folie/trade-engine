@@ -20,8 +20,8 @@
 
 .breadcrumb {
   font-family: var(--font-mono);
-  font-size: var(--font-size-base);
-  letter-spacing: 0.06em;
+  font-size: var(--font-size-sm);
+  letter-spacing: 0.05em;
 }
 
 .breadcrumbBrand {
@@ -36,9 +36,9 @@
 .autoRefresh {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   font-family: var(--font-mono);
-  font-size: var(--font-size-base);
+  font-size: var(--font-size-sm);
   color: var(--text-dim);
 }
 
@@ -54,10 +54,10 @@
 
 .pageTitle {
   font-family: var(--font-sans);
-  font-size: var(--font-size-stat);
+  font-size: var(--font-size-2xl);
   font-weight: 700;
   color: var(--text-primary);
-  margin: 0 0 var(--space-5) 0;
+  margin: 0 0 var(--space-4) 0;
   letter-spacing: 0.02em;
 }
 
@@ -92,27 +92,40 @@
 .searchInput {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-4);
   background: var(--card-bg);
-  border: 1px solid var(--border);
-  padding: 8px 16px;
+  border: 1px solid var(--border-muted);
+  padding: 6px 14px;
+  transition: all 0.2s ease;
+}
+
+.searchInput:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 8px rgba(57, 255, 20, 0.12);
+  background: rgba(255, 255, 255, 0.02);
 }
 
 .searchLabel {
   font-family: var(--font-mono);
-  font-size: var(--font-size-md);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
   color: var(--text-dim);
   white-space: nowrap;
 }
 
 .searchField {
   font-family: var(--font-mono);
-  font-size: var(--font-size-md);
+  font-size: 11px;
   color: var(--text-primary);
   background: transparent;
-  border: none;
-  outline: none;
-  min-width: 100px;
+  border: none !important;
+  outline: none !important;
+  box-shadow: none !important;
+  min-width: 80px;
+  flex: 1;
+  padding: 0;
+  margin: 0;
 }
 
 .searchField::placeholder {
@@ -130,51 +143,11 @@
 
 .filterPill {
   font-family: var(--font-mono);
-  font-size: var(--font-size-md);
-  font-weight: 700;
+  font-size: var(--font-size-xs);
+  font-weight: 400;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 6px 20px;
-  border: 1px solid;
-  background: transparent;
   cursor: pointer;
-  transition: background var(--transition-fast), color var(--transition-fast);
-}
-
-/* Green (ALL / BUY) */
-.pillGreenOutline {
-  color: var(--emerald);
-  border-color: var(--emerald);
-}
-
-.pillGreen {
-  background: var(--emerald);
-  color: var(--canvas-bg);
-  border-color: var(--emerald);
-}
-
-/* Red (SELL) */
-.pillRedOutline {
-  color: var(--red);
-  border-color: var(--red);
-}
-
-.pillRed {
-  background: var(--red);
-  color: var(--canvas-bg);
-  border-color: var(--red);
-}
-
-/* Amber (HOLD) */
-.pillAmberOutline {
-  color: var(--amber);
-  border-color: var(--amber);
-}
-
-.pillAmber {
-  background: var(--amber);
-  color: var(--canvas-bg);
-  border-color: var(--amber);
 }
 
 .filterPillActive {

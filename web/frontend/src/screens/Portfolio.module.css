@@ -9,6 +9,58 @@
   padding: var(--space-6);
 }
 
+/* ── Header row: breadcrumb + auto-refresh ────────────────────────────────── */
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+
+.breadcrumb {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  letter-spacing: 0.05em;
+}
+
+.breadcrumbBrand {
+  color: var(--cyan);
+}
+
+.breadcrumbSep,
+.breadcrumbPage {
+  color: var(--text-dim);
+}
+
+.autoRefresh {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+}
+
+.greenDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--emerald);
+  flex-shrink: 0;
+}
+
+/* ── Page title ───────────────────────────────────────────────────────────── */
+
+.pageTitle {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0 0 var(--space-4) 0;
+  letter-spacing: 0.02em;
+}
+
 /* Error banner — full-width above the KPI row */
 .fetchErrorBanner {
   width: 100%;

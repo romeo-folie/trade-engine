@@ -11,7 +11,7 @@ export interface WebEvent {
 export interface NodeState {
   id: string;
   label: string;
-  kind: 'source' | 'processing' | 'output';
+  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter';
   event_count: number;
   last_event_at?: string;
   avg_latency_ms?: number;
@@ -28,35 +28,36 @@ export interface SnapshotEvent {
 
 // Particle colours sourced from design tokens (tokens.css / tokens.ts).
 // Update here when the token palette changes to keep particles in sync.
-import { TOKENS } from '../styles/tokens';
+// Particle colours sourced from design tokens (tokens.css / tokens.ts).
+// Update here when the token palette changes to keep particles in sync.
 
 export const PARTICLE_COLORS: Record<string, string> = {
   // Market data
-  DataFetched:          TOKENS.blue,
-  IndicatorsComputed:   TOKENS.blue,
+  DataFetched:          '#22C55E', // emerald
+  IndicatorsComputed:   '#39FF14', // acidGreen
   // News
-  NewsIngested:         TOKENS.amber,
+  NewsIngested:         '#F59E0B', // amber
   // LLM / analysis
-  AnalysisCompleted:    TOKENS.violet,
+  AnalysisCompleted:    '#8B5CF6', // violet
   // Signal flow
-  SignalGenerated:      TOKENS.violet,
-  RiskCheckCompleted:   TOKENS.violet,
-  SignalQueued:         TOKENS.amber,
+  SignalGenerated:      '#8B5CF6', // violet
+  RiskCheckCompleted:   '#39FF14', // acidGreen
+  SignalQueued:         '#F59E0B', // amber
   // Execution
-  TradeExecuted:        TOKENS.emerald,
-  TradeSimulated:       TOKENS.emerald,
-  TradeClosed:          TOKENS.red,
-  PositionUpdated:      TOKENS.emerald,
-  PortfolioSnapshot:    TOKENS.emerald,
+  TradeExecuted:        '#22C55E', // emerald
+  TradeSimulated:       '#22C55E', // emerald
+  TradeClosed:          '#EF4444', // red
+  PositionUpdated:      '#22C55E', // emerald
+  PortfolioSnapshot:    '#22C55E', // emerald
   // Blocked / expired
-  SignalBlocked:        TOKENS.textDim,
-  SignalExpired:        TOKENS.textDim,
+  SignalBlocked:        '#6B7280', // textDim
+  SignalExpired:        '#6B7280', // textDim
   // Errors
-  ErrorOccurred:        TOKENS.red,
+  ErrorOccurred:        '#EF4444', // red
 };
 
 export function particleColor(eventType: string): string {
-  return PARTICLE_COLORS[eventType] ?? TOKENS.cyan;
+  return PARTICLE_COLORS[eventType] ?? '#39FF14';
 }
 
 // ── Event type → human label ─────────────────────────────────────────────────

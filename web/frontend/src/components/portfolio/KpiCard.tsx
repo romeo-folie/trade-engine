@@ -20,9 +20,9 @@ export default function KpiCard({ label, value, valueColor, prominent }: KpiCard
   return (
     <CornerCard
       active={prominent}
-      bracketColor={prominent ? 'var(--accent)' : 'var(--border)'}
+      bracketColor={valueColor ?? (prominent ? 'var(--accent)' : 'var(--border)')}
       bracketSize={10}
-      bracketWidth={1}
+      bracketWidth={1.5}
       className={`${styles.card} ${prominent ? styles.prominent : ''}`}
     >
       <span className={styles.label}>{label}</span>

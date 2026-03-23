@@ -4,7 +4,7 @@
   position: fixed;
   inset: 0;
   background: rgba(0, 0, 0, 0.5);
-  z-index: var(--z-panel);
+  z-index: 500;
 }
 
 .panel {
@@ -17,7 +17,7 @@
   max-width: 90vw;
   background: var(--panel-bg);
   border-left: 1px solid var(--border);
-  z-index: var(--z-modal);
+  z-index: 600;
   display: flex;
   flex-direction: column;
   overflow-y: auto;

@@ -4,8 +4,8 @@
   left: 0;
   right: 0;
   height: var(--topbar-height);
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  background: transparent;
+  border-bottom: 1px solid var(--border-muted);
   display: flex;
   align-items: center;
   justify-content: space-between;

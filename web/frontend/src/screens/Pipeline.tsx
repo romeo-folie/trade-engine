@@ -38,14 +38,20 @@ export default function PipelineScreen() {
 
   return (
     <div className={styles.screen}>
-      <HubGraph
-        nodes={nodes}
-        nodeMetrics={nodeMetrics}
-        recentEventSignatures={recentEventSignatures}
-        onNodeClick={handleNodeClick}
-      />
-      <EventFeed events={events} />
-      <DrillDownPanel nodeId={selectedNodeId} onClose={handleClose} />
+      <div className={styles.canvasTag}>
+        <span className={styles.tagLabel}>Signals</span>
+      </div>
+      
+      <div className={styles.innerFrame}>
+        <HubGraph
+          nodes={nodes}
+          nodeMetrics={nodeMetrics}
+          recentEventSignatures={recentEventSignatures}
+          onNodeClick={handleNodeClick}
+        />
+        <EventFeed events={events} />
+        <DrillDownPanel nodeId={selectedNodeId} onClose={handleClose} />
+      </div>
     </div>
   );
 }

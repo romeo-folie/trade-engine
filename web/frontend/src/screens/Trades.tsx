@@ -10,6 +10,8 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
+import { ChamferedBox } from '../components/common/ChamferedBox';
+import { colors } from '../styles/tokens';
 import type { Column } from '../components/table/DataTable';
 import { fmtPrice, fmtDate } from '../utils/format';
 import styles from './Trades.module.css';
@@ -71,12 +73,7 @@ function pnlClass(n: number): string {
   return '';
 }
 
-function statusBadgeClass(status: string): string {
-  const s = status.toLowerCase();
-  if (s === 'open') return styles.badgeOpen;
-  if (s === 'closed') return styles.badgeClosed;
-  return styles.badgeCancelled;
-}
+
 
 /* ── Analyst colour map ───────────────────────────────────────────────────── */
 
@@ -177,11 +174,33 @@ const COLUMNS: Column<Trade>[] = [
   {
     key: 'Status',
     label: 'STATUS',
-    render: (t) => (
-      <span className={`${styles.badge} ${statusBadgeClass(t.Status)} chamfer-sm`}>
-        {t.Status.toUpperCase()}
-      </span>
-    ),
+    render: (t) => {
+      const status = t.Status.toLowerCase();
+      let color = colors.borderMuted;
+      let bg = 'transparent';
+      let text = 'var(--text-primary)';
+
+      if (status === 'open') { color = colors.acidGreen; bg = colors.acidGreen; text = '#0D0D11'; }
+      else if (status === 'closed') { color = colors.borderMuted; bg = 'rgba(255, 255, 255, 0.05)'; text = 'var(--text-muted)'; }
+
+      return (
+        <ChamferedBox
+          chamfer={4}
+          backgroundColor={bg}
+          borderColor={color}
+          style={{
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: '1px 6px'
+          }}
+        >
+          <span style={{ fontSize: 9, fontWeight: 700, color: text }}>
+            {t.Status.toUpperCase()}
+          </span>
+        </ChamferedBox>
+      );
+    },
   },
   {
     key: 'OpenedAt',
@@ -292,7 +311,13 @@ export default function TradesScreen() {
               <span
                 key={a.name}
                 className={`${styles.analystPill} chamfer-sm`}
-                style={{ borderColor: ANALYST_PILL_COLORS[a.name] ?? 'var(--border)' }}
+                style={{
+                  padding: '1px 8px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  borderColor: ANALYST_PILL_COLORS[a.name] ?? 'var(--border)'
+                }}
               >
                 <span style={{ color: ANALYST_PILL_COLORS[a.name] ?? 'var(--text-muted)' }}>{a.name.toUpperCase()}</span>
                 <span style={{ color: verdictColor(a.verdict) }}>{a.verdict}</span>
@@ -379,7 +404,19 @@ export default function TradesScreen() {
 
   return (
     <div className={styles.screen}>
-      <div className={styles.sectionLabel}>TRADES</div>
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>TRADES</span>
+        </div>
+        <div className={styles.autoRefresh}>
+          <span className={styles.greenDot} />
+          AUTO-REFRESH 30s
+        </div>
+      </div>
+
+      <h1 className={styles.pageTitle}>TRADES</h1>
 
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">
@@ -403,13 +440,13 @@ export default function TradesScreen() {
           <span className={styles.summaryLabel}>OPEN{periodLabel}</span>
           <span className={styles.summaryValue}>{summary.openCount}</span>
         </CornerCard>
-        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
+        <CornerCard bracketColor={summary.winRate >= 50 ? 'var(--accent)' : 'var(--red)'} className={styles.summaryCard}>
           <span className={styles.summaryLabel}>WIN RATE{periodLabel}</span>
           <span className={`${styles.summaryValue} ${summary.winRate >= 50 ? styles.positive : styles.negative}`}>
             {summary.winRate.toFixed(1)}%
           </span>
         </CornerCard>
-        <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
+        <CornerCard bracketColor={summary.avgPnl >= 0 ? 'var(--accent)' : 'var(--red)'} className={styles.summaryCard}>
           <span className={styles.summaryLabel}>AVG P&amp;L{periodLabel}</span>
           <span className={`${styles.summaryValue} ${pnlClass(summary.avgPnl)}`}>
             {fmtPnl(summary.avgPnl)}

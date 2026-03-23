@@ -116,7 +116,15 @@ export default function BacktestsScreen() {
 
   return (
     <div className={styles.screen}>
-      <div className={styles.sectionLabel}>BACKTESTS</div>
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>BACKTESTS</span>
+        </div>
+      </div>
+
+      <h1 className={styles.pageTitle}>BACKTESTS</h1>
 
       {fetchError && (
         <div className={styles.fetchErrorBanner} role="alert">

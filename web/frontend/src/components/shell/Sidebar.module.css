@@ -4,8 +4,8 @@
   left: 0;
   bottom: 0;
   width: var(--sidebar-collapsed);
-  background: var(--surface);
-  border-right: 1px solid var(--border);
+  background: transparent;
+  border-right: 1px solid var(--border-muted);
   display: flex;
   flex-direction: column;
   padding: var(--space-2) 0;

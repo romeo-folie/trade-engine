@@ -27,7 +27,7 @@ export default function CornerCard({
   active,
   bracketColor,
   bracketSize = 10,
-  bracketWidth = 1,
+  bracketWidth = 1.5,
   hideBrackets,
   className,
   style,

@@ -1,6 +1,7 @@
 import { memo, type CSSProperties } from 'react';
 import { BaseEdge, getBezierPath, type EdgeProps } from '@xyflow/react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { colors } from '../styles/tokens';
 
 export interface ParticleInfo {
   id: string;
@@ -60,11 +61,15 @@ export const AnimatedEdge = memo(function AnimatedEdge({
     <>
       <BaseEdge id={id} path={edgePath} style={{
         ...style,
-        stroke: edgeColor,
-        strokeWidth: isActive ? 2 : 1,
+        stroke: isActive ? colors.acidGreen : colors.borderMuted,
+        strokeWidth: 1,
+        strokeDasharray: isActive ? '5 5' : 'none',
+        animation: isActive ? 'edge-dash 0.5s linear infinite' : 'none',
         filter: isActive ? 'url(#edge-glow)' : undefined,
-        transition: 'stroke 0.3s, stroke-width 0.3s',
+        transition: 'stroke 0.3s',
       }} />
+
+      {/* Global CSS for the dash animation would be needed in global.css or similar */}
 
       {/* Color-coded particles flowing along the edge */}
       <AnimatePresence>

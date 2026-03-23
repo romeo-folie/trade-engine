@@ -13,10 +13,44 @@ import type { NodeMetrics } from '../hooks/useEngineSocket';
 import { PipelineNode } from './PipelineNode';
 import { AnimatedEdge, GlowDefs } from './AnimatedEdge';
 import type { ParticleInfo } from './AnimatedEdge';
+import { colors } from '../styles/tokens';
 
 // ── Layout constants ──────────────────────────────────────────────────────────
-const COL = { source: 0, processing: 400, output: 820 };
-const ROW_GAP = 110;
+const COL = { 
+  source: 0, 
+  processing: 320, // Arbiter / Processing
+  analysis: 680,   // Analysts
+  synthesis: 1040, // Synthesis / Risk
+  output: 1360     // Execution / Portfolio
+};
+const ROW_GAP = 160;
+
+// Helper to determine column position based on node properties
+function getNodePosition(node: NodeState, index: number): { x: number, y: number } {
+  if (node.kind === 'source') return { x: COL.source, y: index * ROW_GAP + 100 };
+  
+  // Specific assignments based on ID to match hub-and-spoke
+  if (node.id === 'data_enrichment' || node.id === 'indicator_engine' || node.id === 'prompt_assembly') {
+    return { x: COL.processing, y: 180 }; // Stacked or single
+  }
+  
+  if (node.id.includes('analysis')) {
+    // If we have multiple analyses, we could spread them. For now, assume one or few.
+    return { x: COL.analysis, y: index * ROW_GAP + 60 };
+  }
+  
+  if (node.id === 'consensus' || node.id === 'risk_manager') {
+    return { x: COL.synthesis, y: 180 };
+  }
+  
+  if (node.id === 'executor' || node.id === 'portfolio') {
+    return { x: COL.output, y: 180 };
+  }
+
+  // Fallback
+  const x = node.kind === 'output' ? COL.output : COL.processing;
+  return { x, y: index * ROW_GAP + 60 };
+}
 
 interface PipelineGraphProps {
   nodes: NodeState[];
@@ -31,48 +65,33 @@ const edgeTypes = { animated: AnimatedEdge };
 export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: PipelineGraphProps) {
   // Assign positions per column.
   const flowNodes: Node[] = useMemo(() => {
-    const byKind: Record<string, NodeState[]> = { source: [], processing: [], output: [] };
-    for (const n of nodes) byKind[n.kind]?.push(n);
-
-    const result: Node[] = [];
-    for (const [kind, kindNodes] of Object.entries(byKind)) {
-      kindNodes.forEach((n, i) => {
-        result.push({
-          id: n.id,
-          type: 'pipeline',
-          position: { x: COL[kind as keyof typeof COL], y: i * ROW_GAP + 60 },
-          data: {
-            nodeState: n,
-            isActive: isRecentlyActive(n, events),
-            metrics: nodeMetrics[n.id],
-          },
-        });
-      });
-    }
-    return result;
+    return nodes.map((n, i) => ({
+      id: n.id,
+      type: 'pipeline',
+      position: getNodePosition(n, i),
+      data: {
+        nodeState: n,
+        isActive: isRecentlyActive(n, events),
+        metrics: nodeMetrics[n.id],
+      },
+    }));
   }, [nodes, events, nodeMetrics]);
 
-  // Build edges with particle data from recent events.
+  // ... [keep flowEdges logic as is for now, just ensure colors come from tokens]
   const flowEdges: Edge[] = useMemo(() => {
     // Collect recent particles per edge.
     const edgeParticles: Record<string, ParticleInfo[]> = {};
-    const edgeColors: Record<string, string> = {};
     const recentEvents = events.slice(0, 30);
 
     for (const ev of recentEvents) {
       const edgeKey = `${ev.source}-${ev.target}`;
       if (!edgeParticles[edgeKey]) edgeParticles[edgeKey] = [];
-      // Limit particles per edge to avoid visual clutter.
       if (edgeParticles[edgeKey].length < 4) {
         edgeParticles[edgeKey].push({
           id: `${ev.type}-${ev.timestamp}-${edgeParticles[edgeKey].length}`,
           color: particleColor(ev.type),
           timestamp: new Date(ev.timestamp).getTime(),
         });
-      }
-      // Edge color follows the most recent event type.
-      if (!edgeColors[edgeKey]) {
-        edgeColors[edgeKey] = particleColor(ev.type);
       }
     }
 
@@ -81,15 +100,13 @@ export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: Pipel
     return STATIC_EDGES.map(e => {
       const key = `${e.source}-${e.target}`;
       const isActive = activeEdges.has(key);
-      const color = edgeColors[key] ?? (isActive ? '#00f5ff' : '#2d2b45');
       return {
         ...e,
         type: 'animated' as const,
-        animated: false, // we handle animation via particles
+        animated: false,
         data: {
           active: isActive,
           particles: edgeParticles[key] ?? [],
-          edgeColor: color,
         },
       };
     });
@@ -101,7 +118,7 @@ export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: Pipel
   );
 
   return (
-    <div style={{ height: '100%', background: '#0D1117' }}>
+    <div style={{ height: '100%', background: colors.canvas }}>
       <GlowDefs />
       <ReactFlow
         nodes={flowNodes}
@@ -114,7 +131,13 @@ export function PipelineGraph({ nodes, events, nodeMetrics, onNodeClick }: Pipel
         proOptions={{ hideAttribution: true }}
         colorMode="dark"
       >
-        <Background variant={BackgroundVariant.Dots} color="#1e1b35" gap={24} />
+        <Background 
+          variant={BackgroundVariant.Dots} 
+          color={colors.borderMuted} 
+          gap={20} 
+          size={1}
+          style={{ opacity: 0.2 }}
+        />
       </ReactFlow>
     </div>
   );

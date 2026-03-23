@@ -7,49 +7,57 @@
   color: var(--text-primary);
 }
 
-/* ── Header ── */
-.header {
+/* ── Header row: breadcrumb + info ────────────────────────────────────────── */
+
+.headerRow {
   display: flex;
   align-items: center;
-  gap: var(--space-4);
-  padding: var(--space-3) var(--space-6);
-  border-bottom: 1px solid var(--border-muted);
-  flex-shrink: 0;
+  justify-content: space-between;
+  padding: var(--space-6) var(--space-6) 0 var(--space-6);
+  margin-bottom: var(--space-4);
 }
 
-.headerTitle {
+.breadcrumb {
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
-  font-weight: 700;
-  color: var(--accent);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0.05em;
 }
 
-.headerSub {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.breadcrumbBrand {
+  color: var(--cyan);
+}
+
+.breadcrumbSep,
+.breadcrumbPage {
+  color: var(--text-dim);
 }
 
 .headerRight {
-  margin-left: auto;
   display: flex;
   align-items: center;
   gap: var(--space-3);
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  font-size: var(--font-size-sm);
   color: var(--text-dim);
 }
 
 .statusDot {
   display: inline-block;
-  width: 6px;
-  height: 6px;
+  width: 8px;
+  height: 8px;
   border-radius: 50%;
   background: var(--emerald);
+}
+
+/* ── Page title ───────────────────────────────────────────────────────────── */
+
+.pageTitle {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-2xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  margin: 0 var(--space-6) var(--space-4) var(--space-6);
+  letter-spacing: 0.02em;
 }
 
 /* ── Content ── */
@@ -94,46 +102,73 @@
 }
 
 /* ── Inputs ── */
-.input {
-  width: 150px;
-  padding: 6px 12px;
-  font-family: var(--font-mono);
-  font-size: var(--font-size-sm);
-  color: var(--text-primary);
+.input,
+.inputWithUnit {
+  width: 120px;
+  height: 32px;
   background: var(--card-bg);
   border: 1px solid var(--border);
   border-radius: 4px;
-  text-align: right;
-  outline: none;
-  transition: border-color var(--transition-fast);
-}
-
-.input:focus {
-  border-color: var(--accent);
-}
-
-.inputWithUnit {
   display: flex;
   align-items: center;
-  gap: 0;
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast);
+  outline: none;
+  flex-shrink: 0;
 }
 
-.inputWithUnit .input {
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
-  border-right: none;
+.input:focus,
+.inputWithUnit:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent); /* Single clean border effect */
+}
+
+/* Internal raw input element */
+.inputField {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  padding: 0 10px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  background: transparent;
+  border: none !important;
+  outline: none !important;
+  text-align: right;
+  min-width: 0;
+}
+
+/* Chrome, Safari, Edge, Opera */
+.inputField::-webkit-outer-spin-button,
+.inputField::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  appearance: none;
+  margin: 0;
+}
+
+/* Firefox */
+.inputField[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
 }
 
 .unit {
-  padding: 6px 8px;
+  padding: 0 8px;
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  font-size: 10px;
   color: var(--text-dim);
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  border-left: none;
-  border-radius: 0 4px 4px 0;
-  white-space: nowrap;
+  border-left: 1px solid var(--border);
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(255, 255, 255, 0.03);
+  min-width: 32px;
+  text-transform: uppercase;
+}
+
+.inputWithUnit:focus-within .unit {
+  border-left-color: var(--accent);
 }
 
 /* ── Model roles ── */
@@ -160,15 +195,9 @@
   font-size: 13px;
   background: transparent;
   border: 1px solid var(--border);
+  border-radius: 3px;
   padding: 2px 8px;
   transition: color var(--transition-fast), border-color var(--transition-fast);
-  clip-path: polygon(
-    0 0,
-    calc(100% - 6px) 0,
-    100% 6px,
-    100% 100%,
-    0 100%
-  );
 }
 
 .swapBtn:hover {
@@ -219,15 +248,9 @@
   height: 16px;
   background: var(--card-bg);
   border: 1px solid var(--border);
+  border-radius: 2px;
   cursor: pointer;
   position: relative;
-  clip-path: polygon(
-    0 0,
-    calc(100% - 4px) 0,
-    100% 4px,
-    100% 100%,
-    0 100%
-  );
 }
 
 .checkbox:checked {
@@ -242,6 +265,7 @@
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-dim);
+  margin-bottom: var(--space-2);
 }
 
 /* ── System Actions ── */
@@ -295,7 +319,7 @@
 
 .discardBtn {
   flex: 1;
-  padding: 10px 24px;
+  padding: 12px 24px;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -304,24 +328,20 @@
   color: var(--text-muted);
   background: transparent;
   border: 1px solid var(--border);
+  border-radius: 4px;
   cursor: pointer;
-  transition: opacity var(--transition-fast);
-  clip-path: polygon(
-    0 0,
-    calc(100% - 12px) 0,
-    100% 12px,
-    100% 100%,
-    0 100%
-  );
+  transition: all var(--transition-fast);
+  text-align: center;
 }
 
 .discardBtn:hover {
-  opacity: 0.8;
+  border-color: var(--text-dim);
+  color: var(--text-primary);
 }
 
 .saveBtn {
   flex: 1;
-  padding: 10px 24px;
+  padding: 12px 24px;
   font-family: var(--font-mono);
   font-size: var(--font-size-sm);
   font-weight: 600;
@@ -330,15 +350,10 @@
   color: #111;
   background: var(--accent);
   border: 1px solid var(--accent);
+  border-radius: 4px;
   cursor: pointer;
   transition: opacity var(--transition-fast);
-  clip-path: polygon(
-    0 0,
-    calc(100% - 12px) 0,
-    100% 12px,
-    100% 100%,
-    0 100%
-  );
+  text-align: center;
 }
 
 .saveBtn:hover {

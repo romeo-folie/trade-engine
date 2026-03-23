@@ -88,24 +88,9 @@
 }
 
 .actionBtn {
-  background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: var(--space-1) var(--space-3);
   cursor: pointer;
-  transition: color var(--transition-fast), border-color var(--transition-fast);
-}
-
-.actionBtn:hover {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-
-.actionBtn:focus-visible {
-  outline: 1px solid var(--accent);
-  outline-offset: 2px;
 }
