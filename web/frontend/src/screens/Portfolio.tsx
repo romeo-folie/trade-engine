@@ -13,7 +13,6 @@ import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import EquityCurve from '../components/portfolio/EquityCurve';
 import PositionsTable from '../components/portfolio/PositionsTable';
-import type { Position } from '../components/portfolio/PositionsTable';
 import styles from './Portfolio.module.css';
 
 /* ── API response types ─────────────────────────────────────────────────────── */
@@ -34,13 +33,6 @@ interface PortfolioSnapshot {
 /* ── Mock data ──────────────────────────────────────────────────────────────── */
 
 // TODO: replace with /api/positions when backend endpoint is available
-const MOCK_POSITIONS: Position[] = [
-  { ticker: 'BTC/USDT', direction: 'LONG', strategy: 'TREND', entry: 83241.50, current: 84120.00, unrealizedPnl: 878.50, pnlPct: 1.06 },
-  { ticker: 'ETH/USDT', direction: 'LONG', strategy: 'MOMENTUM', entry: 3780.60, current: 3842.10, unrealizedPnl: 246.00, pnlPct: 1.63 },
-  { ticker: 'SOL/USDT', direction: 'LONG', strategy: 'TREND', entry: 182.30, current: 186.90, unrealizedPnl: 138.00, pnlPct: 2.52 },
-  { ticker: 'NVDA', direction: 'SHORT', strategy: 'MEAN_REV', entry: 892.40, current: 901.20, unrealizedPnl: -352.00, pnlPct: -0.99 },
-  { ticker: 'BTC/USDT', direction: 'LONG', strategy: 'NEWS_SENT', entry: 83900.00, current: 86230.70, unrealizedPnl: 2330.70, pnlPct: 2.78 },
-];
 
 // TODO: replace with real equity history from /api/portfolio/history when available
 function generateMockEquityData(currentValue: number): { date: string; value: number }[] {
@@ -62,23 +54,8 @@ function generateMockEquityData(currentValue: number): { date: string; value: nu
 }
 
 // TODO: derive from DailySummary endpoint when available
-const MOCK_PERIOD_STATS = [
-  { label: 'Today', pnl: 1580.00, pct: 1.53 },
-  { label: 'This Week', pnl: 4200.00, pct: 4.17 },
-  { label: 'This Month', pnl: 8340.00, pct: 8.65 },
-  { label: 'All Time', pnl: 4821.50, pct: 4.82 },
-];
 
 // TODO: derive from trades data when sufficient history is available
-const MOCK_SYSTEM_STATS: { label: string; value: string; color?: string; sub?: string }[] = [
-  { label: 'Win Rate', value: '68.1%', color: TOKENS.emerald },
-  { label: 'Total Trades', value: '47' },
-  { label: 'Avg Hold Time', value: '2h 14m' },
-  { label: 'Max Drawdown', value: '-3.2%', color: TOKENS.red },
-  { label: 'Sharpe Ratio', value: '1.84' },
-  { label: 'Best Trade', value: '+$1,240', color: TOKENS.emerald, sub: 'NVDA LONG' },
-  { label: 'Worst Trade', value: '-$380', color: TOKENS.red, sub: 'TSLA SELL' },
-];
 
 /* ── Helpers ────────────────────────────────────────────────────────────────── */
 
@@ -207,49 +184,23 @@ export default function PortfolioScreen() {
       </div>
 
       {/* ── Open Positions ────────────────────────────────────────────────── */}
-      <PositionsTable positions={MOCK_POSITIONS} />
+      <PositionsTable positions={[]} />
 
       {/* ── Performance Metrics ───────────────────────────────────────────── */}
+      {/* Period and system stats require a dedicated summary endpoint.
+          Placeholder displayed until live data is wired. */}
       <div className={styles.metricsGrid}>
-        {/* Left — Period Performance */}
         <div className={styles.metricsSection}>
           <div className={styles.sectionLabel}>PERIOD PERFORMANCE</div>
-          {MOCK_PERIOD_STATS.map((row) => (
-            <div key={row.label} className={styles.metricRow}>
-              <span className={styles.metricLabel}>{row.label}</span>
-              <span>
-                <span className={`${styles.metricValue} ${row.pnl >= 0 ? styles.positive : styles.negative}`}>
-                  {fmtPnl(row.pnl)}
-                </span>
-                <span className={`${styles.metricSub} ${row.pct >= 0 ? styles.positive : styles.negative}`}>
-                  {row.pct >= 0 ? '+' : ''}{row.pct.toFixed(2)}%
-                </span>
-              </span>
-            </div>
-          ))}
+          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
+            — awaiting live data
+          </div>
         </div>
-
-        {/* Right — System Stats */}
         <div className={styles.metricsSection}>
           <div className={styles.sectionLabel}>SYSTEM STATS</div>
-          {MOCK_SYSTEM_STATS.map((row) => (
-            <div key={row.label} className={styles.metricRow}>
-              <span className={styles.metricLabel}>{row.label}</span>
-              <span>
-                <span
-                  className={styles.metricValue}
-                  style={row.color ? { color: row.color } : undefined}
-                >
-                  {row.value}
-                </span>
-                {row.sub && (
-                  <span className={styles.metricSub} style={{ color: TOKENS.textFaint }}>
-                    {row.sub}
-                  </span>
-                )}
-              </span>
-            </div>
-          ))}
+          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
+            — awaiting live data
+          </div>
         </div>
       </div>
     </div>

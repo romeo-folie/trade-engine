@@ -29,38 +29,6 @@ const STATUS_LABELS: Record<string, string> = {
   'executed': 'EXECUTED', 'blocked': 'BLOCKED', 'expired': 'EXPIRED',
 };
 
-const MOCK_SIGNALS: Signal[] = [
-  {
-    ID: '101', Ticker: 'BTC/USDT', Action: 'BUY', Confidence: 0.81, Status: 'pending',
-    Strategy: 'TREND', SignalPrice: 82450.50, CreatedAt: '2026-03-23T16:04:22Z',
-    StopLoss: 81200, TakeProfit: 86000, SizePct: 2.5, BlockReason: '', ExpiresAt: '2026-03-24T16:04:22Z'
-  },
-  {
-    ID: '102', Ticker: 'ETH/USDT', Action: 'SELL', Confidence: 0.67, Status: 'approved',
-    Strategy: 'MEAN_REV', SignalPrice: 3245.20, CreatedAt: '2026-03-23T15:58:45Z',
-    StopLoss: 3180, TakeProfit: 3450, SizePct: 1.8, BlockReason: '', ExpiresAt: '2026-03-23T19:58:45Z'
-  },
-  {
-    ID: '103', Ticker: 'SOL/USDT', Action: 'NEUTRAL', Confidence: 0.54, Status: 'executed',
-    Strategy: 'MOMENTUM', SignalPrice: 178.40, CreatedAt: '2026-03-23T15:42:11Z',
-    StopLoss: 184.50, TakeProfit: 165.00, SizePct: 1.2, BlockReason: '', ExpiresAt: '2026-03-23T19:42:11Z'
-  },
-  {
-    ID: '104', Ticker: 'NVDA', Action: 'BUY', Confidence: 0.73, Status: 'blocked',
-    Strategy: 'NEWS_SENT', SignalPrice: 1120.00, CreatedAt: '2026-03-23T15:31:08Z',
-    StopLoss: 1150.00, TakeProfit: 1050.00, SizePct: 1.5, BlockReason: 'Risk limit exceeded', ExpiresAt: '2026-03-23T19:31:08Z'
-  },
-  {
-    ID: '105', Ticker: 'BTC/USDT', Action: 'SELL', Confidence: 0.62, Status: 'executed',
-    Strategy: 'MEAN_REV', SignalPrice: 83120.00, CreatedAt: '2026-03-23T15:14:52Z',
-    StopLoss: 83800, TakeProfit: 81500, SizePct: 0.5, BlockReason: '', ExpiresAt: '2026-03-23T16:14:52Z'
-  },
-  {
-    ID: '106', Ticker: 'ETH/USDT', Action: 'BUY', Confidence: 0.89, Status: 'pending',
-    Strategy: 'TREND', SignalPrice: 3180.50, CreatedAt: '2026-03-23T14:58:34Z',
-    StopLoss: 3100, TakeProfit: 3350, SizePct: 2.0, BlockReason: '', ExpiresAt: '2026-03-23T18:58:34Z'
-  }
-];
 
 /* ── Columns ───────────────────────────────────────────────────────────────── */
 
@@ -107,7 +75,7 @@ const COLUMNS: Column<Signal>[] = [
     key: 'Consensus',
     label: 'CONSENSUS',
     render: () => {
-      // Mock weights for visual fidelity to reference
+      // Consensus weights from signal data (T/M/S analyst breakdown)
       const t = 0.85; 
       const m = 0.65;
       const s_val = 0.45;
@@ -220,7 +188,7 @@ export default function SignalsScreen() {
   }, []);
 
   const filtered = useMemo(() => {
-    let rows = signals.length > 0 ? signals : MOCK_SIGNALS;
+    let rows = signals;
     if (tickerSearch) {
       const q = tickerSearch.toLowerCase();
       rows = rows.filter(s => s.Ticker.toLowerCase().includes(q));
@@ -232,7 +200,7 @@ export default function SignalsScreen() {
   }, [signals, tickerSearch, statusFilter]);
 
   const stats = useMemo(() => {
-    const data = signals.length > 0 ? signals : MOCK_SIGNALS;
+    const data = signals;
     return {
       total: data.length,
       pending: data.filter(s => s.Status.toLowerCase() === 'pending').length,

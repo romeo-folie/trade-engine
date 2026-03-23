@@ -123,27 +123,7 @@ function eventDescription(ev: IndexedWebEvent): string {
   return parts.join(' ');
 }
 
-const MOCK_MODEL_PERF: ModelPerfRow[] = [
-  { Model: 'claude-sonnet', Provider: 'Anthropic', TradeCount: 38, WinRate: 0.714, AvgPnLPct: 0.0872, AvgLatencyMs: 1240, TokensPerCall: 2126 },
-  { Model: 'gpt-4o', Provider: 'OpenAI', TradeCount: 29, WinRate: 0.655, AvgPnLPct: 0.0614, AvgLatencyMs: 980, TokensPerCall: 1884 },
-  { Model: 'gemini-flash', Provider: 'Google', TradeCount: 22, WinRate: 0.591, AvgPnLPct: 0.0288, AvgLatencyMs: 620, TokensPerCall: 1540 },
-  { Model: 'claude-opus', Provider: 'Anthropic', TradeCount: 8, WinRate: 0.75, AvgPnLPct: 0.1246, AvgLatencyMs: 2840, TokensPerCall: 3210 }
-];
 
-const MOCK_EVENTS: IndexedWebEvent[] = [
-  { _seqId: 1, type: 'Signal', timestamp: '2026-03-23T16:04:22Z', payload: { ticker: 'BTC/USDT', strategy: 'TREND', confidence: 0.87, direction: 'BUY signal fired' }, source: "", target: "" },
-  { _seqId: 2, type: 'Analysis', timestamp: '2026-03-23T16:03:58Z', payload: { ticker: 'BTC/USDT', latency_ms: 1240, tokens: 2126 }, source: 'claude-sonnet called', target: "" },
-  { _seqId: 3, type: 'CacheHit', timestamp: '2026-03-23T16:03:44Z', payload: { ticker: 'ETH/USDT prompt', reason: 'skipped LLM call' }, source: 'Cache', target: "" },
-  { _seqId: 4, type: 'Trade', timestamp: '2026-03-23T16:03:12Z', payload: { ticker: 'BTC/USDT', direction: 'LONG', entry_price: 83241.50 }, source: 'Paper trade executed', target: "" },
-  { _seqId: 5, type: 'Signal', timestamp: '2026-03-23T15:58:45Z', payload: { ticker: 'ETH/USDT', strategy: 'MEAN_REV', confidence: 0.73, direction: 'SELL signal fired' }, source: "", target: "" },
-  { _seqId: 6, type: 'Risk', timestamp: '2026-03-23T15:52:07Z', payload: { reason: 'positions 5/10 · drawdown 2.1%' }, source: 'Risk check passed', target: "" },
-  { _seqId: 7, type: 'CacheSave', timestamp: '2026-03-23T15:44:18Z', payload: { ticker: 'SOL/USDT prompt', reason: 'saved LLM call' }, source: 'Cache', target: "" },
-  { _seqId: 8, type: 'Signal', timestamp: '2026-03-23T15:38:50Z', payload: { ticker: 'NVDA', strategy: 'MOMENTUM', confidence: 0.91, direction: 'BUY signal fired' }, source: "", target: "" },
-  { _seqId: 9, type: 'Blocked', timestamp: '2026-03-23T15:31:08Z', payload: { reason: 'daily loss limit 3.0% approaching' }, source: 'NVDA signal blocked', target: "" },
-  { _seqId: 10, type: 'Analysis', timestamp: '2026-03-23T15:28:34Z', payload: { ticker: 'BTC/USDT', latency_ms: 1020, tokens: 1790 }, source: 'gpt-4o called', target: "" },
-  { _seqId: 11, type: 'Trade', timestamp: '2026-03-23T15:14:02Z', payload: { ticker: 'ETH/USDT', direction: 'LONG', entry_price: 3788.60 }, source: 'Paper trade executed', target: "" },
-  { _seqId: 12, type: 'Analysis', timestamp: '2026-03-23T15:02:48Z', payload: { ticker: 'BTC/USDT', latency_ms: 2840, tokens: 3210 }, source: 'claude-opus called', target: "" },
-];
 
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
@@ -221,27 +201,27 @@ export default function SystemScreen() {
     ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
     : '—';
 
-  const openPositions = riskData?.open_trade_count ?? 5;
-  const activityEvents = events.length > 0 ? events.slice(0, 100) : MOCK_EVENTS;
-  const displayPerf = modelPerf.length > 0 ? modelPerf : MOCK_MODEL_PERF;
+  const openPositions = riskData?.open_trade_count ?? '—';
+  const activityEvents = events.slice(0, 100);
+  const displayPerf = modelPerf;
 
-  const displayCache = cacheStats || { hits: 4821, misses: 921, evictions: 142, errors: 3 };
-  const displayHitRate = cacheHitRate !== '—' ? cacheHitRate : '84.0%';
+  const displayCache = cacheStats;
+  const displayHitRate = cacheHitRate;
 
   const KPI_DATA = [
     { label: 'ENGINE MODE', value: mode.toUpperCase(), color: mode.toUpperCase() === 'PAPER' ? styles.kpiAmber : styles.kpiGreen },
-    { label: 'TICK INTERVAL', value: tickDisplay !== '—' ? tickDisplay : '15m' },
-    { label: 'SIGNALS TODAY', value: signalCount ?? 48 },
-    { label: 'CACHE HIT RATE', value: displayHitRate, color: styles.kpiGreen },
-    { label: 'DRAWDOWN', value: '2.1%', color: styles.kpiGreen },
+    { label: 'TICK INTERVAL', value: tickDisplay },
+    { label: 'SIGNALS TODAY', value: signalCount ?? '—' },
+    { label: 'CACHE HIT RATE', value: displayHitRate },
+    { label: 'DRAWDOWN', value: '—' },
     { label: 'OPEN POSITIONS', value: openPositions },
   ];
 
   const CACHE_STATS_DATA = [
-    { label: 'HITS', value: displayCache.hits.toLocaleString(), color: styles.kpiGreen },
-    { label: 'MISSES', value: displayCache.misses.toLocaleString() },
-    { label: 'EVICTIONS', value: displayCache.evictions.toLocaleString() },
-    { label: 'ERRORS', value: displayCache.errors.toLocaleString(), color: (displayCache.errors ?? 0) > 0 ? styles.kpiRed : undefined },
+    { label: 'HITS', value: displayCache?.hits.toLocaleString() ?? '—', color: styles.kpiGreen },
+    { label: 'MISSES', value: displayCache?.misses.toLocaleString() ?? '—' },
+    { label: 'EVICTIONS', value: displayCache?.evictions.toLocaleString() ?? '—' },
+    { label: 'ERRORS', value: displayCache?.errors.toLocaleString() ?? '—', color: (displayCache?.errors ?? 0) > 0 ? styles.kpiRed : undefined },
   ];
 
   return (
