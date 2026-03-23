@@ -1,6 +1,9 @@
-import { memo, useState } from 'react';
+import { memo, useMemo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { motion, AnimatePresence } from 'framer-motion';
+import { motion } from 'framer-motion';
+import { colors, typography } from '../styles/tokens';
+import { CornerBrackets } from './common/CornerBrackets';
+import { ChamferedBox } from './common/ChamferedBox';
 import type { NodeState } from '../types/protocol';
 import type { NodeMetrics } from '../hooks/useEngineSocket';
 
@@ -11,126 +14,178 @@ interface PipelineNodeData {
   [key: string]: unknown;
 }
 
-const KIND_COLORS: Record<string, { border: string; glow: string; accent: string }> = {
-  source:     { border: '#00b4ff', glow: '0 0 12px #00b4ff44', accent: '#00b4ff' },
-  processing: { border: '#a855f7', glow: '0 0 12px #a855f744', accent: '#a855f7' },
-  output:     { border: '#22c55e', glow: '0 0 12px #22c55e44', accent: '#22c55e' },
-};
+/**
+ * Maps node logic to visual roles as per DESIGN_SPEC.md
+ */
+type NodeRole = 'SIGNAL_SOURCE' | 'ARBITER' | 'ANALYST' | 'SYNTHESIS' | 'EXECUTION' | 'DEFAULT';
+
+function getNodeRole(node: NodeState): NodeRole {
+  if (node.kind === 'source') return 'SIGNAL_SOURCE';
+  if (node.id === 'data_enrichment' || node.id === 'indicator_engine' || node.id === 'prompt_assembly') return 'ARBITER';
+  if (node.id.includes('analysis') || node.id.includes('analyst')) return 'ANALYST';
+  if (node.id === 'consensus' || node.id === 'risk_manager') return 'SYNTHESIS';
+  if (node.id === 'executor' || node.id === 'portfolio') return 'EXECUTION';
+  return 'DEFAULT';
+}
 
 export const PipelineNode = memo(function PipelineNode({ data }: NodeProps) {
-  const { nodeState, isActive, metrics } = data as PipelineNodeData;
-  const colors = KIND_COLORS[nodeState.kind] ?? KIND_COLORS.processing;
-  const [hovered, setHovered] = useState(false);
+  const { nodeState, isActive } = data as PipelineNodeData;
+  const role = useMemo(() => getNodeRole(nodeState), [nodeState]);
+  
+  // Extract meta data with defaults for "polishing"
+  const meta = nodeState.meta || {};
+  const label = nodeState.label || 'UNKNOWN';
+  const subLabel = (meta.subLabel as string) || '';
+  const value = (meta.value as string) || '';
+  const trend = (meta.trend as string) || ''; // e.g. "+2.4%"
+  const status = (meta.status as string) || 'ACTIVE'; // e.g. "LONG", "NEUTRAL"
+  
+  // Analyst specific
+  const analystType = (meta.analystType as keyof typeof colors) || 'analystTechnical';
+  const analystColor = colors[analystType] || colors.indigo;
 
-  const eventCount = metrics?.eventCount ?? nodeState.event_count;
-  const lastEventAt = metrics?.lastEventAt
-    ? new Date(metrics.lastEventAt).toLocaleTimeString()
-    : nodeState.last_event_at
-      ? new Date(nodeState.last_event_at).toLocaleTimeString()
-      : null;
+  const renderContent = () => {
+    switch (role) {
+      case 'SIGNAL_SOURCE':
+        return (
+          <div style={{ padding: '12px 16px' }}>
+            <div style={{ color: colors.textDim, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 4 }}>SIGNAL SOURCE</div>
+            <div style={{ color: colors.textMuted, fontSize: 11, fontFamily: typography.mono, marginBottom: 8 }}>{subLabel || 'BTC / USDT'}</div>
+            <div style={{ color: colors.textPrimary, fontSize: 20, fontFamily: typography.sans, fontWeight: 700 }}>{label || 'BTC'}</div>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginTop: 4 }}>
+              <div style={{ color: colors.textPrimary, fontSize: 14, fontFamily: typography.mono }}>{value || '$84,192.30'}</div>
+              <div style={{ color: colors.emerald, fontSize: 10, fontFamily: typography.mono }}>{trend || '+2.4%'}</div>
+            </div>
+          </div>
+        );
+
+      case 'ARBITER':
+        return (
+          <div style={{ padding: '12px 16px' }}>
+             <div style={{ color: colors.acidGreen, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 4 }}>ARBITER</div>
+             <div style={{ color: colors.textPrimary, fontSize: 14, fontFamily: typography.sans, fontWeight: 600, marginBottom: 8 }}>{label}</div>
+             <div style={{ color: colors.textDim, fontSize: 9, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 4 }}>ROUTING TO:</div>
+             <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+                {['Technical', 'Momentum', 'Sentiment'].map(a => (
+                  <div key={a} style={{ fontSize: 9, padding: '2px 6px', border: `1px solid ${colors.border}`, borderRadius: 2, color: colors.textMuted }}>{a}</div>
+                ))}
+             </div>
+          </div>
+        );
+
+      case 'ANALYST':
+        return (
+          <CornerBrackets color={analystColor} active={isActive}>
+            <div style={{ padding: '8px 4px', minWidth: 160 }}>
+              <div style={{ color: analystColor, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 2 }}>ANALYST</div>
+              <div style={{ color: colors.textPrimary, fontSize: 13, fontFamily: typography.sans, fontWeight: 500, marginBottom: 8 }}>{label.replace('Analyst', '').trim()}</div>
+              <div style={{ color: colors.emerald, fontSize: 16, fontFamily: typography.mono, fontWeight: 700, letterSpacing: '0.05em' }}>{status || 'LONG'}</div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginTop: 4 }}>
+                <span style={{ color: colors.textDim, fontSize: 9 }}>CONFIDENCE</span>
+                <span style={{ color: colors.textMuted, fontSize: 9 }}>87%</span>
+              </div>
+            </div>
+          </CornerBrackets>
+        );
+
+      case 'SYNTHESIS':
+        return (
+          <div style={{ padding: '12px 16px' }}>
+            <div style={{ color: colors.amber, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 4 }}>SYNTHESIS</div>
+            <div style={{ color: colors.textPrimary, fontSize: 13, fontFamily: typography.sans, fontWeight: 500, marginBottom: 8 }}>Ensemble</div>
+            <div style={{ width: '100%', height: 40, display: 'flex', flexDirection: 'column', gap: 4, justifyContent: 'center' }}>
+               <div style={{ width: '80%', height: 4, background: colors.indigo, borderRadius: 2 }} />
+               <div style={{ width: '60%', height: 4, background: colors.amber, borderRadius: 2 }} />
+               <div style={{ width: '45%', height: 4, background: colors.violet, borderRadius: 2 }} />
+            </div>
+            <div style={{ color: colors.emerald, fontSize: 16, fontFamily: typography.mono, fontWeight: 700, marginTop: 4 }}>LONG 0.81</div>
+          </div>
+        );
+
+      case 'EXECUTION':
+        return (
+          <div style={{ padding: '12px 16px' }}>
+            <div style={{ color: colors.emerald, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase', marginBottom: 4 }}>EXECUTION</div>
+            <div style={{ color: colors.textPrimary, fontSize: 13, fontFamily: typography.sans, fontWeight: 500, marginBottom: 8 }}>Live Router</div>
+            <div style={{ background: `${colors.emerald}22`, color: colors.emerald, fontSize: 10, padding: '2px 8px', borderRadius: 4, display: 'inline-block', marginBottom: 8 }}>LONG</div>
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 4, fontSize: 9, color: colors.textDim }}>
+               <span>SIZE</span><span style={{ color: colors.textPrimary }}>$12,500</span>
+               <span>ENTRY</span><span style={{ color: colors.textPrimary }}>$83,261.50</span>
+            </div>
+          </div>
+        );
+
+      default:
+        return (
+          <div style={{ padding: '12px 16px' }}>
+            <div style={{ color: colors.textDim, fontSize: 10, fontFamily: typography.mono, textTransform: 'uppercase' }}>{nodeState.kind}</div>
+            <div style={{ color: colors.textPrimary, fontSize: 14, fontFamily: typography.sans, fontWeight: 600 }}>{label}</div>
+          </div>
+        );
+    }
+  };
+
+  const showLeftStrip = role === 'SIGNAL_SOURCE' || role === 'ARBITER' || role === 'SYNTHESIS';
+  const stripColor = role === 'SIGNAL_SOURCE' ? colors.slate : role === 'ARBITER' ? colors.acidGreen : colors.amber;
 
   return (
     <motion.div
-      onMouseEnter={() => setHovered(true)}
-      onMouseLeave={() => setHovered(false)}
-      animate={isActive
-        ? { boxShadow: [colors.glow, `0 0 24px ${colors.border}66`, colors.glow] }
-        : { boxShadow: '0 0 0px transparent' }
-      }
-      transition={isActive ? { duration: 1.2, repeat: Infinity, ease: 'easeInOut' } : {}}
-      style={{
-        background: isActive
-          ? 'linear-gradient(135deg, #16133e 0%, #1a1648 100%)'
-          : '#12103a',
-        border: `1.5px solid ${isActive ? colors.border : '#2d2b45'}`,
-        borderRadius: 10,
-        padding: '12px 18px',
-        minWidth: 180,
-        cursor: 'pointer',
-        transition: 'border-color 0.3s, background 0.3s',
-        position: 'relative',
-      }}
+      whileHover={{ scale: 1.02 }}
+      transition={{ duration: 0.2 }}
+      style={{ cursor: 'pointer', position: 'relative' }}
     >
-      <Handle type="target" position={Position.Left} style={{ background: colors.border, width: 8, height: 8 }} />
+      <Handle 
+        type="target" 
+        position={Position.Left} 
+        style={{ 
+          background: colors.border, 
+          width: 8, height: 8, 
+          border: `2px solid ${colors.canvas}`,
+          zIndex: 10 
+        }} 
+      />
 
-      {/* Active indicator dot */}
+      <ChamferedBox 
+        isActive={isActive}
+        backgroundColor={colors.cardBg}
+        borderColor={isActive ? colors.acidGreen : colors.border}
+        style={{ minWidth: role === 'ARBITER' ? 280 : 220 }}
+      >
+        <div style={{ display: 'flex', position: 'relative' }}>
+          {showLeftStrip && (
+            <div style={{ width: 4, backgroundColor: stripColor, flexShrink: 0 }} />
+          )}
+          <div style={{ flexGrow: 1 }}>
+            {renderContent()}
+          </div>
+        </div>
+      </ChamferedBox>
+
+      <Handle 
+        type="source" 
+        position={Position.Right} 
+        style={{ 
+          background: colors.border, 
+          width: 8, height: 8, 
+          border: `2px solid ${colors.canvas}`,
+          zIndex: 10 
+        }} 
+      />
+      
+      {/* Active pulse */}
       {isActive && (
         <motion.div
-          animate={{ opacity: [1, 0.3, 1] }}
+          animate={{ opacity: [1, 0.4, 1] }}
           transition={{ duration: 1.5, repeat: Infinity }}
           style={{
-            position: 'absolute', top: 8, right: 10,
-            width: 6, height: 6, borderRadius: '50%',
-            background: colors.accent,
-            boxShadow: `0 0 6px ${colors.accent}`,
+            position: 'absolute', top: 4, right: 4,
+            width: 4, height: 4, borderRadius: '50%',
+            background: colors.acidGreen,
+            boxShadow: `0 0 6px ${colors.acidGreen}`,
+            zIndex: 20
           }}
         />
       )}
-
-      <div style={{
-        color: '#e2e0ff',
-        fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-        fontSize: 12,
-        fontWeight: 600,
-        letterSpacing: '0.02em',
-      }}>
-        {nodeState.label}
-      </div>
-
-      <div style={{
-        display: 'flex', gap: 8, alignItems: 'center',
-        marginTop: 5,
-        fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-        fontSize: 10,
-      }}>
-        <span style={{ color: '#6b6b8f', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          {nodeState.kind}
-        </span>
-        {eventCount > 0 && (
-          <span style={{ color: colors.accent, fontWeight: 500 }}>
-            {eventCount.toLocaleString()} ev
-          </span>
-        )}
-      </div>
-
-      {/* Hover tooltip with metadata */}
-      <AnimatePresence>
-        {hovered && (
-          <motion.div
-            initial={{ opacity: 0, y: 4 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: 4 }}
-            transition={{ duration: 0.15 }}
-            style={{
-              position: 'absolute',
-              bottom: 'calc(100% + 8px)',
-              left: '50%',
-              transform: 'translateX(-50%)',
-              background: '#1a1848',
-              border: '1px solid #2d2b55',
-              borderRadius: 6,
-              padding: '8px 12px',
-              minWidth: 160,
-              zIndex: 20,
-              fontFamily: '"JetBrains Mono", "Fira Code", monospace',
-              fontSize: 10,
-              boxShadow: '0 4px 20px rgba(0,0,0,0.5)',
-              pointerEvents: 'none',
-            }}
-          >
-            <div style={{ color: '#e2e0ff', fontWeight: 600, marginBottom: 4 }}>{nodeState.label}</div>
-            <div style={{ color: '#6b6b8f' }}>Events: {eventCount.toLocaleString()}</div>
-            {lastEventAt && (
-              <div style={{ color: '#6b6b8f' }}>Last: {lastEventAt}</div>
-            )}
-            {nodeState.avg_latency_ms != null && nodeState.avg_latency_ms > 0 && (
-              <div style={{ color: '#6b6b8f' }}>Avg latency: {nodeState.avg_latency_ms.toFixed(1)}ms</div>
-            )}
-          </motion.div>
-        )}
-      </AnimatePresence>
-
-      <Handle type="source" position={Position.Right} style={{ background: colors.border, width: 8, height: 8 }} />
     </motion.div>
   );
 });

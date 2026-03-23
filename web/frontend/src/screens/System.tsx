@@ -8,6 +8,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import { EVENT_LABELS } from '../types/protocol';
 import type { IndexedWebEvent } from '../hooks/useEngineSocket';
+import CornerCard from '../components/CornerCard';
 import styles from './System.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -122,6 +123,8 @@ function eventDescription(ev: IndexedWebEvent): string {
   return parts.join(' ');
 }
 
+
+
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function SystemScreen() {
@@ -198,14 +201,28 @@ export default function SystemScreen() {
     ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
     : '—';
 
-  const modeClass = mode === 'PAPER' ? styles.kpiAmber
-    : mode === 'LIVE' || mode === 'AUTO' ? styles.kpiAccent
-    : mode === 'MANUAL' ? styles.kpiRed
-    : '';
-
   const openPositions = riskData?.open_trade_count ?? '—';
-
   const activityEvents = events.slice(0, 100);
+  const displayPerf = modelPerf;
+
+  const displayCache = cacheStats;
+  const displayHitRate = cacheHitRate;
+
+  const KPI_DATA = [
+    { label: 'ENGINE MODE', value: mode.toUpperCase(), color: mode.toUpperCase() === 'PAPER' ? styles.kpiAmber : styles.kpiGreen },
+    { label: 'TICK INTERVAL', value: tickDisplay },
+    { label: 'SIGNALS TODAY', value: signalCount ?? '—' },
+    { label: 'CACHE HIT RATE', value: displayHitRate },
+    { label: 'DRAWDOWN', value: '—' },
+    { label: 'OPEN POSITIONS', value: openPositions },
+  ];
+
+  const CACHE_STATS_DATA = [
+    { label: 'HITS', value: displayCache?.hits.toLocaleString() ?? '—', color: styles.kpiGreen },
+    { label: 'MISSES', value: displayCache?.misses.toLocaleString() ?? '—' },
+    { label: 'EVICTIONS', value: displayCache?.evictions.toLocaleString() ?? '—' },
+    { label: 'ERRORS', value: displayCache?.errors.toLocaleString() ?? '—', color: (displayCache?.errors ?? 0) > 0 ? styles.kpiRed : undefined },
+  ];
 
   return (
     <div className={styles.screen}>
@@ -240,44 +257,13 @@ export default function SystemScreen() {
         </div>
       </div>
 
-      {/* KPI Strip — 6 cards */}
       <div className={styles.kpiStrip}>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>ENGINE MODE</span>
-          <span className={`${styles.kpiValue} ${modeClass}`}>{mode}</span>
-        </div>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>TICK INTERVAL</span>
-          <span className={styles.kpiValue}>{tickDisplay}</span>
-        </div>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>SIGNALS TODAY</span>
-          <span className={styles.kpiValue}>{signalCount ?? '—'}</span>
-        </div>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>CACHE HIT RATE</span>
-          <span className={`${styles.kpiValue} ${styles.kpiAccent}`}>{cacheHitRate}</span>
-        </div>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>DRAWDOWN</span>
-          <span className={`${styles.kpiValue} ${styles.kpiAmber}`}>—</span>
-        </div>
-        <div className={styles.kpiCard}>
-          <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-          <span className={styles.bracketBR} aria-hidden="true">¬</span>
-          <span className={styles.kpiLabel}>OPEN POSITIONS</span>
-          <span className={styles.kpiValue}>{openPositions}</span>
-        </div>
+        {KPI_DATA.map((kpi) => (
+          <div key={kpi.label} className={styles.kpiCard}>
+            <div className={styles.kpiLabel}>{kpi.label}</div>
+            <div className={`${styles.kpiValue} ${kpi.color || ''}`}>{kpi.value}</div>
+          </div>
+        ))}
       </div>
 
       {/* Two-column main area */}
@@ -302,26 +288,18 @@ export default function SystemScreen() {
                 </tr>
               </thead>
               <tbody>
-                {modelPerf.length === 0 ? (
-                  <tr>
-                    <td className={styles.td} colSpan={6}>
-                      <span className={styles.emptyText}>No model data available</span>
+                {displayPerf.map(row => (
+                  <tr key={`${row.Provider}-${row.Model}`}>
+                    <td className={styles.td}>{row.Model}</td>
+                    <td className={styles.td}>{row.TradeCount}</td>
+                    <td className={`${styles.td} ${winRateClass(row.WinRate)}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
+                    <td className={`${styles.td} ${(row.AvgPnLPct ?? 0) >= 0 ? styles.green : styles.red}`}>
+                      {row.AvgPnLPct != null ? (row.AvgPnLPct >= 0 ? '+' : '') + fmtPct(row.AvgPnLPct * 100) : '—'}
                     </td>
+                    <td className={styles.td}>{row.AvgLatencyMs != null ? `${row.AvgLatencyMs.toLocaleString()}ms` : '—'}</td>
+                    <td className={styles.td}>{row.TokensPerCall != null ? row.TokensPerCall.toLocaleString() : '—'}</td>
                   </tr>
-                ) : (
-                  modelPerf.map(row => (
-                    <tr key={`${row.Provider}-${row.Model}`}>
-                      <td className={styles.td}>{row.Model}</td>
-                      <td className={styles.td}>{row.TradeCount}</td>
-                      <td className={`${styles.td} ${winRateClass(row.WinRate)}`}>{fmtPct(row.WinRate != null ? row.WinRate * 100 : null)}</td>
-                      <td className={`${styles.td} ${(row.AvgPnLPct ?? 0) >= 0 ? styles.green : styles.red}`}>
-                        {row.AvgPnLPct != null ? (row.AvgPnLPct >= 0 ? '+' : '') + fmtPct(row.AvgPnLPct * 100) : '—'}
-                      </td>
-                      <td className={styles.td}>{row.AvgLatencyMs != null ? `${row.AvgLatencyMs.toLocaleString()}ms` : '—'}</td>
-                      <td className={styles.td}>{row.TokensPerCall != null ? row.TokensPerCall.toLocaleString() : '—'}</td>
-                    </tr>
-                  ))
-                )}
+                ))}
               </tbody>
             </table>
           </div>
@@ -333,38 +311,14 @@ export default function SystemScreen() {
           </div>
 
           <div className={styles.cacheStrip}>
-            <div className={styles.cacheCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
-              <span className={styles.kpiLabel}>HITS</span>
-              <span className={`${styles.kpiValue} ${styles.kpiGreen}`}>
-                {cacheStats?.hits.toLocaleString() ?? '—'}
-              </span>
-            </div>
-            <div className={styles.cacheCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
-              <span className={styles.kpiLabel}>MISSES</span>
-              <span className={styles.kpiValue}>
-                {cacheStats?.misses.toLocaleString() ?? '—'}
-              </span>
-            </div>
-            <div className={styles.cacheCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
-              <span className={styles.kpiLabel}>EVICTIONS</span>
-              <span className={styles.kpiValue}>
-                {cacheStats?.evictions.toLocaleString() ?? '—'}
-              </span>
-            </div>
-            <div className={styles.cacheCard}>
-              <span className={styles.bracketTL} aria-hidden="true">⌐</span>
-              <span className={styles.bracketBR} aria-hidden="true">¬</span>
-              <span className={styles.kpiLabel}>ERRORS</span>
-              <span className={`${styles.kpiValue} ${(cacheStats?.errors ?? 0) > 0 ? styles.kpiRed : ''}`}>
-                {cacheStats?.errors.toLocaleString() ?? '—'}
-              </span>
-            </div>
+            {CACHE_STATS_DATA.map((item) => (
+              <CornerCard key={item.label} bracketColor={item.color || 'var(--border)'} bracketSize={12}>
+                <div className={styles.cacheCard}>
+                  <div className={styles.cacheLabel}>{item.label}</div>
+                  <div className={`${styles.cacheValue} ${item.color || ''}`}>{item.value}</div>
+                </div>
+              </CornerCard>
+            ))}
           </div>
         </div>
 

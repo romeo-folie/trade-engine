@@ -22,7 +22,6 @@ export default function StrategyRow({
   return (
     <div className={styles.wrapper}>
       <div className={styles.row}>
-        <span className={styles.name}>{name}</span>
         <button
           type="button"
           className={styles.chevron}
@@ -31,6 +30,7 @@ export default function StrategyRow({
         >
           {expanded ? '▼' : '▶'}
         </button>
+        <span className={styles.name}>{name}</span>
         <Toggle checked={enabled} onChange={onToggle} aria-label={`${name} strategy`} />
       </div>
       {expanded && params && (

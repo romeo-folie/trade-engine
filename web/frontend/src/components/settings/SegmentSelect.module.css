@@ -44,3 +44,12 @@
   background: var(--amber);
   color: var(--canvas-bg);
 }
+
+.fullWidth {
+  width: 100%;
+}
+
+.fullWidth .segment {
+  flex: 1;
+  justify-content: center;
+}

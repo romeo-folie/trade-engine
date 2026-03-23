@@ -1,5 +1,7 @@
 import { useState, useMemo } from 'react';
 import type React from 'react';
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import styles from './PositionsTable.module.css';
 
 export interface Position {
@@ -128,15 +130,26 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
             // Use index as tiebreaker — the backend provides no stable row id.
             // Positions for the same ticker+strategy+entry are indistinguishable without one.
             const rowKey = `${p.ticker}-${p.strategy}-${p.entry}-${i}`;
+            const dirIsLong = p.direction === 'LONG';
             return (
               <tr key={rowKey}>
                 <td style={{ fontWeight: 700 }}>{p.ticker}</td>
                 <td>
-                  <span
-                    className={`${styles.badge} ${p.direction === 'LONG' ? styles.badgeLong : styles.badgeShort} chamfer-sm`}
+                  <ChamferedBox
+                    chamfer={4}
+                    backgroundColor={dirIsLong ? colors.acidGreen : colors.red}
+                    borderColor={dirIsLong ? colors.acidGreen : colors.red}
+                    style={{ 
+                      display: 'inline-flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'center',
+                      padding: '1px 6px' 
+                    }}
                   >
-                    {p.direction === 'LONG' ? 'BUY' : 'SELL'}
-                  </span>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
+                      {dirIsLong ? 'BUY' : 'SELL'}
+                    </span>
+                  </ChamferedBox>
                 </td>
                 <td style={{ color: 'var(--text-muted)' }}>{p.strategy}</td>
                 <td>{fmtPrice(p.entry)}</td>

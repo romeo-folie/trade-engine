@@ -126,3 +126,12 @@ a:hover {
   white-space: nowrap;
   border-width: 0;
 }
+
+@keyframes edge-dash {
+  from {
+    stroke-dashoffset: 10;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}

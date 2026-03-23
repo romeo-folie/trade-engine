@@ -14,6 +14,7 @@ interface SegmentSelectProps {
   value: string;
   onChange: (value: string) => void;
   color?: 'accent' | 'emerald' | 'amber';
+  fullWidth?: boolean;
 }
 
 const COLOR_CLASS: Record<string, string | undefined> = {
@@ -26,9 +27,10 @@ export default function SegmentSelect({
   value,
   onChange,
   color = 'accent',
+  fullWidth = false,
 }: SegmentSelectProps) {
   return (
-    <div className={styles.group}>
+    <div className={`${styles.group} ${fullWidth ? styles.fullWidth : ''}`}>
       {options.map((opt) => {
         const isActive = opt.value === value;
         const activeVariant = opt.activeColor ?? color;

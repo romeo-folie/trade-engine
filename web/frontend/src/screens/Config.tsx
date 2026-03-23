@@ -3,18 +3,11 @@ import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
+import { ChamferedBox } from '../components/common/ChamferedBox';
+import { colors } from '../styles/tokens';
 import styles from './Config.module.css';
 
 const ENGINE_VERSION = 'v2.1.0';
-
-const MODEL_OPTIONS = [
-  'gpt-4o',
-  'gpt-4o-mini',
-  'claude-opus-4-6',
-  'claude-sonnet-4-6',
-  'gemini-2.0-flash',
-  'gemini-2.5-pro',
-];
 
 /* ── Default config values ── */
 const DEFAULTS = {
@@ -74,7 +67,6 @@ export default function ConfigScreen() {
   const [toast, setToast] = useState<string | null>(null);
   const [showRestartModal, setShowRestartModal] = useState(false);
   const [rawInput, setRawInput] = useState<Record<string, string>>({});
-  const [openModelSelect, setOpenModelSelect] = useState<string | null>(null);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => () => clearTimeout(toastTimerRef.current), []);
@@ -122,15 +114,20 @@ export default function ConfigScreen() {
   return (
     <div className={styles.screen}>
       {/* ── Header ── */}
-      <header className={styles.header}>
-        <span className={styles.headerTitle}>TradeEngine</span>
-        <span className={styles.headerSub}>System Configuration</span>
+      <div className={styles.headerRow}>
+        <div className={styles.breadcrumb}>
+          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
+          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbPage}>CONFIG</span>
+        </div>
         <div className={styles.headerRight}>
           <span>{ENGINE_VERSION}</span>
           <span className={styles.statusDot} />
           <span>ALL SYSTEMS NOMINAL</span>
         </div>
-      </header>
+      </div>
+
+      <h1 className={styles.pageTitle}>SYSTEM CONFIGURATION</h1>
 
       {/* ── Two-column content ── */}
       <div className={styles.content}>
@@ -178,13 +175,15 @@ export default function ConfigScreen() {
 
             <div className={styles.row}>
               <span className={styles.label}>initial_capital</span>
-              <input
-                className={styles.input}
-                value={rawInput.initialCapital ?? formatNumber(config.initialCapital)}
-                onFocus={() => setRawInput((prev) => ({ ...prev, initialCapital: String(config.initialCapital) }))}
-                onChange={(e) => setRawInput((prev) => ({ ...prev, initialCapital: e.target.value }))}
-                onBlur={() => { set('initialCapital', parseFormattedNumber(rawInput.initialCapital ?? '')); setRawInput((prev) => { const { initialCapital: _, ...rest } = prev; return rest; }); }}
-              />
+              <div className={styles.input}>
+                <input
+                  className={styles.inputField}
+                  value={rawInput.initialCapital ?? formatNumber(config.initialCapital)}
+                  onFocus={() => setRawInput((prev) => ({ ...prev, initialCapital: String(config.initialCapital) }))}
+                  onChange={(e) => setRawInput((prev) => ({ ...prev, initialCapital: e.target.value }))}
+                  onBlur={() => { set('initialCapital', parseFormattedNumber(rawInput.initialCapital ?? '')); setRawInput((prev) => { const { initialCapital: _, ...rest } = prev; return rest; }); }}
+                />
+              </div>
             </div>
           </SettingsSection>
 
@@ -192,48 +191,54 @@ export default function ConfigScreen() {
           <SettingsSection title="Risk Thresholds">
             <div className={styles.row}>
               <span className={styles.label}>confidence_threshold</span>
-              <input className={styles.input} type="number" step="0.01" value={config.confidenceThreshold} onChange={(e) => set('confidenceThreshold', +e.target.value)} />
+              <div className={styles.input}>
+                <input className={styles.inputField} type="number" step="0.01" value={config.confidenceThreshold} onChange={(e) => set('confidenceThreshold', +e.target.value)} />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>min_risk_reward</span>
-              <input className={styles.input} type="number" step="0.1" value={config.minRiskReward} onChange={(e) => set('minRiskReward', +e.target.value)} />
+              <div className={styles.input}>
+                <input className={styles.inputField} type="number" step="0.1" value={config.minRiskReward} onChange={(e) => set('minRiskReward', +e.target.value)} />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>max_position_size</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="0.1" value={config.maxPositionSize} onChange={(e) => set('maxPositionSize', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="0.1" value={config.maxPositionSize} onChange={(e) => set('maxPositionSize', +e.target.value)} />
                 <span className={styles.unit}>%</span>
               </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>max_open_positions</span>
-              <input className={styles.input} type="number" step="1" value={config.maxOpenPositions} onChange={(e) => set('maxOpenPositions', +e.target.value)} />
+              <div className={styles.input}>
+                <input className={styles.inputField} type="number" step="1" value={config.maxOpenPositions} onChange={(e) => set('maxOpenPositions', +e.target.value)} />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>daily_loss_limit</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="0.1" value={config.dailyLossLimit} onChange={(e) => set('dailyLossLimit', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="0.1" value={config.dailyLossLimit} onChange={(e) => set('dailyLossLimit', +e.target.value)} />
                 <span className={styles.unit}>%</span>
               </div>
             </div>
             <div className={styles.row}>
               <span className={styles.labelRed}>max_drawdown_pct</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="0.1" value={config.maxDrawdownPct} onChange={(e) => set('maxDrawdownPct', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="0.1" value={config.maxDrawdownPct} onChange={(e) => set('maxDrawdownPct', +e.target.value)} />
                 <span className={styles.unit}>%</span>
               </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>cooldown_after_loss</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="1" value={config.cooldownAfterLoss} onChange={(e) => set('cooldownAfterLoss', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="1" value={config.cooldownAfterLoss} onChange={(e) => set('cooldownAfterLoss', +e.target.value)} />
                 <span className={styles.unit}>min</span>
               </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>signal_expiry</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="1" value={config.signalExpiry} onChange={(e) => set('signalExpiry', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="1" value={config.signalExpiry} onChange={(e) => set('signalExpiry', +e.target.value)} />
                 <span className={styles.unit}>min</span>
               </div>
             </div>
@@ -284,28 +289,7 @@ export default function ConfigScreen() {
                 <span className={styles.label}>{label}</span>
                 <span className={styles.modelName}>
                   {config[key]}
-                  <button
-                    type="button"
-                    className={styles.swapBtn}
-                    onClick={() => setOpenModelSelect(openModelSelect === key ? null : key)}
-                  >
-                    ⇄
-                  </button>
                 </span>
-                {openModelSelect === key && (
-                  <select
-                    className={styles.modelSelect}
-                    value={config[key]}
-                    onChange={(e) => {
-                      set(key, e.target.value);
-                      setOpenModelSelect(null);
-                    }}
-                  >
-                    {MODEL_OPTIONS.map((m) => (
-                      <option key={m} value={m}>{m}</option>
-                    ))}
-                  </select>
-                )}
               </div>
             ))}
           </SettingsSection>
@@ -313,6 +297,7 @@ export default function ConfigScreen() {
           {/* COST PROFILE */}
           <SettingsSection title="Cost Profile">
             <SegmentSelect
+              fullWidth
               options={[
                 { label: 'BUDGET', value: 'budget' },
                 { label: 'BALANCED', value: 'balanced' },
@@ -323,23 +308,27 @@ export default function ConfigScreen() {
             />
             <div className={styles.row}>
               <span className={styles.label}>Daily Token Budget</span>
-              <input
-                className={styles.input}
-                value={rawInput.dailyTokenBudget ?? formatNumber(config.dailyTokenBudget)}
-                onFocus={() => setRawInput((prev) => ({ ...prev, dailyTokenBudget: String(config.dailyTokenBudget) }))}
-                onChange={(e) => setRawInput((prev) => ({ ...prev, dailyTokenBudget: e.target.value }))}
-                onBlur={() => { set('dailyTokenBudget', parseFormattedNumber(rawInput.dailyTokenBudget ?? '')); setRawInput((prev) => { const { dailyTokenBudget: _, ...rest } = prev; return rest; }); }}
-              />
+              <div className={styles.input}>
+                <input
+                  className={styles.inputField}
+                  value={rawInput.dailyTokenBudget ?? formatNumber(config.dailyTokenBudget)}
+                  onFocus={() => setRawInput((prev) => ({ ...prev, dailyTokenBudget: String(config.dailyTokenBudget) }))}
+                  onChange={(e) => setRawInput((prev) => ({ ...prev, dailyTokenBudget: e.target.value }))}
+                  onBlur={() => { set('dailyTokenBudget', parseFormattedNumber(rawInput.dailyTokenBudget ?? '')); setRawInput((prev) => { const { dailyTokenBudget: _, ...rest } = prev; return rest; }); }}
+                />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Weekly Token Budget</span>
-              <input
-                className={styles.input}
-                value={rawInput.weeklyTokenBudget ?? formatNumber(config.weeklyTokenBudget)}
-                onFocus={() => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: String(config.weeklyTokenBudget) }))}
-                onChange={(e) => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: e.target.value }))}
-                onBlur={() => { set('weeklyTokenBudget', parseFormattedNumber(rawInput.weeklyTokenBudget ?? '')); setRawInput((prev) => { const { weeklyTokenBudget: _, ...rest } = prev; return rest; }); }}
-              />
+              <div className={styles.input}>
+                <input
+                  className={styles.inputField}
+                  value={rawInput.weeklyTokenBudget ?? formatNumber(config.weeklyTokenBudget)}
+                  onFocus={() => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: String(config.weeklyTokenBudget) }))}
+                  onChange={(e) => setRawInput((prev) => ({ ...prev, weeklyTokenBudget: e.target.value }))}
+                  onBlur={() => { set('weeklyTokenBudget', parseFormattedNumber(rawInput.weeklyTokenBudget ?? '')); setRawInput((prev) => { const { weeklyTokenBudget: _, ...rest } = prev; return rest; }); }}
+                />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Auto-degrade on budget hit</span>
@@ -383,13 +372,15 @@ export default function ConfigScreen() {
             <div className={styles.row}>
               <span className={styles.label}>Batch Window</span>
               <div className={styles.inputWithUnit}>
-                <input className={styles.input} type="number" step="1" value={config.batchWindow} onChange={(e) => set('batchWindow', +e.target.value)} />
+                <input className={styles.inputField} type="number" step="1" value={config.batchWindow} onChange={(e) => set('batchWindow', +e.target.value)} />
                 <span className={styles.unit}>sec</span>
               </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Min Confidence for Alert</span>
-              <input className={styles.input} type="number" step="0.01" value={config.minConfidenceAlert} onChange={(e) => set('minConfidenceAlert', +e.target.value)} />
+              <div className={styles.input}>
+                <input className={styles.inputField} type="number" step="0.01" value={config.minConfidenceAlert} onChange={(e) => set('minConfidenceAlert', +e.target.value)} />
+              </div>
             </div>
             <div className={styles.row}>
               <span className={styles.label}>Include HOLDs</span>
@@ -399,18 +390,26 @@ export default function ConfigScreen() {
 
           {/* SYSTEM ACTIONS */}
           <SettingsSection title="System Actions">
-            <button
-              className={`${styles.btnAmber} chamfer-sm`}
+            <ChamferedBox
+              chamfer={6}
+              backgroundColor={colors.amber}
+              borderColor={colors.amber}
               onClick={() => setShowRestartModal(true)}
+              className={styles.btnAmber}
+              style={{ marginBottom: 16, padding: '10px 0', textAlign: 'center' }}
             >
-              Restart Engine
-            </button>
-            <button
-              className={`${styles.btnRed} chamfer-sm`}
+              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Restart Engine</span>
+            </ChamferedBox>
+            <ChamferedBox
+              chamfer={6}
+              backgroundColor={colors.red}
+              borderColor={colors.red}
               onClick={handleReset}
+              className={styles.btnRed}
+              style={{ padding: '10px 0', textAlign: 'center' }}
             >
-              Reset to Defaults
-            </button>
+              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Reset to Defaults</span>
+            </ChamferedBox>
             <span className={styles.versionText}>
               TradeEngine {ENGINE_VERSION} — Build 20260318
             </span>
@@ -420,37 +419,62 @@ export default function ConfigScreen() {
 
       {/* ── Footer ── */}
       <footer className={styles.footer}>
-        <button className={`${styles.discardBtn} chamfer-sm`} onClick={handleDiscard}>
+        <ChamferedBox
+          chamfer={6}
+          backgroundColor="transparent"
+          borderColor={colors.borderMuted}
+          onClick={handleDiscard}
+          className={styles.discardBtn}
+          style={{ padding: '8px 24px' }}
+        >
           Discard
-        </button>
-        <button className={`${styles.saveBtn} chamfer-sm`} onClick={handleSave}>
-          Save Changes
-        </button>
+        </ChamferedBox>
+        <ChamferedBox
+          chamfer={6}
+          backgroundColor={colors.acidGreen}
+          borderColor={colors.acidGreen}
+          onClick={handleSave}
+          className={styles.saveBtn}
+          style={{ padding: '8px 24px' }}
+        >
+          <span style={{ color: '#0D0D11', fontWeight: 700 }}>Save Changes</span>
+        </ChamferedBox>
       </footer>
 
       {/* ── Restart confirmation modal ── */}
       {showRestartModal && (
         <div className={styles.modalOverlay} onClick={() => setShowRestartModal(false)}>
-          <div className={`${styles.modal} chamfer`} onClick={(e) => e.stopPropagation()}>
+          <ChamferedBox
+            chamfer={12}
+            backgroundColor={colors.cardBg}
+            borderColor={colors.borderMuted}
+            className={styles.modal}
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: 400, padding: 32 }}
+          >
             <h3 className={styles.modalTitle}>Restart Engine?</h3>
             <p className={styles.modalBody}>
               This will interrupt active trades. Are you sure you want to proceed?
             </p>
             <div className={styles.modalActions}>
               <button
-                className={`${styles.discardBtn} chamfer-sm`}
+                className={styles.discardBtn}
                 onClick={() => setShowRestartModal(false)}
+                style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', cursor: 'pointer' }}
               >
                 Cancel
               </button>
-              <button
-                className={`${styles.btnAmber} chamfer-sm`}
+              <ChamferedBox
+                chamfer={6}
+                backgroundColor={colors.amber}
+                borderColor={colors.amber}
                 onClick={handleRestart}
+                style={{ padding: '8px 24px' }}
               >
-                Confirm Restart
-              </button>
+                <span style={{ color: '#0D0D11', fontWeight: 700 }}>Confirm Restart</span>
+              </ChamferedBox>
             </div>
-          </div>
+          </ChamferedBox>
         </div>
       )}
 

@@ -1,3 +1,5 @@
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import type { AnalysisRecord } from '../../screens/Analysis';
 import styles from './AnalysisCard.module.css';
 
@@ -6,11 +8,11 @@ interface AnalysisCardProps {
   onClick: () => void;
 }
 
-function actionColor(action: string) {
+function actionColors(action: string) {
   const a = action.toUpperCase();
-  if (a === 'BUY') return { chip: styles.chipBuy, conf: styles.confBuy, bar: styles.barBuy };
-  if (a === 'SELL') return { chip: styles.chipSell, conf: styles.confSell, bar: styles.barSell };
-  return { chip: styles.chipHold, conf: styles.confHold, bar: styles.barHold };
+  if (a === 'BUY') return colors.acidGreen;
+  if (a === 'SELL') return colors.red;
+  return colors.amber;
 }
 
 function fmtTime(iso: string): string {
@@ -25,17 +27,16 @@ function fmtSLTP(v: number | null | undefined): string {
 }
 
 export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
-  const { chip, conf, bar } = actionColor(analysis.Action);
+  const accent = actionColors(analysis.Action);
   const confPct = (analysis.Confidence * 100).toFixed(0);
 
   return (
-    <div
+    <ChamferedBox
+      chamfer={12}
       className={styles.card}
       onClick={onClick}
-      onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onClick(); } }}
-      tabIndex={0}
-      role="button"
-      aria-label={`${analysis.Ticker} ${analysis.Action} analysis`}
+      backgroundColor={colors.cardBg}
+      borderColor={colors.borderMuted}
     >
       {/* Row 1: Ticker + timestamp */}
       <div className={styles.headerRow}>
@@ -50,14 +51,29 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
 
       {/* Row 3: Signal badge + confidence + bar */}
       <div className={styles.signalRow}>
-        <span className={`${styles.chip} ${chip}`}>
-          {analysis.Action.toUpperCase()}
-        </span>
-        <span className={`${styles.confidence} ${conf}`}>{confPct}%</span>
+        <ChamferedBox
+          chamfer={4}
+          backgroundColor={accent}
+          borderColor={accent}
+          style={{ 
+            padding: '0px 6px',
+            display: 'inline-flex',
+            alignItems: 'center',
+            justifyContent: 'center'
+          }}
+        >
+          <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
+            {analysis.Action.toUpperCase()}
+          </span>
+        </ChamferedBox>
+        <span className={styles.confidence} style={{ color: colors.textPrimary }}>{confPct}%</span>
         <div className={styles.confBarTrack}>
           <div
-            className={`${styles.confBarFill} ${bar}`}
-            style={{ width: `${Math.min(Number(confPct), 100)}%` }}
+            className={styles.confBarFill}
+            style={{ 
+              width: `${Math.min(Number(confPct), 100)}%`,
+              backgroundColor: accent
+            }}
           />
         </div>
       </div>
@@ -71,6 +87,6 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
         <span className={styles.slValue}>SL {fmtSLTP(analysis.StopLoss)}</span>
         <span className={styles.tpValue}>TP {fmtSLTP(analysis.TakeProfit)}</span>
       </div>
-    </div>
+    </ChamferedBox>
   );
 }

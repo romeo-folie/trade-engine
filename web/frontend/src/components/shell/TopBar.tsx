@@ -1,13 +1,13 @@
 import { useEffect, useState } from 'react';
+import { colors, typography } from '../../styles/tokens';
 import type { ConnectionStatus } from '../../hooks/useEngineSocket';
-import styles from './TopBar.module.css';
 
 interface TopBarProps {
   status: ConnectionStatus;
   eventsPerSecond: number;
 }
 
-export default function TopBar({ status, eventsPerSecond }: TopBarProps) {
+export default function TopBar({ status }: TopBarProps) {
   const [clock, setClock] = useState(() => formatClock());
 
   useEffect(() => {
@@ -15,52 +15,70 @@ export default function TopBar({ status, eventsPerSecond }: TopBarProps) {
     return () => clearInterval(id);
   }, []);
 
-  const dotClass = STATUS_DOT[status];
-  const textClass = STATUS_TEXT[status];
-  const label = STATUS_LABEL[status];
-
   return (
-    <header className={styles.topbar}>
-      <div className={styles.left}>
-        <span className={styles.wordmark}>[TRADE ENGINE]</span>
+    <header style={{
+      height: 40,
+      background: colors.canvas,
+      borderBottom: '1px solid rgba(255, 255, 255, 0.15)',
+      display: 'flex',
+      alignItems: 'center',
+      padding: '0 20px',
+      justifyContent: 'space-between',
+      position: 'fixed',
+      top: 0,
+      left: 0,
+      right: 0,
+      zIndex: 'var(--z-topbar)',
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <span style={{ 
+          color: colors.acidGreen, 
+          fontFamily: typography.mono, 
+          fontWeight: 700, 
+          fontSize: 14,
+          letterSpacing: '0.05em'
+        }}>
+          TRADEENGINE
+        </span>
+        <span style={{ 
+          color: colors.textDim, 
+          fontFamily: typography.mono, 
+          fontSize: 11,
+          marginTop: 1
+        }}>
+          v2.1.0
+        </span>
       </div>
 
-      <div className={styles.right}>
-        <span className={styles.status}>
-          <span className={`${styles.dot} ${dotClass}`} />
-          <span className={textClass}>{label}</span>
-        </span>
-
-        <span className={styles.clock}>{clock}</span>
-
-        <span className={styles.rate}>
-          {eventsPerSecond.toFixed(1)} evt/s
-        </span>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+        <div style={{ 
+          display: 'flex', 
+          alignItems: 'center', 
+          gap: 8,
+          fontSize: 11,
+          fontFamily: typography.mono,
+        }}>
+           <span style={{ color: colors.textDim }}>{clock}</span>
+           <div style={{ 
+             background: status === 'connected' ? colors.emerald : colors.red,
+             color: colors.canvas,
+             padding: '1px 6px',
+             borderRadius: 2,
+             fontSize: 9,
+             fontWeight: 700
+           }}>
+             {status === 'connected' ? 'LIVE' : 'CLOSED'}
+           </div>
+           <div style={{ 
+             width: 6, height: 6, borderRadius: '50%', 
+             background: status === 'connected' ? colors.acidGreen : colors.textDim,
+             boxShadow: status === 'connected' ? `0 0 6px ${colors.acidGreen}` : 'none'
+           }} />
+        </div>
       </div>
     </header>
   );
 }
-
-const STATUS_DOT: Record<ConnectionStatus, string> = {
-  connecting: styles.dotIntermediate,
-  reconnecting: styles.dotIntermediate,
-  connected: styles.dotConnected,
-  disconnected: styles.dotDisconnected,
-};
-
-const STATUS_TEXT: Record<ConnectionStatus, string> = {
-  connecting: styles.statusIntermediate,
-  reconnecting: styles.statusIntermediate,
-  connected: styles.statusConnected,
-  disconnected: styles.statusDisconnected,
-};
-
-const STATUS_LABEL: Record<ConnectionStatus, string> = {
-  connecting: 'CONNECTING\u2026',
-  reconnecting: 'RECONNECTING\u2026',
-  connected: 'CONNECTED',
-  disconnected: 'DISCONNECTED',
-};
 
 function formatClock(): string {
   return new Date().toLocaleTimeString('en-GB', {

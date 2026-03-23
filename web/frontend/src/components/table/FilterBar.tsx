@@ -1,5 +1,7 @@
 import { useId } from 'react';
 import type React from 'react';
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import styles from './FilterBar.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -72,14 +74,16 @@ export default function FilterBar({
       {actions && actions.length > 0 && (
         <div className={styles.actions}>
           {actions.map(a => (
-            <button
+            <ChamferedBox
               key={a.label}
-              type="button"
-              className={`${styles.actionBtn} chamfer-sm`}
+              chamfer={6}
+              borderColor={colors.borderMuted}
               onClick={a.onClick}
+              className={styles.actionBtn}
+              style={{ padding: '4px 12px' }}
             >
               {a.label}
-            </button>
+            </ChamferedBox>
           ))}
         </div>
       )}

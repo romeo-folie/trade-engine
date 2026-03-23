@@ -1,248 +1,167 @@
-/* ── Hub node — ENGINE centre ──────────────────────────────────────────── */
-.hub {
-  width: 160px;
-  height: 80px;
-  background: var(--panel-bg);
-  border: 2px solid var(--accent);
-  box-shadow: 0 0 12px rgba(57, 255, 20, 0.35), inset 0 0 8px rgba(57, 255, 20, 0.05);
-  clip-path: polygon(
-    0 0,
-    calc(100% - var(--chamfer-sm)) 0,
-    100% var(--chamfer-sm),
-    100% 100%,
-    0 100%
-  );
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: default;
+/* ── Base Card ───────────────────────────────────────────────────────────── */
+.cardBase {
+  width: 280px;
+  min-height: 140px;
   outline: none;
-  transition: box-shadow 0.2s;
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: visible;
 }
 
-.hubLabel {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-md);
-  font-weight: 700;
-  color: var(--accent);
-  letter-spacing: 0.12em;
-  text-shadow: 0 0 6px rgba(57, 255, 20, 0.4);
-  text-transform: uppercase;
+.inactive {
+  opacity: 0.4;
+  filter: grayscale(1);
 }
 
-/* ── Analyst node card — plain border, no brackets, no strip ─────────── */
-.analystCard {
-  width: 180px;
-  min-height: 110px;
-  background: var(--card-bg);
-  border: 1px solid var(--border);
-  clip-path: polygon(
-    0 0,
-    calc(100% - var(--chamfer-sm)) 0,
-    100% var(--chamfer-sm),
-    100% 100%,
-    0 100%
-  );
-  cursor: pointer;
-  outline: none;
-  position: relative;
-  transition: border-color 200ms, box-shadow 200ms;
-}
-
-.analystCard:hover {
-  box-shadow: 0 0 8px var(--accent-glow);
-}
-
-.analystCard:focus-visible {
-  box-shadow: 0 0 0 2px var(--accent);
-}
-
-.analystActive {
-  border-color: var(--accent);
-  box-shadow: 0 0 8px rgba(57, 255, 20, 0.3);
-}
-
-.analystInner {
-  padding: 12px 14px;
+.cardInner {
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  height: 100%;
 }
 
-.analystHeader {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-
-.analystName {
+/* ── Typography & Elements ───────────────────────────────────────────────── */
+.nodeTitle {
   font-family: var(--font-sans);
   font-size: 14px;
   font-weight: 700;
-  color: var(--text-primary);
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  line-height: 1.2;
+  color: #FFFFFF;
+  margin-bottom: 4px;
 }
 
-.signalDesc {
+.subValue {
   font-family: var(--font-mono);
   font-size: 9px;
-  color: var(--text-faint);
-  letter-spacing: 0.08em;
+  color: var(--text-dim);
   text-transform: uppercase;
-  margin-top: 2px;
+  letter-spacing: 0.05em;
 }
 
-.signalDirection {
+.kindLabel {
   font-family: var(--font-mono);
-  font-size: 18px;
+  font-size: 9px;
   font-weight: 700;
-  line-height: 1;
-  margin-top: 4px;
-}
-
-.dirLong    { color: var(--accent); }
-.dirShort   { color: var(--red); }
-.dirNeutral { color: var(--amber); }
-
-.analystConfidence {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-faint);
-  letter-spacing: 0.06em;
-}
-
-/* ── Category label — shared between analyst and structural ──────────── */
-.categoryLabel {
-  font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-faint);
+  color: var(--text-dim);
   letter-spacing: 0.12em;
   text-transform: uppercase;
 }
 
-/* ── Structural node card — CornerCard wrapper, with left strip ───────── */
-.card {
-  width: 220px;
-  min-height: 120px;
-  background: var(--card-bg);
-  clip-path: polygon(
-    0 0,
-    calc(100% - var(--chamfer-sm)) 0,
-    100% var(--chamfer-sm),
-    100% 100%,
-    0 100%
-  );
-  cursor: pointer;
-  outline: none;
-  overflow: hidden;
-  transition: box-shadow 0.2s;
-}
+/* ── Specific Templates ──────────────────────────────────────────────────── */
 
-.card:hover {
-  box-shadow: 0 0 8px var(--accent-glow);
-}
-
-.card:focus-visible {
-  box-shadow: 0 0 0 2px var(--accent);
-}
-
-.bypassed {
-  opacity: 0.35;
-}
-
-/* Left colour strip (structural nodes) */
-.strip {
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 3px;
-  height: 100%;
-}
-
-/* Inner content (padded away from strip) */
-.inner {
-  padding: 12px 12px 12px 14px;
-  height: 100%;
+/* Sidebar / Status */
+.analystHeader {
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-
-.header {
-  display: flex;
-  align-items: center;
   justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
 }
 
-.nodeLabel {
-  font-family: var(--font-sans);
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  color: var(--text-primary);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-}
-
-/* Status dot */
-.dot {
-  width: 6px;
-  height: 6px;
+.statusDot {
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
-  flex-shrink: 0;
 }
 
-.dotGreen {
-  background: var(--accent);
-  box-shadow: 0 0 6px rgba(57, 255, 20, 0.8);
-  animation: pulse 1.5s ease-in-out infinite;
-}
+.dotGreen { background: #39FF14; box-shadow: 0 0 6px #39FF14; }
+.dotAmber { background: #F59E0B; box-shadow: 0 0 6px #F59E0B; }
+.dotGrey  { background: #4B5563; }
 
-.dotAmber {
-  background: var(--amber);
-  box-shadow: 0 0 4px rgba(245, 158, 11, 0.6);
-}
-
-.dotGrey {
-  background: var(--text-faint);
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50%       { opacity: 0.4; }
-}
-
-.meta {
-  font-family: var(--font-mono);
-  font-size: 18px;
-  font-weight: 700;
-  color: var(--text-primary);
-  line-height: 1;
+/* Signal Source */
+.signalGrid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
   margin-top: 4px;
 }
 
-.metaValue {
-  color: var(--text-primary);
-}
-
-.metaLabel {
-  font-size: var(--font-size-xs);
-  color: var(--text-dim);
-  margin-left: 2px;
-}
-
-.timestamp {
+.price {
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  color: var(--text-faint);
+  font-size: 16px;
+  color: #FFFFFF;
+  font-weight: 700;
 }
 
-.bypassedLabel {
-  font-family: var(--font-mono);
+/* Arbiter (Signal Router) */
+.arbiter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.routingBox {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.routeBadge {
+  padding: 2px 6px;
   font-size: 9px;
-  letter-spacing: 0.15em;
+  font-weight: 600;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
   color: var(--text-dim);
-  text-transform: uppercase;
-  margin-top: auto;
+}
+
+.routeActive {
+  background: rgba(57, 255, 20, 0.1);
+  border-color: rgba(57, 255, 20, 0.3);
+}
+
+.recipeText {
+  font-size: 8px;
+  color: #FBBF24;
+  letter-spacing: 0.05em;
+  margin-top: 4px;
+  font-family: var(--font-mono);
+}
+
+/* Analyst Nodes */
+.analystVerdict {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  font-weight: 800;
+  margin: 4px 0;
+}
+
+.verdictLong  { color: #39FF14; }
+.verdictShort { color: #EF4444; }
+.verdictNeutral { color: #9CA3AF; }
+
+/* Synthesis / Ensemble */
+.ensembleBox {
+  margin-top: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 4px;
+  padding: 6px;
+}
+
+/* Execution */
+.executionBadge {
+  display: inline-block;
+  padding: 2px 8px;
+  background: rgba(34, 197, 94, 0.2);
+  color: #22C55E;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-top: 8px;
+}
+
+/* Hub / Engine */
+.hub {
+  width: 200px;
+  height: 100px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.hubWordmark {
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
 }

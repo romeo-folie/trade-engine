@@ -9,6 +9,8 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import AnalysisCard from '../components/analysis/AnalysisCard';
 import AnalysisModal from '../components/analysis/AnalysisModal';
+import { ChamferedBox } from '../components/common/ChamferedBox';
+import { colors } from '../styles/tokens';
 import styles from './Analysis.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -37,6 +39,7 @@ const ACTION_TABS = ['', 'BUY', 'SELL', 'HOLD'] as const;
 const ACTION_LABELS: Record<string, string> = {
   '': 'ALL', 'BUY': 'BUY', 'SELL': 'SELL', 'HOLD': 'HOLD',
 };
+
 
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
@@ -168,27 +171,33 @@ export default function AnalysisScreen() {
         {ACTION_TABS.map(tab => {
           const label = ACTION_LABELS[tab];
           const isActive = actionFilter === tab;
-          let pillClass = styles.filterPill;
-          if (isActive) {
-            pillClass += ' ' + styles.filterPillActive;
-            if (tab === 'BUY' || tab === '') pillClass += ' ' + styles.pillGreen;
-            else if (tab === 'SELL') pillClass += ' ' + styles.pillRed;
-            else if (tab === 'HOLD') pillClass += ' ' + styles.pillAmber;
-          } else {
-            if (tab === 'BUY' || tab === '') pillClass += ' ' + styles.pillGreenOutline;
-            else if (tab === 'SELL') pillClass += ' ' + styles.pillRedOutline;
-            else if (tab === 'HOLD') pillClass += ' ' + styles.pillAmberOutline;
-          }
+          
+          let color = colors.borderMuted;
+          if (tab === 'BUY' || tab === '') color = colors.acidGreen;
+          else if (tab === 'SELL') color = colors.red;
+          else if (tab === 'HOLD') color = colors.amber;
+
           return (
-            <button
+            <ChamferedBox
               key={tab}
-              type="button"
-              aria-pressed={isActive}
-              className={pillClass}
+              chamfer={4}
+              isActive={isActive}
+              backgroundColor={isActive ? color : 'transparent'}
+              borderColor={isActive ? color : colors.borderMuted}
+              activeColor={color}
               onClick={() => setActionFilter(tab)}
+              className={styles.filterPill}
+              style={{ 
+                padding: '1px 10px',
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center'
+              }}
             >
-              {label}
-            </button>
+              <span style={{ color: isActive ? '#0D0D11' : undefined }}>
+                {label}
+              </span>
+            </ChamferedBox>
           );
         })}
       </div>
