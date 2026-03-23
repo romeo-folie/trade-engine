@@ -19,10 +19,15 @@ import (
 )
 
 // nyLoc is the US/Eastern timezone for ORB time gates.
+// LoadLocation failure is fatal: the EST fallback is DST-unaware and would
+// shift all time gates by 1 hour during summer, causing missed or misfired scans.
 var nyLoc = func() *time.Location {
 	loc, err := time.LoadLocation("America/New_York")
 	if err != nil {
-		loc = time.FixedZone("EST", -5*60*60)
+		// tzdata package not embedded and system timezone DB missing.
+		// This is a hard misconfiguration — do not silently fall back to fixed EST.
+		panic(fmt.Sprintf("orb: cannot load America/New_York timezone: %v\n"+
+			"Hint: import _ \"time/tzdata\" in main or ensure the system tzdata is installed.", err))
 	}
 	return loc
 }()
@@ -170,7 +175,8 @@ func (s *ORBScheduler) setState(state State) {
 }
 
 func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
-	if et.Weekday() == time.Saturday || et.Weekday() == time.Sunday {
+	// Skip weekends and market holidays (IsTradingDay uses the engine's calendar).
+	if et.Weekday() == time.Saturday || et.Weekday() == time.Sunday || !IsTradingDay(s.now()) {
 		return nil
 	}
 	h, m, _ := et.Clock()
@@ -234,8 +240,10 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// News fetching is a future enhancement — for now the LLM scores
-		// based on gap magnitude and pre-market volume alone.
+		// News fetching is deferred to a follow-up iteration.
+		// Without real news the LLM scores on gap magnitude and pre-market
+		// volume alone, which makes catalyst_type/catalyst_quality unreliable.
+		// Wire Alpaca News API (or similar) here when available.
 		var newsItems []prompts.ORBNewsItem
 
 		sysPrompt, userMsg := prompts.BuildORBPrompt(
