@@ -53,8 +53,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   // ── Hub Template ──────────────────────────────────────────────────────────
   if (d.isHub || d.nodeId === '__hub__') {
     return (
-      <ChamferedBox 
-        isActive={nodeActive} 
+      <ChamferedBox
+        isActive={false}
         chamfer={12}
         backgroundColor="#0D0D11"
         borderColor={colors.acidGreen}
@@ -84,17 +84,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
   const isArbiterFinal = d.kind === 'arbiter_final';
   const isTicker = d.kind === 'ticker';
-  const cardAccent = isArbiterFinal ? colors.amber
-                   : isAnalyst ? accentColor
-                   : colors.acidGreen;
   const cardBorder = isArbiterFinal ? colors.amber
                    : isAnalyst ? accentColor
                    : colors.borderMuted;
 
   return (
     <ChamferedBox
-      isActive={nodeActive}
-      activeColor={cardAccent}
+      isActive={false}
       borderColor={cardBorder}
       className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''} ${isTicker ? styles.tickerCard : ''}`}
       style={{ cursor: 'pointer' }}

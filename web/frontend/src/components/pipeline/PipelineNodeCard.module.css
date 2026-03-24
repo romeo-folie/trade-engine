@@ -8,8 +8,7 @@
 }
 
 .inactive {
-  opacity: 0.4;
-  filter: grayscale(1);
+  /* Cards remain fully colored — engine idle state signals through edges, not cards */
 }
 
 .cardInner {

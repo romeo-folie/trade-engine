@@ -223,6 +223,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow edges ──────────────────────────────────────────────
 
   const rfEdges = useMemo<Edge[]>(() => {
+    const isNodeRecentlyActive = (nodeId: string): boolean => {
+      const lastEventAt = nodeMetrics[nodeId]?.lastEventAt;
+      if (!lastEventAt) return false;
+      return Date.now() - lastEventAt < 10_000;
+    };
+
     const edges: Edge[] = [];
     const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
     const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
@@ -231,18 +237,30 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
     const tickerIds = rfNodes.filter(n => n.data.kind === 'ticker').map(n => n.id);
 
-    const makeEdge = (src: string, tgt: string) => ({
-      id: `e-${src}-${tgt}`,
-      source: src,
-      target: tgt,
-      style: {
-        stroke: EDGE_ACTIVE,
-        strokeWidth: 1,
-        strokeDasharray: '5 5',
-        animation: 'edge-dash 0.5s linear infinite',
-      },
-      type: 'smoothstep',
-    });
+    const makeEdge = (src: string, tgt: string) => {
+      const active = isNodeRecentlyActive(src);
+      return {
+        id: `e-${src}-${tgt}`,
+        source: src,
+        target: tgt,
+        style: active
+          ? {
+              stroke: EDGE_ACTIVE,
+              strokeWidth: 1,
+              strokeDasharray: '5 5',
+              animation: 'edge-dash 0.5s linear infinite',
+              opacity: 1,
+            }
+          : {
+              stroke: colors.border,
+              strokeWidth: 1,
+              strokeDasharray: '',
+              animation: '',
+              opacity: 0.35,
+            },
+        type: 'smoothstep',
+      };
+    };
 
     if (arbiterId) {
       sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
@@ -266,7 +284,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     executionIds.forEach(eid => edges.push(makeEdge('risk_manager', eid)));
 
     return edges;
-  }, [rfNodes]);
+  }, [rfNodes, nodeMetrics]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
