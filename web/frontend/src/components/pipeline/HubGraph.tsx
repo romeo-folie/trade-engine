@@ -50,6 +50,10 @@ const NODE_H = 140;
 const EDGE_ACTIVE   = colors.acidGreen;
 const EDGE_INACTIVE = colors.borderMuted;
 
+// Visual kinds understood by PipelineNodeCard.
+// Backend kinds (processing, output) are remapped via the demo node override list.
+const VISUAL_KINDS = new Set(['source', 'arbiter', 'analyst', 'synthesis', 'execution']);
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function getColumnX(kind: string): number {
@@ -102,13 +106,19 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       { id: 'executor', label: 'Live Router', kind: 'execution', event_count: 12, last_event_at: new Date().toISOString() },
     ];
 
-    const allNodes = [...nodes];
-    // Ensure we have the full chain for demo
-    demoNodes.forEach(dn => {
-      if (!allNodes.find(n => n.id === dn.id || (n.kind === dn.kind && n.kind !== 'analyst'))) {
-        allNodes.push(dn);
-      }
-    });
+    // Build the node list:
+    // 1. For each demo node ID, use the demo version (has correct visual kind + label).
+    //    If the backend also sent a node with that ID, its metrics are merged in separately
+    //    via nodeMetrics — no need to keep the backend version here.
+    // 2. Append any live nodes from the backend that have a recognised visual kind
+    //    and are NOT already covered by the demo list (e.g. dynamically added sources).
+    // 3. Silently drop backend nodes with unrecognised kinds (processing, output) that
+    //    have no demo equivalent — they would render as dark default cards at column 0.
+    const demoIds = new Set(demoNodes.map(d => d.id));
+    const liveVisualNodes = nodes.filter(
+      n => VISUAL_KINDS.has(n.kind) && !demoIds.has(n.id)
+    );
+    const allNodes = [...demoNodes, ...liveVisualNodes];
 
     // Positions based on columns + vertical stacking for analysts
     const analystNodes = allNodes.filter(n => n.kind.includes('analyst'));

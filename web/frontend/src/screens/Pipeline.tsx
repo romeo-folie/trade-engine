@@ -38,10 +38,6 @@ export default function PipelineScreen() {
 
   return (
     <div className={styles.screen}>
-      <div className={styles.canvasTag}>
-        <span className={styles.tagLabel}>Signals</span>
-      </div>
-      
       <div className={styles.innerFrame}>
         <HubGraph
           nodes={nodes}
