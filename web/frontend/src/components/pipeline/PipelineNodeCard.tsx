@@ -24,6 +24,9 @@ export interface PipelineNodeData {
   isHub?: boolean;
   lastEventType?: string | null;
   onNodeClick: (id: string) => void;
+  provider?: string;
+  accuracy?: number;
+  accentColor?: string;
   [key: string]: unknown;
 }
 
@@ -67,23 +70,33 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
   // ── Analyst Detection & Accent ───────────────────────────────────────────
   const isAnalyst = d.kind.toLowerCase().includes('analyst') || ['technical', 'momentum', 'sentiment', 'macro', 'llm_analysis'].includes(d.nodeId);
-  const accentColor = d.nodeId === 'technical' ? colors.analystTechnical :
+  const accentColor = d.accentColor ??
+                     (d.nodeId === 'technical' ? colors.analystTechnical :
                      d.nodeId === 'momentum' ? colors.analystMomentum :
                      d.nodeId === 'sentiment' ? colors.analystSentiment :
                      d.nodeId === 'macro' ? colors.analystMacro :
-                     d.nodeId === 'llm_analysis' ? colors.acidGreen : colors.borderMuted;
+                     d.nodeId === 'llm_analysis' ? colors.acidGreen : colors.borderMuted);
 
   const verdict = (d.lastEventType || 'NEUTRAL').toUpperCase();
   const verdictClass = verdict.includes('LONG') || verdict.includes('BUY') ? styles.verdictLong :
                       verdict.includes('SHORT') || verdict.includes('SELL') ? styles.verdictShort :
                       styles.verdictNeutral;
 
+  const isArbiterFinal = d.kind === 'arbiter_final';
+  const isTicker = d.kind === 'ticker';
+  const cardAccent = isArbiterFinal ? colors.amber
+                   : isAnalyst ? accentColor
+                   : colors.acidGreen;
+  const cardBorder = isArbiterFinal ? colors.amber
+                   : isAnalyst ? accentColor
+                   : colors.borderMuted;
+
   return (
-    <ChamferedBox 
+    <ChamferedBox
       isActive={nodeActive}
-      activeColor={isAnalyst ? accentColor : colors.acidGreen}
-      borderColor={isAnalyst ? accentColor : colors.borderMuted}
-      className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''}`}
+      activeColor={cardAccent}
+      borderColor={cardBorder}
+      className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''} ${isTicker ? styles.tickerCard : ''}`}
       style={{ cursor: 'pointer' }}
     >
       <div onClick={() => d.onNodeClick(d.nodeId)} className={styles.cardInner}>
@@ -91,8 +104,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
 
         <div className={styles.analystHeader}>
-          <span className={styles.kindLabel} style={{ color: isAnalyst ? accentColor : undefined }}>
-            {d.kind.toUpperCase()}
+          <span className={styles.kindLabel} style={{ color: isAnalyst ? accentColor : isArbiterFinal ? colors.amber : undefined }}>
+            {d.kind === 'arbiter_final' ? 'ARBITER' : d.kind.toUpperCase()}
           </span>
           <div className={`${styles.statusDot} ${statusDot}`} />
         </div>
@@ -138,13 +151,25 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {/* ── Analyst Template ── */}
         {isAnalyst && (
           <div>
-            <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
-            <div className={`${styles.analystVerdict} ${verdictClass}`}>
+            {d.provider && (
+              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 2 }}>
+                {d.provider.toUpperCase()}
+              </div>
+            )}
+            {!d.provider && (
+              <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
+            )}
+            <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
               {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
                verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
             </div>
-            <div className={styles.kindLabel} style={{ opacity: 0.6 }}>
-              {d.eventCount > 0 ? `${d.eventCount} ANALYSES` : 'PENDING'}
+            {d.accuracy !== undefined && d.accuracy > 0 && (
+              <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
+                ACC: {Math.round(d.accuracy * 100)}%
+              </div>
+            )}
+            <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+              {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'PENDING'}
             </div>
           </div>
         )}
@@ -220,6 +245,42 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 </div>
               </>
             )}
+          </div>
+        )}
+
+        {/* ── Ticker Template ── */}
+        {d.kind === 'ticker' && (
+          <div style={{ padding: '2px 0' }}>
+            <div style={{
+              fontFamily: 'var(--font-mono)',
+              fontSize: 18,
+              fontWeight: 800,
+              color: colors.textPrimary,
+              letterSpacing: '0.05em',
+              marginBottom: 6,
+            }}>
+              {d.label}
+            </div>
+            <div className={styles.feedStatusRow}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'LIVE' : 'IDLE'}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* ── Arbiter Final Template ── */}
+        {d.kind === 'arbiter_final' && (
+          <div>
+            <div className={styles.nodeTitle}>Ensemble Resolver</div>
+            <div className={styles.subValue} style={{ marginTop: 4 }}>
+              RESOLVES DISSENT
+            </div>
+            <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'ACTIVE' : 'STANDBY'}
+              </span>
+            </div>
           </div>
         )}
       </div>

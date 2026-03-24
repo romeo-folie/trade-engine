@@ -190,6 +190,12 @@
   justify-content: center;
 }
 
+/* Ticker Node — narrower card */
+.tickerCard {
+  width: 160px;
+  min-height: 100px;
+}
+
 .hubWordmark {
   color: var(--accent);
   font-family: var(--font-mono);

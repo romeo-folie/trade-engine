@@ -11,7 +11,7 @@ export interface WebEvent {
 export interface NodeState {
   id: string;
   label: string;
-  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter';
+  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter' | 'ticker' | 'arbiter_final';
   event_count: number;
   last_event_at?: string;
   avg_latency_ms?: number;
