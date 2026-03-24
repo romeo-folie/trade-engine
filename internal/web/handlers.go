@@ -22,6 +22,7 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/node/risk", handleRisk)
 	mux.HandleFunc("/api/node/portfolio", handlePortfolio)
 	mux.HandleFunc("/api/node/ticker/", handleTicker) // /api/node/ticker/:ticker
+	mux.HandleFunc("/api/node/watchlist", handleWatchlist)
 	mux.HandleFunc("/api/node/models", handleModels)
 	mux.HandleFunc("/api/signals/recent", handleRecentSignals)
 	mux.HandleFunc("/api/trades/recent", handleRecentTrades)
@@ -96,6 +97,32 @@ func handleTicker(w http.ResponseWriter, r *http.Request) {
 		"analysis": latestAnalysis,
 		"signals":  signals,
 	})
+}
+
+// GET /api/node/watchlist
+func handleWatchlist(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	items, err := store.GetWatchlistItems(ctx, true)
+	if err != nil {
+		apiError(w, "watchlist query failed", err)
+		return
+	}
+	type watchlistEntry struct {
+		Ticker     string   `json:"ticker"`
+		Strategies []string `json:"strategies"`
+		Timeframes []string `json:"timeframes"`
+	}
+	out := make([]watchlistEntry, 0, len(items))
+	for _, it := range items {
+		out = append(out, watchlistEntry{
+			Ticker:     it.Ticker,
+			Strategies: it.Strategies,
+			Timeframes: it.Timeframes,
+		})
+	}
+	jsonResponse(w, map[string]any{"tickers": out})
 }
 
 // GET /api/node/models
