@@ -37,7 +37,7 @@ const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
 // Column X-offsets based on design spec
 const COL = {
-  source: 0,
+  source: 40,       // offset from canvas edge for breathing room
   arbiter: 380,
   analyst: 760,
   synthesis: 1100,
@@ -101,6 +101,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const wrapperRef = useRef<HTMLDivElement>(null);
   const particlesRef = useRef<Particle[]>([]);
   const lastFrameRef = useRef<number>(0);
+  const setViewportRef = useRef<((vp: { x: number; y: number; zoom: number }) => void) | null>(null);
 
   const watchlistTickers = useWatchlist();
   const modelEnsemble = useModelEnsemble();
@@ -252,11 +253,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
               opacity: 1,
             }
           : {
-              stroke: colors.border,
+              stroke: colors.textFaint,
               strokeWidth: 1,
               strokeDasharray: '',
               animation: '',
-              opacity: 0.35,
+              opacity: 0.55,
             },
         type: 'smoothstep',
       };
@@ -402,6 +403,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return { ...n, position: { x, y } };
       });
     });
+    setViewportRef.current?.({ x: 40, y: 40, zoom: 0.7 });
   }, [setRfNodes]);
 
   return (
@@ -413,10 +415,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         onEdgesChange={onEdgesChange}
         onNodeClick={handleNodeClick}
         onViewportChange={handleViewportChange}
+        onInit={(instance) => { setViewportRef.current = instance.setViewport; }}
         nodeTypes={NODE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
-        defaultViewport={{ x: 0, y: 0, zoom: 0.7 }}
+        defaultViewport={{ x: 40, y: 40, zoom: 0.7 }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />

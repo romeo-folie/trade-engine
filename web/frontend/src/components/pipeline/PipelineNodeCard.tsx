@@ -86,7 +86,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   const isTicker = d.kind === 'ticker';
   const cardBorder = isArbiterFinal ? colors.amber
                    : isAnalyst ? accentColor
-                   : colors.borderMuted;
+                   : colors.border;
 
   return (
     <ChamferedBox
@@ -189,12 +189,12 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               <>
                 <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
                 <EnsembleConsensus items={[
-                  { label: 'TECH', value: 0.8, color: colors.analystTechnical },
-                  { label: 'MOM',  value: 0.4, color: colors.analystMomentum },
-                  { label: 'SENT', value: 0.9, color: colors.analystSentiment }
+                  { label: 'TECH', value: nodeActive ? 0.8 : 0, color: colors.analystTechnical },
+                  { label: 'MOM',  value: nodeActive ? 0.4 : 0, color: colors.analystMomentum },
+                  { label: 'SENT', value: nodeActive ? 0.9 : 0, color: colors.analystSentiment }
                 ]} />
-                <div className={`${styles.analystVerdict} ${styles.verdictLong}`} style={{ fontSize: 14, marginTop: 8 }}>
-                  LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span>
+                <div className={`${styles.analystVerdict} ${nodeActive ? styles.verdictLong : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
+                  {nodeActive ? <>LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span></> : '—'}
                 </div>
               </>
             )}
@@ -225,7 +225,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               </>
             ) : (
               <>
-                <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ display: 'inline-block', marginBottom: 8 }}>LONG</div>
+                <div className={`${styles.routeBadge} ${nodeActive ? styles.routeActive : ''}`} style={{ display: 'inline-block', marginBottom: 8 }}>
+                  {nodeActive ? 'LONG' : '—'}
+                </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                   <div>
                     <div className={styles.subValue}>SIZE</div>
