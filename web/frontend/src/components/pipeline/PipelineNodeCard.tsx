@@ -155,18 +155,31 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {!d.provider && (
               <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
             )}
-            <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-              {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-               verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-            </div>
-            {d.accuracy !== undefined && d.accuracy > 0 && (
-              <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
-                ACC: {Math.round(d.accuracy * 100)}%
-              </div>
+            {nodeActive ? (
+              <>
+                <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
+                  {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+                   verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
+                </div>
+                {d.accuracy !== undefined && d.accuracy > 0 && (
+                  <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
+                    ACC: {Math.round(d.accuracy * 100)}%
+                  </div>
+                )}
+                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+                  {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'ANALYZING'}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
+                  —
+                </div>
+                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+                  STANDBY
+                </div>
+              </>
             )}
-            <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-              {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'PENDING'}
-            </div>
           </div>
         )}
 

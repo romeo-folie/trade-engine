@@ -254,7 +254,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           lastEventAt: liveLastEventAt,
           metrics,
           isHub: false,
-          lastEventType: recentEventSignatures[n.id]?.type ?? 'buy_signal',
+          lastEventType: recentEventSignatures[n.id]?.type ?? null,
           onNodeClick,
           provider,
           accuracy,
