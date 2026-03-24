@@ -16,18 +16,22 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/orb"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/web"
 	"github.com/spf13/cobra"
 )
 
 var (
-	runMode   string
-	runDryRun bool
-	runDetach bool
+	runMode    string
+	runDryRun  bool
+	runDetach  bool
+	runWeb     bool
+	runWebPort string
 )
 
 var runCmd = &cobra.Command{
@@ -181,10 +185,26 @@ Modes:
 			}
 
 			orbPortfolio := newDBPortfolioValuer(100_000)
+			orbBus := events.New()
 			orbScheduler := orb.NewORBScheduler(
 				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
 				broker, orbPortfolio, orbNotifier,
 			)
+			orbScheduler.SetBus(orbBus)
+
+			if runWeb {
+				webSrv := web.NewServer(web.Config{
+					Port:           runWebPort,
+					Host:           "0.0.0.0",
+					AllowedOrigins: []string{"*"},
+				}, orbBus)
+				if err := webSrv.Start(ctx); err != nil {
+					return fmt.Errorf("web server: %w", err)
+				}
+				defer webSrv.Stop()
+				logger.Info("web observability server started (orb mode)", "port", runWebPort)
+				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
+			}
 
 			logger.Info("ORB scheduler starting")
 			fmt.Println("ORB mode active. Waiting for pre-market scan window...")
@@ -193,6 +213,20 @@ Modes:
 			}
 			fmt.Println("TradeEngine (ORB) stopped.")
 			return nil
+		}
+
+		if runWeb {
+			webSrv := web.NewServer(web.Config{
+				Port:           runWebPort,
+				Host:           "0.0.0.0",
+				AllowedOrigins: []string{"*"},
+			}, eng.Bus())
+			if err := webSrv.Start(ctx); err != nil {
+				return fmt.Errorf("web server: %w", err)
+			}
+			defer webSrv.Stop()
+			logger.Info("web observability server started", "port", runWebPort)
+			fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
 		}
 
 		if err := eng.Run(ctx); err != nil {
@@ -220,6 +254,9 @@ func startDetachedRun() error {
 	}
 	if runDryRun {
 		args = append(args, "--dry-run")
+	}
+	if runWeb {
+		args = append(args, "--web", "--web-port", runWebPort)
 	}
 
 	child := exec.Command(os.Args[0], args...)
@@ -442,4 +479,6 @@ func init() {
 	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")
+	runCmd.Flags().BoolVar(&runWeb, "web", false, "Start the web observability server in-process")
+	runCmd.Flags().StringVar(&runWebPort, "web-port", "8080", "Port for the in-process web server")
 }
