@@ -37,12 +37,12 @@ const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
 // Column X-offsets — 40px gap between card edges (NODE_W=280)
 const COL = {
-  source:        40,
-  arbiter:       360,   // 40 + 280 + 40
-  analyst:       680,   // 360 + 280 + 40
-  synthesis:     1000,  // 680 + 280 + 40
-  arbiter_final: 1320,  // 1000 + 280 + 40
-  execution:     1640,  // 1320 + 280 + 40
+  source:        60,
+  arbiter:       440,   // 60 + 280 + 100
+  analyst:       820,   // 440 + 280 + 100
+  synthesis:     1200,  // 820 + 280 + 100
+  arbiter_final: 1580,  // 1200 + 280 + 100
+  execution:     1960,  // 1580 + 280 + 100
 };
 
 const CY = 400;
@@ -406,7 +406,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return { ...n, position: { x, y } };
       });
     });
-    setViewportRef.current?.({ x: 40, y: 40, zoom: 0.7 });
+    setViewportRef.current?.({ x: 20, y: 60, zoom: 0.6 });
   }, [setRfNodes]);
 
   return (
@@ -422,7 +422,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         nodeTypes={NODE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
-        defaultViewport={{ x: 40, y: 40, zoom: 0.7 }}
+        defaultViewport={{ x: 20, y: 60, zoom: 0.6 }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />
