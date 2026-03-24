@@ -47,12 +47,7 @@ const CY = 400;
 const NODE_W = 280;
 const NODE_H = 140;
 
-const EDGE_ACTIVE   = colors.acidGreen;
-const EDGE_INACTIVE = colors.borderMuted;
-
-// Visual kinds understood by PipelineNodeCard.
-// Backend kinds (processing, output) are remapped via the demo node override list.
-const VISUAL_KINDS = new Set(['source', 'arbiter', 'analyst', 'synthesis', 'execution']);
+const EDGE_ACTIVE = colors.acidGreen;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -94,45 +89,48 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
   const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
-    // Add internal demo/structural nodes to complete the pipeline if missing
-    const demoNodes: NodeState[] = [
-      { id: 'btc-signal', label: 'BTC/USDT', kind: 'source', event_count: 1420, last_event_at: new Date().toISOString() },
-      { id: 'arbiter', label: 'Signal Router', kind: 'arbiter', event_count: 50, last_event_at: new Date().toISOString() },
-      { id: 'technical', label: 'Technical', kind: 'analyst', event_count: 124, last_event_at: new Date().toISOString() },
-      { id: 'momentum', label: 'Momentum', kind: 'analyst', event_count: 89, last_event_at: new Date().toISOString() },
-      { id: 'sentiment', label: 'Sentiment', kind: 'analyst', event_count: 210, last_event_at: new Date().toISOString() },
-      { id: 'macro', label: 'Macro', kind: 'analyst', event_count: 45, last_event_at: new Date().toISOString() },
-      { id: 'consensus', label: 'Ensemble', kind: 'synthesis', event_count: 56, last_event_at: new Date().toISOString() },
-      { id: 'executor', label: 'Live Router', kind: 'execution', event_count: 12, last_event_at: new Date().toISOString() },
+    // Pipeline nodes with real backend IDs mapped to visual kinds.
+    // Only nodes that have a meaningful card template are included.
+    const PIPELINE_NODES: NodeState[] = [
+      // Sources (col 0)
+      { id: 'alpaca',           label: 'Alpaca Feed',       kind: 'source',    event_count: 0, last_event_at: undefined },
+      { id: 'news_api',         label: 'News Feed',         kind: 'source',    event_count: 0, last_event_at: undefined },
+      // Arbiter (col 1)
+      { id: 'indicator_engine', label: 'Indicator Engine',  kind: 'arbiter',   event_count: 0, last_event_at: undefined },
+      // Analyst (col 2)
+      { id: 'llm_analysis',     label: 'LLM Analysis',      kind: 'analyst',   event_count: 0, last_event_at: undefined },
+      // Synthesis (col 3)
+      { id: 'consensus',        label: 'Consensus',         kind: 'synthesis', event_count: 0, last_event_at: undefined },
+      { id: 'risk_manager',     label: 'Risk Manager',      kind: 'synthesis', event_count: 0, last_event_at: undefined },
+      // Execution (col 4)
+      { id: 'executor',         label: 'Executor',          kind: 'execution', event_count: 0, last_event_at: undefined },
+      { id: 'portfolio',        label: 'Portfolio',         kind: 'execution', event_count: 0, last_event_at: undefined },
     ];
 
-    // Build the node list:
-    // 1. For each demo node ID, use the demo version (has correct visual kind + label).
-    //    If the backend also sent a node with that ID, its metrics are merged in separately
-    //    via nodeMetrics — no need to keep the backend version here.
-    // 2. Append any live nodes from the backend that have a recognised visual kind
-    //    and are NOT already covered by the demo list (e.g. dynamically added sources).
-    // 3. Silently drop backend nodes with unrecognised kinds (processing, output) that
-    //    have no demo equivalent — they would render as dark default cards at column 0.
-    const demoIds = new Set(demoNodes.map(d => d.id));
-    const liveVisualNodes = nodes.filter(
-      n => VISUAL_KINDS.has(n.kind) && !demoIds.has(n.id)
-    );
-    const allNodes = [...demoNodes, ...liveVisualNodes];
+    // Merge live metrics from backend into pipeline nodes.
+    // Only nodes in PIPELINE_NODES are rendered — unknown backend nodes are dropped.
+    const allNodes = PIPELINE_NODES.map(pn => {
+      const live = nodes.find(n => n.id === pn.id);
+      return live
+        ? { ...pn, event_count: live.event_count, last_event_at: live.last_event_at }
+        : pn;
+    });
 
-    // Positions based on columns + vertical stacking for analysts
-    const analystNodes = allNodes.filter(n => n.kind.includes('analyst'));
-    const analystGap = 200;
-    const analystStartY = CY - ((analystNodes.length - 1) * analystGap) / 2;
+    // Stack nodes vertically within each kind group
+    const kindGroups: Record<string, typeof allNodes> = {};
+    for (const n of allNodes) {
+      if (!kindGroups[n.kind]) kindGroups[n.kind] = [];
+      kindGroups[n.kind].push(n);
+    }
 
     return allNodes.map((n) => {
-      let x = getColumnX(n.kind);
-      let y = CY - NODE_H / 2;
+      const group = kindGroups[n.kind] || [n];
+      const groupGap = 200;
+      const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
+      const groupIdx = group.findIndex(gn => gn.id === n.id);
 
-      if (n.kind.includes('analyst')) {
-        const aIdx = analystNodes.findIndex(an => an.id === n.id);
-        y = analystStartY + aIdx * analystGap;
-      }
+      const x = getColumnX(n.kind);
+      const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
 
       const metrics = nodeMetrics[n.id] ?? null;
       const liveLastEventAt = metrics?.lastEventAt
@@ -167,35 +165,34 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
     const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
     const analystIds = rfNodes.filter(n => n.data.kind.includes('analyst')).map(n => n.id);
-    const synthesisId = rfNodes.find(n => n.data.kind === 'synthesis')?.id;
-    const executionId = rfNodes.find(n => n.data.kind === 'execution')?.id;
+    const synthesisIds = rfNodes.filter(n => n.data.kind === 'synthesis').map(n => n.id);
+    const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
 
-    const creationEdges = (src: string, tgt: string) => {
-      const isActive = true; // For demo, keep edges active
-      return {
-        id: `e-${src}-${tgt}`,
-        source: src,
-        target: tgt,
-        style: {
-          stroke: isActive ? EDGE_ACTIVE : EDGE_INACTIVE,
-          strokeWidth: 1,
-          strokeDasharray: '5 5',
-          animation: 'edge-dash 0.5s linear infinite',
-        },
-        type: 'smoothstep',
-      };
-    };
+    const makeEdge = (src: string, tgt: string) => ({
+      id: `e-${src}-${tgt}`,
+      source: src,
+      target: tgt,
+      style: {
+        stroke: EDGE_ACTIVE,
+        strokeWidth: 1,
+        strokeDasharray: '5 5',
+        animation: 'edge-dash 0.5s linear infinite',
+      },
+      type: 'smoothstep',
+    });
 
     if (arbiterId) {
-      sourceIds.forEach(sid => edges.push(creationEdges(sid, arbiterId)));
-      analystIds.forEach(aid => edges.push(creationEdges(arbiterId, aid)));
+      sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
+      analystIds.forEach(aid => edges.push(makeEdge(arbiterId, aid)));
     }
-    if (synthesisId) {
-      analystIds.forEach(aid => edges.push(creationEdges(aid, synthesisId)));
-    }
-    if (executionId && synthesisId) {
-      edges.push(creationEdges(synthesisId, executionId));
-    }
+    // All analysts → all synthesis nodes
+    synthesisIds.forEach(sid => {
+      analystIds.forEach(aid => edges.push(makeEdge(aid, sid)));
+    });
+    // All synthesis → all execution nodes
+    executionIds.forEach(eid => {
+      synthesisIds.forEach(sid => edges.push(makeEdge(sid, eid)));
+    });
 
     return edges;
   }, [rfNodes]);
@@ -291,15 +288,23 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   });
 
   const resetLayout = useCallback(() => {
-    // Re-trigger positions by clearing and re-setting if needed, 
-    // but React Flow handles basic node position state. 
-    // To truly "reset", we can just re-apply the column logic.
-    setRfNodes((nodes) => nodes.map(n => {
-      const colX = getColumnX(n.data.kind);
-      // For analysts, we'd need to re-find their index, 
-      // but for now, simple column reset is a good start.
-      return { ...n, position: { x: colX, y: CY - NODE_H / 2 } };
-    }));
+    setRfNodes((currentNodes) => {
+      const groups: Record<string, typeof currentNodes> = {};
+      for (const n of currentNodes) {
+        const k = n.data.kind;
+        if (!groups[k]) groups[k] = [];
+        groups[k].push(n);
+      }
+      return currentNodes.map(n => {
+        const group = groups[n.data.kind] || [n];
+        const groupGap = 200;
+        const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
+        const groupIdx = group.findIndex(gn => gn.id === n.id);
+        const x = getColumnX(n.data.kind);
+        const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
+        return { ...n, position: { x, y } };
+      });
+    });
   }, [setRfNodes]);
 
   return (

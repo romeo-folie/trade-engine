@@ -1,11 +1,18 @@
 import { memo, useMemo } from 'react';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
-import Sparkline from './Sparkline';
 import EnsembleConsensus from './EnsembleConsensus';
 import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
+
+function lastTickLabel(lastEventAt: string | null): string {
+  if (!lastEventAt) return '—';
+  const ms = Date.now() - new Date(lastEventAt).getTime();
+  if (ms < 60_000) return `${Math.floor(ms / 1000)}s ago`;
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+  return `${Math.floor(ms / 3_600_000)}h ago`;
+}
 
 export interface PipelineNodeData {
   nodeId: string;
@@ -59,11 +66,12 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   }
 
   // ── Analyst Detection & Accent ───────────────────────────────────────────
-  const isAnalyst = d.kind.toLowerCase().includes('analyst') || ['technical', 'momentum', 'sentiment', 'macro'].includes(d.nodeId);
-  const accentColor = d.nodeId === 'technical' ? colors.analystTechnical : 
+  const isAnalyst = d.kind.toLowerCase().includes('analyst') || ['technical', 'momentum', 'sentiment', 'macro', 'llm_analysis'].includes(d.nodeId);
+  const accentColor = d.nodeId === 'technical' ? colors.analystTechnical :
                      d.nodeId === 'momentum' ? colors.analystMomentum :
                      d.nodeId === 'sentiment' ? colors.analystSentiment :
-                     d.nodeId === 'macro' ? colors.analystMacro : colors.borderMuted;
+                     d.nodeId === 'macro' ? colors.analystMacro :
+                     d.nodeId === 'llm_analysis' ? colors.acidGreen : colors.borderMuted;
 
   const verdict = (d.lastEventType || 'NEUTRAL').toUpperCase();
   const verdictClass = verdict.includes('LONG') || verdict.includes('BUY') ? styles.verdictLong :
@@ -91,73 +99,127 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
         <div className={styles.nodeTitle}>{d.label}</div>
 
-        {/* ── Signal Template ── */}
+        {/* ── Source Template ── */}
         {d.kind === 'source' && (
-          <div className={styles.signalGrid}>
-            <div>
-              <div className={styles.price}>$84,192.30</div>
-              <div className={styles.verdictLong} style={{ fontSize: 10, marginTop: 4 }}>+2.41% <span style={{ color: '#FBBF24', marginLeft: 4 }}>HIGH VOL</span></div>
+          <div className={styles.sourceContent}>
+            <div className={styles.sourceRow}>
+              <div>
+                <div className={styles.subValue}>EVENTS</div>
+                <div className={styles.metricValue}>{d.eventCount.toLocaleString()}</div>
+              </div>
+              <div>
+                <div className={styles.subValue}>LAST TICK</div>
+                <div className={styles.metricValue}>{lastTickLabel(d.lastEventAt)}</div>
+              </div>
             </div>
-            <Sparkline data={[83900, 84100, 84050, 84150, 84192]} />
+            <div className={styles.feedStatusRow}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'LIVE' : 'IDLE'}
+              </span>
+            </div>
           </div>
         )}
 
-        {/* ── Arbiter Template (Signal Router) ── */}
+        {/* ── Arbiter Template (Indicator Engine) ── */}
         {d.kind === 'arbiter' && (
           <div className={styles.arbiter}>
-            <div className={styles.subValue}>ROUTING TO:</div>
+            <div className={styles.subValue}>INDICATOR ENGINE</div>
             <div className={styles.routingBox}>
-              <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ color: colors.analystTechnical }}>TECHNICAL</div>
-              <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ color: colors.analystMomentum }}>MOMENTUM</div>
-              <div className={styles.routeBadge}>SENTIMENT</div>
+              {['RSI', 'EMA', 'MACD', 'ADX', 'ATR', 'OBV'].map(ind => (
+                <div key={ind} className={`${styles.routeBadge} ${nodeActive ? styles.routeActive : ''}`}>{ind}</div>
+              ))}
             </div>
-            <div className={styles.recipeText}>MTL RECIPE: HTEM PERPENDUM</div>
-            <div className={styles.kindLabel} style={{ marginTop: 2 }}>2 OF 4 ANALYSTS ROUTED</div>
+            <div className={styles.subValue} style={{ marginTop: 6 }}>
+              {d.eventCount > 0 ? `${d.eventCount.toLocaleString()} COMPUTATIONS` : 'WAITING FOR DATA'}
+            </div>
           </div>
         )}
 
         {/* ── Analyst Template ── */}
         {isAnalyst && (
           <div>
-            <div className={styles.subValue} style={{ fontSize: 9 }}>RSI • MACD • EMA</div>
+            <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
             <div className={`${styles.analystVerdict} ${verdictClass}`}>
-              {verdict.includes('LONG') ? 'LONG' : verdict.includes('SHORT') ? 'SHORT' : 'NEUTRAL'}
+              {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+               verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
             </div>
-            <div className={styles.kindLabel} style={{ opacity: 0.6 }}>CONFIDENCE: 84%</div>
-            <div className={styles.kindLabel} style={{ opacity: 0.6 }}>WEIGHT: 0.40</div>
+            <div className={styles.kindLabel} style={{ opacity: 0.6 }}>
+              {d.eventCount > 0 ? `${d.eventCount} ANALYSES` : 'PENDING'}
+            </div>
           </div>
         )}
 
         {/* ── Synthesis Template ── */}
         {d.kind === 'synthesis' && (
           <div className={styles.ensembleBox}>
-            <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
-            <EnsembleConsensus items={[
-              { label: 'TECH', value: 0.8, color: colors.analystTechnical },
-              { label: 'MOM',  value: 0.4, color: colors.analystMomentum },
-              { label: 'SENT', value: 0.9, color: colors.analystSentiment }
-            ]} />
-            <div className={`${styles.analystVerdict} ${styles.verdictLong}`} style={{ fontSize: 14, marginTop: 8 }}>
-              LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span>
-            </div>
+            {d.nodeId === 'risk_manager' ? (
+              <>
+                <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 6 }}>RISK CHECKS</div>
+                {['CONFIDENCE', 'R/R RATIO', 'POSITION SIZE', 'DRAWDOWN'].map(check => (
+                  <div key={check} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                    <span className={styles.kindLabel}>{check}</span>
+                    <span className={styles.kindLabel} style={{ color: nodeActive ? colors.emerald : colors.textDim }}>
+                      {nodeActive ? 'PASS' : '—'}
+                    </span>
+                  </div>
+                ))}
+              </>
+            ) : (
+              <>
+                <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
+                <EnsembleConsensus items={[
+                  { label: 'TECH', value: 0.8, color: colors.analystTechnical },
+                  { label: 'MOM',  value: 0.4, color: colors.analystMomentum },
+                  { label: 'SENT', value: 0.9, color: colors.analystSentiment }
+                ]} />
+                <div className={`${styles.analystVerdict} ${styles.verdictLong}`} style={{ fontSize: 14, marginTop: 8 }}>
+                  LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span>
+                </div>
+              </>
+            )}
           </div>
         )}
 
         {/* ── Execution Template ── */}
         {d.kind === 'execution' && (
           <div className={styles.execution}>
-            <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ display: 'inline-block', marginBottom: 8 }}>LONG</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-              <div>
-                <div className={styles.subValue}>SIZE</div>
-                <div className={styles.kindLabel} style={{ color: '#fff' }}>$12,500</div>
-              </div>
-              <div>
-                <div className={styles.subValue}>ENTRY</div>
-                <div className={styles.kindLabel} style={{ color: '#fff' }}>$84,241.50</div>
-              </div>
-            </div>
-            <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center' }}>EXECUTING</div>
+            {d.nodeId === 'portfolio' ? (
+              <>
+                <div className={styles.subValue} style={{ marginBottom: 6 }}>PORTFOLIO</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <div>
+                    <div className={styles.subValue}>EQUITY</div>
+                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
+                  </div>
+                  <div>
+                    <div className={styles.subValue}>POSITIONS</div>
+                    <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                      {d.eventCount > 0 ? d.eventCount : '0'}
+                    </div>
+                  </div>
+                </div>
+                <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center', marginTop: 8 }}>
+                  {nodeActive ? 'TRACKING' : 'IDLE'}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ display: 'inline-block', marginBottom: 8 }}>LONG</div>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                  <div>
+                    <div className={styles.subValue}>SIZE</div>
+                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
+                  </div>
+                  <div>
+                    <div className={styles.subValue}>ENTRY</div>
+                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
+                  </div>
+                </div>
+                <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center' }}>
+                  {nodeActive ? 'EXECUTING' : 'READY'}
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>
