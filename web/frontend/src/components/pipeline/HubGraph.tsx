@@ -7,7 +7,9 @@
  * Animated particles travel along edges powered by framer-motion.
  * Clicking a node opens the DrillDownPanel.
  */
-import { useCallback, useMemo, useEffect, useRef } from 'react';
+import { useCallback, useMemo, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { LayoutGrid, Lock, LockOpen, Crosshair } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -27,7 +29,6 @@ import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
 import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
-import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './HubGraph.module.css';
 
@@ -94,6 +95,47 @@ interface Particle {
   speed: number;
 }
 
+// ── CanvasIconButton ──────────────────────────────────────────────────────────
+
+interface CanvasIconButtonProps {
+  icon: ReactNode;
+  onClick: () => void;
+  title?: string;
+  active?: boolean;
+}
+
+function CanvasIconButton({ icon, onClick, title, active }: CanvasIconButtonProps) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        width: 28,
+        height: 28,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: active ? 'rgba(57, 255, 20, 0.1)' : 'rgba(13, 13, 17, 0.85)',
+        border: `1px solid ${active ? 'rgba(57, 255, 20, 0.4)' : 'rgba(26, 26, 34, 0.8)'}`,
+        borderRadius: 4,
+        color: active ? '#39FF14' : '#6B7280',
+        cursor: 'pointer',
+        backdropFilter: 'blur(4px)',
+        transition: 'all 0.15s ease',
+        padding: 0,
+      }}
+      onMouseEnter={e => {
+        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#F0F0F0';
+      }}
+      onMouseLeave={e => {
+        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#6B7280';
+      }}
+    >
+      {icon}
+    </button>
+  );
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, onNodeClick }: HubGraphProps) {
@@ -102,6 +144,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const particlesRef = useRef<Particle[]>([]);
   const lastFrameRef = useRef<number>(0);
   const setViewportRef = useRef<((vp: { x: number; y: number; zoom: number }) => void) | null>(null);
+  const fitViewRef = useRef<((opts?: { padding?: number; duration?: number }) => void) | null>(null);
+  const [layoutLocked, setLayoutLocked] = useState(false);
 
   const watchlistTickers = useWatchlist();
   const modelEnsemble = useModelEnsemble();
@@ -295,6 +339,19 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   useEffect(() => { setRfNodes(rfNodes); }, [rfNodes, setRfNodes]);
   useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
 
+  // Center view on initial render
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fitViewRef.current?.({ padding: 0.15, duration: 300 });
+    }, 100);
+    return () => clearTimeout(timer);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Patch draggable on all nodes when lock state changes
+  useEffect(() => {
+    setRfNodes(nds => nds.map(n => ({ ...n, draggable: !layoutLocked })));
+  }, [layoutLocked, setRfNodes]);
+
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
     onNodeClick(node.id);
   }, [onNodeClick]);
@@ -406,7 +463,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return { ...n, position: { x, y } };
       });
     });
-    setViewportRef.current?.({ x: 20, y: 60, zoom: 0.6 });
+    // Give React a tick to apply new positions before fitting
+    setTimeout(() => {
+      fitViewRef.current?.({ padding: 0.15, duration: 400 });
+    }, 50);
   }, [setRfNodes]);
 
   return (
@@ -418,7 +478,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         onEdgesChange={onEdgesChange}
         onNodeClick={handleNodeClick}
         onViewportChange={handleViewportChange}
-        onInit={(instance) => { setViewportRef.current = instance.setViewport; }}
+        onInit={(instance) => {
+          setViewportRef.current = instance.setViewport;
+          fitViewRef.current = instance.fitView;
+        }}
         nodeTypes={NODE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
@@ -436,34 +499,34 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       </ReactFlow>
       <canvas ref={canvasRef} className={styles.particleCanvas} style={{ pointerEvents: 'none' }} />
 
-      {/* Floating Controls */}
+      {/* Floating Controls — vertical icon stack, top right */}
       <div style={{
         position: 'absolute',
         top: 20,
         right: 20,
         zIndex: 10,
         display: 'flex',
-        gap: 12
+        flexDirection: 'column',
+        gap: 8,
       }}>
-        <ChamferedBox
-          chamfer={6}
-          backgroundColor="rgba(13, 13, 17, 0.8)"
-          borderColor={colors.borderMuted}
+        <CanvasIconButton
+          icon={<Crosshair size={14} />}
+          onClick={() => fitViewRef.current?.({ padding: 0.15, duration: 400 })}
+          title="Fit view"
+          active={false}
+        />
+        <CanvasIconButton
+          icon={<LayoutGrid size={14} />}
           onClick={resetLayout}
-          style={{
-            padding: '6px 12px',
-            backdropFilter: 'blur(4px)',
-          }}
-        >
-          <span style={{
-            fontSize: '10px',
-            fontWeight: 700,
-            color: colors.textDim,
-            letterSpacing: '0.05em'
-          }}>
-            RESET LAYOUT
-          </span>
-        </ChamferedBox>
+          title="Reset layout"
+          active={false}
+        />
+        <CanvasIconButton
+          icon={layoutLocked ? <Lock size={14} /> : <LockOpen size={14} />}
+          onClick={() => setLayoutLocked(l => !l)}
+          title={layoutLocked ? 'Unlock layout' : 'Lock layout'}
+          active={layoutLocked}
+        />
       </div>
     </div>
   );
