@@ -35,14 +35,14 @@ import styles from './HubGraph.module.css';
 
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
-// Column X-offsets based on design spec
+// Column X-offsets — 40px gap between card edges (NODE_W=280)
 const COL = {
-  source: 40,       // offset from canvas edge for breathing room
-  arbiter: 380,
-  analyst: 760,
-  synthesis: 1100,
-  arbiter_final: 1280,
-  execution: 1500,
+  source:        40,
+  arbiter:       360,   // 40 + 280 + 40
+  analyst:       680,   // 360 + 280 + 40
+  synthesis:     1000,  // 680 + 280 + 40
+  arbiter_final: 1320,  // 1000 + 280 + 40
+  execution:     1640,  // 1320 + 280 + 40
 };
 
 const CY = 400;
@@ -181,7 +181,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         y = TICKER_Y_BASE;
       } else {
         const group = kindGroups[n.kind] || [n];
-        const groupGap = 200;
+        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
+        const groupGap = n.kind === 'synthesis' ? 320 : 200;
         const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         x = getColumnX(n.kind);
@@ -395,7 +396,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           return { ...n, position: { x, y: TICKER_Y_BASE } };
         }
         const group = groups[n.data.kind] || [n];
-        const groupGap = 200;
+        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
+        const groupGap = n.data.kind === 'synthesis' ? 320 : 200;
         const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         const x = getColumnX(n.data.kind);
