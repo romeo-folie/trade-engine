@@ -175,8 +175,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
                   —
                 </div>
-                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-                  STANDBY
+                <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
+                  <span className={styles.feedBadgeIdle}>STANDBY</span>
                 </div>
               </>
             )}
