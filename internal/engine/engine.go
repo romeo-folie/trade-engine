@@ -759,7 +759,16 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
 		Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
 		Reasoning: resp.Reasoning, Provider: meta.Provider, Model: meta.Model, LatencyMs: meta.LatencyMs,
+		FastPathed: result.FastPathed,
 	})
+	if !result.FastPathed && result.Arbiter != nil {
+		e.bus.Publish(events.ArbiterInvoked, events.ArbiterInvokedPayload{
+			Ticker:         ticker,
+			Action:         string(resp.Action),
+			Confidence:     resp.Confidence,
+			DissentSummary: result.Arbiter.DissentSummary,
+		})
+	}
 
 	// Persist — use ensemble variant when multiple analysts were queried.
 	var analysisID string

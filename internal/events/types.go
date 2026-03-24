@@ -12,6 +12,7 @@ const (
 	DataFetched            Type = "data.fetched"
 	IndicatorsComputed     Type = "indicators.computed"
 	AnalysisCompleted      Type = "analysis.completed"
+	ArbiterInvoked         Type = "arbiter.invoked"
 	SignalGenerated        Type = "signal.generated"
 	SignalBlocked          Type = "signal.blocked"
 	SignalExpired          Type = "signal.expired"
@@ -60,6 +61,15 @@ type AnalysisCompletedPayload struct {
 	Provider   string
 	Model      string
 	LatencyMs  int64
+	FastPathed bool `json:"fast_pathed"` // true = unanimous analysts, arbiter skipped
+}
+
+// ArbiterInvokedPayload is emitted when the arbiter resolves analyst dissent.
+type ArbiterInvokedPayload struct {
+	Ticker         string  `json:"ticker"`
+	Action         string  `json:"action"`
+	Confidence     float64 `json:"confidence"`
+	DissentSummary string  `json:"dissent_summary"`
 }
 
 // SignalGeneratedPayload is emitted when a new signal is created (passed risk).

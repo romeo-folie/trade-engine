@@ -39,6 +39,7 @@ export const PARTICLE_COLORS: Record<string, string> = {
   NewsIngested:         '#F59E0B', // amber
   // LLM / analysis
   AnalysisCompleted:    '#8B5CF6', // violet
+  ArbiterInvoked:       '#F59E0B', // amber — dissent resolution
   // Signal flow
   SignalGenerated:      '#8B5CF6', // violet
   RiskCheckCompleted:   '#39FF14', // acidGreen
@@ -66,6 +67,7 @@ export const EVENT_LABELS: Record<string, string> = {
   DataFetched:        'Market Data',
   IndicatorsComputed: 'Indicators',
   AnalysisCompleted:  'Analysis',
+  ArbiterInvoked:     'Arbiter',
   SignalGenerated:    'Signal',
   SignalBlocked:      'Blocked',
   SignalExpired:      'Expired',

@@ -274,12 +274,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // All analysts → consensus
     analystIds.forEach(aid => edges.push(makeEdge(aid, 'consensus')));
 
-    // consensus → arbiter_final → risk_manager (or consensus → risk_manager if no arbiter)
+    // Always draw both paths; edge activity is driven by isNodeRecentlyActive.
+    // Fast path: consensus → risk_manager (lights up via SignalGenerated)
+    // Arbiter path: consensus → arbiter_node → risk_manager (lights up via ArbiterInvoked)
+    edges.push(makeEdge('consensus', 'risk_manager'));
     if (arbiterFinalId) {
       edges.push(makeEdge('consensus', arbiterFinalId));
       edges.push(makeEdge(arbiterFinalId, 'risk_manager'));
-    } else {
-      edges.push(makeEdge('consensus', 'risk_manager'));
     }
 
     // risk_manager → all execution nodes
