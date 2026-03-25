@@ -70,8 +70,9 @@ type ORBScheduler struct {
 	executor   execution.Executor
 	portfolio  PortfolioValuer
 	notifier   Notifier
-	bus        *events.Bus // optional; nil means no event publishing
-	now        func() time.Time // injectable for tests
+	news       data.NewsProvider // optional; nil disables news enrichment
+	bus        *events.Bus       // optional; nil means no event publishing
+	now        func() time.Time  // injectable for tests
 
 	mu           sync.Mutex // protects state, session, candidates for TUI reads
 	state        State
@@ -104,6 +105,12 @@ func NewORBScheduler(
 		rangeBuffers: make(map[string]*RangeBuffer),
 		orderIDs:     make(map[string]string),
 	}
+}
+
+// SetNewsProvider wires a news source for pre-market catalyst enrichment.
+// Call before Run. If not called, the LLM scores on price/volume data only.
+func (s *ORBScheduler) SetNewsProvider(news data.NewsProvider) {
+	s.news = news
 }
 
 // SetBus wires an event bus so the ORB scheduler publishes pipeline events.
@@ -256,11 +263,31 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// News fetching is deferred to a follow-up iteration.
-		// Without real news the LLM scores on gap magnitude and pre-market
-		// volume alone, which makes catalyst_type/catalyst_quality unreliable.
-		// Wire Alpaca News API (or similar) here when available.
+		// Fetch recent news for this ticker to give the LLM catalyst context.
+		// Without news, catalyst_type/catalyst_quality are unreliable since the
+		// model can only see gap magnitude and pre-market volume.
 		var newsItems []prompts.ORBNewsItem
+		if s.news != nil {
+			since := s.now().Add(-time.Duration(s.cfg.NewsLookbackHours) * time.Hour)
+			rawNews, newsErr := s.news.FetchNews(ctx, gap.Ticker, since)
+			if newsErr != nil {
+				fmt.Printf("orb: news fetch %s: %v\n", gap.Ticker, newsErr)
+			} else {
+				for _, n := range rawNews {
+					sentiment := "NEUTRAL"
+					if n.SentimentScore > 0.1 {
+						sentiment = "POSITIVE"
+					} else if n.SentimentScore < -0.1 {
+						sentiment = "NEGATIVE"
+					}
+					newsItems = append(newsItems, prompts.ORBNewsItem{
+						Headline:    n.Headline,
+						Sentiment:   sentiment,
+						PublishedAt: n.PublishedAt,
+					})
+				}
+			}
+		}
 
 		sysPrompt, userMsg := prompts.BuildORBPrompt(
 			prompts.ORBCandidate{

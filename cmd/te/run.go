@@ -190,6 +190,9 @@ Modes:
 				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
 				broker, orbPortfolio, orbNotifier,
 			)
+			if newsProvider != nil {
+				orbScheduler.SetNewsProvider(newsProvider)
+			}
 			orbScheduler.SetBus(orbBus)
 
 			if runWeb {

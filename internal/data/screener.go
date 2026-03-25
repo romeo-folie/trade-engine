@@ -35,7 +35,7 @@ type alpacaMoversResponse struct {
 // sorted by absolute gap descending. Uses the Alpaca Screener API.
 func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64) ([]GapCandidate, error) {
 	params := url.Values{}
-	params.Set("top", "20")
+	params.Set("top", "50")
 	resp, err := client.get(ctx, "/v1beta1/screener/stocks/movers", params)
 	if err != nil {
 		return nil, fmt.Errorf("fetch movers: %w", err)
