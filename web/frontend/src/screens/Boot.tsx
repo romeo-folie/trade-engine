@@ -8,6 +8,7 @@
  *
  * Transitions to the Shell once socket reaches 'connected'.
  */
+import { useState, useEffect } from 'react';
 import type { ConnectionStatus } from '../hooks/useEngineSocket';
 import styles from './Boot.module.css';
 
@@ -19,8 +20,9 @@ interface LogLine {
   kind?: 'title' | 'separator';
 }
 
-const BOOT_LINES: LogLine[] = [
-  { tag: 'SYSTEM', text: 'TradeEngine v2.0.0 — initialising', kind: 'title' },
+function buildBootLines(version: string): LogLine[] {
+  return [
+  { tag: 'SYSTEM', text: `TradeEngine ${version} — initialising`, kind: 'title' },
   { text: '───────────────────────────────────────────────', kind: 'separator' },
   { tag: 'OK',   text: 'kernel modules loaded' },
   { tag: 'OK',   text: 'config validated' },
@@ -35,7 +37,8 @@ const BOOT_LINES: LogLine[] = [
   { tag: 'OK',   text: 'market data feed — online' },
   { tag: 'OK',   text: 'signal processor — ready' },
   { tag: 'WAIT', text: 'connecting to engine socket...' },
-];
+  ]
+}
 
 const LINE_DELAY_MS = 80;
 
@@ -62,6 +65,18 @@ interface BootScreenProps {
 }
 
 export default function BootScreen({ status }: BootScreenProps) {
+  const [version, setVersion] = useState('v—');
+
+  useEffect(() => {
+    fetch('/api/system/status')
+      .then(r => r.ok ? r.json() : null)
+      .then((d: { version?: string } | null) => {
+        if (d?.version) setVersion(`v${d.version}`);
+      })
+      .catch(() => {});
+  }, []);
+
+  const BOOT_LINES = buildBootLines(version);
   const showError = status === 'reconnecting';
 
   const lines: LogLine[] = showError

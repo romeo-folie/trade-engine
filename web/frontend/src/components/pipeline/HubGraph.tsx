@@ -27,6 +27,7 @@ import type { NodeState } from '../../types/protocol';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
+import { useSystemStatus } from '../../hooks/useSystemStatus';
 import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
 import { colors } from '../../styles/tokens';
@@ -47,7 +48,6 @@ const COL = {
 };
 
 const CY = 400;
-const TICKER_Y_BASE = 700;
 
 // Node dimensions
 const NODE_W = 280;
@@ -149,6 +149,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   const watchlistTickers = useWatchlist();
   const modelEnsemble = useModelEnsemble();
+  const systemStatus = useSystemStatus();
+  const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
@@ -185,15 +187,6 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       { id: 'portfolio',        label: 'Portfolio',         kind: 'execution',     event_count: 0, last_event_at: undefined },
     ];
 
-    // Ticker sub-nodes (below main pipeline)
-    const tickerNodes: NodeState[] = watchlistTickers.map(t => ({
-      id: `ticker-${t.ticker}`,
-      label: t.ticker,
-      kind: 'ticker' as const,
-      event_count: 0,
-      last_event_at: undefined,
-    }));
-
     // Merge live metrics from backend into pipeline nodes.
     const mergedPipeline = PIPELINE_NODES.map(pn => {
       const live = nodes.find(n => n.id === pn.id);
@@ -202,36 +195,23 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         : pn;
     });
 
-    const allNodes = [...mergedPipeline, ...tickerNodes];
+    const allNodes = [...mergedPipeline];
 
-    // Stack nodes vertically within each kind group (excluding tickers — positioned separately)
+    // Stack nodes vertically within each kind group
     const kindGroups: Record<string, typeof allNodes> = {};
     for (const n of allNodes) {
-      if (n.kind === 'ticker') continue;
       if (!kindGroups[n.kind]) kindGroups[n.kind] = [];
       kindGroups[n.kind].push(n);
     }
 
     return allNodes.map((n) => {
-      let x: number;
-      let y: number;
-
-      if (n.kind === 'ticker') {
-        // Position ticker nodes in a horizontal row below the main pipeline
-        const tickerGroup = allNodes.filter(tn => tn.kind === 'ticker');
-        const idx = tickerGroup.findIndex(tn => tn.id === n.id);
-        const totalWidth = (tickerGroup.length - 1) * 200;
-        x = (COL.source + COL.arbiter) / 2 - totalWidth / 2 + idx * 200;
-        y = TICKER_Y_BASE;
-      } else {
-        const group = kindGroups[n.kind] || [n];
-        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
-        const groupGap = n.kind === 'synthesis' ? 320 : 200;
-        const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
-        const groupIdx = group.findIndex(gn => gn.id === n.id);
-        x = getColumnX(n.kind);
-        y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
-      }
+      const group = kindGroups[n.kind] || [n];
+      // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
+      const groupGap = n.kind === 'synthesis' ? 320 : 200;
+      const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
+      const groupIdx = group.findIndex(gn => gn.id === n.id);
+      const x = getColumnX(n.kind);
+      const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
 
       const metrics = nodeMetrics[n.id] ?? null;
       const liveLastEventAt = metrics?.lastEventAt
@@ -259,12 +239,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           provider,
           accuracy,
           accentColor: provider ? modelAccentColor(provider) : undefined,
+          // Alpaca Feed: pass watchlist for marquee display
+          ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
         },
         draggable: true,
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
@@ -281,7 +263,6 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const analystIds = rfNodes.filter(n => n.data.kind === 'analyst').map(n => n.id);
     const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
     const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
-    const tickerIds = rfNodes.filter(n => n.data.kind === 'ticker').map(n => n.id);
 
     const makeEdge = (src: string, tgt: string) => {
       const active = isNodeRecentlyActive(src);
@@ -311,8 +292,6 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     if (arbiterId) {
       sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
       analystIds.forEach(aid => edges.push(makeEdge(arbiterId, aid)));
-      // Ticker nodes → indicator_engine
-      tickerIds.forEach(tid => edges.push(makeEdge(tid, arbiterId)));
     }
 
     // All analysts → consensus
@@ -440,19 +419,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     setRfNodes((currentNodes) => {
       const groups: Record<string, typeof currentNodes> = {};
       for (const n of currentNodes) {
-        const k = n.data.kind;
-        if (k === 'ticker') continue;
-        if (!groups[k]) groups[k] = [];
-        groups[k].push(n);
+        if (!groups[n.data.kind]) groups[n.data.kind] = [];
+        groups[n.data.kind].push(n);
       }
       return currentNodes.map(n => {
-        if (n.data.kind === 'ticker') {
-          const tickerGroup = currentNodes.filter(tn => tn.data.kind === 'ticker');
-          const idx = tickerGroup.findIndex(tn => tn.id === n.id);
-          const totalWidth = (tickerGroup.length - 1) * 200;
-          const x = (COL.source + COL.arbiter) / 2 - totalWidth / 2 + idx * 200;
-          return { ...n, position: { x, y: TICKER_Y_BASE } };
-        }
         const group = groups[n.data.kind] || [n];
         // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
         const groupGap = n.data.kind === 'synthesis' ? 320 : 200;

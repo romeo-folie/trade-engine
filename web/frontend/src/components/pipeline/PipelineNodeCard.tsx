@@ -5,6 +5,7 @@ import EnsembleConsensus from './EnsembleConsensus';
 import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
+import type { WatchlistTicker } from '../../hooks/useWatchlist';
 
 function lastTickLabel(lastEventAt: string | null): string {
   if (!lastEventAt) return '—';
@@ -27,6 +28,8 @@ export interface PipelineNodeData {
   provider?: string;
   accuracy?: number;
   accentColor?: string;
+  watchlistTickers?: WatchlistTicker[];
+  isOrbMode?: boolean;
   [key: string]: unknown;
 }
 
@@ -126,6 +129,10 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 {nodeActive ? 'LIVE' : 'IDLE'}
               </span>
             </div>
+            {/* Watchlist ticker marquee — Alpaca Feed only, hidden in ORB mode */}
+            {d.nodeId === 'alpaca' && !d.isOrbMode && d.watchlistTickers && d.watchlistTickers.length > 0 && (
+              <WatchlistMarquee tickers={d.watchlistTickers} />
+            )}
           </div>
         )}
 
@@ -296,6 +303,37 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         )}
       </div>
     </ChamferedBox>
+  );
+}
+
+// ── WatchlistMarquee ──────────────────────────────────────────────────────────
+
+interface WatchlistMarqueeProps {
+  tickers: WatchlistTicker[];
+}
+
+function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
+  // Duration scales with list length so speed stays constant (~30px/s per ticker)
+  const duration = Math.max(tickers.length * 1.8, 6);
+  // Duplicate for seamless loop
+  const doubled = [...tickers, ...tickers];
+
+  return (
+    <div className={styles.tickerPillsWrapper}>
+      <div className={styles.tickerPillsLabel}>WATCHING</div>
+      <div
+        className={styles.tickerPillsTrack}
+        style={{
+          animation: `tickerMarquee ${duration}s linear infinite`,
+        }}
+      >
+        {doubled.map((t, i) => (
+          <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>
+            {t.ticker}
+          </span>
+        ))}
+      </div>
+    </div>
   );
 }
 

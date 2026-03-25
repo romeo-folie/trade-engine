@@ -189,10 +189,57 @@
   justify-content: center;
 }
 
-/* Ticker Node — narrower card */
+/* Ticker Node — narrower card (legacy, kept for reference) */
 .tickerCard {
   width: 160px;
   min-height: 100px;
+}
+
+/* ── Watchlist Ticker Pills (inside Alpaca Feed card) ──────────────────── */
+.tickerPillsWrapper {
+  margin-top: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+
+.tickerPillsLabel {
+  font-family: var(--font-mono);
+  font-size: 8px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-bottom: 4px;
+}
+
+.tickerPillsTrack {
+  display: flex;
+  gap: 5px;
+  /* animation applied inline with dynamic duration */
+  white-space: nowrap;
+}
+
+@keyframes tickerMarquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
+.tickerPillsTrack:hover {
+  animation-play-state: paused !important;
+}
+
+.tickerPill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-primary, #F0F0F0);
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  letter-spacing: 0.08em;
+  flex-shrink: 0;
 }
 
 .hubWordmark {
