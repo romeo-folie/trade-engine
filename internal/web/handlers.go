@@ -467,7 +467,10 @@ func queryInt(r *http.Request, key string, def, max int) int {
 func handleKnowledgeGraph(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	limit := queryInt(r, "limit", 120, 500)
-	watchlistOnly := r.URL.Query().Get("watchlist_only") == "true"
+	// Default watchlist_only=true so the satellite overlay stays scoped to
+	// watched tickers unless the caller explicitly opts out.
+	wloParam := r.URL.Query().Get("watchlist_only")
+	watchlistOnly := wloParam == "" || wloParam == "true"
 
 	entities, err := knowledge.ListEntities(ctx, "")
 	if err != nil {
@@ -508,6 +511,9 @@ func handleKnowledgeGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Collect all relationships whose both endpoints are in our entity set.
+	// Use a seen-set to deduplicate: GetRelationshipsForEntity returns each edge
+	// from both endpoints' perspectives, so without dedup every edge appears twice.
+	seenRelIDs := make(map[string]struct{})
 	var relationships []store.EntityRelationship
 	for _, e := range entities {
 		rels, relErr := store.GetRelationshipsForEntity(ctx, e.ID)
@@ -516,9 +522,13 @@ func handleKnowledgeGraph(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		for _, rel := range rels {
+			if _, seen := seenRelIDs[rel.ID]; seen {
+				continue
+			}
 			_, srcOK := entityIDs[rel.FromEntityID]
 			_, tgtOK := entityIDs[rel.ToEntityID]
 			if srcOK && tgtOK {
+				seenRelIDs[rel.ID] = struct{}{}
 				relationships = append(relationships, rel)
 			}
 		}
