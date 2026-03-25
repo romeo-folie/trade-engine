@@ -5,7 +5,7 @@
 
 export const colors = {
   // Base
-  canvas:       '#0E0E14',  // pipeline canvas — dark charcoal-indigo
+  canvas:       '#050507',  // main canvas background (near-black)
   panelBg:      '#0B0B10',  // slide-in panel background
   cardBg:       '#131319',  // card / node background
   cardBgAlt:    '#16161D',  // slightly brighter card

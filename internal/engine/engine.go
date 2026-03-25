@@ -1073,6 +1073,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		stalePct = 2.0
 	}
 
+	analysisIDs := []string{}
+	if analysisID != "" {
+		analysisIDs = []string{analysisID}
+	}
 	sig := store.Signal{
 		Ticker:            ticker,
 		Action:            string(resp.Action),
@@ -1085,6 +1089,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		Status:            "pending",
 		ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
+		AnalysisIDs:       analysisIDs,
 	}
 
 	// Run risk checks.
@@ -1115,6 +1120,14 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		}
 		logger.Info("risk check", "check", r.Name, "level", level, "passed", r.Passed, "reason", r.Reason)
 	}
+	// Broadcast all check results so the pipeline UI can show live PASS/FAIL.
+	riskEvChecks := make([]events.RiskCheckResult, len(results))
+	for i, r := range results {
+		riskEvChecks[i] = events.RiskCheckResult{Name: r.Name, Passed: r.Passed, Reason: r.Reason}
+	}
+	e.bus.Publish(events.RiskCheckCompleted, events.RiskCheckCompletedPayload{
+		Ticker: ticker, Passed: passed, Checks: riskEvChecks,
+	})
 
 	if !passed {
 		sig.Status = "blocked"
