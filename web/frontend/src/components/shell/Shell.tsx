@@ -1,5 +1,6 @@
 import { Outlet } from 'react-router-dom';
 import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
+import { useSystemStatus } from '../../hooks/useSystemStatus';
 import TopBar from './TopBar';
 import Sidebar from './Sidebar';
 import BottomBar from './BottomBar';
@@ -7,6 +8,8 @@ import { colors } from '../../styles/tokens';
 
 export default function Shell() {
   const socket = useEngineSocketContext();
+  // Single fetch for both TopBar (version) and BottomBar (uptime) — avoids duplicate requests
+  const systemStatus = useSystemStatus();
 
   return (
     <div style={{
@@ -16,7 +19,7 @@ export default function Shell() {
       background: colors.canvas,
       overflow: 'hidden',
     }}>
-      <TopBar status={socket.status} eventsPerSecond={socket.eventsPerSecond} />
+      <TopBar status={socket.status} eventsPerSecond={socket.eventsPerSecond} version={systemStatus?.version ?? '...'} />
       
       <div style={{ 
         display: 'flex', 
@@ -40,7 +43,12 @@ export default function Shell() {
         </main>
       </div>
 
-      <BottomBar />
+      <BottomBar
+        status={socket.status}
+        lastSignalAt={socket.lastSignalAt}
+        avgLatencyMs={socket.avgLatencyMs}
+        baseUptimeSeconds={systemStatus?.uptimeSeconds ?? null}
+      />
     </div>
   );
 }

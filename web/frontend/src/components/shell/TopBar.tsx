@@ -5,9 +5,10 @@ import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 interface TopBarProps {
   status: ConnectionStatus;
   eventsPerSecond: number;
+  version: string;
 }
 
-export default function TopBar({ status }: TopBarProps) {
+export default function TopBar({ status, version }: TopBarProps) {
   const [clock, setClock] = useState(() => formatClock());
 
   useEffect(() => {
@@ -46,7 +47,7 @@ export default function TopBar({ status }: TopBarProps) {
           fontSize: 11,
           marginTop: 1
         }}>
-          v2.1.0
+          v{version}
         </span>
       </div>
 

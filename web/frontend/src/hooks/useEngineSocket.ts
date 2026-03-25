@@ -18,7 +18,7 @@ export interface NodeMetrics {
   lastEventAt: number | null; // epoch ms
 }
 
-interface EngineSocketState {
+export interface EngineSocketState {
   status: ConnectionStatus;
   nodes: NodeState[];
   events: IndexedWebEvent[];
@@ -26,6 +26,8 @@ interface EngineSocketState {
   paused: boolean;
   setPaused: (p: boolean) => void;
   nodeMetrics: Record<string, NodeMetrics>;
+  lastSignalAt: number | null;   // epoch ms of most recent SignalGenerated event
+  avgLatencyMs: number | null;   // rolling avg latency_ms from AnalysisCompleted payloads
 }
 
 const MAX_EVENTS = 200;
@@ -42,6 +44,9 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
   const [paused, setPaused] = useState(false);
   const [nodeMetrics, setNodeMetrics] = useState<Record<string, NodeMetrics>>({});
+  const [lastSignalAt, setLastSignalAt] = useState<number | null>(null);
+  const latencySamplesRef = useRef<number[]>([]);
+  const [avgLatencyMs, setAvgLatencyMs] = useState<number | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -101,6 +106,26 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           }
           return next;
         });
+
+        // Track last signal time
+        if (webEv.type === 'SignalGenerated') {
+          setLastSignalAt(now);
+        }
+
+        // Track avg LLM latency (rolling window of last 10 samples)
+        if (webEv.type === 'AnalysisCompleted' && webEv.payload) {
+          try {
+            // payload may arrive as a JSON string or already-parsed object depending on runtime
+            const p: { latency_ms?: number } = typeof webEv.payload === 'string'
+              ? JSON.parse(webEv.payload)
+              : (webEv.payload as { latency_ms?: number });
+            if (p.latency_ms != null && p.latency_ms > 0) {
+              latencySamplesRef.current = [...latencySamplesRef.current, p.latency_ms].slice(-10);
+              const avg = latencySamplesRef.current.reduce((a, b) => a + b, 0) / latencySamplesRef.current.length;
+              setAvgLatencyMs(Math.round(avg));
+            }
+          } catch { /* ignore parse errors */ }
+        }
       } catch {
         // Malformed message — ignore.
       }
@@ -128,7 +153,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs };
 }
 
 function buildWsUrl(): string {
