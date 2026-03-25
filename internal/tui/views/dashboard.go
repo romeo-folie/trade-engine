@@ -130,7 +130,7 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 			if t.EntryPrice > 0 {
 				pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
 			}
-			if t.Direction == "sell" {
+			if t.Direction == "short" {
 				pnl = (t.EntryPrice - currentPrice) * t.Quantity
 				if t.EntryPrice > 0 {
 					pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
