@@ -7,7 +7,9 @@
  * Animated particles travel along edges powered by framer-motion.
  * Clicking a node opens the DrillDownPanel.
  */
-import { useCallback, useMemo, useEffect, useRef } from 'react';
+import { useCallback, useMemo, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
+import { LayoutGrid, Lock, LockOpen, Crosshair } from 'lucide-react';
 import {
   ReactFlow,
   Background,
@@ -27,7 +29,6 @@ import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
 import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
-import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './HubGraph.module.css';
 
@@ -35,14 +36,14 @@ import styles from './HubGraph.module.css';
 
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
-// Column X-offsets based on design spec
+// Column X-offsets — 40px gap between card edges (NODE_W=280)
 const COL = {
-  source: 0,
-  arbiter: 380,
-  analyst: 760,
-  synthesis: 1100,
-  arbiter_final: 1280,
-  execution: 1500,
+  source:        60,
+  arbiter:       440,   // 60 + 280 + 100
+  analyst:       820,   // 440 + 280 + 100
+  synthesis:     1200,  // 820 + 280 + 100
+  arbiter_final: 1580,  // 1200 + 280 + 100
+  execution:     1960,  // 1580 + 280 + 100
 };
 
 const CY = 400;
@@ -94,6 +95,47 @@ interface Particle {
   speed: number;
 }
 
+// ── CanvasIconButton ──────────────────────────────────────────────────────────
+
+interface CanvasIconButtonProps {
+  icon: ReactNode;
+  onClick: () => void;
+  title?: string;
+  active?: boolean;
+}
+
+function CanvasIconButton({ icon, onClick, title, active }: CanvasIconButtonProps) {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      style={{
+        width: 28,
+        height: 28,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: active ? 'rgba(57, 255, 20, 0.1)' : 'rgba(13, 13, 17, 0.85)',
+        border: `1px solid ${active ? 'rgba(57, 255, 20, 0.4)' : 'rgba(26, 26, 34, 0.8)'}`,
+        borderRadius: 4,
+        color: active ? '#39FF14' : '#6B7280',
+        cursor: 'pointer',
+        backdropFilter: 'blur(4px)',
+        transition: 'all 0.15s ease',
+        padding: 0,
+      }}
+      onMouseEnter={e => {
+        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#F0F0F0';
+      }}
+      onMouseLeave={e => {
+        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#6B7280';
+      }}
+    >
+      {icon}
+    </button>
+  );
+}
+
 // ── Component ────────────────────────────────────────────────────────────────
 
 export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, onNodeClick }: HubGraphProps) {
@@ -101,6 +143,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const wrapperRef = useRef<HTMLDivElement>(null);
   const particlesRef = useRef<Particle[]>([]);
   const lastFrameRef = useRef<number>(0);
+  const setViewportRef = useRef<((vp: { x: number; y: number; zoom: number }) => void) | null>(null);
+  const fitViewRef = useRef<((opts?: { padding?: number; duration?: number }) => void) | null>(null);
+  const [layoutLocked, setLayoutLocked] = useState(false);
 
   const watchlistTickers = useWatchlist();
   const modelEnsemble = useModelEnsemble();
@@ -180,7 +225,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         y = TICKER_Y_BASE;
       } else {
         const group = kindGroups[n.kind] || [n];
-        const groupGap = 200;
+        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
+        const groupGap = n.kind === 'synthesis' ? 320 : 200;
         const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         x = getColumnX(n.kind);
@@ -208,7 +254,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           lastEventAt: liveLastEventAt,
           metrics,
           isHub: false,
-          lastEventType: recentEventSignatures[n.id]?.type ?? 'buy_signal',
+          lastEventType: recentEventSignatures[n.id]?.type ?? null,
           onNodeClick,
           provider,
           accuracy,
@@ -223,6 +269,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow edges ──────────────────────────────────────────────
 
   const rfEdges = useMemo<Edge[]>(() => {
+    const isNodeRecentlyActive = (nodeId: string): boolean => {
+      const lastEventAt = nodeMetrics[nodeId]?.lastEventAt;
+      if (!lastEventAt) return false;
+      return Date.now() - lastEventAt < 10_000;
+    };
+
     const edges: Edge[] = [];
     const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
     const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
@@ -231,18 +283,30 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
     const tickerIds = rfNodes.filter(n => n.data.kind === 'ticker').map(n => n.id);
 
-    const makeEdge = (src: string, tgt: string) => ({
-      id: `e-${src}-${tgt}`,
-      source: src,
-      target: tgt,
-      style: {
-        stroke: EDGE_ACTIVE,
-        strokeWidth: 1,
-        strokeDasharray: '5 5',
-        animation: 'edge-dash 0.5s linear infinite',
-      },
-      type: 'smoothstep',
-    });
+    const makeEdge = (src: string, tgt: string) => {
+      const active = isNodeRecentlyActive(src);
+      return {
+        id: `e-${src}-${tgt}`,
+        source: src,
+        target: tgt,
+        style: active
+          ? {
+              stroke: EDGE_ACTIVE,
+              strokeWidth: 1,
+              strokeDasharray: '5 5',
+              animation: 'edge-dash 0.5s linear infinite',
+              opacity: 1,
+            }
+          : {
+              stroke: colors.textFaint,
+              strokeWidth: 1,
+              strokeDasharray: '',
+              animation: '',
+              opacity: 0.55,
+            },
+        type: 'smoothstep',
+      };
+    };
 
     if (arbiterId) {
       sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
@@ -254,25 +318,39 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // All analysts → consensus
     analystIds.forEach(aid => edges.push(makeEdge(aid, 'consensus')));
 
-    // consensus → arbiter_final → risk_manager (or consensus → risk_manager if no arbiter)
+    // Always draw both paths; edge activity is driven by isNodeRecentlyActive.
+    // Fast path: consensus → risk_manager (lights up via SignalGenerated)
+    // Arbiter path: consensus → arbiter_node → risk_manager (lights up via ArbiterInvoked)
+    edges.push(makeEdge('consensus', 'risk_manager'));
     if (arbiterFinalId) {
       edges.push(makeEdge('consensus', arbiterFinalId));
       edges.push(makeEdge(arbiterFinalId, 'risk_manager'));
-    } else {
-      edges.push(makeEdge('consensus', 'risk_manager'));
     }
 
     // risk_manager → all execution nodes
     executionIds.forEach(eid => edges.push(makeEdge('risk_manager', eid)));
 
     return edges;
-  }, [rfNodes]);
+  }, [rfNodes, nodeMetrics]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
   useEffect(() => { setRfNodes(rfNodes); }, [rfNodes, setRfNodes]);
   useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
+
+  // Center view on initial render
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      fitViewRef.current?.({ padding: 0.15, duration: 300 });
+    }, 100);
+    return () => clearTimeout(timer);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Patch draggable on all nodes when lock state changes
+  useEffect(() => {
+    setRfNodes(nds => nds.map(n => ({ ...n, draggable: !layoutLocked })));
+  }, [layoutLocked, setRfNodes]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
     onNodeClick(node.id);
@@ -376,7 +454,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           return { ...n, position: { x, y: TICKER_Y_BASE } };
         }
         const group = groups[n.data.kind] || [n];
-        const groupGap = 200;
+        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
+        const groupGap = n.data.kind === 'synthesis' ? 320 : 200;
         const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         const x = getColumnX(n.data.kind);
@@ -384,6 +463,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return { ...n, position: { x, y } };
       });
     });
+    // Give React a tick to apply new positions before fitting
+    setTimeout(() => {
+      fitViewRef.current?.({ padding: 0.15, duration: 400 });
+    }, 50);
   }, [setRfNodes]);
 
   return (
@@ -395,10 +478,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         onEdgesChange={onEdgesChange}
         onNodeClick={handleNodeClick}
         onViewportChange={handleViewportChange}
+        onInit={(instance) => {
+          setViewportRef.current = instance.setViewport;
+          fitViewRef.current = instance.fitView;
+        }}
         nodeTypes={NODE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
-        defaultViewport={{ x: 0, y: 0, zoom: 0.7 }}
+        defaultViewport={{ x: 20, y: 60, zoom: 0.6 }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />
@@ -412,34 +499,34 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       </ReactFlow>
       <canvas ref={canvasRef} className={styles.particleCanvas} style={{ pointerEvents: 'none' }} />
 
-      {/* Floating Controls */}
+      {/* Floating Controls — vertical icon stack, top right */}
       <div style={{
         position: 'absolute',
         top: 20,
         right: 20,
         zIndex: 10,
         display: 'flex',
-        gap: 12
+        flexDirection: 'column',
+        gap: 8,
       }}>
-        <ChamferedBox
-          chamfer={6}
-          backgroundColor="rgba(13, 13, 17, 0.8)"
-          borderColor={colors.borderMuted}
+        <CanvasIconButton
+          icon={<Crosshair size={14} />}
+          onClick={() => fitViewRef.current?.({ padding: 0.15, duration: 400 })}
+          title="Fit view"
+          active={false}
+        />
+        <CanvasIconButton
+          icon={<LayoutGrid size={14} />}
           onClick={resetLayout}
-          style={{
-            padding: '6px 12px',
-            backdropFilter: 'blur(4px)',
-          }}
-        >
-          <span style={{
-            fontSize: '10px',
-            fontWeight: 700,
-            color: colors.textDim,
-            letterSpacing: '0.05em'
-          }}>
-            RESET LAYOUT
-          </span>
-        </ChamferedBox>
+          title="Reset layout"
+          active={false}
+        />
+        <CanvasIconButton
+          icon={layoutLocked ? <Lock size={14} /> : <LockOpen size={14} />}
+          onClick={() => setLayoutLocked(l => !l)}
+          title={layoutLocked ? 'Unlock layout' : 'Lock layout'}
+          active={layoutLocked}
+        />
       </div>
     </div>
   );

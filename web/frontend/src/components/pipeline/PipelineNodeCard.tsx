@@ -53,8 +53,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   // ── Hub Template ──────────────────────────────────────────────────────────
   if (d.isHub || d.nodeId === '__hub__') {
     return (
-      <ChamferedBox 
-        isActive={nodeActive} 
+      <ChamferedBox
+        isActive={false}
         chamfer={12}
         backgroundColor="#0D0D11"
         borderColor={colors.acidGreen}
@@ -84,17 +84,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
   const isArbiterFinal = d.kind === 'arbiter_final';
   const isTicker = d.kind === 'ticker';
-  const cardAccent = isArbiterFinal ? colors.amber
-                   : isAnalyst ? accentColor
-                   : colors.acidGreen;
   const cardBorder = isArbiterFinal ? colors.amber
                    : isAnalyst ? accentColor
-                   : colors.borderMuted;
+                   : colors.border;
 
   return (
     <ChamferedBox
-      isActive={nodeActive}
-      activeColor={cardAccent}
+      isActive={false}
       borderColor={cardBorder}
       className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''} ${isTicker ? styles.tickerCard : ''}`}
       style={{ cursor: 'pointer' }}
@@ -159,18 +155,31 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {!d.provider && (
               <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
             )}
-            <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-              {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-               verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-            </div>
-            {d.accuracy !== undefined && d.accuracy > 0 && (
-              <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
-                ACC: {Math.round(d.accuracy * 100)}%
-              </div>
+            {nodeActive ? (
+              <>
+                <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
+                  {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+                   verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
+                </div>
+                {d.accuracy !== undefined && d.accuracy > 0 && (
+                  <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
+                    ACC: {Math.round(d.accuracy * 100)}%
+                  </div>
+                )}
+                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+                  {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'ANALYZING'}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
+                  —
+                </div>
+                <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
+                  <span className={styles.feedBadgeIdle}>STANDBY</span>
+                </div>
+              </>
             )}
-            <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-              {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'PENDING'}
-            </div>
           </div>
         )}
 
@@ -193,12 +202,12 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               <>
                 <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
                 <EnsembleConsensus items={[
-                  { label: 'TECH', value: 0.8, color: colors.analystTechnical },
-                  { label: 'MOM',  value: 0.4, color: colors.analystMomentum },
-                  { label: 'SENT', value: 0.9, color: colors.analystSentiment }
+                  { label: 'TECH', value: nodeActive ? 0.8 : 0, color: colors.analystTechnical },
+                  { label: 'MOM',  value: nodeActive ? 0.4 : 0, color: colors.analystMomentum },
+                  { label: 'SENT', value: nodeActive ? 0.9 : 0, color: colors.analystSentiment }
                 ]} />
-                <div className={`${styles.analystVerdict} ${styles.verdictLong}`} style={{ fontSize: 14, marginTop: 8 }}>
-                  LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span>
+                <div className={`${styles.analystVerdict} ${nodeActive ? styles.verdictLong : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
+                  {nodeActive ? <>LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span></> : '—'}
                 </div>
               </>
             )}
@@ -229,7 +238,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               </>
             ) : (
               <>
-                <div className={`${styles.routeBadge} ${styles.routeActive}`} style={{ display: 'inline-block', marginBottom: 8 }}>LONG</div>
+                <div className={`${styles.routeBadge} ${nodeActive ? styles.routeActive : ''}`} style={{ display: 'inline-block', marginBottom: 8 }}>
+                  {nodeActive ? 'LONG' : '—'}
+                </div>
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                   <div>
                     <div className={styles.subValue}>SIZE</div>

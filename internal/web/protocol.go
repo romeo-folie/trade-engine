@@ -61,6 +61,8 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
 	case events.AnalysisCompleted:
 		return "llm_analysis", "consensus", "AnalysisCompleted"
+	case events.ArbiterInvoked:
+		return "consensus", "arbiter_node", "ArbiterInvoked"
 
 	// ── Signal flow ──────────────────────────────────────────────────────
 	case events.SignalGenerated:
@@ -123,6 +125,7 @@ func pipelineNodes() []NodeState {
 		{ID: "prompt_assembly", Label: "Prompt Assembly", Kind: "processing"},
 		{ID: "llm_analysis", Label: "LLM Analysis", Kind: "processing"},
 		{ID: "consensus", Label: "Consensus Resolution", Kind: "processing"},
+		{ID: "arbiter_node", Label: "Arbiter", Kind: "processing"},
 		{ID: "risk_manager", Label: "Risk Checks", Kind: "processing"},
 
 		// ── Output nodes ─────────────────────────────────────────────────

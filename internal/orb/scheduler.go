@@ -14,6 +14,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -69,6 +70,7 @@ type ORBScheduler struct {
 	executor   execution.Executor
 	portfolio  PortfolioValuer
 	notifier   Notifier
+	bus        *events.Bus // optional; nil means no event publishing
 	now        func() time.Time // injectable for tests
 
 	mu           sync.Mutex // protects state, session, candidates for TUI reads
@@ -102,6 +104,20 @@ func NewORBScheduler(
 		rangeBuffers: make(map[string]*RangeBuffer),
 		orderIDs:     make(map[string]string),
 	}
+}
+
+// SetBus wires an event bus so the ORB scheduler publishes pipeline events.
+// Call before Run. If not called, events are silently dropped (safe for tests).
+func (s *ORBScheduler) SetBus(bus *events.Bus) {
+	s.bus = bus
+}
+
+// publish emits an event on the bus. No-op when bus is nil.
+func (s *ORBScheduler) publish(t events.Type, payload any) {
+	if s.bus == nil {
+		return
+	}
+	s.bus.Publish(t, payload)
 }
 
 // Run starts the ORB scheduler loop. Blocks until ctx is cancelled.
@@ -331,6 +347,14 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 	s.notify(ctx, sb.String())
 
 	s.setState(StateCandidateReady)
+	for _, sc := range selected {
+		s.publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
+			Ticker:     sc.Gap.Ticker,
+			Action:     sc.Score.Action,
+			Confidence: sc.Score.Conviction,
+			Reasoning:  sc.Score.Reasoning,
+		})
+	}
 	return nil
 }
 
@@ -444,6 +468,11 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			continue
 		}
 		s.orderIDs[ticker] = orderID
+		s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+			Ticker:    ticker,
+			Direction: side,
+			Strategy:  "orb",
+		})
 
 		if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
 			SessionID:  sessionID,
@@ -500,6 +529,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		if err := store.UpdateORBSession(ctx, s.db, sessionID, "done", nil, nil); err != nil {
 			fmt.Printf("orb: update session to done: %v\n", err)
 		}
+		s.publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{})
 		s.notify(ctx, "ORB: Session complete for today.")
 
 		// Reset for next day
