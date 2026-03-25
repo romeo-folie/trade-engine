@@ -33,6 +33,17 @@ var nyLoc = func() *time.Location {
 	return loc
 }()
 
+// maxNewsPerTicker caps the number of news items passed to the LLM per candidate.
+// Limits context window usage while keeping the most recent catalyst signals.
+const maxNewsPerTicker = 10
+
+// sentimentPositiveThreshold and sentimentNegativeThreshold define the boundaries
+// used when mapping a Finnhub float sentiment score to a POSITIVE/NEUTRAL/NEGATIVE label.
+const (
+	sentimentPositiveThreshold = 0.1
+	sentimentNegativeThreshold = -0.1
+)
+
 // State represents the ORB scheduler's current phase.
 type State string
 
@@ -273,11 +284,17 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 			if newsErr != nil {
 				fmt.Printf("orb: news fetch %s: %v\n", gap.Ticker, newsErr)
 			} else {
+				// Cap to most recent N items to avoid context window blowout on
+				// high-volume tickers. FetchNews returns newest-first, so a simple
+				// slice preserves recency ordering.
+				if len(rawNews) > maxNewsPerTicker {
+					rawNews = rawNews[:maxNewsPerTicker]
+				}
 				for _, n := range rawNews {
 					sentiment := "NEUTRAL"
-					if n.SentimentScore > 0.1 {
+					if n.SentimentScore > sentimentPositiveThreshold {
 						sentiment = "POSITIVE"
-					} else if n.SentimentScore < -0.1 {
+					} else if n.SentimentScore < sentimentNegativeThreshold {
 						sentiment = "NEGATIVE"
 					}
 					newsItems = append(newsItems, prompts.ORBNewsItem{

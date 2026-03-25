@@ -8,7 +8,7 @@
  *
  * Transitions to the Shell once socket reaches 'connected'.
  */
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import type { ConnectionStatus } from '../hooks/useEngineSocket';
 import styles from './Boot.module.css';
 
@@ -76,7 +76,7 @@ export default function BootScreen({ status }: BootScreenProps) {
       .catch(() => {});
   }, []);
 
-  const BOOT_LINES = buildBootLines(version);
+  const BOOT_LINES = useMemo(() => buildBootLines(version), [version]);
   const showError = status === 'reconnecting';
 
   const lines: LogLine[] = showError
