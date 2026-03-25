@@ -1073,6 +1073,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		stalePct = 2.0
 	}
 
+	analysisIDs := []string{}
+	if analysisID != "" {
+		analysisIDs = []string{analysisID}
+	}
 	sig := store.Signal{
 		Ticker:            ticker,
 		Action:            string(resp.Action),
@@ -1085,6 +1089,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		Status:            "pending",
 		ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
+		AnalysisIDs:       analysisIDs,
 	}
 
 	// Run risk checks.

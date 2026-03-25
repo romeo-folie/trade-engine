@@ -27,18 +27,22 @@ type Signal struct {
 
 // InsertSignal creates a new signal record and returns its UUID.
 func InsertSignal(ctx context.Context, s Signal) (string, error) {
+	ids := s.AnalysisIDs
+	if ids == nil {
+		ids = []string{}
+	}
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO signals (
 			ticker, action, strategy, signal_price, stop_loss, take_profit,
 			confidence, size_pct, status, block_reason,
-			expires_at, stale_threshold_pct
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			analysis_ids, expires_at, stale_threshold_pct
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id`,
 		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
-		s.ExpiresAt, s.StalePriceMovePct,
+		ids, s.ExpiresAt, s.StalePriceMovePct,
 	).Scan(&id)
 	return id, err
 }
