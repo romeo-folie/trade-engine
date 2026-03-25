@@ -280,6 +280,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const c = typeColor[(e.entity_type || '').toLowerCase()] ?? '#6B7280';
       return {
         id: `kg-${e.id}`,
+        type: 'knowledgeNode',
         position: { x, y },
         data: {
           label: `${e.name}${ticker ? ` (${ticker})` : ''}`,
