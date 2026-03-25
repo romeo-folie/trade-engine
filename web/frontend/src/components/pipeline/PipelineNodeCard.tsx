@@ -199,7 +199,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 const checks = d.riskChecks as RiskCheckResult[] | undefined;
                 const displayChecks = checks && checks.length > 0
                   ? checks
-                  : ['confidence_threshold', 'risk_reward_ratio', 'position_size_limit', 'max_open_positions', 'daily_loss_limit', 'max_drawdown', 'cooldown_after_loss'].map(n => ({ name: n, passed: false, reason: '' }));
+                  : ['confidence_threshold', 'risk_reward_ratio', 'position_size_limit', 'max_open_positions', 'daily_loss_limit', 'max_drawdown', 'cooldown_after_loss'].map(checkName => ({ name: checkName, passed: false, reason: '' }));
                 const hasRealData = checks && checks.length > 0;
                 return (
                   <>

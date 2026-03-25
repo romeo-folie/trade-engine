@@ -162,9 +162,11 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
         <div className={styles.body}>
           {/* Analyst routing */}
-          <div className={styles.routingLabel}>
-            ROUTED: {activeAnalysts.length} of {analysts.length} ANALYSTS
-          </div>
+          {analysts.length > 0 && (
+            <div className={styles.routingLabel}>
+              ROUTED: {activeAnalysts.length} of {analysts.length} ANALYSTS
+            </div>
+          )}
           <div className={styles.analystCards}>
             {analysts.length === 0 ? (
               <div className={styles.analystDesc} style={{ padding: 8, color: 'var(--text-faint)' }}>
@@ -196,8 +198,8 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
             )}
           </div>
 
-          {/* Ensemble synthesis */}
-          <div className={styles.ensembleSection}>
+          {/* Ensemble synthesis — only shown when analyst data is available */}
+          {analysts.length > 0 && <div className={styles.ensembleSection}>
             <div className={styles.sectionLabel}>ENSEMBLE SYNTHESIS</div>
             {activeAnalysts.map((a, idx) => (
               <div key={a.name} className={styles.ensembleRow}>
@@ -214,7 +216,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               </span>
               <span className={styles.verdictScore}>WEIGHTED <strong>{(ensemble?.confidence ?? signal.Confidence).toFixed(2)}</strong></span>
             </div>
-          </div>
+          </div>}
 
           {/* Execution */}
           <div className={styles.executionSection}>
