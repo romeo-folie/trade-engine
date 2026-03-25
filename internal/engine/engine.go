@@ -1115,6 +1115,14 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		}
 		logger.Info("risk check", "check", r.Name, "level", level, "passed", r.Passed, "reason", r.Reason)
 	}
+	// Broadcast all check results so the pipeline UI can show live PASS/FAIL.
+	riskEvChecks := make([]events.RiskCheckResult, len(results))
+	for i, r := range results {
+		riskEvChecks[i] = events.RiskCheckResult{Name: r.Name, Passed: r.Passed, Reason: r.Reason}
+	}
+	e.bus.Publish(events.RiskCheckCompleted, events.RiskCheckCompletedPayload{
+		Ticker: ticker, Passed: passed, Checks: riskEvChecks,
+	})
 
 	if !passed {
 		sig.Status = "blocked"
