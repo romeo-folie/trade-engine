@@ -201,11 +201,11 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           {/* Ensemble synthesis — only shown when analyst data is available */}
           {analysts.length > 0 && <div className={styles.ensembleSection}>
             <div className={styles.sectionLabel}>ENSEMBLE SYNTHESIS</div>
-            {activeAnalysts.map((a, idx) => (
+            {activeAnalysts.map((a) => (
               <div key={a.name} className={styles.ensembleRow}>
                 <span className={styles.ensembleLabel}>{a.name}</span>
                 <div className={styles.ensembleTrack}>
-                  <div className={styles.ensembleFill} style={{ width: `${a.weight * 100}%`, background: analystBarColor(idx) }} />
+                  <div className={styles.ensembleFill} style={{ width: `${a.weight * 100}%`, background: analystBarColor(analysts.indexOf(a)) }} />
                 </div>
                 <span className={styles.ensembleWeight}>{a.weight.toFixed(2)}</span>
               </div>

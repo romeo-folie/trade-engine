@@ -83,8 +83,9 @@ const COLUMNS: Column<Signal>[] = [
       const active = s.Analysts.filter(a => a.active);
       return (
         <div className={styles.consensusGrid}>
-          {active.slice(0, 3).map((a, i) => {
-            const barColor = ANALYST_BAR_COLORS[i] ?? colors.borderMuted;
+          {active.slice(0, 3).map((a) => {
+            const canonicalIdx = s.Analysts!.indexOf(a);
+            const barColor = ANALYST_BAR_COLORS[canonicalIdx] ?? colors.borderMuted;
             return (
               <div key={a.name} className={styles.consensusRow}>
                 <div className={styles.consensusBar} style={{ width: a.confidence * 40, background: barColor }} />
