@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -116,7 +117,10 @@ func buildSnapshot(ctx context.Context) *SnapshotEvent {
 			Nodes:     nodes,
 		}
 	}
-	snap, _ := store.GetLatestPortfolioSnapshot(ctx)
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil {
+		logger.Warn("buildSnapshot: portfolio snapshot query failed", "err", err)
+	}
 	if snap != nil {
 		for i := range nodes {
 			if nodes[i].ID == "portfolio" {
