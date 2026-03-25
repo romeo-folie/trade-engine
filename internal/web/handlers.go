@@ -10,6 +10,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/knowledge"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -31,6 +32,7 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
+	mux.HandleFunc("/api/knowledge/graph", handleKnowledgeGraph)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -452,4 +454,88 @@ func queryInt(r *http.Request, key string, def, max int) int {
 		return max
 	}
 	return n
+}
+
+// GET /api/knowledge/graph?watchlist_only=true&limit=120
+//
+// Returns entities and relationships for the knowledge-graph satellite overlay
+// in the pipeline screen.
+//
+// Query params:
+//   watchlist_only  bool  If "true", restrict entities to tickers on the watchlist.
+//   limit           int   Max entities to return (default 120, max 500).
+func handleKnowledgeGraph(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	limit := queryInt(r, "limit", 120, 500)
+	watchlistOnly := r.URL.Query().Get("watchlist_only") == "true"
+
+	entities, err := knowledge.ListEntities(ctx, "")
+	if err != nil {
+		logger.Error("[web] knowledge graph: list entities", "err", err.Error())
+		http.Error(w, "failed to load entities", http.StatusInternalServerError)
+		return
+	}
+
+	// Filter to watchlist tickers when requested.
+	if watchlistOnly {
+		wlItems, wlErr := store.GetWatchlistItems(ctx, true)
+		if wlErr != nil {
+			logger.Warn("[web] knowledge graph: get watchlist", "err", wlErr.Error())
+		} else {
+			tickerSet := make(map[string]struct{}, len(wlItems))
+			for _, item := range wlItems {
+				tickerSet[strings.ToUpper(item.Ticker)] = struct{}{}
+			}
+			filtered := entities[:0]
+			for _, e := range entities {
+				if _, ok := tickerSet[strings.ToUpper(e.Ticker)]; ok {
+					filtered = append(filtered, e)
+				}
+			}
+			entities = filtered
+		}
+	}
+
+	// Cap to limit.
+	if len(entities) > limit {
+		entities = entities[:limit]
+	}
+
+	// Build a set of entity IDs for relationship filtering.
+	entityIDs := make(map[string]struct{}, len(entities))
+	for _, e := range entities {
+		entityIDs[e.ID] = struct{}{}
+	}
+
+	// Collect all relationships whose both endpoints are in our entity set.
+	var relationships []store.EntityRelationship
+	for _, e := range entities {
+		rels, relErr := store.GetRelationshipsForEntity(ctx, e.ID)
+		if relErr != nil {
+			logger.Warn("[web] knowledge graph: get rels", "entity", e.ID, "err", relErr.Error())
+			continue
+		}
+		for _, rel := range rels {
+			_, srcOK := entityIDs[rel.FromEntityID]
+			_, tgtOK := entityIDs[rel.ToEntityID]
+			if srcOK && tgtOK {
+				relationships = append(relationships, rel)
+			}
+		}
+	}
+	if relationships == nil {
+		relationships = []store.EntityRelationship{}
+	}
+
+	type response struct {
+		Entities      []knowledge.Entity            `json:"entities"`
+		Relationships []store.EntityRelationship     `json:"relationships"`
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if encErr := json.NewEncoder(w).Encode(response{
+		Entities:      entities,
+		Relationships: relationships,
+	}); encErr != nil {
+		logger.Error("[web] knowledge graph: encode response", "err", encErr.Error())
+	}
 }

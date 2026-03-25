@@ -19,8 +19,12 @@ interface DrillDownPanelProps {
 function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
   const { nodes, nodeMetrics } = useEngineSocketContext();
 
+  // Knowledge-graph satellite nodes emit "ticker-<SYMBOL>" IDs.
+  // Strip the prefix and render a lightweight ticker card instead of a pipeline node card.
+  const kgTicker = nodeId?.startsWith('ticker-') ? nodeId.slice('ticker-'.length) : null;
+
   const detail = useMemo(() => {
-    if (!nodeId) return null;
+    if (!nodeId || kgTicker) return null;
     const node = nodes.find(n => n.id === nodeId);
     if (!node) return null;
     const metrics = nodeMetrics[nodeId] ?? null;
@@ -35,7 +39,7 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
       avg_latency_ms: node.avg_latency_ms ?? null,
       meta: node.meta ?? null,
     };
-  }, [nodeId, nodes, nodeMetrics]);
+  }, [nodeId, kgTicker, nodes, nodeMetrics]);
 
   return (
     <AnimatePresence>
@@ -50,7 +54,9 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
           aria-label={`Node detail: ${detail?.label ?? nodeId}`}
         >
           <div className={styles.header}>
-            <span className={styles.nodeLabel}>{detail?.label ?? nodeId}</span>
+            <span className={styles.nodeLabel}>
+              {kgTicker ? `KG: ${kgTicker}` : (detail?.label ?? nodeId)}
+            </span>
             <button
               className={styles.close}
               onClick={onClose}
@@ -59,7 +65,17 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
           </div>
 
           <div className={styles.body}>
-            {detail && (
+            {kgTicker && (
+              <>
+                <Row label="TICKER" value={kgTicker} />
+                <Row label="SOURCE" value="KNOWLEDGE GRAPH" />
+                <p className={styles.muted} style={{ marginTop: 12, fontSize: 11 }}>
+                  Entity detail available in the Analysis screen.
+                </p>
+              </>
+            )}
+
+            {!kgTicker && detail && (
               <>
                 <Row label="KIND"         value={detail.kind.toUpperCase()} />
                 <Row label="EVENTS"       value={detail.event_count.toLocaleString()} />
@@ -82,7 +98,7 @@ function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
               </>
             )}
 
-            {!detail && (
+            {!kgTicker && !detail && (
               <p className={styles.muted}>No data available.</p>
             )}
           </div>
