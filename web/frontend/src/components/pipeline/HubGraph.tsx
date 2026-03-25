@@ -469,11 +469,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       </ReactFlow>
       <canvas ref={canvasRef} className={styles.particleCanvas} style={{ pointerEvents: 'none' }} />
 
-      {/* Floating Controls — vertical icon stack, top right */}
+      {/* Floating Controls — vertical icon stack, bottom left */}
       <div style={{
         position: 'absolute',
-        top: 20,
-        right: 20,
+        bottom: 20,
+        left: 20,
         zIndex: 10,
         display: 'flex',
         flexDirection: 'column',
