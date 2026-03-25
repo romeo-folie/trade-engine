@@ -12,29 +12,26 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// resetSQL clears all transactional/market data while preserving:
-//   - watchlist       (user-defined tickers)
-//   - entities        (knowledge graph nodes)
-//   - relationships   (knowledge graph edges)
-//   - entity_mentions (news ↔ entity links)
-const resetSQL = `TRUNCATE
-  signals,
-  trades,
-  orders,
-  analyses,
-  analysis_cache,
-  portfolio_snapshots,
-  candles,
-  news_items,
-  backtest_runs,
-  backtest_trades,
-  orb_sessions,
-  orb_trades,
-  daily_summaries,
-  prompt_cache,
-  prediction_snapshots,
-  config_history
-CASCADE;`
+// resetTables is the ordered list of tables to truncate.
+// Each is truncated only if it exists — safe across different migration states.
+var resetTables = []string{
+	"signals",
+	"trades",
+	"orders",
+	"analyses",
+	"analysis_cache",
+	"portfolio_snapshots",
+	"candles",
+	"news_items",
+	"backtest_runs",
+	"backtest_trades",
+	"orb_sessions",
+	"orb_trades",
+	"daily_summaries",
+	"prompt_cache",
+	"prediction_snapshots",
+	"config_history",
+}
 
 var dbResetForce bool
 
@@ -82,10 +79,24 @@ Cleared tables:
 		defer store.Close()
 
 		fmt.Print("Resetting database... ")
-		if _, err := store.GetDB().Exec(context.Background(), resetSQL); err != nil {
-			return fmt.Errorf("reset failed: %w", err)
+		ctx := context.Background()
+		cleared := 0
+		for _, tbl := range resetTables {
+			// Check existence before truncating — safe across different migration states.
+			var exists bool
+			err := store.GetDB().QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1)`,
+				tbl,
+			).Scan(&exists)
+			if err != nil || !exists {
+				continue
+			}
+			if _, err := store.GetDB().Exec(ctx, "TRUNCATE "+tbl+" CASCADE"); err != nil {
+				return fmt.Errorf("truncate %s: %w", tbl, err)
+			}
+			cleared++
 		}
-		fmt.Println("done.")
+		fmt.Printf("done. (%d tables cleared)\n", cleared)
 		fmt.Println("Preserved: watchlist, entities, relationships, entity_mentions")
 		return nil
 	},
