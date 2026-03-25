@@ -401,6 +401,11 @@ func (e *Engine) logNextCycle(nextTick time.Time, displayLoc *time.Location) {
 // tick processes all active watchlist items for a single engine cycle.
 // Items are processed in parallel; errors per item are logged but do not abort the tick.
 func (e *Engine) tick(ctx context.Context) error {
+	// Refresh portfolio state before processing any signals so that executeSignal
+	// has an accurate cash balance from the very first tick (not the zero-value
+	// default from NewTracker).
+	e.refreshPortfolio(ctx)
+
 	items, err := store.GetWatchlistItems(ctx, true)
 	if err != nil {
 		return fmt.Errorf("get watchlist: %w", err)
