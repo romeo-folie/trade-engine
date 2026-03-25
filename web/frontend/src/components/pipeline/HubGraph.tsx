@@ -232,7 +232,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           nodeId: n.id,
           label: n.label,
           kind: n.kind,
-          eventCount: n.event_count,
+          eventCount: (metrics?.eventCount ?? 0) + (n.event_count ?? 0),
           lastEventAt: liveLastEventAt,
           metrics,
           isHub: false,

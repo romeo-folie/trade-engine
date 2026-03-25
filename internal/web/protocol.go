@@ -58,7 +58,7 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	switch t {
 	// ── Data pipeline ────────────────────────────────────────────────────
 	case events.DataFetched:
-		return "data_enrichment", "indicator_engine", "DataFetched"
+		return "alpaca", "indicator_engine", "DataFetched"
 	case events.NewsFetched:
 		return "news_api", "indicator_engine", "NewsFetched"
 	case events.IndicatorsComputed:
