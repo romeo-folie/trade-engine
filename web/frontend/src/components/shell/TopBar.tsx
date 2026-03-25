@@ -5,22 +5,15 @@ import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 interface TopBarProps {
   status: ConnectionStatus;
   eventsPerSecond: number;
+  version: string;
 }
 
-export default function TopBar({ status }: TopBarProps) {
+export default function TopBar({ status, version }: TopBarProps) {
   const [clock, setClock] = useState(() => formatClock());
-  const [version, setVersion] = useState<string>('...');
 
   useEffect(() => {
     const id = setInterval(() => setClock(formatClock()), 1000);
     return () => clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    fetch('/api/system/status')
-      .then(r => r.json())
-      .then((d: { version?: string }) => { if (d.version) setVersion(d.version); })
-      .catch(() => setVersion('—'));
   }, []);
 
   return (

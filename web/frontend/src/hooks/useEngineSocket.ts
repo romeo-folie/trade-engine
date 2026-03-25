@@ -115,7 +115,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         // Track avg LLM latency (rolling window of last 10 samples)
         if (webEv.type === 'AnalysisCompleted' && webEv.payload) {
           try {
-            const p = JSON.parse(webEv.payload as unknown as string) as { latency_ms?: number };
+            // payload may arrive as a JSON string or already-parsed object depending on runtime
+            const p: { latency_ms?: number } = typeof webEv.payload === 'string'
+              ? JSON.parse(webEv.payload)
+              : (webEv.payload as { latency_ms?: number });
             if (p.latency_ms != null && p.latency_ms > 0) {
               latencySamplesRef.current = [...latencySamplesRef.current, p.latency_ms].slice(-10);
               const avg = latencySamplesRef.current.reduce((a, b) => a + b, 0) / latencySamplesRef.current.length;

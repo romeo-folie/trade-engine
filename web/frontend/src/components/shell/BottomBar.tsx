@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { colors, typography } from '../../styles/tokens';
 import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 
@@ -6,6 +6,7 @@ interface BottomBarProps {
   status: ConnectionStatus;
   lastSignalAt: number | null;
   avgLatencyMs: number | null;
+  baseUptimeSeconds: number | null;
 }
 
 function fmtUptime(sec: number): string {
@@ -37,30 +38,20 @@ function Divider() {
   return <span style={{ color: colors.textFaint }}>|</span>;
 }
 
-export default function BottomBar({ status, lastSignalAt, avgLatencyMs }: BottomBarProps) {
+export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUptimeSeconds }: BottomBarProps) {
   const [uptime, setUptime] = useState<number | null>(null);
+  const tickingRef = useRef(false);
 
-  // Fetch uptime from API on mount, refresh every 60s
+  // Seed uptime from parent (Shell fetches once via useSystemStatus)
+  // then tick locally every second. Re-seed if parent value changes (reconnect).
   useEffect(() => {
-    const fetchUptime = () => {
-      fetch('/api/system/status')
-        .then(r => r.json())
-        .then((d: { uptime_seconds?: number }) => {
-          if (d.uptime_seconds != null) setUptime(d.uptime_seconds);
-        })
-        .catch(() => {});
-    };
-    fetchUptime();
-    const id = setInterval(fetchUptime, 60_000);
-    return () => clearInterval(id);
-  }, []);
-
-  // Increment locally every second so the display ticks without waiting 60s
-  useEffect(() => {
-    if (uptime === null) return;
-    const id = setInterval(() => setUptime(u => (u ?? 0) + 1), 1000);
-    return () => clearInterval(id);
-  }, [uptime !== null]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (baseUptimeSeconds == null) return;
+    setUptime(baseUptimeSeconds);
+    if (!tickingRef.current) {
+      tickingRef.current = true;
+      setInterval(() => setUptime(u => (u ?? 0) + 1), 1000);
+    }
+  }, [baseUptimeSeconds]);
 
   const isPipelineActive = status === 'connected';
 
