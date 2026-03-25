@@ -88,7 +88,10 @@ Cleared tables:
 				`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1)`,
 				tbl,
 			).Scan(&exists)
-			if err != nil || !exists {
+			if err != nil {
+				return fmt.Errorf("check table %s exists: %w", tbl, err)
+			}
+			if !exists {
 				continue
 			}
 			if _, err := store.GetDB().Exec(ctx, "TRUNCATE "+tbl+" CASCADE"); err != nil {
