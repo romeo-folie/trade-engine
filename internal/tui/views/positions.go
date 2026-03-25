@@ -51,7 +51,7 @@ func FetchPositionDetail(ctx context.Context, tradeID string) (d PositionDetail,
 	if trade.EntryPrice > 0 {
 		d.PnLPct = (d.PnL / (trade.EntryPrice * trade.Quantity)) * 100
 	}
-	if trade.Direction == "sell" {
+	if trade.Direction == "short" {
 		d.PnL = (trade.EntryPrice - d.CurrentPrice) * trade.Quantity
 		if trade.EntryPrice > 0 {
 			d.PnLPct = (d.PnL / (trade.EntryPrice * trade.Quantity)) * 100
