@@ -1185,10 +1185,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 // records the entry order.
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal) {
 	side := execution.OrderSideBuy
-	direction := "buy"
+	direction := "long"
 	if sig.Action == string(analysis.ActionSell) {
 		side = execution.OrderSideSell
-		direction = "sell"
+		direction = "short"
 	}
 
 	// Size: use signal's size_pct of portfolio cash.
@@ -1382,16 +1382,16 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 		var exitReason string
 
 		if t.StopLoss > 0 {
-			if (t.Direction == "buy" && currentPrice <= t.StopLoss) ||
-				(t.Direction == "sell" && currentPrice >= t.StopLoss) {
+			if (t.Direction == "long" && currentPrice <= t.StopLoss) ||
+				(t.Direction == "short" && currentPrice >= t.StopLoss) {
 				shouldClose = true
 				exitReason = "stop-loss hit"
 			}
 		}
 
 		if !shouldClose && t.TakeProfit > 0 {
-			if (t.Direction == "buy" && currentPrice >= t.TakeProfit) ||
-				(t.Direction == "sell" && currentPrice <= t.TakeProfit) {
+			if (t.Direction == "long" && currentPrice >= t.TakeProfit) ||
+				(t.Direction == "short" && currentPrice <= t.TakeProfit) {
 				shouldClose = true
 				exitReason = "take-profit hit"
 			}
@@ -1403,7 +1403,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 
 		// Place exit order.
 		exitSide := execution.OrderSideSell
-		if t.Direction == "sell" {
+		if t.Direction == "short" {
 			exitSide = execution.OrderSideBuy
 		}
 		result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
@@ -1421,7 +1421,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 
 		// Calculate P&L.
 		pnl := (result.FilledPrice - t.EntryPrice) * t.Quantity
-		if t.Direction == "sell" {
+		if t.Direction == "short" {
 			pnl = (t.EntryPrice - result.FilledPrice) * t.Quantity
 		}
 		pnlPct := 0.0
