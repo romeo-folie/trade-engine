@@ -25,6 +25,7 @@ import '@xyflow/react/dist/style.css';
 import { useAnimationFrame } from 'framer-motion';
 import type { NodeState } from '../../types/protocol';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
+import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
 import { useSystemStatus } from '../../hooks/useSystemStatus';
@@ -151,6 +152,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const modelEnsemble = useModelEnsemble();
   const systemStatus = useSystemStatus();
   const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
+  const { analystConsensus, lastRiskChecks, lastTrade, portfolioState } = useEngineSocketContext();
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
@@ -241,12 +243,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           accentColor: provider ? modelAccentColor(provider) : undefined,
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
+          // Live pipeline data
+          ...(n.id === 'consensus' ? { analystConsensus } : {}),
+          ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
+          ...(n.id === 'executor' ? { lastTrade } : {}),
+          ...(n.id === 'portfolio' ? { portfolioState } : {}),
         },
         draggable: true,
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, lastRiskChecks, lastTrade, portfolioState]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 

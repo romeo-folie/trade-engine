@@ -21,6 +21,8 @@ import styles from './Signals.module.css';
 
 
 
+const ANALYST_BAR_COLORS = [colors.analystTechnical, colors.analystMomentum, colors.analystSentiment, colors.analystMacro];
+
 /* ── Status pill tabs ─────────────────────────────────────────────────────── */
 
 const STATUS_TABS = ['', 'pending', 'approved', 'executed', 'blocked', 'expired'];
@@ -74,25 +76,22 @@ const COLUMNS: Column<Signal>[] = [
   {
     key: 'Consensus',
     label: 'CONSENSUS',
-    render: () => {
-      // Consensus weights from signal data (T/M/S analyst breakdown)
-      const t = 0.85; 
-      const m = 0.65;
-      const s_val = 0.45;
+    render: (s) => {
+      if (!s.Analysts || s.Analysts.length === 0) {
+        return <span style={{ color: colors.textFaint, fontSize: 9 }}>—</span>;
+      }
+      const active = s.Analysts.filter(a => a.active);
       return (
         <div className={styles.consensusGrid}>
-          <div className={styles.consensusRow}>
-            <div className={styles.consensusBar} style={{ width: t * 40, background: colors.analystTechnical }} />
-            <span className={styles.consensusLetter}>T</span>
-          </div>
-          <div className={styles.consensusRow}>
-            <div className={styles.consensusBar} style={{ width: m * 30, background: colors.analystMomentum }} />
-            <span className={styles.consensusLetter}>M</span>
-          </div>
-          <div className={styles.consensusRow}>
-            <div className={styles.consensusBar} style={{ width: s_val * 20, background: colors.analystSentiment }} />
-            <span className={styles.consensusLetter}>S</span>
-          </div>
+          {active.slice(0, 3).map((a, i) => {
+            const barColor = ANALYST_BAR_COLORS[i] ?? colors.borderMuted;
+            return (
+              <div key={a.name} className={styles.consensusRow}>
+                <div className={styles.consensusBar} style={{ width: a.confidence * 40, background: barColor }} />
+                <span className={styles.consensusLetter}>{a.name.charAt(0).toUpperCase()}</span>
+              </div>
+            );
+          })}
         </div>
       );
     }

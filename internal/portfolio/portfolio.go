@@ -109,14 +109,15 @@ func (t *Tracker) CurrentState() State {
 }
 
 // MaybeSnapshot writes a snapshot if the interval has elapsed.
-func (t *Tracker) MaybeSnapshot(ctx context.Context) {
+// Returns the snapshot state written, or nil if interval not elapsed / on error.
+func (t *Tracker) MaybeSnapshot(ctx context.Context) *State {
 	t.mu.RLock()
 	s := t.state
 	elapsed := time.Since(t.lastSnapshot)
 	t.mu.RUnlock()
 
 	if elapsed < t.snapshotEvery {
-		return
+		return nil
 	}
 	_, err := store.GetDB().Exec(ctx, `
 		INSERT INTO portfolio_snapshots
@@ -126,12 +127,13 @@ func (t *Tracker) MaybeSnapshot(ctx context.Context) {
 	)
 	if err != nil {
 		logger.Warn("portfolio snapshot failed", "err", err)
-		return
+		return nil
 	}
 	t.mu.Lock()
 	t.lastSnapshot = time.Now()
 	t.mu.Unlock()
 	logger.Debug("portfolio snapshot written", "total", s.TotalValue)
+	return &s
 }
 
 // MaybeDailySummary writes a daily_summaries row when the calendar date changes.

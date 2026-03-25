@@ -22,6 +22,7 @@ const (
 	TradeSimulated         Type = "trade.simulated"
 	TradeClosed            Type = "trade.closed"
 	PositionUpdated        Type = "position.updated"
+	NewsFetched            Type = "news.fetched"
 	PortfolioSnapshotTaken Type = "portfolio.snapshot"
 	ErrorOccurred          Type = "error"
 )
@@ -159,11 +160,18 @@ type PositionUpdatedPayload struct {
 
 // PortfolioSnapshotPayload is emitted after a portfolio snapshot is written.
 type PortfolioSnapshotPayload struct {
-	TotalValue    float64
-	Cash          float64
-	Invested      float64
-	UnrealizedPnL float64
-	OpenPositions int
+	TotalValue     float64
+	Cash           float64
+	Invested       float64
+	UnrealizedPnL  float64
+	RealizedPnLDay float64
+	OpenPositions  int
+}
+
+// NewsFetchedPayload is emitted after news articles are fetched and stored for a ticker.
+type NewsFetchedPayload struct {
+	Ticker string
+	Count  int
 }
 
 // ErrorPayload is emitted when a non-fatal error occurs in the pipeline.

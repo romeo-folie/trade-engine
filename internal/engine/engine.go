@@ -955,6 +955,9 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 		return
 	}
 	logger.Info("news fetched", "ticker", ticker, "count", len(items))
+	e.bus.Publish(events.NewsFetched, events.NewsFetchedPayload{
+		Ticker: ticker, Count: len(items),
+	})
 
 	if e.enricher == nil || !e.cfg.Markets.News.ExtractionEnabled {
 		return
@@ -1454,7 +1457,16 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	// Update portfolio state after monitoring.
-	e.portfolio.MaybeSnapshot(ctx)
+	if snap := e.portfolio.MaybeSnapshot(ctx); snap != nil {
+		e.bus.Publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{
+			TotalValue:     snap.TotalValue,
+			Cash:           snap.Cash,
+			Invested:       snap.Invested,
+			UnrealizedPnL:  snap.UnrealizedPnL,
+			RealizedPnLDay: snap.RealizedPnLDay,
+			OpenPositions:  snap.OpenPositions,
+		})
+	}
 }
 
 // ─── Phase 4: Signal expiry (4.8) ────────────────────────────────────────────
