@@ -50,11 +50,14 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		"type":          string(req.Type),
 		"time_in_force": "day",
 	}
-	if req.LimitPrice > 0 {
-		body["limit_price"] = fmt.Sprintf("%.4f", req.LimitPrice)
-	}
-	if req.StopPrice > 0 {
-		body["stop_price"] = fmt.Sprintf("%.4f", req.StopPrice)
+	// Market orders must not include price fields — Alpaca returns 422 if they are present.
+	if req.Type != OrderTypeMarket {
+		if req.LimitPrice > 0 {
+			body["limit_price"] = fmt.Sprintf("%.4f", req.LimitPrice)
+		}
+		if req.StopPrice > 0 {
+			body["stop_price"] = fmt.Sprintf("%.4f", req.StopPrice)
+		}
 	}
 	if req.OrderClass == "bracket" {
 		body["order_class"] = "bracket"
