@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { colors, typography } from '../../styles/tokens';
 import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 
@@ -40,17 +40,14 @@ function Divider() {
 
 export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUptimeSeconds }: BottomBarProps) {
   const [uptime, setUptime] = useState<number | null>(null);
-  const tickingRef = useRef(false);
 
-  // Seed uptime from parent (Shell fetches once via useSystemStatus)
-  // then tick locally every second. Re-seed if parent value changes (reconnect).
+  // Seed uptime from parent prop and start a 1s local tick.
+  // Cleanup clears the interval on unmount or when baseUptimeSeconds changes (reconnect).
   useEffect(() => {
     if (baseUptimeSeconds == null) return;
     setUptime(baseUptimeSeconds);
-    if (!tickingRef.current) {
-      tickingRef.current = true;
-      setInterval(() => setUptime(u => (u ?? 0) + 1), 1000);
-    }
+    const id = setInterval(() => setUptime(u => (u ?? 0) + 1), 1000);
+    return () => clearInterval(id);
   }, [baseUptimeSeconds]);
 
   const isPipelineActive = status === 'connected';
