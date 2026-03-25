@@ -33,6 +33,17 @@ var nyLoc = func() *time.Location {
 	return loc
 }()
 
+// maxNewsPerTicker caps the number of news items passed to the LLM per candidate.
+// Limits context window usage while keeping the most recent catalyst signals.
+const maxNewsPerTicker = 10
+
+// sentimentPositiveThreshold and sentimentNegativeThreshold define the boundaries
+// used when mapping a Finnhub float sentiment score to a POSITIVE/NEUTRAL/NEGATIVE label.
+const (
+	sentimentPositiveThreshold = 0.1
+	sentimentNegativeThreshold = -0.1
+)
+
 // State represents the ORB scheduler's current phase.
 type State string
 
@@ -70,8 +81,9 @@ type ORBScheduler struct {
 	executor   execution.Executor
 	portfolio  PortfolioValuer
 	notifier   Notifier
-	bus        *events.Bus // optional; nil means no event publishing
-	now        func() time.Time // injectable for tests
+	news       data.NewsProvider // optional; nil disables news enrichment
+	bus        *events.Bus       // optional; nil means no event publishing
+	now        func() time.Time  // injectable for tests
 
 	mu           sync.Mutex // protects state, session, candidates for TUI reads
 	state        State
@@ -104,6 +116,12 @@ func NewORBScheduler(
 		rangeBuffers: make(map[string]*RangeBuffer),
 		orderIDs:     make(map[string]string),
 	}
+}
+
+// SetNewsProvider wires a news source for pre-market catalyst enrichment.
+// Call before Run. If not called, the LLM scores on price/volume data only.
+func (s *ORBScheduler) SetNewsProvider(news data.NewsProvider) {
+	s.news = news
 }
 
 // SetBus wires an event bus so the ORB scheduler publishes pipeline events.
@@ -256,11 +274,37 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		// News fetching is deferred to a follow-up iteration.
-		// Without real news the LLM scores on gap magnitude and pre-market
-		// volume alone, which makes catalyst_type/catalyst_quality unreliable.
-		// Wire Alpaca News API (or similar) here when available.
+		// Fetch recent news for this ticker to give the LLM catalyst context.
+		// Without news, catalyst_type/catalyst_quality are unreliable since the
+		// model can only see gap magnitude and pre-market volume.
 		var newsItems []prompts.ORBNewsItem
+		if s.news != nil {
+			since := s.now().Add(-time.Duration(s.cfg.NewsLookbackHours) * time.Hour)
+			rawNews, newsErr := s.news.FetchNews(ctx, gap.Ticker, since)
+			if newsErr != nil {
+				fmt.Printf("orb: news fetch %s: %v\n", gap.Ticker, newsErr)
+			} else {
+				// Cap to most recent N items to avoid context window blowout on
+				// high-volume tickers. FetchNews returns newest-first, so a simple
+				// slice preserves recency ordering.
+				if len(rawNews) > maxNewsPerTicker {
+					rawNews = rawNews[:maxNewsPerTicker]
+				}
+				for _, n := range rawNews {
+					sentiment := "NEUTRAL"
+					if n.SentimentScore > sentimentPositiveThreshold {
+						sentiment = "POSITIVE"
+					} else if n.SentimentScore < sentimentNegativeThreshold {
+						sentiment = "NEGATIVE"
+					}
+					newsItems = append(newsItems, prompts.ORBNewsItem{
+						Headline:    n.Headline,
+						Sentiment:   sentiment,
+						PublishedAt: n.PublishedAt,
+					})
+				}
+			}
+		}
 
 		sysPrompt, userMsg := prompts.BuildORBPrompt(
 			prompts.ORBCandidate{

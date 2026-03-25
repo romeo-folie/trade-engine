@@ -264,7 +264,7 @@ func Defaults() *Config {
 		},
 		ORB: ORBConfig{
 			Mode:              "paper",
-			GapThresholdPct:   3.0,
+			GapThresholdPct:   2.5,
 			MaxCandidates:     2,
 			RangeMinutes:      15,
 			RiskReward:        2.0,
