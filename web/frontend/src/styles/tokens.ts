@@ -5,10 +5,10 @@
 
 export const colors = {
   // Base
-  canvas:       '#050507',  // main canvas background (nearly black)
-  panelBg:      '#070709',  // slide-in panel background
-  cardBg:       '#09090C',  // card / node background
-  cardBgAlt:    '#0C0C10',  // slightly brighter card
+  canvas:       '#0E0E14',  // pipeline canvas — dark charcoal-indigo
+  panelBg:      '#0B0B10',  // slide-in panel background
+  cardBg:       '#131319',  // card / node background
+  cardBgAlt:    '#16161D',  // slightly brighter card
   border:       '#1A1A22',  // default border (darker for distinction)
   borderMuted:  '#121218',  // nearly invisible border
 
