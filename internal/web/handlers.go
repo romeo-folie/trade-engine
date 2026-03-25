@@ -46,7 +46,7 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{
-		"open_trades":     openTrades,
+		"open_trades":      openTrades,
 		"open_trade_count": len(openTrades),
 	})
 }

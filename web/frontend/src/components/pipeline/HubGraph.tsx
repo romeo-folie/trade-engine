@@ -29,6 +29,7 @@ import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
 import { useSystemStatus } from '../../hooks/useSystemStatus';
+import { useKnowledgeGraph, type KnowledgeEntity, type KnowledgeRelationship } from '../../hooks/useKnowledgeGraph';
 import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
 import { colors } from '../../styles/tokens';
@@ -151,12 +152,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const watchlistTickers = useWatchlist();
   const modelEnsemble = useModelEnsemble();
   const systemStatus = useSystemStatus();
+  const { entities: kgEntities, relationships: kgRelationships } = useKnowledgeGraph();
   const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
   const { analystConsensus, lastRiskChecks, lastTrade, portfolioState } = useEngineSocketContext();
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
-  const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
+  const rfNodes = useMemo<Node[]>(() => {
     // Dynamic analyst nodes — expand into per-model cards when data available
     const analystNodes: NodeState[] = modelEnsemble.length > 0
       ? modelEnsemble.map(m => ({
@@ -206,7 +208,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       kindGroups[n.kind].push(n);
     }
 
-    return allNodes.map((n) => {
+    const pipelineRfNodes = allNodes.map((n) => {
       const group = kindGroups[n.kind] || [n];
       // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
       const groupGap = n.kind === 'synthesis' ? 320 : 200;
@@ -253,7 +255,53 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, lastRiskChecks, lastTrade, portfolioState]);
+
+    // Knowledge graph satellite cluster (detached from main pipeline).
+    const maxEntities = 24;
+    const entitySlice = kgEntities.slice(0, maxEntities);
+    const cols = 6;
+    const baseX = 520;
+    const baseY = CY + 560;
+
+    const typeColor: Record<string, string> = {
+      company: '#39FF14',
+      person: '#60A5FA',
+      event: '#F59E0B',
+      country: '#A78BFA',
+      commodity: '#34D399',
+      sector: '#F472B6',
+      index: '#94A3B8',
+    };
+
+    const knowledgeNodes: Node[] = entitySlice.map((e: KnowledgeEntity, i: number) => {
+      const x = baseX + (i % cols) * 250;
+      const y = baseY + Math.floor(i / cols) * 130;
+      const ticker = (e.ticker || '').toUpperCase();
+      const c = typeColor[(e.entity_type || '').toLowerCase()] ?? '#6B7280';
+      return {
+        id: `kg-${e.id}`,
+        position: { x, y },
+        data: {
+          label: `${e.name}${ticker ? ` (${ticker})` : ''}`,
+          ticker,
+        },
+        style: {
+          border: `1px solid ${c}66`,
+          background: 'rgba(9, 9, 12, 0.92)',
+          color: '#F3F4F6',
+          borderRadius: 6,
+          padding: '8px 10px',
+          fontSize: 11,
+          width: 190,
+          boxShadow: `0 0 8px ${c}22`,
+        },
+        draggable: true,
+        selectable: true,
+      };
+    });
+
+    return [...pipelineRfNodes, ...knowledgeNodes];
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, lastRiskChecks, lastTrade, portfolioState, kgEntities, kgRelationships]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
@@ -265,11 +313,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     };
 
     const edges: Edge[] = [];
-    const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
-    const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
-    const analystIds = rfNodes.filter(n => n.data.kind === 'analyst').map(n => n.id);
-    const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
-    const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
+    const pipelineNodes = rfNodes.filter(n => n.type === 'pipelineNode');
+    const sourceIds = pipelineNodes.filter(n => (n.data as PipelineNodeData).kind === 'source').map(n => n.id);
+    const arbiterId = pipelineNodes.find(n => (n.data as PipelineNodeData).kind === 'arbiter')?.id;
+    const analystIds = pipelineNodes.filter(n => (n.data as PipelineNodeData).kind === 'analyst').map(n => n.id);
+    const arbiterFinalId = pipelineNodes.find(n => (n.data as PipelineNodeData).kind === 'arbiter_final')?.id;
+    const executionIds = pipelineNodes.filter(n => (n.data as PipelineNodeData).kind === 'execution').map(n => n.id);
 
     const makeEdge = (src: string, tgt: string) => {
       const active = isNodeRecentlyActive(src);
@@ -316,8 +365,36 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // risk_manager → all execution nodes
     executionIds.forEach(eid => edges.push(makeEdge('risk_manager', eid)));
 
+    // Knowledge graph satellite edges (detached from main pipeline).
+    const kgNodeIDs = new Set(rfNodes.filter(n => n.type === 'knowledgeNode').map(n => n.id));
+    const relColor = (relType: string) => {
+      const rt = relType.toLowerCase();
+      if (rt.includes('competes') || rt.includes('blocked') || rt.includes('risk')) return '#EF4444';
+      if (rt.includes('partner') || rt.includes('supplies') || rt.includes('invests')) return '#22C55E';
+      return '#9CA3AF';
+    };
+
+    kgRelationships.slice(0, 120).forEach((rel: KnowledgeRelationship) => {
+      const src = `kg-${rel.from_entity_id}`;
+      const tgt = `kg-${rel.to_entity_id}`;
+      if (!kgNodeIDs.has(src) || !kgNodeIDs.has(tgt)) return;
+      edges.push({
+        id: `kg-e-${rel.id}`,
+        source: src,
+        target: tgt,
+        type: 'smoothstep',
+        label: rel.relationship_type,
+        labelStyle: { fill: '#9CA3AF', fontSize: 9 },
+        style: {
+          stroke: relColor(rel.relationship_type),
+          strokeWidth: Math.max(1, Math.min(3, rel.strength || 1)),
+          opacity: 0.75,
+        },
+      });
+    });
+
     return edges;
-  }, [rfNodes, nodeMetrics]);
+  }, [rfNodes, nodeMetrics, kgRelationships]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
@@ -339,6 +416,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   }, [layoutLocked, setRfNodes]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
+    if (node.id.startsWith('kg-')) {
+      const ticker = typeof node.data?.ticker === 'string' ? node.data.ticker : '';
+      if (ticker) {
+        onNodeClick(`ticker-${ticker}`);
+        return;
+      }
+    }
     onNodeClick(node.id);
   }, [onNodeClick]);
 
@@ -426,16 +510,20 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     setRfNodes((currentNodes) => {
       const groups: Record<string, typeof currentNodes> = {};
       for (const n of currentNodes) {
-        if (!groups[n.data.kind]) groups[n.data.kind] = [];
-        groups[n.data.kind].push(n);
+        const kind = (n.data as PipelineNodeData).kind;
+        if (n.type !== 'pipelineNode' || !kind) continue;
+        if (!groups[kind]) groups[kind] = [];
+        groups[kind].push(n);
       }
       return currentNodes.map(n => {
-        const group = groups[n.data.kind] || [n];
+        if (n.type !== 'pipelineNode') return n; // keep knowledge cluster layout unchanged
+        const kind = (n.data as PipelineNodeData).kind;
+        const group = groups[kind] || [n];
         // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
-        const groupGap = n.data.kind === 'synthesis' ? 320 : 200;
+        const groupGap = kind === 'synthesis' ? 320 : 200;
         const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
-        const x = getColumnX(n.data.kind);
+        const x = getColumnX(kind);
         const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
         return { ...n, position: { x, y } };
       });
