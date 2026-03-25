@@ -6,6 +6,7 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
 import type { WatchlistTicker } from '../../hooks/useWatchlist';
+import type { AnalystConsensusEntry, RiskCheckResult, LastTrade, PortfolioState } from '../../hooks/useEngineSocket';
 
 function lastTickLabel(lastEventAt: string | null): string {
   if (!lastEventAt) return '—';
@@ -130,8 +131,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               </span>
             </div>
             {/* Watchlist ticker marquee — Alpaca Feed only, hidden in ORB mode */}
-            {d.nodeId === 'alpaca' && !d.isOrbMode && d.watchlistTickers && d.watchlistTickers.length > 0 && (
-              <WatchlistMarquee tickers={d.watchlistTickers} />
+            {d.nodeId === 'alpaca' && !d.isOrbMode && (
+              <WatchlistMarquee tickers={d.watchlistTickers ?? []} />
             )}
           </div>
         )}
@@ -194,29 +195,64 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {d.kind === 'synthesis' && (
           <div className={styles.ensembleBox}>
             {d.nodeId === 'risk_manager' ? (
-              <>
-                <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 6 }}>RISK CHECKS</div>
-                {['CONFIDENCE', 'R/R RATIO', 'POSITION SIZE', 'DRAWDOWN'].map(check => (
-                  <div key={check} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
-                    <span className={styles.kindLabel}>{check}</span>
-                    <span className={styles.kindLabel} style={{ color: nodeActive ? colors.emerald : colors.textDim }}>
-                      {nodeActive ? 'PASS' : '—'}
-                    </span>
-                  </div>
-                ))}
-              </>
+              (() => {
+                const checks = d.riskChecks as RiskCheckResult[] | undefined;
+                const displayChecks = checks && checks.length > 0
+                  ? checks
+                  : ['confidence_threshold', 'risk_reward_ratio', 'position_size_limit', 'max_open_positions', 'daily_loss_limit', 'max_drawdown', 'cooldown_after_loss'].map(checkName => ({ name: checkName, passed: false, reason: '' }));
+                const hasRealData = checks && checks.length > 0;
+                return (
+                  <>
+                    <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 6 }}>RISK CHECKS</div>
+                    {displayChecks.map(check => (
+                      <div key={check.name} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }} title={check.reason || undefined}>
+                        <span className={styles.kindLabel}>{check.name}</span>
+                        <span className={styles.kindLabel} style={{ color: hasRealData ? (check.passed ? colors.emerald : colors.red) : colors.textDim }}>
+                          {hasRealData ? (check.passed ? 'PASS' : 'FAIL') : '—'}
+                        </span>
+                      </div>
+                    ))}
+                  </>
+                );
+              })()
             ) : (
-              <>
-                <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
-                <EnsembleConsensus items={[
-                  { label: 'TECH', value: nodeActive ? 0.8 : 0, color: colors.analystTechnical },
-                  { label: 'MOM',  value: nodeActive ? 0.4 : 0, color: colors.analystMomentum },
-                  { label: 'SENT', value: nodeActive ? 0.9 : 0, color: colors.analystSentiment }
-                ]} />
-                <div className={`${styles.analystVerdict} ${nodeActive ? styles.verdictLong : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
-                  {nodeActive ? <>LONG <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>0.81</span></> : '—'}
-                </div>
-              </>
+              (() => {
+                const ac = d.analystConsensus as Record<string, AnalystConsensusEntry> | undefined;
+                const PROVIDER_COLORS: Record<string, string> = {
+                  anthropic: colors.analystTechnical,
+                  openai: colors.analystMomentum,
+                  google: colors.analystSentiment,
+                };
+                const entries = ac ? Object.entries(ac) : [];
+                const items = entries.map(([key, v]) => ({
+                  label: key.slice(0, 4).toUpperCase(),
+                  value: v.confidence,
+                  color: PROVIDER_COLORS[v.provider?.toLowerCase()] ?? colors.analystMacro,
+                }));
+                // Derive consensus verdict from majority
+                const buys = entries.filter(([, v]) => v.verdict?.toUpperCase() === 'BUY').length;
+                const sells = entries.filter(([, v]) => v.verdict?.toUpperCase() === 'SELL').length;
+                const consensusVerdict = entries.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
+                const avgConf = entries.length > 0
+                  ? entries.reduce((sum, [, v]) => sum + v.confidence, 0) / entries.length
+                  : 0;
+                const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
+                  : consensusVerdict === 'SHORT' ? styles.verdictShort
+                  : styles.verdictNeutral;
+                return (
+                  <>
+                    <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
+                    <EnsembleConsensus items={items.length > 0 ? items : [
+                      { label: 'TECH', value: 0, color: colors.analystTechnical },
+                      { label: 'MOM',  value: 0, color: colors.analystMomentum },
+                      { label: 'SENT', value: 0, color: colors.analystSentiment },
+                    ]} />
+                    <div className={`${styles.analystVerdict} ${consensusVerdict ? verdictCls : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
+                      {consensusVerdict ? <>{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : '—'}
+                    </div>
+                  </>
+                );
+              })()
             )}
           </div>
         )}
@@ -225,43 +261,109 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {d.kind === 'execution' && (
           <div className={styles.execution}>
             {d.nodeId === 'portfolio' ? (
-              <>
-                <div className={styles.subValue} style={{ marginBottom: 6 }}>PORTFOLIO</div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <div>
-                    <div className={styles.subValue}>EQUITY</div>
-                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
-                  </div>
-                  <div>
-                    <div className={styles.subValue}>POSITIONS</div>
-                    <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                      {d.eventCount > 0 ? d.eventCount : '0'}
+              (() => {
+                const ps = d.portfolioState as PortfolioState | undefined;
+                if (ps) {
+                  return (
+                    <>
+                      <div className={styles.subValue} style={{ marginBottom: 6 }}>PORTFOLIO</div>
+                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                        <div>
+                          <div className={styles.subValue}>EQUITY</div>
+                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                            ${ps.totalValue.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                          </div>
+                        </div>
+                        <div>
+                          <div className={styles.subValue}>CASH</div>
+                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                            ${ps.cash.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                          </div>
+                        </div>
+                        <div>
+                          <div className={styles.subValue}>INVESTED</div>
+                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                            ${ps.invested.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                          </div>
+                        </div>
+                        <div>
+                          <div className={styles.subValue}>POSITIONS</div>
+                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                            {ps.openPositions}
+                          </div>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+                        <div>
+                          <div className={styles.subValue}>UNREAL P&L</div>
+                          <div className={styles.kindLabel} style={{
+                            color: ps.unrealizedPnL >= 0 ? colors.acidGreen : colors.red
+                          }}>
+                            {ps.unrealizedPnL >= 0 ? '+' : ''}{ps.unrealizedPnL.toFixed(2)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className={styles.subValue}>TODAY P&L</div>
+                          <div className={styles.kindLabel} style={{
+                            color: ps.realizedPnlToday >= 0 ? colors.acidGreen : colors.red
+                          }}>
+                            {ps.realizedPnlToday >= 0 ? '+' : ''}{ps.realizedPnlToday.toFixed(2)}
+                          </div>
+                        </div>
+                      </div>
+                      <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center', marginTop: 6 }}>
+                        TRACKING
+                      </div>
+                    </>
+                  );
+                }
+                return (
+                  <>
+                    <div className={styles.subValue} style={{ marginBottom: 6 }}>PORTFOLIO</div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                      <div>
+                        <div className={styles.subValue}>EQUITY</div>
+                        <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
+                      </div>
+                      <div>
+                        <div className={styles.subValue}>POSITIONS</div>
+                        <div className={styles.kindLabel} style={{ color: '#fff' }}>0</div>
+                      </div>
                     </div>
-                  </div>
-                </div>
-                <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center', marginTop: 8 }}>
-                  {nodeActive ? 'TRACKING' : 'IDLE'}
-                </div>
-              </>
+                    <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center', marginTop: 8 }}>IDLE</div>
+                  </>
+                );
+              })()
             ) : (
-              <>
-                <div className={`${styles.routeBadge} ${nodeActive ? styles.routeActive : ''}`} style={{ display: 'inline-block', marginBottom: 8 }}>
-                  {nodeActive ? 'LONG' : '—'}
-                </div>
-                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                  <div>
-                    <div className={styles.subValue}>SIZE</div>
-                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
-                  </div>
-                  <div>
-                    <div className={styles.subValue}>ENTRY</div>
-                    <div className={styles.kindLabel} style={{ color: '#fff' }}>—</div>
-                  </div>
-                </div>
-                <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center' }}>
-                  {nodeActive ? 'EXECUTING' : 'READY'}
-                </div>
-              </>
+              (() => {
+                const trade = d.lastTrade as LastTrade | undefined;
+                const dir = trade ? trade.direction.toUpperCase() : null;
+                const dirLabel = dir === 'BUY' ? 'LONG' : dir === 'SELL' ? 'SHORT' : dir;
+                return (
+                  <>
+                    <div className={`${styles.routeBadge} ${trade ? styles.routeActive : ''}`} style={{ display: 'inline-block', marginBottom: 8 }}>
+                      {trade ? dirLabel : '—'}
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                      <div>
+                        <div className={styles.subValue}>SIZE</div>
+                        <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                          {trade ? trade.quantity.toFixed(1) : '—'}
+                        </div>
+                      </div>
+                      <div>
+                        <div className={styles.subValue}>ENTRY</div>
+                        <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                          {trade ? `$${trade.entryPrice.toFixed(2)}` : '—'}
+                        </div>
+                      </div>
+                    </div>
+                    <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center' }}>
+                      {trade ? 'EXECUTING' : 'READY'}
+                    </div>
+                  </>
+                );
+              })()
             )}
           </div>
         )}
@@ -313,6 +415,15 @@ interface WatchlistMarqueeProps {
 }
 
 function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
+  if (tickers.length === 0) {
+    return (
+      <div className={styles.tickerPillsWrapper}>
+        <div className={styles.tickerPillsLabel}>WATCHING</div>
+        <div className={styles.kindLabel} style={{ opacity: 0.4 }}>—</div>
+      </div>
+    );
+  }
+
   // Duration scales with list length so speed stays constant (~30px/s per ticker)
   const duration = Math.max(tickers.length * 1.8, 6);
   // Duplicate for seamless loop

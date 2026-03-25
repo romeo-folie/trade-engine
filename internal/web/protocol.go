@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // ── Wire types ────────────────────────────────────────────────────────────────
@@ -57,6 +59,8 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	// ── Data pipeline ────────────────────────────────────────────────────
 	case events.DataFetched:
 		return "data_enrichment", "indicator_engine", "DataFetched"
+	case events.NewsFetched:
+		return "news_api", "indicator_engine", "NewsFetched"
 	case events.IndicatorsComputed:
 		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
 	case events.AnalysisCompleted:
@@ -101,12 +105,42 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 
 // buildSnapshot returns the current pipeline state for a newly connected client.
 // It queries store functions to populate live data where available.
-func buildSnapshot(_ context.Context) *SnapshotEvent {
+func buildSnapshot(ctx context.Context) *SnapshotEvent {
 	now := time.Now().UTC()
+	nodes := pipelineNodes()
+
+	// Attach live portfolio figures to the portfolio node's Meta.
+	if !store.IsConnected() {
+		return &SnapshotEvent{
+			Type:      "snapshot",
+			Timestamp: now,
+			Nodes:     nodes,
+		}
+	}
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil {
+		logger.Warn("buildSnapshot: portfolio snapshot query failed", "err", err)
+	}
+	if snap != nil {
+		for i := range nodes {
+			if nodes[i].ID == "portfolio" {
+				nodes[i].Meta = map[string]any{
+					"total_value":       snap.TotalValue,
+					"cash":              snap.Cash,
+					"invested":          snap.Invested,
+					"unrealized_pnl":    snap.UnrealizedPnL,
+					"realized_pnl_today": snap.RealizedPnLToday,
+					"open_positions":    snap.OpenPositions,
+				}
+				break
+			}
+		}
+	}
+
 	return &SnapshotEvent{
 		Type:      "snapshot",
 		Timestamp: now,
-		Nodes:     pipelineNodes(),
+		Nodes:     nodes,
 	}
 }
 

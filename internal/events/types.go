@@ -22,6 +22,7 @@ const (
 	TradeSimulated         Type = "trade.simulated"
 	TradeClosed            Type = "trade.closed"
 	PositionUpdated        Type = "position.updated"
+	NewsFetched            Type = "news.fetched"
 	PortfolioSnapshotTaken Type = "portfolio.snapshot"
 	ErrorOccurred          Type = "error"
 )
@@ -53,15 +54,15 @@ type IndicatorsComputedPayload struct {
 
 // AnalysisCompletedPayload is emitted after an LLM analysis completes.
 type AnalysisCompletedPayload struct {
-	Ticker     string
-	AnalysisID string
-	Action     string // BUY | SELL | HOLD
-	Confidence float64
-	Reasoning  string
-	Provider   string
-	Model      string
-	LatencyMs  int64
-	FastPathed bool `json:"fast_pathed"` // true = unanimous analysts, arbiter skipped
+	Ticker     string  `json:"ticker"`
+	AnalysisID string  `json:"analysis_id"`
+	Action     string  `json:"action"` // BUY | SELL | HOLD
+	Confidence float64 `json:"confidence"`
+	Reasoning  string  `json:"reasoning"`
+	Provider   string  `json:"provider"`
+	Model      string  `json:"model"`
+	LatencyMs  int64   `json:"latency_ms"`
+	FastPathed bool    `json:"fast_pathed"` // true = unanimous analysts, arbiter skipped
 }
 
 // ArbiterInvokedPayload is emitted when the arbiter resolves analyst dissent.
@@ -111,27 +112,27 @@ type SignalQueuedPayload struct {
 
 // RiskCheckCompletedPayload is emitted after all risk checks run for a signal.
 type RiskCheckCompletedPayload struct {
-	Ticker string
-	Passed bool
-	Checks []RiskCheckResult
+	Ticker string           `json:"ticker"`
+	Passed bool             `json:"passed"`
+	Checks []RiskCheckResult `json:"checks"`
 }
 
 // RiskCheckResult is a single check outcome within RiskCheckCompletedPayload.
 type RiskCheckResult struct {
-	Name   string
-	Passed bool
-	Reason string
+	Name   string `json:"name"`
+	Passed bool   `json:"passed"`
+	Reason string `json:"reason"`
 }
 
 // TradeExecutedPayload is emitted when a trade is opened via the executor.
 type TradeExecutedPayload struct {
-	TradeID    string
-	SignalID   string
-	Ticker     string
-	Direction  string // buy | sell
-	EntryPrice float64
-	Quantity   float64
-	Strategy   string
+	TradeID    string  `json:"trade_id"`
+	SignalID   string  `json:"signal_id"`
+	Ticker     string  `json:"ticker"`
+	Direction  string  `json:"direction"` // buy | sell
+	EntryPrice float64 `json:"entry_price"`
+	Quantity   float64 `json:"quantity"`
+	Strategy   string  `json:"strategy"`
 }
 
 // TradeSimulatedPayload is emitted for paper trades (same data as executed).
@@ -159,11 +160,18 @@ type PositionUpdatedPayload struct {
 
 // PortfolioSnapshotPayload is emitted after a portfolio snapshot is written.
 type PortfolioSnapshotPayload struct {
-	TotalValue    float64
-	Cash          float64
-	Invested      float64
-	UnrealizedPnL float64
-	OpenPositions int
+	TotalValue     float64 `json:"total_value"`
+	Cash           float64 `json:"cash"`
+	Invested       float64 `json:"invested"`
+	UnrealizedPnL  float64 `json:"unrealized_pnl"`
+	RealizedPnLDay float64 `json:"realized_pnl_today"`
+	OpenPositions  int     `json:"open_positions"`
+}
+
+// NewsFetchedPayload is emitted after news articles are fetched and stored for a ticker.
+type NewsFetchedPayload struct {
+	Ticker string `json:"ticker"`
+	Count  int    `json:"count"`
 }
 
 // ErrorPayload is emitted when a non-fatal error occurs in the pipeline.

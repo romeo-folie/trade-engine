@@ -47,31 +47,22 @@ interface SignalDetailPanelProps {
 
 
 
-/* ── Stub analyst data — fallback when API data is absent ────────────────── */
-
-const STUB_ANALYSTS: AnalystData[] = [
-  { name: 'Technical', verdict: 'LONG', confidence: 0.87, description: 'RSI 68, MACD crossover confirmed', weight: 0.25, active: true, model: '' },
-  { name: 'Momentum', verdict: 'LONG', confidence: 0.92, description: 'Volume spike 2.1x, price breakout', weight: 0.25, active: true, model: '' },
-  { name: 'Sentiment', verdict: 'NEUTRAL', confidence: 0.55, description: 'Mixed news sentiment, no clear bias', weight: 0.25, active: true, model: '' },
-  { name: 'Macro', verdict: 'NEUTRAL', confidence: 0, description: 'Not routed this cycle', weight: 0.25, active: false, model: '' },
-];
-
 /* ── Colour maps ────────────────────────────────────────────────────────── */
 
-const ANALYST_COLORS: Record<string, string> = {
-  Technical: 'var(--indigo)',
-  Momentum:  'var(--amber)',
-  Sentiment: 'var(--violet)',
-  Macro:     'var(--blue)',
-};
+const ANALYST_PALETTE = [
+  colors.analystTechnical,
+  colors.analystMomentum,
+  colors.analystSentiment,
+  colors.analystMacro,
+];
 
-function analystBracketColor(name: string, active: boolean): string {
+function analystBracketColor(index: number, active: boolean): string {
   if (!active) return 'var(--border)';
-  return ANALYST_COLORS[name] ?? 'var(--border)';
+  return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
 }
 
-function analystBarColor(name: string): string {
-  return ANALYST_COLORS[name] ?? 'var(--border)';
+function analystBarColor(index: number): string {
+  return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
 }
 
 function verdictColor(verdict: string): string {
@@ -120,8 +111,8 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
   const dirIsLong = signal.Action.toUpperCase() === 'BUY';
 
-  // Use real analyst data when available, fall back to stubs
-  const analysts = signal.Analysts && signal.Analysts.length > 0 ? signal.Analysts : STUB_ANALYSTS;
+  // Use real analyst data when available
+  const analysts = signal.Analysts && signal.Analysts.length > 0 ? signal.Analysts : [];
   const ensemble = signal.Ensemble ?? null;
   const activeAnalysts = analysts.filter(a => a.active);
   const exec = executionLabel(signal.Status);
@@ -171,42 +162,50 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
         <div className={styles.body}>
           {/* Analyst routing */}
-          <div className={styles.routingLabel}>
-            ROUTED: {activeAnalysts.length} of {analysts.length} ANALYSTS
-          </div>
+          {analysts.length > 0 && (
+            <div className={styles.routingLabel}>
+              ROUTED: {activeAnalysts.length} of {analysts.length} ANALYSTS
+            </div>
+          )}
           <div className={styles.analystCards}>
-            {analysts.map(analyst => (
-              <CornerCard
-                key={analyst.name}
-                bracketColor={analystBracketColor(analyst.name, analyst.active)}
-                bracketSize={10}
-                bracketWidth={1}
-                className={`${styles.analystCard} ${!analyst.active ? styles.bypassed : ''}`}
-              >
-                <div className={styles.analystHeader}>
-                  <span className={styles.analystName}>{analyst.name}</span>
-                  <span className={styles.analystVerdict} style={{ color: analyst.active ? verdictColor(analyst.verdict) : 'var(--text-faint)' }}>
-                    {analyst.active ? analyst.verdict : 'BYPASSED'}
-                  </span>
-                </div>
-                {analyst.active && (
-                  <div className={styles.analystBarTrack}>
-                    <div className={styles.analystBar} style={{ background: analystBarColor(analyst.name), width: `${analyst.confidence * 100}%` }} />
+            {analysts.length === 0 ? (
+              <div className={styles.analystDesc} style={{ padding: 8, color: 'var(--text-faint)' }}>
+                Analyst data not available for this signal.
+              </div>
+            ) : (
+              analysts.map((analyst, idx) => (
+                <CornerCard
+                  key={analyst.name}
+                  bracketColor={analystBracketColor(idx, analyst.active)}
+                  bracketSize={10}
+                  bracketWidth={1}
+                  className={`${styles.analystCard} ${!analyst.active ? styles.bypassed : ''}`}
+                >
+                  <div className={styles.analystHeader}>
+                    <span className={styles.analystName}>{analyst.name}</span>
+                    <span className={styles.analystVerdict} style={{ color: analyst.active ? verdictColor(analyst.verdict) : 'var(--text-faint)' }}>
+                      {analyst.active ? analyst.verdict : 'BYPASSED'}
+                    </span>
                   </div>
-                )}
-                <div className={styles.analystDesc}>{analyst.description}</div>
-              </CornerCard>
-            ))}
+                  {analyst.active && (
+                    <div className={styles.analystBarTrack}>
+                      <div className={styles.analystBar} style={{ background: analystBarColor(idx), width: `${analyst.confidence * 100}%` }} />
+                    </div>
+                  )}
+                  <div className={styles.analystDesc}>{analyst.description}</div>
+                </CornerCard>
+              ))
+            )}
           </div>
 
-          {/* Ensemble synthesis */}
-          <div className={styles.ensembleSection}>
+          {/* Ensemble synthesis — only shown when analyst data is available */}
+          {analysts.length > 0 && <div className={styles.ensembleSection}>
             <div className={styles.sectionLabel}>ENSEMBLE SYNTHESIS</div>
-            {activeAnalysts.map(a => (
+            {activeAnalysts.map((a) => (
               <div key={a.name} className={styles.ensembleRow}>
                 <span className={styles.ensembleLabel}>{a.name}</span>
                 <div className={styles.ensembleTrack}>
-                  <div className={styles.ensembleFill} style={{ width: `${a.weight * 100}%`, background: analystBarColor(a.name) }} />
+                  <div className={styles.ensembleFill} style={{ width: `${a.weight * 100}%`, background: analystBarColor(analysts.indexOf(a)) }} />
                 </div>
                 <span className={styles.ensembleWeight}>{a.weight.toFixed(2)}</span>
               </div>
@@ -217,7 +216,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               </span>
               <span className={styles.verdictScore}>WEIGHTED <strong>{(ensemble?.confidence ?? signal.Confidence).toFixed(2)}</strong></span>
             </div>
-          </div>
+          </div>}
 
           {/* Execution */}
           <div className={styles.executionSection}>
