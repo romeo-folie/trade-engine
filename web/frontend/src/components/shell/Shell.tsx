@@ -40,7 +40,11 @@ export default function Shell() {
         </main>
       </div>
 
-      <BottomBar />
+      <BottomBar
+        status={socket.status}
+        lastSignalAt={socket.lastSignalAt}
+        avgLatencyMs={socket.avgLatencyMs}
+      />
     </div>
   );
 }

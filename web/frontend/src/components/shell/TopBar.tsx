@@ -9,10 +9,18 @@ interface TopBarProps {
 
 export default function TopBar({ status }: TopBarProps) {
   const [clock, setClock] = useState(() => formatClock());
+  const [version, setVersion] = useState<string>('...');
 
   useEffect(() => {
     const id = setInterval(() => setClock(formatClock()), 1000);
     return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/system/status')
+      .then(r => r.json())
+      .then((d: { version?: string }) => { if (d.version) setVersion(d.version); })
+      .catch(() => setVersion('—'));
   }, []);
 
   return (
@@ -46,7 +54,7 @@ export default function TopBar({ status }: TopBarProps) {
           fontSize: 11,
           marginTop: 1
         }}>
-          v2.1.0
+          v{version}
         </span>
       </div>
 

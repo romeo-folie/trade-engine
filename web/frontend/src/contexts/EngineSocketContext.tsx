@@ -16,6 +16,8 @@ export interface EngineSocketContextValue {
   paused: boolean;
   setPaused: (p: boolean) => void;
   nodeMetrics: Record<string, NodeMetrics>;
+  lastSignalAt: number | null;
+  avgLatencyMs: number | null;
 }
 
 export const EngineSocketContext = createContext<EngineSocketContextValue | null>(null);
