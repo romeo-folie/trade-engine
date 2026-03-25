@@ -439,8 +439,8 @@ func TestDefaultsORBConfig(t *testing.T) {
 	if cfg.ORB.Mode != "paper" {
 		t.Errorf("default orb.mode = %q, want paper", cfg.ORB.Mode)
 	}
-	if cfg.ORB.GapThresholdPct != 3.0 {
-		t.Errorf("default orb.gap_threshold_pct = %f, want 3.0", cfg.ORB.GapThresholdPct)
+	if cfg.ORB.GapThresholdPct != 2.5 {
+		t.Errorf("default orb.gap_threshold_pct = %f, want 2.5", cfg.ORB.GapThresholdPct)
 	}
 	if cfg.ORB.MaxCandidates != 2 {
 		t.Errorf("default orb.max_candidates = %d, want 2", cfg.ORB.MaxCandidates)
