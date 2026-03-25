@@ -242,11 +242,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 return (
                   <>
                     <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
-                    <EnsembleConsensus items={items.length > 0 ? items : [
-                      { label: 'TECH', value: 0, color: colors.analystTechnical },
-                      { label: 'MOM',  value: 0, color: colors.analystMomentum },
-                      { label: 'SENT', value: 0, color: colors.analystSentiment },
-                    ]} />
+                    <EnsembleConsensus items={items} />
                     <div className={`${styles.analystVerdict} ${consensusVerdict ? verdictCls : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
                       {consensusVerdict ? <>{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : '—'}
                     </div>
