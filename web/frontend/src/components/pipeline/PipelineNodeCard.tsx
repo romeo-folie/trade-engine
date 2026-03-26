@@ -466,9 +466,7 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
       <div className={styles.tickerPillsLabel}>WATCHING</div>
       <div
         className={styles.tickerPillsTrack}
-        style={{
-          animation: `tickerMarquee ${duration}s linear infinite`,
-        }}
+        style={{ ['--marquee-duration' as string]: `${duration}s` }}
       >
         {doubled.map((t, i) => (
           <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>
