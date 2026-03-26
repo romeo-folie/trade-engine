@@ -24,6 +24,15 @@ export interface AnalystConsensusEntry {
   provider: string;
 }
 
+export interface AnalystVote {
+  provider: string;
+  model: string;
+  action: string;   // 'BUY' | 'SELL' | 'HOLD' | ''
+  confidence: number;
+  skipped: boolean;
+  latency_ms: number;
+}
+
 export interface RiskCheckResult {
   name: string;
   passed: boolean;
@@ -60,6 +69,7 @@ export interface EngineSocketState {
   lastRiskChecks: RiskCheckResult[];
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
+  analystVotes: AnalystVote[];
 }
 
 const MAX_EVENTS = 200;
@@ -83,6 +93,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [lastRiskChecks, setLastRiskChecks] = useState<RiskCheckResult[]>([]);
   const [lastTrade, setLastTrade] = useState<LastTrade | null>(null);
   const [portfolioState, setPortfolioState] = useState<PortfolioState | null>(null);
+  const [analystVotes, setAnalystVotes] = useState<AnalystVote[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -188,9 +199,22 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           } catch { /* ignore parse errors */ }
         }
 
+        // Track per-analyst votes
+        if (webEv.type === 'AnalystVotesPublished' && webEv.payload) {
+          try {
+            const p = typeof webEv.payload === 'string'
+              ? JSON.parse(webEv.payload)
+              : (webEv.payload as Record<string, unknown>);
+            if (Array.isArray(p.votes)) {
+              setAnalystVotes(p.votes as AnalystVote[]);
+            }
+          } catch { /* ignore */ }
+        }
+
         // Reset analyst consensus on new tick
         if (webEv.type === 'DataFetched') {
           setAnalystConsensus({});
+          setAnalystVotes([]);
         }
 
         // Track risk check results
@@ -263,7 +287,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes };
 }
 
 function buildWsUrl(): string {

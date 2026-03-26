@@ -152,7 +152,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const modelEnsemble = useModelEnsemble();
   const systemStatus = useSystemStatus();
   const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
-  const { analystConsensus, lastRiskChecks, lastTrade, portfolioState } = useEngineSocketContext();
+  const { analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState } = useEngineSocketContext();
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
@@ -173,7 +173,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const PIPELINE_NODES: NodeState[] = [
       // Sources (col 0)
       { id: 'alpaca',           label: 'Alpaca Feed',       kind: 'source',        event_count: 0, last_event_at: undefined },
-      { id: 'news_api',         label: 'News Feed',         kind: 'source',        event_count: 0, last_event_at: undefined },
+      { id: 'news_api',         label: nodes.find(n => n.id === 'news_api')?.label ?? 'News Feed', kind: 'source', event_count: 0, last_event_at: undefined },
       // Arbiter (col 1)
       { id: 'indicator_engine', label: 'Indicator Engine',  kind: 'arbiter',       event_count: 0, last_event_at: undefined },
       // Analyst (col 2) — dynamic
@@ -224,6 +224,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const provider = n.meta?.provider as string | undefined;
       const accuracy = n.meta?.accuracy as number | undefined;
 
+      // Match analyst vote for this node
+      const vote = provider
+        ? analystVotes.find(v => v.model === n.label || v.provider === provider)
+        : undefined;
+
       return {
         id: n.id,
         type: 'pipelineNode',
@@ -241,6 +246,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           provider,
           accuracy,
           accentColor: provider ? modelAccentColor(provider) : undefined,
+          // Per-analyst live vote
+          ...(vote ? { verdict: vote.action, voteConfidence: vote.confidence, skipped: vote.skipped } : {}),
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
           // Live pipeline data
@@ -253,7 +260,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, lastRiskChecks, lastTrade, portfolioState]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
@@ -271,8 +278,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
     const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
 
-    const makeEdge = (src: string, tgt: string) => {
-      const active = isNodeRecentlyActive(src);
+    const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean }) => {
+      const active = !opts?.forceInactive && isNodeRecentlyActive(src);
       return {
         id: `e-${src}-${tgt}`,
         source: src,
@@ -298,7 +305,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
     if (arbiterId) {
       sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
-      analystIds.forEach(aid => edges.push(makeEdge(arbiterId, aid)));
+      analystIds.forEach(aid => {
+        // Only light the edge to an analyst if their vote was NOT skipped
+        const analystNode = rfNodes.find(n => n.id === aid);
+        const modelName = (analystNode?.data as PipelineNodeData)?.label ?? '';
+        const vote = analystVotes.find(v => v.model === modelName || aid.includes(v.provider.toLowerCase()));
+        const wasInvoked = vote ? !vote.skipped : false;
+        edges.push(makeEdge(arbiterId, aid, { forceInactive: analystVotes.length > 0 && !wasInvoked }));
+      });
     }
 
     // All analysts → consensus
@@ -317,7 +331,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     executionIds.forEach(eid => edges.push(makeEdge('risk_manager', eid)));
 
     return edges;
-  }, [rfNodes, nodeMetrics]);
+  }, [rfNodes, nodeMetrics, analystVotes]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);

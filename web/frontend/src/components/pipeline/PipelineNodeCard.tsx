@@ -163,12 +163,44 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {!d.provider && (
               <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
             )}
+            {/* Per-analyst live vote badge */}
+            {(() => {
+              const liveVerdict = d.verdict as string | undefined;
+              const voteConf = d.voteConfidence as number | undefined;
+              const isSkipped = d.skipped as boolean | undefined;
+              if (isSkipped) {
+                return (
+                  <div className={styles.kindLabel} style={{ opacity: 0.4, marginTop: 4, fontSize: 11 }}>
+                    SKIPPED
+                  </div>
+                );
+              }
+              if (liveVerdict) {
+                const vColor = liveVerdict === 'BUY' ? colors.emerald : liveVerdict === 'SELL' ? colors.red : colors.amber;
+                const vLabel = liveVerdict === 'BUY' ? 'LONG' : liveVerdict === 'SELL' ? 'SHORT' : liveVerdict;
+                return (
+                  <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                    <span style={{ color: vColor, fontWeight: 700, fontSize: 14, fontFamily: 'var(--font-mono)' }}>
+                      {vLabel}
+                    </span>
+                    {voteConf != null && (
+                      <span style={{ color: vColor, opacity: 0.8, fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+                        {Math.round(voteConf * 100)}%
+                      </span>
+                    )}
+                  </div>
+                );
+              }
+              return null;
+            })()}
             {nodeActive ? (
               <>
-                <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-                  {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-                   verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-                </div>
+                {!d.verdict && !d.skipped && (
+                  <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
+                    {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+                     verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
+                  </div>
+                )}
                 {d.accuracy !== undefined && d.accuracy > 0 && (
                   <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
                     ACC: {Math.round(d.accuracy * 100)}%
@@ -180,12 +212,16 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               </>
             ) : (
               <>
-                <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
-                  —
-                </div>
-                <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
-                  <span className={styles.feedBadgeIdle}>STANDBY</span>
-                </div>
+                {!d.verdict && !d.skipped && (
+                  <>
+                    <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
+                      —
+                    </div>
+                    <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
+                      <span className={styles.feedBadgeIdle}>STANDBY</span>
+                    </div>
+                  </>
+                )}
               </>
             )}
           </div>

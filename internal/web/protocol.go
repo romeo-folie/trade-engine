@@ -65,6 +65,8 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
 	case events.AnalysisCompleted:
 		return "llm_analysis", "consensus", "AnalysisCompleted"
+	case events.AnalystVotesPublished:
+		return "llm_analysis", "llm_analysis", "AnalystVotesPublished"
 	case events.ArbiterInvoked:
 		return "consensus", "arbiter_node", "ArbiterInvoked"
 
