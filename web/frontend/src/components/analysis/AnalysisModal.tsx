@@ -131,7 +131,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
             <div className={styles.kvList}>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Action</span>
-                <span className={`${styles.kvVal} ${actionClass(analysis.Action)}`}>{action}</span>
+                <span className={`${styles.kvBadge} ${actionClass(analysis.Action)}`}>{action}</span>
               </div>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Stop Loss</span>

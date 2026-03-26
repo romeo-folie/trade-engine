@@ -214,11 +214,13 @@
 .tickerPillsTrack {
   display: flex;
   gap: 5px;
-  /* animation applied inline with dynamic duration */
   white-space: nowrap;
+  /* duration driven by --marquee-duration CSS var set inline */
+  animation: tickerMarquee var(--marquee-duration, 10s) linear infinite;
 }
 
-@keyframes tickerMarquee {
+/* :global keeps the keyframe name unscoped so inline style references work too */
+:global(@keyframes tickerMarquee) {
   from { transform: translateX(0); }
   to   { transform: translateX(-50%); }
 }

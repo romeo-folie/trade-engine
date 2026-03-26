@@ -40,10 +40,17 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
   const d = data;
   const isBypassed = d.eventCount === 0 && d.nodeId !== '__hub__';
   const nodeActive = useMemo(() => {
+    // Execution cards (executor, portfolio): treat as active if data is present.
+    // Trades/positions are infrequent — a recency gate would show IDLE immediately
+    // after the 5s window even though the last trade data is still displayed.
+    if (d.kind === 'execution') {
+      if (d.nodeId === 'executor') return !!(d.lastTrade as LastTrade | undefined);
+      if (d.nodeId === 'portfolio') return !!(d.portfolioState as PortfolioState | undefined);
+    }
     if (!d.lastEventAt) return false;
     const ms = typeof d.lastEventAt === 'string' ? new Date(d.lastEventAt).getTime() : d.lastEventAt;
     return Date.now() - ms < 5_000;
-  }, [d.lastEventAt]);
+  }, [d.lastEventAt, d.kind, d.nodeId, d.lastTrade, d.portfolioState]);
 
   const statusDot = useMemo(() => {
     if (!d.lastEventAt) return styles.dotGrey;
@@ -466,9 +473,7 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
       <div className={styles.tickerPillsLabel}>WATCHING</div>
       <div
         className={styles.tickerPillsTrack}
-        style={{
-          animation: `tickerMarquee ${duration}s linear infinite`,
-        }}
+        style={{ ['--marquee-duration' as string]: `${duration}s` }}
       >
         {doubled.map((t, i) => (
           <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>
