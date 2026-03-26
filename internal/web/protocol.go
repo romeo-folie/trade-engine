@@ -3,8 +3,10 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"time"
 
+	appconfig "github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -107,9 +109,9 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 
 // buildSnapshot returns the current pipeline state for a newly connected client.
 // It queries store functions to populate live data where available.
-func buildSnapshot(ctx context.Context) *SnapshotEvent {
+func buildSnapshot(ctx context.Context, cfg *appconfig.Config) *SnapshotEvent {
 	now := time.Now().UTC()
-	nodes := pipelineNodes()
+	nodes := pipelineNodes(cfg)
 
 	// Attach live portfolio figures to the portfolio node's Meta.
 	if !store.IsConnected() {
@@ -146,32 +148,77 @@ func buildSnapshot(ctx context.Context) *SnapshotEvent {
 	}
 }
 
-// pipelineNodes returns the static node topology.  Live metrics (event counts,
-// latency) are populated by the frontend from streamed events; the snapshot
-// carries the baseline structure so the graph can render immediately.
-func pipelineNodes() []NodeState {
-	return []NodeState{
+// pipelineNodes returns the node topology, seeding analyst cards and news label
+// from the engine config when available.
+func pipelineNodes(cfg *appconfig.Config) []NodeState {
+	// News feed label — derive from configured provider.
+	newsLabel := "News (Finnhub/Benzinga)" // fallback
+	if cfg != nil && cfg.Markets.News.Provider != "" {
+		switch strings.ToLower(cfg.Markets.News.Provider) {
+		case "finnhub":
+			newsLabel = "Finnhub News"
+		case "benzinga":
+			newsLabel = "Benzinga News"
+		default:
+			newsLabel = strings.ToUpper(cfg.Markets.News.Provider[:1]) +
+				cfg.Markets.News.Provider[1:] + " News"
+		}
+	}
+
+	// Analyst nodes — one per configured analyst, falling back to a single placeholder.
+	var analystNodes []NodeState
+	if cfg != nil && len(cfg.Models.Roles.Analysts) > 0 {
+		for _, roleKey := range cfg.Models.Roles.Analysts {
+			entry, ok := cfg.Models.Registry[roleKey]
+			if !ok {
+				continue
+			}
+			analystNodes = append(analystNodes, NodeState{
+				ID:    "analyst-" + roleKey,
+				Label: entry.Model,
+				Kind:  "processing",
+				Meta: map[string]any{
+					"provider":     entry.Provider,
+					"registry_key": roleKey,
+				},
+			})
+		}
+	}
+	if len(analystNodes) == 0 {
+		analystNodes = []NodeState{
+			{ID: "llm_analysis", Label: "LLM Analysis", Kind: "processing"},
+		}
+	}
+
+	nodes := []NodeState{
 		// ── Source nodes ──────────────────────────────────────────────────
 		{ID: "alpaca", Label: "Alpaca", Kind: "source"},
-		{ID: "news_api", Label: "News (Finnhub/Benzinga)", Kind: "source"},
+		{ID: "news_api", Label: newsLabel, Kind: "source"},
 
 		// ── Processing nodes ──────────────────────────────────────────────
 		{ID: "data_enrichment", Label: "Data Enrichment", Kind: "processing"},
 		{ID: "indicator_engine", Label: "Indicator Computation", Kind: "processing"},
 		{ID: "prompt_assembly", Label: "Prompt Assembly", Kind: "processing"},
+		// llm_analysis is kept as a stable routing node for AnalysisCompleted / AnalystVotesPublished
+		// events (mapEventEdge targets this ID). It does not render as an analyst card — the
+		// per-analyst cards (analyst-<roleKey>) are rendered from analystNodes below.
 		{ID: "llm_analysis", Label: "LLM Analysis", Kind: "processing"},
-		{ID: "consensus", Label: "Consensus Resolution", Kind: "processing"},
-		{ID: "arbiter_node", Label: "Arbiter", Kind: "processing"},
-		{ID: "risk_manager", Label: "Risk Checks", Kind: "processing"},
+	}
+	nodes = append(nodes, analystNodes...)
+	nodes = append(nodes,
+		NodeState{ID: "consensus", Label: "Consensus Resolution", Kind: "processing"},
+		NodeState{ID: "arbiter_node", Label: "Arbiter", Kind: "processing"},
+		NodeState{ID: "risk_manager", Label: "Risk Checks", Kind: "processing"},
 
 		// ── Output nodes ─────────────────────────────────────────────────
-		{ID: "executor", Label: "Executed Trades", Kind: "output"},
-		{ID: "blocked_signals", Label: "Blocked Signals", Kind: "output"},
-		{ID: "approvals", Label: "Queued Approvals", Kind: "output"},
-		{ID: "portfolio", Label: "Portfolio", Kind: "output"},
+		NodeState{ID: "executor", Label: "Executed Trades", Kind: "output"},
+		NodeState{ID: "blocked_signals", Label: "Blocked Signals", Kind: "output"},
+		NodeState{ID: "approvals", Label: "Queued Approvals", Kind: "output"},
+		NodeState{ID: "portfolio", Label: "Portfolio", Kind: "output"},
 
 		// ── System nodes ─────────────────────────────────────────────────
-		{ID: "engine", Label: "Engine Core", Kind: "processing"},
-		{ID: "error_bus", Label: "Error Bus", Kind: "output"},
-	}
+		NodeState{ID: "engine", Label: "Engine Core", Kind: "processing"},
+		NodeState{ID: "error_bus", Label: "Error Bus", Kind: "output"},
+	)
+	return nodes
 }

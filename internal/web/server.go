@@ -23,6 +23,7 @@ import (
 	"nhooyr.io/websocket"
 	"nhooyr.io/websocket/wsjson"
 
+	appconfig "github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
@@ -50,6 +51,10 @@ type Config struct {
 	// AllowedOrigins lists the origins permitted to open WebSocket connections.
 	// If empty, only same-origin requests are accepted (the nhooyr/websocket default).
 	AllowedOrigins []string
+
+	// EngineConfig optionally carries the loaded engine configuration so the
+	// web layer can seed pipeline nodes from config (analyst cards, news label).
+	EngineConfig *appconfig.Config
 }
 
 // Server is the TradeEngine observability web server.
@@ -57,6 +62,7 @@ type Config struct {
 // REST drill-down endpoints are registered on /api/*.
 type Server struct {
 	cfg        Config
+	engineCfg  *appconfig.Config // nil when not provided
 	bus        *events.Bus
 	httpServer *http.Server
 
@@ -67,9 +73,10 @@ type Server struct {
 // NewServer creates a Server. Call Start to bind and begin serving.
 func NewServer(cfg Config, bus *events.Bus) *Server {
 	s := &Server{
-		cfg: cfg,
-		bus: bus,
-		hub: newClientHub(),
+		cfg:       cfg,
+		engineCfg: cfg.EngineConfig,
+		bus:       bus,
+		hub:       newClientHub(),
 	}
 	return s
 }
@@ -169,7 +176,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ctx := conn.CloseRead(r.Context())
 
 	// Send initial snapshot so the UI isn't blank on first load.
-	snap := buildSnapshot(ctx)
+	snap := buildSnapshot(ctx, s.engineCfg)
 	if err := wsjson.Write(ctx, conn, snap); err != nil {
 		return
 	}

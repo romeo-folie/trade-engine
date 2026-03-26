@@ -157,17 +157,38 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
   const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
-    // Dynamic analyst nodes — expand into per-model cards when data available
-    const analystNodes: NodeState[] = modelEnsemble.length > 0
-      ? modelEnsemble.map(m => ({
-          id: m.id,
-          label: m.modelName,
+    // Config-seeded analyst nodes: prefer "analyst-*" prefixed nodes (config-seeded).
+    // Fall back to "llm_analysis" only when no analyst-* nodes exist (legacy single-model config).
+    const prefixedAnalysts = nodes.filter(n => n.id.startsWith('analyst-'));
+    const snapshotAnalystNodes = prefixedAnalysts.length > 0
+      ? prefixedAnalysts
+      : nodes.filter(n => n.id === 'llm_analysis');
+
+    // Build base analyst list from snapshot nodes (config-seeded, always complete).
+    // modelEnsemble is only used to ENRICH snapshot nodes with performance data (accuracy,
+    // totalSignals) — it never replaces the list, because /api/node/models filters to models
+    // with ≥5 historical trades and would drop analysts that haven't fired enough yet.
+    const baseAnalysts: NodeState[] = snapshotAnalystNodes.length > 0
+      ? snapshotAnalystNodes.map(n => ({
+          id: n.id,
+          label: n.label,
           kind: 'analyst' as const,
-          event_count: m.totalSignals,
+          event_count: 0,
           last_event_at: undefined,
-          meta: { provider: m.provider, accuracy: m.accuracy },
+          meta: { provider: (n.meta?.provider as string) ?? '' },
         }))
       : [{ id: 'llm_analysis', label: 'LLM Analysis', kind: 'analyst' as const, event_count: 0, last_event_at: undefined }];
+
+    // Overlay performance data from modelEnsemble where available (matched by model label).
+    const analystNodes: NodeState[] = baseAnalysts.map(base => {
+      const perf = modelEnsemble.find(m => m.modelName === base.label);
+      if (!perf) return base;
+      return {
+        ...base,
+        event_count: perf.totalSignals,
+        meta: { ...(base.meta ?? {}), provider: perf.provider, accuracy: perf.accuracy },
+      };
+    });
 
     // Pipeline nodes with real backend IDs mapped to visual kinds.
     const PIPELINE_NODES: NodeState[] = [
