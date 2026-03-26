@@ -199,6 +199,10 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 		{ID: "data_enrichment", Label: "Data Enrichment", Kind: "processing"},
 		{ID: "indicator_engine", Label: "Indicator Computation", Kind: "processing"},
 		{ID: "prompt_assembly", Label: "Prompt Assembly", Kind: "processing"},
+		// llm_analysis is kept as a stable routing node for AnalysisCompleted / AnalystVotesPublished
+		// events (mapEventEdge targets this ID). It does not render as an analyst card — the
+		// per-analyst cards (analyst-<roleKey>) are rendered from analystNodes below.
+		{ID: "llm_analysis", Label: "LLM Analysis", Kind: "processing"},
 	}
 	nodes = append(nodes, analystNodes...)
 	nodes = append(nodes,
