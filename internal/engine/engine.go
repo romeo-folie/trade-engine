@@ -813,9 +813,11 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		})
 	}
 
-	// Persist — use ensemble variant when multiple analysts were queried.
+	// Persist — use ensemble variant when any analyst results are available so
+	// that ensemble_results is always stored and the frontend analyst panel is
+	// populated even when only a single analyst is configured.
 	var analysisID string
-	if len(result.AnalystResults) > 1 {
+	if len(result.AnalystResults) >= 1 {
 		ensembleJSON, _ := json.Marshal(result.AnalystResults)
 		var arbJSON []byte
 		var dissentSummary string
