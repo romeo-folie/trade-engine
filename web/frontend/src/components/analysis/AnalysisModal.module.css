@@ -66,6 +66,15 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: #fff;
+  /* Angled pill — chamfer-sm top-right cut (matches design system) */
+  clip-path: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    0 100%
+  );
+  border-radius: 4px 0 4px 4px;
 }
 
 .badgeBuy { background: var(--emerald); }
@@ -210,3 +219,22 @@
 
 .valRed { color: var(--red); }
 .valGreen { color: var(--emerald); }
+
+/* Action value in kv rows — angled pill matching header badge */
+.kvBadge {
+  padding: 1px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #fff;
+  clip-path: polygon(
+    0 0,
+    calc(100% - 6px) 0,
+    100% 6px,
+    100% 100%,
+    0 100%
+  );
+  border-radius: 4px 0 4px 4px;
+}
