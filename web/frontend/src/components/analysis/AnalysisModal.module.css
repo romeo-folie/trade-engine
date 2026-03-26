@@ -66,15 +66,15 @@
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: #fff;
-  /* Angled pill — chamfer-sm top-right cut (matches design system) */
+  /* Dual chamfer — bottom-left and bottom-right corners cut at 45° */
   clip-path: polygon(
     0 0,
-    calc(100% - 6px) 0,
-    100% 6px,
-    100% 100%,
-    0 100%
+    100% 0,
+    100% calc(100% - 6px),
+    calc(100% - 6px) 100%,
+    6px 100%,
+    0 calc(100% - 6px)
   );
-  border-radius: 4px 0 4px 4px;
 }
 
 .badgeBuy { background: var(--emerald); }
@@ -220,7 +220,7 @@
 .valRed { color: var(--red); }
 .valGreen { color: var(--emerald); }
 
-/* Action value in kv rows — angled pill matching header badge */
+/* Action value in kv rows — dual chamfer matching header badge */
 .kvBadge {
   padding: 1px 8px;
   font-family: var(--font-mono);
@@ -231,10 +231,10 @@
   color: #fff;
   clip-path: polygon(
     0 0,
-    calc(100% - 6px) 0,
-    100% 6px,
-    100% 100%,
-    0 100%
+    100% 0,
+    100% calc(100% - 5px),
+    calc(100% - 5px) 100%,
+    5px 100%,
+    0 calc(100% - 5px)
   );
-  border-radius: 4px 0 4px 4px;
 }
