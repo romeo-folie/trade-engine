@@ -5,7 +5,7 @@
  * Screens consume via useEngineSocketContext() — no duplicate connections.
  */
 import { createContext, useContext } from 'react';
-import type { ConnectionStatus, NodeMetrics, IndexedWebEvent, AnalystConsensusEntry, RiskCheckResult, LastTrade, PortfolioState } from '../hooks/useEngineSocket';
+import type { ConnectionStatus, NodeMetrics, IndexedWebEvent, AnalystConsensusEntry, AnalystVote, RiskCheckResult, LastTrade, PortfolioState } from '../hooks/useEngineSocket';
 import type { NodeState } from '../types/protocol';
 
 export interface EngineSocketContextValue {
@@ -22,6 +22,7 @@ export interface EngineSocketContextValue {
   lastRiskChecks: RiskCheckResult[];
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
+  analystVotes: AnalystVote[];
 }
 
 export const EngineSocketContext = createContext<EngineSocketContextValue | null>(null);

@@ -761,6 +761,44 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		"reasoning_len", len(resp.Reasoning),
 		"reasoning_truncated", len(resp.Reasoning) > len(reasoningPreview),
 	)
+	// Broadcast per-analyst votes so the frontend can render individual cards.
+	{
+		var votes []events.AnalystVotePayload
+		if len(result.AnalystResults) > 0 {
+			for _, ar := range result.AnalystResults {
+				skipped := ar.Err != nil
+				action := ""
+				conf := 0.0
+				if !skipped {
+					action = string(ar.Response.Action)
+					conf = ar.Response.Confidence
+				}
+				votes = append(votes, events.AnalystVotePayload{
+					Provider:   ar.Provider,
+					Model:      ar.Model,
+					Action:     action,
+					Confidence: conf,
+					Skipped:    skipped,
+					LatencyMs:  ar.LatencyMs,
+				})
+			}
+		} else {
+			// Single-model path — synthesize a one-entry slice.
+			votes = []events.AnalystVotePayload{{
+				Provider:   meta.Provider,
+				Model:      meta.Model,
+				Action:     string(resp.Action),
+				Confidence: resp.Confidence,
+				Skipped:    false,
+				LatencyMs:  meta.LatencyMs,
+			}}
+		}
+		e.bus.Publish(events.AnalystVotesPublished, events.AnalystVotesPublishedPayload{
+			Ticker: ticker,
+			Votes:  votes,
+		})
+	}
+
 	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
 		Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
 		Reasoning: resp.Reasoning, Provider: meta.Provider, Model: meta.Model, LatencyMs: meta.LatencyMs,

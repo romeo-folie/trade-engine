@@ -23,6 +23,7 @@ const (
 	TradeClosed            Type = "trade.closed"
 	PositionUpdated        Type = "position.updated"
 	NewsFetched            Type = "news.fetched"
+	AnalystVotesPublished  Type = "analysis.analyst_votes"
 	PortfolioSnapshotTaken Type = "portfolio.snapshot"
 	ErrorOccurred          Type = "error"
 )
@@ -172,6 +173,22 @@ type PortfolioSnapshotPayload struct {
 type NewsFetchedPayload struct {
 	Ticker string `json:"ticker"`
 	Count  int    `json:"count"`
+}
+
+// AnalystVotePayload describes one analyst's individual vote in an ensemble cycle.
+type AnalystVotePayload struct {
+	Provider   string  `json:"provider"`
+	Model      string  `json:"model"`
+	Action     string  `json:"action"`    // BUY | SELL | HOLD | ""
+	Confidence float64 `json:"confidence"`
+	Skipped    bool    `json:"skipped"`   // true = analyst errored or wasn't invoked
+	LatencyMs  int64   `json:"latency_ms"`
+}
+
+// AnalystVotesPublishedPayload is emitted after per-analyst results are collected.
+type AnalystVotesPublishedPayload struct {
+	Ticker string               `json:"ticker"`
+	Votes  []AnalystVotePayload `json:"votes"`
 }
 
 // ErrorPayload is emitted when a non-fatal error occurs in the pipeline.
