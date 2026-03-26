@@ -224,10 +224,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const provider = n.meta?.provider as string | undefined;
       const accuracy = n.meta?.accuracy as number | undefined;
 
-      // Match analyst vote for this node
-      const vote = provider
-        ? analystVotes.find(v => v.model === n.label || v.provider === provider)
-        : undefined;
+      // Match analyst vote by node label (analyst name) only — provider is not
+      // a stable key and causes mis-assignment when multiple analysts share a provider.
+      const vote = analystVotes.find(v => v.model === n.label);
 
       return {
         id: n.id,
@@ -309,7 +308,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         // Only light the edge to an analyst if their vote was NOT skipped
         const analystNode = rfNodes.find(n => n.id === aid);
         const modelName = (analystNode?.data as PipelineNodeData)?.label ?? '';
-        const vote = analystVotes.find(v => v.model === modelName || aid.includes(v.provider.toLowerCase()));
+        // Match by analyst name (node label) only — no provider fallback.
+        const vote = analystVotes.find(v => v.model === modelName);
         const wasInvoked = vote ? !vote.skipped : false;
         edges.push(makeEdge(arbiterId, aid, { forceInactive: analystVotes.length > 0 && !wasInvoked }));
       });
