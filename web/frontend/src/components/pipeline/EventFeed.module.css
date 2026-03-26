@@ -3,7 +3,7 @@
   top: 0;
   right: 0;
   width: 280px;
-  max-height: 35vh;   /* cap at 35% viewport — never bleeds past top quadrant */
+  max-height: 20vh;   /* compact — detail available on dedicated events page */
   padding: var(--space-3) var(--space-2);
   overflow: hidden;
   pointer-events: none;
