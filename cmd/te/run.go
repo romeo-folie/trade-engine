@@ -200,6 +200,7 @@ Modes:
 					Port:           runWebPort,
 					Host:           "0.0.0.0",
 					AllowedOrigins: []string{"*"},
+					EngineConfig:   cfg,
 				}, orbBus)
 				if err := webSrv.Start(ctx); err != nil {
 					return fmt.Errorf("web server: %w", err)
@@ -223,6 +224,7 @@ Modes:
 				Port:           runWebPort,
 				Host:           "0.0.0.0",
 				AllowedOrigins: []string{"*"},
+				EngineConfig:   cfg,
 			}, eng.Bus())
 			if err := webSrv.Start(ctx); err != nil {
 				return fmt.Errorf("web server: %w", err)

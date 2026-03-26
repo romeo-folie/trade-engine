@@ -157,7 +157,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
   const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
-    // Dynamic analyst nodes — expand into per-model cards when data available
+    // Config-seeded analyst nodes from WS snapshot (id prefix "analyst-") or legacy "llm_analysis"
+    const snapshotAnalystNodes = nodes.filter(n => n.id.startsWith('analyst-') || n.id === 'llm_analysis');
+
+    // modelEnsemble provides richer data (accuracy, totalSignals) once available.
+    // Prefer modelEnsemble when populated, else fall back to snapshot nodes.
     const analystNodes: NodeState[] = modelEnsemble.length > 0
       ? modelEnsemble.map(m => ({
           id: m.id,
@@ -167,7 +171,16 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           last_event_at: undefined,
           meta: { provider: m.provider, accuracy: m.accuracy },
         }))
-      : [{ id: 'llm_analysis', label: 'LLM Analysis', kind: 'analyst' as const, event_count: 0, last_event_at: undefined }];
+      : snapshotAnalystNodes.length > 0
+        ? snapshotAnalystNodes.map(n => ({
+            id: n.id,
+            label: n.label,
+            kind: 'analyst' as const,
+            event_count: 0,
+            last_event_at: undefined,
+            meta: { provider: (n.meta?.provider as string) ?? '' },
+          }))
+        : [{ id: 'llm_analysis', label: 'LLM Analysis', kind: 'analyst' as const, event_count: 0, last_event_at: undefined }];
 
     // Pipeline nodes with real backend IDs mapped to visual kinds.
     const PIPELINE_NODES: NodeState[] = [
