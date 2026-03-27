@@ -28,31 +28,29 @@ export interface SnapshotEvent {
 
 // Particle colours sourced from design tokens (tokens.css / tokens.ts).
 // Update here when the token palette changes to keep particles in sync.
-// Particle colours sourced from design tokens (tokens.css / tokens.ts).
-// Update here when the token palette changes to keep particles in sync.
-
 export const PARTICLE_COLORS: Record<string, string> = {
-  // Market data
-  DataFetched:          '#22C55E', // emerald
-  IndicatorsComputed:   '#39FF14', // acidGreen
+  // Market data & Indicators
+  DataFetched:          '#0EA5E9', // sky blue
+  IndicatorsComputed:   '#06B6D4', // cyan
   // News
   NewsIngested:         '#F59E0B', // amber
-  // LLM / analysis
+  // LLM / Analysis
   AnalysisCompleted:    '#8B5CF6', // violet
-  ArbiterInvoked:       '#F59E0B', // amber — dissent resolution
+  AnalystVotesPublished:'#A855F7', // light purple
+  ArbiterInvoked:       '#EC4899', // pink — resolution
   // Signal flow
-  SignalGenerated:      '#8B5CF6', // violet
-  RiskCheckCompleted:   '#39FF14', // acidGreen
-  SignalQueued:         '#F59E0B', // amber
+  SignalGenerated:      '#6366F1', // indigo
+  RiskCheckCompleted:   '#3B82F6', // blue
+  SignalQueued:       '#F59E0B', // amber
   // Execution
-  TradeExecuted:        '#22C55E', // emerald
+  TradeExecuted:        '#39FF14', // acid green
   TradeSimulated:       '#22C55E', // emerald
   TradeClosed:          '#EF4444', // red
-  PositionUpdated:      '#22C55E', // emerald
-  PortfolioSnapshot:    '#22C55E', // emerald
+  PositionUpdated:      '#3B82F6', // blue
+  PortfolioSnapshot:    '#14B8A6', // teal
   // Blocked / expired
-  SignalBlocked:        '#6B7280', // textDim
-  SignalExpired:        '#6B7280', // textDim
+  SignalBlocked:        '#6B7280', // grey
+  SignalExpired:        '#6B7280', // grey
   // Errors
   ErrorOccurred:        '#EF4444', // red
 };
@@ -66,8 +64,9 @@ export function particleColor(eventType: string): string {
 export const EVENT_LABELS: Record<string, string> = {
   DataFetched:        'Market Data',
   IndicatorsComputed: 'Indicators',
-  AnalysisCompleted:  'Analysis',
-  ArbiterInvoked:     'Arbiter',
+  AnalysisCompleted:    'Analysis',
+  AnalystVotesPublished:'Votes',
+  ArbiterInvoked:       'Resolver',
   SignalGenerated:    'Signal',
   SignalBlocked:      'Blocked',
   SignalExpired:      'Expired',
