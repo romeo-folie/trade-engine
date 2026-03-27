@@ -49,6 +49,7 @@ const COL = {
   arbiter:       1660,
   risk:          2060,
   execution:     2460,
+  portfolio:     2960,
 };
 
 const CY = 400;
@@ -67,6 +68,7 @@ function getColumnX(nodeId: string, kind: string): number {
   if (nodeId === 'arbiter_node')     return COL.arbiter;
   if (nodeId === 'risk_manager')     return COL.risk;
   if (nodeId === 'indicator_engine') return COL.indicators;
+  if (nodeId === 'portfolio')        return COL.portfolio;
 
   // Priority 2: General kinds
   switch (kind) {
@@ -254,6 +256,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       let estimatedH = NODE_H;
       if (n.id === 'consensus') estimatedH = 184;
       if (n.id === 'risk_manager') estimatedH = 222;
+      if (n.id === 'portfolio') estimatedH = 222;
+      if (n.id === 'executor') estimatedH = 190;
       if (n.kind === 'execution') estimatedH = 190;
       if (n.kind === 'analyst') estimatedH = 160;
 
@@ -326,10 +330,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
     const analystIds = rfNodes.filter(n => n.data.kind === 'analyst').map(n => n.id);
     const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
-    const executionIds = rfNodes.filter(n => n.data.kind === 'execution').map(n => n.id);
+    // analysis removed executionIds from main loop, removing its usage here too
 
-    const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean }) => {
-      const active = !opts?.forceInactive && isNodeRecentlyActive(src);
+    const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean; activeOverride?: boolean }) => {
+      const active = opts?.activeOverride !== undefined 
+        ? opts.activeOverride 
+        : !opts?.forceInactive && isNodeRecentlyActive(src);
       return {
         id: `e-${src}-${tgt}`,
         source: src,
@@ -381,8 +387,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       edges.push(makeEdge(arbiterFinalId, 'risk_manager'));
     }
 
-    // risk_manager → all execution nodes
-    executionIds.forEach(eid => edges.push(makeEdge('risk_manager', eid)));
+    // Causal flow: Risk → Executor → Portfolio
+    const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
+    const riskActive = isNodeRecentlyActive('risk_manager');
+    
+    // Risk → Executor (Lights only on PASS)
+    edges.push(makeEdge('risk_manager', 'executor', { 
+      activeOverride: riskActive && allRiskPassed 
+    }));
+    
+    // Executor → Portfolio (Pulse on trade activity)
+    edges.push(makeEdge('executor', 'portfolio'));
 
     return edges;
   }, [rfNodes, nodeMetrics, analystVotes]);
@@ -439,6 +454,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           const getEstimatedH = (id: string, kind: string) => {
             if (id === 'consensus') return 184;
             if (id === 'risk_manager') return 222;
+            if (id === 'portfolio') return 222;
+            if (id === 'executor') return 190;
             if (kind === 'execution') return 190;
             if (kind === 'analyst') return 160;
             return NODE_H;
