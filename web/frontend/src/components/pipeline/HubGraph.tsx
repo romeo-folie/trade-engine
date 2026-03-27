@@ -33,10 +33,12 @@ import PipelineNodeCard, { type PipelineNodeData } from './PipelineNodeCard';
 import { particleColor } from '../../types/protocol';
 import { colors } from '../../styles/tokens';
 import styles from './HubGraph.module.css';
+import OrganicEdge from './OrganicEdge';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
+const EDGE_TYPES = { organic: OrganicEdge };
 
 // Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
 const COL = {
@@ -100,6 +102,7 @@ interface Particle {
   color: string;
   progress: number;
   speed: number;
+  bezierIntensity: number; // For non-linear paths
 }
 
 // ── CanvasIconButton ──────────────────────────────────────────────────────────
@@ -246,8 +249,16 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const groupIdx = group.findIndex(gn => gn.id === n.id);
       
       const x = getColumnX(n.id, n.kind);
+      
+      // Variable height estimation for centering (Data-backed from CSS + Content)
+      let estimatedH = NODE_H;
+      if (n.id === 'consensus') estimatedH = 184;
+      if (n.id === 'risk_manager') estimatedH = 222;
+      if (n.kind === 'execution') estimatedH = 190;
+      if (n.kind === 'analyst') estimatedH = 160;
+
       // Center the whole group vertically around CY
-      let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (NODE_H / 2);
+      let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
 
       // Arbiter offset to clarify bypass path: move it up so the straight path 
       // from Consensus to Risk Manager is visible beneath it.
@@ -338,7 +349,10 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
               animation: '',
               opacity: 0.55,
             },
-        type: 'smoothstep',
+        data: {
+          active,
+        },
+        type: 'organic',
       };
     };
 
@@ -416,23 +430,35 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       prevSignatures.current[nodeId] = sig;
 
       // Find the edge(s) this node is a source of
-      const outgoingEdges = rfE.filter(e => e.source === nodeId);
-      outgoingEdges.forEach(edge => {
-        const src = rfNodeMap.get(edge.source);
-        const tgt = rfNodeMap.get(edge.target);
-        if (!src || !tgt) return;
+        const outgoingEdges = rfE.filter(e => e.source === nodeId);
+        outgoingEdges.forEach(edge => {
+          const src = rfNodeMap.get(edge.source);
+          const tgt = rfNodeMap.get(edge.target);
+          if (!src || !tgt) return;
 
-        particlesRef.current.push({
-          id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
-          fromX: src.position.x + NODE_W / 2,
-          fromY: src.position.y + NODE_H / 2,
-          toX: tgt.position.x + NODE_W / 2,
-          toY: tgt.position.y + NODE_H / 2,
-          color: particleColor(sig.type),
-          progress: 0,
-          speed: 0.001 + Math.random() * 0.0005,
+          const getEstimatedH = (id: string, kind: string) => {
+            if (id === 'consensus') return 184;
+            if (id === 'risk_manager') return 222;
+            if (kind === 'execution') return 190;
+            if (kind === 'analyst') return 160;
+            return NODE_H;
+          };
+
+          const srcH = getEstimatedH(src.id, src.data.kind);
+          const tgtH = getEstimatedH(tgt.id, tgt.data.kind);
+
+          particlesRef.current.push({
+            id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
+            fromX: src.position.x + NODE_W,
+            fromY: src.position.y + srcH / 2,
+            toX: tgt.position.x,
+            toY: tgt.position.y + tgtH / 2,
+            color: particleColor(sig.type),
+            progress: 0,
+            speed: 0.0008 + Math.random() * 0.0004,
+            bezierIntensity: 0.8, // Match OrganicEdge
+          });
         });
-      });
     }
   }, [recentEventSignatures, rfNodes, rfE]);
 
@@ -455,8 +481,25 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
     particlesRef.current = particlesRef.current.filter(p => {
       p.progress = Math.min(1, p.progress + p.speed * dt);
-      const x = (p.fromX + (p.toX - p.fromX) * p.progress) * vp.zoom + vp.x;
-      const y = (p.fromY + (p.toY - p.fromY) * p.progress) * vp.zoom + vp.y;
+      
+      const t = p.progress;
+      const xStart = p.fromX;
+      const yStart = p.fromY;
+      const xEnd = p.toX;
+      const yEnd = p.toY;
+
+      // Standard cubic bezier for horizontal flow (control points moved out by intensity)
+      const cp1X = xStart + (xEnd - xStart) * p.bezierIntensity;
+      const cp1Y = yStart;
+      const cp2X = xEnd - (xEnd - xStart) * p.bezierIntensity;
+      const cp2Y = yEnd;
+
+      // Calculate path (Cubic Bezier)
+      const xRaw = Math.pow(1-t, 3)*xStart + 3*Math.pow(1-t, 2)*t*cp1X + 3*(1-t)*Math.pow(t, 2)*cp2X + Math.pow(t, 3)*xEnd;
+      const yRaw = Math.pow(1-t, 3)*yStart + 3*Math.pow(1-t, 2)*t*cp1Y + 3*(1-t)*Math.pow(t, 2)*cp2Y + Math.pow(t, 3)*yEnd;
+
+      const x = xRaw * vp.zoom + vp.x;
+      const y = yRaw * vp.zoom + vp.y;
 
       const radius = 6 * vp.zoom;
       ctx.beginPath();
@@ -522,6 +565,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           fitViewRef.current = instance.fitView;
         }}
         nodeTypes={NODE_TYPES}
+        edgeTypes={EDGE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
         defaultViewport={{ x: 20, y: 60, zoom: 0.6 }}
