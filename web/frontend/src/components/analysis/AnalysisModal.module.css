@@ -51,35 +51,21 @@
 }
 
 .title {
-  font-family: var(--font-sans);
-  font-size: 22px;
-  font-weight: 700;
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 800;
   color: var(--text-primary);
+  letter-spacing: 0.05em;
 }
 
-.badge {
-  display: inline-block;
-  padding: 2px 10px;
+.badgeText {
   font-family: var(--font-mono);
   font-size: 12px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #fff;
-  /* Dual chamfer — bottom-left and bottom-right corners cut at 45° */
-  clip-path: polygon(
-    0 0,
-    100% 0,
-    100% calc(100% - 6px),
-    calc(100% - 6px) 100%,
-    6px 100%,
-    0 calc(100% - 6px)
-  );
+  color: #050507; /* Dark text on bright background */
 }
-
-.badgeBuy { background: var(--emerald); }
-.badgeSell { background: var(--red); }
-.badgeHold { background: var(--amber); }
 
 .headerMeta {
   font-family: var(--font-mono);
@@ -220,21 +206,11 @@
 .valRed { color: var(--red); }
 .valGreen { color: var(--emerald); }
 
-/* Action value in kv rows — dual chamfer matching header badge */
-.kvBadge {
-  padding: 1px 8px;
+.kvBadgeText {
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: #fff;
-  clip-path: polygon(
-    0 0,
-    100% 0,
-    100% calc(100% - 5px),
-    calc(100% - 5px) 100%,
-    5px 100%,
-    0 calc(100% - 5px)
-  );
+  color: #050507; /* Dark text on bright background */
 }

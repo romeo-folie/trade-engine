@@ -12,6 +12,7 @@ interface ChamferedBoxProps {
   activeColor?: string;
   onClick?: React.MouseEventHandler<HTMLDivElement>;
   title?: string;
+  centerContent?: boolean;
 }
 
 /**
@@ -28,7 +29,8 @@ export function ChamferedBox({
   isActive = false,
   activeColor = colors.acidGreen,
   onClick,
-  title
+  title,
+  centerContent = false
 }: ChamferedBoxProps) {
   const [dims, setDims] = useState({ w: 0, h: 0 });
   const ref = useRef<HTMLDivElement>(null);
@@ -53,9 +55,9 @@ export function ChamferedBox({
     const { w, h } = dims;
     if (w === 0 || h === 0) return '';
     
-    // Safety: ensure chamfer doesn't exceed dimensions
-    const c = Math.min(chamfer, w - 2, h - 2);
-    const inset = strokeWidth / 2;
+    const c = Math.min(chamfer, w - 4, h - 4);
+    // Inset the path to ensure the full stroke fits within the SVG viewport without subpixel clipping.
+    const inset = (strokeWidth / 2) + 0.8;
 
     return `
       M ${inset} ${inset}
@@ -89,6 +91,7 @@ export function ChamferedBox({
           left: 0,
           width: '100%',
           height: '100%',
+          overflow: 'visible',
           pointerEvents: 'none',
           zIndex: 0,
           display: 'block',
@@ -111,10 +114,10 @@ export function ChamferedBox({
         zIndex: 1, 
         width: '100%', 
         height: '100%',
-        display: style?.display === 'flex' ? 'flex' : undefined,
-        flexDirection: style?.flexDirection as any || (style?.display === 'flex' ? 'row' : undefined),
-        alignItems: style?.alignItems || (style?.display === 'flex' ? 'center' : undefined),
-        justifyContent: style?.justifyContent || (style?.display === 'flex' ? 'center' : undefined),
+        display: centerContent ? 'flex' : (style?.display?.includes('flex') ? style.display : undefined),
+        flexDirection: style?.flexDirection as any || (centerContent ? 'row' : (style?.display?.includes('flex') ? 'row' : undefined)),
+        alignItems: style?.alignItems || (centerContent ? 'center' : (style?.display?.includes('flex') ? 'center' : undefined)),
+        justifyContent: style?.justifyContent || (centerContent ? 'center' : (style?.display?.includes('flex') ? 'center' : undefined)),
       }}>
         {children}
       </div>

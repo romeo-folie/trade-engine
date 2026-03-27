@@ -134,6 +134,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
             <span className={styles.title}>{signal.Ticker}</span>
             <ChamferedBox
               chamfer={6}
+              centerContent
               backgroundColor={dirIsLong ? colors.emerald : colors.red}
               borderColor={dirIsLong ? colors.emerald : colors.red}
               style={{ display: 'inline-block', padding: '2px 8px', marginLeft: '12px' }}
@@ -268,21 +269,44 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
 
             <span className={styles.kvLabel}>Status</span>
             <span className={styles.kvValue}>
-              <ChamferedBox
-                chamfer={4}
-                backgroundColor={signal.Status.toLowerCase() === 'executed' ? colors.acidGreen : colors.borderMuted}
-                borderColor={signal.Status.toLowerCase() === 'executed' ? colors.acidGreen : colors.borderMuted}
-                style={{ 
-                  display: 'inline-flex', 
-                  alignItems: 'center', 
-                  justifyContent: 'center',
-                  padding: '1px 8px' 
-                }}
-              >
-                <span style={{ fontSize: 9, fontWeight: 700, color: signal.Status.toLowerCase() === 'executed' ? '#0D0D11' : 'var(--text-dim)' }}>
-                  {signal.Status.toUpperCase()}
-                </span>
-              </ChamferedBox>
+              {(() => {
+                const s = signal.Status.toLowerCase();
+                let borderColor = colors.textDim;
+                let bgColor = 'transparent';
+                let textColor = 'var(--text-dim)';
+
+                if (s === 'executed' || s === 'approved') {
+                  borderColor = colors.acidGreen;
+                  bgColor = s === 'executed' ? colors.acidGreen : 'transparent';
+                  textColor = s === 'executed' ? '#0D0D11' : colors.acidGreen;
+                } else if (s === 'blocked') {
+                  borderColor = colors.red;
+                  bgColor = 'rgba(239, 68, 68, 0.15)';
+                  textColor = colors.red;
+                } else if (s === 'pending') {
+                  borderColor = colors.amber;
+                  textColor = colors.amber;
+                }
+
+                return (
+                  <ChamferedBox
+                    chamfer={4}
+                    centerContent
+                    backgroundColor={bgColor}
+                    borderColor={borderColor}
+                    style={{ 
+                      display: 'inline-flex', 
+                      alignItems: 'center', 
+                      justifyContent: 'center',
+                      padding: '1px 8px' 
+                    }}
+                  >
+                    <span style={{ fontSize: 9, fontWeight: 700, color: textColor }}>
+                      {signal.Status.toUpperCase()}
+                    </span>
+                  </ChamferedBox>
+                );
+              })()}
             </span>
 
             <span className={styles.kvLabel}>Expires</span>
@@ -293,34 +317,29 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           <div className={styles.actionRow}>
             <ChamferedBox
               chamfer={6}
+              centerContent
               backgroundColor="transparent"
-              borderColor={colors.borderMuted}
+              borderColor={colors.red}
               className={styles.btnOverride}
               title="Manual override — not yet implemented"
               style={{
                 padding: '10px 0',
                 flex: 1,
-                backgroundColor: colors.borderMuted,
-                textAlign: 'center',
-                display: 'inline-flex',
-                alignItems: 'center',
-                justifyContent: 'center'
               }}
             >
               OVERRIDE
             </ChamferedBox>
             <ChamferedBox
               chamfer={6}
+              centerContent
               backgroundColor="transparent"
-              borderColor={colors.borderMuted}
+              borderColor={colors.border}
               onClick={onClose}
               className={styles.btnDismiss}
               style={{
-              padding: '2px 8px',
-              display: 'inline-flex',
-              alignItems: 'center',
-              justifyContent: 'center'
-            }}
+                padding: '10px 0',
+                flex: 1,
+              }}
             >
               CLOSE
             </ChamferedBox>
