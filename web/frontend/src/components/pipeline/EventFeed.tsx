@@ -35,7 +35,7 @@ function EventFeed({ events }: EventFeedProps) {
             style={{ opacity }}
           >
             <span className={styles.ts}>{ts}</span>
-            <span className={styles.evType} style={{ color }}>{label}</span>
+            <span className={styles.evType} style={{ color, textShadow: `0 0 8px ${color}44` }}>{label}</span>
             <span className={styles.route}>{ev.source}→{ev.target}</span>
           </div>
         );
