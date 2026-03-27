@@ -164,6 +164,18 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 				cfg.Markets.News.Provider[1:] + " News"
 		}
 	}
+	// Arbiter node config
+	arbiterLabel := "Arbiter"
+	var arbiterMeta map[string]any
+	if cfg != nil {
+		arbCfg := cfg.Models.ArbiterConfig()
+		if arbCfg.Model != "" {
+			arbiterLabel = arbCfg.Model
+			arbiterMeta = map[string]any{
+				"provider": arbCfg.Provider,
+			}
+		}
+	}
 
 	// Analyst nodes — one per configured analyst, falling back to a single placeholder.
 	var analystNodes []NodeState
@@ -207,7 +219,12 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 	nodes = append(nodes, analystNodes...)
 	nodes = append(nodes,
 		NodeState{ID: "consensus", Label: "Consensus Resolution", Kind: "processing"},
-		NodeState{ID: "arbiter_node", Label: "Arbiter", Kind: "processing"},
+		NodeState{
+			ID:    "arbiter_node",
+			Label: arbiterLabel,
+			Kind:  "processing",
+			Meta:  arbiterMeta,
+		},
 		NodeState{ID: "risk_manager", Label: "Risk Checks", Kind: "processing"},
 
 		// ── Output nodes ─────────────────────────────────────────────────
