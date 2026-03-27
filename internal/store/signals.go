@@ -55,6 +55,14 @@ func UpdateSignalStatus(ctx context.Context, id, status, blockReason string) err
 	return err
 }
 
+// UpdateSignalPrice updates the signal_price for a signal.
+func UpdateSignalPrice(ctx context.Context, id string, price float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE signals SET signal_price=$1, updated_at=NOW() WHERE id=$2`,
+		price, id)
+	return err
+}
+
 // GetPendingSignals returns all signals with status = 'pending' or 'approved'.
 func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 	rows, err := GetDB().Query(ctx, `

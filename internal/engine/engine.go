@@ -58,8 +58,8 @@ type Engine struct {
 	executor     execution.Executor
 	portfolio    *portfolio.Tracker
 	bus          *events.Bus
-	enricher     *knowledge.Enricher  // nil if no LLM configured
-	embedder     embeddings.Embedder  // nil if embeddings disabled
+	enricher     *knowledge.Enricher // nil if no LLM configured
+	embedder     embeddings.Embedder // nil if embeddings disabled
 
 	// newsLastFetched tracks when news was last fetched per ticker, to avoid
 	// hammering the news API on every 5-min tick.
@@ -1229,6 +1229,34 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if sig.Action == string(analysis.ActionSell) {
 		side = execution.OrderSideSell
 		direction = "short"
+	}
+
+	// Ensure signal price is populated before sizing/execution.
+	if sig.SignalPrice <= 0 {
+		for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe1Day} {
+			latest, err := store.GetLatestCandle(ctx, sig.Ticker, tf)
+			if err == nil && latest != nil && latest.Close > 0 {
+				sig.SignalPrice = latest.Close
+				if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+					logger.Warn("update signal price", "id", sigID, "err", err)
+				}
+				break
+			}
+		}
+	}
+	if sig.SignalPrice <= 0 {
+		reason := "signal price unavailable (no recent candles)"
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Warn("signal execution skipped — missing signal price",
+			"ticker", sig.Ticker,
+		)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "signal price",
+		})
+		return
 	}
 
 	// Size: use signal's size_pct of portfolio cash.
