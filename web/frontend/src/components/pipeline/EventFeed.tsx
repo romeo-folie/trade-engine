@@ -32,12 +32,7 @@ function EventFeed({ events }: EventFeedProps) {
           <div
             key={ev._seqId}
             className={styles.row}
-            style={{ 
-              opacity,
-              borderLeft: `2px solid ${color}`,
-              paddingLeft: 10,
-              marginLeft: -8 
-            }}
+            style={{ opacity }}
           >
             <span className={styles.ts}>{ts}</span>
             <span className={styles.evType} style={{ color, textShadow: `0 0 8px ${color}44` }}>{label}</span>
