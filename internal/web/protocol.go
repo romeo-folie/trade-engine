@@ -165,7 +165,7 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 		}
 	}
 	// Arbiter node config
-	arbiterLabel := "—"
+	arbiterLabel := "-"
 	var arbiterMeta map[string]any
 	if cfg != nil {
 		arbCfg := cfg.Models.ArbiterConfig()
@@ -182,6 +182,7 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 			arbiterLabel = arbCfg.Model
 			arbiterMeta = map[string]any{
 				"provider": arbCfg.Provider,
+				"model":    arbCfg.Model,
 			}
 		}
 	}
