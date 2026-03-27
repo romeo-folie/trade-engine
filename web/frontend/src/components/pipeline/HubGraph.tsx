@@ -213,7 +213,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Consensus (col 3)
       { id: 'consensus', label: 'Consensus', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Arbiter Final (col 4) — handles dissent
-      { id: 'arbiter_node', label: 'Ensemble Arbiter', kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
+      { 
+        id: 'arbiter_node', 
+        label: nodes.find(n => n.id === 'arbiter_node')?.label ?? 'Ensemble Arbiter', 
+        kind: 'arbiter_final', 
+        event_count: 0, 
+        last_event_at: undefined 
+      },
       // Risk Manager (col 5)
       { id: 'risk_manager', label: 'Risk Manager', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Execution (col 6)
@@ -238,6 +244,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       kindGroups[n.kind].push(n);
     }
 
+    // Calculate global allRiskPassed state
+    const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
+
     return allNodes.map((n) => {
       // Grouping logic for vertical stacking. 
       // Singletons on the central path (Consensus, Risk, Executor, Portfolio) stay isolated and centered.
@@ -256,7 +265,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Variable height estimation for centering (Data-backed from CSS + Content)
       let estimatedH = NODE_H;
       if (n.id === 'consensus') estimatedH = 180;
-      if (n.id === 'risk_manager') estimatedH = 210;
+      if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
       if (n.id === 'portfolio') estimatedH = 240;
       if (n.id === 'executor') estimatedH = 160;
       if (n.kind === 'execution') estimatedH = 160;
@@ -316,8 +325,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           // Live pipeline data
           ...(n.id === 'consensus' ? { analystConsensus, analystVotes } : {}),
           ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
-          ...(n.id === 'executor' ? { lastTrade } : {}),
-          ...(n.id === 'portfolio' ? { portfolioState } : {}),
+          ...(n.id === 'executor' ? { lastTrade, allRiskPassed } : {}),
+          ...(n.id === 'portfolio' ? { portfolioState, allRiskPassed } : {}),
         },
         draggable: true,
         selectable: true,
@@ -331,6 +340,15 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const isNodeRecentlyActive = (nodeId: string): boolean => {
       const lastEventAt = nodeMetrics[nodeId]?.lastEventAt;
       if (!lastEventAt) return false;
+      // Execution cards (executor, portfolio): treat as active if data is present.
+      // Trades/positions are infrequent — a recency gate would show IDLE immediately
+      // after the 5s window even though the last trade data is still displayed.
+      const node = rfNodes.find(n => n.id === nodeId);
+      if (node?.data.kind === 'execution') {
+        const allPassed = node.data.allRiskPassed !== false;
+        if (node.id === 'executor') return !!(node.data.lastTrade) && allPassed;
+        if (node.id === 'portfolio') return !!(node.data.portfolioState) && allPassed;
+      }
       return Date.now() - lastEventAt < 10_000;
     };
 
@@ -408,7 +426,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     edges.push(makeEdge('executor', 'portfolio'));
 
     return edges;
-  }, [rfNodes, nodeMetrics, analystVotes]);
+  }, [rfNodes, nodeMetrics, analystVotes, lastRiskChecks]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
@@ -461,7 +479,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
           const getEstimatedH = (id: string, kind: string) => {
             if (id === 'consensus') return 180;
-            if (id === 'risk_manager') return 210;
+            if (id === 'risk_manager') return 180;
             if (id === 'portfolio') return 240;
             if (id === 'executor') return 160;
             if (kind === 'execution') return 160;
@@ -578,7 +596,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         // Variable height estimation for centering (Data-backed from CSS + Content)
         let estimatedH = NODE_H;
         if (n.id === 'consensus') estimatedH = 180;
-        if (n.id === 'risk_manager') estimatedH = 210;
+        if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
         if (n.id === 'portfolio') estimatedH = 240;
         if (n.id === 'executor') estimatedH = 160;
         if (n.data.kind === 'execution') estimatedH = 160;
