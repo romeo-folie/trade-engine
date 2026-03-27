@@ -227,12 +227,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       { id: 'portfolio', label: 'Portfolio', kind: 'execution', event_count: 0, last_event_at: undefined },
     ];
 
-    // Merge live metrics from backend into pipeline nodes.
+    // Merge live metrics and metadata from backend into pipeline nodes.
     const mergedPipeline = PIPELINE_NODES.map(pn => {
       const live = nodes.find(n => n.id === pn.id);
-      return live
-        ? { ...pn, event_count: live.event_count, last_event_at: live.last_event_at }
-        : pn;
+      if (!live) return pn;
+      return { 
+        ...pn, 
+        label: live.label || pn.label,
+        event_count: live.event_count, 
+        last_event_at: live.last_event_at,
+        meta: { ...(pn.meta ?? {}), ...(live.meta ?? {}) }
+      };
     });
 
     const allNodes = [...mergedPipeline];
