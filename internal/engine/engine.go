@@ -1221,6 +1221,49 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 	}
 }
 
+// resolveFallbackCandle selects the freshest available candle for a signal
+// price fallback, enforcing timeframe-specific recency windows.
+func resolveFallbackCandle(now time.Time, lookup func(tf data.Timeframe) (*data.Candle, error)) *data.Candle {
+	for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe1Day} {
+		latest, err := lookup(tf)
+		if err != nil || latest == nil {
+			continue
+		}
+		if latest.Close <= 0 {
+			continue
+		}
+		if !isFreshCandle(tf, latest.Timestamp, now) {
+			continue
+		}
+		return latest
+	}
+	return nil
+}
+
+func isFreshCandle(tf data.Timeframe, ts time.Time, now time.Time) bool {
+	maxAge := maxFallbackCandleAge(tf)
+	if maxAge <= 0 {
+		return false
+	}
+	age := now.Sub(ts)
+	return age >= 0 && age <= maxAge
+}
+
+func maxFallbackCandleAge(tf data.Timeframe) time.Duration {
+	switch tf {
+	case data.Timeframe5Min:
+		return 30 * time.Minute
+	case data.Timeframe15Min:
+		return 2 * time.Hour
+	case data.Timeframe1Hour:
+		return 6 * time.Hour
+	case data.Timeframe1Day:
+		return 48 * time.Hour
+	default:
+		return 0
+	}
+}
+
 // executeSignal places the order via the executor, creates a trade record, and
 // records the entry order.
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal) {
@@ -1233,14 +1276,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 	// Ensure signal price is populated before sizing/execution.
 	if sig.SignalPrice <= 0 {
-		for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe1Day} {
-			latest, err := store.GetLatestCandle(ctx, sig.Ticker, tf)
-			if err == nil && latest != nil && latest.Close > 0 {
-				sig.SignalPrice = latest.Close
-				if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
-					logger.Warn("update signal price", "id", sigID, "err", err)
-				}
-				break
+		if candle := resolveFallbackCandle(time.Now(), func(tf data.Timeframe) (*data.Candle, error) {
+			return store.GetLatestCandle(ctx, sig.Ticker, tf)
+		}); candle != nil {
+			sig.SignalPrice = candle.Close
+			if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+				logger.Warn("update signal price", "id", sigID, "err", err)
 			}
 		}
 	}

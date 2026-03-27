@@ -81,6 +81,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
 
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [nodes, setNodes] = useState<NodeState[]>([]);
+  const nodesRef = useRef<NodeState[]>([]);
   const [events, setEvents] = useState<IndexedWebEvent[]>([]);
   const seqRef = useRef(0);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
@@ -102,6 +103,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const shouldReconnectRef = useRef(true);
 
   useEffect(() => { pausedRef.current = paused; }, [paused]);
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
 
   // Rolling event-rate calculation.
   useEffect(() => {
@@ -206,7 +208,23 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
               ? JSON.parse(webEv.payload)
               : (webEv.payload as Record<string, unknown>);
             if (Array.isArray(p.votes)) {
-              setAnalystVotes(p.votes as AnalystVote[]);
+              const votes = p.votes as AnalystVote[];
+              setAnalystVotes(votes);
+              const nowTs = Date.now();
+              setNodeMetrics(prev => {
+                const next = { ...prev };
+                for (const vote of votes) {
+                  if (vote.skipped) continue;
+                  const node = nodesRef.current.find(n => n.label === vote.model);
+                  if (!node) continue;
+                  const existing = next[node.id] ?? { eventCount: 0, lastEventAt: null };
+                  next[node.id] = {
+                    eventCount: existing.eventCount + 1,
+                    lastEventAt: nowTs,
+                  };
+                }
+                return next;
+              });
             }
           } catch { /* ignore */ }
         }
