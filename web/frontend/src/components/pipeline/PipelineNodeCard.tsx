@@ -119,7 +119,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           <div className={`${styles.statusDot} ${statusDot}`} />
         </div>
 
-        <div className={styles.nodeTitle}>{d.label}</div>
+        {d.kind !== 'arbiter_final' && (
+          <div className={styles.nodeTitle}>{d.label}</div>
+        )}
 
         {/* ── Source Template ── */}
         {d.kind === 'source' && (
@@ -442,11 +444,11 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           </div>
         )}
 
-        {/* ── Arbiter Final Template ── */}
         {d.kind === 'arbiter_final' && (
           <div>
-            <div className={styles.nodeTitle}>Ensemble Resolver</div>
-            <div className={styles.subValue} style={{ marginTop: 4 }}>
+            <div className={styles.nodeTitle} style={{ color: accentColor || colors.amber }}>{d.label}</div>
+            <div className={styles.subValue} style={{ marginTop: 2 }}>Ensemble Resolver</div>
+            <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 4, opacity: 0.5 }}>
               RESOLVES DISSENT
             </div>
             <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
