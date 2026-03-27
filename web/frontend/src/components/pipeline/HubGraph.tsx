@@ -42,14 +42,14 @@ const EDGE_TYPES = { organic: OrganicEdge };
 
 // Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
 const COL = {
-  source:        60,
-  indicators:    460,
-  analysts:      860,
-  consensus:     1260,
-  arbiter:       1660,
+  source: 60,
+  indicators: 460,
+  analysts: 860,
+  consensus: 1260,
+  arbiter: 1660,
   risk:          2060,
   execution:     2460,
-  portfolio:     2960,
+  portfolio:     2800,
 };
 
 const CY = 400;
@@ -64,7 +64,7 @@ const EDGE_ACTIVE = colors.acidGreen;
 
 function getColumnX(nodeId: string, kind: string): number {
   // Priority 1: Specific node IDs for key pipeline stages
-  if (nodeId === 'consensus')        return COL.consensus;
+  if (nodeId === 'consensus') return COL.consensus;
   if (nodeId === 'arbiter_node')     return COL.arbiter;
   if (nodeId === 'risk_manager')     return COL.risk;
   if (nodeId === 'indicator_engine') return COL.indicators;
@@ -72,19 +72,19 @@ function getColumnX(nodeId: string, kind: string): number {
 
   // Priority 2: General kinds
   switch (kind) {
-    case 'source':    return COL.source;
-    case 'analyst':   return COL.analysts;
+    case 'source': return COL.source;
+    case 'analyst': return COL.analysts;
     case 'execution': return COL.execution;
-    default:          return COL.source;
+    default: return COL.source;
   }
 }
 
 function modelAccentColor(provider: string): string {
   switch (provider.toLowerCase()) {
     case 'anthropic': return colors.analystTechnical;
-    case 'openai':    return colors.analystMomentum;
-    case 'google':    return colors.analystSentiment;
-    default:          return colors.analystMacro;
+    case 'openai': return colors.analystMomentum;
+    case 'google': return colors.analystSentiment;
+    default: return colors.analystMacro;
   }
 }
 
@@ -100,7 +100,7 @@ interface HubGraphProps {
 interface Particle {
   id: string;
   fromX: number; fromY: number;
-  toX: number;   toY: number;
+  toX: number; toY: number;
   color: string;
   progress: number;
   speed: number;
@@ -181,13 +181,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // with ≥5 historical trades and would drop analysts that haven't fired enough yet.
     const baseAnalysts: NodeState[] = snapshotAnalystNodes.length > 0
       ? snapshotAnalystNodes.map(n => ({
-          id: n.id,
-          label: n.label,
-          kind: 'analyst' as const,
-          event_count: 0,
-          last_event_at: undefined,
-          meta: { provider: (n.meta?.provider as string) ?? '' },
-        }))
+        id: n.id,
+        label: n.label,
+        kind: 'analyst' as const,
+        event_count: 0,
+        last_event_at: undefined,
+        meta: { provider: (n.meta?.provider as string) ?? '' },
+      }))
       : [{ id: 'llm_analysis', label: 'LLM Analysis', kind: 'analyst' as const, event_count: 0, last_event_at: undefined }];
 
     // Overlay performance data from modelEnsemble where available (matched by model label).
@@ -204,21 +204,21 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // Pipeline nodes with real backend IDs mapped to visual stages.
     const PIPELINE_NODES: NodeState[] = [
       // Sources (col 0)
-      { id: 'alpaca',           label: 'Alpaca Feed',       kind: 'source',        event_count: 0, last_event_at: undefined },
-      { id: 'news_api',         label: nodes.find(n => n.id === 'news_api')?.label ?? 'News Feed', kind: 'source', event_count: 0, last_event_at: undefined },
+      { id: 'alpaca', label: 'Alpaca Feed', kind: 'source', event_count: 0, last_event_at: undefined },
+      { id: 'news_api', label: nodes.find(n => n.id === 'news_api')?.label ?? 'News Feed', kind: 'source', event_count: 0, last_event_at: undefined },
       // Arbiter (col 1)
-      { id: 'indicator_engine', label: 'Indicator Engine',  kind: 'arbiter',       event_count: 0, last_event_at: undefined },
+      { id: 'indicator_engine', label: 'Indicator Engine', kind: 'arbiter', event_count: 0, last_event_at: undefined },
       // Analyst (col 2) — dynamic
       ...analystNodes,
       // Consensus (col 3)
-      { id: 'consensus',        label: 'Consensus',         kind: 'synthesis',     event_count: 0, last_event_at: undefined },
+      { id: 'consensus', label: 'Consensus', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Arbiter Final (col 4) — handles dissent
-      { id: 'arbiter_node',     label: 'Ensemble Arbiter',  kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
+      { id: 'arbiter_node', label: 'Ensemble Arbiter', kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
       // Risk Manager (col 5)
-      { id: 'risk_manager',     label: 'Risk Manager',      kind: 'synthesis',     event_count: 0, last_event_at: undefined },
+      { id: 'risk_manager', label: 'Risk Manager', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Execution (col 6)
-      { id: 'executor',         label: 'Executor',          kind: 'execution',     event_count: 0, last_event_at: undefined },
-      { id: 'portfolio',        label: 'Portfolio',         kind: 'execution',     event_count: 0, last_event_at: undefined },
+      { id: 'executor', label: 'Executor', kind: 'execution', event_count: 0, last_event_at: undefined },
+      { id: 'portfolio', label: 'Portfolio', kind: 'execution', event_count: 0, last_event_at: undefined },
     ];
 
     // Merge live metrics from backend into pipeline nodes.
@@ -239,35 +239,44 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     }
 
     return allNodes.map((n) => {
-      // Grouping logic for vertical stacking
-      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager') ? n.id : n.kind;
+      // Grouping logic for vertical stacking. 
+      // Singletons on the central path (Consensus, Risk, Executor, Portfolio) stay isolated and centered.
+      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') ? n.id : n.kind;
       const group = allNodes.filter(an => {
-        const ak = (an.id === 'consensus' || an.id === 'risk_manager') ? an.id : an.kind;
+        const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') ? an.id : an.kind;
         return ak === groupKey;
       });
 
       // Layout coordinates (center-to-center symmetry)
       const groupGap = n.kind === 'analyst' ? 180 : 260;
       const groupIdx = group.findIndex(gn => gn.id === n.id);
-      
+
       const x = getColumnX(n.id, n.kind);
-      
+
       // Variable height estimation for centering (Data-backed from CSS + Content)
       let estimatedH = NODE_H;
-      if (n.id === 'consensus') estimatedH = 184;
-      if (n.id === 'risk_manager') estimatedH = 222;
-      if (n.id === 'portfolio') estimatedH = 222;
-      if (n.id === 'executor') estimatedH = 190;
-      if (n.kind === 'execution') estimatedH = 190;
+      if (n.id === 'consensus') estimatedH = 180;
+      if (n.id === 'risk_manager') estimatedH = 210;
+      if (n.id === 'portfolio') estimatedH = 240;
+      if (n.id === 'executor') estimatedH = 160;
+      if (n.kind === 'execution') estimatedH = 160;
       if (n.kind === 'analyst') estimatedH = 160;
 
       // Center the whole group vertically around CY
       let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
 
-      // Arbiter offset to clarify bypass path: move it up so the straight path 
-      // from Consensus to Risk Manager is visible beneath it.
+      // Arbiter offset to clarify bypass path
       if (n.id === 'arbiter_node') {
         y -= 220;
+      }
+
+      // Execution phase stagger as per desired layout: 
+      // Risk (Center) -> Executor (Down) -> Portfolio (Up)
+      if (n.id === 'executor') {
+        y += 100;
+      }
+      if (n.id === 'portfolio') {
+        y -= 150;
       }
 
       const metrics = nodeMetrics[n.id] ?? null;
@@ -330,7 +339,6 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
     const analystIds = rfNodes.filter(n => n.data.kind === 'analyst').map(n => n.id);
     const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
-    // analysis removed executionIds from main loop, removing its usage here too
 
     const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean; activeOverride?: boolean }) => {
       const active = opts?.activeOverride !== undefined 
@@ -342,19 +350,19 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         target: tgt,
         style: active
           ? {
-              stroke: EDGE_ACTIVE,
-              strokeWidth: 1,
-              strokeDasharray: '5 5',
-              animation: 'edge-dash 0.5s linear infinite',
-              opacity: 1,
-            }
+            stroke: EDGE_ACTIVE,
+            strokeWidth: 1,
+            strokeDasharray: '5 5',
+            animation: 'edge-dash 0.5s linear infinite',
+            opacity: 1,
+          }
           : {
-              stroke: colors.textFaint,
-              strokeWidth: 1,
-              strokeDasharray: '',
-              animation: '',
-              opacity: 0.55,
-            },
+            stroke: colors.textFaint,
+            strokeWidth: 1,
+            strokeDasharray: '',
+            animation: '',
+            opacity: 0.55,
+          },
         data: {
           active,
         },
@@ -445,37 +453,54 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       prevSignatures.current[nodeId] = sig;
 
       // Find the edge(s) this node is a source of
-        const outgoingEdges = rfE.filter(e => e.source === nodeId);
-        outgoingEdges.forEach(edge => {
-          const src = rfNodeMap.get(edge.source);
-          const tgt = rfNodeMap.get(edge.target);
-          if (!src || !tgt) return;
+      const outgoingEdges = rfE.filter(e => e.source === nodeId);
+      outgoingEdges.forEach(edge => {
+        const src = rfNodeMap.get(edge.source);
+        const tgt = rfNodeMap.get(edge.target);
+        if (!src || !tgt) return;
 
           const getEstimatedH = (id: string, kind: string) => {
-            if (id === 'consensus') return 184;
-            if (id === 'risk_manager') return 222;
-            if (id === 'portfolio') return 222;
-            if (id === 'executor') return 190;
-            if (kind === 'execution') return 190;
+            if (id === 'consensus') return 180;
+            if (id === 'risk_manager') return 210;
+            if (id === 'portfolio') return 240;
+            if (id === 'executor') return 160;
+            if (kind === 'execution') return 160;
             if (kind === 'analyst') return 160;
             return NODE_H;
           };
 
-          const srcH = getEstimatedH(src.id, src.data.kind);
-          const tgtH = getEstimatedH(tgt.id, tgt.data.kind);
+        const srcH = getEstimatedH(src.id, src.data.kind);
+        const tgtH = getEstimatedH(tgt.id, tgt.data.kind);
 
-          particlesRef.current.push({
-            id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
-            fromX: src.position.x + NODE_W,
-            fromY: src.position.y + srcH / 2,
-            toX: tgt.position.x,
-            toY: tgt.position.y + tgtH / 2,
-            color: particleColor(sig.type),
-            progress: 0,
-            speed: 0.0008 + Math.random() * 0.0004,
-            bezierIntensity: 0.8, // Match OrganicEdge
-          });
+        // Recalculate positions with the same offsets used in the node mapping
+        let fromY = src.position.y + srcH / 2;
+        if (src.id === 'executor') {
+          fromY += 100;
+        }
+        if (src.id === 'portfolio') {
+          fromY -= 150;
+        }
+
+        let toY = tgt.position.y + tgtH / 2;
+        if (tgt.id === 'executor') {
+          toY += 100;
+        }
+        if (tgt.id === 'portfolio') {
+          toY -= 150;
+        }
+
+        particlesRef.current.push({
+          id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
+          fromX: src.position.x + NODE_W,
+          fromY,
+          toX: tgt.position.x,
+          toY,
+          color: particleColor(sig.type),
+          progress: 0,
+          speed: 0.0008 + Math.random() * 0.0004,
+          bezierIntensity: 0.8, // Match OrganicEdge
         });
+      });
     }
   }, [recentEventSignatures, rfNodes, rfE]);
 
@@ -498,7 +523,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
     particlesRef.current = particlesRef.current.filter(p => {
       p.progress = Math.min(1, p.progress + p.speed * dt);
-      
+
       const t = p.progress;
       const xStart = p.fromX;
       const yStart = p.fromY;
@@ -512,8 +537,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       const cp2Y = yEnd;
 
       // Calculate path (Cubic Bezier)
-      const xRaw = Math.pow(1-t, 3)*xStart + 3*Math.pow(1-t, 2)*t*cp1X + 3*(1-t)*Math.pow(t, 2)*cp2X + Math.pow(t, 3)*xEnd;
-      const yRaw = Math.pow(1-t, 3)*yStart + 3*Math.pow(1-t, 2)*t*cp1Y + 3*(1-t)*Math.pow(t, 2)*cp2Y + Math.pow(t, 3)*yEnd;
+      const xRaw = Math.pow(1 - t, 3) * xStart + 3 * Math.pow(1 - t, 2) * t * cp1X + 3 * (1 - t) * Math.pow(t, 2) * cp2X + Math.pow(t, 3) * xEnd;
+      const yRaw = Math.pow(1 - t, 3) * yStart + 3 * Math.pow(1 - t, 2) * t * cp1Y + 3 * (1 - t) * Math.pow(t, 2) * cp2Y + Math.pow(t, 3) * yEnd;
 
       const x = xRaw * vp.zoom + vp.x;
       const y = yRaw * vp.zoom + vp.y;
@@ -544,19 +569,39 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         groups[n.data.kind].push(n);
       }
       return currentNodes.map(n => {
-        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager') ? n.id : n.data.kind;
+        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') ? n.id : n.data.kind;
         const group = currentNodes.filter(an => {
-          const ak = (an.id === 'consensus' || an.id === 'risk_manager') ? an.id : an.data.kind;
+          const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') ? an.id : an.data.kind;
           return ak === groupKey;
         });
+
+        // Variable height estimation for centering (Data-backed from CSS + Content)
+        let estimatedH = NODE_H;
+        if (n.id === 'consensus') estimatedH = 180;
+        if (n.id === 'risk_manager') estimatedH = 210;
+        if (n.id === 'portfolio') estimatedH = 240;
+        if (n.id === 'executor') estimatedH = 160;
+        if (n.data.kind === 'execution') estimatedH = 160;
+        if (n.data.kind === 'analyst') estimatedH = 160;
 
         const groupGap = n.data.kind === 'analyst' ? 180 : 260;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         const x = getColumnX(n.id, n.data.kind);
-        let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (NODE_H / 2);
+        
+        // Center vertically around CY
+        let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
 
+        // Arbiter offset to clarify bypass path
         if (n.id === 'arbiter_node') {
           y -= 220;
+        }
+
+        // Execution phase stagger: Risk (Center) -> Executor (Down) -> Portfolio (Up)
+        if (n.id === 'executor') {
+          y += 100;
+        }
+        if (n.id === 'portfolio') {
+          y -= 150;
         }
 
         return { ...n, position: { x, y } };
