@@ -45,6 +45,7 @@
   /* ── Typography ─────────────────────────────────────────────────────── */
   --font-mono:      'JetBrains Mono', 'Fira Code', monospace;
   --font-sans:      'Space Grotesk', system-ui, sans-serif;
+  --font-display:   'Orbitron', 'Space Grotesk', sans-serif;
 
   --font-size-xs:   0.625rem;   /* 10px — micro labels */
   --font-size-sm:   0.6875rem;  /* 11px — secondary data */

@@ -1,4 +1,5 @@
 import { memo, useMemo } from 'react';
+import { motion } from 'framer-motion';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import EnsembleConsensus from './EnsembleConsensus';
@@ -260,34 +261,46 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               })()
             ) : (
               (() => {
+                const PROVIDER_CONFIG = [
+                  { id: 'openai', label: 'GPT', color: colors.analystMomentum },
+                  { id: 'anthropic', label: 'ANTH', color: colors.analystTechnical },
+                  { id: 'google', label: 'GEMI', color: colors.analystSentiment },
+                ];
+
                 const ac = d.analystConsensus as Record<string, AnalystConsensusEntry> | undefined;
-                const PROVIDER_COLORS: Record<string, string> = {
-                  anthropic: colors.analystTechnical,
-                  openai: colors.analystMomentum,
-                  google: colors.analystSentiment,
-                };
-                const entries = ac ? Object.entries(ac) : [];
-                const items = entries.map(([key, v]) => ({
-                  label: key.slice(0, 4).toUpperCase(),
-                  value: v.confidence,
-                  color: PROVIDER_COLORS[v.provider?.toLowerCase()] ?? colors.analystMacro,
-                }));
-                // Derive consensus verdict from majority
-                const buys = entries.filter(([, v]) => v.verdict?.toUpperCase() === 'BUY').length;
-                const sells = entries.filter(([, v]) => v.verdict?.toUpperCase() === 'SELL').length;
+                const av = d.analystVotes as { model: string; provider: string; skipped: boolean }[] | undefined;
+                
+                const items = PROVIDER_CONFIG.map(conf => {
+                  const entry = ac ? Object.values(ac).find(v => v.provider?.toLowerCase() === conf.id) : null;
+                  const vote = av ? av.find(v => v.provider?.toLowerCase() === conf.id) : null;
+                  const isConsulted = vote ? !vote.skipped : false;
+                  
+                  return {
+                    label: conf.label,
+                    value: entry?.confidence,
+                    color: conf.color,
+                    isLoading: isConsulted && !entry && nodeActive,
+                  };
+                });
+                
+                const entries = ac ? Object.values(ac) : [];
+                const buys = entries.filter(v => v.verdict?.toUpperCase() === 'BUY').length;
+                const sells = entries.filter(v => v.verdict?.toUpperCase() === 'SELL').length;
                 const consensusVerdict = entries.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
                 const avgConf = entries.length > 0
-                  ? entries.reduce((sum, [, v]) => sum + v.confidence, 0) / entries.length
+                  ? entries.reduce((sum, v) => sum + v.confidence, 0) / entries.length
                   : 0;
+                
                 const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
                   : consensusVerdict === 'SHORT' ? styles.verdictShort
                   : styles.verdictNeutral;
+                  
                 return (
                   <>
                     <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
                     <EnsembleConsensus items={items} />
                     <div className={`${styles.analystVerdict} ${consensusVerdict ? verdictCls : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
-                      {consensusVerdict ? <>{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : '—'}
+                      {consensusVerdict ? <>{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : (nodeActive ? 'CONSULTING...' : '—')}
                     </div>
                   </>
                 );
@@ -463,24 +476,31 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
     );
   }
 
-  // Duration scales with list length so speed stays constant (~30px/s per ticker)
-  const duration = Math.max(tickers.length * 1.8, 6);
-  // Duplicate for seamless loop
-  const doubled = [...tickers, ...tickers];
+  // Duplicate for seamless 50% loop
+  const items = useMemo(() => [...tickers, ...tickers], [tickers]);
+  // Speed — scale duration by set length (e.g. 2.5s per ticker)
+  const duration = useMemo(() => Math.max(tickers.length * 2.5, 10), [tickers.length]);
 
   return (
     <div className={styles.tickerPillsWrapper}>
       <div className={styles.tickerPillsLabel}>WATCHING</div>
-      <div
+      <motion.div
         className={styles.tickerPillsTrack}
-        style={{ ['--marquee-duration' as string]: `${duration}s` }}
+        animate={{ x: [0, "-50%"] }}
+        transition={{
+          duration: duration,
+          ease: "linear",
+          repeat: Infinity,
+        }}
+        // Force GPU acceleration to prevent subpixel jitter
+        style={{ translateZ: 0 }}
       >
-        {doubled.map((t, i) => (
+        {items.map((t, i) => (
           <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>
             {t.ticker}
           </span>
         ))}
-      </div>
+      </motion.div>
     </div>
   );
 }

@@ -52,12 +52,12 @@
 /* ── Page title ───────────────────────────────────────────────────────────── */
 
 .pageTitle {
-  font-family: var(--font-sans);
+  font-family: var(--font-display);
   font-size: var(--font-size-2xl);
-  font-weight: 700;
+  font-weight: 900;
   color: var(--text-primary);
   margin: 0 var(--space-6) var(--space-4) var(--space-6);
-  letter-spacing: 0.02em;
+  letter-spacing: 0.05em;
 }
 
 /* ── Content ── */

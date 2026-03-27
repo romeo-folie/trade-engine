@@ -106,14 +106,16 @@ const COLUMNS: Column<Signal>[] = [
       let bg = 'transparent';
       let text = 'var(--text-primary)';
 
-      if (status === 'pending') { color = colors.analystMomentum; bg = 'rgba(245, 158, 11, 0.1)'; text = colors.analystMomentum; }
+      if (status === 'pending') { color = colors.amber; bg = 'rgba(245, 158, 11, 0.1)'; text = colors.amber; }
       else if (status === 'approved') { color = colors.acidGreen; bg = 'transparent'; text = colors.acidGreen; }
       else if (status === 'executed') { color = colors.acidGreen; bg = colors.acidGreen; text = '#0D0D11'; }
       else if (status === 'blocked') { color = colors.red; bg = 'rgba(239, 68, 68, 0.15)'; text = colors.red; }
+      else if (status === 'expired') { color = colors.textDim; bg = 'transparent'; text = 'var(--text-dim)'; }
 
       return (
         <ChamferedBox
           chamfer={4}
+          centerContent
           backgroundColor={bg}
           borderColor={color}
           style={{ width: 80, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '2px 0' }}
@@ -277,6 +279,7 @@ export default function SignalsScreen() {
               <ChamferedBox
                 key={tab || 'all'}
                 chamfer={4}
+                centerContent
                 backgroundColor={isActive ? colors.acidGreen : 'transparent'}
                 borderColor={isActive ? colors.acidGreen : 'var(--border)'}
                 onClick={() => setStatusFilter(tab)}

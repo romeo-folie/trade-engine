@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react';
 import type { AnalysisRecord } from '../../screens/Analysis';
+import { ChamferedBox } from '../common/ChamferedBox';
+import { colors } from '../../styles/tokens';
 import styles from './AnalysisModal.module.css';
 
 interface AnalysisModalProps {
@@ -7,11 +9,11 @@ interface AnalysisModalProps {
   onClose: () => void;
 }
 
-function actionClass(action: string): string {
+function actionColors(action: string) {
   const a = action.toUpperCase();
-  if (a === 'BUY') return styles.badgeBuy;
-  if (a === 'SELL') return styles.badgeSell;
-  return styles.badgeHold;
+  if (a === 'BUY') return colors.acidGreen;
+  if (a === 'SELL') return colors.red;
+  return colors.amber;
 }
 
 function confClass(action: string): string {
@@ -92,9 +94,22 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div className={styles.headerLeft}>
             <div className={styles.headerTopRow}>
               <span className={styles.title}>{analysis.Ticker}</span>
-              <span className={`${styles.badge} ${actionClass(analysis.Action)}`}>
-                {action}
-              </span>
+              <ChamferedBox
+                chamfer={6}
+                centerContent
+                backgroundColor={actionColors(analysis.Action)}
+                borderColor={actionColors(analysis.Action)}
+                style={{
+                  padding: '2px 10px',
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+              >
+                <span className={styles.badgeText}>
+                  {action}
+                </span>
+              </ChamferedBox>
             </div>
             <span className={styles.headerMeta}>
               {fmtDateTime(analysis.CreatedAt)} · {analysis.Strategy.replace(/_/g, ' ')} · {analysis.ModelProvider} / {analysis.ModelName}
@@ -131,7 +146,20 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
             <div className={styles.kvList}>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Action</span>
-                <span className={`${styles.kvBadge} ${actionClass(analysis.Action)}`}>{action}</span>
+                <ChamferedBox
+                  chamfer={4}
+                  centerContent
+                  backgroundColor={actionColors(analysis.Action)}
+                  borderColor={actionColors(analysis.Action)}
+                  style={{
+                    padding: '1px 8px',
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    justifyContent: 'center'
+                  }}
+                >
+                  <span className={styles.kvBadgeText}>{action}</span>
+                </ChamferedBox>
               </div>
               <div className={styles.kvRow}>
                 <span className={styles.kvKey}>Stop Loss</span>

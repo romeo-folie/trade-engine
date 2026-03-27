@@ -13,8 +13,9 @@ import { colors, typography } from '../../styles/tokens';
 
 interface ConsensusItem {
   label: string;
-  value: number; // 0–1
+  value?: number; // 0–1, optional if loading
   color: string;
+  isLoading?: boolean;
 }
 
 interface EnsembleConsensusProps {
@@ -27,10 +28,9 @@ function AnimatedBar({ item, index }: { item: ConsensusItem; index: number }) {
   const prevValue = useRef(-1);
 
   useEffect(() => {
-    if (item.value === prevValue.current) return;
+    if (item.value === undefined || item.value === prevValue.current) return;
     prevValue.current = item.value;
-    // Small delay so React paints the 0-width state first, giving the transition something to animate from.
-    const id = setTimeout(() => setWidth(item.value * 100), 30 + index * 60);
+    const id = setTimeout(() => setWidth(item.value! * 100), 30 + index * 60);
     return () => clearTimeout(id);
   }, [item.value, index]);
 
@@ -54,26 +54,40 @@ function AnimatedBar({ item, index }: { item: ConsensusItem; index: number }) {
         position: 'relative',
         overflow: 'hidden',
       }}>
-        <div style={{
-          position: 'absolute',
-          left: 0,
-          top: 0,
-          bottom: 0,
-          width: `${width}%`,
-          background: item.color,
-          boxShadow: `0 0 4px ${item.color}66`,
-          transition: 'width 0.6s cubic-bezier(0.16, 1, 0.3, 1)',
-        }} />
+        {item.isLoading ? (
+          <div 
+            className="consensus-pulse"
+            style={{
+              position: 'absolute',
+              height: '100%',
+              width: '40%',
+              background: `linear-gradient(90deg, transparent, ${item.color}44, transparent)`,
+              left: '-40%',
+            }}
+          />
+        ) : (
+          <div style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: `${width}%`,
+            background: item.color,
+            boxShadow: `0 0 4px ${item.color}66`,
+            transition: 'width 0.6s cubic-bezier(0.16, 1, 0.3, 1)',
+          }} />
+        )}
       </div>
       <span style={{
         fontFamily: typography.mono,
         fontSize: 8,
-        color: colors.textDim,
+        color: item.isLoading ? colors.textFaint : colors.textDim,
         width: 24,
         textAlign: 'right',
         flexShrink: 0,
+        opacity: item.isLoading ? 0.3 : 1,
       }}>
-        {Math.round(item.value * 100)}%
+        {item.isLoading ? '...' : `${Math.round((item.value || 0) * 100)}%`}
       </span>
     </div>
   );

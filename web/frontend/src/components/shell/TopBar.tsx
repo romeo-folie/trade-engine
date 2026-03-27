@@ -32,18 +32,18 @@ export default function TopBar({ status, version }: TopBarProps) {
       zIndex: 'var(--z-topbar)',
     }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-        <span style={{ 
-          color: colors.acidGreen, 
-          fontFamily: typography.mono, 
-          fontWeight: 700, 
-          fontSize: 14,
-          letterSpacing: '0.05em'
+        <span style={{
+          color: colors.acidGreen,
+          fontFamily: typography.display,
+          fontWeight: 800,
+          fontSize: 16,
+          letterSpacing: '0.15em'
         }}>
-          TRADEENGINE
+          TRADE-ENGINE
         </span>
-        <span style={{ 
-          color: colors.textDim, 
-          fontFamily: typography.mono, 
+        <span style={{
+          color: colors.textDim,
+          fontFamily: typography.mono,
           fontSize: 11,
           marginTop: 1
         }}>
@@ -52,29 +52,29 @@ export default function TopBar({ status, version }: TopBarProps) {
       </div>
 
       <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
-        <div style={{ 
-          display: 'flex', 
-          alignItems: 'center', 
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
           gap: 8,
           fontSize: 11,
           fontFamily: typography.mono,
         }}>
-           <span style={{ color: colors.textDim }}>{clock}</span>
-           <div style={{ 
-             background: status === 'connected' ? colors.emerald : colors.red,
-             color: colors.canvas,
-             padding: '1px 6px',
-             borderRadius: 2,
-             fontSize: 9,
-             fontWeight: 700
-           }}>
-             {status === 'connected' ? 'LIVE' : 'CLOSED'}
-           </div>
-           <div style={{ 
-             width: 6, height: 6, borderRadius: '50%', 
-             background: status === 'connected' ? colors.acidGreen : colors.textDim,
-             boxShadow: status === 'connected' ? `0 0 6px ${colors.acidGreen}` : 'none'
-           }} />
+          <span style={{ color: colors.textDim }}>{clock}</span>
+          <div style={{
+            background: status === 'connected' ? colors.emerald : colors.red,
+            color: colors.canvas,
+            padding: '1px 6px',
+            borderRadius: 2,
+            fontSize: 9,
+            fontWeight: 700
+          }}>
+            {status === 'connected' ? 'LIVE' : 'CLOSED'}
+          </div>
+          <div style={{
+            width: 6, height: 6, borderRadius: '50%',
+            background: status === 'connected' ? colors.acidGreen : colors.textDim,
+            boxShadow: status === 'connected' ? `0 0 6px ${colors.acidGreen}` : 'none'
+          }} />
         </div>
       </div>
     </header>

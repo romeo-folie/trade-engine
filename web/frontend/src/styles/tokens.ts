@@ -43,4 +43,5 @@ export const TOKENS = colors;
 export const typography = {
   mono: '"JetBrains Mono", monospace',
   sans: '"Space Grotesk", sans-serif',
+  display: '"Orbitron", sans-serif',
 };

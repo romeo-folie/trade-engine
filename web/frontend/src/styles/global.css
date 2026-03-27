@@ -1,3 +1,5 @@
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400..900&display=swap');
+
 /* Space Grotesk — self-hosted variable font (no external CDN dependency) */
 @font-face {
   font-family: 'Space Grotesk';
@@ -128,10 +130,17 @@ a:hover {
 }
 
 @keyframes edge-dash {
-  from {
-    stroke-dashoffset: 10;
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
+  from { stroke-dashoffset: 10; }
+  to { stroke-dashoffset: 0; }
+}
+
+@keyframes consensus-pulse {
+  0%   { left: -100%; opacity: 0; }
+  20%  { opacity: 1; }
+  80%  { opacity: 1; }
+  100% { left: 250%; opacity: 0; }
+}
+
+.consensus-pulse {
+  animation: consensus-pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }

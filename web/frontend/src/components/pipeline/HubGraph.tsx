@@ -38,14 +38,15 @@ import styles from './HubGraph.module.css';
 
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 
-// Column X-offsets — 40px gap between card edges (NODE_W=280)
+// Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
 const COL = {
   source:        60,
-  arbiter:       440,   // 60 + 280 + 100
-  analyst:       820,   // 440 + 280 + 100
-  synthesis:     1200,  // 820 + 280 + 100
-  arbiter_final: 1580,  // 1200 + 280 + 100
-  execution:     1960,  // 1580 + 280 + 100
+  indicators:    460,
+  analysts:      860,
+  consensus:     1260,
+  arbiter:       1660,
+  risk:          2060,
+  execution:     2460,
 };
 
 const CY = 400;
@@ -58,15 +59,20 @@ const EDGE_ACTIVE = colors.acidGreen;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function getColumnX(kind: string): number {
-  if (kind === 'source') return COL.source;
-  if (kind === 'arbiter') return COL.arbiter;
-  if (kind === 'ticker') return COL.source;
-  if (kind.includes('analyst')) return COL.analyst;
-  if (kind === 'synthesis') return COL.synthesis;
-  if (kind === 'arbiter_final') return COL.arbiter_final;
-  if (kind === 'execution') return COL.execution;
-  return COL.source;
+function getColumnX(nodeId: string, kind: string): number {
+  // Priority 1: Specific node IDs for key pipeline stages
+  if (nodeId === 'consensus')        return COL.consensus;
+  if (nodeId === 'arbiter_node')     return COL.arbiter;
+  if (nodeId === 'risk_manager')     return COL.risk;
+  if (nodeId === 'indicator_engine') return COL.indicators;
+
+  // Priority 2: General kinds
+  switch (kind) {
+    case 'source':    return COL.source;
+    case 'analyst':   return COL.analysts;
+    case 'execution': return COL.execution;
+    default:          return COL.source;
+  }
 }
 
 function modelAccentColor(provider: string): string {
@@ -190,7 +196,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       };
     });
 
-    // Pipeline nodes with real backend IDs mapped to visual kinds.
+    // Pipeline nodes with real backend IDs mapped to visual stages.
     const PIPELINE_NODES: NodeState[] = [
       // Sources (col 0)
       { id: 'alpaca',           label: 'Alpaca Feed',       kind: 'source',        event_count: 0, last_event_at: undefined },
@@ -199,13 +205,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       { id: 'indicator_engine', label: 'Indicator Engine',  kind: 'arbiter',       event_count: 0, last_event_at: undefined },
       // Analyst (col 2) — dynamic
       ...analystNodes,
-      // Synthesis (col 3)
+      // Consensus (col 3)
       { id: 'consensus',        label: 'Consensus',         kind: 'synthesis',     event_count: 0, last_event_at: undefined },
-      // Arbiter Final (col 3.5) — new
-      { id: 'arbiter_node',     label: 'Arbiter',           kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
-      // Synthesis (col 3 continued)
+      // Arbiter Final (col 4) — handles dissent
+      { id: 'arbiter_node',     label: 'Ensemble Arbiter',  kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
+      // Risk Manager (col 5)
       { id: 'risk_manager',     label: 'Risk Manager',      kind: 'synthesis',     event_count: 0, last_event_at: undefined },
-      // Execution (col 4)
+      // Execution (col 6)
       { id: 'executor',         label: 'Executor',          kind: 'execution',     event_count: 0, last_event_at: undefined },
       { id: 'portfolio',        label: 'Portfolio',         kind: 'execution',     event_count: 0, last_event_at: undefined },
     ];
@@ -228,13 +234,26 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     }
 
     return allNodes.map((n) => {
-      const group = kindGroups[n.kind] || [n];
-      // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
-      const groupGap = n.kind === 'synthesis' ? 320 : 200;
-      const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
+      // Grouping logic for vertical stacking
+      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager') ? n.id : n.kind;
+      const group = allNodes.filter(an => {
+        const ak = (an.id === 'consensus' || an.id === 'risk_manager') ? an.id : an.kind;
+        return ak === groupKey;
+      });
+
+      // Layout coordinates (center-to-center symmetry)
+      const groupGap = n.kind === 'analyst' ? 180 : 260;
       const groupIdx = group.findIndex(gn => gn.id === n.id);
-      const x = getColumnX(n.kind);
-      const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
+      
+      const x = getColumnX(n.id, n.kind);
+      // Center the whole group vertically around CY
+      let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (NODE_H / 2);
+
+      // Arbiter offset to clarify bypass path: move it up so the straight path 
+      // from Consensus to Risk Manager is visible beneath it.
+      if (n.id === 'arbiter_node') {
+        y -= 220;
+      }
 
       const metrics = nodeMetrics[n.id] ?? null;
       const liveLastEventAt = metrics?.lastEventAt
@@ -271,7 +290,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
           // Live pipeline data
-          ...(n.id === 'consensus' ? { analystConsensus } : {}),
+          ...(n.id === 'consensus' ? { analystConsensus, analystVotes } : {}),
           ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
           ...(n.id === 'executor' ? { lastTrade } : {}),
           ...(n.id === 'portfolio' ? { portfolioState } : {}),
@@ -465,13 +484,21 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         groups[n.data.kind].push(n);
       }
       return currentNodes.map(n => {
-        const group = groups[n.data.kind] || [n];
-        // synthesis needs extra vertical gap so arbiter_final can sit between consensus and risk_manager
-        const groupGap = n.data.kind === 'synthesis' ? 320 : 200;
-        const groupStartY = CY - ((group.length - 1) * groupGap) / 2;
+        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager') ? n.id : n.data.kind;
+        const group = currentNodes.filter(an => {
+          const ak = (an.id === 'consensus' || an.id === 'risk_manager') ? an.id : an.data.kind;
+          return ak === groupKey;
+        });
+
+        const groupGap = n.data.kind === 'analyst' ? 180 : 260;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
-        const x = getColumnX(n.data.kind);
-        const y = group.length > 1 ? groupStartY + groupIdx * groupGap : CY - NODE_H / 2;
+        const x = getColumnX(n.id, n.data.kind);
+        let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (NODE_H / 2);
+
+        if (n.id === 'arbiter_node') {
+          y -= 220;
+        }
+
         return { ...n, position: { x, y } };
       });
     });
