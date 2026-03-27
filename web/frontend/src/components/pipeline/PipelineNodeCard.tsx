@@ -45,8 +45,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
     // Trades/positions are infrequent — a recency gate would show IDLE immediately
     // after the 5s window even though the last trade data is still displayed.
     if (d.kind === 'execution') {
-      if (d.nodeId === 'executor') return !!(d.lastTrade as LastTrade | undefined);
-      if (d.nodeId === 'portfolio') return !!(d.portfolioState as PortfolioState | undefined);
+      const allPassed = (d.allRiskPassed as boolean | undefined) !== false;
+      if (d.nodeId === 'executor') return !!(d.lastTrade as LastTrade | undefined) && allPassed;
+      if (d.nodeId === 'portfolio') return !!(d.portfolioState as PortfolioState | undefined) && allPassed;
     }
     if (!d.lastEventAt) return false;
     const ms = typeof d.lastEventAt === 'string' ? new Date(d.lastEventAt).getTime() : d.lastEventAt;
@@ -104,7 +105,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
     <ChamferedBox
       isActive={false}
       borderColor={cardBorder}
-      className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''} ${isTicker ? styles.tickerCard : ''}`}
+      className={`${styles.cardBase} ${isBypassed ? styles.inactive : ''} ${isTicker ? styles.tickerCard : ''} ${d.nodeId === 'risk_manager' ? styles.riskCard : ''}`}
       style={{ cursor: 'pointer' }}
     >
       <div onClick={() => d.onNodeClick(d.nodeId)} className={styles.cardInner}>
@@ -118,7 +119,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           <div className={`${styles.statusDot} ${statusDot}`} />
         </div>
 
-        <div className={styles.nodeTitle}>{d.label}</div>
+        {d.kind !== 'arbiter_final' && (
+          <div className={styles.nodeTitle}>{d.label}</div>
+        )}
 
         {/* ── Source Template ── */}
         {d.kind === 'source' && (
@@ -363,8 +366,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                           </div>
                         </div>
                       </div>
-                      <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center', marginTop: 6 }}>
-                        TRACKING
+                      <div className={d.allRiskPassed !== false ? styles.executionBadge : styles.executionBadgeIdle} style={{ width: '100%', textAlign: 'center', marginTop: 6 }}>
+                        {d.allRiskPassed !== false ? 'TRACKING' : 'IDLE'}
                       </div>
                     </>
                   );
@@ -410,8 +413,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                         </div>
                       </div>
                     </div>
-                    <div className={styles.executionBadge} style={{ width: '100%', textAlign: 'center' }}>
-                      {trade ? 'EXECUTING' : 'READY'}
+                    <div className={trade && (d.allRiskPassed !== false) ? styles.executionBadge : styles.executionBadgeIdle} style={{ width: '100%', textAlign: 'center' }}>
+                      {trade && (d.allRiskPassed !== false) ? 'EXECUTING' : 'READY'}
                     </div>
                   </>
                 );
@@ -441,11 +444,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           </div>
         )}
 
-        {/* ── Arbiter Final Template ── */}
         {d.kind === 'arbiter_final' && (
           <div>
-            <div className={styles.nodeTitle}>Ensemble Resolver</div>
-            <div className={styles.subValue} style={{ marginTop: 4 }}>
+            <div className={styles.nodeTitle} style={{ color: accentColor || colors.amber }}>
+              {((d.meta as Record<string, unknown>)?.model as string) || (d.label && d.label !== 'Arbiter' && d.label !== '-' ? d.label : '-')}
+            </div>
+            <div className={styles.subValue} style={{ marginTop: 2 }}>Ensemble Resolver</div>
+            <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 4, opacity: 0.5 }}>
               RESOLVES DISSENT
             </div>
             <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>

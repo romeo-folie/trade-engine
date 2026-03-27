@@ -47,9 +47,9 @@ const COL = {
   analysts: 860,
   consensus: 1260,
   arbiter: 1660,
-  risk:          2060,
-  execution:     2460,
-  portfolio:     2800,
+  risk: 2060,
+  execution: 2460,
+  portfolio: 2800,
 };
 
 const CY = 400;
@@ -65,10 +65,10 @@ const EDGE_ACTIVE = colors.acidGreen;
 function getColumnX(nodeId: string, kind: string): number {
   // Priority 1: Specific node IDs for key pipeline stages
   if (nodeId === 'consensus') return COL.consensus;
-  if (nodeId === 'arbiter_node')     return COL.arbiter;
-  if (nodeId === 'risk_manager')     return COL.risk;
+  if (nodeId === 'arbiter_node') return COL.arbiter;
+  if (nodeId === 'risk_manager') return COL.risk;
   if (nodeId === 'indicator_engine') return COL.indicators;
-  if (nodeId === 'portfolio')        return COL.portfolio;
+  if (nodeId === 'portfolio') return COL.portfolio;
 
   // Priority 2: General kinds
   switch (kind) {
@@ -213,7 +213,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Consensus (col 3)
       { id: 'consensus', label: 'Consensus', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Arbiter Final (col 4) — handles dissent
-      { id: 'arbiter_node', label: 'Ensemble Arbiter', kind: 'arbiter_final', event_count: 0, last_event_at: undefined },
+      {
+        id: 'arbiter_node',
+        label: nodes.find(n => n.id === 'arbiter_node')?.label ?? 'Ensemble Arbiter',
+        kind: 'arbiter_final',
+        event_count: 0,
+        last_event_at: undefined
+      },
       // Risk Manager (col 5)
       { id: 'risk_manager', label: 'Risk Manager', kind: 'synthesis', event_count: 0, last_event_at: undefined },
       // Execution (col 6)
@@ -221,12 +227,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       { id: 'portfolio', label: 'Portfolio', kind: 'execution', event_count: 0, last_event_at: undefined },
     ];
 
-    // Merge live metrics from backend into pipeline nodes.
+    // Merge live metrics and metadata from backend into pipeline nodes.
     const mergedPipeline = PIPELINE_NODES.map(pn => {
       const live = nodes.find(n => n.id === pn.id);
-      return live
-        ? { ...pn, event_count: live.event_count, last_event_at: live.last_event_at }
-        : pn;
+      if (!live) return pn;
+      return {
+        ...pn,
+        label: live.label || pn.label,
+        event_count: live.event_count,
+        last_event_at: live.last_event_at,
+        meta: { ...(pn.meta ?? {}), ...(live.meta ?? {}) }
+      };
     });
 
     const allNodes = [...mergedPipeline];
@@ -237,6 +248,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       if (!kindGroups[n.kind]) kindGroups[n.kind] = [];
       kindGroups[n.kind].push(n);
     }
+
+    // Calculate global allRiskPassed state
+    const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
 
     return allNodes.map((n) => {
       // Grouping logic for vertical stacking. 
@@ -256,7 +270,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Variable height estimation for centering (Data-backed from CSS + Content)
       let estimatedH = NODE_H;
       if (n.id === 'consensus') estimatedH = 180;
-      if (n.id === 'risk_manager') estimatedH = 210;
+      if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
       if (n.id === 'portfolio') estimatedH = 240;
       if (n.id === 'executor') estimatedH = 160;
       if (n.kind === 'execution') estimatedH = 160;
@@ -267,7 +281,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
       // Arbiter offset to clarify bypass path
       if (n.id === 'arbiter_node') {
-        y -= 220;
+        y -= 245;
+      }
+
+      // Minor vertical correction for Risk Manager to align with Consensus spline
+      if (n.id === 'risk_manager') {
+        y -= 20;
       }
 
       // Execution phase stagger as per desired layout: 
@@ -316,8 +335,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           // Live pipeline data
           ...(n.id === 'consensus' ? { analystConsensus, analystVotes } : {}),
           ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
-          ...(n.id === 'executor' ? { lastTrade } : {}),
-          ...(n.id === 'portfolio' ? { portfolioState } : {}),
+          ...(n.id === 'executor' ? { lastTrade, allRiskPassed } : {}),
+          ...(n.id === 'portfolio' ? { portfolioState, allRiskPassed } : {}),
         },
         draggable: true,
         selectable: true,
@@ -331,6 +350,15 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const isNodeRecentlyActive = (nodeId: string): boolean => {
       const lastEventAt = nodeMetrics[nodeId]?.lastEventAt;
       if (!lastEventAt) return false;
+      // Execution cards (executor, portfolio): treat as active if data is present.
+      // Trades/positions are infrequent — a recency gate would show IDLE immediately
+      // after the 5s window even though the last trade data is still displayed.
+      const node = rfNodes.find(n => n.id === nodeId);
+      if (node?.data.kind === 'execution') {
+        const allPassed = node.data.allRiskPassed !== false;
+        if (node.id === 'executor') return !!(node.data.lastTrade) && allPassed;
+        if (node.id === 'portfolio') return !!(node.data.portfolioState) && allPassed;
+      }
       return Date.now() - lastEventAt < 10_000;
     };
 
@@ -341,8 +369,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
 
     const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean; activeOverride?: boolean }) => {
-      const active = opts?.activeOverride !== undefined 
-        ? opts.activeOverride 
+      const active = opts?.activeOverride !== undefined
+        ? opts.activeOverride
         : !opts?.forceInactive && isNodeRecentlyActive(src);
       return {
         id: `e-${src}-${tgt}`,
@@ -398,17 +426,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // Causal flow: Risk → Executor → Portfolio
     const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
     const riskActive = isNodeRecentlyActive('risk_manager');
-    
+
     // Risk → Executor (Lights only on PASS)
-    edges.push(makeEdge('risk_manager', 'executor', { 
-      activeOverride: riskActive && allRiskPassed 
+    edges.push(makeEdge('risk_manager', 'executor', {
+      activeOverride: riskActive && allRiskPassed
     }));
-    
+
     // Executor → Portfolio (Pulse on trade activity)
     edges.push(makeEdge('executor', 'portfolio'));
 
     return edges;
-  }, [rfNodes, nodeMetrics, analystVotes]);
+  }, [rfNodes, nodeMetrics, analystVotes, lastRiskChecks]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
@@ -459,15 +487,15 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         const tgt = rfNodeMap.get(edge.target);
         if (!src || !tgt) return;
 
-          const getEstimatedH = (id: string, kind: string) => {
-            if (id === 'consensus') return 180;
-            if (id === 'risk_manager') return 210;
-            if (id === 'portfolio') return 240;
-            if (id === 'executor') return 160;
-            if (kind === 'execution') return 160;
-            if (kind === 'analyst') return 160;
-            return NODE_H;
-          };
+        const getEstimatedH = (id: string, kind: string) => {
+          if (id === 'consensus') return 180;
+          if (id === 'risk_manager') return 180;
+          if (id === 'portfolio') return 240;
+          if (id === 'executor') return 160;
+          if (kind === 'execution') return 160;
+          if (kind === 'analyst') return 160;
+          return NODE_H;
+        };
 
         const srcH = getEstimatedH(src.id, src.data.kind);
         const tgtH = getEstimatedH(tgt.id, tgt.data.kind);
@@ -578,7 +606,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         // Variable height estimation for centering (Data-backed from CSS + Content)
         let estimatedH = NODE_H;
         if (n.id === 'consensus') estimatedH = 180;
-        if (n.id === 'risk_manager') estimatedH = 210;
+        if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
         if (n.id === 'portfolio') estimatedH = 240;
         if (n.id === 'executor') estimatedH = 160;
         if (n.data.kind === 'execution') estimatedH = 160;
@@ -587,13 +615,18 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         const groupGap = n.data.kind === 'analyst' ? 180 : 260;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         const x = getColumnX(n.id, n.data.kind);
-        
+
         // Center vertically around CY
         let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
 
         // Arbiter offset to clarify bypass path
         if (n.id === 'arbiter_node') {
-          y -= 220;
+          y -= 245;
+        }
+
+        // Minor vertical correction for Risk Manager to align with Consensus spline
+        if (n.id === 'risk_manager') {
+          y -= 20;
         }
 
         // Execution phase stagger: Risk (Center) -> Executor (Down) -> Portfolio (Up)
