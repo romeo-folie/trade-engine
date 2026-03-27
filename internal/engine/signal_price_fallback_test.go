@@ -50,3 +50,14 @@ func TestIsFreshCandleRejectsFutureTimestamps(t *testing.T) {
 		t.Fatalf("expected future candle to be rejected")
 	}
 }
+
+func TestIsFreshCandleInclusiveAtMaxAge(t *testing.T) {
+	now := time.Date(2026, 3, 27, 12, 0, 0, 0, time.UTC)
+	maxAge := maxFallbackCandleAge(data.Timeframe1Hour)
+	if maxAge <= 0 {
+		t.Fatalf("expected max age to be positive")
+	}
+	if !isFreshCandle(data.Timeframe1Hour, now.Add(-maxAge), now) {
+		t.Fatalf("expected candle at max age to be accepted")
+	}
+}

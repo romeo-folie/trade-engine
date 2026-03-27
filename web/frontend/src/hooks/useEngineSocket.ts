@@ -82,6 +82,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [nodes, setNodes] = useState<NodeState[]>([]);
   const nodesRef = useRef<NodeState[]>([]);
+  const nodeIdByLabelRef = useRef<Map<string, string>>(new Map());
   const [events, setEvents] = useState<IndexedWebEvent[]>([]);
   const seqRef = useRef(0);
   const [eventsPerSecond, setEventsPerSecond] = useState(0);
@@ -103,7 +104,16 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const shouldReconnectRef = useRef(true);
 
   useEffect(() => { pausedRef.current = paused; }, [paused]);
-  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => {
+    nodesRef.current = nodes;
+    const next = new Map<string, string>();
+    for (const node of nodes) {
+      if (node.label) {
+        next.set(node.label, node.id);
+      }
+    }
+    nodeIdByLabelRef.current = next;
+  }, [nodes]);
 
   // Rolling event-rate calculation.
   useEffect(() => {
@@ -215,10 +225,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 const next = { ...prev };
                 for (const vote of votes) {
                   if (vote.skipped) continue;
-                  const node = nodesRef.current.find(n => n.label === vote.model);
-                  if (!node) continue;
-                  const existing = next[node.id] ?? { eventCount: 0, lastEventAt: null };
-                  next[node.id] = {
+                  const nodeId = nodeIdByLabelRef.current.get(vote.model);
+                  if (!nodeId) continue;
+                  const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
+                  next[nodeId] = {
                     eventCount: existing.eventCount + 1,
                     lastEventAt: nowTs,
                   };
