@@ -15,6 +15,12 @@ function actionColors(action: string) {
   return colors.amber;
 }
 
+function actionTextColor(action: string) {
+  const a = action.toUpperCase();
+  if (a === 'SELL') return colors.textPrimary;
+  return '#0D0D11';
+}
+
 function fmtTime(iso: string): string {
   if (!iso) return '—';
   const d = new Date(iso);
@@ -62,7 +68,7 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
             justifyContent: 'center'
           }}
         >
-          <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
+          <span style={{ fontSize: 9, fontWeight: 700, color: actionTextColor(analysis.Action) }}>
             {analysis.Action.toUpperCase()}
           </span>
         </ChamferedBox>

@@ -1,5 +1,5 @@
-import { memo, useMemo } from 'react';
-import { motion } from 'framer-motion';
+import { memo, useMemo, useEffect, useRef } from 'react';
+import { motion, useMotionValue, animate, type AnimationPlaybackControls } from 'framer-motion';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import EnsembleConsensus from './EnsembleConsensus';
@@ -481,19 +481,39 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
   // Speed — scale duration by set length (e.g. 2.5s per ticker)
   const duration = useMemo(() => Math.max(tickers.length * 2.5, 10), [tickers.length]);
 
+  const trackRef = useRef<HTMLDivElement | null>(null);
+  const x = useMotionValue(0);
+  const animRef = useRef<AnimationPlaybackControls | null>(null);
+
+  useEffect(() => {
+    if (!trackRef.current) return;
+    const distance = trackRef.current.scrollWidth / 2;
+    if (!distance || Number.isNaN(distance)) return;
+
+    animRef.current?.stop();
+    animRef.current = animate(x, [0, -distance], {
+      duration,
+      ease: 'linear',
+      repeat: Infinity,
+      repeatType: 'loop',
+    });
+
+    return () => {
+      animRef.current?.stop();
+    };
+  }, [x, duration, items.length]);
+
   return (
-    <div className={styles.tickerPillsWrapper}>
+    <div
+      className={styles.tickerPillsWrapper}
+      onMouseEnter={() => animRef.current?.pause()}
+      onMouseLeave={() => animRef.current?.play()}
+    >
       <div className={styles.tickerPillsLabel}>WATCHING</div>
       <motion.div
+        ref={trackRef}
         className={styles.tickerPillsTrack}
-        animate={{ x: [0, "-50%"] }}
-        transition={{
-          duration: duration,
-          ease: "linear",
-          repeat: Infinity,
-        }}
-        // Force GPU acceleration to prevent subpixel jitter
-        style={{ translateZ: 0 }}
+        style={{ x, translateZ: 0 }}
       >
         {items.map((t, i) => (
           <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>

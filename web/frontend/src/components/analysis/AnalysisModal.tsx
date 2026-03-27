@@ -16,6 +16,12 @@ function actionColors(action: string) {
   return colors.amber;
 }
 
+function actionTextColor(action: string) {
+  const a = action.toUpperCase();
+  if (a === 'SELL') return colors.textPrimary;
+  return '#0D0D11';
+}
+
 function confClass(action: string): string {
   const a = action.toUpperCase();
   if (a === 'BUY') return styles.confBuy;
@@ -106,7 +112,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                   justifyContent: 'center'
                 }}
               >
-                <span className={styles.badgeText}>
+                <span className={styles.badgeText} style={{ color: actionTextColor(analysis.Action) }}>
                   {action}
                 </span>
               </ChamferedBox>
@@ -158,7 +164,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                     justifyContent: 'center'
                   }}
                 >
-                  <span className={styles.kvBadgeText}>{action}</span>
+                  <span className={styles.kvBadgeText} style={{ color: actionTextColor(analysis.Action) }}>{action}</span>
                 </ChamferedBox>
               </div>
               <div className={styles.kvRow}>
