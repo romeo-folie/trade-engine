@@ -165,10 +165,18 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 		}
 	}
 	// Arbiter node config
-	arbiterLabel := "Arbiter"
+	arbiterLabel := "-"
 	var arbiterMeta map[string]any
 	if cfg != nil {
 		arbCfg := cfg.Models.ArbiterConfig()
+		// If standard resolution (role -> registry -> legacy) fails, 
+		// explicitly check Registry["arbiter"] as per user preference.
+		if arbCfg.Model == "" && cfg.Models.Registry != nil {
+			if entry, ok := cfg.Models.Registry["arbiter"]; ok {
+				arbCfg = entry.ModelConfig
+			}
+		}
+
 		if arbCfg.Model != "" {
 			arbiterLabel = arbCfg.Model
 			arbiterMeta = map[string]any{
