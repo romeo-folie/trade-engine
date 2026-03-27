@@ -168,16 +168,9 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 	arbiterLabel := "-"
 	var arbiterMeta map[string]any
 	if cfg != nil {
-		var arbCfg appconfig.ModelConfig
-		// Strictly pull from registry key "arbiter" as per review feedback.
-		// Role fallbacks are handled by the engine's analyzer; UI specifically
-		// expects the registry model for this stage's label.
-		if cfg.Models.Registry != nil {
-			if entry, ok := cfg.Models.Registry["arbiter"]; ok {
-				arbCfg = entry.ModelConfig
-			}
-		}
-
+		// Resolve arbiter via config resolver (registry roles when present,
+		// legacy fields otherwise).
+		arbCfg := cfg.Models.ArbiterConfig()
 		if arbCfg.Model != "" {
 			arbiterLabel = arbCfg.Model
 			arbiterMeta = map[string]any{
