@@ -446,7 +446,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
         {d.kind === 'arbiter_final' && (
           <div>
-            <div className={styles.nodeTitle} style={{ color: accentColor || colors.amber }}>{d.label}</div>
+            <div className={styles.nodeTitle} style={{ color: accentColor || colors.amber }}>
+              {d.label && d.label !== '-' ? d.label : '—'}
+            </div>
             <div className={styles.subValue} style={{ marginTop: 2 }}>Ensemble Resolver</div>
             <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 4, opacity: 0.5 }}>
               RESOLVES DISSENT
