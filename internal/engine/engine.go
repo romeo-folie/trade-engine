@@ -171,7 +171,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		newsProvider:      news,
 		executor:          exec,
 		portfolio:         portfolio.NewTracker(time.Hour),
-		bus:               events.New(),
+		bus:               bus, // use the same bus as az
 		enricher:          knowledge.NewEnricher(cfg, callFn),
 		embedder:          emb,
 		newsLastFetched:   make(map[string]time.Time),

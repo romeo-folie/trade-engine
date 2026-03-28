@@ -65,6 +65,9 @@ func (a *Analyzer) Providers() []ModelProvider {
 // Arbiter returns the configured arbiter provider (may be nil).
 func (a *Analyzer) Arbiter() ModelProvider { return a.arbiter }
 
+// Bus returns the event bus used by this analyzer.
+func (a *Analyzer) Bus() *events.Bus { return a.bus }
+
 // Analyze is the primary engine entry-point. Routes to single or ensemble mode.
 func (a *Analyzer) Analyze(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) (AnalysisResponse, ModelCallMeta, error) {
 	res, err := a.AnalyzeFull(ctx, req, impact)
