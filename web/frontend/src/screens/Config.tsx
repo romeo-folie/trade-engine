@@ -236,7 +236,6 @@ export default function ConfigScreen() {
           <span className={styles.breadcrumbPage}>CONFIG</span>
         </div>
         <div className={styles.headerRight}>
-          <span>{ENGINE_VERSION}</span>
           <span className={styles.statusDot} />
           <span>ALL SYSTEMS NOMINAL</span>
         </div>
@@ -507,23 +506,23 @@ export default function ConfigScreen() {
           <SettingsSection title="System Actions">
             <ChamferedBox
               chamfer={6}
-              backgroundColor={colors.amber}
+              backgroundColor="transparent"
               borderColor={colors.amber}
               onClick={() => setShowRestartModal(true)}
               className={styles.btnAmber}
               style={{ marginBottom: 16, padding: '10px 0', textAlign: 'center' }}
             >
-              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Restart Engine</span>
+              <span style={{ color: colors.amber, fontWeight: 700 }}>Restart Engine</span>
             </ChamferedBox>
             <ChamferedBox
               chamfer={6}
-              backgroundColor={colors.red}
+              backgroundColor="transparent"
               borderColor={colors.red}
               onClick={handleReset}
               className={styles.btnRed}
               style={{ padding: '10px 0', textAlign: 'center' }}
             >
-              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Reset to Defaults</span>
+              <span style={{ color: colors.red, fontWeight: 700 }}>Reset to Defaults</span>
             </ChamferedBox>
             <span className={styles.versionText}>
               TradeEngine {ENGINE_VERSION} — Build 20260318
