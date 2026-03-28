@@ -27,8 +27,8 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Trades',    icon: BarChart2,   path: '/trades' },
   { label: 'Analysis',  icon: Brain,      path: '/analysis' },
   { label: 'Backtests', icon: RefreshCw,  path: '/backtests' },
-  { label: 'Config',    icon: Settings,   path: '/config' },
   { label: 'System',    icon: Server,     path: '/system' },
+  { label: 'Config',    icon: Settings,   path: '/config' },
 ];
 
 const ICON_SIZE = 18;

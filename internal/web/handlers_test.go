@@ -1,10 +1,14 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/config"
 )
 
 // ─── queryInt ────────────────────────────────────────────────────────────────
@@ -93,3 +97,29 @@ func TestIsNotFound(t *testing.T) {
 type errStr string
 
 func (e errStr) Error() string { return string(e) }
+
+// ─── handleSystemConfig ──────────────────────────────────────────────────────
+
+func TestConfigMasking(t *testing.T) {
+	// Create a dummy config with a secret.
+	cfg := &config.ModelConfig{
+		Provider: "openai",
+		Model:    "gpt-4o",
+		APIKey:   "sk-TEST-SECRET-PLEASE-IGNORE",
+	}
+
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("json.Marshal failed: %v", err)
+	}
+
+	s := string(data)
+	if strings.Contains(s, "sk-TEST-SECRET") {
+		t.Errorf("JSON contains secret: %s", s)
+	}
+
+	// Double check that APIKey is omitted entirely (json:"-")
+	if strings.Contains(s, "\"APIKey\":") || strings.Contains(s, "\"api_key\":") {
+		t.Errorf("JSON contains APIKey field: %s", s)
+	}
+}

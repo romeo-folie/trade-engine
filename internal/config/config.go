@@ -102,7 +102,7 @@ type EmbeddingsConfig struct {
 	// APIKeyEnv is the environment variable name holding the OpenAI API key.
 	// Only required when provider = "openai".
 	APIKeyEnv string `yaml:"api_key_env"`
-	APIKey    string `yaml:"-"` // resolved from APIKeyEnv at load time
+	APIKey    string `yaml:"-" json:"-"` // resolved from APIKeyEnv at load time
 
 	// OllamaBaseURL is the Ollama server URL (default: http://localhost:11434).
 	OllamaBaseURL string `yaml:"ollama_base_url"`
@@ -240,7 +240,7 @@ type ModelConfig struct {
 	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
 	Model       string  `yaml:"model"`
 	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
-	APIKey      string  `yaml:"-"`           // resolved at runtime, never serialised
+	APIKey      string  `yaml:"-" json:"-"`           // resolved at runtime, never serialised
 	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
 	TimeoutSec  int     `yaml:"timeout_sec"`
@@ -406,7 +406,7 @@ type MarketsConfig struct {
 type NewsAPIConfig struct {
 	Provider      string `yaml:"provider"`        // finnhub | benzinga
 	APIKeyEnv     string `yaml:"api_key_env"`     // env var name holding the API key
-	APIKey        string `yaml:"-"`               // resolved at runtime
+	APIKey        string `yaml:"-" json:"-"`               // resolved at runtime
 	FetchEveryMin int    `yaml:"fetch_every_min"` // cadence in minutes (default 15)
 
 	// Extraction controls knowledge-graph enrichment LLM calls.
@@ -421,9 +421,9 @@ type StocksConfig struct {
 	Enabled   bool   `yaml:"enabled"`
 	Paper     bool   `yaml:"paper"`
 	APIKeyEnv string `yaml:"api_key_env"`
-	APIKey    string `yaml:"-"`
+	APIKey    string `yaml:"-" json:"-"`
 	SecretEnv string `yaml:"secret_env"`
-	Secret    string `yaml:"-"`
+	Secret    string `yaml:"-" json:"-"`
 	BaseURL   string `yaml:"base_url"`
 	DataURL   string `yaml:"data_url"`
 }
@@ -492,7 +492,7 @@ type NotificationsConfig struct {
 type TelegramConfig struct {
 	Enabled     bool     `yaml:"enabled"`
 	BotTokenEnv string   `yaml:"bot_token_env"`
-	BotToken    string   `yaml:"-"`
+	BotToken    string   `yaml:"-" json:"-"`
 	ChatID      string   `yaml:"chat_id"`
 	NotifyOn    []string `yaml:"notify_on"`
 

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -31,6 +32,7 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
+	mux.HandleFunc("/api/system/config", handleSystemConfig)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -398,6 +400,70 @@ func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
 		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
 		"uptime_seconds":    uptimeSec,
 	})
+}
+
+// GET /api/system/config
+// POST /api/system/config
+func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		jsonResponse(w, config.Get())
+	case http.MethodPost:
+		var updates map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		// Field mapping for flat keys from frontend to nested config paths.
+		mapping := map[string]string{
+			"mode":                 "engine.mode",
+			"tick_interval_sec":    "engine.tick_interval_sec",
+			"initial_capital":      "engine.initial_capital",
+			"dry_run":              "engine.dry_run",
+			"confidence_threshold": "risk.confidence_threshold",
+			"max_position_pct":     "risk.max_position_pct",
+			"max_open_positions":   "risk.max_open_positions",
+			"daily_loss_limit_pct": "risk.daily_loss_limit_pct",
+			"max_drawdown_pct":     "risk.max_drawdown_pct",
+			"cooldown_after_loss":  "risk.cooldown_after_loss_min",
+			"signal_expiry":        "risk.signal_expiry_min",
+			"cost_profile":         "cost.profile",
+			"daily_token_budget":   "cost.daily_token_budget",
+			"weekly_token_budget":  "cost.weekly_token_budget",
+			"auto_degrade_budget":  "cost.auto_degrade_on_budget_hit",
+			"telegram_enabled":     "notifications.telegram.enabled",
+			// Analyst roles
+			"analyst_cheap":    "models.roles.analysts.0",
+			"analyst_mid":      "models.roles.analysts.1",
+			"analyst_frontier": "models.roles.analysts.2",
+			"arbiter":          "models.roles.arbiter",
+			"classifier":       "models.roles.classifier",
+		}
+
+		for k, v := range updates {
+			dotPath, ok := mapping[k]
+			if !ok {
+				// Also allow direct dot-path updates if provided.
+				dotPath = k
+			}
+			valStr := fmt.Sprintf("%v", v)
+			if err := config.SetField(dotPath, valStr); err != nil {
+				apiError(w, "config update failed", err)
+				return
+			}
+		}
+
+		// Reload live config into memory
+		if _, err := config.Load(); err != nil {
+			apiError(w, "reload failed", err)
+			return
+		}
+
+		jsonResponse(w, map[string]string{"status": "ok"})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
