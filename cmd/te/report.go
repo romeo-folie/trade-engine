@@ -141,7 +141,9 @@ func runReportPerformance(cmd *cobra.Command, _ []string) error {
 			pnl, wr := "─", "─"
 			if r.AvgPnLPct != nil { pnl = fmt.Sprintf("%+.2f%%", *r.AvgPnLPct) }
 			if r.WinRate != nil    { wr  = fmt.Sprintf("%.1f%%", *r.WinRate*100) }
-			fmt.Printf("%-14s  %-28s  %8d  %10s  %8s\n", r.Provider, r.Model, r.TradeCount, pnl, wr)
+			provider := "unknown"; if r.Provider != nil { provider = *r.Provider }
+			model := "unknown"; if r.Model != nil { model = *r.Model }
+			fmt.Printf("%-14s  %-28s  %8d  %10s  %8s\n", provider, model, r.TradeCount, pnl, wr)
 		}
 	}
 	return nil

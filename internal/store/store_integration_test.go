@@ -340,6 +340,7 @@ func TestRelationship_LifecycleAndMentions(t *testing.T) {
 		{
 			ExternalID:  newsExtID,
 			Headline:    "Test news for entity mention",
+			URL:         "https://example.com/intg/mention/" + newsExtID,
 			Source:      "test",
 			PublishedAt: time.Now(),
 			Tickers:     []string{"INTG_FROM"},
@@ -403,7 +404,7 @@ func TestNews_UpsertAndQuery(t *testing.T) {
 			Headline:       "Integration test headline",
 			Summary:        "Integration test summary",
 			Source:         "finnhub",
-			URL:            "https://example.com/intg",
+			URL:            "https://example.com/intg/" + extID,
 			PublishedAt:    published,
 			Tickers:        []string{"TEST_NEWS_AAPL"},
 			SentimentScore: 0.5,

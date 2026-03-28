@@ -43,14 +43,14 @@ const EDGE_TYPES = { organic: OrganicEdge };
 // Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
 const COL = {
   source: 60,
-  enricher: 260,
-  indicators: 460,
-  analysts: 860,
-  consensus: 1260,
-  arbiter: 1660,
-  risk: 2060,
-  execution: 2460,
-  portfolio: 2800,
+  enricher: 460,
+  indicators: 860,
+  analysts: 1360,     // Extra spacer for analyst stack
+  consensus: 1860,
+  arbiter: 2360,       // Center point between consensus and risk
+  risk: 2860,
+  execution: 3360,
+  portfolio: 3800,
 };
 
 const CY = 400;
@@ -70,6 +70,8 @@ function getColumnX(nodeId: string, kind: string): number {
   if (nodeId === 'risk_manager') return COL.risk;
   if (nodeId === 'indicator_engine') return COL.indicators;
   if (nodeId === 'portfolio') return COL.portfolio;
+  if (nodeId === 'alpaca') return COL.enricher; // Move Alpaca to process col to avoid crossing
+  if (nodeId === 'news_api') return COL.source;
 
   // Priority 2: General kinds
   switch (kind) {
@@ -258,15 +260,19 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
     return allNodes.map((n) => {
       // Grouping logic for vertical stacking. 
-      // Singletons on the central path (Consensus, Risk, Executor, Portfolio) stay isolated and centered.
-      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') ? n.id : n.kind;
+      // Group Alpaca with Enricher for vertical stacking to clear the path.
+      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') 
+        ? n.id 
+        : (n.id === 'alpaca' || n.kind === 'enricher') ? 'entry_processing' : n.kind;
       const group = allNodes.filter(an => {
-        const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') ? an.id : an.kind;
+        const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') 
+          ? an.id 
+          : (an.id === 'alpaca' || an.kind === 'enricher') ? 'entry_processing' : an.kind;
         return ak === groupKey;
       });
 
       // Layout coordinates (center-to-center symmetry)
-      const groupGap = n.kind === 'analyst' ? 180 : 260;
+      const groupGap = (n.kind === 'analyst' || n.kind === 'enricher') ? 200 : 260;
       const groupIdx = group.findIndex(gn => gn.id === n.id);
 
       const x = getColumnX(n.id, n.kind);
@@ -277,8 +283,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
       if (n.id === 'portfolio') estimatedH = 240;
       if (n.id === 'executor') estimatedH = 160;
-      if (n.kind === 'execution') estimatedH = 160;
-      if (n.kind === 'analyst') estimatedH = 160;
+      if (n.kind === 'execution' || n.kind === 'enricher' || n.kind === 'analyst') estimatedH = 180;
 
       // Center the whole group vertically around CY
       let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
@@ -458,21 +463,31 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
-  useEffect(() => { setRfNodes(rfNodes); }, [rfNodes, setRfNodes]);
+  // Sync edges simply (they don't have user-managed state like positions)
   useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
 
-  // Center view on initial render
+  // Sync nodes smarter: preserve user-dragged positions and handle lock state
+  // This prevents the "snap-back" bug where nodes reset to defaults on every event.
   useEffect(() => {
-    const timer = setTimeout(() => {
-      fitViewRef.current?.({ padding: 0.15, duration: 300 });
-    }, 100);
-    return () => clearTimeout(timer);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Patch draggable on all nodes when lock state changes
-  useEffect(() => {
-    setRfNodes(nds => nds.map(n => ({ ...n, draggable: !layoutLocked })));
-  }, [layoutLocked, setRfNodes]);
+    setRfNodes((nds) => {
+      const currentMap = new Map(nds.map(n => [n.id, { 
+        position: n.position, 
+        dragging: n.dragging, 
+        selected: n.selected 
+      }]));
+      
+      return rfNodes.map(n => {
+        const existing = currentMap.get(n.id);
+        return {
+          ...n,
+          position: existing?.position || n.position,
+          dragging: existing?.dragging,
+          selected: existing?.selected,
+          draggable: !layoutLocked, // Update lock state on all nodes
+        };
+      });
+    });
+  }, [rfNodes, layoutLocked, setRfNodes]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
     onNodeClick(node.id);
@@ -484,11 +499,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   }, []);
 
   // ── Particle Spawning ──────────────────────────────────────────────────
+  // Map nodes from the actual React Flow state (rfN) so that particles
+  // originate from current/dragged positions rather than calculated defaults.
   const rfNodeMap = useMemo(() => {
-    const m = new Map<string, typeof rfNodes[number]>();
-    for (const n of rfNodes) m.set(n.id, n);
+    const m = new Map<string, typeof rfN[number]>();
+    for (const n of rfN) m.set(n.id, n);
     return m;
-  }, [rfNodes]);
+  }, [rfN]);
 
   const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
   useEffect(() => {
@@ -509,8 +526,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           if (id === 'risk_manager') return 180;
           if (id === 'portfolio') return 240;
           if (id === 'executor') return 160;
-          if (kind === 'execution') return 160;
-          if (kind === 'analyst') return 160;
+          if (kind === 'execution' || kind === 'enricher' || kind === 'analyst') return 180;
           return NODE_H;
         };
 
@@ -547,7 +563,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         });
       });
     }
-  }, [recentEventSignatures, rfNodes, rfE]);
+  }, [recentEventSignatures, rfNodeMap, rfE]);
 
   // Canvas loop... (same as before but using rfN for dynamic node positions)
   useAnimationFrame((time) => {
@@ -614,9 +630,13 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         groups[n.data.kind].push(n);
       }
       return currentNodes.map(n => {
-        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') ? n.id : n.data.kind;
+        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') 
+          ? n.id 
+          : (n.id === 'alpaca' || n.data.kind === 'enricher') ? 'entry_processing' : n.data.kind;
         const group = currentNodes.filter(an => {
-          const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') ? an.id : an.data.kind;
+          const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') 
+            ? an.id 
+            : (an.id === 'alpaca' || an.data.kind === 'enricher') ? 'entry_processing' : an.data.kind;
           return ak === groupKey;
         });
 
@@ -626,10 +646,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
         if (n.id === 'portfolio') estimatedH = 240;
         if (n.id === 'executor') estimatedH = 160;
-        if (n.data.kind === 'execution') estimatedH = 160;
-        if (n.data.kind === 'analyst') estimatedH = 160;
+        if (n.data.kind === 'execution' || n.data.kind === 'enricher' || n.data.kind === 'analyst') estimatedH = 180;
 
-        const groupGap = n.data.kind === 'analyst' ? 180 : 260;
+        const groupGap = (n.data.kind === 'analyst' || n.data.kind === 'enricher') ? 200 : 260;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
         const x = getColumnX(n.id, n.data.kind);
 
@@ -680,7 +699,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         edgeTypes={EDGE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
-        defaultViewport={{ x: 20, y: 60, zoom: 0.6 }}
+        defaultViewport={{ x: 80, y: 80, zoom: 0.4 }}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />

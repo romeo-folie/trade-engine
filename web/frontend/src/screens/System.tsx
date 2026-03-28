@@ -229,12 +229,11 @@ export default function SystemScreen() {
       {/* Breadcrumb */}
       <div className={styles.headerRow}>
         <div className={styles.breadcrumb}>
-          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
-          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbBrand}>~/</span>
           <span className={styles.breadcrumbPage}>SYSTEM</span>
         </div>
         <div className={styles.versionStatus}>
-          v2.1.0 <span className={styles.greenDot} /> ALL SYSTEMS NOMINAL
+          ALL SYSTEMS NOMINAL
         </div>
       </div>
 

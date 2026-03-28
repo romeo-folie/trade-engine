@@ -228,8 +228,11 @@ var modelsPerformanceCmd = &cobra.Command{
 			pnl, wr := "─", "─"
 			if r.AvgPnLPct != nil { pnl = fmt.Sprintf("%+.2f%%", *r.AvgPnLPct) }
 			if r.WinRate != nil    { wr  = fmt.Sprintf("%.1f%%", *r.WinRate*100) }
+			provider := "unknown"; if r.Provider != nil { provider = *r.Provider }
+			model := "unknown"; if r.Model != nil { model = *r.Model }
+			conf := 0.0; if r.AvgConfidence != nil { conf = *r.AvgConfidence }
 			fmt.Printf("%-14s  %-30s  %8d  %10s  %8s  %8.3f\n",
-				r.Provider, r.Model, r.TradeCount, pnl, wr, r.AvgConfidence)
+				provider, model, r.TradeCount, pnl, wr, conf)
 		}
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)

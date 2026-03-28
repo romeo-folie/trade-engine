@@ -24,7 +24,7 @@
 }
 
 .breadcrumbBrand {
-  color: var(--cyan);
+  color: var(--accent); font-weight: 800; font-size: 1.15em; letter-spacing: 0.1em;
 }
 
 .breadcrumbSep,

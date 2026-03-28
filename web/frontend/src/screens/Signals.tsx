@@ -218,8 +218,7 @@ export default function SignalsScreen() {
     <div className={styles.screen}>
       <div className={styles.topBar}>
         <div className={styles.breadcrumb}>
-          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
-          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbBrand}>~/</span>
           <span className={styles.breadcrumbPage}>SIGNALS</span>
         </div>
         <div className={styles.systemStatus}>
