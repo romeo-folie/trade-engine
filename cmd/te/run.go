@@ -180,7 +180,10 @@ Modes:
 
 			orbBus := events.New()
 			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
-			orbNotifier := &orbTelegramNotifier{bot: tgBot}
+			var orbNotifier orb.Notifier
+			if tgBot != nil {
+				orbNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
 
 			orbPortfolio := newDBPortfolioValuer(100_000)
 			orbScheduler := orb.NewORBScheduler(

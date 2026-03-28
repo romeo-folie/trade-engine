@@ -403,6 +403,7 @@ func toWebEvents(ev events.Event) []*WebEvent {
 		if !ok {
 			return nil
 		}
+		raw, _ := json.Marshal(payload)
 		var msgs []*WebEvent
 		for _, v := range payload.Votes {
 			if v.Skipped {
@@ -410,15 +411,12 @@ func toWebEvents(ev events.Event) []*WebEvent {
 			}
 			// Map specific model back to its pipeline ID (analyst-roleKey).
 			// Protocol node builder uses "analyst-" + registryKey.
-			// Currently we use a heuristic based on known config or we can
-			// extend AnalystVotePayload to carry its SourceID.
-			// For now, mapping all to llm_analysis was the bottleneck.
 			msgs = append(msgs, &WebEvent{
 				Type:      "AnalystVotesPublished",
 				Timestamp: ev.Timestamp,
 				Source:    "llm_analysis", // Frontend handles mapping votes to cards
 				Target:    "consensus",
-				Payload:   nil, // Votes already in consensus payload or separate
+				Payload:   json.RawMessage(raw),
 			})
 		}
 		// Special case: we still want the consensus pulse.

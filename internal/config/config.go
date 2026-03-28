@@ -948,29 +948,58 @@ func scalarNode(value string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
 }
 
-// setYAMLNode sets a dotted-path key in a YAML mapping node tree.
+// setYAMLNode sets a dotted-path key in a YAML node tree.
+// Supports both MappingNode (by key) and SequenceNode (by index).
 func setYAMLNode(node *yaml.Node, parts []string, value string) {
-	if node.Kind != yaml.MappingNode {
+	if len(parts) == 0 {
 		return
 	}
 	key := parts[0]
-	for i := 0; i < len(node.Content)-1; i += 2 {
-		if node.Content[i].Value == key {
-			if len(parts) == 1 {
-				node.Content[i+1] = scalarNode(value)
-			} else {
-				setYAMLNode(node.Content[i+1], parts[1:], value)
+
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i < len(node.Content)-1; i += 2 {
+			if node.Content[i].Value == key {
+				if len(parts) == 1 {
+					node.Content[i+1] = scalarNode(value)
+				} else {
+					setYAMLNode(node.Content[i+1], parts[1:], value)
+				}
+				return
 			}
+		}
+		// Key not found — append.
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
+		if len(parts) == 1 {
+			node.Content = append(node.Content, keyNode, scalarNode(value))
+		} else {
+			child := &yaml.Node{Kind: yaml.MappingNode}
+			node.Content = append(node.Content, keyNode, child)
+			setYAMLNode(child, parts[1:], value)
+		}
+		return
+	}
+
+	if node.Kind == yaml.SequenceNode {
+		idx, err := strconv.Atoi(key)
+		if err != nil {
 			return
 		}
-	}
-	// Key not found — append.
-	keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
-	if len(parts) == 1 {
-		node.Content = append(node.Content, keyNode, scalarNode(value))
-	} else {
-		child := &yaml.Node{Kind: yaml.MappingNode}
-		node.Content = append(node.Content, keyNode, child)
-		setYAMLNode(child, parts[1:], value)
+		if idx < 0 {
+			return
+		}
+		// Ensure sequence is long enough
+		for len(node.Content) <= idx {
+			node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: ""})
+		}
+		if len(parts) == 1 {
+			node.Content[idx] = scalarNode(value)
+		} else {
+			// Promote missing scalar node to MappingNode if we need to recurse
+			if node.Content[idx].Kind == yaml.ScalarNode && node.Content[idx].Value == "" {
+				node.Content[idx] = &yaml.Node{Kind: yaml.MappingNode}
+			}
+			setYAMLNode(node.Content[idx], parts[1:], value)
+		}
+		return
 	}
 }
