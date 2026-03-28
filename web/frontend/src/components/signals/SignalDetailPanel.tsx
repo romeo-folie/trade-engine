@@ -183,7 +183,14 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
                   className={`${styles.analystCard} ${!analyst.active ? styles.bypassed : ''}`}
                 >
                   <div className={styles.analystHeader}>
-                    <span className={styles.analystName}>{analyst.name}</span>
+                    <div>
+                      <div className={styles.analystName}>{analyst.name}</div>
+                      {analyst.active && analyst.model && (
+                        <div style={{ fontSize: 9, color: 'var(--text-dim)', marginTop: 1, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
+                          {analyst.model}
+                        </div>
+                      )}
+                    </div>
                     <span className={styles.analystVerdict} style={{ color: analyst.active ? verdictColor(analyst.verdict) : 'var(--text-faint)' }}>
                       {analyst.active ? analyst.verdict : 'BYPASSED'}
                     </span>

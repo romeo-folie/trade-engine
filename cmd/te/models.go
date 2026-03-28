@@ -30,7 +30,7 @@ var modelsListCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		providers := az.Providers()
 
 		fmt.Printf("%-20s  %-12s  %-30s  %s\n", "ROLE", "PROVIDER", "MODEL", "STATUS")
@@ -72,7 +72,7 @@ var modelsTestCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		providers := az.Providers()
 		prompt := strings.Join(args, " ")
 		req := analysis.AnalysisRequest{Ticker: prompt, Strategy: "test"}
@@ -133,7 +133,7 @@ var modelsCompareCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		req := analysis.AnalysisRequest{Ticker: ticker, Strategy: "momentum"}
 
 		fmt.Fprintf(os.Stderr, "→ Querying %d analysts for %s…\n", len(az.Providers()), ticker)

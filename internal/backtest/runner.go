@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
@@ -486,7 +487,7 @@ func (r *Runner) query(ctx context.Context, req analysis.AnalysisRequest, provid
 		}
 	}
 
-	resp, meta, err := r.analyzer.Analyze(ctx, req)
+	resp, meta, err := r.analyzer.Analyze(ctx, req, depth.ImpactScore{Score: 1.0, Depth: 3})
 	if err != nil {
 		return analysis.AnalysisResponse{}, err
 	}

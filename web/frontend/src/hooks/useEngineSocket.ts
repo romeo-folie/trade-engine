@@ -70,6 +70,7 @@ export interface EngineSocketState {
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
   analystVotes: AnalystVote[];
+  selectedAnalysts: string[];
 }
 
 const MAX_EVENTS = 200;
@@ -96,6 +97,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [lastTrade, setLastTrade] = useState<LastTrade | null>(null);
   const [portfolioState, setPortfolioState] = useState<PortfolioState | null>(null);
   const [analystVotes, setAnalystVotes] = useState<AnalystVote[]>([]);
+  const [selectedAnalysts, setSelectedAnalysts] = useState<string[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -187,6 +189,11 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setLastSignalAt(now);
         }
 
+        // Track selected analysts for fanned-out pulses
+        if (webEv.type === 'AnalysisStarted') {
+          setSelectedAnalysts(prev => Array.from(new Set([...prev, webEv.target])));
+        }
+
         // Track avg LLM latency (rolling window of last 10 samples)
         if (webEv.type === 'AnalysisCompleted' && webEv.payload) {
           try {
@@ -243,6 +250,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         if (webEv.type === 'DataFetched') {
           setAnalystConsensus({});
           setAnalystVotes([]);
+          setSelectedAnalysts([]);
         }
 
         // Track risk check results
@@ -315,7 +323,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, selectedAnalysts };
 }
 
 function buildWsUrl(): string {

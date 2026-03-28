@@ -100,7 +100,7 @@ var runBTCmd = &cobra.Command{
 			os.Getenv(cfg.Markets.Stocks.SecretEnv),
 			cfg.Markets.Stocks.DataURL,
 		)
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		runner := backtest.NewRunner(cfg, alpaca, az)
 
 		opts := backtest.RunOptions{

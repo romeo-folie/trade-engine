@@ -23,6 +23,7 @@ export interface EngineSocketContextValue {
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
   analystVotes: AnalystVote[];
+  selectedAnalysts: string[];
 }
 
 export const EngineSocketContext = createContext<EngineSocketContextValue | null>(null);

@@ -43,6 +43,7 @@ const EDGE_TYPES = { organic: OrganicEdge };
 // Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
 const COL = {
   source: 60,
+  enricher: 260,
   indicators: 460,
   analysts: 860,
   consensus: 1260,
@@ -73,6 +74,7 @@ function getColumnX(nodeId: string, kind: string): number {
   // Priority 2: General kinds
   switch (kind) {
     case 'source': return COL.source;
+    case 'enricher': return COL.enricher;
     case 'analyst': return COL.analysts;
     case 'execution': return COL.execution;
     default: return COL.source;
@@ -163,7 +165,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const modelEnsemble = useModelEnsemble();
   const systemStatus = useSystemStatus();
   const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
-  const { analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState } = useEngineSocketContext();
+  const { analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState, selectedAnalysts } = useEngineSocketContext();
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
@@ -206,6 +208,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Sources (col 0)
       { id: 'alpaca', label: 'Alpaca Feed', kind: 'source', event_count: 0, last_event_at: undefined },
       { id: 'news_api', label: nodes.find(n => n.id === 'news_api')?.label ?? 'News Feed', kind: 'source', event_count: 0, last_event_at: undefined },
+      // Enricher (col 0.5)
+      { id: 'news_enricher', label: 'News Enricher', kind: 'enricher', event_count: 0, last_event_at: undefined },
       // Arbiter (col 1)
       { id: 'indicator_engine', label: 'Indicator Engine', kind: 'arbiter', event_count: 0, last_event_at: undefined },
       // Analyst (col 2) — dynamic
@@ -330,6 +334,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           accentColor: provider ? modelAccentColor(provider) : undefined,
           // Per-analyst live vote
           ...(vote ? { verdict: vote.action, voteConfidence: vote.confidence, skipped: vote.skipped } : {}),
+          isChosen: selectedAnalysts.includes(n.id),
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
           // Live pipeline data
@@ -399,15 +404,27 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     };
 
     if (arbiterId) {
-      sourceIds.forEach(sid => edges.push(makeEdge(sid, arbiterId)));
+      sourceIds.forEach(sid => {
+        // News source goes to enricher, others to indicator_engine
+        if (sid === 'news_api') {
+          edges.push(makeEdge(sid, 'news_enricher'));
+          edges.push(makeEdge('news_enricher', arbiterId));
+        } else {
+          edges.push(makeEdge(sid, arbiterId));
+        }
+      });
+
       analystIds.forEach(aid => {
-        // Only light the edge to an analyst if their vote was NOT skipped
+        // Selective pulsing based on selectedAnalysts set (from AnalysisStarted)
+        const isSelected = selectedAnalysts.includes(aid);
         const analystNode = rfNodes.find(n => n.id === aid);
         const modelName = (analystNode?.data as PipelineNodeData)?.label ?? '';
-        // Match by analyst name (node label) only — no provider fallback.
         const vote = analystVotes.find(v => v.model === modelName);
         const wasInvoked = vote ? !vote.skipped : false;
-        edges.push(makeEdge(arbiterId, aid, { forceInactive: analystVotes.length > 0 && !wasInvoked }));
+        
+        // Edge lights up if EITHER it's currently selected OR was recently invoked
+        const active = isSelected || wasInvoked;
+        edges.push(makeEdge(arbiterId, aid, { activeOverride: active }));
       });
     }
 

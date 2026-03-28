@@ -178,14 +178,11 @@ Modes:
 				return fmt.Errorf("ORB mode requires Alpaca market data provider")
 			}
 
-			analyzer := analysis.NewAnalyzer(cfg.Models)
-			var orbNotifier orb.Notifier
-			if tgBot != nil {
-				orbNotifier = &orbTelegramNotifier{bot: tgBot}
-			}
+			orbBus := events.New()
+			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
+			orbNotifier := &orbTelegramNotifier{bot: tgBot}
 
 			orbPortfolio := newDBPortfolioValuer(100_000)
-			orbBus := events.New()
 			orbScheduler := orb.NewORBScheduler(
 				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
 				broker, orbPortfolio, orbNotifier,

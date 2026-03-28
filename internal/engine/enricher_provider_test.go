@@ -12,7 +12,7 @@ import (
 func makeAnalyzerWithProviders(cfgs []config.ModelConfig) *analysis.Analyzer {
 	mc := config.ModelsConfig{}
 	mc.Analysts = cfgs
-	return analysis.NewAnalyzer(mc)
+	return analysis.NewAnalyzer(mc, nil)
 }
 
 // TestResolveEnricherProvider_RegistryPath verifies that when
@@ -48,7 +48,7 @@ func TestResolveEnricherProvider_RegistryPath(t *testing.T) {
 		NewsEnricher: "news_enricher",
 	}
 
-	az := analysis.NewAnalyzer(cfg.Models)
+	az := analysis.NewAnalyzer(cfg.Models, nil)
 	p := resolveEnricherProvider(az, cfg)
 
 	if p == nil {
@@ -81,7 +81,7 @@ func TestResolveEnricherProvider_LegacyFallback(t *testing.T) {
 	cfg.Markets.News.ExtractionProvider = "openai"
 	cfg.Markets.News.ExtractionModel = "gpt-4o"
 
-	az := analysis.NewAnalyzer(cfg.Models)
+	az := analysis.NewAnalyzer(cfg.Models, nil)
 	p := resolveEnricherProvider(az, cfg)
 
 	if p == nil {
@@ -110,7 +110,7 @@ func TestResolveEnricherProvider_NoMatchReturnsNil(t *testing.T) {
 	cfg.Markets.News.ExtractionProvider = "openai"
 	cfg.Markets.News.ExtractionModel = "gpt-4o-mini"
 
-	az := analysis.NewAnalyzer(cfg.Models)
+	az := analysis.NewAnalyzer(cfg.Models, nil)
 	p := resolveEnricherProvider(az, cfg)
 
 	if p != nil {

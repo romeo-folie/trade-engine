@@ -25,6 +25,8 @@ const (
 	NewsFetched            Type = "news.fetched"
 	AnalystVotesPublished  Type = "analysis.analyst_votes"
 	PortfolioSnapshotTaken Type = "portfolio.snapshot"
+	AnalysisStarted        Type = "analysis.started"
+	NewsEnriched           Type = "news.enriched"
 	ErrorOccurred          Type = "error"
 )
 
@@ -189,6 +191,19 @@ type AnalystVotePayload struct {
 type AnalystVotesPublishedPayload struct {
 	Ticker string               `json:"ticker"`
 	Votes  []AnalystVotePayload `json:"votes"`
+}
+
+// AnalysisStartedPayload is emitted when the analyzer begins the fan-out.
+type AnalysisStartedPayload struct {
+	Ticker           string   `json:"ticker"`
+	Depth            int      `json:"depth"`
+	SelectedAnalysts []string `json:"selected_analysts"` // e.g. ["analyst-cheap", "analyst-mid"]
+}
+
+// NewsEnrichedPayload is emitted after the news enricher LLM extracts sentiment.
+type NewsEnrichedPayload struct {
+	Ticker string `json:"ticker"`
+	Count  int    `json:"count"`
 }
 
 // ErrorPayload is emitted when a non-fatal error occurs in the pipeline.

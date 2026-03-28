@@ -32,6 +32,7 @@ export interface PipelineNodeData {
   accentColor?: string;
   watchlistTickers?: WatchlistTicker[];
   isOrbMode?: boolean;
+  isChosen?: boolean;
   [key: string]: unknown;
 }
 
@@ -163,6 +164,21 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           </div>
         )}
 
+        {/* ── Enricher Template ── */}
+        {d.kind === 'enricher' && (
+          <div className={styles.enricherContent}>
+            <div className={styles.subValue}>SENTIMENT EXTRACTION</div>
+            <div className={styles.metricValue} style={{ color: colors.amber }}>
+              {d.eventCount > 0 ? `${d.eventCount} ARTICLES` : 'LISTENING'}
+            </div>
+            <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'ENRICHING' : 'IDLE'}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* ── Analyst Template ── */}
         {isAnalyst && (
           <div>
@@ -204,36 +220,32 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               }
               return null;
             })()}
-            {nodeActive ? (
-              <>
-                {!d.verdict && !d.skipped && (
-                  <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-                    {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-                     verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-                  </div>
-                )}
-                {d.accuracy !== undefined && d.accuracy > 0 && (
-                  <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
-                    ACC: {Math.round(d.accuracy * 100)}%
-                  </div>
-                )}
-                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-                  {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'ANALYZING'}
-                </div>
-              </>
+            {d.isChosen ? (
+              <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
+                <span className={styles.feedBadgeActive} style={{ background: 'rgba(57, 255, 20, 0.15)', border: '1px solid #39FF14', boxShadow: '0 0 10px rgba(57, 255, 20, 0.2)' }}>
+                  ACTIVE
+                </span>
+              </div>
             ) : (
-              <>
-                {!d.verdict && !d.skipped && (
-                  <>
-                    <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
-                      —
-                    </div>
-                    <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
-                      <span className={styles.feedBadgeIdle}>STANDBY</span>
-                    </div>
-                  </>
-                )}
-              </>
+              <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
+                <span className={styles.feedBadgeIdle}>STANDBY</span>
+              </div>
+            )}
+            {!d.verdict && !d.skipped && d.isChosen && (
+              <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
+                {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+                 verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
+              </div>
+            )}
+            {d.accuracy !== undefined && d.accuracy > 0 && d.isChosen && (
+              <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
+                ACC: {Math.round(d.accuracy * 100)}%
+              </div>
+            )}
+            {d.eventCount > 0 && d.isChosen && (
+              <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+                {d.eventCount} SIGNALS
+              </div>
             )}
           </div>
         )}

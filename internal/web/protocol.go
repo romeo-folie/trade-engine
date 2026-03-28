@@ -62,7 +62,9 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	case events.DataFetched:
 		return "alpaca", "indicator_engine", "DataFetched"
 	case events.NewsFetched:
-		return "news_api", "indicator_engine", "NewsFetched"
+		return "news_api", "news_enricher", "NewsFetched"
+	case events.NewsEnriched:
+		return "news_enricher", "indicator_engine", "NewsEnriched"
 	case events.IndicatorsComputed:
 		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
 	case events.AnalysisCompleted:
@@ -71,6 +73,9 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 		return "llm_analysis", "llm_analysis", "AnalystVotesPublished"
 	case events.ArbiterInvoked:
 		return "consensus", "arbiter_node", "ArbiterInvoked"
+	case events.AnalysisStarted:
+		// Target is dynamically determined from payload in toWebEvent
+		return "prompt_assembly", "analyst-set", "AnalysisStarted"
 
 	// ── Signal flow ──────────────────────────────────────────────────────
 	case events.SignalGenerated:
@@ -209,6 +214,7 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 		// ── Source nodes ──────────────────────────────────────────────────
 		{ID: "alpaca", Label: "Alpaca", Kind: "source"},
 		{ID: "news_api", Label: newsLabel, Kind: "source"},
+		{ID: "news_enricher", Label: "News Enrichment", Kind: "processing"},
 
 		// ── Processing nodes ──────────────────────────────────────────────
 		{ID: "data_enrichment", Label: "Data Enrichment", Kind: "processing"},
