@@ -93,7 +93,14 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 	if a.bus != nil {
 		selected := make([]string, len(activeAnalysts))
 		for i := range activeAnalysts {
-			selected[i] = "analyst-" + a.cfg.Roles.Analysts[i]
+			if i < len(a.cfg.Roles.Analysts) {
+				selected[i] = "analyst-" + a.cfg.Roles.Analysts[i]
+			} else if len(activeAnalysts) > 1 {
+				// Match protocol.go legacy multiple analysts: distinct cards by index.
+				selected[i] = fmt.Sprintf("analyst-%d", i)
+			} else {
+				selected[i] = "llm_analysis"
+			}
 		}
 		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
 			Ticker:           req.Ticker,

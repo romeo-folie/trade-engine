@@ -67,13 +67,17 @@ function secToDisplay(sec: number): string {
   if (sec == null) return '1h';
   if (sec < 60) return `${sec}s`;
   if (sec < 3600) return `${Math.round(sec / 60)}m`;
-  return `${Math.round(sec / 3600)}h`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
 }
 
 function displayToSec(display: string): number {
+  if (!display) return 3600;
   const val = parseInt(display);
+  if (isNaN(val)) return 3600;
   if (display.endsWith('m')) return val * 60;
   if (display.endsWith('h')) return val * 3600;
+  if (display.endsWith('d')) return val * 86400;
   return val;
 }
 
