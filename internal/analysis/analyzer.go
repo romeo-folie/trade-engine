@@ -89,17 +89,35 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 		activeAnalysts = a.analysts[:impact.Depth]
 	}
 
-	// Emit AnalysisStarted for visualization.
+	// Depth-1 bypass: single analyst cannot satisfy ensemble quorum — use single-analyst path.
+	if len(activeAnalysts) == 1 {
+		resp, meta, err := activeAnalysts[0].Analyze(ctx, req)
+		single := AnalystResult{
+			Provider: meta.Provider, Model: meta.Model,
+			Response: resp, Meta: meta, Err: err, LatencyMs: meta.LatencyMs,
+		}
+		if a.bus != nil {
+			selected := []string{"llm_analysis"}
+			if len(a.cfg.Roles.Analysts) > 0 {
+				selected = []string{"analyst-" + a.cfg.Roles.Analysts[0]}
+			}
+			a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+				Ticker:           req.Ticker,
+				Depth:            impact.Depth,
+				SelectedAnalysts: selected,
+			})
+		}
+		return AnalyzeResult{Response: resp, Meta: meta, AnalystResults: []AnalystResult{single}}, err
+	}
+
+	// Emit AnalysisStarted for visualization (depth ≥ 2).
 	if a.bus != nil {
 		selected := make([]string, len(activeAnalysts))
 		for i := range activeAnalysts {
 			if i < len(a.cfg.Roles.Analysts) {
 				selected[i] = "analyst-" + a.cfg.Roles.Analysts[i]
-			} else if len(activeAnalysts) > 1 {
-				// Match protocol.go legacy multiple analysts: distinct cards by index.
-				selected[i] = fmt.Sprintf("analyst-%d", i)
 			} else {
-				selected[i] = "llm_analysis"
+				selected[i] = fmt.Sprintf("analyst-%d", i)
 			}
 		}
 		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
