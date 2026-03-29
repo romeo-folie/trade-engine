@@ -13,6 +13,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
+	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -103,7 +104,8 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	if exec == nil {
 		exec = execution.NewPaperExecutor()
 	}
-	az := analysis.NewAnalyzer(cfg.Models)
+	bus := events.New()
+	az := analysis.NewAnalyzer(cfg.Models, bus)
 
 	// Build an enricher call that executes extraction against a single available
 	// provider (instead of full ensemble mode).
@@ -169,7 +171,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		newsProvider:      news,
 		executor:          exec,
 		portfolio:         portfolio.NewTracker(time.Hour),
-		bus:               events.New(),
+		bus:               bus, // use the same bus as az
 		enricher:          knowledge.NewEnricher(cfg, callFn),
 		embedder:          emb,
 		newsLastFetched:   make(map[string]time.Time),
@@ -650,6 +652,10 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 			Sentiment:   sentimentLabel(n.SentimentScore),
 		})
 	}
+	e.bus.Publish(events.NewsEnriched, events.NewsEnrichedPayload{
+		Ticker: ticker,
+		Count:  len(snippets),
+	})
 
 	// Build knowledge graph context for this ticker (best-effort; non-fatal).
 	var knowledgeCtx string
@@ -708,7 +714,8 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		Portfolio: analysis.PortfolioContext{}, // Phase 4
 	}
 
-	result, err := e.analyzer.AnalyzeFull(ctx, req)
+	impact := e.calculateImpactScore(ticker, snippets, candles)
+	result, err := e.analyzer.AnalyzeFull(ctx, req, impact)
 
 	// Record token usage for cost tracking (#177) — BEFORE checking err.
 	// AnalyzeFull can return a non-nil result alongside a non-nil error (e.g.
@@ -1675,4 +1682,39 @@ func (e *Engine) runRetention(ctx context.Context) {
 	if n1 > 0 || n2 > 0 {
 		logger.Info("retention complete", "intraday_candles", n1, "prompt_cache", n2)
 	}
+}
+func (e *Engine) calculateImpactScore(ticker string, snippets []analysis.NewsSnippet, candles []data.Candle) depth.ImpactScore {
+	if !e.cfg.Analysis.AdaptiveDepth.Enabled {
+		return depth.ImpactScore{Score: 1.0, Depth: 3} // default to full depth
+	}
+
+	// 1. ATRPct
+	var atrPct float64
+	if len(candles) > 0 {
+		_ = candles[len(candles)-1]
+		atrPct = 2.0 // placeholder for 2%
+	}
+
+	// 2. NewsChanged
+	newsChanged := false
+	if len(snippets) > 0 {
+		// hash comparison logic here...
+		newsChanged = true
+	}
+
+	// 3. RiskProximity
+	riskProximity := 0.0
+	// ...
+
+	// 4. ADX
+	adx := 25.0 // placeholder
+
+	tc := depth.TickContext{
+		ATRPct:           atrPct,
+		NewsChanged:      newsChanged,
+		RiskProximityPct: riskProximity,
+		ADX:              adx,
+	}
+
+	return depth.Score(tc, e.cfg.Analysis.AdaptiveDepth)
 }

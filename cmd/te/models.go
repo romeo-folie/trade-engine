@@ -30,7 +30,7 @@ var modelsListCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		providers := az.Providers()
 
 		fmt.Printf("%-20s  %-12s  %-30s  %s\n", "ROLE", "PROVIDER", "MODEL", "STATUS")
@@ -72,7 +72,7 @@ var modelsTestCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		providers := az.Providers()
 		prompt := strings.Join(args, " ")
 		req := analysis.AnalysisRequest{Ticker: prompt, Strategy: "test"}
@@ -133,7 +133,7 @@ var modelsCompareCmd = &cobra.Command{
 		}
 		defer store.Close()
 
-		az := analysis.NewAnalyzer(cfg.Models)
+		az := analysis.NewAnalyzer(cfg.Models, nil)
 		req := analysis.AnalysisRequest{Ticker: ticker, Strategy: "momentum"}
 
 		fmt.Fprintf(os.Stderr, "→ Querying %d analysts for %s…\n", len(az.Providers()), ticker)
@@ -228,8 +228,11 @@ var modelsPerformanceCmd = &cobra.Command{
 			pnl, wr := "─", "─"
 			if r.AvgPnLPct != nil { pnl = fmt.Sprintf("%+.2f%%", *r.AvgPnLPct) }
 			if r.WinRate != nil    { wr  = fmt.Sprintf("%.1f%%", *r.WinRate*100) }
+			provider := "unknown"; if r.Provider != nil { provider = *r.Provider }
+			model := "unknown"; if r.Model != nil { model = *r.Model }
+			conf := 0.0; if r.AvgConfidence != nil { conf = *r.AvgConfidence }
 			fmt.Printf("%-14s  %-30s  %8d  %10s  %8s  %8.3f\n",
-				r.Provider, r.Model, r.TradeCount, pnl, wr, r.AvgConfidence)
+				provider, model, r.TradeCount, pnl, wr, conf)
 		}
 		if asJSON {
 			enc := json.NewEncoder(os.Stdout)

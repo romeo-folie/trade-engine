@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -321,7 +322,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 			Ticker:             gap.Ticker,
 			CustomSystemPrompt: sysPrompt,
 			CustomUserMessage:  userMsg,
-		})
+		}, depth.ImpactScore{Score: 1.0, Depth: 3})
 		if err != nil {
 			fmt.Printf("orb: LLM scoring %s failed: %v\n", gap.Ticker, err)
 			continue

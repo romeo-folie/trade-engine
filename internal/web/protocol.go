@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"time"
 
@@ -62,7 +63,9 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	case events.DataFetched:
 		return "alpaca", "indicator_engine", "DataFetched"
 	case events.NewsFetched:
-		return "news_api", "indicator_engine", "NewsFetched"
+		return "news_api", "news_enricher", "NewsFetched"
+	case events.NewsEnriched:
+		return "news_enricher", "indicator_engine", "NewsEnriched"
 	case events.IndicatorsComputed:
 		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
 	case events.AnalysisCompleted:
@@ -71,6 +74,9 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 		return "llm_analysis", "llm_analysis", "AnalystVotesPublished"
 	case events.ArbiterInvoked:
 		return "consensus", "arbiter_node", "ArbiterInvoked"
+	case events.AnalysisStarted:
+		// Target is dynamically determined from payload in toWebEvent
+		return "prompt_assembly", "analyst-set", "AnalysisStarted"
 
 	// ── Signal flow ──────────────────────────────────────────────────────
 	case events.SignalGenerated:
@@ -182,18 +188,25 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 
 	// Analyst nodes — one per configured analyst, falling back to a single placeholder.
 	var analystNodes []NodeState
-	if cfg != nil && len(cfg.Models.Roles.Analysts) > 0 {
-		for _, roleKey := range cfg.Models.Roles.Analysts {
-			entry, ok := cfg.Models.Registry[roleKey]
-			if !ok {
-				continue
+	if cfg != nil {
+		roleAnalysts := cfg.Models.Roles.Analysts
+		for i, ac := range cfg.Models.AnalystConfigs() {
+			id := "llm_analysis"
+			var roleKey string
+			if i < len(roleAnalysts) {
+				roleKey = roleAnalysts[i]
+				id = "analyst-" + roleKey
+			} else if len(cfg.Models.AnalystConfigs()) > 1 {
+				// Legacy multiple analysts: use index to allow distinct cards
+				id = fmt.Sprintf("analyst-%d", i)
 			}
+
 			analystNodes = append(analystNodes, NodeState{
-				ID:    "analyst-" + roleKey,
-				Label: entry.Model,
+				ID:    id,
+				Label: ac.Model,
 				Kind:  "processing",
 				Meta: map[string]any{
-					"provider":     entry.Provider,
+					"provider":     ac.Provider,
 					"registry_key": roleKey,
 				},
 			})
@@ -209,6 +222,7 @@ func pipelineNodes(cfg *appconfig.Config) []NodeState {
 		// ── Source nodes ──────────────────────────────────────────────────
 		{ID: "alpaca", Label: "Alpaca", Kind: "source"},
 		{ID: "news_api", Label: newsLabel, Kind: "source"},
+		{ID: "news_enricher", Label: "News Enrichment", Kind: "processing"},
 
 		// ── Processing nodes ──────────────────────────────────────────────
 		{ID: "data_enrichment", Label: "Data Enrichment", Kind: "processing"},

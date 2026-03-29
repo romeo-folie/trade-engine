@@ -11,7 +11,7 @@ export interface WebEvent {
 export interface NodeState {
   id: string;
   label: string;
-  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter' | 'ticker' | 'arbiter_final';
+  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter' | 'ticker' | 'arbiter_final' | 'enricher';
   event_count: number;
   last_event_at?: string;
   avg_latency_ms?: number;
@@ -33,9 +33,11 @@ export const PARTICLE_COLORS: Record<string, string> = {
   DataFetched:          '#0EA5E9', // sky blue
   IndicatorsComputed:   '#06B6D4', // cyan
   // News
+  NewsEnriched:         '#F59E0B', // amber
   NewsIngested:         '#F59E0B', // amber
   // LLM / Analysis
   AnalysisCompleted:    '#8B5CF6', // violet
+  AnalysisStarted:      '#6366F1', // indigo
   AnalystVotesPublished:'#A855F7', // light purple
   ArbiterInvoked:       '#EC4899', // pink — resolution
   // Signal flow
@@ -64,7 +66,9 @@ export function particleColor(eventType: string): string {
 export const EVENT_LABELS: Record<string, string> = {
   DataFetched:        'Market Data',
   IndicatorsComputed: 'Indicators',
+  NewsEnriched:       'News',
   AnalysisCompleted:    'Analysis',
+  AnalysisStarted:      'Dispatch',
   AnalystVotesPublished:'Votes',
   ArbiterInvoked:       'Resolver',
   SignalGenerated:    'Signal',

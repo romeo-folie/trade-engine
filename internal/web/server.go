@@ -199,11 +199,10 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			msg := toWebEvent(ev)
-			if msg == nil {
-				continue
+			msgs := toWebEvents(ev)
+			for _, msg := range msgs {
+				s.hub.broadcast(ctx, msg)
 			}
-			s.hub.broadcast(ctx, msg)
 		}
 	}
 }
@@ -377,9 +376,46 @@ func serveNoFrontend(w http.ResponseWriter, _ *http.Request) {
 </body></html>`))
 }
 
-// toWebEvent converts an internal engine event to a wire-format WebEvent.
-// Returns nil for event types that should not be forwarded to the browser.
-func toWebEvent(ev events.Event) *WebEvent {
+// toWebEvents converts an internal engine event to one or more wire-format WebEvents.
+// Returns an empty slice for event types that should not be forwarded.
+func toWebEvents(ev events.Event) []*WebEvent {
+	// Handle fan-out events that produce multiple web pulses (Complex Routing).
+	switch ev.Type {
+	case events.AnalysisStarted:
+		payload, ok := ev.Payload.(events.AnalysisStartedPayload)
+		if !ok {
+			return nil
+		}
+		var msgs []*WebEvent
+		tickerJSON, _ := json.Marshal(map[string]string{"ticker": payload.Ticker})
+		for _, target := range payload.SelectedAnalysts {
+			msgs = append(msgs, &WebEvent{
+				Type:      "AnalysisStarted",
+				Timestamp: ev.Timestamp,
+				Source:    "prompt_assembly",
+				Target:    target,
+				Payload:   json.RawMessage(tickerJSON),
+			})
+		}
+		return msgs
+
+	case events.AnalystVotesPublished:
+		payload, ok := ev.Payload.(events.AnalystVotesPublishedPayload)
+		if !ok {
+			return nil
+		}
+		raw, _ := json.Marshal(payload)
+		// Emit a single AnalystVotesPublished event per cycle — frontend reads all votes
+		// from the payload. Emitting one per non-skipped vote was redundant and inflated WS traffic.
+		return []*WebEvent{{
+			Type:      "AnalystVotesPublished",
+			Timestamp: ev.Timestamp,
+			Source:    "llm_analysis",
+			Target:    "consensus",
+			Payload:   json.RawMessage(raw),
+		}}
+	}
+
 	src, dst, evType := mapEventEdge(ev.Type)
 	if evType == "" {
 		return nil
@@ -388,14 +424,13 @@ func toWebEvent(ev events.Event) *WebEvent {
 	if err != nil {
 		logger.Warn("web: failed to marshal event payload",
 			"type", string(ev.Type), "err", err.Error())
-		// Send event without payload so the UI still sees pipeline activity.
 		payload = nil
 	}
-	return &WebEvent{
+	return []*WebEvent{{
 		Type:      evType,
 		Timestamp: ev.Timestamp,
 		Source:    src,
 		Target:    dst,
 		Payload:   json.RawMessage(payload),
-	}
+	}}
 }

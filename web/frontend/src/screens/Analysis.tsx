@@ -118,8 +118,7 @@ export default function AnalysisScreen() {
       {/* Breadcrumb + auto-refresh */}
       <div className={styles.headerRow}>
         <div className={styles.breadcrumb}>
-          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
-          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbBrand}>~/</span>
           <span className={styles.breadcrumbPage}>ANALYSIS</span>
         </div>
         <div className={styles.autoRefresh}>

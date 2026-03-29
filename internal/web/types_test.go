@@ -72,14 +72,14 @@ func TestMapAnalystResults_validResults(t *testing.T) {
 	}
 
 	// Check names
-	if analysts[0].Name != "Technical" {
-		t.Errorf("expected Technical, got %s", analysts[0].Name)
+	if analysts[0].Name != "Standard Analysis" {
+		t.Errorf("expected Standard Analysis, got %s", analysts[0].Name)
 	}
-	if analysts[1].Name != "Momentum" {
-		t.Errorf("expected Momentum, got %s", analysts[1].Name)
+	if analysts[1].Name != "High-Depth Analysis" {
+		t.Errorf("expected High-Depth Analysis, got %s", analysts[1].Name)
 	}
-	if analysts[2].Name != "Sentiment" {
-		t.Errorf("expected Sentiment, got %s", analysts[2].Name)
+	if analysts[2].Name != "Deep-Reasoning Analysis" {
+		t.Errorf("expected Deep-Reasoning Analysis, got %s", analysts[2].Name)
 	}
 
 	// Check verdict mapping

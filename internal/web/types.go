@@ -29,7 +29,7 @@ type APIEnsembleResult struct {
 // both this slice and ensemble.go in the same commit — they are coupled.
 // Long-term fix: have AnalystResult carry its own Name field so this mapping
 // is unnecessary (tracked as a follow-up task).
-var analystNames = []string{"Technical", "Momentum", "Sentiment", "Macro"}
+var analystNames = []string{"Standard Analysis", "High-Depth Analysis", "Deep-Reasoning Analysis", "Macro Analysis"}
 
 func analystName(idx int) string {
 	if idx < len(analystNames) {

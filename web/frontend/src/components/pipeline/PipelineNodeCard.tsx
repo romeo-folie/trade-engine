@@ -32,6 +32,7 @@ export interface PipelineNodeData {
   accentColor?: string;
   watchlistTickers?: WatchlistTicker[];
   isOrbMode?: boolean;
+  isChosen?: boolean;
   [key: string]: unknown;
 }
 
@@ -163,16 +164,31 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           </div>
         )}
 
+        {/* ── Enricher Template ── */}
+        {d.kind === 'enricher' && (
+          <div className={styles.enricherContent}>
+            <div className={styles.subValue}>SENTIMENT EXTRACTION</div>
+            <div className={styles.metricValue} style={{ color: colors.amber }}>
+              {d.eventCount > 0 ? `${d.eventCount} ARTICLES` : 'LISTENING'}
+            </div>
+            <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'ENRICHING' : 'IDLE'}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* ── Analyst Template ── */}
         {isAnalyst && (
           <div>
             {d.provider && (
-              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 2 }}>
+              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>
                 {d.provider.toUpperCase()}
               </div>
             )}
             {!d.provider && (
-              <div className={styles.subValue} style={{ fontSize: 9 }}>LLM ENSEMBLE</div>
+              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>LLM ENSEMBLE</div>
             )}
             {/* Per-analyst live vote badge */}
             {(() => {
@@ -181,7 +197,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               const isSkipped = d.skipped as boolean | undefined;
               if (isSkipped) {
                 return (
-                  <div className={styles.kindLabel} style={{ opacity: 0.4, marginTop: 4, fontSize: 11 }}>
+                  <div className={styles.kindLabel} style={{ opacity: 0.4, marginTop: 8, fontSize: 11 }}>
                     SKIPPED
                   </div>
                 );
@@ -190,7 +206,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 const vColor = liveVerdict === 'BUY' ? colors.emerald : liveVerdict === 'SELL' ? colors.red : colors.amber;
                 const vLabel = liveVerdict === 'BUY' ? 'LONG' : liveVerdict === 'SELL' ? 'SHORT' : liveVerdict;
                 return (
-                  <div style={{ marginTop: 4, display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
                     <span style={{ color: vColor, fontWeight: 700, fontSize: 14, fontFamily: 'var(--font-mono)' }}>
                       {vLabel}
                     </span>
@@ -204,36 +220,32 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               }
               return null;
             })()}
-            {nodeActive ? (
-              <>
-                {!d.verdict && !d.skipped && (
-                  <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-                    {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-                     verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-                  </div>
-                )}
-                {d.accuracy !== undefined && d.accuracy > 0 && (
-                  <div className={styles.kindLabel} style={{ opacity: 0.7 }}>
-                    ACC: {Math.round(d.accuracy * 100)}%
-                  </div>
-                )}
-                <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-                  {d.eventCount > 0 ? `${d.eventCount} SIGNALS` : 'ANALYZING'}
-                </div>
-              </>
+            {d.isChosen ? (
+              <div className={styles.feedStatusRow} style={{ marginTop: 12 }}>
+                <span className={styles.feedBadgeActive} style={{ background: 'rgba(57, 255, 20, 0.15)', border: '1px solid #39FF14', boxShadow: '0 0 10px rgba(57, 255, 20, 0.2)' }}>
+                  ACTIVE
+                </span>
+              </div>
             ) : (
-              <>
-                {!d.verdict && !d.skipped && (
-                  <>
-                    <div className={`${styles.analystVerdict} ${styles.verdictNeutral}`} style={{ fontSize: 16 }}>
-                      —
-                    </div>
-                    <div className={styles.feedStatusRow} style={{ marginTop: 6 }}>
-                      <span className={styles.feedBadgeIdle}>STANDBY</span>
-                    </div>
-                  </>
-                )}
-              </>
+              <div className={styles.feedStatusRow} style={{ marginTop: 12 }}>
+                <span className={styles.feedBadgeIdle}>STANDBY</span>
+              </div>
+            )}
+            {!d.verdict && !d.skipped && d.isChosen && (
+              <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
+                {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
+                 verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
+              </div>
+            )}
+            {d.accuracy !== undefined && d.accuracy > 0 && d.isChosen && (
+              <div className={styles.kindLabel} style={{ opacity: 0.7, marginTop: 8 }}>
+                ACC: {Math.round(d.accuracy * 100)}%
+              </div>
+            )}
+            {d.eventCount > 0 && d.isChosen && (
+              <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
+                {d.eventCount} SIGNALS
+              </div>
             )}
           </div>
         )}
@@ -446,10 +458,10 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
         {d.kind === 'arbiter_final' && (
           <div>
-            <div className={styles.nodeTitle} style={{ color: accentColor || colors.amber }}>
+            <div className={styles.nodeTitle}>
               {((d.meta as Record<string, unknown>)?.model as string) || (d.label && d.label !== 'Arbiter' && d.label !== '-' ? d.label : '-')}
             </div>
-            <div className={styles.subValue} style={{ marginTop: 2 }}>Ensemble Resolver</div>
+            <div className={styles.subValue} style={{ marginTop: 2 }}>{d.provider ? d.provider.toUpperCase() : 'ENSEMBLE RESOLVER'}</div>
             <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 4, opacity: 0.5 }}>
               RESOLVES DISSENT
             </div>

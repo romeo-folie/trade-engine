@@ -107,10 +107,10 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 // JSON tags use Provider/Model to preserve the shared /api/node/models contract consumed by
 // both DrillDownPanel (llm_analysis, consensus tabs) and the System screen model-performance table.
 type ModelPerformanceRow struct {
-	Provider             string   `json:"Provider"`
-	Model                string   `json:"Model"`
+	Provider             *string  `json:"Provider"`
+	Model                *string  `json:"Model"`
 	TotalRecommendations int      `json:"TotalRecommendations"`
-	AvgConfidence        float64  `json:"AvgConfidence"`
+	AvgConfidence        *float64 `json:"AvgConfidence"`
 	TradeCount           int      `json:"TradeCount"`
 	AvgPnLPct            *float64 `json:"AvgPnLPct"`
 	WinningTrades        int      `json:"WinningTrades"`
@@ -121,7 +121,7 @@ type ModelPerformanceRow struct {
 // GetModelPerformance returns per-model accuracy stats (Phase 12.6).
 func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformanceRow, error) {
 	q := `
-		SELECT provider, model,
+		SELECT COALESCE(provider, 'unknown'), COALESCE(model, 'unknown'),
 		       total_recommendations, avg_confidence,
 		       trade_count, avg_pnl_pct,
 		       winning_trades, losing_trades, win_rate

@@ -52,17 +52,38 @@ const DEFAULTS = {
 type Config = typeof DEFAULTS;
 
 function formatNumber(n: number): string {
+  if (n == null) return '0';
   return n.toLocaleString('en-US');
 }
 
 function parseFormattedNumber(s: string): number {
+  if (!s) return 0;
   const cleaned = s.replace(/,/g, '');
   const n = Number(cleaned);
   return Number.isNaN(n) ? 0 : n;
 }
 
+function secToDisplay(sec: number): string {
+  if (sec == null) return '1h';
+  if (sec < 60) return `${sec}s`;
+  if (sec < 3600) return `${Math.round(sec / 60)}m`;
+  if (sec < 86400) return `${Math.round(sec / 3600)}h`;
+  return `${Math.round(sec / 86400)}d`;
+}
+
+function displayToSec(display: string): number {
+  if (!display) return 3600;
+  const val = parseInt(display);
+  if (isNaN(val)) return 3600;
+  if (display.endsWith('m')) return val * 60;
+  if (display.endsWith('h')) return val * 3600;
+  if (display.endsWith('d')) return val * 86400;
+  return val;
+}
+
 export default function ConfigScreen() {
   const [config, setConfig] = useState<Config>({ ...DEFAULTS });
+  const [isSaving, setIsSaving] = useState(false);
   const savedRef = useRef<Config>({ ...DEFAULTS });
   const [toast, setToast] = useState<string | null>(null);
   const [showRestartModal, setShowRestartModal] = useState(false);
@@ -92,9 +113,108 @@ export default function ConfigScreen() {
     toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   }, []);
 
-  const handleSave = useCallback(() => {
-    savedRef.current = { ...config };
-    showToast('Config saved locally — daemon restart required.');
+  useEffect(() => {
+    async function loadConfig() {
+      try {
+        const res = await fetch('/api/system/config');
+        if (!res.ok) throw new Error('Failed to fetch config');
+        const data = await res.json();
+        
+        const mapped: Config = {
+          ...DEFAULTS,
+          mode: data.engine?.mode || DEFAULTS.mode,
+          tickInterval: secToDisplay(data.engine?.tick_interval_sec),
+          dryRun: data.engine?.dry_run ?? DEFAULTS.dryRun,
+          initialCapital: data.engine?.initial_capital || DEFAULTS.initialCapital,
+          confidenceThreshold: data.risk?.confidence_threshold || DEFAULTS.confidenceThreshold,
+          maxPositionSize: data.risk?.max_position_pct || DEFAULTS.maxPositionSize,
+          maxOpenPositions: data.risk?.max_open_positions || DEFAULTS.maxOpenPositions,
+          dailyLossLimit: data.risk?.daily_loss_limit_pct || DEFAULTS.dailyLossLimit,
+          maxDrawdownPct: data.risk?.max_drawdown_pct || DEFAULTS.maxDrawdownPct,
+          cooldownAfterLoss: data.risk?.cooldown_after_loss_min || DEFAULTS.cooldownAfterLoss,
+          signalExpiry: data.risk?.signal_expiry_min || DEFAULTS.signalExpiry,
+          strategies: {
+            trendFollowing: data.strategies?.trend_following?.enabled ?? DEFAULTS.strategies.trendFollowing,
+            meanReversion: data.strategies?.mean_reversion?.enabled ?? DEFAULTS.strategies.meanReversion,
+            momentum: data.strategies?.momentum?.enabled ?? DEFAULTS.strategies.momentum,
+            newsSentiment: data.strategies?.news_sentiment?.enabled ?? DEFAULTS.strategies.newsSentiment,
+          },
+          analystCheap: data.models?.roles?.analysts?.[0] || DEFAULTS.analystCheap,
+          analystMid: data.models?.roles?.analysts?.[1] || DEFAULTS.analystMid,
+          analystFrontier: data.models?.roles?.analysts?.[2] || DEFAULTS.analystFrontier,
+          arbiter: data.models?.roles?.arbiter || DEFAULTS.arbiter,
+          classifier: data.models?.roles?.classifier || DEFAULTS.classifier,
+          costProfile: data.cost?.profile || DEFAULTS.costProfile,
+          dailyTokenBudget: data.cost?.daily_token_budget || DEFAULTS.dailyTokenBudget,
+          weeklyTokenBudget: data.cost?.weekly_token_budget || DEFAULTS.weeklyTokenBudget,
+          autoDegradeBudget: data.cost?.auto_degrade_on_budget_hit ?? DEFAULTS.autoDegradeBudget,
+          telegram: data.notifications?.telegram?.enabled ?? DEFAULTS.telegram,
+          notifySignal: data.notifications?.telegram?.notify_on?.includes('signal_generated') ?? DEFAULTS.notifySignal,
+          notifyTrade: data.notifications?.telegram?.notify_on?.includes('trade_executed') ?? DEFAULTS.notifyTrade,
+          notifyError: data.notifications?.telegram?.notify_on?.includes('error_occurred') ?? DEFAULTS.notifyError,
+          batchEnabled: data.notifications?.telegram?.batch_enabled ?? DEFAULTS.batchEnabled,
+          batchWindow: data.notifications?.telegram?.batch_window_sec ?? DEFAULTS.batchWindow,
+          minConfidenceAlert: data.notifications?.telegram?.min_confidence_for_alert || DEFAULTS.minConfidenceAlert,
+          includeHolds: data.notifications?.telegram?.include_holds ?? DEFAULTS.includeHolds,
+        };
+        
+        setConfig(mapped);
+        savedRef.current = { ...mapped };
+      } catch (err) {
+        showToast('Failed to load system config.');
+      }
+    }
+    loadConfig();
+  }, [showToast]);
+
+  const handleSave = useCallback(async () => {
+    setIsSaving(true);
+    const payload = {
+      mode: config.mode,
+      tick_interval_sec: displayToSec(config.tickInterval),
+      initial_capital: config.initialCapital,
+      dry_run: config.dryRun,
+      confidence_threshold: config.confidenceThreshold,
+      max_position_pct: config.maxPositionSize,
+      max_open_positions: config.maxOpenPositions,
+      daily_loss_limit_pct: config.dailyLossLimit,
+      max_drawdown_pct: config.maxDrawdownPct,
+      cooldown_after_loss: config.cooldownAfterLoss,
+      signal_expiry: config.signalExpiry,
+      cost_profile: config.costProfile,
+      daily_token_budget: config.dailyTokenBudget,
+      weekly_token_budget: config.weeklyTokenBudget,
+      auto_degrade_budget: config.autoDegradeBudget,
+      telegram_enabled: config.telegram,
+      analyst_cheap: config.analystCheap,
+      analyst_mid: config.analystMid,
+      analyst_frontier: config.analystFrontier,
+      arbiter: config.arbiter,
+      classifier: config.classifier,
+      // Strategy maps
+      'strategies.trend_following.enabled': config.strategies.trendFollowing,
+      'strategies.mean_reversion.enabled': config.strategies.meanReversion,
+      'strategies.momentum.enabled': config.strategies.momentum,
+      'strategies.news_sentiment.enabled': config.strategies.newsSentiment,
+    };
+
+    try {
+      const res = await fetch('/api/system/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        savedRef.current = { ...config };
+        showToast('Config saved to disk — daemon restart required.');
+      } else {
+        showToast('Failed to persist configuration.');
+      }
+    } catch (e) {
+      showToast('Connection error failed to save.');
+    } finally {
+      setIsSaving(false);
+    }
   }, [config, showToast]);
 
   const handleDiscard = useCallback(() => {
@@ -116,12 +236,10 @@ export default function ConfigScreen() {
       {/* ── Header ── */}
       <div className={styles.headerRow}>
         <div className={styles.breadcrumb}>
-          <span className={styles.breadcrumbBrand}>TRADEENGINE</span>
-          <span className={styles.breadcrumbSep}> / </span>
+          <span className={styles.breadcrumbBrand}>~/</span>
           <span className={styles.breadcrumbPage}>CONFIG</span>
         </div>
         <div className={styles.headerRight}>
-          <span>{ENGINE_VERSION}</span>
           <span className={styles.statusDot} />
           <span>ALL SYSTEMS NOMINAL</span>
         </div>
@@ -392,23 +510,23 @@ export default function ConfigScreen() {
           <SettingsSection title="System Actions">
             <ChamferedBox
               chamfer={6}
-              backgroundColor={colors.amber}
+              backgroundColor="transparent"
               borderColor={colors.amber}
               onClick={() => setShowRestartModal(true)}
               className={styles.btnAmber}
               style={{ marginBottom: 16, padding: '10px 0', textAlign: 'center' }}
             >
-              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Restart Engine</span>
+              <span style={{ color: colors.amber, fontWeight: 700 }}>Restart Engine</span>
             </ChamferedBox>
             <ChamferedBox
               chamfer={6}
-              backgroundColor={colors.red}
+              backgroundColor="transparent"
               borderColor={colors.red}
               onClick={handleReset}
               className={styles.btnRed}
               style={{ padding: '10px 0', textAlign: 'center' }}
             >
-              <span style={{ color: '#0D0D11', fontWeight: 700 }}>Reset to Defaults</span>
+              <span style={{ color: colors.red, fontWeight: 700 }}>Reset to Defaults</span>
             </ChamferedBox>
             <span className={styles.versionText}>
               TradeEngine {ENGINE_VERSION} — Build 20260318
@@ -433,11 +551,17 @@ export default function ConfigScreen() {
           chamfer={6}
           backgroundColor={colors.acidGreen}
           borderColor={colors.acidGreen}
-          onClick={handleSave}
+          onClick={isSaving ? undefined : handleSave}
           className={styles.saveBtn}
-          style={{ padding: '8px 24px' }}
+          style={{ 
+            padding: '8px 24px', 
+            opacity: isSaving ? 0.5 : 1, 
+            cursor: isSaving ? 'not-allowed' : 'pointer' 
+          }}
         >
-          <span style={{ color: '#0D0D11', fontWeight: 700 }}>Save Changes</span>
+          <span style={{ color: '#0D0D11', fontWeight: 700 }}>
+            {isSaving ? 'SAVING...' : 'Save Changes'}
+          </span>
         </ChamferedBox>
       </footer>
 

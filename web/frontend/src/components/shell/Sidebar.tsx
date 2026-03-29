@@ -27,8 +27,8 @@ const NAV_ITEMS: NavItem[] = [
   { label: 'Trades',    icon: BarChart2,   path: '/trades' },
   { label: 'Analysis',  icon: Brain,      path: '/analysis' },
   { label: 'Backtests', icon: RefreshCw,  path: '/backtests' },
-  { label: 'Config',    icon: Settings,   path: '/config' },
   { label: 'System',    icon: Server,     path: '/system' },
+  { label: 'Config',    icon: Settings,   path: '/config' },
 ];
 
 const ICON_SIZE = 18;
@@ -73,6 +73,7 @@ export default function Sidebar() {
           <NavLink
             to={path}
             aria-label={label}
+            className=""
             style={({ isActive }) => ({
               display: 'flex',
               alignItems: 'center',
@@ -81,7 +82,10 @@ export default function Sidebar() {
               height: 36,
               borderRadius: 4,
               color: isActive ? colors.acidGreen : colors.textDim,
-              background: isActive ? `${colors.acidGreen}11` : 'transparent',
+              background: 'transparent',
+              border: 'none',
+              outline: 'none',
+              boxShadow: 'none',
               transition: 'all 0.2s ease',
             })}
           >

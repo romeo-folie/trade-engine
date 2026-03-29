@@ -20,8 +20,8 @@
 
 /* active variant: full green perimeter (brackets not rendered when active=true) */
 .active {
-  outline: 1px solid var(--accent, #39FF14);
-  box-shadow: 0 0 8px rgba(57, 255, 20, 0.2);
+  outline: 1.5px solid var(--bracket-color, var(--accent));
+  box-shadow: 0 0 12px var(--bracket-color, rgba(57, 255, 20, 0.2));
 }
 
 /* ── Base span ─────────────────────────────────────────────────────────── */

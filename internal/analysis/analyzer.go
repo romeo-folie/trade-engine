@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
@@ -17,12 +19,13 @@ type Analyzer struct {
 	analysts []ModelProvider
 	arbiter  ModelProvider
 	cfg      config.ModelsConfig
+	bus      *events.Bus
 }
 
 // NewAnalyzer constructs an Analyzer from the models config section.
 // Uses registry roles when present (models.registry + models.roles.analysts).
 // Falls back to legacy cfg.Analysts[], then cfg.Primary.
-func NewAnalyzer(cfg config.ModelsConfig) *Analyzer {
+func NewAnalyzer(cfg config.ModelsConfig, bus *events.Bus) *Analyzer {
 	var analysts []ModelProvider
 	// Registry path: AnalystConfigs() transparently returns registry entries
 	// when available, falling back to legacy Analysts[] otherwise.
@@ -41,7 +44,7 @@ func NewAnalyzer(cfg config.ModelsConfig) *Analyzer {
 	if ac := cfg.ArbiterConfig(); ac.Provider != "" {
 		arbiter = buildProvider(ac)
 	}
-	return &Analyzer{analysts: analysts, arbiter: arbiter, cfg: cfg}
+	return &Analyzer{analysts: analysts, arbiter: arbiter, cfg: cfg, bus: bus}
 }
 
 // Primary returns the first configured analyst for backward compat.
@@ -62,44 +65,70 @@ func (a *Analyzer) Providers() []ModelProvider {
 // Arbiter returns the configured arbiter provider (may be nil).
 func (a *Analyzer) Arbiter() ModelProvider { return a.arbiter }
 
+// Bus returns the event bus used by this analyzer.
+func (a *Analyzer) Bus() *events.Bus { return a.bus }
+
 // Analyze is the primary engine entry-point. Routes to single or ensemble mode.
-func (a *Analyzer) Analyze(ctx context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
-	res, err := a.AnalyzeFull(ctx, req)
+func (a *Analyzer) Analyze(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) (AnalysisResponse, ModelCallMeta, error) {
+	res, err := a.AnalyzeFull(ctx, req, impact)
 	return res.Response, res.Meta, err
 }
 
-// AnalyzeFull returns the full result including per-analyst breakdown.
-func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest) (AnalyzeResult, error) {
+// AnalyzeFull executes either a single-model analysis or a full ensemble
+// based on consensus config.
+func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) (AnalyzeResult, error) {
 	if !a.cfg.Consensus.Enabled || len(a.analysts) <= 1 {
 		resp, meta, err := a.analyzeSingle(ctx, req)
 		single := AnalystResult{Provider: meta.Provider, Model: meta.Model, Response: resp, Meta: meta, Err: err, LatencyMs: meta.LatencyMs}
 		return AnalyzeResult{Response: resp, Meta: meta, AnalystResults: []AnalystResult{single}}, err
 	}
-	return a.analyzeEnsembleResult(ctx, req)
-}
 
-func (a *Analyzer) analyzeSingle(ctx context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
-	primary := a.Primary()
-	if primary == nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("no analysts configured")
+	// Filter analysts based on adaptive depth (when enabled).
+	activeAnalysts := a.analysts
+	if impact.Depth > 0 && impact.Depth < len(a.analysts) {
+		activeAnalysts = a.analysts[:impact.Depth]
 	}
-	if !primary.IsAvailable() {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("primary analyst %s/%s is not available", primary.ProviderName(), primary.ModelName())
-	}
-	resp, meta, err := primary.Analyze(ctx, req)
-	if err != nil {
-		logger.Warn("primary analyst failed", "ticker", req.Ticker, "provider", primary.ProviderName(), "model", primary.ModelName(), "err", err)
-	}
-	return resp, meta, err
-}
 
-func (a *Analyzer) analyzeEnsembleResult(ctx context.Context, req AnalysisRequest) (AnalyzeResult, error) {
-	results, err := a.AnalyzeEnsemble(ctx, req)
+	// Depth-1 bypass: single analyst cannot satisfy ensemble quorum — use single-analyst path.
+	if len(activeAnalysts) == 1 {
+		resp, meta, err := activeAnalysts[0].Analyze(ctx, req)
+		single := AnalystResult{
+			Provider: meta.Provider, Model: meta.Model,
+			Response: resp, Meta: meta, Err: err, LatencyMs: meta.LatencyMs,
+		}
+		if a.bus != nil {
+			selected := []string{"llm_analysis"}
+			if len(a.cfg.Roles.Analysts) > 0 {
+				selected = []string{"analyst-" + a.cfg.Roles.Analysts[0]}
+			}
+			a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+				Ticker:           req.Ticker,
+				Depth:            impact.Depth,
+				SelectedAnalysts: selected,
+			})
+		}
+		return AnalyzeResult{Response: resp, Meta: meta, AnalystResults: []AnalystResult{single}}, err
+	}
+
+	// Emit AnalysisStarted for visualization (depth ≥ 2).
+	if a.bus != nil {
+		selected := make([]string, len(activeAnalysts))
+		for i := range activeAnalysts {
+			if i < len(a.cfg.Roles.Analysts) {
+				selected[i] = "analyst-" + a.cfg.Roles.Analysts[i]
+			} else {
+				selected[i] = fmt.Sprintf("analyst-%d", i)
+			}
+		}
+		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+			Ticker:           req.Ticker,
+			Depth:            impact.Depth,
+			SelectedAnalysts: selected,
+		})
+	}
+
+	results, err := a.AnalyzeEnsembleWithSet(ctx, req, activeAnalysts)
 	if err != nil {
-		// Return partial results alongside the error so callers can still
-		// record token usage from analyst Metas. Providers consume tokens
-		// before erroring (e.g. JSON extraction failures), so discarding
-		// results would undercount spend and delay guardrail enforcement.
 		return AnalyzeResult{AnalystResults: results}, err
 	}
 
@@ -142,13 +171,33 @@ func (a *Analyzer) analyzeEnsembleResult(ctx context.Context, req AnalysisReques
 	return AnalyzeResult{Response: arbResult.Final, Meta: arbResult.Meta, AnalystResults: results, Arbiter: &arbResult}, nil
 }
 
+func (a *Analyzer) analyzeSingle(ctx context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
+	primary := a.Primary()
+	if primary == nil {
+		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("no analysts configured")
+	}
+	if !primary.IsAvailable() {
+		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("primary analyst %s/%s is not available", primary.ProviderName(), primary.ModelName())
+	}
+	resp, meta, err := primary.Analyze(ctx, req)
+	if err != nil {
+		logger.Warn("primary analyst failed", "ticker", req.Ticker, "provider", primary.ProviderName(), "model", primary.ModelName(), "err", err)
+	}
+	return resp, meta, err
+}
+
 // ─── 12.3: Parallel analyst fan-out ──────────────────────────────────────────
 
 // AnalyzeEnsemble fans out to all configured analysts in parallel.
 // Requires at least 2 successful responses; returns error otherwise.
 func (a *Analyzer) AnalyzeEnsemble(ctx context.Context, req AnalysisRequest) ([]AnalystResult, error) {
-	available := make([]ModelProvider, 0, len(a.analysts))
-	for _, p := range a.analysts {
+	return a.AnalyzeEnsembleWithSet(ctx, req, a.analysts)
+}
+
+// AnalyzeEnsembleWithSet fans out to a specific set of analysts in parallel.
+func (a *Analyzer) AnalyzeEnsembleWithSet(ctx context.Context, req AnalysisRequest, analysts []ModelProvider) ([]AnalystResult, error) {
+	available := make([]ModelProvider, 0, len(analysts))
+	for _, p := range analysts {
 		if p.IsAvailable() {
 			available = append(available, p)
 		}

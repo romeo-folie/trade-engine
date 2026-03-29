@@ -70,6 +70,7 @@ export interface EngineSocketState {
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
   analystVotes: AnalystVote[];
+  selectedAnalysts: string[];
 }
 
 const MAX_EVENTS = 200;
@@ -96,6 +97,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [lastTrade, setLastTrade] = useState<LastTrade | null>(null);
   const [portfolioState, setPortfolioState] = useState<PortfolioState | null>(null);
   const [analystVotes, setAnalystVotes] = useState<AnalystVote[]>([]);
+  const [selectedAnalysts, setSelectedAnalysts] = useState<string[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -187,6 +189,20 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setLastSignalAt(now);
         }
 
+        // Track selected analysts for fanned-out pulses.
+        // Replace (not append) on AnalysisStarted to clear stale badges from the prior cycle.
+        if (webEv.type === 'AnalysisStarted') {
+          setSelectedAnalysts(prev => {
+            const next = new Set(prev);
+            next.add(webEv.target);
+            return Array.from(next);
+          });
+        }
+        // Clear selected analysts when a new analysis cycle begins (SignalGenerated or DataFetched).
+        if (webEv.type === 'SignalGenerated') {
+          setSelectedAnalysts([]);
+        }
+
         // Track avg LLM latency (rolling window of last 10 samples)
         if (webEv.type === 'AnalysisCompleted' && webEv.payload) {
           try {
@@ -243,6 +259,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         if (webEv.type === 'DataFetched') {
           setAnalystConsensus({});
           setAnalystVotes([]);
+          setSelectedAnalysts([]);
         }
 
         // Track risk check results
@@ -315,7 +332,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, selectedAnalysts };
 }
 
 function buildWsUrl(): string {
