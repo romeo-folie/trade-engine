@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -403,12 +404,17 @@ func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
 }
 
 // GET /api/system/config
-// POST /api/system/config
+// POST /api/system/config  — mutation is restricted to loopback (127.x / ::1) callers.
 func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		jsonResponse(w, config.Get())
 	case http.MethodPost:
+		// Only loopback callers may mutate engine config.
+		if !isLoopback(r) {
+			http.Error(w, "forbidden: config mutation requires local connection", http.StatusForbidden)
+			return
+		}
 		var updates map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
@@ -518,4 +524,15 @@ func queryInt(r *http.Request, key string, def, max int) int {
 		return max
 	}
 	return n
+}
+
+// isLoopback returns true when the request originates from a loopback address (127.x or ::1).
+// Used to restrict mutating endpoints to local callers only.
+func isLoopback(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

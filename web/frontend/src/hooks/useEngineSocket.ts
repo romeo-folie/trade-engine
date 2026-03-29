@@ -189,9 +189,18 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setLastSignalAt(now);
         }
 
-        // Track selected analysts for fanned-out pulses
+        // Track selected analysts for fanned-out pulses.
+        // Replace (not append) on AnalysisStarted to clear stale badges from the prior cycle.
         if (webEv.type === 'AnalysisStarted') {
-          setSelectedAnalysts(prev => Array.from(new Set([...prev, webEv.target])));
+          setSelectedAnalysts(prev => {
+            const next = new Set(prev);
+            next.add(webEv.target);
+            return Array.from(next);
+          });
+        }
+        // Clear selected analysts when a new analysis cycle begins (SignalGenerated or DataFetched).
+        if (webEv.type === 'SignalGenerated') {
+          setSelectedAnalysts([]);
         }
 
         // Track avg LLM latency (rolling window of last 10 samples)

@@ -387,13 +387,14 @@ func toWebEvents(ev events.Event) []*WebEvent {
 			return nil
 		}
 		var msgs []*WebEvent
+		tickerJSON, _ := json.Marshal(map[string]string{"ticker": payload.Ticker})
 		for _, target := range payload.SelectedAnalysts {
 			msgs = append(msgs, &WebEvent{
 				Type:      "AnalysisStarted",
 				Timestamp: ev.Timestamp,
 				Source:    "prompt_assembly",
 				Target:    target,
-				Payload:   json.RawMessage(`{"ticker":"` + payload.Ticker + `"}`),
+				Payload:   json.RawMessage(tickerJSON),
 			})
 		}
 		return msgs
@@ -404,23 +405,15 @@ func toWebEvents(ev events.Event) []*WebEvent {
 			return nil
 		}
 		raw, _ := json.Marshal(payload)
-		var msgs []*WebEvent
-		for _, v := range payload.Votes {
-			if v.Skipped {
-				continue
-			}
-			// Map specific model back to its pipeline ID (analyst-roleKey).
-			// Protocol node builder uses "analyst-" + registryKey.
-			msgs = append(msgs, &WebEvent{
-				Type:      "AnalystVotesPublished",
-				Timestamp: ev.Timestamp,
-				Source:    "llm_analysis", // Frontend handles mapping votes to cards
-				Target:    "consensus",
-				Payload:   json.RawMessage(raw),
-			})
-		}
-		// Special case: we still want the consensus pulse.
-		return msgs
+		// Emit a single AnalystVotesPublished event per cycle — frontend reads all votes
+		// from the payload. Emitting one per non-skipped vote was redundant and inflated WS traffic.
+		return []*WebEvent{{
+			Type:      "AnalystVotesPublished",
+			Timestamp: ev.Timestamp,
+			Source:    "llm_analysis",
+			Target:    "consensus",
+			Payload:   json.RawMessage(raw),
+		}}
 	}
 
 	src, dst, evType := mapEventEdge(ev.Type)
