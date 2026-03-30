@@ -55,6 +55,25 @@ type Position struct {
 	UnrealizedPL float64
 }
 
+// NormalizeOrderStatus maps Alpaca's transient/broker-specific order statuses to
+// the values accepted by the DB order_status enum: pending | filled | partial | cancelled | rejected.
+// Alpaca returns states like "pending_new", "accepted", "held" before a fill — all map to "pending".
+func NormalizeOrderStatus(status string) string {
+	switch status {
+	case "filled":
+		return "filled"
+	case "partially_filled":
+		return "partial"
+	case "cancelled", "canceled":
+		return "cancelled"
+	case "rejected", "expired":
+		return "rejected"
+	default:
+		// pending_new, accepted, accepted_for_bidding, held, new, etc.
+		return "pending"
+	}
+}
+
 // AccountInfo contains the broker account's cash and portfolio equity.
 // Used as the single source of truth for portfolio valuation when a real
 // broker is configured.

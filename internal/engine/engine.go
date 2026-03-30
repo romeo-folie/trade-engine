@@ -1384,7 +1384,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Quantity:      result.FilledQty,
 		FilledPrice:   result.FilledPrice,
 		FilledQty:     result.FilledQty,
-		Status:        result.Status,
+		Status:        execution.NormalizeOrderStatus(result.Status),
 	}
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
@@ -1623,7 +1623,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			Quantity:      result.FilledQty,
 			FilledPrice:   result.FilledPrice,
 			FilledQty:     result.FilledQty,
-			Status:        result.Status,
+			Status:        execution.NormalizeOrderStatus(result.Status),
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
 		}
