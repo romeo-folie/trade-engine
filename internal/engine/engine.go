@@ -1397,6 +1397,55 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Direction: direction, EntryPrice: result.FilledPrice,
 		Quantity: result.FilledQty, Strategy: sig.Strategy,
 	})
+
+	// If the broker returned a zero fill price (Alpaca market orders fill async),
+	// poll GetOrderStatus until we have a real price and backfill the trade record.
+	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
+		brokerOrderID := result.BrokerOrderID
+		executor := e.executor
+		go func() {
+			const maxRetries = 8
+			const retryDelay = 3 * time.Second
+			for i := 0; i < maxRetries; i++ {
+				time.Sleep(retryDelay)
+				pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				status, err := executor.GetOrderStatus(pollCtx, brokerOrderID)
+				cancel()
+				if err != nil {
+					logger.Warn("fill poll: GetOrderStatus error",
+						"broker_order_id", brokerOrderID, "attempt", i+1, "err", err)
+					continue
+				}
+				if status.FilledPrice > 0 {
+					bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer bfCancel()
+					if err := store.UpdateTradeEntryPrice(bfCtx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
+						logger.Warn("fill poll: update trade entry price",
+							"trade_id", tradeID, "err", err)
+					} else {
+						logger.Info("fill poll: entry price backfilled",
+							"trade_id", tradeID,
+							"ticker", sig.Ticker,
+							"entry_price", status.FilledPrice,
+							"qty", status.FilledQty,
+						)
+					}
+					if err := store.UpdateOrderFillPrice(bfCtx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
+						logger.Warn("fill poll: update order fill price",
+							"broker_order_id", brokerOrderID, "err", err)
+					}
+					return
+				}
+				logger.Debug("fill poll: price still zero, retrying",
+					"broker_order_id", brokerOrderID, "attempt", i+1)
+			}
+			logger.Warn("fill poll: entry price not resolved after max retries — manual reconciliation needed",
+				"trade_id", tradeID,
+				"broker_order_id", brokerOrderID,
+				"ticker", sig.Ticker,
+			)
+		}()
+	}
 }
 
 // ApproveSignal approves a pending signal and executes it. Called from CLI / Telegram.

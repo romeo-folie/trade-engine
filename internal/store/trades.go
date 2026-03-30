@@ -46,6 +46,29 @@ func InsertTrade(ctx context.Context, t Trade) (string, error) {
 }
 
 // CloseTrade updates a trade with exit price, P&L, and closed_at.
+// UpdateTradeEntryPrice backfills the entry_price and quantity for a trade
+// after an async broker fill confirmation arrives.
+// UpdateTradeEntryPrice backfills the entry_price and quantity for a trade
+// after an async broker fill confirmation arrives.
+func UpdateTradeEntryPrice(ctx context.Context, id string, entryPrice, quantity float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades
+		SET entry_price=$1, quantity=$2
+		WHERE id=$3`,
+		entryPrice, quantity, id)
+	return err
+}
+
+// UpdateOrderFillPrice backfills filled_price and filled_qty on an order row.
+func UpdateOrderFillPrice(ctx context.Context, brokerOrderID string, filledPrice, filledQty float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE orders
+		SET filled_price=$1, filled_qty=$2, status='filled'
+		WHERE broker_order_id=$3`,
+		filledPrice, filledQty, brokerOrderID)
+	return err
+}
+
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
