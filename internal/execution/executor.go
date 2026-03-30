@@ -55,10 +55,22 @@ type Position struct {
 	UnrealizedPL float64
 }
 
+// AccountInfo contains the broker account's cash and portfolio equity.
+// Used as the single source of truth for portfolio valuation when a real
+// broker is configured.
+type AccountInfo struct {
+	Cash            float64 // buying power / available cash
+	PortfolioEquity float64 // total account equity (cash + positions)
+}
+
 // Executor is the interface all broker adapters must satisfy.
 type Executor interface {
 	PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error)
 	CancelOrder(ctx context.Context, brokerOrderID string) error
 	GetOrderStatus(ctx context.Context, brokerOrderID string) (OrderResult, error)
 	GetPositions(ctx context.Context) ([]Position, error)
+	// GetAccount returns the broker account's cash and portfolio equity.
+	// Implementations that don't have a real broker (PaperExecutor) return
+	// zeroed AccountInfo and a nil error; callers fall back to local derivation.
+	GetAccount(ctx context.Context) (AccountInfo, error)
 }

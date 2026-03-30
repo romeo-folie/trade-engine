@@ -172,6 +172,26 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 	return out, nil
 }
 
+// GetAccount returns the Alpaca account's buying power and portfolio equity.
+func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
+	var resp struct {
+		BuyingPower    string `json:"buying_power"`
+		PortfolioValue string `json:"portfolio_value"`
+	}
+	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: %w", err)
+	}
+	cash, err := parseFloat(resp.BuyingPower)
+	if err != nil {
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse buying_power %q: %w", resp.BuyingPower, err)
+	}
+	equity, err := parseFloat(resp.PortfolioValue)
+	if err != nil {
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse portfolio_value %q: %w", resp.PortfolioValue, err)
+	}
+	return AccountInfo{Cash: cash, PortfolioEquity: equity}, nil
+}
+
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 
 func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, out any) error {

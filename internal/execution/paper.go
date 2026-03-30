@@ -85,3 +85,9 @@ func (p *PaperExecutor) GetOrderStatus(_ context.Context, brokerOrderID string) 
 func (p *PaperExecutor) GetPositions(_ context.Context) ([]Position, error) {
 	return nil, nil
 }
+
+// GetAccount returns zeroed AccountInfo for the paper executor.
+// The engine falls back to local derivation from initial_capital when Cash == 0.
+func (p *PaperExecutor) GetAccount(_ context.Context) (AccountInfo, error) {
+	return AccountInfo{}, nil
+}

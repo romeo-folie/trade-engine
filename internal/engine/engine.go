@@ -1499,14 +1499,24 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		}
 	}
 
-	// Cash = initial capital - invested. For paper trading without a real broker
-	// account, estimate from config or use a default.
-	cash := e.cfg.Engine.InitialCapital
-	for _, p := range positions {
-		cash -= p.CurrentValue - p.UnrealizedPL // subtract cost basis
+	// Prefer broker account cash (buying_power) as the single source of truth.
+	// Fall back to local derivation from initial_capital when the broker doesn't
+	// provide account data (PaperExecutor, no API key).
+	var cash float64
+	if acct, err := e.executor.GetAccount(ctx); err != nil {
+		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
+	} else if acct.Cash > 0 {
+		cash = acct.Cash
 	}
-	if cash < 0 {
-		cash = 0
+	if cash == 0 {
+		// Local fallback: initial_capital minus cost basis of open positions.
+		cash = e.cfg.Engine.InitialCapital
+		for _, p := range positions {
+			cash -= p.CurrentValue - p.UnrealizedPL
+		}
+		if cash < 0 {
+			cash = 0
+		}
 	}
 
 	e.portfolio.Update(eps, cash, realizedToday)
