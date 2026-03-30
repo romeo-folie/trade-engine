@@ -294,9 +294,18 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         y -= 245;
       }
 
-      // Minor vertical correction for Risk Manager to align with Consensus spline
+      // Pin risk_manager Y to match consensus's midpoint so the connecting edge
+      // stays horizontally level regardless of risk_manager card height.
+      // consensus estimatedH = 180, so its midpoint = y_consensus + 90.
+      // We want risk_manager's midpoint to equal consensus's midpoint:
+      //   y_risk + estimatedH_risk/2 = y_consensus + 90
+      // Since risk_manager is a single-node group, y_consensus === CY - (180/2) = CY - 90.
+      // Therefore y_risk = CY - 90 - estimatedH_risk/2 ... but estimatedH varies.
+      // Simplest approach: pin risk_manager top to CY - 90 so its top aligns with
+      // consensus's top, and the edge mid connects at the same horizontal band.
       if (n.id === 'risk_manager') {
-        y -= 20;
+        const consensusEstH = 180;
+        y = CY - consensusEstH / 2;
       }
 
       // Execution phase stagger as per desired layout: 
