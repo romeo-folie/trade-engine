@@ -431,15 +431,12 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
       analystIds.forEach(aid => {
         // Selective pulsing based on selectedAnalysts set (from AnalysisStarted)
+        // Edge lights up only while the analyst is actively selected for this dispatch.
+        // selectedAnalysts is cleared on TickStarted so the edge goes dark at cycle reset.
+        // wasInvoked (from analystVotes) was removed: it persisted the entire tick duration,
+        // keeping edges lit long after analysis completed.
         const isSelected = selectedAnalysts.includes(aid);
-        const analystNode = rfNodes.find(n => n.id === aid);
-        const modelName = (analystNode?.data as PipelineNodeData)?.label ?? '';
-        const vote = analystVotes.find(v => v.model === modelName);
-        const wasInvoked = vote ? !vote.skipped : false;
-        
-        // Edge lights up if EITHER it's currently selected OR was recently invoked
-        const active = isSelected || wasInvoked;
-        edges.push(makeEdge(arbiterId, aid, { activeOverride: active }));
+        edges.push(makeEdge(arbiterId, aid, { activeOverride: isSelected }));
       });
     }
 
