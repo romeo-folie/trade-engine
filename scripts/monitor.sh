@@ -16,5 +16,8 @@ fi
 
 tmux new-session -s "$SESSION" \; \
   send-keys "cd $ENGINE_DIR && tail -f ~/.tradeengine/logs/engine.log" Enter \; \
+  split-window -v \; \
+  send-keys "tail -f /tmp/te-switch.log 2>/dev/null || echo 'waiting for te-switch.log...'; tail -f /tmp/te-switch.log" Enter \; \
+  select-pane -t 0 \; \
   split-window -h \; \
   send-keys "cd $ENGINE_DIR && ./te dashboard" Enter
