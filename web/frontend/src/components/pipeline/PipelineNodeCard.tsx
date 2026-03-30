@@ -244,7 +244,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             )}
             {d.eventCount > 0 && d.isChosen && (
               <div className={styles.kindLabel} style={{ opacity: 0.5 }}>
-                {d.eventCount} SIGNALS
+                {d.eventCount} ANALYSES
               </div>
             )}
           </div>
