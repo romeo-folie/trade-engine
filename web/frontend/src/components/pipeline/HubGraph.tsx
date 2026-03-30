@@ -12,6 +12,7 @@ import type { ReactNode } from 'react';
 import { LayoutGrid, Lock, LockOpen, Crosshair } from 'lucide-react';
 import {
   ReactFlow,
+  PanOnScrollMode,
   Background,
   MiniMap,
   useNodesState,
@@ -700,6 +701,9 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         minZoom={0.2}
         maxZoom={1.5}
         defaultViewport={{ x: 80, y: 80, zoom: 0.4 }}
+        panOnScroll
+        panOnScrollMode={PanOnScrollMode.Free}
+        zoomOnScroll={false}
         proOptions={{ hideAttribution: true }}
       >
         <Background variant={BackgroundVariant.Dots} gap={20} size={1} color="#1A1A22" style={{ opacity: 0.2 }} />
