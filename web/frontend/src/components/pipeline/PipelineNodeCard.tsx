@@ -7,7 +7,7 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
 import type { WatchlistTicker } from '../../hooks/useWatchlist';
-import type { AnalystConsensusEntry, RiskCheckResult, LastTrade, PortfolioState } from '../../hooks/useEngineSocket';
+import type { RiskCheckResult, LastTrade, PortfolioState } from '../../hooks/useEngineSocket';
 
 function lastTickLabel(lastEventAt: string | null): string {
   if (!lastEventAt) return '—';
@@ -282,28 +282,26 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                   { id: 'google', label: 'GEMI', color: colors.analystSentiment },
                 ];
 
-                const ac = d.analystConsensus as Record<string, AnalystConsensusEntry> | undefined;
-                const av = d.analystVotes as { model: string; provider: string; skipped: boolean }[] | undefined;
-                
+                // Drive consensus display entirely from analystVotes (last AnalystVotesPublished event).
+                // analystConsensus accumulates across tickers/ticks and is stale — don't use it here.
+                const av = d.analystVotes as { model: string; provider: string; action: string; confidence: number; skipped: boolean }[] | undefined;
+                const activeVotes = av ? av.filter(v => !v.skipped) : [];
+
                 const items = PROVIDER_CONFIG.map(conf => {
-                  const entry = ac ? Object.values(ac).find(v => v.provider?.toLowerCase() === conf.id) : null;
-                  const vote = av ? av.find(v => v.provider?.toLowerCase() === conf.id) : null;
-                  const isConsulted = vote ? !vote.skipped : false;
-                  
+                  const vote = activeVotes.find(v => v.provider?.toLowerCase() === conf.id);
                   return {
                     label: conf.label,
-                    value: entry?.confidence,
+                    value: vote?.confidence,
                     color: conf.color,
-                    isLoading: isConsulted && !entry && nodeActive,
+                    isLoading: false,
                   };
                 });
-                
-                const entries = ac ? Object.values(ac) : [];
-                const buys = entries.filter(v => v.verdict?.toUpperCase() === 'BUY').length;
-                const sells = entries.filter(v => v.verdict?.toUpperCase() === 'SELL').length;
-                const consensusVerdict = entries.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
-                const avgConf = entries.length > 0
-                  ? entries.reduce((sum, v) => sum + v.confidence, 0) / entries.length
+
+                const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
+                const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
+                const consensusVerdict = activeVotes.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
+                const avgConf = activeVotes.length > 0
+                  ? activeVotes.reduce((sum, v) => sum + v.confidence, 0) / activeVotes.length
                   : 0;
                 
                 const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
