@@ -403,6 +403,11 @@ func (e *Engine) logNextCycle(nextTick time.Time, displayLoc *time.Location) {
 // tick processes all active watchlist items for a single engine cycle.
 // Items are processed in parallel; errors per item are logged but do not abort the tick.
 func (e *Engine) tick(ctx context.Context) error {
+	// Signal the start of a new tick cycle. The frontend uses this as a boundary
+	// to reset pipeline node card state (event counts, verdicts) before new data
+	// arrives. Must fire before any other events in the tick.
+	e.bus.Publish(events.TickStarted, events.TickStartedPayload{})
+
 	// Refresh portfolio state before processing any signals so that executeSignal
 	// has an accurate cash balance from the very first tick (not the zero-value
 	// default from NewTracker).

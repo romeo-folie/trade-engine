@@ -55,6 +55,8 @@ export const PARTICLE_COLORS: Record<string, string> = {
   SignalExpired:        '#6B7280', // grey
   // Errors
   ErrorOccurred:        '#EF4444', // red
+  // System
+  TickStarted:          '#4B5563', // dim grey — cycle boundary, not a data event
 };
 
 export function particleColor(eventType: string): string {
@@ -82,4 +84,5 @@ export const EVENT_LABELS: Record<string, string> = {
   PositionUpdated:    'Position',
   PortfolioSnapshot:  'Portfolio',
   ErrorOccurred:      'Error',
+  TickStarted:        'New Tick',
 };

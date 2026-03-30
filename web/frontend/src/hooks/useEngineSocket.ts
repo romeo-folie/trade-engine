@@ -255,11 +255,21 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           } catch { /* ignore */ }
         }
 
-        // Reset analyst consensus on new tick
-        if (webEv.type === 'DataFetched') {
+        // TickStarted — cycle boundary reset.
+        // Zero out all node metrics except portfolio (which always shows latest state).
+        // Also reset analyst consensus, votes, selected analysts, and risk checks
+        // so cards return to their idle/standby states at the start of each tick.
+        if (webEv.type === 'TickStarted') {
+          setNodeMetrics(prev => {
+            const portfolio = prev['portfolio'];
+            const next: Record<string, NodeMetrics> = {};
+            if (portfolio) next['portfolio'] = portfolio;
+            return next;
+          });
           setAnalystConsensus({});
           setAnalystVotes([]);
           setSelectedAnalysts([]);
+          setLastRiskChecks([]);
         }
 
         // Track risk check results

@@ -105,6 +105,8 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	// ── System ───────────────────────────────────────────────────────────
 	case events.ErrorOccurred:
 		return "engine", "error_bus", "ErrorOccurred"
+	case events.TickStarted:
+		return "engine", "engine", "TickStarted"
 
 	default:
 		return "", "", ""

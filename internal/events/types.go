@@ -28,6 +28,7 @@ const (
 	AnalysisStarted        Type = "analysis.started"
 	NewsEnriched           Type = "news.enriched"
 	ErrorOccurred          Type = "error"
+	TickStarted            Type = "tick.started"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -213,3 +214,8 @@ type ErrorPayload struct {
 	Message   string
 	Err       error
 }
+
+// TickStartedPayload is emitted at the very start of each engine tick.
+// Frontend uses this as a cycle boundary to reset pipeline node card state.
+type TickStartedPayload struct{}
+
