@@ -147,9 +147,10 @@ export default function ConfigScreen() {
           weeklyTokenBudget: data.cost?.weekly_token_budget || DEFAULTS.weeklyTokenBudget,
           autoDegradeBudget: data.cost?.auto_degrade_on_budget_hit ?? DEFAULTS.autoDegradeBudget,
           telegram: data.notifications?.telegram?.enabled ?? DEFAULTS.telegram,
-          notifySignal: data.notifications?.telegram?.notify_on?.includes('signal_generated') ?? DEFAULTS.notifySignal,
-          notifyTrade: data.notifications?.telegram?.notify_on?.includes('trade_executed') ?? DEFAULTS.notifyTrade,
-          notifyError: data.notifications?.telegram?.notify_on?.includes('error_occurred') ?? DEFAULTS.notifyError,
+          notifySignal: (data.notifications?.telegram?.notify_on?.includes('signal_generated') || data.notifications?.telegram?.notify_on?.includes('signal')) ?? DEFAULTS.notifySignal,
+          notifyTrade: (data.notifications?.telegram?.notify_on?.includes('trade_executed') || data.notifications?.telegram?.notify_on?.includes('trade')) ?? DEFAULTS.notifyTrade,
+          notifyError: (data.notifications?.telegram?.notify_on?.includes('error_occurred') || data.notifications?.telegram?.notify_on?.includes('error')) ?? DEFAULTS.notifyError,
+          notifyDailySummary: data.notifications?.telegram?.notify_on?.includes('daily_summary') ?? DEFAULTS.notifyDailySummary,
           batchEnabled: data.notifications?.telegram?.batch_enabled ?? DEFAULTS.batchEnabled,
           batchWindow: data.notifications?.telegram?.batch_window_sec ?? DEFAULTS.batchWindow,
           minConfidenceAlert: data.notifications?.telegram?.min_confidence_for_alert || DEFAULTS.minConfidenceAlert,
@@ -167,6 +168,12 @@ export default function ConfigScreen() {
 
   const handleSave = useCallback(async () => {
     setIsSaving(true);
+    const notifyOn: string[] = [];
+    if (config.notifySignal) notifyOn.push('signal');
+    if (config.notifyTrade) notifyOn.push('trade');
+    if (config.notifyError) notifyOn.push('error');
+    if (config.notifyDailySummary) notifyOn.push('daily_summary');
+
     const payload = {
       mode: config.mode,
       tick_interval_sec: displayToSec(config.tickInterval),
@@ -184,6 +191,11 @@ export default function ConfigScreen() {
       weekly_token_budget: config.weeklyTokenBudget,
       auto_degrade_budget: config.autoDegradeBudget,
       telegram_enabled: config.telegram,
+      'notifications.telegram.notify_on': notifyOn,
+      'notifications.telegram.batch_enabled': config.batchEnabled,
+      'notifications.telegram.batch_window_sec': config.batchWindow,
+      'notifications.telegram.min_confidence_for_alert': config.minConfidenceAlert,
+      'notifications.telegram.include_holds': config.includeHolds,
       analyst_cheap: config.analystCheap,
       analyst_mid: config.analystMid,
       analyst_frontier: config.analystFrontier,
@@ -219,9 +231,18 @@ export default function ConfigScreen() {
     setConfig({ ...savedRef.current });
   }, []);
 
-  const handleRestart = useCallback(() => {
+  const handleRestart = useCallback(async () => {
     setShowRestartModal(false);
-    showToast('Restart signal sent — engine restarting.');
+    try {
+      const res = await fetch('/api/system/restart', { method: 'POST' });
+      if (!res.ok) {
+        showToast('Failed to restart engine.');
+        return;
+      }
+      showToast('Restart signal sent — engine restarting.');
+    } catch {
+      showToast('Failed to restart engine.');
+    }
   }, [showToast]);
 
   const handleReset = useCallback(() => {

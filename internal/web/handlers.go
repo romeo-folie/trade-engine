@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
@@ -37,6 +39,7 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/config", handleSystemConfig)
+	mux.HandleFunc("/api/system/restart", handleSystemRestart)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -56,7 +59,7 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{
-		"open_trades":     openTrades,
+		"open_trades":      openTrades,
 		"open_trade_count": len(openTrades),
 	})
 }
@@ -682,6 +685,33 @@ func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// POST /api/system/restart — loopback only. Sends SIGTERM to current process
+// after the response is flushed so a supervisor (systemd/pm2/etc.) can restart it.
+func handleSystemRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopback(r) {
+		http.Error(w, "forbidden: restart requires local connection", http.StatusForbidden)
+		return
+	}
+
+	jsonResponse(w, map[string]string{"status": "restarting"})
+
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		p, err := os.FindProcess(os.Getpid())
+		if err != nil {
+			logger.Warn("web: restart find process failed", "err", err.Error())
+			return
+		}
+		if err := p.Signal(syscall.SIGTERM); err != nil {
+			logger.Warn("web: restart signal failed", "err", err.Error())
+		}
+	}()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
