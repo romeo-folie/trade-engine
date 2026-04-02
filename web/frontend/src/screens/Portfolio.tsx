@@ -4,7 +4,6 @@
  * Fetches live portfolio snapshot from GET /api/node/portfolio every 15s.
  * Trades fetch (GET /api/trades/recent) is intentionally deferred — will be
  * added when the trades table is implemented in a future task.
- * Open positions use mock data until a dedicated endpoint.
  *
  * Task 4 of the web redesign (closes #204).
  */
