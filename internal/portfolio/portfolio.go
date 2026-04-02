@@ -44,6 +44,8 @@ func NewTracker(snapshotInterval time.Duration) *Tracker {
 // data without importing execution package internals.
 type ExecPosition struct {
 	Ticker       string
+	Quantity     float64
+	AvgCostBasis float64
 	CurrentValue float64
 	UnrealizedPL float64
 }
@@ -106,6 +108,18 @@ func (t *Tracker) CurrentState() State {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.state
+}
+
+// Positions returns a snapshot of current open positions.
+func (t *Tracker) Positions() []ExecPosition {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if len(t.positions) == 0 {
+		return []ExecPosition{}
+	}
+	out := make([]ExecPosition, len(t.positions))
+	copy(out, t.positions)
+	return out
 }
 
 // MaybeSnapshot writes a snapshot if the interval has elapsed.

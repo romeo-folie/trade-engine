@@ -81,3 +81,30 @@ func TestConcurrentAccess(t *testing.T) {
 	}
 	<-done
 }
+
+func TestPositions(t *testing.T) {
+	tr := NewTracker(time.Hour)
+	positions := []ExecPosition{
+		{Ticker: "AAPL", Quantity: 10, AvgCostBasis: 150.0, CurrentValue: 1700, UnrealizedPL: 200},
+		{Ticker: "MSFT", Quantity: 5, AvgCostBasis: 300.0, CurrentValue: 1600, UnrealizedPL: 100},
+	}
+	tr.Update(positions, 5000, 300)
+
+	got := tr.Positions()
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2", len(got))
+	}
+
+	if got[0].Ticker != "AAPL" || got[0].Quantity != 10 || got[0].AvgCostBasis != 150.0 {
+		t.Errorf("incorrect position details for AAPL: %+v", got[0])
+	}
+	if got[1].Ticker != "MSFT" || got[1].Quantity != 5 || got[1].AvgCostBasis != 300.0 {
+		t.Errorf("incorrect position details for MSFT: %+v", got[1])
+	}
+
+	// Verify it's a copy.
+	got[0].Ticker = "MODIFIED"
+	if tr.Positions()[0].Ticker == "MODIFIED" {
+		t.Error("Positions() returned a pointer or aliased slice")
+	}
+}

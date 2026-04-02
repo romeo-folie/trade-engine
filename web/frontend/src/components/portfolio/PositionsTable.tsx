@@ -6,12 +6,20 @@ import styles from './PositionsTable.module.css';
 
 export interface Position {
   ticker: string;
-  direction: 'LONG' | 'SHORT';
-  strategy: string;
+  direction: string;
   entry: number;
-  current: number;
-  unrealizedPnl: number;
-  pnlPct: number;
+  current?: number;
+  unrealizedPnl?: number;
+  pnlPct?: number;
+  strategy: string;
+  // PascalCase from API (store.Trade)
+  Ticker?: string;
+  Direction?: string;
+  EntryPrice?: number;
+  CurrentPrice?: number;
+  PnL?: number;
+  PnLPct?: number;
+  Strategy?: string;
 }
 
 interface PositionsTableProps {
@@ -22,17 +30,7 @@ type SortKey = keyof Pick<Position, 'ticker' | 'entry' | 'current' | 'unrealized
 type SortDir = 'asc' | 'desc';
 
 function fmtPrice(n: number): string {
-  return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-}
-
-function fmtPnl(n: number): string {
-  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
-  return `${sign}$${fmtPrice(Math.abs(n))}`;
-}
-
-function fmtPct(n: number): string {
-  const sign = n > 0 ? '+' : '';
-  return `${sign}${n.toFixed(2)}%`;
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 function SortIndicator({ col, sortKey, sortDir }: { col: SortKey; sortKey: SortKey; sortDir: SortDir }) {
@@ -126,14 +124,23 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
         </thead>
         <tbody>
           {sorted.map((p, i) => {
-            const pnlCls = p.unrealizedPnl >= 0 ? styles.positive : styles.negative;
+            const pnl = (p.PnL || p.unrealizedPnl) ?? 0;
+            const pnlPct = (p.PnLPct || p.pnlPct) ?? 0;
+            const pnlCls = pnl >= 0 ? styles.positive : styles.negative;
+            // Map PascalCase from API or lowercase from local mock
+            const ticker = p.Ticker || p.ticker || '';
+            const direction = (p.Direction || p.direction || '').toUpperCase();
+            const strategy = p.Strategy || p.strategy || '';
+            const entry = p.EntryPrice || p.entry || 0;
+            const current = p.CurrentPrice || p.current || entry; // fall back to entry if current unknown
+
             // Use index as tiebreaker — the backend provides no stable row id.
-            // Positions for the same ticker+strategy+entry are indistinguishable without one.
-            const rowKey = `${p.ticker}-${p.strategy}-${p.entry}-${i}`;
-            const dirIsLong = p.direction === 'LONG';
+            const rowKey = `${ticker}-${strategy}-${entry}-${i}`;
+            const dirIsLong = direction === 'LONG';
+            
             return (
               <tr key={rowKey}>
-                <td style={{ fontWeight: 700 }}>{p.ticker}</td>
+                <td style={{ fontWeight: 700 }}>{ticker}</td>
                 <td>
                   <ChamferedBox
                     chamfer={4}
@@ -146,16 +153,20 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
                       padding: '1px 6px' 
                     }}
                   >
-                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
-                      {dirIsLong ? 'BUY' : 'SELL'}
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11', display: 'flex', alignItems: 'center', gap: '2px' }}>
+                      {dirIsLong ? '▲' : '▼'} {dirIsLong ? 'BUY' : 'SELL'}
                     </span>
                   </ChamferedBox>
                 </td>
-                <td style={{ color: 'var(--text-muted)' }}>{p.strategy}</td>
-                <td>{fmtPrice(p.entry)}</td>
-                <td>{fmtPrice(p.current)}</td>
-                <td className={pnlCls}>{fmtPnl(p.unrealizedPnl)}</td>
-                <td className={pnlCls}>{fmtPct(p.pnlPct)}</td>
+                <td style={{ color: 'var(--text-muted)' }}>{strategy}</td>
+                <td style={{ color: 'var(--text-dim)' }}>
+                  <div style={{ fontSize: 11 }}>{fmtPrice(entry)}</div>
+                  <div style={{ fontSize: 13, color: 'var(--text-primary)' }}>{fmtPrice(current)}</div>
+                </td>
+                <td className={pnlCls} style={{ fontWeight: 700 }}>
+                  <div>{pnl >= 0 ? '+' : ''}{pnl.toFixed(2)}</div>
+                  <div style={{ fontSize: 11, opacity: 0.8 }}>{pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%</div>
+                </td>
                 <td>
                   <span className={styles.status}>
                     <span className={styles.statusDot} />

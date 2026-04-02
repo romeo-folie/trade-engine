@@ -31,6 +31,9 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
 	mux.HandleFunc("/api/backtests/runs", handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
+	mux.HandleFunc("/api/portfolio/summaries", handlePortfolioSummaries)
+	mux.HandleFunc("/api/portfolio/stats", handlePortfolioStats)
+	mux.HandleFunc("/api/portfolio/positions", handlePortfolioPositions)
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/config", handleSystemConfig)
@@ -65,6 +68,52 @@ func handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, snap)
+}
+
+// GET /api/portfolio/summaries
+func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	limit := queryInt(r, "limit", 30, 100)
+	summaries, err := store.GetRecentDailySummaries(ctx, limit)
+	if err != nil {
+		apiError(w, "summaries query failed", err)
+		return
+	}
+	if summaries == nil {
+		summaries = []store.DailySummary{}
+	}
+	jsonResponse(w, map[string]any{"summaries": summaries})
+}
+
+// GET /api/portfolio/stats
+func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	stats, err := store.GetPortfolioStats(ctx)
+	if err != nil {
+		apiError(w, "portfolio stats query failed", err)
+		return
+	}
+	jsonResponse(w, stats)
+}
+
+// GET /api/portfolio/positions
+func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		apiError(w, "positions query failed", err)
+		return
+	}
+	if trades == nil {
+		trades = []store.Trade{}
+	}
+	jsonResponse(w, map[string]any{"positions": trades})
 }
 
 // GET /api/node/ticker/:ticker

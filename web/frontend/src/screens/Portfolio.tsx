@@ -74,8 +74,34 @@ function pnlColor(n: number): string {
 
 /* ── Component ──────────────────────────────────────────────────────────────── */
 
+interface DailySummary {
+  ID: string;
+  Date: string;
+  StartingValue: number;
+  EndingValue: number;
+  PnL: number;
+  PnLPct: number;
+  TradesOpened: number;
+  TradesClosed: number;
+  Wins: number;
+  Losses: number;
+}
+
+interface PortfolioStats {
+  WinRatePct: number;
+  ProfitFactor: number;
+  TotalTrades: number;
+  BestDayPnl: number;
+  WorstDayPnl: number;
+}
+
+/* ── Component ──────────────────────────────────────────────────────────────── */
+
 export default function PortfolioScreen() {
   const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
+  const [summaries, setSummaries] = useState<DailySummary[]>([]);
+  const [stats, setStats] = useState<PortfolioStats | null>(null);
+  const [positions, setPositions] = useState<any[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
   // Per-tick AbortController ref — aborts previous in-flight request before starting new one
   const fetchControllerRef = useRef<AbortController | null>(null);
@@ -88,27 +114,42 @@ export default function PortfolioScreen() {
       fetchControllerRef.current = controller;
 
       try {
-        const res = await fetch('/api/node/portfolio', { signal: controller.signal });
-        if (res.ok) {
-          const data = await res.json();
+        // Fetch snapshot
+        const resSn = await fetch('/api/node/portfolio', { signal: controller.signal });
+        if (resSn.ok) {
+          const data = await resSn.json();
           if (data && typeof data.TotalValue === 'number') {
             setSnapshot(data);
             setFetchError(null);
-          } else {
-            console.warn('[PortfolioScreen] unexpected payload shape:', data);
-            setFetchError('Unexpected response shape from /api/node/portfolio');
           }
-        } else {
-          console.warn('[PortfolioScreen] non-2xx response:', res.status, res.statusText);
-          setFetchError(`API error: ${res.status} ${res.statusText}`);
+        }
+
+        // Fetch daily summaries (period performance)
+        const resSum = await fetch('/api/portfolio/summaries?limit=7', { signal: controller.signal });
+        if (resSum.ok) {
+          const data = await resSum.json();
+          setSummaries(data.summaries || []);
+        }
+
+        // Fetch stats
+        const resStats = await fetch('/api/portfolio/stats', { signal: controller.signal });
+        if (resStats.ok) {
+          const statsData = await resStats.json();
+          setStats(statsData);
+        }
+
+        // Fetch positions
+        const resPos = await fetch('/api/portfolio/positions', { signal: controller.signal });
+        if (resPos.ok) {
+          const posData = await resPos.json();
+          setPositions(posData.positions || []);
         }
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[PortfolioScreen] snapshot fetch error:', err);
+          console.warn('[PortfolioScreen] fetch error:', err);
           setFetchError(err.message);
         }
       }
-      // Trades fetch deferred until trades table is rendered in a future task
     }
 
     load();
@@ -120,7 +161,6 @@ export default function PortfolioScreen() {
   }, []);
 
   // Use real snapshot data only — no hardcoded fallbacks for financial values.
-  // Display placeholder dashes until the first successful fetch.
   const hasData = snapshot !== null;
   const totalValue = snapshot?.TotalValue ?? 0;
   const cash = snapshot?.Cash ?? 0;
@@ -128,10 +168,17 @@ export default function PortfolioScreen() {
   const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
   const dayPnl = snapshot?.RealizedPnLToday ?? 0;
 
-  const equityData = useMemo(
-    () => (totalValue !== null ? generateMockEquityData(totalValue) : []),
-    [totalValue],
-  );
+  const equityData = useMemo(() => {
+    if (!hasData) return [];
+    // If we have real historical summaries, use them. Otherwise fallback to mock for the chart.
+    if (summaries.length > 1) {
+      return [...summaries].reverse().map(s => ({
+        date: s.Date.split('T')[0],
+        value: s.EndingValue
+      }));
+    }
+    return generateMockEquityData(totalValue);
+  }, [totalValue, summaries, hasData]);
 
   return (
     <div className={styles.screen}>
@@ -183,22 +230,56 @@ export default function PortfolioScreen() {
       </div>
 
       {/* ── Open Positions ────────────────────────────────────────────────── */}
-      <PositionsTable positions={[]} />
+      <PositionsTable positions={positions} />
 
       {/* ── Performance Metrics ───────────────────────────────────────────── */}
-      {/* Period and system stats require a dedicated summary endpoint.
-          Placeholder displayed until live data is wired. */}
       <div className={styles.metricsGrid}>
         <div className={styles.metricsSection}>
-          <div className={styles.sectionLabel}>PERIOD PERFORMANCE</div>
-          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
-            — awaiting live data
+          <div className={styles.sectionLabel}>PERIOD PERFORMANCE (7D)</div>
+          <div className={styles.metricList}>
+            {summaries.length === 0 ? (
+              <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>— awaiting live data</div>
+            ) : (
+              summaries.map(s => (
+                <div key={s.ID} className={styles.metricRow}>
+                  <span className={styles.metricLabel}>{s.Date.split('T')[0]}</span>
+                  <span className={styles.metricValue} style={{ color: pnlColor(s.PnL) }}>
+                    {fmtPnl(s.PnL)} ({s.PnLPct.toFixed(2)}%)
+                  </span>
+                </div>
+              ))
+            )}
           </div>
         </div>
         <div className={styles.metricsSection}>
           <div className={styles.sectionLabel}>SYSTEM STATS</div>
-          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
-            — awaiting live data
+          <div className={styles.metricList}>
+            {!stats ? (
+              <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>— awaiting live data</div>
+            ) : (
+              <>
+                <div className={styles.metricRow}>
+                  <span className={styles.metricLabel}>WIN RATE</span>
+                  <span className={styles.metricValue}>{stats.WinRatePct.toFixed(1)}%</span>
+                </div>
+                <div className={styles.metricRow}>
+                  <span className={styles.metricLabel}>PROFIT FACTOR</span>
+                  <span className={styles.metricValue}>{stats.ProfitFactor.toFixed(2)}</span>
+                </div>
+                <div className={styles.metricRow}>
+                  <span className={styles.metricLabel}>TOTAL TRADES</span>
+                  <span className={styles.metricValue}>{stats.TotalTrades}</span>
+                </div>
+                <div className={styles.metricRow}>
+                  <span className={styles.metricLabel}>BEST DAY</span>
+                  <span className={styles.metricValue} style={{ color: TOKENS.emerald }}>{fmtPnl(stats.BestDayPnl)}</span>
+                </div>
+                <div className={styles.metricRow}>
+                  <span className={styles.metricLabel}>WORST DAY</span>
+                  <span className={styles.metricValue} style={{ color: TOKENS.red }}>{fmtPnl(stats.WorstDayPnl)}</span>
+                </div>
+              </>
+            )}
           </div>
         </div>
       </div>

@@ -1494,25 +1494,34 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		})
 	}
 
-	// Compute realized P&L today from closed trades.
+	// Prefer broker daily P&L (realized + unrealized today) as the source of truth.
+	// Fall back to local realized P&L calculation for PaperExecutor or if broker
+	// does not support day_pnl reporting.
 	var realizedToday float64
-	closedTrades, _ := store.GetRecentTrades(ctx, 100)
-	today := time.Now().UTC().Truncate(24 * time.Hour)
-	for _, t := range closedTrades {
-		if t.Status == "closed" && t.ClosedAt.After(today) {
-			realizedToday += t.PnL
-		}
-	}
-
-	// Prefer broker account cash (buying_power) as the single source of truth.
-	// Fall back to local derivation from initial_capital when the broker doesn't
-	// provide account data (PaperExecutor, no API key).
 	var cash float64
 	if acct, err := e.executor.GetAccount(ctx); err != nil {
 		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
-	} else if acct.Cash > 0 {
-		cash = acct.Cash
+	} else {
+		if acct.Cash > 0 {
+			cash = acct.Cash
+		}
+		// Use broker's reported DayPnL if provided (real-time accuracy).
+		if acct.DayPnL != 0 {
+			realizedToday = acct.DayPnL
+		}
 	}
+
+	if realizedToday == 0 {
+		// Local fallback: sum realized P&L from trades closed today.
+		closedTrades, _ := store.GetRecentTrades(ctx, 100)
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+		for _, t := range closedTrades {
+			if t.Status == "closed" && t.ClosedAt.After(today) {
+				realizedToday += t.PnL
+			}
+		}
+	}
+
 	if cash == 0 {
 		// Local fallback: initial_capital minus cost basis of open positions.
 		cash = e.cfg.Engine.InitialCapital

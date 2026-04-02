@@ -147,6 +147,91 @@ func GetDailySummaryByDate(ctx context.Context, date time.Time) (*DailySummary, 
 }
 
 // ── Trades by date range ──────────────────────────────────────────────────────
+// GetRecentDailySummaries returns the last N days of summaries.
+func GetRecentDailySummaries(ctx context.Context, limit int) ([]DailySummary, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, date, starting_value, ending_value, pnl, COALESCE(pnl_pct,0),
+		       trades_opened, trades_closed, wins, losses,
+		       signals_generated, signals_blocked,
+		       model_tokens_input, model_tokens_output, created_at
+		FROM daily_summaries
+		ORDER BY date DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var summaries []DailySummary
+	for rows.Next() {
+		var s DailySummary
+		if err := rows.Scan(
+			&s.ID, &s.Date, &s.StartingValue, &s.EndingValue, &s.PnL, &s.PnLPct,
+			&s.TradesOpened, &s.TradesClosed, &s.Wins, &s.Losses,
+			&s.SignalsGenerated, &s.SignalsBlocked,
+			&s.ModelTokensInput, &s.ModelTokensOutput, &s.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		summaries = append(summaries, s)
+	}
+	return summaries, rows.Err()
+}
+
+type PortfolioStats struct {
+	WinRatePct   float64
+	ProfitFactor float64
+	TotalTrades  int
+	BestDayPnl   float64
+	WorstDayPnl  float64
+}
+
+// GetPortfolioStats calculates aggregate performance metrics from all daily summaries.
+func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
+	var stats PortfolioStats
+	var totalWins, totalLosses int
+	var grossProfit, grossLoss float64
+
+	rows, err := GetDB().Query(ctx, `
+		SELECT wins, losses, pnl
+		FROM daily_summaries`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var w, l int
+		var pnl float64
+		if err := rows.Scan(&w, &l, &pnl); err != nil {
+			return nil, err
+		}
+		totalWins += w
+		totalLosses += l
+		stats.TotalTrades += (w + l)
+		if pnl > 0 {
+			grossProfit += pnl
+			if pnl > stats.BestDayPnl {
+				stats.BestDayPnl = pnl
+			}
+		} else if pnl < 0 {
+			grossLoss += (-pnl)
+			if pnl < stats.WorstDayPnl {
+				stats.WorstDayPnl = pnl
+			}
+		}
+	}
+
+	if stats.TotalTrades > 0 {
+		stats.WinRatePct = float64(totalWins) / float64(stats.TotalTrades) * 100
+	}
+	if grossLoss > 0 {
+		stats.ProfitFactor = grossProfit / grossLoss
+	} else if grossProfit > 0 {
+		stats.ProfitFactor = 99.9 // effectively infinite
+	}
+
+	return &stats, nil
+}
 
 // GetClosedTradesByDateRange returns closed trades within [from, to].
 func GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]Trade, error) {
