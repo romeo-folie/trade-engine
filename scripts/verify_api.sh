@@ -13,7 +13,19 @@ check_key() {
     local url=$1
     local key=$2
     local body
-    body=$(curl -s "$BASE_URL$url")
+    local http_code
+    
+    # -s: silent, -w: write-out %{http_code} at the end
+    body=$(curl -s -w "%{http_code}" "$BASE_URL$url")
+    http_code="${body: -3}"
+    body="${body:0:${#body}-3}"
+    
+    if [ "$http_code" != "200" ]; then
+        echo "❌ $url returned HTTP $http_code (expected 200)"
+        echo "   Body: $body"
+        exit 1
+    fi
+
     if echo "$body" | grep -q "\"$key\""; then
         echo "✅ $url contains '$key'"
     else

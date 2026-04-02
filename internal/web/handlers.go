@@ -43,6 +43,10 @@ func registerAPIHandlers(mux *http.ServeMux) {
 
 // GET /api/node/risk
 func handleRisk(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -59,6 +63,10 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/portfolio
 func handlePortfolio(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -208,6 +216,10 @@ func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/ticker/:ticker
 func handleTicker(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ticker := r.URL.Path[len("/api/node/ticker/"):]
 	if ticker == "" {
 		http.Error(w, "ticker required", http.StatusBadRequest)
@@ -243,6 +255,10 @@ func handleTicker(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/watchlist
 func handleWatchlist(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -269,6 +285,10 @@ func handleWatchlist(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/models
 func handleModels(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -290,6 +310,10 @@ type signalWithAnalysts struct {
 
 // GET /api/signals/recent?limit=N
 func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -328,6 +352,10 @@ type tradeWithAnalysts struct {
 
 // GET /api/trades/recent?limit=N
 func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -358,6 +386,10 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/analyses/recent?limit=N
 func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -433,6 +465,10 @@ func toRunSummary(r store.BacktestRun) backteststRunSummary {
 // GET /api/backtests/runs?limit=N
 // Returns runs without ConfigSnapshot to avoid leaking API keys.
 func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 20, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -452,6 +488,10 @@ func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 // GET /api/backtests/runs/:id         → run metadata including ConfigSnapshot.initial_cash
 // GET /api/backtests/runs/:id/trades  → trade list for equity curve
 func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	path := r.URL.Path[len("/api/backtests/runs/"):]
 
 	if strings.HasSuffix(path, "/trades") {
