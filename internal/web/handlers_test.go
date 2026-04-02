@@ -2,14 +2,35 @@ package web
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
+
+func TestMain(m *testing.M) {
+	// Create a dummy config file so config.Load() doesn't fail.
+	tmpCfg := "test_config.yaml"
+	_ = os.WriteFile(tmpCfg, []byte(`engine: { mode: paper }`), 0600)
+	defer os.Remove(tmpCfg)
+
+	// Override ConfigPath temporarily to use our dummy file.
+	origPath := os.Getenv("TRADE_ENGINE_CONFIG")
+	os.Setenv("TRADE_ENGINE_CONFIG", tmpCfg)
+	defer os.Setenv("TRADE_ENGINE_CONFIG", origPath)
+
+	if _, err := config.Load(); err != nil {
+		fmt.Printf("failed to load mock config: %v\n", err)
+		os.Exit(1)
+	}
+
+	os.Exit(m.Run())
+}
 
 // ─── queryInt ────────────────────────────────────────────────────────────────
 
@@ -121,5 +142,64 @@ func TestConfigMasking(t *testing.T) {
 	// Double check that APIKey is omitted entirely (json:"-")
 	if strings.Contains(s, "\"APIKey\":") || strings.Contains(s, "\"api_key\":") {
 		t.Errorf("JSON contains APIKey field: %s", s)
+	}
+}
+
+// ─── Portfolio Handlers (No DB) ──────────────────────────────────────────────
+
+func TestPortfolioHandlers_NoDB(t *testing.T) {
+	// Since store.Connect hasn't been called, store.IsConnected() returns false.
+	handlers := []struct {
+		name    string
+		handler http.HandlerFunc
+		url     string
+	}{
+		{"History", handlePortfolioHistory, "/api/portfolio/history"},
+		{"Performance", handlePortfolioPerformance, "/api/portfolio/performance"},
+		{"Stats", handlePortfolioStats, "/api/portfolio/stats"},
+	}
+
+	for _, tt := range handlers {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("GET", tt.url, nil)
+			tt.handler(w, r)
+
+			if w.Code != http.StatusInternalServerError {
+				t.Errorf("expected 500, got %d", w.Code)
+			}
+			if !strings.Contains(w.Body.String(), "database not connected") {
+				t.Errorf("expected 'database not connected' error, got %q", w.Body.String())
+			}
+		})
+	}
+}
+
+// ─── System Status ───────────────────────────────────────────────────────────
+
+func TestHandleSystemStatus_Structure(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/system/status", nil)
+
+	handleSystemStatus(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp struct {
+		Version  string  `json:"version"`
+		Drawdown float64 `json:"drawdown"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("json.Unmarshal failed: %v", err)
+	}
+
+	if resp.Version == "" {
+		t.Error("expected non-empty version")
+	}
+	// drawdown should be 0.0 when not connected
+	if resp.Drawdown != 0.0 {
+		t.Errorf("expected drawdown 0.0, got %f", resp.Drawdown)
 	}
 }

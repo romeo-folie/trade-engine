@@ -305,7 +305,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // consensus's top, and the edge mid connects at the same horizontal band.
       if (n.id === 'risk_manager') {
         const consensusEstH = 180;
-        y = CY - consensusEstH / 2;
+        y = CY - consensusEstH / 2 - 20;
       }
 
       // Execution phase stagger as per desired layout: 
@@ -435,7 +435,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         // selectedAnalysts is cleared on TickStarted so the edge goes dark at cycle reset.
         // wasInvoked (from analystVotes) was removed: it persisted the entire tick duration,
         // keeping edges lit long after analysis completed.
-        const isSelected = selectedAnalysts.includes(aid);
+        const isSelected = selectedAnalysts.includes(aid) && isNodeRecentlyActive(aid);
         edges.push(makeEdge(arbiterId, aid, { activeOverride: isSelected }));
       });
     }
@@ -706,7 +706,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         edgeTypes={EDGE_TYPES}
         minZoom={0.2}
         maxZoom={1.5}
-        defaultViewport={{ x: 80, y: 80, zoom: 0.4 }}
+        fitView
+        fitViewOptions={{ padding: 0.2 }}
         panOnScroll
         panOnScrollMode={PanOnScrollMode.Free}
         zoomOnScroll={false}

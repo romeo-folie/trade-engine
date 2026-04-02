@@ -46,8 +46,8 @@ const COLUMNS: Column<Signal>[] = [
     label: 'DIR',
     render: (s) => {
       const a = s.Action.toUpperCase();
-      if (a === 'BUY' || a === 'LONG') return <span className={styles.dirLong}>LONG</span>;
-      if (a === 'SELL' || a === 'SHORT') return <span className={styles.dirShort}>SHORT</span>;
+      if (a === 'BUY' || a === 'LONG') return <span className={styles.dirLong}><span style={{ color: colors.acidGreen, marginRight: 4 }}>▲</span>LONG</span>;
+      if (a === 'SELL' || a === 'SHORT') return <span className={styles.dirShort}><span style={{ color: colors.red, marginRight: 4 }}>▼</span>SHORT</span>;
       return <span className={styles.dirNeut}>NEUTRAL</span>;
     },
   },
@@ -142,6 +142,7 @@ const COLUMNS: Column<Signal>[] = [
 
 export default function SignalsScreen() {
   const [signals, setSignals] = useState<Signal[]>([]);
+  const [systemStatus, setSystemStatus] = useState<{ version: string; status: string } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
@@ -156,21 +157,30 @@ export default function SignalsScreen() {
       fetchControllerRef.current = controller;
 
       try {
-        const res = await fetch('/api/signals/recent?limit=100', { signal: controller.signal });
-        if (!res.ok) {
-          setFetchError(`${res.status} ${res.statusText}`);
-          return;
+        const [sigRes, sysRes] = await Promise.all([
+          fetch('/api/signals/recent?limit=100', { signal: controller.signal }),
+          fetch('/api/system/status', { signal: controller.signal }),
+        ]);
+
+        if (sigRes.ok) {
+          const data = await sigRes.json();
+          if (data && Array.isArray(data.signals)) {
+            setSignals(data.signals);
+            setSelectedSignal(sel =>
+              sel ? data.signals.find((s: Signal) => s.ID === sel.ID) ?? sel : null
+            );
+          }
         }
-        const data = await res.json();
-        if (data && Array.isArray(data.signals)) {
-          setSignals(data.signals);
-          setSelectedSignal(sel =>
-            sel ? data.signals.find((s: Signal) => s.ID === sel.ID) ?? sel : null
-          );
-          setFetchError(null);
-        } else {
-          setFetchError('Unexpected response shape');
+
+        if (sysRes.ok) {
+          const data = await sysRes.json();
+          setSystemStatus({
+            version: data.version || '0.0.0',
+            status: 'ALL SYSTEMS NOMINAL' // Or derive from actual status if available
+          });
         }
+        
+        setFetchError(null);
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
           console.warn('[SignalsScreen] fetch error:', err);
@@ -209,6 +219,7 @@ export default function SignalsScreen() {
       executed: data.filter(s => s.Status.toLowerCase() === 'executed').length,
       blocked: data.filter(s => s.Status.toLowerCase() === 'blocked').length,
       approved: data.filter(s => s.Status.toLowerCase() === 'approved').length,
+      expired: data.filter(s => s.Status.toLowerCase() === 'expired').length,
     };
   }, [signals]);
 
@@ -222,7 +233,7 @@ export default function SignalsScreen() {
           <span className={styles.breadcrumbPage}>SIGNALS</span>
         </div>
         <div className={styles.systemStatus}>
-          v2.1.0 <span className={styles.statusDot}>●</span> ALL SYSTEMS NOMINAL
+          v{systemStatus?.version ?? '—'} <span className={styles.statusDot}>●</span> {systemStatus?.status ?? 'LOADING...'}
         </div>
       </div>
 
@@ -266,7 +277,7 @@ export default function SignalsScreen() {
         </CornerCard>
         <CornerCard className={styles.statCard} bracketColor="var(--text-faint)">
           <div className={styles.statLabel}>EXPIRED</div>
-          <div className={`${styles.statValue} ${styles.statDim}`}>0</div>
+          <div className={`${styles.statValue} ${styles.statDim}`}>{stats.expired}</div>
         </CornerCard>
       </div>
 

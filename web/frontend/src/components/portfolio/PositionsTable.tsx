@@ -146,7 +146,8 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
                       padding: '1px 6px' 
                     }}
                   >
-                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11', display: 'flex', alignItems: 'center', gap: 2 }}>
+                      <span style={{ fontSize: 10 }}>{dirIsLong ? '▲' : '▼'}</span>
                       {dirIsLong ? 'BUY' : 'SELL'}
                     </span>
                   </ChamferedBox>
