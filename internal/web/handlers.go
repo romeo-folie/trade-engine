@@ -43,6 +43,10 @@ func registerAPIHandlers(mux *http.ServeMux) {
 
 // GET /api/node/risk
 func handleRisk(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -59,6 +63,10 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/portfolio
 func handlePortfolio(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -70,8 +78,108 @@ func handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, snap)
 }
 
+// GET /api/portfolio/history?days=N
+func handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	days := queryInt(r, "days", 30, 365)
+	from := time.Now().AddDate(0, 0, -days)
+	to := time.Now()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	summaries, err := store.GetDailySummaries(ctx, from, to)
+	if err != nil {
+		apiError(w, "history query failed", err)
+		return
+	}
+
+	type historyPoint struct {
+		Date  string  `json:"date"`
+		Value float64 `json:"value"`
+	}
+	out := make([]historyPoint, 0, len(summaries))
+	for _, s := range summaries {
+		out = append(out, historyPoint{
+			Date:  s.Date.Format("2006-01-02"),
+			Value: s.EndingValue,
+		})
+	}
+	jsonResponse(w, map[string]any{"history": out})
+}
+
+// GET /api/portfolio/performance
+func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil {
+		apiError(w, "latest snapshot query failed", err)
+		return
+	}
+	if snap == nil {
+		jsonResponse(w, map[string]any{})
+		return
+	}
+
+	now := time.Now().UTC()
+	today := now.Truncate(24 * time.Hour)
+	week := today.AddDate(0, 0, -7)
+	month := today.AddDate(0, 0, -30)
+
+	summaries, err := store.GetDailySummaries(ctx, month, today)
+	if err != nil {
+		apiError(w, "summaries query failed", err)
+		return
+	}
+
+	performance := map[string]any{
+		"current_value": snap.TotalValue,
+	}
+
+	findStartValue := func(target time.Time) float64 {
+		for _, s := range summaries {
+			if s.Date.Equal(target) || s.Date.After(target) {
+				return s.StartingValue
+			}
+		}
+		return 0
+	}
+
+	todayStart := findStartValue(today)
+	weekStart := findStartValue(week)
+	monthStart := findStartValue(month)
+
+	if todayStart > 0 {
+		pnl := snap.TotalValue - todayStart
+		performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / todayStart) * 100}
+	}
+	if weekStart > 0 {
+		pnl := snap.TotalValue - weekStart
+		performance["week"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / weekStart) * 100}
+	}
+	if monthStart > 0 {
+		pnl := snap.TotalValue - monthStart
+		performance["month"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / monthStart) * 100}
+	}
+
+	jsonResponse(w, performance)
+}
+
 // GET /api/portfolio/summaries
 func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -89,6 +197,10 @@ func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/portfolio/stats
 func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -102,6 +214,10 @@ func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/portfolio/positions
 func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -118,6 +234,10 @@ func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/ticker/:ticker
 func handleTicker(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ticker := r.URL.Path[len("/api/node/ticker/"):]
 	if ticker == "" {
 		http.Error(w, "ticker required", http.StatusBadRequest)
@@ -153,6 +273,10 @@ func handleTicker(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/watchlist
 func handleWatchlist(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -179,6 +303,10 @@ func handleWatchlist(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/node/models
 func handleModels(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
@@ -200,6 +328,10 @@ type signalWithAnalysts struct {
 
 // GET /api/signals/recent?limit=N
 func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -238,6 +370,10 @@ type tradeWithAnalysts struct {
 
 // GET /api/trades/recent?limit=N
 func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -268,6 +404,10 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/analyses/recent?limit=N
 func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 50, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -343,6 +483,10 @@ func toRunSummary(r store.BacktestRun) backteststRunSummary {
 // GET /api/backtests/runs?limit=N
 // Returns runs without ConfigSnapshot to avoid leaking API keys.
 func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	limit := queryInt(r, "limit", 20, 200)
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
@@ -362,6 +506,10 @@ func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 // GET /api/backtests/runs/:id         → run metadata including ConfigSnapshot.initial_cash
 // GET /api/backtests/runs/:id/trades  → trade list for equity curve
 func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
 	path := r.URL.Path[len("/api/backtests/runs/"):]
 
 	if strings.HasSuffix(path, "/trades") {
@@ -439,16 +587,31 @@ func handleSystemCache(w http.ResponseWriter, _ *http.Request) {
 }
 
 // GET /api/system/status
-func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
+func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	uptimeSec := int(time.Since(processStart).Seconds())
 
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var peak float64
+	var drawdown float64
+	if store.IsConnected() {
+		_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
+
+		snap, _ := store.GetLatestPortfolioSnapshot(ctx)
+		if peak > 0 && snap != nil && snap.TotalValue < peak {
+			drawdown = (peak - snap.TotalValue) / peak
+		}
+	}
+
 	jsonResponse(w, map[string]any{
-		"version":           "0.1.0",
+		"version":           "2.1.0",
 		"mode":              strings.ToUpper(cfg.Engine.Mode),
 		"tick_interval_sec": cfg.Engine.TickIntervalSec,
 		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
 		"uptime_seconds":    uptimeSec,
+		"drawdown":          drawdown,
 	})
 }
 
@@ -531,7 +694,11 @@ func jsonResponse(w http.ResponseWriter, v any) {
 }
 
 func apiError(w http.ResponseWriter, msg string, err error) {
-	logger.Warn("web: api error", "msg", msg, "err", err.Error())
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
+	logger.Warn("web: api error", "msg", msg, "err", errStr)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})

@@ -256,21 +256,31 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {d.nodeId === 'risk_manager' ? (
               (() => {
                 const checks = d.riskChecks as RiskCheckResult[] | undefined;
-                const displayChecks = checks && checks.length > 0
-                  ? checks
-                  : ['confidence_threshold', 'risk_reward_ratio', 'position_size_limit', 'max_open_positions', 'daily_loss_limit', 'max_drawdown', 'cooldown_after_loss'].map(checkName => ({ name: checkName, passed: false, reason: '' }));
-                const hasRealData = checks && checks.length > 0;
+                const RISK_CHECK_NAMES = [
+                  'confidence_threshold',
+                  'risk_reward_ratio',
+                  'position_size_limit',
+                  'max_open_positions',
+                  'daily_loss_limit',
+                  'max_drawdown',
+                  'cooldown_after_loss'
+                ];
+                
+                
                 return (
                   <>
                     <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 6 }}>RISK CHECKS</div>
-                    {displayChecks.map(check => (
-                      <div key={check.name} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }} title={check.reason || undefined}>
-                        <span className={styles.kindLabel}>{check.name}</span>
-                        <span className={styles.kindLabel} style={{ color: hasRealData ? (check.passed ? colors.emerald : colors.red) : colors.textDim }}>
-                          {hasRealData ? (check.passed ? 'PASS' : 'FAIL') : '—'}
-                        </span>
-                      </div>
-                    ))}
+                    {RISK_CHECK_NAMES.map(checkName => {
+                      const check = checks?.find(c => c.name === checkName);
+                      return (
+                        <div key={checkName} style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }} title={check?.reason || undefined}>
+                          <span className={styles.kindLabel}>{checkName}</span>
+                          <span className={styles.kindLabel} style={{ color: check ? (check.passed ? colors.emerald : colors.red) : colors.textDim }}>
+                            {check ? (check.passed ? 'PASS' : 'FAIL') : '—'}
+                          </span>
+                        </div>
+                      );
+                    })}
                   </>
                 );
               })()
