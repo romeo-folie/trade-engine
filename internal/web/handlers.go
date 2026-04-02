@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -56,7 +55,7 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{
-		"open_trades":     openTrades,
+		"open_trades":      openTrades,
 		"open_trade_count": len(openTrades),
 	})
 }
@@ -665,8 +664,7 @@ func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 				// Also allow direct dot-path updates if provided.
 				dotPath = k
 			}
-			valStr := fmt.Sprintf("%v", v)
-			if err := config.SetField(dotPath, valStr); err != nil {
+			if err := config.SetFieldAny(dotPath, v); err != nil {
 				apiError(w, "config update failed", err)
 				return
 			}

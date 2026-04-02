@@ -36,13 +36,13 @@ type Config struct {
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
 type ORBConfig struct {
 	Enabled           bool    `yaml:"enabled"`
-	Mode              string  `yaml:"mode"`               // "paper" | "live"
-	GapThresholdPct   float64 `yaml:"gap_threshold_pct"`  // minimum gap % (e.g. 3.0)
-	MaxCandidates     int     `yaml:"max_candidates"`     // 1–5
-	RangeMinutes      int     `yaml:"range_minutes"`      // 5 or 15
-	RiskReward        float64 `yaml:"risk_reward"`        // e.g. 2.0
-	MaxRiskPct        float64 `yaml:"max_risk_pct"`       // max loss per trade as % of portfolio
-	MaxPositionPct    float64 `yaml:"max_position_pct"`   // max notional per trade as % of portfolio (e.g. 10.0)
+	Mode              string  `yaml:"mode"`                // "paper" | "live"
+	GapThresholdPct   float64 `yaml:"gap_threshold_pct"`   // minimum gap % (e.g. 3.0)
+	MaxCandidates     int     `yaml:"max_candidates"`      // 1–5
+	RangeMinutes      int     `yaml:"range_minutes"`       // 5 or 15
+	RiskReward        float64 `yaml:"risk_reward"`         // e.g. 2.0
+	MaxRiskPct        float64 `yaml:"max_risk_pct"`        // max loss per trade as % of portfolio
+	MaxPositionPct    float64 `yaml:"max_position_pct"`    // max notional per trade as % of portfolio (e.g. 10.0)
 	NewsLookbackHours int     `yaml:"news_lookback_hours"` // e.g. 24
 }
 
@@ -240,7 +240,7 @@ type ModelConfig struct {
 	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
 	Model       string  `yaml:"model"`
 	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
-	APIKey      string  `yaml:"-" json:"-"`           // resolved at runtime, never serialised
+	APIKey      string  `yaml:"-" json:"-"`  // resolved at runtime, never serialised
 	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
 	TimeoutSec  int     `yaml:"timeout_sec"`
@@ -406,7 +406,7 @@ type MarketsConfig struct {
 type NewsAPIConfig struct {
 	Provider      string `yaml:"provider"`        // finnhub | benzinga
 	APIKeyEnv     string `yaml:"api_key_env"`     // env var name holding the API key
-	APIKey        string `yaml:"-" json:"-"`               // resolved at runtime
+	APIKey        string `yaml:"-" json:"-"`      // resolved at runtime
 	FetchEveryMin int    `yaml:"fetch_every_min"` // cadence in minutes (default 15)
 
 	// Extraction controls knowledge-graph enrichment LLM calls.
@@ -626,6 +626,25 @@ func Get() *Config {
 
 // SetField updates a single dotted-path key in the config YAML file.
 func SetField(dotPath, value string) error {
+	return SetFieldAny(dotPath, parseScalarString(value))
+}
+
+func parseScalarString(value string) any {
+	if b, err := strconv.ParseBool(value); err == nil {
+		return b
+	}
+	if i, err := strconv.ParseInt(value, 10, 64); err == nil {
+		return i
+	}
+	if f, err := strconv.ParseFloat(value, 64); err == nil {
+		return f
+	}
+	return value
+}
+
+// SetFieldAny updates a single dotted-path key in the config YAML file.
+// Supports scalar and sequence values.
+func SetFieldAny(dotPath string, value any) error {
 	data, err := os.ReadFile(ConfigPath())
 	var node yaml.Node
 	if err != nil && !os.IsNotExist(err) {
@@ -948,9 +967,47 @@ func scalarNode(value string) *yaml.Node {
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: value}
 }
 
+func yamlNodeFromAny(value any) *yaml.Node {
+	switch v := value.(type) {
+	case nil:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!null", Value: "null"}
+	case bool:
+		if v {
+			return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"}
+		}
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "false"}
+	case int:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(v)}
+	case int8, int16, int32, int64:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", v)}
+	case uint, uint8, uint16, uint32, uint64:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprintf("%d", v)}
+	case float32:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(float64(v), 'f', -1, 64)}
+	case float64:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!float", Value: strconv.FormatFloat(v, 'f', -1, 64)}
+	case string:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+	case []string:
+		n := &yaml.Node{Kind: yaml.SequenceNode}
+		for _, item := range v {
+			n.Content = append(n.Content, yamlNodeFromAny(item))
+		}
+		return n
+	case []any:
+		n := &yaml.Node{Kind: yaml.SequenceNode}
+		for _, item := range v {
+			n.Content = append(n.Content, yamlNodeFromAny(item))
+		}
+		return n
+	default:
+		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprintf("%v", v)}
+	}
+}
+
 // setYAMLNode sets a dotted-path key in a YAML node tree.
 // Supports both MappingNode (by key) and SequenceNode (by index).
-func setYAMLNode(node *yaml.Node, parts []string, value string) {
+func setYAMLNode(node *yaml.Node, parts []string, value any) {
 	if len(parts) == 0 {
 		return
 	}
@@ -960,7 +1017,7 @@ func setYAMLNode(node *yaml.Node, parts []string, value string) {
 		for i := 0; i < len(node.Content)-1; i += 2 {
 			if node.Content[i].Value == key {
 				if len(parts) == 1 {
-					node.Content[i+1] = scalarNode(value)
+					node.Content[i+1] = yamlNodeFromAny(value)
 				} else {
 					setYAMLNode(node.Content[i+1], parts[1:], value)
 				}
@@ -970,7 +1027,7 @@ func setYAMLNode(node *yaml.Node, parts []string, value string) {
 		// Key not found — append.
 		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Value: key}
 		if len(parts) == 1 {
-			node.Content = append(node.Content, keyNode, scalarNode(value))
+			node.Content = append(node.Content, keyNode, yamlNodeFromAny(value))
 		} else {
 			child := &yaml.Node{Kind: yaml.MappingNode}
 			node.Content = append(node.Content, keyNode, child)
@@ -992,7 +1049,7 @@ func setYAMLNode(node *yaml.Node, parts []string, value string) {
 			node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: ""})
 		}
 		if len(parts) == 1 {
-			node.Content[idx] = scalarNode(value)
+			node.Content[idx] = yamlNodeFromAny(value)
 		} else {
 			// Promote missing scalar node to MappingNode if we need to recurse
 			if node.Content[idx].Kind == yaml.ScalarNode && node.Content[idx].Value == "" {

@@ -165,6 +165,46 @@ func TestSetField_NestedPathAndBool(t *testing.T) {
 	}
 }
 
+func TestSetFieldAny_SequenceValue(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	path := ConfigPath()
+	if err := save(Defaults(), path); err != nil {
+		t.Fatalf("save defaults: %v", err)
+	}
+
+	if err := SetFieldAny("notifications.telegram.notify_on", []any{"signal", "trade", "error"}); err != nil {
+		t.Fatalf("SetFieldAny: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := len(cfg.Notifications.Telegram.NotifyOn), 3; got != want {
+		t.Fatalf("notify_on length = %d, want %d", got, want)
+	}
+	if cfg.Notifications.Telegram.NotifyOn[0] != "signal" || cfg.Notifications.Telegram.NotifyOn[1] != "trade" || cfg.Notifications.Telegram.NotifyOn[2] != "error" {
+		t.Fatalf("notify_on = %#v", cfg.Notifications.Telegram.NotifyOn)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "[signal trade error]") {
+		t.Fatalf("notify_on written as scalar, expected YAML sequence: %s", s)
+	}
+	if !strings.Contains(s, "notify_on:\n") {
+		t.Fatalf("notify_on key missing: %s", s)
+	}
+	if !strings.Contains(s, "- signal") || !strings.Contains(s, "- trade") || !strings.Contains(s, "- error") {
+		t.Fatalf("notify_on sequence items missing: %s", s)
+	}
+}
+
 // ── Registry tests ────────────────────────────────────────────────────────────
 
 func TestDefaultsRegistryPresent(t *testing.T) {
