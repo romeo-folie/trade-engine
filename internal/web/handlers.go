@@ -23,6 +23,9 @@ var processStart = time.Now()
 func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/node/risk", handleRisk)
 	mux.HandleFunc("/api/node/portfolio", handlePortfolio)
+	mux.HandleFunc("/api/portfolio/history", handlePortfolioHistory)
+	mux.HandleFunc("/api/portfolio/performance", handlePortfolioPerformance)
+	mux.HandleFunc("/api/portfolio/stats", handlePortfolioStats)
 	mux.HandleFunc("/api/node/ticker/", handleTicker) // /api/node/ticker/:ticker
 	mux.HandleFunc("/api/node/watchlist", handleWatchlist)
 	mux.HandleFunc("/api/node/models", handleModels)
@@ -65,6 +68,142 @@ func handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, snap)
+}
+
+// GET /api/portfolio/history?days=N
+func handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	days := queryInt(r, "days", 30, 365)
+	from := time.Now().AddDate(0, 0, -days)
+	to := time.Now()
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	summaries, err := store.GetDailySummaries(ctx, from, to)
+	if err != nil {
+		apiError(w, "history query failed", err)
+		return
+	}
+
+	type historyPoint struct {
+		Date  string  `json:"date"`
+		Value float64 `json:"value"`
+	}
+	out := make([]historyPoint, 0, len(summaries))
+	for _, s := range summaries {
+		out = append(out, historyPoint{
+			Date:  s.Date.Format("2006-01-02"),
+			Value: s.EndingValue,
+		})
+	}
+	jsonResponse(w, map[string]any{"history": out})
+}
+
+// GET /api/portfolio/performance
+func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Get latest snapshot for current value
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil {
+		apiError(w, "latest snapshot query failed", err)
+		return
+	}
+	if snap == nil {
+		jsonResponse(w, map[string]any{})
+		return
+	}
+
+	now := time.Now().UTC()
+	today := now.Truncate(24 * time.Hour)
+	week := today.AddDate(0, 0, -7)
+	month := today.AddDate(0, 0, -30)
+
+	summaries, err := store.GetDailySummaries(ctx, month, today)
+	if err != nil {
+		apiError(w, "summaries query failed", err)
+		return
+	}
+
+	performance := map[string]any{
+		"current_value": snap.TotalValue,
+	}
+
+	findStartValue := func(target time.Time) float64 {
+		for _, s := range summaries {
+			if s.Date.Equal(target) || s.Date.After(target) {
+				return s.StartingValue
+			}
+		}
+		return 0
+	}
+
+	todayStart := findStartValue(today)
+	weekStart := findStartValue(week)
+	monthStart := findStartValue(month)
+
+	if todayStart > 0 {
+		pnl := snap.TotalValue - todayStart
+		performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / todayStart) * 100}
+	}
+	if weekStart > 0 {
+		pnl := snap.TotalValue - weekStart
+		performance["week"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / weekStart) * 100}
+	}
+	if monthStart > 0 {
+		pnl := snap.TotalValue - monthStart
+		performance["month"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / monthStart) * 100}
+	}
+
+	jsonResponse(w, performance)
+}
+
+// GET /api/portfolio/stats
+func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Aggregate stats from daily summaries
+	summaries, err := store.GetDailySummaries(ctx, time.Now().AddDate(-1, 0, 0), time.Now())
+	if err != nil {
+		apiError(w, "stats query failed", err)
+		return
+	}
+
+	var totalTrades, wins, losses int
+	var totalPnL float64
+	for _, s := range summaries {
+		totalTrades += s.TradesClosed
+		wins += s.Wins
+		losses += s.Losses
+		totalPnL += s.PnL
+	}
+
+	winRate := 0.0
+	if (wins + losses) > 0 {
+		winRate = float64(wins) / float64(wins+losses) * 100
+	}
+
+	jsonResponse(w, map[string]any{
+		"total_trades": totalTrades,
+		"win_rate":     winRate,
+		"wins":         wins,
+		"losses":       losses,
+		"total_pnl":    totalPnL,
+	})
 }
 
 // GET /api/node/ticker/:ticker
@@ -390,16 +529,31 @@ func handleSystemCache(w http.ResponseWriter, _ *http.Request) {
 }
 
 // GET /api/system/status
-func handleSystemStatus(w http.ResponseWriter, _ *http.Request) {
+func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	uptimeSec := int(time.Since(processStart).Seconds())
 
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	var peak float64
+	var drawdown float64
+	if store.IsConnected() {
+		_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
+
+		snap, _ := store.GetLatestPortfolioSnapshot(ctx)
+		if peak > 0 && snap != nil && snap.TotalValue < peak {
+			drawdown = (peak - snap.TotalValue) / peak
+		}
+	}
+
 	jsonResponse(w, map[string]any{
-		"version":           "0.1.0",
+		"version":           "2.1.0",
 		"mode":              strings.ToUpper(cfg.Engine.Mode),
 		"tick_interval_sec": cfg.Engine.TickIntervalSec,
 		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
 		"uptime_seconds":    uptimeSec,
+		"drawdown":          drawdown,
 	})
 }
 
@@ -482,7 +636,11 @@ func jsonResponse(w http.ResponseWriter, v any) {
 }
 
 func apiError(w http.ResponseWriter, msg string, err error) {
-	logger.Warn("web: api error", "msg", msg, "err", err.Error())
+	errStr := ""
+	if err != nil {
+		errStr = err.Error()
+	}
+	logger.Warn("web: api error", "msg", msg, "err", errStr)
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusInternalServerError)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})

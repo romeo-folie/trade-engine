@@ -98,7 +98,7 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 			Name:        analystName(i),
 			Verdict:     mapVerdict(r.Response.Action),
 			Confidence:  r.Response.Confidence,
-			Description: truncate(r.Response.Reasoning, 120),
+			Description: r.Response.Reasoning,
 			Weight:      weight,
 			Active:      active,
 			Model:       model,

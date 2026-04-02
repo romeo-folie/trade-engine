@@ -18,6 +18,7 @@ interface SystemStatus {
   tick_interval_sec: number;
   tick_interval_min: number; // float: e.g. 0.5 for 30s, 1.0 for 60s
   uptime_seconds: number;
+  drawdown?: number;
 }
 
 interface CacheStats {
@@ -213,7 +214,7 @@ export default function SystemScreen() {
     { label: 'TICK INTERVAL', value: tickDisplay },
     { label: 'SIGNALS TODAY', value: signalCount ?? '—' },
     { label: 'CACHE HIT RATE', value: displayHitRate },
-    { label: 'DRAWDOWN', value: '—' },
+    { label: 'DRAWDOWN', value: fmtPct(systemStatus?.drawdown != null ? systemStatus.drawdown * 100 : null) },
     { label: 'OPEN POSITIONS', value: openPositions },
   ];
 

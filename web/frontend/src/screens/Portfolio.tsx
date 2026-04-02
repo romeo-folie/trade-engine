@@ -8,11 +8,12 @@
  *
  * Task 4 of the web redesign (closes #204).
  */
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import EquityCurve from '../components/portfolio/EquityCurve';
 import PositionsTable from '../components/portfolio/PositionsTable';
+import type { Position } from '../components/portfolio/PositionsTable';
 import styles from './Portfolio.module.css';
 
 /* ── API response types ─────────────────────────────────────────────────────── */
@@ -28,34 +29,30 @@ interface PortfolioSnapshot {
   CreatedAt: string;
 }
 
-// Trade interface deferred — will be added when trades table is rendered
-
-/* ── Mock data ──────────────────────────────────────────────────────────────── */
-
-// TODO: replace with /api/positions when backend endpoint is available
-
-// TODO: replace with real equity history from /api/portfolio/history when available
-function generateMockEquityData(currentValue: number): { date: string; value: number }[] {
-  const points: { date: string; value: number }[] = [];
-  const now = new Date();
-  const startValue = currentValue * 0.95;
-  for (let i = 16; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    const progress = (16 - i) / 16;
-    const noise = (Math.sin(i * 1.7) * 0.015) + (Math.cos(i * 0.8) * 0.008);
-    const value = startValue + (currentValue - startValue) * progress + currentValue * noise;
-    points.push({
-      date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
-      value: Math.round(value * 100) / 100,
-    });
-  }
-  return points;
+interface HistoryPoint {
+  date: string;
+  value: number;
 }
 
-// TODO: derive from DailySummary endpoint when available
+interface PerformancePeriod {
+  pnl: number;
+  pnl_pct: number;
+}
 
-// TODO: derive from trades data when sufficient history is available
+interface PerformanceData {
+  current_value: number;
+  today?: PerformancePeriod;
+  week?: PerformancePeriod;
+  month?: PerformancePeriod;
+}
+
+interface PortfolioStats {
+  total_trades: number;
+  win_rate: number;
+  wins: number;
+  losses: number;
+  total_pnl: number;
+}
 
 /* ── Helpers ────────────────────────────────────────────────────────────────── */
 
@@ -68,6 +65,11 @@ function fmtPnl(n: number): string {
   return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+function fmtPct(n: number): string {
+  const sign = n > 0 ? '+' : '';
+  return `${sign}${n.toFixed(2)}%`;
+}
+
 function pnlColor(n: number): string {
   return n >= 0 ? TOKENS.emerald : TOKENS.red;
 }
@@ -76,39 +78,68 @@ function pnlColor(n: number): string {
 
 export default function PortfolioScreen() {
   const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
+  const [history, setHistory] = useState<HistoryPoint[]>([]);
+  const [performance, setPerformance] = useState<PerformanceData | null>(null);
+  const [stats, setStats] = useState<PortfolioStats | null>(null);
+  const [positions, setPositions] = useState<Position[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  // Per-tick AbortController ref — aborts previous in-flight request before starting new one
+
   const fetchControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     async function load() {
-      // Abort any prior in-flight request before starting a new one
       fetchControllerRef.current?.abort();
       const controller = new AbortController();
       fetchControllerRef.current = controller;
 
       try {
-        const res = await fetch('/api/node/portfolio', { signal: controller.signal });
-        if (res.ok) {
-          const data = await res.json();
-          if (data && typeof data.TotalValue === 'number') {
-            setSnapshot(data);
-            setFetchError(null);
-          } else {
-            console.warn('[PortfolioScreen] unexpected payload shape:', data);
-            setFetchError('Unexpected response shape from /api/node/portfolio');
-          }
-        } else {
-          console.warn('[PortfolioScreen] non-2xx response:', res.status, res.statusText);
-          setFetchError(`API error: ${res.status} ${res.statusText}`);
+        const [portRes, histRes, perfRes, statsRes, riskRes] = await Promise.all([
+          fetch('/api/node/portfolio', { signal: controller.signal }),
+          fetch('/api/portfolio/history?days=30', { signal: controller.signal }),
+          fetch('/api/portfolio/performance', { signal: controller.signal }),
+          fetch('/api/portfolio/stats', { signal: controller.signal }),
+          fetch('/api/node/risk', { signal: controller.signal }),
+        ]);
+
+        if (portRes.ok) {
+          const data = await portRes.json();
+          if (data && typeof data.TotalValue === 'number') setSnapshot(data);
         }
+        if (histRes.ok) {
+          const data = await histRes.json();
+          if (data && Array.isArray(data.history)) setHistory(data.history);
+        }
+        if (perfRes.ok) {
+          const data = await perfRes.json();
+          setPerformance(data);
+        }
+        if (statsRes.ok) {
+          const data = await statsRes.json();
+          setStats(data);
+        }
+        if (riskRes.ok) {
+          const data = await riskRes.json();
+          if (data && Array.isArray(data.open_trades)) {
+            // Map backend trades to frontend positions
+            const mapped = data.open_trades.map((t: any) => ({
+              ticker: t.Ticker,
+              direction: t.Direction.toUpperCase(),
+              strategy: t.Strategy,
+              entry: t.EntryPrice,
+              current: t.EntryPrice + (t.PnL / t.Quantity), // Simplified: current estimate if not in payload
+              unrealizedPnl: t.PnL,
+              pnlPct: t.PnLPct,
+            }));
+            setPositions(mapped);
+          }
+        }
+        setFetchError(null);
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[PortfolioScreen] snapshot fetch error:', err);
+          console.warn('[PortfolioScreen] fetch error:', err);
           setFetchError(err.message);
         }
       }
-      // Trades fetch deferred until trades table is rendered in a future task
     }
 
     load();
@@ -119,19 +150,12 @@ export default function PortfolioScreen() {
     };
   }, []);
 
-  // Use real snapshot data only — no hardcoded fallbacks for financial values.
-  // Display placeholder dashes until the first successful fetch.
   const hasData = snapshot !== null;
   const totalValue = snapshot?.TotalValue ?? 0;
   const cash = snapshot?.Cash ?? 0;
   const invested = snapshot?.Invested ?? 0;
   const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
   const dayPnl = snapshot?.RealizedPnLToday ?? 0;
-
-  const equityData = useMemo(
-    () => (totalValue !== null ? generateMockEquityData(totalValue) : []),
-    [totalValue],
-  );
 
   return (
     <div className={styles.screen}>
@@ -173,8 +197,8 @@ export default function PortfolioScreen() {
 
       {/* ── Equity Curve ──────────────────────────────────────────────────── */}
       <div className={styles.curveSection}>
-        {hasData ? (
-          <EquityCurve data={equityData} />
+        {history.length > 0 ? (
+          <EquityCurve data={history} />
         ) : (
           <div className={styles.curvePlaceholder}>
             {fetchError ? 'Unable to load equity data' : 'Loading equity data…'}
@@ -183,23 +207,59 @@ export default function PortfolioScreen() {
       </div>
 
       {/* ── Open Positions ────────────────────────────────────────────────── */}
-      <PositionsTable positions={[]} />
+      <PositionsTable positions={positions} />
 
       {/* ── Performance Metrics ───────────────────────────────────────────── */}
-      {/* Period and system stats require a dedicated summary endpoint.
-          Placeholder displayed until live data is wired. */}
       <div className={styles.metricsGrid}>
         <div className={styles.metricsSection}>
           <div className={styles.sectionLabel}>PERIOD PERFORMANCE</div>
-          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
-            — awaiting live data
-          </div>
+          {performance ? (
+            <>
+              <div className={styles.metricRow}>
+                <span>TODAY</span>
+                <span className={performance.today ? pnlColor(performance.today.pnl) : undefined}>
+                  {performance.today ? `${fmtPnl(performance.today.pnl)} (${fmtPct(performance.today.pnl_pct)})` : '—'}
+                </span>
+              </div>
+              <div className={styles.metricRow}>
+                <span>7D</span>
+                <span className={performance.week ? pnlColor(performance.week.pnl) : undefined}>
+                  {performance.week ? `${fmtPnl(performance.week.pnl)} (${fmtPct(performance.week.pnl_pct)})` : '—'}
+                </span>
+              </div>
+              <div className={styles.metricRow}>
+                <span>30D</span>
+                <span className={performance.month ? pnlColor(performance.month.pnl) : undefined}>
+                  {performance.month ? `${fmtPnl(performance.month.pnl)} (${fmtPct(performance.month.pnl_pct)})` : '—'}
+                </span>
+              </div>
+            </>
+          ) : (
+            <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>— awaiting live data</div>
+          )}
         </div>
         <div className={styles.metricsSection}>
           <div className={styles.sectionLabel}>SYSTEM STATS</div>
-          <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>
-            — awaiting live data
-          </div>
+          {stats ? (
+            <>
+              <div className={styles.metricRow}>
+                <span>TOTAL TRADES</span>
+                <span style={{ color: 'var(--text-primary)' }}>{stats.total_trades}</span>
+              </div>
+              <div className={styles.metricRow}>
+                <span>WIN RATE</span>
+                <span className={stats.win_rate >= 50 ? styles.positive : styles.negative}>
+                  {stats.win_rate.toFixed(1)}%
+                </span>
+              </div>
+              <div className={styles.metricRow}>
+                <span>TOTAL P&L</span>
+                <span className={pnlColor(stats.total_pnl)}>{fmtPnl(stats.total_pnl)}</span>
+              </div>
+            </>
+          ) : (
+            <div className={styles.metricRow} style={{ color: 'var(--text-faint)' }}>— awaiting live data</div>
+          )}
         </div>
       </div>
     </div>
