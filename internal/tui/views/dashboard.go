@@ -110,12 +110,26 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 		return d
 	}
 
-	// Open trades → positions
-	var visibleInvested float64
-	var largestVisiblePosValue float64
-	var totalCostBasis float64
+	// Initial summary values from config/local derivation (fallback).
+	d.Cash = initialCapital
+	d.TotalValue = initialCapital
+
+	// Prefer the latest portfolio snapshot if available (Alpaca-backed).
+	if snap, err := store.GetLatestPortfolioSnapshot(ctx); err == nil && snap != nil {
+		d.Cash = snap.Cash
+		d.TotalValue = snap.TotalValue
+		d.Invested = snap.Invested
+		d.UnrealizedPnL = snap.UnrealizedPnL
+		d.OpenPositionCnt = snap.OpenPositions
+	}
+
+	// Fetch open trades to populate the positions table and refine P&L if more recent
+	// candle data is available.
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
+		var visibleInvested float64
+		var largestVisiblePosValue float64
+		var localUnrealizedPnL float64
 		for _, t := range trades {
 			// Get latest price for unrealized P&L
 			var currentPrice float64
@@ -138,17 +152,12 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 			}
 
 			posValue := currentPrice * t.Quantity
-			d.Invested += posValue
-			d.UnrealizedPnL += pnl
-			// Cost basis is always entryPrice×qty regardless of direction.
-			totalCostBasis += t.EntryPrice * t.Quantity
-
 			visibleInvested += posValue
+			localUnrealizedPnL += pnl
 			if posValue > largestVisiblePosValue {
 				largestVisiblePosValue = posValue
 			}
 
-			d.OpenPositionCnt++
 			d.Positions = append(d.Positions, PositionRow{
 				Ticker:       t.Ticker,
 				EntryPrice:   t.EntryPrice,
@@ -161,12 +170,30 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 				Strategy:     t.Strategy,
 			})
 		}
-	}
 
-	// Cash = initial_capital minus the cost basis of all open positions.
-	// Cost basis is accumulated per-trade as entryPrice×qty (direction-agnostic).
-	// TotalValue = Cash + Invested (mark-to-market).
-	d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
+		// If no snapshot exists, fall back to derived values.
+		// If a snapshot does exist, those values are generally preferred as they
+		// reflect the broker's reality, but we use the live position list count.
+		if len(d.Positions) > 0 {
+			d.OpenPositionCnt = len(d.Positions)
+		}
+
+		if d.TotalValue == initialCapital && d.Cash == initialCapital {
+			// Fallback: derive cash and total from cost basis.
+			var totalCostBasis float64
+			for _, t := range trades {
+				totalCostBasis += t.EntryPrice * t.Quantity
+			}
+			d.Invested = visibleInvested
+			d.UnrealizedPnL = localUnrealizedPnL
+			d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
+		}
+
+		// Risk: largest position % (stays consistent with displayed rows)
+		if visibleInvested > 0 {
+			d.LargestPosPct = (largestVisiblePosValue / (visibleInvested + d.Cash)) * 100
+		}
+	}
 
 	// Pending signals (manual mode only)
 	if mode == "manual" {
@@ -211,9 +238,11 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 		}
 	}
 
-	// Largest visible position % (kept consistent with displayed rows)
-	if visibleInvested > 0 {
-		d.LargestPosPct = (largestVisiblePosValue / (visibleInvested + d.Cash)) * 100
+	// Drawdown calculation from peak
+	var peak float64
+	_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
+	if peak > d.TotalValue && peak > 0 {
+		d.DrawdownPct = ((peak - d.TotalValue) / peak) * 100
 	}
 
 	// Active watchlist summary

@@ -23,9 +23,6 @@ var processStart = time.Now()
 func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/node/risk", handleRisk)
 	mux.HandleFunc("/api/node/portfolio", handlePortfolio)
-	mux.HandleFunc("/api/portfolio/history", handlePortfolioHistory)
-	mux.HandleFunc("/api/portfolio/performance", handlePortfolioPerformance)
-	mux.HandleFunc("/api/portfolio/stats", handlePortfolioStats)
 	mux.HandleFunc("/api/node/ticker/", handleTicker) // /api/node/ticker/:ticker
 	mux.HandleFunc("/api/node/watchlist", handleWatchlist)
 	mux.HandleFunc("/api/node/models", handleModels)
@@ -34,6 +31,9 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
 	mux.HandleFunc("/api/backtests/runs", handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
+	mux.HandleFunc("/api/portfolio/summaries", handlePortfolioSummaries)
+	mux.HandleFunc("/api/portfolio/stats", handlePortfolioStats)
+	mux.HandleFunc("/api/portfolio/positions", handlePortfolioPositions)
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/config", handleSystemConfig)
@@ -120,7 +120,6 @@ func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// Get latest snapshot for current value
 	snap, err := store.GetLatestPortfolioSnapshot(ctx)
 	if err != nil {
 		apiError(w, "latest snapshot query failed", err)
@@ -175,6 +174,27 @@ func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, performance)
 }
 
+// GET /api/portfolio/summaries
+func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	limit := queryInt(r, "limit", 30, 100)
+	summaries, err := store.GetRecentDailySummaries(ctx, limit)
+	if err != nil {
+		apiError(w, "summaries query failed", err)
+		return
+	}
+	if summaries == nil {
+		summaries = []store.DailySummary{}
+	}
+	jsonResponse(w, map[string]any{"summaries": summaries})
+}
+
 // GET /api/portfolio/stats
 func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
@@ -184,34 +204,32 @@ func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	// Aggregate stats from daily summaries
-	summaries, err := store.GetDailySummaries(ctx, time.Now().AddDate(-1, 0, 0), time.Now())
+	stats, err := store.GetPortfolioStats(ctx)
 	if err != nil {
-		apiError(w, "stats query failed", err)
+		apiError(w, "portfolio stats query failed", err)
 		return
 	}
+	jsonResponse(w, stats)
+}
 
-	var totalTrades, wins, losses int
-	var totalPnL float64
-	for _, s := range summaries {
-		totalTrades += s.TradesClosed
-		wins += s.Wins
-		losses += s.Losses
-		totalPnL += s.PnL
+// GET /api/portfolio/positions
+func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
 	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
 
-	winRate := 0.0
-	if (wins + losses) > 0 {
-		winRate = float64(wins) / float64(wins+losses) * 100
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		apiError(w, "positions query failed", err)
+		return
 	}
-
-	jsonResponse(w, map[string]any{
-		"total_trades": totalTrades,
-		"win_rate":     winRate,
-		"wins":         wins,
-		"losses":       losses,
-		"total_pnl":    totalPnL,
-	})
+	if trades == nil {
+		trades = []store.Trade{}
+	}
+	jsonResponse(w, map[string]any{"positions": trades})
 }
 
 // GET /api/node/ticker/:ticker

@@ -3,8 +3,6 @@ import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
-import { ChamferedBox } from '../components/common/ChamferedBox';
-import { colors } from '../styles/tokens';
 import styles from './Config.module.css';
 
 const ENGINE_VERSION = 'v2.1.0';
@@ -508,26 +506,21 @@ export default function ConfigScreen() {
 
           {/* SYSTEM ACTIONS */}
           <SettingsSection title="System Actions">
-            <ChamferedBox
-              chamfer={6}
-              backgroundColor="transparent"
-              borderColor={colors.amber}
+            <button
+              type="button"
               onClick={() => setShowRestartModal(true)}
               className={styles.btnAmber}
-              style={{ marginBottom: 16, padding: '10px 0', textAlign: 'center' }}
+              style={{ marginBottom: 16 }}
             >
-              <span style={{ color: colors.amber, fontWeight: 700 }}>Restart Engine</span>
-            </ChamferedBox>
-            <ChamferedBox
-              chamfer={6}
-              backgroundColor="transparent"
-              borderColor={colors.red}
+              Restart Engine
+            </button>
+            <button
+              type="button"
               onClick={handleReset}
               className={styles.btnRed}
-              style={{ padding: '10px 0', textAlign: 'center' }}
             >
-              <span style={{ color: colors.red, fontWeight: 700 }}>Reset to Defaults</span>
-            </ChamferedBox>
+              Reset to Defaults
+            </button>
             <span className={styles.versionText}>
               TradeEngine {ENGINE_VERSION} — Build 20260318
             </span>
@@ -537,44 +530,32 @@ export default function ConfigScreen() {
 
       {/* ── Footer ── */}
       <footer className={styles.footer}>
-        <ChamferedBox
-          chamfer={6}
-          backgroundColor="transparent"
-          borderColor={colors.borderMuted}
+        <button
+          type="button"
           onClick={handleDiscard}
           className={styles.discardBtn}
-          style={{ padding: '8px 24px' }}
         >
           Discard
-        </ChamferedBox>
-        <ChamferedBox
-          chamfer={6}
-          backgroundColor={colors.acidGreen}
-          borderColor={colors.acidGreen}
+        </button>
+        <button
+          type="button"
           onClick={isSaving ? undefined : handleSave}
           className={styles.saveBtn}
           style={{ 
-            padding: '8px 24px', 
             opacity: isSaving ? 0.5 : 1, 
             cursor: isSaving ? 'not-allowed' : 'pointer' 
           }}
         >
-          <span style={{ color: '#0D0D11', fontWeight: 700 }}>
-            {isSaving ? 'SAVING...' : 'Save Changes'}
-          </span>
-        </ChamferedBox>
+          {isSaving ? 'SAVING...' : 'Save Changes'}
+        </button>
       </footer>
 
       {/* ── Restart confirmation modal ── */}
       {showRestartModal && (
         <div className={styles.modalOverlay} onClick={() => setShowRestartModal(false)}>
-          <ChamferedBox
-            chamfer={12}
-            backgroundColor={colors.cardBg}
-            borderColor={colors.borderMuted}
+          <div
             className={styles.modal}
             onClick={(e) => e.stopPropagation()}
-            style={{ width: 400, padding: 32 }}
           >
             <h3 className={styles.modalTitle}>Restart Engine?</h3>
             <p className={styles.modalBody}>
@@ -582,23 +563,22 @@ export default function ConfigScreen() {
             </p>
             <div className={styles.modalActions}>
               <button
+                type="button"
                 className={styles.discardBtn}
                 onClick={() => setShowRestartModal(false)}
-                style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', cursor: 'pointer' }}
+                style={{ background: 'transparent', border: 'none', color: 'var(--text-dim)', flex: 'initial', padding: '8px 12px' }}
               >
                 Cancel
               </button>
-              <ChamferedBox
-                chamfer={6}
-                backgroundColor={colors.amber}
-                borderColor={colors.amber}
+              <button
+                type="button"
+                className={styles.confirmBtn}
                 onClick={handleRestart}
-                style={{ padding: '8px 24px' }}
               >
-                <span style={{ color: '#0D0D11', fontWeight: 700 }}>Confirm Restart</span>
-              </ChamferedBox>
+                Confirm Restart
+              </button>
             </div>
-          </ChamferedBox>
+          </div>
         </div>
       )}
 

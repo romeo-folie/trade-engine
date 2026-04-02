@@ -303,7 +303,7 @@
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
   color: var(--text-faint);
-  margin-top: var(--space-2);
+  margin-top: var(--space-4);
   text-align: center;
   display: block;
   width: 100%;
@@ -372,11 +372,13 @@
 }
 
 .modal {
-  background: var(--panel-bg);
+  background: var(--card-bg);
   border: 1px solid var(--border);
-  padding: var(--space-6);
+  padding: 32px;
   max-width: 420px;
   width: 100%;
+  border-radius: 4px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 }
 
 .modalTitle {
@@ -398,7 +400,28 @@
 .modalActions {
   display: flex;
   justify-content: flex-end;
-  gap: var(--space-3);
+  align-items: center;
+  gap: var(--space-6);
+  margin-top: var(--space-6);
+}
+
+.confirmBtn {
+  padding: 10px 24px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #0D0D11;
+  background: var(--amber);
+  border: 1px solid var(--amber);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: opacity var(--transition-fast);
+}
+
+.confirmBtn:hover {
+  opacity: 0.9;
 }
 
 /* ── Toast ── */

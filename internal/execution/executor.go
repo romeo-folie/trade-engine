@@ -80,6 +80,7 @@ func NormalizeOrderStatus(status string) string {
 type AccountInfo struct {
 	Cash            float64 // buying power / available cash
 	PortfolioEquity float64 // total account equity (cash + positions)
+	DayPnL          float64 // realized + unrealized profit/loss for the current session
 }
 
 // Executor is the interface all broker adapters must satisfy.

@@ -177,6 +177,7 @@ func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 	var resp struct {
 		BuyingPower    string `json:"buying_power"`
 		PortfolioValue string `json:"portfolio_value"`
+		DayPnL         string `json:"day_pnl"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
 		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: %w", err)
@@ -189,7 +190,11 @@ func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 	if err != nil {
 		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse portfolio_value %q: %w", resp.PortfolioValue, err)
 	}
-	return AccountInfo{Cash: cash, PortfolioEquity: equity}, nil
+	dayPnL, err := parseFloat(resp.DayPnL)
+	if err != nil {
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse day_pnl %q: %w", resp.DayPnL, err)
+	}
+	return AccountInfo{Cash: cash, PortfolioEquity: equity, DayPnL: dayPnL}, nil
 }
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
