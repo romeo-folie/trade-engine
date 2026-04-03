@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -162,6 +163,78 @@ func TestSetField_NestedPathAndBool(t *testing.T) {
 	s := string(data)
 	if strings.Contains(s, "telegram.enabled") {
 		t.Fatalf("unexpected flattened key in YAML: %s", s)
+	}
+}
+
+func TestSetFieldAny_SequenceValue(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	path := ConfigPath()
+	if err := save(Defaults(), path); err != nil {
+		t.Fatalf("save defaults: %v", err)
+	}
+
+	if err := SetFieldAny("notifications.telegram.notify_on", []any{"signal", "trade", "error"}); err != nil {
+		t.Fatalf("SetFieldAny: %v", err)
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got, want := len(cfg.Notifications.Telegram.NotifyOn), 3; got != want {
+		t.Fatalf("notify_on length = %d, want %d", got, want)
+	}
+	if cfg.Notifications.Telegram.NotifyOn[0] != "signal" || cfg.Notifications.Telegram.NotifyOn[1] != "trade" || cfg.Notifications.Telegram.NotifyOn[2] != "error" {
+		t.Fatalf("notify_on = %#v", cfg.Notifications.Telegram.NotifyOn)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "[signal trade error]") {
+		t.Fatalf("notify_on written as scalar, expected YAML sequence: %s", s)
+	}
+	if !strings.Contains(s, "notify_on:\n") {
+		t.Fatalf("notify_on key missing: %s", s)
+	}
+	if !strings.Contains(s, "- signal") || !strings.Contains(s, "- trade") || !strings.Contains(s, "- error") {
+		t.Fatalf("notify_on sequence items missing: %s", s)
+	}
+}
+
+func TestSetFieldAny_JsonNumber(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	path := ConfigPath()
+	save(Defaults(), path)
+
+	// Test Integer json.Number
+	if err := SetFieldAny("risk.max_open_positions", json.Number("15")); err != nil {
+		t.Fatalf("SetFieldAny int: %v", err)
+	}
+	// Test Float json.Number
+	if err := SetFieldAny("risk.max_position_pct", json.Number("3.5")); err != nil {
+		t.Fatalf("SetFieldAny float: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "max_open_positions: \"15\"") {
+		t.Error("max_open_positions written as string, expected int")
+	}
+	if !strings.Contains(s, "max_open_positions: 15") {
+		t.Error("max_open_positions missing or incorrect")
+	}
+	if !strings.Contains(s, "max_position_pct: 3.5") {
+		t.Error("max_position_pct missing or incorrect")
 	}
 }
 
