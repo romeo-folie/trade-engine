@@ -92,6 +92,7 @@ type ORBScheduler struct {
 	candidates   []ScoredCandidate
 	rangeBuffers map[string]*RangeBuffer
 	orderIDs     map[string]string // ticker → orderID
+	lastScan     time.Time         // Eastern Time of the last successful scan
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -250,26 +251,39 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 }
 
 func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
+	h, m, _ := et.Clock()
+	etMinutes := h*60 + m
+
+	// 1. Strict Cutoff: stop scanning once the market opens.
+	// Once 9:30 AM ET is reached, we can no longer add new candidates to the session
+	// as the Opening Range window has already begun.
+	if etMinutes >= 9*60+30 {
+		s.notify(ctx, "ORB: Pre-market scan window closed. No candidates found today.")
+		s.setState(StateDone)
+		s.mu.Lock()
+		session := s.session
+		s.mu.Unlock()
+		if session != nil {
+			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
+				return fmt.Errorf("update session to skipped: %w", err)
+			}
+		}
+		return nil
+	}
+
+	// 2. Scan Cadence: minimize LLM costs by only scanning every 2 minutes.
+	// The scheduler ticks every 30s, but gap movers and news don't shift that fast.
+	if !s.lastScan.IsZero() && et.Sub(s.lastScan) < 2*time.Minute {
+		return nil
+	}
+	s.lastScan = et
+
 	gaps, err := data.FetchGapMovers(ctx, s.marketData, s.cfg.GapThresholdPct)
 	if err != nil {
 		return fmt.Errorf("scan gap movers: %w", err)
 	}
 
 	if len(gaps) == 0 {
-		h, m, _ := et.Clock()
-		etMinutes := h*60 + m
-		if etMinutes >= 9*60+30 {
-			s.notify(ctx, "ORB: No qualifying gap candidates today. Engine idle until tomorrow.")
-			s.setState(StateDone)
-			s.mu.Lock()
-			session := s.session
-			s.mu.Unlock()
-			if session != nil {
-				if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
-					return fmt.Errorf("update session to skipped: %w", err)
-				}
-			}
-		}
 		return nil
 	}
 
@@ -367,15 +381,6 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	candidatesJSON, _ := json.Marshal(scored)
 
 	if len(selected) == 0 {
-		h, m, _ := et.Clock()
-		etMinutes := h*60 + m
-		if etMinutes >= 9*60+30 {
-			s.notify(ctx, "ORB: Scanned candidates but none passed LLM catalyst filter. Engine idle until tomorrow.")
-			s.setState(StateDone)
-			if err := store.UpdateORBSession(ctx, s.db, sessionID, "skipped", candidatesJSON, nil); err != nil {
-				return fmt.Errorf("update session to skipped: %w", err)
-			}
-		}
 		return nil
 	}
 
