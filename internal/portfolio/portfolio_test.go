@@ -11,7 +11,7 @@ func TestTrackerUpdate_BasicState(t *testing.T) {
 		{Ticker: "AAPL", CurrentValue: 5000, UnrealizedPL: 200},
 		{Ticker: "TSLA", CurrentValue: 3000, UnrealizedPL: -100},
 	}
-	tr.Update(positions, 2000, 150)
+	tr.Update(positions, 2000, 10000, 500, 150) // 2000 cash, 10000 equity, 500 day pnl, 150 realized today
 
 	s := tr.CurrentState()
 	if s.TotalValue != 10000 { // 2000 cash + 5000 + 3000
@@ -35,19 +35,19 @@ func TestTrackerPeakValue(t *testing.T) {
 	tr := NewTracker(time.Hour)
 
 	// First update: peak = 10000
-	tr.Update([]ExecPosition{{CurrentValue: 8000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 8000}}, 2000, 10000, 0, 0)
 	if tr.CurrentState().PeakValue != 10000 {
 		t.Fatalf("PeakValue = %.2f, want 10000", tr.CurrentState().PeakValue)
 	}
 
 	// Lower value: peak stays at 10000
-	tr.Update([]ExecPosition{{CurrentValue: 6000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 6000}}, 2000, 8000, 0, 0)
 	if tr.CurrentState().PeakValue != 10000 {
 		t.Fatalf("PeakValue = %.2f, want 10000 (unchanged)", tr.CurrentState().PeakValue)
 	}
 
 	// New high: peak = 12000
-	tr.Update([]ExecPosition{{CurrentValue: 10000}}, 2000, 0)
+	tr.Update([]ExecPosition{{CurrentValue: 10000}}, 2000, 12000, 0, 0)
 	if tr.CurrentState().PeakValue != 12000 {
 		t.Fatalf("PeakValue = %.2f, want 12000", tr.CurrentState().PeakValue)
 	}
@@ -70,7 +70,7 @@ func TestConcurrentAccess(t *testing.T) {
 	// Writer goroutine.
 	go func() {
 		for i := 0; i < 100; i++ {
-			tr.Update([]ExecPosition{{CurrentValue: float64(i * 100)}}, 1000, 0)
+			tr.Update([]ExecPosition{{CurrentValue: float64(i * 100)}}, 1000, float64(1000+i*100), 0, 0)
 		}
 		close(done)
 	}()
@@ -88,7 +88,7 @@ func TestPositions(t *testing.T) {
 		{Ticker: "AAPL", Quantity: 10, AvgCostBasis: 150.0, CurrentValue: 1700, UnrealizedPL: 200},
 		{Ticker: "MSFT", Quantity: 5, AvgCostBasis: 300.0, CurrentValue: 1600, UnrealizedPL: 100},
 	}
-	tr.Update(positions, 5000, 300)
+	tr.Update(positions, 5000, 8300, 600, 300)
 
 	got := tr.Positions()
 	if len(got) != 2 {

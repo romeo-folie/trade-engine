@@ -149,14 +149,15 @@ func TestConfigMasking(t *testing.T) {
 
 func TestPortfolioHandlers_NoDB(t *testing.T) {
 	// Since store.Connect hasn't been called, store.IsConnected() returns false.
+	srv := NewServer(Config{}, nil, nil)
 	handlers := []struct {
 		name    string
 		handler http.HandlerFunc
 		url     string
 	}{
-		{"History", handlePortfolioHistory, "/api/portfolio/history"},
-		{"Performance", handlePortfolioPerformance, "/api/portfolio/performance"},
-		{"Stats", handlePortfolioStats, "/api/portfolio/stats"},
+		{"History", srv.handlePortfolioHistory, "/api/portfolio/history"},
+		{"Performance", srv.handlePortfolioPerformance, "/api/portfolio/performance"},
+		{"Stats", srv.handlePortfolioStats, "/api/portfolio/stats"},
 	}
 
 	for _, tt := range handlers {
@@ -181,7 +182,8 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/api/system/status", nil)
 
-	handleSystemStatus(w, r)
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemStatus(w, r)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)

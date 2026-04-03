@@ -90,6 +90,10 @@ type Engine struct {
 
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
+
+	// todayStartingEquity tracks the equity at 00:00 UTC for the current day.
+	todayStartingEquity float64
+	todaySummaryDate    string
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -170,7 +174,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		analyzer:          az,
 		newsProvider:      news,
 		executor:          exec,
-		portfolio:         portfolio.NewTracker(time.Hour),
+		portfolio:         portfolio.NewTracker(5 * time.Minute),
 		bus:               bus, // use the same bus as az
 		enricher:          knowledge.NewEnricher(cfg, callFn),
 		embedder:          emb,
@@ -1499,26 +1503,23 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	// does not support day_pnl reporting.
 	var realizedToday float64
 	var cash float64
+	var totalEquity float64
+	var dayPnL float64
+
 	if acct, err := e.executor.GetAccount(ctx); err != nil {
 		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
 	} else {
-		if acct.Cash > 0 {
-			cash = acct.Cash
-		}
-		// Use broker's reported DayPnL if provided (real-time accuracy).
-		if acct.DayPnL != 0 {
-			realizedToday = acct.DayPnL
-		}
+		cash = acct.Cash
+		totalEquity = acct.PortfolioEquity
+		dayPnL = acct.DayPnL
 	}
 
-	if realizedToday == 0 {
-		// Local fallback: sum realized P&L from trades closed today.
-		closedTrades, _ := store.GetRecentTrades(ctx, 100)
-		today := time.Now().UTC().Truncate(24 * time.Hour)
-		for _, t := range closedTrades {
-			if t.Status == "closed" && t.ClosedAt.After(today) {
-				realizedToday += t.PnL
-			}
+	// Local fallback: sum realized P&L from trades closed today.
+	closedTrades, _ := store.GetRecentTrades(ctx, 100)
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+	for _, t := range closedTrades {
+		if t.Status == "closed" && t.ClosedAt.After(today) {
+			realizedToday += t.PnL
 		}
 	}
 
@@ -1533,8 +1534,16 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		}
 	}
 
-	e.portfolio.Update(eps, cash, realizedToday)
+	if totalEquity == 0 {
+		totalEquity = cash
+		for _, p := range positions {
+			totalEquity += p.CurrentValue
+		}
+	}
+
+	e.portfolio.Update(eps, cash, totalEquity, dayPnL, realizedToday)
 }
+
 
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
@@ -1659,16 +1668,66 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	// Update portfolio state after monitoring.
-	if snap := e.portfolio.MaybeSnapshot(ctx); snap != nil {
+	snap := e.portfolio.MaybeSnapshot(ctx)
+	if snap != nil {
 		e.bus.Publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{
 			TotalValue:     snap.TotalValue,
 			Cash:           snap.Cash,
 			Invested:       snap.Invested,
 			UnrealizedPnL:  snap.UnrealizedPnL,
-			RealizedPnLDay: snap.RealizedPnLDay,
+			DayPnL:         snap.DayPnL,
 			OpenPositions:  snap.OpenPositions,
 		})
 	}
+
+	// Update the daily summary row so System Stats and Period Performance remain live.
+	e.updateDailySummary(ctx)
+}
+
+// updateDailySummary upserts a daily_summaries row for the current date.
+func (e *Engine) updateDailySummary(ctx context.Context) {
+	today := time.Now().UTC().Format("2006-01-02")
+	if e.todaySummaryDate != today {
+		// New day or startup — fetch starting equity.
+		e.todaySummaryDate = today
+		if s, _ := store.GetDailySummaryByDate(ctx, time.Now().UTC().Truncate(24*time.Hour)); s != nil {
+			e.todayStartingEquity = s.StartingValue
+		} else if snap, _ := store.GetLatestPortfolioSnapshot(ctx); snap != nil {
+			e.todayStartingEquity = snap.TotalValue
+		} else {
+			e.todayStartingEquity = e.portfolio.CurrentState().TotalValue
+		}
+	}
+
+	// Fetch current day's trade stats from store (simplest way to ensure accuracy).
+	start := time.Now().UTC().Truncate(24 * time.Hour)
+	end := start.Add(24 * time.Hour)
+	trades, _ := store.GetClosedTradesByDateRange(ctx, start, end)
+
+	var wins, losses int
+	for _, t := range trades {
+		if t.PnL > 0 {
+			wins++
+		} else if t.PnL < 0 {
+			losses++
+		}
+	}
+
+	// Token usage from cost tracker.
+	tokStats := e.costTracker.TakeSnapshot()
+
+	// Perform the upsert.
+	e.portfolio.MaybeDailySummary(ctx,
+		e.todayStartingEquity,
+		0,           // tradesOpened (placeholder, could track in engine if needed)
+		len(trades), // tradesClosed
+		wins,
+		losses,
+		0, // signalGenerated (placeholder)
+		0, // signalBlocked (placeholder)
+		tokStats.DailyTokens, // total tokens as input for now
+		0,                   // tokens output
+	)
 }
 
 // ─── Phase 4: Signal expiry (4.8) ────────────────────────────────────────────
