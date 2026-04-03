@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
@@ -17,6 +19,15 @@ import (
 
 // processStart records the time this process was loaded, used for uptime.
 var processStart = time.Now()
+
+// restartSignalFn sends SIGTERM to the current process. Overridden in tests.
+var restartSignalFn = func() error {
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGTERM)
+}
 
 // registerAPIHandlers mounts the REST drill-down endpoints on mux.
 func registerAPIHandlers(mux *http.ServeMux) {
@@ -36,6 +47,7 @@ func registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/system/cache", handleSystemCache)
 	mux.HandleFunc("/api/system/status", handleSystemStatus)
 	mux.HandleFunc("/api/system/config", handleSystemConfig)
+	mux.HandleFunc("/api/system/restart", handleSystemRestart)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -612,6 +624,27 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"uptime_seconds":    uptimeSec,
 		"drawdown":          drawdown,
 	})
+}
+
+// POST /api/system/restart — restricted to loopback callers.
+func handleSystemRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopback(r) {
+		http.Error(w, "forbidden: restart requires local connection", http.StatusForbidden)
+		return
+	}
+
+	jsonResponse(w, map[string]string{"status": "restarting"})
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		if err := restartSignalFn(); err != nil {
+			logger.Warn("web: restart signal failed", "err", err.Error())
+		}
+	}()
 }
 
 // GET /api/system/config
