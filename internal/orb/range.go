@@ -22,13 +22,18 @@ type RangeBuffer struct {
 	ticker       string
 	rangeMinutes int
 	bars         []data.Candle
+	timestamps   map[time.Time]bool
 	locked       bool
 	result       *OpeningRange
 }
 
 // NewRangeBuffer creates a buffer that locks after rangeMinutes bars.
 func NewRangeBuffer(ticker string, rangeMinutes int) *RangeBuffer {
-	return &RangeBuffer{ticker: ticker, rangeMinutes: rangeMinutes}
+	return &RangeBuffer{
+		ticker:       ticker,
+		rangeMinutes: rangeMinutes,
+		timestamps:   make(map[time.Time]bool),
+	}
 }
 
 // Add appends a 1-min candle. Returns (true, *OpeningRange) when the range is locked.
@@ -38,7 +43,14 @@ func (b *RangeBuffer) Add(candle data.Candle) (bool, *OpeningRange) {
 	if b.locked {
 		return true, b.result
 	}
+	// De-duplicate: only add unique timestamps.
+	// This guards against repeated FetchCandles calls that return overlapping data.
+	if b.timestamps[candle.Timestamp] {
+		return b.locked, b.result
+	}
+	b.timestamps[candle.Timestamp] = true
 	b.bars = append(b.bars, candle)
+
 	if len(b.bars) >= b.rangeMinutes {
 		high, low := b.bars[0].High, b.bars[0].Low
 		for _, bar := range b.bars[1:] {

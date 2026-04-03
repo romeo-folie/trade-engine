@@ -190,7 +190,7 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	case StateIdle:
 		return s.tickIdle(ctx, et)
 	case StateScanning:
-		return s.tickScanning(ctx)
+		return s.tickScanning(ctx, et)
 	case StateCandidateReady:
 		return s.tickCandidateReady(ctx, et)
 	case StateRangeWatch:
@@ -249,21 +249,25 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	return nil
 }
 
-func (s *ORBScheduler) tickScanning(ctx context.Context) error {
+func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	gaps, err := data.FetchGapMovers(ctx, s.marketData, s.cfg.GapThresholdPct)
 	if err != nil {
 		return fmt.Errorf("scan gap movers: %w", err)
 	}
 
 	if len(gaps) == 0 {
-		s.notify(ctx, "ORB: No qualifying gap candidates today. Engine idle until tomorrow.")
-		s.setState(StateDone)
-		s.mu.Lock()
-		session := s.session
-		s.mu.Unlock()
-		if session != nil {
-			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
-				return fmt.Errorf("update session to skipped: %w", err)
+		h, m, _ := et.Clock()
+		etMinutes := h*60 + m
+		if etMinutes >= 9*60+30 {
+			s.notify(ctx, "ORB: No qualifying gap candidates today. Engine idle until tomorrow.")
+			s.setState(StateDone)
+			s.mu.Lock()
+			session := s.session
+			s.mu.Unlock()
+			if session != nil {
+				if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
+					return fmt.Errorf("update session to skipped: %w", err)
+				}
 			}
 		}
 		return nil
@@ -363,10 +367,14 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 	candidatesJSON, _ := json.Marshal(scored)
 
 	if len(selected) == 0 {
-		s.notify(ctx, "ORB: Scanned candidates but none passed LLM catalyst filter. Engine idle until tomorrow.")
-		s.setState(StateDone)
-		if err := store.UpdateORBSession(ctx, s.db, sessionID, "skipped", candidatesJSON, nil); err != nil {
-			return fmt.Errorf("update session to skipped: %w", err)
+		h, m, _ := et.Clock()
+		etMinutes := h*60 + m
+		if etMinutes >= 9*60+30 {
+			s.notify(ctx, "ORB: Scanned candidates but none passed LLM catalyst filter. Engine idle until tomorrow.")
+			s.setState(StateDone)
+			if err := store.UpdateORBSession(ctx, s.db, sessionID, "skipped", candidatesJSON, nil); err != nil {
+				return fmt.Errorf("update session to skipped: %w", err)
+			}
 		}
 		return nil
 	}
