@@ -63,3 +63,4 @@ tmp/
 .tmp/
 node_modules/
 
+internal/web/test_config.yaml
