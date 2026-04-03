@@ -30,30 +30,30 @@ var restartSignalFn = func() error {
 }
 
 // registerAPIHandlers mounts the REST drill-down endpoints on mux.
-func registerAPIHandlers(mux *http.ServeMux) {
-	mux.HandleFunc("/api/node/risk", handleRisk)
-	mux.HandleFunc("/api/node/portfolio", handlePortfolio)
-	mux.HandleFunc("/api/node/ticker/", handleTicker) // /api/node/ticker/:ticker
-	mux.HandleFunc("/api/node/watchlist", handleWatchlist)
-	mux.HandleFunc("/api/node/models", handleModels)
-	mux.HandleFunc("/api/signals/recent", handleRecentSignals)
-	mux.HandleFunc("/api/trades/recent", handleRecentTrades)
-	mux.HandleFunc("/api/analyses/recent", handleRecentAnalyses)
-	mux.HandleFunc("/api/backtests/runs", handleBacktestRuns)
-	mux.HandleFunc("/api/backtests/runs/", handleBacktestRunDetail)
-	mux.HandleFunc("/api/portfolio/summaries", handlePortfolioSummaries)
-	mux.HandleFunc("/api/portfolio/stats", handlePortfolioStats)
-	mux.HandleFunc("/api/portfolio/positions", handlePortfolioPositions)
-	mux.HandleFunc("/api/system/cache", handleSystemCache)
-	mux.HandleFunc("/api/system/status", handleSystemStatus)
-	mux.HandleFunc("/api/system/config", handleSystemConfig)
-	mux.HandleFunc("/api/system/restart", handleSystemRestart)
+func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
+	mux.HandleFunc("/api/node/risk", s.handleRisk)
+	mux.HandleFunc("/api/node/portfolio", s.handlePortfolio)
+	mux.HandleFunc("/api/node/ticker/", s.handleTicker) // /api/node/ticker/:ticker
+	mux.HandleFunc("/api/node/watchlist", s.handleWatchlist)
+	mux.HandleFunc("/api/node/models", s.handleModels)
+	mux.HandleFunc("/api/signals/recent", s.handleRecentSignals)
+	mux.HandleFunc("/api/trades/recent", s.handleRecentTrades)
+	mux.HandleFunc("/api/analyses/recent", s.handleRecentAnalyses)
+	mux.HandleFunc("/api/backtests/runs", s.handleBacktestRuns)
+	mux.HandleFunc("/api/backtests/runs/", s.handleBacktestRunDetail)
+	mux.HandleFunc("/api/portfolio/summaries", s.handlePortfolioSummaries)
+	mux.HandleFunc("/api/portfolio/stats", s.handlePortfolioStats)
+	mux.HandleFunc("/api/portfolio/positions", s.handlePortfolioPositions)
+	mux.HandleFunc("/api/system/cache", s.handleSystemCache)
+	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
+	mux.HandleFunc("/api/system/config", s.handleSystemConfig)
+	mux.HandleFunc("/api/system/restart", s.handleSystemRestart)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // GET /api/node/risk
-func handleRisk(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -73,24 +73,54 @@ func handleRisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/portfolio
-func handlePortfolio(w http.ResponseWriter, r *http.Request) {
+// Returns portfolio state from the live tracker when available;
+// falls back to the latest DB snapshot when the tracker is not initialized.
+func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
+	if s.tracker != nil {
+		state := s.tracker.CurrentState()
+		jsonResponse(w, map[string]any{
+			"TotalValue":       state.TotalValue,
+			"Cash":             state.Cash,
+			"Invested":         state.Invested,
+			"UnrealizedPnL":    state.UnrealizedPnL,
+			"DayPnL":           state.DayPnL,
+			"RealizedPnLToday": state.RealizedPnLDay,
+			"OpenPositions":    state.OpenPositions,
+		})
+		return
+	}
+	// Tracker not initialized — fall back to the latest DB snapshot.
 	if !store.IsConnected() {
-		apiError(w, "database not connected", nil)
+		apiError(w, "portfolio tracker not initialized and database not connected", nil)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-
 	snap, err := store.GetLatestPortfolioSnapshot(ctx)
 	if err != nil {
-		apiError(w, "portfolio query failed", err)
+		apiError(w, "portfolio snapshot query failed", err)
 		return
 	}
-	jsonResponse(w, snap)
+	if snap == nil {
+		jsonResponse(w, map[string]any{
+			"TotalValue": 0.0, "Cash": 0.0, "Invested": 0.0,
+			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0, "OpenPositions": 0,
+		})
+		return
+	}
+	jsonResponse(w, map[string]any{
+		"TotalValue":       snap.TotalValue,
+		"Cash":             snap.Cash,
+		"Invested":         snap.Invested,
+		"UnrealizedPnL":    snap.UnrealizedPnL,
+		"DayPnL":           0.0, // not stored in DB snapshots
+		"RealizedPnLToday": snap.RealizedPnLToday,
+		"OpenPositions":    snap.OpenPositions,
+	})
 }
 
 // GET /api/portfolio/history?days=N
-func handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -123,7 +153,7 @@ func handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/portfolio/performance
-func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -186,7 +216,7 @@ func handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/portfolio/summaries
-func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -207,7 +237,7 @@ func handlePortfolioSummaries(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/portfolio/stats
-func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -224,14 +254,68 @@ func handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/portfolio/positions
-func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+// Returns open positions from the live tracker when available, enriched with
+// trade metadata (direction, strategy) from the store. Falls back to open
+// trades from the store when the tracker is not initialized.
+func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+	if s.tracker != nil {
+		positions := s.tracker.Positions()
+
+		// Enrich positions with direction/strategy from open trades if DB is available.
+		tradeByTicker := map[string]store.Trade{}
+		if store.IsConnected() {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			if openTrades, err := store.GetOpenTrades(ctx); err == nil {
+				for _, t := range openTrades {
+					tradeByTicker[t.Ticker] = t
+				}
+			}
+		}
+
+		type positionDTO struct {
+			Ticker       string  `json:"Ticker"`
+			Direction    string  `json:"Direction"`
+			Strategy     string  `json:"Strategy"`
+			EntryPrice   float64 `json:"EntryPrice"`
+			CurrentPrice float64 `json:"CurrentPrice"`
+			Quantity     float64 `json:"Quantity"`
+			PnL          float64 `json:"PnL"`
+			PnLPct       float64 `json:"PnLPct"`
+		}
+
+		dtos := make([]positionDTO, 0, len(positions))
+		for _, p := range positions {
+			dto := positionDTO{
+				Ticker:     p.Ticker,
+				EntryPrice: p.AvgCostBasis,
+				Quantity:   p.Quantity,
+				PnL:        p.UnrealizedPL,
+			}
+			if p.Quantity > 0 {
+				dto.CurrentPrice = p.CurrentValue / p.Quantity
+				costBasis := p.AvgCostBasis * p.Quantity
+				if costBasis > 0 {
+					dto.PnLPct = (p.UnrealizedPL / costBasis) * 100
+				}
+			}
+			if t, ok := tradeByTicker[p.Ticker]; ok {
+				dto.Direction = t.Direction
+				dto.Strategy = t.Strategy
+			}
+			dtos = append(dtos, dto)
+		}
+		jsonResponse(w, map[string]any{"positions": dtos})
+		return
+	}
+
+	// Tracker not initialized — fall back to open trades from the store.
 	if !store.IsConnected() {
-		apiError(w, "database not connected", nil)
+		apiError(w, "portfolio tracker not initialized and database not connected", nil)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-
 	trades, err := store.GetOpenTrades(ctx)
 	if err != nil {
 		apiError(w, "positions query failed", err)
@@ -244,7 +328,7 @@ func handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/ticker/:ticker
-func handleTicker(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleTicker(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -283,7 +367,7 @@ func handleTicker(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/watchlist
-func handleWatchlist(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -313,7 +397,7 @@ func handleWatchlist(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/models
-func handleModels(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -338,7 +422,7 @@ type signalWithAnalysts struct {
 }
 
 // GET /api/signals/recent?limit=N
-func handleRecentSignals(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -380,7 +464,7 @@ type tradeWithAnalysts struct {
 }
 
 // GET /api/trades/recent?limit=N
-func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -414,7 +498,7 @@ func handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/analyses/recent?limit=N
-func handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -493,7 +577,7 @@ func toRunSummary(r store.BacktestRun) backteststRunSummary {
 
 // GET /api/backtests/runs?limit=N
 // Returns runs without ConfigSnapshot to avoid leaking API keys.
-func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -516,7 +600,7 @@ func handleBacktestRuns(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/backtests/runs/:id         → run metadata including ConfigSnapshot.initial_cash
 // GET /api/backtests/runs/:id/trades  → trade list for equity curve
-func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -587,18 +671,18 @@ func handleBacktestRunDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/system/cache
-func handleSystemCache(w http.ResponseWriter, _ *http.Request) {
-	s := cache.TakeSnapshot()
+func (s *Server) handleSystemCache(w http.ResponseWriter, _ *http.Request) {
+	snap := cache.TakeSnapshot()
 	jsonResponse(w, map[string]any{
-		"hits":      s.Hits,
-		"misses":    s.Misses,
-		"evictions": s.Evictions,
-		"errors":    s.Errors,
+		"hits":      snap.Hits,
+		"misses":    snap.Misses,
+		"evictions": snap.Evictions,
+		"errors":    snap.Errors,
 	})
 }
 
 // GET /api/system/status
-func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	cfg := config.Get()
 	uptimeSec := int(time.Since(processStart).Seconds())
 
@@ -627,7 +711,7 @@ func handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // POST /api/system/restart — restricted to loopback callers.
-func handleSystemRestart(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
@@ -649,7 +733,7 @@ func handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/system/config
 // POST /api/system/config  — mutation is restricted to loopback (127.x / ::1) callers.
-func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		jsonResponse(w, config.Get())

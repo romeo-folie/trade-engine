@@ -55,7 +55,7 @@ func runWebCmd(cmd *cobra.Command, _ []string) error {
 		Port:           webPort,
 		Host:           "127.0.0.1",
 		AllowedOrigins: []string{"http://localhost:" + webPort, "http://127.0.0.1:" + webPort},
-	}, bus)
+	}, bus, nil)
 	if err := srv.Start(ctx); err != nil {
 		return fmt.Errorf("web server failed to start: %w", err)
 	}

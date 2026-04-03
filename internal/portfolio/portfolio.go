@@ -16,7 +16,8 @@ type State struct {
 	Cash           float64
 	Invested       float64
 	UnrealizedPnL  float64
-	RealizedPnLDay float64
+	DayPnL         float64 // net change in equity since last session close
+	RealizedPnLDay float64 // realized P&L today (from closed trades)
 	OpenPositions  int
 	PeakValue      float64 // all-time high (for drawdown)
 	LastLossAt     time.Time
@@ -65,8 +66,8 @@ func (t *Tracker) PositionMap() map[string]float64 {
 	return out
 }
 
-// Update refreshes the in-memory state from executor positions + realized P&L today.
-func (t *Tracker) Update(positions []ExecPosition, cashBalance, realizedPnLDay float64) {
+// Update refreshes the in-memory state from executor positions + account metrics.
+func (t *Tracker) Update(positions []ExecPosition, cashBalance, totalEquity, dayPnL, realizedPnLDay float64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -79,16 +80,17 @@ func (t *Tracker) Update(positions []ExecPosition, cashBalance, realizedPnLDay f
 		invested += p.CurrentValue
 		unrealizedPnL += p.UnrealizedPL
 	}
-	total := cashBalance + invested
+
 	peak := t.state.PeakValue
-	if total > peak {
-		peak = total
+	if totalEquity > peak {
+		peak = totalEquity
 	}
 	t.state = State{
-		TotalValue:     total,
+		TotalValue:     totalEquity,
 		Cash:           cashBalance,
 		Invested:       invested,
 		UnrealizedPnL:  unrealizedPnL,
+		DayPnL:         dayPnL,
 		RealizedPnLDay: realizedPnLDay,
 		OpenPositions:  len(positions),
 		PeakValue:      peak,
@@ -157,13 +159,11 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 ) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	t.mu.RLock()
-	alreadyWritten := today.Equal(t.lastDailySummary)
 	s := t.state
 	t.mu.RUnlock()
 
-	if alreadyWritten {
-		return
-	}
+	// Perform the upsert. ON CONFLICT handles existing rows for today.
+
 	pnlPct := 0.0
 	if startingValue > 0 {
 		pnlPct = ((s.TotalValue - startingValue) / startingValue) * 100

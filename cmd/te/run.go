@@ -201,7 +201,7 @@ Modes:
 					Host:           "0.0.0.0",
 					AllowedOrigins: []string{"*"},
 					EngineConfig:   cfg,
-				}, orbBus)
+				}, orbBus, nil)
 				if err := webSrv.Start(ctx); err != nil {
 					return fmt.Errorf("web server: %w", err)
 				}
@@ -225,7 +225,7 @@ Modes:
 				Host:           "0.0.0.0",
 				AllowedOrigins: []string{"*"},
 				EngineConfig:   cfg,
-			}, eng.Bus())
+			}, eng.Bus(), eng.Portfolio())
 			if err := webSrv.Start(ctx); err != nil {
 				return fmt.Errorf("web server: %w", err)
 			}

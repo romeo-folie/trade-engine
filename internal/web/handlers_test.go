@@ -150,14 +150,15 @@ func TestConfigMasking(t *testing.T) {
 
 func TestPortfolioHandlers_NoDB(t *testing.T) {
 	// Since store.Connect hasn't been called, store.IsConnected() returns false.
+	srv := NewServer(Config{}, nil, nil)
 	handlers := []struct {
 		name    string
 		handler http.HandlerFunc
 		url     string
 	}{
-		{"History", handlePortfolioHistory, "/api/portfolio/history"},
-		{"Performance", handlePortfolioPerformance, "/api/portfolio/performance"},
-		{"Stats", handlePortfolioStats, "/api/portfolio/stats"},
+		{"History", srv.handlePortfolioHistory, "/api/portfolio/history"},
+		{"Performance", srv.handlePortfolioPerformance, "/api/portfolio/performance"},
+		{"Stats", srv.handlePortfolioStats, "/api/portfolio/stats"},
 	}
 
 	for _, tt := range handlers {
@@ -182,7 +183,8 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/api/system/status", nil)
 
-	handleSystemStatus(w, r)
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemStatus(w, r)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
@@ -210,7 +212,8 @@ func TestHandleSystemRestart_MethodNotAllowed(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet, "/api/system/restart", nil)
 	r.RemoteAddr = "127.0.0.1:12345"
 
-	handleSystemRestart(w, r)
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("expected 405, got %d", w.Code)
 	}
@@ -221,7 +224,8 @@ func TestHandleSystemRestart_ForbiddenForNonLoopback(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/api/system/restart", nil)
 	r.RemoteAddr = "10.0.0.2:12345"
 
-	handleSystemRestart(w, r)
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d", w.Code)
 	}
@@ -241,7 +245,8 @@ func TestHandleSystemRestart_OKTriggersSignal(t *testing.T) {
 	r := httptest.NewRequest(http.MethodPost, "/api/system/restart", nil)
 	r.RemoteAddr = "127.0.0.1:12345"
 
-	handleSystemRestart(w, r)
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
 	}
@@ -251,5 +256,37 @@ func TestHandleSystemRestart_OKTriggersSignal(t *testing.T) {
 		// ok
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected restart signal to be triggered")
+	}
+}
+
+// ─── Portfolio / Positions handlers (nil tracker, no DB) ─────────────────────
+
+func TestHandlePortfolio_NilTracker_NoDB(t *testing.T) {
+	// With no tracker and no DB connection, expect 500 with a clear error.
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/node/portfolio", nil)
+	srv.handlePortfolio(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not connected") {
+		t.Errorf("expected 'not connected' in error body, got %q", w.Body.String())
+	}
+}
+
+func TestHandlePortfolioPositions_NilTracker_NoDB(t *testing.T) {
+	// With no tracker and no DB connection, expect 500 with a clear error.
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/portfolio/positions", nil)
+	srv.handlePortfolioPositions(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not connected") {
+		t.Errorf("expected 'not connected' in error body, got %q", w.Body.String())
 	}
 }

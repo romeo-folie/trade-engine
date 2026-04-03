@@ -23,7 +23,7 @@ interface PortfolioSnapshot {
   Cash: number;
   Invested: number;
   UnrealizedPnL: number;
-  RealizedPnLToday: number;
+  DayPnL: number;
   OpenPositions: number;
   CreatedAt: string;
 }
@@ -166,7 +166,7 @@ export default function PortfolioScreen() {
   const cash = snapshot?.Cash ?? 0;
   const invested = snapshot?.Invested ?? 0;
   const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
-  const dayPnl = snapshot?.RealizedPnLToday ?? 0;
+  const dayPnl = snapshot?.DayPnL ?? 0;
 
   const equityData = useMemo(() => {
     if (!hasData) return [];

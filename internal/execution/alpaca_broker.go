@@ -172,30 +172,48 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 	return out, nil
 }
 
-// GetAccount returns the Alpaca account's buying power and portfolio equity.
+// GetAccount returns the Alpaca account's cash balance, equity, and daily P&L.
 func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 	var resp struct {
-		BuyingPower    string `json:"buying_power"`
+		Cash           string `json:"cash"`
+		Equity         string `json:"equity"`
+		LastEquity     string `json:"last_equity"`
 		PortfolioValue string `json:"portfolio_value"`
-		DayPnL         string `json:"day_pnl"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
 		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: %w", err)
 	}
-	cash, err := parseFloat(resp.BuyingPower)
+
+	cash, err := parseFloat(resp.Cash)
 	if err != nil {
-		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse buying_power %q: %w", resp.BuyingPower, err)
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse cash %q: %w", resp.Cash, err)
 	}
-	equity, err := parseFloat(resp.PortfolioValue)
+
+	// Use 'equity' if available, otherwise fall back to 'portfolio_value'.
+	equityStr := resp.Equity
+	if equityStr == "" {
+		equityStr = resp.PortfolioValue
+	}
+	equity, err := parseFloat(equityStr)
 	if err != nil {
-		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse portfolio_value %q: %w", resp.PortfolioValue, err)
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse equity %q: %w", equityStr, err)
 	}
-	dayPnL, err := parseFloat(resp.DayPnL)
+
+	lastEquity, err := parseFloat(resp.LastEquity)
 	if err != nil {
-		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse day_pnl %q: %w", resp.DayPnL, err)
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse last_equity %q: %w", resp.LastEquity, err)
 	}
-	return AccountInfo{Cash: cash, PortfolioEquity: equity, DayPnL: dayPnL}, nil
+
+	// DayPnL matches the Alpaca UI's "Daily Change" (equity - last_equity).
+	dayPnL := equity - lastEquity
+
+	return AccountInfo{
+		Cash:            cash,
+		PortfolioEquity: equity,
+		DayPnL:          dayPnL,
+	}, nil
 }
+
 
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 

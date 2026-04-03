@@ -164,12 +164,13 @@ type PositionUpdatedPayload struct {
 
 // PortfolioSnapshotPayload is emitted after a portfolio snapshot is written.
 type PortfolioSnapshotPayload struct {
-	TotalValue     float64 `json:"total_value"`
-	Cash           float64 `json:"cash"`
-	Invested       float64 `json:"invested"`
-	UnrealizedPnL  float64 `json:"unrealized_pnl"`
-	RealizedPnLDay float64 `json:"realized_pnl_today"`
-	OpenPositions  int     `json:"open_positions"`
+	TotalValue       float64 `json:"total_value"`
+	Cash             float64 `json:"cash"`
+	Invested         float64 `json:"invested"`
+	UnrealizedPnL    float64 `json:"unrealized_pnl"`
+	RealizedPnLToday float64 `json:"realized_pnl_today"` // realized P&L from closed trades today
+	DayPnL           float64 `json:"day_pnl"`            // net equity change since last session close (broker-reported)
+	OpenPositions    int     `json:"open_positions"`
 }
 
 // NewsFetchedPayload is emitted after news articles are fetched and stored for a ticker.

@@ -26,6 +26,7 @@ import (
 	appconfig "github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 )
 
 // frontendFS holds the compiled React app embedded at build time.
@@ -68,15 +69,20 @@ type Server struct {
 
 	// hub manages connected WebSocket clients.
 	hub *clientHub
+
+	// tracker provides live portfolio metrics (equity, cash, positions).
+	tracker *portfolio.Tracker
 }
 
-// NewServer creates a Server. Call Start to bind and begin serving.
-func NewServer(cfg Config, bus *events.Bus) *Server {
+
+// NewServer creates a Server with a reference to the live portfolio tracker.
+func NewServer(cfg Config, bus *events.Bus, tracker *portfolio.Tracker) *Server {
 	s := &Server{
 		cfg:       cfg,
 		engineCfg: cfg.EngineConfig,
 		bus:       bus,
 		hub:       newClientHub(),
+		tracker:   tracker,
 	}
 	return s
 }
@@ -107,7 +113,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	mux.HandleFunc("/ws", s.handleWebSocket)
-	registerAPIHandlers(mux)
+	s.registerAPIHandlers(mux)
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
