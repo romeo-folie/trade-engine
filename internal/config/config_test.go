@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,6 +203,38 @@ func TestSetFieldAny_SequenceValue(t *testing.T) {
 	}
 	if !strings.Contains(s, "- signal") || !strings.Contains(s, "- trade") || !strings.Contains(s, "- error") {
 		t.Fatalf("notify_on sequence items missing: %s", s)
+	}
+}
+
+func TestSetFieldAny_JsonNumber(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+
+	path := ConfigPath()
+	save(Defaults(), path)
+
+	// Test Integer json.Number
+	if err := SetFieldAny("risk.max_open_positions", json.Number("15")); err != nil {
+		t.Fatalf("SetFieldAny int: %v", err)
+	}
+	// Test Float json.Number
+	if err := SetFieldAny("risk.max_position_pct", json.Number("3.5")); err != nil {
+		t.Fatalf("SetFieldAny float: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	s := string(data)
+	if strings.Contains(s, "max_open_positions: \"15\"") {
+		t.Error("max_open_positions written as string, expected int")
+	}
+	if !strings.Contains(s, "max_open_positions: 15") {
+		t.Error("max_open_positions missing or incorrect")
+	}
+	if !strings.Contains(s, "max_position_pct: 3.5") {
+		t.Error("max_position_pct missing or incorrect")
 	}
 }
 

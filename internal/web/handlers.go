@@ -660,7 +660,9 @@ func handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var updates map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.UseNumber()
+		if err := dec.Decode(&updates); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
