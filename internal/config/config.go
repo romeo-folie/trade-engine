@@ -44,7 +44,8 @@ type ORBConfig struct {
 	RiskReward        float64 `yaml:"risk_reward"`         // e.g. 2.0
 	MaxRiskPct        float64 `yaml:"max_risk_pct"`        // max loss per trade as % of portfolio
 	MaxPositionPct    float64 `yaml:"max_position_pct"`    // max notional per trade as % of portfolio (e.g. 10.0)
-	NewsLookbackHours int     `yaml:"news_lookback_hours"` // e.g. 24
+	NewsLookbackHours   int     `yaml:"news_lookback_hours"`   // e.g. 24
+	ScanCadenceMinutes  int     `yaml:"scan_cadence_minutes"`  // minimum minutes between pre-market scans (default 2)
 }
 
 // CostConfig controls the user-facing cost profile and budget guardrails.

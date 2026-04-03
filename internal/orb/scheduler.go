@@ -38,6 +38,9 @@ var nyLoc = func() *time.Location {
 // Limits context window usage while keeping the most recent catalyst signals.
 const maxNewsPerTicker = 10
 
+// marketOpenMinutes is the Eastern Time minute-of-day when the US equity market opens (9:30 AM ET).
+const marketOpenMinutes = 9*60 + 30
+
 // sentimentPositiveThreshold and sentimentNegativeThreshold define the boundaries
 // used when mapping a Finnhub float sentiment score to a POSITIVE/NEUTRAL/NEGATIVE label.
 const (
@@ -92,6 +95,7 @@ type ORBScheduler struct {
 	candidates   []ScoredCandidate
 	rangeBuffers map[string]*RangeBuffer
 	orderIDs     map[string]string // ticker → orderID
+	lastScan     time.Time         // Eastern Time of the last successful scan
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -190,7 +194,7 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	case StateIdle:
 		return s.tickIdle(ctx, et)
 	case StateScanning:
-		return s.tickScanning(ctx)
+		return s.tickScanning(ctx, et)
 	case StateCandidateReady:
 		return s.tickCandidateReady(ctx, et)
 	case StateRangeWatch:
@@ -249,14 +253,15 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	return nil
 }
 
-func (s *ORBScheduler) tickScanning(ctx context.Context) error {
-	gaps, err := data.FetchGapMovers(ctx, s.marketData, s.cfg.GapThresholdPct)
-	if err != nil {
-		return fmt.Errorf("scan gap movers: %w", err)
-	}
+func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
+	h, m, _ := et.Clock()
+	etMinutes := h*60 + m
 
-	if len(gaps) == 0 {
-		s.notify(ctx, "ORB: No qualifying gap candidates today. Engine idle until tomorrow.")
+	// 1. Strict Cutoff: stop scanning once the market opens.
+	// Once 9:30 AM ET is reached, we can no longer add new candidates to the session
+	// as the Opening Range window has already begun.
+	if etMinutes >= marketOpenMinutes {
+		s.notify(ctx, "ORB: Pre-market scan window closed. No candidates found today.")
 		s.setState(StateDone)
 		s.mu.Lock()
 		session := s.session
@@ -266,6 +271,23 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 				return fmt.Errorf("update session to skipped: %w", err)
 			}
 		}
+		return nil
+	}
+
+	// 2. Scan Cadence: minimize LLM costs by only scanning every N minutes.
+	// The scheduler ticks every 30s, but gap movers and news don't shift that fast.
+	cadence := time.Duration(s.cfg.ScanCadenceMinutes) * time.Minute
+	if !s.lastScan.IsZero() && et.Sub(s.lastScan) < cadence {
+		return nil
+	}
+
+	gaps, err := data.FetchGapMovers(ctx, s.marketData, s.cfg.GapThresholdPct)
+	if err != nil {
+		return fmt.Errorf("scan gap movers: %w", err)
+	}
+	s.lastScan = et
+
+	if len(gaps) == 0 {
 		return nil
 	}
 
@@ -363,10 +385,26 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 	candidatesJSON, _ := json.Marshal(scored)
 
 	if len(selected) == 0 {
-		s.notify(ctx, "ORB: Scanned candidates but none passed LLM catalyst filter. Engine idle until tomorrow.")
+		return nil
+	}
+
+	// Guard: if the market has already opened by the time scoring completes,
+	// discard the candidates. The opening-range window has already started and
+	// we would miss part of it, skewing the range calculation.
+	// Re-read the clock here because LLM scoring is synchronous and can take
+	// several seconds per ticker, potentially crossing the 9:30 boundary.
+	postScanET := s.now().In(nyLoc)
+	postScanHour, postScanMinute, _ := postScanET.Clock()
+	if postScanHour*60+postScanMinute >= marketOpenMinutes {
+		s.notify(ctx, "ORB: Scan completed after market open — discarding candidates to avoid a skewed opening range.")
 		s.setState(StateDone)
-		if err := store.UpdateORBSession(ctx, s.db, sessionID, "skipped", candidatesJSON, nil); err != nil {
-			return fmt.Errorf("update session to skipped: %w", err)
+		s.mu.Lock()
+		session := s.session
+		s.mu.Unlock()
+		if session != nil {
+			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
+				return fmt.Errorf("update session to skipped: %w", err)
+			}
 		}
 		return nil
 	}
@@ -406,7 +444,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context) error {
 func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) error {
 	h, m, _ := et.Clock()
 	etMinutes := h*60 + m
-	if etMinutes < 9*60+30 {
+	if etMinutes < marketOpenMinutes {
 		return nil
 	}
 

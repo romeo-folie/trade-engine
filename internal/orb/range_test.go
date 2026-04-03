@@ -114,3 +114,29 @@ func TestRangeBufferConcurrent(t *testing.T) {
 		t.Fatal("expected range to be set after 20 concurrent adds with 10-bar threshold")
 	}
 }
+
+func TestRangeBufferDeduplication(t *testing.T) {
+	buf := NewRangeBuffer("PLTR", 5)
+	base := time.Date(2026, 3, 20, 9, 30, 0, 0, time.UTC)
+
+	// Add 10 candles, but 5 are duplicates
+	for i := 0; i < 5; i++ {
+		ts := base.Add(time.Duration(i) * time.Minute)
+		// Add the same timestamp twice
+		locked1, _ := buf.Add(makeCandle(20.0, 19.0, ts))
+		locked2, _ := buf.Add(makeCandle(21.0, 18.0, ts)) // Should be ignored
+
+		if i < 4 && (locked1 || locked2) {
+			t.Fatalf("buffer locked early at unique bar %d", i+1)
+		}
+		if i == 4 && !locked1 {
+			t.Fatal("buffer should have locked at 5th unique bar")
+		}
+	}
+
+	r := buf.Range()
+	if r.High != 20.0 {
+		t.Errorf("High = %f, want 20.0 (second candle of same TS should be ignored)", r.High)
+	}
+}
+
