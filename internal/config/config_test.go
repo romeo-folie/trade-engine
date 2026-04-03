@@ -527,6 +527,9 @@ func TestDefaultsORBConfig(t *testing.T) {
 	if cfg.ORB.MaxRiskPct != 1.0 {
 		t.Errorf("default orb.max_risk_pct = %f, want 1.0", cfg.ORB.MaxRiskPct)
 	}
+	if cfg.ORB.ScanCadenceMinutes != 2 {
+		t.Errorf("default orb.scan_cadence_minutes = %d, want 2", cfg.ORB.ScanCadenceMinutes)
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

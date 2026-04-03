@@ -270,7 +270,8 @@ func Defaults() *Config {
 			RiskReward:        2.0,
 			MaxRiskPct:        1.0,
 			MaxPositionPct:    10.0, // hard cap: notional <= 10% of portfolio per trade
-			NewsLookbackHours: 24,
+			NewsLookbackHours:  24,
+			ScanCadenceMinutes: 2,
 		},
 	}
 }
