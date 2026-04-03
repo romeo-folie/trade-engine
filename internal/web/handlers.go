@@ -14,7 +14,6 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/logger"
-	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -74,13 +73,50 @@ func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/portfolio
-// Returns the live in-memory portfolio state from the tracker.
+// Returns portfolio state from the live tracker when available;
+// falls back to the latest DB snapshot when the tracker is not initialized.
 func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
-	if s.tracker == nil {
-		apiError(w, "portfolio tracker not initialized", nil)
+	if s.tracker != nil {
+		state := s.tracker.CurrentState()
+		jsonResponse(w, map[string]any{
+			"TotalValue":       state.TotalValue,
+			"Cash":             state.Cash,
+			"Invested":         state.Invested,
+			"UnrealizedPnL":    state.UnrealizedPnL,
+			"DayPnL":           state.DayPnL,
+			"RealizedPnLToday": state.RealizedPnLDay,
+			"OpenPositions":    state.OpenPositions,
+		})
 		return
 	}
-	jsonResponse(w, s.tracker.CurrentState())
+	// Tracker not initialized — fall back to the latest DB snapshot.
+	if !store.IsConnected() {
+		apiError(w, "portfolio tracker not initialized and database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	snap, err := store.GetLatestPortfolioSnapshot(ctx)
+	if err != nil {
+		apiError(w, "portfolio snapshot query failed", err)
+		return
+	}
+	if snap == nil {
+		jsonResponse(w, map[string]any{
+			"TotalValue": 0.0, "Cash": 0.0, "Invested": 0.0,
+			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0, "OpenPositions": 0,
+		})
+		return
+	}
+	jsonResponse(w, map[string]any{
+		"TotalValue":       snap.TotalValue,
+		"Cash":             snap.Cash,
+		"Invested":         snap.Invested,
+		"UnrealizedPnL":    snap.UnrealizedPnL,
+		"DayPnL":           0.0, // not stored in DB snapshots
+		"RealizedPnLToday": snap.RealizedPnLToday,
+		"OpenPositions":    snap.OpenPositions,
+	})
 }
 
 // GET /api/portfolio/history?days=N
@@ -218,17 +254,77 @@ func (s *Server) handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/portfolio/positions
-// Returns open positions directly from the broker (via the live tracker).
+// Returns open positions from the live tracker when available, enriched with
+// trade metadata (direction, strategy) from the store. Falls back to open
+// trades from the store when the tracker is not initialized.
 func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
-	if s.tracker == nil {
-		apiError(w, "portfolio tracker not initialized", nil)
+	if s.tracker != nil {
+		positions := s.tracker.Positions()
+
+		// Enrich positions with direction/strategy from open trades if DB is available.
+		tradeByTicker := map[string]store.Trade{}
+		if store.IsConnected() {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			if openTrades, err := store.GetOpenTrades(ctx); err == nil {
+				for _, t := range openTrades {
+					tradeByTicker[t.Ticker] = t
+				}
+			}
+		}
+
+		type positionDTO struct {
+			Ticker       string  `json:"Ticker"`
+			Direction    string  `json:"Direction"`
+			Strategy     string  `json:"Strategy"`
+			EntryPrice   float64 `json:"EntryPrice"`
+			CurrentPrice float64 `json:"CurrentPrice"`
+			Quantity     float64 `json:"Quantity"`
+			PnL          float64 `json:"PnL"`
+			PnLPct       float64 `json:"PnLPct"`
+		}
+
+		dtos := make([]positionDTO, 0, len(positions))
+		for _, p := range positions {
+			dto := positionDTO{
+				Ticker:     p.Ticker,
+				EntryPrice: p.AvgCostBasis,
+				Quantity:   p.Quantity,
+				PnL:        p.UnrealizedPL,
+			}
+			if p.Quantity > 0 {
+				dto.CurrentPrice = p.CurrentValue / p.Quantity
+				costBasis := p.AvgCostBasis * p.Quantity
+				if costBasis > 0 {
+					dto.PnLPct = (p.UnrealizedPL / costBasis) * 100
+				}
+			}
+			if t, ok := tradeByTicker[p.Ticker]; ok {
+				dto.Direction = t.Direction
+				dto.Strategy = t.Strategy
+			}
+			dtos = append(dtos, dto)
+		}
+		jsonResponse(w, map[string]any{"positions": dtos})
 		return
 	}
-	positions := s.tracker.Positions()
-	if positions == nil {
-		positions = []portfolio.ExecPosition{}
+
+	// Tracker not initialized — fall back to open trades from the store.
+	if !store.IsConnected() {
+		apiError(w, "portfolio tracker not initialized and database not connected", nil)
+		return
 	}
-	jsonResponse(w, map[string]any{"positions": positions})
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		apiError(w, "positions query failed", err)
+		return
+	}
+	if trades == nil {
+		trades = []store.Trade{}
+	}
+	jsonResponse(w, map[string]any{"positions": trades})
 }
 
 // GET /api/node/ticker/:ticker

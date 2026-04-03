@@ -258,3 +258,35 @@ func TestHandleSystemRestart_OKTriggersSignal(t *testing.T) {
 		t.Fatal("expected restart signal to be triggered")
 	}
 }
+
+// ─── Portfolio / Positions handlers (nil tracker, no DB) ─────────────────────
+
+func TestHandlePortfolio_NilTracker_NoDB(t *testing.T) {
+	// With no tracker and no DB connection, expect 500 with a clear error.
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/node/portfolio", nil)
+	srv.handlePortfolio(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not connected") {
+		t.Errorf("expected 'not connected' in error body, got %q", w.Body.String())
+	}
+}
+
+func TestHandlePortfolioPositions_NilTracker_NoDB(t *testing.T) {
+	// With no tracker and no DB connection, expect 500 with a clear error.
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/portfolio/positions", nil)
+	srv.handlePortfolioPositions(w, r)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "not connected") {
+		t.Errorf("expected 'not connected' in error body, got %q", w.Body.String())
+	}
+}

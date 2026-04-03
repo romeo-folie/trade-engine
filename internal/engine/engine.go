@@ -94,6 +94,10 @@ type Engine struct {
 	// todayStartingEquity tracks the equity at 00:00 UTC for the current day.
 	todayStartingEquity float64
 	todaySummaryDate    string
+
+	// lastDailySummaryUpdate tracks when updateDailySummary last ran to throttle
+	// the expensive DB query + upsert cycle.
+	lastDailySummaryUpdate time.Time
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -1514,12 +1518,15 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		dayPnL = acct.DayPnL
 	}
 
-	// Local fallback: sum realized P&L from trades closed today.
-	closedTrades, _ := store.GetRecentTrades(ctx, 100)
-	today := time.Now().UTC().Truncate(24 * time.Hour)
-	for _, t := range closedTrades {
-		if t.Status == "closed" && t.ClosedAt.After(today) {
-			realizedToday += t.PnL
+	if dayPnL == 0 {
+		// Local fallback: sum realized P&L from trades closed today (only when
+		// the broker does not provide it to avoid unnecessary DB load).
+		closedTrades, _ := store.GetRecentTrades(ctx, 100)
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+		for _, t := range closedTrades {
+			if t.Status == "closed" && t.ClosedAt.After(today) {
+				realizedToday += t.PnL
+			}
 		}
 	}
 
@@ -1671,17 +1678,23 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	snap := e.portfolio.MaybeSnapshot(ctx)
 	if snap != nil {
 		e.bus.Publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{
-			TotalValue:     snap.TotalValue,
-			Cash:           snap.Cash,
-			Invested:       snap.Invested,
-			UnrealizedPnL:  snap.UnrealizedPnL,
-			DayPnL:         snap.DayPnL,
-			OpenPositions:  snap.OpenPositions,
+			TotalValue:       snap.TotalValue,
+			Cash:             snap.Cash,
+			Invested:         snap.Invested,
+			UnrealizedPnL:    snap.UnrealizedPnL,
+			RealizedPnLToday: snap.RealizedPnLDay,
+			DayPnL:           snap.DayPnL,
+			OpenPositions:    snap.OpenPositions,
 		})
 	}
 
-	// Update the daily summary row so System Stats and Period Performance remain live.
-	e.updateDailySummary(ctx)
+	// Throttle daily summary updates: run at most every 5 minutes to avoid
+	// excessive DB query + upsert load on every monitorPositions invocation.
+	const dailySummaryUpdateInterval = 5 * time.Minute
+	if time.Since(e.lastDailySummaryUpdate) >= dailySummaryUpdateInterval {
+		e.updateDailySummary(ctx)
+		e.lastDailySummaryUpdate = time.Now()
+	}
 }
 
 // updateDailySummary upserts a daily_summaries row for the current date.
