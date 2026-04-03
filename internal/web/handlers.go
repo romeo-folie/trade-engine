@@ -3,11 +3,12 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
@@ -19,6 +20,15 @@ import (
 
 // processStart records the time this process was loaded, used for uptime.
 var processStart = time.Now()
+
+// restartSignalFn sends SIGTERM to the current process. Overridden in tests.
+var restartSignalFn = func() error {
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return err
+	}
+	return proc.Signal(syscall.SIGTERM)
+}
 
 // registerAPIHandlers mounts the REST drill-down endpoints on mux.
 func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
@@ -38,6 +48,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/system/cache", s.handleSystemCache)
 	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
 	mux.HandleFunc("/api/system/config", s.handleSystemConfig)
+	mux.HandleFunc("/api/system/restart", s.handleSystemRestart)
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -57,7 +68,7 @@ func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{
-		"open_trades":     openTrades,
+		"open_trades":      openTrades,
 		"open_trade_count": len(openTrades),
 	})
 }
@@ -603,6 +614,27 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// POST /api/system/restart — restricted to loopback callers.
+func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	if !isLoopback(r) {
+		http.Error(w, "forbidden: restart requires local connection", http.StatusForbidden)
+		return
+	}
+
+	jsonResponse(w, map[string]string{"status": "restarting"})
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		if err := restartSignalFn(); err != nil {
+			logger.Warn("web: restart signal failed", "err", err.Error())
+		}
+	}()
+}
+
 // GET /api/system/config
 // POST /api/system/config  — mutation is restricted to loopback (127.x / ::1) callers.
 func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
@@ -616,7 +648,9 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var updates map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&updates); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.UseNumber()
+		if err := dec.Decode(&updates); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
@@ -653,8 +687,7 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 				// Also allow direct dot-path updates if provided.
 				dotPath = k
 			}
-			valStr := fmt.Sprintf("%v", v)
-			if err := config.SetField(dotPath, valStr); err != nil {
+			if err := config.SetFieldAny(dotPath, v); err != nil {
 				apiError(w, "config update failed", err)
 				return
 			}

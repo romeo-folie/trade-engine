@@ -9,6 +9,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
@@ -203,5 +204,57 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	// drawdown should be 0.0 when not connected
 	if resp.Drawdown != 0.0 {
 		t.Errorf("expected drawdown 0.0, got %f", resp.Drawdown)
+	}
+}
+
+func TestHandleSystemRestart_MethodNotAllowed(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodGet, "/api/system/restart", nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
+	if w.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestHandleSystemRestart_ForbiddenForNonLoopback(t *testing.T) {
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/system/restart", nil)
+	r.RemoteAddr = "10.0.0.2:12345"
+
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", w.Code)
+	}
+}
+
+func TestHandleSystemRestart_OKTriggersSignal(t *testing.T) {
+	orig := restartSignalFn
+	defer func() { restartSignalFn = orig }()
+
+	called := make(chan struct{}, 1)
+	restartSignalFn = func() error {
+		called <- struct{}{}
+		return nil
+	}
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/system/restart", nil)
+	r.RemoteAddr = "127.0.0.1:12345"
+
+	srv := NewServer(Config{}, nil, nil)
+	srv.handleSystemRestart(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	select {
+	case <-called:
+		// ok
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("expected restart signal to be triggered")
 	}
 }
