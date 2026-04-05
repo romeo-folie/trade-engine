@@ -7,6 +7,7 @@ import (
 	"math"
 	"net/url"
 	"sort"
+	"strings"
 )
 
 // GapCandidate represents a stock gapping significantly from its prior close.
@@ -20,10 +21,9 @@ type GapCandidate struct {
 
 type alpacaMover struct {
 	Symbol     string  `json:"symbol"`
-	ChangePerc float64 `json:"change_percent"`
+	ChangePerc float64 `json:"percent_change"`
 	Price      float64 `json:"price"`
-	Volume     int64   `json:"volume"`
-	PrevClose  float64 `json:"previous_close"`
+	Change     float64 `json:"change"` // absolute dollar change
 }
 
 type alpacaMoversResponse struct {
@@ -57,8 +57,7 @@ func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64
 				Ticker:        m.Symbol,
 				GapPct:        m.ChangePerc,
 				PreMarketLast: m.Price,
-				PreMarketVol:  m.Volume,
-				PriorClose:    m.PrevClose,
+				PriorClose:    m.Price - m.Change,
 			})
 		}
 	}
@@ -66,5 +65,57 @@ func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64
 	sort.Slice(candidates, func(i, j int) bool {
 		return math.Abs(candidates[i].GapPct) > math.Abs(candidates[j].GapPct)
 	})
+
+	// Enrich candidates with pre-market volume from the snapshots endpoint.
+	// The screener/movers endpoint does not include volume data.
+	if len(candidates) > 0 {
+		tickers := make([]string, len(candidates))
+		for i, c := range candidates {
+			tickers[i] = c.Ticker
+		}
+		vols, err := fetchSnapshotVolumes(ctx, client, tickers)
+		if err != nil {
+			// Non-fatal: volume is supplementary context for the LLM.
+			fmt.Printf("orb: snapshot volumes: %v\n", err)
+		} else {
+			for i := range candidates {
+				candidates[i].PreMarketVol = vols[candidates[i].Ticker]
+			}
+		}
+	}
+
 	return candidates, nil
+}
+
+// alpacaSnapshot represents the relevant subset of an Alpaca stock snapshot.
+type alpacaSnapshot struct {
+	MinuteBar *alpacaBar `json:"minuteBar"`
+	DailyBar  *alpacaBar `json:"dailyBar"`
+}
+
+// fetchSnapshotVolumes fetches the daily bar volume for the given tickers
+// via the Alpaca multi-snapshot endpoint in a single call.
+func fetchSnapshotVolumes(ctx context.Context, client *AlpacaClient, tickers []string) (map[string]int64, error) {
+	params := url.Values{}
+	params.Set("symbols", strings.Join(tickers, ","))
+	params.Set("feed", "iex")
+
+	resp, err := client.get(ctx, "/v2/stocks/snapshots", params)
+	if err != nil {
+		return nil, fmt.Errorf("fetch snapshots: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var snapshots map[string]alpacaSnapshot
+	if err := json.NewDecoder(resp.Body).Decode(&snapshots); err != nil {
+		return nil, fmt.Errorf("decode snapshots: %w", err)
+	}
+
+	vols := make(map[string]int64, len(snapshots))
+	for sym, snap := range snapshots {
+		if snap.DailyBar != nil {
+			vols[sym] = snap.DailyBar.Volume
+		}
+	}
+	return vols, nil
 }

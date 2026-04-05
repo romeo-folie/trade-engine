@@ -2,7 +2,6 @@ package data
 
 import (
 	"context"
-	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -10,26 +9,38 @@ import (
 )
 
 func TestFetchGapMovers(t *testing.T) {
-	moversResp := alpacaMoversResponse{
-		Gainers: []alpacaMover{
-			{Symbol: "AAPL", ChangePerc: 5.2, Price: 180.0, Volume: 100000, PrevClose: 171.1},
-			{Symbol: "TSLA", ChangePerc: 2.1, Price: 250.0, Volume: 80000, PrevClose: 244.9},
-			{Symbol: "NVDA", ChangePerc: 4.0, Price: 500.0, Volume: 120000, PrevClose: 480.8},
-		},
-		Losers: []alpacaMover{
-			{Symbol: "META", ChangePerc: -6.0, Price: 300.0, Volume: 90000, PrevClose: 319.1},
-			{Symbol: "AMZN", ChangePerc: -1.5, Price: 180.0, Volume: 70000, PrevClose: 182.7},
-		},
-	}
+	// Use raw JSON matching the real Alpaca API field names to catch
+	// deserialization mismatches (the previous Go-struct-based test
+	// silently masked a wrong json tag).
+	const moversJSON = `{
+		"gainers": [
+			{"symbol":"AAPL","percent_change":5.2,"change":8.93,"price":180.0},
+			{"symbol":"TSLA","percent_change":2.1,"change":5.15,"price":250.0},
+			{"symbol":"NVDA","percent_change":4.0,"change":19.23,"price":500.0}
+		],
+		"losers": [
+			{"symbol":"META","percent_change":-6.0,"change":-19.15,"price":300.0},
+			{"symbol":"AMZN","percent_change":-1.5,"change":-2.74,"price":180.0}
+		]
+	}`
+
+	const snapshotsJSON = `{
+		"AAPL": {"dailyBar":{"t":"2026-04-05T04:00:00Z","o":171.0,"h":181.0,"l":170.0,"c":180.0,"v":1500000,"vw":176.0}},
+		"META": {"dailyBar":{"t":"2026-04-05T04:00:00Z","o":318.0,"h":320.0,"l":298.0,"c":300.0,"v":2200000,"vw":310.0}},
+		"NVDA": {"dailyBar":{"t":"2026-04-05T04:00:00Z","o":482.0,"h":505.0,"l":480.0,"c":500.0,"v":3100000,"vw":495.0}}
+	}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1beta1/screener/stocks/movers" {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1beta1/screener/stocks/movers":
+			w.Write([]byte(moversJSON))
+		case "/v2/stocks/snapshots":
+			w.Write([]byte(snapshotsJSON))
+		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			http.Error(w, "not found", 404)
-			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(moversResp)
 	}))
 	defer srv.Close()
 
@@ -61,18 +72,32 @@ func TestFetchGapMovers(t *testing.T) {
 	if math.Abs(candidates[0].GapPct-(-6.0)) > 0.01 {
 		t.Errorf("candidates[0].GapPct = %f, want -6.0", candidates[0].GapPct)
 	}
+
+	// Verify PriorClose is derived correctly (price - change)
+	if math.Abs(candidates[1].PriorClose-171.07) > 0.01 {
+		t.Errorf("candidates[1].PriorClose = %f, want ~171.07", candidates[1].PriorClose)
+	}
+
+	// Verify PreMarketVol is enriched from snapshots
+	if candidates[0].PreMarketVol != 2200000 { // META
+		t.Errorf("candidates[0].PreMarketVol = %d, want 2200000", candidates[0].PreMarketVol)
+	}
+	if candidates[1].PreMarketVol != 1500000 { // AAPL
+		t.Errorf("candidates[1].PreMarketVol = %d, want 1500000", candidates[1].PreMarketVol)
+	}
 }
 
 func TestFetchGapMoversHighThreshold(t *testing.T) {
-	moversResp := alpacaMoversResponse{
-		Gainers: []alpacaMover{
-			{Symbol: "AAPL", ChangePerc: 2.0, Price: 180.0, Volume: 100000, PrevClose: 176.5},
-		},
-	}
+	const moversJSON = `{
+		"gainers": [
+			{"symbol":"AAPL","percent_change":2.0,"change":3.53,"price":180.0}
+		],
+		"losers": []
+	}`
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(moversResp)
+		w.Write([]byte(moversJSON))
 	}))
 	defer srv.Close()
 
