@@ -190,11 +190,11 @@ The engine runs in distinct modes that cover different markets and sessions. Use
 # ── Forex ORB: London session ────────────────────────────────────
 # Starts 30 min before London open (08:00 UTC) for pre-session setup.
 # The scheduler auto-exits after range lockout + order management.
-30 7 * * 1-5  te run --mode orb-forex  # config: session=london
+30 7 * * 1-5  te run --mode orb-forex --session london
 
 # ── Forex ORB: New York session ──────────────────────────────────
 # Starts 30 min before NY open (13:00 UTC).
-30 12 * * 1-5  te run --mode orb-forex  # config: session=newyork
+30 12 * * 1-5  te run --mode orb-forex --session newyork
 
 # ── Equities ORB (optional) ──────────────────────────────────────
 # Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
@@ -214,7 +214,7 @@ The engine runs in distinct modes that cover different markets and sessions. Use
 **Notes:**
 
 - Forex ORB (`orb-forex`) requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
-- Each `orb-forex` entry uses the same binary but different `forex_orb.session` config (`london` or `newyork`). Use separate config files or env var overrides to distinguish them.
+- The `--session` flag overrides `forex_orb.session` at runtime, so one config file serves both cron entries.
 - Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex ORB since they use different brokers.
 - Standard mode and equities ORB should not overlap — standard mode starts after ORB's 14:30 UTC cutoff.
 - The feedback reviewer runs inside whichever process is active at `feedback.review_time_utc` (default 18:00 UTC).

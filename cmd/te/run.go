@@ -29,6 +29,7 @@ import (
 
 var (
 	runMode    string
+	runSession string
 	runDryRun  bool
 	runDetach  bool
 	runWeb     bool
@@ -72,6 +73,10 @@ Modes:
 		mode := cfg.Engine.Mode
 		if runMode != "" {
 			mode = runMode
+		}
+		// CLI --session flag overrides forex_orb.session.
+		if runSession != "" {
+			cfg.ForexORB.Session = runSession
 		}
 		if runDryRun || cfg.Engine.DryRun {
 			logger.Info("dry-run mode — no orders will be placed")
@@ -356,6 +361,9 @@ func startDetachedRun() error {
 	if runMode != "" {
 		args = append(args, "--mode", runMode)
 	}
+	if runSession != "" {
+		args = append(args, "--session", runSession)
+	}
 	if runDryRun {
 		args = append(args, "--dry-run")
 	}
@@ -581,6 +589,7 @@ func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
 
 func init() {
 	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|orb-forex)")
+	runCmd.Flags().StringVar(&runSession, "session", "", "Override forex_orb.session (london|newyork)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")
 	runCmd.Flags().BoolVar(&runWeb, "web", false, "Start the web observability server in-process")
