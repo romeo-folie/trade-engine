@@ -128,6 +128,48 @@ func checkFlags(
 		}
 	}
 
+	// ── ORB session win-rate check ───────────────────────────────────────────
+	for k, metrics := range byKey {
+		if k.scope != "orb_session" {
+			continue
+		}
+		winIns, hasWin := metrics["win_rate"]
+		if !hasWin {
+			continue
+		}
+		tcIns, hasTc := metrics["trade_count"]
+		tradeCount := 0
+		if hasTc {
+			tradeCount = int(tcIns.Value)
+		}
+
+		if winIns.Value < cfg.InstrumentWinRateMin && tradeCount >= cfg.InstrumentMinTrades {
+			dup, err := store.HasUnresolvedFlag(ctx, date, "orb_session", k.scopeKey, "win_rate")
+			if err != nil {
+				return fmt.Errorf("feedback: HasUnresolvedFlag orb_session win_rate %s: %w", k.scopeKey, err)
+			}
+			if dup {
+				continue
+			}
+			msg := fmt.Sprintf(
+				"%s win rate dropped to %.0f%% over last %d trades (threshold: %.0f%%)",
+				k.scopeKey, winIns.Value*100, tradeCount, cfg.InstrumentWinRateMin*100,
+			)
+			if err := insertAndPublish(ctx, bus, store.FeedbackFlag{
+				Date:        date,
+				Scope:       "orb_session",
+				ScopeKey:    k.scopeKey,
+				Severity:    "warning",
+				Message:     msg,
+				Metric:      "win_rate",
+				MetricValue: winIns.Value,
+				Threshold:   cfg.InstrumentWinRateMin,
+			}); err != nil {
+				return err
+			}
+		}
+	}
+
 	// ── Arbiter override rate ────────────────────────────────────────────────
 	if arbIns, ok := getMetric("system", "arbiter", "arbiter_override_rate"); ok {
 		if arbIns.Value > cfg.ArbiterOverrideRateMax {

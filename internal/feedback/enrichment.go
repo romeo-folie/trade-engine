@@ -9,6 +9,14 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// titleCase uppercases the first byte of s.
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
 // GetPerformanceContext returns a formatted text block summarising recent
 // instrument and model performance for use in LLM prompts.
 // Returns an empty string when no data is available.
@@ -20,10 +28,18 @@ func GetPerformanceContext(ctx context.Context, ticker string) (string, error) {
 	}
 
 	// All model-level insights for the latest date (30d window).
+	// Search backwards up to 7 days to find the most recent date with data.
 	today := time.Now().UTC().Truncate(24 * time.Hour)
-	modelInsights, err := store.GetLatestFeedbackInsights(ctx, "model", "30d", today)
-	if err != nil {
-		return "", fmt.Errorf("feedback: GetLatestFeedbackInsights model: %w", err)
+	var modelInsights []store.FeedbackInsight
+	for daysBack := 0; daysBack < 7; daysBack++ {
+		insightDate := today.AddDate(0, 0, -daysBack)
+		modelInsights, err = store.GetLatestFeedbackInsights(ctx, "model", "30d", insightDate)
+		if err != nil {
+			return "", fmt.Errorf("feedback: model insights: %w", err)
+		}
+		if len(modelInsights) > 0 {
+			break
+		}
 	}
 
 	if len(instrInsights) == 0 && len(modelInsights) == 0 {
@@ -61,7 +77,7 @@ func GetPerformanceContext(ctx context.Context, ticker string) (string, error) {
 			if avgPnl < 0 {
 				sign = ""
 			}
-			parts = append(parts, fmt.Sprintf("avg %s%.1f%%", sign, avgPnl*100))
+			parts = append(parts, fmt.Sprintf("avg %s%.1f%%", sign, avgPnl))
 		}
 		if len(parts) > 0 {
 			fmt.Fprintf(&sb, "- %s: %s\n", ticker, strings.Join(parts, ", "))
@@ -144,7 +160,7 @@ func GetORBPerformanceContext(ctx context.Context, ticker, session string) (stri
 	label := ticker
 	if session != "" {
 		// Capitalise the session name for display.
-		label = ticker + " " + strings.Title(session) //nolint:staticcheck
+		label = ticker + " " + titleCase(session)
 	}
 	label += " ORB"
 
@@ -164,7 +180,7 @@ func GetORBPerformanceContext(ctx context.Context, ticker, session string) (stri
 		if avgPnl < 0 {
 			sign = ""
 		}
-		fmt.Fprintf(&sb, ", avg PnL: %s%.1f%%", sign, avgPnl*100)
+		fmt.Fprintf(&sb, ", avg PnL: %s%.1f%%", sign, avgPnl)
 	}
 	sb.WriteString("\n")
 

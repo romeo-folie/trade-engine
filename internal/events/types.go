@@ -236,9 +236,10 @@ type FeedbackFlagCreatedPayload struct {
 
 // ORBStateChangedPayload is emitted when the ORB scheduler transitions to a new state.
 type ORBStateChangedPayload struct {
-	State     string `json:"state"`
-	SessionID string `json:"session_id"`
-	Date      string `json:"date"`
+	State      string `json:"state"`
+	SessionID  string `json:"session_id,omitempty"`
+	Date       string `json:"date,omitempty"`
+	AssetClass string `json:"asset_class,omitempty"`
 }
 
 // ORBCandidatesReadyPayload is emitted when ORB candidates are selected and persisted.

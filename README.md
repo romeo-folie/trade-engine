@@ -190,16 +190,16 @@ The engine runs in distinct modes that cover different markets and sessions. Use
 # ── Forex ORB: London session ────────────────────────────────────
 # Starts 30 min before London open (08:00 UTC) for pre-session setup.
 # The scheduler auto-exits after range lockout + order management.
-30 7 * * 1-5  te run --mode orb-forex --session london
+30 7 * * 1-5  te run --mode orb-forex --session london --web --web-port 8080
 
 # ── Forex ORB: New York session ──────────────────────────────────
 # Starts 30 min before NY open (13:00 UTC).
-30 12 * * 1-5  te run --mode orb-forex --session newyork
+30 12 * * 1-5  te run --mode orb-forex --session newyork --web --web-port 8080
 
 # ── Equities ORB (optional) ──────────────────────────────────────
 # Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
 # Market open is 13:30 UTC (9:30 AM ET). Auto-exits by 14:30 UTC.
-0 10 * * 1-5  te run --mode orb
+0 10 * * 1-5  te run --mode orb --web --web-port 8080
 
 # ── Standard mode: US equities session ───────────────────────────
 # Runs the full analysis pipeline (ensemble LLM, risk checks, execution).

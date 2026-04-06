@@ -842,8 +842,13 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{})
 		s.notify(ctx, "ORB: Session complete for today.")
 
-		// Reset for next day
+		// Capture session info before resetting for next day.
 		s.mu.Lock()
+		var sid, sdate string
+		if s.session != nil {
+			sid = s.session.ID
+			sdate = s.session.Date.Format("2006-01-02")
+		}
 		s.session = nil
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
@@ -852,7 +857,9 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.mu.Unlock()
 
 		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
-			State: string(StateIdle),
+			State:     string(StateIdle),
+			SessionID: sid,
+			Date:      sdate,
 		})
 	}
 	return nil

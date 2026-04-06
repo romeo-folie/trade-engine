@@ -855,7 +855,8 @@ func (s *Server) handleORBSessionToday(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if session == nil {
-		http.Error(w, "no session for today", http.StatusNotFound)
+		w.WriteHeader(http.StatusNotFound)
+		jsonResponse(w, map[string]any{"error": "no ORB session for today"})
 		return
 	}
 	jsonResponse(w, map[string]any{"session": session})
@@ -930,10 +931,18 @@ func (s *Server) handleORBPerformance(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
 
-	insights, err := store.GetLatestFeedbackInsights(ctx, "orb_session", window, today)
-	if err != nil {
-		apiError(w, "orb performance query failed", err)
-		return
+	var insights []store.FeedbackInsight
+	for daysBack := 0; daysBack < 7; daysBack++ {
+		insightDate := today.AddDate(0, 0, -daysBack)
+		var err2 error
+		insights, err2 = store.GetLatestFeedbackInsights(ctx, "orb_session", window, insightDate)
+		if err2 != nil {
+			apiError(w, "orb performance query failed", err2)
+			return
+		}
+		if len(insights) > 0 {
+			break
+		}
 	}
 
 	// Group by scope_key and extract metrics per instrument

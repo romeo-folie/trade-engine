@@ -27,7 +27,7 @@ sleep 5
 case "$MODE" in
   orb)
     echo "[te-switch] Starting in ORB mode (equities)..."
-    ./te run --mode orb --detach
+    ./te run --mode orb --web --web-port 8080 --detach
     ;;
   orb-forex)
     # Auto-detect session from UTC hour if not specified.
@@ -40,7 +40,7 @@ case "$MODE" in
       fi
     fi
     echo "[te-switch] Starting in Forex ORB mode (session: $SESSION)..."
-    ./te run --mode orb-forex --session "$SESSION" --detach
+    ./te run --mode orb-forex --session "$SESSION" --web --web-port 8080 --detach
     ;;
   *)
     echo "[te-switch] Starting in regular mode..."

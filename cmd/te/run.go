@@ -313,7 +313,23 @@ Modes:
 				}()
 			}
 
-			// 11. Run.
+			// 11. Start web server if requested.
+			if runWeb {
+				webSrv := web.NewServer(web.Config{
+					Port:           runWebPort,
+					Host:           "0.0.0.0",
+					AllowedOrigins: []string{"*"},
+					EngineConfig:   cfg,
+				}, orbBus, nil)
+				if err := webSrv.Start(ctx); err != nil {
+					return fmt.Errorf("web server: %w", err)
+				}
+				defer webSrv.Stop()
+				logger.Info("web observability server started (orb-forex mode)", "port", runWebPort)
+				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
+			}
+
+			// 12. Run.
 			logger.Info("ORB-Forex scheduler starting")
 			fmt.Println("ORB-Forex mode active. Waiting for forex session open...")
 			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
