@@ -262,6 +262,7 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 	b := newTestIBKRBroker("http://unused")
 
 	cases := map[string]string{
+		// Forex (CASH)
 		"EUR/USD": "12087792",
 		"GBP/USD": "12087797",
 		"USD/JPY": "12087802",
@@ -270,9 +271,12 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 		"USD/CAD": "12087817",
 		"NZD/USD": "15016065",
 		"EUR/GBP": "12087811",
+		// Metals (CFD)
+		"XAU/USD": "69067924",
+		"XAG/USD": "69067925",
 	}
 	for pair, wantConid := range cases {
-		got, err := b.resolveConid(t.Context(), pair)
+		got, err := b.resolveConid(t.Context(), pair, "")
 		if err != nil {
 			t.Errorf("resolveConid(%q) error: %v", pair, err)
 			continue
@@ -284,13 +288,14 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 }
 
 func TestResolveConid_APIFallback(t *testing.T) {
+	// XPT/USD is not in the hardcoded map, so it falls through to the API.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/iserver/secdef/search" && r.URL.Query().Get("symbol") == "XAU" {
+		if r.URL.Path == "/iserver/secdef/search" && r.URL.Query().Get("symbol") == "XPT" {
 			w.Header().Set("Content-Type", "application/json")
 			// Simulate IBKR secdef search response.
 			w.Write([]byte(`[
-				{"conid": 69067924, "companyName": "XAU.USD", "description": "XAU/USD", "exchange": "IDEALPRO"},
-				{"conid": 99999999, "companyName": "XAU.CHF", "description": "XAU/CHF", "exchange": "IDEALPRO"}
+				{"conid": 12345678, "companyName": "XPT.USD", "description": "XPT/USD", "exchange": "IDEALPRO"},
+				{"conid": 99999999, "companyName": "XPT.CHF", "description": "XPT/CHF", "exchange": "IDEALPRO"}
 			]`))
 			return
 		}
@@ -300,16 +305,16 @@ func TestResolveConid_APIFallback(t *testing.T) {
 
 	b := newTestIBKRBroker(srv.URL)
 
-	conid, err := b.resolveConid(t.Context(), "XAU/USD")
+	conid, err := b.resolveConid(t.Context(), "XPT/USD", "CFD")
 	if err != nil {
 		t.Fatalf("resolveConid API fallback error: %v", err)
 	}
-	if conid != "69067924" {
-		t.Errorf("conid = %q; want 69067924", conid)
+	if conid != "12345678" {
+		t.Errorf("conid = %q; want 12345678", conid)
 	}
 
 	// Second call must come from cache (server would 404 on repeat).
-	conid2, err := b.resolveConid(t.Context(), "XAU/USD")
+	conid2, err := b.resolveConid(t.Context(), "XPT/USD", "CFD")
 	if err != nil {
 		t.Fatalf("resolveConid (cached) error: %v", err)
 	}
@@ -326,7 +331,7 @@ func TestResolveConid_NotFound(t *testing.T) {
 	defer srv.Close()
 
 	b := newTestIBKRBroker(srv.URL)
-	_, err := b.resolveConid(t.Context(), "ZZZ/YYY")
+	_, err := b.resolveConid(t.Context(), "ZZZ/YYY", "CASH")
 	if err == nil {
 		t.Error("expected error for unknown pair, got nil")
 	}

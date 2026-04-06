@@ -60,7 +60,11 @@ func (b *IBKRBroker) throttle() {
 
 // PlaceOrder submits a simple or bracket order to the IBKR Client Portal gateway.
 func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {
-	conid, err := b.resolveConid(ctx, req.Ticker)
+	secType := req.SecType
+	if secType == "" {
+		secType = "CASH"
+	}
+	conid, err := b.resolveConid(ctx, req.Ticker, secType)
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: resolve conid for %q: %w", req.Ticker, err)
 	}
@@ -69,9 +73,9 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 
 	var orders []map[string]any
 	if req.OrderClass == "bracket" {
-		orders = buildBracketOrders(conid, orderType, req)
+		orders = buildBracketOrders(conid, secType, orderType, req)
 	} else {
-		orders = []map[string]any{buildSingleOrder(conid, orderType, req)}
+		orders = []map[string]any{buildSingleOrder(conid, secType, orderType, req)}
 	}
 
 	payload := map[string]any{"orders": orders}
@@ -183,9 +187,9 @@ func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
 }
 
 // reverseConid resolves a conid string back to a ticker symbol.
-// Checks the hardcoded forex map first, then the dynamic cache.
+// Checks the hardcoded conid map first, then the dynamic cache.
 func (b *IBKRBroker) reverseConid(conid string) string {
-	for pair, c := range forexConids {
+	for pair, c := range ibkrConids {
 		if c == conid {
 			return pair
 		}
@@ -250,10 +254,10 @@ func mapOrderType(t OrderType) string {
 	}
 }
 
-func buildSingleOrder(conid, orderType string, req OrderRequest) map[string]any {
+func buildSingleOrder(conid, secType, orderType string, req OrderRequest) map[string]any {
 	o := map[string]any{
 		"conid":     conid,
-		"secType":   "CASH",
+		"secType":   secType,
 		"side":      mapSide(req.Side),
 		"quantity":  req.Quantity,
 		"orderType": orderType,
@@ -264,10 +268,10 @@ func buildSingleOrder(conid, orderType string, req OrderRequest) map[string]any 
 	return o
 }
 
-func buildBracketOrders(conid, orderType string, req OrderRequest) []map[string]any {
+func buildBracketOrders(conid, secType, orderType string, req OrderRequest) []map[string]any {
 	parent := map[string]any{
 		"conid":     conid,
-		"secType":   "CASH",
+		"secType":   secType,
 		"side":      mapSide(req.Side),
 		"quantity":  req.Quantity,
 		"orderType": orderType,
@@ -283,25 +287,25 @@ func buildBracketOrders(conid, orderType string, req OrderRequest) []map[string]
 	}
 
 	takeProfit := map[string]any{
-		"conid":      conid,
-		"secType":    "CASH",
-		"side":       exitSide,
-		"quantity":   req.Quantity,
-		"orderType":  "LMT",
-		"price":      req.TakeProfitPrice,
-		"tif":        "DAY",
-		"parentId":   req.TradeID,
+		"conid":     conid,
+		"secType":   secType,
+		"side":      exitSide,
+		"quantity":  req.Quantity,
+		"orderType": "LMT",
+		"price":     req.TakeProfitPrice,
+		"tif":       "DAY",
+		"parentId":  req.TradeID,
 	}
 
 	stopLoss := map[string]any{
-		"conid":      conid,
-		"secType":    "CASH",
-		"side":       exitSide,
-		"quantity":   req.Quantity,
-		"orderType":  "STP",
-		"auxPrice":   req.StopLossPrice,
-		"tif":        "DAY",
-		"parentId":   req.TradeID,
+		"conid":     conid,
+		"secType":   secType,
+		"side":      exitSide,
+		"quantity":  req.Quantity,
+		"orderType": "STP",
+		"auxPrice":  req.StopLossPrice,
+		"tif":       "DAY",
+		"parentId":  req.TradeID,
 	}
 
 	return []map[string]any{parent, takeProfit, stopLoss}

@@ -36,6 +36,10 @@ type OrderRequest struct {
 	OrderClass       string  // "" (simple) | "bracket"
 	TakeProfitPrice  float64 // limit price for take-profit leg
 	StopLossPrice    float64 // stop price for stop-loss leg
+
+	// SecType overrides the IBKR security type for this order.
+	// "" defaults to "CASH" (forex). Use "CFD" for metals like XAU/USD.
+	SecType string // "" (default/CASH) | "CASH" (forex) | "CFD" (metals)
 }
 
 // OrderResult is the immediate response from the broker.

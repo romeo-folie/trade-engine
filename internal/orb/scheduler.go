@@ -159,6 +159,20 @@ func (s *ORBScheduler) isForexMode() bool {
 	return s.forexCfg != nil && s.forexCfg.Enabled
 }
 
+// instrumentForTicker returns the Instrument config for the given ticker symbol,
+// or nil if not found (e.g. in equities mode or ticker not configured).
+func (s *ORBScheduler) instrumentForTicker(ticker string) *config.Instrument {
+	if s.forexCfg == nil {
+		return nil
+	}
+	for i := range s.forexCfg.Instruments {
+		if s.forexCfg.Instruments[i].Symbol == ticker {
+			return &s.forexCfg.Instruments[i]
+		}
+	}
+	return nil
+}
+
 // sessionOpenMinutes returns the minute-of-day for market/session open
 // in the scheduler's timezone (ET for equities, configured TZ for forex).
 func (s *ORBScheduler) sessionOpenMinutes() int {
@@ -626,7 +640,17 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			}
 		}
 
-		params := ComputeBracket(r, side, portfolioVal, s.cfg)
+		var params BracketParams
+		if s.isForexMode() {
+			inst := s.instrumentForTicker(ticker)
+			if inst == nil {
+				fmt.Printf("orb: skipping %s — no instrument config found\n", ticker)
+				continue
+			}
+			params = ComputeForexBracket(r, side, portfolioVal, *s.forexCfg, *inst)
+		} else {
+			params = ComputeBracket(r, side, portfolioVal, s.cfg)
+		}
 
 		orderID, err := PlaceBracket(ctx, s.executor, params)
 		if err != nil {

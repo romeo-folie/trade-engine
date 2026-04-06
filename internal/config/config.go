@@ -415,18 +415,24 @@ type IBKRConfig struct {
 	InsecureTLS bool   `yaml:"insecure_tls"` // IBKR gateway uses self-signed certs
 }
 
-// ForexORBConfig configures the Opening Range Breakout strategy for forex pairs via IBKR.
+// Instrument defines a tradeable instrument for forex/CFD ORB.
+type Instrument struct {
+	Symbol     string  `yaml:"symbol"`       // e.g. "EUR/USD", "XAU/USD"
+	SecType    string  `yaml:"sec_type"`     // "CASH" (forex) or "CFD" (metals)
+	MinLotSize float64 `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
+	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
+}
+
+// ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
 type ForexORBConfig struct {
-	Enabled        bool     `yaml:"enabled"`
-	Pairs          []string `yaml:"pairs"`            // e.g. ["EUR/USD", "GBP/USD"]
-	Session        string   `yaml:"session"`          // "london" | "newyork" | "both"
-	Timezone       string   `yaml:"timezone"`         // e.g. "UTC" (default)
-	RangeMinutes   int      `yaml:"range_minutes"`    // 15 or 30
-	RiskReward     float64  `yaml:"risk_reward"`
-	MaxRiskPct     float64  `yaml:"max_risk_pct"`
-	MaxPositionPct float64  `yaml:"max_position_pct"`
-	MinLotSize     float64  `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD
-	PipBuffer      float64  `yaml:"pip_buffer"`   // absolute pip offset for entry (e.g. 0.0002)
+	Enabled        bool         `yaml:"enabled"`
+	Instruments    []Instrument `yaml:"instruments"`
+	Session        string       `yaml:"session"`        // "london" | "newyork" | "both"
+	Timezone       string       `yaml:"timezone"`       // e.g. "UTC" (default)
+	RangeMinutes   int          `yaml:"range_minutes"`  // 15 or 30
+	RiskReward     float64      `yaml:"risk_reward"`
+	MaxRiskPct     float64      `yaml:"max_risk_pct"`
+	MaxPositionPct float64      `yaml:"max_position_pct"`
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).

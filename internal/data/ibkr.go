@@ -32,8 +32,9 @@ var ibkrTimeframeDurations = map[Timeframe]time.Duration{
 	Timeframe1Day:  24 * time.Hour,
 }
 
-// Well-known IBKR contract IDs for major forex pairs on IDEALPRO.
-var ibkrForexConids = map[string]string{
+// Well-known IBKR contract IDs for major forex pairs and CFD instruments.
+var ibkrConids = map[string]string{
+	// Forex (CASH on IDEALPRO)
 	"EUR/USD": "12087792",
 	"GBP/USD": "12087797",
 	"USD/JPY": "12087802",
@@ -42,6 +43,9 @@ var ibkrForexConids = map[string]string{
 	"USD/CAD": "12087817",
 	"NZD/USD": "15016065",
 	"EUR/GBP": "12087811",
+	// Metals (CFD)
+	"XAU/USD": "69067924",
+	"XAG/USD": "69067925",
 }
 
 // IBKRClient implements MarketDataProvider using the IBKR Client Portal REST API.
@@ -125,12 +129,12 @@ func (c *IBKRClient) get(ctx context.Context, path string, params url.Values) (*
 
 // ── Contract resolution ───────────────────────────────────────────────────────
 
-// resolveConid returns the IBKR contract ID (conid) for the given forex pair.
-// Returns an error if the pair is not in the well-known map.
+// resolveConid returns the IBKR contract ID (conid) for the given symbol.
+// Returns an error if the symbol is not in the well-known map.
 func (c *IBKRClient) resolveConid(pair string) (string, error) {
-	conid, ok := ibkrForexConids[pair]
+	conid, ok := ibkrConids[pair]
 	if !ok {
-		return "", fmt.Errorf("ibkr: unknown forex pair %q (not in static conid map)", pair)
+		return "", fmt.Errorf("ibkr: unknown symbol %q (not in static conid map)", pair)
 	}
 	return conid, nil
 }

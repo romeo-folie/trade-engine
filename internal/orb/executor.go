@@ -17,6 +17,7 @@ type BracketParams struct {
 	StopLoss   float64
 	TakeProfit float64
 	Qty        int
+	SecType    string // for IBKR: "CASH" (forex) or "CFD" (metals)
 }
 
 // ComputeBracket derives entry/stop/target from an opening range and config.
@@ -67,13 +68,14 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 	}
 }
 
-// ComputeForexBracket derives entry/stop/target from an opening range for forex.
+// ComputeForexBracket derives entry/stop/target from an opening range for forex/CFD instruments.
 // Uses an absolute pip buffer instead of the percentage-based buffer used by
 // ComputeBracket for equities. Position sizing respects MaxRiskPct and
 // MaxPositionPct, and is rounded down to the nearest lot size.
-func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.ForexORBConfig) BracketParams {
+// Per-instrument values (PipBuffer, MinLotSize, SecType) are taken from inst.
+func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) BracketParams {
 	var entryStop, stopLoss, takeProfit float64
-	pip := cfg.PipBuffer // e.g. 0.0002 for EUR/USD (2 pips)
+	pip := inst.PipBuffer // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
 
 	if side == "buy" {
 		entryStop = r.High + pip
@@ -95,7 +97,7 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
 
 	// Round down to lot size
-	lotSize := int(cfg.MinLotSize)
+	lotSize := int(inst.MinLotSize)
 	if lotSize > 0 {
 		qty = (qty / lotSize) * lotSize
 		if qty < lotSize {
@@ -127,6 +129,7 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		StopLoss:   stopLoss,
 		TakeProfit: takeProfit,
 		Qty:        qty,
+		SecType:    inst.SecType,
 	}
 }
 
@@ -141,6 +144,7 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 		OrderClass:      "bracket",
 		TakeProfitPrice: params.TakeProfit,
 		StopLossPrice:   params.StopLoss,
+		SecType:         params.SecType,
 	}
 	result, err := executor.PlaceOrder(ctx, req)
 	if err != nil {

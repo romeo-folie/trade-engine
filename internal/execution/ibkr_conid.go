@@ -6,8 +6,9 @@ import (
 	"strings"
 )
 
-// forexConids contains well-known IBKR contract IDs for major forex pairs on IDEALPRO.
-var forexConids = map[string]string{
+// ibkrConids contains well-known IBKR contract IDs for forex pairs and CFD instruments.
+var ibkrConids = map[string]string{
+	// Forex (CASH on IDEALPRO)
 	"EUR/USD": "12087792",
 	"GBP/USD": "12087797",
 	"USD/JPY": "12087802",
@@ -16,16 +17,20 @@ var forexConids = map[string]string{
 	"USD/CAD": "12087817",
 	"NZD/USD": "15016065",
 	"EUR/GBP": "12087811",
+	// Metals (CFD)
+	"XAU/USD": "69067924",
+	"XAG/USD": "69067925",
 }
 
-// resolveConid returns the IBKR contract ID (conid) for a forex pair such as "EUR/USD".
+// resolveConid returns the IBKR contract ID (conid) for a symbol such as "EUR/USD" or "XAU/USD".
+// The secType parameter is used only for the API search fallback (e.g. "CASH" or "CFD").
 // Resolution order:
 //  1. Hardcoded map (no network round-trip).
 //  2. In-process cache populated by previous API lookups.
 //  3. IBKR secdef search API.
-func (b *IBKRBroker) resolveConid(ctx context.Context, pair string) (string, error) {
+func (b *IBKRBroker) resolveConid(ctx context.Context, pair string, secType string) (string, error) {
 	// 1. Hardcoded map.
-	if conid, ok := forexConids[pair]; ok {
+	if conid, ok := ibkrConids[pair]; ok {
 		return conid, nil
 	}
 
@@ -40,9 +45,14 @@ func (b *IBKRBroker) resolveConid(ctx context.Context, pair string) (string, err
 	// 3. API search.
 	parts := strings.SplitN(pair, "/", 2)
 	if len(parts) != 2 {
-		return "", fmt.Errorf("invalid forex pair %q: expected BASE/QUOTE format", pair)
+		return "", fmt.Errorf("invalid pair %q: expected BASE/QUOTE format", pair)
 	}
 	base := parts[0]
+
+	// Default to CASH if secType is not specified.
+	if secType == "" {
+		secType = "CASH"
+	}
 
 	var results []struct {
 		Conid       int    `json:"conid"`
@@ -50,7 +60,7 @@ func (b *IBKRBroker) resolveConid(ctx context.Context, pair string) (string, err
 		Description string `json:"description"`
 		Exchange    string `json:"exchange"`
 	}
-	path := "/iserver/secdef/search?symbol=" + base + "&secType=CASH"
+	path := "/iserver/secdef/search?symbol=" + base + "&secType=" + secType
 	if err := b.do(ctx, "GET", path, nil, &results); err != nil {
 		return "", fmt.Errorf("ibkr resolveConid: search %q: %w", pair, err)
 	}

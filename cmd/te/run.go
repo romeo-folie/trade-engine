@@ -261,7 +261,7 @@ Modes:
 			orbCfg := config.ORBConfig{
 				Enabled:        cfg.ForexORB.Enabled,
 				Mode:           "paper",
-				MaxCandidates:  len(cfg.ForexORB.Pairs),
+				MaxCandidates:  len(cfg.ForexORB.Instruments),
 				RangeMinutes:   cfg.ForexORB.RangeMinutes,
 				RiskReward:     cfg.ForexORB.RiskReward,
 				MaxRiskPct:     cfg.ForexORB.MaxRiskPct,
@@ -276,9 +276,9 @@ Modes:
 
 			// 9. Wire forex-specific config and scanner.
 			forexScanner := &orb.ForexCandidateScanner{
-				Pairs:      cfg.ForexORB.Pairs,
-				MarketData: ibkrData,
-				Cfg:        cfg.ForexORB,
+				Instruments: cfg.ForexORB.Instruments,
+				MarketData:  ibkrData,
+				Cfg:         cfg.ForexORB,
 			}
 			orbScheduler.SetScanner(forexScanner)
 			orbScheduler.SetForexConfig(&cfg.ForexORB)

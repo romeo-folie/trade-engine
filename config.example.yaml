@@ -313,12 +313,26 @@ orb:
 
 # forex_orb:
 #   enabled: false
-#   pairs: ["EUR/USD", "GBP/USD"]
-#   session: london          # london | newyork | both
+#   instruments:
+#     - symbol: EUR/USD
+#       sec_type: CASH
+#       min_lot_size: 20000
+#       pip_buffer: 0.0002
+#     - symbol: GBP/USD
+#       sec_type: CASH
+#       min_lot_size: 20000
+#       pip_buffer: 0.0002
+#     - symbol: XAU/USD
+#       sec_type: CFD
+#       min_lot_size: 1
+#       pip_buffer: 0.50
+#     - symbol: XAG/USD
+#       sec_type: CFD
+#       min_lot_size: 50
+#       pip_buffer: 0.01
+#   session: london
 #   timezone: UTC
 #   range_minutes: 15
 #   risk_reward: 2.0
 #   max_risk_pct: 1.0
 #   max_position_pct: 10.0
-#   min_lot_size: 20000
-#   pip_buffer: 0.0002

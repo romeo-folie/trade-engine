@@ -280,16 +280,17 @@ func Defaults() *Config {
 			ScanCadenceMinutes: 2,
 		},
 		ForexORB: ForexORBConfig{
-			Enabled:        false,
-			Pairs:          []string{"EUR/USD", "GBP/USD"},
+			Enabled: false,
+			Instruments: []Instrument{
+				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
+				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
+			},
 			Session:        "london",
 			Timezone:       "UTC",
 			RangeMinutes:   15,
 			RiskReward:     2.0,
 			MaxRiskPct:     1.0,
 			MaxPositionPct: 10.0,
-			MinLotSize:     20000,
-			PipBuffer:      0.0002,
 		},
 	}
 }
