@@ -52,6 +52,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			toPromptCandles(req.RecentCandles), toPromptIndicators(req.Indicators),
 			toPromptNews(req.News), toPromptPortfolio(req.Portfolio),
 			req.KnowledgeContext, toPromptSimilarSetups(req.SimilarAnalyses),
+			req.PerformanceContext,
 		)
 	}
 	rawPrompt := systemPrompt + "\n\n---\n\n" + userMessage

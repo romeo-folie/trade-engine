@@ -17,6 +17,7 @@ func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 		Portfolio{},
 		"",  // knowledgeContext — empty for unit test
 		nil, // similarSetups — empty for unit test
+		"",  // performanceContext — empty for unit test
 	)
 
 	checks := []string{

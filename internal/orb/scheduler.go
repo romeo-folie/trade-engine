@@ -17,6 +17,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -90,11 +91,12 @@ type ORBScheduler struct {
 	executor   execution.Executor
 	portfolio  PortfolioValuer
 	notifier   Notifier
-	news       data.NewsProvider    // optional; nil disables news enrichment
-	bus        *events.Bus          // optional; nil means no event publishing
-	now        func() time.Time     // injectable for tests
-	scanner    CandidateScanner     // optional; nil uses inline equities scanning
-	forexCfg   *config.ForexORBConfig // optional; nil means equities mode
+	news        data.NewsProvider      // optional; nil disables news enrichment
+	bus         *events.Bus            // optional; nil means no event publishing
+	now         func() time.Time       // injectable for tests
+	scanner     CandidateScanner       // optional; nil uses inline equities scanning
+	forexCfg    *config.ForexORBConfig // optional; nil means equities mode
+	feedbackCfg *config.FeedbackConfig // optional; nil disables feedback enrichment
 
 	mu           sync.Mutex // protects state, session, candidates for TUI reads
 	state        State
@@ -152,6 +154,12 @@ func (s *ORBScheduler) SetScanner(scanner CandidateScanner) {
 // Call before Run to switch the scheduler from equities to forex session timing.
 func (s *ORBScheduler) SetForexConfig(cfg *config.ForexORBConfig) {
 	s.forexCfg = cfg
+}
+
+// SetFeedbackConfig wires feedback configuration for ORB prompt enrichment.
+// Call before Run. If not called, prompt enrichment is disabled.
+func (s *ORBScheduler) SetFeedbackConfig(cfg *config.FeedbackConfig) {
+	s.feedbackCfg = cfg
 }
 
 // isForexMode reports whether the scheduler is running in forex mode.
@@ -418,6 +426,12 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 				}
 			}
 
+			var orbPerfCtx string
+			if s.feedbackCfg != nil && s.feedbackCfg.Enabled && s.feedbackCfg.ORBPromptEnrichment {
+				if pc, err := feedback.GetORBPerformanceContext(ctx, gap.Ticker, ""); err == nil {
+					orbPerfCtx = pc
+				}
+			}
 			sysPrompt, userMsg := prompts.BuildORBPrompt(
 				prompts.ORBCandidate{
 					Ticker:        gap.Ticker,
@@ -427,6 +441,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 					PriorClose:    gap.PriorClose,
 				},
 				newsItems,
+				orbPerfCtx,
 			)
 
 			resp, meta, analyzeErr := s.analyzer.Analyze(ctx, analysis.AnalysisRequest{

@@ -136,6 +136,7 @@ func (b *TelegramBot) subscribeEvents(ctx context.Context) {
 		{events.SignalQueued, b.handleSignalQueued},
 		{events.SignalBlocked, b.handleSignalBlocked},
 		{events.ErrorOccurred, b.handleError},
+		{events.FeedbackFlagCreated, b.handleFeedbackFlag},
 	}
 
 	for _, bind := range bindings {
@@ -325,6 +326,30 @@ func (b *TelegramBot) handleError(ev events.Event) {
 	)
 	if err := b.sendMessage(msg, nil); err != nil {
 		logger.Warn("telegram: send error alert failed", "error", err)
+	}
+}
+
+func (b *TelegramBot) handleFeedbackFlag(ev events.Event) {
+	if !b.notifyOn["feedback"] {
+		return
+	}
+	p, ok := ev.Payload.(events.FeedbackFlagCreatedPayload)
+	if !ok {
+		return
+	}
+	var icon string
+	switch p.Severity {
+	case "critical":
+		icon = "[!!!]"
+	case "warning":
+		icon = "[!]"
+	default:
+		icon = "[i]"
+	}
+	msg := fmt.Sprintf("%s *Feedback Alert*\n%s\n\nScope: `%s` / `%s`",
+		icon, p.Message, p.Scope, p.ScopeKey)
+	if err := b.sendMessage(msg, nil); err != nil {
+		logger.Warn("telegram: send feedback flag failed", "error", err)
 	}
 }
 

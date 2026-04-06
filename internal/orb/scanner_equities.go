@@ -79,6 +79,7 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 				PriorClose:    gap.PriorClose,
 			},
 			newsItems,
+			"",
 		)
 
 		resp, meta, analyzeErr := s.Analyzer.Analyze(ctx, analysis.AnalysisRequest{

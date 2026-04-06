@@ -33,6 +33,7 @@ type Config struct {
 	Cost          CostConfig          `yaml:"cost"`
 	ORB           ORBConfig           `yaml:"orb"`
 	ForexORB      ForexORBConfig      `yaml:"forex_orb"`
+	Feedback      FeedbackConfig      `yaml:"feedback"`
 }
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
@@ -433,6 +434,24 @@ type ForexORBConfig struct {
 	RiskReward     float64      `yaml:"risk_reward"`
 	MaxRiskPct     float64      `yaml:"max_risk_pct"`
 	MaxPositionPct float64      `yaml:"max_position_pct"`
+}
+
+// FeedbackConfig controls the automated feedback pipeline (Phase 17).
+type FeedbackConfig struct {
+	Enabled             bool               `yaml:"enabled"`
+	ReviewTimeUTC       string             `yaml:"review_time_utc"`
+	Windows             []int              `yaml:"windows"`
+	PromptEnrichment    bool               `yaml:"prompt_enrichment"`
+	ORBPromptEnrichment bool               `yaml:"orb_prompt_enrichment"`
+	Thresholds          FeedbackThresholds `yaml:"thresholds"`
+}
+
+type FeedbackThresholds struct {
+	ModelWinRateMin        float64 `yaml:"model_win_rate_min"`
+	ModelMinTrades         int     `yaml:"model_min_trades"`
+	InstrumentWinRateMin   float64 `yaml:"instrument_win_rate_min"`
+	InstrumentMinTrades    int     `yaml:"instrument_min_trades"`
+	ArbiterOverrideRateMax float64 `yaml:"arbiter_override_rate_max"`
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).

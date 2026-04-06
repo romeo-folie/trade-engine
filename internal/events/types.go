@@ -29,6 +29,7 @@ const (
 	NewsEnriched           Type = "news.enriched"
 	ErrorOccurred          Type = "error"
 	TickStarted            Type = "tick.started"
+	FeedbackFlagCreated    Type = "feedback.flag_created"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -219,4 +220,13 @@ type ErrorPayload struct {
 // TickStartedPayload is emitted at the very start of each engine tick.
 // Frontend uses this as a cycle boundary to reset pipeline node card state.
 type TickStartedPayload struct{}
+
+// FeedbackFlagCreatedPayload is emitted when a new feedback flag is raised.
+type FeedbackFlagCreatedPayload struct {
+	FlagID   string `json:"flag_id"`
+	Scope    string `json:"scope"`
+	ScopeKey string `json:"scope_key"`
+	Severity string `json:"severity"`
+	Message  string `json:"message"`
+}
 

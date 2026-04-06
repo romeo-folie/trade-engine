@@ -292,5 +292,19 @@ func Defaults() *Config {
 			MaxRiskPct:     1.0,
 			MaxPositionPct: 10.0,
 		},
+		Feedback: FeedbackConfig{
+			Enabled:             false,
+			ReviewTimeUTC:       "18:00",
+			Windows:             []int{1, 7, 30},
+			PromptEnrichment:    true,
+			ORBPromptEnrichment: true,
+			Thresholds: FeedbackThresholds{
+				ModelWinRateMin:        0.40,
+				ModelMinTrades:         20,
+				InstrumentWinRateMin:   0.35,
+				InstrumentMinTrades:    10,
+				ArbiterOverrideRateMax: 0.50,
+			},
+		},
 	}
 }

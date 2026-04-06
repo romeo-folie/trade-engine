@@ -18,6 +18,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/orb"
@@ -195,6 +196,15 @@ Modes:
 				orbScheduler.SetNewsProvider(newsProvider)
 			}
 			orbScheduler.SetBus(orbBus)
+			if cfg.Feedback.Enabled {
+				orbScheduler.SetFeedbackConfig(&cfg.Feedback)
+				reviewer := feedback.NewReviewer(cfg.Feedback, orbBus, store.GetDB())
+				go func() {
+					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
+						fmt.Printf("feedback reviewer: %v\n", err)
+					}
+				}()
+			}
 
 			if runWeb {
 				webSrv := web.NewServer(web.Config{
@@ -288,6 +298,15 @@ Modes:
 				orbScheduler.SetNewsProvider(newsProvider)
 			}
 			orbScheduler.SetBus(orbBus)
+			if cfg.Feedback.Enabled {
+				orbScheduler.SetFeedbackConfig(&cfg.Feedback)
+				reviewer := feedback.NewReviewer(cfg.Feedback, orbBus, store.GetDB())
+				go func() {
+					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
+						fmt.Printf("feedback reviewer: %v\n", err)
+					}
+				}()
+			}
 
 			// 11. Run.
 			logger.Info("ORB-Forex scheduler starting")

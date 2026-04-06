@@ -45,7 +45,7 @@ Rules:
 - Be conservative — most gap candidates should be skipped`
 
 // BuildORBPrompt constructs the system and user prompts for ORB catalyst scoring.
-func BuildORBPrompt(candidate ORBCandidate, news []ORBNewsItem) (systemPrompt, userMessage string) {
+func BuildORBPrompt(candidate ORBCandidate, news []ORBNewsItem, orbPerformanceContext string) (systemPrompt, userMessage string) {
 	systemPrompt = orbSystemPrompt
 
 	var sb strings.Builder
@@ -74,6 +74,12 @@ func BuildORBPrompt(candidate ORBCandidate, news []ORBNewsItem) (systemPrompt, u
 		sb.WriteString("\n")
 	} else {
 		sb.WriteString("## RECENT NEWS\nNo relevant news found in the past 24 hours.\n\n")
+	}
+
+	if orbPerformanceContext != "" {
+		sb.WriteString("## HISTORICAL ORB PERFORMANCE\n")
+		sb.WriteString(orbPerformanceContext)
+		sb.WriteString("\n")
 	}
 
 	sb.WriteString("## TASK\n")

@@ -336,3 +336,16 @@ orb:
 #   risk_reward: 2.0
 #   max_risk_pct: 1.0
 #   max_position_pct: 10.0
+
+# feedback:
+#   enabled: false
+#   review_time_utc: "18:00"
+#   windows: [1, 7, 30]
+#   prompt_enrichment: true
+#   orb_prompt_enrichment: true
+#   thresholds:
+#     model_win_rate_min: 0.40
+#     model_min_trades: 20
+#     instrument_win_rate_min: 0.35
+#     instrument_min_trades: 10
+#     arbiter_override_rate_max: 0.50
