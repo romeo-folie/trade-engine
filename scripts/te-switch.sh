@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # te-switch.sh — stop the running engine and restart in the specified mode
+#
 # Usage: te-switch.sh [orb|orb-forex|regular] [--session london|newyork]
+#
+# For orb-forex, if --session is omitted the script picks the session
+# automatically based on current UTC hour:
+#   Before 12:00 UTC → london  (London open 08:00 UTC)
+#   12:00 UTC onward → newyork (NY open 13:00 UTC)
 
 set -euo pipefail
 
@@ -24,13 +30,17 @@ case "$MODE" in
     ./te run --mode orb --web --web-port 8080 --detach
     ;;
   orb-forex)
-    if [ -n "$SESSION" ]; then
-      echo "[te-switch] Starting in Forex ORB mode (session: $SESSION)..."
-      ./te run --mode orb-forex --session "$SESSION" --web --web-port 8080 --detach
-    else
-      echo "[te-switch] Starting in Forex ORB mode..."
-      ./te run --mode orb-forex --web --web-port 8080 --detach
+    # Auto-detect session from UTC hour if not specified.
+    if [ -z "$SESSION" ]; then
+      HOUR_UTC=$(date -u +%H)
+      if [ "$HOUR_UTC" -lt 12 ]; then
+        SESSION="london"
+      else
+        SESSION="newyork"
+      fi
     fi
+    echo "[te-switch] Starting in Forex ORB mode (session: $SESSION)..."
+    ./te run --mode orb-forex --session "$SESSION" --web --web-port 8080 --detach
     ;;
   *)
     echo "[te-switch] Starting in regular mode..."
