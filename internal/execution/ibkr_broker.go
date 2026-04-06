@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,7 +41,7 @@ func NewIBKRBroker(cfg config.IBKRConfig) *IBKRBroker {
 	}
 	return &IBKRBroker{
 		accountID:   cfg.AccountID,
-		gatewayURL:  cfg.GatewayURL,
+		gatewayURL:  strings.TrimRight(cfg.GatewayURL, "/"),
 		httpClient:  &http.Client{Timeout: 30 * time.Second, Transport: transport},
 		minInterval: 100 * time.Millisecond,
 		conidCache:  make(map[string]string),

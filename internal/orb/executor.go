@@ -113,11 +113,11 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entryStop))
 		if lotSize > 0 {
 			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
+			if maxQtyByNotional < lotSize {
+				maxQtyByNotional = 0 // cannot trade — min lot exceeds position cap
+			}
 		}
-		if maxQtyByNotional < lotSize && lotSize > 0 {
-			maxQtyByNotional = lotSize
-		}
-		if qty > maxQtyByNotional {
+		if maxQtyByNotional >= 0 && qty > maxQtyByNotional {
 			qty = maxQtyByNotional
 		}
 	}

@@ -137,8 +137,9 @@ func getClosedTradesInRange(ctx context.Context, from, to time.Time) ([]store.Tr
 	return out, rows.Err()
 }
 
-// getFastPathedCountForTrades returns how many trades in the slice had their
-// analysis NOT fast_pathed (i.e. the arbiter was actually invoked).
+// getArbiterInvokedCountForTrades returns how many unique signals in the slice had their
+// analysis NOT fast_pathed (i.e. the arbiter was actually invoked), counting per signal
+// rather than per analysis row to avoid double-counting.
 func getArbiterInvokedCountForTrades(ctx context.Context, trades []store.Trade) (arbitrated int, total int, err error) {
 	// Collect signal IDs from trades that have one.
 	var signalIDs []string
@@ -147,33 +148,26 @@ func getArbiterInvokedCountForTrades(ctx context.Context, trades []store.Trade) 
 			signalIDs = append(signalIDs, t.SignalID)
 		}
 	}
-	total = len(signalIDs)
-	if total == 0 {
+	if len(signalIDs) == 0 {
 		return 0, 0, nil
 	}
 
-	rows, err := store.GetDB().Query(ctx, `
-		SELECT COALESCE(a.fast_pathed, false)
+	// Count unique signals, not individual analysis rows, to avoid inflating counts
+	// when a signal has multiple analysis_ids.
+	err = store.GetDB().QueryRow(ctx, `
+		SELECT COUNT(DISTINCT s.id) FILTER (WHERE a.fast_pathed = false) AS arbitrated,
+		       COUNT(DISTINCT s.id) AS total
 		FROM signals s
-		JOIN analyses a ON a.id = ANY(s.analysis_ids)
-		WHERE s.id = ANY($1)`,
+		JOIN trades t ON t.signal_id = s.id
+		JOIN LATERAL unnest(s.analysis_ids) AS aid ON TRUE
+		JOIN analyses a ON a.id = aid
+		WHERE t.status = 'closed' AND s.id = ANY($1)`,
 		signalIDs,
-	)
+	).Scan(&arbitrated, &total)
 	if err != nil {
-		return 0, total, err
+		return 0, 0, err
 	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var fp bool
-		if err := rows.Scan(&fp); err != nil {
-			return 0, total, err
-		}
-		if !fp {
-			arbitrated++
-		}
-	}
-	return arbitrated, total, rows.Err()
+	return arbitrated, total, nil
 }
 
 // windowLabel converts a window integer (days) to a label like "1d", "7d", "30d".
@@ -319,7 +313,15 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 			if orbStats[ot.Ticker] == nil {
 				orbStats[ot.Ticker] = &tradeStats{}
 			}
-			orbStats[ot.Ticker].add(ot.PnL, 0) // ORBTrade has no PnLPct field
+			// ORBTrade has no PnLPct field — compute it from fill price and quantity.
+			var pnlPct float64
+			if ot.FillPrice > 0 && ot.EntryStop > 0 {
+				notional := ot.FillPrice * float64(ot.Qty)
+				if notional > 0 {
+					pnlPct = ot.PnL / notional * 100
+				}
+			}
+			orbStats[ot.Ticker].add(ot.PnL, pnlPct)
 		}
 
 		for ticker, s := range orbStats {

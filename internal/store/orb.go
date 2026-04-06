@@ -3,20 +3,23 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // ORBSession mirrors a row from the orb_sessions table.
 type ORBSession struct {
-	ID         string
-	Date       time.Time
-	Status     string
-	Candidates json.RawMessage
-	Selected   []string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
+	ID          string
+	Date        time.Time
+	Status      string
+	SessionName string
+	Candidates  json.RawMessage
+	Selected    []string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
 }
 
 // ORBTrade mirrors a row from the orb_trades table.
@@ -37,14 +40,14 @@ type ORBTrade struct {
 	ClosedAt   *time.Time
 }
 
-// CreateORBSession inserts a new ORB session for the given date.
-func CreateORBSession(ctx context.Context, db *pgxpool.Pool, date time.Time) (*ORBSession, error) {
+// CreateORBSession inserts a new ORB session for the given date and session name.
+func CreateORBSession(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName string) (*ORBSession, error) {
 	var s ORBSession
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_sessions (date) VALUES ($1)
-		RETURNING id, date, status, candidates, selected, created_at, updated_at`,
-		date,
-	).Scan(&s.ID, &s.Date, &s.Status, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
+		INSERT INTO orb_sessions (date, session_name) VALUES ($1, $2)
+		RETURNING id, date, status, session_name, candidates, selected, created_at, updated_at`,
+		date, sessionName,
+	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -66,14 +69,18 @@ func UpdateORBSession(ctx context.Context, db *pgxpool.Pool, id, status string, 
 	return err
 }
 
-// GetORBSessionByDate retrieves the ORB session for a given date.
-func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time) (*ORBSession, error) {
+// GetORBSessionByDate retrieves the ORB session for a given date and session name.
+// Returns nil, nil when no session exists for that date/name combination.
+func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName string) (*ORBSession, error) {
 	var s ORBSession
 	err := db.QueryRow(ctx, `
-		SELECT id, date, status, candidates, selected, created_at, updated_at
-		FROM orb_sessions WHERE date=$1`, date,
-	).Scan(&s.ID, &s.Date, &s.Status, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
+		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
+		FROM orb_sessions WHERE date=$1 AND session_name=$2`, date, sessionName,
+	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	return &s, nil
@@ -116,7 +123,7 @@ func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fi
 // GetRecentORBSessions returns up to limit ORB sessions ordered by date descending.
 func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBSession, error) {
 	rows, err := db.Query(ctx, `
-		SELECT id, date, status, candidates, selected, created_at, updated_at
+		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
 		FROM orb_sessions ORDER BY date DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -127,7 +134,7 @@ func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]O
 	for rows.Next() {
 		var s ORBSession
 		if err := rows.Scan(
-			&s.ID, &s.Date, &s.Status, &s.Candidates, &s.Selected,
+			&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected,
 			&s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
 			return nil, err

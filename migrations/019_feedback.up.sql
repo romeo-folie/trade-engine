@@ -1,6 +1,6 @@
 -- Phase 17: Feedback pipeline — performance metrics and alert flags.
 CREATE TABLE feedback_insights (
-    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     date        DATE NOT NULL,
     scope       TEXT NOT NULL,
     scope_key   TEXT NOT NULL,
@@ -16,7 +16,7 @@ CREATE INDEX idx_feedback_insights_lookup
     ON feedback_insights (scope, scope_key, date DESC);
 
 CREATE TABLE feedback_flags (
-    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     date          DATE NOT NULL,
     scope         TEXT NOT NULL,
     scope_key     TEXT NOT NULL,

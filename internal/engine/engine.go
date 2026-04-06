@@ -193,7 +193,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		activeCostProfile: cfg.Cost.Profile,
 	}
 
-	if cfg.Feedback.Enabled {
+	if cfg.Feedback.Enabled && store.IsConnected() {
 		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())
 	}
 

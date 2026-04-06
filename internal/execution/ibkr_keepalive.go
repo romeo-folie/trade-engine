@@ -3,8 +3,9 @@ package execution
 import (
 	"context"
 	"fmt"
-	"log"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
 // CheckAuth verifies that the IBKR Client Portal gateway has an authenticated session.
@@ -47,7 +48,7 @@ func (b *IBKRBroker) StartKeepalive(ctx context.Context, tickleSec int) func() {
 				return
 			case <-ticker.C:
 				if err := b.do(ctx, "POST", "/iserver/auth/tickle", nil, nil); err != nil {
-					log.Printf("[WARN] ibkr keepalive tickle failed: %v", err)
+					logger.Warn("ibkr keepalive tickle failed", "err", err)
 				}
 			}
 		}

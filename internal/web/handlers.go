@@ -848,9 +848,14 @@ func (s *Server) handleORBSessionToday(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	session, err := store.GetORBSessionByDate(ctx, store.GetDB(), today)
+	sessionName := r.URL.Query().Get("session_name")
+	session, err := store.GetORBSessionByDate(ctx, store.GetDB(), today, sessionName)
 	if err != nil {
-		apiNotFound(w, "no orb session found for today")
+		apiError(w, "orb session query failed", err)
+		return
+	}
+	if session == nil {
+		http.Error(w, "no session for today", http.StatusNotFound)
 		return
 	}
 	jsonResponse(w, map[string]any{"session": session})
@@ -956,19 +961,20 @@ func (s *Server) handleORBPerformance(w http.ResponseWriter, r *http.Request) {
 	}
 
 	instruments := make([]instrumentPerf, 0, len(perfByScopeKey))
-	var totalWinRate, totalAvgPnL float64
 	var totalTrades int
+	var weightedWinRate, weightedPnL float64
 	for _, p := range perfByScopeKey {
 		instruments = append(instruments, *p)
-		totalWinRate += p.WinRate
-		totalAvgPnL += p.AvgPnLPct
 		totalTrades += p.TradeCount
+		weightedWinRate += p.WinRate * float64(p.TradeCount)
+		weightedPnL += p.AvgPnLPct * float64(p.TradeCount)
 	}
 
-	var overallWinRate, overallAvgPnL float64
-	if len(instruments) > 0 {
-		overallWinRate = totalWinRate / float64(len(instruments))
-		overallAvgPnL = totalAvgPnL / float64(len(instruments))
+	overallWinRate := 0.0
+	overallAvgPnL := 0.0
+	if totalTrades > 0 {
+		overallWinRate = weightedWinRate / float64(totalTrades)
+		overallAvgPnL = weightedPnL / float64(totalTrades)
 	}
 
 	jsonResponse(w, map[string]any{
@@ -1006,7 +1012,17 @@ func (s *Server) handleORBFlags(w http.ResponseWriter, r *http.Request) {
 	if flags == nil {
 		flags = []store.FeedbackFlag{}
 	}
-	jsonResponse(w, map[string]any{"flags": flags})
+
+	var orbFlags []store.FeedbackFlag
+	for _, f := range flags {
+		if f.Scope == "orb_session" || f.Scope == "instrument" {
+			orbFlags = append(orbFlags, f)
+		}
+	}
+	if orbFlags == nil {
+		orbFlags = []store.FeedbackFlag{}
+	}
+	jsonResponse(w, map[string]any{"flags": orbFlags})
 }
 
 // POST /api/orb/flags/:id/resolve

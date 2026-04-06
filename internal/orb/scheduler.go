@@ -167,6 +167,15 @@ func (s *ORBScheduler) isForexMode() bool {
 	return s.forexCfg != nil && s.forexCfg.Enabled
 }
 
+// sessionName returns the session name used as the uniqueness key for orb_sessions.
+// Equities ORB uses "" (the default). Forex ORB derives the name from the configured session.
+func (s *ORBScheduler) sessionName() string {
+	if s.forexCfg != nil && s.forexCfg.Enabled {
+		return s.forexCfg.Session
+	}
+	return ""
+}
+
 // instrumentForTicker returns the Instrument config for the given ticker symbol,
 // or nil if not found (e.g. in equities mode or ticker not configured).
 func (s *ORBScheduler) instrumentForTicker(ticker string) *config.Instrument {
@@ -310,7 +319,7 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	}
 
 	today := time.Date(sessionNow.Year(), sessionNow.Month(), sessionNow.Day(), 0, 0, 0, 0, sessionTZ)
-	existing, err := store.GetORBSessionByDate(ctx, s.db, today)
+	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
 	if err == nil && existing != nil {
 		if existing.Status == "done" || existing.Status == "skipped" {
 			return nil
@@ -325,7 +334,7 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	s.mu.Unlock()
 
 	if !hasSession {
-		session, err := store.CreateORBSession(ctx, s.db, today)
+		session, err := store.CreateORBSession(ctx, s.db, today, s.sessionName())
 		if err != nil {
 			return fmt.Errorf("create orb session: %w", err)
 		}
@@ -394,7 +403,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 		}
 	} else {
 		// Inline equities scanning: gap movers + LLM scoring
-		gaps, gapErr := data.FetchGapMovers(ctx, s.marketData.(*data.AlpacaClient), s.cfg.GapThresholdPct)
+		alpacaClient, ok := s.marketData.(*data.AlpacaClient)
+		if !ok {
+			return fmt.Errorf("equities scanning requires AlpacaClient as MarketDataProvider; set a CandidateScanner for other providers")
+		}
+		gaps, gapErr := data.FetchGapMovers(ctx, alpacaClient, s.cfg.GapThresholdPct)
 		if gapErr != nil {
 			return fmt.Errorf("scan gap movers: %w", gapErr)
 		}

@@ -64,3 +64,6 @@ tmp/
 node_modules/
 
 internal/web/test_config.yaml
+
+# Claude Code local settings
+.claude/settings.local.json
