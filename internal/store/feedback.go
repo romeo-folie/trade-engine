@@ -40,9 +40,9 @@ type FeedbackFlag struct {
 // (date, scope, scope_key, metric, window).
 func UpsertFeedbackInsight(ctx context.Context, ins FeedbackInsight) error {
 	_, err := GetDB().Exec(ctx, `
-		INSERT INTO feedback_insights (date, scope, scope_key, metric, value, window, trade_count)
+		INSERT INTO feedback_insights (date, scope, scope_key, metric, value, time_window, trade_count)
 		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (date, scope, scope_key, metric, window)
+		ON CONFLICT (date, scope, scope_key, metric, time_window)
 		DO UPDATE SET value = EXCLUDED.value, trade_count = EXCLUDED.trade_count, created_at = NOW()`,
 		ins.Date, ins.Scope, ins.ScopeKey, ins.Metric, ins.Value, ins.Window, ins.TradeCount,
 	)
@@ -66,9 +66,9 @@ func InsertFeedbackFlag(ctx context.Context, flag FeedbackFlag) (string, error) 
 // ordered by date descending.
 func GetFeedbackInsights(ctx context.Context, scope, scopeKey, window string, limit int) ([]FeedbackInsight, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, date, scope, scope_key, metric, value, window, trade_count, created_at
+		SELECT id, date, scope, scope_key, metric, value, time_window, trade_count, created_at
 		FROM feedback_insights
-		WHERE scope = $1 AND scope_key = $2 AND window = $3
+		WHERE scope = $1 AND scope_key = $2 AND time_window = $3
 		ORDER BY date DESC
 		LIMIT $4`,
 		scope, scopeKey, window, limit,
@@ -84,9 +84,9 @@ func GetFeedbackInsights(ctx context.Context, scope, scopeKey, window string, li
 // Used by the nightly reviewer to check computed results.
 func GetLatestFeedbackInsights(ctx context.Context, scope, window string, date time.Time) ([]FeedbackInsight, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT id, date, scope, scope_key, metric, value, window, trade_count, created_at
+		SELECT id, date, scope, scope_key, metric, value, time_window, trade_count, created_at
 		FROM feedback_insights
-		WHERE scope = $1 AND window = $2 AND date = $3`,
+		WHERE scope = $1 AND time_window = $2 AND date = $3`,
 		scope, window, date,
 	)
 	if err != nil {

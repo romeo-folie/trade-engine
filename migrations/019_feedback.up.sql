@@ -6,10 +6,10 @@ CREATE TABLE feedback_insights (
     scope_key   TEXT NOT NULL,
     metric      TEXT NOT NULL,
     value       NUMERIC NOT NULL,
-    window      TEXT NOT NULL,
+    time_window TEXT NOT NULL,
     trade_count INT NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(date, scope, scope_key, metric, window)
+    UNIQUE(date, scope, scope_key, metric, time_window)
 );
 
 CREATE INDEX idx_feedback_insights_lookup
