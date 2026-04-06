@@ -170,17 +170,17 @@ func checkFlags(
 		}
 	}
 
-	// ── Arbiter override rate ────────────────────────────────────────────────
-	if arbIns, ok := getMetric("system", "arbiter", "arbiter_override_rate"); ok {
-		if arbIns.Value > cfg.ArbiterOverrideRateMax {
-			dup, err := store.HasUnresolvedFlag(ctx, date, "system", "arbiter", "arbiter_override_rate")
+	// ── Arbiter invoked rate ────────────────────────────────────────────────
+	if arbIns, ok := getMetric("system", "arbiter", "arbiter_invoked_rate"); ok {
+		if arbIns.Value > cfg.ArbiterInvokedRateMax {
+			dup, err := store.HasUnresolvedFlag(ctx, date, "system", "arbiter", "arbiter_invoked_rate")
 			if err != nil {
-				return fmt.Errorf("feedback: HasUnresolvedFlag arbiter_override_rate: %w", err)
+				return fmt.Errorf("feedback: HasUnresolvedFlag arbiter_invoked_rate: %w", err)
 			}
 			if !dup {
 				msg := fmt.Sprintf(
-					"Arbiter override rate at %.0f%% (threshold: %.0f%%)",
-					arbIns.Value*100, cfg.ArbiterOverrideRateMax*100,
+					"Arbiter invoked rate at %.0f%% (threshold: %.0f%%)",
+					arbIns.Value*100, cfg.ArbiterInvokedRateMax*100,
 				)
 				if err := insertAndPublish(ctx, bus, store.FeedbackFlag{
 					Date:        date,
@@ -188,9 +188,9 @@ func checkFlags(
 					ScopeKey:    "arbiter",
 					Severity:    "info",
 					Message:     msg,
-					Metric:      "arbiter_override_rate",
+					Metric:      "arbiter_invoked_rate",
 					MetricValue: arbIns.Value,
-					Threshold:   cfg.ArbiterOverrideRateMax,
+					Threshold:   cfg.ArbiterInvokedRateMax,
 				}); err != nil {
 					return err
 				}

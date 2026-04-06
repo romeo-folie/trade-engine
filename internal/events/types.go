@@ -259,7 +259,7 @@ type ORBRangeLockedPayload struct {
 
 // ORBTradeUpdatePayload is emitted when an ORB trade is placed or its status changes.
 type ORBTradeUpdatePayload struct {
-	TradeID   string   `json:"trade_id"`
+	OrderID   string   `json:"order_id"`
 	Ticker    string   `json:"ticker"`
 	Side      string   `json:"side"`
 	Status    string   `json:"status"`

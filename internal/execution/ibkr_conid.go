@@ -4,23 +4,13 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/romeo-folie/trade-engine/internal/ibkrconids"
 )
 
-// ibkrConids contains well-known IBKR contract IDs for forex pairs and CFD instruments.
-var ibkrConids = map[string]string{
-	// Forex (CASH on IDEALPRO)
-	"EUR/USD": "12087792",
-	"GBP/USD": "12087797",
-	"USD/JPY": "12087802",
-	"AUD/USD": "15016059",
-	"USD/CHF": "12087820",
-	"USD/CAD": "12087817",
-	"NZD/USD": "15016065",
-	"EUR/GBP": "12087811",
-	// Metals (CFD)
-	"XAU/USD": "69067924",
-	"XAG/USD": "69067925",
-}
+// ibkrConids is the authoritative map of IBKR contract IDs for known instruments,
+// shared with the data package via internal/ibkrconids.
+var ibkrConids = ibkrconids.Conids
 
 // resolveConid returns the IBKR contract ID (conid) for a symbol such as "EUR/USD" or "XAU/USD".
 // The secType parameter is used only for the API search fallback (e.g. "CASH" or "CFD").

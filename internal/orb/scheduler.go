@@ -747,6 +747,10 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 			params = ComputeForexBracket(r, side, portfolioVal, *s.forexCfg, *inst)
+			if params.Qty == 0 {
+				fmt.Printf("orb: skipping %s — min lot size exceeds position cap\n", ticker)
+				continue
+			}
 		} else {
 			params = ComputeBracket(r, side, portfolioVal, s.cfg)
 		}
@@ -763,7 +767,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			Strategy:  "orb",
 		})
 		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-			TradeID: orderID,
+			OrderID: orderID,
 			Ticker:  ticker,
 			Side:    side,
 			Status:  "pending",
@@ -825,7 +829,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
 				}
 				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					TradeID: orderID,
+					OrderID: orderID,
 					Ticker:  ticker,
 					Status:  "cancelled",
 				})

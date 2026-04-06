@@ -303,7 +303,7 @@ func Defaults() *Config {
 				ModelMinTrades:         20,
 				InstrumentWinRateMin:   0.35,
 				InstrumentMinTrades:    10,
-				ArbiterOverrideRateMax: 0.50,
+				ArbiterInvokedRateMax: 0.50,
 			},
 		},
 	}

@@ -420,7 +420,7 @@ type IBKRConfig struct {
 type Instrument struct {
 	Symbol     string  `yaml:"symbol"`       // e.g. "EUR/USD", "XAU/USD"
 	SecType    string  `yaml:"sec_type"`     // "CASH" (forex) or "CFD" (metals)
-	MinLotSize float64 `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
+	MinLotSize int     `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
 	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
 }
 
@@ -451,7 +451,7 @@ type FeedbackThresholds struct {
 	ModelMinTrades         int     `yaml:"model_min_trades"`
 	InstrumentWinRateMin   float64 `yaml:"instrument_win_rate_min"`
 	InstrumentMinTrades    int     `yaml:"instrument_min_trades"`
-	ArbiterOverrideRateMax float64 `yaml:"arbiter_override_rate_max"`
+	ArbiterInvokedRateMax float64 `yaml:"arbiter_invoked_rate_max"`
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).

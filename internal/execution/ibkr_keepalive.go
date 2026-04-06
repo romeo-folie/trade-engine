@@ -34,7 +34,7 @@ func (b *IBKRBroker) CheckAuth(ctx context.Context) error {
 // network blips should not terminate the session.
 func (b *IBKRBroker) StartKeepalive(ctx context.Context, tickleSec int) func() {
 	if tickleSec <= 0 {
-		tickleSec = 240 // IBKR default session timeout is 60 s; tickle every 4 min is safe.
+		tickleSec = 240 // Default to a 4-minute keepalive interval when unspecified.
 	}
 
 	ctx, cancel := context.WithCancel(ctx)

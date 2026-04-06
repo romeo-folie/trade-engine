@@ -175,9 +175,9 @@ func windowLabel(days int) string {
 	return fmt.Sprintf("%dd", days)
 }
 
-// upsert is a small helper to reduce repetition in runReview.
-func upsert(ctx context.Context, date time.Time, scope, scopeKey, metric, window string, value float64, tradeCount int) error {
-	return store.UpsertFeedbackInsight(ctx, store.FeedbackInsight{
+// upsert persists a feedback insight and returns it for accumulation in allInsights.
+func upsert(ctx context.Context, date time.Time, scope, scopeKey, metric, window string, value float64, tradeCount int) (store.FeedbackInsight, error) {
+	ins := store.FeedbackInsight{
 		Date:       date,
 		Scope:      scope,
 		ScopeKey:   scopeKey,
@@ -185,7 +185,8 @@ func upsert(ctx context.Context, date time.Time, scope, scopeKey, metric, window
 		Value:      value,
 		Window:     window,
 		TradeCount: tradeCount,
-	})
+	}
+	return ins, store.UpsertFeedbackInsight(ctx, ins)
 }
 
 // runReview executes the full nightly feedback computation for all configured windows.
@@ -226,80 +227,56 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 
 		// Upsert model metrics.
 		for modelKey, s := range modelStats {
-			ins := []struct {
+			for _, m := range []struct {
 				metric string
 				value  float64
 			}{
 				{"win_rate", s.winRate()},
 				{"avg_pnl_pct", s.avgPnlPct()},
 				{"trade_count", float64(s.total)},
-			}
-			for _, m := range ins {
-				insight := store.FeedbackInsight{
-					Date:       today,
-					Scope:      "model",
-					ScopeKey:   modelKey,
-					Metric:     m.metric,
-					Value:      m.value,
-					Window:     label,
-					TradeCount: s.total,
-				}
-				if err := store.UpsertFeedbackInsight(ctx, insight); err != nil {
+			} {
+				ins, err := upsert(ctx, today, "model", modelKey, m.metric, label, m.value, s.total)
+				if err != nil {
 					return fmt.Errorf("feedback: upsert model insight %s/%s: %w", modelKey, m.metric, err)
 				}
-				allInsights = append(allInsights, insight)
+				allInsights = append(allInsights, ins)
 			}
 		}
 
 		// Upsert instrument metrics.
 		for ticker, s := range instrStats {
-			ins := []struct {
+			for _, m := range []struct {
 				metric string
 				value  float64
 			}{
 				{"win_rate", s.winRate()},
 				{"avg_pnl_pct", s.avgPnlPct()},
 				{"trade_count", float64(s.total)},
-			}
-			for _, m := range ins {
-				insight := store.FeedbackInsight{
-					Date:       today,
-					Scope:      "instrument",
-					ScopeKey:   ticker,
-					Metric:     m.metric,
-					Value:      m.value,
-					Window:     label,
-					TradeCount: s.total,
-				}
-				if err := store.UpsertFeedbackInsight(ctx, insight); err != nil {
+			} {
+				ins, err := upsert(ctx, today, "instrument", ticker, m.metric, label, m.value, s.total)
+				if err != nil {
 					return fmt.Errorf("feedback: upsert instrument insight %s/%s: %w", ticker, m.metric, err)
 				}
-				allInsights = append(allInsights, insight)
+				allInsights = append(allInsights, ins)
 			}
 		}
 
-		// Arbiter override rate.
+		// Arbiter invoked rate: fraction of signals where the arbiter was actually
+		// consulted (fast_pathed=false). This is an "invoked" rate, not an "override"
+		// rate — it reflects how often the arbiter runs, not how often it disagrees.
 		arbitrated, arbTotal, err := getArbiterInvokedCountForTrades(ctx, trades)
 		if err != nil {
 			return fmt.Errorf("feedback: arbiter count window=%s: %w", label, err)
 		}
-		var overrideRate float64
+		var invokedRate float64
 		if arbTotal > 0 {
-			overrideRate = float64(arbitrated) / float64(arbTotal)
+			invokedRate = float64(arbitrated) / float64(arbTotal)
 		}
-		arbInsight := store.FeedbackInsight{
-			Date:       today,
-			Scope:      "system",
-			ScopeKey:   "arbiter",
-			Metric:     "arbiter_override_rate",
-			Value:      overrideRate,
-			Window:     label,
-			TradeCount: arbTotal,
-		}
-		if err := store.UpsertFeedbackInsight(ctx, arbInsight); err != nil {
+		arbIns, err := upsert(ctx, today, "system", "arbiter", "arbiter_invoked_rate", label, invokedRate, arbTotal)
+		if err != nil {
 			return fmt.Errorf("feedback: upsert arbiter insight window=%s: %w", label, err)
 		}
-		allInsights = append(allInsights, arbInsight)
+		allInsights = append(allInsights, arbIns)
 
 		// ── ORB trades ───────────────────────────────────────────────────────
 		orbTrades, err := store.GetClosedORBTradesByDateRange(ctx, r.db, from, to)
@@ -325,28 +302,19 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 		}
 
 		for ticker, s := range orbStats {
-			ins := []struct {
+			for _, m := range []struct {
 				metric string
 				value  float64
 			}{
 				{"win_rate", s.winRate()},
 				{"avg_pnl_pct", s.avgPnlPct()},
 				{"trade_count", float64(s.total)},
-			}
-			for _, m := range ins {
-				insight := store.FeedbackInsight{
-					Date:       today,
-					Scope:      "orb_session",
-					ScopeKey:   ticker,
-					Metric:     m.metric,
-					Value:      m.value,
-					Window:     label,
-					TradeCount: s.total,
-				}
-				if err := store.UpsertFeedbackInsight(ctx, insight); err != nil {
+			} {
+				ins, err := upsert(ctx, today, "orb_session", ticker, m.metric, label, m.value, s.total)
+				if err != nil {
 					return fmt.Errorf("feedback: upsert orb insight %s/%s: %w", ticker, m.metric, err)
 				}
-				allInsights = append(allInsights, insight)
+				allInsights = append(allInsights, ins)
 			}
 		}
 	}
@@ -354,6 +322,3 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 	// Check for threshold violations and raise flags.
 	return checkFlags(ctx, r.bus, r.cfg.Thresholds, today, allInsights)
 }
-
-// suppress unused import warning — upsert helper is used inline
-var _ = upsert

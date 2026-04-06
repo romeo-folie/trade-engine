@@ -97,7 +97,7 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
 
 	// Round down to lot size
-	lotSize := int(inst.MinLotSize)
+	lotSize := inst.MinLotSize
 	if lotSize > 0 {
 		qty = (qty / lotSize) * lotSize
 		if qty < lotSize {
@@ -122,6 +122,8 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		}
 	}
 
+	// If qty is zero after the notional cap, the minimum lot size exceeds the
+	// position limit — signal "cannot trade" so the caller can skip this order.
 	return BracketParams{
 		Ticker:     r.Ticker,
 		Side:       side,

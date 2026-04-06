@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/ibkrconids"
 )
 
 // ibkrTimeframes maps our internal Timeframe constants to IBKR's bar size format.
@@ -33,20 +35,9 @@ var ibkrTimeframeDurations = map[Timeframe]time.Duration{
 }
 
 // Well-known IBKR contract IDs for major forex pairs and CFD instruments.
-var ibkrConids = map[string]string{
-	// Forex (CASH on IDEALPRO)
-	"EUR/USD": "12087792",
-	"GBP/USD": "12087797",
-	"USD/JPY": "12087802",
-	"AUD/USD": "15016059",
-	"USD/CHF": "12087820",
-	"USD/CAD": "12087817",
-	"NZD/USD": "15016065",
-	"EUR/GBP": "12087811",
-	// Metals (CFD)
-	"XAU/USD": "69067924",
-	"XAG/USD": "69067925",
-}
+// The authoritative map lives in internal/ibkrconids and is shared with the
+// execution package to avoid duplication.
+var ibkrConids = ibkrconids.Conids
 
 // IBKRClient implements MarketDataProvider using the IBKR Client Portal REST API.
 // The Client Portal gateway uses cookie-based SSO — no API key headers are needed.

@@ -348,4 +348,4 @@ orb:
 #     model_min_trades: 20
 #     instrument_win_rate_min: 0.35
 #     instrument_min_trades: 10
-#     arbiter_override_rate_max: 0.50
+#     arbiter_invoked_rate_max: 0.50

@@ -53,7 +53,7 @@ internal/
   embeddings/        — pgvector embedding pipeline (OpenAI / Ollama)
   knowledge/         — Entity relationship graph + news enrichment
   reports/           — Self-contained HTML report generation (go-echarts)
-migrations/          — SQL migration files (001–019)
+migrations/          — SQL migration files (001–020)
 docs/                — PRD + implementation plan + local-first embeddings guide
 ```
 
