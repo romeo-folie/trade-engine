@@ -113,6 +113,61 @@ func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fi
 	return err
 }
 
+// GetRecentORBSessions returns up to limit ORB sessions ordered by date descending.
+func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBSession, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, date, status, candidates, selected, created_at, updated_at
+		FROM orb_sessions ORDER BY date DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBSession
+	for rows.Next() {
+		var s ORBSession
+		if err := rows.Scan(
+			&s.ID, &s.Date, &s.Status, &s.Candidates, &s.Selected,
+			&s.CreatedAt, &s.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// GetRecentORBTrades returns up to limit ORB trades ordered by created_at descending.
+func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       created_at, closed_at
+		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.CreatedAt, &t.ClosedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // GetORBTrades returns all trades for a given session.
 func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]ORBTrade, error) {
 	rows, err := db.Query(ctx, `

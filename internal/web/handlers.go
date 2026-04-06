@@ -48,6 +48,13 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
 	mux.HandleFunc("/api/system/config", s.handleSystemConfig)
 	mux.HandleFunc("/api/system/restart", s.handleSystemRestart)
+	mux.HandleFunc("/api/orb/sessions", s.handleORBSessions)
+	mux.HandleFunc("/api/orb/session/today", s.handleORBSessionToday)
+	mux.HandleFunc("/api/orb/trades/recent", s.handleORBRecentTrades)
+	mux.HandleFunc("/api/orb/trades", s.handleORBTrades)
+	mux.HandleFunc("/api/orb/performance", s.handleORBPerformance)
+	mux.HandleFunc("/api/orb/flags", s.handleORBFlags)
+	mux.HandleFunc("/api/orb/flags/", s.handleORBFlagResolve) // POST /api/orb/flags/:id/resolve
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -799,6 +806,236 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+}
+
+// ── ORB handlers ──────────────────────────────────────────────────────────────
+
+// GET /api/orb/sessions?limit=10
+func (s *Server) handleORBSessions(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	limit := 10
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	sessions, err := store.GetRecentORBSessions(ctx, store.GetDB(), limit)
+	if err != nil {
+		apiError(w, "orb sessions query failed", err)
+		return
+	}
+	if sessions == nil {
+		sessions = []store.ORBSession{}
+	}
+	jsonResponse(w, map[string]any{"sessions": sessions})
+}
+
+// GET /api/orb/session/today
+func (s *Server) handleORBSessionToday(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	session, err := store.GetORBSessionByDate(ctx, store.GetDB(), today)
+	if err != nil {
+		apiNotFound(w, "no orb session found for today")
+		return
+	}
+	jsonResponse(w, map[string]any{"session": session})
+}
+
+// GET /api/orb/trades?session_id=<uuid>
+func (s *Server) handleORBTrades(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	sessionID := r.URL.Query().Get("session_id")
+	if sessionID == "" {
+		apiError(w, "session_id required", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	trades, err := store.GetORBTrades(ctx, store.GetDB(), sessionID)
+	if err != nil {
+		apiError(w, "orb trades query failed", err)
+		return
+	}
+	if trades == nil {
+		trades = []store.ORBTrade{}
+	}
+	jsonResponse(w, map[string]any{"trades": trades})
+}
+
+// GET /api/orb/trades/recent?limit=20
+func (s *Server) handleORBRecentTrades(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	trades, err := store.GetRecentORBTrades(ctx, store.GetDB(), limit)
+	if err != nil {
+		apiError(w, "orb recent trades query failed", err)
+		return
+	}
+	if trades == nil {
+		trades = []store.ORBTrade{}
+	}
+	jsonResponse(w, map[string]any{"trades": trades})
+}
+
+// GET /api/orb/performance?window=30d
+func (s *Server) handleORBPerformance(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	window := r.URL.Query().Get("window")
+	if window == "" {
+		window = "30d"
+	}
+
+	now := time.Now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+
+	insights, err := store.GetLatestFeedbackInsights(ctx, "orb_session", window, today)
+	if err != nil {
+		apiError(w, "orb performance query failed", err)
+		return
+	}
+
+	// Group by scope_key and extract metrics per instrument
+	type instrumentPerf struct {
+		Ticker     string  `json:"ticker"`
+		WinRate    float64 `json:"win_rate"`
+		AvgPnLPct  float64 `json:"avg_pnl_pct"`
+		TradeCount int     `json:"trade_count"`
+	}
+	perfByScopeKey := map[string]*instrumentPerf{}
+	for _, ins := range insights {
+		p, ok := perfByScopeKey[ins.ScopeKey]
+		if !ok {
+			p = &instrumentPerf{Ticker: ins.ScopeKey}
+			perfByScopeKey[ins.ScopeKey] = p
+		}
+		switch ins.Metric {
+		case "win_rate":
+			p.WinRate = ins.Value
+		case "avg_pnl_pct":
+			p.AvgPnLPct = ins.Value
+		case "trade_count":
+			p.TradeCount = ins.TradeCount
+		}
+	}
+
+	instruments := make([]instrumentPerf, 0, len(perfByScopeKey))
+	var totalWinRate, totalAvgPnL float64
+	var totalTrades int
+	for _, p := range perfByScopeKey {
+		instruments = append(instruments, *p)
+		totalWinRate += p.WinRate
+		totalAvgPnL += p.AvgPnLPct
+		totalTrades += p.TradeCount
+	}
+
+	var overallWinRate, overallAvgPnL float64
+	if len(instruments) > 0 {
+		overallWinRate = totalWinRate / float64(len(instruments))
+		overallAvgPnL = totalAvgPnL / float64(len(instruments))
+	}
+
+	jsonResponse(w, map[string]any{
+		"instruments": instruments,
+		"overall": map[string]any{
+			"win_rate":    overallWinRate,
+			"avg_pnl_pct": overallAvgPnL,
+			"trade_count": totalTrades,
+			"window":      window,
+		},
+	})
+}
+
+// GET /api/orb/flags?limit=20
+func (s *Server) handleORBFlags(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	flags, err := store.GetActiveFlags(ctx, limit)
+	if err != nil {
+		apiError(w, "orb flags query failed", err)
+		return
+	}
+	if flags == nil {
+		flags = []store.FeedbackFlag{}
+	}
+	jsonResponse(w, map[string]any{"flags": flags})
+}
+
+// POST /api/orb/flags/:id/resolve
+func (s *Server) handleORBFlagResolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+
+	// Extract flag ID: path is /api/orb/flags/<id>/resolve
+	path := strings.TrimPrefix(r.URL.Path, "/api/orb/flags/")
+	id := strings.TrimSuffix(path, "/resolve")
+	if id == "" || id == path {
+		http.Error(w, "expected /api/orb/flags/{id}/resolve", http.StatusBadRequest)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := store.ResolveFlag(ctx, id); err != nil {
+		apiError(w, "resolve flag failed", err)
+		return
+	}
+	jsonResponse(w, map[string]string{"status": "ok"})
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

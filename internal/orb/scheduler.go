@@ -335,6 +335,16 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	}
 
 	s.setState(StateScanning)
+	s.mu.Lock()
+	session := s.session
+	s.mu.Unlock()
+	if session != nil {
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State:     string(StateScanning),
+			SessionID: session.ID,
+			Date:      session.Date.Format("2006-01-02"),
+		})
+	}
 	return nil
 }
 
@@ -359,6 +369,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
 				return fmt.Errorf("update session to skipped: %w", err)
 			}
+			s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+				State:     string(StateDone),
+				SessionID: session.ID,
+				Date:      session.Date.Format("2006-01-02"),
+			})
 		}
 		return nil
 	}
@@ -511,6 +526,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			if err := store.UpdateORBSession(ctx, s.db, session.ID, "skipped", nil, nil); err != nil {
 				return fmt.Errorf("update session to skipped: %w", err)
 			}
+			s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+				State:     string(StateDone),
+				SessionID: session.ID,
+				Date:      session.Date.Format("2006-01-02"),
+			})
 		}
 		return nil
 	}
@@ -536,6 +556,22 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	s.notify(ctx, sb.String())
 
 	s.setState(StateCandidateReady)
+	s.mu.Lock()
+	pubSession := s.session
+	pubCandidates := s.candidates
+	s.mu.Unlock()
+	if pubSession != nil {
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State:     string(StateCandidateReady),
+			SessionID: pubSession.ID,
+			Date:      pubSession.Date.Format("2006-01-02"),
+		})
+		s.publish(events.ORBCandidatesReady, events.ORBCandidatesReadyPayload{
+			SessionID:  pubSession.ID,
+			Candidates: pubCandidates,
+			Selected:   selectedTickers,
+		})
+	}
 	for _, sc := range selected {
 		s.publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
 			Ticker:     sc.Gap.Ticker,
@@ -570,6 +606,16 @@ func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) err
 		return fmt.Errorf("update session to range_watch: %w", err)
 	}
 	s.setState(StateRangeWatch)
+	s.mu.Lock()
+	rwSession := s.session
+	s.mu.Unlock()
+	if rwSession != nil {
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State:     string(StateRangeWatch),
+			SessionID: rwSession.ID,
+			Date:      rwSession.Date.Format("2006-01-02"),
+		})
+	}
 	return nil
 }
 
@@ -596,6 +642,15 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 		for _, c := range candles {
 			locked, _ := buf.Add(c)
 			if locked {
+				r := buf.Range()
+				if r != nil {
+					s.publish(events.ORBRangeLocked, events.ORBRangeLockedPayload{
+						Ticker:       ticker,
+						RangeHigh:    r.High,
+						RangeLow:     r.Low,
+						RangeMinutes: s.cfg.RangeMinutes,
+					})
+				}
 				break
 			}
 		}
@@ -609,11 +664,17 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 		sessionID := s.session.ID
 		sessionCandidates := s.session.Candidates
 		sessionSelected := s.session.Selected
+		exSession := s.session
 		s.mu.Unlock()
 		if err := store.UpdateORBSession(ctx, s.db, sessionID, "executing", sessionCandidates, sessionSelected); err != nil {
 			return fmt.Errorf("update session to executing: %w", err)
 		}
 		s.setState(StateExecuting)
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State:     string(StateExecuting),
+			SessionID: exSession.ID,
+			Date:      exSession.Date.Format("2006-01-02"),
+		})
 	}
 	return nil
 }
@@ -622,6 +683,16 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	if s.executor == nil {
 		s.notify(ctx, "ORB: No broker configured — cannot place bracket orders.")
 		s.setState(StateDone)
+		s.mu.Lock()
+		noExecSession := s.session
+		s.mu.Unlock()
+		if noExecSession != nil {
+			s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+				State:     string(StateDone),
+				SessionID: noExecSession.ID,
+				Date:      noExecSession.Date.Format("2006-01-02"),
+			})
+		}
 		return nil
 	}
 
@@ -678,6 +749,12 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			Direction: side,
 			Strategy:  "orb",
 		})
+		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+			TradeID: orderID,
+			Ticker:  ticker,
+			Side:    side,
+			Status:  "pending",
+		})
 
 		if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
 			SessionID:  sessionID,
@@ -702,6 +779,16 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	}
 
 	s.setState(StateDone)
+	s.mu.Lock()
+	doneSession := s.session
+	s.mu.Unlock()
+	if doneSession != nil {
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State:     string(StateDone),
+			SessionID: doneSession.ID,
+			Date:      doneSession.Date.Format("2006-01-02"),
+		})
+	}
 	return nil
 }
 
@@ -724,6 +811,11 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 				if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
 					fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
 				}
+				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+					TradeID: orderID,
+					Ticker:  ticker,
+					Status:  "cancelled",
+				})
 			}
 		}
 
@@ -745,6 +837,10 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.orderIDs = make(map[string]string)
 		s.state = StateIdle
 		s.mu.Unlock()
+
+		s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+			State: string(StateIdle),
+		})
 	}
 	return nil
 }

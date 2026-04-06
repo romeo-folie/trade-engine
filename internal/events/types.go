@@ -30,6 +30,10 @@ const (
 	ErrorOccurred          Type = "error"
 	TickStarted            Type = "tick.started"
 	FeedbackFlagCreated    Type = "feedback.flag_created"
+	ORBStateChanged        Type = "orb.state_changed"
+	ORBCandidatesReady     Type = "orb.candidates_ready"
+	ORBRangeLocked         Type = "orb.range_locked"
+	ORBTradeUpdate         Type = "orb.trade_update"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -228,5 +232,37 @@ type FeedbackFlagCreatedPayload struct {
 	ScopeKey string `json:"scope_key"`
 	Severity string `json:"severity"`
 	Message  string `json:"message"`
+}
+
+// ORBStateChangedPayload is emitted when the ORB scheduler transitions to a new state.
+type ORBStateChangedPayload struct {
+	State     string `json:"state"`
+	SessionID string `json:"session_id"`
+	Date      string `json:"date"`
+}
+
+// ORBCandidatesReadyPayload is emitted when ORB candidates are selected and persisted.
+type ORBCandidatesReadyPayload struct {
+	SessionID  string   `json:"session_id"`
+	Candidates any      `json:"candidates"` // []ScoredCandidate serialized
+	Selected   []string `json:"selected"`
+}
+
+// ORBRangeLockedPayload is emitted when an opening range is locked for a ticker.
+type ORBRangeLockedPayload struct {
+	Ticker       string  `json:"ticker"`
+	RangeHigh    float64 `json:"range_high"`
+	RangeLow     float64 `json:"range_low"`
+	RangeMinutes int     `json:"range_minutes"`
+}
+
+// ORBTradeUpdatePayload is emitted when an ORB trade is placed or its status changes.
+type ORBTradeUpdatePayload struct {
+	TradeID   string   `json:"trade_id"`
+	Ticker    string   `json:"ticker"`
+	Side      string   `json:"side"`
+	Status    string   `json:"status"`
+	FillPrice float64  `json:"fill_price,omitempty"`
+	PnL       *float64 `json:"pnl,omitempty"`
 }
 
