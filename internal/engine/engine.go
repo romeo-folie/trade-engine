@@ -20,6 +20,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/knowledge"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -98,6 +99,8 @@ type Engine struct {
 	// lastDailySummaryUpdate tracks when updateDailySummary last ran to throttle
 	// the expensive DB query + upsert cycle.
 	lastDailySummaryUpdate time.Time
+
+	feedbackReviewer *feedback.Reviewer
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -172,7 +175,7 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	tracker := cost.NewTracker()
 	guardrail := cost.NewGuardrail(&cfg.Cost, tracker, nil) // notifier set later via SetCostNotifier
 
-	return &Engine{
+	e := &Engine{
 		cfg:               cfg,
 		marketData:        market,
 		analyzer:          az,
@@ -189,6 +192,12 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		costGuardrail:     guardrail,
 		activeCostProfile: cfg.Cost.Profile,
 	}
+
+	if cfg.Feedback.Enabled && store.IsConnected() {
+		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())
+	}
+
+	return e
 }
 
 // Run starts the engine loop. It blocks until ctx is cancelled.
@@ -234,6 +243,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	if store.IsConnected() {
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
+	}
+
+	if e.feedbackReviewer != nil {
+		go func() {
+			if err := e.feedbackReviewer.Run(ctx); err != nil && err != context.Canceled {
+				fmt.Printf("feedback reviewer: %v\n", err)
+			}
+		}()
 	}
 
 	logger.Info("engine loop started", "interval_sec", e.cfg.Engine.TickIntervalSec, "mode", e.mode)
@@ -700,13 +717,21 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		}
 	}
 
+	var performanceCtx string
+	if e.cfg.Feedback.Enabled && e.cfg.Feedback.PromptEnrichment {
+		if pc, err := feedback.GetPerformanceContext(ctx, ticker); err == nil {
+			performanceCtx = pc
+		}
+	}
+
 	req := analysis.AnalysisRequest{
-		Ticker:           ticker,
-		Strategy:         strategy,
-		Timeframe:        timeframe,
-		RecentCandles:    snaps,
-		KnowledgeContext: knowledgeCtx,
-		SimilarAnalyses:  similarSetups,
+		Ticker:             ticker,
+		Strategy:           strategy,
+		Timeframe:          timeframe,
+		RecentCandles:      snaps,
+		KnowledgeContext:   knowledgeCtx,
+		SimilarAnalyses:    similarSetups,
+		PerformanceContext: performanceCtx,
 		Indicators: analysis.IndicatorSnapshot{
 			EMA20: set.EMA20, EMA50: set.EMA50, EMA200: set.EMA200,
 			SMA20: set.SMA20, SMA50: set.SMA50, SMA200: set.SMA200,

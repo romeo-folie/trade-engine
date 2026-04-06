@@ -124,6 +124,12 @@ func Defaults() *Config {
 				BaseURL:   "https://paper-api.alpaca.markets",
 				DataURL:   "https://data.alpaca.markets",
 			},
+			IBKR: IBKRConfig{
+				Enabled:     false,
+				GatewayURL:  "https://localhost:5000",
+				TickleSec:   240,
+				InsecureTLS: true,
+			},
 			News: NewsAPIConfig{
 				Provider:                     "finnhub",
 				APIKeyEnv:                    "FINNHUB_API_KEY",
@@ -272,6 +278,33 @@ func Defaults() *Config {
 			MaxPositionPct:    10.0, // hard cap: notional <= 10% of portfolio per trade
 			NewsLookbackHours:  24,
 			ScanCadenceMinutes: 2,
+		},
+		ForexORB: ForexORBConfig{
+			Enabled: false,
+			Instruments: []Instrument{
+				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
+				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
+			},
+			Session:        "london",
+			Timezone:       "UTC",
+			RangeMinutes:   15,
+			RiskReward:     2.0,
+			MaxRiskPct:     1.0,
+			MaxPositionPct: 10.0,
+		},
+		Feedback: FeedbackConfig{
+			Enabled:             false,
+			ReviewTimeUTC:       "18:00",
+			Windows:             []int{1, 7, 30},
+			PromptEnrichment:    true,
+			ORBPromptEnrichment: true,
+			Thresholds: FeedbackThresholds{
+				ModelWinRateMin:        0.40,
+				ModelMinTrades:         20,
+				InstrumentWinRateMin:   0.35,
+				InstrumentMinTrades:    10,
+				ArbiterInvokedRateMax: 0.50,
+			},
 		},
 	}
 }

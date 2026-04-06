@@ -32,6 +32,8 @@ type Config struct {
 	Analysis      AnalysisConfig      `yaml:"analysis"`
 	Cost          CostConfig          `yaml:"cost"`
 	ORB           ORBConfig           `yaml:"orb"`
+	ForexORB      ForexORBConfig      `yaml:"forex_orb"`
+	Feedback      FeedbackConfig      `yaml:"feedback"`
 }
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
@@ -401,7 +403,55 @@ type ConsensusConfig struct {
 
 type MarketsConfig struct {
 	Stocks StocksConfig  `yaml:"stocks"`
+	IBKR   IBKRConfig    `yaml:"ibkr"`
 	News   NewsAPIConfig `yaml:"news"`
+}
+
+// IBKRConfig configures the Interactive Brokers Client Portal gateway connection.
+type IBKRConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	AccountID   string `yaml:"account_id"`
+	GatewayURL  string `yaml:"gateway_url"`  // e.g. "https://localhost:5000"
+	TickleSec   int    `yaml:"tickle_sec"`   // keepalive interval (default 240)
+	InsecureTLS bool   `yaml:"insecure_tls"` // IBKR gateway uses self-signed certs
+}
+
+// Instrument defines a tradeable instrument for forex/CFD ORB.
+type Instrument struct {
+	Symbol     string  `yaml:"symbol"`       // e.g. "EUR/USD", "XAU/USD"
+	SecType    string  `yaml:"sec_type"`     // "CASH" (forex) or "CFD" (metals)
+	MinLotSize int     `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
+	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
+}
+
+// ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
+type ForexORBConfig struct {
+	Enabled        bool         `yaml:"enabled"`
+	Instruments    []Instrument `yaml:"instruments"`
+	Session        string       `yaml:"session"`        // "london" | "newyork" | "both"
+	Timezone       string       `yaml:"timezone"`       // e.g. "UTC" (default)
+	RangeMinutes   int          `yaml:"range_minutes"`  // 15 or 30
+	RiskReward     float64      `yaml:"risk_reward"`
+	MaxRiskPct     float64      `yaml:"max_risk_pct"`
+	MaxPositionPct float64      `yaml:"max_position_pct"`
+}
+
+// FeedbackConfig controls the automated feedback pipeline (Phase 17).
+type FeedbackConfig struct {
+	Enabled             bool               `yaml:"enabled"`
+	ReviewTimeUTC       string             `yaml:"review_time_utc"`
+	Windows             []int              `yaml:"windows"`
+	PromptEnrichment    bool               `yaml:"prompt_enrichment"`
+	ORBPromptEnrichment bool               `yaml:"orb_prompt_enrichment"`
+	Thresholds          FeedbackThresholds `yaml:"thresholds"`
+}
+
+type FeedbackThresholds struct {
+	ModelWinRateMin        float64 `yaml:"model_win_rate_min"`
+	ModelMinTrades         int     `yaml:"model_min_trades"`
+	InstrumentWinRateMin   float64 `yaml:"instrument_win_rate_min"`
+	InstrumentMinTrades    int     `yaml:"instrument_min_trades"`
+	ArbiterInvokedRateMax float64 `yaml:"arbiter_invoked_rate_max"`
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).

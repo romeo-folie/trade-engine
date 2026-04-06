@@ -72,6 +72,7 @@ type SimilarPastSetup struct {
 //  5. Recent news
 //  6. Knowledge graph (placeholder)
 //  7. Similar past analyses (placeholder)
+//  8. Performance context (feedback pipeline)
 func BuildStockPrompt(
 	ticker, strategy, timeframe string,
 	candles []Candle,
@@ -80,9 +81,10 @@ func BuildStockPrompt(
 	portfolio Portfolio,
 	knowledgeContext string,
 	similarSetups []SimilarPastSetup,
+	performanceContext string,
 ) (systemPrompt, userMessage string) {
 	systemPrompt = buildSystem(strategy)
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups)
+	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
 }
 
@@ -118,6 +120,7 @@ func buildUser(
 	portfolio Portfolio,
 	knowledgeContext string,
 	similarSetups []SimilarPastSetup,
+	performanceContext string,
 ) string {
 	var b strings.Builder
 
@@ -204,6 +207,15 @@ func buildUser(
 		}
 	} else {
 		b.WriteString("No similar past setups found.\n")
+	}
+
+	// Performance context section (populated by feedback pipeline Phase 5).
+	b.WriteString("\n### PERFORMANCE CONTEXT\n")
+	if performanceContext != "" {
+		b.WriteString(performanceContext)
+		b.WriteString("\n")
+	} else {
+		b.WriteString("No performance data available.\n")
 	}
 
 	b.WriteString("\nRespond with ONLY the JSON object.")

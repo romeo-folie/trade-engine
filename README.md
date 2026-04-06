@@ -21,6 +21,7 @@ graph TD
     Analysis --> Risk[Risk Manager<br/>internal/risk/]
     Risk --> Executor[Order Executor<br/>internal/execution/]
     Executor -->|paper / live| AlpacaBroker[Alpaca Broker API]
+    Executor -->|forex / CFD| IBKRBroker[IBKR Client Portal API]
     Engine --> Backtest[Backtesting Engine<br/>internal/backtest/]
     Engine --> Knowledge[Knowledge Graph<br/>internal/knowledge/]
     Engine --> Embeddings[Vector Embeddings<br/>internal/embeddings/]
@@ -42,7 +43,9 @@ internal/
   logger/            — Structured slog dual-output (stdout + file)
   analysis/          — Multi-model ensemble analysis (Claude · GPT-4o · Gemini · Ollama)
   risk/              — 7-check risk manager (confidence, R/R, position size, drawdown, …)
-  execution/         — PaperExecutor + AlpacaBroker live executor
+  execution/         — PaperExecutor + AlpacaBroker + IBKRBroker executors
+  orb/               — Opening Range Breakout strategy (equities + forex/CFD)
+  feedback/          — Performance feedback pipeline (nightly review + prompt enrichment)
   portfolio/         — Portfolio tracker + position monitoring
   tui/               — Bubble Tea terminal dashboard
   notify/            — Telegram notifications + signal approval buttons
@@ -50,7 +53,7 @@ internal/
   embeddings/        — pgvector embedding pipeline (OpenAI / Ollama)
   knowledge/         — Entity relationship graph + news enrichment
   reports/           — Self-contained HTML report generation (go-echarts)
-migrations/          — SQL migration files (001–013)
+migrations/          — SQL migration files (001–020)
 docs/                — PRD + implementation plan + local-first embeddings guide
 ```
 
@@ -179,6 +182,43 @@ When Telegram is enabled (`notifications.telegram.enabled: true`), pending manua
 - ❌ Reject
 - 📋 Full Analysis
 
+## Cron Schedule (Production)
+
+The engine runs in distinct modes that cover different markets and sessions. Use separate cron entries to orchestrate them throughout the day. All times are **UTC**.
+
+```
+# ── Forex ORB: London session ────────────────────────────────────
+# Starts 30 min before London open (08:00 UTC) for pre-session setup.
+# The scheduler auto-exits after range lockout + order management.
+30 7 * * 1-5  te run --mode orb-forex --session london --web --web-port 8080
+
+# ── Forex ORB: New York session ──────────────────────────────────
+# Starts 30 min before NY open (13:00 UTC).
+30 12 * * 1-5  te run --mode orb-forex --session newyork --web --web-port 8080
+
+# ── Equities ORB (optional) ──────────────────────────────────────
+# Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
+# Market open is 13:30 UTC (9:30 AM ET). Auto-exits by 14:30 UTC.
+0 10 * * 1-5  te run --mode orb --web --web-port 8080
+
+# ── Standard mode: US equities session ───────────────────────────
+# Runs the full analysis pipeline (ensemble LLM, risk checks, execution).
+# US market hours: 13:30–20:00 UTC (9:30 AM – 4:00 PM ET).
+# Start after ORB modes finish to avoid resource contention.
+0 15 * * 1-5  te run --mode auto
+
+# ── Kill any leftover process before next day ────────────────────
+0 21 * * 1-5  te stop
+```
+
+**Notes:**
+
+- Forex ORB (`orb-forex`) requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
+- The `--session` flag overrides `forex_orb.session` at runtime, so one config file serves both cron entries.
+- Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex ORB since they use different brokers.
+- Standard mode and equities ORB should not overlap — standard mode starts after ORB's 14:30 UTC cutoff.
+- The feedback reviewer runs inside whichever process is active at `feedback.review_time_utc` (default 18:00 UTC).
+
 ## CLI Reference
 
 ```
@@ -216,6 +256,9 @@ te logs search <query>              Search log file
 | 12 | Multi-model ensemble deliberation (Claude · GPT-4o · Gemini · Ollama) | ✅ Complete |
 | 13 | Go-live operational (paper trading run → live switch) | 🔄 In progress |
 | 14 | Web visualisation dashboard | ⏳ Planned |
+| 15 | Opening Range Breakout — equities (Alpaca) | ✅ Complete |
+| 16 | IBKR integration — forex + CFD ORB (EUR/USD, XAU/USD, etc.) | ✅ Complete |
+| 17 | Feedback pipeline — nightly review, flags, prompt enrichment | ✅ Complete |
 
 ## Module READMEs
 

@@ -108,6 +108,16 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	case events.TickStarted:
 		return "engine", "engine", "TickStarted"
 
+	// ── ORB ──────────────────────────────────────────────────────────────
+	case events.ORBStateChanged:
+		return "orb_scheduler", "orb_session", "ORBStateChanged"
+	case events.ORBCandidatesReady:
+		return "orb_scanner", "orb_scheduler", "ORBCandidatesReady"
+	case events.ORBRangeLocked:
+		return "market_data", "orb_scheduler", "ORBRangeLocked"
+	case events.ORBTradeUpdate:
+		return "orb_scheduler", "executor", "ORBTradeUpdate"
+
 	default:
 		return "", "", ""
 	}

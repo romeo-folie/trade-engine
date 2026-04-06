@@ -52,6 +52,11 @@ type AnalysisRequest struct {
 	// when embeddings.similar_analyses_enabled = true.
 	// Empty slice causes the prompt to emit a "not available" placeholder.
 	SimilarAnalyses []SimilarSetup
+
+	// PerformanceContext is a pre-formatted performance feedback block for
+	// injection into the stock prompt's PERFORMANCE CONTEXT section.
+	// Empty string causes the prompt to emit a "not available" placeholder.
+	PerformanceContext string
 }
 
 // SimilarSetup describes a past analysis that resembles the current one,

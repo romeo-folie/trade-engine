@@ -17,6 +17,7 @@ type BracketParams struct {
 	StopLoss   float64
 	TakeProfit float64
 	Qty        int
+	SecType    string // for IBKR: "CASH" (forex) or "CFD" (metals)
 }
 
 // ComputeBracket derives entry/stop/target from an opening range and config.
@@ -67,6 +68,73 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 	}
 }
 
+// ComputeForexBracket derives entry/stop/target from an opening range for forex/CFD instruments.
+// Uses an absolute pip buffer instead of the percentage-based buffer used by
+// ComputeBracket for equities. Position sizing respects MaxRiskPct and
+// MaxPositionPct, and is rounded down to the nearest lot size.
+// Per-instrument values (PipBuffer, MinLotSize, SecType) are taken from inst.
+func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) BracketParams {
+	var entryStop, stopLoss, takeProfit float64
+	pip := inst.PipBuffer // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
+
+	if side == "buy" {
+		entryStop = r.High + pip
+		stopLoss = r.Low - pip
+		risk := entryStop - stopLoss
+		takeProfit = entryStop + risk*cfg.RiskReward
+	} else {
+		entryStop = r.Low - pip
+		stopLoss = r.High + pip
+		risk := stopLoss - entryStop
+		takeProfit = entryStop - risk*cfg.RiskReward
+	}
+
+	riskPerUnit := math.Abs(entryStop - stopLoss)
+	if riskPerUnit < 0.0001 {
+		riskPerUnit = 0.0001
+	}
+	maxRiskDollars := portfolioValue * cfg.MaxRiskPct / 100.0
+	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
+
+	// Round down to lot size
+	lotSize := inst.MinLotSize
+	if lotSize > 0 {
+		qty = (qty / lotSize) * lotSize
+		if qty < lotSize {
+			qty = lotSize
+		}
+	}
+	if qty < 1 {
+		qty = 1
+	}
+
+	// Hard notional cap: qty × entry price must not exceed MaxPositionPct% of portfolio.
+	if cfg.MaxPositionPct > 0 && entryStop > 0 {
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entryStop))
+		if lotSize > 0 {
+			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
+			if maxQtyByNotional < lotSize {
+				maxQtyByNotional = 0 // cannot trade — min lot exceeds position cap
+			}
+		}
+		if maxQtyByNotional >= 0 && qty > maxQtyByNotional {
+			qty = maxQtyByNotional
+		}
+	}
+
+	// If qty is zero after the notional cap, the minimum lot size exceeds the
+	// position limit — signal "cannot trade" so the caller can skip this order.
+	return BracketParams{
+		Ticker:     r.Ticker,
+		Side:       side,
+		EntryStop:  entryStop,
+		StopLoss:   stopLoss,
+		TakeProfit: takeProfit,
+		Qty:        qty,
+		SecType:    inst.SecType,
+	}
+}
+
 // PlaceBracket submits a bracket stop order via the executor.
 func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (string, error) {
 	req := execution.OrderRequest{
@@ -78,6 +146,7 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 		OrderClass:      "bracket",
 		TakeProfitPrice: params.TakeProfit,
 		StopLossPrice:   params.StopLoss,
+		SecType:         params.SecType,
 	}
 	result, err := executor.PlaceOrder(ctx, req)
 	if err != nil {

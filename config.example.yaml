@@ -134,6 +134,13 @@ markets:
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
 
+  # ibkr:
+  #   enabled: false
+  #   account_id: ""
+  #   gateway_url: "https://localhost:5000"
+  #   tickle_sec: 240
+  #   insecure_tls: true
+
   news:
     provider: finnhub             # finnhub | benzinga
     api_key_env: FINNHUB_API_KEY
@@ -303,3 +310,42 @@ orb:
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)
   news_lookback_hours: 24      # How far back to fetch news for catalyst scoring
+
+# forex_orb:
+#   enabled: false
+#   instruments:
+#     - symbol: EUR/USD
+#       sec_type: CASH
+#       min_lot_size: 20000
+#       pip_buffer: 0.0002
+#     - symbol: GBP/USD
+#       sec_type: CASH
+#       min_lot_size: 20000
+#       pip_buffer: 0.0002
+#     - symbol: XAU/USD
+#       sec_type: CFD
+#       min_lot_size: 1
+#       pip_buffer: 0.50
+#     - symbol: XAG/USD
+#       sec_type: CFD
+#       min_lot_size: 50
+#       pip_buffer: 0.01
+#   session: london
+#   timezone: UTC
+#   range_minutes: 15
+#   risk_reward: 2.0
+#   max_risk_pct: 1.0
+#   max_position_pct: 10.0
+
+# feedback:
+#   enabled: false
+#   review_time_utc: "18:00"
+#   windows: [1, 7, 30]
+#   prompt_enrichment: true
+#   orb_prompt_enrichment: true
+#   thresholds:
+#     model_win_rate_min: 0.40
+#     model_min_trades: 20
+#     instrument_win_rate_min: 0.35
+#     instrument_min_trades: 10
+#     arbiter_invoked_rate_max: 0.50
