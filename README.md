@@ -184,28 +184,29 @@ When Telegram is enabled (`notifications.telegram.enabled: true`), pending manua
 
 ## Cron Schedule (Production)
 
-The engine runs in distinct modes that cover different markets and sessions. Use separate cron entries to orchestrate them throughout the day. All times are **UTC**.
+The engine runs in distinct modes that cover different markets and sessions. Each cron entry uses `te-switch.sh` which stops any running process before starting the new mode. All times are **UTC**.
 
 ```
+TE=/path/to/scripts/te-switch.sh
+
 # ── Forex ORB: London session ────────────────────────────────────
 # Starts 30 min before London open (08:00 UTC) for pre-session setup.
-# The scheduler auto-exits after range lockout + order management.
-30 7 * * 1-5  te run --mode orb-forex --session london --web --web-port 8080
+# te-switch.sh stops any running process, then starts the new mode.
+30 7 * * 1-5  $TE orb-forex --session london
 
 # ── Forex ORB: New York session ──────────────────────────────────
 # Starts 30 min before NY open (13:00 UTC).
-30 12 * * 1-5  te run --mode orb-forex --session newyork --web --web-port 8080
+30 12 * * 1-5  $TE orb-forex --session newyork
 
 # ── Equities ORB (optional) ──────────────────────────────────────
 # Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
 # Market open is 13:30 UTC (9:30 AM ET). Auto-exits by 14:30 UTC.
-0 10 * * 1-5  te run --mode orb --web --web-port 8080
+0 10 * * 1-5  $TE orb
 
 # ── Standard mode: US equities session ───────────────────────────
 # Runs the full analysis pipeline (ensemble LLM, risk checks, execution).
 # US market hours: 13:30–20:00 UTC (9:30 AM – 4:00 PM ET).
-# Start after ORB modes finish to avoid resource contention.
-0 15 * * 1-5  te run --mode auto
+0 15 * * 1-5  $TE regular
 
 # ── Kill any leftover process before next day ────────────────────
 0 21 * * 1-5  te stop
@@ -213,8 +214,9 @@ The engine runs in distinct modes that cover different markets and sessions. Use
 
 **Notes:**
 
-- Forex ORB (`orb-forex`) requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
-- The `--session` flag overrides `forex_orb.session` at runtime, so one config file serves both cron entries.
+- `te-switch.sh` runs `te stop` + waits 5 seconds before starting each mode, preventing process collisions.
+- For `orb-forex`, if `--session` is omitted, the script auto-detects from UTC hour (before 12:00 = london, after = newyork).
+- Forex ORB requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
 - Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex ORB since they use different brokers.
 - Standard mode and equities ORB should not overlap — standard mode starts after ORB's 14:30 UTC cutoff.
 - The feedback reviewer runs inside whichever process is active at `feedback.review_time_utc` (default 18:00 UTC).
