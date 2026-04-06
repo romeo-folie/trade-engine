@@ -32,6 +32,7 @@ type Config struct {
 	Analysis      AnalysisConfig      `yaml:"analysis"`
 	Cost          CostConfig          `yaml:"cost"`
 	ORB           ORBConfig           `yaml:"orb"`
+	ForexORB      ForexORBConfig      `yaml:"forex_orb"`
 }
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
@@ -401,7 +402,31 @@ type ConsensusConfig struct {
 
 type MarketsConfig struct {
 	Stocks StocksConfig  `yaml:"stocks"`
+	IBKR   IBKRConfig    `yaml:"ibkr"`
 	News   NewsAPIConfig `yaml:"news"`
+}
+
+// IBKRConfig configures the Interactive Brokers Client Portal gateway connection.
+type IBKRConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	AccountID   string `yaml:"account_id"`
+	GatewayURL  string `yaml:"gateway_url"`  // e.g. "https://localhost:5000"
+	TickleSec   int    `yaml:"tickle_sec"`   // keepalive interval (default 240)
+	InsecureTLS bool   `yaml:"insecure_tls"` // IBKR gateway uses self-signed certs
+}
+
+// ForexORBConfig configures the Opening Range Breakout strategy for forex pairs via IBKR.
+type ForexORBConfig struct {
+	Enabled        bool     `yaml:"enabled"`
+	Pairs          []string `yaml:"pairs"`            // e.g. ["EUR/USD", "GBP/USD"]
+	Session        string   `yaml:"session"`          // "london" | "newyork" | "both"
+	Timezone       string   `yaml:"timezone"`         // e.g. "UTC" (default)
+	RangeMinutes   int      `yaml:"range_minutes"`    // 15 or 30
+	RiskReward     float64  `yaml:"risk_reward"`
+	MaxRiskPct     float64  `yaml:"max_risk_pct"`
+	MaxPositionPct float64  `yaml:"max_position_pct"`
+	MinLotSize     float64  `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD
+	PipBuffer      float64  `yaml:"pip_buffer"`   // absolute pip offset for entry (e.g. 0.0002)
 }
 
 // NewsAPIConfig configures the news data provider (Finnhub or Benzinga).

@@ -134,6 +134,13 @@ markets:
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
 
+  # ibkr:
+  #   enabled: false
+  #   account_id: ""
+  #   gateway_url: "https://localhost:5000"
+  #   tickle_sec: 240
+  #   insecure_tls: true
+
   news:
     provider: finnhub             # finnhub | benzinga
     api_key_env: FINNHUB_API_KEY
@@ -303,3 +310,15 @@ orb:
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)
   news_lookback_hours: 24      # How far back to fetch news for catalyst scoring
+
+# forex_orb:
+#   enabled: false
+#   pairs: ["EUR/USD", "GBP/USD"]
+#   session: london          # london | newyork | both
+#   timezone: UTC
+#   range_minutes: 15
+#   risk_reward: 2.0
+#   max_risk_pct: 1.0
+#   max_position_pct: 10.0
+#   min_lot_size: 20000
+#   pip_buffer: 0.0002

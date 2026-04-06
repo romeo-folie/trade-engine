@@ -67,6 +67,69 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 	}
 }
 
+// ComputeForexBracket derives entry/stop/target from an opening range for forex.
+// Uses an absolute pip buffer instead of the percentage-based buffer used by
+// ComputeBracket for equities. Position sizing respects MaxRiskPct and
+// MaxPositionPct, and is rounded down to the nearest lot size.
+func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.ForexORBConfig) BracketParams {
+	var entryStop, stopLoss, takeProfit float64
+	pip := cfg.PipBuffer // e.g. 0.0002 for EUR/USD (2 pips)
+
+	if side == "buy" {
+		entryStop = r.High + pip
+		stopLoss = r.Low - pip
+		risk := entryStop - stopLoss
+		takeProfit = entryStop + risk*cfg.RiskReward
+	} else {
+		entryStop = r.Low - pip
+		stopLoss = r.High + pip
+		risk := stopLoss - entryStop
+		takeProfit = entryStop - risk*cfg.RiskReward
+	}
+
+	riskPerUnit := math.Abs(entryStop - stopLoss)
+	if riskPerUnit < 0.0001 {
+		riskPerUnit = 0.0001
+	}
+	maxRiskDollars := portfolioValue * cfg.MaxRiskPct / 100.0
+	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
+
+	// Round down to lot size
+	lotSize := int(cfg.MinLotSize)
+	if lotSize > 0 {
+		qty = (qty / lotSize) * lotSize
+		if qty < lotSize {
+			qty = lotSize
+		}
+	}
+	if qty < 1 {
+		qty = 1
+	}
+
+	// Hard notional cap: qty × entry price must not exceed MaxPositionPct% of portfolio.
+	if cfg.MaxPositionPct > 0 && entryStop > 0 {
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entryStop))
+		if lotSize > 0 {
+			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
+		}
+		if maxQtyByNotional < lotSize && lotSize > 0 {
+			maxQtyByNotional = lotSize
+		}
+		if qty > maxQtyByNotional {
+			qty = maxQtyByNotional
+		}
+	}
+
+	return BracketParams{
+		Ticker:     r.Ticker,
+		Side:       side,
+		EntryStop:  entryStop,
+		StopLoss:   stopLoss,
+		TakeProfit: takeProfit,
+		Qty:        qty,
+	}
+}
+
 // PlaceBracket submits a bracket stop order via the executor.
 func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (string, error) {
 	req := execution.OrderRequest{

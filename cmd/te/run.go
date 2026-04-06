@@ -43,10 +43,11 @@ The engine polls the watchlist on each tick, runs LLM analysis, and
 manages signals and trades according to the active mode.
 
 Modes:
-  manual  — signals are queued as pending; require approval
-  auto    — signals that pass risk checks execute automatically
-  paper   — paper trades on Alpaca paper API (default)
-  orb     — Opening Range Breakout mode (LLM-enhanced gap-and-go)`,
+  manual     — signals are queued as pending; require approval
+  auto       — signals that pass risk checks execute automatically
+  paper      — paper trades on Alpaca paper API (default)
+  orb        — Opening Range Breakout mode (LLM-enhanced gap-and-go)
+  orb-forex  — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if runDetach {
 			return startDetachedRun()
@@ -216,6 +217,85 @@ Modes:
 				return fmt.Errorf("orb scheduler: %w", err)
 			}
 			fmt.Println("TradeEngine (ORB) stopped.")
+			return nil
+		}
+
+		// ORB-Forex mode: run the ORB scheduler with IBKR and forex-specific components.
+		if mode == "orb-forex" {
+			// 1. Validate IBKR config.
+			if !cfg.Markets.IBKR.Enabled {
+				return fmt.Errorf("orb-forex mode requires markets.ibkr.enabled=true")
+			}
+			if !cfg.ForexORB.Enabled {
+				return fmt.Errorf("orb-forex mode requires forex_orb.enabled=true")
+			}
+			if cfg.Markets.IBKR.AccountID == "" {
+				return fmt.Errorf("orb-forex mode requires markets.ibkr.account_id to be set")
+			}
+
+			// 2. Create IBKR broker.
+			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
+			if err := ibkrBroker.CheckAuth(ctx); err != nil {
+				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
+			}
+			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
+			defer stopKeepalive()
+
+			// 3. Create IBKR market data client.
+			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
+
+			// 4. Create event bus and analyzer (same pattern as equities ORB).
+			orbBus := events.New()
+			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
+
+			// 5. Create notification adapter (same pattern as equities ORB).
+			var orbNotifier orb.Notifier
+			if tgBot != nil {
+				orbNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
+
+			// 6. Create portfolio valuer (same pattern as equities ORB).
+			orbPortfolio := newDBPortfolioValuer(100_000)
+
+			// 7. Build ORB config from ForexORBConfig for the scheduler.
+			orbCfg := config.ORBConfig{
+				Enabled:        cfg.ForexORB.Enabled,
+				Mode:           "paper",
+				MaxCandidates:  len(cfg.ForexORB.Pairs),
+				RangeMinutes:   cfg.ForexORB.RangeMinutes,
+				RiskReward:     cfg.ForexORB.RiskReward,
+				MaxRiskPct:     cfg.ForexORB.MaxRiskPct,
+				MaxPositionPct: cfg.ForexORB.MaxPositionPct,
+			}
+
+			// 8. Create ORB scheduler with IBKR components.
+			orbScheduler := orb.NewORBScheduler(
+				orbCfg, store.GetDB(), ibkrData, analyzer,
+				ibkrBroker, orbPortfolio, orbNotifier,
+			)
+
+			// 9. Wire forex-specific config and scanner.
+			forexScanner := &orb.ForexCandidateScanner{
+				Pairs:      cfg.ForexORB.Pairs,
+				MarketData: ibkrData,
+				Cfg:        cfg.ForexORB,
+			}
+			orbScheduler.SetScanner(forexScanner)
+			orbScheduler.SetForexConfig(&cfg.ForexORB)
+
+			// 10. Wire optional news and bus (same as equities ORB).
+			if newsProvider != nil {
+				orbScheduler.SetNewsProvider(newsProvider)
+			}
+			orbScheduler.SetBus(orbBus)
+
+			// 11. Run.
+			logger.Info("ORB-Forex scheduler starting")
+			fmt.Println("ORB-Forex mode active. Waiting for forex session open...")
+			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
+				return fmt.Errorf("orb-forex scheduler: %w", err)
+			}
+			fmt.Println("TradeEngine (ORB-Forex) stopped.")
 			return nil
 		}
 
@@ -481,7 +561,7 @@ func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
 }
 
 func init() {
-	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb)")
+	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|orb-forex)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")
 	runCmd.Flags().BoolVar(&runWeb, "web", false, "Start the web observability server in-process")

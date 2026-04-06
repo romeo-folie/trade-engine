@@ -124,6 +124,12 @@ func Defaults() *Config {
 				BaseURL:   "https://paper-api.alpaca.markets",
 				DataURL:   "https://data.alpaca.markets",
 			},
+			IBKR: IBKRConfig{
+				Enabled:     false,
+				GatewayURL:  "https://localhost:5000",
+				TickleSec:   240,
+				InsecureTLS: true,
+			},
 			News: NewsAPIConfig{
 				Provider:                     "finnhub",
 				APIKeyEnv:                    "FINNHUB_API_KEY",
@@ -272,6 +278,18 @@ func Defaults() *Config {
 			MaxPositionPct:    10.0, // hard cap: notional <= 10% of portfolio per trade
 			NewsLookbackHours:  24,
 			ScanCadenceMinutes: 2,
+		},
+		ForexORB: ForexORBConfig{
+			Enabled:        false,
+			Pairs:          []string{"EUR/USD", "GBP/USD"},
+			Session:        "london",
+			Timezone:       "UTC",
+			RangeMinutes:   15,
+			RiskReward:     2.0,
+			MaxRiskPct:     1.0,
+			MaxPositionPct: 10.0,
+			MinLotSize:     20000,
+			PipBuffer:      0.0002,
 		},
 	}
 }
