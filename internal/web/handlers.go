@@ -299,15 +299,22 @@ func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request
 				Quantity:   p.Quantity,
 				PnL:        p.UnrealizedPL,
 			}
-			if p.Quantity > 0 {
+			if p.CurrentPrice > 0 {
+				dto.CurrentPrice = p.CurrentPrice
+			} else if p.Quantity > 0 {
 				dto.CurrentPrice = p.CurrentValue / p.Quantity
-				costBasis := p.AvgCostBasis * p.Quantity
-				if costBasis > 0 {
-					dto.PnLPct = (p.UnrealizedPL / costBasis) * 100
-				}
+			}
+			costBasis := p.AvgCostBasis * p.Quantity
+			if costBasis > 0 {
+				dto.PnLPct = (p.UnrealizedPL / costBasis) * 100
+			}
+			if p.Side != "" {
+				dto.Direction = p.Side
 			}
 			if t, ok := tradeByTicker[p.Ticker]; ok {
-				dto.Direction = t.Direction
+				if dto.Direction == "" {
+					dto.Direction = t.Direction
+				}
 				dto.Strategy = t.Strategy
 			}
 			dtos = append(dtos, dto)

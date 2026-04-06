@@ -1522,8 +1522,12 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	for _, p := range positions {
 		eps = append(eps, portfolio.ExecPosition{
 			Ticker:       p.Ticker,
+			Quantity:     p.Quantity,
+			AvgCostBasis: p.AvgCostBasis,
+			CurrentPrice: p.CurrentPrice,
 			CurrentValue: p.CurrentValue,
 			UnrealizedPL: p.UnrealizedPL,
+			Side:         p.Side,
 		})
 	}
 

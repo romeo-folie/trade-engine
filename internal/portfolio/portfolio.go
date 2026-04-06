@@ -46,9 +46,11 @@ func NewTracker(snapshotInterval time.Duration) *Tracker {
 type ExecPosition struct {
 	Ticker       string
 	Quantity     float64
-	AvgCostBasis float64
-	CurrentValue float64
+	AvgCostBasis float64 // per-share average entry price
+	CurrentPrice float64 // per-share current price (0 if unavailable)
+	CurrentValue float64 // total market value
 	UnrealizedPL float64
+	Side         string // "long" or "short" (empty if unavailable)
 }
 
 // PositionMap returns a snapshot of current open positions as ticker→currentValue.

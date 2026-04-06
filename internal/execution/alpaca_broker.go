@@ -136,8 +136,10 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		Symbol       string `json:"symbol"`
 		Qty          string `json:"qty"`
 		AvgEntryPx   string `json:"avg_entry_price"`
+		CurrentPrice string `json:"current_price"`
 		MarketValue  string `json:"market_value"`
 		UnrealizedPL string `json:"unrealized_pl"`
+		Side         string `json:"side"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/positions", nil, &resp); err != nil {
 		return nil, fmt.Errorf("alpaca GetPositions: %w", err)
@@ -153,6 +155,10 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		if err != nil {
 			return nil, fmt.Errorf("alpaca GetPositions: parse avg_entry_price %q: %w", p.AvgEntryPx, err)
 		}
+		cp, err := parseFloat(p.CurrentPrice)
+		if err != nil {
+			return nil, fmt.Errorf("alpaca GetPositions: parse current_price %q: %w", p.CurrentPrice, err)
+		}
 		mv, err := parseFloat(p.MarketValue)
 		if err != nil {
 			return nil, fmt.Errorf("alpaca GetPositions: parse market_value %q: %w", p.MarketValue, err)
@@ -165,8 +171,10 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 			Ticker:       p.Symbol,
 			Quantity:     qty,
 			AvgCostBasis: avg,
+			CurrentPrice: cp,
 			CurrentValue: mv,
 			UnrealizedPL: upl,
+			Side:         p.Side,
 		})
 	}
 	return out, nil
@@ -175,10 +183,9 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 // GetAccount returns the Alpaca account's cash balance, equity, and daily P&L.
 func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 	var resp struct {
-		Cash           string `json:"cash"`
-		Equity         string `json:"equity"`
-		LastEquity     string `json:"last_equity"`
-		PortfolioValue string `json:"portfolio_value"`
+		Cash       string `json:"cash"`
+		Equity     string `json:"equity"`
+		LastEquity string `json:"last_equity"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
 		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: %w", err)
@@ -189,14 +196,9 @@ func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse cash %q: %w", resp.Cash, err)
 	}
 
-	// Use 'equity' if available, otherwise fall back to 'portfolio_value'.
-	equityStr := resp.Equity
-	if equityStr == "" {
-		equityStr = resp.PortfolioValue
-	}
-	equity, err := parseFloat(equityStr)
+	equity, err := parseFloat(resp.Equity)
 	if err != nil {
-		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse equity %q: %w", equityStr, err)
+		return AccountInfo{}, fmt.Errorf("alpaca GetAccount: parse equity %q: %w", resp.Equity, err)
 	}
 
 	lastEquity, err := parseFloat(resp.LastEquity)

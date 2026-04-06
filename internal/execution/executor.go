@@ -54,9 +54,11 @@ type OrderResult struct {
 type Position struct {
 	Ticker       string
 	Quantity     float64
-	AvgCostBasis float64
-	CurrentValue float64
+	AvgCostBasis float64 // per-share average entry price
+	CurrentPrice float64 // per-share current price (0 if broker doesn't provide)
+	CurrentValue float64 // total market value (qty × current price)
 	UnrealizedPL float64
+	Side         string // "long" or "short" (empty if broker doesn't provide)
 }
 
 // NormalizeOrderStatus maps Alpaca's transient/broker-specific order statuses to
@@ -82,7 +84,7 @@ func NormalizeOrderStatus(status string) string {
 // Used as the single source of truth for portfolio valuation when a real
 // broker is configured.
 type AccountInfo struct {
-	Cash            float64 // buying power / available cash
+	Cash            float64 // cash balance (not buying power — Alpaca tracks those separately)
 	PortfolioEquity float64 // total account equity (cash + positions)
 	DayPnL          float64 // realized + unrealized profit/loss for the current session
 }
