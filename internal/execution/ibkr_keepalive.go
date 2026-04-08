@@ -26,6 +26,64 @@ func (b *IBKRBroker) CheckAuth(ctx context.Context) error {
 	return nil
 }
 
+// StartAuthMonitor polls CheckAuth every monitorSec seconds and invokes
+// onExpired when the gateway session is lost, and onRecovered when it comes
+// back after a previous failure.
+//
+// Repeated onExpired calls are debounced: the callback is suppressed until
+// debounceMin minutes have elapsed since the last invocation, so the user
+// does not receive a flood of alerts while re-authenticating.
+//
+// Either callback may be nil. The returned stop function cancels the goroutine.
+func (b *IBKRBroker) StartAuthMonitor(
+	ctx context.Context,
+	monitorSec int,
+	debounceMin int,
+	onExpired func(gatewayURL string),
+	onRecovered func(gatewayURL string),
+) func() {
+	if monitorSec <= 0 {
+		monitorSec = 60
+	}
+	if debounceMin <= 0 {
+		debounceMin = 30
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		ticker := time.NewTicker(time.Duration(monitorSec) * time.Second)
+		defer ticker.Stop()
+
+		var lastAlerted time.Time
+		wasDown := false
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				err := b.CheckAuth(ctx)
+				if err != nil {
+					logger.Warn("ibkr auth monitor: session not authenticated", "err", err)
+					if onExpired != nil && time.Since(lastAlerted) >= time.Duration(debounceMin)*time.Minute {
+						onExpired(b.gatewayURL)
+						lastAlerted = time.Now()
+					}
+					wasDown = true
+				} else {
+					if wasDown && onRecovered != nil {
+						onRecovered(b.gatewayURL)
+					}
+					wasDown = false
+				}
+			}
+		}
+	}()
+
+	return cancel
+}
+
 // StartKeepalive pings POST /iserver/auth/tickle every tickleSec seconds to prevent
 // the Client Portal gateway from timing out the session. The returned stop function
 // cancels the background goroutine; call it on shutdown.

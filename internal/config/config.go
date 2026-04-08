@@ -414,6 +414,14 @@ type IBKRConfig struct {
 	GatewayURL  string `yaml:"gateway_url"`  // e.g. "https://localhost:5000"
 	TickleSec   int    `yaml:"tickle_sec"`   // keepalive interval (default 240)
 	InsecureTLS bool   `yaml:"insecure_tls"` // IBKR gateway uses self-signed certs
+
+	// AuthMonitorSec is how often the auth monitor polls /iserver/auth/status.
+	// Default: 60 seconds.
+	AuthMonitorSec int `yaml:"auth_monitor_sec"`
+	// AuthAlertDebounceMin is the minimum minutes between repeated "session
+	// expired" Telegram alerts. Prevents spam while the user is re-authenticating.
+	// Default: 30 minutes.
+	AuthAlertDebounceMin int `yaml:"auth_alert_debounce_min"`
 }
 
 // Instrument defines a tradeable instrument for forex/CFD ORB.
