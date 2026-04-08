@@ -151,30 +151,36 @@ func TestConfigMasking(t *testing.T) {
 func TestPortfolioHandlers_NoDB(t *testing.T) {
 	// Since store.Connect hasn't been called, store.IsConnected() returns false.
 	srv := NewServer(Config{}, nil, nil)
-	handlers := []struct {
-		name    string
-		handler http.HandlerFunc
-		url     string
-	}{
-		{"History", srv.handlePortfolioHistory, "/api/portfolio/history"},
-		{"Performance", srv.handlePortfolioPerformance, "/api/portfolio/performance"},
-		{"Stats", srv.handlePortfolioStats, "/api/portfolio/stats"},
-	}
 
-	for _, tt := range handlers {
-		t.Run(tt.name, func(t *testing.T) {
-			w := httptest.NewRecorder()
-			r := httptest.NewRequest("GET", tt.url, nil)
-			tt.handler(w, r)
+	// Stats still returns 500 when DB is unavailable (no fallback exists).
+	t.Run("Stats", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		srv.handlePortfolioStats(w, httptest.NewRequest("GET", "/api/portfolio/stats", nil))
+		if w.Code != http.StatusInternalServerError {
+			t.Errorf("expected 500, got %d", w.Code)
+		}
+		if !strings.Contains(w.Body.String(), "database not connected") {
+			t.Errorf("expected 'database not connected' error, got %q", w.Body.String())
+		}
+	})
 
-			if w.Code != http.StatusInternalServerError {
-				t.Errorf("expected 500, got %d", w.Code)
-			}
-			if !strings.Contains(w.Body.String(), "database not connected") {
-				t.Errorf("expected 'database not connected' error, got %q", w.Body.String())
-			}
-		})
-	}
+	// History and Performance now return 200 with empty/partial data when DB is
+	// unavailable — the broker-direct path succeeds without a DB connection.
+	t.Run("History_NoDB_Returns200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		srv.handlePortfolioHistory(w, httptest.NewRequest("GET", "/api/portfolio/history", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 (graceful empty), got %d", w.Code)
+		}
+	})
+
+	t.Run("Performance_NoDB_Returns200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		srv.handlePortfolioPerformance(w, httptest.NewRequest("GET", "/api/portfolio/performance", nil))
+		if w.Code != http.StatusOK {
+			t.Errorf("expected 200 (graceful empty), got %d", w.Code)
+		}
+	})
 }
 
 // ─── System Status ───────────────────────────────────────────────────────────

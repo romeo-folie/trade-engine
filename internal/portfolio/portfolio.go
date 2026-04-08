@@ -31,6 +31,11 @@ type Tracker struct {
 	snapshotEvery    time.Duration
 	lastSnapshot     time.Time
 	lastDailySummary time.Time
+
+	// mode and broker tag snapshot rows written to the DB (Phase 18).
+	// Set via SetTags before the first snapshot.
+	mode   string // "live" | "paper"
+	broker string // "alpaca" | "ibkr"
 }
 
 // NewTracker creates a Tracker with the given snapshot interval.
@@ -126,24 +131,32 @@ func (t *Tracker) Positions() []ExecPosition {
 	return out
 }
 
+// SetTags sets the mode and broker that will be written to snapshot rows.
+// Call this once after NewTracker when the engine configuration is known.
+func (t *Tracker) SetTags(mode, broker string) {
+	t.mu.Lock()
+	t.mode = mode
+	t.broker = broker
+	t.mu.Unlock()
+}
+
 // MaybeSnapshot writes a snapshot if the interval has elapsed.
 // Returns the snapshot state written, or nil if interval not elapsed / on error.
 func (t *Tracker) MaybeSnapshot(ctx context.Context) *State {
 	t.mu.RLock()
 	s := t.state
 	elapsed := time.Since(t.lastSnapshot)
+	mode := t.mode
+	broker := t.broker
 	t.mu.RUnlock()
 
 	if elapsed < t.snapshotEvery {
 		return nil
 	}
-	_, err := store.GetDB().Exec(ctx, `
-		INSERT INTO portfolio_snapshots
-		  (total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions)
-		VALUES ($1,$2,$3,$4,$5,$6)`,
-		s.TotalValue, s.Cash, s.Invested, s.UnrealizedPnL, s.RealizedPnLDay, s.OpenPositions,
-	)
-	if err != nil {
+	if err := store.InsertPortfolioSnapshot(
+		ctx, s.TotalValue, s.Cash, s.Invested, s.UnrealizedPnL, s.RealizedPnLDay,
+		s.OpenPositions, "engine", mode, broker,
+	); err != nil {
 		logger.Warn("portfolio snapshot failed", "err", err)
 		return nil
 	}

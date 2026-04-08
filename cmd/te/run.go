@@ -19,6 +19,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/feedback"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/orb"
@@ -132,9 +133,35 @@ Modes:
 		}
 		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
 
+		// Tag portfolio snapshots with mode (live/paper) and broker name (Phase 18).
+		portfolioMode := "paper"
+		if !cfg.Markets.Stocks.Paper {
+			portfolioMode = "live"
+		}
+		portfolioBroker := ""
+		if cfg.Markets.Stocks.APIKey != "" {
+			portfolioBroker = "alpaca"
+		}
+		eng.Portfolio().SetTags(portfolioMode, portfolioBroker)
+
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		// Start independent portfolio poller and backfill when Alpaca is configured.
+		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
+			if cfg.Portfolio.Poller.Enabled {
+				interval := time.Duration(cfg.Portfolio.Poller.IntervalSec) * time.Second
+				poller := portfolio.NewPoller(
+					alpacaBroker, interval,
+					cfg.Portfolio.Poller.SignificantChangePct,
+					portfolioMode, portfolioBroker,
+				)
+				go poller.Run(ctx)
+			}
+			// One-time backfill runs in background; skips gracefully if DB unavailable.
+			go portfolio.Backfill(ctx, alpacaBroker, portfolioMode, portfolioBroker)
+		}
 
 		// Start background embedding worker if enabled.
 		if cfg.Embeddings.Enabled {
@@ -346,6 +373,18 @@ Modes:
 				AllowedOrigins: []string{"*"},
 				EngineConfig:   cfg,
 			}, eng.Bus(), eng.Portfolio())
+			// Wire broker-direct portfolio view when Alpaca is configured.
+			if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
+				pc := cfg.Portfolio.Cache
+				bvCache := web.NewBrokerCache(
+					alpacaBroker,
+					time.Duration(pc.AccountTTLSec)*time.Second,
+					time.Duration(pc.PositionsTTLSec)*time.Second,
+					time.Duration(pc.HistoryTTLSec)*time.Second,
+					time.Duration(pc.OrdersTTLSec)*time.Second,
+				)
+				webSrv.SetBrokerView(bvCache)
+			}
 			if err := webSrv.Start(ctx); err != nil {
 				return fmt.Errorf("web server: %w", err)
 			}
