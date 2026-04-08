@@ -139,8 +139,11 @@ Modes:
 			portfolioMode = "live"
 		}
 		portfolioBroker := ""
-		if cfg.Markets.Stocks.APIKey != "" {
+		switch broker.(type) {
+		case *execution.AlpacaBroker:
 			portfolioBroker = "alpaca"
+		case *execution.IBKRBroker:
+			portfolioBroker = "ibkr"
 		}
 		eng.Portfolio().SetTags(portfolioMode, portfolioBroker)
 
@@ -148,17 +151,20 @@ Modes:
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Start independent portfolio poller and backfill when Alpaca is configured.
-		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
+		// Start independent portfolio poller for any broker that implements BrokerView.
+		// Backfill is Alpaca-only (IBKR has no history endpoint).
+		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
 			if cfg.Portfolio.Poller.Enabled {
 				interval := time.Duration(cfg.Portfolio.Poller.IntervalSec) * time.Second
 				poller := portfolio.NewPoller(
-					alpacaBroker, interval,
+					bv, interval,
 					cfg.Portfolio.Poller.SignificantChangePct,
 					portfolioMode, portfolioBroker,
 				)
 				go poller.Run(ctx)
 			}
+		}
+		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
 			// One-time backfill runs in background; skips gracefully if DB unavailable.
 			go portfolio.Backfill(ctx, alpacaBroker, portfolioMode, portfolioBroker)
 		}
@@ -245,6 +251,18 @@ Modes:
 					AllowedOrigins: []string{"*"},
 					EngineConfig:   cfg,
 				}, orbBus, nil)
+				// Wire broker-direct portfolio view for any broker implementing BrokerView.
+				if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
+					pc := cfg.Portfolio.Cache
+					bvCache := web.NewBrokerCache(
+						bv,
+						time.Duration(pc.AccountTTLSec)*time.Second,
+						time.Duration(pc.PositionsTTLSec)*time.Second,
+						time.Duration(pc.HistoryTTLSec)*time.Second,
+						time.Duration(pc.OrdersTTLSec)*time.Second,
+					)
+					webSrv.SetBrokerView(bvCache)
+				}
 				if err := webSrv.Start(ctx); err != nil {
 					return fmt.Errorf("web server: %w", err)
 				}
@@ -348,6 +366,16 @@ Modes:
 					AllowedOrigins: []string{"*"},
 					EngineConfig:   cfg,
 				}, orbBus, nil)
+				// Wire IBKR broker-direct portfolio view.
+				pc := cfg.Portfolio.Cache
+				bvCache := web.NewBrokerCache(
+					ibkrBroker,
+					time.Duration(pc.AccountTTLSec)*time.Second,
+					time.Duration(pc.PositionsTTLSec)*time.Second,
+					time.Duration(pc.HistoryTTLSec)*time.Second,
+					time.Duration(pc.OrdersTTLSec)*time.Second,
+				)
+				webSrv.SetBrokerView(bvCache)
 				if err := webSrv.Start(ctx); err != nil {
 					return fmt.Errorf("web server: %w", err)
 				}
@@ -373,11 +401,11 @@ Modes:
 				AllowedOrigins: []string{"*"},
 				EngineConfig:   cfg,
 			}, eng.Bus(), eng.Portfolio())
-			// Wire broker-direct portfolio view when Alpaca is configured.
-			if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
+			// Wire broker-direct portfolio view for any broker implementing BrokerView.
+			if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
 				pc := cfg.Portfolio.Cache
 				bvCache := web.NewBrokerCache(
-					alpacaBroker,
+					bv,
 					time.Duration(pc.AccountTTLSec)*time.Second,
 					time.Duration(pc.PositionsTTLSec)*time.Second,
 					time.Duration(pc.HistoryTTLSec)*time.Second,

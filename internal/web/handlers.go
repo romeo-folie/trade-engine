@@ -99,7 +99,14 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 				"Cash":             acct.Cash,
 				"Invested":         invested,
 				"UnrealizedPnL":    0.0, // not exposed by account endpoint alone
-				"DayPnL":           acct.Equity - acct.LastEquity,
+				// IBKR does not expose prior-day close; guard to avoid showing
+				// full equity as DayPnL when LastEquity is zero.
+				"DayPnL": func() float64 {
+					if acct.LastEquity > 0 {
+						return acct.Equity - acct.LastEquity
+					}
+					return 0.0
+				}(),
 				"RealizedPnLToday": 0.0,
 				"OpenPositions":    0, // enriched by /positions endpoint
 				"BuyingPower":      acct.BuyingPower,
@@ -204,20 +211,41 @@ func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// ── TradeEngine series (DB) ──────────────────────────────────────────────
+	// When mode is "all" (or empty), use daily_summaries (one row/day, fast).
+	// When mode is "live" or "paper", query portfolio_snapshots filtered by mode
+	// (tagged since migration 021) and collapse to one point per calendar day.
 	var teSeries []equityPoint
 	if store.IsConnected() {
 		from := time.Now().AddDate(0, 0, -days)
 		to := time.Now()
-		summaries, err := store.GetDailySummaries(ctx, from, to)
-		if err == nil {
-			// Filter by mode if requested and the column is available.
-			teSeries = make([]equityPoint, 0, len(summaries))
-			for _, s := range summaries {
-				_ = mode // mode filtering applied in Phase 4 (column added by migration)
-				teSeries = append(teSeries, equityPoint{
-					T: s.Date.Format("2006-01-02"),
-					V: s.EndingValue,
-				})
+		if mode == "" || mode == "all" {
+			summaries, err := store.GetDailySummaries(ctx, from, to)
+			if err == nil {
+				teSeries = make([]equityPoint, 0, len(summaries))
+				for _, s := range summaries {
+					teSeries = append(teSeries, equityPoint{
+						T: s.Date.Format("2006-01-02"),
+						V: s.EndingValue,
+					})
+				}
+			}
+		} else {
+			snaps, err := store.GetPortfolioSnapshotsByMode(ctx, from, to, mode)
+			if err == nil {
+				// Collapse to one point per calendar day (last snapshot of each day).
+				byDay := map[string]float64{}
+				dayOrder := []string{}
+				for _, sn := range snaps {
+					key := sn.CreatedAt.UTC().Format("2006-01-02")
+					if _, seen := byDay[key]; !seen {
+						dayOrder = append(dayOrder, key)
+					}
+					byDay[key] = sn.TotalValue // last row wins (snaps ordered ASC)
+				}
+				teSeries = make([]equityPoint, 0, len(dayOrder))
+				for _, k := range dayOrder {
+					teSeries = append(teSeries, equityPoint{T: k, V: byDay[k]})
+				}
 			}
 		}
 	}
@@ -276,12 +304,11 @@ func (s *Server) handlePortfolioPerformance(w http.ResponseWriter, r *http.Reque
 		"stale_at":      staleAt,
 	}
 
-	// Today P&L from broker when available; otherwise from DB summaries.
+	// Today P&L from broker when available — set unconditionally (does not
+	// require DB). pnl_pct is relative to prior-day close (currentValue - pnl).
 	if dayPnL != nil {
 		pnl := *dayPnL
-		if today24 := store.IsConnected(); today24 {
-			performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, currentValue-pnl) * 100}
-		}
+		performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, currentValue-pnl) * 100}
 	}
 
 	// Week/month P&L always derived from DB summaries.
@@ -407,7 +434,13 @@ func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request
 					PnL:          p.UnrealizedPL,
 					Direction:    p.Side,
 				}
-				costBasis := p.AvgEntryPrice * p.Quantity
+				// Use absolute quantity so short positions (negative qty) don't
+				// produce a negative cost basis and a nonsensical PnLPct.
+				qtyAbs := p.Quantity
+				if qtyAbs < 0 {
+					qtyAbs = -qtyAbs
+				}
+				costBasis := p.AvgEntryPrice * qtyAbs
 				if costBasis > 0 {
 					dto.PnLPct = safeDiv(p.UnrealizedPL, costBasis) * 100
 				}

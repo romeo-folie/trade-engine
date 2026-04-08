@@ -9,10 +9,17 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// backfillWindow is the maximum history window fetched from Alpaca.
+// "1A" = 1 year, the maximum the portfolio/history endpoint supports.
+const backfillWindow = "1A"
+
 // Backfill fetches up to one year of Alpaca equity history and seeds
-// portfolio_snapshots for any calendar days that have no existing row.
-// It is idempotent — existing rows are never modified. Rows written by the
-// backfill are tagged source='backfill' so they can be filtered later.
+// portfolio_snapshots for any calendar days that have no existing row for the
+// given mode. It is idempotent — existing rows are never modified. Rows written
+// by the backfill are tagged source='backfill' so they can be filtered later.
+//
+// Existence checks are scoped to the same mode to avoid cross-mode suppression
+// (e.g. existing paper rows should not block live backfill rows for the same day).
 //
 // Call once after DB connect, typically at startup, in a background goroutine.
 func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string) {
@@ -20,8 +27,8 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 		return
 	}
 
-	logger.Info("portfolio backfill: fetching Alpaca equity history (1Y/1D)")
-	hist, err := bv.EquityCurve(ctx, "all", "1D")
+	logger.Info("portfolio backfill: fetching Alpaca equity history (1A/1D)")
+	hist, err := bv.EquityCurve(ctx, backfillWindow, "1D")
 	if err != nil {
 		// ErrBrokerUnavailable means IBKR — backfill not supported, silently skip.
 		if err != execution.ErrBrokerUnavailable {
@@ -30,10 +37,12 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 		return
 	}
 
-	// Load the set of existing snapshot dates (truncated to day) so we only
-	// insert rows for gaps.
+	// Scope the existence check to the same mode so paper and live rows don't
+	// suppress each other. Query only within the backfill window to keep startup
+	// work bounded.
+	windowStart := time.Now().AddDate(-1, 0, 0)
 	existing := map[string]struct{}{}
-	rows, err := store.GetPortfolioSnapshotsByMode(ctx, time.Time{}, time.Now(), "")
+	rows, err := store.GetPortfolioSnapshotsByMode(ctx, windowStart, time.Now(), mode)
 	if err == nil {
 		for _, s := range rows {
 			existing[s.CreatedAt.UTC().Truncate(24*time.Hour).Format("2006-01-02")] = struct{}{}
@@ -48,20 +57,18 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 		day := pt.Time.UTC().Truncate(24 * time.Hour)
 		key := day.Format("2006-01-02")
 		if _, ok := existing[key]; ok {
-			continue // already have data for this day
+			continue // already have data for this day+mode
 		}
 
-		// Use a context derived from the parent but not timed-out aggressively
-		// since this is a batch insert that may take a few seconds.
 		insertCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := store.InsertPortfolioSnapshot(
 			insertCtx,
-			pt.Equity,          // total_value = equity
-			0,                  // cash unknown from history endpoint
-			0,                  // invested unknown
-			0,                  // unrealized_pnl unknown
-			0,                  // realized_pnl_today unknown
-			0,                  // open_positions unknown
+			pt.Equity, // total_value = equity
+			0,         // cash unknown from history endpoint
+			0,         // invested unknown
+			0,         // unrealized_pnl unknown
+			0,         // realized_pnl_today unknown
+			0,         // open_positions unknown
 			"backfill", mode, broker,
 		)
 		cancel()
@@ -69,7 +76,7 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 			logger.Warn("portfolio backfill: insert failed", "date", key, "err", err)
 			continue
 		}
-		existing[key] = struct{}{} // mark to prevent double-insert in same run
+		existing[key] = struct{}{} // prevent double-insert in same run
 		inserted++
 	}
 

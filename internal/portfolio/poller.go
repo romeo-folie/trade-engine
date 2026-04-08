@@ -63,9 +63,11 @@ func (p *Poller) Run(ctx context.Context) {
 	}
 }
 
-// poll fetches account state from the broker and writes a snapshot if needed.
-// It always calls the broker (to track threshold changes) but only writes to
-// the DB when the store is connected.
+// poll fetches account state from the broker and writes a snapshot.
+// Called on every interval tick (unconditional write) plus whenever
+// significant equity moves are detected between ticks. Only skips the
+// DB write if the store is not connected — the broker is always called
+// so threshold tracking stays accurate even during DB outages.
 func (p *Poller) poll(ctx context.Context) {
 	acct, err := p.bv.AccountSnapshot(ctx)
 	if err != nil {
@@ -77,20 +79,10 @@ func (p *Poller) poll(ctx context.Context) {
 	cash := acct.Cash
 	invested := equity - cash
 
-	// Decide whether to write a snapshot.
-	write := p.lastSnapshotEquity == 0
-	if !write && p.lastSnapshotEquity != 0 {
-		changePct := math.Abs((equity-p.lastSnapshotEquity)/p.lastSnapshotEquity) * 100
-		write = changePct >= p.sigChangePct
-	}
-
-	if !write {
-		return
-	}
-
 	// Only write to DB when connected; skip silently otherwise so the poller
-	// can resume writing when the DB comes back without missing threshold events.
+	// can resume writing when the DB comes back without losing equity tracking.
 	if !store.IsConnected() {
+		p.lastSnapshotEquity = equity // keep threshold tracking up-to-date
 		return
 	}
 
@@ -103,4 +95,34 @@ func (p *Poller) poll(ctx context.Context) {
 	}
 	p.lastSnapshotEquity = equity
 	logger.Debug("portfolio poller: snapshot written", "equity", equity)
+}
+
+// pollIfSignificant is called at sub-interval cadence (future) or can be
+// triggered by external equity events. It skips the DB write when equity
+// hasn't moved past sigChangePct since the last persisted snapshot.
+func (p *Poller) pollIfSignificant(ctx context.Context) {
+	acct, err := p.bv.AccountSnapshot(ctx)
+	if err != nil {
+		return
+	}
+	equity := acct.Equity
+	if p.lastSnapshotEquity != 0 {
+		changePct := math.Abs((equity-p.lastSnapshotEquity)/p.lastSnapshotEquity) * 100
+		if changePct < p.sigChangePct {
+			return
+		}
+	}
+	if !store.IsConnected() {
+		return
+	}
+	cash := acct.Cash
+	if err := store.InsertPortfolioSnapshot(
+		ctx, equity, cash, equity-cash, 0, 0, 0,
+		"poller", p.mode, p.broker,
+	); err != nil {
+		logger.Warn("portfolio poller: significant-change snapshot failed", "err", err)
+		return
+	}
+	p.lastSnapshotEquity = equity
+	logger.Debug("portfolio poller: significant-change snapshot written", "equity", equity)
 }
