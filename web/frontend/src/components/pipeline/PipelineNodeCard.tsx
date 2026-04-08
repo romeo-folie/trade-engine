@@ -342,50 +342,66 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                   return (
                     <>
                       <div className={styles.subValue} style={{ marginBottom: 6 }}>PORTFOLIO</div>
-                      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
-                        <div>
-                          <div className={styles.subValue}>EQUITY</div>
-                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                            ${ps.totalValue.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={styles.subValue}>CASH</div>
-                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                            ${ps.cash.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={styles.subValue}>INVESTED</div>
-                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                            ${ps.invested.toLocaleString('en-US', { maximumFractionDigits: 0 })}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={styles.subValue}>POSITIONS</div>
-                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                            {ps.openPositions}
-                          </div>
-                        </div>
-                      </div>
-                      <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
-                        <div>
-                          <div className={styles.subValue}>UNREAL P&L</div>
-                          <div className={styles.kindLabel} style={{
-                            color: ps.unrealizedPnL >= 0 ? colors.acidGreen : colors.red
-                          }}>
-                            {ps.unrealizedPnL >= 0 ? '+' : ''}{ps.unrealizedPnL.toFixed(2)}
-                          </div>
-                        </div>
-                        <div>
-                          <div className={styles.subValue}>TODAY P&L</div>
-                          <div className={styles.kindLabel} style={{
-                            color: ps.realizedPnlToday >= 0 ? colors.acidGreen : colors.red
-                          }}>
-                            {ps.realizedPnlToday >= 0 ? '+' : ''}{ps.realizedPnlToday.toFixed(2)}
-                          </div>
-                        </div>
-                      </div>
+                      {(() => {
+                        // Defensive: payload fields may be missing/undefined for
+                        // some publishers (e.g. ORB scheduler). Coerce to safe
+                        // numbers so render can never throw.
+                        const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+                        const totalValue = num(ps.totalValue);
+                        const cash = num(ps.cash);
+                        const invested = num(ps.invested);
+                        const openPositions = num(ps.openPositions);
+                        const unrealizedPnL = num(ps.unrealizedPnL);
+                        const realizedPnlToday = num(ps.realizedPnlToday);
+                        return (
+                          <>
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 12px' }}>
+                              <div>
+                                <div className={styles.subValue}>EQUITY</div>
+                                <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                                  ${totalValue.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={styles.subValue}>CASH</div>
+                                <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                                  ${cash.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={styles.subValue}>INVESTED</div>
+                                <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                                  ${invested.toLocaleString('en-US', { maximumFractionDigits: 0 })}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={styles.subValue}>POSITIONS</div>
+                                <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                                  {openPositions}
+                                </div>
+                              </div>
+                            </div>
+                            <div style={{ marginTop: 6, display: 'flex', gap: 8 }}>
+                              <div>
+                                <div className={styles.subValue}>UNREAL P&L</div>
+                                <div className={styles.kindLabel} style={{
+                                  color: unrealizedPnL >= 0 ? colors.acidGreen : colors.red
+                                }}>
+                                  {unrealizedPnL >= 0 ? '+' : ''}{unrealizedPnL.toFixed(2)}
+                                </div>
+                              </div>
+                              <div>
+                                <div className={styles.subValue}>TODAY P&L</div>
+                                <div className={styles.kindLabel} style={{
+                                  color: realizedPnlToday >= 0 ? colors.acidGreen : colors.red
+                                }}>
+                                  {realizedPnlToday >= 0 ? '+' : ''}{realizedPnlToday.toFixed(2)}
+                                </div>
+                              </div>
+                            </div>
+                          </>
+                        );
+                      })()}
                       <div className={d.allRiskPassed !== false ? styles.executionBadge : styles.executionBadgeIdle} style={{ width: '100%', textAlign: 'center', marginTop: 6 }}>
                         {d.allRiskPassed !== false ? 'TRACKING' : 'IDLE'}
                       </div>
@@ -412,8 +428,17 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             ) : (
               (() => {
                 const trade = d.lastTrade as LastTrade | undefined;
-                const dir = trade ? trade.direction.toUpperCase() : null;
+                // Defensive: trade fields may be missing for some publishers.
+                const dir = trade && typeof trade.direction === 'string' && trade.direction
+                  ? trade.direction.toUpperCase()
+                  : null;
                 const dirLabel = dir === 'BUY' ? 'LONG' : dir === 'SELL' ? 'SHORT' : dir;
+                const safeQty = trade && typeof trade.quantity === 'number' && Number.isFinite(trade.quantity)
+                  ? trade.quantity
+                  : null;
+                const safeEntry = trade && typeof trade.entryPrice === 'number' && Number.isFinite(trade.entryPrice)
+                  ? trade.entryPrice
+                  : null;
                 return (
                   <>
                     <div className={`${styles.routeBadge} ${trade ? styles.routeActive : ''}`} style={{ display: 'inline-block', marginBottom: 8 }}>
@@ -423,13 +448,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                       <div>
                         <div className={styles.subValue}>SIZE</div>
                         <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                          {trade ? trade.quantity.toFixed(1) : '—'}
+                          {safeQty !== null ? safeQty.toFixed(1) : '—'}
                         </div>
                       </div>
                       <div>
                         <div className={styles.subValue}>ENTRY</div>
                         <div className={styles.kindLabel} style={{ color: '#fff' }}>
-                          {trade ? `$${trade.entryPrice.toFixed(2)}` : '—'}
+                          {safeEntry !== null ? `$${safeEntry.toFixed(2)}` : '—'}
                         </div>
                       </div>
                     </div>

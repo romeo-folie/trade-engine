@@ -12,6 +12,7 @@ import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import HubGraph from '../components/pipeline/HubGraph';
 import EventFeed from '../components/pipeline/EventFeed';
 import DrillDownPanel from '../components/pipeline/DrillDownPanel';
+import ErrorBoundary from '../components/ErrorBoundary';
 import styles from './Pipeline.module.css';
 
 export default function PipelineScreen() {
@@ -39,12 +40,14 @@ export default function PipelineScreen() {
   return (
     <div className={styles.screen}>
       <div className={styles.innerFrame}>
-        <HubGraph
-          nodes={nodes}
-          nodeMetrics={nodeMetrics}
-          recentEventSignatures={recentEventSignatures}
-          onNodeClick={handleNodeClick}
-        />
+        <ErrorBoundary>
+          <HubGraph
+            nodes={nodes}
+            nodeMetrics={nodeMetrics}
+            recentEventSignatures={recentEventSignatures}
+            onNodeClick={handleNodeClick}
+          />
+        </ErrorBoundary>
         <EventFeed events={events} />
         <DrillDownPanel nodeId={selectedNodeId} onClose={handleClose} />
       </div>
