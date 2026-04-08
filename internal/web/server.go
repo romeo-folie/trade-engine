@@ -72,6 +72,10 @@ type Server struct {
 
 	// tracker provides live portfolio metrics (equity, cash, positions).
 	tracker *portfolio.Tracker
+
+	// brokerView serves broker-direct portfolio data independent of engine ticks.
+	// Nil when no real broker is configured (orb-only modes, paper-only).
+	brokerView *brokerCache
 }
 
 
@@ -85,6 +89,13 @@ func NewServer(cfg Config, bus *events.Bus, tracker *portfolio.Tracker) *Server 
 		tracker:   tracker,
 	}
 	return s
+}
+
+// SetBrokerView attaches a BrokerView implementation (already wrapped in
+// brokerCache) to the server. Call this after NewServer when a real broker
+// is configured. Safe to skip for paper / orb-only modes.
+func (s *Server) SetBrokerView(bv *brokerCache) {
+	s.brokerView = bv
 }
 
 // Start binds the HTTP server and begins forwarding engine events to clients.

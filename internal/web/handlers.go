@@ -41,6 +41,8 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/analyses/recent", s.handleRecentAnalyses)
 	mux.HandleFunc("/api/backtests/runs", s.handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", s.handleBacktestRunDetail)
+	mux.HandleFunc("/api/portfolio/history", s.handlePortfolioHistory)
+	mux.HandleFunc("/api/portfolio/performance", s.handlePortfolioPerformance)
 	mux.HandleFunc("/api/portfolio/summaries", s.handlePortfolioSummaries)
 	mux.HandleFunc("/api/portfolio/stats", s.handlePortfolioStats)
 	mux.HandleFunc("/api/portfolio/positions", s.handlePortfolioPositions)
@@ -80,9 +82,43 @@ func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /api/node/portfolio
-// Returns portfolio state from the live tracker when available;
-// falls back to the latest DB snapshot when the tracker is not initialized.
+// Broker-first: reads live account state from the broker when configured,
+// falls back to the in-process tracker, then to the latest DB snapshot.
+// All responses include source ("broker"|"tracker"|"db") and stale_at (non-null on fallback).
 func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// ── 1. Broker-direct path ────────────────────────────────────────────────
+	if s.brokerView != nil {
+		acct, err := s.brokerView.AccountSnapshot(ctx)
+		if err == nil {
+			invested := acct.Equity - acct.Cash
+			jsonResponse(w, map[string]any{
+				"TotalValue":       acct.Equity,
+				"Cash":             acct.Cash,
+				"Invested":         invested,
+				"UnrealizedPnL":    0.0, // not exposed by account endpoint alone
+				// IBKR does not expose prior-day close; guard to avoid showing
+				// full equity as DayPnL when LastEquity is zero.
+				"DayPnL": func() float64 {
+					if acct.LastEquity > 0 {
+						return acct.Equity - acct.LastEquity
+					}
+					return 0.0
+				}(),
+				"RealizedPnLToday": 0.0,
+				"OpenPositions":    0, // enriched by /positions endpoint
+				"BuyingPower":      acct.BuyingPower,
+				"source":           "broker",
+				"stale_at":         nil,
+			})
+			return
+		}
+		logger.Warn("broker AccountSnapshot failed, falling back", "err", err)
+	}
+
+	// ── 2. In-process tracker ────────────────────────────────────────────────
 	if s.tracker != nil {
 		state := s.tracker.CurrentState()
 		jsonResponse(w, map[string]any{
@@ -93,16 +129,17 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 			"DayPnL":           state.DayPnL,
 			"RealizedPnLToday": state.RealizedPnLDay,
 			"OpenPositions":    state.OpenPositions,
+			"source":           "tracker",
+			"stale_at":         nil,
 		})
 		return
 	}
-	// Tracker not initialized — fall back to the latest DB snapshot.
+
+	// ── 3. DB fallback ────────────────────────────────────────────────────────
 	if !store.IsConnected() {
 		apiError(w, "portfolio tracker not initialized and database not connected", nil)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
 	snap, err := store.GetLatestPortfolioSnapshot(ctx)
 	if err != nil {
 		apiError(w, "portfolio snapshot query failed", err)
@@ -112,6 +149,7 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		jsonResponse(w, map[string]any{
 			"TotalValue": 0.0, "Cash": 0.0, "Invested": 0.0,
 			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0, "OpenPositions": 0,
+			"source": "db", "stale_at": nil,
 		})
 		return
 	}
@@ -120,106 +158,199 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		"Cash":             snap.Cash,
 		"Invested":         snap.Invested,
 		"UnrealizedPnL":    snap.UnrealizedPnL,
-		"DayPnL":           0.0, // not stored in DB snapshots
+		"DayPnL":           0.0,
 		"RealizedPnLToday": snap.RealizedPnLToday,
 		"OpenPositions":    snap.OpenPositions,
+		"source":           "db",
+		"stale_at":         snap.CreatedAt.UTC().Format(time.RFC3339),
 	})
 }
 
-// GET /api/portfolio/history?days=N
+// GET /api/portfolio/history?days=N&period=1M&timeframe=1D&mode=all
+// Returns two series for the overlay chart:
+//   - alpaca: broker equity curve (from BrokerView.EquityCurve, or nil on unavailability)
+//   - trade_engine: our snapshotted equity from daily_summaries
+//
+// The `period` and `timeframe` query params follow Alpaca conventions (e.g.
+// period=1M&timeframe=1D). When omitted, defaults mirror the `days` param.
 func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) {
-	if !store.IsConnected() {
-		apiError(w, "database not connected", nil)
-		return
-	}
-	days := queryInt(r, "days", 30, 365)
-	from := time.Now().AddDate(0, 0, -days)
-	to := time.Now()
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
 
-	summaries, err := store.GetDailySummaries(ctx, from, to)
-	if err != nil {
-		apiError(w, "history query failed", err)
-		return
+	period := r.URL.Query().Get("period")
+	timeframe := r.URL.Query().Get("timeframe")
+	if period == "" {
+		period = "1M"
+	}
+	if timeframe == "" {
+		timeframe = "1D"
+	}
+	days := queryInt(r, "days", 30, 365)
+	mode := r.URL.Query().Get("mode") // "live" | "paper" | "all" (default "all")
+
+	type equityPoint struct {
+		T string  `json:"t"`
+		V float64 `json:"v"`
 	}
 
-	type historyPoint struct {
-		Date  string  `json:"date"`
-		Value float64 `json:"value"`
+	// ── Broker series (Alpaca) ───────────────────────────────────────────────
+	var alpacaSeries []equityPoint
+	source := "db"
+	if s.brokerView != nil {
+		if hist, err := s.brokerView.EquityCurve(ctx, period, timeframe); err == nil {
+			source = "broker"
+			alpacaSeries = make([]equityPoint, 0, len(hist.Points))
+			for _, p := range hist.Points {
+				alpacaSeries = append(alpacaSeries, equityPoint{
+					T: p.Time.Format(time.RFC3339),
+					V: p.Equity,
+				})
+			}
+		}
+		// ErrBrokerUnavailable (IBKR) is silent — alpacaSeries stays nil.
 	}
-	out := make([]historyPoint, 0, len(summaries))
-	for _, s := range summaries {
-		out = append(out, historyPoint{
-			Date:  s.Date.Format("2006-01-02"),
-			Value: s.EndingValue,
-		})
+
+	// ── TradeEngine series (DB) ──────────────────────────────────────────────
+	// When mode is "all" (or empty), use daily_summaries (one row/day, fast).
+	// When mode is "live" or "paper", query portfolio_snapshots filtered by mode
+	// (tagged since migration 021) and collapse to one point per calendar day.
+	var teSeries []equityPoint
+	if store.IsConnected() {
+		from := time.Now().AddDate(0, 0, -days)
+		to := time.Now()
+		if mode == "" || mode == "all" {
+			summaries, err := store.GetDailySummaries(ctx, from, to)
+			if err == nil {
+				teSeries = make([]equityPoint, 0, len(summaries))
+				for _, s := range summaries {
+					teSeries = append(teSeries, equityPoint{
+						T: s.Date.Format("2006-01-02"),
+						V: s.EndingValue,
+					})
+				}
+			}
+		} else {
+			snaps, err := store.GetPortfolioSnapshotsByMode(ctx, from, to, mode)
+			if err == nil {
+				// Collapse to one point per calendar day (last snapshot of each day).
+				byDay := map[string]float64{}
+				dayOrder := []string{}
+				for _, sn := range snaps {
+					key := sn.CreatedAt.UTC().Format("2006-01-02")
+					if _, seen := byDay[key]; !seen {
+						dayOrder = append(dayOrder, key)
+					}
+					byDay[key] = sn.TotalValue // last row wins (snaps ordered ASC)
+				}
+				teSeries = make([]equityPoint, 0, len(dayOrder))
+				for _, k := range dayOrder {
+					teSeries = append(teSeries, equityPoint{T: k, V: byDay[k]})
+				}
+			}
+		}
 	}
-	jsonResponse(w, map[string]any{"history": out})
+
+	jsonResponse(w, map[string]any{
+		"alpaca":       alpacaSeries,
+		"trade_engine": teSeries,
+		"source":       source,
+	})
 }
 
 // GET /api/portfolio/performance
+// Broker-first: derives period P&L from broker account (day) and DB summaries
+// (week/month). Falls back to DB-only when no broker is configured.
 func (s *Server) handlePortfolioPerformance(w http.ResponseWriter, r *http.Request) {
-	if !store.IsConnected() {
-		apiError(w, "database not connected", nil)
-		return
-	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-
-	snap, err := store.GetLatestPortfolioSnapshot(ctx)
-	if err != nil {
-		apiError(w, "latest snapshot query failed", err)
-		return
-	}
-	if snap == nil {
-		jsonResponse(w, map[string]any{})
-		return
-	}
 
 	now := time.Now().UTC()
 	today := now.Truncate(24 * time.Hour)
 	week := today.AddDate(0, 0, -7)
 	month := today.AddDate(0, 0, -30)
 
-	summaries, err := store.GetDailySummaries(ctx, month, today)
-	if err != nil {
-		apiError(w, "summaries query failed", err)
+	// Try broker for live current value + today P&L.
+	var currentValue float64
+	var dayPnL *float64
+	source := "db"
+
+	if s.brokerView != nil {
+		if acct, err := s.brokerView.AccountSnapshot(ctx); err == nil {
+			source = "broker"
+			currentValue = acct.Equity
+			dpnl := acct.Equity - acct.LastEquity
+			dayPnL = &dpnl
+		}
+	}
+
+	// Fall back to DB for current value when broker unavailable.
+	var staleAt *string
+	if currentValue == 0 && store.IsConnected() {
+		if snap, err := store.GetLatestPortfolioSnapshot(ctx); err == nil && snap != nil {
+			currentValue = snap.TotalValue
+			s := snap.CreatedAt.UTC().Format(time.RFC3339)
+			staleAt = &s
+		}
+	}
+
+	if currentValue == 0 {
+		jsonResponse(w, map[string]any{"source": source})
 		return
 	}
 
 	performance := map[string]any{
-		"current_value": snap.TotalValue,
+		"current_value": currentValue,
+		"source":        source,
+		"stale_at":      staleAt,
 	}
 
-	findStartValue := func(target time.Time) float64 {
-		for _, s := range summaries {
-			if s.Date.Equal(target) || s.Date.After(target) {
-				return s.StartingValue
+	// Today P&L from broker when available — set unconditionally (does not
+	// require DB). pnl_pct is relative to prior-day close (currentValue - pnl).
+	if dayPnL != nil {
+		pnl := *dayPnL
+		performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, currentValue-pnl) * 100}
+	}
+
+	// Week/month P&L always derived from DB summaries.
+	if store.IsConnected() {
+		summaries, err := store.GetDailySummaries(ctx, month, today)
+		if err == nil {
+			findStart := func(target time.Time) float64 {
+				for _, s := range summaries {
+					if s.Date.Equal(target) || s.Date.After(target) {
+						return s.StartingValue
+					}
+				}
+				return 0
+			}
+
+			if dayPnL == nil {
+				// No broker — derive today from summaries too.
+				if todayStart := findStart(today); todayStart > 0 {
+					pnl := currentValue - todayStart
+					performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, todayStart) * 100}
+				}
+			}
+			if weekStart := findStart(week); weekStart > 0 {
+				pnl := currentValue - weekStart
+				performance["week"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, weekStart) * 100}
+			}
+			if monthStart := findStart(month); monthStart > 0 {
+				pnl := currentValue - monthStart
+				performance["month"] = map[string]any{"pnl": pnl, "pnl_pct": safeDiv(pnl, monthStart) * 100}
 			}
 		}
-		return 0
-	}
-
-	todayStart := findStartValue(today)
-	weekStart := findStartValue(week)
-	monthStart := findStartValue(month)
-
-	if todayStart > 0 {
-		pnl := snap.TotalValue - todayStart
-		performance["today"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / todayStart) * 100}
-	}
-	if weekStart > 0 {
-		pnl := snap.TotalValue - weekStart
-		performance["week"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / weekStart) * 100}
-	}
-	if monthStart > 0 {
-		pnl := snap.TotalValue - monthStart
-		performance["month"] = map[string]any{"pnl": pnl, "pnl_pct": (pnl / monthStart) * 100}
 	}
 
 	jsonResponse(w, performance)
+}
+
+// safeDiv returns a/b, or 0 when b is zero (avoids division-by-zero panics).
+func safeDiv(a, b float64) float64 {
+	if b == 0 {
+		return 0
+	}
+	return a / b
 }
 
 // GET /api/portfolio/summaries
@@ -260,37 +391,76 @@ func (s *Server) handlePortfolioStats(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, stats)
 }
 
-// GET /api/portfolio/positions
-// Returns open positions from the live tracker when available, enriched with
-// trade metadata (direction, strategy) from the store. Falls back to open
-// trades from the store when the tracker is not initialized.
-func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
-	if s.tracker != nil {
-		positions := s.tracker.Positions()
+// positionDTO is the wire shape for a single position in /api/portfolio/positions.
+type positionDTO struct {
+	Ticker       string  `json:"Ticker"`
+	Direction    string  `json:"Direction"`
+	Strategy     string  `json:"Strategy"`
+	EntryPrice   float64 `json:"EntryPrice"`
+	CurrentPrice float64 `json:"CurrentPrice"`
+	Quantity     float64 `json:"Quantity"`
+	PnL          float64 `json:"PnL"`
+	PnLPct       float64 `json:"PnLPct"`
+}
 
-		// Enrich positions with direction/strategy from open trades if DB is available.
-		tradeByTicker := map[string]store.Trade{}
-		if store.IsConnected() {
-			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-			defer cancel()
-			if openTrades, err := store.GetOpenTrades(ctx); err == nil {
-				for _, t := range openTrades {
-					tradeByTicker[t.Ticker] = t
-				}
+// GET /api/portfolio/positions
+// Broker-first: fetches live positions from broker, enriches with trade metadata
+// from the DB, and falls back to tracker → DB when broker is unavailable.
+func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	// Build trade-metadata lookup once (used by all paths that have DB).
+	tradeByTicker := map[string]store.Trade{}
+	if store.IsConnected() {
+		if openTrades, err := store.GetOpenTrades(ctx); err == nil {
+			for _, t := range openTrades {
+				tradeByTicker[t.Ticker] = t
 			}
 		}
+	}
 
-		type positionDTO struct {
-			Ticker       string  `json:"Ticker"`
-			Direction    string  `json:"Direction"`
-			Strategy     string  `json:"Strategy"`
-			EntryPrice   float64 `json:"EntryPrice"`
-			CurrentPrice float64 `json:"CurrentPrice"`
-			Quantity     float64 `json:"Quantity"`
-			PnL          float64 `json:"PnL"`
-			PnLPct       float64 `json:"PnLPct"`
+	// ── 1. Broker-direct ─────────────────────────────────────────────────────
+	if s.brokerView != nil {
+		brokerPositions, err := s.brokerView.PositionsSnapshot(ctx)
+		if err == nil {
+			dtos := make([]positionDTO, 0, len(brokerPositions))
+			for _, p := range brokerPositions {
+				dto := positionDTO{
+					Ticker:       p.Symbol,
+					EntryPrice:   p.AvgEntryPrice,
+					CurrentPrice: p.CurrentPrice,
+					Quantity:     p.Quantity,
+					PnL:          p.UnrealizedPL,
+					Direction:    p.Side,
+				}
+				// Use absolute quantity so short positions (negative qty) don't
+				// produce a negative cost basis and a nonsensical PnLPct.
+				qtyAbs := p.Quantity
+				if qtyAbs < 0 {
+					qtyAbs = -qtyAbs
+				}
+				costBasis := p.AvgEntryPrice * qtyAbs
+				if costBasis > 0 {
+					dto.PnLPct = safeDiv(p.UnrealizedPL, costBasis) * 100
+				}
+				if t, ok := tradeByTicker[p.Symbol]; ok {
+					if dto.Direction == "" {
+						dto.Direction = t.Direction
+					}
+					dto.Strategy = t.Strategy
+				}
+				dtos = append(dtos, dto)
+			}
+			jsonResponse(w, map[string]any{"positions": dtos, "source": "broker", "stale_at": nil})
+			return
 		}
+		logger.Warn("broker PositionsSnapshot failed, falling back", "err", err)
+	}
 
+	// ── 2. In-process tracker ─────────────────────────────────────────────────
+	if s.tracker != nil {
+		positions := s.tracker.Positions()
 		dtos := make([]positionDTO, 0, len(positions))
 		for _, p := range positions {
 			dto := positionDTO{
@@ -302,11 +472,11 @@ func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request
 			if p.CurrentPrice > 0 {
 				dto.CurrentPrice = p.CurrentPrice
 			} else if p.Quantity > 0 {
-				dto.CurrentPrice = p.CurrentValue / p.Quantity
+				dto.CurrentPrice = safeDiv(p.CurrentValue, p.Quantity)
 			}
 			costBasis := p.AvgCostBasis * p.Quantity
 			if costBasis > 0 {
-				dto.PnLPct = (p.UnrealizedPL / costBasis) * 100
+				dto.PnLPct = safeDiv(p.UnrealizedPL, costBasis) * 100
 			}
 			if p.Side != "" {
 				dto.Direction = p.Side
@@ -319,17 +489,15 @@ func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request
 			}
 			dtos = append(dtos, dto)
 		}
-		jsonResponse(w, map[string]any{"positions": dtos})
+		jsonResponse(w, map[string]any{"positions": dtos, "source": "tracker", "stale_at": nil})
 		return
 	}
 
-	// Tracker not initialized — fall back to open trades from the store.
+	// ── 3. DB fallback ────────────────────────────────────────────────────────
 	if !store.IsConnected() {
 		apiError(w, "portfolio tracker not initialized and database not connected", nil)
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
 	trades, err := store.GetOpenTrades(ctx)
 	if err != nil {
 		apiError(w, "positions query failed", err)
@@ -338,7 +506,7 @@ func (s *Server) handlePortfolioPositions(w http.ResponseWriter, r *http.Request
 	if trades == nil {
 		trades = []store.Trade{}
 	}
-	jsonResponse(w, map[string]any{"positions": trades})
+	jsonResponse(w, map[string]any{"positions": trades, "source": "db", "stale_at": nil})
 }
 
 // GET /api/node/ticker/:ticker

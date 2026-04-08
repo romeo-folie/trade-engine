@@ -294,6 +294,19 @@ func Defaults() *Config {
 			MaxRiskPct:     1.0,
 			MaxPositionPct: 10.0,
 		},
+		Portfolio: PortfolioConfig{
+			Poller: PollerConfig{
+				Enabled:             true,
+				IntervalSec:         60,
+				SignificantChangePct: 0.05,
+			},
+			Cache: CacheConfig{
+				AccountTTLSec:   3,
+				PositionsTTLSec: 3,
+				HistoryTTLSec:   30,
+				OrdersTTLSec:    10,
+			},
+		},
 		Feedback: FeedbackConfig{
 			Enabled:             false,
 			ReviewTimeUTC:       "18:00",

@@ -91,3 +91,25 @@ func (p *PaperExecutor) GetPositions(_ context.Context) ([]Position, error) {
 func (p *PaperExecutor) GetAccount(_ context.Context) (AccountInfo, error) {
 	return AccountInfo{}, nil
 }
+
+// ─── BrokerView ───────────────────────────────────────────────────────────────
+//
+// PaperExecutor has no real broker connection, so every BrokerView call returns
+// ErrBrokerUnavailable. The web layer uses this to fall back to DB-derived data
+// and surface a "stale" badge in the UI.
+
+func (p *PaperExecutor) AccountSnapshot(_ context.Context) (BrokerAccount, error) {
+	return BrokerAccount{}, ErrBrokerUnavailable
+}
+
+func (p *PaperExecutor) PositionsSnapshot(_ context.Context) ([]BrokerPosition, error) {
+	return nil, ErrBrokerUnavailable
+}
+
+func (p *PaperExecutor) EquityCurve(_ context.Context, _, _ string) (EquityHistory, error) {
+	return EquityHistory{}, ErrBrokerUnavailable
+}
+
+func (p *PaperExecutor) RecentFills(_ context.Context) ([]BrokerOrder, error) {
+	return nil, ErrBrokerUnavailable
+}

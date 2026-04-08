@@ -1,78 +1,46 @@
 /**
- * Portfolio screen — equity curve, KPI cards, positions table, performance metrics.
+ * Portfolio screen — live broker-direct equity, KPI cards, overlay chart,
+ * positions table, performance metrics.
  *
- * Fetches live portfolio snapshot from GET /api/node/portfolio every 15s.
- * Trades fetch (GET /api/trades/recent) is intentionally deferred — will be
- * added when the trades table is implemented in a future task.
- * Open positions use mock data until a dedicated endpoint.
- *
- * Task 4 of the web redesign (closes #204).
+ * Data sources (Phase 18):
+ *   GET /api/node/portfolio      — account snapshot (broker-first, 5s refresh)
+ *   GET /api/portfolio/history   — dual equity series (Alpaca + TradeEngine)
+ *   GET /api/portfolio/positions — positions (broker-first)
+ *   GET /api/portfolio/summaries — 7-day period performance
+ *   GET /api/portfolio/stats     — aggregate win-rate, PF, etc.
  */
 import { useState, useEffect, useMemo, useRef } from 'react';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
-import EquityCurve from '../components/portfolio/EquityCurve';
+import OverlayChart, { ChartMode } from '../components/portfolio/OverlayChart';
 import PositionsTable from '../components/portfolio/PositionsTable';
+import ErrorBoundary from '../components/ErrorBoundary';
 import styles from './Portfolio.module.css';
 
 /* ── API response types ─────────────────────────────────────────────────────── */
 
 interface PortfolioSnapshot {
-  ID: string;
   TotalValue: number;
   Cash: number;
   Invested: number;
   UnrealizedPnL: number;
   DayPnL: number;
+  BuyingPower?: number;
   OpenPositions: number;
-  CreatedAt: string;
+  source: 'broker' | 'tracker' | 'db';
+  stale_at: string | null;
 }
 
-// Trade interface deferred — will be added when trades table is rendered
-
-/* ── Mock data ──────────────────────────────────────────────────────────────── */
-
-// TODO: replace with /api/positions when backend endpoint is available
-
-// TODO: replace with real equity history from /api/portfolio/history when available
-function generateMockEquityData(currentValue: number): { date: string; value: number }[] {
-  const points: { date: string; value: number }[] = [];
-  const now = new Date();
-  const startValue = currentValue * 0.95;
-  for (let i = 16; i >= 0; i--) {
-    const d = new Date(now);
-    d.setDate(d.getDate() - i);
-    const progress = (16 - i) / 16;
-    const noise = (Math.sin(i * 1.7) * 0.015) + (Math.cos(i * 0.8) * 0.008);
-    const value = startValue + (currentValue - startValue) * progress + currentValue * noise;
-    points.push({
-      date: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`,
-      value: Math.round(value * 100) / 100,
-    });
-  }
-  return points;
+interface EquityPoint {
+  t: string;
+  v: number;
 }
 
-// TODO: derive from DailySummary endpoint when available
-
-// TODO: derive from trades data when sufficient history is available
-
-/* ── Helpers ────────────────────────────────────────────────────────────────── */
-
-function fmt$(n: number): string {
-  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+interface HistoryResponse {
+  alpaca: EquityPoint[] | null;
+  trade_engine: EquityPoint[] | null;
+  source: string;
 }
-
-function fmtPnl(n: number): string {
-  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
-  return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-}
-
-function pnlColor(n: number): string {
-  return n >= 0 ? TOKENS.emerald : TOKENS.red;
-}
-
-/* ── Component ──────────────────────────────────────────────────────────────── */
 
 interface DailySummary {
   ID: string;
@@ -95,26 +63,84 @@ interface PortfolioStats {
   WorstDayPnl: number;
 }
 
+/* ── Helpers ────────────────────────────────────────────────────────────────── */
+
+function fmt$(n: number): string {
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtPnl(n: number): string {
+  const sign = n > 0 ? '+' : n < 0 ? '-' : '';
+  return `${sign}$${Math.abs(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function pnlColor(n: number): string {
+  return n >= 0 ? TOKENS.emerald : TOKENS.red;
+}
+
+function formatStaleTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false });
+  } catch {
+    return iso;
+  }
+}
+
+/* ── Source badge ───────────────────────────────────────────────────────────── */
+
+function SourceBadge({ source, staleAt }: { source?: string; staleAt?: string | null }) {
+  if (!source) return null;
+  const isLive = source === 'broker' || source === 'tracker';
+  const label  = isLive ? 'LIVE' : `STALE ${staleAt ? formatStaleTime(staleAt) : ''}`.trim();
+  const color  = isLive ? TOKENS.acidGreen : TOKENS.amber;
+  return (
+    <span style={{
+      fontFamily: 'var(--font-mono)',
+      fontSize: 10,
+      color,
+      border: `1px solid ${color}`,
+      borderRadius: 3,
+      padding: '1px 6px',
+      letterSpacing: '0.08em',
+    }}>
+      {label}
+    </span>
+  );
+}
+
 /* ── Component ──────────────────────────────────────────────────────────────── */
 
+type ModeFilter = 'all' | 'live' | 'paper';
+const CHART_MODES: { key: ChartMode; label: string }[] = [
+  { key: 'overlay', label: 'OVERLAY' },
+  { key: 'alpaca',  label: 'ALPACA'  },
+  { key: 'te',      label: 'TRADEENGINE' },
+];
+const MODE_FILTERS: { key: ModeFilter; label: string }[] = [
+  { key: 'all',   label: 'ALL'   },
+  { key: 'live',  label: 'LIVE'  },
+  { key: 'paper', label: 'PAPER' },
+];
+
 export default function PortfolioScreen() {
-  const [snapshot, setSnapshot] = useState<PortfolioSnapshot | null>(null);
-  const [summaries, setSummaries] = useState<DailySummary[]>([]);
-  const [stats, setStats] = useState<PortfolioStats | null>(null);
-  const [positions, setPositions] = useState<any[]>([]);
+  const [snapshot, setSnapshot]     = useState<PortfolioSnapshot | null>(null);
+  const [history, setHistory]       = useState<HistoryResponse | null>(null);
+  const [summaries, setSummaries]   = useState<DailySummary[]>([]);
+  const [stats, setStats]           = useState<PortfolioStats | null>(null);
+  const [positions, setPositions]   = useState<any[]>([]);
   const [fetchError, setFetchError] = useState<string | null>(null);
-  // Per-tick AbortController ref — aborts previous in-flight request before starting new one
+  const [chartMode, setChartMode]   = useState<ChartMode>('overlay');
+  const [modeFilter, setModeFilter] = useState<ModeFilter>('all');
   const fetchControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     async function load() {
-      // Abort any prior in-flight request before starting a new one
       fetchControllerRef.current?.abort();
       const controller = new AbortController();
       fetchControllerRef.current = controller;
 
       try {
-        // Fetch snapshot
+        // Snapshot
         const resSn = await fetch('/api/node/portfolio', { signal: controller.signal });
         if (resSn.ok) {
           const data = await resSn.json();
@@ -124,21 +150,25 @@ export default function PortfolioScreen() {
           }
         }
 
-        // Fetch daily summaries (period performance)
+        // Equity history (dual series)
+        const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
+        const resHist = await fetch(histUrl, { signal: controller.signal });
+        if (resHist.ok) {
+          setHistory(await resHist.json());
+        }
+
+        // Daily summaries
         const resSum = await fetch('/api/portfolio/summaries?limit=7', { signal: controller.signal });
         if (resSum.ok) {
           const data = await resSum.json();
           setSummaries(data.summaries || []);
         }
 
-        // Fetch stats
+        // Stats
         const resStats = await fetch('/api/portfolio/stats', { signal: controller.signal });
-        if (resStats.ok) {
-          const statsData = await resStats.json();
-          setStats(statsData);
-        }
+        if (resStats.ok) setStats(await resStats.json());
 
-        // Fetch positions
+        // Positions
         const resPos = await fetch('/api/portfolio/positions', { signal: controller.signal });
         if (resPos.ok) {
           const posData = await resPos.json();
@@ -153,32 +183,34 @@ export default function PortfolioScreen() {
     }
 
     load();
-    const interval = setInterval(load, 15_000);
+    // 5s background refresh — broker data stays fresh without overwhelming the API
+    // (brokercache absorbs burst; see internal/web/brokercache.go TTLs)
+    const interval = setInterval(load, 5_000);
     return () => {
       fetchControllerRef.current?.abort();
       clearInterval(interval);
     };
-  }, []);
+  }, [modeFilter]); // re-fetch when mode filter changes
 
-  // Use real snapshot data only — no hardcoded fallbacks for financial values.
-  const hasData = snapshot !== null;
+  const hasData    = snapshot !== null;
   const totalValue = snapshot?.TotalValue ?? 0;
-  const cash = snapshot?.Cash ?? 0;
-  const invested = snapshot?.Invested ?? 0;
+  const cash       = snapshot?.Cash ?? 0;
+  const invested   = snapshot?.Invested ?? 0;
   const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
-  const dayPnl = snapshot?.DayPnL ?? 0;
+  const dayPnl     = snapshot?.DayPnL ?? 0;
 
-  const equityData = useMemo(() => {
-    if (!hasData) return [];
-    // If we have real historical summaries, use them. Otherwise fallback to mock for the chart.
+  const alpacaSeries = useMemo(() => history?.alpaca ?? [], [history]);
+  const teSeries     = useMemo(() => {
+    if (history?.trade_engine?.length) return history.trade_engine;
+    // Fallback: build from DB summaries when history endpoint has no TE series
     if (summaries.length > 1) {
       return [...summaries].reverse().map(s => ({
-        date: s.Date.split('T')[0],
-        value: s.EndingValue
+        t: s.Date.split('T')[0],
+        v: s.EndingValue,
       }));
     }
-    return generateMockEquityData(totalValue);
-  }, [totalValue, summaries, hasData]);
+    return [];
+  }, [history, summaries]);
 
   return (
     <div className={styles.screen}>
@@ -187,9 +219,12 @@ export default function PortfolioScreen() {
           <span className={styles.breadcrumbBrand}>~/</span>
           <span className={styles.breadcrumbPage}>PORTFOLIO</span>
         </div>
-        <div className={styles.autoRefresh}>
-          <span className={styles.greenDot} />
-          AUTO-REFRESH 15s
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <SourceBadge source={snapshot?.source} staleAt={snapshot?.stale_at} />
+          <div className={styles.autoRefresh}>
+            <span className={styles.greenDot} />
+            AUTO-REFRESH 5s
+          </div>
         </div>
       </div>
 
@@ -218,10 +253,64 @@ export default function PortfolioScreen() {
         />
       </div>
 
-      {/* ── Equity Curve ──────────────────────────────────────────────────── */}
+      {/* ── Equity Chart ──────────────────────────────────────────────────── */}
       <div className={styles.curveSection}>
-        {hasData ? (
-          <EquityCurve data={equityData} />
+        {/* Chart controls: source tabs + mode filter */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+          {/* Source tabs */}
+          <div style={{ display: 'flex', gap: 2 }}>
+            {CHART_MODES.map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => setChartMode(key)}
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 10,
+                  letterSpacing: '0.08em',
+                  padding: '3px 8px',
+                  border: `1px solid ${chartMode === key ? TOKENS.acidGreen : TOKENS.border}`,
+                  borderRadius: 3,
+                  background: chartMode === key ? TOKENS.accentGlow : 'transparent',
+                  color: chartMode === key ? TOKENS.acidGreen : TOKENS.textFaint,
+                  cursor: 'pointer',
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Mode filter */}
+          <div style={{ display: 'flex', gap: 2 }}>
+            {MODE_FILTERS.map(({ key, label }) => (
+              <button
+                key={key}
+                onClick={() => setModeFilter(key)}
+                style={{
+                  fontFamily: 'var(--font-mono)',
+                  fontSize: 10,
+                  letterSpacing: '0.08em',
+                  padding: '3px 8px',
+                  border: `1px solid ${modeFilter === key ? TOKENS.amber : TOKENS.border}`,
+                  borderRadius: 3,
+                  background: modeFilter === key ? 'rgba(245,158,11,0.1)' : 'transparent',
+                  color: modeFilter === key ? TOKENS.amber : TOKENS.textFaint,
+                  cursor: 'pointer',
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {hasData || alpacaSeries.length > 0 || teSeries.length > 0 ? (
+          <ErrorBoundary fallback={<div className={styles.curvePlaceholder}>Chart unavailable</div>}>
+            <OverlayChart
+              alpaca={alpacaSeries}
+              tradeEngine={teSeries}
+              mode={chartMode}
+            />
+          </ErrorBoundary>
         ) : (
           <div className={styles.curvePlaceholder}>
             {fetchError ? 'Unable to load equity data' : 'Loading equity data…'}

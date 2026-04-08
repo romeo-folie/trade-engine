@@ -34,6 +34,31 @@ type Config struct {
 	ORB           ORBConfig           `yaml:"orb"`
 	ForexORB      ForexORBConfig      `yaml:"forex_orb"`
 	Feedback      FeedbackConfig      `yaml:"feedback"`
+	Portfolio     PortfolioConfig     `yaml:"portfolio"`
+}
+
+// ── Portfolio ──────────────────────────────────────────────────────────────────
+
+// PortfolioConfig groups broker-direct portfolio settings (Phase 18).
+type PortfolioConfig struct {
+	Poller PollerConfig `yaml:"poller"`
+	Cache  CacheConfig  `yaml:"cache"`
+}
+
+// PollerConfig controls the independent portfolio snapshot goroutine that
+// writes rows to portfolio_snapshots regardless of engine tick cadence.
+type PollerConfig struct {
+	Enabled               bool    `yaml:"enabled"`
+	IntervalSec           int     `yaml:"interval_sec"`             // seconds between polls (default 60)
+	SignificantChangePct   float64 `yaml:"significant_change_pct"`   // extra snapshot when equity moves by this % (default 0.05)
+}
+
+// CacheConfig controls the web-layer broker TTL cache.
+type CacheConfig struct {
+	AccountTTLSec   int `yaml:"account_ttl_sec"`   // default 3
+	PositionsTTLSec int `yaml:"positions_ttl_sec"` // default 3
+	HistoryTTLSec   int `yaml:"history_ttl_sec"`   // default 30
+	OrdersTTLSec    int `yaml:"orders_ttl_sec"`    // default 10
 }
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).

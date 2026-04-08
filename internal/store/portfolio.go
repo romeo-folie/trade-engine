@@ -16,7 +16,76 @@ type PortfolioSnapshot struct {
 	UnrealizedPnL    float64
 	RealizedPnLToday float64
 	OpenPositions    int
+	Source           string // "engine" | "poller" | "backfill"
+	Mode             string // "live" | "paper" (empty for pre-migration rows)
+	Broker           string // "alpaca" | "ibkr" (empty for pre-migration rows)
 	CreatedAt        time.Time
+}
+
+// InsertPortfolioSnapshot writes a snapshot row. source/mode/broker tag the
+// origin of the data (added by migration 021). Pass empty strings for
+// pre-migration compatibility — Postgres will use the column DEFAULT.
+func InsertPortfolioSnapshot(ctx context.Context, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, source, mode, broker string) error {
+	if source == "" {
+		source = "engine"
+	}
+	_, err := GetDB().Exec(ctx, `
+		INSERT INTO portfolio_snapshots
+		  (total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions, source, mode, broker)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		totalValue, cash, invested, unrealizedPnL, realizedPnLToday, openPositions,
+		source, nullableText(mode), nullableText(broker),
+	)
+	return err
+}
+
+// nullableText converts an empty string to nil so Postgres stores NULL.
+func nullableText(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
+// GetPortfolioSnapshotsByMode returns snapshots within [from, to] filtered by
+// mode ("live"/"paper"/"" for all), ordered by time ascending.
+func GetPortfolioSnapshotsByMode(ctx context.Context, from, to time.Time, mode string) ([]PortfolioSnapshot, error) {
+	var query string
+	var args []any
+	if mode == "" || mode == "all" {
+		query = `SELECT id, total_value, cash, invested, unrealized_pnl, realized_pnl_today,
+		                open_positions, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
+		         FROM portfolio_snapshots
+		         WHERE created_at >= $1 AND created_at <= $2
+		         ORDER BY created_at ASC`
+		args = []any{from.UTC(), to.UTC()}
+	} else {
+		query = `SELECT id, total_value, cash, invested, unrealized_pnl, realized_pnl_today,
+		                open_positions, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
+		         FROM portfolio_snapshots
+		         WHERE created_at >= $1 AND created_at <= $2 AND mode = $3
+		         ORDER BY created_at ASC`
+		args = []any{from.UTC(), to.UTC(), mode}
+	}
+	rows, err := GetDB().Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var snaps []PortfolioSnapshot
+	for rows.Next() {
+		var s PortfolioSnapshot
+		if err := rows.Scan(
+			&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
+			&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+			&s.Source, &s.Mode, &s.Broker, &s.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		snaps = append(snaps, s)
+	}
+	return snaps, rows.Err()
 }
 
 // DailySummary mirrors a row from the daily_summaries table.
