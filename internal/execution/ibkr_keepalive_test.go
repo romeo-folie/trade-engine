@@ -187,6 +187,65 @@ func TestStartAuthMonitor_StopCancelsGoroutine(t *testing.T) {
 	}
 }
 
+func TestStartAuthMonitor_OnRecoveredNotCalledWithoutPriorAlert(t *testing.T) {
+	// Coherence: onRecovered must NOT fire when the corresponding expiry alert
+	// was suppressed by the debounce window.
+	//
+	// Scenario:
+	//   Cycle 1 — down → alert fires (alertSent=true) → up → onRecovered fires
+	//             alertSent is reset to false.
+	//   Cycle 2 — down again within debounce window → alert suppressed
+	//             (alertSent stays false) → up → onRecovered must NOT fire.
+	var authenticated atomic.Bool
+	authenticated.Store(false) // start down
+
+	srv := newAuthStatusServer(t, &authenticated)
+	defer srv.Close()
+
+	b := NewIBKRBroker(config.IBKRConfig{GatewayURL: srv.URL, InsecureTLS: false})
+
+	expiredCh := make(chan struct{}, 2)
+	recoveredCh := make(chan struct{}, 2)
+
+	// 1-minute debounce: first alert fires immediately, second within 1 min is suppressed.
+	stop := b.StartAuthMonitor(t.Context(), 1, 1,
+		func(_ string) { expiredCh <- struct{}{} },
+		func(_ string) { recoveredCh <- struct{}{} },
+	)
+	defer stop()
+
+	// --- Cycle 1: confirm first expiry alert fires ---
+	select {
+	case <-expiredCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cycle-1 expiry alert")
+	}
+
+	// Restore session — onRecovered should fire (alertSent=true from cycle 1).
+	authenticated.Store(true)
+	select {
+	case <-recoveredCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for cycle-1 recovery alert")
+	}
+
+	// --- Cycle 2: drop session again within debounce window ---
+	// alertSent was reset to false on recovery; new expiry is within 1-min debounce.
+	authenticated.Store(false)
+
+	// Wait for the monitor to observe the down state.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Restore session — onRecovered must NOT fire (no alert was sent this cycle).
+	authenticated.Store(true)
+	select {
+	case <-recoveredCh:
+		t.Error("onRecovered fired in cycle 2 without a prior expiry alert — coherence violated")
+	case <-time.After(2500 * time.Millisecond):
+		// Pass: no spurious recovery notification.
+	}
+}
+
 func TestStartAuthMonitor_DefaultsAppliedWhenZero(t *testing.T) {
 	// Passing 0 for monitorSec and debounceMin should not panic and should
 	// apply the defaults (60s and 30m). We only verify no panic here since

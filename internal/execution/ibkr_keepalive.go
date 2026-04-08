@@ -32,7 +32,12 @@ func (b *IBKRBroker) CheckAuth(ctx context.Context) error {
 //
 // Repeated onExpired calls are debounced: the callback is suppressed until
 // debounceMin minutes have elapsed since the last invocation, so the user
-// does not receive a flood of alerts while re-authenticating.
+// does not receive a flood of alerts while re-authenticating. onRecovered is
+// only called when an expiry alert was actually sent, keeping the two
+// notifications coherent.
+//
+// Callbacks are dispatched in their own goroutines so that blocking network
+// I/O (e.g. a Telegram send) does not stall the poll loop or delay shutdown.
 //
 // Either callback may be nil. The returned stop function cancels the goroutine.
 func (b *IBKRBroker) StartAuthMonitor(
@@ -57,6 +62,7 @@ func (b *IBKRBroker) StartAuthMonitor(
 
 		var lastAlerted time.Time
 		wasDown := false
+		alertSent := false // tracks whether an expiry alert was actually dispatched
 
 		for {
 			select {
@@ -65,17 +71,23 @@ func (b *IBKRBroker) StartAuthMonitor(
 			case <-ticker.C:
 				err := b.CheckAuth(ctx)
 				if err != nil {
-					logger.Warn("ibkr auth monitor: session not authenticated", "err", err)
+					if !wasDown {
+						logger.Warn("ibkr auth monitor: session not authenticated", "err", err)
+					}
 					if onExpired != nil && time.Since(lastAlerted) >= time.Duration(debounceMin)*time.Minute {
-						onExpired(b.gatewayURL)
+						url := b.gatewayURL
+						go onExpired(url)
 						lastAlerted = time.Now()
+						alertSent = true
 					}
 					wasDown = true
 				} else {
-					if wasDown && onRecovered != nil {
-						onRecovered(b.gatewayURL)
+					if wasDown && alertSent && onRecovered != nil {
+						url := b.gatewayURL
+						go onRecovered(url)
 					}
 					wasDown = false
+					alertSent = false
 				}
 			}
 		}
