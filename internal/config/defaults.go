@@ -125,10 +125,12 @@ func Defaults() *Config {
 				DataURL:   "https://data.alpaca.markets",
 			},
 			IBKR: IBKRConfig{
-				Enabled:     false,
-				GatewayURL:  "https://localhost:5000",
-				TickleSec:   240,
-				InsecureTLS: true,
+				Enabled:              false,
+				GatewayURL:           "https://localhost:5000",
+				TickleSec:            240,
+				InsecureTLS:          true,
+				AuthMonitorSec:       60,
+				AuthAlertDebounceMin: 30,
 			},
 			News: NewsAPIConfig{
 				Provider:                     "finnhub",

@@ -256,6 +256,34 @@ Modes:
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
 			defer stopKeepalive()
 
+			stopAuthMonitor := ibkrBroker.StartAuthMonitor(
+				ctx,
+				cfg.Markets.IBKR.AuthMonitorSec,
+				cfg.Markets.IBKR.AuthAlertDebounceMin,
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					msg := fmt.Sprintf(
+						"🔐 *IBKR session expired*\nGateway: `%s`\nPlease re-authenticate via the Client Portal.",
+						gatewayURL,
+					)
+					if err := tgBot.SendImmediate(ctx, msg); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send alert", "err", err)
+					}
+				},
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					msg := fmt.Sprintf("✅ *IBKR session restored*\nGateway: `%s`", gatewayURL)
+					if err := tgBot.SendImmediate(ctx, msg); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send recovery alert", "err", err)
+					}
+				},
+			)
+			defer stopAuthMonitor()
+
 			// 3. Create IBKR market data client.
 			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
 
