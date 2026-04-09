@@ -52,7 +52,7 @@ func (b *IBKRBroker) PositionsSnapshot(ctx context.Context) ([]BrokerPosition, e
 		MktValue     float64 `json:"mktValue"`
 		UnrealizedPL float64 `json:"unrealizedPnl"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr PositionsSnapshot: %w", err)
 	}
 
@@ -96,7 +96,7 @@ func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 		TradeTime   string  `json:"trade_time"` // e.g. "20240101-12:00:00"
 		Conid       int     `json:"conid"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/iserver/account/trades", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr RecentFills: %w", err)
 	}
 

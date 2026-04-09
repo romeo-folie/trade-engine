@@ -365,7 +365,7 @@ func (b *IBKRBroker) do(ctx context.Context, method, path string, body any, out 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("ibkr %s %s → %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(respBytes))
 	}
-	if out != nil && len(respBytes) > 0 {
+	if out != nil && len(bytes.TrimSpace(respBytes)) > 0 {
 		return json.Unmarshal(respBytes, out)
 	}
 	return nil
