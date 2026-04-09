@@ -50,7 +50,7 @@ func (b *IBKRBroker) resolveConid(ctx context.Context, pair string, secType stri
 		Description string `json:"description"`
 		Exchange    string `json:"exchange"`
 	}
-	path := "/iserver/secdef/search?symbol=" + base + "&secType=" + secType
+	path := "/v1/api/iserver/secdef/search?symbol=" + base + "&secType=" + secType
 	if err := b.do(ctx, "GET", path, nil, &results); err != nil {
 		return "", fmt.Errorf("ibkr resolveConid: search %q: %w", pair, err)
 	}

@@ -194,6 +194,15 @@ Modes:
 				// Auto-degrade alerts bypass the batch queue via SendImmediate.
 				eng.SetCostNotifier(tgBot)
 				logger.Info("telegram notifications enabled", "batch_enabled", cfg.Notifications.Telegram.BatchEnabled)
+
+				startMsg := fmt.Sprintf("🟢 *TradeEngine started*\nMode: `%s`", mode)
+				if mode == "orb-forex" && cfg.ForexORB.Session != "" {
+					startMsg += fmt.Sprintf(" · Session: `%s`", cfg.ForexORB.Session)
+				}
+				startMsg += fmt.Sprintf("\nTick: `%ds`", cfg.Engine.TickIntervalSec)
+				if err := tgBot.SendImmediate(ctx, startMsg); err != nil {
+					logger.Warn("telegram: failed to send startup notification", "err", err)
+				}
 			}
 		}
 

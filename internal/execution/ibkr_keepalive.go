@@ -16,7 +16,7 @@ func (b *IBKRBroker) CheckAuth(ctx context.Context) error {
 		Authenticated bool `json:"authenticated"`
 		Connected     bool `json:"connected"`
 	}
-	if err := b.do(ctx, "GET", "/iserver/auth/status", nil, &status); err != nil {
+	if err := b.do(ctx, "GET", "/v1/api/iserver/auth/status", nil, &status); err != nil {
 		return fmt.Errorf("ibkr CheckAuth: %w", err)
 	}
 	if !status.Authenticated || !status.Connected {
@@ -117,7 +117,7 @@ func (b *IBKRBroker) StartKeepalive(ctx context.Context, tickleSec int) func() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if err := b.do(ctx, "POST", "/iserver/auth/tickle", nil, nil); err != nil {
+				if err := b.do(ctx, "POST", "/v1/api/iserver/auth/tickle", nil, nil); err != nil {
 					logger.Warn("ibkr keepalive tickle failed", "err", err)
 				}
 			}

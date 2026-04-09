@@ -204,7 +204,7 @@ func (c *IBKRClient) FetchCandles(ctx context.Context, ticker string, tf Timefra
 	params.Set("bar", barSize)
 	params.Set("outsideRth", "true")
 
-	resp, err := c.get(ctx, "/iserver/marketdata/history", params)
+	resp, err := c.get(ctx, "/v1/api/iserver/marketdata/history", params)
 	if err != nil {
 		return nil, fmt.Errorf("fetch candles %s: %w", ticker, err)
 	}
@@ -252,7 +252,7 @@ func (c *IBKRClient) FetchQuote(ctx context.Context, ticker string) (*Quote, err
 		params.Set("conids", conid)
 		params.Set("fields", "84,85,86")
 
-		resp, err := c.get(ctx, "/iserver/marketdata/snapshot", params)
+		resp, err := c.get(ctx, "/v1/api/iserver/marketdata/snapshot", params)
 		if err != nil {
 			return nil, fmt.Errorf("fetch quote %s: %w", ticker, err)
 		}

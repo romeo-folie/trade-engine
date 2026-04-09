@@ -83,7 +83,7 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 
 	// POST orders — IBKR may return a confirmation prompt instead of an order ID.
 	var rawResp json.RawMessage
-	if err := b.do(ctx, http.MethodPost, "/iserver/account/"+b.accountID+"/orders", payload, &rawResp); err != nil {
+	if err := b.do(ctx, http.MethodPost, "/v1/api/iserver/account/"+b.accountID+"/orders", payload, &rawResp); err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: %w", err)
 	}
 
@@ -119,7 +119,7 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 
 	replyID := replyPrompts[0].ID
 	var confirmed json.RawMessage
-	if err := b.do(ctx, http.MethodPost, "/iserver/reply/"+replyID, map[string]bool{"confirmed": true}, &confirmed); err != nil {
+	if err := b.do(ctx, http.MethodPost, "/v1/api/iserver/reply/"+replyID, map[string]bool{"confirmed": true}, &confirmed); err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: confirm reply %s: %w", replyID, err)
 	}
 
@@ -128,7 +128,7 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 
 // CancelOrder sends a DELETE request to cancel an open order.
 func (b *IBKRBroker) CancelOrder(ctx context.Context, brokerOrderID string) error {
-	return b.do(ctx, http.MethodDelete, "/iserver/account/"+b.accountID+"/order/"+brokerOrderID, nil, nil)
+	return b.do(ctx, http.MethodDelete, "/v1/api/iserver/account/"+b.accountID+"/order/"+brokerOrderID, nil, nil)
 }
 
 // GetOrderStatus fetches the current state of an order by scanning the live order list.
@@ -141,7 +141,7 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 			FilledQty   float64 `json:"filledQuantity"`
 		} `json:"orders"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/iserver/account/orders", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &resp); err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: %w", err)
 	}
 
@@ -168,7 +168,7 @@ func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		MktValue     float64 `json:"mktValue"`
 		UnrealizedPL float64 `json:"unrealizedPnl"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr GetPositions: %w", err)
 	}
 
