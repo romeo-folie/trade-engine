@@ -126,7 +126,7 @@ func Defaults() *Config {
 			},
 			IBKR: IBKRConfig{
 				Enabled:              false,
-				GatewayURL:           "https://localhost:5000",
+				GatewayURL:           "https://localhost:5001",
 				TickleSec:            240,
 				InsecureTLS:          true,
 				AuthMonitorSec:       60,
