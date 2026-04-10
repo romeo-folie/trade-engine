@@ -294,6 +294,35 @@ func Defaults() *Config {
 			MaxRiskPct:     1.0,
 			MaxPositionPct: 10.0,
 		},
+		FuturesORB: FuturesORBConfig{
+			Enabled:        false,
+			SessionOpenET:  "09:30", // US equity index futures open with the equity market
+			RangeMinutes:   15,
+			RiskReward:     2.0,
+			MaxRiskPct:     1.0,
+			MaxPositionPct: 20.0, // one ES contract is ~$255k notional — 20% of $100k = $20k cap (< 1 contract)
+			Instruments: []FuturesInstrument{
+				// US equity index futures — quarterly expiry (Mar/Jun/Sep/Dec)
+				{Symbol: "ES", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 12.50, TickBuffer: 2},
+				{Symbol: "NQ", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 5.00, TickBuffer: 2},
+				{Symbol: "YM", Exchange: "CBOT", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 1.00, TickValue: 5.00, TickBuffer: 4},
+				{Symbol: "RTY", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.10, TickValue: 5.00, TickBuffer: 4},
+			},
+		},
+		FuturesORBMetals: FuturesORBConfig{
+			Enabled:        false,
+			SessionOpenET:  "08:20", // COMEX pit open (US/Eastern)
+			RangeMinutes:   15,
+			RiskReward:     2.0,
+			MaxRiskPct:     1.0,
+			MaxPositionPct: 30.0,
+			Instruments: []FuturesInstrument{
+				// Gold futures (COMEX) — monthly expiry; 100 troy oz per contract
+				{Symbol: "GC", Exchange: "COMEX", AssetClass: "metal", ExpiryCycle: "monthly", TickSize: 0.10, TickValue: 10.00, TickBuffer: 3},
+				// Silver futures (COMEX) — monthly expiry; 5000 troy oz per contract
+				{Symbol: "SI", Exchange: "COMEX", AssetClass: "metal", ExpiryCycle: "monthly", TickSize: 0.005, TickValue: 25.00, TickBuffer: 5},
+			},
+		},
 		Portfolio: PortfolioConfig{
 			Poller: PollerConfig{
 				Enabled:             true,

@@ -31,9 +31,11 @@ type Config struct {
 	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
 	Analysis      AnalysisConfig      `yaml:"analysis"`
 	Cost          CostConfig          `yaml:"cost"`
-	ORB           ORBConfig           `yaml:"orb"`
-	ForexORB      ForexORBConfig      `yaml:"forex_orb"`
-	Feedback      FeedbackConfig      `yaml:"feedback"`
+	ORB              ORBConfig           `yaml:"orb"`
+	ForexORB         ForexORBConfig      `yaml:"forex_orb"`
+	FuturesORB       FuturesORBConfig    `yaml:"futures_orb"`
+	FuturesORBMetals FuturesORBConfig    `yaml:"futures_orb_metals"`
+	Feedback         FeedbackConfig      `yaml:"feedback"`
 	Portfolio     PortfolioConfig     `yaml:"portfolio"`
 }
 
@@ -467,6 +469,29 @@ type ForexORBConfig struct {
 	RiskReward     float64      `yaml:"risk_reward"`
 	MaxRiskPct     float64      `yaml:"max_risk_pct"`
 	MaxPositionPct float64      `yaml:"max_position_pct"`
+}
+
+// FuturesInstrument defines a single exchange-listed futures contract for ORB.
+type FuturesInstrument struct {
+	Symbol      string  `yaml:"symbol"`       // e.g. "ES", "NQ", "GC"
+	Exchange    string  `yaml:"exchange"`     // e.g. "CME", "CBOT", "COMEX"
+	AssetClass  string  `yaml:"asset_class"`  // "equity_index" | "metal" | "energy"
+	ExpiryCycle string  `yaml:"expiry_cycle"` // "quarterly" | "monthly"
+	TickSize    float64 `yaml:"tick_size"`    // minimum price increment (e.g. 0.25 for ES)
+	TickValue   float64 `yaml:"tick_value"`   // dollar value per tick (e.g. $12.50 for ES)
+	TickBuffer  int     `yaml:"tick_buffer"`  // ticks of buffer above/below range high/low
+}
+
+// FuturesORBConfig configures the Opening Range Breakout strategy for exchange-listed futures via IBKR.
+// Re-used for different asset class groups (equity index, metals, energy) via separate top-level keys.
+type FuturesORBConfig struct {
+	Enabled        bool               `yaml:"enabled"`
+	SessionOpenET  string             `yaml:"session_open_et"` // "HH:MM" in US/Eastern, e.g. "09:30"
+	RangeMinutes   int                `yaml:"range_minutes"`
+	RiskReward     float64            `yaml:"risk_reward"`
+	MaxRiskPct     float64            `yaml:"max_risk_pct"`
+	MaxPositionPct float64            `yaml:"max_position_pct"`
+	Instruments    []FuturesInstrument `yaml:"instruments"`
 }
 
 // FeedbackConfig controls the automated feedback pipeline (Phase 17).

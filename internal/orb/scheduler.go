@@ -95,8 +95,9 @@ type ORBScheduler struct {
 	bus         *events.Bus            // optional; nil means no event publishing
 	now         func() time.Time       // injectable for tests
 	scanner     CandidateScanner       // optional; nil uses inline equities scanning
-	forexCfg    *config.ForexORBConfig // optional; nil means equities mode
-	feedbackCfg *config.FeedbackConfig // optional; nil disables feedback enrichment
+	forexCfg    *config.ForexORBConfig   // optional; nil means equities mode
+	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
+	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
 
 	mu           sync.Mutex // protects state, session, candidates for TUI reads
 	state        State
@@ -156,6 +157,31 @@ func (s *ORBScheduler) SetForexConfig(cfg *config.ForexORBConfig) {
 	s.forexCfg = cfg
 }
 
+// SetFuturesConfig enables futures mode with the given configuration.
+// Call before Run to switch the scheduler from equities to futures session timing.
+func (s *ORBScheduler) SetFuturesConfig(cfg *config.FuturesORBConfig) {
+	s.futuresCfg = cfg
+}
+
+// isFuturesMode reports whether the scheduler is running in futures mode.
+func (s *ORBScheduler) isFuturesMode() bool {
+	return s.futuresCfg != nil && s.futuresCfg.Enabled
+}
+
+// futuresInstrumentForTicker returns the FuturesInstrument config for the given symbol,
+// or nil if not found or futures mode is not configured.
+func (s *ORBScheduler) futuresInstrumentForTicker(ticker string) *config.FuturesInstrument {
+	if s.futuresCfg == nil {
+		return nil
+	}
+	for i := range s.futuresCfg.Instruments {
+		if s.futuresCfg.Instruments[i].Symbol == ticker {
+			return &s.futuresCfg.Instruments[i]
+		}
+	}
+	return nil
+}
+
 // SetFeedbackConfig wires feedback configuration for ORB prompt enrichment.
 // Call before Run. If not called, prompt enrichment is disabled.
 func (s *ORBScheduler) SetFeedbackConfig(cfg *config.FeedbackConfig) {
@@ -168,8 +194,12 @@ func (s *ORBScheduler) isForexMode() bool {
 }
 
 // sessionName returns the session name used as the uniqueness key for orb_sessions.
-// Equities ORB uses "" (the default). Forex ORB derives the name from the configured session.
+// Equities ORB uses "" (the default). Forex ORB uses the configured session name.
+// Futures ORB uses "futures" — distinct from all forex session names ("london", "newyork", "both", "").
 func (s *ORBScheduler) sessionName() string {
+	if s.isFuturesMode() {
+		return "futures"
+	}
 	if s.forexCfg != nil && s.forexCfg.Enabled {
 		return s.forexCfg.Session
 	}
@@ -191,8 +221,14 @@ func (s *ORBScheduler) instrumentForTicker(ticker string) *config.Instrument {
 }
 
 // sessionOpenMinutes returns the minute-of-day for market/session open
-// in the scheduler's timezone (ET for equities, configured TZ for forex).
+// in the scheduler's timezone (ET for equities/futures, configured TZ for forex).
 func (s *ORBScheduler) sessionOpenMinutes() int {
+	if s.isFuturesMode() && s.futuresCfg.SessionOpenET != "" {
+		var h, m int
+		if _, err := fmt.Sscanf(s.futuresCfg.SessionOpenET, "%d:%d", &h, &m); err == nil {
+			return h*60 + m
+		}
+	}
 	if s.forexCfg != nil && s.forexCfg.Enabled {
 		switch s.forexCfg.Session {
 		case "london":

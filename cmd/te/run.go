@@ -49,8 +49,10 @@ Modes:
   manual     — signals are queued as pending; require approval
   auto       — signals that pass risk checks execute automatically
   paper      — paper trades on Alpaca paper API (default)
-  orb        — Opening Range Breakout mode (LLM-enhanced gap-and-go)
-  orb-forex  — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)`,
+  orb             — Opening Range Breakout mode (LLM-enhanced gap-and-go)
+  orb-forex       — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)
+  orb-futures     — Equity index futures ORB via IBKR (ES/NQ/YM/RTY; requires markets.ibkr.enabled=true)
+  orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if runDetach {
 			return startDetachedRun()
@@ -428,6 +430,161 @@ Modes:
 				return fmt.Errorf("orb-forex scheduler: %w", err)
 			}
 			fmt.Println("TradeEngine (ORB-Forex) stopped.")
+			return nil
+		}
+
+		// ORB-Futures mode: equity index futures (ES/NQ/YM/RTY) or metals (GC/SI) via IBKR.
+		if mode == "orb-futures" || mode == "orb-futures-metals" {
+			isMetals := mode == "orb-futures-metals"
+
+			// 1. Validate IBKR config.
+			if !cfg.Markets.IBKR.Enabled {
+				return fmt.Errorf("%s mode requires markets.ibkr.enabled=true", mode)
+			}
+			if cfg.Markets.IBKR.AccountID == "" {
+				return fmt.Errorf("%s mode requires markets.ibkr.account_id to be set", mode)
+			}
+
+			futuresCfg := &cfg.FuturesORB
+			if isMetals {
+				futuresCfg = &cfg.FuturesORBMetals
+			}
+			if !futuresCfg.Enabled {
+				return fmt.Errorf("%s mode requires %s.enabled=true in config", mode, map[bool]string{true: "futures_orb_metals", false: "futures_orb"}[isMetals])
+			}
+
+			// 2. Create IBKR broker and authenticate.
+			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
+			if err := ibkrBroker.CheckAuth(ctx); err != nil {
+				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
+			}
+			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
+			defer stopKeepalive()
+
+			stopAuthMonitor := ibkrBroker.StartAuthMonitor(
+				ctx,
+				cfg.Markets.IBKR.AuthMonitorSec,
+				cfg.Markets.IBKR.AuthAlertDebounceMin,
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					msg := fmt.Sprintf(
+						"🔐 *IBKR session expired*\nGateway: `%s`\nPlease re-authenticate via the Client Portal.",
+						gatewayURL,
+					)
+					if err := tgBot.SendImmediate(ctx, msg); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send alert", "err", err)
+					}
+				},
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					msg := fmt.Sprintf("✅ *IBKR session restored*\nGateway: `%s`", gatewayURL)
+					if err := tgBot.SendImmediate(ctx, msg); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send recovery alert", "err", err)
+					}
+				},
+			)
+			defer stopAuthMonitor()
+
+			// 3. Warm conid cache — resolves front-month contracts at startup.
+			// Instruments in the static FuturesConids map cost no network call;
+			// monthly-expiry instruments (GC, SI) are resolved dynamically here.
+			if err := ibkrBroker.WarmFuturesConidCache(ctx, futuresCfg.Instruments); err != nil {
+				return fmt.Errorf("%s startup: %w", mode, err)
+			}
+
+			// 4. Create IBKR market data client.
+			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
+
+			// 5. Create event bus and analyzer.
+			orbBus := events.New()
+			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
+
+			// 6. Create notification adapter.
+			var orbNotifier orb.Notifier
+			if tgBot != nil {
+				orbNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
+
+			// 7. Create portfolio valuer.
+			orbPortfolio := newDBPortfolioValuer(cfg.Engine.InitialCapital)
+
+			// 8. Build ORBConfig shim for the scheduler.
+			orbCfg := config.ORBConfig{
+				Enabled:        true,
+				Mode:           "paper",
+				MaxCandidates:  len(futuresCfg.Instruments),
+				RangeMinutes:   futuresCfg.RangeMinutes,
+				RiskReward:     futuresCfg.RiskReward,
+				MaxRiskPct:     futuresCfg.MaxRiskPct,
+				MaxPositionPct: futuresCfg.MaxPositionPct,
+			}
+
+			// 9. Create ORB scheduler with IBKR components.
+			orbScheduler := orb.NewORBScheduler(
+				orbCfg, store.GetDB(), ibkrData, analyzer,
+				ibkrBroker, orbPortfolio, orbNotifier,
+			)
+
+			// 10. Wire futures-specific config and scanner.
+			futuresScanner := &orb.FuturesCandidateScanner{
+				Instruments: futuresCfg.Instruments,
+				MarketData:  ibkrData,
+				Cfg:         *futuresCfg,
+			}
+			orbScheduler.SetScanner(futuresScanner)
+			orbScheduler.SetFuturesConfig(futuresCfg)
+
+			// 11. Wire optional news and bus.
+			if newsProvider != nil {
+				orbScheduler.SetNewsProvider(newsProvider)
+			}
+			orbScheduler.SetBus(orbBus)
+			if cfg.Feedback.Enabled {
+				orbScheduler.SetFeedbackConfig(&cfg.Feedback)
+				reviewer := feedback.NewReviewer(cfg.Feedback, orbBus, store.GetDB())
+				go func() {
+					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
+						fmt.Printf("feedback reviewer: %v\n", err)
+					}
+				}()
+			}
+
+			// 12. Start web server if requested.
+			if runWeb {
+				webSrv := web.NewServer(web.Config{
+					Port:           runWebPort,
+					Host:           "0.0.0.0",
+					AllowedOrigins: []string{"*"},
+					EngineConfig:   cfg,
+				}, orbBus, nil)
+				pc := cfg.Portfolio.Cache
+				bvCache := web.NewBrokerCache(
+					ibkrBroker,
+					time.Duration(pc.AccountTTLSec)*time.Second,
+					time.Duration(pc.PositionsTTLSec)*time.Second,
+					time.Duration(pc.HistoryTTLSec)*time.Second,
+					time.Duration(pc.OrdersTTLSec)*time.Second,
+				)
+				webSrv.SetBrokerView(bvCache)
+				if err := webSrv.Start(ctx); err != nil {
+					return fmt.Errorf("web server: %w", err)
+				}
+				defer webSrv.Stop()
+				logger.Info("web observability server started", "mode", mode, "port", runWebPort)
+				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
+			}
+
+			// 13. Run.
+			logger.Info("ORB-Futures scheduler starting", "mode", mode)
+			fmt.Printf("%s mode active. Waiting for session open (%s ET)...\n", mode, futuresCfg.SessionOpenET)
+			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
+				return fmt.Errorf("%s scheduler: %w", mode, err)
+			}
+			fmt.Printf("TradeEngine (%s) stopped.\n", mode)
 			return nil
 		}
 

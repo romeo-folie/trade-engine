@@ -135,6 +135,69 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 	}
 }
 
+// ComputeFuturesBracket derives entry/stop/target for an exchange-listed futures contract.
+//
+// Prices are snapped to the nearest tick (tickSize) and the buffer beyond the range
+// high/low is expressed as an integer number of ticks (inst.TickBuffer).
+// Position sizing uses dollar risk per contract (riskTicks × tickValue) against
+// MaxRiskPct, then clamps by MaxPositionPct using the contract's notional value
+// (entryStop × contractMultiplier where contractMultiplier = tickValue / tickSize).
+// Returns qty=0 when even a single contract exceeds the notional cap — the caller
+// should skip the order rather than placing a zero-quantity order.
+func ComputeFuturesBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.FuturesORBConfig, inst config.FuturesInstrument) BracketParams {
+	buf := float64(inst.TickBuffer) * inst.TickSize
+
+	var entryStop, stopLoss, takeProfit float64
+	if side == "buy" {
+		entryStop = r.High + buf
+		stopLoss = r.Low - buf
+		risk := entryStop - stopLoss
+		takeProfit = entryStop + risk*cfg.RiskReward
+	} else {
+		entryStop = r.Low - buf
+		stopLoss = r.High + buf
+		risk := stopLoss - entryStop
+		takeProfit = entryStop - risk*cfg.RiskReward
+	}
+
+	// Risk sizing: floor range width to at least 1 tick so riskTicks is never zero.
+	rangeWidth := math.Abs(entryStop - stopLoss)
+	riskTicks := math.Max(1, math.Round(rangeWidth/inst.TickSize))
+	riskPerContract := riskTicks * inst.TickValue
+
+	maxRiskDollars := portfolioValue * cfg.MaxRiskPct / 100.0
+	qty := int(math.Floor(maxRiskDollars / riskPerContract))
+	if qty < 1 {
+		qty = 1
+	}
+
+	// Notional cap: qty × entryStop × contractMultiplier ≤ MaxPositionPct% of portfolio.
+	// contractMultiplier converts price points to dollars (e.g. ES: $12.50/0.25 = $50/pt).
+	if cfg.MaxPositionPct > 0 && entryStop > 0 && inst.TickSize > 0 {
+		contractMultiplier := inst.TickValue / inst.TickSize
+		notionalPerContract := entryStop * contractMultiplier
+		maxNotional := portfolioValue * cfg.MaxPositionPct / 100.0
+		maxQtyByNotional := int(math.Floor(maxNotional / notionalPerContract))
+		if maxQtyByNotional < 1 {
+			// Even one contract exceeds the cap — caller must skip this order.
+			return BracketParams{Ticker: r.Ticker, Side: side, EntryStop: entryStop, StopLoss: stopLoss, TakeProfit: takeProfit, Qty: 0, SecType: "FUT"}
+		}
+		if qty > maxQtyByNotional {
+			qty = maxQtyByNotional
+		}
+	}
+
+	return BracketParams{
+		Ticker:     r.Ticker,
+		Side:       side,
+		EntryStop:  entryStop,
+		StopLoss:   stopLoss,
+		TakeProfit: takeProfit,
+		Qty:        qty,
+		SecType:    "FUT",
+	}
+}
+
 // PlaceBracket submits a bracket stop order via the executor.
 func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (string, error) {
 	req := execution.OrderRequest{
