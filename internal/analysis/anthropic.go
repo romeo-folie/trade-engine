@@ -240,7 +240,7 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 
 	// Validate required fields.
 	switch result.Action {
-	case ActionBuy, ActionSell, ActionHold:
+	case ActionBuy, ActionSell, ActionHold, ActionTrade, ActionSkip:
 	default:
 		return AnalysisResponse{}, fmt.Errorf("invalid action %q", result.Action)
 	}

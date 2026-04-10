@@ -913,9 +913,12 @@ func (s *ORBScheduler) notify(ctx context.Context, msg string) {
 }
 
 // orbRawResponse is the full JSON schema returned by the ORB custom system prompt.
+// The confidence field was previously named "conviction" — it is now "confidence"
+// so that extractAnalysisJSON maps it to AnalysisResponse.Confidence, enabling
+// the ensemble fast-path when all analysts unanimously agree.
 type orbRawResponse struct {
 	Action          string   `json:"action"`
-	Conviction      float64  `json:"conviction"`
+	Confidence      float64  `json:"confidence"`
 	CatalystType    string   `json:"catalyst_type"`
 	CatalystQuality string   `json:"catalyst_quality"`
 	Reasoning       string   `json:"reasoning"`
@@ -938,7 +941,7 @@ func parseORBResult(rawResponse string, fallback analysis.AnalysisResponse) ORBA
 		(parsed.Action == "trade" || parsed.Action == "skip") {
 		return ORBAnalysisResult{
 			Action:          parsed.Action,
-			Conviction:      parsed.Conviction,
+			Conviction:      parsed.Confidence,
 			CatalystType:    parsed.CatalystType,
 			CatalystQuality: parsed.CatalystQuality,
 			Reasoning:       parsed.Reasoning,

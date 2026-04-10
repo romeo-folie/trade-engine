@@ -56,6 +56,30 @@ func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
 	}
 }
 
+// ORB mode returns "trade" or "skip" instead of BUY/SELL/HOLD.
+// Both must be accepted so the ORB scanner does not log "invalid action" errors.
+func TestExtractAnalysisJSON_AcceptsORBTradeAction(t *testing.T) {
+	raw := `{"action":"trade","conviction":0.85,"catalyst_type":"news","catalyst_quality":"substantive","reasoning":"FDA catalyst"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionTrade {
+		t.Fatalf("action = %q, want TRADE", got.Action)
+	}
+}
+
+func TestExtractAnalysisJSON_AcceptsORBSkipAction(t *testing.T) {
+	raw := `{"action":"skip","conviction":0.2,"catalyst_type":"unknown","catalyst_quality":"none","reasoning":"no catalyst"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionSkip {
+		t.Fatalf("action = %q, want SKIP", got.Action)
+	}
+}
+
 func TestExtractAnalysisJSON_RecoversTruncatedJSON(t *testing.T) {
 	raw := "{\n \"action\": \"buy\",\n \"confidence\": 0.75,\n \"size_pct\": 2.0,\n \"stop_loss\": 100,\n \"take_profit\": 110,\n \"reasoning\": \"truncated"
 	got, err := extractAnalysisJSON(raw)

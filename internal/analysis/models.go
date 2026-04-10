@@ -14,9 +14,11 @@ import (
 type Action string
 
 const (
-	ActionBuy  Action = "BUY"
-	ActionSell Action = "SELL"
-	ActionHold Action = "HOLD"
+	ActionBuy   Action = "BUY"
+	ActionSell  Action = "SELL"
+	ActionHold  Action = "HOLD"
+	ActionTrade Action = "TRADE" // ORB mode: candidate passes the gate
+	ActionSkip  Action = "SKIP"  // ORB mode: candidate filtered out
 )
 
 // AnalysisRequest carries everything a model needs to produce a recommendation.

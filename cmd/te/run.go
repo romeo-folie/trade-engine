@@ -648,9 +648,15 @@ func startDetachedRun() error {
 		args = append(args, "--web", "--web-port", runWebPort)
 	}
 
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open devnull: %w", err)
+	}
+	defer devNull.Close()
+
 	child := exec.Command(os.Args[0], args...)
-	child.Stdout = f
-	child.Stderr = f
+	child.Stdout = devNull // logger writes to log file directly; stdout redirect would duplicate every line
+	child.Stderr = f       // capture panics and non-logger stderr in the log file
 	child.Stdin = nil
 	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 

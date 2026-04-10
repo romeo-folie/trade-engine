@@ -31,7 +31,7 @@ Your task: analyze a pre-market gap candidate and determine whether the catalyst
 You MUST respond with ONLY a valid JSON object matching this exact schema:
 {
   "action":           "trade" | "skip",
-  "conviction":       <float 0.0-1.0>,
+  "confidence":       <float 0.0-1.0>,
   "catalyst_type":    "earnings" | "upgrade" | "filing" | "news" | "unknown",
   "catalyst_quality": "substantive" | "speculative" | "none",
   "reasoning":        "<max 200 chars>",
@@ -39,7 +39,7 @@ You MUST respond with ONLY a valid JSON object matching this exact schema:
 }
 
 Rules:
-- action "trade" only when conviction >= 0.65 AND catalyst_quality != "none"
+- action "trade" only when confidence >= 0.65 AND catalyst_quality != "none"
 - Strong BUY signals: earnings beat with raised guidance, major analyst upgrade, FDA approval, acquisition announcement
 - SKIP signals: no clear catalyst, low-float pump pattern, very thin pre-market volume, purely technical move
 - Be conservative — most gap candidates should be skipped`
