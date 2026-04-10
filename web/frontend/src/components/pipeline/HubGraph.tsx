@@ -443,12 +443,20 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     // All analysts → consensus
     analystIds.forEach(aid => edges.push(makeEdge(aid, 'consensus')));
 
-    // Always draw both paths; edge activity is driven by isNodeRecentlyActive.
-    // Fast path: consensus → risk_manager (lights up via SignalGenerated)
-    // Arbiter path: consensus → arbiter_node → risk_manager (lights up via ArbiterInvoked)
-    edges.push(makeEdge('consensus', 'risk_manager'));
+    // The two post-consensus paths are mutually exclusive:
+    //   Fast path:    consensus → risk_manager        (when arbiter was NOT invoked)
+    //   Arbiter path: consensus → arbiter_node → risk_manager (when ArbiterInvoked fired)
+    //
+    // arbiter_node nodeMetrics are only ever updated by ArbiterInvoked events
+    // (protocol.go maps ArbiterInvoked → source=consensus, target=arbiter_node).
+    // So isNodeRecentlyActive('arbiter_node') is a reliable "was arbiter used?" flag
+    // with no new state required.
+    const arbiterActive = arbiterFinalId ? isNodeRecentlyActive(arbiterFinalId) : false;
+    edges.push(makeEdge('consensus', 'risk_manager', {
+      activeOverride: isNodeRecentlyActive('consensus') && !arbiterActive,
+    }));
     if (arbiterFinalId) {
-      edges.push(makeEdge('consensus', arbiterFinalId));
+      edges.push(makeEdge('consensus', arbiterFinalId, { activeOverride: arbiterActive }));
       edges.push(makeEdge(arbiterFinalId, 'risk_manager'));
     }
 
@@ -521,8 +529,15 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue;
       prevSignatures.current[nodeId] = sig;
 
-      // Find the edge(s) this node is a source of
-      const outgoingEdges = rfE.filter(e => e.source === nodeId);
+      // Find the edge(s) this node is a source of.
+      // For the consensus node, only spawn particles on the path actually taken:
+      //   AnalysisCompleted → fast path (consensus → risk_manager), suppress arbiter edge
+      //   ArbiterInvoked    → arbiter path (consensus → arbiter_node), suppress direct edge
+      const outgoingEdges = rfE.filter(e => {
+        if (e.source !== 'consensus') return e.source === nodeId;
+        if (sig.type === 'ArbiterInvoked') return e.target === 'arbiter_node';
+        return e.target === 'risk_manager';
+      });
       outgoingEdges.forEach(edge => {
         const src = rfNodeMap.get(edge.source);
         const tgt = rfNodeMap.get(edge.target);
