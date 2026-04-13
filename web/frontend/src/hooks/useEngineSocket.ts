@@ -117,6 +117,26 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     nodeIdByLabelRef.current = next;
   }, [nodes]);
 
+  // Seed portfolio state from REST API so the card shows live values even
+  // before the first WebSocket PortfolioSnapshot event arrives.
+  useEffect(() => {
+    const controller = new AbortController();
+    fetch('/api/node/portfolio', { signal: controller.signal })
+      .then(r => r.json())
+      .then(p => {
+        setPortfolioState({
+          totalValue: p.TotalValue ?? 0,
+          cash: p.Cash ?? 0,
+          invested: p.Invested ?? 0,
+          unrealizedPnL: p.UnrealizedPnL ?? 0,
+          realizedPnlToday: p.DayPnL ?? 0,
+          openPositions: p.OpenPositions ?? 0,
+        });
+      })
+      .catch(() => { /* non-critical */ });
+    return () => controller.abort();
+  }, []);
+
   // Rolling event-rate calculation.
   useEffect(() => {
     const id = setInterval(() => {

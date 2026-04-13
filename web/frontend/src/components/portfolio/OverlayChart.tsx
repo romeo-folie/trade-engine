@@ -92,7 +92,7 @@ function CustomTooltip({ active, payload, label }: any) {
       <div className={styles.tooltipDate}>{label}</div>
       {alpacaVal != null && (
         <div className={styles.tooltipRow}>
-          <span style={{ color: TOKENS.textMuted }}>■</span>
+          <span style={{ color: TOKENS.amber }}>■</span>
           <span className={styles.tooltipLabel}>Alpaca</span>
           <span className={styles.tooltipVal}>${alpacaVal.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</span>
         </div>
@@ -156,7 +156,7 @@ export default function OverlayChart({ alpaca, tradeEngine, mode }: OverlayChart
             <Line
               type="monotone"
               dataKey="alpaca"
-              stroke={TOKENS.textMuted}
+              stroke={TOKENS.amber}
               strokeWidth={2}
               dot={false}
               isAnimationActive={false}
