@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -255,12 +257,27 @@ func mapOrderType(t OrderType) string {
 	}
 }
 
+// conidInt converts a string conid to an integer for the IBKR API,
+// which rejects string-typed conids with a 400 "incorrect type" error.
+func conidInt(conid string) any {
+	if n, err := strconv.Atoi(conid); err == nil {
+		return n
+	}
+	return conid // fallback to string if parse fails (shouldn't happen)
+}
+
+// qtyInt converts a float64 quantity to an integer for the IBKR API,
+// which rejects float-typed quantities for certain instrument types (e.g. CFD).
+func qtyInt(q float64) int {
+	return int(math.Round(q))
+}
+
 func buildSingleOrder(conid, secType, orderType string, req OrderRequest) map[string]any {
 	o := map[string]any{
-		"conid":     conid,
+		"conid":     conidInt(conid),
 		"secType":   secType,
 		"side":      mapSide(req.Side),
-		"quantity":  req.Quantity,
+		"quantity":  qtyInt(req.Quantity),
 		"orderType": orderType,
 		"tif":       "DAY",
 		"cOID":      req.TradeID,
@@ -270,11 +287,14 @@ func buildSingleOrder(conid, secType, orderType string, req OrderRequest) map[st
 }
 
 func buildBracketOrders(conid, secType, orderType string, req OrderRequest) []map[string]any {
+	qty := qtyInt(req.Quantity)
+	cid := conidInt(conid)
+
 	parent := map[string]any{
-		"conid":     conid,
+		"conid":     cid,
 		"secType":   secType,
 		"side":      mapSide(req.Side),
-		"quantity":  req.Quantity,
+		"quantity":  qty,
 		"orderType": orderType,
 		"tif":       "DAY",
 		"cOID":      req.TradeID,
@@ -288,10 +308,10 @@ func buildBracketOrders(conid, secType, orderType string, req OrderRequest) []ma
 	}
 
 	takeProfit := map[string]any{
-		"conid":     conid,
+		"conid":     cid,
 		"secType":   secType,
 		"side":      exitSide,
-		"quantity":  req.Quantity,
+		"quantity":  qty,
 		"orderType": "LMT",
 		"price":     req.TakeProfitPrice,
 		"tif":       "DAY",
@@ -299,12 +319,12 @@ func buildBracketOrders(conid, secType, orderType string, req OrderRequest) []ma
 	}
 
 	stopLoss := map[string]any{
-		"conid":     conid,
+		"conid":     cid,
 		"secType":   secType,
 		"side":      exitSide,
-		"quantity":  req.Quantity,
+		"quantity":  qty,
 		"orderType": "STP",
-		"auxPrice":  req.StopLossPrice,
+		"price":     req.StopLossPrice,
 		"tif":       "DAY",
 		"parentId":  req.TradeID,
 	}
@@ -320,6 +340,7 @@ func mapSide(side OrderSide) string {
 }
 
 // applyPrice attaches the correct price field(s) for the given order type.
+// IBKR Client Portal API uses "price" for both LMT and STP order types.
 func applyPrice(o map[string]any, orderType string, req OrderRequest) {
 	switch orderType {
 	case "LMT":
@@ -328,7 +349,7 @@ func applyPrice(o map[string]any, orderType string, req OrderRequest) {
 		}
 	case "STP":
 		if req.StopPrice > 0 {
-			o["auxPrice"] = req.StopPrice
+			o["price"] = req.StopPrice
 		}
 	}
 }

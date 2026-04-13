@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -210,6 +211,7 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 		TakeProfitPrice: params.TakeProfit,
 		StopLossPrice:   params.StopLoss,
 		SecType:         params.SecType,
+		TradeID:         fmt.Sprintf("orb-%s-%d", params.Ticker, time.Now().UnixMilli()),
 	}
 	result, err := executor.PlaceOrder(ctx, req)
 	if err != nil {

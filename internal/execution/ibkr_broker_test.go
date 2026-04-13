@@ -65,7 +65,8 @@ func TestIBKRPlaceOrder(t *testing.T) {
 		t.Fatalf("expected 1 order in body, got %v", capturedBody)
 	}
 	o := orders[0].(map[string]any)
-	if o["conid"] != "12087792" {
+	// conid is sent as a JSON number (int) — after JSON round-trip it's float64.
+	if o["conid"] != float64(12087792) {
 		t.Errorf("conid = %v; want 12087792", o["conid"])
 	}
 	if o["side"] != "BUY" {
@@ -74,8 +75,8 @@ func TestIBKRPlaceOrder(t *testing.T) {
 	if o["orderType"] != "STP" {
 		t.Errorf("orderType = %v; want STP", o["orderType"])
 	}
-	if o["auxPrice"] != 1.095 {
-		t.Errorf("auxPrice = %v; want 1.095", o["auxPrice"])
+	if o["price"] != 1.095 {
+		t.Errorf("price = %v; want 1.095", o["price"])
 	}
 	if o["cOID"] != "trade-abc" {
 		t.Errorf("cOID = %v; want trade-abc", o["cOID"])
@@ -133,14 +134,14 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	sl := orders[2].(map[string]any)
 
 	// Parent
-	if parent["conid"] != "12087797" { // GBP/USD
+	if parent["conid"] != float64(12087797) { // GBP/USD
 		t.Errorf("parent conid = %v; want 12087797", parent["conid"])
 	}
 	if parent["orderType"] != "STP" {
 		t.Errorf("parent orderType = %v; want STP", parent["orderType"])
 	}
-	if parent["auxPrice"] != 1.265 {
-		t.Errorf("parent auxPrice = %v; want 1.265", parent["auxPrice"])
+	if parent["price"] != 1.265 {
+		t.Errorf("parent price = %v; want 1.265", parent["price"])
 	}
 	if parent["cOID"] != "trade-bracket" {
 		t.Errorf("parent cOID = %v; want trade-bracket", parent["cOID"])
@@ -164,8 +165,8 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	if sl["orderType"] != "STP" {
 		t.Errorf("sl orderType = %v; want STP", sl["orderType"])
 	}
-	if sl["auxPrice"] != 1.255 {
-		t.Errorf("sl auxPrice = %v; want 1.255", sl["auxPrice"])
+	if sl["price"] != 1.255 {
+		t.Errorf("sl price = %v; want 1.255", sl["price"])
 	}
 	if sl["parentId"] != "trade-bracket" {
 		t.Errorf("sl parentId = %v; want trade-bracket", sl["parentId"])

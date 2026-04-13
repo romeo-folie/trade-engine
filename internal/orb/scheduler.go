@@ -99,13 +99,14 @@ type ORBScheduler struct {
 	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
 	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
 
-	mu           sync.Mutex // protects state, session, candidates for TUI reads
-	state        State
-	session      *store.ORBSession
-	candidates   []ScoredCandidate
-	rangeBuffers map[string]*RangeBuffer
-	orderIDs     map[string]string // ticker → orderID
-	lastScan     time.Time         // Eastern Time of the last successful scan
+	mu             sync.Mutex // protects state, session, candidates for TUI reads
+	state          State
+	session        *store.ORBSession
+	candidates     []ScoredCandidate
+	rangeBuffers   map[string]*RangeBuffer
+	orderIDs       map[string]string // ticker → orderID
+	lastScan       time.Time         // Eastern Time of the last successful scan
+	fetchFailures  map[string]int    // ticker → consecutive candle-fetch failures
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -126,10 +127,11 @@ func NewORBScheduler(
 		executor:     executor,
 		portfolio:    portfolio,
 		notifier:     notifier,
-		now:          time.Now,
-		state:        StateIdle,
-		rangeBuffers: make(map[string]*RangeBuffer),
-		orderIDs:     make(map[string]string),
+		now:           time.Now,
+		state:         StateIdle,
+		rangeBuffers:  make(map[string]*RangeBuffer),
+		orderIDs:      make(map[string]string),
+		fetchFailures: make(map[string]int),
 	}
 }
 
@@ -360,6 +362,17 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 		if existing.Status == "done" || existing.Status == "skipped" {
 			return nil
 		}
+
+		// Resume an in-progress session after a restart instead of
+		// unconditionally restarting from StateScanning (which would
+		// hit the "pre-market window closed" cutoff if past session open).
+		if existing.Status == "candidate_ready" || existing.Status == "range_watch" || existing.Status == "executing" {
+			if err := s.resumeSession(ctx, existing); err != nil {
+				return fmt.Errorf("resume session %s from %s: %w", existing.ID, existing.Status, err)
+			}
+			return nil
+		}
+
 		s.mu.Lock()
 		s.session = existing
 		s.mu.Unlock()
@@ -390,6 +403,54 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 			Date:      session.Date.Format("2006-01-02"),
 		})
 	}
+	return nil
+}
+
+// resumeSession restores in-memory state from a persisted in-progress session
+// after a process restart, then transitions to the appropriate state so the
+// scheduler continues from where it left off instead of re-entering StateScanning
+// (which would hit the "pre-market window closed" cutoff).
+func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSession) error {
+	// Restore candidates from the persisted JSON.
+	var candidates []ScoredCandidate
+	if len(existing.Candidates) > 0 {
+		if err := json.Unmarshal(existing.Candidates, &candidates); err != nil {
+			return fmt.Errorf("unmarshal candidates: %w", err)
+		}
+	}
+
+	s.mu.Lock()
+	s.session = existing
+	s.candidates = candidates
+	s.mu.Unlock()
+
+	targetState := State(existing.Status)
+
+	// For range_watch or executing, rebuild range buffers so tickRangeWatch
+	// can resume fetching candles. Fresh buffers are fine — they will
+	// re-accumulate from session open on the next tick.
+	if targetState == StateRangeWatch || targetState == StateExecuting {
+		rangeMinutes := s.cfg.RangeMinutes
+		if s.isForexMode() && s.forexCfg != nil {
+			rangeMinutes = s.forexCfg.RangeMinutes
+		} else if s.isFuturesMode() && s.futuresCfg != nil {
+			rangeMinutes = s.futuresCfg.RangeMinutes
+		}
+		s.mu.Lock()
+		s.rangeBuffers = make(map[string]*RangeBuffer)
+		for _, sc := range s.candidates {
+			s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, rangeMinutes)
+		}
+		s.mu.Unlock()
+	}
+
+	s.setState(targetState)
+	fmt.Printf("orb: resumed session %s in state %s with %d candidates\n", existing.ID, existing.Status, len(candidates))
+	s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
+		State:     existing.Status,
+		SessionID: existing.ID,
+		Date:      existing.Date.Format("2006-01-02"),
+	})
 	return nil
 }
 
@@ -677,6 +738,8 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 	marketOpen := time.Date(sessionDay.Year(), sessionDay.Month(), sessionDay.Day(), openHour, openMin, 0, 0, sessionTZ)
 	now := s.now()
 
+	const maxFetchFailures = 3 // drop instrument after this many consecutive failures
+
 	allLocked := true
 	for ticker, buf := range s.rangeBuffers {
 		if buf.Range() != nil {
@@ -684,10 +747,17 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 		}
 		candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, marketOpen, now)
 		if err != nil {
-			fmt.Printf("orb: fetch candles %s: %v\n", ticker, err)
-			allLocked = false
+			s.fetchFailures[ticker]++
+			if s.fetchFailures[ticker] >= maxFetchFailures {
+				fmt.Printf("orb: dropping %s after %d consecutive candle-fetch failures: %v\n", ticker, s.fetchFailures[ticker], err)
+				delete(s.rangeBuffers, ticker)
+			} else {
+				fmt.Printf("orb: fetch candles %s (attempt %d/%d): %v\n", ticker, s.fetchFailures[ticker], maxFetchFailures, err)
+				allLocked = false
+			}
 			continue
 		}
+		s.fetchFailures[ticker] = 0 // reset on success
 		for _, c := range candles {
 			locked, _ := buf.Add(c)
 			if locked {
@@ -762,9 +832,17 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			continue
 		}
 
-		// Reject flat/near-flat ranges to avoid unbounded order quantity
-		if r.High-r.Low < 0.01 {
-			fmt.Printf("orb: skipping %s — opening range too narrow (high=%.4f, low=%.4f)\n", ticker, r.High, r.Low)
+		// Reject flat/near-flat ranges to avoid unbounded order quantity.
+		// Forex/CFD instruments trade at very different price scales than equities,
+		// so use 2× the pip buffer as the minimum range width when available.
+		minRange := 0.01
+		if s.isForexMode() {
+			if inst := s.instrumentForTicker(ticker); inst != nil && inst.PipBuffer > 0 {
+				minRange = inst.PipBuffer * 2
+			}
+		}
+		if r.High-r.Low < minRange {
+			fmt.Printf("orb: skipping %s — opening range too narrow (high=%.4f, low=%.4f, min=%.4f)\n", ticker, r.High, r.Low, minRange)
 			continue
 		}
 
@@ -823,7 +901,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			fmt.Printf("orb: store trade %s: %v\n", ticker, err)
 		}
 
-		msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.2f stop=%.2f target=%.2f qty=%d",
+		msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
 			strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
 	}
 
