@@ -104,7 +104,7 @@ type ORBScheduler struct {
 	session        *store.ORBSession
 	candidates     []ScoredCandidate
 	rangeBuffers   map[string]*RangeBuffer
-	orderIDs       map[string]string // ticker → orderID
+	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
 	lastScan       time.Time         // Eastern Time of the last successful scan
 	fetchFailures  map[string]int    // ticker → consecutive candle-fetch failures
 }
@@ -130,7 +130,7 @@ func NewORBScheduler(
 		now:           time.Now,
 		state:         StateIdle,
 		rangeBuffers:  make(map[string]*RangeBuffer),
-		orderIDs:      make(map[string]string),
+		orderIDs:      make(map[string][2]string),
 		fetchFailures: make(map[string]int),
 	}
 }
@@ -846,63 +846,123 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			continue
 		}
 
-		side := "buy"
-		for _, sc := range candidates {
-			if sc.Gap.Ticker == ticker && sc.Gap.GapPct < 0 {
-				side = "sell"
-			}
-		}
-
-		var params BracketParams
+		// Forex mode: place dual-sided brackets (buy + sell) so the market
+		// decides direction. Equities/futures: single side from gap direction.
 		if s.isForexMode() {
 			inst := s.instrumentForTicker(ticker)
 			if inst == nil {
 				fmt.Printf("orb: skipping %s — no instrument config found\n", ticker)
 				continue
 			}
-			params = ComputeForexBracket(r, side, portfolioVal, *s.forexCfg, *inst)
-			if params.Qty == 0 {
+
+			buyParams := ComputeForexBracket(r, "buy", portfolioVal, *s.forexCfg, *inst)
+			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, *inst)
+
+			if buyParams.Qty == 0 && sellParams.Qty == 0 {
 				fmt.Printf("orb: skipping %s — min lot size exceeds position cap\n", ticker)
 				continue
 			}
+
+			var ids [2]string
+			for i, p := range []struct {
+				side   string
+				params BracketParams
+			}{{"buy", buyParams}, {"sell", sellParams}} {
+				if p.params.Qty == 0 {
+					continue
+				}
+				orderID, err := PlaceBracket(ctx, s.executor, p.params)
+				if err != nil {
+					fmt.Printf("orb: place bracket %s %s: %v\n", p.side, ticker, err)
+					continue
+				}
+				ids[i] = orderID
+				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+					OrderID: orderID,
+					Ticker:  ticker,
+					Side:    p.side,
+					Status:  "pending",
+				})
+				if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+					SessionID:  sessionID,
+					Ticker:     ticker,
+					Side:       p.side,
+					EntryStop:  p.params.EntryStop,
+					StopLoss:   p.params.StopLoss,
+					TakeProfit: p.params.TakeProfit,
+					Qty:        p.params.Qty,
+					OrderID:    orderID,
+					Status:     "pending",
+				}); err != nil {
+					fmt.Printf("orb: store trade %s %s: %v\n", p.side, ticker, err)
+				}
+				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
+					strings.ToUpper(p.side), ticker, p.params.EntryStop, p.params.StopLoss, p.params.TakeProfit, p.params.Qty))
+			}
+			s.orderIDs[ticker] = ids
+			s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+				Ticker:    ticker,
+				Direction: "dual",
+				Strategy:  "orb",
+			})
 		} else {
-			params = ComputeBracket(r, side, portfolioVal, s.cfg)
-		}
+			side := "buy"
+			for _, sc := range candidates {
+				if sc.Gap.Ticker == ticker && sc.Gap.GapPct < 0 {
+					side = "sell"
+				}
+			}
 
-		orderID, err := PlaceBracket(ctx, s.executor, params)
-		if err != nil {
-			fmt.Printf("orb: place bracket %s: %v\n", ticker, err)
-			continue
-		}
-		s.orderIDs[ticker] = orderID
-		s.publish(events.TradeSimulated, events.TradeExecutedPayload{
-			Ticker:    ticker,
-			Direction: side,
-			Strategy:  "orb",
-		})
-		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-			OrderID: orderID,
-			Ticker:  ticker,
-			Side:    side,
-			Status:  "pending",
-		})
+			var params BracketParams
+			if s.isFuturesMode() {
+				fi := s.futuresInstrumentForTicker(ticker)
+				if fi == nil {
+					fmt.Printf("orb: skipping %s — no futures instrument config found\n", ticker)
+					continue
+				}
+				params = ComputeFuturesBracket(r, side, portfolioVal, *s.futuresCfg, *fi)
+			} else {
+				params = ComputeBracket(r, side, portfolioVal, s.cfg)
+			}
 
-		if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-			SessionID:  sessionID,
-			Ticker:     ticker,
-			Side:       side,
-			EntryStop:  params.EntryStop,
-			StopLoss:   params.StopLoss,
-			TakeProfit: params.TakeProfit,
-			Qty:        params.Qty,
-			OrderID:    orderID,
-			Status:     "pending",
-		}); err != nil {
-			fmt.Printf("orb: store trade %s: %v\n", ticker, err)
-		}
+			if params.Qty == 0 {
+				fmt.Printf("orb: skipping %s — position size too small\n", ticker)
+				continue
+			}
 
-		msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
-			strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
+			orderID, err := PlaceBracket(ctx, s.executor, params)
+			if err != nil {
+				fmt.Printf("orb: place bracket %s: %v\n", ticker, err)
+				continue
+			}
+			s.orderIDs[ticker] = [2]string{orderID, ""}
+			s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+				Ticker:    ticker,
+				Direction: side,
+				Strategy:  "orb",
+			})
+			s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+				OrderID: orderID,
+				Ticker:  ticker,
+				Side:    side,
+				Status:  "pending",
+			})
+			if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+				SessionID:  sessionID,
+				Ticker:     ticker,
+				Side:       side,
+				EntryStop:  params.EntryStop,
+				StopLoss:   params.StopLoss,
+				TakeProfit: params.TakeProfit,
+				Qty:        params.Qty,
+				OrderID:    orderID,
+				Status:     "pending",
+			}); err != nil {
+				fmt.Printf("orb: store trade %s: %v\n", ticker, err)
+			}
+			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
+				strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
+		}
 	}
 
 	if len(msgs) > 0 {
@@ -927,26 +987,73 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 	h, m, _ := et.Clock()
 	etMinutes := h*60 + m
 
+	// Poll for fills and cancel the opposing side (dual-sided forex OCO).
+	if s.executor != nil {
+		for ticker, ids := range s.orderIDs {
+			buyID, sellID := ids[0], ids[1]
+			if buyID == "" || sellID == "" {
+				continue // single-sided — no opposing cancel needed
+			}
+
+			// Check if buy side filled → cancel sell
+			if buyID != "" {
+				if res, err := s.executor.GetOrderStatus(ctx, buyID); err == nil && res.Status == "filled" {
+					fmt.Printf("orb: %s buy filled — cancelling sell side\n", ticker)
+					if cancelErr := CancelOrder(ctx, s.executor, sellID); cancelErr != nil {
+						fmt.Printf("orb: cancel sell %s: %v\n", ticker, cancelErr)
+					}
+					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, sellID); dbErr != nil {
+						fmt.Printf("orb: update cancelled sell trade %s: %v\n", ticker, dbErr)
+					}
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: sellID, Ticker: ticker, Side: "sell", Status: "cancelled",
+					})
+					s.orderIDs[ticker] = [2]string{buyID, ""}
+					continue
+				}
+			}
+
+			// Check if sell side filled → cancel buy
+			if sellID != "" {
+				if res, err := s.executor.GetOrderStatus(ctx, sellID); err == nil && res.Status == "filled" {
+					fmt.Printf("orb: %s sell filled — cancelling buy side\n", ticker)
+					if cancelErr := CancelOrder(ctx, s.executor, buyID); cancelErr != nil {
+						fmt.Printf("orb: cancel buy %s: %v\n", ticker, cancelErr)
+					}
+					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, buyID); dbErr != nil {
+						fmt.Printf("orb: update cancelled buy trade %s: %v\n", ticker, dbErr)
+					}
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: buyID, Ticker: ticker, Side: "buy", Status: "cancelled",
+					})
+					s.orderIDs[ticker] = [2]string{"", sellID}
+					continue
+				}
+			}
+		}
+	}
+
 	// After 10:30 ET, cancel unfilled orders and wrap up
 	if etMinutes >= 10*60+30 {
 		if s.executor != nil {
-			for ticker, orderID := range s.orderIDs {
-				// Best-effort cancel; already-filled orders return an error which is fine.
-				cancelErr := CancelOrder(ctx, s.executor, orderID)
-				if cancelErr != nil {
-					fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, cancelErr)
+			for ticker, ids := range s.orderIDs {
+				for _, orderID := range ids {
+					if orderID == "" {
+						continue
+					}
+					cancelErr := CancelOrder(ctx, s.executor, orderID)
+					if cancelErr != nil {
+						fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, cancelErr)
+					}
+					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
+						fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
+					}
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: orderID,
+						Ticker:  ticker,
+						Status:  "cancelled",
+					})
 				}
-				// Update trade status to "cancelled" regardless of broker response.
-				// If the order was already filled, the status will only update rows
-				// still in "pending" state (WHERE status='pending' guard in SQL).
-				if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
-					fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
-				}
-				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					OrderID: orderID,
-					Ticker:  ticker,
-					Status:  "cancelled",
-				})
 			}
 		}
 
@@ -970,7 +1077,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.session = nil
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
-		s.orderIDs = make(map[string]string)
+		s.orderIDs = make(map[string][2]string)
 		s.state = StateIdle
 		s.mu.Unlock()
 
