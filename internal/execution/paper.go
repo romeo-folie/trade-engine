@@ -8,9 +8,20 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
+// StopOrderSimulator is implemented by executors that support simulated stop
+// order fills driven by external price data. The ORB scheduler uses this
+// interface to trigger fills when the market price crosses a stop level.
+type StopOrderSimulator interface {
+	// PendingStopOrders returns all stop orders that are still pending.
+	PendingStopOrders() map[string]OrderRequest
+	// SimulateFill transitions a pending order to filled at the given price.
+	SimulateFill(orderID string, price float64) error
+}
+
 // PaperExecutor simulates order execution locally without contacting any broker.
 // Used in backtesting (Phase 7) and as a fallback when no broker is configured.
-// All "fills" happen immediately at the provided market price.
+// Market and limit orders fill immediately. Stop orders stay pending until
+// SimulateFill is called (typically by the ORB scheduler after checking prices).
 type PaperExecutor struct {
 	mu     sync.RWMutex
 	orders map[string]*paperOrder
@@ -27,15 +38,34 @@ func NewPaperExecutor() *PaperExecutor {
 	return &PaperExecutor{orders: make(map[string]*paperOrder)}
 }
 
-// PlaceOrder simulates an immediate fill at the provided limit/stop price,
-// or at a placeholder price of 0 for market orders (caller should substitute
-// the fetched quote price before calling in live simulation).
+// PlaceOrder simulates order placement. Market and limit orders fill
+// immediately at the provided price. Stop orders (OrderTypeStop) are kept
+// pending until SimulateFill is called with a market price that has crossed
+// the stop level.
 func (p *PaperExecutor) PlaceOrder(_ context.Context, req OrderRequest) (OrderResult, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.nextID++
 	id := fmt.Sprintf("PAPER-%06d", p.nextID)
 
+	// Stop orders stay pending — they only fill when price crosses the trigger.
+	if req.Type == OrderTypeStop && req.StopPrice > 0 {
+		result := OrderResult{
+			BrokerOrderID: id,
+			Status:        "pending",
+		}
+		p.orders[id] = &paperOrder{result: result, request: req}
+		logger.Debug("paper stop order pending",
+			"id", id,
+			"ticker", req.Ticker,
+			"side", string(req.Side),
+			"qty", req.Quantity,
+			"stopPrice", req.StopPrice,
+		)
+		return result, nil
+	}
+
+	// Market and limit orders fill immediately.
 	fillPrice := req.LimitPrice
 	if fillPrice == 0 {
 		fillPrice = req.StopPrice
@@ -90,6 +120,45 @@ func (p *PaperExecutor) GetPositions(_ context.Context) ([]Position, error) {
 // The engine falls back to local derivation from initial_capital when Cash == 0.
 func (p *PaperExecutor) GetAccount(_ context.Context) (AccountInfo, error) {
 	return AccountInfo{}, nil
+}
+
+// ─── StopOrderSimulator ──────────────────────────────────────────────────────
+
+// PendingStopOrders returns all stop orders that are still pending.
+func (p *PaperExecutor) PendingStopOrders() map[string]OrderRequest {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	out := make(map[string]OrderRequest)
+	for id, o := range p.orders {
+		if o.result.Status == "pending" && o.request.Type == OrderTypeStop {
+			out[id] = o.request
+		}
+	}
+	return out
+}
+
+// SimulateFill transitions a pending order to filled at the given price.
+func (p *PaperExecutor) SimulateFill(orderID string, price float64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	o, ok := p.orders[orderID]
+	if !ok {
+		return fmt.Errorf("paper order %s not found", orderID)
+	}
+	if o.result.Status != "pending" {
+		return fmt.Errorf("paper order %s is %s, not pending", orderID, o.result.Status)
+	}
+	o.result.Status = "filled"
+	o.result.FilledPrice = price
+	o.result.FilledQty = o.request.Quantity
+	logger.Debug("paper stop order filled (simulated)",
+		"id", orderID,
+		"ticker", o.request.Ticker,
+		"side", string(o.request.Side),
+		"qty", o.request.Quantity,
+		"price", price,
+	)
+	return nil
 }
 
 // ─── BrokerView ───────────────────────────────────────────────────────────────

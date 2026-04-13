@@ -761,8 +761,8 @@ func TestEmbedding_VectorOperations(t *testing.T) {
 		t.Errorf("GetAnalysesWithoutEmbedding: analysis %q not found", id)
 	}
 
-	// UpdateAnalysisEmbedding — supply a 1536-dim vector.
-	vec := make([]float32, 1536)
+	// UpdateAnalysisEmbedding — supply a 768-dim vector (matches DB schema).
+	vec := make([]float32, 768)
 	for i := range vec {
 		vec[i] = float32(i) * 0.001
 	}

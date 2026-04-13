@@ -12,7 +12,7 @@ func newTestScheduler() *ORBScheduler {
 		cfg:          config.ORBConfig{},
 		state:        StateIdle,
 		rangeBuffers: make(map[string]*RangeBuffer),
-		orderIDs:     make(map[string]string),
+		orderIDs:     make(map[string][2]string),
 	}
 }
 

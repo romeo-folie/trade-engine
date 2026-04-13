@@ -109,6 +109,20 @@ func CancelORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID stri
 	return err
 }
 
+// FillORBTradeByOrderID marks a pending trade as filled given its broker order ID.
+// Returns true if a row was actually updated (i.e. the trade was pending).
+func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='filled', fill_price=$1, closed_at=NOW()
+		WHERE order_id=$2 AND status='pending'`,
+		fillPrice, orderID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // UpdateORBTrade updates a trade's status, fill price, and PnL.
 func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fillPrice *float64, pnl *float64) error {
 	_, err := db.Exec(ctx, `

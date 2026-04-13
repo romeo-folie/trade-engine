@@ -25,7 +25,7 @@ func TestIBKRPlaceOrder(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/iserver/account/U123456/orders":
+		case "/v1/api/iserver/account/U123456/orders":
 			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
 				t.Errorf("decode request body: %v", err)
 			}
@@ -95,7 +95,7 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	var capturedBody map[string]any
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/iserver/account/U123456/orders" {
+		if r.URL.Path == "/v1/api/iserver/account/U123456/orders" {
 			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
 				t.Errorf("decode request body: %v", err)
 			}
@@ -184,11 +184,11 @@ func TestIBKROrderConfirmation(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/iserver/account/U123456/orders":
+		case "/v1/api/iserver/account/U123456/orders":
 			// First response: confirmation prompt (no order_id, has id).
 			w.Write([]byte(`[{"id":"REPLY-99","message":["Order requires confirmation"]}]`))
 
-		case "/iserver/reply/REPLY-99":
+		case "/v1/api/iserver/reply/REPLY-99":
 			// Verify the confirmation body.
 			var body map[string]any
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -291,7 +291,7 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 func TestResolveConid_APIFallback(t *testing.T) {
 	// XPT/USD is not in the hardcoded map, so it falls through to the API.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/iserver/secdef/search" && r.URL.Query().Get("symbol") == "XPT" {
+		if r.URL.Path == "/v1/api/iserver/secdef/search" && r.URL.Query().Get("symbol") == "XPT" {
 			w.Header().Set("Content-Type", "application/json")
 			// Simulate IBKR secdef search response.
 			w.Write([]byte(`[
@@ -342,7 +342,7 @@ func TestResolveConid_NotFound(t *testing.T) {
 
 func TestIBKRCheckAuth_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/iserver/auth/status" || r.Method != http.MethodGet {
+		if r.URL.Path != "/v1/api/iserver/auth/status" || r.Method != http.MethodGet {
 			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
 			http.NotFound(w, r)
 			return
