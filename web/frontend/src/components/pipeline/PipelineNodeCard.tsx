@@ -7,7 +7,7 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import styles from './PipelineNodeCard.module.css';
 import type { WatchlistTicker } from '../../hooks/useWatchlist';
-import type { RiskCheckResult, LastTrade, PortfolioState } from '../../hooks/useEngineSocket';
+import type { RiskCheckResult, LastTrade, PortfolioState, VerdictEntry } from '../../hooks/useEngineSocket';
 
 function lastTickLabel(lastEventAt: string | null): string {
   if (!lastEventAt) return '—';
@@ -91,10 +91,6 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                      d.nodeId === 'macro' ? colors.analystMacro :
                      d.nodeId === 'llm_analysis' ? colors.acidGreen : colors.borderMuted);
 
-  const verdict = (d.lastEventType || 'NEUTRAL').toUpperCase();
-  const verdictClass = verdict.includes('LONG') || verdict.includes('BUY') ? styles.verdictLong :
-                      verdict.includes('SHORT') || verdict.includes('SELL') ? styles.verdictShort :
-                      styles.verdictNeutral;
 
   const isArbiterFinal = d.kind === 'arbiter_final';
   const isTicker = d.kind === 'ticker';
@@ -190,63 +186,33 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
             {!d.provider && (
               <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>LLM ENSEMBLE</div>
             )}
-            {/* Per-analyst live vote badge */}
             {(() => {
-              const liveVerdict = d.verdict as string | undefined;
-              const voteConf = d.voteConfidence as number | undefined;
-              const isSkipped = d.skipped as boolean | undefined;
-              if (isSkipped) {
-                return (
-                  <div className={styles.kindLabel} style={{ opacity: 0.4, marginTop: 8, fontSize: 11 }}>
-                    SKIPPED
-                  </div>
-                );
-              }
-              if (liveVerdict) {
-                const vColor = liveVerdict === 'BUY' ? colors.emerald : liveVerdict === 'SELL' ? colors.red : colors.amber;
-                const vLabel = liveVerdict === 'BUY' ? 'LONG' : liveVerdict === 'SELL' ? 'SHORT' : liveVerdict;
-                return (
-                  <div style={{ marginTop: 8, display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <span style={{ color: vColor, fontWeight: 700, fontSize: 14, fontFamily: 'var(--font-mono)' }}>
-                      {vLabel}
-                    </span>
-                    {voteConf != null && (
-                      <span style={{ color: vColor, opacity: 0.8, fontSize: 12, fontFamily: 'var(--font-mono)' }}>
-                        {Math.round(voteConf * 100)}%
+              const entries = d.verdictEntries as VerdictEntry[] | undefined;
+              const hasVerdicts = entries && entries.length > 0;
+              const isActive = d.isChosen || hasVerdicts;
+              return (
+                <>
+                  {isActive ? (
+                    <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+                      <span className={styles.feedBadgeActive} style={{ background: 'rgba(57, 255, 20, 0.15)', border: '1px solid #39FF14', boxShadow: '0 0 10px rgba(57, 255, 20, 0.2)' }}>
+                        ACTIVE
                       </span>
-                    )}
-                  </div>
-                );
-              }
-              return null;
+                    </div>
+                  ) : (
+                    <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+                      <span className={styles.feedBadgeIdle}>STANDBY</span>
+                    </div>
+                  )}
+                  {hasVerdicts ? (
+                    <VerdictMarquee entries={entries} />
+                  ) : d.eventCount > 0 && d.isChosen ? (
+                    <div className={styles.kindLabel} style={{ opacity: 0.5, marginTop: 10 }}>
+                      {d.eventCount} ANALYSES
+                    </div>
+                  ) : null}
+                </>
+              );
             })()}
-            {d.isChosen ? (
-              <div className={styles.feedStatusRow} style={{ marginTop: 12 }}>
-                <span className={styles.feedBadgeActive} style={{ background: 'rgba(57, 255, 20, 0.15)', border: '1px solid #39FF14', boxShadow: '0 0 10px rgba(57, 255, 20, 0.2)' }}>
-                  ACTIVE
-                </span>
-              </div>
-            ) : (
-              <div className={styles.feedStatusRow} style={{ marginTop: 12 }}>
-                <span className={styles.feedBadgeIdle}>STANDBY</span>
-              </div>
-            )}
-            {!d.verdict && !d.skipped && d.isChosen && (
-              <div className={`${styles.analystVerdict} ${verdictClass}`} style={{ fontSize: 16 }}>
-                {verdict.includes('LONG') || verdict.includes('BUY') ? 'LONG' :
-                 verdict.includes('SHORT') || verdict.includes('SELL') ? 'SHORT' : 'ANALYZING'}
-              </div>
-            )}
-            {d.accuracy !== undefined && d.accuracy > 0 && d.isChosen && (
-              <div className={styles.kindLabel} style={{ opacity: 0.7, marginTop: 8 }}>
-                ACC: {Math.round(d.accuracy * 100)}%
-              </div>
-            )}
-            {d.eventCount > 0 && d.isChosen && (
-              <div className={styles.kindLabel} style={{ opacity: 0.5, marginTop: 10 }}>
-                {d.eventCount} ANALYSES
-              </div>
-            )}
           </div>
         )}
 
@@ -307,23 +273,24 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                   };
                 });
 
+                const ticker = d.currentTicker as string | null;
                 const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
                 const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
                 const consensusVerdict = activeVotes.length === 0 ? null : buys > sells ? 'LONG' : sells > buys ? 'SHORT' : 'HOLD';
                 const avgConf = activeVotes.length > 0
                   ? activeVotes.reduce((sum, v) => sum + v.confidence, 0) / activeVotes.length
                   : 0;
-                
+
                 const verdictCls = consensusVerdict === 'LONG' ? styles.verdictLong
                   : consensusVerdict === 'SHORT' ? styles.verdictShort
                   : styles.verdictNeutral;
-                  
+
                 return (
                   <>
                     <div className={styles.subValue} style={{ fontSize: 8, marginBottom: 4 }}>ENSEMBLE CONSENSUS</div>
                     <EnsembleConsensus items={items} />
                     <div className={`${styles.analystVerdict} ${consensusVerdict ? verdictCls : styles.verdictNeutral}`} style={{ fontSize: 14, marginTop: 8 }}>
-                      {consensusVerdict ? <>{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : (nodeActive ? 'CONSULTING...' : '—')}
+                      {consensusVerdict ? <>{ticker && <span style={{ opacity: 0.6, fontSize: 10, marginRight: 6 }}>{ticker}</span>}{consensusVerdict} <span style={{ opacity: 1, fontSize: 14, marginLeft: 8 }}>{avgConf.toFixed(2)}</span></> : (nodeActive ? 'CONSULTING...' : '—')}
                     </div>
                   </>
                 );
@@ -482,6 +449,53 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         )}
       </div>
     </ChamferedBox>
+  );
+}
+
+// ── VerdictMarquee ───────────────────────────────────────────────────────────
+
+interface VerdictMarqueeProps {
+  entries: VerdictEntry[];
+}
+
+function VerdictMarquee({ entries }: VerdictMarqueeProps) {
+  // Repeat entries enough times to guarantee the track overflows the container,
+  // then duplicate the full set for a seamless 50% scroll loop.
+  const items = useMemo(() => {
+    const minCopies = Math.max(Math.ceil(8 / entries.length), 2);
+    const oneSet = Array.from({ length: minCopies }, () => entries).flat();
+    return [...oneSet, ...oneSet];
+  }, [entries]);
+  const duration = useMemo(() => Math.max(entries.length * 3, 10), [entries.length]);
+
+  return (
+    <div className={styles.tickerPillsWrapper}>
+      <div className={styles.tickerPillsLabel}>VERDICTS</div>
+      <motion.div
+        className={styles.tickerPillsTrack}
+        animate={{ x: [0, "-50%"] }}
+        transition={{
+          duration,
+          ease: "linear",
+          repeat: Infinity,
+        }}
+        style={{ translateZ: 0 }}
+      >
+        {items.map((e, i) => {
+          const pillColor = e.action === 'BUY' ? colors.emerald : e.action === 'SELL' ? colors.red : colors.amber;
+          const pillBg = e.action === 'BUY' ? 'rgba(57, 255, 20, 0.1)' : e.action === 'SELL' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(245, 158, 11, 0.1)';
+          return (
+            <span
+              key={`${e.ticker}-${i}`}
+              className={styles.verdictPill}
+              style={{ background: pillBg, borderColor: pillColor, color: '#fff' }}
+            >
+              {e.ticker}
+            </span>
+          );
+        })}
+      </motion.div>
+    </div>
   );
 }
 

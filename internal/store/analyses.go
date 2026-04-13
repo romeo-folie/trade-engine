@@ -231,6 +231,14 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 	return out, nil
 }
 
+// GetLatestAnalysisTime returns the most recent created_at from the analyses table.
+// Returns nil when the table is empty.
+func GetLatestAnalysisTime(ctx context.Context) (*time.Time, error) {
+	var t *time.Time
+	err := GetDB().QueryRow(ctx, `SELECT MAX(created_at) FROM analyses`).Scan(&t)
+	return t, err
+}
+
 // nullableFloat returns nil for zero values (stop_loss / take_profit on HOLD).
 func nullableFloat(f float64) any {
 	if f == 0 {

@@ -258,6 +258,20 @@
   flex-shrink: 0;
 }
 
+.verdictPill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1px 4px;
+  font-family: var(--font-mono);
+  font-size: 8px;
+  font-weight: 700;
+  border: 1px solid;
+  border-radius: 2px;
+  letter-spacing: 0.06em;
+  flex-shrink: 0;
+}
+
 .hubWordmark {
   color: var(--accent);
   font-family: var(--font-display);
