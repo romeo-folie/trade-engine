@@ -900,11 +900,16 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					strings.ToUpper(p.side), ticker, p.params.EntryStop, p.params.StopLoss, p.params.TakeProfit, p.params.Qty))
 			}
 			s.orderIDs[ticker] = ids
-			s.publish(events.TradeSimulated, events.TradeExecutedPayload{
-				Ticker:    ticker,
-				Direction: "dual",
-				Strategy:  "orb",
-			})
+			// Emit per-side events only for brackets that were actually placed.
+			for i, side := range []string{"buy", "sell"} {
+				if ids[i] != "" {
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker:    ticker,
+						Direction: side,
+						Strategy:  "orb",
+					})
+				}
+			}
 		} else {
 			side := "buy"
 			for _, sc := range candidates {
@@ -935,7 +940,11 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				fmt.Printf("orb: place bracket %s: %v\n", ticker, err)
 				continue
 			}
-			s.orderIDs[ticker] = [2]string{orderID, ""}
+			if side == "sell" {
+				s.orderIDs[ticker] = [2]string{"", orderID}
+			} else {
+				s.orderIDs[ticker] = [2]string{orderID, ""}
+			}
 			s.publish(events.TradeSimulated, events.TradeExecutedPayload{
 				Ticker:    ticker,
 				Direction: side,
@@ -997,10 +1006,20 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 
 			// Check if buy side filled → cancel sell
 			if buyID != "" {
-				if res, err := s.executor.GetOrderStatus(ctx, buyID); err == nil && res.Status == "filled" {
-					fmt.Printf("orb: %s buy filled — cancelling sell side\n", ticker)
+				res, err := s.executor.GetOrderStatus(ctx, buyID)
+				if err != nil {
+					fmt.Printf("orb: GetOrderStatus buy %s (%s): %v\n", ticker, buyID, err)
+				} else if res.Status == "filled" {
+					fmt.Printf("orb: %s buy filled (%.4f) — cancelling sell side\n", ticker, res.FilledPrice)
+					if dbErr := store.FillORBTradeByOrderID(ctx, s.db, buyID, res.FilledPrice); dbErr != nil {
+						fmt.Printf("orb: update filled buy trade %s: %v\n", ticker, dbErr)
+					}
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: buyID, Ticker: ticker, Side: "buy", Status: "filled", FillPrice: res.FilledPrice,
+					})
 					if cancelErr := CancelOrder(ctx, s.executor, sellID); cancelErr != nil {
-						fmt.Printf("orb: cancel sell %s: %v\n", ticker, cancelErr)
+						fmt.Printf("orb: cancel sell %s: %v (will retry next tick)\n", ticker, cancelErr)
+						continue // keep both IDs tracked so next tick retries
 					}
 					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, sellID); dbErr != nil {
 						fmt.Printf("orb: update cancelled sell trade %s: %v\n", ticker, dbErr)
@@ -1015,10 +1034,20 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 
 			// Check if sell side filled → cancel buy
 			if sellID != "" {
-				if res, err := s.executor.GetOrderStatus(ctx, sellID); err == nil && res.Status == "filled" {
-					fmt.Printf("orb: %s sell filled — cancelling buy side\n", ticker)
+				res, err := s.executor.GetOrderStatus(ctx, sellID)
+				if err != nil {
+					fmt.Printf("orb: GetOrderStatus sell %s (%s): %v\n", ticker, sellID, err)
+				} else if res.Status == "filled" {
+					fmt.Printf("orb: %s sell filled (%.4f) — cancelling buy side\n", ticker, res.FilledPrice)
+					if dbErr := store.FillORBTradeByOrderID(ctx, s.db, sellID, res.FilledPrice); dbErr != nil {
+						fmt.Printf("orb: update filled sell trade %s: %v\n", ticker, dbErr)
+					}
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: sellID, Ticker: ticker, Side: "sell", Status: "filled", FillPrice: res.FilledPrice,
+					})
 					if cancelErr := CancelOrder(ctx, s.executor, buyID); cancelErr != nil {
-						fmt.Printf("orb: cancel buy %s: %v\n", ticker, cancelErr)
+						fmt.Printf("orb: cancel buy %s: %v (will retry next tick)\n", ticker, cancelErr)
+						continue // keep both IDs tracked so next tick retries
 					}
 					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, buyID); dbErr != nil {
 						fmt.Printf("orb: update cancelled buy trade %s: %v\n", ticker, dbErr)
@@ -1036,8 +1065,9 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 	// After 10:30 ET, cancel unfilled orders and wrap up
 	if etMinutes >= 10*60+30 {
 		if s.executor != nil {
+			sides := [2]string{"buy", "sell"}
 			for ticker, ids := range s.orderIDs {
-				for _, orderID := range ids {
+				for i, orderID := range ids {
 					if orderID == "" {
 						continue
 					}
@@ -1051,6 +1081,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: orderID,
 						Ticker:  ticker,
+						Side:    sides[i],
 						Status:  "cancelled",
 					})
 				}

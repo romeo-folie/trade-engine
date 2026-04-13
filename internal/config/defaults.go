@@ -284,8 +284,8 @@ func Defaults() *Config {
 		ForexORB: ForexORBConfig{
 			Enabled: false,
 			Instruments: []Instrument{
-				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
-				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 20000, PipBuffer: 0.0002},
+				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002},
+				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002},
 			},
 			Session:        "london",
 			Timezone:       "UTC",

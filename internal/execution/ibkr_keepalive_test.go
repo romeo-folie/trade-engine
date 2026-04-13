@@ -11,12 +11,12 @@ import (
 )
 
 // newAuthStatusServer returns a test server whose response to
-// GET /iserver/auth/status is controlled by the supplied atomic bool.
+// GET /v1/api/iserver/auth/status is controlled by the supplied atomic bool.
 // authenticated=true and connected=true when the flag is 1; both false when 0.
 func newAuthStatusServer(t *testing.T, authenticated *atomic.Bool) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/iserver/auth/status" {
+		if r.URL.Path != "/v1/api/iserver/auth/status" {
 			http.NotFound(w, r)
 			return
 		}
