@@ -159,3 +159,24 @@ func goodFriday(year int) time.Time {
 	easter := time.Date(year, time.Month(month), day, 0, 0, 0, 0, nyLoc)
 	return easter.AddDate(0, 0, -2) // Good Friday is 2 days before Easter
 }
+
+// startupSkipDecision determines whether the startup tick should be skipped
+// and, if so, when the next tick should fire.
+//
+// skip=true when lastAnalysis is non-nil and its age relative to now is less
+// than the tick interval — meaning an analysis already ran recently enough
+// that firing again immediately would be redundant.
+//
+// When skip=true, nextTick is NextTickTime(lastAnalysis, interval), preserving
+// the cadence from the last run rather than resetting the clock to now.
+// When skip=false, nextTick is the zero value and the caller uses its normal
+// scheduling path.
+func startupSkipDecision(now time.Time, lastAnalysis *time.Time, interval time.Duration) (skip bool, nextTick time.Time) {
+	if lastAnalysis == nil {
+		return false, time.Time{}
+	}
+	if now.Sub(*lastAnalysis) >= interval {
+		return false, time.Time{}
+	}
+	return true, NextTickTime(*lastAnalysis, interval)
+}

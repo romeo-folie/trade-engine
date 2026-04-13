@@ -276,10 +276,28 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.applyDegradedProfile(&interval)
 
 	ranStartupTick := false
+	var skippedLastAnalysisAt *time.Time // set when we skip due to recent analysis
 	if IsMarketOpen(startupNow) {
-		ranStartupTick = true
-		if err := e.tick(ctx); err != nil {
-			logger.Warn("tick error", "err", err.Error())
+		skipStartup := false
+		if e.cfg.Engine.ShouldSkipRecentTick() {
+			lastAnalysis, err := store.GetLatestAnalysisTime(ctx)
+			if err == nil {
+				skip, _ := startupSkipDecision(startupNow, lastAnalysis, interval)
+				if skip {
+					skipStartup = true
+					skippedLastAnalysisAt = lastAnalysis
+					logger.Info("skipping startup tick — last analysis recent",
+						"last_analysis_age", startupNow.Sub(*lastAnalysis).Round(time.Second).String(),
+						"interval", interval.String(),
+					)
+				}
+			}
+		}
+		if !skipStartup {
+			ranStartupTick = true
+			if err := e.tick(ctx); err != nil {
+				logger.Warn("tick error", "err", err.Error())
+			}
 		}
 	} else {
 		nextOpen := nextMarketOpen(startupNow)
@@ -306,12 +324,22 @@ func (e *Engine) Run(ctx context.Context) error {
 	// same startupNow timestamp for scheduling. If we used a fresh time.Now()
 	// that crossed the 09:30 boundary, nextMarketOpen would jump to tomorrow,
 	// missing the entire today's session.
+	//
+	// Special case: if we skipped because a recent analysis exists, schedule
+	// the next tick from the last analysis time so we fire at
+	// lastAnalysis + interval (the remaining time) rather than waiting a full
+	// interval or jumping to tomorrow's open.
 	timerBase := time.Now()
-	base := timerBase
-	if !ranStartupTick {
-		base = startupNow
+	var nextTick time.Time
+	if skippedLastAnalysisAt != nil {
+		_, nextTick = startupSkipDecision(startupNow, skippedLastAnalysisAt, interval)
+	} else {
+		base := timerBase
+		if !ranStartupTick {
+			base = startupNow
+		}
+		nextTick = nextEngineWake(base, interval, ranStartupTick)
 	}
-	nextTick := nextEngineWake(base, interval, ranStartupTick)
 	e.logNextCycle(nextTick, displayLoc)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()

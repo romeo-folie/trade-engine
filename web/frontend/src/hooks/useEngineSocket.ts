@@ -33,6 +33,17 @@ export interface AnalystVote {
   latency_ms: number;
 }
 
+/** A single ticker verdict for the scrolling verdict marquee. */
+export interface VerdictEntry {
+  ticker: string;
+  action: string;   // 'BUY' | 'SELL' | 'HOLD'
+  confidence: number;
+}
+
+/** Per-analyst verdict history, keyed by analyst model name. */
+export type VerdictHistory = Record<string, VerdictEntry[]>;
+
+
 export interface RiskCheckResult {
   name: string;
   passed: boolean;
@@ -70,10 +81,14 @@ export interface EngineSocketState {
   lastTrade: LastTrade | null;
   portfolioState: PortfolioState | null;
   analystVotes: AnalystVote[];
+  currentTicker: string | null;
   selectedAnalysts: string[];
+  verdictHistory: VerdictHistory;
+  consensusHistory: VerdictEntry[];
 }
 
 const MAX_EVENTS = 200;
+const MAX_VERDICT_HISTORY = 50; // per analyst and for consensus
 const RATE_WINDOW_MS = 5000;
 
 export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocketState {
@@ -97,7 +112,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const [lastTrade, setLastTrade] = useState<LastTrade | null>(null);
   const [portfolioState, setPortfolioState] = useState<PortfolioState | null>(null);
   const [analystVotes, setAnalystVotes] = useState<AnalystVote[]>([]);
+  const [currentTicker, setCurrentTicker] = useState<string | null>(null);
   const [selectedAnalysts, setSelectedAnalysts] = useState<string[]>([]);
+  const [verdictHistory, setVerdictHistory] = useState<VerdictHistory>({});
+  const [consensusHistory, setConsensusHistory] = useState<VerdictEntry[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const pausedRef = useRef(paused);
@@ -247,15 +265,17 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           } catch { /* ignore parse errors */ }
         }
 
-        // Track per-analyst votes
+        // Track per-analyst votes and accumulate verdict history for marquee
         if (webEv.type === 'AnalystVotesPublished' && webEv.payload) {
           try {
             const p = typeof webEv.payload === 'string'
               ? JSON.parse(webEv.payload)
               : (webEv.payload as Record<string, unknown>);
             if (Array.isArray(p.votes)) {
+              const ticker = p.ticker as string | undefined;
               const votes = p.votes as AnalystVote[];
               setAnalystVotes(votes);
+              if (ticker) setCurrentTicker(ticker);
               const nowTs = Date.now();
               setNodeMetrics(prev => {
                 const next = { ...prev };
@@ -271,6 +291,36 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 }
                 return next;
               });
+
+              // Accumulate per-analyst verdict history for scrolling marquee.
+              // History is kept across ticks and capped at MAX_VERDICT_HISTORY per
+              // analyst (and for consensus) so it doesn't grow unbounded.
+              if (ticker) {
+                setVerdictHistory(prev => {
+                  const next = { ...prev };
+                  for (const vote of votes) {
+                    if (vote.skipped) continue;
+                    const key = vote.model;
+                    const existing = next[key] ?? [];
+                    const updated = [...existing, { ticker, action: vote.action, confidence: vote.confidence }];
+                    next[key] = updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
+                  }
+                  return next;
+                });
+
+                // Build consensus-level verdict for this ticker
+                const activeVotes = votes.filter(v => !v.skipped);
+                if (activeVotes.length > 0) {
+                  const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
+                  const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
+                  const action = buys > sells ? 'BUY' : sells > buys ? 'SELL' : 'HOLD';
+                  const avgConf = activeVotes.reduce((s, v) => s + v.confidence, 0) / activeVotes.length;
+                  setConsensusHistory(prev => {
+                    const updated = [...prev, { ticker, action, confidence: avgConf }];
+                    return updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
+                  });
+                }
+              }
             }
           } catch { /* ignore */ }
         }
@@ -290,6 +340,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setAnalystVotes([]);
           setSelectedAnalysts([]);
           setLastRiskChecks([]);
+          setCurrentTicker(null);
+          // verdictHistory and consensusHistory persist across ticks intentionally.
         }
 
         // Track risk check results
@@ -362,7 +414,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, selectedAnalysts };
+  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, currentTicker, selectedAnalysts, verdictHistory, consensusHistory };
 }
 
 function buildWsUrl(): string {

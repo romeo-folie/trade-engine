@@ -168,7 +168,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   const modelEnsemble = useModelEnsemble();
   const systemStatus = useSystemStatus();
   const isOrbMode = systemStatus?.mode?.toLowerCase() === 'orb';
-  const { analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState, selectedAnalysts } = useEngineSocketContext();
+  const { analystConsensus, analystVotes, currentTicker, lastRiskChecks, lastTrade, portfolioState, selectedAnalysts, verdictHistory } = useEngineSocketContext();
 
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
@@ -350,10 +350,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           // Per-analyst live vote
           ...(vote ? { verdict: vote.action, voteConfidence: vote.confidence, skipped: vote.skipped } : {}),
           isChosen: selectedAnalysts.includes(n.id),
+          verdictEntries: n.label ? (verdictHistory[n.label] ?? []) : [],
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
           // Live pipeline data
-          ...(n.id === 'consensus' ? { analystConsensus, analystVotes } : {}),
+          ...(n.id === 'consensus' ? { analystConsensus, analystVotes, currentTicker } : {}),
           ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
           ...(n.id === 'executor' ? { lastTrade, allRiskPassed } : {}),
           ...(n.id === 'portfolio' ? { portfolioState, allRiskPassed } : {}),
@@ -362,7 +363,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, analystVotes, lastRiskChecks, lastTrade, portfolioState]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, analystVotes, currentTicker, lastRiskChecks, lastTrade, portfolioState, verdictHistory]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
