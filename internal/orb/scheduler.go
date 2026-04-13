@@ -1018,6 +1018,11 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 				if price == 0 {
 					price = (quote.Bid + quote.Ask) / 2
 				}
+				if price <= 0 {
+					fmt.Printf("orb: paper sim: skip %s: no valid quote price (last=%.4f bid=%.4f ask=%.4f)\n",
+						ticker, quote.Last, quote.Bid, quote.Ask)
+					continue
+				}
 				for orderID, req := range pending {
 					if req.Ticker != ticker {
 						continue
@@ -1073,14 +1078,19 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 				}
 			}
 
-			// persistFill is a helper to mark a side as filled in DB and emit event.
+			// persistFill marks a side as filled in DB and emits the event only
+			// if the DB row was actually updated (idempotent on retry ticks).
 			persistFill := func(s2 *sideStatus) {
-				if dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, s2.res.FilledPrice); dbErr != nil {
+				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, s2.res.FilledPrice)
+				if dbErr != nil {
 					fmt.Printf("orb: update filled %s trade %s: %v\n", s2.side, ticker, dbErr)
+					return
 				}
-				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: s2.res.FilledPrice,
-				})
+				if updated {
+					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+						OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: s2.res.FilledPrice,
+					})
+				}
 			}
 
 			// Both sides filled (rare — volatile market filled both stops before poll).
@@ -1136,12 +1146,15 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					// Reconcile already-filled orders instead of cancelling them.
 					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
 						fmt.Printf("orb: 10:30 cleanup: %s %s already filled at %.4f — persisting\n", sides[i], ticker, res.FilledPrice)
-						if dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, res.FilledPrice); dbErr != nil {
+						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, res.FilledPrice)
+						if dbErr != nil {
 							fmt.Printf("orb: update filled trade %s: %v\n", ticker, dbErr)
 						}
-						s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-							OrderID: orderID, Ticker: ticker, Side: sides[i], Status: "filled", FillPrice: res.FilledPrice,
-						})
+						if updated {
+							s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+								OrderID: orderID, Ticker: ticker, Side: sides[i], Status: "filled", FillPrice: res.FilledPrice,
+							})
+						}
 						continue
 					}
 					cancelErr := CancelOrder(ctx, s.executor, orderID)
