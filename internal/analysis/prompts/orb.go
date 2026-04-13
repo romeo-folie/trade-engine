@@ -46,7 +46,7 @@ Rules:
 - SKIP signals: no clear catalyst, low-float pump pattern, very thin pre-market volume, purely technical move
 - Be conservative — most gap candidates should be skipped
 
-USING HISTORICAL ORB PERFORMANCE (apply only when trade_count >= 5):
+USING HISTORICAL ORB PERFORMANCE (apply only when wins + losses implies at least 5 total trades for this ticker/session):
 - Win rate < 45%: your confidence ceiling is 0.65 for this ticker/session.
 - Win rate >= 65%: full confidence range (0.0–1.0) is available.
 - Win rate 45%–65%: no constraint — use your normal judgment.

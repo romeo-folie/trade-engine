@@ -111,7 +111,7 @@ RULES:
 - If data is insufficient, return HOLD with low confidence.
 - Never recommend size_pct > 0 for a HOLD action.
 
-USING PERFORMANCE CONTEXT (apply only when trade_count >= 5):
+USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trades in last 30 days):
 - Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
 - Ticker win rate >= 65%%: full confidence range (0.0–1.0) is available.
 - Ticker win rate 45%%–65%%: no constraint — use your normal judgment.
