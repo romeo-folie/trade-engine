@@ -94,11 +94,23 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		acct, err := s.brokerView.AccountSnapshot(ctx)
 		if err == nil {
 			invested := acct.Equity - acct.Cash
+
+			// Aggregate unrealized PnL from positions — the account endpoint
+			// doesn't expose it directly.
+			var unrealizedPnL float64
+			var openPositions int
+			if positions, pErr := s.brokerView.PositionsSnapshot(ctx); pErr == nil {
+				openPositions = len(positions)
+				for _, p := range positions {
+					unrealizedPnL += p.UnrealizedPL
+				}
+			}
+
 			jsonResponse(w, map[string]any{
 				"TotalValue":       acct.Equity,
 				"Cash":             acct.Cash,
 				"Invested":         invested,
-				"UnrealizedPnL":    0.0, // not exposed by account endpoint alone
+				"UnrealizedPnL":    unrealizedPnL,
 				// IBKR does not expose prior-day close; guard to avoid showing
 				// full equity as DayPnL when LastEquity is zero.
 				"DayPnL": func() float64 {
@@ -108,7 +120,7 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 					return 0.0
 				}(),
 				"RealizedPnLToday": 0.0,
-				"OpenPositions":    0, // enriched by /positions endpoint
+				"OpenPositions":    openPositions,
 				"BuyingPower":      acct.BuyingPower,
 				"source":           "broker",
 				"stale_at":         nil,

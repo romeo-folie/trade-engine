@@ -79,6 +79,7 @@
 
 /* Equity curve section */
 .curveSection {
+  height: 300px;
   margin-bottom: var(--space-6);
 }
 
