@@ -863,10 +863,6 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
-			// NOTE: In paper mode, PaperExecutor fills stop orders immediately,
-			// so the OCO poll will deterministically cancel the sell side.
-			// A proper fix requires PaperExecutor to keep stops pending until
-			// a simulated price cross — tracked separately from this PR.
 			var ids [2]string
 			for i, p := range []struct {
 				side   string
@@ -999,6 +995,52 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 	h, m, _ := et.Clock()
 	etMinutes := h*60 + m
+
+	// Paper mode: simulate stop order fills by checking current prices.
+	// Real brokers fill stops server-side; PaperExecutor keeps them pending
+	// until we drive fills from market data here.
+	if sim, ok := s.executor.(execution.StopOrderSimulator); ok {
+		pending := sim.PendingStopOrders()
+		if len(pending) > 0 {
+			// Collect unique tickers from pending stop orders.
+			tickers := make(map[string]struct{})
+			for _, req := range pending {
+				tickers[req.Ticker] = struct{}{}
+			}
+			// Fetch current quotes and check for stop crosses.
+			for ticker := range tickers {
+				quote, err := s.marketData.FetchQuote(ctx, ticker)
+				if err != nil {
+					fmt.Printf("orb: paper sim: fetch quote %s: %v\n", ticker, err)
+					continue
+				}
+				price := quote.Last
+				if price == 0 {
+					price = (quote.Bid + quote.Ask) / 2
+				}
+				for orderID, req := range pending {
+					if req.Ticker != ticker {
+						continue
+					}
+					// Buy stop triggers when price rises to/above stop level.
+					// Sell stop triggers when price falls to/below stop level.
+					triggered := false
+					if req.Side == execution.OrderSideBuy && price >= req.StopPrice {
+						triggered = true
+					} else if req.Side == execution.OrderSideSell && price <= req.StopPrice {
+						triggered = true
+					}
+					if triggered {
+						fmt.Printf("orb: paper sim: %s %s stop triggered at %.4f (stop=%.4f)\n",
+							req.Side, ticker, price, req.StopPrice)
+						if err := sim.SimulateFill(orderID, req.StopPrice); err != nil {
+							fmt.Printf("orb: paper sim: fill %s: %v\n", orderID, err)
+						}
+					}
+				}
+			}
+		}
+	}
 
 	// Poll for fills and cancel the opposing side (dual-sided forex OCO).
 	if s.executor != nil {
