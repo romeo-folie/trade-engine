@@ -24,7 +24,9 @@ type ORBNewsItem struct {
 	PublishedAt time.Time
 }
 
-const orbSystemPrompt = `You are an expert pre-market stock analyst specializing in gap-and-go momentum plays.
+// BuildORBPrompt constructs the system and user prompts for ORB catalyst scoring.
+func BuildORBPrompt(candidate ORBCandidate, news []ORBNewsItem, orbPerformanceContext string) (systemPrompt, userMessage string) {
+	systemPrompt = `You are an expert pre-market stock analyst specializing in gap-and-go momentum plays.
 
 Your task: analyze a pre-market gap candidate and determine whether the catalyst is substantive enough to support an Opening Range Breakout trade.
 
@@ -42,11 +44,13 @@ Rules:
 - action "trade" only when confidence >= 0.65 AND catalyst_quality != "none"
 - Strong BUY signals: earnings beat with raised guidance, major analyst upgrade, FDA approval, acquisition announcement
 - SKIP signals: no clear catalyst, low-float pump pattern, very thin pre-market volume, purely technical move
-- Be conservative — most gap candidates should be skipped`
+- Be conservative — most gap candidates should be skipped
 
-// BuildORBPrompt constructs the system and user prompts for ORB catalyst scoring.
-func BuildORBPrompt(candidate ORBCandidate, news []ORBNewsItem, orbPerformanceContext string) (systemPrompt, userMessage string) {
-	systemPrompt = orbSystemPrompt
+USING HISTORICAL ORB PERFORMANCE (apply only when wins + losses implies at least 5 total trades for this ticker/session):
+- Win rate < 45%: your confidence ceiling is 0.65 for this ticker/session.
+- Win rate >= 65%: full confidence range (0.0–1.0) is available.
+- Win rate 45%–65%: no constraint — use your normal judgment.
+- Negative avg PnL: bias toward "skip" unless the catalyst is clearly substantive.`
 
 	var sb strings.Builder
 	direction := "up"
