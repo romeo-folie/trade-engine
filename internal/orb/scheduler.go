@@ -863,6 +863,10 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
+			// NOTE: In paper mode, PaperExecutor fills stop orders immediately,
+			// so the OCO poll will deterministically cancel the sell side.
+			// A proper fix requires PaperExecutor to keep stops pending until
+			// a simulated price cross — tracked separately from this PR.
 			var ids [2]string
 			for i, p := range []struct {
 				side   string
@@ -1027,7 +1031,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: sellID, Ticker: ticker, Side: "sell", Status: "cancelled",
 					})
-					s.orderIDs[ticker] = [2]string{buyID, ""}
+					delete(s.orderIDs, ticker) // OCO resolved — nothing left to track
 					continue
 				}
 			}
@@ -1055,7 +1059,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: buyID, Ticker: ticker, Side: "buy", Status: "cancelled",
 					})
-					s.orderIDs[ticker] = [2]string{"", sellID}
+					delete(s.orderIDs, ticker) // OCO resolved — nothing left to track
 					continue
 				}
 			}
@@ -1069,6 +1073,11 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 			for ticker, ids := range s.orderIDs {
 				for i, orderID := range ids {
 					if orderID == "" {
+						continue
+					}
+					// Skip orders that are already filled — only cancel pending ones.
+					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
+						fmt.Printf("orb: 10:30 cleanup skipping %s %s — already filled\n", sides[i], ticker)
 						continue
 					}
 					cancelErr := CancelOrder(ctx, s.executor, orderID)
