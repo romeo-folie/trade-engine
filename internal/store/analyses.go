@@ -232,8 +232,11 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 }
 
 // GetLatestAnalysisTime returns the most recent created_at from the analyses table.
-// Returns nil when the table is empty.
+// Returns (nil, nil) when the table is empty or the DB is not connected.
 func GetLatestAnalysisTime(ctx context.Context) (*time.Time, error) {
+	if !IsConnected() {
+		return nil, nil
+	}
 	var t *time.Time
 	err := GetDB().QueryRow(ctx, `SELECT MAX(created_at) FROM analyses`).Scan(&t)
 	return t, err

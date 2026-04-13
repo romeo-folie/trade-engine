@@ -88,6 +88,7 @@ export interface EngineSocketState {
 }
 
 const MAX_EVENTS = 200;
+const MAX_VERDICT_HISTORY = 50; // per analyst and for consensus
 const RATE_WINDOW_MS = 5000;
 
 export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocketState {
@@ -291,7 +292,9 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 return next;
               });
 
-              // Accumulate per-analyst verdict history for scrolling marquee
+              // Accumulate per-analyst verdict history for scrolling marquee.
+              // History is kept across ticks and capped at MAX_VERDICT_HISTORY per
+              // analyst (and for consensus) so it doesn't grow unbounded.
               if (ticker) {
                 setVerdictHistory(prev => {
                   const next = { ...prev };
@@ -299,7 +302,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                     if (vote.skipped) continue;
                     const key = vote.model;
                     const existing = next[key] ?? [];
-                    next[key] = [...existing, { ticker, action: vote.action, confidence: vote.confidence }];
+                    const updated = [...existing, { ticker, action: vote.action, confidence: vote.confidence }];
+                    next[key] = updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
                   }
                   return next;
                 });
@@ -311,7 +315,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                   const sells = activeVotes.filter(v => v.action?.toUpperCase() === 'SELL').length;
                   const action = buys > sells ? 'BUY' : sells > buys ? 'SELL' : 'HOLD';
                   const avgConf = activeVotes.reduce((s, v) => s + v.confidence, 0) / activeVotes.length;
-                  setConsensusHistory(prev => [...prev, { ticker, action, confidence: avgConf }]);
+                  setConsensusHistory(prev => {
+                    const updated = [...prev, { ticker, action, confidence: avgConf }];
+                    return updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
+                  });
                 }
               }
             }
@@ -333,8 +340,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setAnalystVotes([]);
           setSelectedAnalysts([]);
           setLastRiskChecks([]);
-          setVerdictHistory({});
-          setConsensusHistory([]);
+          setCurrentTicker(null);
+          // verdictHistory and consensusHistory persist across ticks intentionally.
         }
 
         // Track risk check results
