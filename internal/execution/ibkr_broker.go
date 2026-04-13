@@ -137,10 +137,10 @@ func (b *IBKRBroker) CancelOrder(ctx context.Context, brokerOrderID string) erro
 func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (OrderResult, error) {
 	var resp struct {
 		Orders []struct {
-			OrderID     string `json:"orderId"`
-			Status      string `json:"status"`
-			FilledPrice float64 `json:"avgPrice"`
-			FilledQty   float64 `json:"filledQuantity"`
+			OrderID     json.Number `json:"orderId"`
+			Status      string      `json:"status"`
+			AvgPrice    string      `json:"avgPrice"`
+			FilledQty   float64     `json:"filledQuantity"`
 		} `json:"orders"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &resp); err != nil {
@@ -148,11 +148,15 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 	}
 
 	for _, o := range resp.Orders {
-		if o.OrderID == brokerOrderID {
+		if o.OrderID.String() == brokerOrderID {
+			var fillPrice float64
+			if o.AvgPrice != "" {
+				fmt.Sscanf(o.AvgPrice, "%f", &fillPrice)
+			}
 			return OrderResult{
-				BrokerOrderID: o.OrderID,
+				BrokerOrderID: o.OrderID.String(),
 				Status:        NormalizeIBKROrderStatus(o.Status),
-				FilledPrice:   o.FilledPrice,
+				FilledPrice:   fillPrice,
 				FilledQty:     o.FilledQty,
 			}, nil
 		}
@@ -382,7 +386,7 @@ func (b *IBKRBroker) do(ctx context.Context, method, path string, body any, out 
 	}
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MB
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("ibkr %s %s → %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(respBytes))
 	}

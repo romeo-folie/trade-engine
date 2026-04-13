@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -236,7 +237,7 @@ func (s *ORBScheduler) sessionOpenMinutes() int {
 		case "london":
 			return 8 * 60 // 08:00 UTC
 		case "newyork":
-			return 13 * 60 // 13:00 UTC
+			return 13*60 + 30 // 13:30 UTC (9:30 AM ET)
 		case "both":
 			return 8 * 60 // start with London
 		}
@@ -274,7 +275,7 @@ func (s *ORBScheduler) Run(ctx context.Context) error {
 			return ctx.Err()
 		case <-ticker.C:
 			if err := s.tick(ctx); err != nil {
-				fmt.Printf("orb tick error: %v\n", err)
+				slog.Error("orb tick error", "err", err)
 			}
 		}
 	}
@@ -444,8 +445,30 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 		s.mu.Unlock()
 	}
 
+	// Restore orderIDs from pending trades so tickDone can poll fill status.
+	if targetState == StateExecuting || targetState == StateDone {
+		trades, err := store.GetORBTrades(ctx, s.db, existing.ID)
+		if err != nil {
+			return fmt.Errorf("load orb trades for resume: %w", err)
+		}
+		for _, t := range trades {
+			if t.Status != "pending" || t.OrderID == "" {
+				continue
+			}
+			ids := s.orderIDs[t.Ticker]
+			switch t.Side {
+			case "buy":
+				ids[0] = t.OrderID
+			case "sell":
+				ids[1] = t.OrderID
+			}
+			s.orderIDs[t.Ticker] = ids
+		}
+		slog.Info("orb: restored orderIDs from DB", "count", len(s.orderIDs))
+	}
+
 	s.setState(targetState)
-	fmt.Printf("orb: resumed session %s in state %s with %d candidates\n", existing.ID, existing.Status, len(candidates))
+	slog.Info("orb: resumed session", "session_id", existing.ID, "state", existing.Status, "candidates", len(candidates))
 	s.publish(events.ORBStateChanged, events.ORBStateChangedPayload{
 		State:     existing.Status,
 		SessionID: existing.ID,
@@ -462,10 +485,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	sessionMinutes := h*60 + m
 	openMinutes := s.sessionOpenMinutes()
 
-	// 1. Strict Cutoff: stop scanning once the session opens.
-	// Once the session open time is reached, we can no longer add new candidates
-	// as the Opening Range window has already begun.
-	if sessionMinutes >= openMinutes {
+	// 1. Strict Cutoff: stop scanning once the session opens (equities/futures only).
+	// Forex instruments are pre-configured — no gap scanning is needed — so the
+	// cutoff doesn't apply; the scanner immediately returns the instrument list
+	// and transitions to range_watch at or after session open.
+	if !s.isForexMode() && sessionMinutes >= openMinutes {
 		s.notify(ctx, "ORB: Pre-market scan window closed. No candidates found today.")
 		s.setState(StateDone)
 		s.mu.Lock()
@@ -527,7 +551,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 				since := s.now().Add(-time.Duration(s.cfg.NewsLookbackHours) * time.Hour)
 				rawNews, newsErr := s.news.FetchNews(ctx, gap.Ticker, since)
 				if newsErr != nil {
-					fmt.Printf("orb: news fetch %s: %v\n", gap.Ticker, newsErr)
+					slog.Warn("orb: news fetch failed", "ticker", gap.Ticker, "err", newsErr)
 				} else {
 					// Cap to most recent N items to avoid context window blowout on
 					// high-volume tickers. FetchNews returns newest-first, so a simple
@@ -575,7 +599,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 				CustomUserMessage:  userMsg,
 			}, depth.ImpactScore{Score: 1.0, Depth: 3})
 			if analyzeErr != nil {
-				fmt.Printf("orb: LLM scoring %s failed: %v\n", gap.Ticker, analyzeErr)
+				slog.Error("orb: LLM scoring failed", "ticker", gap.Ticker, "err", analyzeErr)
 				continue
 			}
 
@@ -749,10 +773,10 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 		if err != nil {
 			s.fetchFailures[ticker]++
 			if s.fetchFailures[ticker] >= maxFetchFailures {
-				fmt.Printf("orb: dropping %s after %d consecutive candle-fetch failures: %v\n", ticker, s.fetchFailures[ticker], err)
+				slog.Warn("orb: dropping instrument after candle-fetch failures", "ticker", ticker, "failures", s.fetchFailures[ticker], "err", err)
 				delete(s.rangeBuffers, ticker)
 			} else {
-				fmt.Printf("orb: fetch candles %s (attempt %d/%d): %v\n", ticker, s.fetchFailures[ticker], maxFetchFailures, err)
+				slog.Warn("orb: fetch candles failed", "ticker", ticker, "attempt", s.fetchFailures[ticker], "max", maxFetchFailures, "err", err)
 				allLocked = false
 			}
 			continue
@@ -827,6 +851,10 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 
 	var msgs []string
 	for ticker, buf := range s.rangeBuffers {
+		// Skip tickers that already have brackets placed (e.g. after restart resume).
+		if ids, ok := s.orderIDs[ticker]; ok && (ids[0] != "" || ids[1] != "") {
+			continue
+		}
 		r := buf.Range()
 		if r == nil {
 			continue
@@ -842,7 +870,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			}
 		}
 		if r.High-r.Low < minRange {
-			fmt.Printf("orb: skipping %s — opening range too narrow (high=%.4f, low=%.4f, min=%.4f)\n", ticker, r.High, r.Low, minRange)
+			slog.Info("orb: skipping instrument — opening range too narrow", "ticker", ticker, "high", r.High, "low", r.Low, "min_range", minRange)
 			continue
 		}
 
@@ -851,7 +879,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 		if s.isForexMode() {
 			inst := s.instrumentForTicker(ticker)
 			if inst == nil {
-				fmt.Printf("orb: skipping %s — no instrument config found\n", ticker)
+				slog.Warn("orb: skipping instrument — no config found", "ticker", ticker)
 				continue
 			}
 
@@ -859,7 +887,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, *inst)
 
 			if buyParams.Qty == 0 && sellParams.Qty == 0 {
-				fmt.Printf("orb: skipping %s — min lot size exceeds position cap\n", ticker)
+				slog.Warn("orb: skipping instrument — min lot size exceeds position cap", "ticker", ticker)
 				continue
 			}
 
@@ -873,7 +901,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				}
 				orderID, err := PlaceBracket(ctx, s.executor, p.params)
 				if err != nil {
-					fmt.Printf("orb: place bracket %s %s: %v\n", p.side, ticker, err)
+					slog.Error("orb: place bracket failed", "side", p.side, "ticker", ticker, "err", err)
 					continue
 				}
 				ids[i] = orderID
@@ -894,7 +922,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					OrderID:    orderID,
 					Status:     "pending",
 				}); err != nil {
-					fmt.Printf("orb: store trade %s %s: %v\n", p.side, ticker, err)
+					slog.Error("orb: store trade failed", "side", p.side, "ticker", ticker, "err", err)
 				}
 				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
 					strings.ToUpper(p.side), ticker, p.params.EntryStop, p.params.StopLoss, p.params.TakeProfit, p.params.Qty))
@@ -922,7 +950,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			if s.isFuturesMode() {
 				fi := s.futuresInstrumentForTicker(ticker)
 				if fi == nil {
-					fmt.Printf("orb: skipping %s — no futures instrument config found\n", ticker)
+					slog.Warn("orb: skipping — no futures instrument config", "ticker", ticker)
 					continue
 				}
 				params = ComputeFuturesBracket(r, side, portfolioVal, *s.futuresCfg, *fi)
@@ -931,13 +959,13 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			}
 
 			if params.Qty == 0 {
-				fmt.Printf("orb: skipping %s — position size too small\n", ticker)
+				slog.Warn("orb: skipping — position size too small", "ticker", ticker)
 				continue
 			}
 
 			orderID, err := PlaceBracket(ctx, s.executor, params)
 			if err != nil {
-				fmt.Printf("orb: place bracket %s: %v\n", ticker, err)
+				slog.Error("orb: place bracket failed", "ticker", ticker, "err", err)
 				continue
 			}
 			if side == "sell" {
@@ -967,7 +995,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				OrderID:    orderID,
 				Status:     "pending",
 			}); err != nil {
-				fmt.Printf("orb: store trade %s: %v\n", ticker, err)
+				slog.Error("orb: store trade failed", "ticker", ticker, "err", err)
 			}
 			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
 				strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
@@ -1011,7 +1039,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 			for ticker := range tickers {
 				quote, err := s.marketData.FetchQuote(ctx, ticker)
 				if err != nil {
-					fmt.Printf("orb: paper sim: fetch quote %s: %v\n", ticker, err)
+					slog.Warn("orb: paper sim: fetch quote failed", "ticker", ticker, "err", err)
 					continue
 				}
 				price := quote.Last
@@ -1019,8 +1047,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					price = (quote.Bid + quote.Ask) / 2
 				}
 				if price <= 0 {
-					fmt.Printf("orb: paper sim: skip %s: no valid quote price (last=%.4f bid=%.4f ask=%.4f)\n",
-						ticker, quote.Last, quote.Bid, quote.Ask)
+					slog.Warn("orb: paper sim: no valid quote price", "ticker", ticker, "last", quote.Last, "bid", quote.Bid, "ask", quote.Ask)
 					continue
 				}
 				for orderID, req := range pending {
@@ -1036,10 +1063,9 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 						triggered = true
 					}
 					if triggered {
-						fmt.Printf("orb: paper sim: %s %s stop triggered at %.4f (stop=%.4f)\n",
-							req.Side, ticker, price, req.StopPrice)
+						slog.Info("orb: paper sim: stop triggered", "side", req.Side, "ticker", ticker, "price", price, "stop", req.StopPrice)
 						if err := sim.SimulateFill(orderID, req.StopPrice); err != nil {
-							fmt.Printf("orb: paper sim: fill %s: %v\n", orderID, err)
+							slog.Error("orb: paper sim: fill failed", "order_id", orderID, "err", err)
 						}
 					}
 				}
@@ -1070,7 +1096,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 			for _, s2 := range ss {
 				res, err := s.executor.GetOrderStatus(ctx, s2.id)
 				if err != nil {
-					fmt.Printf("orb: GetOrderStatus %s %s (%s): %v\n", s2.side, ticker, s2.id, err)
+					slog.Warn("orb: GetOrderStatus failed", "side", s2.side, "ticker", ticker, "order_id", s2.id, "err", err)
 				} else {
 					s2.res = res
 					s2.ok = true
@@ -1083,7 +1109,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 			persistFill := func(s2 *sideStatus) {
 				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, s2.res.FilledPrice)
 				if dbErr != nil {
-					fmt.Printf("orb: update filled %s trade %s: %v\n", s2.side, ticker, dbErr)
+					slog.Error("orb: update filled trade failed", "side", s2.side, "ticker", ticker, "err", dbErr)
 					return
 				}
 				if updated {
@@ -1095,7 +1121,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 
 			// Both sides filled (rare — volatile market filled both stops before poll).
 			if ss[0].filled && ss[1].filled {
-				fmt.Printf("orb: %s both sides filled — persisting double fill\n", ticker)
+				slog.Info("orb: both sides filled — persisting double fill", "ticker", ticker)
 				persistFill(ss[0])
 				persistFill(ss[1])
 				delete(s.orderIDs, ticker)
@@ -1108,21 +1134,21 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					continue
 				}
 				other := ss[1-i]
-				fmt.Printf("orb: %s %s filled (%.4f) — cancelling %s side\n", ticker, filled.side, filled.res.FilledPrice, other.side)
+				slog.Info("orb: side filled — cancelling opposing", "ticker", ticker, "filled_side", filled.side, "fill_price", filled.res.FilledPrice, "cancel_side", other.side)
 				persistFill(filled)
 				if cancelErr := CancelOrder(ctx, s.executor, other.id); cancelErr != nil {
 					// Cancel failed — check if other side also filled before retrying.
 					if otherRes, err := s.executor.GetOrderStatus(ctx, other.id); err == nil && otherRes.Status == "filled" {
-						fmt.Printf("orb: %s %s also filled (%.4f) — double fill\n", ticker, other.side, otherRes.FilledPrice)
+						slog.Info("orb: opposing side also filled — double fill", "ticker", ticker, "side", other.side, "fill_price", otherRes.FilledPrice)
 						other.res = otherRes
 						persistFill(other)
 						delete(s.orderIDs, ticker)
 					} else {
-						fmt.Printf("orb: cancel %s %s: %v (will retry next tick)\n", other.side, ticker, cancelErr)
+						slog.Warn("orb: cancel failed, will retry next tick", "side", other.side, "ticker", ticker, "err", cancelErr)
 					}
 				} else {
 					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, other.id); dbErr != nil {
-						fmt.Printf("orb: update cancelled %s trade %s: %v\n", other.side, ticker, dbErr)
+						slog.Error("orb: update cancelled trade failed", "side", other.side, "ticker", ticker, "err", dbErr)
 					}
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: other.id, Ticker: ticker, Side: other.side, Status: "cancelled",
@@ -1145,10 +1171,10 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					}
 					// Reconcile already-filled orders instead of cancelling them.
 					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
-						fmt.Printf("orb: 10:30 cleanup: %s %s already filled at %.4f — persisting\n", sides[i], ticker, res.FilledPrice)
+						slog.Info("orb: 10:30 cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", res.FilledPrice)
 						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, res.FilledPrice)
 						if dbErr != nil {
-							fmt.Printf("orb: update filled trade %s: %v\n", ticker, dbErr)
+							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)
 						}
 						if updated {
 							s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
@@ -1159,10 +1185,10 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					}
 					cancelErr := CancelOrder(ctx, s.executor, orderID)
 					if cancelErr != nil {
-						fmt.Printf("orb: cancel %s order %s: %v\n", ticker, orderID, cancelErr)
+						slog.Warn("orb: cancel order failed", "ticker", ticker, "order_id", orderID, "err", cancelErr)
 					}
 					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, orderID); dbErr != nil {
-						fmt.Printf("orb: update cancelled trade %s: %v\n", ticker, dbErr)
+						slog.Error("orb: update cancelled trade failed", "ticker", ticker, "err", dbErr)
 					}
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: orderID,
@@ -1179,7 +1205,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.mu.Unlock()
 
 		if err := store.UpdateORBSession(ctx, s.db, sessionID, "done", nil, nil); err != nil {
-			fmt.Printf("orb: update session to done: %v\n", err)
+			slog.Error("orb: update session to done failed", "err", err)
 		}
 		s.publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{})
 		s.notify(ctx, "ORB: Session complete for today.")
