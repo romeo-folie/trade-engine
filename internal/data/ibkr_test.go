@@ -23,7 +23,7 @@ func TestIBKRFetchCandles(t *testing.T) {
 	// t=1712000000000 ms → 2024-04-01 20:53:20 UTC
 	// t=1712003600000 ms → 2024-04-01 21:53:20 UTC
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/iserver/marketdata/history" {
+		if r.URL.Path != "/v1/api/iserver/marketdata/history" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if r.URL.Query().Get("conid") != "12087792" {
@@ -153,7 +153,7 @@ func TestIBKRFetchCandles_MalformedJSON(t *testing.T) {
 
 func TestIBKRFetchQuote(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/iserver/marketdata/snapshot" {
+		if r.URL.Path != "/v1/api/iserver/marketdata/snapshot" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
 		}
 		if r.URL.Query().Get("conids") != "12087792" {
