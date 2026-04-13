@@ -109,7 +109,18 @@ RULES:
 - size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
 - Do not output markdown, explanations, or any text outside the JSON object.
 - If data is insufficient, return HOLD with low confidence.
-- Never recommend size_pct > 0 for a HOLD action.`, strategy)
+- Never recommend size_pct > 0 for a HOLD action.
+
+USING PERFORMANCE CONTEXT (apply only when trade_count >= 5):
+- Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
+- Ticker win rate >= 65%%: full confidence range (0.0–1.0) is available.
+- Ticker win rate 45%%–65%%: no constraint — use your normal judgment.
+- Ticker avg PnL is negative: bias toward HOLD unless the current setup provides a clearly stronger catalyst than usual.
+
+USING SIMILAR PAST ANALYSES:
+- If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
+- If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
+- Entries marked "outcome unknown" carry no weight.`, strategy)
 }
 
 func buildUser(
