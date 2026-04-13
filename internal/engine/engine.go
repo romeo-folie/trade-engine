@@ -280,13 +280,14 @@ func (e *Engine) Run(ctx context.Context) error {
 	if IsMarketOpen(startupNow) {
 		skipStartup := false
 		if e.cfg.Engine.ShouldSkipRecentTick() {
-			if lastAnalysis, err := store.GetLatestAnalysisTime(ctx); err == nil && lastAnalysis != nil {
-				age := startupNow.Sub(*lastAnalysis)
-				if age < interval {
+			lastAnalysis, err := store.GetLatestAnalysisTime(ctx)
+			if err == nil {
+				skip, _ := startupSkipDecision(startupNow, lastAnalysis, interval)
+				if skip {
 					skipStartup = true
 					skippedLastAnalysisAt = lastAnalysis
 					logger.Info("skipping startup tick — last analysis recent",
-						"last_analysis_age", age.Round(time.Second).String(),
+						"last_analysis_age", startupNow.Sub(*lastAnalysis).Round(time.Second).String(),
 						"interval", interval.String(),
 					)
 				}
@@ -331,7 +332,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	timerBase := time.Now()
 	var nextTick time.Time
 	if skippedLastAnalysisAt != nil {
-		nextTick = NextTickTime(*skippedLastAnalysisAt, interval)
+		_, nextTick = startupSkipDecision(startupNow, skippedLastAnalysisAt, interval)
 	} else {
 		base := timerBase
 		if !ranStartupTick {

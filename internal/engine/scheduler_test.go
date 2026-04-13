@@ -163,6 +163,82 @@ func TestNextEngineWake(t *testing.T) {
 	})
 }
 
+func ptr(t time.Time) *time.Time { return &t }
+
+// TestStartupSkipDecision covers the pure skip-decision and next-tick scheduling
+// logic introduced in the skip_recent_tick feature.
+func TestStartupSkipDecision(t *testing.T) {
+	interval := time.Hour
+
+	tests := []struct {
+		name         string
+		now          string
+		lastAnalysis *time.Time  // nil → no prior analyses
+		wantSkip     bool
+		wantNextTick string // empty string → zero value (don't check)
+	}{
+		{
+			name:         "no prior analyses — do not skip",
+			now:          "2024-03-11T10:00:00",
+			lastAnalysis: nil,
+			wantSkip:     false,
+		},
+		{
+			name:         "last analysis older than interval — do not skip",
+			now:          "2024-03-11T10:00:00",
+			lastAnalysis: ptr(mustParseNY(t, "2024-03-11T08:30:00")), // 90 min ago
+			wantSkip:     false,
+		},
+		{
+			name:         "last analysis exactly at interval boundary — do not skip",
+			now:          "2024-03-11T10:00:00",
+			lastAnalysis: ptr(mustParseNY(t, "2024-03-11T09:00:00")), // exactly 1h ago
+			wantSkip:     false,
+		},
+		{
+			name:         "last analysis recent — skip and schedule from last analysis",
+			now:          "2024-03-11T10:00:00",
+			lastAnalysis: ptr(mustParseNY(t, "2024-03-11T09:45:00")), // 15 min ago
+			wantSkip:     true,
+			wantNextTick: "2024-03-11T10:45:00", // lastAnalysis + 1h
+		},
+		{
+			name:         "recent analysis, next tick crosses market close — routes to next open",
+			now:          "2024-03-11T15:45:00",
+			lastAnalysis: ptr(mustParseNY(t, "2024-03-11T15:30:00")), // 15 min ago
+			wantSkip:     true,
+			wantNextTick: "2024-03-12T09:30:00", // 15:30+1h=16:30 is after close
+		},
+		{
+			name:         "recent analysis on friday, next tick falls on weekend — routes to monday",
+			now:          "2024-03-15T15:45:00", // Friday
+			lastAnalysis: ptr(mustParseNY(t, "2024-03-15T15:30:00")), // 15 min ago
+			wantSkip:     true,
+			wantNextTick: "2024-03-18T09:30:00", // 15:30+1h=16:30 Friday → Monday open
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := mustParseNY(t, tt.now)
+			skip, nextTick := startupSkipDecision(now, tt.lastAnalysis, interval)
+
+			if skip != tt.wantSkip {
+				t.Errorf("skip = %v, want %v", skip, tt.wantSkip)
+			}
+			if tt.wantNextTick != "" {
+				want := mustParseNY(t, tt.wantNextTick)
+				if !nextTick.Equal(want) {
+					t.Errorf("nextTick = %v, want %v", nextTick, want)
+				}
+			}
+			if !tt.wantSkip && !nextTick.IsZero() {
+				t.Errorf("expected zero nextTick when skip=false, got %v", nextTick)
+			}
+		})
+	}
+}
+
 func TestHolidayHelpers(t *testing.T) {
 	t.Run("nthWeekday thanksgiving", func(t *testing.T) {
 		got := nthWeekday(2024, time.November, time.Thursday, 4)
