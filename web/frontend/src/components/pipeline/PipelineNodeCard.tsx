@@ -458,43 +458,52 @@ interface VerdictMarqueeProps {
   entries: VerdictEntry[];
 }
 
+// Pills overflow the card at roughly 6 entries — only scroll beyond that.
+const SCROLL_THRESHOLD = 6;
+
 function VerdictMarquee({ entries }: VerdictMarqueeProps) {
-  // Repeat entries enough times to guarantee the track overflows the container,
-  // then duplicate the full set for a seamless 50% scroll loop.
-  const items = useMemo(() => {
-    const minCopies = Math.max(Math.ceil(8 / entries.length), 2);
-    const oneSet = Array.from({ length: minCopies }, () => entries).flat();
-    return [...oneSet, ...oneSet];
-  }, [entries]);
+  const shouldScroll = entries.length > SCROLL_THRESHOLD;
+
+  // Only build the duplicated set when we actually need to scroll.
+  const scrollItems = useMemo(() => {
+    if (!shouldScroll) return entries;
+    return [...entries, ...entries];
+  }, [entries, shouldScroll]);
+
   const duration = useMemo(() => Math.max(entries.length * 3, 10), [entries.length]);
+
+  const pills = (items: VerdictEntry[], keyPrefix = '') =>
+    items.map((e, i) => {
+      const pillColor = e.action === 'BUY' ? colors.emerald : e.action === 'SELL' ? colors.red : colors.amber;
+      const pillBg = e.action === 'BUY' ? 'rgba(57, 255, 20, 0.1)' : e.action === 'SELL' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(245, 158, 11, 0.1)';
+      return (
+        <span
+          key={`${keyPrefix}${e.ticker}-${i}`}
+          className={styles.verdictPill}
+          style={{ background: pillBg, borderColor: pillColor, color: '#fff' }}
+        >
+          {e.ticker}
+        </span>
+      );
+    });
 
   return (
     <div className={styles.tickerPillsWrapper}>
       <div className={styles.tickerPillsLabel}>VERDICTS</div>
-      <motion.div
-        className={styles.tickerPillsTrack}
-        animate={{ x: [0, "-50%"] }}
-        transition={{
-          duration,
-          ease: "linear",
-          repeat: Infinity,
-        }}
-        style={{ translateZ: 0 }}
-      >
-        {items.map((e, i) => {
-          const pillColor = e.action === 'BUY' ? colors.emerald : e.action === 'SELL' ? colors.red : colors.amber;
-          const pillBg = e.action === 'BUY' ? 'rgba(57, 255, 20, 0.1)' : e.action === 'SELL' ? 'rgba(239, 68, 68, 0.1)' : 'rgba(245, 158, 11, 0.1)';
-          return (
-            <span
-              key={`${e.ticker}-${i}`}
-              className={styles.verdictPill}
-              style={{ background: pillBg, borderColor: pillColor, color: '#fff' }}
-            >
-              {e.ticker}
-            </span>
-          );
-        })}
-      </motion.div>
+      {shouldScroll ? (
+        <motion.div
+          className={styles.tickerPillsTrack}
+          animate={{ x: [0, "-50%"] }}
+          transition={{ duration, ease: "linear", repeat: Infinity }}
+          style={{ translateZ: 0 }}
+        >
+          {pills(scrollItems)}
+        </motion.div>
+      ) : (
+        <div className={styles.tickerPillsTrack} style={{ flexWrap: 'wrap' }}>
+          {pills(entries)}
+        </div>
+      )}
     </div>
   );
 }
