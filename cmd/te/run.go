@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -52,7 +54,8 @@ Modes:
   orb             — Opening Range Breakout mode (LLM-enhanced gap-and-go)
   orb-forex       — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)
   orb-futures     — Equity index futures ORB via IBKR (ES/NQ/YM/RTY; requires markets.ibkr.enabled=true)
-  orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)`,
+  orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)
+  orb-newyork     — Combined equities + forex ORB for the NY session (Alpaca + IBKR; requires both configured)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if runDetach {
 			return startDetachedRun()
@@ -255,33 +258,6 @@ Modes:
 				}()
 			}
 
-			if runWeb {
-				webSrv := web.NewServer(web.Config{
-					Port:           runWebPort,
-					Host:           "0.0.0.0",
-					AllowedOrigins: []string{"*"},
-					EngineConfig:   cfg,
-				}, orbBus, nil)
-				// Wire broker-direct portfolio view for any broker implementing BrokerView.
-				if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
-					pc := cfg.Portfolio.Cache
-					bvCache := web.NewBrokerCache(
-						bv,
-						time.Duration(pc.AccountTTLSec)*time.Second,
-						time.Duration(pc.PositionsTTLSec)*time.Second,
-						time.Duration(pc.HistoryTTLSec)*time.Second,
-						time.Duration(pc.OrdersTTLSec)*time.Second,
-					)
-					webSrv.SetBrokerView(bvCache)
-				}
-				if err := webSrv.Start(ctx); err != nil {
-					return fmt.Errorf("web server: %w", err)
-				}
-				defer webSrv.Stop()
-				logger.Info("web observability server started (orb mode)", "port", runWebPort)
-				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
-			}
-
 			logger.Info("ORB scheduler starting")
 			fmt.Println("ORB mode active. Waiting for pre-market scan window...")
 			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
@@ -398,33 +374,7 @@ Modes:
 				}()
 			}
 
-			// 11. Start web server if requested.
-			if runWeb {
-				webSrv := web.NewServer(web.Config{
-					Port:           runWebPort,
-					Host:           "0.0.0.0",
-					AllowedOrigins: []string{"*"},
-					EngineConfig:   cfg,
-				}, orbBus, nil)
-				// Wire IBKR broker-direct portfolio view.
-				pc := cfg.Portfolio.Cache
-				bvCache := web.NewBrokerCache(
-					ibkrBroker,
-					time.Duration(pc.AccountTTLSec)*time.Second,
-					time.Duration(pc.PositionsTTLSec)*time.Second,
-					time.Duration(pc.HistoryTTLSec)*time.Second,
-					time.Duration(pc.OrdersTTLSec)*time.Second,
-				)
-				webSrv.SetBrokerView(bvCache)
-				if err := webSrv.Start(ctx); err != nil {
-					return fmt.Errorf("web server: %w", err)
-				}
-				defer webSrv.Stop()
-				logger.Info("web observability server started (orb-forex mode)", "port", runWebPort)
-				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
-			}
-
-			// 12. Run.
+			// 11. Run.
 			logger.Info("ORB-Forex scheduler starting")
 			fmt.Println("ORB-Forex mode active. Waiting for forex session open...")
 			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
@@ -555,38 +505,164 @@ Modes:
 				}()
 			}
 
-			// 12. Start web server if requested.
-			if runWeb {
-				webSrv := web.NewServer(web.Config{
-					Port:           runWebPort,
-					Host:           "0.0.0.0",
-					AllowedOrigins: []string{"*"},
-					EngineConfig:   cfg,
-				}, orbBus, nil)
-				pc := cfg.Portfolio.Cache
-				bvCache := web.NewBrokerCache(
-					ibkrBroker,
-					time.Duration(pc.AccountTTLSec)*time.Second,
-					time.Duration(pc.PositionsTTLSec)*time.Second,
-					time.Duration(pc.HistoryTTLSec)*time.Second,
-					time.Duration(pc.OrdersTTLSec)*time.Second,
-				)
-				webSrv.SetBrokerView(bvCache)
-				if err := webSrv.Start(ctx); err != nil {
-					return fmt.Errorf("web server: %w", err)
-				}
-				defer webSrv.Stop()
-				logger.Info("web observability server started", "mode", mode, "port", runWebPort)
-				fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
-			}
-
-			// 13. Run.
+			// 12. Run.
 			logger.Info("ORB-Futures scheduler starting", "mode", mode)
 			fmt.Printf("%s mode active. Waiting for session open (%s ET)...\n", mode, futuresCfg.SessionOpenET)
 			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
 				return fmt.Errorf("%s scheduler: %w", mode, err)
 			}
 			fmt.Printf("TradeEngine (%s) stopped.\n", mode)
+			return nil
+		}
+
+		// ORB-NewYork mode: run equities ORB (Alpaca) and forex ORB (IBKR, newyork
+		// session) concurrently. Both schedulers share only the DB connection.
+		// Starts 30 min before NY open (13:30 UTC); both sessions open together.
+		if mode == "orb-newyork" {
+			// 1. Validate prerequisites.
+			if !store.IsConnected() {
+				return fmt.Errorf("orb-newyork mode requires a database connection")
+			}
+			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
+			if !ok || alpacaClient == nil {
+				return fmt.Errorf("orb-newyork mode requires Alpaca market data provider")
+			}
+			if !cfg.Markets.IBKR.Enabled {
+				return fmt.Errorf("orb-newyork mode requires markets.ibkr.enabled=true")
+			}
+			if !cfg.ForexORB.Enabled {
+				return fmt.Errorf("orb-newyork mode requires forex_orb.enabled=true")
+			}
+			if cfg.Markets.IBKR.AccountID == "" {
+				return fmt.Errorf("orb-newyork mode requires markets.ibkr.account_id to be set")
+			}
+			if !cfg.ORB.Enabled {
+				return fmt.Errorf("orb-newyork mode requires orb.enabled=true")
+			}
+
+			// 2. Set up IBKR broker (shared by the forex scheduler).
+			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
+			if err := ibkrBroker.CheckAuth(ctx); err != nil {
+				notifyIBKRAuthFailure(ctx, tgBot, err, cfg.Markets.IBKR.GatewayURL)
+				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
+			}
+			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
+			defer stopKeepalive()
+			stopAuthMonitor := ibkrBroker.StartAuthMonitor(
+				ctx,
+				cfg.Markets.IBKR.AuthMonitorSec,
+				cfg.Markets.IBKR.AuthAlertDebounceMin,
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					if err := tgBot.SendImmediate(ctx, fmt.Sprintf(
+						"🔐 *IBKR session expired*\nGateway: `%s`\nPlease re-authenticate via the Client Portal.",
+						gatewayURL,
+					)); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send alert", "err", err)
+					}
+				},
+				func(gatewayURL string) {
+					if tgBot == nil {
+						return
+					}
+					if err := tgBot.SendImmediate(ctx, fmt.Sprintf(
+						"✅ *IBKR session restored*\nGateway: `%s`", gatewayURL,
+					)); err != nil {
+						logger.Warn("ibkr auth monitor: failed to send recovery alert", "err", err)
+					}
+				},
+			)
+			defer stopAuthMonitor()
+
+			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
+
+			// 3. Build equities ORB scheduler (Alpaca data + broker).
+			equitiesBus := events.New()
+			equitiesAnalyzer := analysis.NewAnalyzer(cfg.Models, equitiesBus)
+			var equitiesNotifier orb.Notifier
+			if tgBot != nil {
+				equitiesNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
+			equitiesScheduler := orb.NewORBScheduler(
+				cfg.ORB, store.GetDB(), alpacaClient, equitiesAnalyzer,
+				broker, newDBPortfolioValuer(100_000), equitiesNotifier,
+			)
+			if newsProvider != nil {
+				equitiesScheduler.SetNewsProvider(newsProvider)
+			}
+			equitiesScheduler.SetBus(equitiesBus)
+			// A single Reviewer covers both schedulers — it queries all trades
+			// globally and is not scoped to a bus. Running two would duplicate
+			// flag computation and event publishing.
+			if cfg.Feedback.Enabled {
+				equitiesScheduler.SetFeedbackConfig(&cfg.Feedback)
+				reviewer := feedback.NewReviewer(cfg.Feedback, equitiesBus, store.GetDB())
+				go func() {
+					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
+						fmt.Printf("feedback reviewer: %v\n", err)
+					}
+				}()
+			}
+
+			// 4. Build forex ORB scheduler (IBKR data + broker, newyork session).
+			cfg.ForexORB.Session = "newyork"
+			forexBus := events.New()
+			forexAnalyzer := analysis.NewAnalyzer(cfg.Models, forexBus)
+			var forexNotifier orb.Notifier
+			if tgBot != nil {
+				forexNotifier = &orbTelegramNotifier{bot: tgBot}
+			}
+			forexORBCfg := config.ORBConfig{
+				Enabled:        cfg.ForexORB.Enabled,
+				Mode:           "paper",
+				MaxCandidates:  len(cfg.ForexORB.Instruments),
+				RangeMinutes:   cfg.ForexORB.RangeMinutes,
+				RiskReward:     cfg.ForexORB.RiskReward,
+				MaxRiskPct:     cfg.ForexORB.MaxRiskPct,
+				MaxPositionPct: cfg.ForexORB.MaxPositionPct,
+			}
+			forexScheduler := orb.NewORBScheduler(
+				forexORBCfg, store.GetDB(), ibkrData, forexAnalyzer,
+				ibkrBroker, newDBPortfolioValuer(100_000), forexNotifier,
+			)
+			forexScanner := &orb.ForexCandidateScanner{
+				Instruments: cfg.ForexORB.Instruments,
+				MarketData:  ibkrData,
+				Cfg:         cfg.ForexORB,
+			}
+			forexScheduler.SetScanner(forexScanner)
+			forexScheduler.SetForexConfig(&cfg.ForexORB)
+			if newsProvider != nil {
+				forexScheduler.SetNewsProvider(newsProvider)
+			}
+			forexScheduler.SetBus(forexBus)
+			if cfg.Feedback.Enabled {
+				forexScheduler.SetFeedbackConfig(&cfg.Feedback)
+			}
+
+			// 5. Run both schedulers concurrently. A fatal error in either cancels
+			// the shared context, which unblocks the other via its ctx.Done() check.
+			logger.Info("ORB-NewYork combined scheduler starting")
+			fmt.Println("ORB-NewYork mode active (equities + forex). Waiting for pre-market scan window...")
+			eg, egCtx := errgroup.WithContext(ctx)
+			eg.Go(func() error {
+				if err := equitiesScheduler.Run(egCtx); err != nil && err != context.Canceled {
+					return fmt.Errorf("equities orb: %w", err)
+				}
+				return nil
+			})
+			eg.Go(func() error {
+				if err := forexScheduler.Run(egCtx); err != nil && err != context.Canceled {
+					return fmt.Errorf("forex orb: %w", err)
+				}
+				return nil
+			})
+			if err := eg.Wait(); err != nil {
+				return err
+			}
+			fmt.Println("TradeEngine (ORB-NewYork) stopped.")
 			return nil
 		}
 
