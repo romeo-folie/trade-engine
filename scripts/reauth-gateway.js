@@ -14,40 +14,50 @@
  * Optional env vars:
  *   IBKR_GATEWAY_URL      — defaults to https://localhost:5001
  *   TELEGRAM_BOT_TOKEN    — send result notifications (skipped if unset)
- *   TELEGRAM_CHAT_ID      — defaults to 5684725055
+ *   TELEGRAM_CHAT_ID      — required when TELEGRAM_BOT_TOKEN is set
  *
  * Exit codes:
- *   0 — authenticated successfully
+ *   0 — authenticated successfully (or already authenticated)
  *   1 — authentication failed after all retries
  */
 
 const { chromium } = require('playwright');
 const https = require('https');
+const { URL }  = require('url');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const GATEWAY_URL     = process.env.IBKR_GATEWAY_URL   || 'https://localhost:5001';
-const USERNAME        = process.env.IBKR_API_USERNAME;
-const PASSWORD        = process.env.IBKR_API_PASSWORD;
-const TG_TOKEN        = process.env.TELEGRAM_BOT_TOKEN;
-const TG_CHAT_ID      = process.env.TELEGRAM_CHAT_ID   || '5684725055';
+const GATEWAY_URL  = process.env.IBKR_GATEWAY_URL || 'https://localhost:5001';
+const USERNAME     = process.env.IBKR_API_USERNAME;
+const PASSWORD     = process.env.IBKR_API_PASSWORD;
+const TG_TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
+const TG_CHAT_ID   = process.env.TELEGRAM_CHAT_ID;
 
 // Retry the full login sequence up to MAX_ATTEMPTS times with RETRY_DELAY_MS
 // between attempts. The gateway can be slow to accept new sessions immediately
 // after the maintenance window.
-const MAX_ATTEMPTS    = 3;
-const RETRY_DELAY_MS  = 30_000;
+const MAX_ATTEMPTS   = 3;
+const RETRY_DELAY_MS = 30_000;
 
 // How long to wait for the login page to load and for the post-login auth
 // status check before giving up on a single attempt.
-const NAV_TIMEOUT_MS  = 30_000;
-const AUTH_POLL_MS    = 3_000;
-const AUTH_MAX_POLLS  = 10;
+const NAV_TIMEOUT_MS = 30_000;
+const AUTH_POLL_MS   = 3_000;
+const AUTH_MAX_POLLS = 10;
+
+// Timeout for outbound HTTP requests (Telegram send, auth status check).
+const HTTP_TIMEOUT_MS = 10_000;
+
+// Only disable TLS verification when the gateway host is localhost / loopback.
+// This prevents silent MITM if IBKR_GATEWAY_URL is ever pointed elsewhere.
+const gatewayHost        = new URL(GATEWAY_URL).hostname;
+const isLocalhost        = gatewayHost === 'localhost' || gatewayHost === '127.0.0.1';
+const rejectUnauthorized = !isLocalhost;
 
 // ── Telegram helper ───────────────────────────────────────────────────────────
 
 async function sendTelegram(text) {
-  if (!TG_TOKEN) return;
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
   const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
   return new Promise((resolve) => {
     const req = https.request(
@@ -62,6 +72,9 @@ async function sendTelegram(text) {
         res.on('end', resolve);
       }
     );
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error('Telegram request timed out'));
+    });
     req.on('error', (e) => { console.warn('Telegram send failed:', e.message); resolve(); });
     req.write(body);
     req.end();
@@ -74,7 +87,7 @@ function checkAuthStatus() {
   return new Promise((resolve) => {
     const req = https.request(
       `${GATEWAY_URL}/v1/api/iserver/auth/status`,
-      { rejectUnauthorized: false },
+      { rejectUnauthorized },
       (res) => {
         let data = '';
         res.on('data', (chunk) => { data += chunk; });
@@ -88,6 +101,9 @@ function checkAuthStatus() {
         });
       }
     );
+    req.setTimeout(HTTP_TIMEOUT_MS, () => {
+      req.destroy(new Error('Auth status check timed out'));
+    });
     req.on('error', () => resolve(false));
     req.end();
   });
@@ -96,7 +112,7 @@ function checkAuthStatus() {
 // ── Login via browser ─────────────────────────────────────────────────────────
 
 async function attemptLogin(browser) {
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  const context = await browser.newContext({ ignoreHTTPSErrors: isLocalhost });
   const page    = await context.newPage();
 
   try {
@@ -150,14 +166,14 @@ async function main() {
   if (!USERNAME || !PASSWORD) {
     console.error('IBKR_API_USERNAME and IBKR_API_PASSWORD must be set.');
     await sendTelegram('⚠️ IBKR reauth skipped — credentials not configured (IBKR_API_USERNAME / IBKR_API_PASSWORD missing).');
-    process.exit(1);
+    return 1;
   }
 
   // Fast-path: already authenticated (e.g. reauth ran twice, or session survived).
   if (await checkAuthStatus()) {
     console.log('Gateway already authenticated — nothing to do.');
     await sendTelegram('✅ IBKR gateway already authenticated — no reauth needed.');
-    process.exit(0);
+    return 0;
   }
 
   const browser = await chromium.launch({ headless: true });
@@ -170,7 +186,7 @@ async function main() {
       if (ok) {
         console.log('\n✓ IBKR gateway re-authenticated successfully.');
         await sendTelegram('✅ IBKR gateway re-authenticated — engine ready for next session.');
-        process.exit(0);
+        return 0;
       }
 
       if (attempt < MAX_ATTEMPTS) {
@@ -185,15 +201,19 @@ async function main() {
       `Manual login required: ${GATEWAY_URL}\n` +
       `The engine will not start for the next session until this is resolved.`
     );
-    process.exit(1);
+    return 1;
 
   } finally {
+    // browser.close() always runs here — process.exitCode is set after this
+    // block completes so the finally is never bypassed.
     await browser.close();
   }
 }
 
-main().catch(async (err) => {
-  console.error('Unexpected error:', err);
-  await sendTelegram(`🔐 IBKR reauth script crashed: ${err.message}`);
-  process.exit(1);
-});
+main()
+  .then((code) => { process.exitCode = code; })
+  .catch(async (err) => {
+    console.error('Unexpected error:', err);
+    await sendTelegram(`🔐 IBKR reauth script crashed: ${err.message}`);
+    process.exitCode = 1;
+  });
