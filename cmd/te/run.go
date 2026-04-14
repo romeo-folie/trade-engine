@@ -307,6 +307,7 @@ Modes:
 			// 2. Create IBKR broker.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
+				notifyIBKRAuthFailure(ctx, tgBot, err, cfg.Markets.IBKR.GatewayURL)
 				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
@@ -456,6 +457,7 @@ Modes:
 			// 2. Create IBKR broker and authenticate.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
+				notifyIBKRAuthFailure(ctx, tgBot, err, cfg.Markets.IBKR.GatewayURL)
 				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
@@ -859,6 +861,21 @@ func (p *dbPortfolioValuer) PortfolioValue() float64 {
 		return p.defaultValue
 	}
 	return snap.TotalValue
+}
+
+// notifyIBKRAuthFailure sends an immediate Telegram alert when the IBKR gateway
+// is not authenticated at startup. The send is bounded by a 10s timeout so a
+// Telegram outage cannot stall the engine shutdown path.
+func notifyIBKRAuthFailure(ctx context.Context, bot *notify.TelegramBot, err error, gatewayURL string) {
+	if bot == nil {
+		return
+	}
+	msg := fmt.Sprintf("🔐 IBKR auth failed on startup — engine did not start.\n%v\n\nRe-authenticate at %s and restart.", err, gatewayURL)
+	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if sendErr := bot.SendImmediate(sendCtx, msg); sendErr != nil {
+		logger.Warn("telegram: failed to send IBKR auth alert", "err", sendErr)
+	}
 }
 
 // orbTelegramNotifier adapts notify.TelegramBot to the orb.Notifier interface.
