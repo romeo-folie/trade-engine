@@ -517,10 +517,12 @@ Modes:
 
 		// ORB-NewYork mode: run equities ORB (Alpaca) and forex ORB (IBKR, newyork
 		// session) concurrently. Both schedulers share only the DB connection.
-		// Start at 10:00 UTC (6 AM ET) — equities scans pre-market gap movers while
-		// forex idles until its 13:30 UTC session open, then both run in parallel.
+		// Starts 30 min before NY open (13:30 UTC); both sessions open together.
 		if mode == "orb-newyork" {
 			// 1. Validate prerequisites.
+			if !store.IsConnected() {
+				return fmt.Errorf("orb-newyork mode requires a database connection")
+			}
 			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
 			if !ok || alpacaClient == nil {
 				return fmt.Errorf("orb-newyork mode requires Alpaca market data provider")
@@ -591,12 +593,15 @@ Modes:
 				equitiesScheduler.SetNewsProvider(newsProvider)
 			}
 			equitiesScheduler.SetBus(equitiesBus)
+			// A single Reviewer covers both schedulers — it queries all trades
+			// globally and is not scoped to a bus. Running two would duplicate
+			// flag computation and event publishing.
 			if cfg.Feedback.Enabled {
 				equitiesScheduler.SetFeedbackConfig(&cfg.Feedback)
 				reviewer := feedback.NewReviewer(cfg.Feedback, equitiesBus, store.GetDB())
 				go func() {
 					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
-						fmt.Printf("feedback reviewer (equities): %v\n", err)
+						fmt.Printf("feedback reviewer: %v\n", err)
 					}
 				}()
 			}
@@ -635,12 +640,6 @@ Modes:
 			forexScheduler.SetBus(forexBus)
 			if cfg.Feedback.Enabled {
 				forexScheduler.SetFeedbackConfig(&cfg.Feedback)
-				reviewer := feedback.NewReviewer(cfg.Feedback, forexBus, store.GetDB())
-				go func() {
-					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
-						fmt.Printf("feedback reviewer (forex): %v\n", err)
-					}
-				}()
 			}
 
 			// 5. Run both schedulers concurrently. A fatal error in either cancels
