@@ -50,9 +50,50 @@ func TestExtractAnalysisJSON_NormalizesLowercaseAction(t *testing.T) {
 }
 
 func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
-	raw := `{"action":"WAIT","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
+	raw := `{"action":"WATCH","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
 	if _, err := extractAnalysisJSON(raw); err == nil {
 		t.Fatal("expected error for invalid action")
+	}
+}
+
+func TestExtractAnalysisJSON_AcceptsWaitAction(t *testing.T) {
+	raw := `{"action":"WAIT","confidence":0.75,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"real catalyst, gap too extreme for entry"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionWait {
+		t.Fatalf("action = %q, want WAIT", got.Action)
+	}
+}
+
+func TestExtractAnalysisJSON_WaitZerosSizePct(t *testing.T) {
+	// Model non-compliance: WAIT with non-zero size_pct — must be sanitised before persistence.
+	raw := `{"action":"WAIT","confidence":0.80,"size_pct":3.0,"stop_loss":150.0,"take_profit":160.0,"reasoning":"gap too large"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.SizePct != 0 {
+		t.Fatalf("size_pct = %f, want 0 for WAIT action", got.SizePct)
+	}
+	if got.StopLoss != 0 {
+		t.Fatalf("stop_loss = %f, want 0 for WAIT action", got.StopLoss)
+	}
+	if got.TakeProfit != 0 {
+		t.Fatalf("take_profit = %f, want 0 for WAIT action", got.TakeProfit)
+	}
+}
+
+func TestExtractAnalysisJSON_HoldZerosSizePct(t *testing.T) {
+	// Same invariant for HOLD — must never carry non-zero sizing fields.
+	raw := `{"action":"HOLD","confidence":0.40,"size_pct":1.5,"stop_loss":100.0,"take_profit":110.0,"reasoning":"no catalyst"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.SizePct != 0 {
+		t.Fatalf("size_pct = %f, want 0 for HOLD action", got.SizePct)
 	}
 }
 

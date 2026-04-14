@@ -126,6 +126,68 @@ func TestMajorityVote_AllFailed(t *testing.T) {
 	}
 }
 
+func TestMajorityVote_WaitMajority(t *testing.T) {
+	// 2 WAIT vs 1 BUY — WAIT wins outright.
+	results := []AnalystResult{
+		makeResult(ActionWait, 0.80, nil),
+		makeResult(ActionWait, 0.75, nil),
+		makeResult(ActionBuy, 0.90, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionWait {
+		t.Fatalf("action = %q, want WAIT (2 vs 1 BUY)", resp.Action)
+	}
+}
+
+func TestMajorityVote_TieWaitVsBuyReturnsWait(t *testing.T) {
+	// WAIT and BUY tied → WAIT wins (don't rush into poor timing).
+	results := []AnalystResult{
+		makeResult(ActionWait, 0.80, nil),
+		makeResult(ActionBuy, 0.80, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionWait {
+		t.Fatalf("action = %q, want WAIT on WAIT-BUY tie (conservative)", resp.Action)
+	}
+}
+
+func TestMajorityVote_TieWaitVsHoldReturnsHold(t *testing.T) {
+	// WAIT and HOLD tied → HOLD wins (more conservative; no confirmed catalyst).
+	results := []AnalystResult{
+		makeResult(ActionWait, 0.75, nil),
+		makeResult(ActionHold, 0.75, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionHold {
+		t.Fatalf("action = %q, want HOLD on WAIT-HOLD tie (most conservative)", resp.Action)
+	}
+}
+
+func TestMajorityVote_AllWait(t *testing.T) {
+	// Unanimous WAIT — fast path should also catch this but majorityVote handles it.
+	results := []AnalystResult{
+		makeResult(ActionWait, 0.85, nil),
+		makeResult(ActionWait, 0.80, nil),
+		makeResult(ActionWait, 0.78, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionWait {
+		t.Fatalf("action = %q, want WAIT", resp.Action)
+	}
+}
+
 func TestExtractDissent_Present(t *testing.T) {
 	got := extractDissent("Analysis complete. DISSENT: Model-A said SELL while others said BUY.")
 	if got == "" {

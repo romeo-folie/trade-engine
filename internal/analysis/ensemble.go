@@ -148,7 +148,12 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 
 // ─── Majority vote fallback ─────────────────────────────────────────────────────
 
-// majorityVote returns the action with the most votes; HOLD wins ties.
+// majorityVote returns the action with the most votes.
+// Tie-breaking follows a conservative cascade: HOLD > WAIT > SKIP > directional.
+// Rationale: HOLD means "no interest"; WAIT means "interested, poor timing";
+// SKIP is ORB mode's conservative gate; BUY/SELL/TRADE means "act now".
+// Iterates over whatever actions are present in counts so ORB-mode TRADE/SKIP
+// votes are correctly tallied when majorityVote is used as an arbiter fallback.
 func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 	successes := successfulResults(results)
 	if len(successes) == 0 {
@@ -160,28 +165,37 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 		counts[r.Response.Action]++
 		confSum[r.Response.Action] += r.Response.Confidence
 	}
-	// Find the maximum vote count across all actions.
+	// Find the maximum vote count dynamically over all observed actions so
+	// non-standard actions (TRADE, SKIP) are counted when present.
 	maxCount := 0
-	for _, action := range []Action{ActionBuy, ActionSell, ActionHold} {
-		if counts[action] > maxCount {
-			maxCount = counts[action]
+	for _, c := range counts {
+		if c > maxCount {
+			maxCount = c
 		}
 	}
-	// Collect all actions that share the maximum vote count.
+	// Collect all actions tied for the lead.
 	var leaders []Action
-	for _, action := range []Action{ActionBuy, ActionSell, ActionHold} {
-		if counts[action] == maxCount {
+	for action, c := range counts {
+		if c == maxCount {
 			leaders = append(leaders, action)
 		}
 	}
-	// If BUY and SELL are both tied for the lead, the directional signal is
-	// ambiguous — return HOLD (neutral) rather than favouring BUY by iteration order.
+	// Resolve ties with the conservative cascade: HOLD > WAIT > SKIP > directional.
 	var winner Action
 	if len(leaders) == 1 {
 		winner = leaders[0]
 	} else {
-		// Multiple actions tied: always prefer HOLD over a directional bias.
-		winner = ActionHold
+		switch {
+		case counts[ActionHold] == maxCount:
+			winner = ActionHold // HOLD beats everything on a tie
+		case counts[ActionWait] == maxCount:
+			winner = ActionWait // WAIT beats BUY/SELL/TRADE on a tie
+		case counts[ActionSkip] == maxCount:
+			winner = ActionSkip // SKIP beats TRADE on a tie (ORB conservative)
+		default:
+			// Multiple directional actions tied — signal is ambiguous, use HOLD.
+			winner = ActionHold
+		}
 	}
 	if maxCount == 0 {
 		winner = ActionHold
@@ -218,13 +232,25 @@ Your task:
 
 Output ONLY a valid JSON object:
 {
-  "action": "BUY" | "SELL" | "HOLD",
+  "action": "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence": <0.0–1.0>,
   "size_pct": <0.0–10.0>,
   "stop_loss": <price or 0>,
   "take_profit": <price or 0>,
   "reasoning": "<synthesis; include 'DISSENT: ...' if analysts disagreed>"
 }
+
+Action semantics:
+- BUY / SELL: strong catalyst AND entry timing is favourable — act now.
+- WAIT: real, material catalyst exists but entry conditions are not yet met
+  (e.g. extreme gap-up with no intraday range, consolidation in progress).
+  Set size_pct to 0 for WAIT. High confidence is valid for WAIT — it reflects
+  conviction in the catalyst, not in the timing.
+- HOLD: no meaningful catalyst or setup — nothing to track.
+
+If a significant minority of analysts voted WAIT on valid-catalyst grounds
+but the majority voted BUY, weigh whether entry timing is ambiguous enough
+to prefer WAIT over a premature entry.
 
 Do not include any text outside the JSON object.`
 }

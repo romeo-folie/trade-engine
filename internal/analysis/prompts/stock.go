@@ -95,27 +95,34 @@ Your task is to analyse the provided market data and return a trade recommendati
 
 OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
 {
-  "action":      "BUY" | "SELL" | "HOLD",
+  "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence":  <float 0.0–1.0>,
   "size_pct":    <float, recommended position size as %% of portfolio>,
-  "stop_loss":   <float price, or null if HOLD>,
-  "take_profit": <float price, or null if HOLD>,
+  "stop_loss":   <float price, or 0 if HOLD/WAIT>,
+  "take_profit": <float price, or 0 if HOLD/WAIT>,
   "reasoning":   "<concise explanation referencing specific data points>"
 }
 
 RULES:
-- action must be exactly "BUY", "SELL", or "HOLD" (uppercase).
+- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
 - confidence must be between 0.0 and 1.0.
 - size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
 - Do not output markdown, explanations, or any text outside the JSON object.
 - If data is insufficient, return HOLD with low confidence.
-- Never recommend size_pct > 0 for a HOLD action.
+- Never recommend size_pct > 0 for a HOLD or WAIT action.
+- Use HOLD when there is no meaningful catalyst or setup worth tracking.
+- Use WAIT when the catalyst is real and material but entry conditions are not
+  yet met — for example: extreme gap-up with no established intraday range,
+  consolidation still in progress, or pre-breakout compression not yet resolved.
+  WAIT signals re-evaluation on the next cycle. High confidence is valid for
+  WAIT — it reflects conviction in the catalyst, not in the entry timing.
+- Use BUY or SELL only when the catalyst is strong AND entry timing is favourable.
 
 USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trades in last 30 days):
 - Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
 - Ticker win rate >= 65%%: full confidence range (0.0–1.0) is available.
 - Ticker win rate 45%%–65%%: no constraint — use your normal judgment.
-- Ticker avg PnL is negative: bias toward HOLD unless the current setup provides a clearly stronger catalyst than usual.
+- Ticker avg PnL is negative: bias toward HOLD or WAIT unless the current setup provides a clearly stronger catalyst than usual.
 
 USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
