@@ -101,9 +101,12 @@ async function sendTelegram(text) {
   });
 }
 
-// ── Auth status check (direct HTTP, no browser) ───────────────────────────────
+// ── Auth status check ─────────────────────────────────────────────────────────
 
-function checkAuthStatus() {
+// checkAuthStatusDirect: plain HTTPS request, no session cookies.
+// Works before any browser session exists (pre-login fast-path).
+// Returns false on 403/401 — the gateway requires cookies once a session exists.
+function checkAuthStatusDirect() {
   return new Promise((resolve) => {
     const req = https.request(
       `${GATEWAY_URL}/v1/api/iserver/auth/status`,
@@ -129,6 +132,22 @@ function checkAuthStatus() {
   });
 }
 
+// checkAuthStatusFromPage: fetch via the Playwright page so the browser's
+// session cookies are included. Required after login because the gateway now
+// scopes the authenticated session to the cookie set at login time.
+async function checkAuthStatusFromPage(page) {
+  try {
+    return await page.evaluate(async () => {
+      const r = await fetch('/v1/api/iserver/auth/status');
+      if (!r.ok) return false;
+      const j = await r.json();
+      return j.authenticated === true && j.connected === true;
+    });
+  } catch {
+    return false;
+  }
+}
+
 // ── Login via browser ─────────────────────────────────────────────────────────
 
 async function attemptLogin(browser) {
@@ -139,15 +158,32 @@ async function attemptLogin(browser) {
     console.log(`  Navigating to ${GATEWAY_URL} ...`);
     await page.goto(GATEWAY_URL, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS });
 
-    // Wait for the username field — the gateway may redirect to /sso/Login first.
-    await page.waitForSelector('#user_name', { timeout: NAV_TIMEOUT_MS });
+    // Wait for the username field — the gateway redirects to /sso/Login which
+    // renders the form dynamically. Field IDs changed in the 2024+ login UI.
+    await page.waitForSelector('#xyz-field-username', { timeout: NAV_TIMEOUT_MS });
+
+    // Switch to Paper mode if the toggle is not already set. The toggle
+    // defaults to Live; paper trading accounts must select Paper or login fails.
+    // The actual <input> is hidden — click the visible <label for="toggle1"> instead.
+    // Wait after clicking for the form to re-render before filling credentials.
+    const paperToggle = page.locator('input[name="paperSwitch"]');
+    const isPaper = await paperToggle.isChecked().catch(() => false);
+    if (!isPaper) {
+      console.log('  Switching to Paper trading mode...');
+      await page.locator('label[for="toggle1"]').click();
+      await new Promise(r => setTimeout(r, 1000));
+    }
 
     console.log('  Filling credentials...');
-    await page.fill('#user_name', USERNAME);
-    await page.fill('#password', PASSWORD);
+    // Use keyboard.type() rather than fill() — the gateway's JS framework
+    // requires real keystroke events to bind the input values to its model.
+    await page.locator('#xyz-field-username').click();
+    await page.keyboard.type(USERNAME);
+    await page.locator('#xyz-field-password').click();
+    await page.keyboard.type(PASSWORD);
 
-    // The submit button is either a button or an input depending on gateway version.
-    const submitSelector = 'button#submitForm, input#submitForm, button[type="submit"]';
+    // Login button in the current gateway UI.
+    const submitSelector = 'button.xyz-button-login[type="submit"]';
     await page.click(submitSelector);
 
     // After clicking, the gateway shows a brief loading state then either:
@@ -166,7 +202,7 @@ async function attemptLogin(browser) {
         await paperBtn.first().click();
       }
 
-      const authed = await checkAuthStatus();
+      const authed = await checkAuthStatusFromPage(page);
       if (authed) {
         console.log(`  Authenticated after ${(i + 1) * AUTH_POLL_MS / 1000}s.`);
         return true;
@@ -190,7 +226,9 @@ async function main() {
   }
 
   // Fast-path: already authenticated (e.g. reauth ran twice, or session survived).
-  if (await checkAuthStatus()) {
+  // Uses direct HTTP; returns false if the gateway requires cookies (post-login),
+  // in which case we fall through to the browser login which is safe to repeat.
+  if (await checkAuthStatusDirect()) {
     console.log('Gateway already authenticated — nothing to do.');
     await sendTelegram('✅ IBKR gateway already authenticated — no reauth needed.');
     return 0;
