@@ -1,0 +1,12 @@
+{
+  "name": "trade-engine-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Maintenance scripts for trade-engine",
+  "scripts": {
+    "reauth": "node reauth-gateway.js"
+  },
+  "dependencies": {
+    "playwright": "^1.49.0"
+  }
+}

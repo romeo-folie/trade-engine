@@ -863,14 +863,18 @@ func (p *dbPortfolioValuer) PortfolioValue() float64 {
 	return snap.TotalValue
 }
 
-// notifyIBKRAuthFailure sends an immediate Telegram alert when the IBKR gateway
-// is not authenticated at startup. The send is bounded by a 10s timeout so a
-// Telegram outage cannot stall the engine shutdown path.
+// notifyIBKRAuthFailure sends a Telegram alert when the IBKR gateway is not
+// authenticated at engine startup. A 10-second timeout context is used so that
+// a slow or unreachable Telegram API cannot stall the startup failure path.
+// Dynamic values are wrapped in backticks to avoid Markdown parse errors.
 func notifyIBKRAuthFailure(ctx context.Context, bot *notify.TelegramBot, err error, gatewayURL string) {
 	if bot == nil {
 		return
 	}
-	msg := fmt.Sprintf("🔐 IBKR auth failed on startup — engine did not start.\n%v\n\nRe-authenticate at %s and restart.", err, gatewayURL)
+	msg := fmt.Sprintf(
+		"🔐 IBKR auth failed on startup — engine did not start.\n`%v`\n\nRe-authenticate at `%s` and restart.",
+		err, gatewayURL,
+	)
 	sendCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	if sendErr := bot.SendImmediate(sendCtx, msg); sendErr != nil {
