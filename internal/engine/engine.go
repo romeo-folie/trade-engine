@@ -1167,7 +1167,14 @@ func (e *Engine) SetCostNotifier(n cost.DegradeNotifier) {
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
 // and routes execution according to the current mode.
 func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string) {
-	if resp.Action == analysis.ActionHold {
+	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
+		// WAIT: real catalyst but poor entry timing — analysis is recorded,
+		// no signal fires. No cooldown is applied so the ticker is re-evaluated
+		// on the next normal tick.
+		if resp.Action == analysis.ActionWait && resp.SizePct != 0 {
+			// Sanitise: WAIT must never carry a non-zero size.
+			resp.SizePct = 0
+		}
 		return
 	}
 

@@ -50,9 +50,20 @@ func TestExtractAnalysisJSON_NormalizesLowercaseAction(t *testing.T) {
 }
 
 func TestExtractAnalysisJSON_RejectsInvalidAction(t *testing.T) {
-	raw := `{"action":"WAIT","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
+	raw := `{"action":"WATCH","confidence":0.5,"size_pct":1.0,"stop_loss":1,"take_profit":2,"reasoning":"x"}`
 	if _, err := extractAnalysisJSON(raw); err == nil {
 		t.Fatal("expected error for invalid action")
+	}
+}
+
+func TestExtractAnalysisJSON_AcceptsWaitAction(t *testing.T) {
+	raw := `{"action":"WAIT","confidence":0.75,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"real catalyst, gap too extreme for entry"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionWait {
+		t.Fatalf("action = %q, want WAIT", got.Action)
 	}
 }
 

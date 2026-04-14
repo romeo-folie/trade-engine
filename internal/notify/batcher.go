@@ -45,13 +45,13 @@ func NewTickBatcher(cfg config.TelegramConfig, sendFn func(text string) error) *
 }
 
 // Add enqueues a BatchItem. Drops the item if it does not meet the confidence
-// threshold or is a HOLD when include_holds=false. Starts the auto-flush timer
-// on the first item added.
+// threshold or is a HOLD/WAIT when include_holds=false. Starts the auto-flush
+// timer on the first item added.
 func (b *TickBatcher) Add(item BatchItem) {
 	if !b.cfg.BatchEnabled {
 		return
 	}
-	if item.Action == "HOLD" && !b.cfg.IncludeHolds {
+	if (item.Action == "HOLD" || item.Action == "WAIT") && !b.cfg.IncludeHolds {
 		return
 	}
 	if item.Kind == "signal" && item.Confidence < b.cfg.MinConfidenceForAlert {
