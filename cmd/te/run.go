@@ -307,7 +307,14 @@ Modes:
 			// 2. Create IBKR broker.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
-				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
+				authErr := fmt.Errorf("IBKR gateway not authenticated: %w", err)
+				if tgBot != nil {
+					msg := fmt.Sprintf("🔐 IBKR auth failed on startup — engine did not start.\n%s\n\nRe-authenticate at %s and restart.", err, cfg.Markets.IBKR.GatewayURL)
+					if sendErr := tgBot.SendImmediate(ctx, msg); sendErr != nil {
+						logger.Warn("telegram: failed to send IBKR auth alert", "err", sendErr)
+					}
+				}
+				return authErr
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
 			defer stopKeepalive()
@@ -456,7 +463,14 @@ Modes:
 			// 2. Create IBKR broker and authenticate.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
-				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
+				authErr := fmt.Errorf("IBKR gateway not authenticated: %w", err)
+				if tgBot != nil {
+					msg := fmt.Sprintf("🔐 IBKR auth failed on startup — engine did not start.\n%s\n\nRe-authenticate at %s and restart.", err, cfg.Markets.IBKR.GatewayURL)
+					if sendErr := tgBot.SendImmediate(ctx, msg); sendErr != nil {
+						logger.Warn("telegram: failed to send IBKR auth alert", "err", sendErr)
+					}
+				}
+				return authErr
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
 			defer stopKeepalive()
