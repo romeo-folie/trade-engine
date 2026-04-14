@@ -23,7 +23,6 @@
 
 const { chromium } = require('playwright');
 const https = require('https');
-const { URL }  = require('url');
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -49,16 +48,37 @@ const AUTH_MAX_POLLS = 10;
 const HTTP_TIMEOUT_MS = 10_000;
 
 // Only disable TLS verification when the gateway host is localhost / loopback.
-// This prevents silent MITM if IBKR_GATEWAY_URL is ever pointed elsewhere.
-const gatewayHost        = new URL(GATEWAY_URL).hostname;
-const isLocalhost        = gatewayHost === 'localhost' || gatewayHost === '127.0.0.1';
-const rejectUnauthorized = !isLocalhost;
+// Parsed inside a helper so that an invalid IBKR_GATEWAY_URL does not crash
+// the module before main() can report the error; defaults to secure (true) on
+// any parse failure.
+function getRejectUnauthorized(gatewayUrl) {
+  try {
+    const { URL } = require('url');
+    const host = new URL(gatewayUrl).hostname;
+    return host !== 'localhost' && host !== '127.0.0.1';
+  } catch (e) {
+    console.warn(`Invalid IBKR_GATEWAY_URL "${gatewayUrl}": ${e.message}. Defaulting to TLS verification enabled.`);
+    return true;
+  }
+}
+
+const rejectUnauthorized = getRejectUnauthorized(GATEWAY_URL);
+const isLocalhost        = !rejectUnauthorized;
 
 // ── Telegram helper ───────────────────────────────────────────────────────────
 
+// Escape characters that are special in Telegram's HTML parse mode so that
+// dynamic content (error messages, URLs) never causes a 400 from the API.
+function escapeTelegramHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 async function sendTelegram(text) {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
-  const body = JSON.stringify({ chat_id: TG_CHAT_ID, text, parse_mode: 'HTML' });
+  const body = JSON.stringify({ chat_id: TG_CHAT_ID, text: escapeTelegramHtml(text), parse_mode: 'HTML' });
   return new Promise((resolve) => {
     const req = https.request(
       {
@@ -181,7 +201,10 @@ async function main() {
   try {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       console.log(`\nAttempt ${attempt}/${MAX_ATTEMPTS}`);
-      const ok = await attemptLogin(browser);
+      const ok = await attemptLogin(browser).catch((err) => {
+        console.warn('  Login attempt threw:', err.message);
+        return false;
+      });
 
       if (ok) {
         console.log('\n✓ IBKR gateway re-authenticated successfully.');
