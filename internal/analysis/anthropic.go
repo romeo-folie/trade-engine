@@ -248,6 +248,15 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 		return AnalysisResponse{}, fmt.Errorf("confidence %f out of [0,1]", result.Confidence)
 	}
 
+	// Enforce invariant: non-directional actions must never carry position sizing.
+	// Applied here (before any persistence path) so stored analyses are always
+	// consistent, regardless of which code path calls extractAnalysisJSON.
+	if result.Action == ActionHold || result.Action == ActionWait {
+		result.SizePct = 0
+		result.StopLoss = 0
+		result.TakeProfit = 0
+	}
+
 	return result, nil
 }
 

@@ -1171,10 +1171,6 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
 		// no signal fires. No cooldown is applied so the ticker is re-evaluated
 		// on the next normal tick.
-		if resp.Action == analysis.ActionWait && resp.SizePct != 0 {
-			// Sanitise: WAIT must never carry a non-zero size.
-			resp.SizePct = 0
-		}
 		return
 	}
 

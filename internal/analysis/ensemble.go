@@ -149,9 +149,11 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 // ─── Majority vote fallback ─────────────────────────────────────────────────────
 
 // majorityVote returns the action with the most votes.
-// Tie-breaking follows a conservative cascade: HOLD > WAIT > BUY/SELL.
+// Tie-breaking follows a conservative cascade: HOLD > WAIT > SKIP > directional.
 // Rationale: HOLD means "no interest"; WAIT means "interested, poor timing";
-// BUY/SELL means "act now". On ambiguity, prefer the less committed action.
+// SKIP is ORB mode's conservative gate; BUY/SELL/TRADE means "act now".
+// Iterates over whatever actions are present in counts so ORB-mode TRADE/SKIP
+// votes are correctly tallied when majorityVote is used as an arbiter fallback.
 func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 	successes := successfulResults(results)
 	if len(successes) == 0 {
@@ -163,34 +165,35 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 		counts[r.Response.Action]++
 		confSum[r.Response.Action] += r.Response.Confidence
 	}
-	// Find the maximum vote count across all actions including WAIT.
+	// Find the maximum vote count dynamically over all observed actions so
+	// non-standard actions (TRADE, SKIP) are counted when present.
 	maxCount := 0
-	for _, action := range []Action{ActionBuy, ActionSell, ActionHold, ActionWait} {
-		if counts[action] > maxCount {
-			maxCount = counts[action]
+	for _, c := range counts {
+		if c > maxCount {
+			maxCount = c
 		}
 	}
-	// Collect all actions that share the maximum vote count.
+	// Collect all actions tied for the lead.
 	var leaders []Action
-	for _, action := range []Action{ActionBuy, ActionSell, ActionHold, ActionWait} {
-		if counts[action] == maxCount {
+	for action, c := range counts {
+		if c == maxCount {
 			leaders = append(leaders, action)
 		}
 	}
-	// Resolve ties with the conservative cascade: HOLD > WAIT > directional.
+	// Resolve ties with the conservative cascade: HOLD > WAIT > SKIP > directional.
 	var winner Action
 	if len(leaders) == 1 {
 		winner = leaders[0]
 	} else {
-		hasHold := counts[ActionHold] == maxCount
-		hasWait := counts[ActionWait] == maxCount
 		switch {
-		case hasHold:
+		case counts[ActionHold] == maxCount:
 			winner = ActionHold // HOLD beats everything on a tie
-		case hasWait:
-			winner = ActionWait // WAIT beats BUY/SELL on a tie
+		case counts[ActionWait] == maxCount:
+			winner = ActionWait // WAIT beats BUY/SELL/TRADE on a tie
+		case counts[ActionSkip] == maxCount:
+			winner = ActionSkip // SKIP beats TRADE on a tie (ORB conservative)
 		default:
-			// BUY vs SELL tie: directional signal is ambiguous — use HOLD.
+			// Multiple directional actions tied — signal is ambiguous, use HOLD.
 			winner = ActionHold
 		}
 	}
