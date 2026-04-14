@@ -24,7 +24,7 @@ models:
       timeout_sec: 60
     analyst_mid:
       provider: google
-      model: gemini-3.1-pro-preview
+      model: gemini-2.5-flash
       api_key_env: GEMINI_API_KEY       # export GEMINI_API_KEY=... (aistudio.google.com)
       max_tokens: 2048
       temperature: 0.1
@@ -32,7 +32,7 @@ models:
       fallback: gemini_flash            # fallback registry key on 429/503
     gemini_flash:
       provider: google
-      model: gemini-2.5-flash
+      model: gemini-2.5-flash-lite
       api_key_env: GEMINI_API_KEY
       max_tokens: 2048
       temperature: 0.1

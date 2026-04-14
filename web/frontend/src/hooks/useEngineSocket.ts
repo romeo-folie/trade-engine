@@ -341,7 +341,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setSelectedAnalysts([]);
           setLastRiskChecks([]);
           setCurrentTicker(null);
-          // verdictHistory and consensusHistory persist across ticks intentionally.
+          setVerdictHistory({});
+          setConsensusHistory([]);
         }
 
         // Track risk check results
