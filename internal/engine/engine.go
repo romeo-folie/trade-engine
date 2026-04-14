@@ -1684,17 +1684,24 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
-		// Calculate P&L.
-		pnl := (result.FilledPrice - t.EntryPrice) * t.Quantity
+		// Calculate P&L. Use currentPrice as the exit price if the broker
+		// returned 0 (e.g. Alpaca paper orders that are still pending at the
+		// time PlaceOrder returns). currentPrice is guaranteed non-zero above
+		// and is the price that crossed the stop/take-profit threshold.
+		exitPrice := result.FilledPrice
+		if exitPrice == 0 {
+			exitPrice = currentPrice
+		}
+		pnl := (exitPrice - t.EntryPrice) * t.Quantity
 		if t.Direction == "short" {
-			pnl = (t.EntryPrice - result.FilledPrice) * t.Quantity
+			pnl = (t.EntryPrice - exitPrice) * t.Quantity
 		}
 		pnlPct := 0.0
 		if t.EntryPrice > 0 {
 			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
 		}
 
-		if err := store.CloseTrade(ctx, t.ID, result.FilledPrice, pnl, pnlPct); err != nil {
+		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
 			logger.Warn("close trade", "trade_id", t.ID, "err", err)
 		}
 
@@ -1706,7 +1713,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			Side:          string(exitSide),
 			OrderType:     string(execution.OrderTypeMarket),
 			Quantity:      result.FilledQty,
-			FilledPrice:   result.FilledPrice,
+			FilledPrice:   exitPrice,
 			FilledQty:     result.FilledQty,
 			Status:        execution.NormalizeOrderStatus(result.Status),
 			IsStopLoss:    exitReason == "stop-loss hit",
@@ -1729,7 +1736,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 		)
 		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 			TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: result.FilledPrice,
+			EntryPrice: t.EntryPrice, ExitPrice: exitPrice,
 			PnL: pnl, PnLPct: pnlPct, Reason: exitReason,
 		})
 	}
