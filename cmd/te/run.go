@@ -307,9 +307,8 @@ Modes:
 			// 2. Create IBKR broker.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
-				authErr := fmt.Errorf("IBKR gateway not authenticated: %w", err)
 				notifyIBKRAuthFailure(ctx, tgBot, err, cfg.Markets.IBKR.GatewayURL)
-				return authErr
+				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
 			defer stopKeepalive()
@@ -458,9 +457,8 @@ Modes:
 			// 2. Create IBKR broker and authenticate.
 			ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
 			if err := ibkrBroker.CheckAuth(ctx); err != nil {
-				authErr := fmt.Errorf("IBKR gateway not authenticated: %w", err)
 				notifyIBKRAuthFailure(ctx, tgBot, err, cfg.Markets.IBKR.GatewayURL)
-				return authErr
+				return fmt.Errorf("IBKR gateway not authenticated: %w", err)
 			}
 			stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
 			defer stopKeepalive()
