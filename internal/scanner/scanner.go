@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -70,7 +71,7 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 	// Run once immediately at startup if market is open.
 	if s.isMarketOpen() {
 		if err := s.runScan(ctx); err != nil && err != context.Canceled {
-			fmt.Printf("scanner: initial scan error: %v\n", err)
+			slog.Error("scanner: initial scan error", "err", err)
 		}
 	}
 
@@ -83,7 +84,7 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 				continue
 			}
 			if err := s.runScan(ctx); err != nil && err != context.Canceled {
-				fmt.Printf("scanner: scan error: %v\n", err)
+				slog.Error("scanner: scan error", "err", err)
 			}
 		}
 	}
@@ -97,10 +98,12 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		s.Bus.Publish(events.ScanStarted, events.ScanStartedPayload{})
 	}
 
+	slog.Info("scanner: scan started")
+
 	// 1. Expire stale scanner items before adding new ones.
 	expired, err := store.ExpireScannedItems(ctx)
 	if err != nil {
-		fmt.Printf("scanner: expire stale items: %v\n", err)
+		slog.Warn("scanner: expire stale items", "err", err)
 	}
 
 	// 2. Fetch candidates from both screeners.
@@ -108,6 +111,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fetch candidates: %w", err)
 	}
+	slog.Info("scanner: candidates fetched", "count", len(candidates))
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -147,7 +151,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		}
 		result, err := s.scoreCandidate(ctx, c)
 		if err != nil {
-			fmt.Printf("scanner: score %s: %v\n", c.Ticker, err)
+			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
 		}
 		if result.Action == "add" && result.Conviction >= s.Cfg.MinConviction {
@@ -178,9 +182,10 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			ExpiresAt: &expiresAt,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
-			fmt.Printf("scanner: add watchlist item %s: %v\n", sc.candidate.Ticker, err)
+			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)
 			continue
 		}
+		slog.Info("scanner: added to watchlist", "ticker", sc.candidate.Ticker, "conviction", sc.score.Conviction, "setup", sc.score.SetupType, "strategy", sc.score.Strategy)
 		added = append(added, sc)
 
 		if s.Bus != nil {
@@ -197,6 +202,13 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	}
 
 	durationMs := time.Since(start).Milliseconds()
+
+	slog.Info("scanner: scan completed",
+		"candidates_evaluated", len(candidates),
+		"items_added", len(added),
+		"items_expired", len(expired),
+		"duration_ms", durationMs,
+	)
 
 	if s.Bus != nil {
 		s.Bus.Publish(events.ScanCompleted, events.ScanCompletedPayload{
@@ -222,7 +234,7 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	// Top movers (gainers + losers).
 	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, 0) // 0 = no gap threshold for swing scanner
 	if err != nil {
-		fmt.Printf("scanner: fetch movers: %v\n", err)
+		slog.Warn("scanner: fetch movers failed", "err", err)
 	}
 	top := s.Cfg.TopMovers
 	if top <= 0 {
@@ -248,7 +260,7 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	}
 	actives, err := data.FetchMostActive(ctx, s.AlpacaClient, topActives)
 	if err != nil {
-		fmt.Printf("scanner: fetch most actives: %v\n", err)
+		slog.Warn("scanner: fetch most actives failed", "err", err)
 	}
 	for _, a := range actives {
 		if existing, ok := byTicker[a.Ticker]; ok {
