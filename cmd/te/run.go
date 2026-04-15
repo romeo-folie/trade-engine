@@ -25,6 +25,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/orb"
+	"github.com/romeo-folie/trade-engine/internal/scanner"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/web"
 	"github.com/spf13/cobra"
@@ -691,6 +692,36 @@ Modes:
 			defer webSrv.Stop()
 			logger.Info("web observability server started", "port", runWebPort)
 			fmt.Printf("🌐 Web UI: http://localhost:%s\n", runWebPort)
+		}
+
+		// Start autonomous market scanner if enabled (non-ORB modes only).
+		if cfg.Scanner.Enabled {
+			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
+			if !ok || alpacaClient == nil {
+				logger.Warn("scanner disabled — requires Alpaca market data provider")
+			} else {
+				scanAnalyzer := analysis.NewAnalyzer(cfg.Models, eng.Bus())
+				mscanner := &scanner.MarketScanner{
+					AlpacaClient: alpacaClient,
+					Analyzer:     scanAnalyzer,
+					News:         newsProvider,
+					Bus:          eng.Bus(),
+					Cfg:          cfg.Scanner,
+				}
+				if tgBot != nil {
+					mscanner.Notifier = tgBot
+				}
+				go func() {
+					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
+						logger.Warn("market scanner stopped with error", "err", err.Error())
+					}
+				}()
+				logger.Info("market scanner started",
+					"interval_hours", cfg.Scanner.ScanIntervalHours,
+					"ttl_days", cfg.Scanner.TTLDays,
+					"candidate_cap", cfg.Scanner.CandidateCap,
+				)
+			}
 		}
 
 		if err := eng.Run(ctx); err != nil {

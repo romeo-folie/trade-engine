@@ -336,6 +336,16 @@ func Defaults() *Config {
 				OrdersTTLSec:    10,
 			},
 		},
+		Scanner: ScannerConfig{
+			Enabled:           false,
+			ScanIntervalHours: 2,
+			CandidateCap:      10,
+			TTLDays:           3,
+			MinConviction:     0.65,
+			NewsLookbackHours: 24,
+			TopMovers:         20,
+			TopActives:        20,
+		},
 		Feedback: FeedbackConfig{
 			Enabled:             false,
 			ReviewTimeUTC:       "18:00",

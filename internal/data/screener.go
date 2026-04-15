@@ -87,6 +87,57 @@ func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64
 	return candidates, nil
 }
 
+// MostActiveCandidate represents a stock with unusually high trading activity.
+type MostActiveCandidate struct {
+	Ticker     string
+	Volume     int64
+	TradeCount int64
+	Price      float64
+}
+
+type alpacaMostActivesResponse struct {
+	MostActives []alpacaMostActive `json:"most_actives"`
+}
+
+type alpacaMostActive struct {
+	Symbol     string  `json:"symbol"`
+	Volume     int64   `json:"volume"`
+	TradeCount int64   `json:"trade_count"`
+	Price      float64 `json:"price"`
+}
+
+// FetchMostActive returns the top most-active stocks by volume using the Alpaca screener API.
+func FetchMostActive(ctx context.Context, client *AlpacaClient, top int) ([]MostActiveCandidate, error) {
+	if top <= 0 {
+		top = 20
+	}
+	params := url.Values{}
+	params.Set("by", "volume")
+	params.Set("top", fmt.Sprintf("%d", top))
+
+	resp, err := client.get(ctx, "/v1beta1/screener/stocks/most-actives", params)
+	if err != nil {
+		return nil, fmt.Errorf("fetch most actives: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var activesResp alpacaMostActivesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&activesResp); err != nil {
+		return nil, fmt.Errorf("decode most actives: %w", err)
+	}
+
+	candidates := make([]MostActiveCandidate, 0, len(activesResp.MostActives))
+	for _, m := range activesResp.MostActives {
+		candidates = append(candidates, MostActiveCandidate{
+			Ticker:     m.Symbol,
+			Volume:     m.Volume,
+			TradeCount: m.TradeCount,
+			Price:      m.Price,
+		})
+	}
+	return candidates, nil
+}
+
 // alpacaSnapshot represents the relevant subset of an Alpaca stock snapshot.
 type alpacaSnapshot struct {
 	MinuteBar *alpacaBar `json:"minuteBar"`

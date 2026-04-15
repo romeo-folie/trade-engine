@@ -34,6 +34,10 @@ const (
 	ORBCandidatesReady     Type = "orb.candidates_ready"
 	ORBRangeLocked         Type = "orb.range_locked"
 	ORBTradeUpdate         Type = "orb.trade_update"
+
+	ScanStarted        Type = "scanner.started"
+	ScanCompleted      Type = "scanner.completed"
+	ScannerItemAdded   Type = "scanner.item_added"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -265,5 +269,27 @@ type ORBTradeUpdatePayload struct {
 	Status    string   `json:"status"`
 	FillPrice float64  `json:"fill_price,omitempty"`
 	PnL       *float64 `json:"pnl,omitempty"`
+}
+
+// ScanStartedPayload is emitted when the market scanner begins a scan cycle.
+type ScanStartedPayload struct{}
+
+// ScanCompletedPayload is emitted when a scan cycle finishes.
+type ScanCompletedPayload struct {
+	CandidatesEvaluated int      `json:"candidates_evaluated"`
+	ItemsAdded          int      `json:"items_added"`
+	ItemsExpired        int      `json:"items_expired"`
+	DurationMs          int64    `json:"duration_ms"`
+}
+
+// ScannerItemAddedPayload is emitted when a scanner candidate is added to the watchlist.
+type ScannerItemAddedPayload struct {
+	Ticker     string   `json:"ticker"`
+	Conviction float64  `json:"conviction"`
+	SetupType  string   `json:"setup_type"`
+	Strategy   string   `json:"strategy"`
+	Timeframes []string `json:"timeframes"`
+	Reasoning  string   `json:"reasoning"`
+	ExpiresAt  string   `json:"expires_at"` // RFC3339
 }
 

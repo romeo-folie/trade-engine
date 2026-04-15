@@ -35,6 +35,7 @@ type Config struct {
 	ForexORB         ForexORBConfig      `yaml:"forex_orb"`
 	FuturesORB       FuturesORBConfig    `yaml:"futures_orb"`
 	FuturesORBMetals FuturesORBConfig    `yaml:"futures_orb_metals"`
+	Scanner          ScannerConfig       `yaml:"scanner"`
 	Feedback         FeedbackConfig      `yaml:"feedback"`
 	Portfolio     PortfolioConfig     `yaml:"portfolio"`
 }
@@ -501,6 +502,42 @@ type FuturesORBConfig struct {
 	MaxRiskPct     float64            `yaml:"max_risk_pct"`
 	MaxPositionPct float64            `yaml:"max_position_pct"`
 	Instruments    []FuturesInstrument `yaml:"instruments"`
+}
+
+// ScannerConfig controls the autonomous market scanner that discovers swing-trade
+// candidates and adds them to the watchlist with a configurable TTL.
+type ScannerConfig struct {
+	// Enabled turns the scanner on or off. Default: false.
+	Enabled bool `yaml:"enabled"`
+
+	// ScanIntervalHours is how often the scanner runs during market hours.
+	// Default: 2 (runs at roughly 10am, 12pm, 2pm ET on a standard trading day).
+	ScanIntervalHours int `yaml:"scan_interval_hours"`
+
+	// CandidateCap is the maximum number of scanner-sourced tickers that may be
+	// active on the watchlist at any one time. Lowest-conviction items are evicted
+	// when the cap is reached. Default: 10.
+	CandidateCap int `yaml:"candidate_cap"`
+
+	// TTLDays is how many calendar days a scanner-added ticker stays on the watchlist
+	// before being auto-expired (deactivated) if no signal fires. Default: 3.
+	TTLDays int `yaml:"ttl_days"`
+
+	// MinConviction is the minimum LLM conviction score (0–1) required for a
+	// candidate to be added to the watchlist. Default: 0.65.
+	MinConviction float64 `yaml:"min_conviction"`
+
+	// NewsLookbackHours controls how far back to fetch news when enriching
+	// screener candidates before LLM scoring. Default: 24.
+	NewsLookbackHours int `yaml:"news_lookback_hours"`
+
+	// TopMovers is the number of top movers (gainers + losers) to fetch per scan.
+	// Default: 20.
+	TopMovers int `yaml:"top_movers"`
+
+	// TopActives is the number of most-active-by-volume stocks to fetch per scan.
+	// Default: 20.
+	TopActives int `yaml:"top_actives"`
 }
 
 // FeedbackConfig controls the automated feedback pipeline (Phase 17).
