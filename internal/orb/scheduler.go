@@ -107,7 +107,8 @@ type ORBScheduler struct {
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
 	lastScan       time.Time         // Eastern Time of the last successful scan
-	fetchFailures  map[string]int    // ticker → consecutive candle-fetch failures
+	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
+	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -132,7 +133,8 @@ func NewORBScheduler(
 		state:         StateIdle,
 		rangeBuffers:  make(map[string]*RangeBuffer),
 		orderIDs:      make(map[string][2]string),
-		fetchFailures: make(map[string]int),
+		fetchFailures:    make(map[string]int),
+		fetchLastAttempt: make(map[string]time.Time),
 	}
 }
 
@@ -762,26 +764,39 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 	marketOpen := time.Date(sessionDay.Year(), sessionDay.Month(), sessionDay.Day(), openHour, openMin, 0, 0, sessionTZ)
 	now := s.now()
 
-	const maxFetchFailures = 3 // drop instrument after this many consecutive failures
+	const (
+		maxFetchFailures  = 3               // drop instrument after this many consecutive failures
+		fetchRetryBackoff = 60 * time.Second // minimum wait between candle-fetch attempts
+	)
 
 	allLocked := true
 	for ticker, buf := range s.rangeBuffers {
 		if buf.Range() != nil {
 			continue // already locked
 		}
+		// Rate-limit retries: skip this tick if the last attempt was too recent.
+		// This gives IBKR's data feed time to activate after a fresh gateway session
+		// rather than burning all retries within 90 seconds.
+		if last, ok := s.fetchLastAttempt[ticker]; ok && time.Since(last) < fetchRetryBackoff {
+			allLocked = false
+			continue
+		}
+		s.fetchLastAttempt[ticker] = s.now()
 		candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, marketOpen, now)
 		if err != nil {
 			s.fetchFailures[ticker]++
 			if s.fetchFailures[ticker] >= maxFetchFailures {
 				slog.Warn("orb: dropping instrument after candle-fetch failures", "ticker", ticker, "failures", s.fetchFailures[ticker], "err", err)
 				delete(s.rangeBuffers, ticker)
+				delete(s.fetchLastAttempt, ticker)
 			} else {
 				slog.Warn("orb: fetch candles failed", "ticker", ticker, "attempt", s.fetchFailures[ticker], "max", maxFetchFailures, "err", err)
 				allLocked = false
 			}
 			continue
 		}
-		s.fetchFailures[ticker] = 0 // reset on success
+		s.fetchFailures[ticker] = 0    // reset on success
+		delete(s.fetchLastAttempt, ticker)
 		for _, c := range candles {
 			locked, _ := buf.Add(c)
 			if locked {
