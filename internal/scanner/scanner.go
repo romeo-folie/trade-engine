@@ -154,6 +154,13 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
 		}
+		slog.Info("scanner: candidate scored",
+			"ticker", c.Ticker,
+			"action", result.Action,
+			"conviction", result.Conviction,
+			"setup", result.SetupType,
+			"reasoning", result.Reasoning,
+		)
 		if result.Action == "add" && result.Conviction >= s.Cfg.MinConviction {
 			scored = append(scored, scoredCandidate{candidate: c, score: result})
 		}
