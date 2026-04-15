@@ -37,8 +37,33 @@ fi
 # Re-authenticate the IBKR gateway before every restart. The script fast-paths
 # immediately if the gateway is already authenticated, so this is cheap when
 # auth is healthy.
+#
+# Cron runs with a minimal PATH that does not include nvm-managed Node binaries.
+# Resolve node via nvm if available, then fall back to common install locations.
+NODE_BIN=""
+if [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+  # shellcheck source=/dev/null
+  source "${NVM_DIR:-$HOME/.nvm}/nvm.sh" --no-use
+  NODE_BIN="$(command -v node 2>/dev/null || true)"
+fi
+if [ -z "$NODE_BIN" ]; then
+  for candidate in \
+    "$HOME/.nvm/versions/node/v22.13.0/bin/node" \
+    /usr/local/bin/node \
+    /opt/homebrew/bin/node; do
+    if [ -x "$candidate" ]; then
+      NODE_BIN="$candidate"
+      break
+    fi
+  done
+fi
+
 echo "[te-switch] Running IBKR gateway re-authentication..."
-node "$ENGINE_DIR/scripts/reauth-gateway.js" || echo "[te-switch] WARNING: reauth failed — engine will start anyway"
+if [ -n "$NODE_BIN" ]; then
+  "$NODE_BIN" "$ENGINE_DIR/scripts/reauth-gateway.js" || echo "[te-switch] WARNING: reauth failed — engine will start anyway"
+else
+  echo "[te-switch] WARNING: node not found — skipping reauth"
+fi
 
 echo "[te-switch] Stopping any running engine instance..."
 ./te stop 2>/dev/null || true
