@@ -138,6 +138,28 @@ const COLUMNS: Column<Signal>[] = [
   }
 ];
 
+/* ── CSV export ────────────────────────────────────────────────────────────── */
+
+function signalsToCsv(sigs: Signal[]): string {
+  const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
+  const header = 'ticker,action,strategy,confidence,size_pct,signal_price,stop_loss,take_profit,status,created_at';
+  const rows = sigs.map(s =>
+    [
+      escape(s.Ticker),
+      escape(s.Action),
+      escape(s.Strategy),
+      s.Confidence.toFixed(4),
+      s.SizePct.toFixed(2),
+      s.SignalPrice.toFixed(2),
+      s.StopLoss.toFixed(2),
+      s.TakeProfit.toFixed(2),
+      escape(s.Status),
+      escape(s.CreatedAt),
+    ].join(',')
+  );
+  return [header, ...rows].join('\n');
+}
+
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function SignalsScreen() {
@@ -148,7 +170,9 @@ export default function SignalsScreen() {
   const [tickerSearch, setTickerSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout>>();
 
   useEffect(() => {
     async function load() {
@@ -225,6 +249,22 @@ export default function SignalsScreen() {
 
   const handleClosePanel = useCallback(() => setSelectedSignal(null), []);
 
+  const handleExport = useCallback(() => {
+    const csv = signalsToCsv(filtered);
+    if (!navigator.clipboard) {
+      setToastMsg('Clipboard not available (requires HTTPS)');
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
+      return;
+    }
+    navigator.clipboard.writeText(csv).then(() => {
+      setToastMsg('CSV copied to clipboard');
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
+    }).catch(() => {
+      setToastMsg('Failed to copy');
+      toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
+    });
+  }, [filtered]);
+
   return (
     <div className={styles.screen}>
       <div className={styles.topBar}>
@@ -239,7 +279,7 @@ export default function SignalsScreen() {
 
       <div className={styles.header}>
         <h1 className={styles.pageTitle}>SIGNALS</h1>
-        <button className={styles.exportBtn}>EXPORT CSV</button>
+        <button className={styles.exportBtn} onClick={handleExport}>EXPORT CSV</button>
       </div>
 
       {fetchError && (
@@ -328,6 +368,10 @@ export default function SignalsScreen() {
 
       {selectedSignal && (
         <SignalDetailPanel signal={selectedSignal} onClose={handleClosePanel} />
+      )}
+
+      {toastMsg && (
+        <div className={`${styles.toast} chamfer-sm`} role="status">{toastMsg}</div>
       )}
     </div>
   );
