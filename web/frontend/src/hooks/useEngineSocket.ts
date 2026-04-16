@@ -122,6 +122,9 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
   const recentTimestamps = useRef<number[]>([]);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const shouldReconnectRef = useRef(true);
+  // Tracks tickers seen in the current analysis cycle. When a ticker repeats,
+  // it signals a new cycle has begun (works even when TickStarted is not emitted).
+  const cycleTickersRef = useRef<Set<string>>(new Set());
 
   useEffect(() => { pausedRef.current = paused; }, [paused]);
   useEffect(() => {
@@ -292,12 +295,20 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 return next;
               });
 
-              // Accumulate per-analyst verdict history for scrolling marquee.
-              // History is kept across ticks and capped at MAX_VERDICT_HISTORY per
-              // analyst (and for consensus) so it doesn't grow unbounded.
+              // Accumulate per-analyst verdict history for the current cycle only.
+              // A repeated ticker signals a new cycle — reset before appending so
+              // the marquee stays fresh even when TickStarted is not emitted.
               if (ticker) {
+                const isNewCycle = cycleTickersRef.current.has(ticker);
+                if (isNewCycle) {
+                  cycleTickersRef.current = new Set([ticker]);
+                } else {
+                  cycleTickersRef.current.add(ticker);
+                }
+
                 setVerdictHistory(prev => {
-                  const next = { ...prev };
+                  const base = isNewCycle ? {} : prev;
+                  const next = { ...base };
                   for (const vote of votes) {
                     if (vote.skipped) continue;
                     const key = vote.model;
@@ -316,7 +327,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                   const action = buys > sells ? 'BUY' : sells > buys ? 'SELL' : 'HOLD';
                   const avgConf = activeVotes.reduce((s, v) => s + v.confidence, 0) / activeVotes.length;
                   setConsensusHistory(prev => {
-                    const updated = [...prev, { ticker, action, confidence: avgConf }];
+                    const base = isNewCycle ? [] : prev;
+                    const updated = [...base, { ticker, action, confidence: avgConf }];
                     return updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
                   });
                 }
@@ -343,6 +355,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           setCurrentTicker(null);
           setVerdictHistory({});
           setConsensusHistory([]);
+          cycleTickersRef.current = new Set();
         }
 
         // Track risk check results
