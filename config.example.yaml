@@ -79,7 +79,7 @@ models:
 
   consensus:
     enabled: true
-    fast_path_confidence: 0.80   # All analysts must meet this min confidence to fast-path
+    fast_path_confidence: 0.68   # All analysts must meet this min confidence to fast-path
     fast_path_max_spread: 0.15   # Max confidence spread across analysts to fast-path
 
   # ── Legacy single-model / inline-ensemble mode ────────────────────────────

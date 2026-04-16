@@ -50,6 +50,7 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 		if c < minC { minC = c }
 	}
 	if maxC < minConf || maxC-minC > maxSpread {
+		logger.Debug("fast-path rejected", "maxC", maxC, "minC", minC, "spread", maxC-minC, "minConf", minConf, "maxSpread", maxSpread)
 		return AnalysisResponse{}, false
 	}
 	avg := math.Round(sum/float64(len(confs))*1000) / 1000
