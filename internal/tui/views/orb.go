@@ -139,7 +139,7 @@ func RenderORBView(d ORBViewData, width int) string {
 	for i, s := range d.Sessions {
 		b.WriteString(RenderORBPanel(s, width))
 		if i < len(d.Sessions)-1 {
-			b.WriteString("\n" + dimText.Render(strings.Repeat("─", min(width-2, 60))) + "\n\n")
+			b.WriteString("\n" + dimText.Render(strings.Repeat("─", max(0, min(width-2, 60)))) + "\n\n")
 		}
 	}
 	return b.String()

@@ -273,6 +273,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.activeView == ViewTrades && !m.showTradeDetail && len(m.tradeData.Trades) > 0 {
+				if m.selectedTrade >= len(m.tradeData.Trades) {
+					m.selectedTrade = len(m.tradeData.Trades) - 1
+				}
 				tradeID := m.tradeData.Trades[m.selectedTrade].ID
 				if detail, ok := views.FetchTradeDetail(context.Background(), tradeID); ok {
 					m.tradeDetail = detail
@@ -448,14 +451,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		dc := loadDisplayConfig()
 		m.dashData = views.FetchDashboardData(ctx, m.mode, dc.initialCapital)
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
-		m.tradeData.Selected = m.selectedTrade
 		m.signalData = views.FetchSignalFeed(ctx, 50)
-		m.signalData.Selected = m.selectedSignal
 		m.watchlistData = views.FetchWatchlistData(ctx)
-		m.watchlistData.Selected = m.selectedWatchlist
 		m.configData = views.FetchConfigData(ctx, m.mode)
-		m.configData.Selected = m.selectedConfig
 		m.orbData = views.FetchORBViewData(ctx)
+		// Clamp selection indices so they stay in-bounds after data shrinks.
+		if n := len(m.tradeData.Trades); m.selectedTrade >= n && n > 0 {
+			m.selectedTrade = n - 1
+		}
+		if n := len(m.signalData.Signals); m.selectedSignal >= n && n > 0 {
+			m.selectedSignal = n - 1
+		}
+		if n := len(m.watchlistData.Items); m.selectedWatchlist >= n && n > 0 {
+			m.selectedWatchlist = n - 1
+		}
+		if n := len(m.configData.Items); m.selectedConfig >= n && n > 0 {
+			m.selectedConfig = n - 1
+		}
+		if n := len(m.dashData.PendingSignals); m.selectedPending >= n && n > 0 {
+			m.selectedPending = n - 1
+		}
+		m.tradeData.Selected = m.selectedTrade
+		m.signalData.Selected = m.selectedSignal
+		m.watchlistData.Selected = m.selectedWatchlist
+		m.configData.Selected = m.selectedConfig
 		return m, pollTicker()
 	}
 
