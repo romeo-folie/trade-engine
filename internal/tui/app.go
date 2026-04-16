@@ -26,6 +26,7 @@ const (
 	ViewWatchlist
 	ViewSignals
 	ViewConfig
+	ViewORB
 )
 
 // viewLabel returns the display name for a view.
@@ -41,13 +42,15 @@ func viewLabel(v View) string {
 		return "Signals"
 	case ViewConfig:
 		return "Config"
+	case ViewORB:
+		return "ORB"
 	default:
 		return "Unknown"
 	}
 }
 
 // allViews lists every view in tab order.
-var allViews = []View{ViewDashboard, ViewTrades, ViewWatchlist, ViewSignals, ViewConfig}
+var allViews = []View{ViewDashboard, ViewTrades, ViewWatchlist, ViewSignals, ViewConfig, ViewORB}
 
 // viewKeys maps key presses to views.
 var viewKeys = map[string]View{
@@ -56,6 +59,7 @@ var viewKeys = map[string]View{
 	"3": ViewWatchlist,
 	"4": ViewSignals,
 	"5": ViewConfig,
+	"6": ViewORB,
 }
 
 // ── Messages ──────────────────────────────────────────────────────────────────
@@ -100,6 +104,7 @@ type Model struct {
 	signalData    views.SignalFeedData
 	watchlistData views.WatchlistData
 	configData    views.ConfigData
+	orbData       views.ORBViewData
 
 	// Selection state for sub-views
 	selectedTrade     int
@@ -107,6 +112,7 @@ type Model struct {
 	selectedWatchlist int
 	selectedConfig    int
 	showTradeDetail   bool
+	tradeDetail       views.TradeDetailData // cached on open; avoids per-frame DB query
 	configEditing     bool
 	configInput       string
 
@@ -210,15 +216,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		switch msg.String() {
 		case "q", "ctrl+c":
-			if m.showDetail {
+			if m.showDetail || m.showTradeDetail {
 				m.showDetail = false
+				m.showTradeDetail = false
 				return m, nil
 			}
 			m.cleanup()
 			return m, tea.Quit
 		case "esc":
-			if m.showDetail {
+			if m.showDetail || m.showTradeDetail {
 				m.showDetail = false
+				m.showTradeDetail = false
 				return m, nil
 			}
 		case "enter":
@@ -264,40 +272,80 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showDetail = true
 				return m, nil
 			}
+			if m.activeView == ViewTrades && !m.showTradeDetail && len(m.tradeData.Trades) > 0 {
+				tradeID := m.tradeData.Trades[m.selectedTrade].ID
+				if detail, ok := views.FetchTradeDetail(context.Background(), tradeID); ok {
+					m.tradeDetail = detail
+					m.showTradeDetail = true
+				}
+				return m, nil
+			}
 		case "j", "down":
-			if m.showDetail {
+			if m.showDetail || m.showTradeDetail {
 				return m, nil
 			}
-			if m.activeView == ViewConfig && len(m.configData.Items) > 0 {
-				m.selectedConfig = (m.selectedConfig + 1) % len(m.configData.Items)
-				m.configData.Selected = m.selectedConfig
-				return m, nil
+			switch m.activeView {
+			case ViewConfig:
+				if len(m.configData.Items) > 0 {
+					m.selectedConfig = (m.selectedConfig + 1) % len(m.configData.Items)
+					m.configData.Selected = m.selectedConfig
+				}
+			case ViewTrades:
+				if len(m.tradeData.Trades) > 0 {
+					m.selectedTrade = (m.selectedTrade + 1) % len(m.tradeData.Trades)
+					m.tradeData.Selected = m.selectedTrade
+				}
+			case ViewSignals:
+				if len(m.signalData.Signals) > 0 {
+					m.selectedSignal = (m.selectedSignal + 1) % len(m.signalData.Signals)
+					m.signalData.Selected = m.selectedSignal
+				}
+			case ViewWatchlist:
+				if len(m.watchlistData.Items) > 0 {
+					m.selectedWatchlist = (m.selectedWatchlist + 1) % len(m.watchlistData.Items)
+					m.watchlistData.Selected = m.selectedWatchlist
+				}
+			case ViewDashboard:
+				if m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
+					m.selectedPending = (m.selectedPending + 1) % len(m.dashData.PendingSignals)
+				} else if len(m.dashData.Positions) > 0 {
+					m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
+				}
 			}
-			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
-				m.selectedPending = (m.selectedPending + 1) % len(m.dashData.PendingSignals)
-				return m, nil
-			}
-			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
-				m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
-				return m, nil
-			}
+			return m, nil
 		case "k", "up":
-			if m.showDetail {
+			if m.showDetail || m.showTradeDetail {
 				return m, nil
 			}
-			if m.activeView == ViewConfig && len(m.configData.Items) > 0 {
-				m.selectedConfig = (m.selectedConfig - 1 + len(m.configData.Items)) % len(m.configData.Items)
-				m.configData.Selected = m.selectedConfig
-				return m, nil
+			switch m.activeView {
+			case ViewConfig:
+				if len(m.configData.Items) > 0 {
+					m.selectedConfig = (m.selectedConfig - 1 + len(m.configData.Items)) % len(m.configData.Items)
+					m.configData.Selected = m.selectedConfig
+				}
+			case ViewTrades:
+				if len(m.tradeData.Trades) > 0 {
+					m.selectedTrade = (m.selectedTrade - 1 + len(m.tradeData.Trades)) % len(m.tradeData.Trades)
+					m.tradeData.Selected = m.selectedTrade
+				}
+			case ViewSignals:
+				if len(m.signalData.Signals) > 0 {
+					m.selectedSignal = (m.selectedSignal - 1 + len(m.signalData.Signals)) % len(m.signalData.Signals)
+					m.signalData.Selected = m.selectedSignal
+				}
+			case ViewWatchlist:
+				if len(m.watchlistData.Items) > 0 {
+					m.selectedWatchlist = (m.selectedWatchlist - 1 + len(m.watchlistData.Items)) % len(m.watchlistData.Items)
+					m.watchlistData.Selected = m.selectedWatchlist
+				}
+			case ViewDashboard:
+				if m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
+					m.selectedPending = (m.selectedPending - 1 + len(m.dashData.PendingSignals)) % len(m.dashData.PendingSignals)
+				} else if len(m.dashData.Positions) > 0 {
+					m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
+				}
 			}
-			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 {
-				m.selectedPending = (m.selectedPending - 1 + len(m.dashData.PendingSignals)) % len(m.dashData.PendingSignals)
-				return m, nil
-			}
-			if m.activeView == ViewDashboard && len(m.dashData.Positions) > 0 {
-				m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
-				return m, nil
-			}
+			return m, nil
 		case "a":
 			// Approve pending signal
 			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
@@ -318,6 +366,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.statusMsgTime = time.Now()
+				if m.selectedPending > 0 {
+					m.selectedPending--
+				}
 				return m, nil
 			}
 		case "r":
@@ -375,6 +426,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if len(m.recentEvents) > maxRecentEvents {
 			m.recentEvents = m.recentEvents[len(m.recentEvents)-maxRecentEvents:]
 		}
+		ctx := context.Background()
+		// Refresh dashboard data on trade/portfolio/signal events.
+		if views.ApplyEvent(&m.dashData, evt) {
+			dc := loadDisplayConfig()
+			m.dashData = views.FetchDashboardData(ctx, m.mode, dc.initialCapital)
+		}
+		// Refresh ORB view on any ORB-related event.
+		switch evt.Type {
+		case events.ORBStateChanged, events.ORBCandidatesReady, events.ORBTradeUpdate:
+			m.orbData = views.FetchORBViewData(ctx)
+		}
 		// Continue listening for events.
 		if m.sub != nil {
 			return m, waitForEvent(m.sub)
@@ -393,6 +455,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.watchlistData.Selected = m.selectedWatchlist
 		m.configData = views.FetchConfigData(ctx, m.mode)
 		m.configData.Selected = m.selectedConfig
+		m.orbData = views.FetchORBViewData(ctx)
 		return m, pollTicker()
 	}
 
@@ -484,12 +547,8 @@ func (m Model) renderBody() string {
 	case ViewDashboard:
 		return views.RenderDashboard(m.dashData, m.width, m.height, m.selectedPending)
 	case ViewTrades:
-		if m.showTradeDetail && m.selectedTrade < len(m.tradeData.Trades) {
-			tradeID := m.tradeData.Trades[m.selectedTrade].ID
-			detail, ok := views.FetchTradeDetail(context.Background(), tradeID)
-			if ok {
-				return views.RenderTradeDetail(detail)
-			}
+		if m.showTradeDetail {
+			return views.RenderTradeDetail(m.tradeDetail)
 		}
 		return views.RenderTradeHistory(m.tradeData, m.width)
 	case ViewWatchlist:
@@ -498,36 +557,16 @@ func (m Model) renderBody() string {
 		return views.RenderSignalFeed(m.signalData, m.width)
 	case ViewConfig:
 		return views.RenderConfig(m.configData, m.width)
+	case ViewORB:
+		return views.RenderORBView(m.orbData, m.width)
 	default:
 		return "unknown view"
 	}
 }
 
-func (m Model) renderPlaceholder(title, desc string) string {
-	titleStyle := lipgloss.NewStyle().
-		Bold(true).
-		Foreground(lipgloss.Color("117")).
-		MarginTop(1).
-		MarginLeft(2)
-
-	descStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("245")).
-		MarginLeft(2)
-
-	eventCount := fmt.Sprintf("Events received: %d", len(m.recentEvents))
-	eventStyle := lipgloss.NewStyle().
-		Foreground(lipgloss.Color("243")).
-		MarginLeft(2).
-		MarginTop(1)
-
-	return titleStyle.Render(title) + "\n" +
-		descStyle.Render(desc) + "\n" +
-		eventStyle.Render(eventCount) + "\n" +
-		descStyle.Render("(placeholder — implementation coming in next sub-issues)")
-}
 
 func (m Model) renderStatusBar() string {
-	left := " [1-5] switch view  [tab] next  [q] quit"
+	left := " [1-6] switch view  [tab] next  [q] quit"
 	if m.activeView == ViewConfig {
 		if m.configEditing {
 			left = fmt.Sprintf(" editing value: %s", m.configInput)

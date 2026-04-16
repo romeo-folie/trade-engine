@@ -141,13 +141,15 @@ func (b *IBKRBroker) CancelOrder(ctx context.Context, brokerOrderID string) erro
 }
 
 // GetOrderStatus fetches the current state of an order by scanning the live order list.
+// If the order is absent from the live list (e.g. it filled or was cancelled before this
+// poll), it falls back to the trades/executions endpoint which retains completed orders.
 func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (OrderResult, error) {
 	var resp struct {
 		Orders []struct {
-			OrderID     json.Number `json:"orderId"`
-			Status      string      `json:"status"`
-			AvgPrice    string      `json:"avgPrice"`
-			FilledQty   float64     `json:"filledQuantity"`
+			OrderID   json.Number `json:"orderId"`
+			Status    string      `json:"status"`
+			AvgPrice  string      `json:"avgPrice"`
+			FilledQty float64     `json:"filledQuantity"`
 		} `json:"orders"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &resp); err != nil {
@@ -168,6 +170,29 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 			}, nil
 		}
 	}
+
+	// Order not in live list — it may have already filled/cancelled.
+	// Fall back to the executions endpoint which retains completed orders.
+	var trades []struct {
+		OrderID    string  `json:"orderId"`
+		Status     string  `json:"order_status"`
+		Price      float64 `json:"price"`
+		FilledQty  float64 `json:"size"`
+	}
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades", nil, &trades); err != nil {
+		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found in live orders, and trades lookup failed: %w", brokerOrderID, err)
+	}
+	for _, t := range trades {
+		if t.OrderID == brokerOrderID {
+			return OrderResult{
+				BrokerOrderID: t.OrderID,
+				Status:        NormalizeIBKROrderStatus(t.Status),
+				FilledPrice:   t.Price,
+				FilledQty:     t.FilledQty,
+			}, nil
+		}
+	}
+
 	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found", brokerOrderID)
 }
 

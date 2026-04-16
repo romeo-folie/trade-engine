@@ -110,7 +110,7 @@ func Defaults() *Config {
 			// on every tick. Enable explicitly once multiple analysts are set up.
 			Consensus: ConsensusConfig{
 				Enabled:            false,
-				FastPathConfidence: 0.80,
+				FastPathConfidence: 0.68,
 				FastPathMaxSpread:  0.15,
 				Strategy:           "majority",
 			},
