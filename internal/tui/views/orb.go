@@ -187,16 +187,18 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 		colFmt := "  %-6s %-4s  entry=%7.4f  stop=%7.4f  target=%7.4f  qty=%-4d  [%-9s]%s\n"
 		for _, t := range data.Trades {
 			extra := ""
-			switch t.Status {
-			case "filled":
+			if t.FillPrice != 0 {
 				extra = fmt.Sprintf("  fill=%.4f", t.FillPrice)
-			case "closed":
+			}
+			if t.Status == "closed" && t.ExitPrice != 0 {
 				exitLabel := t.ExitType
 				if exitLabel == "" {
 					exitLabel = "exit"
 				}
-				pnlStr := colorPnL(t.PnL)
-				extra = fmt.Sprintf("  fill=%.4f  %s=%.4f  pnl=%s", t.FillPrice, exitLabel, t.ExitPrice, pnlStr)
+				extra += fmt.Sprintf("  %s=%.4f", exitLabel, t.ExitPrice)
+			}
+			if t.PnL != 0 {
+				extra += fmt.Sprintf("  PnL:%s", colorPnL(t.PnL))
 			}
 			fmt.Fprintf(&sb, colFmt,
 				t.Ticker, strings.ToUpper(t.Side),
