@@ -245,7 +245,7 @@ func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, ou
 	}
 	defer resp.Body.Close()
 
-	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB – equity history can exceed 8 KiB
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("alpaca %s %s → %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(respBytes))
 	}
