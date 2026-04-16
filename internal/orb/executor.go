@@ -200,7 +200,9 @@ func ComputeFuturesBracket(r *OpeningRange, side string, portfolioValue float64,
 }
 
 // PlaceBracket submits a bracket stop order via the executor.
-func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (string, error) {
+// Returns the parent entry order ID plus the take-profit and stop-loss child
+// order IDs (both empty when the broker doesn't expose child IDs, e.g. Alpaca).
+func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (parentID, tpOrderID, slOrderID string, err error) {
 	req := execution.OrderRequest{
 		Ticker:          params.Ticker,
 		Side:            execution.OrderSide(params.Side),
@@ -215,9 +217,22 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 	}
 	result, err := executor.PlaceOrder(ctx, req)
 	if err != nil {
-		return "", fmt.Errorf("place bracket %s: %w", params.Ticker, err)
+		return "", "", "", fmt.Errorf("place bracket %s: %w", params.Ticker, err)
 	}
-	return result.BrokerOrderID, nil
+	if len(result.ChildOrderIDs) >= 2 {
+		return result.BrokerOrderID, result.ChildOrderIDs[0], result.ChildOrderIDs[1], nil
+	}
+	return result.BrokerOrderID, "", "", nil
+}
+
+// exitPnL computes realised P&L in quote-currency units when an exit leg fills.
+// For a buy: profit = (exitPrice - entryPrice) × qty.
+// For a sell: profit = (entryPrice - exitPrice) × qty.
+func exitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
+	if side == "sell" {
+		return (entryPrice - exitPrice) * float64(qty)
+	}
+	return (exitPrice - entryPrice) * float64(qty)
 }
 
 // CancelOrder cancels an open order by its broker order ID.

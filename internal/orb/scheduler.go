@@ -106,9 +106,22 @@ type ORBScheduler struct {
 	candidates     []ScoredCandidate
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
+	trackedTrades  map[string]*trackedTrade // entry order ID → trade context + exit state
 	lastScan       time.Time         // Eastern Time of the last successful scan
 	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
 	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
+}
+
+// trackedTrade holds per-order context needed to observe the full trade lifecycle.
+// It is registered when the entry bracket is placed and removed when the exit fills.
+type trackedTrade struct {
+	dbID      string  // orb_trades primary key
+	tpOrderID string  // take-profit child order ID (empty if broker doesn't expose it)
+	slOrderID string  // stop-loss child order ID
+	side      string  // "buy" | "sell"
+	ticker    string
+	qty       int
+	entryFill float64 // set when entry stop order fills; 0 while still pending
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -133,6 +146,7 @@ func NewORBScheduler(
 		state:         StateIdle,
 		rangeBuffers:  make(map[string]*RangeBuffer),
 		orderIDs:      make(map[string][2]string),
+		trackedTrades: make(map[string]*trackedTrade),
 		fetchFailures:    make(map[string]int),
 		fetchLastAttempt: make(map[string]time.Time),
 	}
@@ -447,26 +461,42 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 		s.mu.Unlock()
 	}
 
-	// Restore orderIDs from pending trades so tickDone can poll fill status.
+	// Restore orderIDs and trackedTrades from DB on restart.
 	if targetState == StateExecuting || targetState == StateDone {
 		trades, err := store.GetORBTrades(ctx, s.db, existing.ID)
 		if err != nil {
 			return fmt.Errorf("load orb trades for resume: %w", err)
 		}
 		for _, t := range trades {
-			if t.Status != "pending" || t.OrderID == "" {
+			if t.OrderID == "" {
 				continue
 			}
-			ids := s.orderIDs[t.Ticker]
-			switch t.Side {
-			case "buy":
-				ids[0] = t.OrderID
-			case "sell":
-				ids[1] = t.OrderID
+			// Restore pending entry orders into orderIDs so fill-polling resumes.
+			if t.Status == "pending" {
+				ids := s.orderIDs[t.Ticker]
+				switch t.Side {
+				case "buy":
+					ids[0] = t.OrderID
+				case "sell":
+					ids[1] = t.OrderID
+				}
+				s.orderIDs[t.Ticker] = ids
 			}
-			s.orderIDs[t.Ticker] = ids
+			// Restore exit watching for filled entries that haven't closed yet.
+			if t.Status == "filled" && (t.TpOrderID != "" || t.SlOrderID != "") {
+				s.trackedTrades[t.OrderID] = &trackedTrade{
+					dbID:      t.ID,
+					tpOrderID: t.TpOrderID,
+					slOrderID: t.SlOrderID,
+					side:      t.Side,
+					ticker:    t.Ticker,
+					qty:       t.Qty,
+					entryFill: t.FillPrice,
+				}
+			}
 		}
-		slog.Info("orb: restored orderIDs from DB", "count", len(s.orderIDs))
+		slog.Info("orb: restored orderIDs from DB", "count", len(s.orderIDs),
+			"exit_watching", len(s.trackedTrades))
 	}
 
 	s.setState(targetState)
@@ -914,7 +944,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				if p.params.Qty == 0 {
 					continue
 				}
-				orderID, err := PlaceBracket(ctx, s.executor, p.params)
+				orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, p.params)
 				if err != nil {
 					slog.Error("orb: place bracket failed", "side", p.side, "ticker", ticker, "err", err)
 					continue
@@ -926,7 +956,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					Side:    p.side,
 					Status:  "pending",
 				})
-				if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+				dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
 					SessionID:  sessionID,
 					Ticker:     ticker,
 					Side:       p.side,
@@ -936,8 +966,16 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					Qty:        p.params.Qty,
 					OrderID:    orderID,
 					Status:     "pending",
-				}); err != nil {
+					TpOrderID:  tpID,
+					SlOrderID:  slID,
+				})
+				if err != nil {
 					slog.Error("orb: store trade failed", "side", p.side, "ticker", ticker, "err", err)
+				} else {
+					s.trackedTrades[orderID] = &trackedTrade{
+						dbID: dbID, tpOrderID: tpID, slOrderID: slID,
+						side: p.side, ticker: ticker, qty: p.params.Qty,
+					}
 				}
 				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
 					strings.ToUpper(p.side), ticker, p.params.EntryStop, p.params.StopLoss, p.params.TakeProfit, p.params.Qty))
@@ -978,7 +1016,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
-			orderID, err := PlaceBracket(ctx, s.executor, params)
+			orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, params)
 			if err != nil {
 				slog.Error("orb: place bracket failed", "ticker", ticker, "err", err)
 				continue
@@ -999,7 +1037,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				Side:    side,
 				Status:  "pending",
 			})
-			if err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+			dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
 				SessionID:  sessionID,
 				Ticker:     ticker,
 				Side:       side,
@@ -1009,8 +1047,16 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				Qty:        params.Qty,
 				OrderID:    orderID,
 				Status:     "pending",
-			}); err != nil {
+				TpOrderID:  tpID,
+				SlOrderID:  slID,
+			})
+			if err != nil {
 				slog.Error("orb: store trade failed", "ticker", ticker, "err", err)
+			} else {
+				s.trackedTrades[orderID] = &trackedTrade{
+					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
+					side: side, ticker: ticker, qty: params.Qty,
+				}
 			}
 			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
 				strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
@@ -1121,6 +1167,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 
 			// persistFill marks a side as filled in DB and emits the event only
 			// if the DB row was actually updated (idempotent on retry ticks).
+			// It also stamps entryFill on the trackedTrade so exit polling can begin.
 			persistFill := func(s2 *sideStatus) {
 				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, s2.res.FilledPrice)
 				if dbErr != nil {
@@ -1131,6 +1178,9 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
 						OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: s2.res.FilledPrice,
 					})
+					if tc := s.trackedTrades[s2.id]; tc != nil {
+						tc.entryFill = s2.res.FilledPrice
+					}
 				}
 			}
 
@@ -1171,6 +1221,42 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					delete(s.orderIDs, ticker)
 				}
 				break // only one side can be the trigger
+			}
+		}
+	}
+
+	// Poll exit legs (TP / stop-loss) for trades whose entries have already filled.
+	if s.executor != nil {
+		for entryOrderID, tc := range s.trackedTrades {
+			if tc.entryFill == 0 || (tc.tpOrderID == "" && tc.slOrderID == "") {
+				continue // entry not yet filled, or no child IDs available
+			}
+			type exitCandidate struct {
+				orderID  string
+				exitType string
+			}
+			for _, ec := range []exitCandidate{
+				{tc.tpOrderID, "tp"},
+				{tc.slOrderID, "stop"},
+			} {
+				if ec.orderID == "" {
+					continue
+				}
+				res, err := s.executor.GetOrderStatus(ctx, ec.orderID)
+				if err != nil || res.Status != "filled" {
+					continue
+				}
+				pnl := exitPnL(tc.side, tc.entryFill, res.FilledPrice, tc.qty)
+				slog.Info("orb: exit filled",
+					"ticker", tc.ticker, "side", tc.side,
+					"exit_type", ec.exitType, "exit_price", res.FilledPrice,
+					"entry_price", tc.entryFill, "pnl", pnl,
+				)
+				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, res.FilledPrice, pnl); dbErr != nil {
+					slog.Error("orb: close trade failed", "ticker", tc.ticker, "err", dbErr)
+				}
+				delete(s.trackedTrades, entryOrderID)
+				break // one exit leg closes the trade
 			}
 		}
 	}
@@ -1236,6 +1322,15 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.orderIDs = make(map[string][2]string)
+		// Mark any tracked trades whose exits we never observed as expired.
+		for entryOrderID, tc := range s.trackedTrades {
+			if tc.entryFill != 0 {
+				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, "expired", 0, 0); dbErr != nil {
+					slog.Warn("orb: mark expired trade failed", "ticker", tc.ticker, "err", dbErr)
+				}
+			}
+			delete(s.trackedTrades, entryOrderID)
+		}
 		s.state = StateIdle
 		s.mu.Unlock()
 

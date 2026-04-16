@@ -48,6 +48,9 @@ type OrderResult struct {
 	Status        string  // pending | filled | partial | cancelled
 	FilledPrice   float64 // 0 if not yet filled
 	FilledQty     float64
+	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
+	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
+	ChildOrderIDs []string
 }
 
 // Position represents a current open position at the broker.

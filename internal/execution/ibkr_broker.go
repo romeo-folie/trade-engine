@@ -104,10 +104,17 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 	}
 	if err := json.Unmarshal(raw, &orderResults); err == nil && len(orderResults) > 0 && orderResults[0].OrderID != "" {
 		r := orderResults[0]
-		return OrderResult{
+		result := OrderResult{
 			BrokerOrderID: r.OrderID,
 			Status:        NormalizeIBKROrderStatus(r.OrderStatus),
-		}, nil
+		}
+		// Bracket responses include child order IDs at indices 1 (TP) and 2 (stop-loss).
+		for _, child := range orderResults[1:] {
+			if child.OrderID != "" {
+				result.ChildOrderIDs = append(result.ChildOrderIDs, child.OrderID)
+			}
+		}
+		return result, nil
 	}
 
 	// Check for a reply (confirmation) prompt.

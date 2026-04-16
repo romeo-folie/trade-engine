@@ -36,8 +36,13 @@ type ORBTrade struct {
 	Status     string
 	FillPrice  float64
 	PnL        float64
-	CreatedAt  time.Time
-	ClosedAt   *time.Time
+	// Exit tracking — populated after the TP or stop-loss leg fills.
+	TpOrderID string
+	SlOrderID string
+	ExitPrice float64
+	ExitType  string // "tp" | "stop" | "expired"
+	CreatedAt time.Time
+	ClosedAt  *time.Time
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -86,16 +91,19 @@ func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time, 
 	return &s, nil
 }
 
-// CreateORBTrade inserts a new ORB trade record.
-func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) error {
-	_, err := db.Exec(ctx, `
-		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+// CreateORBTrade inserts a new ORB trade record and returns the generated row ID.
+func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (string, error) {
+	var id string
+	err := db.QueryRow(ctx, `
+		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		RETURNING id`,
 		trade.SessionID, trade.Ticker, trade.Side,
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
 		trade.Qty, nullableString(trade.OrderID), trade.Status,
-	)
-	return err
+		nullableString(trade.TpOrderID), nullableString(trade.SlOrderID),
+	).Scan(&id)
+	return id, err
 }
 
 // CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
@@ -121,6 +129,17 @@ func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// CloseORBTrade records the outcome of an ORB trade once its exit leg (TP or stop)
+// fills. exitType is "tp", "stop", or "expired". pnl is in quote-currency units.
+func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType string, exitPrice, pnl float64) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='closed', exit_type=$1, exit_price=$2, pnl=$3, closed_at=NOW()
+		WHERE id=$4`,
+		exitType, exitPrice, pnl, id)
+	return err
 }
 
 // UpdateORBTrade updates a trade's status, fill price, and PnL.
@@ -165,6 +184,8 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''),
 		       created_at, closed_at
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
@@ -180,6 +201,8 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
+			&t.TpOrderID, &t.SlOrderID,
+			&t.ExitPrice, &t.ExitType,
 			&t.CreatedAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
@@ -196,6 +219,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''),
 		       created_at, closed_at
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
@@ -212,6 +237,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
+			&t.TpOrderID, &t.SlOrderID,
+			&t.ExitPrice, &t.ExitType,
 			&t.CreatedAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
