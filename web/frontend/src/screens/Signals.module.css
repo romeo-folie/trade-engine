@@ -285,3 +285,43 @@
   from { opacity: 0; transform: translateY(8px); }
   to { opacity: 1; transform: translateY(0); }
 }
+
+/* Table footer — pagination controls */
+.tableFooter {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--border-muted);
+}
+
+.footerCount {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-faint);
+  letter-spacing: var(--ls-mono-label);
+}
+
+.loadMoreBtn {
+  background: transparent;
+  border: 1px solid var(--border-muted);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 4px 12px;
+  cursor: pointer;
+  letter-spacing: var(--ls-mono-label);
+  transition: all 0.15s ease;
+}
+
+.loadMoreBtn:not(:disabled):hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.loadMoreBtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

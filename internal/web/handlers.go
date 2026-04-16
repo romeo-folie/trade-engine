@@ -615,17 +615,50 @@ type signalWithAnalysts struct {
 	Ensemble *APIEnsembleResult `json:"Ensemble,omitempty"`
 }
 
-// GET /api/signals/recent?limit=N
+// validSignalStatuses is the set of accepted values for the status filter.
+var validSignalStatuses = map[string]bool{
+	"pending": true, "approved": true, "executed": true,
+	"blocked": true, "expired": true, "stale": true,
+}
+
+// GET /api/signals/recent?limit=N&ticker=T&status=S&before=<created_at_rfc3339nano>,<id>
 func (s *Server) handleRecentSignals(w http.ResponseWriter, r *http.Request) {
+	limit := queryInt(r, "limit", 50, 200)
+	ticker := strings.TrimSpace(r.URL.Query().Get("ticker"))
+	status := strings.TrimSpace(r.URL.Query().Get("status"))
+	beforeRaw := strings.TrimSpace(r.URL.Query().Get("before"))
+
+	if status != "" && !validSignalStatuses[status] {
+		http.Error(w, `{"error":"invalid status value"}`, http.StatusBadRequest)
+		return
+	}
+
+	opts := store.ListSignalsOpts{Limit: limit, Ticker: ticker, Status: status}
+
+	if beforeRaw != "" {
+		idx := strings.LastIndex(beforeRaw, ",")
+		if idx < 1 || idx == len(beforeRaw)-1 {
+			http.Error(w, `{"error":"malformed before cursor"}`, http.StatusBadRequest)
+			return
+		}
+		ts, err := time.Parse(time.RFC3339Nano, beforeRaw[:idx])
+		if err != nil {
+			http.Error(w, `{"error":"malformed before cursor"}`, http.StatusBadRequest)
+			return
+		}
+		opts.BeforeTime = ts
+		opts.BeforeID = beforeRaw[idx+1:]
+	}
+
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
 	}
-	limit := queryInt(r, "limit", 50, 200)
+
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	sigs, err := store.GetRecentSignals(ctx, limit)
+	sigs, err := store.ListSignals(ctx, opts)
 	if err != nil {
 		apiError(w, "signals query failed", err)
 		return
@@ -635,7 +668,6 @@ func (s *Server) handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 	analystBatch, err := store.GetAnalystResultsBatchForSignals(ctx, sigs)
 	if err != nil {
 		logger.Warn("web: batch analyst results lookup failed", "err", err.Error())
-		// Non-fatal — enrich what we can (map will be nil/empty)
 	}
 
 	enriched := make([]signalWithAnalysts, len(sigs))
@@ -647,7 +679,15 @@ func (s *Server) handleRecentSignals(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	jsonResponse(w, map[string]any{"signals": enriched})
+
+	var nextCursor *string
+	if len(sigs) == limit {
+		last := sigs[len(sigs)-1]
+		c := last.CreatedAt.UTC().Format(time.RFC3339Nano) + "," + last.ID
+		nextCursor = &c
+	}
+
+	jsonResponse(w, map[string]any{"signals": enriched, "next_cursor": nextCursor})
 }
 
 // tradeWithAnalysts enriches a Trade with analyst routing data.

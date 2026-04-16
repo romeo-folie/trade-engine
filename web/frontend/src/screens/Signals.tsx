@@ -1,12 +1,11 @@
 /**
  * Signals screen — filterable table of trading signals with detail panel.
  *
- * Fetches live signals from GET /api/signals/recent?limit=100 every 15s.
- * Ticker search + status pill tab filter. Row click opens SignalDetailPanel.
- *
- * Task 5 of the web redesign (closes #205).
+ * Fetches signals from GET /api/signals/recent with server-side ticker/status
+ * filtering and cursor-based (keyset) pagination. Polls every 15s for new
+ * signals on page 1; "Load more" appends older pages without resetting scroll.
  */
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -16,7 +15,6 @@ import SignalDetailPanel from '../components/signals/SignalDetailPanel';
 import type { Signal } from '../components/signals/SignalDetailPanel';
 import type { Column } from '../components/table/DataTable';
 import styles from './Signals.module.css';
-
 
 
 
@@ -65,9 +63,9 @@ const COLUMNS: Column<Signal>[] = [
       <div className={styles.confidenceCell}>
         <span className={styles.confidenceValue}>{(s.Confidence * 100).toFixed(0)}%</span>
         <div className={styles.confidenceBar}>
-          <div 
-            className={styles.confidenceFill} 
-            style={{ width: `${Math.round(s.Confidence * 100)}%` }} 
+          <div
+            className={styles.confidenceFill}
+            style={{ width: `${Math.round(s.Confidence * 100)}%` }}
           />
         </div>
       </div>
@@ -160,50 +158,85 @@ function signalsToCsv(sigs: Signal[]): string {
   return [header, ...rows].join('\n');
 }
 
+/* ── URL builder ──────────────────────────────────────────────────────────── */
+
+function buildSignalsUrl(ticker: string, status: string, before?: string | null): string {
+  const p = new URLSearchParams({ limit: '50' });
+  if (ticker) p.set('ticker', ticker);
+  if (status) p.set('status', status);
+  if (before) p.set('before', before);
+  return `/api/signals/recent?${p}`;
+}
+
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function SignalsScreen() {
   const [signals, setSignals] = useState<Signal[]>([]);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [systemStatus, setSystemStatus] = useState<{ version: string; status: string } | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
+  const [debouncedTicker, setDebouncedTicker] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
+  const cursorInitialized = useRef(false);
 
+  // Debounce ticker search — 300ms after last keystroke
   useEffect(() => {
-    async function load() {
+    const t = setTimeout(() => setDebouncedTicker(tickerSearch), 300);
+    return () => clearTimeout(t);
+  }, [tickerSearch]);
+
+  // Fetch system status once on mount
+  useEffect(() => {
+    fetch('/api/system/status')
+      .then(r => (r.ok ? r.json() : null))
+      .then(data => {
+        if (data) setSystemStatus({ version: data.version || '0.0.0', status: 'ALL SYSTEMS NOMINAL' });
+      })
+      .catch(() => {});
+  }, []);
+
+  // Main data effect: reset + poll when server-side filters change
+  useEffect(() => {
+    setSignals([]);
+    setNextCursor(null);
+    setIsLoading(true);
+    cursorInitialized.current = false;
+
+    async function fetchPage1() {
       fetchControllerRef.current?.abort();
       const controller = new AbortController();
       fetchControllerRef.current = controller;
 
       try {
-        const [sigRes, sysRes] = await Promise.all([
-          fetch('/api/signals/recent?limit=100', { signal: controller.signal }),
-          fetch('/api/system/status', { signal: controller.signal }),
-        ]);
-
-        if (sigRes.ok) {
-          const data = await sigRes.json();
-          if (data && Array.isArray(data.signals)) {
-            setSignals(data.signals);
-            setSelectedSignal(sel =>
-              sel ? data.signals.find((s: Signal) => s.ID === sel.ID) ?? sel : null
-            );
-          }
+        const res = await fetch(buildSignalsUrl(debouncedTicker, statusFilter), { signal: controller.signal });
+        if (!res.ok) {
+          setFetchError(`${res.status} ${res.statusText}`);
+          return;
         }
+        const data = await res.json();
+        const fresh: Signal[] = data.signals ?? [];
 
-        if (sysRes.ok) {
-          const data = await sysRes.json();
-          setSystemStatus({
-            version: data.version || '0.0.0',
-            status: 'ALL SYSTEMS NOMINAL' // Or derive from actual status if available
+        if (!cursorInitialized.current) {
+          // First load for this filter combination — set cursor and replace state
+          setNextCursor(data.next_cursor ?? null);
+          cursorInitialized.current = true;
+          setSignals(fresh);
+        } else {
+          // Poll merge: prepend new signals, update existing ones in-place
+          setSignals(prev => {
+            const freshById = new Map(fresh.map((s: Signal) => [s.ID, s]));
+            const updated = prev.map(s => freshById.get(s.ID) ?? s);
+            const brandNew = fresh.filter(s => !prev.some(e => e.ID === s.ID));
+            return [...brandNew, ...updated];
           });
         }
-        
         setFetchError(null);
       } catch (err) {
         if (err instanceof Error && err.name !== 'AbortError') {
@@ -215,42 +248,38 @@ export default function SignalsScreen() {
       }
     }
 
-    load();
-    const interval = setInterval(load, 15_000);
+    fetchPage1();
+    const interval = setInterval(fetchPage1, 15_000);
     return () => {
       fetchControllerRef.current?.abort();
       clearInterval(interval);
     };
-  }, []);
+  }, [debouncedTicker, statusFilter]);
 
-  const filtered = useMemo(() => {
-    let rows = signals;
-    if (tickerSearch) {
-      const q = tickerSearch.toLowerCase();
-      rows = rows.filter(s => s.Ticker.toLowerCase().includes(q));
+  const handleLoadMore = useCallback(async () => {
+    if (!nextCursor || isLoadingMore) return;
+    setIsLoadingMore(true);
+    try {
+      const res = await fetch(buildSignalsUrl(debouncedTicker, statusFilter, nextCursor));
+      if (!res.ok) return;
+      const data = await res.json();
+      const more: Signal[] = data.signals ?? [];
+      setSignals(prev => {
+        const existingIds = new Set(prev.map(s => s.ID));
+        return [...prev, ...more.filter(s => !existingIds.has(s.ID))];
+      });
+      setNextCursor(data.next_cursor ?? null);
+    } catch (err) {
+      console.warn('[SignalsScreen] load more error:', err);
+    } finally {
+      setIsLoadingMore(false);
     }
-    if (statusFilter) {
-      rows = rows.filter(s => s.Status.toLowerCase() === statusFilter);
-    }
-    return rows;
-  }, [signals, tickerSearch, statusFilter]);
-
-  const stats = useMemo(() => {
-    const data = signals;
-    return {
-      total: data.length,
-      pending: data.filter(s => s.Status.toLowerCase() === 'pending').length,
-      executed: data.filter(s => s.Status.toLowerCase() === 'executed').length,
-      blocked: data.filter(s => s.Status.toLowerCase() === 'blocked').length,
-      approved: data.filter(s => s.Status.toLowerCase() === 'approved').length,
-      expired: data.filter(s => s.Status.toLowerCase() === 'expired').length,
-    };
-  }, [signals]);
+  }, [nextCursor, isLoadingMore, debouncedTicker, statusFilter]);
 
   const handleClosePanel = useCallback(() => setSelectedSignal(null), []);
 
   const handleExport = useCallback(() => {
-    const csv = signalsToCsv(filtered);
+    const csv = signalsToCsv(signals);
     if (!navigator.clipboard) {
       setToastMsg('Clipboard not available (requires HTTPS)');
       toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
@@ -263,7 +292,29 @@ export default function SignalsScreen() {
       setToastMsg('Failed to copy');
       toastTimer.current = setTimeout(() => setToastMsg(null), 2000);
     });
-  }, [filtered]);
+  }, [signals]);
+
+  const stats = {
+    total: signals.length,
+    pending: signals.filter(s => s.Status === 'pending').length,
+    executed: signals.filter(s => s.Status === 'executed').length,
+    blocked: signals.filter(s => s.Status === 'blocked').length,
+    approved: signals.filter(s => s.Status === 'approved').length,
+    expired: signals.filter(s => s.Status === 'expired').length,
+  };
+
+  const tableFooter = (
+    <div className={styles.tableFooter}>
+      <span className={styles.footerCount}>SHOWING {signals.length}</span>
+      <button
+        className={styles.loadMoreBtn}
+        onClick={handleLoadMore}
+        disabled={!nextCursor || isLoadingMore}
+      >
+        {isLoadingMore ? 'LOADING…' : nextCursor ? 'LOAD MORE' : 'ALL LOADED'}
+      </button>
+    </div>
+  );
 
   return (
     <div className={styles.screen}>
@@ -279,7 +330,7 @@ export default function SignalsScreen() {
 
       <div className={styles.header}>
         <h1 className={styles.pageTitle}>SIGNALS</h1>
-        <button className={styles.exportBtn} onClick={handleExport}>EXPORT CSV</button>
+        <button className={styles.exportBtn} onClick={handleExport} title="Exports loaded rows">EXPORT CSV</button>
       </div>
 
       {fetchError && (
@@ -296,7 +347,7 @@ export default function SignalsScreen() {
 
       <div className={styles.statsRow}>
         <CornerCard className={styles.statCard} bracketColor="var(--text-primary)">
-          <div className={styles.statLabel}>TOTAL TODAY</div>
+          <div className={styles.statLabel}>LOADED</div>
           <div className={`${styles.statValue} ${styles.statLarge}`}>{stats.total}</div>
         </CornerCard>
         <CornerCard className={styles.statCard} bracketColor="var(--amber)">
@@ -333,7 +384,7 @@ export default function SignalsScreen() {
                 backgroundColor={isActive ? colors.acidGreen : 'transparent'}
                 borderColor={isActive ? colors.acidGreen : 'var(--border)'}
                 onClick={() => setStatusFilter(tab)}
-                style={{ 
+                style={{
                   padding: '2px 14px',
                   cursor: 'pointer'
                 }}
@@ -357,12 +408,13 @@ export default function SignalsScreen() {
       {!(isLoading && signals.length === 0) && (
         <DataTable<Signal>
           columns={COLUMNS}
-          data={filtered}
+          data={signals}
           rowKey={(s) => s.ID}
           onRowClick={setSelectedSignal}
           defaultSortKey="CreatedAt"
           defaultSortDir="desc"
           ariaLabel="Trading signals"
+          footer={tableFooter}
         />
       )}
 

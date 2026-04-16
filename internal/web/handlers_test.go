@@ -296,3 +296,55 @@ func TestHandlePortfolioPositions_NilTracker_NoDB(t *testing.T) {
 		t.Errorf("expected 'not connected' in error body, got %q", w.Body.String())
 	}
 }
+
+// ─── handleRecentSignals (no DB) ─────────────────────────────────────────────
+
+func TestHandleRecentSignals_NoDB(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/signals/recent", nil)
+	srv.handleRecentSignals(w, r)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 (no DB), got %d", w.Code)
+	}
+}
+
+func TestHandleRecentSignals_InvalidStatus(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/signals/recent?status=invalid", nil)
+	srv.handleRecentSignals(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for invalid status, got %d", w.Code)
+	}
+}
+
+func TestHandleRecentSignals_MalformedCursor_NoComma(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/signals/recent?before=notacursor", nil)
+	srv.handleRecentSignals(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for no-comma cursor, got %d", w.Code)
+	}
+}
+
+func TestHandleRecentSignals_MalformedCursor_BadTimestamp(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/signals/recent?before=notadate,someid", nil)
+	srv.handleRecentSignals(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad timestamp in cursor, got %d", w.Code)
+	}
+}
+
+func TestHandleRecentSignals_MalformedCursor_TrailingComma(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/api/signals/recent?before=2026-04-16T09:12:33Z,", nil)
+	srv.handleRecentSignals(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for trailing-comma cursor, got %d", w.Code)
+	}
+}

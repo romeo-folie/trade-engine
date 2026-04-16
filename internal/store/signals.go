@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -149,6 +151,75 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 		       created_at, updated_at
 		FROM signals
 		ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Signal
+	for rows.Next() {
+		var s Signal
+		if err := rows.Scan(
+			&s.ID, &s.Ticker, &s.Action, &s.Strategy, &s.SignalPrice,
+			&s.StopLoss, &s.TakeProfit,
+			&s.Confidence, &s.SizePct, &s.Status,
+			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
+			&s.CreatedAt, &s.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListSignalsOpts controls filtering and cursor pagination for ListSignals.
+type ListSignalsOpts struct {
+	Limit      int       // 1..200
+	Ticker     string    // optional ILIKE substring
+	Status     string    // optional exact match
+	BeforeTime time.Time // optional cursor; zero = no cursor
+	BeforeID   string    // tiebreaker for equal created_at values
+}
+
+// ListSignals returns signals with optional ticker/status filtering and keyset
+// pagination. The cursor (BeforeTime, BeforeID) is the (created_at, id) of the
+// last row from the previous page. Pass a zero BeforeTime for the first page.
+func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
+	var args []any
+	var conds []string
+
+	if opts.Ticker != "" {
+		args = append(args, opts.Ticker)
+		conds = append(conds, fmt.Sprintf("ticker ILIKE '%%' || $%d || '%%'", len(args)))
+	}
+	if opts.Status != "" {
+		args = append(args, opts.Status)
+		conds = append(conds, fmt.Sprintf("status = $%d", len(args)))
+	}
+	if !opts.BeforeTime.IsZero() {
+		args = append(args, opts.BeforeTime, opts.BeforeID)
+		conds = append(conds, fmt.Sprintf("(created_at, id) < ($%d, $%d)", len(args)-1, len(args)))
+	}
+
+	where := ""
+	if len(conds) > 0 {
+		where = "WHERE " + strings.Join(conds, " AND ")
+	}
+
+	args = append(args, opts.Limit)
+	q := fmt.Sprintf(`
+		SELECT id, ticker, action, strategy, signal_price,
+		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
+		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
+		       created_at, updated_at
+		FROM signals
+		%s
+		ORDER BY created_at DESC, id DESC
+		LIMIT $%d`, where, len(args))
+
+	rows, err := GetDB().Query(ctx, q, args...)
 	if err != nil {
 		return nil, err
 	}

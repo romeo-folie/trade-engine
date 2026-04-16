@@ -21,6 +21,7 @@ interface DataTableProps<T> {
   defaultSortKey?: keyof T;
   defaultSortDir?: 'asc' | 'desc';
   ariaLabel?: string;
+  footer?: React.ReactNode;
 }
 
 type SortDir = 'asc' | 'desc';
@@ -44,6 +45,7 @@ export default function DataTable<T>({
   defaultSortKey,
   defaultSortDir = 'desc',
   ariaLabel = 'Data table',
+  footer,
 }: DataTableProps<T>) {
   const [sortKey, setSortKey] = useState<keyof T | null>(defaultSortKey ?? null);
   const [sortDir, setSortDir] = useState<SortDir>(defaultSortDir);
@@ -141,6 +143,13 @@ export default function DataTable<T>({
           })
         )}
       </tbody>
+      {footer && (
+        <tfoot>
+          <tr>
+            <td colSpan={columns.length}>{footer}</td>
+          </tr>
+        </tfoot>
+      )}
     </table>
   );
 }
