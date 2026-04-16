@@ -405,17 +405,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		case "tab":
-			if !m.showDetail {
+			if !m.showDetail && !m.showTradeDetail {
 				m.activeView = (m.activeView + 1) % View(len(allViews))
 			}
 			return m, nil
 		case "shift+tab":
-			if !m.showDetail {
+			if !m.showDetail && !m.showTradeDetail {
 				m.activeView = (m.activeView - 1 + View(len(allViews))) % View(len(allViews))
 			}
 			return m, nil
 		default:
-			if !m.showDetail {
+			if !m.showDetail && !m.showTradeDetail {
 				if v, ok := viewKeys[msg.String()]; ok {
 					m.activeView = v
 					return m, nil
