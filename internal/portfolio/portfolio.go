@@ -177,11 +177,16 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	s := t.state
 	t.mu.RUnlock()
 
-	// Perform the upsert. ON CONFLICT handles existing rows for today.
-
+	// Use the broker-reported DayPnL (equity - last_equity) when available, or the
+	// realized-trade fallback stored in the tracker. This avoids distorting the daily
+	// figure with intraday unrealized swings from open positions.
+	dayPnL := s.DayPnL
+	if dayPnL == 0 {
+		dayPnL = s.TotalValue - startingValue
+	}
 	pnlPct := 0.0
 	if startingValue > 0 {
-		pnlPct = ((s.TotalValue - startingValue) / startingValue) * 100
+		pnlPct = (dayPnL / startingValue) * 100
 	}
 	_, err := store.GetDB().Exec(ctx, `
 		INSERT INTO daily_summaries (
@@ -197,7 +202,7 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 			signals_generated=EXCLUDED.signals_generated, signals_blocked=EXCLUDED.signals_blocked,
 			model_tokens_input=EXCLUDED.model_tokens_input, model_tokens_output=EXCLUDED.model_tokens_output`,
 		today.Format("2006-01-02"),
-		startingValue, s.TotalValue, s.TotalValue-startingValue, pnlPct,
+		startingValue, s.TotalValue, dayPnL, pnlPct,
 		tradesOpened, tradesClosed, wins, losses,
 		sigGenerated, sigBlocked, tokIn, tokOut,
 	)

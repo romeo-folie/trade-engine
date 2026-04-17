@@ -10,6 +10,7 @@ import (
 	appconfig "github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -127,7 +128,7 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 
 // buildSnapshot returns the current pipeline state for a newly connected client.
 // It queries store functions to populate live data where available.
-func buildSnapshot(ctx context.Context, cfg *appconfig.Config) *SnapshotEvent {
+func buildSnapshot(ctx context.Context, cfg *appconfig.Config, tracker *portfolio.Tracker) *SnapshotEvent {
 	now := time.Now().UTC()
 	nodes := pipelineNodes(cfg)
 
@@ -144,15 +145,22 @@ func buildSnapshot(ctx context.Context, cfg *appconfig.Config) *SnapshotEvent {
 		logger.Warn("buildSnapshot: portfolio snapshot query failed", "err", err)
 	}
 	if snap != nil {
+		// Prefer the live tracker's DayPnL (broker-reported equity delta) over the
+		// persisted realized_pnl_today, which is zero when the broker provides DayPnL.
+		var dayPnL float64
+		if tracker != nil {
+			dayPnL = tracker.CurrentState().DayPnL
+		}
 		for i := range nodes {
 			if nodes[i].ID == "portfolio" {
 				nodes[i].Meta = map[string]any{
-					"total_value":       snap.TotalValue,
-					"cash":              snap.Cash,
-					"invested":          snap.Invested,
-					"unrealized_pnl":    snap.UnrealizedPnL,
+					"total_value":        snap.TotalValue,
+					"cash":               snap.Cash,
+					"invested":           snap.Invested,
+					"unrealized_pnl":     snap.UnrealizedPnL,
 					"realized_pnl_today": snap.RealizedPnLToday,
-					"open_positions":    snap.OpenPositions,
+					"day_pnl":            dayPnL,
+					"open_positions":     snap.OpenPositions,
 				}
 				break
 			}

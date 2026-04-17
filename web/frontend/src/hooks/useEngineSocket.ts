@@ -195,7 +195,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 cash: m.cash as number,
                 invested: m.invested as number,
                 unrealizedPnL: m.unrealized_pnl as number,
-                realizedPnlToday: (m.realized_pnl_today as number) ?? 0,
+                realizedPnlToday: (m.day_pnl as number) ?? (m.realized_pnl_today as number) ?? 0,
                 openPositions: m.open_positions as number,
               });
             }
@@ -396,7 +396,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
               cash: p.cash as number,
               invested: p.invested as number,
               unrealizedPnL: p.unrealized_pnl as number,
-              realizedPnlToday: (p.realized_pnl_today as number) ?? 0,
+              realizedPnlToday: (p.day_pnl as number) ?? (p.realized_pnl_today as number) ?? 0,
               openPositions: p.open_positions as number,
             });
           } catch { /* ignore */ }

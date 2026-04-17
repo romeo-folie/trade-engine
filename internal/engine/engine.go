@@ -1768,11 +1768,17 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 func (e *Engine) updateDailySummary(ctx context.Context) {
 	today := time.Now().UTC().Format("2006-01-02")
 	if e.todaySummaryDate != today {
-		// New day or startup — fetch starting equity.
+		// New day or engine startup — determine the true beginning-of-day equity.
+		// Priority: (1) existing DB row preserves its starting_value; (2) last
+		// snapshot written before today (previous-day close); (3) first snapshot
+		// of today (engine started mid-session); (4) live tracker state.
 		e.todaySummaryDate = today
-		if s, _ := store.GetDailySummaryByDate(ctx, time.Now().UTC().Truncate(24*time.Hour)); s != nil {
+		todayStart := time.Now().UTC().Truncate(24 * time.Hour)
+		if s, _ := store.GetDailySummaryByDate(ctx, todayStart); s != nil {
 			e.todayStartingEquity = s.StartingValue
-		} else if snap, _ := store.GetLatestPortfolioSnapshot(ctx); snap != nil {
+		} else if snap, _ := store.GetLastSnapshotBeforeDay(ctx, todayStart); snap != nil {
+			e.todayStartingEquity = snap.TotalValue
+		} else if snap, _ := store.GetFirstSnapshotOfDay(ctx, todayStart); snap != nil {
 			e.todayStartingEquity = snap.TotalValue
 		} else {
 			e.todayStartingEquity = e.portfolio.CurrentState().TotalValue
