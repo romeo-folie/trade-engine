@@ -1,5 +1,6 @@
 // Package logger provides a structured logger built on log/slog.
 // Writes to both stdout and ~/.tradeengine/logs/engine.log simultaneously.
+// The log file is rotated automatically via lumberjack (size, age, backup count).
 package logger
 
 import (
@@ -9,25 +10,45 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
-	once      sync.Once
-	std       *slog.Logger
-	logFile   *os.File
+	once    sync.Once
+	std     *slog.Logger
+	logFile *lumberjack.Logger
 )
 
-// Init initialises the global logger. Must be called once at startup.
+// RotationConfig carries log-file rotation settings.
+type RotationConfig struct {
+	MaxSizeMB  int  // max megabytes before rotation; default 50
+	MaxBackups int  // max number of old log files to keep; default 7
+	MaxAgeDays int  // max days to keep old log files; default 30
+	Compress   bool // gzip rotated files; default true
+}
+
+// DefaultRotationConfig returns sensible defaults for rotation.
+func DefaultRotationConfig() RotationConfig {
+	return RotationConfig{MaxSizeMB: 50, MaxBackups: 7, MaxAgeDays: 30, Compress: true}
+}
+
+// Init initialises the global logger with rotation defaults.
 // level: debug | info | warn | error. format: text | json.
 func Init(level, format string) error {
+	return InitWithRotation(level, format, DefaultRotationConfig())
+}
+
+// InitWithRotation initialises the global logger with explicit rotation settings.
+func InitWithRotation(level, format string, rot RotationConfig) error {
 	var initErr error
 	once.Do(func() {
-		initErr = initLogger(level, format)
+		initErr = initLogger(level, format, rot)
 	})
 	return initErr
 }
 
-func initLogger(level, format string) error {
+func initLogger(level, format string, rot RotationConfig) error {
 	slogLevel := parseLevel(level)
 
 	// Ensure log directory exists.
@@ -37,14 +58,22 @@ func initLogger(level, format string) error {
 		return err
 	}
 
-	var err error
-	logFile, err = os.OpenFile(
-		filepath.Join(logDir, "engine.log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY,
-		0640,
-	)
+	logPath := filepath.Join(logDir, "engine.log")
+
+	// Eagerly validate that the log file is writable. lumberjack opens lazily on
+	// the first write, so without this check a permissions error would be silent.
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
 	if err != nil {
 		return err
+	}
+	f.Close()
+
+	logFile = &lumberjack.Logger{
+		Filename:   logPath,
+		MaxSize:    rot.MaxSizeMB,
+		MaxBackups: rot.MaxBackups,
+		MaxAge:     rot.MaxAgeDays,
+		Compress:   rot.Compress,
 	}
 
 	w := io.MultiWriter(os.Stdout, logFile)
@@ -76,10 +105,13 @@ func parseLevel(level string) slog.Level {
 }
 
 // Get returns the global slog.Logger.
+// If Init/InitWithRotation was never called, it initialises with defaults via
+// once.Do so that a subsequent Init call doesn't open a second writer.
 func Get() *slog.Logger {
 	if std == nil {
-		// Fallback: initialise with defaults if Init wasn't called.
-		_ = initLogger("info", "text")
+		once.Do(func() {
+			_ = initLogger("info", "text", DefaultRotationConfig())
+		})
 	}
 	return std
 }
@@ -93,13 +125,13 @@ func LogFilePath() string {
 // Close flushes and closes the underlying log file.
 func Close() {
 	if logFile != nil {
-		logFile.Close()
+		_ = logFile.Close()
 	}
 }
 
 // Convenience wrappers.
 
-func Debug(msg string, args ...any)  { Get().Debug(msg, args...) }
-func Info(msg string, args ...any)   { Get().Info(msg, args...) }
-func Warn(msg string, args ...any)   { Get().Warn(msg, args...) }
-func Error(msg string, args ...any)  { Get().Error(msg, args...) }
+func Debug(msg string, args ...any) { Get().Debug(msg, args...) }
+func Info(msg string, args ...any)  { Get().Info(msg, args...) }
+func Warn(msg string, args ...any)  { Get().Warn(msg, args...) }
+func Error(msg string, args ...any) { Get().Error(msg, args...) }

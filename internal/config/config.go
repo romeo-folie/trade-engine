@@ -663,8 +663,12 @@ type TelegramConfig struct {
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 type LoggingConfig struct {
-	Level  string `yaml:"level"`  // debug | info | warn | error
-	Format string `yaml:"format"` // json | text
+	Level      string `yaml:"level"`        // debug | info | warn | error
+	Format     string `yaml:"format"`       // json | text
+	MaxSizeMB  int    `yaml:"max_size_mb"`  // max size of engine.log before rotation (MB)
+	MaxBackups int    `yaml:"max_backups"`  // number of rotated log files to keep
+	MaxAgeDays int    `yaml:"max_age_days"` // max age of rotated log files (days)
+	Compress   bool   `yaml:"compress"`     // gzip rotated log files
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────
@@ -853,6 +857,19 @@ func Validate(cfg *Config) []string {
 	validCostProfiles := map[string]bool{"budget": true, "balanced": true, "pro": true}
 	if p := cfg.Cost.Profile; !validCostProfiles[p] {
 		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
+	}
+
+	// Validate logging rotation settings. lumberjack treats 0 as "use default"
+	// for MaxSize/MaxAge/MaxBackups, but we require explicit positive values so
+	// users don't accidentally disable rotation by zeroing a field.
+	if cfg.Logging.MaxSizeMB <= 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_size_mb must be > 0, got %d", cfg.Logging.MaxSizeMB))
+	}
+	if cfg.Logging.MaxBackups < 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_backups must be >= 0, got %d", cfg.Logging.MaxBackups))
+	}
+	if cfg.Logging.MaxAgeDays < 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_age_days must be >= 0, got %d", cfg.Logging.MaxAgeDays))
 	}
 
 	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative

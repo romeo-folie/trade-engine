@@ -1890,16 +1890,39 @@ func (e *Engine) runRetentionLoop(ctx context.Context) {
 }
 
 func (e *Engine) runRetention(ctx context.Context) {
+	if !store.IsConnected() {
+		return
+	}
 	n1, err1 := store.CleanupIntradayCandles(ctx)
 	n2, err2 := store.CleanupPromptCache(ctx)
+	n3, err3 := store.CleanupPortfolioSnapshots(ctx)
+	n4, err4 := store.CleanupNewsItems(ctx)
+	n5, err5 := store.CleanupConfigHistory(ctx)
+	n6, err6 := store.CleanupFeedbackFlags(ctx)
 	if err1 != nil {
 		logger.Warn("retention: intraday cleanup failed", "err", err1)
 	}
 	if err2 != nil {
 		logger.Warn("retention: prompt cache cleanup failed", "err", err2)
 	}
-	if n1 > 0 || n2 > 0 {
-		logger.Info("retention complete", "intraday_candles", n1, "prompt_cache", n2)
+	if err3 != nil {
+		logger.Warn("retention: portfolio snapshots cleanup failed", "err", err3)
+	}
+	if err4 != nil {
+		logger.Warn("retention: news items cleanup failed", "err", err4)
+	}
+	if err5 != nil {
+		logger.Warn("retention: config history cleanup failed", "err", err5)
+	}
+	if err6 != nil {
+		logger.Warn("retention: feedback flags cleanup failed", "err", err6)
+	}
+	if n1+n2+n3+n4+n5+n6 > 0 {
+		logger.Info("retention complete",
+			"intraday_candles", n1, "prompt_cache", n2,
+			"portfolio_snapshots", n3, "news_items", n4,
+			"config_history", n5, "feedback_flags", n6,
+		)
 	}
 }
 func (e *Engine) calculateImpactScore(ticker string, snippets []analysis.NewsSnippet, candles []data.Candle) depth.ImpactScore {

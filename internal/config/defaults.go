@@ -198,8 +198,12 @@ func Defaults() *Config {
 			},
 		},
 		Logging: LoggingConfig{
-			Level:  "info",
-			Format: "text",
+			Level:      "info",
+			Format:     "text",
+			MaxSizeMB:  50,
+			MaxBackups: 7,
+			MaxAgeDays: 30,
+			Compress:   true,
 		},
 		Database: DatabaseConfig{
 			URLEnv: "DATABASE_URL",
