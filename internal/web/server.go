@@ -193,7 +193,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	ctx := conn.CloseRead(r.Context())
 
 	// Send initial snapshot so the UI isn't blank on first load.
-	snap := buildSnapshot(ctx, s.engineCfg)
+	snap := buildSnapshot(ctx, s.engineCfg, s.tracker)
 	if err := wsjson.Write(ctx, conn, snap); err != nil {
 		return
 	}

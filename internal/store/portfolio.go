@@ -157,6 +157,56 @@ func GetLatestPortfolioSnapshot(ctx context.Context) (*PortfolioSnapshot, error)
 	return &s, nil
 }
 
+// GetFirstSnapshotOfDay returns the earliest snapshot on the given UTC date, or
+// nil if none exists. Used to determine the true beginning-of-day equity when
+// no daily_summaries row has been written yet.
+func GetFirstSnapshotOfDay(ctx context.Context, day time.Time) (*PortfolioSnapshot, error) {
+	start := day.UTC().Truncate(24 * time.Hour)
+	end := start.Add(24 * time.Hour)
+	var s PortfolioSnapshot
+	err := GetDB().QueryRow(ctx, `
+		SELECT id, total_value, cash, invested,
+		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		FROM portfolio_snapshots
+		WHERE created_at >= $1 AND created_at < $2
+		ORDER BY created_at ASC LIMIT 1`,
+		start, end).Scan(
+		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+	)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &s, nil
+}
+
+// GetLastSnapshotBeforeDay returns the most recent snapshot written before the
+// given UTC date, used as the previous-day closing equity for PnL baseline.
+func GetLastSnapshotBeforeDay(ctx context.Context, day time.Time) (*PortfolioSnapshot, error) {
+	cutoff := day.UTC().Truncate(24 * time.Hour)
+	var s PortfolioSnapshot
+	err := GetDB().QueryRow(ctx, `
+		SELECT id, total_value, cash, invested,
+		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		FROM portfolio_snapshots
+		WHERE created_at < $1
+		ORDER BY created_at DESC LIMIT 1`,
+		cutoff).Scan(
+		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+	)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &s, nil
+}
+
 // ── Daily Summaries ───────────────────────────────────────────────────────────
 
 // GetDailySummaries returns summaries within [from, to] ordered by date.
