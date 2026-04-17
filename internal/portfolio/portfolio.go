@@ -177,12 +177,14 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	s := t.state
 	t.mu.RUnlock()
 
-	// Use the broker-reported DayPnL (equity - last_equity) when available, or the
-	// realized-trade fallback stored in the tracker. This avoids distorting the daily
-	// figure with intraday unrealized swings from open positions.
+	// Use the broker-reported DayPnL (equity - last_equity) when available, or fall
+	// back to realized trade PnL. Avoids distorting the daily figure with intraday
+	// unrealized swings from open positions. A legitimately flat day (DayPnL == 0)
+	// is indistinguishable from "unavailable" here; RealizedPnLDay is 0 too in that
+	// case, so both produce the correct result.
 	dayPnL := s.DayPnL
 	if dayPnL == 0 {
-		dayPnL = s.TotalValue - startingValue
+		dayPnL = s.RealizedPnLDay
 	}
 	pnlPct := 0.0
 	if startingValue > 0 {

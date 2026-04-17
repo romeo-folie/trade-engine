@@ -145,23 +145,25 @@ func buildSnapshot(ctx context.Context, cfg *appconfig.Config, tracker *portfoli
 		logger.Warn("buildSnapshot: portfolio snapshot query failed", "err", err)
 	}
 	if snap != nil {
-		// Prefer the live tracker's DayPnL (broker-reported equity delta) over the
-		// persisted realized_pnl_today, which is zero when the broker provides DayPnL.
-		var dayPnL float64
+		// Include day_pnl (broker-reported equity delta) only when the tracker has a
+		// non-zero value. Omitting the key when unavailable lets the frontend fall
+		// through to realized_pnl_today rather than masking it with a spurious 0.
+		meta := map[string]any{
+			"total_value":        snap.TotalValue,
+			"cash":               snap.Cash,
+			"invested":           snap.Invested,
+			"unrealized_pnl":     snap.UnrealizedPnL,
+			"realized_pnl_today": snap.RealizedPnLToday,
+			"open_positions":     snap.OpenPositions,
+		}
 		if tracker != nil {
-			dayPnL = tracker.CurrentState().DayPnL
+			if dpnl := tracker.CurrentState().DayPnL; dpnl != 0 {
+				meta["day_pnl"] = dpnl
+			}
 		}
 		for i := range nodes {
 			if nodes[i].ID == "portfolio" {
-				nodes[i].Meta = map[string]any{
-					"total_value":        snap.TotalValue,
-					"cash":               snap.Cash,
-					"invested":           snap.Invested,
-					"unrealized_pnl":     snap.UnrealizedPnL,
-					"realized_pnl_today": snap.RealizedPnLToday,
-					"day_pnl":            dayPnL,
-					"open_positions":     snap.OpenPositions,
-				}
+				nodes[i].Meta = meta
 				break
 			}
 		}
