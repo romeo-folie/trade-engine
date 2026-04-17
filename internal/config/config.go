@@ -663,8 +663,12 @@ type TelegramConfig struct {
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 type LoggingConfig struct {
-	Level  string `yaml:"level"`  // debug | info | warn | error
-	Format string `yaml:"format"` // json | text
+	Level      string `yaml:"level"`        // debug | info | warn | error
+	Format     string `yaml:"format"`       // json | text
+	MaxSizeMB  int    `yaml:"max_size_mb"`  // max size of engine.log before rotation (MB)
+	MaxBackups int    `yaml:"max_backups"`  // number of rotated log files to keep
+	MaxAgeDays int    `yaml:"max_age_days"` // max age of rotated log files (days)
+	Compress   bool   `yaml:"compress"`     // gzip rotated log files
 }
 
 // ── Database ──────────────────────────────────────────────────────────────────

@@ -271,6 +271,10 @@ notifications:
 logging:
   level: info                  # debug | info | warn | error
   format: text                 # text | json
+  max_size_mb: 50              # rotate engine.log when it reaches this size
+  max_backups: 7               # number of rotated log files to keep
+  max_age_days: 30             # delete rotated log files older than this
+  compress: true               # gzip rotated log files
 
 database:
   url_env: DATABASE_URL        # export DATABASE_URL=postgres://...

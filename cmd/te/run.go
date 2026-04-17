@@ -72,7 +72,12 @@ Modes:
 			}
 			return fmt.Errorf("invalid configuration (%d error(s)); fix config before starting", len(errs))
 		}
-		if err := logger.Init(cfg.Logging.Level, cfg.Logging.Format); err != nil {
+		if err := logger.InitWithRotation(cfg.Logging.Level, cfg.Logging.Format, logger.RotationConfig{
+				MaxSizeMB:  cfg.Logging.MaxSizeMB,
+				MaxBackups: cfg.Logging.MaxBackups,
+				MaxAgeDays: cfg.Logging.MaxAgeDays,
+				Compress:   cfg.Logging.Compress,
+			}); err != nil {
 			return err
 		}
 
