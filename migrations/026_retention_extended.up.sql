@@ -1,6 +1,9 @@
 -- 026_retention_extended.up.sql
--- Cleanup functions for tables that previously had no retention policy.
--- Called daily by the engine scheduler via store.Cleanup* wrappers.
+-- SQL cleanup functions for tables that previously had no retention policy.
+-- Note: the engine's daily retention loop uses direct DELETE statements in
+-- internal/store/retention.go (matching the existing pattern from migration 011).
+-- These functions are provided for ad-hoc manual invocation (SELECT cleanup_*())
+-- and as documentation of the intended retention windows.
 
 -- Delete portfolio snapshots older than 180 days (no FKs; derivable from trades).
 CREATE OR REPLACE FUNCTION cleanup_portfolio_snapshots()

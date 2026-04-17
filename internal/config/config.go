@@ -859,6 +859,19 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("cost.profile must be one of budget|balanced|pro, got %q", p))
 	}
 
+	// Validate logging rotation settings. lumberjack treats 0 as "use default"
+	// for MaxSize/MaxAge/MaxBackups, but we require explicit positive values so
+	// users don't accidentally disable rotation by zeroing a field.
+	if cfg.Logging.MaxSizeMB <= 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_size_mb must be > 0, got %d", cfg.Logging.MaxSizeMB))
+	}
+	if cfg.Logging.MaxBackups < 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_backups must be >= 0, got %d", cfg.Logging.MaxBackups))
+	}
+	if cfg.Logging.MaxAgeDays < 0 {
+		errs = append(errs, fmt.Sprintf("logging.max_age_days must be >= 0, got %d", cfg.Logging.MaxAgeDays))
+	}
+
 	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative
 	// values would silently disable enforcement rather than error.  Zero is
 	// valid (means "no budget cap for this period").

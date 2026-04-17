@@ -1890,6 +1890,9 @@ func (e *Engine) runRetentionLoop(ctx context.Context) {
 }
 
 func (e *Engine) runRetention(ctx context.Context) {
+	if !store.IsConnected() {
+		return
+	}
 	n1, err1 := store.CleanupIntradayCandles(ctx)
 	n2, err2 := store.CleanupPromptCache(ctx)
 	n3, err3 := store.CleanupPortfolioSnapshots(ctx)

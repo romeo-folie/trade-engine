@@ -58,8 +58,18 @@ func initLogger(level, format string, rot RotationConfig) error {
 		return err
 	}
 
+	logPath := filepath.Join(logDir, "engine.log")
+
+	// Eagerly validate that the log file is writable. lumberjack opens lazily on
+	// the first write, so without this check a permissions error would be silent.
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0640)
+	if err != nil {
+		return err
+	}
+	f.Close()
+
 	logFile = &lumberjack.Logger{
-		Filename:   filepath.Join(logDir, "engine.log"),
+		Filename:   logPath,
 		MaxSize:    rot.MaxSizeMB,
 		MaxBackups: rot.MaxBackups,
 		MaxAge:     rot.MaxAgeDays,
@@ -95,10 +105,13 @@ func parseLevel(level string) slog.Level {
 }
 
 // Get returns the global slog.Logger.
+// If Init/InitWithRotation was never called, it initialises with defaults via
+// once.Do so that a subsequent Init call doesn't open a second writer.
 func Get() *slog.Logger {
 	if std == nil {
-		// Fallback: initialise with defaults if Init wasn't called.
-		_ = initLogger("info", "text", DefaultRotationConfig())
+		once.Do(func() {
+			_ = initLogger("info", "text", DefaultRotationConfig())
+		})
 	}
 	return std
 }
