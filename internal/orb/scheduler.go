@@ -261,6 +261,14 @@ func (s *ORBScheduler) sessionOpenMinutes() int {
 	return marketOpenMinutes // 9:30 AM ET for equities
 }
 
+// sessionCleanupMinutes returns the minute-of-day (in session TZ) after which tickDone
+// should cancel unfilled orders and mark the session done. Always 60 minutes after open,
+// which preserves the existing 10:30 ET behaviour for equities/NY-forex while giving
+// London (08:00 UTC open) a 09:00 UTC cutoff instead of the previous 14:30 UTC.
+func (s *ORBScheduler) sessionCleanupMinutes() int {
+	return s.sessionOpenMinutes() + 60
+}
+
 // sessionTimezone returns the timezone location for the scheduler.
 // Forex uses the configured timezone (default UTC); equities uses US/Eastern.
 func (s *ORBScheduler) sessionTimezone() *time.Location {
@@ -374,6 +382,13 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	}
 
 	today := time.Date(sessionNow.Year(), sessionNow.Month(), sessionNow.Day(), 0, 0, 0, 0, sessionTZ)
+
+	// Sweep any prior-day sessions that never reached "done" — e.g. because the
+	// process was killed before the cleanup window fired.
+	if err := store.MarkStaleORBSessionsDone(ctx, s.db, today, s.sessionName()); err != nil {
+		slog.Warn("orb: mark stale sessions done failed", "err", err)
+	}
+
 	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
 	if err == nil && existing != nil {
 		if existing.Status == "done" || existing.Status == "skipped" {
@@ -1082,9 +1097,6 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 }
 
 func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
-	h, m, _ := et.Clock()
-	etMinutes := h*60 + m
-
 	// Paper mode: simulate stop order fills by checking current prices.
 	// Real brokers fill stops server-side; PaperExecutor keeps them pending
 	// until we drive fills from market data here.
@@ -1261,8 +1273,14 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 		}
 	}
 
-	// After 10:30 ET, cancel unfilled orders and wrap up
-	if etMinutes >= 10*60+30 {
+	// Cancel unfilled orders and wrap up once we are past the cleanup cutoff.
+	// The cutoff is 60 minutes after session open in the session's own timezone
+	// (09:00 UTC for London, 10:30 ET for New York — matching the prior hardcoded value).
+	sessionTZ := s.sessionTimezone()
+	sessionNow := s.now().In(sessionTZ)
+	sh, sm, _ := sessionNow.Clock()
+	sessionMinutes := sh*60 + sm
+	if sessionMinutes >= s.sessionCleanupMinutes() {
 		if s.executor != nil {
 			sides := [2]string{"buy", "sell"}
 			for ticker, ids := range s.orderIDs {
@@ -1272,7 +1290,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
 					}
 					// Reconcile already-filled orders instead of cancelling them.
 					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
-						slog.Info("orb: 10:30 cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", res.FilledPrice)
+						slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", res.FilledPrice)
 						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, res.FilledPrice)
 						if dbErr != nil {
 							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)

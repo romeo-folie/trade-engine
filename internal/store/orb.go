@@ -74,6 +74,20 @@ func UpdateORBSession(ctx context.Context, db *pgxpool.Pool, id, status string, 
 	return err
 }
 
+// MarkStaleORBSessionsDone marks any in-progress sessions for the given session name
+// whose date is before beforeDate as "done". This prevents sessions from staying stuck
+// in "executing" when the scheduler process is restarted on a later day.
+func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, beforeDate time.Time, sessionName string) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_sessions
+		SET status = 'done', updated_at = NOW()
+		WHERE status IN ('executing', 'range_watch', 'candidate_ready', 'scanning')
+		  AND date < $1
+		  AND session_name = $2`,
+		beforeDate, sessionName)
+	return err
+}
+
 // GetORBSessionByDate retrieves the ORB session for a given date and session name.
 // Returns nil, nil when no session exists for that date/name combination.
 func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName string) (*ORBSession, error) {
