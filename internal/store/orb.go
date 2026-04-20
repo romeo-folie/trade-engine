@@ -75,17 +75,36 @@ func UpdateORBSession(ctx context.Context, db *pgxpool.Pool, id, status string, 
 }
 
 // MarkStaleORBSessionsDone marks any in-progress sessions for the given session name
-// whose date is before beforeDate as "done". This prevents sessions from staying stuck
-// in "executing" when the scheduler process is restarted on a later day.
-func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, beforeDate time.Time, sessionName string) error {
-	_, err := db.Exec(ctx, `
-		UPDATE orb_sessions
-		SET status = 'done', updated_at = NOW()
-		WHERE status IN ('executing', 'range_watch', 'candidate_ready', 'scanning')
-		  AND date < $1
-		  AND session_name = $2`,
-		beforeDate, sessionName)
-	return err
+// whose date is earlier than the cutoff date as "done", and simultaneously expires any
+// pending trades in those sessions. Both updates run in a single transaction so the
+// session and trade state remain consistent.
+func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, cutoffDate time.Time, sessionName string) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	_, err = tx.Exec(ctx, `
+		WITH swept AS (
+			UPDATE orb_sessions
+			SET status = 'done', updated_at = NOW()
+			WHERE status IN ('executing', 'range_watch', 'candidate_ready', 'scanning')
+			  AND date < $1::date
+			  AND session_name = $2
+			RETURNING id
+		)
+		UPDATE orb_trades
+		SET status     = 'expired',
+		    exit_type  = 'expired',
+		    closed_at  = COALESCE(closed_at, NOW())
+		WHERE session_id IN (SELECT id FROM swept)
+		  AND status = 'pending'`,
+		cutoffDate.Format("2006-01-02"), sessionName)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetORBSessionByDate retrieves the ORB session for a given date and session name.

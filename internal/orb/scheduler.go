@@ -265,8 +265,9 @@ func (s *ORBScheduler) sessionOpenMinutes() int {
 // should cancel unfilled orders and mark the session done. Always 60 minutes after open,
 // which preserves the existing 10:30 ET behaviour for equities/NY-forex while giving
 // London (08:00 UTC open) a 09:00 UTC cutoff instead of the previous 14:30 UTC.
+// The result is clamped to the 0–1439 range so late-evening session opens don't overflow.
 func (s *ORBScheduler) sessionCleanupMinutes() int {
-	return s.sessionOpenMinutes() + 60
+	return (s.sessionOpenMinutes() + 60) % (24 * 60)
 }
 
 // sessionTimezone returns the timezone location for the scheduler.
@@ -348,7 +349,7 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	case StateExecuting:
 		return s.tickExecuting(ctx)
 	case StateDone:
-		return s.tickDone(ctx, et)
+		return s.tickDone(ctx)
 	}
 	return nil
 }
@@ -1096,7 +1097,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	return nil
 }
 
-func (s *ORBScheduler) tickDone(ctx context.Context, et time.Time) error {
+func (s *ORBScheduler) tickDone(ctx context.Context) error {
 	// Paper mode: simulate stop order fills by checking current prices.
 	// Real brokers fill stops server-side; PaperExecutor keeps them pending
 	// until we drive fills from market data here.

@@ -91,6 +91,63 @@ func TestSchedulerFuturesMode_SessionOpenMinutes_MetalsOpen(t *testing.T) {
 	}
 }
 
+func TestSessionCleanupMinutes(t *testing.T) {
+	cases := []struct {
+		name    string
+		setup   func(*ORBScheduler)
+		wantMin int // minute-of-day in session TZ
+	}{
+		{
+			name: "equities (09:30 ET open → 10:30 ET cleanup)",
+			setup: func(s *ORBScheduler) {
+				// No forex/futures config → equities default.
+			},
+			wantMin: 10*60 + 30,
+		},
+		{
+			name: "london forex (08:00 UTC open → 09:00 UTC cleanup)",
+			setup: func(s *ORBScheduler) {
+				s.SetForexConfig(&config.ForexORBConfig{Enabled: true, Session: "london", Timezone: "UTC"})
+			},
+			wantMin: 9 * 60,
+		},
+		{
+			name: "newyork forex (13:30 UTC open → 14:30 UTC cleanup)",
+			setup: func(s *ORBScheduler) {
+				s.SetForexConfig(&config.ForexORBConfig{Enabled: true, Session: "newyork", Timezone: "UTC"})
+			},
+			wantMin: 14*60 + 30,
+		},
+		{
+			name: "futures 09:30 ET open → 10:30 ET cleanup",
+			setup: func(s *ORBScheduler) {
+				s.SetFuturesConfig(testFuturesCfg) // SessionOpenET = "09:30"
+			},
+			wantMin: 10*60 + 30,
+		},
+		{
+			name: "futures late-evening open (23:00) does not overflow 1439",
+			setup: func(s *ORBScheduler) {
+				cfg := *testFuturesCfg
+				cfg.SessionOpenET = "23:00"
+				s.SetFuturesConfig(&cfg)
+			},
+			wantMin: 0, // (23*60 + 60) % 1440 = 1440 % 1440 = 0
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newTestScheduler()
+			tc.setup(s)
+			got := s.sessionCleanupMinutes()
+			if got != tc.wantMin {
+				t.Errorf("sessionCleanupMinutes: want %d, got %d", tc.wantMin, got)
+			}
+		})
+	}
+}
+
 func TestSchedulerFuturesMode_InstrumentLookup_Found(t *testing.T) {
 	s := newTestScheduler()
 	s.SetFuturesConfig(testFuturesCfg)
