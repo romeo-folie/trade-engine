@@ -129,22 +129,22 @@ Safe to run multiple times (idempotent).`,
 		defer store.Close()
 
 		ctx := context.Background()
-		today := time.Now().UTC().Truncate(24 * time.Hour)
+		todayStr := time.Now().UTC().Format("2006-01-02")
 
 		rows, err := store.GetDB().Query(ctx, `
 			SELECT id, date, ending_value
 			FROM daily_summaries
-			WHERE date < $1
-			ORDER BY date ASC`, today)
+			WHERE date < $1::date
+			ORDER BY date ASC`, todayStr)
 		if err != nil {
 			return fmt.Errorf("query daily_summaries: %w", err)
 		}
 		defer rows.Close()
 
 		type summaryRow struct {
-			id           string
-			date         time.Time
-			endingValue  float64
+			id          string
+			date        time.Time
+			endingValue float64
 		}
 		var past []summaryRow
 		for rows.Next() {
@@ -154,7 +154,9 @@ Safe to run multiple times (idempotent).`,
 			}
 			past = append(past, r)
 		}
-		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate daily_summaries: %w", err)
+		}
 
 		if len(past) == 0 {
 			fmt.Println("No past daily_summaries rows found — nothing to backfill.")
@@ -172,7 +174,9 @@ Safe to run multiple times (idempotent).`,
 				WHERE created_at < $1
 				ORDER BY created_at DESC LIMIT 1`, dayMidnight).Scan(&prevTotal)
 			if err != nil {
-				// No snapshot before this day — cannot compute baseline; skip.
+				if !store.IsNoRows(err) {
+					return fmt.Errorf("query prior snapshot for %s: %w", r.date.Format("2006-01-02"), err)
+				}
 				fmt.Printf("  skip  %s — no prior snapshot\n", r.date.Format("2006-01-02"))
 				skipped++
 				continue
