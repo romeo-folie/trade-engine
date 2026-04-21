@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -102,8 +103,106 @@ Cleared tables:
 	},
 }
 
+var dbBackfillCmd = &cobra.Command{
+	Use:   "backfill-summaries",
+	Short: "Recompute starting_value, pnl, and pnl_pct for past daily_summaries rows",
+	Long: `Corrects historical daily_summaries rows whose starting_value was set from
+a mid-session snapshot (the old bug) instead of the previous-day closing snapshot.
+
+For each past day it:
+  1. Finds the last portfolio_snapshot written before midnight of that day.
+  2. Uses its total_value as the correct starting_value.
+  3. Recomputes pnl = ending_value - starting_value and pnl_pct accordingly.
+
+Today's row is skipped — the running engine writes it correctly in real time.
+Safe to run multiple times (idempotent).`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.Load()
+		if err != nil {
+			return err
+		}
+		_ = cfg
+
+		if err := store.Connect(context.Background()); err != nil {
+			return fmt.Errorf("connect to database: %w", err)
+		}
+		defer store.Close()
+
+		ctx := context.Background()
+		today := time.Now().UTC().Truncate(24 * time.Hour)
+
+		rows, err := store.GetDB().Query(ctx, `
+			SELECT id, date, ending_value
+			FROM daily_summaries
+			WHERE date < $1
+			ORDER BY date ASC`, today)
+		if err != nil {
+			return fmt.Errorf("query daily_summaries: %w", err)
+		}
+		defer rows.Close()
+
+		type summaryRow struct {
+			id           string
+			date         time.Time
+			endingValue  float64
+		}
+		var past []summaryRow
+		for rows.Next() {
+			var r summaryRow
+			if err := rows.Scan(&r.id, &r.date, &r.endingValue); err != nil {
+				return fmt.Errorf("scan: %w", err)
+			}
+			past = append(past, r)
+		}
+		rows.Close()
+
+		if len(past) == 0 {
+			fmt.Println("No past daily_summaries rows found — nothing to backfill.")
+			return nil
+		}
+
+		updated := 0
+		skipped := 0
+		for _, r := range past {
+			dayMidnight := r.date.UTC().Truncate(24 * time.Hour)
+
+			var prevTotal float64
+			err := store.GetDB().QueryRow(ctx, `
+				SELECT total_value FROM portfolio_snapshots
+				WHERE created_at < $1
+				ORDER BY created_at DESC LIMIT 1`, dayMidnight).Scan(&prevTotal)
+			if err != nil {
+				// No snapshot before this day — cannot compute baseline; skip.
+				fmt.Printf("  skip  %s — no prior snapshot\n", r.date.Format("2006-01-02"))
+				skipped++
+				continue
+			}
+
+			pnl := r.endingValue - prevTotal
+			pnlPct := 0.0
+			if prevTotal > 0 {
+				pnlPct = (pnl / prevTotal) * 100
+			}
+
+			if _, err := store.GetDB().Exec(ctx, `
+				UPDATE daily_summaries
+				SET starting_value=$1, pnl=$2, pnl_pct=$3
+				WHERE id=$4`, prevTotal, pnl, pnlPct, r.id); err != nil {
+				return fmt.Errorf("update %s: %w", r.date.Format("2006-01-02"), err)
+			}
+			fmt.Printf("  fixed %s  starting=%.2f  pnl=%.2f (%.2f%%)\n",
+				r.date.Format("2006-01-02"), prevTotal, pnl, pnlPct)
+			updated++
+		}
+
+		fmt.Printf("\nDone: %d updated, %d skipped (no prior snapshot).\n", updated, skipped)
+		return nil
+	},
+}
+
 func init() {
 	dbResetCmd.Flags().BoolVarP(&dbResetForce, "force", "f", false, "Skip confirmation prompt")
 	dbCmd.AddCommand(dbResetCmd)
+	dbCmd.AddCommand(dbBackfillCmd)
 	rootCmd.AddCommand(dbCmd)
 }
