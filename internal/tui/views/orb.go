@@ -186,7 +186,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 
 		colFmt := "  %-6s %-4s  entry=%7.4f  stop=%7.4f  target=%7.4f  qty=%-4d  [%-9s]%s\n"
 		var totalCost, totalPnL float64
-		var wins, losses int
+		var wins, losses, closedCount int
 		for _, t := range data.Trades {
 			extra := ""
 			if t.FillPrice != 0 {
@@ -194,19 +194,20 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 				totalCost += cost
 				extra = fmt.Sprintf("  fill=%.4f  cost=$%.2f", t.FillPrice, cost)
 			}
-			if t.Status == "closed" && t.ExitPrice != 0 {
-				exitLabel := t.ExitType
-				if exitLabel == "" {
-					exitLabel = "exit"
-				}
-				extra += fmt.Sprintf("  %s=%.4f", exitLabel, t.ExitPrice)
-			}
-			if t.PnL != 0 {
+			if t.Status == "closed" {
+				closedCount++
 				totalPnL += t.PnL
 				if t.PnL > 0 {
 					wins++
-				} else {
+				} else if t.PnL < 0 {
 					losses++
+				}
+				if t.ExitPrice != 0 {
+					exitLabel := t.ExitType
+					if exitLabel == "" {
+						exitLabel = "exit"
+					}
+					extra += fmt.Sprintf("  %s=%.4f", exitLabel, t.ExitPrice)
 				}
 				extra += fmt.Sprintf("  PnL:%s", colorPnL(t.PnL))
 			}
@@ -217,12 +218,12 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 		}
 
 		// Session summary line
-		if totalCost > 0 || totalPnL != 0 {
+		if totalCost > 0 || closedCount > 0 {
 			summaryParts := []string{}
 			if totalCost > 0 {
-				summaryParts = append(summaryParts, fmt.Sprintf("deployed $%.2f", totalCost))
+				summaryParts = append(summaryParts, fmt.Sprintf("notional $%.2f", totalCost))
 			}
-			if wins+losses > 0 {
+			if closedCount > 0 {
 				summaryParts = append(summaryParts,
 					fmt.Sprintf("W:%d L:%d", wins, losses))
 				summaryParts = append(summaryParts,
