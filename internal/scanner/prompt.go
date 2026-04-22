@@ -36,8 +36,9 @@ type SwingScoreResult struct {
 }
 
 // BuildSwingPrompt constructs the system and user prompts for swing-trade candidate scoring.
-func BuildSwingPrompt(candidate SwingCandidate) (systemPrompt, userMessage string) {
-	systemPrompt = `You are an expert swing trader and market analyst. Your role is to evaluate intraday market screener candidates and determine whether they are worth adding to a swing-trade watchlist for further analysis.
+// minConviction is injected from config so the prompt threshold always matches runtime behaviour.
+func BuildSwingPrompt(candidate SwingCandidate, minConviction float64) (systemPrompt, userMessage string) {
+	systemPrompt = fmt.Sprintf(`You are an expert swing trader and market analyst. Your role is to evaluate intraday market screener candidates and determine whether they are worth adding to a swing-trade watchlist for further analysis.
 
 You MUST respond with ONLY a valid JSON object matching this exact schema:
 {
@@ -51,7 +52,7 @@ You MUST respond with ONLY a valid JSON object matching this exact schema:
 }
 
 Rules:
-- action "add" only when conviction >= 0.65
+- action "add" when conviction >= %.2f; "skip" otherwise
 - "add" signals: strong news catalyst, unusual volume with price confirmation, momentum continuation above key levels, clear oversold setup with reversal signal
 - "skip" signals: no identifiable catalyst, purely noise-driven movement, already extended past reasonable entry, penny stock / very low float risk
 - strategy must match the setup:
@@ -60,7 +61,7 @@ Rules:
     - volume_surge without directional news → "momentum"
     - oversold_bounce → "mean_reversion"
 - timeframes: swing trades generally use "1D" as primary; add "4H" for momentum setups or when entry timing matters
-- Be selective — most candidates should be skipped. A focused watchlist beats a bloated one.`
+- This is a discovery watchlist — add anything with a credible setup worth monitoring; the trading engine applies its own signal gates before acting.`, minConviction)
 
 	var sb strings.Builder
 	direction := "up"
