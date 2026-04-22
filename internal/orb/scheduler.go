@@ -106,8 +106,9 @@ type ORBScheduler struct {
 	candidates     []ScoredCandidate
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
-	trackedTrades  map[string]*trackedTrade // entry order ID → trade context + exit state
-	lastScan       time.Time         // Eastern Time of the last successful scan
+	trackedTrades      map[string]*trackedTrade // entry order ID → trade context + exit state
+	reconciledSessions map[string]struct{}      // session IDs already reconciled on startup
+	lastScan           time.Time                // Eastern Time of the last successful scan
 	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
 	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
 }
@@ -146,7 +147,8 @@ func NewORBScheduler(
 		state:         StateIdle,
 		rangeBuffers:  make(map[string]*RangeBuffer),
 		orderIDs:      make(map[string][2]string),
-		trackedTrades: make(map[string]*trackedTrade),
+		trackedTrades:      make(map[string]*trackedTrade),
+		reconciledSessions: make(map[string]struct{}),
 		fetchFailures:    make(map[string]int),
 		fetchLastAttempt: make(map[string]time.Time),
 	}
@@ -1372,6 +1374,14 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 // It polls IBKR once for each outstanding TP/SL order and closes the DB record
 // if it finds a fill, preventing trades from staying "filled" indefinitely.
 func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID string) {
+	if _, done := s.reconciledSessions[sessionID]; done {
+		return
+	}
+	s.reconciledSessions[sessionID] = struct{}{}
+
+	if s.db == nil {
+		return
+	}
 	trades, err := store.GetORBTrades(ctx, s.db, sessionID)
 	if err != nil {
 		slog.Warn("orb: reconcile: load trades failed", "session_id", sessionID, "err", err)
