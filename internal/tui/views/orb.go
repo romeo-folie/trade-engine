@@ -184,17 +184,11 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 		sb.WriteString("\n")
 		sb.WriteString(labelStyle.Render("Trades:") + "\n")
 
-		colFmt := "  %-6s %-4s  entry=%7.4f  stop=%7.4f  target=%7.4f  qty=%-4d  [%-9s]%s\n"
 		var totalCost, totalPnL float64
 		var wins, losses, closedCount int
 		for _, t := range data.Trades {
-			extra := ""
-			if t.FillPrice != 0 {
-				cost := t.FillPrice * float64(t.Qty)
-				totalCost += cost
-				extra = fmt.Sprintf("  fill=%.4f  cost=$%.2f", t.FillPrice, cost)
-			}
-			if t.Status == "closed" {
+			switch t.Status {
+			case "closed":
 				closedCount++
 				totalPnL += t.PnL
 				if t.PnL > 0 {
@@ -202,19 +196,39 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 				} else if t.PnL < 0 {
 					losses++
 				}
-				if t.ExitPrice != 0 {
-					exitLabel := t.ExitType
-					if exitLabel == "" {
-						exitLabel = "exit"
-					}
-					extra += fmt.Sprintf("  %s=%.4f", exitLabel, t.ExitPrice)
+				if t.FillPrice != 0 {
+					totalCost += t.FillPrice * float64(t.Qty)
 				}
-				extra += fmt.Sprintf("  PnL:%s", colorPnL(t.PnL))
+				exitStr := ""
+				if t.ExitPrice != 0 {
+					exitStr = fmt.Sprintf(" → %.4f", t.ExitPrice)
+				}
+				fillStr := "—"
+				if t.FillPrice != 0 {
+					fillStr = fmt.Sprintf("%.4f", t.FillPrice)
+				}
+				fmt.Fprintf(&sb, "  %-6s %-4s  [%-8s]  qty=%-4d  %s%s   PnL:%s\n",
+					t.Ticker, strings.ToUpper(t.Side),
+					orbExitLabel(t.ExitType),
+					t.Qty, fillStr, exitStr,
+					colorPnL(t.PnL))
+			case "filled":
+				if t.FillPrice != 0 {
+					totalCost += t.FillPrice * float64(t.Qty)
+				}
+				fmt.Fprintf(&sb, "  %-6s %-4s  [open    ]  qty=%-4d  fill=%.4f  stop=%.4f  target=%.4f\n",
+					t.Ticker, strings.ToUpper(t.Side),
+					t.Qty, t.FillPrice, t.StopLoss, t.TakeProfit)
+			default:
+				statusLabel := t.Status
+				if len(statusLabel) > 8 {
+					statusLabel = statusLabel[:8]
+				}
+				fmt.Fprintf(&sb, "  %-6s %-4s  [%-8s]  qty=%-4d  entry=%.4f  stop=%.4f  target=%.4f\n",
+					t.Ticker, strings.ToUpper(t.Side),
+					statusLabel,
+					t.Qty, t.EntryStop, t.StopLoss, t.TakeProfit)
 			}
-			fmt.Fprintf(&sb, colFmt,
-				t.Ticker, strings.ToUpper(t.Side),
-				t.EntryStop, t.StopLoss, t.TakeProfit, t.Qty,
-				renderTradeStatus(t.Status), extra)
 		}
 
 		// Session summary line
@@ -224,18 +238,29 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 				summaryParts = append(summaryParts, fmt.Sprintf("notional $%.2f", totalCost))
 			}
 			if closedCount > 0 {
-				summaryParts = append(summaryParts,
-					fmt.Sprintf("W:%d L:%d", wins, losses))
-				summaryParts = append(summaryParts,
-					fmt.Sprintf("net PnL: %s", colorPnL(totalPnL)))
+				summaryParts = append(summaryParts, fmt.Sprintf("W:%d L:%d", wins, losses))
+				summaryParts = append(summaryParts, fmt.Sprintf("net PnL: %s", colorPnL(totalPnL)))
 			}
-			sb.WriteString("  " + labelStyle.Render(strings.Join(summaryParts, "  │  ")) + "\n")
+			sb.WriteString("  " + strings.Join(summaryParts, "  │  ") + "\n")
 		}
 	} else if data.Status != "idle" && data.Status != "" {
 		sb.WriteString("\n" + dimText.Render("  No trades placed this session") + "\n")
 	}
 
 	return sb.String()
+}
+
+func orbExitLabel(exitType string) string {
+	switch exitType {
+	case "tp":
+		return "TP hit"
+	case "stop":
+		return "stopped"
+	case "expired":
+		return "expired"
+	default:
+		return "closed"
+	}
 }
 
 func renderORBStatus(status string) string {
@@ -258,18 +283,4 @@ func renderORBStatus(status string) string {
 	}
 }
 
-func renderTradeStatus(status string) string {
-	switch status {
-	case "filled":
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("220")).Render("filled")
-	case "closed":
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("46")).Render("closed")
-	case "cancelled":
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("245")).Render("cancelled")
-	case "pending":
-		return lipgloss.NewStyle().Foreground(lipgloss.Color("33")).Render("pending")
-	default:
-		return status
-	}
-}
 

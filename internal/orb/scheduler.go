@@ -393,6 +393,11 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
 	if err == nil && existing != nil {
 		if existing.Status == "done" || existing.Status == "skipped" {
+			// Reconcile any filled-but-unclosed trades whose TP/SL may have
+			// filled in IBKR while the engine was down.
+			if existing.Status == "done" && s.executor != nil {
+				s.reconcileDoneSessionTrades(ctx, existing.ID)
+			}
 			return nil
 		}
 
@@ -1360,6 +1365,48 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		})
 	}
 	return nil
+}
+
+// reconcileDoneSessionTrades checks filled-but-unclosed trades from a session
+// that was already marked done (e.g. TE was restarted after session ended).
+// It polls IBKR once for each outstanding TP/SL order and closes the DB record
+// if it finds a fill, preventing trades from staying "filled" indefinitely.
+func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID string) {
+	trades, err := store.GetORBTrades(ctx, s.db, sessionID)
+	if err != nil {
+		slog.Warn("orb: reconcile: load trades failed", "session_id", sessionID, "err", err)
+		return
+	}
+	for _, t := range trades {
+		if t.Status != "filled" || (t.TpOrderID == "" && t.SlOrderID == "") {
+			continue
+		}
+		type exitCandidate struct {
+			orderID  string
+			exitType string
+		}
+		for _, ec := range []exitCandidate{
+			{t.TpOrderID, "tp"},
+			{t.SlOrderID, "stop"},
+		} {
+			if ec.orderID == "" {
+				continue
+			}
+			res, err := s.executor.GetOrderStatus(ctx, ec.orderID)
+			if err != nil || res.Status != "filled" {
+				continue
+			}
+			pnl := exitPnL(t.Side, t.FillPrice, res.FilledPrice, t.Qty)
+			slog.Info("orb: reconcile: exit found",
+				"ticker", t.Ticker, "exit_type", ec.exitType,
+				"exit_price", res.FilledPrice, "pnl", pnl,
+			)
+			if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, ec.exitType, res.FilledPrice, pnl); dbErr != nil {
+				slog.Error("orb: reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
+			}
+			break
+		}
+	}
 }
 
 func (s *ORBScheduler) notify(ctx context.Context, msg string) {

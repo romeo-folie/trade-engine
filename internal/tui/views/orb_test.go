@@ -48,8 +48,8 @@ func TestRenderORBPanelWithTrades(t *testing.T) {
 		},
 	}
 	out := RenderORBPanel(data, 80)
-	if !strings.Contains(out, "closed") {
-		t.Error("expected 'closed' status in trade")
+	if !strings.Contains(out, "TP hit") {
+		t.Error("expected 'TP hit' exit label in trade row")
 	}
 	if !strings.Contains(out, "PnL") {
 		t.Error("expected PnL in output")
@@ -65,11 +65,7 @@ func TestRenderORBPanelCostBasis(t *testing.T) {
 		},
 	}
 	out := RenderORBPanel(data, 120)
-	// cost = 150.20 * 10 = 1502.00
-	if !strings.Contains(out, "cost=$1502.00") {
-		t.Errorf("expected 'cost=$1502.00' in output, got:\n%s", out)
-	}
-	// filled trade with no exit → no footer W/L section, but notional should appear
+	// cost = 150.20 * 10 = 1502.00; per-trade row no longer shows cost, only summary footer does
 	if !strings.Contains(out, "notional $1502.00") {
 		t.Errorf("expected 'notional $1502.00' in footer, got:\n%s", out)
 	}
