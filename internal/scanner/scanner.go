@@ -351,7 +351,7 @@ func (s *MarketScanner) enrichWithNews(ctx context.Context, candidates []SwingCa
 
 // scoreCandidate calls the LLM scorer for a single candidate.
 func (s *MarketScanner) scoreCandidate(ctx context.Context, candidate SwingCandidate) (SwingScoreResult, error) {
-	sysPrompt, userMsg := BuildSwingPrompt(candidate)
+	sysPrompt, userMsg := BuildSwingPrompt(candidate, s.Cfg.MinConviction)
 
 	resp, meta, err := s.Analyzer.Analyze(ctx, analysis.AnalysisRequest{
 		Ticker:             candidate.Ticker,
