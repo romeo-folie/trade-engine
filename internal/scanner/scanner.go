@@ -366,12 +366,21 @@ func (s *MarketScanner) scoreCandidate(ctx context.Context, candidate SwingCandi
 }
 
 // parseSwingResult extracts the structured result from the LLM's raw response.
+// Tolerant to casing, markdown fences, and chatter around the JSON block — the
+// generic extractAnalysisJSON already accepts all of these, so this parser must
+// too or candidates are silently downgraded to "skip" despite stage-1 success.
 func parseSwingResult(rawResponse string, fallback analysis.AnalysisResponse) SwingScoreResult {
 	raw := strings.TrimSpace(rawResponse)
 	raw = strings.TrimPrefix(raw, "```json")
 	raw = strings.TrimPrefix(raw, "```")
 	raw = strings.TrimSuffix(raw, "```")
 	raw = strings.TrimSpace(raw)
+
+	if !strings.HasPrefix(raw, "{") {
+		if start, end := strings.Index(raw, "{"), strings.LastIndex(raw, "}"); start >= 0 && end > start {
+			raw = raw[start : end+1]
+		}
+	}
 
 	var parsed struct {
 		Action     string   `json:"action"`
@@ -383,22 +392,30 @@ func parseSwingResult(rawResponse string, fallback analysis.AnalysisResponse) Sw
 		Risks      []string `json:"risks"`
 	}
 
-	if err := json.Unmarshal([]byte(raw), &parsed); err == nil &&
-		(parsed.Action == "add" || parsed.Action == "skip") {
-		return SwingScoreResult{
-			Action:     parsed.Action,
-			Conviction: parsed.Conviction,
-			SetupType:  parsed.SetupType,
-			Strategy:   parsed.Strategy,
-			Timeframes: parsed.Timeframes,
-			Reasoning:  parsed.Reasoning,
-			Risks:      parsed.Risks,
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+		action := strings.ToLower(strings.TrimSpace(parsed.Action))
+		if action == "add" || action == "skip" {
+			return SwingScoreResult{
+				Action:     action,
+				Conviction: parsed.Conviction,
+				SetupType:  parsed.SetupType,
+				Strategy:   parsed.Strategy,
+				Timeframes: parsed.Timeframes,
+				Reasoning:  parsed.Reasoning,
+				Risks:      parsed.Risks,
+			}
 		}
 	}
 
-	// Fallback: map standard AnalysisResponse to a skip result.
+	// Defense-in-depth fallback. Prefer the action the generic extractor already
+	// normalized over a blind "skip" — otherwise any response that survives
+	// extractAnalysisJSON but trips this local parse is silently dropped.
+	action := "skip"
+	if fallback.Action == analysis.ActionAdd {
+		action = "add"
+	}
 	return SwingScoreResult{
-		Action:     "skip",
+		Action:     action,
 		Conviction: fallback.Confidence,
 		Reasoning:  fallback.Reasoning,
 	}
