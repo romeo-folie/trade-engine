@@ -20,6 +20,7 @@ const (
 	ActionWait  Action = "WAIT"  // real catalyst, poor entry timing — re-evaluate next tick
 	ActionTrade Action = "TRADE" // ORB mode: candidate passes the gate
 	ActionSkip  Action = "SKIP"  // ORB mode: candidate filtered out
+	ActionAdd   Action = "ADD"   // scanner mode: candidate should be added to the watchlist
 )
 
 // AnalysisRequest carries everything a model needs to produce a recommendation.

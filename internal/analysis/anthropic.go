@@ -240,7 +240,7 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 
 	// Validate required fields.
 	switch result.Action {
-	case ActionBuy, ActionSell, ActionHold, ActionWait, ActionTrade, ActionSkip:
+	case ActionBuy, ActionSell, ActionHold, ActionWait, ActionTrade, ActionSkip, ActionAdd:
 	default:
 		return AnalysisResponse{}, fmt.Errorf("invalid action %q", result.Action)
 	}
@@ -251,7 +251,7 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 	// Enforce invariant: non-directional actions must never carry position sizing.
 	// Applied here (before any persistence path) so stored analyses are always
 	// consistent, regardless of which code path calls extractAnalysisJSON.
-	if result.Action == ActionHold || result.Action == ActionWait {
+	if result.Action == ActionHold || result.Action == ActionWait || result.Action == ActionAdd {
 		result.SizePct = 0
 		result.StopLoss = 0
 		result.TakeProfit = 0
