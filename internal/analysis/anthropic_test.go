@@ -121,6 +121,32 @@ func TestExtractAnalysisJSON_AcceptsORBSkipAction(t *testing.T) {
 	}
 }
 
+// Swing scanner mode returns "add" or "skip". "add" must be accepted so the
+// market scanner does not drop every candidate with an "invalid action" error.
+func TestExtractAnalysisJSON_AcceptsScannerAddAction(t *testing.T) {
+	raw := `{"action":"add","conviction":0.65,"setup_type":"news_catalyst","strategy":"news_sentiment","timeframes":["1D"],"reasoning":"earnings beat"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionAdd {
+		t.Fatalf("action = %q, want ADD", got.Action)
+	}
+}
+
+// ADD is non-directional; any sizing/stop/target fields must be zeroed, matching
+// the invariant already enforced for HOLD and WAIT.
+func TestExtractAnalysisJSON_AddZerosSizePct(t *testing.T) {
+	raw := `{"action":"add","confidence":0.70,"size_pct":2.0,"stop_loss":150.0,"take_profit":160.0,"reasoning":"watchlist candidate"}`
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.SizePct != 0 || got.StopLoss != 0 || got.TakeProfit != 0 {
+		t.Fatalf("ADD must zero size/stop/target, got size=%v stop=%v tp=%v", got.SizePct, got.StopLoss, got.TakeProfit)
+	}
+}
+
 func TestExtractAnalysisJSON_RecoversTruncatedJSON(t *testing.T) {
 	raw := "{\n \"action\": \"buy\",\n \"confidence\": 0.75,\n \"size_pct\": 2.0,\n \"stop_loss\": 100,\n \"take_profit\": 110,\n \"reasoning\": \"truncated"
 	got, err := extractAnalysisJSON(raw)
