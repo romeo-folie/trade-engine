@@ -56,27 +56,25 @@ models:
       temperature: 0.1
       timeout_sec: 90
     classifier:
-      provider: deepseek
-      model: deepseek-chat
-      api_key_env: DEEPSEEK_API_KEY
+      provider: google
+      model: gemini-2.5-flash-lite
+      api_key_env: GEMINI_API_KEY
       max_tokens: 256
       temperature: 0.0
       timeout_sec: 15
-    # classifier (OpenAI alternative):
-    #   provider: openai
-    #   model: gpt-4o-mini
-    #   api_key_env: OPENAI_API_KEY
+    # classifier (alternatives):
+    #   provider: deepseek / model: deepseek-chat / api_key_env: DEEPSEEK_API_KEY
+    #   provider: openai   / model: gpt-4o-mini   / api_key_env: OPENAI_API_KEY
     news_enricher:
-      provider: deepseek
-      model: deepseek-chat
-      api_key_env: DEEPSEEK_API_KEY
+      provider: google
+      model: gemini-2.5-flash-lite
+      api_key_env: GEMINI_API_KEY
       max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
-    # news_enricher (OpenAI alternative):
-    #   provider: openai
-    #   model: gpt-4o-mini
-    #   api_key_env: OPENAI_API_KEY
+    # news_enricher (alternatives):
+    #   provider: deepseek / model: deepseek-chat / api_key_env: DEEPSEEK_API_KEY
+    #   provider: openai   / model: gpt-4o-mini   / api_key_env: OPENAI_API_KEY
     embedder:
       provider: ollama
       model: nomic-embed-text
@@ -160,10 +158,10 @@ markets:
 
     # Knowledge extraction controls (cost/rate guardrails)
     extraction_enabled: true
-    extraction_provider: deepseek  # use a single provider for extraction path; supported: anthropic | openai | deepseek | google | ollama
-    extraction_model: deepseek-chat # must exist in configured model clients; no cross-provider fallback
-    # extraction_provider: openai  # OpenAI alternative
-    # extraction_model: gpt-4o
+    extraction_provider: google    # use a single provider for extraction path; supported: anthropic | openai | deepseek | google | ollama
+    extraction_model: gemini-2.5-flash-lite # must exist in configured model clients; no cross-provider fallback
+    # extraction_provider: deepseek / extraction_model: deepseek-chat  (alternative)
+    # extraction_provider: openai   / extraction_model: gpt-4o         (alternative)
     extraction_max_articles_per_tick: 10
     extraction_rpm: 20             # global extraction requests/minute cap
 
