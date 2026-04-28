@@ -108,7 +108,8 @@ type ORBScheduler struct {
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
 	trackedTrades      map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions   map[string]struct{}  // session IDs already reconciled on startup
+	reconciledSessions   map[string]struct{}  // session IDs already processed by reconcileDoneSessionTrades
+	backfilledSessions   map[string]struct{}  // session IDs already processed by backfillRecentExits
 	backfillFired        bool                 // true once the startup trades-feed backfill has run
 	lastExitReconcileAt  time.Time            // wall time of the last per-tick trades-feed reconcile
 	lastScan             time.Time            // Eastern Time of the last successful scan
@@ -152,6 +153,7 @@ func NewORBScheduler(
 		orderIDs:      make(map[string][2]string),
 		trackedTrades:      make(map[string]*trackedTrade),
 		reconciledSessions: make(map[string]struct{}),
+		backfilledSessions: make(map[string]struct{}),
 		fetchFailures:    make(map[string]int),
 		fetchLastAttempt: make(map[string]time.Time),
 	}
@@ -1565,7 +1567,7 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 
 // backfillRecentExits scans done sessions from the last 7 days for any
 // filled-but-unclosed trades and reconciles them via the IBKR trades feed.
-// Runs once per process lifetime in a goroutine from tickIdle.
+// Runs synchronously once per process lifetime from tickIdle.
 func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 	fetcher, ok := s.executor.(TradesFetcher)
 	if !ok {
@@ -1591,7 +1593,7 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 		if sess.Status != "done" {
 			continue
 		}
-		if _, already := s.reconciledSessions[sess.ID]; already {
+		if _, already := s.backfilledSessions[sess.ID]; already {
 			continue
 		}
 		trades, err := store.GetORBTrades(ctx, s.db, sess.ID)
@@ -1611,7 +1613,7 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 		slog.Info("orb: backfill: reconciling session",
 			"session_id", sess.ID, "date", sess.Date.Format("2006-01-02"), "name", sess.SessionName)
 		s.matchExitsFromRecords(ctx, trades, records)
-		s.reconciledSessions[sess.ID] = struct{}{}
+		s.backfilledSessions[sess.ID] = struct{}{}
 	}
 }
 
