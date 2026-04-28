@@ -57,9 +57,9 @@ type LLMClassifier struct {
 // NewLLMClassifier creates a Layer-2 classifier. modelCfg is the resolved
 // registry entry for the "classifier" role.
 //
-// Supported providers: "openai", "deepseek" (OpenAI-compatible endpoint).
-// Unsupported providers or missing API keys return a stub whose Classify
-// always fails open. Use IsSupported() to check before wiring into the gate.
+// The constructor always returns an *LLMClassifier. Unsupported providers or
+// missing API keys are detected by IsSupported(), and classification fails
+// open at runtime on any error. Use IsSupported() before wiring into the gate.
 func NewLLMClassifier(cfg config.ClassifierConfig, modelCfg config.ModelConfig) *LLMClassifier {
 	timeout := 15 * time.Second
 	if modelCfg.TimeoutSec > 0 {
