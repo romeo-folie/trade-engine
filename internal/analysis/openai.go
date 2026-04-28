@@ -18,11 +18,14 @@ import (
 const openAIAPIURL = "https://api.openai.com/v1/chat/completions"
 
 // OpenAIClient implements ModelProvider using the OpenAI Chat Completions API.
+// It is also reused for OpenAI-compatible providers (e.g. DeepSeek) by
+// setting providerOverride and baseURL at construction time.
 type OpenAIClient struct {
-	cfg        config.ModelConfig
-	apiKey     string
-	baseURL    string // overridable for tests; defaults to openAIAPIURL
-	httpClient *http.Client
+	cfg              config.ModelConfig
+	apiKey           string
+	baseURL          string // overridable for tests or compatible providers
+	providerOverride string // non-empty overrides "openai" in ProviderName / meta
+	httpClient       *http.Client
 }
 
 func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
@@ -37,7 +40,12 @@ func NewOpenAIClient(cfg config.ModelConfig) *OpenAIClient {
 	return &OpenAIClient{cfg: cfg, apiKey: apiKey, baseURL: openAIAPIURL, httpClient: &http.Client{Timeout: timeout}}
 }
 
-func (c *OpenAIClient) ProviderName() string { return "openai" }
+func (c *OpenAIClient) ProviderName() string {
+	if c.providerOverride != "" {
+		return c.providerOverride
+	}
+	return "openai"
+}
 func (c *OpenAIClient) ModelName() string    { return c.cfg.Model }
 func (c *OpenAIClient) IsAvailable() bool    { return c.apiKey != "" }
 
@@ -127,7 +135,7 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		rawText = apiResp.Choices[0].Message.Content
 	}
 	meta := ModelCallMeta{
-		Provider: "openai", Model: c.cfg.Model, PromptHash: promptHash,
+		Provider: c.ProviderName(), Model: c.cfg.Model, PromptHash: promptHash,
 		RawPrompt: rawPrompt, RawResponse: rawText,
 		InputTokens: apiResp.Usage.PromptTokens, OutputTokens: apiResp.Usage.CompletionTokens,
 		LatencyMs: latencyMs, IndicatorJSON: indicatorJSON,

@@ -57,22 +57,23 @@ type LLMClassifier struct {
 // NewLLMClassifier creates a Layer-2 classifier. modelCfg is the resolved
 // registry entry for the "classifier" role.
 //
-// Note: the LLM classifier uses the OpenAI Chat Completions API format directly.
-// Only "openai" provider registry entries are supported.
-//
-// Unsupported providers (anything other than "openai") or missing API keys return
-// a stub LLMClassifier whose Classify always fails open without making HTTP calls.
-// Use IsSupported() to check before wiring into the gate.
+// Supported providers: "openai", "deepseek" (OpenAI-compatible endpoint).
+// Unsupported providers or missing API keys return a stub whose Classify
+// always fails open. Use IsSupported() to check before wiring into the gate.
 func NewLLMClassifier(cfg config.ClassifierConfig, modelCfg config.ModelConfig) *LLMClassifier {
 	timeout := 15 * time.Second
 	if modelCfg.TimeoutSec > 0 {
 		timeout = time.Duration(modelCfg.TimeoutSec) * time.Second
 	}
+	baseURL := "https://api.openai.com/v1/chat/completions"
+	if modelCfg.Provider == "deepseek" {
+		baseURL = "https://api.deepseek.com/v1/chat/completions"
+	}
 	return &LLMClassifier{
 		cfg:        cfg,
 		modelCfg:   modelCfg,
 		httpClient: &http.Client{Timeout: timeout},
-		baseURL:    "https://api.openai.com/v1/chat/completions",
+		baseURL:    baseURL,
 	}
 }
 
@@ -80,7 +81,8 @@ func NewLLMClassifier(cfg config.ClassifierConfig, modelCfg config.ModelConfig) 
 // incompatible with the LLM classifier. The gate should skip wiring Layer 2
 // when this returns false.
 func (l *LLMClassifier) IsSupported() bool {
-	return l.modelCfg.Provider == "openai" && l.modelCfg.APIKey != ""
+	supported := l.modelCfg.Provider == "openai" || l.modelCfg.Provider == "deepseek"
+	return supported && l.modelCfg.APIKey != ""
 }
 
 // SetBaseURL overrides the API endpoint. Used in tests to inject a test server.
