@@ -466,7 +466,7 @@ export default function TradesScreen() {
           },
         ]}
         actions={[
-          { label: 'EXPORT CSV', onClick: handleExport },
+          { label: 'COPY CSV', onClick: handleExport },
         ]}
       />
 

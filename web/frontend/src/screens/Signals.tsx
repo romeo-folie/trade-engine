@@ -330,7 +330,7 @@ export default function SignalsScreen() {
 
       <div className={styles.header}>
         <h1 className={styles.pageTitle}>SIGNALS</h1>
-        <button className={styles.exportBtn} onClick={handleExport} title="Exports loaded rows">EXPORT CSV</button>
+        <button className={styles.exportBtn} onClick={handleExport} title="Copies loaded rows as CSV to clipboard">COPY CSV</button>
       </div>
 
       {fetchError && (

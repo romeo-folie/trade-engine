@@ -72,7 +72,7 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 	if activeOnly {
 		q += " WHERE active = true AND (expires_at IS NULL OR expires_at > NOW())"
 	}
-	q += " ORDER BY created_at ASC"
+	q += " ORDER BY created_at DESC"
 
 	rows, err := GetDB().Query(ctx, q)
 	if err != nil {
