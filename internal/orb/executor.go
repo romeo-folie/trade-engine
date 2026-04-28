@@ -10,6 +10,13 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
+// TradesFetcher is satisfied by brokers that can return a recent execution history.
+// The ORB reconciler uses it to match bracket exit fills back to DB records without
+// depending on child order IDs that may not have been captured at placement time.
+type TradesFetcher interface {
+	FetchTradeRecords(ctx context.Context, days int) ([]execution.IBKRTradeRecord, error)
+}
+
 // BracketParams holds the computed bracket order parameters.
 type BracketParams struct {
 	Ticker     string

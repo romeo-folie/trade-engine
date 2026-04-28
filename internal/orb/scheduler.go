@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -107,8 +108,11 @@ type ORBScheduler struct {
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
 	trackedTrades      map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions map[string]struct{}      // session IDs already reconciled on startup
-	lastScan           time.Time                // Eastern Time of the last successful scan
+	reconciledSessions   map[string]struct{}  // session IDs already processed by reconcileDoneSessionTrades
+	backfilledSessions   map[string]struct{}  // session IDs already processed by backfillRecentExits
+	backfillFired        bool                 // true once the startup trades-feed backfill has run
+	lastExitReconcileAt  time.Time            // wall time of the last per-tick trades-feed reconcile
+	lastScan             time.Time            // Eastern Time of the last successful scan
 	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
 	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
 }
@@ -149,6 +153,7 @@ func NewORBScheduler(
 		orderIDs:      make(map[string][2]string),
 		trackedTrades:      make(map[string]*trackedTrade),
 		reconciledSessions: make(map[string]struct{}),
+		backfilledSessions: make(map[string]struct{}),
 		fetchFailures:    make(map[string]int),
 		fetchLastAttempt: make(map[string]time.Time),
 	}
@@ -390,6 +395,13 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	// process was killed before the cleanup window fired.
 	if err := store.MarkStaleORBSessionsDone(ctx, s.db, today, s.sessionName()); err != nil {
 		slog.Warn("orb: mark stale sessions done failed", "err", err)
+	}
+
+	// Once per process lifetime: reconcile any filled-but-unclosed trades across
+	// all recent done sessions (up to 7 days) using the IBKR trades feed.
+	if !s.backfillFired {
+		s.backfillFired = true
+		s.backfillRecentExits(ctx)
 	}
 
 	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
@@ -1281,6 +1293,24 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		}
 	}
 
+	// Trades-feed reconcile: catch any exits that the order-ID-based loop missed
+	// (e.g. when child IDs were not captured at placement due to confirmation-prompt
+	// flow). Throttled to once per minute to stay well within IBKR's 10 req/s limit.
+	if time.Since(s.lastExitReconcileAt) >= time.Minute {
+		s.mu.Lock()
+		var liveSessionID string
+		if s.session != nil {
+			liveSessionID = s.session.ID
+		}
+		s.mu.Unlock()
+		if liveSessionID != "" && s.db != nil {
+			if trades, err := store.GetORBTrades(ctx, s.db, liveSessionID); err == nil {
+				s.reconcileExitsFromTrades(ctx, liveSessionID, trades)
+				s.lastExitReconcileAt = time.Now()
+			}
+		}
+	}
+
 	// Cancel unfilled orders and wrap up once we are past the cleanup cutoff.
 	// The cutoff is 60 minutes after session open in the session's own timezone
 	// (09:00 UTC for London, 10:30 ET for New York — matching the prior hardcoded value).
@@ -1387,6 +1417,8 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 		slog.Warn("orb: reconcile: load trades failed", "session_id", sessionID, "err", err)
 		return
 	}
+
+	// Fast path: order-ID-based reconcile for trades where we captured child IDs.
 	for _, t := range trades {
 		if t.Status != "filled" || (t.TpOrderID == "" && t.SlOrderID == "") {
 			continue
@@ -1417,6 +1449,10 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 			break
 		}
 	}
+
+	// Fallback: trades-feed reconcile catches fills where child IDs were not captured
+	// (e.g. confirmation-prompt flow dropped them) or where GetOrderStatus aged out.
+	s.reconcileExitsFromTrades(ctx, sessionID, trades)
 }
 
 func (s *ORBScheduler) notify(ctx context.Context, msg string) {
@@ -1424,6 +1460,161 @@ func (s *ORBScheduler) notify(ctx context.Context, msg string) {
 		return
 	}
 	_ = s.notifier.Notify(ctx, msg)
+}
+
+// reconcileExitsFromTrades fetches recent fills from the IBKR trades endpoint and
+// matches them to any filled-but-unclosed ORB trades for the given session.
+// It is the primary reconciliation mechanism when child order IDs are unavailable.
+func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID string, trades []store.ORBTrade) {
+	fetcher, ok := s.executor.(TradesFetcher)
+	if !ok {
+		return // executor doesn't expose trade history (e.g. Alpaca, PaperExecutor)
+	}
+	var hasFilled bool
+	for _, t := range trades {
+		if t.Status == "filled" {
+			hasFilled = true
+			break
+		}
+	}
+	if !hasFilled {
+		return
+	}
+	records, err := fetcher.FetchTradeRecords(ctx, 7)
+	if err != nil {
+		slog.Warn("orb: exit reconcile: fetch trade records failed", "session_id", sessionID, "err", err)
+		return
+	}
+	s.matchExitsFromRecords(ctx, trades, records)
+}
+
+// matchExitsFromRecords attributes IBKR fill records to filled-but-unclosed ORB trades
+// using a tuple match: same symbol, opposite side, same qty, fill time after entry, and
+// price within 10% of the TP–SL range of one of the bracket levels.
+func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store.ORBTrade, records []execution.IBKRTradeRecord) {
+	for i := range trades {
+		t := &trades[i]
+		if t.Status != "filled" || t.FillPrice == 0 {
+			continue
+		}
+
+		// Use ClosedAt (entry fill time) as the lower bound, minus a 60s buffer to
+		// account for the poll lag between the actual IBKR fill and when we persisted
+		// it. This prevents filtering out legitimate exits that arrived quickly after
+		// the entry fill while still rejecting fills that predate the order placement.
+		entryTime := t.CreatedAt
+		if t.ClosedAt != nil {
+			buffered := t.ClosedAt.Add(-60 * time.Second)
+			if buffered.After(t.CreatedAt) {
+				entryTime = buffered
+			}
+		}
+
+		exitSide := "sell"
+		if t.Side == "sell" {
+			exitSide = "buy"
+		}
+
+		// Allow a 10% tolerance relative to the bracket range so minor slippage
+		// on the stop leg doesn't prevent attribution.
+		tolerance := math.Abs(t.TakeProfit-t.StopLoss) * 0.1
+		if tolerance == 0 {
+			tolerance = t.FillPrice * 0.001 // fallback: 0.1% of fill price
+		}
+
+		for _, rec := range records {
+			if rec.Symbol != t.Ticker {
+				continue
+			}
+			if rec.Side != exitSide {
+				continue
+			}
+			if math.Abs(rec.Qty-float64(t.Qty)) > 0.5 {
+				continue
+			}
+			if !rec.FilledAt.After(entryTime) {
+				continue
+			}
+
+			diffTP := math.Abs(rec.Price - t.TakeProfit)
+			diffSL := math.Abs(rec.Price - t.StopLoss)
+			if diffTP > tolerance && diffSL > tolerance {
+				continue // fill price not near either bracket level
+			}
+
+			exitType := "tp"
+			if diffSL < diffTP {
+				exitType = "stop"
+			}
+
+			pnl := exitPnL(t.Side, t.FillPrice, rec.Price, t.Qty)
+			slog.Info("orb: exit reconcile: matched",
+				"ticker", t.Ticker, "side", t.Side,
+				"exit_type", exitType, "exit_price", rec.Price,
+				"entry_price", t.FillPrice, "pnl", pnl,
+			)
+			// Mark in-memory so subsequent iterations in this pass skip it.
+			t.Status = "closed"
+			if s.db != nil {
+				if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, exitType, rec.Price, pnl); dbErr != nil {
+					slog.Error("orb: exit reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
+				}
+			}
+			break
+		}
+	}
+}
+
+// backfillRecentExits scans done sessions from the last 7 days for any
+// filled-but-unclosed trades and reconciles them via the IBKR trades feed.
+// Runs synchronously once per process lifetime from tickIdle.
+func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
+	fetcher, ok := s.executor.(TradesFetcher)
+	if !ok {
+		return
+	}
+	if s.db == nil {
+		return
+	}
+
+	records, err := fetcher.FetchTradeRecords(ctx, 7)
+	if err != nil {
+		slog.Warn("orb: backfill: fetch trade records failed", "err", err)
+		return
+	}
+
+	sessions, err := store.GetRecentORBSessions(ctx, s.db, 20)
+	if err != nil {
+		slog.Warn("orb: backfill: load sessions failed", "err", err)
+		return
+	}
+
+	for _, sess := range sessions {
+		if sess.Status != "done" {
+			continue
+		}
+		if _, already := s.backfilledSessions[sess.ID]; already {
+			continue
+		}
+		trades, err := store.GetORBTrades(ctx, s.db, sess.ID)
+		if err != nil {
+			continue
+		}
+		var hasFilled bool
+		for _, t := range trades {
+			if t.Status == "filled" {
+				hasFilled = true
+				break
+			}
+		}
+		if !hasFilled {
+			continue
+		}
+		slog.Info("orb: backfill: reconciling session",
+			"session_id", sess.ID, "date", sess.Date.Format("2006-01-02"), "name", sess.SessionName)
+		s.matchExitsFromRecords(ctx, trades, records)
+		s.backfilledSessions[sess.ID] = struct{}{}
+	}
 }
 
 // orbRawResponse is the full JSON schema returned by the ORB custom system prompt.

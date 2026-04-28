@@ -92,47 +92,66 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 	return b.resolveOrderResponse(ctx, rawResp)
 }
 
-// resolveOrderResponse handles IBKR's two-step order confirmation flow.
+// resolveOrderResponse handles IBKR's multi-step order confirmation flow.
 // On success the gateway returns [{order_id, order_status, ...}].
 // On a compliance/confirmation prompt it returns [{id, message, ...}]; we
 // auto-confirm by POSTing {"confirmed": true} to /iserver/reply/{replyId}.
+// Bracket orders commonly trigger 2–3 sequential prompts before all order IDs
+// are returned, so we loop up to maxConfirmRounds rather than recursing once.
 func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessage) (OrderResult, error) {
-	// Try direct order result first.
+	const maxConfirmRounds = 5
+	current := raw
+	for range maxConfirmRounds {
+		if result, ok := parseIBKROrderResult(current); ok {
+			return result, nil
+		}
+
+		// Check for a reply (confirmation) prompt.
+		var replyPrompts []struct {
+			ID      string   `json:"id"`
+			Message []string `json:"message"`
+		}
+		if err := json.Unmarshal(current, &replyPrompts); err != nil || len(replyPrompts) == 0 || replyPrompts[0].ID == "" {
+			return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: unexpected response: %s", current)
+		}
+
+		replyID := replyPrompts[0].ID
+		var confirmed json.RawMessage
+		if err := b.do(ctx, http.MethodPost, "/v1/api/iserver/reply/"+replyID, map[string]bool{"confirmed": true}, &confirmed); err != nil {
+			return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: confirm reply %s: %w", replyID, err)
+		}
+		current = confirmed
+	}
+	// One final parse: the last confirmation round may have returned order IDs
+	// directly and the loop exited before checking them.
+	if result, ok := parseIBKROrderResult(current); ok {
+		return result, nil
+	}
+	return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: exceeded %d confirmation rounds", maxConfirmRounds)
+}
+
+// parseIBKROrderResult attempts to decode raw as a direct order-result array.
+// Returns the populated OrderResult and true on success; zero value and false otherwise.
+func parseIBKROrderResult(raw json.RawMessage) (OrderResult, bool) {
 	var orderResults []struct {
 		OrderID     string `json:"order_id"`
 		OrderStatus string `json:"order_status"`
 	}
-	if err := json.Unmarshal(raw, &orderResults); err == nil && len(orderResults) > 0 && orderResults[0].OrderID != "" {
-		r := orderResults[0]
-		result := OrderResult{
-			BrokerOrderID: r.OrderID,
-			Status:        NormalizeIBKROrderStatus(r.OrderStatus),
+	if err := json.Unmarshal(raw, &orderResults); err != nil || len(orderResults) == 0 || orderResults[0].OrderID == "" {
+		return OrderResult{}, false
+	}
+	r := orderResults[0]
+	result := OrderResult{
+		BrokerOrderID: r.OrderID,
+		Status:        NormalizeIBKROrderStatus(r.OrderStatus),
+	}
+	// Bracket responses include child order IDs at indices 1 (TP) and 2 (stop-loss).
+	for _, child := range orderResults[1:] {
+		if child.OrderID != "" {
+			result.ChildOrderIDs = append(result.ChildOrderIDs, child.OrderID)
 		}
-		// Bracket responses include child order IDs at indices 1 (TP) and 2 (stop-loss).
-		for _, child := range orderResults[1:] {
-			if child.OrderID != "" {
-				result.ChildOrderIDs = append(result.ChildOrderIDs, child.OrderID)
-			}
-		}
-		return result, nil
 	}
-
-	// Check for a reply (confirmation) prompt.
-	var replyPrompts []struct {
-		ID      string `json:"id"`
-		Message []string `json:"message"`
-	}
-	if err := json.Unmarshal(raw, &replyPrompts); err != nil || len(replyPrompts) == 0 || replyPrompts[0].ID == "" {
-		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: unexpected response: %s", raw)
-	}
-
-	replyID := replyPrompts[0].ID
-	var confirmed json.RawMessage
-	if err := b.do(ctx, http.MethodPost, "/v1/api/iserver/reply/"+replyID, map[string]bool{"confirmed": true}, &confirmed); err != nil {
-		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: confirm reply %s: %w", replyID, err)
-	}
-
-	return b.resolveOrderResponse(ctx, confirmed)
+	return result, true
 }
 
 // CancelOrder sends a DELETE request to cancel an open order.

@@ -166,11 +166,13 @@ func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string
 
 // CloseORBTrade records the outcome of an ORB trade once its exit leg (TP or stop)
 // fills. exitType is "tp", "stop", or "expired". pnl is in quote-currency units.
+// The WHERE clause guards on status='filled' so concurrent reconcilers cannot
+// overwrite an already-closed trade.
 func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType string, exitPrice, pnl float64) error {
 	_, err := db.Exec(ctx, `
 		UPDATE orb_trades
 		SET status='closed', exit_type=$1, exit_price=$2, pnl=$3, closed_at=NOW()
-		WHERE id=$4`,
+		WHERE id=$4 AND status='filled'`,
 		exitType, exitPrice, pnl, id)
 	return err
 }
