@@ -218,10 +218,23 @@
 }
 
 /* ── Watchlist Ticker Pills (inside Alpaca Feed card) ──────────────────── */
+
+@keyframes marqueeScroll {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+
 .tickerPillsWrapper {
   margin-top: 8px;
   overflow: hidden;
   width: 100%;
+}
+
+/* Applied to the duplicated track for seamless infinite scroll.
+   Duration is set inline via animationDuration so it scales with content length. */
+.marqueeTrack {
+  animation: marqueeScroll linear infinite;
+  will-change: transform;
 }
 
 .tickerPillsLabel {
