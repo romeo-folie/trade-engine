@@ -281,6 +281,8 @@ func buildProvider(cfg config.ModelConfig) ModelProvider {
 		return NewAnthropicClient(cfg)
 	case "openai":
 		return NewOpenAIClient(cfg)
+	case "deepseek":
+		return NewDeepSeekClient(cfg)
 	case "google":
 		return NewGeminiClient(cfg)
 	case "ollama":

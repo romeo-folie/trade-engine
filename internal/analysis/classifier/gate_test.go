@@ -148,3 +148,52 @@ func TestGateUnknownModeNormalisedToShadow(t *testing.T) {
 		t.Error("unknown mode must normalise to shadow and never block analysis")
 	}
 }
+
+func TestLLMClassifier_DeepSeek_IsSupported(t *testing.T) {
+	modelCfg := config.ModelConfig{Provider: "deepseek", Model: "deepseek-chat", APIKey: "test-key"}
+	llm := classifier.NewLLMClassifier(testCfg(), modelCfg)
+	if !llm.IsSupported() {
+		t.Error("IsSupported should return true for provider=deepseek with an API key")
+	}
+}
+
+func TestLLMClassifier_DeepSeek_IsSupported_NoKey(t *testing.T) {
+	modelCfg := config.ModelConfig{Provider: "deepseek", Model: "deepseek-chat"}
+	llm := classifier.NewLLMClassifier(testCfg(), modelCfg)
+	if llm.IsSupported() {
+		t.Error("IsSupported should return false when API key is absent")
+	}
+}
+
+func TestLLMClassifier_DeepSeek_UsesDeepSeekEndpoint(t *testing.T) {
+	hitURL := ""
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitURL = r.URL.Path
+		w.Header().Set("Content-Type", "application/json")
+		resp := map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]string{"content": "ANALYZE bullish momentum"}},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	modelCfg := config.ModelConfig{Provider: "deepseek", Model: "deepseek-chat", APIKey: "test-key"}
+	llm := classifier.NewLLMClassifier(testCfg(), modelCfg)
+	llm.SetBaseURL(srv.URL + "/v1/chat/completions")
+
+	s := base()
+	s.RSIDelta = 0
+	s.EMAGapDelta = 0
+	s.PriceMovesPct = 0
+	s.NewsHash = s.LastNewsHash
+
+	_, err := llm.Classify(context.Background(), s)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if hitURL != "/v1/chat/completions" {
+		t.Errorf("request path = %q, want /v1/chat/completions", hitURL)
+	}
+}
