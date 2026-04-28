@@ -1,5 +1,4 @@
 import { memo, useMemo } from 'react';
-import { motion } from 'framer-motion';
 import { Handle, Position, type NodeProps, type Node } from '@xyflow/react';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import EnsembleConsensus from './EnsembleConsensus';
@@ -491,14 +490,12 @@ function VerdictMarquee({ entries }: VerdictMarqueeProps) {
     <div className={styles.tickerPillsWrapper}>
       <div className={styles.tickerPillsLabel}>VERDICTS</div>
       {shouldScroll ? (
-        <motion.div
-          className={styles.tickerPillsTrack}
-          animate={{ x: [0, "-50%"] }}
-          transition={{ duration, ease: "linear", repeat: Infinity }}
-          style={{ translateZ: 0 }}
+        <div
+          className={`${styles.tickerPillsTrack} ${styles.marqueeTrack}`}
+          style={{ animationDuration: `${duration}s` }}
         >
           {pills(scrollItems)}
-        </motion.div>
+        </div>
       ) : (
         <div className={styles.tickerPillsTrack} style={{ flexWrap: 'wrap' }}>
           {pills(entries)}
@@ -532,23 +529,16 @@ function WatchlistMarquee({ tickers }: WatchlistMarqueeProps) {
   return (
     <div className={styles.tickerPillsWrapper}>
       <div className={styles.tickerPillsLabel}>WATCHING</div>
-      <motion.div
-        className={styles.tickerPillsTrack}
-        animate={{ x: [0, "-50%"] }}
-        transition={{
-          duration: duration,
-          ease: "linear",
-          repeat: Infinity,
-        }}
-        // Force GPU acceleration to prevent subpixel jitter
-        style={{ translateZ: 0 }}
+      <div
+        className={`${styles.tickerPillsTrack} ${styles.marqueeTrack}`}
+        style={{ animationDuration: `${duration}s` }}
       >
         {items.map((t, i) => (
           <span key={`${t.ticker}-${i}`} className={styles.tickerPill}>
             {t.ticker}
           </span>
         ))}
-      </motion.div>
+      </div>
     </div>
   );
 }
