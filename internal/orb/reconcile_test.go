@@ -3,8 +3,10 @@ package orb
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // stubExecutor implements execution.Executor for reconcile tests.
@@ -56,6 +58,182 @@ func TestReconcileDoneSession_RunsOnce(t *testing.T) {
 	if len(exec.statusCalls) != callsBefore {
 		t.Errorf("executor called on second reconcile: want 0 extra calls, got %d",
 			len(exec.statusCalls)-callsBefore)
+	}
+}
+
+// ─── matchExitsFromRecords ────────────────────────────────────────────────────
+
+// stubTradesFetcher satisfies TradesFetcher for unit tests.
+type stubTradesFetcher struct {
+	records []execution.IBKRTradeRecord
+	calls   int
+}
+
+func (f *stubTradesFetcher) FetchTradeRecords(_ context.Context, _ int) ([]execution.IBKRTradeRecord, error) {
+	f.calls++
+	return f.records, nil
+}
+
+func TestMatchExitsFromRecords_TPHit(t *testing.T) {
+	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
+	closedAt := entryTime
+
+	trades := []store.ORBTrade{
+		{
+			ID:         "trade-1",
+			Ticker:     "EUR/USD",
+			Side:       "buy",
+			Qty:        5000,
+			FillPrice:  1.1707,
+			TakeProfit: 1.1907,
+			StopLoss:   1.1607,
+			Status:     "filled",
+			CreatedAt:  entryTime.Add(-5 * time.Second),
+			ClosedAt:   &closedAt,
+		},
+	}
+
+	records := []execution.IBKRTradeRecord{
+		{
+			Symbol:   "EUR/USD",
+			Side:     "sell", // opposite of buy entry
+			Qty:      5000,
+			Price:    1.1907,            // exactly at TP
+			FilledAt: entryTime.Add(time.Hour), // after entry
+		},
+	}
+
+	s := &ORBScheduler{
+		reconciledSessions: make(map[string]struct{}),
+		trackedTrades:      make(map[string]*trackedTrade),
+	}
+	// matchExitsFromRecords requires s.db — keep nil to verify it short-circuits
+	// gracefully after computing the match.
+	s.matchExitsFromRecords(context.Background(), trades, records)
+
+	// Trade should now show status="closed" in the in-memory slice.
+	if trades[0].Status != "closed" {
+		t.Errorf("trade status = %q after TP match; want closed", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_SLHit(t *testing.T) {
+	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
+	closedAt := entryTime
+
+	trades := []store.ORBTrade{
+		{
+			ID:         "trade-2",
+			Ticker:     "GBP/USD",
+			Side:       "sell",
+			Qty:        5000,
+			FillPrice:  1.3515,
+			TakeProfit: 1.3315, // TP is below entry for a sell
+			StopLoss:   1.3615, // SL is above entry for a sell
+			Status:     "filled",
+			CreatedAt:  entryTime.Add(-5 * time.Second),
+			ClosedAt:   &closedAt,
+		},
+	}
+
+	records := []execution.IBKRTradeRecord{
+		{
+			Symbol:   "GBP/USD",
+			Side:     "buy",           // opposite of sell entry
+			Qty:      5000,
+			Price:    1.3615,          // at SL
+			FilledAt: entryTime.Add(time.Hour),
+		},
+	}
+
+	s := &ORBScheduler{
+		reconciledSessions: make(map[string]struct{}),
+		trackedTrades:      make(map[string]*trackedTrade),
+	}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+
+	if trades[0].Status != "closed" {
+		t.Errorf("trade status = %q after SL match; want closed", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_SkipsWrongSymbol(t *testing.T) {
+	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
+	closedAt := entryTime
+
+	trades := []store.ORBTrade{
+		{
+			ID:         "trade-3",
+			Ticker:     "EUR/USD",
+			Side:       "buy",
+			Qty:        5000,
+			FillPrice:  1.1707,
+			TakeProfit: 1.1907,
+			StopLoss:   1.1607,
+			Status:     "filled",
+			CreatedAt:  entryTime.Add(-5 * time.Second),
+			ClosedAt:   &closedAt,
+		},
+	}
+
+	records := []execution.IBKRTradeRecord{
+		{
+			Symbol:   "GBP/USD", // wrong symbol
+			Side:     "sell",
+			Qty:      5000,
+			Price:    1.1907,
+			FilledAt: entryTime.Add(time.Hour),
+		},
+	}
+
+	s := &ORBScheduler{
+		reconciledSessions: make(map[string]struct{}),
+		trackedTrades:      make(map[string]*trackedTrade),
+	}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+
+	if trades[0].Status != "filled" {
+		t.Errorf("trade status = %q; want filled (symbol mismatch should not match)", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_SkipsEarlierFill(t *testing.T) {
+	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
+	closedAt := entryTime
+
+	trades := []store.ORBTrade{
+		{
+			ID:         "trade-4",
+			Ticker:     "EUR/USD",
+			Side:       "buy",
+			Qty:        5000,
+			FillPrice:  1.1707,
+			TakeProfit: 1.1907,
+			StopLoss:   1.1607,
+			Status:     "filled",
+			CreatedAt:  entryTime.Add(-5 * time.Second),
+			ClosedAt:   &closedAt,
+		},
+	}
+
+	records := []execution.IBKRTradeRecord{
+		{
+			Symbol:   "EUR/USD",
+			Side:     "sell",
+			Qty:      5000,
+			Price:    1.1907,
+			FilledAt: entryTime.Add(-time.Minute), // BEFORE entry — must not match
+		},
+	}
+
+	s := &ORBScheduler{
+		reconciledSessions: make(map[string]struct{}),
+		trackedTrades:      make(map[string]*trackedTrade),
+	}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+
+	if trades[0].Status != "filled" {
+		t.Errorf("trade status = %q; want filled (pre-entry fill should not match)", trades[0].Status)
 	}
 }
 

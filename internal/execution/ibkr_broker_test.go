@@ -230,6 +230,70 @@ func TestIBKROrderConfirmation(t *testing.T) {
 	}
 }
 
+// TestIBKROrderConfirmation_TwoRound verifies that bracket placement survives
+// two sequential confirmation prompts before receiving order IDs, which is the
+// common real-world IBKR flow (price-check prompt + outside-RTH prompt).
+func TestIBKROrderConfirmation_TwoRound(t *testing.T) {
+	round := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/U123456/orders":
+			// Initial placement: first confirmation prompt.
+			w.Write([]byte(`[{"id":"REPLY-A1","message":["Price check required"]}]`))
+		case "/v1/api/iserver/reply/REPLY-A1":
+			round++
+			// First confirm resolves to a second prompt (outside-RTH warning).
+			w.Write([]byte(`[{"id":"REPLY-A2","message":["Order outside regular trading hours"]}]`))
+		case "/v1/api/iserver/reply/REPLY-A2":
+			round++
+			// Second confirm resolves to all three bracket order IDs.
+			w.Write([]byte(`[` +
+				`{"order_id":"ORD-P","order_status":"PreSubmitted"},` +
+				`{"order_id":"ORD-TP","order_status":"PreSubmitted"},` +
+				`{"order_id":"ORD-SL","order_status":"PreSubmitted"}` +
+				`]`))
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	result, err := b.PlaceOrder(t.Context(), OrderRequest{
+		Ticker:          "GBP/USD",
+		Side:            OrderSideBuy,
+		Type:            OrderTypeStop,
+		Quantity:        50000,
+		StopPrice:       1.265,
+		TradeID:         "trade-tworound",
+		OrderClass:      "bracket",
+		TakeProfitPrice: 1.275,
+		StopLossPrice:   1.255,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder (two-round) error: %v", err)
+	}
+	if round != 2 {
+		t.Errorf("expected 2 confirmation rounds, got %d", round)
+	}
+	if result.BrokerOrderID != "ORD-P" {
+		t.Errorf("BrokerOrderID = %q; want ORD-P", result.BrokerOrderID)
+	}
+	if len(result.ChildOrderIDs) != 2 {
+		t.Errorf("ChildOrderIDs = %v; want [ORD-TP ORD-SL]", result.ChildOrderIDs)
+	} else {
+		if result.ChildOrderIDs[0] != "ORD-TP" {
+			t.Errorf("ChildOrderIDs[0] = %q; want ORD-TP", result.ChildOrderIDs[0])
+		}
+		if result.ChildOrderIDs[1] != "ORD-SL" {
+			t.Errorf("ChildOrderIDs[1] = %q; want ORD-SL", result.ChildOrderIDs[1])
+		}
+	}
+}
+
 // ─── NormalizeIBKROrderStatus ─────────────────────────────────────────────────
 
 func TestNormalizeIBKROrderStatus(t *testing.T) {

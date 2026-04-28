@@ -84,6 +84,76 @@ func (b *IBKRBroker) EquityCurve(_ context.Context, _, _ string) (EquityHistory,
 	return EquityHistory{}, ErrBrokerUnavailable
 }
 
+// IBKRTradeRecord is a single execution (fill) from the IBKR trades endpoint.
+// Used by the ORB exit reconciler to match bracket exit fills back to DB records
+// without relying on child order IDs that may not have been captured at placement.
+type IBKRTradeRecord struct {
+	OrderID  string
+	Conid    string
+	Symbol   string    // human-readable (e.g. "EUR/USD"); falls back to raw conid if unknown
+	Side     string    // "buy" | "sell"
+	Qty      float64
+	Price    float64
+	FilledAt time.Time
+}
+
+// FetchTradeRecords returns filled executions from /iserver/account/trades for the
+// last N days (clamped to 1–7, the gateway's maximum). Unlike RecentFills it does
+// not filter to today, making it suitable for multi-day exit reconciliation.
+func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTradeRecord, error) {
+	if days < 1 {
+		days = 1
+	}
+	if days > 7 {
+		days = 7
+	}
+	var resp []struct {
+		OrderID   int64   `json:"orderId"`
+		Symbol    string  `json:"symbol"`
+		Side      string  `json:"side"` // "B" | "S"
+		Size      float64 `json:"size"`
+		Price     float64 `json:"price"`
+		Status    string  `json:"status"`
+		TradeTime string  `json:"trade_time"` // "YYYYMMDD-HH:MM:SS" UTC
+		Conid     int     `json:"conid"`
+	}
+	path := fmt.Sprintf("/v1/api/iserver/account/trades?days=%d", days)
+	if err := b.do(ctx, http.MethodGet, path, nil, &resp); err != nil {
+		return nil, fmt.Errorf("ibkr FetchTradeRecords: %w", err)
+	}
+
+	const ibkrTimeFmt = "20060102-15:04:05"
+	out := make([]IBKRTradeRecord, 0, len(resp))
+	for _, o := range resp {
+		if NormalizeIBKROrderStatus(o.Status) != "filled" {
+			continue
+		}
+		t, err := time.ParseInLocation(ibkrTimeFmt, o.TradeTime, time.UTC)
+		if err != nil {
+			continue
+		}
+		side := "buy"
+		if o.Side == "S" {
+			side = "sell"
+		}
+		conidStr := fmt.Sprintf("%d", o.Conid)
+		symbol := o.Symbol
+		if resolved := b.reverseConid(conidStr); resolved != conidStr {
+			symbol = resolved
+		}
+		out = append(out, IBKRTradeRecord{
+			OrderID:  fmt.Sprintf("%d", o.OrderID),
+			Conid:    conidStr,
+			Symbol:   symbol,
+			Side:     side,
+			Qty:      o.Size,
+			Price:    o.Price,
+			FilledAt: t,
+		})
+	}
+	return out, nil
+}
+
 // RecentFills fetches today's filled orders from /iserver/account/trades.
 func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 	var resp []struct {
