@@ -90,7 +90,7 @@ func (b *IBKRBroker) EquityCurve(_ context.Context, _, _ string) (EquityHistory,
 type IBKRTradeRecord struct {
 	OrderID  string
 	Conid    string
-	Symbol   string    // human-readable (e.g. "EUR/USD"); falls back to raw conid if unknown
+	Symbol   string    // human-readable when conid is resolved (e.g. "EUR/USD"); otherwise the raw API symbol field
 	Side     string    // "buy" | "sell"
 	Qty      float64
 	Price    float64

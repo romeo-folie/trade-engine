@@ -108,9 +108,10 @@ type ORBScheduler struct {
 	rangeBuffers   map[string]*RangeBuffer
 	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
 	trackedTrades      map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions map[string]struct{}      // session IDs already reconciled on startup
-	backfillFired      bool                     // true once the startup trades-feed backfill has run
-	lastScan           time.Time                // Eastern Time of the last successful scan
+	reconciledSessions   map[string]struct{}  // session IDs already reconciled on startup
+	backfillFired        bool                 // true once the startup trades-feed backfill has run
+	lastExitReconcileAt  time.Time            // wall time of the last per-tick trades-feed reconcile
+	lastScan             time.Time            // Eastern Time of the last successful scan
 	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
 	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
 }
@@ -1292,16 +1293,19 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 
 	// Trades-feed reconcile: catch any exits that the order-ID-based loop missed
 	// (e.g. when child IDs were not captured at placement due to confirmation-prompt
-	// flow). Runs each tick so new fills from IBKR are picked up promptly.
-	s.mu.Lock()
-	var liveSessionID string
-	if s.session != nil {
-		liveSessionID = s.session.ID
-	}
-	s.mu.Unlock()
-	if liveSessionID != "" && s.db != nil {
-		if trades, err := store.GetORBTrades(ctx, s.db, liveSessionID); err == nil {
-			s.reconcileExitsFromTrades(ctx, liveSessionID, trades)
+	// flow). Throttled to once per minute to stay well within IBKR's 10 req/s limit.
+	if time.Since(s.lastExitReconcileAt) >= time.Minute {
+		s.mu.Lock()
+		var liveSessionID string
+		if s.session != nil {
+			liveSessionID = s.session.ID
+		}
+		s.mu.Unlock()
+		if liveSessionID != "" && s.db != nil {
+			if trades, err := store.GetORBTrades(ctx, s.db, liveSessionID); err == nil {
+				s.reconcileExitsFromTrades(ctx, liveSessionID, trades)
+				s.lastExitReconcileAt = time.Now()
+			}
 		}
 	}
 
@@ -1492,9 +1496,16 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			continue
 		}
 
+		// Use ClosedAt (entry fill time) as the lower bound, minus a 60s buffer to
+		// account for the poll lag between the actual IBKR fill and when we persisted
+		// it. This prevents filtering out legitimate exits that arrived quickly after
+		// the entry fill while still rejecting fills that predate the order placement.
 		entryTime := t.CreatedAt
 		if t.ClosedAt != nil {
-			entryTime = *t.ClosedAt
+			buffered := t.ClosedAt.Add(-60 * time.Second)
+			if buffered.After(t.CreatedAt) {
+				entryTime = buffered
+			}
 		}
 
 		exitSide := "sell"
