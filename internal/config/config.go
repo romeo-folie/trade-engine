@@ -278,7 +278,7 @@ type AdaptiveDepthWeights struct {
 
 // ModelConfig describes a single model endpoint.
 type ModelConfig struct {
-	Provider    string  `yaml:"provider"` // anthropic | openai | google | ollama
+	Provider    string  `yaml:"provider"` // anthropic | openai | deepseek | google | ollama
 	Model       string  `yaml:"model"`
 	APIKeyEnv   string  `yaml:"api_key_env"` // env var name
 	APIKey      string  `yaml:"-" json:"-"`  // resolved at runtime, never serialised
@@ -567,7 +567,7 @@ type NewsAPIConfig struct {
 
 	// Extraction controls knowledge-graph enrichment LLM calls.
 	ExtractionEnabled            bool   `yaml:"extraction_enabled"`
-	ExtractionProvider           string `yaml:"extraction_provider"`              // anthropic | openai | google | ollama
+	ExtractionProvider           string `yaml:"extraction_provider"`              // anthropic | openai | deepseek | google | ollama
 	ExtractionModel              string `yaml:"extraction_model"`                 // optional provider model override
 	ExtractionMaxArticlesPerTick int    `yaml:"extraction_max_articles_per_tick"` // cap per ticker per engine tick
 	ExtractionRPM                int    `yaml:"extraction_rpm"`                   // global requests/minute cap
