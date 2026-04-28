@@ -69,6 +69,14 @@ models:
       provider: ollama
       model: nomic-embed-text
       timeout_sec: 30
+    # ── DeepSeek (OpenAI-compatible; cheaper alternative to gpt-4o) ───────────
+    # deepseek_cheap:
+    #   provider: deepseek
+    #   model: deepseek-chat
+    #   api_key_env: DEEPSEEK_API_KEY  # export DEEPSEEK_API_KEY=sk-...
+    #   max_tokens: 2048
+    #   temperature: 0.1
+    #   timeout_sec: 60
 
   roles:
     analysts: [analyst_cheap, analyst_mid, analyst_frontier]
@@ -148,7 +156,7 @@ markets:
 
     # Knowledge extraction controls (cost/rate guardrails)
     extraction_enabled: true
-    extraction_provider: openai    # use a single provider for extraction path
+    extraction_provider: openai    # use a single provider for extraction path; supported: anthropic | openai | deepseek | google | ollama
     extraction_model: gpt-4o       # must exist in configured model clients; no cross-provider fallback
     extraction_max_articles_per_tick: 10
     extraction_rpm: 20             # global extraction requests/minute cap
