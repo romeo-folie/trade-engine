@@ -102,23 +102,7 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 	const maxConfirmRounds = 5
 	current := raw
 	for range maxConfirmRounds {
-		// Try direct order result first.
-		var orderResults []struct {
-			OrderID     string `json:"order_id"`
-			OrderStatus string `json:"order_status"`
-		}
-		if err := json.Unmarshal(current, &orderResults); err == nil && len(orderResults) > 0 && orderResults[0].OrderID != "" {
-			r := orderResults[0]
-			result := OrderResult{
-				BrokerOrderID: r.OrderID,
-				Status:        NormalizeIBKROrderStatus(r.OrderStatus),
-			}
-			// Bracket responses include child order IDs at indices 1 (TP) and 2 (stop-loss).
-			for _, child := range orderResults[1:] {
-				if child.OrderID != "" {
-					result.ChildOrderIDs = append(result.ChildOrderIDs, child.OrderID)
-				}
-			}
+		if result, ok := parseIBKROrderResult(current); ok {
 			return result, nil
 		}
 
@@ -138,7 +122,36 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 		}
 		current = confirmed
 	}
+	// One final parse: the last confirmation round may have returned order IDs
+	// directly and the loop exited before checking them.
+	if result, ok := parseIBKROrderResult(current); ok {
+		return result, nil
+	}
 	return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: exceeded %d confirmation rounds", maxConfirmRounds)
+}
+
+// parseIBKROrderResult attempts to decode raw as a direct order-result array.
+// Returns the populated OrderResult and true on success; zero value and false otherwise.
+func parseIBKROrderResult(raw json.RawMessage) (OrderResult, bool) {
+	var orderResults []struct {
+		OrderID     string `json:"order_id"`
+		OrderStatus string `json:"order_status"`
+	}
+	if err := json.Unmarshal(raw, &orderResults); err != nil || len(orderResults) == 0 || orderResults[0].OrderID == "" {
+		return OrderResult{}, false
+	}
+	r := orderResults[0]
+	result := OrderResult{
+		BrokerOrderID: r.OrderID,
+		Status:        NormalizeIBKROrderStatus(r.OrderStatus),
+	}
+	// Bracket responses include child order IDs at indices 1 (TP) and 2 (stop-loss).
+	for _, child := range orderResults[1:] {
+		if child.OrderID != "" {
+			result.ChildOrderIDs = append(result.ChildOrderIDs, child.OrderID)
+		}
+	}
+	return result, true
 }
 
 // CancelOrder sends a DELETE request to cancel an open order.

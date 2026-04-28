@@ -294,6 +294,59 @@ func TestIBKROrderConfirmation_TwoRound(t *testing.T) {
 	}
 }
 
+// TestIBKROrderConfirmation_FiveRounds verifies that when IBKR issues exactly
+// maxConfirmRounds (5) sequential prompts, the final confirmation response that
+// carries the order IDs is still parsed correctly (off-by-one guard).
+func TestIBKROrderConfirmation_FiveRounds(t *testing.T) {
+	round := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.URL.Path == "/v1/api/iserver/account/U123456/orders":
+			w.Write([]byte(`[{"id":"R1","message":["prompt 1"]}]`))
+		case r.URL.Path == "/v1/api/iserver/reply/R1":
+			round++
+			w.Write([]byte(`[{"id":"R2","message":["prompt 2"]}]`))
+		case r.URL.Path == "/v1/api/iserver/reply/R2":
+			round++
+			w.Write([]byte(`[{"id":"R3","message":["prompt 3"]}]`))
+		case r.URL.Path == "/v1/api/iserver/reply/R3":
+			round++
+			w.Write([]byte(`[{"id":"R4","message":["prompt 4"]}]`))
+		case r.URL.Path == "/v1/api/iserver/reply/R4":
+			round++
+			w.Write([]byte(`[{"id":"R5","message":["prompt 5"]}]`))
+		case r.URL.Path == "/v1/api/iserver/reply/R5":
+			round++
+			// 5th confirm finally returns order IDs — this is the off-by-one case.
+			w.Write([]byte(`[{"order_id":"ORD-FINAL","order_status":"Submitted"}]`))
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	result, err := b.PlaceOrder(t.Context(), OrderRequest{
+		Ticker:   "EUR/USD",
+		Side:     OrderSideBuy,
+		Type:     OrderTypeMarket,
+		Quantity: 100000,
+		TradeID:  "trade-fiverounds",
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder (5-round) error: %v", err)
+	}
+	if round != 5 {
+		t.Errorf("expected 5 confirmation rounds, got %d", round)
+	}
+	if result.BrokerOrderID != "ORD-FINAL" {
+		t.Errorf("BrokerOrderID = %q; want ORD-FINAL", result.BrokerOrderID)
+	}
+}
+
 // ─── NormalizeIBKROrderStatus ─────────────────────────────────────────────────
 
 func TestNormalizeIBKROrderStatus(t *testing.T) {

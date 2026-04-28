@@ -398,7 +398,7 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	// all recent done sessions (up to 7 days) using the IBKR trades feed.
 	if !s.backfillFired {
 		s.backfillFired = true
-		go s.backfillRecentExits(ctx)
+		s.backfillRecentExits(ctx)
 	}
 
 	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
