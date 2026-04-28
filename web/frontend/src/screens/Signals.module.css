@@ -67,7 +67,7 @@
   margin-bottom: var(--space-1);
 }
 
-.exportBtn {
+.copyCsvBtn {
   background: transparent;
   border: 1px solid var(--accent);
   color: var(--accent);
@@ -79,7 +79,7 @@
   transition: all 0.2s ease;
 }
 
-.exportBtn:hover {
+.copyCsvBtn:hover {
   background: var(--accent-dim);
   box-shadow: 0 0 10px var(--accent-glow);
 }

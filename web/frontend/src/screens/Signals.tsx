@@ -278,7 +278,7 @@ export default function SignalsScreen() {
 
   const handleClosePanel = useCallback(() => setSelectedSignal(null), []);
 
-  const handleExport = useCallback(() => {
+  const handleCopyCsv = useCallback(() => {
     const csv = signalsToCsv(signals);
     if (!navigator.clipboard) {
       setToastMsg('Clipboard not available (requires HTTPS)');
@@ -330,7 +330,7 @@ export default function SignalsScreen() {
 
       <div className={styles.header}>
         <h1 className={styles.pageTitle}>SIGNALS</h1>
-        <button className={styles.exportBtn} onClick={handleExport} title="Copies loaded rows as CSV to clipboard">COPY CSV</button>
+        <button className={styles.copyCsvBtn} onClick={handleCopyCsv} title="Copies loaded rows as CSV to clipboard">COPY CSV</button>
       </div>
 
       {fetchError && (

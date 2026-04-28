@@ -386,7 +386,7 @@ export default function TradesScreen() {
     return match ? ` (${match.label.toUpperCase()})` : '';
   }, [dateFilter]);
 
-  const handleExport = useCallback(() => {
+  const handleCopyCsv = useCallback(() => {
     const csv = tradesToCsv(filtered);
     if (!navigator.clipboard) {
       setToastMsg('Clipboard not available (requires HTTPS)');
@@ -466,7 +466,7 @@ export default function TradesScreen() {
           },
         ]}
         actions={[
-          { label: 'COPY CSV', onClick: handleExport },
+          { label: 'COPY CSV', onClick: handleCopyCsv },
         ]}
       />
 
