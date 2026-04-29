@@ -160,21 +160,23 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 	sb.WriteString(titleStyle.Render("ORB Session") + "  " + sessionLabel + "\n")
 	sb.WriteString(labelStyle.Render("Status: ") + renderORBStatus(data.Status) + "\n")
 
-	// Candidates
+	// Candidates — show only those eligible for trading (Action == "trade")
 	if len(data.Candidates) > 0 {
-		sb.WriteString("\n")
-		sb.WriteString(labelStyle.Render("Candidates:") + "\n")
+		var eligible []ORBCandidateRow
 		for _, c := range data.Candidates {
+			if c.Action == "trade" {
+				eligible = append(eligible, c)
+			}
+		}
+		sb.WriteString("\n")
+		sb.WriteString(labelStyle.Render(fmt.Sprintf("Candidates (%d of %d eligible):", len(eligible), len(data.Candidates))) + "\n")
+		for _, c := range eligible {
 			selected := " "
 			if slices.Contains(data.Selected, c.Ticker) {
 				selected = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("*")
 			}
-			actionStr := dimText.Render(c.Action)
-			if c.Action == "trade" {
-				actionStr = greenText.Render("trade")
-			}
-			fmt.Fprintf(&sb, "  %s %-6s  gap %+5.1f%%  conv %.0f%%  %s  %s\n",
-				selected, c.Ticker, c.GapPct, c.Conviction*100, actionStr,
+			fmt.Fprintf(&sb, "  %s %-6s  gap %+5.1f%%  conv %.0f%%  %s\n",
+				selected, c.Ticker, c.GapPct, c.Conviction*100,
 				dimText.Render(c.Reasoning))
 		}
 	}
