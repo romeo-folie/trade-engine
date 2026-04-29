@@ -169,7 +169,10 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 			}
 		}
 		sb.WriteString("\n")
-		sb.WriteString(labelStyle.Render(fmt.Sprintf("Candidates (%d of %d eligible):", len(eligible), len(data.Candidates))) + "\n")
+		sb.WriteString(labelStyle.Render(fmt.Sprintf("Candidates (%d trade-eligible of %d scanned):", len(eligible), len(data.Candidates))) + "\n")
+		if len(eligible) == 0 {
+			sb.WriteString(dimText.Render("  No trade-eligible candidates") + "\n")
+		}
 		for _, c := range eligible {
 			selected := " "
 			if slices.Contains(data.Selected, c.Ticker) {
