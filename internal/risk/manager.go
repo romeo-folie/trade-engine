@@ -33,8 +33,11 @@ type CheckInput struct {
 	LastLossAt     time.Time // last time a losing trade closed
 
 	// HoldsLong is true when there is an open long trade in Ticker.
-	// Used by checkPositionOwnership to block SELL signals with no position.
-	HoldsLong bool
+	// LongQuantity is the total shares held long (sum across open trades).
+	// Used by checkPositionOwnership to block SELL signals with no position
+	// or where the proposed sell quantity exceeds what is held.
+	HoldsLong    bool
+	LongQuantity float64
 }
 
 // CheckResult is the outcome of a single risk check.
@@ -157,10 +160,21 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 	if in.Action != "SELL" {
 		return pass(name)
 	}
-	if in.HoldsLong {
-		return pass(name)
+	if !in.HoldsLong {
+		return fail(name, fmt.Sprintf("no open long position in %s — cannot sell", in.Ticker))
 	}
-	return fail(name, fmt.Sprintf("no open long position in %s — cannot sell", in.Ticker))
+	// Verify the proposed sell quantity does not exceed shares held.
+	// Overselling would result in a net short even with a position check.
+	if in.SignalPrice > 0 && in.LongQuantity > 0 {
+		proposedQty := (in.Cash * in.SizePct / 100) / in.SignalPrice
+		if proposedQty > in.LongQuantity {
+			return fail(name, fmt.Sprintf(
+				"sell qty %.2f exceeds held long %.2f in %s",
+				proposedQty, in.LongQuantity, in.Ticker,
+			))
+		}
+	}
+	return pass(name)
 }
 
 func checkCooldownAfterLoss(in CheckInput) CheckResult {

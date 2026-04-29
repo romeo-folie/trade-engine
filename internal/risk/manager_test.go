@@ -79,12 +79,27 @@ func TestPositionOwnership_BuyAlwaysPasses(t *testing.T) {
 	assertPasses(t, checkPositionOwnership, in)
 }
 
-func TestPositionOwnership_SellWithPosition(t *testing.T) {
+func TestPositionOwnership_SellWithSufficientPosition(t *testing.T) {
 	in := baseInput()
 	in.Action = "SELL"
 	in.Ticker = "HIMS"
 	in.HoldsLong = true
+	// proposedQty = (5000 * 2.0/100) / 100.0 = 1.0; held = 10 → ok
+	in.LongQuantity = 10
 	assertPasses(t, checkPositionOwnership, in)
+}
+
+func TestPositionOwnership_SellExceedsHeldQuantity(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.Ticker = "HIMS"
+	in.HoldsLong = true
+	// proposedQty = (5000 * 2.0/100) / 100.0 = 1.0; held = 0.5 → oversell
+	in.LongQuantity = 0.5
+	r := assertFails(t, checkPositionOwnership, in)
+	if r.Name != "position_ownership" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
 }
 
 func TestPositionOwnership_SellWithoutPosition(t *testing.T) {
