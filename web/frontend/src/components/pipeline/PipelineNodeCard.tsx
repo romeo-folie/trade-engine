@@ -251,23 +251,31 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               })()
             ) : (
               (() => {
-                const PROVIDER_CONFIG = [
-                  { id: 'openai', label: 'GPT', color: colors.analystMomentum },
-                  { id: 'anthropic', label: 'ANTH', color: colors.analystTechnical },
-                  { id: 'google', label: 'GEMI', color: colors.analystSentiment },
-                ];
+                const PROVIDER_COLOR: Record<string, string> = {
+                  openai:    colors.analystMomentum,
+                  anthropic: colors.analystTechnical,
+                  google:    colors.analystSentiment,
+                  deepseek:  colors.analystMacro,
+                };
+                const PROVIDER_LABEL: Record<string, string> = {
+                  openai:    'GPT',
+                  anthropic: 'ANTH',
+                  google:    'GEMI',
+                  deepseek:  'DEEP',
+                };
+                const FALLBACK_COLORS = [colors.acidGreen, colors.amber, colors.red, colors.emerald];
 
                 // Drive consensus display entirely from analystVotes (last AnalystVotesPublished event).
                 // analystConsensus accumulates across tickers/ticks and is stale — don't use it here.
                 const av = d.analystVotes as { model: string; provider: string; action: string; confidence: number; skipped: boolean }[] | undefined;
                 const activeVotes = av ? av.filter(v => !v.skipped) : [];
 
-                const items = PROVIDER_CONFIG.map(conf => {
-                  const vote = activeVotes.find(v => v.provider?.toLowerCase() === conf.id);
+                const items = activeVotes.map((vote, i) => {
+                  const pid = vote.provider?.toLowerCase() ?? '';
                   return {
-                    label: conf.label,
-                    value: vote?.confidence,
-                    color: conf.color,
+                    label: PROVIDER_LABEL[pid] ?? pid.slice(0, 4).toUpperCase(),
+                    value: vote.confidence,
+                    color: PROVIDER_COLOR[pid] ?? FALLBACK_COLORS[i % FALLBACK_COLORS.length],
                     isLoading: false,
                   };
                 });

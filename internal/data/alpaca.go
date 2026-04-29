@@ -18,6 +18,7 @@ var alpacaTimeframes = map[Timeframe]string{
 	Timeframe5Min:  "5Min",
 	Timeframe15Min: "15Min",
 	Timeframe1Hour: "1Hour",
+	Timeframe4Hour: "4Hour",
 	Timeframe1Day:  "1Day",
 }
 

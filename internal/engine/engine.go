@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -519,6 +520,11 @@ func (e *Engine) tick(ctx context.Context) error {
 func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
+	}
+
+	// Normalize to lowercase — LLM may return uppercase like "4H" or "1D".
+	for i, tf := range timeframes {
+		timeframes[i] = strings.ToLower(tf)
 	}
 
 	for _, tfStr := range timeframes {
