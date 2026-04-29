@@ -1110,6 +1110,15 @@ func hasConfiguredModel(cfg *Config, provider, model string) bool {
 	if arbiter := cfg.Models.ArbiterConfig(); match(arbiter) {
 		return true
 	}
+
+	// Check all remaining registry entries (classifier, news_enricher, fallbacks,
+	// etc.) so extraction_provider/model can reference any configured registry key,
+	// not just analyst/arbiter roles.
+	for _, entry := range cfg.Models.Registry {
+		if match(entry.ModelConfig) {
+			return true
+		}
+	}
 	return false
 }
 
