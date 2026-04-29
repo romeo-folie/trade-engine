@@ -25,8 +25,8 @@ func TestRenderORBPanelWithCandidates(t *testing.T) {
 		Date:   time.Date(2026, 3, 20, 0, 0, 0, 0, time.UTC),
 		Status: "candidate_ready",
 		Candidates: []ORBCandidateRow{
-			{Ticker: "AAPL", GapPct: 5.2, Conviction: 0.85, Reasoning: "earnings beat"},
-			{Ticker: "TSLA", GapPct: -4.1, Conviction: 0.60, Reasoning: "no clear catalyst"},
+			{Ticker: "AAPL", GapPct: 5.2, Conviction: 0.85, Action: "trade", Reasoning: "earnings beat"},
+			{Ticker: "TSLA", GapPct: -4.1, Conviction: 0.60, Action: "skip", Reasoning: "no clear catalyst"},
 		},
 		Selected: []string{"AAPL"},
 	}
