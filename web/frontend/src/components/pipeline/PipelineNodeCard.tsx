@@ -273,6 +273,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 const items = activeVotes.map((vote, i) => {
                   const pid = vote.provider?.toLowerCase() ?? '';
                   return {
+                    id: vote.model || `${pid}-${i}`,
                     label: PROVIDER_LABEL[pid] ?? pid.slice(0, 4).toUpperCase(),
                     value: vote.confidence,
                     color: PROVIDER_COLOR[pid] ?? FALLBACK_COLORS[i % FALLBACK_COLORS.length],
