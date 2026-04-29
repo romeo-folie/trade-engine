@@ -53,7 +53,7 @@ func (c *OllamaClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 			toPromptCandles(req.RecentCandles), toPromptIndicators(req.Indicators),
 			toPromptNews(req.News), toPromptPortfolio(req.Portfolio),
 			req.KnowledgeContext, toPromptSimilarSetups(req.SimilarAnalyses),
-			req.PerformanceContext,
+			req.PerformanceContext, req.MomentumPlay,
 		)
 	}
 	combinedPrompt := systemPrompt + "\n\n" + userMessage

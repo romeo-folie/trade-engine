@@ -77,6 +77,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			req.KnowledgeContext,
 			toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext,
+			req.MomentumPlay,
 		)
 	}
 

@@ -15,9 +15,10 @@ func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 		Indicators{RSI: 55.2, EMA20: 99.1, VolSMA20: 12000, VolRatio: 1.2},
 		[]NewsItem{{Headline: "Apple launches new product", Source: "Reuters", PublishedAt: time.Now().Add(-2 * time.Hour), Sentiment: "bullish"}},
 		Portfolio{},
-		"",  // knowledgeContext — empty for unit test
-		nil, // similarSetups — empty for unit test
-		"",  // performanceContext — empty for unit test
+		"",    // knowledgeContext — empty for unit test
+		nil,   // similarSetups — empty for unit test
+		"",    // performanceContext — empty for unit test
+		false, // momentumPlay — standard prompt for this test
 	)
 
 	checks := []string{
