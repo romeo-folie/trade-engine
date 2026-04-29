@@ -1110,6 +1110,15 @@ func hasConfiguredModel(cfg *Config, provider, model string) bool {
 	if arbiter := cfg.Models.ArbiterConfig(); match(arbiter) {
 		return true
 	}
+
+	// Check the news_enricher registry role. resolveEnricherProvider prefers this
+	// over the analyst scan, so it is a valid runtime source for extraction even
+	// when the model is not in the analyst list.
+	if mc, err := cfg.Models.ResolveRole("news_enricher"); err == nil {
+		if match(mc) {
+			return true
+		}
+	}
 	return false
 }
 
