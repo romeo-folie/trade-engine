@@ -1212,9 +1212,18 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 	pState := e.portfolio.CurrentState()
 	openTrades, _ := store.GetOpenTrades(ctx)
 
+	holdsLong := false
+	for _, t := range openTrades {
+		if t.Ticker == ticker && t.Direction == "long" {
+			holdsLong = true
+			break
+		}
+	}
+
 	riskIn := risk.CheckInput{
 		Cfg:            e.cfg.Risk,
 		Action:         string(resp.Action),
+		Ticker:         ticker,
 		Confidence:     resp.Confidence,
 		SizePct:        resp.SizePct,
 		StopLoss:       resp.StopLoss,
@@ -1226,6 +1235,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		DailyPnL:       pState.RealizedPnLDay,
 		PeakValue:      pState.PeakValue,
 		LastLossAt:     pState.LastLossAt,
+		HoldsLong:      holdsLong,
 	}
 
 	results, passed := risk.CheckAll(riskIn)

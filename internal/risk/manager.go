@@ -16,20 +16,25 @@ type CheckInput struct {
 	Cfg config.RiskConfig
 
 	// Signal fields
-	Action     string  // BUY | SELL
-	Confidence float64 // 0.0–1.0
-	SizePct    float64 // recommended position %
-	StopLoss   float64 // price
-	TakeProfit float64 // price
+	Action      string  // BUY | SELL
+	Ticker      string
+	Confidence  float64 // 0.0–1.0
+	SizePct     float64 // recommended position %
+	StopLoss    float64 // price
+	TakeProfit  float64 // price
 	SignalPrice float64
 
 	// Portfolio state
-	PortfolioValue  float64
-	Cash            float64
-	OpenPositions   int
-	DailyPnL        float64 // realised P&L today (negative = loss)
-	PeakValue       float64 // for drawdown calculation
-	LastLossAt      time.Time // last time a losing trade closed
+	PortfolioValue float64
+	Cash           float64
+	OpenPositions  int
+	DailyPnL       float64   // realised P&L today (negative = loss)
+	PeakValue      float64   // for drawdown calculation
+	LastLossAt     time.Time // last time a losing trade closed
+
+	// HoldsLong is true when there is an open long trade in Ticker.
+	// Used by checkPositionOwnership to block SELL signals with no position.
+	HoldsLong bool
 }
 
 // CheckResult is the outcome of a single risk check.
@@ -44,6 +49,7 @@ type CheckResult struct {
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
 		checkConfidence,
+		checkPositionOwnership,
 		checkRiskReward,
 		checkPositionSize,
 		checkMaxOpenPositions,
@@ -144,6 +150,17 @@ func checkMaxDrawdown(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("drawdown %.2f%% >= limit %.2f%% — circuit breaker active",
 		drawdownPct, in.Cfg.MaxDrawdownPct))
+}
+
+func checkPositionOwnership(in CheckInput) CheckResult {
+	name := "position_ownership"
+	if in.Action != "SELL" {
+		return pass(name)
+	}
+	if in.HoldsLong {
+		return pass(name)
+	}
+	return fail(name, fmt.Sprintf("no open long position in %s — cannot sell", in.Ticker))
 }
 
 func checkCooldownAfterLoss(in CheckInput) CheckResult {
