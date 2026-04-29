@@ -251,23 +251,30 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               })()
             ) : (
               (() => {
-                const PROVIDER_CONFIG = [
-                  { id: 'openai', label: 'GPT', color: colors.analystMomentum },
-                  { id: 'anthropic', label: 'ANTH', color: colors.analystTechnical },
-                  { id: 'google', label: 'GEMI', color: colors.analystSentiment },
-                ];
+                const PROVIDER_LABEL: Record<string, string> = {
+                  openai: 'GPT',
+                  anthropic: 'ANTH',
+                  google: 'GEMI',
+                  deepseek: 'DEEP',
+                };
+                const PROVIDER_COLOR: Record<string, string> = {
+                  openai: colors.analystMomentum,
+                  anthropic: colors.analystTechnical,
+                  google: colors.analystSentiment,
+                  deepseek: colors.analystMacro,
+                };
 
                 // Drive consensus display entirely from analystVotes (last AnalystVotesPublished event).
                 // analystConsensus accumulates across tickers/ticks and is stale — don't use it here.
                 const av = d.analystVotes as { model: string; provider: string; action: string; confidence: number; skipped: boolean }[] | undefined;
                 const activeVotes = av ? av.filter(v => !v.skipped) : [];
 
-                const items = PROVIDER_CONFIG.map(conf => {
-                  const vote = activeVotes.find(v => v.provider?.toLowerCase() === conf.id);
+                const items = activeVotes.map(vote => {
+                  const key = vote.provider?.toLowerCase() ?? '';
                   return {
-                    label: conf.label,
-                    value: vote?.confidence,
-                    color: conf.color,
+                    label: PROVIDER_LABEL[key] ?? key.slice(0, 4).toUpperCase(),
+                    value: vote.confidence,
+                    color: PROVIDER_COLOR[key] ?? colors.borderMuted,
                     isLoading: false,
                   };
                 });
