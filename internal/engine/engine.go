@@ -1216,11 +1216,35 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 
 	// Run risk checks.
 	pState := e.portfolio.CurrentState()
-	openTrades, _ := store.GetOpenTrades(ctx)
+	openTrades, openTradesErr := store.GetOpenTrades(ctx)
+	if openTradesErr != nil {
+		logger.Warn("get open trades for risk checks", "ticker", ticker, "err", openTradesErr)
+		// For SELL signals we cannot verify position ownership — block rather than
+		// risk a naked sell. BUY signals can proceed with a degraded position count.
+		if resp.Action == "SELL" {
+			sig.Status = "blocked"
+			sig.BlockReason = "unable to verify open positions (DB error)"
+			if _, err := store.InsertSignal(ctx, sig); err != nil {
+				logger.Warn("store blocked signal", "ticker", ticker, "err", err)
+			}
+			logger.Warn("signal blocked", "ticker", ticker, "reason", sig.BlockReason)
+			return
+		}
+	}
+
+	var holdsLong bool
+	var longQuantity float64
+	for _, t := range openTrades {
+		if t.Ticker == ticker && t.Direction == "long" {
+			holdsLong = true
+			longQuantity += t.Quantity
+		}
+	}
 
 	riskIn := risk.CheckInput{
 		Cfg:            e.cfg.Risk,
 		Action:         string(resp.Action),
+		Ticker:         ticker,
 		Confidence:     resp.Confidence,
 		SizePct:        resp.SizePct,
 		StopLoss:       resp.StopLoss,
@@ -1232,6 +1256,8 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		DailyPnL:       pState.RealizedPnLDay,
 		PeakValue:      pState.PeakValue,
 		LastLossAt:     pState.LastLossAt,
+		HoldsLong:      holdsLong,
+		LongQuantity:   longQuantity,
 	}
 
 	results, passed := risk.CheckAll(riskIn)
@@ -1535,6 +1561,27 @@ func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {
 	if sig.Status != "pending" && sig.Status != "approved" {
 		return fmt.Errorf("signal %s has status %q — cannot approve", sigID, sig.Status)
 	}
+
+	// Re-check position ownership at execution time: the long may have been
+	// closed between signal generation and manual approval.
+	if sig.Action == "SELL" {
+		openTrades, _ := store.GetOpenTrades(ctx)
+		var holdsLong bool
+		for _, t := range openTrades {
+			if t.Ticker == sig.Ticker && t.Direction == "long" {
+				holdsLong = true
+				break
+			}
+		}
+		if !holdsLong {
+			if updateErr := store.UpdateSignalStatus(ctx, sigID, "blocked",
+				"no open long position in "+sig.Ticker+" — cannot sell (position closed since approval)"); updateErr != nil {
+				logger.Warn("update signal status", "err", updateErr)
+			}
+			return fmt.Errorf("signal %s blocked: no open long position in %s", sigID, sig.Ticker)
+		}
+	}
+
 	e.executeSignal(ctx, sigID, *sig)
 	return nil
 }
