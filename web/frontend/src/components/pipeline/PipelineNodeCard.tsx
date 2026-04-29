@@ -269,15 +269,19 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 const av = d.analystVotes as { model: string; provider: string; action: string; confidence: number; skipped: boolean }[] | undefined;
                 const activeVotes = av ? av.filter(v => !v.skipped) : [];
 
-                const items = activeVotes.map(vote => {
-                  const key = vote.provider?.toLowerCase() ?? '';
-                  return {
-                    label: PROVIDER_LABEL[key] ?? key.slice(0, 4).toUpperCase(),
-                    value: vote.confidence,
-                    color: PROVIDER_COLOR[key] ?? colors.borderMuted,
-                    isLoading: false,
-                  };
+                // Aggregate per provider: multiple analysts on the same provider → one bar, averaged confidence.
+                const confByProvider = new Map<string, number[]>();
+                activeVotes.forEach(vote => {
+                  const key = vote.provider?.toLowerCase() || 'unknown';
+                  if (!confByProvider.has(key)) confByProvider.set(key, []);
+                  confByProvider.get(key)!.push(vote.confidence);
                 });
+                const items = Array.from(confByProvider.entries()).map(([key, confs]) => ({
+                  label: PROVIDER_LABEL[key] ?? (key.slice(0, 4).toUpperCase() || 'UNKN'),
+                  value: confs.reduce((s, c) => s + c, 0) / confs.length,
+                  color: PROVIDER_COLOR[key] ?? colors.textDim,
+                  isLoading: false,
+                }));
 
                 const ticker = d.currentTicker as string | null;
                 const buys = activeVotes.filter(v => v.action?.toUpperCase() === 'BUY').length;
