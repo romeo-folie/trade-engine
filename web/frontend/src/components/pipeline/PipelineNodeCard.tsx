@@ -277,6 +277,7 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                   confByProvider.get(key)!.push(vote.confidence);
                 });
                 const items = Array.from(confByProvider.entries()).map(([key, confs]) => ({
+                  id: key,
                   label: PROVIDER_LABEL[key] ?? (key.slice(0, 4).toUpperCase() || 'UNKN'),
                   value: confs.reduce((s, c) => s + c, 0) / confs.length,
                   color: PROVIDER_COLOR[key] ?? colors.textDim,
