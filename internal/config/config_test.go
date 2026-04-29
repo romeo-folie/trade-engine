@@ -135,6 +135,49 @@ func TestValidateExtractionProviderMustExistInConfiguredModels(t *testing.T) {
 	}
 }
 
+func TestValidateExtractionProviderSatisfiedByNewsEnricherRole(t *testing.T) {
+	// extraction_provider/model should pass when the news_enricher registry role
+	// matches, even if that model is not in the analyst list.
+	cfg := Defaults()
+	cfg.Models.Registry = map[string]ModelRegistryEntry{
+		"enricher": {ModelConfig: ModelConfig{Provider: "google", Model: "gemini-2.5-flash-lite", APIKeyEnv: "GEMINI_API_KEY"}},
+	}
+	cfg.Models.Roles = ModelRoles{
+		NewsEnricher: "enricher",
+	}
+	cfg.Models.Analysts = []ModelConfig{{Provider: "anthropic", Model: "claude-sonnet-4-6", APIKeyEnv: "ANTHROPIC_API_KEY"}}
+	cfg.Markets.News.ExtractionEnabled = true
+	cfg.Markets.News.ExtractionProvider = "google"
+	cfg.Markets.News.ExtractionModel = "gemini-2.5-flash-lite"
+	cfg.Markets.News.ExtractionRPM = 10
+	cfg.Markets.News.ExtractionMaxArticlesPerTick = 5
+	errs := Validate(cfg)
+	if containsStr(errs, "markets.news.extraction_provider/model") {
+		t.Fatalf("expected no extraction provider/model error when news_enricher role matches, got: %v", errs)
+	}
+}
+
+func TestValidateExtractionProviderNotSatisfiedByUnusedRegistryEntry(t *testing.T) {
+	// An entry that exists in the registry but is not wired into any role or the
+	// analyst list must NOT satisfy the extraction_provider/model check — it is
+	// never instantiated at runtime.
+	cfg := Defaults()
+	cfg.Models.Registry = map[string]ModelRegistryEntry{
+		"unused": {ModelConfig: ModelConfig{Provider: "google", Model: "gemini-2.5-pro", APIKeyEnv: "GEMINI_API_KEY"}},
+	}
+	cfg.Models.Roles = ModelRoles{} // no news_enricher role configured
+	cfg.Models.Analysts = []ModelConfig{{Provider: "anthropic", Model: "claude-sonnet-4-6", APIKeyEnv: "ANTHROPIC_API_KEY"}}
+	cfg.Markets.News.ExtractionEnabled = true
+	cfg.Markets.News.ExtractionProvider = "google"
+	cfg.Markets.News.ExtractionModel = "gemini-2.5-pro"
+	cfg.Markets.News.ExtractionRPM = 10
+	cfg.Markets.News.ExtractionMaxArticlesPerTick = 5
+	errs := Validate(cfg)
+	if !containsStr(errs, "markets.news.extraction_provider/model") {
+		t.Fatalf("expected extraction provider/model error for unused registry entry, got: %v", errs)
+	}
+}
+
 func TestSetField_NestedPathAndBool(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HOME", dir)

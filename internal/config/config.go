@@ -1111,11 +1111,11 @@ func hasConfiguredModel(cfg *Config, provider, model string) bool {
 		return true
 	}
 
-	// Check all remaining registry entries (classifier, news_enricher, fallbacks,
-	// etc.) so extraction_provider/model can reference any configured registry key,
-	// not just analyst/arbiter roles.
-	for _, entry := range cfg.Models.Registry {
-		if match(entry.ModelConfig) {
+	// Check the news_enricher registry role. resolveEnricherProvider prefers this
+	// over the analyst scan, so it is a valid runtime source for extraction even
+	// when the model is not in the analyst list.
+	if mc, err := cfg.Models.ResolveRole("news_enricher"); err == nil {
+		if match(mc) {
 			return true
 		}
 	}
