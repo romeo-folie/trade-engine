@@ -110,6 +110,28 @@ func TestAlpacaFetchCandles_InvalidTimeframe(t *testing.T) {
 	}
 }
 
+func TestAlpacaFetchCandles_4HourTimeframe(t *testing.T) {
+	var gotTF string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotTF = r.URL.Query().Get("timeframe")
+		resp := alpacaBarsResponse{Symbol: "AAPL", Bars: []alpacaBar{}}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := newTestAlpacaClient(srv.URL)
+	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+	_, err := client.FetchCandles(context.Background(), "AAPL", Timeframe4Hour, from, to)
+	if err != nil {
+		t.Fatalf("FetchCandles error: %v", err)
+	}
+	if gotTF != "4Hour" {
+		t.Errorf("expected timeframe=4Hour, got %q", gotTF)
+	}
+}
+
 func TestAlpacaFetchHistory_Success(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		limit := r.URL.Query().Get("limit")

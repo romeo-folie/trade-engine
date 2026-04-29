@@ -15,6 +15,7 @@ const (
 	Timeframe5Min  Timeframe = "5m"
 	Timeframe15Min Timeframe = "15m"
 	Timeframe1Hour Timeframe = "1h"
+	Timeframe4Hour Timeframe = "4h"
 	Timeframe1Day  Timeframe = "1d"
 )
 

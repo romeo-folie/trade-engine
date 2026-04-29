@@ -12,6 +12,7 @@ import { useEffect, useRef, useState } from 'react';
 import { colors, typography } from '../../styles/tokens';
 
 interface ConsensusItem {
+  id?: string;   // unique key per bar (e.g. model name); falls back to label
   label: string;
   value?: number; // 0–1, optional if loading
   color: string;
@@ -120,7 +121,7 @@ export default function EnsembleConsensus({ items }: EnsembleConsensusProps) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5, width: '100%' }}>
       {items.map((item, i) => (
-        <AnimatedBar key={item.label} item={item} index={i} />
+        <AnimatedBar key={item.id ?? item.label} item={item} index={i} />
       ))}
     </div>
   );
