@@ -488,13 +488,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes, strategies []string) {
+		go func(ticker string, timeframes, strategies []string, source string) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes, strategies)
-		}(item.Ticker, item.Timeframes, item.Strategies)
+			e.processStock(ctx, ticker, timeframes, strategies, source)
+		}(item.Ticker, item.Timeframes, item.Strategies, item.Source)
 	}
 
 	wg.Wait()
@@ -517,7 +517,7 @@ func (e *Engine) tick(ctx context.Context) error {
 
 // processStock fetches candles, computes indicators, and fetches news for a single stock.
 // strategies is the ticker's configured strategy list (from the watchlist item).
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string) {
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -623,7 +623,23 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 		Now:      time.Now(),
 	}
 
-	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, e.cfg.Analysis)
+	mcCfg := e.cfg.Analysis
+	if source == "scanner" && mcCfg.HoldCooldownMin > 0 {
+		reduced := mcCfg.HoldCooldownMin / 4
+		if reduced < 10 {
+			reduced = 10
+		}
+		if reduced > mcCfg.HoldCooldownMin {
+			reduced = mcCfg.HoldCooldownMin
+		}
+		mcCfg.HoldCooldownMin = reduced
+	}
+	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, mcCfg)
+	// Scanner tickers that previously returned WAIT must be re-evaluated next
+	// cycle regardless of indicator movement — WAIT means "check again soon".
+	if skip && skipReason == SkipReasonNoChange && source == "scanner" && prev != nil && prev.LastDecision == "WAIT" {
+		skip = false
+	}
 	if skip {
 		msg := "analysis skipped — no material change"
 		if skipReason == SkipReasonHoldCooldown {
@@ -642,12 +658,12 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	}
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash)
+	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source)
 }
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string) {
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string, source string) {
 	if set == nil {
 		return
 	}
@@ -762,6 +778,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		Ticker:             ticker,
 		Strategy:           strategy,
 		Timeframe:          timeframe,
+		MomentumPlay:       source == "scanner",
 		RecentCandles:      snaps,
 		KnowledgeContext:   knowledgeCtx,
 		SimilarAnalyses:    similarSetups,

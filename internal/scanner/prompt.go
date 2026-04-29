@@ -68,7 +68,7 @@ Rules:
     - news_catalyst → "news_sentiment" or "momentum"
     - volume_surge without directional news → "momentum"
     - oversold_bounce → "mean_reversion"
-- timeframes: swing trades generally use "1D" as primary; add "4H" for momentum setups or when entry timing matters
+- timeframes: momentum plays should use ["1H", "4H"] for entry timing; add "1D" only for longer multi-day swings. Prefer ["1H", "4H"] for momentum_breakout and news_catalyst setups. Use ["1D"] only for oversold_bounce or "other" where the move is likely to play out over several days
 - This is a discovery watchlist — add anything with a credible setup worth monitoring; the trading engine applies its own signal gates before acting.`, convictionStr)
 
 	var sb strings.Builder

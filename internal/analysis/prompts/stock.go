@@ -82,10 +82,50 @@ func BuildStockPrompt(
 	knowledgeContext string,
 	similarSetups []SimilarPastSetup,
 	performanceContext string,
+	momentumPlay bool,
 ) (systemPrompt, userMessage string) {
-	systemPrompt = buildSystem(strategy)
+	if momentumPlay {
+		systemPrompt = buildMomentumSystem(strategy)
+	} else {
+		systemPrompt = buildSystem(strategy)
+	}
 	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
+}
+
+// buildMomentumSystem returns a system prompt for scanner-sourced tickers.
+// It reframes the question from "swing-trade evaluation" to "is this momentum
+// entry still valid?" — appropriate for intraday movers and news catalysts.
+func buildMomentumSystem(strategy string) string {
+	return fmt.Sprintf(`You are a short-term momentum trader evaluating a live entry opportunity.
+
+This ticker was flagged by an intraday screener as a "%s" play (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
+
+OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
+{
+  "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
+  "confidence":  <float 0.0–1.0>,
+  "size_pct":    <float, recommended position size as %% of portfolio>,
+  "stop_loss":   <float price, or 0 if HOLD/WAIT>,
+  "take_profit": <float price, or 0 if HOLD/WAIT>,
+  "reasoning":   "<concise explanation referencing specific data points>"
+}
+
+RULES:
+- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
+- confidence must be between 0.0 and 1.0.
+- size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
+- Do not output markdown, explanations, or any text outside the JSON object.
+- Never recommend size_pct > 0 for a HOLD or WAIT action.
+- Focus on short/medium timeframe signals (1H, 4H candles) over daily trend context.
+
+ENTRY DECISION GUIDE:
+- BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 2:1 with a clear stop below recent structure.
+- SELL: catalyst is negative, price shows exhaustion or a failed breakout, or a long position should exit.
+- WAIT: the setup is valid but timing is poor — gap too wide, no intraday base formed yet, or consolidation still in progress. WAIT means re-evaluate next cycle.
+- HOLD: the original momentum has faded, the catalyst is fully priced in, or the setup has failed. Remove this ticker from active consideration.
+
+SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.`, strategy)
 }
 
 func buildSystem(strategy string) string {

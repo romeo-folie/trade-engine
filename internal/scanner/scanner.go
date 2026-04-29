@@ -178,7 +178,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	for _, sc := range scored {
 		timeframes := sc.score.Timeframes
 		if len(timeframes) == 0 {
-			timeframes = []string{"1D"}
+			timeframes = []string{"1H", "4H"}
 		}
 		item := store.WatchlistItem{
 			Ticker:    sc.candidate.Ticker,

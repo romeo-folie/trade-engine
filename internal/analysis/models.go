@@ -61,6 +61,12 @@ type AnalysisRequest struct {
 	// injection into the stock prompt's PERFORMANCE CONTEXT section.
 	// Empty string causes the prompt to emit a "not available" placeholder.
 	PerformanceContext string
+
+	// MomentumPlay signals that this ticker was added by the scanner as a
+	// short-term momentum or catalyst play. Providers swap in a momentum-focused
+	// system prompt that asks "is the entry still valid?" rather than the
+	// standard swing-trade framing.
+	MomentumPlay bool
 }
 
 // SimilarSetup describes a past analysis that resembles the current one,
