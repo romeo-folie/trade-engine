@@ -629,9 +629,17 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 		if reduced < 10 {
 			reduced = 10
 		}
+		if reduced > mcCfg.HoldCooldownMin {
+			reduced = mcCfg.HoldCooldownMin
+		}
 		mcCfg.HoldCooldownMin = reduced
 	}
 	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, mcCfg)
+	// Scanner tickers that previously returned WAIT must be re-evaluated next
+	// cycle regardless of indicator movement — WAIT means "check again soon".
+	if skip && skipReason == SkipReasonNoChange && source == "scanner" && prev != nil && prev.LastDecision == "WAIT" {
+		skip = false
+	}
 	if skip {
 		msg := "analysis skipped — no material change"
 		if skipReason == SkipReasonHoldCooldown {

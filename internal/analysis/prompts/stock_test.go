@@ -6,6 +6,26 @@ import (
 	"time"
 )
 
+func TestBuildStockPrompt_MomentumPlay(t *testing.T) {
+	sys, _ := BuildStockPrompt(
+		"NVDA", "momentum", "1h",
+		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
+	)
+	momentumMarkers := []string{
+		"momentum trader",
+		"entry is STILL valid",
+		"WAIT means re-evaluate next cycle",
+	}
+	for _, m := range momentumMarkers {
+		if !strings.Contains(sys, m) {
+			t.Fatalf("momentum system prompt missing expected text: %q", m)
+		}
+	}
+	if strings.Contains(sys, "disciplined quantitative trading analyst") {
+		t.Fatal("momentum prompt should not contain standard swing-trade framing")
+	}
+}
+
 func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 	sys, user := BuildStockPrompt(
 		"AAPL",
