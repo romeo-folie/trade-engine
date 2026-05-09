@@ -27,7 +27,12 @@ ALTER TABLE trades
     ADD COLUMN IF NOT EXISTS consolidated_into UUID
     REFERENCES trades(id) ON DELETE SET NULL;
 
--- 3. Index supports lookups like "show me every row collapsed into X" and
---    keeps the FK validation cheap.
+-- 3. Partial index supports lookups like "show me every row collapsed into X"
+--    and keeps the FK validation cheap. The WHERE clause skips the (vast
+--    majority) NULL rows so the index stays small — only consolidated rows
+--    are indexed. Dropped + recreated to guarantee the partial predicate
+--    even if a prior (non-partial) version of this migration was applied.
+DROP INDEX IF EXISTS idx_trades_consolidated_into;
 CREATE INDEX IF NOT EXISTS idx_trades_consolidated_into
-    ON trades(consolidated_into);
+    ON trades(consolidated_into)
+    WHERE consolidated_into IS NOT NULL;
