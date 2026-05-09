@@ -86,14 +86,11 @@ func TestReconcile_BothEmpty(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{},
 		&fakeStore{},
 		0, // use default tolerance
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	recs := collect()
 	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 0 {
 		t.Fatalf("expected 0 drift warnings, got %d", got)
@@ -104,7 +101,7 @@ func TestReconcile_MatchWithinTolerance(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{positions: []execution.BrokerPosition{
 			{Symbol: "AAPL", Quantity: 10.005, Side: "long"},
 		}},
@@ -113,9 +110,6 @@ func TestReconcile_MatchWithinTolerance(t *testing.T) {
 		}},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	if got := countByLevelMsg(collect(), "WARN", "reconciler: broker/DB drift"); got != 0 {
 		t.Fatalf("expected 0 warnings within tolerance, got %d", got)
 	}
@@ -125,16 +119,13 @@ func TestReconcile_BrokerOnly(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{positions: []execution.BrokerPosition{
 			{Symbol: "JMIA", Quantity: 50, Side: "long"},
 		}},
 		&fakeStore{trades: nil},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	recs := collect()
 	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 1 {
 		t.Fatalf("expected 1 drift warning, got %d", got)
@@ -161,7 +152,7 @@ func TestReconcile_DBOnly(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{positions: nil},
 		&fakeStore{trades: []store.Trade{
 			{Ticker: "JMIA", Quantity: 25, Status: "open", Direction: "buy"},
@@ -169,9 +160,6 @@ func TestReconcile_DBOnly(t *testing.T) {
 		}},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	recs := collect()
 	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 1 {
 		t.Fatalf("expected 1 drift warning, got %d", got)
@@ -195,7 +183,7 @@ func TestReconcile_MismatchOverTolerance(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{positions: []execution.BrokerPosition{
 			{Symbol: "TSLA", Quantity: 12, Side: "long"},
 		}},
@@ -204,9 +192,6 @@ func TestReconcile_MismatchOverTolerance(t *testing.T) {
 		}},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	recs := collect()
 	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 1 {
 		t.Fatalf("expected 1 drift warning, got %d", got)
@@ -230,10 +215,7 @@ func TestReconcile_NilBrokerSkipsCleanly(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(), nil, &fakeStore{}, 0.01)
-	if err != nil {
-		t.Fatalf("expected nil error when broker is nil, got %v", err)
-	}
+	ReconcileBrokerVsDB(context.Background(), nil, &fakeStore{}, 0.01)
 	recs := collect()
 	if got := countByLevelMsg(recs, "INFO", "reconciler skipped — broker unavailable"); got != 1 {
 		t.Fatalf("expected 1 skip INFO, got %d", got)
@@ -247,16 +229,96 @@ func TestReconcile_BrokerUnavailableErrorSkipsCleanly(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{err: execution.ErrBrokerUnavailable},
 		&fakeStore{},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("expected nil error on ErrBrokerUnavailable, got %v", err)
-	}
 	if got := countByLevelMsg(collect(), "INFO", "reconciler skipped — broker unavailable"); got != 1 {
 		t.Fatalf("expected 1 skip INFO, got %d", got)
+	}
+}
+
+// TestReconcile_SideMismatch covers the canonical side-flip drift the abs-only
+// aggregation used to hide: broker reports a -50 short, DB has a 50 long. The
+// absolute quantities are equal, but the positions point in opposite
+// directions — that's a real, dangerous mismatch.
+func TestReconcile_SideMismatch(t *testing.T) {
+	collect, restore := captureLogs(t)
+	defer restore()
+
+	ReconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{positions: []execution.BrokerPosition{
+			{Symbol: "JMIA", Quantity: -50, Side: "short"},
+		}},
+		&fakeStore{trades: []store.Trade{
+			{Ticker: "JMIA", Quantity: 50, Status: "open", Direction: "buy"},
+		}},
+		0.01,
+	)
+	recs := collect()
+	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 1 {
+		t.Fatalf("expected 1 drift warning, got %d", got)
+	}
+	rec := findRecord(recs, "WARN", "reconciler: broker/DB drift", "JMIA")
+	if rec == nil {
+		t.Fatal("expected JMIA WARN record not found")
+	}
+	if rec["source"] != "side_mismatch" {
+		t.Fatalf("expected source=side_mismatch, got %v", rec["source"])
+	}
+	if rec["broker_qty"].(float64) != -50 {
+		t.Fatalf("expected broker_qty=-50 (signed), got %v", rec["broker_qty"])
+	}
+	if rec["db_qty"].(float64) != 50 {
+		t.Fatalf("expected db_qty=50 (signed long), got %v", rec["db_qty"])
+	}
+}
+
+// TestReconcile_BrokerShortPositiveQtyWithSide covers the non-Alpaca shape
+// where a broker reports a positive Quantity with Side="short". The reconciler
+// must still treat it as a short and flag the side mismatch against a long DB
+// row.
+func TestReconcile_BrokerShortPositiveQtyWithSide(t *testing.T) {
+	collect, restore := captureLogs(t)
+	defer restore()
+
+	ReconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{positions: []execution.BrokerPosition{
+			{Symbol: "JMIA", Quantity: 50, Side: "short"},
+		}},
+		&fakeStore{trades: []store.Trade{
+			{Ticker: "JMIA", Quantity: 50, Status: "open", Direction: "buy"},
+		}},
+		0.01,
+	)
+	recs := collect()
+	rec := findRecord(recs, "WARN", "reconciler: broker/DB drift", "JMIA")
+	if rec == nil {
+		t.Fatal("expected JMIA WARN record not found")
+	}
+	if rec["source"] != "side_mismatch" {
+		t.Fatalf("expected source=side_mismatch, got %v", rec["source"])
+	}
+}
+
+// TestReconcile_BothShortMatch ensures the signed convention does not
+// accidentally flag a legitimate match where both sides are short.
+func TestReconcile_BothShortMatch(t *testing.T) {
+	collect, restore := captureLogs(t)
+	defer restore()
+
+	ReconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{positions: []execution.BrokerPosition{
+			{Symbol: "JMIA", Quantity: -50, Side: "short"},
+		}},
+		&fakeStore{trades: []store.Trade{
+			{Ticker: "JMIA", Quantity: 50, Status: "open", Direction: "sell"},
+		}},
+		0.01,
+	)
+	if got := countByLevelMsg(collect(), "WARN", "reconciler: broker/DB drift"); got != 0 {
+		t.Fatalf("expected 0 warnings when both sides are short and quantities match, got %d", got)
 	}
 }
 
@@ -264,7 +326,7 @@ func TestReconcile_MultipleTickersDeterministicOrder(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()
 
-	err := ReconcileBrokerVsDB(context.Background(),
+	ReconcileBrokerVsDB(context.Background(),
 		&fakeBrokerView{positions: []execution.BrokerPosition{
 			{Symbol: "ZBRA", Quantity: 1},
 			{Symbol: "AAPL", Quantity: 9},
@@ -275,9 +337,6 @@ func TestReconcile_MultipleTickersDeterministicOrder(t *testing.T) {
 		}},
 		0.01,
 	)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
 	recs := collect()
 	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 3 {
 		t.Fatalf("expected 3 drift warnings, got %d", got)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"sort"
+	"strings"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -40,56 +41,88 @@ func (storeAdapter) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	return store.GetOpenTrades(ctx)
 }
 
+// signedBrokerQty returns the broker quantity with the sign implied by the
+// position side. Some brokers (Alpaca) already signal shorts via a negative
+// Quantity; others may pass a positive Quantity with Side="short". We normalise
+// to a single signed convention: negative => short, positive => long.
+func signedBrokerQty(p execution.BrokerPosition) float64 {
+	if p.Quantity < 0 {
+		return p.Quantity
+	}
+	if strings.EqualFold(p.Side, "short") {
+		return -math.Abs(p.Quantity)
+	}
+	return p.Quantity
+}
+
+// signedDBQty translates a DB-stored open trade into a signed quantity using
+// the same convention as signedBrokerQty. DB stores quantity as a positive
+// number with a separate Direction column ("buy"/"sell" or "long"/"short").
+// "sell"/"short" are treated as a held short position.
+func signedDBQty(t store.Trade) float64 {
+	q := math.Abs(t.Quantity)
+	d := strings.ToLower(strings.TrimSpace(t.Direction))
+	if d == "sell" || d == "short" {
+		return -q
+	}
+	return q
+}
+
 // ReconcileBrokerVsDB compares broker positions to DB-tracked open trades and
 // emits a WARN log line for every ticker where they diverge by more than
 // `tolerance` shares. It is observability-only: no DB or broker mutation.
 //
 // Behaviour:
 //   - broker == nil OR PositionsSnapshot returns ErrBrokerUnavailable: logs an
-//     INFO ("reconciler skipped — broker unavailable") and returns nil. Boot
-//     must not fail when there is no real broker (e.g. PaperExecutor).
+//     INFO ("reconciler skipped — broker unavailable") and returns. Boot must
+//     not fail when there is no real broker (e.g. PaperExecutor).
 //   - tolerance <= 0: falls back to DefaultBrokerDriftToleranceShares.
 //   - Tickers present in only one side count as drift (source=broker_only or
-//     source=db_only). Tickers present in both with |Δqty| > tolerance log
-//     source=mismatch.
+//     source=db_only).
+//   - Tickers present in both with |Δsigned_qty| > tolerance log
+//     source=mismatch. When the absolute quantities are within tolerance but
+//     the signs differ (e.g. broker -50 short vs DB 50 long), the drift is
+//     reported with source=side_mismatch — the most dangerous shape of drift.
 //
 // Mirrors the visibility-first stance of reconcileDoneSessionTrades (PR #297).
-func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db reconcilerStore, tolerance float64) error {
+// Returns no error: failures (broker fetch, DB fetch) are logged and swallowed
+// so a stale dev DB or paused broker can't block engine start.
+func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db reconcilerStore, tolerance float64) {
 	if tolerance <= 0 {
 		tolerance = DefaultBrokerDriftToleranceShares
 	}
 
 	if broker == nil {
 		logger.Info("reconciler skipped — broker unavailable", "reason", "nil_broker_view")
-		return nil
+		return
 	}
 
 	positions, err := broker.PositionsSnapshot(ctx)
 	if err != nil {
 		if errors.Is(err, execution.ErrBrokerUnavailable) {
 			logger.Info("reconciler skipped — broker unavailable", "reason", "ErrBrokerUnavailable")
-			return nil
+			return
 		}
 		logger.Warn("reconciler: broker positions fetch failed", "err", err.Error())
-		return nil
+		return
 	}
 
 	if db == nil {
 		logger.Warn("reconciler: db unavailable — skipping")
-		return nil
+		return
 	}
 	openTrades, err := db.GetOpenTrades(ctx)
 	if err != nil {
 		logger.Warn("reconciler: db open trades fetch failed", "err", err.Error())
-		return nil
+		return
 	}
 
 	type aggregate struct {
-		brokerQty   float64
-		dbQty       float64
-		dbRowCount  int
-		seenBroker  bool
-		seenDB      bool
+		brokerQty  float64 // signed: negative for short, positive for long
+		dbQty      float64 // signed: same convention
+		dbRowCount int
+		seenBroker bool
+		seenDB     bool
 	}
 	byTicker := make(map[string]*aggregate)
 
@@ -102,10 +135,7 @@ func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 			a = &aggregate{}
 			byTicker[p.Symbol] = a
 		}
-		// BrokerPosition.Quantity is signed for short positions; use absolute
-		// value because DB-side quantity is stored as a positive number with
-		// a separate `direction` column.
-		a.brokerQty += math.Abs(p.Quantity)
+		a.brokerQty += signedBrokerQty(p)
 		a.seenBroker = true
 	}
 
@@ -118,7 +148,7 @@ func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 			a = &aggregate{}
 			byTicker[t.Ticker] = a
 		}
-		a.dbQty += t.Quantity
+		a.dbQty += signedDBQty(t)
 		a.dbRowCount++
 		a.seenDB = true
 	}
@@ -135,15 +165,26 @@ func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 	for _, ticker := range tickers {
 		a := byTicker[ticker]
 		diff := math.Abs(a.brokerQty - a.dbQty)
-		if diff <= tolerance {
+		absMatchesButSidesDiffer := math.Abs(math.Abs(a.brokerQty)-math.Abs(a.dbQty)) <= tolerance &&
+			a.seenBroker && a.seenDB &&
+			((a.brokerQty < 0) != (a.dbQty < 0)) &&
+			(a.brokerQty != 0 || a.dbQty != 0)
+
+		if diff <= tolerance && !absMatchesButSidesDiffer {
 			continue
 		}
+
 		source := "mismatch"
 		switch {
 		case a.seenBroker && !a.seenDB:
 			source = "broker_only"
 		case !a.seenBroker && a.seenDB:
 			source = "db_only"
+		case absMatchesButSidesDiffer:
+			// Absolute quantities match within tolerance but signs differ:
+			// the canonical "broker short, DB long" (or vice-versa) drift
+			// that the abs-only check used to silently miss.
+			source = "side_mismatch"
 		}
 		logger.Warn("reconciler: broker/DB drift",
 			"ticker", ticker,
@@ -160,15 +201,14 @@ func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		"tickers_compared", len(tickers),
 		"drift_warnings", driftCount,
 	)
-	return nil
 }
 
 // ReconcileBrokerVsDBWithStore is a convenience wrapper that uses the package
 // store.GetOpenTrades. Call this from boot when no special test store is needed.
-func ReconcileBrokerVsDBWithStore(ctx context.Context, broker reconcilerBrokerView, tolerance float64) error {
+func ReconcileBrokerVsDBWithStore(ctx context.Context, broker reconcilerBrokerView, tolerance float64) {
 	if !store.IsConnected() {
 		logger.Info("reconciler skipped — db not connected")
-		return nil
+		return
 	}
-	return ReconcileBrokerVsDB(ctx, broker, storeAdapter{}, tolerance)
+	ReconcileBrokerVsDB(ctx, broker, storeAdapter{}, tolerance)
 }
