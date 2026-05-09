@@ -136,13 +136,26 @@ func Info(msg string, args ...any)  { Get().Info(msg, args...) }
 func Warn(msg string, args ...any)  { Get().Warn(msg, args...) }
 func Error(msg string, args ...any) { Get().Error(msg, args...) }
 
-// SetForTesting replaces the global logger with the supplied *slog.Logger and
-// returns a restore function. Intended for unit tests that need to capture
-// emitted log records (e.g. asserting WARN counts in the broker/DB
-// reconciler). Not safe for concurrent test use across goroutines unless the
-// callers serialise themselves.
+// SetForTesting replaces both the package-level logger (`std`, used by the
+// Debug/Info/Warn/Error wrappers in this file) AND the slog default
+// (`slog.Default`, used by callers that log via `slog.Info` etc. directly,
+// such as the orb and scanner packages) with the supplied *slog.Logger, and
+// returns a restore function that puts both back.
+//
+// Both must be set in lockstep: tests that capture WARN records would
+// otherwise miss every record emitted via `slog.*` directly, producing false
+// negatives where the production code clearly logged but the test asserted
+// "no logs". Restore reverses both in the inverse order.
+//
+// Not safe for concurrent test use across goroutines unless the callers
+// serialise themselves.
 func SetForTesting(l *slog.Logger) (restore func()) {
 	prev := std
+	prevDefault := slog.Default()
 	std = l
-	return func() { std = prev }
+	slog.SetDefault(l)
+	return func() {
+		std = prev
+		slog.SetDefault(prevDefault)
+	}
 }
