@@ -729,6 +729,20 @@ Modes:
 			}
 		}
 
+		// Startup broker-vs-DB reconciler (Issue #313). Pure observability:
+		// emits WARN per ticker where broker quantity diverges from summed DB
+		// open-trade quantity. Never crashes boot — broker errors are logged
+		// and swallowed so a stale dev DB or paused broker can't block start.
+		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
+			if err := engine.ReconcileBrokerVsDBWithStore(ctx, bv, 0); err != nil {
+				logger.Warn("startup reconciler returned error (non-fatal)", "err", err.Error())
+			}
+		} else {
+			if err := engine.ReconcileBrokerVsDBWithStore(ctx, nil, 0); err != nil {
+				logger.Warn("startup reconciler returned error (non-fatal)", "err", err.Error())
+			}
+		}
+
 		if err := eng.Run(ctx); err != nil {
 			return err
 		}

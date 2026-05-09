@@ -135,3 +135,14 @@ func Debug(msg string, args ...any) { Get().Debug(msg, args...) }
 func Info(msg string, args ...any)  { Get().Info(msg, args...) }
 func Warn(msg string, args ...any)  { Get().Warn(msg, args...) }
 func Error(msg string, args ...any) { Get().Error(msg, args...) }
+
+// SetForTesting replaces the global logger with the supplied *slog.Logger and
+// returns a restore function. Intended for unit tests that need to capture
+// emitted log records (e.g. asserting WARN counts in the broker/DB
+// reconciler). Not safe for concurrent test use across goroutines unless the
+// callers serialise themselves.
+func SetForTesting(l *slog.Logger) (restore func()) {
+	prev := std
+	std = l
+	return func() { std = prev }
+}
