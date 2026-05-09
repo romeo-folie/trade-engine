@@ -2,10 +2,10 @@
 name: te-correctness-unblock
 status: backlog
 created: 2026-05-09T20:01:47Z
-updated: 2026-05-09T20:01:47Z
+updated: 2026-05-09T20:49:15Z
 progress: 0%
 prd: .claude/prds/te-throughput-discipline.md
-github: (will be set on sync)
+github: https://github.com/romeo-folie/trade-engine/issues/310
 ---
 
 # Epic: te-correctness-unblock
@@ -73,11 +73,11 @@ Make the trade engine honest about what is open, free up the position budget tha
 
 ## Tasks Created
 
-- [ ] 001.md - JMIA verification + collapse migration (parallel: false; blocker for 002, 005)
-- [ ] 002.md - Distinct-ticker position counting + max_per_ticker cap (parallel: true; depends_on 001)
-- [ ] 003.md - Startup broker-vs-DB reconciler (parallel: true)
-- [ ] 004.md - Feedback-loop audit (performanceContext flow) (parallel: true)
-- [ ] 005.md - Canvas position-counter visibility (parallel: true; depends_on 002)
+- [ ] #311 - JMIA verification + collapse migration (parallel: false; blocker for 002, 005)
+- [ ] #312 - Distinct-ticker position counting + max_per_ticker cap (parallel: true; depends_on #311)
+- [ ] #313 - Startup broker-vs-DB reconciler (parallel: true)
+- [ ] #314 - Feedback-loop audit (performanceContext flow) (parallel: true)
+- [ ] #315 - Canvas position-counter visibility (parallel: true; depends_on #312)
 
 Total tasks: 5
 Parallel tasks: 4 (after 001 lands)

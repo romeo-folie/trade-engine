@@ -2,10 +2,10 @@
 name: te-generation-exits
 status: backlog
 created: 2026-05-09T20:01:47Z
-updated: 2026-05-09T20:01:47Z
+updated: 2026-05-09T20:49:25Z
 progress: 0%
 prd: .claude/prds/te-throughput-discipline.md
-github: (will be set on sync)
+github: https://github.com/romeo-folie/trade-engine/issues/316
 ---
 
 # Epic: te-generation-exits
@@ -92,18 +92,18 @@ Generate more BUY signals per week without lowering the quality bar, and exit po
 
 ## Tasks Created
 
-- [ ] 001.md - Gate calibration — R:R floor + tiered confidence + scanner-RSI loosen (parallel: true)
-- [ ] 002.md - Prompt tightening (R:R self-filter) + first-touch regression check (parallel: true; conflicts_with 007)
-- [ ] 003.md - SELL ownership short-circuit (parallel: true)
-- [ ] 004.md - Per-trade max-$-at-risk hard cap (parallel: true)
-- [ ] 005.md - Multi-timeframe arbiter for borderline WAITs (parallel: true)
-- [ ] 006.md - Server-side trailing stop manager (parallel: true)
-- [ ] 007.md - Specialist analysts (parallel: false; depends_on 001; conflicts_with 002)
-- [ ] 008.md - Pyramiding into winners (parallel: true; cross-epic depends on te-correctness-unblock/002)
-- [ ] 009.md - Observability — counterfactual logging + daily summary counters (parallel: true; depends_on 001)
+- [ ] #317 - Gate calibration — R:R floor + tiered confidence + scanner-RSI loosen (parallel: true)
+- [ ] #318 - Prompt tightening (R:R self-filter) + first-touch regression check (parallel: true; conflicts_with #323)
+- [ ] #319 - SELL ownership short-circuit (parallel: true)
+- [ ] #320 - Per-trade max-$-at-risk hard cap (parallel: true)
+- [ ] #321 - Multi-timeframe arbiter for borderline WAITs (parallel: true)
+- [ ] #322 - Server-side trailing stop manager (parallel: true)
+- [ ] #323 - Specialist analysts (parallel: false; depends_on #317; conflicts_with #318)
+- [ ] #324 - Pyramiding into winners (parallel: true; cross-epic depends on #312 (te-correctness-unblock))
+- [ ] #325 - Observability — counterfactual logging + daily summary counters (parallel: true; depends_on #317)
 
 Total tasks: 9
 Parallel tasks: 8
 Sequential tasks: 1 (007 must wait for 001 and not run alongside 002)
-Cross-epic dependency: 008 hard-depends on te-correctness-unblock/002
+Cross-epic dependency: 008 hard-depends on #312 (te-correctness-unblock)
 Estimated total effort: 40–60 hours
