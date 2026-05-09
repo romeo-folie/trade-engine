@@ -647,6 +647,94 @@ func TestTrade_LifecycleAndQuery(t *testing.T) {
 	}
 }
 
+// TestTrade_ConsolidatedExcludedFromOpen verifies that the migration that
+// added the `consolidated` trade_status enum value (issue #311) is wired
+// correctly: GetOpenTrades must NOT return rows whose status was set to
+// 'consolidated' by the JMIA collapse migration.
+//
+// The test inserts two open rows for the same ticker, marks one
+// 'consolidated' with consolidated_into pointing at the other, and asserts
+// only the canonical row appears in GetOpenTrades.
+func TestTrade_ConsolidatedExcludedFromOpen(t *testing.T) {
+	ctx := context.Background()
+
+	canonicalID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_TR_CONSOL",
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 10.0,
+		Quantity:   100.0,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade canonical: %v", err)
+	}
+	staleID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_TR_CONSOL",
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 11.0,
+		Quantity:   50.0,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade stale: %v", err)
+	}
+
+	// Apply the same mutation the consolidate command performs.
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE trades
+		SET status='consolidated', consolidated_into=$1
+		WHERE id=$2`, canonicalID, staleID); err != nil {
+		t.Fatalf("mark consolidated: %v", err)
+	}
+
+	open, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("GetOpenTrades: %v", err)
+	}
+	for _, tr := range open {
+		if tr.ID == staleID {
+			t.Errorf("GetOpenTrades returned consolidated row %q (must be excluded)", staleID)
+		}
+	}
+
+	// Sanity: the canonical row IS still open.
+	foundCanonical := false
+	for _, tr := range open {
+		if tr.ID == canonicalID {
+			foundCanonical = true
+			break
+		}
+	}
+	if !foundCanonical {
+		t.Errorf("GetOpenTrades: canonical row %q missing", canonicalID)
+	}
+
+	// Sanity: the consolidated row is still in the table (preserved, not deleted)
+	// and carries the expected back-pointer.
+	got, err := store.GetTradeByID(ctx, staleID)
+	if err != nil {
+		t.Fatalf("GetTradeByID stale: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("consolidated row %q was deleted; should be preserved", staleID)
+	}
+	if got.Status != "consolidated" {
+		t.Errorf("status: got %q, want consolidated", got.Status)
+	}
+
+	// Verify the consolidated_into pointer via direct SELECT (column not on
+	// the Trade struct because it's collapse-only metadata).
+	var pointsAt string
+	if err := store.GetDB().QueryRow(ctx,
+		`SELECT consolidated_into::text FROM trades WHERE id=$1`, staleID,
+	).Scan(&pointsAt); err != nil {
+		t.Fatalf("query consolidated_into: %v", err)
+	}
+	if pointsAt != canonicalID {
+		t.Errorf("consolidated_into: got %q, want %q", pointsAt, canonicalID)
+	}
+}
+
 // ─── Portfolio ────────────────────────────────────────────────────────────────
 
 func TestPortfolio_EmptyRangeNoError(t *testing.T) {
