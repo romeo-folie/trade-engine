@@ -16,16 +16,18 @@
 //	    --broker-avg-entry=2.34 \
 //	    --apply
 //
-// REVERSIBILITY: the operation is reversible with a single SQL statement
-// against the canonical id printed at end of the run:
+// REVERSIBILITY: rollback is partial. The collapse can be reverted with:
 //
 //	UPDATE trades
 //	SET status='open', consolidated_into=NULL
 //	WHERE consolidated_into = '<canonical_id>';
 //
-// The canonical row's pre-collapse quantity / entry_price are NOT
-// preserved by this script — capture them from the dry-run output before
-// running with --apply if you want a perfect rollback.
+// HOWEVER, the canonical row's pre-collapse quantity / entry_price are NOT
+// preserved by this script — applying --apply overwrites them with the
+// broker aggregate. To enable a *full* rollback, this command always prints
+// the canonical row's original quantity / entry_price along with a
+// copy-pasteable UPDATE statement (both in dry-run and --apply). Capture
+// those values before running with --apply if you want a perfect rollback.
 package main
 
 import (
@@ -116,9 +118,32 @@ func run() error {
 			*expectedRows, *ticker, len(openRows), len(openRows))
 	}
 
-	// 2. Pick the canonical row deterministically: the only one that has a
-	//    matching row in `orders` (i.e. was actually placed at the broker).
-	//    Tiebreaker: oldest opened_at.
+	// 2. Pick the canonical row deterministically: it must be the ONLY open
+	//    row that has a matching row in `orders` (i.e. was actually placed
+	//    at the broker). If two or more open rows are broker-linked, this is
+	//    NOT a stale-restart pattern — it's real broker-tracked state and
+	//    consolidating would erase data. Refuse explicitly.
+	var brokerLinkedCount int
+	if err := db.QueryRow(ctx, `
+		SELECT count(*)
+		FROM trades
+		WHERE ticker=$1
+		  AND status='open'
+		  AND id IN (SELECT trade_id FROM orders WHERE ticker=$1 AND trade_id IS NOT NULL)`,
+		*ticker,
+	).Scan(&brokerLinkedCount); err != nil {
+		return fmt.Errorf("count broker-linked open rows: %w", err)
+	}
+	if brokerLinkedCount == 0 {
+		return fmt.Errorf("no open %s row has a matching orders row — refusing to guess at the canonical row", *ticker)
+	}
+	if brokerLinkedCount > 1 {
+		return fmt.Errorf("multiple open %s rows have linked orders (got %d) — refusing to consolidate; manual investigation required",
+			*ticker, brokerLinkedCount)
+	}
+
+	// Exactly one broker-linked row — that's the canonical row. Tiebreaker
+	// by opened_at is preserved for safety even though count==1.
 	var canonicalID string
 	err = db.QueryRow(ctx, `
 		SELECT id
@@ -142,8 +167,11 @@ func run() error {
 	fmt.Printf("broker qty:       %.4f\n", *brokerQty)
 	fmt.Printf("broker avg entry: %.6f\n\n", *brokerAvgEntry)
 	fmt.Println("PLAN:")
+	var canonicalOrigQty, canonicalOrigEntry float64
 	for _, r := range openRows {
 		if r.ID == canonicalID {
+			canonicalOrigQty = r.Quantity
+			canonicalOrigEntry = r.EntryPrice
 			fmt.Printf("  CANONICAL  %s  qty=%g entry=%g  -> qty=%g entry=%g (broker aggregate)\n",
 				r.ID, r.Quantity, r.EntryPrice, *brokerQty, *brokerAvgEntry)
 		} else {
@@ -151,6 +179,17 @@ func run() error {
 				r.ID, r.Quantity, r.EntryPrice, canonicalID)
 		}
 	}
+	fmt.Println()
+
+	// Print the rollback recipe up-front (works for both dry-run and --apply)
+	// so the operator captures the canonical row's original qty/entry_price
+	// BEFORE they are overwritten. Rollback is partial without these values.
+	fmt.Println("ROLLBACK (capture before --apply):")
+	fmt.Printf("  -- partial rollback (status + pointer):\n")
+	fmt.Printf("  UPDATE trades SET status='open', consolidated_into=NULL WHERE consolidated_into = '%s';\n", canonicalID)
+	fmt.Printf("  -- restore canonical row's original quantity / entry_price:\n")
+	fmt.Printf("  UPDATE trades SET quantity=%g, entry_price=%g WHERE id = '%s';\n",
+		canonicalOrigQty, canonicalOrigEntry, canonicalID)
 	fmt.Println()
 
 	if !*apply {
@@ -168,6 +207,29 @@ func run() error {
 		// safe to call after Commit (returns ErrTxClosed which we ignore).
 		_ = tx.Rollback(ctx)
 	}()
+
+	// Re-verify the broker-linked count *inside* the transaction to close any
+	// race window between the pre-flight count and the UPDATE below. If a
+	// new broker-linked row appeared in the meantime, abort rather than
+	// erase real broker state.
+	var brokerLinkedCountTx int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*)
+		FROM trades
+		WHERE ticker=$1
+		  AND status='open'
+		  AND id IN (SELECT trade_id FROM orders WHERE ticker=$1 AND trade_id IS NOT NULL)`,
+		*ticker,
+	).Scan(&brokerLinkedCountTx); err != nil {
+		return fmt.Errorf("re-count broker-linked open rows in tx: %w", err)
+	}
+	if brokerLinkedCountTx > 1 {
+		return fmt.Errorf("multiple open %s rows have linked orders (got %d) — refusing to consolidate; manual investigation required",
+			*ticker, brokerLinkedCountTx)
+	}
+	if brokerLinkedCountTx == 0 {
+		return fmt.Errorf("canonical row no longer broker-linked at apply time — refusing to consolidate")
+	}
 
 	// Update canonical row's quantity / entry_price to the broker aggregate.
 	canonicalTag, err := tx.Exec(ctx, `
@@ -217,7 +279,10 @@ func run() error {
 	fmt.Printf("APPLIED. canonical=%s  consolidated=%d  remaining_open=%d\n",
 		canonicalID, consolidateTag.RowsAffected(), remainingOpen)
 	fmt.Println()
-	fmt.Println("Reversibility:")
+	fmt.Println("Reversibility (partial — restores status + pointer only):")
 	fmt.Printf("  UPDATE trades SET status='open', consolidated_into=NULL WHERE consolidated_into = '%s';\n", canonicalID)
+	fmt.Println("Reversibility (full — also restores canonical qty/entry_price):")
+	fmt.Printf("  UPDATE trades SET quantity=%g, entry_price=%g WHERE id = '%s';\n",
+		canonicalOrigQty, canonicalOrigEntry, canonicalID)
 	return nil
 }
