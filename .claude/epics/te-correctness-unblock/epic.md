@@ -73,13 +73,13 @@ Make the trade engine honest about what is open, free up the position budget tha
 
 ## Tasks Created
 
-- [ ] #311 - JMIA verification + collapse migration (parallel: false; blocker for 002, 005)
+- [ ] #311 - JMIA verification + collapse migration (parallel: false; blocker for #312, #315)
 - [ ] #312 - Distinct-ticker position counting + max_per_ticker cap (parallel: true; depends_on #311)
 - [ ] #313 - Startup broker-vs-DB reconciler (parallel: true)
 - [ ] #314 - Feedback-loop audit (performanceContext flow) (parallel: true)
 - [ ] #315 - Canvas position-counter visibility (parallel: true; depends_on #312)
 
 Total tasks: 5
-Parallel tasks: 4 (after 001 lands)
-Sequential tasks: 1 (001 must precede 002 and 005)
+Parallel tasks: 4 (after #311 lands)
+Sequential tasks: 1 (#311 must precede #312 and #315)
 Estimated total effort: 12–18 hours

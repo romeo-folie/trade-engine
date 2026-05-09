@@ -104,6 +104,6 @@ Generate more BUY signals per week without lowering the quality bar, and exit po
 
 Total tasks: 9
 Parallel tasks: 8
-Sequential tasks: 1 (007 must wait for 001 and not run alongside 002)
-Cross-epic dependency: 008 hard-depends on #312 (te-correctness-unblock)
+Sequential tasks: 1 (#323 must wait for #317 and not run alongside #318)
+Cross-epic dependency: #324 hard-depends on #312 (te-correctness-unblock)
 Estimated total effort: 40–60 hours

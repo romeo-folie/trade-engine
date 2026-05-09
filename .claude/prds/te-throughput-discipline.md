@@ -86,7 +86,7 @@ Three problems compound.
 - Block reason: `max_$_at_risk %.2f%% > limit 1.00%%`.
 
 ### FR-10 — Server-side trailing stop manager
-- On each portfolio update tick, recompute trailing stop for each open long: `max(initial_stop, high_water_mark × (1 − atr_multiple))`.
+- On each portfolio update tick, recompute trailing stop for each open long: `max(initial_stop, high_water_mark − atr_multiple × ATR)`. ATR is in absolute price units; `atr_multiple` is a unitless coefficient (default 1.5).
 - Submit/replace the stop order with the broker.
 - Decouples exit timing from arbiter latency.
 - Initial implementation: stocks/long-only. Forex/ORB has its own exit machinery already.
