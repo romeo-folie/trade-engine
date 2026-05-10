@@ -20,6 +20,12 @@ type Analyzer struct {
 	arbiter  ModelProvider
 	cfg      config.ModelsConfig
 	bus      *events.Bus
+
+	// specialist is the optional 4-role specialist sub-config (Issue #323).
+	// Wired by the engine via SetSpecialistConfig when
+	// analysis.specialist_mode_enabled is true. Nil means specialist mode is
+	// off and AnalyzeSpecialist will refuse to run.
+	specialist *config.AnalysisConfig
 }
 
 // NewAnalyzer constructs an Analyzer from the models config section.
