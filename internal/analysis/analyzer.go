@@ -20,6 +20,12 @@ type Analyzer struct {
 	arbiter  ModelProvider
 	cfg      config.ModelsConfig
 	bus      *events.Bus
+
+	// specialist is the optional 4-role specialist sub-config (Issue #323).
+	// Wired by the engine via SetSpecialistConfig when
+	// analysis.specialist_mode_enabled is true. Nil means specialist mode is
+	// off and AnalyzeSpecialist will refuse to run.
+	specialist *config.AnalysisConfig
 }
 
 // NewAnalyzer constructs an Analyzer from the models config section.
@@ -255,6 +261,23 @@ func modelTimeout(p ModelProvider, cfg config.ModelsConfig) time.Duration {
 		}
 	}
 	return 30 * time.Second
+}
+
+// modelTimeoutForRegistry resolves the per-call timeout for a registry-keyed
+// provider. Specialist roles (Issue #323) often map to registry entries that
+// are NOT in models.roles.analysts, so the analysts-only modelTimeout() scan
+// would silently fall back to the hardcoded 30s and ignore registry-level
+// timeout_sec configuration. Lookup order:
+//  1. cfg.Registry[registryKey].TimeoutSec  (specialist + arbiter source of truth)
+//  2. modelTimeout(p, cfg)                  (analysts-config fallback)
+//  3. 30s                                    (final hard default, via modelTimeout)
+func modelTimeoutForRegistry(registryKey string, p ModelProvider, cfg config.ModelsConfig) time.Duration {
+	if registryKey != "" && cfg.Registry != nil {
+		if entry, ok := cfg.Registry[registryKey]; ok && entry.TimeoutSec > 0 {
+			return time.Duration(entry.TimeoutSec) * time.Second
+		}
+	}
+	return modelTimeout(p, cfg)
 }
 
 func primaryMeta(results []AnalystResult) ModelCallMeta {

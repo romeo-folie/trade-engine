@@ -251,6 +251,21 @@ type AnalysisConfig struct {
 	// MultiTimeframeBorderlineConfMax is the inclusive upper bound of the
 	// borderline confidence band. Defaults to 0.70.
 	MultiTimeframeBorderlineConfMax float64 `yaml:"multi_timeframe_borderline_conf_max"`
+
+	// SpecialistModeEnabled toggles the 4-role specialist arbiter path
+	// (Issue #323, inspired by Grok 4.20's Alpha Arena 4-agent debate).
+	// When true, the engine routes signal-generation calls to
+	// AnalyzeSpecialist instead of AnalyzeFull. AnalyzeFull itself is
+	// unchanged. Default: false (safe-rollout).
+	SpecialistModeEnabled bool `yaml:"specialist_mode_enabled"`
+
+	// SpecialistRoles maps each specialist role name to a registry key in
+	// models.registry. Recognised roles: fundamental, technical, sentiment,
+	// risk_manager. Roles whose mapped provider is missing or unavailable
+	// are skipped at runtime with a WARN log (no crash).
+	// Example: {fundamental: claude, technical: deepseek, sentiment: gemini,
+	//           risk_manager: grok}
+	SpecialistRoles map[string]string `yaml:"specialist_roles"`
 }
 
 // ClassifierConfig controls the two-stage classifier gate.
