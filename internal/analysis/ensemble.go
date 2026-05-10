@@ -109,11 +109,15 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 
 	// Shuffle to anonymise.
 	indices := rand.Perm(len(successes))
-	labels := []string{"Model-A", "Model-B", "Model-C", "Model-D", "Model-E"}
 	var sb strings.Builder
 	for i, idx := range indices {
 		r := successes[idx]
-		label := labels[i%len(labels)]
+		// Generate enough unique labels for arbitrary ensemble sizes —
+		// previously we cycled a fixed 5-label slice, so a 6-result combined
+		// set (e.g. multi-timeframe re-arbitration with 3 analysts × 2
+		// timeframes) re-used "Model-A" for two distinct results, making the
+		// arbiter prompt ambiguous (Codex P2, Issue #321 PR #336).
+		label := arbiterLabel(i)
 		sb.WriteString(fmt.Sprintf("\n--- %s ---\nAction: %s\nConfidence: %.3f\nSizePct: %.1f%%\n",
 			label, r.Response.Action, r.Response.Confidence, r.Response.SizePct))
 		if r.Response.StopLoss > 0 {
@@ -145,6 +149,26 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		"dissent", dissentSummary != "", "latency_ms", meta.LatencyMs,
 	)
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
+}
+
+// arbiterLabel returns a unique anonymised label for the i-th analyst result
+// in the arbiter prompt: Model-A..Model-Z, Model-AA..Model-ZZ, Model-AAA..,
+// etc. True Excel-column-style encoder: unique for any i ≥ 0 with no
+// collisions, including the 26→AA and 702→AAA roll-overs.
+//
+// Issue #321 PR #336: the round-2 fixup used `(i/26 - 1) % 26` which is
+// modulo on the first character — `arbiterLabel(702)` would have wrapped
+// back to "Model-AA" (same as i=26) instead of producing "Model-AAA".
+// This implementation handles arbitrary i correctly.
+func arbiterLabel(i int) string {
+	s := ""
+	i++ // bijective base-26 (Excel) is 1-indexed for the column scheme.
+	for i > 0 {
+		i--
+		s = string(rune('A'+(i%26))) + s
+		i /= 26
+	}
+	return "Model-" + s
 }
 
 // ─── Majority vote fallback ─────────────────────────────────────────────────────
