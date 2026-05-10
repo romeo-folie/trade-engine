@@ -471,16 +471,16 @@ func (s *Server) handlePortfolioDailyCounters(w http.ResponseWriter, r *http.Req
 		summaries = []store.DailySummary{}
 	}
 
-	// If today's row hasn't been upserted yet, synthesize it from the live
-	// aggregate so the dashboard isn't permanently waiting for the next 5-
-	// minute rollup tick.
+	// Today's counters need to be live: the dashboard polls every 5 seconds,
+	// but the daily-summary writer only fires every few minutes (and once per
+	// rollup tick). Without overlaying, the UI sticks at zero — or, worse, on
+	// a stale earlier-in-the-day count — until the next rollup. Persisted
+	// rows remain the source of truth for prior days; today is recomputed
+	// every request from the signals + trades tables.
 	todayStart := now.Truncate(24 * time.Hour)
-	hasToday := false
-	for _, s := range summaries {
-		if s.Date.UTC().Truncate(24 * time.Hour).Equal(todayStart) {
-			hasToday = true
-			break
-		}
+	var liveToday *store.DailyCounters
+	if dc, err := store.AggregateDailyCounters(ctx, todayStart); err == nil {
+		liveToday = &dc
 	}
 
 	type counterDTO struct {
@@ -492,30 +492,44 @@ func (s *Server) handlePortfolioDailyCounters(w http.ResponseWriter, r *http.Req
 		ExecutedLosing  int            `json:"executed_losing"`
 		BlockedByReason map[string]int `json:"blocked_by_reason"`
 	}
+	dtoFromCounters := func(date time.Time, dc store.DailyCounters) counterDTO {
+		return counterDTO{
+			Date:            date.UTC().Format("2006-01-02"),
+			SignalsTotal:    dc.SignalsTotal,
+			SignalsBlocked:  dc.SignalsBlocked,
+			SignalsExecuted: dc.SignalsExecuted,
+			ExecutedWinning: dc.ExecutedWinning,
+			ExecutedLosing:  dc.ExecutedLosing,
+			BlockedByReason: dc.BlockedByReason,
+		}
+	}
+
 	out := make([]counterDTO, 0, len(summaries)+1)
-	for _, s := range summaries {
+	hasToday := false
+	for _, sum := range summaries {
+		sumDate := sum.Date.UTC().Truncate(24 * time.Hour)
+		if sumDate.Equal(todayStart) {
+			hasToday = true
+			if liveToday != nil {
+				// Replace the persisted (potentially stale) row with the
+				// live aggregate.
+				out = append(out, dtoFromCounters(todayStart, *liveToday))
+				continue
+			}
+		}
 		out = append(out, counterDTO{
-			Date:            s.Date.UTC().Format("2006-01-02"),
-			SignalsTotal:    s.SignalsTotal,
-			SignalsBlocked:  s.SignalsBlocked,
-			SignalsExecuted: s.SignalsExecuted,
-			ExecutedWinning: s.ExecutedWinning,
-			ExecutedLosing:  s.ExecutedLosing,
-			BlockedByReason: s.BlockedByReason,
+			Date:            sumDate.Format("2006-01-02"),
+			SignalsTotal:    sum.SignalsTotal,
+			SignalsBlocked:  sum.SignalsBlocked,
+			SignalsExecuted: sum.SignalsExecuted,
+			ExecutedWinning: sum.ExecutedWinning,
+			ExecutedLosing:  sum.ExecutedLosing,
+			BlockedByReason: sum.BlockedByReason,
 		})
 	}
-	if !hasToday {
-		if dc, err := store.AggregateDailyCounters(ctx, todayStart); err == nil {
-			out = append(out, counterDTO{
-				Date:            todayStart.Format("2006-01-02"),
-				SignalsTotal:    dc.SignalsTotal,
-				SignalsBlocked:  dc.SignalsBlocked,
-				SignalsExecuted: dc.SignalsExecuted,
-				ExecutedWinning: dc.ExecutedWinning,
-				ExecutedLosing:  dc.ExecutedLosing,
-				BlockedByReason: dc.BlockedByReason,
-			})
-		}
+	// No persisted row for today yet — append the synthesized one.
+	if !hasToday && liveToday != nil {
+		out = append(out, dtoFromCounters(todayStart, *liveToday))
 	}
 
 	jsonResponse(w, map[string]any{"counters": out})
