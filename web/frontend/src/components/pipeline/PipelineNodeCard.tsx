@@ -352,8 +352,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                           <div
                             className={styles.kindLabel}
                             style={{ color: '#fff' }}
-                            title="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
-                            aria-label="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
+                            title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
+                            aria-label="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
                           >
                             {ps.openPositions}
                             {ps.openTradeRows != null && ps.openTradeRows !== ps.openPositions && (

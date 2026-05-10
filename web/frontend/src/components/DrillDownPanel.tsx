@@ -274,7 +274,7 @@ function RiskPanel({ data }: { data: RiskData }) {
         label="Open Positions"
         value={value}
         color="#a855f7"
-        title="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
+        title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
       />
       {data.open_trades?.length > 0 && (
         <div style={{ marginTop: 16 }}>
@@ -314,7 +314,7 @@ function PortfolioPanel({ data }: { data: PortfolioData }) {
             label="Open Positions"
             value={positionsValue}
             color="#6b6b8f"
-            title="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
+            title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
           />
         </div>
       </div>
