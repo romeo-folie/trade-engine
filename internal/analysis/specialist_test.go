@@ -1,10 +1,190 @@
 package analysis
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/events"
 )
+
+// fakeRoleProvider is a stub ModelProvider used by AnalyzeSpecialist tests so
+// we don't need real API keys. Records the request and returns a fixed BUY.
+type fakeRoleProvider struct {
+	provider string
+	model    string
+}
+
+func (f *fakeRoleProvider) ProviderName() string { return f.provider }
+func (f *fakeRoleProvider) ModelName() string    { return f.model }
+func (f *fakeRoleProvider) IsAvailable() bool    { return true }
+func (f *fakeRoleProvider) Analyze(_ context.Context, _ AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
+	return AnalysisResponse{
+			Action: ActionBuy, Confidence: 0.7,
+			SizePct: 1.0, StopLoss: 100, TakeProfit: 110,
+			Reasoning: "fake " + f.provider,
+		},
+		ModelCallMeta{Provider: f.provider, Model: f.model},
+		nil
+}
+
+// withSpecialistBuildProvider swaps the package-level provider builder for the
+// duration of a test. Restores the original on Cleanup.
+func withSpecialistBuildProvider(t *testing.T, fn func(config.ModelConfig) ModelProvider) {
+	t.Helper()
+	prev := specialistBuildProvider
+	specialistBuildProvider = fn
+	t.Cleanup(func() { specialistBuildProvider = prev })
+}
+
+// TestAnalyzeSpecialist_EmitsAnalysisStarted is the regression guard for the
+// Copilot-flagged real bug: AnalyzeSpecialist must publish events.AnalysisStarted
+// (mirroring AnalyzeFull) so the pipeline graph / WebSocket protocol can pulse
+// the selected analyst nodes when specialist mode is on. The SelectedAnalysts
+// list must reflect only the roles that actually run.
+func TestAnalyzeSpecialist_EmitsAnalysisStarted(t *testing.T) {
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		return &fakeRoleProvider{provider: c.Provider, model: c.Model}
+	})
+
+	bus := events.New()
+	sub := bus.Subscribe(events.AnalysisStarted)
+
+	registry := config.ModelRegistry{
+		"analyst_frontier": {ModelConfig: config.ModelConfig{Provider: "anthropic", Model: "claude"}},
+		"analyst_mid":      {ModelConfig: config.ModelConfig{Provider: "openai", Model: "gpt"}},
+		"analyst_cheap":    {ModelConfig: config.ModelConfig{Provider: "deepseek", Model: "ds"}},
+	}
+	a := &Analyzer{
+		cfg: config.ModelsConfig{Registry: registry},
+		bus: bus,
+		specialist: &config.AnalysisConfig{
+			SpecialistRoles: map[string]string{
+				"fundamental":  "analyst_frontier",
+				"technical":    "analyst_mid",
+				"sentiment":    "analyst_cheap",
+				"risk_manager": "analyst_frontier",
+			},
+		},
+	}
+
+	if _, err := a.AnalyzeSpecialist(context.Background(), AnalysisRequest{Ticker: "AAPL"}, depth.ImpactScore{}); err != nil {
+		t.Fatalf("AnalyzeSpecialist returned error: %v", err)
+	}
+
+	// Drain — there must be exactly one AnalysisStarted, and no more.
+	var got []events.AnalysisStartedPayload
+	timeout := time.After(500 * time.Millisecond)
+loop:
+	for {
+		select {
+		case ev := <-sub.C:
+			p, ok := ev.Payload.(events.AnalysisStartedPayload)
+			if !ok {
+				t.Fatalf("unexpected payload type: %T", ev.Payload)
+			}
+			got = append(got, p)
+		case <-timeout:
+			break loop
+		}
+		if len(got) >= 2 {
+			// Give one more tick to surface duplicates, then break.
+			break
+		}
+	}
+	// Brief drain for any duplicate.
+	select {
+	case ev := <-sub.C:
+		got = append(got, ev.Payload.(events.AnalysisStartedPayload))
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 AnalysisStarted event, got %d (%+v)", len(got), got)
+	}
+	p := got[0]
+	if p.Ticker != "AAPL" {
+		t.Errorf("ticker = %q, want AAPL", p.Ticker)
+	}
+	if p.Depth != 4 {
+		t.Errorf("depth = %d, want 4 (4 successfully-resolved roles)", p.Depth)
+	}
+	want := []string{
+		"analyst-analyst_frontier", // fundamental
+		"analyst-analyst_mid",      // technical
+		"analyst-analyst_cheap",    // sentiment
+		"analyst-analyst_frontier", // risk_manager (same registry key by design)
+	}
+	if len(p.SelectedAnalysts) != len(want) {
+		t.Fatalf("SelectedAnalysts length = %d, want %d (%v vs %v)",
+			len(p.SelectedAnalysts), len(want), p.SelectedAnalysts, want)
+	}
+	// Order follows specialistRoleOrder (fundamental, technical, sentiment, risk_manager).
+	for i := range want {
+		if p.SelectedAnalysts[i] != want[i] {
+			t.Errorf("SelectedAnalysts[%d] = %q, want %q (full: %v)",
+				i, p.SelectedAnalysts[i], want[i], p.SelectedAnalysts)
+		}
+	}
+}
+
+// TestAnalyzeSpecialist_SelectedAnalystsExcludesUnresolvedRoles verifies that
+// the SelectedAnalysts list only includes roles that successfully resolved a
+// provider — skipped/missing roles must NOT leak into the event payload.
+func TestAnalyzeSpecialist_SelectedAnalystsExcludesUnresolvedRoles(t *testing.T) {
+	withSpecialistBuildProvider(t, func(c config.ModelConfig) ModelProvider {
+		return &fakeRoleProvider{provider: c.Provider, model: c.Model}
+	})
+
+	bus := events.New()
+	sub := bus.Subscribe(events.AnalysisStarted)
+
+	// Only two registry keys are defined — sentiment maps to a missing key, and
+	// risk_manager has an empty mapping. Both should be skipped silently.
+	registry := config.ModelRegistry{
+		"analyst_frontier": {ModelConfig: config.ModelConfig{Provider: "anthropic", Model: "claude"}},
+		"analyst_mid":      {ModelConfig: config.ModelConfig{Provider: "openai", Model: "gpt"}},
+	}
+	a := &Analyzer{
+		cfg: config.ModelsConfig{Registry: registry},
+		bus: bus,
+		specialist: &config.AnalysisConfig{
+			SpecialistRoles: map[string]string{
+				"fundamental":  "analyst_frontier",
+				"technical":    "analyst_mid",
+				"sentiment":    "missing_key", // Resolve will fail
+				"risk_manager": "",            // empty — skipped
+			},
+		},
+	}
+
+	if _, err := a.AnalyzeSpecialist(context.Background(), AnalysisRequest{Ticker: "T"}, depth.ImpactScore{}); err != nil {
+		t.Fatalf("AnalyzeSpecialist returned error: %v", err)
+	}
+
+	select {
+	case ev := <-sub.C:
+		p := ev.Payload.(events.AnalysisStartedPayload)
+		if len(p.SelectedAnalysts) != 2 {
+			t.Fatalf("SelectedAnalysts = %v; want exactly 2 entries (skipped roles must be excluded)", p.SelectedAnalysts)
+		}
+		sorted := append([]string{}, p.SelectedAnalysts...)
+		sort.Strings(sorted)
+		want := []string{"analyst-analyst_frontier", "analyst-analyst_mid"}
+		for i := range want {
+			if sorted[i] != want[i] {
+				t.Errorf("sorted[%d] = %q, want %q (full: %v)", i, sorted[i], want[i], p.SelectedAnalysts)
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("AnalysisStarted not emitted")
+	}
+}
 
 // makeRoleResult is the analogue of makeResult (ensemble_test.go) but tagged
 // with a specialist role so resolveSpecialist can apply the veto rule.

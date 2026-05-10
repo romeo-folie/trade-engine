@@ -22,12 +22,19 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
 // specialistRoleOrder is the canonical ordering used in reasoning concatenation
 // and table-driven tests. Risk-manager is last so its veto reads naturally.
 var specialistRoleOrder = []string{"fundamental", "technical", "sentiment", "risk_manager"}
+
+// specialistBuildProvider is the seam used by AnalyzeSpecialist to construct a
+// per-role provider from its resolved ModelConfig. Defaults to buildProvider
+// in production; tests overwrite this to inject fakes that don't require real
+// API keys.
+var specialistBuildProvider = buildProvider
 
 // specialistResult bundles a per-role response with the provider that produced it.
 type specialistResult struct {
@@ -58,8 +65,9 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 
 	// Resolve each role to a ModelProvider; skip with WARN when missing.
 	type roleProvider struct {
-		role     string
-		provider ModelProvider
+		role        string
+		registryKey string
+		provider    ModelProvider
 	}
 	var rps []roleProvider
 	for _, role := range specialistRoleOrder {
@@ -74,16 +82,32 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 				"role", role, "registry_key", key, "err", err)
 			continue
 		}
-		p := buildProvider(mc)
+		p := specialistBuildProvider(mc)
 		if !p.IsAvailable() {
 			logger.Warn("specialist role provider not available — skipping",
 				"role", role, "provider", p.ProviderName(), "model", p.ModelName())
 			continue
 		}
-		rps = append(rps, roleProvider{role: role, provider: p})
+		rps = append(rps, roleProvider{role: role, registryKey: key, provider: p})
 	}
 	if len(rps) < 2 {
 		return AnalyzeResult{}, fmt.Errorf("specialist mode: only %d/%d roles available — need at least 2", len(rps), len(specialistRoleOrder))
+	}
+
+	// Emit AnalysisStarted so the pipeline graph / WebSocket consumers can pulse
+	// the selected analyst nodes — mirrors AnalyzeFull's behavior. SelectedAnalysts
+	// reflects only the roles that will actually run (skipped/missing roles are
+	// excluded). Naming convention: "analyst-<registry_key>".
+	if a.bus != nil {
+		selected := make([]string, 0, len(rps))
+		for _, rp := range rps {
+			selected = append(selected, "analyst-"+rp.registryKey)
+		}
+		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+			Ticker:           req.Ticker,
+			Depth:            len(rps),
+			SelectedAnalysts: selected,
+		})
 	}
 
 	// Build the per-role custom system prompt. The user message is shared.
