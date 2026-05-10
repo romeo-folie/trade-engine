@@ -20,6 +20,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
 	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -178,6 +179,20 @@ Modes:
 		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
 			// One-time backfill runs in background; skips gracefully if DB unavailable.
 			go portfolio.Backfill(ctx, alpacaBroker, portfolioMode, portfolioBroker)
+		}
+
+		// Server-side trailing stop manager (#322). Opt-in; disabled by
+		// default so existing operators keep current behaviour. Walks the
+		// stop_loss up using `new_stop = max(current_stop, hwm − atr_multiple × ATR)`.
+		if cfg.Risk.TrailingStop.Enabled && marketProvider != nil && broker != nil {
+			tsCfg := trailing.Config{
+				Enabled:     true,
+				ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
+				Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
+				ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
+			}
+			mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
+			go mgr.Run(ctx)
 		}
 
 		// Start background embedding worker if enabled.
