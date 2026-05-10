@@ -63,3 +63,10 @@ func (liveStore) UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrok
 	}
 	return store.UpdateOrderStopPriceAndID(ctx, orderID, newBrokerOrderID, newStopPrice)
 }
+
+func (liveStore) CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.CloseTrade(ctx, id, exitPrice, pnl, pnlPct)
+}

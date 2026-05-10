@@ -155,6 +155,22 @@ func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error
 	return id, nil
 }
 
+func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.trades[id]
+	if !ok {
+		return errors.New("trade not found")
+	}
+	t.Status = "closed"
+	t.ExitPrice = exitPrice
+	t.PnL = pnl
+	t.PnLPct = pnlPct
+	t.ClosedAt = time.Now()
+	f.trades[id] = t
+	return nil
+}
+
 func (f *fakeStore) UpdateOrderStopPriceAndID(_ context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -660,6 +676,28 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	if len(fb.cancelled) == 0 {
 		t.Fatalf("expected stale stop to be cancelled before market exit")
 	}
+
+	// After a successful market exit the trade row MUST be flipped to
+	// status='closed' with exit_price + pnl set. Without this the trade
+	// stays open, gets re-selected by GetOpenTrades on the next tick, and
+	// the manager places a duplicate market sell.
+	closed := fs.trades["t1"]
+	if closed.Status != "closed" {
+		t.Fatalf("trade not closed after market exit: status=%q", closed.Status)
+	}
+	if closed.ExitPrice == 0 {
+		t.Fatalf("exit_price not persisted after market exit")
+	}
+
+	// Smoke test: a second UpdateAll tick must NOT emit another market sell
+	// because the closed trade is no longer "open". Without the close in
+	// the production path this would loop forever.
+	placedBefore := len(fb.placed)
+	m.UpdateAll(context.Background())
+	if len(fb.placed) != placedBefore {
+		t.Fatalf("duplicate market exit on second tick: placed %d → %d",
+			placedBefore, len(fb.placed))
+	}
 }
 
 // TestManager_RoundingAvoidsReplaceChurn pins the float-equality fix: when
@@ -773,6 +811,9 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	}
 	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0); err == nil {
 		t.Fatalf("UpdateOrderStopPriceAndID(no DB): want error, got nil")
+	}
+	if err := ls.CloseTrade(ctx, "t1", 100, 1, 1); err == nil {
+		t.Fatalf("CloseTrade(no DB): want error, got nil")
 	}
 }
 

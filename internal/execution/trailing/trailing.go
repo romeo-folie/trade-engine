@@ -92,6 +92,12 @@ type TradeStore interface {
 	LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*store.Order, error)
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
 	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error
+	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
+	// + closed_at. Called after a successful trail-driven market exit so the
+	// trade isn't picked up again on the next tick (which would place a
+	// duplicate market sell). Mirrors what engine.monitorPositions does on
+	// a stop/take-profit fill.
+	CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
 }
 
 // Config controls the trailing-stop manager.
@@ -257,8 +263,23 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("market exit: %w", err)
 		}
-		// Persist HWM only — the stop_loss row remains the prior value;
-		// fill-handling code closes the trade out as usual.
+		// Close the trade row immediately. Without this the trade stays
+		// status='open', GetOpenTrades returns it again on the next tick,
+		// and the manager places a duplicate market sell. Mirrors the
+		// close-side bookkeeping in engine.monitorPositions.
+		exitPrice := currentPrice
+		pnl := (exitPrice - t.EntryPrice) * t.Quantity
+		pnlPct := 0.0
+		if t.EntryPrice > 0 {
+			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
+		}
+		if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+			// Best-effort persist HWM so the next tick has updated baseline.
+			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
+			return fmt.Errorf("close trade after market exit: %w", err)
+		}
+		// Persist HWM after CloseTrade so the trail snapshot is intact for
+		// post-mortem queries.
 		return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 	}
 
