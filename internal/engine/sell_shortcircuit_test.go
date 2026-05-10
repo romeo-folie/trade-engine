@@ -1,11 +1,13 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/risk"
 )
 
@@ -116,6 +118,135 @@ func TestBuildOwnershipShortCircuitBlock(t *testing.T) {
 	}
 	if blockEv.BlockReason != reason {
 		t.Errorf("block event BlockReason = %q, want %q", blockEv.BlockReason, reason)
+	}
+}
+
+// TestShouldPrefetchOpenTrades verifies the gating predicate that controls
+// whether runAnalysis issues an up-front store.GetOpenTrades query (#319,
+// PR #337 round-3). The prefetch must run only when both conditions hold:
+//
+//   - the strategy is canonically SELL-only (dual-direction strategies do not
+//     need ownership info up-front; generateSignal fetches on-demand). Without
+//     this gate every analysis cycle pays a wasted DB roundtrip — Copilot perf
+//     regression flagged on round-2.
+//   - the store is connected (a nil pool would panic via GetDB inside
+//     GetOpenTrades). Without this gate the SELL-only path crashes whenever
+//     the engine runs degraded without a DB — Copilot crash flagged on round-2.
+func TestShouldPrefetchOpenTrades(t *testing.T) {
+	cases := []struct {
+		name         string
+		strategy     string
+		dbConnected  bool
+		wantPrefetch bool
+	}{
+		// SELL-only strategies prefetch only with a live DB.
+		{"sell_only with db prefetches", "sell_only", true, true},
+		{"exit_signal with db prefetches", "exit_signal", true, true},
+		{"close_position with db prefetches", "close_position", true, true},
+
+		// SELL-only without DB must NOT prefetch — would panic in GetDB.
+		// Falls through to LLM; the post-LLM gate handles no-DB the same
+		// way it does for any other SELL.
+		{"sell_only no db skips", "sell_only", false, false},
+		{"exit_signal no db skips", "exit_signal", false, false},
+
+		// Dual-direction strategies must NEVER prefetch even with a live DB —
+		// the prefetch is purely there to support the SELL ownership
+		// short-circuit, so for trend_following / mean_reversion / momentum /
+		// news_sentiment / etc. we leave it to generateSignal's on-demand
+		// fetch (perf regression fix).
+		{"trend_following with db skips", "trend_following", true, false},
+		{"trend_following no db skips", "trend_following", false, false},
+		{"mean_reversion with db skips", "mean_reversion", true, false},
+		{"momentum with db skips", "momentum", true, false},
+		{"news_sentiment with db skips", "news_sentiment", true, false},
+
+		// Empty / unknown strategies are treated as dual-direction.
+		{"empty with db skips", "", true, false},
+		{"unknown with db skips", "made_up", true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldPrefetchOpenTrades(tc.strategy, tc.dbConnected)
+			if got != tc.wantPrefetch {
+				t.Fatalf("shouldPrefetchOpenTrades(%q, dbConnected=%v) = %v, want %v",
+					tc.strategy, tc.dbConnected, got, tc.wantPrefetch)
+			}
+		})
+	}
+}
+
+// TestEmitOwnershipShortCircuitBlock_NoDBStillPublishesEvents verifies the
+// no-DB safety guard added in PR #337 round-3. emitOwnershipShortCircuitBlock
+// previously called store.InsertSignal unconditionally, which panics via
+// GetDB when the engine is running degraded without a database (Copilot crash
+// review). The fix skips the persist but still publishes RiskCheckCompleted +
+// SignalBlocked events so the in-process surfaces (TUI, Telegram, dashboard
+// SSE) continue to see the block. Only the persistent signals row is lost.
+func TestEmitOwnershipShortCircuitBlock_NoDBStillPublishesEvents(t *testing.T) {
+	// store.IsConnected reads the unexported package-level pool, which is nil
+	// in the test process unless an explicit Connect was issued. Engine tests
+	// in this package run without Connect, so IsConnected == false here.
+
+	bus := events.New()
+	riskSub := bus.Subscribe(events.RiskCheckCompleted)
+	defer bus.Unsubscribe(riskSub)
+	blockSub := bus.Subscribe(events.SignalBlocked)
+	defer bus.Unsubscribe(blockSub)
+
+	cfg := config.Defaults()
+	cfg.Risk.SignalExpiryMin = 30
+	cfg.Risk.StalePriceMovePct = 2.0
+
+	e := &Engine{
+		cfg: cfg,
+		bus: bus,
+	}
+
+	candles := []data.Candle{{Close: 555.55}}
+	reason := risk.NoPositionBlockReason("MSFT")
+
+	// Must not panic even though the store has no live pool.
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("emitOwnershipShortCircuitBlock panicked with no DB: %v", r)
+		}
+	}()
+	e.emitOwnershipShortCircuitBlock(context.Background(), "MSFT", "sell_only", candles, reason)
+
+	// Both events must have fired despite the missing DB. We use a short
+	// deadline rather than blocking forever so a bug that drops the publish
+	// surfaces as a clear timeout failure.
+	select {
+	case ev := <-riskSub.C:
+		payload, ok := ev.Payload.(events.RiskCheckCompletedPayload)
+		if !ok {
+			t.Fatalf("RiskCheckCompleted payload type = %T, want RiskCheckCompletedPayload", ev.Payload)
+		}
+		if payload.Ticker != "MSFT" || payload.Passed {
+			t.Errorf("risk event identity/pass wrong: %+v", payload)
+		}
+		if len(payload.Checks) != 1 || payload.Checks[0].Name != "position_ownership" {
+			t.Errorf("risk event checks wrong: %+v", payload.Checks)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RiskCheckCompleted not published within 1s")
+	}
+
+	select {
+	case ev := <-blockSub.C:
+		payload, ok := ev.Payload.(events.SignalBlockedPayload)
+		if !ok {
+			t.Fatalf("SignalBlocked payload type = %T, want SignalBlockedPayload", ev.Payload)
+		}
+		if payload.Ticker != "MSFT" || payload.Action != "SELL" {
+			t.Errorf("block event identity wrong: %+v", payload)
+		}
+		if payload.FailedCheck != "position_ownership" || payload.BlockReason != reason {
+			t.Errorf("block event metadata wrong: %+v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SignalBlocked not published within 1s")
 	}
 }
 
