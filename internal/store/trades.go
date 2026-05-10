@@ -25,6 +25,10 @@ type Trade struct {
 	OpenedAt      time.Time
 	ClosedAt      time.Time
 	CreatedAt     time.Time
+	// HighWaterMark is the running maximum price observed for an open trade,
+	// used by the trailing-stop manager (#322). 0 when the manager has not
+	// yet observed the trade (column is NULL in DB).
+	HighWaterMark float64
 }
 
 // InsertTrade creates a new open trade record and returns its UUID.
@@ -69,6 +73,63 @@ func UpdateOrderFillPrice(ctx context.Context, brokerOrderID string, filledPrice
 	return err
 }
 
+// UpdateTradeTrailing persists the latest trailing-stop computation for a
+// trade: the new stop_loss and the high_water_mark. Used by the trailing-stop
+// manager (#322). Either field may be 0 to skip updating that column.
+func UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades
+		SET stop_loss = COALESCE(NULLIF($1, 0), stop_loss),
+		    high_water_mark = COALESCE(NULLIF($2, 0), high_water_mark)
+		WHERE id = $3`,
+		stopLoss, highWaterMark, id)
+	return err
+}
+
+// LatestStopLossOrderForTrade returns the most-recently-created open stop-loss
+// order for a trade, or nil if none exists. Used by the trailing-stop
+// manager (#322) to decide whether to PATCH/replace an existing broker stop
+// or submit a new one.
+func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity,
+		       COALESCE(limit_price,0), COALESCE(stop_price,0),
+		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
+		       status, is_stop_loss, is_take_profit,
+		       created_at, updated_at
+		FROM orders
+		WHERE trade_id = $1
+		  AND is_stop_loss = TRUE
+		  AND status IN ('pending','partial')
+		ORDER BY created_at DESC
+		LIMIT 1`, tradeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out, err := scanOrders(rows)
+	if err != nil || len(out) == 0 {
+		return nil, err
+	}
+	return &out[0], nil
+}
+
+// UpdateOrderStopPriceAndID updates the stop price and broker order id of an
+// existing order row. The trailing-stop manager (#322) calls this after
+// successfully replacing the broker STOP — Alpaca returns a fresh order id
+// on PATCH so we have to track the new id.
+func UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE orders
+		SET stop_price = $1,
+		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
+		    updated_at = NOW()
+		WHERE id = $3`,
+		newStopPrice, newBrokerOrderID, orderID)
+	return err
+}
+
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
@@ -95,7 +156,8 @@ func GetOpenTrades(ctx context.Context) ([]Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
-		       opened_at, COALESCE(closed_at, opened_at), created_at
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0)
 		FROM trades WHERE status='open'
 		ORDER BY opened_at DESC`)
 	if err != nil {
@@ -113,7 +175,8 @@ func GetRecentTrades(ctx context.Context, limit int) ([]Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
-		       opened_at, COALESCE(closed_at, opened_at), created_at
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0)
 		FROM trades ORDER BY opened_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -130,7 +193,8 @@ func GetTradeByID(ctx context.Context, id string) (*Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
-		       opened_at, COALESCE(closed_at, opened_at), created_at
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0)
 		FROM trades WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
@@ -158,6 +222,7 @@ func scanTrades(rows interface {
 			&t.PnL, &t.PnLPct, &t.Status,
 			&t.ModelProvider, &t.ModelName,
 			&t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
+			&t.HighWaterMark,
 		); err != nil {
 			return nil, err
 		}
