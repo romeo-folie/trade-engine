@@ -159,6 +159,24 @@ func (b *IBKRBroker) CancelOrder(ctx context.Context, brokerOrderID string) erro
 	return b.do(ctx, http.MethodDelete, "/v1/api/iserver/account/"+b.accountID+"/order/"+brokerOrderID, nil, nil)
 }
 
+// ReplaceStopOrder updates the stop price on an open IBKR STOP order via the
+// modify endpoint (POST /iserver/account/{acctId}/order/{orderId}). Used by
+// the trailing-stop manager (#322). IBKR may return a confirmation prompt;
+// the same resolveOrderResponse flow used by PlaceOrder handles it.
+func (b *IBKRBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error) {
+	body := map[string]any{
+		"orderId":   brokerOrderID,
+		"orderType": "STP",
+		"price":     newStopPrice,
+	}
+	var raw json.RawMessage
+	path := "/v1/api/iserver/account/" + b.accountID + "/order/" + brokerOrderID
+	if err := b.do(ctx, http.MethodPost, path, body, &raw); err != nil {
+		return OrderResult{}, fmt.Errorf("ibkr ReplaceStopOrder: %w", err)
+	}
+	return b.resolveOrderResponse(ctx, raw)
+}
+
 // GetOrderStatus fetches the current state of an order by scanning the live order list.
 // If the order is absent from the live list (e.g. it filled or was cancelled before this
 // poll), it falls back to the trades/executions endpoint which retains completed orders.
@@ -213,7 +231,11 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 		}
 	}
 
-	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found", brokerOrderID)
+	// Wrap ErrOrderNotFound so callers (e.g. trailing-stop's
+	// cancelAndConfirm) can detect the terminal "order purged from broker"
+	// case via errors.Is and treat it as cancelled rather than as an
+	// unconfirmed status.
+	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q: %w", brokerOrderID, ErrOrderNotFound)
 }
 
 // GetPositions returns all open positions from the IBKR account.

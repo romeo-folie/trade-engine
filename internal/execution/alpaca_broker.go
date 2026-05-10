@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -101,7 +102,46 @@ func (b *AlpacaBroker) CancelOrder(ctx context.Context, brokerOrderID string) er
 	return b.do(ctx, http.MethodDelete, "/v2/orders/"+brokerOrderID, nil, nil)
 }
 
+// ReplaceStopOrder updates the stop price on an existing open STOP order via
+// Alpaca's PATCH /v2/orders/{order_id} endpoint. Used by the server-side
+// trailing-stop manager (#322) to walk the stop up without having to cancel
+// and resubmit. Alpaca returns a fresh order id on success.
+func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error) {
+	body := map[string]any{
+		"stop_price": fmt.Sprintf("%.4f", newStopPrice),
+	}
+	var resp struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		FilledAvgPx string `json:"filled_avg_price"`
+		FilledQty   string `json:"filled_qty"`
+	}
+	if err := b.do(ctx, http.MethodPatch, "/v2/orders/"+brokerOrderID, body, &resp); err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: %w", err)
+	}
+	filledPrice, err := parseFloat(resp.FilledAvgPx)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: parse filled_avg_price %q: %w", resp.FilledAvgPx, err)
+	}
+	filledQty, err := parseFloat(resp.FilledQty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: parse filled_qty %q: %w", resp.FilledQty, err)
+	}
+	return OrderResult{
+		BrokerOrderID: resp.ID,
+		Status:        resp.Status,
+		FilledPrice:   filledPrice,
+		FilledQty:     filledQty,
+	}, nil
+}
+
 // GetOrderStatus returns the current state of an order.
+//
+// Returns an error wrapping ErrOrderNotFound when Alpaca responds with 404
+// (the order has been purged from the broker's lookup, typically because it
+// already settled into a terminal state). Callers using errors.Is can treat
+// this as "the order is effectively gone" rather than as an unconfirmed
+// status.
 func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (OrderResult, error) {
 	var resp struct {
 		ID          string `json:"id"`
@@ -110,6 +150,13 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		FilledQty   string `json:"filled_qty"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/orders/"+brokerOrderID, nil, &resp); err != nil {
+		// `do` formats 4xx responses as "alpaca METHOD path → CODE: body"
+		// — sniff the 404 prefix to map onto the sentinel. Cleaner than
+		// punching the status code through `do`'s signature for one
+		// caller.
+		if strings.Contains(err.Error(), "→ 404") {
+			return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus %s: %w", brokerOrderID, ErrOrderNotFound)
+		}
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: %w", err)
 	}
 

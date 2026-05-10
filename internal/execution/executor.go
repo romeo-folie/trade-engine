@@ -2,7 +2,18 @@
 // PRD §18 — Executor interface contract.
 package execution
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrOrderNotFound is returned by Executor implementations when a broker
+// reports that the order ID is unknown — typically a 404 from Alpaca's
+// /v2/orders/{id} endpoint or IBKR's "not found in live orders + trades"
+// fallthrough. Callers can detect this with errors.Is and treat it as a
+// terminal state (the order is effectively gone) rather than as an
+// uncertain status that blocks resubmission.
+var ErrOrderNotFound = errors.New("execution: order not found at broker")
 
 // OrderSide identifies the direction of an order.
 type OrderSide string
@@ -102,4 +113,14 @@ type Executor interface {
 	// Implementations that don't have a real broker (PaperExecutor) return
 	// zeroed AccountInfo and a nil error; callers fall back to local derivation.
 	GetAccount(ctx context.Context) (AccountInfo, error)
+}
+
+// StopOrderReplacer is an optional capability implemented by broker adapters
+// that support modifying an existing STOP order's price in place. The
+// trailing-stop manager (#322) prefers replace over cancel+submit when the
+// broker supports it. Implementations should treat ReplaceStopOrder as
+// idempotent: returning a fresh OrderResult whose BrokerOrderID may differ
+// from the input (Alpaca returns a new id on PATCH).
+type StopOrderReplacer interface {
+	ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error)
 }

@@ -104,3 +104,31 @@ func Compute(candles []data.Candle) (*IndicatorSet, error) {
 
 	return set, nil
 }
+
+// ComputeATR returns the Average True Range over a configurable period using
+// Wilder's smoothing. The trailing-stop manager (#322) uses this to honour
+// the operator's `risk.trailing_stop.atr_period` setting; the bundled Compute
+// helper above hardcodes period 14 for backward compatibility with other
+// callers (signals, strategy filters) that don't expose a knob.
+//
+// Returns 0 when there are fewer than period+1 candles — same convention as
+// the rest of the package, so a thin lookback can't poison a live stop with
+// a spurious ATR estimate.
+func ComputeATR(candles []data.Candle, period int) float64 {
+	if period <= 0 {
+		return 0
+	}
+	n := len(candles)
+	if n < period+1 {
+		return 0
+	}
+	highs := make([]float64, n)
+	lows := make([]float64, n)
+	closes := make([]float64, n)
+	for i, c := range candles {
+		highs[i] = c.High
+		lows[i] = c.Low
+		closes[i] = c.Close
+	}
+	return atr(highs, lows, closes, period)
+}
