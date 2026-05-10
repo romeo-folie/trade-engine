@@ -250,6 +250,19 @@ analysis:
     llm_fallback_enabled: false      # If true, a SKIP from rules is confirmed by LLM
     llm_fallback_model: classifier   # Role name (from models.roles) for the LLM fallback — not a direct registry key
 
+  # Specialist analysts (Issue #323, Grok 4.20 Alpha Arena lesson).
+  # When enabled, AnalyzeFull runs four role-specialised prompts (fundamental,
+  # technical, sentiment, risk_manager) instead of duplicate-prompt ensemble.
+  # Resolution: 3-of-4 majority OR risk-manager veto (decisive when present).
+  # Falls back to majority vote if risk-manager is missing/failed.
+  # DEFAULT OFF — opt in only after verifying provider keys for every mapped role.
+  specialist_mode_enabled: false
+  specialist_roles:
+    fundamental: claude
+    technical: deepseek
+    sentiment: gemini
+    risk_manager: grok
+
   # Adaptive depth: scores each tick and routes to fewer analysts when the
   # situation is low-volatility / low-novelty. Requires analyst tier roles
   # (analyst_cheap, analyst_mid, analyst_frontier) in models.registry.
