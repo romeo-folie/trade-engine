@@ -128,6 +128,12 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 	bus := events.New()
 	az := analysis.NewAnalyzer(cfg.Models, bus)
 
+	// Issue #323: wire specialist sub-config when the feature flag is on so
+	// AnalyzeSpecialist can resolve role→registry-key mappings at runtime.
+	if cfg.Analysis.SpecialistModeEnabled {
+		az.SetSpecialistConfig(&cfg.Analysis)
+	}
+
 	// Build an enricher call that executes extraction against a single available
 	// provider (instead of full ensemble mode).
 	//
@@ -865,7 +871,17 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
-	result, err := e.analyzer.AnalyzeFull(ctx, req, impact)
+	// Issue #323: when specialist mode is enabled, route to the 4-role
+	// specialist arbiter (fundamental / technical / sentiment / risk_manager)
+	// instead of the duplicate-prompt ensemble. Both paths return AnalyzeResult
+	// so all downstream cost-tracking, persistence and UI code is unchanged.
+	var result analysis.AnalyzeResult
+	var err error
+	if e.cfg.Analysis.SpecialistModeEnabled {
+		result, err = e.analyzer.AnalyzeSpecialist(ctx, req, impact)
+	} else {
+		result, err = e.analyzer.AnalyzeFull(ctx, req, impact)
+	}
 
 	// Record token usage for cost tracking (#177) — BEFORE checking err and
 	// BEFORE the optional second-pass below so first-pass spend is always
