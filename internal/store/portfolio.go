@@ -281,10 +281,14 @@ const dailySummarySelect = `
 	       COALESCE(blocked_by_reason,'{}'::jsonb)
 	FROM daily_summaries`
 
-// scanDailySummaries materialises rows into DailySummary values. JSONB
-// blocked_by_reason is unmarshalled into a Go map; an empty/missing object
-// produces a nil map so callers can distinguish "not yet populated" from
-// "no signals blocked".
+// scanDailySummaries materialises rows into DailySummary values.
+// blocked_by_reason is always a JSON object (possibly empty): the
+// dailySummarySelect COALESCE rewrites NULL to '{}'::jsonb, and the
+// portfolio writer always emits at least '{}'. As an optimisation we still
+// leave the map nil when the column scans as empty (`{}`) so callers can
+// cheaply check `if s.BlockedByReason == nil` to mean "no blocks today" —
+// the previous "not yet populated" distinction the old comment claimed is
+// not actually possible from the SQL.
 func scanDailySummaries(rows interface {
 	Next() bool
 	Scan(...any) error
@@ -479,7 +483,16 @@ func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
 	return &stats, nil
 }
 
-// GetClosedTradesByDateRange returns closed trades within [from, to].
+// GetClosedTradesByDateRange returns closed trades whose closed_at falls in
+// the half-open interval [from, to). The exclusive upper bound matches the
+// convention used by AggregateDailyCounters (which keys windows off
+// `created_at < day + interval '1 day'`), so "all trades closed on day D"
+// is `(D, D + 24h)` from both sides — a trade closed at exactly midnight UTC
+// counts in the day starting at that midnight, never in the previous day.
+//
+// Callers that want a single day pass `to = from.Add(24 * time.Hour)`.
+// Range callers (performance / weekly reports) pass `to` as the moment they
+// want excluded — typically `time.Now()` for "everything up to right now".
 func GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]Trade, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
@@ -491,7 +504,7 @@ func GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]Trad
 		       COALESCE(high_water_mark,0)
 		FROM trades
 		WHERE status='closed'
-		  AND closed_at >= $1 AND closed_at <= $2
+		  AND closed_at >= $1 AND closed_at < $2
 		ORDER BY closed_at ASC`,
 		from.UTC(), to.UTC())
 	if err != nil {

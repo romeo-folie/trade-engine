@@ -1029,6 +1029,65 @@ func TestPortfolio_GetClosedTradesByDateRange(t *testing.T) {
 	}
 }
 
+// TestPortfolio_GetClosedTradesByDateRange_MidnightBoundary asserts the
+// half-open [from, to) semantics: a trade whose closed_at is exactly the
+// boundary instant counts in the day STARTING at that instant, never in
+// the day ending at it. Matches AggregateDailyCounters' window so the two
+// rollup paths agree on which day owns a midnight-close trade.
+func TestPortfolio_GetClosedTradesByDateRange_MidnightBoundary(t *testing.T) {
+	ctx := context.Background()
+
+	// Pick a midnight far enough in the past that we won't collide with
+	// other tests' "now" inserts but stable across runs.
+	midnight := time.Date(2026, 1, 15, 0, 0, 0, 0, time.UTC)
+
+	id, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_BOUNDARY",
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 100,
+		Quantity:   1,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE trades SET status='closed', exit_price=$1, pnl=$2, closed_at=$3
+		WHERE id=$4`, 110.0, 10.0, midnight, id); err != nil {
+		t.Fatalf("close trade at midnight: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM trades WHERE id=$1", id)
+	})
+
+	// PREVIOUS day window [midnight - 24h, midnight) — must NOT contain it.
+	prevDay, err := store.GetClosedTradesByDateRange(ctx, midnight.Add(-24*time.Hour), midnight)
+	if err != nil {
+		t.Fatalf("prev-day query: %v", err)
+	}
+	for _, tr := range prevDay {
+		if tr.ID == id {
+			t.Fatalf("midnight trade leaked into previous day's window")
+		}
+	}
+
+	// DAY-OF window [midnight, midnight + 24h) — must contain it.
+	dayOf, err := store.GetClosedTradesByDateRange(ctx, midnight, midnight.Add(24*time.Hour))
+	if err != nil {
+		t.Fatalf("day-of query: %v", err)
+	}
+	found := false
+	for _, tr := range dayOf {
+		if tr.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("midnight trade missing from its own day's window")
+	}
+}
+
 // ─── Retention ────────────────────────────────────────────────────────────────
 
 func TestRetention_CleanupNoError(t *testing.T) {
