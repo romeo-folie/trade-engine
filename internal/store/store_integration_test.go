@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 
@@ -732,6 +733,165 @@ func TestTrade_ConsolidatedExcludedFromOpen(t *testing.T) {
 	}
 	if pointsAt != canonicalID {
 		t.Errorf("consolidated_into: got %q, want %q", pointsAt, canonicalID)
+	}
+}
+
+// TestCountOpenTrades_AgreesWithGetOpenTrades pins the contract that
+// CountOpenTrades and len(GetOpenTrades) return the same value at every
+// step. Both run independent SQL today; if a future filter is added to
+// one and forgotten on the other, the canvas would silently disagree
+// with the count badge. This test catches that drift.
+func TestCountOpenTrades_AgreesWithGetOpenTrades(t *testing.T) {
+	if os.Getenv("DATABASE_URL") == "" {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+
+	// Capture the baseline so the assertions are robust to any rows
+	// other tests left behind in the shared schema.
+	baselineCount, err := store.CountOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("CountOpenTrades baseline: %v", err)
+	}
+	baselineList, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("GetOpenTrades baseline: %v", err)
+	}
+	if baselineCount != len(baselineList) {
+		t.Fatalf("baseline disagreement: CountOpenTrades=%d, len(GetOpenTrades)=%d",
+			baselineCount, len(baselineList))
+	}
+
+	// Insert three open trades. Using a TEST_COA_ prefix and unique
+	// suffix keeps the rows isolated even when the suite is re-run
+	// against a non-truncated schema.
+	suffix := time.Now().Format("150405.000")
+	tickers := []string{
+		"TEST_COA_AAA_" + suffix,
+		"TEST_COA_BBB_" + suffix,
+		"TEST_COA_CCC_" + suffix,
+	}
+	openIDs := make([]string, 0, len(tickers))
+	for _, tk := range tickers {
+		id, err := store.InsertTrade(ctx, store.Trade{
+			Ticker:     tk,
+			Direction:  "long",
+			Strategy:   "momentum",
+			EntryPrice: 100.0,
+			Quantity:   1.0,
+		})
+		if err != nil {
+			t.Fatalf("InsertTrade %s: %v", tk, err)
+		}
+		openIDs = append(openIDs, id)
+		assertCountAgrees(t, ctx, "after open insert "+tk)
+	}
+
+	// Cleanup at end: hard-delete every row this test created.
+	t.Cleanup(func() {
+		db := store.GetDB()
+		for _, id := range openIDs {
+			_, _ = db.Exec(ctx, `DELETE FROM trades WHERE id=$1`, id)
+		}
+	})
+
+	// Insert and immediately close two trades.
+	closedIDs := make([]string, 0, 2)
+	for i := 0; i < 2; i++ {
+		tk := "TEST_COA_CLOSED_" + suffix + "_" + time.Now().Format("000")
+		id, err := store.InsertTrade(ctx, store.Trade{
+			Ticker:     tk,
+			Direction:  "long",
+			Strategy:   "momentum",
+			EntryPrice: 100.0,
+			Quantity:   1.0,
+		})
+		if err != nil {
+			t.Fatalf("InsertTrade closed %d: %v", i, err)
+		}
+		closedIDs = append(closedIDs, id)
+		assertCountAgrees(t, ctx, "after closed insert (still open)")
+
+		if err := store.CloseTrade(ctx, id, 110.0, 10.0, 10.0); err != nil {
+			t.Fatalf("CloseTrade %d: %v", i, err)
+		}
+		assertCountAgrees(t, ctx, "after CloseTrade")
+	}
+	t.Cleanup(func() {
+		db := store.GetDB()
+		for _, id := range closedIDs {
+			_, _ = db.Exec(ctx, `DELETE FROM trades WHERE id=$1`, id)
+		}
+	})
+
+	// Insert a row and mark it consolidated — exercises the same
+	// status-filter contract that PR #311 introduced.
+	consID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_COA_CONS_" + suffix,
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 100.0,
+		Quantity:   1.0,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade consolidated: %v", err)
+	}
+	assertCountAgrees(t, ctx, "after consolidated insert (still open)")
+
+	// Need a canonical row for the FK back-pointer.
+	canonicalID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_COA_CONS_CANON_" + suffix,
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 100.0,
+		Quantity:   1.0,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade canonical: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE trades
+		SET status='consolidated', consolidated_into=$1
+		WHERE id=$2`, canonicalID, consID); err != nil {
+		t.Fatalf("mark consolidated: %v", err)
+	}
+	assertCountAgrees(t, ctx, "after mark consolidated")
+
+	t.Cleanup(func() {
+		db := store.GetDB()
+		// Clear back-pointer first so the canonical row can be deleted.
+		_, _ = db.Exec(ctx, `UPDATE trades SET consolidated_into=NULL WHERE id=$1`, consID)
+		_, _ = db.Exec(ctx, `DELETE FROM trades WHERE id=$1`, consID)
+		_, _ = db.Exec(ctx, `DELETE FROM trades WHERE id=$1`, canonicalID)
+	})
+
+	// Final delta sanity-check: 3 inserted opens + 1 canonical (still open).
+	finalCount, err := store.CountOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("CountOpenTrades final: %v", err)
+	}
+	wantDelta := len(openIDs) + 1
+	if got := finalCount - baselineCount; got != wantDelta {
+		t.Errorf("open delta vs baseline: want %d, got %d (baseline=%d, final=%d)",
+			wantDelta, got, baselineCount, finalCount)
+	}
+}
+
+// assertCountAgrees fails the test if CountOpenTrades and
+// len(GetOpenTrades) disagree at the named step.
+func assertCountAgrees(t *testing.T, ctx context.Context, step string) {
+	t.Helper()
+	c, err := store.CountOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("%s: CountOpenTrades: %v", step, err)
+	}
+	list, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		t.Fatalf("%s: GetOpenTrades: %v", step, err)
+	}
+	if c != len(list) {
+		t.Fatalf("%s: CountOpenTrades=%d disagrees with len(GetOpenTrades)=%d",
+			step, c, len(list))
 	}
 }
 
