@@ -152,17 +152,23 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 }
 
 // arbiterLabel returns a unique anonymised label for the i-th analyst result
-// in the arbiter prompt: Model-A..Model-Z, then Model-AA..Model-AZ,
-// Model-BA.., etc. Excel-column-style. Unique for any practical ensemble
-// size and never collides for i in [0, 26+26*26]. Issue #321 PR #336.
+// in the arbiter prompt: Model-A..Model-Z, Model-AA..Model-ZZ, Model-AAA..,
+// etc. True Excel-column-style encoder: unique for any i ≥ 0 with no
+// collisions, including the 26→AA and 702→AAA roll-overs.
+//
+// Issue #321 PR #336: the round-2 fixup used `(i/26 - 1) % 26` which is
+// modulo on the first character — `arbiterLabel(702)` would have wrapped
+// back to "Model-AA" (same as i=26) instead of producing "Model-AAA".
+// This implementation handles arbitrary i correctly.
 func arbiterLabel(i int) string {
-	if i < 26 {
-		return fmt.Sprintf("Model-%c", 'A'+i)
+	s := ""
+	i++ // bijective base-26 (Excel) is 1-indexed for the column scheme.
+	for i > 0 {
+		i--
+		s = string(rune('A'+(i%26))) + s
+		i /= 26
 	}
-	// Two-letter labels for i >= 26.
-	first := (i/26 - 1) % 26
-	second := i % 26
-	return fmt.Sprintf("Model-%c%c", 'A'+first, 'A'+second)
+	return "Model-" + s
 }
 
 // ─── Majority vote fallback ─────────────────────────────────────────────────────

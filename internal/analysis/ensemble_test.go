@@ -229,23 +229,56 @@ func TestExtractDissent_CaseInsensitive(t *testing.T) {
 }
 
 // TestArbiterLabel_UniqueUpToReasonableSize asserts that arbiterLabel produces
-// distinct labels for any combined-set size up to 8 (the worst case after
-// multi-timeframe re-arbitration with 3 analysts × 2 timeframes + headroom).
-// Issue #321 PR #336: previously a hardcoded 5-label slice cycled at index 5.
+// distinct labels across the full Excel-column rollover range. The bound is
+// 1000 to cover the 702→AAA transition where the round-2 fixup silently
+// collided with i=26 (both → "Model-AA"). Issue #321 PR #336.
 func TestArbiterLabel_UniqueUpToReasonableSize(t *testing.T) {
-	seen := make(map[string]struct{}, 8)
-	for i := 0; i < 8; i++ {
+	const N = 1000
+	seen := make(map[string]int, N)
+	for i := 0; i < N; i++ {
 		l := arbiterLabel(i)
-		if _, dup := seen[l]; dup {
-			t.Fatalf("arbiterLabel(%d)=%q duplicates an earlier label", i, l)
+		if prev, dup := seen[l]; dup {
+			t.Fatalf("arbiterLabel(%d)=%q duplicates label from i=%d", i, l, prev)
 		}
-		seen[l] = struct{}{}
+		seen[l] = i
 	}
 	// Sanity: first six labels are Model-A..Model-F.
 	for i, want := range []string{"Model-A", "Model-B", "Model-C", "Model-D", "Model-E", "Model-F"} {
 		if got := arbiterLabel(i); got != want {
 			t.Errorf("arbiterLabel(%d)=%q, want %q", i, got, want)
 		}
+	}
+}
+
+// TestArbiterLabel_NoCollisionAtThreeLetterTransition explicitly guards the
+// 702-index wrap that the round-2 fixup got wrong: bijective base-26 must
+// emit "Model-AAA" at i=702, not "Model-AA" (which is i=26). Issue #321
+// PR #336 (Copilot review).
+func TestArbiterLabel_NoCollisionAtThreeLetterTransition(t *testing.T) {
+	cases := []struct {
+		i    int
+		want string
+	}{
+		{0, "Model-A"},
+		{25, "Model-Z"},
+		{26, "Model-AA"},
+		{27, "Model-AB"},
+		{51, "Model-AZ"},
+		{52, "Model-BA"},
+		{701, "Model-ZZ"},
+		{702, "Model-AAA"},
+		{703, "Model-AAB"},
+	}
+	for _, c := range cases {
+		if got := arbiterLabel(c.i); got != c.want {
+			t.Errorf("arbiterLabel(%d)=%q, want %q", c.i, got, c.want)
+		}
+	}
+	if arbiterLabel(701) == arbiterLabel(702) {
+		t.Errorf("arbiterLabel(701) must differ from arbiterLabel(702): got %q", arbiterLabel(701))
+	}
+	if arbiterLabel(26) == arbiterLabel(702) {
+		t.Errorf("arbiterLabel(26) must differ from arbiterLabel(702): got %q", arbiterLabel(26))
 	}
 }
 
