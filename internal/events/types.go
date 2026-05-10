@@ -176,9 +176,10 @@ type PositionUpdatedPayload struct {
 // OpenTradeRows is the count of trade rows with status='open' (DB), companion
 // to OpenPositions which counts distinct (ticker, direction) pairs. Exposing
 // both lets the canvas portfolio card surface divergence in real time without
-// being clobbered by the next WebSocket tick. Pointer + omitempty so that an
-// unknown value (DB unavailable, query failed) serializes to null/absent
-// rather than zero — the frontend treats null as "hide divergence".
+// being clobbered by the next WebSocket tick. Pointer + omitempty: nil values
+// are omitted entirely from the JSON payload (the key is absent rather than
+// encoded as null) so subscribers must treat absence as "unknown" — distinct
+// from a known zero. The frontend hides the divergence indicator in that case.
 type PortfolioSnapshotPayload struct {
 	TotalValue       float64 `json:"total_value"`
 	Cash             float64 `json:"cash"`

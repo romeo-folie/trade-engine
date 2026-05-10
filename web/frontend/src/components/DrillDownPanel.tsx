@@ -67,7 +67,10 @@ interface PortfolioData {
   // Count of DB rows where status='open'. Equals OpenPositions in steady state
   // after Epic A consolidation. Divergence is surfaced in the card below to
   // make pending consolidation immediately visible.
-  OpenTradeRows?: number;
+  // Backend returns *int which serializes to JSON null when nil (omitempty
+   // would also drop the key entirely), so the wire format is number | null |
+   // undefined. Consumers below use loose `== null` checks to handle both.
+   OpenTradeRows?: number | null;
 }
 
 interface ModelPerf {
