@@ -101,6 +101,39 @@ func (b *AlpacaBroker) CancelOrder(ctx context.Context, brokerOrderID string) er
 	return b.do(ctx, http.MethodDelete, "/v2/orders/"+brokerOrderID, nil, nil)
 }
 
+// ReplaceStopOrder updates the stop price on an existing open STOP order via
+// Alpaca's PATCH /v2/orders/{order_id} endpoint. Used by the server-side
+// trailing-stop manager (#322) to walk the stop up without having to cancel
+// and resubmit. Alpaca returns a fresh order id on success.
+func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error) {
+	body := map[string]any{
+		"stop_price": fmt.Sprintf("%.4f", newStopPrice),
+	}
+	var resp struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		FilledAvgPx string `json:"filled_avg_price"`
+		FilledQty   string `json:"filled_qty"`
+	}
+	if err := b.do(ctx, http.MethodPatch, "/v2/orders/"+brokerOrderID, body, &resp); err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: %w", err)
+	}
+	filledPrice, err := parseFloat(resp.FilledAvgPx)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: parse filled_avg_price %q: %w", resp.FilledAvgPx, err)
+	}
+	filledQty, err := parseFloat(resp.FilledQty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: parse filled_qty %q: %w", resp.FilledQty, err)
+	}
+	return OrderResult{
+		BrokerOrderID: resp.ID,
+		Status:        resp.Status,
+		FilledPrice:   filledPrice,
+		FilledQty:     filledQty,
+	}, nil
+}
+
 // GetOrderStatus returns the current state of an order.
 func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (OrderResult, error) {
 	var resp struct {

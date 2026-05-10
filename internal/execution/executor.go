@@ -103,3 +103,13 @@ type Executor interface {
 	// zeroed AccountInfo and a nil error; callers fall back to local derivation.
 	GetAccount(ctx context.Context) (AccountInfo, error)
 }
+
+// StopOrderReplacer is an optional capability implemented by broker adapters
+// that support modifying an existing STOP order's price in place. The
+// trailing-stop manager (#322) prefers replace over cancel+submit when the
+// broker supports it. Implementations should treat ReplaceStopOrder as
+// idempotent: returning a fresh OrderResult whose BrokerOrderID may differ
+// from the input (Alpaca returns a new id on PATCH).
+type StopOrderReplacer interface {
+	ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error)
+}

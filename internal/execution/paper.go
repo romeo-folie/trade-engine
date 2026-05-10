@@ -122,6 +122,32 @@ func (p *PaperExecutor) GetAccount(_ context.Context) (AccountInfo, error) {
 	return AccountInfo{}, nil
 }
 
+// ReplaceStopOrder updates the stop price on a pending paper STOP order.
+// Used by the trailing-stop manager (#322) so the simulator can model walking
+// the stop up tick-over-tick. Returns an error if the order is missing or no
+// longer pending.
+func (p *PaperExecutor) ReplaceStopOrder(_ context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	o, ok := p.orders[brokerOrderID]
+	if !ok {
+		return OrderResult{}, fmt.Errorf("paper order %s not found", brokerOrderID)
+	}
+	if o.result.Status != "pending" {
+		return OrderResult{}, fmt.Errorf("paper order %s is %s, not pending", brokerOrderID, o.result.Status)
+	}
+	if o.request.Type != OrderTypeStop {
+		return OrderResult{}, fmt.Errorf("paper order %s is %s, not stop", brokerOrderID, o.request.Type)
+	}
+	o.request.StopPrice = newStopPrice
+	logger.Debug("paper stop order replaced",
+		"id", brokerOrderID,
+		"ticker", o.request.Ticker,
+		"newStopPrice", newStopPrice,
+	)
+	return o.result, nil
+}
+
 // ─── StopOrderSimulator ──────────────────────────────────────────────────────
 
 // PendingStopOrders returns all stop orders that are still pending.
