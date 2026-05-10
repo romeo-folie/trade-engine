@@ -474,6 +474,104 @@ func NoPositionBlockReason(ticker string) string {
 	return fmt.Sprintf("no open long position in %s — cannot sell", ticker)
 }
 
+// ─── Counterfactual evaluation (Issue #325) ──────────────────────────────────
+
+// LooseConfig overrides per the #325 spec. Used by EvaluateCounterfactual to
+// re-run CheckAll against a relaxed gate set so the operator can see, over
+// time, how often the strict gates would have admitted a signal under the
+// looser policy.
+//
+// Only the calibratable knobs are loosened (R:R floor, confidence floor).
+// Position-budget / cooldown / daily-loss / drawdown gates are not loosened
+// because those are state machines, not calibration knobs.
+const (
+	LooseMinRiskReward       = 1.30
+	LooseConfidenceThreshold = 0.55
+)
+
+// CalibratableChecks lists the check names whose outcomes a future calibration
+// pass might tighten or relax. counterfactual evaluation only runs when the
+// strict failure was on one of these checks; failures on the rest
+// (max_open_positions, cooldown_after_loss, …) are state-of-the-world signals
+// that loosening thresholds wouldn't change.
+//
+// Exported so callers (engine, tests) can decide whether to run the
+// counterfactual rather than re-deriving the list.
+var CalibratableChecks = map[string]struct{}{
+	"confidence_threshold": {},
+	"risk_reward_ratio":    {},
+	"max_dollar_risk":      {},
+	"position_size_limit":  {},
+}
+
+// IsCalibratable reports whether `check` belongs to the family the
+// counterfactual is meaningful for. Defaults to true for unknown names so
+// future checks are observed by default — drop them into the non-calibratable
+// list explicitly when the gate is a hard state machine.
+func IsCalibratable(check string) bool {
+	if check == "" {
+		return false
+	}
+	switch check {
+	case "max_open_positions", "position_ownership", "daily_loss_limit",
+		"max_drawdown", "cooldown_after_loss", "max_per_ticker",
+		"pyramid_policy", "pyramid_disabled":
+		return false
+	}
+	// Default to calibratable when in doubt — the spec explicitly says
+	// "default to calibratable rather than skip" so a new check doesn't
+	// silently disappear from observability.
+	return true
+}
+
+// CounterfactualResult is the output of EvaluateCounterfactual.
+type CounterfactualResult struct {
+	// PassedLoose is true when CheckAll on the loose config returns pass.
+	PassedLoose bool
+	// FlippedCheck names the strict check that failed but the loose check
+	// passed. Empty when PassedLoose is false (or when no flip occurred —
+	// e.g. both runs failed on the same check, indicating the gate would
+	// have failed regardless of threshold relaxation).
+	FlippedCheck string
+	// LooseResults is the full slice from the loose CheckAll, exposed for
+	// debugging/tests; production callers only need PassedLoose +
+	// FlippedCheck.
+	LooseResults []CheckResult
+}
+
+// EvaluateCounterfactual re-runs CheckAll against a loose config derived from
+// `in` and reports whether the loose policy would have admitted the signal.
+// Strict-results is the slice produced by the canonical CheckAll the engine
+// already ran — passed in so we can determine the flipped check without
+// re-running it.
+//
+// The function performs no I/O and is safe to call inside the hot path.
+// Designed to live alongside the existing CheckAll call without affecting
+// which signals execute (this is observability-only).
+func EvaluateCounterfactual(in CheckInput, strictResults []CheckResult) CounterfactualResult {
+	loose := in
+	loose.Cfg = in.Cfg // copy
+	loose.Cfg.MinRiskReward = LooseMinRiskReward
+	loose.Cfg.ConfidenceTiers = nil
+	loose.Cfg.ConfidenceThreshold = LooseConfidenceThreshold
+
+	looseResults, passedLoose := CheckAll(loose)
+	out := CounterfactualResult{PassedLoose: passedLoose, LooseResults: looseResults}
+	if !passedLoose {
+		return out
+	}
+	// Find the strict failure that the loose run cleared. The strict slice
+	// short-circuits on first failure so the failed check is the last
+	// element; identify it by name and confirm the loose run admitted it.
+	for _, r := range strictResults {
+		if !r.Passed {
+			out.FlippedCheck = r.Name
+			break
+		}
+	}
+	return out
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 func pass(name string) CheckResult { return CheckResult{Name: name, Passed: true} }
