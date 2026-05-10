@@ -86,10 +86,16 @@ func UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark
 	return err
 }
 
-// LatestStopLossOrderForTrade returns the most-recently-created open stop-loss
-// order for a trade, or nil if none exists. Used by the trailing-stop
-// manager (#322) to decide whether to PATCH/replace an existing broker stop
-// or submit a new one.
+// LatestStopLossOrderForTrade returns the most-recently-created open STOP
+// (or stop-limit) order for a trade, or nil if none exists. Used by the
+// trailing-stop manager (#322) to decide whether to PATCH/replace an
+// existing broker stop or submit a new one.
+//
+// The order_type filter is load-bearing: the codebase records market exit
+// orders with is_stop_loss=true (the flag tags the order's purpose, not
+// its type). Without the order_type clause this query could return a
+// market exit and the manager would try to PATCH/cancel-and-replace it as
+// if it were a STOP — racing the broker's market fill.
 func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
@@ -101,6 +107,7 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 		FROM orders
 		WHERE trade_id = $1
 		  AND is_stop_loss = TRUE
+		  AND order_type IN ('stop','stop_limit')
 		  AND status IN ('pending','partial')
 		ORDER BY created_at DESC
 		LIMIT 1`, tradeID)

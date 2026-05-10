@@ -505,6 +505,72 @@ func TestOrder_InsertAndUpdate(t *testing.T) {
 	}
 }
 
+// TestLatestStopLossOrderForTrade_OrderTypeFilter pins the order_type filter
+// on LatestStopLossOrderForTrade. The codebase records market exit orders
+// with is_stop_loss=TRUE (it tags the order's purpose, not its type), so a
+// trade can have BOTH a live STOP and a market exit row that both satisfy
+// is_stop_loss + status. Without the order_type IN ('stop','stop_limit')
+// guard the query could return the market order and the trailing-stop
+// manager would try to PATCH/cancel it — racing the broker fill.
+func TestLatestStopLossOrderForTrade_OrderTypeFilter(t *testing.T) {
+	ctx := context.Background()
+
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     "TEST_LSL_AAPL",
+		Direction:  "long",
+		Strategy:   "momentum",
+		EntryPrice: 100.0,
+		Quantity:   10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+
+	// Pre-existing live STOP — what the manager should find.
+	stopID, err := store.InsertOrder(ctx, store.Order{
+		TradeID:    tradeID,
+		Ticker:     "TEST_LSL_AAPL",
+		Side:       "sell",
+		OrderType:  "stop",
+		Quantity:   10,
+		StopPrice:  95.0,
+		Status:     "pending",
+		IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder stop: %v", err)
+	}
+
+	// Trail-driven market exit recorded with is_stop_loss=true — the bug
+	// would surface this row instead of the STOP above.
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID:    tradeID,
+		Ticker:     "TEST_LSL_AAPL",
+		Side:       "sell",
+		OrderType:  "market",
+		Quantity:   10,
+		Status:     "pending",
+		IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder market: %v", err)
+	}
+
+	got, err := store.LatestStopLossOrderForTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("LatestStopLossOrderForTrade: %v", err)
+	}
+	if got == nil {
+		t.Fatal("LatestStopLossOrderForTrade: nil result")
+	}
+	if got.ID != stopID {
+		t.Errorf("returned wrong order: got id=%s (type=%s); want STOP id=%s",
+			got.ID, got.OrderType, stopID)
+	}
+	if got.OrderType != "stop" {
+		t.Errorf("returned non-stop order_type: %q", got.OrderType)
+	}
+}
+
 // ─── Overrides ────────────────────────────────────────────────────────────────
 
 func TestOverride_CRUD(t *testing.T) {
