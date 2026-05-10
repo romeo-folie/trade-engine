@@ -82,9 +82,15 @@ func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "risk query failed", err)
 		return
 	}
+	// open_trade_count is the authoritative trade-row count and always succeeds
+	// here because it's just len() over the loaded rows. Surface it under both
+	// keys so the canvas card (which reads `open_trade_rows` everywhere) can
+	// detect divergence on /api/node/risk too.
+	rowCount := len(openTrades)
 	jsonResponse(w, map[string]any{
 		"open_trades":      openTrades,
-		"open_trade_count": len(openTrades),
+		"open_trade_count": rowCount,
+		"open_trade_rows":  &rowCount,
 		"open_positions":   countDistinctOpenPositions(openTrades),
 	})
 }
@@ -118,11 +124,16 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Trade-row count from DB — used by every path so the response shape is
-	// uniform. Best-effort: a DB error here just means we can't surface drift.
-	openTradeRows := 0
+	// uniform. Best-effort: when the DB is disconnected or the count query
+	// fails, leave the pointer nil so the JSON serializes to null and the
+	// frontend (which already treats null as "hide divergence") doesn't
+	// mistake an unknown value for a real zero.
+	var openTradeRows *int
 	if store.IsConnected() {
-		if openTrades, dbErr := store.GetOpenTrades(ctx); dbErr == nil {
-			openTradeRows = len(openTrades)
+		if n, dbErr := store.CountOpenTrades(ctx); dbErr == nil {
+			openTradeRows = &n
+		} else {
+			logger.Warn("CountOpenTrades failed; omitting open_trade_rows", "err", dbErr)
 		}
 	}
 
