@@ -323,7 +323,7 @@ func TestManager_FirstTickSeedsHWM(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:         "t1",
 		Ticker:     "AAPL",
-		Direction:  "buy",
+		Direction:  "long",
 		Status:     "open",
 		EntryPrice: 100,
 		StopLoss:   95,
@@ -352,7 +352,7 @@ func TestManager_RatchetsStopOnNewHigh(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      95,
@@ -397,7 +397,7 @@ func TestManager_DoesNotWidenOnDrop(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      95,
@@ -436,7 +436,7 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      95,
@@ -488,7 +488,7 @@ func TestManager_FallsBackToCancelResubmit(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      95,
@@ -527,11 +527,11 @@ func TestManager_FallsBackToCancelResubmit(t *testing.T) {
 func TestManager_SkipsForexORB(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
-		ID: "t1", Ticker: "AAPL", Direction: "buy", Status: "open",
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
 		Strategy: "ORB", EntryPrice: 100, StopLoss: 95, Quantity: 10,
 	}
 	fs.trades["t2"] = store.Trade{
-		ID: "t2", Ticker: "EURUSD", Direction: "buy", Status: "open",
+		ID: "t2", Ticker: "EURUSD", Direction: "long", Status: "open",
 		Strategy: "forex_orb", EntryPrice: 1.10, StopLoss: 1.09, Quantity: 1000,
 	}
 	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
@@ -554,7 +554,7 @@ func TestManager_CancelErrorDoesNotSubmitDuplicateStop(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      95,
@@ -613,7 +613,7 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    100,
 		StopLoss:      109, // already very tight
@@ -683,7 +683,7 @@ func TestManager_RoundingAvoidsReplaceChurn(t *testing.T) {
 	fs.trades["t1"] = store.Trade{
 		ID:            "t1",
 		Ticker:        "AAPL",
-		Direction:     "buy",
+		Direction:     "long",
 		Status:        "open",
 		EntryPrice:    50,
 		StopLoss:      rounded,

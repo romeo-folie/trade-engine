@@ -191,7 +191,11 @@ func isLongStockTrade(t store.Trade) bool {
 	if t.Status != "open" {
 		return false
 	}
-	if t.Direction != "buy" {
+	// Engine persists `direction` as "long"/"short" (see executeSignal in
+	// internal/engine/engine.go). The original "buy"/"sell" guard silently
+	// skipped every real long trade in production — tests passed because the
+	// fixtures matched the broken value. Use the production value.
+	if t.Direction != "long" {
 		return false
 	}
 	strat := strings.ToLower(t.Strategy)

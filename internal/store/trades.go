@@ -10,7 +10,7 @@ type Trade struct {
 	ID            string
 	SignalID      string
 	Ticker        string
-	Direction     string // buy | sell
+	Direction     string // long | short — value the engine actually persists
 	Strategy      string
 	EntryPrice    float64
 	ExitPrice     float64
