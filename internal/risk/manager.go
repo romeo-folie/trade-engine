@@ -60,6 +60,7 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 		checkPositionOwnership,
 		checkRiskReward,
 		checkPositionSize,
+		checkMaxDollarRisk,
 		checkMaxOpenPositions,
 		checkMaxPerTicker,
 		checkDailyLossLimit,
@@ -124,6 +125,59 @@ func checkPositionSize(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("size_pct %.1f%% > max %.1f%%",
 		in.SizePct, in.Cfg.MaxPositionPct))
+}
+
+// checkMaxDollarRisk enforces a hard cap on per-trade dollar at risk
+// (qty × |entry − stop|) as a percent of portfolio equity (#320). This is
+// independent of checkPositionSize, which caps notional exposure: a small
+// notional with a far stop can still risk more than acceptable, and a large
+// notional with a tight stop can risk less. Both gates protect against
+// different failure modes.
+//
+// This check applies only to opening trades (BUY); exits (SELL) should not
+// be blocked by an entry-risk cap. SELL is exit-only in this codebase
+// (checkPositionOwnership blocks SELL with no open long), and the analyst
+// prompt requests stop_loss/take_profit on SELL signals too — running the
+// entry-risk gate against those would block legitimate exits.
+//
+// Skipped when PortfolioValue == 0 (mirrors checkDailyLossLimit), when
+// MaxDollarRiskPct <= 0 (treat as disabled to keep older configs safe),
+// when StopLoss == 0 (no stop set, can't compute risk), or for non-BUY
+// actions (entry-risk cap applies to opening trades only).
+// Fails when StopLoss equals SignalPrice (zero risk distance, invalid setup;
+// not necessarily caught upstream because checkRiskReward is skipped when
+// TakeProfit is also zero).
+//
+// Quantity estimate uses Cash, not PortfolioValue, to match the actual
+// engine sizing in executeSignal (`pState.Cash * SizePct/100 / SignalPrice`).
+// Using PortfolioValue here would overestimate qty when cash is partially
+// deployed and produce false blocks.
+func checkMaxDollarRisk(in CheckInput) CheckResult {
+	name := "max_dollar_risk"
+	if in.Action != "BUY" {
+		return pass(name)
+	}
+	if in.PortfolioValue == 0 || in.Cfg.MaxDollarRiskPct <= 0 {
+		return pass(name)
+	}
+	if in.StopLoss == 0 {
+		return pass(name)
+	}
+	if in.SignalPrice <= 0 {
+		return pass(name)
+	}
+	const epsilon = 1e-9
+	if math.Abs(in.SignalPrice-in.StopLoss) < epsilon {
+		return fail(name, "stop-loss equals signal price (zero risk, invalid)")
+	}
+	qty := (in.SizePct / 100) * in.Cash / in.SignalPrice
+	dollarAtRisk := qty * math.Abs(in.SignalPrice-in.StopLoss)
+	riskPct := dollarAtRisk / in.PortfolioValue * 100
+	if riskPct <= in.Cfg.MaxDollarRiskPct {
+		return pass(name)
+	}
+	return fail(name, fmt.Sprintf("$-at-risk %.2f%% > limit %.2f%%",
+		riskPct, in.Cfg.MaxDollarRiskPct))
 }
 
 func checkMaxOpenPositions(in CheckInput) CheckResult {

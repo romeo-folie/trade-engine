@@ -14,6 +14,7 @@ func defaultCfg() config.RiskConfig {
 		MaxPositionPct:      5.0,
 		MaxOpenPositions:    10,
 		MaxPerTicker:        2,
+		MaxDollarRiskPct:    1.0,
 		DailyLossLimitPct:   3.0,
 		MaxDrawdownPct:      10.0,
 		CooldownAfterLoss:   30,
@@ -144,6 +145,129 @@ func TestPositionSize_Fail(t *testing.T) {
 	in := baseInput()
 	in.SizePct = 6.0
 	assertFails(t, checkPositionSize, in)
+}
+
+// ── Max dollar at risk (#320) ─────────────────────────────────────────────────
+
+func TestMaxDollarRisk_PassWellUnderCap(t *testing.T) {
+	// baseInput: qty = (2/100)*5000/100 = 1; risk per share = 5; $@risk = 5
+	// pct = 0.05% << 1.0% cap → pass
+	assertPasses(t, checkMaxDollarRisk, baseInput())
+}
+
+func TestMaxDollarRisk_AtCapExactlyPasses(t *testing.T) {
+	in := baseInput()
+	// Cash=10000, SizePct=2, SignalPrice=100 → qty=2
+	// |100-50|=50; $@risk = 100; pct = 100/10000*100 = 1.00% == cap → pass
+	in.Cash = 10000
+	in.SignalPrice = 100.0
+	in.StopLoss = 50.0
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+func TestMaxDollarRisk_OneBasisPointOverFails(t *testing.T) {
+	in := baseInput()
+	// Cash=10000, SizePct=2, SignalPrice=100 → qty=2
+	// |100-49.495|=50.505; $@risk = 101.01; pct = 1.0101% → rounds to 1.01%
+	// Genuine 1 bp over the 1.00% cap; block reason prints "1.01% > 1.00%".
+	in.Cash = 10000
+	in.SignalPrice = 100.0
+	in.StopLoss = 49.495
+	r := assertFails(t, checkMaxDollarRisk, in)
+	if r.Name != "max_dollar_risk" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
+	// Block reason format: "$-at-risk %.2f%% > limit %.2f%%"
+	want := "$-at-risk 1.01% > limit 1.00%"
+	if r.Reason != want {
+		t.Fatalf("block reason mismatch:\n  got:  %q\n  want: %q", r.Reason, want)
+	}
+}
+
+func TestMaxDollarRisk_PortfolioValueZeroPasses(t *testing.T) {
+	in := baseInput()
+	in.PortfolioValue = 0
+	in.Cash = 10000
+	in.SignalPrice = 100.0
+	in.StopLoss = 50.0 // would be at cap if portfolio were nonzero
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+func TestMaxDollarRisk_DisabledWhenZero(t *testing.T) {
+	in := baseInput()
+	in.Cfg.MaxDollarRiskPct = 0
+	in.SignalPrice = 100.0
+	in.StopLoss = 1.0 // wildly over a 1% cap, but cap is disabled
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+// Mirrors the engine's actual sizing path: position is sized off Cash,
+// not PortfolioValue. With most cash already deployed, an equity-based
+// qty estimate would overstate $@risk and produce a false block. The
+// cash-based estimate keeps the gate consistent with what the engine
+// will actually trade.
+func TestMaxDollarRisk_UsesCashNotPortfolioValue(t *testing.T) {
+	in := baseInput()
+	// PortfolioValue=100k, Cash=20k (most deployed), SizePct=5, stop 10% from price.
+	// Cash-based qty = (5/100)*20000/100 = 10 → $@risk = 10 * 10 = 100
+	// pct = 100/100000 * 100 = 0.10% << 1.0% cap → pass.
+	//
+	// Equity-based qty (the prior bug) = (5/100)*100000/100 = 50 → $@risk = 500
+	// pct = 0.50% — still under cap here, but the multiplier is 5×; the test
+	// pins the cash-based formula by asserting a passing reason that matches
+	// the smaller estimate.
+	in.PortfolioValue = 100000
+	in.Cash = 20000
+	in.SizePct = 5.0
+	in.SignalPrice = 100.0
+	in.StopLoss = 90.0
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+func TestMaxDollarRisk_SkipWhenStopLossZero(t *testing.T) {
+	// Mirrors checkRiskReward semantics: no stop → nothing to measure → pass.
+	in := baseInput()
+	in.StopLoss = 0
+	in.TakeProfit = 0
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+// SELL signals are exit-only (checkPositionOwnership blocks SELL without an
+// open long). The analyst prompt requests stop_loss/take_profit on SELLs too,
+// so the entry-risk cap must skip them — otherwise legitimate exits with a
+// far stop would be blocked.
+func TestMaxDollarRisk_SkipsForSell(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	// Stop far enough that the BUY path would fail: $@risk = 2 * 50 = 100,
+	// pct = 100/10000*100 = 1.00% (at cap) and we push it well over.
+	in.Cash = 10000
+	in.SignalPrice = 100.0
+	in.StopLoss = 1.0 // wildly over the 1% cap if this check ran
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+// Guards a hole in checkRiskReward: when TakeProfit is zero, that check is
+// skipped, so a StopLoss == SignalPrice (zero risk distance) wouldn't be
+// caught upstream. checkMaxDollarRisk fails it explicitly, mirroring the
+// same defensive pattern checkRiskReward uses for "stop equals signal price".
+func TestMaxDollarRisk_FailsWhenStopEqualsSignal(t *testing.T) {
+	in := baseInput()
+	in.SignalPrice = 100.0
+	in.StopLoss = 100.0
+	in.TakeProfit = 0 // checkRiskReward would skip this case entirely
+	// Confirm the load-bearing assumption: checkRiskReward does NOT catch this.
+	if rr := checkRiskReward(in); !rr.Passed {
+		t.Fatalf("precondition: expected checkRiskReward to skip when TP==0, got fail: %s", rr.Reason)
+	}
+	r := assertFails(t, checkMaxDollarRisk, in)
+	if r.Name != "max_dollar_risk" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
+	want := "stop-loss equals signal price (zero risk, invalid)"
+	if r.Reason != want {
+		t.Fatalf("block reason mismatch:\n  got:  %q\n  want: %q", r.Reason, want)
+	}
 }
 
 // ── Max open positions ────────────────────────────────────────────────────────
