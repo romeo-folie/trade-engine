@@ -1616,6 +1616,33 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 			Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
 			BlockReason: sig.BlockReason, FailedCheck: risk.BlockReason(results),
 		})
+
+		// Issue #325: counterfactual logging. Re-evaluates the same signal
+		// against a relaxed gate set (R:R 1.30, conf 0.55, no tiers) so we can
+		// measure empirically whether the strict gates are over- or under-tuned.
+		// Observability-only — never affects which signals execute. Skipped when
+		// the failing check is a state machine (max_open_positions, cooldown,
+		// drawdown, …) since loosening thresholds wouldn't change the outcome.
+		var failedCheck string
+		for _, r := range results {
+			if !r.Passed {
+				failedCheck = r.Name
+				break
+			}
+		}
+		if risk.IsCalibratable(failedCheck) {
+			cf := risk.EvaluateCounterfactual(riskIn, results)
+			flipped := cf.FlippedCheck
+			if !cf.PassedLoose {
+				flipped = "none"
+			}
+			logger.Info("signal blocked counterfactual",
+				"ticker", ticker,
+				"passed_strict", false,
+				"passed_loose", cf.PassedLoose,
+				"flipped_check", flipped,
+			)
+		}
 		return
 	}
 
@@ -2210,17 +2237,34 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 	// Token usage from cost tracker.
 	tokStats := e.costTracker.TakeSnapshot()
 
-	// Perform the upsert.
+	// Issue #325: aggregate observability counters (signals_total /
+	// signals_executed / executed_winning|losing / blocked_by_reason). On DB
+	// error we MUST skip the upsert entirely — otherwise the ON CONFLICT path
+	// would overwrite the previously-populated row's signals_total /
+	// signals_executed / blocked_by_reason columns with zeros, silently
+	// erasing today's accumulated counters. updateDailySummary runs on a
+	// throttled loop, so the next tick will retry; there's no risk of a
+	// permanently missing row.
+	counters, err := store.AggregateDailyCounters(ctx, start)
+	if err != nil {
+		logger.Warn("aggregate daily counters; skipping upsert to preserve prior row", "err", err)
+		return
+	}
+
+	// Perform the upsert. Prefer the aggregated signal counts over the
+	// historical zero-value placeholders so the legacy signals_generated /
+	// signals_blocked columns now reflect reality too.
 	e.portfolio.MaybeDailySummary(ctx,
 		e.todayStartingEquity,
-		0,           // tradesOpened (placeholder, could track in engine if needed)
-		len(trades), // tradesClosed
+		0,                       // tradesOpened (placeholder, could track in engine if needed)
+		len(trades),             // tradesClosed
 		wins,
 		losses,
-		0,                    // signalGenerated (placeholder)
-		0,                    // signalBlocked (placeholder)
-		tokStats.DailyTokens, // total tokens as input for now
-		0,                    // tokens output
+		counters.SignalsTotal,   // signalGenerated — total daily signals
+		counters.SignalsBlocked, // signalBlocked — daily blocked subset
+		tokStats.DailyTokens,    // total tokens as input for now
+		0,                       // tokens output
+		counters,
 	)
 }
 

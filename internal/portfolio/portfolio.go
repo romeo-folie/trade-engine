@@ -3,6 +3,7 @@ package portfolio
 
 import (
 	"context"
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -168,9 +169,17 @@ func (t *Tracker) MaybeSnapshot(ctx context.Context) *State {
 }
 
 // MaybeDailySummary writes a daily_summaries row when the calendar date changes.
+//
+// counters carries the Issue #325 observability rollup (signals_total /
+// signals_executed / executed_winning|losing / blocked_by_reason). It is
+// always upserted alongside the legacy P&L columns so the dashboard always
+// has a fresh row to read. Pass an empty store.DailyCounters{} when the
+// caller can't aggregate (no DB / pre-#325 paths) — the row will still write,
+// the new columns will simply hold their zero values.
 func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	tradesOpened, tradesClosed, wins, losses, sigGenerated, sigBlocked int,
 	tokIn, tokOut int64,
+	counters store.DailyCounters,
 ) {
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	t.mu.RLock()
@@ -190,23 +199,44 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	if startingValue > 0 {
 		pnlPct = (dayPnL / startingValue) * 100
 	}
+	// Marshal the block-reason histogram for JSONB storage. A nil/empty map
+	// becomes the empty object so the column is always valid JSONB rather
+	// than NULL — the schema default already supplies '{}', this just keeps
+	// the explicit insert path consistent.
+	blockedJSON := []byte("{}")
+	if len(counters.BlockedByReason) > 0 {
+		if b, err := json.Marshal(counters.BlockedByReason); err == nil {
+			blockedJSON = b
+		}
+	}
+	// pgx encodes a raw []byte as bytea. blocked_by_reason is JSONB, so the
+	// placeholder is cast explicitly with ::jsonb (the same pattern UpdateORBSession
+	// uses for the candidates column). Without the cast, INSERT fails at runtime
+	// with "column ... is of type jsonb but expression is of type bytea".
 	_, err := store.GetDB().Exec(ctx, `
 		INSERT INTO daily_summaries (
 			date, starting_value, ending_value, pnl, pnl_pct,
 			trades_opened, trades_closed, wins, losses,
 			signals_generated, signals_blocked,
-			model_tokens_input, model_tokens_output
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			model_tokens_input, model_tokens_output,
+			signals_total, signals_executed,
+			executed_winning, executed_losing, blocked_by_reason
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb)
 		ON CONFLICT (date) DO UPDATE SET
 			ending_value=EXCLUDED.ending_value, pnl=EXCLUDED.pnl, pnl_pct=EXCLUDED.pnl_pct,
 			trades_opened=EXCLUDED.trades_opened, trades_closed=EXCLUDED.trades_closed,
 			wins=EXCLUDED.wins, losses=EXCLUDED.losses,
 			signals_generated=EXCLUDED.signals_generated, signals_blocked=EXCLUDED.signals_blocked,
-			model_tokens_input=EXCLUDED.model_tokens_input, model_tokens_output=EXCLUDED.model_tokens_output`,
+			model_tokens_input=EXCLUDED.model_tokens_input, model_tokens_output=EXCLUDED.model_tokens_output,
+			signals_total=EXCLUDED.signals_total, signals_executed=EXCLUDED.signals_executed,
+			executed_winning=EXCLUDED.executed_winning, executed_losing=EXCLUDED.executed_losing,
+			blocked_by_reason=EXCLUDED.blocked_by_reason`,
 		today.Format("2006-01-02"),
 		startingValue, s.TotalValue, dayPnL, pnlPct,
 		tradesOpened, tradesClosed, wins, losses,
 		sigGenerated, sigBlocked, tokIn, tokOut,
+		counters.SignalsTotal, counters.SignalsExecuted,
+		counters.ExecutedWinning, counters.ExecutedLosing, blockedJSON,
 	)
 	if err != nil {
 		logger.Warn("daily summary failed", "err", err)
@@ -215,5 +245,11 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 	t.mu.Lock()
 	t.lastDailySummary = today
 	t.mu.Unlock()
-	logger.Info("daily summary written", "date", today.Format("2006-01-02"), "pnl_pct", pnlPct)
+	logger.Info("daily summary written",
+		"date", today.Format("2006-01-02"),
+		"pnl_pct", pnlPct,
+		"signals_total", counters.SignalsTotal,
+		"signals_blocked", counters.SignalsBlocked,
+		"signals_executed", counters.SignalsExecuted,
+	)
 }

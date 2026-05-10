@@ -14,6 +14,7 @@ import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import OverlayChart, { ChartMode } from '../components/portfolio/OverlayChart';
 import PositionsTable from '../components/portfolio/PositionsTable';
+import DailyCountersCard from '../components/portfolio/DailyCountersCard';
 import ErrorBoundary from '../components/ErrorBoundary';
 import styles from './Portfolio.module.css';
 
@@ -316,6 +317,11 @@ export default function PortfolioScreen() {
             {fetchError ? 'Unable to load equity data' : 'Loading equity data…'}
           </div>
         )}
+      </div>
+
+      {/* ── Today's signal pipeline (Issue #325) ───────────────────────── */}
+      <div style={{ marginBottom: 'var(--space-6)' }}>
+        <DailyCountersCard />
       </div>
 
       {/* ── Open Positions ────────────────────────────────────────────────── */}

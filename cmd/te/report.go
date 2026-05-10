@@ -173,7 +173,10 @@ func runReportDaily(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("load summary: %w", err)
 	}
-	dayEnd := date.Add(24*time.Hour - time.Second)
+	// GetClosedTradesByDateRange uses a half-open [from, to) interval — pass
+	// the start of the next day so a trade closed at the very last second of
+	// `date` is still included.
+	dayEnd := date.Add(24 * time.Hour)
 	trades, err := store.GetClosedTradesByDateRange(ctx, date, dayEnd)
 	if err != nil {
 		return fmt.Errorf("load trades: %w", err)
