@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -352,3 +353,156 @@ func TestBlockReason_ReturnsFirstFailReason(t *testing.T) {
 		t.Fatal("expected non-empty block reason")
 	}
 }
+
+// ── Pyramiding (#324) ─────────────────────────────────────────────────────────
+
+func TestPyramidPolicy_NoExistingLong_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = false
+	in.Cfg.PyramidEnabled = false // even when disabled, fresh entries pass
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_SellAlwaysPasses(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.Cfg.PyramidEnabled = false
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_DisabledRejectsExistingLong(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110 // up 10%, would otherwise pyramid
+	in.Cfg.PyramidEnabled = false
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_disabled") {
+		t.Fatalf("expected reason to include 'pyramid_disabled', got: %s", r.Reason)
+	}
+}
+
+func TestPyramidPolicy_EnabledAndUp6Pct_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106 // +6%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_EnabledButFlat_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 100 // 0%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_min_gain_not_met") {
+		t.Fatalf("expected reason to include 'pyramid_min_gain_not_met', got: %s", r.Reason)
+	}
+}
+
+func TestPyramidPolicy_EnabledButLosing_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 95 // -5%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertFails(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_EnabledMissingPrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 0 // unknown
+	in.SignalPrice = 100
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertFails(t, checkPyramidPolicy, in)
+}
+
+func TestCheckAll_PyramidCapHonoured(t *testing.T) {
+	// Pyramid criteria met but per-ticker cap reached → blocks naturally.
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105   // tightened stop above original entry
+	in.TakeProfit = 130 // generous TP keeps R:R > 2 so we land on the cap
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	in.Cfg.MaxPerTicker = 2
+	in.OpenByTicker = map[string]int{"AAPL": 2}
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected CheckAll to fail when per-ticker cap reached")
+	}
+	if reason := BlockReason(results); !contains(reason, "per-ticker") {
+		t.Fatalf("expected per-ticker block reason, got: %s", reason)
+	}
+}
+
+func TestCheckAll_PyramidEnabledAndUp_Passes(t *testing.T) {
+	// End-to-end: pyramid criteria met, capacity available → all checks pass.
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105
+	in.TakeProfit = 130
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	in.Cfg.MaxPerTicker = 2
+	in.OpenByTicker = map[string]int{"AAPL": 1}
+	if _, ok := CheckAll(in); !ok {
+		t.Fatal("expected CheckAll to pass for valid pyramid signal")
+	}
+}
+
+func TestCheckAll_PyramidDisabled_BlocksWithReason(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105
+	in.TakeProfit = 130
+	in.Cfg.PyramidEnabled = false
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected CheckAll to fail when pyramid disabled")
+	}
+	if reason := BlockReason(results); !contains(reason, "pyramid_disabled") {
+		t.Fatalf("expected reason to include 'pyramid_disabled', got: %s", reason)
+	}
+}
+
+// contains is a tiny alias kept for readability inside pyramid tests.
+func contains(s, sub string) bool { return strings.Contains(s, sub) }

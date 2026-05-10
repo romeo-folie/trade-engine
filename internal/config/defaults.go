@@ -177,6 +177,8 @@ func Defaults() *Config {
 			MaxPositionPct:       5.0,
 			MaxOpenPositions:     10,
 			MaxPerTicker:         0,
+			PyramidEnabled:       false,
+			PyramidMinGainPct:    5.0,
 			DailyLossLimitPct:    3.0,
 			MaxDrawdownPct:       15.0,
 			CooldownAfterLoss:    60,
@@ -276,13 +278,13 @@ func Defaults() *Config {
 			CacheTTLMin: 0,
 		},
 		ORB: ORBConfig{
-			Mode:              "paper",
-			GapThresholdPct:   2.5,
-			MaxCandidates:     2,
-			RangeMinutes:      15,
-			RiskReward:        2.0,
-			MaxRiskPct:        1.0,
-			MaxPositionPct:    10.0, // hard cap: notional <= 10% of portfolio per trade
+			Mode:               "paper",
+			GapThresholdPct:    2.5,
+			MaxCandidates:      2,
+			RangeMinutes:       15,
+			RiskReward:         2.0,
+			MaxRiskPct:         1.0,
+			MaxPositionPct:     10.0, // hard cap: notional <= 10% of portfolio per trade
 			NewsLookbackHours:  24,
 			ScanCadenceMinutes: 2,
 		},
@@ -330,8 +332,8 @@ func Defaults() *Config {
 		},
 		Portfolio: PortfolioConfig{
 			Poller: PollerConfig{
-				Enabled:             true,
-				IntervalSec:         60,
+				Enabled:              true,
+				IntervalSec:          60,
 				SignificantChangePct: 0.05,
 			},
 			Cache: CacheConfig{
@@ -358,10 +360,10 @@ func Defaults() *Config {
 			PromptEnrichment:    true,
 			ORBPromptEnrichment: true,
 			Thresholds: FeedbackThresholds{
-				ModelWinRateMin:        0.40,
-				ModelMinTrades:         20,
-				InstrumentWinRateMin:   0.35,
-				InstrumentMinTrades:    10,
+				ModelWinRateMin:       0.40,
+				ModelMinTrades:        20,
+				InstrumentWinRateMin:  0.35,
+				InstrumentMinTrades:   10,
 				ArbiterInvokedRateMax: 0.50,
 			},
 		},

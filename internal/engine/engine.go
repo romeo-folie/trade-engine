@@ -1251,6 +1251,8 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 
 	var holdsLong bool
 	var longQuantity float64
+	var longCostBasis float64 // sum of qty * entry_price across open longs
+	var longMaxStop float64   // canonical (highest) existing stop across open longs
 	// Count distinct (ticker, direction) pairs so multiple consolidated rows
 	// for the same instrument don't inflate the open-positions budget (#312).
 	// Also build a per-ticker count restricted to the incoming signal's
@@ -1267,27 +1269,52 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		if t.Ticker == ticker && t.Direction == "long" {
 			holdsLong = true
 			longQuantity += t.Quantity
+			longCostBasis += t.Quantity * t.EntryPrice
+			if t.StopLoss > longMaxStop {
+				longMaxStop = t.StopLoss
+			}
+		}
+	}
+	var longAvgEntry float64
+	if longQuantity > 0 {
+		longAvgEntry = longCostBasis / longQuantity
+	}
+
+	// Pyramiding (#324): if this is a BUY landing on an existing long, tighten
+	// the new lot's stop to max(canonical existing stop, weighted avg entry)
+	// so the combined cost basis is at worst breakeven on the original lot
+	// when the new stop trips. checkPyramidPolicy still gates whether the
+	// signal passes; this only sets the stop for the row that gets inserted
+	// downstream when the gate is open.
+	if resp.Action == "BUY" && holdsLong && e.cfg.Risk.PyramidEnabled {
+		tightened := longMaxStop
+		if longAvgEntry > tightened {
+			tightened = longAvgEntry
+		}
+		if tightened > sig.StopLoss {
+			sig.StopLoss = tightened
 		}
 	}
 
 	riskIn := risk.CheckInput{
-		Cfg:            e.cfg.Risk,
-		Action:         string(resp.Action),
-		Ticker:         ticker,
-		Confidence:     resp.Confidence,
-		SizePct:        resp.SizePct,
-		StopLoss:       resp.StopLoss,
-		TakeProfit:     resp.TakeProfit,
-		SignalPrice:    signalPrice,
-		PortfolioValue: pState.TotalValue,
-		Cash:           pState.Cash,
-		OpenPositions:  len(positions),
-		OpenByTicker:   byTicker,
-		DailyPnL:       pState.RealizedPnLDay,
-		PeakValue:      pState.PeakValue,
-		LastLossAt:     pState.LastLossAt,
-		HoldsLong:      holdsLong,
-		LongQuantity:   longQuantity,
+		Cfg:               e.cfg.Risk,
+		Action:            string(resp.Action),
+		Ticker:            ticker,
+		Confidence:        resp.Confidence,
+		SizePct:           resp.SizePct,
+		StopLoss:          sig.StopLoss,
+		TakeProfit:        sig.TakeProfit,
+		SignalPrice:       signalPrice,
+		PortfolioValue:    pState.TotalValue,
+		Cash:              pState.Cash,
+		OpenPositions:     len(positions),
+		OpenByTicker:      byTicker,
+		DailyPnL:          pState.RealizedPnLDay,
+		PeakValue:         pState.PeakValue,
+		LastLossAt:        pState.LastLossAt,
+		HoldsLong:         holdsLong,
+		LongQuantity:      longQuantity,
+		LongAvgEntryPrice: longAvgEntry,
 	}
 
 	results, passed := risk.CheckAll(riskIn)
@@ -1694,7 +1721,6 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	e.portfolio.Update(eps, cash, totalEquity, dayPnL, realizedToday)
 }
 
-
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
@@ -1906,10 +1932,10 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 		len(trades), // tradesClosed
 		wins,
 		losses,
-		0, // signalGenerated (placeholder)
-		0, // signalBlocked (placeholder)
+		0,                    // signalGenerated (placeholder)
+		0,                    // signalBlocked (placeholder)
 		tokStats.DailyTokens, // total tokens as input for now
-		0,                   // tokens output
+		0,                    // tokens output
 	)
 }
 

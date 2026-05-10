@@ -16,7 +16,7 @@ type CheckInput struct {
 	Cfg config.RiskConfig
 
 	// Signal fields
-	Action      string  // BUY | SELL
+	Action      string // BUY | SELL
 	Ticker      string
 	Confidence  float64 // 0.0–1.0
 	SizePct     float64 // recommended position %
@@ -32,10 +32,10 @@ type CheckInput struct {
 	// in the same direction as the incoming signal (longs for BUY, shorts for
 	// SELL). Consumed by checkMaxPerTicker (#312). May be nil; checks treat a
 	// missing key as 0.
-	OpenByTicker   map[string]int
-	DailyPnL       float64   // realised P&L today (negative = loss)
-	PeakValue      float64   // for drawdown calculation
-	LastLossAt     time.Time // last time a losing trade closed
+	OpenByTicker map[string]int
+	DailyPnL     float64   // realised P&L today (negative = loss)
+	PeakValue    float64   // for drawdown calculation
+	LastLossAt   time.Time // last time a losing trade closed
 
 	// HoldsLong is true when there is an open long trade in Ticker.
 	// LongQuantity is the total shares held long (sum across open trades).
@@ -43,6 +43,12 @@ type CheckInput struct {
 	// or where the proposed sell quantity exceeds what is held.
 	HoldsLong    bool
 	LongQuantity float64
+
+	// LongAvgEntryPrice is the quantity-weighted average entry price across
+	// all open long lots in Ticker. Consumed by checkPyramidPolicy (#324) to
+	// determine whether a BUY-on-existing-long qualifies as a pyramid add.
+	// Zero when HoldsLong is false or quantities are unknown.
+	LongAvgEntryPrice float64
 }
 
 // CheckResult is the outcome of a single risk check.
@@ -58,6 +64,7 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
 		checkConfidence,
 		checkPositionOwnership,
+		checkPyramidPolicy,
 		checkRiskReward,
 		checkPositionSize,
 		checkMaxOpenPositions,
@@ -197,6 +204,49 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 				proposedQty, in.LongQuantity, in.Ticker,
 			))
 		}
+	}
+	return pass(name)
+}
+
+// checkPyramidPolicy gates BUY signals that would land on a ticker with an
+// existing open long (#324). Three outcomes:
+//
+//   - No existing long → pass; this is a fresh entry.
+//   - Existing long but PyramidEnabled=false → fail with "pyramid_disabled".
+//     Default rollout: operators must explicitly opt in to pyramiding.
+//   - Existing long and PyramidEnabled=true → pass only if unrealised gain
+//     on the average entry is at least PyramidMinGainPct. Below threshold
+//     fails with "pyramid_min_gain_not_met" so we never double down on a
+//     flat or losing position.
+//
+// SELL signals and BUYs on tickers with no open long are unaffected; the
+// per-ticker cap (#312) still bounds the number of pyramid adds.
+func checkPyramidPolicy(in CheckInput) CheckResult {
+	name := "pyramid_policy"
+	if in.Action != "BUY" {
+		return pass(name)
+	}
+	if !in.HoldsLong {
+		return pass(name)
+	}
+	if !in.Cfg.PyramidEnabled {
+		return fail(name, fmt.Sprintf(
+			"pyramid_disabled: %s already has an open long and risk.pyramid_enabled is false",
+			in.Ticker,
+		))
+	}
+	if in.LongAvgEntryPrice <= 0 || in.SignalPrice <= 0 {
+		return fail(name, fmt.Sprintf(
+			"cannot evaluate pyramid gain for %s (avg_entry=%.4f signal_price=%.4f)",
+			in.Ticker, in.LongAvgEntryPrice, in.SignalPrice,
+		))
+	}
+	gainPct := ((in.SignalPrice - in.LongAvgEntryPrice) / in.LongAvgEntryPrice) * 100
+	if gainPct < in.Cfg.PyramidMinGainPct {
+		return fail(name, fmt.Sprintf(
+			"pyramid_min_gain_not_met: %s up %.2f%% < required %.2f%%",
+			in.Ticker, gainPct, in.Cfg.PyramidMinGainPct,
+		))
 	}
 	return pass(name)
 }
