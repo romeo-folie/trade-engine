@@ -142,7 +142,11 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			timeout := modelTimeout(rp.provider, a.cfg)
+			// Use the registry-aware helper: specialist roles map to registry
+			// keys that are typically NOT in models.roles.analysts, so the
+			// analysts-only modelTimeout() would silently fall back to 30s
+			// instead of honouring registry.<key>.timeout_sec.
+			timeout := modelTimeoutForRegistry(rp.registryKey, rp.provider, a.cfg)
 			mctx, cancel := context.WithTimeout(ctx, timeout)
 			defer cancel()
 			t0 := time.Now()

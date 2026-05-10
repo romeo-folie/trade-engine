@@ -186,6 +186,60 @@ func TestAnalyzeSpecialist_SelectedAnalystsExcludesUnresolvedRoles(t *testing.T)
 	}
 }
 
+// TestModelTimeoutForRegistry_RegistryWins is the regression guard for the
+// Copilot-flagged real bug: specialist roles map to registry keys that aren't
+// in models.roles.analysts, so modelTimeout() silently returned the hardcoded
+// 30s and ignored the per-registry timeout_sec. modelTimeoutForRegistry must
+// honour cfg.Registry[key].TimeoutSec.
+func TestModelTimeoutForRegistry_RegistryWins(t *testing.T) {
+	cfg := config.ModelsConfig{
+		Registry: config.ModelRegistry{
+			"analyst_frontier": {
+				ModelConfig: config.ModelConfig{
+					Provider:   "anthropic",
+					Model:      "claude",
+					TimeoutSec: 60,
+				},
+			},
+		},
+		// Crucially: roles.analysts does NOT mention analyst_frontier, so the
+		// existing modelTimeout() scan would miss it.
+	}
+	p := &fakeRoleProvider{provider: "anthropic", model: "claude"}
+	got := modelTimeoutForRegistry("analyst_frontier", p, cfg)
+	if got != 60*time.Second {
+		t.Fatalf("modelTimeoutForRegistry = %v, want 60s (registry timeout_sec must win over the 30s default)", got)
+	}
+}
+
+// TestModelTimeoutForRegistry_FallsBackToAnalystsConfig verifies that when the
+// registry key is absent or has no TimeoutSec, the helper falls through to the
+// analysts-config path (modelTimeout) — preserving existing behavior for the
+// non-specialist callers.
+func TestModelTimeoutForRegistry_FallsBackToAnalystsConfig(t *testing.T) {
+	cfg := config.ModelsConfig{
+		Analysts: []config.ModelConfig{
+			{Provider: "openai", Model: "gpt", TimeoutSec: 45},
+		},
+	}
+	p := &fakeRoleProvider{provider: "openai", model: "gpt"}
+	got := modelTimeoutForRegistry("missing_key", p, cfg)
+	if got != 45*time.Second {
+		t.Fatalf("modelTimeoutForRegistry = %v, want 45s (analysts-config fallback)", got)
+	}
+}
+
+// TestModelTimeoutForRegistry_FinalDefault verifies the 30s hardcoded default
+// fires only when no registry entry and no analysts entry matches.
+func TestModelTimeoutForRegistry_FinalDefault(t *testing.T) {
+	cfg := config.ModelsConfig{}
+	p := &fakeRoleProvider{provider: "anthropic", model: "claude"}
+	got := modelTimeoutForRegistry("nope", p, cfg)
+	if got != 30*time.Second {
+		t.Fatalf("modelTimeoutForRegistry = %v, want 30s (final default)", got)
+	}
+}
+
 // makeRoleResult is the analogue of makeResult (ensemble_test.go) but tagged
 // with a specialist role so resolveSpecialist can apply the veto rule.
 func makeRoleResult(role string, action Action, conf float64, err error) specialistResult {
