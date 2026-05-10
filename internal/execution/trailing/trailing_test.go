@@ -221,6 +221,12 @@ type fakeBroker struct {
 	// works; tests can set it to "pending" or "" to simulate broker
 	// timeouts where the cancel didn't actually take.
 	statusOverride map[string]string
+	// nextFillPrice / nextFillQty are returned on the next PlaceOrder call
+	// to simulate the broker echoing back the immediate fill (e.g. Alpaca
+	// IOC market sells). Reset to zero after each call.
+	nextFillPrice float64
+	nextFillQty   float64
+	nextStatus    string // optional override of "pending" on PlaceOrder
 }
 
 type replaceCall struct {
@@ -233,10 +239,21 @@ func (b *fakeBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (
 	defer b.mu.Unlock()
 	b.placed = append(b.placed, req)
 	b.nextID++
-	return execution.OrderResult{
+	status := "pending"
+	if b.nextStatus != "" {
+		status = b.nextStatus
+	}
+	res := execution.OrderResult{
 		BrokerOrderID: "broker-" + itoa(b.nextID),
-		Status:        "pending",
-	}, nil
+		Status:        status,
+		FilledPrice:   b.nextFillPrice,
+		FilledQty:     b.nextFillQty,
+	}
+	// One-shot — caller resets per test.
+	b.nextFillPrice = 0
+	b.nextFillQty = 0
+	b.nextStatus = ""
+	return res, nil
 }
 
 func (b *fakeBroker) CancelOrder(_ context.Context, brokerOrderID string) error {
@@ -814,6 +831,72 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	}
 	if err := ls.CloseTrade(ctx, "t1", 100, 1, 1); err == nil {
 		t.Fatalf("CloseTrade(no DB): want error, got nil")
+	}
+}
+
+// TestManager_MarketExitUsesBrokerFilledPrice pins the round-3 review fix:
+// when exitAtMarket fires and the broker echoes back FilledPrice/FilledQty
+// (typical for Alpaca IOC market sells), the trade close + persisted order
+// MUST reflect the broker's actual fill, not the snapshot price that
+// triggered the trail. Otherwise pnl misreports and the order_history view
+// looks wrong.
+func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "long",
+		Status:        "open",
+		EntryPrice:    100,
+		StopLoss:      109,
+		Quantity:      10,
+		HighWaterMark: 200, // forces trail-crossed exit
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	fb := &fakeBroker{
+		nextFillPrice: 99.50, // broker fills below the snapshot 100
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	closed := fs.trades["t1"]
+	if closed.Status != "closed" {
+		t.Fatalf("trade not closed: status=%q", closed.Status)
+	}
+	if closed.ExitPrice != 99.50 {
+		t.Fatalf("exit_price not from broker fill: got %v want 99.50", closed.ExitPrice)
+	}
+	// pnl computed from broker fill price, not the snapshot 100.
+	wantPnL := (99.50 - 100.0) * 10
+	if closed.PnL != wantPnL {
+		t.Fatalf("pnl misreported: got %v want %v", closed.PnL, wantPnL)
+	}
+
+	// Verify the persisted order row carries FilledPrice/FilledQty/Quantity
+	// the same way engine.monitorPositions records its non-trailing exits.
+	var marketOrder *store.Order
+	for _, o := range fs.orders {
+		if o.OrderType == string(execution.OrderTypeMarket) {
+			oCopy := o
+			marketOrder = &oCopy
+			break
+		}
+	}
+	if marketOrder == nil {
+		t.Fatalf("no market order persisted")
+	}
+	if marketOrder.FilledPrice != 99.50 {
+		t.Fatalf("order.filled_price: got %v want 99.50", marketOrder.FilledPrice)
+	}
+	if marketOrder.FilledQty != 10 {
+		t.Fatalf("order.filled_qty: got %v want 10", marketOrder.FilledQty)
+	}
+	if marketOrder.Quantity != 10 {
+		t.Fatalf("order.quantity: got %v want 10", marketOrder.Quantity)
 	}
 }
 

@@ -264,7 +264,8 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			"new_stop", newStop,
 			"current_price", currentPrice,
 		)
-		if err := m.exitAtMarket(ctx, t); err != nil {
+		exitRes, err := m.exitAtMarket(ctx, t)
+		if err != nil {
 			// Persist HWM so the next tick has fresh baseline; surface error.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("market exit: %w", err)
@@ -273,7 +274,15 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 		// status='open', GetOpenTrades returns it again on the next tick,
 		// and the manager places a duplicate market sell. Mirrors the
 		// close-side bookkeeping in engine.monitorPositions.
-		exitPrice := currentPrice
+		//
+		// Prefer the broker's reported FilledPrice when present so the
+		// trade row + pnl reflect the real fill rather than the snapshot
+		// price that crossed the trail. Falls back to currentPrice for
+		// brokers that return 0 on a still-pending fill (Alpaca paper).
+		exitPrice := exitRes.FilledPrice
+		if exitPrice == 0 {
+			exitPrice = currentPrice
+		}
 		pnl := (exitPrice - t.EntryPrice) * t.Quantity
 		pnlPct := 0.0
 		if t.EntryPrice > 0 {
@@ -444,7 +453,11 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 // band has crossed the current price and a stop order would fill instantly
 // anyway — submitting a market sell guarantees the exit prints rather than
 // leaving a stale stop sitting at the old level.
-func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) error {
+//
+// Returns the broker's OrderResult so the caller can use the actual
+// FilledPrice/FilledQty for trade close + pnl. Mirrors the field set
+// engine.monitorPositions persists on its non-trailing exit path.
+func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, error) {
 	// Best-effort: cancel any live stop first so the market sell isn't
 	// double-counted by the broker risk engine. Failure is logged but
 	// doesn't block the market exit (the exit is the safety move).
@@ -465,19 +478,31 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) error {
 		TradeID:  t.ID,
 	})
 	if err != nil {
-		return fmt.Errorf("place market sell: %w", err)
+		return execution.OrderResult{}, fmt.Errorf("place market sell: %w", err)
 	}
-	_, err = m.store.InsertOrder(ctx, store.Order{
+	// Persist the order with the broker's actual fill data when present so
+	// downstream pnl/order-history queries see the real exit, not just the
+	// snapshot price that triggered the trail. Falls back to t.Quantity for
+	// FilledQty when the broker hasn't reported a fill yet (Status=pending).
+	filledQty := res.FilledQty
+	if filledQty == 0 {
+		filledQty = t.Quantity
+	}
+	if _, insErr := m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,
 		BrokerOrderID: res.BrokerOrderID,
 		Ticker:        t.Ticker,
 		Side:          string(execution.OrderSideSell),
 		OrderType:     string(execution.OrderTypeMarket),
 		Quantity:      t.Quantity,
+		FilledPrice:   res.FilledPrice,
+		FilledQty:     filledQty,
 		Status:        execution.NormalizeOrderStatus(res.Status),
 		IsStopLoss:    true, // counts toward the trade's exit bookkeeping
-	})
-	return err
+	}); insErr != nil {
+		return res, insErr
+	}
+	return res, nil
 }
 
 // brokerTickDecimals returns the price-tick precision for the ticker. US
