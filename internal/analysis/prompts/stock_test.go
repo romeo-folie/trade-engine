@@ -56,3 +56,27 @@ func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildStockPrompt_RRSelfFilter asserts both the standard swing prompt and
+// the momentum prompt instruct the model to downgrade BUY → WAIT when the
+// proposed R:R is below 1.5. The phrasing is the contract — gate calibration
+// (#317) drops the floor to 1.40, so the prompt-level filter at 1.5 keeps the
+// model honest at the source rather than relying on the gate.
+func TestBuildStockPrompt_RRSelfFilter(t *testing.T) {
+	standardSys, _ := BuildStockPrompt(
+		"AAPL", "trend_following", "1d",
+		nil, Indicators{}, nil, Portfolio{}, "", nil, "", false,
+	)
+	momentumSys, _ := BuildStockPrompt(
+		"NVDA", "momentum", "1h",
+		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
+	)
+
+	const phrase = "if your proposed take_profit divided by risk yields R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5."
+	if !strings.Contains(standardSys, phrase) {
+		t.Fatalf("standard system prompt missing R:R self-filter guidance:\n%s", standardSys)
+	}
+	if !strings.Contains(momentumSys, phrase) {
+		t.Fatalf("momentum system prompt missing R:R self-filter guidance:\n%s", momentumSys)
+	}
+}

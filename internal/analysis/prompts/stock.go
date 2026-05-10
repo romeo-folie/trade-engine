@@ -125,6 +125,8 @@ ENTRY DECISION GUIDE:
 - WAIT: the setup is valid but timing is poor — gap too wide, no intraday base formed yet, or consolidation still in progress. WAIT means re-evaluate next cycle.
 - HOLD: the original momentum has faded, the catalyst is fully priced in, or the setup has failed. Remove this ticker from active consideration.
 
+R:R SELF-FILTER (MANDATORY): if your proposed take_profit divided by risk yields R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.
+
 SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.`, strategy)
 }
 
@@ -157,6 +159,7 @@ RULES:
   WAIT signals re-evaluation on the next cycle. High confidence is valid for
   WAIT — it reflects conviction in the catalyst, not in the entry timing.
 - Use BUY or SELL only when the catalyst is strong AND entry timing is favourable.
+- R:R SELF-FILTER (MANDATORY): if your proposed take_profit divided by risk yields R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.
 
 USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trades in last 30 days):
 - Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
