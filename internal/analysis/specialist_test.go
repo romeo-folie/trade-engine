@@ -148,6 +148,44 @@ func TestResolveSpecialist_NonActionableSuppressesSizing(t *testing.T) {
 	}
 }
 
+// TestResolveSpecialist_RiskLevelsAverageOverWinningVotersOnly is the
+// regression test for Codex review on PR #342. When 3 BUY voters disagree
+// with 1 SELL voter and the BUY action wins, the resulting StopLoss /
+// TakeProfit must average over the BUY voters only — otherwise the SELL
+// voter's opposite-direction levels corrupt the signal's risk parameters.
+func TestResolveSpecialist_RiskLevelsAverageOverWinningVotersOnly(t *testing.T) {
+	mk := func(role string, action Action, sl, tp float64) specialistResult {
+		return specialistResult{
+			Role: role,
+			Response: AnalysisResponse{
+				Action: action, Confidence: 0.7,
+				SizePct: 2.0, StopLoss: sl, TakeProfit: tp,
+				Reasoning: role + " says " + string(action),
+			},
+			Meta: ModelCallMeta{Provider: "test", Model: role + "-model"},
+		}
+	}
+	results := []specialistResult{
+		mk("fundamental", ActionBuy, 95.0, 110.0),
+		mk("technical", ActionBuy, 95.0, 110.0),
+		mk("sentiment", ActionBuy, 95.0, 110.0),
+		// Dissenting SELL voter — opposite-direction stop/take. MUST be excluded
+		// from the averaging step or the resulting signal would carry SL=97.5,
+		// TP=105.0 instead of the BUY voters' 95.0 / 110.0.
+		mk("risk_manager", ActionSell, 105.0, 90.0),
+	}
+	final := resolveSpecialist(results)
+	if final.Action != ActionBuy {
+		t.Fatalf("expected BUY (3-of-4 majority), got %q", final.Action)
+	}
+	if final.StopLoss != 95.0 {
+		t.Errorf("StopLoss = %.4f; want 95.0 (average over BUY voters only, NOT %.4f which would include the SELL voter)", final.StopLoss, (95.0*3+105.0)/4)
+	}
+	if final.TakeProfit != 110.0 {
+		t.Errorf("TakeProfit = %.4f; want 110.0 (average over BUY voters only, NOT %.4f which would include the SELL voter)", final.TakeProfit, (110.0*3+90.0)/4)
+	}
+}
+
 // TestResolveSpecialist_NoSuccessesYieldsHold guards the failure mode where
 // every role errored — we should not crash and we must default to a safe HOLD.
 func TestResolveSpecialist_NoSuccessesYieldsHold(t *testing.T) {

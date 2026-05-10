@@ -246,30 +246,55 @@ func resolveSpecialist(results []specialistResult) AnalysisResponse {
 		}
 	}
 
-	// Compose averages and the picked-from response for sizing/SL/TP.
-	var sumConf, sumSize, sumSL, sumTP float64
-	var nSL, nTP int
+	// Confidence averages over ALL successful roles (it expresses overall
+	// committee certainty, not just the winners' certainty).
+	var sumConf float64
 	for _, r := range successes {
 		sumConf += r.Response.Confidence
-		sumSize += r.Response.SizePct
-		if r.Response.StopLoss > 0 {
-			sumSL += r.Response.StopLoss
-			nSL++
-		}
-		if r.Response.TakeProfit > 0 {
-			sumTP += r.Response.TakeProfit
-			nTP++
-		}
 	}
 	n := float64(len(successes))
 	avgConf := math.Round(sumConf/n*1000) / 1000
-	avgSize := math.Round(sumSize/n*100) / 100
-	var avgSL, avgTP float64
-	if nSL > 0 {
-		avgSL = math.Round(sumSL/float64(nSL)*10000) / 10000
+
+	// Sizing / SL / TP must average ONLY over roles whose action matches the
+	// final action. Otherwise a 3-of-4 BUY decision would inherit the dissenting
+	// SELL voter's opposite-direction stop-loss / take-profit, corrupting the
+	// risk levels on the resulting signal. See Codex review on PR #342.
+	var winners []specialistResult
+	for _, r := range successes {
+		if r.Response.Action == finalAction {
+			winners = append(winners, r)
+		}
 	}
-	if nTP > 0 {
-		avgTP = math.Round(sumTP/float64(nTP)*10000) / 10000
+	var avgSize, avgSL, avgTP float64
+	if len(winners) == 0 {
+		// Safety fallback — finalAction came from majority/veto, so at least one
+		// successful role should match. If none do (e.g. majority-vote helper
+		// returned a cascade winner that no role actually voted for), keep risk
+		// levels at zero rather than averaging across opposite-direction voters.
+		logger.Warn("specialist: no roles matched finalAction — zeroing sizing",
+			"final_action", string(finalAction))
+	} else {
+		var sumSize, sumSL, sumTP float64
+		var nSL, nTP int
+		for _, r := range winners {
+			sumSize += r.Response.SizePct
+			if r.Response.StopLoss > 0 {
+				sumSL += r.Response.StopLoss
+				nSL++
+			}
+			if r.Response.TakeProfit > 0 {
+				sumTP += r.Response.TakeProfit
+				nTP++
+			}
+		}
+		w := float64(len(winners))
+		avgSize = math.Round(sumSize/w*100) / 100
+		if nSL > 0 {
+			avgSL = math.Round(sumSL/float64(nSL)*10000) / 10000
+		}
+		if nTP > 0 {
+			avgTP = math.Round(sumTP/float64(nTP)*10000) / 10000
+		}
 	}
 
 	// Suppress sizing for non-actionable verdicts (mirrors arbiter behavior).
