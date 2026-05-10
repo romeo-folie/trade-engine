@@ -44,6 +44,10 @@ func FetchConfigData(ctx context.Context, currentMode string) ConfigData {
 			Description: "Maximum concurrent open trades",
 		},
 		{
+			Key: "risk.max_per_ticker", Label: "Max Per Ticker", Kind: "number",
+			Description: "Per-ticker open-position cap in same direction (0 disables)",
+		},
+		{
 			Key: "risk.daily_loss_limit_pct", Label: "Daily Loss Limit %", Kind: "number",
 			Description: "Circuit breaker: max daily loss as % of portfolio",
 		},
@@ -76,6 +80,7 @@ func FetchConfigData(ctx context.Context, currentMode string) ConfigData {
 		"engine.mode":                  currentMode,
 		"risk.confidence_threshold":    "0.65",
 		"risk.max_open_positions":      "10",
+		"risk.max_per_ticker":          "2",
 		"risk.daily_loss_limit_pct":    "3.0",
 		"risk.max_drawdown_pct":        "15.0",
 		"risk.max_position_pct":        "5.0",

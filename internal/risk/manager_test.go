@@ -13,6 +13,7 @@ func defaultCfg() config.RiskConfig {
 		MinRiskReward:       2.0,
 		MaxPositionPct:      5.0,
 		MaxOpenPositions:    10,
+		MaxPerTicker:        2,
 		DailyLossLimitPct:   3.0,
 		MaxDrawdownPct:      10.0,
 		CooldownAfterLoss:   30,
@@ -155,6 +156,86 @@ func TestMaxOpenPositions_Fail(t *testing.T) {
 	in := baseInput()
 	in.OpenPositions = 10
 	assertFails(t, checkMaxOpenPositions, in)
+}
+
+// ── Max per ticker (#312) ─────────────────────────────────────────────────────
+
+func TestMaxPerTicker_PassWhenBelowLimit(t *testing.T) {
+	in := baseInput()
+	in.Ticker = "JMIA"
+	in.OpenByTicker = map[string]int{"JMIA": 1}
+	assertPasses(t, checkMaxPerTicker, in)
+}
+
+func TestMaxPerTicker_FailWhenAtLimit(t *testing.T) {
+	in := baseInput()
+	in.Ticker = "JMIA"
+	in.OpenByTicker = map[string]int{"JMIA": 2}
+	r := assertFails(t, checkMaxPerTicker, in)
+	if r.Name != "max_per_ticker" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
+}
+
+func TestMaxPerTicker_DisabledWhenZero(t *testing.T) {
+	in := baseInput()
+	in.Cfg.MaxPerTicker = 0
+	in.Ticker = "JMIA"
+	// Even an absurdly large count should pass when the cap is disabled.
+	in.OpenByTicker = map[string]int{"JMIA": 99}
+	assertPasses(t, checkMaxPerTicker, in)
+}
+
+func TestMaxPerTicker_NilMapTreatedAsZero(t *testing.T) {
+	in := baseInput()
+	in.Ticker = "JMIA"
+	in.OpenByTicker = nil
+	assertPasses(t, checkMaxPerTicker, in)
+}
+
+// Mirrors the engine-side aggregation: 8 open rows for the same
+// (ticker, direction) collapse to a single distinct position and a
+// per-ticker count of 8. Asserts the new fields wire through CheckInput.
+func TestDistinctPositionCounting_EngineAggregation(t *testing.T) {
+	type openTrade struct {
+		Ticker    string
+		Direction string
+	}
+	openTrades := []openTrade{
+		{"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"},
+		{"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"},
+	}
+	action := "BUY"
+	positions := make(map[string]struct{}, len(openTrades))
+	byTicker := make(map[string]int, len(openTrades))
+	for _, ot := range openTrades {
+		key := ot.Ticker + "|" + ot.Direction
+		positions[key] = struct{}{}
+		if (action == "BUY" && ot.Direction == "long") ||
+			(action == "SELL" && ot.Direction == "short") {
+			byTicker[ot.Ticker]++
+		}
+	}
+	if got := len(positions); got != 1 {
+		t.Fatalf("distinct positions: want 1, got %d", got)
+	}
+	if got := byTicker["JMIA"]; got != 8 {
+		t.Fatalf("byTicker[JMIA]: want 8, got %d", got)
+	}
+
+	// Feeding into CheckAll: max_open_positions sees 1 (passes), but the
+	// per-ticker cap of 2 catches the burst.
+	in := baseInput()
+	in.Ticker = "JMIA"
+	in.OpenPositions = len(positions)
+	in.OpenByTicker = byTicker
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatalf("expected CheckAll to block, got pass; results=%+v", results)
+	}
+	if reason := BlockReason(results); reason == "" {
+		t.Fatal("expected non-empty block reason")
+	}
 }
 
 // ── Daily loss ────────────────────────────────────────────────────────────────
