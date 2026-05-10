@@ -2239,12 +2239,16 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 
 	// Issue #325: aggregate observability counters (signals_total /
 	// signals_executed / executed_winning|losing / blocked_by_reason). On DB
-	// error we fall through with a zero-value DailyCounters; the upsert still
-	// records the legacy P&L columns so today's row exists.
+	// error we MUST skip the upsert entirely — otherwise the ON CONFLICT path
+	// would overwrite the previously-populated row's signals_total /
+	// signals_executed / blocked_by_reason columns with zeros, silently
+	// erasing today's accumulated counters. updateDailySummary runs on a
+	// throttled loop, so the next tick will retry; there's no risk of a
+	// permanently missing row.
 	counters, err := store.AggregateDailyCounters(ctx, start)
 	if err != nil {
-		logger.Warn("aggregate daily counters", "err", err)
-		counters = store.DailyCounters{}
+		logger.Warn("aggregate daily counters; skipping upsert to preserve prior row", "err", err)
+		return
 	}
 
 	// Perform the upsert. Prefer the aggregated signal counts over the

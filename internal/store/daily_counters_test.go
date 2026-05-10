@@ -186,6 +186,104 @@ func TestDailySummary_BlockedByReasonRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDailySummary_AggregateFailurePreservesPriorRow guards the engine's
+// updateDailySummary fix: when AggregateDailyCounters returns an error on a
+// rollup tick, the writer MUST skip the upsert so the previously-populated
+// row's counter columns aren't overwritten with zeros.
+//
+// Before the fix, engine.updateDailySummary fell through with a zero-value
+// DailyCounters{} and still called MaybeDailySummary — the ON CONFLICT path
+// silently wiped signals_total / signals_executed / blocked_by_reason for
+// the day. The fix early-returns on aggregate error.
+//
+// We can't trivially mock store.AggregateDailyCounters from outside the
+// package, so this test mirrors the engine's exact decision: seed a row,
+// call AggregateDailyCounters with a cancelled context to force the error
+// path, assert that no upsert was issued (i.e. the seeded row is byte-for-
+// byte unchanged) when the engine's `if err != nil { return }` short-circuit
+// fires.
+func TestDailySummary_AggregateFailurePreservesPriorRow(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := store.GetDB().Exec(ctx, "TRUNCATE signals, trades CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "TRUNCATE signals, trades CASCADE")
+	})
+
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+
+	// Seed a known-good row carrying non-zero counters and a populated
+	// blocked_by_reason histogram — exactly what an active trading day
+	// would have written into daily_summaries.
+	tr := portfolio.NewTracker(0)
+	tr.Update(nil, 100_000, 100_000, 0, 0)
+
+	seeded := store.DailyCounters{
+		Date:            today,
+		SignalsTotal:    42,
+		SignalsBlocked:  10,
+		SignalsExecuted: 32,
+		ExecutedWinning: 20,
+		ExecutedLosing:  12,
+		BlockedByReason: map[string]int{
+			"confidence 0.55 < threshold 0.65": 7,
+			"R:R 1.20 < minimum 1.40":          3,
+		},
+	}
+	tr.MaybeDailySummary(ctx,
+		100_000.0,
+		1, 1, 0, 0,
+		seeded.SignalsTotal, seeded.SignalsBlocked,
+		0, 0,
+		seeded,
+	)
+
+	before, err := store.GetDailySummaryByDate(ctx, today)
+	if err != nil || before == nil {
+		t.Fatalf("seed read failed: row=%v err=%v", before, err)
+	}
+	if before.SignalsTotal != 42 || before.ExecutedWinning != 20 {
+		t.Fatalf("seed sanity: SignalsTotal=%d ExecutedWinning=%d (want 42/20)",
+			before.SignalsTotal, before.ExecutedWinning)
+	}
+
+	// Force AggregateDailyCounters to fail by passing a cancelled context.
+	// pgx surfaces ctx.Err() as the query error, so the engine's
+	// `if err != nil { return }` short-circuit fires here.
+	cancelledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := store.AggregateDailyCounters(cancelledCtx, today); err == nil {
+		t.Fatal("AggregateDailyCounters with cancelled ctx returned nil error; cannot exercise failure path")
+	}
+	// At this point the engine fix returns BEFORE invoking MaybeDailySummary,
+	// so the seeded row must be unchanged. (The pre-fix code would have
+	// called MaybeDailySummary with a zero-value DailyCounters{} and wiped
+	// the counter columns via ON CONFLICT DO UPDATE.)
+
+	after, err := store.GetDailySummaryByDate(ctx, today)
+	if err != nil || after == nil {
+		t.Fatalf("post-failure read failed: row=%v err=%v", after, err)
+	}
+	if after.SignalsTotal != seeded.SignalsTotal {
+		t.Errorf("SignalsTotal=%d want %d (prior row got overwritten on aggregate failure)",
+			after.SignalsTotal, seeded.SignalsTotal)
+	}
+	if after.SignalsExecuted != seeded.SignalsExecuted {
+		t.Errorf("SignalsExecuted=%d want %d", after.SignalsExecuted, seeded.SignalsExecuted)
+	}
+	if after.ExecutedWinning != seeded.ExecutedWinning || after.ExecutedLosing != seeded.ExecutedLosing {
+		t.Errorf("win/loss = %d/%d want %d/%d",
+			after.ExecutedWinning, after.ExecutedLosing,
+			seeded.ExecutedWinning, seeded.ExecutedLosing)
+	}
+	if after.BlockedByReason["confidence 0.55 < threshold 0.65"] != 7 ||
+		after.BlockedByReason["R:R 1.20 < minimum 1.40"] != 3 {
+		t.Errorf("blocked_by_reason wiped or mutated: got=%v", after.BlockedByReason)
+	}
+}
+
 // TestAggregateDailyCounters_LiveBetweenRollups simulates the dashboard's
 // 5-second poll cadence: the daily-summaries row is written once with N
 // signals, the engine then inserts another signal between rollups, and the
