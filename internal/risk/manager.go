@@ -134,18 +134,28 @@ func checkPositionSize(in CheckInput) CheckResult {
 // notional with a tight stop can risk less. Both gates protect against
 // different failure modes.
 //
-// Skipped when PortfolioValue == 0 (mirrors checkDailyLossLimit) or when
-// MaxDollarRiskPct <= 0 (treat as disabled to keep older configs safe).
-// Zero stop-distance is already caught upstream by checkRiskReward.
+// Skipped when PortfolioValue == 0 (mirrors checkDailyLossLimit), when
+// MaxDollarRiskPct <= 0 (treat as disabled to keep older configs safe),
+// or when StopLoss == 0 (mirrors checkRiskReward — no stop, nothing to
+// measure). Zero stop-distance with a non-zero stop is already caught
+// upstream by checkRiskReward.
+//
+// Quantity estimate uses Cash, not PortfolioValue, to match the actual
+// engine sizing in executeSignal (`pState.Cash * SizePct/100 / SignalPrice`).
+// Using PortfolioValue here would overestimate qty when cash is partially
+// deployed and produce false blocks.
 func checkMaxDollarRisk(in CheckInput) CheckResult {
 	name := "max_dollar_risk"
 	if in.PortfolioValue == 0 || in.Cfg.MaxDollarRiskPct <= 0 {
 		return pass(name)
 	}
+	if in.StopLoss == 0 {
+		return pass(name)
+	}
 	if in.SignalPrice <= 0 {
 		return pass(name)
 	}
-	qty := (in.SizePct / 100) * in.PortfolioValue / in.SignalPrice
+	qty := (in.SizePct / 100) * in.Cash / in.SignalPrice
 	dollarAtRisk := qty * math.Abs(in.SignalPrice-in.StopLoss)
 	riskPct := dollarAtRisk / in.PortfolioValue * 100
 	if riskPct <= in.Cfg.MaxDollarRiskPct {
