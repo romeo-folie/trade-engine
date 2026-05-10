@@ -489,25 +489,15 @@ const (
 	LooseConfidenceThreshold = 0.55
 )
 
-// CalibratableChecks lists the check names whose outcomes a future calibration
-// pass might tighten or relax. counterfactual evaluation only runs when the
-// strict failure was on one of these checks; failures on the rest
-// (max_open_positions, cooldown_after_loss, …) are state-of-the-world signals
-// that loosening thresholds wouldn't change.
-//
-// Exported so callers (engine, tests) can decide whether to run the
-// counterfactual rather than re-deriving the list.
-var CalibratableChecks = map[string]struct{}{
-	"confidence_threshold": {},
-	"risk_reward_ratio":    {},
-	"max_dollar_risk":      {},
-	"position_size_limit":  {},
-}
-
 // IsCalibratable reports whether `check` belongs to the family the
 // counterfactual is meaningful for. Defaults to true for unknown names so
 // future checks are observed by default — drop them into the non-calibratable
 // list explicitly when the gate is a hard state machine.
+//
+// Implemented as a switch (not a map lookup) because the non-calibratable
+// list is stable and code review caught the previous duplicate
+// `CalibratableChecks` map drifting out of sync with this function — one
+// source of truth here avoids the same bug recurring.
 func IsCalibratable(check string) bool {
 	if check == "" {
 		return false

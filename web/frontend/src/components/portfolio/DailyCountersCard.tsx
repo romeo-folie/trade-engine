@@ -9,7 +9,7 @@
  * daily-summary writer hasn't fired yet, so this card never sits at zero on
  * engine restart.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { TOKENS } from '../../styles/tokens';
 
 interface DailyCounter {
@@ -44,12 +44,27 @@ function topBlockReasons(map: Record<string, number> | null, n: number): { reaso
 export default function DailyCountersCard() {
   const [today, setToday] = useState<DailyCounter | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Track the in-flight controller so polls fired before unmount are torn
+  // down on cleanup. Mirrors the AbortController pattern used by Portfolio,
+  // Trades, and Signals screens — without it, an unmount mid-fetch leaks
+  // the response handler and can race a state update against a stale
+  // component.
+  const fetchControllerRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     async function load() {
+      // Cancel any prior in-flight request so only the latest response
+      // can update state (5s poll cadence + slow networks otherwise pile
+      // up parallel requests).
+      fetchControllerRef.current?.abort();
+      const controller = new AbortController();
+      fetchControllerRef.current = controller;
+
       try {
-        const res = await fetch('/api/portfolio/daily-counters?days=1');
+        const res = await fetch('/api/portfolio/daily-counters?days=1', {
+          signal: controller.signal,
+        });
         if (!res.ok) {
           if (!cancelled) setError(`HTTP ${res.status}`);
           return;
@@ -62,7 +77,8 @@ export default function DailyCountersCard() {
         setToday(last);
         setError(null);
       } catch (err) {
-        if (!cancelled && err instanceof Error) {
+        // AbortError on unmount/refresh is expected — swallow it.
+        if (!cancelled && err instanceof Error && err.name !== 'AbortError') {
           setError(err.message);
         }
       }
@@ -72,6 +88,7 @@ export default function DailyCountersCard() {
     return () => {
       cancelled = true;
       clearInterval(interval);
+      fetchControllerRef.current?.abort();
     };
   }, []);
 

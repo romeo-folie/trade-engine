@@ -221,9 +221,6 @@ func TestDailyCounters_DaysClamp(t *testing.T) {
 			t.Errorf("queryInt(%q)=%d want %d", c.raw, got, c.want)
 		}
 	}
-	// Avoid the unused-import warning when store is only referenced
-	// transitively via the helper above.
-	_ = store.IsConnected
 }
 
 // ─── System Status ───────────────────────────────────────────────────────────
