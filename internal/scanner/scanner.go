@@ -181,12 +181,16 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			timeframes = []string{"1H", "4H"}
 		}
 		item := store.WatchlistItem{
-			Ticker:    sc.candidate.Ticker,
-			Platform:  "stock",
+			Ticker:     sc.candidate.Ticker,
+			Platform:   "stock",
 			Strategies: []string{sc.score.Strategy},
 			Timeframes: timeframes,
-			Source:    "scanner",
-			ExpiresAt: &expiresAt,
+			// Persist scanner conviction in MinConfidence so downstream
+			// engine logic (#317 RSI loosen) can read it without going
+			// back to the scanner's in-memory state.
+			MinConfidence: sc.score.Conviction,
+			Source:        "scanner",
+			ExpiresAt:     &expiresAt,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
 			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)

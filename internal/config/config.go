@@ -231,6 +231,26 @@ type AnalysisConfig struct {
 
 	// AdaptiveDepth configures impact-score-driven analyst tier routing (PRD §7.3).
 	AdaptiveDepth AdaptiveDepthConfig `yaml:"adaptive_depth"`
+
+	// MultiTimeframeBorderlineEnabled enables a second analyst pass on the
+	// alternate timeframe when the arbiter resolves to WAIT inside a narrow
+	// borderline confidence band. The combined arbiter then picks the final
+	// action (Issue #321). Default: true.
+	MultiTimeframeBorderlineEnabled bool `yaml:"multi_timeframe_borderline_enabled"`
+
+	// MultiTimeframeAltMap maps a primary timeframe to its alternate. Keys and
+	// values are timeframe strings (e.g. "1h", "4h", "1d"). When a primary
+	// timeframe has no entry the second pass is skipped for that ticker.
+	// Defaults: 1h → 4h, 4h → 1h, 1d → 1h.
+	MultiTimeframeAltMap map[string]string `yaml:"multi_timeframe_alt_map"`
+
+	// MultiTimeframeBorderlineConfMin is the inclusive lower bound of the
+	// borderline confidence band. Defaults to 0.55.
+	MultiTimeframeBorderlineConfMin float64 `yaml:"multi_timeframe_borderline_conf_min"`
+
+	// MultiTimeframeBorderlineConfMax is the inclusive upper bound of the
+	// borderline confidence band. Defaults to 0.70.
+	MultiTimeframeBorderlineConfMax float64 `yaml:"multi_timeframe_borderline_conf_max"`
 }
 
 // ClassifierConfig controls the two-stage classifier gate.
@@ -627,15 +647,29 @@ type NewsSentimentConfig struct {
 
 type RiskConfig struct {
 	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
-	MinRiskReward       float64 `yaml:"min_risk_reward"`
-	MaxPositionPct      float64 `yaml:"max_position_pct"`
-	MaxOpenPositions    int     `yaml:"max_open_positions"`
+	// ConfidenceTiers expresses tiered confidence requirements that vary by
+	// the trade's R:R ratio (#317). Default empty (no tiers — falls back
+	// to the static `confidence_threshold`). Configure tiers in YAML to
+	// enable R:R-aware confidence gating. Tiers are evaluated in
+	// declaration order; the first tier whose RRMin is <= the trade's R:R
+	// applies. Best practice: declare tiers in descending RRMin order
+	// (e.g. {2.0, 0.60} then {1.4, 0.65}). Defaults() leaves this nil so
+	// existing configs that omit the key are unaffected by the upgrade —
+	// see config.example.yaml for the recommended ladder.
+	ConfidenceTiers  []ConfidenceTier `yaml:"confidence_tiers"`
+	MinRiskReward    float64          `yaml:"min_risk_reward"`
+	MaxPositionPct   float64          `yaml:"max_position_pct"`
+	MaxOpenPositions int              `yaml:"max_open_positions"`
 	// MaxPerTicker caps the number of open positions in the same direction
 	// for a single ticker (#312). Default is 0 (disabled) so older configs
 	// that don't set this key upgrade safely without unexpected blocks; the
 	// example config recommends 2. Operators opt in by setting a positive
 	// value in their config.
 	MaxPerTicker int `yaml:"max_per_ticker"`
+	// MaxDollarRiskPct caps the per-trade dollar at risk
+	// (qty × |entry − stop|) as a percent of portfolio equity (#320).
+	// Default 1.0. Treated as disabled when set to 0.
+	MaxDollarRiskPct float64 `yaml:"max_dollar_risk_pct"`
 	// PyramidEnabled gates the pyramiding-into-winners feature (#324). When
 	// true, a BUY signal on a ticker with an existing open long that is up
 	// ≥ PyramidMinGainPct adds a new lot with a tightened stop instead of
@@ -653,6 +687,14 @@ type RiskConfig struct {
 	DefaultTakeProfitPct float64 `yaml:"default_take_profit_pct"`
 	SignalExpiryMin      int     `yaml:"signal_expiry_min"`
 	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
+}
+
+// ConfidenceTier expresses a (R:R floor → confidence floor) pair (#317).
+// Used to require stricter confidence at lower R:R bands and looser
+// confidence at higher R:R bands. See RiskConfig.ConfidenceTiers.
+type ConfidenceTier struct {
+	RRMin   float64 `yaml:"rr_min"`
+	ConfMin float64 `yaml:"conf_min"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

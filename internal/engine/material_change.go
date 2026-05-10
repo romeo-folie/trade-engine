@@ -14,9 +14,9 @@ import (
 type SkipReason string
 
 const (
-	SkipReasonNone          SkipReason = ""
-	SkipReasonHoldCooldown  SkipReason = "HOLD_COOLDOWN"
-	SkipReasonNoChange      SkipReason = "NO_MATERIAL_CHANGE"
+	SkipReasonNone         SkipReason = ""
+	SkipReasonHoldCooldown SkipReason = "HOLD_COOLDOWN"
+	SkipReasonNoChange     SkipReason = "NO_MATERIAL_CHANGE"
 )
 
 // TickerState holds the last-seen indicator snapshot for a single ticker.
@@ -63,6 +63,43 @@ func emaGapPct(price, ema float64) float64 {
 		return 0
 	}
 	return (price - ema) / ema * 100
+}
+
+// applyScannerOverrides returns a copy of the AnalysisConfig with
+// scanner-only material-change relaxations applied. Manual or
+// config-sourced tickers (source != "scanner") are returned unchanged.
+//
+// Two relaxations:
+//
+//  1. HOLD cooldown ÷ 4 (PR #309): scanner-added tickers shouldn't sit on a
+//     2-hour cooldown after one HOLD when they're meant to be actively
+//     watched. Floored at 10 minutes so we don't thrash the LLM on noise.
+//  2. RSI-delta threshold loosened to 2.0 (#317), but only when the
+//     scanner's conviction in the ticker is ≥ 0.75. High-conviction
+//     scanner finds re-trigger LLM analysis on smaller indicator moves
+//     than the default 3.0 floor would allow.
+func applyScannerOverrides(cfg config.AnalysisConfig, source string, scannerConviction float64) config.AnalysisConfig {
+	if source != "scanner" {
+		return cfg
+	}
+
+	if cfg.HoldCooldownMin > 0 {
+		reduced := cfg.HoldCooldownMin / 4
+		if reduced < 10 {
+			reduced = 10
+		}
+		if reduced > cfg.HoldCooldownMin {
+			reduced = cfg.HoldCooldownMin
+		}
+		cfg.HoldCooldownMin = reduced
+	}
+
+	const scannerRSIDeltaFloor = 2.0
+	const scannerConvictionFloor = 0.75
+	if scannerConviction >= scannerConvictionFloor && cfg.RSIDeltaThreshold > scannerRSIDeltaFloor {
+		cfg.RSIDeltaThreshold = scannerRSIDeltaFloor
+	}
+	return cfg
 }
 
 // CheckMaterialChange determines whether a full LLM analysis should run for

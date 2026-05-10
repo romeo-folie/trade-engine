@@ -102,6 +102,15 @@ type Engine struct {
 	lastDailySummaryUpdate time.Time
 
 	feedbackReviewer *feedback.Reviewer
+
+	// multiTFCandleFetcher is the on-demand fetch path used by the borderline
+	// re-arbitration alt pass (Issue #321 PR #336). Watchlist-driven refresh
+	// only fetches the timeframes listed on the item, so an alt-tf candle
+	// store would otherwise go stale and the second pass would re-arbitrate
+	// over outdated bars. This field lets the alt pass proactively refresh
+	// the alt timeframe before reading. Defaults to fetchAndStoreCandles;
+	// tests override it to avoid network/DB.
+	multiTFCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -193,6 +202,11 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		costGuardrail:     guardrail,
 		activeCostProfile: cfg.Cost.Profile,
 	}
+
+	// Default the multi-tf alt-pass fetcher to the production candle fetch path.
+	// Tests override this field directly to avoid network/DB. See Issue #321
+	// PR #336 fix for stale alt-tf candles.
+	e.multiTFCandleFetcher = e.fetchAndStoreCandles
 
 	if cfg.Feedback.Enabled && store.IsConnected() {
 		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())
@@ -488,13 +502,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes, strategies []string, source string) {
+		go func(ticker string, timeframes, strategies []string, source string, conviction float64) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes, strategies, source)
-		}(item.Ticker, item.Timeframes, item.Strategies, item.Source)
+			e.processStock(ctx, ticker, timeframes, strategies, source, conviction)
+		}(item.Ticker, item.Timeframes, item.Strategies, item.Source, item.MinConfidence)
 	}
 
 	wg.Wait()
@@ -517,7 +531,10 @@ func (e *Engine) tick(ctx context.Context) error {
 
 // processStock fetches candles, computes indicators, and fetches news for a single stock.
 // strategies is the ticker's configured strategy list (from the watchlist item).
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string) {
+// scannerConviction carries the scanner's conviction score (0.0–1.0) for
+// scanner-sourced tickers; 0 for manual/config sources. Used by the
+// scanner-only RSI-delta loosen (#317).
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -623,17 +640,7 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 		Now:      time.Now(),
 	}
 
-	mcCfg := e.cfg.Analysis
-	if source == "scanner" && mcCfg.HoldCooldownMin > 0 {
-		reduced := mcCfg.HoldCooldownMin / 4
-		if reduced < 10 {
-			reduced = 10
-		}
-		if reduced > mcCfg.HoldCooldownMin {
-			reduced = mcCfg.HoldCooldownMin
-		}
-		mcCfg.HoldCooldownMin = reduced
-	}
+	mcCfg := applyScannerOverrides(e.cfg.Analysis, source, scannerConviction)
 	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, mcCfg)
 	// Scanner tickers that previously returned WAIT must be re-evaluated next
 	// cycle regardless of indicator movement — WAIT means "check again soon".
@@ -674,6 +681,60 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 
 	if strategy == "" {
 		strategy = "trend_following"
+	}
+
+	// Pre-LLM SELL ownership short-circuit (#319). For strategies whose primary
+	// action is SELL (close/exit-only), there is no point asking the analyst
+	// what to do on a ticker we don't hold long: the only valid recommendation
+	// is SELL, which the post-LLM position-ownership gate would then block.
+	// Skipping here saves the full LLM round-trip — input prompt, model output,
+	// arbiter pass — for every such cycle.
+	//
+	// The canonical SELL-only strategy list is defined in risk.IsSellOnlyStrategy
+	// (sell_only / exit_signal / close_position today). For strategies that emit
+	// BUY *or* SELL depending on context (the default trend_following/
+	// mean_reversion/momentum/news_sentiment set), we still need the LLM to
+	// pick a direction, so the short-circuit does not fire.
+	//
+	// Load openTrades here ONLY when the ownership probe is needed: a SELL-only
+	// strategy with a live DB. For dual-direction strategies and HOLD/WAIT
+	// outcomes the prefetch would be wasted work — generateSignal already
+	// fetches on-demand for the post-LLM ownership check (Copilot perf
+	// regression on PR #337 round-2). When the prefetch is skipped we leave
+	// prefetchedOpenTrades nil so generateSignal re-issues the query through
+	// its existing degraded-mode handling.
+	//
+	// store.IsConnected gating prevents store.GetOpenTrades from panicking
+	// (GetDB panics if the pool is nil). When a SELL-only strategy is gated
+	// out of the prefetch because the DB is not connected, we cannot verify
+	// ownership, so we fall through to the LLM and let generateSignal's
+	// post-LLM ownership gate handle the no-DB path the same way it does for
+	// any other SELL.
+	var prefetchedOpenTrades []store.Trade
+	if shouldPrefetchOpenTrades(strategy, store.IsConnected()) {
+		if openTrades, err := store.GetOpenTrades(ctx); err != nil {
+			// On a DB read failure, fall through to the LLM rather than silently
+			// skipping; the post-LLM gate will still block any SELL we cannot
+			// verify. This mirrors how generateSignal handles GetOpenTrades errors
+			// for SELL signals. Leave prefetchedOpenTrades nil so generateSignal
+			// re-tries the query and applies its own degraded-mode handling.
+			logger.Warn("sell-strategy ownership probe failed — falling through to LLM",
+				"ticker", ticker, "strategy", strategy, "err", err.Error())
+		} else {
+			prefetchedOpenTrades = openTrades
+			holdsLong := tickerHasOpenLongIn(openTrades, ticker)
+			if shouldSkipSellStrategy(strategy, holdsLong) {
+				reason := risk.NoPositionBlockReason(ticker)
+				logger.Info("analysis skipped — no position",
+					"ticker", ticker,
+					"strategy", strategy,
+					"timeframe", timeframe,
+					"reason", reason,
+				)
+				e.emitOwnershipShortCircuitBlock(ctx, ticker, strategy, candles, reason)
+				return
+			}
+		}
 	}
 
 	// Build candle snapshots (most-recent-first for prompt context).
@@ -806,7 +867,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	impact := e.calculateImpactScore(ticker, snippets, candles)
 	result, err := e.analyzer.AnalyzeFull(ctx, req, impact)
 
-	// Record token usage for cost tracking (#177) — BEFORE checking err.
+	// Record token usage for cost tracking (#177) — BEFORE checking err and
+	// BEFORE the optional second-pass below so first-pass spend is always
+	// captured even if a second pass overwrites `result`. Issue #321's
+	// alt-timeframe pass records its own tokens via recordMultiTFCost into a
+	// distinct "<model>#mtf2" bucket; the re-arbiter cost is recorded after
+	// re-arbitration completes.
+	//
 	// AnalyzeFull can return a non-nil result alongside a non-nil error (e.g.
 	// JSON extraction failures in single-analyst mode). Providers consume tokens
 	// before erroring, so skipping recording on error would undercount spend and
@@ -837,6 +904,49 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		} else if result.Meta.Provider != "" && result.Meta.Model != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
 			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
 				result.Meta.InputTokens, result.Meta.OutputTokens)
+		}
+	}
+
+	// Issue #321 — Multi-timeframe arbiter for borderline WAITs.
+	// If the first pass resolved to WAIT inside the configured borderline band,
+	// run a second analyst pass on the alternate timeframe and re-arbitrate
+	// over the combined set. The recursion guard is enforced by passing the
+	// secondPass=false flag here; runSecondTimeframePass never re-invokes this
+	// branch, so a third pass cannot fire.
+	if err == nil {
+		if altTF, run := shouldRunSecondPass(e.cfg.Analysis, result.Response, timeframe, false); run {
+			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
+				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
+				"confidence", fmt.Sprintf("%.3f", result.Response.Confidence))
+			if altResult, ok := e.runSecondTimeframePass(ctx, req, altTF, ticker, impact); ok {
+				// Charge the alt-pass tokens to a distinct bucket
+				// ("<model>#mtf2") so we can measure marginal cost.
+				e.recordMultiTFCost(altResult)
+				combined := combineForArbiter(timeframe, altTF, result.AnalystResults, altResult.AnalystResults)
+				combinedReq := req
+				combinedReq.Timeframe = fmt.Sprintf("%s+%s", timeframe, altTF)
+				if reArb, rerr := reArbitrate(ctx, e.analyzer, combinedReq, combined); rerr == nil {
+					// Charge re-arbiter tokens to the multi-tf bucket too —
+					// it would not have run absent the second pass.
+					if reArb.Arbiter != nil && reArb.Arbiter.Meta.Provider != "" && reArb.Arbiter.Meta.Model != "" &&
+						(reArb.Arbiter.Meta.InputTokens > 0 || reArb.Arbiter.Meta.OutputTokens > 0) {
+						e.costTracker.Record(reArb.Arbiter.Meta.Provider, reArb.Arbiter.Meta.Model+multiTFCostSuffix,
+							reArb.Arbiter.Meta.InputTokens, reArb.Arbiter.Meta.OutputTokens)
+					}
+					logger.Info("multi-tf: re-arbitration complete",
+						"ticker", ticker,
+						"original_action", string(result.Response.Action),
+						"final_action", string(reArb.Response.Action),
+						"final_confidence", fmt.Sprintf("%.3f", reArb.Response.Confidence))
+					result = reArb
+				} else {
+					logger.Warn("multi-tf: re-arbitration failed — keeping original WAIT",
+						"ticker", ticker, "err", rerr.Error())
+				}
+			} else {
+				logger.Debug("multi-tf: alt-timeframe pass unavailable — keeping original WAIT",
+					"ticker", ticker, "alt_tf", altTF)
+			}
 		}
 	}
 
@@ -935,7 +1045,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
-	e.generateSignal(ctx, ticker, strategy, candles, resp, analysisID)
+	// Hand the pre-fetched openTrades (loaded by the SELL ownership short-circuit
+	// probe above) into generateSignal so we don't fire a second identical
+	// GetOpenTrades query for SELL-only strategies. Nil is the common case —
+	// dual-direction strategies and no-DB / probe-failed cycles all leave the
+	// prefetch unset, and generateSignal then re-fetches on-demand and applies
+	// its degraded-mode handling.
+	e.generateSignal(ctx, ticker, strategy, candles, resp, analysisID, prefetchedOpenTrades)
 
 	// Update material-change gate state for next tick.
 	latestClose := 0.0
@@ -959,6 +1075,118 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// shouldSkipSellStrategy is the pure decision predicate for the pre-LLM
+// SELL ownership short-circuit (#319). Returns true only when the strategy
+// is canonically SELL-only AND the portfolio holds no open long. Extracted
+// from runAnalysis so the decision can be unit-tested without a DB.
+func shouldSkipSellStrategy(strategy string, holdsLong bool) bool {
+	return risk.IsSellOnlyStrategy(strategy) && !holdsLong
+}
+
+// shouldPrefetchOpenTrades reports whether runAnalysis should issue an
+// up-front store.GetOpenTrades query to support the SELL-only ownership
+// short-circuit (#319). Returns true only when (a) the strategy is canonically
+// SELL-only — dual-direction strategies and HOLD/WAIT cycles get the prefetch
+// skipped to avoid a wasted DB roundtrip every tick (Copilot perf review on
+// PR #337 round-2) — AND (b) the store is connected, so GetOpenTrades won't
+// panic via GetDB on a nil pool. When this returns false the SELL ownership
+// gate falls through to generateSignal's on-demand fetch for the post-LLM
+// ownership check.
+func shouldPrefetchOpenTrades(strategy string, dbConnected bool) bool {
+	return risk.IsSellOnlyStrategy(strategy) && dbConnected
+}
+
+// tickerHasOpenLongIn reports whether the supplied openTrades slice contains
+// any open long position in the given ticker. Used by the SELL ownership
+// pre-LLM short-circuit (#319) so we can skip the analyst call entirely when
+// a SELL-only strategy is scheduled against a ticker we don't hold.
+//
+// Slice-based (rather than fetching itself) so the caller can reuse the same
+// GetOpenTrades result for the post-LLM risk-check pass — avoiding a duplicate
+// DB query per analysis cycle.
+func tickerHasOpenLongIn(openTrades []store.Trade, ticker string) bool {
+	for _, t := range openTrades {
+		if t.Ticker == ticker && t.Direction == "long" {
+			return true
+		}
+	}
+	return false
+}
+
+// buildOwnershipShortCircuitBlock returns the synthetic blocked SELL signal
+// and the two event payloads that the SELL-only pre-LLM short-circuit emits
+// so the cycle is still visible in the signals table and on the dashboard
+// rather than disappearing silently (Codex/Copilot review on PR #337).
+//
+// Pure (no DB / no event bus) so it can be unit-tested without spinning up a
+// Postgres test database. emitOwnershipShortCircuitBlock wires the result to
+// store.InsertSignal and the engine event bus.
+func buildOwnershipShortCircuitBlock(cfg config.RiskConfig, ticker, strategy string, candles []data.Candle, reason string, now time.Time) (store.Signal, events.RiskCheckCompletedPayload, events.SignalBlockedPayload) {
+	var signalPrice float64
+	if len(candles) > 0 {
+		signalPrice = candles[len(candles)-1].Close
+	}
+	expiryMin := cfg.SignalExpiryMin
+	if expiryMin == 0 {
+		expiryMin = 30
+	}
+	stalePct := cfg.StalePriceMovePct
+	if stalePct == 0 {
+		stalePct = 2.0
+	}
+	sig := store.Signal{
+		Ticker:            ticker,
+		Action:            "SELL",
+		Strategy:          strategy,
+		SignalPrice:       signalPrice,
+		Status:            "blocked",
+		BlockReason:       reason,
+		ExpiresAt:         now.Add(time.Duration(expiryMin) * time.Minute),
+		StalePriceMovePct: stalePct,
+	}
+	riskEv := events.RiskCheckCompletedPayload{
+		Ticker: ticker,
+		Passed: false,
+		Checks: []events.RiskCheckResult{{
+			Name:   "position_ownership",
+			Passed: false,
+			Reason: reason,
+		}},
+	}
+	blockEv := events.SignalBlockedPayload{
+		Ticker:      ticker,
+		Action:      "SELL",
+		BlockReason: reason,
+		FailedCheck: "position_ownership",
+	}
+	return sig, riskEv, blockEv
+}
+
+// emitOwnershipShortCircuitBlock persists the synthetic blocked signal and
+// publishes the matching RiskCheckCompleted + SignalBlocked events so the
+// downstream surface (Signals table, TUI, Telegram, dashboard) sees a SELL
+// short-circuit identically to a normal post-LLM risk-check rejection.
+//
+// When the store is not connected (degraded/no-DB mode) the persistent insert
+// is skipped — store.InsertSignal calls store.GetDB which panics if the pool
+// is nil — but we still publish the in-process events so the TUI/Telegram/
+// dashboard surfaces continue to see the block. Only the persistent record is
+// lost (Copilot crash review on PR #337 round-2).
+func (e *Engine) emitOwnershipShortCircuitBlock(ctx context.Context, ticker, strategy string, candles []data.Candle, reason string) {
+	sig, riskEv, blockEv := buildOwnershipShortCircuitBlock(e.cfg.Risk, ticker, strategy, candles, reason, time.Now())
+	if store.IsConnected() {
+		if _, err := store.InsertSignal(ctx, sig); err != nil {
+			logger.Warn("store ownership short-circuit blocked signal",
+				"ticker", ticker, "err", err)
+		}
+	} else {
+		logger.Info("signal blocked (no-DB; not persisted)",
+			"ticker", ticker, "strategy", strategy, "reason", reason)
+	}
+	e.bus.Publish(events.RiskCheckCompleted, riskEv)
+	e.bus.Publish(events.SignalBlocked, blockEv)
 }
 
 // resolveEnricherProvider returns the ModelProvider to use for knowledge
@@ -1225,7 +1453,13 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
 // and routes execution according to the current mode.
-func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string) {
+//
+// prefetchedOpenTrades, when non-nil, is reused for the position-ownership and
+// portfolio-shape risk inputs instead of issuing another GetOpenTrades query.
+// runAnalysis loads openTrades up front for the SELL-only short-circuit probe
+// (#319) and threads the same slice through here so a typical analysis cycle
+// only hits the trades store once. Pass nil to force a fresh query.
+func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
 		// no signal fires. No cooldown is applied so the ticker is re-evaluated
@@ -1269,7 +1503,15 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 
 	// Run risk checks.
 	pState := e.portfolio.CurrentState()
-	openTrades, openTradesErr := store.GetOpenTrades(ctx)
+	var openTrades []store.Trade
+	var openTradesErr error
+	if prefetchedOpenTrades != nil {
+		// Reuse the slice already loaded by runAnalysis's SELL-ownership probe
+		// so a normal analysis cycle costs one GetOpenTrades query, not two.
+		openTrades = prefetchedOpenTrades
+	} else {
+		openTrades, openTradesErr = store.GetOpenTrades(ctx)
+	}
 	if openTradesErr != nil {
 		logger.Warn("get open trades for risk checks", "ticker", ticker, "err", openTradesErr)
 		// For SELL signals we cannot verify position ownership — block rather than

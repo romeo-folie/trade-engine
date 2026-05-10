@@ -172,11 +172,20 @@ func Defaults() *Config {
 			},
 		},
 		Risk: RiskConfig{
-			ConfidenceThreshold:  0.65,
-			MinRiskReward:        1.5,
+			ConfidenceThreshold: 0.65,
+			// ConfidenceTiers defaults to nil so existing configs that omit
+			// `risk.confidence_tiers` keep using the static
+			// `confidence_threshold` floor (#317 review). Pre-filling tiers
+			// here would silently overlay tiered gating onto operators who
+			// explicitly raised confidence_threshold (same shape as the #312
+			// MaxPerTicker default-overlay bug). Opt in via YAML;
+			// config.example.yaml carries the recommended tier ladder.
+			ConfidenceTiers:      nil,
+			MinRiskReward:        1.4,
 			MaxPositionPct:       5.0,
 			MaxOpenPositions:     10,
 			MaxPerTicker:         0,
+			MaxDollarRiskPct:     1.0,
 			PyramidEnabled:       false,
 			PyramidMinGainPct:    5.0,
 			DailyLossLimitPct:    3.0,
@@ -254,6 +263,18 @@ func Defaults() *Config {
 					TrendStrength: 0.20,
 				},
 			},
+			// Multi-timeframe borderline arbiter (Issue #321) — defaults are
+			// deliberately narrow so only a small fraction of WAITs incur the
+			// 2× token cost. 1d → 1h gives the daily view a near-term sanity
+			// check; 1h ↔ 4h cross-checks intra-day vs swing perspectives.
+			MultiTimeframeBorderlineEnabled: true,
+			MultiTimeframeAltMap: map[string]string{
+				"1h": "4h",
+				"4h": "1h",
+				"1d": "1h",
+			},
+			MultiTimeframeBorderlineConfMin: 0.55,
+			MultiTimeframeBorderlineConfMax: 0.70,
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,
