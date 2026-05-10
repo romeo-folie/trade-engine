@@ -257,11 +257,16 @@ analysis:
   # Falls back to majority vote if risk-manager is missing/failed.
   # DEFAULT OFF — opt in only after verifying provider keys for every mapped role.
   specialist_mode_enabled: false
+  # Map each specialist role to a key declared in models.registry above.
+  # The mapping below is illustrative — operators should swap in whichever
+  # provider+model they want behind each role. Any role whose mapped registry
+  # key is missing or whose provider is unavailable is skipped at runtime
+  # with a WARN log (no crash).
   specialist_roles:
-    fundamental: claude
-    technical: deepseek
-    sentiment: gemini
-    risk_manager: grok
+    fundamental: analyst_frontier   # frontier model for catalysts/earnings reasoning
+    technical: analyst_mid          # mid-tier for indicator/structure analysis
+    sentiment: analyst_cheap        # cheap model for high-volume news/social pass
+    risk_manager: analyst_frontier  # frontier model for portfolio/veto decisions
 
   # Adaptive depth: scores each tick and routes to fewer analysts when the
   # situation is low-volatility / low-novelty. Requires analyst tier roles
