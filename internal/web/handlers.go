@@ -45,6 +45,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/portfolio/performance", s.handlePortfolioPerformance)
 	mux.HandleFunc("/api/portfolio/summaries", s.handlePortfolioSummaries)
 	mux.HandleFunc("/api/portfolio/stats", s.handlePortfolioStats)
+	mux.HandleFunc("/api/portfolio/daily-counters", s.handlePortfolioDailyCounters)
 	mux.HandleFunc("/api/portfolio/positions", s.handlePortfolioPositions)
 	mux.HandleFunc("/api/system/cache", s.handleSystemCache)
 	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
@@ -436,6 +437,88 @@ func (s *Server) handlePortfolioSummaries(w http.ResponseWriter, r *http.Request
 		summaries = []store.DailySummary{}
 	}
 	jsonResponse(w, map[string]any{"summaries": summaries})
+}
+
+// GET /api/portfolio/daily-counters?days=N
+//
+// Returns the last N days of observability rollups (Issue #325) — one row per
+// calendar day with signals_total / signals_blocked / signals_executed,
+// blocked_by_reason histogram, and executed_winning / executed_losing trade
+// counts. Default 30 days, max 90.
+//
+// Today's row is computed live from signals + trades when there's no
+// daily_summaries row yet, so the dashboard never reads a "0 signals" row on
+// engine startup before the rollup writer fires.
+func (s *Server) handlePortfolioDailyCounters(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	days := queryInt(r, "days", 30, 90)
+	now := time.Now().UTC()
+	from := now.AddDate(0, 0, -days+1).Truncate(24 * time.Hour)
+	to := now.Truncate(24 * time.Hour)
+
+	summaries, err := store.GetDailySummaries(ctx, from, to)
+	if err != nil {
+		apiError(w, "daily counters query failed", err)
+		return
+	}
+	if summaries == nil {
+		summaries = []store.DailySummary{}
+	}
+
+	// If today's row hasn't been upserted yet, synthesize it from the live
+	// aggregate so the dashboard isn't permanently waiting for the next 5-
+	// minute rollup tick.
+	todayStart := now.Truncate(24 * time.Hour)
+	hasToday := false
+	for _, s := range summaries {
+		if s.Date.UTC().Truncate(24 * time.Hour).Equal(todayStart) {
+			hasToday = true
+			break
+		}
+	}
+
+	type counterDTO struct {
+		Date            string         `json:"date"`
+		SignalsTotal    int            `json:"signals_total"`
+		SignalsBlocked  int            `json:"signals_blocked"`
+		SignalsExecuted int            `json:"signals_executed"`
+		ExecutedWinning int            `json:"executed_winning"`
+		ExecutedLosing  int            `json:"executed_losing"`
+		BlockedByReason map[string]int `json:"blocked_by_reason"`
+	}
+	out := make([]counterDTO, 0, len(summaries)+1)
+	for _, s := range summaries {
+		out = append(out, counterDTO{
+			Date:            s.Date.UTC().Format("2006-01-02"),
+			SignalsTotal:    s.SignalsTotal,
+			SignalsBlocked:  s.SignalsBlocked,
+			SignalsExecuted: s.SignalsExecuted,
+			ExecutedWinning: s.ExecutedWinning,
+			ExecutedLosing:  s.ExecutedLosing,
+			BlockedByReason: s.BlockedByReason,
+		})
+	}
+	if !hasToday {
+		if dc, err := store.AggregateDailyCounters(ctx, todayStart); err == nil {
+			out = append(out, counterDTO{
+				Date:            todayStart.Format("2006-01-02"),
+				SignalsTotal:    dc.SignalsTotal,
+				SignalsBlocked:  dc.SignalsBlocked,
+				SignalsExecuted: dc.SignalsExecuted,
+				ExecutedWinning: dc.ExecutedWinning,
+				ExecutedLosing:  dc.ExecutedLosing,
+				BlockedByReason: dc.BlockedByReason,
+			})
+		}
+	}
+
+	jsonResponse(w, map[string]any{"counters": out})
 }
 
 // GET /api/portfolio/stats

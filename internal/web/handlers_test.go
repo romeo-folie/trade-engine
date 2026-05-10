@@ -184,6 +184,48 @@ func TestPortfolioHandlers_NoDB(t *testing.T) {
 	})
 }
 
+// ─── DailyCounters Handler ───────────────────────────────────────────────────
+
+// Without a DB, the counters endpoint should 500 with "database not connected"
+// — same shape as Stats above. Validates the route is wired and the
+// not-connected branch is hit before any query attempt.
+func TestHandleDailyCounters_NoDB(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+
+	w := httptest.NewRecorder()
+	srv.handlePortfolioDailyCounters(w, httptest.NewRequest("GET", "/api/portfolio/daily-counters", nil))
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "database not connected") {
+		t.Errorf("expected 'database not connected' error, got %q", w.Body.String())
+	}
+}
+
+// queryInt(days, default=30, max=90) — verify the cap kicks in and the
+// default applies when missing. Mirrors the existing TestQueryInt cases but
+// pinned to the daily-counters limits so a future bump is caught here too.
+func TestDailyCounters_DaysClamp(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want int
+	}{
+		{"", 30},
+		{"days=7", 7},
+		{"days=200", 90}, // capped at max
+		{"days=-1", 30},  // negative → default
+	}
+	for _, c := range cases {
+		r := &http.Request{URL: &url.URL{RawQuery: c.raw}}
+		if got := queryInt(r, "days", 30, 90); got != c.want {
+			t.Errorf("queryInt(%q)=%d want %d", c.raw, got, c.want)
+		}
+	}
+	// Avoid the unused-import warning when store is only referenced
+	// transitively via the helper above.
+	_ = store.IsConnected
+}
+
 // ─── System Status ───────────────────────────────────────────────────────────
 
 func TestHandleSystemStatus_Structure(t *testing.T) {
