@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -117,5 +118,125 @@ func TestAggregateDailyCounters(t *testing.T) {
 	}
 	if dc.BlockedByReason["confidence 0.55 < threshold 0.65"] != 1 {
 		t.Errorf("confidence bucket missing: %v", dc.BlockedByReason)
+	}
+}
+
+// TestDailySummary_BlockedByReasonRoundTrip writes a daily_summaries row
+// through the production code path (portfolio.MaybeDailySummary, which is
+// what the engine calls every minute) carrying a non-empty
+// blocked_by_reason map, then reads it back and checks the JSONB column
+// round-trips correctly.
+//
+// The previous implementation passed `[]byte` as the bind value without an
+// explicit ::jsonb cast — pgx encodes []byte as bytea, which Postgres rejects
+// when the column is jsonb. This test would catch any regression to that
+// path so the fix doesn't silently break again.
+func TestDailySummary_BlockedByReasonRoundTrip(t *testing.T) {
+	ctx := context.Background()
+
+	// Don't TRUNCATE daily_summaries — other tests may depend on existing
+	// rows. Use today's date and rely on the upsert to overwrite.
+	today := time.Now().UTC().Truncate(24 * time.Hour)
+
+	tr := portfolio.NewTracker(0) // 0 cooldown so MaybeDailySummary runs immediately
+	tr.Update(nil, 100_000, 100_000, 0, 0)
+
+	counters := store.DailyCounters{
+		Date:            today,
+		SignalsTotal:    7,
+		SignalsBlocked:  4,
+		SignalsExecuted: 3,
+		ExecutedWinning: 2,
+		ExecutedLosing:  1,
+		BlockedByReason: map[string]int{
+			"confidence 0.55 < threshold 0.65": 2,
+			"R:R 1.20 < minimum 1.40":          1,
+			"max_open_positions reached":       1,
+		},
+	}
+
+	tr.MaybeDailySummary(ctx,
+		100_000.0,
+		1, 1, 0, 0,
+		counters.SignalsTotal, counters.SignalsBlocked,
+		0, 0,
+		counters,
+	)
+
+	got, err := store.GetDailySummaryByDate(ctx, today)
+	if err != nil {
+		t.Fatalf("GetDailySummaryByDate: %v", err)
+	}
+	if got == nil {
+		t.Fatal("GetDailySummaryByDate: returned nil — write likely failed; check logs for jsonb cast error")
+	}
+	if got.BlockedByReason == nil {
+		t.Fatalf("blocked_by_reason round-tripped as nil; want non-empty map")
+	}
+	if got.BlockedByReason["confidence 0.55 < threshold 0.65"] != 2 {
+		t.Errorf("confidence bucket = %d, want 2; full map=%v",
+			got.BlockedByReason["confidence 0.55 < threshold 0.65"], got.BlockedByReason)
+	}
+	if got.BlockedByReason["R:R 1.20 < minimum 1.40"] != 1 {
+		t.Errorf("R:R bucket = %d, want 1", got.BlockedByReason["R:R 1.20 < minimum 1.40"])
+	}
+	if got.SignalsTotal != 7 || got.ExecutedWinning != 2 || got.ExecutedLosing != 1 {
+		t.Errorf("scalar counters mismatch: total=%d winning=%d losing=%d",
+			got.SignalsTotal, got.ExecutedWinning, got.ExecutedLosing)
+	}
+}
+
+// TestAggregateDailyCounters_LiveBetweenRollups simulates the dashboard's
+// 5-second poll cadence: the daily-summaries row is written once with N
+// signals, the engine then inserts another signal between rollups, and the
+// next AggregateDailyCounters call must reflect the new count. Without the
+// handler's live-overlay (Issue #325 review fix), the dashboard would stay
+// pinned to the persisted row's stale value until the next rollup tick.
+func TestAggregateDailyCounters_LiveBetweenRollups(t *testing.T) {
+	ctx := context.Background()
+
+	if _, err := store.GetDB().Exec(ctx, "TRUNCATE signals, trades CASCADE"); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "TRUNCATE signals, trades CASCADE")
+	})
+
+	now := time.Now().UTC()
+	today := now.Truncate(24 * time.Hour)
+
+	insert := func() {
+		if _, err := store.InsertSignal(ctx, store.Signal{
+			Ticker: "TEST", Action: "BUY", Strategy: "momentum",
+			SignalPrice: 100, StopLoss: 95, TakeProfit: 110, Confidence: 0.7,
+			SizePct: 1.0, Status: "executed",
+			ExpiresAt: now.Add(15 * time.Minute), StalePriceMovePct: 2.0,
+		}); err != nil {
+			t.Fatalf("InsertSignal: %v", err)
+		}
+	}
+
+	// First poll (T=12:01 in the spec): 2 signals.
+	insert()
+	insert()
+	first, err := store.AggregateDailyCounters(ctx, today)
+	if err != nil {
+		t.Fatalf("first AggregateDailyCounters: %v", err)
+	}
+	if first.SignalsTotal != 2 {
+		t.Fatalf("first poll: SignalsTotal=%d want 2", first.SignalsTotal)
+	}
+
+	// Engine produces a third signal between rollup ticks.
+	insert()
+
+	// Second poll (T=12:02): the dashboard re-queries and must see 3.
+	second, err := store.AggregateDailyCounters(ctx, today)
+	if err != nil {
+		t.Fatalf("second AggregateDailyCounters: %v", err)
+	}
+	if second.SignalsTotal != 3 {
+		t.Errorf("second poll: SignalsTotal=%d want 3 (live overlay broken?)",
+			second.SignalsTotal)
 	}
 }

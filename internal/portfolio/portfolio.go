@@ -209,6 +209,10 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 			blockedJSON = b
 		}
 	}
+	// pgx encodes a raw []byte as bytea. blocked_by_reason is JSONB, so the
+	// placeholder is cast explicitly with ::jsonb (the same pattern UpdateORBSession
+	// uses for the candidates column). Without the cast, INSERT fails at runtime
+	// with "column ... is of type jsonb but expression is of type bytea".
 	_, err := store.GetDB().Exec(ctx, `
 		INSERT INTO daily_summaries (
 			date, starting_value, ending_value, pnl, pnl_pct,
@@ -217,7 +221,7 @@ func (t *Tracker) MaybeDailySummary(ctx context.Context, startingValue float64,
 			model_tokens_input, model_tokens_output,
 			signals_total, signals_executed,
 			executed_winning, executed_losing, blocked_by_reason
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18::jsonb)
 		ON CONFLICT (date) DO UPDATE SET
 			ending_value=EXCLUDED.ending_value, pnl=EXCLUDED.pnl, pnl_pct=EXCLUDED.pnl_pct,
 			trades_opened=EXCLUDED.trades_opened, trades_closed=EXCLUDED.trades_closed,
