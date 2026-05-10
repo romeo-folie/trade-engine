@@ -430,6 +430,14 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 	// is fine (it's gone), a "filled" / "cancelled" is fine (terminal).
 	status, statusErr := m.exec.GetOrderStatus(ctx, brokerOrderID)
 	if statusErr != nil {
+		// Broker says the order doesn't exist — that IS the terminal
+		// state we wanted. Treat as a confirmed cancel so resubmission
+		// can proceed instead of stalling on the "we don't know"
+		// branch. This is what the comment above promised but the
+		// original code missed.
+		if errors.Is(statusErr, execution.ErrOrderNotFound) {
+			return nil
+		}
 		// Couldn't even confirm. If cancel succeeded the broker likely
 		// purged the order; if cancel also failed we have no idea.
 		if cancelErr != nil {

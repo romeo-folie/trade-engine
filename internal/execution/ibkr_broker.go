@@ -231,7 +231,11 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 		}
 	}
 
-	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found", brokerOrderID)
+	// Wrap ErrOrderNotFound so callers (e.g. trailing-stop's
+	// cancelAndConfirm) can detect the terminal "order purged from broker"
+	// case via errors.Is and treat it as cancelled rather than as an
+	// unconfirmed status.
+	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q: %w", brokerOrderID, ErrOrderNotFound)
 }
 
 // GetPositions returns all open positions from the IBKR account.

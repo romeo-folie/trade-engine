@@ -105,7 +105,11 @@ func (p *PaperExecutor) GetOrderStatus(_ context.Context, brokerOrderID string) 
 	defer p.mu.RUnlock()
 	o, ok := p.orders[brokerOrderID]
 	if !ok {
-		return OrderResult{}, fmt.Errorf("paper order %s not found", brokerOrderID)
+		// Wrap ErrOrderNotFound so callers (e.g. trailing-stop's
+		// cancelAndConfirm) can detect the terminal "order is gone"
+		// case via errors.Is and treat it as cancelled rather than as
+		// an unconfirmed status.
+		return OrderResult{}, fmt.Errorf("paper order %s: %w", brokerOrderID, ErrOrderNotFound)
 	}
 	return o.result, nil
 }

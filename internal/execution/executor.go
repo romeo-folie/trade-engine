@@ -2,7 +2,18 @@
 // PRD §18 — Executor interface contract.
 package execution
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrOrderNotFound is returned by Executor implementations when a broker
+// reports that the order ID is unknown — typically a 404 from Alpaca's
+// /v2/orders/{id} endpoint or IBKR's "not found in live orders + trades"
+// fallthrough. Callers can detect this with errors.Is and treat it as a
+// terminal state (the order is effectively gone) rather than as an
+// uncertain status that blocks resubmission.
+var ErrOrderNotFound = errors.New("execution: order not found at broker")
 
 // OrderSide identifies the direction of an order.
 type OrderSide string

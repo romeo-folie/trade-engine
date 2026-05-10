@@ -221,6 +221,9 @@ type fakeBroker struct {
 	// works; tests can set it to "pending" or "" to simulate broker
 	// timeouts where the cancel didn't actually take.
 	statusOverride map[string]string
+	// notFoundIDs contains broker order ids GetOrderStatus must report as
+	// ErrOrderNotFound — exercises the cancelAndConfirm sentinel path.
+	notFoundIDs map[string]bool
 	// nextFillPrice / nextFillQty are returned on the next PlaceOrder call
 	// to simulate the broker echoing back the immediate fill (e.g. Alpaca
 	// IOC market sells). Reset to zero after each call.
@@ -277,6 +280,9 @@ func (b *fakeBroker) CancelOrder(_ context.Context, brokerOrderID string) error 
 func (b *fakeBroker) GetOrderStatus(_ context.Context, brokerOrderID string) (execution.OrderResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.notFoundIDs[brokerOrderID] {
+		return execution.OrderResult{}, execution.ErrOrderNotFound
+	}
 	if s, ok := b.statusOverride[brokerOrderID]; ok {
 		return execution.OrderResult{Status: s}, nil
 	}
@@ -961,6 +967,58 @@ func TestManager_StopRoundedAgainstNumericRoundtrip(t *testing.T) {
 	if len(base.replaced)+len(base.placed) != 0 {
 		t.Fatalf("BUG REGRESSED: NUMERIC-roundtrip stop triggered broker churn: replaced=%d placed=%d (mult=%v atr=%v)",
 			len(base.replaced), len(base.placed), mult, atr)
+	}
+}
+
+// TestCancelAndConfirm_NotFoundTreatedAsTerminal pins the round-3 fix for
+// the cancelAndConfirm comment/behavior mismatch: the comment says a 404 /
+// "order not found" status response is fine (terminal), but the original
+// code errored out and blocked resubmission. With the executor.ErrOrderNotFound
+// sentinel, cancelAndConfirm now returns nil so the cancel+resubmit
+// fallback can complete — exactly what the comment promised.
+func TestCancelAndConfirm_NotFoundTreatedAsTerminal(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "long",
+		Status:        "open",
+		EntryPrice:    100,
+		StopLoss:      95,
+		Quantity:      10,
+		HighWaterMark: 100,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "broker-pre",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     95,
+		Status:        "pending",
+		IsStopLoss:    true,
+	})
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
+	// failReplace forces the cancel+resubmit fallback. CancelOrder
+	// "succeeds" (no error) but GetOrderStatus reports the broker has
+	// already purged the id → ErrOrderNotFound. Per the comment this is
+	// terminal-cancelled state and resubmission must proceed.
+	base := &fakeBroker{
+		failReplace: true,
+		notFoundIDs: map[string]bool{"broker-pre": true},
+	}
+	fb := fakeBrokerWithReplace{fakeBroker: base}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(base.placed) != 1 {
+		t.Fatalf("expected resubmit after broker reported not-found: placed=%d", len(base.placed))
+	}
+	if base.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("resubmitted order wrong type: %v", base.placed[0].Type)
 	}
 }
 
