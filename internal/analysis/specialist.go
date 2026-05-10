@@ -322,16 +322,18 @@ func composeSpecialistReasoning(successes []specialistResult, finalAction Action
 	sort.Slice(successes, func(i, j int) bool { return roleIndex(successes[i].Role) < roleIndex(successes[j].Role) })
 
 	for _, r := range successes {
-		fmt.Fprintf(&b, "[%s] %s — %s (conf %.2f)\n", r.Role, r.Response.Action, strings.TrimSpace(r.Response.Reasoning), r.Response.Confidence)
+		// Cast the Action defined-string-type to string so %s formats as the
+		// literal action verb instead of "%!s(analysis.Action=BUY)".
+		fmt.Fprintf(&b, "[%s] %s — %s (conf %.2f)\n", r.Role, string(r.Response.Action), strings.TrimSpace(r.Response.Reasoning), r.Response.Confidence)
 	}
 
 	switch {
 	case hadMajority:
-		fmt.Fprintf(&b, "[specialist] resolved by 3-of-%d majority → %s", len(successes), finalAction)
+		fmt.Fprintf(&b, "[specialist] resolved by 3-of-%d majority → %s", len(successes), string(finalAction))
 	case rm != nil && (rm.Response.Action == ActionWait || rm.Response.Action == ActionHold):
-		fmt.Fprintf(&b, "[specialist] resolved by risk-manager veto (%s) → %s", rm.Response.Action, finalAction)
+		fmt.Fprintf(&b, "[specialist] resolved by risk-manager veto (%s) → %s", string(rm.Response.Action), string(finalAction))
 	default:
-		fmt.Fprintf(&b, "[specialist] resolved by majority-vote fallback → %s", finalAction)
+		fmt.Fprintf(&b, "[specialist] resolved by majority-vote fallback → %s", string(finalAction))
 	}
 	return b.String()
 }

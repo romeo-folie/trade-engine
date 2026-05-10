@@ -186,6 +186,41 @@ func TestResolveSpecialist_RiskLevelsAverageOverWinningVotersOnly(t *testing.T) 
 	}
 }
 
+// TestComposeSpecialistReasoning_FormatsActionAsString is the regression test
+// for the Copilot-flagged %s-with-defined-string-type printf bug. Action is a
+// `type Action string`, and using %s on it without a cast renders as
+// "%!s(analysis.Action=BUY)". The reasoning string must contain the literal
+// action verb (e.g. "BUY"), not the printf error fallback.
+func TestComposeSpecialistReasoning_FormatsActionAsString(t *testing.T) {
+	successes := []specialistResult{
+		makeRoleResult("fundamental", ActionBuy, 0.80, nil),
+		makeRoleResult("technical", ActionBuy, 0.75, nil),
+		makeRoleResult("sentiment", ActionBuy, 0.70, nil),
+		makeRoleResult("risk_manager", ActionBuy, 0.65, nil),
+	}
+	reasoning := composeSpecialistReasoning(successes, ActionBuy, true, &successes[3])
+	if strings.Contains(reasoning, "%!") {
+		t.Fatalf("reasoning contains printf error fallback (%%! marker):\n%s", reasoning)
+	}
+	if !strings.Contains(reasoning, "BUY") {
+		t.Errorf("reasoning missing literal 'BUY' verb:\n%s", reasoning)
+	}
+
+	// Also verify the veto branch renders cleanly (uses rm.Response.Action).
+	veto := []specialistResult{
+		makeRoleResult("fundamental", ActionBuy, 0.70, nil),
+		makeRoleResult("technical", ActionSell, 0.60, nil),
+		makeRoleResult("risk_manager", ActionWait, 0.65, nil),
+	}
+	vReasoning := composeSpecialistReasoning(veto, ActionWait, false, &veto[2])
+	if strings.Contains(vReasoning, "%!") {
+		t.Fatalf("veto reasoning contains printf error fallback:\n%s", vReasoning)
+	}
+	if !strings.Contains(vReasoning, "WAIT") {
+		t.Errorf("veto reasoning missing literal 'WAIT' verb:\n%s", vReasoning)
+	}
+}
+
 // TestResolveSpecialist_NoSuccessesYieldsHold guards the failure mode where
 // every role errored — we should not crash and we must default to a safe HOLD.
 func TestResolveSpecialist_NoSuccessesYieldsHold(t *testing.T) {
