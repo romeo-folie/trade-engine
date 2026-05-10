@@ -41,7 +41,7 @@ func TestCheckMaterialChange(t *testing.T) {
 				LastAnalysedAt: now.Add(-60 * time.Minute),
 			},
 			in: MaterialChangeInput{
-				Now:      now,
+				Now: now,
 			},
 			wantSkip:   true,
 			wantReason: SkipReasonHoldCooldown,
@@ -148,6 +148,105 @@ func TestCheckMaterialChange(t *testing.T) {
 				t.Errorf("reason = %q, want %q", reason, tt.wantReason)
 			}
 		})
+	}
+}
+
+// ── Scanner overrides (#317) ──────────────────────────────────────────────────
+
+func TestApplyScannerOverrides_NonScannerUntouched(t *testing.T) {
+	base := config.AnalysisConfig{
+		HoldCooldownMin:   120,
+		RSIDeltaThreshold: 3.0,
+	}
+	out := applyScannerOverrides(base, "manual", 0.95)
+	if out.HoldCooldownMin != 120 || out.RSIDeltaThreshold != 3.0 {
+		t.Fatalf("manual source must be untouched, got %+v", out)
+	}
+}
+
+func TestApplyScannerOverrides_ScannerLowConvictionOnlyCooldown(t *testing.T) {
+	base := config.AnalysisConfig{
+		HoldCooldownMin:   120,
+		RSIDeltaThreshold: 3.0,
+	}
+	out := applyScannerOverrides(base, "scanner", 0.60)
+	// Cooldown still drops (this isn't gated by conviction).
+	if out.HoldCooldownMin != 30 {
+		t.Fatalf("cooldown should drop to 30, got %d", out.HoldCooldownMin)
+	}
+	// RSI threshold must NOT drop for conviction below the 0.75 floor.
+	if out.RSIDeltaThreshold != 3.0 {
+		t.Fatalf("low-conviction scanner must keep RSI threshold at 3.0, got %.1f", out.RSIDeltaThreshold)
+	}
+}
+
+func TestApplyScannerOverrides_ScannerHighConvictionLoosensRSI(t *testing.T) {
+	base := config.AnalysisConfig{
+		HoldCooldownMin:   120,
+		RSIDeltaThreshold: 3.0,
+	}
+	out := applyScannerOverrides(base, "scanner", 0.80)
+	if out.RSIDeltaThreshold != 2.0 {
+		t.Fatalf("high-conviction scanner must drop RSI threshold to 2.0, got %.1f", out.RSIDeltaThreshold)
+	}
+}
+
+// If a config already sets RSI threshold below the 2.0 floor, the override
+// must not raise it. The override is a one-way relaxation.
+func TestApplyScannerOverrides_DoesNotRaiseRSIThreshold(t *testing.T) {
+	base := config.AnalysisConfig{
+		HoldCooldownMin:   120,
+		RSIDeltaThreshold: 1.5,
+	}
+	out := applyScannerOverrides(base, "scanner", 0.90)
+	if out.RSIDeltaThreshold != 1.5 {
+		t.Fatalf("override must not raise RSI threshold, got %.1f", out.RSIDeltaThreshold)
+	}
+}
+
+// TestCheckMaterialChange_FirstTouchAlwaysAnalyses is the regression guard for
+// issue #318: scanner-added tickers must run a full analysis on first
+// appearance. CheckMaterialChange itself is source-agnostic — the engine layer
+// stamps state lazily after analysis, so any genuinely first-touch ticker
+// (scanner or watchlist) presents prev == nil and must return
+// (false, SkipReasonNone). If a future refactor pre-populates prev for any
+// reason, this test will catch it before scanner momentum entries silently
+// regress to NO_MATERIAL_CHANGE skips on cycle one.
+func TestCheckMaterialChange_FirstTouchAlwaysAnalyses(t *testing.T) {
+	now := time.Now()
+	cfg := config.AnalysisConfig{
+		MaterialChangeOnly:    true,
+		HoldCooldownMin:       120,
+		RSIDeltaThreshold:     3.0,
+		EMAGapDeltaPct:        0.5,
+		PriceMoveThresholdPct: 0.75,
+		NewsNoveltyEnabled:    true,
+	}
+
+	// Mirrors what processStock passes for a scanner-fresh ticker like SBET on
+	// first appearance: real indicator values, real news hash, no prior state.
+	in := MaterialChangeInput{
+		RSI:      62.5,
+		EMA20:    18.40,
+		Price:    18.92,
+		NewsHash: "deadbeef",
+		Now:      now,
+	}
+
+	skip, reason, deltas := CheckMaterialChange(nil, in, cfg)
+	if skip {
+		t.Fatalf("first-touch should always analyse (prev == nil); got skip=true reason=%q", reason)
+	}
+	if reason != SkipReasonNone {
+		t.Fatalf("first-touch should yield SkipReasonNone; got %q", reason)
+	}
+	// Deltas map must not contain stale rsi/price/ema entries — those are only
+	// computed when prev != nil. Their presence would indicate state leakage
+	// from a prior run and would point at the persistence bug suspected in #318.
+	for _, k := range []string{"rsi_delta", "ema_gap_delta_pct", "price_move_pct"} {
+		if _, ok := deltas[k]; ok {
+			t.Fatalf("first-touch deltas leaked %q (prev was nil) — value=%v", k, deltas[k])
+		}
 	}
 }
 

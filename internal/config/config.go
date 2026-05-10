@@ -18,26 +18,26 @@ import (
 // ── Top-level config ──────────────────────────────────────────────────────────
 
 type Config struct {
-	Engine        EngineConfig        `yaml:"engine"`
-	Models        ModelsConfig        `yaml:"models"`
-	Markets       MarketsConfig       `yaml:"markets"`
-	Strategies    StrategiesConfig    `yaml:"strategies"`
-	Risk          RiskConfig          `yaml:"risk"`
-	Notifications NotificationsConfig `yaml:"notifications"`
-	Logging       LoggingConfig       `yaml:"logging"`
-	Database      DatabaseConfig      `yaml:"database"`
-	Reports       ReportsConfig       `yaml:"reports"`
-	Backtest      BacktestConfig      `yaml:"backtest"`
-	Embeddings    EmbeddingsConfig    `yaml:"embeddings"`
-	Analysis      AnalysisConfig      `yaml:"analysis"`
-	Cost          CostConfig          `yaml:"cost"`
+	Engine           EngineConfig        `yaml:"engine"`
+	Models           ModelsConfig        `yaml:"models"`
+	Markets          MarketsConfig       `yaml:"markets"`
+	Strategies       StrategiesConfig    `yaml:"strategies"`
+	Risk             RiskConfig          `yaml:"risk"`
+	Notifications    NotificationsConfig `yaml:"notifications"`
+	Logging          LoggingConfig       `yaml:"logging"`
+	Database         DatabaseConfig      `yaml:"database"`
+	Reports          ReportsConfig       `yaml:"reports"`
+	Backtest         BacktestConfig      `yaml:"backtest"`
+	Embeddings       EmbeddingsConfig    `yaml:"embeddings"`
+	Analysis         AnalysisConfig      `yaml:"analysis"`
+	Cost             CostConfig          `yaml:"cost"`
 	ORB              ORBConfig           `yaml:"orb"`
 	ForexORB         ForexORBConfig      `yaml:"forex_orb"`
 	FuturesORB       FuturesORBConfig    `yaml:"futures_orb"`
 	FuturesORBMetals FuturesORBConfig    `yaml:"futures_orb_metals"`
 	Scanner          ScannerConfig       `yaml:"scanner"`
 	Feedback         FeedbackConfig      `yaml:"feedback"`
-	Portfolio     PortfolioConfig     `yaml:"portfolio"`
+	Portfolio        PortfolioConfig     `yaml:"portfolio"`
 }
 
 // ── Portfolio ──────────────────────────────────────────────────────────────────
@@ -51,9 +51,9 @@ type PortfolioConfig struct {
 // PollerConfig controls the independent portfolio snapshot goroutine that
 // writes rows to portfolio_snapshots regardless of engine tick cadence.
 type PollerConfig struct {
-	Enabled               bool    `yaml:"enabled"`
-	IntervalSec           int     `yaml:"interval_sec"`             // seconds between polls (default 60)
-	SignificantChangePct   float64 `yaml:"significant_change_pct"`   // extra snapshot when equity moves by this % (default 0.05)
+	Enabled              bool    `yaml:"enabled"`
+	IntervalSec          int     `yaml:"interval_sec"`           // seconds between polls (default 60)
+	SignificantChangePct float64 `yaml:"significant_change_pct"` // extra snapshot when equity moves by this % (default 0.05)
 }
 
 // CacheConfig controls the web-layer broker TTL cache.
@@ -66,16 +66,16 @@ type CacheConfig struct {
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
 type ORBConfig struct {
-	Enabled           bool    `yaml:"enabled"`
-	Mode              string  `yaml:"mode"`                // "paper" | "live"
-	GapThresholdPct   float64 `yaml:"gap_threshold_pct"`   // minimum gap % (e.g. 3.0)
-	MaxCandidates     int     `yaml:"max_candidates"`      // 1–5
-	RangeMinutes      int     `yaml:"range_minutes"`       // 5 or 15
-	RiskReward        float64 `yaml:"risk_reward"`         // e.g. 2.0
-	MaxRiskPct        float64 `yaml:"max_risk_pct"`        // max loss per trade as % of portfolio
-	MaxPositionPct    float64 `yaml:"max_position_pct"`    // max notional per trade as % of portfolio (e.g. 10.0)
-	NewsLookbackHours   int     `yaml:"news_lookback_hours"`   // e.g. 24
-	ScanCadenceMinutes  int     `yaml:"scan_cadence_minutes"`  // minimum minutes between pre-market scans (default 2)
+	Enabled            bool    `yaml:"enabled"`
+	Mode               string  `yaml:"mode"`                 // "paper" | "live"
+	GapThresholdPct    float64 `yaml:"gap_threshold_pct"`    // minimum gap % (e.g. 3.0)
+	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5
+	RangeMinutes       int     `yaml:"range_minutes"`        // 5 or 15
+	RiskReward         float64 `yaml:"risk_reward"`          // e.g. 2.0
+	MaxRiskPct         float64 `yaml:"max_risk_pct"`         // max loss per trade as % of portfolio
+	MaxPositionPct     float64 `yaml:"max_position_pct"`     // max notional per trade as % of portfolio (e.g. 10.0)
+	NewsLookbackHours  int     `yaml:"news_lookback_hours"`  // e.g. 24
+	ScanCadenceMinutes int     `yaml:"scan_cadence_minutes"` // minimum minutes between pre-market scans (default 2)
 }
 
 // CostConfig controls the user-facing cost profile and budget guardrails.
@@ -170,9 +170,9 @@ type EngineConfig struct {
 	TickIntervalSec int     `yaml:"tick_interval_sec"` // default 3600 (60 min)
 	MaxWatchlist    int     `yaml:"max_watchlist"`
 	DryRun          bool    `yaml:"dry_run"`
-	InitialCapital  float64 `yaml:"initial_capital"`   // starting cash for paper trading (default 100000)
-	LogTimezone     string  `yaml:"log_timezone"`      // IANA timezone for display (default "UTC")
-	SkipRecentTick  *bool   `yaml:"skip_recent_tick"`  // skip startup tick if last analysis is within tick interval (default true)
+	InitialCapital  float64 `yaml:"initial_capital"`  // starting cash for paper trading (default 100000)
+	LogTimezone     string  `yaml:"log_timezone"`     // IANA timezone for display (default "UTC")
+	SkipRecentTick  *bool   `yaml:"skip_recent_tick"` // skip startup tick if last analysis is within tick interval (default true)
 }
 
 // ShouldSkipRecentTick returns true (default) unless explicitly set to false.
@@ -231,6 +231,26 @@ type AnalysisConfig struct {
 
 	// AdaptiveDepth configures impact-score-driven analyst tier routing (PRD §7.3).
 	AdaptiveDepth AdaptiveDepthConfig `yaml:"adaptive_depth"`
+
+	// MultiTimeframeBorderlineEnabled enables a second analyst pass on the
+	// alternate timeframe when the arbiter resolves to WAIT inside a narrow
+	// borderline confidence band. The combined arbiter then picks the final
+	// action (Issue #321). Default: true.
+	MultiTimeframeBorderlineEnabled bool `yaml:"multi_timeframe_borderline_enabled"`
+
+	// MultiTimeframeAltMap maps a primary timeframe to its alternate. Keys and
+	// values are timeframe strings (e.g. "1h", "4h", "1d"). When a primary
+	// timeframe has no entry the second pass is skipped for that ticker.
+	// Defaults: 1h → 4h, 4h → 1h, 1d → 1h.
+	MultiTimeframeAltMap map[string]string `yaml:"multi_timeframe_alt_map"`
+
+	// MultiTimeframeBorderlineConfMin is the inclusive lower bound of the
+	// borderline confidence band. Defaults to 0.55.
+	MultiTimeframeBorderlineConfMin float64 `yaml:"multi_timeframe_borderline_conf_min"`
+
+	// MultiTimeframeBorderlineConfMax is the inclusive upper bound of the
+	// borderline confidence band. Defaults to 0.70.
+	MultiTimeframeBorderlineConfMax float64 `yaml:"multi_timeframe_borderline_conf_max"`
 }
 
 // ClassifierConfig controls the two-stage classifier gate.
@@ -473,9 +493,9 @@ type Instrument struct {
 type ForexORBConfig struct {
 	Enabled        bool         `yaml:"enabled"`
 	Instruments    []Instrument `yaml:"instruments"`
-	Session        string       `yaml:"session"`        // "london" | "newyork" | "both"
-	Timezone       string       `yaml:"timezone"`       // e.g. "UTC" (default)
-	RangeMinutes   int          `yaml:"range_minutes"`  // 15 or 30
+	Session        string       `yaml:"session"`       // "london" | "newyork" | "both"
+	Timezone       string       `yaml:"timezone"`      // e.g. "UTC" (default)
+	RangeMinutes   int          `yaml:"range_minutes"` // 15 or 30
 	RiskReward     float64      `yaml:"risk_reward"`
 	MaxRiskPct     float64      `yaml:"max_risk_pct"`
 	MaxPositionPct float64      `yaml:"max_position_pct"`
@@ -495,12 +515,12 @@ type FuturesInstrument struct {
 // FuturesORBConfig configures the Opening Range Breakout strategy for exchange-listed futures via IBKR.
 // Re-used for different asset class groups (equity index, metals, energy) via separate top-level keys.
 type FuturesORBConfig struct {
-	Enabled        bool               `yaml:"enabled"`
-	SessionOpenET  string             `yaml:"session_open_et"` // "HH:MM" in US/Eastern, e.g. "09:30"
-	RangeMinutes   int                `yaml:"range_minutes"`
-	RiskReward     float64            `yaml:"risk_reward"`
-	MaxRiskPct     float64            `yaml:"max_risk_pct"`
-	MaxPositionPct float64            `yaml:"max_position_pct"`
+	Enabled        bool                `yaml:"enabled"`
+	SessionOpenET  string              `yaml:"session_open_et"` // "HH:MM" in US/Eastern, e.g. "09:30"
+	RangeMinutes   int                 `yaml:"range_minutes"`
+	RiskReward     float64             `yaml:"risk_reward"`
+	MaxRiskPct     float64             `yaml:"max_risk_pct"`
+	MaxPositionPct float64             `yaml:"max_position_pct"`
 	Instruments    []FuturesInstrument `yaml:"instruments"`
 }
 
@@ -551,10 +571,10 @@ type FeedbackConfig struct {
 }
 
 type FeedbackThresholds struct {
-	ModelWinRateMin        float64 `yaml:"model_win_rate_min"`
-	ModelMinTrades         int     `yaml:"model_min_trades"`
-	InstrumentWinRateMin   float64 `yaml:"instrument_win_rate_min"`
-	InstrumentMinTrades    int     `yaml:"instrument_min_trades"`
+	ModelWinRateMin       float64 `yaml:"model_win_rate_min"`
+	ModelMinTrades        int     `yaml:"model_min_trades"`
+	InstrumentWinRateMin  float64 `yaml:"instrument_win_rate_min"`
+	InstrumentMinTrades   int     `yaml:"instrument_min_trades"`
 	ArbiterInvokedRateMax float64 `yaml:"arbiter_invoked_rate_max"`
 }
 
@@ -626,16 +646,40 @@ type NewsSentimentConfig struct {
 // ── Risk ─────────────────────────────────────────────────────────────────────
 
 type RiskConfig struct {
-	ConfidenceThreshold  float64 `yaml:"confidence_threshold"`
-	MinRiskReward        float64 `yaml:"min_risk_reward"`
-	MaxPositionPct       float64 `yaml:"max_position_pct"`
-	MaxOpenPositions     int     `yaml:"max_open_positions"`
+	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
+	// ConfidenceTiers expresses tiered confidence requirements that vary by
+	// the trade's R:R ratio (#317). Default empty (no tiers — falls back
+	// to the static `confidence_threshold`). Configure tiers in YAML to
+	// enable R:R-aware confidence gating. Tiers are evaluated in
+	// declaration order; the first tier whose RRMin is <= the trade's R:R
+	// applies. Best practice: declare tiers in descending RRMin order
+	// (e.g. {2.0, 0.60} then {1.4, 0.65}). Defaults() leaves this nil so
+	// existing configs that omit the key are unaffected by the upgrade —
+	// see config.example.yaml for the recommended ladder.
+	ConfidenceTiers  []ConfidenceTier `yaml:"confidence_tiers"`
+	MinRiskReward    float64          `yaml:"min_risk_reward"`
+	MaxPositionPct   float64          `yaml:"max_position_pct"`
+	MaxOpenPositions int              `yaml:"max_open_positions"`
 	// MaxPerTicker caps the number of open positions in the same direction
 	// for a single ticker (#312). Default is 0 (disabled) so older configs
 	// that don't set this key upgrade safely without unexpected blocks; the
 	// example config recommends 2. Operators opt in by setting a positive
 	// value in their config.
-	MaxPerTicker         int     `yaml:"max_per_ticker"`
+	MaxPerTicker int `yaml:"max_per_ticker"`
+	// MaxDollarRiskPct caps the per-trade dollar at risk
+	// (qty × |entry − stop|) as a percent of portfolio equity (#320).
+	// Default 1.0. Treated as disabled when set to 0.
+	MaxDollarRiskPct float64 `yaml:"max_dollar_risk_pct"`
+	// PyramidEnabled gates the pyramiding-into-winners feature (#324). When
+	// true, a BUY signal on a ticker with an existing open long that is up
+	// ≥ PyramidMinGainPct adds a new lot with a tightened stop instead of
+	// being rejected as a duplicate. Default is false (safe rollout): the
+	// operator must explicitly opt in. When false, BUY-on-existing-long is
+	// blocked with reason "pyramid_disabled".
+	PyramidEnabled bool `yaml:"pyramid_enabled"`
+	// PyramidMinGainPct is the minimum unrealised gain (%) required on the
+	// existing long for a BUY to qualify as a pyramid add. Default 5.0%.
+	PyramidMinGainPct    float64 `yaml:"pyramid_min_gain_pct"`
 	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
 	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
 	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`
@@ -661,6 +705,14 @@ type TrailingStopConfig struct {
 	ATRMultiple float64 `yaml:"atr_multiple"`
 	IntervalSec int     `yaml:"interval_sec"`
 	ATRPeriod   int     `yaml:"atr_period"`
+}
+
+// ConfidenceTier expresses a (R:R floor → confidence floor) pair (#317).
+// Used to require stricter confidence at lower R:R bands and looser
+// confidence at higher R:R bands. See RiskConfig.ConfidenceTiers.
+type ConfidenceTier struct {
+	RRMin   float64 `yaml:"rr_min"`
+	ConfMin float64 `yaml:"conf_min"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────

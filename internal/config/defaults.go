@@ -172,11 +172,22 @@ func Defaults() *Config {
 			},
 		},
 		Risk: RiskConfig{
-			ConfidenceThreshold:  0.65,
-			MinRiskReward:        1.5,
+			ConfidenceThreshold: 0.65,
+			// ConfidenceTiers defaults to nil so existing configs that omit
+			// `risk.confidence_tiers` keep using the static
+			// `confidence_threshold` floor (#317 review). Pre-filling tiers
+			// here would silently overlay tiered gating onto operators who
+			// explicitly raised confidence_threshold (same shape as the #312
+			// MaxPerTicker default-overlay bug). Opt in via YAML;
+			// config.example.yaml carries the recommended tier ladder.
+			ConfidenceTiers:      nil,
+			MinRiskReward:        1.4,
 			MaxPositionPct:       5.0,
 			MaxOpenPositions:     10,
 			MaxPerTicker:         0,
+			MaxDollarRiskPct:     1.0,
+			PyramidEnabled:       false,
+			PyramidMinGainPct:    5.0,
 			DailyLossLimitPct:    3.0,
 			MaxDrawdownPct:       15.0,
 			CooldownAfterLoss:    60,
@@ -252,6 +263,18 @@ func Defaults() *Config {
 					TrendStrength: 0.20,
 				},
 			},
+			// Multi-timeframe borderline arbiter (Issue #321) — defaults are
+			// deliberately narrow so only a small fraction of WAITs incur the
+			// 2× token cost. 1d → 1h gives the daily view a near-term sanity
+			// check; 1h ↔ 4h cross-checks intra-day vs swing perspectives.
+			MultiTimeframeBorderlineEnabled: true,
+			MultiTimeframeAltMap: map[string]string{
+				"1h": "4h",
+				"4h": "1h",
+				"1d": "1h",
+			},
+			MultiTimeframeBorderlineConfMin: 0.55,
+			MultiTimeframeBorderlineConfMax: 0.70,
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,
@@ -276,13 +299,13 @@ func Defaults() *Config {
 			CacheTTLMin: 0,
 		},
 		ORB: ORBConfig{
-			Mode:              "paper",
-			GapThresholdPct:   2.5,
-			MaxCandidates:     2,
-			RangeMinutes:      15,
-			RiskReward:        2.0,
-			MaxRiskPct:        1.0,
-			MaxPositionPct:    10.0, // hard cap: notional <= 10% of portfolio per trade
+			Mode:               "paper",
+			GapThresholdPct:    2.5,
+			MaxCandidates:      2,
+			RangeMinutes:       15,
+			RiskReward:         2.0,
+			MaxRiskPct:         1.0,
+			MaxPositionPct:     10.0, // hard cap: notional <= 10% of portfolio per trade
 			NewsLookbackHours:  24,
 			ScanCadenceMinutes: 2,
 		},
@@ -330,8 +353,8 @@ func Defaults() *Config {
 		},
 		Portfolio: PortfolioConfig{
 			Poller: PollerConfig{
-				Enabled:             true,
-				IntervalSec:         60,
+				Enabled:              true,
+				IntervalSec:          60,
 				SignificantChangePct: 0.05,
 			},
 			Cache: CacheConfig{
@@ -358,10 +381,10 @@ func Defaults() *Config {
 			PromptEnrichment:    true,
 			ORBPromptEnrichment: true,
 			Thresholds: FeedbackThresholds{
-				ModelWinRateMin:        0.40,
-				ModelMinTrades:         20,
-				InstrumentWinRateMin:   0.35,
-				InstrumentMinTrades:    10,
+				ModelWinRateMin:       0.40,
+				ModelMinTrades:        20,
+				InstrumentWinRateMin:  0.35,
+				InstrumentMinTrades:   10,
 				ArbiterInvokedRateMax: 0.50,
 			},
 		},
