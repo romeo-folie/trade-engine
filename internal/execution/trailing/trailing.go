@@ -244,8 +244,14 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 
 	// Round to broker tick size before persistence + comparison so tiny
 	// floating-point noise (e.g. 48.50000001 vs 48.5) doesn't trigger a
-	// pointless REPLACE API call every tick.
-	newStop = roundToTick(newStop, brokerTickDecimals(t.Ticker))
+	// pointless REPLACE API call every tick. Round BOTH sides: t.StopLoss
+	// is scanned from a NUMERIC column and binary roundtrip can leave it
+	// as 48.509999… for what the broker stored as 48.51 — comparing the
+	// rounded candidate against the unrounded persisted value would then
+	// fire a no-op REPLACE on every tick.
+	dp := brokerTickDecimals(t.Ticker)
+	newStop = roundToTick(newStop, dp)
+	persistedStop := roundToTick(t.StopLoss, dp)
 
 	// If the trail says we should already be out (stop ≥ current price)
 	// the broker stop would fill instantly anyway. Don't leave a stale stop
@@ -284,13 +290,13 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	}
 
 	// If the stop hasn't moved (and the HWM hasn't either), nothing to do.
-	if newStop == t.StopLoss && hwm == t.HighWaterMark {
+	if newStop == persistedStop && hwm == t.HighWaterMark {
 		return nil
 	}
 
 	// Submit/replace broker STOP order whenever the stop_loss actually
 	// moved. HWM-only updates skip the broker call.
-	if newStop != t.StopLoss {
+	if newStop != persistedStop {
 		if err := m.submitOrReplaceStop(ctx, t, newStop); err != nil {
 			// Persist HWM even on broker failure so the next tick has the
 			// updated baseline; log WARN and retry next tick.

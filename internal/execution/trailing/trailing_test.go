@@ -817,6 +817,70 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	}
 }
 
+// TestManager_StopRoundedAgainstNumericRoundtrip pins the round-3 fix for
+// the float-equality bug: after persistence, t.StopLoss is scanned from a
+// NUMERIC column and binary roundtrip can leave it as 48.509999999999998
+// for what the broker stored as 48.51. The earlier code rounded only the
+// candidate (newStop) before comparing — the inequality then fired a
+// pointless REPLACE on every tick. Round BOTH sides.
+func TestManager_StopRoundedAgainstNumericRoundtrip(t *testing.T) {
+	// Pre-stage: trade.StopLoss carries the canonical float that NUMERIC
+	// roundtrip can produce for 48.51.
+	noisyStop := 48.509999999999998
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "long",
+		Status:        "open",
+		EntryPrice:    50,
+		StopLoss:      noisyStop,
+		Quantity:      10,
+		HighWaterMark: 50,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "broker-pre",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     noisyStop,
+		Status:        "pending",
+		IsStopLoss:    true,
+	})
+
+	// Construct candles whose computed candidate rounds to exactly 48.51,
+	// matching the persisted noisyStop after symmetric rounding. The flat
+	// 50-price baseline produces a small ATR; with multiple chosen so
+	// hwm − mult*atr → ~48.51 the comparator must say "no change".
+	fp := &fakePrices{candles: makeFlatPriceCandles(50, candle(50, 50.01, 49.99, 50))}
+	atr := indicators.ComputeATR(fp.candles, DefaultATRPeriod)
+	if atr <= 0 {
+		t.Fatalf("ATR was zero in test setup; can't compute deterministic stop")
+	}
+	// Solve mult so 50 - mult*atr == 48.51 exactly post-rounding.
+	mult := (50.0 - 48.51) / atr
+
+	base := &fakeBroker{}
+	fb := fakeBrokerWithReplace{fakeBroker: base}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: mult}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	// Sanity check: roundToTick should map both representations to the
+	// same broker tick. If this ever drifts the test below would mask the
+	// bug it's trying to pin.
+	if got := roundToTick(noisyStop, 2); got != 48.51 {
+		t.Fatalf("setup precondition failed: roundToTick(%v) = %v, want 48.51", noisyStop, got)
+	}
+
+	if len(base.replaced)+len(base.placed) != 0 {
+		t.Fatalf("BUG REGRESSED: NUMERIC-roundtrip stop triggered broker churn: replaced=%d placed=%d (mult=%v atr=%v)",
+			len(base.replaced), len(base.placed), mult, atr)
+	}
+}
+
 // TestManager_DisabledIsFastReturn ensures Run() exits cleanly when
 // Config.Enabled is false — no goroutine leaks, no broker calls.
 func TestManager_DisabledIsFastReturn(t *testing.T) {
