@@ -72,7 +72,7 @@ func TestBuildStockPrompt_RRSelfFilter(t *testing.T) {
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
 	)
 
-	const phrase = "if your proposed take_profit divided by risk yields R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5."
+	const phrase = "Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5."
 	if !strings.Contains(standardSys, phrase) {
 		t.Fatalf("standard system prompt missing R:R self-filter guidance:\n%s", standardSys)
 	}
