@@ -189,8 +189,16 @@ strategies:
     min_sentiment: 0.6
     max_age_hours: 48
 risk:
-  confidence_threshold: 0.65   # Minimum LLM confidence to generate a signal
-  min_risk_reward: 1.5         # Minimum R:R ratio required
+  confidence_threshold: 0.65   # Static floor used when confidence_tiers is empty
+  # Tiered confidence by R:R (#317): the first tier whose rr_min is <= the
+  # trade's R:R applies. Declare tiers in descending rr_min order.
+  # An empty/omitted list falls back to confidence_threshold only.
+  confidence_tiers:
+    - rr_min: 2.0
+      conf_min: 0.60
+    - rr_min: 1.4
+      conf_min: 0.65
+  min_risk_reward: 1.4         # Minimum R:R ratio required (#317: 1.5 → 1.4)
   max_position_pct: 5.0        # Max % of portfolio per position
   max_open_positions: 10
   max_per_ticker: 2            # Cap open positions per ticker (same direction); 0 disables (#312)

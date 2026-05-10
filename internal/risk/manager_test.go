@@ -73,6 +73,156 @@ func TestConfidence_Fail(t *testing.T) {
 	}
 }
 
+// ── Tiered confidence (#317) ─────────────────────────────────────────────────
+
+func tieredCfg() config.RiskConfig {
+	cfg := defaultCfg()
+	cfg.MinRiskReward = 1.4
+	cfg.ConfidenceTiers = []config.ConfidenceTier{
+		{RRMin: 2.0, ConfMin: 0.60},
+		{RRMin: 1.4, ConfMin: 0.65},
+	}
+	return cfg
+}
+
+// High R:R band: R:R >= 2.0 → conf floor 0.60. A 0.62 confidence trade that
+// would have been rejected by the 0.65 static floor must now pass.
+func TestConfidenceTiered_HighRR_LooserConfFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	// reward=10, risk=5 → R:R=2.0 (matches first tier exactly).
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Mid R:R band (1.4 ≤ R:R < 2.0): conf floor stays at 0.65. A 0.62 confidence
+// trade is rejected with the new tier-aware reason string.
+func TestConfidenceTiered_MidRR_StricterConfFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	// reward=7.5, risk=5 → R:R=1.5 (mid tier).
+	in.TakeProfit = 107.5
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "tier-required 0.65") || !contains(r.Reason, "R:R 1.50") {
+		t.Fatalf("expected reason to mention tier-required floor and R:R, got %q", r.Reason)
+	}
+}
+
+// Mid R:R band: 0.66 confidence clears the 0.65 tier floor.
+func TestConfidenceTiered_MidRR_PassesAtTierFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.66
+	in.TakeProfit = 107.5 // R:R = 1.5
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Below every tier AND below MinRiskReward: tiered check defers to
+// checkRiskReward by passing, so the operator gets the accurate R:R reason
+// rather than a confidence reason that masks the real cause (#317 review).
+func TestConfidenceTiered_BelowMinRR_DefersToRiskRewardCheck(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg() // MinRiskReward = 1.4
+	in.TakeProfit = 105.0 // reward=5, risk=5 → R:R = 1.0 (below MinRiskReward)
+
+	// High confidence is irrelevant — pass either way.
+	in.Confidence = 0.66
+	assertPasses(t, checkConfidenceTiered, in)
+
+	// Low confidence must STILL pass the tiered check so the downstream
+	// checkRiskReward can produce the real "R:R 1.00 < minimum 1.40" reason.
+	in.Confidence = 0.50
+	assertPasses(t, checkConfidenceTiered, in)
+
+	// Sanity check: the deferred checkRiskReward does indeed reject.
+	r := assertFails(t, checkRiskReward, in)
+	if !contains(r.Reason, "R:R 1.00") || !contains(r.Reason, "minimum 1.40") {
+		t.Fatalf("expected R:R reason from checkRiskReward, got %q", r.Reason)
+	}
+}
+
+// Misconfiguration safety net: if a tier list leaves a gap *above*
+// MinRiskReward (e.g. MinRiskReward=1.0, lowest tier RRMin=2.0, R:R=1.5),
+// the static ConfidenceThreshold floor still gates so signals don't slip
+// through ungated.
+func TestConfidenceTiered_BelowAllTiersAboveMinRR_FallsBackToStatic(t *testing.T) {
+	in := baseInput()
+	cfg := defaultCfg()
+	cfg.MinRiskReward = 1.0 // lower than the lowest tier floor
+	cfg.ConfidenceTiers = []config.ConfidenceTier{
+		{RRMin: 2.0, ConfMin: 0.60},
+	}
+	in.Cfg = cfg
+	in.TakeProfit = 107.5 // R:R = 1.5 (above MinRiskReward, below lowest tier)
+
+	in.Confidence = 0.66 // ≥ static 0.65 → pass
+	assertPasses(t, checkConfidenceTiered, in)
+
+	in.Confidence = 0.50 // < static 0.65 → fail with static reason
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold 0.65") {
+		t.Fatalf("expected static-floor reason, got %q", r.Reason)
+	}
+}
+
+// Empty tier list must preserve the pre-#317 behaviour exactly.
+func TestConfidenceTiered_EmptyTiersBackwardsCompat(t *testing.T) {
+	in := baseInput()
+	in.Cfg.ConfidenceTiers = nil // explicit
+	in.Confidence = 0.50
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold") || contains(r.Reason, "tier-required") {
+		t.Fatalf("empty tiers should produce static-floor reason, got %q", r.Reason)
+	}
+
+	in.Confidence = 0.80
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Without a stop/TP, R:R can't be computed; tiered check falls back to static.
+func TestConfidenceTiered_NoStopTPFallsBackToStatic(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.StopLoss = 0
+	in.TakeProfit = 0
+	in.Confidence = 0.62 // < 0.65 static
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold 0.65") {
+		t.Fatalf("expected static-floor reason when R:R unknown, got %q", r.Reason)
+	}
+}
+
+// CheckAll with tiered config short-circuits with the tiered reason string,
+// confirming the wiring uses checkConfidenceTiered (not checkConfidence).
+func TestCheckAll_UsesTieredConfidence(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	in.TakeProfit = 107.5 // R:R = 1.5 → tier requires 0.65
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected tiered confidence to block")
+	}
+	reason := BlockReason(results)
+	if !contains(reason, "tier-required") {
+		t.Fatalf("expected tiered reason from CheckAll, got %q", reason)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
 // ── Position ownership ────────────────────────────────────────────────────────
 
 func TestPositionOwnership_BuyAlwaysPasses(t *testing.T) {
@@ -134,6 +284,70 @@ func TestRiskReward_SkipWhenNoStopLoss(t *testing.T) {
 	in.StopLoss = 0
 	in.TakeProfit = 0
 	assertPasses(t, checkRiskReward, in)
+}
+
+// Inverted long setup: stop sits above entry. With math.Abs alone this would
+// produce a positive R:R and pass the gate, then the engine's long-stop
+// trigger (price <= stop) would fire immediately at execution. The geometry
+// guard rejects upfront with an actionable reason.
+func TestRiskReward_BuyWithStopAboveSignal_Fails(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 105
+	in.TakeProfit = 110
+	r := assertFails(t, checkRiskReward, in)
+	if !strings.Contains(r.Reason, "invalid SL/TP geometry for BUY") {
+		t.Fatalf("expected geometry reason, got %q", r.Reason)
+	}
+}
+
+func TestRiskReward_BuyWithTakeProfitBelowSignal_Fails(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 98
+	r := assertFails(t, checkRiskReward, in)
+	if !strings.Contains(r.Reason, "invalid SL/TP geometry for BUY") {
+		t.Fatalf("expected geometry reason, got %q", r.Reason)
+	}
+}
+
+func TestRiskReward_BuyValidGeometry_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 110
+	assertPasses(t, checkRiskReward, in)
+	rr, ok := computeRR(in)
+	if !ok {
+		t.Fatalf("expected computeRR to succeed for valid BUY geometry")
+	}
+	if rr != 2.0 {
+		t.Fatalf("expected R:R=2.0, got %.2f", rr)
+	}
+}
+
+// SELL is exit-only in this codebase. Analyst SELL signals can ship with
+// long-perspective stop/target geometry; we deliberately keep the legacy
+// math.Abs semantics for SELL so legitimate exits aren't blocked by the new
+// BUY-only geometry guard.
+func TestRiskReward_SellWithMath_Abs_PreservedBehavior(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 110
+	assertPasses(t, checkRiskReward, in)
+	rr, ok := computeRR(in)
+	if !ok {
+		t.Fatalf("expected computeRR to succeed for SELL with math.Abs semantics")
+	}
+	if rr != 2.0 {
+		t.Fatalf("expected R:R=2.0 via math.Abs for SELL, got %.2f", rr)
+	}
 }
 
 // ── Position size ─────────────────────────────────────────────────────────────

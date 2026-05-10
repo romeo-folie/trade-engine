@@ -16,7 +16,7 @@ type CheckInput struct {
 	Cfg config.RiskConfig
 
 	// Signal fields
-	Action      string  // BUY | SELL
+	Action      string // BUY | SELL
 	Ticker      string
 	Confidence  float64 // 0.0–1.0
 	SizePct     float64 // recommended position %
@@ -32,10 +32,10 @@ type CheckInput struct {
 	// in the same direction as the incoming signal (longs for BUY, shorts for
 	// SELL). Consumed by checkMaxPerTicker (#312). May be nil; checks treat a
 	// missing key as 0.
-	OpenByTicker   map[string]int
-	DailyPnL       float64   // realised P&L today (negative = loss)
-	PeakValue      float64   // for drawdown calculation
-	LastLossAt     time.Time // last time a losing trade closed
+	OpenByTicker map[string]int
+	DailyPnL     float64   // realised P&L today (negative = loss)
+	PeakValue    float64   // for drawdown calculation
+	LastLossAt   time.Time // last time a losing trade closed
 
 	// HoldsLong is true when there is an open long trade in Ticker.
 	// LongQuantity is the total shares held long (sum across open trades).
@@ -63,13 +63,13 @@ type CheckResult struct {
 // reorder has no impact on BUY-side latency or behaviour.
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
-		checkPositionOwnership,
-		checkConfidence,
+		checkPositionOwnership,    // #337 — runs first; SELL on no-long blocks cleanly
+		checkConfidenceTiered,     // #339 — replaces checkConfidence
 		checkRiskReward,
 		checkPositionSize,
-		checkMaxDollarRisk,
+		checkMaxDollarRisk,        // #335
 		checkMaxOpenPositions,
-		checkMaxPerTicker,
+		checkMaxPerTicker,         // #312 (Epic A)
 		checkDailyLossLimit,
 		checkMaxDrawdown,
 		checkCooldownAfterLoss,
@@ -98,6 +98,10 @@ func BlockReason(results []CheckResult) string {
 
 // ─── Individual checks ────────────────────────────────────────────────────────
 
+// checkConfidence is the static-floor confidence check retained for backwards
+// compatibility and direct unit testing. Production CheckAll uses
+// checkConfidenceTiered (#317) which falls back to this floor when no tiers
+// match or none are configured.
 func checkConfidence(in CheckInput) CheckResult {
 	name := "confidence_threshold"
 	if in.Confidence >= in.Cfg.ConfidenceThreshold {
@@ -107,11 +111,98 @@ func checkConfidence(in CheckInput) CheckResult {
 		in.Confidence, in.Cfg.ConfidenceThreshold))
 }
 
+// checkConfidenceTiered enforces a confidence floor that varies with R:R
+// (#317). Tiers from Cfg.ConfidenceTiers are scanned in declaration order;
+// the first tier whose RRMin is <= the trade's R:R applies. When no R:R can
+// be computed (no stop/TP) or no tier matches, we fall back to the static
+// ConfidenceThreshold floor — this preserves the pre-#317 behaviour for
+// configs that haven't opted into tiers.
+func checkConfidenceTiered(in CheckInput) CheckResult {
+	name := "confidence_threshold"
+
+	// When tiers aren't configured, behave exactly like the legacy static check.
+	if len(in.Cfg.ConfidenceTiers) == 0 {
+		return checkConfidence(in)
+	}
+
+	// Compute R:R if a stop and target are present. Without them we can't
+	// place the signal in any tier, so fall back to the static floor.
+	rr, hasRR := computeRR(in)
+	if !hasRR {
+		return checkConfidence(in)
+	}
+
+	for _, tier := range in.Cfg.ConfidenceTiers {
+		if rr >= tier.RRMin {
+			if in.Confidence >= tier.ConfMin {
+				return pass(name)
+			}
+			return fail(name, fmt.Sprintf(
+				"confidence %.2f < tier-required %.2f (R:R %.2f)",
+				in.Confidence, tier.ConfMin, rr,
+			))
+		}
+	}
+
+	// R:R is below every configured tier floor. If it's also below the
+	// configured MinRiskReward, defer the rejection to checkRiskReward so
+	// the operator gets an accurate "R:R x.xx < minimum y.yy" reason
+	// rather than a confidence reason that masks the real cause (#317
+	// review). CheckAll runs confidence before R:R, so without this pass
+	// here the confidence reason wins. When a misconfigured tier list
+	// leaves a gap above MinRiskReward, fall back to the static floor so
+	// signals still get gated.
+	if rr < in.Cfg.MinRiskReward {
+		return pass(name)
+	}
+	return checkConfidence(in)
+}
+
+// computeRR derives the trade's R:R ratio from CheckInput. Returns (0, false)
+// when stop/TP/price are missing, when risk is zero, or when BUY geometry is
+// inverted (stop at-or-above entry, target at-or-below entry).
+//
+// SELL is exit-only in this codebase (see checkPositionOwnership and the
+// checkMaxDollarRisk SELL skip), and analyst SELL signals can ship inverted
+// stop/target relative to a pure short setup. To avoid spuriously rejecting
+// legitimate exits we keep the existing math.Abs semantics for SELL and only
+// enforce geometry on BUY (the side that actually opens new risk).
+func computeRR(in CheckInput) (float64, bool) {
+	if in.StopLoss == 0 || in.TakeProfit == 0 || in.SignalPrice == 0 {
+		return 0, false
+	}
+	if in.Action == "BUY" {
+		if in.StopLoss >= in.SignalPrice || in.TakeProfit <= in.SignalPrice {
+			return 0, false
+		}
+	}
+	risk := math.Abs(in.SignalPrice - in.StopLoss)
+	reward := math.Abs(in.TakeProfit - in.SignalPrice)
+	if risk == 0 {
+		return 0, false
+	}
+	return reward / risk, true
+}
+
 func checkRiskReward(in CheckInput) CheckResult {
 	name := "risk_reward_ratio"
 	if in.StopLoss == 0 || in.TakeProfit == 0 {
 		// No stop/TP provided — skip R:R check.
 		return pass(name)
+	}
+	// Validate BUY geometry before taking absolute values: an inverted long
+	// setup (stop >= entry or target <= entry) would otherwise yield a
+	// positive R:R via math.Abs and pass the gate, only to fire its stop
+	// immediately at execution because the engine treats StopLoss as a long
+	// stop that triggers on price <= stop. SELL is exit-only and skipped to
+	// preserve the legacy math.Abs behaviour for analyst exit signals.
+	if in.Action == "BUY" {
+		if in.StopLoss >= in.SignalPrice || in.TakeProfit <= in.SignalPrice {
+			return fail(name, fmt.Sprintf(
+				"invalid SL/TP geometry for BUY (stop %.2f >= signal %.2f or take_profit %.2f <= signal %.2f)",
+				in.StopLoss, in.SignalPrice, in.TakeProfit, in.SignalPrice,
+			))
+		}
 	}
 	risk := math.Abs(in.SignalPrice - in.StopLoss)
 	reward := math.Abs(in.TakeProfit - in.SignalPrice)
