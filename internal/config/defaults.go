@@ -252,6 +252,18 @@ func Defaults() *Config {
 					TrendStrength: 0.20,
 				},
 			},
+			// Multi-timeframe borderline arbiter (Issue #321) — defaults are
+			// deliberately narrow so only a small fraction of WAITs incur the
+			// 2× token cost. 1d → 1h gives the daily view a near-term sanity
+			// check; 1h ↔ 4h cross-checks intra-day vs swing perspectives.
+			MultiTimeframeBorderlineEnabled: true,
+			MultiTimeframeAltMap: map[string]string{
+				"1h": "4h",
+				"4h": "1h",
+				"1d": "1h",
+			},
+			MultiTimeframeBorderlineConfMin: 0.55,
+			MultiTimeframeBorderlineConfMax: 0.70,
 		},
 		Embeddings: EmbeddingsConfig{
 			Enabled:                  false,

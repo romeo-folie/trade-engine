@@ -806,7 +806,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	impact := e.calculateImpactScore(ticker, snippets, candles)
 	result, err := e.analyzer.AnalyzeFull(ctx, req, impact)
 
-	// Record token usage for cost tracking (#177) — BEFORE checking err.
+	// Record token usage for cost tracking (#177) — BEFORE checking err and
+	// BEFORE the optional second-pass below so first-pass spend is always
+	// captured even if a second pass overwrites `result`. Issue #321's
+	// alt-timeframe pass records its own tokens via recordMultiTFCost into a
+	// distinct "<model>#mtf2" bucket; the re-arbiter cost is recorded after
+	// re-arbitration completes.
+	//
 	// AnalyzeFull can return a non-nil result alongside a non-nil error (e.g.
 	// JSON extraction failures in single-analyst mode). Providers consume tokens
 	// before erroring, so skipping recording on error would undercount spend and
@@ -837,6 +843,49 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		} else if result.Meta.Provider != "" && result.Meta.Model != "" && (result.Meta.InputTokens > 0 || result.Meta.OutputTokens > 0) {
 			e.costTracker.Record(result.Meta.Provider, result.Meta.Model,
 				result.Meta.InputTokens, result.Meta.OutputTokens)
+		}
+	}
+
+	// Issue #321 — Multi-timeframe arbiter for borderline WAITs.
+	// If the first pass resolved to WAIT inside the configured borderline band,
+	// run a second analyst pass on the alternate timeframe and re-arbitrate
+	// over the combined set. The recursion guard is enforced by passing the
+	// secondPass=false flag here; runSecondTimeframePass never re-invokes this
+	// branch, so a third pass cannot fire.
+	if err == nil {
+		if altTF, run := shouldRunSecondPass(e.cfg.Analysis, result.Response, timeframe, false); run {
+			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
+				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
+				"confidence", fmt.Sprintf("%.3f", result.Response.Confidence))
+			if altResult, ok := e.runSecondTimeframePass(ctx, req, altTF, ticker); ok {
+				// Charge the alt-pass tokens to a distinct bucket
+				// ("<model>#mtf2") so we can measure marginal cost.
+				e.recordMultiTFCost(altResult)
+				combined := combineForArbiter(timeframe, altTF, result.AnalystResults, altResult.AnalystResults)
+				combinedReq := req
+				combinedReq.Timeframe = fmt.Sprintf("%s+%s", timeframe, altTF)
+				if reArb, rerr := reArbitrate(ctx, e.analyzer, combinedReq, combined); rerr == nil {
+					// Charge re-arbiter tokens to the multi-tf bucket too —
+					// it would not have run absent the second pass.
+					if reArb.Arbiter != nil && reArb.Arbiter.Meta.Provider != "" && reArb.Arbiter.Meta.Model != "" &&
+						(reArb.Arbiter.Meta.InputTokens > 0 || reArb.Arbiter.Meta.OutputTokens > 0) {
+						e.costTracker.Record(reArb.Arbiter.Meta.Provider, reArb.Arbiter.Meta.Model+multiTFCostSuffix,
+							reArb.Arbiter.Meta.InputTokens, reArb.Arbiter.Meta.OutputTokens)
+					}
+					logger.Info("multi-tf: re-arbitration complete",
+						"ticker", ticker,
+						"original_action", string(result.Response.Action),
+						"final_action", string(reArb.Response.Action),
+						"final_confidence", fmt.Sprintf("%.3f", reArb.Response.Confidence))
+					result = reArb
+				} else {
+					logger.Warn("multi-tf: re-arbitration failed — keeping original WAIT",
+						"ticker", ticker, "err", rerr.Error())
+				}
+			} else {
+				logger.Debug("multi-tf: alt-timeframe pass unavailable — keeping original WAIT",
+					"ticker", ticker, "alt_tf", altTF)
+			}
 		}
 	}
 
