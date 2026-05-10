@@ -646,6 +646,10 @@ type RiskConfig struct {
 	// example config recommends 2. Operators opt in by setting a positive
 	// value in their config.
 	MaxPerTicker         int     `yaml:"max_per_ticker"`
+	// MaxDollarRiskPct caps the per-trade dollar at risk
+	// (qty × |entry − stop|) as a percent of portfolio equity (#320).
+	// Default 1.0. Treated as disabled when set to 0.
+	MaxDollarRiskPct     float64 `yaml:"max_dollar_risk_pct"`
 	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
 	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
 	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`
