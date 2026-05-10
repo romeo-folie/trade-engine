@@ -64,6 +64,11 @@ export interface PortfolioState {
   unrealizedPnL: number;
   realizedPnlToday: number;
   openPositions: number;
+  // Count of DB rows with status='open'. Equals openPositions in steady state
+  // (after Epic A consolidation work). Divergence is rendered in the canvas
+  // portfolio card to surface drift or pending consolidation. May be null when
+  // the source (e.g. WebSocket PortfolioSnapshot event) doesn't supply it.
+  openTradeRows: number | null;
 }
 
 export interface EngineSocketState {
@@ -152,6 +157,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           unrealizedPnL: p.UnrealizedPnL ?? 0,
           realizedPnlToday: p.DayPnL ?? 0,
           openPositions: p.OpenPositions ?? 0,
+          openTradeRows: p.OpenTradeRows ?? null,
         });
       })
       .catch(() => { /* non-critical */ });
@@ -198,6 +204,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 // day_pnl is 0 when broker unavailable (PaperExecutor); fall through to realized_pnl_today.
                 realizedPnlToday: (m.day_pnl != null ? m.day_pnl as number : null) || (m.realized_pnl_today as number) || 0,
                 openPositions: m.open_positions as number,
+                // Snapshot meta doesn't include trade-row count today; null hides divergence in the card.
+                openTradeRows: (m.open_trade_rows != null ? m.open_trade_rows as number : null),
               });
             }
           }
@@ -399,6 +407,8 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
               unrealizedPnL: p.unrealized_pnl as number,
               realizedPnlToday: (p.day_pnl != null ? p.day_pnl as number : null) || (p.realized_pnl_today as number) || 0,
               openPositions: p.open_positions as number,
+              // PortfolioSnapshot WebSocket event doesn't carry the row count today.
+              openTradeRows: (p.open_trade_rows != null ? p.open_trade_rows as number : null),
             });
           } catch { /* ignore */ }
         }

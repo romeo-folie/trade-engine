@@ -78,6 +78,15 @@ func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) 
 	return err
 }
 
+// CountOpenTrades returns the number of trade rows with status='open'.
+// Cheaper than GetOpenTrades when only the count is needed: avoids loading
+// every column of every open trade just to call len(...).
+func CountOpenTrades(ctx context.Context) (int, error) {
+	var n int
+	err := GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM trades WHERE status='open'`).Scan(&n)
+	return n, err
+}
+
 // GetOpenTrades returns all trades with status = 'open'.
 func GetOpenTrades(ctx context.Context) ([]Trade, error) {
 	rows, err := GetDB().Query(ctx, `

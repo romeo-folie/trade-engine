@@ -62,6 +62,13 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 // GET /api/node/risk
+//
+// Returns two distinct counts so the canvas can flag drift between them:
+//   - open_positions: distinct (ticker, direction) pairs — the canonical
+//     "open position" notion used by the risk gate (see PR #330).
+//   - open_trade_count: count of DB rows with status='open' (kept for
+//     backwards compat). Equals open_positions in steady state; divergence
+//     points to pending consolidation work or a bug.
 func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
@@ -75,19 +82,60 @@ func (s *Server) handleRisk(w http.ResponseWriter, r *http.Request) {
 		apiError(w, "risk query failed", err)
 		return
 	}
+	// open_trade_count is the authoritative trade-row count and always succeeds
+	// here because it's just len() over the loaded rows. Surface it under both
+	// keys so the canvas card (which reads `open_trade_rows` everywhere) can
+	// detect divergence on /api/node/risk too.
+	rowCount := len(openTrades)
 	jsonResponse(w, map[string]any{
 		"open_trades":      openTrades,
-		"open_trade_count": len(openTrades),
+		"open_trade_count": rowCount,
+		"open_trade_rows":  &rowCount,
+		"open_positions":   countDistinctOpenPositions(openTrades),
 	})
+}
+
+// countDistinctOpenPositions returns the number of distinct (ticker, direction)
+// pairs in the supplied trade rows. Mirrors the canonical pattern from
+// internal/engine/engine.go (PR #330) so all consumers — risk gate, portfolio
+// card, canvas — agree on the "open position" denominator.
+func countDistinctOpenPositions(trades []store.Trade) int {
+	seen := make(map[string]struct{}, len(trades))
+	for _, t := range trades {
+		seen[t.Ticker+"|"+t.Direction] = struct{}{}
+	}
+	return len(seen)
 }
 
 // GET /api/node/portfolio
 // Broker-first: reads live account state from the broker when configured,
 // falls back to the in-process tracker, then to the latest DB snapshot.
 // All responses include source ("broker"|"tracker"|"db") and stale_at (non-null on fallback).
+//
+// All three paths emit two position counts:
+//   - OpenPositions: distinct ticker (or ticker+direction) count — the canonical
+//     denominator used by the risk gate (see PR #330). For the broker path this
+//     is len(positions) since the broker already aggregates per ticker.
+//   - OpenTradeRows: count of DB rows with status='open'. Equals OpenPositions
+//     in steady state; divergence is rendered in the canvas card to surface
+//     pending consolidation work or drift.
 func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
+
+	// Trade-row count from DB — used by every path so the response shape is
+	// uniform. Best-effort: when the DB is disconnected or the count query
+	// fails, leave the pointer nil so the JSON serializes to null and the
+	// frontend (which already treats null as "hide divergence") doesn't
+	// mistake an unknown value for a real zero.
+	var openTradeRows *int
+	if store.IsConnected() {
+		if n, dbErr := store.CountOpenTrades(ctx); dbErr == nil {
+			openTradeRows = &n
+		} else {
+			logger.Warn("CountOpenTrades failed; omitting open_trade_rows", "err", dbErr)
+		}
+	}
 
 	// ── 1. Broker-direct path ────────────────────────────────────────────────
 	if s.brokerView != nil {
@@ -121,6 +169,7 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 				}(),
 				"RealizedPnLToday": 0.0,
 				"OpenPositions":    openPositions,
+				"OpenTradeRows":    openTradeRows,
 				"BuyingPower":      acct.BuyingPower,
 				"source":           "broker",
 				"stale_at":         nil,
@@ -141,6 +190,7 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 			"DayPnL":           state.DayPnL,
 			"RealizedPnLToday": state.RealizedPnLDay,
 			"OpenPositions":    state.OpenPositions,
+			"OpenTradeRows":    openTradeRows,
 			"source":           "tracker",
 			"stale_at":         nil,
 		})
@@ -160,7 +210,8 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	if snap == nil {
 		jsonResponse(w, map[string]any{
 			"TotalValue": 0.0, "Cash": 0.0, "Invested": 0.0,
-			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0, "OpenPositions": 0,
+			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0,
+			"OpenPositions": 0, "OpenTradeRows": openTradeRows,
 			"source": "db", "stale_at": nil,
 		})
 		return
@@ -173,6 +224,7 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 		"DayPnL":           0.0,
 		"RealizedPnLToday": snap.RealizedPnLToday,
 		"OpenPositions":    snap.OpenPositions,
+		"OpenTradeRows":    openTradeRows,
 		"source":           "db",
 		"stale_at":         snap.CreatedAt.UTC().Format(time.RFC3339),
 	})

@@ -1827,6 +1827,18 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	// Update portfolio state after monitoring.
 	snap := e.portfolio.MaybeSnapshot(ctx)
 	if snap != nil {
+		// Best-effort trade-row count so live ticks carry the divergence
+		// signal alongside OpenPositions. Nil on error/disconnected DB —
+		// the frontend treats null as "hide divergence", matching the REST
+		// shape from /api/node/portfolio.
+		var openTradeRows *int
+		if store.IsConnected() {
+			if n, dbErr := store.CountOpenTrades(ctx); dbErr == nil {
+				openTradeRows = &n
+			} else {
+				logger.Warn("CountOpenTrades failed; portfolio snapshot omits open_trade_rows", "err", dbErr)
+			}
+		}
 		e.bus.Publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{
 			TotalValue:       snap.TotalValue,
 			Cash:             snap.Cash,
@@ -1835,6 +1847,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			RealizedPnLToday: snap.RealizedPnLDay,
 			DayPnL:           snap.DayPnL,
 			OpenPositions:    snap.OpenPositions,
+			OpenTradeRows:    openTradeRows,
 		})
 	}
 

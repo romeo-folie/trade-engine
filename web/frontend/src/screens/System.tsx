@@ -135,7 +135,7 @@ export default function SystemScreen() {
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
   const [modelPerf, setModelPerf] = useState<ModelPerfRow[]>([]);
   const [signalCount, setSignalCount] = useState<number | null>(null);
-  const [riskData, setRiskData] = useState<{ open_trade_count: number } | null>(null);
+  const [riskData, setRiskData] = useState<{ open_trade_count: number; open_positions?: number } | null>(null);
   const [uptime, setUptime] = useState(0);
   const baseUptime = useRef(0);
   const loadedAt = useRef(Date.now());
@@ -202,7 +202,16 @@ export default function SystemScreen() {
     ? ((cacheStats.hits / (cacheStats.hits + cacheStats.misses)) * 100).toFixed(1) + '%'
     : '—';
 
-  const openPositions = riskData?.open_trade_count ?? '—';
+  // Prefer the distinct (ticker, direction) count when the new field is present
+  // — that matches what the risk gate uses (PR #330). Fall back to the trade-row
+  // count for older API responses. Render "N (M rows)" when the two diverge so
+  // pending consolidation work is visible (Issue #315). After Epic A is fully
+  // deployed the divergence indicator should be hidden in steady state.
+  const openPositions = riskData == null
+    ? '—'
+    : riskData.open_positions == null || riskData.open_positions === riskData.open_trade_count
+      ? riskData.open_trade_count
+      : `${riskData.open_positions} (${riskData.open_trade_count} rows)`;
   const activityEvents = events.slice(0, 100);
   const displayPerf = modelPerf;
 

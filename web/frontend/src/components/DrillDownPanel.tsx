@@ -52,6 +52,9 @@ interface RiskData {
     Status: string;
   }>;
   open_trade_count: number;
+  // Distinct (ticker, direction) count — equals open_trade_count in steady state
+  // after Epic A consolidation (#311/#312/#315). Optional for backwards compat.
+  open_positions?: number;
 }
 
 interface PortfolioData {
@@ -61,6 +64,13 @@ interface PortfolioData {
   UnrealizedPnL?: number;
   RealizedPnLToday?: number;
   OpenPositions?: number;
+  // Count of DB rows where status='open'. Equals OpenPositions in steady state
+  // after Epic A consolidation. Divergence is surfaced in the card below to
+  // make pending consolidation immediately visible.
+  // Backend returns *int which serializes to JSON null when nil (omitempty
+   // would also drop the key entirely), so the wire format is number | null |
+   // undefined. Consumers below use loose `== null` checks to handle both.
+   OpenTradeRows?: number | null;
 }
 
 interface ModelPerf {
@@ -253,9 +263,22 @@ function renderNodeContent(nodeId: string, data: unknown): ReactNode {
 // ── Risk Panel ────────────────────────────────────────────────────────────────
 
 function RiskPanel({ data }: { data: RiskData }) {
+  // Prefer the distinct-ticker count when available — that's the gate's
+  // canonical denominator. Show the row count in parentheses only when the two
+  // diverge so steady state stays a single number (Issue #315).
+  const distinct = data.open_positions ?? data.open_trade_count;
+  const rows = data.open_trade_count;
+  const value = distinct === rows
+    ? String(distinct)
+    : `${distinct} (${rows} rows)`;
   return (
     <div>
-      <StatCard label="Open Positions" value={data.open_trade_count} color="#a855f7" />
+      <StatCard
+        label="Open Positions"
+        value={value}
+        color="#a855f7"
+        title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
+      />
       {data.open_trades?.length > 0 && (
         <div style={{ marginTop: 16 }}>
           <SectionLabel>Active Trades</SectionLabel>
@@ -271,6 +294,14 @@ function RiskPanel({ data }: { data: RiskData }) {
 // ── Portfolio Panel ──────────────────────────────────────────────────────────
 
 function PortfolioPanel({ data }: { data: PortfolioData }) {
+  // Mirror the canvas card: show plain count when distinct tickers and DB rows
+  // agree (Epic A steady state); show "N (M rows)" when they diverge so
+  // pending consolidation is immediately visible (Issue #315).
+  const distinct = data.OpenPositions ?? 0;
+  const rows = data.OpenTradeRows;
+  const positionsValue = (rows == null || rows === distinct)
+    ? String(distinct)
+    : `${distinct} (${rows} rows)`;
   return (
     <div>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
@@ -282,7 +313,12 @@ function PortfolioPanel({ data }: { data: PortfolioData }) {
       <div style={{ marginTop: 10 }}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>
           <StatCard label="Realized Today" value={fmtPnl(data.RealizedPnLToday)} color={pnlColor(data.RealizedPnLToday)} />
-          <StatCard label="Open Positions" value={data.OpenPositions ?? 0} color="#6b6b8f" />
+          <StatCard
+            label="Open Positions"
+            value={positionsValue}
+            color="#6b6b8f"
+            title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
+          />
         </div>
       </div>
     </div>
@@ -471,14 +507,18 @@ function RawPanel({ data }: { data: unknown }) {
 
 // ── Shared UI atoms ──────────────────────────────────────────────────────────
 
-function StatCard({ label, value, color }: { label: string; value: string | number; color: string }) {
+function StatCard({ label, value, color, title }: { label: string; value: string | number; color: string; title?: string }) {
   return (
-    <div style={{
-      background: '#12103a',
-      border: '1px solid #2d2b45',
-      borderRadius: 8,
-      padding: '12px 14px',
-    }}>
+    <div
+      style={{
+        background: '#12103a',
+        border: '1px solid #2d2b45',
+        borderRadius: 8,
+        padding: '12px 14px',
+      }}
+      title={title}
+      aria-label={title}
+    >
       <div style={{ color: '#6b6b8f', fontSize: 9, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
         {label}
       </div>
