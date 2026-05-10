@@ -203,6 +203,8 @@ risk:
   max_open_positions: 10
   max_per_ticker: 2            # Cap open positions per ticker (same direction); 0 disables (#312)
   max_dollar_risk_pct: 1.0     # Hard cap on per-trade $-at-risk (qty × |entry − stop|) as % of equity; 0 disables (#320)
+  pyramid_enabled: false       # Allow BUY on existing long up >= pyramid_min_gain_pct (#324). Default off — safe rollout.
+  pyramid_min_gain_pct: 5.0    # Minimum unrealised gain (%) on the open long for a pyramid add (#324)
   daily_loss_limit_pct: 3.0    # Pause engine if daily loss exceeds this
   max_drawdown_pct: 15.0       # Emergency stop if drawdown exceeds this
   cooldown_after_loss_min: 60  # Minutes to pause trading after a losing trade

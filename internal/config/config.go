@@ -665,11 +665,21 @@ type RiskConfig struct {
 	// that don't set this key upgrade safely without unexpected blocks; the
 	// example config recommends 2. Operators opt in by setting a positive
 	// value in their config.
-	MaxPerTicker         int     `yaml:"max_per_ticker"`
+	MaxPerTicker int `yaml:"max_per_ticker"`
 	// MaxDollarRiskPct caps the per-trade dollar at risk
 	// (qty × |entry − stop|) as a percent of portfolio equity (#320).
 	// Default 1.0. Treated as disabled when set to 0.
-	MaxDollarRiskPct     float64 `yaml:"max_dollar_risk_pct"`
+	MaxDollarRiskPct float64 `yaml:"max_dollar_risk_pct"`
+	// PyramidEnabled gates the pyramiding-into-winners feature (#324). When
+	// true, a BUY signal on a ticker with an existing open long that is up
+	// ≥ PyramidMinGainPct adds a new lot with a tightened stop instead of
+	// being rejected as a duplicate. Default is false (safe rollout): the
+	// operator must explicitly opt in. When false, BUY-on-existing-long is
+	// blocked with reason "pyramid_disabled".
+	PyramidEnabled bool `yaml:"pyramid_enabled"`
+	// PyramidMinGainPct is the minimum unrealised gain (%) required on the
+	// existing long for a BUY to qualify as a pyramid add. Default 5.0%.
+	PyramidMinGainPct    float64 `yaml:"pyramid_min_gain_pct"`
 	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
 	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`
 	CooldownAfterLoss    int     `yaml:"cooldown_after_loss_min"`

@@ -43,6 +43,21 @@ type CheckInput struct {
 	// or where the proposed sell quantity exceeds what is held.
 	HoldsLong    bool
 	LongQuantity float64
+
+	// LongAvgEntryPrice is the quantity-weighted average entry price across
+	// all open long lots in Ticker. Consumed by checkPyramidPolicy (#324) to
+	// determine whether a BUY-on-existing-long qualifies as a pyramid add.
+	// Zero when HoldsLong is false or quantities are unknown.
+	LongAvgEntryPrice float64
+
+	// LongMaxStop is the highest (most-protective for a long) stop_loss across
+	// all open long lots in Ticker. Consumed by checkPyramidPolicy (#324) to
+	// reject pyramid attempts where the existing protective stop has already
+	// drifted at or above the current signal price (e.g. after a gap down
+	// before monitorPositions runs). Without this guard the new lot would be
+	// inserted with a stop above market and immediately closed on the next
+	// monitor pass. Zero when HoldsLong is false or no stops are recorded.
+	LongMaxStop float64
 }
 
 // CheckResult is the outcome of a single risk check.
@@ -64,6 +79,7 @@ type CheckResult struct {
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
 		checkPositionOwnership,    // #337 — runs first; SELL on no-long blocks cleanly
+		checkPyramidPolicy,        // #324 — pyramid eligibility on existing long
 		checkConfidenceTiered,     // #339 — replaces checkConfidence
 		checkRiskReward,
 		checkPositionSize,
@@ -349,6 +365,61 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 				proposedQty, in.LongQuantity, in.Ticker,
 			))
 		}
+	}
+	return pass(name)
+}
+
+// checkPyramidPolicy gates BUY signals that would land on a ticker with an
+// existing open long (#324). Three outcomes:
+//
+//   - No existing long → pass; this is a fresh entry.
+//   - Existing long but PyramidEnabled=false → fail with "pyramid_disabled".
+//     Default rollout: operators must explicitly opt in to pyramiding.
+//   - Existing long and PyramidEnabled=true → pass only if unrealised gain
+//     on the average entry is at least PyramidMinGainPct. Below threshold
+//     fails with "pyramid_min_gain_not_met" so we never double down on a
+//     flat or losing position.
+//
+// SELL signals and BUYs on tickers with no open long are unaffected; the
+// per-ticker cap (#312) still bounds the number of pyramid adds.
+func checkPyramidPolicy(in CheckInput) CheckResult {
+	name := "pyramid_policy"
+	if in.Action != "BUY" {
+		return pass(name)
+	}
+	if !in.HoldsLong {
+		return pass(name)
+	}
+	if !in.Cfg.PyramidEnabled {
+		return fail(name, fmt.Sprintf(
+			"pyramid_disabled: %s already has an open long and risk.pyramid_enabled is false",
+			in.Ticker,
+		))
+	}
+	if in.LongAvgEntryPrice <= 0 || in.SignalPrice <= 0 {
+		return fail(name, fmt.Sprintf(
+			"cannot evaluate pyramid gain for %s (avg_entry=%.4f signal_price=%.4f)",
+			in.Ticker, in.LongAvgEntryPrice, in.SignalPrice,
+		))
+	}
+	gainPct := ((in.SignalPrice - in.LongAvgEntryPrice) / in.LongAvgEntryPrice) * 100
+	if gainPct < in.Cfg.PyramidMinGainPct {
+		return fail(name, fmt.Sprintf(
+			"pyramid_min_gain_not_met: %s up %.2f%% < required %.2f%%",
+			in.Ticker, gainPct, in.Cfg.PyramidMinGainPct,
+		))
+	}
+	// The new lot's stop is tightened downstream to max(canonical existing
+	// stop, weighted avg entry). When that canonical stop has drifted at or
+	// above the current signal price the resulting long stop would sit above
+	// market — the new trade closes immediately on the next monitor pass.
+	// Reject the pyramid attempt instead of inserting a trade that's already
+	// underwater. The pre-existing position is unaffected.
+	if in.LongMaxStop > 0 && in.LongMaxStop >= in.SignalPrice {
+		return fail(name, fmt.Sprintf(
+			"pyramid_stop_above_price: %s existing stop %.4f >= signal price %.4f",
+			in.Ticker, in.LongMaxStop, in.SignalPrice,
+		))
 	}
 	return pass(name)
 }

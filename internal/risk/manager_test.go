@@ -676,18 +676,21 @@ func TestCheckAll_ShortCircuitsOnFirstFail(t *testing.T) {
 	if ok {
 		t.Fatal("expected failure")
 	}
-	// After the #319 reorder checkPositionOwnership runs first; Action=BUY in
-	// baseInput so ownership passes, then checkConfidence fails and short-
-	// circuits. Expect exactly 2 results: the BUY-side ownership pass, plus
-	// the failing confidence check.
-	if len(results) != 2 {
-		t.Fatalf("expected 2 results (ownership pass + confidence fail), got %d", len(results))
+	// CheckAll order (post #324): position_ownership → pyramid_policy →
+	// confidence_threshold → … Action=BUY in baseInput with no open long, so
+	// ownership and pyramid both pass as cheap no-ops, then the confidence
+	// check fails and short-circuits. Expect exactly 3 results.
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results (ownership pass + pyramid pass + confidence fail), got %d", len(results))
 	}
 	if results[0].Name != "position_ownership" || !results[0].Passed {
 		t.Fatalf("expected position_ownership to pass first, got %+v", results[0])
 	}
-	if results[1].Name != "confidence_threshold" || results[1].Passed {
-		t.Fatalf("expected confidence_threshold to fail second, got %+v", results[1])
+	if results[1].Name != "pyramid_policy" || !results[1].Passed {
+		t.Fatalf("expected pyramid_policy to pass second, got %+v", results[1])
+	}
+	if results[2].Name != "confidence_threshold" || results[2].Passed {
+		t.Fatalf("expected confidence_threshold to fail third, got %+v", results[2])
 	}
 }
 
@@ -721,6 +724,212 @@ func TestBlockReason_ReturnsFirstFailReason(t *testing.T) {
 	reason := BlockReason(results)
 	if reason == "" {
 		t.Fatal("expected non-empty block reason")
+	}
+}
+
+// ── Pyramiding (#324) ─────────────────────────────────────────────────────────
+
+func TestPyramidPolicy_NoExistingLong_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = false
+	in.Cfg.PyramidEnabled = false // even when disabled, fresh entries pass
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_SellAlwaysPasses(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.Cfg.PyramidEnabled = false
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_DisabledRejectsExistingLong(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110 // up 10%, would otherwise pyramid
+	in.Cfg.PyramidEnabled = false
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_disabled") {
+		t.Fatalf("expected reason to include 'pyramid_disabled', got: %s", r.Reason)
+	}
+}
+
+func TestPyramidPolicy_EnabledAndUp6Pct_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106 // +6%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_EnabledButFlat_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 100 // 0%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_min_gain_not_met") {
+		t.Fatalf("expected reason to include 'pyramid_min_gain_not_met', got: %s", r.Reason)
+	}
+}
+
+func TestPyramidPolicy_EnabledButLosing_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 95 // -5%
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertFails(t, checkPyramidPolicy, in)
+}
+
+func TestPyramidPolicy_EnabledMissingPrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 0 // unknown
+	in.SignalPrice = 100
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertFails(t, checkPyramidPolicy, in)
+}
+
+// Gain criteria met but the existing canonical stop has drifted at or above
+// the current signal price (e.g. a fast gap down before monitorPositions
+// runs). The new lot's stop would be tightened to that out-of-range value
+// and the position would close immediately — block the pyramid attempt
+// outright with pyramid_stop_above_price.
+func TestPyramidPolicy_StopAtOrAbovePrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106 // +6%, gain met
+	in.LongMaxStop = 108 // stop above market (e.g. trailing stop ratcheted up)
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_stop_above_price") {
+		t.Fatalf("expected reason to include 'pyramid_stop_above_price', got: %s", r.Reason)
+	}
+}
+
+// Boundary: stop exactly equal to the signal price should also reject — the
+// new lot's stop would equal entry, immediate stop-out on first tick.
+func TestPyramidPolicy_StopEqualPrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106
+	in.LongMaxStop = 106
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_stop_above_price") {
+		t.Fatalf("expected reason to include 'pyramid_stop_above_price', got: %s", r.Reason)
+	}
+}
+
+// Sanity: a stop strictly below the signal price still passes (normal case).
+func TestPyramidPolicy_StopBelowPrice_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.LongMaxStop = 102 // healthy: between entry and price
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
+func TestCheckAll_PyramidCapHonoured(t *testing.T) {
+	// Pyramid criteria met but per-ticker cap reached → blocks naturally.
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105   // tightened stop above original entry
+	in.TakeProfit = 130 // generous TP keeps R:R > 2 so we land on the cap
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	in.Cfg.MaxPerTicker = 2
+	in.OpenByTicker = map[string]int{"AAPL": 2}
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected CheckAll to fail when per-ticker cap reached")
+	}
+	if reason := BlockReason(results); !contains(reason, "per-ticker") {
+		t.Fatalf("expected per-ticker block reason, got: %s", reason)
+	}
+}
+
+func TestCheckAll_PyramidEnabledAndUp_Passes(t *testing.T) {
+	// End-to-end: pyramid criteria met, capacity available → all checks pass.
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105
+	in.TakeProfit = 130
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	in.Cfg.MaxPerTicker = 2
+	in.OpenByTicker = map[string]int{"AAPL": 1}
+	if _, ok := CheckAll(in); !ok {
+		t.Fatal("expected CheckAll to pass for valid pyramid signal")
+	}
+}
+
+func TestCheckAll_PyramidDisabled_BlocksWithReason(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.StopLoss = 105
+	in.TakeProfit = 130
+	in.Cfg.PyramidEnabled = false
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected CheckAll to fail when pyramid disabled")
+	}
+	if reason := BlockReason(results); !contains(reason, "pyramid_disabled") {
+		t.Fatalf("expected reason to include 'pyramid_disabled', got: %s", reason)
 	}
 }
 
