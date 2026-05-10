@@ -1187,6 +1187,42 @@ func (e *Engine) SetCostNotifier(n cost.DegradeNotifier) {
 
 // ─── Phase 4: Signal generation ───────────────────────────────────────────────
 
+// pyramidTightenedStop returns the stop the new lot of a pyramid add should
+// carry. Inputs:
+//
+//   - analystStop is the StopLoss the analyst returned (resp.StopLoss).
+//   - existingMaxStop is the highest stop across open long lots in the
+//     ticker (canonical existing protective stop).
+//   - avgEntry is the quantity-weighted average entry across those lots.
+//   - signalPrice is the current price the new lot would be opened at.
+//
+// The new lot's stop is the larger of (existingMaxStop, avgEntry) — the
+// former honours stops the operator (or a trailing manager) has already
+// ratcheted up; the latter guarantees a stop-out is at worst breakeven on
+// the original lot. The analyst stop is kept if it's already tighter than
+// either. The result is also capped strictly below signalPrice so a
+// degenerate input can never produce an immediately-out-of-range long stop;
+// callers should additionally route through checkPyramidPolicy which
+// rejects pyramid attempts where the existing stop has drifted at or above
+// market (#324 review).
+func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice float64) float64 {
+	tightened := existingMaxStop
+	if avgEntry > tightened {
+		tightened = avgEntry
+	}
+	if tightened <= analystStop {
+		return analystStop
+	}
+	// Defence in depth: never return a stop that would be at or above the
+	// current signal price for a long position. checkPyramidPolicy already
+	// rejects this case, so in practice we won't reach here — but keep the
+	// invariant local so a future refactor can't accidentally violate it.
+	if signalPrice > 0 && tightened >= signalPrice {
+		return analystStop
+	}
+	return tightened
+}
+
 // generateSignal creates a signal from a BUY/SELL analysis, runs risk checks,
 // and routes execution according to the current mode.
 func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string) {
@@ -1280,22 +1316,14 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		longAvgEntry = longCostBasis / longQuantity
 	}
 
-	// Pyramiding (#324): if this is a BUY landing on an existing long, tighten
-	// the new lot's stop to max(canonical existing stop, weighted avg entry)
-	// so the combined cost basis is at worst breakeven on the original lot
-	// when the new stop trips. checkPyramidPolicy still gates whether the
-	// signal passes; this only sets the stop for the row that gets inserted
-	// downstream when the gate is open.
-	if resp.Action == "BUY" && holdsLong && e.cfg.Risk.PyramidEnabled {
-		tightened := longMaxStop
-		if longAvgEntry > tightened {
-			tightened = longAvgEntry
-		}
-		if tightened > sig.StopLoss {
-			sig.StopLoss = tightened
-		}
-	}
-
+	// Pyramiding (#324): the new lot's stop will be tightened to
+	// max(canonical existing stop, weighted avg entry) so the combined cost
+	// basis is at worst breakeven on the original lot when the new stop
+	// trips. The mutation is deferred until AFTER risk checks pass so a
+	// blocked signal still records the unmodified analyst stop and the
+	// SignalGenerated payload below matches what is stored. checkPyramidPolicy
+	// rejects the attempt outright when the existing stop already sits at or
+	// above the current signal price.
 	riskIn := risk.CheckInput{
 		Cfg:               e.cfg.Risk,
 		Action:            string(resp.Action),
@@ -1315,6 +1343,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		HoldsLong:         holdsLong,
 		LongQuantity:      longQuantity,
 		LongAvgEntryPrice: longAvgEntry,
+		LongMaxStop:       longMaxStop,
 	}
 
 	results, passed := risk.CheckAll(riskIn)
@@ -1348,6 +1377,17 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		return
 	}
 
+	// Pyramiding (#324): risk checks have cleared, including
+	// checkPyramidPolicy's gain-met / stop-below-price gates. Tighten the new
+	// lot's stop so the combined cost basis is at worst breakeven on the
+	// original lot when the new stop trips. Performed here — after the gate,
+	// before InsertSignal — so blocked signals keep the unmodified analyst
+	// stop and the SignalGenerated payload below reflects the actual stored
+	// value.
+	if resp.Action == "BUY" && holdsLong && e.cfg.Risk.PyramidEnabled {
+		sig.StopLoss = pyramidTightenedStop(sig.StopLoss, longMaxStop, longAvgEntry, signalPrice)
+	}
+
 	sigID, err := store.InsertSignal(ctx, sig)
 	if err != nil {
 		logger.Warn("store signal", "ticker", ticker, "err", err)
@@ -1363,10 +1403,13 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		"mode", e.Mode(),
 	)
 
+	// Publish the actual stored signal parameters — sig.StopLoss/sig.TakeProfit
+	// reflect any pyramid stop tightening above; using resp.* would diverge
+	// from what downstream order placement consumes (#324 review).
 	e.bus.Publish(events.SignalGenerated, events.SignalGeneratedPayload{
 		SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 		Confidence: resp.Confidence, SignalPrice: signalPrice,
-		StopLoss: resp.StopLoss, TakeProfit: resp.TakeProfit, Mode: e.Mode(),
+		StopLoss: sig.StopLoss, TakeProfit: sig.TakeProfit, Mode: e.Mode(),
 	})
 
 	// Route based on mode.

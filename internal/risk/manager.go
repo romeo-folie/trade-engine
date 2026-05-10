@@ -49,6 +49,15 @@ type CheckInput struct {
 	// determine whether a BUY-on-existing-long qualifies as a pyramid add.
 	// Zero when HoldsLong is false or quantities are unknown.
 	LongAvgEntryPrice float64
+
+	// LongMaxStop is the highest (most-protective for a long) stop_loss across
+	// all open long lots in Ticker. Consumed by checkPyramidPolicy (#324) to
+	// reject pyramid attempts where the existing protective stop has already
+	// drifted at or above the current signal price (e.g. after a gap down
+	// before monitorPositions runs). Without this guard the new lot would be
+	// inserted with a stop above market and immediately closed on the next
+	// monitor pass. Zero when HoldsLong is false or no stops are recorded.
+	LongMaxStop float64
 }
 
 // CheckResult is the outcome of a single risk check.
@@ -246,6 +255,18 @@ func checkPyramidPolicy(in CheckInput) CheckResult {
 		return fail(name, fmt.Sprintf(
 			"pyramid_min_gain_not_met: %s up %.2f%% < required %.2f%%",
 			in.Ticker, gainPct, in.Cfg.PyramidMinGainPct,
+		))
+	}
+	// The new lot's stop is tightened downstream to max(canonical existing
+	// stop, weighted avg entry). When that canonical stop has drifted at or
+	// above the current signal price the resulting long stop would sit above
+	// market — the new trade closes immediately on the next monitor pass.
+	// Reject the pyramid attempt instead of inserting a trade that's already
+	// underwater. The pre-existing position is unaffected.
+	if in.LongMaxStop > 0 && in.LongMaxStop >= in.SignalPrice {
+		return fail(name, fmt.Sprintf(
+			"pyramid_stop_above_price: %s existing stop %.4f >= signal price %.4f",
+			in.Ticker, in.LongMaxStop, in.SignalPrice,
 		))
 	}
 	return pass(name)

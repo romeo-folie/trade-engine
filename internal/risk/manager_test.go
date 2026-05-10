@@ -440,6 +440,62 @@ func TestPyramidPolicy_EnabledMissingPrice_Rejects(t *testing.T) {
 	assertFails(t, checkPyramidPolicy, in)
 }
 
+// Gain criteria met but the existing canonical stop has drifted at or above
+// the current signal price (e.g. a fast gap down before monitorPositions
+// runs). The new lot's stop would be tightened to that out-of-range value
+// and the position would close immediately — block the pyramid attempt
+// outright with pyramid_stop_above_price.
+func TestPyramidPolicy_StopAtOrAbovePrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106 // +6%, gain met
+	in.LongMaxStop = 108 // stop above market (e.g. trailing stop ratcheted up)
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_stop_above_price") {
+		t.Fatalf("expected reason to include 'pyramid_stop_above_price', got: %s", r.Reason)
+	}
+}
+
+// Boundary: stop exactly equal to the signal price should also reject — the
+// new lot's stop would equal entry, immediate stop-out on first tick.
+func TestPyramidPolicy_StopEqualPrice_Rejects(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 106
+	in.LongMaxStop = 106
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	r := assertFails(t, checkPyramidPolicy, in)
+	if !contains(r.Reason, "pyramid_stop_above_price") {
+		t.Fatalf("expected reason to include 'pyramid_stop_above_price', got: %s", r.Reason)
+	}
+}
+
+// Sanity: a stop strictly below the signal price still passes (normal case).
+func TestPyramidPolicy_StopBelowPrice_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.Ticker = "AAPL"
+	in.HoldsLong = true
+	in.LongQuantity = 10
+	in.LongAvgEntryPrice = 100
+	in.SignalPrice = 110
+	in.LongMaxStop = 102 // healthy: between entry and price
+	in.Cfg.PyramidEnabled = true
+	in.Cfg.PyramidMinGainPct = 5.0
+	assertPasses(t, checkPyramidPolicy, in)
+}
+
 func TestCheckAll_PyramidCapHonoured(t *testing.T) {
 	// Pyramid criteria met but per-ticker cap reached → blocks naturally.
 	in := baseInput()
