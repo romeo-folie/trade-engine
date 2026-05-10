@@ -20,7 +20,12 @@ import (
 // suite can drive the real GetFeedbackInsights / GetLatestFeedbackInsights
 // queries that GetPerformanceContext depends on. If DATABASE_URL is unset
 // the suite exits cleanly — no failure, no pollution of any live DB.
-const testDBName = "tradeengine_test"
+//
+// The DB name is intentionally distinct from internal/store's
+// `tradeengine_test` so the two packages can run in parallel under
+// `go test ./...` without one package's TRUNCATE/DELETE wiping rows
+// the other is mid-test on.
+const testDBName = "tradeengine_feedback_test"
 
 func TestMain(m *testing.M) {
 	prodDSN := os.Getenv("DATABASE_URL")
@@ -53,7 +58,29 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Truncate feedback tables in our isolated DB so each `go test`
+	// invocation starts from a clean, deterministic slate. This is
+	// scoped to our own DB (tradeengine_feedback_test); it does not
+	// touch internal/store's tradeengine_test.
+	if err := truncateFeedbackTables(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "truncate feedback tables: %v\n", err)
+		os.Exit(1)
+	}
+
 	os.Exit(m.Run())
+}
+
+func truncateFeedbackTables(ctx context.Context) error {
+	for _, tbl := range []string{"feedback_insights", "feedback_flags"} {
+		if _, err := store.GetDB().Exec(ctx,
+			fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", tbl),
+		); err != nil {
+			// Table may not exist in older schemas — log and continue
+			// rather than fail the whole suite.
+			fmt.Fprintf(os.Stderr, "truncate %s: %v\n", tbl, err)
+		}
+	}
+	return nil
 }
 
 func deriveDSNs(prodDSN string) (string, string, error) {
