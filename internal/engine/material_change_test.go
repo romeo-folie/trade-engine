@@ -151,6 +151,52 @@ func TestCheckMaterialChange(t *testing.T) {
 	}
 }
 
+// TestCheckMaterialChange_FirstTouchAlwaysAnalyses is the regression guard for
+// issue #318: scanner-added tickers must run a full analysis on first
+// appearance. CheckMaterialChange itself is source-agnostic — the engine layer
+// stamps state lazily after analysis, so any genuinely first-touch ticker
+// (scanner or watchlist) presents prev == nil and must return
+// (false, SkipReasonNone). If a future refactor pre-populates prev for any
+// reason, this test will catch it before scanner momentum entries silently
+// regress to NO_MATERIAL_CHANGE skips on cycle one.
+func TestCheckMaterialChange_FirstTouchAlwaysAnalyses(t *testing.T) {
+	now := time.Now()
+	cfg := config.AnalysisConfig{
+		MaterialChangeOnly:    true,
+		HoldCooldownMin:       120,
+		RSIDeltaThreshold:     3.0,
+		EMAGapDeltaPct:        0.5,
+		PriceMoveThresholdPct: 0.75,
+		NewsNoveltyEnabled:    true,
+	}
+
+	// Mirrors what processStock passes for a scanner-fresh ticker like SBET on
+	// first appearance: real indicator values, real news hash, no prior state.
+	in := MaterialChangeInput{
+		RSI:      62.5,
+		EMA20:    18.40,
+		Price:    18.92,
+		NewsHash: "deadbeef",
+		Now:      now,
+	}
+
+	skip, reason, deltas := CheckMaterialChange(nil, in, cfg)
+	if skip {
+		t.Fatalf("first-touch should always analyse (prev == nil); got skip=true reason=%q", reason)
+	}
+	if reason != SkipReasonNone {
+		t.Fatalf("first-touch should yield SkipReasonNone; got %q", reason)
+	}
+	// Deltas map must not contain stale rsi/price/ema entries — those are only
+	// computed when prev != nil. Their presence would indicate state leakage
+	// from a prior run and would point at the persistence bug suspected in #318.
+	for _, k := range []string{"rsi_delta", "ema_gap_delta_pct", "price_move_pct"} {
+		if _, ok := deltas[k]; ok {
+			t.Fatalf("first-touch deltas leaked %q (prev was nil) — value=%v", k, deltas[k])
+		}
+	}
+}
+
 func TestNewsDigestHash(t *testing.T) {
 	h1 := NewsDigestHash([]string{"A", "B"})
 	h2 := NewsDigestHash([]string{"A", "B"})
