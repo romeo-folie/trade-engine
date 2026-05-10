@@ -1,6 +1,7 @@
 package risk
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -337,9 +338,41 @@ func TestCheckAll_ShortCircuitsOnFirstFail(t *testing.T) {
 	if ok {
 		t.Fatal("expected failure")
 	}
-	// Should stop after first failed check.
+	// After the #319 reorder checkPositionOwnership runs first; Action=BUY in
+	// baseInput so ownership passes, then checkConfidence fails and short-
+	// circuits. Expect exactly 2 results: the BUY-side ownership pass, plus
+	// the failing confidence check.
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results (ownership pass + confidence fail), got %d", len(results))
+	}
+	if results[0].Name != "position_ownership" || !results[0].Passed {
+		t.Fatalf("expected position_ownership to pass first, got %+v", results[0])
+	}
+	if results[1].Name != "confidence_threshold" || results[1].Passed {
+		t.Fatalf("expected confidence_threshold to fail second, got %+v", results[1])
+	}
+}
+
+// SELL signals on tickers we don't hold should now block on
+// position_ownership before any other gate gets a chance to flag confidence,
+// R:R, or sizing complaints (#319). Verifies the reorder.
+func TestCheckAll_SellWithoutPositionFailsFirst(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.Ticker = "HIMS"
+	in.HoldsLong = false
+	// Also break R:R and confidence — these should not be the reported reason.
+	in.Confidence = 0.10
+	in.TakeProfit = 100.5 // tiny reward → bad R:R if it ran
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected failure")
+	}
 	if len(results) != 1 {
-		t.Fatalf("expected 1 result (short-circuit), got %d", len(results))
+		t.Fatalf("expected ownership to be the only result, got %d: %+v", len(results), results)
+	}
+	if results[0].Name != "position_ownership" {
+		t.Fatalf("expected first failure to be position_ownership, got %s", results[0].Name)
 	}
 }
 
@@ -350,5 +383,43 @@ func TestBlockReason_ReturnsFirstFailReason(t *testing.T) {
 	reason := BlockReason(results)
 	if reason == "" {
 		t.Fatal("expected non-empty block reason")
+	}
+}
+
+// IsSellOnlyStrategy backs the engine's pre-LLM short-circuit (#319). The
+// canonical SELL-only names (currently a small reserved set) must return
+// true; the default analyst strategies must not, since they emit BUY *or*
+// SELL depending on context and the LLM call is still required.
+func TestIsSellOnlyStrategy(t *testing.T) {
+	sellOnly := []string{"sell_only", "exit_signal", "close_position"}
+	for _, s := range sellOnly {
+		if !IsSellOnlyStrategy(s) {
+			t.Errorf("expected %q to be sell-only", s)
+		}
+	}
+	dualDirection := []string{
+		"trend_following", "mean_reversion", "momentum", "news_sentiment",
+		"", "TREND_FOLLOWING", "unknown",
+	}
+	for _, s := range dualDirection {
+		if IsSellOnlyStrategy(s) {
+			t.Errorf("did not expect %q to be sell-only", s)
+		}
+	}
+}
+
+// NoPositionBlockReason is the canonical reason string both the post-LLM
+// gate and the pre-LLM short-circuit write so dashboards can pattern-match
+// once. The check fixates on the substring "no open long position" which
+// is what existing PR #306 tests already assert against indirectly.
+func TestNoPositionBlockReason_FormatStable(t *testing.T) {
+	reason := NoPositionBlockReason("HIMS")
+	if reason == "" {
+		t.Fatal("expected non-empty reason")
+	}
+	for _, want := range []string{"HIMS", "no open long position", "cannot sell"} {
+		if !strings.Contains(reason, want) {
+			t.Errorf("expected reason to contain %q, got %q", want, reason)
+		}
 	}
 }

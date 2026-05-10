@@ -676,6 +676,38 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		strategy = "trend_following"
 	}
 
+	// Pre-LLM SELL ownership short-circuit (#319). For strategies whose primary
+	// action is SELL (close/exit-only), there is no point asking the analyst
+	// what to do on a ticker we don't hold long: the only valid recommendation
+	// is SELL, which the post-LLM position-ownership gate would then block.
+	// Skipping here saves the full LLM round-trip — input prompt, model output,
+	// arbiter pass — for every such cycle.
+	//
+	// The canonical SELL-only strategy list is defined in risk.IsSellOnlyStrategy
+	// (currently empty; see comment there). For strategies that emit BUY *or*
+	// SELL depending on context (the default trend_following/mean_reversion/
+	// momentum/news_sentiment set), we still need the LLM to pick a direction,
+	// so the short-circuit does not fire.
+	if risk.IsSellOnlyStrategy(strategy) {
+		holdsLong, err := tickerHasOpenLong(ctx, ticker)
+		if err != nil {
+			// On a DB read failure, fall through to the LLM rather than silently
+			// skipping; the post-LLM gate will still block any SELL we cannot
+			// verify. This mirrors how processSignal handles GetOpenTrades errors
+			// for SELL signals.
+			logger.Warn("sell-strategy ownership probe failed — falling through to LLM",
+				"ticker", ticker, "strategy", strategy, "err", err.Error())
+		} else if shouldSkipSellStrategy(strategy, holdsLong) {
+			logger.Info("analysis skipped — no position",
+				"ticker", ticker,
+				"strategy", strategy,
+				"timeframe", timeframe,
+				"reason", "no_position",
+			)
+			return
+		}
+	}
+
 	// Build candle snapshots (most-recent-first for prompt context).
 	// Precedence: strategy window sets the cap (strategy-specific tuning);
 	// MaxCandlesPerPrompt acts as an absolute hard upper bound.
@@ -959,6 +991,35 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// shouldSkipSellStrategy is the pure decision predicate for the pre-LLM
+// SELL ownership short-circuit (#319). Returns true only when the strategy
+// is canonically SELL-only AND the portfolio holds no open long. Extracted
+// from runAnalysis so the decision can be unit-tested without a DB.
+func shouldSkipSellStrategy(strategy string, holdsLong bool) bool {
+	return risk.IsSellOnlyStrategy(strategy) && !holdsLong
+}
+
+// tickerHasOpenLong reports whether the trades store currently has any open
+// long position in the given ticker. Used by the SELL ownership pre-LLM
+// short-circuit (#319) so we can skip the analyst call entirely when a
+// SELL-only strategy is scheduled against a ticker we don't hold.
+//
+// A non-nil error is returned only when the underlying store query fails.
+// Callers fall through to the LLM in that case rather than silently skipping
+// — the post-LLM ownership gate will still block any naked sell.
+func tickerHasOpenLong(ctx context.Context, ticker string) (bool, error) {
+	openTrades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range openTrades {
+		if t.Ticker == ticker && t.Direction == "long" {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // resolveEnricherProvider returns the ModelProvider to use for knowledge
