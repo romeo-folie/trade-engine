@@ -109,11 +109,15 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 
 	// Shuffle to anonymise.
 	indices := rand.Perm(len(successes))
-	labels := []string{"Model-A", "Model-B", "Model-C", "Model-D", "Model-E"}
 	var sb strings.Builder
 	for i, idx := range indices {
 		r := successes[idx]
-		label := labels[i%len(labels)]
+		// Generate enough unique labels for arbitrary ensemble sizes —
+		// previously we cycled a fixed 5-label slice, so a 6-result combined
+		// set (e.g. multi-timeframe re-arbitration with 3 analysts × 2
+		// timeframes) re-used "Model-A" for two distinct results, making the
+		// arbiter prompt ambiguous (Codex P2, Issue #321 PR #336).
+		label := arbiterLabel(i)
 		sb.WriteString(fmt.Sprintf("\n--- %s ---\nAction: %s\nConfidence: %.3f\nSizePct: %.1f%%\n",
 			label, r.Response.Action, r.Response.Confidence, r.Response.SizePct))
 		if r.Response.StopLoss > 0 {
@@ -145,6 +149,20 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		"dissent", dissentSummary != "", "latency_ms", meta.LatencyMs,
 	)
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
+}
+
+// arbiterLabel returns a unique anonymised label for the i-th analyst result
+// in the arbiter prompt: Model-A..Model-Z, then Model-AA..Model-AZ,
+// Model-BA.., etc. Excel-column-style. Unique for any practical ensemble
+// size and never collides for i in [0, 26+26*26]. Issue #321 PR #336.
+func arbiterLabel(i int) string {
+	if i < 26 {
+		return fmt.Sprintf("Model-%c", 'A'+i)
+	}
+	// Two-letter labels for i >= 26.
+	first := (i/26 - 1) % 26
+	second := i % 26
+	return fmt.Sprintf("Model-%c%c", 'A'+first, 'A'+second)
 }
 
 // ─── Majority vote fallback ─────────────────────────────────────────────────────

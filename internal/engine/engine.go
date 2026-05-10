@@ -857,7 +857,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 			logger.Info("multi-tf: borderline WAIT — running alt-timeframe pass",
 				"ticker", ticker, "primary_tf", timeframe, "alt_tf", altTF,
 				"confidence", fmt.Sprintf("%.3f", result.Response.Confidence))
-			if altResult, ok := e.runSecondTimeframePass(ctx, req, altTF, ticker); ok {
+			if altResult, ok := e.runSecondTimeframePass(ctx, req, altTF, ticker, impact); ok {
 				// Charge the alt-pass tokens to a distinct bucket
 				// ("<model>#mtf2") so we can measure marginal cost.
 				e.recordMultiTFCost(altResult)

@@ -56,7 +56,14 @@ func shouldRunSecondPass(cfg config.AnalysisConfig, resp analysis.AnalysisRespon
 		return "", false
 	}
 	alt, ok := cfg.MultiTimeframeAltMap[strings.ToLower(primaryTF)]
-	if !ok || alt == "" {
+	if !ok {
+		return "", false
+	}
+	// Normalise alt value: lowercase + trim whitespace so config like
+	// `1h: "4H"` resolves to "4h" and matches the lowercase candle keys
+	// used downstream (Codex/Copilot review, Issue #321 PR #336).
+	alt = strings.ToLower(strings.TrimSpace(alt))
+	if alt == "" {
 		return "", false
 	}
 	return alt, true
@@ -124,10 +131,21 @@ func (e *Engine) recordMultiTFCost(result analysis.AnalyzeResult) {
 // runSecondTimeframePass loads candles for the alternate timeframe, recomputes
 // indicators, builds an analysis request that mirrors the primary-pass request
 // (same news/strategy/portfolio context, just different timeframe + indicators
-// + candles), and invokes AnalyzeFull. Returns (result, true) on success or
-// (_, false) when alt-timeframe candles are unavailable / insufficient — the
-// caller should then fall back to the original WAIT.
-func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis.AnalysisRequest, altTF string, ticker string) (analysis.AnalyzeResult, bool) {
+// + candles), and fans out to the analysts only. Returns (result, true) on
+// success or (_, false) when alt-timeframe candles are unavailable /
+// insufficient — the caller should then fall back to the original WAIT.
+//
+// We deliberately call AnalyzeEnsembleWithSet rather than AnalyzeFull because
+// the alt pass is only used to collect additional analyst votes; the caller
+// then re-arbitrates over the combined primary+alt set. Calling AnalyzeFull
+// here would spend an extra arbiter call (LLM cost + latency) on every
+// borderline WAIT whose result is then discarded (Codex P2 / Copilot review,
+// Issue #321 PR #336).
+//
+// `impact` is threaded through from the primary pass so the alt fan-out runs
+// at the same adaptive depth tier as the primary — otherwise the alt pass
+// would always consult every provider regardless of impact (Copilot review).
+func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis.AnalysisRequest, altTF string, ticker string, impact depth.ImpactScore) (analysis.AnalyzeResult, bool) {
 	historyFrom := time.Now().AddDate(-2, 0, 0)
 	candles, err := store.GetCandles(ctx, ticker, data.Timeframe(altTF), historyFrom, time.Now())
 	if err != nil {
@@ -194,37 +212,52 @@ func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis
 		VolRatio: volRatio(candles, set.VolumeSMA20),
 	}
 
-	// Reuse same impact score (depth) — the second pass is on the same ticker
-	// and we don't want depth filtering to reduce analysts to a single one and
-	// silently change ensemble shape mid-flight.
-	altResult, err := e.analyzer.AnalyzeFull(ctx, altReq, depth.ImpactScore{Depth: len(e.analyzer.Providers())})
+	// Reuse the primary pass's impact score so the alt fan-out runs at the
+	// same adaptive depth tier — otherwise alt would always consult every
+	// provider regardless of impact (Copilot review, Issue #321 PR #336).
+	//
+	// We call AnalyzeEnsembleWithSet directly (not AnalyzeFull) so the alt
+	// pass produces analyst votes only — no per-timeframe arbiter call. The
+	// caller re-arbitrates once over the combined primary+alt set, so a
+	// per-timeframe arbiter here would be discarded LLM spend (Codex P2).
+	providers := e.analyzer.Providers()
+	activeAnalysts := providers
+	if impact.Depth > 0 && impact.Depth < len(providers) {
+		activeAnalysts = providers[:impact.Depth]
+	}
+	if len(activeAnalysts) == 0 {
+		logger.Debug("multi-tf: no analysts available for alt pass — falling back",
+			"ticker", ticker, "alt_tf", altTF)
+		return analysis.AnalyzeResult{}, false
+	}
+	altAnalysts, err := e.analyzer.AnalyzeEnsembleWithSet(ctx, altReq, activeAnalysts)
 	if err != nil {
-		// AnalyzeFull can return a non-nil result alongside a non-nil error in
-		// partial-failure cases. We log and check below whether the result is
-		// usable; if not we fall back.
+		// AnalyzeEnsembleWithSet returns a non-nil slice alongside an error
+		// when fewer than 2 analysts succeeded. Log and check usability.
 		logger.Warn("multi-tf: alt-timeframe analysis returned error",
 			"ticker", ticker, "alt_tf", altTF, "err", err.Error())
-		if len(altResult.AnalystResults) == 0 {
+		if len(altAnalysts) == 0 {
 			return analysis.AnalyzeResult{}, false
 		}
 	}
-	return altResult, true
+	return analysis.AnalyzeResult{AnalystResults: altAnalysts}, true
 }
 
-// reArbitrate runs the arbiter over the combined analyst set when one is
-// configured; otherwise it falls back to majority vote across the combined
-// set. This keeps the same arbiter shape used by the primary pass.
+// reArbitrate runs the configured arbiter over the combined analyst set and
+// returns the synthesised result. When no arbiter is configured (or the
+// arbiter is unavailable) it returns an error so the caller can preserve the
+// original WAIT. There is intentionally no majority-vote fallback here:
+// majorityVote lives in internal/analysis and is unexported, and a borderline
+// re-arbitration without a real arbiter would simply re-emit a WAIT-tilted
+// vote, which is what we already had.
 func reArbitrate(ctx context.Context, analyzer *analysis.Analyzer, req analysis.AnalysisRequest, combined []analysis.AnalystResult) (analysis.AnalyzeResult, error) {
 	if analyzer == nil {
 		return analysis.AnalyzeResult{}, fmt.Errorf("nil analyzer")
 	}
 	arb := analyzer.Arbiter()
 	if arb == nil || !arb.IsAvailable() {
-		// No arbiter — let the analyzer's existing exported helpers handle it.
-		// MajorityVote is unexported; we synthesise an AnalyzeResult by picking
-		// the first successful response as a fallback. The caller decides how
-		// to surface this; the failure path is well-tested in ensemble.go.
-		// We surface it as an error so the caller can keep the original WAIT.
+		// No arbiter configured/available — surface as an error so the caller
+		// keeps the original WAIT instead of inventing a fallback signal.
 		return analysis.AnalyzeResult{AnalystResults: combined}, fmt.Errorf("no arbiter available for re-arbitration")
 	}
 	arbResult, err := analysis.Arbitrate(ctx, arb, req, combined)

@@ -109,6 +109,37 @@ func TestShouldRunSecondPass_TimeframeCaseInsensitive(t *testing.T) {
 	}
 }
 
+// TestShouldRunSecondPass_AltValueNormalised: when config has an uppercase or
+// space-padded alt value (e.g. `1h: " 4H "`), the returned alt must be
+// lowercase + trimmed so downstream candle lookups (which use lowercase
+// timeframe strings) hit the right rows. Issue #321 PR #336 (Copilot).
+func TestShouldRunSecondPass_AltValueNormalised(t *testing.T) {
+	cfg := borderlineCfg()
+	cfg.MultiTimeframeAltMap = map[string]string{
+		"1h": " 4H ",
+		"4h": "1D",
+	}
+	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.62}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "1h", false); !ok || alt != "4h" {
+		t.Fatalf("expected normalised alt=4h, got alt=%q ok=%v", alt, ok)
+	}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "4h", false); !ok || alt != "1d" {
+		t.Fatalf("expected normalised alt=1d, got alt=%q ok=%v", alt, ok)
+	}
+}
+
+// TestShouldRunSecondPass_WhitespaceOnlyAltSkipped: a whitespace-only alt
+// value normalises to "" and must skip rather than fire a doomed candle
+// lookup. Issue #321 PR #336.
+func TestShouldRunSecondPass_WhitespaceOnlyAltSkipped(t *testing.T) {
+	cfg := borderlineCfg()
+	cfg.MultiTimeframeAltMap = map[string]string{"1h": "   "}
+	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.62}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "1h", false); ok || alt != "" {
+		t.Fatalf("expected whitespace-only alt to skip, got alt=%q ok=%v", alt, ok)
+	}
+}
+
 func TestCombineForArbiter_TagsReasoningWithTimeframe(t *testing.T) {
 	primary := []analysis.AnalystResult{
 		{Provider: "p1", Model: "m1", Response: analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.6, Reasoning: "primary reasoning"}},
