@@ -60,6 +60,7 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 		checkPositionOwnership,
 		checkRiskReward,
 		checkPositionSize,
+		checkMaxDollarRisk,
 		checkMaxOpenPositions,
 		checkMaxPerTicker,
 		checkDailyLossLimit,
@@ -124,6 +125,34 @@ func checkPositionSize(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("size_pct %.1f%% > max %.1f%%",
 		in.SizePct, in.Cfg.MaxPositionPct))
+}
+
+// checkMaxDollarRisk enforces a hard cap on per-trade dollar at risk
+// (qty × |entry − stop|) as a percent of portfolio equity (#320). This is
+// independent of checkPositionSize, which caps notional exposure: a small
+// notional with a far stop can still risk more than acceptable, and a large
+// notional with a tight stop can risk less. Both gates protect against
+// different failure modes.
+//
+// Skipped when PortfolioValue == 0 (mirrors checkDailyLossLimit) or when
+// MaxDollarRiskPct <= 0 (treat as disabled to keep older configs safe).
+// Zero stop-distance is already caught upstream by checkRiskReward.
+func checkMaxDollarRisk(in CheckInput) CheckResult {
+	name := "max_dollar_risk"
+	if in.PortfolioValue == 0 || in.Cfg.MaxDollarRiskPct <= 0 {
+		return pass(name)
+	}
+	if in.SignalPrice <= 0 {
+		return pass(name)
+	}
+	qty := (in.SizePct / 100) * in.PortfolioValue / in.SignalPrice
+	dollarAtRisk := qty * math.Abs(in.SignalPrice-in.StopLoss)
+	riskPct := dollarAtRisk / in.PortfolioValue * 100
+	if riskPct <= in.Cfg.MaxDollarRiskPct {
+		return pass(name)
+	}
+	return fail(name, fmt.Sprintf("$-at-risk %.2f%% > limit %.2f%%",
+		riskPct, in.Cfg.MaxDollarRiskPct))
 }
 
 func checkMaxOpenPositions(in CheckInput) CheckResult {

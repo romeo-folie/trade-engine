@@ -14,6 +14,7 @@ func defaultCfg() config.RiskConfig {
 		MaxPositionPct:      5.0,
 		MaxOpenPositions:    10,
 		MaxPerTicker:        2,
+		MaxDollarRiskPct:    1.0,
 		DailyLossLimitPct:   3.0,
 		MaxDrawdownPct:      10.0,
 		CooldownAfterLoss:   30,
@@ -144,6 +145,55 @@ func TestPositionSize_Fail(t *testing.T) {
 	in := baseInput()
 	in.SizePct = 6.0
 	assertFails(t, checkPositionSize, in)
+}
+
+// ── Max dollar at risk (#320) ─────────────────────────────────────────────────
+
+func TestMaxDollarRisk_PassWellUnderCap(t *testing.T) {
+	// baseInput: qty = (2/100)*10000/100 = 2; risk per share = 5; $@risk = 10
+	// pct = 0.10% << 1.0% cap → pass
+	assertPasses(t, checkMaxDollarRisk, baseInput())
+}
+
+func TestMaxDollarRisk_AtCapExactlyPasses(t *testing.T) {
+	in := baseInput()
+	// qty = (2/100)*10000/100 = 2; |100-50| = 50; $@risk = 100
+	// pct = 100/10000*100 = 1.00% == 1.0% cap → pass
+	in.SignalPrice = 100.0
+	in.StopLoss = 50.0
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+func TestMaxDollarRisk_OneBasisPointOverFails(t *testing.T) {
+	in := baseInput()
+	// |100-49.99| = 50.01; $@risk = 100.02; pct = 1.0002% > 1.0% → fail
+	in.SignalPrice = 100.0
+	in.StopLoss = 49.99
+	r := assertFails(t, checkMaxDollarRisk, in)
+	if r.Name != "max_dollar_risk" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
+	// Block reason format: "$-at-risk %.2f%% > limit %.2f%%"
+	want := "$-at-risk 1.00% > limit 1.00%"
+	if r.Reason != want {
+		t.Fatalf("block reason mismatch:\n  got:  %q\n  want: %q", r.Reason, want)
+	}
+}
+
+func TestMaxDollarRisk_PortfolioValueZeroPasses(t *testing.T) {
+	in := baseInput()
+	in.PortfolioValue = 0
+	in.SignalPrice = 100.0
+	in.StopLoss = 50.0 // would be at cap if portfolio were nonzero
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+func TestMaxDollarRisk_DisabledWhenZero(t *testing.T) {
+	in := baseInput()
+	in.Cfg.MaxDollarRiskPct = 0
+	in.SignalPrice = 100.0
+	in.StopLoss = 1.0 // wildly over a 1% cap, but cap is disabled
+	assertPasses(t, checkMaxDollarRisk, in)
 }
 
 // ── Max open positions ────────────────────────────────────────────────────────
