@@ -1251,7 +1251,19 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 
 	var holdsLong bool
 	var longQuantity float64
+	// Count distinct (ticker, direction) pairs so multiple consolidated rows
+	// for the same instrument don't inflate the open-positions budget (#312).
+	// Also build a per-ticker count restricted to the incoming signal's
+	// direction so the per-ticker cap can be enforced independently.
+	positions := make(map[string]struct{}, len(openTrades))
+	byTicker := make(map[string]int, len(openTrades))
 	for _, t := range openTrades {
+		key := t.Ticker + "|" + string(t.Direction)
+		positions[key] = struct{}{}
+		if (resp.Action == "BUY" && t.Direction == "long") ||
+			(resp.Action == "SELL" && t.Direction == "short") {
+			byTicker[t.Ticker]++
+		}
 		if t.Ticker == ticker && t.Direction == "long" {
 			holdsLong = true
 			longQuantity += t.Quantity
@@ -1269,7 +1281,8 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		SignalPrice:    signalPrice,
 		PortfolioValue: pState.TotalValue,
 		Cash:           pState.Cash,
-		OpenPositions:  len(openTrades),
+		OpenPositions:  len(positions),
+		OpenByTicker:   byTicker,
 		DailyPnL:       pState.RealizedPnLDay,
 		PeakValue:      pState.PeakValue,
 		LastLossAt:     pState.LastLossAt,

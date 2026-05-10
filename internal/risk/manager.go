@@ -28,6 +28,11 @@ type CheckInput struct {
 	PortfolioValue float64
 	Cash           float64
 	OpenPositions  int
+	// OpenByTicker holds the number of open positions in each ticker, counted
+	// in the same direction as the incoming signal (longs for BUY, shorts for
+	// SELL). Consumed by checkMaxPerTicker (#312). May be nil; checks treat a
+	// missing key as 0.
+	OpenByTicker   map[string]int
 	DailyPnL       float64   // realised P&L today (negative = loss)
 	PeakValue      float64   // for drawdown calculation
 	LastLossAt     time.Time // last time a losing trade closed
@@ -56,6 +61,7 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 		checkRiskReward,
 		checkPositionSize,
 		checkMaxOpenPositions,
+		checkMaxPerTicker,
 		checkDailyLossLimit,
 		checkMaxDrawdown,
 		checkCooldownAfterLoss,
@@ -127,6 +133,24 @@ func checkMaxOpenPositions(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("open positions %d >= limit %d",
 		in.OpenPositions, in.Cfg.MaxOpenPositions))
+}
+
+// checkMaxPerTicker caps the number of open positions per ticker in the
+// signal's direction (#312). Skipped when Cfg.MaxPerTicker <= 0; the
+// default in Defaults() is 0 so older configs without the new key upgrade
+// safely without unexpected blocks. Opt in by setting a positive value
+// (risk.max_per_ticker) in your config — config.example.yaml recommends 2.
+func checkMaxPerTicker(in CheckInput) CheckResult {
+	name := "max_per_ticker"
+	if in.Cfg.MaxPerTicker <= 0 {
+		return pass(name)
+	}
+	count := in.OpenByTicker[in.Ticker]
+	if count < in.Cfg.MaxPerTicker {
+		return pass(name)
+	}
+	return fail(name, fmt.Sprintf("open positions in %s reach per-ticker limit %d",
+		in.Ticker, in.Cfg.MaxPerTicker))
 }
 
 func checkDailyLossLimit(in CheckInput) CheckResult {
