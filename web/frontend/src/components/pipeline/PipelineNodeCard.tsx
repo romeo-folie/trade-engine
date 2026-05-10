@@ -341,8 +341,26 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                         </div>
                         <div>
                           <div className={styles.subValue}>POSITIONS</div>
-                          <div className={styles.kindLabel} style={{ color: '#fff' }}>
+                          {/*
+                            Render the canonical distinct-ticker count.
+                            When the underlying DB row count diverges, surface it
+                            in parentheses so drift is immediately visible to the
+                            operator (Issue #315). After Epic A (#311/#312/#313)
+                            is fully deployed, the two numbers should agree in
+                            steady state and the parenthetical will be hidden.
+                          */}
+                          <div
+                            className={styles.kindLabel}
+                            style={{ color: '#fff' }}
+                            title="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
+                            aria-label="Distinct tickers / total open trade rows. Divergence indicates pending consolidation work."
+                          >
                             {ps.openPositions}
+                            {ps.openTradeRows != null && ps.openTradeRows !== ps.openPositions && (
+                              <span style={{ color: colors.acidGreen, marginLeft: 4, fontSize: 9 }}>
+                                ({ps.openTradeRows} rows)
+                              </span>
+                            )}
                           </div>
                         </div>
                       </div>
