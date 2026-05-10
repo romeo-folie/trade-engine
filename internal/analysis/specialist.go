@@ -51,9 +51,6 @@ type specialistResult struct {
 // Confidence is the average over returning roles. Reasoning is concatenated
 // per-role and prefixed by the role label so downstream UI can split it back.
 func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _ depth.ImpactScore) (AnalyzeResult, error) {
-	roleMap := a.cfg.Roles // for adaptive-depth bus payloads only — not used here
-	_ = roleMap
-
 	specialistCfg := a.specialistRolesConfig()
 	if len(specialistCfg) == 0 {
 		return AnalyzeResult{}, fmt.Errorf("specialist mode enabled but analysis.specialist_roles is empty")
