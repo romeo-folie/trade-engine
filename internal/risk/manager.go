@@ -159,10 +159,22 @@ func checkConfidenceTiered(in CheckInput) CheckResult {
 }
 
 // computeRR derives the trade's R:R ratio from CheckInput. Returns (0, false)
-// when stop/TP/price are missing or when risk is zero.
+// when stop/TP/price are missing, when risk is zero, or when BUY geometry is
+// inverted (stop at-or-above entry, target at-or-below entry).
+//
+// SELL is exit-only in this codebase (see checkPositionOwnership and the
+// checkMaxDollarRisk SELL skip), and analyst SELL signals can ship inverted
+// stop/target relative to a pure short setup. To avoid spuriously rejecting
+// legitimate exits we keep the existing math.Abs semantics for SELL and only
+// enforce geometry on BUY (the side that actually opens new risk).
 func computeRR(in CheckInput) (float64, bool) {
 	if in.StopLoss == 0 || in.TakeProfit == 0 || in.SignalPrice == 0 {
 		return 0, false
+	}
+	if in.Action == "BUY" {
+		if in.StopLoss >= in.SignalPrice || in.TakeProfit <= in.SignalPrice {
+			return 0, false
+		}
 	}
 	risk := math.Abs(in.SignalPrice - in.StopLoss)
 	reward := math.Abs(in.TakeProfit - in.SignalPrice)
@@ -177,6 +189,20 @@ func checkRiskReward(in CheckInput) CheckResult {
 	if in.StopLoss == 0 || in.TakeProfit == 0 {
 		// No stop/TP provided — skip R:R check.
 		return pass(name)
+	}
+	// Validate BUY geometry before taking absolute values: an inverted long
+	// setup (stop >= entry or target <= entry) would otherwise yield a
+	// positive R:R via math.Abs and pass the gate, only to fire its stop
+	// immediately at execution because the engine treats StopLoss as a long
+	// stop that triggers on price <= stop. SELL is exit-only and skipped to
+	// preserve the legacy math.Abs behaviour for analyst exit signals.
+	if in.Action == "BUY" {
+		if in.StopLoss >= in.SignalPrice || in.TakeProfit <= in.SignalPrice {
+			return fail(name, fmt.Sprintf(
+				"invalid SL/TP geometry for BUY (stop %.2f >= signal %.2f or take_profit %.2f <= signal %.2f)",
+				in.StopLoss, in.SignalPrice, in.TakeProfit, in.SignalPrice,
+			))
+		}
 	}
 	risk := math.Abs(in.SignalPrice - in.StopLoss)
 	reward := math.Abs(in.TakeProfit - in.SignalPrice)

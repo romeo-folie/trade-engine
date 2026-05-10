@@ -286,6 +286,70 @@ func TestRiskReward_SkipWhenNoStopLoss(t *testing.T) {
 	assertPasses(t, checkRiskReward, in)
 }
 
+// Inverted long setup: stop sits above entry. With math.Abs alone this would
+// produce a positive R:R and pass the gate, then the engine's long-stop
+// trigger (price <= stop) would fire immediately at execution. The geometry
+// guard rejects upfront with an actionable reason.
+func TestRiskReward_BuyWithStopAboveSignal_Fails(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 105
+	in.TakeProfit = 110
+	r := assertFails(t, checkRiskReward, in)
+	if !strings.Contains(r.Reason, "invalid SL/TP geometry for BUY") {
+		t.Fatalf("expected geometry reason, got %q", r.Reason)
+	}
+}
+
+func TestRiskReward_BuyWithTakeProfitBelowSignal_Fails(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 98
+	r := assertFails(t, checkRiskReward, in)
+	if !strings.Contains(r.Reason, "invalid SL/TP geometry for BUY") {
+		t.Fatalf("expected geometry reason, got %q", r.Reason)
+	}
+}
+
+func TestRiskReward_BuyValidGeometry_Passes(t *testing.T) {
+	in := baseInput()
+	in.Action = "BUY"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 110
+	assertPasses(t, checkRiskReward, in)
+	rr, ok := computeRR(in)
+	if !ok {
+		t.Fatalf("expected computeRR to succeed for valid BUY geometry")
+	}
+	if rr != 2.0 {
+		t.Fatalf("expected R:R=2.0, got %.2f", rr)
+	}
+}
+
+// SELL is exit-only in this codebase. Analyst SELL signals can ship with
+// long-perspective stop/target geometry; we deliberately keep the legacy
+// math.Abs semantics for SELL so legitimate exits aren't blocked by the new
+// BUY-only geometry guard.
+func TestRiskReward_SellWithMath_Abs_PreservedBehavior(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	in.SignalPrice = 100
+	in.StopLoss = 95
+	in.TakeProfit = 110
+	assertPasses(t, checkRiskReward, in)
+	rr, ok := computeRR(in)
+	if !ok {
+		t.Fatalf("expected computeRR to succeed for SELL with math.Abs semantics")
+	}
+	if rr != 2.0 {
+		t.Fatalf("expected R:R=2.0 via math.Abs for SELL, got %.2f", rr)
+	}
+}
+
 // ── Position size ─────────────────────────────────────────────────────────────
 
 func TestPositionSize_Pass(t *testing.T) {
