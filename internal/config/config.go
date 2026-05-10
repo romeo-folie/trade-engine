@@ -254,8 +254,9 @@ type AnalysisConfig struct {
 
 	// SpecialistModeEnabled toggles the 4-role specialist arbiter path
 	// (Issue #323, inspired by Grok 4.20's Alpha Arena 4-agent debate).
-	// When true, AnalyzeFull routes to AnalyzeSpecialist instead of the
-	// duplicate-prompt ensemble. Default: false (safe-rollout).
+	// When true, the engine routes signal-generation calls to
+	// AnalyzeSpecialist instead of AnalyzeFull. AnalyzeFull itself is
+	// unchanged. Default: false (safe-rollout).
 	SpecialistModeEnabled bool `yaml:"specialist_mode_enabled"`
 
 	// SpecialistRoles maps each specialist role name to a registry key in
