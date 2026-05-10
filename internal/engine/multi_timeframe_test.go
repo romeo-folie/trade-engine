@@ -1,12 +1,15 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
+	"github.com/romeo-folie/trade-engine/internal/data"
 )
 
 func borderlineCfg() config.AnalysisConfig {
@@ -218,6 +221,121 @@ func TestRecordMultiTFCost_NilTrackerSafe(t *testing.T) {
 	e := &Engine{}
 	// Must not panic.
 	e.recordMultiTFCost(analysis.AnalyzeResult{})
+}
+
+// TestShouldRunSecondPass_AltSelfLoopSkipped: when the alt-map points a
+// timeframe at itself (e.g. mis-config `1h: "1h"`), the second pass would
+// re-analyse the same timeframe — doubling token cost for zero new
+// information. Skip rather than fire. Issue #321 PR #336 (Copilot review).
+func TestShouldRunSecondPass_AltSelfLoopSkipped(t *testing.T) {
+	cfg := borderlineCfg()
+	cfg.MultiTimeframeAltMap = map[string]string{"1h": "1h"}
+	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.62}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "1h", false); ok {
+		t.Fatalf("expected self-loop alt mapping to skip, got alt=%q ok=true", alt)
+	}
+	// Case-insensitive variant: "1H" → "1h" still considered self-loop.
+	cfg.MultiTimeframeAltMap = map[string]string{"1h": " 1H "}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "1h", false); ok {
+		t.Fatalf("expected normalised self-loop to skip, got alt=%q ok=true", alt)
+	}
+}
+
+// TestLoadAltCandles_FetcherInvokedBeforeLoad asserts the on-demand fetch
+// runs before the loader reads, so the alt-tf bars are fresh even when the
+// watchlist item didn't list the alt timeframe. Issue #321 PR #336 (Copilot).
+func TestLoadAltCandles_FetcherInvokedBeforeLoad(t *testing.T) {
+	var order []string
+	fetcher := func(_ context.Context, ticker string, tf data.Timeframe) {
+		if ticker != "AAPL" || tf != data.Timeframe("4h") {
+			t.Errorf("fetcher called with wrong args: ticker=%q tf=%q", ticker, tf)
+		}
+		order = append(order, "fetch")
+	}
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		order = append(order, "load")
+		// Return enough fresh candles to pass the warmup gate.
+		out := make([]data.Candle, 25)
+		now := time.Now().UTC()
+		for i := range out {
+			out[i] = data.Candle{Ticker: "AAPL", Timeframe: "4h", Timestamp: now.Add(-time.Duration(25-i) * 4 * time.Hour), Close: 100, Open: 100, High: 101, Low: 99, Volume: 1000}
+		}
+		return out, nil
+	}
+	candles, ok := loadAltCandles(context.Background(), "AAPL", "4h", fetcher, loader)
+	if !ok {
+		t.Fatalf("expected ok=true with fresh candles available")
+	}
+	if len(candles) != 25 {
+		t.Fatalf("expected 25 candles, got %d", len(candles))
+	}
+	if len(order) != 2 || order[0] != "fetch" || order[1] != "load" {
+		t.Fatalf("expected fetch-then-load ordering, got %v", order)
+	}
+}
+
+// TestLoadAltCandles_FetchFreshBars: when the loader returns enough
+// candles after the on-demand fetch, the helper proceeds. This is the
+// "fresh after fetch" branch — proves the fetch closes the staleness gap.
+func TestLoadAltCandles_FetchFreshBars(t *testing.T) {
+	var fetchCalls int
+	fetcher := func(_ context.Context, _ string, _ data.Timeframe) { fetchCalls++ }
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		// Simulate the fetch having just upserted fresh bars.
+		out := make([]data.Candle, 30)
+		for i := range out {
+			out[i].Timestamp = time.Now().UTC().Add(-time.Duration(30-i) * time.Hour)
+		}
+		return out, nil
+	}
+	if _, ok := loadAltCandles(context.Background(), "AAPL", "1h", fetcher, loader); !ok {
+		t.Fatalf("expected ok=true after fresh fetch")
+	}
+	if fetchCalls != 1 {
+		t.Fatalf("expected exactly 1 fetch call, got %d", fetchCalls)
+	}
+}
+
+// TestLoadAltCandles_StillStaleAfterFetchSkips: if the on-demand fetch fails
+// upstream and the loader returns too few bars, we must not push outdated
+// data into the arbiter — fall back to the original WAIT (return ok=false).
+func TestLoadAltCandles_StillStaleAfterFetchSkips(t *testing.T) {
+	fetcher := func(_ context.Context, _ string, _ data.Timeframe) {} // simulated no-op fetch
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		// Only 5 bars available — below the 20-bar warmup threshold.
+		return make([]data.Candle, 5), nil
+	}
+	if _, ok := loadAltCandles(context.Background(), "AAPL", "1h", fetcher, loader); ok {
+		t.Fatalf("expected ok=false when alt candles remain insufficient after fetch")
+	}
+}
+
+// TestLoadAltCandles_LoaderErrorFallsBack: a transient DB error surfacing
+// from the loader must short-circuit to fallback (no panic, ok=false).
+func TestLoadAltCandles_LoaderErrorFallsBack(t *testing.T) {
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		return nil, errors.New("db down")
+	}
+	if _, ok := loadAltCandles(context.Background(), "AAPL", "1h", nil, loader); ok {
+		t.Fatalf("expected ok=false on loader error")
+	}
+}
+
+// TestLoadAltCandles_NilFetcherStillLoads: when no fetcher is wired (e.g.
+// engines constructed in test fixtures), loadAltCandles must still attempt
+// the load rather than silently no-op.
+func TestLoadAltCandles_NilFetcherStillLoads(t *testing.T) {
+	var loadCalls int
+	loader := func(_ context.Context, _ string, _ data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+		loadCalls++
+		return make([]data.Candle, 25), nil
+	}
+	if _, ok := loadAltCandles(context.Background(), "AAPL", "1h", nil, loader); !ok {
+		t.Fatalf("expected ok=true with nil fetcher and sufficient candles")
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected exactly 1 load call, got %d", loadCalls)
+	}
 }
 
 func TestShouldRunSecondPass_ZeroBandSkipped(t *testing.T) {

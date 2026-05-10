@@ -102,6 +102,15 @@ type Engine struct {
 	lastDailySummaryUpdate time.Time
 
 	feedbackReviewer *feedback.Reviewer
+
+	// multiTFCandleFetcher is the on-demand fetch path used by the borderline
+	// re-arbitration alt pass (Issue #321 PR #336). Watchlist-driven refresh
+	// only fetches the timeframes listed on the item, so an alt-tf candle
+	// store would otherwise go stale and the second pass would re-arbitrate
+	// over outdated bars. This field lets the alt pass proactively refresh
+	// the alt timeframe before reading. Defaults to fetchAndStoreCandles;
+	// tests override it to avoid network/DB.
+	multiTFCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -193,6 +202,11 @@ func New(cfg *config.Config, market data.MarketDataProvider, news data.NewsProvi
 		costGuardrail:     guardrail,
 		activeCostProfile: cfg.Cost.Profile,
 	}
+
+	// Default the multi-tf alt-pass fetcher to the production candle fetch path.
+	// Tests override this field directly to avoid network/DB. See Issue #321
+	// PR #336 fix for stale alt-tf candles.
+	e.multiTFCandleFetcher = e.fetchAndStoreCandles
 
 	if cfg.Feedback.Enabled && store.IsConnected() {
 		e.feedbackReviewer = feedback.NewReviewer(cfg.Feedback, bus, store.GetDB())

@@ -55,7 +55,8 @@ func shouldRunSecondPass(cfg config.AnalysisConfig, resp analysis.AnalysisRespon
 	if cfg.MultiTimeframeAltMap == nil {
 		return "", false
 	}
-	alt, ok := cfg.MultiTimeframeAltMap[strings.ToLower(primaryTF)]
+	primaryNorm := strings.ToLower(strings.TrimSpace(primaryTF))
+	alt, ok := cfg.MultiTimeframeAltMap[primaryNorm]
 	if !ok {
 		return "", false
 	}
@@ -64,6 +65,13 @@ func shouldRunSecondPass(cfg config.AnalysisConfig, resp analysis.AnalysisRespon
 	// used downstream (Codex/Copilot review, Issue #321 PR #336).
 	alt = strings.ToLower(strings.TrimSpace(alt))
 	if alt == "" {
+		return "", false
+	}
+	// Self-loop guard: if the alt timeframe equals the primary (e.g. mis-config
+	// `1h: "1h"`), running a second pass would re-analyse the same timeframe,
+	// doubling token cost for no new information. Skip rather than silently
+	// burn tokens (Copilot review, Issue #321 PR #336).
+	if alt == primaryNorm {
 		return "", false
 	}
 	return alt, true
@@ -145,17 +153,46 @@ func (e *Engine) recordMultiTFCost(result analysis.AnalyzeResult) {
 // `impact` is threaded through from the primary pass so the alt fan-out runs
 // at the same adaptive depth tier as the primary — otherwise the alt pass
 // would always consult every provider regardless of impact (Copilot review).
-func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis.AnalysisRequest, altTF string, ticker string, impact depth.ImpactScore) (analysis.AnalyzeResult, bool) {
+// altCandleFetcher refreshes alt-timeframe candles into the candle store
+// (matches the production fetchAndStoreCandles signature).
+type altCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
+
+// altCandleLoader reads alt-timeframe candles from the candle store
+// (matches store.GetCandles).
+type altCandleLoader func(ctx context.Context, ticker string, tf data.Timeframe, from, to time.Time) ([]data.Candle, error)
+
+// loadAltCandles refreshes the alt-timeframe candles via fetcher (when
+// provided) and then loads them via loader. Returns (candles, true) when at
+// least 20 candles are available — enough for the indicator warmup the alt
+// pass needs. Returns (_, false) on load error or insufficient bar count so
+// the caller falls back to the original WAIT.
+//
+// The fetcher seam exists to fix Issue #321 PR #336 (Copilot): the engine
+// only refreshes candles for timeframes listed on the watchlist item, so
+// alt-tf candles can go stale between ticks. Refreshing on demand here
+// ensures the second pass always re-arbitrates over fresh data.
+func loadAltCandles(ctx context.Context, ticker, altTF string, fetcher altCandleFetcher, loader altCandleLoader) ([]data.Candle, bool) {
+	if fetcher != nil {
+		fetcher(ctx, ticker, data.Timeframe(altTF))
+	}
 	historyFrom := time.Now().AddDate(-2, 0, 0)
-	candles, err := store.GetCandles(ctx, ticker, data.Timeframe(altTF), historyFrom, time.Now())
+	candles, err := loader(ctx, ticker, data.Timeframe(altTF), historyFrom, time.Now())
 	if err != nil {
 		logger.Debug("multi-tf: alt candles fetch failed — falling back",
 			"ticker", ticker, "alt_tf", altTF, "err", err.Error())
-		return analysis.AnalyzeResult{}, false
+		return nil, false
 	}
 	if len(candles) < 20 {
 		logger.Debug("multi-tf: insufficient alt-timeframe candles — falling back",
 			"ticker", ticker, "alt_tf", altTF, "count", len(candles))
+		return nil, false
+	}
+	return candles, true
+}
+
+func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis.AnalysisRequest, altTF string, ticker string, impact depth.ImpactScore) (analysis.AnalyzeResult, bool) {
+	candles, ok := loadAltCandles(ctx, ticker, altTF, e.multiTFCandleFetcher, store.GetCandles)
+	if !ok {
 		return analysis.AnalyzeResult{}, false
 	}
 	set, err := indicators.Compute(candles)
