@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func TestMain(m *testing.M) {
@@ -262,6 +263,61 @@ func TestHandleSystemRestart_OKTriggersSignal(t *testing.T) {
 		// ok
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("expected restart signal to be triggered")
+	}
+}
+
+// ─── countDistinctOpenPositions ──────────────────────────────────────────────
+
+func TestCountDistinctOpenPositions(t *testing.T) {
+	cases := []struct {
+		name   string
+		trades []store.Trade
+		want   int
+	}{
+		{"empty", nil, 0},
+		{"single", []store.Trade{{Ticker: "AAPL", Direction: "long"}}, 1},
+		{
+			// 8 JMIA-shape rows that all collapse to a single (ticker,direction).
+			"duplicates collapse",
+			[]store.Trade{
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+				{Ticker: "JMIA", Direction: "long"},
+			},
+			1,
+		},
+		{
+			// Same ticker, opposite directions count as two positions.
+			"long and short same ticker",
+			[]store.Trade{
+				{Ticker: "TSLA", Direction: "long"},
+				{Ticker: "TSLA", Direction: "short"},
+			},
+			2,
+		},
+		{
+			// Mix of distinct tickers and a duplicate.
+			"mixed distinct",
+			[]store.Trade{
+				{Ticker: "AAPL", Direction: "long"},
+				{Ticker: "MSFT", Direction: "long"},
+				{Ticker: "AAPL", Direction: "long"},
+				{Ticker: "NVDA", Direction: "short"},
+			},
+			3,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := countDistinctOpenPositions(c.trades); got != c.want {
+				t.Errorf("countDistinctOpenPositions(%v) = %d, want %d", c.trades, got, c.want)
+			}
+		})
 	}
 }
 
