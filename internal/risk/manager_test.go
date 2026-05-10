@@ -71,6 +71,123 @@ func TestConfidence_Fail(t *testing.T) {
 	}
 }
 
+// ── Tiered confidence (#317) ─────────────────────────────────────────────────
+
+func tieredCfg() config.RiskConfig {
+	cfg := defaultCfg()
+	cfg.MinRiskReward = 1.4
+	cfg.ConfidenceTiers = []config.ConfidenceTier{
+		{RRMin: 2.0, ConfMin: 0.60},
+		{RRMin: 1.4, ConfMin: 0.65},
+	}
+	return cfg
+}
+
+// High R:R band: R:R >= 2.0 → conf floor 0.60. A 0.62 confidence trade that
+// would have been rejected by the 0.65 static floor must now pass.
+func TestConfidenceTiered_HighRR_LooserConfFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	// reward=10, risk=5 → R:R=2.0 (matches first tier exactly).
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Mid R:R band (1.4 ≤ R:R < 2.0): conf floor stays at 0.65. A 0.62 confidence
+// trade is rejected with the new tier-aware reason string.
+func TestConfidenceTiered_MidRR_StricterConfFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	// reward=7.5, risk=5 → R:R=1.5 (mid tier).
+	in.TakeProfit = 107.5
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "tier-required 0.65") || !contains(r.Reason, "R:R 1.50") {
+		t.Fatalf("expected reason to mention tier-required floor and R:R, got %q", r.Reason)
+	}
+}
+
+// Mid R:R band: 0.66 confidence clears the 0.65 tier floor.
+func TestConfidenceTiered_MidRR_PassesAtTierFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.66
+	in.TakeProfit = 107.5 // R:R = 1.5
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Below every tier (R:R < 1.4): confidence_threshold static floor applies.
+// checkRiskReward will reject downstream; the tiered check is a no-op here.
+func TestConfidenceTiered_BelowAllTiers_FallsBackToStaticFloor(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.66  // ≥ static 0.65 floor → pass
+	in.TakeProfit = 105.0 // R:R = 1.0 (below all tiers)
+	assertPasses(t, checkConfidenceTiered, in)
+
+	in.Confidence = 0.50 // < static floor → fail
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold 0.65") {
+		t.Fatalf("expected static-floor reason, got %q", r.Reason)
+	}
+}
+
+// Empty tier list must preserve the pre-#317 behaviour exactly.
+func TestConfidenceTiered_EmptyTiersBackwardsCompat(t *testing.T) {
+	in := baseInput()
+	in.Cfg.ConfidenceTiers = nil // explicit
+	in.Confidence = 0.50
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold") || contains(r.Reason, "tier-required") {
+		t.Fatalf("empty tiers should produce static-floor reason, got %q", r.Reason)
+	}
+
+	in.Confidence = 0.80
+	assertPasses(t, checkConfidenceTiered, in)
+}
+
+// Without a stop/TP, R:R can't be computed; tiered check falls back to static.
+func TestConfidenceTiered_NoStopTPFallsBackToStatic(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.StopLoss = 0
+	in.TakeProfit = 0
+	in.Confidence = 0.62 // < 0.65 static
+	r := assertFails(t, checkConfidenceTiered, in)
+	if !contains(r.Reason, "threshold 0.65") {
+		t.Fatalf("expected static-floor reason when R:R unknown, got %q", r.Reason)
+	}
+}
+
+// CheckAll with tiered config short-circuits with the tiered reason string,
+// confirming the wiring uses checkConfidenceTiered (not checkConfidence).
+func TestCheckAll_UsesTieredConfidence(t *testing.T) {
+	in := baseInput()
+	in.Cfg = tieredCfg()
+	in.Confidence = 0.62
+	in.TakeProfit = 107.5 // R:R = 1.5 → tier requires 0.65
+	results, ok := CheckAll(in)
+	if ok {
+		t.Fatal("expected tiered confidence to block")
+	}
+	if !contains(results[0].Reason, "tier-required") {
+		t.Fatalf("expected tiered reason from CheckAll, got %q", results[0].Reason)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
+}
+
+func indexOf(s, sub string) int {
+	for i := 0; i+len(sub) <= len(s); i++ {
+		if s[i:i+len(sub)] == sub {
+			return i
+		}
+	}
+	return -1
+}
+
 // ── Position ownership ────────────────────────────────────────────────────────
 
 func TestPositionOwnership_BuyAlwaysPasses(t *testing.T) {

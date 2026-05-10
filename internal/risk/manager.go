@@ -16,7 +16,7 @@ type CheckInput struct {
 	Cfg config.RiskConfig
 
 	// Signal fields
-	Action      string  // BUY | SELL
+	Action      string // BUY | SELL
 	Ticker      string
 	Confidence  float64 // 0.0–1.0
 	SizePct     float64 // recommended position %
@@ -32,10 +32,10 @@ type CheckInput struct {
 	// in the same direction as the incoming signal (longs for BUY, shorts for
 	// SELL). Consumed by checkMaxPerTicker (#312). May be nil; checks treat a
 	// missing key as 0.
-	OpenByTicker   map[string]int
-	DailyPnL       float64   // realised P&L today (negative = loss)
-	PeakValue      float64   // for drawdown calculation
-	LastLossAt     time.Time // last time a losing trade closed
+	OpenByTicker map[string]int
+	DailyPnL     float64   // realised P&L today (negative = loss)
+	PeakValue    float64   // for drawdown calculation
+	LastLossAt   time.Time // last time a losing trade closed
 
 	// HoldsLong is true when there is an open long trade in Ticker.
 	// LongQuantity is the total shares held long (sum across open trades).
@@ -56,7 +56,7 @@ type CheckResult struct {
 // Returns the slice of all results and a bool indicating overall pass.
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
-		checkConfidence,
+		checkConfidenceTiered,
 		checkPositionOwnership,
 		checkRiskReward,
 		checkPositionSize,
@@ -90,6 +90,10 @@ func BlockReason(results []CheckResult) string {
 
 // ─── Individual checks ────────────────────────────────────────────────────────
 
+// checkConfidence is the static-floor confidence check retained for backwards
+// compatibility and direct unit testing. Production CheckAll uses
+// checkConfidenceTiered (#317) which falls back to this floor when no tiers
+// match or none are configured.
 func checkConfidence(in CheckInput) CheckResult {
 	name := "confidence_threshold"
 	if in.Confidence >= in.Cfg.ConfidenceThreshold {
@@ -97,6 +101,58 @@ func checkConfidence(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("confidence %.2f < threshold %.2f",
 		in.Confidence, in.Cfg.ConfidenceThreshold))
+}
+
+// checkConfidenceTiered enforces a confidence floor that varies with R:R
+// (#317). Tiers from Cfg.ConfidenceTiers are scanned in declaration order;
+// the first tier whose RRMin is <= the trade's R:R applies. When no R:R can
+// be computed (no stop/TP) or no tier matches, we fall back to the static
+// ConfidenceThreshold floor — this preserves the pre-#317 behaviour for
+// configs that haven't opted into tiers.
+func checkConfidenceTiered(in CheckInput) CheckResult {
+	name := "confidence_threshold"
+
+	// When tiers aren't configured, behave exactly like the legacy static check.
+	if len(in.Cfg.ConfidenceTiers) == 0 {
+		return checkConfidence(in)
+	}
+
+	// Compute R:R if a stop and target are present. Without them we can't
+	// place the signal in any tier, so fall back to the static floor.
+	rr, hasRR := computeRR(in)
+	if !hasRR {
+		return checkConfidence(in)
+	}
+
+	for _, tier := range in.Cfg.ConfidenceTiers {
+		if rr >= tier.RRMin {
+			if in.Confidence >= tier.ConfMin {
+				return pass(name)
+			}
+			return fail(name, fmt.Sprintf(
+				"confidence %.2f < tier-required %.2f (R:R %.2f)",
+				in.Confidence, tier.ConfMin, rr,
+			))
+		}
+	}
+
+	// R:R below every tier floor — checkRiskReward will reject downstream.
+	// Apply the static floor here so a misconfigured tier list still gates.
+	return checkConfidence(in)
+}
+
+// computeRR derives the trade's R:R ratio from CheckInput. Returns (0, false)
+// when stop/TP/price are missing or when risk is zero.
+func computeRR(in CheckInput) (float64, bool) {
+	if in.StopLoss == 0 || in.TakeProfit == 0 || in.SignalPrice == 0 {
+		return 0, false
+	}
+	risk := math.Abs(in.SignalPrice - in.StopLoss)
+	reward := math.Abs(in.TakeProfit - in.SignalPrice)
+	if risk == 0 {
+		return 0, false
+	}
+	return reward / risk, true
 }
 
 func checkRiskReward(in CheckInput) CheckResult {

@@ -488,13 +488,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes, strategies []string, source string) {
+		go func(ticker string, timeframes, strategies []string, source string, conviction float64) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes, strategies, source)
-		}(item.Ticker, item.Timeframes, item.Strategies, item.Source)
+			e.processStock(ctx, ticker, timeframes, strategies, source, conviction)
+		}(item.Ticker, item.Timeframes, item.Strategies, item.Source, item.MinConfidence)
 	}
 
 	wg.Wait()
@@ -517,7 +517,10 @@ func (e *Engine) tick(ctx context.Context) error {
 
 // processStock fetches candles, computes indicators, and fetches news for a single stock.
 // strategies is the ticker's configured strategy list (from the watchlist item).
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string) {
+// scannerConviction carries the scanner's conviction score (0.0–1.0) for
+// scanner-sourced tickers; 0 for manual/config sources. Used by the
+// scanner-only RSI-delta loosen (#317).
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -623,17 +626,7 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 		Now:      time.Now(),
 	}
 
-	mcCfg := e.cfg.Analysis
-	if source == "scanner" && mcCfg.HoldCooldownMin > 0 {
-		reduced := mcCfg.HoldCooldownMin / 4
-		if reduced < 10 {
-			reduced = 10
-		}
-		if reduced > mcCfg.HoldCooldownMin {
-			reduced = mcCfg.HoldCooldownMin
-		}
-		mcCfg.HoldCooldownMin = reduced
-	}
+	mcCfg := applyScannerOverrides(e.cfg.Analysis, source, scannerConviction)
 	skip, skipReason, deltas := CheckMaterialChange(prev, mcIn, mcCfg)
 	// Scanner tickers that previously returned WAIT must be re-evaluated next
 	// cycle regardless of indicator movement — WAIT means "check again soon".
@@ -1694,7 +1687,6 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	e.portfolio.Update(eps, cash, totalEquity, dayPnL, realizedToday)
 }
 
-
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
@@ -1906,10 +1898,10 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 		len(trades), // tradesClosed
 		wins,
 		losses,
-		0, // signalGenerated (placeholder)
-		0, // signalBlocked (placeholder)
+		0,                    // signalGenerated (placeholder)
+		0,                    // signalBlocked (placeholder)
 		tokStats.DailyTokens, // total tokens as input for now
-		0,                   // tokens output
+		0,                    // tokens output
 	)
 }
 
