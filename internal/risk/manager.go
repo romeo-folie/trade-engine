@@ -54,10 +54,17 @@ type CheckResult struct {
 
 // CheckAll runs every risk check in PRD §9.1 order.
 // Returns the slice of all results and a bool indicating overall pass.
+//
+// Position ownership runs first (#319) so SELL signals on tickers we don't
+// hold block out cleanly with the canonical NoPositionBlockReason message
+// ("no open long position in <ticker> — cannot sell") rather than getting
+// labelled with confidence/R:R complaints that don't match the real cause.
+// For BUY signals checkPositionOwnership is a cheap no-op pass, so the
+// reorder has no impact on BUY-side latency or behaviour.
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
-		checkConfidence,
 		checkPositionOwnership,
+		checkConfidence,
 		checkRiskReward,
 		checkPositionSize,
 		checkMaxDollarRisk,
@@ -239,7 +246,7 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 		return pass(name)
 	}
 	if !in.HoldsLong {
-		return fail(name, fmt.Sprintf("no open long position in %s — cannot sell", in.Ticker))
+		return fail(name, NoPositionBlockReason(in.Ticker))
 	}
 	// Verify the proposed sell quantity does not exceed shares held.
 	// Overselling would result in a net short even with a position check.
@@ -266,6 +273,43 @@ func checkCooldownAfterLoss(in CheckInput) CheckResult {
 	}
 	remaining := time.Until(cooldownEnd).Round(time.Second)
 	return fail(name, fmt.Sprintf("cooldown active — %s remaining after last loss", remaining))
+}
+
+// IsSellOnlyStrategy reports whether a strategy's primary action is SELL —
+// i.e. an exit/close strategy that, by design, never recommends BUY. The
+// engine uses this to short-circuit LLM calls (#319) when such a strategy is
+// scheduled against a ticker with no open long: the analyst would only be
+// able to recommend SELL, which the position-ownership gate would then block,
+// so the LLM call is pure waste.
+//
+// Canonical list (matched case-sensitively against the lowercase strategy
+// names used in config and the engine):
+//
+//   - sell_only
+//   - exit_signal
+//   - close_position
+//
+// The dual-direction strategies that ship today (trend_following,
+// mean_reversion, momentum, news_sentiment) all emit BUY, SELL, HOLD, or
+// WAIT depending on context, so they are not on the list and always reach
+// the analyst. Add new exit-only strategy names here as they are introduced.
+func IsSellOnlyStrategy(strategy string) bool {
+	switch strategy {
+	case "sell_only", "exit_signal", "close_position":
+		return true
+	}
+	return false
+}
+
+// NoPositionBlockReason returns the canonical block reason recorded on
+// signals when a SELL is rejected because the portfolio holds no open long in
+// the ticker. Used by both checkPositionOwnership (post-LLM gate) and the
+// pre-LLM SELL ownership short-circuit in engine.runAnalysis (#319), so the
+// blocked-signal row and the SignalBlocked event payload carry identical
+// reason text in either path. Centralised so dashboards and counterfactual
+// logs can pattern-match on a single string.
+func NoPositionBlockReason(ticker string) string {
+	return fmt.Sprintf("no open long position in %s — cannot sell", ticker)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
