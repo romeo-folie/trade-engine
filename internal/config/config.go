@@ -628,12 +628,14 @@ type NewsSentimentConfig struct {
 type RiskConfig struct {
 	ConfidenceThreshold float64 `yaml:"confidence_threshold"`
 	// ConfidenceTiers expresses tiered confidence requirements that vary by
-	// the trade's R:R ratio (#317). When non-empty, the tiered check
-	// supersedes the static ConfidenceThreshold floor. Tiers are evaluated
-	// in declaration order; the first tier whose RRMin is <= the trade's
-	// R:R applies. Best practice: declare tiers in descending RRMin order
-	// (e.g. {2.0, 0.60} then {1.4, 0.65}). A zero-value (nil/empty) list
-	// preserves the old behaviour of ConfidenceThreshold-only gating.
+	// the trade's R:R ratio (#317). Default empty (no tiers — falls back
+	// to the static `confidence_threshold`). Configure tiers in YAML to
+	// enable R:R-aware confidence gating. Tiers are evaluated in
+	// declaration order; the first tier whose RRMin is <= the trade's R:R
+	// applies. Best practice: declare tiers in descending RRMin order
+	// (e.g. {2.0, 0.60} then {1.4, 0.65}). Defaults() leaves this nil so
+	// existing configs that omit the key are unaffected by the upgrade —
+	// see config.example.yaml for the recommended ladder.
 	ConfidenceTiers  []ConfidenceTier `yaml:"confidence_tiers"`
 	MinRiskReward    float64          `yaml:"min_risk_reward"`
 	MaxPositionPct   float64          `yaml:"max_position_pct"`

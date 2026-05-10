@@ -116,16 +116,48 @@ func TestConfidenceTiered_MidRR_PassesAtTierFloor(t *testing.T) {
 	assertPasses(t, checkConfidenceTiered, in)
 }
 
-// Below every tier (R:R < 1.4): confidence_threshold static floor applies.
-// checkRiskReward will reject downstream; the tiered check is a no-op here.
-func TestConfidenceTiered_BelowAllTiers_FallsBackToStaticFloor(t *testing.T) {
+// Below every tier AND below MinRiskReward: tiered check defers to
+// checkRiskReward by passing, so the operator gets the accurate R:R reason
+// rather than a confidence reason that masks the real cause (#317 review).
+func TestConfidenceTiered_BelowMinRR_DefersToRiskRewardCheck(t *testing.T) {
 	in := baseInput()
-	in.Cfg = tieredCfg()
-	in.Confidence = 0.66  // ≥ static 0.65 floor → pass
-	in.TakeProfit = 105.0 // R:R = 1.0 (below all tiers)
+	in.Cfg = tieredCfg() // MinRiskReward = 1.4
+	in.TakeProfit = 105.0 // reward=5, risk=5 → R:R = 1.0 (below MinRiskReward)
+
+	// High confidence is irrelevant — pass either way.
+	in.Confidence = 0.66
 	assertPasses(t, checkConfidenceTiered, in)
 
-	in.Confidence = 0.50 // < static floor → fail
+	// Low confidence must STILL pass the tiered check so the downstream
+	// checkRiskReward can produce the real "R:R 1.00 < minimum 1.40" reason.
+	in.Confidence = 0.50
+	assertPasses(t, checkConfidenceTiered, in)
+
+	// Sanity check: the deferred checkRiskReward does indeed reject.
+	r := assertFails(t, checkRiskReward, in)
+	if !contains(r.Reason, "R:R 1.00") || !contains(r.Reason, "minimum 1.40") {
+		t.Fatalf("expected R:R reason from checkRiskReward, got %q", r.Reason)
+	}
+}
+
+// Misconfiguration safety net: if a tier list leaves a gap *above*
+// MinRiskReward (e.g. MinRiskReward=1.0, lowest tier RRMin=2.0, R:R=1.5),
+// the static ConfidenceThreshold floor still gates so signals don't slip
+// through ungated.
+func TestConfidenceTiered_BelowAllTiersAboveMinRR_FallsBackToStatic(t *testing.T) {
+	in := baseInput()
+	cfg := defaultCfg()
+	cfg.MinRiskReward = 1.0 // lower than the lowest tier floor
+	cfg.ConfidenceTiers = []config.ConfidenceTier{
+		{RRMin: 2.0, ConfMin: 0.60},
+	}
+	in.Cfg = cfg
+	in.TakeProfit = 107.5 // R:R = 1.5 (above MinRiskReward, below lowest tier)
+
+	in.Confidence = 0.66 // ≥ static 0.65 → pass
+	assertPasses(t, checkConfidenceTiered, in)
+
+	in.Confidence = 0.50 // < static 0.65 → fail with static reason
 	r := assertFails(t, checkConfidenceTiered, in)
 	if !contains(r.Reason, "threshold 0.65") {
 		t.Fatalf("expected static-floor reason, got %q", r.Reason)

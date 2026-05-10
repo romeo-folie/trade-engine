@@ -173,10 +173,14 @@ func Defaults() *Config {
 		},
 		Risk: RiskConfig{
 			ConfidenceThreshold: 0.65,
-			ConfidenceTiers: []ConfidenceTier{
-				{RRMin: 2.0, ConfMin: 0.60},
-				{RRMin: 1.4, ConfMin: 0.65},
-			},
+			// ConfidenceTiers defaults to nil so existing configs that omit
+			// `risk.confidence_tiers` keep using the static
+			// `confidence_threshold` floor (#317 review). Pre-filling tiers
+			// here would silently overlay tiered gating onto operators who
+			// explicitly raised confidence_threshold (same shape as the #312
+			// MaxPerTicker default-overlay bug). Opt in via YAML;
+			// config.example.yaml carries the recommended tier ladder.
+			ConfidenceTiers:      nil,
 			MinRiskReward:        1.4,
 			MaxPositionPct:       5.0,
 			MaxOpenPositions:     10,

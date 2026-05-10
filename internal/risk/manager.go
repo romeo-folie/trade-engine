@@ -136,8 +136,17 @@ func checkConfidenceTiered(in CheckInput) CheckResult {
 		}
 	}
 
-	// R:R below every tier floor — checkRiskReward will reject downstream.
-	// Apply the static floor here so a misconfigured tier list still gates.
+	// R:R is below every configured tier floor. If it's also below the
+	// configured MinRiskReward, defer the rejection to checkRiskReward so
+	// the operator gets an accurate "R:R x.xx < minimum y.yy" reason
+	// rather than a confidence reason that masks the real cause (#317
+	// review). CheckAll runs confidence before R:R, so without this pass
+	// here the confidence reason wins. When a misconfigured tier list
+	// leaves a gap above MinRiskReward, fall back to the static floor so
+	// signals still get gated.
+	if rr < in.Cfg.MinRiskReward {
+		return pass(name)
+	}
 	return checkConfidence(in)
 }
 
