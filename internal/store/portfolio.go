@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 )
 
@@ -100,11 +101,24 @@ type DailySummary struct {
 	TradesClosed      int
 	Wins              int
 	Losses            int
-	SignalsGenerated   int
-	SignalsBlocked     int
+	SignalsGenerated  int
+	SignalsBlocked    int
 	ModelTokensInput  int64
 	ModelTokensOutput int64
 	CreatedAt         time.Time
+
+	// Issue #325 — observability counters. Populated by the rollup writer in
+	// portfolio.MaybeDailySummary. SignalsTotal is the strict daily total
+	// (any status). SignalsExecuted is the subset that reached
+	// status='executed'. ExecutedWinning/ExecutedLosing aggregate trades by
+	// pnl sign for trades closed today. BlockedByReason is a JSONB map of
+	// block_reason -> count for signals blocked today; nil when the column
+	// is empty/missing.
+	SignalsTotal     int
+	SignalsExecuted  int
+	ExecutedWinning  int
+	ExecutedLosing   int
+	BlockedByReason  map[string]int
 }
 
 // ── Portfolio Snapshots ───────────────────────────────────────────────────────
@@ -211,12 +225,7 @@ func GetLastSnapshotBeforeDay(ctx context.Context, day time.Time) (*PortfolioSna
 
 // GetDailySummaries returns summaries within [from, to] ordered by date.
 func GetDailySummaries(ctx context.Context, from, to time.Time) ([]DailySummary, error) {
-	rows, err := GetDB().Query(ctx, `
-		SELECT id, date, starting_value, ending_value, pnl, COALESCE(pnl_pct,0),
-		       trades_opened, trades_closed, wins, losses,
-		       signals_generated, signals_blocked,
-		       model_tokens_input, model_tokens_output, created_at
-		FROM daily_summaries
+	rows, err := GetDB().Query(ctx, dailySummarySelect+`
 		WHERE date >= $1 AND date <= $2
 		ORDER BY date ASC`,
 		from.UTC(), to.UTC())
@@ -224,76 +233,194 @@ func GetDailySummaries(ctx context.Context, from, to time.Time) ([]DailySummary,
 		return nil, err
 	}
 	defer rows.Close()
-
-	var summaries []DailySummary
-	for rows.Next() {
-		var s DailySummary
-		if err := rows.Scan(
-			&s.ID, &s.Date, &s.StartingValue, &s.EndingValue, &s.PnL, &s.PnLPct,
-			&s.TradesOpened, &s.TradesClosed, &s.Wins, &s.Losses,
-			&s.SignalsGenerated, &s.SignalsBlocked,
-			&s.ModelTokensInput, &s.ModelTokensOutput, &s.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		summaries = append(summaries, s)
-	}
-	return summaries, rows.Err()
+	return scanDailySummaries(rows)
 }
 
 // GetDailySummaryByDate returns the summary for a specific date, or nil.
 func GetDailySummaryByDate(ctx context.Context, date time.Time) (*DailySummary, error) {
-	var s DailySummary
-	err := GetDB().QueryRow(ctx, `
-		SELECT id, date, starting_value, ending_value, pnl, COALESCE(pnl_pct,0),
-		       trades_opened, trades_closed, wins, losses,
-		       signals_generated, signals_blocked,
-		       model_tokens_input, model_tokens_output, created_at
-		FROM daily_summaries
-		WHERE date = $1`, date.UTC()).Scan(
-		&s.ID, &s.Date, &s.StartingValue, &s.EndingValue, &s.PnL, &s.PnLPct,
-		&s.TradesOpened, &s.TradesClosed, &s.Wins, &s.Losses,
-		&s.SignalsGenerated, &s.SignalsBlocked,
-		&s.ModelTokensInput, &s.ModelTokensOutput, &s.CreatedAt,
-	)
+	rows, err := GetDB().Query(ctx, dailySummarySelect+`
+		WHERE date = $1`, date.UTC())
 	if err != nil {
-		if IsNoRows(err) {
-			return nil, nil
-		}
 		return nil, err
 	}
-	return &s, nil
+	defer rows.Close()
+	out, err := scanDailySummaries(rows)
+	if err != nil {
+		return nil, err
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return &out[0], nil
 }
 
 // ── Trades by date range ──────────────────────────────────────────────────────
 // GetRecentDailySummaries returns the last N days of summaries.
 func GetRecentDailySummaries(ctx context.Context, limit int) ([]DailySummary, error) {
-	rows, err := GetDB().Query(ctx, `
-		SELECT id, date, starting_value, ending_value, pnl, COALESCE(pnl_pct,0),
-		       trades_opened, trades_closed, wins, losses,
-		       signals_generated, signals_blocked,
-		       model_tokens_input, model_tokens_output, created_at
-		FROM daily_summaries
+	rows, err := GetDB().Query(ctx, dailySummarySelect+`
 		ORDER BY date DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	return scanDailySummaries(rows)
+}
 
+// dailySummarySelect is the canonical column list/order used by every
+// DailySummary read path so adding columns is a single-edit change. Issue
+// #325 added signals_total / signals_executed / executed_winning /
+// executed_losing / blocked_by_reason. COALESCE keeps reads working against
+// older rows that predate the migration.
+const dailySummarySelect = `
+	SELECT id, date, starting_value, ending_value, pnl, COALESCE(pnl_pct,0),
+	       trades_opened, trades_closed, wins, losses,
+	       signals_generated, signals_blocked,
+	       model_tokens_input, model_tokens_output, created_at,
+	       COALESCE(signals_total,0), COALESCE(signals_executed,0),
+	       COALESCE(executed_winning,0), COALESCE(executed_losing,0),
+	       COALESCE(blocked_by_reason,'{}'::jsonb)
+	FROM daily_summaries`
+
+// scanDailySummaries materialises rows into DailySummary values. JSONB
+// blocked_by_reason is unmarshalled into a Go map; an empty/missing object
+// produces a nil map so callers can distinguish "not yet populated" from
+// "no signals blocked".
+func scanDailySummaries(rows interface {
+	Next() bool
+	Scan(...any) error
+	Err() error
+}) ([]DailySummary, error) {
 	var summaries []DailySummary
 	for rows.Next() {
 		var s DailySummary
+		var blockedRaw []byte
 		if err := rows.Scan(
 			&s.ID, &s.Date, &s.StartingValue, &s.EndingValue, &s.PnL, &s.PnLPct,
 			&s.TradesOpened, &s.TradesClosed, &s.Wins, &s.Losses,
 			&s.SignalsGenerated, &s.SignalsBlocked,
 			&s.ModelTokensInput, &s.ModelTokensOutput, &s.CreatedAt,
+			&s.SignalsTotal, &s.SignalsExecuted,
+			&s.ExecutedWinning, &s.ExecutedLosing,
+			&blockedRaw,
 		); err != nil {
 			return nil, err
+		}
+		if len(blockedRaw) > 0 && string(blockedRaw) != "{}" {
+			m := map[string]int{}
+			if err := json.Unmarshal(blockedRaw, &m); err == nil && len(m) > 0 {
+				s.BlockedByReason = m
+			}
 		}
 		summaries = append(summaries, s)
 	}
 	return summaries, rows.Err()
+}
+
+// DailyCounters holds the aggregated counters written to daily_summaries by
+// the rollup job (Issue #325). Computed by AggregateDailyCounters from the
+// signals + trades tables for a single calendar date.
+type DailyCounters struct {
+	Date            time.Time
+	SignalsTotal    int
+	SignalsBlocked  int
+	SignalsExecuted int
+	ExecutedWinning int
+	ExecutedLosing  int
+	BlockedByReason map[string]int
+}
+
+// AggregateDailyCounters scans signals and closed trades for the UTC calendar
+// day containing `day` and returns the rollup. Used by the rollup writer
+// (portfolio.MaybeDailySummary) and by the new /api/portfolio/daily-counters
+// handler when fetching a backfill window.
+//
+// Signals are bucketed by status; "executed" is the canonical successful
+// outcome. blocked_by_reason groups blocked rows by their canonical
+// block_reason text (NULL/empty rows bucket as "unspecified" so a missing
+// reason is visible rather than silently dropped).
+//
+// Closed trades are joined by closed_at::date — wins are pnl > 0, losses are
+// pnl < 0. A breakeven trade (pnl = 0) counts as neither.
+func AggregateDailyCounters(ctx context.Context, day time.Time) (DailyCounters, error) {
+	dayUTC := day.UTC().Truncate(24 * time.Hour)
+	dc := DailyCounters{Date: dayUTC, BlockedByReason: map[string]int{}}
+
+	// Signals total + per-status counts.
+	rows, err := GetDB().Query(ctx, `
+		SELECT status, COUNT(*) FROM signals
+		WHERE created_at >= $1 AND created_at < $1::timestamptz + interval '1 day'
+		GROUP BY status`, dayUTC)
+	if err != nil {
+		return dc, err
+	}
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			rows.Close()
+			return dc, err
+		}
+		dc.SignalsTotal += n
+		switch status {
+		case "blocked":
+			dc.SignalsBlocked += n
+		case "executed":
+			dc.SignalsExecuted += n
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return dc, err
+	}
+
+	// Block-reason histogram (only for blocked rows).
+	rows, err = GetDB().Query(ctx, `
+		SELECT COALESCE(NULLIF(block_reason,''), 'unspecified'), COUNT(*)
+		FROM signals
+		WHERE status = 'blocked'
+		  AND created_at >= $1 AND created_at < $1::timestamptz + interval '1 day'
+		GROUP BY 1`, dayUTC)
+	if err != nil {
+		return dc, err
+	}
+	for rows.Next() {
+		var reason string
+		var n int
+		if err := rows.Scan(&reason, &n); err != nil {
+			rows.Close()
+			return dc, err
+		}
+		dc.BlockedByReason[reason] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return dc, err
+	}
+
+	// Closed-trade win/loss counts for the day.
+	rows, err = GetDB().Query(ctx, `
+		SELECT COALESCE(pnl,0) FROM trades
+		WHERE status = 'closed'
+		  AND closed_at >= $1 AND closed_at < $1::timestamptz + interval '1 day'`,
+		dayUTC)
+	if err != nil {
+		return dc, err
+	}
+	for rows.Next() {
+		var pnl float64
+		if err := rows.Scan(&pnl); err != nil {
+			rows.Close()
+			return dc, err
+		}
+		switch {
+		case pnl > 0:
+			dc.ExecutedWinning++
+		case pnl < 0:
+			dc.ExecutedLosing++
+		}
+	}
+	rows.Close()
+	return dc, rows.Err()
 }
 
 type PortfolioStats struct {
