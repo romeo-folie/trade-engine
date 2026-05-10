@@ -136,10 +136,10 @@ func checkMaxOpenPositions(in CheckInput) CheckResult {
 }
 
 // checkMaxPerTicker caps the number of open positions per ticker in the
-// signal's direction (#312). When Cfg.MaxPerTicker <= 0 the check is
-// disabled and always passes — this is the safe-rollout default so that
-// older configs without the new key never start blocking signals after
-// an upgrade. Operators opt in by setting risk.max_per_ticker explicitly.
+// signal's direction (#312). Skipped when Cfg.MaxPerTicker <= 0; the
+// default in Defaults() is 0 so older configs without the new key upgrade
+// safely without unexpected blocks. Opt in by setting a positive value
+// (risk.max_per_ticker) in your config — config.example.yaml recommends 2.
 func checkMaxPerTicker(in CheckInput) CheckResult {
 	name := "max_per_ticker"
 	if in.Cfg.MaxPerTicker <= 0 {

@@ -631,8 +631,10 @@ type RiskConfig struct {
 	MaxPositionPct       float64 `yaml:"max_position_pct"`
 	MaxOpenPositions     int     `yaml:"max_open_positions"`
 	// MaxPerTicker caps the number of open positions in the same direction
-	// for a single ticker (#312). 0 disables the check (safe-rollout default
-	// for older configs that don't set this key).
+	// for a single ticker (#312). Default is 0 (disabled) so older configs
+	// that don't set this key upgrade safely without unexpected blocks; the
+	// example config recommends 2. Operators opt in by setting a positive
+	// value in their config.
 	MaxPerTicker         int     `yaml:"max_per_ticker"`
 	DailyLossLimitPct    float64 `yaml:"daily_loss_limit_pct"`
 	MaxDrawdownPct       float64 `yaml:"max_drawdown_pct"`

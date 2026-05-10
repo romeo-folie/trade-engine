@@ -176,7 +176,7 @@ func Defaults() *Config {
 			MinRiskReward:        1.5,
 			MaxPositionPct:       5.0,
 			MaxOpenPositions:     10,
-			MaxPerTicker:         2,
+			MaxPerTicker:         0,
 			DailyLossLimitPct:    3.0,
 			MaxDrawdownPct:       15.0,
 			CooldownAfterLoss:    60,
