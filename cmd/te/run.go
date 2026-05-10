@@ -184,15 +184,23 @@ Modes:
 		// Server-side trailing stop manager (#322). Opt-in; disabled by
 		// default so existing operators keep current behaviour. Walks the
 		// stop_loss up using `new_stop = max(current_stop, hwm − atr_multiple × ATR)`.
+		//
+		// Requires a live DB connection — the manager reads open trades and
+		// persists HWM/stop updates. If store.Connect() failed earlier we
+		// skip startup so the LiveStore adapter never panics in production.
 		if cfg.Risk.TrailingStop.Enabled && marketProvider != nil && broker != nil {
-			tsCfg := trailing.Config{
-				Enabled:     true,
-				ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
-				Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
-				ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
+			if !store.IsConnected() {
+				logger.Warn("trailing-stop manager requested but DB not connected; skipping startup")
+			} else {
+				tsCfg := trailing.Config{
+					Enabled:     true,
+					ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
+					Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
+					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
+				}
+				mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
+				go mgr.Run(ctx)
 			}
-			mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
-			go mgr.Run(ctx)
 		}
 
 		// Start background embedding worker if enabled.
