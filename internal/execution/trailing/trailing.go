@@ -232,16 +232,29 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	// tick).
 	newStop := ComputeNewStop(t.StopLoss, hwm, atr, m.cfg.ATRMultiple)
 
-	// Defensive sanity: a trailing stop above the current price would fill
-	// instantly. Skip the broker call but keep the HWM update so we don't
-	// spam logs on a noisy print.
+	// Round to broker tick size before persistence + comparison so tiny
+	// floating-point noise (e.g. 48.50000001 vs 48.5) doesn't trigger a
+	// pointless REPLACE API call every tick.
+	newStop = roundToTick(newStop, brokerTickDecimals(t.Ticker))
+
+	// If the trail says we should already be out (stop ≥ current price)
+	// the broker stop would fill instantly anyway. Don't leave a stale stop
+	// sitting at the old price — exit at market immediately so the band's
+	// implied "we're done" actually plays out.
 	if newStop >= currentPrice {
-		logger.Debug("trailing-stop: computed stop >= current price; skipping broker update",
+		logger.Info("trailing-stop: trail crossed price; exiting at market",
 			"trade_id", t.ID,
 			"ticker", t.Ticker,
 			"new_stop", newStop,
 			"current_price", currentPrice,
 		)
+		if err := m.exitAtMarket(ctx, t); err != nil {
+			// Persist HWM so the next tick has fresh baseline; surface error.
+			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
+			return fmt.Errorf("market exit: %w", err)
+		}
+		// Persist HWM only — the stop_loss row remains the prior value;
+		// fill-handling code closes the trade out as usual.
 		return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 	}
 
@@ -278,6 +291,8 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 }
 
 // priceAndATR fetches recent 1h candles and returns (last close, ATR).
+// ATR honours the configured `risk.trailing_stop.atr_period` so the operator
+// knob actually flows through to the trailing band.
 func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, float64, error) {
 	if m.prices == nil {
 		return 0, 0, errors.New("no price provider configured")
@@ -289,18 +304,21 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 	if len(candles) == 0 {
 		return 0, 0, errors.New("no candles returned")
 	}
-	set, err := indicators.Compute(candles)
-	if err != nil {
-		return 0, 0, err
-	}
-	return candles[len(candles)-1].Close, set.ATR, nil
+	atrVal := indicators.ComputeATR(candles, m.cfg.ATRPeriod)
+	return candles[len(candles)-1].Close, atrVal, nil
 }
 
 // submitOrReplaceStop sends the new stop price to the broker. If a broker
 // stop already exists it is replaced (PATCH on Alpaca / modify on IBKR) when
-// the executor implements StopOrderReplacer. Otherwise the manager submits a
-// fresh STOP order. The orders table is updated to reflect the live broker
-// id and stop price.
+// the executor implements StopOrderReplacer. Otherwise the manager cancels
+// the prior stop and submits a fresh STOP order — but only after the cancel
+// is confirmed. The orders table is updated to reflect the live broker id
+// and stop price.
+//
+// Safety: if the fallback cancel fails (broker timeout, etc.) we DO NOT
+// place a new stop — that would leave two live STOP orders on the same long
+// and a later price drop could over-exit / flip the account short. Instead
+// we surface the error and rely on the next tick to retry.
 func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newStop float64) error {
 	existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
 	if err != nil {
@@ -309,7 +327,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 
 	side := execution.OrderSideSell // long-only scope: exit a long via SELL
 	if existing != nil && existing.BrokerOrderID != "" {
-		// Replace path.
+		// Replace path — atomic on the broker side, no double-stop window.
 		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok {
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
@@ -320,13 +338,11 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 				"err", err,
 			)
 		}
-		// Fallback: cancel then resubmit.
-		if err := m.exec.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
-			logger.Warn("trailing-stop: cancel of stale stop failed; will still attempt resubmit",
-				"trade_id", t.ID,
-				"broker_order_id", existing.BrokerOrderID,
-				"err", err,
-			)
+		// Fallback: cancel, CONFIRM cancellation, then resubmit. If we
+		// can't confirm the prior stop is gone, bail out — placing a new
+		// stop now risks two live stops on the same position.
+		if err := m.cancelAndConfirm(ctx, existing.BrokerOrderID); err != nil {
+			return fmt.Errorf("cancel of stale stop unconfirmed; refusing to submit duplicate stop: %w", err)
 		}
 	}
 
@@ -358,4 +374,96 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		IsStopLoss:    true,
 	})
 	return err
+}
+
+// cancelAndConfirm cancels a broker order and only returns nil once the
+// broker reports the order in a terminal cancelled/filled state. If the
+// cancel call itself errors we re-query the broker to learn the real
+// status — the order may already be gone (race) or still live (timeout).
+//
+// This is the load-bearing safety check that prevents double-stop
+// submission during the cancel+resubmit fallback path. Never short-circuit
+// or relax this without re-doing the duplicate-stop analysis.
+func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) error {
+	cancelErr := m.exec.CancelOrder(ctx, brokerOrderID)
+	// Independent of cancel success, query status: a 404 / "order not found"
+	// is fine (it's gone), a "filled" / "cancelled" is fine (terminal).
+	status, statusErr := m.exec.GetOrderStatus(ctx, brokerOrderID)
+	if statusErr != nil {
+		// Couldn't even confirm. If cancel succeeded the broker likely
+		// purged the order; if cancel also failed we have no idea.
+		if cancelErr != nil {
+			return fmt.Errorf("cancel + status both failed: cancel=%v status=%v", cancelErr, statusErr)
+		}
+		// Cancel said OK but we can't verify — treat as unconfirmed and
+		// refuse the duplicate-submission risk.
+		return fmt.Errorf("cancel reported success but status check failed: %w", statusErr)
+	}
+	switch execution.NormalizeOrderStatus(status.Status) {
+	case "cancelled", "filled", "rejected":
+		return nil
+	}
+	if cancelErr != nil {
+		return fmt.Errorf("cancel failed and order still %s: %w", status.Status, cancelErr)
+	}
+	return fmt.Errorf("cancel returned no error but order still %s; will retry next tick", status.Status)
+}
+
+// exitAtMarket flattens a long position immediately. Used when the trailing
+// band has crossed the current price and a stop order would fill instantly
+// anyway — submitting a market sell guarantees the exit prints rather than
+// leaving a stale stop sitting at the old level.
+func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) error {
+	// Best-effort: cancel any live stop first so the market sell isn't
+	// double-counted by the broker risk engine. Failure is logged but
+	// doesn't block the market exit (the exit is the safety move).
+	if existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID); err == nil && existing != nil && existing.BrokerOrderID != "" {
+		if err := m.exec.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
+			logger.Warn("trailing-stop: cancel of stop before market exit failed",
+				"trade_id", t.ID,
+				"broker_order_id", existing.BrokerOrderID,
+				"err", err,
+			)
+		}
+	}
+	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
+		Ticker:   t.Ticker,
+		Side:     execution.OrderSideSell,
+		Type:     execution.OrderTypeMarket,
+		Quantity: t.Quantity,
+		TradeID:  t.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("place market sell: %w", err)
+	}
+	_, err = m.store.InsertOrder(ctx, store.Order{
+		TradeID:       t.ID,
+		BrokerOrderID: res.BrokerOrderID,
+		Ticker:        t.Ticker,
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeMarket),
+		Quantity:      t.Quantity,
+		Status:        execution.NormalizeOrderStatus(res.Status),
+		IsStopLoss:    true, // counts toward the trade's exit bookkeeping
+	})
+	return err
+}
+
+// brokerTickDecimals returns the price-tick precision for the ticker. US
+// equities round to $0.01 on both Alpaca and IBKR; forex pairs (which the
+// scope guard already excludes from this manager) would need 4–5. We default
+// to 2 decimals which matches the long-stocks scope.
+func brokerTickDecimals(_ string) int {
+	return 2
+}
+
+// roundToTick rounds price to `decimals` places using bankers' rounding via
+// math.Round. The trailing-stop comparison uses the rounded value so tiny
+// float noise (e.g. 48.5000001 vs 48.5) doesn't churn REPLACE calls.
+func roundToTick(price float64, decimals int) float64 {
+	if decimals < 0 {
+		decimals = 0
+	}
+	scale := math.Pow(10, float64(decimals))
+	return math.Round(price*scale) / scale
 }

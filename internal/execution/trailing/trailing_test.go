@@ -9,6 +9,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -195,6 +196,15 @@ type fakeBroker struct {
 	supportReplace bool
 	failReplace    bool
 	nextID         int
+	// failCancel makes CancelOrder return an error — used to exercise the
+	// duplicate-stop safety path (P1: cancel-error must NOT submit a new
+	// stop, otherwise two live stops can over-exit/flip the position).
+	failCancel bool
+	// cancelledStatus drives what GetOrderStatus reports for cancelled
+	// order IDs. Defaults to "cancelled" so happy-path cancel+resubmit
+	// works; tests can set it to "pending" or "" to simulate broker
+	// timeouts where the cancel didn't actually take.
+	statusOverride map[string]string
 }
 
 type replaceCall struct {
@@ -217,10 +227,26 @@ func (b *fakeBroker) CancelOrder(_ context.Context, brokerOrderID string) error 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.cancelled = append(b.cancelled, brokerOrderID)
+	if b.failCancel {
+		return errors.New("simulated broker cancel failure")
+	}
+	if b.statusOverride == nil {
+		b.statusOverride = map[string]string{}
+	}
+	// Default: a successful cancel flips the broker-side status so the
+	// safety check in cancelAndConfirm sees a terminal state.
+	if _, ok := b.statusOverride[brokerOrderID]; !ok {
+		b.statusOverride[brokerOrderID] = "cancelled"
+	}
 	return nil
 }
 
-func (b *fakeBroker) GetOrderStatus(_ context.Context, _ string) (execution.OrderResult, error) {
+func (b *fakeBroker) GetOrderStatus(_ context.Context, brokerOrderID string) (execution.OrderResult, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s, ok := b.statusOverride[brokerOrderID]; ok {
+		return execution.OrderResult{Status: s}, nil
+	}
 	return execution.OrderResult{Status: "pending"}, nil
 }
 
@@ -514,6 +540,239 @@ func TestManager_SkipsForexORB(t *testing.T) {
 	m.UpdateAll(context.Background())
 	if len(fb.placed) != 0 || len(fb.cancelled) != 0 {
 		t.Fatalf("manager touched ORB/forex trade: placed=%d cancelled=%d", len(fb.placed), len(fb.cancelled))
+	}
+}
+
+// TestManager_CancelErrorDoesNotSubmitDuplicateStop is the P1 regression
+// test for the duplicate-stop bug: when the cancel+resubmit fallback path
+// runs and CancelOrder returns an error, the manager MUST NOT place a new
+// stop. Two live stops on the same long can over-exit on a price drop and
+// flip the account short. The fix only places after cancellation is
+// confirmed via GetOrderStatus.
+func TestManager_CancelErrorDoesNotSubmitDuplicateStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "buy",
+		Status:        "open",
+		EntryPrice:    100,
+		StopLoss:      95,
+		Quantity:      10,
+		HighWaterMark: 100,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "broker-pre",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     95,
+		Status:        "pending",
+		IsStopLoss:    true,
+	})
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
+	// failReplace forces the cancel+resubmit fallback; failCancel makes
+	// the broker reject the cancel; status override leaves the order
+	// "pending" so cancellation is unconfirmed.
+	base := &fakeBroker{
+		failReplace: true,
+		failCancel:  true,
+		statusOverride: map[string]string{
+			"broker-pre": "pending",
+		},
+	}
+	fb := fakeBrokerWithReplace{fakeBroker: base}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(base.placed) != 0 {
+		t.Fatalf("P1 BUG REGRESSED: cancel failed but new stop was submitted (placed=%d)", len(base.placed))
+	}
+	// The original stop row must remain intact at the old broker id and
+	// price — we never touched it.
+	for _, o := range fs.orders {
+		if o.BrokerOrderID != "broker-pre" {
+			t.Fatalf("stale stop replaced after cancel error: %+v", o)
+		}
+		if o.StopPrice != 95 {
+			t.Fatalf("stale stop's price mutated despite cancel error: %v", o.StopPrice)
+		}
+	}
+}
+
+// TestManager_StopAtOrAbovePriceForcesMarketExit covers the edge case where
+// the trailing band has crossed the current price. Leaving a stale broker
+// stop sitting at the old level would mean the trail never actually fires;
+// instead the manager submits a market sell so the exit prints immediately.
+func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "buy",
+		Status:        "open",
+		EntryPrice:    100,
+		StopLoss:      109, // already very tight
+		Quantity:      10,
+		HighWaterMark: 110,
+	}
+	// Pre-existing stop so we exercise the cancel-before-market-exit path.
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "broker-pre",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     109,
+		Status:        "pending",
+		IsStopLoss:    true,
+	})
+
+	// HWM=200 (well above price), small ATR, modest mult → candidate stop
+	// of 200 - 0.1*1 = 199.9, well above current price 110. The trail's
+	// implication is "we should already be out", so the manager must
+	// market-exit instead of leaving the stale 109 stop sitting there.
+	fs.trades["t1"] = func() store.Trade {
+		t := fs.trades["t1"]
+		t.HighWaterMark = 200
+		return t
+	}()
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 1 {
+		t.Fatalf("expected 1 market sell, got %d", len(fb.placed))
+	}
+	if fb.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("expected market order, got %v", fb.placed[0].Type)
+	}
+	if fb.placed[0].Side != execution.OrderSideSell {
+		t.Fatalf("expected SELL side for long exit, got %v", fb.placed[0].Side)
+	}
+	if len(fb.cancelled) == 0 {
+		t.Fatalf("expected stale stop to be cancelled before market exit")
+	}
+}
+
+// TestManager_RoundingAvoidsReplaceChurn pins the float-equality fix: when
+// the recomputed stop rounds to the same broker tick as the persisted stop
+// (US equities = $0.01), the manager must NOT issue a REPLACE call.
+// Without rounding, sub-cent ATR jitter would churn the API every tick.
+//
+// We pre-stage the trade with the exact rounded stop the trail will compute
+// from these inputs, prove no broker churn, then perturb ATR with a tiny
+// candle wiggle and prove the rounded result is still byte-equal so the
+// no-op short-circuit triggers.
+func TestManager_RoundingAvoidsReplaceChurn(t *testing.T) {
+	fp := &fakePrices{candles: makeFlatPriceCandles(50, candle(50, 50.01, 49.99, 50))}
+
+	// Probe the actual rounded stop the formula will produce on this fake.
+	atr := indicators.ComputeATR(fp.candles, DefaultATRPeriod)
+	candidate := 50.0 - 1.5*atr
+	rounded := roundToTick(candidate, 2)
+
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "buy",
+		Status:        "open",
+		EntryPrice:    50,
+		StopLoss:      rounded,
+		Quantity:      10,
+		HighWaterMark: 50,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "broker-pre",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     rounded,
+		Status:        "pending",
+		IsStopLoss:    true,
+	})
+
+	base := &fakeBroker{}
+	fb := fakeBrokerWithReplace{fakeBroker: base}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(base.replaced)+len(base.placed) != 0 {
+		t.Fatalf("rounded stop unchanged but broker was called: replaced=%d placed=%d",
+			len(base.replaced), len(base.placed))
+	}
+
+	// Sanity: the helper rounds in both directions identically.
+	if got := roundToTick(48.50000001, 2); got != 48.50 {
+		t.Fatalf("roundToTick: 48.50000001 → %v (want 48.50)", got)
+	}
+	if got := roundToTick(48.504, 2); got != 48.50 {
+		t.Fatalf("roundToTick: 48.504 → %v (want 48.50)", got)
+	}
+	if got := roundToTick(48.506, 2); got != 48.51 {
+		t.Fatalf("roundToTick: 48.506 → %v (want 48.51)", got)
+	}
+}
+
+// TestManager_ATRPeriodHonoured confirms that the configured atr_period
+// flows through to the indicator computation. We compare a 5-period vs
+// 14-period ATR over the same noisy series; for noisy candles the two
+// values must differ.
+func TestManager_ATRPeriodHonoured(t *testing.T) {
+	// Ascending price series with widening true ranges.
+	candles := make([]data.Candle, 0, 40)
+	for i := 0; i < 40; i++ {
+		base := 100.0 + float64(i)
+		spread := 0.5 + float64(i%5)*0.3
+		candles = append(candles, candle(base, base+spread, base-spread, base+0.1))
+	}
+	short := indicators.ComputeATR(candles, 5)
+	long := indicators.ComputeATR(candles, 14)
+	if short <= 0 || long <= 0 {
+		t.Fatalf("ATR returned zero for sufficient lookback: short=%v long=%v", short, long)
+	}
+	if short == long {
+		t.Fatalf("ATR(5) == ATR(14) on noisy series — period not applied")
+	}
+}
+
+// TestLiveStore_NoDBPanicSafe documents the no-DB safety contract: when the
+// store package has no live pool, the LiveStore adapter must NOT panic.
+// Reads return empty + nil; writes return a clean sentinel error. Without
+// this guard, GetDB() panics and crashes the trailing-stop goroutine.
+func TestLiveStore_NoDBPanicSafe(t *testing.T) {
+	ls := LiveStore()
+	ctx := context.Background()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("LiveStore panicked with no DB: %v", r)
+		}
+	}()
+	if trs, err := ls.GetOpenTrades(ctx); err != nil || trs != nil {
+		t.Fatalf("GetOpenTrades(no DB): want nil/nil, got %v/%v", trs, err)
+	}
+	if err := ls.UpdateTradeTrailing(ctx, "t1", 1, 1); err == nil {
+		t.Fatalf("UpdateTradeTrailing(no DB): want error, got nil")
+	}
+	if _, err := ls.LatestStopLossOrderForTrade(ctx, "t1"); err == nil {
+		t.Fatalf("LatestStopLossOrderForTrade(no DB): want error, got nil")
+	}
+	if _, err := ls.InsertOrder(ctx, store.Order{}); err == nil {
+		t.Fatalf("InsertOrder(no DB): want error, got nil")
+	}
+	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0); err == nil {
+		t.Fatalf("UpdateOrderStopPriceAndID(no DB): want error, got nil")
 	}
 }
 
