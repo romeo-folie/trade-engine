@@ -232,6 +232,44 @@ func TestMaxDollarRisk_SkipWhenStopLossZero(t *testing.T) {
 	assertPasses(t, checkMaxDollarRisk, in)
 }
 
+// SELL signals are exit-only (checkPositionOwnership blocks SELL without an
+// open long). The analyst prompt requests stop_loss/take_profit on SELLs too,
+// so the entry-risk cap must skip them — otherwise legitimate exits with a
+// far stop would be blocked.
+func TestMaxDollarRisk_SkipsForSell(t *testing.T) {
+	in := baseInput()
+	in.Action = "SELL"
+	// Stop far enough that the BUY path would fail: $@risk = 2 * 50 = 100,
+	// pct = 100/10000*100 = 1.00% (at cap) and we push it well over.
+	in.Cash = 10000
+	in.SignalPrice = 100.0
+	in.StopLoss = 1.0 // wildly over the 1% cap if this check ran
+	assertPasses(t, checkMaxDollarRisk, in)
+}
+
+// Guards a hole in checkRiskReward: when TakeProfit is zero, that check is
+// skipped, so a StopLoss == SignalPrice (zero risk distance) wouldn't be
+// caught upstream. checkMaxDollarRisk fails it explicitly, mirroring the
+// same defensive pattern checkRiskReward uses for "stop equals signal price".
+func TestMaxDollarRisk_FailsWhenStopEqualsSignal(t *testing.T) {
+	in := baseInput()
+	in.SignalPrice = 100.0
+	in.StopLoss = 100.0
+	in.TakeProfit = 0 // checkRiskReward would skip this case entirely
+	// Confirm the load-bearing assumption: checkRiskReward does NOT catch this.
+	if rr := checkRiskReward(in); !rr.Passed {
+		t.Fatalf("precondition: expected checkRiskReward to skip when TP==0, got fail: %s", rr.Reason)
+	}
+	r := assertFails(t, checkMaxDollarRisk, in)
+	if r.Name != "max_dollar_risk" {
+		t.Fatalf("wrong check name: %s", r.Name)
+	}
+	want := "stop-loss equals signal price (zero risk, invalid)"
+	if r.Reason != want {
+		t.Fatalf("block reason mismatch:\n  got:  %q\n  want: %q", r.Reason, want)
+	}
+}
+
 // ── Max open positions ────────────────────────────────────────────────────────
 
 func TestMaxOpenPositions_Pass(t *testing.T) {

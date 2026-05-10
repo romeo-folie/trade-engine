@@ -134,11 +134,19 @@ func checkPositionSize(in CheckInput) CheckResult {
 // notional with a tight stop can risk less. Both gates protect against
 // different failure modes.
 //
+// This check applies only to opening trades (BUY); exits (SELL) should not
+// be blocked by an entry-risk cap. SELL is exit-only in this codebase
+// (checkPositionOwnership blocks SELL with no open long), and the analyst
+// prompt requests stop_loss/take_profit on SELL signals too — running the
+// entry-risk gate against those would block legitimate exits.
+//
 // Skipped when PortfolioValue == 0 (mirrors checkDailyLossLimit), when
 // MaxDollarRiskPct <= 0 (treat as disabled to keep older configs safe),
-// or when StopLoss == 0 (mirrors checkRiskReward — no stop, nothing to
-// measure). Zero stop-distance with a non-zero stop is already caught
-// upstream by checkRiskReward.
+// when StopLoss == 0 (no stop set, can't compute risk), or for non-BUY
+// actions (entry-risk cap applies to opening trades only).
+// Fails when StopLoss equals SignalPrice (zero risk distance, invalid setup;
+// not necessarily caught upstream because checkRiskReward is skipped when
+// TakeProfit is also zero).
 //
 // Quantity estimate uses Cash, not PortfolioValue, to match the actual
 // engine sizing in executeSignal (`pState.Cash * SizePct/100 / SignalPrice`).
@@ -146,6 +154,9 @@ func checkPositionSize(in CheckInput) CheckResult {
 // deployed and produce false blocks.
 func checkMaxDollarRisk(in CheckInput) CheckResult {
 	name := "max_dollar_risk"
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.PortfolioValue == 0 || in.Cfg.MaxDollarRiskPct <= 0 {
 		return pass(name)
 	}
@@ -154,6 +165,10 @@ func checkMaxDollarRisk(in CheckInput) CheckResult {
 	}
 	if in.SignalPrice <= 0 {
 		return pass(name)
+	}
+	const epsilon = 1e-9
+	if math.Abs(in.SignalPrice-in.StopLoss) < epsilon {
+		return fail(name, "stop-loss equals signal price (zero risk, invalid)")
 	}
 	qty := (in.SizePct / 100) * in.Cash / in.SignalPrice
 	dollarAtRisk := qty * math.Abs(in.SignalPrice-in.StopLoss)
