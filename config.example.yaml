@@ -201,6 +201,11 @@ risk:
   default_take_profit_pct: 4.0
   signal_expiry_min: 30        # Discard pending signals older than this
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
+  trailing_stop:               # Server-side trailing stop manager (#322)
+    enabled: false             # Opt-in; disabled by default
+    atr_multiple: 1.5          # new_stop = hwm - atr_multiple * ATR (absolute-price ATR)
+    interval_sec: 60           # Recompute cadence
+    atr_period: 14             # Wilder ATR lookback in 1h candles
 
 # ── Analysis gate (cost-reduction Epics 1 & 2) ───────────────────────────────
 # Controls the pre-LLM material-change gate (zero token cost) and the optional

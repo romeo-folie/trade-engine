@@ -643,6 +643,24 @@ type RiskConfig struct {
 	DefaultTakeProfitPct float64 `yaml:"default_take_profit_pct"`
 	SignalExpiryMin      int     `yaml:"signal_expiry_min"`
 	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
+
+	// TrailingStop configures the server-side trailing stop manager (#322).
+	// When Enabled, a goroutine periodically recomputes per-trade trailing
+	// stops via `new_stop = max(current_stop, hwm - atr_multiple * ATR)` and
+	// submits/replaces a broker STOP order. Disabled by default.
+	TrailingStop TrailingStopConfig `yaml:"trailing_stop"`
+}
+
+// TrailingStopConfig governs the server-side trailing stop manager (#322).
+// ATRMultiple is a unitless coefficient applied to absolute-price ATR; the
+// trailing stop is `high_water_mark - ATRMultiple * ATR`. With a default of
+// 1.5 a $50 stock with ATR=$1 trails at $48.50 from each new high-water mark.
+// IntervalSec defaults to 60s when zero. ATRPeriod defaults to 14 (Wilder).
+type TrailingStopConfig struct {
+	Enabled     bool    `yaml:"enabled"`
+	ATRMultiple float64 `yaml:"atr_multiple"`
+	IntervalSec int     `yaml:"interval_sec"`
+	ATRPeriod   int     `yaml:"atr_period"`
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
