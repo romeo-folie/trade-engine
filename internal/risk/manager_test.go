@@ -195,7 +195,12 @@ func TestMaxPerTicker_NilMapTreatedAsZero(t *testing.T) {
 
 // Mirrors the engine-side aggregation: 8 open rows for the same
 // (ticker, direction) collapse to a single distinct position and a
-// per-ticker count of 8. Asserts the new fields wire through CheckInput.
+// per-ticker count that depends on the action.
+//
+// The implementation only counts a row toward byTicker when the action
+// matches the row's direction (BUY+long or SELL+short). Subtests pin
+// each action variant so a future change to the gating logic can't
+// silently regress HOLD/WAIT to count as live additions.
 func TestDistinctPositionCounting_EngineAggregation(t *testing.T) {
 	type openTrade struct {
 		Ticker    string
@@ -205,36 +210,70 @@ func TestDistinctPositionCounting_EngineAggregation(t *testing.T) {
 		{"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"},
 		{"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"}, {"JMIA", "long"},
 	}
-	action := "BUY"
-	positions := make(map[string]struct{}, len(openTrades))
-	byTicker := make(map[string]int, len(openTrades))
-	for _, ot := range openTrades {
-		key := ot.Ticker + "|" + ot.Direction
-		positions[key] = struct{}{}
-		if (action == "BUY" && ot.Direction == "long") ||
-			(action == "SELL" && ot.Direction == "short") {
-			byTicker[ot.Ticker]++
+
+	aggregate := func(action string) (positions map[string]struct{}, byTicker map[string]int) {
+		positions = make(map[string]struct{}, len(openTrades))
+		byTicker = make(map[string]int, len(openTrades))
+		for _, ot := range openTrades {
+			key := ot.Ticker + "|" + ot.Direction
+			positions[key] = struct{}{}
+			if (action == "BUY" && ot.Direction == "long") ||
+				(action == "SELL" && ot.Direction == "short") {
+				byTicker[ot.Ticker]++
+			}
 		}
-	}
-	if got := len(positions); got != 1 {
-		t.Fatalf("distinct positions: want 1, got %d", got)
-	}
-	if got := byTicker["JMIA"]; got != 8 {
-		t.Fatalf("byTicker[JMIA]: want 8, got %d", got)
+		return positions, byTicker
 	}
 
-	// Feeding into CheckAll: max_open_positions sees 1 (passes), but the
-	// per-ticker cap of 2 catches the burst.
-	in := baseInput()
-	in.Ticker = "JMIA"
-	in.OpenPositions = len(positions)
-	in.OpenByTicker = byTicker
-	results, ok := CheckAll(in)
-	if ok {
-		t.Fatalf("expected CheckAll to block, got pass; results=%+v", results)
-	}
-	if reason := BlockReason(results); reason == "" {
-		t.Fatal("expected non-empty block reason")
+	t.Run("BUY", func(t *testing.T) {
+		positions, byTicker := aggregate("BUY")
+		if got := len(positions); got != 1 {
+			t.Fatalf("distinct positions: want 1, got %d", got)
+		}
+		if got := byTicker["JMIA"]; got != 8 {
+			t.Fatalf("byTicker[JMIA]: want 8, got %d", got)
+		}
+
+		// Feeding into CheckAll: max_open_positions sees 1 (passes), but the
+		// per-ticker cap of 2 catches the burst.
+		in := baseInput()
+		in.Ticker = "JMIA"
+		in.OpenPositions = len(positions)
+		in.OpenByTicker = byTicker
+		results, ok := CheckAll(in)
+		if ok {
+			t.Fatalf("expected CheckAll to block, got pass; results=%+v", results)
+		}
+		if reason := BlockReason(results); reason == "" {
+			t.Fatal("expected non-empty block reason")
+		}
+	})
+
+	// SELL against 8 long rows must NOT count any of them — a sell
+	// against held longs is a close, not an additional position.
+	t.Run("SELL", func(t *testing.T) {
+		positions, byTicker := aggregate("SELL")
+		if got := len(positions); got != 1 {
+			t.Fatalf("distinct positions: want 1, got %d", got)
+		}
+		if got := byTicker["JMIA"]; got != 0 {
+			t.Fatalf("byTicker[JMIA] for SELL on longs: want 0, got %d", got)
+		}
+	})
+
+	// HOLD/WAIT are non-actions: they must never inflate per-ticker
+	// counts regardless of how many open rows the ticker has.
+	for _, action := range []string{"HOLD", "WAIT"} {
+		action := action
+		t.Run(action, func(t *testing.T) {
+			positions, byTicker := aggregate(action)
+			if got := len(positions); got != 1 {
+				t.Fatalf("distinct positions: want 1, got %d", got)
+			}
+			if got := byTicker["JMIA"]; got != 0 {
+				t.Fatalf("byTicker[JMIA] for %s: want 0, got %d", action, got)
+			}
+		})
 	}
 }
 
