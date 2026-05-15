@@ -59,6 +59,19 @@ func truncate(s string, maxLen int) string {
 	return string(runes[:maxLen-1]) + "…"
 }
 
+// analystResultJSON is a JSON-safe mirror of analysis.AnalystResult.
+// The Err field is intentionally omitted: encoding/json serialises a non-nil
+// error as {} (no exported fields on the concrete type), then fails to
+// deserialise {} back into the error interface — killing the whole slice
+// decode. Active analysts are detected via empty Response.Action instead.
+type analystResultJSON struct {
+	Provider  string                    `json:"Provider"`
+	Model     string                    `json:"Model"`
+	Response  analysis.AnalysisResponse `json:"Response"`
+	Meta      analysis.ModelCallMeta    `json:"Meta"`
+	LatencyMs int64                     `json:"LatencyMs"`
+}
+
 // mapAnalystResults converts raw ensemble_results JSON into API types.
 // Returns nil slices when raw is nil or empty.
 func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
@@ -66,7 +79,7 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 		return nil, nil
 	}
 
-	var results []analysis.AnalystResult
+	var results []analystResultJSON
 	if err := json.Unmarshal(raw, &results); err != nil {
 		return nil, nil
 	}
@@ -90,8 +103,6 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 			model = r.Provider
 		}
 
-		// After JSON round-trip, Err is always nil (error interface
-		// doesn't unmarshal). Detect inactive analysts by empty Action.
 		active := r.Response.Action != ""
 
 		analysts[i] = APIAnalystResult{
