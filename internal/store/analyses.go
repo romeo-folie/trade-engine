@@ -271,6 +271,12 @@ type AnalysisSummary struct {
 	OutputTokens  int       `json:"OutputTokens"`
 	LatencyMs     int       `json:"LatencyMs"`
 	CreatedAt     time.Time `json:"CreatedAt"`
+
+	// Raw bytes for handler-side mapping; not serialized to JSON.
+	EnsembleResultsRaw []byte `json:"-"`
+	ArbiterResponseRaw []byte `json:"-"`
+	FastPathed         bool   `json:"-"`
+	DissentSummaryRaw  string `json:"-"`
 }
 
 // GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.
@@ -281,7 +287,9 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
 		       model_provider, model_name,
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       created_at
+		       created_at,
+		       ensemble_results, arbiter_response,
+		       COALESCE(fast_pathed, false), COALESCE(dissent_summary, '')
 		FROM analyses
 		ORDER BY created_at DESC
 		LIMIT $1`
@@ -300,6 +308,8 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 			&a.ModelProvider, &a.ModelName,
 			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
 			&a.CreatedAt,
+			&a.EnsembleResultsRaw, &a.ArbiterResponseRaw,
+			&a.FastPathed, &a.DissentSummaryRaw,
 		); err != nil {
 			return nil, err
 		}
