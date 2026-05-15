@@ -1,8 +1,31 @@
 import { useEffect, useRef } from 'react';
 import type { AnalysisRecord } from '../../screens/Analysis';
 import { ChamferedBox } from '../common/ChamferedBox';
+import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
 import styles from './AnalysisModal.module.css';
+
+const ANALYST_PALETTE = [
+  colors.analystTechnical,
+  colors.analystMomentum,
+  colors.analystSentiment,
+  colors.analystMacro,
+];
+
+function analystBracketColor(index: number, active: boolean): string {
+  if (!active) return 'var(--border)';
+  return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
+}
+
+function analystBarColor(index: number): string {
+  return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
+}
+
+function verdictColor(verdict: string): string {
+  if (verdict === 'LONG') return 'var(--accent)';
+  if (verdict === 'SHORT') return 'var(--red)';
+  return 'var(--amber)';
+}
 
 interface AnalysisModalProps {
   analysis: AnalysisRecord;
@@ -157,16 +180,38 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                 ANALYST BREAKDOWN{analysis.FastPathed ? ' · FAST-PATH' : ''}
               </div>
               <div className={styles.analystList}>
-                {analysis.AnalystResults.map((a) => (
-                  <div key={a.name} className={`${styles.analystCard} ${!a.active ? styles.analystInactive : ''}`}>
+                {analysis.AnalystResults.map((a, idx) => (
+                  <CornerCard
+                    key={a.name}
+                    bracketColor={analystBracketColor(idx, a.active)}
+                    bracketSize={10}
+                    bracketWidth={1}
+                    className={`${styles.analystCard} ${!a.active ? styles.bypassed : ''}`}
+                  >
                     <div className={styles.analystHeader}>
-                      <span className={styles.analystName}>{a.name}</span>
-                      <span className={`${styles.analystBadge} ${styles[`verdict${a.verdict}`] ?? ''}`}>{a.verdict}</span>
-                      <span className={styles.analystConf}>{(a.confidence * 100).toFixed(0)}%</span>
+                      <div>
+                        <div className={styles.analystName}>{a.name}</div>
+                        {a.model && (
+                          <div className={styles.analystModel}>{a.model}</div>
+                        )}
+                      </div>
+                      <span
+                        className={styles.analystVerdict}
+                        style={{ color: a.active ? verdictColor(a.verdict) : 'var(--text-faint)' }}
+                      >
+                        {a.active ? a.verdict : 'BYPASSED'}
+                      </span>
                     </div>
-                    <div className={styles.analystModel}>{a.model}</div>
+                    {a.active && (
+                      <div className={styles.analystBarTrack}>
+                        <div
+                          className={styles.analystBar}
+                          style={{ background: analystBarColor(idx), width: `${a.confidence * 100}%` }}
+                        />
+                      </div>
+                    )}
                     {a.description && <div className={styles.analystDesc}>{a.description}</div>}
-                  </div>
+                  </CornerCard>
                 ))}
               </div>
             </div>
