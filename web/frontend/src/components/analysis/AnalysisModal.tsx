@@ -134,15 +134,13 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Full Reasoning — prefer arbiter text; fall back to Reasoning only if it isn't a synthetic summary */}
+          {/* Full Reasoning — prefer arbiter text; always fall back to Reasoning (may be a majority-vote summary) */}
           <div className={styles.section}>
             <div className={styles.sectionLabel}>FULL REASONING</div>
             {analysis.ArbiterReasoning ? (
               <div className={styles.reasoning}>{analysis.ArbiterReasoning}</div>
-            ) : analysis.Reasoning && !analysis.Reasoning.startsWith('[') ? (
-              <div className={styles.reasoning}>{analysis.Reasoning}</div>
             ) : (
-              <div className={styles.reasoningEmpty}>No synthesis available — see analyst breakdown below.</div>
+              <div className={styles.reasoning}>{analysis.Reasoning}</div>
             )}
             {analysis.DissentSummary && (
               <div className={styles.dissentBlock}>

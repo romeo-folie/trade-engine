@@ -217,13 +217,6 @@
 
 /* ── Reasoning states ─────────────────────────────────────────────────────── */
 
-.reasoningEmpty {
-  font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--text-dim);
-  font-style: italic;
-}
-
 .dissentBlock {
   margin-top: 16px;
   padding-top: 16px;
