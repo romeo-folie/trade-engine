@@ -238,66 +238,70 @@
 .analystList {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3, 12px);
 }
 
 .analystCard {
-  border: 1px solid var(--border-muted);
-  padding: 12px 14px;
-  background: var(--surface-raised, rgba(255,255,255,0.03));
+  background: var(--card-bg);
+  padding: var(--space-3, 12px) var(--space-4, 16px);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2, 8px);
 }
 
-.analystInactive {
+.bypassed {
   opacity: 0.45;
 }
 
 .analystHeader {
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
 }
 
 .analystName {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--font-size-sm, 13px);
   font-weight: 700;
   color: var(--text-primary);
-  flex: 1;
-}
-
-.analystBadge {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  padding: 1px 6px;
-  border: 1px solid currentColor;
 }
 
-.verdictLONG  { color: var(--emerald); }
-.verdictSHORT { color: var(--red); }
-.verdictNEUTRAL { color: var(--amber); }
-
-.analystConf {
+.analystVerdict {
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-dim);
-  font-variant-numeric: tabular-nums;
+  font-size: var(--font-size-xs, 11px);
+  font-weight: 700;
+  letter-spacing: 0.06em;
 }
 
 .analystModel {
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9px;
   color: var(--text-dim);
-  margin-bottom: 8px;
+  margin-top: 1px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.analystBarTrack {
+  height: 3px;
+  background: var(--border-muted);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.analystBar {
+  height: 100%;
+  border-radius: 2px;
+  transition: width var(--transition-base, 200ms);
 }
 
 .analystDesc {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--font-size-xs, 11px);
   color: var(--text-muted);
-  line-height: 1.6;
+  line-height: 1.5;
   white-space: pre-wrap;
+  overflow: visible;
 }
