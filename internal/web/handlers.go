@@ -880,6 +880,24 @@ func (s *Server) handleRecentTrades(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, map[string]any{"trades": enriched})
 }
 
+// analysisSummaryResponse extends AnalysisSummary with per-analyst and arbiter
+// reasoning fields derived from the JSONB ensemble columns.
+type analysisSummaryResponse struct {
+	store.AnalysisSummary
+	AnalystResults   []APIAnalystResult `json:"AnalystResults,omitempty"`
+	ArbiterReasoning string             `json:"ArbiterReasoning,omitempty"`
+	DissentSummary   string             `json:"DissentSummary,omitempty"`
+	FastPathed       bool               `json:"FastPathed"`
+}
+
+// arbiterFinalWrapper mirrors the top-level shape of a serialised ArbiterResult
+// (ensemble.go). Fields are PascalCase because ArbiterResult has no json tags.
+type arbiterFinalWrapper struct {
+	Final struct {
+		Reasoning string `json:"reasoning"`
+	} `json:"Final"`
+}
+
 // GET /api/analyses/recent?limit=N
 func (s *Server) handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
@@ -890,15 +908,31 @@ func (s *Server) handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
-	analyses, err := store.GetRecentAnalysesSummary(ctx, limit)
+	summaries, err := store.GetRecentAnalysesSummary(ctx, limit)
 	if err != nil {
 		apiError(w, "analyses query failed", err)
 		return
 	}
-	if analyses == nil {
-		analyses = []store.AnalysisSummary{}
+
+	out := make([]analysisSummaryResponse, len(summaries))
+	for i, a := range summaries {
+		r := analysisSummaryResponse{
+			AnalysisSummary: a,
+			FastPathed:      a.FastPathed,
+			DissentSummary:  a.DissentSummaryRaw,
+		}
+		if analysts, _ := mapAnalystResults(a.EnsembleResultsRaw); len(analysts) > 0 {
+			r.AnalystResults = analysts
+		}
+		if len(a.ArbiterResponseRaw) > 0 {
+			var arb arbiterFinalWrapper
+			if json.Unmarshal(a.ArbiterResponseRaw, &arb) == nil {
+				r.ArbiterReasoning = arb.Final.Reasoning
+			}
+		}
+		out[i] = r
 	}
-	jsonResponse(w, map[string]any{"analyses": analyses})
+	jsonResponse(w, map[string]any{"analyses": out})
 }
 
 // GET /api/backtests/runs?limit=N

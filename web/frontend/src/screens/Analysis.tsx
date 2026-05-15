@@ -15,6 +15,16 @@ import styles from './Analysis.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
 
+export interface AnalystResult {
+  name: string;
+  verdict: string;
+  confidence: number;
+  description: string;
+  weight: number;
+  active: boolean;
+  model: string;
+}
+
 export interface AnalysisRecord {
   ID: string;
   Ticker: string;
@@ -31,6 +41,10 @@ export interface AnalysisRecord {
   OutputTokens: number;
   LatencyMs: number;
   CreatedAt: string;
+  AnalystResults: AnalystResult[] | null;
+  ArbiterReasoning: string;
+  DissentSummary: string;
+  FastPathed: boolean;
 }
 
 /* ── Filter tabs ───────────────────────────────────────────────────────────── */

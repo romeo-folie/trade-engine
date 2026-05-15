@@ -134,11 +134,43 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Full Reasoning */}
+          {/* Full Reasoning — prefer arbiter text; always fall back to Reasoning (may be a majority-vote summary) */}
           <div className={styles.section}>
             <div className={styles.sectionLabel}>FULL REASONING</div>
-            <div className={styles.reasoning}>{analysis.Reasoning}</div>
+            {analysis.ArbiterReasoning ? (
+              <div className={styles.reasoning}>{analysis.ArbiterReasoning}</div>
+            ) : (
+              <div className={styles.reasoning}>{analysis.Reasoning}</div>
+            )}
+            {analysis.DissentSummary && (
+              <div className={styles.dissentBlock}>
+                <span className={styles.dissentLabel}>DISSENT</span>
+                <div className={styles.reasoning}>{analysis.DissentSummary}</div>
+              </div>
+            )}
           </div>
+
+          {/* Per-analyst breakdown */}
+          {analysis.AnalystResults && analysis.AnalystResults.length > 0 && (
+            <div className={styles.section}>
+              <div className={styles.sectionLabel}>
+                ANALYST BREAKDOWN{analysis.FastPathed ? ' · FAST-PATH' : ''}
+              </div>
+              <div className={styles.analystList}>
+                {analysis.AnalystResults.map((a) => (
+                  <div key={a.name} className={`${styles.analystCard} ${!a.active ? styles.analystInactive : ''}`}>
+                    <div className={styles.analystHeader}>
+                      <span className={styles.analystName}>{a.name}</span>
+                      <span className={`${styles.analystBadge} ${styles[`verdict${a.verdict}`] ?? ''}`}>{a.verdict}</span>
+                      <span className={styles.analystConf}>{(a.confidence * 100).toFixed(0)}%</span>
+                    </div>
+                    <div className={styles.analystModel}>{a.model}</div>
+                    {a.description && <div className={styles.analystDesc}>{a.description}</div>}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {/* Signal Parameters */}
           <div className={styles.section}>
