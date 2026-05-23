@@ -14,7 +14,7 @@ func TestBuildStockPrompt_MomentumPlay(t *testing.T) {
 	momentumMarkers := []string{
 		"momentum trader",
 		"entry is STILL valid",
-		"WAIT means re-evaluate next cycle",
+		"use ONLY when you can name a specific, concrete blocker",
 	}
 	for _, m := range momentumMarkers {
 		if !strings.Contains(sys, m) {
@@ -72,7 +72,7 @@ func TestBuildStockPrompt_RRSelfFilter(t *testing.T) {
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
 	)
 
-	const phrase = "Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5."
+	const phrase = "Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2."
 	if !strings.Contains(standardSys, phrase) {
 		t.Fatalf("standard system prompt missing R:R self-filter guidance:\n%s", standardSys)
 	}

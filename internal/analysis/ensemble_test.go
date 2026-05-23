@@ -158,8 +158,11 @@ func TestMajorityVote_WaitMajority(t *testing.T) {
 	}
 }
 
-func TestMajorityVote_TieWaitVsBuyReturnsWait(t *testing.T) {
-	// WAIT and BUY tied → WAIT wins (don't rush into poor timing).
+func TestMajorityVote_TieWaitVsBuyReturnsBuy(t *testing.T) {
+	// WAIT and BUY tied → BUY wins. Production showed WAIT-wins-ties was the
+	// dominant reason directional signals were silently downgraded.
+	// Refusing to act on a 50/50 split is a worse default than acting on the
+	// directional side analysts proposed.
 	results := []AnalystResult{
 		makeResult(ActionWait, 0.80, nil),
 		makeResult(ActionBuy, 0.80, nil),
@@ -168,8 +171,41 @@ func TestMajorityVote_TieWaitVsBuyReturnsWait(t *testing.T) {
 	if !ok {
 		t.Fatal("majorityVote should succeed")
 	}
-	if resp.Action != ActionWait {
-		t.Fatalf("action = %q, want WAIT on WAIT-BUY tie (conservative)", resp.Action)
+	if resp.Action != ActionBuy {
+		t.Fatalf("action = %q, want BUY on WAIT-BUY tie (directional wins)", resp.Action)
+	}
+}
+
+func TestMajorityVote_TieWaitVsSellReturnsSell(t *testing.T) {
+	// Mirror of the WAIT-vs-BUY case for SELL.
+	results := []AnalystResult{
+		makeResult(ActionWait, 0.80, nil),
+		makeResult(ActionSell, 0.80, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionSell {
+		t.Fatalf("action = %q, want SELL on WAIT-SELL tie (directional wins)", resp.Action)
+	}
+}
+
+func TestMajorityVote_TieTradeVsSkipReturnsSkip(t *testing.T) {
+	// ORB fallback: TRADE and SKIP tied → SKIP wins. The conservative ORB gate
+	// must hold on the arbiter-fallback path — a split candidate must not become
+	// executable just because the arbiter failed (PR #346 review). This is
+	// deliberately the opposite of the stock WAIT-vs-directional flip.
+	results := []AnalystResult{
+		makeResult(ActionTrade, 0.80, nil),
+		makeResult(ActionSkip, 0.80, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionSkip {
+		t.Fatalf("action = %q, want SKIP on TRADE-SKIP tie (ORB stays conservative)", resp.Action)
 	}
 }
 
