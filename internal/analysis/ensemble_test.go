@@ -191,6 +191,24 @@ func TestMajorityVote_TieWaitVsSellReturnsSell(t *testing.T) {
 	}
 }
 
+func TestMajorityVote_TieTradeVsSkipReturnsSkip(t *testing.T) {
+	// ORB fallback: TRADE and SKIP tied → SKIP wins. The conservative ORB gate
+	// must hold on the arbiter-fallback path — a split candidate must not become
+	// executable just because the arbiter failed (PR #346 review). This is
+	// deliberately the opposite of the stock WAIT-vs-directional flip.
+	results := []AnalystResult{
+		makeResult(ActionTrade, 0.80, nil),
+		makeResult(ActionSkip, 0.80, nil),
+	}
+	resp, ok := majorityVote(results)
+	if !ok {
+		t.Fatal("majorityVote should succeed")
+	}
+	if resp.Action != ActionSkip {
+		t.Fatalf("action = %q, want SKIP on TRADE-SKIP tie (ORB stays conservative)", resp.Action)
+	}
+}
+
 func TestMajorityVote_TieWaitVsHoldReturnsHold(t *testing.T) {
 	// WAIT and HOLD tied → HOLD wins (more conservative; no confirmed catalyst).
 	results := []AnalystResult{

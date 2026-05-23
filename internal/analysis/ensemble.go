@@ -208,10 +208,18 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 			leaders = append(leaders, action)
 		}
 	}
-	// Resolve ties: HOLD > directional > WAIT > SKIP.
-	// Tracks the production observation that WAIT-vs-BUY ties were dominating
-	// signal generation; flipping the cascade lets a 1-BUY/1-WAIT (or 2/2)
-	// split produce a trade rather than another no-op.
+	// Resolve ties. Two action vocabularies use this fallback and they never
+	// mix in one ensemble: the stock pipeline emits BUY/SELL/HOLD/WAIT, the ORB
+	// pipeline emits TRADE/SKIP. The only real-world tie pairs are therefore
+	// WAIT-vs-directional (stock) and TRADE-vs-SKIP (ORB), so each is ordered
+	// for its own context:
+	//   - Stock: HOLD > BUY/SELL > WAIT. Production showed WAIT-wins-ties was
+	//     silently downgrading directional signals; directional now wins so a
+	//     1-BUY/1-WAIT (or 2/2) split produces a trade rather than a no-op.
+	//   - ORB: SKIP > TRADE. SKIP stays ahead of TRADE so the conservative ORB
+	//     gate is unchanged — a split ORB candidate must not become executable
+	//     on the arbiter-fallback path (PR #346 review).
+	// Opposed BUY-vs-SELL ties fall to HOLD (no directional bias).
 	var winner Action
 	if len(leaders) == 1 {
 		winner = leaders[0]
@@ -229,12 +237,12 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 			winner = ActionBuy // directional beats WAIT on a tie.
 		case hasSell:
 			winner = ActionSell
+		case counts[ActionSkip] == maxCount:
+			winner = ActionSkip // SKIP beats TRADE on a tie (ORB conservative — unchanged).
 		case hasTrade:
 			winner = ActionTrade
 		case counts[ActionWait] == maxCount:
 			winner = ActionWait
-		case counts[ActionSkip] == maxCount:
-			winner = ActionSkip
 		default:
 			winner = ActionHold
 		}
