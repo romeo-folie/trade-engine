@@ -320,9 +320,10 @@ func TestResolveSpecialist(t *testing.T) {
 				// Risk-manager errored → veto unavailable → majority fallback.
 				makeRoleResult("risk_manager", ActionBuy, 0.0, fmt.Errorf("timeout")),
 			},
-			// Two successful: BUY and WAIT — tie. majorityVote conservative
-			// cascade gives WAIT priority over BUY on a tie.
-			wantAct:  ActionWait,
+			// Two successful: BUY and WAIT — tie. majorityVote now resolves
+			// ties to the directional side (BUY beats WAIT) so signals
+			// aren't silently downgraded when one analyst hedges.
+			wantAct:  ActionBuy,
 			wantNote: "majority-vote fallback",
 		},
 		{

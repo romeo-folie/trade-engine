@@ -24,8 +24,8 @@ func TestDefaultsTickInterval(t *testing.T) {
 
 func TestDefaultsRiskThreshold(t *testing.T) {
 	cfg := Defaults()
-	if cfg.Risk.ConfidenceThreshold != 0.65 {
-		t.Errorf("default confidence_threshold = %f, want 0.65", cfg.Risk.ConfidenceThreshold)
+	if cfg.Risk.ConfidenceThreshold != 0.55 {
+		t.Errorf("default confidence_threshold = %f, want 0.55", cfg.Risk.ConfidenceThreshold)
 	}
 }
 

@@ -174,11 +174,14 @@ func arbiterLabel(i int) string {
 // ─── Majority vote fallback ─────────────────────────────────────────────────────
 
 // majorityVote returns the action with the most votes.
-// Tie-breaking follows a conservative cascade: HOLD > WAIT > SKIP > directional.
-// Rationale: HOLD means "no interest"; WAIT means "interested, poor timing";
-// SKIP is ORB mode's conservative gate; BUY/SELL/TRADE means "act now".
-// Iterates over whatever actions are present in counts so ORB-mode TRADE/SKIP
-// votes are correctly tallied when majorityVote is used as an arbiter fallback.
+// Tie-breaking cascade: HOLD > directional > WAIT > SKIP.
+// Rationale: HOLD means "no interest, drop from active consideration" — a real
+// signal of disengagement, so it wins. Among directional (BUY/SELL) vs WAIT,
+// directional wins: when analysts are split, refusing to act is a worse default
+// than acting on the directional side they're proposing. WAIT is only the
+// winner when it has an outright plurality. SKIP is ORB-mode's conservative
+// gate and remains last. BUY-vs-SELL ties still resolve to HOLD (no directional
+// bias on opposed signals).
 func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 	successes := successfulResults(results)
 	if len(successes) == 0 {
@@ -205,20 +208,34 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 			leaders = append(leaders, action)
 		}
 	}
-	// Resolve ties with the conservative cascade: HOLD > WAIT > SKIP > directional.
+	// Resolve ties: HOLD > directional > WAIT > SKIP.
+	// Tracks the production observation that WAIT-vs-BUY ties were dominating
+	// signal generation; flipping the cascade lets a 1-BUY/1-WAIT (or 2/2)
+	// split produce a trade rather than another no-op.
 	var winner Action
 	if len(leaders) == 1 {
 		winner = leaders[0]
 	} else {
+		hasBuy := counts[ActionBuy] == maxCount
+		hasSell := counts[ActionSell] == maxCount
+		hasTrade := counts[ActionTrade] == maxCount
 		switch {
 		case counts[ActionHold] == maxCount:
-			winner = ActionHold // HOLD beats everything on a tie
+			winner = ActionHold // HOLD ("drop ticker") still wins ties — true disengagement signal.
+		case hasBuy && hasSell:
+			// Opposed directional signals — no directional bias, fall to HOLD.
+			winner = ActionHold
+		case hasBuy:
+			winner = ActionBuy // directional beats WAIT on a tie.
+		case hasSell:
+			winner = ActionSell
+		case hasTrade:
+			winner = ActionTrade
 		case counts[ActionWait] == maxCount:
-			winner = ActionWait // WAIT beats BUY/SELL/TRADE on a tie
+			winner = ActionWait
 		case counts[ActionSkip] == maxCount:
-			winner = ActionSkip // SKIP beats TRADE on a tie (ORB conservative)
+			winner = ActionSkip
 		default:
-			// Multiple directional actions tied — signal is ambiguous, use HOLD.
 			winner = ActionHold
 		}
 	}
@@ -266,16 +283,23 @@ Output ONLY a valid JSON object:
 }
 
 Action semantics:
-- BUY / SELL: strong catalyst AND entry timing is favourable — act now.
-- WAIT: real, material catalyst exists but entry conditions are not yet met
-  (e.g. extreme gap-up with no intraday range, consolidation in progress).
-  Set size_pct to 0 for WAIT. High confidence is valid for WAIT — it reflects
-  conviction in the catalyst, not in the timing.
+- BUY / SELL: directional catalyst is present and the trade can be structured
+  with a defined stop and target. You do not need perfect timing — markets
+  rarely give it. A reasonable entry with a defined risk is sufficient.
+- WAIT: use ONLY when you can name a specific, concrete blocker that prevents
+  entry on this cycle. Acceptable blockers are factual: "price is %.2f above
+  the named resistance at $X with no pullback printed", "earnings release in
+  under 4 hours", "20%%+ gap with zero established intraday range and no
+  volume confirmation". Vague language like "timing feels off", "wait for
+  clarity", "let it settle", "consolidation in progress" is NOT a valid
+  blocker — if you find yourself reaching for those phrases, return BUY or
+  SELL with appropriately reduced confidence instead. Set size_pct to 0 for
+  WAIT.
 - HOLD: no meaningful catalyst or setup — nothing to track.
 
-If a significant minority of analysts voted WAIT on valid-catalyst grounds
-but the majority voted BUY, weigh whether entry timing is ambiguous enough
-to prefer WAIT over a premature entry.
+DECISION BIAS: when analysts disagree, default to the directional side they
+propose unless WAIT is justified by a concrete, named blocker per the rules
+above. Refusing to act is a decision with its own cost; treat it as one.
 
 Do not include any text outside the JSON object.`
 }

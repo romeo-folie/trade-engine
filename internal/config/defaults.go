@@ -172,7 +172,7 @@ func Defaults() *Config {
 			},
 		},
 		Risk: RiskConfig{
-			ConfidenceThreshold: 0.65,
+			ConfidenceThreshold: 0.55,
 			// ConfidenceTiers defaults to nil so existing configs that omit
 			// `risk.confidence_tiers` keep using the static
 			// `confidence_threshold` floor (#317 review). Pre-filling tiers
@@ -181,9 +181,9 @@ func Defaults() *Config {
 			// MaxPerTicker default-overlay bug). Opt in via YAML;
 			// config.example.yaml carries the recommended tier ladder.
 			ConfidenceTiers:      nil,
-			MinRiskReward:        1.4,
+			MinRiskReward:        1.2,
 			MaxPositionPct:       5.0,
-			MaxOpenPositions:     10,
+			MaxOpenPositions:     20,
 			MaxPerTicker:         0,
 			MaxDollarRiskPct:     1.0,
 			PyramidEnabled:       false,
@@ -193,7 +193,7 @@ func Defaults() *Config {
 			CooldownAfterLoss:    60,
 			DefaultStopLossPct:   2.0,
 			DefaultTakeProfitPct: 4.0,
-			SignalExpiryMin:      30,
+			SignalExpiryMin:      120,
 			StalePriceMovePct:    2.0,
 		},
 		Notifications: NotificationsConfig{

@@ -7,7 +7,7 @@ import (
 
 // rrSelfFilterSentence is the literal R:R guidance sentence required by PR #334
 // in every system prompt. The role-specialist prompts (Issue #323) MUST keep it.
-const rrSelfFilterSentence = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.`
+const rrSelfFilterSentence = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.`
 
 func TestRolePrompts_RoleSpecificMarkers(t *testing.T) {
 	cases := []struct {

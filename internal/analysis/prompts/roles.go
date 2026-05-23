@@ -11,7 +11,11 @@ import "fmt"
 
 // rrSelfFilter is the literal R:R guidance sentence required by PR #334.
 // Tests assert this exact string is present in every role prompt.
-const rrSelfFilter = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.`
+// Threshold lowered from 1.5 → 1.2 to match the gate calibration in
+// config.yaml.risk.min_risk_reward (operator preference for risk-tolerant
+// trading; prompt-level filter must not exceed the gate or signals get
+// downgraded to WAIT at the source and never reach the gate).
+const rrSelfFilter = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.`
 
 // roleOutputSchema is the shared JSON-schema block all role prompts emit.
 const roleOutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
@@ -101,16 +105,17 @@ YOUR MANDATE: enforce risk discipline. Anchor on portfolio exposure, position si
 %s
 
 ROLE GUIDANCE:
-- PREFER WAIT OVER BUY whenever any of the following are true:
-  - Stop distance exceeds 2x ATR (over-extended entry)
-  - Position size implied by sizing rules would exceed the 5%% per-position cap
-  - The portfolio already holds a correlated long with material exposure
-  - R:R is below 1.5 (the self-filter forces WAIT — emit it)
-  - Drawdown is elevated and adding fresh risk is imprudent
-- BUY only when sizing, exposure, R:R, and stop placement all clear. Conviction is not enough — discipline is.
+- VETO with WAIT (or HOLD when the setup is dead) ONLY when you can name a concrete, specific discipline failure:
+  - Stop distance exceeds 2.5x ATR (over-extended entry — name the ATR value)
+  - Position size implied by sizing rules would exceed the 5%% per-position cap (name the size)
+  - Portfolio already holds the SAME ticker at full per-ticker cap, or a directly correlated long that would compound a named macro/sector risk
+  - R:R is below 1.2 (the self-filter forces a wider TP / tighter SL — emit WAIT only if neither is plausible)
+  - Drawdown exceeds 10%% AND current equity is within 2%% of the daily loss limit
+- A vague concern ("conditions seem risky", "uncertainty is elevated", "let it settle") is NOT a valid veto. If you cannot name the specific number that fails, you do not have a veto.
+- BUY when the trade structure clears the named discipline checks above. You are the safety circuit, not a permanent brake — your role only exists to catch concrete violations, not to second-guess every directional signal.
 - SELL when an existing long is breaching its stop, exposure has grown beyond comfort, or correlation risk has materialised.
 - HOLD when there is no actionable signal — discipline does not mean opining on every chart.
-- Your reasoning MUST explicitly state the discipline check that drove the verdict (e.g. "veto: stop is 2.4x ATR — too wide", "veto: AAPL/MSFT correlation already at portfolio limit"). Use the words "veto" or "discipline" when blocking a setup the other analysts may favour.
+- Your reasoning MUST explicitly state the discipline check that drove the verdict, with concrete numbers (e.g. "veto: stop is 2.6x ATR (ATR=$1.20, stop=$3.10 below entry)"). If you cannot quote a number, do not emit a veto — pass to the directional consensus.
 
 %s`, strategy, roleOutputSchema, rrSelfFilter)
 }

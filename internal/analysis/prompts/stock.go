@@ -122,10 +122,10 @@ RULES:
 ENTRY DECISION GUIDE:
 - BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 1.5:1 with a clear stop below recent structure.
 - SELL: catalyst is negative, price shows exhaustion or a failed breakout, or a long position should exit.
-- WAIT: the setup is valid but timing is poor — gap too wide, no intraday base formed yet, or consolidation still in progress. WAIT means re-evaluate next cycle.
+- WAIT: use ONLY when you can name a specific, concrete blocker (e.g. "price is $X above named resistance with no pullback", "earnings in under 4 hours", "gap >20%% with zero intraday range printed"). Vague timing language ("setup forming", "wait for clarity", "consolidation in progress") is NOT a valid blocker — propose BUY/SELL with reduced confidence instead, or HOLD if the setup is genuinely dead.
 - HOLD: the original momentum has faded, the catalyst is fully priced in, or the setup has failed. Remove this ticker from active consideration.
 
-R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.
+R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
 
 SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.`, strategy)
 }
@@ -153,19 +153,23 @@ RULES:
 - If data is insufficient, return HOLD with low confidence.
 - Never recommend size_pct > 0 for a HOLD or WAIT action.
 - Use HOLD when there is no meaningful catalyst or setup worth tracking.
-- Use WAIT when the catalyst is real and material but entry conditions are not
-  yet met — for example: extreme gap-up with no established intraday range,
-  consolidation still in progress, or pre-breakout compression not yet resolved.
-  WAIT signals re-evaluation on the next cycle. High confidence is valid for
-  WAIT — it reflects conviction in the catalyst, not in the entry timing.
-- Use BUY or SELL only when the catalyst is strong AND entry timing is favourable.
-- R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.5, set action to WAIT and do not propose entry. Only emit BUY if R:R >= 1.5.
+- Use WAIT ONLY when you can name a specific, concrete blocker preventing
+  entry on this cycle. Acceptable blockers are factual: "price is %%.2f above
+  the named resistance at $X with no pullback printed", "earnings release in
+  under 4 hours", "gap >20%% with zero intraday range and no volume
+  confirmation". Vague language ("timing feels off", "wait for clarity",
+  "consolidation in progress", "let it settle") is NOT a valid blocker. If
+  the setup has a reasonable entry with a defined stop, propose BUY or SELL
+  with reduced confidence rather than WAIT. Refusing to act has a cost too.
+- Use BUY or SELL when there is a directional catalyst and the trade can be
+  structured with a defined stop and target. You do not need perfect timing.
+- R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
 
 USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trades in last 30 days):
 - Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
 - Ticker win rate >= 65%%: full confidence range (0.0–1.0) is available.
 - Ticker win rate 45%%–65%%: no constraint — use your normal judgment.
-- Ticker avg PnL is negative: bias toward HOLD or WAIT unless the current setup provides a clearly stronger catalyst than usual.
+- Ticker avg PnL is negative: lower your confidence by 0.05–0.10 but still propose BUY/SELL if the setup is otherwise sound. Do not use this as a blanket reason to WAIT.
 
 USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
