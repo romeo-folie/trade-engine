@@ -120,7 +120,7 @@ RULES:
 - Focus on short/medium timeframe signals (1H, 4H candles) over daily trend context.
 
 ENTRY DECISION GUIDE:
-- BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 1.5:1 with a clear stop below recent structure.
+- BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 1.2:1 with a clear stop below recent structure.
 - SELL: catalyst is negative, price shows exhaustion or a failed breakout, or a long position should exit.
 - WAIT: use ONLY when you can name a specific, concrete blocker (e.g. "price is $X above named resistance with no pullback", "earnings in under 4 hours", "gap >20%% with zero intraday range printed"). Vague timing language ("setup forming", "wait for clarity", "consolidation in progress") is NOT a valid blocker — propose BUY/SELL with reduced confidence instead, or HOLD if the setup is genuinely dead.
 - HOLD: the original momentum has faded, the catalyst is fully priced in, or the setup has failed. Remove this ticker from active consideration.
