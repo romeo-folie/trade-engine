@@ -320,6 +320,17 @@ type ModelConfig struct {
 	MaxTokens   int     `yaml:"max_tokens"`
 	Temperature float64 `yaml:"temperature"`
 	TimeoutSec  int     `yaml:"timeout_sec"`
+	// ThinkingBudget controls Gemini 2.5 "thinking" tokens. Gemini counts
+	// thinking tokens inside maxOutputTokens, so unbounded thinking can starve
+	// the visible answer and truncate it mid-string. Semantics (google provider):
+	//   > 0  → bounded thinking; client sends maxOutputTokens = max_tokens + budget
+	//   < 0  → dynamic thinking (-1); operator must size max_tokens generously
+	//   == 0 → unset; no thinkingConfig sent, so the model keeps its native
+	//          default. (We can't force a budget of 0 because some models —
+	//          gemini-2.5-pro, gemini-3 — reject a disabled thinking budget,
+	//          and an int field can't distinguish explicit 0 from omitted.)
+	// Ignored by non-Gemini providers.
+	ThinkingBudget int `yaml:"thinking_budget"`
 }
 
 // ModelRegistryEntry extends ModelConfig with an optional fallback registry key.

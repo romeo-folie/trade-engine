@@ -68,10 +68,39 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		temperature = 0.7
 	}
 
+	// Gemini 2.5 counts thinking tokens inside maxOutputTokens. Left unbounded,
+	// a verbose thinking phase can consume the whole budget and leave too few
+	// tokens for the JSON answer, truncating it mid-string. When a thinking_budget
+	// is configured we send an explicit thinkingConfig and add headroom so the
+	// answer (maxTokens) can never be crowded out by thinking (thinkingBudget).
+	genConfig := map[string]any{
+		"temperature":      temperature,
+		"responseMimeType": "application/json",
+	}
+	thinkingBudget := c.cfg.ThinkingBudget
+	maxOut := maxTokens
+	switch {
+	case thinkingBudget > 0:
+		// Bounded thinking + headroom: the answer (maxTokens) can never be
+		// crowded out because thinking has its own dedicated budget on top.
+		maxOut = maxTokens + thinkingBudget
+		genConfig["thinkingConfig"] = map[string]any{"thinkingBudget": thinkingBudget}
+	case thinkingBudget < 0:
+		// Dynamic thinking (-1): Gemini sizes its own budget; the operator owns
+		// keeping max_tokens generous enough to leave room for the answer.
+		genConfig["thinkingConfig"] = map[string]any{"thinkingBudget": -1}
+	}
+	// thinkingBudget == 0 (unset): send no thinkingConfig and leave maxOutputTokens
+	// at the answer budget. This preserves each model's native default — some
+	// Gemini models (2.5-pro, gemini-3) cannot have thinking disabled, so we must
+	// not force a budget of 0 on them. The MAX_TOKENS guard below still catches
+	// any truncation that results.
+	genConfig["maxOutputTokens"] = maxOut
+
 	body := map[string]any{
 		"systemInstruction": map[string]any{"parts": []map[string]any{{"text": systemPrompt}}},
 		"contents":          []map[string]any{{"role": "user", "parts": []map[string]any{{"text": userMessage}}}},
-		"generationConfig":  map[string]any{"maxOutputTokens": maxTokens, "temperature": temperature, "responseMimeType": "application/json"},
+		"generationConfig":  genConfig,
 	}
 	bodyBytes, err := json.Marshal(body)
 	if err != nil {
@@ -112,7 +141,8 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 
 	var apiResp struct {
 		Candidates []struct {
-			Content struct {
+			FinishReason string `json:"finishReason"`
+			Content      struct {
 				Parts []struct {
 					Text string `json:"text"`
 				} `json:"parts"`
@@ -121,14 +151,18 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		UsageMetadata struct {
 			PromptTokenCount     int `json:"promptTokenCount"`
 			CandidatesTokenCount int `json:"candidatesTokenCount"`
+			ThoughtsTokenCount   int `json:"thoughtsTokenCount"`
 		} `json:"usageMetadata"`
 	}
 	if err := json.Unmarshal(respBytes, &apiResp); err != nil {
 		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini parse response: %w", err)
 	}
-	var rawText string
-	if len(apiResp.Candidates) > 0 && len(apiResp.Candidates[0].Content.Parts) > 0 {
-		rawText = apiResp.Candidates[0].Content.Parts[0].Text
+	var rawText, finishReason string
+	if len(apiResp.Candidates) > 0 {
+		finishReason = apiResp.Candidates[0].FinishReason
+		if len(apiResp.Candidates[0].Content.Parts) > 0 {
+			rawText = apiResp.Candidates[0].Content.Parts[0].Text
+		}
 	}
 	meta := ModelCallMeta{
 		Provider: "google", Model: c.cfg.Model, PromptHash: promptHash,
@@ -137,6 +171,26 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		OutputTokens:  apiResp.UsageMetadata.CandidatesTokenCount,
 		LatencyMs:     latencyMs,
 		IndicatorJSON: indicatorJSON,
+	}
+
+	// A MAX_TOKENS finish means the answer was cut off — thinking and/or output
+	// hit maxOutputTokens. extractAnalysisJSON would otherwise leniently salvage
+	// a partial JSON (e.g. a reasoning string truncated mid-word) and persist it.
+	// Fail loudly instead so the analyst is dropped, not stored half-formed.
+	if finishReason == "MAX_TOKENS" {
+		if req.Ticker != "__extraction__" {
+			logger.Warn("gemini: response truncated by token cap",
+				"ticker", req.Ticker,
+				"model", c.cfg.Model,
+				"thinking_tokens", apiResp.UsageMetadata.ThoughtsTokenCount,
+				"answer_tokens", apiResp.UsageMetadata.CandidatesTokenCount,
+				"max_output_tokens", maxOut,
+				"raw_len", len(rawText),
+			)
+		}
+		return AnalysisResponse{}, meta, fmt.Errorf(
+			"gemini truncated (finishReason=MAX_TOKENS): thinking %d + answer %d hit maxOutputTokens %d; raise max_tokens or lower thinking_budget",
+			apiResp.UsageMetadata.ThoughtsTokenCount, apiResp.UsageMetadata.CandidatesTokenCount, maxOut)
 	}
 	analysis, err := extractAnalysisJSON(rawText)
 	if err != nil {
