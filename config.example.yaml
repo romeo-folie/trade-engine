@@ -33,6 +33,12 @@ models:
       max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
+      # gemini-2.5-flash counts "thinking" tokens inside maxOutputTokens. Without
+      # a dedicated budget, a long thinking phase starves the JSON answer and
+      # truncates it mid-string. thinking_budget gives thinking its own allowance;
+      # the client then requests maxOutputTokens = max_tokens + thinking_budget so
+      # the answer can never be crowded out. Set 0/omit to disable, -1 for dynamic.
+      thinking_budget: 1024
       fallback: gemini_flash            # fallback registry key on 429/503
     gemini_flash:
       provider: google

@@ -129,6 +129,152 @@ func TestGeminiClient_Analyze_InvalidJSON(t *testing.T) {
 	}
 }
 
+// geminiRespWithFinish builds a response with an explicit finishReason and a
+// thoughtsTokenCount, for exercising the thinking/truncation paths.
+func geminiRespWithFinish(text, finishReason string, thoughts int) map[string]any {
+	return map[string]any{
+		"candidates": []map[string]any{
+			{
+				"finishReason": finishReason,
+				"content": map[string]any{
+					"parts": []map[string]any{{"text": text}},
+				},
+			},
+		},
+		"usageMetadata": map[string]any{
+			"promptTokenCount":     10,
+			"candidatesTokenCount": 20,
+			"thoughtsTokenCount":   thoughts,
+		},
+	}
+}
+
+// captureGeminiBody returns a server that records the request body and replies
+// with the given canned response, plus a channel to read the captured body.
+func captureGeminiBody(t *testing.T, resp map[string]any) (*httptest.Server, <-chan map[string]any) {
+	t.Helper()
+	bodyCh := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		bodyCh <- body
+		json.NewEncoder(w).Encode(resp)
+	}))
+	return srv, bodyCh
+}
+
+func genConfigFrom(t *testing.T, body map[string]any) map[string]any {
+	t.Helper()
+	gc, ok := body["generationConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("generationConfig missing or wrong type: %T", body["generationConfig"])
+	}
+	return gc
+}
+
+// With a positive thinking_budget, the client must bound thinking and add
+// headroom so the visible answer can't be starved: maxOutputTokens = max + budget.
+func TestGeminiClient_Analyze_ThinkingBudget_Headroom(t *testing.T) {
+	payload := `{"action":"WAIT","confidence":0.6,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"ok"}`
+	srv, bodyCh := captureGeminiBody(t, geminiRespWithFinish(payload, "STOP", 800))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash", APIKey: "test-key", MaxTokens: 2048, ThinkingBudget: 1024}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := genConfigFrom(t, <-bodyCh)
+	if got := gc["maxOutputTokens"].(float64); got != 3072 {
+		t.Errorf("maxOutputTokens = %v, want 3072 (2048 answer + 1024 thinking)", got)
+	}
+	tc, ok := gc["thinkingConfig"].(map[string]any)
+	if !ok {
+		t.Fatalf("thinkingConfig missing: %T", gc["thinkingConfig"])
+	}
+	if got := tc["thinkingBudget"].(float64); got != 1024 {
+		t.Errorf("thinkingBudget = %v, want 1024", got)
+	}
+}
+
+// With thinking_budget unset (0), the client sends no thinkingConfig (preserving
+// the model's native default) and maxOutputTokens equals the answer budget.
+func TestGeminiClient_Analyze_ThinkingUnsetIsNative(t *testing.T) {
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"ok"}`
+	srv, bodyCh := captureGeminiBody(t, geminiRespWithFinish(payload, "STOP", 0))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash-lite", APIKey: "test-key", MaxTokens: 2048}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := genConfigFrom(t, <-bodyCh)
+	if got := gc["maxOutputTokens"].(float64); got != 2048 {
+		t.Errorf("maxOutputTokens = %v, want 2048 (no headroom)", got)
+	}
+	if _, present := gc["thinkingConfig"]; present {
+		t.Errorf("thinkingConfig should be absent when thinking_budget is unset, got %v", gc["thinkingConfig"])
+	}
+}
+
+// A negative thinking_budget requests dynamic thinking (-1) without adding
+// headroom — the operator owns sizing max_tokens.
+func TestGeminiClient_Analyze_ThinkingDynamic(t *testing.T) {
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"ok"}`
+	srv, bodyCh := captureGeminiBody(t, geminiRespWithFinish(payload, "STOP", 0))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash", APIKey: "test-key", MaxTokens: 4096, ThinkingBudget: -1}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	gc := genConfigFrom(t, <-bodyCh)
+	if got := gc["maxOutputTokens"].(float64); got != 4096 {
+		t.Errorf("maxOutputTokens = %v, want 4096 (no headroom for dynamic)", got)
+	}
+	tc := gc["thinkingConfig"].(map[string]any)
+	if got := tc["thinkingBudget"].(float64); got != -1 {
+		t.Errorf("thinkingBudget = %v, want -1 (dynamic)", got)
+	}
+}
+
+// A MAX_TOKENS finish must surface as an error even though the partial JSON is
+// otherwise salvageable — otherwise a truncated reasoning gets persisted.
+func TestGeminiClient_Analyze_MaxTokensTruncation(t *testing.T) {
+	// Valid-but-truncated style payload the lenient extractor could salvage.
+	partial := `{"action":"WAIT","confidence":0.7,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"NVDA exhibits short-`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(geminiRespWithFinish(partial, "MAX_TOKENS", 1981))
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash", APIKey: "test-key", MaxTokens: 2048, ThinkingBudget: 1024}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	_, meta, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "NVDA"})
+	if err == nil {
+		t.Fatal("expected error on MAX_TOKENS finish")
+	}
+	if !strings.Contains(err.Error(), "MAX_TOKENS") {
+		t.Errorf("error = %q, want mention of MAX_TOKENS", err.Error())
+	}
+	// Meta is still returned for observability (raw response preserved).
+	if meta.RawResponse == "" {
+		t.Error("expected meta.RawResponse to be populated for diagnostics")
+	}
+}
+
 func TestGeminiClient_Analyze_CustomPrompt(t *testing.T) {
 	bodyCh := make(chan map[string]any, 1)
 	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"custom"}`
