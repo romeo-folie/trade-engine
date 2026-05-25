@@ -325,7 +325,10 @@ type ModelConfig struct {
 	// the visible answer and truncate it mid-string. Semantics (google provider):
 	//   > 0  → bounded thinking; client sends maxOutputTokens = max_tokens + budget
 	//   < 0  → dynamic thinking (-1); operator must size max_tokens generously
-	//   == 0 → thinking disabled (deterministic, full-length answer). Default.
+	//   == 0 → unset; no thinkingConfig sent, so the model keeps its native
+	//          default. (We can't force a budget of 0 because some models —
+	//          gemini-2.5-pro, gemini-3 — reject a disabled thinking budget,
+	//          and an int field can't distinguish explicit 0 from omitted.)
 	// Ignored by non-Gemini providers.
 	ThinkingBudget int `yaml:"thinking_budget"`
 }
