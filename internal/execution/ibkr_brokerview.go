@@ -4,8 +4,32 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 )
+
+// ibkrFloat decodes a numeric field that the IBKR Client Portal may serialize
+// either as a JSON number (1.1750) or as a quoted string ("1.1750"). The
+// /iserver/account/trades endpoint returns size and price as strings, which a
+// plain float64 field cannot decode — this previously failed every ORB exit
+// reconcile with "cannot unmarshal string into Go struct field .price of type
+// float64", leaving filled trades stranded with no exit price or PnL.
+type ibkrFloat float64
+
+func (f *ibkrFloat) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	v, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return fmt.Errorf("ibkrFloat: parse %q: %w", s, err)
+	}
+	*f = ibkrFloat(v)
+	return nil
+}
 
 // IBKRBroker satisfies BrokerView. IBKR Client Portal does not expose a
 // portfolio-history endpoint comparable to Alpaca's, so EquityCurve returns
@@ -90,8 +114,8 @@ func (b *IBKRBroker) EquityCurve(_ context.Context, _, _ string) (EquityHistory,
 type IBKRTradeRecord struct {
 	OrderID  string
 	Conid    string
-	Symbol   string    // human-readable when conid is resolved (e.g. "EUR/USD"); otherwise the raw API symbol
-	Side     string    // "buy" | "sell"
+	Symbol   string // human-readable when conid is resolved (e.g. "EUR/USD"); otherwise the raw API symbol
+	Side     string // "buy" | "sell"
 	Qty      float64
 	Price    float64
 	FilledAt time.Time
@@ -108,14 +132,14 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 		days = 7
 	}
 	var resp []struct {
-		OrderID   int64   `json:"orderId"`
-		Symbol    string  `json:"symbol"`
-		Side      string  `json:"side"` // "B" | "S"
-		Size      float64 `json:"size"`
-		Price     float64 `json:"price"`
-		Status    string  `json:"status"`
-		TradeTime string  `json:"trade_time"` // "YYYYMMDD-HH:MM:SS" UTC
-		Conid     int     `json:"conid"`
+		OrderID   int64     `json:"orderId"`
+		Symbol    string    `json:"symbol"`
+		Side      string    `json:"side"` // "B" | "S"
+		Size      ibkrFloat `json:"size"`
+		Price     ibkrFloat `json:"price"`
+		Status    string    `json:"status"`
+		TradeTime string    `json:"trade_time"` // "YYYYMMDD-HH:MM:SS" UTC
+		Conid     int       `json:"conid"`
 	}
 	path := fmt.Sprintf("/v1/api/iserver/account/trades?days=%d", days)
 	if err := b.do(ctx, http.MethodGet, path, nil, &resp); err != nil {
@@ -146,8 +170,8 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 			Conid:    conidStr,
 			Symbol:   symbol,
 			Side:     side,
-			Qty:      o.Size,
-			Price:    o.Price,
+			Qty:      float64(o.Size),
+			Price:    float64(o.Price),
 			FilledAt: t,
 		})
 	}
@@ -157,14 +181,14 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 // RecentFills fetches today's filled orders from /iserver/account/trades.
 func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 	var resp []struct {
-		OrderID     int64   `json:"orderId"`
-		Symbol      string  `json:"symbol"`
-		Side        string  `json:"side"` // "B" | "S"
-		Size        float64 `json:"size"`
-		Price       float64 `json:"price"`
-		Status      string  `json:"status"`
-		TradeTime   string  `json:"trade_time"` // e.g. "20240101-12:00:00"
-		Conid       int     `json:"conid"`
+		OrderID   int64     `json:"orderId"`
+		Symbol    string    `json:"symbol"`
+		Side      string    `json:"side"` // "B" | "S"
+		Size      ibkrFloat `json:"size"`
+		Price     ibkrFloat `json:"price"`
+		Status    string    `json:"status"`
+		TradeTime string    `json:"trade_time"` // e.g. "20240101-12:00:00"
+		Conid     int       `json:"conid"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr RecentFills: %w", err)
@@ -194,9 +218,9 @@ func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 			BrokerOrderID: fmt.Sprintf("%d", o.OrderID),
 			Symbol:        symbol,
 			Side:          side,
-			Qty:           o.Size,
-			FilledQty:     o.Size,
-			FilledAvgPx:   o.Price,
+			Qty:           float64(o.Size),
+			FilledQty:     float64(o.Size),
+			FilledAvgPx:   float64(o.Price),
 			Status:        "filled",
 			FilledAt:      tradeTime,
 		})

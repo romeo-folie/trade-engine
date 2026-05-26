@@ -211,11 +211,12 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 	// Order not in live list — it may have already filled/cancelled.
 	// Fall back to the executions endpoint which retains completed orders.
 	// Schema matches RecentFills: orderId is a bare integer, status field is "status".
+	// price and size arrive as quoted strings, so decode via ibkrFloat.
 	var trades []struct {
-		OrderID   int64   `json:"orderId"`
-		Status    string  `json:"status"`
-		Price     float64 `json:"price"`
-		FilledQty float64 `json:"size"`
+		OrderID   int64     `json:"orderId"`
+		Status    string    `json:"status"`
+		Price     ibkrFloat `json:"price"`
+		FilledQty ibkrFloat `json:"size"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades", nil, &trades); err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found in live orders, and trades lookup failed: %w", brokerOrderID, err)
@@ -225,8 +226,8 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 			return OrderResult{
 				BrokerOrderID: brokerOrderID,
 				Status:        NormalizeIBKROrderStatus(t.Status),
-				FilledPrice:   t.Price,
-				FilledQty:     t.FilledQty,
+				FilledPrice:   float64(t.Price),
+				FilledQty:     float64(t.FilledQty),
 			}, nil
 		}
 	}

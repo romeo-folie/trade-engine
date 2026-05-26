@@ -76,7 +76,7 @@ func (f *stubTradesFetcher) FetchTradeRecords(_ context.Context, _ int) ([]execu
 
 func TestMatchExitsFromRecords_TPHit(t *testing.T) {
 	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
-	closedAt := entryTime
+	filledAt := entryTime
 
 	trades := []store.ORBTrade{
 		{
@@ -89,7 +89,7 @@ func TestMatchExitsFromRecords_TPHit(t *testing.T) {
 			StopLoss:   1.1607,
 			Status:     "filled",
 			CreatedAt:  entryTime.Add(-5 * time.Second),
-			ClosedAt:   &closedAt,
+			FilledAt:   &filledAt,
 		},
 	}
 
@@ -98,7 +98,7 @@ func TestMatchExitsFromRecords_TPHit(t *testing.T) {
 			Symbol:   "EUR/USD",
 			Side:     "sell", // opposite of buy entry
 			Qty:      5000,
-			Price:    1.1907,            // exactly at TP
+			Price:    1.1907,                   // exactly at TP
 			FilledAt: entryTime.Add(time.Hour), // after entry
 		},
 	}
@@ -119,7 +119,7 @@ func TestMatchExitsFromRecords_TPHit(t *testing.T) {
 
 func TestMatchExitsFromRecords_SLHit(t *testing.T) {
 	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
-	closedAt := entryTime
+	filledAt := entryTime
 
 	trades := []store.ORBTrade{
 		{
@@ -132,16 +132,16 @@ func TestMatchExitsFromRecords_SLHit(t *testing.T) {
 			StopLoss:   1.3615, // SL is above entry for a sell
 			Status:     "filled",
 			CreatedAt:  entryTime.Add(-5 * time.Second),
-			ClosedAt:   &closedAt,
+			FilledAt:   &filledAt,
 		},
 	}
 
 	records := []execution.IBKRTradeRecord{
 		{
 			Symbol:   "GBP/USD",
-			Side:     "buy",           // opposite of sell entry
+			Side:     "buy", // opposite of sell entry
 			Qty:      5000,
-			Price:    1.3615,          // at SL
+			Price:    1.3615, // at SL
 			FilledAt: entryTime.Add(time.Hour),
 		},
 	}
@@ -159,7 +159,7 @@ func TestMatchExitsFromRecords_SLHit(t *testing.T) {
 
 func TestMatchExitsFromRecords_SkipsWrongSymbol(t *testing.T) {
 	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
-	closedAt := entryTime
+	filledAt := entryTime
 
 	trades := []store.ORBTrade{
 		{
@@ -172,7 +172,7 @@ func TestMatchExitsFromRecords_SkipsWrongSymbol(t *testing.T) {
 			StopLoss:   1.1607,
 			Status:     "filled",
 			CreatedAt:  entryTime.Add(-5 * time.Second),
-			ClosedAt:   &closedAt,
+			FilledAt:   &filledAt,
 		},
 	}
 
@@ -199,7 +199,7 @@ func TestMatchExitsFromRecords_SkipsWrongSymbol(t *testing.T) {
 
 func TestMatchExitsFromRecords_SkipsEarlierFill(t *testing.T) {
 	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
-	closedAt := entryTime
+	filledAt := entryTime
 
 	trades := []store.ORBTrade{
 		{
@@ -212,7 +212,7 @@ func TestMatchExitsFromRecords_SkipsEarlierFill(t *testing.T) {
 			StopLoss:   1.1607,
 			Status:     "filled",
 			CreatedAt:  entryTime.Add(-5 * time.Second),
-			ClosedAt:   &closedAt,
+			FilledAt:   &filledAt,
 		},
 	}
 

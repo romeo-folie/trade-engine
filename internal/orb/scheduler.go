@@ -1498,13 +1498,14 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			continue
 		}
 
-		// Use ClosedAt (entry fill time) as the lower bound, minus a 60s buffer to
+		// Use FilledAt (entry fill time) as the lower bound, minus a 60s buffer to
 		// account for the poll lag between the actual IBKR fill and when we persisted
 		// it. This prevents filtering out legitimate exits that arrived quickly after
 		// the entry fill while still rejecting fills that predate the order placement.
+		// Falls back to CreatedAt (bracket placement time) when filled_at is unset.
 		entryTime := t.CreatedAt
-		if t.ClosedAt != nil {
-			buffered := t.ClosedAt.Add(-60 * time.Second)
+		if t.FilledAt != nil {
+			buffered := t.FilledAt.Add(-60 * time.Second)
 			if buffered.After(t.CreatedAt) {
 				entryTime = buffered
 			}
