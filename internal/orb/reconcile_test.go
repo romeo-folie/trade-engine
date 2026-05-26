@@ -237,6 +237,33 @@ func TestMatchExitsFromRecords_SkipsEarlierFill(t *testing.T) {
 	}
 }
 
+// TestReleaseTrackedTradesForReconcile verifies that end-of-session cleanup clears
+// the in-memory tracking map but does NOT close filled trades. Leaving them in
+// status='filled' keeps them eligible for the DB-backed exit reconcilers, which
+// close them later with the real exit price/PnL. (Previously cleanup marked them
+// 'expired' with pnl=0, which — once migration 030 made 'closed' a legal status —
+// permanently blocked reconciliation and polluted realized-PnL feedback stats.)
+func TestReleaseTrackedTradesForReconcile(t *testing.T) {
+	s := &ORBScheduler{
+		trackedTrades: map[string]*trackedTrade{
+			"entry-1": {dbID: "trade-1", ticker: "EUR/USD", side: "buy", qty: 5000, entryFill: 1.1707}, // filled
+			"entry-2": {dbID: "trade-2", ticker: "GBP/USD", side: "sell", qty: 5000, entryFill: 0},     // never filled
+		},
+	}
+
+	// Hold s.mu to honor the method's documented contract, matching the
+	// production call site in tickDone.
+	s.mu.Lock()
+	s.releaseTrackedTradesForReconcile()
+	s.mu.Unlock()
+
+	if len(s.trackedTrades) != 0 {
+		t.Errorf("trackedTrades not cleared: %d entries remain", len(s.trackedTrades))
+	}
+	// The method takes no store handle by construction, so it cannot transition any
+	// trade to a terminal DB state — the filled trade is left for the reconcilers.
+}
+
 func TestReconcileDoneSession_DifferentSessionsReconcileIndependently(t *testing.T) {
 	exec := &stubExecutor{statuses: map[string]execution.OrderResult{}}
 	s := &ORBScheduler{

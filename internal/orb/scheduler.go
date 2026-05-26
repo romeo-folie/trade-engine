@@ -86,44 +86,44 @@ type CandidateScanner interface {
 
 // ORBScheduler implements the time-gated ORB state machine.
 type ORBScheduler struct {
-	cfg        config.ORBConfig
-	db         *pgxpool.Pool
-	marketData data.MarketDataProvider
-	analyzer   *analysis.Analyzer
-	executor   execution.Executor
-	portfolio  PortfolioValuer
-	notifier   Notifier
-	news        data.NewsProvider      // optional; nil disables news enrichment
-	bus         *events.Bus            // optional; nil means no event publishing
-	now         func() time.Time       // injectable for tests
-	scanner     CandidateScanner       // optional; nil uses inline equities scanning
+	cfg         config.ORBConfig
+	db          *pgxpool.Pool
+	marketData  data.MarketDataProvider
+	analyzer    *analysis.Analyzer
+	executor    execution.Executor
+	portfolio   PortfolioValuer
+	notifier    Notifier
+	news        data.NewsProvider        // optional; nil disables news enrichment
+	bus         *events.Bus              // optional; nil means no event publishing
+	now         func() time.Time         // injectable for tests
+	scanner     CandidateScanner         // optional; nil uses inline equities scanning
 	forexCfg    *config.ForexORBConfig   // optional; nil means equities mode
 	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
 	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
 
-	mu             sync.Mutex // protects state, session, candidates for TUI reads
-	state          State
-	session        *store.ORBSession
-	candidates     []ScoredCandidate
-	rangeBuffers   map[string]*RangeBuffer
-	orderIDs       map[string][2]string // ticker → [buyOrderID, sellOrderID]
-	trackedTrades      map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions   map[string]struct{}  // session IDs already processed by reconcileDoneSessionTrades
-	backfilledSessions   map[string]struct{}  // session IDs already processed by backfillRecentExits
-	backfillFired        bool                 // true once the startup trades-feed backfill has run
-	lastExitReconcileAt  time.Time            // wall time of the last per-tick trades-feed reconcile
-	lastScan             time.Time            // Eastern Time of the last successful scan
-	fetchFailures      map[string]int       // ticker → consecutive candle-fetch failures
-	fetchLastAttempt   map[string]time.Time // ticker → wall time of last candle-fetch attempt
+	mu                  sync.Mutex // protects state, session, candidates for TUI reads
+	state               State
+	session             *store.ORBSession
+	candidates          []ScoredCandidate
+	rangeBuffers        map[string]*RangeBuffer
+	orderIDs            map[string][2]string     // ticker → [buyOrderID, sellOrderID]
+	trackedTrades       map[string]*trackedTrade // entry order ID → trade context + exit state
+	reconciledSessions  map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
+	backfilledSessions  map[string]struct{}      // session IDs already processed by backfillRecentExits
+	backfillFired       bool                     // true once the startup trades-feed backfill has run
+	lastExitReconcileAt time.Time                // wall time of the last per-tick trades-feed reconcile
+	lastScan            time.Time                // Eastern Time of the last successful scan
+	fetchFailures       map[string]int           // ticker → consecutive candle-fetch failures
+	fetchLastAttempt    map[string]time.Time     // ticker → wall time of last candle-fetch attempt
 }
 
 // trackedTrade holds per-order context needed to observe the full trade lifecycle.
 // It is registered when the entry bracket is placed and removed when the exit fills.
 type trackedTrade struct {
-	dbID      string  // orb_trades primary key
-	tpOrderID string  // take-profit child order ID (empty if broker doesn't expose it)
-	slOrderID string  // stop-loss child order ID
-	side      string  // "buy" | "sell"
+	dbID      string // orb_trades primary key
+	tpOrderID string // take-profit child order ID (empty if broker doesn't expose it)
+	slOrderID string // stop-loss child order ID
+	side      string // "buy" | "sell"
 	ticker    string
 	qty       int
 	entryFill float64 // set when entry stop order fills; 0 while still pending
@@ -140,22 +140,22 @@ func NewORBScheduler(
 	notifier Notifier,
 ) *ORBScheduler {
 	return &ORBScheduler{
-		cfg:          cfg,
-		db:           db,
-		marketData:   marketData,
-		analyzer:     analyzer,
-		executor:     executor,
-		portfolio:    portfolio,
-		notifier:     notifier,
-		now:           time.Now,
-		state:         StateIdle,
-		rangeBuffers:  make(map[string]*RangeBuffer),
-		orderIDs:      make(map[string][2]string),
+		cfg:                cfg,
+		db:                 db,
+		marketData:         marketData,
+		analyzer:           analyzer,
+		executor:           executor,
+		portfolio:          portfolio,
+		notifier:           notifier,
+		now:                time.Now,
+		state:              StateIdle,
+		rangeBuffers:       make(map[string]*RangeBuffer),
+		orderIDs:           make(map[string][2]string),
 		trackedTrades:      make(map[string]*trackedTrade),
 		reconciledSessions: make(map[string]struct{}),
 		backfilledSessions: make(map[string]struct{}),
-		fetchFailures:    make(map[string]int),
-		fetchLastAttempt: make(map[string]time.Time),
+		fetchFailures:      make(map[string]int),
+		fetchLastAttempt:   make(map[string]time.Time),
 	}
 }
 
@@ -830,7 +830,7 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 	now := s.now()
 
 	const (
-		maxFetchFailures  = 3               // drop instrument after this many consecutive failures
+		maxFetchFailures  = 3                // drop instrument after this many consecutive failures
 		fetchRetryBackoff = 60 * time.Second // minimum wait between candle-fetch attempts
 	)
 
@@ -860,7 +860,7 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 			}
 			continue
 		}
-		s.fetchFailures[ticker] = 0    // reset on success
+		s.fetchFailures[ticker] = 0 // reset on success
 		delete(s.fetchLastAttempt, ticker)
 		for _, c := range candles {
 			locked, _ := buf.Add(c)
@@ -1378,15 +1378,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.orderIDs = make(map[string][2]string)
-		// Mark any tracked trades whose exits we never observed as expired.
-		for entryOrderID, tc := range s.trackedTrades {
-			if tc.entryFill != 0 {
-				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, "expired", 0, 0); dbErr != nil {
-					slog.Warn("orb: mark expired trade failed", "ticker", tc.ticker, "err", dbErr)
-				}
-			}
-			delete(s.trackedTrades, entryOrderID)
-		}
+		s.releaseTrackedTradesForReconcile()
 		s.state = StateIdle
 		s.mu.Unlock()
 
@@ -1397,6 +1389,26 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		})
 	}
 	return nil
+}
+
+// releaseTrackedTradesForReconcile clears the in-memory exit-tracking map at the
+// end of a session WITHOUT touching the DB. Filled trades are deliberately left in
+// status='filled': their bracket TP/SL stays live at the broker after the session
+// is marked done, so the real exit fills later and the DB-backed reconcilers — the
+// trades-feed matcher and reconcileDoneSessionTrades, both keyed on status='filled'
+// — close them then with the true exit price and PnL. Closing them here as 'expired'
+// (pnl=0) would lie about the outcome and, because every reconciler and CloseORBTrade
+// guard on status='filled', permanently block recovery while polluting realized-PnL
+// feedback stats. This method takes no store handle by design, so it cannot regress
+// into writing a premature terminal state. Caller must hold s.mu.
+func (s *ORBScheduler) releaseTrackedTradesForReconcile() {
+	for entryOrderID, tc := range s.trackedTrades {
+		if tc.entryFill != 0 {
+			slog.Info("orb: session cleanup: leaving filled trade open for exit reconciliation",
+				"ticker", tc.ticker, "trade_id", tc.dbID)
+		}
+		delete(s.trackedTrades, entryOrderID)
+	}
 }
 
 // reconcileDoneSessionTrades checks filled-but-unclosed trades from a session
