@@ -11,11 +11,11 @@ import (
 type FeedbackInsight struct {
 	ID         string
 	Date       time.Time
-	Scope      string  // "model" | "instrument" | "orb_session" | "system"
-	ScopeKey   string  // e.g. "anthropic/claude-sonnet", "EUR/USD:london"
-	Metric     string  // "win_rate", "avg_pnl_pct", "trade_count", "arbiter_override_rate"
+	Scope      string // "model" | "instrument" | "orb_session" | "system"
+	ScopeKey   string // e.g. "anthropic/claude-sonnet", "EUR/USD:london"
+	Metric     string // "win_rate", "avg_pnl_pct", "trade_count", "arbiter_override_rate"
 	Value      float64
-	Window     string  // "1d" | "7d" | "30d"
+	Window     string // "1d" | "7d" | "30d"
 	TradeCount int
 	CreatedAt  time.Time
 }
@@ -26,7 +26,7 @@ type FeedbackFlag struct {
 	Date        time.Time
 	Scope       string
 	ScopeKey    string
-	Severity    string     // "info" | "warning" | "critical"
+	Severity    string // "info" | "warning" | "critical"
 	Message     string
 	Metric      string
 	MetricValue float64
@@ -137,9 +137,12 @@ func HasUnresolvedFlag(ctx context.Context, date time.Time, scope, scopeKey, met
 	return exists, err
 }
 
-// GetClosedORBTradesByDateRange returns ORB trades with status 'filled' whose
-// closed_at falls in [from, to). Takes an explicit pool param following the ORB
-// store convention.
+// GetClosedORBTradesByDateRange returns ORB trades that closed (TP/stop/expiry,
+// status 'closed') with their exit leg in [from, to), as keyed by closed_at.
+// These are the trades with a realized PnL, used by the feedback reviewer for
+// win-rate and avg-PnL stats. Filled-but-open trades are deliberately excluded —
+// they have no outcome yet and their closed_at is NULL. Takes an explicit pool
+// param following the ORB store convention.
 func GetClosedORBTradesByDateRange(ctx context.Context, db *pgxpool.Pool, from, to time.Time) ([]ORBTrade, error) {
 	rows, err := db.Query(ctx, `
 		SELECT id, session_id, ticker, side,
@@ -148,7 +151,7 @@ func GetClosedORBTradesByDateRange(ctx context.Context, db *pgxpool.Pool, from, 
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       created_at, closed_at
 		FROM orb_trades
-		WHERE status = 'filled' AND closed_at >= $1 AND closed_at < $2
+		WHERE status = 'closed' AND closed_at >= $1 AND closed_at < $2
 		ORDER BY closed_at DESC`,
 		from, to,
 	)

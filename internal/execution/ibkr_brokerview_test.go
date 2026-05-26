@@ -1,13 +1,53 @@
 package execution
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
+// ─── ibkrFloat ────────────────────────────────────────────────────────────────
+
+func TestIBKRFloat_UnmarshalJSON(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want float64
+	}{
+		{"quoted string (real trades-endpoint shape)", `"1.1750"`, 1.1750},
+		{"bare number", `1.1750`, 1.1750},
+		{"quoted integer", `"5000"`, 5000},
+		{"empty string", `""`, 0},
+		{"null", `null`, 0},
+		{"negative quoted", `"-12.5"`, -12.5},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var f ibkrFloat
+			if err := json.Unmarshal([]byte(c.in), &f); err != nil {
+				t.Fatalf("unmarshal %s: %v", c.in, err)
+			}
+			if float64(f) != c.want {
+				t.Errorf("ibkrFloat(%s) = %v; want %v", c.in, float64(f), c.want)
+			}
+		})
+	}
+
+	// Malformed numeric strings must surface an error rather than silently zero.
+	var f ibkrFloat
+	if err := json.Unmarshal([]byte(`"not-a-number"`), &f); err == nil {
+		t.Error("expected error decoding non-numeric string, got nil")
+	}
+}
+
 // ─── FetchTradeRecords ────────────────────────────────────────────────────────
 
+// TestFetchTradeRecords exercises the parse/filter/resolve logic with bare-number
+// size/price (the ibkrFloat numeric branch). The real IBKR Client Portal sends
+// these as quoted strings — that string branch is covered by
+// TestFetchTradeRecords_StringEncodedNumerics, which is the regression guard for
+// the production bug. Keep both: they cover the two ibkrFloat decode branches.
 func TestFetchTradeRecords(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/api/iserver/account/trades" {
@@ -73,6 +113,48 @@ func TestFetchTradeRecords(t *testing.T) {
 	}
 	if r.FilledAt.IsZero() {
 		t.Error("FilledAt should not be zero")
+	}
+}
+
+// TestFetchTradeRecords_StringEncodedNumerics mirrors the real IBKR Client Portal
+// payload, which serializes size and price as quoted strings. Before ibkrFloat,
+// this failed with "cannot unmarshal string into Go struct field .price of type
+// float64", which silently broke every ORB exit reconcile in production.
+func TestFetchTradeRecords_StringEncodedNumerics(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[
+			{
+				"orderId": 123456789,
+				"symbol": "EUR.USD",
+				"side": "S",
+				"size": "5000",
+				"price": "1.16030",
+				"status": "Filled",
+				"trade_time": "20260428-08:17:02",
+				"conid": 12087792
+			}
+		]`))
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	records, err := b.FetchTradeRecords(t.Context(), 7)
+	if err != nil {
+		t.Fatalf("FetchTradeRecords error: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("len(records) = %d; want 1", len(records))
+	}
+	r := records[0]
+	if r.Qty != 5000 {
+		t.Errorf("Qty = %v; want 5000 (string-encoded size)", r.Qty)
+	}
+	if r.Price != 1.16030 {
+		t.Errorf("Price = %v; want 1.16030 (string-encoded price)", r.Price)
+	}
+	if r.Side != "sell" {
+		t.Errorf("Side = %q; want sell", r.Side)
 	}
 }
 

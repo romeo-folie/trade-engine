@@ -42,7 +42,11 @@ type ORBTrade struct {
 	ExitPrice float64
 	ExitType  string // "tp" | "stop" | "expired"
 	CreatedAt time.Time
-	ClosedAt  *time.Time
+	// FilledAt is the entry-leg fill time. The exit reconciler uses it as the
+	// lower bound when matching exit fills. ClosedAt is set only once the trade
+	// actually closes (TP/stop/expiry), so it stays nil while a trade is open.
+	FilledAt *time.Time
+	ClosedAt *time.Time
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -152,10 +156,12 @@ func CancelORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID stri
 
 // FillORBTradeByOrderID marks a pending trade as filled given its broker order ID.
 // Returns true if a row was actually updated (i.e. the trade was pending).
+// filled_at records the entry-leg fill time; closed_at stays NULL until the trade
+// actually exits via CloseORBTrade.
 func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64) (bool, error) {
 	tag, err := db.Exec(ctx, `
 		UPDATE orb_trades
-		SET status='filled', fill_price=$1, closed_at=NOW()
+		SET status='filled', fill_price=$1, filled_at=NOW()
 		WHERE order_id=$2 AND status='pending'`,
 		fillPrice, orderID)
 	if err != nil {
@@ -177,12 +183,16 @@ func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType string, e
 	return err
 }
 
-// UpdateORBTrade updates a trade's status, fill price, and PnL.
+// UpdateORBTrade updates a trade's status, fill price, and PnL. closed_at is set
+// only for terminal-without-fill transitions ('cancelled','expired'); 'filled' is
+// excluded so it never stamps closed_at on a still-open trade (that would break the
+// reconciler's lower-bound logic and the closed_at invariant). Entry fills go
+// through FillORBTradeByOrderID, which sets filled_at instead.
 func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fillPrice *float64, pnl *float64) error {
 	_, err := db.Exec(ctx, `
 		UPDATE orb_trades
 		SET status=$1, fill_price=$2, pnl=$3,
-		    closed_at = CASE WHEN $1 IN ('filled','cancelled','expired') THEN NOW() ELSE closed_at END
+		    closed_at = CASE WHEN $1 IN ('cancelled','expired') THEN NOW() ELSE closed_at END
 		WHERE id=$4`,
 		status, fillPrice, pnl, id)
 	return err
@@ -221,7 +231,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''),
-		       created_at, closed_at
+		       created_at, filled_at, closed_at
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -238,7 +248,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType,
-			&t.CreatedAt, &t.ClosedAt,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -256,7 +266,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''),
-		       created_at, closed_at
+		       created_at, filled_at, closed_at
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -274,7 +284,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType,
-			&t.CreatedAt, &t.ClosedAt,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
 		}
