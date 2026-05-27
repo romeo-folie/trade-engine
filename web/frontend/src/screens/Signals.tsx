@@ -44,8 +44,8 @@ const COLUMNS: Column<Signal>[] = [
     label: 'DIR',
     render: (s) => {
       const a = s.Action.toUpperCase();
-      if (a === 'BUY' || a === 'LONG') return <span className={styles.dirLong}><span style={{ color: colors.acidGreen, marginRight: 4 }}>▲</span>LONG</span>;
-      if (a === 'SELL' || a === 'SHORT') return <span className={styles.dirShort}><span style={{ color: colors.red, marginRight: 4 }}>▼</span>SHORT</span>;
+      if (a === 'BUY' || a === 'LONG') return <span className={styles.dirLong}>LONG</span>;
+      if (a === 'SELL' || a === 'SHORT') return <span className={styles.dirShort}>SHORT</span>;
       return <span className={styles.dirNeut}>NEUTRAL</span>;
     },
   },

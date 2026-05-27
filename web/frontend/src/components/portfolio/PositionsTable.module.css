@@ -89,8 +89,11 @@
   50% { opacity: 0.7; box-shadow: 0 0 6px 2px var(--amber-dim); }
 }
 
-.positive { color: var(--emerald); }
-.negative { color: var(--red); }
+/* Scoped to `.table td` so these win the specificity battle against the base
+   `.table td { color: var(--text-primary) }` rule above — otherwise every P&L
+   cell stays the default white instead of going green/red. */
+.table td.positive { color: var(--emerald); }
+.table td.negative { color: var(--red); }
 
 /* Sort indicator glyphs — inactive (⇅) and active (↑/↓) */
 .sortIndicator {
