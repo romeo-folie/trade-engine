@@ -139,8 +139,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
               borderColor={dirIsLong ? colors.emerald : colors.red}
               style={{ display: 'inline-block', padding: '2px 8px', marginLeft: '12px' }}
             >
-              <span style={{ fontSize: 10, fontWeight: 700, color: '#FFFFFF', display: 'flex', alignItems: 'center', gap: 4 }}>
-                <span style={{ fontSize: 11 }}>{dirIsLong ? '▲' : '▼'}</span>
+              <span style={{ fontSize: 10, fontWeight: 700, color: '#FFFFFF' }}>
                 {dirIsLong ? 'LONG' : 'SHORT'}
               </span>
             </ChamferedBox>
@@ -259,8 +258,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
                   padding: '1px 6px' 
                 }}
               >
-                <span style={{ fontSize: 9, fontWeight: 700, color: '#111', display: 'flex', alignItems: 'center', gap: 2 }}>
-                  <span style={{ fontSize: 10 }}>{dirIsLong ? '▲' : '▼'}</span>
+                <span style={{ fontSize: 9, fontWeight: 700, color: '#111' }}>
                   {dirIsLong ? 'BUY' : 'SELL'}
                 </span>
               </ChamferedBox>

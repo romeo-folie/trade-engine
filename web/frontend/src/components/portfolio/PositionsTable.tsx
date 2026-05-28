@@ -152,6 +152,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
             const normalized = normalizePosition(p);
             const { ticker, direction, strategy, entry, current, unrealizedPnl, pnlPct } = normalized;
             const pnlCls = unrealizedPnl >= 0 ? styles.positive : styles.negative;
+            const pnlPctCls = pnlPct >= 0 ? styles.positive : styles.negative;
 
             // Use index as tiebreaker — the backend provides no stable row id.
             const rowKey = `${ticker}-${strategy}-${entry}-${i}`;
@@ -172,8 +173,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
                       padding: '1px 6px'
                     }}
                   >
-                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11', display: 'flex', alignItems: 'center', gap: 2 }}>
-                      <span style={{ fontSize: 10 }}>{dirIsLong ? '▲' : '▼'}</span>
+                    <span style={{ fontSize: 9, fontWeight: 700, color: '#0D0D11' }}>
                       {dirIsLong ? 'BUY' : 'SELL'}
                     </span>
                   </ChamferedBox>
@@ -184,7 +184,7 @@ export default function PositionsTable({ positions }: PositionsTableProps) {
                 <td className={pnlCls} style={{ fontWeight: 700 }}>
                   {unrealizedPnl >= 0 ? '+' : ''}{unrealizedPnl.toFixed(2)}
                 </td>
-                <td className={pnlCls} style={{ fontWeight: 700 }}>
+                <td className={pnlPctCls} style={{ fontWeight: 700 }}>
                   {pnlPct >= 0 ? '+' : ''}{pnlPct.toFixed(2)}%
                 </td>
                 <td>
