@@ -5,6 +5,8 @@
  * Task 8 of the web redesign (closes #206).
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
+import useSWR from 'swr';
+import { jsonFetcher } from '../hooks/swr';
 import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import { EVENT_LABELS } from '../types/protocol';
@@ -132,58 +134,38 @@ function eventDescription(ev: IndexedWebEvent): string {
 export default function SystemScreen() {
   const { status: wsStatus, events } = useEngineSocketContext();
 
-  const [systemStatus, setSystemStatus] = useState<SystemStatus | null>(null);
-  const [cacheStats, setCacheStats] = useState<CacheStats | null>(null);
-  const [modelPerf, setModelPerf] = useState<ModelPerfRow[]>([]);
-  const [signalCount, setSignalCount] = useState<number | null>(null);
-  const [riskData, setRiskData] = useState<{ open_trade_count: number; open_positions?: number } | null>(null);
   const [uptime, setUptime] = useState(0);
   const baseUptime = useRef(0);
   const loadedAt = useRef(Date.now());
 
-  const fetchAll = useCallback(async () => {
-    const [statusRes, cacheRes, modelsRes, signalsRes, riskRes] = await Promise.allSettled([
-      fetch('/api/system/status'),
-      fetch('/api/system/cache'),
-      fetch('/api/node/models'),
-      fetch('/api/signals/recent?limit=200'),
-      fetch('/api/node/risk'),
-    ]);
+  // 5 parallel SWR subscriptions; all share the same 30s refresh cadence
+  // (auto-paused while hidden) and dedupe across components via SWR's cache.
+  const swrOpts = { refreshInterval: 30_000 } as const;
+  const { data: systemStatus = null } = useSWR<SystemStatus>('/api/system/status', jsonFetcher, swrOpts);
+  const { data: cacheStats   = null } = useSWR<CacheStats>('/api/system/cache', jsonFetcher, swrOpts);
+  const { data: modelsData }          = useSWR<{ model_performance?: ModelPerfRow[] }>('/api/node/models', jsonFetcher, swrOpts);
+  const { data: signalsData }         = useSWR<{ signals?: { CreatedAt: string }[] }>('/api/signals/recent?limit=200', jsonFetcher, swrOpts);
+  const { data: riskData = null }     = useSWR<{ open_trade_count: number; open_positions?: number }>('/api/node/risk', jsonFetcher, swrOpts);
 
-    if (statusRes.status === 'fulfilled' && statusRes.value.ok) {
-      const data = await statusRes.value.json();
-      setSystemStatus(data);
-      baseUptime.current = data.uptime_seconds;
-      loadedAt.current = Date.now();
-    }
-    if (cacheRes.status === 'fulfilled' && cacheRes.value.ok) {
-      setCacheStats(await cacheRes.value.json());
-    }
-    if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
-      const data = await modelsRes.value.json();
-      if (data?.model_performance) setModelPerf(data.model_performance);
-    }
-    if (signalsRes.status === 'fulfilled' && signalsRes.value.ok) {
-      const data = await signalsRes.value.json();
-      // Best-effort count from last 200 signals; may undercount if >200 signals today.
-      if (data?.signals && Array.isArray(data.signals)) {
+  const modelPerf = modelsData?.model_performance ?? [];
+  // Today's signal count — best-effort from last 200 (may undercount if >200/day).
+  const signalCount: number | null = signalsData?.signals
+    ? signalsData.signals.filter(s => {
         const todayPrefix = new Date().toISOString().slice(0, 10);
-        const todayCount = data.signals.filter((s: { CreatedAt: string }) =>
-          s.CreatedAt.startsWith(todayPrefix)
-        ).length;
-        setSignalCount(todayCount);
-      }
-    }
-    if (riskRes.status === 'fulfilled' && riskRes.value.ok) {
-      setRiskData(await riskRes.value.json());
-    }
-  }, []);
+        return s.CreatedAt.startsWith(todayPrefix);
+      }).length
+    : null;
 
-  useEffect(() => { fetchAll(); }, [fetchAll]);
-  useVisiblePoll(fetchAll, 30_000);
+  // Recompute uptime baseline whenever a fresh status arrives.
+  useEffect(() => {
+    if (!systemStatus) return;
+    baseUptime.current = systemStatus.uptime_seconds;
+    loadedAt.current = Date.now();
+  }, [systemStatus]);
 
-  // Uptime ticker — pauses when tab is hidden (Date.now() math means it
-  // self-corrects to the right value on visibility return without intervening ticks).
+  // Uptime ticker — pure UI, pauses when tab is hidden (Date.now() math means
+  // it self-corrects to the right value on visibility return without intervening
+  // ticks). Stays on useVisiblePoll since SWR's model is for data fetching.
   const tickUptime = useCallback(() => {
     const elapsed = Math.floor((Date.now() - loadedAt.current) / 1000);
     setUptime(baseUptime.current + elapsed);

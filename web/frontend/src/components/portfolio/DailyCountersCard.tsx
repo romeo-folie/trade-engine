@@ -9,8 +9,8 @@
  * daily-summary writer hasn't fired yet, so this card never sits at zero on
  * engine restart.
  */
-import { useEffect, useRef, useState, useCallback } from 'react';
-import { useVisiblePoll } from '../../hooks/useVisiblePoll';
+import useSWR from 'swr';
+import { jsonFetcher } from '../../hooks/swr';
 import { TOKENS } from '../../styles/tokens';
 
 interface DailyCounter {
@@ -43,55 +43,17 @@ function topBlockReasons(map: Record<string, number> | null, n: number): { reaso
 }
 
 export default function DailyCountersCard() {
-  const [today, setToday] = useState<DailyCounter | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  // Track the in-flight controller so polls fired before unmount are torn
-  // down on cleanup. Mirrors the AbortController pattern used by Portfolio,
-  // Trades, and Signals screens — without it, an unmount mid-fetch leaks
-  // the response handler and can race a state update against a stale
-  // component.
-  const fetchControllerRef = useRef<AbortController | null>(null);
-
-  const load = useCallback(async () => {
-    // Cancel any prior in-flight request so only the latest response can
-    // update state (5s poll cadence + slow networks otherwise pile up
-    // parallel requests).
-    fetchControllerRef.current?.abort();
-    const controller = new AbortController();
-    fetchControllerRef.current = controller;
-
-    try {
-      const res = await fetch('/api/portfolio/daily-counters?days=1', {
-        signal: controller.signal,
-      });
-      if (controller.signal.aborted) return;
-      if (!res.ok) {
-        setError(`HTTP ${res.status}`);
-        return;
-      }
-      const data: CountersResponse = await res.json();
-      if (controller.signal.aborted) return;
-      // Newest day is last in the array (asc by date in the handler);
-      // synthesized today is appended last when no row exists yet.
-      const last = data.counters?.[data.counters.length - 1] ?? null;
-      setToday(last);
-      setError(null);
-    } catch (err) {
-      // AbortError on unmount/refresh is expected — swallow it.
-      if (err instanceof Error && err.name !== 'AbortError') {
-        setError(err.message);
-      }
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    return () => fetchControllerRef.current?.abort();
-  }, [load]);
-
-  // 5s background refresh — pauses when the tab is hidden so a backgrounded
-  // Portfolio tab doesn't keep hitting /api/portfolio/daily-counters.
-  useVisiblePoll(load, 5_000);
+  // 5s background refresh — SWR pauses when the tab is hidden so a
+  // backgrounded Portfolio tab doesn't keep hitting daily-counters.
+  const { data, error } = useSWR<CountersResponse>(
+    '/api/portfolio/daily-counters?days=1',
+    jsonFetcher,
+    { refreshInterval: 5_000 },
+  );
+  // Newest day is last in the array (asc by date in the handler);
+  // synthesized today is appended last when no row exists yet.
+  const today: DailyCounter | null = data?.counters?.[data.counters.length - 1] ?? null;
+  const errorMsg = error instanceof Error ? error.message : null;
 
   const total = today?.signals_total ?? 0;
   const blocked = today?.signals_blocked ?? 0;
@@ -124,9 +86,9 @@ export default function DailyCountersCard() {
         TODAY&apos;S SIGNAL PIPELINE
       </div>
 
-      {error && !today && (
+      {errorMsg && !today && (
         <div style={{ color: TOKENS.textFaint, fontFamily: 'var(--font-mono)', fontSize: 12 }}>
-          {`Failed to load (${error})`}
+          {`Failed to load (${errorMsg})`}
         </div>
       )}
 
