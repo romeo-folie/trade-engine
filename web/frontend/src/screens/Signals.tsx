@@ -6,6 +6,7 @@
  * signals on page 1; "Load more" appends older pages without resetting scroll.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -202,59 +203,62 @@ export default function SignalsScreen() {
       .catch(() => {});
   }, []);
 
-  // Main data effect: reset + poll when server-side filters change
+  // fetchPage1 closes over the current filters; identity changes when filters
+  // change so the reset-and-load effect below re-fires. useVisiblePoll captures
+  // the latest fetchPage1 in a ref, so polling always uses current filters
+  // without tearing the interval down on every filter change.
+  const fetchPage1 = useCallback(async () => {
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
+
+    try {
+      const res = await fetch(buildSignalsUrl(debouncedTicker, statusFilter), { signal: controller.signal });
+      if (!res.ok) {
+        setFetchError(`${res.status} ${res.statusText}`);
+        return;
+      }
+      const data = await res.json();
+      const fresh: Signal[] = data.signals ?? [];
+
+      if (!cursorInitialized.current) {
+        // First load for this filter combination — set cursor and replace state
+        setNextCursor(data.next_cursor ?? null);
+        cursorInitialized.current = true;
+        setSignals(fresh);
+      } else {
+        // Poll merge: prepend new signals, update existing ones in-place
+        setSignals(prev => {
+          const freshById = new Map(fresh.map((s: Signal) => [s.ID, s]));
+          const updated = prev.map(s => freshById.get(s.ID) ?? s);
+          const brandNew = fresh.filter(s => !prev.some(e => e.ID === s.ID));
+          return [...brandNew, ...updated];
+        });
+      }
+      setFetchError(null);
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        console.warn('[SignalsScreen] fetch error:', err);
+        setFetchError(err.message);
+      }
+    } finally {
+      setIsLoading(false);
+    }
+  }, [debouncedTicker, statusFilter]);
+
+  // Reset + load when filters change (fetchPage1 identity tracks them).
   useEffect(() => {
     setSignals([]);
     setNextCursor(null);
     setIsLoading(true);
     cursorInitialized.current = false;
-
-    async function fetchPage1() {
-      fetchControllerRef.current?.abort();
-      const controller = new AbortController();
-      fetchControllerRef.current = controller;
-
-      try {
-        const res = await fetch(buildSignalsUrl(debouncedTicker, statusFilter), { signal: controller.signal });
-        if (!res.ok) {
-          setFetchError(`${res.status} ${res.statusText}`);
-          return;
-        }
-        const data = await res.json();
-        const fresh: Signal[] = data.signals ?? [];
-
-        if (!cursorInitialized.current) {
-          // First load for this filter combination — set cursor and replace state
-          setNextCursor(data.next_cursor ?? null);
-          cursorInitialized.current = true;
-          setSignals(fresh);
-        } else {
-          // Poll merge: prepend new signals, update existing ones in-place
-          setSignals(prev => {
-            const freshById = new Map(fresh.map((s: Signal) => [s.ID, s]));
-            const updated = prev.map(s => freshById.get(s.ID) ?? s);
-            const brandNew = fresh.filter(s => !prev.some(e => e.ID === s.ID));
-            return [...brandNew, ...updated];
-          });
-        }
-        setFetchError(null);
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[SignalsScreen] fetch error:', err);
-          setFetchError(err.message);
-        }
-      } finally {
-        setIsLoading(false);
-      }
-    }
-
     fetchPage1();
-    const interval = setInterval(fetchPage1, 15_000);
     return () => {
       fetchControllerRef.current?.abort();
-      clearInterval(interval);
     };
-  }, [debouncedTicker, statusFilter]);
+  }, [fetchPage1]);
+
+  useVisiblePoll(fetchPage1, 15_000);
 
   const handleLoadMore = useCallback(async () => {
     if (!nextCursor || isLoadingMore) return;

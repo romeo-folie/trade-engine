@@ -10,6 +10,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import AnalysisCard from '../components/analysis/AnalysisCard';
 import AnalysisModal from '../components/analysis/AnalysisModal';
 import { ChamferedBox } from '../components/common/ChamferedBox';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import { colors } from '../styles/tokens';
 import styles from './Analysis.module.css';
 
@@ -71,45 +72,45 @@ export default function AnalysisScreen() {
   const [selected, setSelected] = useState<AnalysisRecord | null>(null);
   const fetchControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    async function load() {
-      fetchControllerRef.current?.abort();
-      const controller = new AbortController();
-      fetchControllerRef.current = controller;
+  const load = useCallback(async () => {
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
 
-      try {
-        const res = await fetch('/api/analyses/recent?limit=100', { signal: controller.signal });
-        if (!res.ok) {
-          setFetchError(`${res.status} ${res.statusText}`);
-          return;
-        }
-        const data = await res.json();
-        if (data && Array.isArray(data.analyses)) {
-          setAnalyses(data.analyses);
-          setSelected(sel =>
-            sel ? data.analyses.find((a: AnalysisRecord) => a.ID === sel.ID) ?? sel : null
-          );
-          setFetchError(null);
-        } else {
-          setFetchError('Unexpected response shape');
-        }
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[AnalysisScreen] fetch error:', err);
-          setFetchError(err.message);
-        }
-      } finally {
-        setIsLoading(false);
+    try {
+      const res = await fetch('/api/analyses/recent?limit=100', { signal: controller.signal });
+      if (!res.ok) {
+        setFetchError(`${res.status} ${res.statusText}`);
+        return;
       }
+      const data = await res.json();
+      if (data && Array.isArray(data.analyses)) {
+        setAnalyses(data.analyses);
+        setSelected(sel =>
+          sel ? data.analyses.find((a: AnalysisRecord) => a.ID === sel.ID) ?? sel : null
+        );
+        setFetchError(null);
+      } else {
+        setFetchError('Unexpected response shape');
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        console.warn('[AnalysisScreen] fetch error:', err);
+        setFetchError(err.message);
+      }
+    } finally {
+      setIsLoading(false);
     }
+  }, []);
 
+  useEffect(() => {
     load();
-    const interval = setInterval(load, 30_000);
     return () => {
       fetchControllerRef.current?.abort();
-      clearInterval(interval);
     };
-  }, []);
+  }, [load]);
+
+  useVisiblePoll(load, 30_000);
 
   const filtered = useMemo(() => {
     let rows = analyses;

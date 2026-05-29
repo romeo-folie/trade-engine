@@ -1,5 +1,6 @@
-import { useEffect, useState, useRef, type ReactNode } from 'react';
+import { useEffect, useState, useRef, useCallback, type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 
 // ── Node display names (hoisted — used before function definitions below) ─────
 
@@ -149,23 +150,25 @@ export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
       .then(d => { if (!controller.signal.aborted) { setData(d); setLoading(false); } })
       .catch(e => { if (!controller.signal.aborted) { setError(String(e)); setLoading(false); } });
 
-    // Auto-refresh every 10s while panel is open.
-    // Each tick: abort the previous refresh request before starting a new one.
-    const iv = setInterval(() => {
-      refreshAbortRef.current?.abort();
-      const refreshController = new AbortController();
-      refreshAbortRef.current = refreshController;
-      fetchNodeData(nodeId, refreshController.signal)
-        .then(d => { if (!refreshController.signal.aborted) { setData(d); setError(null); } })
-        .catch(e => { if (!refreshController.signal.aborted) { setError(String(e)); } });
-    }, 10_000);
-
     return () => {
       controller.abort();
       refreshAbortRef.current?.abort();
-      clearInterval(iv);
     };
   }, [nodeId]);
+
+  // 10s auto-refresh while panel is open. No-op when nodeId is absent so the
+  // interval timer is harmless but does no work. Pauses when the tab is hidden
+  // so a backgrounded Pipeline tab doesn't keep hitting the node API.
+  const refresh = useCallback(() => {
+    if (!nodeId) return;
+    refreshAbortRef.current?.abort();
+    const refreshController = new AbortController();
+    refreshAbortRef.current = refreshController;
+    fetchNodeData(nodeId, refreshController.signal)
+      .then(d => { if (!refreshController.signal.aborted) { setData(d); setError(null); } })
+      .catch(e => { if (!refreshController.signal.aborted) { setError(String(e)); } });
+  }, [nodeId]);
+  useVisiblePoll(refresh, 10_000);
 
   return (
     <AnimatePresence>

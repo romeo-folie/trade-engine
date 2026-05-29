@@ -9,7 +9,8 @@
  *   GET /api/portfolio/summaries — 7-day period performance
  *   GET /api/portfolio/stats     — aggregate win-rate, PF, etc.
  */
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import OverlayChart, { ChartMode } from '../components/portfolio/OverlayChart';
@@ -134,64 +135,65 @@ export default function PortfolioScreen() {
   const [modeFilter, setModeFilter] = useState<ModeFilter>('all');
   const fetchControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    async function load() {
-      fetchControllerRef.current?.abort();
-      const controller = new AbortController();
-      fetchControllerRef.current = controller;
+  const load = useCallback(async () => {
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
 
-      try {
-        // Snapshot
-        const resSn = await fetch('/api/node/portfolio', { signal: controller.signal });
-        if (resSn.ok) {
-          const data = await resSn.json();
-          if (data && typeof data.TotalValue === 'number') {
-            setSnapshot(data);
-            setFetchError(null);
-          }
-        }
-
-        // Equity history (dual series)
-        const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
-        const resHist = await fetch(histUrl, { signal: controller.signal });
-        if (resHist.ok) {
-          setHistory(await resHist.json());
-        }
-
-        // Daily summaries
-        const resSum = await fetch('/api/portfolio/summaries?limit=7', { signal: controller.signal });
-        if (resSum.ok) {
-          const data = await resSum.json();
-          setSummaries(data.summaries || []);
-        }
-
-        // Stats
-        const resStats = await fetch('/api/portfolio/stats', { signal: controller.signal });
-        if (resStats.ok) setStats(await resStats.json());
-
-        // Positions
-        const resPos = await fetch('/api/portfolio/positions', { signal: controller.signal });
-        if (resPos.ok) {
-          const posData = await resPos.json();
-          setPositions(posData.positions || []);
-        }
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[PortfolioScreen] fetch error:', err);
-          setFetchError(err.message);
+    try {
+      // Snapshot
+      const resSn = await fetch('/api/node/portfolio', { signal: controller.signal });
+      if (resSn.ok) {
+        const data = await resSn.json();
+        if (data && typeof data.TotalValue === 'number') {
+          setSnapshot(data);
+          setFetchError(null);
         }
       }
-    }
 
+      // Equity history (dual series)
+      const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
+      const resHist = await fetch(histUrl, { signal: controller.signal });
+      if (resHist.ok) {
+        setHistory(await resHist.json());
+      }
+
+      // Daily summaries
+      const resSum = await fetch('/api/portfolio/summaries?limit=7', { signal: controller.signal });
+      if (resSum.ok) {
+        const data = await resSum.json();
+        setSummaries(data.summaries || []);
+      }
+
+      // Stats
+      const resStats = await fetch('/api/portfolio/stats', { signal: controller.signal });
+      if (resStats.ok) setStats(await resStats.json());
+
+      // Positions
+      const resPos = await fetch('/api/portfolio/positions', { signal: controller.signal });
+      if (resPos.ok) {
+        const posData = await resPos.json();
+        setPositions(posData.positions || []);
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        console.warn('[PortfolioScreen] fetch error:', err);
+        setFetchError(err.message);
+      }
+    }
+  }, [modeFilter]);
+
+  useEffect(() => {
     load();
-    // 5s background refresh — broker data stays fresh without overwhelming the API
-    // (brokercache absorbs burst; see internal/web/brokercache.go TTLs)
-    const interval = setInterval(load, 5_000);
     return () => {
       fetchControllerRef.current?.abort();
-      clearInterval(interval);
     };
-  }, [modeFilter]); // re-fetch when mode filter changes
+  }, [load]);
+
+  // 5s background refresh — broker data stays fresh without overwhelming the API
+  // (brokercache absorbs burst; see internal/web/brokercache.go TTLs). Pauses when
+  // the tab is hidden so background tabs don't keep hitting the broker.
+  useVisiblePoll(load, 5_000);
 
   const hasData    = snapshot !== null;
   const totalValue = snapshot?.TotalValue ?? 0;

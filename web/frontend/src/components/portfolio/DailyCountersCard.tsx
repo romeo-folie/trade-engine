@@ -9,7 +9,8 @@
  * daily-summary writer hasn't fired yet, so this card never sits at zero on
  * engine restart.
  */
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { useVisiblePoll } from '../../hooks/useVisiblePoll';
 import { TOKENS } from '../../styles/tokens';
 
 interface DailyCounter {
@@ -51,46 +52,46 @@ export default function DailyCountersCard() {
   // component.
   const fetchControllerRef = useRef<AbortController | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      // Cancel any prior in-flight request so only the latest response
-      // can update state (5s poll cadence + slow networks otherwise pile
-      // up parallel requests).
-      fetchControllerRef.current?.abort();
-      const controller = new AbortController();
-      fetchControllerRef.current = controller;
+  const load = useCallback(async () => {
+    // Cancel any prior in-flight request so only the latest response can
+    // update state (5s poll cadence + slow networks otherwise pile up
+    // parallel requests).
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
 
-      try {
-        const res = await fetch('/api/portfolio/daily-counters?days=1', {
-          signal: controller.signal,
-        });
-        if (!res.ok) {
-          if (!cancelled) setError(`HTTP ${res.status}`);
-          return;
-        }
-        const data: CountersResponse = await res.json();
-        if (cancelled) return;
-        // Newest day is last in the array (asc by date in the handler);
-        // synthesized today is appended last when no row exists yet.
-        const last = data.counters?.[data.counters.length - 1] ?? null;
-        setToday(last);
-        setError(null);
-      } catch (err) {
-        // AbortError on unmount/refresh is expected — swallow it.
-        if (!cancelled && err instanceof Error && err.name !== 'AbortError') {
-          setError(err.message);
-        }
+    try {
+      const res = await fetch('/api/portfolio/daily-counters?days=1', {
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      if (!res.ok) {
+        setError(`HTTP ${res.status}`);
+        return;
+      }
+      const data: CountersResponse = await res.json();
+      if (controller.signal.aborted) return;
+      // Newest day is last in the array (asc by date in the handler);
+      // synthesized today is appended last when no row exists yet.
+      const last = data.counters?.[data.counters.length - 1] ?? null;
+      setToday(last);
+      setError(null);
+    } catch (err) {
+      // AbortError on unmount/refresh is expected — swallow it.
+      if (err instanceof Error && err.name !== 'AbortError') {
+        setError(err.message);
       }
     }
-    load();
-    const interval = setInterval(load, 5_000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-      fetchControllerRef.current?.abort();
-    };
   }, []);
+
+  useEffect(() => {
+    load();
+    return () => fetchControllerRef.current?.abort();
+  }, [load]);
+
+  // 5s background refresh — pauses when the tab is hidden so a backgrounded
+  // Portfolio tab doesn't keep hitting /api/portfolio/daily-counters.
+  useVisiblePoll(load, 5_000);
 
   const total = today?.signals_total ?? 0;
   const blocked = today?.signals_blocked ?? 0;
