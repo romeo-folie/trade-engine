@@ -4,7 +4,8 @@
  *
  * Task 8 of the web redesign (closes #206).
  */
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import { EVENT_LABELS } from '../types/protocol';
 import type { IndexedWebEvent } from '../hooks/useEngineSocket';
@@ -140,58 +141,54 @@ export default function SystemScreen() {
   const baseUptime = useRef(0);
   const loadedAt = useRef(Date.now());
 
-  useEffect(() => {
-    async function fetchAll() {
-      const [statusRes, cacheRes, modelsRes, signalsRes, riskRes] = await Promise.allSettled([
-        fetch('/api/system/status'),
-        fetch('/api/system/cache'),
-        fetch('/api/node/models'),
-        fetch('/api/signals/recent?limit=200'),
-        fetch('/api/node/risk'),
-      ]);
+  const fetchAll = useCallback(async () => {
+    const [statusRes, cacheRes, modelsRes, signalsRes, riskRes] = await Promise.allSettled([
+      fetch('/api/system/status'),
+      fetch('/api/system/cache'),
+      fetch('/api/node/models'),
+      fetch('/api/signals/recent?limit=200'),
+      fetch('/api/node/risk'),
+    ]);
 
-      if (statusRes.status === 'fulfilled' && statusRes.value.ok) {
-        const data = await statusRes.value.json();
-        setSystemStatus(data);
-        baseUptime.current = data.uptime_seconds;
-        loadedAt.current = Date.now();
-      }
-      if (cacheRes.status === 'fulfilled' && cacheRes.value.ok) {
-        setCacheStats(await cacheRes.value.json());
-      }
-      if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
-        const data = await modelsRes.value.json();
-        if (data?.model_performance) setModelPerf(data.model_performance);
-      }
-      if (signalsRes.status === 'fulfilled' && signalsRes.value.ok) {
-        const data = await signalsRes.value.json();
-        // Best-effort count from last 200 signals; may undercount if >200 signals today.
-        if (data?.signals && Array.isArray(data.signals)) {
-          const todayPrefix = new Date().toISOString().slice(0, 10);
-          const todayCount = data.signals.filter((s: { CreatedAt: string }) =>
-            s.CreatedAt.startsWith(todayPrefix)
-          ).length;
-          setSignalCount(todayCount);
-        }
-      }
-      if (riskRes.status === 'fulfilled' && riskRes.value.ok) {
-        setRiskData(await riskRes.value.json());
+    if (statusRes.status === 'fulfilled' && statusRes.value.ok) {
+      const data = await statusRes.value.json();
+      setSystemStatus(data);
+      baseUptime.current = data.uptime_seconds;
+      loadedAt.current = Date.now();
+    }
+    if (cacheRes.status === 'fulfilled' && cacheRes.value.ok) {
+      setCacheStats(await cacheRes.value.json());
+    }
+    if (modelsRes.status === 'fulfilled' && modelsRes.value.ok) {
+      const data = await modelsRes.value.json();
+      if (data?.model_performance) setModelPerf(data.model_performance);
+    }
+    if (signalsRes.status === 'fulfilled' && signalsRes.value.ok) {
+      const data = await signalsRes.value.json();
+      // Best-effort count from last 200 signals; may undercount if >200 signals today.
+      if (data?.signals && Array.isArray(data.signals)) {
+        const todayPrefix = new Date().toISOString().slice(0, 10);
+        const todayCount = data.signals.filter((s: { CreatedAt: string }) =>
+          s.CreatedAt.startsWith(todayPrefix)
+        ).length;
+        setSignalCount(todayCount);
       }
     }
-
-    fetchAll();
-    const interval = setInterval(fetchAll, 30_000);
-    return () => clearInterval(interval);
+    if (riskRes.status === 'fulfilled' && riskRes.value.ok) {
+      setRiskData(await riskRes.value.json());
+    }
   }, []);
 
-  // Tick uptime every second
-  useEffect(() => {
-    const id = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - loadedAt.current) / 1000);
-      setUptime(baseUptime.current + elapsed);
-    }, 1000);
-    return () => clearInterval(id);
+  useEffect(() => { fetchAll(); }, [fetchAll]);
+  useVisiblePoll(fetchAll, 30_000);
+
+  // Uptime ticker — pauses when tab is hidden (Date.now() math means it
+  // self-corrects to the right value on visibility return without intervening ticks).
+  const tickUptime = useCallback(() => {
+    const elapsed = Math.floor((Date.now() - loadedAt.current) / 1000);
+    setUptime(baseUptime.current + elapsed);
   }, []);
+  useVisiblePoll(tickUptime, 1000);
 
   const mode = systemStatus?.mode ?? '—';
   const tickSec = systemStatus?.tick_interval_sec ?? null;

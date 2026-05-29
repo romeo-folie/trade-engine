@@ -7,6 +7,7 @@
  * Task 5 of the web redesign (closes #205).
  */
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { useVisiblePoll } from '../hooks/useVisiblePoll';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -245,42 +246,42 @@ export default function TradesScreen() {
   const fetchControllerRef = useRef<AbortController | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
 
-  useEffect(() => {
-    async function load() {
-      fetchControllerRef.current?.abort();
-      const controller = new AbortController();
-      fetchControllerRef.current = controller;
+  const load = useCallback(async () => {
+    fetchControllerRef.current?.abort();
+    const controller = new AbortController();
+    fetchControllerRef.current = controller;
 
-      try {
-        const res = await fetch('/api/trades/recent?limit=200', { signal: controller.signal });
-        if (!res.ok) {
-          setFetchError(`${res.status} ${res.statusText}`);
-          return;
-        }
-        const data = await res.json();
-        if (data && Array.isArray(data.trades)) {
-          setTrades(data.trades);
-          setFetchError(null);
-        } else {
-          setFetchError('Unexpected response shape');
-        }
-      } catch (err) {
-        if (err instanceof Error && err.name !== 'AbortError') {
-          console.warn('[TradesScreen] fetch error:', err);
-          setFetchError(err.message);
-        }
-      } finally {
-        setIsLoading(false);
+    try {
+      const res = await fetch('/api/trades/recent?limit=200', { signal: controller.signal });
+      if (!res.ok) {
+        setFetchError(`${res.status} ${res.statusText}`);
+        return;
       }
+      const data = await res.json();
+      if (data && Array.isArray(data.trades)) {
+        setTrades(data.trades);
+        setFetchError(null);
+      } else {
+        setFetchError('Unexpected response shape');
+      }
+    } catch (err) {
+      if (err instanceof Error && err.name !== 'AbortError') {
+        console.warn('[TradesScreen] fetch error:', err);
+        setFetchError(err.message);
+      }
+    } finally {
+      setIsLoading(false);
     }
+  }, []);
 
+  useEffect(() => {
     load();
-    const interval = setInterval(load, 30_000);
     return () => {
       fetchControllerRef.current?.abort();
-      clearInterval(interval);
     };
-  }, []);
+  }, [load]);
+
+  useVisiblePoll(load, 30_000);
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 

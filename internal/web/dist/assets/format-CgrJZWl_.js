@@ -1,0 +1,1 @@
+function n(t){return Number.isFinite(t)?"$"+t.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2}):"—"}function r(t){return t?new Date(t).toLocaleString("en-US",{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit",hour12:!1}):"—"}export{n as a,r as f};
