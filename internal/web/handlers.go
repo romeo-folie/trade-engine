@@ -39,6 +39,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/signals/recent", s.handleRecentSignals)
 	mux.HandleFunc("/api/trades/recent", s.handleRecentTrades)
 	mux.HandleFunc("/api/analyses/recent", s.handleRecentAnalyses)
+	mux.HandleFunc("/api/analyses/", s.handleAnalysisDetail) // /api/analyses/{id}
 	mux.HandleFunc("/api/backtests/runs", s.handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", s.handleBacktestRunDetail)
 	mux.HandleFunc("/api/portfolio/history", s.handlePortfolioHistory)
@@ -914,25 +915,62 @@ func (s *Server) handleRecentAnalyses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// GetRecentAnalysesSummary deliberately skips ensemble_results / arbiter_response
+	// — AnalystResults and ArbiterReasoning stay zero-valued here and are populated
+	// only by handleAnalysisDetail (which AnalysisModal fetches on open).
 	out := make([]analysisSummaryResponse, len(summaries))
 	for i, a := range summaries {
-		r := analysisSummaryResponse{
+		out[i] = analysisSummaryResponse{
 			AnalysisSummary: a,
 			FastPathed:      a.FastPathed,
 			DissentSummary:  a.DissentSummaryRaw,
 		}
-		if analysts, _ := mapAnalystResults(a.EnsembleResultsRaw); len(analysts) > 0 {
-			r.AnalystResults = analysts
-		}
-		if len(a.ArbiterResponseRaw) > 0 {
-			var arb arbiterFinalWrapper
-			if json.Unmarshal(a.ArbiterResponseRaw, &arb) == nil {
-				r.ArbiterReasoning = arb.Final.Reasoning
-			}
-		}
-		out[i] = r
 	}
 	jsonResponse(w, map[string]any{"analyses": out})
+}
+
+// GET /api/analyses/{id} — returns a single analysis with the full JSONB payload
+// (ensemble_results, arbiter_response) trimmed from /api/analyses/recent for
+// payload efficiency. AnalysisModal fetches this on open to render per-analyst
+// reasoning and the arbiter synthesis.
+func (s *Server) handleAnalysisDetail(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/analyses/")
+	if id == "" || strings.Contains(id, "/") {
+		http.Error(w, `{"error":"missing analysis id"}`, http.StatusBadRequest)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	a, err := store.GetAnalysisDetail(ctx, id)
+	if err != nil {
+		apiError(w, "analysis detail query failed", err)
+		return
+	}
+	if a == nil {
+		http.Error(w, `{"error":"analysis not found"}`, http.StatusNotFound)
+		return
+	}
+
+	out := analysisSummaryResponse{
+		AnalysisSummary: *a,
+		FastPathed:      a.FastPathed,
+		DissentSummary:  a.DissentSummaryRaw,
+	}
+	if analysts, _ := mapAnalystResults(a.EnsembleResultsRaw); len(analysts) > 0 {
+		out.AnalystResults = analysts
+	}
+	if len(a.ArbiterResponseRaw) > 0 {
+		var arb arbiterFinalWrapper
+		if json.Unmarshal(a.ArbiterResponseRaw, &arb) == nil {
+			out.ArbiterReasoning = arb.Final.Reasoning
+		}
+	}
+	jsonResponse(w, out)
 }
 
 // GET /api/backtests/runs?limit=N

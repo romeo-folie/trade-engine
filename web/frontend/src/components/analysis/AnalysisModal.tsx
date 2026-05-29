@@ -1,5 +1,5 @@
-import { useEffect, useRef } from 'react';
-import type { AnalysisRecord } from '../../screens/Analysis';
+import { useEffect, useRef, useState } from 'react';
+import type { AnalysisRecord, AnalystResult } from '../../screens/Analysis';
 import { ChamferedBox } from '../common/ChamferedBox';
 import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
@@ -70,8 +70,37 @@ function fmtPrice(v: number): string {
   return v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
+interface AnalysisDetail {
+  ArbiterReasoning?: string;
+  AnalystResults?: AnalystResult[] | null;
+}
+
 export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
+  // Heavy JSONB fields (ArbiterReasoning, AnalystResults) are trimmed from
+  // /api/analyses/recent for payload efficiency — we lazy-fetch them via
+  // /api/analyses/{id} on modal open. detailLoading drives the "loading…"
+  // placeholders; null detail means we haven't fetched yet for this id.
+  const [detail, setDetail] = useState<AnalysisDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setDetail(null);
+    setDetailLoading(true);
+    fetch(`/api/analyses/${encodeURIComponent(analysis.ID)}`, { signal: controller.signal })
+      .then(r => (r.ok ? r.json() : null))
+      .then((data: AnalysisDetail | null) => {
+        if (data) setDetail(data);
+        setDetailLoading(false);
+      })
+      .catch(err => {
+        // Aborts (closing the modal or switching analyses mid-flight) are
+        // expected — only surface real failures.
+        if ((err as { name?: string }).name !== 'AbortError') setDetailLoading(false);
+      });
+    return () => controller.abort();
+  }, [analysis.ID]);
 
   useEffect(() => {
     function handleKey(e: KeyboardEvent) {
@@ -157,11 +186,14 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Full Reasoning — prefer arbiter text; always fall back to Reasoning (may be a majority-vote summary) */}
+          {/* Full Reasoning — prefer arbiter text (loaded from /api/analyses/{id});
+              fall back to top-level Reasoning while detail is loading or absent. */}
           <div className={styles.section}>
             <div className={styles.sectionLabel}>FULL REASONING</div>
-            {analysis.ArbiterReasoning ? (
-              <div className={styles.reasoning}>{analysis.ArbiterReasoning}</div>
+            {detail?.ArbiterReasoning ? (
+              <div className={styles.reasoning}>{detail.ArbiterReasoning}</div>
+            ) : detailLoading ? (
+              <div className={styles.reasoning} aria-busy="true">Loading reasoning…</div>
             ) : (
               <div className={styles.reasoning}>{analysis.Reasoning}</div>
             )}
@@ -173,14 +205,14 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
             )}
           </div>
 
-          {/* Per-analyst breakdown */}
-          {analysis.AnalystResults && analysis.AnalystResults.length > 0 && (
+          {/* Per-analyst breakdown — lazy-loaded with the rest of the detail payload. */}
+          {detail?.AnalystResults && detail.AnalystResults.length > 0 && (
             <div className={styles.section}>
               <div className={styles.sectionLabel}>
                 ANALYST BREAKDOWN{analysis.FastPathed ? ' · FAST-PATH' : ''}
               </div>
               <div className={styles.analystList}>
-                {analysis.AnalystResults.map((a, idx) => (
+                {detail.AnalystResults.map((a, idx) => (
                   <CornerCard
                     key={a.name}
                     bracketColor={analystBracketColor(idx, a.active)}
