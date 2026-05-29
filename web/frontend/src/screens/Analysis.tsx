@@ -42,8 +42,12 @@ export interface AnalysisRecord {
   OutputTokens: number;
   LatencyMs: number;
   CreatedAt: string;
-  AnalystResults: AnalystResult[] | null;
-  ArbiterReasoning: string;
+  // AnalystResults and ArbiterReasoning are omitted from /api/analyses/recent
+  // for payload efficiency — AnalysisModal lazy-fetches them via
+  // /api/analyses/{id}. Optional here so consumers can't accidentally rely on
+  // their presence from a list response.
+  AnalystResults?: AnalystResult[] | null;
+  ArbiterReasoning?: string;
   DissentSummary: string;
   FastPathed: boolean;
 }
