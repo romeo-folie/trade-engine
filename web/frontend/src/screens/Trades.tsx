@@ -7,7 +7,8 @@
  * Task 5 of the web redesign (closes #205).
  */
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { useVisiblePoll } from '../hooks/useVisiblePoll';
+import useSWR from 'swr';
+import { jsonFetcher } from '../hooks/swr';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -236,52 +237,19 @@ function tradesToCsv(trades: Trade[]): string {
 /* ── Component ─────────────────────────────────────────────────────────────── */
 
 export default function TradesScreen() {
-  const [trades, setTrades] = useState<Trade[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
   const [dateFilter, setDateFilter] = useState('');
   const [toastMsg, setToastMsg] = useState<string | null>(null);
   const [expandedRow, setExpandedRow] = useState<string | null>(null);
-  const fetchControllerRef = useRef<AbortController | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
 
-  const load = useCallback(async () => {
-    fetchControllerRef.current?.abort();
-    const controller = new AbortController();
-    fetchControllerRef.current = controller;
-
-    try {
-      const res = await fetch('/api/trades/recent?limit=200', { signal: controller.signal });
-      if (!res.ok) {
-        setFetchError(`${res.status} ${res.statusText}`);
-        return;
-      }
-      const data = await res.json();
-      if (data && Array.isArray(data.trades)) {
-        setTrades(data.trades);
-        setFetchError(null);
-      } else {
-        setFetchError('Unexpected response shape');
-      }
-    } catch (err) {
-      if (err instanceof Error && err.name !== 'AbortError') {
-        console.warn('[TradesScreen] fetch error:', err);
-        setFetchError(err.message);
-      }
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    return () => {
-      fetchControllerRef.current?.abort();
-    };
-  }, [load]);
-
-  useVisiblePoll(load, 30_000);
+  const { data, error, isLoading } = useSWR<{ trades: Trade[] }>(
+    '/api/trades/recent?limit=200',
+    jsonFetcher,
+    { refreshInterval: 30_000 },
+  );
+  const trades = useMemo(() => data?.trades ?? [], [data]);
+  const fetchError = error instanceof Error ? error.message : null;
 
   useEffect(() => () => clearTimeout(toastTimer.current), []);
 

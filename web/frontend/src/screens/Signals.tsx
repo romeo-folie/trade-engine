@@ -6,7 +6,8 @@
  * signals on page 1; "Load more" appends older pages without resetting scroll.
  */
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useVisiblePoll } from '../hooks/useVisiblePoll';
+import useSWR from 'swr';
+import { jsonFetcher } from '../hooks/swr';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -175,17 +176,18 @@ export default function SignalsScreen() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
-  const [systemStatus, setSystemStatus] = useState<{ version: string; status: string } | null>(null);
-  const [isLoading, setIsLoading] = useState(true);
-  const [fetchError, setFetchError] = useState<string | null>(null);
   const [tickerSearch, setTickerSearch] = useState('');
   const [debouncedTicker, setDebouncedTicker] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
   const [selectedSignal, setSelectedSignal] = useState<Signal | null>(null);
   const [toastMsg, setToastMsg] = useState<string | null>(null);
-  const fetchControllerRef = useRef<AbortController | null>(null);
   const toastTimer = useRef<ReturnType<typeof setTimeout>>();
-  const cursorInitialized = useRef(false);
+  const initializedUrlRef = useRef<string | null>(null);
+
+  // Mirror Trades.tsx: clear a pending toast timer on unmount so a setState
+  // doesn't fire on an unmounted component if the user navigates away while
+  // the 2s toast is still pending.
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
 
   // Debounce ticker search — 300ms after last keystroke
   useEffect(() => {
@@ -193,72 +195,45 @@ export default function SignalsScreen() {
     return () => clearTimeout(t);
   }, [tickerSearch]);
 
-  // Fetch system status once on mount
+  // System status (mount-once; long stale window since version doesn't change at runtime)
+  const { data: systemStatusData } = useSWR<{ version?: string }>(
+    '/api/system/status',
+    jsonFetcher,
+    { refreshInterval: 0, revalidateOnFocus: false },
+  );
+  const systemStatus = systemStatusData
+    ? { version: systemStatusData.version || '0.0.0', status: 'ALL SYSTEMS NOMINAL' }
+    : null;
+
+  // Signals list — URL changes when filters change, which causes SWR to fetch
+  // a fresh key; the effect below mirrors fresh-data into local state and
+  // applies the merge-vs-replace logic that the cursor pagination depends on.
+  const pageUrl = buildSignalsUrl(debouncedTicker, statusFilter);
+  const { data: pageData, error, isLoading } = useSWR<{ signals: Signal[]; next_cursor: string | null }>(
+    pageUrl,
+    jsonFetcher,
+    { refreshInterval: 15_000 },
+  );
+  const fetchError = error instanceof Error ? error.message : null;
+
   useEffect(() => {
-    fetch('/api/system/status')
-      .then(r => (r.ok ? r.json() : null))
-      .then(data => {
-        if (data) setSystemStatus({ version: data.version || '0.0.0', status: 'ALL SYSTEMS NOMINAL' });
-      })
-      .catch(() => {});
-  }, []);
-
-  // fetchPage1 closes over the current filters; identity changes when filters
-  // change so the reset-and-load effect below re-fires. useVisiblePoll captures
-  // the latest fetchPage1 in a ref, so polling always uses current filters
-  // without tearing the interval down on every filter change.
-  const fetchPage1 = useCallback(async () => {
-    fetchControllerRef.current?.abort();
-    const controller = new AbortController();
-    fetchControllerRef.current = controller;
-
-    try {
-      const res = await fetch(buildSignalsUrl(debouncedTicker, statusFilter), { signal: controller.signal });
-      if (!res.ok) {
-        setFetchError(`${res.status} ${res.statusText}`);
-        return;
-      }
-      const data = await res.json();
-      const fresh: Signal[] = data.signals ?? [];
-
-      if (!cursorInitialized.current) {
-        // First load for this filter combination — set cursor and replace state
-        setNextCursor(data.next_cursor ?? null);
-        cursorInitialized.current = true;
-        setSignals(fresh);
-      } else {
-        // Poll merge: prepend new signals, update existing ones in-place
-        setSignals(prev => {
-          const freshById = new Map(fresh.map((s: Signal) => [s.ID, s]));
-          const updated = prev.map(s => freshById.get(s.ID) ?? s);
-          const brandNew = fresh.filter(s => !prev.some(e => e.ID === s.ID));
-          return [...brandNew, ...updated];
-        });
-      }
-      setFetchError(null);
-    } catch (err) {
-      if (err instanceof Error && err.name !== 'AbortError') {
-        console.warn('[SignalsScreen] fetch error:', err);
-        setFetchError(err.message);
-      }
-    } finally {
-      setIsLoading(false);
+    if (!pageData) return;
+    const fresh = pageData.signals ?? [];
+    if (initializedUrlRef.current !== pageUrl) {
+      // New filter combo — replace (clears any older paginated tail too).
+      setSignals(fresh);
+      setNextCursor(pageData.next_cursor ?? null);
+      initializedUrlRef.current = pageUrl;
+    } else {
+      // Same URL polling — merge: prepend brand-new ids, update existing in place.
+      setSignals(prev => {
+        const freshById = new Map(fresh.map((s: Signal) => [s.ID, s]));
+        const updated = prev.map(s => freshById.get(s.ID) ?? s);
+        const brandNew = fresh.filter(s => !prev.some(e => e.ID === s.ID));
+        return [...brandNew, ...updated];
+      });
     }
-  }, [debouncedTicker, statusFilter]);
-
-  // Reset + load when filters change (fetchPage1 identity tracks them).
-  useEffect(() => {
-    setSignals([]);
-    setNextCursor(null);
-    setIsLoading(true);
-    cursorInitialized.current = false;
-    fetchPage1();
-    return () => {
-      fetchControllerRef.current?.abort();
-    };
-  }, [fetchPage1]);
-
-  useVisiblePoll(fetchPage1, 15_000);
+  }, [pageData, pageUrl]);
 
   const handleLoadMore = useCallback(async () => {
     if (!nextCursor || isLoadingMore) return;

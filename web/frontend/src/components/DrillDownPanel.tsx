@@ -1,6 +1,6 @@
-import { useEffect, useState, useRef, useCallback, type ReactNode } from 'react';
+import { type ReactNode } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { useVisiblePoll } from '../hooks/useVisiblePoll';
+import useSWR from 'swr';
 
 // ── Node display names (hoisted — used before function definitions below) ─────
 
@@ -129,46 +129,14 @@ interface DrillDownPanelProps {
 }
 
 export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
-  const [data, setData] = useState<unknown>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-  const refreshAbortRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    if (!nodeId) { setData(null); return; }
-
-    // Abort any in-flight request from previous nodeId.
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-
-    setLoading(true);
-    setError(null);
-
-    fetchNodeData(nodeId, controller.signal)
-      .then(d => { if (!controller.signal.aborted) { setData(d); setLoading(false); } })
-      .catch(e => { if (!controller.signal.aborted) { setError(String(e)); setLoading(false); } });
-
-    return () => {
-      controller.abort();
-      refreshAbortRef.current?.abort();
-    };
-  }, [nodeId]);
-
-  // 10s auto-refresh while panel is open. No-op when nodeId is absent so the
-  // interval timer is harmless but does no work. Pauses when the tab is hidden
-  // so a backgrounded Pipeline tab doesn't keep hitting the node API.
-  const refresh = useCallback(() => {
-    if (!nodeId) return;
-    refreshAbortRef.current?.abort();
-    const refreshController = new AbortController();
-    refreshAbortRef.current = refreshController;
-    fetchNodeData(nodeId, refreshController.signal)
-      .then(d => { if (!refreshController.signal.aborted) { setData(d); setError(null); } })
-      .catch(e => { if (!refreshController.signal.aborted) { setError(String(e)); } });
-  }, [nodeId]);
-  useVisiblePoll(refresh, 10_000);
+  // Conditional fetch: null key skips the fetch entirely when no node selected.
+  // SWR pauses the 10s interval when the tab is hidden.
+  const { data, error, isLoading: loading } = useSWR<unknown>(
+    nodeId || null,
+    (id: string) => fetchNodeData(id),
+    { refreshInterval: 10_000 },
+  );
+  const errorMsg = error ? String(error) : null;
 
   return (
     <AnimatePresence>
@@ -226,9 +194,9 @@ export function DrillDownPanel({ nodeId, onClose }: DrillDownPanelProps) {
           {/* Content */}
           <div style={{ padding: '16px 20px' }}>
             {loading && <Skeleton />}
-            {error && <ErrorCard message={error} />}
-            {!loading && !error && data != null && renderNodeContent(nodeId, data)}
-            {!loading && !error && !data && (
+            {errorMsg && <ErrorCard message={errorMsg} />}
+            {!loading && !errorMsg && data != null && renderNodeContent(nodeId, data)}
+            {!loading && !errorMsg && !data && (
               <div style={{ color: '#4b4b6f', fontSize: 12, textAlign: 'center', marginTop: 40 }}>
                 No data available
               </div>

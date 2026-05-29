@@ -9,8 +9,10 @@
  *   GET /api/portfolio/summaries — 7-day period performance
  *   GET /api/portfolio/stats     — aggregate win-rate, PF, etc.
  */
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { useVisiblePoll } from '../hooks/useVisiblePoll';
+import { useState, useMemo } from 'react';
+import useSWR from 'swr';
+import { jsonFetcher } from '../hooks/swr';
+import { useEngineSocketContext } from '../contexts/EngineSocketContext';
 import { TOKENS } from '../styles/tokens';
 import KpiCard from '../components/portfolio/KpiCard';
 import OverlayChart, { ChartMode } from '../components/portfolio/OverlayChart';
@@ -125,75 +127,41 @@ const MODE_FILTERS: { key: ModeFilter; label: string }[] = [
 ];
 
 export default function PortfolioScreen() {
-  const [snapshot, setSnapshot]     = useState<PortfolioSnapshot | null>(null);
-  const [history, setHistory]       = useState<HistoryResponse | null>(null);
-  const [summaries, setSummaries]   = useState<DailySummary[]>([]);
-  const [stats, setStats]           = useState<PortfolioStats | null>(null);
-  const [positions, setPositions]   = useState<any[]>([]);
-  const [fetchError, setFetchError] = useState<string | null>(null);
   const [chartMode, setChartMode]   = useState<ChartMode>('overlay');
   const [modeFilter, setModeFilter] = useState<ModeFilter>('all');
-  const fetchControllerRef = useRef<AbortController | null>(null);
 
-  const load = useCallback(async () => {
-    fetchControllerRef.current?.abort();
-    const controller = new AbortController();
-    fetchControllerRef.current = controller;
+  // Snapshot now comes from the WebSocket portfolio stream (PR-C of the perf
+  // cleanup). useEngineSocket already does a one-time REST seed at mount, so
+  // the card shows fresh values even before the first push event arrives —
+  // no need to poll /api/node/portfolio in parallel.
+  const { portfolioState } = useEngineSocketContext();
+  const snapshot: PortfolioSnapshot | null = portfolioState ? {
+    TotalValue:    portfolioState.totalValue,
+    Cash:          portfolioState.cash,
+    Invested:      portfolioState.invested,
+    UnrealizedPnL: portfolioState.unrealizedPnL,
+    DayPnL:        portfolioState.realizedPnlToday,
+    OpenPositions: portfolioState.openPositions,
+    source:        'tracker',
+    stale_at:      null,
+  } : null;
 
-    try {
-      // Snapshot
-      const resSn = await fetch('/api/node/portfolio', { signal: controller.signal });
-      if (resSn.ok) {
-        const data = await resSn.json();
-        if (data && typeof data.TotalValue === 'number') {
-          setSnapshot(data);
-          setFetchError(null);
-        }
-      }
-
-      // Equity history (dual series)
-      const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
-      const resHist = await fetch(histUrl, { signal: controller.signal });
-      if (resHist.ok) {
-        setHistory(await resHist.json());
-      }
-
-      // Daily summaries
-      const resSum = await fetch('/api/portfolio/summaries?limit=7', { signal: controller.signal });
-      if (resSum.ok) {
-        const data = await resSum.json();
-        setSummaries(data.summaries || []);
-      }
-
-      // Stats
-      const resStats = await fetch('/api/portfolio/stats', { signal: controller.signal });
-      if (resStats.ok) setStats(await resStats.json());
-
-      // Positions
-      const resPos = await fetch('/api/portfolio/positions', { signal: controller.signal });
-      if (resPos.ok) {
-        const posData = await resPos.json();
-        setPositions(posData.positions || []);
-      }
-    } catch (err) {
-      if (err instanceof Error && err.name !== 'AbortError') {
-        console.warn('[PortfolioScreen] fetch error:', err);
-        setFetchError(err.message);
-      }
-    }
-  }, [modeFilter]);
-
-  useEffect(() => {
-    load();
-    return () => {
-      fetchControllerRef.current?.abort();
-    };
-  }, [load]);
-
-  // 5s background refresh — broker data stays fresh without overwhelming the API
-  // (brokercache absorbs burst; see internal/web/brokercache.go TTLs). Pauses when
-  // the tab is hidden so background tabs don't keep hitting the broker.
-  useVisiblePoll(load, 5_000);
+  // Equity history depends on modeFilter — SWR keys on the URL, so changing
+  // the filter automatically fetches a new key + caches both. 5s refresh
+  // matches the prior cadence; SWR pauses it while the tab is hidden.
+  const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
+  const swrOpts = { refreshInterval: 5_000 } as const;
+  const { data: history = null,    error: historyError }   = useSWR<HistoryResponse>(histUrl, jsonFetcher, swrOpts);
+  const { data: summariesData,     error: summariesError } = useSWR<{ summaries?: DailySummary[] }>('/api/portfolio/summaries?limit=7', jsonFetcher, swrOpts);
+  const summaries = useMemo(() => summariesData?.summaries ?? [], [summariesData]);
+  const { data: stats = null,      error: statsError }     = useSWR<PortfolioStats>('/api/portfolio/stats', jsonFetcher, swrOpts);
+  const { data: positionsData,     error: positionsError } = useSWR<{ positions?: any[] }>('/api/portfolio/positions', jsonFetcher, swrOpts);
+  const positions = useMemo(() => positionsData?.positions ?? [], [positionsData]);
+  // Surface ANY failing endpoint so the alert banner + chart placeholder
+  // reflect a real error state (not just positions). Mirrors the prior
+  // single-fetchAll behavior where any thrown error set fetchError.
+  const fetchError = [historyError, summariesError, statsError, positionsError]
+    .find((e): e is Error => e instanceof Error)?.message ?? null;
 
   const hasData    = snapshot !== null;
   const totalValue = snapshot?.TotalValue ?? 0;
