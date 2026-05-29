@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -281,6 +282,12 @@ type AnalysisSummary struct {
 
 // GetRecentAnalysesSummary retrieves summary fields for the most recent analyses.
 // It does not fetch raw_response, raw_prompt, prompt_hash, or indicators.
+// GetRecentAnalysesSummary returns the most recent N analyses for the list view.
+// Deliberately OMITS the heavy JSONB columns (ensemble_results, arbiter_response):
+// they average 13 KB and 3.4 KB per row respectively and the list cards don't
+// render the per-analyst reasoning or the arbiter reasoning — only AnalysisModal
+// does, and it now fetches GetAnalysisDetail on open. Trimming these here cut the
+// /api/analyses/recent payload from ~1.6 MB to ~150 KB (limit=100).
 func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary, error) {
 	q := `
 		SELECT id, ticker, strategy, action, confidence, size_pct,
@@ -288,7 +295,6 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 		       model_provider, model_name,
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
 		       created_at,
-		       ensemble_results, arbiter_response,
 		       COALESCE(fast_pathed, false), COALESCE(dissent_summary, '')
 		FROM analyses
 		ORDER BY created_at DESC
@@ -308,7 +314,6 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 			&a.ModelProvider, &a.ModelName,
 			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
 			&a.CreatedAt,
-			&a.EnsembleResultsRaw, &a.ArbiterResponseRaw,
 			&a.FastPathed, &a.DissentSummaryRaw,
 		); err != nil {
 			return nil, err
@@ -316,6 +321,40 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// GetAnalysisDetail returns a single analysis with the full JSONB payload — used
+// by AnalysisModal which renders per-analyst reasoning (ensemble_results) and
+// the arbiter synthesis (arbiter_response). Returns (nil, nil) when not found
+// so callers can render a 404 cleanly.
+func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error) {
+	q := `
+		SELECT id, ticker, strategy, action, confidence, size_pct,
+		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
+		       model_provider, model_name,
+		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
+		       created_at,
+		       ensemble_results, arbiter_response,
+		       COALESCE(fast_pathed, false), COALESCE(dissent_summary, '')
+		FROM analyses
+		WHERE id = $1`
+	var a AnalysisSummary
+	err := GetDB().QueryRow(ctx, q, id).Scan(
+		&a.ID, &a.Ticker, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
+		&a.StopLoss, &a.TakeProfit, &a.Reasoning,
+		&a.ModelProvider, &a.ModelName,
+		&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
+		&a.CreatedAt,
+		&a.EnsembleResultsRaw, &a.ArbiterResponseRaw,
+		&a.FastPathed, &a.DissentSummaryRaw,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &a, nil
 }
 
 // GetAnalystResultsBatchForSignals fetches ensemble_results for a batch of signals
