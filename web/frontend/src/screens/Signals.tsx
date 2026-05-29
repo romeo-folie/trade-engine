@@ -216,11 +216,22 @@ export default function SignalsScreen() {
   );
   const fetchError = error instanceof Error ? error.message : null;
 
+  // Reset on filter change so previous results don't keep rendering under the
+  // new filter controls while SWR fetches the uncached URL. Without this, a
+  // slow or failed fetch leaves the prior filter's table/CSV/detail panel
+  // visible — the bug Codex flagged on PR #352.
+  useEffect(() => {
+    setSignals([]);
+    setNextCursor(null);
+    initializedUrlRef.current = null;
+  }, [pageUrl]);
+
+  // Apply fresh page-1 data: replace on first arrival for this URL, merge on
+  // subsequent polls of the same URL.
   useEffect(() => {
     if (!pageData) return;
     const fresh = pageData.signals ?? [];
     if (initializedUrlRef.current !== pageUrl) {
-      // New filter combo — replace (clears any older paginated tail too).
       setSignals(fresh);
       setNextCursor(pageData.next_cursor ?? null);
       initializedUrlRef.current = pageUrl;
