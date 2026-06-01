@@ -109,15 +109,12 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 		return nil
 	}
 
-	// Rank distinct neighbours by edge strength, take the strongest maxPerScan.
+	// Rank distinct neighbours by edge strength, strongest first.
 	ranked := make([]store.NeighborCandidate, 0, len(best))
 	for _, n := range best {
 		ranked = append(ranked, n)
 	}
 	sort.Slice(ranked, func(i, j int) bool { return ranked[i].Strength > ranked[j].Strength })
-	if len(ranked) > maxPerScan {
-		ranked = ranked[:maxPerScan]
-	}
 
 	// Build candidates. Graph neighbours carry no screener price/volume, so fetch a
 	// quote for a credible price; drop any we can't price (the scorer would otherwise
@@ -127,9 +124,13 @@ func (s *MarketScanner) graphNeighborCandidates(ctx context.Context, existing []
 		slog.Warn("scanner: graph sourcing — no Alpaca client, cannot price neighbors")
 		return nil
 	}
+	// Apply maxPerScan to PRICED candidates, not the raw ranking: a handful of
+	// unpriceable high-strength tickers (stale/non-US/mistyped) must not consume the
+	// budget and starve valid lower-ranked neighbours. Keep pricing down the ranking
+	// until the budget fills.
 	var out []SwingCandidate
 	for _, n := range ranked {
-		if ctx.Err() != nil {
+		if len(out) >= maxPerScan || ctx.Err() != nil {
 			break
 		}
 		q, err := s.AlpacaClient.FetchQuote(ctx, n.Ticker)
