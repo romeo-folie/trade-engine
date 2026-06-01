@@ -15,8 +15,12 @@ type SwingCandidate struct {
 	ChangePct  float64 // % price change today (from movers); 0 if from most-actives only
 	Volume     int64   // today's volume
 	TradeCount int64   // number of trades today
-	Sources    []string // "mover" | "active" — which screeners surfaced this ticker
+	Sources    []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
 	News       []SwingNewsItem
+	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
+	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
+	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
+	GraphContext string
 }
 
 // SwingNewsItem is a lightweight news record for prompt injection.
@@ -69,6 +73,7 @@ Rules:
     - volume_surge without directional news → "momentum"
     - oversold_bounce → "mean_reversion"
 - timeframes: momentum plays should use ["1H", "4H"] for entry timing; add "1D" only for longer multi-day swings. Prefer ["1H", "4H"] for momentum_breakout and news_catalyst setups. Use ["1D"] only for oversold_bounce or "other" where the move is likely to play out over several days
+- if a "Graph link" is shown, the candidate was surfaced because it is related (supply chain, competition, etc.) to a ticker already being watched. Treat the link as a thesis to confirm, not a reason to add on its own: require a credible swing setup (catalyst, volume, or momentum) in the candidate itself before "add".
 - This is a discovery watchlist — add anything with a credible setup worth monitoring; the trading engine applies its own signal gates before acting.`, convictionStr)
 
 	var sb strings.Builder
@@ -90,6 +95,9 @@ Rules:
 		sb.WriteString(fmt.Sprintf("Trade count:  %d\n", candidate.TradeCount))
 	}
 	sb.WriteString(fmt.Sprintf("Surfaced by:  %s\n", strings.Join(candidate.Sources, ", ")))
+	if candidate.GraphContext != "" {
+		sb.WriteString(fmt.Sprintf("Graph link:   %s\n", candidate.GraphContext))
+	}
 	sb.WriteString("\n")
 
 	if len(candidate.News) > 0 {

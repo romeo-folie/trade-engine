@@ -44,6 +44,21 @@ func DeleteRelationship(ctx context.Context, id string) error {
 	return store.DeleteRelationship(ctx, id)
 }
 
+// ConfirmRelationship promotes an auto-generated edge to trusted (clears the
+// auto_generated flag) so it becomes eligible to source scanner candidates.
+func ConfirmRelationship(ctx context.Context, id string) error {
+	return store.ConfirmRelationship(ctx, id)
+}
+
+// NeighborCandidate is a tradeable company one hop from a seed ticker in the graph.
+type NeighborCandidate = store.NeighborCandidate
+
+// EligibleNeighbors returns trustworthy 1-hop company neighbours of the seed ticker
+// (seed/confirmed edges, or auto edges meeting the confidence + corroboration bar).
+func EligibleNeighbors(ctx context.Context, ticker string, minConfidence float64, minCorroboration int, minStrength float64) ([]NeighborCandidate, error) {
+	return store.EligibleNeighbors(ctx, ticker, minConfidence, minCorroboration, minStrength)
+}
+
 // EntityByTicker looks up an entity by stock ticker (case-insensitive).
 // Returns nil if not found.
 func EntityByTicker(ctx context.Context, ticker string) (*Entity, error) {
