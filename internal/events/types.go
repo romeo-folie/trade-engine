@@ -35,9 +35,9 @@ const (
 	ORBRangeLocked         Type = "orb.range_locked"
 	ORBTradeUpdate         Type = "orb.trade_update"
 
-	ScanStarted        Type = "scanner.started"
-	ScanCompleted      Type = "scanner.completed"
-	ScannerItemAdded   Type = "scanner.item_added"
+	ScanStarted      Type = "scanner.started"
+	ScanCompleted    Type = "scanner.completed"
+	ScannerItemAdded Type = "scanner.item_added"
 )
 
 // Event is the envelope delivered to subscribers.
@@ -125,8 +125,8 @@ type SignalQueuedPayload struct {
 
 // RiskCheckCompletedPayload is emitted after all risk checks run for a signal.
 type RiskCheckCompletedPayload struct {
-	Ticker string           `json:"ticker"`
-	Passed bool             `json:"passed"`
+	Ticker string            `json:"ticker"`
+	Passed bool              `json:"passed"`
 	Checks []RiskCheckResult `json:"checks"`
 }
 
@@ -201,9 +201,9 @@ type NewsFetchedPayload struct {
 type AnalystVotePayload struct {
 	Provider   string  `json:"provider"`
 	Model      string  `json:"model"`
-	Action     string  `json:"action"`    // BUY | SELL | HOLD | ""
+	Action     string  `json:"action"` // BUY | SELL | HOLD | ""
 	Confidence float64 `json:"confidence"`
-	Skipped    bool    `json:"skipped"`   // true = analyst errored or wasn't invoked
+	Skipped    bool    `json:"skipped"` // true = analyst errored or wasn't invoked
 	LatencyMs  int64   `json:"latency_ms"`
 }
 
@@ -285,20 +285,21 @@ type ScanStartedPayload struct{}
 
 // ScanCompletedPayload is emitted when a scan cycle finishes.
 type ScanCompletedPayload struct {
-	CandidatesEvaluated int      `json:"candidates_evaluated"`
-	ItemsAdded          int      `json:"items_added"`
-	ItemsExpired        int      `json:"items_expired"`
-	DurationMs          int64    `json:"duration_ms"`
+	CandidatesEvaluated int   `json:"candidates_evaluated"`
+	ItemsAdded          int   `json:"items_added"`
+	ItemsExpired        int   `json:"items_expired"`
+	DurationMs          int64 `json:"duration_ms"`
 }
 
 // ScannerItemAddedPayload is emitted when a scanner candidate is added to the watchlist.
 type ScannerItemAddedPayload struct {
-	Ticker     string   `json:"ticker"`
-	Conviction float64  `json:"conviction"`
-	SetupType  string   `json:"setup_type"`
-	Strategy   string   `json:"strategy"`
-	Timeframes []string `json:"timeframes"`
-	Reasoning  string   `json:"reasoning"`
-	ExpiresAt  string   `json:"expires_at"` // RFC3339
+	Ticker       string   `json:"ticker"`
+	Conviction   float64  `json:"conviction"`
+	SetupType    string   `json:"setup_type"`
+	Strategy     string   `json:"strategy"`
+	Timeframes   []string `json:"timeframes"`
+	Reasoning    string   `json:"reasoning"`
+	ExpiresAt    string   `json:"expires_at"`              // RFC3339
+	Sources      []string `json:"sources,omitempty"`       // "mover" | "active" | "graph_neighbor"
+	GraphContext string   `json:"graph_context,omitempty"` // why a graph neighbour was surfaced
 }
-

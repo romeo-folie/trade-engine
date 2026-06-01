@@ -112,6 +112,14 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return fmt.Errorf("fetch candidates: %w", err)
 	}
 	slog.Info("scanner: candidates fetched", "count", len(candidates))
+
+	// 2.5 Source extra candidates from the knowledge graph — tradeable companies
+	// one hop from a manually-watched ticker. No-op unless graph sourcing is enabled.
+	if graphCands := s.graphNeighborCandidates(ctx, candidates); len(graphCands) > 0 {
+		candidates = append(candidates, graphCands...)
+		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
+	}
+
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -201,13 +209,15 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:     sc.candidate.Ticker,
-				Conviction: sc.score.Conviction,
-				SetupType:  sc.score.SetupType,
-				Strategy:   sc.score.Strategy,
-				Timeframes: timeframes,
-				Reasoning:  sc.score.Reasoning,
-				ExpiresAt:  expiresAt.Format(time.RFC3339),
+				Ticker:       sc.candidate.Ticker,
+				Conviction:   sc.score.Conviction,
+				SetupType:    sc.score.SetupType,
+				Strategy:     sc.score.Strategy,
+				Timeframes:   timeframes,
+				Reasoning:    sc.score.Reasoning,
+				ExpiresAt:    expiresAt.Format(time.RFC3339),
+				Sources:      sc.candidate.Sources,
+				GraphContext: sc.candidate.GraphContext,
 			})
 		}
 	}
@@ -432,6 +442,9 @@ func (s *MarketScanner) buildTelegramMessage(added []scoredCandidate, expired in
 	for _, sc := range added {
 		sb.WriteString(fmt.Sprintf("• *%s* — %s (conviction: %.0f%%)\n",
 			sc.candidate.Ticker, sc.score.SetupType, sc.score.Conviction*100))
+		if sc.candidate.GraphContext != "" {
+			sb.WriteString(fmt.Sprintf("  🔗 _%s_\n", sc.candidate.GraphContext))
+		}
 		if sc.score.Reasoning != "" {
 			sb.WriteString(fmt.Sprintf("  _%s_\n", sc.score.Reasoning))
 		}

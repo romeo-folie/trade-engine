@@ -373,6 +373,13 @@ func Defaults() *Config {
 			NewsLookbackHours: 24,
 			TopMovers:         20,
 			TopActives:        20,
+			GraphNeighbors: GraphNeighborsConfig{
+				Enabled:          false,
+				MaxPerScan:       5,
+				MinConfidence:    0.80,
+				MinCorroboration: 2,
+				MinEdgeStrength:  0.6,
+			},
 		},
 		Feedback: FeedbackConfig{
 			Enabled:             false,

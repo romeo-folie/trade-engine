@@ -164,8 +164,9 @@ var graphReviewCmd = &cobra.Command{
 	Use:   "review",
 	Short: "Review auto-generated relationships (confirm or reject)",
 	Long: `Shows relationships extracted automatically from news articles and prompts
-you to confirm (c) or reject (r) each one.  Confirmed relationships have their
-auto_generated flag preserved but are retained.  Rejected relationships are deleted.`,
+you to confirm (c) or reject (r) each one.  Confirming an edge clears its
+auto_generated flag, promoting it to a trusted edge that can source scanner
+candidates.  Rejected relationships are deleted.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if err := connectDB(); err != nil {
 			return err
@@ -190,9 +191,16 @@ auto_generated flag preserved but are retained.  Rejected relationships are dele
 			if r.Confidence != nil {
 				conf = fmt.Sprintf("%.0f%%", *r.Confidence*100)
 			}
+			// GetPendingAutoRelationships returns edges in outbound orientation, so
+			// RelatedEntity is the to-entity; resolve the from-entity name so the
+			// reviewer can see which way the edge actually runs before confirming.
+			fromName := r.FromEntityID
+			if e, err := knowledge.EntityByID(context.Background(), r.FromEntityID); err == nil && e != nil {
+				fromName = e.Name
+			}
 			fmt.Printf("[%d/%d] %s  --%s-->  %s  (confidence: %s)\n",
 				i+1, len(pending),
-				r.RelatedEntity.Name, r.RelationshipType,
+				fromName, r.RelationshipType,
 				r.RelatedEntity.Name, conf,
 			)
 			if r.Description != "" {
@@ -205,8 +213,13 @@ auto_generated flag preserved but are retained.  Rejected relationships are dele
 			}
 			switch strings.ToLower(strings.TrimSpace(scanner.Text())) {
 			case "c", "confirm":
-				confirmed++
-				fmt.Println("  ✓ Confirmed.")
+				if err := knowledge.ConfirmRelationship(context.Background(), r.ID); err != nil {
+					logger.Warn("confirm relationship failed", "id", r.ID, "err", err.Error())
+					fmt.Printf("  ✗ Error confirming: %v\n", err)
+				} else {
+					confirmed++
+					fmt.Println("  ✓ Confirmed (now scanner-eligible).")
+				}
 			case "r", "reject":
 				if err := knowledge.DeleteRelationship(context.Background(), r.ID); err != nil {
 					logger.Warn("delete relationship failed", "id", r.ID, "err", err.Error())

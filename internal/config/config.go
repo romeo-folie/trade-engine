@@ -584,6 +584,39 @@ type ScannerConfig struct {
 	// TopActives is the number of most-active-by-volume stocks to fetch per scan.
 	// Default: 20.
 	TopActives int `yaml:"top_actives"`
+
+	// GraphNeighbors configures sourcing scanner candidates from the knowledge
+	// graph — tradeable companies one hop from a manually-watched ticker.
+	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
+}
+
+// GraphNeighborsConfig controls whether the scanner sources additional candidates
+// from the knowledge graph. When enabled, every scan traverses out from manually
+// watched tickers (source != "scanner") to their trusted graph neighbours and feeds
+// those tickers through the same LLM scoring + conviction gate as screener
+// candidates. Disabled by default so it never changes behaviour until opted in.
+type GraphNeighborsConfig struct {
+	// Enabled turns graph-neighbour sourcing on or off. Default: false.
+	Enabled bool `yaml:"enabled"`
+
+	// MaxPerScan caps how many graph-neighbour candidates are added to the
+	// candidate pool per scan, so the graph can't crowd out screener candidates.
+	// Default: 5.
+	MaxPerScan int `yaml:"max_per_scan"`
+
+	// MinConfidence is the minimum extractor confidence (0–1) for an
+	// auto-generated edge to be eligible. Seed/confirmed edges bypass this.
+	// Default: 0.80.
+	MinConfidence float64 `yaml:"min_confidence"`
+
+	// MinCorroboration is the minimum number of distinct news items that must have
+	// asserted an auto-generated edge for it to be eligible. Seed/confirmed edges
+	// bypass this. Default: 2.
+	MinCorroboration int `yaml:"min_corroboration"`
+
+	// MinEdgeStrength is the minimum edge strength (0–1) for a neighbour to be
+	// considered. Default: 0.6.
+	MinEdgeStrength float64 `yaml:"min_edge_strength"`
 }
 
 // FeedbackConfig controls the automated feedback pipeline (Phase 17).
