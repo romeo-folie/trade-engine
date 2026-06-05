@@ -101,20 +101,21 @@ type ORBScheduler struct {
 	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
 	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
 
-	mu                  sync.Mutex // protects state, session, candidates for TUI reads
-	state               State
-	session             *store.ORBSession
-	candidates          []ScoredCandidate
-	rangeBuffers        map[string]*RangeBuffer
-	orderIDs            map[string][2]string     // ticker → [buyOrderID, sellOrderID]
-	trackedTrades       map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions  map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
-	backfilledSessions  map[string]struct{}      // session IDs already processed by backfillRecentExits
-	backfillFired       bool                     // true once the startup trades-feed backfill has run
-	lastExitReconcileAt time.Time                // wall time of the last per-tick trades-feed reconcile
-	lastScan            time.Time                // Eastern Time of the last successful scan
-	fetchFailures       map[string]int           // ticker → consecutive candle-fetch failures
-	fetchLastAttempt    map[string]time.Time     // ticker → wall time of last candle-fetch attempt
+	mu                   sync.Mutex // protects state, session, candidates for TUI reads
+	state                State
+	session              *store.ORBSession
+	candidates           []ScoredCandidate
+	rangeBuffers         map[string]*RangeBuffer
+	orderIDs             map[string][2]string     // ticker → [buyOrderID, sellOrderID]
+	trackedTrades        map[string]*trackedTrade // entry order ID → trade context + exit state
+	reconciledSessions   map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
+	backfilledSessions   map[string]struct{}      // session IDs already processed by backfillRecentExits
+	backfillFired        bool                     // true once the startup trades-feed backfill has run
+	lastExitReconcileAt  time.Time                // wall time of the last per-tick trades-feed reconcile
+	lastPaperExitCheckAt time.Time                // wall time of the last paper-mode exit-monitor sweep
+	lastScan             time.Time                // Eastern Time of the last successful scan
+	fetchFailures        map[string]int           // ticker → consecutive candle-fetch failures
+	fetchLastAttempt     map[string]time.Time     // ticker → wall time of last candle-fetch attempt
 }
 
 // trackedTrade holds per-order context needed to observe the full trade lifecycle.
@@ -343,6 +344,13 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 
 	now := s.now()
 	et := now.In(nyLoc)
+
+	// Paper mode only: record TP/stop exits for already-filled trades by replaying
+	// their 1-minute price path. Runs in every state (not just StateDone) because a
+	// bracket's exit is GTC — it can fill while a new session is scanning, or days
+	// after the session that opened it went "done". Real brokers fill these legs
+	// server-side, so this is a no-op for live executors. Throttled internally.
+	s.reconcilePaperExits(ctx)
 
 	switch state {
 	case StateIdle:
@@ -1408,6 +1416,109 @@ func (s *ORBScheduler) releaseTrackedTradesForReconcile() {
 				"ticker", tc.ticker, "trade_id", tc.dbID)
 		}
 		delete(s.trackedTrades, entryOrderID)
+	}
+}
+
+// paperExitCheckInterval throttles the paper-mode exit reconciler. Resolution replays
+// 1-minute bars, so a once-per-minute sweep is as fine-grained as the data allows while
+// keeping candle requests light. A real broker fills exit legs server-side, so the
+// reconciler never runs for live executors.
+const paperExitCheckInterval = time.Minute
+
+// paperExitHorizon bounds how far forward FROM THE FILL the reconciler replays bars for
+// a single trade. The window is always anchored at fill time (never at "now"), so a
+// trade stuck for weeks is replayed over the bars right after it filled — not an
+// unrelated recent week, which would fabricate a bogus exit. (This relies on the data
+// provider honouring the window end: see IBKRClient.FetchCandles' startTime anchor —
+// without it the endpoint only ever returns the most-recent period.) Forex ORB brackets
+// are intraday and resolve within hours; a week is generous headroom while capping the
+// cost of the first post-fix sweep and staying within providers' intraday-history
+// limits. A trade whose bars never touch a leg within this window — or whose history the
+// provider no longer retains (e.g. trades older than IBKR's 1-minute retention, which
+// therefore cannot be backfilled) — is left 'filled' rather than force-closed, so we
+// never invent an outcome.
+const paperExitHorizon = 7 * 24 * time.Hour
+
+// reconcilePaperExits records TP/stop-loss exits for filled ORB trades in paper mode.
+//
+// PaperExecutor has no server-side bracket: PlaceBracket flattens the bracket into a
+// single entry order, so once the entry fills there are no live TP/SL legs for the
+// IBKR-oriented reconcilers (exit-leg polling and the trades-feed matcher) to find.
+// Without this, every paper ORB trade stays 'filled' forever and never records an
+// outcome — exactly the bug that left realized PnL and feedback stats blind to ORB.
+//
+// It replays each filled trade's price path from fill time forward using 1-minute bars
+// and closes the trade at the first leg the path touches, stamping closed_at with that
+// bar's time. Replaying bars (rather than sampling a single live quote) means it records
+// the leg that fired first and stays correct whether a trade is closed live, after a
+// restart, or backfilled long after the fact — including the trades stuck before this
+// fix shipped. It runs in every scheduler state because a bracket's exit is effectively
+// GTC and may fill while a later session runs or days after its own session went "done".
+// CloseORBTradeAt guards on status='filled', so it is idempotent against a live reconciler.
+func (s *ORBScheduler) reconcilePaperExits(ctx context.Context) {
+	// Paper mode only: identified by the executor implementing StopOrderSimulator.
+	if _, ok := s.executor.(execution.StopOrderSimulator); !ok {
+		return
+	}
+	if s.db == nil || s.marketData == nil {
+		return
+	}
+	if time.Since(s.lastPaperExitCheckAt) < paperExitCheckInterval {
+		return
+	}
+	s.lastPaperExitCheckAt = s.now()
+
+	trades, err := store.GetOpenFilledORBTrades(ctx, s.db)
+	if err != nil {
+		slog.Warn("orb: paper exit: load filled trades failed", "err", err)
+		return
+	}
+
+	now := s.now()
+	for i := range trades {
+		t := trades[i]
+
+		// Replay window: anchored at entry fill (fallback row creation) and bounded
+		// forward by the horizon, never extending past now. Anchoring at fill — not at
+		// now — is what keeps an old stuck trade replayed over its own post-fill bars
+		// instead of an unrelated recent window.
+		from := t.CreatedAt
+		if t.FilledAt != nil {
+			from = *t.FilledAt
+		}
+		to := from.Add(paperExitHorizon)
+		if to.After(now) {
+			to = now
+		}
+		if !to.After(from) {
+			continue // window not open yet (just filled this tick) — retry next sweep
+		}
+
+		candles, cErr := s.marketData.FetchCandles(ctx, t.Ticker, data.Timeframe1Min, from, to)
+		if cErr != nil {
+			slog.Warn("orb: paper exit: fetch candles failed", "ticker", t.Ticker, "err", cErr)
+			continue
+		}
+
+		exitType, exitPrice, exitTime, found := resolveExitFromCandles(t.Side, t.StopLoss, t.TakeProfit, candles)
+		if !found {
+			continue // still open — price path never reached a leg within the window
+		}
+
+		pnl := exitPnL(t.Side, t.FillPrice, exitPrice, t.Qty)
+		slog.Info("orb: paper exit: resolved from bars",
+			"ticker", t.Ticker, "side", t.Side, "exit_type", exitType,
+			"exit_price", exitPrice, "entry_price", t.FillPrice, "exit_time", exitTime, "pnl", pnl,
+		)
+		if dbErr := store.CloseORBTradeAt(ctx, s.db, t.ID, exitType, exitPrice, pnl, exitTime); dbErr != nil {
+			slog.Error("orb: paper exit: close trade failed", "ticker", t.Ticker, "err", dbErr)
+			continue
+		}
+		pnlVal := pnl
+		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+			OrderID: t.OrderID, Ticker: t.Ticker, Side: t.Side,
+			Status: "closed", FillPrice: t.FillPrice, PnL: &pnlVal,
+		})
 	}
 }
 

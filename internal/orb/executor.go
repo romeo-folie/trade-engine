@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
@@ -20,7 +21,7 @@ type TradesFetcher interface {
 // BracketParams holds the computed bracket order parameters.
 type BracketParams struct {
 	Ticker     string
-	Side       string  // "buy" | "sell"
+	Side       string // "buy" | "sell"
 	EntryStop  float64
 	StopLoss   float64
 	TakeProfit float64
@@ -32,13 +33,13 @@ type BracketParams struct {
 func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg config.ORBConfig) BracketParams {
 	var entryStop, stopLoss, takeProfit float64
 	if side == "buy" {
-		entryStop = r.High * 1.001  // 0.1% above range high
-		stopLoss = r.Low * 0.999    // 0.1% below range low
+		entryStop = r.High * 1.001 // 0.1% above range high
+		stopLoss = r.Low * 0.999   // 0.1% below range low
 		risk := entryStop - stopLoss
 		takeProfit = entryStop + risk*cfg.RiskReward
 	} else {
-		entryStop = r.Low * 0.999   // 0.1% below range low
-		stopLoss = r.High * 1.001   // 0.1% above range high
+		entryStop = r.Low * 0.999 // 0.1% below range low
+		stopLoss = r.High * 1.001 // 0.1% above range high
 		risk := stopLoss - entryStop
 		takeProfit = entryStop - risk*cfg.RiskReward
 	}
@@ -240,6 +241,39 @@ func exitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
 		return (entryPrice - exitPrice) * float64(qty)
 	}
 	return (exitPrice - entryPrice) * float64(qty)
+}
+
+// resolveExitFromCandles walks an ordered series of OHLC bars and reports the first
+// bar whose range touches a bracket leg for a filled trade, returning the exit type
+// ("tp"/"stop"), the level price to fill at, and the bar's timestamp. found is false
+// when no bar reaches either leg (the position never exited within the bars given).
+//
+// This replays the actual price path rather than sampling a single live quote, so it
+// records the leg that fired first — correct for trades observed live, after a restart,
+// or backfilled long after the fact. A non-positive level is treated as "unset" so a
+// missing stop or target never fires. When a single bar straddles both legs (its range
+// spans stop and target), the stop is taken as the conservative tie-break, since we
+// cannot know the intra-bar order and must not over-report wins.
+func resolveExitFromCandles(side string, stopLoss, takeProfit float64, candles []data.Candle) (exitType string, exitPrice float64, exitTime time.Time, found bool) {
+	for _, c := range candles {
+		switch side {
+		case "buy":
+			if stopLoss > 0 && c.Low <= stopLoss {
+				return "stop", stopLoss, c.Timestamp, true
+			}
+			if takeProfit > 0 && c.High >= takeProfit {
+				return "tp", takeProfit, c.Timestamp, true
+			}
+		case "sell":
+			if stopLoss > 0 && c.High >= stopLoss {
+				return "stop", stopLoss, c.Timestamp, true
+			}
+			if takeProfit > 0 && c.Low <= takeProfit {
+				return "tp", takeProfit, c.Timestamp, true
+			}
+		}
+	}
+	return "", 0, time.Time{}, false
 }
 
 // CancelOrder cancels an open order by its broker order ID.

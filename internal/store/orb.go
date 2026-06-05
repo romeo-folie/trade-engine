@@ -183,6 +183,21 @@ func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType string, e
 	return err
 }
 
+// CloseORBTradeAt is like CloseORBTrade but stamps closed_at with an explicit time
+// rather than NOW(). The paper-mode bars reconciler uses it so a trade closed from a
+// historical price path records the actual bar timestamp at which its TP/stop was
+// touched — keeping closed_at accurate for trades resolved after the fact (e.g. on
+// restart or backfill) instead of collapsing them all to the reconcile time. The
+// status='filled' guard makes it idempotent against the IBKR reconcilers.
+func CloseORBTradeAt(ctx context.Context, db *pgxpool.Pool, id, exitType string, exitPrice, pnl float64, closedAt time.Time) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='closed', exit_type=$1, exit_price=$2, pnl=$3, closed_at=$4
+		WHERE id=$5 AND status='filled'`,
+		exitType, exitPrice, pnl, closedAt, id)
+	return err
+}
+
 // UpdateORBTrade updates a trade's status, fill price, and PnL. closed_at is set
 // only for terminal-without-fill transitions ('cancelled','expired'); 'filled' is
 // excluded so it never stamps closed_at on a still-open trade (that would break the
@@ -233,6 +248,51 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(exit_price,0), COALESCE(exit_type,''),
 		       created_at, filled_at, closed_at
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.TpOrderID, &t.SlOrderID,
+			&t.ExitPrice, &t.ExitType,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// GetOpenFilledORBTrades returns every ORB trade currently in status='filled'
+// (entry leg filled, exit not yet recorded) across all sessions, oldest first.
+//
+// This exists for the paper-mode exit monitor. A real broker holds the bracket's
+// TP/SL legs server-side and fills them itself — possibly long after the session
+// is "done" — and the IBKR reconcilers close the DB row from that fill. In paper
+// mode there is no server-side bracket, so nothing ever fills the exit legs and
+// these trades would otherwise stay 'filled' forever. The monitor drives their
+// exits from live quotes, which means it must see filled trades regardless of
+// which (possibly already-done) session they belong to.
+func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''),
+		       created_at, filled_at, closed_at
+		FROM orb_trades WHERE status='filled'
+		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
 		return nil, err
 	}

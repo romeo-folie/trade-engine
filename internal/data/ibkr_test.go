@@ -32,6 +32,12 @@ func TestIBKRFetchCandles(t *testing.T) {
 		if r.URL.Query().Get("outsideRth") != "true" {
 			t.Errorf("expected outsideRth=true")
 		}
+		// startTime must anchor the END of the window (to) in UTC, so historical
+		// ranges are fetched rather than the most-recent period.
+		wantStart := time.Unix(1712100000, 0).UTC().Format("20060102-15:04:05")
+		if got := r.URL.Query().Get("startTime"); got != wantStart {
+			t.Errorf("expected startTime=%s, got %s", wantStart, got)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"data": [
