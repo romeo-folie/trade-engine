@@ -203,6 +203,16 @@ func (c *IBKRClient) FetchCandles(ctx context.Context, ticker string, tf Timefra
 	params.Set("period", period)
 	params.Set("bar", barSize)
 	params.Set("outsideRth", "true")
+	// startTime is IBKR's most-recent anchor: the returned window is `period` of bars
+	// extending BACKWARD from startTime, i.e. [startTime − period, startTime]. We pass
+	// startTime=to and a period sized by computePeriod to cover the span, which yields
+	// [to − period, to] ⊇ [from, to] (period ≥ to−from, so the far edge reaches `from`).
+	// Without startTime the endpoint anchors at "now", so a request for an OLD [from,to]
+	// window returns the most-recent `period` of bars, which the range filter below then
+	// discards entirely (they all fall after `to`) — the bug that left old paper trades
+	// unresolvable. The format is IBKR's yyyyMMdd-HH:mm:ss in UTC. Existing callers pass
+	// to≈now, so for them this is behaviour-preserving (anchor "now" was already implicit).
+	params.Set("startTime", to.UTC().Format("20060102-15:04:05"))
 
 	resp, err := c.get(ctx, "/v1/api/iserver/marketdata/history", params)
 	if err != nil {

@@ -1428,12 +1428,15 @@ const paperExitCheckInterval = time.Minute
 // paperExitHorizon bounds how far forward FROM THE FILL the reconciler replays bars for
 // a single trade. The window is always anchored at fill time (never at "now"), so a
 // trade stuck for weeks is replayed over the bars right after it filled — not an
-// unrelated recent week, which would fabricate a bogus exit. Forex ORB brackets are
-// intraday and resolve within hours; a week is generous headroom while capping the cost
-// of the first post-fix sweep (it must resolve every historically-stuck trade) and
-// staying within providers' intraday-history limits. A trade whose bars never touch a
-// leg within this window — or whose history the provider can no longer serve — is left
-// 'filled' rather than force-closed, so we never invent an outcome.
+// unrelated recent week, which would fabricate a bogus exit. (This relies on the data
+// provider honouring the window end: see IBKRClient.FetchCandles' startTime anchor —
+// without it the endpoint only ever returns the most-recent period.) Forex ORB brackets
+// are intraday and resolve within hours; a week is generous headroom while capping the
+// cost of the first post-fix sweep and staying within providers' intraday-history
+// limits. A trade whose bars never touch a leg within this window — or whose history the
+// provider no longer retains (e.g. trades older than IBKR's 1-minute retention, which
+// therefore cannot be backfilled) — is left 'filled' rather than force-closed, so we
+// never invent an outcome.
 const paperExitHorizon = 7 * 24 * time.Hour
 
 // reconcilePaperExits records TP/stop-loss exits for filled ORB trades in paper mode.
