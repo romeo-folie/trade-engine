@@ -4,6 +4,8 @@ export interface SystemStatus {
   version: string;
   mode: string;
   uptimeSeconds: number;
+  /** Next engine run-cycle time as an ISO string, or null if not scheduled. */
+  nextCycleAt: string | null;
 }
 
 /**
@@ -19,12 +21,13 @@ export function useSystemStatus(): SystemStatus | null {
     const fetchStatus = (attempt: number) => {
       fetch('/api/system/status')
         .then(r => r.json())
-        .then((d: { version?: string; mode?: string; uptime_seconds?: number }) => {
+        .then((d: { version?: string; mode?: string; uptime_seconds?: number; next_cycle_at?: string }) => {
           if (cancelled) return;
           setStatus({
             version: d.version ?? '—',
             mode: d.mode ?? '—',
             uptimeSeconds: d.uptime_seconds ?? 0,
+            nextCycleAt: d.next_cycle_at || null,
           });
         })
         .catch(() => {

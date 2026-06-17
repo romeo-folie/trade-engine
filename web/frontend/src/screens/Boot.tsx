@@ -10,6 +10,7 @@
  */
 import { useState, useEffect, useMemo } from 'react';
 import type { ConnectionStatus } from '../hooks/useEngineSocket';
+import { APP_VERSION } from '../version';
 import styles from './Boot.module.css';
 
 /* ── Boot log sequence ───────────────────────────────────────────────────── */
@@ -65,7 +66,10 @@ interface BootScreenProps {
 }
 
 export default function BootScreen({ status }: BootScreenProps) {
-  const [version, setVersion] = useState('v—');
+  // Seed from the build-time constant so the version shows immediately — the
+  // engine WebSocket often connects (unmounting this screen) before the async
+  // status fetch resolves, which previously left it stuck on the "v—" placeholder.
+  const [version, setVersion] = useState(`v${APP_VERSION}`);
 
   useEffect(() => {
     fetch('/api/system/status')

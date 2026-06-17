@@ -1155,6 +1155,19 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Next engine run-cycle time, published by the engine loop to engine_state.
+	// Empty when the engine has not scheduled yet (e.g. DB down or no run loop).
+	var nextCycleAt string
+	var nextCycleInSec int
+	if v, ok, err := store.GetEngineState(ctx, store.EngineStateNextCycleAt); err == nil && ok {
+		if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+			nextCycleAt = t.UTC().Format(time.RFC3339)
+			if d := time.Until(t); d > 0 {
+				nextCycleInSec = int(d.Seconds())
+			}
+		}
+	}
+
 	jsonResponse(w, map[string]any{
 		"version":           "2.1.0",
 		"mode":              strings.ToUpper(cfg.Engine.Mode),
@@ -1162,6 +1175,8 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
 		"uptime_seconds":    uptimeSec,
 		"drawdown":          drawdown,
+		"next_cycle_at":     nextCycleAt,
+		"next_cycle_in_sec": nextCycleInSec,
 	})
 }
 

@@ -132,11 +132,14 @@ const COLUMNS: Column<Trade>[] = [
   {
     key: 'Direction',
     label: 'DIR',
-    render: (t) => (
-      <span className={t.Direction.toLowerCase() === 'buy' ? styles.dirBuy : styles.dirSell}>
-        {t.Direction.toUpperCase()}
-      </span>
-    ),
+    render: (t) => {
+      // Direction is polymorphic: "long"/"short" for stock trades, "buy"/"sell"
+      // for others. Mirror the Signals normalization so LONG gets the long color.
+      const d = t.Direction.toUpperCase();
+      if (d === 'BUY' || d === 'LONG') return <span className={styles.dirBuy}>LONG</span>;
+      if (d === 'SELL' || d === 'SHORT') return <span className={styles.dirSell}>SHORT</span>;
+      return <span className={styles.dirNeut}>NEUTRAL</span>;
+    },
   },
   {
     key: 'Strategy',

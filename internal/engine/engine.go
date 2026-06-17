@@ -361,7 +361,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 		nextTick = nextEngineWake(base, interval, ranStartupTick)
 	}
-	e.logNextCycle(nextTick, displayLoc)
+	e.logNextCycle(ctx, nextTick, displayLoc)
 	timer := time.NewTimer(time.Until(nextTick))
 	defer timer.Stop()
 
@@ -405,7 +405,7 @@ func (e *Engine) Run(ctx context.Context) error {
 				base = now
 			}
 			nextTick = nextEngineWake(base, interval, ranTick)
-			e.logNextCycle(nextTick, displayLoc)
+			e.logNextCycle(ctx, nextTick, displayLoc)
 			// Safe to call Reset directly: timer.C was just consumed above.
 			timer.Reset(time.Until(nextTick))
 		case <-ctx.Done():
@@ -466,12 +466,23 @@ func (e *Engine) applyDegradedProfile(interval *time.Duration) {
 	}
 }
 
-func (e *Engine) logNextCycle(nextTick time.Time, displayLoc *time.Location) {
+func (e *Engine) logNextCycle(ctx context.Context, nextTick time.Time, displayLoc *time.Location) {
 	wait := time.Until(nextTick)
 	logger.Info("engine cycle complete",
 		"next_cycle_in_sec", int(wait.Seconds()),
 		"next_cycle_at", nextTick.In(displayLoc).Format(time.RFC3339),
 	)
+
+	// Publish the next-cycle time to a shared store so cross-process readers
+	// (the in-process web server and the out-of-process TUI) can surface it.
+	// Best-effort: a failure here must never disrupt scheduling.
+	if store.IsConnected() {
+		wctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+		if err := store.SetEngineState(wctx, store.EngineStateNextCycleAt, nextTick.UTC().Format(time.RFC3339)); err != nil {
+			logger.Warn("failed to persist next_cycle_at", "err", err.Error())
+		}
+	}
 }
 
 // tick processes all active watchlist items for a single engine cycle.
