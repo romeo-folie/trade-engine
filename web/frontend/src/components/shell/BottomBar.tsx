@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { colors, typography } from '../../styles/tokens';
 import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 
@@ -9,6 +9,9 @@ interface BottomBarProps {
   baseUptimeSeconds: number | null;
   nextCycleAt: string | null;
 }
+
+// Tolerance for browser-vs-server clock skew when accepting a next-cycle timestamp.
+const CLOCK_SKEW_MS = 10_000;
 
 function fmtUptime(sec: number): string {
   const h = Math.floor(sec / 3600);
@@ -66,11 +69,8 @@ export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUpti
   }, [baseUptimeSeconds]);
 
   // Next-cycle countdown. Tracks the target time locally and ticks every second.
-  // The parent fetches /api/system/status once on mount, so when the countdown
-  // elapses we refetch ourselves to pick up the engine's next scheduled cycle.
   const [targetMs, setTargetMs] = useState<number | null>(null);
   const [remainingMs, setRemainingMs] = useState<number | null>(null);
-  const refetchingFor = useRef<number | null>(null);
 
   useEffect(() => {
     setTargetMs(nextCycleAt ? Date.parse(nextCycleAt) : null);
@@ -87,32 +87,41 @@ export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUpti
     return () => clearInterval(id);
   }, [targetMs]);
 
-  // When the cycle elapses, poll for the engine's next scheduled cycle. The engine
-  // only writes the new next_cycle_at *after* its (possibly minutes-long) tick
-  // completes, so a single fetch may still return the elapsed timestamp — keep
-  // retrying (every ~3s) until a fresh, later timestamp arrives. The guard ensures
-  // only one request is in flight per target at a time, never a per-second storm.
+  // Poll /api/system/status for the next-cycle timestamp whenever we lack a usable
+  // one. useSystemStatus only fetches once on mount, so the bar polls on its own in
+  // two cases: (1) at startup before the engine has written next_cycle_at — the web
+  // server can start before the engine's first schedule, and a startup tick can take
+  // minutes; (2) after the current cycle elapses — the engine writes the next
+  // schedule only once its (possibly minutes-long) tick finishes, so an immediate
+  // fetch may still return the elapsed timestamp. Keyed on a stable boolean so it
+  // does not restart every second; the chained setTimeout caps requests at ~1/5s.
+  const needTarget = targetMs == null || (remainingMs != null && remainingMs <= 0);
   useEffect(() => {
-    if (targetMs == null || remainingMs == null || remainingMs > 0) return;
-    if (refetchingFor.current === targetMs) return;
-    refetchingFor.current = targetMs;
+    if (!needTarget) return;
     let cancelled = false;
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = () => {
       fetch('/api/system/status')
         .then(r => (r.ok ? r.json() : null))
         .then((d: { next_cycle_at?: string } | null) => {
           if (cancelled) return;
           const next = d?.next_cycle_at ? Date.parse(d.next_cycle_at) : NaN;
-          if (!Number.isNaN(next) && next !== targetMs) {
-            setTargetMs(next); // fresh schedule — guard resets via targetMs change
-          } else {
-            refetchingFor.current = null; // not rescheduled yet — allow a retry
+          // Accept a different timestamp that isn't clearly stale. The skew window
+          // tolerates a browser clock lagging the server's (a genuinely-future
+          // next_cycle_at can otherwise read as just-past here); `next !== targetMs`
+          // is what actually rejects the current elapsed target being re-returned.
+          if (!Number.isNaN(next) && next > Date.now() - CLOCK_SKEW_MS && next !== targetMs) {
+            setTargetMs(next); // fresh schedule — effect stops polling
+          } else if (!cancelled) {
+            timer = setTimeout(poll, 5000); // still unknown/elapsed — keep trying
           }
         })
-        .catch(() => { if (!cancelled) refetchingFor.current = null; });
-    }, 3000);
+        .catch(() => { if (!cancelled) timer = setTimeout(poll, 5000); });
+    };
+    // Small initial delay; give a known-elapsed target a moment to reschedule.
+    timer = setTimeout(poll, targetMs == null ? 1000 : 3000);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [targetMs, remainingMs]);
+  }, [needTarget, targetMs]);
 
   const isPipelineActive = status === 'connected';
 
