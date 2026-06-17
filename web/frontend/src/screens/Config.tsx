@@ -3,9 +3,10 @@ import SettingsSection from '../components/settings/SettingsSection';
 import SegmentSelect from '../components/settings/SegmentSelect';
 import Toggle from '../components/settings/Toggle';
 import StrategyRow from '../components/settings/StrategyRow';
+import { APP_VERSION } from '../version';
 import styles from './Config.module.css';
 
-const ENGINE_VERSION = 'v2.1.0';
+const ENGINE_VERSION = `v${APP_VERSION}`;
 
 /* ── Default config values ── */
 const DEFAULTS = {

@@ -139,13 +139,20 @@
   border-color: var(--border-muted);
 }
 
+/* Direction pills — same tokens as Signals' .dirLong/.dirShort/.dirNeut so LONG
+   renders identically on both screens (acid-green accent, not the softer emerald). */
 .dirBuy {
-  color: var(--emerald);
+  color: var(--accent);
   font-weight: 700;
 }
 
 .dirSell {
   color: var(--red);
+  font-weight: 700;
+}
+
+.dirNeut {
+  color: var(--amber);
   font-weight: 700;
 }
 

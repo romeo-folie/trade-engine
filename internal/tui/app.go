@@ -84,6 +84,10 @@ type Model struct {
 	recentEvents []events.Event
 	lastPoll     time.Time
 
+	// nextCycleAt is the engine's next scheduled run-cycle time, published to the
+	// shared engine_state table by the (separate) engine process. Zero if unknown.
+	nextCycleAt time.Time
+
 	// dashData is the cached dashboard data (refreshed on poll ticks).
 	dashData views.DashboardData
 	mode     string // engine mode for dashboard header
@@ -455,6 +459,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.configData = views.FetchConfigData(ctx, m.mode)
 		m.orbData = views.FetchORBViewData(ctx)
+		// Next engine run-cycle time, published by the engine process to engine_state.
+		m.nextCycleAt = time.Time{}
+		if v, ok, err := store.GetEngineState(ctx, store.EngineStateNextCycleAt); err == nil && ok {
+			if t, perr := time.Parse(time.RFC3339, v); perr == nil {
+				m.nextCycleAt = t
+			}
+		}
 		// Clamp selection indices so they stay in-bounds after data shrinks.
 		if n := len(m.tradeData.Trades); m.selectedTrade >= n && n > 0 {
 			m.selectedTrade = n - 1
@@ -607,7 +618,7 @@ func (m Model) renderStatusBar() string {
 		lastEvent = fmt.Sprintf("last: %s @ %s", last.Type, last.Timestamp.Format("15:04:05"))
 	}
 
-	right := fmt.Sprintf("poll: %s  %s ", m.lastPoll.Format("15:04:05"), lastEvent)
+	right := fmt.Sprintf("next: %s  poll: %s  %s ", fmtNextCycle(m.nextCycleAt), m.lastPoll.Format("15:04:05"), lastEvent)
 
 	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
 	if gap < 0 {
@@ -619,6 +630,29 @@ func (m Model) renderStatusBar() string {
 	}
 
 	return statusBarStyle.Width(m.width).Render(left + padding + right)
+}
+
+// fmtNextCycle renders the engine's next run-cycle time for the status bar.
+// Shows the local clock time plus a relative countdown; "—" when unknown and
+// "due" once the scheduled time has passed (engine tick imminent or stalled).
+func fmtNextCycle(t time.Time) string {
+	if t.IsZero() {
+		return "—"
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return "due"
+	}
+	var rel string
+	switch {
+	case d >= time.Hour:
+		rel = fmt.Sprintf("%dh%dm", int(d.Hours()), int(d.Minutes())%60)
+	case d >= time.Minute:
+		rel = fmt.Sprintf("%dm", int(d.Minutes()))
+	default:
+		rel = fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	return fmt.Sprintf("%s (%s)", t.Local().Format("15:04"), rel)
 }
 
 // displayConfig holds per-tick config values needed by the TUI poll loop.

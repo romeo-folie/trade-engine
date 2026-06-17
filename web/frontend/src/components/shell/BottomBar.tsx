@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { colors, typography } from '../../styles/tokens';
 import type { ConnectionStatus } from '../../hooks/useEngineSocket';
 
@@ -7,12 +7,27 @@ interface BottomBarProps {
   lastSignalAt: number | null;
   avgLatencyMs: number | null;
   baseUptimeSeconds: number | null;
+  nextCycleAt: string | null;
 }
 
 function fmtUptime(sec: number): string {
   const h = Math.floor(sec / 3600);
   const m = Math.floor((sec % 3600) / 60);
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+// Renders the countdown to the next engine run cycle.
+// null target → "—"; already elapsed → "DUE"; otherwise Xh Ym / Ym Zs / Zs.
+function fmtCountdown(remainingMs: number | null): string {
+  if (remainingMs == null) return '—';
+  if (remainingMs <= 0) return 'DUE';
+  const sec = Math.floor(remainingMs / 1000);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = sec % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${s}s`;
+  return `${s}s`;
 }
 
 function fmtSignalTime(ts: number | null): string {
@@ -38,7 +53,7 @@ function Divider() {
   return <span style={{ color: colors.textFaint }}>|</span>;
 }
 
-export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUptimeSeconds }: BottomBarProps) {
+export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUptimeSeconds, nextCycleAt }: BottomBarProps) {
   const [uptime, setUptime] = useState<number | null>(null);
 
   // Seed uptime from parent prop and start a 1s local tick.
@@ -49,6 +64,55 @@ export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUpti
     const id = setInterval(() => setUptime(u => (u ?? 0) + 1), 1000);
     return () => clearInterval(id);
   }, [baseUptimeSeconds]);
+
+  // Next-cycle countdown. Tracks the target time locally and ticks every second.
+  // The parent fetches /api/system/status once on mount, so when the countdown
+  // elapses we refetch ourselves to pick up the engine's next scheduled cycle.
+  const [targetMs, setTargetMs] = useState<number | null>(null);
+  const [remainingMs, setRemainingMs] = useState<number | null>(null);
+  const refetchingFor = useRef<number | null>(null);
+
+  useEffect(() => {
+    setTargetMs(nextCycleAt ? Date.parse(nextCycleAt) : null);
+  }, [nextCycleAt]);
+
+  useEffect(() => {
+    if (targetMs == null) {
+      setRemainingMs(null);
+      return;
+    }
+    const update = () => setRemainingMs(targetMs - Date.now());
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  }, [targetMs]);
+
+  // When the cycle elapses, poll for the engine's next scheduled cycle. The engine
+  // only writes the new next_cycle_at *after* its (possibly minutes-long) tick
+  // completes, so a single fetch may still return the elapsed timestamp — keep
+  // retrying (every ~3s) until a fresh, later timestamp arrives. The guard ensures
+  // only one request is in flight per target at a time, never a per-second storm.
+  useEffect(() => {
+    if (targetMs == null || remainingMs == null || remainingMs > 0) return;
+    if (refetchingFor.current === targetMs) return;
+    refetchingFor.current = targetMs;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      fetch('/api/system/status')
+        .then(r => (r.ok ? r.json() : null))
+        .then((d: { next_cycle_at?: string } | null) => {
+          if (cancelled) return;
+          const next = d?.next_cycle_at ? Date.parse(d.next_cycle_at) : NaN;
+          if (!Number.isNaN(next) && next !== targetMs) {
+            setTargetMs(next); // fresh schedule — guard resets via targetMs change
+          } else {
+            refetchingFor.current = null; // not rescheduled yet — allow a retry
+          }
+        })
+        .catch(() => { if (!cancelled) refetchingFor.current = null; });
+    }, 3000);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [targetMs, remainingMs]);
 
   const isPipelineActive = status === 'connected';
 
@@ -86,6 +150,10 @@ export default function BottomBar({ status, lastSignalAt, avgLatencyMs, baseUpti
       <Divider />
 
       <StatItem label="LAST SIGNAL" value={fmtSignalTime(lastSignalAt)} />
+
+      <Divider />
+
+      <StatItem label="NEXT CYCLE" value={fmtCountdown(remainingMs)} />
 
       <Divider />
 

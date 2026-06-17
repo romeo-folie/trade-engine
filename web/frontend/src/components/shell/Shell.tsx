@@ -48,6 +48,7 @@ export default function Shell() {
         lastSignalAt={socket.lastSignalAt}
         avgLatencyMs={socket.avgLatencyMs}
         baseUptimeSeconds={systemStatus?.uptimeSeconds ?? null}
+        nextCycleAt={systemStatus?.nextCycleAt ?? null}
       />
     </div>
   );
