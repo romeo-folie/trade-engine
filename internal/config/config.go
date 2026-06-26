@@ -344,6 +344,16 @@ type ModelConfig struct {
 	// field is omitted (native default) rather than sent invalid. Ignored by
 	// non-reasoning OpenAI models and all other providers.
 	ReasoningEffort string `yaml:"reasoning_effort"`
+	// RequestsPerMinute paces outbound requests for this model to stay under a
+	// provider's per-model rate quota. One rate limiter is created per Gemini
+	// client instance and shared by all of that client's concurrent calls (e.g.
+	// the single enricher client paces all its news-extraction goroutines).
+	// Limiting is per-instance, not global: as long as each Gemini model is used
+	// by only one role (analyst and enricher use different models today), this
+	// keeps each model under its quota. If two roles share one model their rates
+	// are ADDITIVE — give them different models or lower each RPM accordingly.
+	// 0 uses the provider default (10 RPM for google). Honoured by google only.
+	RequestsPerMinute int `yaml:"requests_per_minute"`
 }
 
 // ModelRegistryEntry extends ModelConfig with an optional fallback registry key.

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
@@ -89,6 +90,65 @@ func TestGeminiClient_Analyze_Success(t *testing.T) {
 	}
 	if meta.InputTokens != 10 || meta.OutputTokens != 20 {
 		t.Errorf("token counts = %d/%d, want 10/20", meta.InputTokens, meta.OutputTokens)
+	}
+}
+
+func TestGeminiClient_Analyze_RetriesOn429(t *testing.T) {
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"x"}`
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			w.Write([]byte(`{"error":{"code":429,"status":"RESOURCE_EXHAUSTED","details":[{"retryDelay":"0.01s"}]}}`))
+			return
+		}
+		json.NewEncoder(w).Encode(validGeminiResp(payload))
+	}))
+	defer srv.Close()
+
+	// High RPM so the limiter never adds delay; we're isolating the retry path.
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash", APIKey: "test-key", RequestsPerMinute: 600000}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	resp, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "AAPL"})
+	if err != nil {
+		t.Fatalf("expected retry to succeed, got: %v", err)
+	}
+	if resp.Action != ActionHold {
+		t.Errorf("action = %q, want HOLD", resp.Action)
+	}
+	if calls != 2 {
+		t.Errorf("server hit %d times, want 2 (one 429 + one success)", calls)
+	}
+}
+
+func TestGeminiClient_Analyze_429GivesUpWhenDelayExceedsDeadline(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusTooManyRequests)
+		// 30s requested delay cannot fit a 100ms context deadline → no retry.
+		w.Write([]byte(`{"error":{"code":429,"details":[{"retryDelay":"30s"}]}}`))
+	}))
+	defer srv.Close()
+
+	cfg := config.ModelConfig{Model: "gemini-2.5-flash", APIKey: "test-key", RequestsPerMinute: 600000}
+	c := NewGeminiClient(cfg)
+	c.baseURL = srv.URL
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, _, err := c.Analyze(ctx, AnalysisRequest{Ticker: "AAPL"})
+	if err == nil {
+		t.Fatal("expected error when retry delay exceeds deadline")
+	}
+	if !strings.Contains(err.Error(), "gemini API 429") {
+		t.Errorf("error = %q, want gemini API 429", err.Error())
+	}
+	if calls != 1 {
+		t.Errorf("server hit %d times, want 1 (no retry attempted)", calls)
 	}
 }
 
