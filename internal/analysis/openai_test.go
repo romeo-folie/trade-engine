@@ -177,6 +177,102 @@ func TestOpenAIClient_Analyze_CustomPrompt(t *testing.T) {
 	}
 }
 
+func TestIsOpenAIReasoningModel(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"gpt-5-nano", true},
+		{"gpt-5", true},
+		{"gpt-5-mini-2025-08-07", true},
+		{"o1", true},
+		{"o3-mini", true},
+		{"o4-mini", true},
+		{"gpt-4o", false},
+		{"gpt-4-turbo", false},
+		{"deepseek-chat", false},
+		// gpt-5 chat aliases are conventional chat models, not reasoning models.
+		{"gpt-5-chat-latest", false},
+		{"gpt-5.3-chat-latest", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := isOpenAIReasoningModel(tc.model); got != tc.want {
+			t.Errorf("isOpenAIReasoningModel(%q) = %v, want %v", tc.model, got, tc.want)
+		}
+	}
+}
+
+// captureOpenAIBody runs a single Analyze against a stub server and returns the
+// decoded request body, so tests can assert which token/temperature schema the
+// client emitted.
+func captureOpenAIBody(t *testing.T, cfg config.ModelConfig, override string) map[string]any {
+	t.Helper()
+	payload := `{"action":"HOLD","confidence":0.5,"size_pct":0,"stop_loss":0,"take_profit":0,"reasoning":"x"}`
+	bodyCh := make(chan map[string]any, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request body: %v", err)
+		}
+		bodyCh <- body
+		json.NewEncoder(w).Encode(validOpenAIResp(payload))
+	}))
+	defer srv.Close()
+
+	c := NewOpenAIClient(cfg)
+	c.baseURL = srv.URL
+	c.providerOverride = override
+
+	if _, _, err := c.Analyze(context.Background(), AnalysisRequest{Ticker: "TSLA"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	return <-bodyCh
+}
+
+func TestOpenAIClient_Analyze_ReasoningModelSchema(t *testing.T) {
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "gpt-5-nano", APIKey: "test-key"}, "")
+
+	if _, ok := body["max_tokens"]; ok {
+		t.Error("reasoning model request must not include max_tokens")
+	}
+	if _, ok := body["temperature"]; ok {
+		t.Error("reasoning model request must not include temperature")
+	}
+	if _, ok := body["max_completion_tokens"]; !ok {
+		t.Error("reasoning model request must include max_completion_tokens")
+	}
+}
+
+func TestOpenAIClient_Analyze_ClassicModelSchema(t *testing.T) {
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "gpt-4o", APIKey: "test-key"}, "")
+
+	if _, ok := body["max_completion_tokens"]; ok {
+		t.Error("classic model request must not include max_completion_tokens")
+	}
+	if _, ok := body["max_tokens"]; !ok {
+		t.Error("classic model request must include max_tokens")
+	}
+	if _, ok := body["temperature"]; !ok {
+		t.Error("classic model request must include temperature")
+	}
+}
+
+func TestOpenAIClient_Analyze_DeepSeekKeepsClassicSchema(t *testing.T) {
+	// Use a model name that WOULD trip the reasoning check on genuine OpenAI
+	// ("o1"), so this proves the providerOverride guard — not the model name —
+	// is what keeps a compatible provider on the classic max_tokens schema. If
+	// the guard were removed, this request would wrongly switch schemas.
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "o1", APIKey: "test-key"}, "deepseek")
+
+	if _, ok := body["max_completion_tokens"]; ok {
+		t.Error("deepseek request must not include max_completion_tokens")
+	}
+	if _, ok := body["max_tokens"]; !ok {
+		t.Error("deepseek request must include max_tokens")
+	}
+}
+
 func TestOpenAIClient_Analyze_EmptyChoices(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]any{
