@@ -23,7 +23,15 @@ const openAIAPIURL = "https://api.openai.com/v1/chat/completions"
 // covers the gpt-5 family (gpt-5, gpt-5-mini, gpt-5-nano, …) and the o-series
 // (o1, o3, o4, …). Matching is by name prefix so future point releases and
 // dated snapshots (e.g. "gpt-5-nano-2025-08-07") are caught automatically.
+//
+// The gpt-5 *chat* aliases (e.g. "gpt-5-chat-latest") are deliberately excluded:
+// they are conventional chat models that still accept temperature and the classic
+// max_tokens field, so routing them through the reasoning branch would silently
+// drop a configured temperature.
 func isOpenAIReasoningModel(model string) bool {
+	if strings.Contains(model, "-chat") {
+		return false
+	}
 	for _, prefix := range []string{"gpt-5", "o1", "o3", "o4"} {
 		if strings.HasPrefix(model, prefix) {
 			return true

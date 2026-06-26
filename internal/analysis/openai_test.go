@@ -191,6 +191,9 @@ func TestIsOpenAIReasoningModel(t *testing.T) {
 		{"gpt-4o", false},
 		{"gpt-4-turbo", false},
 		{"deepseek-chat", false},
+		// gpt-5 chat aliases are conventional chat models, not reasoning models.
+		{"gpt-5-chat-latest", false},
+		{"gpt-5.3-chat-latest", false},
 		{"", false},
 	}
 	for _, tc := range cases {
