@@ -203,6 +203,24 @@ func TestIsOpenAIReasoningModel(t *testing.T) {
 	}
 }
 
+func TestDefaultReasoningEffort(t *testing.T) {
+	cases := []struct {
+		model string
+		want  string
+	}{
+		{"gpt-5-nano", "low"},
+		{"gpt-5", "low"},
+		{"o3-mini", "low"},
+		{"gpt-5-pro", ""},            // only "high" is valid; omit and use native default
+		{"gpt-5-pro-2026-01-15", ""}, // dated snapshots must match too
+	}
+	for _, tc := range cases {
+		if got := defaultReasoningEffort(tc.model); got != tc.want {
+			t.Errorf("defaultReasoningEffort(%q) = %q, want %q", tc.model, got, tc.want)
+		}
+	}
+}
+
 // captureOpenAIBody runs a single Analyze against a stub server and returns the
 // decoded request body, so tests can assert which token/temperature schema the
 // client emitted.
@@ -256,6 +274,29 @@ func TestOpenAIClient_Analyze_ReasoningEffortOverride(t *testing.T) {
 
 	if got := body["reasoning_effort"]; got != "medium" {
 		t.Errorf("reasoning_effort = %v, want medium (from config)", got)
+	}
+}
+
+func TestOpenAIClient_Analyze_ProModelOmitsDefaultEffort(t *testing.T) {
+	// gpt-5-pro only accepts "high"; defaulting it to "low" would 400. With no
+	// configured effort the client must omit the field (native default), while
+	// still using the reasoning-model token schema.
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "gpt-5-pro", APIKey: "test-key"}, "")
+
+	if _, ok := body["max_completion_tokens"]; !ok {
+		t.Error("gpt-5-pro must still use max_completion_tokens")
+	}
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Error("gpt-5-pro with unset effort must omit reasoning_effort")
+	}
+}
+
+func TestOpenAIClient_Analyze_ProModelHonorsExplicitEffort(t *testing.T) {
+	// An explicit value always wins, even for gpt-5-pro.
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "gpt-5-pro", APIKey: "test-key", ReasoningEffort: "high"}, "")
+
+	if got := body["reasoning_effort"]; got != "high" {
+		t.Errorf("reasoning_effort = %v, want high (from config)", got)
 	}
 }
 
