@@ -113,6 +113,14 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	// expect the classic "max_tokens"/"temperature" pair.
 	if c.providerOverride == "" && isOpenAIReasoningModel(c.cfg.Model) {
 		body["max_completion_tokens"] = maxTokens
+		// Reasoning tokens count inside max_completion_tokens; on a large prompt
+		// unbounded reasoning eats the whole budget and returns an empty answer
+		// (finish_reason=length). Cap it — default "low" keeps room for the JSON.
+		effort := c.cfg.ReasoningEffort
+		if effort == "" {
+			effort = "low"
+		}
+		body["reasoning_effort"] = effort
 	} else {
 		body["max_tokens"] = maxTokens
 		body["temperature"] = temperature

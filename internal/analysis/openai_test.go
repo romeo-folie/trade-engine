@@ -242,6 +242,21 @@ func TestOpenAIClient_Analyze_ReasoningModelSchema(t *testing.T) {
 	if _, ok := body["max_completion_tokens"]; !ok {
 		t.Error("reasoning model request must include max_completion_tokens")
 	}
+	// Reasoning models must cap reasoning_effort so the visible answer isn't
+	// starved; default is "low" when unset.
+	if got := body["reasoning_effort"]; got != "low" {
+		t.Errorf("reasoning_effort = %v, want low (default)", got)
+	}
+}
+
+func TestOpenAIClient_Analyze_ReasoningEffortOverride(t *testing.T) {
+	// "medium" is valid across every reasoning family (gpt-5 and o1/o3/o4),
+	// so it exercises the override without implying "minimal" is universal.
+	body := captureOpenAIBody(t, config.ModelConfig{Model: "gpt-5-nano", APIKey: "test-key", ReasoningEffort: "medium"}, "")
+
+	if got := body["reasoning_effort"]; got != "medium" {
+		t.Errorf("reasoning_effort = %v, want medium (from config)", got)
+	}
 }
 
 func TestOpenAIClient_Analyze_ClassicModelSchema(t *testing.T) {
@@ -255,6 +270,9 @@ func TestOpenAIClient_Analyze_ClassicModelSchema(t *testing.T) {
 	}
 	if _, ok := body["temperature"]; !ok {
 		t.Error("classic model request must include temperature")
+	}
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Error("classic model request must not include reasoning_effort")
 	}
 }
 
