@@ -40,6 +40,19 @@ func isOpenAIReasoningModel(model string) bool {
 	return false
 }
 
+// defaultReasoningEffort returns the reasoning_effort to send for a reasoning
+// model when none is configured. "low" stops a large prompt's reasoning from
+// starving the visible answer and is accepted by every reasoning family —
+// except gpt-5-pro, which only supports "high". For gpt-5-pro we return ""
+// (omit the field) and let the model use its native default rather than turn a
+// previously valid request into a 400. An explicit config value always wins.
+func defaultReasoningEffort(model string) string {
+	if strings.Contains(model, "gpt-5-pro") {
+		return ""
+	}
+	return "low"
+}
+
 // OpenAIClient implements ModelProvider using the OpenAI Chat Completions API.
 // It is also reused for OpenAI-compatible providers (e.g. DeepSeek) by
 // setting providerOverride and baseURL at construction time.
@@ -113,6 +126,16 @@ func (c *OpenAIClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	// expect the classic "max_tokens"/"temperature" pair.
 	if c.providerOverride == "" && isOpenAIReasoningModel(c.cfg.Model) {
 		body["max_completion_tokens"] = maxTokens
+		// Reasoning tokens count inside max_completion_tokens; on a large prompt
+		// unbounded reasoning eats the whole budget and returns an empty answer
+		// (finish_reason=length). Cap it — default "low" keeps room for the JSON.
+		effort := c.cfg.ReasoningEffort
+		if effort == "" {
+			effort = defaultReasoningEffort(c.cfg.Model)
+		}
+		if effort != "" {
+			body["reasoning_effort"] = effort
+		}
 	} else {
 		body["max_tokens"] = maxTokens
 		body["temperature"] = temperature

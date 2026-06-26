@@ -331,6 +331,19 @@ type ModelConfig struct {
 	//          and an int field can't distinguish explicit 0 from omitted.)
 	// Ignored by non-Gemini providers.
 	ThinkingBudget int `yaml:"thinking_budget"`
+	// ReasoningEffort controls how many hidden reasoning tokens OpenAI's gpt-5
+	// and o-series models spend before emitting the answer. These reasoning
+	// tokens count inside max_completion_tokens, so unbounded reasoning on a
+	// large prompt can consume the whole budget and return an empty completion
+	// (finish_reason=length). Valid values are model-dependent:
+	//   gpt-5:       "minimal" | "low" | "medium" | "high"
+	//   gpt-5-pro:   "high" only
+	//   o1/o3/o4:    "low" | "medium" | "high"   (these reject "minimal")
+	// When unset for a reasoning model the OpenAI client defaults to "low",
+	// which is accepted by every family except gpt-5-pro — for gpt-5-pro the
+	// field is omitted (native default) rather than sent invalid. Ignored by
+	// non-reasoning OpenAI models and all other providers.
+	ReasoningEffort string `yaml:"reasoning_effort"`
 }
 
 // ModelRegistryEntry extends ModelConfig with an optional fallback registry key.
