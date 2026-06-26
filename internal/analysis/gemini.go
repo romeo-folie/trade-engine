@@ -17,12 +17,25 @@ import (
 
 const geminiAPIBaseURL = "https://generativelanguage.googleapis.com/v1beta/models"
 
+// geminiDefaultRPM paces Gemini calls when no requests_per_minute is configured.
+// Free-tier per-model limits hover around 10–15 RPM; 10 leaves headroom under
+// the tightest of those so the analyst + enricher + classifier sharing a model
+// don't trip RESOURCE_EXHAUSTED. Operators on a paid tier can raise it via
+// models.registry.<key>.requests_per_minute.
+const geminiDefaultRPM = 10
+
+// geminiMaxRetries bounds the 429/503 retry budget per call (1 retry = 2 total
+// attempts). Retries honour the server's retryDelay and are skipped when the
+// delay would not fit the remaining context deadline.
+const geminiMaxRetries = 1
+
 // GeminiClient implements ModelProvider using the Google Gemini REST API.
 type GeminiClient struct {
 	cfg        config.ModelConfig
 	apiKey     string
 	baseURL    string // overridable for tests; defaults to geminiAPIBaseURL
 	httpClient *http.Client
+	limiter    *modelRateLimiter
 }
 
 func NewGeminiClient(cfg config.ModelConfig) *GeminiClient {
@@ -34,7 +47,17 @@ func NewGeminiClient(cfg config.ModelConfig) *GeminiClient {
 	if timeout == 0 {
 		timeout = 30 * time.Second
 	}
-	return &GeminiClient{cfg: cfg, apiKey: apiKey, baseURL: geminiAPIBaseURL, httpClient: &http.Client{Timeout: timeout}}
+	rpm := cfg.RequestsPerMinute
+	if rpm <= 0 {
+		rpm = geminiDefaultRPM
+	}
+	return &GeminiClient{
+		cfg:        cfg,
+		apiKey:     apiKey,
+		baseURL:    geminiAPIBaseURL,
+		httpClient: &http.Client{Timeout: timeout},
+		limiter:    newModelRateLimiter(rpm),
+	}
 }
 
 func (c *GeminiClient) ProviderName() string { return "google" }
@@ -113,30 +136,61 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 	}
 	// Key in header — never in URL (prevents leaking via access logs, proxies, referers).
 	url := fmt.Sprintf("%s/%s:generateContent", c.baseURL, model)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
-	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("x-goog-api-key", c.apiKey)
 
-	start := time.Now()
-	resp, err := c.httpClient.Do(httpReq)
-	latencyMs := time.Since(start).Milliseconds()
-	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini request: %w", err)
-	}
-	defer resp.Body.Close()
-	respBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini read response: %w", err)
-	}
-	if resp.StatusCode >= 400 {
+	// Pace + bounded-retry loop. The limiter proactively spaces calls under the
+	// per-model quota; the retry recovers the occasional 429/503 that still slips
+	// through (e.g. another process sharing the key) by honouring the server's
+	// retryDelay, but only when that delay fits the remaining context deadline.
+	var respBytes []byte
+	var latencyMs int64
+	for attempt := 0; ; attempt++ {
+		if err := c.limiter.wait(ctx); err != nil {
+			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini rate-limit wait: %w", err)
+		}
+
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyBytes))
+		if err != nil {
+			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini build request: %w", err)
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("x-goog-api-key", c.apiKey)
+
+		start := time.Now()
+		resp, err := c.httpClient.Do(httpReq)
+		latencyMs = time.Since(start).Milliseconds()
+		if err != nil {
+			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini request: %w", err)
+		}
+		respBytes, err = io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini read response: %w", err)
+		}
+
+		if resp.StatusCode < 400 {
+			break
+		}
 		snippet := respBytes
 		if len(snippet) > 512 {
 			snippet = snippet[:512]
 		}
-		return AnalysisResponse{}, ModelCallMeta{}, fmt.Errorf("gemini API %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		apiErr := fmt.Errorf("gemini API %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+
+		// Retry only transient rate/availability errors, within budget, and only
+		// if the server's requested delay fits the caller's remaining deadline.
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable
+		if !retryable || attempt >= geminiMaxRetries {
+			return AnalysisResponse{}, ModelCallMeta{}, apiErr
+		}
+		delay := parseRetryDelay(respBytes)
+		if !sleepWithinDeadline(ctx, delay) {
+			return AnalysisResponse{}, ModelCallMeta{}, apiErr
+		}
+		if req.Ticker != "__extraction__" {
+			logger.Warn("gemini: transient error, retrying after delay",
+				"ticker", req.Ticker, "model", c.cfg.Model,
+				"status", resp.StatusCode, "retry_delay", delay.String(), "attempt", attempt+1)
+		}
 	}
 
 	var apiResp struct {
