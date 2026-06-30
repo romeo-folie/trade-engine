@@ -158,6 +158,15 @@ markets:
   #   tickle_sec: 240
   #   insecure_tls: true
 
+  # OANDA v20 — data-only source for the ORB backtest engine (`te backtest orb`).
+  # A free practice (demo) account needs no funding; on a non-US OANDA entity it
+  # serves metals (XAU/USD, XAG/USD) alongside spot forex. Never used for live trading.
+  # oanda:
+  #   enabled: true
+  #   token_env: OANDA_API_TOKEN   # env var holding your v20 API token
+  #   account_id: ""               # only needed for live quotes, not for candles
+  #   practice: true               # true → api-fxpractice.oanda.com (free demo)
+
   news:
     provider: finnhub             # finnhub | benzinga
     api_key_env: FINNHUB_API_KEY

@@ -511,6 +511,20 @@ type MarketsConfig struct {
 	Stocks StocksConfig  `yaml:"stocks"`
 	IBKR   IBKRConfig    `yaml:"ibkr"`
 	News   NewsAPIConfig `yaml:"news"`
+	OANDA  OANDAConfig   `yaml:"oanda"`
+}
+
+// OANDAConfig configures the OANDA v20 REST data provider used by the ORB backtest
+// engine. The practice (demo) environment is free, needs no funding, and on a non-US
+// OANDA entity serves metals (XAU/USD, XAG/USD) — making it the backtest's source of
+// deep 1-minute forex/metals history. Live trading does not use this; it is data-only.
+type OANDAConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	TokenEnv  string `yaml:"token_env"`  // env var holding the v20 API token (e.g. OANDA_API_TOKEN)
+	Token     string `yaml:"-" json:"-"` // resolved from TokenEnv at load time
+	AccountID string `yaml:"account_id"` // OANDA account id (for the pricing endpoint; optional for candles)
+	Practice  bool   `yaml:"practice"`   // true → practice base URL (default); false → live
+	BaseURL   string `yaml:"base_url"`   // optional explicit override
 }
 
 // IBKRConfig configures the Interactive Brokers Client Portal gateway connection.
@@ -1247,6 +1261,7 @@ func resolveEnvVars(cfg *Config) {
 	cfg.Markets.Stocks.APIKey = resolveEnv(cfg.Markets.Stocks.APIKeyEnv)
 	cfg.Markets.Stocks.Secret = resolveEnv(cfg.Markets.Stocks.SecretEnv)
 	cfg.Markets.News.APIKey = resolveEnv(cfg.Markets.News.APIKeyEnv)
+	cfg.Markets.OANDA.Token = resolveEnv(cfg.Markets.OANDA.TokenEnv)
 	cfg.Notifications.Telegram.BotToken = resolveEnv(cfg.Notifications.Telegram.BotTokenEnv)
 	cfg.Embeddings.APIKey = resolveEnv(cfg.Embeddings.APIKeyEnv)
 }

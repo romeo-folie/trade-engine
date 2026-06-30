@@ -142,6 +142,11 @@ func Defaults() *Config {
 				ExtractionMaxArticlesPerTick: 10,
 				ExtractionRPM:                20,
 			},
+			OANDA: OANDAConfig{
+				Enabled:  false,
+				TokenEnv: "OANDA_API_TOKEN",
+				Practice: true, // free demo environment; data-only, never used for live trading
+			},
 		},
 		Strategies: StrategiesConfig{
 			TrendFollowing: TrendFollowingConfig{
