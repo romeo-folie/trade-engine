@@ -106,7 +106,10 @@ type ORBScheduler struct {
 	session                 *store.ORBSession
 	candidates              []ScoredCandidate
 	rangeBuffers            map[string]*RangeBuffer
-	orderIDs                map[string][2]string     // ticker → [buyOrderID, sellOrderID]
+	orderIDs                map[string][2]string     // ticker → [buyOrderID, sellOrderID] (runner / primary entry)
+	scaleOutEntryIDs        map[string][2]string     // ticker → [buyPartialID, sellPartialID]; the split-bracket PARTIAL entry alongside orderIDs' runner. Empty unless partial-TP is configured, so the no-partial path is unchanged.
+	splitPlaced             bool                     // true once a split-bracket pair was placed this session; gates the orphaned-split-entry sweep so it is a no-op otherwise
+	lastSplitOrphanCheckAt  time.Time                // wall time of the last orphaned-split-entry sweep
 	trackedTrades           map[string]*trackedTrade // entry order ID → trade context + exit state
 	reconciledSessions      map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
 	backfilledSessions      map[string]struct{}      // session IDs already processed by backfillRecentExits
@@ -158,6 +161,7 @@ func NewORBScheduler(
 		state:              StateIdle,
 		rangeBuffers:       make(map[string]*RangeBuffer),
 		orderIDs:           make(map[string][2]string),
+		scaleOutEntryIDs:   make(map[string][2]string),
 		trackedTrades:      make(map[string]*trackedTrade),
 		reconciledSessions: make(map[string]struct{}),
 		backfilledSessions: make(map[string]struct{}),
@@ -393,6 +397,11 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// trade row, and alerts on orders it can't prove ownership of). No-op outside forex mode.
 	s.reconcileOrphanedLegs(ctx)
 
+	// Cancel a split-bracket entry that never filled once its sibling has already exited: the
+	// logical trade is over, so a still-pending entry must not fill on a breakout retest and
+	// open a fresh position. No-op unless a split pair was placed this session.
+	s.cancelOrphanedSplitEntries(ctx)
+
 	// Universal exit backstop: record TP/stop exits for already-filled trades by replaying
 	// their price path from market-data bars. Runs in every state because a bracket's exit
 	// is effectively GTC — it can fill while a new session is scanning, or days after the
@@ -549,16 +558,26 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 			if t.OrderID == "" {
 				continue
 			}
-			// Restore pending entry orders into orderIDs so fill-polling resumes.
+			// Restore pending entry orders into the tracking maps so fill-polling resumes.
+			// A split-bracket PARTIAL row routes into scaleOutEntryIDs so it doesn't clobber
+			// its runner's slot in orderIDs (both share ticker+side); everything else (runner
+			// or ordinary single bracket) routes into orderIDs.
 			if t.Status == "pending" {
-				ids := s.orderIDs[t.Ticker]
+				m := s.orderIDs
+				if t.ScaleOutRole == "partial" {
+					m = s.scaleOutEntryIDs
+				}
+				if t.ScaleOutRole != "" {
+					s.splitPlaced = true // a restored split leg can be orphaned by its sibling exiting
+				}
+				ids := m[t.Ticker]
 				switch t.Side {
 				case "buy":
 					ids[0] = t.OrderID
 				case "sell":
 					ids[1] = t.OrderID
 				}
-				s.orderIDs[t.Ticker] = ids
+				m[t.Ticker] = ids
 				// Also track the entry stop so the implausible-fill guard (sanitizeEntryFill)
 				// still fires if this order fills after a mid-session restart. entryFill stays
 				// 0 until it actually fills; the exit-poll loop skips entryFill==0 trades.
@@ -998,8 +1017,13 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	pendingConfirmation := false
 	for ticker, buf := range s.rangeBuffers {
 		// Skip tickers that already have brackets placed (e.g. after restart resume, or a
-		// confirmation that fired on an earlier tick).
+		// confirmation that fired on an earlier tick). Check both maps so a ticker whose
+		// runner already cleared but whose split-bracket partial is still working is not
+		// re-placed.
 		if ids, ok := s.orderIDs[ticker]; ok && (ids[0] != "" || ids[1] != "") {
+			continue
+		}
+		if ids, ok := s.scaleOutEntryIDs[ticker]; ok && (ids[0] != "" || ids[1] != "") {
 			continue
 		}
 		if _, held := heldTickers[ticker]; held {
@@ -1097,7 +1121,59 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				placeFn = PlaceMarketBracket
 			}
 
-			var ids [2]string
+			// placeAndRecord places one bracket, records its orb_trades row and starts
+			// tracking it, returning the broker entry order ID and the DB row id. role is
+			// "runner"/"partial" for the two legs of a split-bracket trade, "" for an
+			// ordinary single bracket; parentDBID links a partial row to its runner row.
+			// Returns ("","") only when the broker placement itself failed; a DB-record
+			// failure still returns the orderID so the live order stays OCO-managed.
+			placeAndRecord := func(side string, params BracketParams, role, parentDBID string) (string, string) {
+				orderID, tpID, slID, err := placeFn(ctx, s.executor, params)
+				if err != nil {
+					slog.Error("orb: place bracket failed", "side", side, "ticker", ticker, "role", role, "err", err)
+					return "", ""
+				}
+				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+					OrderID: orderID, Ticker: ticker, Side: side, Status: "pending",
+				})
+				var parentPtr *string
+				if parentDBID != "" {
+					parentPtr = &parentDBID
+				}
+				dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+					SessionID:        sessionID,
+					Ticker:           ticker,
+					Side:             side,
+					EntryStop:        params.EntryStop,
+					StopLoss:         params.StopLoss,
+					TakeProfit:       params.TakeProfit,
+					Qty:              params.Qty,
+					OrderID:          orderID,
+					Status:           "pending",
+					TpOrderID:        tpID,
+					SlOrderID:        slID,
+					ScaleOutRole:     role,
+					ScaleOutParentID: parentPtr,
+				})
+				if err != nil {
+					slog.Error("orb: store trade failed", "side", side, "ticker", ticker, "role", role, "err", err)
+					return orderID, ""
+				}
+				s.trackedTrades[orderID] = &trackedTrade{
+					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
+					side: side, ticker: ticker, qty: params.Qty,
+					entryStop: params.EntryStop,
+				}
+				label := ticker
+				if role != "" {
+					label = ticker + " [" + role + "]"
+				}
+				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
+					strings.ToUpper(side), label, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
+				return orderID, dbID
+			}
+
+			var ids, scaleIds [2]string
 			for i, p := range []struct {
 				side   string
 				params BracketParams
@@ -1105,44 +1181,36 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				if p.params.Qty == 0 {
 					continue
 				}
-				orderID, tpID, slID, err := placeFn(ctx, s.executor, p.params)
-				if err != nil {
-					slog.Error("orb: place bracket failed", "side", p.side, "ticker", ticker, "err", err)
+				// Split-bracket partial take-profit (Phase 4 live): when the instrument
+				// configures a partial, enter as a PARTIAL bracket (nearer target) plus a
+				// RUNNER bracket (farther target) sharing the stop. split=false (the default,
+				// and when the size is too small to split) keeps the single base bracket — the
+				// no-partial path is byte-identical to before.
+				partialParams, runnerParams, split := ScaleOutBrackets(p.params, *inst)
+				runnerRole := ""
+				if split {
+					runnerRole = "runner"
+				}
+				// Place the runner first so its DB row exists to parent the partial. If the
+				// broker placement fails, skip the side entirely — never place a naked partial.
+				runnerID, runnerDBID := placeAndRecord(p.side, runnerParams, runnerRole, "")
+				if runnerID == "" {
 					continue
 				}
-				ids[i] = orderID
-				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					OrderID: orderID,
-					Ticker:  ticker,
-					Side:    p.side,
-					Status:  "pending",
-				})
-				dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-					SessionID:  sessionID,
-					Ticker:     ticker,
-					Side:       p.side,
-					EntryStop:  p.params.EntryStop,
-					StopLoss:   p.params.StopLoss,
-					TakeProfit: p.params.TakeProfit,
-					Qty:        p.params.Qty,
-					OrderID:    orderID,
-					Status:     "pending",
-					TpOrderID:  tpID,
-					SlOrderID:  slID,
-				})
-				if err != nil {
-					slog.Error("orb: store trade failed", "side", p.side, "ticker", ticker, "err", err)
-				} else {
-					s.trackedTrades[orderID] = &trackedTrade{
-						dbID: dbID, tpOrderID: tpID, slOrderID: slID,
-						side: p.side, ticker: ticker, qty: p.params.Qty,
-						entryStop: p.params.EntryStop,
-					}
+				ids[i] = runnerID
+				if split {
+					// Link the partial to the runner row (parent nil if the runner row failed
+					// to persist — both orders are still live and OCO-managed; the link is
+					// reporting-only).
+					partialID, _ := placeAndRecord(p.side, partialParams, "partial", runnerDBID)
+					scaleIds[i] = partialID
 				}
-				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
-					strings.ToUpper(p.side), ticker, p.params.EntryStop, p.params.StopLoss, p.params.TakeProfit, p.params.Qty))
 			}
 			s.orderIDs[ticker] = ids
+			if scaleIds[0] != "" || scaleIds[1] != "" {
+				s.scaleOutEntryIDs[ticker] = scaleIds
+				s.splitPlaced = true // arm the orphaned-split-entry sweep for this session
+			}
 			// Emit per-side events only for brackets that were actually placed.
 			for i, side := range []string{"buy", "sell"} {
 				if ids[i] != "" {
@@ -1308,150 +1376,137 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		}
 	}
 
-	// Poll fills for SINGLE-SIDED forex entries (confirmation / direction eligibility).
-	// The dual-sided OCO block below skips these (it needs both legs to detect a double
-	// fill), so without this their fill would only be persisted at the cleanup cutoff —
-	// stamping filled_at late and starting the max-hold clock late. There is no opposing
-	// leg to cancel here, so it just persists the fill.
+	// Poll entry fills and enforce app-managed cross-side OCO for forex brackets, including
+	// split-bracket partials. Per ticker, gather every working entry order — runner + partial,
+	// both sides (scaleOutEntryIDs is empty unless partial-TP is configured, so a no-partial
+	// ticker reduces to the original [buy,sell] pair). Whichever SIDE fills first wins: its
+	// fills are persisted and the opposing side's orders are cancelled (the broker only OCOs
+	// the TP/SL legs WITHIN one bracket; cross-side and cross-bracket OCO is app-managed). A
+	// single-sided entry (confirmation / direction eligibility) has nothing to cancel — its
+	// fills are just persisted. Orders resolve individually, so a lagging partial fill is
+	// picked up on a later tick; clearEntryID drops each resolved order and forgets the ticker
+	// once no working entry remains.
 	if s.executor != nil {
-		for ticker, ids := range s.orderIDs {
-			buyID, sellID := ids[0], ids[1]
-			if (buyID == "") == (sellID == "") {
-				continue // both empty or both present — not single-sided
-			}
-			orderID, side := buyID, "buy"
-			if sellID != "" {
-				orderID, side = sellID, "sell"
-			}
-			res, err := s.executor.GetOrderStatus(ctx, orderID)
-			if err != nil || res.Status != "filled" {
-				continue
-			}
-			price := res.FilledPrice
-			if tc := s.trackedTrades[orderID]; tc != nil {
-				if corrected, was := sanitizeEntryFill(side, tc.entryStop, price); was {
-					slog.Warn("orb: implausible single-sided entry fill — recording stop level instead",
-						"side", side, "ticker", ticker, "reported", res.FilledPrice, "entry_stop", tc.entryStop, "recorded", corrected)
-					price = corrected
+		seen := make(map[string]struct{})
+		tickers := make([]string, 0, len(s.orderIDs)+len(s.scaleOutEntryIDs))
+		for _, m := range []map[string][2]string{s.orderIDs, s.scaleOutEntryIDs} {
+			for ticker := range m {
+				if _, dup := seen[ticker]; !dup {
+					seen[ticker] = struct{}{}
+					tickers = append(tickers, ticker)
 				}
 			}
-			updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
-			if dbErr != nil {
-				slog.Error("orb: persist single-sided fill failed", "side", side, "ticker", ticker, "err", dbErr)
-				continue
-			}
-			if updated {
-				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					OrderID: orderID, Ticker: ticker, Side: side, Status: "filled", FillPrice: price,
-				})
-				if tc := s.trackedTrades[orderID]; tc != nil {
-					tc.entryFill = price
-				}
-			}
-			// Entry is filled and persisted — drop it from orderIDs so later ticks don't
-			// re-poll the broker for a known-filled order (exit polling uses trackedTrades).
-			delete(s.orderIDs, ticker)
 		}
-	}
-
-	// Poll for fills and cancel the opposing side (dual-sided forex OCO).
-	if s.executor != nil {
-		for ticker, ids := range s.orderIDs {
-			buyID, sellID := ids[0], ids[1]
-			if buyID == "" || sellID == "" {
-				continue // single-sided — handled by the single-sided poll above
-			}
-
-			// Fetch both statuses upfront to detect double fills.
-			type sideStatus struct {
+		for _, ticker := range tickers {
+			type entryOrder struct {
 				id     string
 				side   string
 				res    execution.OrderResult
-				ok     bool
 				filled bool
 			}
-			ss := [2]*sideStatus{
-				{id: buyID, side: "buy"},
-				{id: sellID, side: "sell"},
-			}
-			for _, s2 := range ss {
-				res, err := s.executor.GetOrderStatus(ctx, s2.id)
-				if err != nil {
-					slog.Warn("orb: GetOrderStatus failed", "side", s2.side, "ticker", ticker, "order_id", s2.id, "err", err)
-				} else {
-					s2.res = res
-					s2.ok = true
-					s2.filled = res.Status == "filled"
-				}
-			}
-
-			// persistFill marks a side as filled in DB and emits the event only
-			// if the DB row was actually updated (idempotent on retry ticks).
-			// It also stamps entryFill on the trackedTrade so exit polling can begin.
-			persistFill := func(s2 *sideStatus) {
-				// Guard against an implausible reported fill (a buy below / sell above its own
-				// stop), which IBKR can return when both bracket legs fill simultaneously and
-				// would otherwise corrupt the entry price and all downstream PnL.
-				price := s2.res.FilledPrice
-				if tc := s.trackedTrades[s2.id]; tc != nil {
-					if corrected, was := sanitizeEntryFill(s2.side, tc.entryStop, price); was {
-						slog.Warn("orb: implausible entry fill from broker — recording stop level instead",
-							"side", s2.side, "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
-						price = corrected
+			var entries []entryOrder
+			for _, m := range []map[string][2]string{s.orderIDs, s.scaleOutEntryIDs} {
+				ids := m[ticker]
+				for i, id := range ids {
+					if id == "" {
+						continue
 					}
-				}
-				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, price)
-				if dbErr != nil {
-					slog.Error("orb: update filled trade failed", "side", s2.side, "ticker", ticker, "err", dbErr)
-					return
-				}
-				if updated {
-					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-						OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: price,
-					})
-					if tc := s.trackedTrades[s2.id]; tc != nil {
-						tc.entryFill = price
+					side := "buy"
+					if i == 1 {
+						side = "sell"
 					}
+					entries = append(entries, entryOrder{id: id, side: side})
 				}
 			}
-
-			// Both sides filled (rare — volatile market filled both stops before poll).
-			if ss[0].filled && ss[1].filled {
-				slog.Info("orb: both sides filled — persisting double fill", "ticker", ticker)
-				persistFill(ss[0])
-				persistFill(ss[1])
-				delete(s.orderIDs, ticker)
+			if len(entries) == 0 {
 				continue
 			}
 
-			// One side filled → cancel the other.
-			for i, filled := range ss {
-				if !filled.filled {
+			buyFilled, sellFilled := false, false
+			for k := range entries {
+				res, err := s.executor.GetOrderStatus(ctx, entries[k].id)
+				if err != nil {
+					slog.Warn("orb: GetOrderStatus failed", "side", entries[k].side, "ticker", ticker, "order_id", entries[k].id, "err", err)
 					continue
 				}
-				other := ss[1-i]
-				slog.Info("orb: side filled — cancelling opposing", "ticker", ticker, "filled_side", filled.side, "fill_price", filled.res.FilledPrice, "cancel_side", other.side)
-				persistFill(filled)
-				if cancelErr := CancelOrder(ctx, s.executor, other.id); cancelErr != nil {
-					// Cancel failed — check if other side also filled before retrying.
-					if otherRes, err := s.executor.GetOrderStatus(ctx, other.id); err == nil && otherRes.Status == "filled" {
-						slog.Info("orb: opposing side also filled — double fill", "ticker", ticker, "side", other.side, "fill_price", otherRes.FilledPrice)
-						other.res = otherRes
-						persistFill(other)
-						delete(s.orderIDs, ticker)
+				entries[k].res = res
+				entries[k].filled = res.Status == "filled"
+				if entries[k].filled {
+					if entries[k].side == "buy" {
+						buyFilled = true
 					} else {
-						slog.Warn("orb: cancel failed, will retry next tick", "side", other.side, "ticker", ticker, "err", cancelErr)
+						sellFilled = true
 					}
-				} else {
-					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, other.id); dbErr != nil {
-						slog.Error("orb: update cancelled trade failed", "side", other.side, "ticker", ticker, "err", dbErr)
+				}
+			}
+			if !buyFilled && !sellFilled {
+				continue // no entry filled yet
+			}
+
+			doubleFill := buyFilled && sellFilled
+			winning := "buy"
+			if sellFilled && !buyFilled {
+				winning = "sell"
+			}
+			if doubleFill {
+				slog.Info("orb: both sides filled — persisting double fill", "ticker", ticker)
+			}
+
+			// allOpposingResolved tracks whether every order that must be cancelled this tick
+			// actually was. A FILLED winner must NOT be cleared from tracking until then: if a
+			// cancel fails and we forgot the winner, the next tick would see only pending
+			// loser(s), hit the !buyFilled && !sellFilled guard, skip the ticker, and never
+			// retry the cancel — leaving a live opposing stop that can fill into a reverse
+			// position. Keeping the winner tracked makes the next tick re-enter and retry.
+			allOpposingResolved := true
+			for k := range entries {
+				e := &entries[k]
+				switch {
+				case e.filled:
+					// Persist now (idempotent); clearing is deferred until the opposing cancels
+					// succeed (see below).
+					s.persistEntryFill(ctx, ticker, e.side, e.id, e.res.FilledPrice)
+				case !doubleFill && e.side == winning:
+					// A not-yet-filled order on the winning side (e.g. a split-bracket partial
+					// lagging its runner) — leave it for a later poll so it fills normally.
+					// NOT in a double fill: there, both directions already triggered, so every
+					// still-pending entry (on EITHER side) must be cancelled to avoid a lagging
+					// partial firing on top and compounding the double position. (If such a
+					// "pending" entry has in fact already filled at the broker, the cancel fails
+					// and the recheck below persists it.)
+				default:
+					// Losing side (or any pending order in a double fill) — cancel. A cancel
+					// failure may mean it just filled.
+					slog.Info("orb: side filled — cancelling opposing", "ticker", ticker, "winning_side", winning, "cancel_side", e.side, "order_id", e.id)
+					if err := CancelOrder(ctx, s.executor, e.id); err != nil {
+						if res, rerr := s.executor.GetOrderStatus(ctx, e.id); rerr == nil && res.Status == "filled" {
+							slog.Info("orb: opposing order also filled — double fill", "ticker", ticker, "side", e.side, "order_id", e.id, "fill_price", res.FilledPrice)
+							s.persistEntryFill(ctx, ticker, e.side, e.id, res.FilledPrice)
+							s.clearEntryID(ticker, e.id)
+						} else {
+							slog.Warn("orb: cancel failed, will retry next tick", "side", e.side, "ticker", ticker, "order_id", e.id, "err", err)
+							allOpposingResolved = false
+						}
+						continue
+					}
+					if dbErr := store.CancelORBTradeByOrderID(ctx, s.db, e.id); dbErr != nil {
+						slog.Error("orb: update cancelled trade failed", "side", e.side, "ticker", ticker, "err", dbErr)
 					}
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-						OrderID: other.id, Ticker: ticker, Side: other.side, Status: "cancelled",
+						OrderID: e.id, Ticker: ticker, Side: e.side, Status: "cancelled",
 					})
-					delete(s.orderIDs, ticker)
+					s.clearEntryID(ticker, e.id)
 				}
-				break // only one side can be the trigger
+			}
+			// Clear filled winners only once every opposing order was cancelled. If a cancel
+			// failed, keep them tracked so the next tick re-enters this block (the winner still
+			// reports filled), persists idempotently, and retries the cancel.
+			if allOpposingResolved {
+				for k := range entries {
+					if entries[k].filled {
+						s.clearEntryID(ticker, entries[k].id)
+					}
+				}
 			}
 		}
 	}
@@ -1520,7 +1575,11 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 	if sessionMinutes >= s.sessionCleanupMinutes() {
 		if s.executor != nil {
 			sides := [2]string{"buy", "sell"}
-			for ticker, ids := range s.orderIDs {
+			// reconcileOrCancel applies the end-of-session reconcile-or-cancel to one
+			// [buy,sell] order-ID pair. Run over BOTH the runner orders and the split-bracket
+			// partial orders so a partial entry left working at the cutoff is reconciled or
+			// cancelled too (scaleOutEntryIDs is empty when partial-TP is unconfigured).
+			reconcileOrCancel := func(ticker string, ids [2]string) {
 				for i, orderID := range ids {
 					if orderID == "" {
 						continue
@@ -1562,6 +1621,12 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					})
 				}
 			}
+			for ticker, ids := range s.orderIDs {
+				reconcileOrCancel(ticker, ids)
+			}
+			for ticker, ids := range s.scaleOutEntryIDs {
+				reconcileOrCancel(ticker, ids)
+			}
 		}
 
 		s.mu.Lock()
@@ -1585,6 +1650,8 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.orderIDs = make(map[string][2]string)
+		s.scaleOutEntryIDs = make(map[string][2]string)
+		s.splitPlaced = false
 		s.directionDecisions = make(map[string][2]bool)
 		s.releaseTrackedTradesForReconcile()
 		s.state = StateIdle
@@ -1597,6 +1664,56 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		})
 	}
 	return nil
+}
+
+// persistEntryFill records a forex entry fill against its orb_trades row, idempotent on
+// retry ticks via the updated flag. It guards an implausible broker-reported price with
+// sanitizeEntryFill (a buy below / sell above its own stop, which IBKR can return when both
+// bracket legs fill at once) and stamps entryFill on the trackedTrade so exit polling begins.
+func (s *ORBScheduler) persistEntryFill(ctx context.Context, ticker, side, orderID string, price float64) {
+	if tc := s.trackedTrades[orderID]; tc != nil {
+		if corrected, was := sanitizeEntryFill(side, tc.entryStop, price); was {
+			slog.Warn("orb: implausible entry fill from broker — recording stop level instead",
+				"side", side, "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
+			price = corrected
+		}
+	}
+	updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
+	if dbErr != nil {
+		slog.Error("orb: update filled trade failed", "side", side, "ticker", ticker, "err", dbErr)
+		return
+	}
+	if updated {
+		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+			OrderID: orderID, Ticker: ticker, Side: side, Status: "filled", FillPrice: price,
+		})
+		if tc := s.trackedTrades[orderID]; tc != nil {
+			tc.entryFill = price
+		}
+	}
+}
+
+// clearEntryID removes a resolved entry order (filled or cancelled) from the runner and
+// partial tracking maps, forgetting the ticker entirely once neither map holds a working
+// entry for it. Single-order granularity (vs the old delete(s.orderIDs, ticker)) so a
+// split-bracket ticker with a still-working sibling order is retained for later polling.
+func (s *ORBScheduler) clearEntryID(ticker, orderID string) {
+	for _, m := range []map[string][2]string{s.orderIDs, s.scaleOutEntryIDs} {
+		ids, ok := m[ticker]
+		if !ok {
+			continue
+		}
+		for i := range ids {
+			if ids[i] == orderID {
+				ids[i] = ""
+			}
+		}
+		if ids[0] == "" && ids[1] == "" {
+			delete(m, ticker)
+		} else {
+			m[ticker] = ids
+		}
+	}
 }
 
 // releaseTrackedTradesForReconcile clears the in-memory exit-tracking map at the

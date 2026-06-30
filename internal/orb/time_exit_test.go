@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"slices"
 	"testing"
 	"time"
 
@@ -280,6 +281,95 @@ func newForexScheduler(exec execution.Executor) *ORBScheduler {
 	}
 }
 
+// TestFlattenDueTimeExits_SplitGroupCancelsOnlyWhenAllFlat is the P1 safety invariant: a
+// split-bracket group (runner + partial sharing one stop price) must cancel its legs ONLY
+// once every leg is confirmed flat — never while a sibling may still hold a position.
+func TestFlattenDueTimeExits_SplitGroupCancelsOnlyWhenAllFlat(t *testing.T) {
+	past := time.Date(2026, 6, 1, 8, 0, 0, 0, time.UTC)
+	now := past.Add(6 * time.Hour) // well past the 240-minute max hold
+	parent := "runner"
+	mkLegs := func() []store.ORBTrade {
+		return []store.ORBTrade{
+			{ID: "runner", Ticker: "EUR/USD", Side: "buy", Qty: 6000, FillPrice: 1.10,
+				EntryStop: 1.10, StopLoss: 1.0950, TakeProfit: 1.11,
+				ScaleOutRole: "runner", FilledAt: &past},
+			{ID: "partial", Ticker: "EUR/USD", Side: "buy", Qty: 4000, FillPrice: 1.10,
+				EntryStop: 1.10, StopLoss: 1.0950, TakeProfit: 1.105,
+				ScaleOutRole: "partial", ScaleOutParentID: &parent, FilledAt: &past},
+		}
+	}
+	legOrders := []execution.WorkingOrder{
+		{OrderID: "r-tp", Ticker: "EUR/USD", Price: 1.11},     // runner TP
+		{OrderID: "sl", Ticker: "EUR/USD", StopPrice: 1.0950}, // shared stop
+		{OrderID: "p-tp", Ticker: "EUR/USD", Price: 1.105},    // partial TP
+	}
+
+	// allFlat=true: broker holds no position → both legs already flat → the group's legs are
+	// cancelled (cleanup is safe because nothing is open).
+	flat := &flattenExec{positions: nil, working: legOrders}
+	newForexScheduler(flat).flattenDueTimeExits(context.Background(), mkLegs(), now)
+	if len(flat.placed) != 0 {
+		t.Errorf("placed %d flatten orders on an already-flat group; want 0", len(flat.placed))
+	}
+	for _, want := range []string{"r-tp", "sl", "p-tp"} {
+		if !slices.Contains(flat.cancelled, want) {
+			t.Errorf("all-flat group: leg %q not cancelled; cancelled=%v", want, flat.cancelled)
+		}
+	}
+
+	// allFlat=false: broker still holds the position and the flatten never confirms → NO leg
+	// may be cancelled. Cancelling the shared stop here would leave a still-open leg naked.
+	open := &flattenExec{
+		positions:    []execution.Position{{Ticker: "EUR/USD", Quantity: 10000}},
+		working:      legOrders,
+		statusResult: execution.OrderResult{Status: "pending"}, // flatten never confirms
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // keep the unconfirmed-fill poll from sleeping
+	newForexScheduler(open).flattenDueTimeExits(ctx, mkLegs(), now)
+	if len(open.cancelled) != 0 {
+		t.Errorf("unconfirmed split group cancelled legs %v; want none (stops must stay until all legs flat)", open.cancelled)
+	}
+}
+
+// TestFlattenDueTimeExits_PullsInNotYetDueSibling guards the timing-skew edge: split legs
+// fill seconds apart, so the runner can pass max-hold one sweep before the partial. The
+// whole group must still be handled together — the runner must NOT take the single-leg path
+// and cancel the shared stop while the partial is still open.
+func TestFlattenDueTimeExits_PullsInNotYetDueSibling(t *testing.T) {
+	now := time.Date(2026, 6, 1, 14, 0, 0, 0, time.UTC)
+	runnerFill := now.Add(-5 * time.Hour)     // past the 240-min max hold → due
+	partialFill := now.Add(-10 * time.Minute) // not yet due
+	parent := "runner"
+	legs := []store.ORBTrade{
+		{ID: "runner", Ticker: "EUR/USD", Side: "buy", Qty: 6000, FillPrice: 1.10,
+			EntryStop: 1.10, StopLoss: 1.0950, TakeProfit: 1.11,
+			ScaleOutRole: "runner", FilledAt: &runnerFill},
+		{ID: "partial", Ticker: "EUR/USD", Side: "buy", Qty: 4000, FillPrice: 1.10,
+			EntryStop: 1.10, StopLoss: 1.0950, TakeProfit: 1.105,
+			ScaleOutRole: "partial", ScaleOutParentID: &parent, FilledAt: &partialFill},
+	}
+	// Broker still holds the position; the flatten never confirms (pending).
+	exec := &flattenExec{
+		positions:    []execution.Position{{Ticker: "EUR/USD", Quantity: 10000}},
+		working:      []execution.WorkingOrder{{OrderID: "sl", Ticker: "EUR/USD", StopPrice: 1.0950}},
+		statusResult: execution.OrderResult{Status: "pending"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	newForexScheduler(exec).flattenDueTimeExits(ctx, legs, now)
+
+	// BOTH legs must be flattened as one group (placed=2), proving the not-yet-due partial was
+	// pulled in rather than the runner taking the single-leg path.
+	if len(exec.placed) != 2 {
+		t.Errorf("placed %d flatten orders; want 2 (the not-yet-due sibling must be pulled into the group)", len(exec.placed))
+	}
+	// And because neither flatten confirmed, the shared stop must NOT be cancelled.
+	if len(exec.cancelled) != 0 {
+		t.Errorf("cancelled %v; want none (shared stop must survive while a leg is still open)", exec.cancelled)
+	}
+}
+
 func TestFlattenAndRecordTimeExit_SkipsWhenAlreadyFlat(t *testing.T) {
 	// Broker reports no open position → the bracket already closed; the time-exit
 	// must NOT place a flatten order or fabricate an exit.
@@ -287,7 +377,7 @@ func TestFlattenAndRecordTimeExit_SkipsWhenAlreadyFlat(t *testing.T) {
 	s := newForexScheduler(exec)
 	trade := store.ORBTrade{ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000, FillPrice: 1.17}
 
-	s.flattenAndRecordTimeExit(context.Background(), trade, 240)
+	s.flattenAndRecordTimeExit(context.Background(), trade, 240, false)
 
 	if len(exec.placed) != 0 {
 		t.Errorf("placed %d flatten orders; want 0 when position already flat", len(exec.placed))
@@ -307,7 +397,7 @@ func TestFlattenAndRecordTimeExit_BoundsQtyToNetPosition(t *testing.T) {
 	cancel() // keep the unconfirmed-fill poll from sleeping
 	trade := store.ORBTrade{ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000, FillPrice: 1.17}
 
-	s.flattenAndRecordTimeExit(ctx, trade, 240)
+	s.flattenAndRecordTimeExit(ctx, trade, 240, false)
 
 	if len(exec.placed) != 1 {
 		t.Fatalf("placed %d orders; want 1", len(exec.placed))
@@ -345,7 +435,7 @@ func TestFlattenAndRecordTimeExit_ShortFlattenSideIsBuy(t *testing.T) {
 	cancel()
 	trade := store.ORBTrade{ID: "t1", Ticker: "EUR/USD", Side: "sell", Qty: 5000, FillPrice: 1.17}
 
-	s.flattenAndRecordTimeExit(ctx, trade, 240)
+	s.flattenAndRecordTimeExit(ctx, trade, 240, false)
 
 	if len(exec.placed) != 1 {
 		t.Fatalf("placed %d orders; want 1", len(exec.placed))

@@ -76,7 +76,22 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 		return
 	}
 
-	now := s.now()
+	s.flattenDueTimeExits(ctx, trades, s.now())
+}
+
+// flattenDueTimeExits is the post-load orchestration of enforceTimeExits, split out so the
+// group-atomic flatten/cancel logic is unit-testable with injected trades.
+func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.ORBTrade, now time.Time) {
+	// Group ALL still-open forex legs by their logical trade — not just the ones already past
+	// max-hold. A split group's legs share a fill instant and the same max-hold, but their
+	// fills can be stamped a few seconds apart, so one leg can become due a sweep before its
+	// sibling. The runner and partial also share one stop PRICE: cancelling that stop while a
+	// sibling leg is still open would leave it naked. So we assemble the whole group, and once
+	// ANY leg is due we flatten EVERY open leg (a sibling a few seconds short of its own
+	// deadline goes with it) and cancel the legs only after the whole group is confirmed flat.
+	groups := make(map[string][]store.ORBTrade)
+	var order []string
+	due := make(map[string]bool)
 	for i := range trades {
 		t := trades[i]
 
@@ -94,16 +109,55 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 			continue
 		}
 
+		key := t.ID
+		if t.ScaleOutParentID != nil && *t.ScaleOutParentID != "" {
+			key = *t.ScaleOutParentID
+		}
+		if _, seen := groups[key]; !seen {
+			order = append(order, key)
+		}
+		groups[key] = append(groups[key], t)
+
 		maxHold := s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker)
 		anchor := t.CreatedAt
 		if t.FilledAt != nil {
 			anchor = *t.FilledAt
 		}
-		if !shouldTimeExit(anchor, maxHold, now) {
+		if shouldTimeExit(anchor, maxHold, now) {
+			due[key] = true
+		}
+	}
+
+	for _, key := range order {
+		if !due[key] {
+			continue // no leg of this logical trade has reached max-hold yet
+		}
+		legs := groups[key]
+		if len(legs) == 1 {
+			// Ordinary trade, or a split leg whose sibling already closed (its shared stop was
+			// OCO-cancelled with it, so nothing else holds that price): flatten and cancel its
+			// legs inline, as before.
+			s.flattenAndRecordTimeExit(ctx, legs[0], s.forexCfg.EffectiveMaxHoldMinutes(legs[0].Ticker), false)
 			continue
 		}
-
-		s.flattenAndRecordTimeExit(ctx, t, maxHold)
+		// Split-bracket group with >1 open leg: flatten every leg first (deferring leg
+		// cancellation), then cancel the group's legs only once EVERY leg is confirmed flat.
+		// If any flatten failed, leave all legs intact and retry next sweep — never strip a
+		// shared stop while a leg might still hold a position.
+		allFlat := true
+		for _, t := range legs {
+			if !s.flattenAndRecordTimeExit(ctx, t, s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker), true) {
+				allFlat = false
+			}
+		}
+		if allFlat {
+			for _, t := range legs {
+				s.cancelBracketLegs(ctx, t)
+			}
+		} else {
+			slog.Warn("orb: time exit: split group not fully flattened — deferring leg cancel to next sweep",
+				"ticker", legs[0].Ticker, "legs", len(legs))
+		}
 	}
 }
 
@@ -119,7 +173,11 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 // position is already flat (bracket filled, exit not yet recorded) it does nothing and
 // defers to the reconcilers; if the flatten can't be confirmed it leaves the row
 // 'filled' with legs intact for the next sweep rather than guessing.
-func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORBTrade, maxHold int) {
+// deferCancel leaves the bracket legs in place after a confirmed flatten (the caller cancels
+// them once an entire split-bracket group is flat — see enforceTimeExits). Returns whether
+// this trade's position is now confirmed FLAT (flattened here or already closed), which the
+// group caller uses to decide it is safe to cancel the shared stop.
+func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORBTrade, maxHold int, deferCancel bool) bool {
 	secType := s.forexSecType(t.Ticker)
 
 	// 1. Read the live position FIRST, while the bracket still protects it. Flatten
@@ -128,7 +186,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
 		slog.Warn("orb: time exit: get positions failed — will retry (legs intact)", "ticker", t.Ticker, "err", err)
-		return
+		return false
 	}
 	var netQty float64
 	for _, p := range positions {
@@ -151,7 +209,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 		// real exit. Leave the row 'filled' and the (already-resolved) legs untouched.
 		slog.Info("orb: time exit: position already flat, deferring to reconcilers",
 			"ticker", t.Ticker, "side", t.Side, "net_qty", netQty, "trade_qty", t.Qty)
-		return
+		return true // position is flat (bracket already filled) — safe for the group to cancel legs
 	}
 
 	// 2. Flatten at market while the bracket legs still protect the position.
@@ -168,7 +226,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	})
 	if err != nil {
 		slog.Warn("orb: time exit: flatten order failed — will retry (legs intact)", "ticker", t.Ticker, "err", err)
-		return
+		return false
 	}
 
 	// 3. Confirm the flatten fill. Only once the position is confirmed flat do we
@@ -177,13 +235,18 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	if !ok {
 		slog.Warn("orb: time exit: flatten fill not confirmed — leaving filled, legs intact for next sweep",
 			"ticker", t.Ticker, "order_id", res.BrokerOrderID)
-		return
+		return false
 	}
 
 	// 4. Cancel the now-redundant bracket legs so a leftover leg can't fire against
 	//    the flat position and open a new one. Position is already closed, so this is
-	//    best-effort cleanup, not protection-critical.
-	s.cancelBracketLegs(ctx, t)
+	//    best-effort cleanup, not protection-critical. For a split-bracket group this is
+	//    DEFERRED to the caller: the runner and partial share one stop price, so cancelling
+	//    here would pull the shared stop while the sibling leg may still be open. The caller
+	//    cancels only once every leg of the group is confirmed flat.
+	if !deferCancel {
+		s.cancelBracketLegs(ctx, t)
+	}
 
 	// 5. Record the exit. PnL is gross (matches the engine's exitPnL convention)
 	//    and is computed on the quantity actually flattened, not the original trade
@@ -194,7 +257,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	pnl := exitPnL(t.Side, t.FillPrice, exitPrice, int(flattenQty))
 	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, "time_exit", "broker", exitPrice, pnl); dbErr != nil {
 		slog.Error("orb: time exit: close trade failed", "ticker", t.Ticker, "err", dbErr)
-		return
+		return true // position IS flat (flatten confirmed); the record retries next sweep
 	}
 	slog.Info("orb: time exit: recorded", "ticker", t.Ticker, "side", t.Side,
 		"exit_price", exitPrice, "entry_price", t.FillPrice, "pnl", pnl)
@@ -203,6 +266,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 		OrderID: t.OrderID, Ticker: t.Ticker, Side: t.Side,
 		Status: "closed", FillPrice: t.FillPrice, PnL: &pnlVal,
 	})
+	return true
 }
 
 // legPriceTol is the relative tolerance for matching a working order's price to a
@@ -306,13 +370,17 @@ func (s *ORBScheduler) protectedOrderIDs() map[string]struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[string]struct{})
-	for _, ids := range s.orderIDs {
-		for _, id := range ids {
-			if id != "" {
-				out[id] = struct{}{}
+	add := func(m map[string][2]string) {
+		for _, ids := range m {
+			for _, id := range ids {
+				if id != "" {
+					out[id] = struct{}{}
+				}
 			}
 		}
 	}
+	add(s.orderIDs)         // runner / primary entries
+	add(s.scaleOutEntryIDs) // split-bracket partial entries (empty unless partial-TP configured)
 	return out
 }
 

@@ -145,6 +145,37 @@ func TestMoveStopLeg_ProtectsCurrentSessionEntry(t *testing.T) {
 	}
 }
 
+// scaleOutTargetR picks the leg's take-profit R-multiple so the planned risk R is recovered
+// correctly: a 1R partial under a 2R strategy must use mult=1 (R = |TP−entry|/1), not the
+// flat RR=2 that would halve R and fire break-even/trailing at the wrong prices.
+func TestScaleOutTargetR(t *testing.T) {
+	inst := config.Instrument{PartialTakeProfitR: 1.0, RunnerTakeProfitR: 3.0}
+	const rr = 2.0
+	cases := []struct {
+		role string
+		inst config.Instrument
+		want float64
+	}{
+		{"", inst, rr},                      // ordinary trade → RR
+		{"partial", inst, 1.0},              // partial → partial_take_profit_r
+		{"runner", inst, 3.0},               // runner → runner_take_profit_r
+		{"runner", config.Instrument{}, rr}, // runner, runner_r unset → RR (base target)
+		{"partial", config.Instrument{PartialFraction: 0.5}, rr}, // partial_r unset → RR fallback
+	}
+	for _, c := range cases {
+		if got := scaleOutTargetR(c.role, c.inst, rr); got != c.want {
+			t.Errorf("scaleOutTargetR(%q) = %v; want %v", c.role, got, c.want)
+		}
+	}
+
+	// End-to-end: a 1R partial under a 2R strategy. Entry 1.1000, R_actual 0.0050, so the
+	// partial TP = 1.1050. Recovered R must be 0.0050 (mult=1), NOT 0.0025 (flat RR=2).
+	gotR := 0.0050 / 1.0 // |1.1050-1.1000| / scaleOutTargetR("partial",...) = 0.0050/1
+	if r := 0.0050 / scaleOutTargetR("partial", inst, rr); r != gotR {
+		t.Errorf("partial R = %v; want %v (mult must be 1, not RR)", r, gotR)
+	}
+}
+
 // Once a stop has been adaptively moved, the bar-replay backstop disables the stop leg
 // (passes stopLoss=0) and replays only the immutable take-profit. This guards against
 // fabricating a stop-out at the MOVED level over a pre-move pullback: a long fills at

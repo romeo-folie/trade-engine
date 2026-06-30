@@ -55,6 +55,13 @@ type ORBTrade struct {
 	// original placement stop). The bar-replay backstop reads it to avoid replaying the
 	// stop leg at a moved level over pre-move bars. Populated by GetOpenFilledORBTrades.
 	StopMovedAt *time.Time
+	// Scale-out (partial take-profit) linkage. ScaleOutRole is "runner" or "partial" for
+	// the two legs of a split-bracket trade, "" for an ordinary single-bracket trade. On a
+	// "partial" row, ScaleOutParentID is the id of its "runner" row (the primary leg); nil
+	// otherwise. Reporting and distinct-ticker counting fold a partial into its parent so
+	// the pair counts as one logical trade. See migration 036.
+	ScaleOutRole     string
+	ScaleOutParentID *string
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -138,15 +145,20 @@ func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time, 
 
 // CreateORBTrade inserts a new ORB trade record and returns the generated row ID.
 func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (string, error) {
+	var parentID any
+	if trade.ScaleOutParentID != nil && *trade.ScaleOutParentID != "" {
+		parentID = *trade.ScaleOutParentID
+	}
 	var id string
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id`,
 		trade.SessionID, trade.Ticker, trade.Side,
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
 		trade.Qty, nullableString(trade.OrderID), trade.Status,
 		nullableString(trade.TpOrderID), nullableString(trade.SlOrderID),
+		nullableString(trade.ScaleOutRole), parentID,
 	).Scan(&id)
 	return id, err
 }
@@ -274,7 +286,8 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
-		       created_at, filled_at, closed_at
+		       created_at, filled_at, closed_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -292,6 +305,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
 		); err != nil {
 			return nil, err
 		}
@@ -318,7 +332,8 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
-		       created_at, filled_at, closed_at, stop_moved_at
+		       created_at, filled_at, closed_at, stop_moved_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
 		FROM orb_trades WHERE status='filled'
 		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
@@ -337,6 +352,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
 		); err != nil {
 			return nil, err
 		}
@@ -369,22 +385,57 @@ type ORBStats struct {
 // counters break the closed set down by how the trade exited and how that exit was
 // determined (broker fill vs bar replay).
 func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
+	// A split-bracket trade is two rows (a partial + its runner); collapse each pair into one
+	// LOGICAL trade so counts aren't inflated and win/loss is judged on the COMBINED PnL.
+	// COALESCE(scale_out_parent_id, id) keys every leg to its runner (a partial → its runner's
+	// id; a runner or an ordinary trade → its own id). A logical trade is "closed" only when
+	// all its legs are, and "open" while any leg is still filled; exit_type/source come from
+	// the non-partial (runner / ordinary) leg.
+	// A logical trade is DONE when every leg is terminal (closed, cancelled, or expired) — a
+	// sibling leg that never filled may be cancelled at cleanup OR marked 'expired' by the
+	// stale-session sweep; either must not keep its realized runner out of the stats. It
+	// counts as a completed trade when done AND at least one leg actually closed (realized an
+	// exit); its PnL/exit come from the closed leg(s). It is still OPEN while any leg is
+	// filled (working).
 	rows, err := db.Query(ctx, `
+		WITH logical AS (
+		    SELECT COALESCE(scale_out_parent_id, id)                          AS trade_id,
+		           MIN(ticker)                                                AS ticker,
+		           bool_and(status IN ('closed','cancelled','expired'))       AS all_done,
+		           bool_or(status='closed')                                   AS any_closed,
+		           bool_or(status='filled')                                   AS any_filled,
+		           bool_or(status IN ('closed','filled'))                     AS active,
+		           COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)       AS pnl,
+		           -- The trade's exit is characterised by the non-partial (runner / ordinary)
+		           -- leg's exit. But if that leg never closed — e.g. the runner entry was
+		           -- cancelled as an orphan and only the partial realised — fall back to the
+		           -- closed leg's exit so the realised trade still lands in a tp/stop bucket.
+		           COALESCE(
+		               MAX(exit_type) FILTER (WHERE status='closed' AND COALESCE(scale_out_role,'') <> 'partial'),
+		               MAX(exit_type) FILTER (WHERE status='closed')
+		           ) AS exit_type,
+		           COALESCE(
+		               MAX(exit_source) FILTER (WHERE status='closed' AND COALESCE(scale_out_role,'') <> 'partial'),
+		               MAX(exit_source) FILTER (WHERE status='closed')
+		           ) AS exit_source
+		    FROM orb_trades
+		    GROUP BY COALESCE(scale_out_parent_id, id)
+		)
 		SELECT ticker,
-		       COUNT(*) FILTER (WHERE status='closed')                        AS closed,
-		       COUNT(*) FILTER (WHERE status='closed' AND pnl > 0)            AS wins,
-		       COUNT(*) FILTER (WHERE status='closed' AND pnl < 0)            AS losses,
-		       COUNT(*) FILTER (WHERE status='closed' AND pnl = 0)            AS scratches,
-		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='tp')     AS tp_exits,
-		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='stop')   AS stop_exits,
-		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='time_exit') AS time_exits,
-		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='replay') AS replay_exits,
-		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='broker') AS broker_exits,
-		       COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)           AS total_pnl,
-		       COUNT(*) FILTER (WHERE status='filled')                        AS open_filled
-		FROM orb_trades
+		       COUNT(*) FILTER (WHERE all_done AND any_closed)                          AS closed,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl > 0)             AS wins,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl < 0)             AS losses,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl = 0)             AS scratches,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='tp')      AS tp_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='stop')    AS stop_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='time_exit') AS time_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_source='replay') AS replay_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_source='broker') AS broker_exits,
+		       COALESCE(SUM(pnl) FILTER (WHERE all_done AND any_closed), 0)            AS total_pnl,
+		       COUNT(*) FILTER (WHERE any_filled AND NOT all_done)                     AS open_filled
+		FROM logical
+		WHERE active
 		GROUP BY ticker
-		HAVING COUNT(*) FILTER (WHERE status IN ('closed','filled')) > 0
 		ORDER BY ticker`)
 	if err != nil {
 		return nil, err
@@ -415,7 +466,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
-		       created_at, filled_at, closed_at
+		       created_at, filled_at, closed_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -434,6 +486,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
 		); err != nil {
 			return nil, err
 		}

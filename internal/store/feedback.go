@@ -149,7 +149,8 @@ func GetClosedORBTradesByDateRange(ctx context.Context, db *pgxpool.Pool, from, 
 		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
-		       created_at, closed_at
+		       created_at, closed_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
 		FROM orb_trades
 		WHERE status = 'closed' AND closed_at >= $1 AND closed_at < $2
 		ORDER BY closed_at DESC`,
@@ -169,6 +170,7 @@ func GetClosedORBTradesByDateRange(ctx context.Context, db *pgxpool.Pool, from, 
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
 			&t.CreatedAt, &t.ClosedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
 		); err != nil {
 			return nil, err
 		}

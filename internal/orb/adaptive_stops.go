@@ -60,8 +60,8 @@ func (s *ORBScheduler) enforceAdaptiveStops(ctx context.Context) {
 			continue
 		}
 		// Planned risk R from the immutable entry/target geometry (the stored stop_loss may
-		// already have been moved): TP = entry ± R×RR, so R = |TP − entry_stop| / RR.
-		R := math.Abs(t.TakeProfit-t.EntryStop) / rr
+		// already have been moved): TP sits at entry ± mult×R, so R = |TP − entry| / mult.
+		R := math.Abs(t.TakeProfit-t.EntryStop) / scaleOutTargetR(t.ScaleOutRole, *inst, rr)
 		if R <= 0 {
 			continue
 		}
@@ -111,6 +111,25 @@ func (s *ORBScheduler) persistMovedStop(ctx context.Context, t store.ORBTrade, n
 		"Recover manually: UPDATE orb_trades SET stop_loss=<live_broker_stop> WHERE id=<trade_id> AND status='filled'",
 		"trade_id", t.ID, "ticker", t.Ticker,
 		"stale_db_stop", t.StopLoss, "live_broker_stop", newStop, "err", err)
+}
+
+// scaleOutTargetR returns the R-multiple at which a leg's take-profit sits — used to recover
+// the planned risk R from the immutable |TP − entry| distance. A split-bracket partial
+// targets partial_take_profit_r and the runner runner_take_profit_r (each falling back to
+// the strategy RR when unset); an ordinary trade targets RR. Dividing by a flat RR instead
+// would mis-scale R for a partial/runner row and fire break-even/trailing at the wrong price.
+func scaleOutTargetR(role string, inst config.Instrument, rr float64) float64 {
+	switch role {
+	case "partial":
+		if inst.PartialTakeProfitR > 0 {
+			return inst.PartialTakeProfitR
+		}
+	case "runner":
+		if inst.RunnerTakeProfitR > 0 {
+			return inst.RunnerTakeProfitR
+		}
+	}
+	return rr
 }
 
 // adaptiveStop computes the desired (tightened) stop for a filled trade given the

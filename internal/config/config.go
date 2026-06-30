@@ -1308,6 +1308,25 @@ func Validate(cfg *Config) []string {
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m",
 					inst.Symbol, inst.BreakoutConfirmation))
 			}
+			// Split-bracket partial take-profit: a partial needs a fraction in (0,1), and its
+			// target must sit nearer than the runner's (else the "partial" closes after the
+			// runner — a nonsensical split that ScaleOutBrackets would still place).
+			if inst.PartialTakeProfitR > 0 {
+				if inst.PartialFraction <= 0 || inst.PartialFraction >= 1 {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: partial_fraction %.3f must be in (0,1) when partial_take_profit_r is set",
+						inst.Symbol, inst.PartialFraction))
+				}
+				runnerR := inst.RunnerTakeProfitR
+				if runnerR <= 0 {
+					runnerR = cfg.ForexORB.RiskReward // unset runner keeps the base RR target
+				}
+				if runnerR > 0 && inst.PartialTakeProfitR >= runnerR {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: partial_take_profit_r %.2f must be less than the runner target %.2f",
+						inst.Symbol, inst.PartialTakeProfitR, runnerR))
+				}
+			}
 		}
 	}
 
