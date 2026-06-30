@@ -347,6 +347,21 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 				}
 				allInsights = append(allInsights, ins)
 			}
+
+			// Auto-throttle: for the configured learn-from window, derive a risk multiplier
+			// from this instrument's realised expectancy and store it so the ORB scheduler can
+			// size by it. Stored only when enabled, only for the throttle window, and only with
+			// adequate sample size — storing the gate's neutral 1.0 below MinTrades would
+			// OVERWRITE a still-valid multiplier from when the window had data (a transient dip
+			// below the threshold would silently undo a throttle), so we skip instead.
+			if at := r.cfg.ORBAutoThrottle; at.Enabled && label == at.ThrottleWindow() && s.total >= at.MinTradesOrDefault() {
+				mult := orbAutoThrottleMultiplier(s.avgPnlPct(), s.total, at)
+				ins, err := upsert(ctx, today, "orb_session", ticker, "risk_multiplier", label, mult, s.total)
+				if err != nil {
+					return fmt.Errorf("feedback: upsert orb risk_multiplier %s: %w", ticker, err)
+				}
+				allInsights = append(allInsights, ins)
+			}
 		}
 	}
 

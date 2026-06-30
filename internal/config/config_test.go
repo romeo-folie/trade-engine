@@ -83,6 +83,49 @@ func TestValidateValidModes(t *testing.T) {
 	}
 }
 
+func TestValidateORBAutoThrottle(t *testing.T) {
+	base := func() *Config {
+		cfg := Defaults()
+		cfg.Feedback.Windows = []int{1, 7, 30}
+		cfg.Feedback.ORBAutoThrottle = ORBAutoThrottleConfig{
+			Enabled: true, Window: "30d", Floor: 0.5, Cap: 1.5,
+		}
+		return cfg
+	}
+
+	// Valid config → no auto-throttle error.
+	for _, e := range Validate(base()) {
+		if strings.Contains(e, "orb_auto_throttle") {
+			t.Errorf("unexpected auto-throttle error on valid config: %s", e)
+		}
+	}
+
+	// Window not among configured feedback.windows → error.
+	cfg := base()
+	cfg.Feedback.ORBAutoThrottle.Window = "14d"
+	if !containsStr(Validate(cfg), "orb_auto_throttle.window") {
+		t.Error("expected window-not-in-windows error")
+	}
+
+	// floor > cap → error.
+	cfg = base()
+	cfg.Feedback.ORBAutoThrottle.Floor = 2.0
+	cfg.Feedback.ORBAutoThrottle.Cap = 1.0
+	if !containsStr(Validate(cfg), "orb_auto_throttle") {
+		t.Error("expected floor>cap error")
+	}
+
+	// Disabled → not validated even if nonsensical.
+	cfg = base()
+	cfg.Feedback.ORBAutoThrottle.Enabled = false
+	cfg.Feedback.ORBAutoThrottle.Window = "999d"
+	for _, e := range Validate(cfg) {
+		if strings.Contains(e, "orb_auto_throttle") {
+			t.Errorf("disabled throttle should not be validated: %s", e)
+		}
+	}
+}
+
 func TestValidateMissingDBURL(t *testing.T) {
 	cfg := Defaults()
 	os.Unsetenv("DATABASE_URL")

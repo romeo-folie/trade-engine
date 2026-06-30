@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -78,6 +80,28 @@ func GetFeedbackInsights(ctx context.Context, scope, scopeKey, window string, li
 	}
 	defer rows.Close()
 	return scanFeedbackInsights(rows)
+}
+
+// GetLatestORBRiskMultiplier returns the most recent auto-throttle risk multiplier the
+// nightly reviewer stored for an ORB instrument over the given window, plus whether one was
+// found. A missing value means the throttle has no opinion (no review yet, or below its
+// min-trades gate), so the caller should fall back to a neutral 1.0.
+func GetLatestORBRiskMultiplier(ctx context.Context, ticker, window string) (float64, bool, error) {
+	var v float64
+	err := GetDB().QueryRow(ctx, `
+		SELECT value FROM feedback_insights
+		WHERE scope='orb_session' AND scope_key=$1 AND metric='risk_multiplier' AND time_window=$2
+		ORDER BY date DESC
+		LIMIT 1`,
+		ticker, window,
+	).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return v, true, nil
 }
 
 // GetLatestFeedbackInsights returns all insights for a scope+window on a specific date.

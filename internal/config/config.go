@@ -744,12 +744,46 @@ type GraphNeighborsConfig struct {
 
 // FeedbackConfig controls the automated feedback pipeline (Phase 17).
 type FeedbackConfig struct {
-	Enabled             bool               `yaml:"enabled"`
-	ReviewTimeUTC       string             `yaml:"review_time_utc"`
-	Windows             []int              `yaml:"windows"`
-	PromptEnrichment    bool               `yaml:"prompt_enrichment"`
-	ORBPromptEnrichment bool               `yaml:"orb_prompt_enrichment"`
-	Thresholds          FeedbackThresholds `yaml:"thresholds"`
+	Enabled             bool                  `yaml:"enabled"`
+	ReviewTimeUTC       string                `yaml:"review_time_utc"`
+	Windows             []int                 `yaml:"windows"`
+	PromptEnrichment    bool                  `yaml:"prompt_enrichment"`
+	ORBPromptEnrichment bool                  `yaml:"orb_prompt_enrichment"`
+	Thresholds          FeedbackThresholds    `yaml:"thresholds"`
+	ORBAutoThrottle     ORBAutoThrottleConfig `yaml:"orb_auto_throttle"`
+}
+
+// ORBAutoThrottleConfig closes the feedback loop on ORB forex position sizing: it derives a
+// per-instrument risk multiplier from rolling realised expectancy (the feedback avg_pnl_pct
+// over Window), sizing a losing instrument down and a winning one up within [Floor, Cap].
+// The nightly reviewer computes and stores it as a `risk_multiplier` insight; the scheduler
+// reads it and MULTIPLIES the static per-instrument risk_multiplier by it. Default-off, so
+// disabled (or below MinTrades, or no data) leaves sizing exactly as today (×1.0).
+type ORBAutoThrottleConfig struct {
+	Enabled     bool    `yaml:"enabled"`
+	Window      string  `yaml:"window"`      // feedback window to learn from, e.g. "30d" (default "30d")
+	MinTrades   int     `yaml:"min_trades"`  // below this trade count → neutral 1.0 (default 20)
+	Sensitivity float64 `yaml:"sensitivity"` // multiplier change per 1 pct-point of avg pnl (default 1.0)
+	Floor       float64 `yaml:"floor"`       // minimum multiplier (default 0.5)
+	Cap         float64 `yaml:"cap"`         // maximum multiplier (default 1.5)
+}
+
+// ThrottleWindow returns the configured learn-from window, defaulting to "30d".
+func (c ORBAutoThrottleConfig) ThrottleWindow() string {
+	if c.Window == "" {
+		return "30d"
+	}
+	return c.Window
+}
+
+// MinTradesOrDefault is the minimum logical-trade count below which the throttle takes no
+// action, defaulting to 20. Shared by the reviewer (which skips storing a multiplier below
+// it, so a transient data gap can't overwrite a valid one) and the mapping function.
+func (c ORBAutoThrottleConfig) MinTradesOrDefault() int {
+	if c.MinTrades <= 0 {
+		return 20
+	}
+	return c.MinTrades
 }
 
 type FeedbackThresholds struct {
@@ -1327,6 +1361,27 @@ func Validate(cfg *Config) []string {
 						inst.Symbol, inst.PartialTakeProfitR, runnerR))
 				}
 			}
+		}
+	}
+
+	// Feedback ORB auto-throttle: the learn-from window must be one the reviewer actually
+	// computes (else no risk_multiplier insight is ever stored), and the bounds must be sane.
+	if at := cfg.Feedback.ORBAutoThrottle; at.Enabled {
+		win := at.ThrottleWindow()
+		found := false
+		for _, w := range cfg.Feedback.Windows {
+			if fmt.Sprintf("%dd", w) == win {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fmt.Sprintf(
+				"feedback.orb_auto_throttle.window %q must be one of the configured feedback.windows", win))
+		}
+		if at.Floor < 0 || at.Cap < 0 || (at.Cap > 0 && at.Floor > at.Cap) {
+			errs = append(errs, fmt.Sprintf(
+				"feedback.orb_auto_throttle: floor %.2f / cap %.2f invalid (need 0 <= floor <= cap)", at.Floor, at.Cap))
 		}
 	}
 
