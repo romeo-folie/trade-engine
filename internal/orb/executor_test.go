@@ -153,3 +153,22 @@ func TestPlaceBracket_OrderShapes(t *testing.T) {
 		t.Errorf("market bracket legs = sl %.4f tp %.4f; want 1.0998/1.1040", mktExec.placed[0].StopLossPrice, mktExec.placed[0].TakeProfitPrice)
 	}
 }
+
+func TestComputeForexBracket_RiskMultiplier(t *testing.T) {
+	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0} // no notional cap so risk sizing binds
+	base := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 1, PipBuffer: 0.0002}
+
+	full := ComputeForexBracket(r, "buy", 100000, cfg, base)
+	half := base
+	half.RiskMultiplier = 0.5
+	scaled := ComputeForexBracket(r, "buy", 100000, cfg, half)
+
+	if scaled.Qty == 0 || full.Qty == 0 {
+		t.Fatalf("unexpected zero qty: full=%d scaled=%d", full.Qty, scaled.Qty)
+	}
+	// 0.5× multiplier ≈ half the size (allow ±1 lot for floor rounding).
+	if diff := full.Qty/2 - scaled.Qty; diff < -1 || diff > 1 {
+		t.Errorf("risk_multiplier 0.5: scaled qty %d; want ≈ half of %d", scaled.Qty, full.Qty)
+	}
+}

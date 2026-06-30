@@ -500,3 +500,145 @@ func TestReplay_DirectionEligibility(t *testing.T) {
 		}
 	})
 }
+
+// adaptiveInst is a EUR/USD instrument with only the given adaptive-exit fields set
+// (no confirmation/direction/range filters), so the adaptive variant reduces to
+// stop_touch entry + adaptive exit management.
+func adaptiveInst(set func(*config.Instrument)) config.Instrument {
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+	set(&inst)
+	return inst
+}
+
+func runAdaptive(candles []data.Candle, inst config.Instrument) ([]SimTrade, error) {
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0, ATRTimeframe: "1h", ATRPeriod: 14}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	return e.Run(context.Background(), Adaptive(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+}
+
+func TestReplay_AdaptiveBreakEven(t *testing.T) {
+	// buy entry 1.1012, stop 1.0998, R=0.0014. +1R = ~1.1026. Reach +1R (stop → entry),
+	// then drop back to entry: exit at break-even, NOT the −1R stop.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // stop_touch buy entry
+		cdl(16, 1.1014, 1.1028, 1.1013, 1.1027), // reaches +1R → stop moves to entry (~1.10125)
+		cdl(17, 1.1014, 1.1015, 1.1011, 1.1012), // drops to the break-even stop → exit
+	)
+	trades, err := runAdaptive(candles, adaptiveInst(func(i *config.Instrument) { i.BreakEvenR = 1.0 }))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "stop" {
+		t.Fatalf("got %+v; want one stop (break-even) exit", trades)
+	}
+	// Break-even exit is ~scratch (just costs), far better than a full −1R (~−7 gross).
+	if trades[0].GrossPnL < -1.0 {
+		t.Errorf("GrossPnL = %v; want ≈ 0 (break-even), not a full −1R loss", trades[0].GrossPnL)
+	}
+}
+
+func TestReplay_AdaptivePartialTakeProfit(t *testing.T) {
+	// Partial 50% at +1R, runner to +2R. Both legs win → 3 fills (entry + partial + runner).
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // entry
+		cdl(16, 1.1014, 1.1028, 1.1013, 1.1027), // reaches +1R → partial 50% at ~1.10265
+		cdl(17, 1.1027, 1.1041, 1.1026, 1.1040), // reaches +2R → runner TP at 1.1040
+	)
+	inst := adaptiveInst(func(i *config.Instrument) {
+		i.MinLotSize = 1 // so a 50% partial of a single-lot position is still a tradeable size
+		i.PartialTakeProfitR = 1.0
+		i.PartialFraction = 0.5
+		i.RunnerTakeProfitR = 2.0
+	})
+	trades, err := runAdaptive(candles, inst)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "tp" {
+		t.Fatalf("got %+v; want one tp (runner) exit", trades)
+	}
+	if trades[0].Commission != 6.0 { // (1 entry + 2 exits) × $2
+		t.Errorf("Commission = %v; want 6.0 (partial adds a third fill)", trades[0].Commission)
+	}
+	if trades[0].GrossPnL <= 0 {
+		t.Errorf("GrossPnL = %v; want > 0 (partial + runner both win)", trades[0].GrossPnL)
+	}
+}
+
+func TestReplay_AdaptiveTrailing(t *testing.T) {
+	// Trail at hwm − 1×ATR (ATR 0.0010). Price spikes to 1.1030 (stop trails to ~1.1020),
+	// then reverses → exit at the trailed stop, locking profit ABOVE entry.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // entry
+		cdl(16, 1.1014, 1.1030, 1.1025, 1.1028), // hwm 1.1030 → trailed stop ~1.1020
+		cdl(17, 1.1026, 1.1027, 1.1019, 1.1020), // drops below the trailed stop → exit
+	)
+	candles = append(candles, h1ATR(0.0010)...) // ATR = 0.0010
+	inst := adaptiveInst(func(i *config.Instrument) {
+		i.TrailATRMult = 1.0
+		i.TrailAfterR = 0
+	})
+	trades, err := runAdaptive(candles, inst)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "stop" {
+		t.Fatalf("got %+v; want one stop (trailed) exit", trades)
+	}
+	// The trailed stop is above entry, so the exit locks a profit (> 0 gross).
+	if trades[0].GrossPnL <= 0 {
+		t.Errorf("GrossPnL = %v; want > 0 (trailed stop locked profit above entry)", trades[0].GrossPnL)
+	}
+}
+
+func TestReplay_AdaptivePartial_SubLotSkipped(t *testing.T) {
+	// MinLotSize 5000, qty 5000, 50% partial = 2500 → rounds to 0 lots → no partial.
+	// The trade must take a single full exit (2 fills), not a fabricated 2500-unit partial.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // entry
+		cdl(16, 1.1014, 1.1028, 1.1013, 1.1027), // reaches the partial level (1R) — but 2500 < 1 lot
+		cdl(17, 1.1027, 1.1041, 1.1026, 1.1040), // TP
+	)
+	inst := adaptiveInst(func(i *config.Instrument) { // MinLotSize stays 5000
+		i.PartialTakeProfitR = 1.0
+		i.PartialFraction = 0.5
+		i.RunnerTakeProfitR = 2.0
+	})
+	trades, err := runAdaptive(candles, inst)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1", len(trades))
+	}
+	if trades[0].Commission != 4.0 { // 2 fills (entry + one exit) — NO partial fill
+		t.Errorf("Commission = %v; want 4.0 (sub-lot partial must not produce a third fill)", trades[0].Commission)
+	}
+}
+
+func TestReplay_PerInstrumentMaxHold(t *testing.T) {
+	// Variant says 240, but the instrument configures 30 — the per-instrument value must win
+	// (mirroring live EffectiveMaxHoldMinutes), so the trade time-exits at 08:45, not 12:15.
+	candles := rangeBars()
+	candles = append(candles, cdl(15, 1.1009, 1.1015, 1.1008, 1.1014)) // enter buy
+	for i := 16; i <= 50; i++ {
+		candles = append(candles, cdl(i, 1.1015, 1.1016, 1.1014, 1.1015)) // hover, no TP/SL
+	}
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 30}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	trades, err := e.Run(context.Background(), TimeExit(240), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "time_exit" {
+		t.Fatalf("got %+v; want one time_exit", trades)
+	}
+	if !trades[0].ExitTime.Equal(sessionOpen.Add(45 * time.Minute)) {
+		t.Errorf("ExitTime = %v; want 08:45 (the instrument's 30-min max-hold, not the variant's 240)", trades[0].ExitTime)
+	}
+}

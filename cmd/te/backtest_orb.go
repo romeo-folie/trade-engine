@@ -54,7 +54,7 @@ func init() {
 		_ = c.MarkFlagRequired("from")
 		_ = c.MarkFlagRequired("to")
 	}
-	orbBTCmd.Flags().StringVar(&btORBVariant, "variant", "baseline", "Rule variant: baseline | time-exit | range-filter | confirmed")
+	orbBTCmd.Flags().StringVar(&btORBVariant, "variant", "baseline", "Rule variant: baseline | time-exit | range-filter | confirmed | adaptive")
 	orbCompareBTCmd.Flags().StringArrayVar(&btORBVariants, "variants", []string{"baseline", "time-exit"}, "Variants to compare (repeat or comma-separate)")
 
 	backtestCmd.AddCommand(orbBTCmd, orbCompareBTCmd)
@@ -247,8 +247,10 @@ func resolveVariant(name string, maxHold int) (orbreplay.Variant, error) {
 		return orbreplay.RangeFilter(maxHold), nil
 	case "confirmed":
 		return orbreplay.Confirmed(maxHold), nil
+	case "adaptive":
+		return orbreplay.Adaptive(maxHold), nil
 	default:
-		return orbreplay.Variant{}, fmt.Errorf("unknown variant %q (known: baseline, time-exit, range-filter, confirmed)", name)
+		return orbreplay.Variant{}, fmt.Errorf("unknown variant %q (known: baseline, time-exit, range-filter, confirmed, adaptive)", name)
 	}
 }
 
