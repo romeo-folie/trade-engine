@@ -287,6 +287,13 @@ func exitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
 // missing stop or target never fires. When a single bar straddles both legs (its range
 // spans stop and target), the stop is taken as the conservative tie-break, since we
 // cannot know the intra-bar order and must not over-report wins.
+// ResolveExitFromCandles is the exported entry point to the bar-walk exit resolver,
+// so the ORB backtest engine replays exits with exactly the live tie-break semantics
+// (stop checked before take-profit on a same-bar straddle — the conservative choice).
+func ResolveExitFromCandles(side string, stopLoss, takeProfit float64, candles []data.Candle) (exitType string, exitPrice float64, exitTime time.Time, found bool) {
+	return resolveExitFromCandles(side, stopLoss, takeProfit, candles)
+}
+
 func resolveExitFromCandles(side string, stopLoss, takeProfit float64, candles []data.Candle) (exitType string, exitPrice float64, exitTime time.Time, found bool) {
 	for _, c := range candles {
 		switch side {

@@ -1,0 +1,291 @@
+package orbreplay
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
+)
+
+// fakeProvider returns scripted candles filtered to the requested [from, to) window.
+type fakeProvider struct{ candles []data.Candle }
+
+func (f *fakeProvider) FetchCandles(_ context.Context, ticker string, tf data.Timeframe, from, to time.Time) ([]data.Candle, error) {
+	var out []data.Candle
+	for _, c := range f.candles {
+		if !c.Timestamp.Before(from) && c.Timestamp.Before(to) {
+			c.Ticker, c.Timeframe = ticker, tf
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *fakeProvider) FetchQuote(context.Context, string) (*data.Quote, error) { return nil, nil }
+func (f *fakeProvider) FetchHistory(context.Context, string, data.Timeframe, int) ([]data.Candle, error) {
+	return nil, nil
+}
+
+var (
+	testDay     = time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC) // a Monday
+	sessionOpen = testDay.Add(8 * time.Hour)                   // London 08:00 UTC
+)
+
+func cdl(min int, o, h, l, c float64) data.Candle {
+	return data.Candle{Timestamp: sessionOpen.Add(time.Duration(min) * time.Minute), Open: o, High: h, Low: l, Close: c}
+}
+
+// rangeBars builds 15 one-minute bars (08:00–08:14) whose extremes are High=1.1010,
+// Low=1.1000 → buy entry 1.1012 / stop 1.0998 / TP 1.1040 for EUR/USD (pip 0.0002).
+func rangeBars() []data.Candle {
+	bars := []data.Candle{cdl(0, 1.1005, 1.1010, 1.1000, 1.1005)} // sets the extremes
+	for i := 1; i < 15; i++ {
+		bars = append(bars, cdl(i, 1.1005, 1.1008, 1.1002, 1.1005)) // strictly inside
+	}
+	return bars
+}
+
+func testEngine(candles []data.Candle, v Variant) ([]SimTrade, error) {
+	cfg := config.ForexORBConfig{
+		Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0,
+	}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	return e.Run(context.Background(), v, testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+}
+
+func TestReplay_CleanLongToTP(t *testing.T) {
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // High 1.1015 ≥ buy entry 1.1012 → enter buy
+		cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // High 1.1041 ≥ TP 1.1040 → take profit
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1", len(trades))
+	}
+	tr := trades[0]
+	if tr.Side != "buy" || tr.ExitType != "tp" {
+		t.Errorf("got side=%s exit=%s; want buy/tp", tr.Side, tr.ExitType)
+	}
+	if tr.NetPnL <= 0 {
+		t.Errorf("NetPnL = %v; want > 0 for a TP win after costs", tr.NetPnL)
+	}
+	if tr.Qty != 5000 {
+		t.Errorf("Qty = %d; want 5000 (notional-capped)", tr.Qty)
+	}
+}
+
+func TestReplay_StopOut(t *testing.T) {
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // enter buy
+		cdl(16, 1.1014, 1.1016, 1.0997, 1.0998), // Low 1.0997 ≤ stop 1.0998 → stop out
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "stop" {
+		t.Fatalf("got %+v; want one stop exit", trades)
+	}
+	if trades[0].NetPnL >= 0 {
+		t.Errorf("NetPnL = %v; want < 0 for a stop loss", trades[0].NetPnL)
+	}
+}
+
+func TestReplay_TimeExitFlattens(t *testing.T) {
+	candles := rangeBars()
+	candles = append(candles, cdl(15, 1.1009, 1.1015, 1.1008, 1.1014)) // enter buy at 08:15
+	// Bars 16..44 hover between stop and TP (no leg touched) through the 30-min deadline.
+	for i := 16; i <= 45; i++ {
+		candles = append(candles, cdl(i, 1.1015, 1.1016, 1.1014, 1.1015))
+	}
+	trades, err := testEngine(candles, TimeExit(30)) // deadline 08:45
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "time_exit" {
+		t.Fatalf("got %+v; want one time_exit", trades)
+	}
+	// Exit at the first bar at/after the deadline (08:45).
+	if !trades[0].ExitTime.Equal(sessionOpen.Add(45 * time.Minute)) {
+		t.Errorf("ExitTime = %v; want 08:45", trades[0].ExitTime)
+	}
+}
+
+func TestReplay_EndOfData(t *testing.T) {
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // enter buy
+		cdl(16, 1.1015, 1.1016, 1.1014, 1.1015), // no leg touched, data ends
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "end_of_data" {
+		t.Fatalf("got %+v; want one end_of_data", trades)
+	}
+}
+
+func TestReplay_NoBreakoutNoTrade(t *testing.T) {
+	candles := rangeBars()
+	// Price stays strictly inside the range — neither stop-entry triggers.
+	candles = append(candles,
+		cdl(15, 1.1005, 1.1009, 1.1001, 1.1004),
+		cdl(16, 1.1004, 1.1008, 1.1002, 1.1006),
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("trades = %d; want 0 (range never broke)", len(trades))
+	}
+}
+
+func TestReplay_CleanShortToTP(t *testing.T) {
+	// Sell entry = Low−pip = 1.0998, stop = High+pip = 1.1012, TP = 1.0998 − 2×0.0014 = 1.0970.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1001, 1.1002, 1.0997, 1.0998), // Low 1.0997 ≤ sell entry 1.0998 → enter sell
+		cdl(16, 1.0998, 1.0999, 1.0969, 1.0970), // Low 1.0969 ≤ TP 1.0970 → take profit
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].Side != "sell" || trades[0].ExitType != "tp" {
+		t.Fatalf("got %+v; want one sell/tp", trades)
+	}
+	if trades[0].NetPnL <= 0 {
+		t.Errorf("NetPnL = %v; want > 0", trades[0].NetPnL)
+	}
+}
+
+func TestReplay_CommissionDragsLosersBelowGross(t *testing.T) {
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014),
+		cdl(16, 1.1014, 1.1016, 1.0997, 1.0998), // stop out
+	)
+	trades, _ := testEngine(candles, Baseline())
+	tr := trades[0]
+	if tr.Commission != 4.0 {
+		t.Errorf("Commission = %v; want 4.0 (2 sides × $2 default)", tr.Commission)
+	}
+	if tr.NetPnL >= tr.GrossPnL {
+		t.Errorf("NetPnL %v should be below GrossPnL %v after commission", tr.NetPnL, tr.GrossPnL)
+	}
+}
+
+func TestReplay_SameBarStopOut(t *testing.T) {
+	// A single wide bar both triggers the breakout and spans the stop. Dual-sided
+	// geometry makes the buy-stop-loss level coincide with the sell-entry level, so a
+	// bearish such bar is taken as a sell that stops on its own bar (conservative).
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1000, 1.1013, 1.0997, 1.0999), // sell entry 1.0998 hit; high 1.1013 ≥ sell stop 1.1012
+		cdl(16, 1.0998, 1.0999, 1.0969, 1.0970), // would be a TP later — must NOT be reached
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1", len(trades))
+	}
+	tr := trades[0]
+	if tr.ExitType != "stop" {
+		t.Errorf("ExitType = %q; want stop (adverse same-bar)", tr.ExitType)
+	}
+	if !tr.ExitTime.Equal(sessionOpen.Add(15 * time.Minute)) {
+		t.Errorf("ExitTime = %v; want 08:15 (stopped on the entry bar, not a later TP)", tr.ExitTime)
+	}
+	if tr.NetPnL >= 0 {
+		t.Errorf("NetPnL = %v; want < 0", tr.NetPnL)
+	}
+}
+
+func TestReplay_SessionBothRejected(t *testing.T) {
+	cfg := config.ForexORBConfig{Session: "both", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+	e := NewEngine(cfg, &fakeProvider{}, nil, 0)
+	if _, err := e.Run(context.Background(), Baseline(), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000); err == nil {
+		t.Error(`session "both" should error (one session per run), got nil`)
+	}
+}
+
+func TestReplay_EntryWindowClosesAfter60Min(t *testing.T) {
+	// A breakout after the 60-min live cancel window (deadline 09:00) must not trade.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1005, 1.1009, 1.1001, 1.1004), // inside the range — no entry
+		cdl(65, 1.1009, 1.1015, 1.1008, 1.1014), // 09:05 breakout — past the entry window
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("trades = %d; want 0 (breakout after the 60-min entry window)", len(trades))
+	}
+}
+
+func TestReplay_NearFlatRangeSkipped(t *testing.T) {
+	// Opening range width 0.0002 < 2×pip (0.0004) → live skips it; the replay must too.
+	var candles []data.Candle
+	candles = append(candles, cdl(0, 1.1001, 1.1002, 1.1000, 1.1001)) // width 0.0002
+	for i := 1; i < 15; i++ {
+		candles = append(candles, cdl(i, 1.1001, 1.1002, 1.1000, 1.1001))
+	}
+	candles = append(candles, cdl(15, 1.1002, 1.1010, 1.1001, 1.1009)) // would break out
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("trades = %d; want 0 (near-flat range filtered)", len(trades))
+	}
+}
+
+func TestReplay_SkipsSessionWhilePriorTradeOpen(t *testing.T) {
+	// A Monday baseline trade that never resolves stays open into Tuesday; the live
+	// guard (tickersWithOpenFilledTrades) would suppress Tuesday's bracket, so the
+	// replay must produce exactly one trade (Monday's), not stack a Tuesday entry.
+	candles := rangeBars() // Mon 08:00–08:14, High 1.1010 / Low 1.1000
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // Mon 08:15 enter buy (TP 1.1040 / stop 1.0998)
+		cdl(16, 1.1015, 1.1016, 1.1014, 1.1015), // Mon inside
+	)
+	// Tuesday (offset +1440 min) has its OWN wide range + breakout that, in isolation,
+	// would trade — but Monday's position is still open, so it must be skipped. All Tue
+	// bars stay between Monday's stop and TP, so Monday's trade does not exit on them.
+	candles = append(candles, cdl(1440, 1.1025, 1.1030, 1.1020, 1.1025)) // Tue range extremes
+	for i := 1441; i < 1455; i++ {
+		candles = append(candles, cdl(i, 1.1025, 1.1028, 1.1022, 1.1025))
+	}
+	candles = append(candles,
+		cdl(1455, 1.1029, 1.1033, 1.1028, 1.1032), // Tue 08:15 breakout (buy entry 1.1032)
+		cdl(1456, 1.1032, 1.1033, 1.1031, 1.1032),
+	)
+
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	trades, err := e.Run(context.Background(), Baseline(), testDay, testDay.Add(48*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1 (Tuesday suppressed while Monday's trade is open)", len(trades))
+	}
+	if !trades[0].EntryTime.Equal(sessionOpen.Add(15 * time.Minute)) {
+		t.Errorf("EntryTime = %v; want Monday 08:15", trades[0].EntryTime)
+	}
+}
