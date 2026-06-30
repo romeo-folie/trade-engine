@@ -119,7 +119,18 @@ func main() {
 			to = now
 		}
 
-		res, rErr := orb.ResolveExitViaBarReplay(ctx, md, t.Ticker, t.Side, t.StopLoss, t.TakeProfit, from, to, now)
+		// If adaptive stop management moved the stop, t.StopLoss is no longer the level that
+		// was live across the whole post-fill window — replaying it would fabricate a stop-out
+		// at the moved level over a pre-move pullback (see migration 035). Disable the stop leg
+		// (0 ⇒ ResolveExitViaBarReplay skips it) and replay only the immutable take-profit;
+		// the stop side is owned by the live broker order. Mirrors reconcileBarReplayExits.
+		replayStop := t.StopLoss
+		if t.StopMovedAt != nil {
+			replayStop = 0
+			fmt.Printf("%-9s %-5s  stop_moved_at=%s — stop leg disabled, replaying TP only\n",
+				t.Ticker, t.Side, t.StopMovedAt.Format(time.RFC3339))
+		}
+		res, rErr := orb.ResolveExitViaBarReplay(ctx, md, t.Ticker, t.Side, replayStop, t.TakeProfit, from, to, now)
 		if rErr != nil {
 			noData++
 			fmt.Printf("%-9s %-5s %5d %12s %10s %8s %5s  %s\n",

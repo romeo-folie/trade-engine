@@ -1710,7 +1710,17 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 			continue // window not open yet — retry next sweep
 		}
 
-		res, rErr := ResolveExitViaBarReplay(ctx, s.marketData, t.Ticker, t.Side, t.StopLoss, t.TakeProfit, from, to, now)
+		// Once adaptive stop management has moved the stop, t.StopLoss no longer reflects the
+		// level that was live across the whole post-fill window — replaying it would fabricate
+		// a stop-out at the moved level over bars the stop had not yet reached (see migration
+		// 035). Disable the stop leg (0 ⇒ resolveExitFromCandles skips it) and replay only the
+		// immutable take-profit; the stop side is owned by the live broker order and captured
+		// by the trades-feed reconciler and the time-exit backstop.
+		replayStop := t.StopLoss
+		if t.StopMovedAt != nil {
+			replayStop = 0
+		}
+		res, rErr := ResolveExitViaBarReplay(ctx, s.marketData, t.Ticker, t.Side, replayStop, t.TakeProfit, from, to, now)
 		if rErr != nil {
 			slog.Warn("orb: bar replay: fetch candles failed", "ticker", t.Ticker, "err", rErr)
 			continue

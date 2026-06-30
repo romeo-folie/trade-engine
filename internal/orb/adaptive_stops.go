@@ -99,9 +99,10 @@ func (s *ORBScheduler) enforceAdaptiveStops(ctx context.Context) {
 // recovery-actionable log. Inverting the order (DB first) is not safer: it would show a
 // tightened stop the broker never accepted, a false sense of protection.
 func (s *ORBScheduler) persistMovedStop(ctx context.Context, t store.ORBTrade, newStop float64) {
+	movedAt := s.now()
 	var err error
 	for range 3 {
-		if err = store.UpdateORBTradeStopLoss(ctx, s.db, t.ID, newStop); err == nil {
+		if err = store.UpdateORBTradeStopLoss(ctx, s.db, t.ID, newStop, movedAt); err == nil {
 			return
 		}
 	}

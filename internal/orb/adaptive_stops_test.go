@@ -145,6 +145,28 @@ func TestMoveStopLeg_ProtectsCurrentSessionEntry(t *testing.T) {
 	}
 }
 
+// Once a stop has been adaptively moved, the bar-replay backstop disables the stop leg
+// (passes stopLoss=0) and replays only the immutable take-profit. This guards against
+// fabricating a stop-out at the MOVED level over a pre-move pullback: a long fills at
+// 1.1000 with an original stop at 1.0950, pulls back to 1.0970 (never touching the
+// original stop), then break-even moves the stop to 1.1000. Replaying the moved stop over
+// the early bar would falsely close it; with the stop leg disabled it stays open.
+func TestBarReplay_DisabledStopLegDoesNotFabricate(t *testing.T) {
+	candles := []data.Candle{
+		{High: 1.1010, Low: 1.0970}, // early pullback — below a 1.1000 break-even stop, above the original 1.0950
+		{High: 1.1030, Low: 1.1005},
+	}
+	// Stop leg disabled (0), TP far away (1.1200, unreached) → no exit fabricated.
+	if _, _, _, found := ResolveExitFromCandles("buy", 0, 1.1200, candles); found {
+		t.Error("disabled stop leg fabricated an exit over a pre-move pullback; want still-open")
+	}
+	// Sanity: had the moved stop (1.1000) been replayed, the early low (1.0970) WOULD have
+	// fabricated a stop-out — confirming the disable is what prevents it.
+	if _, _, _, found := ResolveExitFromCandles("buy", 1.1000, 1.1200, candles); !found {
+		t.Error("expected the moved-stop replay to (wrongly) fire — test premise is invalid otherwise")
+	}
+}
+
 // An executor that cannot replace stops (no StopOrderReplacer) is a safe no-op.
 func TestMoveStopLeg_UnsupportedExecutor(t *testing.T) {
 	s := &ORBScheduler{executor: &stubExecutor{}}
