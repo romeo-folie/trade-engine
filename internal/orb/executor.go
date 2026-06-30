@@ -309,6 +309,22 @@ func resolveExitFromCandles(side string, stopLoss, takeProfit float64, candles [
 	return "", 0, time.Time{}, false
 }
 
+// floorToBar rounds a time down to the start of the bar that contains it, for the given
+// timeframe, so a fetch window starting mid-bar still includes that whole bar (providers
+// key and filter bars by their start timestamp). Times are UTC in this package.
+func floorToBar(t time.Time, tf data.Timeframe) time.Time {
+	switch tf {
+	case data.Timeframe1Min:
+		return t.Truncate(time.Minute)
+	case data.Timeframe1Hour:
+		return t.Truncate(time.Hour)
+	case data.Timeframe1Day:
+		return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, t.Location())
+	default:
+		return t
+	}
+}
+
 // barReplayTimeframe picks the finest market-data bar resolution that the provider
 // still serves for a lookback of the given age. IBKR's history depth shrinks as the
 // bar gets finer (1-min reaches only ~1–2 days; hourly ~1 month; daily ~6+ months),
@@ -368,7 +384,15 @@ func ResolveExitViaBarReplay(ctx context.Context, md data.MarketDataProvider, ti
 	var result BarReplayResult
 
 	for _, tf := range barReplayTimeframeFallbacks(age) {
-		candles, err := md.FetchCandles(ctx, ticker, tf, from, to)
+		// Floor the fetch start to the bar boundary. A provider keys a bar by its START
+		// timestamp and drops bars before `from`; passing the exact fill time (e.g. 08:15)
+		// would exclude the 08:00 hourly / current-day bar that CONTAINS the fill — and that
+		// bar is exactly where an intraday ORB exit usually lands. Without this, an hourly/
+		// daily replay can miss the real exit and either leave the trade open or match a later
+		// unrelated bar. The containing bar also spans pre-fill price (an unavoidable coarse-bar
+		// approximation already noted on resolveExitFromCandles), but including it is strictly
+		// better than dropping the bar the exit happened in.
+		candles, err := md.FetchCandles(ctx, ticker, tf, floorToBar(from, tf), to)
 		if err != nil {
 			lastErr = err
 			continue

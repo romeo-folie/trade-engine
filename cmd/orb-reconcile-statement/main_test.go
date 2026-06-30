@@ -94,6 +94,41 @@ func TestReconcile_NettingCollisionResolvedByTwoPass(t *testing.T) {
 	}
 }
 
+func TestReconcile_QtyMismatchNotMatched(t *testing.T) {
+	// A same-side fill at the right time/price but the WRONG size must not be reserved as
+	// the entry (it would close a 5000-unit trade against an unrelated 1000-unit fill).
+	fills := []*fill{
+		mkFill("EUR/USD", 1000, 1.1700, -2, at(10, 0)), // wrong size
+		mkFill("EUR/USD", -5000, 1.1720, -2, at(11, 0)),
+	}
+	bySym := map[string][]*fill{"EUR/USD": fills}
+	trades := []store.ORBTrade{{
+		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
+		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
+	}}
+	got := reconcile(trades, bySym)
+	if got[0].ok {
+		t.Fatalf("expected unmatched on qty mismatch, got %+v", got[0])
+	}
+}
+
+func TestReconcile_ExitQtyMustMatch(t *testing.T) {
+	// Entry matches, but the only offsetting fill is the wrong size → no exit.
+	fills := []*fill{
+		mkFill("EUR/USD", 5000, 1.1700, -2, at(10, 0)),
+		mkFill("EUR/USD", -1000, 1.1720, -2, at(11, 0)), // wrong-size offset
+	}
+	bySym := map[string][]*fill{"EUR/USD": fills}
+	trades := []store.ORBTrade{{
+		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
+		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
+	}}
+	got := reconcile(trades, bySym)
+	if got[0].ok {
+		t.Fatalf("expected no exit on qty mismatch, got %+v", got[0])
+	}
+}
+
 func TestReconcile_NoEntryFillUnmatched(t *testing.T) {
 	// Statement has only a sell fill; a buy trade finds no same-sign entry.
 	fills := []*fill{mkFill("EUR/USD", -5000, 1.1720, -2, at(11, 0))}

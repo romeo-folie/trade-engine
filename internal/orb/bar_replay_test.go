@@ -44,16 +44,32 @@ func TestBarReplayTimeframeFallbacks(t *testing.T) {
 	}
 }
 
+func TestFloorToBar(t *testing.T) {
+	ts := time.Date(2026, 4, 13, 8, 15, 30, 0, time.UTC)
+	if got := floorToBar(ts, data.Timeframe1Min); !got.Equal(time.Date(2026, 4, 13, 8, 15, 0, 0, time.UTC)) {
+		t.Errorf("1min floor = %v", got)
+	}
+	if got := floorToBar(ts, data.Timeframe1Hour); !got.Equal(time.Date(2026, 4, 13, 8, 0, 0, 0, time.UTC)) {
+		t.Errorf("1h floor = %v", got)
+	}
+	if got := floorToBar(ts, data.Timeframe1Day); !got.Equal(time.Date(2026, 4, 13, 0, 0, 0, 0, time.UTC)) {
+		t.Errorf("1d floor = %v", got)
+	}
+}
+
 // stubMarketData returns canned candles (and/or an error) per timeframe and records
-// which timeframes were requested, so tests can assert the fallback walk.
+// which timeframes were requested (and the from passed), so tests can assert the
+// fallback walk and the bar-boundary flooring.
 type stubMarketData struct {
 	byTF      map[data.Timeframe][]data.Candle
 	errTF     map[data.Timeframe]error
 	requested []data.Timeframe
+	lastFrom  time.Time
 }
 
-func (m *stubMarketData) FetchCandles(_ context.Context, _ string, tf data.Timeframe, _, _ time.Time) ([]data.Candle, error) {
+func (m *stubMarketData) FetchCandles(_ context.Context, _ string, tf data.Timeframe, from, _ time.Time) ([]data.Candle, error) {
 	m.requested = append(m.requested, tf)
+	m.lastFrom = from
 	if m.errTF != nil {
 		if err, ok := m.errTF[tf]; ok {
 			return nil, err
@@ -170,6 +186,27 @@ func TestResolveExitViaBarReplay_AllTimeframesErrorReturnsError(t *testing.T) {
 	_, err := ResolveExitViaBarReplay(context.Background(), md, "EUR/USD", "buy", 140, 170, from, now, now)
 	if err == nil {
 		t.Fatal("expected error when every timeframe fails")
+	}
+}
+
+func TestResolveExitViaBarReplay_FloorsFetchStartToBarBoundary(t *testing.T) {
+	// A trade ~10 days old resolves on hourly bars; the fetch start must be floored to the
+	// top of the hour so the bar containing the fill (and its intraday exit) isn't dropped.
+	md := &stubMarketData{byTF: map[data.Timeframe][]data.Candle{
+		data.Timeframe1Hour: {bar(0, 172, 168)}, // hits tp=170
+	}}
+	now := time.Date(2026, 4, 23, 8, 15, 30, 0, time.UTC)
+	from := time.Date(2026, 4, 13, 8, 15, 30, 0, time.UTC)
+	res, err := ResolveExitViaBarReplay(context.Background(), md, "EUR/USD", "buy", 140, 170, from, now, now)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if !res.Found || res.Timeframe != data.Timeframe1Hour {
+		t.Fatalf("got %+v; want found on 1h", res)
+	}
+	wantFrom := time.Date(2026, 4, 13, 8, 0, 0, 0, time.UTC)
+	if !md.lastFrom.Equal(wantFrom) {
+		t.Errorf("fetch from = %v; want floored %v", md.lastFrom, wantFrom)
 	}
 }
 

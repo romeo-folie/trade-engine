@@ -180,6 +180,9 @@ func reconcile(dbTrades []store.ORBTrade, bySym map[string][]*fill) []match {
 			if fl.used || fl.sign != want {
 				continue
 			}
+			if math.Abs(fl.qty-float64(t.Qty)) > 0.5 {
+				continue // size must match — never reserve a partial/unrelated fill as the entry
+			}
 			dt := anchor.Sub(fl.t)
 			if dt < -5*time.Minute || dt > 90*time.Minute {
 				continue
@@ -215,6 +218,9 @@ func reconcile(dbTrades []store.ORBTrade, bySym map[string][]*fill) []match {
 		for i := entryIdx[k] + 1; i < len(fills); i++ {
 			if fills[i].used || fills[i].sign == want {
 				continue
+			}
+			if math.Abs(fills[i].qty-float64(t.Qty)) > 0.5 {
+				continue // offsetting fill must close the same size we entered
 			}
 			exitI = i
 			break
