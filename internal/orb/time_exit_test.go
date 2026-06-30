@@ -88,16 +88,22 @@ func TestForexSecType(t *testing.T) {
 	}
 }
 
-// ─── cancelWorkingLegs ────────────────────────────────────────────────────────
+// ─── cancelBracketLegs ────────────────────────────────────────────────────────
 
-func TestCancelWorkingLegs_OnlyMatchingTicker(t *testing.T) {
+// tradeWithLegs is a filled trade whose TP=1.12, SL=1.09 are used to price-match legs.
+func tradeWithLegs() store.ORBTrade {
+	return store.ORBTrade{ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
+		FillPrice: 1.10, TakeProfit: 1.12, StopLoss: 1.09}
+}
+
+func TestCancelBracketLegs_OnlyMatchingTicker(t *testing.T) {
 	exec := &flattenExec{working: []execution.WorkingOrder{
-		{OrderID: "tp-eur", Ticker: "EUR/USD"},
-		{OrderID: "sl-eur", Ticker: "EUR/USD"},
-		{OrderID: "tp-gbp", Ticker: "GBP/USD"}, // different ticker — must NOT be cancelled
+		{OrderID: "tp-eur", Ticker: "EUR/USD", Price: 1.12},     // TP leg — matches
+		{OrderID: "sl-eur", Ticker: "EUR/USD", StopPrice: 1.09}, // SL leg — matches
+		{OrderID: "tp-gbp", Ticker: "GBP/USD", Price: 1.12},     // different ticker — must NOT be cancelled
 	}}
 	s := &ORBScheduler{executor: exec}
-	s.cancelWorkingLegs(context.Background(), "EUR/USD")
+	s.cancelBracketLegs(context.Background(), tradeWithLegs())
 
 	if len(exec.cancelled) != 2 {
 		t.Fatalf("cancelled %d orders; want 2 (only EUR/USD legs)", len(exec.cancelled))
@@ -109,29 +115,71 @@ func TestCancelWorkingLegs_OnlyMatchingTicker(t *testing.T) {
 	}
 }
 
-func TestCancelWorkingLegs_NoListerIsNoop(t *testing.T) {
-	// stubExecutor (from reconcile_test.go) does NOT implement WorkingOrdersLister,
-	// so cancelWorkingLegs must be a safe no-op rather than panic.
-	s := &ORBScheduler{executor: &stubExecutor{}}
-	s.cancelWorkingLegs(context.Background(), "EUR/USD") // must not panic
+func TestCancelBracketLegs_SkipsUnrelatedPriceAndKeepsNoPriceFallback(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "sl-leg", Ticker: "EUR/USD", StopPrice: 1.09}, // matches SL — cancel
+		{OrderID: "manual", Ticker: "EUR/USD", Price: 1.30},     // unrelated price — must survive
+		{OrderID: "no-price", Ticker: "EUR/USD"},                // no price exposed — fallback cancel
+	}}
+	s := &ORBScheduler{executor: exec}
+	s.cancelBracketLegs(context.Background(), tradeWithLegs())
+
+	cancelled := map[string]bool{}
+	for _, id := range exec.cancelled {
+		cancelled[id] = true
+	}
+	if !cancelled["sl-leg"] {
+		t.Error("did not cancel the matching SL leg")
+	}
+	if cancelled["manual"] {
+		t.Error("cancelled an unrelated order at a non-matching price (1.30)")
+	}
+	if !cancelled["no-price"] {
+		t.Error("did not cancel a no-price order (fallback: a stale leg must not be left live)")
+	}
 }
 
-func TestCancelWorkingLegs_ProtectsCurrentSessionEntries(t *testing.T) {
+func TestCancelBracketLegs_NoListerIsNoop(t *testing.T) {
+	// stubExecutor (from reconcile_test.go) does NOT implement WorkingOrdersLister,
+	// so cancelBracketLegs must be a safe no-op rather than panic.
+	s := &ORBScheduler{executor: &stubExecutor{}}
+	s.cancelBracketLegs(context.Background(), tradeWithLegs()) // must not panic
+}
+
+func TestCancelBracketLegs_ProtectsCurrentSessionEntries(t *testing.T) {
 	// A prior-session trade time-exiting must cancel its own dangling leg but NOT
 	// the current session's freshly-placed entry stop on the same ticker (which the
 	// account-wide working-orders lookup also returns).
 	exec := &flattenExec{working: []execution.WorkingOrder{
-		{OrderID: "entry-sell", Ticker: "EUR/USD"},  // current session entry — must survive
-		{OrderID: "dangling-sl", Ticker: "EUR/USD"}, // prior trade's stale leg — must be cancelled
+		{OrderID: "entry-sell", Ticker: "EUR/USD", StopPrice: 1.09},  // current session entry — protected even though price matches
+		{OrderID: "dangling-sl", Ticker: "EUR/USD", StopPrice: 1.09}, // prior trade's stale leg — must be cancelled
 	}}
 	s := &ORBScheduler{
 		executor: exec,
 		orderIDs: map[string][2]string{"EUR/USD": {"entry-buy", "entry-sell"}},
 	}
-	s.cancelWorkingLegs(context.Background(), "EUR/USD")
+	s.cancelBracketLegs(context.Background(), tradeWithLegs())
 
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != "dangling-sl" {
 		t.Errorf("cancelled = %v; want [dangling-sl] (current-session entry must be protected)", exec.cancelled)
+	}
+}
+
+// ─── isForexInstrument ────────────────────────────────────────────────────────
+
+func TestIsForexInstrument(t *testing.T) {
+	s := &ORBScheduler{forexCfg: &config.ForexORBConfig{Instruments: []config.Instrument{
+		{Symbol: "EUR/USD"}, {Symbol: "XAU/USD"},
+	}}}
+	if !s.isForexInstrument("EUR/USD") {
+		t.Error("EUR/USD should be a configured forex instrument")
+	}
+	if s.isForexInstrument("AAPL") {
+		t.Error("AAPL must NOT be treated as a forex instrument (shared-table equity trade)")
+	}
+	// nil forexCfg → never a forex instrument.
+	if (&ORBScheduler{}).isForexInstrument("EUR/USD") {
+		t.Error("nil forexCfg should report no forex instruments")
 	}
 }
 
@@ -221,10 +269,6 @@ func TestFlattenAndRecordTimeExit_BoundsQtyToNetPosition(t *testing.T) {
 
 	s.flattenAndRecordTimeExit(ctx, trade, 240)
 
-	// Dangling leg cancelled first.
-	if len(exec.cancelled) != 1 || exec.cancelled[0] != "sl-eur" {
-		t.Errorf("cancelled = %v; want [sl-eur]", exec.cancelled)
-	}
 	if len(exec.placed) != 1 {
 		t.Fatalf("placed %d orders; want 1", len(exec.placed))
 	}
@@ -240,6 +284,13 @@ func TestFlattenAndRecordTimeExit_BoundsQtyToNetPosition(t *testing.T) {
 	}
 	if got.SecType != "CASH" {
 		t.Errorf("flatten secType = %q; want CASH", got.SecType)
+	}
+
+	// P1 invariant: the flatten was NOT confirmed, so the protective bracket legs
+	// must be left intact — cancelling them before a confirmed flatten would leave
+	// the position naked.
+	if len(exec.cancelled) != 0 {
+		t.Errorf("cancelled %v legs on an unconfirmed flatten; want none (protection must be retained)", exec.cancelled)
 	}
 }
 

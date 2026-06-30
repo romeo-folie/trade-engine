@@ -241,14 +241,18 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 			Side:         side,
 			Status:       status,
 			RemainingQty: float64(o.RemainingQty),
+			Price:        float64(o.Price),
+			StopPrice:    float64(o.StopPrice),
 		})
 	}
 	return out, nil
 }
 
 // ibkrOrderRow models one row of /iserver/account/orders. The gateway encodes
-// orderId as a number but ticker/side/status as strings; remainingQuantity may be
-// string- or number-encoded, so it reuses ibkrFloat (which tolerates both).
+// orderId as a number but ticker/side/status as strings; remainingQuantity and the
+// price fields may be string- or number-encoded, so they reuse ibkrFloat (which
+// tolerates both). price/stop_price let a caller match an order to a known
+// take-profit/stop-loss leg; both are 0 when the gateway omits them.
 type ibkrOrderRow struct {
 	OrderID      ibkrID    `json:"orderId"`
 	Conid        int       `json:"conid"`
@@ -256,6 +260,8 @@ type ibkrOrderRow struct {
 	Side         string    `json:"side"`   // "BUY" | "SELL" (sometimes "B" | "S")
 	Status       string    `json:"status"` // "Submitted" | "PreSubmitted" | "Filled" | ...
 	RemainingQty ibkrFloat `json:"remainingQuantity"`
+	Price        ibkrFloat `json:"price"`
+	StopPrice    ibkrFloat `json:"stop_price"`
 }
 
 // RecentFills fetches today's filled orders from /iserver/account/trades.

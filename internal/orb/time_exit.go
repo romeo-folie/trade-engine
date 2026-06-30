@@ -72,6 +72,14 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 	for i := range trades {
 		t := trades[i]
 
+		// Only act on this scheduler's own forex/CFD instruments. The orb_trades
+		// table is shared: in orb-newyork mode an equities scheduler writes equity
+		// trades to the same table, and the forex scheduler must not hand those to
+		// its IBKR forex flatten/cancel path (wrong conid, invalid-pair calls).
+		if !s.isForexInstrument(t.Ticker) {
+			continue
+		}
+
 		// A zero entry fill can't yield a meaningful PnL and signals a corrupt row;
 		// skip it (matches the bar-replay backstop's guard).
 		if t.FillPrice == 0 {
@@ -91,27 +99,27 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 	}
 }
 
-// flattenAndRecordTimeExit cancels a filled trade's remaining bracket legs, flattens
-// the position at market, and records the resulting exit as exit_type='time_exit'.
-// It is intentionally conservative: if the broker reports the position already flat
-// (the bracket filled but the exit was not yet recorded) it does nothing and leaves
-// the broker/bar-replay reconcilers to record the real exit; if the flatten fill can
-// not be confirmed it leaves the row 'filled' for the next sweep rather than guessing.
+// flattenAndRecordTimeExit flattens a filled trade's position at market and records
+// the resulting exit as exit_type='time_exit'.
+//
+// Ordering is deliberate and safety-critical: the protective bracket legs are left in
+// place until a flatten is CONFIRMED, and only then cancelled. A previous version
+// cancelled the legs first — but if GetPositions/PlaceOrder/fill-confirmation then
+// failed (an IBKR/auth hiccup), the position would be left naked with no stop until the
+// next sweep, the opposite of risk containment. So: read position → flatten → confirm
+// fill → cancel the now-redundant legs → close the row. It is also conservative: if the
+// position is already flat (bracket filled, exit not yet recorded) it does nothing and
+// defers to the reconcilers; if the flatten can't be confirmed it leaves the row
+// 'filled' with legs intact for the next sweep rather than guessing.
 func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORBTrade, maxHold int) {
 	secType := s.forexSecType(t.Ticker)
 
-	// 1. Cancel the dangling TP/SL legs so they can't fill after we flatten. The leg
-	//    order IDs were never captured (IBKR's bracket flow doesn't return them), so we
-	//    find them by symbol via the working-orders lookup. Best-effort: a leg that is
-	//    already gone is fine, and a cancel failure is logged but does not block the
-	//    flatten (the market order still reduces the net position).
-	s.cancelWorkingLegs(ctx, t.Ticker)
-
-	// 2. Read the live position. Flatten only this trade's quantity, bounded by the
-	//    broker's net position, so forex netting across trades doesn't over-flatten.
+	// 1. Read the live position FIRST, while the bracket still protects it. Flatten
+	//    only this trade's quantity, bounded by the broker's net position, so forex
+	//    netting across trades doesn't over-flatten.
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
-		slog.Warn("orb: time exit: get positions failed — will retry", "ticker", t.Ticker, "err", err)
+		slog.Warn("orb: time exit: get positions failed — will retry (legs intact)", "ticker", t.Ticker, "err", err)
 		return
 	}
 	var netQty float64
@@ -132,13 +140,13 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	if flattenQty <= 0 {
 		// Position already closed for this trade (bracket filled, just not yet recorded).
 		// Don't fabricate a time exit — let the broker/bar-replay reconcilers record the
-		// real exit. Leave the row 'filled'.
+		// real exit. Leave the row 'filled' and the (already-resolved) legs untouched.
 		slog.Info("orb: time exit: position already flat, deferring to reconcilers",
 			"ticker", t.Ticker, "side", t.Side, "net_qty", netQty, "trade_qty", t.Qty)
 		return
 	}
 
-	// 3. Flatten at market.
+	// 2. Flatten at market while the bracket legs still protect the position.
 	slog.Info("orb: time exit: flattening filled trade past max hold",
 		"ticker", t.Ticker, "side", t.Side, "flatten_side", flattenSide, "qty", flattenQty,
 		"max_hold_min", maxHold, "entry_fill", t.FillPrice)
@@ -151,18 +159,23 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 		TradeID:  t.ID,
 	})
 	if err != nil {
-		slog.Warn("orb: time exit: flatten order failed — will retry", "ticker", t.Ticker, "err", err)
+		slog.Warn("orb: time exit: flatten order failed — will retry (legs intact)", "ticker", t.Ticker, "err", err)
 		return
 	}
 
-	// 4. Confirm the flatten fill price. Only close the DB row once the flatten is a
-	//    confirmed fill — never on an unconfirmed market order.
+	// 3. Confirm the flatten fill. Only once the position is confirmed flat do we
+	//    remove protection / close the row — never on an unconfirmed market order.
 	exitPrice, ok := s.awaitFlattenFill(ctx, res)
 	if !ok {
-		slog.Warn("orb: time exit: flatten fill not confirmed — leaving filled for next sweep",
+		slog.Warn("orb: time exit: flatten fill not confirmed — leaving filled, legs intact for next sweep",
 			"ticker", t.Ticker, "order_id", res.BrokerOrderID)
 		return
 	}
+
+	// 4. Cancel the now-redundant bracket legs so a leftover leg can't fire against
+	//    the flat position and open a new one. Position is already closed, so this is
+	//    best-effort cleanup, not protection-critical.
+	s.cancelBracketLegs(ctx, t)
 
 	// 5. Record the exit. PnL is gross (matches the engine's exitPnL convention)
 	//    and is computed on the quantity actually flattened, not the original trade
@@ -184,40 +197,93 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	})
 }
 
-// cancelWorkingLegs cancels a ticker's still-working orders before a time-exit
-// flatten, removing the bracket's live TP/SL legs (whose IDs were never captured)
-// so they can't fire against the freshly-flattened position. No-op when the executor
-// doesn't expose a working-orders lookup (e.g. PaperExecutor, whose bracket is
-// flattened to a single entry with no live legs).
+// legPriceTol is the relative tolerance for matching a working order's price to a
+// trade's recorded TP/SL leg. The legs are placed at exactly those prices, so this
+// only absorbs broker-side rounding while staying tight enough to exclude unrelated
+// orders (5 bps ≈ 0.6 pip on EUR/USD).
+const legPriceTol = 0.0005
+
+// cancelBracketLegs cancels a filled trade's redundant TP/SL bracket legs after its
+// position has been flattened, so a leftover leg can't fire against the flat position
+// and open a new one. No-op when the executor doesn't expose a working-orders lookup
+// (e.g. PaperExecutor, whose bracket is flattened to a single entry with no live legs).
 //
-// GetWorkingOrders returns EVERY working order on the account, so it is filtered to
-// the target ticker AND made to skip the current session's known entry orders: a
-// prior-session trade time-exiting must never cancel today's freshly-placed entry
-// stops on the same symbol. The dangling legs we DO want gone were never tracked, so
-// they aren't in the protected set.
-func (s *ORBScheduler) cancelWorkingLegs(ctx context.Context, ticker string) {
+// GetWorkingOrders is account-wide, so cancellation is narrowed three ways to avoid
+// touching unrelated orders: same ticker, NOT one of the current session's known entry
+// orders (protectedOrderIDs), and a price that matches this trade's recorded TP or SL
+// (legPriceMatches — a positive ownership signal). When the gateway exposes no price,
+// legPriceMatches falls back to true so a genuine stale leg is still cancelled rather
+// than left live.
+func (s *ORBScheduler) cancelBracketLegs(ctx context.Context, t store.ORBTrade) {
 	lister, ok := s.executor.(execution.WorkingOrdersLister)
 	if !ok {
 		return
 	}
 	orders, err := lister.GetWorkingOrders(ctx)
 	if err != nil {
-		slog.Warn("orb: time exit: list working orders failed", "ticker", ticker, "err", err)
+		slog.Warn("orb: time exit: list working orders failed", "ticker", t.Ticker, "err", err)
 		return
 	}
 	protected := s.protectedOrderIDs()
 	for _, o := range orders {
-		if o.Ticker != ticker {
+		if o.Ticker != t.Ticker {
 			continue
 		}
 		if _, skip := protected[o.OrderID]; skip {
 			continue
 		}
+		if !legPriceMatches(o, t) {
+			continue
+		}
 		if err := s.executor.CancelOrder(ctx, o.OrderID); err != nil {
-			slog.Warn("orb: time exit: cancel working leg failed",
-				"ticker", ticker, "order_id", o.OrderID, "err", err)
+			slog.Warn("orb: time exit: cancel bracket leg failed",
+				"ticker", t.Ticker, "order_id", o.OrderID, "err", err)
 		}
 	}
+}
+
+// legPriceMatches reports whether a working order corresponds to one of a trade's
+// recorded bracket legs, by comparing the order's limit/stop price to the trade's
+// take-profit and stop-loss within legPriceTol. When the order exposes no usable
+// price it returns true: a stale leg with unknown price must still be cancelled, as
+// leaving it live (to open a new position against a flat book) is the worse outcome.
+func legPriceMatches(o execution.WorkingOrder, t store.ORBTrade) bool {
+	orderPrices := []float64{o.Price, o.StopPrice}
+	hasPrice := false
+	for _, p := range orderPrices {
+		if p > 0 {
+			hasPrice = true
+		}
+	}
+	if !hasPrice {
+		return true // no price info — fall back to cancelling (safer than a live leg)
+	}
+	for _, p := range orderPrices {
+		if p <= 0 {
+			continue
+		}
+		for _, target := range []float64{t.TakeProfit, t.StopLoss} {
+			if target > 0 && math.Abs(p-target)/target < legPriceTol {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isForexInstrument reports whether a ticker is one of this scheduler's configured
+// forex/CFD instruments. Used to scope time exits to trades this scheduler owns,
+// since the orb_trades table is shared with the equities scheduler in combined modes.
+func (s *ORBScheduler) isForexInstrument(ticker string) bool {
+	if s.forexCfg == nil {
+		return false
+	}
+	for _, inst := range s.forexCfg.Instruments {
+		if inst.Symbol == ticker {
+			return true
+		}
+	}
+	return false
 }
 
 // protectedOrderIDs returns the current session's known entry order IDs. These must

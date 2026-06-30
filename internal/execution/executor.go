@@ -75,6 +75,8 @@ type WorkingOrder struct {
 	Side         string  // "buy" | "sell"
 	Status       string  // normalized: pending | partial (only working orders are returned)
 	RemainingQty float64 // quantity still working
+	Price        float64 // limit price (0 if none / not exposed)
+	StopPrice    float64 // stop trigger price (0 if none / not exposed)
 }
 
 // WorkingOrdersLister is an optional Executor capability: it lists the broker's
