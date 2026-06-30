@@ -312,8 +312,8 @@ func Defaults() *Config {
 		ForexORB: ForexORBConfig{
 			Enabled: false,
 			Instruments: []Instrument{
-				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002},
-				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002},
+				{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 240},
+				{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
 			},
 			Session:        "london",
 			Timezone:       "UTC",
@@ -321,6 +321,7 @@ func Defaults() *Config {
 			RiskReward:     2.0,
 			MaxRiskPct:     1.0,
 			MaxPositionPct: 10.0,
+			MaxHoldMinutes: 240, // strategy-level fallback: no ORB trade holds past 4h (prevents overnight holds)
 		},
 		FuturesORB: FuturesORBConfig{
 			Enabled:        false,

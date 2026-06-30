@@ -31,6 +31,28 @@ func (f *ibkrFloat) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// ibkrID decodes an order identifier that the IBKR Client Portal may serialize
+// as a JSON number (1234567) or a quoted string ("1234567"). The
+// /iserver/account/orders endpoint has been observed to use both; String() always
+// renders it without a decimal point so it round-trips into cancel-by-id calls.
+type ibkrID int64
+
+func (id *ibkrID) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if s == "" || s == "null" {
+		*id = 0
+		return nil
+	}
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("ibkrID: parse %q: %w", s, err)
+	}
+	*id = ibkrID(v)
+	return nil
+}
+
+func (id ibkrID) String() string { return strconv.FormatInt(int64(id), 10) }
+
 // IBKRBroker satisfies BrokerView. IBKR Client Portal does not expose a
 // portfolio-history endpoint comparable to Alpaca's, so EquityCurve returns
 // ErrBrokerUnavailable and the web layer falls back to our DB series.
@@ -176,6 +198,64 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 		})
 	}
 	return out, nil
+}
+
+// GetWorkingOrders returns the account's live (still-working) orders from
+// /iserver/account/orders. Only orders that are not terminal (i.e. normalize to
+// pending/partial) are returned — filled, cancelled and inactive rows are dropped.
+// The ORB time-exit uses this to locate and cancel a filled trade's remaining
+// bracket legs by symbol when their child order IDs were never captured.
+func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, error) {
+	// The Client Portal returns {"orders": [...], "snapshot": bool}. A bare array
+	// is also tolerated in case the gateway shape changes.
+	var wrapped struct {
+		Orders []ibkrOrderRow `json:"orders"`
+	}
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &wrapped); err != nil {
+		return nil, fmt.Errorf("ibkr GetWorkingOrders: %w", err)
+	}
+
+	out := make([]WorkingOrder, 0, len(wrapped.Orders))
+	for _, o := range wrapped.Orders {
+		status := NormalizeIBKROrderStatus(o.Status)
+		// Keep only working orders; terminal states are not cancellable legs.
+		if status != "pending" && status != "partial" {
+			continue
+		}
+		conidStr := ""
+		if o.Conid != 0 {
+			conidStr = fmt.Sprintf("%d", o.Conid)
+		}
+		side := "buy"
+		if strings.EqualFold(o.Side, "S") || strings.EqualFold(o.Side, "SELL") {
+			side = "sell"
+		}
+		ticker := o.Ticker
+		if resolved := b.reverseConid(conidStr); conidStr != "" && resolved != conidStr {
+			ticker = resolved
+		}
+		out = append(out, WorkingOrder{
+			OrderID:      o.OrderID.String(),
+			Ticker:       ticker,
+			Conid:        conidStr,
+			Side:         side,
+			Status:       status,
+			RemainingQty: float64(o.RemainingQty),
+		})
+	}
+	return out, nil
+}
+
+// ibkrOrderRow models one row of /iserver/account/orders. The gateway encodes
+// orderId as a number but ticker/side/status as strings; remainingQuantity may be
+// string- or number-encoded, so it reuses ibkrFloat (which tolerates both).
+type ibkrOrderRow struct {
+	OrderID      ibkrID    `json:"orderId"`
+	Conid        int       `json:"conid"`
+	Ticker       string    `json:"ticker"`
+	Side         string    `json:"side"`   // "BUY" | "SELL" (sometimes "B" | "S")
+	Status       string    `json:"status"` // "Submitted" | "PreSubmitted" | "Filled" | ...
+	RemainingQty ibkrFloat `json:"remainingQuantity"`
 }
 
 // RecentFills fetches today's filled orders from /iserver/account/trades.

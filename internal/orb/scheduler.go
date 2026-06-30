@@ -113,6 +113,7 @@ type ORBScheduler struct {
 	backfillFired        bool                     // true once the startup trades-feed backfill has run
 	lastExitReconcileAt  time.Time                // wall time of the last per-tick trades-feed reconcile
 	lastPaperExitCheckAt time.Time                // wall time of the last paper-mode exit-monitor sweep
+	lastTimeExitCheckAt  time.Time                // wall time of the last max-hold time-exit sweep
 	lastScan             time.Time                // Eastern Time of the last successful scan
 	fetchFailures        map[string]int           // ticker → consecutive candle-fetch failures
 	fetchLastAttempt     map[string]time.Time     // ticker → wall time of last candle-fetch attempt
@@ -367,6 +368,13 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	case StateDone:
 		err = s.tickDone(ctx)
 	}
+
+	// Risk-containment backstop: flatten any filled trade past its per-instrument max-hold
+	// limit (exit_type='time_exit'). Runs in every state because a filled bracket outlives
+	// its session, and before reconcileBarReplayExits so a genuinely-open trade is recorded
+	// as a confirmed time exit rather than pre-empted by a replayed TP/stop touch. No-op
+	// outside forex mode or when max-hold is unconfigured. Throttled (see enforceTimeExits).
+	s.enforceTimeExits(ctx)
 
 	// Universal exit backstop: record TP/stop exits for already-filled trades by replaying
 	// their price path from market-data bars. Runs in every state because a bracket's exit
@@ -960,10 +968,21 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	candidates := s.candidates
 	s.mu.Unlock()
 
+	// Don't open a new ORB position on a ticker that still holds an unexited filled
+	// trade from a prior session. Two reasons: it would stack uncontrolled risk on the
+	// same instrument, and — because a time-exit cancels dangling bracket legs by symbol
+	// — a later flatten of the stale trade could otherwise cancel these fresh entries.
+	// The stale trade is flattened by enforceTimeExits, freeing the ticker next session.
+	heldTickers := s.tickersWithOpenFilledTrades(ctx)
+
 	var msgs []string
 	for ticker, buf := range s.rangeBuffers {
 		// Skip tickers that already have brackets placed (e.g. after restart resume).
 		if ids, ok := s.orderIDs[ticker]; ok && (ids[0] != "" || ids[1] != "") {
+			continue
+		}
+		if _, held := heldTickers[ticker]; held {
+			slog.Info("orb: skipping instrument — an unexited filled ORB trade is still open", "ticker", ticker)
 			continue
 		}
 		r := buf.Range()

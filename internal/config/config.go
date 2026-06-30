@@ -536,6 +536,14 @@ type Instrument struct {
 	SecType    string  `yaml:"sec_type"`     // "CASH" (forex) or "CFD" (metals)
 	MinLotSize int     `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
 	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
+
+	// MaxHoldMinutes is the per-instrument hard time limit on a *filled* ORB trade.
+	// When a filled position is older than this, the scheduler cancels its remaining
+	// bracket legs, flattens at market, and records exit_type='time_exit'. This caps
+	// the multi-day-hold tail that dominated realized losses. 0 inherits the
+	// strategy-level ForexORBConfig.MaxHoldMinutes; when both are 0 time exits are
+	// disabled for this instrument and trades run until their bracket resolves.
+	MaxHoldMinutes int `yaml:"max_hold_minutes"`
 }
 
 // ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
@@ -548,6 +556,27 @@ type ForexORBConfig struct {
 	RiskReward     float64      `yaml:"risk_reward"`
 	MaxRiskPct     float64      `yaml:"max_risk_pct"`
 	MaxPositionPct float64      `yaml:"max_position_pct"`
+
+	// MaxHoldMinutes is the strategy-level default time limit on a filled ORB trade,
+	// applied to any instrument that does not set its own Instrument.MaxHoldMinutes.
+	// 0 leaves time exits disabled unless an instrument opts in. See Instrument.MaxHoldMinutes.
+	MaxHoldMinutes int `yaml:"max_hold_minutes"`
+}
+
+// EffectiveMaxHoldMinutes returns the resolved max-hold limit for a symbol:
+// the instrument's own value when set, otherwise the strategy-level default.
+// 0 means time exits are disabled for that symbol. An unknown symbol falls back
+// to the strategy default so a stray filled position is still capped.
+func (c ForexORBConfig) EffectiveMaxHoldMinutes(symbol string) int {
+	for _, inst := range c.Instruments {
+		if inst.Symbol == symbol {
+			if inst.MaxHoldMinutes > 0 {
+				return inst.MaxHoldMinutes
+			}
+			break
+		}
+	}
+	return c.MaxHoldMinutes
 }
 
 // FuturesInstrument defines a single exchange-listed futures contract for ORB.
