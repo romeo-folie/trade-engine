@@ -573,9 +573,17 @@ type Instrument struct {
 	// MaxSpreadToRisk rejects a session when the current bid/ask spread is too large
 	// relative to the planned stop distance: spread / |entry_stop - stop_loss|. 0 disables.
 	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
-}
 
-// ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
+	// BreakoutConfirmation (Phase 3) decides what counts as a breakout before entering:
+	//   "" | "stop_touch" — current behaviour: a resting stop fills the instant price
+	//                       touches the breakout level (fills on a wick).
+	//   "close_1m"        — require one 1-minute close beyond the breakout level.
+	//   "close_3m"        — require three consecutive 1-minute closes beyond it (the
+	//                       breakout must hold ~3 minutes), filtering false breakouts.
+	// Confirmation trades enter later and at a worse price than a stop touch, in exchange
+	// for a stronger signal. Default stop_touch preserves current behaviour.
+	BreakoutConfirmation string `yaml:"breakout_confirmation"`
+}
 type ForexORBConfig struct {
 	Enabled        bool         `yaml:"enabled"`
 	Instruments    []Instrument `yaml:"instruments"`

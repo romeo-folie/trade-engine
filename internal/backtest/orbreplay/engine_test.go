@@ -381,3 +381,48 @@ func TestReplay_SpreadFilterVariant(t *testing.T) {
 		}
 	})
 }
+
+func TestReplay_ConfirmedVariant(t *testing.T) {
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	// close_1m confirmation; entry-quality bounds left at 0 so only confirmation matters.
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, BreakoutConfirmation: "close_1m"}
+	run := func(candles []data.Candle) ([]SimTrade, error) {
+		e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+		return e.Run(context.Background(), Confirmed(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	}
+
+	t.Run("wick touch that closes inside does not confirm", func(t *testing.T) {
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1011), // high 1.1015 ≥ entry 1.1012 (a touch) but close 1.1011 inside
+			cdl(16, 1.1011, 1.1011, 1.1009, 1.1010), // stays inside
+		)
+		trades, err := run(candles)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (a wick that closes inside must not confirm — stop_touch would have entered)", len(trades))
+		}
+	})
+
+	t.Run("a close beyond confirms and enters at the close", func(t *testing.T) {
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1016, 1.1008, 1.1014), // close 1.1014 ≥ entry 1.1012 → confirm buy
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		trades, err := run(candles)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 || trades[0].ExitType != "tp" {
+			t.Fatalf("got %+v; want one tp trade", trades)
+		}
+		// Confirmation enters at the confirming close (1.1014 + half-spread), worse than
+		// the stop-touch level 1.1012 — the cost of waiting for confirmation.
+		if trades[0].EntryPrice <= 1.1012 {
+			t.Errorf("EntryPrice = %v; want > 1.1012 (entered at the confirming close, not the breakout level)", trades[0].EntryPrice)
+		}
+	})
+}

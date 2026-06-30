@@ -984,8 +984,12 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	heldTickers := s.tickersWithOpenFilledTrades(ctx)
 
 	var msgs []string
+	// pendingConfirmation becomes true when a confirmation-mode ticker has not yet
+	// confirmed its breakout; the session then stays in Executing and retries next tick.
+	pendingConfirmation := false
 	for ticker, buf := range s.rangeBuffers {
-		// Skip tickers that already have brackets placed (e.g. after restart resume).
+		// Skip tickers that already have brackets placed (e.g. after restart resume, or a
+		// confirmation that fired on an earlier tick).
 		if ids, ok := s.orderIDs[ticker]; ok && (ids[0] != "" || ids[1] != "") {
 			continue
 		}
@@ -1040,6 +1044,26 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			if ok, ratio, reason := s.passesSpread(ctx, ticker, buyParams.EntryStop, buyParams.StopLoss, inst.MaxSpreadToRisk); !ok {
 				slog.Info("orb: skipping instrument — spread too wide", "ticker", ticker, "ratio", ratio, "reason", reason)
 				continue
+			}
+
+			// Breakout confirmation (Phase 3). With stop_touch (default) we place resting
+			// stops now and the broker fills on a touch. With a close_* mode we instead WAIT:
+			// each tick, replay the 1-min candles since the range locked and only place once
+			// a confirmed close prints — then place ONLY the confirmed side (zero the other so
+			// the placement loop below skips it). No confirmation yet → leave the ticker
+			// unplaced and keep the session in Executing (pendingConfirmation) to retry next tick.
+			if RequiresConfirmation(inst.BreakoutConfirmation) {
+				side := s.confirmedSide(ctx, ticker, r, buyParams, sellParams, inst.BreakoutConfirmation)
+				if side == "" {
+					pendingConfirmation = true
+					continue
+				}
+				slog.Info("orb: breakout confirmed", "ticker", ticker, "side", side, "mode", inst.BreakoutConfirmation)
+				if side == "buy" {
+					sellParams.Qty = 0
+				} else {
+					buyParams.Qty = 0
+				}
 			}
 
 			var ids [2]string
@@ -1173,6 +1197,14 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 
 	if len(msgs) > 0 {
 		s.notify(ctx, "ORB Brackets Placed:\n"+strings.Join(msgs, "\n"))
+	}
+
+	// Stay in Executing while a confirmation-mode ticker is still being watched and the
+	// entry window is open — the breakout-watch re-runs next tick. Once everything has
+	// confirmed/placed (or the entry window closes, cancelling unconfirmed setups), fall
+	// through to Done and let tickDone clean up.
+	if pendingConfirmation && s.withinEntryWindow() {
+		return nil
 	}
 
 	s.setState(StateDone)

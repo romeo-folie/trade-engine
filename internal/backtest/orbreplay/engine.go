@@ -27,6 +27,7 @@ type Variant struct {
 	Name              string
 	MaxHoldMinutes    int  // 0 = hold until the bracket resolves (baseline)
 	ApplyEntryFilters bool // apply the Phase 2 entry-quality gates (ATR range + spread/risk)
+	ApplyConfirmation bool // require per-instrument breakout confirmation (Phase 3) instead of a touch
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -44,6 +45,13 @@ func TimeExit(maxHold int) Variant {
 }
 func RangeFilter(maxHold int) Variant {
 	return Variant{Name: "range-filter", MaxHoldMinutes: maxHold, ApplyEntryFilters: true}
+}
+
+// Confirmed is range-filter plus per-instrument breakout confirmation (Phase 3): the
+// entry waits for the configured BreakoutConfirmation (close_1m/close_3m) instead of
+// firing on a touch. Mirrors the live breakout-watch path.
+func Confirmed(maxHold int) Variant {
+	return Variant{Name: "confirmed", MaxHoldMinutes: maxHold, ApplyEntryFilters: true, ApplyConfirmation: true}
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -203,14 +211,38 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		}
 	}
 
-	// Find the first breakout within the live entry window (orders are cancelled
+	// Resolve the entry within the live entry window (orders are cancelled
 	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
 	// the side that triggers first produces a trade.
 	entryDeadline := sessionOpen.Add(entryWindowMinutes * time.Minute)
-	side, entryIdx, ok := firstBreakout(watch, buy, sell, entryDeadline)
-	if !ok {
-		return nil, nil // range never broke within the entry window
+	inWindow := candlesBefore(watch, entryDeadline)
+
+	var side string
+	var entryIdx int
+	var entryMid float64
+	if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {
+		// Confirmation enters at the confirming candle's close (market on confirmation),
+		// not at the breakout level — a later, worse fill in exchange for a stronger signal.
+		var ok bool
+		side, entryIdx, ok = orb.DetectConfirmation(inst.BreakoutConfirmation, inWindow, buy.EntryStop, sell.EntryStop)
+		if !ok {
+			return nil, nil // breakout never confirmed within the entry window
+		}
+		entryMid = watch[entryIdx].Close
+	} else {
+		var ok bool
+		side, entryIdx, ok = firstBreakout(inWindow, buy, sell, entryDeadline)
+		if !ok {
+			return nil, nil // range never broke within the entry window
+		}
+		// A stop entry fills at the breakout level.
+		if side == "buy" {
+			entryMid = buy.EntryStop
+		} else {
+			entryMid = sell.EntryStop
+		}
 	}
+
 	params := buy
 	if side == "sell" {
 		params = sell
@@ -219,11 +251,23 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		return nil, nil // min lot exceeds the position cap for this instrument
 	}
 
-	trade := e.resolveTrade(v, inst, params, watch, entryIdx)
+	trade := e.resolveTrade(v, inst, params, entryMid, watch, entryIdx)
 	if trade == nil {
 		return nil, nil
 	}
 	return []SimTrade{*trade}, nil
+}
+
+// candlesBefore returns the prefix of watch whose timestamps precede the deadline. Index
+// positions are preserved (it's a prefix), so an index into the result is also an index
+// into watch.
+func candlesBefore(watch []data.Candle, deadline time.Time) []data.Candle {
+	for i, c := range watch {
+		if !c.Timestamp.Before(deadline) {
+			return watch[:i]
+		}
+	}
+	return watch
 }
 
 // resolveTrade simulates entry fill and exit for a triggered breakout starting at
@@ -234,14 +278,15 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 // order is unknown, so this assumes the adverse fill (conservative — it avoids the
 // optimistic bias of holding a same-bar stop into a later recovery). A favorable
 // same-bar move to TP is NOT credited; it resolves on subsequent bars instead.
-func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, watch []data.Candle, entryIdx int) *SimTrade {
+func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid float64, watch []data.Candle, entryIdx int) *SimTrade {
 	cost := e.costFor(inst.Symbol)
 	half := cost.Spread / 2
 
 	entryBar := watch[entryIdx]
 	entryTime := entryBar.Timestamp
-	// A stop entry fills at the trigger price, paying the spread (buy at ask, sell at bid).
-	entryFill := p.EntryStop
+	// Fill at entryMid (the breakout level for a stop touch, or the confirming candle's
+	// close for a confirmation entry), paying the spread (buy at ask, sell at bid).
+	entryFill := entryMid
 	if p.Side == "buy" {
 		entryFill += half
 	} else {
