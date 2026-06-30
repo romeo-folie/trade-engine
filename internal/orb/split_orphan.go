@@ -65,9 +65,12 @@ func (s *ORBScheduler) cancelOrphanedSplitEntries(ctx context.Context) {
 
 	for _, orderID := range orphanedSplitEntries(pending, trades) {
 		ticker := pending[orderID]
-		// Guard: if the entry has in fact just filled at the broker (a real position the OCO
-		// block will persist next tick), do NOT cancel it.
-		if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
+		// Guard: if the entry has in fact filled — fully OR partially — at the broker, it is a
+		// REAL position, not an orphaned pending entry. Skip it: cancelling here would cancel
+		// the live remainder and (worse) mark the DB row cancelled, hiding the filled exposure
+		// from exit reconciliation. The OCO / exit reconcilers own a filled position.
+		if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil &&
+			(res.Status == "filled" || res.Status == "partial") {
 			continue
 		}
 		slog.Info("orb: cancelling orphaned split entry — a sibling leg already exited",

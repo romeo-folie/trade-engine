@@ -210,6 +210,66 @@ func TestGetORBStats_PartialCancelledStillCounts(t *testing.T) {
 	}
 }
 
+// TestGetORBStats_PartialOnlyCloseUsesPartialExit verifies that when ONLY the partial leg
+// realised (the runner entry was cancelled as an orphan and never closed), the trade's
+// exit_type/source fall back to the partial's — so the realised win still lands in the TP
+// (and broker) bucket rather than vanishing from the exit breakdown.
+func TestGetORBStats_PartialOnlyCloseUsesPartialExit(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	const ticker = "TESTPO/USD"
+
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "sydney")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	runnerID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: ticker, Side: "buy",
+		EntryStop: 1.10, StopLoss: 1.09, TakeProfit: 1.12, Qty: 6000,
+		Status: "pending", ScaleOutRole: "runner",
+	})
+	if err != nil {
+		t.Fatalf("create runner: %v", err)
+	}
+	partialID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: ticker, Side: "buy",
+		EntryStop: 1.10, StopLoss: 1.09, TakeProfit: 1.11, Qty: 4000,
+		Status: "filled", ScaleOutRole: "partial", ScaleOutParentID: &runnerID,
+	})
+	if err != nil {
+		t.Fatalf("create partial: %v", err)
+	}
+
+	// Runner entry never filled → cancelled as an orphan; the partial took its TP for +50.
+	if _, err := db.Exec(ctx, `UPDATE orb_trades SET status='cancelled' WHERE id=$1`, runnerID); err != nil {
+		t.Fatalf("cancel runner: %v", err)
+	}
+	if err := store.CloseORBTrade(ctx, db, partialID, "tp", "broker", 1.11, 50.0); err != nil {
+		t.Fatalf("close partial: %v", err)
+	}
+
+	stats, err := store.GetORBStats(ctx, db)
+	if err != nil {
+		t.Fatalf("GetORBStats: %v", err)
+	}
+	row := findStat(stats, ticker)
+	if row == nil {
+		t.Fatalf("realised partial-only trade vanished from stats")
+	}
+	if row.Closed != 1 || row.Wins != 1 || row.TotalPnL != 50.0 {
+		t.Errorf("got closed=%d wins=%d pnl=%v; want 1/1/50", row.Closed, row.Wins, row.TotalPnL)
+	}
+	if row.TPExits != 1 {
+		t.Errorf("TPExits = %d; want 1 (exit falls back to the partial leg)", row.TPExits)
+	}
+	if row.BrokerExits != 1 {
+		t.Errorf("BrokerExits = %d; want 1 (partial's broker source)", row.BrokerExits)
+	}
+}
+
 func findStat(stats []store.ORBStats, ticker string) *store.ORBStats {
 	for i := range stats {
 		if stats[i].Ticker == ticker {

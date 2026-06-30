@@ -406,8 +406,18 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 		           bool_or(status='filled')                                   AS any_filled,
 		           bool_or(status IN ('closed','filled'))                     AS active,
 		           COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)       AS pnl,
-		           MAX(exit_type)   FILTER (WHERE COALESCE(scale_out_role,'') <> 'partial') AS exit_type,
-		           MAX(exit_source) FILTER (WHERE COALESCE(scale_out_role,'') <> 'partial') AS exit_source
+		           -- The trade's exit is characterised by the non-partial (runner / ordinary)
+		           -- leg's exit. But if that leg never closed — e.g. the runner entry was
+		           -- cancelled as an orphan and only the partial realised — fall back to the
+		           -- closed leg's exit so the realised trade still lands in a tp/stop bucket.
+		           COALESCE(
+		               MAX(exit_type) FILTER (WHERE status='closed' AND COALESCE(scale_out_role,'') <> 'partial'),
+		               MAX(exit_type) FILTER (WHERE status='closed')
+		           ) AS exit_type,
+		           COALESCE(
+		               MAX(exit_source) FILTER (WHERE status='closed' AND COALESCE(scale_out_role,'') <> 'partial'),
+		               MAX(exit_source) FILTER (WHERE status='closed')
+		           ) AS exit_source
 		    FROM orb_trades
 		    GROUP BY COALESCE(scale_out_parent_id, id)
 		)
