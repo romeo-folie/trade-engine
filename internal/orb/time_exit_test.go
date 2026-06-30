@@ -22,6 +22,14 @@ type flattenExec struct {
 
 	placed    []execution.OrderRequest
 	cancelled []string
+
+	replaceErr error
+	replaced   []stopReplace
+}
+
+type stopReplace struct {
+	orderID string
+	newStop float64
 }
 
 func (e *flattenExec) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
@@ -43,6 +51,13 @@ func (e *flattenExec) GetAccount(_ context.Context) (execution.AccountInfo, erro
 }
 func (e *flattenExec) GetWorkingOrders(_ context.Context) ([]execution.WorkingOrder, error) {
 	return e.working, nil
+}
+func (e *flattenExec) ReplaceStopOrder(_ context.Context, orderID string, newStop float64) (execution.OrderResult, error) {
+	if e.replaceErr != nil {
+		return execution.OrderResult{}, e.replaceErr
+	}
+	e.replaced = append(e.replaced, stopReplace{orderID: orderID, newStop: newStop})
+	return execution.OrderResult{BrokerOrderID: orderID, Status: "pending"}, nil
 }
 
 // ─── shouldTimeExit ───────────────────────────────────────────────────────────

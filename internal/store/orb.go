@@ -50,6 +50,11 @@ type ORBTrade struct {
 	// actually closes (TP/stop/expiry), so it stays nil while a trade is open.
 	FilledAt *time.Time
 	ClosedAt *time.Time
+	// StopMovedAt is the time the protective stop was first moved by adaptive stop
+	// management (break-even / trailing); nil means never moved (stop_loss is still the
+	// original placement stop). The bar-replay backstop reads it to avoid replaying the
+	// stop leg at a moved level over pre-move bars. Populated by GetOpenFilledORBTrades.
+	StopMovedAt *time.Time
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -189,6 +194,23 @@ func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSour
 	return err
 }
 
+// UpdateORBTradeStopLoss records a moved stop on a still-open trade (adaptive break-even /
+// trailing). Guarded on status='filled' so it never touches a closed row. The canonical
+// stop_loss must track the live broker stop so the next adaptive sweep ratchets from it.
+//
+// It also stamps stop_moved_at with the FIRST move time (COALESCE keeps the earliest), the
+// boundary after which stop_loss no longer equals the original placement stop. The
+// bar-replay backstop reads stop_moved_at to stop fabricating stop-outs at a level the
+// stop had not yet reached at the replayed bar's time (see migration 035).
+func UpdateORBTradeStopLoss(ctx context.Context, db *pgxpool.Pool, id string, stopLoss float64, movedAt time.Time) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		   SET stop_loss=$1, stop_moved_at=COALESCE(stop_moved_at, $3)
+		 WHERE id=$2 AND status='filled'`,
+		stopLoss, id, movedAt)
+	return err
+}
+
 // CloseORBTradeAt is like CloseORBTrade but stamps closed_at with an explicit time
 // rather than NOW(). The bar-replay reconciler uses it so a trade closed from a
 // historical price path records the actual bar timestamp at which its TP/stop was
@@ -296,7 +318,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
-		       created_at, filled_at, closed_at
+		       created_at, filled_at, closed_at, stop_moved_at
 		FROM orb_trades WHERE status='filled'
 		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
@@ -314,7 +336,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
-			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
 		); err != nil {
 			return nil, err
 		}

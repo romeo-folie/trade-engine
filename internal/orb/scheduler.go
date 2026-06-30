@@ -101,25 +101,26 @@ type ORBScheduler struct {
 	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
 	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
 
-	mu                   sync.Mutex // protects state, session, candidates for TUI reads
-	state                State
-	session              *store.ORBSession
-	candidates           []ScoredCandidate
-	rangeBuffers         map[string]*RangeBuffer
-	orderIDs             map[string][2]string     // ticker → [buyOrderID, sellOrderID]
-	trackedTrades        map[string]*trackedTrade // entry order ID → trade context + exit state
-	reconciledSessions   map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
-	backfilledSessions   map[string]struct{}      // session IDs already processed by backfillRecentExits
-	backfillFired        bool                     // true once the startup trades-feed backfill has run
-	lastExitReconcileAt  time.Time                // wall time of the last per-tick trades-feed reconcile
-	lastPaperExitCheckAt time.Time                // wall time of the last paper-mode exit-monitor sweep
-	lastTimeExitCheckAt  time.Time                // wall time of the last max-hold time-exit sweep
-	lastOrphanLegCheckAt time.Time                // wall time of the last orphan-leg reconcile
-	alertedOrphanLegs    map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
-	directionDecisions   map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
-	lastScan             time.Time                // Eastern Time of the last successful scan
-	fetchFailures        map[string]int           // ticker → consecutive candle-fetch failures
-	fetchLastAttempt     map[string]time.Time     // ticker → wall time of last candle-fetch attempt
+	mu                      sync.Mutex // protects state, session, candidates for TUI reads
+	state                   State
+	session                 *store.ORBSession
+	candidates              []ScoredCandidate
+	rangeBuffers            map[string]*RangeBuffer
+	orderIDs                map[string][2]string     // ticker → [buyOrderID, sellOrderID]
+	trackedTrades           map[string]*trackedTrade // entry order ID → trade context + exit state
+	reconciledSessions      map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
+	backfilledSessions      map[string]struct{}      // session IDs already processed by backfillRecentExits
+	backfillFired           bool                     // true once the startup trades-feed backfill has run
+	lastExitReconcileAt     time.Time                // wall time of the last per-tick trades-feed reconcile
+	lastPaperExitCheckAt    time.Time                // wall time of the last paper-mode exit-monitor sweep
+	lastTimeExitCheckAt     time.Time                // wall time of the last max-hold time-exit sweep
+	lastAdaptiveStopCheckAt time.Time                // wall time of the last adaptive-stop (break-even/trailing) sweep
+	lastOrphanLegCheckAt    time.Time                // wall time of the last orphan-leg reconcile
+	alertedOrphanLegs       map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
+	directionDecisions      map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
+	lastScan                time.Time                // Eastern Time of the last successful scan
+	fetchFailures           map[string]int           // ticker → consecutive candle-fetch failures
+	fetchLastAttempt        map[string]time.Time     // ticker → wall time of last candle-fetch attempt
 }
 
 // trackedTrade holds per-order context needed to observe the full trade lifecycle.
@@ -380,6 +381,12 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// as a confirmed time exit rather than pre-empted by a replayed TP/stop touch. No-op
 	// outside forex mode or when max-hold is unconfigured. Throttled (see enforceTimeExits).
 	s.enforceTimeExits(ctx)
+
+	// Adaptive stop management (Phase 4 live): ratchet break-even / trailing stops on filled
+	// forex trades whose instrument opts in. No-op when no instrument configures it. Runs
+	// AFTER enforceTimeExits so a trade past max-hold is flattened rather than having its
+	// stop pointlessly nudged the same tick. Throttled (see enforceAdaptiveStops).
+	s.enforceAdaptiveStops(ctx)
 
 	// Cross-tick cleanup of bracket legs left live after a time exit (the inline cancel
 	// is best-effort; this retries off the working-order list, decoupled from the now-closed
@@ -1703,7 +1710,17 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 			continue // window not open yet — retry next sweep
 		}
 
-		res, rErr := ResolveExitViaBarReplay(ctx, s.marketData, t.Ticker, t.Side, t.StopLoss, t.TakeProfit, from, to, now)
+		// Once adaptive stop management has moved the stop, t.StopLoss no longer reflects the
+		// level that was live across the whole post-fill window — replaying it would fabricate
+		// a stop-out at the moved level over bars the stop had not yet reached (see migration
+		// 035). Disable the stop leg (0 ⇒ resolveExitFromCandles skips it) and replay only the
+		// immutable take-profit; the stop side is owned by the live broker order and captured
+		// by the trades-feed reconciler and the time-exit backstop.
+		replayStop := t.StopLoss
+		if t.StopMovedAt != nil {
+			replayStop = 0
+		}
+		res, rErr := ResolveExitViaBarReplay(ctx, s.marketData, t.Ticker, t.Side, replayStop, t.TakeProfit, from, to, now)
 		if rErr != nil {
 			slog.Warn("orb: bar replay: fetch candles failed", "ticker", t.Ticker, "err", rErr)
 			continue

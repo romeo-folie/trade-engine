@@ -1,0 +1,22 @@
+-- 035_orb_stop_moved_at.sql
+--
+-- Records WHEN a trade's protective stop was first moved by adaptive stop
+-- management (live break-even / trailing). NULL means the stop has never been
+-- moved and `stop_loss` still equals the original placement stop.
+--
+-- This exists to keep the bar-replay exit backstop honest. reconcileBarReplayExits
+-- replays the price path from filled_at against the trade's CURRENT stop_loss. Once
+-- an adaptive move has rewritten stop_loss (e.g. to break-even), replaying that
+-- single value over the whole post-fill window would treat the moved stop as if it
+-- had existed since the fill — and an earlier pullback that never touched the
+-- ORIGINAL (wider) stop would be fabricated as a stop-out at the moved level, at the
+-- wrong time and price, then frozen by the status='filled' close guard.
+--
+-- With this column set, the replay stops modelling the stop leg for that trade and
+-- replays only the immutable take-profit leg; the stop side is owned by the live
+-- broker order and captured by the trades-feed reconciler and the time-exit backstop.
+--
+-- Single-file (no .down) by convention: the migration runner globs every *.sql file,
+-- so a .down.sql would be applied forward. The statement is idempotent.
+
+ALTER TABLE orb_trades ADD COLUMN IF NOT EXISTS stop_moved_at TIMESTAMPTZ;
