@@ -391,16 +391,17 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 	// id; a runner or an ordinary trade → its own id). A logical trade is "closed" only when
 	// all its legs are, and "open" while any leg is still filled; exit_type/source come from
 	// the non-partial (runner / ordinary) leg.
-	// A logical trade is DONE when every leg is terminal (closed OR cancelled) — a partial
-	// that never filled and got cancelled must not keep its realized runner out of the stats.
-	// It counts as a completed trade when done AND at least one leg actually closed (realized
-	// an exit); its PnL/exit come from the closed leg(s). It is still OPEN while any leg is
+	// A logical trade is DONE when every leg is terminal (closed, cancelled, or expired) — a
+	// sibling leg that never filled may be cancelled at cleanup OR marked 'expired' by the
+	// stale-session sweep; either must not keep its realized runner out of the stats. It
+	// counts as a completed trade when done AND at least one leg actually closed (realized an
+	// exit); its PnL/exit come from the closed leg(s). It is still OPEN while any leg is
 	// filled (working).
 	rows, err := db.Query(ctx, `
 		WITH logical AS (
 		    SELECT COALESCE(scale_out_parent_id, id)                          AS trade_id,
 		           MIN(ticker)                                                AS ticker,
-		           bool_and(status IN ('closed','cancelled'))                 AS all_done,
+		           bool_and(status IN ('closed','cancelled','expired'))       AS all_done,
 		           bool_or(status='closed')                                   AS any_closed,
 		           bool_or(status='filled')                                   AS any_filled,
 		           bool_or(status IN ('closed','filled'))                     AS active,

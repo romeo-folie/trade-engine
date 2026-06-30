@@ -289,6 +289,13 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 		// COALESCE(scale_out_parent_id, id) (the partial → its runner, everything else →
 		// itself) sums their PnL and notional so feedback counts one trade with the combined
 		// result — matching GetORBStats — instead of two leg rows that skew win_rate/count.
+		//
+		// KNOWN LIMITATION: the fold only spans the rows GetClosedORBTradesByDateRange returns
+		// for THIS window. If a partial closes just before the nightly boundary and the runner
+		// the next day, the two legs land in adjacent windows and are each learned once — the
+		// logical trade is counted twice. A precise fix would assemble the full group and emit
+		// it once all legs are terminal under a logical close date; for a nightly trend signal
+		// (not exact bookkeeping) the boundary-straddle skew is small and accepted here.
 		type orbLogical struct {
 			ticker   string
 			pnl      float64
