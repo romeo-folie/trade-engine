@@ -396,6 +396,10 @@ orb:
 #       min_range_atr: 0.25
 #       max_range_atr: 0.90
 #       max_spread_to_risk: 0.08
+#       # Breakout confirmation (Phase 3): "" / stop_touch (default, fills on a touch),
+#       # close_1m (one 1-min close beyond), or close_3m (3 consecutive closes beyond,
+#       # filters false breakouts). Confirmation enters later at a worse price.
+#       breakout_confirmation: close_1m
 #     - symbol: GBP/USD
 #       sec_type: CASH
 #       min_lot_size: 20000

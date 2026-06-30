@@ -1,10 +1,12 @@
 package orb
 
 import (
+	"context"
 	"math"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
 func TestComputeBracketBuy(t *testing.T) {
@@ -115,5 +117,39 @@ func TestComputeBracketMinQty(t *testing.T) {
 	// Risk per share is huge, max risk is tiny → qty floors to 0 but min is 1
 	if p.Qty != 1 {
 		t.Errorf("Qty = %d, want 1 (minimum)", p.Qty)
+	}
+}
+
+func TestPlaceBracket_OrderShapes(t *testing.T) {
+	// Stop-touch entry: a STOP bracket at the breakout level.
+	stopExec := &flattenExec{placeResult: execution.OrderResult{BrokerOrderID: "o1"}}
+	_, _, _, err := PlaceBracket(context.Background(), stopExec, BracketParams{
+		Ticker: "EUR/USD", Side: "buy", Qty: 5000, EntryStop: 1.1012, StopLoss: 1.0998, TakeProfit: 1.1040,
+	})
+	if err != nil {
+		t.Fatalf("PlaceBracket: %v", err)
+	}
+	if len(stopExec.placed) != 1 {
+		t.Fatalf("placed %d; want 1", len(stopExec.placed))
+	}
+	if got := stopExec.placed[0]; got.Type != execution.OrderTypeStop || got.StopPrice != 1.1012 || got.OrderClass != "bracket" {
+		t.Errorf("stop bracket = type %q stop %.4f class %q; want stop/1.1012/bracket", got.Type, got.StopPrice, got.OrderClass)
+	}
+
+	// Confirmation entry: a MARKET bracket — no resting stop at the breakout level (which
+	// would re-fill on a pullback wick, defeating confirmation).
+	mktExec := &flattenExec{placeResult: execution.OrderResult{BrokerOrderID: "o2"}}
+	_, _, _, err = PlaceMarketBracket(context.Background(), mktExec, BracketParams{
+		Ticker: "EUR/USD", Side: "buy", Qty: 5000, EntryStop: 1.1012, StopLoss: 1.0998, TakeProfit: 1.1040,
+	})
+	if err != nil {
+		t.Fatalf("PlaceMarketBracket: %v", err)
+	}
+	if got := mktExec.placed[0]; got.Type != execution.OrderTypeMarket || got.StopPrice != 0 || got.OrderClass != "bracket" {
+		t.Errorf("market bracket = type %q stop %.4f class %q; want market/0/bracket", got.Type, got.StopPrice, got.OrderClass)
+	}
+	// The protective TP/SL legs are still set on the market bracket.
+	if mktExec.placed[0].StopLossPrice != 1.0998 || mktExec.placed[0].TakeProfitPrice != 1.1040 {
+		t.Errorf("market bracket legs = sl %.4f tp %.4f; want 1.0998/1.1040", mktExec.placed[0].StopLossPrice, mktExec.placed[0].TakeProfitPrice)
 	}
 }

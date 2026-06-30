@@ -614,3 +614,30 @@ func TestForexORBEffectiveMaxHoldMinutes(t *testing.T) {
 		t.Errorf("EffectiveMaxHoldMinutes with no config = %d; want 0 (disabled)", got)
 	}
 }
+
+func TestValidateForexBreakoutConfirmation(t *testing.T) {
+	cfg := Defaults()
+	cfg.ForexORB.Enabled = true
+	cfg.ForexORB.Instruments = []Instrument{
+		{Symbol: "EUR/USD", BreakoutConfirmation: "close_1m"}, // valid
+		{Symbol: "GBP/USD", BreakoutConfirmation: "close_3"},  // typo → must error
+	}
+	errs := Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "GBP/USD") && strings.Contains(e, "breakout_confirmation") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected a validation error for the invalid breakout_confirmation; got %v", errs)
+	}
+
+	// A valid set produces no confirmation error.
+	cfg.ForexORB.Instruments[1].BreakoutConfirmation = "stop_touch"
+	for _, e := range Validate(cfg) {
+		if strings.Contains(e, "breakout_confirmation") {
+			t.Errorf("unexpected breakout_confirmation error for valid config: %s", e)
+		}
+	}
+}

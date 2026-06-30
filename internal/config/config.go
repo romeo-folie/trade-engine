@@ -573,9 +573,17 @@ type Instrument struct {
 	// MaxSpreadToRisk rejects a session when the current bid/ask spread is too large
 	// relative to the planned stop distance: spread / |entry_stop - stop_loss|. 0 disables.
 	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
-}
 
-// ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
+	// BreakoutConfirmation (Phase 3) decides what counts as a breakout before entering:
+	//   "" | "stop_touch" — current behaviour: a resting stop fills the instant price
+	//                       touches the breakout level (fills on a wick).
+	//   "close_1m"        — require one 1-minute close beyond the breakout level.
+	//   "close_3m"        — require three consecutive 1-minute closes beyond it (the
+	//                       breakout must hold ~3 minutes), filtering false breakouts.
+	// Confirmation trades enter later and at a worse price than a stop touch, in exchange
+	// for a stronger signal. Default stop_touch preserves current behaviour.
+	BreakoutConfirmation string `yaml:"breakout_confirmation"`
+}
 type ForexORBConfig struct {
 	Enabled        bool         `yaml:"enabled"`
 	Instruments    []Instrument `yaml:"instruments"`
@@ -1258,6 +1266,20 @@ func Validate(cfg *Config) []string {
 		}
 		if cfg.ORB.Mode != "paper" && cfg.ORB.Mode != "live" {
 			errs = append(errs, "orb.mode must be paper or live")
+		}
+	}
+
+	// Validate forex ORB per-instrument breakout_confirmation so a typo (e.g. "close_3")
+	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
+	// wick-touch entries Phase 3 is meant to filter.
+	if cfg.ForexORB.Enabled {
+		validConfirm := map[string]bool{"": true, "stop_touch": true, "close_1m": true, "close_3m": true}
+		for _, inst := range cfg.ForexORB.Instruments {
+			if !validConfirm[inst.BreakoutConfirmation] {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m",
+					inst.Symbol, inst.BreakoutConfirmation))
+			}
 		}
 	}
 

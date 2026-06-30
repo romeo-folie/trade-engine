@@ -211,17 +211,33 @@ func ComputeFuturesBracket(r *OpeningRange, side string, portfolioValue float64,
 // Returns the parent entry order ID plus the take-profit and stop-loss child
 // order IDs (both empty when the broker doesn't expose child IDs, e.g. Alpaca).
 func PlaceBracket(ctx context.Context, executor execution.Executor, params BracketParams) (parentID, tpOrderID, slOrderID string, err error) {
+	return placeBracket(ctx, executor, params, execution.OrderTypeStop)
+}
+
+// PlaceMarketBracket places a bracket whose PARENT is a market order — used for breakout
+// confirmation entries (Phase 3). Once a close has confirmed the breakout the strategy
+// enters at market, rather than resting a stop at the breakout level: a resting stop would
+// re-fill on a later pullback wick to that level, the exact false-breakout the confirmation
+// was meant to filter. The TP/SL child legs are unchanged.
+func PlaceMarketBracket(ctx context.Context, executor execution.Executor, params BracketParams) (parentID, tpOrderID, slOrderID string, err error) {
+	return placeBracket(ctx, executor, params, execution.OrderTypeMarket)
+}
+
+func placeBracket(ctx context.Context, executor execution.Executor, params BracketParams, orderType execution.OrderType) (parentID, tpOrderID, slOrderID string, err error) {
 	req := execution.OrderRequest{
 		Ticker:          params.Ticker,
 		Side:            execution.OrderSide(params.Side),
-		Type:            execution.OrderTypeStop,
+		Type:            orderType,
 		Quantity:        float64(params.Qty),
-		StopPrice:       params.EntryStop,
 		OrderClass:      "bracket",
 		TakeProfitPrice: params.TakeProfit,
 		StopLossPrice:   params.StopLoss,
 		SecType:         params.SecType,
 		TradeID:         fmt.Sprintf("orb-%s-%d", params.Ticker, time.Now().UnixMilli()),
+	}
+	// A stop-entry bracket triggers at the breakout level; a market parent fills now.
+	if orderType == execution.OrderTypeStop {
+		req.StopPrice = params.EntryStop
 	}
 	result, err := executor.PlaceOrder(ctx, req)
 	if err != nil {
