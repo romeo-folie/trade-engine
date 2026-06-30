@@ -619,3 +619,26 @@ func TestReplay_AdaptivePartial_SubLotSkipped(t *testing.T) {
 		t.Errorf("Commission = %v; want 4.0 (sub-lot partial must not produce a third fill)", trades[0].Commission)
 	}
 }
+
+func TestReplay_PerInstrumentMaxHold(t *testing.T) {
+	// Variant says 240, but the instrument configures 30 — the per-instrument value must win
+	// (mirroring live EffectiveMaxHoldMinutes), so the trade time-exits at 08:45, not 12:15.
+	candles := rangeBars()
+	candles = append(candles, cdl(15, 1.1009, 1.1015, 1.1008, 1.1014)) // enter buy
+	for i := 16; i <= 50; i++ {
+		candles = append(candles, cdl(i, 1.1015, 1.1016, 1.1014, 1.1015)) // hover, no TP/SL
+	}
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 30}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	trades, err := e.Run(context.Background(), TimeExit(240), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "time_exit" {
+		t.Fatalf("got %+v; want one time_exit", trades)
+	}
+	if !trades[0].ExitTime.Equal(sessionOpen.Add(45 * time.Minute)) {
+		t.Errorf("ExitTime = %v; want 08:45 (the instrument's 30-min max-hold, not the variant's 240)", trades[0].ExitTime)
+	}
+}

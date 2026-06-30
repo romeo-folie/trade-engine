@@ -304,11 +304,31 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		atr = e.sessionATR(ctx, inst.Symbol, sessionOpen)
 	}
 
-	trade := e.resolveTrade(v, inst, params, entryMid, atr, watch, entryIdx)
+	// Time-exit deadline is PER-INSTRUMENT, mirroring the live EffectiveMaxHoldMinutes:
+	// the variant only gates whether time exits apply, the minutes come from config (the
+	// variant's own value is the fallback for an instrument with no configured max-hold).
+	maxHoldMin := v.MaxHoldMinutes
+	if v.MaxHoldMinutes > 0 {
+		if eff := effectiveMaxHold(inst, e.cfg); eff > 0 {
+			maxHoldMin = eff
+		}
+	}
+
+	trade := e.resolveTrade(v, inst, params, entryMid, atr, maxHoldMin, watch, entryIdx)
 	if trade == nil {
 		return nil, nil
 	}
 	return []SimTrade{*trade}, nil
+}
+
+// effectiveMaxHold mirrors config.EffectiveMaxHoldMinutes for the (possibly CLI-overridden)
+// instrument passed to the engine: the instrument's own max-hold when set, otherwise the
+// strategy-level fallback. Keeps the replay's per-instrument deadline aligned with live.
+func effectiveMaxHold(inst config.Instrument, cfg config.ForexORBConfig) int {
+	if inst.MaxHoldMinutes > 0 {
+		return inst.MaxHoldMinutes
+	}
+	return cfg.MaxHoldMinutes
 }
 
 // candlesBefore returns the prefix of watch whose timestamps precede the deadline. Index
@@ -331,7 +351,7 @@ func candlesBefore(watch []data.Candle, deadline time.Time) []data.Candle {
 // order is unknown, so this assumes the adverse fill (conservative — it avoids the
 // optimistic bias of holding a same-bar stop into a later recovery). A favorable
 // same-bar move to TP is NOT credited; it resolves on subsequent bars instead.
-func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid, atr float64, watch []data.Candle, entryIdx int) *SimTrade {
+func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid, atr float64, maxHoldMin int, watch []data.Candle, entryIdx int) *SimTrade {
 	cost := e.costFor(inst.Symbol)
 	half := cost.Spread / 2
 
@@ -357,7 +377,7 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 		exitType, exitTime, exitFill = "stop", entryTime, exitWithSpread(p.Side, p.StopLoss, half)
 		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
 	case v.ApplyAdaptiveExit && instHasAdaptiveExits(inst):
-		exitType, gross, exitTime, exitFills = e.resolveAdaptiveExit(v, p, inst, entryFill, half, atr, watch[entryIdx+1:], entryTime)
+		exitType, gross, exitTime, exitFills = e.resolveAdaptiveExit(maxHoldMin, p, inst, entryFill, half, atr, watch[entryIdx+1:], entryTime)
 		// Blended effective exit price (partial + runner) for display: entry + signed
 		// average PnL per unit, so ExitPrice isn't a misleading 0 for adaptive trades.
 		if p.Qty > 0 {
@@ -368,7 +388,7 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 			}
 		}
 	default:
-		et, exitMid, ts := e.resolveExit(v, p, watch[entryIdx+1:], entryTime)
+		et, exitMid, ts := e.resolveExit(maxHoldMin, p, watch[entryIdx+1:], entryTime)
 		exitType, exitTime, exitFill = et, ts, exitWithSpread(p.Side, exitMid, half)
 		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
 	}
@@ -414,12 +434,12 @@ func instHasAdaptiveExits(inst config.Instrument) bool {
 // honours a max-hold: if a TP/SL is touched before the deadline it is taken, otherwise
 // the position is flattened at the first bar at/after the deadline (market = that bar's
 // open). Baseline holds until a leg is touched or data runs out (end_of_data).
-func (e *Engine) resolveExit(v Variant, p orb.BracketParams, rest []data.Candle, entryTime time.Time) (string, float64, time.Time) {
+func (e *Engine) resolveExit(maxHoldMin int, p orb.BracketParams, rest []data.Candle, entryTime time.Time) (string, float64, time.Time) {
 	if len(rest) == 0 {
 		return "end_of_data", p.EntryStop, entryTime
 	}
-	if v.MaxHoldMinutes > 0 {
-		deadline := entryTime.Add(time.Duration(v.MaxHoldMinutes) * time.Minute)
+	if maxHoldMin > 0 {
+		deadline := entryTime.Add(time.Duration(maxHoldMin) * time.Minute)
 		var preDeadline []data.Candle
 		for _, c := range rest {
 			if c.Timestamp.Before(deadline) {

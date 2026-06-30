@@ -19,7 +19,7 @@ import (
 // then check the (possibly moved) stop before the target — the conservative same-bar
 // straddle tie-break, matching resolveExitFromCandles. R is the planned risk
 // |entry_stop − stop_loss|; "favourable R" is measured from the realised entry fill.
-func (e *Engine) resolveAdaptiveExit(v Variant, p orb.BracketParams, inst config.Instrument, entryFill, half, atr float64, rest []data.Candle, entryTime time.Time) (exitType string, gross float64, exitTime time.Time, exitFills int) {
+func (e *Engine) resolveAdaptiveExit(maxHoldMin int, p orb.BracketParams, inst config.Instrument, entryFill, half, atr float64, rest []data.Candle, entryTime time.Time) (exitType string, gross float64, exitTime time.Time, exitFills int) {
 	long := p.Side == "buy"
 	R := absf(p.EntryStop - p.StopLoss)
 	if R <= 0 {
@@ -33,8 +33,8 @@ func (e *Engine) resolveAdaptiveExit(v Variant, p orb.BracketParams, inst config
 	partialDone := false
 	peak := entryFill // most-favourable price reached (high-water mark)
 
-	hasDeadline := v.MaxHoldMinutes > 0
-	deadline := entryTime.Add(time.Duration(v.MaxHoldMinutes) * time.Minute)
+	hasDeadline := maxHoldMin > 0
+	deadline := entryTime.Add(time.Duration(maxHoldMin) * time.Minute)
 
 	favR := func(price float64) float64 {
 		if long {
