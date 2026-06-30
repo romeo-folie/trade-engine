@@ -17,15 +17,16 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/orb"
 )
 
-// Variant is a named rule set so experiments are reproducible. The MVP ships baseline
-// and time-exit (the doc's first two variants); range-filter/confirmed/adaptive land
-// with their live implementations in later PRs.
+// Variant is a named rule set so experiments are reproducible. baseline, time-exit and
+// range-filter are wired; confirmed/adaptive land with their live implementations later.
 type Variant struct {
-	Name           string
-	MaxHoldMinutes int // 0 = hold until the bracket resolves (baseline)
+	Name              string
+	MaxHoldMinutes    int  // 0 = hold until the bracket resolves (baseline)
+	ApplyEntryFilters bool // apply the Phase 2 entry-quality gates (ATR range + spread/risk)
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -33,10 +34,16 @@ type Variant struct {
 // after that would never fill live, so the replay must not count it as a trade.
 const entryWindowMinutes = 60
 
-// Baseline and TimeExit are the built-in MVP variants.
+// Baseline, TimeExit and RangeFilter are the built-in variants. range-filter is
+// time-exit plus the Phase 2 entry-quality gates — the ATR-normalised range filter AND
+// the spread/risk filter — using each instrument's configured bounds, the same gates the
+// live scheduler applies.
 func Baseline() Variant { return Variant{Name: "baseline", MaxHoldMinutes: 0} }
 func TimeExit(maxHold int) Variant {
 	return Variant{Name: "time-exit", MaxHoldMinutes: maxHold}
+}
+func RangeFilter(maxHold int) Variant {
+	return Variant{Name: "range-filter", MaxHoldMinutes: maxHold, ApplyEntryFilters: true}
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -171,8 +178,30 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		return nil, nil
 	}
 
+	// Entry-quality gate 1 — ATR range filter: mirror the live passesRangeQuality gate
+	// using the instrument's configured bounds. Fails open when ATR is unavailable.
+	if v.ApplyEntryFilters && (inst.MinRangeATR > 0 || inst.MaxRangeATR > 0) {
+		if atr := e.sessionATR(ctx, inst.Symbol, sessionOpen); atr > 0 {
+			ratio := (or.High - or.Low) / atr
+			if (inst.MinRangeATR > 0 && ratio < inst.MinRangeATR) || (inst.MaxRangeATR > 0 && ratio > inst.MaxRangeATR) {
+				return nil, nil // outside the configured range_atr_ratio band
+			}
+		}
+	}
+
 	buy := orb.ComputeForexBracket(or, "buy", portfolioValue, e.cfg, inst)
 	sell := orb.ComputeForexBracket(or, "sell", portfolioValue, e.cfg, inst)
+
+	// Entry-quality gate 2 — spread/risk filter: mirror the live passesSpread gate. The
+	// replay's spread is the static CostModel.Spread; risk is the bracket's stop distance
+	// (identical for buy and sell). spread / risk > max → skip, as live would.
+	if v.ApplyEntryFilters && inst.MaxSpreadToRisk > 0 {
+		if risk := absf(buy.EntryStop - buy.StopLoss); risk > 0 {
+			if e.costFor(inst.Symbol).Spread/risk > inst.MaxSpreadToRisk {
+				return nil, nil // spread too wide relative to planned risk
+			}
+		}
+	}
 
 	// Find the first breakout within the live entry window (orders are cancelled
 	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
@@ -336,6 +365,54 @@ func firstBreakout(watch []data.Candle, buy, sell orb.BracketParams, entryDeadli
 }
 
 // ── small helpers ──────────────────────────────────────────────────────────────
+
+// sessionATR fetches a thin lookback of the configured ATR timeframe ending at the
+// session open and returns the ATR (0 when data is unavailable or too shallow — the
+// same fail-open convention as the live filter). Uses ComputeATR so the backtest's ATR
+// matches the live engine's exactly.
+func (e *Engine) sessionATR(ctx context.Context, symbol string, sessionOpen time.Time) float64 {
+	period := e.cfg.ATRPeriod
+	if period <= 0 {
+		period = 14
+	}
+	tf := data.Timeframe(e.cfg.ATRTimeframe)
+	if tf == "" {
+		tf = data.Timeframe1Hour
+	}
+	// Pad the intraday lookback by 72h to clear the forex weekend gap, matching the live
+	// instrumentATR — otherwise a Monday session's ATR window returns too few bars and
+	// ComputeATR yields 0 (filter fails open), diverging from live.
+	lookback := time.Duration(period+2) * atrBarDuration(tf)
+	if atrBarDuration(tf) < 24*time.Hour {
+		lookback += 72 * time.Hour
+	}
+	from := sessionOpen.Add(-lookback)
+	candles, err := e.data.FetchCandles(ctx, symbol, tf, from, sessionOpen)
+	if err != nil {
+		return 0
+	}
+	return indicators.ComputeATR(candles, period)
+}
+
+// atrBarDuration is the wall-clock span of one bar for the supported ATR timeframes.
+func atrBarDuration(tf data.Timeframe) time.Duration {
+	switch tf {
+	case data.Timeframe1Min:
+		return time.Minute
+	case data.Timeframe5Min:
+		return 5 * time.Minute
+	case data.Timeframe15Min:
+		return 15 * time.Minute
+	case data.Timeframe1Hour:
+		return time.Hour
+	case data.Timeframe4Hour:
+		return 4 * time.Hour
+	case data.Timeframe1Day:
+		return 24 * time.Hour
+	default:
+		return time.Hour
+	}
+}
 
 // sessionOpenMinutes mirrors the live scheduler: London 08:00 UTC, New York 13:30 UTC.
 // "both" is rejected: the engine runs one session open per day, so silently mapping it

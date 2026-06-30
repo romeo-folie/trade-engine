@@ -25,6 +25,8 @@ var (
 	btORBVariants    []string
 	btORBCapital     float64
 	btORBMaxHold     int
+	btORBMinRangeATR float64
+	btORBMaxRangeATR float64
 )
 
 // defaultSpreads are conservative per-instrument bid/ask spreads (price units) used by
@@ -46,11 +48,13 @@ func init() {
 		c.Flags().StringVar(&btORBSession, "session", "", "Session: london | newyork (default: config forex_orb.session)")
 		c.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 		c.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
-		c.Flags().IntVar(&btORBMaxHold, "max-hold", 240, "Max-hold minutes for the time-exit variant")
+		c.Flags().IntVar(&btORBMaxHold, "max-hold", 240, "Max-hold minutes for time-exit/range-filter variants")
+		c.Flags().Float64Var(&btORBMinRangeATR, "min-range-atr", 0, "Override min range_atr_ratio for all instruments (range-filter)")
+		c.Flags().Float64Var(&btORBMaxRangeATR, "max-range-atr", 0, "Override max range_atr_ratio for all instruments (range-filter)")
 		_ = c.MarkFlagRequired("from")
 		_ = c.MarkFlagRequired("to")
 	}
-	orbBTCmd.Flags().StringVar(&btORBVariant, "variant", "baseline", "Rule variant: baseline | time-exit")
+	orbBTCmd.Flags().StringVar(&btORBVariant, "variant", "baseline", "Rule variant: baseline | time-exit | range-filter")
 	orbCompareBTCmd.Flags().StringArrayVar(&btORBVariants, "variants", []string{"baseline", "time-exit"}, "Variants to compare (repeat or comma-separate)")
 
 	backtestCmd.AddCommand(orbBTCmd, orbCompareBTCmd)
@@ -192,20 +196,31 @@ func resolveInstruments(forexCfg config.ForexORBConfig, csv string) ([]config.In
 	if len(forexCfg.Instruments) == 0 {
 		return nil, fmt.Errorf("no forex_orb instruments configured")
 	}
-	if csv == "" {
-		return forexCfg.Instruments, nil
-	}
-	bySymbol := make(map[string]config.Instrument, len(forexCfg.Instruments))
-	for _, inst := range forexCfg.Instruments {
-		bySymbol[inst.Symbol] = inst
-	}
 	var out []config.Instrument
-	for _, sym := range splitCSV(csv) {
-		inst, ok := bySymbol[sym]
-		if !ok {
-			return nil, fmt.Errorf("instrument %q is not configured under forex_orb.instruments", sym)
+	if csv == "" {
+		out = append(out, forexCfg.Instruments...)
+	} else {
+		bySymbol := make(map[string]config.Instrument, len(forexCfg.Instruments))
+		for _, inst := range forexCfg.Instruments {
+			bySymbol[inst.Symbol] = inst
 		}
-		out = append(out, inst)
+		for _, sym := range splitCSV(csv) {
+			inst, ok := bySymbol[sym]
+			if !ok {
+				return nil, fmt.Errorf("instrument %q is not configured under forex_orb.instruments", sym)
+			}
+			out = append(out, inst)
+		}
+	}
+	// CLI overrides apply the same range_atr_ratio bounds to every instrument, so the
+	// range-filter variant can be swept without editing per-instrument config.
+	for i := range out {
+		if btORBMinRangeATR > 0 {
+			out[i].MinRangeATR = btORBMinRangeATR
+		}
+		if btORBMaxRangeATR > 0 {
+			out[i].MaxRangeATR = btORBMaxRangeATR
+		}
 	}
 	return out, nil
 }
@@ -228,8 +243,10 @@ func resolveVariant(name string, maxHold int) (orbreplay.Variant, error) {
 		return orbreplay.Baseline(), nil
 	case "time-exit":
 		return orbreplay.TimeExit(maxHold), nil
+	case "range-filter":
+		return orbreplay.RangeFilter(maxHold), nil
 	default:
-		return orbreplay.Variant{}, fmt.Errorf("unknown variant %q (known: baseline, time-exit)", name)
+		return orbreplay.Variant{}, fmt.Errorf("unknown variant %q (known: baseline, time-exit, range-filter)", name)
 	}
 }
 

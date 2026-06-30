@@ -390,6 +390,12 @@ orb:
 #       min_lot_size: 20000
 #       pip_buffer: 0.0002
 #       max_hold_minutes: 240   # flatten a filled trade after 4h (0 = inherit strategy default below)
+#       # Entry-quality filters (Phase 2). All default 0 = off. range_atr_ratio =
+#       # opening_range_width / ATR(atr_period, atr_timeframe). Skip a session whose
+#       # ratio falls outside [min, max], or whose spread/risk exceeds max_spread_to_risk.
+#       min_range_atr: 0.25
+#       max_range_atr: 0.90
+#       max_spread_to_risk: 0.08
 #     - symbol: GBP/USD
 #       sec_type: CASH
 #       min_lot_size: 20000
@@ -416,6 +422,10 @@ orb:
 #   # flattened at market (exit_type='time_exit'). 0 disables time exits. Prevents
 #   # the multi-day holds that caused most ORB losses.
 #   max_hold_minutes: 240
+#   # ATR used by the range-quality filter (range_atr_ratio). Hourly ATR against which a
+#   # 15-30 min opening range yields ratios in the 0.25-1.25 band.
+#   atr_period: 14
+#   atr_timeframe: 1h
 
 # feedback:
 #   enabled: false
