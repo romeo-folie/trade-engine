@@ -108,6 +108,8 @@ type ORBScheduler struct {
 	rangeBuffers            map[string]*RangeBuffer
 	orderIDs                map[string][2]string     // ticker → [buyOrderID, sellOrderID] (runner / primary entry)
 	scaleOutEntryIDs        map[string][2]string     // ticker → [buyPartialID, sellPartialID]; the split-bracket PARTIAL entry alongside orderIDs' runner. Empty unless partial-TP is configured, so the no-partial path is unchanged.
+	splitPlaced             bool                     // true once a split-bracket pair was placed this session; gates the orphaned-split-entry sweep so it is a no-op otherwise
+	lastSplitOrphanCheckAt  time.Time                // wall time of the last orphaned-split-entry sweep
 	trackedTrades           map[string]*trackedTrade // entry order ID → trade context + exit state
 	reconciledSessions      map[string]struct{}      // session IDs already processed by reconcileDoneSessionTrades
 	backfilledSessions      map[string]struct{}      // session IDs already processed by backfillRecentExits
@@ -395,6 +397,11 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// trade row, and alerts on orders it can't prove ownership of). No-op outside forex mode.
 	s.reconcileOrphanedLegs(ctx)
 
+	// Cancel a split-bracket entry that never filled once its sibling has already exited: the
+	// logical trade is over, so a still-pending entry must not fill on a breakout retest and
+	// open a fresh position. No-op unless a split pair was placed this session.
+	s.cancelOrphanedSplitEntries(ctx)
+
 	// Universal exit backstop: record TP/stop exits for already-filled trades by replaying
 	// their price path from market-data bars. Runs in every state because a bracket's exit
 	// is effectively GTC — it can fill while a new session is scanning, or days after the
@@ -559,6 +566,9 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 				m := s.orderIDs
 				if t.ScaleOutRole == "partial" {
 					m = s.scaleOutEntryIDs
+				}
+				if t.ScaleOutRole != "" {
+					s.splitPlaced = true // a restored split leg can be orphaned by its sibling exiting
 				}
 				ids := m[t.Ticker]
 				switch t.Side {
@@ -1199,6 +1209,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			s.orderIDs[ticker] = ids
 			if scaleIds[0] != "" || scaleIds[1] != "" {
 				s.scaleOutEntryIDs[ticker] = scaleIds
+				s.splitPlaced = true // arm the orphaned-split-entry sweep for this session
 			}
 			// Emit per-side events only for brackets that were actually placed.
 			for i, side := range []string{"buy", "sell"} {
@@ -1640,6 +1651,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.orderIDs = make(map[string][2]string)
 		s.scaleOutEntryIDs = make(map[string][2]string)
+		s.splitPlaced = false
 		s.directionDecisions = make(map[string][2]bool)
 		s.releaseTrackedTradesForReconcile()
 		s.state = StateIdle
