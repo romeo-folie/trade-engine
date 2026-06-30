@@ -306,13 +306,17 @@ func (s *ORBScheduler) protectedOrderIDs() map[string]struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make(map[string]struct{})
-	for _, ids := range s.orderIDs {
-		for _, id := range ids {
-			if id != "" {
-				out[id] = struct{}{}
+	add := func(m map[string][2]string) {
+		for _, ids := range m {
+			for _, id := range ids {
+				if id != "" {
+					out[id] = struct{}{}
+				}
 			}
 		}
 	}
+	add(s.orderIDs)         // runner / primary entries
+	add(s.scaleOutEntryIDs) // split-bracket partial entries (empty unless partial-TP configured)
 	return out
 }
 

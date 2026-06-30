@@ -150,6 +150,58 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 	}
 }
 
+// ScaleOutBrackets splits a computed forex bracket into a PARTIAL and a RUNNER bracket for
+// live split-bracket partial take-profit — the live realisation of the backtest adaptive
+// variant's partial (resolveAdaptiveExit). Both brackets share the entry trigger and stop;
+// they differ only in quantity and take-profit level:
+//   - partial: PartialFraction of the size (lot-rounded), take-profit at partial_take_profit_r
+//   - runner:  the remainder, take-profit at runner_take_profit_r (or the base target when
+//     runner_take_profit_r is unset)
+//
+// Levels are measured from the entry trigger over the planned risk R = |EntryStop − StopLoss|,
+// the same basis ComputeForexBracket uses for the base target (the realised fill is unknown
+// at placement; the trigger is the consistent proxy).
+//
+// Returns split=false with the base bracket unchanged as the runner when the instrument does
+// not configure a partial, when R is degenerate, or when lot-rounding leaves either the
+// partial or the runner with no tradeable size — the caller then places the single base
+// bracket exactly as before (so a non-configuring instrument is byte-identical to today).
+func ScaleOutBrackets(base BracketParams, inst config.Instrument) (partial, runner BracketParams, split bool) {
+	if inst.PartialTakeProfitR <= 0 || inst.PartialFraction <= 0 {
+		return BracketParams{}, base, false
+	}
+	R := math.Abs(base.EntryStop - base.StopLoss)
+	if R <= 0 {
+		return BracketParams{}, base, false
+	}
+	f := inst.PartialFraction
+	if f > 1 {
+		f = 1
+	}
+	pq := int(float64(base.Qty) * f)
+	if inst.MinLotSize > 0 { // a partial must be a tradeable lot multiple
+		pq = (pq / inst.MinLotSize) * inst.MinLotSize
+	}
+	rq := base.Qty - pq
+	if pq <= 0 || rq <= 0 {
+		return BracketParams{}, base, false // too small to split into two tradeable lots
+	}
+
+	sign := 1.0
+	if base.Side == "sell" {
+		sign = -1.0
+	}
+	partial = base
+	partial.Qty = pq
+	partial.TakeProfit = base.EntryStop + sign*inst.PartialTakeProfitR*R
+	runner = base
+	runner.Qty = rq
+	if inst.RunnerTakeProfitR > 0 {
+		runner.TakeProfit = base.EntryStop + sign*inst.RunnerTakeProfitR*R
+	}
+	return partial, runner, true
+}
+
 // ComputeFuturesBracket derives entry/stop/target for an exchange-listed futures contract.
 //
 // Prices are snapped to the nearest tick (tickSize) and the buffer beyond the range
