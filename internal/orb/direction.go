@@ -43,3 +43,21 @@ func (s *ORBScheduler) directionEligibility(ctx context.Context, ticker string) 
 	last := candles[len(candles)-1].Close
 	return last >= emaVal, last <= emaVal, true
 }
+
+// directionDecision returns the latched direction eligibility for a ticker: the trend is
+// evaluated ONCE (the first executing tick, at range lock) and cached for the rest of the
+// session. Otherwise, with confirmation modes keeping the scheduler in Executing across
+// ticks, the trend EMA would drift as new candles print and could admit a side that was
+// ineligible at the decision point — diverging from the replay, which decides once. A
+// fail-open result (ok=false) is latched as both-eligible so it isn't re-evaluated either.
+func (s *ORBScheduler) directionDecision(ctx context.Context, ticker string) (longOK, shortOK bool) {
+	if d, ok := s.directionDecisions[ticker]; ok {
+		return d[0], d[1]
+	}
+	long, short, ok := s.directionEligibility(ctx, ticker)
+	if !ok {
+		long, short = true, true // fail open, latched for the session
+	}
+	s.directionDecisions[ticker] = [2]bool{long, short}
+	return long, short
+}

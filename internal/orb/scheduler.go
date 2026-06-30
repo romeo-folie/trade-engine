@@ -116,6 +116,7 @@ type ORBScheduler struct {
 	lastTimeExitCheckAt  time.Time                // wall time of the last max-hold time-exit sweep
 	lastOrphanLegCheckAt time.Time                // wall time of the last orphan-leg reconcile
 	alertedOrphanLegs    map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
+	directionDecisions   map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
 	lastScan             time.Time                // Eastern Time of the last successful scan
 	fetchFailures        map[string]int           // ticker → consecutive candle-fetch failures
 	fetchLastAttempt     map[string]time.Time     // ticker → wall time of last candle-fetch attempt
@@ -162,6 +163,7 @@ func NewORBScheduler(
 		fetchFailures:      make(map[string]int),
 		fetchLastAttempt:   make(map[string]time.Time),
 		alertedOrphanLegs:  make(map[string]struct{}),
+		directionDecisions: make(map[string][2]bool),
 	}
 }
 
@@ -1046,21 +1048,21 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
-			// Direction eligibility (Phase 3): place only the trend-aligned side(s). Zeroing a
-			// side's Qty makes the placement loop (and confirmation) skip it. Fails open (both
-			// sides kept) when the trend EMA is unavailable.
+			// Direction eligibility (Phase 3): place only the trend-aligned side(s). The
+			// decision is LATCHED at the first executing tick (directionDecision) so it can't
+			// drift across confirmation retries. Zeroing a side's Qty makes the placement loop
+			// (and confirmation) skip it; fail-open keeps both sides.
 			if inst.DirectionEligibility {
-				if longOK, shortOK, ok := s.directionEligibility(ctx, ticker); ok {
-					if !longOK {
-						buyParams.Qty = 0
-					}
-					if !shortOK {
-						sellParams.Qty = 0
-					}
-					if buyParams.Qty == 0 && sellParams.Qty == 0 {
-						slog.Info("orb: skipping instrument — neither direction is trend-eligible", "ticker", ticker)
-						continue
-					}
+				longOK, shortOK := s.directionDecision(ctx, ticker)
+				if !longOK {
+					buyParams.Qty = 0
+				}
+				if !shortOK {
+					sellParams.Qty = 0
+				}
+				if buyParams.Qty == 0 && sellParams.Qty == 0 {
+					slog.Info("orb: skipping instrument — neither direction is trend-eligible", "ticker", ticker)
+					continue
 				}
 			}
 
@@ -1299,12 +1301,58 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		}
 	}
 
+	// Poll fills for SINGLE-SIDED forex entries (confirmation / direction eligibility).
+	// The dual-sided OCO block below skips these (it needs both legs to detect a double
+	// fill), so without this their fill would only be persisted at the cleanup cutoff —
+	// stamping filled_at late and starting the max-hold clock late. There is no opposing
+	// leg to cancel here, so it just persists the fill.
+	if s.executor != nil {
+		for ticker, ids := range s.orderIDs {
+			buyID, sellID := ids[0], ids[1]
+			if (buyID == "") == (sellID == "") {
+				continue // both empty or both present — not single-sided
+			}
+			orderID, side := buyID, "buy"
+			if sellID != "" {
+				orderID, side = sellID, "sell"
+			}
+			res, err := s.executor.GetOrderStatus(ctx, orderID)
+			if err != nil || res.Status != "filled" {
+				continue
+			}
+			price := res.FilledPrice
+			if tc := s.trackedTrades[orderID]; tc != nil {
+				if corrected, was := sanitizeEntryFill(side, tc.entryStop, price); was {
+					slog.Warn("orb: implausible single-sided entry fill — recording stop level instead",
+						"side", side, "ticker", ticker, "reported", res.FilledPrice, "entry_stop", tc.entryStop, "recorded", corrected)
+					price = corrected
+				}
+			}
+			updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
+			if dbErr != nil {
+				slog.Error("orb: persist single-sided fill failed", "side", side, "ticker", ticker, "err", dbErr)
+				continue
+			}
+			if updated {
+				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+					OrderID: orderID, Ticker: ticker, Side: side, Status: "filled", FillPrice: price,
+				})
+				if tc := s.trackedTrades[orderID]; tc != nil {
+					tc.entryFill = price
+				}
+			}
+			// Entry is filled and persisted — drop it from orderIDs so later ticks don't
+			// re-poll the broker for a known-filled order (exit polling uses trackedTrades).
+			delete(s.orderIDs, ticker)
+		}
+	}
+
 	// Poll for fills and cancel the opposing side (dual-sided forex OCO).
 	if s.executor != nil {
 		for ticker, ids := range s.orderIDs {
 			buyID, sellID := ids[0], ids[1]
 			if buyID == "" || sellID == "" {
-				continue // single-sided — no opposing cancel needed
+				continue // single-sided — handled by the single-sided poll above
 			}
 
 			// Fetch both statuses upfront to detect double fills.
@@ -1530,6 +1578,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		s.candidates = nil
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.orderIDs = make(map[string][2]string)
+		s.directionDecisions = make(map[string][2]bool)
 		s.releaseTrackedTradesForReconcile()
 		s.state = StateIdle
 		s.mu.Unlock()
