@@ -589,6 +589,23 @@ type Instrument struct {
 	// placed, instead of blind dual-sided brackets that let a single wick pick direction.
 	// false (default) keeps dual-sided. See ForexORBConfig.TrendTimeframe / TrendEMAPeriod.
 	DirectionEligibility bool `yaml:"direction_eligibility"`
+
+	// RiskMultiplier (Phase 5) scales this instrument's per-trade risk relative to the
+	// strategy MaxRiskPct, so a higher-tail-risk instrument (e.g. XAU/USD) can be sized
+	// down without disabling it. <= 0 is treated as 1.0 (no change). Applied in
+	// ComputeForexBracket, so it affects live and backtest sizing identically.
+	RiskMultiplier float64 `yaml:"risk_multiplier"`
+
+	// Adaptive exit management (Phase 4). All default 0 = disabled, preserving the fixed
+	// bracket. R is the planned risk = |entry_stop - stop_loss|; "favourable R" is how far
+	// in profit the trade has gone. Currently modelled by the backtest `adaptive` variant;
+	// the live order-management counterpart lands in a follow-up.
+	BreakEvenR         float64 `yaml:"break_even_r"`          // move the stop to entry once this favourable R is reached
+	TrailATRMult       float64 `yaml:"trail_atr_mult"`        // trail the stop at high-water-mark − this × ATR (ratchet up)
+	TrailAfterR        float64 `yaml:"trail_after_r"`         // begin trailing only after this favourable R
+	PartialTakeProfitR float64 `yaml:"partial_take_profit_r"` // take a partial at this favourable R
+	PartialFraction    float64 `yaml:"partial_fraction"`      // fraction (0..1) of the position to close at the partial
+	RunnerTakeProfitR  float64 `yaml:"runner_take_profit_r"`  // runner's target R after the partial (0 keeps the original target)
 }
 type ForexORBConfig struct {
 	Enabled        bool         `yaml:"enabled"`

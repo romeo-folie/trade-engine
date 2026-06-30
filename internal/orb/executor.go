@@ -102,7 +102,13 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 	if riskPerUnit < 0.0001 {
 		riskPerUnit = 0.0001
 	}
-	maxRiskDollars := portfolioValue * cfg.MaxRiskPct / 100.0
+	// Per-instrument risk multiplier (Phase 5): size a higher-tail-risk instrument down
+	// without disabling it. <= 0 means 1.0 (no change).
+	mult := inst.RiskMultiplier
+	if mult <= 0 {
+		mult = 1.0
+	}
+	maxRiskDollars := portfolioValue * cfg.MaxRiskPct * mult / 100.0
 	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
 
 	// Round down to lot size

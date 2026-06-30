@@ -29,6 +29,7 @@ type Variant struct {
 	ApplyEntryFilters bool // apply the Phase 2 entry-quality gates (ATR range + spread/risk)
 	ApplyConfirmation bool // require per-instrument breakout confirmation (Phase 3) instead of a touch
 	ApplyDirection    bool // apply per-instrument direction eligibility (Phase 3): trend-aligned side only
+	ApplyAdaptiveExit bool // apply per-instrument adaptive exits (Phase 4): break-even / partial / trailing
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -56,6 +57,17 @@ func RangeFilter(maxHold int) Variant {
 // configures none of them behaves like time-exit).
 func Confirmed(maxHold int) Variant {
 	return Variant{Name: "confirmed", MaxHoldMinutes: maxHold, ApplyEntryFilters: true, ApplyConfirmation: true, ApplyDirection: true}
+}
+
+// Adaptive is the full ladder: confirmed entries plus per-instrument adaptive exit
+// management (break-even stop moves, partial take-profit, ATR trailing). Each piece is
+// instrument-gated, so an instrument that configures no adaptive fields behaves like
+// confirmed.
+func Adaptive(maxHold int) Variant {
+	v := Confirmed(maxHold)
+	v.Name = "adaptive"
+	v.ApplyAdaptiveExit = true
+	return v
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -286,7 +298,13 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		return nil, nil // min lot exceeds the position cap for this instrument
 	}
 
-	trade := e.resolveTrade(v, inst, params, entryMid, watch, entryIdx)
+	// ATR for adaptive trailing (only fetched when the variant + instrument need it).
+	var atr float64
+	if v.ApplyAdaptiveExit && inst.TrailATRMult > 0 {
+		atr = e.sessionATR(ctx, inst.Symbol, sessionOpen)
+	}
+
+	trade := e.resolveTrade(v, inst, params, entryMid, atr, watch, entryIdx)
 	if trade == nil {
 		return nil, nil
 	}
@@ -313,7 +331,7 @@ func candlesBefore(watch []data.Candle, deadline time.Time) []data.Candle {
 // order is unknown, so this assumes the adverse fill (conservative — it avoids the
 // optimistic bias of holding a same-bar stop into a later recovery). A favorable
 // same-bar move to TP is NOT credited; it resolves on subsequent bars instead.
-func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid float64, watch []data.Candle, entryIdx int) *SimTrade {
+func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid, atr float64, watch []data.Candle, entryIdx int) *SimTrade {
 	cost := e.costFor(inst.Symbol)
 	half := cost.Spread / 2
 
@@ -329,24 +347,33 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 	}
 
 	var exitType string
-	var exitMid float64
 	var exitTime time.Time
-	if entryBarStopOut(p, entryBar) {
-		exitType, exitMid, exitTime = "stop", p.StopLoss, entryTime
-	} else {
-		exitType, exitMid, exitTime = e.resolveExit(v, p, watch[entryIdx+1:], entryTime)
+	var gross, exitFill float64 // exitFill 0 for adaptive (blended across partial + runner)
+	exitFills := 1              // entry + this many exit fills determines commission
+
+	switch {
+	case entryBarStopOut(p, entryBar):
+		// Adverse same-bar stop — adaptive management never gets a chance.
+		exitType, exitTime, exitFill = "stop", entryTime, exitWithSpread(p.Side, p.StopLoss, half)
+		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
+	case v.ApplyAdaptiveExit && instHasAdaptiveExits(inst):
+		exitType, gross, exitTime, exitFills = e.resolveAdaptiveExit(v, p, inst, entryFill, half, atr, watch[entryIdx+1:], entryTime)
+		// Blended effective exit price (partial + runner) for display: entry + signed
+		// average PnL per unit, so ExitPrice isn't a misleading 0 for adaptive trades.
+		if p.Qty > 0 {
+			if p.Side == "buy" {
+				exitFill = entryFill + gross/float64(p.Qty)
+			} else {
+				exitFill = entryFill - gross/float64(p.Qty)
+			}
+		}
+	default:
+		et, exitMid, ts := e.resolveExit(v, p, watch[entryIdx+1:], entryTime)
+		exitType, exitTime, exitFill = et, ts, exitWithSpread(p.Side, exitMid, half)
+		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
 	}
 
-	// Apply spread on exit: a buy exits by selling at the bid, a sell by buying at the ask.
-	exitFill := exitMid
-	if p.Side == "buy" {
-		exitFill -= half
-	} else {
-		exitFill += half
-	}
-
-	gross := pnl(p.Side, entryFill, exitFill, p.Qty)
-	commission := 2 * cost.CommissionPerSide
+	commission := float64(1+exitFills) * cost.CommissionPerSide
 	riskPerUnit := absf(p.EntryStop - p.StopLoss)
 	var r float64
 	if riskPerUnit > 0 {
@@ -367,6 +394,20 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 		R:          r,
 		HoldDur:    exitTime.Sub(entryTime),
 	}
+}
+
+// exitWithSpread applies the bid/ask spread to an exit price: a buy exits by selling at
+// the bid (−half), a sell exits by buying at the ask (+half).
+func exitWithSpread(side string, mid, half float64) float64 {
+	if side == "buy" {
+		return mid - half
+	}
+	return mid + half
+}
+
+// instHasAdaptiveExits reports whether any adaptive-exit feature is configured.
+func instHasAdaptiveExits(inst config.Instrument) bool {
+	return inst.BreakEvenR > 0 || inst.TrailATRMult > 0 || (inst.PartialTakeProfitR > 0 && inst.PartialFraction > 0)
 }
 
 // resolveExit returns the exit type, mid price and time. For the time-exit variant it

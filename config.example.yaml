@@ -403,6 +403,17 @@ orb:
 #       # Direction eligibility (Phase 3): only place the trend-aligned side (price vs the
 #       # trend-timeframe EMA) instead of blind dual-sided. Default false.
 #       direction_eligibility: true
+#       # Per-instrument risk multiplier (Phase 5): scale this instrument's risk vs the
+#       # strategy max_risk_pct (e.g. 0.35 sizes XAU/USD down). <=0 → 1.0.
+#       risk_multiplier: 0.35
+#       # Adaptive exit management (Phase 4), measured by the backtest `adaptive` variant
+#       # (live order-management lands in a follow-up). R = |entry_stop − stop_loss|.
+#       break_even_r: 0.8           # move the stop to entry after +0.8R
+#       trail_atr_mult: 1.5         # trail at high-water-mark − 1.5×ATR (ratchet up)
+#       trail_after_r: 1.0          # start trailing only after +1.0R
+#       partial_take_profit_r: 1.0  # take a partial at +1.0R
+#       partial_fraction: 0.5       # close half the position at the partial
+#       runner_take_profit_r: 2.0   # runner's target after the partial
 #     - symbol: GBP/USD
 #       sec_type: CASH
 #       min_lot_size: 20000
