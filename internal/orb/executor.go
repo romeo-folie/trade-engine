@@ -338,7 +338,6 @@ type BarReplayResult struct {
 func ResolveExitViaBarReplay(ctx context.Context, md data.MarketDataProvider, ticker, side string, stopLoss, takeProfit float64, from, to, now time.Time) (BarReplayResult, error) {
 	age := now.Sub(from)
 	var lastErr error
-	var sawBars bool
 	var result BarReplayResult
 
 	for _, tf := range barReplayTimeframeFallbacks(age) {
@@ -348,23 +347,26 @@ func ResolveExitViaBarReplay(ctx context.Context, md data.MarketDataProvider, ti
 			continue
 		}
 		if len(candles) == 0 {
-			continue // try a coarser bar with deeper history
+			continue // no data at this resolution — try a coarser bar with deeper history
 		}
-		sawBars = true
+		// The finest timeframe that returns data is authoritative for the requested
+		// window. We do NOT escalate to coarser bars on a no-hit: a coarser bar can span a
+		// wider/earlier interval (e.g. a daily bar includes pre-entry price), so its high/low
+		// could trip a leg the actual post-fill path never reached — fabricating a false
+		// exit. Coarser bars are a fallback ONLY for missing data, never to override a hit/no-hit
+		// the finer bars already resolved.
 		result = BarReplayResult{Timeframe: tf, Bars: len(candles)}
 		exitType, exitPrice, exitTime, found := resolveExitFromCandles(side, stopLoss, takeProfit, candles)
 		if found {
 			result.ExitType, result.ExitPrice, result.ExitTime, result.Found = exitType, exitPrice, exitTime, true
-			return result, nil
 		}
-		// Bars exist but never touched a leg. A coarser bar's wider high/low can only
-		// catch *more* touches over the same span, so keep escalating before giving up.
+		return result, nil
 	}
 
-	if !sawBars && lastErr != nil {
+	if lastErr != nil {
 		return BarReplayResult{}, fmt.Errorf("bar replay %s: no bars from any timeframe: %w", ticker, lastErr)
 	}
-	// sawBars && !found → genuinely still open; !sawBars && lastErr==nil → no data, no error.
+	// No timeframe returned data and none errored → no history available; treat as still open.
 	return result, nil
 }
 

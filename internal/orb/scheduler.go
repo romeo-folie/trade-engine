@@ -345,30 +345,37 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	now := s.now()
 	et := now.In(nyLoc)
 
-	// Universal exit backstop: record TP/stop exits for already-filled trades by
-	// replaying their price path from market-data bars. Runs in every state (not just
-	// StateDone) because a bracket's exit is effectively GTC — it can fill while a new
-	// session is scanning, or days after the session that opened it went "done". It
-	// runs for every executor (broker reconcilers get first crack via a grace period;
-	// see reconcileBarReplayExits) and is the only mechanism that records an outcome
-	// when child IDs were never captured and the trades feed has aged out. Throttled.
-	s.reconcileBarReplayExits(ctx)
-
+	// Run the state handler first: its broker reconcilers (in-session/done-session order
+	// polling and the trades-feed matcher) get the first chance each tick to record a
+	// *confirmed* exit. The bar-replay backstop runs after, so a late broker fill (one
+	// that lands past the grace period) is recorded as 'broker' rather than pre-empted
+	// by replay — both close paths guard on status='filled', and this ordering decides
+	// which source wins when both could fire in the same tick.
+	var err error
 	switch state {
 	case StateIdle:
-		return s.tickIdle(ctx, et)
+		err = s.tickIdle(ctx, et)
 	case StateScanning:
-		return s.tickScanning(ctx, et)
+		err = s.tickScanning(ctx, et)
 	case StateCandidateReady:
-		return s.tickCandidateReady(ctx, et)
+		err = s.tickCandidateReady(ctx, et)
 	case StateRangeWatch:
-		return s.tickRangeWatch(ctx, et)
+		err = s.tickRangeWatch(ctx, et)
 	case StateExecuting:
-		return s.tickExecuting(ctx)
+		err = s.tickExecuting(ctx)
 	case StateDone:
-		return s.tickDone(ctx)
+		err = s.tickDone(ctx)
 	}
-	return nil
+
+	// Universal exit backstop: record TP/stop exits for already-filled trades by replaying
+	// their price path from market-data bars. Runs in every state because a bracket's exit
+	// is effectively GTC — it can fill while a new session is scanning, or days after the
+	// session that opened it went "done". It runs for every executor and is the only
+	// mechanism that records an outcome when child IDs were never captured and the trades
+	// feed has aged out. Throttled; gated by a grace period (see reconcileBarReplayExits).
+	s.reconcileBarReplayExits(ctx)
+
+	return err
 }
 
 func (s *ORBScheduler) setState(state State) {

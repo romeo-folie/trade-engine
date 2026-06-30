@@ -131,6 +131,33 @@ func TestResolveExitViaBarReplay_BarsExistButNeverTouched(t *testing.T) {
 	}
 }
 
+// The finest timeframe that returns data is authoritative: a genuine no-hit on 1-min
+// bars must NOT escalate to coarser bars, even when a coarser bar's wider high/low would
+// trip a leg — that would fabricate a false exit from a wider/earlier interval.
+func TestResolveExitViaBarReplay_NoHitDoesNotEscalate(t *testing.T) {
+	md := &stubMarketData{byTF: map[data.Timeframe][]data.Candle{
+		data.Timeframe1Min: {bar(1, 155, 145), bar(2, 158, 148)}, // never reaches 140 stop / 170 tp
+		data.Timeframe1Day: {dayBar(1, 175, 138)},                // straddles both — would FALSELY trip
+	}}
+	now := time.Now().UTC()
+	from := now.Add(-time.Hour) // fresh → starts at 1-min, which has data
+	res, err := ResolveExitViaBarReplay(context.Background(), md, "EUR/USD", "buy", 140, 170, from, now, now)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.Found {
+		t.Fatalf("expected still-open (no escalation), got %+v", res)
+	}
+	if res.Timeframe != data.Timeframe1Min {
+		t.Errorf("resolved on %v; want 1min to be authoritative", res.Timeframe)
+	}
+	for _, tf := range md.requested {
+		if tf == data.Timeframe1Day {
+			t.Errorf("must not have requested daily bars after 1-min returned data; requested=%v", md.requested)
+		}
+	}
+}
+
 func TestResolveExitViaBarReplay_AllTimeframesErrorReturnsError(t *testing.T) {
 	boom := errors.New("gateway down")
 	md := &stubMarketData{errTF: map[data.Timeframe]error{
