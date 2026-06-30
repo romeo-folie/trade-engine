@@ -109,7 +109,16 @@ func (s *ORBScheduler) confirmedSide(ctx context.Context, ticker string, r *Open
 		slog.Warn("orb: confirmation: fetch candles failed — not confirming this tick", "ticker", ticker, "err", err)
 		return ""
 	}
-	side, _, ok := DetectConfirmation(mode, candles, buy.EntryStop, sell.EntryStop)
+	// Respect direction eligibility: a side zeroed out (Qty 0) is not a candidate, so its
+	// trigger is disabled (0) and DetectConfirmation will never confirm it.
+	buyTrig, sellTrig := buy.EntryStop, sell.EntryStop
+	if buy.Qty == 0 {
+		buyTrig = 0
+	}
+	if sell.Qty == 0 {
+		sellTrig = 0
+	}
+	side, _, ok := DetectConfirmation(mode, candles, buyTrig, sellTrig)
 	if !ok {
 		return ""
 	}

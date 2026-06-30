@@ -28,6 +28,7 @@ type Variant struct {
 	MaxHoldMinutes    int  // 0 = hold until the bracket resolves (baseline)
 	ApplyEntryFilters bool // apply the Phase 2 entry-quality gates (ATR range + spread/risk)
 	ApplyConfirmation bool // require per-instrument breakout confirmation (Phase 3) instead of a touch
+	ApplyDirection    bool // apply per-instrument direction eligibility (Phase 3): trend-aligned side only
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -50,8 +51,11 @@ func RangeFilter(maxHold int) Variant {
 // Confirmed is range-filter plus per-instrument breakout confirmation (Phase 3): the
 // entry waits for the configured BreakoutConfirmation (close_1m/close_3m) instead of
 // firing on a touch. Mirrors the live breakout-watch path.
+// Confirmed is the full Phase 3 variant: range-filter + per-instrument breakout
+// confirmation + direction eligibility (each instrument-gated, so an instrument that
+// configures none of them behaves like time-exit).
 func Confirmed(maxHold int) Variant {
-	return Variant{Name: "confirmed", MaxHoldMinutes: maxHold, ApplyEntryFilters: true, ApplyConfirmation: true}
+	return Variant{Name: "confirmed", MaxHoldMinutes: maxHold, ApplyEntryFilters: true, ApplyConfirmation: true, ApplyDirection: true}
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -211,6 +215,23 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		}
 	}
 
+	// Direction eligibility (Phase 3): place only the trend-aligned side, mirroring the live
+	// directionEligibility gate. Zeroing a side's Qty makes the breakout/confirmation logic
+	// below skip it. Fails open (both sides kept) when the trend EMA is unavailable.
+	if v.ApplyDirection && inst.DirectionEligibility {
+		if longOK, shortOK, ok := e.sessionTrend(ctx, inst.Symbol, sessionOpen); ok {
+			if !longOK {
+				buy.Qty = 0
+			}
+			if !shortOK {
+				sell.Qty = 0
+			}
+			if buy.Qty == 0 && sell.Qty == 0 {
+				return nil, nil // neither direction trend-eligible
+			}
+		}
+	}
+
 	// Resolve the entry within the live entry window (orders are cancelled
 	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
 	// the side that triggers first produces a trade.
@@ -225,7 +246,15 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		// places a MARKET bracket once a close confirms). So the fill is the NEXT bar's open
 		// (≈ the price at the next scheduler tick), not the breakout level — a later, market
 		// fill in exchange for filtering wicks. No resting stop, so no pullback re-fill.
-		cSide, confIdx, ok := orb.DetectConfirmation(inst.BreakoutConfirmation, inWindow, buy.EntryStop, sell.EntryStop)
+		// Respect direction eligibility: a zeroed side is disabled (trigger 0).
+		buyTrig, sellTrig := buy.EntryStop, sell.EntryStop
+		if buy.Qty == 0 {
+			buyTrig = 0
+		}
+		if sell.Qty == 0 {
+			sellTrig = 0
+		}
+		cSide, confIdx, ok := orb.DetectConfirmation(inst.BreakoutConfirmation, inWindow, buyTrig, sellTrig)
 		if !ok {
 			return nil, nil // breakout never confirmed within the entry window
 		}
@@ -443,6 +472,35 @@ func (e *Engine) sessionATR(ctx context.Context, symbol string, sessionOpen time
 		return 0
 	}
 	return indicators.ComputeATR(candles, period)
+}
+
+// sessionTrend mirrors the live directionEligibility gate: it computes the trend EMA from
+// the configured trend timeframe ending at the session open and reports which sides are
+// aligned (long when the latest close ≥ EMA, short when ≤). ok=false on thin data so the
+// caller leaves both sides eligible — identical to live.
+func (e *Engine) sessionTrend(ctx context.Context, symbol string, sessionOpen time.Time) (longOK, shortOK, ok bool) {
+	period := e.cfg.TrendEMAPeriod
+	if period <= 0 {
+		period = 20
+	}
+	tf := data.Timeframe(e.cfg.TrendTimeframe)
+	if tf == "" {
+		tf = data.Timeframe1Hour
+	}
+	lookback := time.Duration(period+2) * atrBarDuration(tf)
+	if atrBarDuration(tf) < 24*time.Hour {
+		lookback += 72 * time.Hour // clear the forex weekend gap, as sessionATR does
+	}
+	candles, err := e.data.FetchCandles(ctx, symbol, tf, sessionOpen.Add(-lookback), sessionOpen)
+	if err != nil || len(candles) < period {
+		return false, false, false
+	}
+	emaVal := indicators.ComputeEMA(candles, period)
+	if emaVal <= 0 {
+		return false, false, false
+	}
+	last := candles[len(candles)-1].Close
+	return last >= emaVal, last <= emaVal, true
 }
 
 // atrBarDuration is the wall-clock span of one bar for the supported ATR timeframes.

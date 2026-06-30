@@ -400,6 +400,9 @@ orb:
 #       # close_1m (one 1-min close beyond), or close_3m (3 consecutive closes beyond,
 #       # filters false breakouts). Confirmation enters later at a worse price.
 #       breakout_confirmation: close_1m
+#       # Direction eligibility (Phase 3): only place the trend-aligned side (price vs the
+#       # trend-timeframe EMA) instead of blind dual-sided. Default false.
+#       direction_eligibility: true
 #     - symbol: GBP/USD
 #       sec_type: CASH
 #       min_lot_size: 20000
@@ -430,6 +433,9 @@ orb:
 #   # 15-30 min opening range yields ratios in the 0.25-1.25 band.
 #   atr_period: 14
 #   atr_timeframe: 1h
+#   # EMA used by the direction-eligibility trend filter.
+#   trend_timeframe: 1h
+#   trend_ema_period: 20
 
 # feedback:
 #   enabled: false

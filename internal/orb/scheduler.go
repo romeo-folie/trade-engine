@@ -1046,6 +1046,24 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
+			// Direction eligibility (Phase 3): place only the trend-aligned side(s). Zeroing a
+			// side's Qty makes the placement loop (and confirmation) skip it. Fails open (both
+			// sides kept) when the trend EMA is unavailable.
+			if inst.DirectionEligibility {
+				if longOK, shortOK, ok := s.directionEligibility(ctx, ticker); ok {
+					if !longOK {
+						buyParams.Qty = 0
+					}
+					if !shortOK {
+						sellParams.Qty = 0
+					}
+					if buyParams.Qty == 0 && sellParams.Qty == 0 {
+						slog.Info("orb: skipping instrument — neither direction is trend-eligible", "ticker", ticker)
+						continue
+					}
+				}
+			}
+
 			// Breakout confirmation (Phase 3). With stop_touch (default) we place resting
 			// stops now and the broker fills on a touch. With a close_* mode we instead WAIT:
 			// each tick, replay the 1-min candles since the range locked and only place once
