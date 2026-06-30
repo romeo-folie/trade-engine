@@ -44,9 +44,9 @@ type OrderRequest struct {
 
 	// Bracket order fields (Phase 15 ORB). When OrderClass is "bracket",
 	// the broker submits a parent + take-profit + stop-loss as one atomic order.
-	OrderClass       string  // "" (simple) | "bracket"
-	TakeProfitPrice  float64 // limit price for take-profit leg
-	StopLossPrice    float64 // stop price for stop-loss leg
+	OrderClass      string  // "" (simple) | "bracket"
+	TakeProfitPrice float64 // limit price for take-profit leg
+	StopLossPrice   float64 // stop price for stop-loss leg
 
 	// SecType overrides the IBKR security type for this order.
 	// "" defaults to "CASH" (forex). Use "CFD" for metals like XAU/USD.
@@ -62,6 +62,30 @@ type OrderResult struct {
 	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
 	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
 	ChildOrderIDs []string
+}
+
+// WorkingOrder is a live (unfilled / still-working) order at the broker.
+// It exists so callers can find and cancel dangling bracket legs by symbol
+// when the child order IDs were never captured at placement time (the IBKR
+// bracket confirmation flow does not reliably return them).
+type WorkingOrder struct {
+	OrderID      string
+	Ticker       string  // resolved symbol when the broker provides one (else raw conid)
+	Conid        string  // IBKR contract id (empty for non-IBKR brokers)
+	Side         string  // "buy" | "sell"
+	Status       string  // normalized: pending | partial (only working orders are returned)
+	RemainingQty float64 // quantity still working
+	Price        float64 // limit price (0 if none / not exposed)
+	StopPrice    float64 // stop trigger price (0 if none / not exposed)
+}
+
+// WorkingOrdersLister is an optional Executor capability: it lists the broker's
+// live working orders. The ORB time-exit uses it to cancel a filled trade's
+// remaining TP/SL bracket legs before flattening, since those leg IDs are not
+// tracked. IBKRBroker implements it; executors that don't (PaperExecutor) are
+// detected via a type assertion and the caller skips leg cancellation.
+type WorkingOrdersLister interface {
+	GetWorkingOrders(ctx context.Context) ([]WorkingOrder, error)
 }
 
 // Position represents a current open position at the broker.

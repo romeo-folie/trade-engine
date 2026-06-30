@@ -380,24 +380,33 @@ orb:
 #       sec_type: CASH
 #       min_lot_size: 20000
 #       pip_buffer: 0.0002
+#       max_hold_minutes: 240   # flatten a filled trade after 4h (0 = inherit strategy default below)
 #     - symbol: GBP/USD
 #       sec_type: CASH
 #       min_lot_size: 20000
 #       pip_buffer: 0.0002
+#       max_hold_minutes: 180
 #     - symbol: XAU/USD
 #       sec_type: CFD
 #       min_lot_size: 1
 #       pip_buffer: 0.50
+#       max_hold_minutes: 90
 #     - symbol: XAG/USD
 #       sec_type: CFD
 #       min_lot_size: 50
 #       pip_buffer: 0.01
+#       max_hold_minutes: 90
 #   session: london
 #   timezone: UTC
 #   range_minutes: 15
 #   risk_reward: 2.0
 #   max_risk_pct: 1.0
 #   max_position_pct: 10.0
+#   # Strategy-level fallback time limit for any instrument that doesn't set its own
+#   # max_hold_minutes. At expiry the bracket legs are cancelled and the position is
+#   # flattened at market (exit_type='time_exit'). 0 disables time exits. Prevents
+#   # the multi-day holds that caused most ORB losses.
+#   max_hold_minutes: 240
 
 # feedback:
 #   enabled: false

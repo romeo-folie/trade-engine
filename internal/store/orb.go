@@ -334,6 +334,7 @@ type ORBStats struct {
 	Scratches   int
 	TPExits     int
 	StopExits   int
+	TimeExits   int
 	ReplayExits int
 	BrokerExits int
 	TotalPnL    float64
@@ -354,6 +355,7 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 		       COUNT(*) FILTER (WHERE status='closed' AND pnl = 0)            AS scratches,
 		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='tp')     AS tp_exits,
 		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='stop')   AS stop_exits,
+		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='time_exit') AS time_exits,
 		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='replay') AS replay_exits,
 		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='broker') AS broker_exits,
 		       COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)           AS total_pnl,
@@ -372,7 +374,7 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 		var s ORBStats
 		if err := rows.Scan(
 			&s.Ticker, &s.Closed, &s.Wins, &s.Losses, &s.Scratches,
-			&s.TPExits, &s.StopExits,
+			&s.TPExits, &s.StopExits, &s.TimeExits,
 			&s.ReplayExits, &s.BrokerExits, &s.TotalPnL, &s.OpenFilled,
 		); err != nil {
 			return nil, err

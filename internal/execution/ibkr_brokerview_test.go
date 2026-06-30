@@ -185,3 +185,63 @@ func TestFetchTradeRecords_DaysClamped(t *testing.T) {
 		t.Errorf("days (clamped from 0) = %q; want 1", gotDays)
 	}
 }
+
+// ─── GetWorkingOrders ───────────────────────────────────────────────────────
+
+// TestGetWorkingOrders verifies the live-orders lookup: only working orders are
+// returned (terminal states dropped), conid reverse-resolves to a ticker, side is
+// normalized, and orderId decodes whether the gateway sends it as a number or a
+// quoted string (the ibkrID two-branch decode the time-exit's cancel-by-id relies on).
+func TestGetWorkingOrders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/iserver/account/orders" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Four rows: a working TP (number id, number price), a working SL (string id,
+		// string stop_price), a filled order and a cancelled order (both dropped).
+		w.Write([]byte(`{"orders":[
+			{"orderId": 111, "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "PreSubmitted", "remainingQuantity": 5000, "price": 1.12},
+			{"orderId": "222", "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "Submitted", "remainingQuantity": "5000", "stop_price": "1.09"},
+			{"orderId": 333, "conid": 12087792, "ticker": "EUR", "side": "SELL", "status": "Filled", "remainingQuantity": 0},
+			{"orderId": 444, "conid": 12087797, "ticker": "GBP", "side": "BUY", "status": "Cancelled", "remainingQuantity": 5000}
+		]}`))
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	orders, err := b.GetWorkingOrders(t.Context())
+	if err != nil {
+		t.Fatalf("GetWorkingOrders error: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("len(orders) = %d; want 2 (filled + cancelled dropped)", len(orders))
+	}
+	// Both working orders are EUR/USD (conid 12087792 reverse-resolves via the map).
+	for _, o := range orders {
+		if o.Ticker != "EUR/USD" {
+			t.Errorf("Ticker = %q; want EUR/USD", o.Ticker)
+		}
+		if o.Side != "sell" {
+			t.Errorf("Side = %q; want sell", o.Side)
+		}
+		if o.RemainingQty != 5000 {
+			t.Errorf("RemainingQty = %v; want 5000", o.RemainingQty)
+		}
+	}
+	if orders[0].OrderID != "111" {
+		t.Errorf("orders[0].OrderID = %q; want 111 (numeric id)", orders[0].OrderID)
+	}
+	if orders[1].OrderID != "222" {
+		t.Errorf("orders[1].OrderID = %q; want 222 (string id)", orders[1].OrderID)
+	}
+	// Leg prices decode from both number (price) and string (stop_price) encodings.
+	if orders[0].Price != 1.12 {
+		t.Errorf("orders[0].Price = %v; want 1.12 (numeric)", orders[0].Price)
+	}
+	if orders[1].StopPrice != 1.09 {
+		t.Errorf("orders[1].StopPrice = %v; want 1.09 (string-encoded)", orders[1].StopPrice)
+	}
+}

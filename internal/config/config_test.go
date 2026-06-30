@@ -585,3 +585,32 @@ func containsStr(slice []string, sub string) bool {
 	}
 	return false
 }
+
+func TestForexORBEffectiveMaxHoldMinutes(t *testing.T) {
+	cfg := ForexORBConfig{
+		MaxHoldMinutes: 240, // strategy-level default
+		Instruments: []Instrument{
+			{Symbol: "EUR/USD", MaxHoldMinutes: 120}, // per-instrument override
+			{Symbol: "GBP/USD", MaxHoldMinutes: 0},   // inherits the strategy default
+		},
+	}
+	cases := []struct {
+		symbol string
+		want   int
+	}{
+		{"EUR/USD", 120}, // instrument override wins
+		{"GBP/USD", 240}, // zero override falls back to strategy default
+		{"XAU/USD", 240}, // unknown symbol falls back to strategy default (stray position still capped)
+	}
+	for _, c := range cases {
+		if got := cfg.EffectiveMaxHoldMinutes(c.symbol); got != c.want {
+			t.Errorf("EffectiveMaxHoldMinutes(%q) = %d; want %d", c.symbol, got, c.want)
+		}
+	}
+
+	// With no strategy default and no override, time exits are disabled (0).
+	none := ForexORBConfig{Instruments: []Instrument{{Symbol: "EUR/USD"}}}
+	if got := none.EffectiveMaxHoldMinutes("EUR/USD"); got != 0 {
+		t.Errorf("EffectiveMaxHoldMinutes with no config = %d; want 0 (disabled)", got)
+	}
+}

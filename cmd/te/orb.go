@@ -42,10 +42,10 @@ recorded are reported separately so a recording gap is visible.`,
 		}
 
 		// Per-instrument table.
-		fmt.Printf("%-9s %6s %5s %6s %6s %6s %10s %9s %s\n",
-			"TICKER", "CLOSED", "WINS", "LOSS", "TP", "STOP", "PNL", "WIN%", "SOURCE(br/rp)")
+		fmt.Printf("%-9s %6s %5s %6s %6s %6s %6s %10s %9s %s\n",
+			"TICKER", "CLOSED", "WINS", "LOSS", "TP", "STOP", "TIME", "PNL", "WIN%", "SOURCE(br/rp)")
 
-		var totClosed, totWins, totLosses, totScratch, totTP, totStop, totBroker, totReplay, totOpen int
+		var totClosed, totWins, totLosses, totScratch, totTP, totStop, totTime, totBroker, totReplay, totOpen int
 		var totPnL float64
 		for _, r := range rows {
 			winPct := "—"
@@ -53,8 +53,8 @@ recorded are reported separately so a recording gap is visible.`,
 			if decided > 0 {
 				winPct = fmt.Sprintf("%.0f%%", float64(r.Wins)/float64(decided)*100)
 			}
-			fmt.Printf("%-9s %6d %5d %6d %6d %6d %10.2f %9s   %d/%d\n",
-				r.Ticker, r.Closed, r.Wins, r.Losses, r.TPExits, r.StopExits,
+			fmt.Printf("%-9s %6d %5d %6d %6d %6d %6d %10.2f %9s   %d/%d\n",
+				r.Ticker, r.Closed, r.Wins, r.Losses, r.TPExits, r.StopExits, r.TimeExits,
 				r.TotalPnL, winPct, r.BrokerExits, r.ReplayExits)
 
 			totClosed += r.Closed
@@ -63,6 +63,7 @@ recorded are reported separately so a recording gap is visible.`,
 			totScratch += r.Scratches
 			totTP += r.TPExits
 			totStop += r.StopExits
+			totTime += r.TimeExits
 			totBroker += r.BrokerExits
 			totReplay += r.ReplayExits
 			totOpen += r.OpenFilled
@@ -80,8 +81,8 @@ recorded are reported separately so a recording gap is visible.`,
 			fmt.Printf(" / %d scratch", totScratch)
 		}
 		fmt.Printf(" | win rate %s | realized PnL %+.2f\n", overallWin, totPnL)
-		fmt.Printf("Exits: %d take-profit, %d stop  |  source: %d broker-confirmed, %d bar-replay\n",
-			totTP, totStop, totBroker, totReplay)
+		fmt.Printf("Exits: %d take-profit, %d stop, %d time-exit  |  source: %d broker-confirmed, %d bar-replay\n",
+			totTP, totStop, totTime, totBroker, totReplay)
 		if totOpen > 0 {
 			fmt.Printf("\n⚠  %d trade(s) still open (entry filled, exit not yet recorded). "+
 				"Run `go run ./cmd/orb-backfill` to reconcile them.\n", totOpen)
