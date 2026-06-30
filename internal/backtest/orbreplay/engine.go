@@ -28,6 +28,11 @@ type Variant struct {
 	MaxHoldMinutes int // 0 = hold until the bracket resolves (baseline)
 }
 
+// entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
+// unfilled entry order 60 minutes after session open (sessionCleanupMinutes). A breakout
+// after that would never fill live, so the replay must not count it as a trade.
+const entryWindowMinutes = 60
+
 // Baseline and TimeExit are the built-in MVP variants.
 func Baseline() Variant { return Variant{Name: "baseline", MaxHoldMinutes: 0} }
 func TimeExit(maxHold int) Variant {
@@ -102,6 +107,12 @@ func (e *Engine) Run(ctx context.Context, v Variant, from, to time.Time, instrum
 		rangeMin = 15
 	}
 
+	// openUntil tracks, per instrument, the exit time of the last trade still running.
+	// The live scheduler skips placing brackets on a ticker that still holds an unexited
+	// fill (tickersWithOpenFilledTrades); the replay mirrors that so baseline / long
+	// max-hold runs don't stack a position live trading would suppress.
+	openUntil := make(map[string]time.Time)
+
 	var trades []SimTrade
 	from = from.UTC()
 	to = to.UTC()
@@ -110,12 +121,21 @@ func (e *Engine) Run(ctx context.Context, v Variant, from, to time.Time, instrum
 		if sessionOpen.Before(from) || sessionOpen.After(to) {
 			continue
 		}
+		// Bracket placement happens after the range locks (≈ rangeEnd); skip the session
+		// if the prior trade is still open at that point.
+		placement := sessionOpen.Add(time.Duration(rangeMin) * time.Minute)
 		for _, inst := range instruments {
+			if exit, open := openUntil[inst.Symbol]; open && exit.After(placement) {
+				continue
+			}
 			t, err := e.simulateSession(ctx, v, inst, sessionOpen, rangeMin, portfolioValue)
 			if err != nil {
 				return nil, err
 			}
-			trades = append(trades, t...)
+			for _, tr := range t {
+				trades = append(trades, tr)
+				openUntil[inst.Symbol] = tr.ExitTime
+			}
 		}
 	}
 	return trades, nil
@@ -145,14 +165,22 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		return nil, nil // not enough data this day (weekend/holiday/gap)
 	}
 
+	// Near-flat range filter: the live scheduler skips an instrument whose opening range
+	// is narrower than 2× the pip buffer (a noisy, easily-wicked range). Mirror it.
+	if inst.PipBuffer > 0 && (or.High-or.Low) < inst.PipBuffer*2 {
+		return nil, nil
+	}
+
 	buy := orb.ComputeForexBracket(or, "buy", portfolioValue, e.cfg, inst)
 	sell := orb.ComputeForexBracket(or, "sell", portfolioValue, e.cfg, inst)
 
-	// Find the first breakout. The opposing side is cancelled (OCO), so only the side
-	// that triggers first produces a trade.
-	side, entryIdx, ok := firstBreakout(watch, buy, sell)
+	// Find the first breakout within the live entry window (orders are cancelled
+	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
+	// the side that triggers first produces a trade.
+	entryDeadline := sessionOpen.Add(entryWindowMinutes * time.Minute)
+	side, entryIdx, ok := firstBreakout(watch, buy, sell, entryDeadline)
 	if !ok {
-		return nil, nil // range never broke within the window
+		return nil, nil // range never broke within the entry window
 	}
 	params := buy
 	if side == "sell" {
@@ -281,12 +309,15 @@ func entryBarStopOut(p orb.BracketParams, bar data.Candle) bool {
 }
 
 // firstBreakout scans the post-range candles for the first bar that triggers either
-// stop-entry. A buy triggers when price rises to the buy-stop (High ≥ entry); a sell
-// when price falls to the sell-stop (Low ≤ entry). If both trigger on the same bar
-// (a whipsaw straddle), the bar's own direction breaks the tie: a bullish bar is taken
-// as buy-first, a bearish bar as sell-first.
-func firstBreakout(watch []data.Candle, buy, sell orb.BracketParams) (side string, idx int, ok bool) {
+// stop-entry, up to entryDeadline (after which live cancels the unfilled orders). A buy
+// triggers when price rises to the buy-stop (High ≥ entry); a sell when price falls to
+// the sell-stop (Low ≤ entry). If both trigger on the same bar (a whipsaw straddle), the
+// bar's own direction breaks the tie: a bullish bar is buy-first, a bearish bar sell-first.
+func firstBreakout(watch []data.Candle, buy, sell orb.BracketParams, entryDeadline time.Time) (side string, idx int, ok bool) {
 	for i, c := range watch {
+		if !c.Timestamp.Before(entryDeadline) {
+			break // past the entry window — live would have cancelled the orders
+		}
 		buyHit := buy.Qty > 0 && buy.EntryStop > 0 && c.High >= buy.EntryStop
 		sellHit := sell.Qty > 0 && sell.EntryStop > 0 && c.Low <= sell.EntryStop
 		switch {

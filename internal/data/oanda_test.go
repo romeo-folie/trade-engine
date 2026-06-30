@@ -1,6 +1,7 @@
 package data
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -18,6 +19,17 @@ func TestOANDAInstrument(t *testing.T) {
 
 func TestOANDAFetchCandles(t *testing.T) {
 	to := time.Date(2026, 4, 13, 8, 3, 0, 0, time.UTC)
+	all := []struct {
+		ts         string
+		o, h, l, c string
+		vol        int
+		complete   bool
+	}{
+		{"2026-04-13T08:00:00Z", "1.1000", "1.1010", "1.0995", "1.1005", 50, true},
+		{"2026-04-13T08:01:00Z", "1.1005", "1.1020", "1.1000", "1.1018", 60, true},
+		{"2026-04-13T08:03:00Z", "1.1018", "1.1025", "1.1012", "1.1020", 70, true},  // == to → excluded
+		{"2026-04-13T08:04:00Z", "1.1020", "1.1021", "1.1019", "1.1020", 10, false}, // incomplete → dropped
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v3/instruments/EUR_USD/candles" {
 			t.Errorf("unexpected path: %s", r.URL.Path)
@@ -27,18 +39,31 @@ func TestOANDAFetchCandles(t *testing.T) {
 		if got := r.URL.Query().Get("granularity"); got != "M1" {
 			t.Errorf("granularity = %q; want M1", got)
 		}
+		// The P1 fix: never send `count` when both from and to are present (OANDA 400s).
+		if got := r.URL.Query().Get("count"); got != "" {
+			t.Errorf("count = %q; want empty when from+to are set", got)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer test-token" {
 			t.Errorf("Authorization = %q; want Bearer test-token", got)
 		}
+		// Emulate OANDA: return only candles at/after the `from` cursor.
+		from, _ := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
 		w.Header().Set("Content-Type", "application/json")
-		// Three complete bars (one at `to`, which must be excluded as the range is
-		// half-open) plus one incomplete bar (must be dropped). Prices are strings.
-		w.Write([]byte(`{"instrument":"EUR_USD","granularity":"M1","candles":[
-			{"time":"2026-04-13T08:00:00Z","volume":50,"complete":true,"mid":{"o":"1.1000","h":"1.1010","l":"1.0995","c":"1.1005"}},
-			{"time":"2026-04-13T08:01:00Z","volume":60,"complete":true,"mid":{"o":"1.1005","h":"1.1020","l":"1.1000","c":"1.1018"}},
-			{"time":"2026-04-13T08:03:00Z","volume":70,"complete":true,"mid":{"o":"1.1018","h":"1.1025","l":"1.1012","c":"1.1020"}},
-			{"time":"2026-04-13T08:04:00Z","volume":10,"complete":false,"mid":{"o":"1.1020","h":"1.1021","l":"1.1019","c":"1.1020"}}
-		]}`))
+		w.Write([]byte(`{"instrument":"EUR_USD","granularity":"M1","candles":[`))
+		first := true
+		for _, c := range all {
+			ts, _ := time.Parse(time.RFC3339, c.ts)
+			if ts.Before(from) {
+				continue
+			}
+			if !first {
+				w.Write([]byte(","))
+			}
+			first = false
+			fmt.Fprintf(w, `{"time":%q,"volume":%d,"complete":%t,"mid":{"o":%q,"h":%q,"l":%q,"c":%q}}`,
+				c.ts, c.vol, c.complete, c.o, c.h, c.l, c.c)
+		}
+		w.Write([]byte(`]}`))
 	}))
 	defer srv.Close()
 

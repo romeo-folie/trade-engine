@@ -165,16 +165,14 @@ func (c *OANDAClient) FetchCandles(ctx context.Context, ticker string, tf Timefr
 		params.Set("price", "M")
 		params.Set("from", cursor.Format(time.RFC3339))
 		params.Set("to", to.Format(time.RFC3339))
-		params.Set("count", strconv.Itoa(oandaMaxCandles))
+		// NB: OANDA rejects `count` when both `from` and `to` are supplied — it returns
+		// up to its 5000-bar cap within the range, and we page forward via the cursor.
 
 		var resp struct {
 			Candles []oandaCandle `json:"candles"`
 		}
 		if err := c.get(ctx, "/v3/instruments/"+instrument+"/candles", params, &resp); err != nil {
 			return nil, err
-		}
-		if len(resp.Candles) == 0 {
-			break
 		}
 
 		var last time.Time
@@ -193,11 +191,13 @@ func (c *OANDAClient) FetchCandles(ctx context.Context, ticker string, tf Timefr
 			last = oc.Time
 		}
 
-		// Advance past the last bar we saw. If the page returned fewer than the cap,
-		// or we made no time progress, we've reached the end of the range.
-		if len(resp.Candles) < oandaMaxCandles || last.IsZero() {
+		// No usable bar this page (empty, or only incomplete/out-of-range) → done.
+		if last.IsZero() {
 			break
 		}
+		// Page forward from just after the last bar. A page that ended before `to` but
+		// returned bars means the cap was hit (or it's the final partial page); the next
+		// fetch returns the remainder or nothing, terminating the loop.
 		next := last.Add(step)
 		if !next.After(cursor) {
 			break // guard against a non-advancing cursor

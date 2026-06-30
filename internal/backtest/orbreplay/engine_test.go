@@ -220,3 +220,72 @@ func TestReplay_SessionBothRejected(t *testing.T) {
 		t.Error(`session "both" should error (one session per run), got nil`)
 	}
 }
+
+func TestReplay_EntryWindowClosesAfter60Min(t *testing.T) {
+	// A breakout after the 60-min live cancel window (deadline 09:00) must not trade.
+	candles := rangeBars()
+	candles = append(candles,
+		cdl(15, 1.1005, 1.1009, 1.1001, 1.1004), // inside the range — no entry
+		cdl(65, 1.1009, 1.1015, 1.1008, 1.1014), // 09:05 breakout — past the entry window
+	)
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("trades = %d; want 0 (breakout after the 60-min entry window)", len(trades))
+	}
+}
+
+func TestReplay_NearFlatRangeSkipped(t *testing.T) {
+	// Opening range width 0.0002 < 2×pip (0.0004) → live skips it; the replay must too.
+	var candles []data.Candle
+	candles = append(candles, cdl(0, 1.1001, 1.1002, 1.1000, 1.1001)) // width 0.0002
+	for i := 1; i < 15; i++ {
+		candles = append(candles, cdl(i, 1.1001, 1.1002, 1.1000, 1.1001))
+	}
+	candles = append(candles, cdl(15, 1.1002, 1.1010, 1.1001, 1.1009)) // would break out
+	trades, err := testEngine(candles, Baseline())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 0 {
+		t.Fatalf("trades = %d; want 0 (near-flat range filtered)", len(trades))
+	}
+}
+
+func TestReplay_SkipsSessionWhilePriorTradeOpen(t *testing.T) {
+	// A Monday baseline trade that never resolves stays open into Tuesday; the live
+	// guard (tickersWithOpenFilledTrades) would suppress Tuesday's bracket, so the
+	// replay must produce exactly one trade (Monday's), not stack a Tuesday entry.
+	candles := rangeBars() // Mon 08:00–08:14, High 1.1010 / Low 1.1000
+	candles = append(candles,
+		cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // Mon 08:15 enter buy (TP 1.1040 / stop 1.0998)
+		cdl(16, 1.1015, 1.1016, 1.1014, 1.1015), // Mon inside
+	)
+	// Tuesday (offset +1440 min) has its OWN wide range + breakout that, in isolation,
+	// would trade — but Monday's position is still open, so it must be skipped. All Tue
+	// bars stay between Monday's stop and TP, so Monday's trade does not exit on them.
+	candles = append(candles, cdl(1440, 1.1025, 1.1030, 1.1020, 1.1025)) // Tue range extremes
+	for i := 1441; i < 1455; i++ {
+		candles = append(candles, cdl(i, 1.1025, 1.1028, 1.1022, 1.1025))
+	}
+	candles = append(candles,
+		cdl(1455, 1.1029, 1.1033, 1.1028, 1.1032), // Tue 08:15 breakout (buy entry 1.1032)
+		cdl(1456, 1.1032, 1.1033, 1.1031, 1.1032),
+	)
+
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	trades, err := e.Run(context.Background(), Baseline(), testDay, testDay.Add(48*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1 (Tuesday suppressed while Monday's trade is open)", len(trades))
+	}
+	if !trades[0].EntryTime.Equal(sessionOpen.Add(15 * time.Minute)) {
+		t.Errorf("EntryTime = %v; want Monday 08:15", trades[0].EntryTime)
+	}
+}
