@@ -1441,12 +1441,20 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 				slog.Info("orb: both sides filled — persisting double fill", "ticker", ticker)
 			}
 
+			// allOpposingResolved tracks whether every order that must be cancelled this tick
+			// actually was. A FILLED winner must NOT be cleared from tracking until then: if a
+			// cancel fails and we forgot the winner, the next tick would see only pending
+			// loser(s), hit the !buyFilled && !sellFilled guard, skip the ticker, and never
+			// retry the cancel — leaving a live opposing stop that can fill into a reverse
+			// position. Keeping the winner tracked makes the next tick re-enter and retry.
+			allOpposingResolved := true
 			for k := range entries {
 				e := &entries[k]
 				switch {
 				case e.filled:
+					// Persist now (idempotent); clearing is deferred until the opposing cancels
+					// succeed (see below).
 					s.persistEntryFill(ctx, ticker, e.side, e.id, e.res.FilledPrice)
-					s.clearEntryID(ticker, e.id)
 				case !doubleFill && e.side == winning:
 					// A not-yet-filled order on the winning side (e.g. a split-bracket partial
 					// lagging its runner) — leave it for a later poll so it fills normally.
@@ -1456,7 +1464,8 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					// "pending" entry has in fact already filled at the broker, the cancel fails
 					// and the recheck below persists it.)
 				default:
-					// Losing side — cancel. A cancel failure may mean it just filled.
+					// Losing side (or any pending order in a double fill) — cancel. A cancel
+					// failure may mean it just filled.
 					slog.Info("orb: side filled — cancelling opposing", "ticker", ticker, "winning_side", winning, "cancel_side", e.side, "order_id", e.id)
 					if err := CancelOrder(ctx, s.executor, e.id); err != nil {
 						if res, rerr := s.executor.GetOrderStatus(ctx, e.id); rerr == nil && res.Status == "filled" {
@@ -1465,6 +1474,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 							s.clearEntryID(ticker, e.id)
 						} else {
 							slog.Warn("orb: cancel failed, will retry next tick", "side", e.side, "ticker", ticker, "order_id", e.id, "err", err)
+							allOpposingResolved = false
 						}
 						continue
 					}
@@ -1475,6 +1485,16 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 						OrderID: e.id, Ticker: ticker, Side: e.side, Status: "cancelled",
 					})
 					s.clearEntryID(ticker, e.id)
+				}
+			}
+			// Clear filled winners only once every opposing order was cancelled. If a cancel
+			// failed, keep them tracked so the next tick re-enters this block (the winner still
+			// reports filled), persists idempotently, and retries the cancel.
+			if allOpposingResolved {
+				for k := range entries {
+					if entries[k].filled {
+						s.clearEntryID(ticker, entries[k].id)
+					}
 				}
 			}
 		}

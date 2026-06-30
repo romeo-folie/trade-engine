@@ -389,11 +389,17 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 	// id; a runner or an ordinary trade → its own id). A logical trade is "closed" only when
 	// all its legs are, and "open" while any leg is still filled; exit_type/source come from
 	// the non-partial (runner / ordinary) leg.
+	// A logical trade is DONE when every leg is terminal (closed OR cancelled) — a partial
+	// that never filled and got cancelled must not keep its realized runner out of the stats.
+	// It counts as a completed trade when done AND at least one leg actually closed (realized
+	// an exit); its PnL/exit come from the closed leg(s). It is still OPEN while any leg is
+	// filled (working).
 	rows, err := db.Query(ctx, `
 		WITH logical AS (
 		    SELECT COALESCE(scale_out_parent_id, id)                          AS trade_id,
 		           MIN(ticker)                                                AS ticker,
-		           bool_and(status='closed')                                  AS all_closed,
+		           bool_and(status IN ('closed','cancelled'))                 AS all_done,
+		           bool_or(status='closed')                                   AS any_closed,
 		           bool_or(status='filled')                                   AS any_filled,
 		           bool_or(status IN ('closed','filled'))                     AS active,
 		           COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)       AS pnl,
@@ -403,17 +409,17 @@ func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
 		    GROUP BY COALESCE(scale_out_parent_id, id)
 		)
 		SELECT ticker,
-		       COUNT(*) FILTER (WHERE all_closed)                          AS closed,
-		       COUNT(*) FILTER (WHERE all_closed AND pnl > 0)             AS wins,
-		       COUNT(*) FILTER (WHERE all_closed AND pnl < 0)             AS losses,
-		       COUNT(*) FILTER (WHERE all_closed AND pnl = 0)             AS scratches,
-		       COUNT(*) FILTER (WHERE all_closed AND exit_type='tp')      AS tp_exits,
-		       COUNT(*) FILTER (WHERE all_closed AND exit_type='stop')    AS stop_exits,
-		       COUNT(*) FILTER (WHERE all_closed AND exit_type='time_exit') AS time_exits,
-		       COUNT(*) FILTER (WHERE all_closed AND exit_source='replay') AS replay_exits,
-		       COUNT(*) FILTER (WHERE all_closed AND exit_source='broker') AS broker_exits,
-		       COALESCE(SUM(pnl) FILTER (WHERE all_closed), 0)            AS total_pnl,
-		       COUNT(*) FILTER (WHERE any_filled AND NOT all_closed)      AS open_filled
+		       COUNT(*) FILTER (WHERE all_done AND any_closed)                          AS closed,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl > 0)             AS wins,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl < 0)             AS losses,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND pnl = 0)             AS scratches,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='tp')      AS tp_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='stop')    AS stop_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_type='time_exit') AS time_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_source='replay') AS replay_exits,
+		       COUNT(*) FILTER (WHERE all_done AND any_closed AND exit_source='broker') AS broker_exits,
+		       COALESCE(SUM(pnl) FILTER (WHERE all_done AND any_closed), 0)            AS total_pnl,
+		       COUNT(*) FILTER (WHERE any_filled AND NOT all_done)                     AS open_filled
 		FROM logical
 		WHERE active
 		GROUP BY ticker

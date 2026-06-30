@@ -155,6 +155,61 @@ func TestGetORBStats_FoldsScaleOutPair(t *testing.T) {
 	}
 }
 
+// TestGetORBStats_PartialCancelledStillCounts verifies a scale-out group where the runner
+// closed but the partial never filled (cancelled at cleanup) still counts as one completed
+// trade with the runner's realized PnL — it must not vanish because a sibling is 'cancelled'
+// rather than 'closed'.
+func TestGetORBStats_PartialCancelledStillCounts(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	const ticker = "TESTPC/USD"
+
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "tokyo")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+
+	runnerID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: ticker, Side: "buy",
+		EntryStop: 1.10, StopLoss: 1.09, TakeProfit: 1.12, Qty: 6000,
+		Status: "filled", ScaleOutRole: "runner",
+	})
+	if err != nil {
+		t.Fatalf("create runner: %v", err)
+	}
+	partialID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: ticker, Side: "buy",
+		EntryStop: 1.10, StopLoss: 1.09, TakeProfit: 1.11, Qty: 4000,
+		Status: "pending", ScaleOutRole: "partial", ScaleOutParentID: &runnerID,
+	})
+	if err != nil {
+		t.Fatalf("create partial: %v", err)
+	}
+
+	// Partial never filled → cancelled; runner takes profit for +90.
+	if _, err := db.Exec(ctx, `UPDATE orb_trades SET status='cancelled' WHERE id=$1`, partialID); err != nil {
+		t.Fatalf("cancel partial: %v", err)
+	}
+	if err := store.CloseORBTrade(ctx, db, runnerID, "tp", "broker", 1.12, 90.0); err != nil {
+		t.Fatalf("close runner: %v", err)
+	}
+
+	stats, _ := store.GetORBStats(ctx, db)
+	row := findStat(stats, ticker)
+	if row == nil {
+		t.Fatalf("trade vanished from stats — cancelled partial sibling hid the realized runner")
+	}
+	if row.Closed != 1 || row.Wins != 1 || row.TotalPnL != 90.0 {
+		t.Errorf("got closed=%d wins=%d pnl=%v; want 1/1/90 (runner realized, partial cancelled)", row.Closed, row.Wins, row.TotalPnL)
+	}
+	if row.OpenFilled != 0 {
+		t.Errorf("OpenFilled = %d; want 0 (group is fully resolved)", row.OpenFilled)
+	}
+}
+
 func findStat(stats []store.ORBStats, ticker string) *store.ORBStats {
 	for i := range stats {
 		if stats[i].Ticker == ticker {
