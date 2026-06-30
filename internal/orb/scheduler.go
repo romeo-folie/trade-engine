@@ -1021,11 +1021,24 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
+			// Entry-quality gate 1: ATR-normalised range filter (Phase 2).
+			if ok, ratio, reason := s.passesRangeQuality(ctx, ticker, r, *inst); !ok {
+				slog.Info("orb: skipping instrument — range quality", "ticker", ticker, "ratio", ratio, "reason", reason)
+				continue
+			}
+
 			buyParams := ComputeForexBracket(r, "buy", portfolioVal, *s.forexCfg, *inst)
 			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, *inst)
 
 			if buyParams.Qty == 0 && sellParams.Qty == 0 {
 				slog.Warn("orb: skipping instrument — min lot size exceeds position cap", "ticker", ticker)
+				continue
+			}
+
+			// Entry-quality gate 2: spread/risk filter (Phase 2). Buy and sell brackets
+			// have the same planned risk magnitude, so one check covers both sides.
+			if ok, ratio, reason := s.passesSpread(ctx, ticker, buyParams.EntryStop, buyParams.StopLoss, inst.MaxSpreadToRisk); !ok {
+				slog.Info("orb: skipping instrument — spread too wide", "ticker", ticker, "ratio", ratio, "reason", reason)
 				continue
 			}
 

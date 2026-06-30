@@ -558,6 +558,21 @@ type Instrument struct {
 	// strategy-level ForexORBConfig.MaxHoldMinutes; when both are 0 time exits are
 	// disabled for this instrument and trades run until their bracket resolves.
 	MaxHoldMinutes int `yaml:"max_hold_minutes"`
+
+	// Entry-quality filters (Phase 2). All default to 0 = disabled, so an instrument
+	// trades every breakout until it opts in. range_atr_ratio = opening_range_width /
+	// ATR(atr_period, atr_timeframe).
+
+	// MinRangeATR / MaxRangeATR bound the opening range's width relative to recent
+	// volatility: too narrow is noise easily wicked through; too wide means much of the
+	// move is already spent. A session whose ratio falls outside [min, max] is skipped.
+	// A bound of 0 disables that side (e.g. MaxRangeATR=0 means no upper bound).
+	MinRangeATR float64 `yaml:"min_range_atr"`
+	MaxRangeATR float64 `yaml:"max_range_atr"`
+
+	// MaxSpreadToRisk rejects a session when the current bid/ask spread is too large
+	// relative to the planned stop distance: spread / |entry_stop - stop_loss|. 0 disables.
+	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
 }
 
 // ForexORBConfig configures the Opening Range Breakout strategy for forex/CFD instruments via IBKR.
@@ -575,6 +590,12 @@ type ForexORBConfig struct {
 	// applied to any instrument that does not set its own Instrument.MaxHoldMinutes.
 	// 0 leaves time exits disabled unless an instrument opts in. See Instrument.MaxHoldMinutes.
 	MaxHoldMinutes int `yaml:"max_hold_minutes"`
+
+	// ATRPeriod / ATRTimeframe define the ATR used by the range-quality filter
+	// (range_atr_ratio). Defaults: period 14, timeframe "1h" — an hourly ATR against
+	// which a 15-30 min opening range yields ratios in the doc's 0.25-1.25 band.
+	ATRPeriod    int    `yaml:"atr_period"`
+	ATRTimeframe string `yaml:"atr_timeframe"` // "1h" | "1d" | etc.
 }
 
 // EffectiveMaxHoldMinutes returns the resolved max-hold limit for a symbol:

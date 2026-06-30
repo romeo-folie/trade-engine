@@ -9,14 +9,19 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
 
-// fakeProvider returns scripted candles filtered to the requested [from, to) window.
+// fakeProvider returns scripted candles filtered to the requested [from, to) window and
+// timeframe. Candles carry their own Timeframe, so a 1-minute session fetch and an hourly
+// ATR fetch draw from disjoint fixtures.
 type fakeProvider struct{ candles []data.Candle }
 
 func (f *fakeProvider) FetchCandles(_ context.Context, ticker string, tf data.Timeframe, from, to time.Time) ([]data.Candle, error) {
 	var out []data.Candle
 	for _, c := range f.candles {
+		if c.Timeframe != tf {
+			continue
+		}
 		if !c.Timestamp.Before(from) && c.Timestamp.Before(to) {
-			c.Ticker, c.Timeframe = ticker, tf
+			c.Ticker = ticker
 			out = append(out, c)
 		}
 	}
@@ -33,7 +38,22 @@ var (
 )
 
 func cdl(min int, o, h, l, c float64) data.Candle {
-	return data.Candle{Timestamp: sessionOpen.Add(time.Duration(min) * time.Minute), Open: o, High: h, Low: l, Close: c}
+	return data.Candle{Timeframe: data.Timeframe1Min, Timestamp: sessionOpen.Add(time.Duration(min) * time.Minute), Open: o, High: h, Low: l, Close: c}
+}
+
+// h1ATR builds 15 hourly bars (ending before the session) with a constant true range,
+// so ComputeATR(_,14) returns that range — a known denominator for range_atr_ratio.
+func h1ATR(trueRange float64) []data.Candle {
+	var out []data.Candle
+	start := sessionOpen.Add(-15 * time.Hour) // all 15 bars fall in sessionATR's 16h lookback
+	for i := range 15 {
+		hi := 1.1000 + trueRange
+		out = append(out, data.Candle{
+			Timeframe: data.Timeframe1Hour, Timestamp: start.Add(time.Duration(i) * time.Hour),
+			Open: 1.1000, High: hi, Low: 1.1000, Close: 1.1000,
+		})
+	}
+	return out
 }
 
 // rangeBars builds 15 one-minute bars (08:00–08:14) whose extremes are High=1.1010,
@@ -288,4 +308,40 @@ func TestReplay_SkipsSessionWhilePriorTradeOpen(t *testing.T) {
 	if !trades[0].EntryTime.Equal(sessionOpen.Add(15 * time.Minute)) {
 		t.Errorf("EntryTime = %v; want Monday 08:15", trades[0].EntryTime)
 	}
+}
+
+func TestReplay_RangeFilterVariant(t *testing.T) {
+	// Opening range width = 0.0010 (rangeBars). ATR = 0.0010 (h1ATR) → range_atr_ratio 1.0.
+	build := func(minATR, maxATR float64) ([]SimTrade, error) {
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // enter buy
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		candles = append(candles, h1ATR(0.0010)...) // ATR = 0.0010
+		cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0, ATRPeriod: 14, ATRTimeframe: "1h"}
+		inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MinRangeATR: minATR, MaxRangeATR: maxATR}
+		e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+		return e.Run(context.Background(), RangeFilter(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	}
+
+	t.Run("ratio above max is filtered", func(t *testing.T) {
+		trades, err := build(0, 0.90) // ratio 1.0 > 0.90
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (range_atr_ratio 1.0 exceeds max 0.90)", len(trades))
+		}
+	})
+
+	t.Run("ratio in band trades", func(t *testing.T) {
+		trades, err := build(0.25, 0) // ratio 1.0 ≥ 0.25, no upper bound
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 {
+			t.Fatalf("trades = %d; want 1 (range_atr_ratio 1.0 passes)", len(trades))
+		}
+	})
 }
