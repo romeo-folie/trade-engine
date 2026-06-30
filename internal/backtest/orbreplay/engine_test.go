@@ -345,3 +345,39 @@ func TestReplay_RangeFilterVariant(t *testing.T) {
 		}
 	})
 }
+
+func TestReplay_SpreadFilterVariant(t *testing.T) {
+	// risk = range width 0.0010 + 2×pip 0.0002 = 0.0014. With spread 0.0002,
+	// spread/risk = 0.143 — rejected by max 0.10, allowed by max 0.20.
+	build := func(maxSpreadToRisk float64) ([]SimTrade, error) {
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // enter buy
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+		inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxSpreadToRisk: maxSpreadToRisk}
+		costs := map[string]CostModel{"EUR/USD": {Spread: 0.0002, CommissionPerSide: 2.0}}
+		e := NewEngine(cfg, &fakeProvider{candles: candles}, costs, 48*time.Hour)
+		return e.Run(context.Background(), RangeFilter(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	}
+
+	t.Run("spread above max is filtered", func(t *testing.T) {
+		trades, err := build(0.10) // 0.143 > 0.10
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (spread/risk 0.143 exceeds max 0.10)", len(trades))
+		}
+	})
+	t.Run("spread within max trades", func(t *testing.T) {
+		trades, err := build(0.20) // 0.143 ≤ 0.20
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 {
+			t.Fatalf("trades = %d; want 1 (spread/risk 0.143 within max 0.20)", len(trades))
+		}
+	})
+}

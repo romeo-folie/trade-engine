@@ -24,9 +24,9 @@ import (
 // Variant is a named rule set so experiments are reproducible. baseline, time-exit and
 // range-filter are wired; confirmed/adaptive land with their live implementations later.
 type Variant struct {
-	Name             string
-	MaxHoldMinutes   int  // 0 = hold until the bracket resolves (baseline)
-	ApplyRangeFilter bool // apply the per-instrument ATR range-quality filter (Phase 2)
+	Name              string
+	MaxHoldMinutes    int  // 0 = hold until the bracket resolves (baseline)
+	ApplyEntryFilters bool // apply the Phase 2 entry-quality gates (ATR range + spread/risk)
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -35,14 +35,15 @@ type Variant struct {
 const entryWindowMinutes = 60
 
 // Baseline, TimeExit and RangeFilter are the built-in variants. range-filter is
-// time-exit plus the ATR-normalised range filter, using each instrument's configured
-// MinRangeATR/MaxRangeATR — the same gate the live scheduler applies.
+// time-exit plus the Phase 2 entry-quality gates — the ATR-normalised range filter AND
+// the spread/risk filter — using each instrument's configured bounds, the same gates the
+// live scheduler applies.
 func Baseline() Variant { return Variant{Name: "baseline", MaxHoldMinutes: 0} }
 func TimeExit(maxHold int) Variant {
 	return Variant{Name: "time-exit", MaxHoldMinutes: maxHold}
 }
 func RangeFilter(maxHold int) Variant {
-	return Variant{Name: "range-filter", MaxHoldMinutes: maxHold, ApplyRangeFilter: true}
+	return Variant{Name: "range-filter", MaxHoldMinutes: maxHold, ApplyEntryFilters: true}
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -177,9 +178,9 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		return nil, nil
 	}
 
-	// ATR range-quality filter (range-filter variant): mirror the live passesRangeQuality
-	// gate using the instrument's configured bounds. Fails open when ATR is unavailable.
-	if v.ApplyRangeFilter && (inst.MinRangeATR > 0 || inst.MaxRangeATR > 0) {
+	// Entry-quality gate 1 — ATR range filter: mirror the live passesRangeQuality gate
+	// using the instrument's configured bounds. Fails open when ATR is unavailable.
+	if v.ApplyEntryFilters && (inst.MinRangeATR > 0 || inst.MaxRangeATR > 0) {
 		if atr := e.sessionATR(ctx, inst.Symbol, sessionOpen); atr > 0 {
 			ratio := (or.High - or.Low) / atr
 			if (inst.MinRangeATR > 0 && ratio < inst.MinRangeATR) || (inst.MaxRangeATR > 0 && ratio > inst.MaxRangeATR) {
@@ -190,6 +191,17 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 
 	buy := orb.ComputeForexBracket(or, "buy", portfolioValue, e.cfg, inst)
 	sell := orb.ComputeForexBracket(or, "sell", portfolioValue, e.cfg, inst)
+
+	// Entry-quality gate 2 — spread/risk filter: mirror the live passesSpread gate. The
+	// replay's spread is the static CostModel.Spread; risk is the bracket's stop distance
+	// (identical for buy and sell). spread / risk > max → skip, as live would.
+	if v.ApplyEntryFilters && inst.MaxSpreadToRisk > 0 {
+		if risk := absf(buy.EntryStop - buy.StopLoss); risk > 0 {
+			if e.costFor(inst.Symbol).Spread/risk > inst.MaxSpreadToRisk {
+				return nil, nil // spread too wide relative to planned risk
+			}
+		}
+	}
 
 	// Find the first breakout within the live entry window (orders are cancelled
 	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
