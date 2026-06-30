@@ -233,6 +233,33 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 	return result.BrokerOrderID, "", "", nil
 }
 
+// sanitizeEntryFill guards against a broker-reported entry fill price that is physically
+// impossible for a stop order. A buy-stop triggers when price rises to entryStop, so it can
+// only fill at entryStop or higher (slippage worsens it upward); a sell-stop, only at entryStop
+// or lower. When both sides of a dual-sided bracket fill in the same instant, IBKR has been
+// observed to return each leg's avgPrice swapped/garbled — yielding a buy "filled" below its
+// stop or a sell above its stop, which then corrupts the recorded entry and all downstream PnL.
+// Such a price is rejected and the entry stop level — the order's trigger, a close and unbiased
+// proxy for the true fill — is recorded instead. tol absorbs rounding. Returns the price to use
+// and whether it was corrected.
+func sanitizeEntryFill(side string, entryStop, reported float64) (float64, bool) {
+	if entryStop <= 0 || reported <= 0 {
+		return reported, false
+	}
+	const tol = 0.001 // 0.1%
+	switch side {
+	case "buy":
+		if reported < entryStop*(1-tol) {
+			return entryStop, true
+		}
+	case "sell":
+		if reported > entryStop*(1+tol) {
+			return entryStop, true
+		}
+	}
+	return reported, false
+}
+
 // ExitPnL is the exported form of exitPnL, for out-of-package callers such as
 // cmd/orb-backfill that resolve exits via ResolveExitViaBarReplay.
 func ExitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {

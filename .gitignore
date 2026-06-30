@@ -67,3 +67,10 @@ internal/web/test_config.yaml
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# IBKR account statements (financial PII) — never commit
+data/*.csv
+
+# stray local build binaries
+/orb-reconcile-statement
+/orb-backfill

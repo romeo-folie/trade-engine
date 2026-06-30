@@ -127,6 +127,7 @@ type trackedTrade struct {
 	side      string // "buy" | "sell"
 	ticker    string
 	qty       int
+	entryStop float64 // the entry stop trigger price; used to sanity-check the reported fill
 	entryFill float64 // set when entry stop order fills; 0 while still pending
 }
 
@@ -533,6 +534,18 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					ids[1] = t.OrderID
 				}
 				s.orderIDs[t.Ticker] = ids
+				// Also track the entry stop so the implausible-fill guard (sanitizeEntryFill)
+				// still fires if this order fills after a mid-session restart. entryFill stays
+				// 0 until it actually fills; the exit-poll loop skips entryFill==0 trades.
+				s.trackedTrades[t.OrderID] = &trackedTrade{
+					dbID:      t.ID,
+					tpOrderID: t.TpOrderID,
+					slOrderID: t.SlOrderID,
+					side:      t.Side,
+					ticker:    t.Ticker,
+					qty:       t.Qty,
+					entryStop: t.EntryStop,
+				}
 			}
 			// Restore exit watching for filled entries that haven't closed yet.
 			if t.Status == "filled" && (t.TpOrderID != "" || t.SlOrderID != "") {
@@ -543,6 +556,7 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					side:      t.Side,
 					ticker:    t.Ticker,
 					qty:       t.Qty,
+					entryStop: t.EntryStop,
 					entryFill: t.FillPrice,
 				}
 			}
@@ -1027,6 +1041,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					s.trackedTrades[orderID] = &trackedTrade{
 						dbID: dbID, tpOrderID: tpID, slOrderID: slID,
 						side: p.side, ticker: ticker, qty: p.params.Qty,
+						entryStop: p.params.EntryStop,
 					}
 				}
 				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
@@ -1108,6 +1123,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				s.trackedTrades[orderID] = &trackedTrade{
 					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
 					side: side, ticker: ticker, qty: params.Qty,
+					entryStop: params.EntryStop,
 				}
 			}
 			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
@@ -1218,17 +1234,28 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 			// if the DB row was actually updated (idempotent on retry ticks).
 			// It also stamps entryFill on the trackedTrade so exit polling can begin.
 			persistFill := func(s2 *sideStatus) {
-				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, s2.res.FilledPrice)
+				// Guard against an implausible reported fill (a buy below / sell above its own
+				// stop), which IBKR can return when both bracket legs fill simultaneously and
+				// would otherwise corrupt the entry price and all downstream PnL.
+				price := s2.res.FilledPrice
+				if tc := s.trackedTrades[s2.id]; tc != nil {
+					if corrected, was := sanitizeEntryFill(s2.side, tc.entryStop, price); was {
+						slog.Warn("orb: implausible entry fill from broker — recording stop level instead",
+							"side", s2.side, "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
+						price = corrected
+					}
+				}
+				updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, s2.id, price)
 				if dbErr != nil {
 					slog.Error("orb: update filled trade failed", "side", s2.side, "ticker", ticker, "err", dbErr)
 					return
 				}
 				if updated {
 					s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-						OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: s2.res.FilledPrice,
+						OrderID: s2.id, Ticker: ticker, Side: s2.side, Status: "filled", FillPrice: price,
 					})
 					if tc := s.trackedTrades[s2.id]; tc != nil {
-						tc.entryFill = s2.res.FilledPrice
+						tc.entryFill = price
 					}
 				}
 			}
@@ -1345,14 +1372,22 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					}
 					// Reconcile already-filled orders instead of cancelling them.
 					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
-						slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", res.FilledPrice)
-						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, res.FilledPrice)
+						price := res.FilledPrice
+						if tc := s.trackedTrades[orderID]; tc != nil {
+							if corrected, was := sanitizeEntryFill(sides[i], tc.entryStop, price); was {
+								slog.Warn("orb: session cleanup: implausible entry fill — recording stop level instead",
+									"side", sides[i], "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
+								price = corrected
+							}
+						}
+						slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
+						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
 						if dbErr != nil {
 							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)
 						}
 						if updated {
 							s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-								OrderID: orderID, Ticker: ticker, Side: sides[i], Status: "filled", FillPrice: res.FilledPrice,
+								OrderID: orderID, Ticker: ticker, Side: sides[i], Status: "filled", FillPrice: price,
 							})
 						}
 						continue
