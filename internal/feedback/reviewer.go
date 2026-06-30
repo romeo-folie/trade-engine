@@ -73,8 +73,8 @@ func (r *Reviewer) Run(ctx context.Context) error {
 
 // tradeStats aggregates win-rate and average PnL% for a group of trades.
 type tradeStats struct {
-	wins       int
-	total      int
+	wins        int
+	total       int
 	totalPnlPct float64
 }
 
@@ -284,21 +284,45 @@ func (r *Reviewer) runReview(ctx context.Context) error {
 			return fmt.Errorf("feedback: GetClosedORBTradesByDateRange window=%s: %w", label, err)
 		}
 
-		// Group ORB trades by ticker.
-		orbStats := make(map[string]*tradeStats)
+		// Fold split-bracket legs into one logical trade before learning from them: a
+		// partial + its runner are two orb_trades rows but ONE trade outcome. Keying on
+		// COALESCE(scale_out_parent_id, id) (the partial → its runner, everything else →
+		// itself) sums their PnL and notional so feedback counts one trade with the combined
+		// result — matching GetORBStats — instead of two leg rows that skew win_rate/count.
+		type orbLogical struct {
+			ticker   string
+			pnl      float64
+			notional float64
+		}
+		logical := make(map[string]*orbLogical)
 		for _, ot := range orbTrades {
-			if orbStats[ot.Ticker] == nil {
-				orbStats[ot.Ticker] = &tradeStats{}
+			key := ot.ID
+			if ot.ScaleOutParentID != nil && *ot.ScaleOutParentID != "" {
+				key = *ot.ScaleOutParentID
 			}
-			// ORBTrade has no PnLPct field — compute it from fill price and quantity.
-			var pnlPct float64
+			lg := logical[key]
+			if lg == nil {
+				lg = &orbLogical{ticker: ot.Ticker}
+				logical[key] = lg
+			}
+			lg.pnl += ot.PnL
 			if ot.FillPrice > 0 && ot.EntryStop > 0 {
-				notional := ot.FillPrice * float64(ot.Qty)
-				if notional > 0 {
-					pnlPct = ot.PnL / notional * 100
-				}
+				lg.notional += ot.FillPrice * float64(ot.Qty)
 			}
-			orbStats[ot.Ticker].add(ot.PnL, pnlPct)
+		}
+
+		// Group logical ORB trades by ticker.
+		orbStats := make(map[string]*tradeStats)
+		for _, lg := range logical {
+			if orbStats[lg.ticker] == nil {
+				orbStats[lg.ticker] = &tradeStats{}
+			}
+			// ORBTrade has no PnLPct field — compute it from the combined fill notional.
+			var pnlPct float64
+			if lg.notional > 0 {
+				pnlPct = lg.pnl / lg.notional * 100
+			}
+			orbStats[lg.ticker].add(lg.pnl, pnlPct)
 		}
 
 		for ticker, s := range orbStats {

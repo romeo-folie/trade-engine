@@ -332,7 +332,8 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
-		       created_at, filled_at, closed_at, stop_moved_at
+		       created_at, filled_at, closed_at, stop_moved_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
 		FROM orb_trades WHERE status='filled'
 		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
@@ -351,6 +352,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 			&t.TpOrderID, &t.SlOrderID,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
 		); err != nil {
 			return nil, err
 		}
