@@ -329,6 +329,8 @@ func Defaults() *Config {
 			MaxHoldMinutes: 240, // strategy-level fallback: no ORB trade holds past 4h (prevents overnight holds)
 			ATRPeriod:      14,
 			ATRTimeframe:   "1h", // hourly ATR for the range-quality filter (range_atr_ratio)
+			TrendTimeframe: "1h", // hourly EMA for the direction-eligibility trend filter
+			TrendEMAPeriod: 20,
 		},
 		FuturesORB: FuturesORBConfig{
 			Enabled:        false,

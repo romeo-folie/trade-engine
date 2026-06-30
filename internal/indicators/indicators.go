@@ -132,3 +132,17 @@ func ComputeATR(candles []data.Candle, period int) float64 {
 	}
 	return atr(highs, lows, closes, period)
 }
+
+// ComputeEMA returns the exponential moving average of the candles' closes over the
+// given period, or 0 when there are fewer than `period` candles (same thin-data
+// convention as ComputeATR). Used by the ORB direction-eligibility trend filter.
+func ComputeEMA(candles []data.Candle, period int) float64 {
+	if period <= 0 || len(candles) < period {
+		return 0
+	}
+	closes := make([]float64, len(candles))
+	for i, c := range candles {
+		closes[i] = c.Close
+	}
+	return ema(closes, period)
+}

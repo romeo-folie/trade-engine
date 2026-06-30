@@ -583,6 +583,12 @@ type Instrument struct {
 	// Confirmation trades enter later and at a worse price than a stop touch, in exchange
 	// for a stronger signal. Default stop_touch preserves current behaviour.
 	BreakoutConfirmation string `yaml:"breakout_confirmation"`
+
+	// DirectionEligibility (Phase 3) makes each breakout direction EARN its bracket: with
+	// it on, only the side aligned with the trend (price vs the trend-timeframe EMA) is
+	// placed, instead of blind dual-sided brackets that let a single wick pick direction.
+	// false (default) keeps dual-sided. See ForexORBConfig.TrendTimeframe / TrendEMAPeriod.
+	DirectionEligibility bool `yaml:"direction_eligibility"`
 }
 type ForexORBConfig struct {
 	Enabled        bool         `yaml:"enabled"`
@@ -604,6 +610,11 @@ type ForexORBConfig struct {
 	// which a 15-30 min opening range yields ratios in the doc's 0.25-1.25 band.
 	ATRPeriod    int    `yaml:"atr_period"`
 	ATRTimeframe string `yaml:"atr_timeframe"` // "1h" | "1d" | etc.
+
+	// TrendTimeframe / TrendEMAPeriod define the EMA used by the direction-eligibility
+	// trend filter (see Instrument.DirectionEligibility). Defaults: "1h", period 20.
+	TrendTimeframe string `yaml:"trend_timeframe"`
+	TrendEMAPeriod int    `yaml:"trend_ema_period"`
 }
 
 // EffectiveMaxHoldMinutes returns the resolved max-hold limit for a symbol:

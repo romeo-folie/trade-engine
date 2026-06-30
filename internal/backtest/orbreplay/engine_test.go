@@ -441,3 +441,62 @@ func TestReplay_ConfirmedVariant(t *testing.T) {
 		}
 	})
 }
+
+// h1Trend builds 21 climbing (start>0) or falling (start<0 slope) hourly bars ending
+// before the session, so ComputeEMA(_,20) sits below/above the last close.
+func h1Trend(rising bool) []data.Candle {
+	var out []data.Candle
+	start := sessionOpen.Add(-21 * time.Hour)
+	for i := range 21 {
+		var px float64
+		if rising {
+			px = 1.1000 + float64(i)*0.0002
+		} else {
+			px = 1.1040 - float64(i)*0.0002
+		}
+		out = append(out, data.Candle{Timeframe: data.Timeframe1Hour, Timestamp: start.Add(time.Duration(i) * time.Hour), Open: px, High: px, Low: px, Close: px})
+	}
+	return out
+}
+
+func TestReplay_DirectionEligibility(t *testing.T) {
+	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0, TrendTimeframe: "1h", TrendEMAPeriod: 20}
+	// Only direction eligibility active (no ATR bounds, spread, or confirmation configured).
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, DirectionEligibility: true}
+	run := func(session, trend []data.Candle) ([]SimTrade, error) {
+		all := append([]data.Candle{}, session...)
+		all = append(all, trend...)
+		e := NewEngine(cfg, &fakeProvider{candles: all}, nil, 48*time.Hour)
+		return e.Run(context.Background(), Confirmed(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	}
+
+	t.Run("uptrend rules out a downside breakout", func(t *testing.T) {
+		session := rangeBars()
+		session = append(session,
+			cdl(15, 1.1001, 1.1002, 1.0997, 1.0998), // sell breakout (low ≤ sell entry 1.0998)
+			cdl(16, 1.0998, 1.0999, 1.0969, 1.0970),
+		)
+		trades, err := run(session, h1Trend(true)) // uptrend → short ineligible
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (sell ruled out by an uptrend)", len(trades))
+		}
+	})
+
+	t.Run("uptrend allows an upside breakout", func(t *testing.T) {
+		session := rangeBars()
+		session = append(session,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // buy breakout
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		trades, err := run(session, h1Trend(true))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 || trades[0].Side != "buy" {
+			t.Fatalf("got %+v; want one buy trade (trend-aligned)", trades)
+		}
+	})
+}

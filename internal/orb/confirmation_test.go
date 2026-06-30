@@ -108,8 +108,8 @@ func TestDetectConfirmation_ShortSide(t *testing.T) {
 func TestConfirmedSide(t *testing.T) {
 	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000,
 		DefinedAt: time.Date(2026, 4, 13, 8, 14, 0, 0, time.UTC)}
-	buy := BracketParams{Side: "buy", EntryStop: 1.1012}
-	sell := BracketParams{Side: "sell", EntryStop: 1.0998}
+	buy := BracketParams{Side: "buy", EntryStop: 1.1012, Qty: 5000}
+	sell := BracketParams{Side: "sell", EntryStop: 1.0998, Qty: 5000}
 	now := func() time.Time { return time.Date(2026, 4, 13, 8, 30, 0, 0, time.UTC) }
 
 	t.Run("close beyond confirms", func(t *testing.T) {
@@ -144,5 +144,87 @@ func TestWithinEntryWindow(t *testing.T) {
 	}
 	if at(9, 30).withinEntryWindow() {
 		t.Error("09:30 UTC should be past the entry window")
+	}
+}
+
+func TestConfirmedSide_RespectsDirectionEligibility(t *testing.T) {
+	// A buy that closed beyond its trigger, but the buy side was ruled ineligible (Qty 0)
+	// by direction eligibility — confirmedSide must not confirm it.
+	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000,
+		DefinedAt: time.Date(2026, 4, 13, 8, 14, 0, 0, time.UTC)}
+	buy := BracketParams{Side: "buy", EntryStop: 1.1012, Qty: 0}                            // ineligible
+	sell := BracketParams{Side: "sell", EntryStop: 1.0998, Qty: 5000}                       // eligible
+	md := &qMarketData{candles: []data.Candle{confBar(15, 1.1011, 1.1016, 1.1010, 1.1014)}} // closes above buy trig
+	s := &ORBScheduler{marketData: md, now: func() time.Time { return time.Date(2026, 4, 13, 8, 30, 0, 0, time.UTC) }}
+	if side := s.confirmedSide(context.Background(), "EUR/USD", r, buy, sell, "close_1m"); side != "" {
+		t.Errorf("confirmedSide = %q; want empty (buy was ruled ineligible)", side)
+	}
+}
+
+func TestDirectionEligibility(t *testing.T) {
+	s := func(emaCandles []data.Candle) *ORBScheduler {
+		return &ORBScheduler{
+			marketData: &qMarketData{candles: emaCandles},
+			forexCfg:   &config.ForexORBConfig{Enabled: true, TrendTimeframe: "1h", TrendEMAPeriod: 20},
+			now:        func() time.Time { return time.Date(2026, 4, 13, 9, 0, 0, 0, time.UTC) },
+		}
+	}
+	// 20 hourly bars climbing 1.1000→1.1019: EMA < last close → uptrend → long only.
+	up := make([]data.Candle, 0, 21)
+	base := time.Date(2026, 4, 12, 12, 0, 0, 0, time.UTC)
+	for i := 0; i < 21; i++ {
+		px := 1.1000 + float64(i)*0.0001
+		up = append(up, data.Candle{Timestamp: base.Add(time.Duration(i) * time.Hour), Open: px, High: px, Low: px, Close: px})
+	}
+	longOK, shortOK, ok := s(up).directionEligibility(context.Background(), "EUR/USD")
+	if !ok || !longOK || shortOK {
+		t.Errorf("uptrend: got long=%v short=%v ok=%v; want long-only", longOK, shortOK, ok)
+	}
+	// Reverse for a downtrend → short only.
+	down := make([]data.Candle, 0, 21)
+	for i := 0; i < 21; i++ {
+		px := 1.1020 - float64(i)*0.0001
+		down = append(down, data.Candle{Timestamp: base.Add(time.Duration(i) * time.Hour), Open: px, High: px, Low: px, Close: px})
+	}
+	longOK, shortOK, ok = s(down).directionEligibility(context.Background(), "EUR/USD")
+	if !ok || longOK || !shortOK {
+		t.Errorf("downtrend: got long=%v short=%v ok=%v; want short-only", longOK, shortOK, ok)
+	}
+	// Thin data → fail open (ok=false).
+	if _, _, ok := s(up[:5]).directionEligibility(context.Background(), "EUR/USD"); ok {
+		t.Error("thin data should report ok=false (fail open)")
+	}
+}
+
+func TestDirectionDecision_Latched(t *testing.T) {
+	// 21 climbing hourly bars → uptrend → long-only on the first call.
+	up := make([]data.Candle, 0, 21)
+	base := time.Date(2026, 4, 12, 12, 0, 0, 0, time.UTC)
+	for i := range 21 {
+		px := 1.1000 + float64(i)*0.0001
+		up = append(up, data.Candle{Timestamp: base.Add(time.Duration(i) * time.Hour), Open: px, High: px, Low: px, Close: px})
+	}
+	md := &qMarketData{candles: up}
+	s := &ORBScheduler{
+		marketData:         md,
+		forexCfg:           &config.ForexORBConfig{Enabled: true, TrendTimeframe: "1h", TrendEMAPeriod: 20},
+		now:                func() time.Time { return time.Date(2026, 4, 13, 9, 0, 0, 0, time.UTC) },
+		directionDecisions: make(map[string][2]bool),
+	}
+	long1, short1 := s.directionDecision(context.Background(), "EUR/USD")
+	if !long1 || short1 {
+		t.Fatalf("first decision: long=%v short=%v; want long-only (uptrend)", long1, short1)
+	}
+
+	// Flip the market to a downtrend — the latched decision must NOT change.
+	down := make([]data.Candle, 0, 21)
+	for i := range 21 {
+		px := 1.1040 - float64(i)*0.0001
+		down = append(down, data.Candle{Timestamp: base.Add(time.Duration(i) * time.Hour), Open: px, High: px, Low: px, Close: px})
+	}
+	md.candles = down
+	long2, short2 := s.directionDecision(context.Background(), "EUR/USD")
+	if long2 != long1 || short2 != short1 {
+		t.Errorf("decision drifted after the market flipped: was (%v,%v), now (%v,%v) — must be latched", long1, short1, long2, short2)
 	}
 }
