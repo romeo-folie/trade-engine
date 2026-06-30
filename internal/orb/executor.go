@@ -233,6 +233,12 @@ func PlaceBracket(ctx context.Context, executor execution.Executor, params Brack
 	return result.BrokerOrderID, "", "", nil
 }
 
+// ExitPnL is the exported form of exitPnL, for out-of-package callers such as
+// cmd/orb-backfill that resolve exits via ResolveExitViaBarReplay.
+func ExitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
+	return exitPnL(side, entryPrice, exitPrice, qty)
+}
+
 // exitPnL computes realised P&L in quote-currency units when an exit leg fills.
 // For a buy: profit = (exitPrice - entryPrice) × qty.
 // For a sell: profit = (entryPrice - exitPrice) × qty.
@@ -274,6 +280,92 @@ func resolveExitFromCandles(side string, stopLoss, takeProfit float64, candles [
 		}
 	}
 	return "", 0, time.Time{}, false
+}
+
+// barReplayTimeframe picks the finest market-data bar resolution that the provider
+// still serves for a lookback of the given age. IBKR's history depth shrinks as the
+// bar gets finer (1-min reaches only ~1–2 days; hourly ~1 month; daily ~6+ months),
+// so an old filled trade must be replayed on coarser bars or no data comes back.
+// Finer bars give more precise TP-vs-stop tie-breaking; coarser bars still resolve
+// the outcome from each bar's high/low, just more conservatively on same-bar straddles.
+func barReplayTimeframe(age time.Duration) data.Timeframe {
+	switch {
+	case age <= 24*time.Hour:
+		return data.Timeframe1Min
+	case age <= 28*24*time.Hour:
+		return data.Timeframe1Hour
+	default:
+		return data.Timeframe1Day
+	}
+}
+
+// barReplayTimeframeFallbacks returns the ordered resolutions to try for a lookback
+// of the given age: the age-appropriate timeframe first, then each coarser one. The
+// coarser fallbacks rescue a replay when the finer bars come back empty (data gap or
+// the lookback just exceeds the finer bar's depth). Coarser is never finer than 1-min
+// and daily is always last, so the list is short and terminates.
+func barReplayTimeframeFallbacks(age time.Duration) []data.Timeframe {
+	switch barReplayTimeframe(age) {
+	case data.Timeframe1Min:
+		return []data.Timeframe{data.Timeframe1Min, data.Timeframe1Hour, data.Timeframe1Day}
+	case data.Timeframe1Hour:
+		return []data.Timeframe{data.Timeframe1Hour, data.Timeframe1Day}
+	default:
+		return []data.Timeframe{data.Timeframe1Day}
+	}
+}
+
+// BarReplayResult reports the outcome of replaying a filled trade's price path.
+type BarReplayResult struct {
+	ExitType  string         // "tp" | "stop"
+	ExitPrice float64        // the bracket leg price the path touched
+	ExitTime  time.Time      // bar timestamp at which the leg was touched
+	Timeframe data.Timeframe // bar resolution that resolved (or last tried) the exit
+	Found     bool           // false when no bar reached a leg within the window
+	Bars      int            // number of bars fetched at the resolving timeframe
+}
+
+// ResolveExitViaBarReplay fetches market-data bars over the replay window [from, to]
+// for a filled ORB trade and reports the first bracket leg (TP or stop) the price path
+// touches. The bar resolution is chosen from how long ago the trade filled relative to
+// `now` (data-retention depth shrinks for finer bars), walking from the finest the
+// lookback allows toward coarser bars and using the first timeframe that returns data —
+// so a trade filled minutes ago resolves on 1-min bars while one filled months ago
+// resolves on daily bars. `to` bounds the fetch (callers cap it at a horizon past the
+// fill so an old stuck trade is replayed over its own post-fill bars, never an unrelated
+// recent window). Returns the resolved exit (Found=true), a not-found result (bars
+// existed but no leg was touched), or an error only when every timeframe returned no bars.
+func ResolveExitViaBarReplay(ctx context.Context, md data.MarketDataProvider, ticker, side string, stopLoss, takeProfit float64, from, to, now time.Time) (BarReplayResult, error) {
+	age := now.Sub(from)
+	var lastErr error
+	var sawBars bool
+	var result BarReplayResult
+
+	for _, tf := range barReplayTimeframeFallbacks(age) {
+		candles, err := md.FetchCandles(ctx, ticker, tf, from, to)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(candles) == 0 {
+			continue // try a coarser bar with deeper history
+		}
+		sawBars = true
+		result = BarReplayResult{Timeframe: tf, Bars: len(candles)}
+		exitType, exitPrice, exitTime, found := resolveExitFromCandles(side, stopLoss, takeProfit, candles)
+		if found {
+			result.ExitType, result.ExitPrice, result.ExitTime, result.Found = exitType, exitPrice, exitTime, true
+			return result, nil
+		}
+		// Bars exist but never touched a leg. A coarser bar's wider high/low can only
+		// catch *more* touches over the same span, so keep escalating before giving up.
+	}
+
+	if !sawBars && lastErr != nil {
+		return BarReplayResult{}, fmt.Errorf("bar replay %s: no bars from any timeframe: %w", ticker, lastErr)
+	}
+	// sawBars && !found → genuinely still open; !sawBars && lastErr==nil → no data, no error.
+	return result, nil
 }
 
 // CancelOrder cancels an open order by its broker order ID.

@@ -345,12 +345,14 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	now := s.now()
 	et := now.In(nyLoc)
 
-	// Paper mode only: record TP/stop exits for already-filled trades by replaying
-	// their 1-minute price path. Runs in every state (not just StateDone) because a
-	// bracket's exit is GTC — it can fill while a new session is scanning, or days
-	// after the session that opened it went "done". Real brokers fill these legs
-	// server-side, so this is a no-op for live executors. Throttled internally.
-	s.reconcilePaperExits(ctx)
+	// Universal exit backstop: record TP/stop exits for already-filled trades by
+	// replaying their price path from market-data bars. Runs in every state (not just
+	// StateDone) because a bracket's exit is effectively GTC — it can fill while a new
+	// session is scanning, or days after the session that opened it went "done". It
+	// runs for every executor (broker reconcilers get first crack via a grace period;
+	// see reconcileBarReplayExits) and is the only mechanism that records an outcome
+	// when child IDs were never captured and the trades feed has aged out. Throttled.
+	s.reconcileBarReplayExits(ctx)
 
 	switch state {
 	case StateIdle:
@@ -1292,7 +1294,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					"exit_type", ec.exitType, "exit_price", res.FilledPrice,
 					"entry_price", tc.entryFill, "pnl", pnl,
 				)
-				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, res.FilledPrice, pnl); dbErr != nil {
+				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
 					slog.Error("orb: close trade failed", "ticker", tc.ticker, "err", dbErr)
 				}
 				delete(s.trackedTrades, entryOrderID)
@@ -1437,29 +1439,37 @@ const paperExitCheckInterval = time.Minute
 // provider no longer retains (e.g. trades older than IBKR's 1-minute retention, which
 // therefore cannot be backfilled) — is left 'filled' rather than force-closed, so we
 // never invent an outcome.
-const paperExitHorizon = 7 * 24 * time.Hour
+const barReplayHorizon = 7 * 24 * time.Hour
 
-// reconcilePaperExits records TP/stop-loss exits for filled ORB trades in paper mode.
+// barReplayGracePeriod is how long after fill the bar-replay backstop waits before
+// closing a trade, leaving the broker reconcilers (in-session exit-leg polling and the
+// trades-feed matcher) the first chance to record a *confirmed* exit. It is longer than
+// the 60-minute post-open session cleanup so a normal same-session exit is broker-sourced;
+// bar replay only steps in for trades the broker path missed. Both close paths guard on
+// status='filled', so even if both fire the first one wins — the grace period just biases
+// which source that is.
+const barReplayGracePeriod = 90 * time.Minute
+
+// reconcileBarReplayExits records TP/stop-loss exits for filled-but-unclosed ORB trades
+// by replaying their price path from market-data bars. It is the universal exit backstop:
+// it runs for every executor (paper or live IBKR), independent of whether bracket child
+// IDs were captured or whether IBKR's 7-day trades feed still retains the fill. Without
+// it, a trade whose exit the broker reconcilers miss stays 'filled' forever and never
+// records an outcome — the bug that left realized PnL and feedback stats blind to ORB.
 //
-// PaperExecutor has no server-side bracket: PlaceBracket flattens the bracket into a
-// single entry order, so once the entry fills there are no live TP/SL legs for the
-// IBKR-oriented reconcilers (exit-leg polling and the trades-feed matcher) to find.
-// Without this, every paper ORB trade stays 'filled' forever and never records an
-// outcome — exactly the bug that left realized PnL and feedback stats blind to ORB.
+// For each trade it replays bars over [fill, fill+horizon] (capped at now), at the finest
+// resolution the provider still serves for that lookback (1-min when fresh, hourly/daily
+// when old), and closes at the first leg the path touches — stamping closed_at with that
+// bar's time. Replaying the path (vs sampling one live quote) records the leg that fired
+// first and stays correct whether the trade is closed live, after a restart, or backfilled
+// long after the fact. Anchoring the window at fill (never at now) keeps an old stuck trade
+// replayed over its own post-fill bars rather than an unrelated recent window.
 //
-// It replays each filled trade's price path from fill time forward using 1-minute bars
-// and closes the trade at the first leg the path touches, stamping closed_at with that
-// bar's time. Replaying bars (rather than sampling a single live quote) means it records
-// the leg that fired first and stays correct whether a trade is closed live, after a
-// restart, or backfilled long after the fact — including the trades stuck before this
-// fix shipped. It runs in every scheduler state because a bracket's exit is effectively
-// GTC and may fill while a later session runs or days after its own session went "done".
-// CloseORBTradeAt guards on status='filled', so it is idempotent against a live reconciler.
-func (s *ORBScheduler) reconcilePaperExits(ctx context.Context) {
-	// Paper mode only: identified by the executor implementing StopOrderSimulator.
-	if _, ok := s.executor.(execution.StopOrderSimulator); !ok {
-		return
-	}
+// Exits it records are tagged exit_source='replay' (a model of the exit from fixed-price
+// bracket legs), distinct from broker-confirmed fills. CloseORBTradeAt guards on
+// status='filled', so this is idempotent against the broker reconcilers; the grace period
+// (see barReplayGracePeriod) lets those record a confirmed exit first when one is available.
+func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 	if s.db == nil || s.marketData == nil {
 		return
 	}
@@ -1470,7 +1480,7 @@ func (s *ORBScheduler) reconcilePaperExits(ctx context.Context) {
 
 	trades, err := store.GetOpenFilledORBTrades(ctx, s.db)
 	if err != nil {
-		slog.Warn("orb: paper exit: load filled trades failed", "err", err)
+		slog.Warn("orb: bar replay: load filled trades failed", "err", err)
 		return
 	}
 
@@ -1478,40 +1488,46 @@ func (s *ORBScheduler) reconcilePaperExits(ctx context.Context) {
 	for i := range trades {
 		t := trades[i]
 
-		// Replay window: anchored at entry fill (fallback row creation) and bounded
-		// forward by the horizon, never extending past now. Anchoring at fill — not at
-		// now — is what keeps an old stuck trade replayed over its own post-fill bars
-		// instead of an unrelated recent window.
+		// A zero entry fill price (NULL fill_price → COALESCE 0) would make exitPnL
+		// compute against a 0 entry, writing an order-of-magnitude-wrong pnl that the
+		// status='filled' guard then freezes permanently. Skip — matches matchExitsFromRecords.
+		if t.FillPrice == 0 {
+			continue
+		}
+
+		// Anchor the replay window at the entry fill (fallback: row creation).
 		from := t.CreatedAt
 		if t.FilledAt != nil {
 			from = *t.FilledAt
 		}
-		to := from.Add(paperExitHorizon)
+		// Grace period: give the broker reconcilers first crack at a confirmed exit.
+		if now.Sub(from) < barReplayGracePeriod {
+			continue
+		}
+		to := from.Add(barReplayHorizon)
 		if to.After(now) {
 			to = now
 		}
 		if !to.After(from) {
-			continue // window not open yet (just filled this tick) — retry next sweep
+			continue // window not open yet — retry next sweep
 		}
 
-		candles, cErr := s.marketData.FetchCandles(ctx, t.Ticker, data.Timeframe1Min, from, to)
-		if cErr != nil {
-			slog.Warn("orb: paper exit: fetch candles failed", "ticker", t.Ticker, "err", cErr)
+		res, rErr := ResolveExitViaBarReplay(ctx, s.marketData, t.Ticker, t.Side, t.StopLoss, t.TakeProfit, from, to, now)
+		if rErr != nil {
+			slog.Warn("orb: bar replay: fetch candles failed", "ticker", t.Ticker, "err", rErr)
 			continue
 		}
-
-		exitType, exitPrice, exitTime, found := resolveExitFromCandles(t.Side, t.StopLoss, t.TakeProfit, candles)
-		if !found {
+		if !res.Found {
 			continue // still open — price path never reached a leg within the window
 		}
 
-		pnl := exitPnL(t.Side, t.FillPrice, exitPrice, t.Qty)
-		slog.Info("orb: paper exit: resolved from bars",
-			"ticker", t.Ticker, "side", t.Side, "exit_type", exitType,
-			"exit_price", exitPrice, "entry_price", t.FillPrice, "exit_time", exitTime, "pnl", pnl,
+		pnl := exitPnL(t.Side, t.FillPrice, res.ExitPrice, t.Qty)
+		slog.Info("orb: bar replay: resolved exit",
+			"ticker", t.Ticker, "side", t.Side, "exit_type", res.ExitType, "timeframe", res.Timeframe,
+			"exit_price", res.ExitPrice, "entry_price", t.FillPrice, "exit_time", res.ExitTime, "pnl", pnl,
 		)
-		if dbErr := store.CloseORBTradeAt(ctx, s.db, t.ID, exitType, exitPrice, pnl, exitTime); dbErr != nil {
-			slog.Error("orb: paper exit: close trade failed", "ticker", t.Ticker, "err", dbErr)
+		if dbErr := store.CloseORBTradeAt(ctx, s.db, t.ID, res.ExitType, "replay", res.ExitPrice, pnl, res.ExitTime); dbErr != nil {
+			slog.Error("orb: bar replay: close trade failed", "ticker", t.Ticker, "err", dbErr)
 			continue
 		}
 		pnlVal := pnl
@@ -1566,7 +1582,7 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 				"ticker", t.Ticker, "exit_type", ec.exitType,
 				"exit_price", res.FilledPrice, "pnl", pnl,
 			)
-			if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, ec.exitType, res.FilledPrice, pnl); dbErr != nil {
+			if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
 				slog.Error("orb: reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
 			}
 			break
@@ -1680,7 +1696,7 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			// Mark in-memory so subsequent iterations in this pass skip it.
 			t.Status = "closed"
 			if s.db != nil {
-				if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, exitType, rec.Price, pnl); dbErr != nil {
+				if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, exitType, "broker", rec.Price, pnl); dbErr != nil {
 					slog.Error("orb: exit reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
 				}
 			}
