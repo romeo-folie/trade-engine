@@ -1,0 +1,155 @@
+package orb
+
+import (
+	"context"
+	"math"
+	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
+)
+
+const eps = 1e-9
+
+// adaptiveStop: break-even moves the stop to the entry fill once the favourable excursion
+// reaches break_even_r; it never widens; it is a no-op until the threshold is met.
+func TestAdaptiveStop_BreakEven(t *testing.T) {
+	inst := config.Instrument{BreakEvenR: 1.0}
+	entry, stop, R := 1.1012, 1.0998, 0.0014 // 1R below entry
+
+	// Not yet at +1R favourable → no move.
+	if got, tighter := adaptiveStop("buy", entry, stop, R, 1.1015, 0, inst); tighter || got != stop {
+		t.Errorf("below threshold: got=%v tighter=%v; want unchanged %v/false", got, tighter, stop)
+	}
+	// At +1R favourable (hwm = entry+R) → stop ratchets to entry.
+	got, tighter := adaptiveStop("buy", entry, stop, R, entry+R, 0, inst)
+	if !tighter || math.Abs(got-entry) > eps {
+		t.Errorf("at +1R: got=%v tighter=%v; want %v/true", got, tighter, entry)
+	}
+}
+
+// Mirror image for a short: break-even drops the stop down to the entry fill.
+func TestAdaptiveStop_BreakEven_Short(t *testing.T) {
+	inst := config.Instrument{BreakEvenR: 1.0}
+	entry, stop, R := 1.0998, 1.1012, 0.0014 // 1R above entry
+	got, tighter := adaptiveStop("sell", entry, stop, R, entry-R, 0, inst)
+	if !tighter || math.Abs(got-entry) > eps {
+		t.Errorf("short at +1R: got=%v tighter=%v; want %v/true", got, tighter, entry)
+	}
+}
+
+// Trailing rides the stop up to hwm − mult×ATR once trail_after_r is met, only when that
+// is tighter than the current stop.
+func TestAdaptiveStop_Trailing(t *testing.T) {
+	inst := config.Instrument{TrailATRMult: 1.0, TrailAfterR: 0}
+	entry, stop, R, atr := 1.1012, 1.0998, 0.0014, 0.0010
+	hwm := 1.1040
+	got, tighter := adaptiveStop("buy", entry, stop, R, hwm, atr, inst)
+	want := hwm - inst.TrailATRMult*atr // 1.1030
+	if !tighter || math.Abs(got-want) > eps {
+		t.Errorf("trail: got=%v tighter=%v; want %v/true", got, tighter, want)
+	}
+	// A candidate looser than the current stop must not widen it.
+	if got, tighter := adaptiveStop("buy", entry, 1.1035, R, hwm, atr, inst); tighter || got != 1.1035 {
+		t.Errorf("trail must not widen: got=%v tighter=%v; want 1.1035/false", got, tighter)
+	}
+}
+
+// R<=0 (degenerate geometry) is a safe no-op rather than a divide-by-zero.
+func TestAdaptiveStop_ZeroRiskNoop(t *testing.T) {
+	if got, tighter := adaptiveStop("buy", 1.1, 1.09, 0, 1.2, 0.001, config.Instrument{BreakEvenR: 1}); tighter || got != 1.09 {
+		t.Errorf("R<=0: got=%v tighter=%v; want 1.09/false", got, tighter)
+	}
+}
+
+func TestHighWaterMark(t *testing.T) {
+	candles := []data.Candle{
+		{High: 1.1020, Low: 1.1005},
+		{High: 1.1045, Low: 1.1010}, // peak high here
+		{High: 1.1030, Low: 1.0990}, // trough low here
+	}
+	if got := highWaterMark("buy", 1.1012, candles); math.Abs(got-1.1045) > eps {
+		t.Errorf("buy hwm = %v; want 1.1045", got)
+	}
+	if got := highWaterMark("sell", 1.1012, candles); math.Abs(got-1.0990) > eps {
+		t.Errorf("sell hwm = %v; want 1.0990", got)
+	}
+	// No candle beats the entry → hwm stays at the entry fill.
+	if got := highWaterMark("buy", 1.2000, candles); math.Abs(got-1.2000) > eps {
+		t.Errorf("entry-only hwm = %v; want 1.2000", got)
+	}
+}
+
+// moveStopLeg resolves the live stop-loss leg by symbol/side/price and replaces it,
+// ignoring the take-profit leg (which carries no stop price) and unrelated symbols.
+func TestMoveStopLeg_ResolvesAndReplaces(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "tp", Ticker: "EUR/USD", Side: "sell", Price: 1.1040},        // TP leg: no StopPrice
+		{OrderID: "sl", Ticker: "EUR/USD", Side: "sell", StopPrice: 1.0998},    // SL leg: matches
+		{OrderID: "other", Ticker: "GBP/USD", Side: "sell", StopPrice: 1.0998}, // wrong symbol
+	}}
+	s := &ORBScheduler{executor: exec}
+	t0 := store.ORBTrade{Ticker: "EUR/USD", Side: "buy", StopLoss: 1.0998}
+
+	if !s.moveStopLeg(context.Background(), t0, 1.1012) {
+		t.Fatal("moveStopLeg returned false; want true")
+	}
+	if len(exec.replaced) != 1 || exec.replaced[0].orderID != "sl" || math.Abs(exec.replaced[0].newStop-1.1012) > eps {
+		t.Errorf("replaced = %+v; want one replace of sl @ 1.1012", exec.replaced)
+	}
+}
+
+// A short's protective stop is a buy-stop — moveStopLeg must match the opposite side.
+func TestMoveStopLeg_ShortMatchesBuyStop(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "sl", Ticker: "EUR/USD", Side: "buy", StopPrice: 1.1012},
+	}}
+	s := &ORBScheduler{executor: exec}
+	t0 := store.ORBTrade{Ticker: "EUR/USD", Side: "sell", StopLoss: 1.1012}
+	if !s.moveStopLeg(context.Background(), t0, 1.0998) || len(exec.replaced) != 1 {
+		t.Errorf("short SL not moved: ok=%v replaced=%+v", len(exec.replaced) == 1, exec.replaced)
+	}
+}
+
+// No working order matches the stored stop → no replace, returns false (never guesses).
+func TestMoveStopLeg_NoMatch(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "sl", Ticker: "EUR/USD", Side: "sell", StopPrice: 1.0950}, // price off
+	}}
+	s := &ORBScheduler{executor: exec}
+	t0 := store.ORBTrade{Ticker: "EUR/USD", Side: "buy", StopLoss: 1.0998}
+	if s.moveStopLeg(context.Background(), t0, 1.1012) || len(exec.replaced) != 0 {
+		t.Errorf("unexpected move: replaced=%+v", exec.replaced)
+	}
+}
+
+// A dual-sided ORB's pending entry is a sell-stop at the same price as the buy's SL leg.
+// moveStopLeg must skip the current-session entry order and only touch the real SL leg.
+func TestMoveStopLeg_ProtectsCurrentSessionEntry(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "sell-entry", Ticker: "EUR/USD", Side: "sell", StopPrice: 1.0998}, // current-session sell entry — protected
+		{OrderID: "sl", Ticker: "EUR/USD", Side: "sell", StopPrice: 1.0998},         // the buy's real SL leg — move this
+	}}
+	s := &ORBScheduler{
+		executor: exec,
+		orderIDs: map[string][2]string{"EUR/USD": {"buy-entry", "sell-entry"}},
+	}
+	t0 := store.ORBTrade{Ticker: "EUR/USD", Side: "buy", StopLoss: 1.0998}
+	if !s.moveStopLeg(context.Background(), t0, 1.1012) {
+		t.Fatal("moveStopLeg returned false; want true (SL leg should still be found)")
+	}
+	if len(exec.replaced) != 1 || exec.replaced[0].orderID != "sl" {
+		t.Errorf("replaced = %+v; want only [sl] (the pending sell entry must be protected)", exec.replaced)
+	}
+}
+
+// An executor that cannot replace stops (no StopOrderReplacer) is a safe no-op.
+func TestMoveStopLeg_UnsupportedExecutor(t *testing.T) {
+	s := &ORBScheduler{executor: &stubExecutor{}}
+	t0 := store.ORBTrade{Ticker: "EUR/USD", Side: "buy", StopLoss: 1.0998}
+	if s.moveStopLeg(context.Background(), t0, 1.1012) {
+		t.Error("moveStopLeg should be false for an executor without StopOrderReplacer")
+	}
+}

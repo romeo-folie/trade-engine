@@ -189,6 +189,16 @@ func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSour
 	return err
 }
 
+// UpdateORBTradeStopLoss records a moved stop on a still-open trade (adaptive break-even /
+// trailing). Guarded on status='filled' so it never touches a closed row. The canonical
+// stop_loss must track the live broker stop so the next adaptive sweep ratchets from it.
+func UpdateORBTradeStopLoss(ctx context.Context, db *pgxpool.Pool, id string, stopLoss float64) error {
+	_, err := db.Exec(ctx, `
+		UPDATE orb_trades SET stop_loss=$1 WHERE id=$2 AND status='filled'`,
+		stopLoss, id)
+	return err
+}
+
 // CloseORBTradeAt is like CloseORBTrade but stamps closed_at with an explicit time
 // rather than NOW(). The bar-replay reconciler uses it so a trade closed from a
 // historical price path records the actual bar timestamp at which its TP/stop was
