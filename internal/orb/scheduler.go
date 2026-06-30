@@ -114,6 +114,8 @@ type ORBScheduler struct {
 	lastExitReconcileAt  time.Time                // wall time of the last per-tick trades-feed reconcile
 	lastPaperExitCheckAt time.Time                // wall time of the last paper-mode exit-monitor sweep
 	lastTimeExitCheckAt  time.Time                // wall time of the last max-hold time-exit sweep
+	lastOrphanLegCheckAt time.Time                // wall time of the last orphan-leg reconcile
+	alertedOrphanLegs    map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
 	lastScan             time.Time                // Eastern Time of the last successful scan
 	fetchFailures        map[string]int           // ticker → consecutive candle-fetch failures
 	fetchLastAttempt     map[string]time.Time     // ticker → wall time of last candle-fetch attempt
@@ -159,6 +161,7 @@ func NewORBScheduler(
 		backfilledSessions: make(map[string]struct{}),
 		fetchFailures:      make(map[string]int),
 		fetchLastAttempt:   make(map[string]time.Time),
+		alertedOrphanLegs:  make(map[string]struct{}),
 	}
 }
 
@@ -375,6 +378,11 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// as a confirmed time exit rather than pre-empted by a replayed TP/stop touch. No-op
 	// outside forex mode or when max-hold is unconfigured. Throttled (see enforceTimeExits).
 	s.enforceTimeExits(ctx)
+
+	// Cross-tick cleanup of bracket legs left live after a time exit (the inline cancel
+	// is best-effort; this retries off the working-order list, decoupled from the now-closed
+	// trade row, and alerts on orders it can't prove ownership of). No-op outside forex mode.
+	s.reconcileOrphanedLegs(ctx)
 
 	// Universal exit backstop: record TP/stop exits for already-filled trades by replaying
 	// their price path from market-data bars. Runs in every state because a bracket's exit

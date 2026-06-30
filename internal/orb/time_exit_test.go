@@ -115,27 +115,17 @@ func TestCancelBracketLegs_OnlyMatchingTicker(t *testing.T) {
 	}
 }
 
-func TestCancelBracketLegs_SkipsUnrelatedPriceAndKeepsNoPriceFallback(t *testing.T) {
+func TestCancelBracketLegs_OnlyCancelsProvenLegs(t *testing.T) {
 	exec := &flattenExec{working: []execution.WorkingOrder{
 		{OrderID: "sl-leg", Ticker: "EUR/USD", StopPrice: 1.09}, // matches SL — cancel
 		{OrderID: "manual", Ticker: "EUR/USD", Price: 1.30},     // unrelated price — must survive
-		{OrderID: "no-price", Ticker: "EUR/USD"},                // no price exposed — fallback cancel
+		{OrderID: "no-price", Ticker: "EUR/USD"},                // no price exposed — cannot prove → must survive
 	}}
 	s := &ORBScheduler{executor: exec}
 	s.cancelBracketLegs(context.Background(), tradeWithLegs())
 
-	cancelled := map[string]bool{}
-	for _, id := range exec.cancelled {
-		cancelled[id] = true
-	}
-	if !cancelled["sl-leg"] {
-		t.Error("did not cancel the matching SL leg")
-	}
-	if cancelled["manual"] {
-		t.Error("cancelled an unrelated order at a non-matching price (1.30)")
-	}
-	if !cancelled["no-price"] {
-		t.Error("did not cancel a no-price order (fallback: a stale leg must not be left live)")
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != "sl-leg" {
+		t.Errorf("cancelled = %v; want [sl-leg] only (unrelated and no-price orders must not be cancelled)", exec.cancelled)
 	}
 }
 
@@ -162,6 +152,41 @@ func TestCancelBracketLegs_ProtectsCurrentSessionEntries(t *testing.T) {
 
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != "dangling-sl" {
 		t.Errorf("cancelled = %v; want [dangling-sl] (current-session entry must be protected)", exec.cancelled)
+	}
+}
+
+// ─── classifyOrphanLegs ───────────────────────────────────────────────────────
+
+func TestClassifyOrphanLegs(t *testing.T) {
+	s := &ORBScheduler{forexCfg: &config.ForexORBConfig{Instruments: []config.Instrument{
+		{Symbol: "EUR/USD"}, {Symbol: "GBP/USD"},
+	}}}
+	orders := []execution.WorkingOrder{
+		{OrderID: "orphan-tp", Ticker: "EUR/USD", Price: 1.12},     // proven stale leg → cancel
+		{OrderID: "orphan-sl", Ticker: "EUR/USD", StopPrice: 1.09}, // proven stale leg → cancel
+		{OrderID: "live-leg", Ticker: "GBP/USD", StopPrice: 1.30},  // ticker has an open filled trade → skip
+		{OrderID: "protected", Ticker: "EUR/USD", StopPrice: 1.09}, // current-session entry → skip
+		{OrderID: "noprice", Ticker: "EUR/USD"},                    // idle ticker, no price → ambiguous (alert)
+		{OrderID: "unrelated", Ticker: "EUR/USD", Price: 1.30},     // idle ticker, non-matching price → leave alone
+		{OrderID: "equity", Ticker: "AAPL", Price: 1.12},           // not a forex instrument → skip
+	}
+	openTickers := map[string]struct{}{"GBP/USD": {}}
+	timeExitPrices := map[string][]float64{"EUR/USD": {1.12, 1.09}}
+	protected := map[string]struct{}{"protected": {}}
+
+	cancel, ambiguous := s.classifyOrphanLegs(orders, openTickers, timeExitPrices, protected)
+
+	wantCancel := map[string]bool{"orphan-tp": true, "orphan-sl": true}
+	if len(cancel) != len(wantCancel) {
+		t.Fatalf("cancel = %v; want %v", cancel, wantCancel)
+	}
+	for _, id := range cancel {
+		if !wantCancel[id] {
+			t.Errorf("cancel includes %q; want only proven stale legs %v", id, wantCancel)
+		}
+	}
+	if len(ambiguous) != 1 || ambiguous[0].OrderID != "noprice" {
+		t.Errorf("ambiguous = %v; want only [noprice]", ambiguous)
 	}
 }
 

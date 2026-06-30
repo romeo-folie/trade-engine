@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"math"
 	"time"
@@ -15,6 +16,13 @@ import (
 // crosses its max-hold boundary once, so minute resolution is ample and keeps the
 // scheduler well within IBKR's request budget.
 const timeExitCheckInterval = time.Minute
+
+// orphanLegCheckInterval throttles the orphan-leg reconciler, and orphanLegLookback
+// bounds how far back it considers a time-exited trade's legs eligible for cleanup.
+const (
+	orphanLegCheckInterval = time.Minute
+	orphanLegLookback      = 24 * time.Hour
+)
 
 // flattenPollAttempts bounds how many times the flatten market order's status is
 // polled before the sweep gives up for this tick. A forex/CFD market order fills
@@ -211,9 +219,9 @@ const legPriceTol = 0.0005
 // GetWorkingOrders is account-wide, so cancellation is narrowed three ways to avoid
 // touching unrelated orders: same ticker, NOT one of the current session's known entry
 // orders (protectedOrderIDs), and a price that matches this trade's recorded TP or SL
-// (legPriceMatches — a positive ownership signal). When the gateway exposes no price,
-// legPriceMatches falls back to true so a genuine stale leg is still cancelled rather
-// than left live.
+// (legPriceMatches — a positive ownership signal). A no-price order cannot be matched
+// and is left alone here; the orphan-leg reconciler surfaces it to the operator rather
+// than cancelling something we can't prove we own.
 func (s *ORBScheduler) cancelBracketLegs(ctx context.Context, t store.ORBTrade) {
 	lister, ok := s.executor.(execution.WorkingOrdersLister)
 	if !ok {
@@ -242,27 +250,32 @@ func (s *ORBScheduler) cancelBracketLegs(ctx context.Context, t store.ORBTrade) 
 	}
 }
 
-// legPriceMatches reports whether a working order corresponds to one of a trade's
-// recorded bracket legs, by comparing the order's limit/stop price to the trade's
-// take-profit and stop-loss within legPriceTol. When the order exposes no usable
-// price it returns true: a stale leg with unknown price must still be cancelled, as
-// leaving it live (to open a new position against a flat book) is the worse outcome.
+// legPriceMatches reports whether a working order can be PROVEN to be one of a
+// trade's recorded bracket legs, by matching the order's limit/stop price to the
+// trade's take-profit or stop-loss within legPriceTol. A no-price order returns false:
+// we never cancel an order we can't prove we own (it could be a manual order or another
+// strategy's). An unprovable stale leg is instead surfaced to the operator by the
+// orphan-leg reconciler rather than silently cancelled or silently left live.
 func legPriceMatches(o execution.WorkingOrder, t store.ORBTrade) bool {
-	orderPrices := []float64{o.Price, o.StopPrice}
-	hasPrice := false
-	for _, p := range orderPrices {
-		if p > 0 {
-			hasPrice = true
-		}
+	if !orderHasPrice(o) {
+		return false
 	}
-	if !hasPrice {
-		return true // no price info — fall back to cancelling (safer than a live leg)
-	}
-	for _, p := range orderPrices {
+	return orderMatchesPrices(o, []float64{t.TakeProfit, t.StopLoss})
+}
+
+// orderHasPrice reports whether the gateway exposed any usable price for the order.
+func orderHasPrice(o execution.WorkingOrder) bool {
+	return o.Price > 0 || o.StopPrice > 0
+}
+
+// orderMatchesPrices reports whether either of the order's prices is within
+// legPriceTol of any positive target price.
+func orderMatchesPrices(o execution.WorkingOrder, targets []float64) bool {
+	for _, p := range []float64{o.Price, o.StopPrice} {
 		if p <= 0 {
 			continue
 		}
-		for _, target := range []float64{t.TakeProfit, t.StopLoss} {
+		for _, target := range targets {
 			if target > 0 && math.Abs(p-target)/target < legPriceTol {
 				return true
 			}
@@ -322,6 +335,126 @@ func (s *ORBScheduler) tickersWithOpenFilledTrades(ctx context.Context) map[stri
 		out[t.Ticker] = struct{}{}
 	}
 	return out
+}
+
+// reconcileOrphanedLegs cancels stale bracket legs left live after a time exit, with
+// cross-tick retry. The time-exit flatten cancels the legs inline, but that cancel is
+// best-effort: if it failed (an IBKR/auth hiccup), a TP/SL leg can remain live against
+// a now-flat position and later open an unintended one. Because the trade row is closed
+// by then, the time-exit sweep won't revisit it — so cleanup is decoupled from the trade
+// row and driven off the working-order list here, retrying every tick until the leg is
+// gone (the doc's "no child TP/SL orders remain live after a time exit" goal).
+//
+// Safety: it only cancels an order it can PROVE is a stale ORB leg — on a configured
+// forex ticker, not a protected current-session entry, on a ticker with NO open filled
+// trade (so no live trade could legitimately own a bracket leg), and at a price matching
+// a recently time-exited trade's TP/SL. A forex order on such an idle ticker that exposes
+// no price can't be proven either way, so it is surfaced to the operator (once) rather
+// than cancelled — never cancelling something we can't prove we own.
+func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
+	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil {
+		return
+	}
+	lister, ok := s.executor.(execution.WorkingOrdersLister)
+	if !ok {
+		return
+	}
+	if time.Since(s.lastOrphanLegCheckAt) < orphanLegCheckInterval {
+		return
+	}
+	s.lastOrphanLegCheckAt = s.now()
+
+	orders, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		slog.Warn("orb: orphan leg: list working orders failed", "err", err)
+		return
+	}
+	if len(orders) == 0 {
+		return
+	}
+
+	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
+	if err != nil {
+		slog.Warn("orb: orphan leg: load filled trades failed", "err", err)
+		return
+	}
+	openTickers := make(map[string]struct{}, len(filled))
+	for _, t := range filled {
+		openTickers[t.Ticker] = struct{}{}
+	}
+
+	recent, err := store.GetRecentORBTrades(ctx, s.db, 500)
+	if err != nil {
+		slog.Warn("orb: orphan leg: load recent trades failed", "err", err)
+		return
+	}
+	cutoff := s.now().Add(-orphanLegLookback)
+	timeExitPrices := make(map[string][]float64)
+	for _, t := range recent {
+		if t.Status != "closed" || t.ExitType != "time_exit" || !s.isForexInstrument(t.Ticker) {
+			continue
+		}
+		if t.ClosedAt == nil || t.ClosedAt.Before(cutoff) {
+			continue
+		}
+		if t.TakeProfit > 0 {
+			timeExitPrices[t.Ticker] = append(timeExitPrices[t.Ticker], t.TakeProfit)
+		}
+		if t.StopLoss > 0 {
+			timeExitPrices[t.Ticker] = append(timeExitPrices[t.Ticker], t.StopLoss)
+		}
+	}
+
+	cancel, ambiguous := s.classifyOrphanLegs(orders, openTickers, timeExitPrices, s.protectedOrderIDs())
+	for _, id := range cancel {
+		if err := s.executor.CancelOrder(ctx, id); err != nil {
+			slog.Warn("orb: orphan leg: cancel failed — will retry next sweep", "order_id", id, "err", err)
+		} else {
+			slog.Info("orb: orphan leg: cancelled stale time-exit bracket leg", "order_id", id)
+		}
+	}
+	for _, o := range ambiguous {
+		if _, alerted := s.alertedOrphanLegs[o.OrderID]; alerted {
+			continue
+		}
+		s.alertedOrphanLegs[o.OrderID] = struct{}{}
+		slog.Warn("orb: orphan leg: working order on idle forex ticker exposes no price — cannot prove ownership; left live",
+			"ticker", o.Ticker, "order_id", o.OrderID)
+		s.notify(ctx, fmt.Sprintf(
+			"ORB: working order %s on %s could not be matched to a bracket leg (no price exposed) and was left live. "+
+				"Please verify it is not an orphaned stop.", o.OrderID, o.Ticker))
+	}
+}
+
+// classifyOrphanLegs partitions account-wide working orders into the stale ORB bracket
+// legs that can be safely cancelled and the ambiguous orders that must be surfaced to an
+// operator instead. See reconcileOrphanedLegs for the ownership rules. Pure (no I/O) so
+// the decision logic is unit-tested directly.
+func (s *ORBScheduler) classifyOrphanLegs(
+	orders []execution.WorkingOrder,
+	openTickers map[string]struct{},
+	timeExitPrices map[string][]float64,
+	protected map[string]struct{},
+) (cancel []string, ambiguous []execution.WorkingOrder) {
+	for _, o := range orders {
+		if !s.isForexInstrument(o.Ticker) {
+			continue
+		}
+		if _, p := protected[o.OrderID]; p {
+			continue
+		}
+		if _, open := openTickers[o.Ticker]; open {
+			continue // a live filled trade may legitimately own a bracket leg here
+		}
+		// Idle ticker: no open filled trade, so no legitimate live bracket leg exists.
+		switch {
+		case orderMatchesPrices(o, timeExitPrices[o.Ticker]):
+			cancel = append(cancel, o.OrderID) // proven stale time-exit leg
+		case !orderHasPrice(o):
+			ambiguous = append(ambiguous, o) // can't prove ownership → alert, don't cancel
+		}
+	}
+	return cancel, ambiguous
 }
 
 // awaitFlattenFill resolves a flatten market order's fill price. It returns the
