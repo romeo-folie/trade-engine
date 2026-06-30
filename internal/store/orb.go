@@ -41,7 +41,10 @@ type ORBTrade struct {
 	SlOrderID string
 	ExitPrice float64
 	ExitType  string // "tp" | "stop" | "expired"
-	CreatedAt time.Time
+	// ExitSource records how the exit was determined: "broker" (an IBKR fill) or
+	// "replay" (reconstructed from market-data bars). Empty until the trade closes.
+	ExitSource string
+	CreatedAt  time.Time
 	// FilledAt is the entry-leg fill time. The exit reconciler uses it as the
 	// lower bound when matching exit fills. ClosedAt is set only once the trade
 	// actually closes (TP/stop/expiry), so it stays nil while a trade is open.
@@ -171,30 +174,33 @@ func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string
 }
 
 // CloseORBTrade records the outcome of an ORB trade once its exit leg (TP or stop)
-// fills. exitType is "tp", "stop", or "expired". pnl is in quote-currency units.
+// fills. exitType is "tp" or "stop"; exitSource is "broker" (an IBKR fill) or
+// "replay" (reconstructed from bars). pnl is in quote-currency units. (Pending trades
+// that never entered are marked status='expired' separately via MarkStaleORBSessionsDone,
+// not through this function.)
 // The WHERE clause guards on status='filled' so concurrent reconcilers cannot
 // overwrite an already-closed trade.
-func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType string, exitPrice, pnl float64) error {
+func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSource string, exitPrice, pnl float64) error {
 	_, err := db.Exec(ctx, `
 		UPDATE orb_trades
-		SET status='closed', exit_type=$1, exit_price=$2, pnl=$3, closed_at=NOW()
-		WHERE id=$4 AND status='filled'`,
-		exitType, exitPrice, pnl, id)
+		SET status='closed', exit_type=$1, exit_source=$2, exit_price=$3, pnl=$4, closed_at=NOW()
+		WHERE id=$5 AND status='filled'`,
+		exitType, exitSource, exitPrice, pnl, id)
 	return err
 }
 
 // CloseORBTradeAt is like CloseORBTrade but stamps closed_at with an explicit time
-// rather than NOW(). The paper-mode bars reconciler uses it so a trade closed from a
+// rather than NOW(). The bar-replay reconciler uses it so a trade closed from a
 // historical price path records the actual bar timestamp at which its TP/stop was
 // touched — keeping closed_at accurate for trades resolved after the fact (e.g. on
 // restart or backfill) instead of collapsing them all to the reconcile time. The
 // status='filled' guard makes it idempotent against the IBKR reconcilers.
-func CloseORBTradeAt(ctx context.Context, db *pgxpool.Pool, id, exitType string, exitPrice, pnl float64, closedAt time.Time) error {
+func CloseORBTradeAt(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSource string, exitPrice, pnl float64, closedAt time.Time) error {
 	_, err := db.Exec(ctx, `
 		UPDATE orb_trades
-		SET status='closed', exit_type=$1, exit_price=$2, pnl=$3, closed_at=$4
-		WHERE id=$5 AND status='filled'`,
-		exitType, exitPrice, pnl, closedAt, id)
+		SET status='closed', exit_type=$1, exit_source=$2, exit_price=$3, pnl=$4, closed_at=$5
+		WHERE id=$6 AND status='filled'`,
+		exitType, exitSource, exitPrice, pnl, closedAt, id)
 	return err
 }
 
@@ -245,7 +251,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
-		       COALESCE(exit_price,0), COALESCE(exit_type,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
@@ -262,7 +268,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
-			&t.ExitPrice, &t.ExitType,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
@@ -289,7 +295,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
-		       COALESCE(exit_price,0), COALESCE(exit_type,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at
 		FROM orb_trades WHERE status='filled'
 		ORDER BY COALESCE(filled_at, created_at)`)
@@ -307,12 +313,71 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
-			&t.ExitPrice, &t.ExitType,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ORBStats is a per-ticker performance aggregate over ORB trades. Closed-trade
+// metrics drive the `te orb stats` summary; OpenFilled surfaces trades whose entry
+// filled but whose exit has not yet been recorded (so the reader can spot a gap).
+type ORBStats struct {
+	Ticker      string
+	Closed      int
+	Wins        int
+	Losses      int
+	Scratches   int
+	TPExits     int
+	StopExits   int
+	ReplayExits int
+	BrokerExits int
+	TotalPnL    float64
+	OpenFilled  int
+}
+
+// GetORBStats returns per-ticker aggregates across every ORB trade. Only tickers
+// with at least one closed or open-filled trade are returned, ordered by ticker.
+// Win/loss/scratch are bucketed by realized pnl sign; exit-type and exit-source
+// counters break the closed set down by how the trade exited and how that exit was
+// determined (broker fill vs bar replay).
+func GetORBStats(ctx context.Context, db *pgxpool.Pool) ([]ORBStats, error) {
+	rows, err := db.Query(ctx, `
+		SELECT ticker,
+		       COUNT(*) FILTER (WHERE status='closed')                        AS closed,
+		       COUNT(*) FILTER (WHERE status='closed' AND pnl > 0)            AS wins,
+		       COUNT(*) FILTER (WHERE status='closed' AND pnl < 0)            AS losses,
+		       COUNT(*) FILTER (WHERE status='closed' AND pnl = 0)            AS scratches,
+		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='tp')     AS tp_exits,
+		       COUNT(*) FILTER (WHERE status='closed' AND exit_type='stop')   AS stop_exits,
+		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='replay') AS replay_exits,
+		       COUNT(*) FILTER (WHERE status='closed' AND exit_source='broker') AS broker_exits,
+		       COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0)           AS total_pnl,
+		       COUNT(*) FILTER (WHERE status='filled')                        AS open_filled
+		FROM orb_trades
+		GROUP BY ticker
+		HAVING COUNT(*) FILTER (WHERE status IN ('closed','filled')) > 0
+		ORDER BY ticker`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBStats
+	for rows.Next() {
+		var s ORBStats
+		if err := rows.Scan(
+			&s.Ticker, &s.Closed, &s.Wins, &s.Losses, &s.Scratches,
+			&s.TPExits, &s.StopExits,
+			&s.ReplayExits, &s.BrokerExits, &s.TotalPnL, &s.OpenFilled,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
 	}
 	return out, rows.Err()
 }
@@ -325,7 +390,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(qty,0), COALESCE(order_id,''), status,
 		       COALESCE(fill_price,0), COALESCE(pnl,0),
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
-		       COALESCE(exit_price,0), COALESCE(exit_type,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
@@ -343,7 +408,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.Qty, &t.OrderID, &t.Status,
 			&t.FillPrice, &t.PnL,
 			&t.TpOrderID, &t.SlOrderID,
-			&t.ExitPrice, &t.ExitType,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 		); err != nil {
 			return nil, err
