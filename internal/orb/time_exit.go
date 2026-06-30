@@ -82,14 +82,16 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 // flattenDueTimeExits is the post-load orchestration of enforceTimeExits, split out so the
 // group-atomic flatten/cancel logic is unit-testable with injected trades.
 func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.ORBTrade, now time.Time) {
-	// Collect the trades due for a time exit, then group split-bracket legs by their logical
-	// trade so a group flattens TOGETHER before any leg is cancelled. The runner and partial
-	// share one stop PRICE: cancelling that stop while a sibling leg is still open (or after
-	// only one leg flattened) would leave the sibling naked or, if left live, fire against a
-	// now-flat leg and open a reverse. So: flatten every leg first, then cancel the legs only
-	// once the WHOLE group is confirmed flat.
+	// Group ALL still-open forex legs by their logical trade — not just the ones already past
+	// max-hold. A split group's legs share a fill instant and the same max-hold, but their
+	// fills can be stamped a few seconds apart, so one leg can become due a sweep before its
+	// sibling. The runner and partial also share one stop PRICE: cancelling that stop while a
+	// sibling leg is still open would leave it naked. So we assemble the whole group, and once
+	// ANY leg is due we flatten EVERY open leg (a sibling a few seconds short of its own
+	// deadline goes with it) and cancel the legs only after the whole group is confirmed flat.
 	groups := make(map[string][]store.ORBTrade)
 	var order []string
+	due := make(map[string]bool)
 	for i := range trades {
 		t := trades[i]
 
@@ -107,15 +109,6 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 			continue
 		}
 
-		maxHold := s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker)
-		anchor := t.CreatedAt
-		if t.FilledAt != nil {
-			anchor = *t.FilledAt
-		}
-		if !shouldTimeExit(anchor, maxHold, now) {
-			continue
-		}
-
 		key := t.ID
 		if t.ScaleOutParentID != nil && *t.ScaleOutParentID != "" {
 			key = *t.ScaleOutParentID
@@ -124,26 +117,39 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 			order = append(order, key)
 		}
 		groups[key] = append(groups[key], t)
+
+		maxHold := s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker)
+		anchor := t.CreatedAt
+		if t.FilledAt != nil {
+			anchor = *t.FilledAt
+		}
+		if shouldTimeExit(anchor, maxHold, now) {
+			due[key] = true
+		}
 	}
 
 	for _, key := range order {
+		if !due[key] {
+			continue // no leg of this logical trade has reached max-hold yet
+		}
 		legs := groups[key]
 		if len(legs) == 1 {
-			// Ordinary trade, or a lone due leg whose split sibling already closed (its shared
-			// stop is gone with it): flatten and cancel its legs inline, as before.
+			// Ordinary trade, or a split leg whose sibling already closed (its shared stop was
+			// OCO-cancelled with it, so nothing else holds that price): flatten and cancel its
+			// legs inline, as before.
 			s.flattenAndRecordTimeExit(ctx, legs[0], s.forexCfg.EffectiveMaxHoldMinutes(legs[0].Ticker), false)
 			continue
 		}
-		// Split-bracket group: flatten every leg first (deferring leg cancellation).
+		// Split-bracket group with >1 open leg: flatten every leg first (deferring leg
+		// cancellation), then cancel the group's legs only once EVERY leg is confirmed flat.
+		// If any flatten failed, leave all legs intact and retry next sweep — never strip a
+		// shared stop while a leg might still hold a position.
 		allFlat := true
 		for _, t := range legs {
 			if !s.flattenAndRecordTimeExit(ctx, t, s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker), true) {
 				allFlat = false
 			}
 		}
-		// Cancel the group's shared legs only once EVERY leg is confirmed flat. If any flatten
-		// failed, leave all legs intact and retry next sweep — never strip a stop while a leg
-		// might still hold a position.
 		if allFlat {
 			for _, t := range legs {
 				s.cancelBracketLegs(ctx, t)
