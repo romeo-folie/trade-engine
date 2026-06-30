@@ -1052,6 +1052,9 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// a confirmed close prints — then place ONLY the confirmed side (zero the other so
 			// the placement loop below skips it). No confirmation yet → leave the ticker
 			// unplaced and keep the session in Executing (pendingConfirmation) to retry next tick.
+			// Stop-touch (default) rests stop-entry brackets at the breakout level. Confirmation
+			// modes instead enter at MARKET once a close confirms — placeFn switches accordingly.
+			placeFn := PlaceBracket
 			if RequiresConfirmation(inst.BreakoutConfirmation) {
 				side := s.confirmedSide(ctx, ticker, r, buyParams, sellParams, inst.BreakoutConfirmation)
 				if side == "" {
@@ -1064,6 +1067,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				} else {
 					buyParams.Qty = 0
 				}
+				placeFn = PlaceMarketBracket
 			}
 
 			var ids [2]string
@@ -1074,7 +1078,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				if p.params.Qty == 0 {
 					continue
 				}
-				orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, p.params)
+				orderID, tpID, slID, err := placeFn(ctx, s.executor, p.params)
 				if err != nil {
 					slog.Error("orb: place bracket failed", "side", p.side, "ticker", ticker, "err", err)
 					continue
@@ -1204,6 +1208,12 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 	// confirmed/placed (or the entry window closes, cancelling unconfirmed setups), fall
 	// through to Done and let tickDone clean up.
 	if pendingConfirmation && s.withinEntryWindow() {
+		// Don't starve trade management while we wait: run tickDone's reconciliation so an
+		// already-placed side's fill is persisted, its opposing dual-sided stop is cancelled
+		// (OCO), and paper stop fills are driven from market data. tickDone's cleanup block is
+		// gated on the cutoff — the exact complement of withinEntryWindow — so it is skipped
+		// here and no session-end transition happens while we're still inside the window.
+		_ = s.tickDone(ctx)
 		return nil
 	}
 

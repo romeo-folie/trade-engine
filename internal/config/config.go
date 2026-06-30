@@ -1269,6 +1269,20 @@ func Validate(cfg *Config) []string {
 		}
 	}
 
+	// Validate forex ORB per-instrument breakout_confirmation so a typo (e.g. "close_3")
+	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
+	// wick-touch entries Phase 3 is meant to filter.
+	if cfg.ForexORB.Enabled {
+		validConfirm := map[string]bool{"": true, "stop_touch": true, "close_1m": true, "close_3m": true}
+		for _, inst := range cfg.ForexORB.Instruments {
+			if !validConfirm[inst.BreakoutConfirmation] {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m",
+					inst.Symbol, inst.BreakoutConfirmation))
+			}
+		}
+	}
+
 	return errs
 }
 

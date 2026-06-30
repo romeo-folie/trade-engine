@@ -221,14 +221,20 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 	var entryIdx int
 	var entryMid float64
 	if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {
-		// Confirmation enters at the confirming candle's close (market on confirmation),
-		// not at the breakout level — a later, worse fill in exchange for a stronger signal.
-		var ok bool
-		side, entryIdx, ok = orb.DetectConfirmation(inst.BreakoutConfirmation, inWindow, buy.EntryStop, sell.EntryStop)
+		// Confirmation is a GATE; the entry is market-on-confirmation, matching live (which
+		// places a MARKET bracket once a close confirms). So the fill is the NEXT bar's open
+		// (≈ the price at the next scheduler tick), not the breakout level — a later, market
+		// fill in exchange for filtering wicks. No resting stop, so no pullback re-fill.
+		cSide, confIdx, ok := orb.DetectConfirmation(inst.BreakoutConfirmation, inWindow, buy.EntryStop, sell.EntryStop)
 		if !ok {
 			return nil, nil // breakout never confirmed within the entry window
 		}
-		entryMid = watch[entryIdx].Close
+		entryIdx = confIdx + 1
+		if entryIdx >= len(watch) {
+			return nil, nil // confirmed on the last available bar — no bar to fill on
+		}
+		side = cSide
+		entryMid = watch[entryIdx].Open
 	} else {
 		var ok bool
 		side, entryIdx, ok = firstBreakout(inWindow, buy, sell, entryDeadline)
@@ -284,8 +290,8 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 
 	entryBar := watch[entryIdx]
 	entryTime := entryBar.Timestamp
-	// Fill at entryMid (the breakout level for a stop touch, or the confirming candle's
-	// close for a confirmation entry), paying the spread (buy at ask, sell at bid).
+	// Fill at entryMid (the breakout level for a stop touch, the next-bar open for a
+	// market-on-confirmation entry), paying the spread (buy at ask, sell at bid).
 	entryFill := entryMid
 	if p.Side == "buy" {
 		entryFill += half
