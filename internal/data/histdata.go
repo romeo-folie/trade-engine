@@ -116,14 +116,13 @@ func (c *HistDataClient) FetchCandles(ctx context.Context, ticker string, tf Tim
 		return nil, nil
 	}
 
-	// This provider is 1-minute-granular: it caches 1-minute bars, so sub-minute precision in the
-	// range is not representable. Floor both bounds to the minute so behaviour is DETERMINISTIC and
-	// matches tick-level [from, to) filtering exactly (a no-op for every real caller, which is
-	// already minute-aligned; without it a sub-minute bound would silently drop/keep an edge bar).
-	from = from.Truncate(time.Minute)
-	to = to.Truncate(time.Minute)
-	if !to.After(from) {
-		return nil, nil // a sub-minute range collapsed to empty
+	// This provider is 1-minute-granular (it caches 1-minute bars), so it cannot honour the
+	// half-open [from, to) contract at sub-minute resolution: flooring the bounds would silently
+	// over-include ticks before `from` and drop the minute containing `to`. Reject non-aligned
+	// bounds so misuse fails loud instead of returning subtly wrong bars — every real caller
+	// (session opens, ATR lookbacks) is already minute-aligned.
+	if subMinute(from) || subMinute(to) {
+		return nil, fmt.Errorf("histdata: FetchCandles needs minute-aligned bounds (1-minute granularity); got from=%s to=%s", from.UTC(), to.UTC())
 	}
 
 	// The archive is keyed by ET month. A tick's ET time is monotonic in its UTC time, so every
@@ -444,6 +443,10 @@ func aggregateTicksToMinute(ticker string, ticks []dukaTick) []Candle {
 	}
 	return aggregateTicks(ticker, Timeframe1Min, time.Minute, time.Time{}, histDataMaxTime, ticks)
 }
+
+// subMinute reports whether a time carries a non-zero seconds/nanoseconds component (i.e. is not
+// aligned to a whole minute).
+func subMinute(t time.Time) bool { return t.Second() != 0 || t.Nanosecond() != 0 }
 
 // sliceBars returns a COPY of the bars whose timestamp is in [from, to). Input must be sorted
 // ascending by timestamp (the month caches are). The copy protects the shared cache from callers

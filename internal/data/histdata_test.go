@@ -287,35 +287,44 @@ func TestHistData_BarCacheEqualsTickAggregation(t *testing.T) {
 
 // A sub-minute range must floor to whole minutes and return the same bars as the minute-aligned
 // query — deterministic, not the silent edge-bar drop/keep of raw bucket-start comparison.
-func TestHistData_FetchCandles_FloorsSubMinuteRange(t *testing.T) {
-	// One ET month (May 2025) of a few ticks per minute across the 08:00 UTC hour.
-	var raw []byte
-	for m := range 60 {
-		// ET 04:mm (EDT) == UTC 08:mm.
-		bid := 1.10000 + float64(m)*0.0001
-		raw = fmt.Appendf(raw, "20250501 04%02d00000,%.5f,%.5f,0\n", m, bid, bid+0.0001)
-	}
-	zb := zipWithCSV(t, "DAT_ASCII_EURUSD_T_202505", string(raw))
-	srv := histDataTestServer(t, zb, nil)
-	defer srv.Close()
-	c := newTestHistData(t, srv.URL, "", srv.Client())
+// A 1-minute-granular provider cannot honour a sub-minute half-open range, so it must reject
+// non-minute-aligned bounds (fail loud) rather than silently return subtly wrong bars. A
+// minute-aligned query still works.
+func TestHistData_FetchCandles_RejectsSubMinuteRange(t *testing.T) {
+	c := newTestHistData(t, "http://unused.invalid", "", nil)
+	ctx := context.Background()
+	aligned := time.Date(2025, 5, 1, 8, 0, 0, 0, time.UTC)
+	end := time.Date(2025, 5, 1, 9, 0, 0, 0, time.UTC)
 
-	aligned, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour,
-		time.Date(2025, 5, 1, 8, 0, 0, 0, time.UTC), time.Date(2025, 5, 1, 9, 0, 0, 0, time.UTC))
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name     string
+		from, to time.Time
+	}{
+		{"sub-second from", aligned.Add(500 * time.Nanosecond), end},
+		{"sub-minute from", aligned.Add(30 * time.Second), end},
+		{"sub-minute to", aligned, end.Add(45 * time.Second)},
+	} {
+		if _, err := c.FetchCandles(ctx, "EUR/USD", Timeframe1Hour, tc.from, tc.to); err == nil {
+			t.Errorf("%s: expected error for non-minute-aligned bounds, got nil", tc.name)
+		}
 	}
-	// Same query with sub-minute jitter on both bounds → must floor to the aligned result.
-	jittered, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour,
-		time.Date(2025, 5, 1, 8, 0, 30, 500, time.UTC), time.Date(2025, 5, 1, 9, 0, 45, 0, time.UTC))
-	if err != nil {
-		t.Fatal(err)
+
+	// Minute-aligned bounds are accepted (no data served here, but no alignment error and it must
+	// not panic — the request reaches the fetch path).
+	if _, err := c.FetchCandles(ctx, "EUR/USD", Timeframe1Hour, aligned, end); err != nil {
+		if strings.Contains(err.Error(), "minute-aligned") {
+			t.Errorf("minute-aligned query wrongly rejected: %v", err)
+		}
 	}
-	if len(aligned) != 1 || len(jittered) != len(aligned) {
-		t.Fatalf("aligned=%d jittered=%d; want both 1 bar", len(aligned), len(jittered))
+}
+
+func TestHistData_SubMinuteHelper(t *testing.T) {
+	base := time.Date(2025, 5, 1, 8, 0, 0, 0, time.UTC)
+	if subMinute(base) {
+		t.Error("whole-minute time reported sub-minute")
 	}
-	if aligned[0] != jittered[0] {
-		t.Errorf("sub-minute range not floored to aligned result:\n aligned=%+v\n jittered=%+v", aligned[0], jittered[0])
+	if !subMinute(base.Add(time.Second)) || !subMinute(base.Add(time.Nanosecond)) {
+		t.Error("sub-minute time not detected")
 	}
 }
 
