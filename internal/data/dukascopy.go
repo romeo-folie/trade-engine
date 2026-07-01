@@ -52,14 +52,14 @@ type DukascopyClient struct {
 	mu    sync.Mutex
 	cache map[string][]dukaTick // hour key → parsed ticks (an empty slice is cached for a no-data hour)
 
-	// Lifetime coverage counters (under mu): if the client fetches more than a full weekend
-	// of hours and NONE ever return ticks, the feed is misconfigured (wrong base URL or
-	// instrument) rather than just closed — a legitimate weekend gap is at most ~48 hours, and
-	// any longer span necessarily includes weekday trading hours with data. Tracked at the
-	// client level (not per FetchCandles call) because the ORB backtest fetches in many small
-	// per-session windows, so a per-call check would never accumulate enough hours to fire.
-	hoursFetched  int
-	hoursWithData int
+	// Per-instrument lifetime coverage counters (under mu): if an instrument's fetches exceed
+	// a full weekend of hours and NONE return ticks, its feed path is misconfigured (wrong
+	// symbol or base URL) rather than just closed — a legitimate weekend gap is at most ~48
+	// hours, and any longer span includes weekday trading hours with data. Keyed PER INSTRUMENT
+	// (not client-wide) so a valid earlier symbol can't mask a later broken one; tracked across
+	// calls because the ORB backtest fetches in many small per-session windows.
+	hoursFetched  map[string]int // instrument → hours fetched
+	hoursWithData map[string]int // instrument → hours that returned ticks
 
 	minInterval time.Duration
 	lastRequest time.Time
@@ -76,11 +76,13 @@ func NewDukascopyClient(baseURL string, pointScale map[string]float64) *Dukascop
 		baseURL = DukascopyBaseURL
 	}
 	return &DukascopyClient{
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		pointScale:  pointScale,
-		httpClient:  &http.Client{Timeout: 60 * time.Second},
-		cache:       make(map[string][]dukaTick),
-		minInterval: 50 * time.Millisecond,
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		pointScale:    pointScale,
+		httpClient:    &http.Client{Timeout: 60 * time.Second},
+		cache:         make(map[string][]dukaTick),
+		hoursFetched:  make(map[string]int),
+		hoursWithData: make(map[string]int),
+		minInterval:   50 * time.Millisecond,
 	}
 }
 
@@ -148,7 +150,8 @@ func (c *DukascopyClient) FetchCandles(ctx context.Context, ticker string, tf Ti
 // fetchHour returns the parsed ticks for one instrument-hour, caching the result (including
 // an empty slice for a no-data hour) so repeated/overlapping range requests don't re-fetch.
 func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour time.Time) ([]dukaTick, error) {
-	path := dukascopyHourPath(dukascopyInstrument(ticker), hour)
+	inst := dukascopyInstrument(ticker)
+	path := dukascopyHourPath(inst, hour)
 
 	c.mu.Lock()
 	if ticks, cached := c.cache[path]; cached {
@@ -173,12 +176,16 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	}
 	c.mu.Lock()
 	c.cache[path] = ticks
-	c.hoursFetched++
-	if len(ticks) > 0 {
-		c.hoursWithData++
+	if c.hoursFetched == nil { // defensive for a directly-constructed client (e.g. in tests)
+		c.hoursFetched = make(map[string]int)
+		c.hoursWithData = make(map[string]int)
 	}
-	brokenFeed := c.hoursWithData == 0 && c.hoursFetched > dukascopyEmptyHoursError
-	fetched := c.hoursFetched
+	c.hoursFetched[inst]++
+	if len(ticks) > 0 {
+		c.hoursWithData[inst]++
+	}
+	fetched := c.hoursFetched[inst]
+	brokenFeed := c.hoursWithData[inst] == 0 && fetched > dukascopyEmptyHoursError
 	c.mu.Unlock()
 
 	if brokenFeed {

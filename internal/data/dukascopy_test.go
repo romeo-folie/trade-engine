@@ -77,6 +77,37 @@ func TestDukascopy_BrokenFeedGuard(t *testing.T) {
 	}
 }
 
+// The broken-feed guard is PER INSTRUMENT: a valid symbol returning ticks must not mask a
+// later misconfigured symbol that 404s for every hour.
+func TestDukascopy_BrokenFeedGuard_PerInstrument(t *testing.T) {
+	// Serve valid data only for EURUSD; 404 everything else (e.g. a wrong GBP path).
+	raw := append(tickRec(0, 110100, 110080, 1, 1), tickRec(1000, 110120, 110100, 1, 1)...)
+	var buf bytes.Buffer
+	w, _ := lzma.NewWriter(&buf)
+	_, _ = w.Write(raw)
+	_ = w.Close()
+	compressed := buf.Bytes()
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/EURUSD/") {
+			_, _ = rw.Write(compressed)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := testClient(srv.URL, srv.Client())
+	from := time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC) // a Monday
+	// EUR/USD over 60h returns bars (valid) → no error, sets its own counters nonzero.
+	if bars, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, from, from.Add(60*time.Hour)); err != nil || len(bars) == 0 {
+		t.Fatalf("EUR/USD: bars=%d err=%v; want data and no error", len(bars), err)
+	}
+	// GBP/USD (same client, all 404) over 60h must STILL error — not masked by EUR/USD's data.
+	if _, err := c.FetchCandles(context.Background(), "GBP/USD", Timeframe1Hour, from, from.Add(60*time.Hour)); err == nil || !strings.Contains(err.Error(), "verify the") {
+		t.Errorf("GBP/USD broken feed masked by EUR/USD data: err = %v; want the broken-feed diagnostic", err)
+	}
+}
+
 func tickRec(ms, ask, bid uint32, askVol, bidVol float32) []byte {
 	b := make([]byte, dukaTickBytes)
 	binary.BigEndian.PutUint32(b[0:], ms)
