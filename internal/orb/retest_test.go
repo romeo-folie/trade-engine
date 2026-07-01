@@ -41,6 +41,22 @@ func TestDetectRetest_LongBounce(t *testing.T) {
 	}
 }
 
+// A bounce that exceeds the retest high but by LESS than the pip buffer must NOT trigger — the
+// buy-stop entry at retestHigh+buffer was never actually traded that candle.
+func TestDetectRetest_BounceMustReachBufferedEntry(t *testing.T) {
+	rangeHigh, rangeLow, buyTrig, buffer, tol := 1.1000, 1.0980, 1.1002, 0.0002, 0.30
+	candles := []data.Candle{
+		rtBar(0, 1.1001, 1.1010, 1.1000, 1.1008), // breakout
+		rtBar(1, 1.1008, 1.1009, 1.1003, 1.1004), // retest bar: high 1.1009 → entry level 1.1011
+		rtBar(2, 1.1004, 1.1010, 1.1004, 1.1009), // high 1.1010 > retestHigh 1.1009 but < entry 1.1011 → NO fill
+		rtBar(3, 1.1009, 1.1012, 1.1006, 1.1011), // high 1.1012 >= 1.1011 → ENTRY here
+	}
+	r := DetectRetest(candles, buyTrig, 0, rangeHigh, rangeLow, buffer, tol, 30)
+	if !r.OK || r.EntryIdx != 3 {
+		t.Fatalf("entry should trigger only when the buffered level is reached (idx 3), got %+v", r)
+	}
+}
+
 // A close back inside the range after breakout = failed breakout → no entry.
 func TestDetectRetest_FailedBreakoutClosesInside(t *testing.T) {
 	rangeHigh, rangeLow, buyTrig := 1.1000, 1.0980, 1.1002

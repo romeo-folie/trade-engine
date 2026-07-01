@@ -305,6 +305,16 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 			}
 		}
 		rp := orb.ComputeRetestBracket(inst.Symbol, side, entryMid, stopLevel, portfolioValue, e.cfg, inst)
+		// Re-apply the spread/risk gate against the RETEST bracket's risk: retest_swing's stop is
+		// much tighter than the range stop, so spread/retest-risk can exceed the cap even when
+		// spread/range-risk (checked above) did not — the gate must see the actual entry's risk.
+		if v.ApplyEntryFilters && inst.MaxSpreadToRisk > 0 {
+			if risk := absf(rp.EntryStop - rp.StopLoss); risk > 0 {
+				if e.costFor(inst.Symbol).Spread/risk > inst.MaxSpreadToRisk {
+					return nil, nil // spread too wide relative to the retest stop distance
+				}
+			}
+		}
 		retestParams = &rp
 	} else if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {
 		// Confirmation is a GATE; the entry is market-on-confirmation, matching live (which

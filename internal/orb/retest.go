@@ -88,7 +88,9 @@ func DetectRetest(candles []data.Candle, buyTrigger, sellTrigger, rangeHigh, ran
 			if c.Close < rangeHigh {
 				return RetestResult{} // closed back inside the range → failed breakout
 			}
-			if haveRetest && c.High > retestHigh {
+			// Entry is a buy-stop at retestHigh+buffer; require the bar to actually TRADE through
+			// that level (high >= entry), else the fill price was never reached this candle.
+			if haveRetest && c.High >= retestHigh+buffer {
 				return RetestResult{Side: "buy", EntryIdx: j, EntryPrice: retestHigh + buffer, SwingLow: retestLow, OK: true}
 			}
 			if c.Low <= buyTrigger+tol && (!haveRetest || c.Low < retestLow) {
@@ -98,7 +100,7 @@ func DetectRetest(candles []data.Candle, buyTrigger, sellTrigger, rangeHigh, ran
 			if c.Close > rangeLow {
 				return RetestResult{} // closed back inside the range → failed breakout
 			}
-			if haveRetest && c.Low < retestLow {
+			if haveRetest && c.Low <= retestLow-buffer {
 				return RetestResult{Side: "sell", EntryIdx: j, EntryPrice: retestLow - buffer, SwingHigh: retestHigh, OK: true}
 			}
 			if c.High >= sellTrigger-tol && (!haveRetest || c.High > retestHigh) {

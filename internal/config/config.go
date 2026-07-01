@@ -1391,14 +1391,16 @@ func Validate(cfg *Config) []string {
 	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
 	// wick-touch entries Phase 3 is meant to filter.
 	if cfg.ForexORB.Enabled {
-		validConfirm := map[string]bool{
-			"": true, "stop_touch": true, "close_1m": true, "close_3m": true,
-			"retest_swing": true, "retest_range": true,
-		}
+		// retest_swing/retest_range are BACKTEST-ONLY: the live scheduler has no retest path (it
+		// only diverges from stop-touch when RequiresConfirmation is true, i.e. the close_* modes),
+		// so a live config with a retest mode would silently place stop-touch brackets. Reject it
+		// here so a live `te run` / `config validate` fails loud instead of misbehaving; the sweep
+		// sets retest modes programmatically and never goes through Validate.
+		validConfirm := map[string]bool{"": true, "stop_touch": true, "close_1m": true, "close_3m": true}
 		for _, inst := range cfg.ForexORB.Instruments {
 			if !validConfirm[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
+					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m (retest_swing/retest_range are backtest-only)",
 					inst.Symbol, inst.BreakoutConfirmation))
 			}
 			// Split-bracket partial take-profit: a partial needs a fraction in (0,1), and its
