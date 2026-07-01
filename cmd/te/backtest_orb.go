@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -184,11 +185,30 @@ func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) 
 	}
 	switch strings.ToLower(cmpOr(prov, "dukascopy")) {
 	case "dukascopy":
-		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, cfg.Markets.Dukascopy.PointScale), nil
+		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveDukascopyCacheDir(cfg.Markets.Dukascopy.CacheDir), cfg.Markets.Dukascopy.PointScale), nil
 	case "oanda":
 		return buildOANDAProvider(cfg.Markets.OANDA)
 	default:
 		return nil, fmt.Errorf("unknown backtest data provider %q (use dukascopy|oanda)", prov)
+	}
+}
+
+// resolveDukascopyCacheDir maps the config value to an actual cache path. An unset value defaults
+// to ~/.tradeengine/dukascopy-cache so the cache is on by default (fetch-once, then serve from
+// disk). "off"/"none"/"disabled" (case-insensitive) turns the cache off — every hour is fetched
+// live, which is only useful for a one-shot run that must not touch prior cached data.
+func resolveDukascopyCacheDir(configured string) string {
+	switch strings.ToLower(strings.TrimSpace(configured)) {
+	case "off", "none", "disabled":
+		return ""
+	case "":
+		home, err := os.UserHomeDir()
+		if err != nil || home == "" {
+			return "" // no home → cache disabled rather than writing to an unknown location
+		}
+		return filepath.Join(home, ".tradeengine", "dukascopy-cache")
+	default:
+		return configured
 	}
 }
 

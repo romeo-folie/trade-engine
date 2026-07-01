@@ -104,8 +104,10 @@ func TestDukascopy_TransientFailureSkipsHour(t *testing.T) {
 	defer srv.Close()
 
 	// No throttle/backoff delay: a directly-constructed client has minInterval 0, but backoff
-	// still sleeps — so keep the range tiny (2 hours: the 503 hour + the good hour).
+	// still sleeps — so keep the range tiny (2 hours: the 503 hour + the good hour) and lower
+	// the retry budget to 2 so the persistently-503 hour fires only one 500 ms backoff.
 	c := testClient(srv.URL, srv.Client())
+	c.maxAttempts = 2
 	bars, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(2*time.Hour))
 	if err != nil {
 		t.Fatalf("a single transient-503 hour must not abort the run: %v", err)
@@ -312,5 +314,152 @@ func TestAggregateTicks(t *testing.T) {
 	b1 := bars[1]
 	if b1.Open != 1.11 || b1.High != 1.11 || b1.Low != 1.11 || b1.Close != 1.11 {
 		t.Errorf("08:01 OHLC = %v/%v/%v/%v; want all 1.11", b1.Open, b1.High, b1.Low, b1.Close)
+	}
+}
+
+// testClientWithCache is testClient plus an on-disk cache root.
+func testClientWithCache(baseURL string, hc *http.Client, cacheDir string) *DukascopyClient {
+	c := testClient(baseURL, hc)
+	c.cacheDir = cacheDir
+	return c
+}
+
+// lzmaBI5 packs raw tick bytes into an LZMA .bi5 body the way the feed serves them.
+func lzmaBI5(t *testing.T, raw []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	w, err := lzma.NewWriter(&buf)
+	if err != nil {
+		t.Fatalf("lzma.NewWriter: %v", err)
+	}
+	if _, err := w.Write(raw); err != nil {
+		t.Fatalf("lzma write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("lzma close: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// The disk cache makes an hour fetch-once: a warm run populates cacheDir, then a second client
+// with the SAME cacheDir and a server that would fail every request must still return the bar —
+// proving it read from disk and never touched the network.
+func TestDukascopy_DiskCache_ServesWithoutNetwork(t *testing.T) {
+	hour := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	raw := append(tickRec(0, 110100, 110080, 1, 1), tickRec(30000, 110150, 110130, 1, 1)...)
+	compressed := lzmaBI5(t, raw)
+	const wantPath = "/EURUSD/2026/06/01/08h_ticks.bi5"
+
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == wantPath {
+			hits++
+			_, _ = rw.Write(compressed)
+			return
+		}
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	// Warm the cache.
+	warm := testClientWithCache(srv.URL, srv.Client(), dir)
+	if _, err := warm.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("warm FetchCandles: %v", err)
+	}
+	if hits != 1 {
+		t.Fatalf("warm run made %d server hits; want 1", hits)
+	}
+
+	// A fresh client with the same cacheDir but a dead server must serve from disk.
+	dead := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer dead.Close()
+
+	cold := testClientWithCache(dead.URL, dead.Client(), dir)
+	bars, err := cold.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("cold (disk) FetchCandles: %v", err)
+	}
+	if len(bars) != 1 || math.Abs(bars[0].Close-1.10140) > 1e-9 {
+		t.Fatalf("disk-served bars = %+v; want 1 bar close 1.10140", bars)
+	}
+}
+
+// A confirmed no-data (404) hour is persisted as a 0-byte marker and never re-fetched.
+func TestDukascopy_DiskCache_PersistsNoDataHour(t *testing.T) {
+	hour := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		hits++
+		rw.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	c := testClientWithCache(srv.URL, srv.Client(), dir)
+	for i := range 2 {
+		bars, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour))
+		if err != nil {
+			t.Fatalf("run %d FetchCandles: %v", i, err)
+		}
+		if len(bars) != 0 {
+			t.Fatalf("run %d bars = %d; want 0", i, len(bars))
+		}
+	}
+	// In-memory cache short-circuits the second call in the SAME client, so this proves the
+	// write path only: a brand-new client reading the marker must not hit the network.
+	fresh := testClientWithCache(srv.URL, srv.Client(), dir)
+	hitsBefore := hits
+	if _, err := fresh.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour)); err != nil {
+		t.Fatalf("fresh FetchCandles: %v", err)
+	}
+	if hits != hitsBefore {
+		t.Fatalf("fresh client hit network %d times for a cached no-data hour; want 0", hits-hitsBefore)
+	}
+}
+
+// A transient failure (retries exhausted → skip) must NOT be persisted, so a later run can still
+// fetch the real data instead of inheriting a phantom no-data marker.
+func TestDukascopy_DiskCache_DoesNotPersistTransientSkip(t *testing.T) {
+	hour := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	const wantPath = "/EURUSD/2026/06/01/08h_ticks.bi5"
+	raw := append(tickRec(0, 110100, 110080, 1, 1), tickRec(30000, 110150, 110130, 1, 1)...)
+	compressed := lzmaBI5(t, raw)
+
+	fail := true
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != wantPath {
+			rw.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if fail {
+			rw.WriteHeader(http.StatusServiceUnavailable) // 503 every attempt → transient skip
+			return
+		}
+		_, _ = rw.Write(compressed)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+
+	// First run: 503 exhausts retries → hour skipped, nothing persisted.
+	skip := testClientWithCache(srv.URL, srv.Client(), dir)
+	skip.maxAttempts = 2 // keep the retry loop short for the test
+	if bars, err := skip.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour)); err != nil || len(bars) != 0 {
+		t.Fatalf("transient run: bars=%d err=%v; want 0/nil (skipped)", len(bars), err)
+	}
+
+	// Second run against a now-healthy server must fetch the real bar (no phantom marker on disk).
+	fail = false
+	ok := testClientWithCache(srv.URL, srv.Client(), dir)
+	bars, err := ok.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("recovery run: %v", err)
+	}
+	if len(bars) != 1 || math.Abs(bars[0].Close-1.10140) > 1e-9 {
+		t.Fatalf("recovery bars = %+v; want 1 bar close 1.10140 (transient skip must not have been cached)", bars)
 	}
 }

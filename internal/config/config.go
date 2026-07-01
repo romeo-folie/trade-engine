@@ -524,6 +524,10 @@ type MarketsConfig struct {
 // tick files served as static objects). Data-only; live trading does not use it.
 type DukascopyConfig struct {
 	BaseURL string `yaml:"base_url"` // optional feed override (default DukascopyBaseURL)
+	// CacheDir is the on-disk cache root. Each hour is fetched from the (rate-limited) feed at
+	// most once, ever, then served from disk — so repeated backtests never re-fetch and never
+	// re-trigger throttling. Empty → default ~/.tradeengine/dukascopy-cache; "off" disables.
+	CacheDir string `yaml:"cache_dir"`
 	// PointScale optionally overrides the integer→price divisor per ticker (e.g. XAU/USD).
 	// Defaults: 5-decimal FX ÷1e5, JPY pairs and metals ÷1e3.
 	PointScale map[string]float64 `yaml:"point_scale"`

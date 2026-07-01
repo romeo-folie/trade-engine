@@ -10,6 +10,8 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -48,8 +50,10 @@ const dukaTickBytes = 20
 // FetchHistory return errors. This is a BACKTEST data source, not a live feed.
 type DukascopyClient struct {
 	baseURL    string
-	pointScale map[string]float64 // ticker → price divisor override (see priceDivisor)
-	httpClient *http.Client
+	cacheDir   string             // on-disk cache root ("" disables); see readDiskCache/writeDiskCache
+	pointScale  map[string]float64 // ticker → price divisor override (see priceDivisor)
+	httpClient  *http.Client
+	maxAttempts int // per-request try budget (default dukascopyMaxAttempts; lowered in tests)
 
 	mu    sync.Mutex
 	cache map[string][]dukaTick // hour key → parsed ticks (an empty slice is cached for a no-data hour)
@@ -91,17 +95,20 @@ var errDukaTransient = errors.New("dukascopy: transient fetch failure (retries e
 const dukascopyMaxFetchFailures = 25
 
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
-// public feed when empty. pointScale optionally overrides the per-ticker price divisor.
-func NewDukascopyClient(baseURL string, pointScale map[string]float64) *DukascopyClient {
+// public feed when empty. cacheDir, when non-empty, enables the on-disk cache (each hour is
+// fetched from the feed at most once, ever). pointScale optionally overrides the divisor.
+func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64) *DukascopyClient {
 	if baseURL == "" {
 		baseURL = DukascopyBaseURL
 	}
 	return &DukascopyClient{
 		baseURL:    strings.TrimRight(baseURL, "/"),
+		cacheDir:   cacheDir,
 		pointScale: pointScale,
 		// 20s (not 60s): a throttled feed hangs the response after the TCP connect; a long
 		// timeout × retries makes one hour take minutes and the run appear stuck. Fail fast.
 		httpClient:    &http.Client{Timeout: 20 * time.Second},
+		maxAttempts:   dukascopyMaxAttempts,
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
@@ -229,7 +236,21 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	}
 	c.mu.Unlock()
 
+	// On-disk cache: a previously-fetched (or confirmed-empty) hour is served from disk and
+	// NEVER re-fetched — the way to use a rate-limited free feed for repeated backtests. Only
+	// confirmed outcomes are cached (see below), so a transient-skipped hour is left uncached
+	// and re-fetched on a later run — that is what makes a throttled fetch resumable.
+	if c.cacheDir != "" {
+		if ticks, ok := c.readDiskCache(path, hour, c.priceDivisor(ticker)); ok {
+			c.mu.Lock()
+			c.cache[path] = ticks
+			c.mu.Unlock()
+			return ticks, nil
+		}
+	}
+
 	body, found, err := c.getBI5(ctx, c.baseURL+"/"+path)
+	confirmed := err == nil // a real 200 or 404 — safe to persist; a transient skip is not
 	if err != nil {
 		// Terminal errors (a non-404 4xx, or context cancellation/deadline) are propagated so
 		// the run fails fast — NOT converted into a silent data gap.
@@ -265,6 +286,13 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	if ticks == nil {
 		ticks = []dukaTick{} // cache non-nil so the "cached" check above hits for no-data hours
 	}
+
+	// Persist a CONFIRMED outcome (data or no-data) to disk so it is never re-fetched.
+	if c.cacheDir != "" && confirmed {
+		if werr := c.writeDiskCache(path, body, found); werr != nil {
+			slog.Warn("dukascopy: disk cache write failed", "path", path, "err", werr)
+		}
+	}
 	c.mu.Lock()
 	c.cache[path] = ticks
 	if c.hoursFetched == nil { // defensive for a directly-constructed client (e.g. in tests)
@@ -286,12 +314,61 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	return ticks, nil
 }
 
+// readDiskCache serves an hour from the on-disk cache. The cache mirrors the feed path under
+// cacheDir; a data hour is the raw .bi5 bytes, a confirmed no-data hour is a 0-byte file, and
+// an absent file means "not cached yet". A corrupt cache file is treated as a miss (re-fetch)
+// rather than an error, so a partial write from a killed run self-heals.
+func (c *DukascopyClient) readDiskCache(path string, hour time.Time, divisor float64) ([]dukaTick, bool) {
+	full := filepath.Join(c.cacheDir, filepath.FromSlash(path))
+	info, err := os.Stat(full)
+	if err != nil {
+		return nil, false // not cached (or unreadable) → fetch
+	}
+	if info.Size() == 0 {
+		return []dukaTick{}, true // confirmed no-data hour
+	}
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		slog.Warn("dukascopy: disk cache read failed — re-fetching", "path", path, "err", err)
+		return nil, false
+	}
+	ticks, err := parseBI5(raw, hour, divisor)
+	if err != nil {
+		slog.Warn("dukascopy: corrupt disk cache entry — re-fetching", "path", path, "err", err)
+		return nil, false
+	}
+	return ticks, true
+}
+
+// writeDiskCache persists a confirmed hour: the raw .bi5 bytes for a data hour, or a 0-byte
+// file for a confirmed no-data (404) hour. The write is atomic (temp file + rename) so an
+// interrupted run never leaves a partially-written entry that a later run would misread.
+func (c *DukascopyClient) writeDiskCache(path string, body []byte, hasData bool) error {
+	full := filepath.Join(c.cacheDir, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	var data []byte
+	if hasData {
+		data = body
+	}
+	tmp := full + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, full)
+}
+
 // getBI5 GETs a .bi5 file. A 404 (weekend / holiday / future hour — the market was closed)
 // is not an error: it returns found=false. Network and 5xx errors are retried; a 4xx other
 // than 404 fails immediately.
 func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, found bool, err error) {
 	var lastErr error
-	for attempt := range dukascopyMaxAttempts {
+	attempts := c.maxAttempts
+	if attempts <= 0 {
+		attempts = dukascopyMaxAttempts
+	}
+	for attempt := range attempts {
 		// Back off BEFORE each retry (not after each failure) so a persistently-dead URL
 		// doesn't sleep a final, pointless interval before giving up.
 		if attempt > 0 && !backoff(ctx, attempt-1) {
