@@ -77,6 +77,43 @@ func TestDukascopy_BrokenFeedGuard(t *testing.T) {
 	}
 }
 
+// A transient fetch failure (a 503 that outlasts the retry budget) on a single hour must NOT
+// abort the run — it's skipped as a data gap while other hours still produce bars. But if an
+// instrument accumulates too many failures the feed is unstable and the run aborts.
+func TestDukascopy_TransientFailureSkipsHour(t *testing.T) {
+	hour := time.Date(2026, 7, 1, 8, 0, 0, 0, time.UTC)
+	raw := append(tickRec(0, 110100, 110080, 1, 1), tickRec(30000, 110150, 110130, 1, 1)...)
+	var buf bytes.Buffer
+	w, _ := lzma.NewWriter(&buf)
+	_, _ = w.Write(raw)
+	_ = w.Close()
+	good := buf.Bytes()
+
+	// 08h always 503s (a persistently-transient hour); 09h serves valid data; others 404.
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/08h_ticks.bi5"):
+			rw.WriteHeader(http.StatusServiceUnavailable)
+		case strings.HasSuffix(r.URL.Path, "/09h_ticks.bi5"):
+			_, _ = rw.Write(good)
+		default:
+			rw.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	// No throttle/backoff delay: a directly-constructed client has minInterval 0, but backoff
+	// still sleeps — so keep the range tiny (2 hours: the 503 hour + the good hour).
+	c := testClient(srv.URL, srv.Client())
+	bars, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, hour, hour.Add(2*time.Hour))
+	if err != nil {
+		t.Fatalf("a single transient-503 hour must not abort the run: %v", err)
+	}
+	if len(bars) != 1 || !bars[0].Timestamp.Equal(hour.Add(time.Hour)) {
+		t.Errorf("got %d bars; want just the 09h bar (the 08h hour skipped)", len(bars))
+	}
+}
+
 // The broken-feed guard is PER INSTRUMENT: a valid symbol returning ticks must not mask a
 // later misconfigured symbol that 404s for every hour.
 func TestDukascopy_BrokenFeedGuard_PerInstrument(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"sort"
@@ -60,6 +61,7 @@ type DukascopyClient struct {
 	// calls because the ORB backtest fetches in many small per-session windows.
 	hoursFetched  map[string]int // instrument → hours fetched
 	hoursWithData map[string]int // instrument → hours that returned ticks
+	fetchFailures map[string]int // instrument → hours skipped after exhausting retries
 
 	minInterval time.Duration
 	lastRequest time.Time
@@ -69,10 +71,16 @@ type DukascopyClient struct {
 // the feed is broken rather than closed (must exceed a ~48h weekend so it never false-fires).
 const dukascopyEmptyHoursError = 48
 
-// dukascopyMaxAttempts is the per-request try budget. The free feed rate-limits under
-// sustained fetching (intermittent 503s); combined with exponential backoff this rides out a
-// transient block (~15s total) instead of aborting a long backtest on a single 503.
+// dukascopyMaxAttempts is the per-request try budget. The free feed emits rare, transient
+// 503s under sustained fetching; combined with exponential backoff this rides out a short
+// block (~15s total). A 503 that outlasts the budget doesn't abort the run (see fetchHour).
 const dukascopyMaxAttempts = 6
+
+// dukascopyMaxFetchFailures bounds how many hours an instrument may FAIL to fetch (after
+// exhausting retries) before the run aborts. A rare transient 503 that outlasts the retry
+// budget is skipped as a one-hour data gap (a multi-thousand-fetch backtest tolerates a few);
+// but a high failure count means the feed is genuinely unstable and the results untrustworthy.
+const dukascopyMaxFetchFailures = 25
 
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
 // public feed when empty. pointScale optionally overrides the per-ticker price divisor.
@@ -167,7 +175,24 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 
 	body, found, err := c.getBI5(ctx, c.baseURL+"/"+path)
 	if err != nil {
-		return nil, err
+		// A transient fetch failure (a 503 that outlasted the retry budget, or a network
+		// error) must NOT abort the whole backtest: skip this one hour as a data gap and carry
+		// on — but abort if an instrument accumulates too many, which means the feed is
+		// genuinely unstable and the results can't be trusted.
+		c.mu.Lock()
+		if c.fetchFailures == nil {
+			c.fetchFailures = make(map[string]int)
+		}
+		c.fetchFailures[inst]++
+		failures := c.fetchFailures[inst]
+		c.mu.Unlock()
+		if failures > dukascopyMaxFetchFailures {
+			return nil, fmt.Errorf("dukascopy: %s: aborting after %d fetch failures for %s (feed unstable): %w",
+				path, failures, inst, err)
+		}
+		slog.Warn("dukascopy: hour fetch failed after retries — skipping as a data gap",
+			"path", path, "instrument_failures", failures, "err", err)
+		found, body = false, nil // treat as no-data for this hour
 	}
 	var ticks []dukaTick
 	if found && len(body) > 0 {
