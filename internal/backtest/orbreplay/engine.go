@@ -30,6 +30,7 @@ type Variant struct {
 	ApplyConfirmation bool // require per-instrument breakout confirmation (Phase 3) instead of a touch
 	ApplyDirection    bool // apply per-instrument direction eligibility (Phase 3): trend-aligned side only
 	ApplyAdaptiveExit bool // apply per-instrument adaptive exits (Phase 4): break-even / partial / trailing
+	ApplyRetest       bool // apply per-instrument retest entry (Phase 6) when BreakoutConfirmation is retest_*
 }
 
 // entryWindowMinutes mirrors the live cleanup cutoff: the live scheduler cancels any
@@ -68,6 +69,14 @@ func Adaptive(maxHold int) Variant {
 	v.Name = "adaptive"
 	v.ApplyAdaptiveExit = true
 	return v
+}
+
+// Retest is range-filter plus the Phase 6 retest entry: instead of a stop-touch or a close
+// confirmation, wait for the breakout to pull back to the level and bounce. Instrument-gated on a
+// retest_* BreakoutConfirmation (so an instrument that configures neither behaves like time-exit).
+// Also applies direction eligibility, matching Confirmed.
+func Retest(maxHold int) Variant {
+	return Variant{Name: "retest", MaxHoldMinutes: maxHold, ApplyEntryFilters: true, ApplyDirection: true, ApplyRetest: true}
 }
 
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
@@ -253,7 +262,61 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 	var side string
 	var entryIdx int
 	var entryMid float64
-	if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {
+	var retestParams *orb.BracketParams // set by the retest branch; overrides the range bracket
+	if v.ApplyRetest && orb.IsRetestMode(inst.BreakoutConfirmation) {
+		// Retest entry (Phase 6): wait for the breakout to pull back to the level and bounce.
+		// Direction eligibility disables a zeroed side by nulling its trigger, same as elsewhere.
+		buyTrig, sellTrig := buy.EntryStop, sell.EntryStop
+		if buy.Qty == 0 {
+			buyTrig = 0
+		}
+		if sell.Qty == 0 {
+			sellTrig = 0
+		}
+		tol := inst.RetestTolerance
+		if tol <= 0 {
+			tol = 0.25 // default: pull back within 25% of the range width of the level
+		}
+		timeoutBars := inst.RetestTimeoutMinutes
+		if timeoutBars <= 0 {
+			timeoutBars = 30
+		}
+		r := orb.DetectRetest(inWindow, buyTrig, sellTrig, or.High, or.Low, inst.PipBuffer, tol, timeoutBars)
+		if !r.OK {
+			return nil, nil // no retest entry within the window
+		}
+		side = r.Side
+		entryIdx = r.EntryIdx
+		entryMid = r.EntryPrice
+		// Stop placement: retest_swing → just beyond the retest swing (tighter); retest_range →
+		// the opposite side of the opening range (the range bracket's stop).
+		var stopLevel float64
+		if inst.BreakoutConfirmation == orb.ConfirmRetestSwing {
+			if side == "buy" {
+				stopLevel = r.SwingLow - inst.PipBuffer
+			} else {
+				stopLevel = r.SwingHigh + inst.PipBuffer
+			}
+		} else { // retest_range
+			if side == "buy" {
+				stopLevel = buy.StopLoss
+			} else {
+				stopLevel = sell.StopLoss
+			}
+		}
+		rp := orb.ComputeRetestBracket(inst.Symbol, side, entryMid, stopLevel, portfolioValue, e.cfg, inst)
+		// Re-apply the spread/risk gate against the RETEST bracket's risk: retest_swing's stop is
+		// much tighter than the range stop, so spread/retest-risk can exceed the cap even when
+		// spread/range-risk (checked above) did not — the gate must see the actual entry's risk.
+		if v.ApplyEntryFilters && inst.MaxSpreadToRisk > 0 {
+			if risk := absf(rp.EntryStop - rp.StopLoss); risk > 0 {
+				if e.costFor(inst.Symbol).Spread/risk > inst.MaxSpreadToRisk {
+					return nil, nil // spread too wide relative to the retest stop distance
+				}
+			}
+		}
+		retestParams = &rp
+	} else if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {
 		// Confirmation is a GATE; the entry is market-on-confirmation, matching live (which
 		// places a MARKET bracket once a close confirms). So the fill is the NEXT bar's open
 		// (≈ the price at the next scheduler tick), not the breakout level — a later, market
@@ -293,6 +356,9 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 	params := buy
 	if side == "sell" {
 		params = sell
+	}
+	if retestParams != nil {
+		params = *retestParams // retest overrides entry / stop / target / qty
 	}
 	if params.Qty == 0 {
 		return nil, nil // min lot exceeds the position cap for this instrument

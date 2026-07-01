@@ -14,8 +14,8 @@ func TestCoarseGrid_SizeMatchesGenerated(t *testing.T) {
 	if len(sets) != g.Size() {
 		t.Fatalf("generated %d sets; Size() = %d", len(sets), g.Size())
 	}
-	if g.Size() != 1728 {
-		t.Errorf("default coarse grid size = %d; want 1728", g.Size())
+	if g.Size() != 2880 {
+		t.Errorf("default coarse grid size = %d; want 2880 (5 confirmations incl. retest)", g.Size())
 	}
 }
 

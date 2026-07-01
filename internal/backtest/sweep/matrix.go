@@ -56,12 +56,12 @@ type CoarseGrid struct {
 	AdaptiveExits  []bool
 }
 
-// DefaultCoarseGrid is the broad, low-resolution first pass (2·4·3·3·3·2·2·2 = 1728 sets).
+// DefaultCoarseGrid is the broad, low-resolution first pass (2·4·5·3·3·2·2·2 = 2880 sets).
 func DefaultCoarseGrid() CoarseGrid {
 	return CoarseGrid{
 		Sessions:       []string{"london", "newyork"},
 		RangeMinutes:   []int{5, 15, 30, 60},
-		Confirmations:  []string{"stop_touch", "close_1m", "close_3m"},
+		Confirmations:  []string{"stop_touch", "close_1m", "close_3m", "retest_swing", "retest_range"},
 		RiskRewards:    []float64{1.0, 1.5, 2.0},
 		MaxHoldMinutes: []int{0, 120, 240},
 		DirectionElig:  []bool{false, true},
@@ -169,13 +169,15 @@ func (p ParamSet) Resolve(base config.ForexORBConfig, instruments []config.Instr
 		out[i] = inst
 	}
 
+	isRetest := p.Confirmation == "retest_swing" || p.Confirmation == "retest_range"
 	v := orbreplay.Variant{
 		Name:              p.Hash(),
 		MaxHoldMinutes:    p.MaxHoldMinutes,
 		ApplyEntryFilters: p.RangeATRFilter,
-		ApplyConfirmation: p.Confirmation != "" && p.Confirmation != "stop_touch",
+		ApplyConfirmation: !isRetest && p.Confirmation != "" && p.Confirmation != "stop_touch",
 		ApplyDirection:    p.DirectionElig,
 		ApplyAdaptiveExit: p.AdaptiveExits,
+		ApplyRetest:       isRetest,
 	}
 	return cfg, out, v
 }
