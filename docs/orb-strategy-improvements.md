@@ -182,6 +182,55 @@ Short:
 For XAU/USD, use stricter confirmation because wick noise and slippage are
 larger.
 
+#### 3a. Retest Entry Mode (proposed — NOT yet implemented)
+
+Status: **not implemented** in live ORB or the backtest sweep. The config
+validator today accepts only `stop_touch | close_1m | close_3m`; the sweep's
+confirmation dimension mirrors that set. Retest is a genuinely new *entry
+primitive*, not just another "N closes beyond" threshold — it needs a
+multi-phase state machine, so it is a dedicated feature PR rather than a new
+enum value bolted onto `DetectConfirmation`.
+
+Lifecycle:
+
+1. Opening range locks.
+2. Price breaks and *closes* beyond the range boundary (the initial breakout).
+3. Price pulls back toward the range boundary / breakout level.
+4. The retest **holds** — price does not close back inside the range (a close
+   back inside = failed breakout, abandon, do not enter).
+5. Enter only on *continuation* away from the level (e.g. a close back beyond
+   the breakout extreme, or a tick beyond the retest bar's high/low).
+
+New parameters this introduces (each a future sweep/refine dimension):
+
+- `retest_tolerance` — how close to the level counts as a retest (in pips or as
+  a fraction of the opening range). Too tight → most breakouts never "retest";
+  too loose → indistinguishable from a failed breakout.
+- `retest_timeout` — how many minutes after the breakout to wait for the
+  retest before abandoning the setup (bounds how long we sit out of the trade).
+- `retest_max_depth` — if the pullback pushes too far past the level (or closes
+  inside the range), it is a failed breakout, not a retest → reject.
+- `continuation_trigger` — what confirms step 5 (close beyond breakout extreme
+  vs. a tick beyond the retest bar).
+
+Trade-offs (why it is worth testing):
+
+- **Upside:** avoids first-breakout traps → higher win rate; and the stop can
+  sit just beyond the retest swing (much closer than range-low/high), so
+  **realized R:R improves** — often the bigger win than the win-rate bump.
+- **Downside:** fewer trades (many clean breakouts run away and never retest,
+  so we miss them entirely); later entry at a worse absolute price than a stop
+  touch; and added state to manage (a trade can sit in a "waiting for retest"
+  limbo, which every lifecycle consumer — reconciliation, time-exit, orphan
+  sweep — must account for, same lesson as single-sided direction eligibility).
+
+Harness integration: add `retest` as a value on the confirmation axis of the
+coarse grid, with its sub-parameters swept in the refine stage. Per the
+established rule, it needs a **backtest twin** — a shared `DetectRetest` used by
+both the live breakout-watch path and the orbreplay engine, so live and replay
+never diverge. Sequencing: land after the current entry-quality primitives are
+validated on real data; it is a Phase 2/3 entry-quality addition.
+
 ### 4. Replace Blind Dual-Sided Entry With Direction Eligibility
 
 Keep both directions possible, but make each direction earn eligibility.
