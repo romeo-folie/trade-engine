@@ -268,14 +268,20 @@ func (s *ORBScheduler) throttledInstrument(ctx context.Context, inst config.Inst
 	if s.feedbackCfg == nil || !s.feedbackCfg.ORBAutoThrottle.Enabled || s.db == nil {
 		return inst
 	}
-	window := s.feedbackCfg.ORBAutoThrottle.ThrottleWindow()
-	auto, ok, err := store.GetLatestORBRiskMultiplier(ctx, inst.Symbol, window)
+	at := s.feedbackCfg.ORBAutoThrottle
+	window := at.ThrottleWindow()
+	// Only trust a recently-refreshed multiplier: a stale one (the window dried up / dropped
+	// below min-trades, so the reviewer stopped rewriting it) must not keep sizing live trades.
+	// GetFreshORBRiskMultiplier normalises this to a UTC calendar date, so a wall-clock value
+	// with a time-of-day is fine.
+	notBefore := s.now().AddDate(0, 0, -at.MaxAgeDaysOrDefault())
+	auto, ok, err := store.GetFreshORBRiskMultiplier(ctx, inst.Symbol, window, notBefore)
 	if err != nil {
 		slog.Warn("orb: auto-throttle: read multiplier failed — using static risk", "ticker", inst.Symbol, "err", err)
 		return inst
 	}
 	if !ok || auto <= 0 {
-		return inst // throttle has no opinion yet (no review, or below its min-trades gate)
+		return inst // no fresh opinion (no recent review, below min-trades, or window dried up)
 	}
 	base := inst.RiskMultiplier
 	if base <= 0 {

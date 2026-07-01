@@ -761,11 +761,12 @@ type FeedbackConfig struct {
 // disabled (or below MinTrades, or no data) leaves sizing exactly as today (×1.0).
 type ORBAutoThrottleConfig struct {
 	Enabled     bool    `yaml:"enabled"`
-	Window      string  `yaml:"window"`      // feedback window to learn from, e.g. "30d" (default "30d")
-	MinTrades   int     `yaml:"min_trades"`  // below this trade count → neutral 1.0 (default 20)
-	Sensitivity float64 `yaml:"sensitivity"` // multiplier change per 1 pct-point of avg pnl (default 1.0)
-	Floor       float64 `yaml:"floor"`       // minimum multiplier (default 0.5)
-	Cap         float64 `yaml:"cap"`         // maximum multiplier (default 1.5)
+	Window      string  `yaml:"window"`       // feedback window to learn from, e.g. "30d" (default "30d")
+	MinTrades   int     `yaml:"min_trades"`   // below this trade count → neutral 1.0 (default 20)
+	Sensitivity float64 `yaml:"sensitivity"`  // multiplier change per 1 pct-point of avg pnl (default 1.0)
+	Floor       float64 `yaml:"floor"`        // minimum multiplier (default 0.5)
+	Cap         float64 `yaml:"cap"`          // maximum multiplier (default 1.5)
+	MaxAgeDays  int     `yaml:"max_age_days"` // ignore a stored multiplier older than this (default 3)
 }
 
 // ThrottleWindow returns the configured learn-from window, defaulting to "30d".
@@ -784,6 +785,19 @@ func (c ORBAutoThrottleConfig) MinTradesOrDefault() int {
 		return 20
 	}
 	return c.MinTrades
+}
+
+// MaxAgeDaysOrDefault is the freshness horizon: a stored multiplier older than this is
+// ignored (the scheduler falls back to neutral sizing), so a rolling window that dries up —
+// dropping below min-trades, or the instrument going quiet — stops applying a stale value
+// once the reviewer stops refreshing it. Because the reviewer SKIPS writing below min-trades,
+// the stored date is exactly "when we last had enough data", so this tolerates a transient
+// dip (still recent) while reverting a sustained one to neutral. Defaults to 3 days.
+func (c ORBAutoThrottleConfig) MaxAgeDaysOrDefault() int {
+	if c.MaxAgeDays <= 0 {
+		return 3
+	}
+	return c.MaxAgeDays
 }
 
 type FeedbackThresholds struct {

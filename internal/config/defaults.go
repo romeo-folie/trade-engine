@@ -414,6 +414,7 @@ func Defaults() *Config {
 				Sensitivity: 1.0,
 				Floor:       0.5,
 				Cap:         1.5,
+				MaxAgeDays:  3,
 			},
 		},
 	}
