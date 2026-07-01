@@ -27,6 +27,7 @@ var (
 	btORBMaxHold     int
 	btORBMinRangeATR float64
 	btORBMaxRangeATR float64
+	btORBProvider    string
 )
 
 // defaultSpreads are conservative per-instrument bid/ask spreads (price units) used by
@@ -51,6 +52,7 @@ func init() {
 		c.Flags().IntVar(&btORBMaxHold, "max-hold", 240, "Max-hold minutes for time-exit/range-filter variants")
 		c.Flags().Float64Var(&btORBMinRangeATR, "min-range-atr", 0, "Override min range_atr_ratio for all instruments (range-filter)")
 		c.Flags().Float64Var(&btORBMaxRangeATR, "max-range-atr", 0, "Override max range_atr_ratio for all instruments (range-filter)")
+		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: dukascopy (default) | oanda (default: config markets.backtest_provider)")
 		_ = c.MarkFlagRequired("from")
 		_ = c.MarkFlagRequired("to")
 	}
@@ -162,7 +164,7 @@ func loadORBBacktest() (*orbBacktestSetup, error) {
 		return nil, err
 	}
 
-	provider, err := buildOANDAProvider(cfg.Markets.OANDA)
+	provider, err := buildBacktestProvider(cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -171,6 +173,23 @@ func loadORBBacktest() (*orbBacktestSetup, error) {
 	engine := orbreplay.NewEngine(forexCfg, provider, costs, 0)
 
 	return &orbBacktestSetup{engine: engine, cfg: forexCfg, from: from, to: to, instruments: instruments}, nil
+}
+
+// buildBacktestProvider selects the ORB backtest data source. Dukascopy is the default: it
+// is free and needs no account or API key. The --provider flag overrides config.
+func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) {
+	prov := btORBProvider
+	if prov == "" {
+		prov = cfg.Markets.BacktestProvider
+	}
+	switch strings.ToLower(cmpOr(prov, "dukascopy")) {
+	case "dukascopy":
+		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, cfg.Markets.Dukascopy.PointScale), nil
+	case "oanda":
+		return buildOANDAProvider(cfg.Markets.OANDA)
+	default:
+		return nil, fmt.Errorf("unknown backtest data provider %q (use dukascopy|oanda)", prov)
+	}
 }
 
 func buildOANDAProvider(oa config.OANDAConfig) (data.MarketDataProvider, error) {

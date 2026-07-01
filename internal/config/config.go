@@ -512,6 +512,21 @@ type MarketsConfig struct {
 	IBKR   IBKRConfig    `yaml:"ibkr"`
 	News   NewsAPIConfig `yaml:"news"`
 	OANDA  OANDAConfig   `yaml:"oanda"`
+
+	Dukascopy DukascopyConfig `yaml:"dukascopy"`
+	// BacktestProvider selects the ORB backtest data source: "dukascopy" (default; free, no
+	// account or API key) or "oanda". Overridable per-run with `te backtest orb --provider`.
+	BacktestProvider string `yaml:"backtest_provider"`
+}
+
+// DukascopyConfig configures the Dukascopy historical tick-data provider — the default,
+// zero-credential source for the ORB backtest engine (no account or API key; hourly .bi5
+// tick files served as static objects). Data-only; live trading does not use it.
+type DukascopyConfig struct {
+	BaseURL string `yaml:"base_url"` // optional feed override (default DukascopyBaseURL)
+	// PointScale optionally overrides the integer→price divisor per ticker (e.g. XAU/USD).
+	// Defaults: 5-decimal FX ÷1e5, JPY pairs and metals ÷1e3.
+	PointScale map[string]float64 `yaml:"point_scale"`
 }
 
 // OANDAConfig configures the OANDA v20 REST data provider used by the ORB backtest
