@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -111,6 +112,41 @@ func TestDukascopy_TransientFailureSkipsHour(t *testing.T) {
 	}
 	if len(bars) != 1 || !bars[0].Timestamp.Equal(hour.Add(time.Hour)) {
 		t.Errorf("got %d bars; want just the 09h bar (the 08h hour skipped)", len(bars))
+	}
+}
+
+// A terminal non-404 4xx (e.g. 403) is NOT transient — it must propagate as a fatal error,
+// not be silently converted into a skipped data-gap hour.
+func TestDukascopy_Terminal4xxPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	_, err := testClient(srv.URL, srv.Client()).
+		FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour, from, from.Add(3*time.Hour))
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Errorf("terminal 4xx must propagate (not skip); got %v", err)
+	}
+	if err != nil && errors.Is(err, errDukaTransient) {
+		t.Errorf("a 403 must not be classified transient: %v", err)
+	}
+}
+
+// A cancelled/deadline-exceeded context must propagate context.Canceled — not be swallowed as
+// a skipped hour (which would let a cancelled backtest keep issuing requests).
+func TestDukascopy_ContextCancelPropagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusServiceUnavailable) // would otherwise retry/backoff
+	}))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	_, err := testClient(srv.URL, srv.Client()).
+		FetchCandles(ctx, "EUR/USD", Timeframe1Hour, from, from.Add(3*time.Hour))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("cancelled context must propagate context.Canceled; got %v", err)
 	}
 }
 

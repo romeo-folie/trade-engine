@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -77,6 +78,11 @@ const dukascopyMaxAttempts = 6
 // per-request throttle): a modest bound keeps the aggregate rate near what the free feed
 // tolerated serially while cutting wall-clock ~Nx over a high-latency link.
 const dukascopyConcurrency = 6
+
+// errDukaTransient marks a fetch error that exhausted the retry budget on a RETRYABLE cause
+// (5xx / network). fetchHour skips such an hour as a data gap; every other error (a terminal
+// non-404 4xx, a context cancellation/deadline) is propagated so the run fails fast.
+var errDukaTransient = errors.New("dukascopy: transient fetch failure (retries exhausted)")
 
 // dukascopyMaxFetchFailures bounds how many hours an instrument may FAIL to fetch (after
 // exhausting retries) before the run aborts. A rare transient 503 that outlasts the retry
@@ -162,26 +168,47 @@ func (c *DukascopyClient) FetchCandles(ctx context.Context, ticker string, tf Ti
 	// never contend on the same key. The concurrency bound is also the rate limiter (there is
 	// no per-request throttle) — occasional 503s from the extra load are absorbed by the
 	// retry + skip-on-exhaust path.
+	// A fatal fetch error (terminal 4xx, the >25 failure cap, a parse error, or caller
+	// cancellation) cancels the shared context and stops scheduling further hours, so the
+	// per-instrument cap acts as a TIMELY safety net rather than letting every remaining hour
+	// run its full retry/backoff first.
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	perHour := make([][]dukaTick, len(hours))
-	errs := make([]error, len(hours))
 	sem := make(chan struct{}, dukascopyConcurrency)
 	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
 	for i := range hours {
+		if fctx.Err() != nil {
+			break // a fatal error already occurred — don't schedule more work
+		}
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			perHour[i], errs[i] = c.fetchHour(ctx, ticker, hours[i])
+			t, err := c.fetchHour(fctx, ticker, hours[i])
+			if err != nil {
+				errOnce.Do(func() { firstErr = err; cancel() })
+				return
+			}
+			perHour[i] = t
 		}(i)
 	}
 	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	// The caller's context may have been cancelled before/while scheduling (so no worker
+	// recorded an error) — surface it rather than returning silently-empty bars.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	var ticks []dukaTick
 	for i := range hours {
-		if errs[i] != nil {
-			return nil, errs[i]
-		}
 		ticks = append(ticks, perHour[i]...)
 	}
 	return aggregateTicks(ticker, tf, step, from, to, ticks), nil
@@ -202,10 +229,15 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 
 	body, found, err := c.getBI5(ctx, c.baseURL+"/"+path)
 	if err != nil {
-		// A transient fetch failure (a 503 that outlasted the retry budget, or a network
-		// error) must NOT abort the whole backtest: skip this one hour as a data gap and carry
-		// on — but abort if an instrument accumulates too many, which means the feed is
-		// genuinely unstable and the results can't be trusted.
+		// Terminal errors (a non-404 4xx, or context cancellation/deadline) are propagated so
+		// the run fails fast — NOT converted into a silent data gap.
+		if !errors.Is(err, errDukaTransient) {
+			return nil, err
+		}
+		// A TRANSIENT failure (a 503 / network error that outlasted the retry budget) must NOT
+		// abort the whole backtest: skip this one hour as a data gap and carry on — but abort if
+		// an instrument accumulates too many, which means the feed is genuinely unstable and the
+		// results can't be trusted.
 		c.mu.Lock()
 		if c.fetchFailures == nil {
 			c.fetchFailures = make(map[string]int)
@@ -293,7 +325,9 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 			lastErr = fmt.Errorf("dukascopy: %s -> %d", u, resp.StatusCode)
 		}
 	}
-	return nil, false, lastErr
+	// Retry budget exhausted on a retryable (5xx / network) cause — mark it transient so
+	// fetchHour can skip the hour rather than abort the whole backtest.
+	return nil, false, fmt.Errorf("%w: %s -> %w", errDukaTransient, u, lastErr)
 }
 
 // backoff sleeps an EXPONENTIALLY growing interval (0.5s, 1s, 2s, 4s, 8s… capped at 8s) so a
