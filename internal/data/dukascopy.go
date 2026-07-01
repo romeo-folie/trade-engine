@@ -62,9 +62,6 @@ type DukascopyClient struct {
 	hoursFetched  map[string]int // instrument → hours fetched
 	hoursWithData map[string]int // instrument → hours that returned ticks
 	fetchFailures map[string]int // instrument → hours skipped after exhausting retries
-
-	minInterval time.Duration
-	lastRequest time.Time
 }
 
 // dukascopyEmptyHoursError is the lifetime empty-hour count past which the client concludes
@@ -75,6 +72,11 @@ const dukascopyEmptyHoursError = 48
 // 503s under sustained fetching; combined with exponential backoff this rides out a short
 // block (~15s total). A 503 that outlasts the budget doesn't abort the run (see fetchHour).
 const dukascopyMaxAttempts = 6
+
+// dukascopyConcurrency bounds in-flight hour fetches. It doubles as the rate limiter (no
+// per-request throttle): a modest bound keeps the aggregate rate near what the free feed
+// tolerated serially while cutting wall-clock ~Nx over a high-latency link.
+const dukascopyConcurrency = 6
 
 // dukascopyMaxFetchFailures bounds how many hours an instrument may FAIL to fetch (after
 // exhausting retries) before the run aborts. A rare transient 503 that outlasts the retry
@@ -95,7 +97,6 @@ func NewDukascopyClient(baseURL string, pointScale map[string]float64) *Dukascop
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
-		minInterval:   150 * time.Millisecond,
 	}
 }
 
@@ -149,13 +150,39 @@ func (c *DukascopyClient) FetchCandles(ctx context.Context, ticker string, tf Ti
 		return nil, nil
 	}
 
-	var ticks []dukaTick
+	// Enumerate the hours overlapping [from, to).
+	var hours []time.Time
 	for hour := from.Truncate(time.Hour); hour.Before(to); hour = hour.Add(time.Hour) {
-		hourTicks, err := c.fetchHour(ctx, ticker, hour)
-		if err != nil {
-			return nil, err
+		hours = append(hours, hour)
+	}
+
+	// Fetch the hours CONCURRENTLY (bounded): sequential per-hour fetches over the feed's
+	// high-latency link dominate a multi-month backtest's wall-clock. The per-hour cache still
+	// de-dups repeated/overlapping hours across calls; each hour here is distinct so workers
+	// never contend on the same key. The concurrency bound is also the rate limiter (there is
+	// no per-request throttle) — occasional 503s from the extra load are absorbed by the
+	// retry + skip-on-exhaust path.
+	perHour := make([][]dukaTick, len(hours))
+	errs := make([]error, len(hours))
+	sem := make(chan struct{}, dukascopyConcurrency)
+	var wg sync.WaitGroup
+	for i := range hours {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			perHour[i], errs[i] = c.fetchHour(ctx, ticker, hours[i])
+		}(i)
+	}
+	wg.Wait()
+
+	var ticks []dukaTick
+	for i := range hours {
+		if errs[i] != nil {
+			return nil, errs[i]
 		}
-		ticks = append(ticks, hourTicks...)
+		ticks = append(ticks, perHour[i]...)
 	}
 	return aggregateTicks(ticker, tf, step, from, to, ticks), nil
 }
@@ -229,9 +256,6 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 // is not an error: it returns found=false. Network and 5xx errors are retried; a 4xx other
 // than 404 fails immediately.
 func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, found bool, err error) {
-	if err := c.throttle(ctx); err != nil {
-		return nil, false, err
-	}
 	var lastErr error
 	for attempt := range dukascopyMaxAttempts {
 		// Back off BEFORE each retry (not after each failure) so a persistently-dead URL
@@ -284,21 +308,6 @@ func backoff(ctx context.Context, attempt int) bool {
 	case <-ctx.Done():
 		return false
 	}
-}
-
-// throttle enforces the per-client minimum request interval, honouring context cancellation.
-func (c *DukascopyClient) throttle(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if since := time.Since(c.lastRequest); since < c.minInterval {
-		select {
-		case <-time.After(c.minInterval - since):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	c.lastRequest = time.Now()
-	return nil
 }
 
 // parseBI5 LZMA-decompresses a .bi5 payload (classic LZMA format) and decodes its ticks.
