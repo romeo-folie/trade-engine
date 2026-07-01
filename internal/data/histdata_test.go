@@ -234,6 +234,133 @@ func TestHistData_DiskCache_CorruptEntryReDownloads(t *testing.T) {
 	}
 }
 
+// The bar-cache path (ticks → 1-minute bars → re-aggregate to a coarser tf) must be identical to
+// aggregating the raw ticks directly. This is the correctness guarantee behind caching bars
+// instead of ticks. Covers multiple minutes across an hour boundary and a range-aligned query.
+func TestHistData_BarCacheEqualsTickAggregation(t *testing.T) {
+	base := time.Date(2025, 5, 1, 8, 0, 0, 0, time.UTC)
+	var ticks []dukaTick
+	// ~90 minutes of ticks, a few per minute with varied prices.
+	for m := range 90 {
+		for s := range 3 {
+			ts := base.Add(time.Duration(m)*time.Minute + time.Duration(s*17)*time.Second)
+			mid := 1.10000 + float64((m*7+s*3)%50)*0.0001 // deterministic wiggle
+			ticks = append(ticks, dukaTick{t: ts, mid: mid, vol: 1})
+		}
+	}
+	from, to := base, base.Add(90*time.Minute)
+
+	for _, tc := range []struct {
+		tf   Timeframe
+		step time.Duration
+	}{
+		{Timeframe1Min, time.Minute},
+		{Timeframe5Min, 5 * time.Minute},
+		{Timeframe15Min, 15 * time.Minute},
+		{Timeframe1Hour, time.Hour},
+	} {
+		ref := aggregateTicks("EUR/USD", tc.tf, tc.step, from, to, ticks)
+
+		// Bar-cache path: ticks → 1-minute bars → slice → re-aggregate.
+		minBars := aggregateTicksToMinute("EUR/USD", ticks)
+		window := sliceBars(minBars, from, to)
+		var got []Candle
+		if tc.tf == Timeframe1Min {
+			got = window
+		} else {
+			got = aggregateBars("EUR/USD", tc.tf, tc.step, window)
+		}
+
+		if len(got) != len(ref) {
+			t.Fatalf("%s: got %d bars, ref %d", tc.tf, len(got), len(ref))
+		}
+		for i := range ref {
+			r, g := ref[i], got[i]
+			if !g.Timestamp.Equal(r.Timestamp) ||
+				math.Abs(g.Open-r.Open) > 1e-12 || math.Abs(g.High-r.High) > 1e-12 ||
+				math.Abs(g.Low-r.Low) > 1e-12 || math.Abs(g.Close-r.Close) > 1e-12 {
+				t.Errorf("%s bar %d mismatch:\n  ref=%+v\n  got=%+v", tc.tf, i, r, g)
+			}
+		}
+	}
+}
+
+// A sub-minute range must floor to whole minutes and return the same bars as the minute-aligned
+// query — deterministic, not the silent edge-bar drop/keep of raw bucket-start comparison.
+func TestHistData_FetchCandles_FloorsSubMinuteRange(t *testing.T) {
+	// One ET month (May 2025) of a few ticks per minute across the 08:00 UTC hour.
+	var raw []byte
+	for m := range 60 {
+		// ET 04:mm (EDT) == UTC 08:mm.
+		bid := 1.10000 + float64(m)*0.0001
+		raw = fmt.Appendf(raw, "20250501 04%02d00000,%.5f,%.5f,0\n", m, bid, bid+0.0001)
+	}
+	zb := zipWithCSV(t, "DAT_ASCII_EURUSD_T_202505", string(raw))
+	srv := histDataTestServer(t, zb, nil)
+	defer srv.Close()
+	c := newTestHistData(t, srv.URL, "", srv.Client())
+
+	aligned, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour,
+		time.Date(2025, 5, 1, 8, 0, 0, 0, time.UTC), time.Date(2025, 5, 1, 9, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same query with sub-minute jitter on both bounds → must floor to the aligned result.
+	jittered, err := c.FetchCandles(context.Background(), "EUR/USD", Timeframe1Hour,
+		time.Date(2025, 5, 1, 8, 0, 30, 500, time.UTC), time.Date(2025, 5, 1, 9, 0, 45, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(aligned) != 1 || len(jittered) != len(aligned) {
+		t.Fatalf("aligned=%d jittered=%d; want both 1 bar", len(aligned), len(jittered))
+	}
+	if aligned[0] != jittered[0] {
+		t.Errorf("sub-minute range not floored to aligned result:\n aligned=%+v\n jittered=%+v", aligned[0], jittered[0])
+	}
+}
+
+// The one timeframe where a bucket spans the ET-month seam is 1-day (the seam lands at a UTC hour,
+// mid-day). Aggregating each month's ticks to 1-minute bars separately, concatenating, and
+// re-bucketing to 1-day must equal aggregating all ticks together.
+func TestHistData_SeamConcatenation_DayBucket(t *testing.T) {
+	day := time.Date(2025, 5, 1, 0, 0, 0, 0, time.UTC)
+	var prevMonth, newMonth, all []dukaTick
+	mk := func(h, m int, mid float64) dukaTick {
+		return dukaTick{t: day.Add(time.Duration(h)*time.Hour + time.Duration(m)*time.Minute), mid: mid, vol: 1}
+	}
+	// Prev ET month contributes 00:00–03:59 UTC of May 1; new ET month contributes 04:00 UTC on
+	// (the seam is UTC 04:00 = ET midnight in EDT). Prices chosen so open/high/low/close are
+	// unambiguous across the seam.
+	for h := range 4 {
+		tk := mk(h, 30, 1.100+float64(h)*0.001) // 1.100,1.101,1.102,1.103
+		prevMonth = append(prevMonth, tk)
+		all = append(all, tk)
+	}
+	for h := 4; h < 8; h++ {
+		tk := mk(h, 30, 1.110-float64(h-4)*0.001) // 1.110,1.109,1.108,1.107
+		newMonth = append(newMonth, tk)
+		all = append(all, tk)
+	}
+
+	ref := aggregateTicks("EUR/USD", Timeframe1Day, 24*time.Hour, time.Time{}, histDataMaxTime, all)
+	// Per-month path: aggregate each month to 1-minute, concatenate, re-bucket to 1-day.
+	concat := append(aggregateTicksToMinute("EUR/USD", prevMonth), aggregateTicksToMinute("EUR/USD", newMonth)...)
+	got := aggregateBars("EUR/USD", Timeframe1Day, 24*time.Hour, concat)
+
+	if len(ref) != 1 || len(got) != 1 {
+		t.Fatalf("ref=%d got=%d bars; want 1 day bar each", len(ref), len(got))
+	}
+	r, g := ref[0], got[0]
+	if !g.Timestamp.Equal(r.Timestamp) || g.Open != r.Open || g.High != r.High || g.Low != r.Low || g.Close != r.Close {
+		t.Errorf("seam day bar mismatch (per-month path must equal direct tick aggregation):\n ref=%+v\n got=%+v", r, g)
+	}
+	// Sanity: the day bar must actually span the seam (open from prev month, close from new month).
+	eq := func(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
+	if !eq(g.Open, 1.100) || !eq(g.Close, 1.107) || !eq(g.High, 1.110) || !eq(g.Low, 1.100) {
+		t.Errorf("day bar OHLC = %.3f/%.3f/%.3f/%.3f; want 1.100/1.110/1.100/1.107 (open pre-seam, close post-seam)", g.Open, g.High, g.Low, g.Close)
+	}
+}
+
 func TestHistData_PairMapping(t *testing.T) {
 	for _, tc := range []struct{ in, url, fx string }{
 		{"EUR/USD", "eurusd", "EURUSD"},
