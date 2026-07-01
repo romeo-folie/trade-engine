@@ -53,7 +53,7 @@ func init() {
 		c.Flags().IntVar(&btORBMaxHold, "max-hold", 240, "Max-hold minutes for time-exit/range-filter variants")
 		c.Flags().Float64Var(&btORBMinRangeATR, "min-range-atr", 0, "Override min range_atr_ratio for all instruments (range-filter)")
 		c.Flags().Float64Var(&btORBMaxRangeATR, "max-range-atr", 0, "Override max range_atr_ratio for all instruments (range-filter)")
-		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: dukascopy (default) | oanda (default: config markets.backtest_provider)")
+		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda (default: config markets.backtest_provider)")
 		_ = c.MarkFlagRequired("from")
 		_ = c.MarkFlagRequired("to")
 	}
@@ -176,28 +176,29 @@ func loadORBBacktest() (*orbBacktestSetup, error) {
 	return &orbBacktestSetup{engine: engine, cfg: forexCfg, from: from, to: to, instruments: instruments}, nil
 }
 
-// buildBacktestProvider selects the ORB backtest data source. Dukascopy is the default: it
-// is free and needs no account or API key. The --provider flag overrides config.
+// buildBacktestProvider selects the ORB backtest data source. HistData is the default: free
+// bulk tick ZIPs with no account, API key, or rate limit. The --provider flag overrides config.
 func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) {
 	prov := btORBProvider
 	if prov == "" {
 		prov = cfg.Markets.BacktestProvider
 	}
-	switch strings.ToLower(cmpOr(prov, "dukascopy")) {
+	switch strings.ToLower(cmpOr(prov, "histdata")) {
+	case "histdata":
+		return data.NewHistDataClient(cfg.Markets.HistData.BaseURL, resolveBacktestCacheDir(cfg.Markets.HistData.CacheDir, "histdata-cache"))
 	case "dukascopy":
-		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveDukascopyCacheDir(cfg.Markets.Dukascopy.CacheDir), cfg.Markets.Dukascopy.PointScale), nil
+		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale), nil
 	case "oanda":
 		return buildOANDAProvider(cfg.Markets.OANDA)
 	default:
-		return nil, fmt.Errorf("unknown backtest data provider %q (use dukascopy|oanda)", prov)
+		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|oanda)", prov)
 	}
 }
 
-// resolveDukascopyCacheDir maps the config value to an actual cache path. An unset value defaults
-// to ~/.tradeengine/dukascopy-cache so the cache is on by default (fetch-once, then serve from
-// disk). "off"/"none"/"disabled" (case-insensitive) turns the cache off — every hour is fetched
-// live, which is only useful for a one-shot run that must not touch prior cached data.
-func resolveDukascopyCacheDir(configured string) string {
+// resolveBacktestCacheDir maps a config cache_dir value to an actual path. An unset value
+// defaults to ~/.tradeengine/<defaultSubdir> so the cache is on by default (fetch-once, then
+// serve from disk). "off"/"none"/"disabled" (case-insensitive) turns the cache off.
+func resolveBacktestCacheDir(configured, defaultSubdir string) string {
 	switch strings.ToLower(strings.TrimSpace(configured)) {
 	case "off", "none", "disabled":
 		return ""
@@ -206,7 +207,7 @@ func resolveDukascopyCacheDir(configured string) string {
 		if err != nil || home == "" {
 			return "" // no home → cache disabled rather than writing to an unknown location
 		}
-		return filepath.Join(home, ".tradeengine", "dukascopy-cache")
+		return filepath.Join(home, ".tradeengine", defaultSubdir)
 	default:
 		return configured
 	}

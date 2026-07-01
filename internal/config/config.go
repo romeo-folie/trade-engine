@@ -514,9 +514,22 @@ type MarketsConfig struct {
 	OANDA  OANDAConfig   `yaml:"oanda"`
 
 	Dukascopy DukascopyConfig `yaml:"dukascopy"`
-	// BacktestProvider selects the ORB backtest data source: "dukascopy" (default; free, no
-	// account or API key) or "oanda". Overridable per-run with `te backtest orb --provider`.
+	HistData  HistDataConfig  `yaml:"histdata"`
+	// BacktestProvider selects the ORB backtest data source: "histdata" (default; free bulk
+	// tick ZIPs, no account/key/throttle), "dukascopy", or "oanda". Overridable per-run with
+	// `te backtest orb --provider`.
 	BacktestProvider string `yaml:"backtest_provider"`
+}
+
+// HistDataConfig configures the HistData.com historical tick provider — the preferred
+// zero-credential source for the ORB backtest engine: free per-month tick ZIPs with no
+// account, API key, or rate limit. Covers EUR/USD, GBP/USD, XAU/USD, XAG/USD back to 2023.
+// Data-only; live trading does not use it.
+type HistDataConfig struct {
+	BaseURL string `yaml:"base_url"` // optional site override (default HistDataBaseURL)
+	// CacheDir is the on-disk cache root. Each instrument-month ZIP is downloaded at most once,
+	// ever, then served from disk. Empty → default ~/.tradeengine/histdata-cache; "off" disables.
+	CacheDir string `yaml:"cache_dir"`
 }
 
 // DukascopyConfig configures the Dukascopy historical tick-data provider — the default,
