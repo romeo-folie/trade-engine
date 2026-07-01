@@ -162,4 +162,19 @@ func TestPassesCommission(t *testing.T) {
 			t.Error("zero qty has no dollar risk to measure; the qty==0 skip handles it")
 		}
 	})
+	t.Run("split-bracket instrument pays four fills", func(t *testing.T) {
+		// qty 70,000 → dollar risk $98. Plain bracket: $4 round trip → 0.041 ≤ 0.05.
+		// With a partial configured, ScaleOutBrackets places TWO orders (2 entry + 2 exit
+		// fills) → $8 → 0.082 > 0.05: the same size must now be rejected.
+		if ok, ratio, _ := passesCommission(70000, entryStop, stopLoss, inst); !ok {
+			t.Fatalf("plain bracket ratio %.3f should pass max 0.05", ratio)
+		}
+		split := inst
+		split.PartialTakeProfitR = 1.0
+		split.PartialFraction = 0.5
+		ok, ratio, _ := passesCommission(70000, entryStop, stopLoss, split)
+		if ok {
+			t.Errorf("split-bracket ratio %.3f should be rejected by max 0.05 (4 fills, not 2)", ratio)
+		}
+	})
 }
