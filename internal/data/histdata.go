@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,8 +42,18 @@ type HistDataClient struct {
 	httpClient *http.Client
 	nyLoc      *time.Location
 
-	mu         sync.Mutex
-	monthTicks map[string][]dukaTick // "PAIR/YYYYMM" → parsed ticks (UTC), so a month is parsed once per run
+	mu sync.Mutex
+	// parseMu serializes the expensive tick-parse+aggregate step so only ONE month's ticks
+	// (~96 MB) are resident at a time, regardless of how many parameter sets run concurrently.
+	// Bar-cache reads stay concurrent under mu; only the one-time population is serialized.
+	parseMu sync.Mutex
+	// monthBars caches AGGREGATED 1-minute bars per "PAIR/YYYYMM", NOT raw ticks. Ticks are the
+	// memory sink (a month is ~2.4M ticks ≈ 100 MB; a multi-year, multi-instrument sweep holding
+	// them all resident blows out RAM and thrashes swap). 1-minute bars are ~1000× smaller and
+	// carry everything the ORB engine needs — coarser timeframes are re-derived from them in
+	// FetchCandles (cheap), and the finest tick detail is never used. Ticks are parsed, aggregated
+	// to 1-minute bars, and immediately discarded (see monthMinuteBarsFor).
+	monthBars map[string][]Candle
 }
 
 // HistDataBaseURL is the public site root. The download flow scrapes a per-page token from the
@@ -81,7 +93,7 @@ func NewHistDataClient(baseURL, cacheDir string) (*HistDataClient, error) {
 		cacheDir:   cacheDir,
 		httpClient: &http.Client{Timeout: 120 * time.Second}, // month ZIPs are ~15 MB
 		nyLoc:      nyLoc,
-		monthTicks: make(map[string][]dukaTick),
+		monthBars:  make(map[string][]Candle),
 	}, nil
 }
 
@@ -104,23 +116,47 @@ func (c *HistDataClient) FetchCandles(ctx context.Context, ticker string, tf Tim
 		return nil, nil
 	}
 
+	// This provider is 1-minute-granular: it caches 1-minute bars, so sub-minute precision in the
+	// range is not representable. Floor both bounds to the minute so behaviour is DETERMINISTIC and
+	// matches tick-level [from, to) filtering exactly (a no-op for every real caller, which is
+	// already minute-aligned; without it a sub-minute bound would silently drop/keep an edge bar).
+	from = from.Truncate(time.Minute)
+	to = to.Truncate(time.Minute)
+	if !to.After(from) {
+		return nil, nil // a sub-minute range collapsed to empty
+	}
+
 	// The archive is keyed by ET month. A tick's ET time is monotonic in its UTC time, so every
 	// tick whose UTC time is in [from, to) has an ET month between from-in-ET and to-in-ET
 	// inclusive — enumerate exactly those, no padding needed.
 	months := enumerateHistDataMonths(from.In(c.nyLoc), to.In(c.nyLoc))
 
-	var all []dukaTick
+	// Gather the cached 1-minute bars for the needed months (each month is aggregated once, then
+	// reused). Per-month 1-minute slices are individually sorted and the months are in order, so
+	// the concatenation is globally sorted ascending — no month's 1-minute bucket can straddle the
+	// ET-month seam because the seam lands on a whole UTC hour (ET offset is ±whole hours).
+	var minBars []Candle
 	for _, ym := range months {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		ticks, err := c.monthTicksFor(ctx, ticker, ym.year, ym.month)
+		bars, err := c.monthMinuteBarsFor(ctx, ticker, ym.year, ym.month)
 		if err != nil {
 			return nil, err
 		}
-		all = append(all, ticks...)
+		minBars = append(minBars, bars...)
 	}
-	return aggregateTicks(ticker, tf, step, from, to, all), nil
+
+	// Slice to the in-range 1-minute window ONCE (binary search over the sorted bars) so a
+	// per-session query costs O(range), not O(month). 1-minute is the cache granularity, so it is
+	// served directly; coarser timeframes are re-bucketed from the window — which correctly handles
+	// buckets spanning the ET-month seam (they draw from both months' 1-minute bars) and matches
+	// aggregating the raw ticks, because 1-minute bars preserve OHLC and every query is minute-aligned.
+	window := sliceBars(minBars, from, to)
+	if tf == Timeframe1Min {
+		return window, nil
+	}
+	return aggregateBars(ticker, tf, step, window), nil
 }
 
 type histDataYM struct{ year, month int }
@@ -142,18 +178,32 @@ func enumerateHistDataMonths(from, to time.Time) []histDataYM {
 	return out
 }
 
-// monthTicksFor returns the parsed ticks (UTC) for one instrument-ET-month, served from the
-// in-memory cache, then the on-disk ZIP cache, then a network download. The ZIP is cached only
-// AFTER it parses cleanly, and a disk-cached ZIP that fails to parse is treated as a miss and
+// monthMinuteBarsFor returns the 1-minute bars for one instrument-ET-month, served from the
+// in-memory bar cache, then the on-disk ZIP cache, then a network download. In every miss path
+// the ticks are parsed, aggregated to 1-minute bars, and DISCARDED — only the bars are retained,
+// which is what keeps a multi-year, multi-instrument sweep inside RAM. The ZIP is cached on disk
+// only AFTER it parses cleanly, and a disk-cached ZIP that fails to parse is treated as a miss and
 // re-downloaded — so a truncated/corrupt cache entry self-heals instead of wedging the run.
-func (c *HistDataClient) monthTicksFor(ctx context.Context, ticker string, year, month int) ([]dukaTick, error) {
+func (c *HistDataClient) monthMinuteBarsFor(ctx context.Context, ticker string, year, month int) ([]Candle, error) {
 	urlSeg, fxPair := histDataPair(ticker)
 	key := fmt.Sprintf("%s/%04d%02d", fxPair, year, month)
 
 	c.mu.Lock()
-	if ticks, ok := c.monthTicks[key]; ok {
+	if bars, ok := c.monthBars[key]; ok {
 		c.mu.Unlock()
-		return ticks, nil
+		return bars, nil
+	}
+	c.mu.Unlock()
+
+	// Serialize the parse+aggregate so at most one month of ticks is resident at once. Re-check the
+	// cache after acquiring parseMu: a concurrent caller may have populated this month while we
+	// waited, in which case we skip the redundant (and memory-heavy) re-parse.
+	c.parseMu.Lock()
+	defer c.parseMu.Unlock()
+	c.mu.Lock()
+	if bars, ok := c.monthBars[key]; ok {
+		c.mu.Unlock()
+		return bars, nil
 	}
 	c.mu.Unlock()
 
@@ -162,7 +212,7 @@ func (c *HistDataClient) monthTicksFor(ctx context.Context, ticker string, year,
 		cachePath = filepath.Join(c.cacheDir, "histdata", fxPair, fmt.Sprintf("%04d%02d.zip", year, month))
 		if b, err := os.ReadFile(cachePath); err == nil && len(b) > 0 {
 			if ticks, perr := parseHistDataZip(b, c.nyLoc); perr == nil {
-				return c.storeMonth(key, ticks), nil
+				return c.storeMonth(key, ticker, ticks), nil
 			} else {
 				slog.Warn("histdata: corrupt cached ZIP — re-downloading", "path", cachePath, "err", perr)
 			}
@@ -182,15 +232,17 @@ func (c *HistDataClient) monthTicksFor(ctx context.Context, ticker string, year,
 			slog.Warn("histdata: cache write failed", "path", cachePath, "err", werr)
 		}
 	}
-	return c.storeMonth(key, ticks), nil
+	return c.storeMonth(key, ticker, ticks), nil
 }
 
-// storeMonth records a parsed month in the in-memory cache and returns it.
-func (c *HistDataClient) storeMonth(key string, ticks []dukaTick) []dukaTick {
+// storeMonth aggregates a month's ticks into 1-minute bars, caches the bars (dropping the ticks),
+// and returns them.
+func (c *HistDataClient) storeMonth(key, ticker string, ticks []dukaTick) []Candle {
+	bars := aggregateTicksToMinute(ticker, ticks)
 	c.mu.Lock()
-	c.monthTicks[key] = ticks
+	c.monthBars[key] = bars
 	c.mu.Unlock()
-	return ticks
+	return bars
 }
 
 // download performs the two-step HistData flow: GET the pair/year page to scrape the per-page
@@ -377,6 +429,73 @@ func writeFileAtomic(path string, data []byte) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// histDataMaxTime is a far-future sentinel used to include every tick when aggregating a whole
+// month (aggregateTicks excludes ticks at or after `to`).
+var histDataMaxTime = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+
+// aggregateTicksToMinute reduces a month's ticks to 1-minute OHLC bars (the cache granularity).
+// The whole span is included via a zero..max sentinel range, so no assumption is made about the
+// ticks being pre-sorted.
+func aggregateTicksToMinute(ticker string, ticks []dukaTick) []Candle {
+	if len(ticks) == 0 {
+		return nil
+	}
+	return aggregateTicks(ticker, Timeframe1Min, time.Minute, time.Time{}, histDataMaxTime, ticks)
+}
+
+// sliceBars returns a COPY of the bars whose timestamp is in [from, to). Input must be sorted
+// ascending by timestamp (the month caches are). The copy protects the shared cache from callers
+// that might mutate the returned slice.
+func sliceBars(bars []Candle, from, to time.Time) []Candle {
+	lo := sort.Search(len(bars), func(i int) bool { return !bars[i].Timestamp.Before(from) })
+	hi := sort.Search(len(bars), func(i int) bool { return !bars[i].Timestamp.Before(to) })
+	if lo >= hi {
+		return nil
+	}
+	out := make([]Candle, hi-lo)
+	copy(out, bars[lo:hi])
+	return out
+}
+
+// aggregateBars re-buckets already-in-range 1-minute bars into coarser OHLC bars of the given
+// timeframe. It mirrors aggregateTicks (bucketing by truncating to the step) but consumes bars —
+// high/low take the extremes, open/close the first/last by timestamp, volume the sum — which is
+// identical to aggregating the underlying ticks because 1-minute bars preserve those.
+func aggregateBars(ticker string, tf Timeframe, step time.Duration, bars []Candle) []Candle {
+	buckets := make(map[time.Time]*aggBar)
+	for _, b := range bars {
+		bucket := b.Timestamp.Truncate(step)
+		a := buckets[bucket]
+		if a == nil {
+			a = &aggBar{open: b.Open, high: b.High, low: b.Low, close: b.Close, openT: b.Timestamp, closeT: b.Timestamp}
+			buckets[bucket] = a
+			continue
+		}
+		if b.High > a.high {
+			a.high = b.High
+		}
+		if b.Low < a.low {
+			a.low = b.Low
+		}
+		if b.Timestamp.Before(a.openT) {
+			a.openT, a.open = b.Timestamp, b.Open
+		}
+		if !b.Timestamp.Before(a.closeT) {
+			a.closeT, a.close = b.Timestamp, b.Close
+		}
+		a.vol += float64(b.Volume)
+	}
+	out := make([]Candle, 0, len(buckets))
+	for bucket, a := range buckets {
+		out = append(out, Candle{
+			Ticker: ticker, Timeframe: tf, Timestamp: bucket,
+			Open: a.open, High: a.high, Low: a.low, Close: a.close, Volume: int64(math.Round(a.vol)),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
+	return out
 }
 
 // FetchQuote is not supported by the historical archive (no live pricing).
