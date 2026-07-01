@@ -1,0 +1,181 @@
+// Package sweep drives the ORB strategy-discovery parameter search: it generates a parameter
+// grid, resolves each parameter set into a concrete orbreplay configuration + variant, runs the
+// backtest over the walk-forward period splits, and ranks candidates by robustness (not net
+// profit). The methodology is coarse-grid-then-refine: a broad low-resolution sweep first, then
+// local refinement of the survivors, then out-of-sample walk-forward validation.
+//
+// The engine is a HARNESS over the knobs the backtest already supports. New strategy primitives
+// (extra sessions, retest/body-size entries, macro blackout, failed-breakout exits) land as
+// separate features that each add a dimension here.
+package sweep
+
+import (
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+
+	"github.com/romeo-folie/trade-engine/internal/backtest/orbreplay"
+	"github.com/romeo-folie/trade-engine/internal/config"
+)
+
+// ParamSet is one concrete point in the search space: a full ORB rule configuration. Only knobs
+// the backtest engine already supports are represented; every field maps to an orbreplay Variant
+// flag or a config value in Resolve.
+type ParamSet struct {
+	Session        string  `json:"session"`         // "london" | "newyork"
+	RangeMinutes   int     `json:"range_minutes"`   // opening-range width: 5 | 15 | 30 | 60
+	Confirmation   string  `json:"confirmation"`    // "stop_touch" | "close_1m" | "close_3m"
+	RiskReward     float64 `json:"risk_reward"`     // take-profit multiple of risk: 1.0 | 1.5 | 2.0
+	MaxHoldMinutes int     `json:"max_hold_minutes"`// time exit: 0 (hold to bracket) | 120 | 240
+	DirectionElig  bool    `json:"direction_elig"`  // trade only the trend-aligned side
+	RangeATRFilter bool    `json:"range_atr_filter"`// skip sessions whose opening range is outside the coarse ATR band
+	AdaptiveExits  bool    `json:"adaptive_exits"`  // break-even + ATR trailing preset
+}
+
+// Coarse ATR-band and adaptive presets applied when the corresponding boolean knob is on. Kept
+// as fixed coarse values here; the refine stage sweeps around a survivor's neighbourhood.
+const (
+	coarseMinRangeATR = 0.5
+	coarseMaxRangeATR = 3.0
+
+	coarseBreakEvenR   = 1.0
+	coarseTrailATRMult = 1.5
+	coarseTrailAfterR  = 1.0
+)
+
+// CoarseGrid defines the per-dimension levels for the coarse sweep. Data-driven so the resolution
+// is easy to tune; the full cartesian product is GenerateCoarse.
+type CoarseGrid struct {
+	Sessions       []string
+	RangeMinutes   []int
+	Confirmations  []string
+	RiskRewards    []float64
+	MaxHoldMinutes []int
+	DirectionElig  []bool
+	RangeATRFilter []bool
+	AdaptiveExits  []bool
+}
+
+// DefaultCoarseGrid is the broad, low-resolution first pass (2·4·3·3·3·2·2·2 = 1728 sets).
+func DefaultCoarseGrid() CoarseGrid {
+	return CoarseGrid{
+		Sessions:       []string{"london", "newyork"},
+		RangeMinutes:   []int{5, 15, 30, 60},
+		Confirmations:  []string{"stop_touch", "close_1m", "close_3m"},
+		RiskRewards:    []float64{1.0, 1.5, 2.0},
+		MaxHoldMinutes: []int{0, 120, 240},
+		DirectionElig:  []bool{false, true},
+		RangeATRFilter: []bool{false, true},
+		AdaptiveExits:  []bool{false, true},
+	}
+}
+
+// Size is the number of parameter sets the grid's cartesian product yields.
+func (g CoarseGrid) Size() int {
+	return len(g.Sessions) * len(g.RangeMinutes) * len(g.Confirmations) * len(g.RiskRewards) *
+		len(g.MaxHoldMinutes) * len(g.DirectionElig) * len(g.RangeATRFilter) * len(g.AdaptiveExits)
+}
+
+// GenerateCoarse enumerates every parameter set in the grid's cartesian product. Order is stable
+// (nested loops in field order) so a run is reproducible.
+func (g CoarseGrid) GenerateCoarse() []ParamSet {
+	out := make([]ParamSet, 0, g.Size())
+	for _, s := range g.Sessions {
+		for _, rm := range g.RangeMinutes {
+			for _, cf := range g.Confirmations {
+				for _, rr := range g.RiskRewards {
+					for _, mh := range g.MaxHoldMinutes {
+						for _, de := range g.DirectionElig {
+							for _, raf := range g.RangeATRFilter {
+								for _, ae := range g.AdaptiveExits {
+									out = append(out, ParamSet{
+										Session: s, RangeMinutes: rm, Confirmation: cf,
+										RiskReward: rr, MaxHoldMinutes: mh, DirectionElig: de,
+										RangeATRFilter: raf, AdaptiveExits: ae,
+									})
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+// Hash is the parameter set's stable identity — the SHA-256 of its canonical JSON, truncated to
+// 16 hex chars. Struct field order is fixed, so the encoding is deterministic.
+func (p ParamSet) Hash() string {
+	b, _ := json.Marshal(p)
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("%x", sum[:8])
+}
+
+// JSON returns the parameter set as a JSON object for storage in sweep_results.resolved_parameters.
+func (p ParamSet) JSON() json.RawMessage {
+	b, _ := json.Marshal(p)
+	return b
+}
+
+// Label is a short human-readable descriptor for logs and the variant name.
+func (p ParamSet) Label() string {
+	de := "de0"
+	if p.DirectionElig {
+		de = "de1"
+	}
+	extra := ""
+	if p.RangeATRFilter {
+		extra += "+atr"
+	}
+	if p.AdaptiveExits {
+		extra += "+adpt"
+	}
+	return fmt.Sprintf("%s/or%d/%s/rr%.1f/mh%d/%s%s", p.Session, p.RangeMinutes, p.Confirmation, p.RiskReward, p.MaxHoldMinutes, de, extra)
+}
+
+// Resolve turns a parameter set into the concrete inputs orbreplay.Engine.Run needs: a
+// ForexORBConfig (session/range/risk-reward), the per-instrument config with the swept gates
+// applied, and the Variant whose Apply* flags switch those gates on. The engine gates each
+// feature on BOTH the variant flag AND the per-instrument config, so both are set together.
+func (p ParamSet) Resolve(base config.ForexORBConfig, instruments []config.Instrument) (config.ForexORBConfig, []config.Instrument, orbreplay.Variant) {
+	cfg := base
+	cfg.Session = p.Session
+	cfg.RangeMinutes = p.RangeMinutes
+	cfg.RiskReward = p.RiskReward
+
+	out := make([]config.Instrument, len(instruments))
+	for i, inst := range instruments {
+		inst.MaxHoldMinutes = p.MaxHoldMinutes
+		if p.Confirmation == "" || p.Confirmation == "stop_touch" {
+			inst.BreakoutConfirmation = "stop_touch"
+		} else {
+			inst.BreakoutConfirmation = p.Confirmation
+		}
+		inst.DirectionEligibility = p.DirectionElig
+		if p.RangeATRFilter {
+			inst.MinRangeATR = coarseMinRangeATR
+			inst.MaxRangeATR = coarseMaxRangeATR
+		} else {
+			inst.MinRangeATR, inst.MaxRangeATR = 0, 0
+		}
+		if p.AdaptiveExits {
+			inst.BreakEvenR = coarseBreakEvenR
+			inst.TrailATRMult = coarseTrailATRMult
+			inst.TrailAfterR = coarseTrailAfterR
+		} else {
+			inst.BreakEvenR, inst.TrailATRMult, inst.TrailAfterR = 0, 0, 0
+		}
+		out[i] = inst
+	}
+
+	v := orbreplay.Variant{
+		Name:              p.Hash(),
+		MaxHoldMinutes:    p.MaxHoldMinutes,
+		ApplyEntryFilters: p.RangeATRFilter,
+		ApplyConfirmation: p.Confirmation != "" && p.Confirmation != "stop_touch",
+		ApplyDirection:    p.DirectionElig,
+		ApplyAdaptiveExit: p.AdaptiveExits,
+	}
+	return cfg, out, v
+}
