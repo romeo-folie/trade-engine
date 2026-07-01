@@ -66,6 +66,12 @@ func NewHistDataClient(baseURL, cacheDir string) (*HistDataClient, error) {
 	}
 	// America/New_York is the crux: HistData timestamps follow US Eastern WITH DST, so a
 	// DST-aware location is required — a fixed EST offset misaligns every summer bar by an hour.
+	//
+	// NOTE: HistData's own FAQ claims the timestamps are fixed EST (UTC-5, no DST). That is
+	// WRONG — verified empirically against Dukascopy (an independent UTC-anchored feed): EUR/USD
+	// bars align at UTC-4 in May 2025 and UTC-5 in Nov 2024, matching to the 5th decimal. Two
+	// different offsets across the DST boundary is impossible under a fixed offset — the data
+	// is DST-aware Eastern. Do NOT "fix" this to a fixed -5h. See TestHistData_ParseTime_DST.
 	nyLoc, err := time.LoadLocation("America/New_York")
 	if err != nil {
 		return nil, fmt.Errorf("histdata: load America/New_York: %w", err)
