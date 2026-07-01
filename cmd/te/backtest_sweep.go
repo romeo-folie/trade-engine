@@ -117,6 +117,11 @@ func runCoarseSweep(ctx context.Context) error {
 	fmt.Println()
 
 	rows, failed := sweepResultRows(sweepID, results)
+	if len(results) > 0 && failed == len(results) {
+		// Every set errored — a provider outage, an unsupported instrument, or an empty window.
+		// This is a failed run, not a valid empty one; fail loudly rather than record success.
+		return fmt.Errorf("sweep failed: all %d parameter sets errored (check provider/instruments/date range); sweep_id %s", failed, sweepID)
+	}
 	if err := store.InsertSweepResults(ctx, db, rows); err != nil {
 		return fmt.Errorf("persist results: %w", err)
 	}

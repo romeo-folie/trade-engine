@@ -8,26 +8,27 @@ import (
 
 // MinTradesFloor is the sample-size floor below which a parameter set is not trustworthy: a
 // strategy with a handful of trades can post a great expectancy by luck. Candidates under the
-// floor are pushed down rather than dropped, so they remain visible but never win.
+// floor are demoted beneath every above-floor candidate — visible, and ordered among
+// themselves, but they can never top the run.
 const MinTradesFloor = 100
+
+// subFloorDemotion is subtracted from any below-floor candidate's score. It is far larger than
+// the realistic spread of above-floor scores (expectancy ± nudges, order 1), so the trade floor
+// is a HARD gate: no thin high-expectancy fluke can outrank an above-floor set, matching the
+// plan's "≥100 trades" acceptance requirement.
+const subFloorDemotion = 1000.0
 
 // RobustnessScore ranks a parameter set by how DEPENDABLE its edge looks — deliberately not net
 // profit, which rewards over-trading and lucky months. Primary term is expectancy per trade
-// (mean R); a sample-size penalty dominates below the trade floor; profit factor and tail loss
-// are secondary nudges. Higher is better. This is the v1 heuristic — the refine/validate stages
-// re-rank survivors on out-of-sample splits and cross-period consistency, which single-period
-// coarse scoring cannot see.
+// (mean R); profit factor and tail loss are secondary nudges; a set below the trade floor is
+// hard-demoted beneath every above-floor set. Higher is better. This is the v1 heuristic — the
+// refine/validate stages re-rank survivors on out-of-sample splits and cross-period consistency,
+// which single-period coarse scoring cannot see.
 func RobustnessScore(m orbreplay.Metrics, minTrades int) float64 {
 	if m.Trades == 0 {
 		return math.Inf(-1)
 	}
 	score := m.ExpectancyR // mean gross R per trade — the core edge signal
-
-	// Sample-size gate: below the floor, subtract up to 1.0 R-equivalent proportionally, so a
-	// 5-trade fluke cannot outrank a 200-trade positive expectancy.
-	if m.Trades < minTrades {
-		score -= float64(minTrades-m.Trades) / float64(minTrades)
-	}
 
 	// Profit factor nudge: reward >1 (net winners exceed net losers) on a log scale so a huge PF
 	// on thin data doesn't dominate. +Inf PF (no losers) is treated as a modest fixed bonus.
@@ -42,6 +43,14 @@ func RobustnessScore(m orbreplay.Metrics, minTrades int) float64 {
 	// eating the stop — penalise proportionally to how far past 1R it ran.
 	if m.MaxLossR < -1.0 {
 		score += 0.05 * (m.MaxLossR + 1.0) // MaxLossR<-1 → negative term
+	}
+
+	// Hard trade-count floor. Below it, demote beneath every above-floor candidate while keeping
+	// sub-floor sets ordered among themselves (fewer trades → deeper demotion, so within the band
+	// more trades and better metrics still rank higher).
+	if m.Trades < minTrades {
+		deficit := float64(minTrades-m.Trades) / float64(minTrades) // (0, 1]
+		score -= subFloorDemotion + deficit
 	}
 	return score
 }

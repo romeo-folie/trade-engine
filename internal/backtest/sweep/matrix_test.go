@@ -97,6 +97,29 @@ func TestRobustnessScore_TradeFloorDominates(t *testing.T) {
 	}
 }
 
+// The trade floor is HARD: even a sub-floor all-winner at high RR must rank below every
+// above-floor candidate (the exact scenario the linear penalty let through).
+func TestRobustnessScore_SubFloorNeverTopsAboveFloor(t *testing.T) {
+	subFloorStar := orbreplay.Metrics{Trades: 5, ExpectancyR: 2.0, ProfitFactor: math.Inf(1)}
+	aboveFloorMeh := orbreplay.Metrics{Trades: 200, ExpectancyR: 0.10, ProfitFactor: 1.3}
+	justBelow := orbreplay.Metrics{Trades: 99, ExpectancyR: 1.5, ProfitFactor: 3.0}
+
+	star := RobustnessScore(subFloorStar, MinTradesFloor)
+	meh := RobustnessScore(aboveFloorMeh, MinTradesFloor)
+	near := RobustnessScore(justBelow, MinTradesFloor)
+	if star >= meh {
+		t.Errorf("5-trade star (%.3f) must rank below 200-trade above-floor (%.3f)", star, meh)
+	}
+	if near >= meh {
+		t.Errorf("99-trade set (%.3f) must rank below any above-floor set (%.3f) — floor is hard", near, meh)
+	}
+	// Within the sub-floor band, more trades still ranks higher.
+	if RobustnessScore(orbreplay.Metrics{Trades: 90, ExpectancyR: 0.2}, MinTradesFloor) <=
+		RobustnessScore(orbreplay.Metrics{Trades: 20, ExpectancyR: 0.2}, MinTradesFloor) {
+		t.Error("within sub-floor band, more trades should rank higher")
+	}
+}
+
 func TestRobustnessScore_EmptyIsWorst(t *testing.T) {
 	if got := RobustnessScore(orbreplay.Metrics{Trades: 0}, MinTradesFloor); !math.IsInf(got, -1) {
 		t.Errorf("empty score = %v; want -Inf", got)
