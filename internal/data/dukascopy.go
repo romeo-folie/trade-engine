@@ -69,6 +69,11 @@ type DukascopyClient struct {
 // the feed is broken rather than closed (must exceed a ~48h weekend so it never false-fires).
 const dukascopyEmptyHoursError = 48
 
+// dukascopyMaxAttempts is the per-request try budget. The free feed rate-limits under
+// sustained fetching (intermittent 503s); combined with exponential backoff this rides out a
+// transient block (~15s total) instead of aborting a long backtest on a single 503.
+const dukascopyMaxAttempts = 6
+
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
 // public feed when empty. pointScale optionally overrides the per-ticker price divisor.
 func NewDukascopyClient(baseURL string, pointScale map[string]float64) *DukascopyClient {
@@ -82,7 +87,7 @@ func NewDukascopyClient(baseURL string, pointScale map[string]float64) *Dukascop
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
-		minInterval:   50 * time.Millisecond,
+		minInterval:   150 * time.Millisecond,
 	}
 }
 
@@ -203,7 +208,12 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		return nil, false, err
 	}
 	var lastErr error
-	for attempt := range 3 {
+	for attempt := range dukascopyMaxAttempts {
+		// Back off BEFORE each retry (not after each failure) so a persistently-dead URL
+		// doesn't sleep a final, pointless interval before giving up.
+		if attempt > 0 && !backoff(ctx, attempt-1) {
+			return nil, false, ctx.Err()
+		}
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if reqErr != nil {
 			return nil, false, reqErr
@@ -211,10 +221,7 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		resp, doErr := c.httpClient.Do(req)
 		if doErr != nil {
 			lastErr = doErr
-			if !backoff(ctx, attempt) {
-				return nil, false, ctx.Err()
-			}
-			continue
+			continue // network error — retry
 		}
 		switch {
 		case resp.StatusCode == http.StatusNotFound:
@@ -225,10 +232,7 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 			resp.Body.Close()
 			if readErr != nil {
 				lastErr = readErr
-				if !backoff(ctx, attempt) {
-					return nil, false, ctx.Err()
-				}
-				continue
+				continue // read error — retry
 			}
 			return data, true, nil
 		case resp.StatusCode < 500:
@@ -238,18 +242,19 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		default: // 5xx — retry
 			resp.Body.Close()
 			lastErr = fmt.Errorf("dukascopy: %s -> %d", u, resp.StatusCode)
-			if !backoff(ctx, attempt) {
-				return nil, false, ctx.Err()
-			}
 		}
 	}
 	return nil, false, lastErr
 }
 
-// backoff sleeps a short, attempt-scaled interval; returns false if the context is cancelled.
+// backoff sleeps an EXPONENTIALLY growing interval (0.5s, 1s, 2s, 4s, 8s… capped at 8s) so a
+// transient 503 from the free feed's rate-limiter gets seconds to clear across the retry
+// budget — a multi-thousand-fetch backtest hits intermittent 503s, and too-short a backoff
+// aborts the whole run on one of them. Returns false if the context is cancelled.
 func backoff(ctx context.Context, attempt int) bool {
+	d := min(500*time.Millisecond<<attempt, 8*time.Second)
 	select {
-	case <-time.After(time.Duration(attempt+1) * 250 * time.Millisecond):
+	case <-time.After(d):
 		return true
 	case <-ctx.Done():
 		return false
