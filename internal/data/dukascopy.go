@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -46,8 +50,10 @@ const dukaTickBytes = 20
 // FetchHistory return errors. This is a BACKTEST data source, not a live feed.
 type DukascopyClient struct {
 	baseURL    string
-	pointScale map[string]float64 // ticker → price divisor override (see priceDivisor)
-	httpClient *http.Client
+	cacheDir   string             // on-disk cache root ("" disables); see readDiskCache/writeDiskCache
+	pointScale  map[string]float64 // ticker → price divisor override (see priceDivisor)
+	httpClient  *http.Client
+	maxAttempts int // per-request try budget (default dukascopyMaxAttempts; lowered in tests)
 
 	mu    sync.Mutex
 	cache map[string][]dukaTick // hour key → parsed ticks (an empty slice is cached for a no-data hour)
@@ -60,29 +66,52 @@ type DukascopyClient struct {
 	// calls because the ORB backtest fetches in many small per-session windows.
 	hoursFetched  map[string]int // instrument → hours fetched
 	hoursWithData map[string]int // instrument → hours that returned ticks
-
-	minInterval time.Duration
-	lastRequest time.Time
+	fetchFailures map[string]int // instrument → hours skipped after exhausting retries
 }
 
 // dukascopyEmptyHoursError is the lifetime empty-hour count past which the client concludes
 // the feed is broken rather than closed (must exceed a ~48h weekend so it never false-fires).
 const dukascopyEmptyHoursError = 48
 
+// dukascopyMaxAttempts is the per-request try budget. The free feed emits rare, transient
+// 503s under sustained fetching; combined with exponential backoff this rides out a short
+// block (~15s total). A 503 that outlasts the budget doesn't abort the run (see fetchHour).
+const dukascopyMaxAttempts = 6
+
+// dukascopyConcurrency bounds in-flight hour fetches. It doubles as the rate limiter (no
+// per-request throttle): a modest bound keeps the aggregate rate near what the free feed
+// tolerated serially while cutting wall-clock ~Nx over a high-latency link.
+const dukascopyConcurrency = 6
+
+// errDukaTransient marks a fetch error that exhausted the retry budget on a RETRYABLE cause
+// (5xx / network). fetchHour skips such an hour as a data gap; every other error (a terminal
+// non-404 4xx, a context cancellation/deadline) is propagated so the run fails fast.
+var errDukaTransient = errors.New("dukascopy: transient fetch failure (retries exhausted)")
+
+// dukascopyMaxFetchFailures bounds how many hours an instrument may FAIL to fetch (after
+// exhausting retries) before the run aborts. A rare transient 503 that outlasts the retry
+// budget is skipped as a one-hour data gap (a multi-thousand-fetch backtest tolerates a few);
+// but a high failure count means the feed is genuinely unstable and the results untrustworthy.
+const dukascopyMaxFetchFailures = 25
+
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
-// public feed when empty. pointScale optionally overrides the per-ticker price divisor.
-func NewDukascopyClient(baseURL string, pointScale map[string]float64) *DukascopyClient {
+// public feed when empty. cacheDir, when non-empty, enables the on-disk cache (each hour is
+// fetched from the feed at most once, ever). pointScale optionally overrides the divisor.
+func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64) *DukascopyClient {
 	if baseURL == "" {
 		baseURL = DukascopyBaseURL
 	}
 	return &DukascopyClient{
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		pointScale:    pointScale,
-		httpClient:    &http.Client{Timeout: 60 * time.Second},
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		cacheDir:   cacheDir,
+		pointScale: pointScale,
+		// 20s (not 60s): a throttled feed hangs the response after the TCP connect; a long
+		// timeout × retries makes one hour take minutes and the run appear stuck. Fail fast.
+		httpClient:    &http.Client{Timeout: 20 * time.Second},
+		maxAttempts:   dukascopyMaxAttempts,
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
-		minInterval:   50 * time.Millisecond,
 	}
 }
 
@@ -136,13 +165,60 @@ func (c *DukascopyClient) FetchCandles(ctx context.Context, ticker string, tf Ti
 		return nil, nil
 	}
 
-	var ticks []dukaTick
+	// Enumerate the hours overlapping [from, to).
+	var hours []time.Time
 	for hour := from.Truncate(time.Hour); hour.Before(to); hour = hour.Add(time.Hour) {
-		hourTicks, err := c.fetchHour(ctx, ticker, hour)
-		if err != nil {
-			return nil, err
+		hours = append(hours, hour)
+	}
+
+	// Fetch the hours CONCURRENTLY (bounded): sequential per-hour fetches over the feed's
+	// high-latency link dominate a multi-month backtest's wall-clock. The per-hour cache still
+	// de-dups repeated/overlapping hours across calls; each hour here is distinct so workers
+	// never contend on the same key. The concurrency bound is also the rate limiter (there is
+	// no per-request throttle) — occasional 503s from the extra load are absorbed by the
+	// retry + skip-on-exhaust path.
+	// A fatal fetch error (terminal 4xx, the >25 failure cap, a parse error, or caller
+	// cancellation) cancels the shared context and stops scheduling further hours, so the
+	// per-instrument cap acts as a TIMELY safety net rather than letting every remaining hour
+	// run its full retry/backoff first.
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	perHour := make([][]dukaTick, len(hours))
+	sem := make(chan struct{}, dukascopyConcurrency)
+	var wg sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	for i := range hours {
+		if fctx.Err() != nil {
+			break // a fatal error already occurred — don't schedule more work
 		}
-		ticks = append(ticks, hourTicks...)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			t, err := c.fetchHour(fctx, ticker, hours[i])
+			if err != nil {
+				errOnce.Do(func() { firstErr = err; cancel() })
+				return
+			}
+			perHour[i] = t
+		}(i)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	// The caller's context may have been cancelled before/while scheduling (so no worker
+	// recorded an error) — surface it rather than returning silently-empty bars.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	var ticks []dukaTick
+	for i := range hours {
+		ticks = append(ticks, perHour[i]...)
 	}
 	return aggregateTicks(ticker, tf, step, from, to, ticks), nil
 }
@@ -160,9 +236,45 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	}
 	c.mu.Unlock()
 
+	// On-disk cache: a previously-fetched (or confirmed-empty) hour is served from disk and
+	// NEVER re-fetched — the way to use a rate-limited free feed for repeated backtests. Only
+	// confirmed outcomes are cached (see below), so a transient-skipped hour is left uncached
+	// and re-fetched on a later run — that is what makes a throttled fetch resumable.
+	if c.cacheDir != "" {
+		if ticks, ok := c.readDiskCache(path, hour, c.priceDivisor(ticker)); ok {
+			c.mu.Lock()
+			c.cache[path] = ticks
+			c.mu.Unlock()
+			return ticks, nil
+		}
+	}
+
 	body, found, err := c.getBI5(ctx, c.baseURL+"/"+path)
+	confirmed := err == nil // a real 200 or 404 — safe to persist; a transient skip is not
 	if err != nil {
-		return nil, err
+		// Terminal errors (a non-404 4xx, or context cancellation/deadline) are propagated so
+		// the run fails fast — NOT converted into a silent data gap.
+		if !errors.Is(err, errDukaTransient) {
+			return nil, err
+		}
+		// A TRANSIENT failure (a 503 / network error that outlasted the retry budget) must NOT
+		// abort the whole backtest: skip this one hour as a data gap and carry on — but abort if
+		// an instrument accumulates too many, which means the feed is genuinely unstable and the
+		// results can't be trusted.
+		c.mu.Lock()
+		if c.fetchFailures == nil {
+			c.fetchFailures = make(map[string]int)
+		}
+		c.fetchFailures[inst]++
+		failures := c.fetchFailures[inst]
+		c.mu.Unlock()
+		if failures > dukascopyMaxFetchFailures {
+			return nil, fmt.Errorf("dukascopy: %s: aborting after %d fetch failures for %s (feed unstable): %w",
+				path, failures, inst, err)
+		}
+		slog.Warn("dukascopy: hour fetch failed after retries — skipping as a data gap",
+			"path", path, "instrument_failures", failures, "err", err)
+		found, body = false, nil // treat as no-data for this hour
 	}
 	var ticks []dukaTick
 	if found && len(body) > 0 {
@@ -173,6 +285,13 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	}
 	if ticks == nil {
 		ticks = []dukaTick{} // cache non-nil so the "cached" check above hits for no-data hours
+	}
+
+	// Persist a CONFIRMED outcome (data or no-data) to disk so it is never re-fetched.
+	if c.cacheDir != "" && confirmed {
+		if werr := c.writeDiskCache(path, body, found); werr != nil {
+			slog.Warn("dukascopy: disk cache write failed", "path", path, "err", werr)
+		}
 	}
 	c.mu.Lock()
 	c.cache[path] = ticks
@@ -195,15 +314,66 @@ func (c *DukascopyClient) fetchHour(ctx context.Context, ticker string, hour tim
 	return ticks, nil
 }
 
+// readDiskCache serves an hour from the on-disk cache. The cache mirrors the feed path under
+// cacheDir; a data hour is the raw .bi5 bytes, a confirmed no-data hour is a 0-byte file, and
+// an absent file means "not cached yet". A corrupt cache file is treated as a miss (re-fetch)
+// rather than an error, so a partial write from a killed run self-heals.
+func (c *DukascopyClient) readDiskCache(path string, hour time.Time, divisor float64) ([]dukaTick, bool) {
+	full := filepath.Join(c.cacheDir, filepath.FromSlash(path))
+	info, err := os.Stat(full)
+	if err != nil {
+		return nil, false // not cached (or unreadable) → fetch
+	}
+	if info.Size() == 0 {
+		return []dukaTick{}, true // confirmed no-data hour
+	}
+	raw, err := os.ReadFile(full)
+	if err != nil {
+		slog.Warn("dukascopy: disk cache read failed — re-fetching", "path", path, "err", err)
+		return nil, false
+	}
+	ticks, err := parseBI5(raw, hour, divisor)
+	if err != nil {
+		slog.Warn("dukascopy: corrupt disk cache entry — re-fetching", "path", path, "err", err)
+		return nil, false
+	}
+	return ticks, true
+}
+
+// writeDiskCache persists a confirmed hour: the raw .bi5 bytes for a data hour, or a 0-byte
+// file for a confirmed no-data (404) hour. The write is atomic (temp file + rename) so an
+// interrupted run never leaves a partially-written entry that a later run would misread.
+func (c *DukascopyClient) writeDiskCache(path string, body []byte, hasData bool) error {
+	full := filepath.Join(c.cacheDir, filepath.FromSlash(path))
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	var data []byte
+	if hasData {
+		data = body
+	}
+	tmp := full + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, full)
+}
+
 // getBI5 GETs a .bi5 file. A 404 (weekend / holiday / future hour — the market was closed)
 // is not an error: it returns found=false. Network and 5xx errors are retried; a 4xx other
 // than 404 fails immediately.
 func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, found bool, err error) {
-	if err := c.throttle(ctx); err != nil {
-		return nil, false, err
-	}
 	var lastErr error
-	for attempt := range 3 {
+	attempts := c.maxAttempts
+	if attempts <= 0 {
+		attempts = dukascopyMaxAttempts
+	}
+	for attempt := range attempts {
+		// Back off BEFORE each retry (not after each failure) so a persistently-dead URL
+		// doesn't sleep a final, pointless interval before giving up.
+		if attempt > 0 && !backoff(ctx, attempt-1) {
+			return nil, false, ctx.Err()
+		}
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if reqErr != nil {
 			return nil, false, reqErr
@@ -211,10 +381,7 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		resp, doErr := c.httpClient.Do(req)
 		if doErr != nil {
 			lastErr = doErr
-			if !backoff(ctx, attempt) {
-				return nil, false, ctx.Err()
-			}
-			continue
+			continue // network error — retry
 		}
 		switch {
 		case resp.StatusCode == http.StatusNotFound:
@@ -225,10 +392,7 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 			resp.Body.Close()
 			if readErr != nil {
 				lastErr = readErr
-				if !backoff(ctx, attempt) {
-					return nil, false, ctx.Err()
-				}
-				continue
+				continue // read error — retry
 			}
 			return data, true, nil
 		case resp.StatusCode < 500:
@@ -238,37 +402,25 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		default: // 5xx — retry
 			resp.Body.Close()
 			lastErr = fmt.Errorf("dukascopy: %s -> %d", u, resp.StatusCode)
-			if !backoff(ctx, attempt) {
-				return nil, false, ctx.Err()
-			}
 		}
 	}
-	return nil, false, lastErr
+	// Retry budget exhausted on a retryable (5xx / network) cause — mark it transient so
+	// fetchHour can skip the hour rather than abort the whole backtest.
+	return nil, false, fmt.Errorf("%w: %s -> %w", errDukaTransient, u, lastErr)
 }
 
-// backoff sleeps a short, attempt-scaled interval; returns false if the context is cancelled.
+// backoff sleeps an EXPONENTIALLY growing interval (0.5s, 1s, 2s, 4s, 8s… capped at 8s) so a
+// transient 503 from the free feed's rate-limiter gets seconds to clear across the retry
+// budget — a multi-thousand-fetch backtest hits intermittent 503s, and too-short a backoff
+// aborts the whole run on one of them. Returns false if the context is cancelled.
 func backoff(ctx context.Context, attempt int) bool {
+	d := min(500*time.Millisecond<<attempt, 8*time.Second)
 	select {
-	case <-time.After(time.Duration(attempt+1) * 250 * time.Millisecond):
+	case <-time.After(d):
 		return true
 	case <-ctx.Done():
 		return false
 	}
-}
-
-// throttle enforces the per-client minimum request interval, honouring context cancellation.
-func (c *DukascopyClient) throttle(ctx context.Context) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if since := time.Since(c.lastRequest); since < c.minInterval {
-		select {
-		case <-time.After(c.minInterval - since):
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-	}
-	c.lastRequest = time.Now()
-	return nil
 }
 
 // parseBI5 LZMA-decompresses a .bi5 payload (classic LZMA format) and decodes its ticks.
