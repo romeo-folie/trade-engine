@@ -134,6 +134,22 @@ func (e *Engine) costFor(symbol string) CostModel {
 	return defaultCost
 }
 
+// commissionRiskOK is the backtest twin of the live passesCommission gate: reject a bracket
+// whose estimated round-trip commission is too large relative to its planned dollar risk,
+// 2×CommissionPerSide / (|entry−stop|×qty) > MaxCommissionToRisk. Uses the engine's cost
+// model (the commission actually charged by resolveTrade) so the gate and the P&L agree.
+// Disabled when MaxCommissionToRisk is 0 or the bracket has no risk/qty to measure.
+func (e *Engine) commissionRiskOK(inst config.Instrument, p orb.BracketParams) bool {
+	if inst.MaxCommissionToRisk <= 0 {
+		return true
+	}
+	riskDollars := absf(p.EntryStop-p.StopLoss) * float64(p.Qty)
+	if riskDollars <= 0 {
+		return true
+	}
+	return 2*e.costFor(inst.Symbol).CommissionPerSide/riskDollars <= inst.MaxCommissionToRisk
+}
+
 // Run replays the variant over [from, to] for the given instruments and returns the
 // per-trade results. One opening-range session is simulated per UTC calendar day per
 // instrument; weekend/holiday days simply yield no candles and are skipped.
@@ -236,6 +252,15 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		}
 	}
 
+	// Entry-quality gate 3 — commission/dollar-risk filter: mirror the live passesCommission
+	// gate. The replay charges CostModel.CommissionPerSide per fill regardless of size, so at
+	// notional-capped qtys the round trip can exceed the entire planned dollar risk; skip the
+	// session as live would. Buy and sell share the risk magnitude and (lot-rounding aside)
+	// the qty, so one side's check covers both.
+	if v.ApplyEntryFilters && !e.commissionRiskOK(inst, buy) {
+		return nil, nil // commission too large relative to planned dollar risk
+	}
+
 	// Direction eligibility (Phase 3): place only the trend-aligned side, mirroring the live
 	// directionEligibility gate. Zeroing a side's Qty makes the breakout/confirmation logic
 	// below skip it. Fails open (both sides kept) when the trend EMA is unavailable.
@@ -314,6 +339,11 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 					return nil, nil // spread too wide relative to the retest stop distance
 				}
 			}
+		}
+		// Same for the commission gate: the retest bracket's dollar risk (tighter stop,
+		// re-sized qty) is what the round-trip commission is actually paid against.
+		if v.ApplyEntryFilters && !e.commissionRiskOK(inst, rp) {
+			return nil, nil // commission too large relative to the retest dollar risk
 		}
 		retestParams = &rp
 	} else if v.ApplyConfirmation && orb.RequiresConfirmation(inst.BreakoutConfirmation) {

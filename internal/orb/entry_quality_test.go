@@ -123,3 +123,43 @@ func TestPassesSpread(t *testing.T) {
 		}
 	})
 }
+
+func TestPassesCommission(t *testing.T) {
+	// entryStop 1.1012, stopLoss 1.0998 → risk/unit 0.0014; qty 5000 → dollar risk $7.
+	// commission_per_side $2 → round trip $4 → ratio 0.571.
+	const entryStop, stopLoss = 1.1012, 1.0998
+	inst := config.Instrument{Symbol: "EUR/USD", CommissionPerSide: 2.0, MaxCommissionToRisk: 0.05}
+
+	t.Run("disabled when max is zero", func(t *testing.T) {
+		off := inst
+		off.MaxCommissionToRisk = 0
+		if ok, _, _ := passesCommission(5000, entryStop, stopLoss, off); !ok {
+			t.Error("disabled (max 0) should always pass")
+		}
+	})
+	t.Run("disabled when commission estimate is zero", func(t *testing.T) {
+		off := inst
+		off.CommissionPerSide = 0
+		if ok, _, _ := passesCommission(5000, entryStop, stopLoss, off); !ok {
+			t.Error("no commission estimate should pass (config validation rejects this combo)")
+		}
+	})
+	t.Run("min-lot dollar risk is rejected", func(t *testing.T) {
+		ok, ratio, reason := passesCommission(5000, entryStop, stopLoss, inst)
+		if ok {
+			t.Errorf("commission/risk %.3f should be rejected by max 0.05 (%s)", ratio, reason)
+		}
+	})
+	t.Run("margin-sized qty passes", func(t *testing.T) {
+		// qty 275,000 → dollar risk $385 → ratio 0.0104 ≤ 0.05.
+		ok, ratio, _ := passesCommission(275000, entryStop, stopLoss, inst)
+		if !ok {
+			t.Errorf("commission/risk %.4f should pass max 0.05", ratio)
+		}
+	})
+	t.Run("zero qty passes through to the existing cannot-trade path", func(t *testing.T) {
+		if ok, _, _ := passesCommission(0, entryStop, stopLoss, inst); !ok {
+			t.Error("zero qty has no dollar risk to measure; the qty==0 skip handles it")
+		}
+	})
+}

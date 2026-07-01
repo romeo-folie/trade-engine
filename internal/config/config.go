@@ -632,6 +632,30 @@ type Instrument struct {
 	// false (default) keeps dual-sided. See ForexORBConfig.TrendTimeframe / TrendEMAPeriod.
 	DirectionEligibility bool `yaml:"direction_eligibility"`
 
+	// MarginRate is the broker's margin requirement for this instrument as a fraction of
+	// notional (e.g. 0.033 ≈ 30:1 leverage for a forex major, 0.05 for a gold CFD). When set,
+	// the ForexORBConfig.MaxPositionPct cap limits MARGIN CONSUMED (notional × margin_rate)
+	// instead of full notional — without it, a leveraged forex position is capped to min-lot
+	// territory where the broker's minimum commission dwarfs the dollar risk per trade
+	// (sweep 9af76e63: fixed ~$4 round-trip on ~$2-15 risk turned TP hits into net losses).
+	// <= 0 keeps the current full-notional behaviour. Applied in sizeForexQty, so it affects
+	// live and backtest sizing identically.
+	MarginRate float64 `yaml:"margin_rate"`
+
+	// CommissionPerSide is the estimated broker commission in account currency per fill
+	// (a bracket round trip pays 2×). Set it to max(broker minimum, bps × typical notional)
+	// for this instrument's size regime. Used by the commission/risk entry gate below and,
+	// when > 0, as the backtest cost model's commission for this instrument. 0 disables the
+	// gate and leaves the backtest on its conservative default.
+	CommissionPerSide float64 `yaml:"commission_per_side"`
+
+	// MaxCommissionToRisk rejects a session when the estimated round-trip commission is too
+	// large relative to the planned DOLLAR risk: 2×commission_per_side / (|entry−stop|×qty).
+	// The spread gate (max_spread_to_risk) can't catch this: spread scales with position size
+	// while commission has a fixed floor, so it only bites at small dollar risk. 0 disables.
+	// Requires commission_per_side > 0 (validated).
+	MaxCommissionToRisk float64 `yaml:"max_commission_to_risk"`
+
 	// RiskMultiplier (Phase 5) scales this instrument's per-trade risk relative to the
 	// strategy MaxRiskPct, so a higher-tail-risk instrument (e.g. XAU/USD) can be sized
 	// down without disabling it. <= 0 is treated as 1.0 (no change). Applied in
@@ -1402,6 +1426,21 @@ func Validate(cfg *Config) []string {
 				errs = append(errs, fmt.Sprintf(
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m (retest_swing/retest_range are backtest-only)",
 					inst.Symbol, inst.BreakoutConfirmation))
+			}
+			// Margin-aware sizing: a rate above 1 would SHRINK the notional cap below the
+			// unleveraged baseline — almost certainly a leverage ratio typed where a fraction
+			// belongs (33 instead of 0.033). Fail loud.
+			if inst.MarginRate > 1 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: margin_rate %.3f must be a fraction of notional in (0, 1] (e.g. 0.033 for 30:1 leverage), not a leverage ratio",
+					inst.Symbol, inst.MarginRate))
+			}
+			// The commission gate needs a commission estimate; a max without one would be a
+			// silent no-op that quietly re-admits the min-commission trades it exists to block.
+			if inst.MaxCommissionToRisk > 0 && inst.CommissionPerSide <= 0 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: max_commission_to_risk requires commission_per_side > 0",
+					inst.Symbol))
 			}
 			// Split-bracket partial take-profit: a partial needs a fraction in (0,1), and its
 			// target must sit nearer than the runner's (else the "partial" closes after the
