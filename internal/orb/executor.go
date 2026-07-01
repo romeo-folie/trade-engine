@@ -98,44 +98,7 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		takeProfit = entryStop - risk*cfg.RiskReward
 	}
 
-	riskPerUnit := math.Abs(entryStop - stopLoss)
-	if riskPerUnit < 0.0001 {
-		riskPerUnit = 0.0001
-	}
-	// Per-instrument risk multiplier (Phase 5): size a higher-tail-risk instrument down
-	// without disabling it. <= 0 means 1.0 (no change).
-	mult := inst.RiskMultiplier
-	if mult <= 0 {
-		mult = 1.0
-	}
-	maxRiskDollars := portfolioValue * cfg.MaxRiskPct * mult / 100.0
-	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
-
-	// Round down to lot size
-	lotSize := inst.MinLotSize
-	if lotSize > 0 {
-		qty = (qty / lotSize) * lotSize
-		if qty < lotSize {
-			qty = lotSize
-		}
-	}
-	if qty < 1 {
-		qty = 1
-	}
-
-	// Hard notional cap: qty × entry price must not exceed MaxPositionPct% of portfolio.
-	if cfg.MaxPositionPct > 0 && entryStop > 0 {
-		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entryStop))
-		if lotSize > 0 {
-			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
-			if maxQtyByNotional < lotSize {
-				maxQtyByNotional = 0 // cannot trade — min lot exceeds position cap
-			}
-		}
-		if maxQtyByNotional >= 0 && qty > maxQtyByNotional {
-			qty = maxQtyByNotional
-		}
-	}
+	qty := sizeForexQty(entryStop, stopLoss, portfolioValue, cfg, inst)
 
 	// If qty is zero after the notional cap, the minimum lot size exceeds the
 	// position limit — signal "cannot trade" so the caller can skip this order.
@@ -148,6 +111,49 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		Qty:        qty,
 		SecType:    inst.SecType,
 	}
+}
+
+// sizeForexQty risk-sizes a forex/CFD position from its entry and stop: qty targets
+// MaxRiskPct×RiskMultiplier of the portfolio at the planned stop distance, rounded down to the
+// instrument's lot size, then capped so notional does not exceed MaxPositionPct of the portfolio.
+// Returns 0 when even the minimum lot breaches the notional cap ("cannot trade"). Shared by the
+// range bracket and the retest bracket so both size identically.
+func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) int {
+	riskPerUnit := math.Abs(entry - stop)
+	if riskPerUnit < 0.0001 {
+		riskPerUnit = 0.0001
+	}
+	mult := inst.RiskMultiplier
+	if mult <= 0 {
+		mult = 1.0
+	}
+	maxRiskDollars := portfolioValue * cfg.MaxRiskPct * mult / 100.0
+	qty := int(math.Floor(maxRiskDollars / riskPerUnit))
+
+	lotSize := inst.MinLotSize
+	if lotSize > 0 {
+		qty = (qty / lotSize) * lotSize
+		if qty < lotSize {
+			qty = lotSize
+		}
+	}
+	if qty < 1 {
+		qty = 1
+	}
+
+	if cfg.MaxPositionPct > 0 && entry > 0 {
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entry))
+		if lotSize > 0 {
+			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
+			if maxQtyByNotional < lotSize {
+				maxQtyByNotional = 0 // cannot trade — min lot exceeds position cap
+			}
+		}
+		if maxQtyByNotional >= 0 && qty > maxQtyByNotional {
+			qty = maxQtyByNotional
+		}
+	}
+	return qty
 }
 
 // ScaleOutBrackets splits a computed forex bracket into a PARTIAL and a RUNNER bracket for

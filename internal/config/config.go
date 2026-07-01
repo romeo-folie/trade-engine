@@ -612,9 +612,19 @@ type Instrument struct {
 	//   "close_1m"        — require one 1-minute close beyond the breakout level.
 	//   "close_3m"        — require three consecutive 1-minute closes beyond it (the
 	//                       breakout must hold ~3 minutes), filtering false breakouts.
+	//   "retest_swing"    — wait for the breakout to pull back to the range level and bounce,
+	//                       then enter; stop just beyond the retest swing (tighter → better R:R).
+	//   "retest_range"    — same retest entry, but stop at the opposite side of the opening range.
 	// Confirmation trades enter later and at a worse price than a stop touch, in exchange
 	// for a stronger signal. Default stop_touch preserves current behaviour.
 	BreakoutConfirmation string `yaml:"breakout_confirmation"`
+
+	// Retest parameters (Phase 6), used only by the retest_* confirmation modes. RetestTolerance
+	// is how close (as a fraction of the opening-range width) the pullback must return to the
+	// breakout level to count as a retest; RetestTimeoutMinutes bounds how long after the breakout
+	// the bounce entry may occur. Zero values fall back to sensible defaults in the engine.
+	RetestTolerance      float64 `yaml:"retest_tolerance"`
+	RetestTimeoutMinutes int     `yaml:"retest_timeout_minutes"`
 
 	// DirectionEligibility (Phase 3) makes each breakout direction EARN its bracket: with
 	// it on, only the side aligned with the trend (price vs the trend-timeframe EMA) is
@@ -1381,11 +1391,14 @@ func Validate(cfg *Config) []string {
 	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
 	// wick-touch entries Phase 3 is meant to filter.
 	if cfg.ForexORB.Enabled {
-		validConfirm := map[string]bool{"": true, "stop_touch": true, "close_1m": true, "close_3m": true}
+		validConfirm := map[string]bool{
+			"": true, "stop_touch": true, "close_1m": true, "close_3m": true,
+			"retest_swing": true, "retest_range": true,
+		}
 		for _, inst := range cfg.ForexORB.Instruments {
 			if !validConfirm[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m",
+					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
 					inst.Symbol, inst.BreakoutConfirmation))
 			}
 			// Split-bracket partial take-profit: a partial needs a fraction in (0,1), and its
