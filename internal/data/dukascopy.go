@@ -97,9 +97,11 @@ func NewDukascopyClient(baseURL string, pointScale map[string]float64) *Dukascop
 		baseURL = DukascopyBaseURL
 	}
 	return &DukascopyClient{
-		baseURL:       strings.TrimRight(baseURL, "/"),
-		pointScale:    pointScale,
-		httpClient:    &http.Client{Timeout: 60 * time.Second},
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		pointScale: pointScale,
+		// 20s (not 60s): a throttled feed hangs the response after the TCP connect; a long
+		// timeout × retries makes one hour take minutes and the run appear stuck. Fail fast.
+		httpClient:    &http.Client{Timeout: 20 * time.Second},
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
