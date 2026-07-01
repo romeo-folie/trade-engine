@@ -404,6 +404,18 @@ func Defaults() *Config {
 				InstrumentMinTrades:   10,
 				ArbiterInvokedRateMax: 0.50,
 			},
+			// Auto-throttle baseline (disabled). Defaulting Sensitivity here — rather than in
+			// the mapping fn — lets an explicit `sensitivity: 0` in YAML mean "flat / no
+			// performance scaling" while an omitted value gets the active 1.0.
+			ORBAutoThrottle: ORBAutoThrottleConfig{
+				Enabled:     false,
+				Window:      "30d",
+				MinTrades:   20,
+				Sensitivity: 1.0,
+				Floor:       0.5,
+				Cap:         1.5,
+				MaxAgeDays:  3,
+			},
 		},
 	}
 }

@@ -259,6 +259,40 @@ func (s *ORBScheduler) instrumentForTicker(ticker string) *config.Instrument {
 	return nil
 }
 
+// throttledInstrument applies the feedback auto-throttle to an instrument's risk multiplier:
+// it MULTIPLIES the static per-instrument risk_multiplier by the nightly-derived multiplier
+// stored from this instrument's rolling realised expectancy. A complete no-op (returns inst
+// unchanged) unless the auto-throttle is enabled, a DB is available, and a stored multiplier
+// exists for the configured window — so disabled / no-data sizing is exactly as before.
+func (s *ORBScheduler) throttledInstrument(ctx context.Context, inst config.Instrument) config.Instrument {
+	if s.feedbackCfg == nil || !s.feedbackCfg.ORBAutoThrottle.Enabled || s.db == nil {
+		return inst
+	}
+	at := s.feedbackCfg.ORBAutoThrottle
+	window := at.ThrottleWindow()
+	// Only trust a recently-refreshed multiplier: a stale one (the window dried up / dropped
+	// below min-trades, so the reviewer stopped rewriting it) must not keep sizing live trades.
+	// GetFreshORBRiskMultiplier normalises this to a UTC calendar date, so a wall-clock value
+	// with a time-of-day is fine.
+	notBefore := s.now().AddDate(0, 0, -at.MaxAgeDaysOrDefault())
+	auto, ok, err := store.GetFreshORBRiskMultiplier(ctx, inst.Symbol, window, notBefore)
+	if err != nil {
+		slog.Warn("orb: auto-throttle: read multiplier failed — using static risk", "ticker", inst.Symbol, "err", err)
+		return inst
+	}
+	if !ok || auto <= 0 {
+		return inst // no fresh opinion (no recent review, below min-trades, or window dried up)
+	}
+	base := inst.RiskMultiplier
+	if base <= 0 {
+		base = 1.0
+	}
+	inst.RiskMultiplier = base * auto // inst is a value copy; caller's config is untouched
+	slog.Info("orb: auto-throttle applied", "ticker", inst.Symbol, "window", window,
+		"static", base, "auto", auto, "effective", inst.RiskMultiplier)
+	return inst
+}
+
 // sessionOpenMinutes returns the minute-of-day for market/session open
 // in the scheduler's timezone (ET for equities/futures, configured TZ for forex).
 func (s *ORBScheduler) sessionOpenMinutes() int {
@@ -1064,8 +1098,12 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
-			buyParams := ComputeForexBracket(r, "buy", portfolioVal, *s.forexCfg, *inst)
-			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, *inst)
+			// Feedback auto-throttle: scale this instrument's risk by its rolling realised
+			// expectancy (a no-op unless enabled and data exists). Computed once, shared by
+			// both sides — they have identical sizing inputs.
+			tinst := s.throttledInstrument(ctx, *inst)
+			buyParams := ComputeForexBracket(r, "buy", portfolioVal, *s.forexCfg, tinst)
+			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, tinst)
 
 			if buyParams.Qty == 0 && sellParams.Qty == 0 {
 				slog.Warn("orb: skipping instrument — min lot size exceeds position cap", "ticker", ticker)

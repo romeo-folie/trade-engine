@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -78,6 +80,34 @@ func GetFeedbackInsights(ctx context.Context, scope, scopeKey, window string, li
 	}
 	defer rows.Close()
 	return scanFeedbackInsights(rows)
+}
+
+// GetFreshORBRiskMultiplier returns the most recent auto-throttle risk multiplier the nightly
+// reviewer stored for an ORB instrument over the given window — but ONLY if it was written on
+// or after notBefore — plus whether one was found. The freshness bound matters because the
+// reviewer skips writing below its min-trades gate, so an old stored value would otherwise
+// keep sizing live trades after the rolling window has too few trades. A missing (or stale)
+// value means the throttle has no current opinion, so the caller falls back to a neutral 1.0.
+func GetFreshORBRiskMultiplier(ctx context.Context, ticker, window string, notBefore time.Time) (float64, bool, error) {
+	var v float64
+	// The `date` column is a DATE; compare it to notBefore's UTC CALENDAR day so a caller
+	// passing a wall-clock timestamp (with a time-of-day) doesn't drop a row written on the
+	// boundary day. Anchoring to UTC keeps it independent of the DB session timezone.
+	err := GetDB().QueryRow(ctx, `
+		SELECT value FROM feedback_insights
+		WHERE scope='orb_session' AND scope_key=$1 AND metric='risk_multiplier' AND time_window=$2
+		  AND date >= ($3 AT TIME ZONE 'UTC')::date
+		ORDER BY date DESC
+		LIMIT 1`,
+		ticker, window, notBefore,
+	).Scan(&v)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, false, nil
+		}
+		return 0, false, err
+	}
+	return v, true, nil
 }
 
 // GetLatestFeedbackInsights returns all insights for a scope+window on a specific date.
