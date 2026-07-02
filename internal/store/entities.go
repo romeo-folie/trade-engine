@@ -72,6 +72,38 @@ func GetEntityByTicker(ctx context.Context, ticker string) (*Entity, error) {
 	return e, nil
 }
 
+// GetTickersMissingEntity returns distinct tickers — from the active stock
+// watchlist plus analyses created in the last `days` days — that have no
+// entities row under a case-insensitive ticker match. Forex-style tickers
+// containing '/' are excluded: they have no issuing organization to look up.
+func GetTickersMissingEntity(ctx context.Context, days int) ([]string, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT DISTINCT t.ticker FROM (
+			SELECT ticker FROM watchlist WHERE active AND platform = 'stock'
+			UNION
+			SELECT ticker FROM analyses WHERE created_at > NOW() - make_interval(days => $1)
+		) t
+		WHERE t.ticker NOT LIKE '%/%'
+		  AND NOT EXISTS (
+			SELECT 1 FROM entities e WHERE UPPER(e.ticker) = UPPER(t.ticker)
+		  )
+		ORDER BY t.ticker`, days)
+	if err != nil {
+		return nil, fmt.Errorf("get tickers missing entity: %w", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var tk string
+		if err := rows.Scan(&tk); err != nil {
+			return nil, err
+		}
+		out = append(out, tk)
+	}
+	return out, rows.Err()
+}
+
 // GetEntityByID returns the entity with the given UUID.
 func GetEntityByID(ctx context.Context, id string) (*Entity, error) {
 	row := GetDB().QueryRow(ctx, `

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 )
@@ -66,6 +67,58 @@ type finnhubArticle struct {
 		BullishPercent float64 `json:"bullishPercent"`
 		BearishPercent float64 `json:"bearishPercent"`
 	} `json:"sentiment"`
+}
+
+// finnhubProfile is the raw JSON shape from Finnhub's /stock/profile2 endpoint.
+type finnhubProfile struct {
+	Name string `json:"name"`
+}
+
+// FetchCompanyProfile returns the company's full name for a ticker via
+// Finnhub's /stock/profile2 endpoint (available on the free tier).
+// Finnhub answers unknown symbols with an empty JSON object and HTTP 200
+// rather than a 404, so "no profile" is returned as ("", nil) — only
+// transport/API failures produce an error.
+func (c *FinnhubClient) FetchCompanyProfile(ctx context.Context, ticker string) (string, error) {
+	if err := c.throttle(ctx); err != nil {
+		return "", err
+	}
+
+	params := url.Values{}
+	params.Set("symbol", ticker)
+	params.Set("token", c.apiKey)
+
+	reqURL := finnhubBaseURL + "/stock/profile2?" + params.Encode()
+	resp, err := withRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+			resp.Body.Close()
+			return nil, &httpError{
+				status:     resp.StatusCode,
+				msg:        fmt.Sprintf("finnhub profile API error %d for %s", resp.StatusCode, ticker),
+				retryAfter: retryAfter,
+			}
+		}
+		return resp, nil
+	})
+	if err != nil {
+		return "", fmt.Errorf("finnhub profile get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var p finnhubProfile
+	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
+		return "", fmt.Errorf("finnhub profile decode: %w", err)
+	}
+	return strings.TrimSpace(p.Name), nil
 }
 
 // FetchNews retrieves company news from Finnhub for a single ticker published after 'since'.

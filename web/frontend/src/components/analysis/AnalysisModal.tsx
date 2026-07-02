@@ -146,9 +146,6 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div className={styles.headerLeft}>
             <div className={styles.headerTopRow}>
               <span className={styles.title}>{analysis.Ticker}</span>
-              {analysis.CompanyName && (
-                <span className={styles.companyName}>{analysis.CompanyName}</span>
-              )}
               <ChamferedBox
                 chamfer={6}
                 centerContent
@@ -166,6 +163,9 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
                 </span>
               </ChamferedBox>
             </div>
+            {analysis.CompanyName && (
+              <span className={styles.companyName}>{analysis.CompanyName}</span>
+            )}
             <span className={styles.headerMeta}>
               {fmtDateTime(analysis.CreatedAt)} · {analysis.Strategy.replace(/_/g, ' ')} · {analysis.ModelProvider} / {analysis.ModelName}
             </span>

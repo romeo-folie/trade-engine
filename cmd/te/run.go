@@ -22,6 +22,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
 	"github.com/romeo-folie/trade-engine/internal/feedback"
+	"github.com/romeo-folie/trade-engine/internal/knowledge"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
@@ -179,6 +180,18 @@ Modes:
 		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
 			// One-time backfill runs in background; skips gracefully if DB unavailable.
 			go portfolio.Backfill(ctx, alpacaBroker, portfolioMode, portfolioBroker)
+		}
+
+		// Company-name backfill: ensure every watchlist/analysis ticker has a
+		// knowledge-graph entity so the UI shows the organization's full name
+		// instead of the model-string fallback. One-shot per boot; the Finnhub
+		// client's throttle paces the profile calls.
+		if fh, ok := newsProvider.(*data.FinnhubClient); ok && fh != nil {
+			go func() {
+				if _, err := knowledge.BackfillCompanyNames(ctx, fh); err != nil && ctx.Err() == nil {
+					logger.Warn("company-name backfill failed", "err", err.Error())
+				}
+			}()
 		}
 
 		// Server-side trailing stop manager (#322). Opt-in; disabled by
