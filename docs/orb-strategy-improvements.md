@@ -90,6 +90,7 @@ Replace the current generic flow with an adaptive one:
 
 ```text
 configured instrument
+  -> macro event risk check
   -> session quality check
   -> range quality check
   -> directional bias check
@@ -253,7 +254,54 @@ If both long and short are eligible, the strategy may place both sides. If only
 one side is eligible, place only that side. If neither side is eligible, skip the
 instrument for that session.
 
-### 5. Make Exits Instrument-Specific
+### 5. Add Macro Event Calendar Filters
+
+Forex ORB should consider scheduled macro events, but first as an event-risk
+filter rather than a directional news-sentiment model.
+
+Examples of high-impact events:
+
+- Central bank rate decisions and press conferences.
+- US CPI, PCE, GDP, nonfarm payrolls, and unemployment releases.
+- ECB, BoE, BoJ, and Fed speeches marked high impact by the data source.
+- Pair-specific releases, such as EUR events for EUR/USD or GBP events for
+  GBP/USD.
+
+Generic headlines should not be part of the first forex ORB implementation.
+They are noisy, difficult to backtest consistently, and can encourage the
+strategy to infer direction from unstructured text. The first version should use
+deterministic macro-calendar metadata:
+
+- Scheduled release time.
+- Country/currency.
+- Event category/name.
+- Impact/importance.
+
+Suggested starting behavior:
+
+```text
+skip a setup when a high-impact event affecting either currency in the pair
+falls inside [session_open - 30m, session_open + 90m]
+```
+
+For XAU/USD, treat high-impact USD, Fed, inflation, employment, GDP, and broad
+risk events as relevant. XAU/USD should use a stricter blackout than EUR/USD or
+GBP/USD because metals tend to reprice sharply around US macro releases.
+
+Alternative behavior to test after the skip rule:
+
+```text
+medium-impact event -> apply risk_multiplier_event = 0.50
+high-impact event   -> apply risk_multiplier_event = 0.00
+```
+
+Important backtest constraint:
+
+- Before the release timestamp, the replay may use only scheduled metadata.
+- `actual`, `forecast`, `previous`, and surprise values may be used only after
+  the simulated clock has passed the release timestamp.
+
+### 6. Make Exits Instrument-Specific
 
 Do not force every instrument into the same 2R bracket.
 
@@ -279,7 +327,7 @@ expectancy:
 expectancy = win_rate * avg_win - loss_rate * avg_loss
 ```
 
-### 6. Add Instrument-Specific Risk Multipliers
+### 7. Add Instrument-Specific Risk Multipliers
 
 Keep all instruments enabled, but size them according to volatility and realized
 loss distribution.
@@ -296,7 +344,7 @@ This is not an instrument removal rule. It is an exposure normalization rule.
 An instrument with larger slippage, larger gaps, and larger tail risk should not
 receive the same effective risk as a calmer FX pair.
 
-### 7. Add Spread and Slippage Guards
+### 8. Add Spread and Slippage Guards
 
 Before placing entry orders, reject sessions where the current spread is too
 wide relative to the planned stop distance.
@@ -320,7 +368,7 @@ Suggested starting values:
 Also record expected spread at entry time so performance can be analyzed by
 liquidity regime.
 
-### 8. Track Regime-Level Performance
+### 9. Track Regime-Level Performance
 
 Performance should be tracked by more than ticker.
 
@@ -329,6 +377,7 @@ Minimum breakdown:
 - Instrument
 - Side
 - Session
+- Macro event regime
 - Day of week
 - Opening range width
 - ATR-normalized range width
@@ -342,9 +391,9 @@ The strategy should learn from setup classes, not just from instruments.
 Example labels:
 
 ```text
-EUR/USD london long confirmed-close narrow-range
-GBP/USD newyork short retest-confirmed normal-spread
-XAU/USD london long momentum-close wide-range
+EUR/USD london long confirmed-close narrow-range no-event
+GBP/USD newyork short retest-confirmed normal-spread post-us-cpi
+XAU/USD london long momentum-close wide-range pre-fomc
 ```
 
 ## Suggested Config Shape
@@ -360,9 +409,18 @@ forex_orb:
   timezone: UTC
   range_minutes: 15
   max_risk_pct: 1.0
+  macro_events:
+    enabled: true
+    provider: tradingeconomics
+    blackout_before_minutes: 30
+    blackout_after_minutes: 90
+    min_skip_importance: high
+    medium_event_risk_multiplier: 0.50
+    high_event_risk_multiplier: 0.00
   instruments:
     - symbol: EUR/USD
       sec_type: CASH
+      currencies: [EUR, USD]
       min_lot_size: 5000
       pip_buffer: 0.0002
       risk_multiplier: 1.0
@@ -376,6 +434,7 @@ forex_orb:
 
     - symbol: GBP/USD
       sec_type: CASH
+      currencies: [GBP, USD]
       min_lot_size: 5000
       pip_buffer: 0.0002
       risk_multiplier: 0.75
@@ -389,6 +448,8 @@ forex_orb:
 
     - symbol: XAU/USD
       sec_type: CFD
+      currencies: [XAU, USD]
+      macro_event_tags: [USD, FED, INFLATION, EMPLOYMENT, GDP, RISK]
       min_lot_size: 1
       pip_buffer: 0.50
       risk_multiplier: 0.35
@@ -427,14 +488,24 @@ forex_orb:
 - Add confirmation modes: `stop_touch`, `close_1m`, `close_3m`, `retest`.
 - Record confirmation mode on each trade.
 
-### Phase 4: Adaptive Exit Management
+### Phase 4: Macro Calendar Event Filter
+
+- Add a normalized `macro_events` store for scheduled and historical economic
+  releases.
+- Add an import command for historical event data.
+- Add instrument-to-currency/event-tag mapping.
+- Add a deterministic blackout/risk-reduction gate before placing ORB entries.
+- Record the active macro event regime on each skipped setup or placed trade.
+- Add replay support for a `macro-filter` variant.
+
+### Phase 5: Adaptive Exit Management
 
 - Add break-even stop movement.
 - Add partial take profit support where broker/executor supports it.
 - Add trailing stop support after a configurable R threshold.
 - Record exit source and exit rule separately.
 
-### Phase 5: Feedback and Auto-Throttling
+### Phase 6: Feedback and Auto-Throttling
 
 - Build rolling performance summaries by instrument, side, session, and setup
   label.
@@ -498,8 +569,9 @@ Primary effect:
 
 ### Outcome 2: Fewer False Breakouts
 
-ATR-normalized range filters, spread filters, and candle-close confirmation
-should reduce trades triggered by random wicks.
+ATR-normalized range filters, macro event filters, spread filters, and
+candle-close confirmation should reduce trades triggered by random wicks or
+macro-release noise.
 
 Expected measurable changes:
 
@@ -510,10 +582,13 @@ Expected measurable changes:
 | Win rate | Up |
 | Average R per trade | Up |
 | Trades stopped within first 15-30 minutes | Down |
+| Trades opened immediately before high-impact releases | Down or zero |
 
 Primary effect:
 
 - The strategy trades less often, but the average setup quality should improve.
+- Avoiding scheduled macro shocks should reduce slippage, whipsaw entries, and
+  false breakout fills around known event windows.
 
 ### Outcome 3: More Stable Instrument Behavior
 
@@ -558,9 +633,28 @@ actionable.
 Expected measurable changes:
 
 - Every closed trade can be grouped by instrument, side, session, range quality,
-  confirmation mode, spread regime, and exit rule.
+  confirmation mode, spread regime, macro event regime, and exit rule.
 - Weekly reviews can identify which setup types are profitable instead of only
   ranking instruments by raw PnL.
+
+### Outcome 6: Macro Event Risk Is Measurable
+
+The strategy should be able to answer whether scheduled macro events help or
+hurt ORB expectancy.
+
+Expected measurable changes:
+
+| Metric | Expected Direction |
+| --- | --- |
+| Trades skipped because of high-impact events | Tracked |
+| PnL around macro blackout windows | Separately reported |
+| Slippage around macro releases | Separately reported |
+| Expectancy with and without event filter | Comparable in replay |
+
+Primary effect:
+
+- The team can decide whether event filters improve expectancy using historical
+  replay instead of intuition.
 
 ## Test Plan
 
@@ -642,6 +736,52 @@ Expected assertions:
 - Both sides are placed only when both directions independently qualify.
 - The chosen confirmation mode is recorded on the trade metadata.
 
+#### Macro Calendar Filter
+
+Test cases:
+
+- A high-impact USD event inside the configured blackout window skips EUR/USD,
+  GBP/USD, and XAU/USD setups.
+- A high-impact EUR event skips EUR/USD but does not skip GBP/USD unless USD is
+  also affected.
+- A medium-impact event applies the configured risk reduction when skip mode is
+  disabled.
+- Events outside the blackout window do not affect eligibility.
+- Missing macro-event data fails according to config: either fail closed for
+  live trading or fail open for replay experiments, but never silently.
+- Event matching uses normalized currencies/tags, not free-form event names.
+
+Expected assertions:
+
+- `macro_event_regime` or equivalent setup metadata is recorded for every skip
+  or trade.
+- No order is placed when a high-impact event requires a skip.
+- A risk-reduction event scales quantity without changing bracket geometry.
+- Event windows are computed in UTC and are stable across local timezone
+  settings.
+
+#### Historical Macro Data Import
+
+Test cases:
+
+- Importing the same provider payload twice is idempotent.
+- Historical events preserve scheduled release time, country, currency,
+  category, importance, forecast, previous, actual, source, and provider ID when
+  available.
+- Provider event IDs are unique per provider.
+- Events with missing importance are stored but do not become high-impact by
+  default.
+- Unknown countries/currencies are stored but ignored by instrument matching
+  unless explicitly mapped.
+
+Expected assertions:
+
+- The import can backfill a date range without broker connectivity.
+- Backtest queries return only events whose scheduled time intersects the
+  simulated decision window.
+- Surprise fields (`actual`, `forecast`, `previous`) are not exposed to the
+  strategy before the release timestamp.
+
 #### Adaptive Exits
 
 Test cases:
@@ -695,8 +835,34 @@ Likely new fields:
 - `spread_to_risk`
 - `confirmation_mode`
 - `setup_label`
+- `macro_event_regime`
+- `macro_event_ids`
 - `max_hold_minutes`
 - `risk_multiplier`
+
+Likely new table:
+
+```text
+macro_events
+```
+
+Suggested fields:
+
+- `provider`
+- `provider_event_id`
+- `release_time_utc`
+- `country`
+- `currency`
+- `category`
+- `event_name`
+- `importance`
+- `actual`
+- `forecast`
+- `previous`
+- `revised`
+- `unit`
+- `source_url`
+- `fetched_at`
 
 ### Replay / Backtest Tests
 
@@ -707,8 +873,9 @@ Replay comparisons:
 1. Current strategy baseline.
 2. Baseline plus time exit.
 3. Time exit plus range filter.
-4. Time exit plus range filter plus confirmation.
-5. Full adaptive exit model.
+4. Time exit plus range filter plus macro event filter.
+5. Time exit plus range filter plus confirmation.
+6. Full adaptive exit model.
 
 Required metrics:
 
@@ -721,6 +888,8 @@ Required metrics:
 - Average winner
 - Average loser
 - Time in trade
+- Skipped trades by macro event reason
+- PnL by macro event regime
 - Trades by instrument/side/session
 
 Expected result before live rollout:
@@ -781,7 +950,8 @@ The improvement work is complete only when the following are true:
 - ORB trades do not remain open overnight by default.
 - Historical replay shows improved expectancy over the current baseline.
 - Unit tests cover time exits, range filters, spread filters, confirmation, and
-  adaptive exits.
+  macro event filters.
+- Unit tests cover adaptive exits.
 - Integration tests cover order lifecycle and DB state transitions.
 - The stats/reporting layer can break down performance by setup label, not only
   by ticker.
@@ -808,6 +978,7 @@ This should make it easy to compare:
 - Current baseline ORB rules.
 - Time-exit rules.
 - Range-quality filters.
+- Macro event filters.
 - Breakout confirmation modes.
 - Instrument-specific exits.
 - Risk multipliers.
@@ -828,11 +999,26 @@ te backtest orb \
 Additional examples:
 
 ```bash
+te macro import \
+  --provider tradingeconomics \
+  --from 2024-01-01 \
+  --to 2026-06-30
+```
+
+```bash
 te backtest orb \
   --from 2026-04-01 \
   --to 2026-06-30 \
   --session london \
   --variant time-exit
+```
+
+```bash
+te backtest orb \
+  --from 2026-04-01 \
+  --to 2026-06-30 \
+  --session london \
+  --variant macro-filter
 ```
 
 ```bash
@@ -862,6 +1048,8 @@ Required inputs:
 Optional inputs:
 
 - Candle timeframe for replay, default `1m`.
+- Historical macro calendar provider or local macro-event store.
+- Macro blackout window and event importance thresholds.
 - Slippage model.
 - Spread model.
 - Commission model.
@@ -878,10 +1066,52 @@ Suggested MVP variants:
 | `baseline` | Current fixed range, dual-sided bracket, fixed 2R, no time exit |
 | `time-exit` | Baseline plus max-hold flattening |
 | `range-filter` | Time exit plus ATR-normalized range filter |
-| `confirmed` | Range filter plus candle-close breakout confirmation |
+| `macro-filter` | Range filter plus scheduled macro-event blackout/risk reduction |
+| `confirmed` | Macro filter plus candle-close breakout confirmation |
 | `adaptive` | Confirmed entries plus instrument-specific risk and exits |
 
 Each run should persist the exact resolved rule config used for the test.
+
+### Historical Macro Data Requirements
+
+Backtesting macro-aware forex ORB requires historical scheduled-event data, not
+only live news headlines.
+
+Recommended data model:
+
+```text
+provider
+provider_event_id
+release_time_utc
+country
+currency
+category
+event_name
+importance
+actual
+forecast
+previous
+revised
+unit
+source_url
+fetched_at
+```
+
+Provider requirements:
+
+- Supports historical date-range queries.
+- Provides scheduled release timestamp.
+- Provides country or currency.
+- Provides an importance/impact field or enough metadata to map one.
+- Provides stable provider IDs or enough fields for deterministic upsert keys.
+
+Implementation notes:
+
+- Store provider payloads in normalized form before using them in replay.
+- Keep provider-specific mapping logic at the import boundary.
+- For replay, join events to instruments by normalized currency and event tags.
+- Do not use post-release surprise values before the simulated release time.
+- Prefer scheduled macro calendars over unstructured headline feeds for the MVP.
 
 ### Suggested Config Shape
 
@@ -889,6 +1119,14 @@ Each run should persist the exact resolved rule config used for the test.
 orb_backtest:
   initial_capital: 100000
   timeframe: 1m
+  macro_events:
+    enabled: true
+    source: local_store
+    blackout_before_minutes: 30
+    blackout_after_minutes: 90
+    min_skip_importance: high
+    medium_event_risk_multiplier: 0.50
+    high_event_risk_multiplier: 0.00
   slippage:
     mode: fixed_spread
     default_spread_points: 0.0001
@@ -909,6 +1147,7 @@ orb_backtest:
       dual_sided: false
       instruments:
         EUR/USD:
+          currencies: [EUR, USD]
           risk_multiplier: 1.0
           max_hold_minutes: 240
           min_range_atr: 0.25
@@ -917,6 +1156,7 @@ orb_backtest:
           take_profit_r: 1.8
           break_even_r: 0.8
         GBP/USD:
+          currencies: [GBP, USD]
           risk_multiplier: 0.75
           max_hold_minutes: 180
           min_range_atr: 0.30
@@ -925,6 +1165,8 @@ orb_backtest:
           take_profit_r: 1.5
           break_even_r: 0.75
         XAU/USD:
+          currencies: [XAU, USD]
+          macro_event_tags: [USD, FED, INFLATION, EMPLOYMENT, GDP, RISK]
           risk_multiplier: 0.35
           max_hold_minutes: 90
           min_range_atr: 0.40
@@ -941,17 +1183,21 @@ For each instrument and session day:
 1. Load 1-minute candles for the session and lookback window.
 2. Build the opening range from the first `range_minutes` candles.
 3. Compute range-quality metrics, including ATR-normalized range width.
-4. Decide eligible directions.
-5. Watch subsequent candles for breakout confirmation.
-6. Simulate entry at the configured trigger or next candle open, depending on
+4. Load macro events that intersect the instrument's configured event window.
+5. Apply macro blackout or event-risk sizing rules.
+6. Decide eligible directions.
+7. Watch subsequent candles for breakout confirmation.
+8. Simulate entry at the configured trigger or next candle open, depending on
    confirmation mode.
-7. Simulate stop, target, break-even, partial, trailing, and time-exit rules.
-8. Close any open trade at end-of-session if max hold or no-overnight is active.
-9. Record the simulated trade and setup metadata.
+9. Simulate stop, target, break-even, partial, trailing, and time-exit rules.
+10. Close any open trade at end-of-session if max hold or no-overnight is active.
+11. Record the simulated trade and setup metadata.
 
 Avoid look-ahead bias:
 
 - Do not use candles after the decision point to compute entry eligibility.
+- Do not use macro `actual`, `forecast`, `previous`, or surprise data before the
+  simulated release timestamp.
 - Confirmation can only use closed candles.
 - Entry after candle-close confirmation should occur at the next candle open or
   a configured limit/stop rule.
