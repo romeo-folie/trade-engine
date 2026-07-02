@@ -79,7 +79,9 @@ func GetEntityByTicker(ctx context.Context, ticker string) (*Entity, error) {
 func GetTickersMissingEntity(ctx context.Context, days int) ([]string, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT DISTINCT t.ticker FROM (
-			SELECT ticker FROM watchlist WHERE active AND platform = 'stock'
+			SELECT ticker FROM watchlist
+			WHERE active AND platform = 'stock'
+			  AND (expires_at IS NULL OR expires_at > NOW())
 			UNION
 			SELECT ticker FROM analyses WHERE created_at > NOW() - make_interval(days => $1)
 		) t
