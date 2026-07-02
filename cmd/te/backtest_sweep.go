@@ -333,8 +333,19 @@ func runValidateSweep(ctx context.Context) error {
 	fwdResults := runner.RunAll(ctx, sets, fwdFrom, fwdTo, prog("forward "))
 	fmt.Println()
 
-	rows, _ := sweepResultRows(valRunID, "validate", valResults)
-	fwdRows, _ := sweepResultRows(valRunID, "forward", fwdResults)
+	rows, valFailed := sweepResultRows(valRunID, "validate", valResults)
+	fwdRows, fwdFailed := sweepResultRows(valRunID, "forward", fwdResults)
+	// If EVERY config errored on a window, that's a data/provider failure — not "the edge died
+	// out-of-sample". Fail loud rather than print a misleading 0-HOLDS report.
+	if len(valResults) > 0 && valFailed == len(valResults) {
+		return fmt.Errorf("validate failed: all %d configs errored on the validation window %s→%s (check data coverage)", valFailed, btSweepValFrom, btSweepValTo)
+	}
+	if len(fwdResults) > 0 && fwdFailed == len(fwdResults) {
+		return fmt.Errorf("validate failed: all %d configs errored on the forward window %s→%s (check data coverage)", fwdFailed, btSweepFwdFrom, fwdToStr)
+	}
+	if valFailed > 0 || fwdFailed > 0 {
+		fmt.Printf("WARNING: %d validate + %d forward config runs errored and were skipped (data gaps?)\n", valFailed, fwdFailed)
+	}
 	rows = append(rows, fwdRows...)
 	if err := store.InsertSweepResults(ctx, db, rows); err != nil {
 		return fmt.Errorf("persist validate results: %w", err)
@@ -365,55 +376,59 @@ func parseWindow(fromStr, toStr string) (time.Time, time.Time, error) {
 // expectancy and trade counts, and flags configs whose edge HOLDS out-of-sample (positive
 // expectancy in all three periods) — the only ones worth trusting.
 func printWalkForward(ctx context.Context, parentID, valRunID string) error {
+	// LEFT JOIN both OOS splits: a train-passer that produced ZERO trades in the validate or
+	// forward window has no row for that split — the single clearest overfit signal — and must
+	// show as a miss, not silently vanish. NULLS LAST keeps traded configs at the top.
 	rows, err := store.GetDB().Query(ctx, `
 		SELECT t.parameter_set_hash, t.instrument_scope,
 		       round((t.metrics->>'expectancy_r')::numeric,3), t.trades,
 		       round((v.metrics->>'expectancy_r')::numeric,3), v.trades,
 		       round((f.metrics->>'expectancy_r')::numeric,3), f.trades
 		FROM sweep_results t
-		JOIN sweep_results v ON v.sweep_id=$2 AND v.period_split='validate'
+		LEFT JOIN sweep_results v ON v.sweep_id=$2 AND v.period_split='validate'
 		     AND v.parameter_set_hash=t.parameter_set_hash AND v.instrument_scope=t.instrument_scope
 		LEFT JOIN sweep_results f ON f.sweep_id=$2 AND f.period_split='forward'
 		     AND f.parameter_set_hash=t.parameter_set_hash AND f.instrument_scope=t.instrument_scope
 		WHERE t.sweep_id=$1 AND t.period_split='full' AND t.instrument_scope<>'ALL'
 		  AND t.trades>=100 AND (t.metrics->>'profit_factor')::numeric>1.15 AND (t.metrics->>'expectancy_r')::numeric>0.05
-		ORDER BY t.instrument_scope, (v.metrics->>'expectancy_r')::numeric DESC`,
+		ORDER BY t.instrument_scope, (v.metrics->>'expectancy_r')::numeric DESC NULLS LAST`,
 		parentID, valRunID)
 	if err != nil {
 		return fmt.Errorf("walk-forward query: %w", err)
 	}
 	defer rows.Close()
 
-	fmt.Printf("\nWALK-FORWARD (train-passers, expectancy_r per period; HOLDS = positive in all three):\n\n")
-	fmt.Printf("%-16s %-8s %8s %8s %8s   %s\n", "HASH", "INST", "TRAIN", "VALID", "FWD", "HOLDS")
-	var held int
+	fmt.Printf("\nWALK-FORWARD (train-passers, expectancy_r per period; HOLDS = positive in all three, no-trade window = miss):\n\n")
+	fmt.Printf("%-16s %-8s %8s %10s %10s   %s\n", "HASH", "INST", "TRAIN", "VALID", "FWD", "HOLDS")
+	var held, total int
+	col := func(e *float64, tr *int) string {
+		if e == nil {
+			return "  no-trade"
+		}
+		return fmt.Sprintf("%.3f(%d)", *e, *tr)
+	}
 	for rows.Next() {
+		total++
 		var hash, inst string
-		var trainE, valE float64
-		var trainTr, valTr int
-		var fwdE *float64
-		var fwdTr *int
+		var trainE float64
+		var trainTr int
+		var valE, fwdE *float64
+		var valTr, fwdTr *int
 		if err := rows.Scan(&hash, &inst, &trainE, &trainTr, &valE, &valTr, &fwdE, &fwdTr); err != nil {
 			return err
 		}
-		fwdStr := "  n/a"
-		holds := trainE > 0 && valE > 0
-		if fwdE != nil {
-			fwdStr = fmt.Sprintf("%8.3f", *fwdE)
-			holds = holds && *fwdE > 0
-		} else {
-			holds = false // no forward data → cannot confirm
-		}
+		// HOLDS: positive expectancy in ALL THREE periods. A no-trade OOS window is not a hold.
+		holds := trainE > 0 && valE != nil && *valE > 0 && fwdE != nil && *fwdE > 0
 		mark := ""
 		if holds {
 			mark = "✓ HOLDS"
 			held++
 		}
-		fmt.Printf("%-16s %-8s %8.3f %8.3f %s   %s\n", hash, inst, trainE, valE, fwdStr, mark)
+		fmt.Printf("%-16s %-8s %8.3f %10s %10s   %s\n", hash, inst, trainE, col(valE, valTr), col(fwdE, fwdTr), mark)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	fmt.Printf("\n%d (config × instrument) survived walk-forward with positive expectancy in train, validate AND forward.\n", held)
+	fmt.Printf("\n%d of %d train-passing (config × instrument) HELD — positive expectancy in train, validate AND forward.\n", held, total)
 	return nil
 }
