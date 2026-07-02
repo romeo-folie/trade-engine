@@ -10,6 +10,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -102,7 +103,10 @@ type Engine struct {
 	lastDailySummaryUpdate time.Time
 
 	// lastExitReconcile throttles the exit-fill reconciler sweep the same way.
-	lastExitReconcile time.Time
+	// exitReconcileInFlight guards against overlapping background sweeps when
+	// a sweep outlives the throttle interval (slow broker API + backlog).
+	lastExitReconcile     time.Time
+	exitReconcileInFlight atomic.Bool
 
 	feedbackReviewer *feedback.Reviewer
 
@@ -2066,10 +2070,14 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
 // maxMonitorCandleAge bounds how old a candle may be and still drive SL/TP
-// decisions in monitorPositions. 4 days tolerates a weekend + market holiday
-// on daily candles while rejecting genuinely dead data (LAC's freshest 1h
-// candle was 31 days old when it triggered a phantom take-profit).
-const maxMonitorCandleAge = 4 * 24 * time.Hour
+// decisions in monitorPositions. Daily bars are stamped at the session date
+// (04:00 UTC), so for a daily-only ticker the freshest bar is already ~5.5
+// days old at the Tuesday open after a Monday holiday (Thu bar → Tue 13:30
+// UTC). 7 days tolerates every ordinary holiday-weekend shape without
+// suspending stop monitoring, while still rejecting genuinely dead data
+// (LAC's freshest 1h candle was 31 days old when it triggered a phantom
+// take-profit).
+const maxMonitorCandleAge = 7 * 24 * time.Hour
 
 // pollExitFill polls the broker for a short window waiting for an exit order
 // to fill, returning the confirmed OrderResult. Market exits typically fill
@@ -2109,12 +2117,20 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	e.refreshPortfolio(ctx)
 
 	// Sweep exit orders whose broker fills were never confirmed and align the
-	// closed trades' recorded exits with broker truth. Runs first so a fill
-	// that confirmed since the last tick is corrected before new closes pile
-	// onto the backlog.
-	if time.Since(e.lastExitReconcile) >= exitReconcileInterval {
-		ReconcileExitOrderFillsWithStore(ctx, e.executor, DefaultExitReconcileBatch)
+	// closed trades' recorded exits with broker truth. Runs in the background:
+	// a backlog is up to DefaultExitReconcileBatch GetOrderStatus calls, and a
+	// slow broker API must never sit between the tick and the safety-critical
+	// SL/TP checks below. The CAS guard prevents overlapping sweeps; the
+	// detached context keeps a sweep from being cancelled when the tick
+	// returns, bounded by its own timeout.
+	if time.Since(e.lastExitReconcile) >= exitReconcileInterval && e.exitReconcileInFlight.CompareAndSwap(false, true) {
 		e.lastExitReconcile = time.Now()
+		go func() {
+			defer e.exitReconcileInFlight.Store(false)
+			sweepCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			ReconcileExitOrderFillsWithStore(sweepCtx, e.executor, DefaultExitReconcileBatch)
+		}()
 	}
 
 	trades, err := store.GetOpenTrades(ctx)
