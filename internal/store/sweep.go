@@ -33,6 +33,46 @@ type SweepResult struct {
 	RankScore          float64
 }
 
+// GetSweepRun returns a run's header by id (for verifying a --from-run parent exists).
+func GetSweepRun(ctx context.Context, db *pgxpool.Pool, id string) (SweepRun, error) {
+	var r SweepRun
+	err := db.QueryRow(ctx, `
+		SELECT id, parent_id, mode, period_from, period_to, param_count, coalesce(notes,''), created_at
+		FROM sweep_runs WHERE id = $1`, id,
+	).Scan(&r.ID, &r.ParentID, &r.Mode, &r.PeriodFrom, &r.PeriodTo, &r.ParamCount, &r.Notes, &r.CreatedAt)
+	return r, err
+}
+
+// SurvivingParamSets returns the DISTINCT resolved_parameters JSON from a run whose metrics clear
+// the acceptance gates (profit_factor > minPF, expectancy_r > minExp, trades >= minTrades) on at
+// least one non-ALL instrument scope. These are the configs worth walk-forward validating. One
+// row per unique parameter_set_hash (the first resolved_parameters seen for it).
+func SurvivingParamSets(ctx context.Context, db *pgxpool.Pool, sweepID string, minPF, minExp float64, minTrades int) ([]json.RawMessage, error) {
+	rows, err := db.Query(ctx, `
+		SELECT DISTINCT ON (parameter_set_hash) resolved_parameters
+		FROM sweep_results
+		WHERE sweep_id = $1
+		  AND instrument_scope <> 'ALL'
+		  AND trades >= $2
+		  AND (metrics->>'profit_factor')::numeric > $3
+		  AND (metrics->>'expectancy_r')::numeric > $4
+		ORDER BY parameter_set_hash`,
+		sweepID, minTrades, minPF, minExp)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []json.RawMessage
+	for rows.Next() {
+		var p json.RawMessage
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // CreateSweepRun inserts a run header and returns its generated id. parentID is nil for a
 // top-level coarse/full run and set for a refine/validate run derived from a parent.
 func CreateSweepRun(ctx context.Context, db *pgxpool.Pool, mode string, from, to time.Time, parentID *string, notes string) (string, error) {
