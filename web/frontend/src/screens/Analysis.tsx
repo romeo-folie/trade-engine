@@ -30,6 +30,10 @@ export interface AnalystResult {
 export interface AnalysisRecord {
   ID: string;
   Ticker: string;
+  // Full name of the underlying organization, joined from the knowledge-graph
+  // entities table server-side. Absent when no entity exists for the ticker
+  // (e.g. ETFs, tickers the news enricher hasn't covered).
+  CompanyName?: string;
   Strategy: string;
   Action: string;
   Confidence: number;
@@ -95,7 +99,10 @@ export default function AnalysisScreen() {
     let rows = analyses;
     if (tickerSearch) {
       const q = tickerSearch.toLowerCase();
-      rows = rows.filter(a => a.Ticker.toLowerCase().includes(q));
+      rows = rows.filter(a =>
+        a.Ticker.toLowerCase().includes(q) ||
+        (a.CompanyName ?? '').toLowerCase().includes(q)
+      );
     }
     if (modelSearch) {
       const mq = modelSearch.toLowerCase();

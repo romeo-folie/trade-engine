@@ -146,6 +146,9 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           <div className={styles.headerLeft}>
             <div className={styles.headerTopRow}>
               <span className={styles.title}>{analysis.Ticker}</span>
+              {analysis.CompanyName && (
+                <span className={styles.companyName}>{analysis.CompanyName}</span>
+              )}
               <ChamferedBox
                 chamfer={6}
                 centerContent
