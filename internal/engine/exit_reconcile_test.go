@@ -27,11 +27,12 @@ func (f *fakeExitExecutor) GetOrderStatus(_ context.Context, brokerOrderID strin
 
 // fakeExitStore records reconciler mutations in memory.
 type fakeExitStore struct {
-	pending     []store.PendingExitOrder
-	pendingErr  error
-	orderFills  map[string][2]float64 // broker_order_id → {price, qty}
-	tradeExits  map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
-	orderStatus map[string]string     // broker_order_id → status
+	pending      []store.PendingExitOrder
+	pendingErr   error
+	tradeExitErr error                 // injected UpdateTradeExit failure
+	orderFills   map[string][2]float64 // broker_order_id → {price, qty}
+	tradeExits   map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
+	orderStatus  map[string]string     // broker_order_id → status
 }
 
 func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
@@ -51,6 +52,9 @@ func (f *fakeExitStore) UpdateOrderFillPrice(_ context.Context, id string, price
 	return nil
 }
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
+	if f.tradeExitErr != nil {
+		return f.tradeExitErr
+	}
 	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
 	return nil
 }
@@ -203,6 +207,26 @@ func TestExitReconcileFilledWithoutPriceCountsError(t *testing.T) {
 	}
 	if len(db.tradeExits) != 0 {
 		t.Fatal("trade must not be rewritten without a real fill price")
+	}
+}
+
+func TestExitReconcileTradeUpdateFailureKeepsOrderSweepable(t *testing.T) {
+	// If the trade correction fails, the order row must NOT be flipped to
+	// 'filled' — the sweep only selects unfilled orders, so writing the order
+	// first would make the bad exit price permanent (Codex review on #383).
+	db := newFakeExitStore(lacExit())
+	db.tradeExitErr = errors.New("transient db error")
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: 480.122977},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.Errors != 1 || stats.Corrected != 0 {
+		t.Fatalf("stats = %+v, want Errors=1 Corrected=0", stats)
+	}
+	if len(db.orderFills) != 0 {
+		t.Fatal("order flipped to filled despite failed trade update — row no longer retryable")
 	}
 }
 

@@ -99,6 +99,69 @@ func TestGetPendingExitOrders_ShapeAndExclusions(t *testing.T) {
 	}
 }
 
+func TestGetPendingExitOrders_IncludesPartialRows(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_PART", Direction: "long", Strategy: "trend_following",
+		EntryPrice: 5, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if err := store.CloseTrade(ctx, tradeID, 6.0, 10, 20); err != nil {
+		t.Fatalf("CloseTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-part", Ticker: "TEST_XRC_PART",
+		Side: "sell", OrderType: "market", Quantity: 10, Status: "partial",
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	rows, err := store.GetPendingExitOrders(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingExitOrders: %v", err)
+	}
+	for _, r := range rows {
+		if r.BrokerOrderID == "brk-xrc-part" {
+			return
+		}
+	}
+	t.Fatal("partial exit order on closed trade not swept — a partially_filled PlaceOrder result would stay priceless forever")
+}
+
+func TestInsertOrder_PersistsFillColumns(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_FILL", Direction: "long", Strategy: "trend_following",
+		EntryPrice: 5, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-fill", Ticker: "TEST_XRC_FILL",
+		Side: "sell", OrderType: "market", Quantity: 10, Status: "filled",
+		FilledPrice: 5.25, FilledQty: 10,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	for _, o := range orders {
+		if o.BrokerOrderID == "brk-xrc-fill" {
+			if o.FilledPrice != 5.25 || o.FilledQty != 10 {
+				t.Fatalf("fill columns = %.4f/%.4f, want 5.25/10 — an already-filled insert must carry its fill", o.FilledPrice, o.FilledQty)
+			}
+			return
+		}
+	}
+	t.Fatal("inserted order not found")
+}
+
 func TestUpdateTradeExit_RewritesPnLPreservesClosedAt(t *testing.T) {
 	ctx := context.Background()
 	tradeID := mustInsertClosedTradeWithPendingExit(t, ctx, "TEST_XRC_UPD", "long", "sell", "brk-xrc-upd")

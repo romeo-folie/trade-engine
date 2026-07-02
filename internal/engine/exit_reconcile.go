@@ -136,29 +136,38 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 					"ticker", p.Ticker, "broker_order_id", p.BrokerOrderID)
 				continue
 			}
+			// Correct the trade BEFORE flipping the order row to 'filled':
+			// the sweep only selects unfilled orders, so writing the order
+			// first would make a failed trade update unretryable — the bad
+			// exit price would stick forever. Trade-first is safe because
+			// UpdateTradeExit is idempotent: if the order write then fails,
+			// the next sweep redoes both.
+			corrected := math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
+			if corrected {
+				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, p.Quantity, res.FilledPrice)
+				if err := db.UpdateTradeExit(ctx, p.TradeID, res.FilledPrice, pnl, pnlPct); err != nil {
+					stats.Errors++
+					logger.Warn("exit reconcile: update trade exit", "trade_id", p.TradeID, "err", err)
+					continue
+				}
+				logger.Info("exit reconcile: corrected trade exit to broker fill",
+					"ticker", p.Ticker,
+					"trade_id", p.TradeID,
+					"recorded_exit", p.ExitPrice,
+					"broker_fill", res.FilledPrice,
+					"pnl", pnl,
+				)
+			}
 			if err := db.UpdateOrderFillPrice(ctx, p.BrokerOrderID, res.FilledPrice, res.FilledQty); err != nil {
 				stats.Errors++
 				logger.Warn("exit reconcile: update order fill", "broker_order_id", p.BrokerOrderID, "err", err)
 				continue
 			}
-			if math.Abs(res.FilledPrice-p.ExitPrice) <= exitPriceEpsilon {
+			if corrected {
+				stats.Corrected++
+			} else {
 				stats.Confirmed++
-				continue
 			}
-			pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, p.Quantity, res.FilledPrice)
-			if err := db.UpdateTradeExit(ctx, p.TradeID, res.FilledPrice, pnl, pnlPct); err != nil {
-				stats.Errors++
-				logger.Warn("exit reconcile: update trade exit", "trade_id", p.TradeID, "err", err)
-				continue
-			}
-			stats.Corrected++
-			logger.Info("exit reconcile: corrected trade exit to broker fill",
-				"ticker", p.Ticker,
-				"trade_id", p.TradeID,
-				"recorded_exit", p.ExitPrice,
-				"broker_fill", res.FilledPrice,
-				"pnl", pnl,
-			)
 		case "cancelled", "rejected":
 			if err := db.MarkOrderStatus(ctx, p.BrokerOrderID, execution.NormalizeOrderStatus(res.Status)); err != nil {
 				stats.Errors++

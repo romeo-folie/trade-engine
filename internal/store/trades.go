@@ -185,19 +185,21 @@ type PendingExitOrder struct {
 	ExitPrice     float64 // exit price currently recorded on the trade row
 }
 
-// GetPendingExitOrders returns orders still marked 'pending' whose trade is
-// already closed and whose side opposes the trade direction — i.e. the exit
-// order for that trade. This shape covers every close path (stop/TP monitor,
-// trailing-stop market exits) regardless of the is_stop_loss/is_take_profit
-// flags. Entry orders (side matching direction) and working broker stops on
-// open trades are excluded by construction.
+// GetPendingExitOrders returns orders still marked 'pending' or 'partial'
+// whose trade is already closed and whose side opposes the trade direction —
+// i.e. the exit order for that trade. This shape covers every close path
+// (stop/TP monitor, trailing-stop market exits) regardless of the
+// is_stop_loss/is_take_profit flags. Entry orders (side matching direction)
+// and working broker stops on open trades are excluded by construction.
+// 'partial' is included because PlaceOrder can return partially_filled and
+// the row must stay sweepable until the broker reports the fill complete.
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT o.id, o.broker_order_id, o.ticker,
 		       t.id, t.direction, t.entry_price, t.quantity, COALESCE(t.exit_price,0)
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
-		WHERE o.status = 'pending'
+		WHERE o.status IN ('pending','partial')
 		  AND COALESCE(o.broker_order_id,'') <> ''
 		  AND t.status = 'closed'
 		  AND ((t.direction = 'long'  AND o.side = 'sell')
