@@ -298,7 +298,12 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 		       a.created_at,
 		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, '')
 		FROM analyses a
-		LEFT JOIN entities e ON UPPER(e.ticker) = UPPER(a.ticker)
+		LEFT JOIN LATERAL (
+			SELECT name FROM entities
+			WHERE UPPER(ticker) = UPPER(a.ticker)
+			ORDER BY (entity_type = 'company') DESC, name
+			LIMIT 1
+		) e ON TRUE
 		ORDER BY a.created_at DESC
 		LIMIT $1`
 	rows, err := GetDB().Query(ctx, q, limit)
@@ -339,7 +344,12 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		       a.ensemble_results, a.arbiter_response,
 		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, '')
 		FROM analyses a
-		LEFT JOIN entities e ON UPPER(e.ticker) = UPPER(a.ticker)
+		LEFT JOIN LATERAL (
+			SELECT name FROM entities
+			WHERE UPPER(ticker) = UPPER(a.ticker)
+			ORDER BY (entity_type = 'company') DESC, name
+			LIMIT 1
+		) e ON TRUE
 		WHERE a.id = $1`
 	var a AnalysisSummary
 	err := GetDB().QueryRow(ctx, q, id).Scan(

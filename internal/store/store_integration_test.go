@@ -117,6 +117,58 @@ func TestAnalysis_EnsembleInsertAndQuery(t *testing.T) {
 	}
 }
 
+// TestAnalysis_SummaryEntityJoinOneToOne guards the CompanyName join in
+// GetRecentAnalysesSummary / GetAnalysisDetail against fan-out. The entities
+// schema only has a case-SENSITIVE UNIQUE(ticker), so two rows whose tickers
+// differ only by case can coexist; a naive case-insensitive join would then
+// duplicate the analysis row in the list (and push others out of the LIMIT).
+func TestAnalysis_SummaryEntityJoinOneToOne(t *testing.T) {
+	ctx := context.Background()
+
+	for _, e := range []store.Entity{
+		{EntityType: "company", Name: "Case Join Test Co", Ticker: "TEST_CJ_DUP"},
+		{EntityType: "commodity", Name: "case join test metal", Ticker: "test_cj_dup"},
+	} {
+		if _, err := store.UpsertEntity(ctx, e); err != nil {
+			t.Fatalf("UpsertEntity %q: %v", e.Ticker, err)
+		}
+	}
+
+	id, err := store.InsertAnalysis(ctx, "TEST_CJ_DUP", "momentum",
+		testAnalysisResp(analysis.ActionBuy), testModelMeta())
+	if err != nil {
+		t.Fatalf("InsertAnalysis: %v", err)
+	}
+
+	sums, err := store.GetRecentAnalysesSummary(ctx, 200)
+	if err != nil {
+		t.Fatalf("GetRecentAnalysesSummary: %v", err)
+	}
+	var matches []store.AnalysisSummary
+	for _, s := range sums {
+		if s.ID == id {
+			matches = append(matches, s)
+		}
+	}
+	if len(matches) != 1 {
+		t.Fatalf("analysis %s appeared %d times in summary, want exactly 1 (entity join fan-out)", id, len(matches))
+	}
+	if matches[0].CompanyName != "Case Join Test Co" {
+		t.Errorf("CompanyName: got %q, want company entity preferred", matches[0].CompanyName)
+	}
+
+	det, err := store.GetAnalysisDetail(ctx, id)
+	if err != nil {
+		t.Fatalf("GetAnalysisDetail: %v", err)
+	}
+	if det == nil {
+		t.Fatal("GetAnalysisDetail: nil")
+	}
+	if det.CompanyName != "Case Join Test Co" {
+		t.Errorf("detail CompanyName: got %q, want company entity preferred", det.CompanyName)
+	}
+}
+
 func TestAnalysis_GetModelPerformance(t *testing.T) {
 	ctx := context.Background()
 	// Just verifies the query executes without error (may return empty rows).
