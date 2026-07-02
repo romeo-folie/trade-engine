@@ -1,6 +1,7 @@
 package sweep
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -138,6 +139,23 @@ func TestPassesAcceptanceGates(t *testing.T) {
 	} {
 		if PassesAcceptanceGates(bad, MinTradesFloor) {
 			t.Errorf("metrics should fail gates: %+v", bad)
+		}
+	}
+}
+
+// validate mode reads survivors back from sweep_results.resolved_parameters, so ParamSet.JSON()
+// must round-trip through json.Unmarshal into an identical ParamSet.
+func TestParamSet_JSONRoundTrip(t *testing.T) {
+	for _, p := range DefaultCoarseGrid().GenerateCoarse()[:50] {
+		var got ParamSet
+		if err := json.Unmarshal(p.JSON(), &got); err != nil {
+			t.Fatalf("unmarshal %s: %v", p.Label(), err)
+		}
+		if got != p {
+			t.Errorf("round-trip mismatch:\n in=%+v\nout=%+v", p, got)
+		}
+		if got.Hash() != p.Hash() {
+			t.Errorf("hash changed across round-trip for %s", p.Label())
 		}
 	}
 }
