@@ -391,7 +391,7 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 		"EUR/GBP": "12087811",
 		// Metals (CFD)
 		"XAU/USD": "69067924",
-		"XAG/USD": "69067925",
+		"XAG/USD": "77124483",
 	}
 	for pair, wantConid := range cases {
 		got, err := b.resolveConid(t.Context(), pair, "")

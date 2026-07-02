@@ -14,7 +14,9 @@ var Conids = map[string]string{
 	"USD/CAD": "12087817",
 	"NZD/USD": "15016065",
 	"EUR/GBP": "12087811",
-	// Metals (CFD)
-	"XAU/USD": "69067924",
-	"XAG/USD": "69067925",
+	// Spot metals (IBKR CMDTY "loco London" — asset class "Commodities" on statements, NOT CFD).
+	// Verified against the live gateway: /iserver/contract/{conid}/info resolves these to
+	// XAUUSD "London Gold" and XAGUSD "London Silver", and /marketdata/history returns bars.
+	"XAU/USD": "69067924", // London Gold
+	"XAG/USD": "77124483", // London Silver — was 69067925, a dead conid ("Contract details are not available")
 }
