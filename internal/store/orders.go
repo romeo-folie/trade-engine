@@ -25,20 +25,25 @@ type Order struct {
 	UpdatedAt     time.Time
 }
 
-// InsertOrder creates a new order record and returns its UUID.
+// InsertOrder creates a new order record and returns its UUID. Fill columns
+// are persisted when set — an order inserted as already-filled (sync fills,
+// or the exit path's inline fill poll) must carry its fill, otherwise a
+// status='filled' row with empty fill columns is invisible to the exit-fill
+// reconciler and stays priceless forever.
 func InsertOrder(ctx context.Context, o Order) (string, error) {
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO orders (
 			trade_id, broker_order_id, ticker, side, order_type,
 			quantity, limit_price, stop_price, status,
-			is_stop_loss, is_take_profit
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			is_stop_loss, is_take_profit, filled_price, filled_qty
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id`,
 		nullableString(o.TradeID), nullableString(o.BrokerOrderID),
 		o.Ticker, o.Side, o.OrderType,
 		o.Quantity, nullableFloat(o.LimitPrice), nullableFloat(o.StopPrice),
 		o.Status, o.IsStopLoss, o.IsTakeProfit,
+		nullableFloat(o.FilledPrice), nullableFloat(o.FilledQty),
 	).Scan(&id)
 	return id, err
 }

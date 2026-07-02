@@ -1,0 +1,213 @@
+package store_test
+
+import (
+	"context"
+	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/store"
+)
+
+// mustInsertClosedTradeWithPendingExit sets up the exact shape the exit-fill
+// reconciler sweeps for: a closed trade whose exit order is still 'pending'
+// with empty fill columns (Alpaca market exits fill async, so the close path
+// records the row before the fill confirms).
+func mustInsertClosedTradeWithPendingExit(t *testing.T, ctx context.Context, ticker, direction, exitSide, brokerOrderID string) string {
+	t.Helper()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker:     ticker,
+		Direction:  direction,
+		Strategy:   "trend_following",
+		EntryPrice: 3.86,
+		Quantity:   480.122977,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	// Close at the (possibly wrong) trigger price, like monitorPositions does.
+	if err := store.CloseTrade(ctx, tradeID, 5.50, 787.40, 42.49); err != nil {
+		t.Fatalf("CloseTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID:       tradeID,
+		BrokerOrderID: brokerOrderID,
+		Ticker:        ticker,
+		Side:          exitSide,
+		OrderType:     "market",
+		Quantity:      480.122977,
+		Status:        "pending",
+		IsTakeProfit:  true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	return tradeID
+}
+
+func TestGetPendingExitOrders_ShapeAndExclusions(t *testing.T) {
+	ctx := context.Background()
+
+	// Row the sweep must find: closed long + pending sell order.
+	wantTradeID := mustInsertClosedTradeWithPendingExit(t, ctx, "TEST_XRC_LAC", "long", "sell", "brk-xrc-1")
+
+	// Exclusion 1: entry order (side matches direction) on a closed trade.
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID:       wantTradeID,
+		BrokerOrderID: "brk-xrc-entry",
+		Ticker:        "TEST_XRC_LAC",
+		Side:          "buy",
+		OrderType:     "market",
+		Quantity:      480.122977,
+		Status:        "pending",
+	}); err != nil {
+		t.Fatalf("InsertOrder entry: %v", err)
+	}
+
+	// Exclusion 2: pending exit-shaped order on a still-OPEN trade (a working
+	// broker stop). Must not be swept — there is nothing to reconcile yet.
+	openTradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_OPEN", Direction: "long", Strategy: "trend_following",
+		EntryPrice: 10, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade open: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: openTradeID, BrokerOrderID: "brk-xrc-stop", Ticker: "TEST_XRC_OPEN",
+		Side: "sell", OrderType: "stop", Quantity: 5, Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder stop: %v", err)
+	}
+
+	rows, err := store.GetPendingExitOrders(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingExitOrders: %v", err)
+	}
+	var found *store.PendingExitOrder
+	for i := range rows {
+		switch rows[i].BrokerOrderID {
+		case "brk-xrc-1":
+			found = &rows[i]
+		case "brk-xrc-entry", "brk-xrc-stop":
+			t.Fatalf("sweep returned excluded order %s", rows[i].BrokerOrderID)
+		}
+	}
+	if found == nil {
+		t.Fatal("pending exit order on closed trade not returned")
+	}
+	if found.TradeID != wantTradeID || found.Direction != "long" ||
+		found.EntryPrice != 3.86 || found.ExitPrice != 5.50 {
+		t.Fatalf("row = %+v, want trade fields joined", *found)
+	}
+}
+
+func TestGetPendingExitOrders_IncludesPartialRows(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_PART", Direction: "long", Strategy: "trend_following",
+		EntryPrice: 5, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if err := store.CloseTrade(ctx, tradeID, 6.0, 10, 20); err != nil {
+		t.Fatalf("CloseTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-part", Ticker: "TEST_XRC_PART",
+		Side: "sell", OrderType: "market", Quantity: 10, Status: "partial",
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	rows, err := store.GetPendingExitOrders(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingExitOrders: %v", err)
+	}
+	for _, r := range rows {
+		if r.BrokerOrderID == "brk-xrc-part" {
+			return
+		}
+	}
+	t.Fatal("partial exit order on closed trade not swept — a partially_filled PlaceOrder result would stay priceless forever")
+}
+
+func TestInsertOrder_PersistsFillColumns(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_FILL", Direction: "long", Strategy: "trend_following",
+		EntryPrice: 5, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-fill", Ticker: "TEST_XRC_FILL",
+		Side: "sell", OrderType: "market", Quantity: 10, Status: "filled",
+		FilledPrice: 5.25, FilledQty: 10,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	for _, o := range orders {
+		if o.BrokerOrderID == "brk-xrc-fill" {
+			if o.FilledPrice != 5.25 || o.FilledQty != 10 {
+				t.Fatalf("fill columns = %.4f/%.4f, want 5.25/10 — an already-filled insert must carry its fill", o.FilledPrice, o.FilledQty)
+			}
+			return
+		}
+	}
+	t.Fatal("inserted order not found")
+}
+
+func TestUpdateTradeExit_RewritesPnLPreservesClosedAt(t *testing.T) {
+	ctx := context.Background()
+	tradeID := mustInsertClosedTradeWithPendingExit(t, ctx, "TEST_XRC_UPD", "long", "sell", "brk-xrc-upd")
+
+	before, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || before == nil {
+		t.Fatalf("GetTradeByID before: %v", err)
+	}
+
+	if err := store.UpdateTradeExit(ctx, tradeID, 3.82, -19.20, -1.04); err != nil {
+		t.Fatalf("UpdateTradeExit: %v", err)
+	}
+
+	after, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || after == nil {
+		t.Fatalf("GetTradeByID after: %v", err)
+	}
+	if after.ExitPrice != 3.82 || after.PnL != -19.20 {
+		t.Fatalf("trade = exit %.4f pnl %.4f, want 3.82 / -19.20", after.ExitPrice, after.PnL)
+	}
+	if after.Status != "closed" {
+		t.Fatalf("status = %q, want closed", after.Status)
+	}
+	if !after.ClosedAt.Equal(before.ClosedAt) {
+		t.Fatalf("closed_at changed %v → %v — correction must preserve close time", before.ClosedAt, after.ClosedAt)
+	}
+}
+
+func TestMarkOrderStatus(t *testing.T) {
+	ctx := context.Background()
+	tradeID := mustInsertClosedTradeWithPendingExit(t, ctx, "TEST_XRC_CXL", "long", "sell", "brk-xrc-cxl")
+
+	if err := store.MarkOrderStatus(ctx, "brk-xrc-cxl", "cancelled"); err != nil {
+		t.Fatalf("MarkOrderStatus: %v", err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	var got string
+	for _, o := range orders {
+		if o.BrokerOrderID == "brk-xrc-cxl" {
+			got = o.Status
+		}
+	}
+	if got != "cancelled" {
+		t.Fatalf("order status = %q, want cancelled", got)
+	}
+}
