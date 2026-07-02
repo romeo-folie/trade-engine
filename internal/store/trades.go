@@ -146,6 +146,81 @@ func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) 
 	return err
 }
 
+// UpdateTradeExit corrects exit_price / pnl / pnl_pct on an already-closed
+// trade without touching closed_at. Used by the exit-fill reconciler when the
+// broker's confirmed fill differs from the trigger price recorded at close
+// time (the close path falls back to the candle price when the broker fill
+// is still pending).
+func UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades
+		SET exit_price=$1, pnl=$2, pnl_pct=$3
+		WHERE id=$4 AND status='closed'`,
+		exitPrice, pnl, pnlPct, id)
+	return err
+}
+
+// MarkOrderStatus sets a terminal status on an order row without touching the
+// fill columns. Used by the exit-fill reconciler when the broker reports an
+// order cancelled/rejected rather than filled.
+func MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE orders
+		SET status=$1, updated_at=NOW()
+		WHERE broker_order_id=$2`,
+		status, brokerOrderID)
+	return err
+}
+
+// PendingExitOrder is a pending exit order row joined with the trade fields
+// needed to recompute P&L once the broker confirms the fill.
+type PendingExitOrder struct {
+	OrderID       string
+	BrokerOrderID string
+	Ticker        string
+	TradeID       string
+	Direction     string // long | short
+	EntryPrice    float64
+	Quantity      float64
+	ExitPrice     float64 // exit price currently recorded on the trade row
+}
+
+// GetPendingExitOrders returns orders still marked 'pending' whose trade is
+// already closed and whose side opposes the trade direction — i.e. the exit
+// order for that trade. This shape covers every close path (stop/TP monitor,
+// trailing-stop market exits) regardless of the is_stop_loss/is_take_profit
+// flags. Entry orders (side matching direction) and working broker stops on
+// open trades are excluded by construction.
+func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT o.id, o.broker_order_id, o.ticker,
+		       t.id, t.direction, t.entry_price, t.quantity, COALESCE(t.exit_price,0)
+		FROM orders o
+		JOIN trades t ON t.id = o.trade_id
+		WHERE o.status = 'pending'
+		  AND COALESCE(o.broker_order_id,'') <> ''
+		  AND t.status = 'closed'
+		  AND ((t.direction = 'long'  AND o.side = 'sell')
+		    OR (t.direction = 'short' AND o.side = 'buy'))
+		ORDER BY o.created_at
+		LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PendingExitOrder
+	for rows.Next() {
+		var p PendingExitOrder
+		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker,
+			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity, &p.ExitPrice); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // CountOpenTrades returns the number of trade rows with status='open'.
 // Cheaper than GetOpenTrades when only the count is needed: avoids loading
 // every column of every open trade just to call len(...).

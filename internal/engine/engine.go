@@ -101,6 +101,9 @@ type Engine struct {
 	// the expensive DB query + upsert cycle.
 	lastDailySummaryUpdate time.Time
 
+	// lastExitReconcile throttles the exit-fill reconciler sweep the same way.
+	lastExitReconcile time.Time
+
 	feedbackReviewer *feedback.Reviewer
 
 	// multiTFCandleFetcher is the on-demand fetch path used by the borderline
@@ -2062,10 +2065,57 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
 
+// maxMonitorCandleAge bounds how old a candle may be and still drive SL/TP
+// decisions in monitorPositions. 4 days tolerates a weekend + market holiday
+// on daily candles while rejecting genuinely dead data (LAC's freshest 1h
+// candle was 31 days old when it triggered a phantom take-profit).
+const maxMonitorCandleAge = 4 * 24 * time.Hour
+
+// pollExitFill polls the broker for a short window waiting for an exit order
+// to fill, returning the confirmed OrderResult. Market exits typically fill
+// within seconds; blocking the monitor loop briefly is preferable to
+// recording a guessed exit price. Returns ok=false if the fill hasn't
+// confirmed inside the window — the caller records the row as pending and the
+// exit-fill reconciler corrects it later.
+func (e *Engine) pollExitFill(ctx context.Context, brokerOrderID string) (execution.OrderResult, bool) {
+	const attempts = 5
+	const delay = 2 * time.Second
+	for i := 0; i < attempts; i++ {
+		select {
+		case <-ctx.Done():
+			return execution.OrderResult{}, false
+		case <-time.After(delay):
+		}
+		status, err := e.executor.GetOrderStatus(ctx, brokerOrderID)
+		if err != nil {
+			logger.Warn("exit fill poll: GetOrderStatus",
+				"broker_order_id", brokerOrderID, "attempt", i+1, "err", err)
+			continue
+		}
+		if execution.NormalizeOrderStatus(status.Status) == "filled" && status.FilledPrice > 0 {
+			return status, true
+		}
+	}
+	return execution.OrderResult{}, false
+}
+
+// exitReconcileInterval throttles the exit-fill reconciler sweep inside the
+// monitor loop.
+const exitReconcileInterval = 10 * time.Minute
+
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
 func (e *Engine) monitorPositions(ctx context.Context) {
 	// Refresh portfolio state from executor positions.
 	e.refreshPortfolio(ctx)
+
+	// Sweep exit orders whose broker fills were never confirmed and align the
+	// closed trades' recorded exits with broker truth. Runs first so a fill
+	// that confirmed since the last tick is corrected before new closes pile
+	// onto the backlog.
+	if time.Since(e.lastExitReconcile) >= exitReconcileInterval {
+		ReconcileExitOrderFillsWithStore(ctx, e.executor, DefaultExitReconcileBatch)
+		e.lastExitReconcile = time.Now()
+	}
 
 	trades, err := store.GetOpenTrades(ctx)
 	if err != nil {
@@ -2077,17 +2127,37 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	for _, t := range trades {
-		// Try intraday candles first for more responsive SL/TP detection,
-		// then fall back to daily.
+		// Use the FRESHEST candle across all timeframes, not the finest
+		// available one. Data collection can stop on a timeframe (ticker
+		// dropped off the watchlist, backfill gap) while coarser timeframes
+		// stay current — a month-old 1h candle must not beat a same-day 4h
+		// candle. A stale 1h close of 5.50 did exactly that for LAC on
+		// 2026-07-02: it crossed the 4.60 take-profit and closed a position
+		// the market (at 3.82) never justified closing.
 		var currentPrice float64
-		for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe1Day} {
+		var priceTS time.Time
+		for _, tf := range []data.Timeframe{data.Timeframe5Min, data.Timeframe15Min, data.Timeframe1Hour, data.Timeframe4Hour, data.Timeframe1Day} {
 			latest, err := store.GetLatestCandle(ctx, t.Ticker, tf)
-			if err == nil && latest != nil {
+			if err == nil && latest != nil && latest.Close > 0 && latest.Timestamp.After(priceTS) {
 				currentPrice = latest.Close
-				break
+				priceTS = latest.Timestamp
 			}
 		}
 		if currentPrice == 0 {
+			continue
+		}
+		// Even the freshest candle can be dangerously old (data collection
+		// dead for the ticker entirely). Acting on it risks phantom SL/TP
+		// triggers, so skip — loudly, because it also means real stops are
+		// NOT being monitored for this position. The cap allows a long
+		// weekend + holiday gap on daily candles.
+		if age := time.Since(priceTS); age > maxMonitorCandleAge {
+			logger.Warn("position monitor: all candle data stale — SL/TP not being checked",
+				"ticker", t.Ticker,
+				"trade_id", t.ID,
+				"latest_candle", priceTS.Format(time.RFC3339),
+				"age", age.Round(time.Minute).String(),
+			)
 			continue
 		}
 
@@ -2132,13 +2202,25 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
-		// Calculate P&L. Use currentPrice as the exit price if the broker
-		// returned 0 (e.g. Alpaca paper orders that are still pending at the
-		// time PlaceOrder returns). currentPrice is guaranteed non-zero above
-		// and is the price that crossed the stop/take-profit threshold.
+		// Prefer the broker's confirmed fill as the exit price. Alpaca market
+		// orders fill async, so PlaceOrder usually returns FilledPrice=0 —
+		// poll briefly for the real fill before recording anything (LAC was
+		// recorded at a stale trigger price 44% away from the actual fill).
+		// Only if the fill still hasn't confirmed do we fall back to
+		// currentPrice; the exit-fill reconciler sweep corrects the row once
+		// the broker reports the fill.
 		exitPrice := result.FilledPrice
+		if exitPrice == 0 && result.BrokerOrderID != "" {
+			if filled, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
+				exitPrice = filled.FilledPrice
+				result = filled
+			}
+		}
+		exitFillConfirmed := exitPrice > 0
 		if exitPrice == 0 {
 			exitPrice = currentPrice
+			logger.Warn("exit fill unconfirmed at close time — recording trigger price, reconciler will correct",
+				"trade_id", t.ID, "ticker", t.Ticker, "broker_order_id", result.BrokerOrderID)
 		}
 		pnl := (exitPrice - t.EntryPrice) * t.Quantity
 		if t.Direction == "short" {
@@ -2153,19 +2235,23 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			logger.Warn("close trade", "trade_id", t.ID, "err", err)
 		}
 
-		// Record exit order.
+		// Record exit order. FilledPrice is only persisted once the broker
+		// confirmed the fill — an unconfirmed row keeps status='pending' and
+		// empty fill columns so the exit-fill reconciler picks it up.
 		exitOrder := store.Order{
 			TradeID:       t.ID,
 			BrokerOrderID: result.BrokerOrderID,
 			Ticker:        t.Ticker,
 			Side:          string(exitSide),
 			OrderType:     string(execution.OrderTypeMarket),
-			Quantity:      result.FilledQty,
-			FilledPrice:   exitPrice,
+			Quantity:      t.Quantity,
 			FilledQty:     result.FilledQty,
 			Status:        execution.NormalizeOrderStatus(result.Status),
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
+		}
+		if exitFillConfirmed {
+			exitOrder.FilledPrice = exitPrice
 		}
 		if _, err := store.InsertOrder(ctx, exitOrder); err != nil {
 			logger.Warn("insert exit order", "trade_id", t.ID, "err", err)
