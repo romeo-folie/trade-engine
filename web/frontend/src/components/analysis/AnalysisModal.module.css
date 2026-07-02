@@ -58,6 +58,14 @@
   letter-spacing: 0.05em;
 }
 
+.companyName {
+  font-family: var(--font-display);
+  font-size: 15px;
+  font-weight: 500;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
 .badgeText {
   font-family: var(--font-mono);
   font-size: 12px;

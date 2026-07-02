@@ -259,6 +259,7 @@ func nullableFloat(f float64) any {
 type AnalysisSummary struct {
 	ID            string    `json:"ID"`
 	Ticker        string    `json:"Ticker"`
+	CompanyName   string    `json:"CompanyName,omitempty"`
 	Strategy      string    `json:"Strategy"`
 	Action        string    `json:"Action"`
 	Confidence    float64   `json:"Confidence"`
@@ -290,14 +291,15 @@ type AnalysisSummary struct {
 // /api/analyses/recent payload from ~1.6 MB to ~150 KB (limit=100).
 func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary, error) {
 	q := `
-		SELECT id, ticker, strategy, action, confidence, size_pct,
-		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
-		       model_provider, model_name,
-		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       created_at,
-		       COALESCE(fast_pathed, false), COALESCE(dissent_summary, '')
-		FROM analyses
-		ORDER BY created_at DESC
+		SELECT a.id, a.ticker, COALESCE(e.name, ''), a.strategy, a.action, a.confidence, a.size_pct,
+		       COALESCE(a.stop_loss, 0), COALESCE(a.take_profit, 0), COALESCE(a.reasoning, ''),
+		       a.model_provider, a.model_name,
+		       COALESCE(a.token_count_input, 0), COALESCE(a.token_count_output, 0), COALESCE(a.latency_ms, 0),
+		       a.created_at,
+		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, '')
+		FROM analyses a
+		LEFT JOIN entities e ON UPPER(e.ticker) = UPPER(a.ticker)
+		ORDER BY a.created_at DESC
 		LIMIT $1`
 	rows, err := GetDB().Query(ctx, q, limit)
 	if err != nil {
@@ -309,7 +311,7 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 	for rows.Next() {
 		var a AnalysisSummary
 		if err := rows.Scan(
-			&a.ID, &a.Ticker, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
+			&a.ID, &a.Ticker, &a.CompanyName, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
 			&a.StopLoss, &a.TakeProfit, &a.Reasoning,
 			&a.ModelProvider, &a.ModelName,
 			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
@@ -329,18 +331,19 @@ func GetRecentAnalysesSummary(ctx context.Context, limit int) ([]AnalysisSummary
 // so callers can render a 404 cleanly.
 func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error) {
 	q := `
-		SELECT id, ticker, strategy, action, confidence, size_pct,
-		       COALESCE(stop_loss, 0), COALESCE(take_profit, 0), COALESCE(reasoning, ''),
-		       model_provider, model_name,
-		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       created_at,
-		       ensemble_results, arbiter_response,
-		       COALESCE(fast_pathed, false), COALESCE(dissent_summary, '')
-		FROM analyses
-		WHERE id = $1`
+		SELECT a.id, a.ticker, COALESCE(e.name, ''), a.strategy, a.action, a.confidence, a.size_pct,
+		       COALESCE(a.stop_loss, 0), COALESCE(a.take_profit, 0), COALESCE(a.reasoning, ''),
+		       a.model_provider, a.model_name,
+		       COALESCE(a.token_count_input, 0), COALESCE(a.token_count_output, 0), COALESCE(a.latency_ms, 0),
+		       a.created_at,
+		       a.ensemble_results, a.arbiter_response,
+		       COALESCE(a.fast_pathed, false), COALESCE(a.dissent_summary, '')
+		FROM analyses a
+		LEFT JOIN entities e ON UPPER(e.ticker) = UPPER(a.ticker)
+		WHERE a.id = $1`
 	var a AnalysisSummary
 	err := GetDB().QueryRow(ctx, q, id).Scan(
-		&a.ID, &a.Ticker, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
+		&a.ID, &a.Ticker, &a.CompanyName, &a.Strategy, &a.Action, &a.Confidence, &a.SizePct,
 		&a.StopLoss, &a.TakeProfit, &a.Reasoning,
 		&a.ModelProvider, &a.ModelName,
 		&a.InputTokens, &a.OutputTokens, &a.LatencyMs,

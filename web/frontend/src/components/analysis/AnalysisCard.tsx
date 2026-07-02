@@ -44,9 +44,10 @@ export default function AnalysisCard({ analysis, onClick }: AnalysisCardProps) {
         <span className={styles.timestamp}>{fmtTime(analysis.CreatedAt)}</span>
       </div>
 
-      {/* Row 2: provider / model */}
+      {/* Row 2: company full name (model string as fallback when the ticker
+          has no knowledge-graph entity — ETFs, uncovered small caps) */}
       <div className={styles.model}>
-        {analysis.ModelProvider} / {analysis.ModelName}
+        {analysis.CompanyName || `${analysis.ModelProvider} / ${analysis.ModelName}`}
       </div>
 
       {/* Row 3: Signal badge + confidence + bar */}
