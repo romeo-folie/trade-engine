@@ -406,6 +406,20 @@ orb:
 #       # Per-instrument risk multiplier (Phase 5): scale this instrument's risk vs the
 #       # strategy max_risk_pct (e.g. 0.35 sizes XAU/USD down). <=0 → 1.0.
 #       risk_multiplier: 0.35
+#       # Margin-aware sizing: broker margin requirement as a fraction of notional
+#       # (0.033 ≈ 30:1 forex leverage, 0.05 gold CFD). When set, max_position_pct caps
+#       # MARGIN CONSUMED (notional × margin_rate) instead of full notional — without it a
+#       # leveraged FX position caps near min-lot, where the broker's minimum commission
+#       # is 13-27% of the dollar risk per trade (sweep 9af76e63). <=0 → full notional.
+#       margin_rate: 0.033
+#       # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
+#       # bps × capped notional)) and the max round-trip commission as a fraction of
+#       # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
+#       # whose size regime the commission floor would eat. 0 disables; a max without
+#       # commission_per_side fails config validation. commission_per_side also overrides
+#       # the backtest cost model's flat default for this instrument.
+#       commission_per_side: 6.0
+#       max_commission_to_risk: 0.05
 #       # Adaptive exit management (Phase 4), measured by the backtest `adaptive` variant
 #       # (live order-management lands in a follow-up). R = |entry_stop − stop_loss|.
 #       break_even_r: 0.8           # move the stop to entry after +0.8R

@@ -116,6 +116,8 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 // sizeForexQty risk-sizes a forex/CFD position from its entry and stop: qty targets
 // MaxRiskPct×RiskMultiplier of the portfolio at the planned stop distance, rounded down to the
 // instrument's lot size, then capped so notional does not exceed MaxPositionPct of the portfolio.
+// With Instrument.MarginRate set, the cap applies to margin consumed (notional × margin_rate)
+// rather than full notional — the leveraged-instrument reading of "% of portfolio per position".
 // Returns 0 when even the minimum lot breaches the notional cap ("cannot trade"). Shared by the
 // range bracket and the retest bracket so both size identically.
 func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) int {
@@ -142,7 +144,11 @@ func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig
 	}
 
 	if cfg.MaxPositionPct > 0 && entry > 0 {
-		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / entry))
+		marginRate := inst.MarginRate
+		if marginRate <= 0 || marginRate > 1 {
+			marginRate = 1.0 // unset (or invalid) → cap on full notional, the pre-margin behaviour
+		}
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / (entry * marginRate)))
 		if lotSize > 0 {
 			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
 			if maxQtyByNotional < lotSize {

@@ -382,6 +382,59 @@ func TestReplay_SpreadFilterVariant(t *testing.T) {
 	})
 }
 
+func TestReplay_CommissionFilterVariant(t *testing.T) {
+	// risk/unit 0.0014; the full-notional cap floors qty to the 5000 min lot → dollar
+	// risk $7. Round-trip commission $4 → commission/risk 0.571: a min-commission trade
+	// the gate exists to refuse. With margin_rate 0.033 the cap lifts to 275,000 units →
+	// dollar risk $385 → ratio 0.0104, and the same max admits the trade.
+	build := func(maxCommissionToRisk, marginRate float64) ([]SimTrade, error) {
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // enter buy
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+		inst := config.Instrument{
+			Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002,
+			MaxCommissionToRisk: maxCommissionToRisk, MarginRate: marginRate,
+		}
+		costs := map[string]CostModel{"EUR/USD": {Spread: 0.0001, CommissionPerSide: 2.0}}
+		e := NewEngine(cfg, &fakeProvider{candles: candles}, costs, 48*time.Hour)
+		return e.Run(context.Background(), RangeFilter(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	}
+
+	t.Run("min-lot dollar risk is filtered", func(t *testing.T) {
+		trades, err := build(0.05, 0) // 0.571 > 0.05
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (commission/risk 0.571 exceeds max 0.05)", len(trades))
+		}
+	})
+	t.Run("disabled gate keeps the min-lot trade", func(t *testing.T) {
+		trades, err := build(0, 0)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 {
+			t.Fatalf("trades = %d; want 1 (gate disabled)", len(trades))
+		}
+	})
+	t.Run("margin-sized position passes the same max", func(t *testing.T) {
+		trades, err := build(0.05, 0.033) // ratio 0.0104 ≤ 0.05
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 {
+			t.Fatalf("trades = %d; want 1 (margin sizing lifts dollar risk above the commission floor)", len(trades))
+		}
+		if got := trades[0].Qty; got != 275000 {
+			t.Fatalf("qty = %d; want 275000 (margin-based cap at 30:1)", got)
+		}
+	})
+}
+
 func TestReplay_ConfirmedVariant(t *testing.T) {
 	cfg := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
 	// close_1m confirmation; entry-quality bounds left at 0 so only confirmation matters.

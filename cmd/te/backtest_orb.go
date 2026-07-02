@@ -272,7 +272,13 @@ func buildCostModels(instruments []config.Instrument) map[string]orbreplay.CostM
 		if !ok {
 			spread = inst.PipBuffer // sensible fallback for an unlisted instrument
 		}
-		costs[inst.Symbol] = orbreplay.CostModel{Spread: spread, CommissionPerSide: orbCommissionPerSide}
+		// Per-instrument commission_per_side overrides the flat default so the replay charges
+		// (and its commission/risk gate measures) the same estimate the live gate uses.
+		commission := orbCommissionPerSide
+		if inst.CommissionPerSide > 0 {
+			commission = inst.CommissionPerSide
+		}
+		costs[inst.Symbol] = orbreplay.CostModel{Spread: spread, CommissionPerSide: commission}
 	}
 	return costs
 }

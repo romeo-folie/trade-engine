@@ -172,3 +172,47 @@ func TestComputeForexBracket_RiskMultiplier(t *testing.T) {
 		t.Errorf("risk_multiplier 0.5: scaled qty %d; want ≈ half of %d", scaled.Qty, full.Qty)
 	}
 }
+
+func TestComputeForexBracket_MarginRate(t *testing.T) {
+	// Range 1.1000-1.1010, pip 0.0002 → buy entry 1.1012, stop 1.0998, risk 0.0014.
+	// Risk sizing targets $1000 (1% of 100k) → ~714k units, so the notional cap binds.
+	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0}
+	base := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002}
+
+	t.Run("unset margin_rate keeps the full-notional cap", func(t *testing.T) {
+		// 100k × 10% / 1.1012 = 9081 → lot-floored 5000.
+		got := ComputeForexBracket(r, "buy", 100000, cfg, base)
+		if got.Qty != 5000 {
+			t.Errorf("qty = %d; want 5000 (full-notional cap, min lot)", got.Qty)
+		}
+	})
+	t.Run("margin_rate caps margin consumed, not notional", func(t *testing.T) {
+		// 100k × 10% / (1.1012 × 0.033) = 275,177 → lot-floored 275,000.
+		inst := base
+		inst.MarginRate = 0.033
+		got := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+		if got.Qty != 275000 {
+			t.Errorf("qty = %d; want 275000 (margin-based cap at 30:1)", got.Qty)
+		}
+	})
+	t.Run("risk sizing still binds when it is the smaller of the two", func(t *testing.T) {
+		// margin cap 275,177 > risk-target 714,285? No — risk target is larger here, so
+		// widen the stop instead: risk 0.0140 → target 71,428 < margin cap → risk binds.
+		wide := &OpeningRange{Ticker: "EUR/USD", High: 1.1104, Low: 1.0968} // risk 0.0140 after ±pip
+		inst := base
+		inst.MarginRate = 0.033
+		got := ComputeForexBracket(wide, "buy", 100000, cfg, inst)
+		if got.Qty != 70000 {
+			t.Errorf("qty = %d; want 70000 (risk-sized 71,428 lot-floored)", got.Qty)
+		}
+	})
+	t.Run("margin_rate above 1 is ignored", func(t *testing.T) {
+		inst := base
+		inst.MarginRate = 33 // leverage ratio typo — validation rejects it; sizing must not amplify
+		got := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+		if got.Qty != 5000 {
+			t.Errorf("qty = %d; want 5000 (invalid rate falls back to full notional)", got.Qty)
+		}
+	})
+}

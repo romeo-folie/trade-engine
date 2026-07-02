@@ -1117,6 +1117,23 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
+			// Entry-quality gate 3: commission/dollar-risk filter. Checked per side — the two
+			// brackets share the risk magnitude but the notional cap can round their qtys to
+			// different lots, and the ratio depends on qty. A failing side is zeroed (skipped
+			// by the placement loop), mirroring how direction eligibility disables a side.
+			if ok, ratio, reason := passesCommission(buyParams.Qty, buyParams.EntryStop, buyParams.StopLoss, *inst); !ok && buyParams.Qty > 0 {
+				slog.Info("orb: disabling buy side — commission too large for planned risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+				buyParams.Qty = 0
+			}
+			if ok, ratio, reason := passesCommission(sellParams.Qty, sellParams.EntryStop, sellParams.StopLoss, *inst); !ok && sellParams.Qty > 0 {
+				slog.Info("orb: disabling sell side — commission too large for planned risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+				sellParams.Qty = 0
+			}
+			if buyParams.Qty == 0 && sellParams.Qty == 0 {
+				slog.Info("orb: skipping instrument — commission too large for planned risk on both sides", "ticker", ticker)
+				continue
+			}
+
 			// Direction eligibility (Phase 3): place only the trend-aligned side(s). The
 			// decision is LATCHED at the first executing tick (directionDecision) so it can't
 			// drift across confirmation retries. Zeroing a side's Qty makes the placement loop

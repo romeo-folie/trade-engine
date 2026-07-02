@@ -93,6 +93,36 @@ func (s *ORBScheduler) passesSpread(ctx context.Context, ticker string, entrySto
 	return true, ratio, ""
 }
 
+// passesCommission checks the estimated round-trip commission against the planned DOLLAR
+// risk: fills×Instrument.CommissionPerSide / (|entry_stop − stop_loss| × qty). The spread
+// gate can't catch this failure mode — spread cost scales with position size while commission
+// has a fixed broker minimum, so at notional-capped sizes the commission alone can exceed the
+// entire planned risk (sweep 9af76e63 measured 0.13–0.27R per trade). A split-bracket
+// instrument (partial_take_profit_r + partial_fraction) places runner and partial as SEPARATE
+// broker orders — two entry fills and two exit fills — so its round trip pays 4 sides, not 2.
+// Returns (ok, ratio, reason). Disabled when MaxCommissionToRisk or CommissionPerSide is 0;
+// unlike the ATR and spread filters it needs no market data, so there is no fail-open path.
+func passesCommission(qty int, entryStop, stopLoss float64, inst config.Instrument) (bool, float64, string) {
+	if inst.MaxCommissionToRisk <= 0 || inst.CommissionPerSide <= 0 {
+		return true, 0, ""
+	}
+	riskDollars := math.Abs(entryStop-stopLoss) * float64(qty)
+	if riskDollars <= 0 {
+		return true, 0, ""
+	}
+	fills := 2.0
+	if inst.PartialTakeProfitR > 0 && inst.PartialFraction > 0 {
+		fills = 4.0 // ScaleOutBrackets splits into two orders: 2 entry + 2 exit fills
+	}
+	commission := fills * inst.CommissionPerSide
+	ratio := commission / riskDollars
+	if ratio > inst.MaxCommissionToRisk {
+		return false, ratio, fmt.Sprintf("commission/risk %.2f > max %.2f (round-trip $%.2f on $%.2f risk)",
+			ratio, inst.MaxCommissionToRisk, commission, riskDollars)
+	}
+	return true, ratio, ""
+}
+
 // atrLookback returns how far back to fetch for an ATR of `period` bars on timeframe
 // `tf`. For intraday timeframes it adds a 72h pad so the window clears the ~48h forex
 // weekend gap — otherwise a Monday-morning session's lookback lands inside the closed
