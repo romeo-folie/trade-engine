@@ -216,3 +216,46 @@ func TestComputeForexBracket_MarginRate(t *testing.T) {
 		}
 	})
 }
+
+func TestComputeForexBracket_MaxNotionalUSD(t *testing.T) {
+	// Silver-shaped scenario: a tight ORB stop on a ~$62 instrument lets the margin cap
+	// size a small-dollar-risk trade into a >$100k notional that trips IBKR's precautionary
+	// order-value limit. Range 62.50–62.70, pip 0.05 → buy entry 62.75, stop 62.45.
+	r := &OpeningRange{Ticker: "XAG/USD", High: 62.70, Low: 62.50}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 0.5, MaxPositionPct: 25.0}
+	base := config.Instrument{Symbol: "XAG/USD", SecType: "CFD", MinLotSize: 50, PipBuffer: 0.05, MarginRate: 0.10}
+
+	t.Run("no cap → margin sizing produces a >$100k notional", func(t *testing.T) {
+		got := ComputeForexBracket(r, "buy", 100000, cfg, base)
+		notional := float64(got.Qty) * got.EntryStop
+		if notional <= 100000 {
+			t.Fatalf("expected an uncapped notional over $100k to reproduce the bug; got qty=%d notional=%.0f", got.Qty, notional)
+		}
+	})
+
+	t.Run("cap bounds order value under the limit", func(t *testing.T) {
+		inst := base
+		inst.MaxNotionalUSD = 95000
+		got := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+		notional := float64(got.Qty) * got.EntryStop
+		if got.Qty == 0 {
+			t.Fatalf("cap zeroed a tradeable size; qty=%d", got.Qty)
+		}
+		if notional > 95000 {
+			t.Errorf("notional %.0f exceeds the $95k cap (qty=%d, entry=%.2f)", notional, got.Qty, got.EntryStop)
+		}
+		if got.Qty%inst.MinLotSize != 0 {
+			t.Errorf("capped qty %d is not a multiple of min lot %d", got.Qty, inst.MinLotSize)
+		}
+	})
+
+	t.Run("cap larger than the sized notional is a no-op", func(t *testing.T) {
+		inst := base
+		uncapped := ComputeForexBracket(r, "buy", 100000, cfg, base)
+		inst.MaxNotionalUSD = 10_000_000 // far above any sized notional
+		got := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+		if got.Qty != uncapped.Qty {
+			t.Errorf("qty = %d; want %d (a loose cap must not change sizing)", got.Qty, uncapped.Qty)
+		}
+	})
+}

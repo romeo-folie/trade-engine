@@ -684,3 +684,25 @@ func TestValidateForexBreakoutConfirmation(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateForexMaxNotionalUSD(t *testing.T) {
+	cfg := Defaults()
+	cfg.ForexORB.Enabled = true
+	cfg.ForexORB.Instruments = []Instrument{
+		{Symbol: "XAG/USD", MaxNotionalUSD: 95000}, // USD-quoted → valid
+		{Symbol: "EUR/GBP", MaxNotionalUSD: 95000}, // GBP-quoted → entry×qty is GBP, must error
+	}
+	errs := Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "EUR/GBP") && strings.Contains(e, "max_notional_usd") {
+			found = true
+		}
+		if strings.Contains(e, "XAG/USD") && strings.Contains(e, "max_notional_usd") {
+			t.Errorf("USD-quoted pair wrongly rejected: %s", e)
+		}
+	}
+	if !found {
+		t.Errorf("expected a max_notional_usd error for the non-USD-quoted pair; got %v", errs)
+	}
+}
