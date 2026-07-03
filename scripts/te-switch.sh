@@ -58,8 +58,26 @@ if [ -z "$NODE_BIN" ]; then
   done
 fi
 
-GATEWAY_URL="${IBKR_GATEWAY_URL:-https://localhost:5001}"
 CURL_BIN="$(command -v curl 2>/dev/null || echo /usr/bin/curl)"
+
+# config_gateway_url: read markets.ibkr.gateway_url from the engine's config file
+# (~/.tradeengine/config.yaml, i.e. config.ConfigPath()) so the gate polls the SAME
+# endpoint `./te run` will connect to. Strips quotes, trailing comments, whitespace.
+# Empty output when the file or key is absent.
+config_gateway_url() {
+  local cfg="$HOME/.tradeengine/config.yaml"
+  [ -f "$cfg" ] || return 0
+  grep -E '^[[:space:]]*gateway_url:' "$cfg" 2>/dev/null | head -1 \
+    | sed -E 's/^[[:space:]]*gateway_url:[[:space:]]*//; s/[[:space:]]*(#.*)?$//; s/^["'\'']//; s/["'\'']$//'
+}
+
+# Resolve the gateway URL the way the engine does: explicit env override wins
+# (also what reauth-gateway.js uses), else the configured value, else the engine
+# default (defaults.go → https://localhost:5000). A hard-coded default here would
+# silently diverge from the engine and turn the gate into a false-negative.
+GATEWAY_URL="${IBKR_GATEWAY_URL:-}"
+[ -n "$GATEWAY_URL" ] || GATEWAY_URL="$(config_gateway_url)"
+[ -n "$GATEWAY_URL" ] || GATEWAY_URL="https://localhost:5000"
 
 # needs_ibkr: modes that require a live, authenticated IBKR gateway session.
 # Equities-only modes (orb, regular) trade via Alpaca and must NOT be gated on
