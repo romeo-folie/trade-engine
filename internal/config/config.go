@@ -649,6 +649,8 @@ type Instrument struct {
 	// default $100k) — a cascade of confirmation prompts that fails placement outright. This
 	// bounds notional so the order clears that limit. <= 0 disables the cap (default), leaving
 	// every other instrument byte-identical. Applied in sizeForexQty (live + backtest parity).
+	// entry×qty is denominated in the pair's QUOTE currency, which equals USD only for USD-quoted
+	// pairs — Validate rejects this field on any non-…/USD symbol.
 	MaxNotionalUSD float64 `yaml:"max_notional_usd"`
 
 	// CommissionPerSide is the estimated broker commission in account currency per fill
@@ -1443,6 +1445,17 @@ func Validate(cfg *Config) []string {
 				errs = append(errs, fmt.Sprintf(
 					"forex_orb instrument %q: margin_rate %.3f must be a fraction of notional in (0, 1] (e.g. 0.033 for 30:1 leverage), not a leverage ratio",
 					inst.Symbol, inst.MarginRate))
+			}
+			// max_notional_usd caps entry×qty, which is denominated in the pair's QUOTE currency.
+			// That equals USD only for USD-quoted pairs (…/USD). On a non-USD-quoted pair (e.g.
+			// USD/JPY, EUR/GBP) entry×qty is JPY/GBP, so a USD cap would drastically under-size or
+			// skip the instrument. Restrict the knob to USD-quoted symbols rather than pretend to
+			// convert (sizeForexQty has no FX rate). The sweep sets instruments programmatically
+			// and never goes through Validate, so it must uphold the same rule.
+			if inst.MaxNotionalUSD > 0 && !strings.HasSuffix(inst.Symbol, "/USD") {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: max_notional_usd is only valid for USD-quoted pairs (…/USD); entry×qty on this pair is quote-currency value, not USD",
+					inst.Symbol))
 			}
 			// The commission gate needs a commission estimate; a max without one would be a
 			// silent no-op that quietly re-admits the min-commission trades it exists to block.
