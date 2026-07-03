@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
 	"net/http"
 	"strconv"
@@ -96,12 +97,18 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 // On success the gateway returns [{order_id, order_status, ...}].
 // On a compliance/confirmation prompt it returns [{id, message, ...}]; we
 // auto-confirm by POSTing {"confirmed": true} to /iserver/reply/{replyId}.
-// Bracket orders commonly trigger 2–3 sequential prompts before all order IDs
-// are returned, so we loop up to maxConfirmRounds rather than recursing once.
+// A multi-leg bracket (parent + TP + SL) can chain many sequential prompts —
+// each stop leg draws the "you are about to submit a stop order" disclaimer,
+// plus per-order size/value precautionary warnings — so we loop up to
+// maxConfirmRounds rather than recursing once. Each prompt is logged: when a
+// placement genuinely can't clear (an unexpected or repeating message), the
+// log shows exactly which warning stalled it instead of a blind round-count.
 func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessage) (OrderResult, error) {
-	const maxConfirmRounds = 5
+	// IBKR draws up to 3 precautionary prompts per order (size, value, stop-order
+	// disclaimer); a 3-leg bracket can therefore chain well past the old cap of 5.
+	const maxConfirmRounds = 15
 	current := raw
-	for range maxConfirmRounds {
+	for round := 1; round <= maxConfirmRounds; round++ {
 		if result, ok := parseIBKROrderResult(current); ok {
 			return result, nil
 		}
@@ -116,6 +123,9 @@ func (b *IBKRBroker) resolveOrderResponse(ctx context.Context, raw json.RawMessa
 		}
 
 		replyID := replyPrompts[0].ID
+		slog.Info("ibkr: auto-confirming order prompt",
+			"round", round, "reply_id", replyID,
+			"message", strings.Join(replyPrompts[0].Message, " | "))
 		var confirmed json.RawMessage
 		if err := b.do(ctx, http.MethodPost, "/v1/api/iserver/reply/"+replyID, map[string]bool{"confirmed": true}, &confirmed); err != nil {
 			return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: confirm reply %s: %w", replyID, err)

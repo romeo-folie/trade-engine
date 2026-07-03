@@ -642,6 +642,15 @@ type Instrument struct {
 	// live and backtest sizing identically.
 	MarginRate float64 `yaml:"margin_rate"`
 
+	// MaxNotionalUSD caps this instrument's order value (entry × qty), in account currency,
+	// applied AFTER the risk- and margin-based sizing in sizeForexQty. A tight ORB stop on a
+	// high-priced instrument (silver ~$62) lets the margin cap size a small-dollar-risk trade
+	// into a large notional that trips the broker's precautionary order-value limit (IBKR
+	// default $100k) — a cascade of confirmation prompts that fails placement outright. This
+	// bounds notional so the order clears that limit. <= 0 disables the cap (default), leaving
+	// every other instrument byte-identical. Applied in sizeForexQty (live + backtest parity).
+	MaxNotionalUSD float64 `yaml:"max_notional_usd"`
+
 	// CommissionPerSide is the estimated broker commission in account currency per fill
 	// (a bracket round trip pays 2×). Set it to max(broker minimum, bps × typical notional)
 	// for this instrument's size regime. Used by the commission/risk entry gate below and,

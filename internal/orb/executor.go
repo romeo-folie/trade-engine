@@ -159,6 +159,24 @@ func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig
 			qty = maxQtyByNotional
 		}
 	}
+
+	// Notional cap: bound order value (entry × qty) so a tight stop on a high-priced
+	// instrument can't size into a notional that trips the broker's precautionary
+	// order-value limit (IBKR default $100k). Applied last so it also clamps the
+	// margin-cap result. If even one lot exceeds the cap, qty→0 (cannot trade) rather
+	// than placing an order that would be rejected — same convention as the margin cap.
+	if inst.MaxNotionalUSD > 0 && entry > 0 {
+		maxQtyByValue := int(math.Floor(inst.MaxNotionalUSD / entry))
+		if lotSize > 0 {
+			maxQtyByValue = (maxQtyByValue / lotSize) * lotSize
+			if maxQtyByValue < lotSize {
+				maxQtyByValue = 0 // one lot alone exceeds the notional cap
+			}
+		}
+		if qty > maxQtyByValue {
+			qty = maxQtyByValue
+		}
+	}
 	return qty
 }
 
