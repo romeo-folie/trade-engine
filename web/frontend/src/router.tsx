@@ -12,6 +12,7 @@ const PortfolioScreen = lazy(() => import('./screens/Portfolio'));
 const SignalsScreen   = lazy(() => import('./screens/Signals'));
 const TradesScreen    = lazy(() => import('./screens/Trades'));
 const AnalysisScreen  = lazy(() => import('./screens/Analysis'));
+const PerformanceScreen = lazy(() => import('./screens/Performance'));
 const BacktestsScreen = lazy(() => import('./screens/Backtests'));
 const ConfigScreen    = lazy(() => import('./screens/Config'));
 const SystemScreen    = lazy(() => import('./screens/System'));
@@ -37,6 +38,7 @@ export const router = createBrowserRouter([
       { path: 'signals',   element: lazyRoute(<SignalsScreen />) },
       { path: 'trades',    element: lazyRoute(<TradesScreen />) },
       { path: 'analysis',  element: lazyRoute(<AnalysisScreen />) },
+      { path: 'performance', element: lazyRoute(<PerformanceScreen />) },
       { path: 'backtests', element: lazyRoute(<BacktestsScreen />) },
       { path: 'config',    element: lazyRoute(<ConfigScreen />) },
       { path: 'system',    element: lazyRoute(<SystemScreen />) },
