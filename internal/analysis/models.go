@@ -179,6 +179,10 @@ type NewsSnippet struct {
 // Placeholder in Phase 3 — populated by Phase 4.
 type PortfolioContext struct {
 	CashAvailable float64
+	// CashKnown distinguishes a real balance (including a fully-deployed $0)
+	// from an unpopulated tracker: with it false the prompt renders an
+	// explicit "not provided" marker instead of a false zero (Codex #392 P2).
+	CashKnown     bool
 	OpenPositions []PositionSummary
 }
 

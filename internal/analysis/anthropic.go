@@ -376,6 +376,7 @@ func toPromptPortfolio(p PortfolioContext, analyzedTicker string) prompts.Portfo
 	}
 	return prompts.Portfolio{
 		CashAvailable:    p.CashAvailable,
+		CashKnown:        p.CashKnown,
 		OpenPositions:    pos,
 		OmittedPositions: omitted,
 	}

@@ -43,7 +43,10 @@ type NewsItem struct {
 // positions dropped by the conversion cap (toPromptPortfolio) so the prompt can
 // say "+N more" instead of silently understating exposure.
 type Portfolio struct {
-	CashAvailable    float64
+	CashAvailable float64
+	// CashKnown distinguishes a real balance (including $0 fully deployed)
+	// from an unpopulated tracker; false renders a "not provided" marker.
+	CashKnown        bool
 	OpenPositions    []Position
 	OmittedPositions int
 }
@@ -311,9 +314,15 @@ func buildUser(
 	// $100 and unrealized P&L renders as a percentage bucketed to 5 points —
 	// the text only changes when something meaningful changes.
 	b.WriteString("\n### PORTFOLIO CONTEXT\n")
-	if portfolio.CashAvailable > 0 {
+	switch {
+	case portfolio.CashKnown && math.Round(portfolio.CashAvailable/100)*100 <= 0:
+		// Known non-positive balance: the account is fully deployed (or in a
+		// margin debit). Rendering this as "not provided" would invite BUY
+		// proposals the cash gates must then discard (Codex #392 P2).
+		b.WriteString("Cash available: ≈$0 (fully deployed — a new long entry requires freeing capital first)\n")
+	case portfolio.CashKnown || portfolio.CashAvailable > 0:
 		b.WriteString(fmt.Sprintf("Cash available: ≈$%.0f\n", math.Round(portfolio.CashAvailable/100)*100))
-	} else {
+	default:
 		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
 	}
 	if len(portfolio.OpenPositions) > 0 {
@@ -324,7 +333,10 @@ func buildUser(
 				side = "long"
 			}
 			line := fmt.Sprintf("  %s: %s %.4f @ %.2f", p.Ticker, side, p.Quantity, p.AvgCostBasis)
-			if basis := p.Quantity * p.AvgCostBasis; basis != 0 {
+			// Print the P&L bucket only when the source actually knows it:
+			// store-fallback positions (paper mode) carry no mark-to-market,
+			// and a fabricated ≈+0% would misinform.
+			if basis := p.Quantity * p.AvgCostBasis; basis != 0 && (p.UnrealizedPL != 0 || p.CurrentValue != 0) {
 				bucket := math.Round(p.UnrealizedPL/math.Abs(basis)*100/5) * 5
 				line += fmt.Sprintf("  unrealized≈%+.0f%%", bucket)
 			}

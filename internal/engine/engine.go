@@ -692,15 +692,30 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source)
 }
 
-// buildPortfolioContext maps live tracker state into the analysis request so
+// buildPortfolioContext maps live portfolio state into the analysis request so
 // analysts see cash and open positions (closes the "Phase 4" gap: 24% of all
 // blocked signals were SELLs on tickers we did not hold, and another 27% hit
 // per-ticker/pyramid/max-position limits — all invisible to a portfolio-blind
 // analyst). Pure function for testability. Downstream, toPromptPortfolio pins
 // the analyzed ticker + caps the list, and the prompt renderer buckets the
 // volatile figures so analysis_cache stays effective.
-func buildPortfolioContext(cash float64, positions []portfolio.ExecPosition) analysis.PortfolioContext {
-	out := analysis.PortfolioContext{CashAvailable: cash}
+//
+// openTrades is the store fallback for when the tracker has no positions: the
+// paper executor's GetPositions returns nil (Codex #392 P1), so in paper mode
+// the tracker is empty while real open trades sit in the trades table — and
+// the PortfolioRules SELL guard would then suppress valid analyst exits.
+// Trades aggregate per (ticker, direction) with a weighted-average entry (the
+// same "distinct position" notion as the risk counter, PR #330); they carry no
+// mark-to-market, so CurrentValue/UnrealizedPL stay zero and the renderer
+// omits the P&L bucket rather than fabricate ≈+0%.
+//
+// CashKnown distinguishes a real balance (including fully-deployed $0) from an
+// uninitialized tracker: equity > 0 means the tracker received a real update.
+func buildPortfolioContext(state portfolio.State, positions []portfolio.ExecPosition, openTrades []store.Trade) analysis.PortfolioContext {
+	out := analysis.PortfolioContext{
+		CashAvailable: state.Cash,
+		CashKnown:     state.Cash > 0 || state.TotalValue > 0,
+	}
 	for _, p := range positions {
 		if p.Quantity == 0 {
 			continue
@@ -714,7 +729,54 @@ func buildPortfolioContext(cash float64, positions []portfolio.ExecPosition) ana
 			UnrealizedPL: p.UnrealizedPL,
 		})
 	}
+	if len(out.OpenPositions) > 0 {
+		return out
+	}
+
+	// Tracker empty — aggregate open trades per (ticker, direction).
+	type key struct{ ticker, dir string }
+	agg := make(map[key]*analysis.PositionSummary)
+	order := []key{}
+	for _, t := range openTrades {
+		if t.Quantity == 0 {
+			continue
+		}
+		k := key{t.Ticker, t.Direction}
+		ps, ok := agg[k]
+		if !ok {
+			ps = &analysis.PositionSummary{Ticker: t.Ticker, Side: t.Direction}
+			agg[k] = ps
+			order = append(order, k)
+		}
+		// Weighted-average entry across pyramided rows.
+		totalCost := ps.AvgCostBasis*ps.Quantity + t.EntryPrice*t.Quantity
+		ps.Quantity += t.Quantity
+		if ps.Quantity != 0 {
+			ps.AvgCostBasis = totalCost / ps.Quantity
+		}
+	}
+	for _, k := range order {
+		out.OpenPositions = append(out.OpenPositions, *agg[k])
+	}
 	return out
+}
+
+// portfolioContextForPrompt assembles the portfolio context for an analysis
+// request, loading the store's open trades as fallback only when the tracker
+// holds no positions (the paper executor reports none — Codex #392 P1). The
+// store query is skipped entirely in the common live-broker case.
+func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.PortfolioContext {
+	state := e.portfolio.CurrentState()
+	positions := e.portfolio.Positions()
+	var openTrades []store.Trade
+	if len(positions) == 0 && store.IsConnected() {
+		if trades, err := store.GetOpenTrades(ctx); err == nil {
+			openTrades = trades
+		} else {
+			logger.Warn("portfolio context: open-trades fallback failed", "err", err)
+		}
+	}
+	return buildPortfolioContext(state, positions, openTrades)
 }
 
 // runAnalysis builds the analysis request, calls the configured model, stores
@@ -910,7 +972,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 			VolRatio: volRatio(candles, set.VolumeSMA20),
 		},
 		News:      snippets,
-		Portfolio: buildPortfolioContext(e.portfolio.CurrentState().Cash, e.portfolio.Positions()),
+		Portfolio: e.portfolioContextForPrompt(ctx),
 	}
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)

@@ -137,3 +137,26 @@ func TestBuildUser_PortfolioRendering_CacheStable(t *testing.T) {
 		}
 	}
 }
+
+// TestBuildUser_CashKnownStates: known $0 renders as fully deployed (not the
+// "not provided" marker), unknown renders the marker, and fallback positions
+// without mark-to-market omit the P&L bucket (Codex #392).
+func TestBuildUser_CashKnownStates(t *testing.T) {
+	deployed := buildUser("HIMS", "1d", nil, Indicators{}, nil,
+		Portfolio{CashAvailable: 0, CashKnown: true, OpenPositions: []Position{
+			{Ticker: "HIMS", Side: "long", Quantity: 10, AvgCostBasis: 40}, // no mark-to-market
+		}}, "", nil, "")
+	if !strings.Contains(deployed, "≈$0 (fully deployed") {
+		t.Error("known $0 must render as fully deployed")
+	}
+	if strings.Contains(deployed, "not provided") {
+		t.Error("known $0 must not render the unknown-cash marker")
+	}
+	if strings.Contains(deployed, "unrealized≈") {
+		t.Error("position without mark-to-market must omit the P&L bucket")
+	}
+	unknown := buildUser("HIMS", "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+	if !strings.Contains(unknown, "not provided — do not assume zero") {
+		t.Error("unknown cash must render the explicit marker")
+	}
+}
