@@ -194,9 +194,16 @@ type PositionSummary struct {
 // ─── Phase 12 types ───────────────────────────────────────────────────────────
 
 // AnalystResult holds the outcome of one analyst model call (Phase 12).
+//
+// Role names the review angle in specialist mode ("fundamental", "technical",
+// "sentiment", "risk_manager"); it is empty for the default generalist ensemble.
+// It is persisted as part of ensemble_results so outcomes can later be sliced by
+// angle — previously the role survived only as a "[role]" text prefix inside the
+// reasoning, which was not queryable.
 type AnalystResult struct {
 	Provider  string
 	Model     string
+	Role      string
 	Response  AnalysisResponse
 	Meta      ModelCallMeta
 	Err       error

@@ -179,7 +179,8 @@ WITH base AS (
            CASE WHEN a.fast_pathed THEN 'fast_path'
                 WHEN a.arbiter_response IS NOT NULL THEN 'arbitrated'
                 ELSE 'consensus' END AS mode,
-           jsonb_array_length(a.ensemble_results) AS n_analysts
+           jsonb_array_length(a.ensemble_results) AS n_analysts,
+           a.ensemble_results AS ensemble
     FROM trades t
     JOIN signals s ON s.id = t.signal_id
     JOIN LATERAL (
@@ -240,6 +241,7 @@ type EntryPerformance struct {
 	ByStrategy     []EntryPerfBucket      `json:"by_strategy"`
 	ByDirection    []EntryPerfBucket      `json:"by_direction"`
 	ByAnalysts     []EntryPerfBucket      `json:"by_analysts"`
+	ByRole         []EntryPerfBucket      `json:"by_role"`
 	Concentration  EntryPerfConcentration `json:"concentration"`
 	ConfidenceGate float64                `json:"confidence_gate"`
 }
@@ -256,6 +258,59 @@ func entryBuckets(ctx context.Context, labelExpr, groupOrder string) ([]EntryPer
 		       round(sum(pnl)::numeric, 2)::float8,
 		       round(avg(conf)::numeric, 3)::float8
 		FROM base ` + groupOrder
+	rows, err := GetDB().Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EntryPerfBucket{}
+	for rows.Next() {
+		var b EntryPerfBucket
+		if err := rows.Scan(&b.Label, &b.N, &b.WinRatePct, &b.AvgPnLPct, &b.NetPnL, &b.AvgConf); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// entryRoleAccuracy measures each specialist review angle by whether its
+// directional call matched what actually happened — not the win rate of trades
+// it touched (in specialist mode all roles vote on every trade, so that would be
+// identical across roles). A role vote is "correct" when it backed the taken
+// side and the trade won, or dissented from the taken side and the trade did not
+// win. HOLD/WAIT abstentions are excluded. Empty until specialist mode has run:
+// the "Role" key only exists in ensemble_results written after that feature is
+// enabled (rows without it are filtered out here).
+func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
+	// Net and avg-P&L are deliberately NULL for role rows. Summing the executed
+	// trade's realized P&L against a role would misattribute it: a role that
+	// dissented from the taken side (said SELL, engine went long) would book the
+	// long's profit as if it were the role's own, so a wrong dissent could show
+	// positive "net". The role cut measures hit rate, not executed profitability
+	// (Codex #390). n + hit rate + avg confidence are the honest columns.
+	q := entryBaseCTE + `
+		SELECT v.role,
+		       count(*)::int,
+		       round(100.0 * avg(v.correct::int)::numeric, 1)::float8,
+		       NULL::float8,
+		       NULL::float8,
+		       round(avg(v.conf)::numeric, 3)::float8
+		FROM (
+		    SELECT elem->>'Role' AS role,
+		           (elem->'Response'->>'confidence')::float8 AS conf,
+		           CASE
+		               WHEN (CASE upper(elem->'Response'->>'action')
+		                          WHEN 'BUY' THEN 'long' WHEN 'SELL' THEN 'short' END) = b.dir
+		               THEN (b.pnl > 0)      -- role backed the taken side → right iff it worked
+		               ELSE (b.pnl <= 0)     -- role dissented → right iff it didn't work
+		           END AS correct
+		    FROM base b
+		    CROSS JOIN LATERAL jsonb_array_elements(b.ensemble) AS elem
+		    WHERE COALESCE(elem->>'Role', '') <> ''
+		      AND upper(elem->'Response'->>'action') IN ('BUY', 'SELL')
+		) v
+		GROUP BY 1 ORDER BY 3 DESC`
 	rows, err := GetDB().Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -322,6 +377,9 @@ func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 		return nil, err
 	}
 	if ep.ByAnalysts, err = entryBuckets(ctx, `n_analysts::text`, `GROUP BY 1 ORDER BY min(n_analysts)`); err != nil {
+		return nil, err
+	}
+	if ep.ByRole, err = entryRoleAccuracy(ctx); err != nil {
 		return nil, err
 	}
 

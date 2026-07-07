@@ -59,6 +59,7 @@ interface EntryPerformance {
   by_strategy: Bucket[];
   by_direction: Bucket[];
   by_analysts: Bucket[];
+  by_role: Bucket[];
   concentration: Concentration;
   confidence_gate: number;
 }
@@ -123,9 +124,11 @@ const MODE_LABELS: Record<string, string> = {
   arbitrated: 'Arbitrated',
   consensus: 'Consensus',
 };
-function prettyLabel(dim: 'mode' | 'strategy' | 'direction' | 'analysts', raw: string): string {
+type Dim = 'mode' | 'strategy' | 'direction' | 'analysts' | 'role';
+function prettyLabel(dim: Dim, raw: string): string {
   if (dim === 'mode') return MODE_LABELS[raw] ?? raw;
   if (dim === 'analysts') return `${raw} analyst${raw === '1' ? '' : 's'}`;
+  if (dim === 'role') { const s = raw.replace(/_/g, ' '); return s.charAt(0).toUpperCase() + s.slice(1); }
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
@@ -152,29 +155,41 @@ function ConfTooltip({ active, payload }: TooltipProps) {
 
 /* ── Breakdown table ─────────────────────────────────────────────────────────── */
 
+const DIM_HEADER: Record<Dim, string> = {
+  mode: 'Decision mode', strategy: 'Strategy', direction: 'Direction', analysts: 'Analysts', role: 'Analyst role',
+};
+
 function BreakdownTable({
-  title, caption, rows, dim, highlightBest,
+  title, caption, rows, dim, highlightBest, emptyMsg,
 }: {
   title: string;
   caption: string;
   rows: Bucket[];
-  dim: 'mode' | 'strategy' | 'direction' | 'analysts';
+  dim: Dim;
   highlightBest?: boolean;
+  emptyMsg?: string;
 }) {
   // Meter scaled to a 70% ceiling so the ~60% max reads near-full without implying 100%.
   const bestLabel = highlightBest && rows.length
     ? rows.reduce((a, b) => (b.win_rate_pct > a.win_rate_pct ? b : a)).label
     : null;
+  const winHeader = dim === 'role' ? 'Hit rate' : 'Win rate';
+  // Net is omitted for roles: attributing the executed trade's P&L to a role
+  // that may have dissented would be misleading (Codex #390).
+  const showNet = dim !== 'role';
   return (
     <CornerCard bracketColor="var(--border)" className={styles.tableCard}>
       <div className={styles.tableTitle}>{title}</div>
+      {rows.length === 0 ? (
+        <p className={styles.emptyState}>{emptyMsg ?? 'No data yet.'}</p>
+      ) : (
       <table className={styles.table}>
         <thead>
           <tr>
-            <th>{dim === 'mode' ? 'Decision mode' : dim === 'strategy' ? 'Strategy' : dim === 'direction' ? 'Direction' : 'Analysts'}</th>
+            <th>{DIM_HEADER[dim]}</th>
             <th className={styles.num}>n</th>
-            <th className={styles.win}>Win rate</th>
-            <th className={styles.num}>Net</th>
+            <th className={styles.win}>{winHeader}</th>
+            {showNet && <th className={styles.num}>Net</th>}
           </tr>
         </thead>
         <tbody>
@@ -193,11 +208,12 @@ function BreakdownTable({
                   <span className={styles.meterNum}>{fmtPct(r.win_rate_pct)}</span>
                 </span>
               </td>
-              <td className={`${styles.num} ${pnlClass(r.net_pnl)}`}>{fmtUsd(r.net_pnl)}</td>
+              {showNet && <td className={`${styles.num} ${pnlClass(r.net_pnl)}`}>{fmtUsd(r.net_pnl)}</td>}
             </tr>
           ))}
         </tbody>
       </table>
+      )}
       <p className={styles.caption}>{caption}</p>
     </CornerCard>
   );
@@ -366,6 +382,14 @@ export default function Performance() {
             <BreakdownTable
               title="By analyst count" dim="analysts" rows={data.by_analysts}
               caption="Almost every entry runs the 3-analyst ensemble — too little variance to compare depth retroactively."
+            />
+          </div>
+
+          <div className={styles.roleSection}>
+            <BreakdownTable
+              title="By analyst role — specialist mode" dim="role" rows={data.by_role} highlightBest
+              emptyMsg="No role-tagged trades yet. Enable specialist mode (analysis.specialist_mode_enabled) — once it produces closed trades, each angle's hit rate appears here."
+              caption="Hit rate = how often the angle's directional call matched the outcome: right when it backed the taken side and the trade won, or dissented and the trade lost (HOLD/WAIT abstentions excluded). Populates only under specialist mode."
             />
           </div>
 

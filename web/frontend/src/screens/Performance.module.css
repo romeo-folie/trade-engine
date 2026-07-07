@@ -226,6 +226,18 @@
 .table td.pos { color: var(--emerald); }
 .table td.neg { color: var(--red); }
 
+.roleSection { margin-bottom: var(--space-5); }
+.emptyState {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+  line-height: 1.6;
+  margin: var(--space-2) 0;
+  padding: var(--space-3);
+  border: 1px dashed var(--border-muted);
+  border-radius: 4px;
+}
+
 .footNote {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
