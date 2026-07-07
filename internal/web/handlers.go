@@ -39,6 +39,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/signals/recent", s.handleRecentSignals)
 	mux.HandleFunc("/api/trades/recent", s.handleRecentTrades)
 	mux.HandleFunc("/api/analyses/recent", s.handleRecentAnalyses)
+	mux.HandleFunc("/api/analyses/entry-performance", s.handleEntryPerformance)
 	mux.HandleFunc("/api/analyses/", s.handleAnalysisDetail) // /api/analyses/{id}
 	mux.HandleFunc("/api/backtests/runs", s.handleBacktestRuns)
 	mux.HandleFunc("/api/backtests/runs/", s.handleBacktestRunDetail)
@@ -756,6 +757,38 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{"model_performance": perf})
+}
+
+// GET /api/analyses/entry-performance
+//
+// Signal-provenance study: every closed equity entry joined back to the
+// analysis that produced it, sliced by confidence band, decision mode
+// (fast-path / arbitrated / consensus), strategy, direction and analyst count.
+// Read-only. confidence_gate is the live risk.confidence_threshold so the UI can
+// mark the entry gate on the confidence chart.
+func (s *Server) handleEntryPerformance(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	perf, err := store.GetEntryPerformance(ctx)
+	if err != nil {
+		apiError(w, "entry performance query failed", err)
+		return
+	}
+	// Source the entry gate from the Server's loaded config, not the global
+	// config.Get() — the standalone `te web` process never calls config.Load(),
+	// so the global panics there. engineCfg is populated by `te run`; when it is
+	// absent we fall back to the documented default so the chart still marks a
+	// meaningful gate.
+	perf.ConfidenceGate = 0.68
+	if s.engineCfg != nil {
+		perf.ConfidenceGate = s.engineCfg.Risk.ConfidenceThreshold
+	}
+	jsonResponse(w, perf)
 }
 
 // signalWithAnalysts enriches a Signal with analyst routing data.

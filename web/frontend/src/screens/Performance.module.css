@@ -1,0 +1,236 @@
+/* Performance screen — signal-provenance study. Mirrors Trades/Portfolio
+   conventions: canvas bg, mono figures, chamfered CornerCards, acid-green accent
+   with emerald/red semantics. */
+
+.screen {
+  width: 100%;
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--canvas-bg);
+  padding: var(--space-6);
+}
+
+/* ── Header ─────────────────────────────────────────────────────────────────── */
+
+.headerRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+.breadcrumb {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  letter-spacing: 0.05em;
+}
+.breadcrumbBrand { color: var(--accent); font-weight: 800; font-size: 1.15em; letter-spacing: 0.1em; }
+.breadcrumbPage { color: var(--text-dim); }
+.autoRefresh {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-dim);
+}
+.greenDot { width: 8px; height: 8px; border-radius: 50%; background: var(--emerald); flex-shrink: 0; }
+
+.pageTitle {
+  font-family: var(--font-display);
+  font-size: var(--font-size-2xl);
+  font-weight: 900;
+  color: var(--text-primary);
+  margin: 0 0 var(--space-2) 0;
+  letter-spacing: 0.05em;
+}
+.subtitle {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-md);
+  color: var(--text-muted);
+  max-width: 78ch;
+  margin: 0 0 var(--space-5) 0;
+  line-height: 1.5;
+}
+.subDim { font-family: var(--font-mono); font-size: var(--font-size-sm); color: var(--text-dim); }
+
+.banner {
+  width: 100%;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  padding: var(--space-4) 0;
+}
+
+/* ── Concentration warning ──────────────────────────────────────────────────── */
+
+.warnCard {
+  background: var(--card-bg);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+.warnTag {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--amber);
+  border: 1px solid var(--amber);
+  padding: 2px 7px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.warnText { font-family: var(--font-sans); font-size: var(--font-size-md); color: var(--text-muted); line-height: 1.5; }
+.warnText strong { color: var(--amber); font-weight: 700; }
+
+/* ── Summary KPIs ───────────────────────────────────────────────────────────── */
+
+.summaryRow {
+  display: flex;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+.summaryCard {
+  background: var(--card-bg);
+  padding: var(--space-3) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 140px;
+}
+.summaryLabel {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+}
+.summaryValue {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-stat);
+  font-weight: 700;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+.summaryFoot {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+
+/* ── Chart card ─────────────────────────────────────────────────────────────── */
+
+.chartCard { background: var(--card-bg); padding: var(--space-4) var(--space-4) var(--space-3); margin-bottom: var(--space-5); }
+.chartWrap { width: 100%; height: 260px; }
+
+.tableTitle {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  margin-bottom: var(--space-3);
+}
+
+.legendRow { display: flex; gap: var(--space-5); margin: var(--space-2) 0 0; padding-left: var(--space-4); }
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-dim);
+}
+.swatchDead, .swatchEdge, .swatchMixed { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.swatchDead { background: var(--red); opacity: 0.55; }
+.swatchEdge { background: var(--emerald); }
+.swatchMixed { background: var(--amber); opacity: 0.75; }
+
+.caption {
+  font-family: var(--font-sans);
+  font-size: var(--font-size-base);
+  color: var(--text-dim);
+  line-height: 1.5;
+  margin: var(--space-3) 0 0;
+}
+
+/* ── Tooltip ────────────────────────────────────────────────────────────────── */
+
+.tooltip {
+  background: var(--card-bg-alt);
+  border: 1px solid var(--border);
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+.tooltipHead { color: var(--accent); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 2px; }
+.tooltipKey { color: var(--text-dim); display: inline-block; min-width: 62px; }
+
+/* ── Breakdown tables ───────────────────────────────────────────────────────── */
+
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+}
+@media (max-width: 760px) { .grid2 { grid-template-columns: 1fr; } }
+
+.tableCard { background: var(--card-bg); padding: var(--space-4); }
+
+.table { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: var(--font-size-md); }
+.table th {
+  font-size: var(--font-size-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  font-weight: 500;
+  text-align: left;
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border);
+}
+.table td {
+  color: var(--text-primary);
+  padding: var(--space-2) var(--space-2);
+  border-bottom: 1px solid var(--border-muted);
+  font-variant-numeric: tabular-nums;
+}
+.table tr:last-child td { border-bottom: none; }
+.table td:first-child { font-family: var(--font-sans); }
+
+.num { text-align: right; }
+.win { width: 46%; }
+
+/* Win-rate meter */
+.meter { display: flex; align-items: center; gap: var(--space-2); }
+.meterTrack { flex: 1; height: 6px; border-radius: 3px; background: var(--card-bg-alt); overflow: hidden; min-width: 40px; }
+.meterFill { display: block; height: 100%; border-radius: 3px; background: var(--accent); }
+.meterNum { min-width: 42px; text-align: right; color: var(--text-primary); }
+
+.bestRow td:first-child { color: var(--accent); }
+
+/* P&L coloring — scope cell rules to `.table td.<x>` so they beat the base
+   `.table td { color: var(--text-primary) }` specificity (see PositionsTable). */
+.pos { color: var(--emerald); }
+.neg { color: var(--red); }
+.table td.pos { color: var(--emerald); }
+.table td.neg { color: var(--red); }
+
+.footNote {
+  font-family: var(--font-mono);
+  font-size: var(--font-size-xs);
+  color: var(--text-faint);
+  line-height: 1.6;
+  margin: 0;
+  max-width: 90ch;
+}

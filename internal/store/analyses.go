@@ -146,6 +146,202 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 	return out, rows.Err()
 }
 
+// ── Entry performance (signal-provenance study) ──────────────────────────────
+//
+// These functions power the Performance screen: every closed equity trade
+// joined back to the analysis that produced it (trades → signals.analysis_ids →
+// analyses), then sliced by how the signal was made — confidence, decision mode
+// (fast-path / arbitrated / consensus), strategy, direction and analyst count.
+// ORB/forex live in orb_trades and are excluded by construction (they never
+// carry a signal_id into `signals`).
+//
+// Win rate is defined once, everywhere: wins / all-closed × 100, with
+// break-even (pnl = 0) trades kept in the denominator. The patched
+// GetPortfolioStats uses the same definition so the two surfaces agree.
+
+// entryBaseCTE is the shared join — exactly one row per closed trade. `mode`
+// collapses the three provenance states (fast_pathed, arbiter_response present,
+// neither) into one label; note that "arbitrated" is NOT simply the negation of
+// "fast-path" — a signal can be neither (analysts agreed but not flagged
+// fast-path).
+//
+// A signal's analysis_ids is an array (a signal can be produced by more than one
+// analysis). We must attribute each trade to a single analysis or a multi-
+// analysis signal would duplicate its trade across every count(*)/sum(pnl)/top-N
+// below. The LATERAL … LIMIT 1 picks the most recent analysis per signal
+// deterministically (created_at DESC, id tie-break), mirroring the DISTINCT ON
+// (s.id) attribution used by the analyst batch path.
+const entryBaseCTE = `
+WITH base AS (
+    SELECT t.ticker, t.direction::text AS dir, t.strategy,
+           t.pnl::float8 AS pnl, t.pnl_pct::float8 AS pnl_pct, t.opened_at,
+           a.confidence::float8 AS conf,
+           CASE WHEN a.fast_pathed THEN 'fast_path'
+                WHEN a.arbiter_response IS NOT NULL THEN 'arbitrated'
+                ELSE 'consensus' END AS mode,
+           jsonb_array_length(a.ensemble_results) AS n_analysts
+    FROM trades t
+    JOIN signals s ON s.id = t.signal_id
+    JOIN LATERAL (
+        SELECT a.confidence, a.fast_pathed, a.arbiter_response, a.ensemble_results
+        FROM unnest(s.analysis_ids) AS aid
+        JOIN analyses a ON a.id = aid
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT 1
+    ) a ON true
+    WHERE t.status = 'closed' AND t.pnl IS NOT NULL
+)`
+
+// EntryPerfOverall is the headline row across all closed equity entries.
+type EntryPerfOverall struct {
+	N            int      `json:"n"`
+	Wins         int      `json:"wins"`
+	Losses       int      `json:"losses"`
+	Breakeven    int      `json:"breakeven"`
+	WinRatePct   float64  `json:"win_rate_pct"`
+	AvgPnLPct    *float64 `json:"avg_pnl_pct"`
+	MedianPnLPct *float64 `json:"median_pnl_pct"`
+	NetPnL       *float64 `json:"net_pnl"`
+	AvgConf      *float64 `json:"avg_conf"`
+	WindowStart  *string  `json:"window_start"`
+	WindowEnd    *string  `json:"window_end"`
+}
+
+// EntryPerfBucket is one row of any breakdown (confidence band, decision mode,
+// strategy, direction, analyst count). `Label` carries the group key.
+type EntryPerfBucket struct {
+	Label      string   `json:"label"`
+	N          int      `json:"n"`
+	WinRatePct float64  `json:"win_rate_pct"`
+	AvgPnLPct  *float64 `json:"avg_pnl_pct"`
+	NetPnL     *float64 `json:"net_pnl"`
+	AvgConf    *float64 `json:"avg_conf"`
+}
+
+// EntryPerfConcentration surfaces how top-heavy the P&L is — at small samples a
+// single trade can carry the whole book, so the UI must warn rather than imply
+// broad edge.
+type EntryPerfConcentration struct {
+	NetPnL      *float64 `json:"net_pnl"`
+	Top3PnL     *float64 `json:"top3_pnl"`
+	TopTicker   *string  `json:"top_ticker"`
+	TopStrategy *string  `json:"top_strategy"`
+	TopPnL      *float64 `json:"top_pnl"`
+	TopPnLPct   *float64 `json:"top_pnl_pct"`
+	TopConf     *float64 `json:"top_conf"`
+}
+
+// EntryPerformance is the full payload for the Performance screen. ConfidenceGate
+// is filled by the handler from live config (risk.confidence_threshold).
+type EntryPerformance struct {
+	Overall        EntryPerfOverall       `json:"overall"`
+	ByConfidence   []EntryPerfBucket      `json:"by_confidence"`
+	ByMode         []EntryPerfBucket      `json:"by_mode"`
+	ByStrategy     []EntryPerfBucket      `json:"by_strategy"`
+	ByDirection    []EntryPerfBucket      `json:"by_direction"`
+	ByAnalysts     []EntryPerfBucket      `json:"by_analysts"`
+	Concentration  EntryPerfConcentration `json:"concentration"`
+	ConfidenceGate float64                `json:"confidence_gate"`
+}
+
+// entryBuckets runs one grouped breakdown over the shared base CTE. labelExpr is
+// the SQL projected as the group label; groupOrder is the GROUP BY … ORDER BY …
+// tail. Callers pass trusted, constant SQL fragments only (never user input).
+func entryBuckets(ctx context.Context, labelExpr, groupOrder string) ([]EntryPerfBucket, error) {
+	q := entryBaseCTE + `
+		SELECT ` + labelExpr + ` AS label,
+		       count(*)::int,
+		       COALESCE(round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1), 0)::float8,
+		       round(avg(pnl_pct)::numeric, 2)::float8,
+		       round(sum(pnl)::numeric, 2)::float8,
+		       round(avg(conf)::numeric, 3)::float8
+		FROM base ` + groupOrder
+	rows, err := GetDB().Query(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []EntryPerfBucket{}
+	for rows.Next() {
+		var b EntryPerfBucket
+		if err := rows.Scan(&b.Label, &b.N, &b.WinRatePct, &b.AvgPnLPct, &b.NetPnL, &b.AvgConf); err != nil {
+			return nil, err
+		}
+		out = append(out, b)
+	}
+	return out, rows.Err()
+}
+
+// GetEntryPerformance assembles the full signal-provenance breakdown. Each cut
+// re-runs the (cheap, ~100-row) base join; correctness beats a single monster
+// query here.
+func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
+	var ep EntryPerformance
+
+	// Overall headline.
+	overallQ := entryBaseCTE + `
+		SELECT count(*)::int,
+		       count(*) FILTER (WHERE pnl > 0)::int,
+		       count(*) FILTER (WHERE pnl < 0)::int,
+		       count(*) FILTER (WHERE pnl = 0)::int,
+		       COALESCE(round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1), 0)::float8,
+		       round(avg(pnl_pct)::numeric, 2)::float8,
+		       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct))::numeric, 2)::float8,
+		       round(sum(pnl)::numeric, 2)::float8,
+		       round(avg(conf)::numeric, 3)::float8,
+		       min(opened_at)::date::text,
+		       max(opened_at)::date::text
+		FROM base`
+	o := &ep.Overall
+	if err := GetDB().QueryRow(ctx, overallQ).Scan(
+		&o.N, &o.Wins, &o.Losses, &o.Breakeven, &o.WinRatePct,
+		&o.AvgPnLPct, &o.MedianPnLPct, &o.NetPnL, &o.AvgConf,
+		&o.WindowStart, &o.WindowEnd,
+	); err != nil {
+		return nil, err
+	}
+
+	var err error
+	confLabel := `CASE WHEN conf < 0.60 THEN '<0.60'
+	                   WHEN conf < 0.68 THEN '0.60-0.68'
+	                   WHEN conf < 0.75 THEN '0.68-0.75'
+	                   WHEN conf < 0.85 THEN '0.75-0.85'
+	                   ELSE '>=0.85' END`
+	if ep.ByConfidence, err = entryBuckets(ctx, confLabel, `GROUP BY 1 ORDER BY min(conf)`); err != nil {
+		return nil, err
+	}
+	// ORDER BY 3 = the win-rate column (3rd in the SELECT list); ordering by an
+	// output alias isn't available since only `label` is named.
+	if ep.ByMode, err = entryBuckets(ctx, `mode`, `GROUP BY 1 ORDER BY 3 DESC`); err != nil {
+		return nil, err
+	}
+	if ep.ByStrategy, err = entryBuckets(ctx, `strategy`, `GROUP BY 1 ORDER BY 3 DESC`); err != nil {
+		return nil, err
+	}
+	if ep.ByDirection, err = entryBuckets(ctx, `dir`, `GROUP BY 1 ORDER BY 1`); err != nil {
+		return nil, err
+	}
+	if ep.ByAnalysts, err = entryBuckets(ctx, `n_analysts::text`, `GROUP BY 1 ORDER BY min(n_analysts)`); err != nil {
+		return nil, err
+	}
+
+	// Concentration: net, top-3 sum, and the single largest winner.
+	concQ := entryBaseCTE + `
+		SELECT (SELECT round(sum(pnl)::numeric, 2)::float8 FROM base),
+		       (SELECT round(sum(pnl)::numeric, 2)::float8 FROM (SELECT pnl FROM base ORDER BY pnl DESC LIMIT 3) x),
+		       top.ticker, top.strategy,
+		       round(top.pnl::numeric, 2)::float8, round(top.pnl_pct::numeric, 2)::float8, round(top.conf::numeric, 3)::float8
+		FROM (SELECT ticker, strategy, pnl, pnl_pct, conf FROM base ORDER BY pnl DESC LIMIT 1) top`
+	c := &ep.Concentration
+	if err := GetDB().QueryRow(ctx, concQ).Scan(
+		&c.NetPnL, &c.Top3PnL, &c.TopTicker, &c.TopStrategy, &c.TopPnL, &c.TopPnLPct, &c.TopConf,
+	); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, err
+	}
+
+	return &ep, nil
+}
+
 // GetAnalysesByTicker retrieves the most recent `limit` analyses for a ticker.
 func GetAnalysesByTicker(ctx context.Context, ticker string, limit int) ([]StoredAnalysis, error) {
 	q := `

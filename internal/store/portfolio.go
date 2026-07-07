@@ -438,11 +438,13 @@ type PortfolioStats struct {
 // GetPortfolioStats calculates aggregate performance metrics from all daily summaries.
 func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
 	var stats PortfolioStats
-	var totalWins, totalLosses int
 	var grossProfit, grossLoss float64
 
+	// Best/worst day and profit factor stay sourced from the daily rollup —
+	// they are inherently day-level. Win rate and trade count are recomputed
+	// from the ledger below.
 	rows, err := GetDB().Query(ctx, `
-		SELECT wins, losses, pnl
+		SELECT pnl
 		FROM daily_summaries`)
 	if err != nil {
 		return nil, err
@@ -450,14 +452,10 @@ func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
 	defer rows.Close()
 
 	for rows.Next() {
-		var w, l int
 		var pnl float64
-		if err := rows.Scan(&w, &l, &pnl); err != nil {
+		if err := rows.Scan(&pnl); err != nil {
 			return nil, err
 		}
-		totalWins += w
-		totalLosses += l
-		stats.TotalTrades += (w + l)
 		if pnl > 0 {
 			grossProfit += pnl
 			if pnl > stats.BestDayPnl {
@@ -471,8 +469,23 @@ func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
 		}
 	}
 
-	if stats.TotalTrades > 0 {
-		stats.WinRatePct = float64(totalWins) / float64(stats.TotalTrades) * 100
+	// Win rate and trade count come straight from the trades ledger, not from
+	// summing daily_summaries. The daily rollup freezes each day's win/loss
+	// counts when it is written, so it drops trades that close after the final
+	// upsert and never absorbs the retroactive pnl corrections made by the
+	// broker-truth reconcilers (#359, #383) — leaving it a point or two low and
+	// drifting. Counting the ledger directly is stable and correct, and matches
+	// the Performance screen (GetEntryPerformance). Definition: wins / all-closed
+	// × 100, break-even (pnl = 0) kept in the denominator.
+	var ledgerWins, ledgerTotal int
+	if err := GetDB().QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE pnl > 0), count(*)
+		FROM trades WHERE status = 'closed' AND pnl IS NOT NULL`).Scan(&ledgerWins, &ledgerTotal); err != nil {
+		return nil, err
+	}
+	stats.TotalTrades = ledgerTotal
+	if ledgerTotal > 0 {
+		stats.WinRatePct = float64(ledgerWins) / float64(ledgerTotal) * 100
 	}
 	if grossLoss > 0 {
 		stats.ProfitFactor = grossProfit / grossLoss
