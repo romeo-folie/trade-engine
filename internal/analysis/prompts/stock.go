@@ -61,6 +61,25 @@ type SimilarPastSetup struct {
 	TradeOutcomePct *float64
 }
 
+// ─── Shared calibration blocks ────────────────────────────────────────────────
+
+// ConfidenceAnchors gives the confidence scale semantic meaning. Live outcome
+// data (89 closed trades, Mar–Jul 2026) showed win rate rises monotonically
+// with confidence (24% below 0.60 → 60% at 0.75–0.85) — the models' relative
+// calibration is real — but with no anchors defined, scores clustered in a
+// 0.55–0.68 hedge band and nothing ever scored ≥0.85. Anchors + an explicit
+// anti-hedging rule push models to commit rather than default to the middle.
+//
+// Deliberately does NOT mention the engine's entry threshold: teaching the
+// gate would inflate every score to just above it and destroy the calibration
+// signal the gate depends on.
+const ConfidenceAnchors = `CONFIDENCE CALIBRATION:
+- 0.50 = coin flip — no discernible edge. Pair with HOLD/WAIT.
+- 0.60 = weak edge — one supporting factor; others neutral or mixed.
+- 0.70 = clear edge — multiple independent factors align (e.g. trend + volume + catalyst).
+- 0.80+ = exceptional — rare; reserve for overwhelming multi-factor confluence.
+- Commit to a view. Do not hedge into the 0.60–0.65 band by default: if the setup is real, score it accordingly; if it is not, score it below 0.60.`
+
 // ─── Prompt builder ───────────────────────────────────────────────────────────
 
 // BuildStockPrompt returns (systemPrompt, userMessage) for a stock analysis request.
@@ -116,8 +135,11 @@ RULES:
 - confidence must be between 0.0 and 1.0.
 - size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
 - Do not output markdown, explanations, or any text outside the JSON object.
+- If data is insufficient, return HOLD with low confidence.
 - Never recommend size_pct > 0 for a HOLD or WAIT action.
 - Focus on short/medium timeframe signals (1H, 4H candles) over daily trend context.
+
+%s
 
 ENTRY DECISION GUIDE:
 - BUY: momentum is intact, price is consolidating or pulling back cleanly, volume confirms, risk/reward >= 1.2:1 with a clear stop below recent structure.
@@ -127,9 +149,39 @@ ENTRY DECISION GUIDE:
 
 R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
 
-SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.`, strategy)
+SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.`, strategy, ConfidenceAnchors)
 }
 
+// strategyGuidance returns a strategy-specific decision block appended to the
+// generalist system prompt. Before this, the strategy name interpolation was
+// the ONLY strategy-specific content — notably for news_sentiment, which
+// produced 2/3 of all closed trades at a 25% win rate. Its worst losers
+// (OPTU −26%, SBET −20%, TE −15%) were longs chasing catalysts after the move:
+// the guidance below targets exactly that failure mode. Language mirrors the
+// dormant sentiment specialist prompt in roles.go, which already had it right.
+func strategyGuidance(strategy string) string {
+	switch strategy {
+	case "news_sentiment":
+		return `
+
+STRATEGY GUIDANCE — news_sentiment:
+- Your edge is FRESHNESS: a catalyst under ~24h old that price has not yet fully absorbed. A bullish two-day-old headline is not a fresh signal.
+- If price has already gapped or moved materially since the headline published, the edge is gone — HOLD. Do not chase a move that already happened; late entries on stale catalysts are this strategy's primary historical failure mode.
+- Sentiment must be CONFIRMED by the price/volume response, not assumed from the headline alone. A bullish headline with flat or fading volume is a warning, not an entry.
+- Weigh source credibility: multiple independent credible sources beat one aggregator restating the same item.`
+	default:
+		return ""
+	}
+}
+
+// buildSystem returns the generalist analyst system prompt.
+//
+// NOTE on the performance-context ceiling: the "<45% win rate → confidence
+// ceiling 0.65" rule sits BELOW risk.confidence_threshold (0.68 as of
+// 2026-07-07), so a ceilinged ticker is deliberately hard-blocked from new
+// entries — not merely penalized. This is intentional (the one ticker
+// currently qualifying, SBET, ran 20% over 5 trades); revisit the ceiling if
+// the gate ever moves.
 func buildSystem(strategy string) string {
 	return fmt.Sprintf(`You are a disciplined quantitative trading analyst running the "%s" strategy.
 
@@ -154,7 +206,7 @@ RULES:
 - Never recommend size_pct > 0 for a HOLD or WAIT action.
 - Use HOLD when there is no meaningful catalyst or setup worth tracking.
 - Use WAIT ONLY when you can name a specific, concrete blocker preventing
-  entry on this cycle. Acceptable blockers are factual: "price is %%.2f above
+  entry on this cycle. Acceptable blockers are factual: "price is $2.40 above
   the named resistance at $X with no pullback printed", "earnings release in
   under 4 hours", "gap >20%% with zero intraday range and no volume
   confirmation". Vague language ("timing feels off", "wait for clarity",
@@ -165,8 +217,10 @@ RULES:
   structured with a defined stop and target. You do not need perfect timing.
 - R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.
 
+%s
+
 USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trades in last 30 days):
-- Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup.
+- Ticker win rate < 45%%: your confidence ceiling is 0.65 regardless of the technical setup. This is intentionally restrictive — a ticker with a demonstrated losing record must sit out until its record improves; do not stretch the score to rescue the setup.
 - Ticker win rate >= 65%%: full confidence range (0.0–1.0) is available.
 - Ticker win rate 45%%–65%%: no constraint — use your normal judgment.
 - Ticker avg PnL is negative: lower your confidence by 0.05–0.10 but still propose BUY/SELL if the setup is otherwise sound. Do not use this as a blanket reason to WAIT.
@@ -174,7 +228,7 @@ USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trad
 USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
 - If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
-- Entries marked "outcome unknown" carry no weight.`, strategy)
+- Entries marked "outcome unknown" carry no weight.%s`, strategy, ConfidenceAnchors, strategyGuidance(strategy))
 }
 
 func buildUser(
@@ -191,6 +245,12 @@ func buildUser(
 
 	// Market data section
 	b.WriteString(fmt.Sprintf("## TICKER: %s | TIMEFRAME: %s\n\n", ticker, timeframe))
+	// The R:R self-filter in every system prompt computes against
+	// "signal_price", which was otherwise never supplied — models had to guess
+	// it meant the latest close. Define it explicitly.
+	if len(candles) > 0 {
+		b.WriteString(fmt.Sprintf("CURRENT PRICE (latest close): %.2f — use this as signal_price in the R:R self-filter.\n\n", candles[0].Close))
+	}
 	b.WriteString("### RECENT OHLCV (most recent first)\n")
 	b.WriteString("Timestamp            | Open    | High    | Low     | Close   | Volume      | VWAP\n")
 	b.WriteString("---------------------|---------|---------|---------|---------|-------------|--------\n")
@@ -218,13 +278,11 @@ func buildUser(
 	b.WriteString(fmt.Sprintf("VWAP:                  %.2f\n", ind.VWAP))
 	b.WriteString(fmt.Sprintf("Volume SMA20 / ratio:  %.0f / %.2fx\n", ind.VolSMA20, ind.VolRatio))
 
-	// Portfolio context section
+	// Portfolio context section. Always print the actual cash figure — the old
+	// "(not yet available — Phase 4)" placeholder fired on any cash <= 0, telling
+	// the model data was missing when the account may simply be fully invested.
 	b.WriteString("\n### PORTFOLIO CONTEXT\n")
-	if portfolio.CashAvailable > 0 {
-		b.WriteString(fmt.Sprintf("Cash available: $%.2f\n", portfolio.CashAvailable))
-	} else {
-		b.WriteString("Cash available: (not yet available — Phase 4)\n")
-	}
+	b.WriteString(fmt.Sprintf("Cash available: $%.2f\n", portfolio.CashAvailable))
 	if len(portfolio.OpenPositions) > 0 {
 		b.WriteString("Open positions:\n")
 		for _, p := range portfolio.OpenPositions {

@@ -17,12 +17,22 @@ import "fmt"
 // downgraded to WAIT at the source and never reach the gate).
 const rrSelfFilter = `R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_price); risk = abs(signal_price - stop_loss); R:R = reward / risk. If R:R < 1.2, widen the take_profit toward the next structural target, or tighten the stop_loss to nearer structure — do not propose entry below 1.2. Only emit BUY if R:R >= 1.2.`
 
+// RRSelfFilter exposes the verbatim R:R sentence for prompts built outside this
+// package (the arbiter in internal/analysis/ensemble.go).
+const RRSelfFilter = rrSelfFilter
+
 // roleOutputSchema is the shared JSON-schema block all role prompts emit.
+//
+// NB: this const is substituted via a %s verb (an argument, not a format
+// string), so percent signs must be SINGLE here — the previous double-escaped
+// `%%` rendered literally as "%%" in the prompts the specialist models saw.
+// It ends with the shared ConfidenceAnchors block (stock.go) so every role
+// scores on the same calibrated scale.
 const roleOutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
 {
   "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence":  <float 0.0–1.0>,
-  "size_pct":    <float, recommended position size as %% of portfolio>,
+  "size_pct":    <float, recommended position size as % of portfolio>,
   "stop_loss":   <float price, or 0 if HOLD/WAIT>,
   "take_profit": <float price, or 0 if HOLD/WAIT>,
   "reasoning":   "<concise explanation referencing specific data points>"
@@ -31,9 +41,11 @@ const roleOutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON objec
 RULES:
 - action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
 - confidence must be between 0.0 and 1.0.
-- size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
+- size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
 - Do not output markdown, explanations, or any text outside the JSON object.
-- Never recommend size_pct > 0 for a HOLD or WAIT action.`
+- Never recommend size_pct > 0 for a HOLD or WAIT action.
+
+` + ConfidenceAnchors
 
 // buildFundamentalSystem returns the specialist prompt for the fundamental analyst.
 // Focus: earnings, catalysts, sector context, business quality. Downweights
