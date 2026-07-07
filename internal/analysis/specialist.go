@@ -183,6 +183,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		analystResults = append(analystResults, AnalystResult{
 			Provider:  r.Meta.Provider,
 			Model:     r.Meta.Model,
+			Role:      r.Role,
 			Response:  r.Response,
 			Meta:      r.Meta,
 			Err:       r.Err,
