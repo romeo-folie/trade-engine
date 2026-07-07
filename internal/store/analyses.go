@@ -283,16 +283,21 @@ func entryBuckets(ctx context.Context, labelExpr, groupOrder string) ([]EntryPer
 // the "Role" key only exists in ensemble_results written after that feature is
 // enabled (rows without it are filtered out here).
 func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
+	// Net and avg-P&L are deliberately NULL for role rows. Summing the executed
+	// trade's realized P&L against a role would misattribute it: a role that
+	// dissented from the taken side (said SELL, engine went long) would book the
+	// long's profit as if it were the role's own, so a wrong dissent could show
+	// positive "net". The role cut measures hit rate, not executed profitability
+	// (Codex #390). n + hit rate + avg confidence are the honest columns.
 	q := entryBaseCTE + `
 		SELECT v.role,
 		       count(*)::int,
 		       round(100.0 * avg(v.correct::int)::numeric, 1)::float8,
 		       NULL::float8,
-		       round(sum(v.pnl)::numeric, 2)::float8,
+		       NULL::float8,
 		       round(avg(v.conf)::numeric, 3)::float8
 		FROM (
-		    SELECT b.pnl,
-		           elem->>'Role' AS role,
+		    SELECT elem->>'Role' AS role,
 		           (elem->'Response'->>'confidence')::float8 AS conf,
 		           CASE
 		               WHEN (CASE upper(elem->'Response'->>'action')

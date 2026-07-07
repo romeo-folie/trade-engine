@@ -174,6 +174,9 @@ function BreakdownTable({
     ? rows.reduce((a, b) => (b.win_rate_pct > a.win_rate_pct ? b : a)).label
     : null;
   const winHeader = dim === 'role' ? 'Hit rate' : 'Win rate';
+  // Net is omitted for roles: attributing the executed trade's P&L to a role
+  // that may have dissented would be misleading (Codex #390).
+  const showNet = dim !== 'role';
   return (
     <CornerCard bracketColor="var(--border)" className={styles.tableCard}>
       <div className={styles.tableTitle}>{title}</div>
@@ -186,7 +189,7 @@ function BreakdownTable({
             <th>{DIM_HEADER[dim]}</th>
             <th className={styles.num}>n</th>
             <th className={styles.win}>{winHeader}</th>
-            <th className={styles.num}>Net</th>
+            {showNet && <th className={styles.num}>Net</th>}
           </tr>
         </thead>
         <tbody>
@@ -205,7 +208,7 @@ function BreakdownTable({
                   <span className={styles.meterNum}>{fmtPct(r.win_rate_pct)}</span>
                 </span>
               </td>
-              <td className={`${styles.num} ${pnlClass(r.net_pnl)}`}>{fmtUsd(r.net_pnl)}</td>
+              {showNet && <td className={`${styles.num} ${pnlClass(r.net_pnl)}`}>{fmtUsd(r.net_pnl)}</td>}
             </tr>
           ))}
         </tbody>
