@@ -278,11 +278,18 @@ func buildUser(
 	b.WriteString(fmt.Sprintf("VWAP:                  %.2f\n", ind.VWAP))
 	b.WriteString(fmt.Sprintf("Volume SMA20 / ratio:  %.0f / %.2fx\n", ind.VolSMA20, ind.VolRatio))
 
-	// Portfolio context section. Always print the actual cash figure — the old
-	// "(not yet available — Phase 4)" placeholder fired on any cash <= 0, telling
-	// the model data was missing when the account may simply be fully invested.
+	// Portfolio context section. The live engine still passes an empty
+	// PortfolioContext (engine.go runAnalysis, "Phase 4"), so cash <= 0 almost
+	// always means "not wired", not "fully invested". Rendering it as $0.00
+	// would feed analysts a false zero-cash state and suppress BUY/sizing
+	// (Codex #391 P1) — keep an explicit unknown marker instead, worded so the
+	// model doesn't treat it as a constraint.
 	b.WriteString("\n### PORTFOLIO CONTEXT\n")
-	b.WriteString(fmt.Sprintf("Cash available: $%.2f\n", portfolio.CashAvailable))
+	if portfolio.CashAvailable > 0 {
+		b.WriteString(fmt.Sprintf("Cash available: $%.2f\n", portfolio.CashAvailable))
+	} else {
+		b.WriteString("Cash available: (not provided — do not assume zero; apply sizing rules normally)\n")
+	}
 	if len(portfolio.OpenPositions) > 0 {
 		b.WriteString("Open positions:\n")
 		for _, p := range portfolio.OpenPositions {

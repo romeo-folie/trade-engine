@@ -130,9 +130,18 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		sb.WriteString(fmt.Sprintf("Reasoning:\n%s\n", r.Response.Reasoning))
 	}
 
+	// Current price for the R:R self-filter: the arbiter's custom message
+	// bypasses the stock prompt builder (and its CURRENT PRICE line), so
+	// signal_price must be supplied here or the filter computes against a
+	// guessed entry (Codex #391 P2). RecentCandles is most-recent-first.
+	var currentPrice float64
+	if len(req.RecentCandles) > 0 {
+		currentPrice = req.RecentCandles[0].Close
+	}
+
 	arbReq := AnalysisRequest{
 		CustomSystemPrompt: arbiterSystemPrompt(),
-		CustomUserMessage:  buildArbiterUserMessage(req.Ticker, sb.String()),
+		CustomUserMessage:  buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()),
 		Ticker:             req.Ticker,
 	}
 
@@ -330,8 +339,16 @@ to rescue from conflicting votes scores low.
 Do not include any text outside the JSON object.`
 }
 
-func buildArbiterUserMessage(ticker, analysesBlock string) string {
-	return fmt.Sprintf("Ticker: %s\n\nThe following independent AI analyses have been submitted for arbitration:\n%s\n\nProduce your synthesised final signal as a JSON object.", ticker, analysesBlock)
+// buildArbiterUserMessage assembles the arbiter's user message. currentPrice
+// defines signal_price for the R:R self-filter in the system prompt; when it is
+// unavailable (0) the message says so explicitly rather than leaving the filter
+// to compute against a guess.
+func buildArbiterUserMessage(ticker string, currentPrice float64, analysesBlock string) string {
+	priceLine := "Current price: unavailable — infer the entry price from the analyst proposals when applying the R:R self-filter."
+	if currentPrice > 0 {
+		priceLine = fmt.Sprintf("Current price (latest close): %.2f — use this as signal_price in the R:R self-filter.", currentPrice)
+	}
+	return fmt.Sprintf("Ticker: %s\n%s\n\nThe following independent AI analyses have been submitted for arbitration:\n%s\n\nProduce your synthesised final signal as a JSON object.", ticker, priceLine, analysesBlock)
 }
 
 func extractDissent(reasoning string) string {

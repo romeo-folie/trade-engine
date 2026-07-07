@@ -439,3 +439,18 @@ func TestArbiterSystemPrompt_Calibration(t *testing.T) {
 		t.Error("arbiter prompt leaks raw format verbs")
 	}
 }
+
+// TestBuildArbiterUserMessage_SignalPrice asserts the arbiter user message
+// defines signal_price for the R:R self-filter (Codex #391 P2): with candles it
+// names the latest close; without, it explicitly says the price is unavailable
+// rather than leaving the filter to compute against a guess.
+func TestBuildArbiterUserMessage_SignalPrice(t *testing.T) {
+	withPrice := buildArbiterUserMessage("AAPL", 187.42, "(analyses)")
+	if !strings.Contains(withPrice, "Current price (latest close): 187.42") {
+		t.Error("arbiter user message missing the signal_price definition line")
+	}
+	noPrice := buildArbiterUserMessage("AAPL", 0, "(analyses)")
+	if !strings.Contains(noPrice, "Current price: unavailable") {
+		t.Error("arbiter user message must state when the current price is unavailable")
+	}
+}
