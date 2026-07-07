@@ -179,12 +179,19 @@ type NewsSnippet struct {
 // Placeholder in Phase 3 — populated by Phase 4.
 type PortfolioContext struct {
 	CashAvailable float64
+	// CashKnown distinguishes a real balance (including a fully-deployed $0)
+	// from an unpopulated tracker: with it false the prompt renders an
+	// explicit "not provided" marker instead of a false zero (Codex #392 P2).
+	CashKnown     bool
 	OpenPositions []PositionSummary
 }
 
 // PositionSummary is a condensed view of an open position.
+// Side is "long"/"short" when the broker reports it (empty means unknown,
+// rendered as long — the stock pipeline is long-only by the #306 guard).
 type PositionSummary struct {
 	Ticker       string
+	Side         string
 	Quantity     float64
 	AvgCostBasis float64
 	CurrentValue float64

@@ -114,7 +114,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	promptCandles := toPromptCandles(req.RecentCandles)
 	promptInd := toPromptIndicators(req.Indicators)
 	promptNews := toPromptNews(req.News)
-	promptPortfolio := toPromptPortfolio(req.Portfolio)
+	promptPortfolio := toPromptPortfolio(req.Portfolio, req.Ticker)
 	promptSimilar := toPromptSimilarSetups(req.SimilarAnalyses)
 
 	mu := &sync.Mutex{}
