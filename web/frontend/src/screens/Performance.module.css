@@ -149,9 +149,10 @@
   font-size: var(--font-size-xs);
   color: var(--text-dim);
 }
-.swatchDead, .swatchEdge { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+.swatchDead, .swatchEdge, .swatchMixed { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
 .swatchDead { background: var(--red); opacity: 0.55; }
 .swatchEdge { background: var(--emerald); }
+.swatchMixed { background: var(--amber); opacity: 0.75; }
 
 .caption {
   font-family: var(--font-sans);

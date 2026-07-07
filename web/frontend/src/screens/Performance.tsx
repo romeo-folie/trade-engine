@@ -96,6 +96,27 @@ function bandLowerBound(label: string): number {
   if (label.startsWith('>=')) return parseFloat(label.slice(2));
   return parseFloat(label.split('-')[0]) || 0;
 }
+/** Upper bound of a band ("<0.60" → 0.60, "0.68-0.75" → 0.75, ">=0.85" → ∞). */
+function bandUpperBound(label: string): number {
+  if (label.startsWith('<')) return parseFloat(label.slice(1));
+  if (label.startsWith('>=')) return Infinity;
+  return parseFloat(label.split('-')[1]) || Infinity;
+}
+
+/** Classify a band against the live entry gate. Bands are fixed reporting bins,
+ *  but the gate is configurable — a band that straddles it is neither purely
+ *  dead nor edge, so it is marked "mixed" rather than miscolored. */
+type Zone = 'dead' | 'edge' | 'mixed';
+function classifyBand(label: string, gate: number): Zone {
+  if (bandUpperBound(label) <= gate) return 'dead';
+  if (bandLowerBound(label) >= gate) return 'edge';
+  return 'mixed';
+}
+const ZONE_FILL: Record<Zone, { fill: string; opacity: number }> = {
+  dead: { fill: TOKENS.red, opacity: 0.55 },
+  edge: { fill: TOKENS.emerald, opacity: 0.9 },
+  mixed: { fill: TOKENS.amber, opacity: 0.75 },
+};
 
 const MODE_LABELS: Record<string, string> = {
   fast_path: 'Fast-path',
@@ -114,7 +135,7 @@ const swrOpts = { refreshInterval: 60_000 } as const;
 
 interface TooltipProps {
   active?: boolean;
-  payload?: { payload: Bucket & { edge: boolean } }[];
+  payload?: { payload: Bucket & { zone: Zone } }[];
 }
 function ConfTooltip({ active, payload }: TooltipProps) {
   if (!active || !payload?.length) return null;
@@ -192,13 +213,14 @@ export default function Performance() {
   const gate = data?.confidence_gate ?? 0.68;
 
   const confData = useMemo(
-    () => (data?.by_confidence ?? []).map((b) => ({ ...b, edge: bandLowerBound(b.label) >= gate })),
+    () => (data?.by_confidence ?? []).map((b) => ({ ...b, zone: classifyBand(b.label, gate) })),
     [data, gate],
   );
-  // Shade the sub-threshold ("dead money") bands as one region.
-  const deadBands = confData.filter((d) => !d.edge);
+  // Shade the fully sub-threshold ("dead money") bands as one region.
+  const deadBands = confData.filter((d) => d.zone === 'dead');
   const deadStart = deadBands[0]?.label;
   const deadEnd = deadBands[deadBands.length - 1]?.label;
+  const hasMixed = confData.some((d) => d.zone === 'mixed');
 
   const o = data?.overall;
   const c = data?.concentration;
@@ -303,7 +325,7 @@ export default function Performance() {
                   <Tooltip content={<ConfTooltip />} cursor={{ fill: 'rgba(255,255,255,0.03)' }} />
                   <Bar dataKey="win_rate_pct" radius={[3, 3, 0, 0]} isAnimationActive={!reducedMotion} maxBarSize={90}>
                     {confData.map((d) => (
-                      <Cell key={d.label} fill={d.edge ? TOKENS.emerald : TOKENS.red} fillOpacity={d.edge ? 0.9 : 0.55} />
+                      <Cell key={d.label} fill={ZONE_FILL[d.zone].fill} fillOpacity={ZONE_FILL[d.zone].opacity} />
                     ))}
                     <LabelList
                       dataKey="win_rate_pct" position="top"
@@ -317,6 +339,9 @@ export default function Performance() {
             <div className={styles.legendRow}>
               <span className={styles.legendItem}><span className={styles.swatchDead} /> below gate · dead money</span>
               <span className={styles.legendItem}><span className={styles.swatchEdge} /> at/above gate · edge zone</span>
+              {hasMixed && (
+                <span className={styles.legendItem}><span className={styles.swatchMixed} /> straddles gate · mixed</span>
+              )}
             </div>
             <p className={styles.caption}>
               Win rate climbs monotonically with the arbiter's final confidence. Bands left of the {gate.toFixed(2)} entry

@@ -159,10 +159,18 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 // break-even (pnl = 0) trades kept in the denominator. The patched
 // GetPortfolioStats uses the same definition so the two surfaces agree.
 
-// entryBaseCTE is the shared join. `mode` collapses the three provenance states
-// (fast_pathed, arbiter_response present, neither) into one label; note that
-// "arbitrated" is NOT simply the negation of "fast-path" — a signal can be
-// neither (analysts agreed but not flagged fast-path).
+// entryBaseCTE is the shared join — exactly one row per closed trade. `mode`
+// collapses the three provenance states (fast_pathed, arbiter_response present,
+// neither) into one label; note that "arbitrated" is NOT simply the negation of
+// "fast-path" — a signal can be neither (analysts agreed but not flagged
+// fast-path).
+//
+// A signal's analysis_ids is an array (a signal can be produced by more than one
+// analysis). We must attribute each trade to a single analysis or a multi-
+// analysis signal would duplicate its trade across every count(*)/sum(pnl)/top-N
+// below. The LATERAL … LIMIT 1 picks the most recent analysis per signal
+// deterministically (created_at DESC, id tie-break), mirroring the DISTINCT ON
+// (s.id) attribution used by the analyst batch path.
 const entryBaseCTE = `
 WITH base AS (
     SELECT t.ticker, t.direction::text AS dir, t.strategy,
@@ -174,8 +182,13 @@ WITH base AS (
            jsonb_array_length(a.ensemble_results) AS n_analysts
     FROM trades t
     JOIN signals s ON s.id = t.signal_id
-    JOIN LATERAL unnest(s.analysis_ids) AS aid ON true
-    JOIN analyses a ON a.id = aid
+    JOIN LATERAL (
+        SELECT a.confidence, a.fast_pathed, a.arbiter_response, a.ensemble_results
+        FROM unnest(s.analysis_ids) AS aid
+        JOIN analyses a ON a.id = aid
+        ORDER BY a.created_at DESC, a.id DESC
+        LIMIT 1
+    ) a ON true
     WHERE t.status = 'closed' AND t.pnl IS NOT NULL
 )`
 
@@ -238,7 +251,7 @@ func entryBuckets(ctx context.Context, labelExpr, groupOrder string) ([]EntryPer
 	q := entryBaseCTE + `
 		SELECT ` + labelExpr + ` AS label,
 		       count(*)::int,
-		       round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1)::float8,
+		       COALESCE(round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1), 0)::float8,
 		       round(avg(pnl_pct)::numeric, 2)::float8,
 		       round(sum(pnl)::numeric, 2)::float8,
 		       round(avg(conf)::numeric, 3)::float8
@@ -271,7 +284,7 @@ func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 		       count(*) FILTER (WHERE pnl > 0)::int,
 		       count(*) FILTER (WHERE pnl < 0)::int,
 		       count(*) FILTER (WHERE pnl = 0)::int,
-		       round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1)::float8,
+		       COALESCE(round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1), 0)::float8,
 		       round(avg(pnl_pct)::numeric, 2)::float8,
 		       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct))::numeric, 2)::float8,
 		       round(sum(pnl)::numeric, 2)::float8,
