@@ -418,3 +418,39 @@ func TestArbiterLabel_TwoLetterRollover(t *testing.T) {
 		t.Errorf("arbiterLabel(52)=%q, want Model-BA", got)
 	}
 }
+
+// TestArbiterSystemPrompt_Calibration guards the prompt-calibration bundle on
+// the arbiter: its confidence is what the entry gate reads on every arbitrated
+// signal, so it must share the analysts' anchors and R:R filter, cap size_pct
+// at the analyst/risk limit (5.0, was 10.0), and not leak raw format verbs
+// (the old plain-string prompt showed literal "%.2f" and "20%%+").
+func TestArbiterSystemPrompt_Calibration(t *testing.T) {
+	sys := arbiterSystemPrompt()
+	if !strings.Contains(sys, "0.70 = clear edge") {
+		t.Error("arbiter prompt is missing the confidence anchors")
+	}
+	if !strings.Contains(sys, "R:R SELF-FILTER (MANDATORY)") {
+		t.Error("arbiter prompt is missing the R:R self-filter")
+	}
+	if !strings.Contains(sys, `"size_pct": <0.0–5.0>`) {
+		t.Error("arbiter size_pct cap must be 5.0 to match the analyst schema and risk.max_position_pct")
+	}
+	if strings.Contains(sys, "%.2f") || strings.Contains(sys, "%%") {
+		t.Error("arbiter prompt leaks raw format verbs")
+	}
+}
+
+// TestBuildArbiterUserMessage_SignalPrice asserts the arbiter user message
+// defines signal_price for the R:R self-filter (Codex #391 P2): with candles it
+// names the latest close; without, it explicitly says the price is unavailable
+// rather than leaving the filter to compute against a guess.
+func TestBuildArbiterUserMessage_SignalPrice(t *testing.T) {
+	withPrice := buildArbiterUserMessage("AAPL", 187.42, "(analyses)")
+	if !strings.Contains(withPrice, "Current price (latest close): 187.42") {
+		t.Error("arbiter user message missing the signal_price definition line")
+	}
+	noPrice := buildArbiterUserMessage("AAPL", 0, "(analyses)")
+	if !strings.Contains(noPrice, "Current price: unavailable") {
+		t.Error("arbiter user message must state when the current price is unavailable")
+	}
+}
