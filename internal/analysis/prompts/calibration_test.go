@@ -85,3 +85,55 @@ func TestPrompts_NoLeakedFormatVerbs(t *testing.T) {
 		}
 	}
 }
+
+// TestPortfolioRules_InAllSystemPrompts: the portfolio-usage rules (SELL only
+// what is held, pyramid awareness, correlation, no anchoring on other losses)
+// must ride along wherever the anchors do.
+func TestPortfolioRules_InAllSystemPrompts(t *testing.T) {
+	const sentinel = "USING PORTFOLIO CONTEXT:"
+	if sys := buildSystem("trend_following"); !strings.Contains(sys, sentinel) {
+		t.Error("generalist system prompt is missing the portfolio rules")
+	}
+	if sys := buildMomentumSystem("momentum"); !strings.Contains(sys, sentinel) {
+		t.Error("momentum system prompt is missing the portfolio rules")
+	}
+	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
+		sys, _ := BuildRolePrompt(role, "AAPL", "swing", "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+		if !strings.Contains(sys, sentinel) {
+			t.Errorf("role %q prompt is missing the portfolio rules", role)
+		}
+	}
+}
+
+// TestBuildUser_PortfolioRendering_CacheStable asserts the position block only
+// contains stable or bucketed figures: exact qty/avg-cost, unrealized P&L
+// bucketed to 5 points, cash rounded to $100, no raw CurrentValue, and an
+// explicit "+N more" line when the conversion cap dropped positions.
+func TestBuildUser_PortfolioRendering_CacheStable(t *testing.T) {
+	p := Portfolio{
+		CashAvailable: 12345.67,
+		OpenPositions: []Position{
+			// +7.3% unrealized → bucket ≈+5%
+			{Ticker: "HIMS", Side: "long", Quantity: 10, AvgCostBasis: 100, CurrentValue: 1073.10, UnrealizedPL: 73.10},
+			// -12.4% unrealized → bucket ≈-10%
+			{Ticker: "SOFI", Quantity: 20, AvgCostBasis: 10, CurrentValue: 175.20, UnrealizedPL: -24.80},
+		},
+		OmittedPositions: 3,
+	}
+	user := buildUser("HIMS", "1d", nil, Indicators{}, nil, p, "", nil, "")
+	for _, want := range []string{
+		"Cash available: ≈$12300",
+		"HIMS: long 10.0000 @ 100.00  unrealized≈+5%",
+		"SOFI: long 20.0000 @ 10.00  unrealized≈-10%", // empty side renders long
+		"(+3 more open positions not listed)",
+	} {
+		if !strings.Contains(user, want) {
+			t.Errorf("portfolio block missing %q\ngot:\n%s", want, user)
+		}
+	}
+	for _, forbidden := range []string{"1073.10", "175.20", "73.10", "12345.67"} {
+		if strings.Contains(user, forbidden) {
+			t.Errorf("portfolio block leaks volatile figure %q (cache churn)", forbidden)
+		}
+	}
+}

@@ -183,8 +183,11 @@ type PortfolioContext struct {
 }
 
 // PositionSummary is a condensed view of an open position.
+// Side is "long"/"short" when the broker reports it (empty means unknown,
+// rendered as long — the stock pipeline is long-only by the #306 guard).
 type PositionSummary struct {
 	Ticker       string
+	Side         string
 	Quantity     float64
 	AvgCostBasis float64
 	CurrentValue float64

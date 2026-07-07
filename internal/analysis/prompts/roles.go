@@ -45,7 +45,9 @@ RULES:
 - Do not output markdown, explanations, or any text outside the JSON object.
 - Never recommend size_pct > 0 for a HOLD or WAIT action.
 
-` + ConfidenceAnchors
+` + ConfidenceAnchors + `
+
+` + PortfolioRules
 
 // buildFundamentalSystem returns the specialist prompt for the fundamental analyst.
 // Focus: earnings, catalysts, sector context, business quality. Downweights

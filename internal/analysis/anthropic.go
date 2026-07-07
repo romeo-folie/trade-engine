@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -73,7 +74,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 			toPromptCandles(req.RecentCandles),
 			toPromptIndicators(req.Indicators),
 			toPromptNews(req.News),
-			toPromptPortfolio(req.Portfolio),
+			toPromptPortfolio(req.Portfolio, req.Ticker),
 			req.KnowledgeContext,
 			toPromptSimilarSetups(req.SimilarAnalyses),
 			req.PerformanceContext,
@@ -341,20 +342,42 @@ func toPromptNews(ns []NewsSnippet) []prompts.NewsItem {
 	return out
 }
 
-func toPromptPortfolio(p PortfolioContext) prompts.Portfolio {
+// maxPromptPositions caps the open-position list rendered into prompts so a
+// large book doesn't bloat every analysis call; the renderer prints "+N more".
+const maxPromptPositions = 15
+
+// toPromptPortfolio converts the request's portfolio context for the prompt
+// builder. analyzedTicker's own position (if held) is pinned first so the cap
+// can never drop the one position SELL/pyramid decisions depend on; the rest
+// sort alphabetically so the rendered text is deterministic (cache-stable)
+// rather than following broker enumeration order.
+func toPromptPortfolio(p PortfolioContext, analyzedTicker string) prompts.Portfolio {
 	pos := make([]prompts.Position, len(p.OpenPositions))
 	for i, op := range p.OpenPositions {
 		pos[i] = prompts.Position{
 			Ticker:       op.Ticker,
+			Side:         op.Side,
 			Quantity:     op.Quantity,
 			AvgCostBasis: op.AvgCostBasis,
 			CurrentValue: op.CurrentValue,
 			UnrealizedPL: op.UnrealizedPL,
 		}
 	}
+	sort.Slice(pos, func(i, j int) bool {
+		if (pos[i].Ticker == analyzedTicker) != (pos[j].Ticker == analyzedTicker) {
+			return pos[i].Ticker == analyzedTicker
+		}
+		return pos[i].Ticker < pos[j].Ticker
+	})
+	omitted := 0
+	if len(pos) > maxPromptPositions {
+		omitted = len(pos) - maxPromptPositions
+		pos = pos[:maxPromptPositions]
+	}
 	return prompts.Portfolio{
-		CashAvailable: p.CashAvailable,
-		OpenPositions: pos,
+		CashAvailable:    p.CashAvailable,
+		OpenPositions:    pos,
+		OmittedPositions: omitted,
 	}
 }
 

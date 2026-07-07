@@ -692,6 +692,31 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source)
 }
 
+// buildPortfolioContext maps live tracker state into the analysis request so
+// analysts see cash and open positions (closes the "Phase 4" gap: 24% of all
+// blocked signals were SELLs on tickers we did not hold, and another 27% hit
+// per-ticker/pyramid/max-position limits — all invisible to a portfolio-blind
+// analyst). Pure function for testability. Downstream, toPromptPortfolio pins
+// the analyzed ticker + caps the list, and the prompt renderer buckets the
+// volatile figures so analysis_cache stays effective.
+func buildPortfolioContext(cash float64, positions []portfolio.ExecPosition) analysis.PortfolioContext {
+	out := analysis.PortfolioContext{CashAvailable: cash}
+	for _, p := range positions {
+		if p.Quantity == 0 {
+			continue
+		}
+		out.OpenPositions = append(out.OpenPositions, analysis.PositionSummary{
+			Ticker:       p.Ticker,
+			Side:         p.Side,
+			Quantity:     p.Quantity,
+			AvgCostBasis: p.AvgCostBasis,
+			CurrentValue: p.CurrentValue,
+			UnrealizedPL: p.UnrealizedPL,
+		})
+	}
+	return out
+}
+
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
 func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string, source string) {
@@ -885,7 +910,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 			VolRatio: volRatio(candles, set.VolumeSMA20),
 		},
 		News:      snippets,
-		Portfolio: analysis.PortfolioContext{}, // Phase 4
+		Portfolio: buildPortfolioContext(e.portfolio.CurrentState().Cash, e.portfolio.Positions()),
 	}
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
