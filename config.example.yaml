@@ -8,6 +8,8 @@ engine:
   max_watchlist: 50            # Maximum concurrent watchlist items
   dry_run: false               # If true, no orders placed regardless of mode
   initial_capital: 100000      # Starting cash for paper trading / position sizing
+  log_timezone: UTC            # IANA timezone for engine log timestamps (e.g. America/New_York)
+  skip_recent_tick: true       # Skip the startup tick when the last analysis is newer than tick_interval_sec
 
 # ── Model configuration ───────────────────────────────────────────────────────
 # Use the registry+roles block (recommended) to name models and reference them
@@ -79,6 +81,11 @@ models:
       max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
+      # Per-model outbound request pacing to stay under the provider's per-model
+      # quota (honoured by google only today; 0 = provider default, 10 RPM).
+      # Limiters are PER CLIENT INSTANCE: if two roles share one model their
+      # rates are additive — use different models or lower each RPM (PR #358).
+      requests_per_minute: 10
     # news_enricher (alternatives):
     #   provider: deepseek / model: deepseek-chat / api_key_env: DEEPSEEK_API_KEY
     #   provider: openai   / model: gpt-4o-mini   / api_key_env: OPENAI_API_KEY
@@ -86,6 +93,21 @@ models:
       provider: ollama
       model: nomic-embed-text
       timeout_sec: 30
+    # OpenAI reasoning-model example (gpt-5 / o-series). Not referenced by any
+    # role below — swap it into models.roles to activate. Shown live so the
+    # reasoning knobs stay documented and machine-checked.
+    analyst_reasoning_example:
+      provider: openai
+      model: gpt-5-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 90
+      # Hidden reasoning tokens count inside max_completion_tokens — unbounded
+      # reasoning can return an empty answer. gpt-5: minimal|low|medium|high;
+      # o1/o3/o4: low|medium|high; gpt-5-pro: high only. Unset → client default
+      # "low" (omitted entirely for gpt-5-pro). Ignored by other providers (PR #356).
+      reasoning_effort: low
 
   roles:
     analysts: [analyst_cheap, analyst_mid, analyst_frontier]
@@ -151,21 +173,38 @@ markets:
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
 
-  # ibkr:
-  #   enabled: false
-  #   account_id: ""
-  #   gateway_url: "https://localhost:5000"
-  #   tickle_sec: 240
-  #   insecure_tls: true
+  # IBKR Client Portal gateway — used by the ORB forex/futures strategies.
+  ibkr:
+    enabled: false
+    account_id: ""
+    gateway_url: "https://localhost:5000"
+    tickle_sec: 240                # Keep-alive ping interval (seconds)
+    insecure_tls: true             # Gateway uses a self-signed cert on localhost
+    auth_monitor_sec: 60           # Poll /auth/status every N seconds while running
+    auth_alert_debounce_min: 30    # Min minutes between repeated auth-flap alerts
 
   # OANDA v20 — data-only source for the ORB backtest engine (`te backtest orb`).
   # A free practice (demo) account needs no funding; on a non-US OANDA entity it
   # serves metals (XAU/USD, XAG/USD) alongside spot forex. Never used for live trading.
-  # oanda:
-  #   enabled: true
-  #   token_env: OANDA_API_TOKEN   # env var holding your v20 API token
-  #   account_id: ""               # only needed for live quotes, not for candles
-  #   practice: true               # true → api-fxpractice.oanda.com (free demo)
+  oanda:
+    enabled: false
+    token_env: OANDA_API_TOKEN   # env var holding your v20 API token
+    account_id: ""               # only needed for live quotes, not for candles
+    practice: true               # true → api-fxpractice.oanda.com (free demo)
+    base_url: ""                 # optional API override; empty uses the practice/live default
+
+  # ORB backtest data source: "histdata" (default; free bulk tick ZIPs, no account),
+  # "dukascopy" (per-hour .bi5 feed; superseded by histdata but still supported), or
+  # "oanda" (v20 candles; needs the free practice-account token above — the ONLY
+  # thing markets.oanda is used for; nothing touches OANDA unless selected here).
+  backtest_provider: histdata
+  histdata:
+    base_url: ""                 # optional site override (default histdata.com)
+    cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/histdata)
+  dukascopy:
+    base_url: ""                 # optional feed override (default datafeed.dukascopy.com)
+    cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/dukascopy)
+    point_scale: {}              # per-symbol price scale overrides, e.g. {"XAU/USD": 1000}
 
   news:
     provider: finnhub             # finnhub | benzinga
@@ -301,6 +340,18 @@ analysis:
       risk_proximity: 0.25          # Distance to stop/drawdown contribution
       trend_strength: 0.20          # ADX normalised contribution
 
+  # Multi-timeframe borderline arbiter (Issue #321): when a WAIT lands in the
+  # borderline confidence band, re-run the ensemble on the mapped alternate
+  # timeframe and re-arbitrate across both views. Narrow band by design — only
+  # a small fraction of WAITs incur the 2× token cost.
+  multi_timeframe_borderline_enabled: true
+  multi_timeframe_borderline_conf_min: 0.55  # Band lower bound (below = plain WAIT)
+  multi_timeframe_borderline_conf_max: 0.70  # Band upper bound (above = plain WAIT)
+  multi_timeframe_alt_map:                   # primary timeframe → alternate to consult
+    1h: 4h
+    4h: 1h
+    1d: 1h
+
 # ── Cost profiles & budget guardrails (cost-reduction Epic 3) ────────────────
 # profile sets a named preset for tick_interval, hold_cooldown, classifier mode,
 # adaptive_depth, and cache TTL. Explicit values in this file always override the
@@ -380,97 +431,190 @@ orb:
   range_minutes: 15            # Opening range window: 5 or 15 minutes
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)
+  max_position_pct: 10.0       # Hard cap: position notional <= this % of portfolio per trade
   news_lookback_hours: 24      # How far back to fetch news for catalyst scoring
+  scan_cadence_minutes: 2      # How often the ORB loop scans during its session window
 
-# forex_orb:
-#   enabled: false
-#   instruments:
-#     - symbol: EUR/USD
-#       sec_type: CASH
-#       min_lot_size: 20000
-#       pip_buffer: 0.0002
-#       max_hold_minutes: 240   # flatten a filled trade after 4h (0 = inherit strategy default below)
-#       # Entry-quality filters (Phase 2). All default 0 = off. range_atr_ratio =
-#       # opening_range_width / ATR(atr_period, atr_timeframe). Skip a session whose
-#       # ratio falls outside [min, max], or whose spread/risk exceeds max_spread_to_risk.
-#       min_range_atr: 0.25
-#       max_range_atr: 0.90
-#       max_spread_to_risk: 0.08
-#       # Breakout confirmation (Phase 3): "" / stop_touch (default, fills on a touch),
-#       # close_1m (one 1-min close beyond), or close_3m (3 consecutive closes beyond,
-#       # filters false breakouts). Confirmation enters later at a worse price.
-#       breakout_confirmation: close_1m
-#       # Direction eligibility (Phase 3): only place the trend-aligned side (price vs the
-#       # trend-timeframe EMA) instead of blind dual-sided. Default false.
-#       direction_eligibility: true
-#       # Per-instrument risk multiplier (Phase 5): scale this instrument's risk vs the
-#       # strategy max_risk_pct (e.g. 0.35 sizes XAU/USD down). <=0 → 1.0.
-#       risk_multiplier: 0.35
-#       # Margin-aware sizing: broker margin requirement as a fraction of notional
-#       # (0.033 ≈ 30:1 forex leverage, 0.05 gold CFD). When set, max_position_pct caps
-#       # MARGIN CONSUMED (notional × margin_rate) instead of full notional — without it a
-#       # leveraged FX position caps near min-lot, where the broker's minimum commission
-#       # is 13-27% of the dollar risk per trade (sweep 9af76e63). <=0 → full notional.
-#       margin_rate: 0.033
-#       # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
-#       # bps × capped notional)) and the max round-trip commission as a fraction of
-#       # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
-#       # whose size regime the commission floor would eat. 0 disables; a max without
-#       # commission_per_side fails config validation. commission_per_side also overrides
-#       # the backtest cost model's flat default for this instrument.
-#       commission_per_side: 6.0
-#       max_commission_to_risk: 0.05
-#       # Adaptive exit management (Phase 4), measured by the backtest `adaptive` variant
-#       # (live order-management lands in a follow-up). R = |entry_stop − stop_loss|.
-#       break_even_r: 0.8           # move the stop to entry after +0.8R
-#       trail_atr_mult: 1.5         # trail at high-water-mark − 1.5×ATR (ratchet up)
-#       trail_after_r: 1.0          # start trailing only after +1.0R
-#       partial_take_profit_r: 1.0  # take a partial at +1.0R
-#       partial_fraction: 0.5       # close half the position at the partial
-#       runner_take_profit_r: 2.0   # runner's target after the partial
-#     - symbol: GBP/USD
-#       sec_type: CASH
-#       min_lot_size: 20000
-#       pip_buffer: 0.0002
-#       max_hold_minutes: 180
-#     - symbol: XAU/USD
-#       sec_type: CFD
-#       min_lot_size: 1
-#       pip_buffer: 0.50
-#       max_hold_minutes: 90
-#     - symbol: XAG/USD
-#       sec_type: CFD
-#       min_lot_size: 50
-#       pip_buffer: 0.01
-#       max_hold_minutes: 90
-#   session: london
-#   timezone: UTC
-#   range_minutes: 15
-#   risk_reward: 2.0
-#   max_risk_pct: 1.0
-#   max_position_pct: 10.0
-#   # Strategy-level fallback time limit for any instrument that doesn't set its own
-#   # max_hold_minutes. At expiry the bracket legs are cancelled and the position is
-#   # flattened at market (exit_type='time_exit'). 0 disables time exits. Prevents
-#   # the multi-day holds that caused most ORB losses.
-#   max_hold_minutes: 240
-#   # ATR used by the range-quality filter (range_atr_ratio). Hourly ATR against which a
-#   # 15-30 min opening range yields ratios in the 0.25-1.25 band.
-#   atr_period: 14
-#   atr_timeframe: 1h
-#   # EMA used by the direction-eligibility trend filter.
-#   trend_timeframe: 1h
-#   trend_ema_period: 20
+# ── Forex/metals ORB (IBKR) — run with `te run --mode orb-forex` ─────────────
+forex_orb:
+  enabled: false
+  instruments:
+    - symbol: EUR/USD
+      sec_type: CASH
+      min_lot_size: 20000
+      pip_buffer: 0.0002
+      max_hold_minutes: 240   # flatten a filled trade after 4h (0 = inherit strategy default below)
+      # Entry-quality filters (Phase 2). All default 0 = off. range_atr_ratio =
+      # opening_range_width / ATR(atr_period, atr_timeframe). Skip a session whose
+      # ratio falls outside [min, max], or whose spread/risk exceeds max_spread_to_risk.
+      min_range_atr: 0.25
+      max_range_atr: 0.90
+      max_spread_to_risk: 0.08
+      # Breakout confirmation (Phase 3): "" / stop_touch (default, fills on a touch),
+      # close_1m (one 1-min close beyond), close_3m (3 consecutive closes beyond,
+      # filters false breakouts), or retest_swing / retest_range (Phase 6: wait for
+      # the pullback to retest the breakout level, enter on the bounce — stop at the
+      # retest swing or the opposite range edge respectively). Confirmation enters
+      # later and at a worse price in exchange for a stronger signal.
+      breakout_confirmation: close_1m
+      # Retest knobs (retest_* modes only): how close the pullback must return to
+      # the breakout level (fraction of opening-range width) and how long after the
+      # breakout the bounce entry may occur. 0 = engine defaults.
+      retest_tolerance: 0
+      retest_timeout_minutes: 0
+      # Direction eligibility (Phase 3): only place the trend-aligned side (price vs the
+      # trend-timeframe EMA) instead of blind dual-sided. Default false.
+      direction_eligibility: true
+      # Per-instrument risk multiplier (Phase 5): scale this instrument's risk vs the
+      # strategy max_risk_pct (e.g. 0.35 sizes XAU/USD down). <=0 → 1.0.
+      risk_multiplier: 0.35
+      # Margin-aware sizing: broker margin requirement as a fraction of notional
+      # (0.033 ≈ 30:1 forex leverage, 0.05 gold CFD). When set, max_position_pct caps
+      # MARGIN CONSUMED (notional × margin_rate) instead of full notional — without it a
+      # leveraged FX position caps near min-lot, where the broker's minimum commission
+      # is 13-27% of the dollar risk per trade (sweep 9af76e63). <=0 → full notional.
+      margin_rate: 0.033
+      # Hard USD cap on order value (entry × qty) applied after all other sizing.
+      # For high-margin_rate metals CFDs whose sizing overshoots the broker's
+      # precautionary order-value limit (IBKR default $100k → endless confirmation
+      # prompts; PR #387 uses 95000 for XAU/XAG). USD-quoted symbols only —
+      # Validate rejects it elsewhere. <=0 disables (default).
+      max_notional_usd: 0
+      # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
+      # bps × capped notional)) and the max round-trip commission as a fraction of
+      # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
+      # whose size regime the commission floor would eat. 0 disables; a max without
+      # commission_per_side fails config validation. commission_per_side also overrides
+      # the backtest cost model's flat default for this instrument.
+      commission_per_side: 6.0
+      max_commission_to_risk: 0.05
+      # Adaptive exit management (Phase 4), measured by the backtest `adaptive` variant
+      # (live order-management lands in a follow-up). R = |entry_stop − stop_loss|.
+      break_even_r: 0.8           # move the stop to entry after +0.8R
+      trail_atr_mult: 1.5         # trail at high-water-mark − 1.5×ATR (ratchet up)
+      trail_after_r: 1.0          # start trailing only after +1.0R
+      partial_take_profit_r: 1.0  # take a partial at +1.0R
+      partial_fraction: 0.5       # close half the position at the partial
+      runner_take_profit_r: 2.0   # runner's target after the partial
+    - symbol: GBP/USD
+      sec_type: CASH
+      min_lot_size: 20000
+      pip_buffer: 0.0002
+      max_hold_minutes: 180
+    - symbol: XAU/USD
+      sec_type: CFD
+      min_lot_size: 1
+      pip_buffer: 0.50
+      max_hold_minutes: 90
+    - symbol: XAG/USD
+      sec_type: CFD
+      min_lot_size: 50
+      pip_buffer: 0.01
+      max_hold_minutes: 90
+  session: london
+  timezone: UTC
+  range_minutes: 15
+  risk_reward: 2.0
+  max_risk_pct: 1.0
+  max_position_pct: 10.0
+  # Strategy-level fallback time limit for any instrument that doesn't set its own
+  # max_hold_minutes. At expiry the bracket legs are cancelled and the position is
+  # flattened at market (exit_type='time_exit'). 0 disables time exits. Prevents
+  # the multi-day holds that caused most ORB losses.
+  max_hold_minutes: 240
+  # ATR used by the range-quality filter (range_atr_ratio). Hourly ATR against which a
+  # 15-30 min opening range yields ratios in the 0.25-1.25 band.
+  atr_period: 14
+  atr_timeframe: 1h
+  # EMA used by the direction-eligibility trend filter.
+  trend_timeframe: 1h
+  trend_ema_period: 20
 
-# feedback:
-#   enabled: false
-#   review_time_utc: "18:00"
-#   windows: [1, 7, 30]
-#   prompt_enrichment: true
-#   orb_prompt_enrichment: true
-#   thresholds:
-#     model_win_rate_min: 0.40
-#     model_min_trades: 20
-#     instrument_win_rate_min: 0.35
-#     instrument_min_trades: 10
-#     arbiter_invoked_rate_max: 0.50
+# ── US equity-index futures ORB (IBKR) — run with `te run --mode orb-newyork` ─
+futures_orb:
+  enabled: false
+  session_open_et: "09:30"     # US equity index futures open with the equity market
+  range_minutes: 15
+  risk_reward: 2.0
+  max_risk_pct: 1.0
+  max_position_pct: 20.0       # One ES contract ≈ $255k notional — cap sized for < 1 contract on $100k
+  instruments:                 # Quarterly expiry (Mar/Jun/Sep/Dec)
+    - { symbol: ES,  exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 12.50, tick_buffer: 2 }
+    - { symbol: NQ,  exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 5.00,  tick_buffer: 2 }
+    - { symbol: YM,  exchange: CBOT, asset_class: equity_index, expiry_cycle: quarterly, tick_size: 1.00, tick_value: 5.00,  tick_buffer: 4 }
+    - { symbol: RTY, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.10, tick_value: 5.00,  tick_buffer: 4 }
+
+# ── COMEX metals futures ORB (IBKR) — run with `te run --mode orb-metals` ─────
+futures_orb_metals:
+  enabled: false
+  session_open_et: "08:20"     # COMEX pit open (US/Eastern)
+  range_minutes: 15
+  risk_reward: 2.0
+  max_risk_pct: 1.0
+  max_position_pct: 30.0
+  instruments:                 # Monthly expiry
+    - { symbol: GC, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.10,  tick_value: 10.00, tick_buffer: 3 }
+    - { symbol: SI, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.005, tick_value: 25.00, tick_buffer: 5 }
+
+# ── Market scanner — autonomous candidate discovery ───────────────────────────
+# Runs during market hours, sourcing candidates from screeners (top movers,
+# most active), the knowledge graph, and news-sympathy triggers. Every candidate
+# passes the same LLM conviction gate before joining the watchlist with a TTL.
+scanner:
+  enabled: false
+  scan_interval_hours: 2       # Scan cadence during market hours (9:30–16:00 ET)
+  candidate_cap: 10            # Max scanner-sourced items on the watchlist at once
+  ttl_days: 3                  # Auto-expire scanner picks after N days without a signal
+  min_conviction: 0.65         # Min LLM conviction to add — discovery gate, not trade approval
+  news_lookback_hours: 24      # News window when enriching candidates before scoring
+  top_movers: 20               # Top gainers+losers fetched per scan
+  top_actives: 20              # Most-active-by-volume fetched per scan
+  graph_neighbors:
+    enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
+    max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks
+    min_confidence: 0.80       # Min extractor confidence for an auto edge (seed/confirmed edges bypass)
+    min_corroboration: 2       # Min distinct news items asserting an auto edge (seed/confirmed bypass)
+    min_edge_strength: 0.6     # Min edge strength (0–1) to consider a neighbor
+  news_sympathy:
+    enabled: false             # News-triggered sympathy: fresh sentiment-strong news on a watched ticker fans out to its graph neighbors (edge eligibility reuses graph_neighbors thresholds)
+    lookback_hours: 6          # How fresh the triggering article must be — spillover edge decays in hours
+    min_abs_sentiment: 0.35    # Min |sentiment_score| for an article to trigger fan-out
+    max_per_scan: 5            # Cap sympathy candidates per scan
+    pair_cooldown_hours: 24    # Don't re-surface the same (seed, neighbor) pair within this window
+
+# ── Feedback pipeline — nightly performance review → prompt enrichment ────────
+feedback:
+  enabled: false
+  review_time_utc: "18:00"
+  windows: [1, 7, 30]          # Rolling review windows (days)
+  prompt_enrichment: true      # Inject per-ticker performance context into stock prompts
+  orb_prompt_enrichment: true  # Inject per-instrument context into ORB prompts
+  thresholds:
+    model_win_rate_min: 0.40
+    model_min_trades: 20
+    instrument_win_rate_min: 0.35
+    instrument_min_trades: 10
+    arbiter_invoked_rate_max: 0.50
+  # ORB auto-throttle: derive a per-instrument risk multiplier from rolling
+  # realised expectancy — sizes a losing instrument down, a winner up, within
+  # [floor, cap]. Disabled (or below min_trades) leaves sizing exactly as-is.
+  orb_auto_throttle:
+    enabled: false
+    window: "30d"              # Feedback window to learn from
+    min_trades: 20             # Below this trade count → neutral 1.0
+    sensitivity: 1.0           # Multiplier change per 1 pct-point of avg PnL
+    floor: 0.5                 # Minimum multiplier
+    cap: 1.5                   # Maximum multiplier
+    max_age_days: 3            # Ignore a stored multiplier older than this
+
+# ── Portfolio data plumbing — broker polling + web cache TTLs ─────────────────
+portfolio:
+  poller:
+    enabled: true
+    interval_sec: 60             # Broker account/positions poll cadence
+    significant_change_pct: 0.05 # Publish an update only when equity moves this much
+  cache:
+    account_ttl_sec: 3           # Web API cache TTLs for broker-backed endpoints
+    positions_ttl_sec: 3
+    history_ttl_sec: 30
+    orders_ttl_sec: 10
