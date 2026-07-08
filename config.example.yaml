@@ -81,6 +81,11 @@ models:
       max_tokens: 2048
       temperature: 0.1
       timeout_sec: 60
+      # Per-model outbound request pacing to stay under the provider's per-model
+      # quota (honoured by google only today; 0 = provider default, 10 RPM).
+      # Limiters are PER CLIENT INSTANCE: if two roles share one model their
+      # rates are additive — use different models or lower each RPM (PR #358).
+      requests_per_minute: 10
     # news_enricher (alternatives):
     #   provider: deepseek / model: deepseek-chat / api_key_env: DEEPSEEK_API_KEY
     #   provider: openai   / model: gpt-4o-mini   / api_key_env: OPENAI_API_KEY
@@ -88,6 +93,21 @@ models:
       provider: ollama
       model: nomic-embed-text
       timeout_sec: 30
+    # OpenAI reasoning-model example (gpt-5 / o-series). Not referenced by any
+    # role below — swap it into models.roles to activate. Shown live so the
+    # reasoning knobs stay documented and machine-checked.
+    analyst_reasoning_example:
+      provider: openai
+      model: gpt-5-mini
+      api_key_env: OPENAI_API_KEY
+      max_tokens: 4096
+      temperature: 0.1
+      timeout_sec: 90
+      # Hidden reasoning tokens count inside max_completion_tokens — unbounded
+      # reasoning can return an empty answer. gpt-5: minimal|low|medium|high;
+      # o1/o3/o4: low|medium|high; gpt-5-pro: high only. Unset → client default
+      # "low" (omitted entirely for gpt-5-pro). Ignored by other providers (PR #356).
+      reasoning_effort: low
 
   roles:
     analysts: [analyst_cheap, analyst_mid, analyst_frontier]
@@ -431,9 +451,17 @@ forex_orb:
       max_range_atr: 0.90
       max_spread_to_risk: 0.08
       # Breakout confirmation (Phase 3): "" / stop_touch (default, fills on a touch),
-      # close_1m (one 1-min close beyond), or close_3m (3 consecutive closes beyond,
-      # filters false breakouts). Confirmation enters later at a worse price.
+      # close_1m (one 1-min close beyond), close_3m (3 consecutive closes beyond,
+      # filters false breakouts), or retest_swing / retest_range (Phase 6: wait for
+      # the pullback to retest the breakout level, enter on the bounce — stop at the
+      # retest swing or the opposite range edge respectively). Confirmation enters
+      # later and at a worse price in exchange for a stronger signal.
       breakout_confirmation: close_1m
+      # Retest knobs (retest_* modes only): how close the pullback must return to
+      # the breakout level (fraction of opening-range width) and how long after the
+      # breakout the bounce entry may occur. 0 = engine defaults.
+      retest_tolerance: 0
+      retest_timeout_minutes: 0
       # Direction eligibility (Phase 3): only place the trend-aligned side (price vs the
       # trend-timeframe EMA) instead of blind dual-sided. Default false.
       direction_eligibility: true
@@ -446,6 +474,12 @@ forex_orb:
       # leveraged FX position caps near min-lot, where the broker's minimum commission
       # is 13-27% of the dollar risk per trade (sweep 9af76e63). <=0 → full notional.
       margin_rate: 0.033
+      # Hard USD cap on order value (entry × qty) applied after all other sizing.
+      # For high-margin_rate metals CFDs whose sizing overshoots the broker's
+      # precautionary order-value limit (IBKR default $100k → endless confirmation
+      # prompts; PR #387 uses 95000 for XAU/XAG). USD-quoted symbols only —
+      # Validate rejects it elsewhere. <=0 disables (default).
+      max_notional_usd: 0
       # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
       # bps × capped notional)) and the max round-trip commission as a fraction of
       # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
