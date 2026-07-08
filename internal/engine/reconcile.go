@@ -249,12 +249,19 @@ func ReconcileBrokerVsDBWithStore(ctx context.Context, broker reconcilerBrokerVi
 // interface so tests can capture inserts without a database.
 type adoptionStore interface {
 	InsertTrade(ctx context.Context, t store.Trade) (string, error)
+	// UpdateTradeTrailing pre-seeds the recovery row's high-water mark
+	// (stopLoss 0 leaves the stop untouched — see store.UpdateTradeTrailing).
+	UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error
 }
 
 type adoptionStoreAdapter struct{}
 
 func (adoptionStoreAdapter) InsertTrade(ctx context.Context, t store.Trade) (string, error) {
 	return store.InsertTrade(ctx, t)
+}
+
+func (adoptionStoreAdapter) UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error {
+	return store.UpdateTradeTrailing(ctx, id, stopLoss, highWaterMark)
 }
 
 // AdoptBrokerOrphans inserts recovery trade rows for broker positions the DB
@@ -329,6 +336,19 @@ func AdoptBrokerOrphans(ctx context.Context, db adoptionStore, drifts []BrokerDr
 			logger.Warn("orphan adoption: insert recovery trade failed",
 				"ticker", d.Ticker, "qty", qty, "err", err.Error())
 			continue
+		}
+		// Pre-seed the trailing high-water mark at the adoption (current)
+		// price. The trailing manager's first-tick seed is max(entry_price,
+		// current): for an underwater long that resurrects the old average
+		// entry as the HWM and computes a stop ABOVE market — the instant
+		// liquidation adoption exists to avoid (Codex #395 P1). A pre-set
+		// HWM skips that seed branch entirely; from adoption forward the
+		// trail ratchets from today's price like any fresh position.
+		if d.CurrentPrice > 0 {
+			if err := db.UpdateTradeTrailing(ctx, id, 0, d.CurrentPrice); err != nil {
+				logger.Warn("orphan adoption: seed high-water mark failed",
+					"trade_id", id, "ticker", d.Ticker, "err", err.Error())
+			}
 		}
 		logger.Info("orphan adoption: recovery trade created",
 			"trade_id", id,

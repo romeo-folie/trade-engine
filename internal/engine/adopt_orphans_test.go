@@ -7,11 +7,25 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-type fakeAdoptionStore struct{ inserted []store.Trade }
+type fakeAdoptionStore struct {
+	inserted []store.Trade
+	hwmSeeds map[string]float64 // trade id → seeded high-water mark
+}
 
 func (f *fakeAdoptionStore) InsertTrade(_ context.Context, t store.Trade) (string, error) {
 	f.inserted = append(f.inserted, t)
 	return "trade-" + t.Ticker, nil
+}
+
+func (f *fakeAdoptionStore) UpdateTradeTrailing(_ context.Context, id string, stopLoss, hwm float64) error {
+	if f.hwmSeeds == nil {
+		f.hwmSeeds = map[string]float64{}
+	}
+	if stopLoss != 0 {
+		panic("adoption must never touch the stop via UpdateTradeTrailing")
+	}
+	f.hwmSeeds[id] = hwm
+	return nil
 }
 
 // AdoptBrokerOrphans: broker_only adopts in full; a same-direction mismatch
@@ -85,5 +99,16 @@ func TestAdoptBrokerOrphans(t *testing.T) {
 		if _, ok := byTicker[bad]; ok {
 			t.Errorf("%s must not be adopted", bad)
 		}
+	}
+
+	// Trailing high-water mark must be pre-seeded at the CURRENT price, so the
+	// trailing manager's max(entry, current) first-tick seed can't resurrect
+	// the old average entry and instantly liquidate an underwater orphan
+	// (Codex #395 P1). No current price → no seed.
+	if hwm := fs.hwmSeeds["trade-NOK"]; hwm != 11.775 {
+		t.Errorf("NOK HWM seed = %v, want 11.775 (current price, not 16.69 entry)", hwm)
+	}
+	if _, seeded := fs.hwmSeeds["trade-NOPX"]; seeded {
+		t.Error("no-current-price adoption must not seed an HWM")
 	}
 }
