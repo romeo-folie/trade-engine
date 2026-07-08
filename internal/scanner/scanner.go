@@ -119,19 +119,27 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	}
 	slog.Info("scanner: candidates fetched", "count", len(candidates))
 
-	// 2.5 Source extra candidates from the knowledge graph — tradeable companies
-	// one hop from a manually-watched ticker. No-op unless graph sourcing is enabled.
-	if graphCands := s.graphNeighborCandidates(ctx, candidates); len(graphCands) > 0 {
-		candidates = append(candidates, graphCands...)
-		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
-	}
-
-	// 2.6 Source news-sympathy candidates — graph neighbours of watched tickers
+	// 2.5 Source news-sympathy candidates — graph neighbours of watched tickers
 	// with fresh, sentiment-strong news, carrying the triggering headline as the
 	// thesis. No-op unless news_sympathy is enabled.
+	//
+	// Sympathy MUST run before the static graph pass: both walk the same edges
+	// and skip tickers already in the pool, so whichever runs first claims a
+	// shared neighbour. Sympathy carries the richer thesis (trigger headline +
+	// direction); if the static pass claimed the ticker first, a fresh-news
+	// neighbour would be scored with only the weak "graph link" hint (Codex #393).
 	if sympCands := s.newsSympathyCandidates(ctx, candidates); len(sympCands) > 0 {
 		candidates = append(candidates, sympCands...)
 		slog.Info("scanner: news-sympathy candidates added to pool", "count", len(sympCands))
+	}
+
+	// 2.6 Source extra candidates from the knowledge graph — tradeable companies
+	// one hop from a manually-watched ticker. No-op unless graph sourcing is
+	// enabled. Runs after sympathy so it only fills in neighbours with no fresh
+	// news trigger.
+	if graphCands := s.graphNeighborCandidates(ctx, candidates); len(graphCands) > 0 {
+		candidates = append(candidates, graphCands...)
+		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
 
 	if len(candidates) == 0 {
