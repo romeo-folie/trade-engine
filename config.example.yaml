@@ -173,8 +173,10 @@ markets:
     practice: true               # true → api-fxpractice.oanda.com (free demo)
     base_url: ""                 # optional API override; empty uses the practice/live default
 
-  # ORB backtest data source: "histdata" (default; free bulk tick ZIPs) or
-  # "dukascopy" (per-hour .bi5 feed; superseded by histdata but still supported).
+  # ORB backtest data source: "histdata" (default; free bulk tick ZIPs, no account),
+  # "dukascopy" (per-hour .bi5 feed; superseded by histdata but still supported), or
+  # "oanda" (v20 candles; needs the free practice-account token above — the ONLY
+  # thing markets.oanda is used for; nothing touches OANDA unless selected here).
   backtest_provider: histdata
   histdata:
     base_url: ""                 # optional site override (default histdata.com)
