@@ -389,7 +389,7 @@ func TestRelationship_LifecycleAndMentions(t *testing.T) {
 
 	// UpsertEntityMention — requires a real news item DB ID.
 	newsExtID := "intg-news-rel-" + time.Now().Format("150405")
-	if err := store.UpsertNewsItems(ctx, []data.NewsItem{
+	if _, err := store.UpsertNewsItems(ctx, []data.NewsItem{
 		{
 			ExternalID:  newsExtID,
 			Headline:    "Test news for entity mention",
@@ -463,12 +463,12 @@ func TestNews_UpsertAndQuery(t *testing.T) {
 			SentimentScore: 0.5,
 		},
 	}
-	if err := store.UpsertNewsItems(ctx, items); err != nil {
+	if _, err := store.UpsertNewsItems(ctx, items); err != nil {
 		t.Fatalf("UpsertNewsItems: %v", err)
 	}
 
 	// Idempotency — re-upsert should not error.
-	if err := store.UpsertNewsItems(ctx, items); err != nil {
+	if _, err := store.UpsertNewsItems(ctx, items); err != nil {
 		t.Fatalf("UpsertNewsItems (idempotent): %v", err)
 	}
 

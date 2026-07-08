@@ -177,7 +177,7 @@ func mustRel(t *testing.T, ctx context.Context, from, to, typ string, strength f
 func mustNews(t *testing.T, ctx context.Context, extID string) string {
 	t.Helper()
 	extID = extID + "-" + time.Now().Format("150405.000")
-	if err := store.UpsertNewsItems(ctx, []data.NewsItem{{
+	if _, err := store.UpsertNewsItems(ctx, []data.NewsItem{{
 		ExternalID:  extID,
 		Headline:    "graph neighbor test news",
 		URL:         "https://example.com/" + extID,
