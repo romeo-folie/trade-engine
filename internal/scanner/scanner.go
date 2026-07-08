@@ -142,6 +142,14 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
 
+	// 2.6 Source news-sympathy candidates — graph neighbours of watched tickers
+	// with fresh, sentiment-strong news, carrying the triggering headline as the
+	// thesis. No-op unless news_sympathy is enabled.
+	if sympCands := s.newsSympathyCandidates(ctx, candidates); len(sympCands) > 0 {
+		candidates = append(candidates, sympCands...)
+		slog.Info("scanner: news-sympathy candidates added to pool", "count", len(sympCands))
+	}
+
 	if len(candidates) == 0 {
 		return nil
 	}
