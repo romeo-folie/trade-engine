@@ -10,10 +10,17 @@ import (
 
 // UpsertNewsItems idempotently inserts news articles.
 // Deduplication is on external_id (preferred) or url.
-// Existing articles are not updated — this is an insert-only store.
-func UpsertNewsItems(ctx context.Context, items []data.NewsItem) error {
+//
+// It returns external_id → news_items.id for every row with an external_id —
+// including rows that already existed. The enricher needs the row UUID to
+// record entity/relationship mentions (relationship_mentions is how auto-
+// extracted graph edges accumulate the corroboration count that gates scanner
+// eligibility); before this the engine passed an empty ID and the mention
+// tables never received a row.
+func UpsertNewsItems(ctx context.Context, items []data.NewsItem) (map[string]string, error) {
+	ids := make(map[string]string, len(items))
 	if len(items) == 0 {
-		return nil
+		return ids, nil
 	}
 	const batchSize = 200
 	for i := 0; i < len(items); i += batchSize {
@@ -21,14 +28,14 @@ func UpsertNewsItems(ctx context.Context, items []data.NewsItem) error {
 		if end > len(items) {
 			end = len(items)
 		}
-		if err := upsertNewsBatch(ctx, items[i:end]); err != nil {
-			return fmt.Errorf("upsert news batch [%d:%d]: %w", i, end, err)
+		if err := upsertNewsBatch(ctx, items[i:end], ids); err != nil {
+			return ids, fmt.Errorf("upsert news batch [%d:%d]: %w", i, end, err)
 		}
 	}
-	return nil
+	return ids, nil
 }
 
-func upsertNewsBatch(ctx context.Context, items []data.NewsItem) error {
+func upsertNewsBatch(ctx context.Context, items []data.NewsItem, ids map[string]string) error {
 	q := `INSERT INTO news_items (external_id, headline, summary, source, url, published_at, tickers, sentiment_score) VALUES `
 	args := make([]any, 0, len(items)*8)
 	for i, item := range items {
@@ -53,14 +60,30 @@ func upsertNewsBatch(ctx context.Context, items []data.NewsItem) error {
 			item.PublishedAt.UTC(), item.Tickers, sentiment,
 		)
 	}
-	// Dedup on external_id if present, otherwise on url.
-	q += ` ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING`
+	// Dedup on external_id if present, otherwise on url. The no-op DO UPDATE
+	// (instead of DO NOTHING) makes RETURNING yield conflicting rows too, so the
+	// caller gets a UUID for every externally-identified article — new or
+	// already stored — without a second query.
+	q += ` ON CONFLICT (external_id) WHERE external_id IS NOT NULL
+	       DO UPDATE SET external_id = EXCLUDED.external_id
+	       RETURNING id, external_id`
 
-	_, err := GetDB().Exec(ctx, q, args...)
+	rows, err := GetDB().Query(ctx, q, args...)
 	if err != nil {
 		return err
 	}
-	return nil
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var extID *string
+		if err := rows.Scan(&id, &extID); err != nil {
+			return err
+		}
+		if extID != nil && *extID != "" {
+			ids[*extID] = id
+		}
+	}
+	return rows.Err()
 }
 
 // GetRecentNews retrieves news items for a ticker published after 'since',

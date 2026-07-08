@@ -788,6 +788,39 @@ type ScannerConfig struct {
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
+
+	// NewsSympathy configures news-triggered sympathy sourcing: fresh,
+	// sentiment-strong news on a manually-watched ticker fans out to its graph
+	// neighbours as candidates, carrying the triggering headline as the thesis.
+	NewsSympathy NewsSympathyConfig `yaml:"news_sympathy"`
+}
+
+// NewsSympathyConfig controls news-triggered sympathy candidate sourcing. Where
+// GraphNeighborsConfig walks the graph on a timer regardless of events, this
+// source reacts to news: a fresh, sentiment-strong article about watched ticker
+// A surfaces A's eligible graph neighbours as candidates, each carrying the
+// triggering headline + sentiment + relationship so the scoring LLM evaluates
+// the spillover thesis (and its direction) rather than a naked chart. Edge
+// eligibility reuses the GraphNeighbors thresholds. Disabled by default.
+type NewsSympathyConfig struct {
+	// Enabled turns news-sympathy sourcing on or off. Default: false.
+	Enabled bool `yaml:"enabled"`
+
+	// LookbackHours is how fresh a triggering article must be. Stale news has
+	// already been priced in — the spillover edge decays in hours. Default: 6.
+	LookbackHours int `yaml:"lookback_hours"`
+
+	// MinAbsSentiment is the minimum |sentiment_score| (0–1) for an article to
+	// act as a trigger; near-neutral news does not move related names. Default: 0.35.
+	MinAbsSentiment float64 `yaml:"min_abs_sentiment"`
+
+	// MaxPerScan caps sympathy candidates added to the pool per scan. Default: 5.
+	MaxPerScan int `yaml:"max_per_scan"`
+
+	// PairCooldownHours suppresses re-triggering the same (seed, neighbour)
+	// pair, so one running story doesn't re-surface the same sympathy idea
+	// every scan. Default: 24.
+	PairCooldownHours int `yaml:"pair_cooldown_hours"`
 }
 
 // GraphNeighborsConfig controls whether the scanner sources additional candidates

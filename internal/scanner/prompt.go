@@ -74,6 +74,7 @@ Rules:
     - oversold_bounce → "mean_reversion"
 - timeframes: momentum plays should use ["1H", "4H"] for entry timing; add "1D" only for longer multi-day swings. Prefer ["1H", "4H"] for momentum_breakout and news_catalyst setups. Use ["1D"] only for oversold_bounce or "other" where the move is likely to play out over several days
 - if a "Graph link" is shown, the candidate was surfaced because it is related (supply chain, competition, etc.) to a ticker already being watched. Treat the link as a thesis to confirm, not a reason to add on its own: require a credible swing setup (catalyst, volume, or momentum) in the candidate itself before "add".
+- if the Graph link begins with "SYMPATHY TRIGGER", fresh news just hit the RELATED ticker, not this one. Reason through the spillover explicitly: (1) direction — a supplier/partner/sector peer usually moves WITH the news, while a competitor may move AGAINST it (their loss can be this company's gain); judge from the specific relationship, not a fixed rule. (2) magnitude — how much of the related ticker's news plausibly transfers to this name's revenue or sentiment. (3) timing — check this candidate's own price/volume: if it has already repriced with the story, the sympathy edge is gone ("skip"); if it has not yet reacted and the spillover logic is sound, that unpriced lag IS the setup.
 - This is a discovery watchlist — add anything with a credible setup worth monitoring; the trading engine applies its own signal gates before acting.`, convictionStr)
 
 	var sb strings.Builder

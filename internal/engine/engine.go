@@ -526,13 +526,13 @@ func (e *Engine) tick(ctx context.Context) error {
 			continue
 		}
 		wg.Add(1)
-		go func(ticker string, timeframes, strategies []string, source string, conviction float64) {
+		go func(item store.WatchlistItem) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, ticker, timeframes, strategies, source, conviction)
-		}(item.Ticker, item.Timeframes, item.Strategies, item.Source, item.MinConfidence)
+			e.processStock(ctx, item.Ticker, item.Timeframes, item.Strategies, item.Source, item.MinConfidence, item.GraphContext)
+		}(item)
 	}
 
 	wg.Wait()
@@ -558,7 +558,11 @@ func (e *Engine) tick(ctx context.Context) error {
 // scannerConviction carries the scanner's conviction score (0.0–1.0) for
 // scanner-sourced tickers; 0 for manual/config sources. Used by the
 // scanner-only RSI-delta loosen (#317).
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64) {
+// graphContext, when non-empty, is the persisted origin thesis for a
+// scanner-sourced candidate (graph link / news-sympathy trigger, migration
+// 038); it is prepended to the knowledge-graph prompt section so the trading
+// analysts see WHY the ticker is on the watchlist.
+func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64, graphContext string) {
 	if len(timeframes) == 0 {
 		timeframes = []string{string(data.Timeframe1Day)}
 	}
@@ -689,7 +693,7 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	}
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source)
+	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source, graphContext)
 }
 
 // buildPortfolioContext maps live portfolio state into the analysis request so
@@ -781,7 +785,7 @@ func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.Portfol
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string, source string) {
+func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string, source string, graphContext string) {
 	if set == nil {
 		return
 	}
@@ -913,6 +917,13 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	var knowledgeCtx string
 	if gc, err := knowledge.BuildContext(ctx, ticker, e.portfolio.PositionMap()); err == nil {
 		knowledgeCtx = gc.Format()
+	}
+	// Prepend the candidate's persisted origin thesis (graph link / sympathy
+	// trigger) so the analysts know WHY this ticker is on the watchlist — e.g.
+	// "SYMPATHY TRIGGER — NVDA news 2h ago (...)". Stable per watchlist item,
+	// so it does not churn the prompt cache.
+	if graphContext != "" {
+		knowledgeCtx = "CANDIDATE ORIGIN: " + graphContext + "\n\n" + knowledgeCtx
 	}
 
 	// Semantic search for similar past setups (best-effort).
@@ -1435,7 +1446,8 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 		logger.Warn("fetch news", "ticker", ticker, "err", err.Error())
 		return
 	}
-	if err := store.UpsertNewsItems(ctx, items); err != nil {
+	newsIDs, err := store.UpsertNewsItems(ctx, items)
+	if err != nil {
 		logger.Warn("upsert news", "ticker", ticker, "err", err.Error())
 		return
 	}
@@ -1457,7 +1469,11 @@ func (e *Engine) fetchAndStoreNews(ctx context.Context, ticker string) {
 	}
 	for i := 0; i < maxItems; i++ {
 		item := items[i]
-		e.enricher.EnrichNewsItem(ctx, "", item.Headline, item.Summary)
+		// Pass the stored row's UUID so the enricher records entity/relationship
+		// mentions — the corroboration count that gates graph-neighbor scanner
+		// eligibility. An empty ID (article without external_id) skips mention
+		// recording, matching prior behavior for those rows.
+		e.enricher.EnrichNewsItem(ctx, newsIDs[item.ExternalID], item.Headline, item.Summary)
 	}
 }
 

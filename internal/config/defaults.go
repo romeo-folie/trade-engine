@@ -390,6 +390,13 @@ func Defaults() *Config {
 				MinCorroboration: 2,
 				MinEdgeStrength:  0.6,
 			},
+			NewsSympathy: NewsSympathyConfig{
+				Enabled:           false,
+				LookbackHours:     6,
+				MinAbsSentiment:   0.35,
+				MaxPerScan:        5,
+				PairCooldownHours: 24,
+			},
 		},
 		Feedback: FeedbackConfig{
 			Enabled:             false,

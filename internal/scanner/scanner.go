@@ -55,6 +55,12 @@ type MarketScanner struct {
 	Bus          bus
 	Cfg          config.ScannerConfig
 	Now          func() time.Time // injectable for tests; defaults to time.Now
+
+	// sympathyFired tracks (seed, neighbour) pairs already surfaced by
+	// news-sympathy sourcing, pruned after the configured cooldown so one
+	// running story doesn't re-surface the same idea every scan. Only touched
+	// from the single-threaded scan loop.
+	sympathyFired map[string]time.Time
 }
 
 // Run starts the scanner loop. It blocks until ctx is cancelled.
@@ -118,6 +124,14 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	if graphCands := s.graphNeighborCandidates(ctx, candidates); len(graphCands) > 0 {
 		candidates = append(candidates, graphCands...)
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
+	}
+
+	// 2.6 Source news-sympathy candidates — graph neighbours of watched tickers
+	// with fresh, sentiment-strong news, carrying the triggering headline as the
+	// thesis. No-op unless news_sympathy is enabled.
+	if sympCands := s.newsSympathyCandidates(ctx, candidates); len(sympCands) > 0 {
+		candidates = append(candidates, sympCands...)
+		slog.Info("scanner: news-sympathy candidates added to pool", "count", len(sympCands))
 	}
 
 	if len(candidates) == 0 {
@@ -198,7 +212,11 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			// back to the scanner's in-memory state.
 			MinConfidence: sc.score.Conviction,
 			Source:        "scanner",
-			ExpiresAt:     &expiresAt,
+			// Persist WHY this candidate was sourced (graph link / sympathy
+			// trigger) so the engine's deep-analysis prompt carries the origin
+			// thesis instead of losing it after this pass.
+			GraphContext: sc.candidate.GraphContext,
+			ExpiresAt:    &expiresAt,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
 			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)
