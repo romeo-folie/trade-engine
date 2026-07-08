@@ -118,6 +118,21 @@ func NormalizeOrderStatus(status string) string {
 	}
 }
 
+// IsTerminalOrderStatus reports whether a broker order status is final — the
+// order will receive no further fills. A fill PRICE appearing is NOT terminal:
+// a partially_filled fractional order has a price while more fills are coming,
+// and treating that as done is what froze NOK's 148-share entry at its first
+// 30-share partial. Accepts raw broker statuses or normalized ones.
+func IsTerminalOrderStatus(status string) bool {
+	switch NormalizeOrderStatus(status) {
+	case "filled", "cancelled", "rejected":
+		return true
+	}
+	// done_for_day: no more fills this session; the engine's day-TIF orders
+	// won't resume tomorrow, so treat as terminal for fill polling.
+	return status == "done_for_day"
+}
+
 // AccountInfo contains the broker account's cash and portfolio equity.
 // Used as the single source of truth for portfolio valuation when a real
 // broker is configured.

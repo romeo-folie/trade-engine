@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -765,15 +766,45 @@ Modes:
 			}
 		}
 
-		// Startup broker-vs-DB reconciler (Issue #313). Pure observability:
-		// emits WARN per ticker where broker quantity diverges from summed DB
-		// open-trade quantity. Never crashes boot — broker errors are logged
-		// and swallowed inside the reconciler so a stale dev DB or paused
-		// broker can't block start. Returns nothing.
+		// Startup broker-vs-DB reconciler (Issue #313). Emits WARN per ticker
+		// where broker quantity diverges from summed DB open-trade quantity.
+		// Never crashes boot — broker errors are logged and swallowed inside
+		// the reconciler so a stale dev DB or paused broker can't block start.
+		//
+		// Drift no longer dies as a log line (NOK: 178 orphaned shares logged
+		// on every boot while bleeding −29%): it is alerted via Telegram, and
+		// with engine.adopt_broker_orphans the untracked positions are adopted
+		// as recovery trade rows so stops and analyst exits manage them again.
+		var drifts []engine.BrokerDrift
 		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
-			engine.ReconcileBrokerVsDBWithStore(ctx, bv, 0)
+			drifts = engine.ReconcileBrokerVsDBWithStore(ctx, bv, 0)
 		} else {
 			engine.ReconcileBrokerVsDBWithStore(ctx, nil, 0)
+		}
+		if len(drifts) > 0 {
+			var adopted []string
+			if cfg.Engine.AdoptBrokerOrphans {
+				adopted = engine.AdoptBrokerOrphansWithStore(ctx, drifts,
+					cfg.Risk.DefaultStopLossPct, cfg.Risk.DefaultTakeProfitPct)
+			}
+			if tgBot != nil {
+				msg := fmt.Sprintf("⚠️ *Broker/DB drift*: %d ticker(s) diverged", len(drifts))
+				for i, d := range drifts {
+					if i == 8 {
+						msg += fmt.Sprintf("\n… and %d more (see engine.log)", len(drifts)-i)
+						break
+					}
+					msg += fmt.Sprintf("\n`%s` broker=%.4f db=%.4f (%s)", d.Ticker, d.BrokerQty, d.DBQty, d.Source)
+				}
+				if len(adopted) > 0 {
+					msg += fmt.Sprintf("\n✅ adopted as recovery trades: `%s`", strings.Join(adopted, ", "))
+				} else if !cfg.Engine.AdoptBrokerOrphans {
+					msg += "\n(adoption off — set engine.adopt_broker_orphans to recover orphans)"
+				}
+				if err := tgBot.SendImmediate(ctx, msg); err != nil {
+					logger.Warn("telegram: failed to send drift alert", "err", err)
+				}
+			}
 		}
 
 		if err := eng.Run(ctx); err != nil {

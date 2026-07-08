@@ -173,6 +173,12 @@ type EngineConfig struct {
 	InitialCapital  float64 `yaml:"initial_capital"`  // starting cash for paper trading (default 100000)
 	LogTimezone     string  `yaml:"log_timezone"`     // IANA timezone for display (default "UTC")
 	SkipRecentTick  *bool   `yaml:"skip_recent_tick"` // skip startup tick if last analysis is within tick interval (default true)
+	// AdoptBrokerOrphans lets the startup reconciler insert recovery trade rows
+	// for broker positions the DB does not track (source=broker_only, or the
+	// untracked surplus of a same-direction mismatch), so stops and analyst
+	// exits manage them again. Stops anchor on the broker's current price.
+	// Default false: drift is alert-only until an operator opts in.
+	AdoptBrokerOrphans bool `yaml:"adopt_broker_orphans"`
 }
 
 // ShouldSkipRecentTick returns true (default) unless explicitly set to false.
