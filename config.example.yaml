@@ -10,6 +10,7 @@ engine:
   initial_capital: 100000      # Starting cash for paper trading / position sizing
   log_timezone: UTC            # IANA timezone for engine log timestamps (e.g. America/New_York)
   skip_recent_tick: true       # Skip the startup tick when the last analysis is newer than tick_interval_sec
+  adopt_broker_orphans: false  # Startup reconciler inserts recovery trade rows for untracked broker positions (stops anchored on current price); false = drift is alert-only
 
 # ── Model configuration ───────────────────────────────────────────────────────
 # Use the registry+roles block (recommended) to name models and reference them

@@ -2006,13 +2006,34 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	})
 
 	// If the broker returned a zero fill price (Alpaca market orders fill async),
-	// poll GetOrderStatus until we have a real price and backfill the trade record.
+	// poll GetOrderStatus and backfill the trade record — until the order reaches
+	// a TERMINAL state, not merely until a price appears. The old `FilledPrice >
+	// 0 → done` condition froze PARTIAL fills as trade truth: NOK's 148.31-share
+	// fractional entry was recorded at its first partial (30 shares), the exit
+	// later sold only those 30, and 118 shares were orphaned at the broker with
+	// no stop and analyst SELLs blocked by the ownership guard. Every poll now
+	// re-backfills, so quantity tracks upward while the order keeps filling.
 	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
 		brokerOrderID := result.BrokerOrderID
 		executor := e.executor
 		go func() {
-			const maxRetries = 8
+			// 40 × 3s = 2 min: fractional market orders can fill in several
+			// parts; the old 24s window was part of how a partial got frozen.
+			const maxRetries = 40
 			const retryDelay = 3 * time.Second
+			backfill := func(status execution.OrderResult) {
+				bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer bfCancel()
+				if err := store.UpdateTradeEntryPrice(bfCtx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
+					logger.Warn("fill poll: update trade entry price",
+						"trade_id", tradeID, "err", err)
+				}
+				if err := store.UpdateOrderFillPrice(bfCtx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
+					logger.Warn("fill poll: update order fill price",
+						"broker_order_id", brokerOrderID, "err", err)
+				}
+			}
+			var lastQty float64
 			for i := 0; i < maxRetries; i++ {
 				time.Sleep(retryDelay)
 				pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2023,33 +2044,28 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 						"broker_order_id", brokerOrderID, "attempt", i+1, "err", err)
 					continue
 				}
-				if status.FilledPrice > 0 {
-					bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer bfCancel()
-					if err := store.UpdateTradeEntryPrice(bfCtx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
-						logger.Warn("fill poll: update trade entry price",
-							"trade_id", tradeID, "err", err)
-					} else {
-						logger.Info("fill poll: entry price backfilled",
-							"trade_id", tradeID,
-							"ticker", sig.Ticker,
-							"entry_price", status.FilledPrice,
-							"qty", status.FilledQty,
-						)
-					}
-					if err := store.UpdateOrderFillPrice(bfCtx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
-						logger.Warn("fill poll: update order fill price",
-							"broker_order_id", brokerOrderID, "err", err)
-					}
+				if status.FilledPrice > 0 && status.FilledQty != lastQty {
+					backfill(status)
+					lastQty = status.FilledQty
+				}
+				if execution.IsTerminalOrderStatus(status.Status) {
+					logger.Info("fill poll: order terminal",
+						"trade_id", tradeID,
+						"ticker", sig.Ticker,
+						"status", status.Status,
+						"entry_price", status.FilledPrice,
+						"qty", status.FilledQty,
+					)
 					return
 				}
-				logger.Debug("fill poll: price still zero, retrying",
-					"broker_order_id", brokerOrderID, "attempt", i+1)
+				logger.Debug("fill poll: order not terminal yet, retrying",
+					"broker_order_id", brokerOrderID, "attempt", i+1, "status", status.Status, "filled_qty", status.FilledQty)
 			}
-			logger.Warn("fill poll: entry price not resolved after max retries — manual reconciliation needed",
+			logger.Warn("fill poll: order not terminal after max retries — recorded last known fill; reconciler will surface any residue",
 				"trade_id", tradeID,
 				"broker_order_id", brokerOrderID,
 				"ticker", sig.Ticker,
+				"last_filled_qty", lastQty,
 			)
 		}()
 	}
@@ -2215,6 +2231,52 @@ func (e *Engine) pollExitFill(ctx context.Context, brokerOrderID string) (execut
 const exitReconcileInterval = 10 * time.Minute
 
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
+// checkExitResidue verifies, shortly after an exit, that the broker holds no
+// more of `ticker` than the DB's remaining open trades account for. Fires the
+// comparison after a settle delay so async exit fills are reflected in the
+// broker's position feed. Detection-only: residue is logged at ERROR (and
+// surfaced by the startup reconciler / adopt_broker_orphans on next boot).
+func (e *Engine) checkExitResidue(ticker string) {
+	executor := e.executor
+	go func() {
+		time.Sleep(15 * time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		positions, err := executor.GetPositions(ctx)
+		if err != nil || positions == nil {
+			return // paper executor reports none; broker errors are non-fatal here
+		}
+		var brokerQty float64
+		for _, p := range positions {
+			if strings.EqualFold(p.Ticker, ticker) {
+				brokerQty += math.Abs(p.Quantity)
+			}
+		}
+		if brokerQty == 0 {
+			return
+		}
+		open, err := store.GetOpenTrades(ctx)
+		if err != nil {
+			return
+		}
+		var dbQty float64
+		for _, t := range open {
+			if strings.EqualFold(t.Ticker, ticker) {
+				dbQty += math.Abs(t.Quantity)
+			}
+		}
+		if residue := brokerQty - dbQty; residue > DefaultBrokerDriftToleranceShares {
+			logger.Error("exit residue: broker still holds untracked shares after exit — orphaned position",
+				"ticker", ticker,
+				"broker_qty", brokerQty,
+				"db_open_qty", dbQty,
+				"residue", residue,
+			)
+		}
+	}()
+}
+
 func (e *Engine) monitorPositions(ctx context.Context) {
 	// Refresh portfolio state from executor positions.
 	e.refreshPortfolio(ctx)
@@ -2392,6 +2454,13 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			EntryPrice: t.EntryPrice, ExitPrice: exitPrice,
 			PnL: pnl, PnLPct: pnlPct, Reason: exitReason,
 		})
+
+		// Residue check: after the exit settles, the broker must hold no more
+		// of this ticker than the DB still tracks. This is how the NOK orphan
+		// stayed invisible — exits sold the recorded quantity and nobody
+		// compared against the broker's remaining position. Async: the exit
+		// fill needs a moment to settle before positions reflect it.
+		e.checkExitResidue(t.Ticker)
 	}
 
 	// Update portfolio state after monitoring.
