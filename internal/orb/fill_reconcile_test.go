@@ -92,6 +92,18 @@ func TestMatchOrphanEntries_PartialResidueSingle(t *testing.T) {
 	}
 }
 
+// A wrongly-'cancelled' entry the broker still holds must still match by
+// ticker+side+qty (matching is status-agnostic), so recordReconciledFill can
+// reopen it to 'filled' — today's XAG/XAU trap.
+func TestMatchOrphanEntries_MatchesCancelledRow(t *testing.T) {
+	f := orphanFinding{Ticker: "XAG/USD", BrokerQty: -800, ManagedQty: 0}
+	cancelled := store.ORBTrade{Ticker: "XAG/USD", Side: "sell", Qty: 800, OrderID: "sell-id", Status: "cancelled"}
+	got := matchOrphanEntries(f, []store.ORBTrade{cancelled}, 0.5)
+	if len(got) != 1 || got[0].OrderID != "sell-id" {
+		t.Fatalf("expected cancelled sell-id to match, got %v", ids(got))
+	}
+}
+
 func TestOppositeSide(t *testing.T) {
 	if oppositeSide("buy") != "sell" || oppositeSide("BUY") != "sell" {
 		t.Error("opposite of buy should be sell")

@@ -403,6 +403,64 @@ func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade,
 	return out, rows.Err()
 }
 
+// GetRecentlyCancelledORBTrades returns ORB trades cancelled on/after `since`.
+// The broker-truth fill reconciler uses it to heal the July/today's trap: an
+// entry filled at IBKR but marked 'cancelled' at session end (GetOrderStatus
+// couldn't confirm the fill), leaving the position unmanaged and invisible to
+// every status='filled' reconciler. When the broker still holds the matching
+// position such a row is reopened to 'filled'.
+func GetRecentlyCancelledORBTrades(ctx context.Context, db *pgxpool.Pool, since time.Time) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at, stop_moved_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
+		FROM orb_trades WHERE status='cancelled' AND closed_at >= $1
+		ORDER BY closed_at`, since.UTC())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.TpOrderID, &t.SlOrderID,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ReopenORBTradeToFilled flips a wrongly-'cancelled' entry back to 'filled' with
+// the given fill price (clearing closed_at) when the broker is found to still
+// hold the position. Guarded to status='cancelled' so it never disturbs a
+// genuinely closed or filled row. Returns whether a row changed.
+func ReopenORBTradeToFilled(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='filled', fill_price=$1, filled_at=NOW(), closed_at=NULL
+		WHERE order_id=$2 AND status='cancelled'`, fillPrice, orderID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // ORBStats is a per-ticker performance aggregate over ORB trades. Closed-trade
 // metrics drive the `te orb stats` summary; OpenFilled surfaces trades whose entry
 // filled but whose exit has not yet been recorded (so the reader can spot a gap).

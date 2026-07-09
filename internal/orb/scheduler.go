@@ -1643,6 +1643,13 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 	sh, sm, _ := sessionNow.Clock()
 	sessionMinutes := sh*60 + sm
 	if sessionMinutes >= s.sessionCleanupMinutes() {
+		// Broker-truth guard (always on, forex/metals): record any held position
+		// as a filled entry BEFORE the cancel loop, so a filled-but-unconfirmed
+		// metals order (GetOrderStatus "order not found") is never cancelled into
+		// the invisible-orphan trap. Filled entries are cleared from s.orderIDs
+		// here, so reconcileOrCancel below only cancels genuinely-unfilled orders.
+		s.reconcileHeldPositionsToFilled(ctx)
+
 		if s.executor != nil {
 			sides := [2]string{"buy", "sell"}
 			// reconcileOrCancel applies the end-of-session reconcile-or-cancel to one

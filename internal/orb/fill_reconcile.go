@@ -18,6 +18,11 @@ import (
 // the extra GetPositions call cheap.
 const orphanFillReconcileInterval = 2 * time.Minute
 
+// reconcileCancelledLookback bounds how far back a wrongly-'cancelled' entry may
+// be reopened to 'filled', so a stale cancel can't match an unrelated later
+// position. A day covers same-session and overnight metals holds.
+const reconcileCancelledLookback = 24 * time.Hour
+
 // reconcileOrphanFills closes the metals-fill blind spot behind the July
 // incident: a bracket entry fills at IBKR but GetOrderStatus can't confirm it
 // (after the size/stop confirmation-prompt chain the parent order id ages out
@@ -38,13 +43,27 @@ const orphanFillReconcileInterval = 2 * time.Minute
 // Forex/metals only and opt-in via forex_orb.reconcile_orphan_fills, because it
 // mutates real-money order/trade state from position inference.
 func (s *ORBScheduler) reconcileOrphanFills(ctx context.Context) {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || !s.forexCfg.ReconcileOrphanFills || s.db == nil || s.executor == nil {
-		return
+	if s.forexCfg == nil || !s.forexCfg.Enabled || !s.forexCfg.ReconcileOrphanFills {
+		return // proactive mid-session reconcile is opt-in
 	}
 	if time.Since(s.lastOrphanFillReconcile) < orphanFillReconcileInterval {
 		return
 	}
 	s.lastOrphanFillReconcile = s.now()
+	s.reconcileHeldPositionsToFilled(ctx)
+}
+
+// reconcileHeldPositionsToFilled is the broker-truth core, WITHOUT the opt-in
+// flag or throttle. The session-cleanup path calls it directly and
+// unconditionally, immediately before cancelling unfilled orders — so a filled-
+// but-unconfirmed metals entry (GetOrderStatus returns "order not found") is
+// recorded as filled from the held position instead of being wrongly cancelled
+// (the July / today's XAG+XAU trap: cancelled at session end, then invisible to
+// every status='filled' reconciler because they don't read cancelled rows).
+func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
+	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil || s.executor == nil {
+		return
+	}
 
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
@@ -61,27 +80,37 @@ func (s *ORBScheduler) reconcileOrphanFills(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: load pending trades failed", "err", err)
 		return
 	}
+	// Also consider recently-cancelled entries: the July/today's trap is a fill
+	// wrongly marked 'cancelled' at session end. When the broker still holds the
+	// position, such a row is reopened to 'filled'. Bounded to a day so a stale
+	// cancel can't match an unrelated new position.
+	cancelled, err := store.GetRecentlyCancelledORBTrades(ctx, s.db, s.now().Add(-reconcileCancelledLookback))
+	if err != nil {
+		slog.Warn("orb: fill reconcile: load cancelled trades failed", "err", err)
+		return
+	}
+	candidates := append(append([]store.ORBTrade{}, pending...), cancelled...)
 
 	// Reuse the detector's residue math to find positions no filled row explains,
-	// then attribute each to the pending entry rows that account for it.
+	// then attribute each to the entry rows (pending OR wrongly-cancelled) that
+	// account for it.
 	for _, f := range findOrphanedPositions(positions, filled, orphanPositionTolerance) {
-		entries := matchOrphanEntries(f, pending, orphanPositionTolerance)
+		entries := matchOrphanEntries(f, candidates, orphanPositionTolerance)
 		if len(entries) == 0 {
-			continue // no pending entry explains it — leave it for the alerting detector
+			continue // no entry explains it — leave it for the alerting detector
 		}
 		fillPrice := math.Abs(avgCostFor(positions, f.Ticker))
 
 		// Record the fill on every matched row (a split bracket stores the runner
-		// and partial as separate same-side rows summing to the residue).
-		// persistEntryFill is a pure DB update keyed on order_id, so the broker's
-		// inability to find the order can't block it; once filled, the DB-backed
-		// managers (adaptive stops, time exits, trades-feed exit reconcile) engage.
+		// and partial as separate same-side rows summing to the residue). Once
+		// filled, the DB-backed managers (adaptive stops, time exits, trades-feed
+		// exit reconcile) engage.
 		var totalQty int
 		for _, e := range entries {
 			slog.Warn("orb: fill reconcile: recording orphaned entry fill from broker truth",
-				"ticker", f.Ticker, "side", e.Side, "qty", e.Qty,
+				"ticker", f.Ticker, "side", e.Side, "qty", e.Qty, "prior_status", e.Status,
 				"broker_qty", f.BrokerQty, "fill_price", fillPrice, "order_id", e.OrderID)
-			s.persistEntryFill(ctx, f.Ticker, e.Side, e.OrderID, fillPrice)
+			s.recordReconciledFill(ctx, e, fillPrice)
 			s.clearEntryID(f.Ticker, e.OrderID)
 			totalQty += e.Qty
 		}
@@ -96,6 +125,29 @@ func (s *ORBScheduler) reconcileOrphanFills(ctx context.Context) {
 	// cancel fails — a live opposing stop-entry must never linger and reverse the
 	// position.
 	s.cancelStaleOCOLegs(ctx)
+}
+
+// recordReconciledFill marks one matched entry row filled, dispatching by its
+// prior status: a 'pending' row goes through the shared persistEntryFill path
+// (sanitizes the price, publishes, updates tracking); a wrongly-'cancelled' row
+// is reopened to 'filled'. Both are pure DB updates keyed on order_id, so the
+// broker's inability to find the order can't block them.
+func (s *ORBScheduler) recordReconciledFill(ctx context.Context, e *store.ORBTrade, price float64) {
+	if strings.EqualFold(e.Status, "cancelled") {
+		reopened, err := store.ReopenORBTradeToFilled(ctx, s.db, e.OrderID, price)
+		if err != nil {
+			slog.Error("orb: fill reconcile: reopen cancelled trade failed",
+				"ticker", e.Ticker, "side", e.Side, "order_id", e.OrderID, "err", err)
+			return
+		}
+		if reopened {
+			s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+				OrderID: e.OrderID, Ticker: e.Ticker, Side: e.Side, Status: "filled", FillPrice: price,
+			})
+		}
+		return
+	}
+	s.persistEntryFill(ctx, e.Ticker, e.Side, e.OrderID, price)
 }
 
 // cancelStaleOCOLegs cancels pending ORB entries whose opposite-side sibling on
