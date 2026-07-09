@@ -100,6 +100,27 @@ func TestAggregateOpenPositions_FallbackToEntryWhenNoMark(t *testing.T) {
 	}
 }
 
+func TestAggregateOpenPositions_MultiLotNoMarkValuesAtCost(t *testing.T) {
+	// Two lots, no candle: 10@$100 + 30@$120 → weighted avg $115, qty 40.
+	// With no mark, the aggregate must value at cost (PnL exactly 0), NOT at
+	// the last lot's entry price (which would fabricate +$200).
+	trades := []store.Trade{
+		{Ticker: "AAA", Direction: "long", EntryPrice: 100, Quantity: 10},
+		{Ticker: "AAA", Direction: "long", EntryPrice: 120, Quantity: 30},
+	}
+	noMark := func(string) (float64, time.Time) { return 0, time.Time{} }
+	rows, _, _, _ := aggregateOpenPositions(trades, noMark)
+	if len(rows) != 1 {
+		t.Fatalf("want 1 row, got %d", len(rows))
+	}
+	if !approx(rows[0].CurrentPrice, 115) {
+		t.Errorf("unmarked current = %.4f, want weighted-avg entry 115", rows[0].CurrentPrice)
+	}
+	if !approx(rows[0].PnL, 0) {
+		t.Errorf("unmarked multi-lot PnL = %.4f, want exactly 0", rows[0].PnL)
+	}
+}
+
 func TestAggregateOpenPositions_FreshestIsMax(t *testing.T) {
 	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	newer := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)

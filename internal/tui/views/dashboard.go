@@ -256,6 +256,7 @@ func aggregateOpenPositions(
 	type group struct {
 		row       PositionRow
 		costBasis float64
+		marked    bool // a real candle mark was found for this ticker
 	}
 	groups := make(map[string]*group)
 	order := make([]string, 0, len(trades))
@@ -267,9 +268,11 @@ func aggregateOpenPositions(
 		}
 		lots++
 
-		currentPrice := t.EntryPrice
+		// markPrice is deterministic per ticker, so all lots of a group share
+		// the same result — either a real mark or none.
+		var markedPrice float64
 		if px, ts := markPrice(t.Ticker); px > 0 {
-			currentPrice = px
+			markedPrice = px
 			if ts.After(freshest) {
 				freshest = ts
 			}
@@ -290,14 +293,22 @@ func aggregateOpenPositions(
 		}
 		g.row.Quantity += t.Quantity
 		g.costBasis += t.EntryPrice * t.Quantity
-		g.row.CurrentPrice = currentPrice // identical across a ticker's lots
 		g.row.Lots++
+		if markedPrice > 0 {
+			g.row.CurrentPrice = markedPrice // identical across a ticker's lots
+			g.marked = true
+		}
 	}
 
 	for _, key := range order {
 		g := groups[key]
 		if g.row.Quantity > 0 {
 			g.row.EntryPrice = g.costBasis / g.row.Quantity // weighted average
+		}
+		if !g.marked {
+			// No usable candle: value at cost (weighted-average entry) so P&L is
+			// exactly 0, rather than the arbitrary last-lot entry price.
+			g.row.CurrentPrice = g.row.EntryPrice
 		}
 		posValue := g.row.CurrentPrice * g.row.Quantity
 		pnl := posValue - g.costBasis
