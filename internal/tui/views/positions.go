@@ -39,8 +39,8 @@ func FetchPositionDetail(ctx context.Context, tradeID string) (d PositionDetail,
 	}
 	d.Trade = *trade
 
-	// Current price
-	if c, err := store.GetLatestCandle(ctx, trade.Ticker, "1d"); err == nil && c != nil {
+	// Current price — freshest candle across all timeframes, entry as fallback.
+	if c, err := store.GetFreshestCandle(ctx, trade.Ticker); err == nil && c != nil && c.Close > 0 {
 		d.CurrentPrice = c.Close
 	} else {
 		d.CurrentPrice = trade.EntryPrice
@@ -153,14 +153,21 @@ func RenderPositionDetail(d PositionDetail, width, height int) string {
 func RenderPositionDetailStatic(p PositionRow, width, height int) string {
 	var b strings.Builder
 
-	title := sectionTitle.Render(fmt.Sprintf("Position: %s", p.Ticker))
-	b.WriteString(title + "\n")
+	titleText := fmt.Sprintf("Position: %s", p.Ticker)
+	if p.Direction != "" {
+		titleText += fmt.Sprintf(" (%s)", strings.ToUpper(p.Direction))
+	}
+	b.WriteString(sectionTitle.Render(titleText) + "\n")
 	b.WriteString(dimText.Render("  Press [esc] to return") + "\n\n")
 
 	pnlStr := colorPnL(p.PnL)
 	pnlPctStr := colorPnLPct(p.PnLPct)
 
-	b.WriteString(fmt.Sprintf("  Entry: $%.2f   Current: $%.2f   Qty: %.4f\n", p.EntryPrice, p.CurrentPrice, p.Quantity))
+	entryLabel := "Entry"
+	if p.Lots > 1 {
+		entryLabel = fmt.Sprintf("Avg entry (%d lots)", p.Lots)
+	}
+	b.WriteString(fmt.Sprintf("  %s: $%.2f   Current: $%.2f   Qty: %.4f\n", entryLabel, p.EntryPrice, p.CurrentPrice, p.Quantity))
 	b.WriteString(fmt.Sprintf("  P&L: %s (%s)\n", pnlStr, pnlPctStr))
 	b.WriteString(fmt.Sprintf("  Stop Loss: $%.2f   Take Profit: $%.2f\n", p.StopLoss, p.TakeProfit))
 	b.WriteString(fmt.Sprintf("  Strategy: %s\n", p.Strategy))

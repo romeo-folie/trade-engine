@@ -78,6 +78,34 @@ func GetCandles(ctx context.Context, ticker string, tf data.Timeframe, from, to 
 
 // GetLatestCandle returns the most recent candle for a ticker+timeframe pair.
 // Returns nil, nil if no candle exists yet.
+// GetFreshestCandle returns the most recent candle for a ticker across ALL
+// timeframes — the freshest available mark-to-market price. The engine scans
+// equities on intraday timeframes (1h/4h) while daily candles are written far
+// less often, so pinning to a single timeframe (e.g. "1d") leaves many tickers
+// with stale or missing prices. Returns (nil, nil) when no candle exists.
+func GetFreshestCandle(ctx context.Context, ticker string) (*data.Candle, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT ticker, timeframe, ts, open, high, low, close, volume, vwap
+		FROM candles
+		WHERE ticker = $1
+		ORDER BY ts DESC
+		LIMIT 1
+	`, ticker)
+
+	var c data.Candle
+	var tfStr string
+	err := row.Scan(&c.Ticker, &tfStr, &c.Timestamp,
+		&c.Open, &c.High, &c.Low, &c.Close, &c.Volume, &c.VWAP)
+	if err != nil {
+		if isNoRows(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	c.Timeframe = data.Timeframe(tfStr)
+	return &c, nil
+}
+
 func GetLatestCandle(ctx context.Context, ticker string, tf data.Timeframe) (*data.Candle, error) {
 	row := GetDB().QueryRow(ctx, `
 		SELECT ticker, timeframe, ts, open, high, low, close, volume, vwap
