@@ -27,8 +27,13 @@ type DashboardData struct {
 	TodayPnL      float64
 	UnrealizedPnL float64
 
-	// Open positions
+	// Open positions, aggregated per (ticker, direction).
 	Positions []PositionRow
+
+	// Position quality / freshness metadata.
+	PositionLots    int       // total valid open trade rows before aggregation
+	MalformedTrades int       // open trades with entry_price<=0 or quantity<=0 (excluded)
+	PriceAsOf       time.Time // timestamp of the freshest candle used to mark positions
 
 	// Pending approvals (manual mode)
 	PendingSignals []SignalRow
@@ -48,9 +53,12 @@ type DashboardData struct {
 	LastUpdate time.Time
 }
 
-// PositionRow is a single row in the open positions table.
+// PositionRow is a single row in the open positions table. When positions are
+// aggregated per ticker, EntryPrice is the quantity-weighted average across
+// lots and Lots is how many open trades were folded into this row.
 type PositionRow struct {
 	Ticker       string
+	Direction    string
 	EntryPrice   float64
 	CurrentPrice float64
 	Quantity     float64
@@ -59,6 +67,7 @@ type PositionRow struct {
 	StopLoss     float64
 	TakeProfit   float64
 	Strategy     string
+	Lots         int
 }
 
 // SignalRow is a single row in the signal feed.
@@ -123,69 +132,43 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 		d.OpenPositionCnt = snap.OpenPositions
 	}
 
-	// Fetch open trades to populate the positions table and refine P&L if more recent
-	// candle data is available.
+	// Fetch open trades and aggregate them per (ticker, direction) into position
+	// rows, marked to the freshest available candle.
 	trades, err := store.GetOpenTrades(ctx)
 	if err == nil {
-		var visibleInvested float64
-		var largestVisiblePosValue float64
-		var localUnrealizedPnL float64
-		for _, t := range trades {
-			// Get latest price for unrealized P&L
-			var currentPrice float64
-			if c, err := store.GetLatestCandle(ctx, t.Ticker, "1d"); err == nil && c != nil {
-				currentPrice = c.Close
-			} else {
-				currentPrice = t.EntryPrice
+		markPrice := func(ticker string) (float64, time.Time) {
+			if c, cerr := store.GetFreshestCandle(ctx, ticker); cerr == nil && c != nil && c.Close > 0 {
+				return c.Close, c.Timestamp
 			}
+			return 0, time.Time{}
+		}
+		d.Positions, d.PositionLots, d.MalformedTrades, d.PriceAsOf = aggregateOpenPositions(trades, markPrice)
 
-			pnl := (currentPrice - t.EntryPrice) * t.Quantity
-			pnlPct := 0.0
-			if t.EntryPrice > 0 {
-				pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-			}
-			if t.Direction == "short" {
-				pnl = (t.EntryPrice - currentPrice) * t.Quantity
-				if t.EntryPrice > 0 {
-					pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-				}
-			}
-
-			posValue := currentPrice * t.Quantity
+		// Aggregate figures derived from the marked rows.
+		var visibleInvested, largestVisiblePosValue, localUnrealizedPnL, totalCostBasis float64
+		for _, p := range d.Positions {
+			posValue := p.CurrentPrice * p.Quantity
+			costBasis := p.EntryPrice * p.Quantity
 			visibleInvested += posValue
-			localUnrealizedPnL += pnl
+			totalCostBasis += costBasis
+			localUnrealizedPnL += p.PnL
 			if posValue > largestVisiblePosValue {
 				largestVisiblePosValue = posValue
 			}
-
-			d.Positions = append(d.Positions, PositionRow{
-				Ticker:       t.Ticker,
-				EntryPrice:   t.EntryPrice,
-				CurrentPrice: currentPrice,
-				Quantity:     t.Quantity,
-				PnL:          pnl,
-				PnLPct:       pnlPct,
-				StopLoss:     t.StopLoss,
-				TakeProfit:   t.TakeProfit,
-				Strategy:     t.Strategy,
-			})
 		}
 
-		// If no snapshot exists, fall back to derived values.
-		// If a snapshot does exist, those values are generally preferred as they
-		// reflect the broker's reality, but we use the live position list count.
+		// Distinct-position count (not raw lot count) is the honest exposure.
 		if len(d.Positions) > 0 {
 			d.OpenPositionCnt = len(d.Positions)
+			// Report unrealized P&L as the sum of the marked positions shown in
+			// the table. The Alpaca snapshot's unrealized_pnl field is often
+			// unpopulated (0), which would otherwise contradict the P&L column.
+			d.UnrealizedPnL = localUnrealizedPnL
 		}
 
 		if d.TotalValue == initialCapital && d.Cash == initialCapital {
-			// Fallback: derive cash and total from cost basis.
-			var totalCostBasis float64
-			for _, t := range trades {
-				totalCostBasis += t.EntryPrice * t.Quantity
-			}
+			// Fallback: derive cash and total from cost basis when no snapshot.
 			d.Invested = visibleInvested
-			d.UnrealizedPnL = localUnrealizedPnL
 			d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
 		}
 
@@ -257,6 +240,90 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 	return d
 }
 
+// aggregateOpenPositions folds open trade lots into one row per
+// (ticker, direction), marked to the price returned by markPrice (which returns
+// a zero price + zero time when no usable mark exists, in which case the lot's
+// entry price is used). EntryPrice on each row is the quantity-weighted average
+// across its lots; PnL uses the correct sign for shorts. Malformed lots
+// (entry_price <= 0 or quantity <= 0) are excluded and counted separately.
+//
+// Extracted from FetchDashboardData so the money math is unit-testable without
+// a database. Rows are returned in first-seen (opened_at DESC) order.
+func aggregateOpenPositions(
+	trades []store.Trade,
+	markPrice func(ticker string) (price float64, ts time.Time),
+) (rows []PositionRow, lots, malformed int, freshest time.Time) {
+	type group struct {
+		row       PositionRow
+		costBasis float64
+		marked    bool // a real candle mark was found for this ticker
+	}
+	groups := make(map[string]*group)
+	order := make([]string, 0, len(trades))
+
+	for _, t := range trades {
+		if t.EntryPrice <= 0 || t.Quantity <= 0 {
+			malformed++
+			continue
+		}
+		lots++
+
+		// markPrice is deterministic per ticker, so all lots of a group share
+		// the same result — either a real mark or none.
+		var markedPrice float64
+		if px, ts := markPrice(t.Ticker); px > 0 {
+			markedPrice = px
+			if ts.After(freshest) {
+				freshest = ts
+			}
+		}
+
+		key := t.Ticker + "|" + t.Direction
+		g := groups[key]
+		if g == nil {
+			g = &group{row: PositionRow{
+				Ticker:     t.Ticker,
+				Direction:  t.Direction,
+				StopLoss:   t.StopLoss, // representative: first (most-recent) lot
+				TakeProfit: t.TakeProfit,
+				Strategy:   t.Strategy,
+			}}
+			groups[key] = g
+			order = append(order, key)
+		}
+		g.row.Quantity += t.Quantity
+		g.costBasis += t.EntryPrice * t.Quantity
+		g.row.Lots++
+		if markedPrice > 0 {
+			g.row.CurrentPrice = markedPrice // identical across a ticker's lots
+			g.marked = true
+		}
+	}
+
+	for _, key := range order {
+		g := groups[key]
+		if g.row.Quantity > 0 {
+			g.row.EntryPrice = g.costBasis / g.row.Quantity // weighted average
+		}
+		if !g.marked {
+			// No usable candle: value at cost (weighted-average entry) so P&L is
+			// exactly 0, rather than the arbitrary last-lot entry price.
+			g.row.CurrentPrice = g.row.EntryPrice
+		}
+		posValue := g.row.CurrentPrice * g.row.Quantity
+		pnl := posValue - g.costBasis
+		if g.row.Direction == "short" {
+			pnl = g.costBasis - posValue
+		}
+		if g.costBasis > 0 {
+			g.row.PnLPct = (pnl / g.costBasis) * 100
+		}
+		g.row.PnL = pnl
+		rows = append(rows, g.row)
+	}
+	return rows, lots, malformed, freshest
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────────
 
 var (
@@ -324,7 +391,7 @@ func RenderDashboard(d DashboardData, width, height, selectedPos, selectedPendin
 	var b strings.Builder
 	b.WriteString(top.String())
 	b.WriteString("\n\n")
-	b.WriteString(renderPositionsTable(d.Positions, width, selectedPos, posBudget))
+	b.WriteString(renderPositionsTable(d, width, selectedPos, posBudget))
 	b.WriteString("\n\n")
 	b.WriteString(bottom.String())
 
@@ -362,14 +429,45 @@ func renderPortfolioSummary(d DashboardData) string {
 		fmt.Sprintf("  Today P&L: %-14s  Unrealized: %s", pnl, unrealized)
 }
 
+// positionsNote builds the dim annotation shown next to the "Open Positions"
+// title: the raw lot count when it differs from the aggregated row count, any
+// excluded malformed trades, and how fresh the marked prices are.
+func positionsNote(d DashboardData) string {
+	var parts []string
+	if d.PositionLots > len(d.Positions) {
+		parts = append(parts, fmt.Sprintf("%d lots", d.PositionLots))
+	}
+	if d.MalformedTrades > 0 {
+		parts = append(parts, fmt.Sprintf("%d malformed hidden", d.MalformedTrades))
+	}
+	if !d.PriceAsOf.IsZero() {
+		age := time.Since(d.PriceAsOf)
+		mark := "marked " + formatDuration(age) + " ago"
+		if age > 26*time.Hour {
+			mark += " (stale)"
+		}
+		parts = append(parts, mark)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "  · " + strings.Join(parts, " · ")
+}
+
 // renderPositionsTable renders the open-positions block. maxLines caps the
 // block's total height (title + column header + rows + scroll indicator); the
 // row list is windowed around `selected` so it stays within budget. maxLines
-// <= 0 renders every row.
-func renderPositionsTable(positions []PositionRow, width, selected, maxLines int) string {
+// <= 0 renders every row. Rows are aggregated per ticker; the title line notes
+// the lot count, any excluded malformed trades, and how fresh the marks are.
+func renderPositionsTable(d DashboardData, width, selected, maxLines int) string {
+	positions := d.Positions
 	header := sectionTitle.Render(fmt.Sprintf("Open Positions (%d)", len(positions)))
+	header += dimText.Render(positionsNote(d))
 
 	if len(positions) == 0 {
+		if d.MalformedTrades > 0 {
+			return header + "\n" + dimText.Render("  No valid open positions")
+		}
 		return header + "\n" + dimText.Render("  No open positions")
 	}
 
@@ -484,10 +582,14 @@ func renderSignalFeed(signals []SignalRow, width int) string {
 }
 
 func renderRiskBar(d DashboardData, width int) string {
+	posStr := fmt.Sprintf("Positions: %d", d.OpenPositionCnt)
+	if d.PositionLots > d.OpenPositionCnt {
+		posStr += fmt.Sprintf(" (%d lots)", d.PositionLots)
+	}
 	parts := []string{
 		fmt.Sprintf("Daily Loss: %.1f%%", d.DailyLossUsed),
 		fmt.Sprintf("Drawdown: %.1f%%", d.DrawdownPct),
-		fmt.Sprintf("Positions: %d", d.OpenPositionCnt),
+		posStr,
 		fmt.Sprintf("Largest: %.1f%%", d.LargestPosPct),
 	}
 
