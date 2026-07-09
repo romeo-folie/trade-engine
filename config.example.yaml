@@ -429,6 +429,7 @@ orb:
   mode: paper                  # paper | live
   gap_threshold_pct: 3.0       # Minimum gap % to qualify as candidate
   max_candidates: 2            # Number of top candidates to trade (1–5)
+  max_scan_candidates: 15      # How many top gap movers to LLM-score per scan (caps rate-limited model calls; 0 = default 15). Ranked by |gap%| desc.
   range_minutes: 15            # Opening range window: 5 or 15 minutes
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)

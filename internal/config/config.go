@@ -69,7 +69,8 @@ type ORBConfig struct {
 	Enabled            bool    `yaml:"enabled"`
 	Mode               string  `yaml:"mode"`                 // "paper" | "live"
 	GapThresholdPct    float64 `yaml:"gap_threshold_pct"`    // minimum gap % (e.g. 3.0)
-	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5
+	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5 (how many scored candidates to actually trade)
+	MaxScanCandidates  int     `yaml:"max_scan_candidates"`  // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked by |gap%| desc, so this keeps the strongest ones.
 	RangeMinutes       int     `yaml:"range_minutes"`        // 5 or 15
 	RiskReward         float64 `yaml:"risk_reward"`          // e.g. 2.0
 	MaxRiskPct         float64 `yaml:"max_risk_pct"`         // max loss per trade as % of portfolio

@@ -21,14 +21,40 @@ type modelRateLimiter struct {
 }
 
 // newModelRateLimiter returns a limiter pacing to rpm requests per minute, or
-// nil (a no-op when passed to wait) if rpm <= 0. One limiter is created per
-// GeminiClient and shared by all of that client's concurrent calls, so e.g. the
-// single enricher client paces all its news-extraction goroutines together.
+// nil (a no-op when passed to wait) if rpm <= 0.
 func newModelRateLimiter(rpm int) *modelRateLimiter {
 	if rpm <= 0 {
 		return nil
 	}
 	return &modelRateLimiter{minInterval: time.Minute / time.Duration(rpm)}
+}
+
+// sharedLimiters holds one limiter per provider+model, so every client of the
+// same model — across roles (analyst, enricher, classifier, ORB scan, specialist
+// panel, …) — paces against ONE schedule. Provider quotas are per-model-per-key,
+// so without this each role's own limiter would ADD UP and blow past the free-
+// tier quota (the RESOURCE_EXHAUSTED storm that stalled the ORB scan). The first
+// client to register a model fixes its rpm; later clients reuse that limiter.
+var (
+	sharedLimitersMu sync.Mutex
+	sharedLimiters   = map[string]*modelRateLimiter{}
+)
+
+// sharedModelRateLimiter returns the process-wide limiter for key (e.g.
+// "google:gemini-2.5-flash"), creating it at rpm on first use. rpm <= 0 disables
+// pacing (returns nil).
+func sharedModelRateLimiter(key string, rpm int) *modelRateLimiter {
+	if rpm <= 0 {
+		return nil
+	}
+	sharedLimitersMu.Lock()
+	defer sharedLimitersMu.Unlock()
+	if l, ok := sharedLimiters[key]; ok {
+		return l
+	}
+	l := newModelRateLimiter(rpm)
+	sharedLimiters[key] = l
+	return l
 }
 
 // reserve claims the next available slot and advances the schedule. It returns

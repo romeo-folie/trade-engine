@@ -41,6 +41,11 @@ var nyLoc = func() *time.Location {
 // Limits context window usage while keeping the most recent catalyst signals.
 const maxNewsPerTicker = 10
 
+// defaultMaxScanCandidates caps how many top gap movers the equities ORB scan
+// LLM-scores when config leaves max_scan_candidates unset. Bounds rate-limited
+// model calls so the scan finishes before the opening range forms.
+const defaultMaxScanCandidates = 15
+
 // marketOpenMinutes is the Eastern Time minute-of-day when the US equity market opens (9:30 AM ET).
 const marketOpenMinutes = 9*60 + 30
 

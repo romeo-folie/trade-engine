@@ -33,6 +33,21 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 		return nil, nil
 	}
 
+	// Cap how many candidates get LLM-scored. FetchGapMovers already ranks by
+	// |gap%| descending, so this keeps the strongest movers and bounds the
+	// number of (rate-limited) model calls — a large gap universe otherwise
+	// sprays dozens of calls into the pre-open window and stalls on the
+	// provider's per-minute quota, finishing after the range opens (candidates
+	// then discarded).
+	maxScan := s.Cfg.MaxScanCandidates
+	if maxScan <= 0 {
+		maxScan = defaultMaxScanCandidates
+	}
+	if len(gaps) > maxScan {
+		fmt.Printf("orb: gap universe %d → scoring top %d by gap%%\n", len(gaps), maxScan)
+		gaps = gaps[:maxScan]
+	}
+
 	nowFn := s.Now
 	if nowFn == nil {
 		nowFn = time.Now
