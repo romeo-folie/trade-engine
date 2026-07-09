@@ -114,11 +114,11 @@ type DailySummary struct {
 	// pnl sign for trades closed today. BlockedByReason is a JSONB map of
 	// block_reason -> count for signals blocked today; nil when the column
 	// is empty/missing.
-	SignalsTotal     int
-	SignalsExecuted  int
-	ExecutedWinning  int
-	ExecutedLosing   int
-	BlockedByReason  map[string]int
+	SignalsTotal    int
+	SignalsExecuted int
+	ExecutedWinning int
+	ExecutedLosing  int
+	BlockedByReason map[string]int
 }
 
 // ── Portfolio Snapshots ───────────────────────────────────────────────────────
@@ -149,6 +149,20 @@ func GetPortfolioSnapshots(ctx context.Context, from, to time.Time) ([]Portfolio
 		snaps = append(snaps, s)
 	}
 	return snaps, rows.Err()
+}
+
+// GetPeakPortfolioValue returns the maximum total_value across portfolio
+// snapshots recorded on/after `since`, ignoring non-positive (glitched) rows.
+// A rolling window is used so a single stale/outlier snapshot from months ago
+// cannot poison the drawdown metric. Returns 0 when no qualifying snapshot
+// exists (drawdown then reads 0).
+func GetPeakPortfolioValue(ctx context.Context, since time.Time) (float64, error) {
+	var peak float64
+	err := GetDB().QueryRow(ctx, `
+		SELECT COALESCE(MAX(total_value), 0)
+		FROM portfolio_snapshots
+		WHERE total_value > 0 AND created_at >= $1`, since).Scan(&peak)
+	return peak, err
 }
 
 // GetLatestPortfolioSnapshot returns the most recent snapshot, or nil if none.
