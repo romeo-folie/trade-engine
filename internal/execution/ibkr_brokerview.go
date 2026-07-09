@@ -88,8 +88,11 @@ func (b *IBKRBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, error)
 }
 
 // PositionsSnapshot fetches open positions from the IBKR Client Portal and
-// returns them in the BrokerView wire shape.
+// returns them in the BrokerView wire shape. Uses the /portfolio positions
+// route (the /iserver/account variant 404s — see GetPositions) and primes the
+// portfolio session first.
 func (b *IBKRBroker) PositionsSnapshot(ctx context.Context) ([]BrokerPosition, error) {
+	b.primePortfolio(ctx)
 	var resp []struct {
 		Conid        int     `json:"conid"`
 		Position     float64 `json:"position"`
@@ -98,7 +101,7 @@ func (b *IBKRBroker) PositionsSnapshot(ctx context.Context) ([]BrokerPosition, e
 		MktValue     float64 `json:"mktValue"`
 		UnrealizedPL float64 `json:"unrealizedPnl"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/portfolio/"+b.accountID+"/positions/0", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr PositionsSnapshot: %w", err)
 	}
 
