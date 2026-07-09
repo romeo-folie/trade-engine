@@ -249,9 +249,27 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 	return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q: %w", brokerOrderID, ErrOrderNotFound)
 }
 
+// primePortfolio satisfies the Client Portal API's session precondition for
+// /portfolio/* endpoints: /portfolio/accounts must have been called in the
+// current gateway session first. Primed per call (one cheap GET) rather than
+// once per client, because the gateway restarts underneath long-lived engine
+// processes and a stale "already primed" flag would silently break positions.
+func (b *IBKRBroker) primePortfolio(ctx context.Context) {
+	var ignored any
+	_ = b.do(ctx, http.MethodGet, "/v1/api/portfolio/accounts", nil, &ignored)
+}
+
 // GetPositions returns all open positions from the IBKR account.
 // The conid→ticker mapping is reverse-resolved via the local cache/hardcoded map.
+//
+// Route: /v1/api/portfolio/{acct}/positions/{page} — the previous
+// /v1/api/iserver/account/{acct}/positions/0 path does not exist in the
+// Client Portal API and returned HTML 404 on every call since April (640
+// occurrences): position-dependent logic (ORB time exits, reconciler) was
+// flying blind, which is how two filled metals brackets ended up as live
+// unprotected shorts the DB recorded as "cancelled".
 func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
+	b.primePortfolio(ctx)
 	var resp []struct {
 		Conid        int     `json:"conid"`
 		Position     float64 `json:"position"`
@@ -259,7 +277,7 @@ func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		MktValue     float64 `json:"mktValue"`
 		UnrealizedPL float64 `json:"unrealizedPnl"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/"+b.accountID+"/positions/0", nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/portfolio/"+b.accountID+"/positions/0", nil, &resp); err != nil {
 		return nil, fmt.Errorf("ibkr GetPositions: %w", err)
 	}
 

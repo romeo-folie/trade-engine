@@ -512,3 +512,70 @@ func TestIBKRCheckAuth_HTTPError(t *testing.T) {
 		t.Error("expected error for HTTP 503, got nil")
 	}
 }
+
+// ─── GetPositions ─────────────────────────────────────────────────────────────
+
+// GetPositions must use the Client Portal /portfolio/{acct}/positions/{page}
+// route with a /portfolio/accounts priming call first. The previous
+// /iserver/account/... path does not exist in the gateway (HTML 404 on every
+// call since April): ORB time exits and the reconciler were position-blind,
+// which left filled metals brackets as live unprotected shorts recorded as
+// "cancelled" in the DB.
+func TestIBKRGetPositions_PortfolioRoute(t *testing.T) {
+	var primed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/portfolio/accounts":
+			primed = true
+			w.Write([]byte(`[{"id":"U123456"}]`))
+		case "/v1/api/portfolio/U123456/positions/0":
+			if !primed {
+				t.Error("positions requested before /portfolio/accounts priming call")
+			}
+			w.Write([]byte(`[{"conid":77124483,"position":-700,"avgCost":58.2525,"mktValue":-41391.0,"unrealizedPnl":-616.69}]`))
+		case "/v1/api/iserver/account/U123456/positions/0":
+			t.Error("legacy /iserver/account positions route must not be called (it 404s at the real gateway)")
+			http.NotFound(w, r)
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	positions, err := b.GetPositions(t.Context())
+	if err != nil {
+		t.Fatalf("GetPositions: %v", err)
+	}
+	if len(positions) != 1 || positions[0].Quantity != -700 {
+		t.Fatalf("positions = %+v, want the -700 XAG short", positions)
+	}
+}
+
+// PositionsSnapshot shares the corrected route and priming.
+func TestIBKRPositionsSnapshot_PortfolioRoute(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/portfolio/accounts":
+			w.Write([]byte(`[]`))
+		case "/v1/api/portfolio/U123456/positions/0":
+			w.Write([]byte(`[{"conid":69067925,"position":-57,"avgCost":4090.18,"mktPrice":4108.06,"mktValue":-234159.4,"unrealizedPnl":-1019.31}]`))
+		default:
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	snap, err := b.PositionsSnapshot(t.Context())
+	if err != nil {
+		t.Fatalf("PositionsSnapshot: %v", err)
+	}
+	if len(snap) != 1 || snap[0].Quantity != -57 {
+		t.Fatalf("snapshot = %+v, want the -57 XAU short", snap)
+	}
+}
