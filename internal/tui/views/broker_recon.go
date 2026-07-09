@@ -1,6 +1,7 @@
 package views
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -115,6 +116,33 @@ func classifyDivergence(broker, db float64) string {
 	}
 }
 
+// ParsePersistedRecon converts the engine's persisted reconciliation JSON (see
+// engine.PersistedReconciliation / EngineStateBrokerDrift) into a
+// BrokerReconResult for rendering. Used as the dashboard's fallback source when
+// it cannot reconcile the broker live. A parse error yields an unavailable
+// result. BrokerCount is unknown from the persisted form (0).
+func ParsePersistedRecon(blob string) BrokerReconResult {
+	var pr struct {
+		CheckedAt time.Time `json:"checked_at"`
+		Drifts    []struct {
+			Ticker    string  `json:"ticker"`
+			BrokerQty float64 `json:"broker_qty"`
+			DBQty     float64 `json:"db_qty"`
+			Source    string  `json:"source"`
+		} `json:"drifts"`
+	}
+	if err := json.Unmarshal([]byte(blob), &pr); err != nil {
+		return BrokerReconResult{Err: "invalid persisted reconciliation"}
+	}
+	res := BrokerReconResult{Available: true, CheckedAt: pr.CheckedAt, InSync: len(pr.Drifts) == 0}
+	for _, d := range pr.Drifts {
+		res.Divergences = append(res.Divergences, PositionDivergence{
+			Ticker: d.Ticker, BrokerQty: d.BrokerQty, DBQty: d.DBQty, Kind: d.Source,
+		})
+	}
+	return res
+}
+
 // renderBrokerReconLine renders the dashboard's broker-vs-DB status line. It
 // returns "" when no broker is configured (Available false, no error) so the
 // dashboard stays clean in DB-only setups.
@@ -126,8 +154,11 @@ func renderBrokerReconLine(r BrokerReconResult) string {
 		return ""
 	}
 	if r.InSync {
-		return greenText.Render("  ✓ broker in sync") +
-			dimText.Render(fmt.Sprintf("  (%d positions, checked %s ago)", r.BrokerCount, brokerReconAge(r.CheckedAt)))
+		detail := "checked " + brokerReconAge(r.CheckedAt) + " ago"
+		if r.BrokerCount > 0 {
+			detail = fmt.Sprintf("%d positions, %s", r.BrokerCount, detail)
+		}
+		return greenText.Render("  ✓ broker in sync") + dimText.Render("  ("+detail+")")
 	}
 
 	parts := make([]string, 0, len(r.Divergences))

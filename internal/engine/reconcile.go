@@ -104,34 +104,38 @@ type BrokerDrift struct {
 // Mirrors the visibility-first stance of reconcileDoneSessionTrades (PR #297).
 // Returns no error: failures (broker fetch, DB fetch) are logged and swallowed
 // so a stale dev DB or paused broker can't block engine start.
-func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db reconcilerStore, tolerance float64) []BrokerDrift {
+// reconcileBrokerVsDB is the core reconciler. The bool return is false when the
+// reconcile could not run to completion (nil/unavailable broker, or a broker/DB
+// fetch error) — distinct from a clean reconcile (empty drifts, true). Callers
+// that persist must not treat a false result as "in sync".
+func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db reconcilerStore, tolerance float64) ([]BrokerDrift, bool) {
 	if tolerance <= 0 {
 		tolerance = DefaultBrokerDriftToleranceShares
 	}
 
 	if broker == nil {
 		logger.Info("reconciler skipped — broker unavailable", "reason", "nil_broker_view")
-		return nil
+		return nil, false
 	}
 
 	positions, err := broker.PositionsSnapshot(ctx)
 	if err != nil {
 		if errors.Is(err, execution.ErrBrokerUnavailable) {
 			logger.Info("reconciler skipped — broker unavailable", "reason", "ErrBrokerUnavailable")
-			return nil
+			return nil, false
 		}
 		logger.Warn("reconciler: broker positions fetch failed", "err", err.Error())
-		return nil
+		return nil, false
 	}
 
 	if db == nil {
 		logger.Warn("reconciler: db unavailable — skipping")
-		return nil
+		return nil, false
 	}
 	openTrades, err := db.GetOpenTrades(ctx)
 	if err != nil {
 		logger.Warn("reconciler: db open trades fetch failed", "err", err.Error())
-		return nil
+		return nil, false
 	}
 
 	type aggregate struct {
@@ -230,17 +234,35 @@ func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		"tickers_compared", len(tickers),
 		"drift_warnings", len(drifts),
 	)
+	return drifts, true
+}
+
+// ReconcileBrokerVsDB reports broker-vs-DB drift, discarding the completed flag.
+// Retained for callers (boot alert/adopt path, tests) that only need the drift
+// list; persisters should use the *Status variants to avoid recording a failed
+// reconcile as "in sync".
+func ReconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db reconcilerStore, tolerance float64) []BrokerDrift {
+	drifts, _ := reconcileBrokerVsDB(ctx, broker, db, tolerance)
 	return drifts
 }
 
 // ReconcileBrokerVsDBWithStore is a convenience wrapper that uses the package
 // store.GetOpenTrades. Call this from boot when no special test store is needed.
 func ReconcileBrokerVsDBWithStore(ctx context.Context, broker reconcilerBrokerView, tolerance float64) []BrokerDrift {
+	drifts, _ := ReconcileBrokerVsDBWithStoreStatus(ctx, broker, tolerance)
+	return drifts
+}
+
+// ReconcileBrokerVsDBWithStoreStatus is ReconcileBrokerVsDBWithStore but also
+// reports whether the reconcile completed (broker + DB both read). Persisters
+// use the flag so a transient failure never overwrites known drift with a
+// false "in sync" result.
+func ReconcileBrokerVsDBWithStoreStatus(ctx context.Context, broker reconcilerBrokerView, tolerance float64) ([]BrokerDrift, bool) {
 	if !store.IsConnected() {
 		logger.Info("reconciler skipped — db not connected")
-		return nil
+		return nil, false
 	}
-	return ReconcileBrokerVsDB(ctx, broker, storeAdapter{}, tolerance)
+	return reconcileBrokerVsDB(ctx, broker, storeAdapter{}, tolerance)
 }
 
 // ─── Orphan adoption ────────────────────────────────────────────────────────────

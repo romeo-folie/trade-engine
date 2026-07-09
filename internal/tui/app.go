@@ -494,6 +494,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.nextCycleAt = t
 			}
 		}
+		// When we have no live broker to reconcile ourselves, fall back to the
+		// drift the engine persists to engine_state (the live path, when a broker
+		// is configured, owns m.brokerRecon via brokerReconMsg instead).
+		if m.brokerView == nil {
+			if v, ok, err := store.GetEngineState(ctx, store.EngineStateBrokerDrift); err == nil && ok {
+				m.brokerRecon = views.ParsePersistedRecon(v)
+			}
+		}
 		// Clamp selection indices so they stay in-bounds after data shrinks.
 		if n := len(m.tradeData.Trades); m.selectedTrade >= n && n > 0 {
 			m.selectedTrade = n - 1
