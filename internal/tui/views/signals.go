@@ -105,8 +105,11 @@ func signalStatusStyle(status string) lipgloss.Style {
 	}
 }
 
-// RenderSignalFeed renders the expanded signal feed view.
-func RenderSignalFeed(data SignalFeedData, width int) string {
+// RenderSignalFeed renders the expanded signal feed view. When height > 0 the
+// title, column header and separator stay fixed while the rows are windowed
+// around the selection so the feed never overflows the viewport (height <= 0
+// renders every row — used by tests).
+func RenderSignalFeed(data SignalFeedData, width, height int) string {
 	var b strings.Builder
 
 	b.WriteString(signalHeaderStyle.Render("Signal Feed"))
@@ -122,7 +125,12 @@ func RenderSignalFeed(data SignalFeedData, width int) string {
 		"TICKER", "ACT", "STATUS", "CONF", "PRICE", "AGE", "DETAIL"))
 	b.WriteString(fmt.Sprintf("  %s\n", strings.Repeat("─", 80)))
 
-	for i, s := range data.Signals {
+	// Fixed chrome: title + blank + column header + separator (4) and
+	// blank + footer (2).
+	start, end := tableWindow(len(data.Signals), data.Selected, height, 6)
+
+	for i := start; i < end; i++ {
+		s := data.Signals[i]
 		age := time.Since(s.CreatedAt).Round(time.Second)
 		ageStr := formatDuration(age)
 
@@ -159,6 +167,10 @@ func RenderSignalFeed(data SignalFeedData, width int) string {
 			s.Confidence, s.SignalPrice, ageStr, detail)
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
+	}
+
+	if ind := scrollIndicator(start, end, len(data.Signals)); ind != "" {
+		b.WriteString(ind + "\n")
 	}
 
 	counts := countStatuses(data.Signals)

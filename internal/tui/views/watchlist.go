@@ -71,8 +71,11 @@ var (
 	inactiveStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
-// RenderWatchlist renders the watchlist management view.
-func RenderWatchlist(data WatchlistData, width int) string {
+// RenderWatchlist renders the watchlist management view. When height > 0 the
+// title, column header and separator stay fixed while the rows are windowed
+// around the selection so a long watchlist never overflows the viewport
+// (height <= 0 renders every row — used by tests).
+func RenderWatchlist(data WatchlistData, width, height int) string {
 	var b strings.Builder
 
 	b.WriteString(wlHeaderStyle.Render("Watchlist"))
@@ -87,15 +90,26 @@ func RenderWatchlist(data WatchlistData, width int) string {
 		"TICKER", "PLATFORM", "STATUS", "TIMEFRAMES", "STRATEGIES", "ADDED"))
 	b.WriteString(fmt.Sprintf("  %s\n", strings.Repeat("─", 85)))
 
+	// activeCount counts across the whole list (not just the visible window) so
+	// the footer stays accurate while scrolling.
 	activeCount := 0
-	for i, item := range data.Items {
+	for _, item := range data.Items {
+		if item.Active {
+			activeCount++
+		}
+	}
+
+	// Fixed chrome: title + blank + column header + separator (4) and
+	// blank + footer (2).
+	start, end := tableWindow(len(data.Items), data.Selected, height, 6)
+
+	for i := start; i < end; i++ {
+		item := data.Items[i]
 		status := "active"
 		style := activeStyle
 		if !item.Active {
 			status = "inactive"
 			style = inactiveStyle
-		} else {
-			activeCount++
 		}
 
 		prefix := "  "
@@ -123,6 +137,10 @@ func RenderWatchlist(data WatchlistData, width int) string {
 			tfs, strats, item.AddedAt.Format("2006-01-02"))
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
+	}
+
+	if ind := scrollIndicator(start, end, len(data.Items)); ind != "" {
+		b.WriteString(ind + "\n")
 	}
 
 	b.WriteString(fmt.Sprintf("\n  %d items (%d active)  |  Updated %s  |  ↑↓ navigate  Space toggle  Esc back",

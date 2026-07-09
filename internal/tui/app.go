@@ -499,7 +499,6 @@ func (m Model) View() string {
 	}
 
 	header := m.renderHeader()
-	body := m.renderBody()
 	statusBar := m.renderStatusBar()
 
 	// Calculate body height: total - header (1) - status bar (1) - borders (2).
@@ -508,11 +507,30 @@ func (m Model) View() string {
 		bodyHeight = 1
 	}
 
+	// Clip the body to the available height. lipgloss's Height() only pads a
+	// short block up to the target; it does NOT truncate a tall one. Without
+	// this clip an over-long view (e.g. many open positions) overflows and the
+	// terminal scrolls the tab bar and column headers off the top of the screen.
+	body := clipToHeight(m.renderBody(bodyHeight), bodyHeight)
+
 	bodyStyle := lipgloss.NewStyle().
 		Width(m.width).
 		Height(bodyHeight)
 
 	return fmt.Sprintf("%s\n%s\n%s", header, bodyStyle.Render(body), statusBar)
+}
+
+// clipToHeight truncates s to at most height terminal lines. Splitting on "\n"
+// is ANSI-safe because lipgloss colour codes never contain newlines.
+func clipToHeight(s string, height int) string {
+	if height < 1 {
+		height = 1
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= height {
+		return s
+	}
+	return strings.Join(lines[:height], "\n")
 }
 
 // cleanup unsubscribes from the bus. Uses value receiver for consistency
@@ -567,7 +585,7 @@ func (m Model) renderHeader() string {
 	return headerStyle.Width(m.width).Render(title + "  " + tabs)
 }
 
-func (m Model) renderBody() string {
+func (m Model) renderBody(height int) string {
 	// Position detail overlay
 	if m.showDetail && m.activeView == ViewDashboard && m.selectedPos < len(m.dashData.Positions) {
 		return views.RenderPositionDetailStatic(m.dashData.Positions[m.selectedPos], m.width, m.height)
@@ -575,16 +593,16 @@ func (m Model) renderBody() string {
 
 	switch m.activeView {
 	case ViewDashboard:
-		return views.RenderDashboard(m.dashData, m.width, m.height, m.selectedPending)
+		return views.RenderDashboard(m.dashData, m.width, height, m.selectedPos, m.selectedPending)
 	case ViewTrades:
 		if m.showTradeDetail {
 			return views.RenderTradeDetail(m.tradeDetail)
 		}
-		return views.RenderTradeHistory(m.tradeData, m.width)
+		return views.RenderTradeHistory(m.tradeData, m.width, height)
 	case ViewWatchlist:
-		return views.RenderWatchlist(m.watchlistData, m.width)
+		return views.RenderWatchlist(m.watchlistData, m.width, height)
 	case ViewSignals:
-		return views.RenderSignalFeed(m.signalData, m.width)
+		return views.RenderSignalFeed(m.signalData, m.width, height)
 	case ViewConfig:
 		return views.RenderConfig(m.configData, m.width)
 	case ViewORB:
@@ -593,7 +611,6 @@ func (m Model) renderBody() string {
 		return "unknown view"
 	}
 }
-
 
 func (m Model) renderStatusBar() string {
 	left := " [1-6] switch view  [tab] next  [q] quit"

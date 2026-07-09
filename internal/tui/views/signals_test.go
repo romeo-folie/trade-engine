@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderSignalFeed_Empty(t *testing.T) {
-	out := RenderSignalFeed(SignalFeedData{LastUpdate: time.Now()}, 120)
+	out := RenderSignalFeed(SignalFeedData{LastUpdate: time.Now()}, 120, 0)
 	if !strings.Contains(out, "No signals yet") {
 		t.Fatal("expected empty state")
 	}
@@ -24,7 +24,7 @@ func TestRenderSignalFeed_MixedStatuses(t *testing.T) {
 		LastUpdate: time.Now(),
 	}
 
-	out := RenderSignalFeed(data, 120)
+	out := RenderSignalFeed(data, 120, 0)
 	if !strings.Contains(out, "AAPL") {
 		t.Fatal("expected AAPL")
 	}
@@ -48,7 +48,7 @@ func TestRenderSignalFeed_SelectionMarker(t *testing.T) {
 		Selected:   1,
 		LastUpdate: time.Now(),
 	}
-	out := RenderSignalFeed(data, 120)
+	out := RenderSignalFeed(data, 120, 0)
 	lines := strings.Split(out, "\n")
 	found := false
 	for _, line := range lines {

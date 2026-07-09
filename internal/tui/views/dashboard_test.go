@@ -37,7 +37,7 @@ func sampleData() DashboardData {
 
 func TestRenderDashboard_ContainsAllSections(t *testing.T) {
 	d := sampleData()
-	out := RenderDashboard(d, 120, 40, 0)
+	out := RenderDashboard(d, 120, 40, 0, 0)
 
 	sections := []string{
 		"PAPER",              // mode header
@@ -45,7 +45,7 @@ func TestRenderDashboard_ContainsAllSections(t *testing.T) {
 		"Open Positions (2)", // positions header
 		"AAPL",               // position ticker
 		"TSLA",
-		"Watchlist (3)",    // watchlist section
+		"Watchlist (3)",     // watchlist section
 		"Pending Approvals", // pending section
 		"MSFT",
 		"Signal Feed", // signal feed
@@ -61,7 +61,7 @@ func TestRenderDashboard_ContainsAllSections(t *testing.T) {
 
 func TestRenderDashboard_EmptyData(t *testing.T) {
 	d := DashboardData{Mode: "manual", LastUpdate: time.Now()}
-	out := RenderDashboard(d, 120, 40, 0)
+	out := RenderDashboard(d, 120, 40, 0, 0)
 
 	if !strings.Contains(out, "No open positions") {
 		t.Error("expected 'No open positions' for empty data")
@@ -73,7 +73,7 @@ func TestRenderDashboard_EmptyData(t *testing.T) {
 
 func TestRenderDashboard_AutoMode(t *testing.T) {
 	d := DashboardData{Mode: "auto", LastUpdate: time.Now()}
-	out := RenderDashboard(d, 120, 40, 0)
+	out := RenderDashboard(d, 120, 40, 0, 0)
 	if !strings.Contains(out, "AUTO") {
 		t.Error("expected AUTO mode in header")
 	}

@@ -158,8 +158,11 @@ var (
 	neutralTradeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("7"))
 )
 
-// RenderTradeHistory renders the scrollable trade history table.
-func RenderTradeHistory(data TradeHistoryData, width int) string {
+// RenderTradeHistory renders the trade history table. When height > 0, the
+// title, column header and separator stay fixed while the row list is windowed
+// around the selection so it never overflows the viewport (height <= 0 renders
+// every row — used by tests).
+func RenderTradeHistory(data TradeHistoryData, width, height int) string {
 	var b strings.Builder
 
 	b.WriteString(tradeHeaderStyle.Render("Trade History"))
@@ -175,7 +178,12 @@ func RenderTradeHistory(data TradeHistoryData, width int) string {
 		"TICKER", "DIR", "STATUS", "ENTRY", "EXIT", "P&L", "P&L %", "DATE"))
 	b.WriteString(fmt.Sprintf("  %s\n", strings.Repeat("─", 80)))
 
-	for i, t := range data.Trades {
+	// Window the rows to fit the viewport. Fixed chrome above/below the rows:
+	// title + blank + column header + separator (4) and blank + footer (2).
+	start, end := tableWindow(len(data.Trades), data.Selected, height, 6)
+
+	for i := start; i < end; i++ {
+		t := data.Trades[i]
 		dir := strings.ToUpper(t.Direction)
 		exitStr := "—"
 		pnlStr := "—"
@@ -206,6 +214,10 @@ func RenderTradeHistory(data TradeHistoryData, width int) string {
 
 		b.WriteString(style.Render(line))
 		b.WriteString("\n")
+	}
+
+	if ind := scrollIndicator(start, end, len(data.Trades)); ind != "" {
+		b.WriteString(ind + "\n")
 	}
 
 	b.WriteString(fmt.Sprintf("\n  %d trades  |  Updated %s  |  ↑↓ navigate  Enter detail  Esc back",
