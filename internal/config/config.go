@@ -715,6 +715,15 @@ type ForexORBConfig struct {
 	// trend filter (see Instrument.DirectionEligibility). Defaults: "1h", period 20.
 	TrendTimeframe string `yaml:"trend_timeframe"`
 	TrendEMAPeriod int    `yaml:"trend_ema_period"`
+
+	// ReconcileOrphanFills, when true, lets the scheduler record an entry fill from
+	// broker truth (positions) when GetOrderStatus can't confirm it — the metals
+	// blind spot where a bracket fills at IBKR but the parent order id ages out of
+	// the orders/trades endpoints, leaving the row 'pending' and the position
+	// unmanaged (no stop/TP manager engages until status='filled'). It marks the
+	// matching pending entry filled and cancels the opposing OCO leg. Opt-in
+	// because it mutates real-money order/trade state from position inference.
+	ReconcileOrphanFills bool `yaml:"reconcile_orphan_fills"`
 }
 
 // EffectiveMaxHoldMinutes returns the resolved max-hold limit for a symbol:

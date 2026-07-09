@@ -361,6 +361,48 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 	return out, rows.Err()
 }
 
+// GetOpenPendingORBTrades returns every ORB trade still awaiting a fill
+// (status='pending'), across all sessions, ordered by creation. Mirrors
+// GetOpenFilledORBTrades. The broker-truth fill reconciler uses it to find
+// entries the broker has actually filled but GetOrderStatus could not confirm
+// (the parent order id aged out of the orders+trades endpoints).
+func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at, stop_moved_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id
+		FROM orb_trades WHERE status='pending'
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.TpOrderID, &t.SlOrderID,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
+			&t.ScaleOutRole, &t.ScaleOutParentID,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ORBStats is a per-ticker performance aggregate over ORB trades. Closed-trade
 // metrics drive the `te orb stats` summary; OpenFilled surfaces trades whose entry
 // filled but whose exit has not yet been recorded (so the reader can spot a gap).

@@ -530,6 +530,13 @@ forex_orb:
   # EMA used by the direction-eligibility trend filter.
   trend_timeframe: 1h
   trend_ema_period: 20
+  # When true, record an entry fill from broker truth (positions) if
+  # GetOrderStatus can't confirm it — the metals blind spot where a bracket
+  # fills at IBKR but the parent order id ages out of the orders/trades
+  # endpoints, leaving the row 'pending' and the position unmanaged. Marks the
+  # matching pending entry filled and cancels the opposing OCO leg. Opt-in: it
+  # mutates real-money order/trade state from position inference.
+  reconcile_orphan_fills: false
 
 # ── US equity-index futures ORB (IBKR) — run with `te run --mode orb-newyork` ─
 futures_orb:
