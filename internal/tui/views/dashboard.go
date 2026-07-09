@@ -50,6 +50,11 @@ type DashboardData struct {
 	// Watchlist summary
 	Watchlist []string
 
+	// BrokerRecon is the latest broker-vs-DB position reconciliation, populated
+	// out-of-band by the TUI (not by FetchDashboardData). Zero value renders
+	// nothing.
+	BrokerRecon BrokerReconResult
+
 	LastUpdate time.Time
 }
 
@@ -374,6 +379,10 @@ func RenderDashboard(d DashboardData, width, height, selectedPos, selectedPendin
 	}
 	bottom.WriteString(renderSignalFeed(d.RecentSignals, width))
 	bottom.WriteString("\n")
+	if line := renderBrokerReconLine(d.BrokerRecon); line != "" {
+		bottom.WriteString(line)
+		bottom.WriteString("\n")
+	}
 	bottom.WriteString(renderRiskBar(d, width))
 
 	// The positions block gets whatever height remains after the surrounding
