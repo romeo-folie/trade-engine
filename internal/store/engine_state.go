@@ -8,6 +8,11 @@ const (
 	// EngineStateNextCycleAt holds the next scheduled engine run-cycle time as an
 	// RFC3339 string (UTC). Written by the engine loop after each schedule.
 	EngineStateNextCycleAt = "next_cycle_at"
+
+	// EngineStateBrokerDrift holds the latest broker-vs-DB reconciliation as a
+	// JSON blob, written periodically by the engine so readers (TUI, web) can
+	// surface drift even when they can't reconcile live themselves.
+	EngineStateBrokerDrift = "broker_drift"
 )
 
 // SetEngineState upserts a runtime engine-state value by key.

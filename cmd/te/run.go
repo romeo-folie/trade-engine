@@ -24,10 +24,10 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
 	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/knowledge"
-	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/orb"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/scanner"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/web"
@@ -776,7 +776,9 @@ Modes:
 		// with engine.adopt_broker_orphans the untracked positions are adopted
 		// as recovery trade rows so stops and analyst exits manage them again.
 		var drifts []engine.BrokerDrift
+		var brokerRecon execution.BrokerView
 		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
+			brokerRecon = bv
 			drifts = engine.ReconcileBrokerVsDBWithStore(ctx, bv, 0)
 		} else {
 			engine.ReconcileBrokerVsDBWithStore(ctx, nil, 0)
@@ -805,6 +807,14 @@ Modes:
 					logger.Warn("telegram: failed to send drift alert", "err", err)
 				}
 			}
+		}
+
+		// Persist the boot reconciliation and keep it fresh in the background,
+		// so readers (TUI, web) can surface drift that develops between engine
+		// restarts. Observability only — no alerts, no adoption on this path.
+		engine.PersistReconciliation(ctx, drifts)
+		if brokerRecon != nil {
+			go engine.RunReconcileLoop(ctx, brokerRecon, engine.BrokerReconcileInterval)
 		}
 
 		if err := eng.Run(ctx); err != nil {
