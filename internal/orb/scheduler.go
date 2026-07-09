@@ -122,6 +122,7 @@ type ORBScheduler struct {
 	alertedOrphanLegs       map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
 	lastOrphanPosCheckAt    time.Time                // wall time of the last broker-position orphan detection
 	alertedOrphanPositions  map[string]struct{}      // tickers already alerted as unmanaged broker positions (re-armed on resolve)
+	lastOrphanFillReconcile time.Time                // wall time of the last broker-truth entry-fill reconcile
 	directionDecisions      map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
 	lastScan                time.Time                // Eastern Time of the last successful scan
 	fetchFailures           map[string]int           // ticker → consecutive candle-fetch failures
@@ -433,6 +434,12 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// is best-effort; this retries off the working-order list, decoupled from the now-closed
 	// trade row, and alerts on orders it can't prove ownership of). No-op outside forex mode.
 	s.reconcileOrphanedLegs(ctx)
+
+	// Broker-truth entry-fill reconcile (opt-in): when the broker holds a position
+	// that a still-pending ORB entry explains, record the fill and cancel the
+	// opposing OCO leg — the metals blind spot where GetOrderStatus can't confirm
+	// the fill. Runs BEFORE the detector so resolved positions don't also alert.
+	s.reconcileOrphanFills(ctx)
 
 	// Detection-only: alert on any broker position no filled ORB trade explains
 	// (the July metals-short orphan shape — filled at the broker, 'cancelled' in
@@ -1636,6 +1643,13 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 	sh, sm, _ := sessionNow.Clock()
 	sessionMinutes := sh*60 + sm
 	if sessionMinutes >= s.sessionCleanupMinutes() {
+		// Broker-truth guard (always on, forex/metals): record any held position
+		// as a filled entry BEFORE the cancel loop, so a filled-but-unconfirmed
+		// metals order (GetOrderStatus "order not found") is never cancelled into
+		// the invisible-orphan trap. Filled entries are cleared from s.orderIDs
+		// here, so reconcileOrCancel below only cancels genuinely-unfilled orders.
+		s.reconcileHeldPositionsToFilled(ctx)
+
 		if s.executor != nil {
 			sides := [2]string{"buy", "sell"}
 			// reconcileOrCancel applies the end-of-session reconcile-or-cancel to one
