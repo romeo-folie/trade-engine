@@ -104,6 +104,20 @@ func TestMatchOrphanEntries_MatchesCancelledRow(t *testing.T) {
 	}
 }
 
+// Two equal-qty split legs where only one filled (residue = one leg): the
+// single-row fallback must NOT guess — different TP/SL/order ids mean recording
+// the wrong bracket. Ambiguous → return nothing (Codex P2).
+func TestMatchOrphanEntries_AmbiguousEqualQtySplit(t *testing.T) {
+	f := orphanFinding{Ticker: "XAG/USD", BrokerQty: -500, ManagedQty: 0}
+	pending := []store.ORBTrade{
+		pendingTrade("XAG/USD", "sell", 500, "runner-id"),
+		pendingTrade("XAG/USD", "sell", 500, "partial-id"),
+	}
+	if got := matchOrphanEntries(f, pending, 0.5); got != nil {
+		t.Fatalf("equal-qty split with residue 500 must be ambiguous, got %v", ids(got))
+	}
+}
+
 func TestOppositeSide(t *testing.T) {
 	if oppositeSide("buy") != "sell" || oppositeSide("BUY") != "sell" {
 		t.Error("opposite of buy should be sell")

@@ -446,6 +446,23 @@ func GetRecentlyCancelledORBTrades(ctx context.Context, db *pgxpool.Pool, since 
 	return out, rows.Err()
 }
 
+// FillPendingORBTradeAtCreated marks a pending entry 'filled' with filled_at set
+// to the row's created_at (placement time) rather than NOW(). The broker-truth
+// reconciler uses it for INFERRED fills discovered well after the fact (an
+// aged-out GetOrderStatus at session cleanup can be an hour past placement), so
+// time-based exits anchored on filled_at don't grant a fresh max-hold window —
+// unlike FillORBTradeByOrderID, which stamps NOW() for real-time fills. Returns
+// whether a row changed.
+func FillPendingORBTradeAtCreated(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE orb_trades SET status='filled', fill_price=$1, filled_at=created_at
+		WHERE order_id=$2 AND status='pending'`, fillPrice, orderID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // ReopenORBTradeToFilled flips a wrongly-'cancelled' entry back to 'filled' with
 // the given fill price (clearing closed_at) when the broker is found to still
 // hold the position. Guarded to status='cancelled' so it never disturbs a

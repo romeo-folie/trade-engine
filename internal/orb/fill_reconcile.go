@@ -139,27 +139,40 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 	s.cancelStaleOCOLegs(ctx)
 }
 
-// recordReconciledFill marks one matched entry row filled, dispatching by its
-// prior status: a 'pending' row goes through the shared persistEntryFill path
-// (sanitizes the price, publishes, updates tracking); a wrongly-'cancelled' row
-// is reopened to 'filled'. Both are pure DB updates keyed on order_id, so the
+// recordReconciledFill marks one matched entry row filled from broker truth,
+// anchoring filled_at to the row's placement time (created_at) for BOTH the
+// pending and cancelled paths — these are inferred fills discovered after the
+// fact, so a NOW() stamp would grant a stale position a fresh max-hold window.
+// The price is sanitized against the row's own entry stop (broker avg cost can
+// be implausible). Both writes are pure DB updates keyed on order_id, so the
 // broker's inability to find the order can't block them.
 func (s *ORBScheduler) recordReconciledFill(ctx context.Context, e *store.ORBTrade, price float64) {
+	if corrected, was := sanitizeEntryFill(e.Side, e.EntryStop, price); was {
+		slog.Warn("orb: fill reconcile: implausible entry fill from broker — recording stop level instead",
+			"side", e.Side, "ticker", e.Ticker, "reported", price, "entry_stop", e.EntryStop, "recorded", corrected)
+		price = corrected
+	}
+
+	var updated bool
+	var err error
 	if strings.EqualFold(e.Status, "cancelled") {
-		reopened, err := store.ReopenORBTradeToFilled(ctx, s.db, e.OrderID, price)
-		if err != nil {
-			slog.Error("orb: fill reconcile: reopen cancelled trade failed",
-				"ticker", e.Ticker, "side", e.Side, "order_id", e.OrderID, "err", err)
-			return
-		}
-		if reopened {
-			s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-				OrderID: e.OrderID, Ticker: e.Ticker, Side: e.Side, Status: "filled", FillPrice: price,
-			})
-		}
+		updated, err = store.ReopenORBTradeToFilled(ctx, s.db, e.OrderID, price)
+	} else {
+		updated, err = store.FillPendingORBTradeAtCreated(ctx, s.db, e.OrderID, price)
+	}
+	if err != nil {
+		slog.Error("orb: fill reconcile: record fill failed",
+			"ticker", e.Ticker, "side", e.Side, "order_id", e.OrderID, "prior_status", e.Status, "err", err)
 		return
 	}
-	s.persistEntryFill(ctx, e.Ticker, e.Side, e.OrderID, price)
+	if updated {
+		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+			OrderID: e.OrderID, Ticker: e.Ticker, Side: e.Side, Status: "filled", FillPrice: price,
+		})
+		if tc := s.trackedTrades[e.OrderID]; tc != nil {
+			tc.entryFill = price
+		}
+	}
 }
 
 // cancelStaleOCOLegs cancels pending ORB entries whose opposite-side sibling on
@@ -231,16 +244,24 @@ func matchOrphanEntries(f orphanFinding, pending []store.ORBTrade, tolerance flo
 	if len(group) == 0 {
 		return nil
 	}
-	// Whole same-side pending set explains the residue (single entry OR a split
-	// bracket's runner + partial).
+	// Whole same-side set explains the residue (single entry OR a split bracket's
+	// runner + partial).
 	if math.Abs(total-residue) <= tolerance {
 		return group
 	}
-	// Fall back: a single row equals the residue (its sibling already managed).
+	// Fall back: exactly one row equals the residue (its sibling already managed).
+	// If two equal-qty legs both match (e.g. a 0.5 split), we can't tell which one
+	// the broker filled — they share ticker/side/qty but differ in TP/SL/order id —
+	// so treat it as ambiguous and leave it for the alerting detector rather than
+	// record the wrong bracket.
+	var singles []*store.ORBTrade
 	for _, t := range group {
 		if math.Abs(float64(t.Qty)-residue) <= tolerance {
-			return []*store.ORBTrade{t}
+			singles = append(singles, t)
 		}
+	}
+	if len(singles) == 1 {
+		return singles
 	}
 	return nil
 }
