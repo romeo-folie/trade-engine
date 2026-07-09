@@ -285,38 +285,48 @@ var (
 )
 
 // RenderDashboard renders the main dashboard view.
-// selectedPending is the index of the currently highlighted pending signal (-1 for none).
-func RenderDashboard(d DashboardData, width, height, selectedPending int) string {
-	var b strings.Builder
+// selectedPos is the index of the highlighted open position; selectedPending is
+// the index of the highlighted pending signal (manual mode). When height > 0
+// the open-positions table is windowed around selectedPos so the surrounding
+// sections (watchlist, signal feed, risk bar) stay on screen no matter how many
+// positions are open.
+func RenderDashboard(d DashboardData, width, height, selectedPos, selectedPending int) string {
+	// Build every section except the positions table first, so we can measure
+	// how much vertical space is left for the (scrollable) positions block.
+	var top strings.Builder
+	top.WriteString(renderModeHeader(d))
+	top.WriteString("\n\n")
+	top.WriteString(renderPortfolioSummary(d))
 
-	// Header bar
-	b.WriteString(renderModeHeader(d))
-	b.WriteString("\n\n")
-
-	// Portfolio summary
-	b.WriteString(renderPortfolioSummary(d))
-	b.WriteString("\n\n")
-
-	// Open positions
-	b.WriteString(renderPositionsTable(d.Positions, width))
-	b.WriteString("\n\n")
-
-	// Active watchlist
-	b.WriteString(renderWatchlistSummary(d.Watchlist))
-	b.WriteString("\n\n")
-
-	// Pending approvals (manual mode only)
+	var bottom strings.Builder
+	bottom.WriteString(renderWatchlistSummary(d.Watchlist, width))
+	bottom.WriteString("\n\n")
 	if len(d.PendingSignals) > 0 {
-		b.WriteString(renderPendingApprovals(d.PendingSignals, width, selectedPending))
-		b.WriteString("\n")
+		bottom.WriteString(renderPendingApprovals(d.PendingSignals, width, selectedPending))
+		bottom.WriteString("\n")
+	}
+	bottom.WriteString(renderSignalFeed(d.RecentSignals, width))
+	bottom.WriteString("\n")
+	bottom.WriteString(renderRiskBar(d, width))
+
+	// The positions block gets whatever height remains after the surrounding
+	// sections and the two blank separators that bracket it. 0 (or a negative
+	// budget on a tiny terminal) means "no windowing" — the View() clip is the
+	// final backstop against overflow.
+	posBudget := 0
+	if height > 0 {
+		posBudget = height - lipgloss.Height(top.String()) - lipgloss.Height(bottom.String()) - 2
+		if posBudget < 3 {
+			posBudget = 3 // always leave room for the title + header + one row
+		}
 	}
 
-	// Signal feed
-	b.WriteString(renderSignalFeed(d.RecentSignals, width))
-	b.WriteString("\n")
-
-	// Risk status bar
-	b.WriteString(renderRiskBar(d, width))
+	var b strings.Builder
+	b.WriteString(top.String())
+	b.WriteString("\n\n")
+	b.WriteString(renderPositionsTable(d.Positions, width, selectedPos, posBudget))
+	b.WriteString("\n\n")
+	b.WriteString(bottom.String())
 
 	return b.String()
 }
@@ -352,30 +362,51 @@ func renderPortfolioSummary(d DashboardData) string {
 		fmt.Sprintf("  Today P&L: %-14s  Unrealized: %s", pnl, unrealized)
 }
 
-func renderPositionsTable(positions []PositionRow, width int) string {
+// renderPositionsTable renders the open-positions block. maxLines caps the
+// block's total height (title + column header + rows + scroll indicator); the
+// row list is windowed around `selected` so it stays within budget. maxLines
+// <= 0 renders every row.
+func renderPositionsTable(positions []PositionRow, width, selected, maxLines int) string {
 	header := sectionTitle.Render(fmt.Sprintf("Open Positions (%d)", len(positions)))
 
 	if len(positions) == 0 {
 		return header + "\n" + dimText.Render("  No open positions")
 	}
 
+	// The column header carries a leading marker column so the ▸ selection
+	// cursor lines up with the rows below it.
 	colFmt := "  %-8s %10s %10s %10s %8s %10s %10s %-10s"
 	hdr := fmt.Sprintf(colFmt, "Ticker", "Entry", "Current", "P&L", "P&L%", "Stop", "Target", "Strategy")
+
+	// Fixed chrome inside this block: title + column header (2).
+	start, end := tableWindow(len(positions), selected, maxLines, 2)
 
 	var rows strings.Builder
 	rows.WriteString(header + "\n")
 	rows.WriteString(tableHeader.Render(hdr) + "\n")
 
-	for _, p := range positions {
+	for i := start; i < end; i++ {
+		p := positions[i]
 		pnlStr := colorPnL(p.PnL)
 		pnlPctStr := colorPnLPct(p.PnLPct)
-		row := fmt.Sprintf("  %-8s %10.2f %10.2f %10s %8s %10.2f %10.2f %-10s",
-			p.Ticker, p.EntryPrice, p.CurrentPrice, pnlStr, pnlPctStr,
+		marker := " "
+		if i == selected {
+			marker = "▸"
+		}
+		row := fmt.Sprintf("%s %-8s %10.2f %10.2f %10s %8s %10.2f %10.2f %-10s",
+			marker, p.Ticker, p.EntryPrice, p.CurrentPrice, pnlStr, pnlPctStr,
 			p.StopLoss, p.TakeProfit, p.Strategy)
 		rows.WriteString(row + "\n")
 	}
 
-	return rows.String()
+	if ind := scrollIndicator(start, end, len(positions)); ind != "" {
+		rows.WriteString(ind + "\n")
+	}
+
+	// Trim the trailing newline so this block joins predictably with the "\n\n"
+	// separators in RenderDashboard (each separator then adds exactly one blank
+	// line, keeping the height budget accurate).
+	return strings.TrimRight(rows.String(), "\n")
 }
 
 func renderPendingApprovals(signals []SignalRow, width int, selected int) string {
@@ -410,12 +441,19 @@ func renderPendingApprovals(signals []SignalRow, width int, selected int) string
 	return b.String()
 }
 
-func renderWatchlistSummary(items []string) string {
+func renderWatchlistSummary(items []string, width int) string {
 	header := sectionTitle.Render(fmt.Sprintf("Watchlist (%d)", len(items)))
 	if len(items) == 0 {
 		return header + "\n" + dimText.Render("  No active watchlist items")
 	}
-	return header + "\n  " + strings.Join(items, ", ")
+	// Hard-wrap the ticker list to the viewport width. Without this the terminal
+	// wraps it visually into an unknown number of rows, which would break the
+	// dashboard's height budget for the positions table above.
+	body := "  " + strings.Join(items, ", ")
+	if width > 2 {
+		body = lipgloss.NewStyle().Width(width).Render(body)
+	}
+	return header + "\n" + body
 }
 
 func renderSignalFeed(signals []SignalRow, width int) string {

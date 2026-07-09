@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderWatchlist_Empty(t *testing.T) {
-	out := RenderWatchlist(WatchlistData{LastUpdate: time.Now()}, 120)
+	out := RenderWatchlist(WatchlistData{LastUpdate: time.Now()}, 120, 0)
 	if !strings.Contains(out, "empty") {
 		t.Fatal("expected empty state")
 	}
@@ -23,7 +23,7 @@ func TestRenderWatchlist_MixedItems(t *testing.T) {
 		Selected:   1,
 		LastUpdate: time.Now(),
 	}
-	out := RenderWatchlist(data, 120)
+	out := RenderWatchlist(data, 120, 0)
 	if !strings.Contains(out, "AAPL") || !strings.Contains(out, "TSLA") || !strings.Contains(out, "GOOG") {
 		t.Fatal("expected all tickers")
 	}

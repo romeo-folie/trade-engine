@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderTradeHistory_Empty(t *testing.T) {
-	out := RenderTradeHistory(TradeHistoryData{LastUpdate: time.Now()}, 120)
+	out := RenderTradeHistory(TradeHistoryData{LastUpdate: time.Now()}, 120, 0)
 	if !strings.Contains(out, "No trades yet") {
 		t.Fatal("expected empty state message")
 	}
@@ -29,7 +29,7 @@ func TestRenderTradeHistory_WithTrades(t *testing.T) {
 		Selected:   0,
 		LastUpdate: time.Now(),
 	}
-	out := RenderTradeHistory(data, 120)
+	out := RenderTradeHistory(data, 120, 0)
 	if !strings.Contains(out, "AAPL") {
 		t.Fatal("expected AAPL in output")
 	}
@@ -53,7 +53,7 @@ func TestRenderTradeHistory_PnLStyling(t *testing.T) {
 		},
 		LastUpdate: time.Now(),
 	}
-	out := RenderTradeHistory(data, 120)
+	out := RenderTradeHistory(data, 120, 0)
 	if !strings.Contains(out, "WIN") || !strings.Contains(out, "LOSE") {
 		t.Fatal("expected both tickers")
 	}
