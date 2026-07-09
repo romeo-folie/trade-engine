@@ -734,6 +734,22 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			return nil
 		}
 
+		// Cap how many gap movers get LLM-scored. This is the production equities
+		// path (te run --mode orb / orb-newyork construct the scheduler without a
+		// CandidateScanner), so the cap MUST live here too — not only in
+		// EquitiesCandidateScanner. FetchGapMovers ranks by |gap%| desc, so we keep
+		// the strongest movers and bound the rate-limited model calls; a large gap
+		// universe otherwise sprays dozens of calls into the pre-open window and
+		// stalls on the provider quota, finishing after the range opens.
+		maxScan := s.cfg.MaxScanCandidates
+		if maxScan <= 0 {
+			maxScan = defaultMaxScanCandidates
+		}
+		if len(gaps) > maxScan {
+			slog.Info("orb: gap universe capped for scoring", "found", len(gaps), "scoring", maxScan)
+			gaps = gaps[:maxScan]
+		}
+
 		// LLM-score each candidate
 		for _, gap := range gaps {
 			if err := ctx.Err(); err != nil {
