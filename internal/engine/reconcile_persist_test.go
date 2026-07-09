@@ -3,8 +3,12 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func TestMarshalReconciliation_RoundTrip(t *testing.T) {
@@ -47,6 +51,31 @@ func TestMarshalReconciliation_InSyncEmptyDrifts(t *testing.T) {
 	}
 	if len(pr.Drifts) != 0 {
 		t.Errorf("expected no drifts, got %+v", pr.Drifts)
+	}
+}
+
+// TestReconcileStatus_FailureIsNotClean is the P2 guard: a failed reconcile
+// (broker error, nil broker) must report ok=false so persisters don't overwrite
+// known drift with a false "in sync"; a clean reconcile reports ok=true.
+func TestReconcileStatus_FailureIsNotClean(t *testing.T) {
+	// Clean: broker and DB agree → no drift, ok=true.
+	drifts, ok := reconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{positions: []execution.BrokerPosition{{Symbol: "AAPL", Quantity: 10, Side: "long"}}},
+		&fakeStore{trades: []store.Trade{{Ticker: "AAPL", Direction: "long", Quantity: 10}}},
+		0.01)
+	if !ok || len(drifts) != 0 {
+		t.Errorf("clean reconcile: drifts=%v ok=%v, want empty/true", drifts, ok)
+	}
+
+	// Broker fetch failure → ok=false (indistinguishable-from-clean bug fixed).
+	if _, ok := reconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{err: errors.New("api down")}, &fakeStore{}, 0.01); ok {
+		t.Error("broker failure must report ok=false")
+	}
+
+	// nil broker → ok=false.
+	if _, ok := reconcileBrokerVsDB(context.Background(), nil, &fakeStore{}, 0.01); ok {
+		t.Error("nil broker must report ok=false")
 	}
 }
 

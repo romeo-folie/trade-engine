@@ -49,8 +49,13 @@ func MarshalReconciliation(drifts []BrokerDrift, checkedAt time.Time) (string, e
 
 // PersistReconciliation writes the drift list to engine_state for cross-process
 // readers. Best-effort — marshal/write errors are logged and swallowed so a
-// reconcile never blocks or crashes the engine.
+// reconcile never blocks or crashes the engine. No-ops when the DB is
+// disconnected (store.SetEngineState → GetDB() would otherwise panic on a
+// DB-less engine start).
 func PersistReconciliation(ctx context.Context, drifts []BrokerDrift) {
+	if !store.IsConnected() {
+		return
+	}
 	blob, err := MarshalReconciliation(drifts, time.Now().UTC())
 	if err != nil {
 		logger.Warn("reconcile persist: marshal failed", "err", err)
@@ -79,7 +84,12 @@ func RunReconcileLoop(ctx context.Context, broker reconcilerBrokerView, interval
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			PersistReconciliation(ctx, ReconcileBrokerVsDBWithStore(ctx, broker, 0))
+			// Only persist a reconcile that actually completed — a transient
+			// broker/DB failure must not overwrite known drift with a false
+			// "in sync".
+			if drifts, ok := ReconcileBrokerVsDBWithStoreStatus(ctx, broker, 0); ok {
+				PersistReconciliation(ctx, drifts)
+			}
 		}
 	}
 }
