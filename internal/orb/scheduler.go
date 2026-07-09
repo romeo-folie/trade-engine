@@ -41,6 +41,11 @@ var nyLoc = func() *time.Location {
 // Limits context window usage while keeping the most recent catalyst signals.
 const maxNewsPerTicker = 10
 
+// defaultMaxScanCandidates caps how many top gap movers the equities ORB scan
+// LLM-scores when config leaves max_scan_candidates unset. Bounds rate-limited
+// model calls so the scan finishes before the opening range forms.
+const defaultMaxScanCandidates = 15
+
 // marketOpenMinutes is the Eastern Time minute-of-day when the US equity market opens (9:30 AM ET).
 const marketOpenMinutes = 9*60 + 30
 
@@ -727,6 +732,22 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 
 		if len(gaps) == 0 {
 			return nil
+		}
+
+		// Cap how many gap movers get LLM-scored. This is the production equities
+		// path (te run --mode orb / orb-newyork construct the scheduler without a
+		// CandidateScanner), so the cap MUST live here too — not only in
+		// EquitiesCandidateScanner. FetchGapMovers ranks by |gap%| desc, so we keep
+		// the strongest movers and bound the rate-limited model calls; a large gap
+		// universe otherwise sprays dozens of calls into the pre-open window and
+		// stalls on the provider quota, finishing after the range opens.
+		maxScan := s.cfg.MaxScanCandidates
+		if maxScan <= 0 {
+			maxScan = defaultMaxScanCandidates
+		}
+		if len(gaps) > maxScan {
+			slog.Info("orb: gap universe capped for scoring", "found", len(gaps), "scoring", maxScan)
+			gaps = gaps[:maxScan]
 		}
 
 		// LLM-score each candidate

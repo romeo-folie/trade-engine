@@ -56,7 +56,10 @@ func NewGeminiClient(cfg config.ModelConfig) *GeminiClient {
 		apiKey:     apiKey,
 		baseURL:    geminiAPIBaseURL,
 		httpClient: &http.Client{Timeout: timeout},
-		limiter:    newModelRateLimiter(rpm),
+		// Shared per-model so all roles on this model pace against one schedule
+		// and their combined rate stays under the provider's per-model quota,
+		// rather than each role's limiter adding up past it.
+		limiter: sharedModelRateLimiter("google:"+cfg.Model, rpm),
 	}
 }
 
