@@ -12,6 +12,11 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// drawdownLookbackDays bounds the window over which the portfolio peak is taken
+// for the drawdown metric, so a single ancient/glitched snapshot can't inflate
+// it indefinitely.
+const drawdownLookbackDays = 90
+
 // DashboardData holds all data needed to render the main dashboard view.
 // Populated by polling the DB or derived from events.
 type DashboardData struct {
@@ -221,10 +226,13 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 		}
 	}
 
-	// Drawdown calculation from peak
-	var peak float64
-	_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
-	if peak > d.TotalValue && peak > 0 {
+	// Drawdown from a rolling peak. Using MAX(total_value) over all time let a
+	// single glitched snapshot (e.g. an April spike to $208k on a $100k account)
+	// dominate the figure forever; a bounded lookback tracks the recent peak and
+	// ignores non-positive rows.
+	// peak > 0 guards against a division by zero when the window has no positive
+	// snapshots (peak == 0) and the latest value is itself a negative glitch.
+	if peak, perr := store.GetPeakPortfolioValue(ctx, time.Now().AddDate(0, 0, -drawdownLookbackDays)); perr == nil && peak > 0 && peak > d.TotalValue {
 		d.DrawdownPct = ((peak - d.TotalValue) / peak) * 100
 	}
 
