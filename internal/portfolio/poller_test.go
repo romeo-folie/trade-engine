@@ -13,9 +13,11 @@ import (
 // ── Stub BrokerView ───────────────────────────────────────────────────────────
 
 type stubBrokerView struct {
-	account    execution.BrokerAccount
-	accountErr error
-	calls      atomic.Int64
+	account      execution.BrokerAccount
+	accountErr   error
+	positions    []execution.BrokerPosition
+	positionsErr error
+	calls        atomic.Int64
 }
 
 func (s *stubBrokerView) AccountSnapshot(_ context.Context) (execution.BrokerAccount, error) {
@@ -23,7 +25,10 @@ func (s *stubBrokerView) AccountSnapshot(_ context.Context) (execution.BrokerAcc
 	return s.account, s.accountErr
 }
 func (s *stubBrokerView) PositionsSnapshot(_ context.Context) ([]execution.BrokerPosition, error) {
-	return nil, execution.ErrBrokerUnavailable
+	if s.positionsErr != nil {
+		return nil, s.positionsErr
+	}
+	return s.positions, nil
 }
 func (s *stubBrokerView) EquityCurve(_ context.Context, _, _ string) (execution.EquityHistory, error) {
 	return execution.EquityHistory{}, execution.ErrBrokerUnavailable
@@ -85,6 +90,38 @@ func TestPollerPoll_ThresholdLogic(t *testing.T) {
 	p.poll(context.Background())
 	if bv.calls.Load() != 2 {
 		t.Errorf("expected 2 broker calls, got %d", bv.calls.Load())
+	}
+}
+
+// TestPositionStats_CountsAndSumsUnrealized verifies the poller derives the
+// open-position count and aggregate unrealized P&L from the broker (fixing the
+// former hardcoded 0 in the snapshot write).
+func TestPositionStats_CountsAndSumsUnrealized(t *testing.T) {
+	bv := &stubBrokerView{positions: []execution.BrokerPosition{
+		{Symbol: "AAPL", UnrealizedPL: 50.5},
+		{Symbol: "TSLA", UnrealizedPL: -20.25},
+		{Symbol: "NVDA", UnrealizedPL: 10.0},
+	}}
+	p := NewPoller(bv, time.Hour, 0.05, "paper", "alpaca")
+
+	count, unrealized := p.positionStats(context.Background())
+	if count != 3 {
+		t.Errorf("count = %d, want 3", count)
+	}
+	if want := 40.25; unrealized != want {
+		t.Errorf("unrealized = %.2f, want %.2f", unrealized, want)
+	}
+}
+
+// TestPositionStats_BestEffortOnError verifies a PositionsSnapshot failure
+// degrades to (0, 0) rather than aborting the snapshot.
+func TestPositionStats_BestEffortOnError(t *testing.T) {
+	bv := &stubBrokerView{positionsErr: errors.New("broker down")}
+	p := NewPoller(bv, time.Hour, 0.05, "paper", "alpaca")
+
+	count, unrealized := p.positionStats(context.Background())
+	if count != 0 || unrealized != 0 {
+		t.Errorf("on error want (0,0), got (%d, %.2f)", count, unrealized)
 	}
 }
 

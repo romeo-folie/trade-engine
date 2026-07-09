@@ -18,12 +18,12 @@ import (
 // The poller also writes an extra snapshot whenever equity moves by more than
 // SignificantChangePct% since the last snapshot.
 type Poller struct {
-	bv                  execution.BrokerView
-	interval            time.Duration
-	sigChangePct        float64 // e.g. 0.05 → write snapshot on >0.05% equity move
-	mode                string  // "live" | "paper"
-	broker              string  // "alpaca" | "ibkr"
-	lastSnapshotEquity  float64
+	bv                 execution.BrokerView
+	interval           time.Duration
+	sigChangePct       float64 // e.g. 0.05 → write snapshot on >0.05% equity move
+	mode               string  // "live" | "paper"
+	broker             string  // "alpaca" | "ibkr"
+	lastSnapshotEquity float64
 }
 
 // NewPoller constructs a Poller. interval is the base poll cadence; zero
@@ -86,15 +86,35 @@ func (p *Poller) poll(ctx context.Context) {
 		return
 	}
 
+	// realized_pnl_today stays 0: it is not derivable from a broker account
+	// snapshot; the engine Tracker path is responsible for realized P&L.
+	openPositions, unrealized := p.positionStats(ctx)
 	if err := store.InsertPortfolioSnapshot(
-		ctx, equity, cash, invested, 0, 0, 0,
+		ctx, equity, cash, invested, unrealized, 0, openPositions,
 		"poller", p.mode, p.broker,
 	); err != nil {
 		logger.Warn("portfolio poller: snapshot write failed", "err", err)
 		return
 	}
 	p.lastSnapshotEquity = equity
-	logger.Debug("portfolio poller: snapshot written", "equity", equity)
+	logger.Debug("portfolio poller: snapshot written", "equity", equity, "positions", openPositions)
+}
+
+// positionStats returns the open-position count and aggregate unrealized P&L
+// from the broker. Best-effort: on error it logs and returns (0, 0) so the
+// snapshot still captures equity/cash/invested (the poller's primary purpose).
+// Callers must only invoke it when about to write, to avoid a wasted broker
+// call during DB outages.
+func (p *Poller) positionStats(ctx context.Context) (count int, unrealized float64) {
+	positions, err := p.bv.PositionsSnapshot(ctx)
+	if err != nil {
+		logger.Warn("portfolio poller: PositionsSnapshot failed; snapshot omits position stats", "err", err)
+		return 0, 0
+	}
+	for _, pos := range positions {
+		unrealized += pos.UnrealizedPL
+	}
+	return len(positions), unrealized
 }
 
 // pollIfSignificant is called at sub-interval cadence (future) or can be
@@ -116,8 +136,9 @@ func (p *Poller) pollIfSignificant(ctx context.Context) {
 		return
 	}
 	cash := acct.Cash
+	openPositions, unrealized := p.positionStats(ctx)
 	if err := store.InsertPortfolioSnapshot(
-		ctx, equity, cash, equity-cash, 0, 0, 0,
+		ctx, equity, cash, equity-cash, unrealized, 0, openPositions,
 		"poller", p.mode, p.broker,
 	); err != nil {
 		logger.Warn("portfolio poller: significant-change snapshot failed", "err", err)
