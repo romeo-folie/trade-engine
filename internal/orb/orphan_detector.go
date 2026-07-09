@@ -38,12 +38,16 @@ const (
 // the BROKER's position, not the DB status, so it catches exactly that shape:
 // something is held that no filled row explains.
 //
-// Only runs in IBKR-backed ORB modes (forex / futures); paper equities has no
-// meaningful broker positions. Alerts fire once per ticker until the drift
-// resolves, then re-arm — so a persistent orphan doesn't spam every sweep, but a
-// fresh one is surfaced within one cadence.
+// Forex/metals mode only. Comparison keys on ticker, and IBKRBroker.reverseConid
+// resolves only forex/metals conids (the static ibkrConids map + the dynamic
+// conidCache) — statically-mapped futures conids (ES/GC/…) fall through to the
+// raw conid, so GetPositions would return a numeric ticker that never matches
+// the symbol in orb_trades and every managed futures position would look
+// orphaned (Codex #397). Futures support waits on a verified conid→symbol
+// reverse path. Paper equities has no broker positions either way. Alerts fire
+// once per ticker until the drift resolves, then re-arm.
 func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
-	if (s.forexCfg == nil && s.futuresCfg == nil) || s.db == nil || s.executor == nil {
+	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil || s.executor == nil {
 		return
 	}
 	if time.Since(s.lastOrphanPosCheckAt) < orphanPositionCheckInterval {
