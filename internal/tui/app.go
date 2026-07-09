@@ -762,6 +762,13 @@ func fetchBrokerRecon(bv execution.BrokerView) tea.Cmd {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
+		// store.GetOpenTrades → store.GetDB() panics without a live connection,
+		// so bail out cleanly when the DB is unavailable (the rest of the TUI
+		// tolerates this too).
+		if !store.IsConnected() {
+			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: "database not connected"}}
+		}
+
 		positions, err := bv.PositionsSnapshot(ctx)
 		if err != nil {
 			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}}
