@@ -13,9 +13,19 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tui/views"
 )
+
+// brokerReconInterval is how often the dashboard reconciles live broker
+// positions against the DB open-trade book. Kept well above the 3s DB poll so
+// the broker API is queried sparingly and never on the render hot path.
+const brokerReconInterval = 60 * time.Second
+
+// brokerReconTolerance is the fractional per-ticker quantity gap tolerated
+// before a position is reported as diverging.
+const brokerReconTolerance = 0.02
 
 // View represents the active screen in the TUI.
 type View int
@@ -70,6 +80,12 @@ type eventMsg events.Event
 // pollTickMsg triggers a DB poll fallback.
 type pollTickMsg time.Time
 
+// brokerReconTickMsg fires on the slow broker-reconciliation interval.
+type brokerReconTickMsg struct{}
+
+// brokerReconMsg carries the result of an async broker-vs-DB reconciliation.
+type brokerReconMsg struct{ result views.BrokerReconResult }
+
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 // Model is the top-level Bubble Tea model for the dashboard.
@@ -123,13 +139,20 @@ type Model struct {
 	// Status message (briefly shown after actions)
 	statusMsg     string
 	statusMsgTime time.Time
+
+	// brokerView is the live (read-only) broker connection used to reconcile
+	// broker positions against the DB. Nil when no broker/creds are configured;
+	// reconciliation is then simply skipped.
+	brokerView  execution.BrokerView
+	brokerRecon views.BrokerReconResult
 }
 
 const maxRecentEvents = 50
 
 // New creates a new TUI Model. The event bus may be nil (DB-only fallback).
-// mode is the current engine mode (manual/auto/paper).
-func New(bus *events.Bus, mode string) Model {
+// mode is the current engine mode (manual/auto/paper). brokerView may be nil,
+// in which case broker-vs-DB reconciliation is disabled.
+func New(bus *events.Bus, mode string, brokerView execution.BrokerView) Model {
 	if mode == "" {
 		mode = "paper"
 	}
@@ -137,6 +160,7 @@ func New(bus *events.Bus, mode string) Model {
 		activeView: ViewDashboard,
 		bus:        bus,
 		mode:       mode,
+		brokerView: brokerView,
 	}
 	// Subscribe eagerly in New() so the subscription is part of the model value
 	// returned to Bubble Tea — Init() has a value receiver, so setting fields
@@ -152,6 +176,10 @@ func (m Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{pollTicker()}
 	if m.sub != nil {
 		cmds = append(cmds, waitForEvent(m.sub))
+	}
+	if m.brokerView != nil {
+		// Reconcile once immediately, then on the slow interval.
+		cmds = append(cmds, fetchBrokerRecon(m.brokerView))
 	}
 	return tea.Batch(cmds...)
 }
@@ -487,6 +515,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.watchlistData.Selected = m.selectedWatchlist
 		m.configData.Selected = m.selectedConfig
 		return m, pollTicker()
+
+	case brokerReconTickMsg:
+		if m.brokerView != nil {
+			return m, fetchBrokerRecon(m.brokerView)
+		}
+
+	case brokerReconMsg:
+		m.brokerRecon = msg.result
+		// Schedule the next reconciliation on the slow interval.
+		return m, brokerReconTick()
 	}
 
 	return m, nil
@@ -600,7 +638,11 @@ func (m Model) renderBody(height int) string {
 
 	switch m.activeView {
 	case ViewDashboard:
-		return views.RenderDashboard(m.dashData, m.width, height, m.selectedPos, m.selectedPending)
+		// Attach the out-of-band broker reconciliation (refreshed by its own
+		// ticker) onto the poll-refreshed dashboard data for rendering.
+		d := m.dashData
+		d.BrokerRecon = m.brokerRecon
+		return views.RenderDashboard(d, m.width, height, m.selectedPos, m.selectedPending)
 	case ViewTrades:
 		if m.showTradeDetail {
 			return views.RenderTradeDetail(m.tradeDetail)
@@ -703,6 +745,42 @@ func pollTicker() tea.Cmd {
 	return tea.Tick(3*time.Second, func(t time.Time) tea.Msg {
 		return pollTickMsg(t)
 	})
+}
+
+// brokerReconTick fires a brokerReconTickMsg after the slow reconcile interval.
+func brokerReconTick() tea.Cmd {
+	return tea.Tick(brokerReconInterval, func(time.Time) tea.Msg {
+		return brokerReconTickMsg{}
+	})
+}
+
+// fetchBrokerRecon fetches live broker positions and reconciles them against the
+// DB open-trade book, off the render path. Failures are surfaced as an
+// unavailable result rather than crashing the TUI.
+func fetchBrokerRecon(bv execution.BrokerView) tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		// store.GetOpenTrades → store.GetDB() panics without a live connection,
+		// so bail out cleanly when the DB is unavailable (the rest of the TUI
+		// tolerates this too).
+		if !store.IsConnected() {
+			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: "database not connected"}}
+		}
+
+		positions, err := bv.PositionsSnapshot(ctx)
+		if err != nil {
+			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}}
+		}
+		trades, err := store.GetOpenTrades(ctx)
+		if err != nil {
+			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}}
+		}
+		res := views.ReconcilePositions(positions, trades, brokerReconTolerance)
+		res.CheckedAt = time.Now()
+		return brokerReconMsg{res}
+	}
 }
 
 // waitForEvent blocks until the next event arrives on the bus subscription.
