@@ -120,6 +120,8 @@ type ORBScheduler struct {
 	lastAdaptiveStopCheckAt time.Time                // wall time of the last adaptive-stop (break-even/trailing) sweep
 	lastOrphanLegCheckAt    time.Time                // wall time of the last orphan-leg reconcile
 	alertedOrphanLegs       map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
+	lastOrphanPosCheckAt    time.Time                // wall time of the last broker-position orphan detection
+	alertedOrphanPositions  map[string]struct{}      // tickers already alerted as unmanaged broker positions (re-armed on resolve)
 	directionDecisions      map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
 	lastScan                time.Time                // Eastern Time of the last successful scan
 	fetchFailures           map[string]int           // ticker → consecutive candle-fetch failures
@@ -150,25 +152,26 @@ func NewORBScheduler(
 	notifier Notifier,
 ) *ORBScheduler {
 	return &ORBScheduler{
-		cfg:                cfg,
-		db:                 db,
-		marketData:         marketData,
-		analyzer:           analyzer,
-		executor:           executor,
-		portfolio:          portfolio,
-		notifier:           notifier,
-		now:                time.Now,
-		state:              StateIdle,
-		rangeBuffers:       make(map[string]*RangeBuffer),
-		orderIDs:           make(map[string][2]string),
-		scaleOutEntryIDs:   make(map[string][2]string),
-		trackedTrades:      make(map[string]*trackedTrade),
-		reconciledSessions: make(map[string]struct{}),
-		backfilledSessions: make(map[string]struct{}),
-		fetchFailures:      make(map[string]int),
-		fetchLastAttempt:   make(map[string]time.Time),
-		alertedOrphanLegs:  make(map[string]struct{}),
-		directionDecisions: make(map[string][2]bool),
+		cfg:                    cfg,
+		db:                     db,
+		marketData:             marketData,
+		analyzer:               analyzer,
+		executor:               executor,
+		portfolio:              portfolio,
+		notifier:               notifier,
+		now:                    time.Now,
+		state:                  StateIdle,
+		rangeBuffers:           make(map[string]*RangeBuffer),
+		orderIDs:               make(map[string][2]string),
+		scaleOutEntryIDs:       make(map[string][2]string),
+		trackedTrades:          make(map[string]*trackedTrade),
+		reconciledSessions:     make(map[string]struct{}),
+		backfilledSessions:     make(map[string]struct{}),
+		fetchFailures:          make(map[string]int),
+		fetchLastAttempt:       make(map[string]time.Time),
+		alertedOrphanLegs:      make(map[string]struct{}),
+		alertedOrphanPositions: make(map[string]struct{}),
+		directionDecisions:     make(map[string][2]bool),
 	}
 }
 
@@ -430,6 +433,11 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// is best-effort; this retries off the working-order list, decoupled from the now-closed
 	// trade row, and alerts on orders it can't prove ownership of). No-op outside forex mode.
 	s.reconcileOrphanedLegs(ctx)
+
+	// Detection-only: alert on any broker position no filled ORB trade explains
+	// (the July metals-short orphan shape — filled at the broker, 'cancelled' in
+	// the DB, invisible to every status='filled' reconciler). Places no orders.
+	s.detectOrphanedPositions(ctx)
 
 	// Cancel a split-bracket entry that never filled once its sibling has already exited: the
 	// logical trade is over, so a still-pending entry must not fill on a breakout retest and
