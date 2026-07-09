@@ -230,7 +230,9 @@ func FetchDashboardData(ctx context.Context, mode string, initialCapital float64
 	// single glitched snapshot (e.g. an April spike to $208k on a $100k account)
 	// dominate the figure forever; a bounded lookback tracks the recent peak and
 	// ignores non-positive rows.
-	if peak, perr := store.GetPeakPortfolioValue(ctx, time.Now().AddDate(0, 0, -drawdownLookbackDays)); perr == nil && peak > d.TotalValue {
+	// peak > 0 guards against a division by zero when the window has no positive
+	// snapshots (peak == 0) and the latest value is itself a negative glitch.
+	if peak, perr := store.GetPeakPortfolioValue(ctx, time.Now().AddDate(0, 0, -drawdownLookbackDays)); perr == nil && peak > 0 && peak > d.TotalValue {
 		d.DrawdownPct = ((peak - d.TotalValue) / peak) * 100
 	}
 
