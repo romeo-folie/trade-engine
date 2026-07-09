@@ -507,11 +507,18 @@ func (m Model) View() string {
 		bodyHeight = 1
 	}
 
-	// Clip the body to the available height. lipgloss's Height() only pads a
-	// short block up to the target; it does NOT truncate a tall one. Without
-	// this clip an over-long view (e.g. many open positions) overflows and the
-	// terminal scrolls the tab bar and column headers off the top of the screen.
-	body := clipToHeight(m.renderBody(bodyHeight), bodyHeight)
+	// Wrap the body to the terminal width BEFORE clipping. lipgloss's Width()
+	// wraps long lines (e.g. the 82–87 cell table separators) into extra
+	// physical rows on a narrow terminal, so clipping logical newlines alone
+	// would undercount and still overflow. Wrapping first makes clipToHeight
+	// count real screen rows.
+	body := lipgloss.NewStyle().Width(m.width).Render(m.renderBody(bodyHeight))
+
+	// Clip the wrapped body to the available height. lipgloss's Height() only
+	// pads a short block up to the target; it does NOT truncate a tall one.
+	// Without this clip an over-long view (e.g. many open positions) overflows
+	// and the terminal scrolls the tab bar and column headers off the top.
+	body = clipToHeight(body, bodyHeight)
 
 	bodyStyle := lipgloss.NewStyle().
 		Width(m.width).
