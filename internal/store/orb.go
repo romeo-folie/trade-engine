@@ -449,11 +449,14 @@ func GetRecentlyCancelledORBTrades(ctx context.Context, db *pgxpool.Pool, since 
 // ReopenORBTradeToFilled flips a wrongly-'cancelled' entry back to 'filled' with
 // the given fill price (clearing closed_at) when the broker is found to still
 // hold the position. Guarded to status='cancelled' so it never disturbs a
-// genuinely closed or filled row. Returns whether a row changed.
+// genuinely closed or filled row. filled_at is set to the row's created_at (the
+// order-placement time, a safe lower bound for the real fill) rather than NOW(),
+// so time-based exits anchored on filled_at don't grant a hours-old position a
+// fresh max-hold window. Returns whether a row changed.
 func ReopenORBTradeToFilled(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64) (bool, error) {
 	tag, err := db.Exec(ctx, `
 		UPDATE orb_trades
-		SET status='filled', fill_price=$1, filled_at=NOW(), closed_at=NULL
+		SET status='filled', fill_price=$1, filled_at=created_at, closed_at=NULL
 		WHERE order_id=$2 AND status='cancelled'`, fillPrice, orderID)
 	if err != nil {
 		return false, err

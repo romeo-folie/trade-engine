@@ -89,13 +89,25 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: load cancelled trades failed", "err", err)
 		return
 	}
-	candidates := append(append([]store.ORBTrade{}, pending...), cancelled...)
-
 	// Reuse the detector's residue math to find positions no filled row explains,
 	// then attribute each to the entry rows (pending OR wrongly-cancelled) that
-	// account for it.
+	// account for it. Match pending and cancelled candidates as SEPARATE
+	// single-status sets: a position that a live pending order and a stale
+	// cancelled order could each explain (cross-session, same ticker/side/qty) is
+	// genuinely ambiguous, so it is left for the alerting detector rather than
+	// risk recording the wrong order as filled and orphaning a live stop entry.
 	for _, f := range findOrphanedPositions(positions, filled, orphanPositionTolerance) {
-		entries := matchOrphanEntries(f, candidates, orphanPositionTolerance)
+		pendingMatch := matchOrphanEntries(f, pending, orphanPositionTolerance)
+		cancelledMatch := matchOrphanEntries(f, cancelled, orphanPositionTolerance)
+		if len(pendingMatch) > 0 && len(cancelledMatch) > 0 {
+			slog.Warn("orb: fill reconcile: ambiguous — both a pending and a cancelled entry match; leaving for the detector",
+				"ticker", f.Ticker, "broker_qty", f.BrokerQty)
+			continue
+		}
+		entries := pendingMatch
+		if len(entries) == 0 {
+			entries = cancelledMatch
+		}
 		if len(entries) == 0 {
 			continue // no entry explains it — leave it for the alerting detector
 		}
