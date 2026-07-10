@@ -724,7 +724,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 		if !ok {
 			return fmt.Errorf("equities scanning requires AlpacaClient as MarketDataProvider; set a CandidateScanner for other providers")
 		}
-		gaps, gapErr := data.FetchGapMovers(ctx, alpacaClient, s.cfg.GapThresholdPct)
+		gaps, gapErr := data.FetchGapMovers(ctx, alpacaClient, data.GapScreen{
+			MinGapPct:       s.cfg.GapThresholdPct,
+			MinPrice:        s.cfg.MinPrice,
+			MinDollarVolume: s.cfg.MinDollarVolume,
+		})
 		if gapErr != nil {
 			return fmt.Errorf("scan gap movers: %w", gapErr)
 		}
@@ -737,8 +741,9 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 		// Cap how many gap movers get LLM-scored. This is the production equities
 		// path (te run --mode orb / orb-newyork construct the scheduler without a
 		// CandidateScanner), so the cap MUST live here too — not only in
-		// EquitiesCandidateScanner. FetchGapMovers ranks by |gap%| desc, so we keep
-		// the strongest movers and bound the rate-limited model calls; a large gap
+		// EquitiesCandidateScanner. FetchGapMovers ranks liquidity-first (|gap%| ×
+		// log10 dollar-volume) after applying the price/volume floors, so we keep the
+		// most tradeable movers and bound the rate-limited model calls; a large gap
 		// universe otherwise sprays dozens of calls into the pre-open window and
 		// stalls on the provider quota, finishing after the range opens.
 		maxScan := s.cfg.MaxScanCandidates

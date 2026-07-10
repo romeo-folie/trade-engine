@@ -25,7 +25,11 @@ type EquitiesCandidateScanner struct {
 // scored candidates (including "skip" actions). Filtering and sorting are
 // handled by the caller (ORBScheduler.tickScanning).
 func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]ScoredCandidate, error) {
-	gaps, err := data.FetchGapMovers(ctx, s.AlpacaClient, s.Cfg.GapThresholdPct)
+	gaps, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{
+		MinGapPct:       s.Cfg.GapThresholdPct,
+		MinPrice:        s.Cfg.MinPrice,
+		MinDollarVolume: s.Cfg.MinDollarVolume,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("scan gap movers: %w", err)
 	}
@@ -33,8 +37,9 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 		return nil, nil
 	}
 
-	// Cap how many candidates get LLM-scored. FetchGapMovers already ranks by
-	// |gap%| descending, so this keeps the strongest movers and bounds the
+	// Cap how many candidates get LLM-scored. FetchGapMovers already ranks
+	// liquidity-first (|gap%| × log10 dollar-volume) after applying the price/
+	// volume floors, so this keeps the most tradeable movers and bounds the
 	// number of (rate-limited) model calls — a large gap universe otherwise
 	// sprays dozens of calls into the pre-open window and stalls on the
 	// provider's per-minute quota, finishing after the range opens (candidates
