@@ -70,6 +70,10 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: get positions failed", "err", err)
 		return
 	}
+	// Scope to this scheduler's forex/metals instruments — a concurrent futures
+	// scheduler on a shared broker (orb-newyork) holds positions whose conids don't
+	// reverse-resolve to symbols, so an unfiltered comparison would mis-handle them.
+	positions = s.forexOnlyPositions(positions)
 	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
 	if err != nil {
 		slog.Warn("orb: fill reconcile: load filled trades failed", "err", err)
