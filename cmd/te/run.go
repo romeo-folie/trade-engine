@@ -685,10 +685,64 @@ Modes:
 				forexScheduler.SetFeedbackConfig(&cfg.Feedback)
 			}
 
-			// 5. Run both schedulers concurrently. A fatal error in either cancels
-			// the shared context, which unblocks the other via its ctx.Done() check.
-			logger.Info("ORB-NewYork combined scheduler starting")
-			fmt.Println("ORB-NewYork mode active (equities + forex). Waiting for pre-market scan window...")
+			// 5. Optionally build a futures ORB scheduler (micro index futures via
+			// IBKR) alongside equities+forex. Index futures open at 09:30 ET — the
+			// same NY open as this mode — so they belong in this process rather than a
+			// colliding cron slot (te-switch runs one engine at a time). Opt-in via
+			// futures_orb.enabled; reuses the IBKR broker/data already set up above. A
+			// conid warm-up failure is NON-fatal: it disables futures for the session
+			// but never takes down the equities/forex bot.
+			var futuresScheduler *orb.ORBScheduler
+			if cfg.FuturesORB.Enabled {
+				if err := ibkrBroker.WarmFuturesConidCache(ctx, cfg.FuturesORB.Instruments); err != nil {
+					logger.Warn("orb-newyork: futures conid warm-up failed — futures disabled this session", "err", err.Error())
+				} else {
+					futuresBus := events.New()
+					futuresAnalyzer := analysis.NewAnalyzer(cfg.Models, futuresBus)
+					var futuresNotifier orb.Notifier
+					if tgBot != nil {
+						futuresNotifier = &orbTelegramNotifier{bot: tgBot}
+					}
+					futuresORBCfg := config.ORBConfig{
+						Enabled:        true,
+						Mode:           "paper",
+						MaxCandidates:  len(cfg.FuturesORB.Instruments),
+						RangeMinutes:   cfg.FuturesORB.RangeMinutes,
+						RiskReward:     cfg.FuturesORB.RiskReward,
+						MaxRiskPct:     cfg.FuturesORB.MaxRiskPct,
+						MaxPositionPct: cfg.FuturesORB.MaxPositionPct,
+					}
+					futuresScheduler = orb.NewORBScheduler(
+						futuresORBCfg, store.GetDB(), ibkrData, futuresAnalyzer,
+						ibkrBroker, newDBPortfolioValuer(100_000), futuresNotifier,
+					)
+					futuresScheduler.SetScanner(&orb.FuturesCandidateScanner{
+						Instruments: cfg.FuturesORB.Instruments,
+						MarketData:  ibkrData,
+						Cfg:         cfg.FuturesORB,
+					})
+					futuresScheduler.SetFuturesConfig(&cfg.FuturesORB)
+					if newsProvider != nil {
+						futuresScheduler.SetNewsProvider(newsProvider)
+					}
+					futuresScheduler.SetBus(futuresBus)
+					// No second feedback Reviewer: the equities scheduler already runs
+					// one that queries all trades globally (see comment above).
+					if cfg.Feedback.Enabled {
+						futuresScheduler.SetFeedbackConfig(&cfg.Feedback)
+					}
+					logger.Info("orb-newyork: futures scheduler enabled", "instruments", len(cfg.FuturesORB.Instruments))
+				}
+			}
+
+			// 6. Run the schedulers concurrently. A fatal error in any one cancels the
+			// shared context, which unblocks the others via their ctx.Done() check.
+			domains := "equities + forex"
+			if futuresScheduler != nil {
+				domains += " + futures"
+			}
+			logger.Info("ORB-NewYork combined scheduler starting", "domains", domains)
+			fmt.Printf("ORB-NewYork mode active (%s). Waiting for pre-market scan window...\n", domains)
 			eg, egCtx := errgroup.WithContext(ctx)
 			eg.Go(func() error {
 				if err := equitiesScheduler.Run(egCtx); err != nil && err != context.Canceled {
@@ -702,6 +756,14 @@ Modes:
 				}
 				return nil
 			})
+			if futuresScheduler != nil {
+				eg.Go(func() error {
+					if err := futuresScheduler.Run(egCtx); err != nil && err != context.Canceled {
+						return fmt.Errorf("futures orb: %w", err)
+					}
+					return nil
+				})
+			}
 			if err := eg.Wait(); err != nil {
 				return err
 			}

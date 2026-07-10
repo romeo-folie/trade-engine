@@ -43,9 +43,12 @@ const (
 // conidCache) — statically-mapped futures conids (ES/GC/…) fall through to the
 // raw conid, so GetPositions would return a numeric ticker that never matches
 // the symbol in orb_trades and every managed futures position would look
-// orphaned (Codex #397). Futures support waits on a verified conid→symbol
-// reverse path. Paper equities has no broker positions either way. Alerts fire
-// once per ticker until the drift resolves, then re-arm.
+// orphaned (Codex #397). We therefore scope the comparison to this scheduler's
+// own forex/metals instruments (forexOnlyPositions): on a shared IBKR broker
+// (orb-newyork runs a forex and a futures scheduler on one broker) the futures
+// scheduler's positions are ignored here and managed by its own brackets. Paper
+// equities has no broker positions either way. Alerts fire once per ticker until
+// the drift resolves, then re-arm.
 func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
 	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil || s.executor == nil {
 		return
@@ -60,6 +63,7 @@ func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
 		slog.Warn("orb: orphan detector: get positions failed", "err", err)
 		return
 	}
+	positions = s.forexOnlyPositions(positions)
 
 	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
 	if err != nil {
@@ -95,6 +99,23 @@ func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
 			slog.Info("orb: orphan detector: position drift resolved", "ticker", ticker)
 		}
 	}
+}
+
+// forexOnlyPositions filters broker positions to this scheduler's configured
+// forex/metals instruments. On a shared IBKR broker, a concurrent futures
+// scheduler (orb-newyork) holds its own positions whose conids do NOT reverse-
+// resolve to symbols — GetPositions returns them as raw numeric conids — so an
+// unfiltered orphan/reconcile comparison would treat every managed futures
+// position as unexplained and fire false alerts. The detector was always
+// documented forex/metals-only; this enforces it.
+func (s *ORBScheduler) forexOnlyPositions(positions []execution.Position) []execution.Position {
+	scoped := make([]execution.Position, 0, len(positions))
+	for _, p := range positions {
+		if s.isForexInstrument(p.Ticker) {
+			scoped = append(scoped, p)
+		}
+	}
+	return scoped
 }
 
 // orphanFinding is one unmanaged broker position surfaced by the detector.

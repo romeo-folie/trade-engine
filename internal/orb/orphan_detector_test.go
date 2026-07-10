@@ -3,6 +3,7 @@ package orb
 import (
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -72,6 +73,25 @@ func TestFindOrphanedPositions(t *testing.T) {
 }
 
 // A short managed by a matching short row is fully explained.
+// forexOnlyPositions must drop positions that aren't this scheduler's configured
+// forex/metals instruments — specifically a concurrent futures scheduler's
+// positions on a shared broker, which come back with raw numeric conids as their
+// "ticker" and would otherwise be flagged as orphans (Codex #397).
+func TestForexOnlyPositions_ExcludesFutures(t *testing.T) {
+	s := &ORBScheduler{forexCfg: &config.ForexORBConfig{Enabled: true, Instruments: []config.Instrument{
+		{Symbol: "XAU/USD"}, {Symbol: "XAG/USD"},
+	}}}
+	positions := []execution.Position{
+		{Ticker: "XAU/USD", Quantity: -57}, // managed metals — kept
+		{Ticker: "793356217", Quantity: 6}, // MES front-month conid (unresolved futures) — dropped
+		{Ticker: "MES", Quantity: 6},        // even a resolved futures symbol isn't a forex instrument — dropped
+	}
+	got := s.forexOnlyPositions(positions)
+	if len(got) != 1 || got[0].Ticker != "XAU/USD" {
+		t.Fatalf("expected only XAU/USD retained, got %+v", got)
+	}
+}
+
 func TestFindOrphanedPositions_ManagedShort(t *testing.T) {
 	positions := []execution.Position{{Ticker: "XAG/USD", Quantity: -700}}
 	filled := []store.ORBTrade{{Ticker: "XAG/USD", Side: "sell", Qty: 700}}
