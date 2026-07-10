@@ -31,9 +31,41 @@ type alpacaMoversResponse struct {
 	Losers  []alpacaMover `json:"losers"`
 }
 
-// FetchGapMovers returns stocks gapping >= minGapPct (absolute value),
-// sorted by absolute gap descending. Uses the Alpaca Screener API.
-func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64) ([]GapCandidate, error) {
+// GapScreen parameterises the gap-mover screen. Zero-valued floors and
+// RankByLiquidity=false are disabled, so callers that only want the raw gap
+// universe (e.g. the swing scanner) can pass GapScreen{MinGapPct: x} and get the
+// historical gap%-ordered behaviour unchanged.
+type GapScreen struct {
+	MinGapPct float64 // minimum |gap %| to qualify (e.g. 3.0)
+	MinPrice  float64 // drop candidates trading below this (0 = no floor); kills sub-$5 penny stocks / warrants
+	// MinDollarVolume drops candidates whose price×volume is below this (0 = no
+	// floor). Best-effort — only applied when volume is known. CAUTION: the volume
+	// comes from Alpaca's iex feed (a single exchange carrying a small fraction of
+	// consolidated volume), so a hard floor here can drop genuinely liquid names
+	// that trade little on IEX specifically. Left off by default for that reason;
+	// only enable it on a SIP-backed deployment.
+	MinDollarVolume float64
+	// RankByLiquidity ranks results by |gap%| × log10(dollarVolume) instead of raw
+	// |gap%| descending. ORB wants this (liquidity-first among floor-clearing
+	// names); raw callers like the swing scanner leave it false to preserve their
+	// documented "top movers by gap%" ordering.
+	RankByLiquidity bool
+}
+
+// FetchGapMovers returns stocks gapping >= p.MinGapPct (absolute value) that
+// clear the price and dollar-volume floors, ranked liquidity-first. Uses the
+// Alpaca Screener API.
+//
+// Ranking rewards liquidity, not raw gap magnitude: Alpaca's movers list sorted
+// by percentage is dominated by sub-$1 penny stocks and warrants (a $0.30 warrant
+// popping 120% outranks a mega-cap gapping 6%), which are un-tradeable and get
+// skipped downstream. Callers cap the returned slice to a top-N for LLM scoring,
+// so a gap%-only rank guarantees only junk gets scored. Here we (1) drop names
+// below MinPrice, (2) drop names below MinDollarVolume where volume is known, and
+// (3) rank by |gap%| × log10(dollarVolume) so a real gap on a liquid name beats a
+// bigger gap on a dead one. Floors and ranking degrade gracefully (fail open) when
+// snapshot volume is unavailable.
+func FetchGapMovers(ctx context.Context, client *AlpacaClient, p GapScreen) ([]GapCandidate, error) {
 	params := url.Values{}
 	params.Set("top", "50")
 	resp, err := client.get(ctx, "/v1beta1/screener/stocks/movers", params)
@@ -52,36 +84,82 @@ func FetchGapMovers(ctx context.Context, client *AlpacaClient, minGapPct float64
 	all = append(all, moversResp.Gainers...)
 	all = append(all, moversResp.Losers...)
 	for _, m := range all {
-		if math.Abs(m.ChangePerc) >= minGapPct {
-			candidates = append(candidates, GapCandidate{
-				Ticker:        m.Symbol,
-				GapPct:        m.ChangePerc,
-				PreMarketLast: m.Price,
-				PriorClose:    m.Price - m.Change,
-			})
+		if math.Abs(m.ChangePerc) < p.MinGapPct {
+			continue
 		}
+		// Price floor: applied first because price is always present on the
+		// movers payload (no extra call) and is the single most effective junk
+		// filter — it eliminates penny stocks and warrants outright.
+		if p.MinPrice > 0 && m.Price < p.MinPrice {
+			continue
+		}
+		candidates = append(candidates, GapCandidate{
+			Ticker:        m.Symbol,
+			GapPct:        m.ChangePerc,
+			PreMarketLast: m.Price,
+			PriorClose:    m.Price - m.Change,
+		})
 	}
 
-	sort.Slice(candidates, func(i, j int) bool {
-		return math.Abs(candidates[i].GapPct) > math.Abs(candidates[j].GapPct)
-	})
-
-	// Enrich candidates with pre-market volume from the snapshots endpoint.
-	// The screener/movers endpoint does not include volume data.
+	// Enrich candidates with volume from the snapshots endpoint. The
+	// screener/movers endpoint does not include volume data, and we need it
+	// BEFORE ranking (liquidity-weighted) and for the dollar-volume floor.
+	volKnown := false
 	if len(candidates) > 0 {
 		tickers := make([]string, len(candidates))
 		for i, c := range candidates {
 			tickers[i] = c.Ticker
 		}
-		vols, err := fetchSnapshotVolumes(ctx, client, tickers)
-		if err != nil {
-			// Non-fatal: volume is supplementary context for the LLM.
-			fmt.Printf("orb: snapshot volumes: %v\n", err)
+		vols, volErr := fetchSnapshotVolumes(ctx, client, tickers)
+		if volErr != nil {
+			// Non-fatal: fall back to gap-magnitude ranking with no volume floor.
+			fmt.Printf("orb: snapshot volumes: %v\n", volErr)
 		} else {
+			volKnown = true
 			for i := range candidates {
 				candidates[i].PreMarketVol = vols[candidates[i].Ticker]
 			}
 		}
+	}
+
+	// Dollar-volume floor: best-effort. Only drop a name we can positively
+	// confirm is illiquid (volume known and > 0 but below the floor). A missing
+	// or zero snapshot volume is treated as "unknown" and kept — the ranking
+	// still deprioritises it.
+	if volKnown && p.MinDollarVolume > 0 {
+		kept := candidates[:0]
+		for _, c := range candidates {
+			dollarVol := c.PreMarketLast * float64(c.PreMarketVol)
+			if c.PreMarketVol > 0 && dollarVol < p.MinDollarVolume {
+				continue
+			}
+			kept = append(kept, c)
+		}
+		candidates = kept
+	}
+
+	// Rank. Raw callers (RankByLiquidity=false) keep the historical |gap%|-desc
+	// order. ORB ranks liquidity-first: score = |gap%| × log10(dollarVolume+10) —
+	// the +10 keeps unknown-volume names (dollarVol=0 → log10(10)=1 → score=|gap%|)
+	// ranked among themselves by gap, while liquid names get a multiplier up to ~9.
+	// The dollar-volume term uses the same (iex) volume as the floor, but as a soft
+	// reorder among already price-floored names it only mildly mis-ranks a name that
+	// trades thin on IEX — it never drops one.
+	if p.RankByLiquidity {
+		rankScore := func(c GapCandidate) float64 {
+			dollarVol := c.PreMarketLast * float64(c.PreMarketVol)
+			if dollarVol < 0 {
+				dollarVol = 0
+			}
+			return math.Abs(c.GapPct) * math.Log10(dollarVol+10)
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			return rankScore(candidates[i]) > rankScore(candidates[j])
+		})
+	} else {
+		sort.Slice(candidates, func(i, j int) bool {
+			return math.Abs(candidates[i].GapPct) > math.Abs(candidates[j].GapPct)
+		})
 	}
 
 	return candidates, nil

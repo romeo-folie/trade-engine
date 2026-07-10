@@ -428,8 +428,10 @@ orb:
   enabled: false               # Set to true to enable ORB mode
   mode: paper                  # paper | live
   gap_threshold_pct: 3.0       # Minimum gap % to qualify as candidate
+  min_price: 5.0               # Drop gap movers below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.
+  min_dollar_volume: 0         # Drop gap movers below this price×volume before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop liquid names — only enable on a SIP-backed deployment.
   max_candidates: 2            # Number of top candidates to trade (1–5)
-  max_scan_candidates: 15      # How many top gap movers to LLM-score per scan (caps rate-limited model calls; 0 = default 15). Ranked by |gap%| desc.
+  max_scan_candidates: 15      # How many top gap movers to LLM-score per scan (caps rate-limited model calls; 0 = default 15). Ranked liquidity-first (|gap%| × log10 dollar-volume).
   range_minutes: 15            # Opening range window: 5 or 15 minutes
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)

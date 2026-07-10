@@ -279,7 +279,9 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 	byTicker := make(map[string]*SwingCandidate)
 
 	// Top movers (gainers + losers).
-	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, 0) // 0 = no gap threshold for swing scanner
+	// 0 = no gap threshold and no price/volume floors: the swing scanner wants the
+	// full mover universe and does its own LLM filtering downstream.
+	movers, err := data.FetchGapMovers(ctx, s.AlpacaClient, data.GapScreen{MinGapPct: 0})
 	if err != nil {
 		slog.Warn("scanner: fetch movers failed", "err", err)
 	}
