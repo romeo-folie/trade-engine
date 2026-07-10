@@ -130,6 +130,42 @@ func TestIBKRFetchCandles_UnknownPair(t *testing.T) {
 	}
 }
 
+func TestIBKRResolveConid_FuturesDynamic(t *testing.T) {
+	// A futures symbol absent from the static maps must resolve via /trsrv/futures
+	// (nearest expiry >= today) and then serve from cache — mirroring the broker so
+	// the market-data path can fetch candles for it.
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/api/trsrv/futures" && r.URL.Query().Get("symbols") == "ZZ" {
+			hits++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"ZZ":[
+				{"conid":222,"expirationDate":20991231,"ltd":20991231},
+				{"conid":111,"expirationDate":20990601,"ltd":20990601},
+				{"conid":999,"expirationDate":20000101,"ltd":20000101}
+			]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
+	conid, err := client.resolveConid(context.Background(), "ZZ")
+	if err != nil {
+		t.Fatalf("resolveConid futures: %v", err)
+	}
+	if conid != "111" { // nearest expiry >= today
+		t.Errorf("conid = %q; want 111 (nearest front-month)", conid)
+	}
+	if _, err := client.resolveConid(context.Background(), "ZZ"); err != nil {
+		t.Fatalf("resolveConid (cached): %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("trsrv hit %d times; want 1 (second call cached)", hits)
+	}
+}
+
 func TestIBKRFetchCandles_UnsupportedTimeframe(t *testing.T) {
 	client := newTestIBKRClient("http://unused")
 	_, err := client.FetchCandles(context.Background(), "EUR/USD", Timeframe("3m"), time.Now(), time.Now())

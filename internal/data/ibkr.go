@@ -48,6 +48,9 @@ type IBKRClient struct {
 	mu          sync.Mutex
 	lastRequest time.Time
 	minInterval time.Duration // 100ms for 10 req/sec
+
+	futConidMu    sync.Mutex
+	futConidCache map[string]string // "FUT:SYMBOL" → conid, for dynamically-resolved futures
 }
 
 // NewIBKRClient creates a new IBKR Client Portal market data client.
@@ -58,9 +61,10 @@ func NewIBKRClient(gatewayURL string, insecureTLS bool) *IBKRClient {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 	return &IBKRClient{
-		gatewayURL:  strings.TrimRight(gatewayURL, "/"),
-		httpClient:  &http.Client{Timeout: 30 * time.Second, Transport: transport},
-		minInterval: 100 * time.Millisecond,
+		gatewayURL:    strings.TrimRight(gatewayURL, "/"),
+		httpClient:    &http.Client{Timeout: 30 * time.Second, Transport: transport},
+		minInterval:   100 * time.Millisecond,
+		futConidCache: make(map[string]string),
 	}
 }
 
@@ -121,12 +125,98 @@ func (c *IBKRClient) get(ctx context.Context, path string, params url.Values) (*
 // ── Contract resolution ───────────────────────────────────────────────────────
 
 // resolveConid returns the IBKR contract ID (conid) for the given symbol.
-// Returns an error if the symbol is not in the well-known map.
-func (c *IBKRClient) resolveConid(pair string) (string, error) {
-	conid, ok := ibkrConids[pair]
-	if !ok {
+//
+// Resolution order mirrors the broker-side resolver (execution.IBKRBroker) so the
+// market-data and order paths agree on which contract a symbol maps to:
+//  1. Forex/CMDTY static map (ibkrConids) — spot forex + London metals.
+//  2. Futures static map (FuturesConids) — front-month, quarterly then monthly.
+//  3. Session cache of dynamically-resolved futures conids.
+//  4. Dynamic /trsrv/futures lookup for futures symbols missing from the map
+//     (every micro before this map is refreshed, and any symbol after it goes
+//     stale) — without this, FetchCandles fails with "unknown symbol" and the
+//     ORB range watch can never collect candles for the instrument.
+func (c *IBKRClient) resolveConid(ctx context.Context, pair string) (string, error) {
+	if conid, ok := ibkrConids[pair]; ok {
+		return conid, nil
+	}
+	// Forex/CMDTY symbols are slash-delimited ("EUR/USD", "XAU/USD") and only ever
+	// live in ibkrConids; futures roots ("MES", "ES", "GC") never contain a slash.
+	// A slashed symbol that missed the map above is a genuinely unknown pair — fail
+	// fast rather than spending a futures /trsrv round-trip (and a rate-limit slot)
+	// that can't resolve it.
+	if strings.Contains(pair, "/") {
 		return "", fmt.Errorf("ibkr: unknown symbol %q (not in static conid map)", pair)
 	}
+	for _, cycle := range []string{"quarterly", "monthly"} {
+		if conid, ok := ibkrconids.FuturesConids[ibkrconids.FrontMonthKey(pair, cycle, time.Now())]; ok {
+			return conid, nil
+		}
+	}
+
+	cacheKey := "FUT:" + pair
+	c.futConidMu.Lock()
+	if conid, ok := c.futConidCache[cacheKey]; ok {
+		c.futConidMu.Unlock()
+		return conid, nil
+	}
+	c.futConidMu.Unlock()
+
+	return c.resolveConidFuturesDynamic(ctx, pair, cacheKey)
+}
+
+// ibkrTrsrvFuture is one contract from /trsrv/futures. expirationDate and ltd are
+// integer YYYYMMDD dates, not strings.
+type ibkrTrsrvFuture struct {
+	Conid          int `json:"conid"`
+	ExpirationDate int `json:"expirationDate"`
+	LTD            int `json:"ltd"`
+}
+
+// resolveConidFuturesDynamic resolves a futures symbol to its nearest front-month
+// conid via /trsrv/futures (which accepts a bare symbol), caching the result.
+func (c *IBKRClient) resolveConidFuturesDynamic(ctx context.Context, symbol, cacheKey string) (string, error) {
+	resp, err := c.get(ctx, "/v1/api/trsrv/futures", url.Values{"symbols": {symbol}})
+	if err != nil {
+		return "", fmt.Errorf("ibkr: resolve futures conid for %q: %w", symbol, err)
+	}
+	defer resp.Body.Close()
+
+	var chains map[string][]ibkrTrsrvFuture
+	if err := json.NewDecoder(resp.Body).Decode(&chains); err != nil {
+		return "", fmt.Errorf("ibkr: decode trsrv/futures for %q: %w", symbol, err)
+	}
+	contracts := chains[symbol]
+	if len(contracts) == 0 {
+		for _, v := range chains {
+			if len(v) > 0 {
+				contracts = v
+				break
+			}
+		}
+	}
+
+	today, _ := strconv.Atoi(time.Now().Format("20060102"))
+	var bestConid, bestExp int
+	for _, ct := range contracts {
+		exp := ct.LTD
+		if exp == 0 {
+			exp = ct.ExpirationDate
+		}
+		if ct.Conid <= 0 || exp < today {
+			continue
+		}
+		if bestExp == 0 || exp < bestExp {
+			bestExp, bestConid = exp, ct.Conid
+		}
+	}
+	if bestConid == 0 {
+		return "", fmt.Errorf("ibkr: unknown symbol %q (not in static conid map, no futures contract found)", symbol)
+	}
+
+	conid := strconv.Itoa(bestConid)
+	c.futConidMu.Lock()
+	c.futConidCache[cacheKey] = conid
+	c.futConidMu.Unlock()
 	return conid, nil
 }
 
@@ -186,7 +276,7 @@ type ibkrSnapshotEntry struct {
 // FetchCandles retrieves OHLCV bars for the given forex pair and time range via
 // the IBKR history endpoint. Volume is set to 0 — IBKR forex volume is unreliable.
 func (c *IBKRClient) FetchCandles(ctx context.Context, ticker string, tf Timeframe, from, to time.Time) ([]Candle, error) {
-	conid, err := c.resolveConid(ticker)
+	conid, err := c.resolveConid(ctx, ticker)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +342,7 @@ func (c *IBKRClient) FetchCandles(ctx context.Context, ticker string, tf Timefra
 // IBKR snapshot API has a "priming" quirk: the first request may return empty
 // fields. If bid and ask are both 0, the method waits 300ms and retries once.
 func (c *IBKRClient) FetchQuote(ctx context.Context, ticker string) (*Quote, error) {
-	conid, err := c.resolveConid(ticker)
+	conid, err := c.resolveConid(ctx, ticker)
 	if err != nil {
 		return nil, err
 	}
