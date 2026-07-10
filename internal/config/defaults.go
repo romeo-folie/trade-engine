@@ -339,14 +339,18 @@ func Defaults() *Config {
 			SessionOpenET:  "09:30", // US equity index futures open with the equity market
 			RangeMinutes:   15,
 			RiskReward:     2.0,
-			MaxRiskPct:     1.0,
-			MaxPositionPct: 20.0, // one ES contract is ~$255k notional — 20% of $100k = $20k cap (< 1 contract)
+			MaxRiskPct:     0.5,  // conservative per-trade risk for the paper trial
+			MaxPositionPct: 20.0, // with margin_rate set this caps MARGIN consumed (~$20k budget on $100k), not full notional
 			Instruments: []FuturesInstrument{
-				// US equity index futures — quarterly expiry (Mar/Jun/Sep/Dec)
-				{Symbol: "ES", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 12.50, TickBuffer: 2},
-				{Symbol: "NQ", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 5.00, TickBuffer: 2},
-				{Symbol: "YM", Exchange: "CBOT", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 1.00, TickValue: 5.00, TickBuffer: 4},
-				{Symbol: "RTY", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.10, TickValue: 5.00, TickBuffer: 4},
+				// Micro E-mini index futures (1/10th of the full-size contract) — quarterly
+				// expiry (Mar/Jun/Sep/Dec). Micros are used so a small/paper account can hold
+				// ≥1 contract: a full-size ES is ~$280k notional, which the position cap sizes
+				// to zero. margin_rate ~0.10 is a conservative overnight-margin ESTIMATE; refine
+				// against IBKR. Full-size ES/NQ/YM/RTY remain valid instruments if configured.
+				{Symbol: "MES", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 1.25, TickBuffer: 2, MarginRate: 0.10},
+				{Symbol: "MNQ", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, MarginRate: 0.10},
+				{Symbol: "MYM", Exchange: "CBOT", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 1.00, TickValue: 0.50, TickBuffer: 4, MarginRate: 0.10},
+				{Symbol: "M2K", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.10, TickValue: 0.50, TickBuffer: 4, MarginRate: 0.10},
 			},
 		},
 		FuturesORBMetals: FuturesORBConfig{

@@ -3,7 +3,7 @@ package execution
 import (
 	"context"
 	"fmt"
-	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -153,51 +153,67 @@ func (b *IBKRBroker) WarmFuturesConidCache(ctx context.Context, instruments []co
 	return nil
 }
 
-// ibkrSecdefContract is one entry from /iserver/secdef/info for FUT contracts.
-type ibkrSecdefContract struct {
-	Conid          int    `json:"conid"`
+// ibkrTrsrvFuture is one contract from /trsrv/futures. expirationDate and ltd are
+// integer YYYYMMDD dates (e.g. 20260918), NOT strings.
+type ibkrTrsrvFuture struct {
 	Symbol         string `json:"symbol"`
-	SecType        string `json:"secType"`
-	Exchange       string `json:"exchange"`
-	LastTradingDay string `json:"lastTradingDay"` // "YYYYMMDD"
+	Conid          int    `json:"conid"`
+	ExpirationDate int    `json:"expirationDate"` // YYYYMMDD
+	LTD            int    `json:"ltd"`            // last trading day, YYYYMMDD
 }
 
-// resolveConidFuturesDynamic queries IBKR's secdef/info endpoint for the nearest
-// expiry front-month contract. When exchange is non-empty the search is scoped to
-// that venue (e.g. "COMEX" for gold), preventing ambiguous multi-venue results.
+// resolveConidFuturesDynamic resolves a futures symbol to its nearest front-month
+// contract conid via IBKR's /trsrv/futures endpoint, which takes a bare symbol and
+// returns the full contract chain. This replaced /iserver/secdef/info?symbol=…,
+// which requires a *conid* and rejects a symbol with "Bad Request: invalid conid"
+// — so the old dynamic path never worked for any symbol missing from the static
+// map (every micro, and every symbol once the map goes stale). exchange is retained
+// for signature compatibility but unused: trsrv keys purely by symbol.
 // Results are cached by cacheKey to avoid repeat calls within a session.
 func (b *IBKRBroker) resolveConidFuturesDynamic(ctx context.Context, symbol, exchange, cacheKey string) (string, error) {
-	path := fmt.Sprintf("/v1/api/iserver/secdef/info?symbol=%s&secType=FUT", symbol)
-	if exchange != "" {
-		path += "&exchange=" + exchange
-	}
+	path := "/v1/api/trsrv/futures?symbols=" + symbol
 
-	var contracts []ibkrSecdefContract
-	if err := b.do(ctx, "GET", path, nil, &contracts); err != nil {
-		return "", fmt.Errorf("ibkr resolveConidFutures: secdef/info %q: %w", symbol, err)
+	var resp map[string][]ibkrTrsrvFuture
+	if err := b.do(ctx, "GET", path, nil, &resp); err != nil {
+		return "", fmt.Errorf("ibkr resolveConidFutures: trsrv/futures %q: %w", symbol, err)
 	}
+	contracts := resp[symbol]
 	if len(contracts) == 0 {
-		return "", fmt.Errorf("ibkr resolveConidFutures: no contracts returned for %q on %q", symbol, exchange)
-	}
-
-	// Sort by LastTradingDay ascending and pick the nearest future expiry >= today.
-	today := time.Now().Format("20060102")
-	sort.Slice(contracts, func(i, j int) bool {
-		return contracts[i].LastTradingDay < contracts[j].LastTradingDay
-	})
-
-	for _, c := range contracts {
-		if c.LastTradingDay >= today && c.Conid > 0 {
-			conid := fmt.Sprintf("%d", c.Conid)
-			b.conidMu.Lock()
-			b.conidCache[cacheKey] = conid
-			b.conidMu.Unlock()
-			return conid, nil
+		// Fallback: take whatever key was returned (guards against case/format drift).
+		for _, v := range resp {
+			if len(v) > 0 {
+				contracts = v
+				break
+			}
 		}
 	}
+	if len(contracts) == 0 {
+		return "", fmt.Errorf("ibkr resolveConidFutures: no contracts returned for %q", symbol)
+	}
 
-	return "", fmt.Errorf(
-		"ibkr resolveConidFutures: no valid front-month found for %q on %q — static map may need updating",
-		symbol, exchange,
-	)
+	// Pick the nearest expiry >= today. Prefer ltd (last trading day); fall back to
+	// expirationDate when ltd is absent.
+	today, _ := strconv.Atoi(time.Now().Format("20060102"))
+	var bestConid, bestExp int
+	for _, c := range contracts {
+		exp := c.LTD
+		if exp == 0 {
+			exp = c.ExpirationDate
+		}
+		if c.Conid <= 0 || exp < today {
+			continue
+		}
+		if bestExp == 0 || exp < bestExp {
+			bestExp, bestConid = exp, c.Conid
+		}
+	}
+	if bestConid == 0 {
+		return "", fmt.Errorf("ibkr resolveConidFutures: no valid front-month found for %q", symbol)
+	}
+
+	conid := strconv.Itoa(bestConid)
+	b.conidMu.Lock()
+	b.conidCache[cacheKey] = conid
+	b.conidMu.Unlock()
+	return conid, nil
 }
