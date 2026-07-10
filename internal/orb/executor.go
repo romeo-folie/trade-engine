@@ -268,19 +268,27 @@ func ComputeFuturesBracket(r *OpeningRange, side string, portfolioValue float64,
 		qty = 1
 	}
 
-	// Notional cap: qty × entryStop × contractMultiplier ≤ MaxPositionPct% of portfolio.
+	// Position cap: qty × marginPerContract ≤ MaxPositionPct% of portfolio.
 	// contractMultiplier converts price points to dollars (e.g. ES: $12.50/0.25 = $50/pt).
+	// With inst.MarginRate set the cap applies to MARGIN CONSUMED (notional × margin_rate)
+	// rather than full notional — futures are leveraged, so a full-notional cap sizes to
+	// zero contracts on a small account (one MES ≈ $28k notional). marginRate unset (or
+	// invalid) → 1.0 → cap on full notional, the pre-margin behaviour.
 	if cfg.MaxPositionPct > 0 && entryStop > 0 && inst.TickSize > 0 {
 		contractMultiplier := inst.TickValue / inst.TickSize
-		notionalPerContract := entryStop * contractMultiplier
-		maxNotional := portfolioValue * cfg.MaxPositionPct / 100.0
-		maxQtyByNotional := int(math.Floor(maxNotional / notionalPerContract))
-		if maxQtyByNotional < 1 {
+		marginRate := inst.MarginRate
+		if marginRate <= 0 || marginRate > 1 {
+			marginRate = 1.0
+		}
+		marginPerContract := entryStop * contractMultiplier * marginRate
+		maxMargin := portfolioValue * cfg.MaxPositionPct / 100.0
+		maxQtyByMargin := int(math.Floor(maxMargin / marginPerContract))
+		if maxQtyByMargin < 1 {
 			// Even one contract exceeds the cap — caller must skip this order.
 			return BracketParams{Ticker: r.Ticker, Side: side, EntryStop: entryStop, StopLoss: stopLoss, TakeProfit: takeProfit, Qty: 0, SecType: "FUT"}
 		}
-		if qty > maxQtyByNotional {
-			qty = maxQtyByNotional
+		if qty > maxQtyByMargin {
+			qty = maxQtyByMargin
 		}
 	}
 

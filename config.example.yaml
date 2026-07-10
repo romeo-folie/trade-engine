@@ -547,13 +547,19 @@ futures_orb:
   session_open_et: "09:30"     # US equity index futures open with the equity market
   range_minutes: 15
   risk_reward: 2.0
-  max_risk_pct: 1.0
-  max_position_pct: 20.0       # One ES contract ≈ $255k notional — cap sized for < 1 contract on $100k
-  instruments:                 # Quarterly expiry (Mar/Jun/Sep/Dec)
-    - { symbol: ES,  exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 12.50, tick_buffer: 2 }
-    - { symbol: NQ,  exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 5.00,  tick_buffer: 2 }
-    - { symbol: YM,  exchange: CBOT, asset_class: equity_index, expiry_cycle: quarterly, tick_size: 1.00, tick_value: 5.00,  tick_buffer: 4 }
-    - { symbol: RTY, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.10, tick_value: 5.00,  tick_buffer: 4 }
+  max_risk_pct: 0.5            # Per-trade risk as % of portfolio (the real risk control)
+  max_position_pct: 20.0       # With margin_rate set this caps MARGIN consumed (notional × margin_rate) ≈ $20k budget on $100k — NOT full notional
+  # Micro E-mini index futures (1/10th of the full-size contract). Micros are used so a
+  # small/paper account can hold ≥1 contract — a full-size ES (~$280k notional) sizes to
+  # zero under the position cap. margin_rate makes max_position_pct cap margin not notional
+  # (same lever as forex_orb); ~0.10 is a conservative overnight-margin ESTIMATE, refine
+  # against IBKR. Swap in ES/NQ/YM/RTY (tick_value 12.50/5.00/5.00/5.00, no margin_rate or a
+  # smaller one) for a full-size account. Quarterly expiry (Mar/Jun/Sep/Dec).
+  instruments:
+    - { symbol: MES, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 1.25, tick_buffer: 2, margin_rate: 0.10 }
+    - { symbol: MNQ, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 0.50, tick_buffer: 2, margin_rate: 0.10 }
+    - { symbol: MYM, exchange: CBOT, asset_class: equity_index, expiry_cycle: quarterly, tick_size: 1.00, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
+    - { symbol: M2K, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.10, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
 
 # ── COMEX metals futures ORB (IBKR) — run with `te run --mode orb-metals` ─────
 futures_orb_metals:
@@ -563,9 +569,11 @@ futures_orb_metals:
   risk_reward: 2.0
   max_risk_pct: 1.0
   max_position_pct: 30.0
+  # margin_rate (optional): caps max_position_pct on margin consumed instead of full
+  # notional — full-size GC is ~$200k notional, so omit it only on a large account.
   instruments:                 # Monthly expiry
-    - { symbol: GC, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.10,  tick_value: 10.00, tick_buffer: 3 }
-    - { symbol: SI, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.005, tick_value: 25.00, tick_buffer: 5 }
+    - { symbol: GC, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.10,  tick_value: 10.00, tick_buffer: 3, margin_rate: 0.10 }
+    - { symbol: SI, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.005, tick_value: 25.00, tick_buffer: 5, margin_rate: 0.10 }
 
 # ── Market scanner — autonomous candidate discovery ───────────────────────────
 # Runs during market hours, sourcing candidates from screeners (top movers,

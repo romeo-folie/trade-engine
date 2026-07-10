@@ -169,6 +169,37 @@ func TestComputeFuturesBracket_NotionalCap_Clamps(t *testing.T) {
 	}
 }
 
+func TestComputeFuturesBracket_MarginRate_EnablesMicro(t *testing.T) {
+	// MES at ~5600: contractMultiplier = $1.25/0.25 = $5/pt → notional/contract = $28,002.50.
+	// On $100k at MaxPositionPct=20% the FULL-notional cap is $20k < $28k → qty would be 0.
+	// With margin_rate=0.10 the cap applies to MARGIN ($28,002.50 × 0.10 = $2,800) → allows 7;
+	// risk sizing binds lower: range 15pt → 64 ticks × $1.25 = $80/contract; 0.5% of $100k =
+	// $500 → floor(500/80) = 6 contracts.
+	mes := config.FuturesInstrument{
+		Symbol: "MES", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly",
+		TickSize: 0.25, TickValue: 1.25, TickBuffer: 2, MarginRate: 0.10,
+	}
+	r := &OpeningRange{Ticker: "MES", High: 5600, Low: 5585}
+	cfg := stdFuturesCfg
+	cfg.MaxRiskPct = 0.5
+	cfg.MaxPositionPct = 20.0
+
+	// Same instrument WITHOUT margin_rate: the full-notional cap zeroes it out.
+	noMargin := mes
+	noMargin.MarginRate = 0
+	if p := ComputeFuturesBracket(r, "buy", 100_000, cfg, noMargin); p.Qty != 0 {
+		t.Fatalf("without margin_rate one MES ($28k notional) should exceed the 20%% ($20k) cap → qty 0, got %d", p.Qty)
+	}
+
+	p := ComputeFuturesBracket(r, "buy", 100_000, cfg, mes)
+	if p.Qty != 6 {
+		t.Errorf("with margin_rate=0.10, MES should size to 6 (risk-bound), got %d", p.Qty)
+	}
+	if p.SecType != "FUT" {
+		t.Errorf("SecType: want FUT, got %q", p.SecType)
+	}
+}
+
 func TestComputeFuturesBracket_SecType_AlwaysFUT(t *testing.T) {
 	r := &OpeningRange{Ticker: "RTY", High: 2100, Low: 2090}
 	rtyInst := config.FuturesInstrument{

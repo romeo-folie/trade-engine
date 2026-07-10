@@ -24,32 +24,32 @@ import "time"
 // Two quarters are populated for each instrument so a roll-week map update
 // has a one-quarter grace period.
 //
-// Last updated: 2026-04-09 (Q2 2026 front-month + Q3 2026 next quarter).
-// Next update due: before June 2026 expiry (third Friday, ~Jun 20 2026).
-// Obtain conids via IBKR TWS contract search or:
-//   GET /v1/api/iserver/secdef/info?symbol=ES&secType=FUT&exchange=CME
+// Last updated: 2026-07-10 (Q3 2026 front-month SEP26 + Q4 2026 next quarter DEC26).
+// Next update due: before September 2026 expiry (third Friday, ~Sep 18 2026).
+// Verified live against the paper gateway via `/v1/api/trsrv/futures?symbols=…` —
+// this is now the authoritative source and the runtime resolver uses it too, so
+// this map is a warm-cache/offline fallback rather than the sole truth. The prior
+// hand-entered full-size conids (751458xxx) did NOT match the gateway and were
+// replaced. Refresh via:
+//   GET /v1/api/trsrv/futures?symbols=ES,NQ,YM,RTY,MES,MNQ,MYM,M2K
 var FuturesConids = map[string]string{
 	// ── US Equity Index Futures (CME/CBOT) ── quarterly expiry (HMUZ)
-	// ES — E-mini S&P 500
-	"ES/202606": "751458521",
-	"ES/202609": "751458598",
-	// NQ — E-mini Nasdaq-100
-	"NQ/202606": "751459012",
-	"NQ/202609": "751459089",
-	// YM — E-mini Dow Jones (CBOT)
-	"YM/202606": "751459345",
-	"YM/202609": "751459421",
-	// RTY — E-mini Russell 2000
-	"RTY/202606": "751459678",
-	"RTY/202609": "751459754",
+	// Full-size E-minis
+	"ES/202609": "649180671", "ES/202612": "515416632", // E-mini S&P 500
+	"NQ/202609": "770561204", "NQ/202612": "563947726", // E-mini Nasdaq-100
+	"YM/202609": "815824220", "YM/202612": "840227352", // E-mini Dow Jones (CBOT)
+	"RTY/202609": "793356259", "RTY/202612": "780341989", // E-mini Russell 2000
+	// Micro E-minis (1/10th of the full-size contract)
+	"MES/202609": "793356217", "MES/202612": "815824257", // Micro E-mini S&P 500
+	"MNQ/202609": "793356225", "MNQ/202612": "815824267", // Micro E-mini Nasdaq-100
+	"MYM/202609": "815824200", "MYM/202612": "840227334", // Micro E-mini Dow Jones (CBOT)
+	"M2K/202609": "793356214", "M2K/202612": "815824254", // Micro E-mini Russell 2000
 
 	// ── Metals Futures (COMEX) ── monthly expiry; add GC/SI entries when enabling metals ORB
 	// "GC/202506": "",
-	// "GC/202507": "",
 
 	// ── Energy Futures (NYMEX) ── monthly expiry; add CL/NG entries when enabling energy ORB
 	// "CL/202506": "",
-	// "CL/202507": "",
 }
 
 // FrontMonthFor returns the "YYYYMM" string for the active front-month contract

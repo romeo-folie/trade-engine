@@ -754,6 +754,12 @@ type FuturesInstrument struct {
 	TickSize    float64 `yaml:"tick_size"`    // minimum price increment (e.g. 0.25 for ES)
 	TickValue   float64 `yaml:"tick_value"`   // dollar value per tick (e.g. $12.50 for ES)
 	TickBuffer  int     `yaml:"tick_buffer"`  // ticks of buffer above/below range high/low
+	// MarginRate makes max_position_pct cap MARGIN CONSUMED (notional × margin_rate)
+	// instead of full contract notional — the same lever forex_orb uses. Futures are
+	// leveraged (one MES controls ~$28k of notional on ~$2.6k overnight margin), so a
+	// full-notional cap sizes to zero contracts on a small account. 0/unset = cap on
+	// full notional (the pre-margin behaviour). ESTIMATE — refine against IBKR margin.
+	MarginRate float64 `yaml:"margin_rate"`
 }
 
 // FuturesORBConfig configures the Opening Range Breakout strategy for exchange-listed futures via IBKR.

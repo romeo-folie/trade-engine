@@ -441,6 +441,45 @@ func TestResolveConid_APIFallback(t *testing.T) {
 	}
 }
 
+func TestResolveConidFutures_TrsrvDynamic(t *testing.T) {
+	// "XYZ" is not in the static FuturesConids map, so FUT resolution falls through
+	// to the dynamic /trsrv/futures path. The chain has an expired contract and two
+	// future ones (out of order) — the resolver must pick the NEAREST future expiry.
+	var trsrvHits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/api/trsrv/futures" && r.URL.Query().Get("symbols") == "XYZ" {
+			trsrvHits++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"XYZ":[
+				{"symbol":"XYZ","conid":222,"expirationDate":20991231,"ltd":20991231},
+				{"symbol":"XYZ","conid":111,"expirationDate":20990601,"ltd":20990601},
+				{"symbol":"XYZ","conid":999,"expirationDate":20000101,"ltd":20000101}
+			]}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+
+	conid, err := b.resolveConid(t.Context(), "XYZ", "FUT")
+	if err != nil {
+		t.Fatalf("resolveConid FUT error: %v", err)
+	}
+	if conid != "111" { // 20990601 is the nearest expiry >= today
+		t.Errorf("conid = %q; want 111 (nearest front-month)", conid)
+	}
+
+	// Second call must be served from cache (no second trsrv hit).
+	if _, err := b.resolveConid(t.Context(), "XYZ", "FUT"); err != nil {
+		t.Fatalf("resolveConid FUT (cached) error: %v", err)
+	}
+	if trsrvHits != 1 {
+		t.Errorf("trsrv hit %d times; want 1 (second call should be cached)", trsrvHits)
+	}
+}
+
 func TestResolveConid_NotFound(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
