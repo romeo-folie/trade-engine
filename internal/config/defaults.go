@@ -306,8 +306,8 @@ func Defaults() *Config {
 		ORB: ORBConfig{
 			Mode:               "paper",
 			GapThresholdPct:    2.5,
-			MinPrice:           5.0,       // no penny stocks / warrants
-			MinDollarVolume:    1_000_000, // best-effort liquidity floor ($1M price×volume)
+			MinPrice:           5.0, // no penny stocks / warrants
+			MinDollarVolume:    0,   // off by default: snapshot volume is iex-only and under-reports consolidated liquidity (see GapScreen.MinDollarVolume). Enable on SIP deployments.
 			MaxCandidates:      2,
 			RangeMinutes:       15,
 			RiskReward:         2.0,

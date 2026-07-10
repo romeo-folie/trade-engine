@@ -31,13 +31,25 @@ type alpacaMoversResponse struct {
 	Losers  []alpacaMover `json:"losers"`
 }
 
-// GapScreen parameterises the gap-mover screen. Zero-valued floors are disabled,
-// so callers that only want the raw gap universe (e.g. the swing scanner) can
-// pass GapScreen{MinGapPct: x} and get the historical behaviour.
+// GapScreen parameterises the gap-mover screen. Zero-valued floors and
+// RankByLiquidity=false are disabled, so callers that only want the raw gap
+// universe (e.g. the swing scanner) can pass GapScreen{MinGapPct: x} and get the
+// historical gap%-ordered behaviour unchanged.
 type GapScreen struct {
-	MinGapPct       float64 // minimum |gap %| to qualify (e.g. 3.0)
-	MinPrice        float64 // drop candidates trading below this (0 = no floor); kills sub-$5 penny stocks / warrants
-	MinDollarVolume float64 // drop candidates whose price×volume is below this (0 = no floor); best-effort — only applied when volume is known
+	MinGapPct float64 // minimum |gap %| to qualify (e.g. 3.0)
+	MinPrice  float64 // drop candidates trading below this (0 = no floor); kills sub-$5 penny stocks / warrants
+	// MinDollarVolume drops candidates whose price×volume is below this (0 = no
+	// floor). Best-effort — only applied when volume is known. CAUTION: the volume
+	// comes from Alpaca's iex feed (a single exchange carrying a small fraction of
+	// consolidated volume), so a hard floor here can drop genuinely liquid names
+	// that trade little on IEX specifically. Left off by default for that reason;
+	// only enable it on a SIP-backed deployment.
+	MinDollarVolume float64
+	// RankByLiquidity ranks results by |gap%| × log10(dollarVolume) instead of raw
+	// |gap%| descending. ORB wants this (liquidity-first among floor-clearing
+	// names); raw callers like the swing scanner leave it false to preserve their
+	// documented "top movers by gap%" ordering.
+	RankByLiquidity bool
 }
 
 // FetchGapMovers returns stocks gapping >= p.MinGapPct (absolute value) that
@@ -126,21 +138,29 @@ func FetchGapMovers(ctx context.Context, client *AlpacaClient, p GapScreen) ([]G
 		candidates = kept
 	}
 
-	// Rank liquidity-first. score = |gap%| × log10(dollarVolume+10): the +10 keeps
-	// unknown-volume names (dollarVol=0 → log10(10)=1 → score=|gap%|) ranked among
-	// themselves by gap, while liquid names get a multiplier up to ~9. When volume
-	// is entirely unavailable this collapses to a pure gap-magnitude sort — the
-	// historical behaviour.
-	rankScore := func(c GapCandidate) float64 {
-		dollarVol := c.PreMarketLast * float64(c.PreMarketVol)
-		if dollarVol < 0 {
-			dollarVol = 0
+	// Rank. Raw callers (RankByLiquidity=false) keep the historical |gap%|-desc
+	// order. ORB ranks liquidity-first: score = |gap%| × log10(dollarVolume+10) —
+	// the +10 keeps unknown-volume names (dollarVol=0 → log10(10)=1 → score=|gap%|)
+	// ranked among themselves by gap, while liquid names get a multiplier up to ~9.
+	// The dollar-volume term uses the same (iex) volume as the floor, but as a soft
+	// reorder among already price-floored names it only mildly mis-ranks a name that
+	// trades thin on IEX — it never drops one.
+	if p.RankByLiquidity {
+		rankScore := func(c GapCandidate) float64 {
+			dollarVol := c.PreMarketLast * float64(c.PreMarketVol)
+			if dollarVol < 0 {
+				dollarVol = 0
+			}
+			return math.Abs(c.GapPct) * math.Log10(dollarVol+10)
 		}
-		return math.Abs(c.GapPct) * math.Log10(dollarVol+10)
+		sort.Slice(candidates, func(i, j int) bool {
+			return rankScore(candidates[i]) > rankScore(candidates[j])
+		})
+	} else {
+		sort.Slice(candidates, func(i, j int) bool {
+			return math.Abs(candidates[i].GapPct) > math.Abs(candidates[j].GapPct)
+		})
 	}
-	sort.Slice(candidates, func(i, j int) bool {
-		return rankScore(candidates[i]) > rankScore(candidates[j])
-	})
 
 	return candidates, nil
 }

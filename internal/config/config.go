@@ -70,7 +70,7 @@ type ORBConfig struct {
 	Mode               string  `yaml:"mode"`                 // "paper" | "live"
 	GapThresholdPct    float64 `yaml:"gap_threshold_pct"`    // minimum gap % (e.g. 3.0)
 	MinPrice           float64 `yaml:"min_price"`            // drop gap movers trading below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.
-	MinDollarVolume    float64 `yaml:"min_dollar_volume"`    // drop gap movers whose price×volume is below this before scoring (omit for default; explicit 0 disables). Best-effort — only applied when snapshot volume is known.
+	MinDollarVolume    float64 `yaml:"min_dollar_volume"`    // drop gap movers whose price×volume is below this before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop genuinely liquid names — only enable on a SIP-backed deployment.
 	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5 (how many scored candidates to actually trade)
 	MaxScanCandidates  int     `yaml:"max_scan_candidates"`  // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked liquidity-first (|gap%| × log10 dollar-volume), so this keeps the most tradeable ones.
 	RangeMinutes       int     `yaml:"range_minutes"`        // 5 or 15

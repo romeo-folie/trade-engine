@@ -29,6 +29,7 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 		MinGapPct:       s.Cfg.GapThresholdPct,
 		MinPrice:        s.Cfg.MinPrice,
 		MinDollarVolume: s.Cfg.MinDollarVolume,
+		RankByLiquidity: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan gap movers: %w", err)

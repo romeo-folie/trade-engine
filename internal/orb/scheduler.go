@@ -728,6 +728,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			MinGapPct:       s.cfg.GapThresholdPct,
 			MinPrice:        s.cfg.MinPrice,
 			MinDollarVolume: s.cfg.MinDollarVolume,
+			RankByLiquidity: true,
 		})
 		if gapErr != nil {
 			return fmt.Errorf("scan gap movers: %w", gapErr)

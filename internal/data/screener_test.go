@@ -196,7 +196,7 @@ func TestFetchGapMoversLiquidityRanking(t *testing.T) {
 	client := NewAlpacaClient("test-key", "test-secret", srv.URL)
 	client.minInterval = 0
 
-	candidates, err := FetchGapMovers(context.Background(), client, GapScreen{MinGapPct: 3.0, MinPrice: 5.0})
+	candidates, err := FetchGapMovers(context.Background(), client, GapScreen{MinGapPct: 3.0, MinPrice: 5.0, RankByLiquidity: true})
 	if err != nil {
 		t.Fatalf("FetchGapMovers: %v", err)
 	}
@@ -205,6 +205,54 @@ func TestFetchGapMoversLiquidityRanking(t *testing.T) {
 	}
 	if candidates[0].Ticker != "LIQ" {
 		t.Errorf("candidates[0].Ticker = %q, want LIQ (liquidity should beat a bigger gap on a thin name)", candidates[0].Ticker)
+	}
+}
+
+// TestFetchGapMoversRawPathKeepsGapOrder guards the swing-scanner path: with
+// RankByLiquidity=false, a lower-gap but far more liquid name must NOT displace a
+// bigger gainer — ordering stays |gap%|-desc regardless of dollar volume.
+func TestFetchGapMoversRawPathKeepsGapOrder(t *testing.T) {
+	// BIG gaps 8% at $6 trading ~$1.8M; MEGA gaps 4% at $200 trading $2B. Under
+	// liquidity ranking MEGA would win; on the raw path BIG (bigger gap) must lead.
+	const moversJSON = `{
+		"gainers": [
+			{"symbol":"BIG","percent_change":8.0,"change":0.44,"price":6.0},
+			{"symbol":"MEGA","percent_change":4.0,"change":7.69,"price":200.0}
+		],
+		"losers": []
+	}`
+	const snapshotsJSON = `{
+		"BIG": {"dailyBar":{"t":"2026-04-05T04:00:00Z","o":5.6,"h":6.1,"l":5.5,"c":6.0,"v":300000,"vw":5.9}},
+		"MEGA": {"dailyBar":{"t":"2026-04-05T04:00:00Z","o":193.0,"h":201.0,"l":192.0,"c":200.0,"v":10000000,"vw":197.0}}
+	}`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1beta1/screener/stocks/movers":
+			w.Write([]byte(moversJSON))
+		case "/v2/stocks/snapshots":
+			w.Write([]byte(snapshotsJSON))
+		default:
+			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.Error(w, "not found", 404)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewAlpacaClient("test-key", "test-secret", srv.URL)
+	client.minInterval = 0
+
+	// Raw path: no floors, no liquidity ranking (swing-scanner default).
+	raw, err := FetchGapMovers(context.Background(), client, GapScreen{MinGapPct: 3.0})
+	if err != nil {
+		t.Fatalf("FetchGapMovers: %v", err)
+	}
+	if len(raw) != 2 {
+		t.Fatalf("expected 2 candidates, got %d", len(raw))
+	}
+	if raw[0].Ticker != "BIG" {
+		t.Errorf("raw[0].Ticker = %q, want BIG (raw path must stay gap%%-ordered, not liquidity-ranked)", raw[0].Ticker)
 	}
 }
 
