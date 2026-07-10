@@ -714,7 +714,10 @@ Modes:
 					}
 					futuresScheduler = orb.NewORBScheduler(
 						futuresORBCfg, store.GetDB(), ibkrData, futuresAnalyzer,
-						ibkrBroker, newDBPortfolioValuer(100_000), futuresNotifier,
+						// Match standalone orb-futures: size risk/margin caps off the
+						// configured initial capital, not a hard-coded $100k, so combined
+						// and standalone modes size futures identically.
+						ibkrBroker, newDBPortfolioValuer(cfg.Engine.InitialCapital), futuresNotifier,
 					)
 					futuresScheduler.SetScanner(&orb.FuturesCandidateScanner{
 						Instruments: cfg.FuturesORB.Instruments,
