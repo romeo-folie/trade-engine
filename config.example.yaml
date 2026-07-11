@@ -173,6 +173,7 @@ markets:
     secret_env: ALPACA_API_SECRET
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
+    option_feed: indicative     # options chain feed: "opra" (real-time, needs Algo Trader Plus) | "indicative" (free, 15-min delayed). options-ORB requires opra.
 
   # IBKR Client Portal gateway — used by the ORB forex/futures strategies.
   ibkr:

@@ -23,27 +23,46 @@ func parseFloat(s string) (float64, error) {
 	return strconv.ParseFloat(s, 64)
 }
 
+// defaultAlpacaDataURL is the market-data host (options chain snapshots live here,
+// not on the trading base URL).
+const defaultAlpacaDataURL = "https://data.alpaca.markets"
+
 // AlpacaBroker implements Executor against the Alpaca paper (or live) trading API.
 type AlpacaBroker struct {
 	apiKey     string
 	secret     string
-	baseURL    string
+	baseURL    string // trading host: orders, positions, /v2/options/contracts
+	dataURL    string // market-data host: /v1beta1/options/snapshots
+	optionFeed string // "opra" (real-time) | "indicative" (free, 15-min delayed)
 	httpClient *http.Client
 }
 
 // NewAlpacaBroker creates an Alpaca broker adapter from market config.
 // Uses the paper endpoint when cfg.Paper is true.
 func NewAlpacaBroker(cfg config.StocksConfig) *AlpacaBroker {
+	dataURL := cfg.DataURL
+	if dataURL == "" {
+		dataURL = defaultAlpacaDataURL
+	}
+	feed := cfg.OptionFeed
+	if feed == "" {
+		feed = "indicative"
+	}
 	return &AlpacaBroker{
 		apiKey:     cfg.APIKey,
 		secret:     cfg.Secret,
 		baseURL:    cfg.BaseURL,
+		dataURL:    dataURL,
+		optionFeed: feed,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
 // PlaceOrder submits a market or limit order to Alpaca.
 func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {
+	if req.SecType == "OPT" {
+		return b.placeOptionOrder(ctx, req)
+	}
 	body := map[string]any{
 		"symbol":        req.Ticker,
 		"qty":           fmt.Sprintf("%.6f", req.Quantity),
@@ -181,6 +200,7 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 	var resp []struct {
 		Symbol       string `json:"symbol"`
+		AssetClass   string `json:"asset_class"` // "us_equity" | "us_option"
 		Qty          string `json:"qty"`
 		AvgEntryPx   string `json:"avg_entry_price"`
 		CurrentPrice string `json:"current_price"`
@@ -214,7 +234,7 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		if err != nil {
 			return nil, fmt.Errorf("alpaca GetPositions: parse unrealized_pl %q: %w", p.UnrealizedPL, err)
 		}
-		out = append(out, Position{
+		pos := Position{
 			Ticker:       p.Symbol,
 			Quantity:     qty,
 			AvgCostBasis: avg,
@@ -222,7 +242,15 @@ func (b *AlpacaBroker) GetPositions(ctx context.Context) ([]Position, error) {
 			CurrentValue: mv,
 			UnrealizedPL: upl,
 			Side:         p.Side,
-		})
+		}
+		// Option positions carry the OCC symbol as their ticker; parse it into the
+		// contract identity so options-ORB reconciliation (issue #416) can key on it.
+		if p.AssetClass == "us_option" {
+			if oc, err := ParseOCCSymbol(p.Symbol); err == nil {
+				pos.Option = &oc
+			}
+		}
+		out = append(out, pos)
 	}
 	return out, nil
 }
@@ -263,10 +291,21 @@ func (b *AlpacaBroker) GetAccount(ctx context.Context) (AccountInfo, error) {
 	}, nil
 }
 
-
 // ─── HTTP helper ──────────────────────────────────────────────────────────────
 
 func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, out any) error {
+	return b.doURL(ctx, method, b.baseURL+path, body, out)
+}
+
+// doData issues a request against the market-data host (b.dataURL) — options
+// chain snapshots live there, not on the trading base URL.
+func (b *AlpacaBroker) doData(ctx context.Context, method, path string, body any, out any) error {
+	return b.doURL(ctx, method, b.dataURL+path, body, out)
+}
+
+// doURL is the shared HTTP core, parameterized by full URL so trading-host and
+// data-host requests reuse the same auth, error handling, and body decoding.
+func (b *AlpacaBroker) doURL(ctx context.Context, method, url string, body any, out any) error {
 	var bodyReader io.Reader
 	if body != nil {
 		bs, err := json.Marshal(body)
@@ -276,7 +315,7 @@ func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, ou
 		bodyReader = bytes.NewReader(bs)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, b.baseURL+path, bodyReader)
+	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
 		return err
 	}
@@ -294,7 +333,7 @@ func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, ou
 
 	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB – equity history can exceed 8 KiB
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("alpaca %s %s → %d: %s", method, path, resp.StatusCode, bytes.TrimSpace(respBytes))
+		return fmt.Errorf("alpaca %s %s → %d: %s", method, url, resp.StatusCode, bytes.TrimSpace(respBytes))
 	}
 	if out != nil && len(respBytes) > 0 {
 		return json.Unmarshal(respBytes, out)

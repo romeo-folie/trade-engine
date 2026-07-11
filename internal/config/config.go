@@ -966,6 +966,11 @@ type StocksConfig struct {
 	Secret    string `yaml:"-" json:"-"`
 	BaseURL   string `yaml:"base_url"`
 	DataURL   string `yaml:"data_url"`
+	// OptionFeed selects the Alpaca options market-data feed: "opra" (real-time,
+	// requires the Algo Trader Plus subscription) or "indicative" (free, 15-min
+	// delayed). Empty defaults to "indicative". Options-ORB (issue #414) requires
+	// "opra" to trade the open; the adapter logs when it falls back to indicative.
+	OptionFeed string `yaml:"option_feed"`
 }
 
 // ── Strategies ────────────────────────────────────────────────────────────────
