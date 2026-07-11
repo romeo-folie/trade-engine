@@ -62,6 +62,18 @@ type ORBTrade struct {
 	// the pair counts as one logical trade. See migration 036.
 	ScaleOutRole     string
 	ScaleOutParentID *string
+	// Instrument identity. AssetClass is "equity" (default), "forex", "futures",
+	// or "option". The remaining fields are populated only for options (Issue #410,
+	// migration 039) and identify the specific contract; they are zero/nil for all
+	// other asset classes. Multiplier is the contract multiplier (100 for standard
+	// US equity options, 1 otherwise) and makes P&L instrument-correct — see ExitPnLM.
+	AssetClass string
+	Underlying string
+	Expiry     *time.Time
+	Strike     float64
+	Right      string // "C" | "P"
+	OCCSymbol  string
+	Multiplier int
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -149,18 +161,75 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 	if trade.ScaleOutParentID != nil && *trade.ScaleOutParentID != "" {
 		parentID = *trade.ScaleOutParentID
 	}
+	// Instrument identity: default asset_class to 'equity' and multiplier to 1 so
+	// existing callers (equity/forex/futures) that leave these zero behave exactly
+	// as before. The option-specific columns are written as NULL unless set.
+	assetClass := trade.AssetClass
+	if assetClass == "" {
+		assetClass = "equity"
+	}
+	multiplier := trade.Multiplier
+	if multiplier == 0 {
+		multiplier = 1
+	}
+	var strike any
+	if trade.Strike != 0 {
+		strike = trade.Strike
+	}
 	var id string
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id, asset_class, underlying, expiry, strike, "right", occ_symbol, multiplier)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		RETURNING id`,
 		trade.SessionID, trade.Ticker, trade.Side,
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
 		trade.Qty, nullableString(trade.OrderID), trade.Status,
 		nullableString(trade.TpOrderID), nullableString(trade.SlOrderID),
 		nullableString(trade.ScaleOutRole), parentID,
+		assetClass, nullableString(trade.Underlying), trade.Expiry,
+		strike, nullableString(trade.Right), nullableString(trade.OCCSymbol), multiplier,
 	).Scan(&id)
 	return id, err
+}
+
+// GetORBTradeByID returns a single ORB trade with full instrument identity,
+// including the option-contract columns (Issue #410). It is the canonical
+// full-fidelity read for the options-ORB router, exits, and reconciler; the
+// list readers select only the fields their callers need and leave the option
+// columns zero. Returns (nil, nil) when no row matches.
+func GetORBTradeByID(ctx context.Context, db *pgxpool.Pool, id string) (*ORBTrade, error) {
+	var t ORBTrade
+	err := db.QueryRow(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), COALESCE(underlying,''), expiry,
+		       COALESCE(strike,0), COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1)
+		FROM orb_trades WHERE id=$1`, id,
+	).Scan(
+		&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+		&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+		&t.Qty, &t.OrderID, &t.Status,
+		&t.FillPrice, &t.PnL,
+		&t.TpOrderID, &t.SlOrderID,
+		&t.ExitPrice, &t.ExitType, &t.ExitSource,
+		&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+		&t.ScaleOutRole, &t.ScaleOutParentID,
+		&t.AssetClass, &t.Underlying, &t.Expiry,
+		&t.Strike, &t.Right, &t.OCCSymbol, &t.Multiplier,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
 }
 
 // CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
