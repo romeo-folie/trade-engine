@@ -65,19 +65,23 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	// broker's own open-orders are the durable source of truth.
 	workingSells := s.workingOptionSells(ctx)
 	for _, t := range trades {
-		// Adopt an in-flight exit sell the broker holds for this contract that we are
-		// not tracking in memory (e.g. after a restart), so it's polled below rather
-		// than duplicated by a fresh sell. Re-derive the exit reason from the current
-		// conditions so the recorded exit_type stays one of the valid values (the
-		// original trigger is lost across the restart); default to the EOD flatten
-		// when no live condition fires.
+		// Recover an in-flight exit after a restart (pendingOptionExits is in-memory).
+		// Prefer the PERSISTED exit order id — it's durable and pollable even if the
+		// sell filled while the process was down, so recovery uses the REAL fill price
+		// instead of an estimate; fall back to any still-open working sell on the OCC
+		// (a net for the rare case the id write failed). Re-derive the reason from
+		// current conditions (the original trigger is lost across restart), defaulting
+		// to the EOD flatten.
 		if _, tracked := s.pendingOptionExits[t.ID]; !tracked {
-			if oid, working := workingSells[t.OCCSymbol]; working {
+			oid := t.ExitOrderID
+			if oid == "" {
+				oid = workingSells[t.OCCSymbol]
+			}
+			if oid != "" {
 				reason, exit := s.optionExit.plan(ctx, t, now, sessionEnding)
 				if !exit || reason == "" {
 					reason = optExitEOD
 				}
-				// The adopted sell closes what the broker still holds (capped at the row).
 				adoptQty := t.Qty
 				if heldQty != nil {
 					if h := int(heldQty[t.OCCSymbol]); h < adoptQty {
@@ -127,6 +131,14 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "err", err)
 			continue
 		}
+		// Persist the exit order id immediately so a restart before the close is
+		// recorded can poll this order for the real fill (Finding 1). Harmless once
+		// the row closes (it's no longer loaded). Best-effort.
+		if orderID != "" {
+			if perr := store.SetORBTradeExitOrderID(ctx, s.db, t.ID, orderID); perr != nil {
+				slog.Warn("orb options: persist exit order id failed", "occ", t.OCCSymbol, "err", perr)
+			}
+		}
 		if !confirmed {
 			// Sell submitted but not confirmed filled. Track the in-flight order so
 			// the next sweep POLLS it (above) rather than sending a second sell, and
@@ -173,10 +185,18 @@ func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTra
 		return true // transient — do NOT re-sell this sweep
 	}
 	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
+		// Record P&L on the quantity the order ACTUALLY sold, not pe.qty. pe.qty for an
+		// ADOPTED exit is derived from the broker's current holding, which is already ~0
+		// once the sell has filled — using it would zero the P&L. res.FilledQty is the
+		// real sold count; fall back to pe.qty only if the broker doesn't report it.
+		soldQty := int(res.FilledQty)
+		if soldQty <= 0 {
+			soldQty = pe.qty
+		}
 		// Retain the pending marker if the DB write fails, so the next sweep re-records
 		// this filled order with its real price rather than losing it. Either way the
 		// order is done — return true so no new sell is sent.
-		if s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice, pe.qty) {
+		if s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice, soldQty) {
 			delete(s.pendingOptionExits, t.ID)
 		}
 		return true

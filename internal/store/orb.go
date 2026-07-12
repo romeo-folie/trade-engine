@@ -74,6 +74,10 @@ type ORBTrade struct {
 	Right      string // "C" | "P"
 	OCCSymbol  string
 	Multiplier int
+	// ExitOrderID is the broker order id of the in-flight sell-to-close, persisted
+	// so restart recovery can poll it for the real fill (options only; empty until
+	// an exit is submitted). Cleared implicitly when the trade closes.
+	ExitOrderID string
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -246,7 +250,8 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at,
 		       COALESCE(underlying,''), expiry, COALESCE(strike,0),
-		       COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1)
+		       COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1),
+		       COALESCE(exit_order_id,'')
 		FROM orb_trades
 		WHERE status='filled' AND asset_class='option'
 		ORDER BY created_at ASC`)
@@ -268,6 +273,7 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.Underlying, &t.Expiry, &t.Strike,
 			&t.Right, &t.OCCSymbol, &t.Multiplier,
+			&t.ExitOrderID,
 		); err != nil {
 			return nil, err
 		}
@@ -276,26 +282,52 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 	return out, rows.Err()
 }
 
+// SetORBTradeExitOrderID persists the in-flight exit sell's broker order id on a
+// trade row so restart recovery can poll it for the real fill (options #415/#416).
+func SetORBTradeExitOrderID(ctx context.Context, db *pgxpool.Pool, tradeID, exitOrderID string) error {
+	_, err := db.Exec(ctx, `UPDATE orb_trades SET exit_order_id=$1 WHERE id=$2`, exitOrderID, tradeID)
+	return err
+}
+
 // GetManagedOptionOCCSymbols returns the set of OCC symbols for non-terminal
 // options-ORB trades (status pending or filled). The options orphan detector
 // (#416) treats a broker option position whose OCC is not in this set as an
 // unexplained orphan. Pending is included so a just-filled entry the fill-poll
 // hasn't marked yet is not falsely flagged.
 func GetManagedOptionOCCSymbols(ctx context.Context, db *pgxpool.Pool) (map[string]bool, error) {
+	qty, err := GetManagedOptionQuantities(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(qty))
+	for occ := range qty {
+		out[occ] = true
+	}
+	return out, nil
+}
+
+// GetManagedOptionQuantities returns the SUM of contract quantities for non-terminal
+// options-ORB trades (status pending or filled) per OCC symbol. The orphan detector
+// (#416) compares this against the broker-held quantity so a broker position of 3
+// contracts explained by a managed row of only 1 is flagged as a 2-contract surplus,
+// not treated as fully managed by OCC presence alone.
+func GetManagedOptionQuantities(ctx context.Context, db *pgxpool.Pool) (map[string]float64, error) {
 	rows, err := db.Query(ctx, `
-		SELECT occ_symbol FROM orb_trades
-		WHERE asset_class='option' AND status IN ('pending','filled') AND occ_symbol IS NOT NULL`)
+		SELECT occ_symbol, COALESCE(SUM(qty),0) FROM orb_trades
+		WHERE asset_class='option' AND status IN ('pending','filled') AND occ_symbol IS NOT NULL
+		GROUP BY occ_symbol`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := make(map[string]bool)
+	out := make(map[string]float64)
 	for rows.Next() {
 		var occ string
-		if err := rows.Scan(&occ); err != nil {
+		var qty float64
+		if err := rows.Scan(&occ, &qty); err != nil {
 			return nil, err
 		}
-		out[occ] = true
+		out[occ] = qty
 	}
 	return out, rows.Err()
 }

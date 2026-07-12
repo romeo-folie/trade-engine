@@ -117,7 +117,7 @@ func TestGetOpenFilledOptionTrades(t *testing.T) {
 
 	// An option entry, created pending then filled — mirroring how the router
 	// records it (fill_price is set by the entry fill-poll, not at creation).
-	occ := "SPY260717C00551000"
+	occ := "MGDQTY261218C00100000"
 	optID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
 		SessionID: sess.ID, Ticker: "SPY", Side: "buy", OrderID: "opt-e1",
 		EntryStop: 550.10, StopLoss: 548.00, TakeProfit: 555.00, Qty: 3, Status: "pending",
@@ -312,5 +312,71 @@ func TestFillORBTradePartialByOrderID(t *testing.T) {
 	got, _ := store.GetORBTradeByID(ctx, db, id)
 	if got == nil || got.Status != "filled" || got.Qty != 3 || got.FillPrice != 1.30 {
 		t.Errorf("row = %+v; want filled, qty 3, fill 1.30", got)
+	}
+}
+
+// TestGetManagedOptionQuantities_SumsPerOCC verifies the orphan detector's managed
+// side sums contract quantities per OCC (so a qty mismatch can be detected), and
+// that SetORBTradeExitOrderID round-trips via GetOpenFilledOptionTrades (restart
+// recovery).
+func TestGetManagedOptionQuantities_SumsPerOCC(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-managedqty")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	exp := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	occ := "MGDQTY261218C00100000" // unique OCC so the global SUM isn't polluted by other tests
+	mk := func(qty int, status, orderID string) string {
+		id, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+			SessionID: sess.ID, Ticker: "MGDQTY", Side: "buy", OrderID: orderID, Status: status, Qty: qty,
+			AssetClass: "option", Underlying: "MGDQTY", Expiry: &exp, Strike: 100, Right: "C",
+			OCCSymbol: occ, Multiplier: 100,
+		})
+		if err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		return id
+	}
+	// Measure the DELTA so the shared/persistent test DB (rows accumulate across
+	// runs; the SUM is global across sessions) doesn't make this non-idempotent.
+	before, err := store.GetManagedOptionQuantities(ctx, db)
+	if err != nil {
+		t.Fatalf("GetManagedOptionQuantities (before): %v", err)
+	}
+	filledID := mk(1, "filled", "mq-1")
+	mk(2, "pending", "mq-2") // pending also counts toward managed
+
+	after, err := store.GetManagedOptionQuantities(ctx, db)
+	if err != nil {
+		t.Fatalf("GetManagedOptionQuantities: %v", err)
+	}
+	if after[occ]-before[occ] != 3 {
+		t.Errorf("managed qty delta for %s = %v; want 3 (1 filled + 2 pending)", occ, after[occ]-before[occ])
+	}
+
+	// Exit-order-id persistence round-trips for the filled row.
+	if err := store.SetORBTradeExitOrderID(ctx, db, filledID, "exit-ord-9"); err != nil {
+		t.Fatalf("SetORBTradeExitOrderID: %v", err)
+	}
+	filled, err := store.GetOpenFilledOptionTrades(ctx, db)
+	if err != nil {
+		t.Fatalf("GetOpenFilledOptionTrades: %v", err)
+	}
+	var found bool
+	for _, tr := range filled {
+		if tr.ID == filledID {
+			found = true
+			if tr.ExitOrderID != "exit-ord-9" {
+				t.Errorf("ExitOrderID = %q; want exit-ord-9", tr.ExitOrderID)
+			}
+		}
+	}
+	if !found {
+		t.Error("filled option row not returned by reader")
 	}
 }
