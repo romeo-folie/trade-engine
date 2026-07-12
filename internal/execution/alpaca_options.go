@@ -153,6 +153,15 @@ func (s OptionSnapshot) Mid() float64 {
 	return (s.Bid + s.Ask) / 2
 }
 
+// OptionNBBO is a contract's national best bid/offer at a point in time — a raw quote
+// without greeks. It lives here (rather than in the backtest package) so both the data
+// layer that fetches historical quotes and the backtest that consumes them can name it
+// without an import cycle.
+type OptionNBBO struct {
+	Bid float64
+	Ask float64
+}
+
 // OptionChainFilter narrows a chain request. Zero-value fields are omitted.
 type OptionChainFilter struct {
 	Right     string // "call" | "put" | "" (both)

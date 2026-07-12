@@ -67,17 +67,24 @@ func (f fakeHist) UnderlyingBars(_ context.Context, _ string, from, to time.Time
 	return out, nil
 }
 
-func (f fakeHist) ListContracts(_ context.Context, underlying, right string, expiryGTE, _ time.Time) ([]execution.OptionContract, error) {
+// ListContracts returns realistic FIXED weekly (Friday) expiries within the requested
+// window — independent of the exact query bounds — so the month-bucketed cache +
+// local expiry filter behave as they would against a real API.
+func (f fakeHist) ListContracts(_ context.Context, underlying, right string, expiryGTE, expiryLTE time.Time) ([]execution.OptionContract, error) {
 	rt := "C"
 	if right == "put" {
 		rt = "P"
 	}
-	exp := dayFloorLoc(expiryGTE).AddDate(0, 0, 2) // ~3 DTE
 	var out []execution.OptionContract
-	for _, k := range []float64{98, 99, 100, 101, 102} {
-		oc := execution.OptionContract{Underlying: underlying, Expiry: exp, Strike: k, Right: rt, Multiplier: 100}
-		oc.OCCSymbol = execution.OCCSymbol(oc)
-		out = append(out, oc)
+	for d := dayFloorLoc(expiryGTE); !d.After(expiryLTE); d = d.AddDate(0, 0, 1) {
+		if d.Weekday() != time.Friday {
+			continue
+		}
+		for _, k := range []float64{98, 99, 100, 101, 102} {
+			oc := execution.OptionContract{Underlying: underlying, Expiry: d, Strike: k, Right: rt, Multiplier: 100}
+			oc.OCCSymbol = execution.OCCSymbol(oc)
+			out = append(out, oc)
+		}
 	}
 	return out, nil
 }
@@ -94,6 +101,16 @@ func (f fakeHist) QuoteAt(_ context.Context, occSymbol string, asOf time.Time) (
 	}
 	half := mid * 0.01 // 2% spread → under the 5% ceiling
 	return mid - half, mid + half, true
+}
+
+func (f fakeHist) QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
+	out := make(map[string]execution.OptionNBBO)
+	for _, s := range occSymbols {
+		if bid, ask, ok := f.QuoteAt(ctx, s, asOf); ok {
+			out[s] = execution.OptionNBBO{Bid: bid, Ask: ask}
+		}
+	}
+	return out, nil
 }
 
 func (f fakeHist) OptionBars(_ context.Context, occSymbol string, from, to time.Time) ([]data.Candle, error) {
@@ -159,6 +176,53 @@ func TestRunner_EndToEnd(t *testing.T) {
 	}
 }
 
+// countingHist wraps fakeHist to count the I/O the #427 optimizations target.
+type countingHist struct {
+	fakeHist
+	quotesAt      int
+	listContracts int
+}
+
+func (c *countingHist) QuotesAt(ctx context.Context, occ []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
+	c.quotesAt++
+	return c.fakeHist.QuotesAt(ctx, occ, asOf)
+}
+
+func (c *countingHist) ListContracts(ctx context.Context, u, r string, gte, lte time.Time) ([]execution.OptionContract, error) {
+	c.listContracts++
+	return c.fakeHist.ListContracts(ctx, u, r, gte, lte)
+}
+
+// TestRunner_BatchedAndCached locks the #427 wins: the gate runs ONCE per signal
+// (peek → ReplayWithDecision, not a second Select) and fetches the chain via a single
+// batched QuotesAt; and the IV seed's contract listings are month-bucket cached
+// rather than re-listed every trading day.
+func TestRunner_BatchedAndCached(t *testing.T) {
+	hd := &countingHist{fakeHist: fakeHist{volAt: func(ts time.Time) float64 { return 0.40 - 0.003*float64(ts.YearDay()) }, optClose: 3.0}}
+	r := newTestRunner(t, hd)
+	listAfterSeed := hd.listContracts // seeding happens in NewRunner
+
+	from := time.Date(2026, 3, 4, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 4, 23, 0, 0, 0, etLoc)
+	trades, err := r.RunUnderlying(context.Background(), "SPY", from, to)
+	if err != nil {
+		t.Fatalf("RunUnderlying: %v", err)
+	}
+	if len(trades) != 1 || !trades[0].Accepted {
+		t.Fatalf("expected 1 accepted trade, got %+v", trades)
+	}
+	// One accepted signal ⇒ exactly one batched chain fetch. A regression to the
+	// double gate-run would make this 2 (peek Select + Replay's internal Select).
+	if hd.quotesAt != 1 {
+		t.Errorf("QuotesAt called %d× for 1 signal; want 1 (single gate-run + batched quotes)", hd.quotesAt)
+	}
+	// ~25 IV-seed weekdays should share a handful of month-bucketed listings, not
+	// one ListContracts per day.
+	if listAfterSeed > 8 {
+		t.Errorf("IV seed made %d ListContracts calls; want ≤8 with the month-bucket cache", listAfterSeed)
+	}
+}
+
 func TestHistChainProvider_DerivesGreeks(t *testing.T) {
 	p := NewHistChainProvider(fakeHist{}, 0, 0) // default vol 0.25
 	asOf := time.Date(2026, 3, 4, 9, 45, 0, 0, etLoc)
@@ -204,7 +268,10 @@ func TestBuildIVSeries(t *testing.T) {
 		t.Fatalf("expected ~10 weekday IV samples, got %d", len(series))
 	}
 	for _, d := range series {
-		if d.ATMIV < 0.25 || d.ATMIV > 0.35 {
+		// Wider band than the seed vol: on days whose nearest Friday expiry is <1 DTE,
+		// ATM IV inversion is numerically soft (small vega), so a 0.30 seed reads back
+		// ~0.24–0.36. That's a real property of short-dated options, not drift.
+		if d.ATMIV < 0.20 || d.ATMIV > 0.40 {
 			t.Errorf("%s ATM IV %.3f not near seeded 0.30", d.Date.Format("2006-01-02"), d.ATMIV)
 		}
 	}

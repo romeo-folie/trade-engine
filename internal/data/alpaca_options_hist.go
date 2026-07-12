@@ -209,6 +209,47 @@ func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf 
 	return newest.BidPrice, newest.AskPrice, true
 }
 
+// QuotesAt returns the newest NBBO at or before asOf for MANY OCC symbols in one
+// call: it requests the window [asOf-quoteLookback, asOf] for all symbols sorted
+// DESCENDING, then takes each symbol's first (newest) quote from the grouped
+// response. Symbols with no quote in the window are absent. This replaces an N+1
+// per-contract fetch across a DTE window with a single batched request.
+//
+// The single page (limit 1000, newest-first) captures the recent quote for every
+// liquid contract — which is the universe options-ORB trades; a genuinely illiquid
+// contract absent from the page is excluded, matching the fail-closed single QuoteAt.
+func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
+	out := make(map[string]execution.OptionNBBO)
+	if len(occSymbols) == 0 {
+		return out, nil
+	}
+	params := url.Values{}
+	params.Set("symbols", strings.Join(occSymbols, ","))
+	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
+	params.Set("end", asOf.UTC().Format(time.RFC3339))
+	params.Set("sort", "desc")
+	params.Set("limit", "1000")
+	var resp alpacaOptQuotesResponse
+	if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
+		slog.Warn("alpaca options: batch historical quotes failed", "n", len(occSymbols), "as_of", asOf, "err", err)
+		return nil, err
+	}
+	for sym, quotes := range resp.Quotes {
+		if len(quotes) == 0 {
+			continue
+		}
+		newest := quotes[0] // desc → newest first
+		if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
+			continue
+		}
+		if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
+			continue
+		}
+		out[sym] = execution.OptionNBBO{Bid: newest.BidPrice, Ask: newest.AskPrice}
+	}
+	return out, nil
+}
+
 // ── historical bars (data API) ───────────────────────────────────────────────
 
 type alpacaOptBarsResponse struct {

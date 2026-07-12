@@ -99,3 +99,37 @@ func TestQuoteAt_RejectsFutureQuote(t *testing.T) {
 		t.Errorf("expected ok=false for a quote stamped after asOf")
 	}
 }
+
+// TestQuotesAt_BatchNewestPerSymbol: QuotesAt sends one batched request (symbols= list,
+// sort=desc) and returns each symbol's newest quote from the grouped response.
+func TestQuotesAt_BatchNewestPerSymbol(t *testing.T) {
+	var gotSymbols, gotSort string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSymbols = r.URL.Query().Get("symbols")
+		gotSort = r.URL.Query().Get("sort")
+		// desc → newest first per symbol; A has a later quote, B one quote.
+		_, _ = w.Write([]byte(`{"quotes":{
+			"SPY240607C00530000":[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24},{"t":"2024-06-07T13:40:00Z","bp":1.10,"ap":1.14}],
+			"SPY240607C00540000":[{"t":"2024-06-07T13:44:00Z","bp":0.80,"ap":0.84}]}}`))
+	}))
+	defer srv.Close()
+
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC)
+	out, err := a.QuotesAt(context.Background(), []string{"SPY240607C00530000", "SPY240607C00540000"}, asOf)
+	if err != nil {
+		t.Fatalf("QuotesAt: %v", err)
+	}
+	if gotSort != "desc" {
+		t.Errorf("expected sort=desc, got %q", gotSort)
+	}
+	if gotSymbols == "" || len(out) != 2 {
+		t.Fatalf("symbols=%q, out=%v", gotSymbols, out)
+	}
+	if out["SPY240607C00530000"].Bid != 1.20 { // newest of the two, not the older 1.10
+		t.Errorf("A newest bid = %v; want 1.20", out["SPY240607C00530000"].Bid)
+	}
+	if out["SPY240607C00540000"].Ask != 0.84 {
+		t.Errorf("B ask = %v; want 0.84", out["SPY240607C00540000"].Ask)
+	}
+}
