@@ -100,8 +100,8 @@ func TestQuoteAt_RejectsFutureQuote(t *testing.T) {
 	}
 }
 
-// TestQuotesAt_BatchNewestPerSymbol: QuotesAt sends one batched request (symbols= list,
-// sort=desc) and returns each symbol's newest quote from the grouped response.
+// TestQuotesAt_BatchNewestPerSymbol: QuotesAt returns each symbol's newest quote from
+// the grouped, desc-sorted response.
 func TestQuotesAt_BatchNewestPerSymbol(t *testing.T) {
 	var gotSymbols, gotSort string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -131,5 +131,38 @@ func TestQuotesAt_BatchNewestPerSymbol(t *testing.T) {
 	}
 	if out["SPY240607C00540000"].Ask != 0.84 {
 		t.Errorf("B ask = %v; want 0.84", out["SPY240607C00540000"].Ask)
+	}
+}
+
+// TestQuotesAt_PagesUntilAllSymbolsResolved guards the Critical fix: Alpaca caps
+// `limit` across ALL symbols, so a busy contract can fill page 1 and push another
+// symbol to page 2. QuotesAt must page until every requested symbol is resolved,
+// not drop the ones missing from page 1.
+func TestQuotesAt_PagesUntilAllSymbolsResolved(t *testing.T) {
+	var pages int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("page_token") == "" {
+			pages++
+			// Page 1: only the busy symbol A (its ticks filled the limit), plus a token.
+			_, _ = w.Write([]byte(`{"quotes":{"AAA240607C00530000":[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24}]},"next_page_token":"p2"}`))
+			return
+		}
+		pages++
+		// Page 2: the symbol that didn't fit on page 1.
+		_, _ = w.Write([]byte(`{"quotes":{"BBB240607C00540000":[{"t":"2024-06-07T13:44:00Z","bp":0.80,"ap":0.84}]},"next_page_token":""}`))
+	}))
+	defer srv.Close()
+
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC)
+	out, err := a.QuotesAt(context.Background(), []string{"AAA240607C00530000", "BBB240607C00540000"}, asOf)
+	if err != nil {
+		t.Fatalf("QuotesAt: %v", err)
+	}
+	if pages != 2 {
+		t.Errorf("expected 2 pages walked, got %d", pages)
+	}
+	if len(out) != 2 || out["AAA240607C00530000"].Bid != 1.20 || out["BBB240607C00540000"].Ask != 0.84 {
+		t.Fatalf("both symbols must resolve across pages, got %v", out)
 	}
 }

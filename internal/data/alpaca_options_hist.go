@@ -169,6 +169,11 @@ type alpacaOptQuotesResponse struct {
 // quoteLookback is how far before asOf QuoteAt searches for the last NBBO.
 const quoteLookback = 15 * time.Minute
 
+// maxOptionQuotePages bounds the batched QuotesAt pagination so a busy chain (many
+// symbols × many ticks in the lookback window) can't spin forever. 50 pages ×
+// limit 1000 = 50k quotes, ample for a whole DTE window over a 15-minute window.
+const maxOptionQuotePages = 50
+
 // QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It asks
 // for the [asOf-quoteLookback, asOf] window sorted DESCENDING with limit=1, so the
 // single returned quote is the newest at or before the evaluation instant — never a
@@ -206,19 +211,27 @@ func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf 
 	return newest.BidPrice, newest.AskPrice, true
 }
 
-// QuotesAt returns the newest NBBO at or before asOf for MANY OCC symbols in one
-// call: it requests the window [asOf-quoteLookback, asOf] for all symbols sorted
-// DESCENDING, then takes each symbol's first (newest) quote from the grouped
-// response. Symbols with no quote in the window are absent. This replaces an N+1
-// per-contract fetch across a DTE window with a single batched request.
+// QuotesAt returns the newest NBBO at or before asOf for MANY OCC symbols, replacing
+// an N+1 per-contract fetch with a batched, PAGED request over the window
+// [asOf-quoteLookback, asOf] sorted DESCENDING.
 //
-// The single page (limit 1000, newest-first) captures the recent quote for every
-// liquid contract — which is the universe options-ORB trades; a genuinely illiquid
-// contract absent from the page is excluded, matching the fail-closed single QuoteAt.
+// Alpaca's multi-symbol quotes endpoint groups results by symbol then orders each
+// group by time, and `limit` caps the TOTAL rows across all symbols — so one busy
+// at-the-money contract can fill a whole page and push other requested symbols onto
+// later pages. A single page would therefore silently drop most of the chain. We
+// page (bounded by maxOptionQuotePages) and record each symbol's newest quote the first
+// time it appears (its quotes are newest-first within a group, so the first
+// occurrence across pages is the global newest), stopping early once every requested
+// symbol is resolved. A symbol absent from all pages is excluded — fail-closed, like
+// the single QuoteAt.
 func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
 	out := make(map[string]execution.OptionNBBO)
 	if len(occSymbols) == 0 {
 		return out, nil
+	}
+	remaining := make(map[string]bool, len(occSymbols))
+	for _, s := range occSymbols {
+		remaining[s] = true
 	}
 	params := url.Values{}
 	params.Set("symbols", strings.Join(occSymbols, ","))
@@ -226,23 +239,33 @@ func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, a
 	params.Set("end", asOf.UTC().Format(time.RFC3339))
 	params.Set("sort", "desc")
 	params.Set("limit", "1000")
-	var resp alpacaOptQuotesResponse
-	if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
-		slog.Warn("alpaca options: batch historical quotes failed", "n", len(occSymbols), "as_of", asOf, "err", err)
-		return nil, err
-	}
-	for sym, quotes := range resp.Quotes {
-		if len(quotes) == 0 {
-			continue
+	for range maxOptionQuotePages {
+		var resp alpacaOptQuotesResponse
+		if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
+			slog.Warn("alpaca options: batch historical quotes failed", "n", len(occSymbols), "as_of", asOf, "err", err)
+			return nil, err
 		}
-		newest := quotes[0] // desc → newest first
-		if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
-			continue
+		for sym, quotes := range resp.Quotes {
+			if !remaining[sym] || len(quotes) == 0 {
+				continue
+			}
+			// First appearance of this symbol across pages = its global newest (desc).
+			// Decide the symbol here (newest-or-nothing, matching single QuoteAt), so a
+			// later page's older quotes for it are ignored.
+			delete(remaining, sym)
+			newest := quotes[0]
+			if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
+				continue
+			}
+			if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
+				continue
+			}
+			out[sym] = execution.OptionNBBO{Bid: newest.BidPrice, Ask: newest.AskPrice}
 		}
-		if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
-			continue
+		if resp.NextPageToken == "" || len(remaining) == 0 {
+			break
 		}
-		out[sym] = execution.OptionNBBO{Bid: newest.BidPrice, Ask: newest.AskPrice}
+		params.Set("page_token", resp.NextPageToken)
 	}
 	return out, nil
 }
