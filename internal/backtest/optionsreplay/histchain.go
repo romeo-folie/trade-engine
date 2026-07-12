@@ -149,14 +149,15 @@ func (p *HistChainProvider) SeedIVHistory(ctx context.Context, ivstore options.I
 	if err != nil {
 		return fmt.Errorf("read seeded IV history for %s: %w", underlying, err)
 	}
-	// Key the cache by ET day → the row's sample INSTANT (as_of). A day is only a cache
-	// hit if its stored as_of equals the ref instant THIS run wants; a row at a
-	// different instant (a legacy midnight-anchored row, or a prior run with another
-	// --iv-ref-minute) is re-derived and overwritten, so the persisted IV always
-	// matches the requested intraday quote and the as-of filter stays honest.
-	seededAt := make(map[string]time.Time, len(existing))
+	// Key the cache by ET day → the row it holds. A day is a cache hit when either its
+	// stored as_of equals the ref instant THIS run wants, OR the row is 'live' — a live
+	// snapshot is the authoritative observed IV (its own honest as_of is lookahead-safe),
+	// and the store won't let a 'derived' seed overwrite it, so re-deriving would just
+	// re-fetch it every run for nothing. A DERIVED row at a different instant (legacy
+	// midnight, or another --iv-ref-minute) is re-derived and overwritten.
+	seeded := make(map[string]options.DailyIV, len(existing))
 	for _, d := range existing {
-		seededAt[d.Date.In(etLoc).Format("2006-01-02")] = d.Date // d.Date IS the as_of instant
+		seeded[d.Date.In(etLoc).Format("2006-01-02")] = d // d.Date IS the as_of instant
 	}
 	// Iterate ET CALENDAR days regardless of the input timestamps' own location (the
 	// CLI parses --from/--to in UTC): a UTC-midnight day-floor would sample the ATM
@@ -171,8 +172,8 @@ func (p *HistChainProvider) SeedIVHistory(ctx context.Context, ivstore options.I
 		// is comparable day to day and lands in real trading hours (DST-safe via etLoc).
 		ref := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, etLoc).
 			Add(time.Duration(refMinuteET) * time.Minute)
-		if at, ok := seededAt[day.Format("2006-01-02")]; ok && at.Equal(ref) {
-			continue // already seeded at exactly this ref instant — no re-fetch
+		if d, ok := seeded[day.Format("2006-01-02")]; ok && (d.Source == "live" || d.Date.Equal(ref)) {
+			continue // live (authoritative) or already at this exact ref instant — no re-fetch
 		}
 		iv, ok := p.dailyATMIVAt(ctx, underlying, ref)
 		if !ok {
@@ -252,7 +253,7 @@ func NewMemIVStore() *memIVStore {
 	return &memIVStore{byUnderlying: map[string][]options.DailyIV{}}
 }
 
-func (m *memIVStore) UpsertOptionIV(_ context.Context, underlying string, asOf time.Time, atmIV float64, _ string) error {
+func (m *memIVStore) UpsertOptionIV(_ context.Context, underlying string, asOf time.Time, atmIV float64, source string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	u := strings.ToUpper(underlying)
@@ -260,11 +261,15 @@ func (m *memIVStore) UpsertOptionIV(_ context.Context, underlying string, asOf t
 	series := m.byUnderlying[u]
 	for i := range series { // one row per ET day — replace if present
 		if series[i].Date.In(etLoc).Format("2006-01-02") == day {
-			series[i] = options.DailyIV{Date: asOf, ATMIV: atmIV}
+			// Mirror the store: a 'live' row is not overwritten by a 'derived' re-seed.
+			if series[i].Source == "live" && source != "live" {
+				return nil
+			}
+			series[i] = options.DailyIV{Date: asOf, ATMIV: atmIV, Source: source}
 			return nil
 		}
 	}
-	series = append(series, options.DailyIV{Date: asOf, ATMIV: atmIV})
+	series = append(series, options.DailyIV{Date: asOf, ATMIV: atmIV, Source: source})
 	sort.Slice(series, func(i, j int) bool { return series[i].Date.Before(series[j].Date) })
 	m.byUnderlying[u] = series
 	return nil

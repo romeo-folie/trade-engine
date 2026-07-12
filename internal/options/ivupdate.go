@@ -38,7 +38,7 @@ func (s storeIVStore) GetIVHistory(ctx context.Context, underlying string, from,
 	}
 	out := make([]DailyIV, len(rows))
 	for i, r := range rows {
-		out[i] = DailyIV{Date: r.Date, ATMIV: r.ATMIV}
+		out[i] = DailyIV{Date: r.Date, ATMIV: r.ATMIV, Source: r.Source}
 	}
 	return out, nil
 }

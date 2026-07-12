@@ -331,6 +331,41 @@ func TestSeedIVHistory_Idempotent(t *testing.T) {
 	}
 }
 
+// TestSeedIVHistory_LiveRowsAreAuthoritative: a 'live' row (the real observed IV) is
+// a cache hit even at a different as_of than the ref — the store won't let a derived
+// seed overwrite it, so re-deriving would just re-fetch it every run for nothing.
+func TestSeedIVHistory_LiveRowsAreAuthoritative(t *testing.T) {
+	hd := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	p := NewHistChainProvider(hd, 0, 0)
+	ivs := NewMemIVStore()
+	// Pre-seed one day with a LIVE row at 16:00 ET (a different instant than the 09:45 ref).
+	liveDay := time.Date(2026, 3, 4, 16, 0, 0, 0, etLoc)
+	_ = ivs.UpsertOptionIV(context.Background(), "SPY", liveDay, 0.42, "live")
+
+	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 6, 0, 0, 0, 0, etLoc)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// The live day must NOT have been re-fetched, and its live value/instant survive.
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
+	for _, d := range series {
+		if d.Date.In(etLoc).Format("2006-01-02") == "2026-03-04" {
+			if d.Source != "live" || d.ATMIV != 0.42 || !d.Date.Equal(liveDay) {
+				t.Errorf("live row was clobbered by a derived seed: %+v", d)
+			}
+		}
+	}
+	// Re-seed again: the live day still isn't re-fetched (would loop otherwise).
+	barsBefore := hd.underlyingBars
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if hd.underlyingBars != barsBefore {
+		t.Errorf("re-seed re-fetched %d days that were already cached (live day should not loop)", hd.underlyingBars-barsBefore)
+	}
+}
+
 // TestSeedIVHistory_UTCDates guards the anchoring regression: the CLI parses
 // --from/--to with time.Parse, which yields UTC. If seeding floored the day in that
 // UTC location and sampled at midnight+offset, the ATM quote would land in the prior
