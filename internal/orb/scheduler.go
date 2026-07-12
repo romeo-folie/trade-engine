@@ -150,6 +150,12 @@ type trackedTrade struct {
 	qty       int
 	entryStop float64 // the entry stop trigger price; used to sanity-check the reported fill
 	entryFill float64 // set when entry stop order fills; 0 while still pending
+	// isOption marks an options-ORB entry. The fill-price sanitizer compares the
+	// reported fill against entryStop, but for an option entryStop is the UNDERLYING
+	// breakout level while the fill is the option PREMIUM — orders of magnitude apart
+	// — so the sanitizer must be skipped or it would overwrite a $2 premium with the
+	// $550 underlying level and corrupt all downstream P&L.
+	isOption bool
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -657,6 +663,10 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					ticker:    t.Ticker,
 					qty:       t.Qty,
 					entryStop: t.EntryStop,
+					// Preserve the option flag across restarts so the fill-poll skips
+					// the underlying-level sanitizer when a pending option fills after
+					// a resume (else the premium is corrupted to the underlying level).
+					isOption: t.AssetClass == "option",
 				}
 			}
 			// Restore exit watching for filled entries that haven't closed yet.
@@ -670,6 +680,7 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					qty:       t.Qty,
 					entryStop: t.EntryStop,
 					entryFill: t.FillPrice,
+					isOption:  t.AssetClass == "option",
 				}
 			}
 		}
@@ -1752,7 +1763,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					// Reconcile already-filled orders instead of cancelling them.
 					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
 						price := res.FilledPrice
-						if tc := s.trackedTrades[orderID]; tc != nil {
+						if tc := s.trackedTrades[orderID]; tc != nil && !tc.isOption {
 							if corrected, was := sanitizeEntryFill(sides[i], tc.entryStop, price); was {
 								slog.Warn("orb: session cleanup: implausible entry fill — recording stop level instead",
 									"side", sides[i], "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
@@ -1836,7 +1847,10 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 // sanitizeEntryFill (a buy below / sell above its own stop, which IBKR can return when both
 // bracket legs fill at once) and stamps entryFill on the trackedTrade so exit polling begins.
 func (s *ORBScheduler) persistEntryFill(ctx context.Context, ticker, side, orderID string, price float64) {
-	if tc := s.trackedTrades[orderID]; tc != nil {
+	// Skip the fill sanitizer for options: entryStop is the underlying breakout
+	// level and price is the option premium, so the stock-shaped check would
+	// wrongly "correct" the premium to the underlying level (see trackedTrade.isOption).
+	if tc := s.trackedTrades[orderID]; tc != nil && !tc.isOption {
 		if corrected, was := sanitizeEntryFill(side, tc.entryStop, price); was {
 			slog.Warn("orb: implausible entry fill from broker — recording stop level instead",
 				"side", side, "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)

@@ -115,6 +115,7 @@ func (s *ORBScheduler) routeOptionsEntry(ctx context.Context, sessionID, ticker,
 	})
 	s.trackedTrades[orderID] = &trackedTrade{
 		dbID: dbID, side: side, ticker: ticker, qty: res.Contracts, entryStop: params.EntryStop,
+		isOption: true, // the entry fill is an option premium — skip the underlying-level sanitizer
 	}
 	return orderID, fmt.Sprintf("  %s %s: %s x%d @ $%.2f (Δ%.2f IVR%.1f DTE%d)",
 		strings.ToUpper(side), ticker, oc.OCCSymbol, res.Contracts, res.Mid,
