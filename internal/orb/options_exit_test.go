@@ -188,6 +188,41 @@ func TestOptionsSessionEnding(t *testing.T) {
 	}
 }
 
+// TestOptionTradeStaleAcrossSessions: a filled option carried over from a prior ET
+// trading day must force-flatten once the regular session is open, but not mid-day
+// on the same day, and not pre-market (when options can't be sold).
+func TestOptionTradeStaleAcrossSessions(t *testing.T) {
+	filledMon := time.Date(2026, 7, 13, 10, 15, 0, 0, nyLoc) // Monday entry
+	trade := func(at time.Time) store.ORBTrade {
+		a := at
+		return store.ORBTrade{FilledAt: &a, CreatedAt: at}
+	}
+	cases := []struct {
+		name  string
+		trade store.ORBTrade
+		now   time.Time
+		want  bool
+	}{
+		{"same day midday", trade(filledMon), time.Date(2026, 7, 13, 12, 0, 0, 0, nyLoc), false},
+		{"next day pre-market", trade(filledMon), time.Date(2026, 7, 14, 8, 0, 0, 0, nyLoc), false},
+		{"next day at open", trade(filledMon), time.Date(2026, 7, 14, 9, 30, 0, 0, nyLoc), true},
+		{"next day midday", trade(filledMon), time.Date(2026, 7, 14, 11, 0, 0, 0, nyLoc), true},
+		{"after weekend at open", trade(filledMon), time.Date(2026, 7, 17, 9, 45, 0, 0, nyLoc), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := optionTradeStaleAcrossSessions(tc.trade, tc.now); got != tc.want {
+				t.Errorf("stale = %v; want %v", got, tc.want)
+			}
+		})
+	}
+	// Falls back to CreatedAt when FilledAt is nil.
+	noFill := store.ORBTrade{CreatedAt: filledMon}
+	if !optionTradeStaleAcrossSessions(noFill, time.Date(2026, 7, 14, 10, 0, 0, 0, nyLoc)) {
+		t.Error("nil FilledAt should use CreatedAt and be stale next day")
+	}
+}
+
 // TestHeldOptionQuantities_TreatsShortAsFlat verifies the exit sweep counts only
 // LONG option contracts: a short position (negative qty or Side "short") is not
 // "held to close", so the sweep won't sell into a deeper short.

@@ -6,11 +6,13 @@
 // abort and exit decisions are identical to live by construction (parity is a test,
 // not a hope — see engine_test.go).
 //
-// The concrete Alpaca historical-chain reconstruction (fetching historical option
-// bars/quotes, deriving IV/delta via Black-Scholes to feed the gate's providers, and
-// assembling Signals) is the remaining I/O integration — the same deferral as the
-// #413 historical provider. This engine operates on already-assembled Signals so the
-// replay logic is provider-agnostic and fully tested against fakes.
+// Engine.Replay operates on an already-assembled Signal, so the replay logic is
+// provider-agnostic and fully tested against fakes. The runnable end-to-end path is
+// built on top of it (see Runner): HistoricalOptionData is the historical I/O seam
+// (internal/data.AlpacaOptionsHist reconstructs OPRA option bars/quotes), HistChainProvider
+// derives the gate's IV/delta via Black-Scholes, AssembleSignals turns underlying
+// bars into breakouts using the live ORB range/bracket functions, and Runner ties
+// them together. Drive it with `te backtest orb-options`.
 package optionsreplay
 
 import (

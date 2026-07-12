@@ -6,11 +6,12 @@ import "sort"
 type Report struct {
 	Total         int            // signals replayed
 	Accepted      int            // passed the gates and sized ≥1 contract
-	Wins          int            // accepted, priced trades with PnL > 0
-	Losses        int            // accepted, priced trades with PnL < 0
-	Scratches     int            // accepted, priced trades with PnL == 0
-	Unpriced      int            // accepted trades whose exit quote was missing (P&L unreliable — excluded from win/loss/PnL)
-	TotalPnL      float64        // realized P&L across accepted, PRICED trades (multiplier-correct)
+	Wins          int            // accepted, priced, RESOLVED trades with PnL > 0
+	Losses        int            // accepted, priced, resolved trades with PnL < 0
+	Scratches     int            // accepted, priced, resolved trades with PnL == 0
+	Unpriced      int            // resolved trades whose exit quote was missing (P&L unreliable — excluded from win/loss/PnL)
+	Unresolved    int            // trades where the Path ran out before any modeled exit fired (path_exhausted) — no real outcome, excluded from win/loss/PnL
+	TotalPnL      float64        // realized P&L across accepted, priced, RESOLVED trades (multiplier-correct)
 	AbortsByGate  map[string]int // count of NOT-accepted signals per aborting gate
 	ExitsByReason map[string]int // count of accepted trades per exit reason (stop/tp/time_exit/eod/path_exhausted)
 }
@@ -45,6 +46,14 @@ func Aggregate(trades []SimTrade) Report {
 		}
 		r.Accepted++
 		r.ExitsByReason[t.ExitReason]++ // the exit REASON is real even when the price wasn't
+		if t.ExitReason == ReasonPathExhausted {
+			// The Path ran out before any modeled exit fired. There is NO real trade
+			// outcome here — closing at the last available bar is a data-coverage
+			// artifact, not a decision. Never let its (arbitrary) last-bar P&L enter
+			// win/loss/TotalPnL, even when that bar happened to carry a quote.
+			r.Unresolved++
+			continue
+		}
 		if !t.PriceKnown {
 			// Exit quote was missing → P&L is a fallback (0), not a real result. Keep it
 			// out of win/loss/P&L so a data gap can't masquerade as a breakeven and bias

@@ -203,6 +203,13 @@ func TestReplay_PathExhausted(t *testing.T) {
 	if sim.ExitReason != ReasonPathExhausted {
 		t.Errorf("exit reason = %q; want %q", sim.ExitReason, ReasonPathExhausted)
 	}
+	// The last bar carried a quote (mid 1.35) so PriceKnown is true and PnL is
+	// non-zero — but because no modeled exit fired, Aggregate must keep it OUT of
+	// win/loss/TotalPnL and bucket it as Unresolved.
+	r := Aggregate([]SimTrade{sim})
+	if r.Unresolved != 1 || r.Wins != 0 || r.Losses != 0 || r.Scratches != 0 || r.TotalPnL != 0 {
+		t.Errorf("path_exhausted leaked into performance totals: %+v", r)
+	}
 }
 
 // TestReplay_UnpricedExit: when the option quote is missing at the exit bar, the exit

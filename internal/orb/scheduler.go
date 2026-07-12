@@ -1816,7 +1816,14 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 						var dbErr error
 						if res.Status != "filled" {
 							if cerr := CancelOrder(ctx, s.executor, orderID); cerr != nil {
-								slog.Warn("orb: session cleanup: cancel partial-fill remainder failed", "ticker", ticker, "order_id", orderID, "err", cerr)
+								// The unfilled remainder is still LIVE as a day order and could
+								// fill more contracts than the partial we'd record. Do NOT persist
+								// the reduced qty — that would orphan the extra contracts under a
+								// smaller row. Leave the row pending; the next cleanup pass retries
+								// the cancel (mirrors the live-poll partial path at ~1611).
+								slog.Warn("orb: session cleanup: cancel partial-fill remainder failed; leaving pending to retry",
+									"ticker", ticker, "order_id", orderID, "err", cerr)
+								continue
 							}
 							slog.Info("orb: session cleanup: partial entry fill — persisting filled portion", "side", sides[i], "ticker", ticker, "filled_qty", res.FilledQty, "fill_price", price)
 							// Persist the actual filled contract count (see the live-poll path).

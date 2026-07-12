@@ -37,6 +37,36 @@ func BSPrice(right string, s, k, t, r, q, sigma float64) float64 {
 	return k*math.Exp(-r*t)*normCDF(-d2) - s*math.Exp(-q*t)*normCDF(-d1)
 }
 
+// BSDelta returns the Black-Scholes delta of a European option: N(d1) for a call,
+// N(d1)-1 for a put. Alpaca serves greeks on LIVE snapshots but not on historical
+// data, so the historical-chain replay derives delta here from a BS-inverted sigma
+// (see ImpliedVol) to drive the delta gate. Degenerate inputs (t<=0 or sigma<=0)
+// collapse to the intrinsic delta (0 or ±1) by moneyness, matching BSPrice's
+// discounted-intrinsic limit.
+func BSDelta(right string, s, k, t, r, q, sigma float64) float64 {
+	call := right == "C" || right == "c"
+	if t <= 0 || sigma <= 0 || s <= 0 || k <= 0 {
+		itm := s > k // at expiry (or zero vol) delta is a step at the strike
+		switch {
+		case call && itm:
+			return 1
+		case call:
+			return 0
+		case !call && !itm:
+			return -1
+		default:
+			return 0
+		}
+	}
+	d1 := (math.Log(s/k) + (r-q+0.5*sigma*sigma)*t) / (sigma * math.Sqrt(t))
+	// The e^{-qt} factor is the dividend-adjusted spot delta; q=0 leaves it at 1.
+	disc := math.Exp(-q * t)
+	if call {
+		return disc * normCDF(d1)
+	}
+	return disc * (normCDF(d1) - 1)
+}
+
 // ImpliedVol inverts BSPrice for sigma via bisection. It returns (iv, true) on
 // convergence and (0, false) when the price is outside the no-arbitrage band or
 // the inputs are degenerate — callers treat !ok as "IV unavailable" and, in the

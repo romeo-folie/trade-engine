@@ -29,6 +29,33 @@ func TestBSPrice_DegenerateIsIntrinsic(t *testing.T) {
 	}
 }
 
+func TestBSDelta(t *testing.T) {
+	// ATM call, r=q=0: delta ≈ 0.5 (slightly above from the +0.5σ²t drift in d1).
+	if got := BSDelta("C", 100, 100, 1, 0, 0, 0.20); math.Abs(got-0.5398) > 0.01 {
+		t.Errorf("ATM call delta = %.4f; want ≈0.54", got)
+	}
+	// Put-call parity (r=q=0): callΔ - putΔ == 1.
+	c := BSDelta("C", 100, 100, 0.1, 0, 0, 0.25)
+	p := BSDelta("P", 100, 100, 0.1, 0, 0, 0.25)
+	if math.Abs((c-p)-1) > 1e-6 {
+		t.Errorf("call %.4f - put %.4f != 1 (parity)", c, p)
+	}
+	// Deep ITM call → ~1; deep OTM call → ~0.
+	if got := BSDelta("C", 200, 100, 0.1, 0, 0, 0.2); got < 0.99 {
+		t.Errorf("deep ITM call delta = %.4f; want ≈1", got)
+	}
+	if got := BSDelta("C", 50, 100, 0.1, 0, 0, 0.2); got > 0.01 {
+		t.Errorf("deep OTM call delta = %.4f; want ≈0", got)
+	}
+	// Degenerate (expired): step at the strike.
+	if got := BSDelta("C", 110, 100, 0, 0, 0, 0.2); got != 1 {
+		t.Errorf("expired ITM call delta = %v; want 1", got)
+	}
+	if got := BSDelta("P", 90, 100, 0, 0, 0, 0.2); got != -1 {
+		t.Errorf("expired ITM put delta = %v; want -1", got)
+	}
+}
+
 func TestImpliedVol_RoundTrip(t *testing.T) {
 	for _, tc := range []struct {
 		right          string

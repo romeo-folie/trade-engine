@@ -27,6 +27,27 @@ func optionsSessionEnding(now time.Time) bool {
 	return et.Hour()*60+et.Minute() >= optionsFlattenCutoffMin
 }
 
+// optionTradeStaleAcrossSessions reports whether a still-open filled option was
+// entered on an EARLIER ET trading day than now — i.e. it survived a prior session
+// (process down, or a sell rejected at the 15:50 flatten). Such a position must be
+// flattened the MOMENT options are tradable again, not held until the current day's
+// 15:50 cutoff, or the no-overnight invariant is violated for most of another
+// session. Gated on the regular session being open so we don't spam rejected
+// pre-market sells; from 15:50 on, optionsSessionEnding already covers it.
+func optionTradeStaleAcrossSessions(t store.ORBTrade, now time.Time) bool {
+	anchor := t.CreatedAt
+	if t.FilledAt != nil {
+		anchor = *t.FilledAt
+	}
+	etNow := now.In(nyLoc)
+	etAnchor := anchor.In(nyLoc)
+	if etNow.Year() == etAnchor.Year() && etNow.YearDay() == etAnchor.YearDay() {
+		return false // same ET trading day — normal intraday handling applies
+	}
+	mod := etNow.Hour()*60 + etNow.Minute()
+	return mod >= marketOpenMinutes
+}
+
 // SetOptionExitManager wires the app-managed exit manager into the scheduler
 // (issue #418). nil leaves options-ORB exits disabled.
 func (s *ORBScheduler) SetOptionExitManager(m *OptionExitManager) { s.optionExit = m }
@@ -52,7 +73,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 		return
 	}
 	now := s.now()
-	sessionEnding := optionsSessionEnding(now)
+	clockSessionEnding := optionsSessionEnding(now)
 	// Snapshot broker-held option positions once (keyed by OCC symbol). If a prior
 	// sell succeeded but its DB record write failed, the row is still 'filled' and
 	// gets re-swept — the held check makes that a record-only heal instead of a
@@ -65,6 +86,10 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	// broker's own open-orders are the durable source of truth.
 	workingSells := s.workingOptionSells(ctx)
 	for _, t := range trades {
+		// A position carried over from a prior ET trading day (process was down, or a
+		// sell was rejected at the last flatten) must be closed as soon as options are
+		// tradable — not held until today's 15:50 cutoff — so force session-ending for it.
+		sessionEnding := clockSessionEnding || optionTradeStaleAcrossSessions(t, now)
 		// Recover an in-flight exit after a restart (pendingOptionExits is in-memory).
 		// Prefer the PERSISTED exit order id — it's durable and pollable even if the
 		// sell filled while the process was down, so recovery uses the REAL fill price
