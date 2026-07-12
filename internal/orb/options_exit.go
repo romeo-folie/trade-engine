@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"strings"
 	"time"
 
@@ -58,7 +59,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	// gets re-swept — the held check makes that a record-only heal instead of a
 	// second, naked sell. held is nil only when the positions read fails; in that
 	// (rare, transient) window we still attempt the protective exit.
-	held := s.heldOptionSymbols(ctx)
+	heldQty := s.heldOptionQuantities(ctx)
 	// Working sell-to-close orders the broker still has open, keyed by OCC symbol.
 	// Adopting these covers the restart case: pendingOptionExits is in-memory, so
 	// after a restart an in-flight exit sell would be untracked and re-sent — the
@@ -77,7 +78,14 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 				if !exit || reason == "" {
 					reason = optExitEOD
 				}
-				s.pendingOptionExits[t.ID] = pendingExit{orderID: oid, reason: reason}
+				// The adopted sell closes what the broker still holds (capped at the row).
+				adoptQty := t.Qty
+				if heldQty != nil {
+					if h := int(heldQty[t.OCCSymbol]); h < adoptQty {
+						adoptQty = h
+					}
+				}
+				s.pendingOptionExits[t.ID] = pendingExit{orderID: oid, reason: reason, qty: adoptQty}
 			}
 		}
 		// If an exit sell is already in flight for this trade, poll it instead of
@@ -96,15 +104,24 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			continue
 		}
 
-		if held != nil && !held[t.OCCSymbol] {
-			// Already flat at the broker — do NOT re-sell. Record the close with a
-			// best-effort price; the reconciler (#416) heals the exact fill.
-			s.recordOptionClose(ctx, t, reason, "reconcile", s.optionExit.estimateExitPrice(ctx, t))
+		// Cap the sell at the broker-held contract count so a prior partial fill (or
+		// an already-flat position) can never over-sell into a short. When the
+		// positions read failed (heldQty nil) we fall back to the full DB quantity.
+		sellQty := t.Qty
+		if heldQty != nil {
+			if h := int(heldQty[t.OCCSymbol]); h < sellQty {
+				sellQty = h
+			}
+		}
+		if heldQty != nil && sellQty <= 0 {
+			// Already flat / fully closed by a prior partial — do NOT re-sell. Record
+			// the close with a best-effort price; the reconciler (#416) heals it.
+			s.recordOptionClose(ctx, t, reason, "reconcile", s.optionExit.estimateExitPrice(ctx, t), t.Qty)
 			delete(s.pendingOptionExits, t.ID)
 			continue
 		}
 
-		px, confirmed, orderID, err := s.optionExit.closeOption(ctx, t)
+		px, confirmed, orderID, err := s.optionExit.closeOption(ctx, t, sellQty)
 		if err != nil {
 			slog.Error("orb options: exit close failed",
 				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "err", err)
@@ -114,21 +131,23 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			// Sell submitted but not confirmed filled. Track the in-flight order so
 			// the next sweep POLLS it (above) rather than sending a second sell, and
 			// leave the row open until the fill confirms.
-			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason}
+			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason, qty: sellQty}
 			slog.Warn("orb options: exit sell not confirmed; tracking order to poll",
 				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "order_id", orderID)
 			continue
 		}
-		s.recordOptionClose(ctx, t, reason, "broker", px)
+		s.recordOptionClose(ctx, t, reason, "broker", px, sellQty)
 		delete(s.pendingOptionExits, t.ID)
 	}
 }
 
 // pendingExit records an exit sell that was submitted but not yet confirmed filled,
-// so it can be polled instead of re-sent.
+// so it can be polled instead of re-sent. qty is the contract count the sell was
+// for, so the recorded P&L reflects what was actually sold (not the full row).
 type pendingExit struct {
 	orderID string
 	reason  string
+	qty     int
 }
 
 // pollPendingOptionExit checks an in-flight exit sell. It returns true when the
@@ -148,7 +167,7 @@ func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTra
 		return true // transient — do NOT re-sell this sweep
 	}
 	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
-		s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice)
+		s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice, pe.qty)
 		delete(s.pendingOptionExits, t.ID)
 		return true
 	}
@@ -159,10 +178,12 @@ func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTra
 	return false
 }
 
-// recordOptionClose writes the exit to the trade row (multiplier-correct P&L),
-// untracks it, and publishes the update.
-func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, reason, exitSource string, exitPrice float64) {
-	pnl := ExitPnLM("buy", t.FillPrice, exitPrice, t.Qty, t.Multiplier)
+// recordOptionClose writes the exit to the trade row (multiplier-correct P&L on
+// the quantity actually sold, not the full row — matching time_exit's flattenQty
+// accounting so a capped/partial sell doesn't over-state P&L), untracks it, and
+// publishes the update.
+func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, reason, exitSource string, exitPrice float64, qty int) {
+	pnl := ExitPnLM("buy", t.FillPrice, exitPrice, qty, t.Multiplier)
 	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, reason, exitSource, exitPrice, pnl); dbErr != nil {
 		slog.Error("orb options: close DB record failed",
 			"ticker", t.Ticker, "occ", t.OCCSymbol, "err", dbErr)
@@ -199,24 +220,26 @@ func (s *ORBScheduler) workingOptionSells(ctx context.Context) map[string]string
 	return out
 }
 
-// heldOptionSymbols returns the set of OCC symbols the broker currently holds as
-// option positions, or nil when the positions read fails. Used to avoid re-selling
-// a position that is already flat.
-func (s *ORBScheduler) heldOptionSymbols(ctx context.Context) map[string]bool {
+// heldOptionQuantities returns the CONTRACT count the broker currently holds per OCC
+// symbol (absolute value), or nil when the positions read fails. The exit sweep caps
+// each sell at this so a prior partial fill (or an already-flat position) can never
+// over-sell into a short; a 0/absent entry means flat.
+func (s *ORBScheduler) heldOptionQuantities(ctx context.Context) map[string]float64 {
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
 		slog.Warn("orb options: broker positions read failed; proceeding without flat-guard", "err", err)
 		return nil
 	}
-	held := make(map[string]bool)
+	held := make(map[string]float64)
 	for _, p := range positions {
+		qty := math.Abs(p.Quantity)
 		switch {
 		case p.Option != nil && p.Option.OCCSymbol != "":
-			held[p.Option.OCCSymbol] = true
-		default:
-			// Non-broker adapters may not populate Option; fall back to the raw symbol,
-			// which for an Alpaca option position is the OCC symbol.
-			held[p.Ticker] = true
+			held[p.Option.OCCSymbol] = qty
+		case execution.IsOCCSymbol(p.Ticker):
+			// Non-broker adapters may not populate Option; for an Alpaca option the
+			// raw symbol is the OCC symbol.
+			held[p.Ticker] = qty
 		}
 	}
 	return held
@@ -352,7 +375,7 @@ func (m *OptionExitManager) plan(ctx context.Context, t store.ORBTrade, now time
 // order returns confirmed=false with the broker orderID, so the caller can TRACK
 // and poll that order next sweep instead of submitting a second sell-to-close (and
 // does not record the close, which would orphan a still-held option).
-func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (fillPrice float64, confirmed bool, orderID string, err error) {
+func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade, qty int) (fillPrice float64, confirmed bool, orderID string, err error) {
 	var expiry time.Time
 	if t.Expiry != nil {
 		expiry = *t.Expiry
@@ -370,7 +393,7 @@ func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (
 		SecType:  "OPT",
 		Side:     execution.OrderSideSell, // sell-to-close the long
 		Type:     execution.OrderTypeMarket,
-		Quantity: float64(t.Qty),
+		Quantity: float64(qty),
 		Option:   &contract,
 	})
 	if err != nil {

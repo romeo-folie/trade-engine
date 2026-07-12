@@ -402,6 +402,18 @@ func (s *ORBScheduler) tickersWithOpenFilledTrades(ctx context.Context) map[stri
 	for _, t := range trades {
 		out[t.Ticker] = struct{}{}
 	}
+	// Options-ORB trades are excluded from GetOpenFilledORBTrades (they have their
+	// own reader + exit path), but the anti-stacking entry guard MUST still see them
+	// — otherwise a new option entry could stack on an underlying whose prior option
+	// is still open (exit pending/unconfirmed or a missed EOD flatten). t.Ticker is
+	// the underlying for options, which is what the guard keys on.
+	if optTrades, oerr := store.GetOpenFilledOptionTrades(ctx, s.db); oerr == nil {
+		for _, t := range optTrades {
+			out[t.Ticker] = struct{}{}
+		}
+	} else {
+		slog.Warn("orb: could not check open filled option trades before placing brackets", "err", oerr)
+	}
 	return out
 }
 
