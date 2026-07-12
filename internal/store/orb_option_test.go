@@ -192,12 +192,12 @@ func TestOptionReconcileScoping(t *testing.T) {
 		SessionID: sess.ID, Ticker: "AAPLSCOPE", Side: "buy", Status: "filled", Qty: 10,
 	})
 
-	// Managed set includes both option OCCs (pending + filled).
-	managed, err := store.GetManagedOptionOCCSymbols(ctx, db)
+	// Managed quantities include both option OCCs (pending + filled).
+	managed, err := store.GetManagedOptionQuantities(ctx, db)
 	if err != nil {
-		t.Fatalf("GetManagedOptionOCCSymbols: %v", err)
+		t.Fatalf("GetManagedOptionQuantities: %v", err)
 	}
-	if !managed[filledOCC] || !managed[pendingOCC] {
+	if managed[filledOCC] <= 0 || managed[pendingOCC] <= 0 {
 		t.Errorf("managed set missing OCCs: %v", managed)
 	}
 

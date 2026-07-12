@@ -3,6 +3,7 @@ package orb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -19,6 +20,13 @@ const optionExitCheckInterval = 15 * time.Second
 // the 16:00 ET US options close) — after it, any open option is flattened so
 // nothing is held overnight (no assignment/expiration risk).
 const optionsFlattenCutoffMin = 15*60 + 50
+
+// OptionsFlattenCutoffET returns the intraday flatten cutoff as "HH:MM" ET. The
+// options backtest derives its default session-end from this so the live flatten time
+// and the backtest's EOD flatten can never silently drift apart.
+func OptionsFlattenCutoffET() string {
+	return fmt.Sprintf("%02d:%02d", optionsFlattenCutoffMin/60, optionsFlattenCutoffMin%60)
+}
 
 // optionsSessionEnding reports whether now is at/after the intraday flatten cutoff
 // in US/Eastern, regardless of the clock's own zone.
@@ -113,12 +121,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 				if !exit || reason == "" {
 					reason = optExitEOD
 				}
-				adoptQty := t.Qty
-				if heldQty != nil {
-					if h := int(heldQty[t.OCCSymbol]); h < adoptQty {
-						adoptQty = h
-					}
-				}
+				adoptQty := capToHeld(t.Qty, heldQty, t.OCCSymbol)
 				s.pendingOptionExits[t.ID] = pendingExit{orderID: oid, reason: reason, qty: adoptQty}
 			}
 		}
@@ -141,12 +144,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 		// Cap the sell at the broker-held contract count so a prior partial fill (or
 		// an already-flat position) can never over-sell into a short. When the
 		// positions read failed (heldQty nil) we fall back to the full DB quantity.
-		sellQty := t.Qty
-		if heldQty != nil {
-			if h := int(heldQty[t.OCCSymbol]); h < sellQty {
-				sellQty = h
-			}
-		}
+		sellQty := capToHeld(t.Qty, heldQty, t.OCCSymbol)
 		if heldQty != nil && sellQty <= 0 {
 			// Already flat / fully closed by a prior partial — do NOT re-sell. Record
 			// the close with a best-effort price; the reconciler (#416) heals it.
@@ -204,6 +202,20 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason, qty: sellQty}
 		}
 	}
+}
+
+// capToHeld caps qty at the broker-held contract count for occ, so a prior partial
+// fill (or an already-flat position) can never over-sell into a short. A nil heldQty
+// (the positions read failed) returns qty unchanged — the callers fall back to the
+// full DB quantity in that transient window.
+func capToHeld(qty int, heldQty map[string]float64, occ string) int {
+	if heldQty == nil {
+		return qty
+	}
+	if h := int(heldQty[occ]); h < qty {
+		return h
+	}
+	return qty
 }
 
 // shouldDeferFreshOptionExit decides whether to skip a FRESH exit sell this sweep.

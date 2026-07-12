@@ -289,23 +289,6 @@ func SetORBTradeExitOrderID(ctx context.Context, db *pgxpool.Pool, tradeID, exit
 	return err
 }
 
-// GetManagedOptionOCCSymbols returns the set of OCC symbols for non-terminal
-// options-ORB trades (status pending or filled). The options orphan detector
-// (#416) treats a broker option position whose OCC is not in this set as an
-// unexplained orphan. Pending is included so a just-filled entry the fill-poll
-// hasn't marked yet is not falsely flagged.
-func GetManagedOptionOCCSymbols(ctx context.Context, db *pgxpool.Pool) (map[string]bool, error) {
-	qty, err := GetManagedOptionQuantities(ctx, db)
-	if err != nil {
-		return nil, err
-	}
-	out := make(map[string]bool, len(qty))
-	for occ := range qty {
-		out[occ] = true
-	}
-	return out, nil
-}
-
 // GetManagedOptionQuantities returns the SUM of contract quantities for non-terminal
 // options-ORB trades (status pending or filled) per OCC symbol. The orphan detector
 // (#416) compares this against the broker-held quantity so a broker position of 3

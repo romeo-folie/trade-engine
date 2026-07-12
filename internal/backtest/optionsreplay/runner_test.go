@@ -8,7 +8,20 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/options"
+	"github.com/romeo-folie/trade-engine/internal/orb"
 )
+
+// TestAssembleConfig_FlattenCutoffSingleSourced: the backtest's default EOD flatten is
+// derived from the live cutoff, so the two can't silently diverge (#429).
+func TestAssembleConfig_FlattenCutoffSingleSourced(t *testing.T) {
+	got := (AssembleConfig{}).withDefaults().SessionEndET
+	if got != orb.OptionsFlattenCutoffET() {
+		t.Errorf("backtest default SessionEndET %q != live cutoff %q", got, orb.OptionsFlattenCutoffET())
+	}
+	if got != "15:50" {
+		t.Errorf("expected 15:50, got %q", got)
+	}
+}
 
 // fakeHist is a deterministic synthetic options market. It prices every contract via
 // Black-Scholes at a per-day vol (so ImpliedVol recovers it and the IV-rank window

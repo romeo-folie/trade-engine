@@ -1,13 +1,10 @@
 package data
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -296,39 +293,10 @@ func (a *AlpacaOptionsHist) OptionBars(ctx context.Context, occSymbol string, fr
 }
 
 // getJSON issues an authenticated GET against host+path and decodes into out,
-// reusing the equity client's throttle and the package retry/backoff helper.
+// reusing the equity client's shared getFrom (throttle + auth + retry + error
+// envelope) rather than re-implementing them.
 func (a *AlpacaOptionsHist) getJSON(ctx context.Context, host, path string, params url.Values, out any) error {
-	if err := a.equity.throttle(ctx); err != nil {
-		return err
-	}
-	u := host + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-	resp, err := withRetry(ctx, func() (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("APCA-API-KEY-ID", a.apiKey)
-		req.Header.Set("APCA-API-SECRET-KEY", a.secret)
-		req.Header.Set("Accept", "application/json")
-		resp, err := a.equity.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
-			resp.Body.Close()
-			return nil, &httpError{
-				status:     resp.StatusCode,
-				msg:        fmt.Sprintf("alpaca %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)),
-				retryAfter: retryAfter,
-			}
-		}
-		return resp, nil
-	})
+	resp, err := a.equity.getFrom(ctx, host, path, params)
 	if err != nil {
 		return err
 	}
