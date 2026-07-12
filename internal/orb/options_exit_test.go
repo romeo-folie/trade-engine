@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -116,33 +117,40 @@ func TestOptionExitManager_Plan(t *testing.T) {
 	}
 }
 
-func TestOptionExitManager_CloseOption_PriceFallback(t *testing.T) {
+func TestOptionExitManager_CloseOption_ConfirmsFill(t *testing.T) {
 	tr := optTrade()
 
-	// 1) Broker returns a fill price -> used directly; verify it's a SELL market order.
-	p1 := &rPlacer{res: execution.OrderResult{FilledPrice: 2.10}}
+	// 1) Confirmed fill (status filled + price) -> confirmed, real price; SELL market.
+	p1 := &rPlacer{res: execution.OrderResult{Status: "filled", FilledPrice: 2.10}}
 	m1 := NewOptionExitManager(fakePricer{ok: true}, nil, p1, 8)
-	px, err := m1.closeOption(context.Background(), tr)
-	if err != nil || px != 2.10 {
-		t.Fatalf("closeOption price = %v (err %v); want 2.10", px, err)
+	px, confirmed, err := m1.closeOption(context.Background(), tr)
+	if err != nil || !confirmed || px != 2.10 {
+		t.Fatalf("closeOption = (%v,%v,%v); want 2.10,true,nil", px, confirmed, err)
 	}
 	if p1.got.Side != execution.OrderSideSell || p1.got.Type != execution.OrderTypeMarket ||
 		p1.got.Option == nil || p1.got.Option.OCCSymbol != tr.OCCSymbol || p1.got.Quantity != 4 {
 		t.Errorf("close order = %+v; want SELL market x4 of the OCC contract", p1.got)
 	}
 
-	// 2) Broker fill 0, quoter has a mid -> falls back to the mid.
-	p2 := &rPlacer{res: execution.OrderResult{FilledPrice: 0}}
-	m2 := NewOptionExitManager(fakePricer{ok: true}, fakeQuoter{mid: 1.90, ok: true}, p2, 8)
-	if px, _ := m2.closeOption(context.Background(), tr); px != 1.90 {
-		t.Errorf("fallback to mid = %v; want 1.90", px)
+	// 2) Accepted/pending (not filled) -> NOT confirmed (caller must not close the row).
+	p2 := &rPlacer{res: execution.OrderResult{Status: "accepted", FilledPrice: 0}}
+	m2 := NewOptionExitManager(fakePricer{ok: true}, nil, p2, 8)
+	if _, confirmed, _ := m2.closeOption(context.Background(), tr); confirmed {
+		t.Error("an accepted/pending sell must not be reported as confirmed")
 	}
 
-	// 3) Broker fill 0, no quoter -> last-resort entry price (P&L 0), reconciled later.
-	p3 := &rPlacer{res: execution.OrderResult{FilledPrice: 0}}
+	// 3) Filled status but 0 price -> NOT confirmed (guards a bogus P&L).
+	p3 := &rPlacer{res: execution.OrderResult{Status: "filled", FilledPrice: 0}}
 	m3 := NewOptionExitManager(fakePricer{ok: true}, nil, p3, 8)
-	if px, _ := m3.closeOption(context.Background(), tr); px != tr.FillPrice {
-		t.Errorf("last-resort exit price = %v; want entry %v", px, tr.FillPrice)
+	if _, confirmed, _ := m3.closeOption(context.Background(), tr); confirmed {
+		t.Error("a zero-price fill must not be reported as confirmed")
+	}
+
+	// 4) Broker error -> err, not confirmed.
+	p4 := &rPlacer{err: errors.New("rejected")}
+	m4 := NewOptionExitManager(fakePricer{ok: true}, nil, p4, 8)
+	if _, confirmed, err := m4.closeOption(context.Background(), tr); err == nil || confirmed {
+		t.Errorf("broker error = (confirmed=%v,err=%v); want false,non-nil", confirmed, err)
 	}
 }
 

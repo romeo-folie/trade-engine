@@ -107,6 +107,27 @@ func TestGetOptionChain_GreeksAndNulls(t *testing.T) {
 	}
 }
 
+// TestGetOptionChain_FailsClosedOffOPRA verifies the chain read errors (fails
+// closed) on the delayed indicative feed, so the gate aborts rather than trading
+// on stale quotes.
+func TestGetOptionChain_FailsClosedOffOPRA(t *testing.T) {
+	called := false
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called = true
+		io.WriteString(w, `{"snapshots":{}}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, dataURL: ts.URL, optionFeed: "indicative", httpClient: ts.Client()}
+
+	_, err := b.GetOptionChain(context.Background(), "SPY", OptionChainFilter{})
+	if err == nil {
+		t.Fatal("expected an error on the non-OPRA feed (fail closed)")
+	}
+	if called {
+		t.Error("must not hit the data API on a non-OPRA feed")
+	}
+}
+
 func TestResolveOptionContracts(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/options/contracts" {

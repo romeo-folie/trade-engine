@@ -71,10 +71,18 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			exitPrice = s.optionExit.estimateExitPrice(ctx, t)
 			exitSource = "reconcile"
 		} else {
-			px, err := s.optionExit.closeOption(ctx, t)
+			px, confirmed, err := s.optionExit.closeOption(ctx, t)
 			if err != nil {
 				slog.Error("orb options: exit close failed",
 					"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "err", err)
+				continue
+			}
+			if !confirmed {
+				// Sell placed but not confirmed filled. Do NOT close the row — that
+				// would orphan a still-held option. Retry next sweep; once the
+				// position clears, the flat-guard records it (no duplicate sell).
+				slog.Warn("orb options: exit sell not confirmed filled; leaving open to retry",
+					"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason)
 				continue
 			}
 			exitPrice = px
@@ -240,16 +248,18 @@ func (m *OptionExitManager) plan(ctx context.Context, t store.ORBTrade, now time
 	})
 }
 
-// closeOption market-sells the long option to flatten the position and returns a
-// usable exit price. Selling closes a long, so this is a SELL order regardless of
-// the ORB direction (which only chose call vs put at entry).
+// closeOption market-sells the long option to flatten the position. Selling closes
+// a long, so this is a SELL order regardless of the ORB direction (which only chose
+// call vs put at entry).
 //
-// A market order may report a 0 fill price before it settles; rather than record a
-// wildly wrong P&L, the exit price falls back to the live option mid, then to the
-// entry price (P&L 0) as a last resort — the broker-truth reconciler (#416) heals
-// the exact price later. The caller MUST still record the close after a successful
-// order so the position is never re-sold on the next sweep.
-func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (exitPrice float64, err error) {
+// It returns (fillPrice, confirmed, err). confirmed is true ONLY when the broker
+// reports the sell as filled with a real price. An 'accepted'/pending market order
+// returns confirmed=false so the caller does NOT record the close — otherwise a
+// sell that later rejects or never fills would leave a live option marked 'closed'
+// and unmanaged, violating the intraday-flatten invariant. The caller retries on
+// the next sweep; the flat-guard there records the close (and prevents a duplicate
+// sell) once the position actually clears.
+func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (fillPrice float64, confirmed bool, err error) {
 	var expiry time.Time
 	if t.Expiry != nil {
 		expiry = *t.Expiry
@@ -271,13 +281,12 @@ func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (
 		Option:   &contract,
 	})
 	if err != nil {
-		return 0, err
+		return 0, false, err
 	}
-	exitPrice = res.FilledPrice
-	if exitPrice <= 0 {
-		exitPrice = m.estimateExitPrice(ctx, t)
+	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
+		return res.FilledPrice, true, nil
 	}
-	return exitPrice, nil
+	return 0, false, nil
 }
 
 // estimateExitPrice is the best available exit price without a broker fill: the

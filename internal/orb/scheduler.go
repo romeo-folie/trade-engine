@@ -1295,6 +1295,9 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				// Options-ORB (issue #414): for options-mode underlyings, execute this
 				// side as a long option instead of a bracket. Guarded by a nil-by-default
 				// router, so the equity/forex/futures bracket path below is unchanged.
+				// NOTE: there is a TWIN of this hook in the equities/futures branch
+				// (the `else` below) — options-mode underlyings are equities, so that
+				// twin is the one that actually fires in production. Keep both in sync.
 				if s.optionsRouter.Handles(ticker) {
 					orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, p.side, p.params)
 					if orderID != "" {
@@ -1370,6 +1373,34 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 
 			if params.Qty == 0 {
 				slog.Warn("orb: skipping — position size too small", "ticker", ticker)
+				continue
+			}
+
+			// Options-ORB (issues #414/#419): route options-mode underlyings to a
+			// long option instead of a stock bracket. THIS equities/futures branch is
+			// the path the options-mode (equities) scheduler actually takes — the
+			// forex branch above has the parallel hook. Guarded by a nil-by-default
+			// router and Handles() (only configured underlyings), so the stock/futures
+			// bracket placement below is unchanged when options-ORB is off.
+			if s.optionsRouter.Handles(ticker) {
+				orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, side, params)
+				if orderID != "" {
+					// Record the entry so the re-entry guard fires (options have no
+					// broker bracket to mark the ticker as entered).
+					if side == "sell" {
+						s.orderIDs[ticker] = [2]string{"", orderID}
+					} else {
+						s.orderIDs[ticker] = [2]string{orderID, ""}
+					}
+					// Emit the activity-feed event the bracket path emits below, so an
+					// options entry shows up like any other ORB entry.
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker: ticker, Direction: side, Strategy: "orb",
+					})
+				}
+				if line != "" {
+					msgs = append(msgs, line)
+				}
 				continue
 			}
 

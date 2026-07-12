@@ -9,8 +9,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
 // maxOptionPages bounds paginated chain/contract fetches so a malformed or
@@ -165,14 +163,13 @@ type OptionChainFilter struct {
 }
 
 // GetOptionChain fetches live chain snapshots for an underlying from the market-
-// data host, following pagination. It warns (rather than silently proceeding)
-// when running on the delayed indicative feed, since options-ORB decisions at the
-// open require the real-time OPRA feed.
+// data host, following pagination. It FAILS CLOSED on the delayed indicative feed:
+// options-ORB decisions at the open require the real-time OPRA feed, so rather than
+// let strike/spread selection run on 15-minute-stale quotes and place live orders,
+// it returns an error — which the chain gate treats as an abort (no trade).
 func (b *AlpacaBroker) GetOptionChain(ctx context.Context, underlying string, filt OptionChainFilter) ([]OptionSnapshot, error) {
 	if b.optionFeed != "opra" {
-		logger.Warn("alpaca option chain on non-real-time feed",
-			"feed", b.optionFeed, "underlying", underlying,
-			"note", "quotes are delayed; options-ORB requires the OPRA (Algo Trader Plus) feed")
+		return nil, fmt.Errorf("alpaca GetOptionChain %s: options require the real-time OPRA feed, got %q — set markets.stocks.option_feed: opra (Algo Trader Plus)", underlying, b.optionFeed)
 	}
 
 	q := url.Values{}
