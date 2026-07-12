@@ -730,7 +730,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), COALESCE(occ_symbol,''), COALESCE("right",''), COALESCE(strike,0)
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -750,6 +751,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OCCSymbol, &t.Right, &t.Strike,
 		); err != nil {
 			return nil, err
 		}

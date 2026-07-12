@@ -649,6 +649,20 @@ Modes:
 				}()
 			}
 
+			// Options-ORB (issue #418): when enabled and the broker is Alpaca, execute
+			// the configured underlyings via long options on the equities/newyork
+			// session. No-op otherwise — the equity bracket path is unchanged.
+			if cfg.OptionsORB.Enabled {
+				if ab, ok := broker.(*execution.AlpacaBroker); ok {
+					equitiesScheduler.SetupOptionsORB(cfg.OptionsORB, ab)
+					logger.Info("options-ORB enabled",
+						"underlyings", cfg.OptionsORB.Underlyings,
+						"premium_budget", cfg.OptionsORB.PremiumBudget)
+				} else {
+					logger.Warn("options-ORB enabled but stocks broker is not Alpaca; skipping")
+				}
+			}
+
 			// 4. Build forex ORB scheduler (IBKR data + broker, newyork session).
 			cfg.ForexORB.Session = "newyork"
 			forexBus := events.New()

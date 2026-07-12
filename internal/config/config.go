@@ -34,6 +34,7 @@ type Config struct {
 	ORB              ORBConfig           `yaml:"orb"`
 	ForexORB         ForexORBConfig      `yaml:"forex_orb"`
 	FuturesORB       FuturesORBConfig    `yaml:"futures_orb"`
+	OptionsORB       OptionsORBConfig    `yaml:"options_orb"`
 	FuturesORBMetals FuturesORBConfig    `yaml:"futures_orb_metals"`
 	Scanner          ScannerConfig       `yaml:"scanner"`
 	Feedback         FeedbackConfig      `yaml:"feedback"`
@@ -760,6 +761,39 @@ type FuturesInstrument struct {
 	// full-notional cap sizes to zero contracts on a small account. 0/unset = cap on
 	// full notional (the pre-margin behaviour). ESTIMATE — refine against IBKR margin.
 	MarginRate float64 `yaml:"margin_rate"`
+}
+
+// OptionsORBConfig configures options-ORB: running the existing ORB signal on a
+// curated set of underlyings but executing via long single-leg equity options on
+// Alpaca. Default-off. The gate thresholds mirror internal/options.GateConfig; the
+// sizing/exit knobs feed the router and app-managed exit manager.
+type OptionsORBConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Underlyings is the set of options-mode symbols. A ticker outside this set runs
+	// the normal equity/forex/futures bracket path unchanged.
+	Underlyings []string `yaml:"underlyings"`
+	// ETFUnderlyings are earnings-free (SPY/QQQ) and exempt from the earnings gate.
+	// A single-name underlying not listed here is subject to the earnings blackout,
+	// and — with no earnings provider wired yet — fails closed (never trades) until
+	// one is configured. v1 enables ETFs first for exactly this reason.
+	ETFUnderlyings []string `yaml:"etf_underlyings"`
+
+	// Sizing (dollars).
+	PremiumBudget   float64 `yaml:"premium_budget"`     // premium to deploy per trade
+	MaxLossPerTrade float64 `yaml:"max_loss_per_trade"` // hard cap on premium at risk (0 = none)
+
+	// Gate thresholds (see internal/options.GateConfig defaults).
+	IVRankCeiling        float64 `yaml:"iv_rank_ceiling"`        // default 70
+	MaxDTE               int     `yaml:"max_dte"`                // default 5
+	DeltaMin             float64 `yaml:"delta_min"`              // default 0.50
+	DeltaMax             float64 `yaml:"delta_max"`              // default 0.60
+	SpreadPctCeiling     float64 `yaml:"spread_pct_ceiling"`     // default 5
+	EarningsBlackoutDays int     `yaml:"earnings_blackout_days"` // default 3
+
+	// Exit + IV pipeline.
+	TimeExitMinutes int `yaml:"time_exit_minutes"` // IV-crush time exit window; 0 disables
+	IVLookbackDays  int `yaml:"iv_lookback_days"`  // IV-Rank trailing window (default 252)
+	IVMinSamples    int `yaml:"iv_min_samples"`    // fail-closed below this many stored days (default 40)
 }
 
 // FuturesORBConfig configures the Opening Range Breakout strategy for exchange-listed futures via IBKR.

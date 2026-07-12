@@ -223,6 +223,50 @@ func TestOptionReconcileScoping(t *testing.T) {
 	}
 }
 
+// TestGetORBTrades_CarriesOptionIdentity verifies the session-scoped TUI reader
+// now surfaces option identity (asset_class/occ_symbol/right/strike) while leaving
+// equity rows as plain 'equity'.
+func TestGetORBTrades_CarriesOptionIdentity(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-getorbtrades")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	exp := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "SPY", Side: "buy", Status: "pending", Qty: 2,
+		AssetClass: "option", Underlying: "SPY", Expiry: &exp, Strike: 551, Right: "C",
+		OCCSymbol: "SPY260717C00551000", Multiplier: 100,
+	})
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "AAPLTUI", Side: "buy", Status: "pending", Qty: 10,
+	})
+
+	trades, err := store.GetORBTrades(ctx, db, sess.ID)
+	if err != nil {
+		t.Fatalf("GetORBTrades: %v", err)
+	}
+	var opt, eq *store.ORBTrade
+	for i := range trades {
+		switch trades[i].Ticker {
+		case "SPY":
+			opt = &trades[i]
+		case "AAPLTUI":
+			eq = &trades[i]
+		}
+	}
+	if opt == nil || opt.AssetClass != "option" || opt.OCCSymbol != "SPY260717C00551000" || opt.Right != "C" || opt.Strike != 551 {
+		t.Errorf("option row identity = %+v", opt)
+	}
+	if eq == nil || eq.AssetClass != "equity" || eq.OCCSymbol != "" || eq.Right != "" {
+		t.Errorf("equity row should carry no option identity: %+v", eq)
+	}
+}
+
 // TestGetORBTradeByID_NotFound confirms a missing id yields (nil, nil), not an error.
 func TestGetORBTradeByID_NotFound(t *testing.T) {
 	if !store.IsConnected() {
