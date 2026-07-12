@@ -100,6 +100,67 @@ func TestORBTrade_OptionRoundTrip(t *testing.T) {
 	}
 }
 
+// TestGetOpenFilledOptionTrades verifies the dedicated reader returns filled
+// option trades with full contract identity + underlying levels (used by the
+// #415 exit watcher), and excludes non-option and non-filled rows.
+func TestGetOpenFilledOptionTrades(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-openfilled")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	exp := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+
+	// An option entry, created pending then filled — mirroring how the router
+	// records it (fill_price is set by the entry fill-poll, not at creation).
+	occ := "SPY260717C00551000"
+	optID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "SPY", Side: "buy", OrderID: "opt-e1",
+		EntryStop: 550.10, StopLoss: 548.00, TakeProfit: 555.00, Qty: 3, Status: "pending",
+		AssetClass: "option", Underlying: "SPY", Expiry: &exp,
+		Strike: 551, Right: "C", OCCSymbol: occ, Multiplier: 100,
+	})
+	if err != nil {
+		t.Fatalf("create option trade: %v", err)
+	}
+	if _, err := store.FillORBTradeByOrderID(ctx, db, "opt-e1", 1.25); err != nil {
+		t.Fatalf("fill option trade: %v", err)
+	}
+	// A filled equity (must be excluded) and a pending option (must be excluded).
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{SessionID: sess.ID, Ticker: "AAPL", Side: "buy", Qty: 10, Status: "filled"})
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{SessionID: sess.ID, Ticker: "QQQ", Side: "buy", Qty: 1, Status: "pending", AssetClass: "option", OCCSymbol: "QQQ260717C00500000"})
+
+	trades, err := store.GetOpenFilledOptionTrades(ctx, db)
+	if err != nil {
+		t.Fatalf("GetOpenFilledOptionTrades: %v", err)
+	}
+	var got *store.ORBTrade
+	for i := range trades {
+		if trades[i].ID == optID {
+			got = &trades[i]
+		}
+		if trades[i].AssetClass != "option" {
+			t.Errorf("reader returned a non-option row: %+v", trades[i])
+		}
+		if trades[i].Status != "filled" {
+			t.Errorf("reader returned a non-filled row: %+v", trades[i])
+		}
+	}
+	if got == nil {
+		t.Fatal("filled option trade not returned")
+	}
+	if got.OCCSymbol != occ || got.Underlying != "SPY" || got.Strike != 551 || got.Right != "C" || got.Multiplier != 100 {
+		t.Errorf("contract identity = %+v", got)
+	}
+	if got.StopLoss != 548.00 || got.TakeProfit != 555.00 || got.FillPrice != 1.25 {
+		t.Errorf("underlying levels/fill not read: stop=%v tp=%v fill=%v", got.StopLoss, got.TakeProfit, got.FillPrice)
+	}
+}
+
 // TestGetORBTradeByID_NotFound confirms a missing id yields (nil, nil), not an error.
 func TestGetORBTradeByID_NotFound(t *testing.T) {
 	if !store.IsConnected() {

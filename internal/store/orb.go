@@ -232,6 +232,50 @@ func GetORBTradeByID(ctx context.Context, db *pgxpool.Pool, id string) (*ORBTrad
 	return &t, nil
 }
 
+// GetOpenFilledOptionTrades returns every filled options-ORB trade (asset_class
+// 'option', status 'filled') across all sessions, oldest first, with full contract
+// identity. The app-managed exit watcher (#415) uses it to find live option
+// positions to manage — the generic list readers omit the option columns, so this
+// dedicated reader selects them.
+func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at,
+		       COALESCE(underlying,''), expiry, COALESCE(strike,0),
+		       COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1)
+		FROM orb_trades
+		WHERE status='filled' AND asset_class='option'
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		t.AssetClass = "option"
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+			&t.Underlying, &t.Expiry, &t.Strike,
+			&t.Right, &t.OCCSymbol, &t.Multiplier,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
 // Used by tickDone to update the DB after best-effort cancel calls.
 func CancelORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string) error {
