@@ -37,14 +37,21 @@ te backtest orb-options
 
 - **`HistoricalOptionData`** (`internal/backtest/optionsreplay/histdata.go`) is the
   historical I/O seam. The concrete implementation is
-  `internal/data.AlpacaOptionsHist`, which reads three Alpaca endpoints:
-  contract listing (`/v2/options/contracts`, trading API), historical NBBO quotes
-  (`/v1beta1/options/quotes`, data API), and option bars (`/v1beta1/options/bars`,
+  `internal/data.AlpacaOptionsHist`, which reads the contract listing
+  (`/v2/options/contracts`, trading API) and option **bars** (`/v1beta1/options/bars`,
   data API), plus equity underlying bars via the existing `AlpacaClient`.
+- **Quotes are modeled from bars (free-data mode).** Alpaca's basic plan serves
+  historical option **bars** and **trades** but **not** historical NBBO quotes
+  (`/v1beta1/options/quotes` 404s without the OPRA/Algo Trader Plus subscription). So
+  `QuoteAt`/`QuotesAt` take each contract's most recent 1-minute bar **close** as the
+  last-trade price and bracket it with a **modeled spread** (`--modeled-spread-pct`,
+  default 3%). The mid is a last-trade proxy; the **spread gate therefore runs on a
+  modeled — not real — spread** (see *Free-data trade-offs* below).
 - **Greeks are derived, not fetched.** Alpaca serves delta/IV on *live* snapshots
-  only. `HistChainProvider` inverts each historical quote mid through
-  `options.ImpliedVol` and computes `options.BSDelta` at that vol, so the delta/IV
-  gates run on the same fields they'd see live.
+  only. `HistChainProvider` inverts each contract's mid through `options.ImpliedVol`
+  and computes `options.BSDelta` at that vol, so the delta/IV gates run on the same
+  fields they'd see live. (The modeled spread is symmetric, so it leaves the mid — and
+  thus the derived IV/delta — unchanged.)
 - **As-of discipline.** Every read is bounded by its request's `start`/`end`, and the
   gate's evaluation instant + spot travel through the context (`WithAsOf`), so the
   chain provider can never price with post-signal data.
@@ -66,25 +73,48 @@ Win rate is `wins / (wins + losses)` over **priced, resolved** trades only.
 
 ```bash
 # Requires Alpaca API creds in the env vars named by markets.stocks.{api_key_env,secret_env}.
+# Runs on the FREE historical option bars — no OPRA subscription needed.
 te backtest orb-options --from 2024-06-01 --to 2024-08-31
 te backtest orb-options --from 2024-06-01 --to 2024-06-30 --underlyings SPY,QQQ
+te backtest orb-options --from 2024-06-01 --to 2024-08-31 --modeled-spread-pct 0.05  # 5% pessimistic
 ```
 
 Config is read from `options_orb` (gates, sizing, IV window) and `orb`
 (range minutes, risk-reward) — the **same** knobs that drive live, so a backtest
 describes the code that would ship.
 
+## Free-data trade-offs
+
+The backtest runs on Alpaca's free option bars (no $99/mo OPRA subscription), which
+means there is no real historical bid/ask. Two consequences worth understanding:
+
+- **The spread gate is modeled, not real.** With a fixed `--modeled-spread-pct` every
+  contract gets the same synthetic spread, so the gate doesn't *discriminate* liquid
+  from illiquid contracts the way live NBBO would — it's effectively a uniform
+  pass/fail at the configured width. It still applies the *cost* of the spread (below).
+- **Set the spread conservatively for a lower bound.** Because you choose the spread,
+  set it wide (e.g. `0.05`) to stress-test: if the strategy survives a fat modeled
+  spread, real (tighter) NBBO would only improve it. A passing modeled-spread backtest
+  is a **floor** on performance, not an optimistic ceiling.
+- **Exit pays the spread; entry doesn't.** Live enters with a limit-at-mid (no spread
+  paid if filled) and exits with a market sell (receives the bid). The backtest mirrors
+  this: entry fills at the mid, exit fills a half-spread below it. This fixes the
+  mid-fill optimism a naive backtest would have.
+
+To upgrade to real NBBO later, add Alpaca's Algo Trader Plus (OPRA) subscription and
+re-point the provider at `/v1beta1/options/quotes`; the rest of the pipeline is
+unchanged.
+
 ## Data requirements & limits
 
-- **OPRA entitlement.** Alpaca historical option bars/quotes require the Algo Trader
-  Plus (OPRA) data subscription. Without it, the option-data calls return HTTP errors,
-  which the runner logs — it never fabricates a fill.
+- **No OPRA subscription required** for the default free-bars mode. (Real historical
+  NBBO quotes *do* need Algo Trader Plus — that's the upgrade path above.)
 - **History depth.** Alpaca option history reaches back to roughly **February 2024**.
-  Earlier windows return empty.
-- **Option-mid proxy.** The exit path uses each option 1-minute bar's *close* (last
-  trade) as the mid. A full NBBO-mid reconstruction would be one quote read per minute
-  per trade; the last-trade proxy is the standard, bounded approximation. Bars with no
-  trade in a minute leave that path point unpriced (see *Honest accounting*).
+  Earlier windows return empty — so start the window ≥ ~2 months past that so the
+  IV-rank seed has enough lookback, or every breakout aborts at `iv_rank`.
+- **Option-mid proxy.** The mid is each option 1-minute bar's *close* (last trade).
+  Bars with no trade in a minute leave that contract unpriced for that instant (see
+  *Honest accounting*).
 - **Close-only exit path → slightly optimistic.** Entries use each bar's High/Low (the
   resting-stop touch), but the exit walk evaluates the underlying stop/target against
   the bar *close*. So an intrabar stop/target touch that reverses before the close is

@@ -20,12 +20,14 @@ var (
 	btOptFrom        string
 	btOptTo          string
 	btOptUnderlyings string
+	btOptSpreadPct   float64
 )
 
 func init() {
 	orbOptionsCmd.Flags().StringVar(&btOptFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	orbOptionsCmd.Flags().StringVar(&btOptTo, "to", "", "End date YYYY-MM-DD (required)")
 	orbOptionsCmd.Flags().StringVar(&btOptUnderlyings, "underlyings", "", "Comma-separated underlyings (default: options_orb.underlyings from config)")
+	orbOptionsCmd.Flags().Float64Var(&btOptSpreadPct, "modeled-spread-pct", 0.03, "Modeled bid/ask width as a fraction of mid (free bars-data has no real NBBO). Brackets the last-trade price for the spread gate and costs the exit (market sell → bid). 0.03 = 3%, conservative")
 	_ = orbOptionsCmd.MarkFlagRequired("from")
 	_ = orbOptionsCmd.MarkFlagRequired("to")
 	backtestCmd.AddCommand(orbOptionsCmd)
@@ -42,10 +44,13 @@ fail-closed strike gates, contract sizing, app-managed exit, and multiplier-corr
 P&L. The backtest supplies only as-of historical data; every trading decision is the
 production code's, so results describe the code that would ship.
 
-DATA REQUIREMENTS: Alpaca historical option bars/quotes require an OPRA-entitled data
-subscription (Algo Trader Plus) and only reach back to ~Feb 2024. A missing
-entitlement or an out-of-range window surfaces as HTTP errors from the data calls,
-not fabricated fills — the run reports what it could and no more.`,
+DATA: runs on Alpaca's FREE historical option BARS (no OPRA/Algo Trader Plus needed).
+Since the basic plan has no historical NBBO quotes, the bid/ask is reconstructed from
+the last-trade price (1-minute bar close) bracketed by --modeled-spread-pct, and the
+exit models a market-sell receiving the bid. The spread gate therefore runs on a
+MODELED spread, not real NBBO — a deliberate free-data trade-off (see
+docs/options-orb-backtest.md). Alpaca option history only reaches back to ~Feb 2024;
+earlier windows return empty and HTTP errors are logged, never fabricated.`,
 	Example: `  te backtest orb-options --from 2024-06-01 --to 2024-08-31
   te backtest orb-options --from 2024-06-01 --to 2024-06-30 --underlyings SPY,QQQ`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -90,9 +95,10 @@ func runOptionsBacktest(ctx context.Context) error {
 	if apiKey == "" || secret == "" {
 		return fmt.Errorf("Alpaca credentials unset: export %s and %s", stocks.APIKeyEnv, stocks.SecretEnv)
 	}
-	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL)
+	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL, btOptSpreadPct)
 
 	rcfg := optionsBacktestConfig(cfg)
+	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct // exit models a market-sell receiving the bid
 
 	fmt.Printf("options-ORB backtest · %s → %s · %s\n\n",
 		btOptFrom, btOptTo, strings.Join(underlyings, ","))

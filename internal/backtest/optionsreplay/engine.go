@@ -80,6 +80,13 @@ type Config struct {
 	PremiumBudget   float64
 	MaxLossPerTrade float64
 	TimeExitMinutes int
+	// ModeledSpreadPct is the full modeled bid/ask width (fraction of mid) applied to
+	// the EXIT: live closes the option with a MARKET sell, which receives the bid, so
+	// the exit fills a half-spread below the mid. The entry stays at the mid (live
+	// places a limit-at-mid, so no spread is paid on entry — this asymmetry is
+	// deliberate). 0 disables it (exit at mid — optimistic). On free (bars) data this
+	// is the only way the spread cost enters P&L, since there is no real NBBO.
+	ModeledSpreadPct float64
 }
 
 // Engine replays Signals through the live gate engine + exit logic.
@@ -177,6 +184,10 @@ func (e *Engine) finish(out SimTrade, sig Signal, bar Bar, reason string) SimTra
 	out.PriceKnown = exitPrice > 0
 	if !out.PriceKnown {
 		exitPrice = out.EntryMid
+	} else if e.cfg.ModeledSpreadPct > 0 {
+		// The live exit is a MARKET sell → it receives the bid, a half-spread below the
+		// mid. Model that cost so the free-data backtest isn't optimistic on fills.
+		exitPrice *= 1 - e.cfg.ModeledSpreadPct/2
 	}
 	out.ExitPrice = exitPrice
 	out.ExitReason = reason

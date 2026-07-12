@@ -56,6 +56,28 @@ func buySignal(path []Bar) Signal {
 	}
 }
 
+// TestReplay_ExitModeledSpread: the modeled spread costs the EXIT (market sell →
+// bid = mid − half-spread) but NOT the entry (limit at mid).
+func TestReplay_ExitModeledSpread(t *testing.T) {
+	// 10% modeled spread → exit fills 5% below the option mid.
+	eng, _ := acceptingEngine(Config{PremiumBudget: 500, ModeledSpreadPct: 0.10})
+	// Target cross; option mid at exit = 2.00.
+	sim := eng.Replay(context.Background(), buySignal([]Bar{
+		{Time: asOf.Add(3 * time.Minute), Underlying: 555.1, OptionMid: 2.00},
+	}))
+	if !sim.Accepted || sim.ExitReason != "tp" {
+		t.Fatalf("expected accepted tp exit, got accepted=%v reason=%q", sim.Accepted, sim.ExitReason)
+	}
+	// Exit fills at bid = 2.00 × (1 − 0.05) = 1.90, not the 2.00 mid.
+	if sim.ExitPrice != 1.90 {
+		t.Errorf("exit price = %.4f; want 1.90 (mid 2.00 − 5%% half-spread)", sim.ExitPrice)
+	}
+	// Entry is unchanged at the mid (1.25), so the spread only bit the exit.
+	if sim.EntryMid != 1.25 {
+		t.Errorf("entry mid = %.4f; want 1.25 (no spread on the limit entry)", sim.EntryMid)
+	}
+}
+
 // TestReplay_ParityWithLiveGate is the headline guarantee: the backtest's accept/
 // abort decision and chosen contract are IDENTICAL to a direct call of the live
 // gate engine on the same signal — because Replay calls that same Select.

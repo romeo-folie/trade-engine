@@ -89,7 +89,9 @@ func runBackfillIV(ctx context.Context) error {
 	if apiKey == "" || secret == "" {
 		return fmt.Errorf("Alpaca credentials unset: export %s and %s", stocks.APIKeyEnv, stocks.SecretEnv)
 	}
-	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL)
+	// Modeled spread 0: IV is derived from the mid (= last-trade price), which the
+	// symmetric bid/ask brackets leave unchanged, so the spread is irrelevant to seeding.
+	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL, 0)
 	chain := optionsreplay.NewHistChainProvider(hd, 0, 0)
 
 	if err := store.Connect(ctx); err != nil {
