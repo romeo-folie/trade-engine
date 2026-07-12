@@ -115,8 +115,9 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 		if heldQty != nil && sellQty <= 0 {
 			// Already flat / fully closed by a prior partial — do NOT re-sell. Record
 			// the close with a best-effort price; the reconciler (#416) heals it.
-			s.recordOptionClose(ctx, t, reason, "reconcile", s.optionExit.estimateExitPrice(ctx, t), t.Qty)
-			delete(s.pendingOptionExits, t.ID)
+			if s.recordOptionClose(ctx, t, reason, "reconcile", s.optionExit.estimateExitPrice(ctx, t), t.Qty) {
+				delete(s.pendingOptionExits, t.ID)
+			}
 			continue
 		}
 
@@ -135,8 +136,14 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "order_id", orderID)
 			continue
 		}
-		s.recordOptionClose(ctx, t, reason, "broker", px, sellQty)
-		delete(s.pendingOptionExits, t.ID)
+		if s.recordOptionClose(ctx, t, reason, "broker", px, sellQty) {
+			delete(s.pendingOptionExits, t.ID)
+		} else {
+			// The sell FILLED but the DB close failed — retain the filled order so the
+			// next sweep polls it and re-records with the real price (not an estimate),
+			// and never sends a second sell.
+			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason, qty: sellQty}
+		}
 	}
 }
 
@@ -166,8 +173,12 @@ func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTra
 		return true // transient — do NOT re-sell this sweep
 	}
 	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
-		s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice, pe.qty)
-		delete(s.pendingOptionExits, t.ID)
+		// Retain the pending marker if the DB write fails, so the next sweep re-records
+		// this filled order with its real price rather than losing it. Either way the
+		// order is done — return true so no new sell is sent.
+		if s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice, pe.qty) {
+			delete(s.pendingOptionExits, t.ID)
+		}
 		return true
 	}
 	if !execution.IsTerminalOrderStatus(res.Status) {
@@ -180,13 +191,15 @@ func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTra
 // recordOptionClose writes the exit to the trade row (multiplier-correct P&L on
 // the quantity actually sold, not the full row — matching time_exit's flattenQty
 // accounting so a capped/partial sell doesn't over-state P&L), untracks it, and
-// publishes the update.
-func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, reason, exitSource string, exitPrice float64, qty int) {
+// publishes the update. Returns false when the DB write failed, so the caller can
+// RETAIN the (already-filled) exit order and re-record it with the real fill price
+// next sweep instead of losing it to an estimated-price heal.
+func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, reason, exitSource string, exitPrice float64, qty int) bool {
 	pnl := ExitPnLM("buy", t.FillPrice, exitPrice, qty, t.Multiplier)
 	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, reason, exitSource, exitPrice, pnl); dbErr != nil {
 		slog.Error("orb options: close DB record failed",
 			"ticker", t.Ticker, "occ", t.OCCSymbol, "err", dbErr)
-		return
+		return false
 	}
 	delete(s.trackedTrades, t.OrderID)
 	s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
@@ -195,6 +208,7 @@ func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, 
 	slog.Info("orb options: exit",
 		"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason,
 		"exit_price", exitPrice, "exit_source", exitSource, "pnl", pnl)
+	return true
 }
 
 // workingOptionSells returns the broker's open sell-to-close option orders keyed by

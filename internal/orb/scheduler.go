@@ -1609,8 +1609,12 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 				if !entries[k].filled && res.FilledQty > 0 {
 					if tc := s.trackedTrades[entries[k].id]; tc != nil && tc.isOption {
 						if cerr := CancelOrder(ctx, s.executor, entries[k].id); cerr != nil {
-							slog.Warn("orb: cancel option partial-fill remainder failed",
+							// The remainder is still working and could fill MORE contracts than
+							// we'd persist. Leave the entry pending and retry the cancel next
+							// tick rather than locking in a qty the broker may exceed.
+							slog.Warn("orb: cancel option partial-fill remainder failed; leaving pending to retry",
 								"ticker", ticker, "order_id", entries[k].id, "err", cerr)
+							continue
 						}
 						slog.Info("orb: option entry partially filled — persisting filled portion, remainder cancelled",
 							"ticker", ticker, "order_id", entries[k].id, "filled_qty", res.FilledQty, "fill_price", res.FilledPrice)
