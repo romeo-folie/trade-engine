@@ -20,12 +20,20 @@ var (
 	btOptFrom        string
 	btOptTo          string
 	btOptUnderlyings string
+	btOptSpreadPct   float64
+	btOptETFs        string
+	btOptPremium     float64
+	btOptMaxLoss     float64
 )
 
 func init() {
 	orbOptionsCmd.Flags().StringVar(&btOptFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	orbOptionsCmd.Flags().StringVar(&btOptTo, "to", "", "End date YYYY-MM-DD (required)")
 	orbOptionsCmd.Flags().StringVar(&btOptUnderlyings, "underlyings", "", "Comma-separated underlyings (default: options_orb.underlyings from config)")
+	orbOptionsCmd.Flags().Float64Var(&btOptSpreadPct, "modeled-spread-pct", 0.03, "Modeled bid/ask width as a fraction of mid (free bars-data has no real NBBO). Brackets the last-trade price for the spread gate and costs the exit (market sell → bid). 0.03 = 3%, conservative")
+	orbOptionsCmd.Flags().StringVar(&btOptETFs, "etf-underlyings", "SPY,QQQ", "Comma-separated earnings-exempt ETFs. Single names hit the earnings gate, which fails closed with no earnings feed, so the backtest is ETF-only")
+	orbOptionsCmd.Flags().Float64Var(&btOptPremium, "premium-budget", 1000, "Dollars of premium to deploy per trade (sizing). options_orb.premium_budget if 0")
+	orbOptionsCmd.Flags().Float64Var(&btOptMaxLoss, "max-loss-per-trade", 0, "Hard cap on premium at risk per trade (0 = no extra cap beyond the budget)")
 	_ = orbOptionsCmd.MarkFlagRequired("from")
 	_ = orbOptionsCmd.MarkFlagRequired("to")
 	backtestCmd.AddCommand(orbOptionsCmd)
@@ -42,10 +50,13 @@ fail-closed strike gates, contract sizing, app-managed exit, and multiplier-corr
 P&L. The backtest supplies only as-of historical data; every trading decision is the
 production code's, so results describe the code that would ship.
 
-DATA REQUIREMENTS: Alpaca historical option bars/quotes require an OPRA-entitled data
-subscription (Algo Trader Plus) and only reach back to ~Feb 2024. A missing
-entitlement or an out-of-range window surfaces as HTTP errors from the data calls,
-not fabricated fills — the run reports what it could and no more.`,
+DATA: runs on Alpaca's FREE historical option BARS (no OPRA/Algo Trader Plus needed).
+Since the basic plan has no historical NBBO quotes, the bid/ask is reconstructed from
+the last-trade price (1-minute bar close) bracketed by --modeled-spread-pct, and the
+exit models a market-sell receiving the bid. The spread gate therefore runs on a
+MODELED spread, not real NBBO — a deliberate free-data trade-off (see
+docs/options-orb-backtest.md). Alpaca option history only reaches back to ~Feb 2024;
+earlier windows return empty and HTTP errors are logged, never fabricated.`,
 	Example: `  te backtest orb-options --from 2024-06-01 --to 2024-08-31
   te backtest orb-options --from 2024-06-01 --to 2024-06-30 --underlyings SPY,QQQ`,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -90,9 +101,39 @@ func runOptionsBacktest(ctx context.Context) error {
 	if apiKey == "" || secret == "" {
 		return fmt.Errorf("Alpaca credentials unset: export %s and %s", stocks.APIKeyEnv, stocks.SecretEnv)
 	}
-	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL)
+	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL, btOptSpreadPct)
 
 	rcfg := optionsBacktestConfig(cfg)
+	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct // exit models a market-sell receiving the bid
+	// ETF underlyings are earnings-exempt. Single names hit the earnings gate, which —
+	// with no earnings provider wired for the backtest — fails CLOSED, so the backtest
+	// is effectively ETF-only. Mark the configured/flagged ETFs so SPY/QQQ aren't
+	// rejected as unknown single names. (Union with any config value.)
+	etfs := append([]string(nil), cfg.OptionsORB.ETFUnderlyings...)
+	for _, e := range splitCSV(btOptETFs) {
+		etfs = append(etfs, strings.ToUpper(e))
+	}
+	rcfg.Gate.ETFUnderlyings = etfs
+
+	// Sizing budget: config is often unset for the backtest, and a 0 budget aborts
+	// every trade at sizing. Fall back to the flag default.
+	if btOptPremium > 0 {
+		rcfg.Replay.PremiumBudget = btOptPremium
+	}
+	if btOptMaxLoss > 0 {
+		rcfg.Replay.MaxLossPerTrade = btOptMaxLoss
+	}
+
+	// Warn on the modeled-spread footgun: the spread gate aborts when spread% ≥ ceiling,
+	// so a modeled spread at/above the ceiling rejects every contract.
+	ceiling := rcfg.Gate.SpreadPctCeiling
+	if ceiling <= 0 {
+		ceiling = 5 // options.DefaultGateConfig ceiling, applied in NewEngine
+	}
+	if btOptSpreadPct*100 >= ceiling {
+		fmt.Printf("WARNING: --modeled-spread-pct %.3f (%.1f%%) ≥ the %.1f%% spread-gate ceiling — every contract will abort at 'spread'. Use a smaller value.\n",
+			btOptSpreadPct, btOptSpreadPct*100, ceiling)
+	}
 
 	fmt.Printf("options-ORB backtest · %s → %s · %s\n\n",
 		btOptFrom, btOptTo, strings.Join(underlyings, ","))

@@ -17,43 +17,64 @@ import (
 // AlpacaOptionsHist is the concrete historical-options data source the runnable
 // options-ORB backtest needs (internal/backtest/optionsreplay.HistoricalOptionData).
 // It is the I/O that production never used — live strike selection reads real-time
-// OPRA snapshots; the backtest reconstructs the past from three Alpaca endpoints:
+// OPRA snapshots; the backtest reconstructs the past from Alpaca endpoints:
 //
-//   - contract listing  → trading API  /v2/options/contracts        (metadata)
-//   - historical quotes → data API     /v1beta1/options/quotes       (NBBO as-of)
-//   - historical bars   → data API     /v1beta1/options/bars         (exit path)
+//   - contract listing  → trading API  /v2/options/contracts   (metadata)
+//   - historical bars   → data API     /v1beta1/options/bars    (price + exit path)
 //
-// Underlying equity bars come from the existing AlpacaClient. Every read is bounded
-// by the request's own start/end so it cannot return post-as-of data.
+// FREE-DATA MODE (no OPRA subscription): Alpaca serves historical option BARS and
+// TRADES on the basic plan but NOT historical NBBO quotes (/options/quotes 404s
+// without Algo Trader Plus). So QuoteAt/QuotesAt reconstruct a synthetic bid/ask from
+// the option's last-trade price (the 1-minute bar close) bracketed by a configurable
+// MODELED spread (modeledSpreadPct, full width as a fraction of the mid). The mid is
+// therefore a last-trade proxy, and the spread gate operates on a modeled — not real —
+// spread. This is the deliberate free-data trade-off (see docs/options-orb-backtest.md);
+// the exit models a market-sell receiving the bid via the same spread.
 //
-// CONSTRAINTS (documented, not silently swallowed): Alpaca option history requires
-// an OPRA-entitled data subscription and only reaches back to ~Feb 2024. A missing
-// entitlement surfaces as an HTTP error from the underlying calls, which the runner
-// logs — it does not fabricate quotes.
+// Underlying equity bars come from the existing AlpacaClient. Every read is bounded by
+// its request's start/end so it cannot return post-as-of data. Alpaca option history
+// only reaches back to ~Feb 2024; earlier windows return empty and HTTP errors are
+// logged, never fabricated.
 type AlpacaOptionsHist struct {
-	apiKey     string
-	secret     string
-	dataURL    string // e.g. https://data.alpaca.markets
-	tradingURL string // e.g. https://api.alpaca.markets (or paper-api for paper keys)
-	equity     *AlpacaClient
+	apiKey           string
+	secret           string
+	dataURL          string // e.g. https://data.alpaca.markets
+	tradingURL       string // e.g. https://api.alpaca.markets (or paper-api for paper keys)
+	modeledSpreadPct float64 // full modeled bid/ask width as a fraction of the mid (0 = none)
+	equity           *AlpacaClient
 }
 
 // NewAlpacaOptionsHist builds the client. dataURL/tradingURL default to the live
-// hosts when empty. The same key/secret authenticate both hosts.
-func NewAlpacaOptionsHist(apiKey, secret, dataURL, tradingURL string) *AlpacaOptionsHist {
+// hosts when empty. modeledSpreadPct is the synthetic bid/ask width (fraction of mid)
+// used to reconstruct quotes from bars; 0 means bid=ask=last-trade (no modeled spread).
+func NewAlpacaOptionsHist(apiKey, secret, dataURL, tradingURL string, modeledSpreadPct float64) *AlpacaOptionsHist {
 	if dataURL == "" {
 		dataURL = "https://data.alpaca.markets"
 	}
 	if tradingURL == "" {
 		tradingURL = "https://api.alpaca.markets"
 	}
-	return &AlpacaOptionsHist{
-		apiKey:     apiKey,
-		secret:     secret,
-		dataURL:    dataURL,
-		tradingURL: tradingURL,
-		equity:     NewAlpacaClient(apiKey, secret, dataURL),
+	if modeledSpreadPct < 0 {
+		modeledSpreadPct = 0
 	}
+	return &AlpacaOptionsHist{
+		apiKey:           apiKey,
+		secret:           secret,
+		dataURL:          dataURL,
+		tradingURL:       tradingURL,
+		modeledSpreadPct: modeledSpreadPct,
+		equity:           NewAlpacaClient(apiKey, secret, dataURL),
+	}
+}
+
+// modeledNBBO brackets a last-trade price with the configured modeled spread: the mid
+// is the price, and bid/ask sit a half-spread either side. A price ≤ 0 yields (0,0).
+func (a *AlpacaOptionsHist) modeledNBBO(price float64) execution.OptionNBBO {
+	if price <= 0 {
+		return execution.OptionNBBO{}
+	}
+	half := price * a.modeledSpreadPct / 2
+	return execution.OptionNBBO{Bid: price - half, Ask: price + half}
 }
 
 // UnderlyingBars returns 1-minute equity bars via the existing equity client.
@@ -153,133 +174,101 @@ func (a *AlpacaOptionsHist) listContractsStatus(ctx context.Context, underlying,
 	return out, nil
 }
 
-// ── historical quotes (data API) ─────────────────────────────────────────────
+// ── historical quotes reconstructed from bars (data API) ─────────────────────
 
-type alpacaOptQuote struct {
-	Timestamp string  `json:"t"`
-	BidPrice  float64 `json:"bp"`
-	AskPrice  float64 `json:"ap"`
-}
+// priceLookback is how far before asOf QuoteAt/QuotesAt search for the last-trade
+// price (the most recent 1-minute bar close).
+const priceLookback = 15 * time.Minute
 
-type alpacaOptQuotesResponse struct {
-	Quotes        map[string][]alpacaOptQuote `json:"quotes"`
-	NextPageToken string                      `json:"next_page_token"`
-}
+// maxOptionBarPages bounds the batched bar pagination so a busy chain (many symbols ×
+// many 1-minute bars in the lookback window) can't spin forever.
+const maxOptionBarPages = 50
 
-// quoteLookback is how far before asOf QuoteAt searches for the last NBBO.
-const quoteLookback = 15 * time.Minute
+// maxSymbolsPerBarRequest is Alpaca's cap on the multi-symbol `symbols` list for the
+// option bars endpoint. Larger requests 400.
+const maxSymbolsPerBarRequest = 100
 
-// maxOptionQuotePages bounds the batched QuotesAt pagination so a busy chain (many
-// symbols × many ticks in the lookback window) can't spin forever. 50 pages ×
-// limit 1000 = 50k quotes, ample for a whole DTE window over a 15-minute window.
-const maxOptionQuotePages = 50
-
-// maxSymbolsPerQuoteRequest is Alpaca's cap on the multi-symbol `symbols` list for
-// the option quotes endpoint. Larger requests 400.
-const maxSymbolsPerQuoteRequest = 100
-
-// QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It asks
-// for the [asOf-quoteLookback, asOf] window sorted DESCENDING with limit=1, so the
-// single returned quote is the newest at or before the evaluation instant — never a
-// stale first-ascending-page quote (a liquid 15-minute window can exceed one page of
-// NBBO updates) and never a quote stamped after asOf (bounded by end=asOf).
+// QuoteAt returns a modeled bid/ask at or before asOf for one OCC symbol. Because the
+// account has no historical NBBO quotes, it takes the most recent 1-minute bar close
+// in [asOf-priceLookback, asOf] as the last-trade price and brackets it with the
+// modeled spread. ok is false when no bar exists in the window.
 func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf time.Time) (float64, float64, bool) {
-	params := url.Values{}
-	params.Set("symbols", occSymbol)
-	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
-	params.Set("end", asOf.UTC().Format(time.RFC3339))
-	params.Set("sort", "desc")
-	params.Set("limit", "1")
-	var resp alpacaOptQuotesResponse
-	if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
-		// Surface systemic failures (e.g. 403 no OPRA entitlement, 429) — otherwise a
-		// blanket auth error is indistinguishable from "no quote in the window" and the
-		// backtest silently reports zero candidates with no cause. ok=false either way;
-		// we never fabricate a quote.
-		slog.Warn("alpaca options: historical quote fetch failed", "occ", occSymbol, "as_of", asOf, "err", err)
+	out := make(map[string]execution.OptionNBBO, 1)
+	if err := a.barsToNBBOChunk(ctx, []string{occSymbol}, asOf, out); err != nil {
+		slog.Warn("alpaca options: historical bar fetch failed", "occ", occSymbol, "as_of", asOf, "err", err)
 		return 0, 0, false
 	}
-	quotes := resp.Quotes[occSymbol]
-	if len(quotes) == 0 {
+	q, ok := out[occSymbol]
+	if !ok || q.Bid <= 0 || q.Ask <= 0 {
 		return 0, 0, false
 	}
-	// Newest first with the end bound at asOf; defensively re-check the timestamp so a
-	// server that ignores sort/end can never hand us a future quote.
-	newest := quotes[0]
-	if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
-		return 0, 0, false
-	}
-	if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
-		return 0, 0, false
-	}
-	return newest.BidPrice, newest.AskPrice, true
+	return q.Bid, q.Ask, true
 }
 
-// QuotesAt returns the newest NBBO at or before asOf for MANY OCC symbols, replacing
-// an N+1 per-contract fetch with a batched, PAGED request over the window
-// [asOf-quoteLookback, asOf] sorted DESCENDING.
-//
-// Alpaca's multi-symbol quotes endpoint groups results by symbol then orders each
-// group by time, and `limit` caps the TOTAL rows across all symbols — so one busy
-// at-the-money contract can fill a whole page and push other requested symbols onto
-// later pages. A single page would therefore silently drop most of the chain. We
-// page (bounded by maxOptionQuotePages) and record each symbol's newest quote the first
-// time it appears (its quotes are newest-first within a group, so the first
-// occurrence across pages is the global newest), stopping early once every requested
-// symbol is resolved. A symbol absent from all pages is excluded — fail-closed, like
-// the single QuoteAt.
+// QuotesAt returns a modeled bid/ask at or before asOf for MANY OCC symbols by
+// batch-fetching each contract's most recent 1-minute bar close (its last-trade price)
+// and bracketing it with the modeled spread. It chunks to Alpaca's 100-symbol cap and
+// pages each chunk (the total-row `limit` is shared across symbols, so one busy
+// contract can push others onto later pages). A symbol with no bar in the window is
+// excluded — fail-closed, matching the gate's treatment of a missing contract.
 func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
 	out := make(map[string]execution.OptionNBBO)
 	if len(occSymbols) == 0 {
 		return out, nil
 	}
-	// Alpaca caps the multi-symbol `symbols` list at 100; a SPY/QQQ DTE window often
-	// exceeds that, and an over-cap request 400s. Chunk into ≤100-symbol batches, each
-	// paged, merging into one result.
-	for i := 0; i < len(occSymbols); i += maxSymbolsPerQuoteRequest {
-		end := min(i+maxSymbolsPerQuoteRequest, len(occSymbols))
-		if err := a.quotesAtChunk(ctx, occSymbols[i:end], asOf, out); err != nil {
+	for i := 0; i < len(occSymbols); i += maxSymbolsPerBarRequest {
+		end := min(i+maxSymbolsPerBarRequest, len(occSymbols))
+		if err := a.barsToNBBOChunk(ctx, occSymbols[i:end], asOf, out); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
 }
 
-// quotesAtChunk resolves the newest NBBO for one ≤100-symbol chunk (paged) and writes
-// results into out.
-func (a *AlpacaOptionsHist) quotesAtChunk(ctx context.Context, chunk []string, asOf time.Time, out map[string]execution.OptionNBBO) error {
+// barsToNBBOChunk fetches 1-minute bars for one ≤100-symbol chunk over
+// [asOf-priceLookback, asOf] (newest-first, paged), takes each symbol's newest bar
+// close as its last-trade price, and writes the modeled bid/ask into out.
+func (a *AlpacaOptionsHist) barsToNBBOChunk(ctx context.Context, chunk []string, asOf time.Time, out map[string]execution.OptionNBBO) error {
 	remaining := make(map[string]bool, len(chunk))
 	for _, s := range chunk {
 		remaining[s] = true
 	}
 	params := url.Values{}
 	params.Set("symbols", strings.Join(chunk, ","))
-	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
+	params.Set("timeframe", "1Min")
+	params.Set("start", asOf.Add(-priceLookback).UTC().Format(time.RFC3339))
 	params.Set("end", asOf.UTC().Format(time.RFC3339))
 	params.Set("sort", "desc")
 	params.Set("limit", "1000")
-	for range maxOptionQuotePages {
-		var resp alpacaOptQuotesResponse
-		if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
-			slog.Warn("alpaca options: batch historical quotes failed", "n", len(chunk), "as_of", asOf, "err", err)
+	for range maxOptionBarPages {
+		var resp alpacaOptBarsResponse
+		if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/bars", params, &resp); err != nil {
+			slog.Warn("alpaca options: batch historical bars failed", "n", len(chunk), "as_of", asOf, "err", err)
 			return err
 		}
-		for sym, quotes := range resp.Quotes {
-			if !remaining[sym] || len(quotes) == 0 {
+		for sym, bars := range resp.Bars {
+			if !remaining[sym] || len(bars) == 0 {
 				continue
 			}
-			// First appearance of this symbol across pages = its global newest (desc).
-			// Decide the symbol here (newest-or-nothing, matching single QuoteAt), so a
-			// later page's older quotes for it are ignored.
-			delete(remaining, sym)
-			newest := quotes[0]
-			if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
-				continue
+			// Bars are stamped at their START and desc-sorted, so bars[0] may be the
+			// in-progress minute [asOf, asOf+1m) whose close reflects trades AFTER asOf —
+			// a lookahead. Take the newest COMPLETED bar (ts+1m ≤ asOf) instead. Only
+			// decide (delete) the symbol once such a bar is found, so if this page held
+			// only the in-progress bar, a later page's older bars can still resolve it.
+			for _, b := range bars {
+				ts, err := time.Parse(time.RFC3339, b.Timestamp)
+				if err != nil {
+					continue
+				}
+				if ts.Add(time.Minute).After(asOf) {
+					continue // in-progress / future bar — its close peeks past asOf
+				}
+				delete(remaining, sym) // newest completed bar for this symbol — decide here
+				if b.Close > 0 {
+					out[sym] = a.modeledNBBO(b.Close)
+				}
+				break
 			}
-			if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
-				continue
-			}
-			out[sym] = execution.OptionNBBO{Bid: newest.BidPrice, Ask: newest.AskPrice}
 		}
 		if resp.NextPageToken == "" || len(remaining) == 0 {
 			break

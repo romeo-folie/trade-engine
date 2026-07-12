@@ -36,7 +36,7 @@ func TestListContracts_QueriesBothStatuses(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.03)
 	from := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, 6, 8, 0, 0, 0, 0, time.UTC)
 	cs, err := a.ListContracts(context.Background(), "SPY", "call", from, to)
@@ -62,61 +62,83 @@ func TestListContracts_QueriesBothStatuses(t *testing.T) {
 	}
 }
 
-// TestQuoteAt_RequestsNewestQuote proves QuoteAt asks for the single newest quote at
-// or before asOf (sort=desc, limit=1) rather than the first ascending page.
-func TestQuoteAt_RequestsNewestQuote(t *testing.T) {
-	var gotSort, gotLimit, gotEnd string
+// TestQuoteAt_ModeledFromBars: with no NBBO quotes, QuoteAt takes the newest bar
+// close as the last-trade price and brackets it with the modeled spread.
+func TestQuoteAt_ModeledFromBars(t *testing.T) {
+	var gotPath, gotSort, gotTF string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query()
-		gotSort, gotLimit, gotEnd = q.Get("sort"), q.Get("limit"), q.Get("end")
-		_, _ = w.Write([]byte(`{"quotes":{"SPY240607C00530000":[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24}]}}`))
+		gotPath = r.URL.Path
+		gotSort = r.URL.Query().Get("sort")
+		gotTF = r.URL.Query().Get("timeframe")
+		_, _ = w.Write([]byte(`{"bars":{"SPY240607C00530000":[{"t":"2024-06-07T13:45:00Z","c":4.00}]}}`))
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.10) // 10% modeled spread
 	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC)
 	bid, ask, ok := a.QuoteAt(context.Background(), "SPY240607C00530000", asOf)
-	if !ok || bid != 1.20 || ask != 1.24 {
-		t.Fatalf("QuoteAt = (%v,%v,%v); want (1.20,1.24,true)", bid, ask, ok)
+	if !ok {
+		t.Fatal("expected a modeled quote from the bar close")
 	}
-	if gotSort != "desc" || gotLimit != "1" {
-		t.Errorf("expected sort=desc limit=1, got sort=%q limit=%q", gotSort, gotLimit)
+	// close 4.00, 10% full spread → half 5% → bid 3.80, ask 4.20, mid 4.00.
+	if bid != 3.80 || ask != 4.20 {
+		t.Errorf("modeled (bid,ask) = (%v,%v); want (3.80,4.20)", bid, ask)
 	}
-	if gotEnd == "" {
-		t.Errorf("expected end bound set to asOf, got empty")
+	if gotPath != "/v1beta1/options/bars" || gotTF != "1Min" || gotSort != "desc" {
+		t.Errorf("expected bars endpoint 1Min desc; got path=%q tf=%q sort=%q", gotPath, gotTF, gotSort)
 	}
 }
 
-// TestQuoteAt_RejectsFutureQuote defends against a server ignoring the end bound: a
-// quote stamped after asOf must not be used.
-func TestQuoteAt_RejectsFutureQuote(t *testing.T) {
+// TestQuoteAt_ExcludesInProgressBar: the bar starting exactly at asOf covers
+// [asOf, asOf+1m) — its close peeks past asOf — so it must be skipped in favour of
+// the newest COMPLETED bar (no lookahead).
+func TestQuoteAt_ExcludesInProgressBar(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"quotes":{"SPY240607C00530000":[{"t":"2024-06-07T14:00:00Z","bp":1.20,"ap":1.24}]}}`))
+		// desc: in-progress 13:46 bar first (close 9.99 = post-breakout), then completed 13:45.
+		_, _ = w.Write([]byte(`{"bars":{"SPY240607C00530000":[{"t":"2024-06-07T13:46:00Z","c":9.99},{"t":"2024-06-07T13:45:00Z","c":4.00}]}}`))
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
-	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC) // before the returned 14:00 quote
-	if _, _, ok := a.QuoteAt(context.Background(), "SPY240607C00530000", asOf); ok {
-		t.Errorf("expected ok=false for a quote stamped after asOf")
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.0)
+	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC) // == the in-progress bar's start
+	bid, _, ok := a.QuoteAt(context.Background(), "SPY240607C00530000", asOf)
+	if !ok {
+		t.Fatal("expected the completed 13:45 bar to be used")
+	}
+	if bid != 4.00 { // the completed bar's close, NOT the in-progress 9.99
+		t.Errorf("price = %v; want 4.00 (completed bar, not the in-progress 9.99 lookahead)", bid)
 	}
 }
 
-// TestQuotesAt_BatchNewestPerSymbol: QuotesAt returns each symbol's newest quote from
-// the grouped, desc-sorted response.
+// TestQuoteAt_RejectsFutureBar: a bar stamped after asOf must not be used.
+func TestQuoteAt_RejectsFutureBar(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"bars":{"SPY240607C00530000":[{"t":"2024-06-07T14:00:00Z","c":4.00}]}}`))
+	}))
+	defer srv.Close()
+
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.03)
+	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC) // before the returned 14:00 bar
+	if _, _, ok := a.QuoteAt(context.Background(), "SPY240607C00530000", asOf); ok {
+		t.Errorf("expected ok=false for a bar stamped after asOf")
+	}
+}
+
+// TestQuotesAt_BatchNewestPerSymbol: QuotesAt takes each symbol's newest bar close
+// (desc → first) and brackets it with the modeled spread.
 func TestQuotesAt_BatchNewestPerSymbol(t *testing.T) {
 	var gotSymbols, gotSort string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotSymbols = r.URL.Query().Get("symbols")
 		gotSort = r.URL.Query().Get("sort")
-		// desc → newest first per symbol; A has a later quote, B one quote.
-		_, _ = w.Write([]byte(`{"quotes":{
-			"SPY240607C00530000":[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24},{"t":"2024-06-07T13:40:00Z","bp":1.10,"ap":1.14}],
-			"SPY240607C00540000":[{"t":"2024-06-07T13:44:00Z","bp":0.80,"ap":0.84}]}}`))
+		// desc → newest first per symbol; A has a later bar (close 4.00) then older.
+		_, _ = w.Write([]byte(`{"bars":{
+			"SPY240607C00530000":[{"t":"2024-06-07T13:45:00Z","c":4.00},{"t":"2024-06-07T13:40:00Z","c":3.50}],
+			"SPY240607C00540000":[{"t":"2024-06-07T13:44:00Z","c":2.00}]}}`))
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.0) // 0 spread → bid=ask=close
 	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC)
 	out, err := a.QuotesAt(context.Background(), []string{"SPY240607C00530000", "SPY240607C00540000"}, asOf)
 	if err != nil {
@@ -128,34 +150,31 @@ func TestQuotesAt_BatchNewestPerSymbol(t *testing.T) {
 	if gotSymbols == "" || len(out) != 2 {
 		t.Fatalf("symbols=%q, out=%v", gotSymbols, out)
 	}
-	if out["SPY240607C00530000"].Bid != 1.20 { // newest of the two, not the older 1.10
-		t.Errorf("A newest bid = %v; want 1.20", out["SPY240607C00530000"].Bid)
+	if out["SPY240607C00530000"].Bid != 4.00 { // newest bar close, not the older 3.50
+		t.Errorf("A newest = %v; want 4.00", out["SPY240607C00530000"].Bid)
 	}
-	if out["SPY240607C00540000"].Ask != 0.84 {
-		t.Errorf("B ask = %v; want 0.84", out["SPY240607C00540000"].Ask)
+	if out["SPY240607C00540000"].Ask != 2.00 {
+		t.Errorf("B = %v; want 2.00", out["SPY240607C00540000"].Ask)
 	}
 }
 
-// TestQuotesAt_PagesUntilAllSymbolsResolved guards the Critical fix: Alpaca caps
-// `limit` across ALL symbols, so a busy contract can fill page 1 and push another
-// symbol to page 2. QuotesAt must page until every requested symbol is resolved,
-// not drop the ones missing from page 1.
+// TestQuotesAt_PagesUntilAllSymbolsResolved: Alpaca caps `limit` across ALL symbols,
+// so a busy contract can fill page 1 and push another symbol to page 2. QuotesAt must
+// page until every requested symbol resolves.
 func TestQuotesAt_PagesUntilAllSymbolsResolved(t *testing.T) {
 	var pages int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("page_token") == "" {
 			pages++
-			// Page 1: only the busy symbol A (its ticks filled the limit), plus a token.
-			_, _ = w.Write([]byte(`{"quotes":{"AAA240607C00530000":[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24}]},"next_page_token":"p2"}`))
+			_, _ = w.Write([]byte(`{"bars":{"AAA240607C00530000":[{"t":"2024-06-07T13:45:00Z","c":4.00}]},"next_page_token":"p2"}`))
 			return
 		}
 		pages++
-		// Page 2: the symbol that didn't fit on page 1.
-		_, _ = w.Write([]byte(`{"quotes":{"BBB240607C00540000":[{"t":"2024-06-07T13:44:00Z","bp":0.80,"ap":0.84}]},"next_page_token":""}`))
+		_, _ = w.Write([]byte(`{"bars":{"BBB240607C00540000":[{"t":"2024-06-07T13:44:00Z","c":2.00}]},"next_page_token":""}`))
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.0)
 	asOf := time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC)
 	out, err := a.QuotesAt(context.Background(), []string{"AAA240607C00530000", "BBB240607C00540000"}, asOf)
 	if err != nil {
@@ -164,7 +183,7 @@ func TestQuotesAt_PagesUntilAllSymbolsResolved(t *testing.T) {
 	if pages != 2 {
 		t.Errorf("expected 2 pages walked, got %d", pages)
 	}
-	if len(out) != 2 || out["AAA240607C00530000"].Bid != 1.20 || out["BBB240607C00540000"].Ask != 0.84 {
+	if len(out) != 2 || out["AAA240607C00530000"].Bid != 4.00 || out["BBB240607C00540000"].Ask != 2.00 {
 		t.Fatalf("both symbols must resolve across pages, got %v", out)
 	}
 }
@@ -183,21 +202,20 @@ func TestQuotesAt_ChunksOver100Symbols(t *testing.T) {
 			http.Error(w, `{"message":"too many symbols"}`, http.StatusBadRequest)
 			return
 		}
-		// Echo one quote back per requested symbol.
 		var b strings.Builder
-		b.WriteString(`{"quotes":{`)
+		b.WriteString(`{"bars":{`)
 		for i, s := range syms {
 			if i > 0 {
 				b.WriteString(",")
 			}
-			fmt.Fprintf(&b, `%q:[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24}]`, s)
+			fmt.Fprintf(&b, `%q:[{"t":"2024-06-07T13:45:00Z","c":4.00}]`, s)
 		}
 		b.WriteString(`}}`)
 		_, _ = w.Write([]byte(b.String()))
 	}))
 	defer srv.Close()
 
-	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.0)
 	syms := make([]string, 250)
 	for i := range syms {
 		syms[i] = fmt.Sprintf("SPY240607C%08d", 500000+i*1000)
