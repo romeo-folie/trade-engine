@@ -146,7 +146,7 @@ func newTestRunner(t *testing.T, hd HistoricalOptionData) *Runner {
 	}
 	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
 	to := time.Date(2026, 3, 6, 0, 0, 0, 0, etLoc)
-	r, err := NewRunner(context.Background(), hd, []string{"SPY"}, from, to, cfg, nil)
+	r, err := NewRunner(context.Background(), hd, NewMemIVStore(), []string{"SPY"}, from, to, cfg, nil)
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
@@ -192,8 +192,14 @@ func TestRunner_EndToEnd(t *testing.T) {
 // countingHist wraps fakeHist to count the I/O the #427 optimizations target.
 type countingHist struct {
 	fakeHist
-	quotesAt      int
-	listContracts int
+	quotesAt       int
+	listContracts  int
+	underlyingBars int
+}
+
+func (c *countingHist) UnderlyingBars(ctx context.Context, u string, from, to time.Time) ([]data.Candle, error) {
+	c.underlyingBars++
+	return c.fakeHist.UnderlyingBars(ctx, u, from, to)
 }
 
 func (c *countingHist) QuotesAt(ctx context.Context, occ []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
@@ -269,14 +275,15 @@ func TestGetOptionChain_RequiresAsOf(t *testing.T) {
 	}
 }
 
-func TestBuildIVSeries(t *testing.T) {
+func TestSeedIVHistory(t *testing.T) {
 	p := NewHistChainProvider(fakeHist{volAt: func(time.Time) float64 { return 0.30 }}, 0, 0)
+	ivs := NewMemIVStore()
 	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
 	to := time.Date(2026, 3, 13, 0, 0, 0, 0, etLoc) // ~2 weeks → ~10 weekdays
-	series, err := p.BuildIVSeries(context.Background(), "SPY", from, to, 15)
-	if err != nil {
-		t.Fatalf("BuildIVSeries: %v", err)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("SeedIVHistory: %v", err)
 	}
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
 	if len(series) < 8 {
 		t.Fatalf("expected ~10 weekday IV samples, got %d", len(series))
 	}
@@ -290,22 +297,91 @@ func TestBuildIVSeries(t *testing.T) {
 	}
 }
 
-// TestBuildIVSeries_UTCDates guards the anchoring regression: the CLI parses
-// --from/--to with time.Parse, which yields UTC. If BuildIVSeries floored the day in
-// that UTC location and sampled at midnight+offset, the ATM quote would land in the
-// prior ET evening (market closed) and seed an EMPTY series → every signal fails the
-// IV-rank gate. The fake now respects the request window, so this fails if that
-// anchoring regresses.
-func TestBuildIVSeries_UTCDates(t *testing.T) {
+// TestSeedIVHistory_Idempotent: a second seed over the same window fetches NOTHING
+// (write-through cache hit) — the whole point of persisting.
+func TestSeedIVHistory_Idempotent(t *testing.T) {
+	hd := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	p := NewHistChainProvider(hd, 0, 0)
+	ivs := NewMemIVStore()
+	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 13, 0, 0, 0, 0, etLoc)
+
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("first seed: %v", err)
+	}
+	if hd.underlyingBars == 0 {
+		t.Fatal("first seed should have fetched per-day data")
+	}
+	firstBars := hd.underlyingBars
+	// Second run, SAME ref minute: every day present at the exact instant → 0 new fetches.
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if hd.underlyingBars != firstBars {
+		t.Errorf("same-ref re-seed made %d new day-fetches; want 0 (cache hit)", hd.underlyingBars-firstBars)
+	}
+
+	// Re-seed at a DIFFERENT ref minute: the cached rows are stamped at the old instant,
+	// so they must be RE-DERIVED (not a stale date-only cache hit).
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 20); err != nil {
+		t.Fatalf("ref-change seed: %v", err)
+	}
+	if hd.underlyingBars <= firstBars {
+		t.Error("changing --iv-ref-minute must re-derive the days, not hit the stale cache")
+	}
+}
+
+// TestSeedIVHistory_LiveRowsAreAuthoritative: a 'live' row (the real observed IV) is
+// a cache hit even at a different as_of than the ref — the store won't let a derived
+// seed overwrite it, so re-deriving would just re-fetch it every run for nothing.
+func TestSeedIVHistory_LiveRowsAreAuthoritative(t *testing.T) {
+	hd := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	p := NewHistChainProvider(hd, 0, 0)
+	ivs := NewMemIVStore()
+	// Pre-seed one day with a LIVE row at 16:00 ET (a different instant than the 09:45 ref).
+	liveDay := time.Date(2026, 3, 4, 16, 0, 0, 0, etLoc)
+	_ = ivs.UpsertOptionIV(context.Background(), "SPY", liveDay, 0.42, "live")
+
+	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 6, 0, 0, 0, 0, etLoc)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// The live day must NOT have been re-fetched, and its live value/instant survive.
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
+	for _, d := range series {
+		if d.Date.In(etLoc).Format("2006-01-02") == "2026-03-04" {
+			if d.Source != "live" || d.ATMIV != 0.42 || !d.Date.Equal(liveDay) {
+				t.Errorf("live row was clobbered by a derived seed: %+v", d)
+			}
+		}
+	}
+	// Re-seed again: the live day still isn't re-fetched (would loop otherwise).
+	barsBefore := hd.underlyingBars
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if hd.underlyingBars != barsBefore {
+		t.Errorf("re-seed re-fetched %d days that were already cached (live day should not loop)", hd.underlyingBars-barsBefore)
+	}
+}
+
+// TestSeedIVHistory_UTCDates guards the anchoring regression: the CLI parses
+// --from/--to with time.Parse, which yields UTC. If seeding floored the day in that
+// UTC location and sampled at midnight+offset, the ATM quote would land in the prior
+// ET evening (market closed) and seed an EMPTY series → every signal fails the IV-rank
+// gate. The fake respects the request window, so this fails if the anchoring regresses.
+func TestSeedIVHistory_UTCDates(t *testing.T) {
 	p := NewHistChainProvider(fakeHist{volAt: func(time.Time) float64 { return 0.30 }}, 0, 0)
+	ivs := NewMemIVStore()
 	from, _ := time.Parse("2006-01-02", "2026-03-02") // UTC, exactly like the CLI
 	to, _ := time.Parse("2006-01-02", "2026-03-13")
-	series, err := p.BuildIVSeries(context.Background(), "SPY", from, to, 15)
-	if err != nil {
-		t.Fatalf("BuildIVSeries: %v", err)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("SeedIVHistory: %v", err)
 	}
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
 	if len(series) < 8 {
-		t.Fatalf("UTC-parsed dates seeded only %d IV days; expected ~10 — as-of anchoring regressed to a closed-market sample window", len(series))
+		t.Fatalf("UTC-parsed dates seeded only %d IV days; expected ~10 — anchoring regressed to a closed-market sample window", len(series))
 	}
 }
 

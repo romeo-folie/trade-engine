@@ -37,12 +37,14 @@ type Runner struct {
 	asm    AssembleConfig
 }
 
-// NewRunner wires the runner. It builds the daily IV series for every underlying
-// over [from-lookback, to] up front (the IV-rank gate needs history before the first
-// backtest day), then constructs the gate + replay engines around it. earnings may
-// be nil when every underlying is an ETF (SPY/QQQ) — single names without an
-// earnings provider fail closed, exactly as live.
-func NewRunner(ctx context.Context, hd HistoricalOptionData, underlyings []string, from, to time.Time, cfg RunnerConfig, earnings options.EarningsProvider) (*Runner, error) {
+// NewRunner wires the runner. It WRITE-THROUGH-seeds the daily IV history for every
+// underlying over [from-lookback, to] into ivstore (the IV-rank gate needs history
+// before the first backtest day) — fetching only days not already stored, so repeat
+// runs are near-instant — then constructs the gate + replay engines reading from that
+// same store. Pass options.NewStoreIVStore(db) to persist to option_iv_history, or
+// NewMemIVStore() for a DB-free run. earnings may be nil when every underlying is an
+// ETF (SPY/QQQ) — single names without an earnings provider fail closed, as live.
+func NewRunner(ctx context.Context, hd HistoricalOptionData, ivstore options.IVStore, underlyings []string, from, to time.Time, cfg RunnerConfig, earnings options.EarningsProvider) (*Runner, error) {
 	if cfg.IVRefMinuteET <= 0 {
 		cfg.IVRefMinuteET = 15
 	}
@@ -54,16 +56,12 @@ func NewRunner(ctx context.Context, hd HistoricalOptionData, underlyings []strin
 	}
 	// Seed enough calendar days before `from` to clear IVMinSamples trading days.
 	ivFrom := from.AddDate(0, 0, -(lookback + 10))
-	series := make(map[string][]options.DailyIV, len(underlyings))
 	for _, u := range underlyings {
-		s, err := chain.BuildIVSeries(ctx, u, ivFrom, to, cfg.IVRefMinuteET)
-		if err != nil {
-			return nil, fmt.Errorf("seed IV series for %s: %w", u, err)
+		if err := chain.SeedIVHistory(ctx, ivstore, u, ivFrom, to, cfg.IVRefMinuteET); err != nil {
+			return nil, fmt.Errorf("seed IV history for %s: %w", u, err)
 		}
-		slog.Info("optionsreplay: seeded IV history", "underlying", u, "days", len(s))
-		series[u] = s
 	}
-	ivr := options.NewIVRankService(NewMemIVReader(series), cfg.IVLookbackDays, cfg.IVMinSamples)
+	ivr := options.NewIVRankService(ivstore, cfg.IVLookbackDays, cfg.IVMinSamples)
 
 	gates := options.NewEngine(cfg.Gate, chain, ivr, earnings)
 	replay := NewEngine(gates, cfg.Replay)

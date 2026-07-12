@@ -41,9 +41,10 @@ func TestRecordLiveATMIV(t *testing.T) {
 	if len(hist) != 1 || math.Abs(hist[0].ATMIV-0.21) > 1e-9 {
 		t.Errorf("stored history = %+v; want one day at 0.21", hist)
 	}
-	// Stored date is day-floored.
-	if !hist[0].Date.Equal(dayFloor(asOf)) {
-		t.Errorf("stored date = %v; want %v", hist[0].Date, dayFloor(asOf))
+	// Stored at the precise snapshot INSTANT (not day-floored), so the as-of filter is
+	// lookahead-safe — a regression to dayFloor(asOf) would fail here.
+	if !hist[0].Date.Equal(asOf) {
+		t.Errorf("stored date = %v; want the instant %v (not day-floored)", hist[0].Date, asOf)
 	}
 }
 

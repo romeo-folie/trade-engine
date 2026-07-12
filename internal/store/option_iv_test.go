@@ -58,3 +58,37 @@ func TestOptionIV_RoundTrip(t *testing.T) {
 		t.Errorf("d1 after derived re-run = %+v; want unchanged 0.19/live", hist[0])
 	}
 }
+
+// TestOptionIV_AsOfInstantFiltering verifies migration 042: the read filters on the
+// precise sample INSTANT (as_of), so a 09:45 sample is excluded from a read ending at
+// 09:40 (no lookahead for a pre-sample breakout) but included when the read reaches
+// 09:50.
+func TestOptionIV_AsOfInstantFiltering(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	et, _ := time.LoadLocation("America/New_York")
+	const u = "SPYIVASOF"
+
+	asOf := time.Date(2026, 6, 3, 9, 45, 0, 0, et) // sampled 09:45 ET
+	if err := store.UpsertOptionIV(ctx, db, u, asOf, 0.25, "derived"); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	from := time.Date(2026, 6, 2, 0, 0, 0, 0, et)
+
+	// Read ending 09:40 (before the sample) → excluded.
+	before, _ := store.GetOptionIVHistory(ctx, db, u, from, time.Date(2026, 6, 3, 9, 40, 0, 0, et))
+	if len(before) != 0 {
+		t.Errorf("a 09:45 sample must be excluded from a read ending 09:40 (lookahead), got %d rows", len(before))
+	}
+	// Read ending 09:50 (after the sample) → included.
+	after, _ := store.GetOptionIVHistory(ctx, db, u, from, time.Date(2026, 6, 3, 9, 50, 0, 0, et))
+	if len(after) != 1 {
+		t.Fatalf("a 09:45 sample must be included in a read ending 09:50, got %d rows", len(after))
+	}
+	if after[0].ATMIV != 0.25 {
+		t.Errorf("IV = %v; want 0.25", after[0].ATMIV)
+	}
+}

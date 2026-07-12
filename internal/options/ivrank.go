@@ -7,8 +7,10 @@ import (
 
 // DailyIV is one underlying's at-the-money implied volatility on one date.
 type DailyIV struct {
-	Date  time.Time
-	ATMIV float64 // annualized IV as a fraction (0.18 = 18%)
+	Date   time.Time
+	ATMIV  float64 // annualized IV as a fraction (0.18 = 18%)
+	Source string  // "derived" | "live" ("" when unknown); the write-through seeder
+	// treats a "live" row as an authoritative cache hit rather than re-deriving over it.
 }
 
 // IVHistoryReader supplies stored daily ATM IV over a date range, oldest first.

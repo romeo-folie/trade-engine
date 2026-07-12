@@ -37,23 +37,27 @@ type fakeIVStore struct {
 
 func newFakeIVStore() *fakeIVStore { return &fakeIVStore{rows: map[string][]DailyIV{}} }
 
-func (f *fakeIVStore) UpsertOptionIV(_ context.Context, u string, date time.Time, iv float64, _ string) error {
-	day := dayFloor(date)
+// UpsertOptionIV mirrors the real store: keep one row per ET day (the PK), but store
+// the precise sample INSTANT as Date (as_of) rather than a day-floored value.
+func (f *fakeIVStore) UpsertOptionIV(_ context.Context, u string, asOf time.Time, iv float64, _ string) error {
+	day := dayFloor(asOf)
 	list := f.rows[u]
 	for i := range list {
-		if list[i].Date.Equal(day) {
-			list[i].ATMIV = iv
+		if dayFloor(list[i].Date).Equal(day) {
+			list[i] = DailyIV{Date: asOf, ATMIV: iv}
 			return nil
 		}
 	}
-	f.rows[u] = append(list, DailyIV{Date: day, ATMIV: iv})
+	f.rows[u] = append(list, DailyIV{Date: asOf, ATMIV: iv})
 	return nil
 }
 
+// GetIVHistory filters on the INSTANT (as_of), like the DB reader — so a same-day
+// sample after `to` is excluded (lookahead-safe).
 func (f *fakeIVStore) GetIVHistory(_ context.Context, u string, from, to time.Time) ([]DailyIV, error) {
 	var out []DailyIV
 	for _, d := range f.rows[u] {
-		if !d.Date.Before(dayFloor(from)) && !d.Date.After(dayFloor(to)) {
+		if !d.Date.Before(from) && !d.Date.After(to) {
 			out = append(out, d)
 		}
 	}
