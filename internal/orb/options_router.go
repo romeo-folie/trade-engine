@@ -56,6 +56,32 @@ func (r *OptionsRouter) Handles(ticker string) bool {
 	return r != nil && r.underlyings[strings.ToUpper(ticker)]
 }
 
+// SizeOptionContracts returns the number of whole contracts to buy for a mid price
+// and multiplier under a premium budget and optional max-loss cap. Long-only, so
+// max loss == premium == contracts × cost; the cap is a second bound on the same
+// quantity. Returns 0 when the budget can't afford one contract or inputs are
+// degenerate. Shared by the live router and the backtest (issue #417) so sizing is
+// identical — parity by reuse.
+func SizeOptionContracts(mid float64, multiplier int, premiumBudget, maxLossPerTrade float64) int {
+	if multiplier <= 0 {
+		multiplier = 100
+	}
+	costPerContract := mid * float64(multiplier)
+	if costPerContract <= 0 {
+		return 0
+	}
+	n := int(math.Floor(premiumBudget / costPerContract))
+	if maxLossPerTrade > 0 {
+		if capN := int(math.Floor(maxLossPerTrade / costPerContract)); capN < n {
+			n = capN
+		}
+	}
+	if n < 0 {
+		n = 0
+	}
+	return n
+}
+
 // SetOptionsRouter wires an options router into the scheduler. Called by the
 // options-mode setup (issue #418); nil leaves options-ORB disabled.
 func (s *ORBScheduler) SetOptionsRouter(r *OptionsRouter) { s.optionsRouter = r }
@@ -147,22 +173,7 @@ func (r *OptionsRouter) Route(ctx context.Context, params BracketParams, asOf ti
 		return OptionRouteResult{Placed: false, Decision: dec, Reason: dec.Gate + ": " + dec.Reason}
 	}
 
-	mult := dec.Contract.Multiplier
-	if mult <= 0 {
-		mult = 100
-	}
-	costPerContract := dec.Mid * float64(mult)
-	if costPerContract <= 0 {
-		return OptionRouteResult{Placed: false, Decision: dec, Reason: "non-positive contract cost"}
-	}
-	contracts := int(math.Floor(r.premiumBudget / costPerContract))
-	// For a long option, max loss == premium paid == contracts × cost, so the
-	// max-loss cap is a second bound on the same quantity.
-	if r.maxLossPerTrade > 0 {
-		if capC := int(math.Floor(r.maxLossPerTrade / costPerContract)); capC < contracts {
-			contracts = capC
-		}
-	}
+	contracts := SizeOptionContracts(dec.Mid, dec.Contract.Multiplier, r.premiumBudget, r.maxLossPerTrade)
 	if contracts < 1 {
 		return OptionRouteResult{Placed: false, Decision: dec,
 			Reason: fmt.Sprintf("premium budget $%.0f too small for one %s contract at mid $%.2f", r.premiumBudget, dec.Contract.OCCSymbol, dec.Mid)}

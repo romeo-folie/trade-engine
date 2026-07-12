@@ -312,6 +312,12 @@ type OptionExitInputs struct {
 	SessionEnding      bool // true when the position must be flattened before close
 }
 
+// DecideOptionExit is the exported form of the live exit decision, so the backtest
+// (issue #417) replays the SAME logic the live sweep uses — parity by reuse.
+func DecideOptionExit(in OptionExitInputs) (reason string, exit bool) {
+	return decideOptionExit(in)
+}
+
 // decideOptionExit chooses the exit reason for a position, or ("", false) to hold.
 // Order: protective/profit underlying crossings first (most informative), then the
 // IV-crush time exit, then the end-of-session flatten as a hard catch-all — so a
