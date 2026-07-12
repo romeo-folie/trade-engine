@@ -202,36 +202,75 @@ func (b *AlpacaBroker) GetOptionChain(ctx context.Context, underlying string, fi
 	var out []OptionSnapshot
 	// Bounded so a malformed or repeating next_page_token can never spin forever.
 	for range maxOptionPages {
-		var resp struct {
-			Snapshots map[string]struct {
-				LatestQuote struct {
-					BidPrice float64 `json:"bp"`
-					AskPrice float64 `json:"ap"`
-				} `json:"latestQuote"`
-				Greeks *struct {
-					Delta float64 `json:"delta"`
-				} `json:"greeks"`
-				ImpliedVolatility *float64 `json:"impliedVolatility"`
-			} `json:"snapshots"`
-			NextPageToken *string `json:"next_page_token"`
-		}
+		var resp optionSnapshotsResponse
 		path := "/v1beta1/options/snapshots/" + url.PathEscape(strings.ToUpper(underlying)) + "?" + q.Encode()
 		if err := b.doData(ctx, http.MethodGet, path, nil, &resp); err != nil {
 			return nil, fmt.Errorf("alpaca GetOptionChain %s: %w", underlying, err)
 		}
-		for sym, s := range resp.Snapshots {
-			snap := OptionSnapshot{
-				OCCSymbol: sym,
-				Bid:       s.LatestQuote.BidPrice,
-				Ask:       s.LatestQuote.AskPrice,
-				IV:        s.ImpliedVolatility,
-			}
-			if s.Greeks != nil {
-				d := s.Greeks.Delta
-				snap.Delta = &d
-			}
-			out = append(out, snap)
+		out = append(out, resp.toSnapshots()...)
+		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
+			break
 		}
+		q.Set("page_token", *resp.NextPageToken)
+	}
+	return out, nil
+}
+
+// optionSnapshotsResponse is the shared shape of the Alpaca options-snapshots
+// endpoints (per-underlying and by-symbols).
+type optionSnapshotsResponse struct {
+	Snapshots map[string]struct {
+		LatestQuote struct {
+			BidPrice float64 `json:"bp"`
+			AskPrice float64 `json:"ap"`
+		} `json:"latestQuote"`
+		Greeks *struct {
+			Delta float64 `json:"delta"`
+		} `json:"greeks"`
+		ImpliedVolatility *float64 `json:"impliedVolatility"`
+	} `json:"snapshots"`
+	NextPageToken *string `json:"next_page_token"`
+}
+
+func (r optionSnapshotsResponse) toSnapshots() []OptionSnapshot {
+	out := make([]OptionSnapshot, 0, len(r.Snapshots))
+	for sym, s := range r.Snapshots {
+		snap := OptionSnapshot{
+			OCCSymbol: sym,
+			Bid:       s.LatestQuote.BidPrice,
+			Ask:       s.LatestQuote.AskPrice,
+			IV:        s.ImpliedVolatility,
+		}
+		if s.Greeks != nil {
+			d := s.Greeks.Delta
+			snap.Delta = &d
+		}
+		out = append(out, snap)
+	}
+	return out
+}
+
+// GetOptionSnapshots returns snapshots for SPECIFIC OCC symbols in one call (the
+// by-symbols endpoint) rather than fetching and scanning the whole underlying chain.
+// The app-managed exit sweep uses it to price only the contracts it holds.
+func (b *AlpacaBroker) GetOptionSnapshots(ctx context.Context, occSymbols []string) ([]OptionSnapshot, error) {
+	if b.optionFeed != "opra" {
+		return nil, fmt.Errorf("alpaca GetOptionSnapshots: options require the real-time OPRA feed, got %q — set markets.stocks.option_feed: opra (Algo Trader Plus)", b.optionFeed)
+	}
+	if len(occSymbols) == 0 {
+		return nil, nil
+	}
+	q := url.Values{}
+	q.Set("feed", b.optionFeed)
+	q.Set("symbols", strings.Join(occSymbols, ","))
+	var out []OptionSnapshot
+	for range maxOptionPages {
+		var resp optionSnapshotsResponse
+		path := "/v1beta1/options/snapshots?" + q.Encode()
+		if err := b.doData(ctx, http.MethodGet, path, nil, &resp); err != nil {
+			return nil, fmt.Errorf("alpaca GetOptionSnapshots: %w", err)
+		}
+		out = append(out, resp.toSnapshots()...)
 		if resp.NextPageToken == nil || *resp.NextPageToken == "" {
 			break
 		}

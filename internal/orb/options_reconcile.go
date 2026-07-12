@@ -61,6 +61,11 @@ func (s *ORBScheduler) detectOrphanOptionPositions(ctx context.Context) {
 	}
 	s.lastOptionOrphanCheckAt = s.now()
 
+	// Intentionally a SEPARATE positions read from enforceOptionExits' (which runs just
+	// before this on the same tick): that sweep SELLS to close, so the orphan detector
+	// must see a POST-sell snapshot. Sharing the sweep's pre-sell snapshot would make a
+	// position it just closed look broker-held-but-unmanaged → a false orphan alert. The
+	// cost is one extra GetPositions when the 60s orphan throttle aligns with a sweep.
 	brokerHeld := s.heldOptionQuantities(ctx) // long option contracts per OCC
 	if brokerHeld == nil {
 		return // positions read failed; try again next sweep

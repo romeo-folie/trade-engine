@@ -226,6 +226,38 @@ func TestOptionTradeStaleAcrossSessions(t *testing.T) {
 	}
 }
 
+type countingPricer struct {
+	calls int
+	px    float64
+	ok    bool
+}
+
+func (p *countingPricer) UnderlyingPrice(context.Context, string) (float64, bool) {
+	p.calls++
+	return p.px, p.ok
+}
+
+// TestOptionExitManager_UnderlyingPriceMemoized: within one sweep, repeated positions
+// on the same underlying share a single price fetch; a new sweep refetches (#426).
+func TestOptionExitManager_UnderlyingPriceMemoized(t *testing.T) {
+	pr := &countingPricer{px: 100, ok: true}
+	m := NewOptionExitManager(pr, nil, nil, 0)
+
+	m.beginSweep()
+	m.underlyingPrice(context.Background(), "SPY")
+	m.underlyingPrice(context.Background(), "SPY")
+	m.underlyingPrice(context.Background(), "QQQ")
+	if pr.calls != 2 { // SPY once (memoized second time) + QQQ once
+		t.Errorf("expected 2 fetches (SPY memoized, QQQ once), got %d", pr.calls)
+	}
+
+	m.beginSweep() // new sweep invalidates the memo
+	m.underlyingPrice(context.Background(), "SPY")
+	if pr.calls != 3 {
+		t.Errorf("expected a refetch after beginSweep, got %d", pr.calls)
+	}
+}
+
 // TestShouldDeferFreshOptionExit: a working-orders read failure defers a fresh
 // stop/target/time exit (avoids a double-sell → naked short), but NEVER defers the
 // session-ending flatten (hard no-overnight invariant).

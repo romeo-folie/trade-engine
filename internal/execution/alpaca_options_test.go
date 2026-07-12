@@ -272,3 +272,33 @@ func TestGetPositions_OptionAware(t *testing.T) {
 		t.Errorf("option multiplier = %d; want 100", option.Option.Multiplier)
 	}
 }
+
+func TestGetOptionSnapshots_TargetedSymbols(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// By-symbols endpoint (no underlying in the path), symbols= set.
+		if r.URL.Path != "/v1beta1/options/snapshots" {
+			t.Errorf("unexpected path %s; want the by-symbols endpoint", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("symbols"); got != "SPY260717C00551000" {
+			t.Errorf("symbols = %q; want the single held contract", got)
+		}
+		if got := r.URL.Query().Get("feed"); got != "opra" {
+			t.Errorf("feed = %q; want opra", got)
+		}
+		io.WriteString(w, `{"snapshots":{"SPY260717C00551000":{"latestQuote":{"bp":1.20,"ap":1.30}}}}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, dataURL: ts.URL, optionFeed: "opra", httpClient: ts.Client()}
+
+	snaps, err := b.GetOptionSnapshots(context.Background(), []string{"SPY260717C00551000"})
+	if err != nil {
+		t.Fatalf("GetOptionSnapshots: %v", err)
+	}
+	if len(snaps) != 1 || snaps[0].Mid() != 1.25 {
+		t.Fatalf("snaps = %+v; want one contract mid 1.25", snaps)
+	}
+	// Empty input makes no call.
+	if s, err := b.GetOptionSnapshots(context.Background(), nil); err != nil || s != nil {
+		t.Errorf("empty symbols: got (%v,%v); want (nil,nil)", s, err)
+	}
+}

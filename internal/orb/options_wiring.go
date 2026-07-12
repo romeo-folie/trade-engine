@@ -34,11 +34,14 @@ func (p marketDataPricer) UnderlyingPrice(ctx context.Context, underlying string
 // time exit uses: it returns the mid of a specific contract by OCC symbol.
 type chainQuoter struct{ broker *execution.AlpacaBroker }
 
-func (c chainQuoter) OptionMid(ctx context.Context, underlying, occSymbol string) (float64, bool) {
+func (c chainQuoter) OptionMid(ctx context.Context, _underlying, occSymbol string) (float64, bool) {
 	if c.broker == nil {
 		return 0, false
 	}
-	snaps, err := c.broker.GetOptionChain(ctx, underlying, execution.OptionChainFilter{})
+	// Fetch ONLY the held contract, not the entire underlying chain — the exit sweep
+	// calls this per open position every 15s, so a full-chain fetch per position is
+	// pure waste.
+	snaps, err := c.broker.GetOptionSnapshots(ctx, []string{occSymbol})
 	if err != nil {
 		return 0, false
 	}

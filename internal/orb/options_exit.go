@@ -86,6 +86,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	if len(trades) == 0 {
 		return
 	}
+	s.optionExit.beginSweep() // memoize underlying prices across this sweep's positions
 	now := s.now()
 	clockSessionEnding := optionsSessionEnding(now)
 	// Snapshot broker-held option positions once (keyed by OCC symbol). If a prior
@@ -445,6 +446,15 @@ type OptionExitManager struct {
 	quoter          OptionQuoter
 	placer          optionsPlacer
 	timeExitMinutes int
+
+	// sweepPx memoizes underlying prices within a single exit sweep, so N option
+	// positions on the same underlying share one quote fetch. Reset by beginSweep.
+	sweepPx map[string]underlyingPx
+}
+
+type underlyingPx struct {
+	px float64
+	ok bool
 }
 
 // NewOptionExitManager builds the manager. quoter may be nil (time exit disabled).
@@ -452,12 +462,31 @@ func NewOptionExitManager(pricer UnderlyingPricer, quoter OptionQuoter, placer o
 	return &OptionExitManager{pricer: pricer, quoter: quoter, placer: placer, timeExitMinutes: timeExitMinutes}
 }
 
+// beginSweep resets the per-sweep underlying-price memo. Called once at the top of
+// each exit sweep so repeated positions on one underlying don't each refetch its price.
+func (m *OptionExitManager) beginSweep() { m.sweepPx = make(map[string]underlyingPx) }
+
+// underlyingPrice returns the underlying price, memoized within the current sweep
+// (including a failed read, so we don't retry per position in one sweep).
+func (m *OptionExitManager) underlyingPrice(ctx context.Context, underlying string) (float64, bool) {
+	if m.sweepPx != nil {
+		if v, ok := m.sweepPx[underlying]; ok {
+			return v.px, v.ok
+		}
+	}
+	px, ok := m.pricer.UnderlyingPrice(ctx, underlying)
+	if m.sweepPx != nil {
+		m.sweepPx[underlying] = underlyingPx{px: px, ok: ok}
+	}
+	return px, ok
+}
+
 // plan decides the exit reason for one filled option trade. It returns ("", false)
 // to hold — including when the underlying price is unavailable and the session is
 // not ending, since acting on missing data could close a healthy position. A
 // session-ending position is always flattened, even without a fresh price.
 func (m *OptionExitManager) plan(ctx context.Context, t store.ORBTrade, now time.Time, sessionEnding bool) (string, bool) {
-	px, ok := m.pricer.UnderlyingPrice(ctx, t.Underlying)
+	px, ok := m.underlyingPrice(ctx, t.Underlying)
 	if !ok {
 		if sessionEnding {
 			return optExitEOD, true
