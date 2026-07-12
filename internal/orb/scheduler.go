@@ -91,20 +91,26 @@ type CandidateScanner interface {
 
 // ORBScheduler implements the time-gated ORB state machine.
 type ORBScheduler struct {
-	cfg         config.ORBConfig
-	db          *pgxpool.Pool
-	marketData  data.MarketDataProvider
-	analyzer    *analysis.Analyzer
-	executor    execution.Executor
-	portfolio   PortfolioValuer
-	notifier    Notifier
-	news        data.NewsProvider        // optional; nil disables news enrichment
-	bus         *events.Bus              // optional; nil means no event publishing
-	now         func() time.Time         // injectable for tests
-	scanner     CandidateScanner         // optional; nil uses inline equities scanning
-	forexCfg    *config.ForexORBConfig   // optional; nil means equities mode
-	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
-	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
+	cfg                     config.ORBConfig
+	db                      *pgxpool.Pool
+	marketData              data.MarketDataProvider
+	analyzer                *analysis.Analyzer
+	executor                execution.Executor
+	portfolio               PortfolioValuer
+	notifier                Notifier
+	news                    data.NewsProvider        // optional; nil disables news enrichment
+	bus                     *events.Bus              // optional; nil means no event publishing
+	now                     func() time.Time         // injectable for tests
+	scanner                 CandidateScanner         // optional; nil uses inline equities scanning
+	forexCfg                *config.ForexORBConfig   // optional; nil means equities mode
+	futuresCfg              *config.FuturesORBConfig // optional; nil means not futures mode
+	feedbackCfg             *config.FeedbackConfig   // optional; nil disables feedback enrichment
+	optionsRouter           *OptionsRouter           // optional; nil disables options-ORB execution (default). Wired by #418.
+	optionExit              *OptionExitManager       // optional; nil disables options-ORB app-managed exits (default). Wired by #418.
+	lastOptionExitCheckAt   time.Time                // wall time of the last options-ORB exit sweep
+	lastOptionOrphanCheckAt time.Time                // wall time of the last options-ORB orphan sweep
+	alertedOrphanOptions    map[string]struct{}      // OCC symbols already alerted as orphans (re-armed on resolve)
+	pendingOptionExits      map[string]pendingExit   // DB trade ID → in-flight exit sell (polled, not re-sent)
 
 	mu                      sync.Mutex // protects state, session, candidates for TUI reads
 	state                   State
@@ -145,6 +151,12 @@ type trackedTrade struct {
 	qty       int
 	entryStop float64 // the entry stop trigger price; used to sanity-check the reported fill
 	entryFill float64 // set when entry stop order fills; 0 while still pending
+	// isOption marks an options-ORB entry. The fill-price sanitizer compares the
+	// reported fill against entryStop, but for an option entryStop is the UNDERLYING
+	// breakout level while the fill is the option PREMIUM — orders of magnitude apart
+	// — so the sanitizer must be skipped or it would overwrite a $2 premium with the
+	// $550 underlying level and corrupt all downstream P&L.
+	isOption bool
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -177,6 +189,7 @@ func NewORBScheduler(
 		fetchLastAttempt:       make(map[string]time.Time),
 		alertedOrphanLegs:      make(map[string]struct{}),
 		alertedOrphanPositions: make(map[string]struct{}),
+		pendingOptionExits:     make(map[string]pendingExit),
 		directionDecisions:     make(map[string][2]bool),
 	}
 }
@@ -429,6 +442,15 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// outside forex mode or when max-hold is unconfigured. Throttled (see enforceTimeExits).
 	s.enforceTimeExits(ctx)
 
+	// Options-ORB app-managed exits (issue #415): watch the underlying against each
+	// filled option's stored stop/target, apply the IV-crush time exit, and flatten
+	// before the close. No-op when the exit manager is unset (non-options runs).
+	s.enforceOptionExits(ctx)
+
+	// Options-ORB orphan detection (issue #416): alert on broker option positions no
+	// managed trade explains (detection-only). No-op unless options-ORB is active.
+	s.detectOrphanOptionPositions(ctx)
+
 	// Adaptive stop management (Phase 4 live): ratchet break-even / trailing stops on filled
 	// forex trades whose instrument opts in. No-op when no instrument configures it. Runs
 	// AFTER enforceTimeExits so a trade past max-hold is flattened rather than having its
@@ -643,6 +665,10 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					ticker:    t.Ticker,
 					qty:       t.Qty,
 					entryStop: t.EntryStop,
+					// Preserve the option flag across restarts so the fill-poll skips
+					// the underlying-level sanitizer when a pending option fills after
+					// a resume (else the premium is corrupted to the underlying level).
+					isOption: t.AssetClass == "option",
 				}
 			}
 			// Restore exit watching for filled entries that haven't closed yet.
@@ -656,6 +682,7 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					qty:       t.Qty,
 					entryStop: t.EntryStop,
 					entryFill: t.FillPrice,
+					isOption:  t.AssetClass == "option",
 				}
 			}
 		}
@@ -1278,6 +1305,25 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				if p.params.Qty == 0 {
 					continue
 				}
+				// Options-ORB (issue #414): for options-mode underlyings, execute this
+				// side as a long option instead of a bracket. Guarded by a nil-by-default
+				// router, so the equity/forex/futures bracket path below is unchanged.
+				// NOTE: there is a TWIN of this hook in the equities/futures branch
+				// (the `else` below) — options-mode underlyings are equities, so that
+				// twin is the one that actually fires in production. Keep both in sync.
+				if s.optionsRouter.Handles(ticker) {
+					orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, p.side, p.params)
+					if orderID != "" {
+						// Record the entry so the session's re-entry guard fires — options
+						// have no broker bracket to mark the ticker as entered, so without
+						// this a fresh order would be placed every tick.
+						ids[i] = orderID
+					}
+					if line != "" {
+						msgs = append(msgs, line)
+					}
+					continue
+				}
 				// Split-bracket partial take-profit (Phase 4 live): when the instrument
 				// configures a partial, enter as a PARTIAL bracket (nearer target) plus a
 				// RUNNER bracket (farther target) sharing the stop. split=false (the default,
@@ -1340,6 +1386,34 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 
 			if params.Qty == 0 {
 				slog.Warn("orb: skipping — position size too small", "ticker", ticker)
+				continue
+			}
+
+			// Options-ORB (issues #414/#419): route options-mode underlyings to a
+			// long option instead of a stock bracket. THIS equities/futures branch is
+			// the path the options-mode (equities) scheduler actually takes — the
+			// forex branch above has the parallel hook. Guarded by a nil-by-default
+			// router and Handles() (only configured underlyings), so the stock/futures
+			// bracket placement below is unchanged when options-ORB is off.
+			if s.optionsRouter.Handles(ticker) {
+				orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, side, params)
+				if orderID != "" {
+					// Record the entry so the re-entry guard fires (options have no
+					// broker bracket to mark the ticker as entered).
+					if side == "sell" {
+						s.orderIDs[ticker] = [2]string{"", orderID}
+					} else {
+						s.orderIDs[ticker] = [2]string{orderID, ""}
+					}
+					// Emit the activity-feed event the bracket path emits below, so an
+					// options entry shows up like any other ORB entry.
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker: ticker, Direction: side, Strategy: "orb",
+					})
+				}
+				if line != "" {
+					msgs = append(msgs, line)
+				}
 				continue
 			}
 
@@ -1528,6 +1602,43 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 				}
 				entries[k].res = res
 				entries[k].filled = res.Status == "filled"
+				// Options enter with LIMIT orders, which can partially fill. Treat a
+				// partial fill as a fill (so the held contracts are managed by the exit
+				// watcher, never orphaned by the session-cutoff cancel) and cancel the
+				// unfilled remainder so no further contracts land beyond the recorded row.
+				if !entries[k].filled && res.FilledQty > 0 {
+					if tc := s.trackedTrades[entries[k].id]; tc != nil && tc.isOption {
+						if cerr := CancelOrder(ctx, s.executor, entries[k].id); cerr != nil {
+							// The remainder is still working and could fill MORE contracts than
+							// we'd persist. Leave the entry pending and retry the cancel next
+							// tick rather than locking in a qty the broker may exceed.
+							slog.Warn("orb: cancel option partial-fill remainder failed; leaving pending to retry",
+								"ticker", ticker, "order_id", entries[k].id, "err", cerr)
+							continue
+						}
+						slog.Info("orb: option entry partially filled — persisting filled portion, remainder cancelled",
+							"ticker", ticker, "order_id", entries[k].id, "filled_qty", res.FilledQty, "fill_price", res.FilledPrice)
+						// Persist the filled portion WITH its actual contract count so the row
+						// reflects reality — the downstream (qty-agnostic) persist would leave the
+						// ordered size, and the exit sweep's positions-unavailable fallback then
+						// sells the full original quantity. This is guarded on status='pending', so
+						// the downstream persistEntryFill for this winner is a harmless no-op.
+						updated, dbErr := store.FillORBTradePartialByOrderID(ctx, s.db, entries[k].id, res.FilledPrice, int(res.FilledQty))
+						if dbErr != nil {
+							// Leave filled=false and retry next tick. Marking it filled now
+							// would let the qty-agnostic downstream persist heal the row to the
+							// FULL ordered size, re-introducing the over-sell this fix prevents.
+							slog.Error("orb: persist option partial entry failed; will retry", "ticker", ticker, "order_id", entries[k].id, "err", dbErr)
+							continue
+						}
+						if updated {
+							s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+								OrderID: entries[k].id, Ticker: ticker, Side: entries[k].side, Status: "filled", FillPrice: res.FilledPrice,
+							})
+						}
+						entries[k].filled = true
+					}
+				}
 				if entries[k].filled {
 					if entries[k].side == "buy" {
 						buyFilled = true
@@ -1688,18 +1799,44 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					if orderID == "" {
 						continue
 					}
-					// Reconcile already-filled orders instead of cancelling them.
-					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
+					// Reconcile already-filled orders instead of cancelling them. For OPTIONS
+					// a PARTIAL fill counts too (res.FilledQty > 0): recording the filled
+					// portion — and cancelling the unfilled remainder — keeps the held
+					// contracts managed instead of orphaning them. The partial branch is
+					// gated on isOption so equity/futures brackets keep main's lifecycle: a
+					// partial there still falls through to 'cancelled' (their TP/SL legs were
+					// placed for the full size, so overwriting qty would desync DB vs broker).
+					tc := s.trackedTrades[orderID]
+					isOption := tc != nil && tc.isOption
+					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && (res.Status == "filled" || (isOption && res.FilledQty > 0)) {
 						price := res.FilledPrice
-						if tc := s.trackedTrades[orderID]; tc != nil {
+						if tc != nil && !tc.isOption {
 							if corrected, was := sanitizeEntryFill(sides[i], tc.entryStop, price); was {
 								slog.Warn("orb: session cleanup: implausible entry fill — recording stop level instead",
 									"side", sides[i], "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
 								price = corrected
 							}
 						}
-						slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
-						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
+						var updated bool
+						var dbErr error
+						if res.Status != "filled" {
+							if cerr := CancelOrder(ctx, s.executor, orderID); cerr != nil {
+								// The unfilled remainder is still LIVE as a day order and could
+								// fill more contracts than the partial we'd record. Do NOT persist
+								// the reduced qty — that would orphan the extra contracts under a
+								// smaller row. Leave the row pending; the next cleanup pass retries
+								// the cancel (mirrors the live-poll partial path at ~1611).
+								slog.Warn("orb: session cleanup: cancel partial-fill remainder failed; leaving pending to retry",
+									"ticker", ticker, "order_id", orderID, "err", cerr)
+								continue
+							}
+							slog.Info("orb: session cleanup: partial entry fill — persisting filled portion", "side", sides[i], "ticker", ticker, "filled_qty", res.FilledQty, "fill_price", price)
+							// Persist the actual filled contract count (see the live-poll path).
+							updated, dbErr = store.FillORBTradePartialByOrderID(ctx, s.db, orderID, price, int(res.FilledQty))
+						} else {
+							slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
+							updated, dbErr = store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
+						}
 						if dbErr != nil {
 							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)
 						}
@@ -1775,7 +1912,10 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 // sanitizeEntryFill (a buy below / sell above its own stop, which IBKR can return when both
 // bracket legs fill at once) and stamps entryFill on the trackedTrade so exit polling begins.
 func (s *ORBScheduler) persistEntryFill(ctx context.Context, ticker, side, orderID string, price float64) {
-	if tc := s.trackedTrades[orderID]; tc != nil {
+	// Skip the fill sanitizer for options: entryStop is the underlying breakout
+	// level and price is the option premium, so the stock-shaped check would
+	// wrongly "correct" the premium to the underlying level (see trackedTrade.isOption).
+	if tc := s.trackedTrades[orderID]; tc != nil && !tc.isOption {
 		if corrected, was := sanitizeEntryFill(side, tc.entryStop, price); was {
 			slog.Warn("orb: implausible entry fill from broker — recording stop level instead",
 				"side", side, "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)

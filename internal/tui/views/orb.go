@@ -50,6 +50,34 @@ type ORBTradeRow struct {
 	ExitPrice  float64
 	ExitType   string
 	PnL        float64
+	// Options-ORB identity (empty/"equity" for non-options rows).
+	AssetClass string
+	OCCSymbol  string
+	Right      string // "C" | "P"
+	Strike     float64
+}
+
+// IsOption reports whether the row is an options-ORB trade.
+func (r ORBTradeRow) IsOption() bool { return r.AssetClass == "option" }
+
+// CostBasis is the capital deployed by the entry fill: premium × contracts × 100 for
+// options (premium is quoted per share, 100 shares/contract), price × shares
+// otherwise. Without the ×100, an options row understates deployed capital 100×.
+func (r ORBTradeRow) CostBasis() float64 {
+	mult := 1.0
+	if r.IsOption() {
+		mult = 100
+	}
+	return r.FillPrice * float64(r.Qty) * mult
+}
+
+// Label is the instrument label for display: the OCC contract for options
+// (e.g. "SPY C551"), otherwise the plain ticker.
+func (r ORBTradeRow) Label() string {
+	if r.IsOption() && r.Right != "" {
+		return fmt.Sprintf("%s %s%g", r.Ticker, r.Right, r.Strike)
+	}
+	return r.Ticker
 }
 
 // FetchORBViewData loads the most recent 3 ORB sessions (today + prior days)
@@ -116,6 +144,10 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 					ExitPrice:  t.ExitPrice,
 					ExitType:   t.ExitType,
 					PnL:        t.PnL,
+					AssetClass: t.AssetClass,
+					OCCSymbol:  t.OCCSymbol,
+					Right:      t.Right,
+					Strike:     t.Strike,
 				})
 			}
 		}
@@ -202,7 +234,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 					losses++
 				}
 				if t.FillPrice != 0 {
-					totalCost += t.FillPrice * float64(t.Qty)
+					totalCost += t.CostBasis()
 				}
 				exitStr := ""
 				if t.ExitPrice != 0 {
@@ -213,16 +245,16 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 					fillStr = fmt.Sprintf("%.4f", t.FillPrice)
 				}
 				fmt.Fprintf(&sb, "  %-6s %-4s  [%-8s]  qty=%-4d  %s%s   PnL:%s\n",
-					t.Ticker, strings.ToUpper(t.Side),
+					t.Label(), strings.ToUpper(t.Side),
 					orbExitLabel(t.ExitType),
 					t.Qty, fillStr, exitStr,
 					colorPnL(t.PnL))
 			case "filled":
 				if t.FillPrice != 0 {
-					totalCost += t.FillPrice * float64(t.Qty)
+					totalCost += t.CostBasis()
 				}
 				fmt.Fprintf(&sb, "  %-6s %-4s  [open    ]  qty=%-4d  fill=%.4f  stop=%.4f  target=%.4f\n",
-					t.Ticker, strings.ToUpper(t.Side),
+					t.Label(), strings.ToUpper(t.Side),
 					t.Qty, t.FillPrice, t.StopLoss, t.TakeProfit)
 			default:
 				statusLabel := t.Status
@@ -230,7 +262,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 					statusLabel = statusLabel[:8]
 				}
 				fmt.Fprintf(&sb, "  %-6s %-4s  [%-8s]  qty=%-4d  entry=%.4f  stop=%.4f  target=%.4f\n",
-					t.Ticker, strings.ToUpper(t.Side),
+					t.Label(), strings.ToUpper(t.Side),
 					statusLabel,
 					t.Qty, t.EntryStop, t.StopLoss, t.TakeProfit)
 			}
@@ -287,5 +319,3 @@ func renderORBStatus(status string) string {
 		return style.Foreground(lipgloss.Color("255")).Render(status)
 	}
 }
-
-

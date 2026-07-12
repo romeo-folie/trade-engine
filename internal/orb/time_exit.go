@@ -402,6 +402,26 @@ func (s *ORBScheduler) tickersWithOpenFilledTrades(ctx context.Context) map[stri
 	for _, t := range trades {
 		out[t.Ticker] = struct{}{}
 	}
+	// Options-ORB trades are excluded from GetOpenFilledORBTrades (they have their
+	// own reader + exit path), but the anti-stacking entry guard MUST still see them
+	// — otherwise a new option entry could stack on an underlying whose prior option
+	// is still open (exit pending/unconfirmed or a missed EOD flatten). t.Ticker is
+	// the underlying for options, which is what the guard keys on.
+	if optTrades, oerr := store.GetOpenFilledOptionTrades(ctx, s.db); oerr == nil {
+		for _, t := range optTrades {
+			out[t.Ticker] = struct{}{}
+		}
+	} else {
+		// FAIL CLOSED for options only: unlike the equity path (fail-open so a transient
+		// DB error never halts all trading), a blind option guard would let a fresh
+		// option entry stack on an unseen open position — doubling premium at risk. We
+		// can't enumerate which underlyings are open, so block ALL option-mode
+		// underlyings for this tick. Equity/forex/futures entries are unaffected.
+		slog.Warn("orb: option-trades read failed — blocking all option-mode entries this tick (fail closed)", "err", oerr)
+		for _, u := range s.optionsRouter.Underlyings() {
+			out[u] = struct{}{}
+		}
+	}
 	return out
 }
 

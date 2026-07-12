@@ -173,6 +173,7 @@ markets:
     secret_env: ALPACA_API_SECRET
     base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
+    option_feed: indicative     # options chain feed: "opra" (real-time, needs Algo Trader Plus) | "indicative" (free, 15-min delayed). options-ORB requires opra.
 
   # IBKR Client Portal gateway — used by the ORB forex/futures strategies.
   ibkr:
@@ -560,6 +561,27 @@ futures_orb:
     - { symbol: MNQ, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 0.50, tick_buffer: 2, margin_rate: 0.10 }
     - { symbol: MYM, exchange: CBOT, asset_class: equity_index, expiry_cycle: quarterly, tick_size: 1.00, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
     - { symbol: M2K, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.10, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
+
+# ── Options-ORB (Alpaca) — run the ORB signal but execute via long equity options ─────
+# Executes on the equities/newyork session. Long-only (buy calls on long breakouts,
+# puts on shorts) so max loss = premium. REQUIRES the Alpaca real-time OPRA options
+# feed (markets.stocks.option_feed: opra) + Level 2 options approval. Default-off.
+options_orb:
+  enabled: false
+  underlyings: [SPY, QQQ]        # options-mode symbols; others run the normal equity path
+  etf_underlyings: [SPY, QQQ]    # earnings-exempt. Add single names (NVDA, TSLA) ONLY with an
+                                 # earnings feed wired — without one they fail closed (never trade).
+  premium_budget: 500           # $ of option premium to deploy per trade
+  max_loss_per_trade: 500       # hard cap on premium at risk (== max loss for a long option)
+  iv_rank_ceiling: 70           # abort if the underlying's IV rank ≥ this (avoid IV crush)
+  max_dte: 5                    # keep contracts with 0 < DTE ≤ this (nearest weekly)
+  delta_min: 0.50               # near-ATM band lower bound (|delta|)
+  delta_max: 0.60               # near-ATM band upper bound
+  spread_pct_ceiling: 5         # abort if the contract's bid-ask spread % ≥ this (slippage)
+  earnings_blackout_days: 3     # single names only; skip within this many days of earnings
+  time_exit_minutes: 8          # IV-crush time exit: close if not profitable within N minutes
+  iv_lookback_days: 252         # IV-Rank trailing window (~1 year)
+  iv_min_samples: 40            # fail closed below this many stored IV days (cold-start guard)
 
 # ── COMEX metals futures ORB (IBKR) — run with `te run --mode orb-metals` ─────
 futures_orb_metals:

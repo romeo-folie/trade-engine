@@ -26,7 +26,12 @@ type BracketParams struct {
 	StopLoss   float64
 	TakeProfit float64
 	Qty        int
-	SecType    string // for IBKR: "CASH" (forex) or "CFD" (metals)
+	SecType    string // for IBKR: "CASH" (forex) or "CFD" (metals); "OPT" for equity options
+	// Option carries the selected contract identity when the options-ORB router
+	// (Issue #414) has chosen a contract; nil for shares/forex/futures. The
+	// underlying's Ticker/EntryStop/StopLoss/TakeProfit still describe the signal;
+	// Qty on an options bracket is a contract count.
+	Option *execution.OptionContract
 }
 
 // ComputeBracket derives entry/stop/target from an opening range and config.
@@ -378,14 +383,33 @@ func ExitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
 	return exitPnL(side, entryPrice, exitPrice, qty)
 }
 
-// exitPnL computes realised P&L in quote-currency units when an exit leg fills.
+// exitPnL computes realised P&L in quote-currency units when an exit leg fills,
+// for a ×1 (shares/forex/futures-unit) instrument.
 // For a buy: profit = (exitPrice - entryPrice) × qty.
 // For a sell: profit = (entryPrice - exitPrice) × qty.
 func exitPnL(side string, entryPrice, exitPrice float64, qty int) float64 {
-	if side == "sell" {
-		return (entryPrice - exitPrice) * float64(qty)
+	return exitPnLM(side, entryPrice, exitPrice, qty, 1)
+}
+
+// ExitPnLM is the exported, multiplier-aware form of exit P&L. For an equity
+// option, multiplier is the contract multiplier (100), so a $1.20 → $1.80 move
+// on 2 contracts realises (1.80-1.20) × 2 × 100 = $120. multiplier <= 0 is
+// treated as 1 so callers that leave it unset get the plain per-unit result.
+func ExitPnLM(side string, entryPrice, exitPrice float64, qty, multiplier int) float64 {
+	return exitPnLM(side, entryPrice, exitPrice, qty, multiplier)
+}
+
+// exitPnLM is the multiplier-aware core. exitPnL delegates here with multiplier=1,
+// preserving the exact prior result for every existing (shares/forex/futures) caller.
+func exitPnLM(side string, entryPrice, exitPrice float64, qty, multiplier int) float64 {
+	if multiplier <= 0 {
+		multiplier = 1
 	}
-	return (exitPrice - entryPrice) * float64(qty)
+	units := float64(qty) * float64(multiplier)
+	if side == "sell" {
+		return (entryPrice - exitPrice) * units
+	}
+	return (exitPrice - entryPrice) * units
 }
 
 // resolveExitFromCandles walks an ordered series of OHLC bars and reports the first

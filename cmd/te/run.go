@@ -300,6 +300,8 @@ Modes:
 					}
 				}()
 			}
+			// Options-ORB also runs in the standalone equities mode.
+			wireOptionsORB(orbScheduler, cfg.OptionsORB, broker)
 
 			logger.Info("ORB scheduler starting")
 			fmt.Println("ORB mode active. Waiting for pre-market scan window...")
@@ -648,6 +650,11 @@ Modes:
 					}
 				}()
 			}
+
+			// Options-ORB (issue #418): when enabled and the broker is Alpaca, execute
+			// the configured underlyings via long options on the equities/newyork
+			// session. No-op otherwise — the equity bracket path is unchanged.
+			wireOptionsORB(equitiesScheduler, cfg.OptionsORB, broker)
 
 			// 4. Build forex ORB scheduler (IBKR data + broker, newyork session).
 			cfg.ForexORB.Session = "newyork"
@@ -1106,6 +1113,23 @@ func newDBPortfolioValuer(defaultValue float64) *dbPortfolioValuer {
 	return &dbPortfolioValuer{
 		defaultValue:  defaultValue,
 		fetchSnapshot: store.GetLatestPortfolioSnapshot,
+	}
+}
+
+// wireOptionsORB enables options-ORB on an equities ORB scheduler when configured
+// and the stocks broker is Alpaca. Called from EVERY equities entrypoint (--mode
+// orb and orb-newyork) so no run mode silently ignores options_orb config and
+// places stock brackets on configured underlyings.
+func wireOptionsORB(scheduler *orb.ORBScheduler, optCfg config.OptionsORBConfig, broker execution.Executor) {
+	if !optCfg.Enabled {
+		return
+	}
+	if ab, ok := broker.(*execution.AlpacaBroker); ok {
+		scheduler.SetupOptionsORB(optCfg, ab)
+		logger.Info("options-ORB enabled",
+			"underlyings", optCfg.Underlyings, "premium_budget", optCfg.PremiumBudget)
+	} else {
+		logger.Warn("options-ORB enabled but stocks broker is not Alpaca; skipping")
 	}
 }
 

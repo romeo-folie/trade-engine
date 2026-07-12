@@ -148,6 +148,32 @@ func TestReconcile_BrokerOnly(t *testing.T) {
 	}
 }
 
+// TestReconcile_SkipsOptionPosition verifies the #416 scope-out: an option
+// position (reported as an OCC symbol) is skipped by this ticker-keyed reconciler
+// — no drift warning, no adoption — because it's owned by the OCC-keyed options
+// orphan detector instead.
+func TestReconcile_SkipsOptionPosition(t *testing.T) {
+	collect, restore := captureLogs(t)
+	defer restore()
+
+	ReconcileBrokerVsDB(context.Background(),
+		&fakeBrokerView{positions: []execution.BrokerPosition{
+			{Symbol: "SPY260717C00551000", Quantity: 4, Side: "long"}, // an option OCC symbol
+			{Symbol: "JMIA", Quantity: 50, Side: "long"},              // a normal equity → still drifts
+		}},
+		&fakeStore{trades: nil},
+		0.01,
+	)
+	recs := collect()
+	// Exactly one drift warning — the equity — the option is skipped.
+	if got := countByLevelMsg(recs, "WARN", "reconciler: broker/DB drift"); got != 1 {
+		t.Fatalf("expected 1 drift warning (equity only), got %d", got)
+	}
+	if findRecord(recs, "WARN", "reconciler: broker/DB drift", "SPY260717C00551000") != nil {
+		t.Fatal("option OCC position must NOT produce a drift warning")
+	}
+}
+
 func TestReconcile_DBOnly(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()

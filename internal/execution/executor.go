@@ -5,6 +5,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrOrderNotFound is returned by Executor implementations when a broker
@@ -32,6 +33,21 @@ const (
 	OrderTypeStop   OrderType = "stop"
 )
 
+// OptionContract identifies a single option contract. It is carried, optionally,
+// alongside an OrderRequest/Position when the instrument is an equity option
+// (SecType "OPT"); it is nil for shares, forex, and futures. The OCC symbol is
+// the broker's canonical contract key (e.g. "AAPL240223C00095000"); Multiplier
+// is the contract multiplier (100 for standard US equity options) and makes
+// notional/P&L math instrument-correct.
+type OptionContract struct {
+	Underlying string    // e.g. "AAPL" — the equity the option is written on
+	Expiry     time.Time // contract expiration date
+	Strike     float64   // strike price
+	Right      string    // "C" (call) | "P" (put)
+	OCCSymbol  string    // 21-char OCC symbol; the broker's tradable contract id
+	Multiplier int       // shares per contract (100 for standard US equity options)
+}
+
 // OrderRequest is the input to PlaceOrder.
 type OrderRequest struct {
 	Ticker     string
@@ -50,7 +66,12 @@ type OrderRequest struct {
 
 	// SecType overrides the IBKR security type for this order.
 	// "" defaults to "CASH" (forex). Use "CFD" for metals like XAU/USD.
-	SecType string // "" (default/CASH) | "CASH" (forex) | "CFD" (metals)
+	SecType string // "" (default/CASH) | "CASH" (forex) | "CFD" (metals) | "OPT" (equity option)
+
+	// Option carries the contract identity when SecType is "OPT"; nil otherwise.
+	// The broker adapter uses Option.OCCSymbol as the order's symbol and
+	// Quantity as the number of contracts.
+	Option *OptionContract
 }
 
 // OrderResult is the immediate response from the broker.
@@ -97,6 +118,11 @@ type Position struct {
 	CurrentValue float64 // total market value (qty × current price)
 	UnrealizedPL float64
 	Side         string // "long" or "short" (empty if broker doesn't provide)
+
+	// Option is populated when the broker reports this position as an equity
+	// option (Alpaca asset_class "us_option"); nil for shares/forex/futures.
+	// Quantity is in contracts and market value already reflects the multiplier.
+	Option *OptionContract
 }
 
 // NormalizeOrderStatus maps Alpaca's transient/broker-specific order statuses to

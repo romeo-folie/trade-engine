@@ -62,6 +62,22 @@ type ORBTrade struct {
 	// the pair counts as one logical trade. See migration 036.
 	ScaleOutRole     string
 	ScaleOutParentID *string
+	// Instrument identity. AssetClass is "equity" (default), "forex", "futures",
+	// or "option". The remaining fields are populated only for options (Issue #410,
+	// migration 039) and identify the specific contract; they are zero/nil for all
+	// other asset classes. Multiplier is the contract multiplier (100 for standard
+	// US equity options, 1 otherwise) and makes P&L instrument-correct — see ExitPnLM.
+	AssetClass string
+	Underlying string
+	Expiry     *time.Time
+	Strike     float64
+	Right      string // "C" | "P"
+	OCCSymbol  string
+	Multiplier int
+	// ExitOrderID is the broker order id of the in-flight sell-to-close, persisted
+	// so restart recovery can poll it for the real fill (options only; empty until
+	// an exit is submitted). Cleared implicitly when the trade closes.
+	ExitOrderID string
 }
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
@@ -149,18 +165,171 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 	if trade.ScaleOutParentID != nil && *trade.ScaleOutParentID != "" {
 		parentID = *trade.ScaleOutParentID
 	}
+	// Instrument identity: default asset_class to 'equity' and multiplier to 1 so
+	// existing callers (equity/forex/futures) that leave these zero behave exactly
+	// as before. The option-specific columns are written as NULL unless set.
+	assetClass := trade.AssetClass
+	if assetClass == "" {
+		assetClass = "equity"
+	}
+	multiplier := trade.Multiplier
+	if multiplier == 0 {
+		multiplier = 1
+	}
+	var strike any
+	if trade.Strike != 0 {
+		strike = trade.Strike
+	}
 	var id string
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id, asset_class, underlying, expiry, strike, "right", occ_symbol, multiplier)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
 		RETURNING id`,
 		trade.SessionID, trade.Ticker, trade.Side,
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
 		trade.Qty, nullableString(trade.OrderID), trade.Status,
 		nullableString(trade.TpOrderID), nullableString(trade.SlOrderID),
 		nullableString(trade.ScaleOutRole), parentID,
+		assetClass, nullableString(trade.Underlying), trade.Expiry,
+		strike, nullableString(trade.Right), nullableString(trade.OCCSymbol), multiplier,
 	).Scan(&id)
 	return id, err
+}
+
+// GetORBTradeByID returns a single ORB trade with full instrument identity,
+// including the option-contract columns (Issue #410). It is the canonical
+// full-fidelity read for the options-ORB router, exits, and reconciler; the
+// list readers select only the fields their callers need and leave the option
+// columns zero. Returns (nil, nil) when no row matches.
+func GetORBTradeByID(ctx context.Context, db *pgxpool.Pool, id string) (*ORBTrade, error) {
+	var t ORBTrade
+	err := db.QueryRow(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at,
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), COALESCE(underlying,''), expiry,
+		       COALESCE(strike,0), COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1)
+		FROM orb_trades WHERE id=$1`, id,
+	).Scan(
+		&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+		&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+		&t.Qty, &t.OrderID, &t.Status,
+		&t.FillPrice, &t.PnL,
+		&t.TpOrderID, &t.SlOrderID,
+		&t.ExitPrice, &t.ExitType, &t.ExitSource,
+		&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+		&t.ScaleOutRole, &t.ScaleOutParentID,
+		&t.AssetClass, &t.Underlying, &t.Expiry,
+		&t.Strike, &t.Right, &t.OCCSymbol, &t.Multiplier,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// GetOpenFilledOptionTrades returns every filled options-ORB trade (asset_class
+// 'option', status 'filled') across all sessions, oldest first, with full contract
+// identity. The app-managed exit watcher (#415) uses it to find live option
+// positions to manage — the generic list readers omit the option columns, so this
+// dedicated reader selects them.
+func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, session_id, ticker, side,
+		       COALESCE(entry_stop,0), COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(qty,0), COALESCE(order_id,''), status,
+		       COALESCE(fill_price,0), COALESCE(pnl,0),
+		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
+		       created_at, filled_at, closed_at,
+		       COALESCE(underlying,''), expiry, COALESCE(strike,0),
+		       COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1),
+		       COALESCE(exit_order_id,'')
+		FROM orb_trades
+		WHERE status='filled' AND asset_class='option'
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ORBTrade
+	for rows.Next() {
+		var t ORBTrade
+		t.AssetClass = "option"
+		if err := rows.Scan(
+			&t.ID, &t.SessionID, &t.Ticker, &t.Side,
+			&t.EntryStop, &t.StopLoss, &t.TakeProfit,
+			&t.Qty, &t.OrderID, &t.Status,
+			&t.FillPrice, &t.PnL,
+			&t.ExitPrice, &t.ExitType, &t.ExitSource,
+			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
+			&t.Underlying, &t.Expiry, &t.Strike,
+			&t.Right, &t.OCCSymbol, &t.Multiplier,
+			&t.ExitOrderID,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SetORBTradeExitOrderID persists the in-flight exit sell's broker order id on a
+// trade row so restart recovery can poll it for the real fill (options #415/#416).
+func SetORBTradeExitOrderID(ctx context.Context, db *pgxpool.Pool, tradeID, exitOrderID string) error {
+	_, err := db.Exec(ctx, `UPDATE orb_trades SET exit_order_id=$1 WHERE id=$2`, exitOrderID, tradeID)
+	return err
+}
+
+// GetManagedOptionOCCSymbols returns the set of OCC symbols for non-terminal
+// options-ORB trades (status pending or filled). The options orphan detector
+// (#416) treats a broker option position whose OCC is not in this set as an
+// unexplained orphan. Pending is included so a just-filled entry the fill-poll
+// hasn't marked yet is not falsely flagged.
+func GetManagedOptionOCCSymbols(ctx context.Context, db *pgxpool.Pool) (map[string]bool, error) {
+	qty, err := GetManagedOptionQuantities(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(qty))
+	for occ := range qty {
+		out[occ] = true
+	}
+	return out, nil
+}
+
+// GetManagedOptionQuantities returns the SUM of contract quantities for non-terminal
+// options-ORB trades (status pending or filled) per OCC symbol. The orphan detector
+// (#416) compares this against the broker-held quantity so a broker position of 3
+// contracts explained by a managed row of only 1 is flagged as a 2-contract surplus,
+// not treated as fully managed by OCC presence alone.
+func GetManagedOptionQuantities(ctx context.Context, db *pgxpool.Pool) (map[string]float64, error) {
+	rows, err := db.Query(ctx, `
+		SELECT occ_symbol, COALESCE(SUM(qty),0) FROM orb_trades
+		WHERE asset_class='option' AND status IN ('pending','filled') AND occ_symbol IS NOT NULL
+		GROUP BY occ_symbol`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]float64)
+	for rows.Next() {
+		var occ string
+		var qty float64
+		if err := rows.Scan(&occ, &qty); err != nil {
+			return nil, err
+		}
+		out[occ] = qty
+	}
+	return out, rows.Err()
 }
 
 // CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
@@ -184,6 +353,23 @@ func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string
 		SET status='filled', fill_price=$1, filled_at=NOW()
 		WHERE order_id=$2 AND status='pending'`,
 		fillPrice, orderID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// FillORBTradePartialByOrderID marks a pending trade filled AND overwrites qty with
+// the actually-filled contract count. Used when an option limit entry only partially
+// fills: the row must reflect the real quantity, otherwise the exit sweep's
+// full-quantity fallback (when the broker positions read is unavailable) could sell
+// more contracts than are actually held.
+func FillORBTradePartialByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64, filledQty int) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='filled', fill_price=$1, filled_at=NOW(), qty=$2
+		WHERE order_id=$3 AND status='pending'`,
+		fillPrice, filledQty, orderID)
 	if err != nil {
 		return false, err
 	}
@@ -334,7 +520,10 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id
-		FROM orb_trades WHERE status='filled'
+		-- Options-ORB rows are excluded: they have their own reader
+		-- (GetOpenFilledOptionTrades) and exit path (#415); this keeps the
+		-- equity/forex/futures exit reconcilers from touching option trades.
+		FROM orb_trades WHERE status='filled' AND COALESCE(asset_class,'equity') <> 'option'
 		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
 		return nil, err
@@ -376,7 +565,10 @@ func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade,
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id
-		FROM orb_trades WHERE status='pending'
+		-- Options-ORB rows excluded (see GetOpenFilledORBTrades): the option entry
+		-- fill-poll is order-ID driven, and fill_reconcile/split-orphan sweeps are
+		-- forex-scoped, so options never need this reader.
+		FROM orb_trades WHERE status='pending' AND COALESCE(asset_class,'equity') <> 'option'
 		ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -587,7 +779,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), COALESCE(occ_symbol,''), COALESCE("right",''), COALESCE(strike,0)
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -607,6 +800,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OCCSymbol, &t.Right, &t.Strike,
 		); err != nil {
 			return nil, err
 		}

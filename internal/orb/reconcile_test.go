@@ -13,6 +13,7 @@ import (
 type stubExecutor struct {
 	statuses    map[string]execution.OrderResult
 	statusCalls []string
+	positions   []execution.Position
 }
 
 func (e *stubExecutor) GetOrderStatus(_ context.Context, id string) (execution.OrderResult, error) {
@@ -27,7 +28,7 @@ func (e *stubExecutor) PlaceOrder(_ context.Context, _ execution.OrderRequest) (
 }
 func (e *stubExecutor) CancelOrder(_ context.Context, _ string) error { return nil }
 func (e *stubExecutor) GetPositions(_ context.Context) ([]execution.Position, error) {
-	return nil, nil
+	return e.positions, nil
 }
 func (e *stubExecutor) GetAccount(_ context.Context) (execution.AccountInfo, error) {
 	return execution.AccountInfo{}, nil
