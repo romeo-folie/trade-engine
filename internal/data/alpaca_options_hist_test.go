@@ -2,8 +2,10 @@ package data
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -164,5 +166,53 @@ func TestQuotesAt_PagesUntilAllSymbolsResolved(t *testing.T) {
 	}
 	if len(out) != 2 || out["AAA240607C00530000"].Bid != 1.20 || out["BBB240607C00540000"].Ask != 0.84 {
 		t.Fatalf("both symbols must resolve across pages, got %v", out)
+	}
+}
+
+// TestQuotesAt_ChunksOver100Symbols guards the Alpaca 100-symbol cap: a >100-symbol
+// request must be split into multiple ≤100 batches (one over-cap request 400s).
+func TestQuotesAt_ChunksOver100Symbols(t *testing.T) {
+	var maxBatch, requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		syms := strings.Split(r.URL.Query().Get("symbols"), ",")
+		if len(syms) > maxBatch {
+			maxBatch = len(syms)
+		}
+		if len(syms) > 100 {
+			http.Error(w, `{"message":"too many symbols"}`, http.StatusBadRequest)
+			return
+		}
+		// Echo one quote back per requested symbol.
+		var b strings.Builder
+		b.WriteString(`{"quotes":{`)
+		for i, s := range syms {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `%q:[{"t":"2024-06-07T13:45:00Z","bp":1.20,"ap":1.24}]`, s)
+		}
+		b.WriteString(`}}`)
+		_, _ = w.Write([]byte(b.String()))
+	}))
+	defer srv.Close()
+
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL)
+	syms := make([]string, 250)
+	for i := range syms {
+		syms[i] = fmt.Sprintf("SPY240607C%08d", 500000+i*1000)
+	}
+	out, err := a.QuotesAt(context.Background(), syms, time.Date(2024, 6, 7, 13, 46, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("QuotesAt: %v", err)
+	}
+	if maxBatch > 100 {
+		t.Errorf("a batch requested %d symbols; Alpaca caps at 100", maxBatch)
+	}
+	if requests < 3 { // 250 → 100+100+50
+		t.Errorf("expected ≥3 chunked requests, got %d", requests)
+	}
+	if len(out) != 250 {
+		t.Errorf("expected all 250 symbols resolved across chunks, got %d", len(out))
 	}
 }

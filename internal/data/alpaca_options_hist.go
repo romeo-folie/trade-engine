@@ -174,6 +174,10 @@ const quoteLookback = 15 * time.Minute
 // limit 1000 = 50k quotes, ample for a whole DTE window over a 15-minute window.
 const maxOptionQuotePages = 50
 
+// maxSymbolsPerQuoteRequest is Alpaca's cap on the multi-symbol `symbols` list for
+// the option quotes endpoint. Larger requests 400.
+const maxSymbolsPerQuoteRequest = 100
+
 // QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It asks
 // for the [asOf-quoteLookback, asOf] window sorted DESCENDING with limit=1, so the
 // single returned quote is the newest at or before the evaluation instant — never a
@@ -229,12 +233,27 @@ func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, a
 	if len(occSymbols) == 0 {
 		return out, nil
 	}
-	remaining := make(map[string]bool, len(occSymbols))
-	for _, s := range occSymbols {
+	// Alpaca caps the multi-symbol `symbols` list at 100; a SPY/QQQ DTE window often
+	// exceeds that, and an over-cap request 400s. Chunk into ≤100-symbol batches, each
+	// paged, merging into one result.
+	for i := 0; i < len(occSymbols); i += maxSymbolsPerQuoteRequest {
+		end := min(i+maxSymbolsPerQuoteRequest, len(occSymbols))
+		if err := a.quotesAtChunk(ctx, occSymbols[i:end], asOf, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// quotesAtChunk resolves the newest NBBO for one ≤100-symbol chunk (paged) and writes
+// results into out.
+func (a *AlpacaOptionsHist) quotesAtChunk(ctx context.Context, chunk []string, asOf time.Time, out map[string]execution.OptionNBBO) error {
+	remaining := make(map[string]bool, len(chunk))
+	for _, s := range chunk {
 		remaining[s] = true
 	}
 	params := url.Values{}
-	params.Set("symbols", strings.Join(occSymbols, ","))
+	params.Set("symbols", strings.Join(chunk, ","))
 	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
 	params.Set("end", asOf.UTC().Format(time.RFC3339))
 	params.Set("sort", "desc")
@@ -242,8 +261,8 @@ func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, a
 	for range maxOptionQuotePages {
 		var resp alpacaOptQuotesResponse
 		if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
-			slog.Warn("alpaca options: batch historical quotes failed", "n", len(occSymbols), "as_of", asOf, "err", err)
-			return nil, err
+			slog.Warn("alpaca options: batch historical quotes failed", "n", len(chunk), "as_of", asOf, "err", err)
+			return err
 		}
 		for sym, quotes := range resp.Quotes {
 			if !remaining[sym] || len(quotes) == 0 {
@@ -267,7 +286,7 @@ func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, a
 		}
 		params.Set("page_token", resp.NextPageToken)
 	}
-	return out, nil
+	return nil
 }
 
 // ── historical bars (data API) ───────────────────────────────────────────────
