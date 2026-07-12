@@ -60,6 +60,17 @@ type ORBTradeRow struct {
 // IsOption reports whether the row is an options-ORB trade.
 func (r ORBTradeRow) IsOption() bool { return r.AssetClass == "option" }
 
+// CostBasis is the capital deployed by the entry fill: premium × contracts × 100 for
+// options (premium is quoted per share, 100 shares/contract), price × shares
+// otherwise. Without the ×100, an options row understates deployed capital 100×.
+func (r ORBTradeRow) CostBasis() float64 {
+	mult := 1.0
+	if r.IsOption() {
+		mult = 100
+	}
+	return r.FillPrice * float64(r.Qty) * mult
+}
+
 // Label is the instrument label for display: the OCC contract for options
 // (e.g. "SPY C551"), otherwise the plain ticker.
 func (r ORBTradeRow) Label() string {
@@ -223,7 +234,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 					losses++
 				}
 				if t.FillPrice != 0 {
-					totalCost += t.FillPrice * float64(t.Qty)
+					totalCost += t.CostBasis()
 				}
 				exitStr := ""
 				if t.ExitPrice != 0 {
@@ -240,7 +251,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 					colorPnL(t.PnL))
 			case "filled":
 				if t.FillPrice != 0 {
-					totalCost += t.FillPrice * float64(t.Qty)
+					totalCost += t.CostBasis()
 				}
 				fmt.Fprintf(&sb, "  %-6s %-4s  [open    ]  qty=%-4d  fill=%.4f  stop=%.4f  target=%.4f\n",
 					t.Label(), strings.ToUpper(t.Side),

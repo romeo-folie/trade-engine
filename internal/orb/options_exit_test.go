@@ -226,6 +226,31 @@ func TestOptionTradeStaleAcrossSessions(t *testing.T) {
 	}
 }
 
+// TestShouldDeferFreshOptionExit: a working-orders read failure defers a fresh
+// stop/target/time exit (avoids a double-sell → naked short), but NEVER defers the
+// session-ending flatten (hard no-overnight invariant).
+func TestShouldDeferFreshOptionExit(t *testing.T) {
+	cases := []struct {
+		name           string
+		workingSellsOK bool
+		sessionEnding  bool
+		wantDefer      bool
+	}{
+		{"read ok, normal exit", true, false, false},
+		{"read ok, flatten", true, true, false},
+		{"read failed, non-flatten → defer", false, false, true},
+		{"read failed, flatten → NEVER defer", false, true, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := shouldDeferFreshOptionExit(tc.workingSellsOK, tc.sessionEnding); got != tc.wantDefer {
+				t.Errorf("shouldDeferFreshOptionExit(%v,%v) = %v; want %v",
+					tc.workingSellsOK, tc.sessionEnding, got, tc.wantDefer)
+			}
+		})
+	}
+}
+
 // TestHeldOptionQuantities_TreatsShortAsFlat verifies the exit sweep counts only
 // LONG option contracts: a short position (negative qty or Side "short") is not
 // "held to close", so the sweep won't sell into a deeper short.

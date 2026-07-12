@@ -75,7 +75,11 @@ func AssembleSignals(underlying string, candles []data.Candle, cfg AssembleConfi
 		if len(bars) < cfg.RangeMinutes+1 {
 			continue // not enough of a session to form a range and a breakout
 		}
-		sessionEnd := day.Add(time.Duration(endMin) * time.Minute)
+		// Build the session bounds as WALL-CLOCK ET times, not midnight+duration: on a
+		// DST-transition day the latter drifts an hour (spring-forward would put the EOD
+		// flatten past the last kept bar so it never fires; fall-back would flatten an
+		// hour early). This matches rthBars, which filters by wall-clock minute.
+		sessionEnd := etTimeOnDay(day, endMin)
 
 		// Opening range from the first RangeMinutes bars (live RangeBuffer).
 		rb := orb.NewRangeBuffer(underlying, cfg.RangeMinutes)
@@ -106,7 +110,7 @@ func AssembleSignals(underlying string, candles []data.Candle, cfg AssembleConfi
 		// entry-cancel cutoff (sessionCleanupMinutes = open + 60m). Measuring from the
 		// range lock instead would keep accepting breakouts for RangeMinutes longer than
 		// production would — replaying trades the live path had already cancelled.
-		sessionOpenTime := day.Add(time.Duration(openMin) * time.Minute)
+		sessionOpenTime := etTimeOnDay(day, openMin)
 		entryDeadline := sessionOpenTime.Add(time.Duration(cfg.EntryWindowMins) * time.Minute)
 		side, bi, ok := firstBreakout(watch, buy, sell, entryDeadline)
 		if !ok {
@@ -195,6 +199,13 @@ func rthBars(day []data.Candle, openMin, endMin int) []data.Candle {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
 	return out
+}
+
+// etTimeOnDay returns the wall-clock ET instant at minutesOfDay on day's ET calendar
+// date. time.Date resolves the correct UTC offset per date, so it is DST-safe (unlike
+// adding a fixed duration to an ET-midnight instant across a transition).
+func etTimeOnDay(day time.Time, minutesOfDay int) time.Time {
+	return time.Date(day.Year(), day.Month(), day.Day(), minutesOfDay/60, minutesOfDay%60, 0, 0, etLoc)
 }
 
 // parseHHMM parses "HH:MM" to minutes-of-day, returning def on any malformed input.

@@ -90,7 +90,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	// Adopting these covers the restart case: pendingOptionExits is in-memory, so
 	// after a restart an in-flight exit sell would be untracked and re-sent — the
 	// broker's own open-orders are the durable source of truth.
-	workingSells := s.workingOptionSells(ctx)
+	workingSells, workingSellsOK := s.workingOptionSells(ctx)
 	for _, t := range trades {
 		// A position carried over from a prior ET trading day (process was down, or a
 		// sell was rejected at the last flatten) must be closed as soon as options are
@@ -156,6 +156,22 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			continue
 		}
 
+		// Fail CLOSED on a working-orders read failure — but ONLY for non-flatten exits.
+		// A fresh sell during the outage could double a prior process's in-flight sell we
+		// can't see (unpersisted exit-order id after a restart; in-process sells are
+		// already tracked in pendingOptionExits and polled above regardless) into a naked
+		// short. Deferring a stop/target/time exit is safe: max loss on a long option is
+		// the premium already paid, and the next sweep retries once the read recovers.
+		// The end-of-session flatten is a HARD no-overnight invariant, so it must NEVER
+		// be deferred — let it proceed and rely on the orphan-position detector (#416) to
+		// flag any rare resulting double-sell, which is far better than an overnight hold
+		// through expiry/assignment.
+		if shouldDeferFreshOptionExit(workingSellsOK, sessionEnding) {
+			slog.Warn("orb options: working-orders read unavailable; deferring fresh non-flatten exit to avoid a double-sell",
+				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason)
+			continue
+		}
+
 		px, confirmed, orderID, err := s.optionExit.closeOption(ctx, t, sellQty)
 		if err != nil {
 			slog.Error("orb options: exit close failed",
@@ -188,6 +204,18 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason, qty: sellQty}
 		}
 	}
+}
+
+// shouldDeferFreshOptionExit decides whether to skip a FRESH exit sell this sweep.
+// It defers only when the working-orders read failed (workingSellsOK=false) AND the
+// exit is NOT a hard session-ending flatten. Deferring a stop/target/time exit is
+// safe (max loss on a long option is the premium already paid, and the next sweep
+// retries once the read recovers) and avoids doubling an unseen in-flight sell into
+// a naked short. The end-of-session flatten is a hard no-overnight invariant and is
+// NEVER deferred, even during a read outage — an overnight hold through expiry is
+// worse than a rare double-sell (which the orphan detector catches).
+func shouldDeferFreshOptionExit(workingSellsOK, sessionEnding bool) bool {
+	return !workingSellsOK && !sessionEnding
 }
 
 // pendingExit records an exit sell that was submitted but not yet confirmed filled,
@@ -265,15 +293,20 @@ func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, 
 // workingOptionSells returns the broker's open sell-to-close option orders keyed by
 // OCC symbol (orderID as value), or nil when the broker doesn't expose working
 // orders or the read fails. Used to re-adopt an in-flight exit after a restart.
-func (s *ORBScheduler) workingOptionSells(ctx context.Context) map[string]string {
+// workingOptionSells returns the broker's open sell-to-close option orders keyed by
+// OCC symbol, and ok=false ONLY when the read genuinely failed (so the caller can
+// fail closed on fresh sells). A broker that doesn't expose working orders returns
+// (nil, true): there is no working-order concept to be blind to, and those executors
+// use different exit mechanics — treating that as "unknown" would wedge every sweep.
+func (s *ORBScheduler) workingOptionSells(ctx context.Context) (map[string]string, bool) {
 	lister, ok := s.executor.(execution.WorkingOrdersLister)
 	if !ok {
-		return nil
+		return nil, true
 	}
 	orders, err := lister.GetWorkingOrders(ctx)
 	if err != nil {
 		slog.Warn("orb options: working orders read failed", "err", err)
-		return nil
+		return nil, false
 	}
 	out := make(map[string]string)
 	for _, o := range orders {
@@ -281,7 +314,7 @@ func (s *ORBScheduler) workingOptionSells(ctx context.Context) map[string]string
 			out[o.Ticker] = o.OrderID
 		}
 	}
-	return out
+	return out, true
 }
 
 // heldOptionQuantities returns the count of LONG contracts the broker currently

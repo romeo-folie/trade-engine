@@ -132,3 +132,16 @@ func TestRenderORBPanelPendingNoFooter(t *testing.T) {
 		t.Errorf("expected no footer for all-pending trades, got:\n%s", out)
 	}
 }
+
+func TestORBTradeRowCostBasis(t *testing.T) {
+	// Equity: price × shares.
+	eq := ORBTradeRow{FillPrice: 150, Qty: 10}
+	if got := eq.CostBasis(); got != 1500 {
+		t.Errorf("equity cost basis = %v; want 1500", got)
+	}
+	// Option: premium × contracts × 100 (was 100× understated without the multiplier).
+	opt := ORBTradeRow{FillPrice: 2.00, Qty: 3, AssetClass: "option"}
+	if got := opt.CostBasis(); got != 600 {
+		t.Errorf("option cost basis = %v; want 600 (2.00 × 3 × 100)", got)
+	}
+}

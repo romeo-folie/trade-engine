@@ -61,6 +61,12 @@ func (c chainQuoter) OptionMid(ctx context.Context, underlying, occSymbol string
 // The earnings provider is intentionally nil for now: v1 enables ETF underlyings
 // (SPY/QQQ), which are earnings-exempt. A single-name underlying with no earnings
 // provider fails closed at the earnings gate (never trades) until one is wired.
+//
+// IV-RANK SEEDING IS A PREREQUISITE: the IVRankService below reads option_iv_history
+// and fails CLOSED below iv_min_samples stored days, so the gate aborts every breakout
+// until that table is seeded. Run `te options backfill-iv` before/daily alongside the
+// session (e.g. from te-switch) to populate it — otherwise options-ORB places zero
+// trades even with a valid OPRA feed.
 func (s *ORBScheduler) SetupOptionsORB(cfg config.OptionsORBConfig, broker *execution.AlpacaBroker) {
 	if !cfg.Enabled || broker == nil {
 		return

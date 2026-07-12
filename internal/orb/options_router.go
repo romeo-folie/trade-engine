@@ -56,6 +56,21 @@ func (r *OptionsRouter) Handles(ticker string) bool {
 	return r != nil && r.underlyings[strings.ToUpper(ticker)]
 }
 
+// Underlyings returns the options-mode symbols (upper-cased). Nil-safe (empty on a
+// nil router). Used to fail closed on an option-guard read error: when the sweep
+// can't confirm whether an option is already open, every option underlying is
+// blocked for that tick so a fresh entry can't stack on an unseen position.
+func (r *OptionsRouter) Underlyings() []string {
+	if r == nil {
+		return nil
+	}
+	out := make([]string, 0, len(r.underlyings))
+	for u := range r.underlyings {
+		out = append(out, u)
+	}
+	return out
+}
+
 // SizeOptionContracts returns the number of whole contracts to buy for a mid price
 // and multiplier under a premium budget and optional max-loss cap. Long-only, so
 // max loss == premium == contracts × cost; the cap is a second bound on the same

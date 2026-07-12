@@ -412,7 +412,15 @@ func (s *ORBScheduler) tickersWithOpenFilledTrades(ctx context.Context) map[stri
 			out[t.Ticker] = struct{}{}
 		}
 	} else {
-		slog.Warn("orb: could not check open filled option trades before placing brackets", "err", oerr)
+		// FAIL CLOSED for options only: unlike the equity path (fail-open so a transient
+		// DB error never halts all trading), a blind option guard would let a fresh
+		// option entry stack on an unseen open position — doubling premium at risk. We
+		// can't enumerate which underlyings are open, so block ALL option-mode
+		// underlyings for this tick. Equity/forex/futures entries are unaffected.
+		slog.Warn("orb: option-trades read failed — blocking all option-mode entries this tick (fail closed)", "err", oerr)
+		for _, u := range s.optionsRouter.Underlyings() {
+			out[u] = struct{}{}
+		}
 	}
 	return out
 }

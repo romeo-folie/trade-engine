@@ -17,6 +17,17 @@ It attaches to the equities/newyork ORB scheduler and is **default-off**.
    15-minute delayed and unusable for an open-momentum strategy; the adapter logs
    a warning when it runs on a non-`opra` feed.
 3. A configured Alpaca stocks broker (`markets.stocks`).
+4. **Seeded IV-Rank history** — the IV-Rank gate reads `option_iv_history` and
+   **fails closed** below `iv_min_samples` stored days, so an unseeded table makes
+   options-ORB place **zero trades**. Run `te options backfill-iv` before starting
+   an options session, and daily (e.g. from te-switch), to keep the trailing IV
+   window populated:
+   ```bash
+   te options backfill-iv --lookback-days 60   # seeds option_iv_history (source=derived)
+   ```
+   It derives daily ATM IV from Alpaca historical option quotes using the *same*
+   `BuildIVSeries` derivation the backtest uses, so the live gate ranks against an
+   identical series. Idempotent; a `derived` row never overwrites a live-recorded one.
 
 ## How it works
 

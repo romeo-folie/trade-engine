@@ -125,7 +125,11 @@ func (p *HistChainProvider) BuildIVSeries(ctx context.Context, underlying string
 		if !ok {
 			continue
 		}
-		out = append(out, options.DailyIV{Date: dayFloorLoc(day), ATMIV: iv})
+		// Stamp at the actual sample INSTANT (not midnight): the IVRank as-of filter is
+		// Date <= asOf, so a midnight stamp would let a same-day breakout BEFORE the
+		// sample time (e.g. a short opening range or a later ref minute) consume IV that
+		// hadn't been observed yet — lookahead. At the ref instant the filter excludes it.
+		out = append(out, options.DailyIV{Date: ref, ATMIV: iv})
 	}
 	return out, nil
 }

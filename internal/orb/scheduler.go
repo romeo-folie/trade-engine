@@ -1799,13 +1799,18 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					if orderID == "" {
 						continue
 					}
-					// Reconcile already-filled orders instead of cancelling them. A PARTIAL
-					// fill counts too (res.FilledQty > 0): recording the filled portion as
-					// filled — and cancelling the unfilled remainder — keeps the held
-					// contracts managed instead of orphaning them under a 'cancelled' row.
-					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && (res.Status == "filled" || res.FilledQty > 0) {
+					// Reconcile already-filled orders instead of cancelling them. For OPTIONS
+					// a PARTIAL fill counts too (res.FilledQty > 0): recording the filled
+					// portion — and cancelling the unfilled remainder — keeps the held
+					// contracts managed instead of orphaning them. The partial branch is
+					// gated on isOption so equity/futures brackets keep main's lifecycle: a
+					// partial there still falls through to 'cancelled' (their TP/SL legs were
+					// placed for the full size, so overwriting qty would desync DB vs broker).
+					tc := s.trackedTrades[orderID]
+					isOption := tc != nil && tc.isOption
+					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && (res.Status == "filled" || (isOption && res.FilledQty > 0)) {
 						price := res.FilledPrice
-						if tc := s.trackedTrades[orderID]; tc != nil && !tc.isOption {
+						if tc != nil && !tc.isOption {
 							if corrected, was := sanitizeEntryFill(sides[i], tc.entryStop, price); was {
 								slog.Warn("orb: session cleanup: implausible entry fill — recording stop level instead",
 									"side", sides[i], "ticker", ticker, "reported", price, "entry_stop", tc.entryStop, "recorded", corrected)
