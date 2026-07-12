@@ -85,6 +85,13 @@ describes the code that would ship.
   trade) as the mid. A full NBBO-mid reconstruction would be one quote read per minute
   per trade; the last-trade proxy is the standard, bounded approximation. Bars with no
   trade in a minute leave that path point unpriced (see *Honest accounting*).
+- **Close-only exit path → slightly optimistic.** Entries use each bar's High/Low (the
+  resting-stop touch), but the exit walk evaluates the underlying stop/target against
+  the bar *close*. So an intrabar stop/target touch that reverses before the close is
+  invisible to the backtest — the trade is not exited on that bar. This mirrors the
+  live 15-second snapshot sweep (which also only sees discrete prices, not every tick),
+  but it does bias results **slightly optimistic** vs. a tick-level fill model: read win
+  rates with that in mind.
 - **IV-rank cold start.** The IV-Rank gate needs `iv_min_samples` seeded days before
   the first backtest day. The runner seeds `[from − lookback, to]`; a window whose
   lookback predates Feb-2024 coverage yields a short series and the gate fails closed

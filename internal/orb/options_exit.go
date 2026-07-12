@@ -3,6 +3,7 @@ package orb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"time"
@@ -19,6 +20,13 @@ const optionExitCheckInterval = 15 * time.Second
 // the 16:00 ET US options close) — after it, any open option is flattened so
 // nothing is held overnight (no assignment/expiration risk).
 const optionsFlattenCutoffMin = 15*60 + 50
+
+// OptionsFlattenCutoffET returns the intraday flatten cutoff as "HH:MM" ET. The
+// options backtest derives its default session-end from this so the live flatten time
+// and the backtest's EOD flatten can never silently drift apart.
+func OptionsFlattenCutoffET() string {
+	return fmt.Sprintf("%02d:%02d", optionsFlattenCutoffMin/60, optionsFlattenCutoffMin%60)
+}
 
 // optionsSessionEnding reports whether now is at/after the intraday flatten cutoff
 // in US/Eastern, regardless of the clock's own zone.
@@ -78,6 +86,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	if len(trades) == 0 {
 		return
 	}
+	s.optionExit.beginSweep() // memoize underlying prices across this sweep's positions
 	now := s.now()
 	clockSessionEnding := optionsSessionEnding(now)
 	// Snapshot broker-held option positions once (keyed by OCC symbol). If a prior
@@ -113,12 +122,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 				if !exit || reason == "" {
 					reason = optExitEOD
 				}
-				adoptQty := t.Qty
-				if heldQty != nil {
-					if h := int(heldQty[t.OCCSymbol]); h < adoptQty {
-						adoptQty = h
-					}
-				}
+				adoptQty := capToHeld(t.Qty, heldQty, t.OCCSymbol)
 				s.pendingOptionExits[t.ID] = pendingExit{orderID: oid, reason: reason, qty: adoptQty}
 			}
 		}
@@ -141,12 +145,7 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 		// Cap the sell at the broker-held contract count so a prior partial fill (or
 		// an already-flat position) can never over-sell into a short. When the
 		// positions read failed (heldQty nil) we fall back to the full DB quantity.
-		sellQty := t.Qty
-		if heldQty != nil {
-			if h := int(heldQty[t.OCCSymbol]); h < sellQty {
-				sellQty = h
-			}
-		}
+		sellQty := capToHeld(t.Qty, heldQty, t.OCCSymbol)
 		if heldQty != nil && sellQty <= 0 {
 			// Already flat / fully closed by a prior partial — do NOT re-sell. Record
 			// the close with a best-effort price; the reconciler (#416) heals it.
@@ -204,6 +203,20 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason, qty: sellQty}
 		}
 	}
+}
+
+// capToHeld caps qty at the broker-held contract count for occ, so a prior partial
+// fill (or an already-flat position) can never over-sell into a short. A nil heldQty
+// (the positions read failed) returns qty unchanged — the callers fall back to the
+// full DB quantity in that transient window.
+func capToHeld(qty int, heldQty map[string]float64, occ string) int {
+	if heldQty == nil {
+		return qty
+	}
+	if h := int(heldQty[occ]); h < qty {
+		return h
+	}
+	return qty
 }
 
 // shouldDeferFreshOptionExit decides whether to skip a FRESH exit sell this sweep.
@@ -433,6 +446,15 @@ type OptionExitManager struct {
 	quoter          OptionQuoter
 	placer          optionsPlacer
 	timeExitMinutes int
+
+	// sweepPx memoizes underlying prices within a single exit sweep, so N option
+	// positions on the same underlying share one quote fetch. Reset by beginSweep.
+	sweepPx map[string]underlyingPx
+}
+
+type underlyingPx struct {
+	px float64
+	ok bool
 }
 
 // NewOptionExitManager builds the manager. quoter may be nil (time exit disabled).
@@ -440,12 +462,31 @@ func NewOptionExitManager(pricer UnderlyingPricer, quoter OptionQuoter, placer o
 	return &OptionExitManager{pricer: pricer, quoter: quoter, placer: placer, timeExitMinutes: timeExitMinutes}
 }
 
+// beginSweep resets the per-sweep underlying-price memo. Called once at the top of
+// each exit sweep so repeated positions on one underlying don't each refetch its price.
+func (m *OptionExitManager) beginSweep() { m.sweepPx = make(map[string]underlyingPx) }
+
+// underlyingPrice returns the underlying price, memoized within the current sweep
+// (including a failed read, so we don't retry per position in one sweep).
+func (m *OptionExitManager) underlyingPrice(ctx context.Context, underlying string) (float64, bool) {
+	if m.sweepPx != nil {
+		if v, ok := m.sweepPx[underlying]; ok {
+			return v.px, v.ok
+		}
+	}
+	px, ok := m.pricer.UnderlyingPrice(ctx, underlying)
+	if m.sweepPx != nil {
+		m.sweepPx[underlying] = underlyingPx{px: px, ok: ok}
+	}
+	return px, ok
+}
+
 // plan decides the exit reason for one filled option trade. It returns ("", false)
 // to hold — including when the underlying price is unavailable and the session is
 // not ending, since acting on missing data could close a healthy position. A
 // session-ending position is always flattened, even without a fresh price.
 func (m *OptionExitManager) plan(ctx context.Context, t store.ORBTrade, now time.Time, sessionEnding bool) (string, bool) {
-	px, ok := m.pricer.UnderlyingPrice(ctx, t.Underlying)
+	px, ok := m.underlyingPrice(ctx, t.Underlying)
 	if !ok {
 		if sessionEnding {
 			return optExitEOD, true

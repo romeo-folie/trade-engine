@@ -28,7 +28,7 @@ type AssembleConfig struct {
 	RangeMinutes    int     // opening-range length in minutes (e.g. 15)
 	EntryWindowMins int     // minutes after SESSION OPEN that a breakout may still fire (matches the live scheduler's cleanup cutoff = open + 60m); NOT measured from the range lock
 	SessionOpenET   string  // "HH:MM" ET regular-session open; default "09:30"
-	SessionEndET    string  // "HH:MM" ET hard flatten; default "15:50"
+	SessionEndET    string  // "HH:MM" ET hard flatten; default = orb.OptionsFlattenCutoffET() (single-sourced with live)
 	RiskReward      float64 // target = entry ± risk × RR (feeds orb.ComputeBracket)
 }
 
@@ -43,7 +43,8 @@ func (c AssembleConfig) withDefaults() AssembleConfig {
 		c.SessionOpenET = "09:30"
 	}
 	if c.SessionEndET == "" {
-		c.SessionEndET = "15:50"
+		// Single-sourced from the LIVE flatten cutoff so backtest EOD parity can't drift.
+		c.SessionEndET = orb.OptionsFlattenCutoffET()
 	}
 	if c.RiskReward <= 0 {
 		c.RiskReward = 2
@@ -112,7 +113,7 @@ func AssembleSignals(underlying string, candles []data.Candle, cfg AssembleConfi
 		// production would — replaying trades the live path had already cancelled.
 		sessionOpenTime := etTimeOnDay(day, openMin)
 		entryDeadline := sessionOpenTime.Add(time.Duration(cfg.EntryWindowMins) * time.Minute)
-		side, bi, ok := firstBreakout(watch, buy, sell, entryDeadline)
+		side, bi, ok := orb.FirstBreakout(watch, buy, sell, entryDeadline)
 		if !ok {
 			continue
 		}
@@ -145,33 +146,6 @@ func AssembleSignals(underlying string, candles []data.Candle, cfg AssembleConfi
 		})
 	}
 	return out
-}
-
-// firstBreakout mirrors the live resting-stop fill rule (and orbreplay's twin): the
-// first bar whose High crosses the buy entry stop or whose Low crosses the sell
-// entry stop wins; a bar that trips both resolves by its own direction (close vs
-// open). Bars at/after the entry deadline are ignored — live would have cancelled
-// the resting entry orders by then.
-func firstBreakout(watch []data.Candle, buy, sell orb.BracketParams, entryDeadline time.Time) (side string, idx int, ok bool) {
-	for i, c := range watch {
-		if !c.Timestamp.Before(entryDeadline) {
-			break
-		}
-		buyHit := buy.EntryStop > 0 && c.High >= buy.EntryStop
-		sellHit := sell.EntryStop > 0 && c.Low <= sell.EntryStop
-		switch {
-		case buyHit && sellHit:
-			if c.Close >= c.Open {
-				return "buy", i, true
-			}
-			return "sell", i, true
-		case buyHit:
-			return "buy", i, true
-		case sellHit:
-			return "sell", i, true
-		}
-	}
-	return "", 0, false
 }
 
 // groupByETDay buckets candles by their ET calendar day (day floored in ET).

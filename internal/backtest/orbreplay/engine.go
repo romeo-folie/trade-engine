@@ -387,7 +387,7 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		entryMid = watch[entryIdx].Open
 	} else {
 		var ok bool
-		side, entryIdx, ok = firstBreakout(inWindow, buy, sell, entryDeadline)
+		side, entryIdx, ok = orb.FirstBreakout(inWindow, buy, sell, entryDeadline)
 		if !ok {
 			return nil, nil // range never broke within the entry window
 		}
@@ -588,33 +588,6 @@ func entryBarStopOut(p orb.BracketParams, bar data.Candle) bool {
 		return bar.Low <= p.StopLoss
 	}
 	return bar.High >= p.StopLoss
-}
-
-// firstBreakout scans the post-range candles for the first bar that triggers either
-// stop-entry, up to entryDeadline (after which live cancels the unfilled orders). A buy
-// triggers when price rises to the buy-stop (High ≥ entry); a sell when price falls to
-// the sell-stop (Low ≤ entry). If both trigger on the same bar (a whipsaw straddle), the
-// bar's own direction breaks the tie: a bullish bar is buy-first, a bearish bar sell-first.
-func firstBreakout(watch []data.Candle, buy, sell orb.BracketParams, entryDeadline time.Time) (side string, idx int, ok bool) {
-	for i, c := range watch {
-		if !c.Timestamp.Before(entryDeadline) {
-			break // past the entry window — live would have cancelled the orders
-		}
-		buyHit := buy.Qty > 0 && buy.EntryStop > 0 && c.High >= buy.EntryStop
-		sellHit := sell.Qty > 0 && sell.EntryStop > 0 && c.Low <= sell.EntryStop
-		switch {
-		case buyHit && sellHit:
-			if c.Close >= c.Open {
-				return "buy", i, true
-			}
-			return "sell", i, true
-		case buyHit:
-			return "buy", i, true
-		case sellHit:
-			return "sell", i, true
-		}
-	}
-	return "", 0, false
 }
 
 // ── small helpers ──────────────────────────────────────────────────────────────

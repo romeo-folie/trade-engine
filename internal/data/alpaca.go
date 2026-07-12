@@ -76,10 +76,17 @@ func (c *AlpacaClient) throttle(ctx context.Context) error {
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
 func (c *AlpacaClient) get(ctx context.Context, path string, params url.Values) (*http.Response, error) {
+	return c.getFrom(ctx, c.dataURL, path, params)
+}
+
+// getFrom is get against an arbitrary base host (the data API by default, or the
+// trading API for the historical-options client), sharing the throttle, auth headers,
+// retry/backoff, and error envelope so callers don't re-implement them.
+func (c *AlpacaClient) getFrom(ctx context.Context, baseURL, path string, params url.Values) (*http.Response, error) {
 	if err := c.throttle(ctx); err != nil {
 		return nil, err
 	}
-	u := c.dataURL + path
+	u := baseURL + path
 	if len(params) > 0 {
 		u += "?" + params.Encode()
 	}

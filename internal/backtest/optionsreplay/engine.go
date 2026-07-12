@@ -101,13 +101,22 @@ func NewEngine(gates *options.Engine, cfg Config) *Engine {
 // "eod" flatten; if the Path runs out first, the trade is closed under the distinct
 // ReasonPathExhausted marker so a data gap isn't miscounted as a real flatten.
 func (e *Engine) Replay(ctx context.Context, sig Signal) SimTrade {
-	out := SimTrade{Underlying: sig.Underlying, AsOf: sig.AsOf}
-
 	dec := e.gates.Select(ctx, options.Signal{
 		Underlying: sig.Underlying,
 		Direction:  sig.Direction,
 		AsOf:       sig.AsOf,
 	})
+	return e.ReplayWithDecision(ctx, sig, dec)
+}
+
+// ReplayWithDecision replays a breakout using a PRE-COMPUTED gate decision instead of
+// running Select itself. The runner peeks the decision to learn the chosen contract
+// (so it can fetch that contract's option-mid path) and then hands it back here — the
+// gate is deterministic per as-of, so this yields the identical result while running
+// the gate (and its per-contract quote fetches) once per signal rather than twice.
+func (e *Engine) ReplayWithDecision(ctx context.Context, sig Signal, dec options.Decision) SimTrade {
+	out := SimTrade{Underlying: sig.Underlying, AsOf: sig.AsOf}
+
 	if !dec.Accepted || dec.Contract == nil {
 		out.Gate = dec.Gate
 		out.Reason = dec.Reason

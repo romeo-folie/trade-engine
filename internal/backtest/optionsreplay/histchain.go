@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -33,12 +34,53 @@ type HistChainProvider struct {
 	data HistoricalOptionData
 	r    float64 // risk-free rate (annualized)
 	q    float64 // dividend yield (annualized)
+
+	mu      sync.Mutex
+	clCache map[string][]execution.OptionContract // month-bucketed contract listings
 }
 
 // NewHistChainProvider builds the provider. r and q feed Black-Scholes; for the
 // short DTEs options-ORB trades they barely move the result, so 0/0 is a fine default.
 func NewHistChainProvider(hd HistoricalOptionData, r, q float64) *HistChainProvider {
-	return &HistChainProvider{data: hd, r: r, q: q}
+	return &HistChainProvider{data: hd, r: r, q: q, clCache: map[string][]execution.OptionContract{}}
+}
+
+// listContracts wraps the data source's ListContracts with a MONTH-bucketed cache.
+// The gate's DTE window shifts every day, so caching by the exact [gte,lte] would
+// never hit across days; instead it fetches the whole month(s) spanning the window
+// once (contract listings are static, so over-fetching is cheap) and filters locally.
+// This collapses ~252 per-day list calls per underlying into ~12 per-month calls.
+func (p *HistChainProvider) listContracts(ctx context.Context, underlying, right string, gte, lte time.Time) ([]execution.OptionContract, error) {
+	wideLo := monthStart(gte)
+	wideHi := monthStart(lte).AddDate(0, 1, 0) // first day of the month after lte
+	key := strings.ToUpper(underlying) + "|" + right + "|" + wideLo.Format("2006-01") + "|" + wideHi.Format("2006-01")
+
+	p.mu.Lock()
+	wide, cached := p.clCache[key]
+	p.mu.Unlock()
+	if !cached {
+		var err error
+		wide, err = p.data.ListContracts(ctx, underlying, right, wideLo, wideHi)
+		if err != nil {
+			return nil, err
+		}
+		p.mu.Lock()
+		p.clCache[key] = wide
+		p.mu.Unlock()
+	}
+
+	out := make([]execution.OptionContract, 0, len(wide))
+	for _, c := range wide {
+		if c.Expiry.Before(gte) || c.Expiry.After(lte) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+func monthStart(t time.Time) time.Time {
+	return time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
 }
 
 // GetOptionChain implements options.ChainProvider. The evaluation instant + spot
@@ -52,17 +94,26 @@ func (p *HistChainProvider) GetOptionChain(ctx context.Context, underlying strin
 	if ao.spot <= 0 {
 		return nil, fmt.Errorf("optionsreplay: non-positive underlying spot %.2f at %s", ao.spot, ao.at.Format(time.RFC3339))
 	}
-	contracts, err := p.data.ListContracts(ctx, underlying, filt.Right, filt.ExpiryGTE, filt.ExpiryLTE)
+	contracts, err := p.listContracts(ctx, underlying, filt.Right, filt.ExpiryGTE, filt.ExpiryLTE)
 	if err != nil {
 		return nil, fmt.Errorf("optionsreplay: list contracts: %w", err)
 	}
+	// Batch every contract's NBBO in ONE call rather than N per-contract fetches.
+	symbols := make([]string, len(contracts))
+	for i, oc := range contracts {
+		symbols[i] = oc.OCCSymbol
+	}
+	quotes, err := p.data.QuotesAt(ctx, symbols, ao.at)
+	if err != nil {
+		return nil, fmt.Errorf("optionsreplay: batch quotes: %w", err)
+	}
 	snaps := make([]execution.OptionSnapshot, 0, len(contracts))
 	for _, oc := range contracts {
-		bid, ask, ok := p.data.QuoteAt(ctx, oc.OCCSymbol, ao.at)
+		q, ok := quotes[oc.OCCSymbol]
 		if !ok {
 			continue // no quote at this instant → contract is invisible to the gate
 		}
-		snap := execution.OptionSnapshot{OCCSymbol: oc.OCCSymbol, Bid: bid, Ask: ask}
+		snap := execution.OptionSnapshot{OCCSymbol: oc.OCCSymbol, Bid: q.Bid, Ask: q.Ask}
 		mid := snap.Mid()
 		if mid > 0 {
 			t := yearsToExpiry(ao.at, oc.Expiry)
@@ -138,7 +189,7 @@ func (p *HistChainProvider) BuildIVSeries(ctx context.Context, underlying string
 func (p *HistChainProvider) atmIV(ctx context.Context, underlying string, at time.Time, spot float64) (float64, bool) {
 	lo := dayFloorLoc(at).AddDate(0, 0, 1)
 	hi := dayFloorLoc(at).AddDate(0, 0, 7)
-	contracts, err := p.data.ListContracts(ctx, underlying, "call", lo, hi)
+	contracts, err := p.listContracts(ctx, underlying, "call", lo, hi)
 	if err != nil {
 		slog.Warn("optionsreplay: IV seed contract listing failed", "underlying", underlying, "at", at, "err", err)
 		return 0, false

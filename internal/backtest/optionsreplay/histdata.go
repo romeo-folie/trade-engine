@@ -30,6 +30,12 @@ type HistoricalOptionData interface {
 	// (the chain gate then never sees this contract — fail-closed, like live).
 	QuoteAt(ctx context.Context, occSymbol string, asOf time.Time) (bid, ask float64, ok bool)
 
+	// QuotesAt returns the NBBO for MANY OCC symbols at the most recent quote at or
+	// before asOf, in one batched call. Symbols with no quote in the window are absent
+	// from the result. Used by the chain provider to avoid an N+1 per-contract fetch
+	// across a whole DTE window.
+	QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error)
+
 	// OptionBars returns 1-minute OHLC bars for one OCC symbol over [from, to]. Used
 	// to build the exit-walk option-mid path once a contract is chosen.
 	OptionBars(ctx context.Context, occSymbol string, from, to time.Time) ([]data.Candle, error)

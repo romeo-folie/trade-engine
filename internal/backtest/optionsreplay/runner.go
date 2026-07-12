@@ -119,7 +119,9 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 			fillOptionMids(sig.Path, obars)
 		}
 	}
-	return r.replay.Replay(aoCtx, sig)
+	// Hand the peeked decision back so Replay doesn't re-run the gate (and its
+	// per-contract quote fetches) a second time — the gate is deterministic per as-of.
+	return r.replay.ReplayWithDecision(aoCtx, sig, dec)
 }
 
 // fillOptionMids sets each Path bar's OptionMid to the historical option bar Close at

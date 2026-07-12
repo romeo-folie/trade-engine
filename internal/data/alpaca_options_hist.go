@@ -1,13 +1,10 @@
 package data
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
@@ -172,6 +169,15 @@ type alpacaOptQuotesResponse struct {
 // quoteLookback is how far before asOf QuoteAt searches for the last NBBO.
 const quoteLookback = 15 * time.Minute
 
+// maxOptionQuotePages bounds the batched QuotesAt pagination so a busy chain (many
+// symbols × many ticks in the lookback window) can't spin forever. 50 pages ×
+// limit 1000 = 50k quotes, ample for a whole DTE window over a 15-minute window.
+const maxOptionQuotePages = 50
+
+// maxSymbolsPerQuoteRequest is Alpaca's cap on the multi-symbol `symbols` list for
+// the option quotes endpoint. Larger requests 400.
+const maxSymbolsPerQuoteRequest = 100
+
 // QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It asks
 // for the [asOf-quoteLookback, asOf] window sorted DESCENDING with limit=1, so the
 // single returned quote is the newest at or before the evaluation instant — never a
@@ -207,6 +213,80 @@ func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf 
 		return 0, 0, false
 	}
 	return newest.BidPrice, newest.AskPrice, true
+}
+
+// QuotesAt returns the newest NBBO at or before asOf for MANY OCC symbols, replacing
+// an N+1 per-contract fetch with a batched, PAGED request over the window
+// [asOf-quoteLookback, asOf] sorted DESCENDING.
+//
+// Alpaca's multi-symbol quotes endpoint groups results by symbol then orders each
+// group by time, and `limit` caps the TOTAL rows across all symbols — so one busy
+// at-the-money contract can fill a whole page and push other requested symbols onto
+// later pages. A single page would therefore silently drop most of the chain. We
+// page (bounded by maxOptionQuotePages) and record each symbol's newest quote the first
+// time it appears (its quotes are newest-first within a group, so the first
+// occurrence across pages is the global newest), stopping early once every requested
+// symbol is resolved. A symbol absent from all pages is excluded — fail-closed, like
+// the single QuoteAt.
+func (a *AlpacaOptionsHist) QuotesAt(ctx context.Context, occSymbols []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
+	out := make(map[string]execution.OptionNBBO)
+	if len(occSymbols) == 0 {
+		return out, nil
+	}
+	// Alpaca caps the multi-symbol `symbols` list at 100; a SPY/QQQ DTE window often
+	// exceeds that, and an over-cap request 400s. Chunk into ≤100-symbol batches, each
+	// paged, merging into one result.
+	for i := 0; i < len(occSymbols); i += maxSymbolsPerQuoteRequest {
+		end := min(i+maxSymbolsPerQuoteRequest, len(occSymbols))
+		if err := a.quotesAtChunk(ctx, occSymbols[i:end], asOf, out); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// quotesAtChunk resolves the newest NBBO for one ≤100-symbol chunk (paged) and writes
+// results into out.
+func (a *AlpacaOptionsHist) quotesAtChunk(ctx context.Context, chunk []string, asOf time.Time, out map[string]execution.OptionNBBO) error {
+	remaining := make(map[string]bool, len(chunk))
+	for _, s := range chunk {
+		remaining[s] = true
+	}
+	params := url.Values{}
+	params.Set("symbols", strings.Join(chunk, ","))
+	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
+	params.Set("end", asOf.UTC().Format(time.RFC3339))
+	params.Set("sort", "desc")
+	params.Set("limit", "1000")
+	for range maxOptionQuotePages {
+		var resp alpacaOptQuotesResponse
+		if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
+			slog.Warn("alpaca options: batch historical quotes failed", "n", len(chunk), "as_of", asOf, "err", err)
+			return err
+		}
+		for sym, quotes := range resp.Quotes {
+			if !remaining[sym] || len(quotes) == 0 {
+				continue
+			}
+			// First appearance of this symbol across pages = its global newest (desc).
+			// Decide the symbol here (newest-or-nothing, matching single QuoteAt), so a
+			// later page's older quotes for it are ignored.
+			delete(remaining, sym)
+			newest := quotes[0]
+			if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
+				continue
+			}
+			if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
+				continue
+			}
+			out[sym] = execution.OptionNBBO{Bid: newest.BidPrice, Ask: newest.AskPrice}
+		}
+		if resp.NextPageToken == "" || len(remaining) == 0 {
+			break
+		}
+		params.Set("page_token", resp.NextPageToken)
+	}
+	return nil
 }
 
 // ── historical bars (data API) ───────────────────────────────────────────────
@@ -255,39 +335,10 @@ func (a *AlpacaOptionsHist) OptionBars(ctx context.Context, occSymbol string, fr
 }
 
 // getJSON issues an authenticated GET against host+path and decodes into out,
-// reusing the equity client's throttle and the package retry/backoff helper.
+// reusing the equity client's shared getFrom (throttle + auth + retry + error
+// envelope) rather than re-implementing them.
 func (a *AlpacaOptionsHist) getJSON(ctx context.Context, host, path string, params url.Values, out any) error {
-	if err := a.equity.throttle(ctx); err != nil {
-		return err
-	}
-	u := host + path
-	if len(params) > 0 {
-		u += "?" + params.Encode()
-	}
-	resp, err := withRetry(ctx, func() (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("APCA-API-KEY-ID", a.apiKey)
-		req.Header.Set("APCA-API-SECRET-KEY", a.secret)
-		req.Header.Set("Accept", "application/json")
-		resp, err := a.equity.httpClient.Do(req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
-			resp.Body.Close()
-			return nil, &httpError{
-				status:     resp.StatusCode,
-				msg:        fmt.Sprintf("alpaca %s %d: %s", path, resp.StatusCode, bytes.TrimSpace(body)),
-				retryAfter: retryAfter,
-			}
-		}
-		return resp, nil
-	})
+	resp, err := a.equity.getFrom(ctx, host, path, params)
 	if err != nil {
 		return err
 	}
