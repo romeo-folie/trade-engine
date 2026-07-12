@@ -153,6 +153,13 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		if p.Symbol == "" {
 			continue
 		}
+		// Options-ORB positions report their OCC symbol and are reconciled by their
+		// own OCC-keyed detector (#416). Skip them here so this ticker-keyed
+		// reconciler never treats an option position as drift or adopts it into the
+		// legacy trades table.
+		if execution.IsOCCSymbol(p.Symbol) {
+			continue
+		}
 		a, ok := byTicker[p.Symbol]
 		if !ok {
 			a = &aggregate{}

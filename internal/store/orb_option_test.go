@@ -161,6 +161,68 @@ func TestGetOpenFilledOptionTrades(t *testing.T) {
 	}
 }
 
+// TestOptionReconcileScoping verifies the #416 scope-out plumbing: the managed-OCC
+// query returns pending+filled option OCCs, and the shared GetOpenFilledORBTrades
+// reader EXCLUDES option rows (they have their own reader + exit path).
+func TestOptionReconcileScoping(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-reconcile-scope")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	exp := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	filledOCC := "SPY260717C00551000"
+	pendingOCC := "QQQ260717P00500000"
+
+	filledOptID, _ := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "SPY", Side: "buy", Status: "filled", Qty: 2,
+		AssetClass: "option", Underlying: "SPY", Expiry: &exp, Strike: 551, Right: "C",
+		OCCSymbol: filledOCC, Multiplier: 100,
+	})
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "QQQ", Side: "sell", Status: "pending", Qty: 1,
+		AssetClass: "option", Underlying: "QQQ", Expiry: &exp, Strike: 500, Right: "P",
+		OCCSymbol: pendingOCC, Multiplier: 100,
+	})
+	eqID, _ := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "AAPLSCOPE", Side: "buy", Status: "filled", Qty: 10,
+	})
+
+	// Managed set includes both option OCCs (pending + filled).
+	managed, err := store.GetManagedOptionOCCSymbols(ctx, db)
+	if err != nil {
+		t.Fatalf("GetManagedOptionOCCSymbols: %v", err)
+	}
+	if !managed[filledOCC] || !managed[pendingOCC] {
+		t.Errorf("managed set missing OCCs: %v", managed)
+	}
+
+	// GetOpenFilledORBTrades excludes the option row, includes the equity row.
+	filled, err := store.GetOpenFilledORBTrades(ctx, db)
+	if err != nil {
+		t.Fatalf("GetOpenFilledORBTrades: %v", err)
+	}
+	var sawOption, sawEquity bool
+	for _, tr := range filled {
+		if tr.ID == filledOptID {
+			sawOption = true
+		}
+		if tr.ID == eqID {
+			sawEquity = true
+		}
+	}
+	if sawOption {
+		t.Error("GetOpenFilledORBTrades must exclude option rows")
+	}
+	if !sawEquity {
+		t.Error("GetOpenFilledORBTrades must still return equity rows")
+	}
+}
+
 // TestGetORBTradeByID_NotFound confirms a missing id yields (nil, nil), not an error.
 func TestGetORBTradeByID_NotFound(t *testing.T) {
 	if !store.IsConnected() {

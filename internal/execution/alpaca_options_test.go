@@ -47,6 +47,19 @@ func TestParseOCCSymbol_Invalid(t *testing.T) {
 	}
 }
 
+func TestIsOCCSymbol(t *testing.T) {
+	for _, s := range []string{"SPY260717C00551000", "AAPL240223C00095000", "QQQ260717P00500000"} {
+		if !IsOCCSymbol(s) {
+			t.Errorf("IsOCCSymbol(%q) = false; want true", s)
+		}
+	}
+	for _, s := range []string{"SPY", "AAPL", "EUR/USD", "", "XAU/USD", "SPY260717X00551000"} {
+		if IsOCCSymbol(s) {
+			t.Errorf("IsOCCSymbol(%q) = true; want false", s)
+		}
+	}
+}
+
 func TestGetOptionChain_GreeksAndNulls(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1beta1/options/snapshots/SPY" {

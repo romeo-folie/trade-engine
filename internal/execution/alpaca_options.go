@@ -79,6 +79,14 @@ func ParseOCCSymbol(sym string) (OptionContract, error) {
 	}, nil
 }
 
+// IsOCCSymbol reports whether sym parses as an option OCC symbol. Reconcilers that
+// key on equity/forex tickers use it to skip option positions (which report their
+// OCC symbol as the position symbol) so they don't false-alarm on them.
+func IsOCCSymbol(sym string) bool {
+	_, err := ParseOCCSymbol(sym)
+	return err == nil
+}
+
 // ─── Option orders ──────────────────────────────────────────────────────────
 
 // placeOptionOrder submits a single-leg option order. Options-ORB v1 is long-only

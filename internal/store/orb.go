@@ -276,6 +276,30 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 	return out, rows.Err()
 }
 
+// GetManagedOptionOCCSymbols returns the set of OCC symbols for non-terminal
+// options-ORB trades (status pending or filled). The options orphan detector
+// (#416) treats a broker option position whose OCC is not in this set as an
+// unexplained orphan. Pending is included so a just-filled entry the fill-poll
+// hasn't marked yet is not falsely flagged.
+func GetManagedOptionOCCSymbols(ctx context.Context, db *pgxpool.Pool) (map[string]bool, error) {
+	rows, err := db.Query(ctx, `
+		SELECT occ_symbol FROM orb_trades
+		WHERE asset_class='option' AND status IN ('pending','filled') AND occ_symbol IS NOT NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]bool)
+	for rows.Next() {
+		var occ string
+		if err := rows.Scan(&occ); err != nil {
+			return nil, err
+		}
+		out[occ] = true
+	}
+	return out, rows.Err()
+}
+
 // CancelORBTradeByOrderID marks a pending trade as cancelled given its broker order ID.
 // Used by tickDone to update the DB after best-effort cancel calls.
 func CancelORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string) error {
@@ -447,7 +471,10 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id
-		FROM orb_trades WHERE status='filled'
+		-- Options-ORB rows are excluded: they have their own reader
+		-- (GetOpenFilledOptionTrades) and exit path (#415); this keeps the
+		-- equity/forex/futures exit reconcilers from touching option trades.
+		FROM orb_trades WHERE status='filled' AND COALESCE(asset_class,'equity') <> 'option'
 		ORDER BY COALESCE(filled_at, created_at)`)
 	if err != nil {
 		return nil, err
@@ -489,7 +516,10 @@ func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade,
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id
-		FROM orb_trades WHERE status='pending'
+		-- Options-ORB rows excluded (see GetOpenFilledORBTrades): the option entry
+		-- fill-poll is order-ID driven, and fill_reconcile/split-orphan sweeps are
+		-- forex-scoped, so options never need this reader.
+		FROM orb_trades WHERE status='pending' AND COALESCE(asset_class,'equity') <> 'option'
 		ORDER BY created_at`)
 	if err != nil {
 		return nil, err

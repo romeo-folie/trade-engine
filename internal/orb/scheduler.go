@@ -91,23 +91,25 @@ type CandidateScanner interface {
 
 // ORBScheduler implements the time-gated ORB state machine.
 type ORBScheduler struct {
-	cfg                   config.ORBConfig
-	db                    *pgxpool.Pool
-	marketData            data.MarketDataProvider
-	analyzer              *analysis.Analyzer
-	executor              execution.Executor
-	portfolio             PortfolioValuer
-	notifier              Notifier
-	news                  data.NewsProvider        // optional; nil disables news enrichment
-	bus                   *events.Bus              // optional; nil means no event publishing
-	now                   func() time.Time         // injectable for tests
-	scanner               CandidateScanner         // optional; nil uses inline equities scanning
-	forexCfg              *config.ForexORBConfig   // optional; nil means equities mode
-	futuresCfg            *config.FuturesORBConfig // optional; nil means not futures mode
-	feedbackCfg           *config.FeedbackConfig   // optional; nil disables feedback enrichment
-	optionsRouter         *OptionsRouter           // optional; nil disables options-ORB execution (default). Wired by #418.
-	optionExit            *OptionExitManager       // optional; nil disables options-ORB app-managed exits (default). Wired by #418.
-	lastOptionExitCheckAt time.Time                // wall time of the last options-ORB exit sweep
+	cfg                     config.ORBConfig
+	db                      *pgxpool.Pool
+	marketData              data.MarketDataProvider
+	analyzer                *analysis.Analyzer
+	executor                execution.Executor
+	portfolio               PortfolioValuer
+	notifier                Notifier
+	news                    data.NewsProvider        // optional; nil disables news enrichment
+	bus                     *events.Bus              // optional; nil means no event publishing
+	now                     func() time.Time         // injectable for tests
+	scanner                 CandidateScanner         // optional; nil uses inline equities scanning
+	forexCfg                *config.ForexORBConfig   // optional; nil means equities mode
+	futuresCfg              *config.FuturesORBConfig // optional; nil means not futures mode
+	feedbackCfg             *config.FeedbackConfig   // optional; nil disables feedback enrichment
+	optionsRouter           *OptionsRouter           // optional; nil disables options-ORB execution (default). Wired by #418.
+	optionExit              *OptionExitManager       // optional; nil disables options-ORB app-managed exits (default). Wired by #418.
+	lastOptionExitCheckAt   time.Time                // wall time of the last options-ORB exit sweep
+	lastOptionOrphanCheckAt time.Time                // wall time of the last options-ORB orphan sweep
+	alertedOrphanOptions    map[string]struct{}      // OCC symbols already alerted as orphans (re-armed on resolve)
 
 	mu                      sync.Mutex // protects state, session, candidates for TUI reads
 	state                   State
@@ -436,6 +438,10 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// filled option's stored stop/target, apply the IV-crush time exit, and flatten
 	// before the close. No-op when the exit manager is unset (non-options runs).
 	s.enforceOptionExits(ctx)
+
+	// Options-ORB orphan detection (issue #416): alert on broker option positions no
+	// managed trade explains (detection-only). No-op unless options-ORB is active.
+	s.detectOrphanOptionPositions(ctx)
 
 	// Adaptive stop management (Phase 4 live): ratchet break-even / trailing stops on filled
 	// forex trades whose instrument opts in. No-op when no instrument configures it. Runs
