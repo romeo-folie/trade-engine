@@ -8,11 +8,13 @@
 -- `date` stays the ET calendar day for one-row-per-day uniqueness (the PK).
 ALTER TABLE option_iv_history ADD COLUMN IF NOT EXISTS as_of TIMESTAMPTZ;
 
--- Existing rows have only day granularity; anchor them at ET midnight of their date.
--- Use timezone('America/New_York', date::timestamp) — NOT date::timestamptz, which
--- would interpret the date in the DB session zone (UTC) and land the instant in the
--- prior ET evening, so a later write-through read would bucket the row under the wrong
--- ET day (cache miss). ET-midnight round-trips back to the same ET calendar day.
+-- Existing rows were sampled intraday (the default 09:45 ET ref minute) but stored
+-- only the day. Anchor them at 09:45 ET — the SAMPLE time — not midnight: a midnight
+-- as_of would be visible to a pre-09:45 opening-range breakout and rank on IV that
+-- wasn't observable yet (lookahead). timezone('America/New_York', ...) builds the
+-- instant in ET (session-timezone-independent) so it round-trips to the same ET day;
+-- the write-through seeder re-derives any row whose as_of doesn't match the current
+-- ref minute, so a wrong guess self-corrects on the next run.
 UPDATE option_iv_history
-   SET as_of = timezone('America/New_York', date::timestamp)
+   SET as_of = timezone('America/New_York', date::timestamp + interval '9 hours 45 minutes')
  WHERE as_of IS NULL;

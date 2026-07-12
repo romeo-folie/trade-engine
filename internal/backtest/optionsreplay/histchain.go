@@ -142,13 +142,21 @@ func (p *HistChainProvider) GetOptionChain(ctx context.Context, underlying strin
 // gate fails closed when the sample count is short — the correct, conservative behavior).
 func (p *HistChainProvider) SeedIVHistory(ctx context.Context, ivstore options.IVStore, underlying string, from, to time.Time, refMinuteET int) error {
 	underlying = strings.ToUpper(underlying)
-	existing, err := ivstore.GetIVHistory(ctx, underlying, from, to)
+	// Read a day past `to`: samples are stamped intraday (09:45 ET), so the last day's
+	// point sits after a midnight `to` bound and would otherwise be missed → re-fetched
+	// every run. The extra day only over-reads days we don't iterate (harmless).
+	existing, err := ivstore.GetIVHistory(ctx, underlying, from, to.AddDate(0, 0, 1))
 	if err != nil {
 		return fmt.Errorf("read seeded IV history for %s: %w", underlying, err)
 	}
-	have := make(map[string]bool, len(existing))
+	// Key the cache by ET day → the row's sample INSTANT (as_of). A day is only a cache
+	// hit if its stored as_of equals the ref instant THIS run wants; a row at a
+	// different instant (a legacy midnight-anchored row, or a prior run with another
+	// --iv-ref-minute) is re-derived and overwritten, so the persisted IV always
+	// matches the requested intraday quote and the as-of filter stays honest.
+	seededAt := make(map[string]time.Time, len(existing))
 	for _, d := range existing {
-		have[d.Date.In(etLoc).Format("2006-01-02")] = true
+		seededAt[d.Date.In(etLoc).Format("2006-01-02")] = d.Date // d.Date IS the as_of instant
 	}
 	// Iterate ET CALENDAR days regardless of the input timestamps' own location (the
 	// CLI parses --from/--to in UTC): a UTC-midnight day-floor would sample the ATM
@@ -159,13 +167,13 @@ func (p *HistChainProvider) SeedIVHistory(ctx context.Context, ivstore options.I
 		if wd := day.Weekday(); wd == time.Saturday || wd == time.Sunday {
 			continue
 		}
-		if have[day.Format("2006-01-02")] {
-			continue // already seeded — the whole point: no re-fetch
-		}
 		// Sample refMinuteET minutes after the 09:30 ET open (not midnight) so the series
 		// is comparable day to day and lands in real trading hours (DST-safe via etLoc).
 		ref := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, etLoc).
 			Add(time.Duration(refMinuteET) * time.Minute)
+		if at, ok := seededAt[day.Format("2006-01-02")]; ok && at.Equal(ref) {
+			continue // already seeded at exactly this ref instant — no re-fetch
+		}
 		iv, ok := p.dailyATMIVAt(ctx, underlying, ref)
 		if !ok {
 			continue

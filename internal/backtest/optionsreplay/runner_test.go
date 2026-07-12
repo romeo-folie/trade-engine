@@ -192,8 +192,14 @@ func TestRunner_EndToEnd(t *testing.T) {
 // countingHist wraps fakeHist to count the I/O the #427 optimizations target.
 type countingHist struct {
 	fakeHist
-	quotesAt      int
-	listContracts int
+	quotesAt       int
+	listContracts  int
+	underlyingBars int
+}
+
+func (c *countingHist) UnderlyingBars(ctx context.Context, u string, from, to time.Time) ([]data.Candle, error) {
+	c.underlyingBars++
+	return c.fakeHist.UnderlyingBars(ctx, u, from, to)
 }
 
 func (c *countingHist) QuotesAt(ctx context.Context, occ []string, asOf time.Time) (map[string]execution.OptionNBBO, error) {
@@ -303,16 +309,25 @@ func TestSeedIVHistory_Idempotent(t *testing.T) {
 	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
 		t.Fatalf("first seed: %v", err)
 	}
-	afterFirst := hd.quotesAt + hd.listContracts
-	if afterFirst == 0 {
-		t.Fatal("first seed should have fetched data")
+	if hd.underlyingBars == 0 {
+		t.Fatal("first seed should have fetched per-day data")
 	}
-	// Second run: every day already present → zero new fetches.
+	firstBars := hd.underlyingBars
+	// Second run, SAME ref minute: every day present at the exact instant → 0 new fetches.
 	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
 		t.Fatalf("second seed: %v", err)
 	}
-	if got := hd.quotesAt + hd.listContracts - afterFirst; got != 0 {
-		t.Errorf("second seed made %d fetches; want 0 (cache hit)", got)
+	if hd.underlyingBars != firstBars {
+		t.Errorf("same-ref re-seed made %d new day-fetches; want 0 (cache hit)", hd.underlyingBars-firstBars)
+	}
+
+	// Re-seed at a DIFFERENT ref minute: the cached rows are stamped at the old instant,
+	// so they must be RE-DERIVED (not a stale date-only cache hit).
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 20); err != nil {
+		t.Fatalf("ref-change seed: %v", err)
+	}
+	if hd.underlyingBars <= firstBars {
+		t.Error("changing --iv-ref-minute must re-derive the days, not hit the stale cache")
 	}
 }
 
