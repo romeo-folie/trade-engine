@@ -44,6 +44,12 @@ func optionTradeStaleAcrossSessions(t store.ORBTrade, now time.Time) bool {
 	if etNow.Year() == etAnchor.Year() && etNow.YearDay() == etAnchor.YearDay() {
 		return false // same ET trading day — normal intraday handling applies
 	}
+	// Only on an actual trading day past the open — otherwise (weekend/holiday) options
+	// are closed and forcing a flatten just spams rejected sells every sweep. Wait for
+	// the next tradable open.
+	if !IsTradingDay(now) {
+		return false
+	}
 	mod := etNow.Hour()*60 + etNow.Minute()
 	return mod >= marketOpenMinutes
 }

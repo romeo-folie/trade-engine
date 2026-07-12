@@ -262,3 +262,24 @@ func TestAssembleSignals_UpBreakout(t *testing.T) {
 	}
 	_ = day
 }
+
+// TestAssembleSignals_EntryDeadlineFromOpen: a breakout that fires AFTER session
+// open + EntryWindowMins must be rejected — the live scheduler cancels unfilled
+// entries at open+60m, so replaying a later move would trade something production
+// never held. The deadline is measured from 09:30, NOT from the range lock.
+func TestAssembleSignals_EntryDeadlineFromOpen(t *testing.T) {
+	base := time.Date(2026, 3, 4, 9, 30, 0, 0, etLoc)
+	var candles []data.Candle
+	for m := range 130 { // 09:30 → 11:39
+		px := 100.0
+		if m >= 70 { // 10:40 ET — past the 10:30 (open+60m) cutoff
+			px = 103
+		}
+		candles = append(candles, data.Candle{Timestamp: base.Add(time.Duration(m) * time.Minute),
+			Open: px, High: px + 0.3, Low: px - 0.3, Close: px})
+	}
+	sigs := AssembleSignals("SPY", candles, AssembleConfig{RangeMinutes: 15, EntryWindowMins: 60, RiskReward: 2})
+	if len(sigs) != 0 {
+		t.Fatalf("expected 0 signals (breakout at 10:40 is past the open+60m deadline), got %d", len(sigs))
+	}
+}

@@ -208,6 +208,9 @@ func TestOptionTradeStaleAcrossSessions(t *testing.T) {
 		{"next day at open", trade(filledMon), time.Date(2026, 7, 14, 9, 30, 0, 0, nyLoc), true},
 		{"next day midday", trade(filledMon), time.Date(2026, 7, 14, 11, 0, 0, 0, nyLoc), true},
 		{"after weekend at open", trade(filledMon), time.Date(2026, 7, 17, 9, 45, 0, 0, nyLoc), true},
+		// Saturday after the open: options are closed → do NOT flatten (would spam
+		// rejected sells); wait for the next tradable open.
+		{"weekend not tradable", trade(filledMon), time.Date(2026, 7, 18, 10, 0, 0, 0, nyLoc), false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

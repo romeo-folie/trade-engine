@@ -26,7 +26,7 @@ var etLoc = func() *time.Location {
 // identical to production for the same bars.
 type AssembleConfig struct {
 	RangeMinutes    int     // opening-range length in minutes (e.g. 15)
-	EntryWindowMins int     // minutes after the range locks to still allow a breakout
+	EntryWindowMins int     // minutes after SESSION OPEN that a breakout may still fire (matches the live scheduler's cleanup cutoff = open + 60m); NOT measured from the range lock
 	SessionOpenET   string  // "HH:MM" ET regular-session open; default "09:30"
 	SessionEndET    string  // "HH:MM" ET hard flatten; default "15:50"
 	RiskReward      float64 // target = entry ± risk × RR (feeds orb.ComputeBracket)
@@ -102,7 +102,12 @@ func AssembleSignals(underlying string, candles []data.Candle, cfg AssembleConfi
 		sell := orb.ComputeBracket(or, "sell", 1, orbCfg)
 
 		watch := bars[rangeEndIdx+1:]
-		entryDeadline := or.DefinedAt.Add(time.Duration(cfg.EntryWindowMins) * time.Minute)
+		// Deadline is SESSION OPEN + EntryWindowMins, matching the live scheduler's
+		// entry-cancel cutoff (sessionCleanupMinutes = open + 60m). Measuring from the
+		// range lock instead would keep accepting breakouts for RangeMinutes longer than
+		// production would — replaying trades the live path had already cancelled.
+		sessionOpenTime := day.Add(time.Duration(openMin) * time.Minute)
+		entryDeadline := sessionOpenTime.Add(time.Duration(cfg.EntryWindowMins) * time.Minute)
 		side, bi, ok := firstBreakout(watch, buy, sell, entryDeadline)
 		if !ok {
 			continue

@@ -81,7 +81,34 @@ type alpacaContractsResponse struct {
 
 // ListContracts pages the trading API for contracts on underlying with expiry in
 // [expiryGTE, expiryLTE] and the given right.
+//
+// It queries BOTH status=active AND status=inactive and merges (dedup by symbol).
+// The endpoint defaults to status=active, which Alpaca limits to contracts expiring
+// before the coming weekend — so a backtest over a PAST window (whose contracts have
+// since expired → inactive) would get an empty list and silently degenerate into
+// fail-closed iv_rank/expiry aborts. Requesting both makes the historical universe
+// visible regardless of when the backtest is run.
 func (a *AlpacaOptionsHist) ListContracts(ctx context.Context, underlying, right string, expiryGTE, expiryLTE time.Time) ([]execution.OptionContract, error) {
+	seen := make(map[string]bool)
+	var out []execution.OptionContract
+	for _, status := range []string{"active", "inactive"} {
+		cs, err := a.listContractsStatus(ctx, underlying, right, status, expiryGTE, expiryLTE)
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cs {
+			if seen[c.OCCSymbol] {
+				continue
+			}
+			seen[c.OCCSymbol] = true
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+// listContractsStatus pages one contract-status universe.
+func (a *AlpacaOptionsHist) listContractsStatus(ctx context.Context, underlying, right, status string, expiryGTE, expiryLTE time.Time) ([]execution.OptionContract, error) {
 	var out []execution.OptionContract
 	pageToken := ""
 	for {
@@ -90,13 +117,14 @@ func (a *AlpacaOptionsHist) ListContracts(ctx context.Context, underlying, right
 		params.Set("expiration_date_gte", expiryGTE.Format("2006-01-02"))
 		params.Set("expiration_date_lte", expiryLTE.Format("2006-01-02"))
 		params.Set("type", right)
+		params.Set("status", status)
 		params.Set("limit", "1000")
 		if pageToken != "" {
 			params.Set("page_token", pageToken)
 		}
 		var resp alpacaContractsResponse
 		if err := a.getJSON(ctx, a.tradingURL, "/v2/options/contracts", params, &resp); err != nil {
-			return nil, fmt.Errorf("list option contracts %s: %w", underlying, err)
+			return nil, fmt.Errorf("list option contracts %s (%s): %w", underlying, status, err)
 		}
 		for _, c := range resp.OptionContracts {
 			exp, err := time.Parse("2006-01-02", c.ExpirationDate)
@@ -144,15 +172,18 @@ type alpacaOptQuotesResponse struct {
 // quoteLookback is how far before asOf QuoteAt searches for the last NBBO.
 const quoteLookback = 15 * time.Minute
 
-// QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It
-// fetches the quote window [asOf-quoteLookback, asOf] and takes the last one, so it
-// never reads a quote stamped after the evaluation instant.
+// QuoteAt returns the most recent NBBO at or before asOf for one OCC symbol. It asks
+// for the [asOf-quoteLookback, asOf] window sorted DESCENDING with limit=1, so the
+// single returned quote is the newest at or before the evaluation instant — never a
+// stale first-ascending-page quote (a liquid 15-minute window can exceed one page of
+// NBBO updates) and never a quote stamped after asOf (bounded by end=asOf).
 func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf time.Time) (float64, float64, bool) {
 	params := url.Values{}
 	params.Set("symbols", occSymbol)
 	params.Set("start", asOf.Add(-quoteLookback).UTC().Format(time.RFC3339))
 	params.Set("end", asOf.UTC().Format(time.RFC3339))
-	params.Set("limit", "1000")
+	params.Set("sort", "desc")
+	params.Set("limit", "1")
 	var resp alpacaOptQuotesResponse
 	if err := a.getJSON(ctx, a.dataURL, "/v1beta1/options/quotes", params, &resp); err != nil {
 		// Surface systemic failures (e.g. 403 no OPRA entitlement, 429) — otherwise a
@@ -166,23 +197,16 @@ func (a *AlpacaOptionsHist) QuoteAt(ctx context.Context, occSymbol string, asOf 
 	if len(quotes) == 0 {
 		return 0, 0, false
 	}
-	// Alpaca returns ascending by time; guard by picking the newest ≤ asOf explicitly.
-	var best alpacaOptQuote
-	var found bool
-	for _, q := range quotes {
-		ts, err := time.Parse(time.RFC3339, q.Timestamp)
-		if err != nil || ts.After(asOf) {
-			continue
-		}
-		if !found || q.Timestamp > best.Timestamp {
-			best = q
-			found = true
-		}
-	}
-	if !found || best.BidPrice <= 0 || best.AskPrice <= 0 {
+	// Newest first with the end bound at asOf; defensively re-check the timestamp so a
+	// server that ignores sort/end can never hand us a future quote.
+	newest := quotes[0]
+	if ts, err := time.Parse(time.RFC3339, newest.Timestamp); err == nil && ts.After(asOf) {
 		return 0, 0, false
 	}
-	return best.BidPrice, best.AskPrice, true
+	if newest.BidPrice <= 0 || newest.AskPrice <= 0 {
+		return 0, 0, false
+	}
+	return newest.BidPrice, newest.AskPrice, true
 }
 
 // ── historical bars (data API) ───────────────────────────────────────────────
