@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
@@ -58,50 +59,144 @@ func (s *ORBScheduler) enforceOptionExits(ctx context.Context) {
 	// second, naked sell. held is nil only when the positions read fails; in that
 	// (rare, transient) window we still attempt the protective exit.
 	held := s.heldOptionSymbols(ctx)
+	// Working sell-to-close orders the broker still has open, keyed by OCC symbol.
+	// Adopting these covers the restart case: pendingOptionExits is in-memory, so
+	// after a restart an in-flight exit sell would be untracked and re-sent — the
+	// broker's own open-orders are the durable source of truth.
+	workingSells := s.workingOptionSells(ctx)
 	for _, t := range trades {
+		// Adopt an in-flight exit sell the broker holds for this contract that we are
+		// not tracking in memory (e.g. after a restart), so it's polled below rather
+		// than duplicated by a fresh sell. Re-derive the exit reason from the current
+		// conditions so the recorded exit_type stays one of the valid values (the
+		// original trigger is lost across the restart); default to the EOD flatten
+		// when no live condition fires.
+		if _, tracked := s.pendingOptionExits[t.ID]; !tracked {
+			if oid, working := workingSells[t.OCCSymbol]; working {
+				reason, exit := s.optionExit.plan(ctx, t, now, sessionEnding)
+				if !exit || reason == "" {
+					reason = optExitEOD
+				}
+				s.pendingOptionExits[t.ID] = pendingExit{orderID: oid, reason: reason}
+			}
+		}
+		// If an exit sell is already in flight for this trade, poll it instead of
+		// submitting another — otherwise a not-yet-filled sell would be re-sent every
+		// sweep, stacking multiple sell-to-close orders on one position.
+		if pe, ok := s.pendingOptionExits[t.ID]; ok {
+			if s.pollPendingOptionExit(ctx, t, pe) {
+				continue // recorded, still working, or transient error — handled
+			}
+			// else: the tracked order is terminal-but-unfilled — fall through to
+			// attempt a fresh exit below.
+		}
+
 		reason, exit := s.optionExit.plan(ctx, t, now, sessionEnding)
 		if !exit {
 			continue
 		}
-		var exitPrice float64
-		exitSource := "broker"
+
 		if held != nil && !held[t.OCCSymbol] {
 			// Already flat at the broker — do NOT re-sell. Record the close with a
 			// best-effort price; the reconciler (#416) heals the exact fill.
-			exitPrice = s.optionExit.estimateExitPrice(ctx, t)
-			exitSource = "reconcile"
-		} else {
-			px, confirmed, err := s.optionExit.closeOption(ctx, t)
-			if err != nil {
-				slog.Error("orb options: exit close failed",
-					"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "err", err)
-				continue
-			}
-			if !confirmed {
-				// Sell placed but not confirmed filled. Do NOT close the row — that
-				// would orphan a still-held option. Retry next sweep; once the
-				// position clears, the flat-guard records it (no duplicate sell).
-				slog.Warn("orb options: exit sell not confirmed filled; leaving open to retry",
-					"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason)
-				continue
-			}
-			exitPrice = px
-		}
-		// Long option: realized P&L uses the long formula regardless of ORB direction.
-		pnl := ExitPnLM("buy", t.FillPrice, exitPrice, t.Qty, t.Multiplier)
-		if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, reason, exitSource, exitPrice, pnl); dbErr != nil {
-			slog.Error("orb options: close DB record failed",
-				"ticker", t.Ticker, "occ", t.OCCSymbol, "err", dbErr)
+			s.recordOptionClose(ctx, t, reason, "reconcile", s.optionExit.estimateExitPrice(ctx, t))
+			delete(s.pendingOptionExits, t.ID)
 			continue
 		}
-		delete(s.trackedTrades, t.OrderID)
-		s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-			OrderID: t.OrderID, Ticker: t.Ticker, Side: t.Side, Status: "closed",
-		})
-		slog.Info("orb options: exit",
-			"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason,
-			"exit_price", exitPrice, "exit_source", exitSource, "pnl", pnl)
+
+		px, confirmed, orderID, err := s.optionExit.closeOption(ctx, t)
+		if err != nil {
+			slog.Error("orb options: exit close failed",
+				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "err", err)
+			continue
+		}
+		if !confirmed {
+			// Sell submitted but not confirmed filled. Track the in-flight order so
+			// the next sweep POLLS it (above) rather than sending a second sell, and
+			// leave the row open until the fill confirms.
+			s.pendingOptionExits[t.ID] = pendingExit{orderID: orderID, reason: reason}
+			slog.Warn("orb options: exit sell not confirmed; tracking order to poll",
+				"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason, "order_id", orderID)
+			continue
+		}
+		s.recordOptionClose(ctx, t, reason, "broker", px)
+		delete(s.pendingOptionExits, t.ID)
 	}
+}
+
+// pendingExit records an exit sell that was submitted but not yet confirmed filled,
+// so it can be polled instead of re-sent.
+type pendingExit struct {
+	orderID string
+	reason  string
+}
+
+// pollPendingOptionExit checks an in-flight exit sell. It returns true when the
+// trade is handled for this sweep (filled-and-recorded, still working, or a
+// transient status-check error — in all of which no new sell should be sent), and
+// false only when the order is terminal-but-unfilled (rejected/cancelled/gone), so
+// the caller attempts a fresh exit.
+func (s *ORBScheduler) pollPendingOptionExit(ctx context.Context, t store.ORBTrade, pe pendingExit) bool {
+	res, err := s.executor.GetOrderStatus(ctx, pe.orderID)
+	if err != nil {
+		if errors.Is(err, execution.ErrOrderNotFound) {
+			delete(s.pendingOptionExits, t.ID) // gone at broker — re-attempt
+			return false
+		}
+		slog.Warn("orb options: exit status check failed; will retry",
+			"occ", t.OCCSymbol, "order_id", pe.orderID, "err", err)
+		return true // transient — do NOT re-sell this sweep
+	}
+	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
+		s.recordOptionClose(ctx, t, pe.reason, "broker", res.FilledPrice)
+		delete(s.pendingOptionExits, t.ID)
+		return true
+	}
+	if !execution.IsTerminalOrderStatus(res.Status) {
+		return true // still working — wait for the fill
+	}
+	delete(s.pendingOptionExits, t.ID) // terminal but not filled — re-attempt
+	return false
+}
+
+// recordOptionClose writes the exit to the trade row (multiplier-correct P&L),
+// untracks it, and publishes the update.
+func (s *ORBScheduler) recordOptionClose(ctx context.Context, t store.ORBTrade, reason, exitSource string, exitPrice float64) {
+	pnl := ExitPnLM("buy", t.FillPrice, exitPrice, t.Qty, t.Multiplier)
+	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, reason, exitSource, exitPrice, pnl); dbErr != nil {
+		slog.Error("orb options: close DB record failed",
+			"ticker", t.Ticker, "occ", t.OCCSymbol, "err", dbErr)
+		return
+	}
+	delete(s.trackedTrades, t.OrderID)
+	s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+		OrderID: t.OrderID, Ticker: t.Ticker, Side: t.Side, Status: "closed",
+	})
+	slog.Info("orb options: exit",
+		"ticker", t.Ticker, "occ", t.OCCSymbol, "reason", reason,
+		"exit_price", exitPrice, "exit_source", exitSource, "pnl", pnl)
+}
+
+// workingOptionSells returns the broker's open sell-to-close option orders keyed by
+// OCC symbol (orderID as value), or nil when the broker doesn't expose working
+// orders or the read fails. Used to re-adopt an in-flight exit after a restart.
+func (s *ORBScheduler) workingOptionSells(ctx context.Context) map[string]string {
+	lister, ok := s.executor.(execution.WorkingOrdersLister)
+	if !ok {
+		return nil
+	}
+	orders, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		slog.Warn("orb options: working orders read failed", "err", err)
+		return nil
+	}
+	out := make(map[string]string)
+	for _, o := range orders {
+		if strings.EqualFold(o.Side, "sell") && execution.IsOCCSymbol(o.Ticker) {
+			out[o.Ticker] = o.OrderID
+		}
+	}
+	return out
 }
 
 // heldOptionSymbols returns the set of OCC symbols the broker currently holds as
@@ -252,14 +347,12 @@ func (m *OptionExitManager) plan(ctx context.Context, t store.ORBTrade, now time
 // a long, so this is a SELL order regardless of the ORB direction (which only chose
 // call vs put at entry).
 //
-// It returns (fillPrice, confirmed, err). confirmed is true ONLY when the broker
-// reports the sell as filled with a real price. An 'accepted'/pending market order
-// returns confirmed=false so the caller does NOT record the close — otherwise a
-// sell that later rejects or never fills would leave a live option marked 'closed'
-// and unmanaged, violating the intraday-flatten invariant. The caller retries on
-// the next sweep; the flat-guard there records the close (and prevents a duplicate
-// sell) once the position actually clears.
-func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (fillPrice float64, confirmed bool, err error) {
+// It returns (fillPrice, confirmed, orderID, err). confirmed is true ONLY when the
+// broker reports the sell as filled with a real price. An 'accepted'/pending market
+// order returns confirmed=false with the broker orderID, so the caller can TRACK
+// and poll that order next sweep instead of submitting a second sell-to-close (and
+// does not record the close, which would orphan a still-held option).
+func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (fillPrice float64, confirmed bool, orderID string, err error) {
 	var expiry time.Time
 	if t.Expiry != nil {
 		expiry = *t.Expiry
@@ -281,12 +374,12 @@ func (m *OptionExitManager) closeOption(ctx context.Context, t store.ORBTrade) (
 		Option:   &contract,
 	})
 	if err != nil {
-		return 0, false, err
+		return 0, false, "", err
 	}
 	if execution.NormalizeOrderStatus(res.Status) == "filled" && res.FilledPrice > 0 {
-		return res.FilledPrice, true, nil
+		return res.FilledPrice, true, res.BrokerOrderID, nil
 	}
-	return 0, false, nil
+	return 0, false, res.BrokerOrderID, nil
 }
 
 // estimateExitPrice is the best available exit price without a broker fill: the

@@ -155,6 +155,38 @@ func TestResolveOptionContracts(t *testing.T) {
 	}
 }
 
+func TestAlpacaGetWorkingOrders(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/orders" || r.URL.Query().Get("status") != "open" {
+			t.Errorf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		io.WriteString(w, `[
+			{"id":"o1","symbol":"SPY260717C00551000","side":"sell","status":"accepted","qty":"2","filled_qty":"0","limit_price":"0"},
+			{"id":"o2","symbol":"AAPL","side":"buy","status":"new","qty":"10","filled_qty":"3","limit_price":"200"}
+		]`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, dataURL: ts.URL, optionFeed: "opra", httpClient: ts.Client()}
+
+	orders, err := b.GetWorkingOrders(context.Background())
+	if err != nil {
+		t.Fatalf("GetWorkingOrders: %v", err)
+	}
+	if len(orders) != 2 {
+		t.Fatalf("len = %d; want 2", len(orders))
+	}
+	// The option sell order maps to its OCC symbol with remaining qty.
+	var opt *WorkingOrder
+	for i := range orders {
+		if orders[i].OrderID == "o1" {
+			opt = &orders[i]
+		}
+	}
+	if opt == nil || opt.Ticker != "SPY260717C00551000" || opt.Side != "sell" || opt.RemainingQty != 2 || opt.Status != "pending" {
+		t.Errorf("option working order = %+v", opt)
+	}
+}
+
 func TestPlaceOptionOrder(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/orders" || r.Method != http.MethodPost {

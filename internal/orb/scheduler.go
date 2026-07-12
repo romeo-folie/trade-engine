@@ -110,6 +110,7 @@ type ORBScheduler struct {
 	lastOptionExitCheckAt   time.Time                // wall time of the last options-ORB exit sweep
 	lastOptionOrphanCheckAt time.Time                // wall time of the last options-ORB orphan sweep
 	alertedOrphanOptions    map[string]struct{}      // OCC symbols already alerted as orphans (re-armed on resolve)
+	pendingOptionExits      map[string]pendingExit   // DB trade ID → in-flight exit sell (polled, not re-sent)
 
 	mu                      sync.Mutex // protects state, session, candidates for TUI reads
 	state                   State
@@ -188,6 +189,7 @@ func NewORBScheduler(
 		fetchLastAttempt:       make(map[string]time.Time),
 		alertedOrphanLegs:      make(map[string]struct{}),
 		alertedOrphanPositions: make(map[string]struct{}),
+		pendingOptionExits:     make(map[string]pendingExit),
 		directionDecisions:     make(map[string][2]bool),
 	}
 }
