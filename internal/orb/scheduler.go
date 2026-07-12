@@ -91,20 +91,21 @@ type CandidateScanner interface {
 
 // ORBScheduler implements the time-gated ORB state machine.
 type ORBScheduler struct {
-	cfg         config.ORBConfig
-	db          *pgxpool.Pool
-	marketData  data.MarketDataProvider
-	analyzer    *analysis.Analyzer
-	executor    execution.Executor
-	portfolio   PortfolioValuer
-	notifier    Notifier
-	news        data.NewsProvider        // optional; nil disables news enrichment
-	bus         *events.Bus              // optional; nil means no event publishing
-	now         func() time.Time         // injectable for tests
-	scanner     CandidateScanner         // optional; nil uses inline equities scanning
-	forexCfg    *config.ForexORBConfig   // optional; nil means equities mode
-	futuresCfg  *config.FuturesORBConfig // optional; nil means not futures mode
-	feedbackCfg *config.FeedbackConfig   // optional; nil disables feedback enrichment
+	cfg           config.ORBConfig
+	db            *pgxpool.Pool
+	marketData    data.MarketDataProvider
+	analyzer      *analysis.Analyzer
+	executor      execution.Executor
+	portfolio     PortfolioValuer
+	notifier      Notifier
+	news          data.NewsProvider        // optional; nil disables news enrichment
+	bus           *events.Bus              // optional; nil means no event publishing
+	now           func() time.Time         // injectable for tests
+	scanner       CandidateScanner         // optional; nil uses inline equities scanning
+	forexCfg      *config.ForexORBConfig   // optional; nil means equities mode
+	futuresCfg    *config.FuturesORBConfig // optional; nil means not futures mode
+	feedbackCfg   *config.FeedbackConfig   // optional; nil disables feedback enrichment
+	optionsRouter *OptionsRouter           // optional; nil disables options-ORB execution (default). Wired by #418.
 
 	mu                      sync.Mutex // protects state, session, candidates for TUI reads
 	state                   State
@@ -1276,6 +1277,22 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				params BracketParams
 			}{{"buy", buyParams}, {"sell", sellParams}} {
 				if p.params.Qty == 0 {
+					continue
+				}
+				// Options-ORB (issue #414): for options-mode underlyings, execute this
+				// side as a long option instead of a bracket. Guarded by a nil-by-default
+				// router, so the equity/forex/futures bracket path below is unchanged.
+				if s.optionsRouter.Handles(ticker) {
+					orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, p.side, p.params)
+					if orderID != "" {
+						// Record the entry so the session's re-entry guard fires — options
+						// have no broker bracket to mark the ticker as entered, so without
+						// this a fresh order would be placed every tick.
+						ids[i] = orderID
+					}
+					if line != "" {
+						msgs = append(msgs, line)
+					}
 					continue
 				}
 				// Split-bracket partial take-profit (Phase 4 live): when the instrument
