@@ -1602,6 +1602,21 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 				}
 				entries[k].res = res
 				entries[k].filled = res.Status == "filled"
+				// Options enter with LIMIT orders, which can partially fill. Treat a
+				// partial fill as a fill (so the held contracts are managed by the exit
+				// watcher, never orphaned by the session-cutoff cancel) and cancel the
+				// unfilled remainder so no further contracts land beyond the recorded row.
+				if !entries[k].filled && res.FilledQty > 0 {
+					if tc := s.trackedTrades[entries[k].id]; tc != nil && tc.isOption {
+						if cerr := CancelOrder(ctx, s.executor, entries[k].id); cerr != nil {
+							slog.Warn("orb: cancel option partial-fill remainder failed",
+								"ticker", ticker, "order_id", entries[k].id, "err", cerr)
+						}
+						slog.Info("orb: option entry partially filled — persisting filled portion, remainder cancelled",
+							"ticker", ticker, "order_id", entries[k].id, "filled_qty", res.FilledQty, "fill_price", res.FilledPrice)
+						entries[k].filled = true
+					}
+				}
 				if entries[k].filled {
 					if entries[k].side == "buy" {
 						buyFilled = true
@@ -1762,8 +1777,11 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 					if orderID == "" {
 						continue
 					}
-					// Reconcile already-filled orders instead of cancelling them.
-					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && res.Status == "filled" {
+					// Reconcile already-filled orders instead of cancelling them. A PARTIAL
+					// fill counts too (res.FilledQty > 0): recording the filled portion as
+					// filled — and cancelling the unfilled remainder — keeps the held
+					// contracts managed instead of orphaning them under a 'cancelled' row.
+					if res, err := s.executor.GetOrderStatus(ctx, orderID); err == nil && (res.Status == "filled" || res.FilledQty > 0) {
 						price := res.FilledPrice
 						if tc := s.trackedTrades[orderID]; tc != nil && !tc.isOption {
 							if corrected, was := sanitizeEntryFill(sides[i], tc.entryStop, price); was {
@@ -1772,7 +1790,14 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 								price = corrected
 							}
 						}
-						slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
+						if res.Status != "filled" {
+							if cerr := CancelOrder(ctx, s.executor, orderID); cerr != nil {
+								slog.Warn("orb: session cleanup: cancel partial-fill remainder failed", "ticker", ticker, "order_id", orderID, "err", cerr)
+							}
+							slog.Info("orb: session cleanup: partial entry fill — persisting filled portion", "side", sides[i], "ticker", ticker, "filled_qty", res.FilledQty, "fill_price", price)
+						} else {
+							slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
+						}
 						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
 						if dbErr != nil {
 							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)

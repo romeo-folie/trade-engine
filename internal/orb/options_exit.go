@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"math"
 	"strings"
 	"time"
 
@@ -220,10 +219,14 @@ func (s *ORBScheduler) workingOptionSells(ctx context.Context) map[string]string
 	return out
 }
 
-// heldOptionQuantities returns the CONTRACT count the broker currently holds per OCC
-// symbol (absolute value), or nil when the positions read fails. The exit sweep caps
+// heldOptionQuantities returns the count of LONG contracts the broker currently
+// holds per OCC symbol, or nil when the positions read fails. The exit sweep caps
 // each sell at this so a prior partial fill (or an already-flat position) can never
-// over-sell into a short; a 0/absent entry means flat.
+// over-sell into a short; a 0/absent entry means "no long contracts to close".
+//
+// Options-ORB is long-only, so a SHORT position (negative qty) is treated as flat —
+// selling it would deepen the short, not close a long. Only positive long holdings
+// are counted.
 func (s *ORBScheduler) heldOptionQuantities(ctx context.Context) map[string]float64 {
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
@@ -232,14 +235,16 @@ func (s *ORBScheduler) heldOptionQuantities(ctx context.Context) map[string]floa
 	}
 	held := make(map[string]float64)
 	for _, p := range positions {
-		qty := math.Abs(p.Quantity)
+		if p.Quantity <= 0 || strings.EqualFold(p.Side, "short") {
+			continue // not a long option position — nothing to sell-to-close
+		}
 		switch {
 		case p.Option != nil && p.Option.OCCSymbol != "":
-			held[p.Option.OCCSymbol] = qty
+			held[p.Option.OCCSymbol] = p.Quantity
 		case execution.IsOCCSymbol(p.Ticker):
 			// Non-broker adapters may not populate Option; for an Alpaca option the
 			// raw symbol is the OCC symbol.
-			held[p.Ticker] = qty
+			held[p.Ticker] = p.Quantity
 		}
 	}
 	return held

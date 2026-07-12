@@ -187,3 +187,23 @@ func TestOptionsSessionEnding(t *testing.T) {
 		t.Error("15:51 ET should be session-ending")
 	}
 }
+
+// TestHeldOptionQuantities_TreatsShortAsFlat verifies the exit sweep counts only
+// LONG option contracts: a short position (negative qty or Side "short") is not
+// "held to close", so the sweep won't sell into a deeper short.
+func TestHeldOptionQuantities_TreatsShortAsFlat(t *testing.T) {
+	longCall := execution.OptionContract{OCCSymbol: "SPY260717C00551000"}
+	shortPut := execution.OptionContract{OCCSymbol: "QQQ260717P00500000"}
+	exec := &stubExecutor{positions: []execution.Position{
+		{Ticker: "SPY260717C00551000", Quantity: 2, Side: "long", Option: &longCall},   // long → held 2
+		{Ticker: "QQQ260717P00500000", Quantity: -1, Side: "short", Option: &shortPut}, // short → excluded
+	}}
+	s := &ORBScheduler{executor: exec}
+	held := s.heldOptionQuantities(context.Background())
+	if held["SPY260717C00551000"] != 2 {
+		t.Errorf("long call held = %v; want 2", held["SPY260717C00551000"])
+	}
+	if _, present := held["QQQ260717P00500000"]; present {
+		t.Error("short option position must not be counted as held (would sell into a deeper short)")
+	}
+}
