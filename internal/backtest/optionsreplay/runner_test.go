@@ -146,7 +146,7 @@ func newTestRunner(t *testing.T, hd HistoricalOptionData) *Runner {
 	}
 	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
 	to := time.Date(2026, 3, 6, 0, 0, 0, 0, etLoc)
-	r, err := NewRunner(context.Background(), hd, []string{"SPY"}, from, to, cfg, nil)
+	r, err := NewRunner(context.Background(), hd, NewMemIVStore(), []string{"SPY"}, from, to, cfg, nil)
 	if err != nil {
 		t.Fatalf("NewRunner: %v", err)
 	}
@@ -269,14 +269,15 @@ func TestGetOptionChain_RequiresAsOf(t *testing.T) {
 	}
 }
 
-func TestBuildIVSeries(t *testing.T) {
+func TestSeedIVHistory(t *testing.T) {
 	p := NewHistChainProvider(fakeHist{volAt: func(time.Time) float64 { return 0.30 }}, 0, 0)
+	ivs := NewMemIVStore()
 	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
 	to := time.Date(2026, 3, 13, 0, 0, 0, 0, etLoc) // ~2 weeks → ~10 weekdays
-	series, err := p.BuildIVSeries(context.Background(), "SPY", from, to, 15)
-	if err != nil {
-		t.Fatalf("BuildIVSeries: %v", err)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("SeedIVHistory: %v", err)
 	}
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
 	if len(series) < 8 {
 		t.Fatalf("expected ~10 weekday IV samples, got %d", len(series))
 	}
@@ -290,22 +291,47 @@ func TestBuildIVSeries(t *testing.T) {
 	}
 }
 
-// TestBuildIVSeries_UTCDates guards the anchoring regression: the CLI parses
-// --from/--to with time.Parse, which yields UTC. If BuildIVSeries floored the day in
-// that UTC location and sampled at midnight+offset, the ATM quote would land in the
-// prior ET evening (market closed) and seed an EMPTY series → every signal fails the
-// IV-rank gate. The fake now respects the request window, so this fails if that
-// anchoring regresses.
-func TestBuildIVSeries_UTCDates(t *testing.T) {
+// TestSeedIVHistory_Idempotent: a second seed over the same window fetches NOTHING
+// (write-through cache hit) — the whole point of persisting.
+func TestSeedIVHistory_Idempotent(t *testing.T) {
+	hd := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	p := NewHistChainProvider(hd, 0, 0)
+	ivs := NewMemIVStore()
+	from := time.Date(2026, 3, 2, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 13, 0, 0, 0, 0, etLoc)
+
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("first seed: %v", err)
+	}
+	afterFirst := hd.quotesAt + hd.listContracts
+	if afterFirst == 0 {
+		t.Fatal("first seed should have fetched data")
+	}
+	// Second run: every day already present → zero new fetches.
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("second seed: %v", err)
+	}
+	if got := hd.quotesAt + hd.listContracts - afterFirst; got != 0 {
+		t.Errorf("second seed made %d fetches; want 0 (cache hit)", got)
+	}
+}
+
+// TestSeedIVHistory_UTCDates guards the anchoring regression: the CLI parses
+// --from/--to with time.Parse, which yields UTC. If seeding floored the day in that
+// UTC location and sampled at midnight+offset, the ATM quote would land in the prior
+// ET evening (market closed) and seed an EMPTY series → every signal fails the IV-rank
+// gate. The fake respects the request window, so this fails if the anchoring regresses.
+func TestSeedIVHistory_UTCDates(t *testing.T) {
 	p := NewHistChainProvider(fakeHist{volAt: func(time.Time) float64 { return 0.30 }}, 0, 0)
+	ivs := NewMemIVStore()
 	from, _ := time.Parse("2006-01-02", "2026-03-02") // UTC, exactly like the CLI
 	to, _ := time.Parse("2006-01-02", "2026-03-13")
-	series, err := p.BuildIVSeries(context.Background(), "SPY", from, to, 15)
-	if err != nil {
-		t.Fatalf("BuildIVSeries: %v", err)
+	if err := p.SeedIVHistory(context.Background(), ivs, "SPY", from, to, 15); err != nil {
+		t.Fatalf("SeedIVHistory: %v", err)
 	}
+	series, _ := ivs.GetIVHistory(context.Background(), "SPY", from, to.Add(24*time.Hour))
 	if len(series) < 8 {
-		t.Fatalf("UTC-parsed dates seeded only %d IV days; expected ~10 — as-of anchoring regressed to a closed-market sample window", len(series))
+		t.Fatalf("UTC-parsed dates seeded only %d IV days; expected ~10 — anchoring regressed to a closed-market sample window", len(series))
 	}
 }
 

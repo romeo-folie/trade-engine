@@ -129,60 +129,72 @@ func (p *HistChainProvider) GetOptionChain(ctx context.Context, underlying strin
 	return snaps, nil
 }
 
-// BuildIVSeries derives a daily ATM implied-volatility series for underlying over
-// [from, to] by inverting the at-the-money option quote on each trading day. It is
-// the historical seed the IV-Rank gate needs: to produce a valid rank on the first
-// backtest day, `from` must reach back at least the IV service's MinSamples of
-// trading days before the window (the caller is responsible for that lookback).
+// SeedIVHistory WRITE-THROUGH-caches the daily ATM implied volatility for underlying
+// over [from, to] into ivstore. For each ET trading day NOT already stored it derives
+// the ATM IV (from the same as-of bar/quote reads the gate uses) and upserts it as a
+// 'derived' point stamped at the sample INSTANT (ref). The first run seeds the window;
+// subsequent runs find the days present and fetch nothing — turning a ~250-day
+// re-fetch every run into a one-time cost, shared with the live gate (both read
+// option_iv_history). To produce a valid rank on the first backtest day, `from` must
+// reach back ≥ the IV service's MinSamples trading days (the caller's lookback).
 //
-// It reuses the same as-of quote reads as the chain provider, so the seed is
-// consistent with what the gate sees intraday. A day with no invertible ATM quote
-// is skipped (the series is sparse, and the rank gate fails closed when the sample
-// count is short — the correct, conservative behavior).
-func (p *HistChainProvider) BuildIVSeries(ctx context.Context, underlying string, from, to time.Time, refMinuteET int) ([]options.DailyIV, error) {
+// A day with no invertible ATM quote is skipped (the series stays sparse and the rank
+// gate fails closed when the sample count is short — the correct, conservative behavior).
+func (p *HistChainProvider) SeedIVHistory(ctx context.Context, ivstore options.IVStore, underlying string, from, to time.Time, refMinuteET int) error {
 	underlying = strings.ToUpper(underlying)
-	var out []options.DailyIV
+	existing, err := ivstore.GetIVHistory(ctx, underlying, from, to)
+	if err != nil {
+		return fmt.Errorf("read seeded IV history for %s: %w", underlying, err)
+	}
+	have := make(map[string]bool, len(existing))
+	for _, d := range existing {
+		have[d.Date.In(etLoc).Format("2006-01-02")] = true
+	}
 	// Iterate ET CALENDAR days regardless of the input timestamps' own location (the
 	// CLI parses --from/--to in UTC): a UTC-midnight day-floor would sample the ATM
-	// quote in the prior ET evening, when the market is closed, and seed an empty
-	// series that fails the IV-rank gate for every signal.
+	// quote in the prior ET evening, when the market is closed.
 	etFrom := from.In(etLoc)
 	day := time.Date(etFrom.Year(), etFrom.Month(), etFrom.Day(), 0, 0, 0, 0, etLoc)
 	for ; !day.After(to); day = day.AddDate(0, 0, 1) {
 		if wd := day.Weekday(); wd == time.Saturday || wd == time.Sunday {
 			continue
 		}
-		// Sample the ATM quote refMinuteET minutes after the 09:30 ET regular-session
-		// open (not after midnight) so the series is comparable day to day and lands
-		// inside real trading hours. time.Date in etLoc resolves DST correctly.
+		if have[day.Format("2006-01-02")] {
+			continue // already seeded — the whole point: no re-fetch
+		}
+		// Sample refMinuteET minutes after the 09:30 ET open (not midnight) so the series
+		// is comparable day to day and lands in real trading hours (DST-safe via etLoc).
 		ref := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, etLoc).
 			Add(time.Duration(refMinuteET) * time.Minute)
-		bars, err := p.data.UnderlyingBars(ctx, underlying, ref, ref.Add(30*time.Minute))
-		if err != nil {
-			// A systemic failure (e.g. 403 no OPRA entitlement) must be visible, not
-			// silently indistinguishable from a thin-data day.
-			slog.Warn("optionsreplay: IV seed underlying bars failed", "underlying", underlying, "at", ref, "err", err)
-			continue
-		}
-		if len(bars) == 0 {
-			continue
-		}
-		spot := bars[0].Close
-		if spot <= 0 {
-			continue
-		}
-		// Nearest listed expiry within a short window, ATM strike nearest spot.
-		iv, ok := p.atmIV(ctx, underlying, ref, spot)
+		iv, ok := p.dailyATMIVAt(ctx, underlying, ref)
 		if !ok {
 			continue
 		}
-		// Stamp at the actual sample INSTANT (not midnight): the IVRank as-of filter is
-		// Date <= asOf, so a midnight stamp would let a same-day breakout BEFORE the
-		// sample time (e.g. a short opening range or a later ref minute) consume IV that
-		// hadn't been observed yet — lookahead. At the ref instant the filter excludes it.
-		out = append(out, options.DailyIV{Date: ref, ATMIV: iv})
+		if err := ivstore.UpsertOptionIV(ctx, underlying, ref, iv, "derived"); err != nil {
+			return fmt.Errorf("persist IV %s %s: %w", underlying, ref.Format("2006-01-02"), err)
+		}
 	}
-	return out, nil
+	return nil
+}
+
+// dailyATMIVAt reads the underlying spot at ref (the first bar close in a 30-minute
+// window) and derives the ATM IV, or false when the day has no usable data.
+func (p *HistChainProvider) dailyATMIVAt(ctx context.Context, underlying string, ref time.Time) (float64, bool) {
+	bars, err := p.data.UnderlyingBars(ctx, underlying, ref, ref.Add(30*time.Minute))
+	if err != nil {
+		// A systemic failure (e.g. 403 no entitlement) must be visible, not silently
+		// indistinguishable from a thin-data day.
+		slog.Warn("optionsreplay: IV seed underlying bars failed", "underlying", underlying, "at", ref, "err", err)
+		return 0, false
+	}
+	if len(bars) == 0 {
+		return 0, false
+	}
+	spot := bars[0].Close
+	if spot <= 0 {
+		return 0, false
+	}
+	return p.atmIV(ctx, underlying, ref, spot)
 }
 
 // atmIV finds the ATM call nearest spot in the front DTE window and inverts its mid.
@@ -218,25 +230,41 @@ func (p *HistChainProvider) atmIV(ctx context.Context, underlying string, at tim
 	return 0, false
 }
 
-// memIVReader is an in-memory options.IVHistoryReader over a precomputed series, so
-// a backtest run needs no option_iv_history DB rows. GetIVHistory returns the
-// oldest-first slice within [from, to], matching the store reader's contract.
-type memIVReader struct {
+// memIVStore is an in-memory options.IVStore for DB-free runs and tests: SeedIVHistory
+// upserts into it and IVRankService reads from it, with no option_iv_history rows. It
+// keeps one entry per ET calendar day (mirroring the store's PK) and filters
+// GetIVHistory on the sample instant like the DB reader.
+type memIVStore struct {
+	mu           sync.Mutex
 	byUnderlying map[string][]options.DailyIV
 }
 
-// NewMemIVReader wraps a per-underlying daily-IV series (as from BuildIVSeries).
-func NewMemIVReader(series map[string][]options.DailyIV) *memIVReader {
-	m := &memIVReader{byUnderlying: make(map[string][]options.DailyIV, len(series))}
-	for u, s := range series {
-		cp := append([]options.DailyIV(nil), s...)
-		sort.Slice(cp, func(i, j int) bool { return cp[i].Date.Before(cp[j].Date) })
-		m.byUnderlying[strings.ToUpper(u)] = cp
-	}
-	return m
+// NewMemIVStore builds an empty in-memory IV store.
+func NewMemIVStore() *memIVStore {
+	return &memIVStore{byUnderlying: map[string][]options.DailyIV{}}
 }
 
-func (m *memIVReader) GetIVHistory(_ context.Context, underlying string, from, to time.Time) ([]options.DailyIV, error) {
+func (m *memIVStore) UpsertOptionIV(_ context.Context, underlying string, asOf time.Time, atmIV float64, _ string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	u := strings.ToUpper(underlying)
+	day := asOf.In(etLoc).Format("2006-01-02")
+	series := m.byUnderlying[u]
+	for i := range series { // one row per ET day — replace if present
+		if series[i].Date.In(etLoc).Format("2006-01-02") == day {
+			series[i] = options.DailyIV{Date: asOf, ATMIV: atmIV}
+			return nil
+		}
+	}
+	series = append(series, options.DailyIV{Date: asOf, ATMIV: atmIV})
+	sort.Slice(series, func(i, j int) bool { return series[i].Date.Before(series[j].Date) })
+	m.byUnderlying[u] = series
+	return nil
+}
+
+func (m *memIVStore) GetIVHistory(_ context.Context, underlying string, from, to time.Time) ([]options.DailyIV, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	all := m.byUnderlying[strings.ToUpper(underlying)]
 	var out []options.DailyIV
 	for _, d := range all {

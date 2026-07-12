@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/options"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
 )
 
@@ -103,6 +104,13 @@ func runOptionsBacktest(ctx context.Context) error {
 	}
 	hd := data.NewAlpacaOptionsHist(apiKey, secret, stocks.DataURL, stocks.BaseURL, btOptSpreadPct)
 
+	// Persist the IV seed to option_iv_history (write-through): the first run seeds the
+	// window, later runs read it back and fetch nothing. Shared with the live gate.
+	if err := store.Connect(ctx); err != nil {
+		return fmt.Errorf("connect DB (for the persisted IV seed): %w", err)
+	}
+	ivstore := options.NewStoreIVStore(store.GetDB())
+
 	rcfg := optionsBacktestConfig(cfg)
 	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct // exit models a market-sell receiving the bid
 	// ETF underlyings are earnings-exempt. Single names hit the earnings gate, which —
@@ -139,7 +147,7 @@ func runOptionsBacktest(ctx context.Context) error {
 		btOptFrom, btOptTo, strings.Join(underlyings, ","))
 	fmt.Println("Seeding IV history and assembling breakouts (this fetches historical option data)…")
 
-	runner, err := optionsreplay.NewRunner(ctx, hd, underlyings, from, to, rcfg, nil)
+	runner, err := optionsreplay.NewRunner(ctx, hd, ivstore, underlyings, from, to, rcfg, nil)
 	if err != nil {
 		return fmt.Errorf("build runner: %w", err)
 	}

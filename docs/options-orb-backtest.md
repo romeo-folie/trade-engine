@@ -83,6 +83,23 @@ Config is read from `options_orb` (gates, sizing, IV window) and `orb`
 (range minutes, risk-reward) — the **same** knobs that drive live, so a backtest
 describes the code that would ship.
 
+### Persisted IV seed (write-through)
+
+The IV-Rank gate needs a trailing daily-ATM-IV series. Rather than re-derive ~250 days
+of it in memory on every run (slow — Alpaca throttles the bar fetches), the backtest
+**write-through-caches** it into `option_iv_history` (migration 040/042): the first run
+seeds the window, and every later run reads it back and fetches **nothing**. This is
+the *same table and reader the live gate uses*, so backtest and live rank against an
+identical series. Requires a DB connection. To pre-seed explicitly (e.g. nightly):
+
+```bash
+te options backfill-iv --underlyings SPY,QQQ --lookback-days 300
+```
+
+The stored `as_of` is the exact 09:45-ET sample instant (not just the day), so the
+gate's as-of filter never includes a same-day sample taken *after* a breakout — no
+lookahead, even for a short opening range.
+
 ## Free-data trade-offs
 
 The backtest runs on Alpaca's free option bars (no $99/mo OPRA subscription), which

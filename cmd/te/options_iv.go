@@ -11,6 +11,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/options"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/spf13/cobra"
 )
@@ -105,27 +106,26 @@ func runBackfillIV(ctx context.Context) error {
 	from := to.AddDate(0, 0, -lookback)
 
 	fmt.Printf("options backfill-iv · %s → %s · %s\n", from.Format("2006-01-02"), to.Format("2006-01-02"), strings.Join(underlyings, ","))
+	ivstore := options.NewStoreIVStore(db)
 	total := 0
 	for _, u := range underlyings {
-		series, err := chain.BuildIVSeries(ctx, u, from, to, ivBackfillRefMinute)
+		// Write-through: fetches + persists only the days not already in option_iv_history,
+		// so re-running daily is cheap. Shared with the backtest's seeding path.
+		if err := chain.SeedIVHistory(ctx, ivstore, u, from, to, ivBackfillRefMinute); err != nil {
+			return fmt.Errorf("seed IV history for %s: %w", u, err)
+		}
+		rows, err := store.GetOptionIVHistory(ctx, db, u, from, to)
 		if err != nil {
-			return fmt.Errorf("derive IV series for %s: %w", u, err)
+			return fmt.Errorf("count IV rows for %s: %w", u, err)
 		}
-		written := 0
-		for _, d := range series {
-			if err := store.UpsertOptionIV(ctx, db, u, d.Date, d.ATMIV, "derived"); err != nil {
-				return fmt.Errorf("upsert IV %s %s: %w", u, d.Date.Format("2006-01-02"), err)
-			}
-			written++
-		}
-		fmt.Printf("  %-6s %d days seeded\n", u, written)
-		total += written
+		fmt.Printf("  %-6s %d days present\n", u, len(rows))
+		total += len(rows)
 	}
-	fmt.Printf("done · %d IV rows upserted\n", total)
+	fmt.Printf("done · %d IV rows present across %s\n", total, strings.Join(underlyings, ","))
 	if total == 0 {
-		// No rows almost always means the OPRA entitlement/date window returned nothing —
-		// fail loud so an operator doesn't think the gate is now populated.
-		return fmt.Errorf("no IV rows derived (check OPRA entitlement + that the window is within Alpaca's ~Feb-2024 option-data coverage)")
+		// No rows almost always means the date window returned nothing — fail loud so an
+		// operator doesn't think the gate is now populated.
+		return fmt.Errorf("no IV rows present (check the window is within Alpaca's ~Feb-2024 option-data coverage)")
 	}
 	return nil
 }

@@ -17,7 +17,7 @@ import (
 // It composes the IVHistoryReader the gate provider consumes.
 type IVStore interface {
 	IVHistoryReader
-	UpsertOptionIV(ctx context.Context, underlying string, date time.Time, atmIV float64, source string) error
+	UpsertOptionIV(ctx context.Context, underlying string, asOf time.Time, atmIV float64, source string) error
 }
 
 // storeIVStore adapts the store package to IVStore, keeping store free of any
@@ -27,8 +27,8 @@ type storeIVStore struct{ db *pgxpool.Pool }
 // NewStoreIVStore wires the IV pipeline to the real database.
 func NewStoreIVStore(db *pgxpool.Pool) IVStore { return storeIVStore{db: db} }
 
-func (s storeIVStore) UpsertOptionIV(ctx context.Context, underlying string, date time.Time, atmIV float64, source string) error {
-	return store.UpsertOptionIV(ctx, s.db, underlying, date, atmIV, source)
+func (s storeIVStore) UpsertOptionIV(ctx context.Context, underlying string, asOf time.Time, atmIV float64, source string) error {
+	return store.UpsertOptionIV(ctx, s.db, underlying, asOf, atmIV, source)
 }
 
 func (s storeIVStore) GetIVHistory(ctx context.Context, underlying string, from, to time.Time) ([]DailyIV, error) {
@@ -76,7 +76,9 @@ func RecordLiveATMIV(ctx context.Context, ivstore IVStore, underlying string, as
 	if !ok {
 		return fmt.Errorf("options: no ATM IV in live chain for %s", underlying)
 	}
-	return ivstore.UpsertOptionIV(ctx, underlying, dayFloor(asOf), iv, "live")
+	// Persist at the precise snapshot instant (not day-floored) so the as-of filter is
+	// lookahead-safe: a same-day intraday breakout before this snapshot won't see it.
+	return ivstore.UpsertOptionIV(ctx, underlying, asOf, iv, "live")
 }
 
 // ─── Bounded up-front derivation ────────────────────────────────────────────
@@ -118,7 +120,7 @@ func BackfillIVHistory(ctx context.Context, ivstore IVStore, hp HistoricalQuoteP
 		if !ok {
 			continue // non-invertible price — skip rather than store a bogus IV
 		}
-		if err := ivstore.UpsertOptionIV(ctx, underlying, dayFloor(qt.Date), iv, "derived"); err != nil {
+		if err := ivstore.UpsertOptionIV(ctx, underlying, qt.Date, iv, "derived"); err != nil {
 			return recorded, fmt.Errorf("options: backfill %s upsert %s: %w", underlying, qt.Date.Format("2006-01-02"), err)
 		}
 		recorded++
