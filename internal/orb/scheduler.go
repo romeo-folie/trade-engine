@@ -1614,6 +1614,24 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 						}
 						slog.Info("orb: option entry partially filled — persisting filled portion, remainder cancelled",
 							"ticker", ticker, "order_id", entries[k].id, "filled_qty", res.FilledQty, "fill_price", res.FilledPrice)
+						// Persist the filled portion WITH its actual contract count so the row
+						// reflects reality — the downstream (qty-agnostic) persist would leave the
+						// ordered size, and the exit sweep's positions-unavailable fallback then
+						// sells the full original quantity. This is guarded on status='pending', so
+						// the downstream persistEntryFill for this winner is a harmless no-op.
+						updated, dbErr := store.FillORBTradePartialByOrderID(ctx, s.db, entries[k].id, res.FilledPrice, int(res.FilledQty))
+						if dbErr != nil {
+							// Leave filled=false and retry next tick. Marking it filled now
+							// would let the qty-agnostic downstream persist heal the row to the
+							// FULL ordered size, re-introducing the over-sell this fix prevents.
+							slog.Error("orb: persist option partial entry failed; will retry", "ticker", ticker, "order_id", entries[k].id, "err", dbErr)
+							continue
+						}
+						if updated {
+							s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+								OrderID: entries[k].id, Ticker: ticker, Side: entries[k].side, Status: "filled", FillPrice: res.FilledPrice,
+							})
+						}
 						entries[k].filled = true
 					}
 				}
@@ -1790,15 +1808,19 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 								price = corrected
 							}
 						}
+						var updated bool
+						var dbErr error
 						if res.Status != "filled" {
 							if cerr := CancelOrder(ctx, s.executor, orderID); cerr != nil {
 								slog.Warn("orb: session cleanup: cancel partial-fill remainder failed", "ticker", ticker, "order_id", orderID, "err", cerr)
 							}
 							slog.Info("orb: session cleanup: partial entry fill — persisting filled portion", "side", sides[i], "ticker", ticker, "filled_qty", res.FilledQty, "fill_price", price)
+							// Persist the actual filled contract count (see the live-poll path).
+							updated, dbErr = store.FillORBTradePartialByOrderID(ctx, s.db, orderID, price, int(res.FilledQty))
 						} else {
 							slog.Info("orb: session cleanup: already filled — persisting", "side", sides[i], "ticker", ticker, "fill_price", price)
+							updated, dbErr = store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
 						}
-						updated, dbErr := store.FillORBTradeByOrderID(ctx, s.db, orderID, price)
 						if dbErr != nil {
 							slog.Error("orb: update filled trade failed", "ticker", ticker, "err", dbErr)
 						}

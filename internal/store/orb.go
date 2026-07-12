@@ -327,6 +327,23 @@ func FillORBTradeByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string
 	return tag.RowsAffected() > 0, nil
 }
 
+// FillORBTradePartialByOrderID marks a pending trade filled AND overwrites qty with
+// the actually-filled contract count. Used when an option limit entry only partially
+// fills: the row must reflect the real quantity, otherwise the exit sweep's
+// full-quantity fallback (when the broker positions read is unavailable) could sell
+// more contracts than are actually held.
+func FillORBTradePartialByOrderID(ctx context.Context, db *pgxpool.Pool, orderID string, fillPrice float64, filledQty int) (bool, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE orb_trades
+		SET status='filled', fill_price=$1, filled_at=NOW(), qty=$2
+		WHERE order_id=$3 AND status='pending'`,
+		fillPrice, filledQty, orderID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // CloseORBTrade records the outcome of an ORB trade once its exit leg (TP or stop)
 // fills. exitType is "tp" or "stop"; exitSource is "broker" (an IBKR fill) or
 // "replay" (reconstructed from bars). pnl is in quote-currency units. (Pending trades

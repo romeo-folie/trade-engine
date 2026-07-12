@@ -281,3 +281,36 @@ func TestGetORBTradeByID_NotFound(t *testing.T) {
 		t.Errorf("expected nil for missing id, got %+v", got)
 	}
 }
+
+// TestFillORBTradePartialByOrderID verifies a partial entry fill persists as filled
+// with the ACTUAL filled quantity (not the ordered size), so the exit sweep's
+// fallback can't over-sell.
+func TestFillORBTradePartialByOrderID(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-partialfill")
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	exp := time.Date(2026, 7, 17, 0, 0, 0, 0, time.UTC)
+	id, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
+		SessionID: sess.ID, Ticker: "SPY", Side: "buy", OrderID: "opt-pf1", Status: "pending",
+		Qty: 10, AssetClass: "option", Underlying: "SPY", Expiry: &exp, Strike: 551, Right: "C",
+		OCCSymbol: "SPY260717C00551000", Multiplier: 100,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// Only 3 of 10 filled.
+	updated, err := store.FillORBTradePartialByOrderID(ctx, db, "opt-pf1", 1.30, 3)
+	if err != nil || !updated {
+		t.Fatalf("partial fill = (%v,%v); want true,nil", updated, err)
+	}
+	got, _ := store.GetORBTradeByID(ctx, db, id)
+	if got == nil || got.Status != "filled" || got.Qty != 3 || got.FillPrice != 1.30 {
+		t.Errorf("row = %+v; want filled, qty 3, fill 1.30", got)
+	}
+}
