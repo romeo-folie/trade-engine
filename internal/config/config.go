@@ -1549,6 +1549,12 @@ func Validate(cfg *Config) []string {
 		if cfg.ORB.MaxCandidates < 1 || cfg.ORB.MaxCandidates > 5 {
 			errs = append(errs, "orb.max_candidates must be 1-5")
 		}
+		// Analyst confidences are on a 0-1 scale, so a threshold > 1 (e.g. the typo 68
+		// for 0.68) can never pass and would silently skip EVERY candidate. 0 means "use
+		// the default"; anything else must be in (0, 1].
+		if cfg.ORB.ScanConfidenceThreshold < 0 || cfg.ORB.ScanConfidenceThreshold > 1 {
+			errs = append(errs, fmt.Sprintf("orb.scan_confidence_threshold must be in [0,1] (0 = default 0.68); got %.3f", cfg.ORB.ScanConfidenceThreshold))
+		}
 		if cfg.ORB.RiskReward < 1.5 {
 			errs = append(errs, "orb.risk_reward must be >= 1.5")
 		}

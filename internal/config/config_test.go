@@ -706,3 +706,35 @@ func TestValidateForexMaxNotionalUSD(t *testing.T) {
 		t.Errorf("expected a max_notional_usd error for the non-USD-quoted pair; got %v", errs)
 	}
 }
+
+// TestValidate_ScanConfidenceThreshold guards the Codex #442 P2: a threshold > 1 (the
+// typo 68 for 0.68) can never pass the 0-1 analyst-confidence gate and would silently
+// skip every ORB candidate — so it must fail startup. 0 (= use default) stays valid.
+func TestValidate_ScanConfidenceThreshold(t *testing.T) {
+	base := func() *Config {
+		c := Defaults()
+		c.ORB.Enabled = true
+		c.ORB.GapThresholdPct = 3.0
+		c.ORB.RangeMinutes = 15
+		c.ORB.MaxCandidates = 2
+		c.ORB.RiskReward = 2.0
+		c.ORB.MaxPositionPct = 20
+		c.ORB.MaxRiskPct = 1.0
+		c.ORB.Mode = "paper"
+		return c
+	}
+	for _, v := range []float64{0, 0.68, 1.0} { // 0 = default; in-range OK
+		c := base()
+		c.ORB.ScanConfidenceThreshold = v
+		if containsStr(Validate(c), "scan_confidence_threshold") {
+			t.Errorf("valid threshold %.2f was flagged: %v", v, Validate(c))
+		}
+	}
+	for _, v := range []float64{68, 1.5, -0.1} { // out of [0,1] must error
+		c := base()
+		c.ORB.ScanConfidenceThreshold = v
+		if !containsStr(Validate(c), "scan_confidence_threshold") {
+			t.Errorf("out-of-range threshold %.2f was NOT flagged", v)
+		}
+	}
+}
