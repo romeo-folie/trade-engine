@@ -302,6 +302,11 @@ func checkMaxDollarRisk(in CheckInput) CheckResult {
 
 func checkMaxOpenPositions(in CheckInput) CheckResult {
 	name := "max_open_positions"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a full position budget must not block the exit that frees a slot.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.OpenPositions < in.Cfg.MaxOpenPositions {
 		return pass(name)
 	}
@@ -316,6 +321,11 @@ func checkMaxOpenPositions(in CheckInput) CheckResult {
 // (risk.max_per_ticker) in your config — config.example.yaml recommends 2.
 func checkMaxPerTicker(in CheckInput) CheckResult {
 	name := "max_per_ticker"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// per-ticker capacity only meaningfully caps opening risk.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.Cfg.MaxPerTicker <= 0 {
 		return pass(name)
 	}
@@ -329,6 +339,11 @@ func checkMaxPerTicker(in CheckInput) CheckResult {
 
 func checkDailyLossLimit(in CheckInput) CheckResult {
 	name := "daily_loss_limit"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a daily-loss pause must still allow closing positions.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.PortfolioValue == 0 {
 		return pass(name) // can't evaluate without portfolio value
 	}
@@ -342,6 +357,11 @@ func checkDailyLossLimit(in CheckInput) CheckResult {
 
 func checkMaxDrawdown(in CheckInput) CheckResult {
 	name := "max_drawdown"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// an emergency drawdown stop must still allow de-risking exits.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.PeakValue == 0 || in.PortfolioValue == 0 {
 		return pass(name)
 	}
@@ -426,6 +446,11 @@ func checkPyramidPolicy(in CheckInput) CheckResult {
 
 func checkCooldownAfterLoss(in CheckInput) CheckResult {
 	name := "cooldown_after_loss"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a post-loss cooldown must not force holding a position.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.LastLossAt.IsZero() || in.Cfg.CooldownAfterLoss == 0 {
 		return pass(name)
 	}

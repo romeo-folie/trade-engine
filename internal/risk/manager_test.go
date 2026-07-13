@@ -979,3 +979,33 @@ func TestPositionSize_SellSkipsSizeCap(t *testing.T) {
 	in.SizePct = in.Cfg.MaxPositionPct + 10
 	assertPasses(t, checkPositionSize, in)
 }
+
+func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
+	// Since #436 a SELL is a close-only exit that strictly reduces risk.
+	// Capacity and trading-pause gates exist to limit NEW risk — blocking
+	// the exit that frees a slot (or de-risks during a pause) is exactly
+	// backwards, and was how a clogged position budget locked itself in.
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.OpenPositions = in.Cfg.MaxOpenPositions + 5           // over budget
+	in.OpenByTicker = map[string]int{in.Ticker: 99}          // over per-ticker cap
+	in.DailyPnL = -1e9                                       // daily-loss pause tripped
+	in.PeakValue = in.PortfolioValue * 100                   // drawdown stop tripped
+	in.LastLossAt = time.Now()                               // cooldown active
+
+	for _, check := range []struct {
+		name string
+		fn   func(CheckInput) CheckResult
+	}{
+		{"max_open_positions", checkMaxOpenPositions},
+		{"max_per_ticker", checkMaxPerTicker},
+		{"daily_loss_limit", checkDailyLossLimit},
+		{"max_drawdown", checkMaxDrawdown},
+		{"cooldown_after_loss", checkCooldownAfterLoss},
+	} {
+		if r := check.fn(in); !r.Passed {
+			t.Fatalf("%s must pass for a SELL exit, failed with: %s", check.name, r.Reason)
+		}
+	}
+}
