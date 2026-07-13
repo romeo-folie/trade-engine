@@ -2047,6 +2047,10 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 		return
 	}
 
+	// Broker-truth guard: bar replay infers a stop/TP touch from market data, which can
+	// fabricate a close on a position the broker still fully holds. Refuse any such close.
+	guard := s.newExitGuard(ctx, trades)
+
 	now := s.now()
 	for i := range trades {
 		t := trades[i]
@@ -2092,6 +2096,11 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 		}
 		if !res.Found {
 			continue // still open — price path never reached a leg within the window
+		}
+		if !guard.allows(&t) {
+			slog.Warn("orb: bar replay: broker still holds the position — deferring replayed close to avoid a phantom",
+				"ticker", t.Ticker, "side", t.Side, "qty", t.Qty, "replay_exit", res.ExitType)
+			continue
 		}
 
 		pnl := exitPnL(t.Side, t.FillPrice, res.ExitPrice, t.Qty)
@@ -2204,6 +2213,10 @@ func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID s
 // using a tuple match: same symbol, opposite side, same qty, fill time after entry, and
 // price within 10% of the TP–SL range of one of the bracket levels.
 func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store.ORBTrade, records []execution.IBKRTradeRecord) {
+	// Broker-truth guard: a trades-feed match near a bracket level can be a stale/unrelated
+	// record that never reduced the position (today's XAG phantom stop on a still-held -850
+	// short). Read positions once and refuse any close the broker hasn't actually made.
+	guard := s.newExitGuard(ctx, trades)
 	for i := range trades {
 		t := &trades[i]
 		if t.Status != "filled" || t.FillPrice == 0 {
@@ -2258,6 +2271,15 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			exitType := "tp"
 			if diffSL < diffTP {
 				exitType = "stop"
+			}
+
+			// Broker-truth gate: only book the close if the broker actually reduced. A match
+			// that leaves the full position held is a phantom — skip it; a genuine exit
+			// records on a later pass once the position read confirms the reduction.
+			if !guard.allows(t) {
+				slog.Warn("orb: exit reconcile: broker still holds the position — deferring matched close to avoid a phantom",
+					"ticker", t.Ticker, "side", t.Side, "qty", t.Qty, "matched_exit", exitType, "matched_price", rec.Price)
+				break
 			}
 
 			pnl := exitPnL(t.Side, t.FillPrice, rec.Price, t.Qty)
