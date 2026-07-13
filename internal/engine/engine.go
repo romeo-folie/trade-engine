@@ -1902,6 +1902,27 @@ func maxFallbackCandleAge(tf data.Timeframe) time.Duration {
 // executeSignal places the order via the executor, creates a trade record, and
 // records the entry order.
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal) {
+	// Market-hours guard (#437): a tick that STARTS before the close can
+	// spend 20+ minutes in analysis and reach execution after 16:00 ET —
+	// 17% of recorded entries landed in the 16:00 hour. After-hours market
+	// orders never fill in-session (day orders expire; GTC bracket entries
+	// queue overnight, far past the fill-poll window) and were recorded as
+	// qty-0 "open" trades that clogged the position budget. Block; the
+	// ticker re-evaluates next session. Applies to SELL exits too — their
+	// market orders equally cannot fill until the open.
+	if !IsMarketOpen(time.Now()) {
+		reason := "market closed — order would not fill this session"
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Warn("signal blocked", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "market_hours",
+		})
+		return
+	}
+
 	side := execution.OrderSideBuy
 	direction := "long"
 	if sig.Action == string(analysis.ActionSell) {
@@ -2152,6 +2173,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					lastQty = status.FilledQty
 				}
 				if execution.IsTerminalOrderStatus(status.Status) {
+					if status.FilledQty == 0 && lastQty == 0 {
+						// Terminal with ZERO fill (expired / cancelled /
+						// rejected): the entry never happened. Without this,
+						// the qty-0 row stayed "open" forever — the IREN/MU/
+						// TSLA phantom rows that inflated the position count.
+						e.cancelUnfilledEntry(tradeID, brokerOrderID, sig.Ticker)
+						return
+					}
 					logger.Info("fill poll: order terminal",
 						"trade_id", tradeID,
 						"ticker", sig.Ticker,
@@ -2163,6 +2192,13 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				}
 				logger.Debug("fill poll: order not terminal yet, retrying",
 					"broker_order_id", brokerOrderID, "attempt", i+1, "status", status.Status, "filled_qty", status.FilledQty)
+			}
+			if lastQty == 0 {
+				// Two minutes of polling an in-hours market order with zero
+				// fill: something is wrong. Cancel rather than leave a qty-0
+				// "open" trade the position counter treats as real.
+				e.cancelUnfilledEntry(tradeID, brokerOrderID, sig.Ticker)
+				return
 			}
 			logger.Warn("fill poll: order not terminal after max retries — recorded last known fill; reconciler will surface any residue",
 				"trade_id", tradeID,
@@ -2208,6 +2244,15 @@ func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {
 	}
 
 	e.executeSignal(ctx, sigID, *sig)
+
+	// executeSignal reports blocks by updating the signal row, not by
+	// returning an error — re-fetch so a manual approver (CLI/Telegram)
+	// gets the real outcome instead of "approved and executing" while the
+	// signal sits blocked (e.g. the market-hours guard on an after-hours
+	// approval, review catch on #437).
+	if after, err := store.GetSignalByID(ctx, sigID); err == nil && after != nil && after.Status == "blocked" {
+		return fmt.Errorf("signal %s blocked at execution: %s", sigID, after.BlockReason)
+	}
 	return nil
 }
 

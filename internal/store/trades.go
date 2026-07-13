@@ -63,6 +63,21 @@ func UpdateTradeEntryPrice(ctx context.Context, id string, entryPrice, quantity 
 	return err
 }
 
+// CancelUnfilledTrade marks an open, zero-quantity trade row cancelled — the
+// cleanup for an entry order that died (expired/cancelled/rejected) or went
+// permanently silent with no fill. Guarded to quantity=0 AND status='open'
+// so it can never cancel a trade that received any fill; returns whether a
+// row was actually cancelled.
+func CancelUnfilledTrade(ctx context.Context, id string) (bool, error) {
+	tag, err := GetDB().Exec(ctx, `
+		UPDATE trades SET status='cancelled', closed_at=NOW()
+		WHERE id=$1 AND status='open' AND quantity=0`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
 // UpdateOrderFillPrice backfills filled_price and filled_qty on an order row.
 func UpdateOrderFillPrice(ctx context.Context, brokerOrderID string, filledPrice, filledQty float64) error {
 	_, err := GetDB().Exec(ctx, `
