@@ -248,3 +248,32 @@ func TestAlpacaOptionHistoryStart_ETAnchored(t *testing.T) {
 		t.Errorf("floor in ET = %v; want 2024-01-15 00:00 ET (a UTC-midnight floor would land on Jan 14)", got)
 	}
 }
+
+// TestListContracts_FiltersAdjustedSymbols: adjusted / non-standard OCC symbols (a
+// numeric prefix from a corporate action) must be dropped — the bars/quotes endpoints
+// 400 on them, poisoning the whole batch.
+func TestListContracts_FiltersAdjustedSymbols(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"option_contracts":[
+			{"symbol":"SPY250117P00370000","underlying_symbol":"SPY","expiration_date":"2025-01-17","strike_price":"370","type":"put"},
+			{"symbol":"1SPY250117P00370010","underlying_symbol":"SPY","expiration_date":"2025-01-17","strike_price":"370.01","type":"put"}]}`))
+	}))
+	defer srv.Close()
+
+	a := NewAlpacaOptionsHist("k", "s", srv.URL, srv.URL, 0.03)
+	from := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2025, 1, 31, 0, 0, 0, 0, time.UTC)
+	cs, err := a.ListContracts(context.Background(), "SPY", "put", from, to)
+	if err != nil {
+		t.Fatalf("ListContracts: %v", err)
+	}
+	for _, c := range cs {
+		if c.OCCSymbol == "1SPY250117P00370010" {
+			t.Errorf("adjusted symbol %q must be filtered out (would 400 the bars batch)", c.OCCSymbol)
+		}
+	}
+	// The standard symbol survives (deduped across active+inactive → 1 unique).
+	if len(cs) != 1 || cs[0].OCCSymbol != "SPY250117P00370000" {
+		t.Errorf("expected only the standard contract, got %+v", cs)
+	}
+}
