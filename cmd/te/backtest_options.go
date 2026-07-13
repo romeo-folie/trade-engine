@@ -25,6 +25,14 @@ var (
 	btOptETFs        string
 	btOptPremium     float64
 	btOptMaxLoss     float64
+	// Strategy levers (override the gate/exit config for tuning sweeps; <=0 keeps the
+	// config/default value).
+	btOptTimeExitMin int
+	btOptDeltaMin    float64
+	btOptDeltaMax    float64
+	btOptMaxDTE      int
+	btOptIVRankCeil  float64
+	btOptRiskReward  float64
 )
 
 func init() {
@@ -35,6 +43,12 @@ func init() {
 	orbOptionsCmd.Flags().StringVar(&btOptETFs, "etf-underlyings", "SPY,QQQ", "Comma-separated earnings-exempt ETFs. Single names hit the earnings gate, which fails closed with no earnings feed, so the backtest is ETF-only")
 	orbOptionsCmd.Flags().Float64Var(&btOptPremium, "premium-budget", 1000, "Dollars of premium to deploy per trade (sizing). options_orb.premium_budget if 0")
 	orbOptionsCmd.Flags().Float64Var(&btOptMaxLoss, "max-loss-per-trade", 0, "Hard cap on premium at risk per trade (0 = no extra cap beyond the budget)")
+	orbOptionsCmd.Flags().IntVar(&btOptTimeExitMin, "time-exit-minutes", -1, "IV-crush time exit: flatten a not-in-profit position after N minutes held. -1 = use config; 0 = force-disable; N = N minutes. Cuts theta bleed from all-day holds")
+	orbOptionsCmd.Flags().Float64Var(&btOptDeltaMin, "delta-min", 0, "Lower |delta| bound for strike selection (0 = gate default 0.50). Higher = deeper ITM = less theta, more directional")
+	orbOptionsCmd.Flags().Float64Var(&btOptDeltaMax, "delta-max", 0, "Upper |delta| bound (0 = gate default 0.60)")
+	orbOptionsCmd.Flags().IntVar(&btOptMaxDTE, "max-dte", 0, "Max days-to-expiry for the chosen contract (0 = gate default 5). Longer = less theta/day")
+	orbOptionsCmd.Flags().Float64Var(&btOptIVRankCeil, "iv-rank-ceiling", 0, "Abort if IV rank ≥ this percent (0 = gate default 70)")
+	orbOptionsCmd.Flags().Float64Var(&btOptRiskReward, "risk-reward", 0, "Underlying target = entry ± risk × this (0 = orb.risk_reward default)")
 	_ = orbOptionsCmd.MarkFlagRequired("from")
 	_ = orbOptionsCmd.MarkFlagRequired("to")
 	backtestCmd.AddCommand(orbOptionsCmd)
@@ -130,6 +144,41 @@ func runOptionsBacktest(ctx context.Context) error {
 	rcfg := optionsBacktestConfig(cfg)
 	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct        // exit models a market-sell receiving the bid
 	rcfg.IVHistoryFloor = data.AlpacaOptionHistoryStart // don't seed IV before Alpaca has data
+
+	// Strategy-lever overrides (>0 wins over the config/default), for tuning sweeps.
+	if btOptTimeExitMin >= 0 { // -1 = unset (keep config); 0 explicitly disables the time exit
+		rcfg.Replay.TimeExitMinutes = btOptTimeExitMin
+	}
+	if btOptDeltaMin > 0 {
+		rcfg.Gate.DeltaMin = btOptDeltaMin
+	}
+	if btOptDeltaMax > 0 {
+		rcfg.Gate.DeltaMax = btOptDeltaMax
+	}
+	if btOptMaxDTE > 0 {
+		rcfg.Gate.MaxDTE = btOptMaxDTE
+	}
+	if btOptIVRankCeil > 0 {
+		rcfg.Gate.IVRankCeiling = btOptIVRankCeil
+	}
+	if btOptRiskReward > 0 {
+		rcfg.Assemble.RiskReward = btOptRiskReward
+	}
+	// Guard the delta band against silent inversion: setting only one bound (a natural
+	// one-lever sweep) can leave min > max against the other's default, so EVERY contract
+	// aborts at the delta gate — indistinguishable from "no such contract". Check the
+	// EFFECTIVE band (0 → the gate's default, which NewEngine would apply).
+	gdef := options.DefaultGateConfig()
+	effDeltaMin, effDeltaMax := rcfg.Gate.DeltaMin, rcfg.Gate.DeltaMax
+	if effDeltaMin <= 0 {
+		effDeltaMin = gdef.DeltaMin
+	}
+	if effDeltaMax <= 0 {
+		effDeltaMax = gdef.DeltaMax
+	}
+	if effDeltaMin > effDeltaMax {
+		return fmt.Errorf("delta band inverted: min %.2f > max %.2f — every contract would abort at the delta gate (set both --delta-min and --delta-max)", effDeltaMin, effDeltaMax)
+	}
 	// ETF underlyings are earnings-exempt. Single names hit the earnings gate, which —
 	// with no earnings provider wired for the backtest — fails CLOSED, so the backtest
 	// is effectively ETF-only. Mark the configured/flagged ETFs so SPY/QQQ aren't
