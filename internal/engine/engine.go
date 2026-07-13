@@ -1904,10 +1904,6 @@ func maxFallbackCandleAge(tf data.Timeframe) time.Duration {
 func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal) {
 	side := execution.OrderSideBuy
 	direction := "long"
-	if sig.Action == string(analysis.ActionSell) {
-		side = execution.OrderSideSell
-		direction = "short"
-	}
 
 	// Ensure signal price is populated before sizing/execution.
 	if sig.SignalPrice <= 0 {
@@ -1932,6 +1928,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
 			BlockReason: reason, FailedCheck: "signal price",
 		})
+		return
+	}
+
+	// SELL = close the ticker's open long (sell_exit.go, #436). Routed
+	// AFTER the signal-price validation above so a SELL can never execute
+	// (or worse, close lots) against a zero price — the paper executor
+	// fills market orders at LimitPrice, so a zero would become a permanent
+	// fabricated ~-100%% exit that no reconciler heals. The old branch here
+	// placed a cash-sized market sell and booked a brand-new SHORT trade
+	// row, leaving the long rows open forever — phantom long+short pairs.
+	// Genuine shorting was never supported: the ownership gate (#306) only
+	// lets SELL through when an open long exists.
+	if sig.Action == string(analysis.ActionSell) {
+		e.executeSellExit(ctx, sigID, sig)
 		return
 	}
 
@@ -1984,28 +1994,6 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		} else {
 			logger.Warn("bracket exits: sized under one whole share — falling back to app-managed exits",
 				"ticker", sig.Ticker, "qty", qty)
-		}
-	}
-
-	// A SELL must not race the ticker's working exit legs: they hold the
-	// long's shares at the broker, and Alpaca rejects a sell of held shares.
-	// Not gated on bracket_exits_enabled — legs placed before a flag flip
-	// must still be cleared (no-op when the ticker has no leg rows). When a
-	// cancel cannot be CONFIRMED, the sell must not proceed: a still-live
-	// leg would race it. Block the signal; the next cycle re-evaluates with
-	// reconciled state.
-	if side == execution.OrderSideSell {
-		if !e.cancelBracketLegsForTicker(ctx, sig.Ticker) {
-			reason := "working exit legs could not be confirmed cancelled — sell would race a live bracket leg"
-			if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
-				logger.Warn("update signal status", "id", sigID, "err", err)
-			}
-			logger.Warn("sell blocked", "ticker", sig.Ticker, "reason", reason)
-			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
-				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
-				BlockReason: reason, FailedCheck: "bracket_leg_cancel",
-			})
-			return
 		}
 	}
 

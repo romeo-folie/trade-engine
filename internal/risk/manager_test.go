@@ -242,17 +242,16 @@ func TestPositionOwnership_SellWithSufficientPosition(t *testing.T) {
 	assertPasses(t, checkPositionOwnership, in)
 }
 
-func TestPositionOwnership_SellExceedsHeldQuantity(t *testing.T) {
+func TestPositionOwnership_SellSmallPositionStillPasses(t *testing.T) {
+	// Since #436 a SELL closes the HELD quantity, so a held position
+	// smaller than the signal's cash-derived size must NOT block the exit
+	// (the old oversell check did exactly that).
 	in := baseInput()
 	in.Action = "SELL"
 	in.Ticker = "HIMS"
 	in.HoldsLong = true
-	// proposedQty = (5000 * 2.0/100) / 100.0 = 1.0; held = 0.5 → oversell
 	in.LongQuantity = 0.5
-	r := assertFails(t, checkPositionOwnership, in)
-	if r.Name != "position_ownership" {
-		t.Fatalf("wrong check name: %s", r.Name)
-	}
+	assertPasses(t, checkPositionOwnership, in)
 }
 
 func TestPositionOwnership_SellWithoutPosition(t *testing.T) {
@@ -969,4 +968,14 @@ func TestNoPositionBlockReason_FormatStable(t *testing.T) {
 			t.Errorf("expected reason to contain %q, got %q", want, reason)
 		}
 	}
+}
+
+func TestPositionSize_SellSkipsSizeCap(t *testing.T) {
+	// Since #436 a SELL's executed size is the held quantity, not the
+	// analyst's size_pct — an oversized proposal must not block the exit.
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.SizePct = in.Cfg.MaxPositionPct + 10
+	assertPasses(t, checkPositionSize, in)
 }

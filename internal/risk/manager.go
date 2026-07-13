@@ -234,6 +234,12 @@ func checkRiskReward(in CheckInput) CheckResult {
 
 func checkPositionSize(in CheckInput) CheckResult {
 	name := "position_size_limit"
+	// SELLs close the HELD quantity (#436) — their executed size is never
+	// derived from size_pct, so capping the analyst's proposal would only
+	// block legitimate exits (same skip pattern as checkMaxDollarRisk).
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.SizePct <= in.Cfg.MaxPositionPct {
 		return pass(name)
 	}
@@ -355,17 +361,11 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 	if !in.HoldsLong {
 		return fail(name, NoPositionBlockReason(in.Ticker))
 	}
-	// Verify the proposed sell quantity does not exceed shares held.
-	// Overselling would result in a net short even with a position check.
-	if in.SignalPrice > 0 && in.LongQuantity > 0 {
-		proposedQty := (in.Cash * in.SizePct / 100) / in.SignalPrice
-		if proposedQty > in.LongQuantity {
-			return fail(name, fmt.Sprintf(
-				"sell qty %.2f exceeds held long %.2f in %s",
-				proposedQty, in.LongQuantity, in.Ticker,
-			))
-		}
-	}
+	// No oversell check: since #436 a SELL closes the HELD long quantity —
+	// the executed size is derived from the open lots, never from the
+	// signal's cash-based size_pct, so a size proposal can't over-sell. The
+	// old cash-derived check here could wrongly block legitimate exits when
+	// cash × size_pct exceeded the (smaller) held position.
 	return pass(name)
 }
 

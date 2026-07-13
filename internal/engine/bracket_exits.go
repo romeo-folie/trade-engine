@@ -284,10 +284,9 @@ func (e *Engine) bookBracketClose(ctx context.Context, t store.Trade, exitPrice,
 // an optimistic mark on a failed cancel would make the monitor treat the
 // trade as app-managed while a live leg still works the position.
 //
-// NOTE: this serves the existing SELL flow, which does NOT close the long
-// trade rows (it books a new short row — pre-existing bug, tracked for a
-// dedicated fix). Cancelling the legs here keeps that flow from being
-// broker-rejected and ensures no orphaned exit legs outlive the position.
+// Called by executeSellExit (#436) before its market sell: the SELL closes
+// every open long lot, so no exit leg may outlive the position or hold its
+// shares when the sell hits the broker.
 func (e *Engine) cancelBracketLegsForTicker(ctx context.Context, ticker string) bool {
 	openTrades, err := store.GetOpenTrades(ctx)
 	if err != nil {
