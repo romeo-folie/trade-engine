@@ -2,10 +2,18 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrNoEarningsCoverage means the symbol has NO rows in earnings_calendar at all — the
+// calendar was never seeded/synced for it, so we're blind to its earnings. The gate must
+// fail CLOSED on this (never trade a single name we can't earnings-check), distinct from a
+// covered symbol that simply has no imminent report.
+var ErrNoEarningsCoverage = errors.New("no earnings coverage for symbol")
 
 // EarningsEvent is one scheduled or historical earnings release (migration 045).
 type EarningsEvent struct {
@@ -32,10 +40,17 @@ func UpsertEarnings(ctx context.Context, db *pgxpool.Pool, symbol string, date t
 }
 
 // NextEarningsOnOrAfter returns the earliest earnings date on or after asOf's ET calendar
-// day for symbol. ok=false when none is scheduled — the earnings gate treats "none" as "no
-// imminent earnings" (dates are public, so absence is real signal, not blindness). The
-// comparison is day-granular, matching the gate's N-day blackout window.
-func NextEarningsOnOrAfter(ctx context.Context, db *pgxpool.Pool, symbol string, asOf time.Time) (time.Time, bool) {
+// day for symbol. Three outcomes the gate must treat differently:
+//
+//	(date, true, nil)   — a next earnings date was found; the gate checks the blackout.
+//	(zero, false, nil)  — the symbol IS covered but has no imminent/upcoming date → SAFE:
+//	                      absence within a covered calendar is real signal (public dates),
+//	                      so the gate passes.
+//	(zero, false, err)  — a read error, OR ErrNoEarningsCoverage (symbol never seeded/synced)
+//	                      → BLIND: the gate must fail CLOSED, never trade unchecked.
+//
+// The date comparison is day-granular, matching the gate's N-day blackout window.
+func NextEarningsOnOrAfter(ctx context.Context, db *pgxpool.Pool, symbol string, asOf time.Time) (time.Time, bool, error) {
 	var d time.Time
 	err := db.QueryRow(ctx, `
 		SELECT earnings_date FROM earnings_calendar
@@ -43,10 +58,22 @@ func NextEarningsOnOrAfter(ctx context.Context, db *pgxpool.Pool, symbol string,
 		ORDER BY earnings_date ASC
 		LIMIT 1`,
 		symbol, asOf).Scan(&d)
-	if err != nil {
-		return time.Time{}, false // no row (or read error) → treat as "none scheduled"
+	if err == nil {
+		return d, true, nil
 	}
-	return d, true
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return time.Time{}, false, err // real read error (DB down, migration missing) → fail closed
+	}
+	// No upcoming date. Distinguish a covered-but-quiet calendar (safe) from a symbol with
+	// zero coverage (blind → fail closed).
+	var covered bool
+	if cErr := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM earnings_calendar WHERE symbol = $1)`, symbol).Scan(&covered); cErr != nil {
+		return time.Time{}, false, cErr
+	}
+	if !covered {
+		return time.Time{}, false, ErrNoEarningsCoverage
+	}
+	return time.Time{}, false, nil // covered, nothing imminent → safe pass
 }
 
 // GetEarnings returns a symbol's earnings dates within [from, to], oldest first (for

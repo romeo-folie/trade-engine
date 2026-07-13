@@ -34,8 +34,9 @@ func NewStoreProvider(db *pgxpool.Pool, asOf func(context.Context) time.Time) *S
 }
 
 // NextEarnings returns the next scheduled earnings date on or after the as-of day for
-// underlying, or ok=false when none is stored (no imminent earnings). Satisfies
-// options.EarningsProvider.
-func (p *StoreProvider) NextEarnings(ctx context.Context, underlying string) (time.Time, bool) {
+// underlying. It propagates the store's tri-state: (date,true,nil) found; (zero,false,nil)
+// covered but nothing imminent; (zero,false,err) read failure or no coverage → the gate
+// fails closed. Satisfies options.EarningsProvider.
+func (p *StoreProvider) NextEarnings(ctx context.Context, underlying string) (time.Time, bool, error) {
 	return store.NextEarningsOnOrAfter(ctx, p.db, underlying, p.asOf(ctx))
 }

@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -32,21 +33,26 @@ func TestEarnings_NextOnOrAfterAndSeedPrecedence(t *testing.T) {
 
 	// A signal 2 days before the Aug report → next earnings is 2024-08-28.
 	asOf := time.Date(2024, 8, 26, 13, 45, 0, 0, time.UTC)
-	when, ok := store.NextEarningsOnOrAfter(ctx, db, sym, asOf)
-	if !ok || when.Format("2006-01-02") != "2024-08-28" {
-		t.Fatalf("next on/after %s = %v ok=%v; want 2024-08-28", asOf.Format("2006-01-02"), when, ok)
+	when, ok, err := store.NextEarningsOnOrAfter(ctx, db, sym, asOf)
+	if err != nil || !ok || when.Format("2006-01-02") != "2024-08-28" {
+		t.Fatalf("next on/after %s = %v ok=%v err=%v; want 2024-08-28", asOf.Format("2006-01-02"), when, ok, err)
 	}
 
 	// A signal AFTER the Aug report → next is the Nov report.
 	after := time.Date(2024, 9, 1, 13, 45, 0, 0, time.UTC)
-	when, ok = store.NextEarningsOnOrAfter(ctx, db, sym, after)
-	if !ok || when.Format("2006-01-02") != "2024-11-20" {
-		t.Fatalf("next after Aug = %v ok=%v; want 2024-11-20", when, ok)
+	when, ok, err = store.NextEarningsOnOrAfter(ctx, db, sym, after)
+	if err != nil || !ok || when.Format("2006-01-02") != "2024-11-20" {
+		t.Fatalf("next after Aug = %v ok=%v err=%v; want 2024-11-20", when, ok, err)
 	}
 
-	// A signal past all dates → none scheduled (gate treats as "no imminent earnings").
-	if _, ok := store.NextEarningsOnOrAfter(ctx, db, sym, mkDate("2030-01-01")); ok {
-		t.Errorf("expected no earnings on/after 2030")
+	// A signal past all dates on a COVERED symbol → no imminent earnings, no error (pass).
+	if _, ok, err := store.NextEarningsOnOrAfter(ctx, db, sym, mkDate("2030-01-01")); ok || err != nil {
+		t.Errorf("covered-but-quiet should be (false,nil); got ok=%v err=%v", ok, err)
+	}
+
+	// A symbol with NO coverage → ErrNoEarningsCoverage so the gate fails closed.
+	if _, _, err := store.NextEarningsOnOrAfter(ctx, db, "UNSEEDEDSYM", asOf); !errors.Is(err, store.ErrNoEarningsCoverage) {
+		t.Errorf("uncovered symbol should return ErrNoEarningsCoverage, got %v", err)
 	}
 
 	// A 'finnhub' refresh must NOT overwrite the authoritative 'seed' row.

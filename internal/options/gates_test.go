@@ -35,10 +35,11 @@ func (f fakeIVR) IVRank(_ context.Context, _ string, _ time.Time) (float64, bool
 type fakeEarnings struct {
 	when time.Time
 	has  bool
+	err  error
 }
 
-func (f fakeEarnings) NextEarnings(_ context.Context, _ string) (time.Time, bool) {
-	return f.when, f.has
+func (f fakeEarnings) NextEarnings(_ context.Context, _ string) (time.Time, bool, error) {
+	return f.when, f.has, f.err
 }
 
 // snap builds an option snapshot with the given contract terms and quote.
@@ -213,6 +214,17 @@ func TestSelect_EarningsOutsideBlackout_Passes(t *testing.T) {
 	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
 	if !dec.Accepted {
 		t.Fatalf("expected accept, got %s: %s", dec.Gate, dec.Reason)
+	}
+}
+
+// TestSelect_EarningsLookupError_FailsClosed: when the provider can't determine earnings
+// (read failure or no coverage for the symbol), the single name must NOT trade unchecked.
+func TestSelect_EarningsLookupError_FailsClosed(t *testing.T) {
+	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
+	earn := fakeEarnings{err: errors.New("no earnings coverage for symbol")}
+	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
+	if dec.Accepted || dec.Gate != GateEarnings {
+		t.Fatalf("expected fail-closed earnings abort on lookup error, got accepted=%v gate=%s", dec.Accepted, dec.Gate)
 	}
 }
 

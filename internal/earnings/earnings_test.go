@@ -61,9 +61,9 @@ func TestSync_UpsertsFromFetcher(t *testing.T) {
 	if err != nil || n != 2 {
 		t.Fatalf("Sync = %d err=%v; want 2", n, err)
 	}
-	when, ok := store.NextEarningsOnOrAfter(ctx, db, sym, mk("2026-04-01"))
-	if !ok || when.Format("2006-01-02") != "2026-05-27" {
-		t.Fatalf("next after Apr = %v ok=%v; want 2026-05-27", when, ok)
+	when, ok, err := store.NextEarningsOnOrAfter(ctx, db, sym, mk("2026-04-01"))
+	if err != nil || !ok || when.Format("2006-01-02") != "2026-05-27" {
+		t.Fatalf("next after Apr = %v ok=%v err=%v; want 2026-05-27", when, ok, err)
 	}
 }
 
@@ -83,12 +83,12 @@ func TestStoreProvider_UsesContextAsOf(t *testing.T) {
 
 	// asOf before the date → returns it.
 	p := NewStoreProvider(db, func(context.Context) time.Time { return mk("2024-08-20") })
-	if when, ok := p.NextEarnings(ctx, sym); !ok || when.Format("2006-01-02") != "2024-08-28" {
-		t.Fatalf("pre-date NextEarnings = %v ok=%v; want 2024-08-28", when, ok)
+	if when, ok, err := p.NextEarnings(ctx, sym); err != nil || !ok || when.Format("2006-01-02") != "2024-08-28" {
+		t.Fatalf("pre-date NextEarnings = %v ok=%v err=%v; want 2024-08-28", when, ok, err)
 	}
-	// asOf after the date → none.
+	// asOf after the date on a covered symbol → none imminent, no error (safe pass).
 	p2 := NewStoreProvider(db, func(context.Context) time.Time { return mk("2024-09-01") })
-	if _, ok := p2.NextEarnings(ctx, sym); ok {
-		t.Errorf("post-date NextEarnings should be false")
+	if _, ok, err := p2.NextEarnings(ctx, sym); ok || err != nil {
+		t.Errorf("post-date NextEarnings should be (false,nil); got ok=%v err=%v", ok, err)
 	}
 }
