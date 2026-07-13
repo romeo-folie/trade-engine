@@ -23,8 +23,13 @@ type Signal struct {
 	AnalysisIDs       []string
 	ExpiresAt         time.Time
 	StalePriceMovePct float64
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	// Deferred marks a signal the engine held back for first-tick
+	// confirmation (entry gates, migration 043). Only deferred signals are
+	// eligible for the deferred-execution sweep — manual-approval pendings
+	// are never touched by it.
+	Deferred  bool
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 // InsertSignal creates a new signal record and returns its UUID.
@@ -38,13 +43,13 @@ func InsertSignal(ctx context.Context, s Signal) (string, error) {
 		INSERT INTO signals (
 			ticker, action, strategy, signal_price, stop_loss, take_profit,
 			confidence, size_pct, status, block_reason,
-			analysis_ids, expires_at, stale_threshold_pct
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			analysis_ids, expires_at, stale_threshold_pct, deferred
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		RETURNING id`,
 		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
-		ids, s.ExpiresAt, s.StalePriceMovePct,
+		ids, s.ExpiresAt, s.StalePriceMovePct, s.Deferred,
 	).Scan(&id)
 	return id, err
 }
@@ -80,6 +85,29 @@ func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 	}
 	defer rows.Close()
 	return scanSignals(rows)
+}
+
+// GetDeferredSignals returns pending signals the engine deferred for
+// first-tick confirmation. Deliberately excludes manual-approval pendings
+// (deferred = FALSE) — see migration 043.
+func GetDeferredSignals(ctx context.Context) ([]Signal, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, ticker, action, strategy, signal_price,
+		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       confidence, COALESCE(size_pct,0), status,
+		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
+		       created_at, updated_at
+		FROM signals WHERE status = 'pending' AND deferred = TRUE
+		ORDER BY created_at ASC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	sigs, err := scanSignals(rows)
+	for i := range sigs {
+		sigs[i].Deferred = true
+	}
+	return sigs, err
 }
 
 // GetSignalsByTicker returns recent signals for a ticker.

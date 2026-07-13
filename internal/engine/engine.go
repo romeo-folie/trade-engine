@@ -91,6 +91,13 @@ type Engine struct {
 	// When the guardrail degrades the profile, this field drives the re-apply.
 	activeCostProfile string
 
+	// lastTickAt is the previous tick's start; sessionFirstTick is true while
+	// processing the first tick of an ET trading day (or the first after a
+	// restart). Both are written by tick() before the per-ticker goroutines
+	// fan out and are read-only afterwards, so no lock is needed.
+	lastTickAt       time.Time
+	sessionFirstTick bool
+
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
 
@@ -504,6 +511,16 @@ func (e *Engine) tick(ctx context.Context) error {
 	// has an accurate cash balance from the very first tick (not the zero-value
 	// default from NewTracker).
 	e.refreshPortfolio(ctx)
+
+	// Entry gate: first-tick deferral (entry_gates.go). Mark whether this is
+	// the ET session's first tick (or the first after a restart) BEFORE the
+	// per-ticker goroutines fan out — they read the flag when routing BUYs.
+	// Then give BUYs deferred by the previous tick their price-hold
+	// confirmation before fresh analysis competes for the same capital.
+	tickNow := time.Now()
+	e.sessionFirstTick = e.lastTickAt.IsZero() || !sameMarketDay(e.lastTickAt, tickNow, nyLoc)
+	e.lastTickAt = tickNow
+	e.processDeferredSignals(ctx)
 
 	items, err := store.GetWatchlistItems(ctx, true)
 	if err != nil {
@@ -1638,6 +1655,34 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		AnalysisIDs:       analysisIDs,
 	}
 
+	// Entry-quality run-up gates (entry_gates.go): news tape-confirmation and
+	// momentum anti-chase. Checked before the generic risk gates so the block
+	// reason names the specific losing cohort. Fail OPEN on a missing prior
+	// close — these are alpha filters, not safety guards.
+	eg := e.cfg.Risk.EntryGates
+	if resp.Action == "BUY" && (eg.NewsMinRunupPct > 0 || eg.MomentumMaxRunupPct > 0) {
+		nowET := time.Now().In(nyLoc)
+		dayStartET := time.Date(nowET.Year(), nowET.Month(), nowET.Day(), 0, 0, 0, 0, nyLoc)
+		prevClose, pcErr := store.GetPrevDailyClose(ctx, ticker, dayStartET)
+		if pcErr != nil || prevClose <= 0 {
+			logger.Warn("entry gates: prior daily close unavailable — run-up gates fail open",
+				"ticker", ticker, "err", pcErr)
+		}
+		if reason := evaluateRunupGates(strategy, string(resp.Action), signalPrice, prevClose, eg); reason != "" {
+			sig.Status = "blocked"
+			sig.BlockReason = reason
+			if _, err := store.InsertSignal(ctx, sig); err != nil {
+				logger.Warn("store blocked signal", "ticker", ticker, "err", err)
+			}
+			logger.Warn("signal blocked", "ticker", ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
+				BlockReason: reason, FailedCheck: "entry_gates",
+			})
+			return
+		}
+	}
+
 	// Run risk checks.
 	pState := e.portfolio.CurrentState()
 	var openTrades []store.Trade
@@ -1664,37 +1709,6 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		}
 	}
 
-	var holdsLong bool
-	var longQuantity float64
-	var longCostBasis float64 // sum of qty * entry_price across open longs
-	var longMaxStop float64   // canonical (highest) existing stop across open longs
-	// Count distinct (ticker, direction) pairs so multiple consolidated rows
-	// for the same instrument don't inflate the open-positions budget (#312).
-	// Also build a per-ticker count restricted to the incoming signal's
-	// direction so the per-ticker cap can be enforced independently.
-	positions := make(map[string]struct{}, len(openTrades))
-	byTicker := make(map[string]int, len(openTrades))
-	for _, t := range openTrades {
-		key := t.Ticker + "|" + string(t.Direction)
-		positions[key] = struct{}{}
-		if (resp.Action == "BUY" && t.Direction == "long") ||
-			(resp.Action == "SELL" && t.Direction == "short") {
-			byTicker[t.Ticker]++
-		}
-		if t.Ticker == ticker && t.Direction == "long" {
-			holdsLong = true
-			longQuantity += t.Quantity
-			longCostBasis += t.Quantity * t.EntryPrice
-			if t.StopLoss > longMaxStop {
-				longMaxStop = t.StopLoss
-			}
-		}
-	}
-	var longAvgEntry float64
-	if longQuantity > 0 {
-		longAvgEntry = longCostBasis / longQuantity
-	}
-
 	// Pyramiding (#324): the new lot's stop will be tightened to
 	// max(canonical existing stop, weighted avg entry) so the combined cost
 	// basis is at worst breakeven on the original lot when the new stop
@@ -1703,27 +1717,12 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 	// SignalGenerated payload below matches what is stored. checkPyramidPolicy
 	// rejects the attempt outright when the existing stop already sits at or
 	// above the current signal price.
-	riskIn := risk.CheckInput{
-		Cfg:               e.cfg.Risk,
-		Action:            string(resp.Action),
-		Ticker:            ticker,
-		Confidence:        resp.Confidence,
-		SizePct:           resp.SizePct,
-		StopLoss:          sig.StopLoss,
-		TakeProfit:        sig.TakeProfit,
-		SignalPrice:       signalPrice,
-		PortfolioValue:    pState.TotalValue,
-		Cash:              pState.Cash,
-		OpenPositions:     len(positions),
-		OpenByTicker:      byTicker,
-		DailyPnL:          pState.RealizedPnLDay,
-		PeakValue:         pState.PeakValue,
-		LastLossAt:        pState.LastLossAt,
-		HoldsLong:         holdsLong,
-		LongQuantity:      longQuantity,
-		LongAvgEntryPrice: longAvgEntry,
-		LongMaxStop:       longMaxStop,
-	}
+	riskIn := buildRiskInput(e.cfg.Risk, string(resp.Action), ticker,
+		resp.Confidence, resp.SizePct, sig.StopLoss, sig.TakeProfit, signalPrice,
+		pState, openTrades)
+	holdsLong := riskIn.HoldsLong
+	longAvgEntry := riskIn.LongAvgEntryPrice
+	longMaxStop := riskIn.LongMaxStop
 
 	results, passed := risk.CheckAll(riskIn)
 	for _, r := range results {
@@ -1794,6 +1793,15 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		sig.StopLoss = pyramidTightenedStop(sig.StopLoss, longMaxStop, longAvgEntry, signalPrice)
 	}
 
+	// First-tick deferral decision is made BEFORE insert so the row carries
+	// the deferred marker (migration 043): the deferred-execution sweep only
+	// ever touches rows stamped here, never manual-approval pendings left
+	// over from a mode switch or restart.
+	mode := e.Mode()
+	deferBuy := e.cfg.Risk.EntryGates.FirstTickDefer && e.sessionFirstTick &&
+		resp.Action == "BUY" && (mode == "auto" || mode == "paper")
+	sig.Deferred = deferBuy
+
 	sigID, err := store.InsertSignal(ctx, sig)
 	if err != nil {
 		logger.Warn("store signal", "ticker", ticker, "err", err)
@@ -1819,9 +1827,22 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 	})
 
 	// Route based on mode.
-	mode := e.Mode()
 	switch mode {
 	case "auto", "paper":
+		// First-tick deferral (entry_gates.go): BUYs born on the session's
+		// first tick stay pending; the next tick executes them only if the
+		// price held (processDeferredSignals). While pending they inherit the
+		// normal expiry + stale-price protections — which also puts the
+		// staleness guard on the auto path for the first time.
+		if deferBuy {
+			logger.Info("signal deferred for first-tick confirmation",
+				"id", sigID, "ticker", ticker, "signal_price", signalPrice)
+			e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
+				SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
+				Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+			})
+			return
+		}
 		e.executeSignal(ctx, sigID, sig)
 	case "manual":
 		// Signal stays pending — user approves via CLI or Telegram.
@@ -2567,6 +2588,140 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 		0,                       // tokens output
 		counters,
 	)
+}
+
+// processDeferredSignals executes BUY signals deferred by the first-tick
+// gate once their price has held, and marks the rest stale. Runs at the
+// start of every tick, auto/paper mode only. Only rows stamped
+// deferred=TRUE at generation are swept (GetDeferredSignals) — manual-mode
+// approval pendings are structurally out of reach even after a mode switch
+// or restart. Before executing, the portfolio-level risk gates are re-run
+// against CURRENT state: cash, open-position count, daily loss, and
+// cooldown may all have changed in the tick since the signal was generated.
+func (e *Engine) processDeferredSignals(ctx context.Context) {
+	if !e.cfg.Risk.EntryGates.FirstTickDefer {
+		return
+	}
+	mode := e.Mode()
+	if mode != "auto" && mode != "paper" {
+		return
+	}
+	deferred, err := store.GetDeferredSignals(ctx)
+	if err != nil {
+		logger.Warn("get deferred signals", "err", err)
+		return
+	}
+	now := time.Now()
+	for _, sig := range deferred {
+		if sig.Action != "BUY" {
+			continue // defensive: only BUYs are ever deferred
+		}
+		if !sig.ExpiresAt.IsZero() && now.After(sig.ExpiresAt) {
+			continue // the expiry loop owns time-outs
+		}
+		latest := resolveFallbackCandle(now, func(tf data.Timeframe) (*data.Candle, error) {
+			return store.GetLatestCandle(ctx, sig.Ticker, tf)
+		})
+		if latest == nil {
+			// No fresh mark to confirm against — keep pending; either a later
+			// tick confirms or the expiry loop cleans up.
+			logger.Warn("deferred signal: no fresh candle to confirm — keeping pending",
+				"id", sig.ID, "ticker", sig.Ticker)
+			continue
+		}
+		tol := e.cfg.Risk.EntryGates.FirstTickHoldTolerancePct
+		if !deferredPriceHeld(sig.SignalPrice, latest.Close, tol) {
+			reason := fmt.Sprintf("first-tick confirmation failed: price %.4f below signal %.4f beyond tolerance", latest.Close, sig.SignalPrice)
+			if err := store.UpdateSignalStatus(ctx, sig.ID, "stale", reason); err != nil {
+				logger.Warn("mark deferred signal stale", "id", sig.ID, "err", err)
+			}
+			logger.Info("deferred signal dropped", "id", sig.ID, "ticker", sig.Ticker, "reason", reason)
+			continue
+		}
+
+		// Price held — re-validate the portfolio-level gates before firing.
+		// Fetched per signal (not per sweep) so an execution earlier in this
+		// loop counts against the next signal's position budget.
+		openTrades, otErr := store.GetOpenTrades(ctx)
+		if otErr != nil {
+			logger.Warn("deferred signal: open trades unavailable — retrying next tick",
+				"id", sig.ID, "ticker", sig.Ticker, "err", otErr)
+			continue
+		}
+		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
+			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
+			e.portfolio.CurrentState(), openTrades)
+		if results, passed := risk.CheckAll(riskIn); !passed {
+			reason := "deferred re-check failed: " + risk.BlockReason(results)
+			if err := store.UpdateSignalStatus(ctx, sig.ID, "stale", reason); err != nil {
+				logger.Warn("mark deferred signal stale", "id", sig.ID, "err", err)
+			}
+			logger.Info("deferred signal dropped", "id", sig.ID, "ticker", sig.Ticker, "reason", reason)
+			continue
+		}
+
+		logger.Info("deferred signal confirmed — executing",
+			"id", sig.ID, "ticker", sig.Ticker,
+			"signal_price", sig.SignalPrice, "confirm_price", latest.Close)
+		e.executeSignal(ctx, sig.ID, sig)
+	}
+}
+
+// buildRiskInput assembles risk.CheckInput for a signal against a portfolio
+// snapshot and open trades. Shared by generateSignal (signal birth) and
+// processDeferredSignals (re-validation at deferred execution) so both
+// paths enforce identical portfolio-level gates. Counts distinct
+// (ticker, direction) pairs so consolidated rows don't inflate the
+// open-positions budget (#312), and builds the per-ticker count restricted
+// to the signal's direction for the per-ticker cap.
+func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, sizePct, stopLoss, takeProfit, signalPrice float64, pState portfolio.State, openTrades []store.Trade) risk.CheckInput {
+	var holdsLong bool
+	var longQuantity float64
+	var longCostBasis float64 // sum of qty * entry_price across open longs
+	var longMaxStop float64   // canonical (highest) existing stop across open longs
+	positions := make(map[string]struct{}, len(openTrades))
+	byTicker := make(map[string]int, len(openTrades))
+	for _, t := range openTrades {
+		key := t.Ticker + "|" + t.Direction
+		positions[key] = struct{}{}
+		if (action == "BUY" && t.Direction == "long") ||
+			(action == "SELL" && t.Direction == "short") {
+			byTicker[t.Ticker]++
+		}
+		if t.Ticker == ticker && t.Direction == "long" {
+			holdsLong = true
+			longQuantity += t.Quantity
+			longCostBasis += t.Quantity * t.EntryPrice
+			if t.StopLoss > longMaxStop {
+				longMaxStop = t.StopLoss
+			}
+		}
+	}
+	var longAvgEntry float64
+	if longQuantity > 0 {
+		longAvgEntry = longCostBasis / longQuantity
+	}
+	return risk.CheckInput{
+		Cfg:               cfg,
+		Action:            action,
+		Ticker:            ticker,
+		Confidence:        confidence,
+		SizePct:           sizePct,
+		StopLoss:          stopLoss,
+		TakeProfit:        takeProfit,
+		SignalPrice:       signalPrice,
+		PortfolioValue:    pState.TotalValue,
+		Cash:              pState.Cash,
+		OpenPositions:     len(positions),
+		OpenByTicker:      byTicker,
+		DailyPnL:          pState.RealizedPnLDay,
+		PeakValue:         pState.PeakValue,
+		LastLossAt:        pState.LastLossAt,
+		HoldsLong:         holdsLong,
+		LongQuantity:      longQuantity,
+		LongAvgEntryPrice: longAvgEntry,
+		LongMaxStop:       longMaxStop,
+	}
 }
 
 // ─── Phase 4: Signal expiry (4.8) ────────────────────────────────────────────

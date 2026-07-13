@@ -1096,6 +1096,42 @@ type RiskConfig struct {
 	// stops via `new_stop = max(current_stop, hwm - atr_multiple * ATR)` and
 	// submits/replaces a broker STOP order. Disabled by default.
 	TrailingStop TrailingStopConfig `yaml:"trailing_stop"`
+
+	// EntryGates are evidence-driven entry-quality filters from the
+	// May–Jul 2026 execution study: news_sentiment entries the tape never
+	// confirmed ran a 16% win rate, momentum entries chasing >2% run-ups
+	// ran 14% vs 55% when not chasing, and the session's first analysis
+	// tick (the overnight-headline burst) was the worst recurring entry
+	// cohort. All gates default OFF; each is independent.
+	EntryGates EntryGatesConfig `yaml:"entry_gates"`
+}
+
+// EntryGatesConfig holds per-strategy entry-quality gates. Zero values
+// disable every gate so existing configs upgrade without behavior change.
+// Gates apply to BUY signals only and fail OPEN when the prior daily close
+// is unavailable — they are alpha filters, not safety guards.
+type EntryGatesConfig struct {
+	// NewsMinRunupPct blocks news_sentiment BUYs unless the price is at
+	// least this % above the prior daily close — the market's reaction
+	// must confirm the headline (its absence is information). 0 disables.
+	// Recommended 2.0.
+	NewsMinRunupPct float64 `yaml:"news_min_runup_pct"`
+	// MomentumMaxRunupPct blocks momentum BUYs when the price is already
+	// more than this % above the prior daily close (anti-chase). 0
+	// disables. Recommended 2.0.
+	MomentumMaxRunupPct float64 `yaml:"momentum_max_runup_pct"`
+	// FirstTickDefer holds BUY signals generated on the session's first
+	// analysis tick (including the first tick after a restart) as pending
+	// instead of executing immediately; the next tick executes them only
+	// if the price has held above the signal price minus the tolerance.
+	// Breaks the correlated overnight-headline burst without a
+	// time-of-day ban. Deferred signals inherit the normal signal-expiry
+	// and stale-price protections while pending.
+	FirstTickDefer bool `yaml:"first_tick_defer"`
+	// FirstTickHoldTolerancePct is how far (%) the price may sit below the
+	// deferred signal's price and still count as "held". Defaults to 1.0
+	// when FirstTickDefer is on and this is 0.
+	FirstTickHoldTolerancePct float64 `yaml:"first_tick_hold_tolerance_pct"`
 }
 
 // TrailingStopConfig governs the server-side trailing stop manager (#322).
