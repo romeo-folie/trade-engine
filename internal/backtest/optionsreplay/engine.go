@@ -58,6 +58,7 @@ type SimTrade struct {
 	Reason     string
 
 	OCCSymbol   string
+	DTE         int // calendar days to expiry of the chosen contract at entry
 	Contracts   int
 	Multiplier  int
 	EntryMid    float64
@@ -152,6 +153,7 @@ func (e *Engine) ReplayWithDecision(ctx context.Context, sig Signal, dec options
 	}
 	out.Accepted = true
 	out.OCCSymbol = dec.Contract.OCCSymbol
+	out.DTE = dec.DTE
 	out.Contracts = contracts
 	out.Multiplier = mult
 	out.EntryMid = dec.Mid

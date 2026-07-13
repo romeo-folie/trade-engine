@@ -15,6 +15,7 @@ type Report struct {
 	TotalPnL      float64        // realized P&L across accepted, priced, RESOLVED trades (multiplier-correct)
 	AbortsByGate  map[string]int // count of NOT-accepted signals per aborting gate
 	ExitsByReason map[string]int // count of accepted trades per exit reason (stop/tp/time_exit/eod/path_exhausted)
+	DTEByDay      map[int]int    // count of accepted trades per calendar-days-to-expiry of the chosen contract
 }
 
 // WinRate is wins / (wins + losses); 0 when there are no decided trades. Scratches
@@ -34,6 +35,7 @@ func Aggregate(trades []SimTrade) Report {
 	r := Report{
 		AbortsByGate:  map[string]int{},
 		ExitsByReason: map[string]int{},
+		DTEByDay:      map[int]int{},
 	}
 	for _, t := range trades {
 		r.Total++
@@ -46,6 +48,7 @@ func Aggregate(trades []SimTrade) Report {
 			continue
 		}
 		r.Accepted++
+		r.DTEByDay[t.DTE]++             // DTE is fixed at entry, so every accepted position counts
 		r.ExitsByReason[t.ExitReason]++ // the exit REASON is real even when the price wasn't
 		if t.ExitReason == ReasonPathExhausted {
 			// The Path ran out before any modeled exit fired. There is NO real trade
