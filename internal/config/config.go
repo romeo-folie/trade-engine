@@ -74,6 +74,7 @@ type ORBConfig struct {
 	MinDollarVolume    float64 `yaml:"min_dollar_volume"`    // drop gap movers whose price×volume is below this before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop genuinely liquid names — only enable on a SIP-backed deployment.
 	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5 (how many scored candidates to actually trade)
 	MaxScanCandidates  int     `yaml:"max_scan_candidates"`  // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked liquidity-first (|gap%| × log10 dollar-volume), so this keeps the most tradeable ones.
+	ScanConfidenceThreshold float64 `yaml:"scan_confidence_threshold"` // min aggregated analyst conviction for a gap candidate to be tradeable (0 = default 0.68). The equities scan aggregates whatever analysts are reachable by confidence — no arbiter required — so scoring survives a provider/arbiter outage.
 	RangeMinutes       int     `yaml:"range_minutes"`        // 5 or 15
 	RiskReward         float64 `yaml:"risk_reward"`          // e.g. 2.0
 	MaxRiskPct         float64 `yaml:"max_risk_pct"`         // max loss per trade as % of portfolio
@@ -1547,6 +1548,12 @@ func Validate(cfg *Config) []string {
 		}
 		if cfg.ORB.MaxCandidates < 1 || cfg.ORB.MaxCandidates > 5 {
 			errs = append(errs, "orb.max_candidates must be 1-5")
+		}
+		// Analyst confidences are on a 0-1 scale, so a threshold > 1 (e.g. the typo 68
+		// for 0.68) can never pass and would silently skip EVERY candidate. 0 means "use
+		// the default"; anything else must be in (0, 1].
+		if cfg.ORB.ScanConfidenceThreshold < 0 || cfg.ORB.ScanConfidenceThreshold > 1 {
+			errs = append(errs, fmt.Sprintf("orb.scan_confidence_threshold must be in [0,1] (0 = default 0.68); got %.3f", cfg.ORB.ScanConfidenceThreshold))
 		}
 		if cfg.ORB.RiskReward < 1.5 {
 			errs = append(errs, "orb.risk_reward must be >= 1.5")
