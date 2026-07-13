@@ -25,6 +25,12 @@ func TestGetRecentORBSessions_SameDateDeterministic(t *testing.T) {
 	date := time.Date(2099, 6, 1, 0, 0, 0, 0, time.UTC)
 	suffix := time.Now().UnixNano()
 	names := make([]string, 3)
+	// Delete the far-future rows at the end: date DESC ordering would otherwise leave these
+	// 2099 sessions permanently AHEAD of real sessions in the dashboard/backfill on a
+	// persistent dev DB.
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(), `DELETE FROM orb_sessions WHERE session_name = ANY($1)`, names)
+	})
 	for i := range names {
 		names[i] = fmt.Sprintf("det-%d-%d", suffix, i)
 		if _, err := store.CreateORBSession(ctx, db, date, names[i]); err != nil {
