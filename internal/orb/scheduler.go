@@ -2049,7 +2049,7 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 
 	// Broker-truth guard: bar replay infers a stop/TP touch from market data, which can
 	// fabricate a close on a position the broker still fully holds. Refuse any such close.
-	guard := s.newExitGuard(ctx, trades)
+	guard := s.newExitGuard(ctx)
 
 	now := s.now()
 	for i := range trades {
@@ -2128,14 +2128,18 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 	if _, done := s.reconciledSessions[sessionID]; done {
 		return
 	}
-	s.reconciledSessions[sessionID] = struct{}{}
-
+	// Marked processed at the END. It IS marked in every terminal case — nil db, a load
+	// error, no trades — EXCEPT when the trades-feed guard is fail-closed (a transient
+	// positions read failure), which must retry rather than strand genuine exits. The
+	// order-ID fast path below is idempotent, so a retry is safe.
 	if s.db == nil {
+		s.reconciledSessions[sessionID] = struct{}{}
 		return
 	}
 	trades, err := store.GetORBTrades(ctx, s.db, sessionID)
 	if err != nil {
 		slog.Warn("orb: reconcile: load trades failed", "session_id", sessionID, "err", err)
+		s.reconciledSessions[sessionID] = struct{}{}
 		return
 	}
 
@@ -2173,7 +2177,9 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 
 	// Fallback: trades-feed reconcile catches fills where child IDs were not captured
 	// (e.g. confirmation-prompt flow dropped them) or where GetOrderStatus aged out.
-	s.reconcileExitsFromTrades(ctx, sessionID, trades)
+	if s.reconcileExitsFromTrades(ctx, sessionID, trades) {
+		s.reconciledSessions[sessionID] = struct{}{}
+	}
 }
 
 func (s *ORBScheduler) notify(ctx context.Context, msg string) {
@@ -2186,10 +2192,14 @@ func (s *ORBScheduler) notify(ctx context.Context, msg string) {
 // reconcileExitsFromTrades fetches recent fills from the IBKR trades endpoint and
 // matches them to any filled-but-unclosed ORB trades for the given session.
 // It is the primary reconciliation mechanism when child order IDs are unavailable.
-func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID string, trades []store.ORBTrade) {
+// reconcileExitsFromTrades returns false only when the broker-truth guard was fail-closed,
+// so a one-shot caller can decline to mark the session processed and retry. The early
+// returns (no trade history, nothing filled, records-fetch failure) are not guard failures
+// and return true — their retry semantics are unchanged from before this guard existed.
+func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID string, trades []store.ORBTrade) bool {
 	fetcher, ok := s.executor.(TradesFetcher)
 	if !ok {
-		return // executor doesn't expose trade history (e.g. Alpaca, PaperExecutor)
+		return true // executor doesn't expose trade history (e.g. Alpaca, PaperExecutor)
 	}
 	var hasFilled bool
 	for _, t := range trades {
@@ -2199,24 +2209,28 @@ func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID s
 		}
 	}
 	if !hasFilled {
-		return
+		return true
 	}
 	records, err := fetcher.FetchTradeRecords(ctx, 7)
 	if err != nil {
 		slog.Warn("orb: exit reconcile: fetch trade records failed", "session_id", sessionID, "err", err)
-		return
+		return true
 	}
-	s.matchExitsFromRecords(ctx, trades, records)
+	return s.matchExitsFromRecords(ctx, trades, records)
 }
 
 // matchExitsFromRecords attributes IBKR fill records to filled-but-unclosed ORB trades
 // using a tuple match: same symbol, opposite side, same qty, fill time after entry, and
 // price within 10% of the TP–SL range of one of the bracket levels.
-func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store.ORBTrade, records []execution.IBKRTradeRecord) {
+// matchExitsFromRecords returns false when the broker-truth guard was fail-closed (a
+// positions/managed read failure), so a ONE-SHOT caller (done-session reconcile, backfill)
+// can decline to mark the session processed and retry rather than silently skipping genuine
+// exits until the IBKR records age out.
+func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store.ORBTrade, records []execution.IBKRTradeRecord) bool {
 	// Broker-truth guard: a trades-feed match near a bracket level can be a stale/unrelated
 	// record that never reduced the position (today's XAG phantom stop on a still-held -850
 	// short). Read positions once and refuse any close the broker hasn't actually made.
-	guard := s.newExitGuard(ctx, trades)
+	guard := s.newExitGuard(ctx)
 	for i := range trades {
 		t := &trades[i]
 		if t.Status != "filled" || t.FillPrice == 0 {
@@ -2298,6 +2312,7 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			break
 		}
 	}
+	return !guard.readFailed
 }
 
 // backfillRecentExits scans done sessions from the last 7 days for any
@@ -2347,8 +2362,11 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 		}
 		slog.Info("orb: backfill: reconciling session",
 			"session_id", sess.ID, "date", sess.Date.Format("2006-01-02"), "name", sess.SessionName)
-		s.matchExitsFromRecords(ctx, trades, records)
-		s.backfilledSessions[sess.ID] = struct{}{}
+		// Mark backfilled only if the guard was usable — a fail-closed guard must not
+		// consume this one-shot backfill and strand genuine exits before the records age out.
+		if s.matchExitsFromRecords(ctx, trades, records) {
+			s.backfilledSessions[sess.ID] = struct{}{}
+		}
 	}
 }
 

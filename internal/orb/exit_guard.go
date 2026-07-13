@@ -57,16 +57,26 @@ type exitGuard struct {
 
 func managedKey(ticker, side string) string { return ticker + "|" + strings.ToLower(side) }
 
-// newExitGuard reads live positions once and precomputes the managed open qty per side from
-// `filled`. Disabled (allows all) for non-forex schedulers so futures/options exit paths are
-// untouched; fails closed (blocks all) when the positions read fails.
-func (s *ORBScheduler) newExitGuard(ctx context.Context, filled []store.ORBTrade) *exitGuard {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || s.executor == nil {
+// newExitGuard reads live positions once and precomputes the managed open qty per side.
+// Disabled (allows all) for non-forex schedulers so futures/options exit paths are untouched;
+// fails closed (blocks all) when the positions OR the managed-set read fails.
+//
+// The managed budget is built from ALL open filled ORB trades ACCOUNT-WIDE, not just the
+// caller's per-session slice: the broker position read is account-wide, so a same-ticker/side
+// position still open in ANOTHER session must be counted too — otherwise this session's
+// genuine close is blocked, its qty wrongly attributed to the cross-session held leg (Codex P1).
+func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
+	if s.forexCfg == nil || !s.forexCfg.Enabled || s.executor == nil || s.db == nil {
 		return &exitGuard{active: false}
 	}
 	positions, err := s.executor.GetPositions(ctx)
 	if err != nil {
 		slog.Warn("orb: exit guard: positions read failed — deferring inference-based closes to avoid a phantom", "err", err)
+		return &exitGuard{active: true, readFailed: true}
+	}
+	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
+	if err != nil {
+		slog.Warn("orb: exit guard: account-wide filled-trades read failed — deferring inference-based closes", "err", err)
 		return &exitGuard{active: true, readFailed: true}
 	}
 	positions = s.forexOnlyPositions(positions)
