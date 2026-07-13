@@ -271,16 +271,36 @@ func printOptionsReport(scope string, r optionsreplay.Report) {
 	fmt.Printf("  Wins/Loss:  %d / %d  (scratch %d)\n", r.Wins, r.Losses, r.Scratches)
 	fmt.Printf("  Win rate:   %.1f%%  (priced, resolved trades only)\n", r.WinRate()*100)
 	fmt.Printf("  Net P&L:    $%.2f\n", r.TotalPnL)
+	if r.Carried > 0 {
+		fmt.Printf("  Carried:    %d exits used a forward-filled (stale) price — INCLUDED in P&L, flagged\n", r.Carried)
+	}
 	if r.Unpriced > 0 || r.Unresolved > 0 {
-		fmt.Printf("  Excluded:   %d unpriced (missing quote), %d unresolved (data ran out) — NOT in win rate/P&L\n",
+		fmt.Printf("  Excluded:   %d unpriced (never traded), %d unresolved (data ran out) — NOT in win rate/P&L\n",
 			r.Unpriced, r.Unresolved)
 	}
 	if len(r.ExitsByReason) > 0 {
 		fmt.Printf("  Exits:      %s\n", sortedCounts(r.ExitsByReason))
 	}
+	if len(r.DTEByDay) > 0 {
+		fmt.Printf("  DTE:        %s  (calendar days to expiry at entry)\n", sortedDTE(r.DTEByDay))
+	}
 	if len(r.AbortsByGate) > 0 {
 		fmt.Printf("  Aborts:     %s\n", sortedCounts(r.AbortsByGate))
 	}
+}
+
+// sortedDTE renders the days-to-expiry histogram as "1d=n 2d=n …" ascending by DTE.
+func sortedDTE(m map[int]int) string {
+	days := make([]int, 0, len(m))
+	for d := range m {
+		days = append(days, d)
+	}
+	sort.Ints(days)
+	parts := make([]string, 0, len(days))
+	for _, d := range days {
+		parts = append(parts, fmt.Sprintf("%dd=%d", d, m[d]))
+	}
+	return strings.Join(parts, "  ")
 }
 
 // sortedCounts renders a count map as "key=n key=n" in deterministic key order.

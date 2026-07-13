@@ -258,3 +258,69 @@ func TestReplay_UnpricedExit(t *testing.T) {
 		t.Errorf("unpriced trade miscounted: %+v", r)
 	}
 }
+
+// TestAggregate_CountsCarriedInPnL: a carried (stale-priced) exit is INCLUDED in
+// win/loss/P&L (and flagged Carried); only an entry-side unpriced gap is excluded.
+func TestAggregate_CountsCarriedInPnL(t *testing.T) {
+	r := Aggregate([]SimTrade{
+		{Accepted: true, PriceKnown: true, PriceCarried: true, ExitReason: "eod", PnL: -50}, // carried loss — counted
+		{Accepted: true, PriceKnown: true, ExitReason: "tp", PnL: 100},                      // real win
+		{Accepted: true, PriceKnown: false, ExitReason: "stop", PnL: 0},                     // entry-side gap — excluded
+	})
+	if r.Carried != 1 {
+		t.Errorf("Carried = %d; want 1", r.Carried)
+	}
+	if r.Wins != 1 || r.Losses != 1 {
+		t.Errorf("carried loss must count in win/loss: W=%d L=%d", r.Wins, r.Losses)
+	}
+	if r.Unpriced != 1 {
+		t.Errorf("entry-side gap must be Unpriced, got %d", r.Unpriced)
+	}
+	if r.TotalPnL != 50 {
+		t.Errorf("TotalPnL = %v; want 50 (100 − 50, carried included)", r.TotalPnL)
+	}
+}
+
+// TestAggregate_DTEHistogram: every accepted position counts toward DTEByDay at its
+// entry DTE — including unpriced/unresolved ones (DTE is fixed at entry) — while
+// gate-aborted signals never do.
+func TestAggregate_DTEHistogram(t *testing.T) {
+	r := Aggregate([]SimTrade{
+		{Accepted: true, DTE: 1, PriceKnown: true, ExitReason: "tp", PnL: 100},
+		{Accepted: true, DTE: 1, PriceKnown: true, ExitReason: "stop", PnL: -50},
+		{Accepted: true, DTE: 3, PriceKnown: false, ExitReason: "eod"},                    // unpriced — still an opened position
+		{Accepted: true, DTE: 5, ExitReason: ReasonPathExhausted, PriceKnown: true},       // unresolved — still opened
+		{Accepted: false, Gate: "iv_rank"},                                                // aborted — never opened
+	})
+	if got := r.DTEByDay[1]; got != 2 {
+		t.Errorf("DTEByDay[1] = %d; want 2", got)
+	}
+	if got := r.DTEByDay[3]; got != 1 {
+		t.Errorf("DTEByDay[3] = %d; want 1 (unpriced still opened)", got)
+	}
+	if got := r.DTEByDay[5]; got != 1 {
+		t.Errorf("DTEByDay[5] = %d; want 1 (unresolved still opened)", got)
+	}
+	if _, ok := r.DTEByDay[0]; ok {
+		t.Errorf("aborted signal must not appear in the DTE histogram: %v", r.DTEByDay)
+	}
+}
+
+// TestReplay_CarriedPriceNoTimeExit: a carried (forward-filled) option price must NOT
+// drive the IV-crush time exit — live never acts on a stale quote. The position holds
+// to a real exit (eod) instead, preserving parity; the exit is still priced.
+func TestReplay_CarriedPriceNoTimeExit(t *testing.T) {
+	eng, _ := acceptingEngine(Config{PremiumBudget: 500, TimeExitMinutes: 8})
+	sim := eng.Replay(context.Background(), buySignal([]Bar{
+		// Past the 8-min window, underlying flat (no stop/tp), option below entry (1.25)
+		// but CARRIED — a real price here would time-exit; a carried one must not.
+		{Time: asOf.Add(9 * time.Minute), Underlying: 551, OptionMid: 1.10, MidCarried: true},
+		{Time: sessEnd.Add(1 * time.Minute), Underlying: 551, OptionMid: 1.40}, // eod, real
+	}))
+	if sim.ExitReason == "time_exit" {
+		t.Errorf("time exit fired on a carried (stale) price — must not (breaks live parity): %+v", sim)
+	}
+	if sim.ExitReason != "eod" {
+		t.Errorf("expected eod (a carried bar can't time-exit), got %q", sim.ExitReason)
+	}
+}

@@ -11,9 +11,11 @@ type Report struct {
 	Scratches     int            // accepted, priced, resolved trades with PnL == 0
 	Unpriced      int            // resolved trades whose exit quote was missing (P&L unreliable — excluded from win/loss/PnL)
 	Unresolved    int            // trades where the Path ran out before any modeled exit fired (path_exhausted) — no real outcome, excluded from win/loss/PnL
+	Carried       int            // trades INCLUDED in P&L whose exit price was forward-filled (stale) because the option didn't trade at the exit minute
 	TotalPnL      float64        // realized P&L across accepted, priced, RESOLVED trades (multiplier-correct)
 	AbortsByGate  map[string]int // count of NOT-accepted signals per aborting gate
 	ExitsByReason map[string]int // count of accepted trades per exit reason (stop/tp/time_exit/eod/path_exhausted)
+	DTEByDay      map[int]int    // count of accepted trades per calendar-days-to-expiry of the chosen contract
 }
 
 // WinRate is wins / (wins + losses); 0 when there are no decided trades. Scratches
@@ -33,6 +35,7 @@ func Aggregate(trades []SimTrade) Report {
 	r := Report{
 		AbortsByGate:  map[string]int{},
 		ExitsByReason: map[string]int{},
+		DTEByDay:      map[int]int{},
 	}
 	for _, t := range trades {
 		r.Total++
@@ -45,6 +48,7 @@ func Aggregate(trades []SimTrade) Report {
 			continue
 		}
 		r.Accepted++
+		r.DTEByDay[t.DTE]++             // DTE is fixed at entry, so every accepted position counts
 		r.ExitsByReason[t.ExitReason]++ // the exit REASON is real even when the price wasn't
 		if t.ExitReason == ReasonPathExhausted {
 			// The Path ran out before any modeled exit fired. There is NO real trade
@@ -55,11 +59,15 @@ func Aggregate(trades []SimTrade) Report {
 			continue
 		}
 		if !t.PriceKnown {
-			// Exit quote was missing → P&L is a fallback (0), not a real result. Keep it
-			// out of win/loss/P&L so a data gap can't masquerade as a breakeven and bias
-			// the win rate. Surfaced via Unpriced so the gap is visible, not hidden.
+			// No option price ever observed (entry-side gap) → P&L is a fallback (0), not
+			// a real result. Keep it out of win/loss/P&L. Surfaced via Unpriced.
 			r.Unpriced++
 			continue
+		}
+		if t.PriceCarried {
+			// Exit price forward-filled from an earlier bar (stale) — still counted in
+			// P&L (dropping it would bias comparisons), but flagged for transparency.
+			r.Carried++
 		}
 		switch {
 		case t.PnL > 0:

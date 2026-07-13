@@ -130,7 +130,9 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 			slog.Warn("optionsreplay: option bars fetch failed; exit path unpriced",
 				"occ", dec.Contract.OCCSymbol, "err", err)
 		} else {
-			fillOptionMids(sig.Path, obars)
+			// Seed the forward-fill with the gate's entry mid so an immediate exit (before
+			// the first post-entry option trade) is priced, not dropped.
+			fillOptionMids(sig.Path, obars, dec.Mid)
 		}
 	}
 	// Hand the peeked decision back so Replay doesn't re-run the gate (and its
@@ -139,20 +141,33 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 }
 
 // fillOptionMids sets each Path bar's OptionMid to the historical option bar Close at
-// the same minute (a standard last-trade proxy for the option mid — a full NBBO-mid
-// reconstruction would be one quote read per minute per trade). Path bars with no
-// matching option bar keep OptionMid=0, so Engine.finish marks them PriceKnown=false
-// and Aggregate excludes them from win/loss/P&L rather than fabricating a value.
-func fillOptionMids(path []Bar, obars []data.Candle) {
+// the same minute (a last-trade proxy for the mid). Minutes with no trade are
+// FORWARD-FILLED (marked MidCarried) so the terminal exit is still priced+counted. The
+// carry is SEEDED with entryMid (the gate's entry price, always a valid quote for an
+// accepted trade), so even an immediate exit that fires before the first post-entry
+// trade is priced — otherwise those would still be dropped, leaving the same
+// liquidity-dependent selection bias for fast exits. A carried price prices the exit
+// but does NOT feed the decision loop's OptionPriceKnown (see Replay), so it can't
+// drive a spurious time exit.
+func fillOptionMids(path []Bar, obars []data.Candle, entryMid float64) {
 	byMin := make(map[int64]float64, len(obars))
 	for _, c := range obars {
 		if c.Close > 0 {
 			byMin[c.Timestamp.Unix()/60] = c.Close
 		}
 	}
+	// Seed with the entry mid: a gap before the first post-entry trade carries the entry
+	// price (stale but honest) rather than being dropped.
+	last := entryMid
 	for i := range path {
 		if mid, ok := byMin[path[i].Time.Unix()/60]; ok {
 			path[i].OptionMid = mid
+			last = mid
+			continue
+		}
+		if last > 0 {
+			path[i].OptionMid = last
+			path[i].MidCarried = true
 		}
 	}
 }

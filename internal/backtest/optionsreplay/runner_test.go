@@ -486,3 +486,39 @@ func TestAssembleSignals_EntryDeadlineFromOpen(t *testing.T) {
 		t.Fatalf("expected 0 signals (breakout at 10:40 is past the open+60m deadline), got %d", len(sigs))
 	}
 }
+
+// TestFillOptionMids_CarriesForward: a missing option bar after a real one carries the
+// last price forward (flagged), so the exit is priced+counted. A bar before the first
+// observed price carries the ENTRY MID seed (so an immediate exit is priced too); only
+// when the seed is 0 (no entry price) does a leading gap stay 0.
+func TestFillOptionMids_CarriesForward(t *testing.T) {
+	base := time.Date(2025, 6, 3, 13, 45, 0, 0, time.UTC)
+	mk := func() []Bar {
+		return []Bar{
+			{Time: base},                      // leading gap
+			{Time: base.Add(1 * time.Minute)}, // real price
+			{Time: base.Add(2 * time.Minute)}, // gap after a price → carried
+		}
+	}
+	obars := []data.Candle{{Timestamp: base.Add(1 * time.Minute), Close: 2.50}}
+
+	// Seeded with the entry mid (1.20): the leading gap carries the entry price, flagged.
+	seeded := mk()
+	fillOptionMids(seeded, obars, 1.20)
+	if seeded[0].OptionMid != 1.20 || !seeded[0].MidCarried {
+		t.Errorf("leading gap should carry the entry mid 1.20 + MidCarried, got %+v", seeded[0])
+	}
+	if seeded[1].OptionMid != 2.50 || seeded[1].MidCarried {
+		t.Errorf("real bar should be 2.50/uncarried, got %+v", seeded[1])
+	}
+	if seeded[2].OptionMid != 2.50 || !seeded[2].MidCarried {
+		t.Errorf("gap after a price should carry 2.50 + MidCarried, got %+v", seeded[2])
+	}
+
+	// Zero seed (no entry price to carry): the leading gap stays 0/uncarried.
+	unseeded := mk()
+	fillOptionMids(unseeded, obars, 0)
+	if unseeded[0].OptionMid != 0 || unseeded[0].MidCarried {
+		t.Errorf("with a zero seed, the leading gap should stay 0/uncarried, got %+v", unseeded[0])
+	}
+}
