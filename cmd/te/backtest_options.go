@@ -94,8 +94,12 @@ func runOptionsBacktest(ctx context.Context) error {
 			to.Format("2006-01-02"), floor.Format("2006-01-02"))
 	}
 	if from.Before(floor) {
-		fmt.Printf("NOTE: --from %s precedes the ~%s option-data floor; earlier days have no data and are skipped.\n",
+		fmt.Printf("NOTE: --from %s precedes the ~%s option-data floor; starting the run at the floor.\n",
 			from.Format("2006-01-02"), floor.Format("2006-01-02"))
+		// Clamp the REPLAY start too, not just the IV seed: equity bars exist before the
+		// option floor, so pre-floor days would otherwise assemble signals that then
+		// fail-closed at iv_rank (no IV coverage) and inflate the abort counts.
+		from = floor
 	}
 
 	underlyings := cfg.OptionsORB.Underlyings
