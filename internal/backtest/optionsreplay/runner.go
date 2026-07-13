@@ -130,7 +130,9 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 			slog.Warn("optionsreplay: option bars fetch failed; exit path unpriced",
 				"occ", dec.Contract.OCCSymbol, "err", err)
 		} else {
-			fillOptionMids(sig.Path, obars)
+			// Seed the forward-fill with the gate's entry mid so an immediate exit (before
+			// the first post-entry option trade) is priced, not dropped.
+			fillOptionMids(sig.Path, obars, dec.Mid)
 		}
 	}
 	// Hand the peeked decision back so Replay doesn't re-run the gate (and its
@@ -140,25 +142,23 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 
 // fillOptionMids sets each Path bar's OptionMid to the historical option bar Close at
 // the same minute (a last-trade proxy for the mid). Minutes with no trade are
-// FORWARD-FILLED from the last observed price (marked MidCarried) so the terminal exit
-// is still priced+counted; only bars before the first observed price (an entry-side
-// gap) keep OptionMid=0 → PriceKnown=false → excluded. A carried price prices the exit
+// FORWARD-FILLED (marked MidCarried) so the terminal exit is still priced+counted. The
+// carry is SEEDED with entryMid (the gate's entry price, always a valid quote for an
+// accepted trade), so even an immediate exit that fires before the first post-entry
+// trade is priced — otherwise those would still be dropped, leaving the same
+// liquidity-dependent selection bias for fast exits. A carried price prices the exit
 // but does NOT feed the decision loop's OptionPriceKnown (see Replay), so it can't
 // drive a spurious time exit.
-func fillOptionMids(path []Bar, obars []data.Candle) {
+func fillOptionMids(path []Bar, obars []data.Candle, entryMid float64) {
 	byMin := make(map[int64]float64, len(obars))
 	for _, c := range obars {
 		if c.Close > 0 {
 			byMin[c.Timestamp.Unix()/60] = c.Close
 		}
 	}
-	// Forward-fill (last-observation-carried-forward): when the option didn't trade at a
-	// path minute, carry the last known price rather than leaving it 0. A 0 exit would be
-	// dropped from P&L, and the drop rate varies by config (different contracts, different
-	// liquidity) — so dropping biases cross-config comparisons. Carrying counts the trade
-	// at a stale-but-honest estimate (flagged MidCarried). Bars before the FIRST observed
-	// price (an entry-side gap) stay 0 — there's nothing to carry.
-	last := 0.0
+	// Seed with the entry mid: a gap before the first post-entry trade carries the entry
+	// price (stale but honest) rather than being dropped.
+	last := entryMid
 	for i := range path {
 		if mid, ok := byMin[path[i].Time.Unix()/60]; ok {
 			path[i].OptionMid = mid
