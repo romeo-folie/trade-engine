@@ -234,6 +234,12 @@ func checkRiskReward(in CheckInput) CheckResult {
 
 func checkPositionSize(in CheckInput) CheckResult {
 	name := "position_size_limit"
+	// SELLs close the HELD quantity (#436) — their executed size is never
+	// derived from size_pct, so capping the analyst's proposal would only
+	// block legitimate exits (same skip pattern as checkMaxDollarRisk).
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.SizePct <= in.Cfg.MaxPositionPct {
 		return pass(name)
 	}
@@ -296,6 +302,11 @@ func checkMaxDollarRisk(in CheckInput) CheckResult {
 
 func checkMaxOpenPositions(in CheckInput) CheckResult {
 	name := "max_open_positions"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a full position budget must not block the exit that frees a slot.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.OpenPositions < in.Cfg.MaxOpenPositions {
 		return pass(name)
 	}
@@ -310,6 +321,11 @@ func checkMaxOpenPositions(in CheckInput) CheckResult {
 // (risk.max_per_ticker) in your config — config.example.yaml recommends 2.
 func checkMaxPerTicker(in CheckInput) CheckResult {
 	name := "max_per_ticker"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// per-ticker capacity only meaningfully caps opening risk.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.Cfg.MaxPerTicker <= 0 {
 		return pass(name)
 	}
@@ -323,6 +339,11 @@ func checkMaxPerTicker(in CheckInput) CheckResult {
 
 func checkDailyLossLimit(in CheckInput) CheckResult {
 	name := "daily_loss_limit"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a daily-loss pause must still allow closing positions.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.PortfolioValue == 0 {
 		return pass(name) // can't evaluate without portfolio value
 	}
@@ -336,6 +357,11 @@ func checkDailyLossLimit(in CheckInput) CheckResult {
 
 func checkMaxDrawdown(in CheckInput) CheckResult {
 	name := "max_drawdown"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// an emergency drawdown stop must still allow de-risking exits.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.PeakValue == 0 || in.PortfolioValue == 0 {
 		return pass(name)
 	}
@@ -355,17 +381,11 @@ func checkPositionOwnership(in CheckInput) CheckResult {
 	if !in.HoldsLong {
 		return fail(name, NoPositionBlockReason(in.Ticker))
 	}
-	// Verify the proposed sell quantity does not exceed shares held.
-	// Overselling would result in a net short even with a position check.
-	if in.SignalPrice > 0 && in.LongQuantity > 0 {
-		proposedQty := (in.Cash * in.SizePct / 100) / in.SignalPrice
-		if proposedQty > in.LongQuantity {
-			return fail(name, fmt.Sprintf(
-				"sell qty %.2f exceeds held long %.2f in %s",
-				proposedQty, in.LongQuantity, in.Ticker,
-			))
-		}
-	}
+	// No oversell check: since #436 a SELL closes the HELD long quantity —
+	// the executed size is derived from the open lots, never from the
+	// signal's cash-based size_pct, so a size proposal can't over-sell. The
+	// old cash-derived check here could wrongly block legitimate exits when
+	// cash × size_pct exceeded the (smaller) held position.
 	return pass(name)
 }
 
@@ -426,6 +446,11 @@ func checkPyramidPolicy(in CheckInput) CheckResult {
 
 func checkCooldownAfterLoss(in CheckInput) CheckResult {
 	name := "cooldown_after_loss"
+	// SELLs are close-only exits since #436 — they strictly reduce risk;
+	// a post-loss cooldown must not force holding a position.
+	if in.Action != "BUY" {
+		return pass(name)
+	}
 	if in.LastLossAt.IsZero() || in.Cfg.CooldownAfterLoss == 0 {
 		return pass(name)
 	}

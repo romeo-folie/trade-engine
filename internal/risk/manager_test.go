@@ -242,17 +242,16 @@ func TestPositionOwnership_SellWithSufficientPosition(t *testing.T) {
 	assertPasses(t, checkPositionOwnership, in)
 }
 
-func TestPositionOwnership_SellExceedsHeldQuantity(t *testing.T) {
+func TestPositionOwnership_SellSmallPositionStillPasses(t *testing.T) {
+	// Since #436 a SELL closes the HELD quantity, so a held position
+	// smaller than the signal's cash-derived size must NOT block the exit
+	// (the old oversell check did exactly that).
 	in := baseInput()
 	in.Action = "SELL"
 	in.Ticker = "HIMS"
 	in.HoldsLong = true
-	// proposedQty = (5000 * 2.0/100) / 100.0 = 1.0; held = 0.5 → oversell
 	in.LongQuantity = 0.5
-	r := assertFails(t, checkPositionOwnership, in)
-	if r.Name != "position_ownership" {
-		t.Fatalf("wrong check name: %s", r.Name)
-	}
+	assertPasses(t, checkPositionOwnership, in)
 }
 
 func TestPositionOwnership_SellWithoutPosition(t *testing.T) {
@@ -967,6 +966,46 @@ func TestNoPositionBlockReason_FormatStable(t *testing.T) {
 	for _, want := range []string{"HIMS", "no open long position", "cannot sell"} {
 		if !strings.Contains(reason, want) {
 			t.Errorf("expected reason to contain %q, got %q", want, reason)
+		}
+	}
+}
+
+func TestPositionSize_SellSkipsSizeCap(t *testing.T) {
+	// Since #436 a SELL's executed size is the held quantity, not the
+	// analyst's size_pct — an oversized proposal must not block the exit.
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.SizePct = in.Cfg.MaxPositionPct + 10
+	assertPasses(t, checkPositionSize, in)
+}
+
+func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
+	// Since #436 a SELL is a close-only exit that strictly reduces risk.
+	// Capacity and trading-pause gates exist to limit NEW risk — blocking
+	// the exit that frees a slot (or de-risks during a pause) is exactly
+	// backwards, and was how a clogged position budget locked itself in.
+	in := baseInput()
+	in.Action = "SELL"
+	in.HoldsLong = true
+	in.OpenPositions = in.Cfg.MaxOpenPositions + 5           // over budget
+	in.OpenByTicker = map[string]int{in.Ticker: 99}          // over per-ticker cap
+	in.DailyPnL = -1e9                                       // daily-loss pause tripped
+	in.PeakValue = in.PortfolioValue * 100                   // drawdown stop tripped
+	in.LastLossAt = time.Now()                               // cooldown active
+
+	for _, check := range []struct {
+		name string
+		fn   func(CheckInput) CheckResult
+	}{
+		{"max_open_positions", checkMaxOpenPositions},
+		{"max_per_ticker", checkMaxPerTicker},
+		{"daily_loss_limit", checkDailyLossLimit},
+		{"max_drawdown", checkMaxDrawdown},
+		{"cooldown_after_loss", checkCooldownAfterLoss},
+	} {
+		if r := check.fn(in); !r.Passed {
+			t.Fatalf("%s must pass for a SELL exit, failed with: %s", check.name, r.Reason)
 		}
 	}
 }

@@ -46,6 +46,15 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "migrate engine test DB: %v\n", err)
 		os.Exit(1)
 	}
+	// Start every `go test` invocation from a clean slate — tests count
+	// rows by ticker, and the isolated DB persists across runs. Scoped to
+	// OUR database (tradeengine_engine_test) only.
+	for _, tbl := range []string{"orders", "trades", "signals"} {
+		if _, err := store.GetDB().Exec(ctx,
+			fmt.Sprintf("TRUNCATE TABLE %s RESTART IDENTITY CASCADE", tbl)); err != nil {
+			fmt.Fprintf(os.Stderr, "truncate %s: %v\n", tbl, err)
+		}
+	}
 	os.Exit(m.Run())
 }
 
