@@ -1990,9 +1990,23 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// A SELL must not race the ticker's working exit legs: they hold the
 	// long's shares at the broker, and Alpaca rejects a sell of held shares.
 	// Not gated on bracket_exits_enabled — legs placed before a flag flip
-	// must still be cleared (no-op when the ticker has no leg rows).
+	// must still be cleared (no-op when the ticker has no leg rows). When a
+	// cancel cannot be CONFIRMED, the sell must not proceed: a still-live
+	// leg would race it. Block the signal; the next cycle re-evaluates with
+	// reconciled state.
 	if side == execution.OrderSideSell {
-		e.cancelBracketLegsForTicker(ctx, sig.Ticker)
+		if !e.cancelBracketLegsForTicker(ctx, sig.Ticker) {
+			reason := "working exit legs could not be confirmed cancelled — sell would race a live bracket leg"
+			if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+				logger.Warn("update signal status", "id", sigID, "err", err)
+			}
+			logger.Warn("sell blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "bracket_leg_cancel",
+			})
+			return
+		}
 	}
 
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
