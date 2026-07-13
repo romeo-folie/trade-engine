@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -138,11 +137,12 @@ func (r *Runner) sessionEnd(t time.Time) time.Time {
 	return time.Date(et.Year(), et.Month(), et.Day(), 16, 0, 0, 0, r.etLoc)
 }
 
-// fetchWithBackoff retries rate-limited fetches with a long pause. The shared
-// client's withRetry already handles transient 429s, but a batch study at the
-// free-tier ceiling exhausts its attempts; an offline audit can afford to
-// wait instead of dropping trades. The 429 check is string-based because the
-// data package's httpError type is unexported.
+// fetchWithBackoff retries failed fetches with a long pause. The shared
+// client's withRetry already handles transient failures, but a batch study at
+// the free-tier ceiling exhausts its attempts (sustained 429s escalate to
+// hung connections and client timeouts); an offline audit can afford to wait
+// instead of dropping trades. Every error is retried except the caller's own
+// context ending — this tool has no partial-failure mode worth preserving.
 func (r *Runner) fetchWithBackoff(ctx context.Context, ticker string, tf data.Timeframe, from, to time.Time) ([]data.Candle, error) {
 	var lastErr error
 	for attempt := range 4 {
@@ -151,10 +151,10 @@ func (r *Runner) fetchWithBackoff(ctx context.Context, ticker string, tf data.Ti
 			return bars, nil
 		}
 		lastErr = err
-		if !strings.Contains(err.Error(), "429") {
-			return nil, err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
 		}
-		slog.Info("study: rate limited, backing off", "ticker", ticker, "attempt", attempt+1)
+		slog.Info("study: fetch failed, backing off", "ticker", ticker, "attempt", attempt+1, "err", err)
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -245,13 +245,21 @@ func (r *Runner) runOne(ctx context.Context, tc TradeCase) TradeResult {
 	}
 
 	// ── Exit fidelity: bracket-sim from the ACTUAL entry ──────────────────
-	entryIdx := firstBarAtOrAfter(bars, tc.OpenedAt)
+	// Anchor at the bar containing the entry instant — the trade is live for
+	// the remainder of that minute and a broker bracket would already be
+	// armed. The fidelity sim is bounded at the recorded close: the bar
+	// window extends days past ClosedAt for the counterfactuals below, but a
+	// trade closed by another path (trailing manager, SELL signal) must not
+	// be credited with a "bracket exit" that happens after it was already
+	// flat — that fabricates improvements and negative detection lags.
+	entryIdx := barContaining(bars, tc.OpenedAt)
 	if entryIdx < 0 {
 		res.Skipped = "no bars after entry"
 		return res
 	}
+	fidelityEnd := lastBarAtOrBefore(bars, tc.ClosedAt)
 	if tc.StopLoss > 0 || tc.TakeProfit > 0 {
-		sim := SimBracketExit(bars, entryIdx, tc.Direction, tc.StopLoss, tc.TakeProfit)
+		sim := SimBracketExit(bars[:fidelityEnd+1], entryIdx, tc.Direction, tc.StopLoss, tc.TakeProfit)
 		res.SimExitPrice = sim.Price
 		res.SimExitReason = sim.Reason
 		if sim.Resolved {
@@ -268,7 +276,9 @@ func (r *Runner) runOne(ctx context.Context, tc TradeCase) TradeResult {
 	}
 
 	// ── Excursions over the actual hold ────────────────────────────────────
-	closeIdx := firstBarAtOrAfter(bars, tc.ClosedAt)
+	// Bounded at the recorded close for the same reason as the fidelity sim:
+	// post-close bars are not part of the hold.
+	closeIdx := fidelityEnd
 	if closeIdx < 0 {
 		closeIdx = len(bars) - 1
 	}

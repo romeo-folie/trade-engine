@@ -188,6 +188,60 @@ func TestSimTrailingExit_ZeroATRFallsBackToBracket(t *testing.T) {
 	}
 }
 
+func TestBarContaining(t *testing.T) {
+	bars := []data.Candle{
+		bar(mins(0), 100, 101, 99, 100),
+		bar(mins(1), 100, 101, 99, 100),
+	}
+	// An instant mid-minute anchors to the bar that contains it.
+	if got := barContaining(bars, mins(0).Add(25*time.Second)); got != 0 {
+		t.Fatalf("got %d, want 0 (containing bar)", got)
+	}
+	// An instant exactly on a bar boundary anchors to that bar.
+	if got := barContaining(bars, mins(1)); got != 1 {
+		t.Fatalf("got %d, want 1", got)
+	}
+	// An instant in a filtered-out gap (e.g. after hours) falls forward.
+	if got := barContaining(bars, mins(0).Add(-30*time.Second)); got != 0 {
+		t.Fatalf("got %d, want 0 (fall forward)", got)
+	}
+	// An instant after the last bar's minute has no containing bar.
+	if got := barContaining(bars, mins(5)); got != -1 {
+		t.Fatalf("got %d, want -1", got)
+	}
+	// ...but within the last bar's minute it anchors to the last bar.
+	if got := barContaining(bars, mins(1).Add(30*time.Second)); got != 1 {
+		t.Fatalf("got %d, want 1 (last bar)", got)
+	}
+}
+
+func TestLastBarAtOrBefore(t *testing.T) {
+	bars := []data.Candle{bar(mins(0), 1, 1, 1, 1), bar(mins(1), 1, 1, 1, 1)}
+	if got := lastBarAtOrBefore(bars, mins(0).Add(30*time.Second)); got != 0 {
+		t.Fatalf("got %d, want 0", got)
+	}
+	if got := lastBarAtOrBefore(bars, mins(0).Add(-time.Second)); got != -1 {
+		t.Fatalf("got %d, want -1", got)
+	}
+	if got := lastBarAtOrBefore(bars, mins(9)); got != 1 {
+		t.Fatalf("got %d, want 1", got)
+	}
+}
+
+func TestSimBracketExit_EmptyOrOutOfRangeStart(t *testing.T) {
+	// A fidelity window that ends before the entry (bars[:0]) must come back
+	// unresolved, never panic or fabricate an exit.
+	sim := SimBracketExit(nil, 0, "long", 98, 102)
+	if sim.Resolved || sim.Reason != "unresolved" {
+		t.Fatalf("got %+v, want unresolved on empty bars", sim)
+	}
+	bars := []data.Candle{bar(mins(0), 100, 103, 97, 101)}
+	sim = SimBracketExit(bars, 5, "long", 98, 102)
+	if sim.Resolved || sim.Reason != "unresolved" {
+		t.Fatalf("got %+v, want unresolved on out-of-range start", sim)
+	}
+}
+
 func TestPctReturnDirections(t *testing.T) {
 	if got := pctReturn("long", 100, 105); got != 5 {
 		t.Fatalf("long: got %.2f, want 5", got)

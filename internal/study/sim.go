@@ -43,6 +43,35 @@ func firstBarAtOrAfter(bars []data.Candle, t time.Time) int {
 	return -1
 }
 
+// barContaining returns the index of the bar whose 1-minute interval contains
+// t, falling back to the first bar after t (e.g. an after-hours instant whose
+// containing bar was filtered out by the RTH cut). -1 when neither exists.
+// Anchoring a replay at the containing bar matters for real entries: a trade
+// opened mid-minute is live for the remainder of that bar, and a stop touched
+// there would have fired a broker bracket immediately.
+func barContaining(bars []data.Candle, t time.Time) int {
+	next := firstBarAtOrAfter(bars, t)
+	prev := next - 1
+	if next < 0 {
+		prev = len(bars) - 1
+	}
+	if prev >= 0 && t.Sub(bars[prev].Timestamp) < time.Minute {
+		return prev
+	}
+	return next
+}
+
+// lastBarAtOrBefore returns the index of the last bar whose timestamp is not
+// after t, or -1 when every bar is later.
+func lastBarAtOrBefore(bars []data.Candle, t time.Time) int {
+	for i := len(bars) - 1; i >= 0; i-- {
+		if !bars[i].Timestamp.After(t) {
+			return i
+		}
+	}
+	return -1
+}
+
 // EntryFill is the result of simulating an entry tactic.
 type EntryFill struct {
 	Idx   int     // bar index of the fill
