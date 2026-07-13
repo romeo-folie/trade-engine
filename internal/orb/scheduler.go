@@ -838,20 +838,24 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 				orbPerfCtx,
 			)
 
-			resp, meta, analyzeErr := s.analyzer.Analyze(ctx, analysis.AnalysisRequest{
+			// Score with the analysts DIRECTLY (no arbiter) and aggregate by confidence,
+			// so a gap candidate is selectable with however many analysts are reachable
+			// (even one) — the equities scan must not go dark when the arbiter is
+			// unconfigured/out-of-credits or a provider is throttled. Errors only when
+			// EVERY analyst failed.
+			analystResults, analyzeErr := s.analyzer.AnalyzeAnalysts(ctx, analysis.AnalysisRequest{
 				Ticker:             gap.Ticker,
 				CustomSystemPrompt: sysPrompt,
 				CustomUserMessage:  userMsg,
 			}, depth.ImpactScore{Score: 1.0, Depth: 3})
 			if analyzeErr != nil {
-				slog.Error("orb: LLM scoring failed", "ticker", gap.Ticker, "err", analyzeErr)
+				slog.Error("orb: LLM scoring failed — no analysts available", "ticker", gap.Ticker, "err", analyzeErr)
 				continue
 			}
 
-			// Parse ORB-specific fields (catalyst_type, catalyst_quality, risks) from
-			// the raw LLM response. The standard AnalysisResponse doesn't carry these
-			// fields — they exist only in the ORB custom prompt schema.
-			result := parseORBResult(meta.RawResponse, resp)
+			// Winning-action mean over the successful analysts, gated on the confidence
+			// threshold. parseORBResult (inside) pulls the ORB-specific catalyst/risks fields.
+			result := aggregateORBScore(analystResults, s.scanConfidenceThreshold())
 			scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
 		}
 	}

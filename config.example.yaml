@@ -441,6 +441,7 @@ orb:
   min_dollar_volume: 0         # Drop gap movers below this price×volume before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop liquid names — only enable on a SIP-backed deployment.
   max_candidates: 2            # Number of top candidates to trade (1–5)
   max_scan_candidates: 15      # How many top gap movers to LLM-score per scan (caps rate-limited model calls; 0 = default 15). Ranked liquidity-first (|gap%| × log10 dollar-volume).
+  scan_confidence_threshold: 0.68  # Min aggregated analyst conviction for a gap candidate to trade (0 = default 0.68). The scan aggregates whatever analysts are reachable by confidence — NO arbiter required — so scoring survives a provider/arbiter outage.
   range_minutes: 15            # Opening range window: 5 or 15 minutes
   risk_reward: 2.0             # Risk/reward ratio for bracket orders (>= 1.5)
   max_risk_pct: 1.0            # Max risk per trade as % of portfolio (<= 5.0)

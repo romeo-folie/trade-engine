@@ -103,17 +103,19 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 			"",
 		)
 
-		resp, meta, analyzeErr := s.Analyzer.Analyze(ctx, analysis.AnalysisRequest{
+		// Analysts-only (no arbiter) + confidence aggregation, so scoring survives an
+		// arbiter/provider outage and works with however many analysts are reachable.
+		analystResults, analyzeErr := s.Analyzer.AnalyzeAnalysts(ctx, analysis.AnalysisRequest{
 			Ticker:             gap.Ticker,
 			CustomSystemPrompt: sysPrompt,
 			CustomUserMessage:  userMsg,
 		}, depth.ImpactScore{Score: 1.0, Depth: 3})
 		if analyzeErr != nil {
-			fmt.Printf("orb: LLM scoring %s failed: %v\n", gap.Ticker, analyzeErr)
+			fmt.Printf("orb: LLM scoring %s failed (no analysts available): %v\n", gap.Ticker, analyzeErr)
 			continue
 		}
 
-		result := parseORBResult(meta.RawResponse, resp)
+		result := aggregateORBScore(analystResults, effectiveScanThreshold(s.Cfg.ScanConfidenceThreshold))
 		scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
 	}
 

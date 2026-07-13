@@ -202,22 +202,37 @@ func (a *Analyzer) AnalyzeEnsemble(ctx context.Context, req AnalysisRequest) ([]
 
 // AnalyzeEnsembleWithSet fans out to a specific set of analysts in parallel.
 func (a *Analyzer) AnalyzeEnsembleWithSet(ctx context.Context, req AnalysisRequest, analysts []ModelProvider) ([]AnalystResult, error) {
+	available := availableProviders(analysts)
+	if len(available) == 0 {
+		return nil, fmt.Errorf("ensemble: no analysts are available (check API keys)")
+	}
+	results := a.runAnalystSet(ctx, req, available)
+	if n := len(successfulResults(results)); n < 2 {
+		return results, fmt.Errorf("ensemble: only %d/%d analysts succeeded (minimum 2 required)", n, len(available))
+	}
+	return results, nil
+}
+
+// availableProviders filters to the configured+ready providers.
+func availableProviders(analysts []ModelProvider) []ModelProvider {
 	available := make([]ModelProvider, 0, len(analysts))
 	for _, p := range analysts {
 		if p.IsAvailable() {
 			available = append(available, p)
 		}
 	}
-	if len(available) == 0 {
-		return nil, fmt.Errorf("ensemble: no analysts are available (check API keys)")
-	}
+	return available
+}
 
+// runAnalystSet runs every provider in parallel and returns all results (failures
+// included, each marked with Err). It enforces no minimum-success count and never
+// invokes the arbiter — callers decide how to aggregate the raw analyst opinions.
+func (a *Analyzer) runAnalystSet(ctx context.Context, req AnalysisRequest, available []ModelProvider) []AnalystResult {
 	mu := &sync.Mutex{}
 	results := make([]AnalystResult, 0, len(available))
 
 	var wg sync.WaitGroup
 	for _, p := range available {
-		p := p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -239,15 +254,26 @@ func (a *Analyzer) AnalyzeEnsembleWithSet(ctx context.Context, req AnalysisReque
 		}()
 	}
 	wg.Wait()
+	return results
+}
 
-	successes := 0
-	for _, r := range results {
-		if r.Err == nil {
-			successes++
-		}
+// AnalyzeAnalysts runs the depth-filtered analysts and returns their raw per-analyst
+// results with NO arbiter and only a >=1-success requirement (it errors only when
+// EVERY analyst fails). Callers that do their own aggregation — e.g. the ORB gap scan,
+// which must keep selecting candidates when the arbiter is unconfigured/failing or when
+// only a single analyst is reachable — use this instead of Analyze/AnalyzeFull.
+func (a *Analyzer) AnalyzeAnalysts(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) ([]AnalystResult, error) {
+	active := a.analysts
+	if impact.Depth > 0 && impact.Depth < len(a.analysts) {
+		active = a.analysts[:impact.Depth]
 	}
-	if successes < 2 {
-		return results, fmt.Errorf("ensemble: only %d/%d analysts succeeded (minimum 2 required)", successes, len(available))
+	available := availableProviders(active)
+	if len(available) == 0 {
+		return nil, fmt.Errorf("no analysts available (check API keys)")
+	}
+	results := a.runAnalystSet(ctx, req, available)
+	if len(successfulResults(results)) == 0 {
+		return results, fmt.Errorf("all %d analysts failed", len(available))
 	}
 	return results, nil
 }
