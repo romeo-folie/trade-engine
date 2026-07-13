@@ -11,6 +11,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/backtest/optionsreplay"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/earnings"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/options"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -213,7 +214,22 @@ func runOptionsBacktest(ctx context.Context) error {
 		btOptFrom, btOptTo, strings.Join(underlyings, ","))
 	fmt.Println("Seeding IV history and assembling breakouts (this fetches historical option data)…")
 
-	runner, err := optionsreplay.NewRunner(ctx, hd, ivstore, underlyings, from, to, rcfg, nil)
+	// Earnings provider reads the shared earnings_calendar table AS OF the replay instant
+	// (not wall-clock now), so single-name underlyings get the same blackout the live gate
+	// applies. ETFs never consult it. Seed historical dates with `te earnings seed` first —
+	// otherwise a single name has no dates and fails closed at the earnings gate.
+	earningsProvider := earnings.NewStoreProvider(store.GetDB(), func(c context.Context) time.Time {
+		if t, ok := optionsreplay.AsOfTime(c); ok {
+			return t
+		}
+		// No as-of on ctx (shouldn't happen — the runner always stamps it). Return a
+		// far-future instant so the "next earnings on or after" query finds nothing and the
+		// gate sees "none scheduled" (fail OPEN — never fabricate a blackout from a wrong
+		// as-of, which a zero time would by returning the earliest historical date).
+		return time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	})
+
+	runner, err := optionsreplay.NewRunner(ctx, hd, ivstore, underlyings, from, to, rcfg, earningsProvider)
 	if err != nil {
 		return fmt.Errorf("build runner: %w", err)
 	}

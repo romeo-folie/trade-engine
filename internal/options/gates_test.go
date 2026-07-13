@@ -194,6 +194,19 @@ func TestSelect_EarningsWithinBlackout_Aborts(t *testing.T) {
 	}
 }
 
+// TestSelect_EarningsSameDayMidnight_Aborts is the regression guard for the store-backed
+// path: a real EarningsProvider returns a DATE (midnight UTC), and a signal on that same
+// day is an intraday instant. The blackout MUST still fire on the day of the report (the
+// day that matters most), not be skipped because midnight < the intraday signal time.
+func TestSelect_EarningsSameDayMidnight_Aborts(t *testing.T) {
+	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
+	earn := fakeEarnings{when: dayFloor(asOf), has: true} // earnings TODAY, stamped at midnight like the DB
+	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
+	if dec.Accepted || dec.Gate != GateEarnings {
+		t.Fatalf("expected earnings abort on the report day itself, got accepted=%v gate=%s", dec.Accepted, dec.Gate)
+	}
+}
+
 func TestSelect_EarningsOutsideBlackout_Passes(t *testing.T) {
 	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
 	earn := fakeEarnings{when: asOf.AddDate(0, 0, 30), has: true} // 30 days out — clear

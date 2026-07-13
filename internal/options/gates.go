@@ -167,8 +167,14 @@ func (e *Engine) Select(ctx context.Context, sig Signal) Decision {
 			return abort(GateEarnings, "no earnings provider for single name %s (fail closed)", underlying)
 		}
 		if when, has := e.earnings.NextEarnings(ctx, underlying); has {
+			// Compare on DAY granularity. A store-backed provider returns a DATE (midnight
+			// UTC) while sig.AsOf is an intraday instant, so a raw instant compare would see
+			// an earnings report scheduled the SAME day as already "past" (midnight < 09:45)
+			// and skip the blackout on the very day it matters most. dayFloor both sides so
+			// the window is the inclusive day range [T−N … T].
 			window := time.Duration(e.cfg.EarningsBlackoutDays) * 24 * time.Hour
-			if !when.Before(sig.AsOf) && when.Sub(sig.AsOf) <= window {
+			sigDay, whenDay := dayFloor(sig.AsOf), dayFloor(when)
+			if !whenDay.Before(sigDay) && whenDay.Sub(sigDay) <= window {
 				return abort(GateEarnings, "earnings for %s at %s within %dd blackout",
 					underlying, when.Format("2006-01-02"), e.cfg.EarningsBlackoutDays)
 			}
