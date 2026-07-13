@@ -405,7 +405,39 @@ func exitPnLM(side string, entryPrice, exitPrice float64, qty, multiplier int) f
 	if multiplier <= 0 {
 		multiplier = 1
 	}
-	units := float64(qty) * float64(multiplier)
+	return exitPnLF(side, entryPrice, exitPrice, qty, float64(multiplier))
+}
+
+// ExitPnLF is the exported float point-value form of exit P&L, for out-of-package callers
+// (the offline recovery tools) that must apply a futures contract's dollar-per-point.
+func ExitPnLF(side string, entryPrice, exitPrice float64, qty int, pointValue float64) float64 {
+	return exitPnLF(side, entryPrice, exitPrice, qty, pointValue)
+}
+
+// PointValueForTicker is the dollar value of a 1.0 price move per contract/unit: for a
+// ticker present in instruments, TickValue/TickSize (MES $5/pt, MYM $0.50/pt); otherwise
+// 1.0 (forex/CFD units like XAU/XAG = $1/pt). Package-level so the scheduler AND the
+// offline recovery tools (orb-backfill, orb-reconcile-statement) share one source of truth
+// and can't diverge on the multiplier.
+func PointValueForTicker(instruments []config.FuturesInstrument, ticker string) float64 {
+	for i := range instruments {
+		if instruments[i].Symbol == ticker && instruments[i].TickSize > 0 {
+			return instruments[i].TickValue / instruments[i].TickSize
+		}
+	}
+	return 1
+}
+
+// exitPnLF is the FLOAT point-value form of exit P&L, for instruments whose dollar move
+// per 1.0 price point isn't an integer — e.g. a micro Dow (MYM) future at $0.50/pt. Forex
+// units (XAU/XAG, $1/pt) pass pointValue=1; a futures point value is TickValue/TickSize
+// (MES $1.25/0.25 = $5/pt, MYM $0.50/1.00 = $0.50/pt). pointValue <= 0 is treated as 1 so
+// callers that leave it unset get the plain per-unit result.
+func exitPnLF(side string, entryPrice, exitPrice float64, qty int, pointValue float64) float64 {
+	if pointValue <= 0 {
+		pointValue = 1
+	}
+	units := float64(qty) * pointValue
 	if side == "sell" {
 		return (entryPrice - exitPrice) * units
 	}
