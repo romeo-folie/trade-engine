@@ -86,6 +86,18 @@ func runOptionsBacktest(ctx context.Context) error {
 	}
 	to = to.Add(24*time.Hour - time.Second)
 
+	// Alpaca has no option data before ~Jan 2024. A window ending before the floor can
+	// produce nothing; one starting before it just has empty early days.
+	floor := data.AlpacaOptionHistoryStart
+	if to.Before(floor) {
+		return fmt.Errorf("window ends %s, before Alpaca's option-data floor %s — no historical option data exists there",
+			to.Format("2006-01-02"), floor.Format("2006-01-02"))
+	}
+	if from.Before(floor) {
+		fmt.Printf("NOTE: --from %s precedes the ~%s option-data floor; earlier days have no data and are skipped.\n",
+			from.Format("2006-01-02"), floor.Format("2006-01-02"))
+	}
+
 	underlyings := cfg.OptionsORB.Underlyings
 	if btOptUnderlyings != "" {
 		underlyings = nil
@@ -112,7 +124,8 @@ func runOptionsBacktest(ctx context.Context) error {
 	ivstore := options.NewStoreIVStore(store.GetDB())
 
 	rcfg := optionsBacktestConfig(cfg)
-	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct // exit models a market-sell receiving the bid
+	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct        // exit models a market-sell receiving the bid
+	rcfg.IVHistoryFloor = data.AlpacaOptionHistoryStart // don't seed IV before Alpaca has data
 	// ETF underlyings are earnings-exempt. Single names hit the earnings gate, which —
 	// with no earnings provider wired for the backtest — fails CLOSED, so the backtest
 	// is effectively ETF-only. Mark the configured/flagged ETFs so SPY/QQQ aren't

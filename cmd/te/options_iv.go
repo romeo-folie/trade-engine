@@ -102,8 +102,12 @@ func runBackfillIV(ctx context.Context) error {
 
 	// Seed [today-lookback, today]. Deriving up to "now" keeps the trailing window
 	// fresh when this runs daily; UpsertOptionIV is idempotent per (underlying, date).
+	// Clamp the start to Alpaca's data floor — earlier days have no data to derive.
 	to := time.Now()
 	from := to.AddDate(0, 0, -lookback)
+	if from.Before(data.AlpacaOptionHistoryStart) {
+		from = data.AlpacaOptionHistoryStart
+	}
 
 	fmt.Printf("options backfill-iv · %s → %s · %s\n", from.Format("2006-01-02"), to.Format("2006-01-02"), strings.Join(underlyings, ","))
 	ivstore := options.NewStoreIVStore(db)

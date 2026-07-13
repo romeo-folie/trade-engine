@@ -22,6 +22,20 @@ type RunnerConfig struct {
 	IVRefMinuteET  int          // minutes after ET session open at which the daily ATM IV is sampled (default 15)
 	RiskFreeRate   float64      // r for Black-Scholes greeks (default 0)
 	DividendYield  float64      // q for Black-Scholes greeks (default 0)
+	// IVHistoryFloor clamps the IV-seed lookback: no day before this is fetched, since
+	// the source has no data there (and a no-data day can't be cached, so it would be
+	// re-fetched every run). Zero disables the clamp. Set it to the data source's floor
+	// (e.g. data.AlpacaOptionHistoryStart).
+	IVHistoryFloor time.Time
+}
+
+// clampIVFrom raises ivFrom to the data floor when it would otherwise reach before it.
+// A zero floor leaves ivFrom unchanged (clamp disabled).
+func clampIVFrom(ivFrom, floor time.Time) time.Time {
+	if !floor.IsZero() && ivFrom.Before(floor) {
+		return floor
+	}
+	return ivFrom
 }
 
 // Runner executes a runnable options-ORB backtest end to end: it seeds the IV-rank
@@ -54,8 +68,10 @@ func NewRunner(ctx context.Context, hd HistoricalOptionData, ivstore options.IVS
 	if lookback <= 0 {
 		lookback = 252
 	}
-	// Seed enough calendar days before `from` to clear IVMinSamples trading days.
-	ivFrom := from.AddDate(0, 0, -(lookback + 10))
+	// Seed enough calendar days before `from` to clear IVMinSamples trading days, but
+	// never before the source's data floor (those days can't have data, so seeding them
+	// just re-fetches empty every run).
+	ivFrom := clampIVFrom(from.AddDate(0, 0, -(lookback+10)), cfg.IVHistoryFloor)
 	for _, u := range underlyings {
 		if err := chain.SeedIVHistory(ctx, ivstore, u, ivFrom, to, cfg.IVRefMinuteET); err != nil {
 			return nil, fmt.Errorf("seed IV history for %s: %w", u, err)
