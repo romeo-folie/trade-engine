@@ -254,7 +254,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	//    position was already partially reduced (a partial leg fill) — using t.Qty
 	//    there would overstate PnL by the t.Qty/flattenQty ratio. flattenQty is
 	//    bounded to t.Qty above, so this never inflates.
-	pnl := exitPnL(t.Side, t.FillPrice, exitPrice, int(flattenQty))
+	pnl := exitPnLF(t.Side, t.FillPrice, exitPrice, int(flattenQty), s.pointValueForTicker(t.Ticker))
 	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, "time_exit", "broker", exitPrice, pnl); dbErr != nil {
 		slog.Error("orb: time exit: close trade failed", "ticker", t.Ticker, "err", dbErr)
 		return true // position IS flat (flatten confirmed); the record retries next sweep

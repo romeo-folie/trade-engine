@@ -40,6 +40,7 @@ import (
 
 	"github.com/joho/godotenv"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/orb"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -153,7 +154,7 @@ type match struct {
 // netted: a single sell fill can serve as a short trade's *entry* or a prior long trade's
 // *exit*. Doing exits first lets a long's exit-search greedily consume a fill that is
 // actually a distinct short trade's entry; entries-first prevents that collision.
-func reconcile(dbTrades []store.ORBTrade, bySym map[string][]*fill) []match {
+func reconcile(dbTrades []store.ORBTrade, bySym map[string][]*fill, futuresInstruments []config.FuturesInstrument) []match {
 	// Process in fill-time order so the earliest trade claims the earliest fills.
 	sort.Slice(dbTrades, func(i, j int) bool {
 		return anchorTime(dbTrades[i]).Before(anchorTime(dbTrades[j]))
@@ -235,7 +236,7 @@ func reconcile(dbTrades []store.ORBTrade, bySym map[string][]*fill) []match {
 		out[k].exitPrice = ex.price
 		out[k].exitTime = ex.t
 		out[k].comm = fills[entryIdx[k]].comm + ex.comm
-		out[k].pnl = orb.ExitPnL(t.Side, t.FillPrice, ex.price, t.Qty)
+		out[k].pnl = orb.ExitPnLF(t.Side, t.FillPrice, ex.price, t.Qty, orb.PointValueForTicker(futuresInstruments, t.Ticker))
 		if out[k].pnl >= 0 {
 			out[k].exitType = "tp"
 		} else {
@@ -286,7 +287,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	matches := reconcile(dbTrades, bySym)
+	// Futures instruments (micro-index + COMEX metals) so exit P&L applies the contract
+	// point value. Best-effort: if config can't load, fall back to per-unit (forex) P&L.
+	var futuresInstruments []config.FuturesInstrument
+	if cfg, cerr := config.Load(); cerr == nil {
+		futuresInstruments = append(append([]config.FuturesInstrument(nil),
+			cfg.FuturesORB.Instruments...), cfg.FuturesORBMetals.Instruments...)
+	}
+
+	matches := reconcile(dbTrades, bySym, futuresInstruments)
 
 	mode := "DRY RUN — no changes written (pass --apply to record)"
 	if *apply {
