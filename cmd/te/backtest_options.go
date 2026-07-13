@@ -271,8 +271,11 @@ func printOptionsReport(scope string, r optionsreplay.Report) {
 	fmt.Printf("  Wins/Loss:  %d / %d  (scratch %d)\n", r.Wins, r.Losses, r.Scratches)
 	fmt.Printf("  Win rate:   %.1f%%  (priced, resolved trades only)\n", r.WinRate()*100)
 	fmt.Printf("  Net P&L:    $%.2f\n", r.TotalPnL)
+	if r.Carried > 0 {
+		fmt.Printf("  Carried:    %d exits used a forward-filled (stale) price — INCLUDED in P&L, flagged\n", r.Carried)
+	}
 	if r.Unpriced > 0 || r.Unresolved > 0 {
-		fmt.Printf("  Excluded:   %d unpriced (missing quote), %d unresolved (data ran out) — NOT in win rate/P&L\n",
+		fmt.Printf("  Excluded:   %d unpriced (never traded), %d unresolved (data ran out) — NOT in win rate/P&L\n",
 			r.Unpriced, r.Unresolved)
 	}
 	if len(r.ExitsByReason) > 0 {

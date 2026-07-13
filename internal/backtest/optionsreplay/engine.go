@@ -30,6 +30,10 @@ type Bar struct {
 	Time       time.Time
 	Underlying float64
 	OptionMid  float64
+	// MidCarried marks that OptionMid was forward-filled from an earlier bar (the option
+	// didn't trade this minute), so the price is a stale estimate rather than a fresh
+	// quote — the trade is still counted, but flagged.
+	MidCarried bool
 }
 
 // Signal is one historical breakout to replay. The gate providers wired into the
@@ -61,11 +65,16 @@ type SimTrade struct {
 	ExitReason  string
 	HeldMinutes int
 	PnL         float64
-	// PriceKnown is false when the exit price fell back to the entry mid because the
-	// historical option quote was missing at the exit bar (a data gap — common on
-	// fast stop-outs). Such trades' P&L is unreliable and Aggregate excludes them
-	// from win/loss/P&L rather than silently counting them as scratches.
+	// PriceKnown is false ONLY when no option price was ever observed on the exit path
+	// (an entry-side data gap — the option never traded before the exit). Aggregate
+	// excludes those from win/loss/P&L. A LATER gap is instead carried forward (see
+	// PriceCarried), so it is priced and counted — dropping a config-dependent subset
+	// of trades would bias cross-config comparisons.
 	PriceKnown bool
+	// PriceCarried is true when the exit used a forward-filled (stale) option price
+	// because the option didn't trade at the exit minute. Such trades ARE counted in
+	// P&L (with the caveat that the price is an estimate).
+	PriceCarried bool
 }
 
 // ReasonPathExhausted marks a close forced because the replay Path ran out before
@@ -155,7 +164,11 @@ func (e *Engine) ReplayWithDecision(ctx context.Context, sig Signal, dec options
 			CurrentUnderlying:  bar.Underlying,
 			EntryOptionPrice:   dec.Mid,
 			CurrentOptionPrice: bar.OptionMid,
-			OptionPriceKnown:   bar.OptionMid > 0,
+			// A carried (forward-filled) price is NOT a live quote — live's time exit never
+			// acts on stale data, so exclude it from the decision's OptionPriceKnown. The
+			// carried value still prices the terminal exit in finish(); it just can't drive
+			// an IV-crush time exit here (which would break parity).
+			OptionPriceKnown: bar.OptionMid > 0 && !bar.MidCarried,
 			HeldMinutes:        minutesBetween(sig.AsOf, bar.Time),
 			TimeExitMinutes:    e.cfg.TimeExitMinutes,
 			SessionEnding:      !sig.SessionEnd.IsZero() && !bar.Time.Before(sig.SessionEnd),
@@ -182,6 +195,7 @@ func (e *Engine) ReplayWithDecision(ctx context.Context, sig Signal, dec options
 func (e *Engine) finish(out SimTrade, sig Signal, bar Bar, reason string) SimTrade {
 	exitPrice := bar.OptionMid
 	out.PriceKnown = exitPrice > 0
+	out.PriceCarried = bar.MidCarried
 	if !out.PriceKnown {
 		exitPrice = out.EntryMid
 	} else if e.cfg.ModeledSpreadPct > 0 {

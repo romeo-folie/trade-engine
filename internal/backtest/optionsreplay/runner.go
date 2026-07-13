@@ -139,10 +139,12 @@ func (r *Runner) replayOne(ctx context.Context, sig Signal) SimTrade {
 }
 
 // fillOptionMids sets each Path bar's OptionMid to the historical option bar Close at
-// the same minute (a standard last-trade proxy for the option mid — a full NBBO-mid
-// reconstruction would be one quote read per minute per trade). Path bars with no
-// matching option bar keep OptionMid=0, so Engine.finish marks them PriceKnown=false
-// and Aggregate excludes them from win/loss/P&L rather than fabricating a value.
+// the same minute (a last-trade proxy for the mid). Minutes with no trade are
+// FORWARD-FILLED from the last observed price (marked MidCarried) so the terminal exit
+// is still priced+counted; only bars before the first observed price (an entry-side
+// gap) keep OptionMid=0 → PriceKnown=false → excluded. A carried price prices the exit
+// but does NOT feed the decision loop's OptionPriceKnown (see Replay), so it can't
+// drive a spurious time exit.
 func fillOptionMids(path []Bar, obars []data.Candle) {
 	byMin := make(map[int64]float64, len(obars))
 	for _, c := range obars {
@@ -150,9 +152,22 @@ func fillOptionMids(path []Bar, obars []data.Candle) {
 			byMin[c.Timestamp.Unix()/60] = c.Close
 		}
 	}
+	// Forward-fill (last-observation-carried-forward): when the option didn't trade at a
+	// path minute, carry the last known price rather than leaving it 0. A 0 exit would be
+	// dropped from P&L, and the drop rate varies by config (different contracts, different
+	// liquidity) — so dropping biases cross-config comparisons. Carrying counts the trade
+	// at a stale-but-honest estimate (flagged MidCarried). Bars before the FIRST observed
+	// price (an entry-side gap) stay 0 — there's nothing to carry.
+	last := 0.0
 	for i := range path {
 		if mid, ok := byMin[path[i].Time.Unix()/60]; ok {
 			path[i].OptionMid = mid
+			last = mid
+			continue
+		}
+		if last > 0 {
+			path[i].OptionMid = last
+			path[i].MidCarried = true
 		}
 	}
 }

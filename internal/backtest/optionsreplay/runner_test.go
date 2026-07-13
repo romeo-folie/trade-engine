@@ -486,3 +486,25 @@ func TestAssembleSignals_EntryDeadlineFromOpen(t *testing.T) {
 		t.Fatalf("expected 0 signals (breakout at 10:40 is past the open+60m deadline), got %d", len(sigs))
 	}
 }
+
+// TestFillOptionMids_CarriesForward: a missing option bar after a real one carries the
+// last price forward (flagged), so the exit is priced+counted; an entry-side gap (no
+// prior price) stays 0.
+func TestFillOptionMids_CarriesForward(t *testing.T) {
+	base := time.Date(2025, 6, 3, 13, 45, 0, 0, time.UTC)
+	path := []Bar{
+		{Time: base},                      // entry-side gap → stays 0
+		{Time: base.Add(1 * time.Minute)}, // real price
+		{Time: base.Add(2 * time.Minute)}, // gap → carried
+	}
+	fillOptionMids(path, []data.Candle{{Timestamp: base.Add(1 * time.Minute), Close: 2.50}})
+	if path[0].OptionMid != 0 || path[0].MidCarried {
+		t.Errorf("entry-side gap should stay 0/uncarried, got %+v", path[0])
+	}
+	if path[1].OptionMid != 2.50 || path[1].MidCarried {
+		t.Errorf("real bar should be 2.50/uncarried, got %+v", path[1])
+	}
+	if path[2].OptionMid != 2.50 || !path[2].MidCarried {
+		t.Errorf("gap after a price should carry 2.50 + MidCarried, got %+v", path[2])
+	}
+}

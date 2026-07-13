@@ -258,3 +258,44 @@ func TestReplay_UnpricedExit(t *testing.T) {
 		t.Errorf("unpriced trade miscounted: %+v", r)
 	}
 }
+
+// TestAggregate_CountsCarriedInPnL: a carried (stale-priced) exit is INCLUDED in
+// win/loss/P&L (and flagged Carried); only an entry-side unpriced gap is excluded.
+func TestAggregate_CountsCarriedInPnL(t *testing.T) {
+	r := Aggregate([]SimTrade{
+		{Accepted: true, PriceKnown: true, PriceCarried: true, ExitReason: "eod", PnL: -50}, // carried loss — counted
+		{Accepted: true, PriceKnown: true, ExitReason: "tp", PnL: 100},                      // real win
+		{Accepted: true, PriceKnown: false, ExitReason: "stop", PnL: 0},                     // entry-side gap — excluded
+	})
+	if r.Carried != 1 {
+		t.Errorf("Carried = %d; want 1", r.Carried)
+	}
+	if r.Wins != 1 || r.Losses != 1 {
+		t.Errorf("carried loss must count in win/loss: W=%d L=%d", r.Wins, r.Losses)
+	}
+	if r.Unpriced != 1 {
+		t.Errorf("entry-side gap must be Unpriced, got %d", r.Unpriced)
+	}
+	if r.TotalPnL != 50 {
+		t.Errorf("TotalPnL = %v; want 50 (100 − 50, carried included)", r.TotalPnL)
+	}
+}
+
+// TestReplay_CarriedPriceNoTimeExit: a carried (forward-filled) option price must NOT
+// drive the IV-crush time exit — live never acts on a stale quote. The position holds
+// to a real exit (eod) instead, preserving parity; the exit is still priced.
+func TestReplay_CarriedPriceNoTimeExit(t *testing.T) {
+	eng, _ := acceptingEngine(Config{PremiumBudget: 500, TimeExitMinutes: 8})
+	sim := eng.Replay(context.Background(), buySignal([]Bar{
+		// Past the 8-min window, underlying flat (no stop/tp), option below entry (1.25)
+		// but CARRIED — a real price here would time-exit; a carried one must not.
+		{Time: asOf.Add(9 * time.Minute), Underlying: 551, OptionMid: 1.10, MidCarried: true},
+		{Time: sessEnd.Add(1 * time.Minute), Underlying: 551, OptionMid: 1.40}, // eod, real
+	}))
+	if sim.ExitReason == "time_exit" {
+		t.Errorf("time exit fired on a carried (stale) price — must not (breaks live parity): %+v", sim)
+	}
+	if sim.ExitReason != "eod" {
+		t.Errorf("expected eod (a carried bar can't time-exit), got %q", sim.ExitReason)
+	}
+}

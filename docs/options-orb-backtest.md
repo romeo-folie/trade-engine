@@ -61,9 +61,14 @@ te backtest orb-options
 The report distinguishes real outcomes from data gaps — a backtest number is only as
 trustworthy as the data behind it:
 
-- **Unpriced** — the option quote was missing at the exit bar (common on fast
-  stop-outs). P&L is a fallback, so the trade is excluded from win/loss/P&L and
-  counted separately.
+- **Carried** — the option didn't trade at the exit minute, so the exit price is
+  **forward-filled** from the last observed bar (last-observation-carried-forward). The
+  trade **is** counted in win/loss/P&L (at a stale-but-honest estimate) and flagged. This
+  matters for tuning: *dropping* these instead would remove a config-dependent subset of
+  trades (different contracts have different liquidity → different drop rates), biasing
+  every cross-config comparison.
+- **Unpriced** — the option was *never* observed on the exit path (an entry-side gap —
+  nothing to carry forward). Only these are excluded from win/loss/P&L.
 - **Unresolved** (`path_exhausted`) — the historical Path ran out before any modeled
   exit fired. No real outcome; excluded from win/loss/P&L.
 
