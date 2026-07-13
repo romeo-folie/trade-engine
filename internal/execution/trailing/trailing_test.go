@@ -145,6 +145,19 @@ func (f *fakeStore) LatestStopLossOrderForTrade(_ context.Context, tradeID strin
 	return nil, nil
 }
 
+func (f *fakeStore) OpenExitLegsForTrade(_ context.Context, tradeID string) ([]store.Order, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []store.Order
+	for _, o := range f.orders {
+		if o.TradeID == tradeID && (o.IsStopLoss || o.IsTakeProfit) &&
+			(o.Status == "pending" || o.Status == "partial") && o.BrokerOrderID != "" {
+			out = append(out, o)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1039,5 +1052,51 @@ func TestManager_DisabledIsFastReturn(t *testing.T) {
 		// expected fast-return
 	case <-time.After(300 * time.Millisecond):
 		t.Fatalf("Run did not return when Enabled=false")
+	}
+}
+
+// TestBracketLeg_NoCancelResubmitFallback pins the #435 rule: when the
+// working stop is an OCO-linked bracket child (ParentOrderID set) and the
+// atomic PATCH replace fails, the manager must NOT fall back to
+// cancel+resubmit — cancelling one OCO leg kills or orphans the sibling
+// take-profit, and a standalone replacement stop would leave the position
+// half-managed. It surfaces an error and retries the replace next sweep.
+func TestBracketLeg_NoCancelResubmitFallback(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID:            "t1",
+		Ticker:        "AAPL",
+		Direction:     "long",
+		Status:        "open",
+		EntryPrice:    100,
+		StopLoss:      95,
+		Quantity:      10,
+		HighWaterMark: 100,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID:       "t1",
+		BrokerOrderID: "leg-sl",
+		Ticker:        "AAPL",
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeStop),
+		Quantity:      10,
+		StopPrice:     95,
+		Status:        "pending",
+		IsStopLoss:    true,
+		ParentOrderID: "parent-1", // bracket child
+	})
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
+	base := &fakeBroker{failReplace: true}
+	fb := fakeBrokerWithReplace{fakeBroker: base}
+
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(base.cancelled) != 0 {
+		t.Fatalf("bracket leg was cancelled after failed replace: %v", base.cancelled)
+	}
+	if len(base.placed) != 0 {
+		t.Fatalf("standalone stop was placed for a bracket-managed trade: %v", base.placed)
 	}
 }

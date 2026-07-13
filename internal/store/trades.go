@@ -103,6 +103,7 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''),
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1

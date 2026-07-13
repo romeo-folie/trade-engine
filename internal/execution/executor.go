@@ -64,6 +64,12 @@ type OrderRequest struct {
 	TakeProfitPrice float64 // limit price for take-profit leg
 	StopLossPrice   float64 // stop price for stop-loss leg
 
+	// TimeInForce overrides the broker default ("day" on Alpaca). Swing-hold
+	// bracket exits use "gtc" so the child legs survive the session close —
+	// day-TIF legs expire at 16:00 ET and would leave overnight positions
+	// unprotected, exactly the hole broker-resident exits exist to plug.
+	TimeInForce string // "" (broker default) | "day" | "gtc"
+
 	// SecType overrides the IBKR security type for this order.
 	// "" defaults to "CASH" (forex). Use "CFD" for metals like XAU/USD.
 	SecType string // "" (default/CASH) | "CASH" (forex) | "CFD" (metals) | "OPT" (equity option)

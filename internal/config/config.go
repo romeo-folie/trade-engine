@@ -1097,6 +1097,14 @@ type RiskConfig struct {
 	// submits/replaces a broker STOP order. Disabled by default.
 	TrailingStop TrailingStopConfig `yaml:"trailing_stop"`
 
+	// BracketExitsEnabled submits stock-path BUY entries as broker bracket
+	// orders (GTC, whole shares): the take-profit and stop-loss live at the
+	// broker and fire intrabar, instead of the engine's hourly candle-close
+	// checks (measured ~1.5%/trade of exit slippage, PR #433 study).
+	// Requires stop_loss AND take_profit on the signal; entries sized under
+	// one whole share fall back to app-managed exits. Default off.
+	BracketExitsEnabled bool `yaml:"bracket_exits_enabled"`
+
 	// EntryGates are evidence-driven entry-quality filters from the
 	// May–Jul 2026 execution study: news_sentiment entries the tape never
 	// confirmed ran a 16% win rate, momentum entries chasing >2% run-ups

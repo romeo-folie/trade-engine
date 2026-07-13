@@ -276,6 +276,7 @@ risk:
     atr_multiple: 1.5          # new_stop = hwm - atr_multiple * ATR (absolute-price ATR)
     interval_sec: 60           # Recompute cadence
     atr_period: 14             # Wilder ATR lookback in 1h candles
+  bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.
   # Entry-quality gates from the May–Jul 2026 execution study. All default off;
   # BUY-only; fail open when the prior daily close is unavailable.
   entry_gates:
