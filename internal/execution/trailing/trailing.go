@@ -90,6 +90,11 @@ type TradeStore interface {
 	GetOpenTrades(ctx context.Context) ([]store.Trade, error)
 	UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error
 	LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*store.Order, error)
+	// OpenExitLegsForTrade returns the trade's still-working stop/take-profit
+	// legs. Non-empty ParentOrderID marks OCO-linked bracket children, which
+	// hold the trade's shares — ALL of them must be cancelled before a market
+	// exit or the broker rejects the sell for insufficient free quantity.
+	OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]store.Order, error)
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
 	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error
 	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
@@ -373,10 +378,20 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			if err == nil {
 				return m.store.UpdateOrderStopPriceAndID(ctx, existing.ID, res.BrokerOrderID, newStop)
 			}
+			if existing.ParentOrderID != "" {
+				// Bracket child leg (#435): cancel+resubmit is FORBIDDEN —
+				// cancelling one OCO leg kills or orphans the sibling
+				// take-profit, and a standalone replacement stop would leave
+				// the position half-managed. Surface the error and let the
+				// next sweep retry the atomic replace.
+				return fmt.Errorf("replace of bracket stop leg failed (no cancel+resubmit fallback for OCO children): %w", err)
+			}
 			logger.Warn("trailing-stop: replace failed, falling back to cancel+resubmit",
 				"trade_id", t.ID,
 				"err", err,
 			)
+		} else if existing.ParentOrderID != "" {
+			return fmt.Errorf("executor cannot replace stops in place; refusing cancel+resubmit on a bracket stop leg")
 		}
 		// Fallback: cancel, CONFIRM cancellation, then resubmit. If we
 		// can't confirm the prior stop is gone, bail out — placing a new
@@ -466,17 +481,27 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 // FilledPrice/FilledQty for trade close + pnl. Mirrors the field set
 // engine.monitorPositions persists on its non-trailing exit path.
 func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, error) {
-	// Best-effort: cancel any live stop first so the market sell isn't
-	// double-counted by the broker risk engine. Failure is logged but
-	// doesn't block the market exit (the exit is the safety move).
-	if existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID); err == nil && existing != nil && existing.BrokerOrderID != "" {
-		if err := m.exec.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
-			logger.Warn("trailing-stop: cancel of stop before market exit failed",
-				"trade_id", t.ID,
-				"broker_order_id", existing.BrokerOrderID,
-				"err", err,
-			)
+	// Cancel every working exit leg first — not just the latest stop. For
+	// bracket-managed trades the stop AND take-profit legs each hold the
+	// trade's shares at the broker; a market sell with either leg still
+	// working is rejected for insufficient free quantity. Failure is logged
+	// but doesn't block the market exit (the exit is the safety move).
+	if legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID); err == nil {
+		for _, leg := range legs {
+			if leg.BrokerOrderID == "" {
+				continue
+			}
+			if err := m.exec.CancelOrder(ctx, leg.BrokerOrderID); err != nil {
+				logger.Warn("trailing-stop: cancel of exit leg before market exit failed",
+					"trade_id", t.ID,
+					"broker_order_id", leg.BrokerOrderID,
+					"err", err,
+				)
+			}
 		}
+	} else {
+		logger.Warn("trailing-stop: exit-leg lookup before market exit failed",
+			"trade_id", t.ID, "err", err)
 	}
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:   t.Ticker,

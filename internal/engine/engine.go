@@ -1965,6 +1965,50 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	}
 
+	// Broker-resident bracket exits (#435, see bracket_exits.go). BUYs with a
+	// coherent stop/target become one atomic bracket: entry + TP limit + SL
+	// stop, GTC so the legs survive the session close. Whole shares only —
+	// Alpaca rejects fractional complex orders — so sub-one-share sizings
+	// fall back to the plain market entry with app-managed exits.
+	bracketed := false
+	if e.cfg.Risk.BracketExitsEnabled && side == execution.OrderSideBuy &&
+		sig.StopLoss > 0 && sig.TakeProfit > 0 &&
+		sig.StopLoss < sig.SignalPrice && sig.TakeProfit > sig.SignalPrice {
+		if whole := math.Floor(qty); whole >= 1 {
+			orderReq.Quantity = whole
+			orderReq.OrderClass = "bracket"
+			orderReq.TakeProfitPrice = sig.TakeProfit
+			orderReq.StopLossPrice = sig.StopLoss
+			orderReq.TimeInForce = "gtc"
+			bracketed = true
+		} else {
+			logger.Warn("bracket exits: sized under one whole share — falling back to app-managed exits",
+				"ticker", sig.Ticker, "qty", qty)
+		}
+	}
+
+	// A SELL must not race the ticker's working exit legs: they hold the
+	// long's shares at the broker, and Alpaca rejects a sell of held shares.
+	// Not gated on bracket_exits_enabled — legs placed before a flag flip
+	// must still be cleared (no-op when the ticker has no leg rows). When a
+	// cancel cannot be CONFIRMED, the sell must not proceed: a still-live
+	// leg would race it. Block the signal; the next cycle re-evaluates with
+	// reconciled state.
+	if side == execution.OrderSideSell {
+		if !e.cancelBracketLegsForTicker(ctx, sig.Ticker) {
+			reason := "working exit legs could not be confirmed cancelled — sell would race a live bracket leg"
+			if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+				logger.Warn("update signal status", "id", sigID, "err", err)
+			}
+			logger.Warn("sell blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "bracket_leg_cancel",
+			})
+			return
+		}
+	}
+
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
@@ -2011,6 +2055,44 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
+	}
+
+	// Persist the bracket's child exit legs so the monitor knows the trade
+	// is broker-managed (reconcileBracketTrade) and the trailing manager
+	// finds the SL leg to PATCH-ratchet. ChildOrderIDs is [TP, SL]. A broker
+	// that returned no legs (e.g. the in-memory paper executor) leaves the
+	// trade app-managed — graceful degradation, loudly logged.
+	if bracketed {
+		if len(result.ChildOrderIDs) >= 2 {
+			legRows := []store.Order{
+				{
+					TradeID: tradeID, BrokerOrderID: result.ChildOrderIDs[0],
+					Ticker: sig.Ticker, Side: string(execution.OrderSideSell),
+					OrderType: string(execution.OrderTypeLimit), Quantity: orderReq.Quantity,
+					LimitPrice: sig.TakeProfit, Status: "pending",
+					IsTakeProfit: true, ParentOrderID: result.BrokerOrderID,
+				},
+				{
+					TradeID: tradeID, BrokerOrderID: result.ChildOrderIDs[1],
+					Ticker: sig.Ticker, Side: string(execution.OrderSideSell),
+					OrderType: string(execution.OrderTypeStop), Quantity: orderReq.Quantity,
+					StopPrice: sig.StopLoss, Status: "pending",
+					IsStopLoss: true, ParentOrderID: result.BrokerOrderID,
+				},
+			}
+			for _, leg := range legRows {
+				if _, err := store.InsertOrder(ctx, leg); err != nil {
+					logger.Warn("insert bracket leg order", "tradeID", tradeID,
+						"broker_order_id", leg.BrokerOrderID, "err", err)
+				}
+			}
+			logger.Info("bracket exit legs resident at broker",
+				"trade_id", tradeID, "ticker", sig.Ticker,
+				"take_profit", sig.TakeProfit, "stop_loss", sig.StopLoss)
+		} else {
+			logger.Warn("bracket requested but broker returned no child legs — exits remain app-managed",
+				"trade_id", tradeID, "ticker", sig.Ticker)
+		}
 	}
 
 	logger.Info("trade opened",
@@ -2329,6 +2411,19 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	for _, t := range trades {
+		// Broker-resident bracket exits (#435): a trade with working exit
+		// legs is protected at the broker — reconcile leg fills into the
+		// trades table and NEVER run the software price-compare exit on top
+		// of live legs (double-sell). Deliberately NOT gated on
+		// bracket_exits_enabled: the flag only decides whether NEW entries
+		// become brackets — an existing bracket trade must stay
+		// broker-managed even after the flag is flipped off, or this loop
+		// would market-sell shares the live legs still hold. Cheap no-op
+		// (one indexed query) for trades without legs. Checked before the
+		// candle logic so a leg fill is booked even when candles are stale.
+		if handled := e.reconcileBracketTrade(ctx, t); handled {
+			continue
+		}
 		// Use the FRESHEST candle across all timeframes, not the finest
 		// available one. Data collection can stop on a timeframe (ticker
 		// dropped off the watchlist, backfill gap) while coarser timeframes

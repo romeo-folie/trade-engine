@@ -21,6 +21,11 @@ type Order struct {
 	Status        string // pending | filled | partial | cancelled
 	IsStopLoss    bool
 	IsTakeProfit  bool
+	// ParentOrderID is the broker order id of the bracket PARENT when this
+	// row is an OCO-linked child exit leg (migration 044). Non-empty means:
+	// PATCH-replace only (cancel+resubmit orphans the sibling leg), and both
+	// legs must be cancelled before selling the shares they hold.
+	ParentOrderID string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -36,14 +41,16 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 		INSERT INTO orders (
 			trade_id, broker_order_id, ticker, side, order_type,
 			quantity, limit_price, stop_price, status,
-			is_stop_loss, is_take_profit, filled_price, filled_qty
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+			is_stop_loss, is_take_profit, filled_price, filled_qty,
+			parent_order_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		RETURNING id`,
 		nullableString(o.TradeID), nullableString(o.BrokerOrderID),
 		o.Ticker, o.Side, o.OrderType,
 		o.Quantity, nullableFloat(o.LimitPrice), nullableFloat(o.StopPrice),
 		o.Status, o.IsStopLoss, o.IsTakeProfit,
 		nullableFloat(o.FilledPrice), nullableFloat(o.FilledQty),
+		nullableString(o.ParentOrderID),
 	).Scan(&id)
 	return id, err
 }
@@ -65,6 +72,7 @@ func GetOrdersByTrade(ctx context.Context, tradeID string) ([]Order, error) {
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''),
 		       created_at, updated_at
 		FROM orders WHERE trade_id=$1 ORDER BY created_at ASC`, tradeID)
 	if err != nil {
@@ -88,6 +96,7 @@ func scanOrders(rows interface {
 			&o.LimitPrice, &o.StopPrice,
 			&o.FilledPrice, &o.FilledQty,
 			&o.Status, &o.IsStopLoss, &o.IsTakeProfit,
+			&o.ParentOrderID,
 			&o.CreatedAt, &o.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -95,4 +104,31 @@ func scanOrders(rows interface {
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// OpenExitLegsForTrade returns the trade's still-working exit legs — pending
+// or partially-filled stop-loss / take-profit orders with a broker id. Used
+// by the bracket-exit paths: a non-empty result means the trade's exits are
+// broker-resident (the software monitor must not double-sell) and the legs
+// hold the trade's shares (they must be cancelled before any other sell).
+func OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]Order, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity,
+		       COALESCE(limit_price,0), COALESCE(stop_price,0),
+		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
+		       status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''),
+		       created_at, updated_at
+		FROM orders
+		WHERE trade_id = $1
+		  AND (is_stop_loss = TRUE OR is_take_profit = TRUE)
+		  AND status IN ('pending','partial')
+		  AND COALESCE(broker_order_id,'') <> ''
+		ORDER BY created_at ASC`, tradeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrders(rows)
 }

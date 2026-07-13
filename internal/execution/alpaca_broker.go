@@ -63,12 +63,16 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if req.SecType == "OPT" {
 		return b.placeOptionOrder(ctx, req)
 	}
+	tif := req.TimeInForce
+	if tif == "" {
+		tif = "day"
+	}
 	body := map[string]any{
 		"symbol":        req.Ticker,
 		"qty":           fmt.Sprintf("%.6f", req.Quantity),
 		"side":          string(req.Side),
 		"type":          string(req.Type),
-		"time_in_force": "day",
+		"time_in_force": tif,
 	}
 	// Market orders must not include price fields — Alpaca returns 422 if they are present.
 	if req.Type != OrderTypeMarket {
@@ -94,6 +98,10 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		Status      string `json:"status"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
+		Legs        []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"` // "limit" (take-profit) | "stop" (stop-loss)
+		} `json:"legs"`
 	}
 	if err := b.do(ctx, http.MethodPost, "/v2/orders", body, &resp); err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: %w", err)
@@ -108,12 +116,30 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse filled_qty %q: %w", resp.FilledQty, err)
 	}
 
-	return OrderResult{
+	result := OrderResult{
 		BrokerOrderID: resp.ID,
 		Status:        resp.Status,
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
-	}, nil
+	}
+	// Bracket child legs, ordered [take-profit, stop-loss] per the
+	// ChildOrderIDs contract. Identified by leg type, not array position —
+	// Alpaca does not document leg ordering.
+	if len(resp.Legs) > 0 {
+		var tpID, slID string
+		for _, leg := range resp.Legs {
+			switch leg.Type {
+			case "limit":
+				tpID = leg.ID
+			case "stop", "stop_limit":
+				slID = leg.ID
+			}
+		}
+		if tpID != "" && slID != "" {
+			result.ChildOrderIDs = []string{tpID, slID}
+		}
+	}
+	return result, nil
 }
 
 // GetWorkingOrders lists Alpaca's currently-open (working) orders. Options-ORB uses
