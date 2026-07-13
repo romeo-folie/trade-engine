@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -104,5 +105,35 @@ func TestCancelUnfilledTrade_GuardedToZeroQty(t *testing.T) {
 	}
 	if status, _ := tradeStatusQty(t, tradeID); status != "open" {
 		t.Fatalf("trade status = %s, want open", status)
+	}
+}
+
+// TestCancelUnfilledEntry_UnconfirmedTerminalLeavesRowOpen pins the Codex P1
+// on #437: a transiently-unreachable broker (or an order that stays working
+// after the cancel attempt) must NOT cancel the ledger row — the order can
+// still fill, and a cancelled row with real shares behind it is the phantom
+// bug inverted. The row stays open for reconciler attention.
+func TestCancelUnfilledEntry_UnconfirmedTerminalLeavesRowOpen(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	old := unfilledCancelRetryDelay
+	unfilledCancelRetryDelay = time.Millisecond
+	defer func() { unfilledCancelRetryDelay = old }()
+
+	tradeID := insertUnfilledEntry(t, "UNCF", "live-order-1")
+	// The order reports a still-working status on every check: cancel is
+	// never confirmed terminal.
+	e := newBracketTestEngine(&fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			"live-order-1": {Status: "accepted"},
+		},
+	})
+
+	e.cancelUnfilledEntry(tradeID, "live-order-1", "UNCF")
+
+	status, _ := tradeStatusQty(t, tradeID)
+	if status != "open" {
+		t.Fatalf("trade status = %s, want open (terminality unconfirmed — never fabricate a cancel)", status)
 	}
 }

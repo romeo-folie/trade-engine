@@ -2,41 +2,75 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// unfilledCancelRetryDelay paces the cancel-and-confirm attempts. Package
+// variable so tests can shrink it.
+var unfilledCancelRetryDelay = 5 * time.Second
+
 // cancelUnfilledEntry cleans up an entry whose broker order died or went
-// permanently silent with ZERO fill: best-effort broker cancel, one final
-// status check (a fill that raced in gets backfilled instead of cancelled),
-// then the qty-0 trade row and its order row are marked cancelled so the
-// position counter never sees a phantom slot (#437 — the after-hours
-// zero-entry rows). Runs from the fill-poll goroutine, so it builds its own
-// bounded contexts.
+// permanently silent with ZERO fill, so the qty-0 trade row never occupies a
+// position slot (#437 — the after-hours zero-entry rows).
+//
+// The ledger is only touched after the broker order is CONFIRMED terminal:
+// cancel, then verify — up to three rounds. A transiently-unreachable broker
+// does not mean the order died (Codex P1 on #437): a still-working order can
+// fill later, and a cancelled trade row with real shares behind it recreates
+// the phantom-position class of bug in the opposite direction. When
+// terminality cannot be confirmed, the row is left open and logged at ERROR
+// — visible and heal-able beats silently wrong. A fill discovered along the
+// way is backfilled instead of cancelled.
+//
+// Runs from the fill-poll goroutine, so it builds its own bounded contexts.
 func (e *Engine) cancelUnfilledEntry(tradeID, brokerOrderID, ticker string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	// Best-effort: a terminal (expired/rejected) order errors here — fine.
-	if err := e.executor.CancelOrder(ctx, brokerOrderID); err != nil {
-		logger.Debug("unfilled entry: broker cancel (may already be terminal)",
-			"broker_order_id", brokerOrderID, "err", err)
+	confirmed := false
+	for attempt := 0; attempt < 3 && !confirmed; attempt++ {
+		if attempt > 0 {
+			time.Sleep(unfilledCancelRetryDelay)
+		}
+		// Best-effort: an already-terminal (expired/rejected) order errors
+		// here — the status check below is what decides anything.
+		if err := e.executor.CancelOrder(ctx, brokerOrderID); err != nil {
+			logger.Debug("unfilled entry: broker cancel attempt",
+				"broker_order_id", brokerOrderID, "attempt", attempt+1, "err", err)
+		}
+		status, err := e.executor.GetOrderStatus(ctx, brokerOrderID)
+		if err != nil {
+			if errors.Is(err, execution.ErrOrderNotFound) {
+				confirmed = true // purged at the broker — terminal and gone
+				break
+			}
+			continue // transient: retry the round
+		}
+		if status.FilledQty > 0 {
+			// A fill raced in — record it; cancelling would orphan shares.
+			logger.Info("unfilled entry: late fill detected — backfilling instead of cancelling",
+				"trade_id", tradeID, "ticker", ticker,
+				"filled_qty", status.FilledQty, "filled_price", status.FilledPrice)
+			if err := store.UpdateTradeEntryPrice(ctx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
+				logger.Warn("unfilled entry: backfill trade", "trade_id", tradeID, "err", err)
+			}
+			if err := store.UpdateOrderFillPrice(ctx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
+				logger.Warn("unfilled entry: backfill order", "broker_order_id", brokerOrderID, "err", err)
+			}
+			return
+		}
+		if execution.IsTerminalOrderStatus(status.Status) {
+			confirmed = true
+		}
 	}
-
-	// Final check: if a fill raced in between the last poll and the cancel,
-	// record it — cancelling the row would orphan real shares.
-	if status, err := e.executor.GetOrderStatus(ctx, brokerOrderID); err == nil && status.FilledQty > 0 {
-		logger.Info("unfilled entry: late fill detected — backfilling instead of cancelling",
-			"trade_id", tradeID, "ticker", ticker,
-			"filled_qty", status.FilledQty, "filled_price", status.FilledPrice)
-		if err := store.UpdateTradeEntryPrice(ctx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
-			logger.Warn("unfilled entry: backfill trade", "trade_id", tradeID, "err", err)
-		}
-		if err := store.UpdateOrderFillPrice(ctx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
-			logger.Warn("unfilled entry: backfill order", "broker_order_id", brokerOrderID, "err", err)
-		}
+	if !confirmed {
+		logger.Error("unfilled entry: could not confirm the broker order terminal — trade row left open for reconciler attention",
+			"trade_id", tradeID, "ticker", ticker, "broker_order_id", brokerOrderID)
 		return
 	}
 
