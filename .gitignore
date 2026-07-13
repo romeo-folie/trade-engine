@@ -74,3 +74,4 @@ data/*.csv
 # stray local build binaries
 /orb-reconcile-statement
 /orb-backfill
+te-study

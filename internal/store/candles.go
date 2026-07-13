@@ -106,6 +106,28 @@ func GetFreshestCandle(ctx context.Context, ticker string) (*data.Candle, error)
 	return &c, nil
 }
 
+// GetPrevDailyClose returns the close of the last daily candle strictly
+// before the given instant (pass midnight of the trading day in the market's
+// timezone to get the prior session's close). Returns 0, nil when no such
+// candle exists — callers treat that as "unknown", not as a price.
+func GetPrevDailyClose(ctx context.Context, ticker string, before time.Time) (float64, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT close FROM candles
+		WHERE ticker = $1 AND timeframe = '1d' AND ts < $2 AND close > 0
+		ORDER BY ts DESC
+		LIMIT 1
+	`, ticker, before)
+
+	var close float64
+	if err := row.Scan(&close); err != nil {
+		if isNoRows(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return close, nil
+}
+
 func GetLatestCandle(ctx context.Context, ticker string, tf data.Timeframe) (*data.Candle, error) {
 	row := GetDB().QueryRow(ctx, `
 		SELECT ticker, timeframe, ts, open, high, low, close, volume, vwap
