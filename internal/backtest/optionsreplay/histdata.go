@@ -67,3 +67,11 @@ func asOfFrom(ctx context.Context) (asOfContext, bool) {
 	v, ok := ctx.Value(asOfKey{}).(asOfContext)
 	return v, ok
 }
+
+// AsOfTime returns the backtest evaluation instant stamped on ctx by WithAsOf, so an
+// as-of-aware EarningsProvider can evaluate "next earnings" as of the replay instant
+// rather than wall-clock now. ok=false on a context with no as-of.
+func AsOfTime(ctx context.Context) (time.Time, bool) {
+	v, ok := asOfFrom(ctx)
+	return v.at, ok
+}

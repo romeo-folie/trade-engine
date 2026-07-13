@@ -35,10 +35,11 @@ func (f fakeIVR) IVRank(_ context.Context, _ string, _ time.Time) (float64, bool
 type fakeEarnings struct {
 	when time.Time
 	has  bool
+	err  error
 }
 
-func (f fakeEarnings) NextEarnings(_ context.Context, _ string) (time.Time, bool) {
-	return f.when, f.has
+func (f fakeEarnings) NextEarnings(_ context.Context, _ string) (time.Time, bool, error) {
+	return f.when, f.has, f.err
 }
 
 // snap builds an option snapshot with the given contract terms and quote.
@@ -194,12 +195,36 @@ func TestSelect_EarningsWithinBlackout_Aborts(t *testing.T) {
 	}
 }
 
+// TestSelect_EarningsSameDayMidnight_Aborts is the regression guard for the store-backed
+// path: a real EarningsProvider returns a DATE (midnight UTC), and a signal on that same
+// day is an intraday instant. The blackout MUST still fire on the day of the report (the
+// day that matters most), not be skipped because midnight < the intraday signal time.
+func TestSelect_EarningsSameDayMidnight_Aborts(t *testing.T) {
+	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
+	earn := fakeEarnings{when: dayFloor(asOf), has: true} // earnings TODAY, stamped at midnight like the DB
+	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
+	if dec.Accepted || dec.Gate != GateEarnings {
+		t.Fatalf("expected earnings abort on the report day itself, got accepted=%v gate=%s", dec.Accepted, dec.Gate)
+	}
+}
+
 func TestSelect_EarningsOutsideBlackout_Passes(t *testing.T) {
 	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
 	earn := fakeEarnings{when: asOf.AddDate(0, 0, 30), has: true} // 30 days out — clear
 	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
 	if !dec.Accepted {
 		t.Fatalf("expected accept, got %s: %s", dec.Gate, dec.Reason)
+	}
+}
+
+// TestSelect_EarningsLookupError_FailsClosed: when the provider can't determine earnings
+// (read failure or no coverage for the symbol), the single name must NOT trade unchecked.
+func TestSelect_EarningsLookupError_FailsClosed(t *testing.T) {
+	chain := fakeChain{snaps: []execution.OptionSnapshot{snap("NVDA", "C", 120, f64(0.55), nil, 2.0, 2.05, expFri)}}
+	earn := fakeEarnings{err: errors.New("no earnings coverage for symbol")}
+	dec := singleNameEngine(chain, fakeIVR{rank: 40, ok: true}, earn).Select(context.Background(), Signal{Underlying: "NVDA", Direction: "buy", AsOf: asOf})
+	if dec.Accepted || dec.Gate != GateEarnings {
+		t.Fatalf("expected fail-closed earnings abort on lookup error, got accepted=%v gate=%s", dec.Accepted, dec.Gate)
 	}
 }
 

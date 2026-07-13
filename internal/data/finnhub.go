@@ -121,6 +121,81 @@ func (c *FinnhubClient) FetchCompanyProfile(ctx context.Context, ticker string) 
 	return strings.TrimSpace(p.Name), nil
 }
 
+// EarningsRelease is one scheduled/historical earnings date from Finnhub's calendar.
+type EarningsRelease struct {
+	Symbol string
+	Date   time.Time // announcement day (parsed from the "YYYY-MM-DD" date field)
+	Hour   string    // 'bmo' | 'amc' | 'dmh' | '' (before/after market, during, unknown)
+}
+
+// finnhubEarningsResp is the raw shape of /calendar/earnings.
+type finnhubEarningsResp struct {
+	EarningsCalendar []struct {
+		Symbol string `json:"symbol"`
+		Date   string `json:"date"` // "2026-08-25"
+		Hour   string `json:"hour"` // "bmo" | "amc" | "dmh" | ""
+	} `json:"earningsCalendar"`
+}
+
+// FetchEarningsCalendar returns earnings releases for symbol within [from, to].
+//
+// FREE-TIER LIMIT: Finnhub serves ~1 month of history plus ALL upcoming dates, so a
+// historical (backtest) window returns an empty list rather than an error — seed those
+// dates separately (they're public record). Live use only needs the next upcoming report,
+// which is always covered. Malformed date strings are skipped, not fatal.
+func (c *FinnhubClient) FetchEarningsCalendar(ctx context.Context, symbol string, from, to time.Time) ([]EarningsRelease, error) {
+	if err := c.throttle(ctx); err != nil {
+		return nil, err
+	}
+
+	params := url.Values{}
+	params.Set("symbol", symbol)
+	params.Set("from", from.Format("2006-01-02"))
+	params.Set("to", to.Format("2006-01-02"))
+	params.Set("token", c.apiKey)
+
+	reqURL := finnhubBaseURL + "/calendar/earnings?" + params.Encode()
+	resp, err := withRetry(ctx, func() (*http.Response, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode >= 400 {
+			retryAfter, _ := parseRetryAfterHeader(resp.Header.Get("Retry-After"), time.Now())
+			resp.Body.Close()
+			return nil, &httpError{
+				status:     resp.StatusCode,
+				msg:        fmt.Sprintf("finnhub earnings API error %d for %s", resp.StatusCode, symbol),
+				retryAfter: retryAfter,
+			}
+		}
+		return resp, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("finnhub earnings get: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var raw finnhubEarningsResp
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("finnhub earnings decode: %w", err)
+	}
+
+	out := make([]EarningsRelease, 0, len(raw.EarningsCalendar))
+	for _, e := range raw.EarningsCalendar {
+		d, perr := time.Parse("2006-01-02", e.Date)
+		if perr != nil {
+			continue // skip an unparseable date rather than fail the whole sync
+		}
+		out = append(out, EarningsRelease{Symbol: e.Symbol, Date: d, Hour: e.Hour})
+	}
+	return out, nil
+}
+
 // FetchNews retrieves company news from Finnhub for a single ticker published after 'since'.
 // Finnhub returns articles in reverse-chronological order.
 func (c *FinnhubClient) FetchNews(ctx context.Context, ticker string, since time.Time) ([]NewsItem, error) {

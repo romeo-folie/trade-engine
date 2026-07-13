@@ -32,10 +32,13 @@ type IVRankProvider interface {
 }
 
 // EarningsProvider reports the next scheduled earnings datetime for a single-name
-// underlying. ok is false when none is scheduled/known. Implemented later
-// (issues #413/#418); ETFs never consult it.
+// underlying. ETFs never consult it. Returns:
+//   - (date, true, nil)  when a next earnings date is known;
+//   - (zero, false, nil) when the calendar is covered but has nothing imminent (safe pass);
+//   - (zero, false, err) when earnings can't be determined — a read failure or no coverage
+//     for the symbol — so the gate MUST fail closed rather than trade unchecked.
 type EarningsProvider interface {
-	NextEarnings(ctx context.Context, underlying string) (time.Time, bool)
+	NextEarnings(ctx context.Context, underlying string) (time.Time, bool, error)
 }
 
 // GateConfig holds the tunable thresholds. Zero values are replaced with the
@@ -166,9 +169,22 @@ func (e *Engine) Select(ctx context.Context, sig Signal) Decision {
 		if e.earnings == nil {
 			return abort(GateEarnings, "no earnings provider for single name %s (fail closed)", underlying)
 		}
-		if when, has := e.earnings.NextEarnings(ctx, underlying); has {
+		when, has, eerr := e.earnings.NextEarnings(ctx, underlying)
+		if eerr != nil {
+			// Can't determine earnings (read failure or no coverage for this single name) →
+			// fail closed, same posture as a nil provider. Never trade a single name blind
+			// to its earnings.
+			return abort(GateEarnings, "earnings lookup for %s failed (fail closed): %v", underlying, eerr)
+		}
+		if has {
+			// Compare on DAY granularity. A store-backed provider returns a DATE (midnight
+			// UTC) while sig.AsOf is an intraday instant, so a raw instant compare would see
+			// an earnings report scheduled the SAME day as already "past" (midnight < 09:45)
+			// and skip the blackout on the very day it matters most. dayFloor both sides so
+			// the window is the inclusive day range [T−N … T].
 			window := time.Duration(e.cfg.EarningsBlackoutDays) * 24 * time.Hour
-			if !when.Before(sig.AsOf) && when.Sub(sig.AsOf) <= window {
+			sigDay, whenDay := dayFloor(sig.AsOf), dayFloor(when)
+			if !whenDay.Before(sigDay) && whenDay.Sub(sigDay) <= window {
 				return abort(GateEarnings, "earnings for %s at %s within %dd blackout",
 					underlying, when.Format("2006-01-02"), e.cfg.EarningsBlackoutDays)
 			}

@@ -5,6 +5,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/earnings"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/options"
 )
@@ -61,9 +62,10 @@ func (c chainQuoter) OptionMid(ctx context.Context, _underlying, occSymbol strin
 // (options chain + order access). No-op when options-ORB is disabled or the broker
 // is not Alpaca — leaving the equity/forex/futures path untouched.
 //
-// The earnings provider is intentionally nil for now: v1 enables ETF underlyings
-// (SPY/QQQ), which are earnings-exempt. A single-name underlying with no earnings
-// provider fails closed at the earnings gate (never trades) until one is wired.
+// The earnings provider is store-backed (earnings_calendar, migration 045): it answers
+// the earnings-blackout gate from the shared table populated by `te earnings sync`
+// (Finnhub coming reports) + `te earnings seed`. Single names still fail closed while the
+// table has no dates for them — populate it before enabling single-name underlyings.
 //
 // IV-RANK SEEDING IS A PREREQUISITE: the IVRankService below reads option_iv_history
 // and fails CLOSED below iv_min_samples stored days, so the gate aborts every breakout
@@ -83,7 +85,7 @@ func (s *ORBScheduler) SetupOptionsORB(cfg config.OptionsORBConfig, broker *exec
 		SpreadPctCeiling:     cfg.SpreadPctCeiling,
 		EarningsBlackoutDays: cfg.EarningsBlackoutDays,
 		ETFUnderlyings:       cfg.ETFUnderlyings,
-	}, broker, ivrank, nil)
+	}, broker, ivrank, earnings.NewStoreProvider(s.db, nil))
 
 	s.SetOptionsRouter(NewOptionsRouter(gates, broker, cfg.Underlyings, cfg.PremiumBudget, cfg.MaxLossPerTrade))
 	s.SetOptionExitManager(NewOptionExitManager(marketDataPricer{md: s.marketData}, chainQuoter{broker: broker}, broker, cfg.TimeExitMinutes))
