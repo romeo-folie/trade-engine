@@ -126,9 +126,16 @@ unchanged.
 
 - **No OPRA subscription required** for the default free-bars mode. (Real historical
   NBBO quotes *do* need Algo Trader Plus — that's the upgrade path above.)
-- **History depth.** Alpaca option history reaches back to roughly **February 2024**.
-  Earlier windows return empty — so start the window ≥ ~2 months past that so the
-  IV-rank seed has enough lookback, or every breakout aborts at `iv_rank`.
+- **History depth (data floor).** Alpaca option history begins ~**mid-January 2024**
+  (verified: the first bars appear 2024-01-18, even for multi-year LEAPs listed long
+  before — so it's a data floor, not a listing date). Nothing exists before 2024.
+  - A window ending before the floor errors out (`--to` before ~2024-01-15).
+  - The IV-seed lookback is **clamped** to the floor (`AlpacaOptionHistoryStart`), so
+    it never wastes a fetch on pre-floor days that can never have data (and so could
+    never be cached — they'd re-fetch every run).
+  - A window that starts near the floor has a short IV-rank lookback (few seeded days),
+    so more breakouts abort at `iv_rank`. For a fully-cached, fast repeat run, choose a
+    window whose whole lookback (~1 year) sits inside coverage — i.e. **2025 onward**.
 - **Option-mid proxy.** The mid is each option 1-minute bar's *close* (last trade).
   Bars with no trade in a minute leave that contract unpriced for that instant (see
   *Honest accounting*).

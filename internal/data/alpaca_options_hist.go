@@ -44,6 +44,26 @@ type AlpacaOptionsHist struct {
 	equity           *AlpacaClient
 }
 
+// alpacaOptionsET is US/Eastern, used to anchor the data-floor date. The backtest
+// iterates ET calendar days, so the floor must be an ET-midnight instant — a UTC one
+// would floor to the PRIOR ET day (a systematic one-day-early off-by-one).
+var alpacaOptionsET = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.FixedZone("EST", -5*60*60)
+	}
+	return loc
+}()
+
+// AlpacaOptionHistoryStart is the earliest ET trading day Alpaca serves historical
+// option data. Empirically the first option bars appear ~2024-01-18 (verified across
+// contracts, including multi-year LEAPs listed long before — so it's the data floor,
+// not a listing date); nothing exists before 2024. Set a few days earlier for a safety
+// margin. The backtest clamps its IV-seed lookback to this so it doesn't waste a fetch
+// on every pre-floor day (which can never have data and so can never be cached).
+// Anchored at ET midnight so the backtest's ET-day iteration lands on this exact day.
+var AlpacaOptionHistoryStart = time.Date(2024, 1, 15, 0, 0, 0, 0, alpacaOptionsET)
+
 // NewAlpacaOptionsHist builds the client. dataURL/tradingURL default to the live
 // hosts when empty. modeledSpreadPct is the synthetic bid/ask width (fraction of mid)
 // used to reconstruct quotes from bars; 0 means bid=ask=last-trade (no modeled spread).

@@ -189,6 +189,53 @@ func TestRunner_EndToEnd(t *testing.T) {
 	}
 }
 
+func TestClampIVFrom(t *testing.T) {
+	floor := time.Date(2024, 1, 15, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2023, 9, 1, 0, 0, 0, 0, time.UTC)
+	after := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	if got := clampIVFrom(before, floor); !got.Equal(floor) {
+		t.Errorf("pre-floor start = %v; want clamped to %v", got, floor)
+	}
+	if got := clampIVFrom(after, floor); !got.Equal(after) {
+		t.Errorf("post-floor start = %v; want unchanged", got)
+	}
+	if got := clampIVFrom(before, time.Time{}); !got.Equal(before) {
+		t.Errorf("zero floor = %v; want unchanged (clamp disabled)", got)
+	}
+}
+
+// TestNewRunner_ClampsIVLookbackToFloor: with a data floor set, seeding fetches only
+// post-floor days — no wasted fetch on pre-floor days that can never have data.
+func TestNewRunner_ClampsIVLookbackToFloor(t *testing.T) {
+	mkCfg := func(floor time.Time) RunnerConfig {
+		return RunnerConfig{
+			Gate:           options.GateConfig{ETFUnderlyings: []string{"SPY"}},
+			Replay:         Config{PremiumBudget: 1000},
+			Assemble:       AssembleConfig{RangeMinutes: 15, EntryWindowMins: 60, RiskReward: 2},
+			IVLookbackDays: 30, IVMinSamples: 1, IVRefMinuteET: 15,
+			IVHistoryFloor: floor,
+		}
+	}
+	from := time.Date(2026, 3, 30, 0, 0, 0, 0, etLoc)
+	to := time.Date(2026, 3, 31, 0, 0, 0, 0, etLoc)
+
+	unclamped := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	if _, err := NewRunner(context.Background(), unclamped, NewMemIVStore(), []string{"SPY"}, from, to, mkCfg(time.Time{}), nil); err != nil {
+		t.Fatalf("unclamped: %v", err)
+	}
+	clamped := &countingHist{fakeHist: fakeHist{volAt: func(time.Time) float64 { return 0.30 }}}
+	floor := time.Date(2026, 3, 20, 0, 0, 0, 0, etLoc) // cuts off the first ~3 weeks of lookback
+	if _, err := NewRunner(context.Background(), clamped, NewMemIVStore(), []string{"SPY"}, from, to, mkCfg(floor), nil); err != nil {
+		t.Fatalf("clamped: %v", err)
+	}
+	if clamped.underlyingBars == 0 {
+		t.Fatal("clamped run fetched nothing; expected the post-floor days")
+	}
+	if clamped.underlyingBars >= unclamped.underlyingBars {
+		t.Errorf("clamp fetched %d days; want fewer than the unclamped %d", clamped.underlyingBars, unclamped.underlyingBars)
+	}
+}
+
 // countingHist wraps fakeHist to count the I/O the #427 optimizations target.
 type countingHist struct {
 	fakeHist

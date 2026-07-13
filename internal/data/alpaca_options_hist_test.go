@@ -234,3 +234,17 @@ func TestQuotesAt_ChunksOver100Symbols(t *testing.T) {
 		t.Errorf("expected all 250 symbols resolved across chunks, got %d", len(out))
 	}
 }
+
+// TestAlpacaOptionHistoryStart_ETAnchored: the data floor must be ET midnight, so the
+// backtest's ET-day iteration lands on the intended day. A UTC-midnight value would
+// convert to the prior ET evening → floor to Jan 14, one day early.
+func TestAlpacaOptionHistoryStart_ETAnchored(t *testing.T) {
+	et, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Skip("no tzdata")
+	}
+	got := AlpacaOptionHistoryStart.In(et)
+	if got.Year() != 2024 || got.Month() != time.January || got.Day() != 15 || got.Hour() != 0 {
+		t.Errorf("floor in ET = %v; want 2024-01-15 00:00 ET (a UTC-midnight floor would land on Jan 14)", got)
+	}
+}
