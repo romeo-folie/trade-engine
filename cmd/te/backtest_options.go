@@ -43,7 +43,7 @@ func init() {
 	orbOptionsCmd.Flags().StringVar(&btOptETFs, "etf-underlyings", "SPY,QQQ", "Comma-separated earnings-exempt ETFs. Single names hit the earnings gate, which fails closed with no earnings feed, so the backtest is ETF-only")
 	orbOptionsCmd.Flags().Float64Var(&btOptPremium, "premium-budget", 1000, "Dollars of premium to deploy per trade (sizing). options_orb.premium_budget if 0")
 	orbOptionsCmd.Flags().Float64Var(&btOptMaxLoss, "max-loss-per-trade", 0, "Hard cap on premium at risk per trade (0 = no extra cap beyond the budget)")
-	orbOptionsCmd.Flags().IntVar(&btOptTimeExitMin, "time-exit-minutes", 0, "IV-crush time exit: flatten a not-in-profit position after N minutes held (0 = disabled). Cuts theta bleed from all-day holds")
+	orbOptionsCmd.Flags().IntVar(&btOptTimeExitMin, "time-exit-minutes", -1, "IV-crush time exit: flatten a not-in-profit position after N minutes held. -1 = use config; 0 = force-disable; N = N minutes. Cuts theta bleed from all-day holds")
 	orbOptionsCmd.Flags().Float64Var(&btOptDeltaMin, "delta-min", 0, "Lower |delta| bound for strike selection (0 = gate default 0.50). Higher = deeper ITM = less theta, more directional")
 	orbOptionsCmd.Flags().Float64Var(&btOptDeltaMax, "delta-max", 0, "Upper |delta| bound (0 = gate default 0.60)")
 	orbOptionsCmd.Flags().IntVar(&btOptMaxDTE, "max-dte", 0, "Max days-to-expiry for the chosen contract (0 = gate default 5). Longer = less theta/day")
@@ -146,7 +146,7 @@ func runOptionsBacktest(ctx context.Context) error {
 	rcfg.IVHistoryFloor = data.AlpacaOptionHistoryStart // don't seed IV before Alpaca has data
 
 	// Strategy-lever overrides (>0 wins over the config/default), for tuning sweeps.
-	if btOptTimeExitMin > 0 {
+	if btOptTimeExitMin >= 0 { // -1 = unset (keep config); 0 explicitly disables the time exit
 		rcfg.Replay.TimeExitMinutes = btOptTimeExitMin
 	}
 	if btOptDeltaMin > 0 {
