@@ -80,8 +80,9 @@ func (r ORBTradeRow) Label() string {
 	return r.Ticker
 }
 
-// FetchORBViewData loads the most recent 3 ORB sessions (today + prior days)
-// and their trades. Safe to call when DB is unavailable — returns an empty result.
+// FetchORBViewData loads the most recent ORB sessions (newest first — a trading day has
+// several concurrent sessions: equities/forex/futures, plus a morning london session) and
+// their trades. Safe to call when DB is unavailable — returns an empty result.
 func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 	d.LastUpdate = time.Now()
 	if !store.IsConnected() {
@@ -89,15 +90,27 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 	}
 	db := store.GetDB()
 
-	sessions, err := store.GetRecentORBSessions(ctx, db, 3)
+	// A single trading day has up to 4 concurrent sessions (equities + forex + futures for
+	// orb-newyork, plus a morning london forex session), so a limit of 3 truncated a day and
+	// hid the futures panel. 6 covers a full day plus a little history. NOTE: this view has no
+	// height-aware scrolling yet, so on a short terminal the LAST panels are truncated — the
+	// created_at-DESC ordering deliberately puts the newest sessions (today's, incl. futures)
+	// FIRST so the ones most likely to matter survive; full scrolling is a follow-up.
+	sessions, err := store.GetRecentORBSessions(ctx, db, 6)
 	if err != nil || len(sessions) == 0 {
 		return d
 	}
 
 	for _, s := range sessions {
+		// The equities scheduler creates its session with an empty name; label it so its
+		// panel isn't headerless next to the named forex/futures panels.
+		name := s.SessionName
+		if name == "" {
+			name = "equities"
+		}
 		sd := ORBSessionData{
 			Date:        s.Date,
-			SessionName: s.SessionName,
+			SessionName: name,
 			Status:      s.Status,
 			Selected:    s.Selected,
 		}

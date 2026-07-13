@@ -243,6 +243,17 @@ func (s *ORBScheduler) futuresInstrumentForTicker(ticker string) *config.Futures
 	return nil
 }
 
+// pointValueForTicker is the dollar value of a 1.0 price move per contract/unit for the
+// realised-P&L calc: TickValue/TickSize for a configured futures instrument (MES $5/pt,
+// MYM $0.50/pt), else 1.0 for forex/CFD units (XAU/XAG = $1/pt). Without this, futures
+// exits are booked at the raw point difference — off by the whole contract multiplier.
+func (s *ORBScheduler) pointValueForTicker(ticker string) float64 {
+	if s.futuresCfg == nil {
+		return 1
+	}
+	return PointValueForTicker(s.futuresCfg.Instruments, ticker)
+}
+
 // SetFeedbackConfig wires feedback configuration for ORB prompt enrichment.
 // Call before Run. If not called, prompt enrichment is disabled.
 func (s *ORBScheduler) SetFeedbackConfig(cfg *config.FeedbackConfig) {
@@ -1744,7 +1755,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 				if err != nil || res.Status != "filled" {
 					continue
 				}
-				pnl := exitPnL(tc.side, tc.entryFill, res.FilledPrice, tc.qty)
+				pnl := exitPnLF(tc.side, tc.entryFill, res.FilledPrice, tc.qty, s.pointValueForTicker(tc.ticker))
 				slog.Info("orb: exit filled",
 					"ticker", tc.ticker, "side", tc.side,
 					"exit_type", ec.exitType, "exit_price", res.FilledPrice,
@@ -2103,7 +2114,7 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 			continue
 		}
 
-		pnl := exitPnL(t.Side, t.FillPrice, res.ExitPrice, t.Qty)
+		pnl := exitPnLF(t.Side, t.FillPrice, res.ExitPrice, t.Qty, s.pointValueForTicker(t.Ticker))
 		slog.Info("orb: bar replay: resolved exit",
 			"ticker", t.Ticker, "side", t.Side, "exit_type", res.ExitType, "timeframe", res.Timeframe,
 			"exit_price", res.ExitPrice, "entry_price", t.FillPrice, "exit_time", res.ExitTime, "pnl", pnl,
@@ -2163,7 +2174,7 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 			if err != nil || res.Status != "filled" {
 				continue
 			}
-			pnl := exitPnL(t.Side, t.FillPrice, res.FilledPrice, t.Qty)
+			pnl := exitPnLF(t.Side, t.FillPrice, res.FilledPrice, t.Qty, s.pointValueForTicker(t.Ticker))
 			slog.Info("orb: reconcile: exit found",
 				"ticker", t.Ticker, "exit_type", ec.exitType,
 				"exit_price", res.FilledPrice, "pnl", pnl,
@@ -2296,7 +2307,7 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 				break
 			}
 
-			pnl := exitPnL(t.Side, t.FillPrice, rec.Price, t.Qty)
+			pnl := exitPnLF(t.Side, t.FillPrice, rec.Price, t.Qty, s.pointValueForTicker(t.Ticker))
 			slog.Info("orb: exit reconcile: matched",
 				"ticker", t.Ticker, "side", t.Side,
 				"exit_type", exitType, "exit_price", rec.Price,

@@ -422,11 +422,15 @@ func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fi
 	return err
 }
 
-// GetRecentORBSessions returns up to limit ORB sessions ordered by date descending.
+// GetRecentORBSessions returns up to limit ORB sessions, newest first. Ordered by
+// (date DESC, created_at DESC): a single trading day has MULTIPLE concurrent sessions —
+// one per scheduler (orb-newyork runs equities + forex + futures, plus a morning london
+// forex session) — all sharing the same date, so a date-only sort would drop same-date
+// sessions arbitrarily under LIMIT (which hid the futures session from the dashboard).
 func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBSession, error) {
 	rows, err := db.Query(ctx, `
 		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
-		FROM orb_sessions ORDER BY date DESC LIMIT $1`, limit)
+		FROM orb_sessions ORDER BY date DESC, created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}

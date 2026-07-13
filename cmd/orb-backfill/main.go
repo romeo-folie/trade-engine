@@ -59,6 +59,10 @@ func main() {
 		fmt.Fprintf(os.Stderr, "load config: %v\n", err)
 		os.Exit(1)
 	}
+	// Futures instruments (micro-index + COMEX metals) so exit P&L applies the contract
+	// point value — otherwise MES/MYM/GC/SI recoveries book the raw point difference.
+	futuresInstruments := append(append([]config.FuturesInstrument(nil),
+		cfg.FuturesORB.Instruments...), cfg.FuturesORBMetals.Instruments...)
 	if !cfg.Markets.IBKR.Enabled {
 		fmt.Fprintln(os.Stderr, "markets.ibkr.enabled must be true — bar replay needs IBKR market data")
 		os.Exit(1)
@@ -144,7 +148,7 @@ func main() {
 			continue
 		}
 
-		pnl := orb.ExitPnL(t.Side, t.FillPrice, res.ExitPrice, t.Qty)
+		pnl := orb.ExitPnLF(t.Side, t.FillPrice, res.ExitPrice, t.Qty, orb.PointValueForTicker(futuresInstruments, t.Ticker))
 		resolved++
 		totalPnL += pnl
 		fmt.Printf("%-9s %-5s %5d %12s %10.5f %+8.2f %5s  %s\n",

@@ -47,7 +47,7 @@ func TestReconcile_SingleBuyRoundTrip(t *testing.T) {
 		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
 		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
 	}}
-	got := reconcile(trades, bySym)
+	got := reconcile(trades, bySym, nil)
 	if len(got) != 1 || !got[0].ok {
 		t.Fatalf("expected 1 matched, got %+v", got)
 	}
@@ -77,7 +77,7 @@ func TestReconcile_NettingCollisionResolvedByTwoPass(t *testing.T) {
 		{ID: "buy", Ticker: "EUR/USD", Side: "buy", Qty: 5000, FillPrice: 1.1700, FilledAt: ptr(at(10, 1))},
 		{ID: "sell", Ticker: "EUR/USD", Side: "sell", Qty: 5000, FillPrice: 1.3000, FilledAt: ptr(at(12, 1))},
 	}
-	got := reconcile(trades, bySym)
+	got := reconcile(trades, bySym, nil)
 	byID := map[string]match{}
 	for _, m := range got {
 		byID[m.t.ID] = m
@@ -106,7 +106,7 @@ func TestReconcile_QtyMismatchNotMatched(t *testing.T) {
 		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
 		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
 	}}
-	got := reconcile(trades, bySym)
+	got := reconcile(trades, bySym, nil)
 	if got[0].ok {
 		t.Fatalf("expected unmatched on qty mismatch, got %+v", got[0])
 	}
@@ -123,7 +123,7 @@ func TestReconcile_ExitQtyMustMatch(t *testing.T) {
 		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
 		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
 	}}
-	got := reconcile(trades, bySym)
+	got := reconcile(trades, bySym, nil)
 	if got[0].ok {
 		t.Fatalf("expected no exit on qty mismatch, got %+v", got[0])
 	}
@@ -137,7 +137,7 @@ func TestReconcile_NoEntryFillUnmatched(t *testing.T) {
 		ID: "t1", Ticker: "EUR/USD", Side: "buy", Qty: 5000,
 		FillPrice: 1.1700, FilledAt: ptr(at(10, 1)),
 	}}
-	got := reconcile(trades, bySym)
+	got := reconcile(trades, bySym, nil)
 	if got[0].ok {
 		t.Fatalf("expected unmatched, got %+v", got[0])
 	}
