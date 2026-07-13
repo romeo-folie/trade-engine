@@ -2619,19 +2619,22 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 		if !sig.ExpiresAt.IsZero() && now.After(sig.ExpiresAt) {
 			continue // the expiry loop owns time-outs
 		}
-		latest := resolveFallbackCandle(now, func(tf data.Timeframe) (*data.Candle, error) {
-			return store.GetLatestCandle(ctx, sig.Ticker, tf)
-		})
-		if latest == nil {
-			// No fresh mark to confirm against — keep pending; either a later
-			// tick confirms or the expiry loop cleans up.
-			logger.Warn("deferred signal: no fresh candle to confirm — keeping pending",
+		// Confirm against a LIVE quote, not the candle store: this sweep runs
+		// before the tick's candle refresh, so the freshest stored candle is
+		// usually the same bar that priced the signal on the previous tick —
+		// "confirming" against it would observe no new information at all
+		// (Codex P1 on #434). Stored candles are only a fallback.
+		confirmPrice := e.deferredConfirmPrice(ctx, sig.Ticker, now)
+		if confirmPrice <= 0 {
+			// No mark to confirm against — keep pending; either a later tick
+			// confirms or the expiry loop cleans up.
+			logger.Warn("deferred signal: no price to confirm against — keeping pending",
 				"id", sig.ID, "ticker", sig.Ticker)
 			continue
 		}
 		tol := e.cfg.Risk.EntryGates.FirstTickHoldTolerancePct
-		if !deferredPriceHeld(sig.SignalPrice, latest.Close, tol) {
-			reason := fmt.Sprintf("first-tick confirmation failed: price %.4f below signal %.4f beyond tolerance", latest.Close, sig.SignalPrice)
+		if !deferredPriceHeld(sig.SignalPrice, confirmPrice, tol) {
+			reason := fmt.Sprintf("first-tick confirmation failed: price %.4f below signal %.4f beyond tolerance", confirmPrice, sig.SignalPrice)
 			if err := store.UpdateSignalStatus(ctx, sig.ID, "stale", reason); err != nil {
 				logger.Warn("mark deferred signal stale", "id", sig.ID, "err", err)
 			}
@@ -2639,9 +2642,16 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			continue
 		}
 
-		// Price held — re-validate the portfolio-level gates before firing.
-		// Fetched per signal (not per sweep) so an execution earlier in this
-		// loop counts against the next signal's position budget.
+		// Price held — re-price the signal to the confirmation mark so risk
+		// checks (R:R, dollar-risk), position sizing, and the paper fill all
+		// see what the broker would actually fill at, not the stale
+		// first-tick price (Codex P2 on #434). A gap up that wrecks the R:R
+		// is rejected organically by the re-check below.
+		sig.SignalPrice = confirmPrice
+
+		// Re-validate the portfolio-level gates before firing. Fetched per
+		// signal (not per sweep) so an execution earlier in this loop counts
+		// against the next signal's position budget.
 		openTrades, otErr := store.GetOpenTrades(ctx)
 		if otErr != nil {
 			logger.Warn("deferred signal: open trades unavailable — retrying next tick",
@@ -2660,11 +2670,40 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			continue
 		}
 
+		// Persist the re-priced signal so the stored row matches what was
+		// risk-checked and executed. Best-effort: an execution at the right
+		// price with a stale stored row beats no execution.
+		if err := store.UpdateSignalPrice(ctx, sig.ID, confirmPrice); err != nil {
+			logger.Warn("update deferred signal price", "id", sig.ID, "err", err)
+		}
+
 		logger.Info("deferred signal confirmed — executing",
-			"id", sig.ID, "ticker", sig.Ticker,
-			"signal_price", sig.SignalPrice, "confirm_price", latest.Close)
+			"id", sig.ID, "ticker", sig.Ticker, "confirm_price", confirmPrice)
 		e.executeSignal(ctx, sig.ID, sig)
 	}
+}
+
+// deferredConfirmPrice returns the freshest available mark for confirming a
+// deferred signal: a live quote mid when the provider answers with a
+// two-sided quote, else the freshest stored candle within its recency
+// window, else 0 (no mark). One-sided quotes (pre-market / thin books) are
+// rejected — FetchQuote's mid is (bid+ask)/2, so a missing side halves the
+// price and would wrongly stale a legitimate signal (same guard as the ORB
+// spread gate).
+func (e *Engine) deferredConfirmPrice(ctx context.Context, ticker string, now time.Time) float64 {
+	if q, err := e.marketData.FetchQuote(ctx, ticker); err != nil {
+		logger.Warn("deferred confirm: quote fetch failed — falling back to stored candles",
+			"ticker", ticker, "err", err)
+	} else if q != nil && q.Bid > 0 && q.Ask > 0 {
+		return q.Last
+	}
+	latest := resolveFallbackCandle(now, func(tf data.Timeframe) (*data.Candle, error) {
+		return store.GetLatestCandle(ctx, ticker, tf)
+	})
+	if latest == nil {
+		return 0
+	}
+	return latest.Close
 }
 
 // buildRiskInput assembles risk.CheckInput for a signal against a portfolio
