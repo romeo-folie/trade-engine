@@ -7,22 +7,30 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-// fakeBracketExec serves canned order statuses and records cancels.
+// fakeBracketExec serves canned order statuses and records cancels/orders.
 type fakeBracketExec struct {
 	statuses  map[string]execution.OrderResult
 	statusErr map[string]error
 	cancelErr map[string]error
 	cancelled []string
+	placed    []execution.OrderRequest
+	placeRes  execution.OrderResult
+	placeErr  error
 }
 
-func (f *fakeBracketExec) PlaceOrder(_ context.Context, _ execution.OrderRequest) (execution.OrderResult, error) {
-	return execution.OrderResult{}, fmt.Errorf("not used")
+func (f *fakeBracketExec) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	if f.placeErr != nil {
+		return execution.OrderResult{}, f.placeErr
+	}
+	f.placed = append(f.placed, req)
+	return f.placeRes, nil
 }
 
 func (f *fakeBracketExec) CancelOrder(_ context.Context, id string) error {
@@ -53,10 +61,11 @@ func (f *fakeBracketExec) GetAccount(_ context.Context) (execution.AccountInfo, 
 
 func newBracketTestEngine(exec execution.Executor) *Engine {
 	return &Engine{
-		cfg:       &config.Config{},
-		executor:  exec,
-		portfolio: portfolio.NewTracker(time.Hour),
-		bus:       events.New(),
+		cfg:         &config.Config{},
+		executor:    exec,
+		portfolio:   portfolio.NewTracker(time.Hour),
+		bus:         events.New(),
+		costTracker: cost.NewTracker(),
 	}
 }
 

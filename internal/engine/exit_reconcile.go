@@ -30,7 +30,12 @@ type exitReconcileExecutor interface {
 // exitStoreAdapter; tests supply an in-memory implementation.
 type exitReconcileStore interface {
 	GetPendingExitOrders(ctx context.Context, limit int) ([]store.PendingExitOrder, error)
-	UpdateOrderFillPrice(ctx context.Context, brokerOrderID string, filledPrice, filledQty float64) error
+	// UpdateOrderFill is scoped to the order row's own id, NOT the broker
+	// order id: a multi-lot SELL exit (#436) writes one order row per lot
+	// sharing a single broker order id, and a blanket update keyed on the
+	// broker id would stamp the broker's AGGREGATE filled qty onto every
+	// lot's row.
+	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
 	UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
 	MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error
 }
@@ -41,8 +46,8 @@ type exitStoreAdapter struct{}
 func (exitStoreAdapter) GetPendingExitOrders(ctx context.Context, limit int) ([]store.PendingExitOrder, error) {
 	return store.GetPendingExitOrders(ctx, limit)
 }
-func (exitStoreAdapter) UpdateOrderFillPrice(ctx context.Context, brokerOrderID string, filledPrice, filledQty float64) error {
-	return store.UpdateOrderFillPrice(ctx, brokerOrderID, filledPrice, filledQty)
+func (exitStoreAdapter) UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error {
+	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
 }
 func (exitStoreAdapter) UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	return store.UpdateTradeExit(ctx, id, exitPrice, pnl, pnlPct)
@@ -158,9 +163,16 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 					"pnl", pnl,
 				)
 			}
-			if err := db.UpdateOrderFillPrice(ctx, p.BrokerOrderID, res.FilledPrice, res.FilledQty); err != nil {
+			// Per-lot fill qty: the broker reports the AGGREGATE fill for
+			// the order, which spans multiple lots on a #436 SELL exit —
+			// each row records at most its own lot's quantity.
+			lotQty := res.FilledQty
+			if p.Quantity > 0 && lotQty > p.Quantity {
+				lotQty = p.Quantity
+			}
+			if err := db.UpdateOrderFill(ctx, p.OrderID, res.FilledPrice, lotQty, "filled"); err != nil {
 				stats.Errors++
-				logger.Warn("exit reconcile: update order fill", "broker_order_id", p.BrokerOrderID, "err", err)
+				logger.Warn("exit reconcile: update order fill", "order_id", p.OrderID, "err", err)
 				continue
 			}
 			if corrected {

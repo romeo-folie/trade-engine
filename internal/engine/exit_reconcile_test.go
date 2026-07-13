@@ -47,7 +47,7 @@ func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 func (f *fakeExitStore) GetPendingExitOrders(_ context.Context, _ int) ([]store.PendingExitOrder, error) {
 	return f.pending, f.pendingErr
 }
-func (f *fakeExitStore) UpdateOrderFillPrice(_ context.Context, id string, price, qty float64) error {
+func (f *fakeExitStore) UpdateOrderFill(_ context.Context, id string, price, qty float64, _ string) error {
 	f.orderFills[id] = [2]float64{price, qty}
 	return nil
 }
@@ -89,7 +89,7 @@ func TestExitReconcileCorrectsToBrokerFill(t *testing.T) {
 	if stats.Corrected != 1 || stats.Scanned != 1 {
 		t.Fatalf("stats = %+v, want Scanned=1 Corrected=1", stats)
 	}
-	fill, ok := db.orderFills["b1"]
+	fill, ok := db.orderFills["o1"]
 	if !ok || fill[0] != 3.82 {
 		t.Fatalf("order fill = %v, want price 3.82 backfilled", fill)
 	}
@@ -143,7 +143,7 @@ func TestExitReconcileMatchingFillOnlyBackfillsOrder(t *testing.T) {
 	if _, touched := db.tradeExits["t1"]; touched {
 		t.Fatal("trade rewritten despite matching fill")
 	}
-	if _, ok := db.orderFills["b1"]; !ok {
+	if _, ok := db.orderFills["o1"]; !ok {
 		t.Fatal("order fill columns not backfilled")
 	}
 }
