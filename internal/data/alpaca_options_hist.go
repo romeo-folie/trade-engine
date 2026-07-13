@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,6 +44,12 @@ type AlpacaOptionsHist struct {
 	modeledSpreadPct float64 // full modeled bid/ask width as a fraction of the mid (0 = none)
 	equity           *AlpacaClient
 }
+
+// stdOCCSymbol matches a standard OCC option symbol — Alpaca's own validation for the
+// bars/quotes endpoints (root 1-5 letters, 6-7 digit date, C/P, 8-digit strike).
+// ADJUSTED symbols (a numeric prefix / odd strike from a corporate action) fail it and
+// are rejected by those endpoints, so we drop them before batching.
+var stdOCCSymbol = regexp.MustCompile(`^[A-Z]{1,5}\d{6,7}[CP]\d{8}$`)
 
 // alpacaOptionsET is US/Eastern, used to anchor the data-floor date. The backtest
 // iterates ET calendar days, so the floor must be an ET-midnight instant — a UTC one
@@ -165,6 +172,14 @@ func (a *AlpacaOptionsHist) listContractsStatus(ctx context.Context, underlying,
 			return nil, fmt.Errorf("list option contracts %s (%s): %w", underlying, status, err)
 		}
 		for _, c := range resp.OptionContracts {
+			// Skip ADJUSTED / non-standard OCC symbols (e.g. "1SPY250117P00370010" from a
+			// corporate action): the contracts endpoint returns them, but the bars/quotes
+			// endpoints reject them with a 400, and because we batch up to 100 symbols per
+			// bars request, ONE such symbol 400s the whole batch and silently drops all its
+			// data. They can't be priced from bars anyway, so exclude them at the source.
+			if !stdOCCSymbol.MatchString(c.Symbol) {
+				continue
+			}
 			exp, err := time.Parse("2006-01-02", c.ExpirationDate)
 			if err != nil {
 				continue
