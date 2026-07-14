@@ -92,10 +92,9 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 
 	// A single trading day has up to 4 concurrent sessions (equities + forex + futures for
 	// orb-newyork, plus a morning london forex session), so a limit of 3 truncated a day and
-	// hid the futures panel. 6 covers a full day plus a little history. NOTE: this view has no
-	// height-aware scrolling yet, so on a short terminal the LAST panels are truncated — the
-	// created_at-DESC ordering deliberately puts the newest sessions (today's, incl. futures)
-	// FIRST so the ones most likely to matter survive; full scrolling is a follow-up.
+	// hid the futures panel. 6 covers a full day plus a little history; the view scrolls
+	// (j/k) so panels past the first screenful stay reachable. created_at-DESC ordering
+	// puts the newest sessions (today's, incl. futures) FIRST.
 	sessions, err := store.GetRecentORBSessions(ctx, db, 6)
 	if err != nil || len(sessions) == 0 {
 		return d
@@ -170,24 +169,60 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 	return d
 }
 
-// RenderORBView renders the full ORB tab with all recent sessions.
-func RenderORBView(d ORBViewData, width int) string {
+// RenderORBView renders the full ORB tab with all recent sessions, windowed to
+// `height` terminal rows starting `scroll` rows into the content. The ORB view
+// scrolls by line rather than by selected row (like the table views do)
+// because its session panels have variable heights and no uniform row unit.
+// height <= 0 disables windowing and returns the full content.
+func RenderORBView(d ORBViewData, width, height, scroll int) string {
+	lines := orbViewLines(d, width)
+	if height <= 0 || len(lines) <= height {
+		return strings.Join(lines, "\n")
+	}
+	// Reserve one line for the scroll indicator.
+	visible := max(height-1, 1)
+	scroll = min(max(scroll, 0), len(lines)-visible)
+	return strings.Join(lines[scroll:scroll+visible], "\n") + "\n" +
+		scrollIndicator(scroll, scroll+visible, len(lines))
+}
+
+// ORBMaxScroll returns the largest useful scroll offset for the ORB view at
+// the given size — the key handler clamps to this so the offset can't run
+// past the bottom of the content.
+func ORBMaxScroll(d ORBViewData, width, height int) int {
+	lines := orbViewLines(d, width)
+	if height <= 0 || len(lines) <= height {
+		return 0
+	}
+	return len(lines) - max(height-1, 1)
+}
+
+// orbViewLines renders the full ORB content and splits it into physical
+// terminal rows. Wrapping to width BEFORE splitting matters: a logical line
+// longer than the terminal occupies several physical rows, so windowing
+// unwrapped lines would overflow the viewport (same reason app.go wraps
+// before clipping).
+func orbViewLines(d ORBViewData, width int) []string {
+	var content string
 	if len(d.Sessions) == 0 {
-		return sectionTitle.Render("ORB Flow") + "\n" +
+		content = sectionTitle.Render("ORB Flow") + "\n" +
 			dimText.Render("  No ORB sessions found")
-	}
-
-	var b strings.Builder
-	b.WriteString(sectionTitle.Render("ORB Flow") +
-		dimText.Render(fmt.Sprintf("  updated %s", d.LastUpdate.Format("15:04:05"))) + "\n\n")
-
-	for i, s := range d.Sessions {
-		b.WriteString(RenderORBPanel(s, width))
-		if i < len(d.Sessions)-1 {
-			b.WriteString("\n" + dimText.Render(strings.Repeat("─", max(0, min(width-2, 60)))) + "\n\n")
+	} else {
+		var b strings.Builder
+		b.WriteString(sectionTitle.Render("ORB Flow") +
+			dimText.Render(fmt.Sprintf("  updated %s", d.LastUpdate.Format("15:04:05"))) + "\n\n")
+		for i, s := range d.Sessions {
+			b.WriteString(RenderORBPanel(s, width))
+			if i < len(d.Sessions)-1 {
+				b.WriteString("\n" + dimText.Render(strings.Repeat("─", max(0, min(width-2, 60)))) + "\n\n")
+			}
 		}
+		content = b.String()
 	}
-	return b.String()
+	if width > 0 {
+		content = lipgloss.NewStyle().Width(width).Render(content)
+	}
+	return strings.Split(content, "\n")
 }
 
 // RenderORBPanel renders a single ORB session panel.

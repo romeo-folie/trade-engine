@@ -131,6 +131,7 @@ type Model struct {
 	selectedSignal    int
 	selectedWatchlist int
 	selectedConfig    int
+	orbScroll         int // line offset into the ORB view (it scrolls by line, not by row selection)
 	showTradeDetail   bool
 	tradeDetail       views.TradeDetailData // cached on open; avoids per-frame DB query
 	configEditing     bool
@@ -346,6 +347,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if len(m.dashData.Positions) > 0 {
 					m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
 				}
+			case ViewORB:
+				m.scrollORB(1)
 			}
 			return m, nil
 		case "k", "up":
@@ -379,6 +382,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				} else if len(m.dashData.Positions) > 0 {
 					m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
 				}
+			case ViewORB:
+				m.scrollORB(-1)
 			}
 			return m, nil
 		case "a":
@@ -538,6 +543,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// scrollORB moves the ORB view's line offset by delta, clamped to the content
+// bounds at the current terminal size. Clamping against fresh data here (not
+// just at render time) keeps the stored offset in range, so one keypress after
+// a data shrink responds immediately instead of draining a stale offset.
+func (m *Model) scrollORB(delta int) {
+	maxScroll := views.ORBMaxScroll(m.orbData, m.width, m.bodyHeight())
+	m.orbScroll = min(max(m.orbScroll+delta, 0), maxScroll)
+}
+
+// bodyHeight is the terminal rows available to the body:
+// total - header (1) - status bar (1) - borders (2).
+func (m Model) bodyHeight() int {
+	h := m.height - 4
+	if h < 1 {
+		h = 1
+	}
+	return h
+}
+
 // View renders the current screen.
 func (m Model) View() string {
 	if m.width == 0 {
@@ -547,11 +571,7 @@ func (m Model) View() string {
 	header := m.renderHeader()
 	statusBar := m.renderStatusBar()
 
-	// Calculate body height: total - header (1) - status bar (1) - borders (2).
-	bodyHeight := m.height - 4
-	if bodyHeight < 1 {
-		bodyHeight = 1
-	}
+	bodyHeight := m.bodyHeight()
 
 	// Wrap the body to the terminal width BEFORE clipping. lipgloss's Width()
 	// wraps long lines (e.g. the 82–87 cell table separators) into extra
@@ -663,7 +683,7 @@ func (m Model) renderBody(height int) string {
 	case ViewConfig:
 		return views.RenderConfig(m.configData, m.width)
 	case ViewORB:
-		return views.RenderORBView(m.orbData, m.width)
+		return views.RenderORBView(m.orbData, m.width, height, m.orbScroll)
 	default:
 		return "unknown view"
 	}
@@ -671,6 +691,9 @@ func (m Model) renderBody(height int) string {
 
 func (m Model) renderStatusBar() string {
 	left := " [1-6] switch view  [tab] next  [q] quit"
+	if m.activeView == ViewORB {
+		left = " [j/k] scroll  [1-6] switch view  [q] quit"
+	}
 	if m.activeView == ViewConfig {
 		if m.configEditing {
 			left = fmt.Sprintf(" editing value: %s", m.configInput)
