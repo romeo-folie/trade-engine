@@ -170,7 +170,15 @@ func (e *Engine) commissionRiskOK(v Variant, inst config.Instrument, p orb.Brack
 	if v.ApplyAdaptiveExit && inst.PartialTakeProfitR > 0 && inst.PartialFraction > 0 {
 		fills = 3.0
 	}
-	return fills*e.costFor(inst.Symbol).perFillCommission(p.Qty)/riskDollars <= inst.MaxCommissionToRisk
+	// The flat per-fill component scales with the fill COUNT, but the per-unit component
+	// scales with units traded — and a round trip always trades qty in and qty out no
+	// matter how many fills the exit splits into (partial pq + runner qty−pq = qty). So
+	// the per-unit part is 2×qty regardless of `fills`, matching what resolveAdaptiveExit
+	// actually charges; fills×perFill(qty) would overstate a 50% partial's commission 1.5×
+	// and veto trades the simulation itself would keep.
+	cost := e.costFor(inst.Symbol)
+	commission := fills*cost.CommissionPerSide + 2*cost.CommissionPerUnit*float64(p.Qty)
+	return commission/riskDollars <= inst.MaxCommissionToRisk
 }
 
 // Run replays the variant over [from, to] for the given instruments and returns the

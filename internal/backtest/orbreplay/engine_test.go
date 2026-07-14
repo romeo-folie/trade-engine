@@ -7,6 +7,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/orb"
 )
 
 // fakeProvider returns scripted candles filtered to the requested [from, to) window and
@@ -815,5 +816,31 @@ func TestReplay_AdaptivePartialCommissionPerUnit(t *testing.T) {
 	// Gross: partial 5 × 20pts + runner 5 × 40pts = 300 pts × $5/pt.
 	if want := 300.0 * 5; absf(tr.GrossPnL-want) > 1e-6 {
 		t.Errorf("GrossPnL = %v; want %v", tr.GrossPnL, want)
+	}
+}
+
+// TestCommissionRiskOK_PerUnitPartial pins the gate's per-unit estimate: a split exit
+// still trades exactly qty units out, so the per-unit commission is 2×qty regardless of
+// fill count. fills×perFill(qty) would overstate a 50% partial 1.5× and veto trades the
+// simulation itself keeps.
+func TestCommissionRiskOK_PerUnitPartial(t *testing.T) {
+	inst := config.Instrument{
+		Symbol: "MES", PointValue: 5, MaxCommissionToRisk: 0.02,
+		PartialTakeProfitR: 1.0, PartialFraction: 0.5,
+	}
+	costs := map[string]CostModel{"MES": {CommissionPerUnit: 0.85}}
+	e := NewEngine(config.ForexORBConfig{}, &fakeProvider{}, costs, 0)
+	// 20-pt risk × $5/pt × 10 contracts = $1000 risk. True round-trip commission
+	// = 0.85 × 2 × 10 = $17 → ratio 0.017 ≤ 0.02 (PASS). The fill-count formula would
+	// charge 3 × 8.5 = $25.5 → 0.0255 (incorrectly FAIL).
+	p := orb.BracketParams{Side: "buy", EntryStop: 5005, StopLoss: 4985, Qty: 10}
+	v := Variant{ApplyAdaptiveExit: true}
+	if !e.commissionRiskOK(v, inst, p) {
+		t.Error("commissionRiskOK = false; want true (per-unit commission is 2×qty, not fills×qty)")
+	}
+	// Tighten the cap below the true ratio → must fail.
+	inst.MaxCommissionToRisk = 0.016
+	if e.commissionRiskOK(v, inst, p) {
+		t.Error("commissionRiskOK = true; want false at cap 0.016 < true ratio 0.017")
 	}
 }
