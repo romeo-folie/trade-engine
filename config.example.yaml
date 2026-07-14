@@ -573,22 +573,35 @@ futures_orb:
 
 # ── Options-ORB (Alpaca) — run the ORB signal but execute via long equity options ─────
 # Executes on the equities/newyork session. Long-only (buy calls on long breakouts,
-# puts on shorts) so max loss = premium. REQUIRES the Alpaca real-time OPRA options
-# feed (markets.stocks.option_feed: opra) + Level 2 options approval. Default-off.
+# puts on shorts) so max loss = premium. The configured `underlyings` are FORCE-WATCHED
+# every day — they get their own opening range and a DUAL-SIDED breakout entry (call vs
+# put chosen by which side of the range breaks first, first breakout only, entry window =
+# open+60m), INDEPENDENT of the LLM gap scan. This mirrors the options-ORB backtest
+# (`te backtest orb-options`) exactly, so live behaviour matches the validated strategy.
+#
+# REQUIRES the Alpaca real-time OPRA options feed (markets.stocks.option_feed: opra) +
+# Level 2 options approval. TWO DAILY PREREQUISITES or the gates fail CLOSED (zero trades):
+#   1. `te options backfill-iv`  — seeds option_iv_history for the IV-rank gate.
+#   2. `te earnings sync`        — populates earnings_calendar for any SINGLE-NAME underlying
+#                                  (ETFs are earnings-exempt). te-switch runs both before launch.
+# Default-off. The values below are the paper-pilot config validated on 2024-H2..2025
+# (SPY/IWM/NVDA positive per-trade across independent periods, robust to strike band and a
+# pessimistic spread) — an in-sample edge; forward paper is the real out-of-sample test.
 options_orb:
   enabled: false
-  underlyings: [SPY, QQQ]        # options-mode symbols; others run the normal equity path
-  etf_underlyings: [SPY, QQQ]    # earnings-exempt. Add single names (NVDA, TSLA) ONLY with an
-                                 # earnings feed wired — without one they fail closed (never trade).
-  premium_budget: 500           # $ of option premium to deploy per trade
-  max_loss_per_trade: 500       # hard cap on premium at risk (== max loss for a long option)
+  underlyings: [SPY, IWM, NVDA]  # options-mode symbols; others run the normal equity path
+  etf_underlyings: [SPY, IWM]    # earnings-exempt. Single names (NVDA) hit the earnings gate and
+                                 # fail closed unless `te earnings sync` has populated their dates.
+  premium_budget: 1000          # $ of option premium to deploy per trade (validated sizing)
+  max_loss_per_trade: 1000      # hard cap on premium at risk (== max loss for a long option)
   iv_rank_ceiling: 70           # abort if the underlying's IV rank ≥ this (avoid IV crush)
   max_dte: 5                    # keep contracts with 0 < DTE ≤ this (nearest weekly)
   delta_min: 0.50               # near-ATM band lower bound (|delta|)
   delta_max: 0.60               # near-ATM band upper bound
   spread_pct_ceiling: 5         # abort if the contract's bid-ask spread % ≥ this (slippage)
   earnings_blackout_days: 3     # single names only; skip within this many days of earnings
-  time_exit_minutes: 8          # IV-crush time exit: close if not profitable within N minutes
+  time_exit_minutes: 0          # IV-crush time exit in minutes; 0 = OFF. The validated strategy holds
+                                # to stop/target/EOD-flatten — the 30-min time exit was OVERFIT (OOS ≈$0).
   iv_lookback_days: 252         # IV-Rank trailing window (~1 year)
   iv_min_samples: 40            # fail closed below this many stored IV days (cold-start guard)
 

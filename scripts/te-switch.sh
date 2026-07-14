@@ -71,6 +71,40 @@ config_gateway_url() {
     | sed -E 's/^[[:space:]]*gateway_url:[[:space:]]*//; s/[[:space:]]*(#.*)?$//; s/^["'\'']//; s/["'\'']$//'
 }
 
+# options_orb_enabled: true (exit 0) when the config's options_orb block has
+# `enabled: true`. Used to gate the daily options-ORB prerequisites so they don't run
+# (and burn API calls) when options-ORB is off.
+options_orb_enabled() {
+  local cfg="$HOME/.tradeengine/config.yaml"
+  [ -f "$cfg" ] || return 1
+  awk '
+    /^options_orb:[[:space:]]*$/ {inblk=1; next}
+    inblk && /^[^[:space:]#]/    {inblk=0}
+    inblk && /^[[:space:]]+enabled:[[:space:]]*true([[:space:]]|#|$)/ {found=1}
+    END {exit found?0:1}
+  ' "$cfg"
+}
+
+# prep_options_orb: seed the two tables the live options-ORB gates read, or they fail
+# CLOSED and place zero trades — the IV-rank gate needs option_iv_history, and single-name
+# underlyings need earnings_calendar dates. Both are best-effort: a failure warns but never
+# blocks the engine launch (the gate simply stays fail-closed for the affected underlying).
+# No-op unless options-ORB is enabled. Both commands default to options_orb.underlyings.
+prep_options_orb() {
+  options_orb_enabled || return 0
+  echo "[te-switch] options-ORB enabled — seeding daily prerequisites (best-effort)..."
+  if ./te options backfill-iv >/dev/null 2>&1; then
+    echo "[te-switch] options-ORB: IV history seeded ✓"
+  else
+    echo "[te-switch] WARNING: 'te options backfill-iv' failed — IV-rank gate may fail closed today."
+  fi
+  if ./te earnings sync >/dev/null 2>&1; then
+    echo "[te-switch] options-ORB: earnings calendar synced ✓"
+  else
+    echo "[te-switch] WARNING: 'te earnings sync' failed — single-name underlyings may fail closed today."
+  fi
+}
+
 # Resolve the gateway URL the way the engine does: explicit env override wins
 # (also what reauth-gateway.js uses), else the configured value, else the engine
 # default (defaults.go → https://localhost:5000). A hard-coded default here would
@@ -159,10 +193,12 @@ sleep 5
 case "$MODE" in
   orb)
     echo "[te-switch] Starting in ORB mode (equities)..."
+    prep_options_orb
     ./te run --mode orb --detach
     ;;
   orb-newyork)
     echo "[te-switch] Starting in ORB-NewYork mode (equities + forex)..."
+    prep_options_orb
     ./te run --mode orb-newyork --detach
     ;;
   orb-forex)

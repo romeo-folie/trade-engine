@@ -138,6 +138,7 @@ type ORBScheduler struct {
 	lastScan                time.Time                // Eastern Time of the last successful scan
 	fetchFailures           map[string]int           // ticker → consecutive candle-fetch failures
 	fetchLastAttempt        map[string]time.Time     // ticker → wall time of last candle-fetch attempt
+	optionsAttempted        map[string]bool          // ticker → the session's single options-ORB breakout entry has been spent (parity with the backtest's one as-of gate eval; prevents re-eval after a gate abort)
 }
 
 // trackedTrade holds per-order context needed to observe the full trade lifecycle.
@@ -629,6 +630,7 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 		}
 		s.mu.Lock()
 		s.rangeBuffers = make(map[string]*RangeBuffer)
+		s.optionsAttempted = make(map[string]bool)
 		for _, sc := range s.candidates {
 			s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, rangeMinutes)
 		}
@@ -773,9 +775,11 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 		}
 		s.lastScan = sessionNow
 
-		if len(gaps) == 0 {
-			return nil
-		}
+		// No early return on an empty gap universe: the options-ORB force-watch below must
+		// still run (SPY/IWM/NVDA don't gap, so the scan never surfaces them), and the cap
+		// and scoring loop are both no-ops on an empty slice. When options-ORB is disabled
+		// this still ends the same way — `selected` stays empty and the len(selected)==0
+		// guard below returns nil.
 
 		// Cap how many gap movers get LLM-scored. This is the production equities
 		// path (te run --mode orb / orb-newyork construct the scheduler without a
@@ -872,6 +876,12 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	}
 	s.lastScan = sessionNow
 
+	// Options-ORB force-watch: inject the configured options underlyings as synthetic
+	// "trade" candidates so they are ORB'd every day, independent of (and resilient to) the
+	// LLM gap scan. No-op when options-ORB is disabled. Injected into `scored` — which is
+	// persisted and rehydrated on resume — not just `selected`.
+	scored = appendForcedOptionsUnderlyings(scored, s.optionsRouter)
+
 	// Filter to "trade" or "BUY" actions, sort by conviction, take top N
 	var selected []ScoredCandidate
 	for _, sc := range scored {
@@ -892,6 +902,9 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 	if len(selected) > s.cfg.MaxCandidates {
 		selected = selected[:s.cfg.MaxCandidates]
 	}
+	// Never let the MaxCandidates cap evict a force-watched options underlying (they carry
+	// Conviction 0 and sort last). No-op when options-ORB is disabled.
+	selected = ensureForcedOptionsSelected(selected, scored, s.optionsRouter)
 
 	s.mu.Lock()
 	sessionID := s.session.ID
@@ -987,6 +1000,7 @@ func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) err
 
 	s.mu.Lock()
 	s.rangeBuffers = make(map[string]*RangeBuffer)
+	s.optionsAttempted = make(map[string]bool)
 	for _, sc := range s.candidates {
 		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.cfg.RangeMinutes)
 	}
@@ -1167,6 +1181,23 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			continue
 		}
 
+		// Options-ORB (force-watched fixed underlyings): dual-sided, breakout-direction
+		// entry via a long option, mirroring the backtest (optionsreplay.AssembleSignals) —
+		// take the FIRST breakout (orb.FirstBreakout) within the entry window and route that
+		// side (buy→call, sell→put). Intercepted BEFORE the forex/equities split so the
+		// gap-sign direction logic never applies to a non-gapping underlying. No-op when the
+		// router doesn't handle this ticker (options-ORB off, or an organic gap candidate).
+		if s.optionsRouter.Handles(ticker) {
+			done, line := s.optionsBreakoutEntry(ctx, sessionID, ticker, r, portfolioVal)
+			if line != "" {
+				msgs = append(msgs, line)
+			}
+			if !done {
+				pendingConfirmation = true // no breakout yet — keep the session Executing, retry next tick
+			}
+			continue
+		}
+
 		// Forex mode: place dual-sided brackets (buy + sell) so the market
 		// decides direction. Equities/futures: single side from gap direction.
 		if s.isForexMode() {
@@ -1320,25 +1351,10 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				if p.params.Qty == 0 {
 					continue
 				}
-				// Options-ORB (issue #414): for options-mode underlyings, execute this
-				// side as a long option instead of a bracket. Guarded by a nil-by-default
-				// router, so the equity/forex/futures bracket path below is unchanged.
-				// NOTE: there is a TWIN of this hook in the equities/futures branch
-				// (the `else` below) — options-mode underlyings are equities, so that
-				// twin is the one that actually fires in production. Keep both in sync.
-				if s.optionsRouter.Handles(ticker) {
-					orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, p.side, p.params)
-					if orderID != "" {
-						// Record the entry so the session's re-entry guard fires — options
-						// have no broker bracket to mark the ticker as entered, so without
-						// this a fresh order would be placed every tick.
-						ids[i] = orderID
-					}
-					if line != "" {
-						msgs = append(msgs, line)
-					}
-					continue
-				}
+				// NOTE: options-router underlyings are intercepted earlier (before the
+				// forex/equities split, via optionsBreakoutEntry) so they never reach this
+				// forex placement loop; the old per-side options hook here is therefore
+				// removed as dead code.
 				// Split-bracket partial take-profit (Phase 4 live): when the instrument
 				// configures a partial, enter as a PARTIAL bracket (nearer target) plus a
 				// RUNNER bracket (farther target) sharing the stop. split=false (the default,
@@ -1404,34 +1420,10 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 
-			// Options-ORB (issues #414/#419): route options-mode underlyings to a
-			// long option instead of a stock bracket. THIS equities/futures branch is
-			// the path the options-mode (equities) scheduler actually takes — the
-			// forex branch above has the parallel hook. Guarded by a nil-by-default
-			// router and Handles() (only configured underlyings), so the stock/futures
-			// bracket placement below is unchanged when options-ORB is off.
-			if s.optionsRouter.Handles(ticker) {
-				orderID, line := s.routeOptionsEntry(ctx, sessionID, ticker, side, params)
-				if orderID != "" {
-					// Record the entry so the re-entry guard fires (options have no
-					// broker bracket to mark the ticker as entered).
-					if side == "sell" {
-						s.orderIDs[ticker] = [2]string{"", orderID}
-					} else {
-						s.orderIDs[ticker] = [2]string{orderID, ""}
-					}
-					// Emit the activity-feed event the bracket path emits below, so an
-					// options entry shows up like any other ORB entry.
-					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
-						Ticker: ticker, Direction: side, Strategy: "orb",
-					})
-				}
-				if line != "" {
-					msgs = append(msgs, line)
-				}
-				continue
-			}
-
+			// NOTE: options-router underlyings are intercepted earlier (before the
+			// forex/equities split, via optionsBreakoutEntry, which decides call/put from a
+			// dual-sided breakout rather than gap sign) so they never reach this stock-bracket
+			// placement; the old options hook here is therefore removed as dead code.
 			orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, params)
 			if err != nil {
 				slog.Error("orb: place bracket failed", "ticker", ticker, "err", err)
@@ -1876,6 +1868,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 		s.scaleOutEntryIDs = make(map[string][2]string)
 		s.splitPlaced = false
 		s.directionDecisions = make(map[string][2]bool)
+		s.optionsAttempted = make(map[string]bool)
 		s.releaseTrackedTradesForReconcile()
 		s.state = StateIdle
 		s.mu.Unlock()
