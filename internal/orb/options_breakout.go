@@ -163,6 +163,16 @@ func (s *ORBScheduler) optionsBreakoutEntry(ctx context.Context, sessionID, tick
 	return true, line
 }
 
+// optionsScoringCutoffReached reports whether the equities LLM scoring loop should stop
+// early (leaving optionsScanCutoffBufferMin before session open) so the time-critical
+// options force-watch reaches candidate_ready before open. now is compared in the session
+// timezone against openMinutes (minutes-of-day, session-local).
+func optionsScoringCutoffReached(now time.Time, tz *time.Location, openMinutes int) bool {
+	n := now.In(tz)
+	h, m, _ := n.Clock()
+	return h*60+m >= openMinutes-optionsScanCutoffBufferMin
+}
+
 func optionsAttemptedKey(sessionID string) string { return "options_attempted:" + sessionID }
 
 // persistOptionsAttempted best-effort saves this session's spent-attempt set to engine_state

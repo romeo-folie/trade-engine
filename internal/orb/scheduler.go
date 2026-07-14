@@ -46,6 +46,18 @@ const maxNewsPerTicker = 10
 // model calls so the scan finishes before the opening range forms.
 const defaultMaxScanCandidates = 15
 
+// optionsScanCutoffBufferMin is how many minutes before session open the LLM scoring
+// loop stops when options-ORB is enabled, so the time-critical force-watched underlyings
+// are committed to candidate_ready before open even if provider rate limits stall scoring.
+// Only the inject+filter+advance work (sub-second) runs after this point; gapper scoring
+// is best-effort enrichment. Decouples options-ORB reliability from LLM latency.
+//
+// The check is between loop iterations, so at most ONE in-flight AnalyzeAnalysts call can
+// overrun past the cutoff. Sized to cover that: the per-provider analyst timeout is ≤90s
+// (models.*.timeout_sec) plus news-fetch overhead, so 3 minutes leaves a comfortable margin
+// before open even if a slow scoring call starts just before the cutoff trips.
+const optionsScanCutoffBufferMin = 3
+
 // marketOpenMinutes is the Eastern Time minute-of-day when the US equity market opens (9:30 AM ET).
 const marketOpenMinutes = 9*60 + 30
 
@@ -801,10 +813,22 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			gaps = gaps[:maxScan]
 		}
 
+		// When options-ORB is enabled its force-watched underlyings are time-critical: they
+		// must reach candidate_ready before session open (they're injected below) or their
+		// opening range is missed and the whole options session is skipped. LLM gapper scoring
+		// can run long under provider rate limits, so bound the loop to stop a safety margin
+		// before open — the forced basket is committed regardless; gapper scoring is best-effort.
+		forceWatch := len(s.optionsRouter.Underlyings()) > 0
+
 		// LLM-score each candidate
 		for _, gap := range gaps {
 			if err := ctx.Err(); err != nil {
 				return err
+			}
+			if forceWatch && optionsScoringCutoffReached(s.now(), sessionTZ, openMinutes) {
+				slog.Warn("orb: bounding LLM scoring to commit options force-watch before open",
+					"scored", len(scored), "unscored_remaining", len(gaps)-len(scored))
+				break
 			}
 			// Fetch recent news for this ticker to give the LLM catalyst context.
 			// Without news, catalyst_type/catalyst_quality are unreliable since the
