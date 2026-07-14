@@ -121,6 +121,8 @@ func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, re
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
+				slog.Error("ibkr: could not verify bracket leg IDs — context cancelled; keeping positional assignment",
+					"trade_id", tradeID, "err", lastErr)
 				return result
 			case <-time.After(500 * time.Millisecond):
 			}
