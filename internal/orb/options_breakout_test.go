@@ -9,6 +9,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // --- pure force-watch helpers -------------------------------------------------
@@ -37,6 +38,20 @@ func TestAppendForcedOptionsUnderlyings(t *testing.T) {
 		}
 	})
 
+	t.Run("organic non-trade score is force-upgraded to trade", func(t *testing.T) {
+		// SPY gaps and the LLM says "skip" — it must still be watched (configured by rule),
+		// so its action is upgraded to trade while gap%/conviction/reasoning are preserved.
+		scored := []ScoredCandidate{{Gap: data.GapCandidate{Ticker: "SPY", GapPct: 4.0}, Score: ORBAnalysisResult{Action: "skip", Conviction: 0.2, Reasoning: "no catalyst"}}}
+		got := appendForcedOptionsUnderlyings(scored, router)
+		i := indexOfTicker(got, "SPY")
+		if i < 0 || !isTradeAction(got[i].Score.Action) {
+			t.Fatalf("SPY organic skip not force-upgraded to trade: %+v", got)
+		}
+		if got[i].Score.Reasoning != "no catalyst" || got[i].Gap.GapPct != 4.0 {
+			t.Errorf("organic score fields clobbered on upgrade: %+v", got[i])
+		}
+	})
+
 	t.Run("nil router is a no-op", func(t *testing.T) {
 		var nilRouter *OptionsRouter
 		scored := []ScoredCandidate{{Gap: data.GapCandidate{Ticker: "AAPL"}}}
@@ -45,6 +60,34 @@ func TestAppendForcedOptionsUnderlyings(t *testing.T) {
 			t.Errorf("nil router should not inject anything; len = %d", len(got))
 		}
 	})
+}
+
+// TestOptionsAttemptedPersistence covers the restart-parity fix: a spent breakout attempt
+// must survive a process restart (gate aborts leave no orb_trades row, so engine_state is the
+// only record). DB-gated — skips without DATABASE_URL.
+func TestOptionsAttemptedPersistence(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping engine_state round-trip")
+	}
+	ctx := context.Background()
+	sessionID := "test-opt-attempted-" + time.Now().Format("20060102150405.000000000")
+	t.Cleanup(func() { _ = store.SetEngineState(ctx, optionsAttemptedKey(sessionID), "[]") })
+
+	// Process A spends attempts on SPY and NVDA, persists them.
+	a := breakoutScheduler(nil, nil)
+	a.optionsAttempted["SPY"] = true
+	a.optionsAttempted["NVDA"] = true
+	a.persistOptionsAttempted(ctx, sessionID)
+
+	// Process B (fresh maps, e.g. after a restart) loads the set.
+	b := breakoutScheduler(nil, nil)
+	b.loadOptionsAttempted(ctx, sessionID)
+	if !b.optionsAttempted["SPY"] || !b.optionsAttempted["NVDA"] {
+		t.Errorf("spent attempts not restored after restart: %v", b.optionsAttempted)
+	}
+	if b.optionsAttempted["IWM"] {
+		t.Error("restored an attempt that was never spent")
+	}
 }
 
 func TestEnsureForcedOptionsSelected(t *testing.T) {

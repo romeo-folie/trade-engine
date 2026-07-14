@@ -2,12 +2,14 @@ package orb
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // appendForcedOptionsUnderlyings injects the options-router underlyings into the scan
@@ -28,8 +30,15 @@ import (
 // nil router, leaving the equity/forex/futures scan path byte-identical.
 func appendForcedOptionsUnderlyings(scored []ScoredCandidate, router *OptionsRouter) []ScoredCandidate {
 	for _, u := range router.Underlyings() {
-		if containsTicker(scored, u) {
-			continue // an organic gap candidate already covers it — don't double-watch
+		if i := indexOfTicker(scored, u); i >= 0 {
+			// The gap scan already surfaced this underlying. Force it to "trade" regardless
+			// of the LLM's action: a configured options underlying is watched BY RULE, so an
+			// organic "skip"/"HOLD" score must not drop it from the selected filter below (its
+			// gap%/conviction/reasoning are left intact for display). Already-"trade" is a no-op.
+			if !isTradeAction(scored[i].Score.Action) {
+				scored[i].Score.Action = "trade"
+			}
+			continue
 		}
 		scored = append(scored, ScoredCandidate{
 			Gap:   data.GapCandidate{Ticker: u},
@@ -58,13 +67,17 @@ func ensureForcedOptionsSelected(selected, scored []ScoredCandidate, router *Opt
 	return selected
 }
 
-func containsTicker(cands []ScoredCandidate, ticker string) bool {
-	for _, sc := range cands {
+func indexOfTicker(cands []ScoredCandidate, ticker string) int {
+	for i, sc := range cands {
 		if strings.EqualFold(sc.Gap.Ticker, ticker) {
-			return true
+			return i
 		}
 	}
-	return false
+	return -1
+}
+
+func containsTicker(cands []ScoredCandidate, ticker string) bool {
+	return indexOfTicker(cands, ticker) >= 0
 }
 
 // candlesAfter returns the candles strictly after t. The breakout watch must start
@@ -124,6 +137,11 @@ func (s *ORBScheduler) optionsBreakoutEntry(ctx context.Context, sessionID, tick
 	// First breakout fired: spend the session's one entry attempt regardless of the gate
 	// outcome, so a gate/broker abort isn't re-evaluated against a later, drifted chain.
 	s.optionsAttempted[ticker] = true
+	// A gate/broker abort creates no orb_trades row, so this KV entry is the ONLY record of
+	// the spent attempt across a restart — without it, a process restart before the entry
+	// window closes would rebuild optionsAttempted empty and replay the same breakout against
+	// a later chain (placing a trade the one-attempt/backtest-parity would have skipped).
+	s.persistOptionsAttempted(ctx, sessionID)
 
 	params := buy
 	if side == "sell" {
@@ -143,4 +161,53 @@ func (s *ORBScheduler) optionsBreakoutEntry(ctx context.Context, sessionID, tick
 		})
 	}
 	return true, line
+}
+
+func optionsAttemptedKey(sessionID string) string { return "options_attempted:" + sessionID }
+
+// persistOptionsAttempted best-effort saves this session's spent-attempt set to engine_state
+// so a mid-session restart restores it (see the call site — gate aborts leave no orb_trades
+// row, so this KV entry is the only cross-restart record). The whole set is written under one
+// session-keyed value; a failure is logged but never blocks the entry (the in-memory set still
+// guards the running process). Stale keys from past sessions are harmless — keyed by session
+// ID, they are never re-read.
+func (s *ORBScheduler) persistOptionsAttempted(ctx context.Context, sessionID string) {
+	// store.SetEngineState → GetDB() PANICS on a DB-less engine start (unlike GetEngineState,
+	// it has no IsConnected guard), so gate on IsConnected here — mirroring
+	// engine.PersistReconciliation. The in-memory set still guards the running process.
+	if sessionID == "" || !store.IsConnected() {
+		return
+	}
+	spent := make([]string, 0, len(s.optionsAttempted))
+	for t := range s.optionsAttempted {
+		spent = append(spent, t)
+	}
+	b, err := json.Marshal(spent)
+	if err != nil {
+		return
+	}
+	if err := store.SetEngineState(ctx, optionsAttemptedKey(sessionID), string(b)); err != nil {
+		slog.Warn("orb options: failed to persist spent-attempt set — a restart may replay a gate-aborted breakout",
+			"session", sessionID, "err", err)
+	}
+}
+
+// loadOptionsAttempted best-effort restores the spent-attempt set on resume so a restart
+// within the entry window does not replay an already-decided breakout. No-op when the map is
+// unset or nothing was persisted.
+func (s *ORBScheduler) loadOptionsAttempted(ctx context.Context, sessionID string) {
+	if sessionID == "" || s.optionsAttempted == nil {
+		return
+	}
+	val, ok, err := store.GetEngineState(ctx, optionsAttemptedKey(sessionID))
+	if err != nil || !ok || val == "" {
+		return
+	}
+	var spent []string
+	if json.Unmarshal([]byte(val), &spent) != nil {
+		return
+	}
+	for _, t := range spent {
+		s.optionsAttempted[t] = true
+	}
 }

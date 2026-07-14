@@ -635,6 +635,9 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 			s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, rangeMinutes)
 		}
 		s.mu.Unlock()
+		// Restore the options-ORB spent-attempt set so a restart within the entry window
+		// doesn't replay an already-decided (esp. gate-aborted) breakout. Best-effort.
+		s.loadOptionsAttempted(ctx, existing.ID)
 	}
 
 	// Restore orderIDs and trackedTrades from DB on restart.
