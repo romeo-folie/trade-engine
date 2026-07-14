@@ -1266,6 +1266,7 @@ type systemConfigDTO struct {
 	} `json:"engine"`
 	Risk struct {
 		ConfidenceThreshold float64 `json:"confidence_threshold"`
+		MinRiskReward       float64 `json:"min_risk_reward"`
 		MaxPositionPct      float64 `json:"max_position_pct"`
 		MaxOpenPositions    int     `json:"max_open_positions"`
 		DailyLossLimitPct   float64 `json:"daily_loss_limit_pct"`
@@ -1308,6 +1309,7 @@ func newSystemConfigDTO(cfg *config.Config) systemConfigDTO {
 	dto.Engine.DryRun = cfg.Engine.DryRun
 	dto.Engine.InitialCapital = cfg.Engine.InitialCapital
 	dto.Risk.ConfidenceThreshold = cfg.Risk.ConfidenceThreshold
+	dto.Risk.MinRiskReward = cfg.Risk.MinRiskReward
 	dto.Risk.MaxPositionPct = cfg.Risk.MaxPositionPct
 	dto.Risk.MaxOpenPositions = cfg.Risk.MaxOpenPositions
 	dto.Risk.DailyLossLimitPct = cfg.Risk.DailyLossLimitPct
@@ -1374,6 +1376,7 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 			"initial_capital":      "engine.initial_capital",
 			"dry_run":              "engine.dry_run",
 			"confidence_threshold": "risk.confidence_threshold",
+			"min_risk_reward":      "risk.min_risk_reward",
 			"max_position_pct":     "risk.max_position_pct",
 			"max_open_positions":   "risk.max_open_positions",
 			"daily_loss_limit_pct": "risk.daily_loss_limit_pct",

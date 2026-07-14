@@ -159,6 +159,7 @@ func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
 	cfg.Engine.Mode = "paper"
 	cfg.Engine.TickIntervalSec = 1800
 	cfg.Risk.ConfidenceThreshold = 0.72
+	cfg.Risk.MinRiskReward = 1.8
 	cfg.Cost.Profile = "balanced"
 	cfg.Models.Roles.Analysts = []string{"cheap", "mid", "frontier"}
 
@@ -187,6 +188,9 @@ func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
 	risk, _ := got["risk"].(map[string]any)
 	if risk == nil || risk["confidence_threshold"] != 0.72 {
 		t.Errorf("risk.confidence_threshold = %v; want 0.72", risk["confidence_threshold"])
+	}
+	if risk == nil || risk["min_risk_reward"] != 1.8 {
+		t.Errorf("risk.min_risk_reward = %v; want 1.8", risk["min_risk_reward"])
 	}
 	cost, _ := got["cost"].(map[string]any)
 	if cost == nil || cost["profile"] != "balanced" {
