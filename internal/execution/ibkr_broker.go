@@ -110,10 +110,29 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 // Leg identity is structural and unambiguous in the live order list: the parent carries the
 // cOID we set (surfaced as order_ref), and each child carries parentId plus its orderType
 // (Limit = take-profit, Stop = stop-loss). If the legs cannot all be identified after a few
-// attempts (gateway snapshot lag), the positional result is returned with a loud error so
-// the scheduler's broker-truth exit guard remains the last line of defense.
+// attempts (gateway snapshot lag), the child IDs are DROPPED rather than returned
+// positionally: positional IDs are known-untrusted, and a mislabeled leg can book a
+// wrong-type/price exit even past the broker-truth guard once the position genuinely
+// flattens (Codex P1). Without child IDs the scheduler's order-ID exit paths stand down
+// and exit attribution falls to the trades-feed reconciler, which matches on broker fill
+// records and is guarded. The parent ID is kept as the positional best guess — the order
+// is already live at the broker, so the row must reference something cancellable, and a
+// wrong parent guess is backstopped by the broker-truth entry-fill reconciler.
 func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, result OrderResult) OrderResult {
 	if tradeID == "" {
+		return result
+	}
+	// A parent verified by order_ref on ANY attempt is trustworthy even when the
+	// children never resolve — prefer it over the positional guess in the fallbacks.
+	var verifiedParentID string
+	fallback := func(reason string, lastErr error) OrderResult {
+		if verifiedParentID != "" {
+			result.BrokerOrderID = verifiedParentID
+		}
+		slog.Error("ibkr: could not verify bracket leg IDs — dropping untrusted child IDs, exits fall back to trades-feed reconcile",
+			"trade_id", tradeID, "reason", reason, "verified_parent", verifiedParentID,
+			"children_dropped", result.ChildOrderIDs, "err", lastErr)
+		result.ChildOrderIDs = nil
 		return result
 	}
 	var lastErr error
@@ -121,9 +140,7 @@ func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, re
 		if attempt > 1 {
 			select {
 			case <-ctx.Done():
-				slog.Error("ibkr: could not verify bracket leg IDs — context cancelled; keeping positional assignment",
-					"trade_id", tradeID, "err", lastErr)
-				return result
+				return fallback("context cancelled", lastErr)
 			case <-time.After(500 * time.Millisecond):
 			}
 		}
@@ -150,6 +167,7 @@ func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, re
 			lastErr = fmt.Errorf("parent with order_ref %q not in live orders", tradeID)
 			continue
 		}
+		verifiedParentID = parentID
 		for _, o := range resp.Orders {
 			if o.ParentID.String() != parentID {
 				continue
@@ -176,9 +194,7 @@ func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, re
 		result.ChildOrderIDs = []string{tpID, slID}
 		return result
 	}
-	slog.Error("ibkr: could not verify bracket leg IDs — keeping positional assignment; exit attribution may be unreliable",
-		"trade_id", tradeID, "err", lastErr)
-	return result
+	return fallback("retries exhausted", lastErr)
 }
 
 // resolveOrderResponse handles IBKR's multi-step order confirmation flow.

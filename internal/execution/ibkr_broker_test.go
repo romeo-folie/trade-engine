@@ -239,10 +239,13 @@ func TestIBKRBracketLegIDsCorrectedFromLiveOrders(t *testing.T) {
 	}
 }
 
-// TestIBKRBracketLegVerifyUnavailableKeepsPositional confirms the fallback: when the
-// live order list cannot identify the legs (e.g. gateway snapshot lag outlasting the
-// retries), the positional assignment is kept rather than failing the placement.
-func TestIBKRBracketLegVerifyUnavailableKeepsPositional(t *testing.T) {
+// TestIBKRBracketLegVerifyUnavailableDropsChildIDs confirms the fail-closed fallback:
+// when the live order list cannot identify the legs (e.g. gateway snapshot lag
+// outlasting the retries), the positional child IDs are DROPPED — they are
+// known-untrusted, and a mislabeled leg can book a wrong-type/price exit (Codex P1).
+// The parent ID is kept as a best guess so the trade row references a cancellable
+// order; exit attribution falls back to the guarded trades-feed reconciler.
+func TestIBKRBracketLegVerifyUnavailableDropsChildIDs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/api/iserver/account/U123456/orders":
@@ -275,10 +278,57 @@ func TestIBKRBracketLegVerifyUnavailableKeepsPositional(t *testing.T) {
 		t.Fatalf("PlaceOrder error: %v", err)
 	}
 	if result.BrokerOrderID != "1" {
-		t.Errorf("BrokerOrderID = %q; want 1", result.BrokerOrderID)
+		t.Errorf("BrokerOrderID = %q; want 1 (positional parent best guess)", result.BrokerOrderID)
 	}
-	if len(result.ChildOrderIDs) != 2 || result.ChildOrderIDs[0] != "2" || result.ChildOrderIDs[1] != "3" {
-		t.Errorf("ChildOrderIDs = %v; want positional [2 3] fallback", result.ChildOrderIDs)
+	if len(result.ChildOrderIDs) != 0 {
+		t.Errorf("ChildOrderIDs = %v; want empty — untrusted positional child IDs must be dropped", result.ChildOrderIDs)
+	}
+}
+
+// TestIBKRBracketLegVerifyParentResolvedChildrenNot covers the partial-verification
+// fallback: the parent IS identified by order_ref (trustworthy) but its children never
+// propagate to the live order list. The verified parent must replace the positional
+// guess — here the placement response listed a child first — while the child IDs are
+// still dropped as untrusted.
+func TestIBKRBracketLegVerifyParentResolvedChildrenNot(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/U123456/orders":
+			w.Header().Set("Content-Type", "application/json")
+			// Rotated: a child leads the array, so the positional parent guess is wrong.
+			w.Write([]byte(`[
+				{"order_id":"801","order_status":"PreSubmitted"},
+				{"order_id":"802","order_status":"PreSubmitted"},
+				{"order_id":"800","order_status":"Submitted"}
+			]`))
+		case "/v1/api/iserver/account/orders":
+			w.Header().Set("Content-Type", "application/json")
+			// Parent present with matching order_ref; children not yet propagated.
+			w.Write([]byte(`{"orders":[{"orderId":800,"order_ref":"orb-EUR/USD-2","orderType":"Stop"}]}`))
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	result, err := b.PlaceOrder(t.Context(), OrderRequest{
+		Ticker:          "EUR/USD",
+		Side:            OrderSideBuy,
+		Type:            OrderTypeStop,
+		Quantity:        50000,
+		StopPrice:       1.10,
+		TradeID:         "orb-EUR/USD-2",
+		OrderClass:      "bracket",
+		TakeProfitPrice: 1.11,
+		StopLossPrice:   1.09,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder error: %v", err)
+	}
+	if result.BrokerOrderID != "800" {
+		t.Errorf("BrokerOrderID = %q; want 800 — the order_ref-verified parent must beat the positional guess", result.BrokerOrderID)
+	}
+	if len(result.ChildOrderIDs) != 0 {
+		t.Errorf("ChildOrderIDs = %v; want empty — unresolved children must be dropped", result.ChildOrderIDs)
 	}
 }
 
