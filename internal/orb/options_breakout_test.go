@@ -127,6 +127,36 @@ func TestCandlesAfter(t *testing.T) {
 	}
 }
 
+func TestOptionsScoringCutoffReached(t *testing.T) {
+	// Equities open = 09:30 ET (570 min); the cutoff is buffer minutes before that. Derive the
+	// boundary from the const so this stays correct if the buffer is retuned.
+	const openMin = 9*60 + 30
+	cutoffMin := openMin - optionsScanCutoffBufferMin // minutes-of-day at/after which scoring stops
+	etAt := func(minOfDay int) time.Time {
+		return time.Date(2026, 7, 14, minOfDay/60, minOfDay%60, 0, 0, nyLoc)
+	}
+	cases := []struct {
+		name string
+		now  time.Time
+		want bool
+	}{
+		{"well before open — keep scoring", etAt(9*60 + 5), false},
+		{"one minute before cutoff — keep scoring", etAt(cutoffMin - 1), false},
+		{"at the cutoff — stop", etAt(cutoffMin), true},
+		{"past open — stop", etAt(openMin + 15), true},
+	}
+	for _, c := range cases {
+		if got := optionsScoringCutoffReached(c.now, nyLoc, openMin); got != c.want {
+			t.Errorf("%s: optionsScoringCutoffReached(%s) = %v; want %v", c.name, c.now.Format("15:04"), got, c.want)
+		}
+	}
+	// A UTC instant must be compared in the session tz, not by its own clock: 09:29 ET is past
+	// any cutoff ≤ 3 min before the 09:30 open.
+	if !optionsScoringCutoffReached(time.Date(2026, 7, 14, 13, 29, 0, 0, time.UTC), nyLoc, openMin) {
+		t.Error("13:29 UTC = 09:29 ET should be past the cutoff")
+	}
+}
+
 // --- optionsBreakoutEntry (no DB touched on the no-breakout / gate-abort paths) ---
 
 // breakoutScheduler wires a scheduler for optionsBreakoutEntry unit tests: equities
