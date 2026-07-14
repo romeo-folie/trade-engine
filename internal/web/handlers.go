@@ -1171,7 +1171,19 @@ func (s *Server) handleSystemCache(w http.ResponseWriter, _ *http.Request) {
 
 // GET /api/system/status
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
-	cfg := config.Get()
+	// Same fallback order as handleSystemConfig: this endpoint is polled by the
+	// Boot screen, System screen and BottomBar, and config.Get() panics in a
+	// process where Load never succeeded (standalone `te web` with a bad file).
+	var cfg *config.Config
+	switch {
+	case config.Loaded():
+		cfg = config.Get()
+	case s.engineCfg != nil:
+		cfg = s.engineCfg
+	default:
+		http.Error(w, "engine config not loaded", http.StatusServiceUnavailable)
+		return
+	}
 	uptimeSec := int(time.Since(processStart).Seconds())
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)

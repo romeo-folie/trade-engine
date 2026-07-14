@@ -37,7 +37,10 @@ WITH analyst_recs AS (
       AND a.ensemble_results <> 'null'::jsonb
       AND jsonb_array_length(a.ensemble_results) > 0
       -- Errored analyst calls persist with an empty Response — not recommendations.
-      AND COALESCE(elem.value -> 'Response' ->> 'action', '') <> ''
+      -- Restricting to the enum's labels also keeps the ::signal_action cast from
+      -- erroring the whole view if a future writer persists ORB/scanner actions
+      -- (TRADE/SKIP/ADD) into ensemble_results.
+      AND elem.value -> 'Response' ->> 'action' IN ('BUY', 'SELL', 'HOLD', 'WAIT')
 ), outcomes AS (
     SELECT unnest(s.analysis_ids) AS analysis_id,
            t.pnl_pct
