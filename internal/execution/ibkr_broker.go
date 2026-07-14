@@ -90,7 +90,111 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: %w", err)
 	}
 
-	return b.resolveOrderResponse(ctx, rawResp)
+	result, err := b.resolveOrderResponse(ctx, rawResp)
+	if err != nil {
+		return result, err
+	}
+	if req.OrderClass == "bracket" {
+		result = b.verifyBracketLegIDs(ctx, req.TradeID, result)
+	}
+	return result, nil
+}
+
+// verifyBracketLegIDs re-derives a bracket's parent/TP/SL order IDs from the live order
+// list instead of trusting the placement response's array order. When placement goes
+// through the confirmation-prompt chain, IBKR returns the order-result array in whatever
+// order the prompts cleared — NOT [parent, TP, SL]. On 2026-07-14 a rotated array made the
+// scheduler poll the ENTRY order as its "SL"/"TP" leg, book phantom exits at the entry's own
+// fill price, and re-enter until the broker held 3× the intended XAG position.
+//
+// Leg identity is structural and unambiguous in the live order list: the parent carries the
+// cOID we set (surfaced as order_ref), and each child carries parentId plus its orderType
+// (Limit = take-profit, Stop = stop-loss). If the legs cannot all be identified after a few
+// attempts (gateway snapshot lag), the child IDs are DROPPED rather than returned
+// positionally: positional IDs are known-untrusted, and a mislabeled leg can book a
+// wrong-type/price exit even past the broker-truth guard once the position genuinely
+// flattens (Codex P1). Without child IDs the scheduler's order-ID exit paths stand down
+// and exit attribution falls to the trades-feed reconciler, which matches on broker fill
+// records and is guarded. The parent ID is kept as the positional best guess — the order
+// is already live at the broker, so the row must reference something cancellable, and a
+// wrong parent guess is backstopped by the broker-truth entry-fill reconciler.
+func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, result OrderResult) OrderResult {
+	if tradeID == "" {
+		return result
+	}
+	// A parent verified by order_ref on ANY attempt is trustworthy even when the
+	// children never resolve — prefer it over the positional guess in the fallbacks.
+	var verifiedParentID string
+	fallback := func(reason string, lastErr error) OrderResult {
+		if verifiedParentID != "" {
+			result.BrokerOrderID = verifiedParentID
+		}
+		slog.Error("ibkr: could not verify bracket leg IDs — dropping untrusted child IDs, exits fall back to trades-feed reconcile",
+			"trade_id", tradeID, "reason", reason, "verified_parent", verifiedParentID,
+			"children_dropped", result.ChildOrderIDs, "err", lastErr)
+		result.ChildOrderIDs = nil
+		return result
+	}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return fallback("context cancelled", lastErr)
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		var resp struct {
+			Orders []struct {
+				OrderID   ibkrID `json:"orderId"`
+				ParentID  ibkrID `json:"parentId"`
+				OrderRef  string `json:"order_ref"`
+				OrderType string `json:"orderType"`
+			} `json:"orders"`
+		}
+		if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &resp); err != nil {
+			lastErr = err
+			continue
+		}
+		var parentID, tpID, slID string
+		for _, o := range resp.Orders {
+			if o.OrderRef == tradeID {
+				parentID = o.OrderID.String()
+				break
+			}
+		}
+		if parentID == "" {
+			lastErr = fmt.Errorf("parent with order_ref %q not in live orders", tradeID)
+			continue
+		}
+		verifiedParentID = parentID
+		for _, o := range resp.Orders {
+			if o.ParentID.String() != parentID {
+				continue
+			}
+			switch t := strings.ToLower(o.OrderType); {
+			case t == "limit" || t == "lmt":
+				tpID = o.OrderID.String()
+			case strings.HasPrefix(t, "stop") || t == "stp":
+				slID = o.OrderID.String()
+			}
+		}
+		if tpID == "" || slID == "" {
+			lastErr = fmt.Errorf("bracket children of parent %s not fully identified (tp=%q sl=%q)", parentID, tpID, slID)
+			continue
+		}
+		if result.BrokerOrderID != parentID || len(result.ChildOrderIDs) < 2 ||
+			result.ChildOrderIDs[0] != tpID || result.ChildOrderIDs[1] != slID {
+			slog.Warn("ibkr: bracket leg IDs corrected from live orders — placement response was not [parent, TP, SL]",
+				"trade_id", tradeID,
+				"response_parent", result.BrokerOrderID, "response_children", result.ChildOrderIDs,
+				"verified_parent", parentID, "verified_tp", tpID, "verified_sl", slID)
+		}
+		result.BrokerOrderID = parentID
+		result.ChildOrderIDs = []string{tpID, slID}
+		return result
+	}
+	return fallback("retries exhausted", lastErr)
 }
 
 // resolveOrderResponse handles IBKR's multi-step order confirmation flow.

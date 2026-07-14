@@ -1735,40 +1735,7 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 	}
 
 	// Poll exit legs (TP / stop-loss) for trades whose entries have already filled.
-	if s.executor != nil {
-		for entryOrderID, tc := range s.trackedTrades {
-			if tc.entryFill == 0 || (tc.tpOrderID == "" && tc.slOrderID == "") {
-				continue // entry not yet filled, or no child IDs available
-			}
-			type exitCandidate struct {
-				orderID  string
-				exitType string
-			}
-			for _, ec := range []exitCandidate{
-				{tc.tpOrderID, "tp"},
-				{tc.slOrderID, "stop"},
-			} {
-				if ec.orderID == "" {
-					continue
-				}
-				res, err := s.executor.GetOrderStatus(ctx, ec.orderID)
-				if err != nil || res.Status != "filled" {
-					continue
-				}
-				pnl := exitPnLF(tc.side, tc.entryFill, res.FilledPrice, tc.qty, s.pointValueForTicker(tc.ticker))
-				slog.Info("orb: exit filled",
-					"ticker", tc.ticker, "side", tc.side,
-					"exit_type", ec.exitType, "exit_price", res.FilledPrice,
-					"entry_price", tc.entryFill, "pnl", pnl,
-				)
-				if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
-					slog.Error("orb: close trade failed", "ticker", tc.ticker, "err", dbErr)
-				}
-				delete(s.trackedTrades, entryOrderID)
-				break // one exit leg closes the trade
-			}
-		}
-	}
+	s.pollExitLegs(ctx)
 
 	// Trades-feed reconcile: catch any exits that the order-ID-based loop missed
 	// (e.g. when child IDs were not captured at placement due to confirmation-prompt
@@ -2155,7 +2122,12 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 	}
 
 	// Fast path: order-ID-based reconcile for trades where we captured child IDs.
-	for _, t := range trades {
+	// Guarded by broker truth like every other close path: mis-captured leg IDs can
+	// make an "exit leg" report filled (it was really the entry order) while the
+	// broker still holds the position. Guard built lazily on the first candidate.
+	var guard *exitGuard
+	for i := range trades {
+		t := &trades[i]
 		if t.Status != "filled" || (t.TpOrderID == "" && t.SlOrderID == "") {
 			continue
 		}
@@ -2174,11 +2146,22 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 			if err != nil || res.Status != "filled" {
 				continue
 			}
+			if guard == nil {
+				guard = s.newExitGuard(ctx)
+			}
+			if !guard.allows(t) {
+				slog.Warn("orb: reconcile: exit leg reports filled but broker still holds the position — deferring close to avoid a phantom",
+					"ticker", t.Ticker, "side", t.Side, "qty", t.Qty,
+					"exit_type", ec.exitType, "order_id", ec.orderID)
+				break
+			}
 			pnl := exitPnLF(t.Side, t.FillPrice, res.FilledPrice, t.Qty, s.pointValueForTicker(t.Ticker))
 			slog.Info("orb: reconcile: exit found",
 				"ticker", t.Ticker, "exit_type", ec.exitType,
 				"exit_price", res.FilledPrice, "pnl", pnl,
 			)
+			// Mark in-memory so the trades-feed fallback below doesn't re-close it.
+			t.Status = "closed"
 			if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
 				slog.Error("orb: reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
 			}
@@ -2188,8 +2171,72 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 
 	// Fallback: trades-feed reconcile catches fills where child IDs were not captured
 	// (e.g. confirmation-prompt flow dropped them) or where GetOrderStatus aged out.
-	if s.reconcileExitsFromTrades(ctx, sessionID, trades) {
+	// A fail-closed guard read in EITHER pass leaves the session unprocessed so genuine
+	// exits are retried rather than stranded.
+	ok := s.reconcileExitsFromTrades(ctx, sessionID, trades)
+	if guard != nil && guard.readFailed {
+		ok = false
+	}
+	if ok {
 		s.reconciledSessions[sessionID] = struct{}{}
+	}
+}
+
+// pollExitLegs polls the TP / stop-loss child orders of every tracked trade whose entry
+// has filled, and books the close when a leg reports filled AND broker truth confirms the
+// position actually reduced. Extracted from the tick path so the phantom-exit regression
+// (2026-07-14 XAG: rotated bracket leg IDs made the ENTRY order pass as a filled "exit")
+// is directly testable.
+func (s *ORBScheduler) pollExitLegs(ctx context.Context) {
+	if s.executor == nil {
+		return
+	}
+	// Broker-truth guard, built lazily on the first filled exit leg. Even the
+	// order-ID path can be lied to: when bracket leg IDs were captured wrong at
+	// placement (the 2026-07-14 XAG rotation), the "exit leg" being polled is the
+	// ENTRY order, which of course reports filled — while the broker still holds
+	// the full position. Never book a close the broker hasn't actually made.
+	var guard *exitGuard
+	for entryOrderID, tc := range s.trackedTrades {
+		if tc.entryFill == 0 || (tc.tpOrderID == "" && tc.slOrderID == "") {
+			continue // entry not yet filled, or no child IDs available
+		}
+		type exitCandidate struct {
+			orderID  string
+			exitType string
+		}
+		for _, ec := range []exitCandidate{
+			{tc.tpOrderID, "tp"},
+			{tc.slOrderID, "stop"},
+		} {
+			if ec.orderID == "" {
+				continue
+			}
+			res, err := s.executor.GetOrderStatus(ctx, ec.orderID)
+			if err != nil || res.Status != "filled" {
+				continue
+			}
+			if guard == nil {
+				guard = s.newExitGuard(ctx)
+			}
+			if !guard.allows(&store.ORBTrade{Ticker: tc.ticker, Side: tc.side, Qty: tc.qty}) {
+				slog.Warn("orb: exit leg reports filled but broker still holds the position — deferring close to avoid a phantom",
+					"ticker", tc.ticker, "side", tc.side, "qty", tc.qty,
+					"exit_type", ec.exitType, "order_id", ec.orderID)
+				break // keep tracking; retry next tick once broker truth confirms the reduction
+			}
+			pnl := exitPnLF(tc.side, tc.entryFill, res.FilledPrice, tc.qty, s.pointValueForTicker(tc.ticker))
+			slog.Info("orb: exit filled",
+				"ticker", tc.ticker, "side", tc.side,
+				"exit_type", ec.exitType, "exit_price", res.FilledPrice,
+				"entry_price", tc.entryFill, "pnl", pnl,
+			)
+			if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
+				slog.Error("orb: close trade failed", "ticker", tc.ticker, "err", dbErr)
+			}
+			delete(s.trackedTrades, entryOrderID)
+			break // one exit leg closes the trade
+		}
 	}
 }
 
