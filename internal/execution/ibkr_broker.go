@@ -90,7 +90,93 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: %w", err)
 	}
 
-	return b.resolveOrderResponse(ctx, rawResp)
+	result, err := b.resolveOrderResponse(ctx, rawResp)
+	if err != nil {
+		return result, err
+	}
+	if req.OrderClass == "bracket" {
+		result = b.verifyBracketLegIDs(ctx, req.TradeID, result)
+	}
+	return result, nil
+}
+
+// verifyBracketLegIDs re-derives a bracket's parent/TP/SL order IDs from the live order
+// list instead of trusting the placement response's array order. When placement goes
+// through the confirmation-prompt chain, IBKR returns the order-result array in whatever
+// order the prompts cleared — NOT [parent, TP, SL]. On 2026-07-14 a rotated array made the
+// scheduler poll the ENTRY order as its "SL"/"TP" leg, book phantom exits at the entry's own
+// fill price, and re-enter until the broker held 3× the intended XAG position.
+//
+// Leg identity is structural and unambiguous in the live order list: the parent carries the
+// cOID we set (surfaced as order_ref), and each child carries parentId plus its orderType
+// (Limit = take-profit, Stop = stop-loss). If the legs cannot all be identified after a few
+// attempts (gateway snapshot lag), the positional result is returned with a loud error so
+// the scheduler's broker-truth exit guard remains the last line of defense.
+func (b *IBKRBroker) verifyBracketLegIDs(ctx context.Context, tradeID string, result OrderResult) OrderResult {
+	if tradeID == "" {
+		return result
+	}
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-ctx.Done():
+				return result
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+		var resp struct {
+			Orders []struct {
+				OrderID   ibkrID `json:"orderId"`
+				ParentID  ibkrID `json:"parentId"`
+				OrderRef  string `json:"order_ref"`
+				OrderType string `json:"orderType"`
+			} `json:"orders"`
+		}
+		if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/orders", nil, &resp); err != nil {
+			lastErr = err
+			continue
+		}
+		var parentID, tpID, slID string
+		for _, o := range resp.Orders {
+			if o.OrderRef == tradeID {
+				parentID = o.OrderID.String()
+				break
+			}
+		}
+		if parentID == "" {
+			lastErr = fmt.Errorf("parent with order_ref %q not in live orders", tradeID)
+			continue
+		}
+		for _, o := range resp.Orders {
+			if o.ParentID.String() != parentID {
+				continue
+			}
+			switch t := strings.ToLower(o.OrderType); {
+			case t == "limit" || t == "lmt":
+				tpID = o.OrderID.String()
+			case strings.HasPrefix(t, "stop") || t == "stp":
+				slID = o.OrderID.String()
+			}
+		}
+		if tpID == "" || slID == "" {
+			lastErr = fmt.Errorf("bracket children of parent %s not fully identified (tp=%q sl=%q)", parentID, tpID, slID)
+			continue
+		}
+		if result.BrokerOrderID != parentID || len(result.ChildOrderIDs) < 2 ||
+			result.ChildOrderIDs[0] != tpID || result.ChildOrderIDs[1] != slID {
+			slog.Warn("ibkr: bracket leg IDs corrected from live orders — placement response was not [parent, TP, SL]",
+				"trade_id", tradeID,
+				"response_parent", result.BrokerOrderID, "response_children", result.ChildOrderIDs,
+				"verified_parent", parentID, "verified_tp", tpID, "verified_sl", slID)
+		}
+		result.BrokerOrderID = parentID
+		result.ChildOrderIDs = []string{tpID, slID}
+		return result
+	}
+	slog.Error("ibkr: could not verify bracket leg IDs — keeping positional assignment; exit attribution may be unreliable",
+		"trade_id", tradeID, "err", lastErr)
+	return result
 }
 
 // resolveOrderResponse handles IBKR's multi-step order confirmation flow.

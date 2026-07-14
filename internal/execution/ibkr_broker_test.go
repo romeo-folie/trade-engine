@@ -95,12 +95,21 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	var capturedBody map[string]any
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/api/iserver/account/U123456/orders" {
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/U123456/orders":
 			if err := json.NewDecoder(r.Body).Decode(&capturedBody); err != nil {
 				t.Errorf("decode request body: %v", err)
 			}
 			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`[{"order_id":"ORD002","order_status":"PreSubmitted"}]`))
+			w.Write([]byte(`[{"order_id":"1002","order_status":"PreSubmitted"}]`))
+		case "/v1/api/iserver/account/orders":
+			// Live order list used by verifyBracketLegIDs to identify legs structurally.
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"orders":[
+				{"orderId":1002,"order_ref":"trade-bracket","orderType":"Stop"},
+				{"orderId":1003,"parentId":1002,"orderType":"Limit"},
+				{"orderId":1004,"parentId":1002,"orderType":"Stop"}
+			]}`))
 		}
 	}))
 	defer srv.Close()
@@ -120,8 +129,11 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlaceOrder (bracket) error: %v", err)
 	}
-	if result.BrokerOrderID != "ORD002" {
-		t.Errorf("BrokerOrderID = %q; want ORD002", result.BrokerOrderID)
+	if result.BrokerOrderID != "1002" {
+		t.Errorf("BrokerOrderID = %q; want 1002", result.BrokerOrderID)
+	}
+	if len(result.ChildOrderIDs) != 2 || result.ChildOrderIDs[0] != "1003" || result.ChildOrderIDs[1] != "1004" {
+		t.Errorf("ChildOrderIDs = %v; want [1003 1004]", result.ChildOrderIDs)
 	}
 
 	orders, ok := capturedBody["orders"].([]any)
@@ -173,6 +185,100 @@ func TestIBKRPlaceBracketOrder(t *testing.T) {
 	}
 	if sl["side"] != "SELL" {
 		t.Errorf("sl side = %v; want SELL", sl["side"])
+	}
+}
+
+// TestIBKRBracketLegIDsCorrectedFromLiveOrders reproduces the 2026-07-14 XAG incident:
+// the placement response (via the confirmation-prompt chain) returned the bracket's
+// order IDs rotated — [TP, SL, parent] instead of [parent, TP, SL] — so the scheduler
+// polled the ENTRY order as an exit leg and booked phantom exits. The broker must
+// re-derive leg identity from the live order list (order_ref → parent, parentId +
+// orderType → children) rather than trust array position.
+func TestIBKRBracketLegIDsCorrectedFromLiveOrders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/U123456/orders":
+			w.Header().Set("Content-Type", "application/json")
+			// Rotated: TP first, then SL, then the parent entry order.
+			w.Write([]byte(`[
+				{"order_id":"918","order_status":"PreSubmitted"},
+				{"order_id":"919","order_status":"PreSubmitted"},
+				{"order_id":"917","order_status":"Submitted"}
+			]`))
+		case "/v1/api/iserver/account/orders":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"orders":[
+				{"orderId":917,"order_ref":"orb-XAG/USD-1","orderType":"Stop"},
+				{"orderId":918,"parentId":917,"orderType":"Limit"},
+				{"orderId":919,"parentId":917,"orderType":"Stop"}
+			]}`))
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	result, err := b.PlaceOrder(t.Context(), OrderRequest{
+		Ticker:          "GBP/USD",
+		Side:            OrderSideBuy,
+		Type:            OrderTypeStop,
+		Quantity:        1600,
+		StopPrice:       58.09,
+		TradeID:         "orb-XAG/USD-1",
+		OrderClass:      "bracket",
+		TakeProfitPrice: 58.61,
+		StopLossPrice:   57.83,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder error: %v", err)
+	}
+	if result.BrokerOrderID != "917" {
+		t.Errorf("BrokerOrderID = %q; want 917 (the true parent, not the first array element)", result.BrokerOrderID)
+	}
+	if len(result.ChildOrderIDs) != 2 || result.ChildOrderIDs[0] != "918" || result.ChildOrderIDs[1] != "919" {
+		t.Errorf("ChildOrderIDs = %v; want [918 919] (TP, SL identified by orderType)", result.ChildOrderIDs)
+	}
+}
+
+// TestIBKRBracketLegVerifyUnavailableKeepsPositional confirms the fallback: when the
+// live order list cannot identify the legs (e.g. gateway snapshot lag outlasting the
+// retries), the positional assignment is kept rather than failing the placement.
+func TestIBKRBracketLegVerifyUnavailableKeepsPositional(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/U123456/orders":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[
+				{"order_id":"1","order_status":"Submitted"},
+				{"order_id":"2","order_status":"PreSubmitted"},
+				{"order_id":"3","order_status":"PreSubmitted"}
+			]`))
+		case "/v1/api/iserver/account/orders":
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`{"orders":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	result, err := b.PlaceOrder(t.Context(), OrderRequest{
+		Ticker:          "GBP/USD",
+		Side:            OrderSideBuy,
+		Type:            OrderTypeStop,
+		Quantity:        1600,
+		StopPrice:       1.25,
+		TradeID:         "orb-GBP/USD-1",
+		OrderClass:      "bracket",
+		TakeProfitPrice: 1.26,
+		StopLossPrice:   1.24,
+	})
+	if err != nil {
+		t.Fatalf("PlaceOrder error: %v", err)
+	}
+	if result.BrokerOrderID != "1" {
+		t.Errorf("BrokerOrderID = %q; want 1", result.BrokerOrderID)
+	}
+	if len(result.ChildOrderIDs) != 2 || result.ChildOrderIDs[0] != "2" || result.ChildOrderIDs[1] != "3" {
+		t.Errorf("ChildOrderIDs = %v; want positional [2 3] fallback", result.ChildOrderIDs)
 	}
 }
 
@@ -248,12 +354,21 @@ func TestIBKROrderConfirmation_TwoRound(t *testing.T) {
 			w.Write([]byte(`[{"id":"REPLY-A2","message":["Order outside regular trading hours"]}]`))
 		case "/v1/api/iserver/reply/REPLY-A2":
 			round++
-			// Second confirm resolves to all three bracket order IDs.
+			// Second confirm resolves to all three bracket order IDs — in the ROTATED
+			// order the confirmation chain really produces (2026-07-14 XAG incident):
+			// [TP, SL, parent], NOT [parent, TP, SL].
 			w.Write([]byte(`[` +
-				`{"order_id":"ORD-P","order_status":"PreSubmitted"},` +
-				`{"order_id":"ORD-TP","order_status":"PreSubmitted"},` +
-				`{"order_id":"ORD-SL","order_status":"PreSubmitted"}` +
+				`{"order_id":"701","order_status":"PreSubmitted"},` +
+				`{"order_id":"702","order_status":"PreSubmitted"},` +
+				`{"order_id":"700","order_status":"Submitted"}` +
 				`]`))
+		case "/v1/api/iserver/account/orders":
+			// Structural truth: parent by order_ref, children by parentId + orderType.
+			w.Write([]byte(`{"orders":[
+				{"orderId":700,"order_ref":"trade-tworound","orderType":"Stop"},
+				{"orderId":701,"parentId":700,"orderType":"Limit"},
+				{"orderId":702,"parentId":700,"orderType":"Stop"}
+			]}`))
 		default:
 			t.Errorf("unexpected request to %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -279,17 +394,17 @@ func TestIBKROrderConfirmation_TwoRound(t *testing.T) {
 	if round != 2 {
 		t.Errorf("expected 2 confirmation rounds, got %d", round)
 	}
-	if result.BrokerOrderID != "ORD-P" {
-		t.Errorf("BrokerOrderID = %q; want ORD-P", result.BrokerOrderID)
+	if result.BrokerOrderID != "700" {
+		t.Errorf("BrokerOrderID = %q; want 700 (the true parent despite the rotated response)", result.BrokerOrderID)
 	}
 	if len(result.ChildOrderIDs) != 2 {
-		t.Errorf("ChildOrderIDs = %v; want [ORD-TP ORD-SL]", result.ChildOrderIDs)
+		t.Errorf("ChildOrderIDs = %v; want [701 702]", result.ChildOrderIDs)
 	} else {
-		if result.ChildOrderIDs[0] != "ORD-TP" {
-			t.Errorf("ChildOrderIDs[0] = %q; want ORD-TP", result.ChildOrderIDs[0])
+		if result.ChildOrderIDs[0] != "701" {
+			t.Errorf("ChildOrderIDs[0] = %q; want 701 (TP identified by orderType)", result.ChildOrderIDs[0])
 		}
-		if result.ChildOrderIDs[1] != "ORD-SL" {
-			t.Errorf("ChildOrderIDs[1] = %q; want ORD-SL", result.ChildOrderIDs[1])
+		if result.ChildOrderIDs[1] != "702" {
+			t.Errorf("ChildOrderIDs[1] = %q; want 702 (SL identified by orderType)", result.ChildOrderIDs[1])
 		}
 	}
 }
