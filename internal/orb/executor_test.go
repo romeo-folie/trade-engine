@@ -259,3 +259,40 @@ func TestComputeForexBracket_MaxNotionalUSD(t *testing.T) {
 		}
 	})
 }
+
+func TestComputeForexBracket_PointValue(t *testing.T) {
+	// Index-futures-shaped instrument mapped onto config.Instrument: range 4990-5000,
+	// buffer 5 → buy entry 5005, stop 4985, risk 20 points. With point_value 5 ($/pt per
+	// contract, e.g. MES) a contract risks $100, so 1% of 100k ($1000) sizes 10 contracts;
+	// without it the same trade would (wrongly) size 50.
+	r := &OpeningRange{Ticker: "MES", High: 5000, Low: 4990}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0} // no cap: risk sizing binds
+	inst := config.Instrument{Symbol: "MES", SecType: "FUT", MinLotSize: 1, PipBuffer: 5, PointValue: 5}
+
+	got := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+	if got.Qty != 10 {
+		t.Errorf("qty = %d; want 10 ($1000 risk / $100-per-contract risk)", got.Qty)
+	}
+
+	t.Run("margin cap measures notional in dollars (price × point_value)", func(t *testing.T) {
+		// Notional per contract = 5005 × $5/pt = $25,025; margin at 0.10 = $2,502.50.
+		// 20% of 100k = $20k margin budget → 7 contracts (risk sizing alone would give 10).
+		capped := cfg
+		capped.MaxPositionPct = 20.0
+		mInst := inst
+		mInst.MarginRate = 0.10
+		got := ComputeForexBracket(r, "buy", 100000, capped, mInst)
+		if got.Qty != 7 {
+			t.Errorf("qty = %d; want 7 ($20k margin / $2502.50 per contract)", got.Qty)
+		}
+	})
+
+	t.Run("zero point_value keeps forex sizing unchanged", func(t *testing.T) {
+		fx := inst
+		fx.PointValue = 0
+		got := ComputeForexBracket(r, "buy", 100000, cfg, fx)
+		if got.Qty != 50 {
+			t.Errorf("qty = %d; want 50 ($1000 risk / $20-per-unit risk at $1/pt)", got.Qty)
+		}
+	})
+}

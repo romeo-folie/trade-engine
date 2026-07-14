@@ -695,3 +695,125 @@ func TestReplay_PerInstrumentMaxHold(t *testing.T) {
 		t.Errorf("ExitTime = %v; want 08:45 (the instrument's 30-min max-hold, not the variant's 240)", trades[0].ExitTime)
 	}
 }
+
+// TestReplay_PointValueScalesPnLRAndCommission runs a futures-shaped instrument
+// (point_value 5, per-contract commission) through a clean long-to-TP session and checks
+// the dollar math: gross = move × qty × point_value, commission = fills × per-contract ×
+// qty, and R stays a pure risk multiple (≈ the configured 2R) regardless of point value.
+func TestReplay_PointValueScalesPnLRAndCommission(t *testing.T) {
+	// Range 4990-5000, buffer 5 → buy entry 5005 / stop 4985 / TP 5045 (2R on 20 pts).
+	bars := []data.Candle{cdl(0, 4995, 5000, 4990, 4995)}
+	for i := 1; i < 15; i++ {
+		bars = append(bars, cdl(i, 4995, 4998, 4992, 4995))
+	}
+	candles := append(bars,
+		cdl(15, 5004, 5006, 5003, 5005), // High ≥ entry 5005 → buy fills
+		cdl(16, 5005, 5046, 5004, 5045), // High ≥ TP 5045 → take profit
+	)
+
+	cfg := config.ForexORBConfig{
+		Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0,
+	}
+	inst := config.Instrument{Symbol: "MES", SecType: "FUT", MinLotSize: 1, PipBuffer: 5, PointValue: 5}
+	costs := map[string]CostModel{"MES": {Spread: 0, CommissionPerUnit: 0.85}}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, costs, 48*time.Hour)
+	trades, err := e.Run(context.Background(), Baseline(), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 {
+		t.Fatalf("trades = %d; want 1", len(trades))
+	}
+	tr := trades[0]
+	if tr.Side != "buy" || tr.ExitType != "tp" {
+		t.Fatalf("got side=%s exit=%s; want buy/tp", tr.Side, tr.ExitType)
+	}
+	// $1000 risk (1% of 100k) at 20 pts × $5/pt = $100/contract → 10 contracts.
+	if tr.Qty != 10 {
+		t.Fatalf("Qty = %d; want 10", tr.Qty)
+	}
+	// Gross: 40 favourable points × 10 contracts × $5/pt.
+	if want := 40.0 * 10 * 5; absf(tr.GrossPnL-want) > 1e-6 {
+		t.Errorf("GrossPnL = %v; want %v", tr.GrossPnL, want)
+	}
+	// Commission: entry + exit fills, $0.85 per contract per fill.
+	if want := 2 * 0.85 * 10; absf(tr.Commission-want) > 1e-6 {
+		t.Errorf("Commission = %v; want %v", tr.Commission, want)
+	}
+	// R is gross / (risk pts × point_value × qty) = 2000/(20×5×10) = 2.0 — the point
+	// value must cancel out or every futures R (and rank score) would be inflated 5×.
+	if absf(tr.R-2.0) > 1e-6 {
+		t.Errorf("R = %v; want 2.0", tr.R)
+	}
+}
+
+// TestSessionOpenAt_NewYorkET verifies the DST-aware session: 09:30 ET is 14:30 UTC in
+// winter (EST) and 13:30 UTC in summer (EDT) — the fixed-UTC "newyork" session cannot
+// represent both, which is why futures use newyork_et.
+func TestSessionOpenAt_NewYorkET(t *testing.T) {
+	winter := time.Date(2025, 1, 15, 0, 0, 0, 0, time.UTC)
+	summer := time.Date(2025, 7, 15, 0, 0, 0, 0, time.UTC)
+
+	got, ok := sessionOpenAt(winter, "newyork_et")
+	if !ok || !got.Equal(time.Date(2025, 1, 15, 14, 30, 0, 0, time.UTC)) {
+		t.Errorf("winter open = %v ok=%v; want 2025-01-15 14:30 UTC", got, ok)
+	}
+	got, ok = sessionOpenAt(summer, "newyork_et")
+	if !ok || !got.Equal(time.Date(2025, 7, 15, 13, 30, 0, 0, time.UTC)) {
+		t.Errorf("summer open = %v ok=%v; want 2025-07-15 13:30 UTC", got, ok)
+	}
+
+	// Fixed-UTC sessions are unchanged.
+	got, _ = sessionOpenAt(winter, "newyork")
+	if !got.Equal(time.Date(2025, 1, 15, 13, 30, 0, 0, time.UTC)) {
+		t.Errorf("newyork open = %v; want 13:30 UTC year-round", got)
+	}
+	if _, ok := sessionOpenAt(winter, "both"); ok {
+		t.Error("session \"both\" must be rejected")
+	}
+}
+
+// TestReplay_AdaptivePartialCommissionPerUnit pins per-fill commission accounting on the
+// adaptive partial path with a per-contract rate: each fill must be billed at its ACTUAL
+// quantity (entry 10, partial 5, runner 5 → 20 contract-sides), not fillCount × fullQty
+// (3 × 10 = 30 sides, a 50% overstatement for a 50% partial).
+func TestReplay_AdaptivePartialCommissionPerUnit(t *testing.T) {
+	// Futures-shaped: range 4990-5000, buffer 5 → buy entry 5005 / stop 4985, R = 20 pts.
+	bars := []data.Candle{cdl(0, 4995, 5000, 4990, 4995)}
+	for i := 1; i < 15; i++ {
+		bars = append(bars, cdl(i, 4995, 4998, 4992, 4995))
+	}
+	candles := append(bars,
+		cdl(15, 5004, 5006, 5003, 5005), // entry at 5005
+		cdl(16, 5005, 5026, 5004, 5025), // +1R (5025) → partial 50%
+		cdl(17, 5025, 5046, 5024, 5045), // +2R (5045) → runner TP
+	)
+	cfg := config.ForexORBConfig{
+		Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0,
+	}
+	inst := config.Instrument{
+		Symbol: "MES", SecType: "FUT", MinLotSize: 1, PipBuffer: 5, PointValue: 5,
+		PartialTakeProfitR: 1.0, PartialFraction: 0.5, RunnerTakeProfitR: 2.0,
+	}
+	costs := map[string]CostModel{"MES": {Spread: 0, CommissionPerUnit: 0.85}}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, costs, 48*time.Hour)
+	trades, err := e.Run(context.Background(), Adaptive(0), testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(trades) != 1 || trades[0].ExitType != "tp" {
+		t.Fatalf("got %+v; want one tp (runner) exit", trades)
+	}
+	tr := trades[0]
+	if tr.Qty != 10 {
+		t.Fatalf("Qty = %d; want 10", tr.Qty)
+	}
+	// entry 10 + partial 5 + runner 5 = 20 contract-sides × $0.85.
+	if want := 20 * 0.85; absf(tr.Commission-want) > 1e-6 {
+		t.Errorf("Commission = %v; want %v (per-fill quantities, not fills × full qty)", tr.Commission, want)
+	}
+	// Gross: partial 5 × 20pts + runner 5 × 40pts = 300 pts × $5/pt.
+	if want := 300.0 * 5; absf(tr.GrossPnL-want) > 1e-6 {
+		t.Errorf("GrossPnL = %v; want %v", tr.GrossPnL, want)
+	}
+}

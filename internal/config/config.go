@@ -664,6 +664,14 @@ type Instrument struct {
 	// pairs — Validate rejects this field on any non-…/USD symbol.
 	MaxNotionalUSD float64 `yaml:"max_notional_usd"`
 
+	// PointValue is the dollar value of a 1.0 price-point move per unit/contract. Forex and
+	// CFD units are $1/point (the default when <= 0), so existing instruments are unaffected.
+	// Exchange-listed futures move more than $1 per point per contract (MES $5, MNQ $2,
+	// MYM $0.50) — the backtest CLI sets this from tick_value/tick_size when mapping a
+	// FuturesInstrument onto this struct. Applied in sizeForexQty (dollar risk and notional
+	// are price × point_value) and in the orbreplay engine's P&L/R/commission math.
+	PointValue float64 `yaml:"point_value"`
+
 	// CommissionPerSide is the estimated broker commission in account currency per fill
 	// (a bracket round trip pays 2×). Set it to max(broker minimum, bps × typical notional)
 	// for this instrument's size regime. Used by the commission/risk entry gate below and,
