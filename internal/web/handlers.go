@@ -1171,7 +1171,19 @@ func (s *Server) handleSystemCache(w http.ResponseWriter, _ *http.Request) {
 
 // GET /api/system/status
 func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
-	cfg := config.Get()
+	// Same fallback order as handleSystemConfig: this endpoint is polled by the
+	// Boot screen, System screen and BottomBar, and config.Get() panics in a
+	// process where Load never succeeded (standalone `te web` with a bad file).
+	var cfg *config.Config
+	switch {
+	case config.Loaded():
+		cfg = config.Get()
+	case s.engineCfg != nil:
+		cfg = s.engineCfg
+	default:
+		http.Error(w, "engine config not loaded", http.StatusServiceUnavailable)
+		return
+	}
 	uptimeSec := int(time.Since(processStart).Seconds())
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -1236,10 +1248,113 @@ func (s *Server) handleSystemRestart(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/system/config
 // POST /api/system/config  — mutation is restricted to loopback (127.x / ::1) callers.
+// systemConfigDTO is the curated GET /api/system/config response. Two bugs made
+// the Settings page silently display frontend DEFAULTS instead of real values:
+// (1) serializing config.Config directly emits Go field names ("Engine","Risk")
+// while the frontend reads yaml-style keys ("engine","risk") — every lookup
+// missed; (2) the standalone `te web` process never called config.Load(), so
+// config.Get() panicked and the fetch failed outright. The DTO also stops the
+// endpoint from leaking the full config (provider API keys, chat IDs, account
+// IDs) to any dashboard viewer — only the fields the Settings page renders are
+// exposed.
+type systemConfigDTO struct {
+	Engine struct {
+		Mode            string  `json:"mode"`
+		TickIntervalSec int     `json:"tick_interval_sec"`
+		DryRun          bool    `json:"dry_run"`
+		InitialCapital  float64 `json:"initial_capital"`
+	} `json:"engine"`
+	Risk struct {
+		ConfidenceThreshold float64 `json:"confidence_threshold"`
+		MinRiskReward       float64 `json:"min_risk_reward"`
+		MaxPositionPct      float64 `json:"max_position_pct"`
+		MaxOpenPositions    int     `json:"max_open_positions"`
+		DailyLossLimitPct   float64 `json:"daily_loss_limit_pct"`
+		MaxDrawdownPct      float64 `json:"max_drawdown_pct"`
+		CooldownAfterLoss   int     `json:"cooldown_after_loss_min"`
+		SignalExpiryMin     int     `json:"signal_expiry_min"`
+	} `json:"risk"`
+	Strategies map[string]struct {
+		Enabled bool `json:"enabled"`
+	} `json:"strategies"`
+	Models struct {
+		Roles struct {
+			Analysts   []string `json:"analysts"`
+			Arbiter    string   `json:"arbiter"`
+			Classifier string   `json:"classifier"`
+		} `json:"roles"`
+	} `json:"models"`
+	Cost struct {
+		Profile                string `json:"profile"`
+		DailyTokenBudget       int    `json:"daily_token_budget"`
+		WeeklyTokenBudget      int    `json:"weekly_token_budget"`
+		AutoDegradeOnBudgetHit bool   `json:"auto_degrade_on_budget_hit"`
+	} `json:"cost"`
+	Notifications struct {
+		Telegram struct {
+			Enabled               bool     `json:"enabled"`
+			NotifyOn              []string `json:"notify_on"`
+			BatchEnabled          bool     `json:"batch_enabled"`
+			BatchWindowSec        int      `json:"batch_window_sec"`
+			MinConfidenceForAlert float64  `json:"min_confidence_for_alert"`
+			IncludeHolds          bool     `json:"include_holds"`
+		} `json:"telegram"`
+	} `json:"notifications"`
+}
+
+func newSystemConfigDTO(cfg *config.Config) systemConfigDTO {
+	var dto systemConfigDTO
+	dto.Engine.Mode = cfg.Engine.Mode
+	dto.Engine.TickIntervalSec = cfg.Engine.TickIntervalSec
+	dto.Engine.DryRun = cfg.Engine.DryRun
+	dto.Engine.InitialCapital = cfg.Engine.InitialCapital
+	dto.Risk.ConfidenceThreshold = cfg.Risk.ConfidenceThreshold
+	dto.Risk.MinRiskReward = cfg.Risk.MinRiskReward
+	dto.Risk.MaxPositionPct = cfg.Risk.MaxPositionPct
+	dto.Risk.MaxOpenPositions = cfg.Risk.MaxOpenPositions
+	dto.Risk.DailyLossLimitPct = cfg.Risk.DailyLossLimitPct
+	dto.Risk.MaxDrawdownPct = cfg.Risk.MaxDrawdownPct
+	dto.Risk.CooldownAfterLoss = cfg.Risk.CooldownAfterLoss
+	dto.Risk.SignalExpiryMin = cfg.Risk.SignalExpiryMin
+	dto.Strategies = map[string]struct {
+		Enabled bool `json:"enabled"`
+	}{
+		"trend_following": {cfg.Strategies.TrendFollowing.Enabled},
+		"mean_reversion":  {cfg.Strategies.MeanReversion.Enabled},
+		"momentum":        {cfg.Strategies.Momentum.Enabled},
+		"news_sentiment":  {cfg.Strategies.NewsSentiment.Enabled},
+	}
+	dto.Models.Roles.Analysts = cfg.Models.Roles.Analysts
+	dto.Models.Roles.Arbiter = cfg.Models.Roles.Arbiter
+	dto.Models.Roles.Classifier = cfg.Models.Roles.Classifier
+	dto.Cost.Profile = cfg.Cost.Profile
+	dto.Cost.DailyTokenBudget = cfg.Cost.DailyTokenBudget
+	dto.Cost.WeeklyTokenBudget = cfg.Cost.WeeklyTokenBudget
+	dto.Cost.AutoDegradeOnBudgetHit = cfg.Cost.AutoDegradeOnBudgetHit
+	tg := cfg.Notifications.Telegram
+	dto.Notifications.Telegram.Enabled = tg.Enabled
+	dto.Notifications.Telegram.NotifyOn = tg.NotifyOn
+	dto.Notifications.Telegram.BatchEnabled = tg.BatchEnabled
+	dto.Notifications.Telegram.BatchWindowSec = tg.BatchWindowSec
+	dto.Notifications.Telegram.MinConfidenceForAlert = tg.MinConfidenceForAlert
+	dto.Notifications.Telegram.IncludeHolds = tg.IncludeHolds
+	return dto
+}
+
 func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		jsonResponse(w, config.Get())
+		// Prefer the live global (reflects POST updates within this process);
+		// fall back to the config captured at server construction (`te run`),
+		// then 503 rather than panicking in a process that never loaded one.
+		switch {
+		case config.Loaded():
+			jsonResponse(w, newSystemConfigDTO(config.Get()))
+		case s.engineCfg != nil:
+			jsonResponse(w, newSystemConfigDTO(s.engineCfg))
+		default:
+			http.Error(w, "engine config not loaded", http.StatusServiceUnavailable)
+		}
 	case http.MethodPost:
 		// Only loopback callers may mutate engine config.
 		if !isLoopback(r) {
@@ -1261,6 +1376,7 @@ func (s *Server) handleSystemConfig(w http.ResponseWriter, r *http.Request) {
 			"initial_capital":      "engine.initial_capital",
 			"dry_run":              "engine.dry_run",
 			"confidence_threshold": "risk.confidence_threshold",
+			"min_risk_reward":      "risk.min_risk_reward",
 			"max_position_pct":     "risk.max_position_pct",
 			"max_open_positions":   "risk.max_open_positions",
 			"daily_loss_limit_pct": "risk.daily_loss_limit_pct",

@@ -117,6 +117,11 @@ type ModelPerformanceRow struct {
 	WinningTrades        int      `json:"WinningTrades"`
 	LosingTrades         int      `json:"LosingTrades"`
 	WinRate              *float64 `json:"WinRate"`
+	// AvgLatencyMs and TokensPerCall come from migration 046 — the System
+	// screen's table always rendered these columns but the view never
+	// produced them (they showed a permanent "—").
+	AvgLatencyMs  *float64 `json:"AvgLatencyMs"`
+	TokensPerCall *float64 `json:"TokensPerCall"`
 }
 
 // GetModelPerformance returns per-model accuracy stats (Phase 12.6).
@@ -125,7 +130,8 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 		SELECT COALESCE(provider, 'unknown'), COALESCE(model, 'unknown'),
 		       total_recommendations, avg_confidence,
 		       trade_count, avg_pnl_pct,
-		       winning_trades, losing_trades, win_rate
+		       winning_trades, losing_trades, win_rate,
+		       avg_latency_ms, tokens_per_call
 		FROM model_performance_detail
 		WHERE trade_count >= $1
 		ORDER BY win_rate DESC NULLS LAST, avg_pnl_pct DESC NULLS LAST`
@@ -138,7 +144,8 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 	for rows.Next() {
 		var r ModelPerformanceRow
 		if err := rows.Scan(&r.Provider, &r.Model, &r.TotalRecommendations, &r.AvgConfidence,
-			&r.TradeCount, &r.AvgPnLPct, &r.WinningTrades, &r.LosingTrades, &r.WinRate); err != nil {
+			&r.TradeCount, &r.AvgPnLPct, &r.WinningTrades, &r.LosingTrades, &r.WinRate,
+			&r.AvgLatencyMs, &r.TokensPerCall); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

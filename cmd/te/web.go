@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/web"
@@ -39,6 +40,12 @@ func init() {
 func runWebCmd(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Load engine config so /api/system/config reflects real values instead of
+	// 503ing. Non-fatal: the UI still loads without it.
+	if _, err := config.Load(); err != nil {
+		cmd.PrintErrf("Warning: config unavailable — settings page will show no data (%v)\n", err)
+	}
 
 	// Connect to the database (needed for REST API drill-down endpoints).
 	// Non-fatal: if DATABASE_URL is unset or unreachable, the UI still loads

@@ -1308,6 +1308,15 @@ func Get() *Config {
 	return current
 }
 
+// Loaded reports whether Load has populated the global config. Callers that can
+// run in processes which never call Load (e.g. the standalone `te web` server)
+// must check this before Get to avoid the panic.
+func Loaded() bool {
+	mu.RLock()
+	defer mu.RUnlock()
+	return current != nil
+}
+
 // SetField updates a single dotted-path key in the config YAML file.
 func SetField(dotPath, value string) error {
 	return SetFieldAny(dotPath, parseScalarString(value))

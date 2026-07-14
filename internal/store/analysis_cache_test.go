@@ -102,7 +102,10 @@ func TestAnalysisCacheExpiry(t *testing.T) {
 		AnalysisJSON: json.RawMessage(`{"action":"SELL"}`),
 		Decision:     "SELL",
 		Confidence:   0.70,
-		ExpiresAt:    time.Now().Add(-1 * time.Millisecond), // already expired
+		// Expired well in the past: the expiry check compares against the DB
+		// server's clock (NOW()), so a sub-second margin flakes on any skew
+		// between the test process and the Postgres server.
+		ExpiresAt: time.Now().Add(-1 * time.Minute),
 	}
 
 	if err := store.UpsertCachedAnalysis(ctx, entry); err != nil {
