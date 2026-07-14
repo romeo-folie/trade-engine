@@ -89,8 +89,10 @@ interface ModelPerf {
 interface TickerData {
   ticker: string;
   // Go handler always emits these keys; values are null when no data exists yet.
+  // The analysis object is a store.StoredAnalysis — its verdict field is Action
+  // (buy/sell/wait/…), NOT Direction (that's a trades-only field).
   analysis: {
-    Direction: string;
+    Action: string;
     Confidence: number;
     Reasoning?: string;
     CreatedAt?: string;
@@ -369,7 +371,7 @@ function TickerPanel({ data }: { data: TickerData }) {
         }}>
           <SectionLabel>Latest Analysis</SectionLabel>
           <div style={{ display: 'flex', gap: 12, marginTop: 8 }}>
-            <DirectionBadge direction={data.analysis.Direction} />
+            <DirectionBadge direction={data.analysis.Action} />
             <div>
               <div style={{ color: '#e2e0ff', fontSize: 11 }}>
                 Confidence: <span style={{ color: '#a855f7' }}>{(data.analysis.Confidence * 100).toFixed(0)}%</span>

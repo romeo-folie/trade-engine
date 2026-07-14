@@ -147,6 +147,111 @@ func TestConfigMasking(t *testing.T) {
 	}
 }
 
+// ─── GET /api/system/config ──────────────────────────────────────────────────
+
+// TestSystemConfigGet_ServesFrontendKeys locks the response contract the Settings
+// page depends on: yaml-style snake_case keys with real values. Serializing
+// config.Config directly emitted Go field names ("Engine","Risk"), so every
+// frontend lookup (data.engine?.mode, data.risk?.confidence_threshold, …) missed
+// and the page silently rendered its hardcoded defaults.
+func TestSystemConfigGet_ServesFrontendKeys(t *testing.T) {
+	cfg := config.Get()
+	cfg.Engine.Mode = "paper"
+	cfg.Engine.TickIntervalSec = 1800
+	cfg.Risk.ConfidenceThreshold = 0.72
+	cfg.Cost.Profile = "balanced"
+	cfg.Models.Roles.Analysts = []string{"cheap", "mid", "frontier"}
+
+	s := NewServer(Config{}, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/system/config", nil)
+	rec := httptest.NewRecorder()
+	s.handleSystemConfig(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d; want 200", rec.Code)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	engine, _ := got["engine"].(map[string]any)
+	if engine == nil {
+		t.Fatalf("response missing lowercase 'engine' key (keys: %v)", mapKeys(got))
+	}
+	if engine["mode"] != "paper" {
+		t.Errorf("engine.mode = %v; want paper", engine["mode"])
+	}
+	if engine["tick_interval_sec"] != float64(1800) {
+		t.Errorf("engine.tick_interval_sec = %v; want 1800", engine["tick_interval_sec"])
+	}
+	risk, _ := got["risk"].(map[string]any)
+	if risk == nil || risk["confidence_threshold"] != 0.72 {
+		t.Errorf("risk.confidence_threshold = %v; want 0.72", risk["confidence_threshold"])
+	}
+	cost, _ := got["cost"].(map[string]any)
+	if cost == nil || cost["profile"] != "balanced" {
+		t.Errorf("cost.profile = %v; want balanced", cost["profile"])
+	}
+	models, _ := got["models"].(map[string]any)
+	roles, _ := models["roles"].(map[string]any)
+	if roles == nil {
+		t.Fatal("response missing models.roles")
+	}
+	analysts, _ := roles["analysts"].([]any)
+	if len(analysts) != 3 || analysts[0] != "cheap" {
+		t.Errorf("models.roles.analysts = %v; want [cheap mid frontier]", analysts)
+	}
+
+	// The curated DTO must not leak config sections the Settings page doesn't
+	// render — provider registries (API key env names), markets (account IDs),
+	// database, or the telegram chat_id.
+	body := rec.Body.String()
+	for _, leak := range []string{"registry", "markets", "database", "chat_id", "api_key", "account_id"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("response leaks %q section: %s", leak, body)
+		}
+	}
+}
+
+// TestSystemConfigGet_PrefersLoadedGlobal pins the fallback order: the loaded
+// global (which reflects POST updates within the process) must win over the
+// EngineConfig captured at server construction. The remaining branch — neither
+// loaded → 503 instead of the old config.Get() panic — cannot be exercised here
+// because the package-shared global cannot be safely unloaded mid-suite.
+func TestSystemConfigGet_PrefersLoadedGlobal(t *testing.T) {
+	if !config.Loaded() {
+		t.Skip("global config unexpectedly not loaded")
+	}
+	other := *config.Get()
+	other.Engine.Mode = "from-engine-cfg"
+	s2 := NewServer(Config{EngineConfig: &other}, nil, nil)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/config", nil)
+	rec := httptest.NewRecorder()
+	s2.handleSystemConfig(rec, req)
+	var got struct {
+		Engine struct {
+			Mode string `json:"mode"`
+		} `json:"engine"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	// Global is loaded in this test binary, so it wins over EngineConfig —
+	// it reflects POST updates within the process.
+	if got.Engine.Mode == "from-engine-cfg" {
+		t.Error("engineCfg overrode the loaded global; global must be preferred")
+	}
+}
+
+func mapKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
 // ─── Portfolio Handlers (No DB) ──────────────────────────────────────────────
 
 func TestPortfolioHandlers_NoDB(t *testing.T) {
