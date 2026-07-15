@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/ibkrconids"
 )
 
 // newTestIBKRBroker creates an IBKRBroker pointed at the supplied test server URL.
@@ -366,11 +368,11 @@ func TestIBKROrderConfirmation(t *testing.T) {
 
 	b := newTestIBKRBroker(srv.URL)
 	result, err := b.PlaceOrder(t.Context(), OrderRequest{
-		Ticker:    "EUR/USD",
-		Side:      OrderSideBuy,
-		Type:      OrderTypeMarket,
-		Quantity:  100000,
-		TradeID:   "trade-confirm",
+		Ticker:   "EUR/USD",
+		Side:     OrderSideBuy,
+		Type:     OrderTypeMarket,
+		Quantity: 100000,
+		TradeID:  "trade-confirm",
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder (confirmation) error: %v", err)
@@ -781,5 +783,43 @@ func TestIBKRPositionsSnapshot_PortfolioRoute(t *testing.T) {
 	}
 	if len(snap) != 1 || snap[0].Quantity != -57 {
 		t.Fatalf("snapshot = %+v, want the -57 XAU short", snap)
+	}
+}
+
+func TestReverseConid_Futures(t *testing.T) {
+	b := newTestIBKRBroker("http://127.0.0.1:0")
+
+	// Static futures map: a front-month conid reverse-resolves to the bare symbol.
+	var mnqConid, mnqSym string
+	for key, c := range ibkrconids.FuturesConids {
+		if sym, _, ok := strings.Cut(key, "/"); ok && sym == "MNQ" {
+			mnqConid, mnqSym = c, sym
+			break
+		}
+	}
+	if mnqConid == "" {
+		t.Fatal("no MNQ entry in FuturesConids fixture")
+	}
+	if got := b.reverseConid(mnqConid); got != mnqSym {
+		t.Errorf("reverseConid(%s) = %q; want %q (static futures map)", mnqConid, got, mnqSym)
+	}
+
+	// Dynamically-cached futures ("FUT:SYMBOL") strip the prefix to the bare symbol.
+	b.conidCache["FUT:MES"] = "999999001"
+	if got := b.reverseConid("999999001"); got != "MES" {
+		t.Errorf("reverseConid(cached FUT:MES) = %q; want MES", got)
+	}
+
+	// Forex static map still resolves (unchanged).
+	for pair, c := range ibkrConids {
+		if got := b.reverseConid(c); got != pair {
+			t.Errorf("reverseConid(%s) = %q; want %q (forex)", c, got, pair)
+		}
+		break
+	}
+
+	// Unknown conid falls back to the raw string.
+	if got := b.reverseConid("000nonexistent"); got != "000nonexistent" {
+		t.Errorf("reverseConid(unknown) = %q; want raw passthrough", got)
 	}
 }

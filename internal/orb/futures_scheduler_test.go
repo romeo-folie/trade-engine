@@ -4,6 +4,8 @@ import (
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // newTestScheduler builds an ORBScheduler with no external deps — safe for unit tests.
@@ -247,5 +249,101 @@ func TestSchedulerFutures_EffectiveForexCfg_Maps(t *testing.T) {
 	if f.RangeMinutes != 30 || f.RiskReward != 1.5 || f.MaxRiskPct != 0.5 ||
 		f.ATRPeriod != 14 || f.ATRTimeframe != "1h" || f.TrendEMAPeriod != 20 {
 		t.Errorf("effectiveForexCfg mismapped in futures mode: %+v", f)
+	}
+}
+
+// TestSchedulerFutures_ExitBackstopScoping verifies the mode-agnostic helpers the exit-side
+// backstops (time exit, adaptive stops, exit guard) use, so futures trades are covered.
+func TestSchedulerFutures_ExitBackstopScoping(t *testing.T) {
+	cfg := *testFuturesCfg
+	cfg.MaxHoldMinutes = 120 // strategy-level default
+	cfg.Instruments = []config.FuturesInstrument{
+		{Symbol: "MNQ", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, MaxHoldMinutes: 240}, // per-contract override
+		{Symbol: "MES", TickSize: 0.25, TickValue: 1.25, TickBuffer: 2},                      // inherits strategy default
+	}
+	s := newTestScheduler()
+	s.SetFuturesConfig(&cfg)
+
+	// ownsInstrument: futures symbols yes, others no.
+	if !s.ownsInstrument("MNQ") || !s.ownsInstrument("MES") {
+		t.Error("ownsInstrument should be true for configured futures")
+	}
+	if s.ownsInstrument("EUR/USD") || s.ownsInstrument("AAPL") {
+		t.Error("ownsInstrument should be false for non-configured tickers")
+	}
+
+	// effectiveMaxHoldMinutes: per-contract override wins; else strategy default.
+	if got := s.effectiveMaxHoldMinutes("MNQ"); got != 240 {
+		t.Errorf("MNQ max-hold = %d; want 240 (per-contract override)", got)
+	}
+	if got := s.effectiveMaxHoldMinutes("MES"); got != 120 {
+		t.Errorf("MES max-hold = %d; want 120 (strategy default — AsForexConfig drops Instruments)", got)
+	}
+
+	// instrumentSecType: futures flatten order must carry FUT.
+	if got := s.instrumentSecType("MNQ"); got != "FUT" {
+		t.Errorf("MNQ secType = %q; want FUT", got)
+	}
+
+	// ownedPositions: keeps this scheduler's futures positions (resolved to symbols by
+	// reverseConid), drops others — so the exit guard counts them against the managed budget.
+	positions := []execution.Position{
+		{Ticker: "MNQ", Quantity: 2},
+		{Ticker: "MES", Quantity: -1},
+		{Ticker: "AAPL", Quantity: 100},    // equities scheduler's — must be dropped
+		{Ticker: "747387490", Quantity: 3}, // an UNRESOLVED conid (belt-and-suspenders) — dropped
+	}
+	owned := s.ownedPositions(positions)
+	if len(owned) != 2 {
+		t.Fatalf("ownedPositions kept %d; want 2 (MNQ, MES)", len(owned))
+	}
+	for _, p := range owned {
+		if p.Ticker != "MNQ" && p.Ticker != "MES" {
+			t.Errorf("ownedPositions kept unexpected %q", p.Ticker)
+		}
+	}
+}
+
+// TestSchedulerFutures_OwnsTradeRow_AssetClassCollision verifies the reconciler scoping
+// distinguishes an equity row from a futures row that shares a root symbol (equity ES vs
+// futures ES) — the Codex #455 collision. The tag comes from tradeAssetClass at placement.
+func TestSchedulerFutures_OwnsTradeRow_AssetClassCollision(t *testing.T) {
+	cfg := *testFuturesCfg // configures ES, NQ as futures
+	s := newTestScheduler()
+	s.SetFuturesConfig(&cfg)
+
+	if s.tradeAssetClass() != "futures" {
+		t.Errorf("tradeAssetClass in futures mode = %q; want futures", s.tradeAssetClass())
+	}
+
+	futuresES := store.ORBTrade{Ticker: "ES", AssetClass: "futures"}
+	equityES := store.ORBTrade{Ticker: "ES", AssetClass: "equity"}  // Eversource stock, same string
+	otherFut := store.ORBTrade{Ticker: "GC", AssetClass: "futures"} // not configured here
+
+	if !s.ownsTradeRow(futuresES) {
+		t.Error("futures-tagged ES must be owned")
+	}
+	if s.ownsTradeRow(equityES) {
+		t.Error("equity ES must NOT be owned by the futures scheduler (collision guard)")
+	}
+	if s.ownsTradeRow(otherFut) {
+		t.Error("GC future is not configured — must not be owned")
+	}
+
+	// ownedTradeRows filters and does not mutate the input.
+	rows := []store.ORBTrade{futuresES, equityES, otherFut}
+	owned := s.ownedTradeRows(rows)
+	if len(owned) != 1 || owned[0].Ticker != "ES" || owned[0].AssetClass != "futures" {
+		t.Errorf("ownedTradeRows = %+v; want just the futures ES", owned)
+	}
+
+	// Forex mode: tradeAssetClass empty (rows default to equity), scoping by ownsInstrument.
+	fs := newTestScheduler()
+	fs.SetForexConfig(&config.ForexORBConfig{Enabled: true, Instruments: []config.Instrument{{Symbol: "EUR/USD"}}})
+	if fs.tradeAssetClass() != "" {
+		t.Errorf("tradeAssetClass in forex mode = %q; want empty", fs.tradeAssetClass())
+	}
+	if !fs.ownsTradeRow(store.ORBTrade{Ticker: "EUR/USD", AssetClass: "equity"}) {
+		t.Error("forex EUR/USD row must be owned in forex mode")
 	}
 }

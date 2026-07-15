@@ -118,6 +118,20 @@ func (s *ORBScheduler) forexOnlyPositions(positions []execution.Position) []exec
 	return scoped
 }
 
+// ownedPositions filters broker positions to instruments this scheduler manages in its
+// active mode — forex/CFD OR futures. The mode-agnostic counterpart of forexOnlyPositions,
+// used by the exit guard so a futures position (now resolved to its symbol by reverseConid,
+// not a raw conid) is counted against the managed budget rather than silently dropped.
+func (s *ORBScheduler) ownedPositions(positions []execution.Position) []execution.Position {
+	scoped := make([]execution.Position, 0, len(positions))
+	for _, p := range positions {
+		if s.ownsInstrument(p.Ticker) {
+			scoped = append(scoped, p)
+		}
+	}
+	return scoped
+}
+
 // orphanFinding is one unmanaged broker position surfaced by the detector.
 type orphanFinding struct {
 	Ticker     string

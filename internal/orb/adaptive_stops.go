@@ -26,7 +26,7 @@ const adaptiveStopInterval = time.Minute
 // Runs for any executor that can both list working orders and replace a stop; a no-op
 // otherwise. Stops only ever ratchet toward price, never widen.
 func (s *ORBScheduler) enforceAdaptiveStops(ctx context.Context) {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil || s.marketData == nil {
+	if (!s.isForexMode() && !s.isFuturesMode()) || s.db == nil || s.marketData == nil {
 		return
 	}
 	if _, ok := s.executor.(execution.StopOrderReplacer); !ok {
@@ -45,17 +45,17 @@ func (s *ORBScheduler) enforceAdaptiveStops(ctx context.Context) {
 		slog.Warn("orb: adaptive stop: load filled trades failed", "err", err)
 		return
 	}
-	rr := s.forexCfg.RiskReward
+	rr := s.effectiveForexCfg().RiskReward
 	if rr <= 0 {
 		rr = 2.0
 	}
 	now := s.now()
 	for i := range trades {
 		t := trades[i]
-		if !s.isForexInstrument(t.Ticker) || t.FillPrice == 0 {
+		if !s.ownsInstrument(t.Ticker) || t.FillPrice == 0 {
 			continue
 		}
-		inst := s.instrumentForTicker(t.Ticker)
+		inst := s.effectiveInstrument(t.Ticker)
 		if inst == nil || (inst.BreakEvenR <= 0 && inst.TrailATRMult <= 0) {
 			continue
 		}

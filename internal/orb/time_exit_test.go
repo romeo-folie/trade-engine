@@ -86,21 +86,21 @@ func TestShouldTimeExit(t *testing.T) {
 	}
 }
 
-// ─── forexSecType ─────────────────────────────────────────────────────────────
+// ─── instrumentSecType ─────────────────────────────────────────────────────────────
 
 func TestForexSecType(t *testing.T) {
 	s := &ORBScheduler{forexCfg: &config.ForexORBConfig{Instruments: []config.Instrument{
 		{Symbol: "EUR/USD", SecType: "CASH"},
 		{Symbol: "XAU/USD", SecType: "CFD"},
 	}}}
-	if got := s.forexSecType("EUR/USD"); got != "CASH" {
-		t.Errorf("forexSecType(EUR/USD) = %q; want CASH", got)
+	if got := s.instrumentSecType("EUR/USD"); got != "CASH" {
+		t.Errorf("instrumentSecType(EUR/USD) = %q; want CASH", got)
 	}
-	if got := s.forexSecType("XAU/USD"); got != "CFD" {
-		t.Errorf("forexSecType(XAU/USD) = %q; want CFD", got)
+	if got := s.instrumentSecType("XAU/USD"); got != "CFD" {
+		t.Errorf("instrumentSecType(XAU/USD) = %q; want CFD", got)
 	}
-	if got := s.forexSecType("UNKNOWN"); got != "" {
-		t.Errorf("forexSecType(UNKNOWN) = %q; want empty", got)
+	if got := s.instrumentSecType("UNKNOWN"); got != "" {
+		t.Errorf("instrumentSecType(UNKNOWN) = %q; want empty", got)
 	}
 }
 

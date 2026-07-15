@@ -40,11 +40,14 @@ const reconcileCancelledLookback = 24 * time.Hour
 // untouched for the detection-only detector to alert on — a true orphan is
 // human territory.
 //
-// Forex/metals only and opt-in via forex_orb.reconcile_orphan_fills, because it
-// mutates real-money order/trade state from position inference.
+// This PROACTIVE mid-session pass is forex/metals-only and opt-in via
+// forex_orb.reconcile_orphan_fills, because it mutates real-money order/trade state from
+// position inference. Futures have no equivalent opt-in flag and are covered instead by the
+// always-on reconcileHeldPositionsToFilled call at session cleanup (which now handles both
+// modes) — the safety-critical path that prevents a filled futures entry being cancelled.
 func (s *ORBScheduler) reconcileOrphanFills(ctx context.Context) {
 	if s.forexCfg == nil || !s.forexCfg.Enabled || !s.forexCfg.ReconcileOrphanFills {
-		return // proactive mid-session reconcile is opt-in
+		return // proactive mid-session reconcile is opt-in (forex/metals only)
 	}
 	if time.Since(s.lastOrphanFillReconcile) < orphanFillReconcileInterval {
 		return
@@ -61,7 +64,7 @@ func (s *ORBScheduler) reconcileOrphanFills(ctx context.Context) {
 // (the July / today's XAG+XAU trap: cancelled at session end, then invisible to
 // every status='filled' reconciler because they don't read cancelled rows).
 func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil || s.executor == nil {
+	if (!s.isForexMode() && !s.isFuturesMode()) || s.db == nil || s.executor == nil {
 		return
 	}
 
@@ -70,20 +73,25 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: get positions failed", "err", err)
 		return
 	}
-	// Scope to this scheduler's forex/metals instruments — a concurrent futures
-	// scheduler on a shared broker (orb-newyork) holds positions whose conids don't
-	// reverse-resolve to symbols, so an unfiltered comparison would mis-handle them.
-	positions = s.forexOnlyPositions(positions)
+	// Scope to this scheduler's own instruments (forex/metals OR futures). This runs
+	// unconditionally at session cleanup right before the cancel loop: a filled-but-
+	// unconfirmed entry (GetOrderStatus "order not found" after the confirmation-prompt
+	// chain ages the parent order out) is recorded as filled from broker truth instead of
+	// being wrongly cancelled. Must cover futures too — they place the same brackets and hit
+	// the same not-found trap, and reverseConid now resolves their positions to symbols.
+	positions = s.ownedPositions(positions)
 	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
 	if err != nil {
 		slog.Warn("orb: fill reconcile: load filled trades failed", "err", err)
 		return
 	}
+	filled = s.ownedTradeRows(filled)
 	pending, err := store.GetOpenPendingORBTrades(ctx, s.db)
 	if err != nil {
 		slog.Warn("orb: fill reconcile: load pending trades failed", "err", err)
 		return
 	}
+	pending = s.ownedTradeRows(pending)
 	// Also consider recently-cancelled entries: the July/today's trap is a fill
 	// wrongly marked 'cancelled' at session end. When the broker still holds the
 	// position, such a row is reopened to 'filled'. Bounded to a day so a stale
@@ -93,6 +101,7 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: load cancelled trades failed", "err", err)
 		return
 	}
+	cancelled = s.ownedTradeRows(cancelled)
 	// Reuse the detector's residue math to find positions no filled row explains,
 	// then attribute each to the entry rows (pending OR wrongly-cancelled) that
 	// account for it. Match pending and cancelled candidates as SEPARATE
