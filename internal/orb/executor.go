@@ -103,6 +103,13 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		takeProfit = entryStop - risk*cfg.RiskReward
 	}
 
+	// Snap to the instrument's tick (no-op for forex/CFD, TickSize 0). Entry/stop are already
+	// exact tick multiples (buffer = tick_buffer×tick_size), but the target = risk×RiskReward
+	// need not land on a tick, and an off-tick futures price is rejected by the exchange.
+	entryStop = snapToTick(entryStop, inst.TickSize)
+	stopLoss = snapToTick(stopLoss, inst.TickSize)
+	takeProfit = snapToTick(takeProfit, inst.TickSize)
+
 	qty := sizeForexQty(entryStop, stopLoss, portfolioValue, cfg, inst)
 
 	// If qty is zero after the notional cap, the minimum lot size exceeds the
@@ -116,6 +123,17 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 		Qty:        qty,
 		SecType:    inst.SecType,
 	}
+}
+
+// snapToTick rounds a price to the nearest multiple of tickSize. tickSize <= 0 (forex/CFD)
+// returns the price unchanged, so non-futures pricing is byte-identical. Futures set
+// TickSize so a bracket's take-profit (entry + risk×RiskReward, which need not be a whole
+// tick) lands on a tradeable price the exchange won't reject.
+func snapToTick(price, tickSize float64) float64 {
+	if tickSize <= 0 {
+		return price
+	}
+	return math.Round(price/tickSize) * tickSize
 }
 
 // sizeForexQty risk-sizes a forex/CFD position from its entry and stop: qty targets
@@ -235,11 +253,11 @@ func ScaleOutBrackets(base BracketParams, inst config.Instrument) (partial, runn
 	}
 	partial = base
 	partial.Qty = pq
-	partial.TakeProfit = base.EntryStop + sign*inst.PartialTakeProfitR*R
+	partial.TakeProfit = snapToTick(base.EntryStop+sign*inst.PartialTakeProfitR*R, inst.TickSize)
 	runner = base
 	runner.Qty = rq
 	if inst.RunnerTakeProfitR > 0 {
-		runner.TakeProfit = base.EntryStop + sign*inst.RunnerTakeProfitR*R
+		runner.TakeProfit = snapToTick(base.EntryStop+sign*inst.RunnerTakeProfitR*R, inst.TickSize)
 	}
 	return partial, runner, true
 }
