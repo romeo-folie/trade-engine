@@ -31,6 +31,7 @@ var (
 	btORBMaxRangeATR float64
 	btORBProvider    string
 	btORBAssetClass  string
+	btORBDukaPaceMs  int
 )
 
 // defaultSpreads are conservative per-instrument bid/ask spreads (price units) used by
@@ -57,6 +58,7 @@ func init() {
 		c.Flags().Float64Var(&btORBMaxRangeATR, "max-range-atr", 0, "Override max range_atr_ratio for all instruments (range-filter)")
 		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda (default: config markets.backtest_provider)")
 		c.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb.instruments via free index-CFD proxy data)")
+		c.Flags().IntVar(&btORBDukaPaceMs, "duka-pace-ms", 0, "Dukascopy politeness: >0 forces 1 in-flight fetch spaced this many ms apart (overrides config). Use 3000-5000 for a throttled cold IP; the disk cache makes the fill resumable, so re-run until it completes.")
 		_ = c.MarkFlagRequired("from")
 		_ = c.MarkFlagRequired("to")
 	}
@@ -202,7 +204,7 @@ func buildBacktestUniverse(cfg *config.Config) (*backtestUniverse, error) {
 			provider: provider, sessions: []string{"london", "newyork"},
 		}
 	case "futures":
-		uni, err = buildFuturesUniverse(cfg.FuturesORB, provider)
+		uni, err = buildFuturesUniverse(cfg.FuturesORB, provider, resolveBacktestProviderName(cfg))
 		if err != nil {
 			return nil, err
 		}
@@ -224,15 +226,26 @@ func buildBacktestUniverse(cfg *config.Config) (*backtestUniverse, error) {
 
 // ── futures universe (index micros over free CFD proxy data) ─────────────────
 
-// futuresProxies maps each micro contract to the free index-CFD price series used as its
-// backtest proxy. HistData's full tick catalogue carries exactly two US index CFDs —
-// SPXUSD and NSXUSD (verified 2026-07: no Dow, no Russell) — so MYM and M2K have no
-// proxy and are skipped with a note. A cash-index level tracks the future closely enough
-// for RULE research — basis shifts the price LEVEL, not the size of a point — but fills
-// are approximate; contract-accurate research needs an exchange-data source.
-var futuresProxies = map[string]string{
-	"MES": "SPXUSD", // S&P 500
-	"MNQ": "NSXUSD", // Nasdaq 100
+// futuresProxiesByProvider maps each micro contract to the free index-CFD price series
+// used as its backtest proxy, PER DATA PROVIDER (vendors name the same index differently
+// and carry different subsets). HistData's full tick catalogue has exactly two US index
+// CFDs — SPXUSD and NSXUSD (verified 2026-07: no Dow, no Russell) — while Dukascopy
+// carries all four. A contract without a proxy on the selected provider is skipped with a
+// note. A cash-index level tracks the future closely enough for RULE research — basis
+// shifts the price LEVEL, not the size of a point — but fills are approximate;
+// contract-accurate research needs an exchange-data source. Running the same sweep on
+// both providers is also a cheap cross-vendor check against data artifacts.
+var futuresProxiesByProvider = map[string]map[string]string{
+	"histdata": {
+		"MES": "SPXUSD", // S&P 500
+		"MNQ": "NSXUSD", // Nasdaq 100
+	},
+	"dukascopy": {
+		"MES": "USA500IDXUSD",   // S&P 500
+		"MNQ": "USATECHIDXUSD",  // Nasdaq 100
+		"MYM": "USA30IDXUSD",    // Dow Jones Industrial Average
+		"M2K": "USSC2000IDXUSD", // Russell 2000
+	},
 }
 
 // Futures cost assumptions. Commission is IBKR's all-in micro E-mini rate per contract
@@ -244,9 +257,19 @@ const (
 	futuresSpreadTicks               = 2.0
 )
 
-func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketDataProvider) (*backtestUniverse, error) {
+func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketDataProvider, providerName string) (*backtestUniverse, error) {
 	if len(fcfg.Instruments) == 0 {
 		return nil, fmt.Errorf("no futures_orb instruments configured")
+	}
+	providerProxies, ok := futuresProxiesByProvider[providerName]
+	if !ok {
+		return nil, fmt.Errorf("--asset-class futures has no index-CFD proxy mapping for provider %q (use histdata or dukascopy)", providerName)
+	}
+	available := make([]string, 0, len(providerProxies))
+	for _, fi := range fcfg.Instruments {
+		if _, ok := providerProxies[fi.Symbol]; ok {
+			available = append(available, fi.Symbol)
+		}
 	}
 	filter := splitCSV(btORBInstruments)
 	want := make(map[string]bool, len(filter))
@@ -263,9 +286,10 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 			continue
 		}
 		matched[fi.Symbol] = true
-		proxy, ok := futuresProxies[fi.Symbol]
+		proxy, ok := providerProxies[fi.Symbol]
 		if !ok {
-			fmt.Printf("NOTE: skipping %s — no free index-CFD proxy series (available: MES, MNQ)\n", fi.Symbol)
+			fmt.Printf("NOTE: skipping %s — no index-CFD proxy series on %s (available: %s)\n",
+				fi.Symbol, providerName, strings.Join(available, ", "))
 			continue
 		}
 		if fi.TickSize <= 0 || fi.TickValue <= 0 {
@@ -291,7 +315,7 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 		}
 	}
 	if len(instruments) == 0 {
-		return nil, fmt.Errorf("no futures instrument has a proxy data series (have: MES, MNQ)")
+		return nil, fmt.Errorf("no futures instrument has a proxy data series on %s (available: %s)", providerName, strings.Join(available, ", "))
 	}
 
 	// Base strategy knobs come from futures_orb; ATR/trend timeframes fall back to the
@@ -326,22 +350,36 @@ func (p proxySymbolProvider) FetchCandles(ctx context.Context, ticker string, tf
 	return p.MarketDataProvider.FetchCandles(ctx, ticker, tf, from, to)
 }
 
-// buildBacktestProvider selects the ORB backtest data source. HistData is the default: free
-// bulk tick ZIPs with no account, API key, or rate limit. The --provider flag overrides config.
-func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) {
+// resolveBacktestProviderName is the effective data-source name for this run: the
+// --provider flag, else config markets.backtest_provider, else histdata.
+func resolveBacktestProviderName(cfg *config.Config) string {
 	prov := btORBProvider
 	if prov == "" {
 		prov = cfg.Markets.BacktestProvider
 	}
-	switch strings.ToLower(cmpOr(prov, "histdata")) {
+	return strings.ToLower(cmpOr(prov, "histdata"))
+}
+
+// buildBacktestProvider selects the ORB backtest data source. HistData is the default: free
+// bulk tick ZIPs with no account, API key, or rate limit. The --provider flag overrides config.
+func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) {
+	switch resolveBacktestProviderName(cfg) {
 	case "histdata":
 		return data.NewHistDataClient(cfg.Markets.HistData.BaseURL, resolveBacktestCacheDir(cfg.Markets.HistData.CacheDir, "histdata-cache"))
 	case "dukascopy":
-		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale), nil
+		opts := data.DukascopyOptions{
+			FetchConcurrency:   cfg.Markets.Dukascopy.FetchConcurrency,
+			MinRequestInterval: time.Duration(cfg.Markets.Dukascopy.MinRequestIntervalMs) * time.Millisecond,
+		}
+		if btORBDukaPaceMs > 0 { // --duka-pace-ms: the polite, resumable-fill profile, overrides config
+			opts.FetchConcurrency = 1
+			opts.MinRequestInterval = time.Duration(btORBDukaPaceMs) * time.Millisecond
+		}
+		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale, opts), nil
 	case "oanda":
 		return buildOANDAProvider(cfg.Markets.OANDA)
 	default:
-		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|oanda)", prov)
+		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|oanda)", resolveBacktestProviderName(cfg))
 	}
 }
 

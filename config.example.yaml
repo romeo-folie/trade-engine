@@ -206,7 +206,9 @@ markets:
   dukascopy:
     base_url: ""                 # optional feed override (default datafeed.dukascopy.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/dukascopy)
-    point_scale: {}              # per-symbol price scale overrides, e.g. {"XAU/USD": 1000}
+    point_scale: {}              # per-symbol price scale overrides, e.g. {"XAU/USD": 1000}. Index CFDs (…IDXUSD) default ÷1000.
+    fetch_concurrency: 0         # in-flight hour fetches (0 = default 6); lower to 1 if a cold cache-fill run drowns in 503s
+    min_request_interval_ms: 0   # global spacing between request starts (0 = none); 3000-5000 + fetch_concurrency 1 for a throttled cold IP. Only taxes the first fill — cached hours never re-fetch.
 
   news:
     provider: finnhub             # finnhub | benzinga

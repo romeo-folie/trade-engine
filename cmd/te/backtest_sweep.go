@@ -34,6 +34,7 @@ func init() {
 	orbSweepCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	orbSweepCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda")
 	orbSweepCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb.instruments via free index-CFD proxy data)")
+	orbSweepCmd.Flags().IntVar(&btORBDukaPaceMs, "duka-pace-ms", 0, "Dukascopy politeness: >0 forces 1 in-flight fetch spaced this many ms apart (overrides config). Warm the cache first (resumable) with a paced single-variant backtest, then sweep off disk.")
 	orbSweepCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
 	orbSweepCmd.Flags().StringVar(&btSweepMode, "mode", "coarse", "Sweep mode: coarse | validate")
 	orbSweepCmd.Flags().IntVar(&btSweepConcurrency, "concurrency", 8, "Parameter sets to evaluate in parallel")

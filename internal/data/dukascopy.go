@@ -49,11 +49,17 @@ const dukaTickBytes = 20
 // Only FetchCandles is meaningful: the historical feed has no live quote, so FetchQuote and
 // FetchHistory return errors. This is a BACKTEST data source, not a live feed.
 type DukascopyClient struct {
-	baseURL    string
-	cacheDir   string             // on-disk cache root ("" disables); see readDiskCache/writeDiskCache
+	baseURL     string
+	cacheDir    string             // on-disk cache root ("" disables); see readDiskCache/writeDiskCache
 	pointScale  map[string]float64 // ticker → price divisor override (see priceDivisor)
 	httpClient  *http.Client
 	maxAttempts int // per-request try budget (default dukascopyMaxAttempts; lowered in tests)
+
+	concurrency int           // in-flight hour-fetch bound (default dukascopyConcurrency)
+	minInterval time.Duration // global spacing between request STARTS (0 = none); see waitTurn
+
+	paceMu        sync.Mutex
+	nextRequestAt time.Time // earliest time the next request may start (under paceMu)
 
 	mu    sync.Mutex
 	cache map[string][]dukaTick // hour key → parsed ticks (an empty slice is cached for a no-data hour)
@@ -94,12 +100,29 @@ var errDukaTransient = errors.New("dukascopy: transient fetch failure (retries e
 // but a high failure count means the feed is genuinely unstable and the results untrustworthy.
 const dukascopyMaxFetchFailures = 25
 
+// DukascopyOptions tunes the client's politeness against the free feed's (varying) burst
+// tolerance. Zero values keep the historical defaults, so existing callers are unchanged.
+type DukascopyOptions struct {
+	FetchConcurrency   int           // in-flight hour fetches (0 → 6)
+	MinRequestInterval time.Duration // global spacing between request starts (0 → none)
+}
+
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
 // public feed when empty. cacheDir, when non-empty, enables the on-disk cache (each hour is
 // fetched from the feed at most once, ever). pointScale optionally overrides the divisor.
-func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64) *DukascopyClient {
+// An optional DukascopyOptions tunes fetch pacing — the 2026 feed throttles cold-IP bursts
+// to roughly one request per 3-5s, which the default concurrency-6/no-spacing profile
+// drowns in 503s; concurrency 1 + 3-5s spacing fills a cache slowly but reliably.
+func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64, opts ...DukascopyOptions) *DukascopyClient {
 	if baseURL == "" {
 		baseURL = DukascopyBaseURL
+	}
+	var opt DukascopyOptions
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
+	if opt.FetchConcurrency <= 0 {
+		opt.FetchConcurrency = dukascopyConcurrency
 	}
 	return &DukascopyClient{
 		baseURL:    strings.TrimRight(baseURL, "/"),
@@ -109,10 +132,37 @@ func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64)
 		// timeout × retries makes one hour take minutes and the run appear stuck. Fail fast.
 		httpClient:    &http.Client{Timeout: 20 * time.Second},
 		maxAttempts:   dukascopyMaxAttempts,
+		concurrency:   opt.FetchConcurrency,
+		minInterval:   opt.MinRequestInterval,
 		cache:         make(map[string][]dukaTick),
 		hoursFetched:  make(map[string]int),
 		hoursWithData: make(map[string]int),
 	}
+}
+
+// waitTurn enforces the global minimum spacing between request starts across all workers.
+// Returns false if the context is cancelled while waiting. Each caller reserves the next
+// slot under paceMu, so N concurrent workers still start requests minInterval apart.
+func (c *DukascopyClient) waitTurn(ctx context.Context) bool {
+	if c.minInterval <= 0 {
+		return true
+	}
+	c.paceMu.Lock()
+	now := time.Now()
+	start := c.nextRequestAt
+	if start.Before(now) {
+		start = now
+	}
+	c.nextRequestAt = start.Add(c.minInterval)
+	c.paceMu.Unlock()
+	if wait := time.Until(start); wait > 0 {
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return false
+		}
+	}
+	return true
 }
 
 // dukaTick is one parsed tick: absolute UTC time, mid price, and combined volume.
@@ -136,9 +186,12 @@ func dukascopyHourPath(inst string, hour time.Time) string {
 }
 
 // priceDivisor returns the integer→price divisor for a ticker. Dukascopy stores prices as
-// scaled integers: 5-decimal FX ÷1e5, JPY pairs and metals (XAU/XAG) ÷1e3. A per-ticker
-// config override (markets.dukascopy.point_scale) wins — set it if a metal's scaling differs
-// (metals scaling is the one worth spot-checking against a known bar).
+// scaled integers: 5-decimal FX ÷1e5; JPY pairs, metals (XAU/XAG) and index CFDs
+// (…IDXUSD: USA30IDXUSD, USA500IDXUSD, USATECHIDXUSD, USSC2000IDXUSD, …) ÷1e3. The index
+// scaling was verified empirically against 2024-03-14 ticks: USA30IDXUSD raw 38897625 ÷1e3
+// = 38,897.6 (Dow) and USSC2000IDXUSD raw 2038126 ÷1e3 = 2,038.1 (Russell 2000), both
+// matching that day's levels. A per-ticker config override (markets.dukascopy.point_scale)
+// wins — set it if a symbol's scaling differs from these rules.
 func (c *DukascopyClient) priceDivisor(ticker string) float64 {
 	if c.pointScale != nil {
 		if d, ok := c.pointScale[ticker]; ok && d > 0 {
@@ -146,7 +199,7 @@ func (c *DukascopyClient) priceDivisor(ticker string) float64 {
 		}
 	}
 	u := dukascopyInstrument(ticker)
-	if strings.Contains(u, "JPY") || strings.HasPrefix(u, "XAU") || strings.HasPrefix(u, "XAG") {
+	if strings.Contains(u, "JPY") || strings.HasPrefix(u, "XAU") || strings.HasPrefix(u, "XAG") || strings.HasSuffix(u, "IDXUSD") {
 		return 1000
 	}
 	return 100000
@@ -185,7 +238,11 @@ func (c *DukascopyClient) FetchCandles(ctx context.Context, ticker string, tf Ti
 	defer cancel()
 
 	perHour := make([][]dukaTick, len(hours))
-	sem := make(chan struct{}, dukascopyConcurrency)
+	concurrency := c.concurrency
+	if concurrency <= 0 { // struct-literal construction (tests) leaves it unset
+		concurrency = dukascopyConcurrency
+	}
+	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var firstErr error
 	var errOnce sync.Once
@@ -377,6 +434,9 @@ func (c *DukascopyClient) getBI5(ctx context.Context, u string) (body []byte, fo
 		req, reqErr := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if reqErr != nil {
 			return nil, false, reqErr
+		}
+		if !c.waitTurn(ctx) { // global politeness spacing (no-op unless configured)
+			return nil, false, ctx.Err()
 		}
 		resp, doErr := c.httpClient.Do(req)
 		if doErr != nil {
