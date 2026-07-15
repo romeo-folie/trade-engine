@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 
@@ -226,5 +227,78 @@ func TestDirectionDecision_Latched(t *testing.T) {
 	long2, short2 := s.directionDecision(context.Background(), "EUR/USD")
 	if long2 != long1 || short2 != short1 {
 		t.Errorf("decision drifted after the market flipped: was (%v,%v), now (%v,%v) — must be latched", long1, short1, long2, short2)
+	}
+}
+
+func TestRetestEntry(t *testing.T) {
+	// Range 1.1000-1.1010, buffer 0.0002 → buy trigger 1.1012. rangeWidth 0.0010, tol 0.00025.
+	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000,
+		DefinedAt: time.Date(2026, 4, 13, 8, 14, 0, 0, time.UTC)}
+	buy := BracketParams{Side: "buy", EntryStop: 1.1012, StopLoss: 1.0998, Qty: 5000}
+	sell := BracketParams{Side: "sell", EntryStop: 1.0998, StopLoss: 1.1012, Qty: 5000}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 1, PipBuffer: 0.0002, BreakoutConfirmation: "retest_range"}
+	now := func() time.Time { return time.Date(2026, 4, 13, 8, 30, 0, 0, time.UTC) }
+
+	// breakout (close ≥ 1.1012) → pullback (low within tol, close inside not breached) → bounce
+	// (high ≥ retestHigh+buffer = 1.1014+0.0002 = 1.1016). Entry at 1.1016.
+	bounce := []data.Candle{
+		confBar(15, 1.1011, 1.1015, 1.1010, 1.1014), // breakout
+		confBar(16, 1.1014, 1.1014, 1.1013, 1.1013), // pullback: low 1.1013 ≤ 1.10145, retestHigh 1.1014
+		confBar(17, 1.1013, 1.1017, 1.1013, 1.1016), // bounce: high 1.1017 ≥ 1.1016
+	}
+
+	t.Run("bounce triggers a retest_range buy at the bounce level", func(t *testing.T) {
+		s := &ORBScheduler{marketData: &qMarketData{candles: bounce}, now: now}
+		rb, side, ok := s.retestEntry(context.Background(), "EUR/USD", r, buy, sell, cfg, inst, 100000)
+		if !ok || side != "buy" {
+			t.Fatalf("retestEntry ok=%v side=%q; want true/buy", ok, side)
+		}
+		if math.Abs(rb.EntryStop-1.1016) > 1e-9 {
+			t.Errorf("entry = %.5f; want 1.1016 (retest bounce level)", rb.EntryStop)
+		}
+		if math.Abs(rb.StopLoss-1.0998) > 1e-9 { // retest_range → range-opposite stop
+			t.Errorf("stop = %.5f; want 1.0998 (range stop)", rb.StopLoss)
+		}
+		// target = entry + risk×RR = 1.1016 + 0.0018×2 = 1.1052.
+		if math.Abs(rb.TakeProfit-1.1052) > 1e-9 {
+			t.Errorf("target = %.5f; want 1.1052", rb.TakeProfit)
+		}
+	})
+
+	t.Run("no bounce yet → not entered", func(t *testing.T) {
+		s := &ORBScheduler{marketData: &qMarketData{candles: bounce[:2]}, now: now} // breakout+pullback, no bounce
+		if _, _, ok := s.retestEntry(context.Background(), "EUR/USD", r, buy, sell, cfg, inst, 100000); ok {
+			t.Error("retestEntry ok=true; want false (bounce not yet printed)")
+		}
+	})
+
+	t.Run("nil market data → not entered (never fail-open)", func(t *testing.T) {
+		s := &ORBScheduler{now: now}
+		if _, _, ok := s.retestEntry(context.Background(), "EUR/USD", r, buy, sell, cfg, inst, 100000); ok {
+			t.Error("retestEntry ok=true with no data; want false")
+		}
+	})
+}
+
+func TestComputeRetestBracket_SnapsFuturesTick(t *testing.T) {
+	// Futures inst: entry/stop/target must land on the 0.25 tick.
+	inst := config.Instrument{Symbol: "MNQ", SecType: "FUT", MinLotSize: 1, PipBuffer: 0.5, PointValue: 2, TickSize: 0.25}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0}
+	// Off-tick entry 5004.9 and stop 4984.1 (as a candle extreme ± buffer could produce).
+	rb := ComputeRetestBracket("MNQ", "buy", 5004.9, 4984.1, 100000, cfg, inst)
+	for _, p := range []float64{rb.EntryStop, rb.StopLoss, rb.TakeProfit} {
+		if rem := math.Abs(p/0.25 - math.Round(p/0.25)); rem > 1e-6 {
+			t.Errorf("price %.4f not a 0.25-tick multiple", p)
+		}
+	}
+	// Target must be RR × the SUBMITTED (snapped) stop distance, not the raw one: entry
+	// 5004.9→5005.00, stop 4984.1→4984.00 → risk 21.00 → target 5005 + 21×2 = 5047.00
+	// (NOT 5046.50 from the unsnapped risk of 20.80).
+	if math.Abs(rb.EntryStop-5005.0) > 1e-6 || math.Abs(rb.StopLoss-4984.0) > 1e-6 {
+		t.Fatalf("snapped entry/stop = %.2f/%.2f; want 5005.00/4984.00", rb.EntryStop, rb.StopLoss)
+	}
+	if math.Abs(rb.TakeProfit-5047.0) > 1e-6 {
+		t.Errorf("target = %.2f; want 5047.00 (RR × submitted stop distance)", rb.TakeProfit)
 	}
 }

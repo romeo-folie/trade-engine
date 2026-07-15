@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
 
@@ -123,6 +124,61 @@ func (s *ORBScheduler) confirmedSide(ctx context.Context, ticker string, r *Open
 		return ""
 	}
 	return side
+}
+
+// retestEntry replays the 1-minute candles since the opening range locked and, if a retest
+// bounce has triggered, returns the retest MARKET bracket (entry at the bounce, stop at the
+// retest swing or the range-opposite level per mode, RR target, re-sized qty) and its side.
+// ok=false when no retest has triggered yet — the caller retries next tick. Like confirmedSide
+// this does NOT fail open: no candles or no bounce means no entry, the safe direction for an
+// entry gate. Only called for retest_* modes. cfg/inst are the effective (mode-mapped) config.
+func (s *ORBScheduler) retestEntry(ctx context.Context, ticker string, r *OpeningRange, buy, sell BracketParams, cfg config.ForexORBConfig, inst config.Instrument, portfolioValue float64) (BracketParams, string, bool) {
+	if s.marketData == nil || r == nil {
+		return BracketParams{}, "", false
+	}
+	candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, r.DefinedAt, s.now())
+	if err != nil {
+		slog.Warn("orb: retest: fetch candles failed — not entering this tick", "ticker", ticker, "err", err)
+		return BracketParams{}, "", false
+	}
+	// A zeroed side (direction eligibility / commission) is not a candidate: disable its trigger.
+	buyTrig, sellTrig := buy.EntryStop, sell.EntryStop
+	if buy.Qty == 0 {
+		buyTrig = 0
+	}
+	if sell.Qty == 0 {
+		sellTrig = 0
+	}
+	tol := inst.RetestTolerance
+	if tol <= 0 {
+		tol = 0.25
+	}
+	timeoutBars := inst.RetestTimeoutMinutes
+	if timeoutBars <= 0 {
+		timeoutBars = 30
+	}
+	res := DetectRetest(candles, buyTrig, sellTrig, r.High, r.Low, inst.PipBuffer, tol, timeoutBars)
+	if !res.OK {
+		return BracketParams{}, "", false
+	}
+	// Stop placement: retest_swing → just beyond the retest swing (tighter); retest_range →
+	// the opposite side of the opening range (the range bracket's stop). Mirrors the backtest.
+	var stopLevel float64
+	if inst.BreakoutConfirmation == ConfirmRetestSwing {
+		if res.Side == "buy" {
+			stopLevel = res.SwingLow - inst.PipBuffer
+		} else {
+			stopLevel = res.SwingHigh + inst.PipBuffer
+		}
+	} else { // retest_range
+		if res.Side == "buy" {
+			stopLevel = buy.StopLoss
+		} else {
+			stopLevel = sell.StopLoss
+		}
+	}
+	rb := ComputeRetestBracket(ticker, res.Side, res.EntryPrice, stopLevel, portfolioValue, cfg, inst)
+	return rb, res.Side, true
 }
 
 // withinEntryWindow reports whether the current time is before the session cleanup cutoff

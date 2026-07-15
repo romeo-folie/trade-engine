@@ -1528,6 +1528,14 @@ func SetFieldAny(dotPath string, value any) error {
 }
 
 // Validate checks the loaded config for common errors.
+// validBreakoutConfirmation is the set of accepted ORB breakout_confirmation modes. All are
+// live-wired: stop_touch (resting stop), close_1m/close_3m (N closes beyond), retest_swing/
+// retest_range (pull back to the level and bounce). "" defaults to stop_touch.
+var validBreakoutConfirmation = map[string]bool{
+	"": true, "stop_touch": true, "close_1m": true, "close_3m": true,
+	"retest_swing": true, "retest_range": true,
+}
+
 func Validate(cfg *Config) []string {
 	var errs []string
 
@@ -1747,16 +1755,13 @@ func Validate(cfg *Config) []string {
 	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
 	// wick-touch entries Phase 3 is meant to filter.
 	if cfg.ForexORB.Enabled {
-		// retest_swing/retest_range are BACKTEST-ONLY: the live scheduler has no retest path (it
-		// only diverges from stop-touch when RequiresConfirmation is true, i.e. the close_* modes),
-		// so a live config with a retest mode would silently place stop-touch brackets. Reject it
-		// here so a live `te run` / `config validate` fails loud instead of misbehaving; the sweep
-		// sets retest modes programmatically and never goes through Validate.
-		validConfirm := map[string]bool{"": true, "stop_touch": true, "close_1m": true, "close_3m": true}
+		// Reject an unknown breakout_confirmation so a typo (e.g. "close_3") fails loud instead
+		// of silently disabling the confirmation gate. All five modes are now live-wired
+		// (retest_swing/retest_range entered the live path alongside stop_touch/close_*).
 		for _, inst := range cfg.ForexORB.Instruments {
-			if !validConfirm[inst.BreakoutConfirmation] {
+			if !validBreakoutConfirmation[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m (retest_swing/retest_range are backtest-only)",
+					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
 					inst.Symbol, inst.BreakoutConfirmation))
 			}
 			// Close-position guard: the threshold is compared against CloseFrac, which is
@@ -1813,6 +1818,20 @@ func Validate(cfg *Config) []string {
 						"forex_orb instrument %q: partial_take_profit_r %.2f must be less than the runner target %.2f",
 						inst.Symbol, inst.PartialTakeProfitR, runnerR))
 				}
+			}
+		}
+	}
+
+	// Futures ORB per-instrument breakout_confirmation — same modes as forex, all live-wired.
+	for _, cfgFut := range []FuturesORBConfig{cfg.FuturesORB, cfg.FuturesORBMetals} {
+		if !cfgFut.Enabled {
+			continue
+		}
+		for _, inst := range cfgFut.Instruments {
+			if !validBreakoutConfirmation[inst.BreakoutConfirmation] {
+				errs = append(errs, fmt.Sprintf(
+					"futures_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
+					inst.Symbol, inst.BreakoutConfirmation))
 			}
 		}
 	}

@@ -676,12 +676,38 @@ func TestValidateForexBreakoutConfirmation(t *testing.T) {
 		t.Errorf("expected a validation error for the invalid breakout_confirmation; got %v", errs)
 	}
 
-	// A valid set produces no confirmation error.
-	cfg.ForexORB.Instruments[1].BreakoutConfirmation = "stop_touch"
-	for _, e := range Validate(cfg) {
-		if strings.Contains(e, "breakout_confirmation") {
-			t.Errorf("unexpected breakout_confirmation error for valid config: %s", e)
+	// A valid set produces no confirmation error — including retest modes, now live-wired.
+	for _, mode := range []string{"stop_touch", "close_1m", "close_3m", "retest_swing", "retest_range", ""} {
+		cfg.ForexORB.Instruments = []Instrument{{Symbol: "EUR/USD", BreakoutConfirmation: mode}}
+		for _, e := range Validate(cfg) {
+			if strings.Contains(e, "breakout_confirmation") {
+				t.Errorf("mode %q wrongly rejected: %s", mode, e)
+			}
 		}
+	}
+}
+
+func TestValidateFuturesBreakoutConfirmation(t *testing.T) {
+	cfg := Defaults()
+	cfg.FuturesORB.Enabled = true
+	cfg.FuturesORB.Instruments = []FuturesInstrument{
+		{Symbol: "MNQ", BreakoutConfirmation: "retest_range"}, // valid, live-wired
+		{Symbol: "MES", BreakoutConfirmation: "close_9m"},     // typo → must error
+	}
+	var mnqErr, mesErr bool
+	for _, e := range Validate(cfg) {
+		if strings.Contains(e, "breakout_confirmation") && strings.Contains(e, "MNQ") {
+			mnqErr = true
+		}
+		if strings.Contains(e, "breakout_confirmation") && strings.Contains(e, "MES") {
+			mesErr = true
+		}
+	}
+	if mnqErr {
+		t.Error("MNQ retest_range wrongly rejected (it is live-wired)")
+	}
+	if !mesErr {
+		t.Error("MES close_9m typo should be rejected")
 	}
 }
 
