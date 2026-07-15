@@ -18,14 +18,15 @@ import (
 // At a price exactly on the EMA both sides are eligible (a flat trend gives no edge to
 // either), preserving the dual-sided default rather than dropping the session.
 func (s *ORBScheduler) directionEligibility(ctx context.Context, ticker string) (longOK, shortOK, ok bool) {
-	if s.marketData == nil || s.forexCfg == nil {
+	if s.marketData == nil || (!s.isForexMode() && !s.isFuturesMode()) {
 		return false, false, false
 	}
-	period := s.forexCfg.TrendEMAPeriod
+	cfg := s.effectiveForexCfg() // forex config, or the futures config mapped onto it
+	period := cfg.TrendEMAPeriod
 	if period <= 0 {
 		period = 20
 	}
-	tf := data.Timeframe(s.forexCfg.TrendTimeframe)
+	tf := data.Timeframe(cfg.TrendTimeframe)
 	if tf == "" {
 		tf = data.Timeframe1Hour
 	}

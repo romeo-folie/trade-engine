@@ -67,14 +67,15 @@ func CloseFractionEligibility(r *OpeningRange, inst config.Instrument) (buyOK, s
 // instrumentATR fetches a thin lookback of the configured ATR timeframe and returns the
 // ATR, or 0 when market data is unavailable or too shallow (ComputeATR's own convention).
 func (s *ORBScheduler) instrumentATR(ctx context.Context, ticker string) float64 {
-	if s.marketData == nil || s.forexCfg == nil {
+	if s.marketData == nil || (!s.isForexMode() && !s.isFuturesMode()) {
 		return 0
 	}
-	period := s.forexCfg.ATRPeriod
+	cfg := s.effectiveForexCfg() // forex config, or the futures config mapped onto it
+	period := cfg.ATRPeriod
 	if period <= 0 {
 		period = 14
 	}
-	tf := data.Timeframe(s.forexCfg.ATRTimeframe)
+	tf := data.Timeframe(cfg.ATRTimeframe)
 	if tf == "" {
 		tf = data.Timeframe1Hour
 	}

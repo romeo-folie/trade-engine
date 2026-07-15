@@ -606,7 +606,11 @@ futures_orb:
       min_range_atr: 0.0           # range-quality band (0 = that bound off)
       max_range_atr: 0.0
       max_spread_to_risk: 0.0      # skip if spread / |entry−stop| exceeds this (0 = off)
-      breakout_confirmation: retest_range  # "" | stop_touch | close_1m | close_3m | retest_swing | retest_range
+      # "" | stop_touch | close_1m | close_3m are live now; retest_swing / retest_range are
+      # backtest-only until the live retest path lands (the scheduler skips a retest-configured
+      # instrument until then). retest_range is the strongest walk-forward MNQ config — the
+      # upgrade target once retest goes live.
+      breakout_confirmation: close_3m
       retest_tolerance: 0.25       # retest_* only: pullback within this fraction of range width
       retest_timeout_minutes: 30   # retest_* only: bounce must occur within N minutes of breakout
       direction_eligibility: false # true = trade only the trend-aligned side

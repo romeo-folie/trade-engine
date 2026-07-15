@@ -17,11 +17,11 @@ func newTestScheduler() *ORBScheduler {
 }
 
 var testFuturesCfg = &config.FuturesORBConfig{
-	Enabled:       true,
-	SessionOpenET: "09:30",
-	RangeMinutes:  15,
-	RiskReward:    2.0,
-	MaxRiskPct:    1.0,
+	Enabled:        true,
+	SessionOpenET:  "09:30",
+	RangeMinutes:   15,
+	RiskReward:     2.0,
+	MaxRiskPct:     1.0,
 	MaxPositionPct: 20.0,
 	Instruments: []config.FuturesInstrument{
 		{Symbol: "ES", Exchange: "CME", AssetClass: "equity_index", ExpiryCycle: "quarterly", TickSize: 0.25, TickValue: 12.50, TickBuffer: 2},
@@ -198,5 +198,54 @@ func TestSchedulerFuturesMode_DisabledConfig_NotFuturesMode(t *testing.T) {
 	s.SetFuturesConfig(disabled)
 	if s.isFuturesMode() {
 		t.Error("Enabled=false should not activate futures mode")
+	}
+}
+
+// TestSchedulerFutures_EffectiveInstrument_Maps verifies futures resolve to a forex-shaped
+// Instrument (so they route through the dual-sided/gated path) with derived buffer/point
+// value and strategy fields carried across.
+func TestSchedulerFutures_EffectiveInstrument_Maps(t *testing.T) {
+	cfg := *testFuturesCfg
+	cfg.Instruments = []config.FuturesInstrument{
+		{Symbol: "MNQ", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, MarginRate: 0.10,
+			BreakoutConfirmation: "close_3m", MaxHoldMinutes: 240, DirectionEligibility: true},
+	}
+	s := newTestScheduler()
+	s.SetFuturesConfig(&cfg)
+
+	inst := s.effectiveInstrument("MNQ")
+	if inst == nil {
+		t.Fatal("effectiveInstrument(MNQ) = nil; want mapped instrument")
+	}
+	if inst.SecType != "FUT" || inst.PipBuffer != 0.5 || inst.PointValue != 2.0 || inst.TickSize != 0.25 {
+		t.Errorf("mapping wrong: SecType=%q PipBuffer=%v PointValue=%v TickSize=%v",
+			inst.SecType, inst.PipBuffer, inst.PointValue, inst.TickSize)
+	}
+	if inst.BreakoutConfirmation != "close_3m" || inst.MaxHoldMinutes != 240 || !inst.DirectionEligibility {
+		t.Errorf("strategy fields not carried: %+v", inst)
+	}
+	// A fresh mapped value, not shared state: mutating it must not affect the config.
+	inst.PipBuffer = 999
+	if again := s.effectiveInstrument("MNQ"); again.PipBuffer != 0.5 {
+		t.Errorf("effectiveInstrument returned shared state: second call PipBuffer=%v", again.PipBuffer)
+	}
+	if s.effectiveInstrument("GC") != nil {
+		t.Error("effectiveInstrument(GC) should be nil — not configured")
+	}
+}
+
+// TestSchedulerFutures_EffectiveForexCfg_Maps verifies the futures strategy config maps onto
+// the ForexORBConfig shape the shared bracket/gate functions consume.
+func TestSchedulerFutures_EffectiveForexCfg_Maps(t *testing.T) {
+	cfg := *testFuturesCfg
+	cfg.RangeMinutes, cfg.RiskReward, cfg.MaxRiskPct = 30, 1.5, 0.5
+	cfg.ATRPeriod, cfg.ATRTimeframe, cfg.TrendEMAPeriod = 14, "1h", 20
+	s := newTestScheduler()
+	s.SetFuturesConfig(&cfg)
+
+	f := s.effectiveForexCfg()
+	if f.RangeMinutes != 30 || f.RiskReward != 1.5 || f.MaxRiskPct != 0.5 ||
+		f.ATRPeriod != 14 || f.ATRTimeframe != "1h" || f.TrendEMAPeriod != 20 {
+		t.Errorf("effectiveForexCfg mismapped in futures mode: %+v", f)
 	}
 }
