@@ -292,4 +292,13 @@ func TestComputeRetestBracket_SnapsFuturesTick(t *testing.T) {
 			t.Errorf("price %.4f not a 0.25-tick multiple", p)
 		}
 	}
+	// Target must be RR × the SUBMITTED (snapped) stop distance, not the raw one: entry
+	// 5004.9→5005.00, stop 4984.1→4984.00 → risk 21.00 → target 5005 + 21×2 = 5047.00
+	// (NOT 5046.50 from the unsnapped risk of 20.80).
+	if math.Abs(rb.EntryStop-5005.0) > 1e-6 || math.Abs(rb.StopLoss-4984.0) > 1e-6 {
+		t.Fatalf("snapped entry/stop = %.2f/%.2f; want 5005.00/4984.00", rb.EntryStop, rb.StopLoss)
+	}
+	if math.Abs(rb.TakeProfit-5047.0) > 1e-6 {
+		t.Errorf("target = %.2f; want 5047.00 (RR × submitted stop distance)", rb.TakeProfit)
+	}
 }

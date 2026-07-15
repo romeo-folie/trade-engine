@@ -1416,18 +1416,27 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			case IsRetestMode(inst.BreakoutConfirmation):
 				// Retest (Phase 6): wait for the breakout to pull back to the level and bounce,
 				// then enter at MARKET with a stop at the retest swing (retest_swing) or the range
-				// opposite (retest_range). The retest bracket has a tighter, re-sized risk than the
-				// range bracket, so re-run the spread + commission gates against IT.
-				rb, side, ok := s.retestEntry(ctx, ticker, r, buyParams, sellParams, fcfg, *inst, portfolioVal)
+				// opposite (retest_range). Bound to the entry window: a bounce after the cleanup
+				// cutoff must NOT enter (unconfirmed entries expire then) — mirrors the backtest,
+				// which only considers candles within the entry window. now() < deadline here, so
+				// the replayed candles are all in-window.
+				if !s.withinEntryWindow() {
+					continue
+				}
+				// Size the retest against the THROTTLED instrument (tinst) like the range brackets
+				// above, so a stored risk_multiplier applies in retest_* modes too. The retest
+				// bracket's risk is tighter than the range bracket, so re-run the spread +
+				// commission gates against IT.
+				rb, side, ok := s.retestEntry(ctx, ticker, r, buyParams, sellParams, fcfg, tinst, portfolioVal)
 				if !ok {
 					pendingConfirmation = true
 					continue
 				}
-				if ok, ratio, reason := s.passesSpread(ctx, ticker, rb.EntryStop, rb.StopLoss, inst.MaxSpreadToRisk); !ok {
+				if ok, ratio, reason := s.passesSpread(ctx, ticker, rb.EntryStop, rb.StopLoss, tinst.MaxSpreadToRisk); !ok {
 					slog.Info("orb: skipping retest — spread too wide vs the retest stop", "ticker", ticker, "ratio", ratio, "reason", reason)
 					continue
 				}
-				if ok, ratio, reason := passesCommission(rb.Qty, rb.EntryStop, rb.StopLoss, *inst); !ok {
+				if ok, ratio, reason := passesCommission(rb.Qty, rb.EntryStop, rb.StopLoss, tinst); !ok {
 					slog.Info("orb: skipping retest — commission too large vs the retest risk", "ticker", ticker, "ratio", ratio, "reason", reason)
 					continue
 				}

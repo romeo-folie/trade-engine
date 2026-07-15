@@ -115,6 +115,12 @@ func DetectRetest(candles []data.Candle, buyTrigger, sellTrigger, rangeHigh, ran
 // target measured from that (tighter) risk, and a risk-sized qty via the same sizer as the range
 // bracket. stopLevel is the swing (± buffer) or the range-opposite level, chosen by the caller.
 func ComputeRetestBracket(ticker, side string, entry, stopLevel, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) BracketParams {
+	// Snap entry/stop to the instrument tick FIRST (no-op for forex, TickSize 0) — the retest
+	// entry is a candle extreme + buffer and the swing stop is a candle low/high, neither of
+	// which need land on a tick — then measure risk and the RR target from the ACTUAL submitted
+	// prices so the target is a true cfg.RiskReward multiple of the submitted stop distance.
+	entry = snapToTick(entry, inst.TickSize)
+	stopLevel = snapToTick(stopLevel, inst.TickSize)
 	risk := math.Abs(entry - stopLevel)
 	var takeProfit float64
 	if side == "buy" {
@@ -122,11 +128,6 @@ func ComputeRetestBracket(ticker, side string, entry, stopLevel, portfolioValue 
 	} else {
 		takeProfit = entry - risk*cfg.RiskReward
 	}
-	// Snap to the instrument's tick (no-op for forex, TickSize 0). The retest entry is a
-	// candle extreme + buffer and the target is entry ± risk×RR — neither need land on a
-	// tick, and an off-tick futures price is rejected by the exchange.
-	entry = snapToTick(entry, inst.TickSize)
-	stopLevel = snapToTick(stopLevel, inst.TickSize)
 	takeProfit = snapToTick(takeProfit, inst.TickSize)
 	return BracketParams{
 		Ticker:     ticker,
