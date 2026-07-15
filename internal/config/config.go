@@ -1605,6 +1605,16 @@ func Validate(cfg *Config) []string {
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m (retest_swing/retest_range are backtest-only)",
 					inst.Symbol, inst.BreakoutConfirmation))
 			}
+			// Close-position guard: the threshold is compared against CloseFrac, which is
+			// normalised to [0,1]. A value >= 1 makes the buy condition (CloseFrac >= t)
+			// unsatisfiable AND the sell condition (CloseFrac <= 1-t) unsatisfiable, silently
+			// skipping EVERY session for the instrument — the classic "60 typed for 0.60" foot-gun.
+			// A negative value is meaningless. Fail loud rather than halt trading in silence.
+			if inst.CloseFracThreshold < 0 || inst.CloseFracThreshold >= 1 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: close_frac_threshold %.3f must be in [0, 1) (0 = off; e.g. 0.60, not 60)",
+					inst.Symbol, inst.CloseFracThreshold))
+			}
 			// Margin-aware sizing: a rate above 1 would SHRINK the notional cap below the
 			// unleveraged baseline — almost certainly a leverage ratio typed where a fraction
 			// belongs (33 instead of 0.033). Fail loud.
