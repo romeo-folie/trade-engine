@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/ibkrconids"
 )
 
 // IBKRBroker implements Executor against the Interactive Brokers Client Portal REST API.
@@ -408,10 +409,27 @@ func (b *IBKRBroker) reverseConid(conid string) string {
 			return pair
 		}
 	}
+	// Futures static map: keys are "SYMBOL/YYYYMM" (front-month), so a match resolves back
+	// to the bare symbol. Without this, GetPositions returns statically-mapped futures
+	// (MNQ/MES/…) as raw numeric conids that never match orb_trades.ticker — the gap that
+	// forced the orphan detector and exit-side backstops to be forex-only (Codex #397).
+	for key, c := range ibkrconids.FuturesConids {
+		if c == conid {
+			if sym, _, ok := strings.Cut(key, "/"); ok {
+				return sym
+			}
+			return key
+		}
+	}
 	b.conidMu.RLock()
 	defer b.conidMu.RUnlock()
 	for pair, c := range b.conidCache {
 		if c == conid {
+			// Dynamically-resolved futures are cached under "FUT:SYMBOL"; strip the prefix
+			// so callers see the bare symbol, matching the static-map and forex behaviour.
+			if sym, ok := strings.CutPrefix(pair, "FUT:"); ok {
+				return sym
+			}
 			return pair
 		}
 	}

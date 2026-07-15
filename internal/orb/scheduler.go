@@ -336,6 +336,26 @@ func (s *ORBScheduler) effectiveForexCfg() config.ForexORBConfig {
 	return config.ForexORBConfig{}
 }
 
+// ownsInstrument reports whether the ticker is one this scheduler manages in its active
+// mode (a configured forex or futures instrument). Replaces isForexInstrument at call
+// sites that must also cover futures, scoping shared orb_trades reconcilers to this
+// scheduler's own rows.
+func (s *ORBScheduler) ownsInstrument(ticker string) bool {
+	return s.effectiveInstrument(ticker) != nil
+}
+
+// effectiveMaxHoldMinutes is the mode-agnostic per-ticker time-exit limit: the instrument's
+// own MaxHoldMinutes, else the strategy-level default. Reimplements config.ForexORBConfig's
+// EffectiveMaxHoldMinutes via effectiveInstrument/effectiveForexCfg because AsForexConfig()
+// does NOT copy the Instruments slice — calling EffectiveMaxHoldMinutes on the mapped futures
+// config would silently ignore a per-contract override and use only the strategy default.
+func (s *ORBScheduler) effectiveMaxHoldMinutes(ticker string) int {
+	if inst := s.effectiveInstrument(ticker); inst != nil && inst.MaxHoldMinutes > 0 {
+		return inst.MaxHoldMinutes
+	}
+	return s.effectiveForexCfg().MaxHoldMinutes
+}
+
 // throttledInstrument applies the feedback auto-throttle to an instrument's risk multiplier:
 // it MULTIPLIES the static per-instrument risk_multiplier by the nightly-derived multiplier
 // stored from this instrument's rolling realised expectancy. A complete no-op (returns inst

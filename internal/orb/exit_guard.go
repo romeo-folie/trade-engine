@@ -58,15 +58,19 @@ type exitGuard struct {
 func managedKey(ticker, side string) string { return ticker + "|" + strings.ToLower(side) }
 
 // newExitGuard reads live positions once and precomputes the managed open qty per side.
-// Disabled (allows all) for non-forex schedulers so futures/options exit paths are untouched;
-// fails closed (blocks all) when the positions OR the managed-set read fails.
+// Active for forex AND futures schedulers (both place dual-sided/split brackets that the
+// inference reconcilers can phantom-close); disabled (allows all) for the equities scheduler,
+// which has no per-instrument position config here. Fails closed (blocks all) when the
+// positions OR the managed-set read fails. Futures positions are keyed by symbol via
+// reverseConid (which resolves the static/dynamic futures conids back to "MNQ" etc.) — without
+// that resolution this guard would silently rubber-stamp every futures close (net=0 → ALLOW).
 //
 // The managed budget is built from ALL open filled ORB trades ACCOUNT-WIDE, not just the
 // caller's per-session slice: the broker position read is account-wide, so a same-ticker/side
 // position still open in ANOTHER session must be counted too — otherwise this session's
 // genuine close is blocked, its qty wrongly attributed to the cross-session held leg (Codex P1).
 func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || s.executor == nil || s.db == nil {
+	if (!s.isForexMode() && !s.isFuturesMode()) || s.executor == nil || s.db == nil {
 		return &exitGuard{active: false}
 	}
 	positions, err := s.executor.GetPositions(ctx)
@@ -79,7 +83,7 @@ func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
 		slog.Warn("orb: exit guard: account-wide filled-trades read failed — deferring inference-based closes", "err", err)
 		return &exitGuard{active: true, readFailed: true}
 	}
-	positions = s.forexOnlyPositions(positions)
+	positions = s.ownedPositions(positions)
 	net := make(map[string]float64)
 	for _, p := range positions {
 		net[p.Ticker] += p.Quantity

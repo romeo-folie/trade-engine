@@ -50,16 +50,16 @@ func shouldTimeExit(anchor time.Time, maxHoldMinutes int, now time.Time) bool {
 // came from trades that became multi-day holds (one GBP/USD buy ran six days to
 // -9.62R), and a fixed time boundary caps that tail.
 //
-// It runs only in forex mode (the only path with per-instrument max-hold config) and
-// only when a real executor + market data are present. For each over-age filled trade
-// it cancels the dangling bracket legs, flattens the position at market, and records
-// exit_type='time_exit'. Crucially it NEVER closes the DB row without first confirming
-// the position was actually flattened at the broker — a DB-only close would repeat the
-// PR #354 mistake of letting the live bracket fill later while the DB claims the trade
-// is done. It runs before reconcileBarReplayExits so a genuinely-open trade is recorded
-// as a time exit rather than pre-empted by a replayed TP/stop touch.
+// It runs in forex OR futures mode (both carry per-instrument max-hold config) and only
+// when a real executor is present. For each over-age filled trade it cancels the dangling
+// bracket legs, flattens the position at market, and records exit_type='time_exit'.
+// Crucially it NEVER closes the DB row without first confirming the position was actually
+// flattened at the broker — a DB-only close would repeat the PR #354 mistake of letting the
+// live bracket fill later while the DB claims the trade is done. It runs before
+// reconcileBarReplayExits so a genuinely-open trade is recorded as a time exit rather than
+// pre-empted by a replayed TP/stop touch.
 func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
-	if s.forexCfg == nil || !s.forexCfg.Enabled {
+	if !s.isForexMode() && !s.isFuturesMode() {
 		return
 	}
 	if s.db == nil || s.executor == nil {
@@ -95,11 +95,11 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 	for i := range trades {
 		t := trades[i]
 
-		// Only act on this scheduler's own forex/CFD instruments. The orb_trades
-		// table is shared: in orb-newyork mode an equities scheduler writes equity
-		// trades to the same table, and the forex scheduler must not hand those to
-		// its IBKR forex flatten/cancel path (wrong conid, invalid-pair calls).
-		if !s.isForexInstrument(t.Ticker) {
+		// Only act on this scheduler's own instruments (forex/CFD or futures). The
+		// orb_trades table is shared: in orb-newyork mode an equities scheduler writes
+		// equity trades to the same table, and this scheduler must not hand those to its
+		// IBKR flatten/cancel path (wrong conid, invalid-symbol calls).
+		if !s.ownsInstrument(t.Ticker) {
 			continue
 		}
 
@@ -118,7 +118,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 		}
 		groups[key] = append(groups[key], t)
 
-		maxHold := s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker)
+		maxHold := s.effectiveMaxHoldMinutes(t.Ticker)
 		anchor := t.CreatedAt
 		if t.FilledAt != nil {
 			anchor = *t.FilledAt
@@ -137,7 +137,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 			// Ordinary trade, or a split leg whose sibling already closed (its shared stop was
 			// OCO-cancelled with it, so nothing else holds that price): flatten and cancel its
 			// legs inline, as before.
-			s.flattenAndRecordTimeExit(ctx, legs[0], s.forexCfg.EffectiveMaxHoldMinutes(legs[0].Ticker), false)
+			s.flattenAndRecordTimeExit(ctx, legs[0], s.effectiveMaxHoldMinutes(legs[0].Ticker), false)
 			continue
 		}
 		// Split-bracket group with >1 open leg: flatten every leg first (deferring leg
@@ -146,7 +146,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 		// shared stop while a leg might still hold a position.
 		allFlat := true
 		for _, t := range legs {
-			if !s.flattenAndRecordTimeExit(ctx, t, s.forexCfg.EffectiveMaxHoldMinutes(t.Ticker), true) {
+			if !s.flattenAndRecordTimeExit(ctx, t, s.effectiveMaxHoldMinutes(t.Ticker), true) {
 				allFlat = false
 			}
 		}
@@ -178,7 +178,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 // this trade's position is now confirmed FLAT (flattened here or already closed), which the
 // group caller uses to decide it is safe to cancel the shared stop.
 func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORBTrade, maxHold int, deferCancel bool) bool {
-	secType := s.forexSecType(t.Ticker)
+	secType := s.instrumentSecType(t.Ticker)
 
 	// 1. Read the live position FIRST, while the bracket still protects it. Flatten
 	//    only this trade's quantity, bounded by the broker's net position, so forex
@@ -440,7 +440,7 @@ func (s *ORBScheduler) tickersWithOpenFilledTrades(ctx context.Context) map[stri
 // no price can't be proven either way, so it is surfaced to the operator (once) rather
 // than cancelled — never cancelling something we can't prove we own.
 func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
-	if s.forexCfg == nil || !s.forexCfg.Enabled || s.db == nil {
+	if (!s.isForexMode() && !s.isFuturesMode()) || s.db == nil {
 		return
 	}
 	lister, ok := s.executor.(execution.WorkingOrdersLister)
@@ -479,7 +479,7 @@ func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
 	cutoff := s.now().Add(-orphanLegLookback)
 	timeExitPrices := make(map[string][]float64)
 	for _, t := range recent {
-		if t.Status != "closed" || t.ExitType != "time_exit" || !s.isForexInstrument(t.Ticker) {
+		if t.Status != "closed" || t.ExitType != "time_exit" || !s.ownsInstrument(t.Ticker) {
 			continue
 		}
 		if t.ClosedAt == nil || t.ClosedAt.Before(cutoff) {
@@ -525,7 +525,7 @@ func (s *ORBScheduler) classifyOrphanLegs(
 	protected map[string]struct{},
 ) (cancel []string, ambiguous []execution.WorkingOrder) {
 	for _, o := range orders {
-		if !s.isForexInstrument(o.Ticker) {
+		if !s.ownsInstrument(o.Ticker) {
 			continue
 		}
 		if _, p := protected[o.OrderID]; p {
@@ -570,17 +570,13 @@ func (s *ORBScheduler) awaitFlattenFill(ctx context.Context, res execution.Order
 	return 0, false
 }
 
-// forexSecType returns the configured IBKR security type for a forex/CFD symbol
-// ("CASH" for spot forex, "CFD" for metals). Defaults to empty (executor treats as
-// CASH) when the symbol isn't configured.
-func (s *ORBScheduler) forexSecType(ticker string) string {
-	if s.forexCfg == nil {
-		return ""
-	}
-	for _, inst := range s.forexCfg.Instruments {
-		if inst.Symbol == ticker {
-			return inst.SecType
-		}
+// instrumentSecType returns the configured IBKR security type for a ticker this scheduler
+// owns: "CASH" (spot forex), "CFD" (metals), or "FUT" (futures, via the mapped instrument).
+// Empty (executor treats as CASH) when the symbol isn't configured — so the flatten order
+// for a time-exited futures position carries SecType "FUT", not a default CASH.
+func (s *ORBScheduler) instrumentSecType(ticker string) string {
+	if inst := s.effectiveInstrument(ticker); inst != nil {
+		return inst.SecType
 	}
 	return ""
 }
