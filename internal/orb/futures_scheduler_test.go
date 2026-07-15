@@ -5,6 +5,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // newTestScheduler builds an ORBScheduler with no external deps — safe for unit tests.
@@ -300,5 +301,49 @@ func TestSchedulerFutures_ExitBackstopScoping(t *testing.T) {
 		if p.Ticker != "MNQ" && p.Ticker != "MES" {
 			t.Errorf("ownedPositions kept unexpected %q", p.Ticker)
 		}
+	}
+}
+
+// TestSchedulerFutures_OwnsTradeRow_AssetClassCollision verifies the reconciler scoping
+// distinguishes an equity row from a futures row that shares a root symbol (equity ES vs
+// futures ES) — the Codex #455 collision. The tag comes from tradeAssetClass at placement.
+func TestSchedulerFutures_OwnsTradeRow_AssetClassCollision(t *testing.T) {
+	cfg := *testFuturesCfg // configures ES, NQ as futures
+	s := newTestScheduler()
+	s.SetFuturesConfig(&cfg)
+
+	if s.tradeAssetClass() != "futures" {
+		t.Errorf("tradeAssetClass in futures mode = %q; want futures", s.tradeAssetClass())
+	}
+
+	futuresES := store.ORBTrade{Ticker: "ES", AssetClass: "futures"}
+	equityES := store.ORBTrade{Ticker: "ES", AssetClass: "equity"}  // Eversource stock, same string
+	otherFut := store.ORBTrade{Ticker: "GC", AssetClass: "futures"} // not configured here
+
+	if !s.ownsTradeRow(futuresES) {
+		t.Error("futures-tagged ES must be owned")
+	}
+	if s.ownsTradeRow(equityES) {
+		t.Error("equity ES must NOT be owned by the futures scheduler (collision guard)")
+	}
+	if s.ownsTradeRow(otherFut) {
+		t.Error("GC future is not configured — must not be owned")
+	}
+
+	// ownedTradeRows filters and does not mutate the input.
+	rows := []store.ORBTrade{futuresES, equityES, otherFut}
+	owned := s.ownedTradeRows(rows)
+	if len(owned) != 1 || owned[0].Ticker != "ES" || owned[0].AssetClass != "futures" {
+		t.Errorf("ownedTradeRows = %+v; want just the futures ES", owned)
+	}
+
+	// Forex mode: tradeAssetClass empty (rows default to equity), scoping by ownsInstrument.
+	fs := newTestScheduler()
+	fs.SetForexConfig(&config.ForexORBConfig{Enabled: true, Instruments: []config.Instrument{{Symbol: "EUR/USD"}}})
+	if fs.tradeAssetClass() != "" {
+		t.Errorf("tradeAssetClass in forex mode = %q; want empty", fs.tradeAssetClass())
+	}
+	if !fs.ownsTradeRow(store.ORBTrade{Ticker: "EUR/USD", AssetClass: "equity"}) {
+		t.Error("forex EUR/USD row must be owned in forex mode")
 	}
 }

@@ -85,11 +85,13 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: load filled trades failed", "err", err)
 		return
 	}
+	filled = s.ownedTradeRows(filled)
 	pending, err := store.GetOpenPendingORBTrades(ctx, s.db)
 	if err != nil {
 		slog.Warn("orb: fill reconcile: load pending trades failed", "err", err)
 		return
 	}
+	pending = s.ownedTradeRows(pending)
 	// Also consider recently-cancelled entries: the July/today's trap is a fill
 	// wrongly marked 'cancelled' at session end. When the broker still holds the
 	// position, such a row is reopened to 'filled'. Bounded to a day so a stale
@@ -99,6 +101,7 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		slog.Warn("orb: fill reconcile: load cancelled trades failed", "err", err)
 		return
 	}
+	cancelled = s.ownedTradeRows(cancelled)
 	// Reuse the detector's residue math to find positions no filled row explains,
 	// then attribute each to the entry rows (pending OR wrongly-cancelled) that
 	// account for it. Match pending and cancelled candidates as SEPARATE

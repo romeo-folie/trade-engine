@@ -90,7 +90,11 @@ func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
 	}
 	managed := make(map[string]int)
 	for i := range filled {
-		if filled[i].Status == "filled" {
+		// Scope to THIS scheduler's rows (asset-class aware): the read is account-wide so a
+		// same-instrument position in another session is still counted, but an equity row that
+		// shares a futures root symbol must not inflate the futures budget and rubber-stamp a
+		// close of a still-held futures position.
+		if filled[i].Status == "filled" && s.ownsTradeRow(filled[i]) {
 			managed[managedKey(filled[i].Ticker, filled[i].Side)] += filled[i].Qty
 		}
 	}
