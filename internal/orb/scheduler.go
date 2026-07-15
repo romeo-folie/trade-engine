@@ -1405,27 +1405,46 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				}
 			}
 
-			// Retest modes (retest_swing / retest_range) are NOT wired into the live path yet
-			// (backtest-only). RequiresConfirmation returns false for them, so without this
-			// guard a retest-configured instrument would silently fall through to stop_touch —
-			// a different strategy than configured. Fail closed (skip, don't misfire) until the
-			// live retest entry lands. Remove this once DetectRetest is wired here.
-			if IsRetestMode(inst.BreakoutConfirmation) {
-				slog.Warn("orb: skipping instrument — retest entry not yet wired live (configure stop_touch/close_1m/close_3m, or wait for the retest live path)",
-					"ticker", ticker, "mode", inst.BreakoutConfirmation)
-				continue
-			}
-
-			// Breakout confirmation (Phase 3). With stop_touch (default) we place resting
-			// stops now and the broker fills on a touch. With a close_* mode we instead WAIT:
-			// each tick, replay the 1-min candles since the range locked and only place once
-			// a confirmed close prints — then place ONLY the confirmed side (zero the other so
-			// the placement loop below skips it). No confirmation yet → leave the ticker
-			// unplaced and keep the session in Executing (pendingConfirmation) to retry next tick.
-			// Stop-touch (default) rests stop-entry brackets at the breakout level. Confirmation
-			// modes instead enter at MARKET once a close confirms — placeFn switches accordingly.
+			// Entry mode (Phase 3/6). stop_touch (default) rests stop-entry brackets at the
+			// breakout level and the broker fills on a touch. close_* and retest_* instead WAIT
+			// and enter at MARKET once their signal prints — each tick replays the 1-min candles
+			// since the range locked, and until the signal fires the ticker stays unplaced with
+			// pendingConfirmation so the watch retries next tick. placeFn switches to a market
+			// bracket for the wait-then-enter modes.
 			placeFn := PlaceBracket
-			if RequiresConfirmation(inst.BreakoutConfirmation) {
+			switch {
+			case IsRetestMode(inst.BreakoutConfirmation):
+				// Retest (Phase 6): wait for the breakout to pull back to the level and bounce,
+				// then enter at MARKET with a stop at the retest swing (retest_swing) or the range
+				// opposite (retest_range). The retest bracket has a tighter, re-sized risk than the
+				// range bracket, so re-run the spread + commission gates against IT.
+				rb, side, ok := s.retestEntry(ctx, ticker, r, buyParams, sellParams, fcfg, *inst, portfolioVal)
+				if !ok {
+					pendingConfirmation = true
+					continue
+				}
+				if ok, ratio, reason := s.passesSpread(ctx, ticker, rb.EntryStop, rb.StopLoss, inst.MaxSpreadToRisk); !ok {
+					slog.Info("orb: skipping retest — spread too wide vs the retest stop", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				if ok, ratio, reason := passesCommission(rb.Qty, rb.EntryStop, rb.StopLoss, *inst); !ok {
+					slog.Info("orb: skipping retest — commission too large vs the retest risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				if rb.Qty == 0 {
+					slog.Info("orb: skipping retest — min lot exceeds the position cap at the retest risk", "ticker", ticker)
+					continue
+				}
+				slog.Info("orb: retest entry", "ticker", ticker, "side", side, "mode", inst.BreakoutConfirmation, "entry", rb.EntryStop, "stop", rb.StopLoss)
+				if side == "buy" {
+					buyParams, sellParams.Qty = rb, 0
+				} else {
+					sellParams, buyParams.Qty = rb, 0
+				}
+				placeFn = PlaceMarketBracket
+			case RequiresConfirmation(inst.BreakoutConfirmation):
+				// close_* confirmation: place ONLY the confirmed side (zero the other so the
+				// placement loop skips it).
 				side := s.confirmedSide(ctx, ticker, r, buyParams, sellParams, inst.BreakoutConfirmation)
 				if side == "" {
 					pendingConfirmation = true
