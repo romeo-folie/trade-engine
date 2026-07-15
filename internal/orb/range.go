@@ -13,6 +13,12 @@ type OpeningRange struct {
 	High      float64
 	Low       float64
 	DefinedAt time.Time
+	// CloseFrac is where the final formation bar closed within the range, normalised to
+	// [0,1]: 0 = at the low, 1 = at the high, 0.5 = mid-range. It captures which way price
+	// was leaning as the range locked — a close near the high means buyers held the range's
+	// top into the lock, a mid-range close is chop with no directional pressure. A degenerate
+	// (zero-width) range yields 0.5 (neutral). Consumed by the close-position entry guard.
+	CloseFrac float64
 }
 
 // RangeBuffer accumulates 1-min candles and locks the opening range
@@ -61,11 +67,17 @@ func (b *RangeBuffer) Add(candle data.Candle) (bool, *OpeningRange) {
 				low = bar.Low
 			}
 		}
+		lastClose := b.bars[len(b.bars)-1].Close
+		closeFrac := 0.5 // neutral default for a degenerate (zero-width) range
+		if high > low {
+			closeFrac = (lastClose - low) / (high - low)
+		}
 		b.result = &OpeningRange{
 			Ticker:    b.ticker,
 			High:      high,
 			Low:       low,
 			DefinedAt: b.bars[len(b.bars)-1].Timestamp,
+			CloseFrac: closeFrac,
 		}
 		b.locked = true
 	}

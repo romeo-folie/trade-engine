@@ -30,6 +30,7 @@ type ParamSet struct {
 	DirectionElig  bool    `json:"direction_elig"`  // trade only the trend-aligned side
 	RangeATRFilter bool    `json:"range_atr_filter"`// skip sessions whose opening range is outside the coarse ATR band
 	AdaptiveExits  bool    `json:"adaptive_exits"`  // break-even + ATR trailing preset
+	CloseFrac      float64 `json:"close_frac"`      // close-position guard threshold (0 = off; arm buy only when range closed in top frac, sell in bottom)
 }
 
 // Coarse ATR-band and adaptive presets applied when the corresponding boolean knob is on. Kept
@@ -54,9 +55,13 @@ type CoarseGrid struct {
 	DirectionElig  []bool
 	RangeATRFilter []bool
 	AdaptiveExits  []bool
+	CloseFrac      []float64
 }
 
-// DefaultCoarseGrid is the broad, low-resolution first pass (2·4·5·3·3·2·2·2 = 2880 sets).
+// DefaultCoarseGrid is the broad, low-resolution first pass (2·4·5·3·3·2·2·2·1 = 2880 sets).
+// CloseFrac defaults to {0} (guard off) so the broad sweep keeps its existing size — the
+// close-position guard multiplies an already-large product, so it is studied in a focused
+// sweep (set CloseFrac to e.g. {0, 0.55, 0.6, 0.65, 0.7}) rather than in every coarse run.
 func DefaultCoarseGrid() CoarseGrid {
 	return CoarseGrid{
 		Sessions:       []string{"london", "newyork"},
@@ -67,18 +72,31 @@ func DefaultCoarseGrid() CoarseGrid {
 		DirectionElig:  []bool{false, true},
 		RangeATRFilter: []bool{false, true},
 		AdaptiveExits:  []bool{false, true},
+		CloseFrac:      []float64{0},
 	}
 }
 
-// Size is the number of parameter sets the grid's cartesian product yields.
+// Size is the number of parameter sets the grid's cartesian product yields. An unset
+// CloseFrac counts as one level (guard off), matching GenerateCoarse's defaulting.
 func (g CoarseGrid) Size() int {
+	closeFracLevels := len(g.CloseFrac)
+	if closeFracLevels == 0 {
+		closeFracLevels = 1
+	}
 	return len(g.Sessions) * len(g.RangeMinutes) * len(g.Confirmations) * len(g.RiskRewards) *
-		len(g.MaxHoldMinutes) * len(g.DirectionElig) * len(g.RangeATRFilter) * len(g.AdaptiveExits)
+		len(g.MaxHoldMinutes) * len(g.DirectionElig) * len(g.RangeATRFilter) * len(g.AdaptiveExits) *
+		closeFracLevels
 }
 
 // GenerateCoarse enumerates every parameter set in the grid's cartesian product. Order is stable
 // (nested loops in field order) so a run is reproducible.
 func (g CoarseGrid) GenerateCoarse() []ParamSet {
+	// A grid built without CloseFrac levels (e.g. older callers) would collapse the innermost
+	// loop to zero sets; default it to {0} (guard off) so the dimension is purely additive.
+	closeFracs := g.CloseFrac
+	if len(closeFracs) == 0 {
+		closeFracs = []float64{0}
+	}
 	out := make([]ParamSet, 0, g.Size())
 	for _, s := range g.Sessions {
 		for _, rm := range g.RangeMinutes {
@@ -88,11 +106,13 @@ func (g CoarseGrid) GenerateCoarse() []ParamSet {
 						for _, de := range g.DirectionElig {
 							for _, raf := range g.RangeATRFilter {
 								for _, ae := range g.AdaptiveExits {
-									out = append(out, ParamSet{
-										Session: s, RangeMinutes: rm, Confirmation: cf,
-										RiskReward: rr, MaxHoldMinutes: mh, DirectionElig: de,
-										RangeATRFilter: raf, AdaptiveExits: ae,
-									})
+									for _, cfrac := range closeFracs {
+										out = append(out, ParamSet{
+											Session: s, RangeMinutes: rm, Confirmation: cf,
+											RiskReward: rr, MaxHoldMinutes: mh, DirectionElig: de,
+											RangeATRFilter: raf, AdaptiveExits: ae, CloseFrac: cfrac,
+										})
+									}
 								}
 							}
 						}
@@ -131,13 +151,18 @@ func (p ParamSet) Label() string {
 	if p.AdaptiveExits {
 		extra += "+adpt"
 	}
+	if p.CloseFrac > 0 {
+		extra += fmt.Sprintf("+cf%.2f", p.CloseFrac)
+	}
 	return fmt.Sprintf("%s/or%d/%s/rr%.1f/mh%d/%s%s", p.Session, p.RangeMinutes, p.Confirmation, p.RiskReward, p.MaxHoldMinutes, de, extra)
 }
 
 // Resolve turns a parameter set into the concrete inputs orbreplay.Engine.Run needs: a
 // ForexORBConfig (session/range/risk-reward), the per-instrument config with the swept gates
-// applied, and the Variant whose Apply* flags switch those gates on. The engine gates each
-// feature on BOTH the variant flag AND the per-instrument config, so both are set together.
+// applied, and the Variant whose Apply* flags switch those gates on. Most features gate on
+// BOTH a variant flag AND the per-instrument config, so both are set together. The exception
+// is the close-position guard: like the live scheduler it has no variant flag and gates purely
+// on inst.CloseFracThreshold (0 = off), so only the config value is set here.
 func (p ParamSet) Resolve(base config.ForexORBConfig, instruments []config.Instrument) (config.ForexORBConfig, []config.Instrument, orbreplay.Variant) {
 	cfg := base
 	cfg.Session = p.Session
@@ -166,6 +191,7 @@ func (p ParamSet) Resolve(base config.ForexORBConfig, instruments []config.Instr
 		} else {
 			inst.BreakEvenR, inst.TrailATRMult, inst.TrailAfterR = 0, 0, 0
 		}
+		inst.CloseFracThreshold = p.CloseFrac
 		out[i] = inst
 	}
 

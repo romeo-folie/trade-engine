@@ -178,3 +178,69 @@ func TestPassesCommission(t *testing.T) {
 		}
 	})
 }
+
+func TestCloseFractionEligibility(t *testing.T) {
+	// Threshold 0.6: buy needs CloseFrac >= 0.6, sell needs <= 0.4; [0.4,0.6] is the dead zone.
+	inst := config.Instrument{CloseFracThreshold: 0.6}
+
+	cases := []struct {
+		name             string
+		frac             float64
+		wantBuy, wantSell bool
+	}{
+		{"closed at high arms buy only", 1.0, true, false},
+		{"just above threshold arms buy only", 0.6, true, false},
+		{"mid-range disables both (dead zone)", 0.5, false, false},
+		{"just inside dead zone lower disables both", 0.4, false, true}, // 0.4 <= 1-0.6=0.4 → sell ok
+		{"closed at low arms sell only", 0.0, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &OpeningRange{CloseFrac: tc.frac}
+			buyOK, sellOK, applied := CloseFractionEligibility(r, inst)
+			if !applied {
+				t.Fatal("guard should be applied when threshold > 0")
+			}
+			if buyOK != tc.wantBuy || sellOK != tc.wantSell {
+				t.Errorf("frac %.2f: got buy=%v sell=%v, want buy=%v sell=%v",
+					tc.frac, buyOK, sellOK, tc.wantBuy, tc.wantSell)
+			}
+		})
+	}
+
+	t.Run("threshold 0 disables the guard (both sides, not-applied)", func(t *testing.T) {
+		r := &OpeningRange{CloseFrac: 0.5}
+		buyOK, sellOK, applied := CloseFractionEligibility(r, config.Instrument{CloseFracThreshold: 0})
+		if applied || !buyOK || !sellOK {
+			t.Errorf("threshold 0 should be inert: got buy=%v sell=%v applied=%v", buyOK, sellOK, applied)
+		}
+	})
+
+	t.Run("nil range is inert", func(t *testing.T) {
+		if _, _, applied := CloseFractionEligibility(nil, inst); applied {
+			t.Error("nil range should not apply the guard")
+		}
+	})
+}
+
+func TestRangeBufferCloseFrac(t *testing.T) {
+	base := time.Date(2026, 4, 13, 9, 30, 0, 0, time.UTC)
+
+	t.Run("close near high yields high frac", func(t *testing.T) {
+		buf := NewRangeBuffer("T", 2)
+		buf.Add(data.Candle{Timestamp: base, High: 10, Low: 8, Close: 9})
+		_, r := buf.Add(data.Candle{Timestamp: base.Add(time.Minute), High: 12, Low: 9, Close: 11.5})
+		// range: high=12, low=8, last close=11.5 → (11.5-8)/(12-8) = 0.875
+		if r.CloseFrac < 0.87 || r.CloseFrac > 0.88 {
+			t.Errorf("CloseFrac = %.4f, want ~0.875", r.CloseFrac)
+		}
+	})
+
+	t.Run("degenerate zero-width range yields neutral 0.5", func(t *testing.T) {
+		buf := NewRangeBuffer("T", 1)
+		_, r := buf.Add(data.Candle{Timestamp: base, High: 10, Low: 10, Close: 10})
+		if r.CloseFrac != 0.5 {
+			t.Errorf("CloseFrac = %.4f, want 0.5 for zero-width range", r.CloseFrac)
+		}
+	})
+}

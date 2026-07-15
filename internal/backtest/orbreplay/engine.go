@@ -293,6 +293,25 @@ func (e *Engine) simulateSession(ctx context.Context, v Variant, inst config.Ins
 		}
 	}
 
+	// Entry-quality gate 4 — close-position guard: mirror the live CloseFractionEligibility
+	// gate. Unlike the ATR/spread/commission gates above (bundled under ApplyEntryFilters),
+	// live applies this purely on the per-instrument CloseFracThreshold, so the replay gates
+	// on the config value alone — CloseFractionEligibility reports applied=false when the
+	// threshold is 0. CloseFrac is set by orb.NewRangeBuffer at lock (same formation bars as
+	// live), so there is no data dependency and no fail-open path. A zeroed side is skipped
+	// below; a mid-range close disables both and skips the session as directionless chop.
+	if buyOK, sellOK, applied := orb.CloseFractionEligibility(or, inst); applied {
+		if !buyOK {
+			buy.Qty = 0
+		}
+		if !sellOK {
+			sell.Qty = 0
+		}
+		if buy.Qty == 0 && sell.Qty == 0 {
+			return nil, nil // range closed mid-range (close-position guard)
+		}
+	}
+
 	// Resolve the entry within the live entry window (orders are cancelled
 	// entryWindowMinutes after session open). The opposing side is OCO-cancelled, so only
 	// the side that triggers first produces a trade.

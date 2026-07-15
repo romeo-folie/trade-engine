@@ -738,3 +738,38 @@ func TestValidate_ScanConfidenceThreshold(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateForexCloseFracThreshold(t *testing.T) {
+	cfg := Defaults()
+	cfg.ForexORB.Enabled = true
+	cfg.ForexORB.Instruments = []Instrument{
+		{Symbol: "XAU/USD", CloseFracThreshold: 0.6}, // valid
+		{Symbol: "XAG/USD", CloseFracThreshold: 0},   // off → valid
+		{Symbol: "EUR/USD", CloseFracThreshold: 60},  // 0.60 typo → both sides unsatisfiable, must error
+	}
+	errs := Validate(cfg)
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e, "EUR/USD") && strings.Contains(e, "close_frac_threshold") {
+			found = true
+		}
+		if (strings.Contains(e, "XAU/USD") || strings.Contains(e, "XAG/USD")) && strings.Contains(e, "close_frac_threshold") {
+			t.Errorf("valid close_frac_threshold wrongly rejected: %s", e)
+		}
+	}
+	if !found {
+		t.Errorf("expected a close_frac_threshold error for the out-of-range value; got %v", errs)
+	}
+
+	// A threshold of exactly 1 is also unsatisfiable and must error.
+	cfg.ForexORB.Instruments = []Instrument{{Symbol: "XAU/USD", CloseFracThreshold: 1.0}}
+	if !containsStr(Validate(cfg), "close_frac_threshold") {
+		t.Error("expected close_frac_threshold=1.0 to be rejected (>= 1 is unsatisfiable)")
+	}
+
+	// A negative threshold is meaningless and must error.
+	cfg.ForexORB.Instruments = []Instrument{{Symbol: "XAU/USD", CloseFracThreshold: -0.1}}
+	if !containsStr(Validate(cfg), "close_frac_threshold") {
+		t.Error("expected negative close_frac_threshold to be rejected")
+	}
+}
