@@ -1294,6 +1294,23 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				}
 			}
 
+			// Entry-quality gate 4: close-position guard (Phase 2). Arm only the side price
+			// leaned toward as the range locked (OpeningRange.CloseFrac vs CloseFracThreshold).
+			// Direction-aware like eligibility above: a zeroed side is skipped by the placement
+			// loop; a mid-range close can disable both and skip the session as directionless chop.
+			if buyOK, sellOK, applied := CloseFractionEligibility(r, *inst); applied {
+				if !buyOK {
+					buyParams.Qty = 0
+				}
+				if !sellOK {
+					sellParams.Qty = 0
+				}
+				if buyParams.Qty == 0 && sellParams.Qty == 0 {
+					slog.Info("orb: skipping instrument — range closed mid-range (close-position guard)", "ticker", ticker, "close_frac", r.CloseFrac, "threshold", inst.CloseFracThreshold)
+					continue
+				}
+			}
+
 			// Breakout confirmation (Phase 3). With stop_touch (default) we place resting
 			// stops now and the broker fills on a touch. With a close_* mode we instead WAIT:
 			// each tick, replay the 1-min candles since the range locked and only place once

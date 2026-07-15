@@ -625,6 +625,17 @@ type Instrument struct {
 	// relative to the planned stop distance: spread / |entry_stop - stop_loss|. 0 disables.
 	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
 
+	// CloseFracThreshold (Phase 2) gates each breakout side on where price closed within the
+	// opening range at lock (OpeningRange.CloseFrac, 0 = at the low, 1 = at the high). It is a
+	// direction-aware guard, not a whole-session skip: the buy side is kept only when
+	// close_frac >= threshold (price finished the range near its top), the sell side only when
+	// close_frac <= 1 - threshold (near its bottom). With a threshold in (0.5, 1) a mid-range
+	// close falls in the [1-threshold, threshold] dead zone and BOTH sides are disabled, so the
+	// session is skipped as directionless chop. A side zeroed here is skipped by the placement
+	// loop, mirroring direction eligibility. 0 (default) disables the guard: buy needs >= 0 and
+	// sell needs <= 1, both always true. Sensible live values are 0.55–0.70.
+	CloseFracThreshold float64 `yaml:"close_frac_threshold"`
+
 	// BreakoutConfirmation (Phase 3) decides what counts as a breakout before entering:
 	//   "" | "stop_touch" — current behaviour: a resting stop fills the instant price
 	//                       touches the breakout level (fills on a wick).
@@ -1609,6 +1620,16 @@ func Validate(cfg *Config) []string {
 				errs = append(errs, fmt.Sprintf(
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m (retest_swing/retest_range are backtest-only)",
 					inst.Symbol, inst.BreakoutConfirmation))
+			}
+			// Close-position guard: the threshold is compared against CloseFrac, which is
+			// normalised to [0,1]. A value >= 1 makes the buy condition (CloseFrac >= t)
+			// unsatisfiable AND the sell condition (CloseFrac <= 1-t) unsatisfiable, silently
+			// skipping EVERY session for the instrument — the classic "60 typed for 0.60" foot-gun.
+			// A negative value is meaningless. Fail loud rather than halt trading in silence.
+			if inst.CloseFracThreshold < 0 || inst.CloseFracThreshold >= 1 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: close_frac_threshold %.3f must be in [0, 1) (0 = off; e.g. 0.60, not 60)",
+					inst.Symbol, inst.CloseFracThreshold))
 			}
 			// Margin-aware sizing: a rate above 1 would SHRINK the notional cap below the
 			// unleveraged baseline — almost certainly a leverage ratio typed where a fraction

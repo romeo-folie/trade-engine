@@ -466,6 +466,11 @@ forex_orb:
       min_range_atr: 0.25
       max_range_atr: 0.90
       max_spread_to_risk: 0.08
+      # Close-position guard (Phase 2): arm only the side price leaned toward as the range
+      # locked. close_frac = (last_close - low) / (high - low) at lock (0 = low, 1 = high).
+      # Buy kept only when close_frac >= threshold, sell only when <= 1 - threshold; a
+      # mid-range close (dead zone) skips the session as directionless. 0 = off. 0.55–0.70.
+      close_frac_threshold: 0
       # Breakout confirmation (Phase 3): "" / stop_touch (default, fills on a touch),
       # close_1m (one 1-min close beyond), close_3m (3 consecutive closes beyond,
       # filters false breakouts), or retest_swing / retest_range (Phase 6: wait for

@@ -697,6 +697,96 @@ func TestReplay_PerInstrumentMaxHold(t *testing.T) {
 	}
 }
 
+// testEngineInst runs the replay with a caller-supplied instrument (so a test can set
+// per-instrument gates like CloseFracThreshold), otherwise identical to testEngine.
+func testEngineInst(candles []data.Candle, v Variant, inst config.Instrument) ([]SimTrade, error) {
+	cfg := config.ForexORBConfig{
+		Session: "london", RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 10.0,
+	}
+	e := NewEngine(cfg, &fakeProvider{candles: candles}, nil, 48*time.Hour)
+	return e.Run(context.Background(), v, testDay, testDay.Add(23*time.Hour), []config.Instrument{inst}, 100000)
+}
+
+// topClosingRange builds 15 one-minute bars with the same extremes as rangeBars
+// (High=1.1010, Low=1.1000) but whose FINAL bar closes at 1.1009 → CloseFrac 0.9,
+// so a close-position guard arms the buy side and disables the sell side.
+func topClosingRange() []data.Candle {
+	bars := []data.Candle{cdl(0, 1.1005, 1.1010, 1.1000, 1.1005)} // sets the extremes
+	for i := 1; i < 14; i++ {
+		bars = append(bars, cdl(i, 1.1005, 1.1008, 1.1002, 1.1005)) // strictly inside
+	}
+	bars = append(bars, cdl(14, 1.1008, 1.1009, 1.1007, 1.1009)) // last close near the high → frac 0.9
+	return bars
+}
+
+func TestReplay_CloseFractionGuard(t *testing.T) {
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, CloseFracThreshold: 0.6}
+
+	t.Run("mid-range close skips the session", func(t *testing.T) {
+		// rangeBars closes at 1.1005 → frac 0.5, inside the [0.4,0.6] dead zone → both sides
+		// zeroed. Even with a clean upside breakout, no trade is placed.
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // would enter buy without the guard
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // would TP
+		)
+		trades, err := testEngineInst(candles, RangeFilter(0), inst)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (mid-range close should skip)", len(trades))
+		}
+	})
+
+	t.Run("top close arms buy only", func(t *testing.T) {
+		candles := topClosingRange()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014), // High ≥ buy entry 1.1012 → enter buy
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040), // TP
+		)
+		trades, err := testEngineInst(candles, RangeFilter(0), inst)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 || trades[0].Side != "buy" {
+			t.Fatalf("got %+v; want exactly one buy trade", trades)
+		}
+	})
+
+	t.Run("top close disables sell — a downside break does not trade", func(t *testing.T) {
+		candles := topClosingRange()
+		candles = append(candles,
+			cdl(15, 1.1001, 1.1002, 1.0997, 1.0998), // Low ≤ sell entry 1.0998 → would enter sell without guard
+			cdl(16, 1.0998, 1.0999, 1.0995, 1.0996),
+		)
+		trades, err := testEngineInst(candles, RangeFilter(0), inst)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 0 {
+			t.Fatalf("trades = %d; want 0 (sell disabled by top close)", len(trades))
+		}
+	})
+
+	t.Run("guard off (threshold 0) trades normally", func(t *testing.T) {
+		off := inst
+		off.CloseFracThreshold = 0
+		candles := rangeBars()
+		candles = append(candles,
+			cdl(15, 1.1009, 1.1015, 1.1008, 1.1014),
+			cdl(16, 1.1014, 1.1041, 1.1013, 1.1040),
+		)
+		trades, err := testEngineInst(candles, RangeFilter(0), off)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if len(trades) != 1 {
+			t.Fatalf("trades = %d; want 1 (guard off should not skip)", len(trades))
+		}
+	})
+}
+
 // TestReplay_PointValueScalesPnLRAndCommission runs a futures-shaped instrument
 // (point_value 5, per-contract commission) through a clean long-to-TP session and checks
 // the dollar math: gross = move × qty × point_value, commission = fills × per-contract ×

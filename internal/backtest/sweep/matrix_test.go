@@ -159,3 +159,41 @@ func TestParamSet_JSONRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestParamSet_Resolve_CloseFrac(t *testing.T) {
+	base := config.ForexORBConfig{Session: "london", RangeMinutes: 15, RiskReward: 2.0}
+	insts := []config.Instrument{{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000}}
+
+	// CloseFrac set → threshold copied onto the instrument.
+	on := ParamSet{Session: "london", RangeMinutes: 15, Confirmation: "stop_touch", RiskReward: 2.0, CloseFrac: 0.65}
+	_, out, _ := on.Resolve(base, insts)
+	if out[0].CloseFracThreshold != 0.65 {
+		t.Errorf("CloseFracThreshold = %v; want 0.65", out[0].CloseFracThreshold)
+	}
+
+	// CloseFrac 0 → guard off on the instrument.
+	off := ParamSet{Session: "london", RangeMinutes: 15, Confirmation: "stop_touch", RiskReward: 2.0}
+	_, out2, _ := off.Resolve(base, insts)
+	if out2[0].CloseFracThreshold != 0 {
+		t.Errorf("CloseFracThreshold = %v; want 0 when unset", out2[0].CloseFracThreshold)
+	}
+}
+
+func TestCoarseGrid_CloseFracDimensionMultiplies(t *testing.T) {
+	g := DefaultCoarseGrid()
+	baseSize := g.Size()
+	g.CloseFrac = []float64{0, 0.6, 0.65}
+	if got := g.Size(); got != baseSize*3 {
+		t.Errorf("Size with 3 CloseFrac levels = %d; want %d", got, baseSize*3)
+	}
+	if len(g.GenerateCoarse()) != g.Size() {
+		t.Errorf("GenerateCoarse count %d != Size %d", len(g.GenerateCoarse()), g.Size())
+	}
+
+	// An empty CloseFrac defaults to one level (guard off), not zero sets.
+	g2 := DefaultCoarseGrid()
+	g2.CloseFrac = nil
+	if len(g2.GenerateCoarse()) != g2.Size() || len(g2.GenerateCoarse()) == 0 {
+		t.Errorf("empty CloseFrac should default to 1 level: gen=%d size=%d", len(g2.GenerateCoarse()), g2.Size())
+	}
+}

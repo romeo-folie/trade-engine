@@ -44,6 +44,26 @@ func (s *ORBScheduler) passesRangeQuality(ctx context.Context, ticker string, r 
 	return true, ratio, ""
 }
 
+// CloseFractionEligibility reports which breakout sides survive the close-position guard
+// (config.Instrument.CloseFracThreshold): the buy side is eligible only when the range
+// locked with price near its top (CloseFrac >= threshold), the sell side only when it
+// locked near its bottom (CloseFrac <= 1 - threshold). With a threshold in (0.5, 1) a
+// mid-range close disables BOTH sides (directionless chop → skip the session). applied is
+// false when the guard is off (threshold <= 0), so the caller leaves both sides untouched
+// rather than treating the always-true bounds as a decision.
+//
+// Unlike the ATR/spread gates there is no market-data fetch and thus no fail-open path:
+// CloseFrac is computed from the same formation bars that defined the range, so it is
+// always available whenever a range exists. A degenerate range already yields CloseFrac
+// 0.5 (see RangeBuffer.Add), which keeps both sides for any threshold <= 0.5.
+func CloseFractionEligibility(r *OpeningRange, inst config.Instrument) (buyOK, sellOK, applied bool) {
+	if inst.CloseFracThreshold <= 0 || r == nil {
+		return true, true, false
+	}
+	t := inst.CloseFracThreshold
+	return r.CloseFrac >= t, r.CloseFrac <= 1-t, true
+}
+
 // instrumentATR fetches a thin lookback of the configured ATR timeframe and returns the
 // ATR, or 0 when market data is unavailable or too shallow (ComputeATR's own convention).
 func (s *ORBScheduler) instrumentATR(ctx context.Context, ticker string) float64 {

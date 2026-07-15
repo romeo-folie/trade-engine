@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ var (
 	btSweepValTo       string
 	btSweepFwdFrom     string
 	btSweepFwdTo       string
+	btSweepCloseFrac   string
 )
 
 func init() {
@@ -40,6 +42,7 @@ func init() {
 	orbSweepCmd.Flags().IntVar(&btSweepConcurrency, "concurrency", 8, "Parameter sets to evaluate in parallel")
 	orbSweepCmd.Flags().IntVar(&btSweepTop, "top", 25, "How many ranked candidates to print")
 	orbSweepCmd.Flags().IntVar(&btSweepMaxRuns, "max-runs", 0, "Cap the number of parameter sets (0 = full grid)")
+	orbSweepCmd.Flags().StringVar(&btSweepCloseFrac, "close-frac", "", "Coarse: close-position guard threshold levels to sweep, comma-separated (e.g. 0,0.55,0.6,0.65,0.7). Default: 0 (guard off)")
 	// validate mode
 	orbSweepCmd.Flags().StringVar(&btSweepFromRun, "from-run", "", "validate: parent coarse sweep_id whose gate-passers to walk-forward")
 	orbSweepCmd.Flags().StringVar(&btSweepValFrom, "validate-from", "2025-01-01", "validate: validation window start")
@@ -79,6 +82,28 @@ Results are stored so a later refine/validate run can seed from this run's survi
 	},
 }
 
+// parseFloatCSV parses a comma-separated list of floats (e.g. "0,0.55,0.6") for the
+// --close-frac sweep flag. Each threshold must be in [0, 1) — a value >= 1 would require a
+// close exactly at the range high to arm the buy side, which never fills.
+func parseFloatCSV(s string) ([]float64, error) {
+	parts := splitCSV(s)
+	out := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a number", p)
+		}
+		if v < 0 || v >= 1 {
+			return nil, fmt.Errorf("threshold %v out of range [0, 1)", v)
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	return out, nil
+}
+
 func runCoarseSweep(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -110,6 +135,14 @@ func runCoarseSweep(ctx context.Context) error {
 
 	grid := sweep.DefaultCoarseGrid()
 	grid.Sessions = uni.sessions // e.g. futures sweeps only the DST-aware US RTH open
+	if btSweepCloseFrac != "" {
+		levels, err := parseFloatCSV(btSweepCloseFrac)
+		if err != nil {
+			return fmt.Errorf("invalid --close-frac %q: %w", btSweepCloseFrac, err)
+		}
+		grid.CloseFrac = levels
+		fmt.Printf("NOTE: sweeping close-position guard levels %v (×%d the base grid)\n", levels, len(levels))
+	}
 	sets := grid.GenerateCoarse()
 	if btSweepMaxRuns > 0 && btSweepMaxRuns < len(sets) {
 		fmt.Printf("NOTE: capping %d parameter sets to --max-runs %d\n", len(sets), btSweepMaxRuns)
