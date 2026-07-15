@@ -617,6 +617,17 @@ type Instrument struct {
 	// relative to the planned stop distance: spread / |entry_stop - stop_loss|. 0 disables.
 	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
 
+	// CloseFracThreshold (Phase 2) gates each breakout side on where price closed within the
+	// opening range at lock (OpeningRange.CloseFrac, 0 = at the low, 1 = at the high). It is a
+	// direction-aware guard, not a whole-session skip: the buy side is kept only when
+	// close_frac >= threshold (price finished the range near its top), the sell side only when
+	// close_frac <= 1 - threshold (near its bottom). With a threshold in (0.5, 1) a mid-range
+	// close falls in the [1-threshold, threshold] dead zone and BOTH sides are disabled, so the
+	// session is skipped as directionless chop. A side zeroed here is skipped by the placement
+	// loop, mirroring direction eligibility. 0 (default) disables the guard: buy needs >= 0 and
+	// sell needs <= 1, both always true. Sensible live values are 0.55–0.70.
+	CloseFracThreshold float64 `yaml:"close_frac_threshold"`
+
 	// BreakoutConfirmation (Phase 3) decides what counts as a breakout before entering:
 	//   "" | "stop_touch" — current behaviour: a resting stop fills the instant price
 	//                       touches the breakout level (fills on a wick).
