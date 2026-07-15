@@ -206,7 +206,9 @@ markets:
   dukascopy:
     base_url: ""                 # optional feed override (default datafeed.dukascopy.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/dukascopy)
-    point_scale: {}              # per-symbol price scale overrides, e.g. {"XAU/USD": 1000}
+    point_scale: {}              # per-symbol price scale overrides, e.g. {"XAU/USD": 1000}. Index CFDs (…IDXUSD) default ÷1000.
+    fetch_concurrency: 0         # in-flight hour fetches (0 = default 6); lower to 1 if a cold cache-fill run drowns in 503s
+    min_request_interval_ms: 0   # global spacing between request starts (0 = none); 3000-5000 + fetch_concurrency 1 for a throttled cold IP. Only taxes the first fill — cached hours never re-fetch.
 
   news:
     provider: finnhub             # finnhub | benzinga
@@ -499,6 +501,11 @@ forex_orb:
       # prompts; PR #387 uses 95000 for XAU/XAG). USD-quoted symbols only —
       # Validate rejects it elsewhere. <=0 disables (default).
       max_notional_usd: 0
+      # Dollar value of a 1.0 price-point move per unit/contract. Forex/CFD units are
+      # $1/point — leave 0 (the default). Set only for exchange-listed futures mapped
+      # onto this struct (tick_value / tick_size: MES 5, MNQ 2, MYM 0.5); scales dollar
+      # risk, notional caps and backtest P&L. The futures backtest CLI sets it itself.
+      point_value: 0
       # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
       # bps × capped notional)) and the max round-trip commission as a fraction of
       # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions

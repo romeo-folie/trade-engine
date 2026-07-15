@@ -22,15 +22,15 @@ import (
 // the backtest engine already supports are represented; every field maps to an orbreplay Variant
 // flag or a config value in Resolve.
 type ParamSet struct {
-	Session        string  `json:"session"`         // "london" | "newyork"
-	RangeMinutes   int     `json:"range_minutes"`   // opening-range width: 5 | 15 | 30 | 60
-	Confirmation   string  `json:"confirmation"`    // "stop_touch" | "close_1m" | "close_3m"
-	RiskReward     float64 `json:"risk_reward"`     // take-profit multiple of risk: 1.0 | 1.5 | 2.0
-	MaxHoldMinutes int     `json:"max_hold_minutes"`// time exit: 0 (hold to bracket) | 120 | 240
-	DirectionElig  bool    `json:"direction_elig"`  // trade only the trend-aligned side
-	RangeATRFilter bool    `json:"range_atr_filter"`// skip sessions whose opening range is outside the coarse ATR band
-	AdaptiveExits  bool    `json:"adaptive_exits"`  // break-even + ATR trailing preset
-	CloseFrac      float64 `json:"close_frac"`      // close-position guard threshold (0 = off; arm buy only when range closed in top frac, sell in bottom)
+	Session        string  `json:"session"`          // "london" | "newyork" | "newyork_et" (DST-aware US RTH, futures)
+	RangeMinutes   int     `json:"range_minutes"`    // opening-range width: 5 | 15 | 30 | 60
+	Confirmation   string  `json:"confirmation"`     // "stop_touch" | "close_1m" | "close_3m"
+	RiskReward     float64 `json:"risk_reward"`      // take-profit multiple of risk: 1.0 | 1.5 | 2.0
+	MaxHoldMinutes int     `json:"max_hold_minutes"` // time exit: 0 (hold to bracket) | 120 | 240
+	DirectionElig  bool    `json:"direction_elig"`   // trade only the trend-aligned side
+	RangeATRFilter bool    `json:"range_atr_filter"` // skip sessions whose opening range is outside the coarse ATR band
+	AdaptiveExits  bool    `json:"adaptive_exits"`   // break-even + ATR trailing preset
+	CloseFrac      float64 `json:"close_frac"`       // close-position guard threshold (0 = off; arm buy only when range closed in top frac, sell in bottom)
 }
 
 // Coarse ATR-band and adaptive presets applied when the corresponding boolean knob is on. Kept

@@ -82,9 +82,26 @@ func Retest(maxHold int) Variant {
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
 // full bid/ask spread in price units; half is applied on entry and half on exit (a buy
 // fills at the ask, exits at the bid). CommissionPerSide is charged on both fills.
+// CommissionPerUnit is additionally charged per unit/contract per fill — futures brokers
+// bill per contract, so a flat per-fill figure would understate a multi-contract trade.
 type CostModel struct {
 	Spread            float64 // full bid/ask spread in price units (e.g. 0.00008 for EUR/USD)
 	CommissionPerSide float64 // currency per fill (a round trip pays 2×)
+	CommissionPerUnit float64 // currency per unit/contract per fill (futures; 0 for forex/CFD)
+}
+
+// perFillCommission is a single fill's commission for a qty-unit trade under this model.
+func (c CostModel) perFillCommission(qty int) float64 {
+	return c.CommissionPerSide + c.CommissionPerUnit*float64(qty)
+}
+
+// pointValue is the instrument's dollars-per-point-per-unit multiplier ($1 unless the
+// instrument sets one — futures contracts mapped onto config.Instrument do).
+func pointValue(inst config.Instrument) float64 {
+	if inst.PointValue > 0 {
+		return inst.PointValue
+	}
+	return 1
 }
 
 // SimTrade is one simulated ORB trade.
@@ -145,7 +162,7 @@ func (e *Engine) commissionRiskOK(v Variant, inst config.Instrument, p orb.Brack
 	if inst.MaxCommissionToRisk <= 0 {
 		return true
 	}
-	riskDollars := absf(p.EntryStop-p.StopLoss) * float64(p.Qty)
+	riskDollars := absf(p.EntryStop-p.StopLoss) * float64(p.Qty) * pointValue(inst)
 	if riskDollars <= 0 {
 		return true
 	}
@@ -153,16 +170,23 @@ func (e *Engine) commissionRiskOK(v Variant, inst config.Instrument, p orb.Brack
 	if v.ApplyAdaptiveExit && inst.PartialTakeProfitR > 0 && inst.PartialFraction > 0 {
 		fills = 3.0
 	}
-	return fills*e.costFor(inst.Symbol).CommissionPerSide/riskDollars <= inst.MaxCommissionToRisk
+	// The flat per-fill component scales with the fill COUNT, but the per-unit component
+	// scales with units traded — and a round trip always trades qty in and qty out no
+	// matter how many fills the exit splits into (partial pq + runner qty−pq = qty). So
+	// the per-unit part is 2×qty regardless of `fills`, matching what resolveAdaptiveExit
+	// actually charges; fills×perFill(qty) would overstate a 50% partial's commission 1.5×
+	// and veto trades the simulation itself would keep.
+	cost := e.costFor(inst.Symbol)
+	commission := fills*cost.CommissionPerSide + 2*cost.CommissionPerUnit*float64(p.Qty)
+	return commission/riskDollars <= inst.MaxCommissionToRisk
 }
 
 // Run replays the variant over [from, to] for the given instruments and returns the
 // per-trade results. One opening-range session is simulated per UTC calendar day per
 // instrument; weekend/holiday days simply yield no candles and are skipped.
 func (e *Engine) Run(ctx context.Context, v Variant, from, to time.Time, instruments []config.Instrument, portfolioValue float64) ([]SimTrade, error) {
-	openMin, ok := sessionOpenMinutes(e.cfg.Session)
-	if !ok {
-		return nil, fmt.Errorf("orbreplay: unsupported session %q (use \"london\" or \"newyork\"; run them separately rather than \"both\")", e.cfg.Session)
+	if _, ok := sessionOpenAt(truncateDay(from), e.cfg.Session); !ok {
+		return nil, fmt.Errorf("orbreplay: unsupported session %q (use \"london\", \"newyork\" or \"newyork_et\"; run them separately rather than \"both\")", e.cfg.Session)
 	}
 	rangeMin := e.cfg.RangeMinutes
 	if rangeMin <= 0 {
@@ -179,7 +203,7 @@ func (e *Engine) Run(ctx context.Context, v Variant, from, to time.Time, instrum
 	from = from.UTC()
 	to = to.UTC()
 	for day := truncateDay(from); !day.After(to); day = day.AddDate(0, 0, 1) {
-		sessionOpen := day.Add(time.Duration(openMin) * time.Minute)
+		sessionOpen, _ := sessionOpenAt(day, e.cfg.Session)
 		if sessionOpen.Before(from) || sessionOpen.After(to) {
 			continue
 		}
@@ -485,6 +509,7 @@ func candlesBefore(watch []data.Candle, deadline time.Time) []data.Candle {
 func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketParams, entryMid, atr float64, maxHoldMin int, watch []data.Candle, entryIdx int) *SimTrade {
 	cost := e.costFor(inst.Symbol)
 	half := cost.Spread / 2
+	pv := pointValue(inst)
 
 	entryBar := watch[entryIdx]
 	entryTime := entryBar.Timestamp
@@ -499,33 +524,36 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 
 	var exitType string
 	var exitTime time.Time
-	var gross, exitFill float64 // exitFill 0 for adaptive (blended across partial + runner)
-	exitFills := 1              // entry + this many exit fills determines commission
+	var gross, exitFill, commission float64 // exitFill 0 for adaptive (blended across partial + runner)
 
 	switch {
 	case entryBarStopOut(p, entryBar):
 		// Adverse same-bar stop — adaptive management never gets a chance.
 		exitType, exitTime, exitFill = "stop", entryTime, exitWithSpread(p.Side, p.StopLoss, half)
-		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
+		gross = pnl(p.Side, entryFill, exitFill, p.Qty, pv)
+		commission = 2 * cost.perFillCommission(p.Qty) // entry + single exit, full qty
 	case v.ApplyAdaptiveExit && instHasAdaptiveExits(inst):
-		exitType, gross, exitTime, exitFills = e.resolveAdaptiveExit(maxHoldMin, p, inst, entryFill, half, atr, watch[entryIdx+1:], entryTime)
+		// Commission comes back from the adaptive resolver: with a per-contract
+		// CommissionPerUnit the partial and runner fills trade different quantities, so
+		// it must be accumulated per fill, not reconstructed from a fill count here.
+		exitType, gross, exitTime, commission = e.resolveAdaptiveExit(maxHoldMin, p, inst, entryFill, half, atr, watch[entryIdx+1:], entryTime)
 		// Blended effective exit price (partial + runner) for display: entry + signed
 		// average PnL per unit, so ExitPrice isn't a misleading 0 for adaptive trades.
 		if p.Qty > 0 {
 			if p.Side == "buy" {
-				exitFill = entryFill + gross/float64(p.Qty)
+				exitFill = entryFill + gross/(float64(p.Qty)*pv)
 			} else {
-				exitFill = entryFill - gross/float64(p.Qty)
+				exitFill = entryFill - gross/(float64(p.Qty)*pv)
 			}
 		}
 	default:
 		et, exitMid, ts := e.resolveExit(maxHoldMin, p, watch[entryIdx+1:], entryTime)
 		exitType, exitTime, exitFill = et, ts, exitWithSpread(p.Side, exitMid, half)
-		gross = pnl(p.Side, entryFill, exitFill, p.Qty)
+		gross = pnl(p.Side, entryFill, exitFill, p.Qty, pv)
+		commission = 2 * cost.perFillCommission(p.Qty) // entry + single exit, full qty
 	}
 
-	commission := float64(1+exitFills) * cost.CommissionPerSide
-	riskPerUnit := absf(p.EntryStop - p.StopLoss)
+	riskPerUnit := absf(p.EntryStop-p.StopLoss) * pv
 	var r float64
 	if riskPerUnit > 0 {
 		r = gross / (riskPerUnit * float64(p.Qty))
@@ -688,17 +716,33 @@ func atrBarDuration(tf data.Timeframe) time.Duration {
 	}
 }
 
-// sessionOpenMinutes mirrors the live scheduler: London 08:00 UTC, New York 13:30 UTC.
-// "both" is rejected: the engine runs one session open per day, so silently mapping it
-// to London would simulate only half the sessions and understate the trade count.
-func sessionOpenMinutes(session string) (int, bool) {
+// nyLocation is loaded once for the DST-aware newyork_et session. A load failure (broken
+// tzdata) falls back to fixed EST so the replay stays runnable rather than panicking; the
+// summer sessions would then open an hour late, which the operator will notice immediately.
+var nyLocation = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.FixedZone("EST", -5*3600)
+	}
+	return loc
+}()
+
+// sessionOpenAt resolves the session open time for a UTC calendar day. London 08:00 UTC and
+// New York 13:30 UTC mirror the live forex scheduler's fixed UTC opens. "newyork_et" is the
+// US equity/futures RTH open — 09:30 America/New_York, DST-aware — which a fixed UTC minute
+// cannot express (13:30 UTC is 09:30 ET only in summer; winter sessions would open an hour
+// early). "both" is rejected: the engine runs one session open per day, so silently mapping
+// it to London would simulate only half the sessions and understate the trade count.
+func sessionOpenAt(day time.Time, session string) (time.Time, bool) {
 	switch session {
 	case "london":
-		return 8 * 60, true
+		return day.Add(8 * time.Hour), true
 	case "newyork":
-		return 13*60 + 30, true
+		return day.Add(13*time.Hour + 30*time.Minute), true
+	case "newyork_et":
+		return time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, nyLocation).UTC(), true
 	default:
-		return 0, false
+		return time.Time{}, false
 	}
 }
 
@@ -707,11 +751,18 @@ func truncateDay(t time.Time) time.Time {
 	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }
 
-func pnl(side string, entry, exit float64, qty int) float64 {
-	if side == "sell" {
-		return (entry - exit) * float64(qty)
+// pnl is the dollar P&L of a qty-unit position: price move × qty × pointValue. pointValue
+// is the dollars-per-point-per-unit multiplier (1 for forex/CFD, the contract multiplier
+// for futures — MES $5/pt, MYM $0.50/pt).
+func pnl(side string, entry, exit float64, qty int, pv float64) float64 {
+	if pv <= 0 {
+		pv = 1
 	}
-	return (exit - entry) * float64(qty)
+	units := float64(qty) * pv
+	if side == "sell" {
+		return (entry - exit) * units
+	}
+	return (exit - entry) * units
 }
 
 func absf(x float64) float64 {

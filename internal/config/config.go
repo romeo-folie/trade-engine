@@ -67,20 +67,20 @@ type CacheConfig struct {
 
 // ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
 type ORBConfig struct {
-	Enabled            bool    `yaml:"enabled"`
-	Mode               string  `yaml:"mode"`                 // "paper" | "live"
-	GapThresholdPct    float64 `yaml:"gap_threshold_pct"`    // minimum gap % (e.g. 3.0)
-	MinPrice           float64 `yaml:"min_price"`            // drop gap movers trading below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.
-	MinDollarVolume    float64 `yaml:"min_dollar_volume"`    // drop gap movers whose price×volume is below this before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop genuinely liquid names — only enable on a SIP-backed deployment.
-	MaxCandidates      int     `yaml:"max_candidates"`       // 1–5 (how many scored candidates to actually trade)
-	MaxScanCandidates  int     `yaml:"max_scan_candidates"`  // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked liquidity-first (|gap%| × log10 dollar-volume), so this keeps the most tradeable ones.
+	Enabled                 bool    `yaml:"enabled"`
+	Mode                    string  `yaml:"mode"`                      // "paper" | "live"
+	GapThresholdPct         float64 `yaml:"gap_threshold_pct"`         // minimum gap % (e.g. 3.0)
+	MinPrice                float64 `yaml:"min_price"`                 // drop gap movers trading below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.
+	MinDollarVolume         float64 `yaml:"min_dollar_volume"`         // drop gap movers whose price×volume is below this before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop genuinely liquid names — only enable on a SIP-backed deployment.
+	MaxCandidates           int     `yaml:"max_candidates"`            // 1–5 (how many scored candidates to actually trade)
+	MaxScanCandidates       int     `yaml:"max_scan_candidates"`       // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked liquidity-first (|gap%| × log10 dollar-volume), so this keeps the most tradeable ones.
 	ScanConfidenceThreshold float64 `yaml:"scan_confidence_threshold"` // min aggregated analyst conviction for a gap candidate to be tradeable (0 = default 0.68). The equities scan aggregates whatever analysts are reachable by confidence — no arbiter required — so scoring survives a provider/arbiter outage.
-	RangeMinutes       int     `yaml:"range_minutes"`        // 5 or 15
-	RiskReward         float64 `yaml:"risk_reward"`          // e.g. 2.0
-	MaxRiskPct         float64 `yaml:"max_risk_pct"`         // max loss per trade as % of portfolio
-	MaxPositionPct     float64 `yaml:"max_position_pct"`     // max notional per trade as % of portfolio (e.g. 10.0)
-	NewsLookbackHours  int     `yaml:"news_lookback_hours"`  // e.g. 24
-	ScanCadenceMinutes int     `yaml:"scan_cadence_minutes"` // minimum minutes between pre-market scans (default 2)
+	RangeMinutes            int     `yaml:"range_minutes"`             // 5 or 15
+	RiskReward              float64 `yaml:"risk_reward"`               // e.g. 2.0
+	MaxRiskPct              float64 `yaml:"max_risk_pct"`              // max loss per trade as % of portfolio
+	MaxPositionPct          float64 `yaml:"max_position_pct"`          // max notional per trade as % of portfolio (e.g. 10.0)
+	NewsLookbackHours       int     `yaml:"news_lookback_hours"`       // e.g. 24
+	ScanCadenceMinutes      int     `yaml:"scan_cadence_minutes"`      // minimum minutes between pre-market scans (default 2)
 }
 
 // CostConfig controls the user-facing cost profile and budget guardrails.
@@ -553,8 +553,16 @@ type DukascopyConfig struct {
 	// re-trigger throttling. Empty → default ~/.tradeengine/dukascopy-cache; "off" disables.
 	CacheDir string `yaml:"cache_dir"`
 	// PointScale optionally overrides the integer→price divisor per ticker (e.g. XAU/USD).
-	// Defaults: 5-decimal FX ÷1e5, JPY pairs and metals ÷1e3.
+	// Defaults: 5-decimal FX ÷1e5, JPY pairs, metals and …IDXUSD index CFDs ÷1e3.
 	PointScale map[string]float64 `yaml:"point_scale"`
+	// FetchConcurrency bounds in-flight hour fetches (0 → default 6). The free feed's
+	// burst tolerance varies; when a cache-fill run drowns in 503s, lower this to 1.
+	FetchConcurrency int `yaml:"fetch_concurrency"`
+	// MinRequestIntervalMs spaces request STARTS globally across all workers (0 → no
+	// spacing). The 2026 feed throttles bursts hard (~1 request per 3-5s tolerated from a
+	// cold IP); 3000-5000 with fetch_concurrency 1 makes a first cache fill slow but
+	// reliable. Cached hours are never re-fetched, so this only taxes the first run.
+	MinRequestIntervalMs int `yaml:"min_request_interval_ms"`
 }
 
 // OANDAConfig configures the OANDA v20 REST data provider used by the ORB backtest
@@ -674,6 +682,14 @@ type Instrument struct {
 	// entry×qty is denominated in the pair's QUOTE currency, which equals USD only for USD-quoted
 	// pairs — Validate rejects this field on any non-…/USD symbol.
 	MaxNotionalUSD float64 `yaml:"max_notional_usd"`
+
+	// PointValue is the dollar value of a 1.0 price-point move per unit/contract. Forex and
+	// CFD units are $1/point (the default when <= 0), so existing instruments are unaffected.
+	// Exchange-listed futures move more than $1 per point per contract (MES $5, MNQ $2,
+	// MYM $0.50) — the backtest CLI sets this from tick_value/tick_size when mapping a
+	// FuturesInstrument onto this struct. Applied in sizeForexQty (dollar risk and notional
+	// are price × point_value) and in the orbreplay engine's P&L/R/commission math.
+	PointValue float64 `yaml:"point_value"`
 
 	// CommissionPerSide is the estimated broker commission in account currency per fill
 	// (a bracket round trip pays 2×). Set it to max(broker minimum, bps × typical notional)

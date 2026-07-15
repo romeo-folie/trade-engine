@@ -126,7 +126,14 @@ func ComputeForexBracket(r *OpeningRange, side string, portfolioValue float64, c
 // Returns 0 when even the minimum lot breaches the notional cap ("cannot trade"). Shared by the
 // range bracket and the retest bracket so both size identically.
 func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig, inst config.Instrument) int {
-	riskPerUnit := math.Abs(entry - stop)
+	// PointValue converts price points to dollars per unit ($1 for forex/CFD units, the
+	// per-contract multiplier for futures mapped onto this struct). It scales the dollar
+	// risk AND the notional caps below; the default 1 keeps forex sizing byte-identical.
+	pv := inst.PointValue
+	if pv <= 0 {
+		pv = 1
+	}
+	riskPerUnit := math.Abs(entry-stop) * pv
 	if riskPerUnit < 0.0001 {
 		riskPerUnit = 0.0001
 	}
@@ -153,7 +160,7 @@ func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig
 		if marginRate <= 0 || marginRate > 1 {
 			marginRate = 1.0 // unset (or invalid) → cap on full notional, the pre-margin behaviour
 		}
-		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / (entry * marginRate)))
+		maxQtyByNotional := int(math.Floor(portfolioValue * cfg.MaxPositionPct / 100.0 / (entry * pv * marginRate)))
 		if lotSize > 0 {
 			maxQtyByNotional = (maxQtyByNotional / lotSize) * lotSize
 			if maxQtyByNotional < lotSize {
@@ -171,7 +178,7 @@ func sizeForexQty(entry, stop, portfolioValue float64, cfg config.ForexORBConfig
 	// margin-cap result. If even one lot exceeds the cap, qty→0 (cannot trade) rather
 	// than placing an order that would be rejected — same convention as the margin cap.
 	if inst.MaxNotionalUSD > 0 && entry > 0 {
-		maxQtyByValue := int(math.Floor(inst.MaxNotionalUSD / entry))
+		maxQtyByValue := int(math.Floor(inst.MaxNotionalUSD / (entry * pv)))
 		if lotSize > 0 {
 			maxQtyByValue = (maxQtyByValue / lotSize) * lotSize
 			if maxQtyByValue < lotSize {

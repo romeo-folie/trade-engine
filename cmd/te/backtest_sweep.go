@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/backtest/orbreplay"
@@ -34,6 +35,8 @@ func init() {
 	orbSweepCmd.Flags().StringVar(&btORBTo, "to", "", "Coarse: end date YYYY-MM-DD")
 	orbSweepCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	orbSweepCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda")
+	orbSweepCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb.instruments via free index-CFD proxy data)")
+	orbSweepCmd.Flags().IntVar(&btORBDukaPaceMs, "duka-pace-ms", 0, "Dukascopy politeness: >0 forces 1 in-flight fetch spaced this many ms apart (overrides config). Warm the cache first (resumable) with a paced single-variant backtest, then sweep off disk.")
 	orbSweepCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
 	orbSweepCmd.Flags().StringVar(&btSweepMode, "mode", "coarse", "Sweep mode: coarse | validate")
 	orbSweepCmd.Flags().IntVar(&btSweepConcurrency, "concurrency", 8, "Parameter sets to evaluate in parallel")
@@ -124,18 +127,14 @@ func runCoarseSweep(ctx context.Context) error {
 
 	// Base config: the coarse grid overrides session/range/risk-reward per set, so the base only
 	// supplies the fields the sweep does not vary (timezone, ATR/trend settings, sizing caps).
-	base := cfg.ForexORB
-	instruments, err := resolveInstruments(base, btORBInstruments)
+	// The universe (instruments, costs, provider, sweepable sessions) comes from --asset-class.
+	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
-	provider, err := buildBacktestProvider(cfg)
-	if err != nil {
-		return err
-	}
-	costs := buildCostModels(instruments)
 
 	grid := sweep.DefaultCoarseGrid()
+	grid.Sessions = uni.sessions // e.g. futures sweeps only the DST-aware US RTH open
 	if btSweepCloseFrac != "" {
 		levels, err := parseFloatCSV(btSweepCloseFrac)
 		if err != nil {
@@ -154,15 +153,15 @@ func runCoarseSweep(ctx context.Context) error {
 		return fmt.Errorf("connect DB: %w", err)
 	}
 	db := store.GetDB()
-	sweepID, err := store.CreateSweepRun(ctx, db, "coarse", from, to, nil, "")
+	sweepID, err := store.CreateSweepRun(ctx, db, "coarse", from, to, nil, assetClassNote(""))
 	if err != nil {
 		return fmt.Errorf("create sweep run: %w", err)
 	}
 
 	fmt.Printf("orb-sweep coarse · %s -> %s · %d sets · %d instruments · concurrency %d\nsweep_id %s\n\n",
-		btORBFrom, btORBTo, len(sets), len(instruments), btSweepConcurrency, sweepID)
+		btORBFrom, btORBTo, len(sets), len(uni.instruments), btSweepConcurrency, sweepID)
 
-	runner := sweep.NewRunner(provider, base, instruments, costs, btORBCapital, btSweepConcurrency)
+	runner := sweep.NewRunner(uni.provider, uni.base, uni.instruments, uni.costs, btORBCapital, btSweepConcurrency)
 	results := runner.RunAll(ctx, sets, from, to, func(done, total int) {
 		if done%25 == 0 || done == total {
 			fmt.Printf("\r  evaluated %d/%d", done, total)
@@ -308,16 +307,10 @@ func runValidateSweep(ctx context.Context) error {
 		return fmt.Errorf("forward window: %w", err)
 	}
 
-	base := cfg.ForexORB
-	instruments, err := resolveInstruments(base, btORBInstruments)
+	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
-	provider, err := buildBacktestProvider(cfg)
-	if err != nil {
-		return err
-	}
-	costs := buildCostModels(instruments)
 
 	if err := store.Connect(ctx); err != nil {
 		return fmt.Errorf("connect DB: %w", err)
@@ -326,6 +319,18 @@ func runValidateSweep(ctx context.Context) error {
 	parent, err := store.GetSweepRun(ctx, db, btSweepFromRun)
 	if err != nil {
 		return fmt.Errorf("parent run %s not found: %w", btSweepFromRun, err)
+	}
+	// The universe (instruments/costs/sessions) must match the one the parent was swept
+	// with — otherwise futures survivors silently replay against forex instruments (or
+	// vice versa) and the walk-forward table is plausible-looking nonsense. The parent's
+	// asset class is stamped in its notes at coarse time.
+	parentFutures := strings.Contains(parent.Notes, "asset_class=futures")
+	if parentFutures != (btORBAssetClass == "futures") {
+		parentClass, flagHint := "forex", "omit --asset-class (or pass forex)"
+		if parentFutures {
+			parentClass, flagHint = "futures", "re-run with --asset-class futures"
+		}
+		return fmt.Errorf("parent run %s was swept with asset_class=%s — %s", btSweepFromRun, parentClass, flagHint)
 	}
 
 	// Survivors: the parent's gate-passing configs (PF>1.15, EXP>0.05R, >=100 trades on any
@@ -346,7 +351,7 @@ func runValidateSweep(ctx context.Context) error {
 		sets = append(sets, p)
 	}
 
-	valRunID, err := store.CreateSweepRun(ctx, db, "validate", valFrom, valTo, &btSweepFromRun, "walk-forward of "+btSweepFromRun)
+	valRunID, err := store.CreateSweepRun(ctx, db, "validate", valFrom, valTo, &btSweepFromRun, assetClassNote("walk-forward of "+btSweepFromRun))
 	if err != nil {
 		return fmt.Errorf("create validate run: %w", err)
 	}
@@ -354,7 +359,7 @@ func runValidateSweep(ctx context.Context) error {
 		btSweepFromRun, parent.PeriodFrom.Format("2006-01-02"), parent.PeriodTo.Format("2006-01-02"),
 		len(sets), btSweepValFrom, btSweepValTo, btSweepFwdFrom, fwdToStr, valRunID)
 
-	runner := sweep.NewRunner(provider, base, instruments, costs, btORBCapital, btSweepConcurrency)
+	runner := sweep.NewRunner(uni.provider, uni.base, uni.instruments, uni.costs, btORBCapital, btSweepConcurrency)
 	prog := func(label string) func(done, total int) {
 		return func(done, total int) {
 			if done%10 == 0 || done == total {
@@ -388,6 +393,20 @@ func runValidateSweep(ctx context.Context) error {
 		return err
 	}
 	return printWalkForward(ctx, btSweepFromRun, valRunID)
+}
+
+// assetClassNote stamps the sweep run's asset class into its notes so validate mode can
+// verify a --from-run parent was swept over the same instrument universe. Forex (the
+// default) is left unstamped for continuity with pre-futures runs.
+func assetClassNote(base string) string {
+	if btORBAssetClass != "futures" {
+		return base
+	}
+	note := "asset_class=futures (index micros over CFD proxy data)"
+	if base == "" {
+		return note
+	}
+	return base + " · " + note
 }
 
 // parseWindow parses an inclusive [from, to] date window into UTC bounds (to extended to end-of-day).

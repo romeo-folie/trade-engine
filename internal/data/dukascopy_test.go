@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -461,5 +462,94 @@ func TestDukascopy_DiskCache_DoesNotPersistTransientSkip(t *testing.T) {
 	}
 	if len(bars) != 1 || math.Abs(bars[0].Close-1.10140) > 1e-9 {
 		t.Fatalf("recovery bars = %+v; want 1 bar close 1.10140 (transient skip must not have been cached)", bars)
+	}
+}
+
+func TestPriceDivisor_IndexCFDs(t *testing.T) {
+	c := NewDukascopyClient("", "", nil)
+	// Index CFDs are ÷1e3, empirically verified against 2024-03-14 ticks (USA30IDXUSD raw
+	// 38897625 → 38,897.6; USSC2000IDXUSD raw 2038126 → 2,038.1). FX majors stay ÷1e5.
+	for sym, want := range map[string]float64{
+		"USA30IDXUSD": 1000, "USA500IDXUSD": 1000, "USATECHIDXUSD": 1000, "USSC2000IDXUSD": 1000,
+		"EUR/USD": 100000, "XAU/USD": 1000,
+	} {
+		if got := c.priceDivisor(sym); got != want {
+			t.Errorf("priceDivisor(%s) = %v; want %v", sym, got, want)
+		}
+	}
+	// Config override still wins.
+	c2 := NewDukascopyClient("", "", map[string]float64{"USA30IDXUSD": 10})
+	if got := c2.priceDivisor("USA30IDXUSD"); got != 10 {
+		t.Errorf("point_scale override = %v; want 10", got)
+	}
+}
+
+// TestParseBI5_IndexCFDLevels decodes real Dukascopy index .bi5 fixtures (2024-03-14 14h
+// UTC) end-to-end through the LZMA+scale path and asserts the mid prices land at that day's
+// actual index levels — proving the ÷1000 index divisor is correct for the FULL pipeline,
+// not just the priceDivisor constant. Fixtures are ~35-60KB; committed under testdata/.
+func TestParseBI5_IndexCFDLevels(t *testing.T) {
+	c := NewDukascopyClient("", "", nil)
+	hour := time.Date(2024, 3, 14, 14, 0, 0, 0, time.UTC)
+	cases := []struct {
+		file   string
+		sym    string
+		lo, hi float64 // sane band for that day's index level
+	}{
+		{"testdata/USA30IDXUSD_2024-03-14_14h.bi5", "USA30IDXUSD", 35000, 42000},     // Dow ~38.9k
+		{"testdata/USSC2000IDXUSD_2024-03-14_14h.bi5", "USSC2000IDXUSD", 1800, 2300}, // Russell ~2038
+	}
+	for _, tc := range cases {
+		raw, err := os.ReadFile(tc.file)
+		if err != nil {
+			t.Fatalf("read fixture %s: %v", tc.file, err)
+		}
+		ticks, err := parseBI5(raw, hour, c.priceDivisor(tc.sym))
+		if err != nil {
+			t.Fatalf("%s parseBI5: %v", tc.sym, err)
+		}
+		if len(ticks) == 0 {
+			t.Fatalf("%s: no ticks decoded", tc.sym)
+		}
+		mid := ticks[0].mid
+		if mid < tc.lo || mid > tc.hi {
+			t.Errorf("%s: mid %.1f outside sane band [%.0f,%.0f] — price scale wrong", tc.sym, mid, tc.lo, tc.hi)
+		}
+		t.Logf("%s: %d ticks, first mid %.1f", tc.sym, len(ticks), mid)
+	}
+}
+
+// TestWaitTurn_SpacesRequests verifies the global pacer spaces request starts by at least
+// minInterval even across concurrent callers, and no-ops when unset.
+func TestWaitTurn_SpacesRequests(t *testing.T) {
+	// Unset → immediate.
+	c0 := NewDukascopyClient("", "", nil)
+	start := time.Now()
+	for range 5 {
+		if !c0.waitTurn(context.Background()) {
+			t.Fatal("waitTurn returned false with no context cancel")
+		}
+	}
+	if d := time.Since(start); d > 20*time.Millisecond {
+		t.Errorf("unset pacer took %s; want ~0", d)
+	}
+
+	// 50ms spacing → 3 turns span ≥100ms (2 gaps).
+	c := NewDukascopyClient("", "", nil, DukascopyOptions{MinRequestInterval: 50 * time.Millisecond})
+	start = time.Now()
+	for range 3 {
+		c.waitTurn(context.Background())
+	}
+	if d := time.Since(start); d < 100*time.Millisecond {
+		t.Errorf("3 paced turns took %s; want ≥100ms", d)
+	}
+
+	// Cancelled context → false, promptly.
+	c2 := NewDukascopyClient("", "", nil, DukascopyOptions{MinRequestInterval: time.Hour})
+	c2.waitTurn(context.Background()) // consume the first free slot
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if c2.waitTurn(ctx) {
+		t.Error("waitTurn returned true on a cancelled context")
 	}
 }
