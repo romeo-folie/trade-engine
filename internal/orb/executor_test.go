@@ -296,3 +296,53 @@ func TestComputeForexBracket_PointValue(t *testing.T) {
 		}
 	})
 }
+
+func TestSnapToTick(t *testing.T) {
+	cases := []struct{ price, tick, want float64 }{
+		{100.03, 0.25, 100.00},  // rounds down
+		{100.13, 0.25, 100.25},  // rounds up
+		{100.125, 0.25, 100.25}, // half rounds up (math.Round)
+		{100.0, 0.25, 100.0},    // already on tick
+		{1.23456, 0, 1.23456},   // tick 0 = no-op (forex)
+		{1.23456, -1, 1.23456},  // negative = no-op
+	}
+	for _, c := range cases {
+		if got := snapToTick(c.price, c.tick); math.Abs(got-c.want) > 1e-9 {
+			t.Errorf("snapToTick(%v, %v) = %v; want %v", c.price, c.tick, got, c.want)
+		}
+	}
+}
+
+func TestComputeForexBracket_SnapsFuturesTakeProfit(t *testing.T) {
+	// A futures-shaped instrument with a fractional-tick target: range 4990-5000, buffer 5
+	// → entry 5005, stop 4985, risk 20. TP = 5005 + 20×2.1 = 5047.0 (already a 0.25 multiple),
+	// so use RR 2.1 with a range that yields an off-tick TP: risk 20 × 2.15 = 43 → TP 5048.0.
+	// Pick RR 1.3: TP = 5005 + 20×1.3 = 5031.0 (on-tick). Use a non-multiple: risk 20×0.3=6 →
+	// entry+6=5011 on-tick. Force off-tick via tick 0.25 and RR 0.075 → 20×0.075=1.5 → 5006.5
+	// (on 0.25). Simplest: assert TP is always a tick multiple for a range of RRs.
+	r := &OpeningRange{Ticker: "MNQ", High: 5000, Low: 4993}
+	inst := config.Instrument{Symbol: "MNQ", SecType: "FUT", MinLotSize: 1, PipBuffer: 0.5, PointValue: 2, TickSize: 0.25}
+	for _, rr := range []float64{1.0, 1.3, 1.5, 2.0, 2.15, 3.33} {
+		cfg := config.ForexORBConfig{RiskReward: rr, MaxRiskPct: 1.0, MaxPositionPct: 0}
+		for _, side := range []string{"buy", "sell"} {
+			b := ComputeForexBracket(r, side, 100000, cfg, inst)
+			for _, p := range []float64{b.EntryStop, b.StopLoss, b.TakeProfit} {
+				if rem := math.Abs(p/0.25 - math.Round(p/0.25)); rem > 1e-6 {
+					t.Errorf("rr=%.2f %s: price %.4f not a 0.25-tick multiple", rr, side, p)
+				}
+			}
+		}
+	}
+}
+
+func TestComputeForexBracket_ForexUnaffectedByTickSnap(t *testing.T) {
+	// TickSize 0 (forex) must leave prices exactly as the raw arithmetic produces them.
+	r := &OpeningRange{Ticker: "EUR/USD", High: 1.1010, Low: 1.1000}
+	cfg := config.ForexORBConfig{RiskReward: 2.0, MaxRiskPct: 1.0, MaxPositionPct: 0}
+	inst := config.Instrument{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 1, PipBuffer: 0.0002} // TickSize unset
+	b := ComputeForexBracket(r, "buy", 100000, cfg, inst)
+	// entry 1.1012, stop 1.0998, risk 0.0014, TP 1.1012+0.0028 = 1.1040 — exact, unrounded.
+	if math.Abs(b.EntryStop-1.1012) > 1e-9 || math.Abs(b.StopLoss-1.0998) > 1e-9 || math.Abs(b.TakeProfit-1.1040) > 1e-9 {
+		t.Errorf("forex bracket changed by tick snap: entry=%.6f stop=%.6f tp=%.6f", b.EntryStop, b.StopLoss, b.TakeProfit)
+	}
+}

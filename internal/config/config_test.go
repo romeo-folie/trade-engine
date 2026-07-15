@@ -773,3 +773,58 @@ func TestValidateForexCloseFracThreshold(t *testing.T) {
 		t.Error("expected negative close_frac_threshold to be rejected")
 	}
 }
+
+func TestFuturesInstrument_ToInstrument(t *testing.T) {
+	fi := FuturesInstrument{
+		Symbol: "MNQ", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, MarginRate: 0.10,
+		MaxHoldMinutes: 240, BreakoutConfirmation: "retest_range", RetestTolerance: 0.25,
+		RetestTimeoutMinutes: 30, DirectionEligibility: true, CommissionPerSide: 0.85,
+		MaxCommissionToRisk: 0.1, RiskMultiplier: 1.5, MaxNotionalUSD: 95000,
+		MinRangeATR: 0.5, MaxRangeATR: 3.0, MaxSpreadToRisk: 0.08,
+		BreakEvenR: 1.0, TrailATRMult: 1.5, TrailAfterR: 1.0,
+		PartialTakeProfitR: 1.0, PartialFraction: 0.5, RunnerTakeProfitR: 2.0,
+	}
+	got := fi.ToInstrument()
+
+	// Derived fields.
+	if got.SecType != "FUT" || got.MinLotSize != 1 {
+		t.Errorf("SecType/MinLotSize = %q/%d; want FUT/1", got.SecType, got.MinLotSize)
+	}
+	if got.PipBuffer != 0.5 { // tick_buffer 2 × tick_size 0.25
+		t.Errorf("PipBuffer = %v; want 0.5", got.PipBuffer)
+	}
+	if got.PointValue != 2.0 { // tick_value 0.50 / tick_size 0.25
+		t.Errorf("PointValue = %v; want 2.0", got.PointValue)
+	}
+	if got.TickSize != 0.25 {
+		t.Errorf("TickSize = %v; want 0.25", got.TickSize)
+	}
+	// Strategy fields copied straight across.
+	if got.BreakoutConfirmation != "retest_range" || got.DirectionEligibility != true ||
+		got.MaxHoldMinutes != 240 || got.CommissionPerSide != 0.85 || got.RiskMultiplier != 1.5 ||
+		got.PartialFraction != 0.5 || got.RunnerTakeProfitR != 2.0 || got.MaxNotionalUSD != 95000 {
+		t.Errorf("strategy fields not copied through: %+v", got)
+	}
+
+	// Zero tick size must not divide-by-zero the point value.
+	z := FuturesInstrument{Symbol: "X", TickSize: 0}.ToInstrument()
+	if z.PointValue != 0 {
+		t.Errorf("zero tick_size: PointValue = %v; want 0", z.PointValue)
+	}
+}
+
+func TestFuturesORBConfig_AsForexConfig(t *testing.T) {
+	c := FuturesORBConfig{
+		RangeMinutes: 15, RiskReward: 2.0, MaxRiskPct: 0.5, MaxPositionPct: 20,
+		MaxHoldMinutes: 240, ATRPeriod: 14, ATRTimeframe: "1h", TrendTimeframe: "1h", TrendEMAPeriod: 20,
+	}
+	f := c.AsForexConfig()
+	if f.RangeMinutes != 15 || f.RiskReward != 2.0 || f.MaxRiskPct != 0.5 || f.MaxPositionPct != 20 ||
+		f.MaxHoldMinutes != 240 || f.ATRPeriod != 14 || f.ATRTimeframe != "1h" ||
+		f.TrendTimeframe != "1h" || f.TrendEMAPeriod != 20 {
+		t.Errorf("AsForexConfig mismapped: %+v", f)
+	}
+	if f.Session != "" { // session stays empty — scheduler branches it independently
+		t.Errorf("Session = %q; want empty", f.Session)
+	}
+}

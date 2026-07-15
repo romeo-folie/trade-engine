@@ -67,14 +67,15 @@ func CloseFractionEligibility(r *OpeningRange, inst config.Instrument) (buyOK, s
 // instrumentATR fetches a thin lookback of the configured ATR timeframe and returns the
 // ATR, or 0 when market data is unavailable or too shallow (ComputeATR's own convention).
 func (s *ORBScheduler) instrumentATR(ctx context.Context, ticker string) float64 {
-	if s.marketData == nil || s.forexCfg == nil {
+	if s.marketData == nil || (!s.isForexMode() && !s.isFuturesMode()) {
 		return 0
 	}
-	period := s.forexCfg.ATRPeriod
+	cfg := s.effectiveForexCfg() // forex config, or the futures config mapped onto it
+	period := cfg.ATRPeriod
 	if period <= 0 {
 		period = 14
 	}
-	tf := data.Timeframe(s.forexCfg.ATRTimeframe)
+	tf := data.Timeframe(cfg.ATRTimeframe)
 	if tf == "" {
 		tf = data.Timeframe1Hour
 	}
@@ -126,7 +127,15 @@ func passesCommission(qty int, entryStop, stopLoss float64, inst config.Instrume
 	if inst.MaxCommissionToRisk <= 0 || inst.CommissionPerSide <= 0 {
 		return true, 0, ""
 	}
-	riskDollars := math.Abs(entryStop-stopLoss) * float64(qty)
+	// Dollar risk = price distance × qty × point value. Forex/CFD units are $1/point (pv
+	// defaults to 1), so existing instruments are unchanged; a futures contract's point
+	// value (MNQ $2, MES $5) must be applied or the ratio is inflated by that multiple and
+	// the gate wrongly disables valid sides. Matches the backtest's commissionRiskOK.
+	pv := inst.PointValue
+	if pv <= 0 {
+		pv = 1
+	}
+	riskDollars := math.Abs(entryStop-stopLoss) * float64(qty) * pv
 	if riskDollars <= 0 {
 		return true, 0, ""
 	}

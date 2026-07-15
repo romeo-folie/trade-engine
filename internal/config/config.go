@@ -691,6 +691,12 @@ type Instrument struct {
 	// are price × point_value) and in the orbreplay engine's P&L/R/commission math.
 	PointValue float64 `yaml:"point_value"`
 
+	// TickSize is the instrument's minimum price increment. 0 (the forex/CFD default) means
+	// prices are not tick-snapped. Futures set it (from FuturesInstrument.TickSize) so bracket
+	// entry/stop/target land on tradeable ticks — an off-tick futures price is rejected by the
+	// exchange. Applied by snapToTick in ComputeForexBracket / ScaleOutBrackets / retest.
+	TickSize float64 `yaml:"tick_size"`
+
 	// CommissionPerSide is the estimated broker commission in account currency per fill
 	// (a bracket round trip pays 2×). Set it to max(broker minimum, bps × typical notional)
 	// for this instrument's size regime. Used by the commission/risk entry gate below and,
@@ -789,6 +795,122 @@ type FuturesInstrument struct {
 	// full-notional cap sizes to zero contracts on a small account. 0/unset = cap on
 	// full notional (the pre-margin behaviour). ESTIMATE — refine against IBKR margin.
 	MarginRate float64 `yaml:"margin_rate"`
+
+	// ── Strategy fields shared with forex Instrument ─────────────────────────────
+	// These make each futures contract carry the same per-instrument strategy config a
+	// forex Instrument does, so futures can route through the shared dual-sided + gated +
+	// confirmation path instead of the long-only gap-sign path. All default 0/"" = off,
+	// preserving the pre-existing behaviour for a contract that configures none of them.
+
+	// MaxHoldMinutes: per-contract time limit on a filled trade (0 inherits the
+	// FuturesORBConfig.MaxHoldMinutes strategy default; both 0 = time exits disabled).
+	MaxHoldMinutes int `yaml:"max_hold_minutes"`
+
+	// Entry-quality gates (Phase 2). range_atr_ratio = opening_range_width / ATR. A session
+	// whose ratio is outside [MinRangeATR, MaxRangeATR] is skipped; a bound of 0 disables
+	// that side. MaxSpreadToRisk rejects a session when spread / |entry−stop| exceeds it.
+	MinRangeATR     float64 `yaml:"min_range_atr"`
+	MaxRangeATR     float64 `yaml:"max_range_atr"`
+	MaxSpreadToRisk float64 `yaml:"max_spread_to_risk"`
+
+	// BreakoutConfirmation (Phase 3): "" / "stop_touch" (resting stop, fills on a touch),
+	// "close_1m" / "close_3m" (require N 1-min closes beyond the level), or "retest_swing" /
+	// "retest_range" (wait for the pullback to retest the level and bounce). retest_* enter
+	// via the live retest path. RetestTolerance/RetestTimeoutMinutes tune the retest_* modes.
+	BreakoutConfirmation string  `yaml:"breakout_confirmation"`
+	RetestTolerance      float64 `yaml:"retest_tolerance"`
+	RetestTimeoutMinutes int     `yaml:"retest_timeout_minutes"`
+
+	// DirectionEligibility (Phase 3): place only the trend-aligned side (price vs the
+	// FuturesORBConfig trend EMA) instead of blind dual-sided brackets. false = dual-sided.
+	DirectionEligibility bool `yaml:"direction_eligibility"`
+
+	// Commission/dollar-risk gate: CommissionPerSide is the estimated commission per fill
+	// (a round trip pays 2×) and MaxCommissionToRisk the max round-trip commission as a
+	// fraction of planned dollar risk. 0 disables the gate; CommissionPerSide also feeds the
+	// backtest cost model. RiskMultiplier scales this contract's per-trade risk (<=0 → 1.0).
+	// MaxNotionalUSD caps order value (entry × qty × point_value) after sizing (0 disables).
+	CommissionPerSide   float64 `yaml:"commission_per_side"`
+	MaxCommissionToRisk float64 `yaml:"max_commission_to_risk"`
+	RiskMultiplier      float64 `yaml:"risk_multiplier"`
+	MaxNotionalUSD      float64 `yaml:"max_notional_usd"`
+
+	// Adaptive exit management (Phase 4). All default 0 = fixed bracket. R = planned risk.
+	BreakEvenR         float64 `yaml:"break_even_r"`
+	TrailATRMult       float64 `yaml:"trail_atr_mult"`
+	TrailAfterR        float64 `yaml:"trail_after_r"`
+	PartialTakeProfitR float64 `yaml:"partial_take_profit_r"`
+	PartialFraction    float64 `yaml:"partial_fraction"`
+	RunnerTakeProfitR  float64 `yaml:"runner_take_profit_r"`
+}
+
+// ToInstrument maps a futures contract onto the forex Instrument shape so it can flow
+// through the shared dual-sided / gated / confirmation ORB path (ComputeForexBracket,
+// the entry-quality gates, direction eligibility, confirmation). This is the LIVE
+// counterpart of the backtest's cmd/te buildFuturesUniverse mapping, kept in one place so
+// live and backtest can't drift on how a contract becomes an Instrument.
+//
+//   - PipBuffer = TickBuffer × TickSize keeps entry/stop on exact tick multiples by
+//     construction (r.High + buffer, r.Low − buffer).
+//   - PointValue = TickValue / TickSize is the $/point multiplier ComputeForexBracket's
+//     sizing and the P&L math need (MES $5, MNQ $2, MYM $0.50).
+//   - TickSize is carried so snapToTick can round the take-profit (which risk×RiskReward
+//     need not land on a tick) to a tradeable price.
+//   - MinLotSize 1 = whole contracts.
+//
+// All Phase 2/3/4 strategy fields are copied straight across.
+func (fi FuturesInstrument) ToInstrument() Instrument {
+	pipBuffer := float64(fi.TickBuffer) * fi.TickSize
+	var pointValue float64
+	if fi.TickSize > 0 {
+		pointValue = fi.TickValue / fi.TickSize
+	}
+	return Instrument{
+		Symbol:               fi.Symbol,
+		SecType:              "FUT",
+		MinLotSize:           1,
+		PipBuffer:            pipBuffer,
+		PointValue:           pointValue,
+		TickSize:             fi.TickSize,
+		MarginRate:           fi.MarginRate,
+		MaxHoldMinutes:       fi.MaxHoldMinutes,
+		MinRangeATR:          fi.MinRangeATR,
+		MaxRangeATR:          fi.MaxRangeATR,
+		MaxSpreadToRisk:      fi.MaxSpreadToRisk,
+		BreakoutConfirmation: fi.BreakoutConfirmation,
+		RetestTolerance:      fi.RetestTolerance,
+		RetestTimeoutMinutes: fi.RetestTimeoutMinutes,
+		DirectionEligibility: fi.DirectionEligibility,
+		CommissionPerSide:    fi.CommissionPerSide,
+		MaxCommissionToRisk:  fi.MaxCommissionToRisk,
+		RiskMultiplier:       fi.RiskMultiplier,
+		MaxNotionalUSD:       fi.MaxNotionalUSD,
+		BreakEvenR:           fi.BreakEvenR,
+		TrailATRMult:         fi.TrailATRMult,
+		TrailAfterR:          fi.TrailAfterR,
+		PartialTakeProfitR:   fi.PartialTakeProfitR,
+		PartialFraction:      fi.PartialFraction,
+		RunnerTakeProfitR:    fi.RunnerTakeProfitR,
+	}
+}
+
+// AsForexConfig maps the futures strategy config onto a ForexORBConfig so futures can reuse
+// ComputeForexBracket / sizeForexQty / the entry-quality gates, which take a ForexORBConfig.
+// Session is left empty (the live scheduler already branches session/timezone on
+// isFuturesMode independently); this only carries the sizing and ATR/trend knobs. Mirrors
+// the backtest's buildFuturesUniverse base-config mapping.
+func (c FuturesORBConfig) AsForexConfig() ForexORBConfig {
+	return ForexORBConfig{
+		RangeMinutes:   c.RangeMinutes,
+		RiskReward:     c.RiskReward,
+		MaxRiskPct:     c.MaxRiskPct,
+		MaxPositionPct: c.MaxPositionPct,
+		MaxHoldMinutes: c.MaxHoldMinutes,
+		ATRPeriod:      c.ATRPeriod,
+		ATRTimeframe:   c.ATRTimeframe,
+		TrendTimeframe: c.TrendTimeframe,
+		TrendEMAPeriod: c.TrendEMAPeriod,
+	}
 }
 
 // OptionsORBConfig configures options-ORB: running the existing ORB signal on a
@@ -827,13 +949,29 @@ type OptionsORBConfig struct {
 // FuturesORBConfig configures the Opening Range Breakout strategy for exchange-listed futures via IBKR.
 // Re-used for different asset class groups (equity index, metals, energy) via separate top-level keys.
 type FuturesORBConfig struct {
-	Enabled        bool                `yaml:"enabled"`
-	SessionOpenET  string              `yaml:"session_open_et"` // "HH:MM" in US/Eastern, e.g. "09:30"
-	RangeMinutes   int                 `yaml:"range_minutes"`
-	RiskReward     float64             `yaml:"risk_reward"`
-	MaxRiskPct     float64             `yaml:"max_risk_pct"`
-	MaxPositionPct float64             `yaml:"max_position_pct"`
-	Instruments    []FuturesInstrument `yaml:"instruments"`
+	Enabled        bool    `yaml:"enabled"`
+	SessionOpenET  string  `yaml:"session_open_et"` // "HH:MM" in US/Eastern, e.g. "09:30"
+	RangeMinutes   int     `yaml:"range_minutes"`
+	RiskReward     float64 `yaml:"risk_reward"`
+	MaxRiskPct     float64 `yaml:"max_risk_pct"`
+	MaxPositionPct float64 `yaml:"max_position_pct"`
+
+	// MaxHoldMinutes is the strategy-level default time limit on a filled futures ORB trade,
+	// applied to any instrument that does not set its own FuturesInstrument.MaxHoldMinutes.
+	// 0 leaves time exits disabled unless an instrument opts in. Mirrors ForexORBConfig.
+	MaxHoldMinutes int `yaml:"max_hold_minutes"`
+
+	// ATRPeriod / ATRTimeframe define the ATR used by the range-quality filter, and
+	// TrendTimeframe / TrendEMAPeriod the EMA used by direction eligibility — the same
+	// filters forex_orb uses, now available to futures once they route through the shared
+	// dual-sided/gated path. Defaults (period 14 / "1h" ATR, "1h" / period 20 trend) match
+	// the forex defaults, so an unset futures config behaves identically.
+	ATRPeriod      int    `yaml:"atr_period"`
+	ATRTimeframe   string `yaml:"atr_timeframe"`
+	TrendTimeframe string `yaml:"trend_timeframe"`
+	TrendEMAPeriod int    `yaml:"trend_ema_period"`
+
+	Instruments []FuturesInstrument `yaml:"instruments"`
 }
 
 // ScannerConfig controls the autonomous market scanner that discovers swing-trade

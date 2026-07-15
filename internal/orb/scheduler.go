@@ -305,6 +305,37 @@ func (s *ORBScheduler) instrumentForTicker(ticker string) *config.Instrument {
 	return nil
 }
 
+// effectiveInstrument returns the per-ticker Instrument config for whichever mode is active:
+// the forex Instrument directly, or a futures contract mapped onto the Instrument shape
+// (FuturesInstrument.ToInstrument) so futures flow through the same dual-sided/gated/
+// confirmation path. Returns nil if the ticker isn't configured for the active mode.
+// The futures case returns a pointer to a fresh mapped value (not shared scheduler state).
+func (s *ORBScheduler) effectiveInstrument(ticker string) *config.Instrument {
+	if s.isFuturesMode() {
+		if fi := s.futuresInstrumentForTicker(ticker); fi != nil {
+			inst := fi.ToInstrument()
+			return &inst
+		}
+		return nil
+	}
+	return s.instrumentForTicker(ticker)
+}
+
+// effectiveForexCfg returns the ForexORBConfig-shaped strategy config for the active mode:
+// the forex config directly, or the futures config mapped onto it (FuturesORBConfig.
+// AsForexConfig) carrying sizing + ATR/trend settings. Used by the shared bracket/sizing/
+// gate functions, which take a ForexORBConfig, so futures reuse them without duplication.
+// Returns a zero config when neither mode is active (callers already guard on mode).
+func (s *ORBScheduler) effectiveForexCfg() config.ForexORBConfig {
+	if s.isFuturesMode() {
+		return s.futuresCfg.AsForexConfig()
+	}
+	if s.forexCfg != nil {
+		return *s.forexCfg
+	}
+	return config.ForexORBConfig{}
+}
+
 // throttledInstrument applies the feedback auto-throttle to an instrument's risk multiplier:
 // it MULTIPLIES the static per-instrument risk_multiplier by the nightly-derived multiplier
 // stored from this instrument's rolling realised expectancy. A complete no-op (returns inst
@@ -1198,8 +1229,8 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 		// Forex/CFD instruments trade at very different price scales than equities,
 		// so use 2× the pip buffer as the minimum range width when available.
 		minRange := 0.01
-		if s.isForexMode() {
-			if inst := s.instrumentForTicker(ticker); inst != nil && inst.PipBuffer > 0 {
+		if s.isForexMode() || s.isFuturesMode() {
+			if inst := s.effectiveInstrument(ticker); inst != nil && inst.PipBuffer > 0 {
 				minRange = inst.PipBuffer * 2
 			}
 		}
@@ -1225,14 +1256,18 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			continue
 		}
 
-		// Forex mode: place dual-sided brackets (buy + sell) so the market
-		// decides direction. Equities/futures: single side from gap direction.
-		if s.isForexMode() {
-			inst := s.instrumentForTicker(ticker)
+		// Forex AND futures: place dual-sided brackets (buy + sell) so the market decides
+		// direction, then apply the entry-quality / direction / confirmation gates. Futures
+		// reach here via effectiveInstrument (FuturesInstrument mapped onto Instrument) and
+		// effectiveForexCfg (FuturesORBConfig mapped onto ForexORBConfig), so they reuse this
+		// whole path instead of the long-only gap-sign branch below. Equities: single side.
+		if s.isForexMode() || s.isFuturesMode() {
+			inst := s.effectiveInstrument(ticker)
 			if inst == nil {
 				slog.Warn("orb: skipping instrument — no config found", "ticker", ticker)
 				continue
 			}
+			fcfg := s.effectiveForexCfg()
 
 			// Entry-quality gate 1: ATR-normalised range filter (Phase 2).
 			if ok, ratio, reason := s.passesRangeQuality(ctx, ticker, r, *inst); !ok {
@@ -1244,8 +1279,8 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// expectancy (a no-op unless enabled and data exists). Computed once, shared by
 			// both sides — they have identical sizing inputs.
 			tinst := s.throttledInstrument(ctx, *inst)
-			buyParams := ComputeForexBracket(r, "buy", portfolioVal, *s.forexCfg, tinst)
-			sellParams := ComputeForexBracket(r, "sell", portfolioVal, *s.forexCfg, tinst)
+			buyParams := ComputeForexBracket(r, "buy", portfolioVal, fcfg, tinst)
+			sellParams := ComputeForexBracket(r, "sell", portfolioVal, fcfg, tinst)
 
 			if buyParams.Qty == 0 && sellParams.Qty == 0 {
 				slog.Warn("orb: skipping instrument — min lot size exceeds position cap", "ticker", ticker)
@@ -1309,6 +1344,17 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					slog.Info("orb: skipping instrument — range closed mid-range (close-position guard)", "ticker", ticker, "close_frac", r.CloseFrac, "threshold", inst.CloseFracThreshold)
 					continue
 				}
+			}
+
+			// Retest modes (retest_swing / retest_range) are NOT wired into the live path yet
+			// (backtest-only). RequiresConfirmation returns false for them, so without this
+			// guard a retest-configured instrument would silently fall through to stop_touch —
+			// a different strategy than configured. Fail closed (skip, don't misfire) until the
+			// live retest entry lands. Remove this once DetectRetest is wired here.
+			if IsRetestMode(inst.BreakoutConfirmation) {
+				slog.Warn("orb: skipping instrument — retest entry not yet wired live (configure stop_touch/close_1m/close_3m, or wait for the retest live path)",
+					"ticker", ticker, "mode", inst.BreakoutConfirmation)
+				continue
 			}
 
 			// Breakout confirmation (Phase 3). With stop_touch (default) we place resting
@@ -1440,6 +1486,9 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				}
 			}
 		} else {
+			// Equities: single side from the pre-market gap direction. (Futures no longer
+			// reach here — they route through the dual-sided/gated forex path above via
+			// effectiveInstrument; the old long-only gap-sign futures placement is gone.)
 			side := "buy"
 			for _, sc := range candidates {
 				if sc.Gap.Ticker == ticker && sc.Gap.GapPct < 0 {
@@ -1447,17 +1496,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				}
 			}
 
-			var params BracketParams
-			if s.isFuturesMode() {
-				fi := s.futuresInstrumentForTicker(ticker)
-				if fi == nil {
-					slog.Warn("orb: skipping — no futures instrument config", "ticker", ticker)
-					continue
-				}
-				params = ComputeFuturesBracket(r, side, portfolioVal, *s.futuresCfg, *fi)
-			} else {
-				params = ComputeBracket(r, side, portfolioVal, s.cfg)
-			}
+			params := ComputeBracket(r, side, portfolioVal, s.cfg)
 
 			if params.Qty == 0 {
 				slog.Warn("orb: skipping — position size too small", "ticker", ticker)

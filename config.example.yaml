@@ -506,6 +506,9 @@ forex_orb:
       # onto this struct (tick_value / tick_size: MES 5, MNQ 2, MYM 0.5); scales dollar
       # risk, notional caps and backtest P&L. The futures backtest CLI sets it itself.
       point_value: 0
+      # Minimum price increment. 0 (forex/CFD default) = prices not tick-snapped. Futures
+      # set it (from the contract's tick_size) so bracket levels land on tradeable ticks.
+      tick_size: 0
       # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
       # bps × capped notional)) and the max round-trip commission as a fraction of
       # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
@@ -571,15 +574,56 @@ futures_orb:
   risk_reward: 2.0
   max_risk_pct: 0.5            # Per-trade risk as % of portfolio (the real risk control)
   max_position_pct: 20.0       # With margin_rate set this caps MARGIN consumed (notional × margin_rate) ≈ $20k budget on $100k — NOT full notional
+  max_hold_minutes: 0          # Strategy-level default time exit (0 = off unless a contract sets its own). Mirrors forex_orb.
+  # ATR (range-quality filter) and trend EMA (direction eligibility) settings — the same
+  # filters forex_orb uses, available once futures route through the shared gated path.
+  atr_period: 14
+  atr_timeframe: "1h"
+  trend_timeframe: "1h"
+  trend_ema_period: 20
   # Micro E-mini index futures (1/10th of the full-size contract). Micros are used so a
   # small/paper account can hold ≥1 contract — a full-size ES (~$280k notional) sizes to
   # zero under the position cap. margin_rate makes max_position_pct cap margin not notional
   # (same lever as forex_orb); ~0.10 is a conservative overnight-margin ESTIMATE, refine
   # against IBKR. Swap in ES/NQ/YM/RTY (tick_value 12.50/5.00/5.00/5.00, no margin_rate or a
   # smaller one) for a full-size account. Quarterly expiry (Mar/Jun/Sep/Dec).
+  #
+  # Per-contract strategy fields (all default 0/"" = off) make a futures contract carry the
+  # same config a forex instrument does, so it routes through the shared dual-sided + gated
+  # + confirmation path instead of the long-only gap-sign path. MNQ below shows the full set
+  # (the walk-forward-validated retest_range shape); the others stay minimal.
   instruments:
     - { symbol: MES, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 1.25, tick_buffer: 2, margin_rate: 0.10 }
-    - { symbol: MNQ, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.25, tick_value: 0.50, tick_buffer: 2, margin_rate: 0.10 }
+    - symbol: MNQ
+      exchange: CME
+      asset_class: equity_index
+      expiry_cycle: quarterly
+      tick_size: 0.25
+      tick_value: 0.50
+      tick_buffer: 2
+      margin_rate: 0.10
+      max_hold_minutes: 240        # flatten a filled trade after 4h
+      min_range_atr: 0.0           # range-quality band (0 = that bound off)
+      max_range_atr: 0.0
+      max_spread_to_risk: 0.0      # skip if spread / |entry−stop| exceeds this (0 = off)
+      # "" | stop_touch | close_1m | close_3m are live now; retest_swing / retest_range are
+      # backtest-only until the live retest path lands (the scheduler skips a retest-configured
+      # instrument until then). retest_range is the strongest walk-forward MNQ config — the
+      # upgrade target once retest goes live.
+      breakout_confirmation: close_3m
+      retest_tolerance: 0.25       # retest_* only: pullback within this fraction of range width
+      retest_timeout_minutes: 30   # retest_* only: bounce must occur within N minutes of breakout
+      direction_eligibility: false # true = trade only the trend-aligned side
+      commission_per_side: 0.85    # $/contract/side; also feeds the backtest cost model + commission gate
+      max_commission_to_risk: 0.0  # skip if round-trip commission / dollar-risk exceeds this (0 = off)
+      risk_multiplier: 1.0         # scale this contract's per-trade risk (<=0 → 1.0)
+      max_notional_usd: 0.0        # cap order value (entry × qty × point_value) after sizing (0 = off)
+      break_even_r: 0.0            # adaptive exits (0 = fixed bracket)
+      trail_atr_mult: 0.0
+      trail_after_r: 0.0
+      partial_take_profit_r: 0.0
+      partial_fraction: 0.0
+      runner_take_profit_r: 0.0
     - { symbol: MYM, exchange: CBOT, asset_class: equity_index, expiry_cycle: quarterly, tick_size: 1.00, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
     - { symbol: M2K, exchange: CME,  asset_class: equity_index, expiry_cycle: quarterly, tick_size: 0.10, tick_value: 0.50, tick_buffer: 4, margin_rate: 0.10 }
 
@@ -625,10 +669,42 @@ futures_orb_metals:
   risk_reward: 2.0
   max_risk_pct: 1.0
   max_position_pct: 30.0
+  max_hold_minutes: 0          # strategy-level default time exit (0 = off)
+  atr_period: 14               # ATR (range-quality filter) / trend EMA (direction eligibility) — shared gated path
+  atr_timeframe: "1h"
+  trend_timeframe: "1h"
+  trend_ema_period: 20
   # margin_rate (optional): caps max_position_pct on margin consumed instead of full
   # notional — full-size GC is ~$200k notional, so omit it only on a large account.
+  # Per-contract strategy fields (all default 0/"" = off) work identically to futures_orb —
+  # see that section's MNQ entry for the full documented set. GC shows them here minimally.
   instruments:                 # Monthly expiry
-    - { symbol: GC, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.10,  tick_value: 10.00, tick_buffer: 3, margin_rate: 0.10 }
+    - symbol: GC
+      exchange: COMEX
+      asset_class: metal
+      expiry_cycle: monthly
+      tick_size: 0.10
+      tick_value: 10.00
+      tick_buffer: 3
+      margin_rate: 0.10
+      max_hold_minutes: 0
+      min_range_atr: 0.0
+      max_range_atr: 0.0
+      max_spread_to_risk: 0.0
+      breakout_confirmation: ""
+      retest_tolerance: 0.0
+      retest_timeout_minutes: 0
+      direction_eligibility: false
+      commission_per_side: 0.0
+      max_commission_to_risk: 0.0
+      risk_multiplier: 1.0
+      max_notional_usd: 0.0
+      break_even_r: 0.0
+      trail_atr_mult: 0.0
+      trail_after_r: 0.0
+      partial_take_profit_r: 0.0
+      partial_fraction: 0.0
+      runner_take_profit_r: 0.0
     - { symbol: SI, exchange: COMEX, asset_class: metal, expiry_cycle: monthly, tick_size: 0.005, tick_value: 25.00, tick_buffer: 5, margin_rate: 0.10 }
 
 # ── Market scanner — autonomous candidate discovery ───────────────────────────

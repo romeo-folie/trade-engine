@@ -184,8 +184,8 @@ func TestCloseFractionEligibility(t *testing.T) {
 	inst := config.Instrument{CloseFracThreshold: 0.6}
 
 	cases := []struct {
-		name             string
-		frac             float64
+		name              string
+		frac              float64
 		wantBuy, wantSell bool
 	}{
 		{"closed at high arms buy only", 1.0, true, false},
@@ -243,4 +243,23 @@ func TestRangeBufferCloseFrac(t *testing.T) {
 			t.Errorf("CloseFrac = %.4f, want 0.5 for zero-width range", r.CloseFrac)
 		}
 	})
+}
+
+func TestPassesCommission_PointValue(t *testing.T) {
+	// Futures-shaped: entry-stop distance 20, qty 2, commission $0.85/side, gate 0.06.
+	// With PointValue 2 (MNQ): dollar risk = 20 × 2 × 2 = $80; round trip $1.70 → 0.021 ≤ 0.06 PASS.
+	// Without the point-value multiply, risk would read 20 × 2 = $40 → 0.0425 — still under 0.06
+	// here, so use a tighter gate to prove the multiplier changes the verdict:
+	inst := config.Instrument{Symbol: "MNQ", PointValue: 2, CommissionPerSide: 0.85, MaxCommissionToRisk: 0.03}
+	// entry 5005, stop 4985 → distance 20.
+	if ok, ratio, reason := passesCommission(2, 5005, 4985, inst); !ok {
+		t.Errorf("MNQ commission/risk %.4f should pass 0.03 with point value applied (%s)", ratio, reason)
+	}
+	// Same numbers as a $1/point instrument (pv unset) → risk $40 → ratio 0.0425 > 0.03 → REJECT.
+	// This is the mis-scaling Codex flagged: forgetting the multiplier wrongly disables the side.
+	flat := inst
+	flat.PointValue = 0
+	if ok, ratio, _ := passesCommission(2, 5005, 4985, flat); ok {
+		t.Errorf("without point value the ratio %.4f exceeds 0.03 and must reject (proves pv matters)", ratio)
+	}
 }
