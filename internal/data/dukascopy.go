@@ -105,6 +105,7 @@ const dukascopyMaxFetchFailures = 25
 type DukascopyOptions struct {
 	FetchConcurrency   int           // in-flight hour fetches (0 → 6)
 	MinRequestInterval time.Duration // global spacing between request starts (0 → none)
+	RequestTimeout     time.Duration // per-request HTTP timeout (0 → default 20s)
 }
 
 // NewDukascopyClient creates a client against the historical feed. baseURL defaults to the
@@ -124,13 +125,19 @@ func NewDukascopyClient(baseURL, cacheDir string, pointScale map[string]float64,
 	if opt.FetchConcurrency <= 0 {
 		opt.FetchConcurrency = dukascopyConcurrency
 	}
+	// Default 20s fails fast when a throttled feed hangs the connection. But the 2026 feed
+	// TARPITS bulk fetchers — successful responses slow to ~15-20s, right at the 20s edge, so
+	// they time out and get discarded as gaps (zero cache progress). A caller doing a paced,
+	// patient fill raises this (via RequestTimeout) so tarpitted-but-successful responses land.
+	reqTimeout := opt.RequestTimeout
+	if reqTimeout <= 0 {
+		reqTimeout = 20 * time.Second
+	}
 	return &DukascopyClient{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		cacheDir:   cacheDir,
-		pointScale: pointScale,
-		// 20s (not 60s): a throttled feed hangs the response after the TCP connect; a long
-		// timeout × retries makes one hour take minutes and the run appear stuck. Fail fast.
-		httpClient:    &http.Client{Timeout: 20 * time.Second},
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		cacheDir:      cacheDir,
+		pointScale:    pointScale,
+		httpClient:    &http.Client{Timeout: reqTimeout},
 		maxAttempts:   dukascopyMaxAttempts,
 		concurrency:   opt.FetchConcurrency,
 		minInterval:   opt.MinRequestInterval,

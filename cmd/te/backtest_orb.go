@@ -374,6 +374,7 @@ func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) 
 		if btORBDukaPaceMs > 0 { // --duka-pace-ms: the polite, resumable-fill profile, overrides config
 			opts.FetchConcurrency = 1
 			opts.MinRequestInterval = time.Duration(btORBDukaPaceMs) * time.Millisecond
+			opts.RequestTimeout = 60 * time.Second // the feed tarpits bulk fetchers to ~18s; be patient
 		}
 		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale, opts), nil
 	case "oanda":
