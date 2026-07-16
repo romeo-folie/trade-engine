@@ -45,10 +45,15 @@ func CleanupPromptCache(ctx context.Context) (int64, error) {
 }
 
 // CleanupPortfolioSnapshots removes snapshots older than 180 days.
+// Backfill rows are exempt: they are the compact one-row-per-day historical
+// equity record (stamped at the point's own time), and pruning them would
+// both truncate the 1Y/ALL chart and make the startup backfill re-fetch and
+// re-insert the pruned span on every restart. Retention targets the
+// high-frequency poller/engine rows, which dominate volume.
 func CleanupPortfolioSnapshots(ctx context.Context) (int64, error) {
 	cutoff := time.Now().AddDate(0, 0, -180)
 	tag, err := GetDB().Exec(ctx,
-		`DELETE FROM portfolio_snapshots WHERE created_at < $1`, cutoff)
+		`DELETE FROM portfolio_snapshots WHERE created_at < $1 AND source <> 'backfill'`, cutoff)
 	if err != nil {
 		return 0, err
 	}
