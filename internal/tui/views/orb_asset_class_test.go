@@ -47,6 +47,21 @@ func TestSessionDisplayLabel(t *testing.T) {
 		{Ticker: "XAU/USD", AssetClass: "metal"},
 		{Ticker: "EUR/USD", AssetClass: "forex"},
 	}
+	optionsOnly := []ORBCandidateRow{
+		{Ticker: "SPY", Action: "trade", AssetClass: "option"},
+		{Ticker: "IWM", Action: "trade", AssetClass: "option"},
+	}
+	// An options panel that also has a real equity gapper that cleared the gate,
+	// plus skipped equity gappers that must NOT affect the label.
+	equityAndOptions := []ORBCandidateRow{
+		{Ticker: "SPY", Action: "trade", AssetClass: "option"},
+		{Ticker: "AAPL", Action: "trade", AssetClass: "equity"},
+		{Ticker: "TSLA", Action: "skip", AssetClass: "equity"},
+	}
+	skippedEquitiesOnly := []ORBCandidateRow{
+		{Ticker: "AAPL", Action: "skip", AssetClass: "equity"},
+		{Ticker: "TSLA", Action: "skip", AssetClass: "equity"},
+	}
 	cases := []struct {
 		name       string
 		session    string
@@ -54,6 +69,9 @@ func TestSessionDisplayLabel(t *testing.T) {
 		want       string
 	}{
 		{"equities empty name", "", nil, "equities"},
+		{"equities options-only → options", "", optionsOnly, "options"},
+		{"equities mixed → equities · options", "", equityAndOptions, "equities · options"},
+		{"equities all skipped → equities", "", skippedEquitiesOnly, "equities"},
 		{"futures", "futures", nil, "futures"},
 		{"newyork all metals", "newyork", metals, "metals · newyork"},
 		{"london all metals", "london", metals, "metals · london"},

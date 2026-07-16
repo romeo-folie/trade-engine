@@ -130,11 +130,42 @@ func isSpotMetal(ticker string) bool {
 func sessionDisplayLabel(sessionName string, candidates []ORBCandidateRow) string {
 	switch sessionName {
 	case "":
-		return "equities"
+		// The equities scheduler also hosts the options-ORB force-watch, so this
+		// panel can hold equity gappers, options underlyings, or both. Name it by
+		// what's actually shown rather than by the scheduler — so an options-only
+		// panel reads "options", not "equities".
+		return equitiesSessionLabel(candidates)
 	case "london", "newyork", "both":
 		return forexAssetWord(candidates) + " · " + sessionName
 	default: // "futures" and any future scheduler name
 		return sessionName
+	}
+}
+
+// equitiesSessionLabel names the equities-scheduler panel from its trade-eligible
+// candidates (the only ones RenderORBPanel shows): "options" when the panel holds
+// only options force-watch, "equities · options" when it holds both, else
+// "equities" (the default, including an empty panel).
+func equitiesSessionLabel(candidates []ORBCandidateRow) string {
+	var hasEquity, hasOption bool
+	for _, c := range candidates {
+		if c.Action != "trade" { // mirror RenderORBPanel's eligible filter
+			continue
+		}
+		switch c.AssetClass {
+		case "option":
+			hasOption = true
+		case "equity":
+			hasEquity = true
+		}
+	}
+	switch {
+	case hasOption && !hasEquity:
+		return "options"
+	case hasOption && hasEquity:
+		return "equities · options"
+	default:
+		return "equities"
 	}
 }
 
