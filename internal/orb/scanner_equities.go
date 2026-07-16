@@ -116,7 +116,7 @@ func (s *EquitiesCandidateScanner) ScanCandidates(ctx context.Context) ([]Scored
 		}
 
 		result := aggregateORBScore(analystResults, effectiveScanThreshold(s.Cfg.ScanConfidenceThreshold))
-		scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
+		scored = append(scored, ScoredCandidate{Gap: gap, Score: result, AssetClass: "equity"})
 	}
 
 	return scored, nil

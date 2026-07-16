@@ -37,6 +37,7 @@ func (s *FuturesCandidateScanner) ScanCandidates(ctx context.Context) ([]ScoredC
 			return nil, err
 		}
 		candidates = append(candidates, ScoredCandidate{
+			AssetClass: "futures",
 			Gap: data.GapCandidate{
 				Ticker:        inst.Symbol,
 				GapPct:        0, // futures ORB does not rely on a gap threshold

@@ -38,11 +38,16 @@ func appendForcedOptionsUnderlyings(scored []ScoredCandidate, router *OptionsRou
 			if !isTradeAction(scored[i].Score.Action) {
 				scored[i].Score.Action = "trade"
 			}
+			// This underlying is watched for options execution regardless of how the
+			// gap scan surfaced it, so tag it "option" for the UI (overriding any
+			// "equity" tag from the gapper path).
+			scored[i].AssetClass = "option"
 			continue
 		}
 		scored = append(scored, ScoredCandidate{
-			Gap:   data.GapCandidate{Ticker: u},
-			Score: ORBAnalysisResult{Action: "trade", Conviction: 0, Reasoning: "options-router force-watch"},
+			AssetClass: "option",
+			Gap:        data.GapCandidate{Ticker: u},
+			Score:      ORBAnalysisResult{Action: "trade", Conviction: 0, Reasoning: "options-router force-watch"},
 		})
 	}
 	return scored

@@ -84,6 +84,12 @@ const (
 type ScoredCandidate struct {
 	Gap   data.GapCandidate `json:"gap"`
 	Score ORBAnalysisResult `json:"score"`
+	// AssetClass tags what kind of instrument this candidate is, so the UI can
+	// label it accurately: "equity" | "option" | "metal" | "forex" | "futures".
+	// Stamped at the candidate source (scanners / options force-watch). Empty on
+	// rows persisted before this field existed — the display layer derives a
+	// fallback from the session + ticker for those.
+	AssetClass string `json:"asset_class,omitempty"`
 }
 
 // PortfolioValuer provides the current portfolio value for position sizing.
@@ -988,7 +994,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 			// Winning-action mean over the successful analysts, gated on the confidence
 			// threshold. parseORBResult (inside) pulls the ORB-specific catalyst/risks fields.
 			result := aggregateORBScore(analystResults, s.scanConfidenceThreshold())
-			scored = append(scored, ScoredCandidate{Gap: gap, Score: result})
+			scored = append(scored, ScoredCandidate{Gap: gap, Score: result, AssetClass: "equity"})
 		}
 	}
 	s.lastScan = sessionNow
