@@ -252,7 +252,18 @@ func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) 
 	if timeframe == "" {
 		timeframe = "1D"
 	}
-	days := queryInt(r, "days", 30, 365)
+	// The DB-side window mirrors the requested broker period so both series
+	// cover the same span. An explicit days param still wins.
+	defaultDays := 30
+	switch period {
+	case "3M":
+		defaultDays = 90
+	case "1A":
+		defaultDays = 365
+	case "all":
+		defaultDays = 3650
+	}
+	days := queryInt(r, "days", defaultDays, 3650)
 	mode := r.URL.Query().Get("mode") // "live" | "paper" | "all" (default "all")
 
 	type equityPoint struct {
