@@ -40,6 +40,25 @@ func InsertPortfolioSnapshot(ctx context.Context, totalValue, cash, invested, un
 	return err
 }
 
+// InsertPortfolioSnapshotAt writes a snapshot row with an explicit created_at.
+// Used by the startup backfill so historical Alpaca equity points land on
+// their own calendar day instead of the day the engine happened to restart —
+// otherwise year-old equity values masquerade as current ones and the
+// backfill's per-day dedup can never see its own prior inserts.
+func InsertPortfolioSnapshotAt(ctx context.Context, createdAt time.Time, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, source, mode, broker string) error {
+	if source == "" {
+		source = "engine"
+	}
+	_, err := GetDB().Exec(ctx, `
+		INSERT INTO portfolio_snapshots
+		  (created_at, total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions, source, mode, broker)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		createdAt.UTC(), totalValue, cash, invested, unrealizedPnL, realizedPnLToday, openPositions,
+		source, nullableText(mode), nullableText(broker),
+	)
+	return err
+}
+
 // nullableText converts an empty string to nil so Postgres stores NULL.
 func nullableText(s string) any {
 	if s == "" {
@@ -166,12 +185,16 @@ func GetPeakPortfolioValue(ctx context.Context, since time.Time) (float64, error
 }
 
 // GetLatestPortfolioSnapshot returns the most recent snapshot, or nil if none.
+// Backfill rows are excluded: they carry historical Alpaca equity (with
+// cash/invested unknown, stored as 0) and must never be read as the current
+// account state.
 func GetLatestPortfolioSnapshot(ctx context.Context) (*PortfolioSnapshot, error) {
 	var s PortfolioSnapshot
 	err := GetDB().QueryRow(ctx, `
 		SELECT id, total_value, cash, invested,
 		       unrealized_pnl, realized_pnl_today, open_positions, created_at
 		FROM portfolio_snapshots
+		WHERE source <> 'backfill'
 		ORDER BY created_at DESC LIMIT 1`).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
 		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
@@ -196,7 +219,7 @@ func GetFirstSnapshotOfDay(ctx context.Context, day time.Time) (*PortfolioSnapsh
 		SELECT id, total_value, cash, invested,
 		       unrealized_pnl, realized_pnl_today, open_positions, created_at
 		FROM portfolio_snapshots
-		WHERE created_at >= $1 AND created_at < $2
+		WHERE created_at >= $1 AND created_at < $2 AND source <> 'backfill'
 		ORDER BY created_at ASC LIMIT 1`,
 		start, end).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
@@ -220,7 +243,7 @@ func GetLastSnapshotBeforeDay(ctx context.Context, day time.Time) (*PortfolioSna
 		SELECT id, total_value, cash, invested,
 		       unrealized_pnl, realized_pnl_today, open_positions, created_at
 		FROM portfolio_snapshots
-		WHERE created_at < $1
+		WHERE created_at < $1 AND source <> 'backfill'
 		ORDER BY created_at DESC LIMIT 1`,
 		cutoff).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,

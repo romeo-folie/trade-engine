@@ -115,6 +115,7 @@ function SourceBadge({ source, staleAt }: { source?: string; staleAt?: string | 
 /* ── Component ──────────────────────────────────────────────────────────────── */
 
 type ModeFilter = 'all' | 'live' | 'paper';
+type PeriodKey = '1M' | '3M' | '1A' | 'all';
 const CHART_MODES: { key: ChartMode; label: string }[] = [
   { key: 'overlay', label: 'OVERLAY' },
   { key: 'alpaca',  label: 'ALPACA'  },
@@ -125,10 +126,19 @@ const MODE_FILTERS: { key: ModeFilter; label: string }[] = [
   { key: 'live',  label: 'LIVE'  },
   { key: 'paper', label: 'PAPER' },
 ];
+// Keys follow Alpaca portfolio/history period conventions ("1A" = 1 year,
+// "all" = full account history) — passed straight through to the backend.
+const PERIODS: { key: PeriodKey; label: string }[] = [
+  { key: '1M',  label: '1M'  },
+  { key: '3M',  label: '3M'  },
+  { key: '1A',  label: '1Y'  },
+  { key: 'all', label: 'ALL' },
+];
 
 export default function PortfolioScreen() {
   const [chartMode, setChartMode]   = useState<ChartMode>('overlay');
   const [modeFilter, setModeFilter] = useState<ModeFilter>('all');
+  const [period, setPeriod]         = useState<PeriodKey>('1M');
 
   // Snapshot now comes from the WebSocket portfolio stream (PR-C of the perf
   // cleanup). useEngineSocket already does a one-time REST seed at mount, so
@@ -149,7 +159,7 @@ export default function PortfolioScreen() {
   // Equity history depends on modeFilter — SWR keys on the URL, so changing
   // the filter automatically fetches a new key + caches both. 5s refresh
   // matches the prior cadence; SWR pauses it while the tab is hidden.
-  const histUrl = `/api/portfolio/history?period=1M&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
+  const histUrl = `/api/portfolio/history?period=${period}&timeframe=1D${modeFilter !== 'all' ? `&mode=${modeFilter}` : ''}`;
   const swrOpts = { refreshInterval: 5_000 } as const;
   const { data: history = null,    error: historyError }   = useSWR<HistoryResponse>(histUrl, jsonFetcher, swrOpts);
   const { data: summariesData,     error: summariesError } = useSWR<{ summaries?: DailySummary[] }>('/api/portfolio/summaries?limit=7', jsonFetcher, swrOpts);
@@ -250,27 +260,52 @@ export default function PortfolioScreen() {
               </button>
             ))}
           </div>
-          {/* Mode filter */}
-          <div style={{ display: 'flex', gap: 2 }}>
-            {MODE_FILTERS.map(({ key, label }) => (
-              <button
-                key={key}
-                onClick={() => setModeFilter(key)}
-                style={{
-                  fontFamily: 'var(--font-mono)',
-                  fontSize: 10,
-                  letterSpacing: '0.08em',
-                  padding: '3px 8px',
-                  border: `1px solid ${modeFilter === key ? TOKENS.amber : TOKENS.border}`,
-                  borderRadius: 3,
-                  background: modeFilter === key ? 'rgba(245,158,11,0.1)' : 'transparent',
-                  color: modeFilter === key ? TOKENS.amber : TOKENS.textFaint,
-                  cursor: 'pointer',
-                }}
-              >
-                {label}
-              </button>
-            ))}
+          {/* Right-hand controls: period range + mode filter */}
+          <div style={{ display: 'flex', gap: 12 }}>
+            {/* Period range */}
+            <div style={{ display: 'flex', gap: 2 }}>
+              {PERIODS.map(({ key, label }) => (
+                <button
+                  key={key}
+                  onClick={() => setPeriod(key)}
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 10,
+                    letterSpacing: '0.08em',
+                    padding: '3px 8px',
+                    border: `1px solid ${period === key ? TOKENS.indigo : TOKENS.border}`,
+                    borderRadius: 3,
+                    background: period === key ? 'rgba(99,102,241,0.1)' : 'transparent',
+                    color: period === key ? TOKENS.indigo : TOKENS.textFaint,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+            {/* Mode filter */}
+            <div style={{ display: 'flex', gap: 2 }}>
+              {MODE_FILTERS.map(({ key, label }) => (
+                <button
+                  key={key}
+                  onClick={() => setModeFilter(key)}
+                  style={{
+                    fontFamily: 'var(--font-mono)',
+                    fontSize: 10,
+                    letterSpacing: '0.08em',
+                    padding: '3px 8px',
+                    border: `1px solid ${modeFilter === key ? TOKENS.amber : TOKENS.border}`,
+                    borderRadius: 3,
+                    background: modeFilter === key ? 'rgba(245,158,11,0.1)' : 'transparent',
+                    color: modeFilter === key ? TOKENS.amber : TOKENS.textFaint,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
 

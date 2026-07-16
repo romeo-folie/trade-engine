@@ -60,9 +60,14 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 			continue // already have data for this day+mode
 		}
 
+		// Stamp the row with the history point's own timestamp. With created_at
+		// defaulting to now(), a year of historical equity would land on the
+		// restart day — masquerading as current values and hiding from the
+		// per-day dedup above, so every restart re-inserted the whole batch.
 		insertCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := store.InsertPortfolioSnapshot(
+		err := store.InsertPortfolioSnapshotAt(
 			insertCtx,
+			pt.Time,
 			pt.Equity, // total_value = equity
 			0,         // cash unknown from history endpoint
 			0,         // invested unknown
