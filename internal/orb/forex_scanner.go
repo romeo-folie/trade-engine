@@ -3,10 +3,24 @@ package orb
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
+
+// forexAssetClass classifies a forex-path instrument for display/labelling.
+// Spot precious metals (XAU/XAG/XPT/XPD vs a currency) trade on the forex
+// scheduler but are metals, not FX pairs — the UI labels them distinctly.
+func forexAssetClass(symbol string) string {
+	base, _, _ := strings.Cut(symbol, "/")
+	switch strings.ToUpper(base) {
+	case "XAU", "XAG", "XPT", "XPD":
+		return "metal"
+	default:
+		return "forex"
+	}
+}
 
 // ForexCandidateScanner implements CandidateScanner for forex/CFD instruments via IBKR.
 // It returns each configured instrument as a candidate with a default "trade" action
@@ -28,6 +42,7 @@ func (s *ForexCandidateScanner) ScanCandidates(ctx context.Context) ([]ScoredCan
 	candidates := make([]ScoredCandidate, 0, len(s.Instruments))
 	for _, inst := range s.Instruments {
 		candidates = append(candidates, ScoredCandidate{
+			AssetClass: forexAssetClass(inst.Symbol),
 			Gap: data.GapCandidate{
 				Ticker:        inst.Symbol,
 				GapPct:        0, // forex/CFD ORB does not rely on gap percentage

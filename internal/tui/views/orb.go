@@ -35,6 +35,10 @@ type ORBCandidateRow struct {
 	Conviction float64
 	Action     string
 	Reasoning  string
+	// AssetClass labels the instrument kind for display: "equity" | "option" |
+	// "metal" | "forex" | "futures". Populated from the stored candidate, or
+	// derived (see candidateAssetClass) for rows persisted before it was stamped.
+	AssetClass string
 }
 
 // ORBTradeRow represents a single bracket trade in the ORB panel.
@@ -80,6 +84,93 @@ func (r ORBTradeRow) Label() string {
 	return r.Ticker
 }
 
+// candidateAssetClass resolves an ORB candidate's asset class for display. It
+// prefers the value stamped on the persisted candidate; for rows written before
+// that field existed it derives one from the session and ticker. The options
+// force-watch sentinel reasoning is our own constant (not free-form LLM prose),
+// so keying on it for legacy rows is safe.
+func candidateAssetClass(stored, sessionName, ticker, reasoning string) string {
+	if stored != "" {
+		return stored
+	}
+	if reasoning == "options-router force-watch" {
+		return "option"
+	}
+	switch sessionName {
+	case "futures":
+		return "futures"
+	case "london", "newyork", "both":
+		if isSpotMetal(ticker) {
+			return "metal"
+		}
+		return "forex"
+	default: // "" — the equities scheduler
+		return "equity"
+	}
+}
+
+// isSpotMetal reports whether a forex-path ticker is a spot precious metal
+// (XAU/XAG/XPT/XPD vs a currency), which trades on the forex scheduler but is a
+// metal, not an FX pair.
+func isSpotMetal(ticker string) bool {
+	base, _, _ := strings.Cut(ticker, "/")
+	switch strings.ToUpper(base) {
+	case "XAU", "XAG", "XPT", "XPD":
+		return true
+	default:
+		return false
+	}
+}
+
+// sessionDisplayLabel turns the raw session name (also the DB uniqueness key)
+// into a user-facing label. Forex sessions carry a time-window name ("newyork")
+// rather than an asset class, so the instrument kind is prepended from the
+// candidates it holds (e.g. "metals · newyork"). Equities/futures already name
+// their asset class.
+func sessionDisplayLabel(sessionName string, candidates []ORBCandidateRow) string {
+	switch sessionName {
+	case "":
+		return "equities"
+	case "london", "newyork", "both":
+		return forexAssetWord(candidates) + " · " + sessionName
+	default: // "futures" and any future scheduler name
+		return sessionName
+	}
+}
+
+// forexAssetWord summarises a forex session's instrument kind for its header:
+// "metals" when every candidate is a spot metal, else "forex".
+func forexAssetWord(candidates []ORBCandidateRow) string {
+	if len(candidates) == 0 {
+		return "forex"
+	}
+	for _, c := range candidates {
+		if c.AssetClass != "metal" {
+			return "forex"
+		}
+	}
+	return "metals"
+}
+
+// assetBadge is the short display tag for a candidate's asset class, padded so
+// the columns after it stay aligned. Empty class → blank (but padded).
+func assetBadge(assetClass string) string {
+	tag := ""
+	switch assetClass {
+	case "option":
+		tag = "[opt]"
+	case "metal":
+		tag = "[metal]"
+	case "forex":
+		tag = "[fx]"
+	case "futures":
+		tag = "[fut]"
+	case "equity":
+		tag = "[eq]"
+	}
+	return fmt.Sprintf("%-7s", tag)
+}
+
 // FetchORBViewData loads the most recent ORB sessions (newest first — a trading day has
 // several concurrent sessions: equities/forex/futures, plus a morning london session) and
 // their trades. Safe to call when DB is unavailable — returns an empty result.
@@ -101,23 +192,17 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 	}
 
 	for _, s := range sessions {
-		// The equities scheduler creates its session with an empty name; label it so its
-		// panel isn't headerless next to the named forex/futures panels.
-		name := s.SessionName
-		if name == "" {
-			name = "equities"
-		}
 		sd := ORBSessionData{
-			Date:        s.Date,
-			SessionName: name,
-			Status:      s.Status,
-			Selected:    s.Selected,
+			Date:     s.Date,
+			Status:   s.Status,
+			Selected: s.Selected,
 		}
 
 		// Unmarshal candidates JSON into display rows.
 		if len(s.Candidates) > 0 {
 			var raw []struct {
-				Gap struct {
+				AssetClass string `json:"asset_class"`
+				Gap        struct {
 					Ticker string  `json:"Ticker"`
 					GapPct float64 `json:"GapPct"`
 				} `json:"Gap"`
@@ -135,10 +220,16 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 						Conviction: c.Score.Conviction,
 						Action:     c.Score.Action,
 						Reasoning:  truncate(c.Score.Reasoning, 50),
+						// Derive from the RAW session name + untruncated reasoning.
+						AssetClass: candidateAssetClass(c.AssetClass, s.SessionName, c.Gap.Ticker, c.Score.Reasoning),
 					})
 				}
 			}
 		}
+
+		// Header label is derived AFTER candidates are parsed: a forex session's
+		// asset word ("metals" vs "forex") depends on what it holds.
+		sd.SessionName = sessionDisplayLabel(s.SessionName, sd.Candidates)
 
 		// Fetch trades for this session.
 		trades, err := store.GetORBTrades(ctx, db, s.ID)
@@ -258,8 +349,13 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 			if slices.Contains(data.Selected, c.Ticker) {
 				selected = lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("*")
 			}
-			fmt.Fprintf(&sb, "  %s %-6s  gap %+5.1f%%  conv %.0f%%  %s\n",
-				selected, c.Ticker, c.GapPct, c.Conviction*100,
+			// Badge is pre-padded to a fixed width BEFORE styling, so the ANSI
+			// color codes don't throw off the %s column alignment.
+			badge := dimText.Render(assetBadge(c.AssetClass))
+			// %-8s fits 7-char forex/metal pairs (e.g. "XAU/USD") so the badge and
+			// downstream columns stay aligned across equity/forex/futures panels.
+			fmt.Fprintf(&sb, "  %s %-8s %s gap %+5.1f%%  conv %.0f%%  %s\n",
+				selected, c.Ticker, badge, c.GapPct, c.Conviction*100,
 				dimText.Render(c.Reasoning))
 		}
 	}
