@@ -49,6 +49,26 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 		takeProfit = entryStop - risk*cfg.RiskReward
 	}
 
+	if side == "buy" {
+		entryStop = snapEquityPriceUp(entryStop)
+		stopLoss = snapEquityPriceDown(stopLoss)
+		takeProfit = snapEquityPriceUp(takeProfit)
+	} else {
+		entryStop = snapEquityPriceDown(entryStop)
+		stopLoss = snapEquityPriceUp(stopLoss)
+		takeProfit = snapEquityPriceDown(takeProfit)
+	}
+	if !validEquityBracket(side, entryStop, stopLoss, takeProfit) {
+		return BracketParams{
+			Ticker:     r.Ticker,
+			Side:       side,
+			EntryStop:  entryStop,
+			StopLoss:   stopLoss,
+			TakeProfit: takeProfit,
+			Qty:        0,
+		}
+	}
+
 	riskPerShare := math.Abs(entryStop - stopLoss)
 	if riskPerShare < 0.01 {
 		riskPerShare = 0.01 // guard against near-zero range width
@@ -80,6 +100,40 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 		TakeProfit: takeProfit,
 		Qty:        qty,
 	}
+}
+
+func validEquityBracket(side string, entryStop, stopLoss, takeProfit float64) bool {
+	if side == "buy" {
+		return entryStop > stopLoss && takeProfit > entryStop
+	}
+	return entryStop < stopLoss && takeProfit < entryStop
+}
+
+func snapEquityPriceUp(price float64) float64 {
+	return snapEquityPriceDirected(price, func(v float64) float64 {
+		return math.Ceil(v - 1e-9)
+	})
+}
+
+func snapEquityPriceDown(price float64) float64 {
+	return snapEquityPriceDirected(price, func(v float64) float64 {
+		return math.Floor(v + 1e-9)
+	})
+}
+
+// snapEquityPriceDirected applies Alpaca/SEC stock minimum price variation
+// rules: stocks at or above $1 trade in penny increments; sub-dollar stocks may
+// use four decimals. The caller chooses ceil/floor so snapping preserves bracket
+// direction instead of collapsing tight ranges.
+func snapEquityPriceDirected(price float64, round func(float64) float64) float64 {
+	if price <= 0 {
+		return price
+	}
+	scale := 100.0
+	if price < 1 {
+		scale = 10000.0
+	}
+	return round(price*scale) / scale
 }
 
 // ComputeForexBracket derives entry/stop/target from an opening range for forex/CFD instruments.

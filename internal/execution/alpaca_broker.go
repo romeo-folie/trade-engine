@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -77,19 +78,19 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	// Market orders must not include price fields — Alpaca returns 422 if they are present.
 	if req.Type != OrderTypeMarket {
 		if req.LimitPrice > 0 {
-			body["limit_price"] = fmt.Sprintf("%.4f", req.LimitPrice)
+			body["limit_price"] = formatAlpacaStockPrice(req.LimitPrice)
 		}
 		if req.StopPrice > 0 {
-			body["stop_price"] = fmt.Sprintf("%.4f", req.StopPrice)
+			body["stop_price"] = formatAlpacaStockPrice(req.StopPrice)
 		}
 	}
 	if req.OrderClass == "bracket" {
 		body["order_class"] = "bracket"
 		body["take_profit"] = map[string]string{
-			"limit_price": fmt.Sprintf("%.4f", req.TakeProfitPrice),
+			"limit_price": formatAlpacaStockPrice(req.TakeProfitPrice),
 		}
 		body["stop_loss"] = map[string]string{
-			"stop_price": fmt.Sprintf("%.4f", req.StopLossPrice),
+			"stop_price": formatAlpacaStockPrice(req.StopLossPrice),
 		}
 	}
 
@@ -140,6 +141,17 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		}
 	}
 	return result, nil
+}
+
+func formatAlpacaStockPrice(price float64) string {
+	decimals := 2
+	scale := 100.0
+	if price < 1 {
+		decimals = 4
+		scale = 10000.0
+	}
+	rounded := math.Round(price*scale) / scale
+	return strconv.FormatFloat(rounded, 'f', decimals, 64)
 }
 
 // GetWorkingOrders lists Alpaca's currently-open (working) orders. Options-ORB uses

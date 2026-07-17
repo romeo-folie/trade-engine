@@ -101,6 +101,105 @@ func TestComputeBracketSell(t *testing.T) {
 	}
 }
 
+func TestComputeBracketSnapsEquityPricesToAlpacaTick(t *testing.T) {
+	r := &OpeningRange{
+		Ticker: "ATAI",
+		High:   7.2286,    // high * 1.001 would have four decimals above $1.
+		Low:    7.1693694, // low * 0.999 ~= 7.1622, rejected by Alpaca.
+	}
+	cfg := config.ORBConfig{
+		RiskReward:     2.0,
+		MaxRiskPct:     1.0,
+		MaxPositionPct: 10,
+	}
+
+	p := ComputeBracket(r, "buy", 100000, cfg)
+
+	for name, price := range map[string]float64{
+		"entry":       p.EntryStop,
+		"stop_loss":   p.StopLoss,
+		"take_profit": p.TakeProfit,
+	} {
+		if math.Abs(price*100-math.Round(price*100)) > 1e-9 {
+			t.Fatalf("%s price %v is not a penny increment", name, price)
+		}
+	}
+	if p.StopLoss != 7.16 {
+		t.Fatalf("StopLoss = %v, want 7.16", p.StopLoss)
+	}
+}
+
+func TestComputeBracketDirectionalSnapPreservesTightBuyRange(t *testing.T) {
+	r := &OpeningRange{
+		Ticker: "LOWP",
+		High:   2.000,
+		Low:    1.999,
+	}
+	cfg := config.ORBConfig{
+		RiskReward:     2.0,
+		MaxRiskPct:     1.0,
+		MaxPositionPct: 100,
+	}
+
+	p := ComputeBracket(r, "buy", 100000, cfg)
+
+	if p.Qty == 0 {
+		t.Fatalf("Qty = 0, want tradeable bracket")
+	}
+	if p.EntryStop != 2.01 || p.StopLoss != 1.99 || p.TakeProfit != 2.02 {
+		t.Fatalf("bracket = entry %.4f stop %.4f target %.4f, want 2.01/1.99/2.02", p.EntryStop, p.StopLoss, p.TakeProfit)
+	}
+	if !validEquityBracket(p.Side, p.EntryStop, p.StopLoss, p.TakeProfit) {
+		t.Fatalf("invalid buy bracket: entry %.4f stop %.4f target %.4f", p.EntryStop, p.StopLoss, p.TakeProfit)
+	}
+}
+
+func TestComputeBracketDirectionalSnapPreservesTightSellRange(t *testing.T) {
+	r := &OpeningRange{
+		Ticker: "LOWP",
+		High:   2.001,
+		Low:    2.000,
+	}
+	cfg := config.ORBConfig{
+		RiskReward:     2.0,
+		MaxRiskPct:     1.0,
+		MaxPositionPct: 100,
+	}
+
+	p := ComputeBracket(r, "sell", 100000, cfg)
+
+	if p.Qty == 0 {
+		t.Fatalf("Qty = 0, want tradeable bracket")
+	}
+	if p.EntryStop != 1.99 || p.StopLoss != 2.01 || p.TakeProfit != 1.98 {
+		t.Fatalf("bracket = entry %.4f stop %.4f target %.4f, want 1.99/2.01/1.98", p.EntryStop, p.StopLoss, p.TakeProfit)
+	}
+	if !validEquityBracket(p.Side, p.EntryStop, p.StopLoss, p.TakeProfit) {
+		t.Fatalf("invalid sell bracket: entry %.4f stop %.4f target %.4f", p.EntryStop, p.StopLoss, p.TakeProfit)
+	}
+}
+
+func TestSnapEquityPriceDirectionalAllowsSubDollarFourDecimals(t *testing.T) {
+	if got := snapEquityPriceUp(0.123456); got != 0.1235 {
+		t.Fatalf("snapEquityPriceUp(0.123456) = %v, want 0.1235", got)
+	}
+	if got := snapEquityPriceDown(0.123456); got != 0.1234 {
+		t.Fatalf("snapEquityPriceDown(0.123456) = %v, want 0.1234", got)
+	}
+	if got := snapEquityPriceUp(39.6196); got != 39.62 {
+		t.Fatalf("snapEquityPriceUp(39.6196) = %v, want 39.62", got)
+	}
+	if got := snapEquityPriceDown(39.6196); got != 39.61 {
+		t.Fatalf("snapEquityPriceDown(39.6196) = %v, want 39.61", got)
+	}
+	if got := snapEquityPriceUp(2.00); got != 2.00 {
+		t.Fatalf("snapEquityPriceUp(2.00) = %v, want 2.00", got)
+	}
+	if got := snapEquityPriceDown(2.00); got != 2.00 {
+		t.Fatalf("snapEquityPriceDown(2.00) = %v, want 2.00", got)
+	}
+}
+
 func TestComputeBracketMinQty(t *testing.T) {
 	r := &OpeningRange{
 		Ticker: "BRK.A",
