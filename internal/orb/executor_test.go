@@ -101,6 +101,43 @@ func TestComputeBracketSell(t *testing.T) {
 	}
 }
 
+func TestComputeBracketSnapsEquityPricesToAlpacaTick(t *testing.T) {
+	r := &OpeningRange{
+		Ticker: "ATAI",
+		High:   7.2286,    // high * 1.001 would have four decimals above $1.
+		Low:    7.1693694, // low * 0.999 ~= 7.1622, rejected by Alpaca.
+	}
+	cfg := config.ORBConfig{
+		RiskReward:     2.0,
+		MaxRiskPct:     1.0,
+		MaxPositionPct: 10,
+	}
+
+	p := ComputeBracket(r, "buy", 100000, cfg)
+
+	for name, price := range map[string]float64{
+		"entry":       p.EntryStop,
+		"stop_loss":   p.StopLoss,
+		"take_profit": p.TakeProfit,
+	} {
+		if math.Abs(price*100-math.Round(price*100)) > 1e-9 {
+			t.Fatalf("%s price %v is not a penny increment", name, price)
+		}
+	}
+	if p.StopLoss != 7.16 {
+		t.Fatalf("StopLoss = %v, want 7.16", p.StopLoss)
+	}
+}
+
+func TestSnapEquityPriceAllowsSubDollarFourDecimals(t *testing.T) {
+	if got := snapEquityPrice(0.123456); got != 0.1235 {
+		t.Fatalf("snapEquityPrice(0.123456) = %v, want 0.1235", got)
+	}
+	if got := snapEquityPrice(39.6196); got != 39.62 {
+		t.Fatalf("snapEquityPrice(39.6196) = %v, want 39.62", got)
+	}
+}
+
 func TestComputeBracketMinQty(t *testing.T) {
 	r := &OpeningRange{
 		Ticker: "BRK.A",

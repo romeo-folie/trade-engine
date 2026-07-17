@@ -49,6 +49,10 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 		takeProfit = entryStop - risk*cfg.RiskReward
 	}
 
+	entryStop = snapEquityPrice(entryStop)
+	stopLoss = snapEquityPrice(stopLoss)
+	takeProfit = snapEquityPrice(takeProfit)
+
 	riskPerShare := math.Abs(entryStop - stopLoss)
 	if riskPerShare < 0.01 {
 		riskPerShare = 0.01 // guard against near-zero range width
@@ -80,6 +84,20 @@ func ComputeBracket(r *OpeningRange, side string, portfolioValue float64, cfg co
 		TakeProfit: takeProfit,
 		Qty:        qty,
 	}
+}
+
+// snapEquityPrice applies Alpaca/SEC stock minimum price variation rules:
+// stocks at or above $1 trade in penny increments; sub-dollar stocks may use
+// four decimals.
+func snapEquityPrice(price float64) float64 {
+	if price <= 0 {
+		return price
+	}
+	scale := 100.0
+	if price < 1 {
+		scale = 10000.0
+	}
+	return math.Round(price*scale) / scale
 }
 
 // ComputeForexBracket derives entry/stop/target from an opening range for forex/CFD instruments.

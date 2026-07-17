@@ -47,7 +47,6 @@ func TestGetAccount_DayPnL(t *testing.T) {
 	}
 }
 
-
 // TestPlaceOrder_BracketLegsAndTIF exercises the #435 bracket path: the
 // request must carry order_class/take_profit/stop_loss and the overridden
 // time_in_force, and the response's child legs must come back as
@@ -104,6 +103,53 @@ func TestPlaceOrder_BracketLegsAndTIF(t *testing.T) {
 	}
 	if len(res.ChildOrderIDs) != 2 || res.ChildOrderIDs[0] != "leg-tp" || res.ChildOrderIDs[1] != "leg-stop" {
 		t.Fatalf("ChildOrderIDs = %v, want [leg-tp leg-stop] regardless of response order", res.ChildOrderIDs)
+	}
+}
+
+func TestPlaceOrder_FormatsStockPricesAtValidAlpacaPrecision(t *testing.T) {
+	var gotBody map[string]any
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		fmt.Fprintln(w, `{"id": "parent-1", "status": "accepted", "filled_avg_price": "", "filled_qty": ""}`)
+	}))
+	defer ts.Close()
+
+	broker := &AlpacaBroker{apiKey: "k", secret: "s", baseURL: ts.URL, httpClient: ts.Client()}
+	_, err := broker.PlaceOrder(context.Background(), OrderRequest{
+		Ticker:          "ATAI",
+		Side:            OrderSideBuy,
+		Type:            OrderTypeStop,
+		Quantity:        10,
+		StopPrice:       7.2377,
+		OrderClass:      "bracket",
+		TakeProfitPrice: 7.5599,
+		StopLossPrice:   7.1622,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if gotBody["stop_price"] != "7.24" {
+		t.Fatalf("parent stop_price = %v, want 7.24", gotBody["stop_price"])
+	}
+	tp := gotBody["take_profit"].(map[string]any)
+	if tp["limit_price"] != "7.56" {
+		t.Fatalf("take_profit.limit_price = %v, want 7.56", tp["limit_price"])
+	}
+	sl := gotBody["stop_loss"].(map[string]any)
+	if sl["stop_price"] != "7.16" {
+		t.Fatalf("stop_loss.stop_price = %v, want 7.16", sl["stop_price"])
+	}
+}
+
+func TestFormatAlpacaStockPrice_AllowsSubDollarFourDecimals(t *testing.T) {
+	if got := formatAlpacaStockPrice(0.123456); got != "0.1235" {
+		t.Fatalf("formatAlpacaStockPrice(0.123456) = %q, want 0.1235", got)
+	}
+	if got := formatAlpacaStockPrice(39.6196); got != "39.62" {
+		t.Fatalf("formatAlpacaStockPrice(39.6196) = %q, want 39.62", got)
 	}
 }
 
