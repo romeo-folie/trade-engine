@@ -473,6 +473,7 @@ func aggregateBars(ticker string, tf Timeframe, step time.Duration, bars []Candl
 		a := buckets[bucket]
 		if a == nil {
 			a = &aggBar{open: b.Open, high: b.High, low: b.Low, close: b.Close, openT: b.Timestamp, closeT: b.Timestamp}
+			a.vol = float64(b.Volume)
 			buckets[bucket] = a
 			continue
 		}

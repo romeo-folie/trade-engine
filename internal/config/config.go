@@ -526,9 +526,10 @@ type MarketsConfig struct {
 
 	Dukascopy DukascopyConfig `yaml:"dukascopy"`
 	HistData  HistDataConfig  `yaml:"histdata"`
+	Exness    ExnessConfig    `yaml:"exness"`
 	// BacktestProvider selects the ORB backtest data source: "histdata" (default; free bulk
-	// tick ZIPs, no account/key/throttle), "dukascopy", or "oanda". Overridable per-run with
-	// `te backtest orb --provider`.
+	// tick ZIPs, no account/key/throttle), "dukascopy", "exness", or "oanda". Overridable
+	// per-run with `te backtest orb --provider`.
 	BacktestProvider string `yaml:"backtest_provider"`
 }
 
@@ -541,6 +542,13 @@ type HistDataConfig struct {
 	// CacheDir is the on-disk cache root. Each instrument-month ZIP is downloaded at most once,
 	// ever, then served from disk. Empty → default ~/.tradeengine/histdata-cache; "off" disables.
 	CacheDir string `yaml:"cache_dir"`
+}
+
+// ExnessConfig configures a local Exness MetaTrader OHLC export directory. Data-only; live
+// trading and cost assumptions still come from the configured broker/execution model.
+type ExnessConfig struct {
+	// DataDir contains files named like XAUUSD_M1_2024_exness.csv. Empty defaults to docs.
+	DataDir string `yaml:"data_dir"`
 }
 
 // DukascopyConfig configures the Dukascopy historical tick-data provider — the default,
@@ -602,6 +610,11 @@ type Instrument struct {
 	MinLotSize int     `yaml:"min_lot_size"` // e.g. 20000 for EUR/USD, 1 for XAU/USD
 	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
 
+	// Strategy selects the live entry model for this instrument. Empty/"orb" keeps the
+	// existing opening-range breakout path. "trend_continuation" waits after the opening
+	// range, requires consecutive closes beyond the range, then enters at market.
+	Strategy string `yaml:"strategy"`
+
 	// MaxHoldMinutes is the per-instrument hard time limit on a *filled* ORB trade.
 	// When a filled position is older than this, the scheduler cancels its remaining
 	// bracket legs, flattens at market, and records exit_type='time_exit'. This caps
@@ -648,6 +661,23 @@ type Instrument struct {
 	// Confirmation trades enter later and at a worse price than a stop touch, in exchange
 	// for a stronger signal. Default stop_touch preserves current behaviour.
 	BreakoutConfirmation string `yaml:"breakout_confirmation"`
+
+	// RiskReward overrides ForexORBConfig.RiskReward for this instrument when > 0.
+	// Useful when one instrument's validated target differs from the strategy default.
+	RiskReward float64 `yaml:"risk_reward"`
+
+	// Trend-continuation parameters. Used only when Strategy is "trend_continuation".
+	// Range filters are measured in pip_buffer units; exclude bands use "min:max" with
+	// max exclusive, e.g. "32:60" skips widths in [32,60).
+	ContinuationDelayMinutes       int     `yaml:"continuation_delay_minutes"`
+	ContinuationConfirmBars        int     `yaml:"continuation_confirm_bars"`
+	ContinuationDepthMult          float64 `yaml:"continuation_depth_mult"`
+	ContinuationTrendFilter        string  `yaml:"continuation_trend_filter"` // none | aligned | contrarian
+	ContinuationTrendLookbackMin   int     `yaml:"continuation_trend_lookback_minutes"`
+	ContinuationMinRangePips       float64 `yaml:"continuation_min_range_pips"`
+	ContinuationMaxRangePips       float64 `yaml:"continuation_max_range_pips"`
+	ContinuationExcludeRangePips   string  `yaml:"continuation_exclude_range_pips"`
+	ContinuationMonthlyStopLossUSD float64 `yaml:"continuation_monthly_stop_loss"`
 
 	// Retest parameters (Phase 6), used only by the retest_* confirmation modes. RetestTolerance
 	// is how close (as a fraction of the opening-range width) the pullback must return to the
@@ -704,11 +734,20 @@ type Instrument struct {
 	// gate and leaves the backtest on its conservative default.
 	CommissionPerSide float64 `yaml:"commission_per_side"`
 
+	// CommissionBpsPerSide is an estimated broker commission rate in basis points of fill
+	// notional per side. This is the accurate model for IBKR London metals: XAGUSD is 3.0
+	// bps/side and XAUUSD is 1.5 bps/side, subject to CommissionMinPerSide. The flat
+	// CommissionPerSide remains available for brokers/instruments charged in dollars per fill.
+	CommissionBpsPerSide float64 `yaml:"commission_bps_per_side"`
+
+	// CommissionMinPerSide is the minimum commission per fill when CommissionBpsPerSide is
+	// set. For IBKR London metals this is USD 2.00. 0 disables the minimum.
+	CommissionMinPerSide float64 `yaml:"commission_min_per_side"`
+
 	// MaxCommissionToRisk rejects a session when the estimated round-trip commission is too
-	// large relative to the planned DOLLAR risk: 2×commission_per_side / (|entry−stop|×qty).
-	// The spread gate (max_spread_to_risk) can't catch this: spread scales with position size
-	// while commission has a fixed floor, so it only bites at small dollar risk. 0 disables.
-	// Requires commission_per_side > 0 (validated).
+	// large relative to the planned DOLLAR risk. The spread gate (max_spread_to_risk) can't
+	// catch this: spread scales with position size while commission has a fixed floor or a
+	// bps-on-notional charge. 0 disables. Requires a flat or bps commission estimate.
 	MaxCommissionToRisk float64 `yaml:"max_commission_to_risk"`
 
 	// RiskMultiplier (Phase 5) scales this instrument's per-trade risk relative to the
@@ -1536,6 +1575,45 @@ var validBreakoutConfirmation = map[string]bool{
 	"retest_swing": true, "retest_range": true,
 }
 
+var validInstrumentStrategy = map[string]bool{
+	"": true, "orb": true, "trend_continuation": true,
+}
+
+var validTrendContinuationFilter = map[string]bool{
+	"": true, "none": true, "aligned": true, "contrarian": true,
+}
+
+func validRangeBandSpec(s string) error {
+	if strings.TrimSpace(s) == "" {
+		return nil
+	}
+	for _, raw := range strings.Split(s, ",") {
+		part := strings.TrimSpace(raw)
+		if part == "" {
+			return fmt.Errorf("empty band")
+		}
+		lo, hi, ok := strings.Cut(part, ":")
+		if !ok {
+			return fmt.Errorf("%q must use min:max", part)
+		}
+		min, err := strconv.ParseFloat(strings.TrimSpace(lo), 64)
+		if err != nil {
+			return fmt.Errorf("%q min is not a number", part)
+		}
+		max, err := strconv.ParseFloat(strings.TrimSpace(hi), 64)
+		if err != nil {
+			return fmt.Errorf("%q max is not a number", part)
+		}
+		if min < 0 || max <= 0 {
+			return fmt.Errorf("%q bounds must be non-negative with max > 0", part)
+		}
+		if min >= max {
+			return fmt.Errorf("%q min must be less than max", part)
+		}
+	}
+	return nil
+}
+
 func Validate(cfg *Config) []string {
 	var errs []string
 
@@ -1759,10 +1837,67 @@ func Validate(cfg *Config) []string {
 		// of silently disabling the confirmation gate. All five modes are now live-wired
 		// (retest_swing/retest_range entered the live path alongside stop_touch/close_*).
 		for _, inst := range cfg.ForexORB.Instruments {
+			if !validInstrumentStrategy[inst.Strategy] {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: strategy %q must be one of orb|trend_continuation",
+					inst.Symbol, inst.Strategy))
+			}
 			if !validBreakoutConfirmation[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
 					inst.Symbol, inst.BreakoutConfirmation))
+			}
+			if inst.RiskReward < 0 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: risk_reward %.2f must not be negative",
+					inst.Symbol, inst.RiskReward))
+			}
+			if inst.ContinuationDelayMinutes < 0 || inst.ContinuationConfirmBars < 0 || inst.ContinuationTrendLookbackMin < 0 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: trend-continuation minute/bar parameters must not be negative",
+					inst.Symbol))
+			}
+			if inst.ContinuationDepthMult < 0 || inst.ContinuationMinRangePips < 0 || inst.ContinuationMaxRangePips < 0 || inst.ContinuationMonthlyStopLossUSD < 0 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: trend-continuation numeric thresholds must not be negative",
+					inst.Symbol))
+			}
+			if inst.ContinuationMaxRangePips > 0 && inst.ContinuationMinRangePips > inst.ContinuationMaxRangePips {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: continuation_min_range_pips must not exceed continuation_max_range_pips",
+					inst.Symbol))
+			}
+			if !validTrendContinuationFilter[inst.ContinuationTrendFilter] {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: continuation_trend_filter %q must be one of none|aligned|contrarian",
+					inst.Symbol, inst.ContinuationTrendFilter))
+			}
+			if err := validRangeBandSpec(inst.ContinuationExcludeRangePips); err != nil {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: continuation_exclude_range_pips invalid: %v",
+					inst.Symbol, err))
+			}
+			if inst.Strategy == "trend_continuation" {
+				if inst.ContinuationDelayMinutes <= 0 {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: continuation_delay_minutes must be > 0 for trend_continuation",
+						inst.Symbol))
+				}
+				if inst.ContinuationConfirmBars <= 0 {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: continuation_confirm_bars must be > 0 for trend_continuation",
+						inst.Symbol))
+				}
+				if inst.ContinuationDepthMult <= 0 {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: continuation_depth_mult must be > 0 for trend_continuation",
+						inst.Symbol))
+				}
+				if (inst.ContinuationTrendFilter == "aligned" || inst.ContinuationTrendFilter == "contrarian") && inst.ContinuationTrendLookbackMin <= 0 {
+					errs = append(errs, fmt.Sprintf(
+						"forex_orb instrument %q: continuation_trend_lookback_minutes must be > 0 when continuation_trend_filter is %q",
+						inst.Symbol, inst.ContinuationTrendFilter))
+				}
 			}
 			// Close-position guard: the threshold is compared against CloseFrac, which is
 			// normalised to [0,1]. A value >= 1 makes the buy condition (CloseFrac >= t)
@@ -1794,10 +1929,15 @@ func Validate(cfg *Config) []string {
 					inst.Symbol))
 			}
 			// The commission gate needs a commission estimate; a max without one would be a
-			// silent no-op that quietly re-admits the min-commission trades it exists to block.
-			if inst.MaxCommissionToRisk > 0 && inst.CommissionPerSide <= 0 {
+			// silent no-op that quietly re-admits the high-cost trades it exists to block.
+			if inst.CommissionBpsPerSide < 0 || inst.CommissionMinPerSide < 0 {
 				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: max_commission_to_risk requires commission_per_side > 0",
+					"forex_orb instrument %q: commission_bps_per_side and commission_min_per_side must not be negative",
+					inst.Symbol))
+			}
+			if inst.MaxCommissionToRisk > 0 && inst.CommissionPerSide <= 0 && inst.CommissionBpsPerSide <= 0 {
+				errs = append(errs, fmt.Sprintf(
+					"forex_orb instrument %q: max_commission_to_risk requires commission_per_side > 0 or commission_bps_per_side > 0",
 					inst.Symbol))
 			}
 			// Split-bracket partial take-profit: a partial needs a fraction in (0,1), and its

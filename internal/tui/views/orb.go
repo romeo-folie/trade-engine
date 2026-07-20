@@ -327,11 +327,11 @@ func ORBMaxScroll(d ORBViewData, width, height int) int {
 func orbViewLines(d ORBViewData, width int) []string {
 	var content string
 	if len(d.Sessions) == 0 {
-		content = sectionTitle.Render("ORB Flow") + "\n" +
-			dimText.Render("  No ORB sessions found")
+		content = sectionTitle.Render("Spec Flow") + "\n" +
+			dimText.Render("  No Spec sessions found")
 	} else {
 		var b strings.Builder
-		b.WriteString(sectionTitle.Render("ORB Flow") +
+		b.WriteString(sectionTitle.Render("Spec Flow") +
 			dimText.Render(fmt.Sprintf("  updated %s", d.LastUpdate.Format("15:04:05"))) + "\n\n")
 		for i, s := range d.Sessions {
 			b.WriteString(RenderORBPanel(s, width))
@@ -359,7 +359,7 @@ func RenderORBPanel(data ORBSessionData, width int) string {
 	if data.SessionName != "" {
 		sessionLabel += "  " + labelStyle.Render(data.SessionName)
 	}
-	sb.WriteString(titleStyle.Render("ORB Session") + "  " + sessionLabel + "\n")
+	sb.WriteString(titleStyle.Render("Spec Session") + "  " + sessionLabel + "\n")
 	sb.WriteString(labelStyle.Render("Status: ") + renderORBStatus(data.Status) + "\n")
 
 	// Candidates — show only those eligible for trading (Action == "trade")

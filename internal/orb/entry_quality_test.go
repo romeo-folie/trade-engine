@@ -263,3 +263,25 @@ func TestPassesCommission_PointValue(t *testing.T) {
 		t.Errorf("without point value the ratio %.4f exceeds 0.03 and must reject (proves pv matters)", ratio)
 	}
 }
+
+func TestPassesCommission_BpsWithMinimum(t *testing.T) {
+	inst := config.Instrument{
+		Symbol: "XAG/USD", CommissionBpsPerSide: 3.0, CommissionMinPerSide: 2.0,
+		MaxCommissionToRisk: 0.05,
+	}
+	// 1600 oz × $58.125 × 3 bps = $27.90/side; round trip ~= $55.80.
+	// Planned risk: 0.80 × 1600 = $1280, ratio ~= 0.0436, so it passes 5%.
+	ok, ratio, reason := passesCommission(1600, 58.125, 57.325, inst)
+	if !ok {
+		t.Fatalf("commission/risk %.4f should pass (%s)", ratio, reason)
+	}
+	if ratio < 0.043 || ratio > 0.044 {
+		t.Fatalf("ratio = %.6f, want about 0.0436", ratio)
+	}
+
+	// Same notional but a tight stop leaves too little planned risk for IBKR's bps cost.
+	ok, ratio, _ = passesCommission(1600, 58.125, 57.825, inst)
+	if ok {
+		t.Fatalf("commission/risk %.4f should fail the 5%% cap", ratio)
+	}
+}

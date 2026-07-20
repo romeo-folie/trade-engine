@@ -53,7 +53,7 @@ func viewLabel(v View) string {
 	case ViewConfig:
 		return "Config"
 	case ViewORB:
-		return "ORB"
+		return "Spec"
 	default:
 		return "Unknown"
 	}

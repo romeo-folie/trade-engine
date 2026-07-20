@@ -44,3 +44,13 @@ func TestMetrics_OvernightHold(t *testing.T) {
 		t.Errorf("OvernightHold = %d; want 1", m.OvernightHold)
 	}
 }
+
+func TestCostModel_PerFillCommissionBpsAndMinimum(t *testing.T) {
+	cost := CostModel{CommissionBpsPerSide: 3.0, CommissionMinPerSide: 2.0}
+	if got := cost.PerFillCommission(100, 50, 1); got != 2 {
+		t.Fatalf("minimum commission = %v, want 2", got)
+	}
+	if got := cost.PerFillCommission(1600, 58.125, 1); math.Abs(got-27.9) > 0.01 {
+		t.Fatalf("bps commission = %v, want about 27.9", got)
+	}
+}

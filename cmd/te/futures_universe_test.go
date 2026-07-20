@@ -19,8 +19,9 @@ func microFuturesCfg() config.FuturesORBConfig {
 }
 
 // TestBuildFuturesUniverse_ProviderProxies checks that each provider maps to its own
-// index-CFD symbol set: HistData covers MES/MNQ only, Dukascopy covers all four, and the
-// point value is derived from tick_value/tick_size regardless of provider.
+// index-CFD symbol set: HistData covers MES/MNQ only, Dukascopy covers all four, Exness
+// local exports cover MES/MNQ/MYM, and the point value is derived from tick_value/tick_size
+// regardless of provider.
 func TestBuildFuturesUniverse_ProviderProxies(t *testing.T) {
 	btORBInstruments = ""
 	defer func() { btORBInstruments = "" }()
@@ -51,6 +52,16 @@ func TestBuildFuturesUniverse_ProviderProxies(t *testing.T) {
 			if inst.Symbol == "MYM" && inst.PointValue != 0.5 {
 				t.Errorf("MYM point_value = %v; want 0.5", inst.PointValue)
 			}
+		}
+	})
+
+	t.Run("exness covers MES MNQ and MYM", func(t *testing.T) {
+		uni, err := buildFuturesUniverse(microFuturesCfg(), nil, "exness")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := symbolSet(uni); !got["MES"] || !got["MNQ"] || !got["MYM"] || got["M2K"] {
+			t.Errorf("exness instruments = %v; want MES,MNQ,MYM only", keys(got))
 		}
 	})
 

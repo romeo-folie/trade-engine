@@ -82,17 +82,34 @@ func Retest(maxHold int) Variant {
 // CostModel captures the trading frictions a forex/CFD ORB trade pays. Spread is the
 // full bid/ask spread in price units; half is applied on entry and half on exit (a buy
 // fills at the ask, exits at the bid). CommissionPerSide is charged on both fills.
+// CommissionBpsPerSide charges a rate on fill notional, subject to CommissionMinPerSide.
 // CommissionPerUnit is additionally charged per unit/contract per fill — futures brokers
 // bill per contract, so a flat per-fill figure would understate a multi-contract trade.
 type CostModel struct {
-	Spread            float64 // full bid/ask spread in price units (e.g. 0.00008 for EUR/USD)
-	CommissionPerSide float64 // currency per fill (a round trip pays 2×)
-	CommissionPerUnit float64 // currency per unit/contract per fill (futures; 0 for forex/CFD)
+	Spread               float64 // full bid/ask spread in price units (e.g. 0.00008 for EUR/USD)
+	CommissionPerSide    float64 // currency per fill (a round trip pays 2×)
+	CommissionBpsPerSide float64 // basis points of fill notional per fill
+	CommissionMinPerSide float64 // minimum currency per fill for bps commission
+	CommissionPerUnit    float64 // currency per unit/contract per fill (futures; 0 for forex/CFD)
 }
 
 // perFillCommission is a single fill's commission for a qty-unit trade under this model.
-func (c CostModel) perFillCommission(qty int) float64 {
-	return c.CommissionPerSide + c.CommissionPerUnit*float64(qty)
+func (c CostModel) perFillCommission(qty int, fillPrice, pointValue float64) float64 {
+	return c.PerFillCommission(qty, fillPrice, pointValue)
+}
+
+// PerFillCommission is a single fill's commission for a qty-unit trade under this model.
+func (c CostModel) PerFillCommission(qty int, fillPrice, pointValue float64) float64 {
+	commission := c.CommissionPerSide + c.CommissionPerUnit*float64(qty)
+	if c.CommissionBpsPerSide > 0 {
+		notional := absf(fillPrice) * float64(qty) * pointValue
+		bpsCommission := notional * c.CommissionBpsPerSide / 10000.0
+		if bpsCommission < c.CommissionMinPerSide {
+			bpsCommission = c.CommissionMinPerSide
+		}
+		commission += bpsCommission
+	}
+	return commission
 }
 
 // pointValue is the instrument's dollars-per-point-per-unit multiplier ($1 unless the
@@ -152,9 +169,9 @@ func (e *Engine) costFor(symbol string) CostModel {
 }
 
 // commissionRiskOK is the backtest twin of the live passesCommission gate: reject a bracket
-// whose estimated round-trip commission is too large relative to its planned dollar risk,
-// fills×CommissionPerSide / (|entry−stop|×qty) > MaxCommissionToRisk. Uses the engine's cost
-// model (the commission actually charged by resolveTrade) so the gate and the P&L agree.
+// whose estimated round-trip commission is too large relative to its planned dollar risk.
+// Uses the engine's cost model (the commission actually charged by resolveTrade) so the
+// gate and the P&L agree for flat, per-unit, and bps-on-notional fees.
 // An adaptive variant with a configured partial plans THREE fills (entry + partial exit +
 // runner exit — resolveTrade's (1+exitFills) charge), not two. Disabled when
 // MaxCommissionToRisk is 0 or the bracket has no risk/qty to measure.
@@ -177,7 +194,14 @@ func (e *Engine) commissionRiskOK(v Variant, inst config.Instrument, p orb.Brack
 	// actually charges; fills×perFill(qty) would overstate a 50% partial's commission 1.5×
 	// and veto trades the simulation itself would keep.
 	cost := e.costFor(inst.Symbol)
-	commission := fills*cost.CommissionPerSide + 2*cost.CommissionPerUnit*float64(p.Qty)
+	entryCommission := cost.perFillCommission(p.Qty, p.EntryStop, pointValue(inst))
+	commission := fills * entryCommission
+	if cost.CommissionPerUnit > 0 {
+		commission = fills*cost.CommissionPerSide + 2*cost.CommissionPerUnit*float64(p.Qty)
+		if cost.CommissionBpsPerSide > 0 {
+			commission += fills * (entryCommission - cost.CommissionPerSide - cost.CommissionPerUnit*float64(p.Qty))
+		}
+	}
 	return commission/riskDollars <= inst.MaxCommissionToRisk
 }
 
@@ -531,7 +555,7 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 		// Adverse same-bar stop — adaptive management never gets a chance.
 		exitType, exitTime, exitFill = "stop", entryTime, exitWithSpread(p.Side, p.StopLoss, half)
 		gross = pnl(p.Side, entryFill, exitFill, p.Qty, pv)
-		commission = 2 * cost.perFillCommission(p.Qty) // entry + single exit, full qty
+		commission = cost.perFillCommission(p.Qty, entryFill, pv) + cost.perFillCommission(p.Qty, exitFill, pv) // entry + single exit, full qty
 	case v.ApplyAdaptiveExit && instHasAdaptiveExits(inst):
 		// Commission comes back from the adaptive resolver: with a per-contract
 		// CommissionPerUnit the partial and runner fills trade different quantities, so
@@ -550,7 +574,7 @@ func (e *Engine) resolveTrade(v Variant, inst config.Instrument, p orb.BracketPa
 		et, exitMid, ts := e.resolveExit(maxHoldMin, p, watch[entryIdx+1:], entryTime)
 		exitType, exitTime, exitFill = et, ts, exitWithSpread(p.Side, exitMid, half)
 		gross = pnl(p.Side, entryFill, exitFill, p.Qty, pv)
-		commission = 2 * cost.perFillCommission(p.Qty) // entry + single exit, full qty
+		commission = cost.perFillCommission(p.Qty, entryFill, pv) + cost.perFillCommission(p.Qty, exitFill, pv) // entry + single exit, full qty
 	}
 
 	riskPerUnit := absf(p.EntryStop-p.StopLoss) * pv
