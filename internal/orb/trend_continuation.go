@@ -278,12 +278,21 @@ func (s *ORBScheduler) trendContinuationEntry(ctx context.Context, ticker string
 	if params.TrendFilter != "" && params.TrendFilter != TrendFilterNone && params.TrendLookbackMinute > 0 {
 		fetchStart = sessionOpen.Add(-time.Duration(params.TrendLookbackMinute) * time.Minute)
 	}
-	candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, fetchStart, s.now())
+	now := s.now()
+	candles, err := s.marketData.FetchCandles(ctx, ticker, data.Timeframe1Min, fetchStart, now)
 	if err != nil {
 		slog.Warn("orb: trend-continuation: fetch candles failed — not entering this tick", "ticker", ticker, "err", err)
 		return TrendContinuationSignal{}, false
 	}
-	return EvaluateTrendContinuation(candles, r, sessionOpen, s.now(), inst, cfg, params, portfolioValue)
+	signal, ok := EvaluateTrendContinuation(candles, r, sessionOpen, now, inst, cfg, params, portfolioValue)
+	if !ok {
+		return TrendContinuationSignal{}, false
+	}
+	if !trendContinuationEntryCurrent(candles, sessionOpen, now, cfg, signal) {
+		slog.Info("orb: trend-continuation: stale entry bar — waiting for next session", "ticker", ticker, "entry_time", signal.EntryTime, "now", now)
+		return TrendContinuationSignal{}, false
+	}
+	return signal, true
 }
 
 func (s *ORBScheduler) continuationMonthlyStopHit(ctx context.Context, ticker string, limit float64) (bool, error) {
@@ -298,4 +307,21 @@ func (s *ORBScheduler) continuationMonthlyStopHit(ctx context.Context, ticker st
 		return false, err
 	}
 	return pnl <= -limit, nil
+}
+
+func trendContinuationEntryCurrent(candles []data.Candle, sessionOpen, now time.Time, cfg config.ForexORBConfig, signal TrendContinuationSignal) bool {
+	if signal.EntryTime.IsZero() || now.Before(signal.EntryTime) || !now.Before(signal.EntryTime.Add(time.Minute)) {
+		return false
+	}
+	rangeEnd := sessionOpen.Add(time.Duration(cfg.RangeMinutes) * time.Minute)
+	var latest time.Time
+	for _, c := range candles {
+		if c.Timestamp.Before(rangeEnd) || c.Timestamp.After(now) {
+			continue
+		}
+		if latest.IsZero() || c.Timestamp.After(latest) {
+			latest = c.Timestamp
+		}
+	}
+	return latest.Equal(signal.EntryTime)
 }

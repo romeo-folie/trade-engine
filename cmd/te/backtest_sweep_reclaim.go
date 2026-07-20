@@ -17,6 +17,7 @@ import (
 )
 
 var (
+	btReclaimSession     string
 	btReclaimLevels      string
 	btReclaimRiskRewards string
 	btReclaimMaxHolds    string
@@ -29,7 +30,7 @@ var (
 func init() {
 	sweepReclaimCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	sweepReclaimCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	sweepReclaimCmd.Flags().StringVar(&btORBSession, "session", "newyork", "Session: london | newyork")
+	sweepReclaimCmd.Flags().StringVar(&btReclaimSession, "session", "newyork", "Session: london | newyork")
 	sweepReclaimCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	sweepReclaimCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
 	sweepReclaimCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
@@ -95,8 +96,8 @@ func runSweepReclaim(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btORBSession != "london" && btORBSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for sweep-reclaim (use london|newyork)", btORBSession)
+	if btReclaimSession != "london" && btReclaimSession != "newyork" {
+		return fmt.Errorf("--session %q unsupported for sweep-reclaim (use london|newyork)", btReclaimSession)
 	}
 	levelSets, err := parseReclaimLevelSets(btReclaimLevels)
 	if err != nil {
@@ -134,14 +135,14 @@ func runSweepReclaim(ctx context.Context) error {
 			for _, mh := range holds {
 				for _, depth := range depths {
 					params = append(params, reclaimParam{
-						Session: btORBSession, LevelSet: levelSet, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth,
+						Session: btReclaimSession, LevelSet: levelSet, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth,
 					})
 				}
 			}
 		}
 	}
 	fmt.Printf("sweep-reclaim · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btORBSession, btORBFrom, btORBTo, len(params), len(instruments))
+		btReclaimSession, btORBFrom, btORBTo, len(params), len(instruments))
 
 	results := make([]reclaimResult, 0, len(params))
 	for _, p := range params {

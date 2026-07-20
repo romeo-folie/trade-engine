@@ -16,6 +16,7 @@ import (
 )
 
 var (
+	btContSession      string
 	btContRanges       string
 	btContDelays       string
 	btContConfirmBars  string
@@ -38,7 +39,7 @@ var (
 func init() {
 	trendContCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	trendContCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	trendContCmd.Flags().StringVar(&btORBSession, "session", "newyork", "Session: london | newyork")
+	trendContCmd.Flags().StringVar(&btContSession, "session", "newyork", "Session: london | newyork")
 	trendContCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	trendContCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
 	trendContCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
@@ -139,8 +140,8 @@ func runTrendContinuation(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btORBSession != "london" && btORBSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for trend-continuation (use london|newyork)", btORBSession)
+	if btContSession != "london" && btContSession != "newyork" {
+		return fmt.Errorf("--session %q unsupported for trend-continuation (use london|newyork)", btContSession)
 	}
 
 	ranges, err := parsePositiveIntCSV(btContRanges)
@@ -208,7 +209,7 @@ func runTrendContinuation(ctx context.Context) error {
 					for _, rr := range rrs {
 						for _, hold := range holds {
 							params = append(params, contParam{
-								Session: btORBSession, RangeMinutes: rm, DelayMinutes: delay, ConfirmBars: confirm,
+								Session: btContSession, RangeMinutes: rm, DelayMinutes: delay, ConfirmBars: confirm,
 								DepthMul: depth, RiskReward: rr, MaxHold: hold, SideMode: btContSideMode,
 								TrendFilter: btContTrendFilter, TrendLookbk: btContTrendLookbk,
 								MinRangePips: btContMinRangePip, MaxRangePips: btContMaxRangePip,
@@ -223,7 +224,7 @@ func runTrendContinuation(ctx context.Context) error {
 	}
 
 	fmt.Printf("trend-continuation · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btORBSession, btORBFrom, btORBTo, len(params), len(instruments))
+		btContSession, btORBFrom, btORBTo, len(params), len(instruments))
 	fmt.Printf("filters: side=%s trend=%s lookback=%dm range_pips=%.1f..%.1f exclude_range_pips=%s monthly_stop_loss=%.2f\n\n",
 		btContSideMode, btContTrendFilter, btContTrendLookbk, btContMinRangePip, btContMaxRangePip, orb.FormatRangeBands(excludeRanges), btContMonthlyStop)
 
@@ -391,18 +392,18 @@ func applyContMonthlyStopLoss(trades []orbreplay.SimTrade, limit float64) []orbr
 	sort.SliceStable(ordered, func(i, j int) bool {
 		return ordered[i].EntryTime.Before(ordered[j].EntryTime)
 	})
-	monthNet := make(map[string]float64)
+	instrumentMonthNet := make(map[string]float64)
 	halted := make(map[string]bool)
 	filtered := make([]orbreplay.SimTrade, 0, len(ordered))
 	for _, trade := range ordered {
-		month := trade.EntryTime.UTC().Format("2006-01")
-		if halted[month] {
+		key := trade.Ticker + "\x00" + trade.EntryTime.UTC().Format("2006-01")
+		if halted[key] {
 			continue
 		}
 		filtered = append(filtered, trade)
-		monthNet[month] += trade.NetPnL
-		if monthNet[month] <= -limit {
-			halted[month] = true
+		instrumentMonthNet[key] += trade.NetPnL
+		if instrumentMonthNet[key] <= -limit {
+			halted[key] = true
 		}
 	}
 	return filtered

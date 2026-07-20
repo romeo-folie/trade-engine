@@ -18,6 +18,7 @@ import (
 )
 
 var (
+	btFadeSession      string
 	btFadeRanges       string
 	btFadeRiskRewards  string
 	btFadeMaxHolds     string
@@ -31,7 +32,7 @@ var (
 func init() {
 	orbFadeCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	orbFadeCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	orbFadeCmd.Flags().StringVar(&btORBSession, "session", "newyork", "Session: london | newyork")
+	orbFadeCmd.Flags().StringVar(&btFadeSession, "session", "newyork", "Session: london | newyork")
 	orbFadeCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	orbFadeCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
 	orbFadeCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
@@ -100,8 +101,8 @@ func runORBFade(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btORBSession != "london" && btORBSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for orb-fade (use london|newyork)", btORBSession)
+	if btFadeSession != "london" && btFadeSession != "newyork" {
+		return fmt.Errorf("--session %q unsupported for orb-fade (use london|newyork)", btFadeSession)
 	}
 
 	ranges, err := parsePositiveIntCSV(btFadeRanges)
@@ -149,7 +150,7 @@ func runORBFade(ctx context.Context) error {
 				for _, mh := range holds {
 					for _, depth := range depths {
 						params = append(params, fadeParam{
-							Session: btORBSession, RangeMinutes: rm, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth, TargetMode: mode,
+							Session: btFadeSession, RangeMinutes: rm, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth, TargetMode: mode,
 						})
 					}
 				}
@@ -157,7 +158,7 @@ func runORBFade(ctx context.Context) error {
 		}
 	}
 	fmt.Printf("orb-fade · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btORBSession, btORBFrom, btORBTo, len(params), len(instruments))
+		btFadeSession, btORBFrom, btORBTo, len(params), len(instruments))
 
 	results := make([]fadeCandidateResult, 0, len(params))
 	for _, p := range params {

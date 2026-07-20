@@ -126,3 +126,22 @@ func TestEvaluateTrendContinuationRangeExcluded(t *testing.T) {
 		t.Fatal("EvaluateTrendContinuation produced a signal for an excluded range")
 	}
 }
+
+func TestTrendContinuationEntryCurrentRejectsStaleEntry(t *testing.T) {
+	sessionOpen := time.Date(2026, 1, 5, 13, 30, 0, 0, time.UTC)
+	rangeEnd := sessionOpen.Add(30 * time.Minute)
+	candles := []data.Candle{
+		{Timestamp: rangeEnd},
+		{Timestamp: rangeEnd.Add(time.Minute)},
+		{Timestamp: rangeEnd.Add(2 * time.Minute)},
+	}
+	signal := TrendContinuationSignal{EntryTime: rangeEnd.Add(time.Minute)}
+	cfg := config.ForexORBConfig{RangeMinutes: 30}
+
+	if !trendContinuationEntryCurrent(candles[:2], sessionOpen, signal.EntryTime.Add(30*time.Second), cfg, signal) {
+		t.Fatal("entry bar should be current while it is the latest watch candle and the clock is inside that minute")
+	}
+	if trendContinuationEntryCurrent(candles, sessionOpen, signal.EntryTime.Add(time.Minute), cfg, signal) {
+		t.Fatal("entry should be stale once the entry minute has elapsed")
+	}
+}
