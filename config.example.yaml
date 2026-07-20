@@ -196,13 +196,16 @@ markets:
     base_url: ""                 # optional API override; empty uses the practice/live default
 
   # ORB backtest data source: "histdata" (default; free bulk tick ZIPs, no account),
-  # "dukascopy" (per-hour .bi5 feed; superseded by histdata but still supported), or
+  # "dukascopy" (per-hour .bi5 feed; superseded by histdata but still supported),
+  # "exness" (local MetaTrader OHLC exports; data-only, not the execution venue), or
   # "oanda" (v20 candles; needs the free practice-account token above — the ONLY
   # thing markets.oanda is used for; nothing touches OANDA unless selected here).
   backtest_provider: histdata
   histdata:
     base_url: ""                 # optional site override (default histdata.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/histdata)
+  exness:
+    data_dir: "docs"             # directory containing SYMBOL_M1_YEAR_exness.csv exports
   dukascopy:
     base_url: ""                 # optional feed override (default datafeed.dukascopy.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/dukascopy)
@@ -459,6 +462,7 @@ forex_orb:
       sec_type: CASH
       min_lot_size: 20000
       pip_buffer: 0.0002
+      strategy: orb             # orb (default dual-sided breakout) | trend_continuation
       max_hold_minutes: 240   # flatten a filled trade after 4h (0 = inherit strategy default below)
       # Entry-quality filters (Phase 2). All default 0 = off. range_atr_ratio =
       # opening_range_width / ATR(atr_period, atr_timeframe). Skip a session whose
@@ -478,6 +482,20 @@ forex_orb:
       # retest swing or the opposite range edge respectively). Confirmation enters
       # later and at a worse price in exchange for a stronger signal.
       breakout_confirmation: close_1m
+      risk_reward: 0            # Per-instrument override when > 0; 0 inherits forex_orb.risk_reward
+      # Trend-continuation knobs (used only when strategy: trend_continuation). The model
+      # waits after the opening range, requires consecutive closes beyond the range, then
+      # enters at market in the retained direction. Range filters are in pip_buffer units;
+      # exclude bands are half-open [min,max), e.g. "32:60".
+      continuation_delay_minutes: 0
+      continuation_confirm_bars: 0
+      continuation_depth_mult: 0
+      continuation_trend_filter: none
+      continuation_trend_lookback_minutes: 0
+      continuation_min_range_pips: 0
+      continuation_max_range_pips: 0
+      continuation_exclude_range_pips: ""
+      continuation_monthly_stop_loss: 0
       # Retest knobs (retest_* modes only): how close the pullback must return to
       # the breakout level (fraction of opening-range width) and how long after the
       # breakout the bounce entry may occur. 0 = engine defaults.
@@ -509,13 +527,14 @@ forex_orb:
       # Minimum price increment. 0 (forex/CFD default) = prices not tick-snapped. Futures
       # set it (from the contract's tick_size) so bracket levels land on tradeable ticks.
       tick_size: 0
-      # Commission/dollar-risk gate: estimated commission per fill (≈ max(broker min,
-      # bps × capped notional)) and the max round-trip commission as a fraction of
-      # planned dollar risk, 2×commission_per_side / (|entry−stop|×qty). Skips sessions
-      # whose size regime the commission floor would eat. 0 disables; a max without
-      # commission_per_side fails config validation. commission_per_side also overrides
-      # the backtest cost model's flat default for this instrument.
+      # Commission/dollar-risk gate: estimated commission per fill and the max round-trip
+      # commission as a fraction of planned dollar risk. Use commission_per_side for flat
+      # dollar estimates, or commission_bps_per_side + commission_min_per_side for bps
+      # products such as IBKR London metals. 0 disables; a max without either commission
+      # estimate fails config validation. These fields also feed the backtest cost model.
       commission_per_side: 6.0
+      commission_bps_per_side: 0
+      commission_min_per_side: 0
       max_commission_to_risk: 0.05
       # Adaptive exit management (Phase 4), measured by the backtest `adaptive` variant
       # (live order-management lands in a follow-up). R = |entry_stop − stop_loss|.
@@ -535,11 +554,17 @@ forex_orb:
       min_lot_size: 1
       pip_buffer: 0.50
       max_hold_minutes: 90
+      commission_bps_per_side: 1.5
+      commission_min_per_side: 2.0
+      max_commission_to_risk: 0.05
     - symbol: XAG/USD
       sec_type: CFD
       min_lot_size: 50
       pip_buffer: 0.01
       max_hold_minutes: 90
+      commission_bps_per_side: 3.0
+      commission_min_per_side: 2.0
+      max_commission_to_risk: 0.05
   session: london
   timezone: UTC
   range_minutes: 15

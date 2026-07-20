@@ -28,13 +28,15 @@ var (
 	btSweepFwdFrom     string
 	btSweepFwdTo       string
 	btSweepCloseFrac   string
+	btSweepMaxHolds    string
 )
 
 func init() {
 	orbSweepCmd.Flags().StringVar(&btORBFrom, "from", "", "Coarse: start date YYYY-MM-DD (the train window)")
 	orbSweepCmd.Flags().StringVar(&btORBTo, "to", "", "Coarse: end date YYYY-MM-DD")
+	orbSweepCmd.Flags().StringVar(&btORBSession, "session", "", "Coarse: restrict to one session (london | newyork | newyork_et)")
 	orbSweepCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
-	orbSweepCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda")
+	orbSweepCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
 	orbSweepCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb.instruments via free index-CFD proxy data)")
 	orbSweepCmd.Flags().IntVar(&btORBDukaPaceMs, "duka-pace-ms", 0, "Dukascopy politeness: >0 forces 1 in-flight fetch spaced this many ms apart (overrides config). Warm the cache first (resumable) with a paced single-variant backtest, then sweep off disk.")
 	orbSweepCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
@@ -42,6 +44,7 @@ func init() {
 	orbSweepCmd.Flags().IntVar(&btSweepConcurrency, "concurrency", 8, "Parameter sets to evaluate in parallel")
 	orbSweepCmd.Flags().IntVar(&btSweepTop, "top", 25, "How many ranked candidates to print")
 	orbSweepCmd.Flags().IntVar(&btSweepMaxRuns, "max-runs", 0, "Cap the number of parameter sets (0 = full grid)")
+	orbSweepCmd.Flags().StringVar(&btSweepMaxHolds, "max-holds", "", "Coarse: max-hold minute levels to sweep, comma-separated (e.g. 60,90,120,180)")
 	orbSweepCmd.Flags().StringVar(&btSweepCloseFrac, "close-frac", "", "Coarse: close-position guard threshold levels to sweep, comma-separated (e.g. 0,0.55,0.6,0.65,0.7). Default: 0 (guard off)")
 	// validate mode
 	orbSweepCmd.Flags().StringVar(&btSweepFromRun, "from-run", "", "validate: parent coarse sweep_id whose gate-passers to walk-forward")
@@ -104,6 +107,25 @@ func parseFloatCSV(s string) ([]float64, error) {
 	return out, nil
 }
 
+func parseIntCSV(s string) ([]int, error) {
+	parts := splitCSV(s)
+	out := make([]int, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not an integer", p)
+		}
+		if v < 0 {
+			return nil, fmt.Errorf("value %v out of range [0, infinity)", v)
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	return out, nil
+}
+
 func runCoarseSweep(ctx context.Context) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -135,6 +157,16 @@ func runCoarseSweep(ctx context.Context) error {
 
 	grid := sweep.DefaultCoarseGrid()
 	grid.Sessions = uni.sessions // e.g. futures sweeps only the DST-aware US RTH open
+	if btORBSession != "" {
+		grid.Sessions = []string{btORBSession}
+	}
+	if btSweepMaxHolds != "" {
+		levels, err := parseIntCSV(btSweepMaxHolds)
+		if err != nil {
+			return fmt.Errorf("invalid --max-holds %q: %w", btSweepMaxHolds, err)
+		}
+		grid.MaxHoldMinutes = levels
+	}
 	if btSweepCloseFrac != "" {
 		levels, err := parseFloatCSV(btSweepCloseFrac)
 		if err != nil {

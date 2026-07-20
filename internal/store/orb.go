@@ -282,6 +282,21 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 	return out, rows.Err()
 }
 
+// SumClosedORBPNLForTicker returns realised net P&L for closed ORB trades in [from, to).
+func SumClosedORBPNLForTicker(ctx context.Context, db *pgxpool.Pool, ticker string, from, to time.Time) (float64, error) {
+	var pnl float64
+	err := db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(pnl), 0)
+		FROM orb_trades
+		WHERE ticker=$1
+		  AND status='closed'
+		  AND closed_at >= $2
+		  AND closed_at < $3`,
+		ticker, from, to,
+	).Scan(&pnl)
+	return pnl, err
+}
+
 // SetORBTradeExitOrderID persists the in-flight exit sell's broker order id on a
 // trade row so restart recovery can poll it for the real fill (options #415/#416).
 func SetORBTradeExitOrderID(ctx context.Context, db *pgxpool.Pool, tradeID, exitOrderID string) error {

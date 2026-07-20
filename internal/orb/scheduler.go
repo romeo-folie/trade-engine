@@ -342,6 +342,16 @@ func (s *ORBScheduler) effectiveForexCfg() config.ForexORBConfig {
 	return config.ForexORBConfig{}
 }
 
+func (s *ORBScheduler) effectiveRangeMinutes() int {
+	if s.isForexMode() && s.forexCfg != nil {
+		return s.forexCfg.RangeMinutes
+	}
+	if s.isFuturesMode() && s.futuresCfg != nil {
+		return s.futuresCfg.RangeMinutes
+	}
+	return s.cfg.RangeMinutes
+}
+
 // ownsInstrument reports whether the ticker is one this scheduler manages in its active
 // mode (a configured forex or futures instrument). Replaces isForexInstrument at call
 // sites that must also cover futures, scoping shared orb_trades reconcilers to this
@@ -372,6 +382,55 @@ func (s *ORBScheduler) tradeAssetClass() string {
 		return "futures"
 	}
 	return ""
+}
+
+// placeAndTrackBracket places one bracket, records its orb_trades row, and starts
+// tracking broker child orders for fill/exit reconciliation.
+func (s *ORBScheduler) placeAndTrackBracket(ctx context.Context, sessionID, ticker, side string, params BracketParams, placeFn func(context.Context, execution.Executor, BracketParams) (string, string, string, error), role, parentDBID string, msgs *[]string) (string, string) {
+	orderID, tpID, slID, err := placeFn(ctx, s.executor, params)
+	if err != nil {
+		slog.Error("orb: place bracket failed", "side", side, "ticker", ticker, "role", role, "err", err)
+		return "", ""
+	}
+	s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
+		OrderID: orderID, Ticker: ticker, Side: side, Status: "pending",
+	})
+	var parentPtr *string
+	if parentDBID != "" {
+		parentPtr = &parentDBID
+	}
+	dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
+		SessionID:        sessionID,
+		Ticker:           ticker,
+		Side:             side,
+		EntryStop:        params.EntryStop,
+		StopLoss:         params.StopLoss,
+		TakeProfit:       params.TakeProfit,
+		Qty:              params.Qty,
+		OrderID:          orderID,
+		Status:           "pending",
+		AssetClass:       s.tradeAssetClass(),
+		TpOrderID:        tpID,
+		SlOrderID:        slID,
+		ScaleOutRole:     role,
+		ScaleOutParentID: parentPtr,
+	})
+	if err != nil {
+		slog.Error("orb: store trade failed", "side", side, "ticker", ticker, "role", role, "err", err)
+		return orderID, ""
+	}
+	s.trackedTrades[orderID] = &trackedTrade{
+		dbID: dbID, tpOrderID: tpID, slOrderID: slID,
+		side: side, ticker: ticker, qty: params.Qty,
+		entryStop: params.EntryStop,
+	}
+	label := ticker
+	if role != "" {
+		label = ticker + " [" + role + "]"
+	}
+	*msgs = append(*msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
+		strings.ToUpper(side), label, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
+	return orderID, dbID
 }
 
 // ownsTradeRow reports whether an orb_trades row belongs to this scheduler — used to scope
@@ -458,12 +517,24 @@ func (s *ORBScheduler) sessionOpenMinutes() int {
 }
 
 // sessionCleanupMinutes returns the minute-of-day (in session TZ) after which tickDone
-// should cancel unfilled orders and mark the session done. Always 60 minutes after open,
-// which preserves the existing 10:30 ET behaviour for equities/NY-forex while giving
-// London (08:00 UTC open) a 09:00 UTC cutoff instead of the previous 14:30 UTC.
-// The result is clamped to the 0–1439 range so late-evening session opens don't overflow.
+// should cancel unfilled orders and mark the session done. Default is 60 minutes after open,
+// preserving the existing 10:30 ET behaviour for equities/NY-forex. Trend-continuation
+// instruments can need a longer delayed-entry watch, so forex mode extends the cutoff to
+// cover range + delay + confirmation bars plus a small next-bar buffer.
 func (s *ORBScheduler) sessionCleanupMinutes() int {
-	return (s.sessionOpenMinutes() + 60) % (24 * 60)
+	offset := 60
+	if s.forexCfg != nil && s.forexCfg.Enabled {
+		for _, inst := range s.forexCfg.Instruments {
+			if !IsTrendContinuation(inst) {
+				continue
+			}
+			needed := s.forexCfg.RangeMinutes + inst.ContinuationDelayMinutes + inst.ContinuationConfirmBars + 2
+			if needed > offset {
+				offset = needed
+			}
+		}
+	}
+	return (s.sessionOpenMinutes() + offset) % (24 * 60)
 }
 
 // sessionTimezone returns the timezone location for the scheduler.
@@ -730,12 +801,7 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 	// can resume fetching candles. Fresh buffers are fine — they will
 	// re-accumulate from session open on the next tick.
 	if targetState == StateRangeWatch || targetState == StateExecuting {
-		rangeMinutes := s.cfg.RangeMinutes
-		if s.isForexMode() && s.forexCfg != nil {
-			rangeMinutes = s.forexCfg.RangeMinutes
-		} else if s.isFuturesMode() && s.futuresCfg != nil {
-			rangeMinutes = s.futuresCfg.RangeMinutes
-		}
+		rangeMinutes := s.effectiveRangeMinutes()
 		s.mu.Lock()
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.optionsAttempted = make(map[string]bool)
@@ -1125,7 +1191,7 @@ func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) err
 	s.rangeBuffers = make(map[string]*RangeBuffer)
 	s.optionsAttempted = make(map[string]bool)
 	for _, sc := range s.candidates {
-		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.cfg.RangeMinutes)
+		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.effectiveRangeMinutes())
 	}
 	sessionID := s.session.ID
 	sessionCandidates := s.session.Candidates
@@ -1201,7 +1267,7 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 						Ticker:       ticker,
 						RangeHigh:    r.High,
 						RangeLow:     r.Low,
-						RangeMinutes: s.cfg.RangeMinutes,
+						RangeMinutes: s.effectiveRangeMinutes(),
 					})
 				}
 				break
@@ -1344,6 +1410,48 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// expectancy (a no-op unless enabled and data exists). Computed once, shared by
 			// both sides — they have identical sizing inputs.
 			tinst := s.throttledInstrument(ctx, *inst)
+			if IsTrendContinuation(tinst) {
+				if stopped, err := s.continuationMonthlyStopHit(ctx, ticker, tinst.ContinuationMonthlyStopLossUSD); err != nil {
+					slog.Warn("orb: trend-continuation: monthly stop read failed — skipping entry", "ticker", ticker, "err", err)
+					continue
+				} else if stopped {
+					slog.Info("orb: trend-continuation: monthly stop hit — skipping entry", "ticker", ticker, "limit", tinst.ContinuationMonthlyStopLossUSD)
+					continue
+				}
+				signal, ok := s.trendContinuationEntry(ctx, ticker, r, fcfg, tinst, portfolioVal)
+				if !ok {
+					pendingConfirmation = true
+					continue
+				}
+				br := signal.Bracket
+				if br.Qty == 0 {
+					slog.Info("orb: skipping trend-continuation — min lot exceeds the position cap", "ticker", ticker)
+					continue
+				}
+				if ok, ratio, reason := s.passesSpread(ctx, ticker, br.EntryStop, br.StopLoss, tinst.MaxSpreadToRisk); !ok {
+					slog.Info("orb: skipping trend-continuation — spread too wide vs the continuation stop", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				if ok, ratio, reason := passesCommission(br.Qty, br.EntryStop, br.StopLoss, tinst); !ok {
+					slog.Info("orb: skipping trend-continuation — commission too large vs the continuation risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				slog.Info("orb: trend-continuation entry", "ticker", ticker, "side", signal.Side, "entry", br.EntryStop, "stop", br.StopLoss, "range_pips", signal.RangePips)
+				orderID, _ := s.placeAndTrackBracket(ctx, sessionID, ticker, signal.Side, br, PlaceMarketBracket, "", "", &msgs)
+				if orderID != "" {
+					if signal.Side == "buy" {
+						s.orderIDs[ticker] = [2]string{orderID, ""}
+					} else {
+						s.orderIDs[ticker] = [2]string{"", orderID}
+					}
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker:    ticker,
+						Direction: signal.Side,
+						Strategy:  StrategyTrendContinuation,
+					})
+				}
+				continue
+			}
 			buyParams := ComputeForexBracket(r, "buy", portfolioVal, fcfg, tinst)
 			sellParams := ComputeForexBracket(r, "sell", portfolioVal, fcfg, tinst)
 
@@ -1481,50 +1589,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// Returns ("","") only when the broker placement itself failed; a DB-record
 			// failure still returns the orderID so the live order stays OCO-managed.
 			placeAndRecord := func(side string, params BracketParams, role, parentDBID string) (string, string) {
-				orderID, tpID, slID, err := placeFn(ctx, s.executor, params)
-				if err != nil {
-					slog.Error("orb: place bracket failed", "side", side, "ticker", ticker, "role", role, "err", err)
-					return "", ""
-				}
-				s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-					OrderID: orderID, Ticker: ticker, Side: side, Status: "pending",
-				})
-				var parentPtr *string
-				if parentDBID != "" {
-					parentPtr = &parentDBID
-				}
-				dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-					SessionID:        sessionID,
-					Ticker:           ticker,
-					Side:             side,
-					EntryStop:        params.EntryStop,
-					StopLoss:         params.StopLoss,
-					TakeProfit:       params.TakeProfit,
-					Qty:              params.Qty,
-					OrderID:          orderID,
-					Status:           "pending",
-					AssetClass:       s.tradeAssetClass(),
-					TpOrderID:        tpID,
-					SlOrderID:        slID,
-					ScaleOutRole:     role,
-					ScaleOutParentID: parentPtr,
-				})
-				if err != nil {
-					slog.Error("orb: store trade failed", "side", side, "ticker", ticker, "role", role, "err", err)
-					return orderID, ""
-				}
-				s.trackedTrades[orderID] = &trackedTrade{
-					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
-					side: side, ticker: ticker, qty: params.Qty,
-					entryStop: params.EntryStop,
-				}
-				label := ticker
-				if role != "" {
-					label = ticker + " [" + role + "]"
-				}
-				msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
-					strings.ToUpper(side), label, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
-				return orderID, dbID
+				return s.placeAndTrackBracket(ctx, sessionID, ticker, side, params, placeFn, role, parentDBID, &msgs)
 			}
 
 			var ids, scaleIds [2]string

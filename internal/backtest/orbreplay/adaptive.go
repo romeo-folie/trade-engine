@@ -26,7 +26,7 @@ func (e *Engine) resolveAdaptiveExit(maxHoldMin int, p orb.BracketParams, inst c
 	long := p.Side == "buy"
 	pv := pointValue(inst)
 	cost := e.costFor(inst.Symbol)
-	commission = cost.perFillCommission(p.Qty) // entry fill
+	commission = cost.perFillCommission(p.Qty, entryFill, pv) // entry fill
 	R := absf(p.EntryStop - p.StopLoss)
 	if R <= 0 {
 		R = 0.0001
@@ -50,12 +50,13 @@ func (e *Engine) resolveAdaptiveExit(maxHoldMin int, p orb.BracketParams, inst c
 	// finish exits the REMAINING position at exitMid and returns the combined result,
 	// charging the final exit fill at the remaining quantity.
 	finish := func(et string, exitMid float64, ts time.Time) (string, float64, time.Time, float64) {
-		return et, partialGross + pnl(p.Side, entryFill, exitWithSpread(p.Side, exitMid, half), remaining, pv), ts,
-			commission + cost.perFillCommission(remaining)
+		exitFill := exitWithSpread(p.Side, exitMid, half)
+		return et, partialGross + pnl(p.Side, entryFill, exitFill, remaining, pv), ts,
+			commission + cost.perFillCommission(remaining, exitFill, pv)
 	}
 
 	if len(rest) == 0 {
-		return "end_of_data", 0, entryTime, commission + cost.perFillCommission(remaining)
+		return "end_of_data", 0, entryTime, commission + cost.perFillCommission(remaining, entryFill, pv)
 	}
 
 	for _, c := range rest {
@@ -90,8 +91,9 @@ func (e *Engine) resolveAdaptiveExit(maxHoldMin int, p orb.BracketParams, inst c
 				case pq >= remaining:
 					return finish("tp", level, c.Timestamp) // fraction closes the whole position
 				case pq > 0:
-					partialGross += pnl(p.Side, entryFill, exitWithSpread(p.Side, level, half), pq, pv)
-					commission += cost.perFillCommission(pq) // partial exit fill at its own qty
+					partialFill := exitWithSpread(p.Side, level, half)
+					partialGross += pnl(p.Side, entryFill, partialFill, pq, pv)
+					commission += cost.perFillCommission(pq, partialFill, pv) // partial exit fill at its own qty
 					remaining -= pq
 					partialDone = true
 					if inst.RunnerTakeProfitR > 0 {

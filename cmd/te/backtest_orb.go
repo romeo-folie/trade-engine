@@ -56,7 +56,7 @@ func init() {
 		c.Flags().IntVar(&btORBMaxHold, "max-hold", 240, "Max-hold minutes for time-exit/range-filter variants")
 		c.Flags().Float64Var(&btORBMinRangeATR, "min-range-atr", 0, "Override min range_atr_ratio for all instruments (range-filter)")
 		c.Flags().Float64Var(&btORBMaxRangeATR, "max-range-atr", 0, "Override max range_atr_ratio for all instruments (range-filter)")
-		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | oanda (default: config markets.backtest_provider)")
+		c.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda (default: config markets.backtest_provider)")
 		c.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb.instruments via free index-CFD proxy data)")
 		c.Flags().IntVar(&btORBDukaPaceMs, "duka-pace-ms", 0, "Dukascopy politeness: >0 forces 1 in-flight fetch spaced this many ms apart (overrides config). Use 3000-5000 for a throttled cold IP; the disk cache makes the fill resumable, so re-run until it completes.")
 		_ = c.MarkFlagRequired("from")
@@ -230,11 +230,12 @@ func buildBacktestUniverse(cfg *config.Config) (*backtestUniverse, error) {
 // used as its backtest proxy, PER DATA PROVIDER (vendors name the same index differently
 // and carry different subsets). HistData's full tick catalogue has exactly two US index
 // CFDs — SPXUSD and NSXUSD (verified 2026-07: no Dow, no Russell) — while Dukascopy
-// carries all four. A contract without a proxy on the selected provider is skipped with a
-// note. A cash-index level tracks the future closely enough for RULE research — basis
-// shifts the price LEVEL, not the size of a point — but fills are approximate;
-// contract-accurate research needs an exchange-data source. Running the same sweep on
-// both providers is also a cheap cross-vendor check against data artifacts.
+// carries all four. Exness local exports currently provide US500/USTEC/US30 but no Russell.
+// A contract without a proxy on the selected provider is skipped with a note. A cash-index
+// level tracks the future closely enough for RULE research — basis shifts the price LEVEL,
+// not the size of a point — but fills are approximate; contract-accurate research needs an
+// exchange-data source. Running the same sweep on multiple providers is also a cheap
+// cross-vendor check against data artifacts.
 var futuresProxiesByProvider = map[string]map[string]string{
 	"histdata": {
 		"MES": "SPXUSD", // S&P 500
@@ -245,6 +246,11 @@ var futuresProxiesByProvider = map[string]map[string]string{
 		"MNQ": "USATECHIDXUSD",  // Nasdaq 100
 		"MYM": "USA30IDXUSD",    // Dow Jones Industrial Average
 		"M2K": "USSC2000IDXUSD", // Russell 2000
+	},
+	"exness": {
+		"MES": "US500", // S&P 500 CFD export
+		"MNQ": "USTEC", // Nasdaq 100 CFD export
+		"MYM": "US30",  // Dow Jones CFD export
 	},
 }
 
@@ -263,7 +269,7 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 	}
 	providerProxies, ok := futuresProxiesByProvider[providerName]
 	if !ok {
-		return nil, fmt.Errorf("--asset-class futures has no index-CFD proxy mapping for provider %q (use histdata or dukascopy)", providerName)
+		return nil, fmt.Errorf("--asset-class futures has no index-CFD proxy mapping for provider %q (use histdata, dukascopy, or exness)", providerName)
 	}
 	available := make([]string, 0, len(providerProxies))
 	for _, fi := range fcfg.Instruments {
@@ -377,10 +383,12 @@ func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) 
 			opts.RequestTimeout = 60 * time.Second // the feed tarpits bulk fetchers to ~18s; be patient
 		}
 		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale, opts), nil
+	case "exness":
+		return data.NewExnessCSVClient(cfg.Markets.Exness.DataDir), nil
 	case "oanda":
 		return buildOANDAProvider(cfg.Markets.OANDA)
 	default:
-		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|oanda)", resolveBacktestProviderName(cfg))
+		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|exness|oanda)", resolveBacktestProviderName(cfg))
 	}
 }
 
@@ -454,10 +462,15 @@ func buildCostModels(instruments []config.Instrument) map[string]orbreplay.CostM
 		// Per-instrument commission_per_side overrides the flat default so the replay charges
 		// (and its commission/risk gate measures) the same estimate the live gate uses.
 		commission := orbCommissionPerSide
-		if inst.CommissionPerSide > 0 {
+		if inst.CommissionPerSide > 0 || inst.CommissionBpsPerSide > 0 {
 			commission = inst.CommissionPerSide
 		}
-		costs[inst.Symbol] = orbreplay.CostModel{Spread: spread, CommissionPerSide: commission}
+		costs[inst.Symbol] = orbreplay.CostModel{
+			Spread:               spread,
+			CommissionPerSide:    commission,
+			CommissionBpsPerSide: inst.CommissionBpsPerSide,
+			CommissionMinPerSide: inst.CommissionMinPerSide,
+		}
 	}
 	return costs
 }
