@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,11 +22,15 @@ var (
 	btStrengthExits     string
 	btStrengthGaps      string
 	btStrengthBroadMin  int
+	btStrengthBroadMins string
+	btStrengthConfirms  string
+	btStrengthTradeSyms string
 	btStrengthUnits     int
 	btStrengthTop       int
 	btStrengthMinTrades int
 	btStrengthAnalysis  bool
 	btStrengthSlipMults string
+	btStrengthScoreMode string
 	btStrengthTrainFrom string
 	btStrengthTrainTo   string
 	btStrengthValFrom   string
@@ -42,14 +47,18 @@ func init() {
 	currencyStrengthCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex only")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthStarts, "starts", "00:00,02:00,06:00", "UTC strength-window start times, HH:MM")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthRankEnds, "rank-ends", "07:00,08:00,09:00,10:00", "UTC strength-window end / entry times, HH:MM")
-	currencyStrengthCmd.Flags().StringVar(&btStrengthExits, "exits", "12:00,14:00,15:00,16:00,17:00,20:00", "UTC fixed exit times, HH:MM")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthExits, "exits", "12:00,14:00,15:00,16:00,17:00,18:00,20:00", "UTC fixed exit times, HH:MM")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthGaps, "min-gaps", "0.0002,0.0004,0.0006,0.001,0.0015,0.002", "Minimum strongest-minus-weakest currency-score gaps")
 	currencyStrengthCmd.Flags().IntVar(&btStrengthBroadMin, "broad-min", 2, "Minimum pair-vote breadth for strongest and weakest currencies")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthBroadMins, "broad-mins", "", "Comma-separated breadth thresholds to sweep (default: --broad-min)")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthConfirms, "confirm-min-moves", "0", "Comma-separated minimum routed-pair signed log moves before entry")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthTradeSyms, "trade-instruments", "", "Comma-separated routed pairs allowed for execution (default: any ranked pair)")
 	currencyStrengthCmd.Flags().IntVar(&btStrengthUnits, "units", 100000, "Fixed trade size in base units")
 	currencyStrengthCmd.Flags().IntVar(&btStrengthTop, "top", 20, "How many ranked candidates to print")
 	currencyStrengthCmd.Flags().IntVar(&btStrengthMinTrades, "min-trades", 100, "Minimum trades for printed candidates")
 	currencyStrengthCmd.Flags().BoolVar(&btStrengthAnalysis, "analysis", false, "Print robustness detail for the top candidate")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthSlipMults, "slippage-mults", "1,1.5,2,3", "Spread/slippage multipliers for --analysis")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthScoreMode, "score-mode", "overall", "Candidate scoring mode: overall | walk-forward")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthTrainFrom, "train-from", "2022-01-01", "Analysis train window start")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthTrainTo, "train-to", "2024-12-31", "Analysis train window end")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthValFrom, "validate-from", "2025-01-01", "Analysis validation window start")
@@ -84,11 +93,12 @@ type strengthParam struct {
 	Exit     string
 	MinGap   float64
 	BroadMin int
+	Confirm  float64
 	Units    int
 }
 
 func (p strengthParam) label() string {
-	return fmt.Sprintf("strength/%s-%s/exit%s/gap%.4f/broad%d/units%d", p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Units)
+	return fmt.Sprintf("strength/%s-%s/exit%s/gap%.4f/broad%d/confirm%.4f/units%d", p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Confirm, p.Units)
 }
 
 type strengthResult struct {
@@ -99,6 +109,12 @@ type strengthResult struct {
 }
 
 type strengthSnapshots map[time.Time]map[string]map[string]float64
+
+type strengthEvalWindow struct {
+	Label string
+	From  time.Time
+	To    time.Time
+}
 
 func runCurrencyStrength(ctx context.Context) error {
 	if btORBAssetClass != "" && btORBAssetClass != "forex" {
@@ -146,12 +162,28 @@ func runCurrencyStrength(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("invalid --min-gaps %q: %w", btStrengthGaps, err)
 	}
+	broadMins, err := parseStrengthBroadMins(btStrengthBroadMins, btStrengthBroadMin)
+	if err != nil {
+		return err
+	}
+	confirms, err := parseNonNegativeFloatLevels(btStrengthConfirms)
+	if err != nil {
+		return fmt.Errorf("invalid --confirm-min-moves %q: %w", btStrengthConfirms, err)
+	}
+	scoreWindows, err := strengthScoreWindows()
+	if err != nil {
+		return err
+	}
 
 	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
 	pairs, err := strengthPairs(uni.instruments)
+	if err != nil {
+		return err
+	}
+	tradeSymbols, err := parseStrengthTradeSymbols(btStrengthTradeSyms, pairs)
 	if err != nil {
 		return err
 	}
@@ -172,10 +204,14 @@ func runCurrencyStrength(ctx context.Context) error {
 					continue
 				}
 				for _, gap := range gaps {
-					params = append(params, strengthParam{
-						Start: start, RankEnd: rankEnd, Exit: exit,
-						MinGap: gap, BroadMin: btStrengthBroadMin, Units: btStrengthUnits,
-					})
+					for _, broadMin := range broadMins {
+						for _, confirm := range confirms {
+							params = append(params, strengthParam{
+								Start: start, RankEnd: rankEnd, Exit: exit,
+								MinGap: gap, BroadMin: broadMin, Confirm: confirm, Units: btStrengthUnits,
+							})
+						}
+					}
 				}
 			}
 		}
@@ -186,9 +222,14 @@ func runCurrencyStrength(ctx context.Context) error {
 
 	results := make([]strengthResult, 0, len(params))
 	for _, p := range params {
-		trades := runStrengthParam(snaps, pairs, uni.costs, p, from, to)
+		trades := runStrengthParam(snaps, pairs, uni.costs, p, from, to, tradeSymbols)
 		res := orbreplay.Summarize(p.label(), trades)
-		results = append(results, strengthResult{Param: p, Result: res, Score: strengthScore(res.Overall, btStrengthMinTrades), Gate: strengthGate(res.Overall, btStrengthMinTrades)})
+		results = append(results, strengthResult{
+			Param:  p,
+			Result: res,
+			Score:  strengthScoreResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
+			Gate:   strengthGateResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
+		})
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Score == results[j].Score {
@@ -205,7 +246,7 @@ func runCurrencyStrength(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("invalid --slippage-mults %q: %w", btStrengthSlipMults, err)
 		}
-		if err := printStrengthAnalysis(snaps, pairs, uni.costs, results, from, to, slips); err != nil {
+		if err := printStrengthAnalysis(snaps, pairs, uni.costs, results, from, to, slips, tradeSymbols, scoreWindows); err != nil {
 			return err
 		}
 	}
@@ -250,6 +291,80 @@ func parseClockList(csv string) ([]string, error) {
 			return nil, err
 		}
 		out = append(out, t.Format("15:04"))
+	}
+	return out, nil
+}
+
+func parseStrengthBroadMins(csv string, fallback int) ([]int, error) {
+	if strings.TrimSpace(csv) == "" {
+		return []int{fallback}, nil
+	}
+	out, err := parsePositiveIntCSV(csv)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --broad-mins %q: %w", csv, err)
+	}
+	return out, nil
+}
+
+func parseNonNegativeFloatLevels(csv string) ([]float64, error) {
+	parts := splitCSV(csv)
+	out := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not a number", p)
+		}
+		if v < 0 {
+			return nil, fmt.Errorf("value %v must not be negative", v)
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	return out, nil
+}
+
+func parseStrengthTradeSymbols(csv string, pairs []strengthPair) (map[string]bool, error) {
+	parts := splitCSV(csv)
+	if len(parts) == 0 {
+		return nil, nil
+	}
+	available := make(map[string]bool, len(pairs))
+	for _, pair := range pairs {
+		available[pair.Instrument.Symbol] = true
+	}
+	out := make(map[string]bool, len(parts))
+	for _, raw := range parts {
+		sym := strings.ToUpper(strings.TrimSpace(raw))
+		if !available[sym] {
+			return nil, fmt.Errorf("--trade-instruments symbol %q is not in the FX backtest universe", raw)
+		}
+		out[sym] = true
+	}
+	return out, nil
+}
+
+func strengthScoreWindows() ([]strengthEvalWindow, error) {
+	if btStrengthScoreMode != "overall" && btStrengthScoreMode != "walk-forward" {
+		return nil, fmt.Errorf("--score-mode must be overall or walk-forward")
+	}
+	windows := []struct {
+		Label string
+		From  string
+		To    string
+	}{
+		{"train", btStrengthTrainFrom, btStrengthTrainTo},
+		{"validate", btStrengthValFrom, btStrengthValTo},
+		{"forward", btStrengthFwdFrom, cmpOr(btStrengthFwdTo, btORBTo)},
+	}
+	out := make([]strengthEvalWindow, 0, len(windows))
+	for _, w := range windows {
+		from, to, err := parseWindow(w.From, w.To)
+		if err != nil {
+			return nil, fmt.Errorf("%s window: %w", w.Label, err)
+		}
+		out = append(out, strengthEvalWindow{Label: w.Label, From: from, To: to})
 	}
 	return out, nil
 }
@@ -322,7 +437,7 @@ func strengthDayCloses(ctx context.Context, provider data.MarketDataProvider, sy
 	return out, nil
 }
 
-func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, from, to time.Time) []orbreplay.SimTrade {
+func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, from, to time.Time, tradeSymbols map[string]bool) []orbreplay.SimTrade {
 	days := make([]time.Time, 0, len(snaps))
 	for day := range snaps {
 		if !day.Before(fadeTruncateDay(from)) && !day.After(to) {
@@ -332,16 +447,17 @@ func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[s
 	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
 	var trades []orbreplay.SimTrade
 	for _, day := range days {
-		if trade := simulateStrengthDay(snaps[day], pairs, costs, p, day); trade != nil {
+		if trade := simulateStrengthDay(snaps[day], pairs, costs, p, day, tradeSymbols); trade != nil {
 			trades = append(trades, *trade)
 		}
 	}
 	return trades
 }
 
-func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time) *orbreplay.SimTrade {
+func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time, tradeSymbols map[string]bool) *orbreplay.SimTrade {
 	scores := make(map[string]float64)
 	votes := make(map[string]int)
+	pairReturns := make(map[string]float64, len(pairs))
 	for _, pair := range pairs {
 		values := day[pair.Instrument.Symbol]
 		start, okStart := values[p.Start]
@@ -352,6 +468,7 @@ func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair
 		}
 		_ = exit
 		ret := math.Log(end / start)
+		pairReturns[pair.Instrument.Symbol] = ret
 		scores[pair.Base] += ret
 		scores[pair.Quote] -= ret
 		switch {
@@ -369,6 +486,16 @@ func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair
 	}
 	pair, side, ok := routeStrengthPair(pairs, strong, weak)
 	if !ok {
+		return nil
+	}
+	if len(tradeSymbols) > 0 && !tradeSymbols[pair.Instrument.Symbol] {
+		return nil
+	}
+	confirm := pairReturns[pair.Instrument.Symbol]
+	if side == "sell" {
+		confirm = -confirm
+	}
+	if confirm < p.Confirm {
 		return nil
 	}
 	entryMid := day[pair.Instrument.Symbol][p.RankEnd]
@@ -462,9 +589,63 @@ func strengthGate(m orbreplay.Metrics, minTrades int) bool {
 	return m.ProfitFactor >= 1.15 && avg > 0 && m.WinRate >= 0.50
 }
 
+func strengthScoreResult(res orbreplay.Result, minTrades int, mode string, windows []strengthEvalWindow) float64 {
+	if mode != "walk-forward" {
+		return strengthScore(res.Overall, minTrades)
+	}
+	windowMinTrades := strengthWindowMinTrades(minTrades)
+	worst := math.Inf(1)
+	for _, window := range windows {
+		trades := filterStrengthTrades(res.Trades, window.From, window.To)
+		score := strengthScore(orbreplay.Summarize(window.Label, trades).Overall, windowMinTrades)
+		if score < worst {
+			worst = score
+		}
+	}
+	if math.IsInf(worst, 1) {
+		return math.Inf(-1)
+	}
+	return worst + strengthScore(res.Overall, minTrades)*0.25
+}
+
+func strengthGateResult(res orbreplay.Result, minTrades int, mode string, windows []strengthEvalWindow) bool {
+	if mode != "walk-forward" {
+		return strengthGate(res.Overall, minTrades)
+	}
+	if res.Overall.Trades < minTrades {
+		return false
+	}
+	windowMinTrades := strengthWindowMinTrades(minTrades)
+	for _, window := range windows {
+		trades := filterStrengthTrades(res.Trades, window.From, window.To)
+		if !strengthGate(orbreplay.Summarize(window.Label, trades).Overall, windowMinTrades) {
+			return false
+		}
+	}
+	return true
+}
+
+func strengthWindowMinTrades(minTrades int) int {
+	windowMinTrades := minTrades / 4
+	if windowMinTrades < 1 {
+		windowMinTrades = 1
+	}
+	return windowMinTrades
+}
+
+func filterStrengthTrades(trades []orbreplay.SimTrade, from, to time.Time) []orbreplay.SimTrade {
+	out := make([]orbreplay.SimTrade, 0, len(trades))
+	for _, trade := range trades {
+		if !trade.EntryTime.Before(from) && !trade.EntryTime.After(to) {
+			out = append(out, trade)
+		}
+	}
+	return out
+}
+
 func printStrengthResults(results []strengthResult, top, minTrades int) {
-	fmt.Printf("%-3s %-5s %-5s %-5s %-7s %7s %6s %6s %11s %9s %8s %5s\n",
-		"#", "START", "RANK", "EXIT", "GAP", "TRADES", "WIN%", "PF", "NET_PNL", "AVG_PNL", "SCORE", "GATE")
+	fmt.Printf("%-3s %-5s %-5s %-5s %-7s %5s %7s %7s %6s %6s %11s %9s %8s %5s\n",
+		"#", "START", "RANK", "EXIT", "GAP", "BRD", "CONF", "TRADES", "WIN%", "PF", "NET_PNL", "AVG_PNL", "SCORE", "GATE")
 	printed := 0
 	for _, r := range results {
 		m := r.Result.Overall
@@ -480,9 +661,9 @@ func printStrengthResults(results []strengthResult, top, minTrades int) {
 		if m.Trades > 0 {
 			avg = m.NetPnL / float64(m.Trades)
 		}
-		fmt.Printf("%-3d %-5s %-5s %-5s %-7.4f %7d %5.1f%% %6s %11.2f %9.2f %8.3f %5s\n",
+		fmt.Printf("%-3d %-5s %-5s %-5s %-7.4f %5d %7.4f %7d %5.1f%% %6s %11.2f %9.2f %8.3f %5s\n",
 			printed, r.Param.Start, r.Param.RankEnd, r.Param.Exit, r.Param.MinGap,
-			m.Trades, m.WinRate*100, fmtPF(m.ProfitFactor), m.NetPnL, avg, r.Score, gate)
+			r.Param.BroadMin, r.Param.Confirm, m.Trades, m.WinRate*100, fmtPF(m.ProfitFactor), m.NetPnL, avg, r.Score, gate)
 		if printed >= top {
 			break
 		}
@@ -492,7 +673,7 @@ func printStrengthResults(results []strengthResult, top, minTrades int) {
 	}
 }
 
-func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, results []strengthResult, from, to time.Time, slipMults []float64) error {
+func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, results []strengthResult, from, to time.Time, slipMults []float64, tradeSymbols map[string]bool, scoreWindows []strengthEvalWindow) error {
 	bestIdx := -1
 	for i, r := range results {
 		if r.Result.Overall.Trades >= btStrengthMinTrades {
@@ -514,7 +695,7 @@ func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs 
 		return t.Ticker
 	}))
 	printStrengthMonthlyDrawdown(trades)
-	if err := printStrengthWalkForward(snaps, pairs, costs, best.Param); err != nil {
+	if err := printStrengthWalkForward(snaps, pairs, costs, best.Param, tradeSymbols); err != nil {
 		return err
 	}
 
@@ -522,7 +703,7 @@ func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs 
 	fmt.Printf("%-8s %7s %6s %6s %11s %9s %8s %5s\n", "MULT", "TRADES", "WIN%", "PF", "NET_PNL", "AVG_PNL", "SCORE", "GATE")
 	for _, mult := range slipMults {
 		stressCosts := multiplyContSpreads(costs, mult)
-		trades := runStrengthParam(snaps, pairs, stressCosts, best.Param, from, to)
+		trades := runStrengthParam(snaps, pairs, stressCosts, best.Param, from, to, tradeSymbols)
 		res := orbreplay.Summarize(best.Param.label(), trades)
 		m := res.Overall
 		avg := 0.0
@@ -530,11 +711,12 @@ func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs 
 			avg = m.NetPnL / float64(m.Trades)
 		}
 		gate := ""
-		if strengthGate(m, btStrengthMinTrades) {
+		if strengthGateResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows) {
 			gate = "PASS"
 		}
 		fmt.Printf("%-8.2f %7d %5.1f%% %6s %11.2f %9.2f %8.3f %5s\n",
-			mult, m.Trades, m.WinRate*100, fmtPF(m.ProfitFactor), m.NetPnL, avg, strengthScore(m, btStrengthMinTrades), gate)
+			mult, m.Trades, m.WinRate*100, fmtPF(m.ProfitFactor), m.NetPnL, avg,
+			strengthScoreResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows), gate)
 	}
 	return nil
 }
@@ -629,7 +811,7 @@ func printStrengthMonthlyDrawdown(trades []orbreplay.SimTrade) {
 	}
 }
 
-func printStrengthWalkForward(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam) error {
+func printStrengthWalkForward(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, tradeSymbols map[string]bool) error {
 	windows := []struct {
 		Label string
 		From  string
@@ -646,7 +828,7 @@ func printStrengthWalkForward(snaps strengthSnapshots, pairs []strengthPair, cos
 		if err != nil {
 			return fmt.Errorf("%s window: %w", w.Label, err)
 		}
-		trades := runStrengthParam(snaps, pairs, costs, p, from, to)
+		trades := runStrengthParam(snaps, pairs, costs, p, from, to, tradeSymbols)
 		m := orbreplay.Summarize(p.label(), trades).Overall
 		avg := 0.0
 		if m.Trades > 0 {

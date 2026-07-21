@@ -49,7 +49,7 @@ func TestSimulateStrengthDayRequiresBroadStrongAndWeakVotes(t *testing.T) {
 	}
 	p := strengthParam{Start: "06:00", RankEnd: "09:00", Exit: "17:00", MinGap: 0.0001, BroadMin: 2, Units: 100000}
 
-	trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC))
+	trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), nil)
 	if trade == nil {
 		t.Fatal("expected broad strength trade")
 	}
@@ -58,8 +58,75 @@ func TestSimulateStrengthDayRequiresBroadStrongAndWeakVotes(t *testing.T) {
 	}
 
 	p.BroadMin = 3
-	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)); trade != nil {
+	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), nil); trade != nil {
 		t.Fatalf("broad-min=3 produced trade %+v, want skip", trade)
+	}
+}
+
+func TestSimulateStrengthDayAppliesRoutedPairConfirmation(t *testing.T) {
+	pairs := []strengthPair{
+		{Instrument: config.Instrument{Symbol: "EUR/USD", SecType: "CASH"}, Base: "EUR", Quote: "USD"},
+		{Instrument: config.Instrument{Symbol: "GBP/USD", SecType: "CASH"}, Base: "GBP", Quote: "USD"},
+		{Instrument: config.Instrument{Symbol: "USD/JPY", SecType: "CASH", PointValue: 0.007}, Base: "USD", Quote: "JPY"},
+		{Instrument: config.Instrument{Symbol: "EUR/JPY", SecType: "CASH", PointValue: 0.007}, Base: "EUR", Quote: "JPY"},
+		{Instrument: config.Instrument{Symbol: "GBP/JPY", SecType: "CASH", PointValue: 0.007}, Base: "GBP", Quote: "JPY"},
+	}
+	day := map[string]map[string]float64{
+		"EUR/USD": {"06:00": 1.10, "09:00": 1.102, "17:00": 1.12},
+		"GBP/USD": {"06:00": 1.20, "09:00": 1.21, "17:00": 1.22},
+		"USD/JPY": {"06:00": 140.0, "09:00": 139.0, "17:00": 138.0},
+		"EUR/JPY": {"06:00": 154.0, "09:00": 155.0, "17:00": 156.0},
+		"GBP/JPY": {"06:00": 168.0, "09:00": 169.0, "17:00": 170.0},
+	}
+	costs := map[string]orbreplay.CostModel{
+		"EUR/USD": {Spread: 0.00008, CommissionPerSide: 2},
+		"GBP/USD": {Spread: 0.00010, CommissionPerSide: 2},
+		"USD/JPY": {Spread: 0.012, CommissionPerSide: 2},
+		"EUR/JPY": {Spread: 0.018, CommissionPerSide: 2},
+		"GBP/JPY": {Spread: 0.022, CommissionPerSide: 2},
+	}
+	p := strengthParam{Start: "06:00", RankEnd: "09:00", Exit: "17:00", MinGap: 0.0001, BroadMin: 2, Confirm: 0.01, Units: 100000}
+
+	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), nil); trade != nil {
+		t.Fatalf("confirm threshold produced trade %+v, want skip", trade)
+	}
+
+	p.Confirm = 0.005
+	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), nil); trade == nil {
+		t.Fatal("lower confirm threshold skipped trade, want execution")
+	}
+}
+
+func TestSimulateStrengthDayAppliesTradeInstrumentFilter(t *testing.T) {
+	pairs := []strengthPair{
+		{Instrument: config.Instrument{Symbol: "EUR/USD", SecType: "CASH"}, Base: "EUR", Quote: "USD"},
+		{Instrument: config.Instrument{Symbol: "GBP/USD", SecType: "CASH"}, Base: "GBP", Quote: "USD"},
+		{Instrument: config.Instrument{Symbol: "USD/JPY", SecType: "CASH", PointValue: 0.007}, Base: "USD", Quote: "JPY"},
+		{Instrument: config.Instrument{Symbol: "EUR/JPY", SecType: "CASH", PointValue: 0.007}, Base: "EUR", Quote: "JPY"},
+		{Instrument: config.Instrument{Symbol: "GBP/JPY", SecType: "CASH", PointValue: 0.007}, Base: "GBP", Quote: "JPY"},
+	}
+	day := map[string]map[string]float64{
+		"EUR/USD": {"06:00": 1.10, "09:00": 1.11, "17:00": 1.12},
+		"GBP/USD": {"06:00": 1.20, "09:00": 1.21, "17:00": 1.22},
+		"USD/JPY": {"06:00": 140.0, "09:00": 139.0, "17:00": 138.0},
+		"EUR/JPY": {"06:00": 154.0, "09:00": 155.0, "17:00": 156.0},
+		"GBP/JPY": {"06:00": 168.0, "09:00": 169.0, "17:00": 170.0},
+	}
+	costs := map[string]orbreplay.CostModel{
+		"EUR/USD": {Spread: 0.00008, CommissionPerSide: 2},
+		"GBP/USD": {Spread: 0.00010, CommissionPerSide: 2},
+		"USD/JPY": {Spread: 0.012, CommissionPerSide: 2},
+		"EUR/JPY": {Spread: 0.018, CommissionPerSide: 2},
+		"GBP/JPY": {Spread: 0.022, CommissionPerSide: 2},
+	}
+	p := strengthParam{Start: "06:00", RankEnd: "09:00", Exit: "17:00", MinGap: 0.0001, BroadMin: 2, Units: 100000}
+
+	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), map[string]bool{"USD/JPY": true}); trade != nil {
+		t.Fatalf("trade filter produced trade %+v, want skip", trade)
+	}
+
+	if trade := simulateStrengthDay(day, pairs, costs, p, time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC), map[string]bool{"EUR/USD": true}); trade == nil {
+		t.Fatal("matching trade filter skipped trade, want execution")
 	}
 }
 
