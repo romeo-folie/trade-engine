@@ -425,21 +425,25 @@ Modes:
 
 			if cfg.CurrencyStrength.Enabled {
 				if shouldRunCurrencyStrengthForForexSession(cfg.ForexORB.Session) {
-					if err := validateCurrencyStrengthPaperConfig(cfg, runDryRun); err != nil {
-						return err
-					}
-					runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
-					if err := runner.loadState(); err != nil {
-						return err
-					}
-					active = append(active, "currency_strength")
-					eg.Go(func() error {
-						logger.Info("forex: currency-strength runner starting")
-						if err := runner.Run(egCtx); err != nil && err != context.Canceled {
-							return fmt.Errorf("currency-strength runner: %w", err)
+					if shouldRunCurrencyStrengthPaperOrders(cfg.CurrencyStrength.Mode) {
+						if err := validateCurrencyStrengthPaperConfig(cfg, runDryRun); err != nil {
+							return err
 						}
-						return nil
-					})
+						runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
+						if err := runner.loadState(); err != nil {
+							return err
+						}
+						active = append(active, "currency_strength")
+						eg.Go(func() error {
+							logger.Info("forex: currency-strength runner starting")
+							if err := runner.Run(egCtx); err != nil && err != context.Canceled {
+								return fmt.Errorf("currency-strength runner: %w", err)
+							}
+							return nil
+						})
+					} else {
+						logger.Info("forex: currency-strength skipped in shared launcher", "mode", cfg.CurrencyStrength.Mode)
+					}
 				} else {
 					logger.Info("forex: currency-strength skipped outside london session", "session", cfg.ForexORB.Session)
 				}

@@ -81,6 +81,10 @@ func shouldRunCurrencyStrengthForForexSession(session string) bool {
 	}
 }
 
+func shouldRunCurrencyStrengthPaperOrders(mode string) bool {
+	return strings.EqualFold(strings.TrimSpace(mode), "paper")
+}
+
 func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 	loc, err := time.LoadLocation(r.cfg.Timezone)
 	if err != nil {
@@ -147,9 +151,14 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	}
 
 	if existing, err := r.configuredPosition(ctx); err != nil {
-		return err
+		logger.Warn("currency-strength: skipping entry after position check failure", "date", dateKey, "err", err)
+		r.decisionDoneFor = dateKey
+		return nil
 	} else if existing != nil {
-		return fmt.Errorf("currency-strength refusing entry: configured IBKR position already exists without runner state (%s qty %.2f)", existing.Ticker, existing.Quantity)
+		logger.Info("currency-strength: skipping entry because configured IBKR position already exists without runner state",
+			"date", dateKey, "ticker", existing.Ticker, "quantity", existing.Quantity)
+		r.decisionDoneFor = dateKey
+		return nil
 	}
 
 	windows := make(map[string]currencystrength.Window, len(pairs))

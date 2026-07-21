@@ -1,10 +1,14 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
 func TestIsIBKRPaperAccountID(t *testing.T) {
@@ -78,4 +82,84 @@ func TestShouldRunCurrencyStrengthForForexSession(t *testing.T) {
 			t.Errorf("shouldRunCurrencyStrengthForForexSession(%q) = %v, want %v", tc.session, got, tc.want)
 		}
 	}
+}
+
+func TestShouldRunCurrencyStrengthPaperOrders(t *testing.T) {
+	cases := []struct {
+		mode string
+		want bool
+	}{
+		{"paper", true},
+		{" PAPER ", true},
+		{"shadow", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := shouldRunCurrencyStrengthPaperOrders(tc.mode); got != tc.want {
+			t.Errorf("shouldRunCurrencyStrengthPaperOrders(%q) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}
+
+func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			TradeInstruments: []string{"GBP/USD"},
+		},
+		market:    fakeMarketDataProvider{},
+		broker:    fakeExecutor{positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}}},
+		statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time {
+			return time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+		},
+	}
+
+	err := runner.evaluateAndEnter(context.Background(), "2026-07-21",
+		time.Date(2026, 7, 21, 6, 0, 0, 0, time.UTC),
+		time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatalf("evaluateAndEnter returned error: %v", err)
+	}
+	if runner.decisionDoneFor != "2026-07-21" {
+		t.Fatalf("decisionDoneFor = %q, want 2026-07-21", runner.decisionDoneFor)
+	}
+}
+
+type fakeMarketDataProvider struct{}
+
+func (fakeMarketDataProvider) FetchCandles(context.Context, string, data.Timeframe, time.Time, time.Time) ([]data.Candle, error) {
+	return nil, errors.New("unexpected market fetch")
+}
+
+func (fakeMarketDataProvider) FetchQuote(context.Context, string) (*data.Quote, error) {
+	return nil, errors.New("unexpected market fetch")
+}
+
+func (fakeMarketDataProvider) FetchHistory(context.Context, string, data.Timeframe, int) ([]data.Candle, error) {
+	return nil, errors.New("unexpected market fetch")
+}
+
+type fakeExecutor struct {
+	positions []execution.Position
+}
+
+func (f fakeExecutor) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unexpected order")
+}
+
+func (f fakeExecutor) CancelOrder(context.Context, string) error {
+	return errors.New("unexpected cancel")
+}
+
+func (f fakeExecutor) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unexpected status")
+}
+
+func (f fakeExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	return f.positions, nil
+}
+
+func (f fakeExecutor) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
 }
