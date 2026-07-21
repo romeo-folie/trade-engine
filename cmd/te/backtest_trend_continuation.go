@@ -39,9 +39,10 @@ var (
 func init() {
 	trendContCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	trendContCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	trendContCmd.Flags().StringVar(&btContSession, "session", "newyork", "Session: london | newyork")
+	trendContCmd.Flags().StringVar(&btContSession, "session", "newyork", "Session: london | newyork | newyork_et (default newyork; futures maps newyork to newyork_et)")
 	trendContCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	trendContCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
+	trendContCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb/default micro-index instruments via index-CFD proxy data)")
 	trendContCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
 	trendContCmd.Flags().StringVar(&btContRanges, "ranges", "15,30,60", "Opening-range minute levels to test")
 	trendContCmd.Flags().StringVar(&btContDelays, "delays", "15,30,60,90", "Minutes after range lock before continuation may enter")
@@ -140,8 +141,9 @@ func runTrendContinuation(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btContSession != "london" && btContSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for trend-continuation (use london|newyork)", btContSession)
+	session, err := normalizeStrategySession(btContSession)
+	if err != nil {
+		return fmt.Errorf("--session %q unsupported for trend-continuation: %w", btContSession, err)
 	}
 
 	ranges, err := parsePositiveIntCSV(btContRanges)
@@ -191,15 +193,10 @@ func runTrendContinuation(ctx context.Context) error {
 		return fmt.Errorf("invalid --exclude-range-pips %q: %w", btContExcludeRange, err)
 	}
 
-	provider, err := buildBacktestProvider(cfg)
+	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
-	instruments, err := resolveInstruments(cfg.ForexORB, btORBInstruments)
-	if err != nil {
-		return err
-	}
-	costs := buildCostModels(instruments)
 
 	var params []contParam
 	for _, rm := range ranges {
@@ -209,7 +206,7 @@ func runTrendContinuation(ctx context.Context) error {
 					for _, rr := range rrs {
 						for _, hold := range holds {
 							params = append(params, contParam{
-								Session: btContSession, RangeMinutes: rm, DelayMinutes: delay, ConfirmBars: confirm,
+								Session: session, RangeMinutes: rm, DelayMinutes: delay, ConfirmBars: confirm,
 								DepthMul: depth, RiskReward: rr, MaxHold: hold, SideMode: btContSideMode,
 								TrendFilter: btContTrendFilter, TrendLookbk: btContTrendLookbk,
 								MinRangePips: btContMinRangePip, MaxRangePips: btContMaxRangePip,
@@ -224,13 +221,13 @@ func runTrendContinuation(ctx context.Context) error {
 	}
 
 	fmt.Printf("trend-continuation · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btContSession, btORBFrom, btORBTo, len(params), len(instruments))
+		session, btORBFrom, btORBTo, len(params), len(uni.instruments))
 	fmt.Printf("filters: side=%s trend=%s lookback=%dm range_pips=%.1f..%.1f exclude_range_pips=%s monthly_stop_loss=%.2f\n\n",
 		btContSideMode, btContTrendFilter, btContTrendLookbk, btContMinRangePip, btContMaxRangePip, orb.FormatRangeBands(excludeRanges), btContMonthlyStop)
 
 	results := make([]contResult, 0, len(params))
 	for _, p := range params {
-		trades, err := runContParam(ctx, cfg.ForexORB, provider, costs, instruments, p, from, to, btORBCapital)
+		trades, err := runContParam(ctx, uni.base, uni.provider, uni.costs, uni.instruments, p, from, to, btORBCapital)
 		if err != nil {
 			return err
 		}
@@ -275,7 +272,7 @@ func runTrendContinuation(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("invalid --slippage-mults %q: %w", btContSlipMults, err)
 		}
-		if err := printContRobustness(ctx, cfg.ForexORB, provider, costs, instruments, results, from, to, btORBCapital, slips); err != nil {
+		if err := printContRobustness(ctx, uni.base, uni.provider, uni.costs, uni.instruments, results, from, to, btORBCapital, slips); err != nil {
 			return err
 		}
 	}

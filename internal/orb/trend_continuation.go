@@ -197,6 +197,9 @@ func EvaluateTrendContinuation(candles []data.Candle, r *OpeningRange, sessionOp
 	if longOK {
 		side = "buy"
 	}
+	if !strategySideAllowed(inst.SideMode, side) {
+		return TrendContinuationSignal{}, false
+	}
 	if !trendContinuationTrendAllowed(ordered, params, sessionOpen, side) {
 		return TrendContinuationSignal{}, false
 	}
@@ -310,18 +313,13 @@ func (s *ORBScheduler) continuationMonthlyStopHit(ctx context.Context, ticker st
 }
 
 func trendContinuationEntryCurrent(candles []data.Candle, sessionOpen, now time.Time, cfg config.ForexORBConfig, signal TrendContinuationSignal) bool {
-	if signal.EntryTime.IsZero() || now.Before(signal.EntryTime) || !now.Before(signal.EntryTime.Add(time.Minute)) {
-		return false
-	}
 	rangeEnd := sessionOpen.Add(time.Duration(cfg.RangeMinutes) * time.Minute)
-	var latest time.Time
+	watch := make([]data.Candle, 0, len(candles))
 	for _, c := range candles {
 		if c.Timestamp.Before(rangeEnd) || c.Timestamp.After(now) {
 			continue
 		}
-		if latest.IsZero() || c.Timestamp.After(latest) {
-			latest = c.Timestamp
-		}
+		watch = append(watch, c)
 	}
-	return latest.Equal(signal.EntryTime)
+	return entryBarCurrent(watch, now, signal.EntryTime)
 }

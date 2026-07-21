@@ -25,14 +25,17 @@ var (
 	btReclaimEntryWindow int
 	btReclaimTop         int
 	btReclaimMinTrades   int
+	btReclaimAnalysis    bool
+	btReclaimSlipMults   string
 )
 
 func init() {
 	sweepReclaimCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	sweepReclaimCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	sweepReclaimCmd.Flags().StringVar(&btReclaimSession, "session", "newyork", "Session: london | newyork")
+	sweepReclaimCmd.Flags().StringVar(&btReclaimSession, "session", "newyork", "Session: london | newyork | newyork_et (default newyork; futures maps newyork to newyork_et)")
 	sweepReclaimCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	sweepReclaimCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
+	sweepReclaimCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb/default micro-index instruments via index-CFD proxy data)")
 	sweepReclaimCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
 	sweepReclaimCmd.Flags().StringVar(&btReclaimLevels, "levels", "prior_day,overnight", "Level sets to test: prior_day, overnight")
 	sweepReclaimCmd.Flags().StringVar(&btReclaimRiskRewards, "risk-rewards", "0.75,1,1.25,1.5,2,2.5,3", "Target R multiples to test")
@@ -41,6 +44,8 @@ func init() {
 	sweepReclaimCmd.Flags().IntVar(&btReclaimEntryWindow, "entry-window", 240, "Minutes after session open to watch for a sweep/reclaim")
 	sweepReclaimCmd.Flags().IntVar(&btReclaimTop, "top", 30, "How many ranked candidates to print")
 	sweepReclaimCmd.Flags().IntVar(&btReclaimMinTrades, "min-trades", 100, "Minimum trades for printed candidates")
+	sweepReclaimCmd.Flags().BoolVar(&btReclaimAnalysis, "analysis", false, "Print robustness analysis for the top candidate")
+	sweepReclaimCmd.Flags().StringVar(&btReclaimSlipMults, "slippage-mults", "1,1.5,2,3", "Spread/slippage multipliers for --analysis")
 	_ = sweepReclaimCmd.MarkFlagRequired("from")
 	_ = sweepReclaimCmd.MarkFlagRequired("to")
 	backtestCmd.AddCommand(sweepReclaimCmd)
@@ -96,8 +101,9 @@ func runSweepReclaim(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btReclaimSession != "london" && btReclaimSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for sweep-reclaim (use london|newyork)", btReclaimSession)
+	session, err := normalizeStrategySession(btReclaimSession)
+	if err != nil {
+		return fmt.Errorf("--session %q unsupported for sweep-reclaim: %w", btReclaimSession, err)
 	}
 	levelSets, err := parseReclaimLevelSets(btReclaimLevels)
 	if err != nil {
@@ -119,15 +125,10 @@ func runSweepReclaim(ctx context.Context) error {
 		return fmt.Errorf("--entry-window must be positive")
 	}
 
-	provider, err := buildBacktestProvider(cfg)
+	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
-	instruments, err := resolveInstruments(cfg.ForexORB, btORBInstruments)
-	if err != nil {
-		return err
-	}
-	costs := buildCostModels(instruments)
 
 	var params []reclaimParam
 	for _, levelSet := range levelSets {
@@ -135,18 +136,18 @@ func runSweepReclaim(ctx context.Context) error {
 			for _, mh := range holds {
 				for _, depth := range depths {
 					params = append(params, reclaimParam{
-						Session: btReclaimSession, LevelSet: levelSet, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth,
+						Session: session, LevelSet: levelSet, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth,
 					})
 				}
 			}
 		}
 	}
 	fmt.Printf("sweep-reclaim · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btReclaimSession, btORBFrom, btORBTo, len(params), len(instruments))
+		session, btORBFrom, btORBTo, len(params), len(uni.instruments))
 
 	results := make([]reclaimResult, 0, len(params))
 	for _, p := range params {
-		trades, err := runReclaimParam(ctx, cfg.ForexORB, provider, costs, instruments, p, from, to, btORBCapital)
+		trades, err := runReclaimParam(ctx, uni.base, uni.provider, uni.costs, uni.instruments, p, from, to, btORBCapital)
 		if err != nil {
 			return err
 		}
@@ -184,6 +185,15 @@ func runSweepReclaim(ctx context.Context) error {
 	}
 	if printed == 0 {
 		fmt.Printf("No candidates had at least %d trades.\n", btReclaimMinTrades)
+	}
+	if btReclaimAnalysis {
+		slips, err := parsePositiveFloatLevels(btReclaimSlipMults)
+		if err != nil {
+			return fmt.Errorf("invalid --slippage-mults %q: %w", btReclaimSlipMults, err)
+		}
+		if err := printReclaimRobustness(ctx, uni.base, uni.provider, uni.costs, uni.instruments, results, from, to, btORBCapital, slips); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -327,4 +337,86 @@ func parseReclaimLevelSets(s string) ([]string, error) {
 		return nil, fmt.Errorf("no values")
 	}
 	return out, nil
+}
+
+func printReclaimRobustness(ctx context.Context, base config.ForexORBConfig, provider data.MarketDataProvider, costs map[string]orbreplay.CostModel, instruments []config.Instrument, results []reclaimResult, from, to time.Time, capital float64, slipMults []float64) error {
+	if len(results) == 0 {
+		return nil
+	}
+	bestIdx := -1
+	for i, r := range results {
+		if r.Result.Overall.Trades >= btReclaimMinTrades {
+			bestIdx = i
+			break
+		}
+	}
+	if bestIdx < 0 {
+		return nil
+	}
+	best := results[bestIdx]
+	trades := best.Result.Trades
+	fmt.Printf("\nRobustness detail for %s\n", best.Param.label())
+	printContMetricLine("overall", best.Result.Overall)
+	printContGrouped("Yearly", groupContTrades(trades, func(t orbreplay.SimTrade) string {
+		return t.EntryTime.UTC().Format("2006")
+	}))
+	printContGrouped("Side split", groupContTrades(trades, func(t orbreplay.SimTrade) string {
+		if t.Side == "buy" {
+			return "long"
+		}
+		if t.Side == "sell" {
+			return "short"
+		}
+		return t.Side
+	}))
+	printContMonthlyDrawdown(trades)
+
+	fmt.Printf("\nSpread/slippage stress\n")
+	fmt.Printf("%-8s %7s %6s %6s %8s %11s %8s %5s\n", "MULT", "TRADES", "WIN%", "PF", "EXP_R", "NET_PNL", "SCORE", "GATE")
+	for _, mult := range slipMults {
+		stressCosts := multiplyContSpreads(costs, mult)
+		stressTrades, err := runReclaimParam(ctx, base, provider, stressCosts, instruments, best.Param, from, to, capital)
+		if err != nil {
+			return fmt.Errorf("sweep-reclaim slippage %.2fx: %w", mult, err)
+		}
+		res := orbreplay.Summarize(best.Param.label(), stressTrades)
+		score := sweep.RobustnessScore(res.Overall, sweep.MinTradesFloor)
+		gate := ""
+		if sweep.PassesAcceptanceGates(res.Overall, sweep.MinTradesFloor) {
+			gate = "PASS"
+		}
+		m := res.Overall
+		fmt.Printf("%-8.2f %7d %5.1f%% %6s %+8.3f %11.2f %8.3f %5s\n",
+			mult, m.Trades, m.WinRate*100, fmtPF(m.ProfitFactor), m.ExpectancyR, m.NetPnL, score, gate)
+	}
+	printReclaimNeighborStability(results)
+	return nil
+}
+
+func printReclaimNeighborStability(results []reclaimResult) {
+	var eligible []reclaimResult
+	for _, r := range results {
+		if r.Result.Overall.Trades >= btReclaimMinTrades {
+			eligible = append(eligible, r)
+		}
+	}
+	if len(eligible) == 0 {
+		return
+	}
+	pass := 0
+	pfs := make([]float64, 0, len(eligible))
+	exps := make([]float64, 0, len(eligible))
+	nets := make([]float64, 0, len(eligible))
+	for _, r := range eligible {
+		if r.Gate {
+			pass++
+		}
+		m := r.Result.Overall
+		pfs = append(pfs, m.ProfitFactor)
+		exps = append(exps, m.ExpectancyR)
+		nets = append(nets, m.NetPnL)
+	}
+	fmt.Printf("\nParameter-neighbor stability\n")
+	fmt.Printf("eligible_sets=%d  gate_pass=%d  median_pf=%s  median_exp=%+.3fR  median_net=%+.2f\n",
+		len(eligible), pass, fmtPF(medianContFloat(pfs)), medianContFloat(exps), medianContFloat(nets))
 }

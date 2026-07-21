@@ -803,9 +803,12 @@ func TestValidateForexCloseFracThreshold(t *testing.T) {
 func TestFuturesInstrument_ToInstrument(t *testing.T) {
 	fi := FuturesInstrument{
 		Symbol: "MNQ", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, MarginRate: 0.10,
+		Strategy: "opening_shock", RangeMinutes: 1, SideMode: "long",
 		MaxHoldMinutes: 240, BreakoutConfirmation: "retest_range", RetestTolerance: 0.25,
 		RetestTimeoutMinutes: 30, DirectionEligibility: true, CommissionPerSide: 0.85,
 		MaxCommissionToRisk: 0.1, RiskMultiplier: 1.5, MaxNotionalUSD: 95000,
+		OpeningShockWindowMinutes: 30, OpeningShockLookback: 40, OpeningShockPercentile: 70,
+		OpeningShockStopMult: 1, OpeningShockEntryDelayMin: 5,
 		MinRangeATR: 0.5, MaxRangeATR: 3.0, MaxSpreadToRisk: 0.08,
 		BreakEvenR: 1.0, TrailATRMult: 1.5, TrailAfterR: 1.0,
 		PartialTakeProfitR: 1.0, PartialFraction: 0.5, RunnerTakeProfitR: 2.0,
@@ -827,8 +830,11 @@ func TestFuturesInstrument_ToInstrument(t *testing.T) {
 	}
 	// Strategy fields copied straight across.
 	if got.BreakoutConfirmation != "retest_range" || got.DirectionEligibility != true ||
+		got.Strategy != "opening_shock" || got.RangeMinutes != 1 || got.SideMode != "long" ||
 		got.MaxHoldMinutes != 240 || got.CommissionPerSide != 0.85 || got.RiskMultiplier != 1.5 ||
-		got.PartialFraction != 0.5 || got.RunnerTakeProfitR != 2.0 || got.MaxNotionalUSD != 95000 {
+		got.PartialFraction != 0.5 || got.RunnerTakeProfitR != 2.0 || got.MaxNotionalUSD != 95000 ||
+		got.OpeningShockWindowMinutes != 30 || got.OpeningShockLookback != 40 ||
+		got.OpeningShockPercentile != 70 || got.OpeningShockEntryDelayMin != 5 {
 		t.Errorf("strategy fields not copied through: %+v", got)
 	}
 
@@ -836,6 +842,28 @@ func TestFuturesInstrument_ToInstrument(t *testing.T) {
 	z := FuturesInstrument{Symbol: "X", TickSize: 0}.ToInstrument()
 	if z.PointValue != 0 {
 		t.Errorf("zero tick_size: PointValue = %v; want 0", z.PointValue)
+	}
+}
+
+func TestValidateFuturesStrategyFamilies(t *testing.T) {
+	cfg := Defaults()
+	cfg.FuturesORB.Enabled = true
+	cfg.FuturesORB.RiskReward = 2
+	cfg.FuturesORB.Instruments = []FuturesInstrument{
+		{Symbol: "MES", TickSize: 0.25, TickValue: 1.25, TickBuffer: 2, Strategy: "trend_continuation", SideMode: "short", RangeMinutes: 30, ContinuationDelayMinutes: 15, ContinuationConfirmBars: 3, ContinuationDepthMult: 2},
+		{Symbol: "MNQ", TickSize: 0.25, TickValue: 0.50, TickBuffer: 2, Strategy: "opening_shock", SideMode: "long", RangeMinutes: 1, OpeningShockWindowMinutes: 30, OpeningShockLookback: 40, OpeningShockPercentile: 70, OpeningShockStopMult: 1},
+		{Symbol: "MYM", TickSize: 1.00, TickValue: 0.50, TickBuffer: 4, Strategy: "sweep_reclaim", RangeMinutes: 1, SweepReclaimLevelSet: "overnight", SweepReclaimDepthMult: 8, SweepReclaimEntryWindowMinutes: 240},
+	}
+	for _, e := range Validate(cfg) {
+		if strings.Contains(e, "futures_orb instrument") {
+			t.Fatalf("unexpected futures strategy validation error: %s", e)
+		}
+	}
+
+	cfg.FuturesORB.Instruments = []FuturesInstrument{{Symbol: "MNQ", Strategy: "opening_shock", SideMode: "up"}}
+	errs := Validate(cfg)
+	if !containsStr(errs, "side_mode") {
+		t.Fatalf("expected invalid side_mode error, got: %v", errs)
 	}
 }
 
