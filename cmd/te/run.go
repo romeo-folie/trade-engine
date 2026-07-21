@@ -56,8 +56,8 @@ Modes:
   auto       — signals that pass risk checks execute automatically
   paper      — paper trades on Alpaca paper API (default)
   orb             — Opening Range Breakout mode (LLM-enhanced gap-and-go)
-  orb-forex       — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)
-  currency-strength — FX currency-strength rotation via IBKR paper account
+  forex           — Forex strategies via IBKR Client Portal (ORB + optional currency strength)
+  orb-forex       — Backward-compatible alias for forex
   orb-futures     — Equity index futures ORB via IBKR (ES/NQ/YM/RTY; requires markets.ibkr.enabled=true)
   orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)
   orb-newyork     — Combined equities + forex ORB for the NY session (Alpaca + IBKR; requires both configured)`,
@@ -245,7 +245,7 @@ Modes:
 				logger.Info("telegram notifications enabled", "batch_enabled", cfg.Notifications.Telegram.BatchEnabled)
 
 				startMsg := fmt.Sprintf("🟢 *TradeEngine started*\nMode: `%s`", mode)
-				if mode == "orb-forex" && cfg.ForexORB.Session != "" {
+				if (mode == "forex" || mode == "orb-forex") && cfg.ForexORB.Session != "" {
 					startMsg += fmt.Sprintf(" · Session: `%s`", cfg.ForexORB.Session)
 				}
 				startMsg += fmt.Sprintf("\nTick: `%ds`", cfg.Engine.TickIntervalSec)
@@ -264,14 +264,6 @@ Modes:
 			fmt.Println("\nTradeEngine stopping...")
 			cancel()
 		}()
-
-		if mode == "currency-strength" {
-			if err := runCurrencyStrengthMode(ctx, cfg, runDryRun, tgBot); err != nil && err != context.Canceled {
-				return fmt.Errorf("currency-strength mode: %w", err)
-			}
-			fmt.Println("TradeEngine (currency-strength) stopped.")
-			return nil
-		}
 
 		// ORB mode: run the ORB scheduler instead of the normal engine loop.
 		if mode == "orb" {
@@ -321,17 +313,18 @@ Modes:
 			return nil
 		}
 
-		// ORB-Forex mode: run the ORB scheduler with IBKR and forex-specific components.
-		if mode == "orb-forex" {
+		// Forex mode: run enabled forex strategies with shared IBKR data/session components.
+		// "orb-forex" remains an alias so existing launch scripts keep working.
+		if mode == "forex" || mode == "orb-forex" {
 			// 1. Validate IBKR config.
 			if !cfg.Markets.IBKR.Enabled {
-				return fmt.Errorf("orb-forex mode requires markets.ibkr.enabled=true")
+				return fmt.Errorf("forex mode requires markets.ibkr.enabled=true")
 			}
-			if !cfg.ForexORB.Enabled {
-				return fmt.Errorf("orb-forex mode requires forex_orb.enabled=true")
+			if !cfg.ForexORB.Enabled && !cfg.CurrencyStrength.Enabled {
+				return fmt.Errorf("forex mode requires at least one enabled strategy: forex_orb.enabled=true or currency_strength.enabled=true")
 			}
 			if cfg.Markets.IBKR.AccountID == "" {
-				return fmt.Errorf("orb-forex mode requires markets.ibkr.account_id to be set")
+				return fmt.Errorf("forex mode requires markets.ibkr.account_id to be set")
 			}
 
 			// 2. Create IBKR broker.
@@ -374,67 +367,93 @@ Modes:
 			// 3. Create IBKR market data client.
 			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
 
-			// 4. Create event bus and analyzer (same pattern as equities ORB).
-			orbBus := events.New()
-			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
+			eg, egCtx := errgroup.WithContext(ctx)
+			var active []string
 
-			// 5. Create notification adapter (same pattern as equities ORB).
-			var orbNotifier orb.Notifier
-			if tgBot != nil {
-				orbNotifier = &orbTelegramNotifier{bot: tgBot}
-			}
+			if cfg.ForexORB.Enabled {
+				// Create event bus/analyzer/notification adapter for ORB.
+				orbBus := events.New()
+				analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
+				var orbNotifier orb.Notifier
+				if tgBot != nil {
+					orbNotifier = &orbTelegramNotifier{bot: tgBot}
+				}
 
-			// 6. Create portfolio valuer (same pattern as equities ORB).
-			orbPortfolio := newDBPortfolioValuer(100_000)
+				orbCfg := config.ORBConfig{
+					Enabled:        cfg.ForexORB.Enabled,
+					Mode:           "paper",
+					MaxCandidates:  len(cfg.ForexORB.Instruments),
+					RangeMinutes:   cfg.ForexORB.RangeMinutes,
+					RiskReward:     cfg.ForexORB.RiskReward,
+					MaxRiskPct:     cfg.ForexORB.MaxRiskPct,
+					MaxPositionPct: cfg.ForexORB.MaxPositionPct,
+				}
+				orbScheduler := orb.NewORBScheduler(
+					orbCfg, store.GetDB(), ibkrData, analyzer,
+					ibkrBroker, newDBPortfolioValuer(100_000), orbNotifier,
+				)
+				forexScanner := &orb.ForexCandidateScanner{
+					Instruments: cfg.ForexORB.Instruments,
+					MarketData:  ibkrData,
+					Cfg:         cfg.ForexORB,
+				}
+				orbScheduler.SetScanner(forexScanner)
+				orbScheduler.SetForexConfig(&cfg.ForexORB)
+				if newsProvider != nil {
+					orbScheduler.SetNewsProvider(newsProvider)
+				}
+				orbScheduler.SetBus(orbBus)
+				if cfg.Feedback.Enabled {
+					orbScheduler.SetFeedbackConfig(&cfg.Feedback)
+					reviewer := feedback.NewReviewer(cfg.Feedback, orbBus, store.GetDB())
+					go func() {
+						if err := reviewer.Run(egCtx); err != nil && err != context.Canceled {
+							fmt.Printf("feedback reviewer: %v\n", err)
+						}
+					}()
+				}
 
-			// 7. Build ORB config from ForexORBConfig for the scheduler.
-			orbCfg := config.ORBConfig{
-				Enabled:        cfg.ForexORB.Enabled,
-				Mode:           "paper",
-				MaxCandidates:  len(cfg.ForexORB.Instruments),
-				RangeMinutes:   cfg.ForexORB.RangeMinutes,
-				RiskReward:     cfg.ForexORB.RiskReward,
-				MaxRiskPct:     cfg.ForexORB.MaxRiskPct,
-				MaxPositionPct: cfg.ForexORB.MaxPositionPct,
-			}
-
-			// 8. Create ORB scheduler with IBKR components.
-			orbScheduler := orb.NewORBScheduler(
-				orbCfg, store.GetDB(), ibkrData, analyzer,
-				ibkrBroker, orbPortfolio, orbNotifier,
-			)
-
-			// 9. Wire forex-specific config and scanner.
-			forexScanner := &orb.ForexCandidateScanner{
-				Instruments: cfg.ForexORB.Instruments,
-				MarketData:  ibkrData,
-				Cfg:         cfg.ForexORB,
-			}
-			orbScheduler.SetScanner(forexScanner)
-			orbScheduler.SetForexConfig(&cfg.ForexORB)
-
-			// 10. Wire optional news and bus (same as equities ORB).
-			if newsProvider != nil {
-				orbScheduler.SetNewsProvider(newsProvider)
-			}
-			orbScheduler.SetBus(orbBus)
-			if cfg.Feedback.Enabled {
-				orbScheduler.SetFeedbackConfig(&cfg.Feedback)
-				reviewer := feedback.NewReviewer(cfg.Feedback, orbBus, store.GetDB())
-				go func() {
-					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
-						fmt.Printf("feedback reviewer: %v\n", err)
+				active = append(active, "orb")
+				eg.Go(func() error {
+					logger.Info("forex: ORB scheduler starting")
+					if err := orbScheduler.Run(egCtx); err != nil && err != context.Canceled {
+						return fmt.Errorf("forex orb scheduler: %w", err)
 					}
-				}()
+					return nil
+				})
 			}
 
-			// 11. Run.
-			logger.Info("ORB-Forex scheduler starting")
-			fmt.Println("ORB-Forex mode active. Waiting for forex session open...")
-			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
-				return fmt.Errorf("orb-forex scheduler: %w", err)
+			if cfg.CurrencyStrength.Enabled {
+				if shouldRunCurrencyStrengthForForexSession(cfg.ForexORB.Session) {
+					if err := validateCurrencyStrengthPaperConfig(cfg, runDryRun); err != nil {
+						return err
+					}
+					runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
+					if err := runner.loadState(); err != nil {
+						return err
+					}
+					active = append(active, "currency_strength")
+					eg.Go(func() error {
+						logger.Info("forex: currency-strength runner starting")
+						if err := runner.Run(egCtx); err != nil && err != context.Canceled {
+							return fmt.Errorf("currency-strength runner: %w", err)
+						}
+						return nil
+					})
+				} else {
+					logger.Info("forex: currency-strength skipped outside london session", "session", cfg.ForexORB.Session)
+				}
 			}
-			fmt.Println("TradeEngine (ORB-Forex) stopped.")
+
+			if len(active) == 0 {
+				return fmt.Errorf("forex mode has no strategies active for session %q", cfg.ForexORB.Session)
+			}
+			logger.Info("forex mode starting", "strategies", strings.Join(active, ","))
+			fmt.Printf("Forex mode active (%s). Waiting for forex session work...\n", strings.Join(active, " + "))
+			if err := eg.Wait(); err != nil && err != context.Canceled {
+				return err
+			}
+			fmt.Println("TradeEngine (forex) stopped.")
 			return nil
 		}
 
@@ -1195,7 +1214,7 @@ func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
 }
 
 func init() {
-	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|orb-forex|currency-strength)")
+	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork)")
 	runCmd.Flags().StringVar(&runSession, "session", "", "Override forex_orb.session (london|newyork)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")

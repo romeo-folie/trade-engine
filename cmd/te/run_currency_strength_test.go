@@ -61,3 +61,21 @@ func TestCurrencyStrengthShouldExitStaleStateImmediately(t *testing.T) {
 		t.Fatal("current-date state should flatten at configured exit time")
 	}
 }
+
+func TestShouldRunCurrencyStrengthForForexSession(t *testing.T) {
+	cases := []struct {
+		session string
+		want    bool
+	}{
+		{"", true},
+		{"london", true},
+		{" both ", true},
+		{"newyork", false},
+		{"futures", false},
+	}
+	for _, tc := range cases {
+		if got := shouldRunCurrencyStrengthForForexSession(tc.session); got != tc.want {
+			t.Errorf("shouldRunCurrencyStrengthForForexSession(%q) = %v, want %v", tc.session, got, tc.want)
+		}
+	}
+}

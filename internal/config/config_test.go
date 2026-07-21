@@ -71,7 +71,7 @@ func TestValidateInvalidMode(t *testing.T) {
 }
 
 func TestValidateValidModes(t *testing.T) {
-	for _, mode := range []string{"manual", "auto", "paper"} {
+	for _, mode := range []string{"manual", "auto", "paper", "orb", "forex", "orb-forex", "orb-futures", "orb-futures-metals", "orb-newyork"} {
 		cfg := Defaults()
 		cfg.Engine.Mode = mode
 		errs := Validate(cfg)

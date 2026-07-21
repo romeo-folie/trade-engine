@@ -3,7 +3,7 @@
 # Fields ending in _env reference environment variable names — set those vars in your shell.
 
 engine:
-  mode: paper                  # manual | auto | paper
+  mode: paper                  # manual | auto | paper | orb | forex | orb-futures | orb-futures-metals | orb-newyork
   tick_interval_sec: 3600      # Analysis interval (seconds). 3600=1h recommended for daily-candle strategy; 300=5min for intraday
   max_watchlist: 50            # Maximum concurrent watchlist items
   dry_run: false               # If true, no orders placed regardless of mode
@@ -454,7 +454,7 @@ orb:
   news_lookback_hours: 24      # How far back to fetch news for catalyst scoring
   scan_cadence_minutes: 2      # How often the ORB loop scans during its session window
 
-# ── Forex/metals ORB (IBKR) — run with `te run --mode orb-forex` ─────────────
+# ── Forex/metals strategies (IBKR) — run with `te run --mode forex` ──────────
 forex_orb:
   enabled: false
   instruments:

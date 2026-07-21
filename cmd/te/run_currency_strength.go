@@ -14,7 +14,6 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
-	"github.com/romeo-folie/trade-engine/internal/notify"
 	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
@@ -41,71 +40,45 @@ type currencyStrengthPaperRunner struct {
 	decisionDoneFor string
 }
 
-func runCurrencyStrengthMode(ctx context.Context, cfg *config.Config, dryRun bool, bot *notify.TelegramBot) error {
+func validateCurrencyStrengthPaperConfig(cfg *config.Config, dryRun bool) error {
 	if !cfg.CurrencyStrength.Enabled {
-		return fmt.Errorf("currency-strength mode requires currency_strength.enabled=true")
+		return fmt.Errorf("currency_strength.enabled=true is required")
 	}
 	if cfg.CurrencyStrength.Mode != "paper" {
-		return fmt.Errorf("currency-strength mode submits IBKR paper orders and requires currency_strength.mode=paper")
+		return fmt.Errorf("currency_strength.mode=paper is required for IBKR paper orders")
 	}
 	if dryRun || cfg.Engine.DryRun {
-		return fmt.Errorf("currency-strength paper mode cannot run with dry_run enabled because no IBKR paper orders would be placed")
+		return fmt.Errorf("currency_strength paper mode cannot run with dry_run enabled because no IBKR paper orders would be placed")
 	}
 	if !cfg.Markets.IBKR.Enabled {
-		return fmt.Errorf("currency-strength mode requires markets.ibkr.enabled=true")
+		return fmt.Errorf("currency_strength requires markets.ibkr.enabled=true")
 	}
 	if cfg.Markets.IBKR.AccountID == "" {
-		return fmt.Errorf("currency-strength mode requires markets.ibkr.account_id to be set")
+		return fmt.Errorf("currency_strength requires markets.ibkr.account_id to be set")
 	}
 	if !isIBKRPaperAccountID(cfg.Markets.IBKR.AccountID) {
-		return fmt.Errorf("currency-strength paper mode requires an IBKR paper account id starting with DU; got %q", cfg.Markets.IBKR.AccountID)
+		return fmt.Errorf("currency_strength paper mode requires an IBKR paper account id starting with DU; got %q", cfg.Markets.IBKR.AccountID)
 	}
+	return nil
+}
 
-	ibkrBroker := execution.NewIBKRBroker(cfg.Markets.IBKR)
-	if err := ibkrBroker.CheckAuth(ctx); err != nil {
-		notifyIBKRAuthFailure(ctx, bot, err, cfg.Markets.IBKR.GatewayURL)
-		return fmt.Errorf("IBKR gateway not authenticated: %w", err)
-	}
-	stopKeepalive := ibkrBroker.StartKeepalive(ctx, cfg.Markets.IBKR.TickleSec)
-	defer stopKeepalive()
-	stopAuthMonitor := ibkrBroker.StartAuthMonitor(
-		ctx,
-		cfg.Markets.IBKR.AuthMonitorSec,
-		cfg.Markets.IBKR.AuthAlertDebounceMin,
-		func(gatewayURL string) {
-			if bot == nil {
-				return
-			}
-			if err := bot.SendImmediate(ctx, fmt.Sprintf(
-				"IBKR session expired\nGateway: `%s`\nPlease re-authenticate via the Client Portal.",
-				gatewayURL,
-			)); err != nil {
-				logger.Warn("ibkr auth monitor: failed to send alert", "err", err)
-			}
-		},
-		func(gatewayURL string) {
-			if bot == nil {
-				return
-			}
-			if err := bot.SendImmediate(ctx, fmt.Sprintf("IBKR session restored\nGateway: `%s`", gatewayURL)); err != nil {
-				logger.Warn("ibkr auth monitor: failed to send recovery alert", "err", err)
-			}
-		},
-	)
-	defer stopAuthMonitor()
-
-	runner := &currencyStrengthPaperRunner{
-		cfg:       cfg.CurrencyStrength,
-		market:    data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS),
-		broker:    ibkrBroker,
+func newCurrencyStrengthPaperRunner(cfg config.CurrencyStrengthConfig, market data.MarketDataProvider, broker execution.Executor) *currencyStrengthPaperRunner {
+	return &currencyStrengthPaperRunner{
+		cfg:       cfg,
+		market:    market,
+		broker:    broker,
 		statePath: defaultCurrencyStrengthStatePath(),
 		now:       time.Now,
 	}
-	if err := runner.loadState(); err != nil {
-		return err
+}
+
+func shouldRunCurrencyStrengthForForexSession(session string) bool {
+	switch strings.ToLower(strings.TrimSpace(session)) {
+	case "", "london", "both":
+		return true
+	default:
+		return false
 	}
-	fmt.Println("Currency-strength IBKR paper mode active. Waiting for configured ranking/exit times...")
-	return runner.Run(ctx)
 }
 
 func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
