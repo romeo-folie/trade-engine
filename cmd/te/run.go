@@ -57,6 +57,7 @@ Modes:
   paper      — paper trades on Alpaca paper API (default)
   orb             — Opening Range Breakout mode (LLM-enhanced gap-and-go)
   orb-forex       — Forex ORB mode via IBKR Client Portal (requires markets.ibkr.enabled=true)
+  currency-strength — FX currency-strength rotation via IBKR paper account
   orb-futures     — Equity index futures ORB via IBKR (ES/NQ/YM/RTY; requires markets.ibkr.enabled=true)
   orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)
   orb-newyork     — Combined equities + forex ORB for the NY session (Alpaca + IBKR; requires both configured)`,
@@ -263,6 +264,14 @@ Modes:
 			fmt.Println("\nTradeEngine stopping...")
 			cancel()
 		}()
+
+		if mode == "currency-strength" {
+			if err := runCurrencyStrengthMode(ctx, cfg, runDryRun, tgBot); err != nil && err != context.Canceled {
+				return fmt.Errorf("currency-strength mode: %w", err)
+			}
+			fmt.Println("TradeEngine (currency-strength) stopped.")
+			return nil
+		}
 
 		// ORB mode: run the ORB scheduler instead of the normal engine loop.
 		if mode == "orb" {
@@ -1186,7 +1195,7 @@ func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
 }
 
 func init() {
-	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|orb-forex)")
+	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|orb-forex|currency-strength)")
 	runCmd.Flags().StringVar(&runSession, "session", "", "Override forex_orb.session (london|newyork)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")

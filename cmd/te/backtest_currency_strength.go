@@ -13,6 +13,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 	"github.com/spf13/cobra"
 )
 
@@ -256,7 +257,7 @@ func runCurrencyStrength(ctx context.Context) error {
 func strengthPairs(instruments []config.Instrument) ([]strengthPair, error) {
 	var pairs []strengthPair
 	for _, inst := range instruments {
-		base, quote, ok := splitFXPair(inst.Symbol)
+		base, quote, ok := currencystrength.SplitPair(inst.Symbol)
 		if !ok {
 			continue
 		}
@@ -269,14 +270,6 @@ func strengthPairs(instruments []config.Instrument) ([]strengthPair, error) {
 		return nil, fmt.Errorf("currency-strength needs at least three CASH FX pairs; got %d", len(pairs))
 	}
 	return pairs, nil
-}
-
-func splitFXPair(symbol string) (string, string, bool) {
-	parts := strings.Split(strings.ToUpper(strings.TrimSpace(symbol)), "/")
-	if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
-		return "", "", false
-	}
-	return parts[0], parts[1], true
 }
 
 func parseClockList(csv string) ([]string, error) {
@@ -462,9 +455,9 @@ func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[s
 }
 
 func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time, tradeSymbols map[string]bool) *orbreplay.SimTrade {
-	scores := make(map[string]float64)
-	votes := make(map[string]int)
-	pairReturns := make(map[string]float64, len(pairs))
+	evalPairs := make([]currencystrength.Pair, 0, len(pairs))
+	windows := make(map[string]currencystrength.Window, len(pairs))
+	bySymbol := make(map[string]config.Instrument, len(pairs))
 	for _, pair := range pairs {
 		values := day[pair.Instrument.Symbol]
 		start, okStart := values[p.Start]
@@ -473,73 +466,28 @@ func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair
 		if !okStart || !okEnd || !okExit || start <= 0 || end <= 0 {
 			return nil
 		}
-		_ = exit
-		ret := math.Log(end / start)
-		pairReturns[pair.Instrument.Symbol] = ret
-		scores[pair.Base] += ret
-		scores[pair.Quote] -= ret
-		switch {
-		case ret > 0:
-			votes[pair.Base]++
-			votes[pair.Quote]--
-		case ret < 0:
-			votes[pair.Base]--
-			votes[pair.Quote]++
+		if exit <= 0 {
+			return nil
 		}
+		evalPairs = append(evalPairs, currencystrength.Pair{Symbol: pair.Instrument.Symbol, Base: pair.Base, Quote: pair.Quote})
+		windows[pair.Instrument.Symbol] = currencystrength.Window{Start: start, End: end}
+		bySymbol[pair.Instrument.Symbol] = pair.Instrument
 	}
-	strong, weak, gap, ok := strongestWeakest(scores)
-	if !ok || gap < p.MinGap || votes[strong] < p.BroadMin || votes[weak] > -p.BroadMin {
+	decision := currencystrength.Evaluate(evalPairs, windows, currencystrength.Config{
+		MinGap:           p.MinGap,
+		BroadMin:         p.BroadMin,
+		ConfirmMinMove:   p.Confirm,
+		TradeInstruments: tradeSymbols,
+	})
+	if decision.Signal == nil {
 		return nil
 	}
-	pair, side, ok := routeStrengthPair(pairs, strong, weak)
-	if !ok {
-		return nil
-	}
-	if len(tradeSymbols) > 0 && !tradeSymbols[pair.Instrument.Symbol] {
-		return nil
-	}
-	confirm := pairReturns[pair.Instrument.Symbol]
-	if side == "sell" {
-		confirm = -confirm
-	}
-	if confirm < p.Confirm {
-		return nil
-	}
-	entryMid := day[pair.Instrument.Symbol][p.RankEnd]
-	exitMid := day[pair.Instrument.Symbol][p.Exit]
+	inst := bySymbol[decision.Signal.Symbol]
+	entryMid := day[decision.Signal.Symbol][p.RankEnd]
+	exitMid := day[decision.Signal.Symbol][p.Exit]
 	entryTime := strengthTimestamp(date, p.RankEnd)
 	exitTime := strengthTimestamp(date, p.Exit)
-	return resolveStrengthTrade(pair.Instrument, side, entryMid, exitMid, entryTime, exitTime, costs[pair.Instrument.Symbol], p.Units)
-}
-
-func strongestWeakest(scores map[string]float64) (strong, weak string, gap float64, ok bool) {
-	if len(scores) == 0 {
-		return "", "", 0, false
-	}
-	first := true
-	var strongScore, weakScore float64
-	for cur, score := range scores {
-		if first || score > strongScore {
-			strong, strongScore = cur, score
-		}
-		if first || score < weakScore {
-			weak, weakScore = cur, score
-		}
-		first = false
-	}
-	return strong, weak, strongScore - weakScore, strong != "" && weak != "" && strong != weak
-}
-
-func routeStrengthPair(pairs []strengthPair, strong, weak string) (strengthPair, string, bool) {
-	for _, pair := range pairs {
-		if pair.Base == strong && pair.Quote == weak {
-			return pair, "buy", true
-		}
-		if pair.Base == weak && pair.Quote == strong {
-			return pair, "sell", true
-		}
-	}
-	return strengthPair{}, "", false
+	return resolveStrengthTrade(inst, decision.Signal.Side, entryMid, exitMid, entryTime, exitTime, costs[decision.Signal.Symbol], p.Units)
 }
 
 func strengthTimestamp(day time.Time, clock string) time.Time {

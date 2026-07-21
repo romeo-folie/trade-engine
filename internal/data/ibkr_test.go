@@ -123,10 +123,52 @@ func TestIBKRFetchCandles_FiltersOutOfRange(t *testing.T) {
 }
 
 func TestIBKRFetchCandles_UnknownPair(t *testing.T) {
-	client := newTestIBKRClient("http://unused")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/iserver/secdef/search" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
 	_, err := client.FetchCandles(context.Background(), "BTC/USD", Timeframe1Hour, time.Now(), time.Now())
 	if err == nil {
 		t.Fatal("expected error for unknown pair")
+	}
+}
+
+func TestIBKRResolveConid_ForexDynamic(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/api/iserver/secdef/search" && r.URL.Query().Get("symbol") == "GBP" && r.URL.Query().Get("secType") == "CASH" {
+			hits++
+			w.Header().Set("Content-Type", "application/json")
+			w.Write([]byte(`[
+				{"conid":11111111,"companyName":"GBP.USD","description":"GBP/USD","exchange":"IDEALPRO"},
+				{"conid":22222222,"companyName":"GBP.JPY","description":"GBP/JPY","exchange":"IDEALPRO"},
+				{"conid":99999999,"companyName":"GBP.JPY","description":"GBP/JPY","exchange":"SMART"}
+			]`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
+	conid, err := client.resolveConid(context.Background(), "GBP/JPY")
+	if err != nil {
+		t.Fatalf("resolveConid forex: %v", err)
+	}
+	if conid != "22222222" {
+		t.Errorf("conid = %q; want 22222222", conid)
+	}
+	if _, err := client.resolveConid(context.Background(), "GBP/JPY"); err != nil {
+		t.Fatalf("resolveConid (cached): %v", err)
+	}
+	if hits != 1 {
+		t.Errorf("secdef/search hit %d times; want 1 (second call cached)", hits)
 	}
 }
 
@@ -233,7 +275,16 @@ func TestIBKRFetchQuote(t *testing.T) {
 }
 
 func TestIBKRFetchQuote_UnknownPair(t *testing.T) {
-	client := newTestIBKRClient("http://unused")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/iserver/secdef/search" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
 	_, err := client.FetchQuote(context.Background(), "BTC/ETH")
 	if err == nil {
 		t.Fatal("expected error for unknown pair")

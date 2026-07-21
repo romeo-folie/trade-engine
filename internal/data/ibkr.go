@@ -51,6 +51,9 @@ type IBKRClient struct {
 
 	futConidMu    sync.Mutex
 	futConidCache map[string]string // "FUT:SYMBOL" → conid, for dynamically-resolved futures
+
+	fxConidMu    sync.Mutex
+	fxConidCache map[string]string // "FX:BASE/QUOTE" → conid, for dynamically-resolved IDEALPRO pairs
 }
 
 // NewIBKRClient creates a new IBKR Client Portal market data client.
@@ -65,6 +68,7 @@ func NewIBKRClient(gatewayURL string, insecureTLS bool) *IBKRClient {
 		httpClient:    &http.Client{Timeout: 30 * time.Second, Transport: transport},
 		minInterval:   100 * time.Millisecond,
 		futConidCache: make(map[string]string),
+		fxConidCache:  make(map[string]string),
 	}
 }
 
@@ -130,8 +134,10 @@ func (c *IBKRClient) get(ctx context.Context, path string, params url.Values) (*
 // market-data and order paths agree on which contract a symbol maps to:
 //  1. Forex/CMDTY static map (ibkrConids) — spot forex + London metals.
 //  2. Futures static map (FuturesConids) — front-month, quarterly then monthly.
-//  3. Session cache of dynamically-resolved futures conids.
-//  4. Dynamic /trsrv/futures lookup for futures symbols missing from the map
+//  3. Session cache of dynamically-resolved IDEALPRO forex conids.
+//  4. Dynamic /iserver/secdef/search lookup for slash-delimited CASH pairs.
+//  5. Session cache of dynamically-resolved futures conids.
+//  6. Dynamic /trsrv/futures lookup for futures symbols missing from the map
 //     (every micro before this map is refreshed, and any symbol after it goes
 //     stale) — without this, FetchCandles fails with "unknown symbol" and the
 //     ORB range watch can never collect candles for the instrument.
@@ -139,13 +145,8 @@ func (c *IBKRClient) resolveConid(ctx context.Context, pair string) (string, err
 	if conid, ok := ibkrConids[pair]; ok {
 		return conid, nil
 	}
-	// Forex/CMDTY symbols are slash-delimited ("EUR/USD", "XAU/USD") and only ever
-	// live in ibkrConids; futures roots ("MES", "ES", "GC") never contain a slash.
-	// A slashed symbol that missed the map above is a genuinely unknown pair — fail
-	// fast rather than spending a futures /trsrv round-trip (and a rate-limit slot)
-	// that can't resolve it.
 	if strings.Contains(pair, "/") {
-		return "", fmt.Errorf("ibkr: unknown symbol %q (not in static conid map)", pair)
+		return c.resolveConidForexDynamic(ctx, pair)
 	}
 	for _, cycle := range []string{"quarterly", "monthly"} {
 		if conid, ok := ibkrconids.FuturesConids[ibkrconids.FrontMonthKey(pair, cycle, time.Now())]; ok {
@@ -162,6 +163,58 @@ func (c *IBKRClient) resolveConid(ctx context.Context, pair string) (string, err
 	c.futConidMu.Unlock()
 
 	return c.resolveConidFuturesDynamic(ctx, pair, cacheKey)
+}
+
+type ibkrSecdefSearchResult struct {
+	Conid       int    `json:"conid"`
+	CompanyName string `json:"companyName"`
+	Description string `json:"description"`
+	Exchange    string `json:"exchange"`
+}
+
+func (c *IBKRClient) resolveConidForexDynamic(ctx context.Context, pair string) (string, error) {
+	cacheKey := "FX:" + pair
+	c.fxConidMu.Lock()
+	if conid, ok := c.fxConidCache[cacheKey]; ok {
+		c.fxConidMu.Unlock()
+		return conid, nil
+	}
+	c.fxConidMu.Unlock()
+
+	parts := strings.SplitN(pair, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", fmt.Errorf("ibkr: invalid forex pair %q: expected BASE/QUOTE", pair)
+	}
+
+	resp, err := c.get(ctx, "/v1/api/iserver/secdef/search", url.Values{
+		"symbol":  {parts[0]},
+		"secType": {"CASH"},
+	})
+	if err != nil {
+		return "", fmt.Errorf("ibkr: resolve forex conid for %q: %w", pair, err)
+	}
+	defer resp.Body.Close()
+
+	var results []ibkrSecdefSearchResult
+	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+		return "", fmt.Errorf("ibkr: decode secdef/search for %q: %w", pair, err)
+	}
+
+	companyName := strings.Replace(pair, "/", ".", 1)
+	for _, r := range results {
+		if r.Conid <= 0 {
+			continue
+		}
+		if r.Exchange == "IDEALPRO" && (r.Description == pair || r.CompanyName == companyName) {
+			conid := strconv.Itoa(r.Conid)
+			c.fxConidMu.Lock()
+			c.fxConidCache[cacheKey] = conid
+			c.fxConidMu.Unlock()
+			return conid, nil
+		}
+	}
+
+	return "", fmt.Errorf("ibkr: forex pair %q not found on IDEALPRO", pair)
 }
 
 // ibkrTrsrvFuture is one contract from /trsrv/futures. expirationDate and ltd are
