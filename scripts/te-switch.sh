@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 # te-switch.sh — stop the running engine and restart in the specified mode
 #
-# Usage: te-switch.sh [orb|orb-forex|orb-newyork|regular] [--session london|newyork]
+# Usage: te-switch.sh [orb|forex|orb-forex|orb-newyork|regular] [--session london|newyork]
 #
-# For orb-forex, if --session is omitted the script picks the session
-# automatically based on current UTC hour:
+# For forex, if --session is omitted the script picks the session automatically
+# based on current UTC hour:
 #   Before 12:00 UTC → london  (London open 08:00 UTC)
 #   12:00 UTC onward → newyork (NY open 13:00 UTC)
+#
+# orb-forex remains accepted as a compatibility alias for forex.
 #
 # orb-newyork runs equities ORB (Alpaca) and forex NY ORB (IBKR) concurrently
 # in a single process. Starts 30 min before NY open (13:30 UTC).
@@ -119,9 +121,16 @@ GATEWAY_URL="${IBKR_GATEWAY_URL:-}"
 # gateway outage.
 needs_ibkr() {
   case "$1" in
-    orb-forex|orb-newyork) return 0 ;;
+    forex|orb-forex|orb-newyork) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+# engine_supports_forex_mode: true when the installed binary exposes `forex` as
+# a primary run mode. This keeps the renamed cron entry compatible until the new
+# binary has been installed.
+engine_supports_forex_mode() {
+  ./te run --help 2>/dev/null | awk '$1 == "forex" {found=1} END {exit found?0:1}'
 }
 
 # gateway_authenticated: ask the gateway's OWN status endpoint — the authoritative
@@ -201,7 +210,7 @@ case "$MODE" in
     prep_options_orb
     ./te run --mode orb-newyork --detach
     ;;
-  orb-forex)
+  forex|orb-forex)
     # Auto-detect session from UTC hour if not specified.
     if [ -z "$SESSION" ]; then
       HOUR_UTC=$(date -u +%H)
@@ -211,8 +220,13 @@ case "$MODE" in
         SESSION="newyork"
       fi
     fi
-    echo "[te-switch] Starting in Forex ORB mode (session: $SESSION)..."
-    ./te run --mode orb-forex --session "$SESSION" --detach
+    echo "[te-switch] Starting in Forex mode (session: $SESSION)..."
+    FOREX_ENGINE_MODE="forex"
+    if ! engine_supports_forex_mode; then
+      FOREX_ENGINE_MODE="orb-forex"
+      echo "[te-switch] WARNING: installed ./te does not expose forex mode yet — falling back to orb-forex."
+    fi
+    ./te run --mode "$FOREX_ENGINE_MODE" --session "$SESSION" --detach
     ;;
   *)
     echo "[te-switch] Starting in regular mode..."

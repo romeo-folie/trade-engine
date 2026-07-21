@@ -1848,9 +1848,13 @@ func validateInstrumentStrategyParams(prefix string, inst Instrument, defaultRR 
 func Validate(cfg *Config) []string {
 	var errs []string
 
-	validModes := map[string]bool{"manual": true, "auto": true, "paper": true}
+	validModes := map[string]bool{
+		"manual": true, "auto": true, "paper": true,
+		"orb": true, "forex": true, "orb-forex": true,
+		"orb-futures": true, "orb-futures-metals": true, "orb-newyork": true,
+	}
 	if !validModes[cfg.Engine.Mode] {
-		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper, got %q", cfg.Engine.Mode))
+		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper|orb|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork, got %q", cfg.Engine.Mode))
 	}
 
 	if cfg.Engine.LogTimezone != "" {

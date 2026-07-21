@@ -189,14 +189,14 @@ The engine runs in distinct modes that cover different markets and sessions. Eac
 ```
 TE=/path/to/scripts/te-switch.sh
 
-# ── Forex ORB: London session ────────────────────────────────────
+# ── Forex strategies: London session ─────────────────────────────
 # Starts 30 min before London open (08:00 UTC) for pre-session setup.
 # te-switch.sh stops any running process, then starts the new mode.
-30 7 * * 1-5  $TE orb-forex --session london
+30 7 * * 1-5  $TE forex --session london
 
-# ── Forex ORB: New York session ──────────────────────────────────
+# ── Forex strategies: New York session ───────────────────────────
 # Starts 30 min before NY open (13:00 UTC).
-30 12 * * 1-5  $TE orb-forex --session newyork
+30 12 * * 1-5  $TE forex --session newyork
 
 # ── Equities ORB (optional) ──────────────────────────────────────
 # Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
@@ -215,9 +215,9 @@ TE=/path/to/scripts/te-switch.sh
 **Notes:**
 
 - `te-switch.sh` runs `te stop` + waits 5 seconds before starting each mode, preventing process collisions.
-- For `orb-forex`, if `--session` is omitted, the script auto-detects from UTC hour (before 12:00 = london, after = newyork).
-- Forex ORB requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
-- Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex ORB since they use different brokers.
+- For `forex`, if `--session` is omitted, the script auto-detects from UTC hour (before 12:00 = london, after = newyork). `orb-forex` remains accepted as a compatibility alias.
+- Forex mode requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
+- Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex mode since they use different brokers.
 - Standard mode and equities ORB should not overlap — standard mode starts after ORB's 14:30 UTC cutoff.
 - The feedback reviewer runs inside whichever process is active at `feedback.review_time_utc` (default 18:00 UTC).
 
