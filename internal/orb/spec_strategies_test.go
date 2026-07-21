@@ -22,7 +22,7 @@ func TestEvaluateSweepReclaimOvernightHighShort(t *testing.T) {
 		TickSize:   1,
 		RiskReward: 3,
 	}
-	cfg := config.ForexORBConfig{RiskReward: 3, MaxRiskPct: 1, MaxPositionPct: 100}
+	cfg := config.ForexORBConfig{RiskReward: 2, MaxRiskPct: 1, MaxPositionPct: 100}
 	candles := []data.Candle{
 		{Timestamp: fetchStart, Open: 40000, High: 40020, Low: 39950, Close: 40010},
 		{Timestamp: sessionOpen.Add(0), Open: 40000, High: 40060, Low: 39990, Close: 40010},
@@ -47,6 +47,48 @@ func TestEvaluateSweepReclaimOvernightHighShort(t *testing.T) {
 	if math.Abs(sig.Bracket.StopLoss-40064) > 1e-9 {
 		t.Fatalf("stop = %v, want 40064", sig.Bracket.StopLoss)
 	}
+	if math.Abs(sig.Bracket.TakeProfit-39840) > 1e-9 {
+		t.Fatalf("target = %v, want instrument RR target 39840", sig.Bracket.TakeProfit)
+	}
+}
+
+func TestEvaluateSweepReclaimSkipsStaleSignal(t *testing.T) {
+	sessionOpen := time.Date(2026, 1, 5, 14, 30, 0, 0, time.UTC)
+	fetchStart := sessionOpen.Add(-16 * time.Hour)
+	levelEnd := sessionOpen
+	inst := config.Instrument{
+		Symbol:     "MYM",
+		SecType:    "FUT",
+		MinLotSize: 1,
+		PipBuffer:  4,
+		PointValue: 0.5,
+		TickSize:   1,
+		RiskReward: 3,
+	}
+	cfg := config.ForexORBConfig{RiskReward: 2, MaxRiskPct: 1, MaxPositionPct: 100}
+	candles := []data.Candle{
+		{Timestamp: fetchStart, Open: 40000, High: 40020, Low: 39950, Close: 40010},
+		{Timestamp: sessionOpen.Add(0), Open: 40000, High: 40060, Low: 39990, Close: 40010},
+		{Timestamp: sessionOpen.Add(time.Minute), Open: 40008, High: 40012, Low: 39990, Close: 40000},
+		{Timestamp: sessionOpen.Add(2 * time.Minute), Open: 40000, High: 40070, Low: 39995, Close: 40010},
+		{Timestamp: sessionOpen.Add(3 * time.Minute), Open: 40005, High: 40008, Low: 39990, Close: 39995},
+	}
+
+	sig, wait, ok := EvaluateSweepReclaim(candles, fetchStart, levelEnd, sessionOpen, sessionOpen.Add(3*time.Minute), inst, cfg, ReclaimParams{
+		LevelSet:           "overnight",
+		SweepDepthMult:     8,
+		EntryWindowMinutes: 180,
+		SideMode:           "both",
+	}, 100000)
+	if !ok || wait {
+		t.Fatalf("signal ok=%v wait=%v, want ok=true wait=false", ok, wait)
+	}
+	if !sig.EntryTime.Equal(sessionOpen.Add(3 * time.Minute)) {
+		t.Fatalf("entry time = %s, want later current reclaim at %s", sig.EntryTime, sessionOpen.Add(3*time.Minute))
+	}
+	if math.Abs(sig.Bracket.EntryStop-40005) > 1e-9 {
+		t.Fatalf("entry = %v, want 40005", sig.Bracket.EntryStop)
+	}
 }
 
 func TestEvaluateOpeningShockLongOnly(t *testing.T) {
@@ -60,7 +102,7 @@ func TestEvaluateOpeningShockLongOnly(t *testing.T) {
 		TickSize:   0.25,
 		RiskReward: 2.5,
 	}
-	cfg := config.ForexORBConfig{RiskReward: 2.5, MaxRiskPct: 1, MaxPositionPct: 100}
+	cfg := config.ForexORBConfig{RiskReward: 2, MaxRiskPct: 1, MaxPositionPct: 100}
 	var candles []data.Candle
 	for i := 0; i < 30; i++ {
 		close := 18000.0 - float64(i+1)
@@ -99,6 +141,9 @@ func TestEvaluateOpeningShockLongOnly(t *testing.T) {
 	}
 	if sig.Bracket.StopLoss >= sig.Bracket.EntryStop {
 		t.Fatalf("buy stop should be below entry, got entry=%v stop=%v", sig.Bracket.EntryStop, sig.Bracket.StopLoss)
+	}
+	if math.Abs(sig.Bracket.TakeProfit-17973.75) > 1e-9 {
+		t.Fatalf("target = %v, want instrument RR target 17973.75", sig.Bracket.TakeProfit)
 	}
 }
 

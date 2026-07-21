@@ -54,7 +54,7 @@ func candleHighLow(bars []data.Candle) (float64, float64) {
 }
 
 func entryBarCurrent(candles []data.Candle, now, entryTime time.Time) bool {
-	if entryTime.IsZero() || now.Before(entryTime) || !now.Before(entryTime.Add(time.Minute)) {
+	if !entryTimeCurrent(now, entryTime) {
 		return false
 	}
 	var latest time.Time
@@ -67,6 +67,17 @@ func entryBarCurrent(candles []data.Candle, now, entryTime time.Time) bool {
 		}
 	}
 	return latest.Equal(entryTime)
+}
+
+func entryTimeCurrent(now, entryTime time.Time) bool {
+	return !entryTime.IsZero() && !now.Before(entryTime) && now.Before(entryTime.Add(time.Minute))
+}
+
+func strategyBracketConfig(cfg config.ForexORBConfig, inst config.Instrument) config.ForexORBConfig {
+	if inst.RiskReward > 0 {
+		cfg.RiskReward = inst.RiskReward
+	}
+	return cfg
 }
 
 func percentileNearestRank(values []float64, pct float64) float64 {
@@ -140,28 +151,36 @@ func EvaluateSweepReclaim(candles []data.Candle, fetchStart, levelEnd, sessionOp
 			switch lvl.sweepSide {
 			case "up":
 				if bar.High >= lvl.price+depth && bar.Close < lvl.price {
+					entryTime := watch[i+1].Timestamp
+					if !entryTimeCurrent(now, entryTime) {
+						continue
+					}
 					entry := watch[i+1].Open
 					stop := bar.High + inst.PipBuffer
 					if stop <= entry || !strategySideAllowed(params.SideMode, "sell") {
 						continue
 					}
 					return StrategySignal{
-						Bracket:   ComputeRetestBracket(inst.Symbol, "sell", entry, stop, portfolioValue, cfg, inst),
+						Bracket:   ComputeRetestBracket(inst.Symbol, "sell", entry, stop, portfolioValue, strategyBracketConfig(cfg, inst), inst),
 						Side:      "sell",
-						EntryTime: watch[i+1].Timestamp,
+						EntryTime: entryTime,
 					}, false, true
 				}
 			case "down":
 				if bar.Low <= lvl.price-depth && bar.Close > lvl.price {
+					entryTime := watch[i+1].Timestamp
+					if !entryTimeCurrent(now, entryTime) {
+						continue
+					}
 					entry := watch[i+1].Open
 					stop := bar.Low - inst.PipBuffer
 					if stop >= entry || !strategySideAllowed(params.SideMode, "buy") {
 						continue
 					}
 					return StrategySignal{
-						Bracket:   ComputeRetestBracket(inst.Symbol, "buy", entry, stop, portfolioValue, cfg, inst),
+						Bracket:   ComputeRetestBracket(inst.Symbol, "buy", entry, stop, portfolioValue, strategyBracketConfig(cfg, inst), inst),
 						Side:      "buy",
-						EntryTime: watch[i+1].Timestamp,
+						EntryTime: entryTime,
 					}, false, true
 				}
 			}
@@ -255,7 +274,7 @@ func EvaluateOpeningShock(candles []data.Candle, history []float64, sessionOpen,
 		return StrategySignal{}, false, false
 	}
 	return StrategySignal{
-		Bracket:   ComputeRetestBracket(inst.Symbol, side, entry, stop, portfolioValue, cfg, inst),
+		Bracket:   ComputeRetestBracket(inst.Symbol, side, entry, stop, portfolioValue, strategyBracketConfig(cfg, inst), inst),
 		Side:      side,
 		EntryTime: watch[entryIdx].Timestamp,
 	}, false, true
