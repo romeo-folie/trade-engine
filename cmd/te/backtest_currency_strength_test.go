@@ -130,6 +130,35 @@ func TestSimulateStrengthDayAppliesTradeInstrumentFilter(t *testing.T) {
 	}
 }
 
+func TestMaybeStrengthScoreWindowsDefersUnusedOverallWindows(t *testing.T) {
+	oldTrainFrom, oldTrainTo := btStrengthTrainFrom, btStrengthTrainTo
+	oldValFrom, oldValTo := btStrengthValFrom, btStrengthValTo
+	oldFwdFrom, oldFwdTo := btStrengthFwdFrom, btStrengthFwdTo
+	oldTo := btORBTo
+	t.Cleanup(func() {
+		btStrengthTrainFrom, btStrengthTrainTo = oldTrainFrom, oldTrainTo
+		btStrengthValFrom, btStrengthValTo = oldValFrom, oldValTo
+		btStrengthFwdFrom, btStrengthFwdTo = oldFwdFrom, oldFwdTo
+		btORBTo = oldTo
+	})
+	btStrengthTrainFrom, btStrengthTrainTo = "2022-01-01", "2024-12-31"
+	btStrengthValFrom, btStrengthValTo = "2025-01-01", "2025-12-31"
+	btStrengthFwdFrom, btStrengthFwdTo = "2026-01-01", ""
+	btORBTo = "2024-12-31"
+
+	windows, err := maybeStrengthScoreWindows("overall", false)
+	if err != nil {
+		t.Fatalf("overall mode parsed unused windows: %v", err)
+	}
+	if windows != nil {
+		t.Fatalf("overall mode windows = %+v, want nil", windows)
+	}
+
+	if _, err := maybeStrengthScoreWindows("walk-forward", false); err == nil {
+		t.Fatal("walk-forward mode accepted invalid forward window, want error")
+	}
+}
+
 func TestResolveStrengthTradeAppliesSpreadCommissionAndJPYPointValue(t *testing.T) {
 	inst := config.Instrument{Symbol: "USD/JPY", PointValue: 0.007}
 	cost := orbreplay.CostModel{Spread: 0.012, CommissionPerSide: 2}

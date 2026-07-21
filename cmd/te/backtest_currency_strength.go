@@ -170,7 +170,7 @@ func runCurrencyStrength(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("invalid --confirm-min-moves %q: %w", btStrengthConfirms, err)
 	}
-	scoreWindows, err := strengthScoreWindows()
+	scoreWindows, err := maybeStrengthScoreWindows(btStrengthScoreMode, btStrengthAnalysis)
 	if err != nil {
 		return err
 	}
@@ -346,9 +346,6 @@ func parseStrengthTradeSymbols(csv string, pairs []strengthPair) (map[string]boo
 }
 
 func strengthScoreWindows() ([]strengthEvalWindow, error) {
-	if btStrengthScoreMode != "overall" && btStrengthScoreMode != "walk-forward" {
-		return nil, fmt.Errorf("--score-mode must be overall or walk-forward")
-	}
 	windows := []struct {
 		Label string
 		From  string
@@ -367,6 +364,16 @@ func strengthScoreWindows() ([]strengthEvalWindow, error) {
 		out = append(out, strengthEvalWindow{Label: w.Label, From: from, To: to})
 	}
 	return out, nil
+}
+
+func maybeStrengthScoreWindows(mode string, analysis bool) ([]strengthEvalWindow, error) {
+	if mode != "overall" && mode != "walk-forward" {
+		return nil, fmt.Errorf("--score-mode must be overall or walk-forward")
+	}
+	if mode != "walk-forward" && !analysis {
+		return nil, nil
+	}
+	return strengthScoreWindows()
 }
 
 func uniqueClockTimes(groups ...[]string) []string {
