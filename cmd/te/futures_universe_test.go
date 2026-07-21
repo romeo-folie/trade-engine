@@ -88,6 +88,32 @@ func TestBuildFuturesUniverse_ProviderProxies(t *testing.T) {
 	})
 }
 
+func TestResearchForexInstrumentsKeepsDefaultMajorsWithConfigOverrides(t *testing.T) {
+	got := researchForexInstruments([]config.Instrument{
+		{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 10000, PipBuffer: 0.0003},
+		{Symbol: "XAG/USD", SecType: "CMDTY", MinLotSize: 1, PipBuffer: 0.02},
+	})
+
+	bySymbol := make(map[string]config.Instrument, len(got))
+	for _, inst := range got {
+		bySymbol[inst.Symbol] = inst
+	}
+	if _, ok := bySymbol["GBP/USD"]; !ok {
+		t.Fatalf("default GBP/USD missing from research forex universe: %v", got)
+	}
+	if usdjpy := bySymbol["USD/JPY"]; usdjpy.PipBuffer != 0.02 || usdjpy.PointValue != 0.007 {
+		t.Fatalf("research USD/JPY defaults = %+v, want JPY-scale buffer and USD point-value proxy", usdjpy)
+	} else if usdjpy.CommissionBpsPerSide != ibkrSpotFXCommissionBpsPerSide || usdjpy.CommissionMinPerSide != ibkrSpotFXCommissionMinPerSide {
+		t.Fatalf("research USD/JPY commission = %+v, want IBKR spot-FX bps+minimum defaults", usdjpy)
+	}
+	if eur := bySymbol["EUR/USD"]; eur.MinLotSize != 10000 || eur.PipBuffer != 0.0003 {
+		t.Fatalf("configured EUR/USD did not override default: %+v", eur)
+	}
+	if _, ok := bySymbol["XAG/USD"]; !ok {
+		t.Fatalf("configured XAG/USD missing from research forex universe: %v", got)
+	}
+}
+
 func symbolSet(uni *backtestUniverse) map[string]bool {
 	m := make(map[string]bool)
 	for _, i := range uni.instruments {

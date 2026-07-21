@@ -40,11 +40,18 @@ var (
 var defaultSpreads = map[string]float64{
 	"EUR/USD": 0.00008,
 	"GBP/USD": 0.00010,
+	"USD/JPY": 0.012,
+	"EUR/JPY": 0.018,
+	"GBP/JPY": 0.022,
 	"XAU/USD": 0.30,
 	"XAG/USD": 0.02,
 }
 
 const orbCommissionPerSide = 2.0 // $ per fill, ≈ the broker-statement round-trip of ~$4
+const (
+	ibkrSpotFXCommissionBpsPerSide = 0.20
+	ibkrSpotFXCommissionMinPerSide = 2.00
+)
 
 func init() {
 	for _, c := range []*cobra.Command{orbBTCmd, orbCompareBTCmd} {
@@ -195,12 +202,14 @@ func buildBacktestUniverse(cfg *config.Config) (*backtestUniverse, error) {
 	var uni *backtestUniverse
 	switch btORBAssetClass {
 	case "", "forex":
-		instruments, err := resolveInstruments(cfg.ForexORB, btORBInstruments)
+		forexCfg := cfg.ForexORB
+		forexCfg.Instruments = researchForexInstruments(cfg.ForexORB.Instruments)
+		instruments, err := resolveInstruments(forexCfg, btORBInstruments)
 		if err != nil {
 			return nil, err
 		}
 		uni = &backtestUniverse{
-			base: cfg.ForexORB, instruments: instruments, costs: buildCostModels(instruments),
+			base: forexCfg, instruments: instruments, costs: buildCostModels(instruments),
 			provider: provider, sessions: []string{"london", "newyork"},
 		}
 	case "futures":
@@ -457,6 +466,64 @@ func buildOANDAProvider(oa config.OANDAConfig) (data.MarketDataProvider, error) 
 		}
 	}
 	return data.NewOANDAClient(token, oa.AccountID, base), nil
+}
+
+// researchForexInstruments makes FX/CFD backtests able to study the default research
+// majors even when the live user config is currently armed for another subset. User
+// configured instruments override defaults, so broker-specific sizing/cost fields still win.
+func researchForexInstruments(configured []config.Instrument) []config.Instrument {
+	defaults := researchForexDefaultInstruments()
+	bySymbol := make(map[string]config.Instrument, len(defaults)+len(configured))
+	order := make([]string, 0, len(defaults)+len(configured))
+	add := func(inst config.Instrument) {
+		if inst.Symbol == "" {
+			return
+		}
+		if _, ok := bySymbol[inst.Symbol]; !ok {
+			order = append(order, inst.Symbol)
+		}
+		bySymbol[inst.Symbol] = inst
+	}
+	for _, inst := range defaults {
+		add(inst)
+	}
+	for _, inst := range configured {
+		add(inst)
+	}
+	out := make([]config.Instrument, 0, len(order))
+	for _, sym := range order {
+		out = append(out, withDefaultSpotFXCommission(bySymbol[sym]))
+	}
+	return out
+}
+
+func researchForexDefaultInstruments() []config.Instrument {
+	defaults := config.Defaults().ForexORB.Instruments
+	exnessFX := []config.Instrument{
+		// JPY-pair PnL is naturally denominated in JPY. Use a static USD conversion
+		// proxy for research sizing/reporting; live broker fills remain the source of truth.
+		{Symbol: "USD/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},
+		{Symbol: "EUR/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},
+		{Symbol: "GBP/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},
+	}
+	out := make([]config.Instrument, 0, len(defaults)+len(exnessFX))
+	seen := make(map[string]bool, len(defaults)+len(exnessFX))
+	for _, inst := range append(defaults, exnessFX...) {
+		if inst.Symbol == "" || seen[inst.Symbol] {
+			continue
+		}
+		seen[inst.Symbol] = true
+		out = append(out, inst)
+	}
+	return out
+}
+
+func withDefaultSpotFXCommission(inst config.Instrument) config.Instrument {
+	if inst.SecType == "CASH" && inst.CommissionPerSide <= 0 && inst.CommissionBpsPerSide <= 0 {
+		inst.CommissionBpsPerSide = ibkrSpotFXCommissionBpsPerSide
+		inst.CommissionMinPerSide = ibkrSpotFXCommissionMinPerSide
+	}
+	return inst
 }
 
 func resolveInstruments(forexCfg config.ForexORBConfig, csv string) ([]config.Instrument, error) {
