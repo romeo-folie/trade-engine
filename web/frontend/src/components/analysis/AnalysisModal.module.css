@@ -160,6 +160,9 @@
 .section {}
 
 .sectionLabel {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--font-mono);
   font-size: 11px;
   font-weight: 400;
@@ -225,20 +228,19 @@
 
 /* ── Reasoning states ─────────────────────────────────────────────────────── */
 
-.dissentBlock {
-  margin-top: 16px;
-  padding-top: 16px;
-  border-top: 1px solid var(--border-muted);
-}
-
+/* Inline badge in the FULL REASONING header. The dissent text itself lives in
+   the reasoning body (it is the "DISSENT: …" prefix the arbiter writes), so
+   this only flags that analysts disagreed. */
 .dissentLabel {
-  display: block;
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--amber);
-  margin-bottom: 8px;
+  border: 1px solid var(--amber);
+  border-radius: 2px;
+  padding: 1px 5px;
+  line-height: 1.4;
 }
 
 /* ── Analyst breakdown ────────────────────────────────────────────────────── */

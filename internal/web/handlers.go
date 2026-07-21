@@ -278,7 +278,18 @@ func (s *Server) handlePortfolioHistory(w http.ResponseWriter, r *http.Request) 
 		if hist, err := s.brokerView.EquityCurve(ctx, period, timeframe); err == nil {
 			source = "broker"
 			alpacaSeries = make([]equityPoint, 0, len(hist.Points))
+			// Alpaca pads the window with equity=0 for every bar before the
+			// account existed (a period=1A request on a 5-month-old account
+			// returns ~150 zero bars). Those are not real equity readings —
+			// rendering them draws a flat $0 line from a year ago and squeezes
+			// the actual history into the right edge of the chart. Drop the
+			// leading zero run so the series starts at account inception, and
+			// skip interior zeros too (the frontend connects across the gap
+			// rather than dipping to zero).
 			for _, p := range hist.Points {
+				if p.Equity == 0 {
+					continue
+				}
 				alpacaSeries = append(alpacaSeries, equityPoint{
 					T: p.Time.Format(time.RFC3339),
 					V: p.Equity,
