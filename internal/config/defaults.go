@@ -334,6 +334,20 @@ func Defaults() *Config {
 			TrendTimeframe: "1h", // hourly EMA for the direction-eligibility trend filter
 			TrendEMAPeriod: 20,
 		},
+		CurrencyStrength: CurrencyStrengthConfig{
+			Enabled:          false,
+			Mode:             "shadow",
+			RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY", "EUR/JPY", "GBP/JPY"},
+			TradeInstruments: []string{"GBP/USD", "USD/JPY"},
+			Timezone:         "UTC",
+			StrengthStart:    "06:00",
+			StrengthEnd:      "09:00",
+			ExitTime:         "18:00",
+			MinGap:           0.0050,
+			BroadMin:         2,
+			ConfirmMinMove:   0.0015,
+			Units:            100000,
+		},
 		FuturesORB: FuturesORBConfig{
 			Enabled:        false,
 			SessionOpenET:  "09:30", // US equity index futures open with the equity market

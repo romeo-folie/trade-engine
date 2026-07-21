@@ -18,27 +18,28 @@ import (
 // ── Top-level config ──────────────────────────────────────────────────────────
 
 type Config struct {
-	Engine           EngineConfig        `yaml:"engine"`
-	Models           ModelsConfig        `yaml:"models"`
-	Markets          MarketsConfig       `yaml:"markets"`
-	Strategies       StrategiesConfig    `yaml:"strategies"`
-	Risk             RiskConfig          `yaml:"risk"`
-	Notifications    NotificationsConfig `yaml:"notifications"`
-	Logging          LoggingConfig       `yaml:"logging"`
-	Database         DatabaseConfig      `yaml:"database"`
-	Reports          ReportsConfig       `yaml:"reports"`
-	Backtest         BacktestConfig      `yaml:"backtest"`
-	Embeddings       EmbeddingsConfig    `yaml:"embeddings"`
-	Analysis         AnalysisConfig      `yaml:"analysis"`
-	Cost             CostConfig          `yaml:"cost"`
-	ORB              ORBConfig           `yaml:"orb"`
-	ForexORB         ForexORBConfig      `yaml:"forex_orb"`
-	FuturesORB       FuturesORBConfig    `yaml:"futures_orb"`
-	OptionsORB       OptionsORBConfig    `yaml:"options_orb"`
-	FuturesORBMetals FuturesORBConfig    `yaml:"futures_orb_metals"`
-	Scanner          ScannerConfig       `yaml:"scanner"`
-	Feedback         FeedbackConfig      `yaml:"feedback"`
-	Portfolio        PortfolioConfig     `yaml:"portfolio"`
+	Engine           EngineConfig           `yaml:"engine"`
+	Models           ModelsConfig           `yaml:"models"`
+	Markets          MarketsConfig          `yaml:"markets"`
+	Strategies       StrategiesConfig       `yaml:"strategies"`
+	Risk             RiskConfig             `yaml:"risk"`
+	Notifications    NotificationsConfig    `yaml:"notifications"`
+	Logging          LoggingConfig          `yaml:"logging"`
+	Database         DatabaseConfig         `yaml:"database"`
+	Reports          ReportsConfig          `yaml:"reports"`
+	Backtest         BacktestConfig         `yaml:"backtest"`
+	Embeddings       EmbeddingsConfig       `yaml:"embeddings"`
+	Analysis         AnalysisConfig         `yaml:"analysis"`
+	Cost             CostConfig             `yaml:"cost"`
+	ORB              ORBConfig              `yaml:"orb"`
+	ForexORB         ForexORBConfig         `yaml:"forex_orb"`
+	CurrencyStrength CurrencyStrengthConfig `yaml:"currency_strength"`
+	FuturesORB       FuturesORBConfig       `yaml:"futures_orb"`
+	OptionsORB       OptionsORBConfig       `yaml:"options_orb"`
+	FuturesORBMetals FuturesORBConfig       `yaml:"futures_orb_metals"`
+	Scanner          ScannerConfig          `yaml:"scanner"`
+	Feedback         FeedbackConfig         `yaml:"feedback"`
+	Portfolio        PortfolioConfig        `yaml:"portfolio"`
 }
 
 // ── Portfolio ──────────────────────────────────────────────────────────────────
@@ -823,6 +824,27 @@ type ForexORBConfig struct {
 	// matching pending entry filled and cancels the opposing OCO leg. Opt-in
 	// because it mutates real-money order/trade state from position inference.
 	ReconcileOrphanFills bool `yaml:"reconcile_orphan_fills"`
+}
+
+// CurrencyStrengthConfig controls the London-session FX currency-strength
+// rotation research setup. It is intentionally separate from forex_orb: this
+// strategy ranks a basket at fixed times, enters at market, and exits by time
+// instead of managing opening-range brackets.
+type CurrencyStrengthConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Mode    string `yaml:"mode"` // "shadow" | "paper"; "live" is rejected until live risk controls exist
+
+	RankInstruments  []string `yaml:"rank_instruments"`  // pairs used to rank currency strength
+	TradeInstruments []string `yaml:"trade_instruments"` // pairs eligible for orders
+
+	Timezone       string  `yaml:"timezone"`         // IANA timezone for the configured HH:MM times
+	StrengthStart  string  `yaml:"strength_start"`   // HH:MM, start of measurement window
+	StrengthEnd    string  `yaml:"strength_end"`     // HH:MM, rank/entry decision time
+	ExitTime       string  `yaml:"exit_time"`        // HH:MM, fixed flatten time
+	MinGap         float64 `yaml:"min_gap"`          // minimum strongest-vs-weakest score gap
+	BroadMin       int     `yaml:"broad_min"`        // minimum broad pair confirmations
+	ConfirmMinMove float64 `yaml:"confirm_min_move"` // minimum signed pair move before a trade is allowed
+	Units          int     `yaml:"units"`            // base-currency units per signal in shadow/paper mode
 }
 
 // EffectiveMaxHoldMinutes returns the resolved max-hold limit for a symbol:
@@ -2038,6 +2060,57 @@ func Validate(cfg *Config) []string {
 		}
 	}
 
+	if cfg.CurrencyStrength.Enabled {
+		switch cfg.CurrencyStrength.Mode {
+		case "shadow", "paper":
+		case "live":
+			errs = append(errs, "currency_strength.mode live is not supported yet; use shadow or paper until live execution controls are implemented")
+		default:
+			errs = append(errs, fmt.Sprintf("currency_strength.mode must be one of shadow|paper, got %q", cfg.CurrencyStrength.Mode))
+		}
+		if len(cfg.CurrencyStrength.RankInstruments) < 3 {
+			errs = append(errs, "currency_strength.rank_instruments must contain at least 3 pairs")
+		}
+		if len(cfg.CurrencyStrength.TradeInstruments) == 0 {
+			errs = append(errs, "currency_strength.trade_instruments must contain at least one pair")
+		}
+		rankSet := make(map[string]struct{}, len(cfg.CurrencyStrength.RankInstruments))
+		for _, pair := range cfg.CurrencyStrength.RankInstruments {
+			if !strings.Contains(pair, "/") {
+				errs = append(errs, fmt.Sprintf("currency_strength.rank_instruments contains invalid pair %q (expected BASE/QUOTE)", pair))
+			}
+			rankSet[pair] = struct{}{}
+		}
+		for _, pair := range cfg.CurrencyStrength.TradeInstruments {
+			if _, ok := rankSet[pair]; !ok {
+				errs = append(errs, fmt.Sprintf("currency_strength.trade_instruments pair %q must also be present in rank_instruments", pair))
+			}
+		}
+		if cfg.CurrencyStrength.Timezone == "" {
+			errs = append(errs, "currency_strength.timezone is required")
+		} else if _, err := time.LoadLocation(cfg.CurrencyStrength.Timezone); err != nil {
+			errs = append(errs, fmt.Sprintf("currency_strength.timezone %q is not a valid IANA timezone: %v", cfg.CurrencyStrength.Timezone, err))
+		}
+		startMin, startOK := parseHHMMConfig("currency_strength.strength_start", cfg.CurrencyStrength.StrengthStart, &errs)
+		endMin, endOK := parseHHMMConfig("currency_strength.strength_end", cfg.CurrencyStrength.StrengthEnd, &errs)
+		exitMin, exitOK := parseHHMMConfig("currency_strength.exit_time", cfg.CurrencyStrength.ExitTime, &errs)
+		if startOK && endOK && exitOK && !(startMin < endMin && endMin < exitMin) {
+			errs = append(errs, "currency_strength times must satisfy strength_start < strength_end < exit_time")
+		}
+		if cfg.CurrencyStrength.MinGap <= 0 {
+			errs = append(errs, "currency_strength.min_gap must be > 0")
+		}
+		if cfg.CurrencyStrength.BroadMin <= 0 {
+			errs = append(errs, "currency_strength.broad_min must be > 0")
+		}
+		if cfg.CurrencyStrength.ConfirmMinMove < 0 {
+			errs = append(errs, "currency_strength.confirm_min_move must be >= 0")
+		}
+		if cfg.CurrencyStrength.Units <= 0 {
+			errs = append(errs, "currency_strength.units must be > 0")
+		}
+	}
+
 	// Validate forex ORB per-instrument breakout_confirmation so a typo (e.g. "close_3")
 	// fails loudly instead of silently disabling the confirmation gate and re-enabling the
 	// wick-touch entries Phase 3 is meant to filter.
@@ -2155,6 +2228,21 @@ func Validate(cfg *Config) []string {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+func parseHHMMConfig(field, raw string, errs *[]string) (int, bool) {
+	parts := strings.Split(raw, ":")
+	if len(parts) != 2 {
+		*errs = append(*errs, fmt.Sprintf("%s must be HH:MM, got %q", field, raw))
+		return 0, false
+	}
+	hour, errHour := strconv.Atoi(parts[0])
+	minute, errMinute := strconv.Atoi(parts[1])
+	if errHour != nil || errMinute != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		*errs = append(*errs, fmt.Sprintf("%s must be HH:MM, got %q", field, raw))
+		return 0, false
+	}
+	return hour*60 + minute, true
+}
 
 func resolveEnvVars(cfg *Config) {
 	// Registry entries.

@@ -593,6 +593,48 @@ func TestValidateORBDisabledSkipsValidation(t *testing.T) {
 	}
 }
 
+func TestValidateCurrencyStrengthValidDefaults(t *testing.T) {
+	cfg := Defaults()
+	cfg.CurrencyStrength.Enabled = true
+	errs := Validate(cfg)
+	for _, e := range errs {
+		if strings.Contains(e, "currency_strength") {
+			t.Errorf("unexpected currency_strength validation error with defaults: %s", e)
+		}
+	}
+}
+
+func TestValidateCurrencyStrengthRejectsLiveMode(t *testing.T) {
+	cfg := Defaults()
+	cfg.CurrencyStrength.Enabled = true
+	cfg.CurrencyStrength.Mode = "live"
+	errs := Validate(cfg)
+	if !containsStr(errs, "currency_strength.mode live is not supported yet") {
+		t.Errorf("expected currency_strength live-mode error, got: %v", errs)
+	}
+}
+
+func TestValidateCurrencyStrengthTradePairsMustBeRanked(t *testing.T) {
+	cfg := Defaults()
+	cfg.CurrencyStrength.Enabled = true
+	cfg.CurrencyStrength.TradeInstruments = []string{"AUD/USD"}
+	errs := Validate(cfg)
+	if !containsStr(errs, "currency_strength.trade_instruments pair") {
+		t.Errorf("expected currency_strength trade-instrument subset error, got: %v", errs)
+	}
+}
+
+func TestValidateCurrencyStrengthTimesMustBeOrdered(t *testing.T) {
+	cfg := Defaults()
+	cfg.CurrencyStrength.Enabled = true
+	cfg.CurrencyStrength.StrengthStart = "09:00"
+	cfg.CurrencyStrength.StrengthEnd = "06:00"
+	errs := Validate(cfg)
+	if !containsStr(errs, "currency_strength times") {
+		t.Errorf("expected currency_strength time-order error, got: %v", errs)
+	}
+}
+
 func TestDefaultsORBConfig(t *testing.T) {
 	cfg := Defaults()
 	if cfg.ORB.Mode != "paper" {

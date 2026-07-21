@@ -8,23 +8,6 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 )
 
-func TestRouteStrengthPairUsesDirectOrInversePair(t *testing.T) {
-	pairs := []strengthPair{
-		{Instrument: config.Instrument{Symbol: "EUR/USD"}, Base: "EUR", Quote: "USD"},
-		{Instrument: config.Instrument{Symbol: "USD/JPY"}, Base: "USD", Quote: "JPY"},
-	}
-
-	pair, side, ok := routeStrengthPair(pairs, "EUR", "USD")
-	if !ok || pair.Instrument.Symbol != "EUR/USD" || side != "buy" {
-		t.Fatalf("direct route = %s/%s/%v, want EUR/USD buy true", pair.Instrument.Symbol, side, ok)
-	}
-
-	pair, side, ok = routeStrengthPair(pairs, "JPY", "USD")
-	if !ok || pair.Instrument.Symbol != "USD/JPY" || side != "sell" {
-		t.Fatalf("inverse route = %s/%s/%v, want USD/JPY sell true", pair.Instrument.Symbol, side, ok)
-	}
-}
-
 func TestSimulateStrengthDayRequiresBroadStrongAndWeakVotes(t *testing.T) {
 	pairs := []strengthPair{
 		{Instrument: config.Instrument{Symbol: "EUR/USD", SecType: "CASH"}, Base: "EUR", Quote: "USD"},

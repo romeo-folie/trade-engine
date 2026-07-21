@@ -603,6 +603,32 @@ forex_orb:
   # mutates real-money order/trade state from position inference.
   reconcile_orphan_fills: false
 
+# ── FX currency-strength rotation (IBKR data/execution) ──────────────────────
+# Research setup from Exness M1 data, traded via IBKR only after live controls
+# are wired. Separate from forex_orb: this ranks a currency basket into the
+# London session, trades strongest-vs-weakest only when breadth confirms, then
+# exits at a fixed time instead of using ORB brackets.
+currency_strength:
+  enabled: false
+  mode: shadow                 # shadow | paper; live is rejected until execution controls exist
+  rank_instruments:
+    - EUR/USD
+    - GBP/USD
+    - USD/JPY
+    - EUR/JPY
+    - GBP/JPY
+  trade_instruments:
+    - GBP/USD
+    - USD/JPY
+  timezone: UTC
+  strength_start: "06:00"
+  strength_end: "09:00"
+  exit_time: "18:00"
+  min_gap: 0.005
+  broad_min: 2
+  confirm_min_move: 0.0015
+  units: 100000
+
 # ── US equity-index futures ORB (IBKR) — run with `te run --mode orb-newyork` ─
 futures_orb:
   enabled: false
