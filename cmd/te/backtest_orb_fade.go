@@ -32,9 +32,10 @@ var (
 func init() {
 	orbFadeCmd.Flags().StringVar(&btORBFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	orbFadeCmd.Flags().StringVar(&btORBTo, "to", "", "End date YYYY-MM-DD (required)")
-	orbFadeCmd.Flags().StringVar(&btFadeSession, "session", "newyork", "Session: london | newyork")
+	orbFadeCmd.Flags().StringVar(&btFadeSession, "session", "newyork", "Session: london | newyork | newyork_et (default newyork; futures maps newyork to newyork_et)")
 	orbFadeCmd.Flags().StringVar(&btORBInstruments, "instruments", "", "Comma-separated symbols (default: all configured)")
 	orbFadeCmd.Flags().StringVar(&btORBProvider, "provider", "", "Data provider: histdata (default) | dukascopy | exness | oanda")
+	orbFadeCmd.Flags().StringVar(&btORBAssetClass, "asset-class", "forex", "Instrument universe: forex (forex_orb.instruments) | futures (futures_orb/default micro-index instruments via index-CFD proxy data)")
 	orbFadeCmd.Flags().Float64Var(&btORBCapital, "capital", 100000, "Initial capital for position sizing")
 	orbFadeCmd.Flags().StringVar(&btFadeRanges, "ranges", "5,15,30,60", "Opening-range minute levels to test")
 	orbFadeCmd.Flags().StringVar(&btFadeRiskRewards, "risk-rewards", "0.75,1,1.25,1.5,2", "Target R multiples to test")
@@ -101,8 +102,9 @@ func runORBFade(ctx context.Context) error {
 		return fmt.Errorf("--to must not be before --from")
 	}
 	to = to.Add(24*time.Hour - time.Second)
-	if btFadeSession != "london" && btFadeSession != "newyork" {
-		return fmt.Errorf("--session %q unsupported for orb-fade (use london|newyork)", btFadeSession)
+	session, err := normalizeStrategySession(btFadeSession)
+	if err != nil {
+		return fmt.Errorf("--session %q unsupported for orb-fade: %w", btFadeSession, err)
 	}
 
 	ranges, err := parsePositiveIntCSV(btFadeRanges)
@@ -129,15 +131,10 @@ func runORBFade(ctx context.Context) error {
 		return fmt.Errorf("--entry-window must be positive")
 	}
 
-	provider, err := buildBacktestProvider(cfg)
+	uni, err := buildBacktestUniverse(cfg)
 	if err != nil {
 		return err
 	}
-	instruments, err := resolveInstruments(cfg.ForexORB, btORBInstruments)
-	if err != nil {
-		return err
-	}
-	costs := buildCostModels(instruments)
 
 	var params []fadeParam
 	for _, rm := range ranges {
@@ -150,7 +147,7 @@ func runORBFade(ctx context.Context) error {
 				for _, mh := range holds {
 					for _, depth := range depths {
 						params = append(params, fadeParam{
-							Session: btFadeSession, RangeMinutes: rm, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth, TargetMode: mode,
+							Session: session, RangeMinutes: rm, RiskReward: rr, MaxHold: mh, SweepDepthMul: depth, TargetMode: mode,
 						})
 					}
 				}
@@ -158,11 +155,11 @@ func runORBFade(ctx context.Context) error {
 		}
 	}
 	fmt.Printf("orb-fade · %s · %s -> %s · %d sets · %d instruments\n\n",
-		btFadeSession, btORBFrom, btORBTo, len(params), len(instruments))
+		session, btORBFrom, btORBTo, len(params), len(uni.instruments))
 
 	results := make([]fadeCandidateResult, 0, len(params))
 	for _, p := range params {
-		trades, err := runFadeParam(ctx, cfg.ForexORB, provider, costs, instruments, p, from, to, btORBCapital)
+		trades, err := runFadeParam(ctx, uni.base, uni.provider, uni.costs, uni.instruments, p, from, to, btORBCapital)
 		if err != nil {
 			return err
 		}
@@ -421,8 +418,27 @@ func fadeSessionOpenAt(day time.Time, session string) (time.Time, bool) {
 		return day.Add(8 * time.Hour), true
 	case "newyork":
 		return day.Add(13*time.Hour + 30*time.Minute), true
+	case "newyork_et":
+		loc, err := time.LoadLocation("America/New_York")
+		if err != nil {
+			return time.Time{}, false
+		}
+		local := time.Date(day.Year(), day.Month(), day.Day(), 9, 30, 0, 0, loc)
+		return local.UTC(), true
 	default:
 		return time.Time{}, false
+	}
+}
+
+func normalizeStrategySession(session string) (string, error) {
+	if btORBAssetClass == "futures" && session == "newyork" {
+		session = "newyork_et"
+	}
+	switch session {
+	case "london", "newyork", "newyork_et":
+		return session, nil
+	default:
+		return "", fmt.Errorf("use london|newyork|newyork_et")
 	}
 }
 

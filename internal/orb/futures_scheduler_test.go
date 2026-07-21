@@ -128,6 +128,43 @@ func TestSessionCleanupMinutes(t *testing.T) {
 			wantMin: 10*60 + 30,
 		},
 		{
+			name: "futures trend-continuation extends cleanup to delayed entry window",
+			setup: func(s *ORBScheduler) {
+				cfg := *testFuturesCfg
+				cfg.RangeMinutes = 30
+				cfg.Instruments = []config.FuturesInstrument{{
+					Symbol: "MES", TickSize: 0.25, TickValue: 1.25, TickBuffer: 2,
+					Strategy: "trend_continuation", ContinuationDelayMinutes: 45, ContinuationConfirmBars: 3, ContinuationDepthMult: 2,
+				}}
+				s.SetFuturesConfig(&cfg)
+			},
+			wantMin: 10*60 + 50,
+		},
+		{
+			name: "futures sweep-reclaim extends cleanup to entry window",
+			setup: func(s *ORBScheduler) {
+				cfg := *testFuturesCfg
+				cfg.Instruments = []config.FuturesInstrument{{
+					Symbol: "MYM", TickSize: 1, TickValue: 0.5, TickBuffer: 4,
+					Strategy: "sweep_reclaim", SweepReclaimEntryWindowMinutes: 180,
+				}}
+				s.SetFuturesConfig(&cfg)
+			},
+			wantMin: 12*60 + 32,
+		},
+		{
+			name: "futures opening-shock extends cleanup through delayed entry",
+			setup: func(s *ORBScheduler) {
+				cfg := *testFuturesCfg
+				cfg.Instruments = []config.FuturesInstrument{{
+					Symbol: "MNQ", TickSize: 0.25, TickValue: 0.5, TickBuffer: 2,
+					Strategy: "opening_shock", OpeningShockWindowMinutes: 70, OpeningShockEntryDelayMin: 5,
+				}}
+				s.SetFuturesConfig(&cfg)
+			},
+			wantMin: 10*60 + 47,
+		},
+		{
 			name: "futures late-evening open (23:00) does not overflow 1439",
 			setup: func(s *ORBScheduler) {
 				cfg := *testFuturesCfg

@@ -352,6 +352,13 @@ func (s *ORBScheduler) effectiveRangeMinutes() int {
 	return s.cfg.RangeMinutes
 }
 
+func (s *ORBScheduler) effectiveRangeMinutesForTicker(ticker string) int {
+	if inst := s.effectiveInstrument(ticker); inst != nil && inst.RangeMinutes > 0 {
+		return inst.RangeMinutes
+	}
+	return s.effectiveRangeMinutes()
+}
+
 // ownsInstrument reports whether the ticker is one this scheduler manages in its active
 // mode (a configured forex or futures instrument). Replaces isForexInstrument at call
 // sites that must also cover futures, scoping shared orb_trades reconcilers to this
@@ -523,18 +530,43 @@ func (s *ORBScheduler) sessionOpenMinutes() int {
 // cover range + delay + confirmation bars plus a small next-bar buffer.
 func (s *ORBScheduler) sessionCleanupMinutes() int {
 	offset := 60
-	if s.forexCfg != nil && s.forexCfg.Enabled {
-		for _, inst := range s.forexCfg.Instruments {
-			if !IsTrendContinuation(inst) {
-				continue
-			}
-			needed := s.forexCfg.RangeMinutes + inst.ContinuationDelayMinutes + inst.ContinuationConfirmBars + 2
-			if needed > offset {
-				offset = needed
-			}
+	for _, inst := range s.cleanupInstruments() {
+		rangeMinutes := s.effectiveRangeMinutes()
+		if inst.RangeMinutes > 0 {
+			rangeMinutes = inst.RangeMinutes
+		}
+		if needed := strategyCleanupOffset(rangeMinutes, inst); needed > offset {
+			offset = needed
 		}
 	}
 	return (s.sessionOpenMinutes() + offset) % (24 * 60)
+}
+
+func (s *ORBScheduler) cleanupInstruments() []config.Instrument {
+	if s.isFuturesMode() && s.futuresCfg != nil {
+		out := make([]config.Instrument, 0, len(s.futuresCfg.Instruments))
+		for _, inst := range s.futuresCfg.Instruments {
+			out = append(out, inst.ToInstrument())
+		}
+		return out
+	}
+	if s.forexCfg != nil && s.forexCfg.Enabled {
+		return s.forexCfg.Instruments
+	}
+	return nil
+}
+
+func strategyCleanupOffset(rangeMinutes int, inst config.Instrument) int {
+	switch {
+	case IsTrendContinuation(inst):
+		return rangeMinutes + inst.ContinuationDelayMinutes + inst.ContinuationConfirmBars + 2
+	case IsSweepReclaim(inst):
+		return inst.SweepReclaimEntryWindowMinutes + 2
+	case IsOpeningShock(inst):
+		return inst.OpeningShockWindowMinutes + inst.OpeningShockEntryDelayMin + 2
+	default:
+		return 0
+	}
 }
 
 // sessionTimezone returns the timezone location for the scheduler.
@@ -801,12 +833,11 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 	// can resume fetching candles. Fresh buffers are fine — they will
 	// re-accumulate from session open on the next tick.
 	if targetState == StateRangeWatch || targetState == StateExecuting {
-		rangeMinutes := s.effectiveRangeMinutes()
 		s.mu.Lock()
 		s.rangeBuffers = make(map[string]*RangeBuffer)
 		s.optionsAttempted = make(map[string]bool)
 		for _, sc := range s.candidates {
-			s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, rangeMinutes)
+			s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.effectiveRangeMinutesForTicker(sc.Gap.Ticker))
 		}
 		s.mu.Unlock()
 		// Restore the options-ORB spent-attempt set so a restart within the entry window
@@ -1191,7 +1222,7 @@ func (s *ORBScheduler) tickCandidateReady(ctx context.Context, et time.Time) err
 	s.rangeBuffers = make(map[string]*RangeBuffer)
 	s.optionsAttempted = make(map[string]bool)
 	for _, sc := range s.candidates {
-		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.effectiveRangeMinutes())
+		s.rangeBuffers[sc.Gap.Ticker] = NewRangeBuffer(sc.Gap.Ticker, s.effectiveRangeMinutesForTicker(sc.Gap.Ticker))
 	}
 	sessionID := s.session.ID
 	sessionCandidates := s.session.Candidates
@@ -1267,7 +1298,7 @@ func (s *ORBScheduler) tickRangeWatch(ctx context.Context, et time.Time) error {
 						Ticker:       ticker,
 						RangeHigh:    r.High,
 						RangeLow:     r.Low,
-						RangeMinutes: s.effectiveRangeMinutes(),
+						RangeMinutes: s.effectiveRangeMinutesForTicker(ticker),
 					})
 				}
 				break
@@ -1362,10 +1393,14 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 		minRange := 0.01
 		if s.isForexMode() || s.isFuturesMode() {
 			if inst := s.effectiveInstrument(ticker); inst != nil && inst.PipBuffer > 0 {
-				minRange = inst.PipBuffer * 2
+				if IsSweepReclaim(*inst) || IsOpeningShock(*inst) {
+					minRange = 0
+				} else {
+					minRange = inst.PipBuffer * 2
+				}
 			}
 		}
-		if r.High-r.Low < minRange {
+		if minRange > 0 && r.High-r.Low < minRange {
 			slog.Info("orb: skipping instrument — opening range too narrow", "ticker", ticker, "high", r.High, "low", r.Low, "min_range", minRange)
 			continue
 		}
@@ -1399,17 +1434,22 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				continue
 			}
 			fcfg := s.effectiveForexCfg()
-
-			// Entry-quality gate 1: ATR-normalised range filter (Phase 2).
-			if ok, ratio, reason := s.passesRangeQuality(ctx, ticker, r, *inst); !ok {
-				slog.Info("orb: skipping instrument — range quality", "ticker", ticker, "ratio", ratio, "reason", reason)
-				continue
+			if inst.RangeMinutes > 0 {
+				fcfg.RangeMinutes = inst.RangeMinutes
 			}
 
 			// Feedback auto-throttle: scale this instrument's risk by its rolling realised
 			// expectancy (a no-op unless enabled and data exists). Computed once, shared by
 			// both sides — they have identical sizing inputs.
 			tinst := s.throttledInstrument(ctx, *inst)
+			usesOpeningRange := !IsSweepReclaim(tinst) && !IsOpeningShock(tinst)
+			if usesOpeningRange {
+				// Entry-quality gate 1: ATR-normalised range filter (Phase 2).
+				if ok, ratio, reason := s.passesRangeQuality(ctx, ticker, r, tinst); !ok {
+					slog.Info("orb: skipping instrument — range quality", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+			}
 			if IsTrendContinuation(tinst) {
 				if stopped, err := s.continuationMonthlyStopHit(ctx, ticker, tinst.ContinuationMonthlyStopLossUSD); err != nil {
 					slog.Warn("orb: trend-continuation: monthly stop read failed — skipping entry", "ticker", ticker, "err", err)
@@ -1448,6 +1488,80 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 						Ticker:    ticker,
 						Direction: signal.Side,
 						Strategy:  StrategyTrendContinuation,
+					})
+				}
+				continue
+			}
+			if IsSweepReclaim(tinst) {
+				signal, wait, ok := s.sweepReclaimEntry(ctx, ticker, fcfg, tinst, portfolioVal)
+				if !ok {
+					if wait {
+						pendingConfirmation = true
+					}
+					continue
+				}
+				br := signal.Bracket
+				if br.Qty == 0 {
+					slog.Info("orb: skipping sweep-reclaim — min lot exceeds the position cap", "ticker", ticker)
+					continue
+				}
+				if ok, ratio, reason := s.passesSpread(ctx, ticker, br.EntryStop, br.StopLoss, tinst.MaxSpreadToRisk); !ok {
+					slog.Info("orb: skipping sweep-reclaim — spread too wide vs the reclaim stop", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				if ok, ratio, reason := passesCommission(br.Qty, br.EntryStop, br.StopLoss, tinst); !ok {
+					slog.Info("orb: skipping sweep-reclaim — commission too large vs the reclaim risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				slog.Info("orb: sweep-reclaim entry", "ticker", ticker, "side", signal.Side, "entry", br.EntryStop, "stop", br.StopLoss)
+				orderID, _ := s.placeAndTrackBracket(ctx, sessionID, ticker, signal.Side, br, PlaceMarketBracket, "", "", &msgs)
+				if orderID != "" {
+					if signal.Side == "buy" {
+						s.orderIDs[ticker] = [2]string{orderID, ""}
+					} else {
+						s.orderIDs[ticker] = [2]string{"", orderID}
+					}
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker:    ticker,
+						Direction: signal.Side,
+						Strategy:  StrategySweepReclaim,
+					})
+				}
+				continue
+			}
+			if IsOpeningShock(tinst) {
+				signal, wait, ok := s.openingShockEntry(ctx, ticker, fcfg, tinst, portfolioVal)
+				if !ok {
+					if wait {
+						pendingConfirmation = true
+					}
+					continue
+				}
+				br := signal.Bracket
+				if br.Qty == 0 {
+					slog.Info("orb: skipping opening-shock — min lot exceeds the position cap", "ticker", ticker)
+					continue
+				}
+				if ok, ratio, reason := s.passesSpread(ctx, ticker, br.EntryStop, br.StopLoss, tinst.MaxSpreadToRisk); !ok {
+					slog.Info("orb: skipping opening-shock — spread too wide vs the shock stop", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				if ok, ratio, reason := passesCommission(br.Qty, br.EntryStop, br.StopLoss, tinst); !ok {
+					slog.Info("orb: skipping opening-shock — commission too large vs the shock risk", "ticker", ticker, "ratio", ratio, "reason", reason)
+					continue
+				}
+				slog.Info("orb: opening-shock entry", "ticker", ticker, "side", signal.Side, "entry", br.EntryStop, "stop", br.StopLoss)
+				orderID, _ := s.placeAndTrackBracket(ctx, sessionID, ticker, signal.Side, br, PlaceMarketBracket, "", "", &msgs)
+				if orderID != "" {
+					if signal.Side == "buy" {
+						s.orderIDs[ticker] = [2]string{orderID, ""}
+					} else {
+						s.orderIDs[ticker] = [2]string{"", orderID}
+					}
+					s.publish(events.TradeSimulated, events.TradeExecutedPayload{
+						Ticker:    ticker,
+						Direction: signal.Side,
+						Strategy:  StrategyOpeningShock,
 					})
 				}
 				continue

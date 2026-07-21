@@ -611,9 +611,19 @@ type Instrument struct {
 	PipBuffer  float64 `yaml:"pip_buffer"`   // e.g. 0.0002 for EUR/USD, 0.50 for XAU/USD
 
 	// Strategy selects the live entry model for this instrument. Empty/"orb" keeps the
-	// existing opening-range breakout path. "trend_continuation" waits after the opening
-	// range, requires consecutive closes beyond the range, then enters at market.
+	// existing opening-range breakout path. Other values select independently validated
+	// intraday strategy families: trend_continuation, sweep_reclaim, or opening_shock.
 	Strategy string `yaml:"strategy"`
+
+	// RangeMinutes overrides the strategy-level opening-range length for this instrument.
+	// Primarily used by per-instrument futures research candidates. 0 inherits the
+	// strategy-level range_minutes.
+	RangeMinutes int `yaml:"range_minutes"`
+
+	// SideMode restricts single-entry strategy families to both sides, long-only, or
+	// short-only. Empty/"both" allows both. Used by trend_continuation, sweep_reclaim,
+	// and opening_shock; ignored by legacy dual-sided ORB.
+	SideMode string `yaml:"side_mode"`
 
 	// MaxHoldMinutes is the per-instrument hard time limit on a *filled* ORB trade.
 	// When a filled position is older than this, the scheduler cancels its remaining
@@ -678,6 +688,18 @@ type Instrument struct {
 	ContinuationMaxRangePips       float64 `yaml:"continuation_max_range_pips"`
 	ContinuationExcludeRangePips   string  `yaml:"continuation_exclude_range_pips"`
 	ContinuationMonthlyStopLossUSD float64 `yaml:"continuation_monthly_stop_loss"`
+
+	// Sweep/reclaim parameters. Used only when Strategy is "sweep_reclaim".
+	SweepReclaimLevelSet           string  `yaml:"sweep_reclaim_level_set"` // prior_day | overnight
+	SweepReclaimDepthMult          float64 `yaml:"sweep_reclaim_depth_mult"`
+	SweepReclaimEntryWindowMinutes int     `yaml:"sweep_reclaim_entry_window_minutes"`
+
+	// Opening-shock parameters. Used only when Strategy is "opening_shock".
+	OpeningShockWindowMinutes int     `yaml:"opening_shock_window_minutes"`
+	OpeningShockLookback      int     `yaml:"opening_shock_lookback"`
+	OpeningShockPercentile    float64 `yaml:"opening_shock_percentile"`
+	OpeningShockStopMult      float64 `yaml:"opening_shock_stop_mult"`
+	OpeningShockEntryDelayMin int     `yaml:"opening_shock_entry_delay_minutes"`
 
 	// Retest parameters (Phase 6), used only by the retest_* confirmation modes. RetestTolerance
 	// is how close (as a fraction of the opening-range width) the pullback must return to the
@@ -845,6 +867,20 @@ type FuturesInstrument struct {
 	// FuturesORBConfig.MaxHoldMinutes strategy default; both 0 = time exits disabled).
 	MaxHoldMinutes int `yaml:"max_hold_minutes"`
 
+	// Strategy selects the live entry model for this contract. Empty/"orb" keeps the
+	// opening-range breakout path. Other values select independently validated strategy
+	// families: trend_continuation, sweep_reclaim, or opening_shock.
+	Strategy string `yaml:"strategy"`
+
+	// RangeMinutes overrides FuturesORBConfig.RangeMinutes for this contract. 0 inherits.
+	RangeMinutes int `yaml:"range_minutes"`
+
+	// SideMode restricts single-entry strategy families to both, long-only, or short-only.
+	SideMode string `yaml:"side_mode"`
+
+	// RiskReward overrides FuturesORBConfig.RiskReward for this contract when > 0.
+	RiskReward float64 `yaml:"risk_reward"`
+
 	// Entry-quality gates (Phase 2). range_atr_ratio = opening_range_width / ATR. A session
 	// whose ratio is outside [MinRangeATR, MaxRangeATR] is skipped; a bound of 0 disables
 	// that side. MaxSpreadToRisk rejects a session when spread / |entry−stop| exceeds it.
@@ -859,6 +895,29 @@ type FuturesInstrument struct {
 	BreakoutConfirmation string  `yaml:"breakout_confirmation"`
 	RetestTolerance      float64 `yaml:"retest_tolerance"`
 	RetestTimeoutMinutes int     `yaml:"retest_timeout_minutes"`
+
+	// Trend-continuation parameters. Used only when Strategy is "trend_continuation".
+	ContinuationDelayMinutes       int     `yaml:"continuation_delay_minutes"`
+	ContinuationConfirmBars        int     `yaml:"continuation_confirm_bars"`
+	ContinuationDepthMult          float64 `yaml:"continuation_depth_mult"`
+	ContinuationTrendFilter        string  `yaml:"continuation_trend_filter"`
+	ContinuationTrendLookbackMin   int     `yaml:"continuation_trend_lookback_minutes"`
+	ContinuationMinRangePips       float64 `yaml:"continuation_min_range_pips"`
+	ContinuationMaxRangePips       float64 `yaml:"continuation_max_range_pips"`
+	ContinuationExcludeRangePips   string  `yaml:"continuation_exclude_range_pips"`
+	ContinuationMonthlyStopLossUSD float64 `yaml:"continuation_monthly_stop_loss"`
+
+	// Sweep/reclaim parameters. Used only when Strategy is "sweep_reclaim".
+	SweepReclaimLevelSet           string  `yaml:"sweep_reclaim_level_set"`
+	SweepReclaimDepthMult          float64 `yaml:"sweep_reclaim_depth_mult"`
+	SweepReclaimEntryWindowMinutes int     `yaml:"sweep_reclaim_entry_window_minutes"`
+
+	// Opening-shock parameters. Used only when Strategy is "opening_shock".
+	OpeningShockWindowMinutes int     `yaml:"opening_shock_window_minutes"`
+	OpeningShockLookback      int     `yaml:"opening_shock_lookback"`
+	OpeningShockPercentile    float64 `yaml:"opening_shock_percentile"`
+	OpeningShockStopMult      float64 `yaml:"opening_shock_stop_mult"`
+	OpeningShockEntryDelayMin int     `yaml:"opening_shock_entry_delay_minutes"`
 
 	// DirectionEligibility (Phase 3): place only the trend-aligned side (price vs the
 	// FuturesORBConfig trend EMA) instead of blind dual-sided brackets. false = dual-sided.
@@ -905,31 +964,52 @@ func (fi FuturesInstrument) ToInstrument() Instrument {
 		pointValue = fi.TickValue / fi.TickSize
 	}
 	return Instrument{
-		Symbol:               fi.Symbol,
-		SecType:              "FUT",
-		MinLotSize:           1,
-		PipBuffer:            pipBuffer,
-		PointValue:           pointValue,
-		TickSize:             fi.TickSize,
-		MarginRate:           fi.MarginRate,
-		MaxHoldMinutes:       fi.MaxHoldMinutes,
-		MinRangeATR:          fi.MinRangeATR,
-		MaxRangeATR:          fi.MaxRangeATR,
-		MaxSpreadToRisk:      fi.MaxSpreadToRisk,
-		BreakoutConfirmation: fi.BreakoutConfirmation,
-		RetestTolerance:      fi.RetestTolerance,
-		RetestTimeoutMinutes: fi.RetestTimeoutMinutes,
-		DirectionEligibility: fi.DirectionEligibility,
-		CommissionPerSide:    fi.CommissionPerSide,
-		MaxCommissionToRisk:  fi.MaxCommissionToRisk,
-		RiskMultiplier:       fi.RiskMultiplier,
-		MaxNotionalUSD:       fi.MaxNotionalUSD,
-		BreakEvenR:           fi.BreakEvenR,
-		TrailATRMult:         fi.TrailATRMult,
-		TrailAfterR:          fi.TrailAfterR,
-		PartialTakeProfitR:   fi.PartialTakeProfitR,
-		PartialFraction:      fi.PartialFraction,
-		RunnerTakeProfitR:    fi.RunnerTakeProfitR,
+		Symbol:                         fi.Symbol,
+		SecType:                        "FUT",
+		MinLotSize:                     1,
+		PipBuffer:                      pipBuffer,
+		PointValue:                     pointValue,
+		TickSize:                       fi.TickSize,
+		MarginRate:                     fi.MarginRate,
+		Strategy:                       fi.Strategy,
+		RangeMinutes:                   fi.RangeMinutes,
+		SideMode:                       fi.SideMode,
+		RiskReward:                     fi.RiskReward,
+		MaxHoldMinutes:                 fi.MaxHoldMinutes,
+		MinRangeATR:                    fi.MinRangeATR,
+		MaxRangeATR:                    fi.MaxRangeATR,
+		MaxSpreadToRisk:                fi.MaxSpreadToRisk,
+		BreakoutConfirmation:           fi.BreakoutConfirmation,
+		RetestTolerance:                fi.RetestTolerance,
+		RetestTimeoutMinutes:           fi.RetestTimeoutMinutes,
+		ContinuationDelayMinutes:       fi.ContinuationDelayMinutes,
+		ContinuationConfirmBars:        fi.ContinuationConfirmBars,
+		ContinuationDepthMult:          fi.ContinuationDepthMult,
+		ContinuationTrendFilter:        fi.ContinuationTrendFilter,
+		ContinuationTrendLookbackMin:   fi.ContinuationTrendLookbackMin,
+		ContinuationMinRangePips:       fi.ContinuationMinRangePips,
+		ContinuationMaxRangePips:       fi.ContinuationMaxRangePips,
+		ContinuationExcludeRangePips:   fi.ContinuationExcludeRangePips,
+		ContinuationMonthlyStopLossUSD: fi.ContinuationMonthlyStopLossUSD,
+		SweepReclaimLevelSet:           fi.SweepReclaimLevelSet,
+		SweepReclaimDepthMult:          fi.SweepReclaimDepthMult,
+		SweepReclaimEntryWindowMinutes: fi.SweepReclaimEntryWindowMinutes,
+		OpeningShockWindowMinutes:      fi.OpeningShockWindowMinutes,
+		OpeningShockLookback:           fi.OpeningShockLookback,
+		OpeningShockPercentile:         fi.OpeningShockPercentile,
+		OpeningShockStopMult:           fi.OpeningShockStopMult,
+		OpeningShockEntryDelayMin:      fi.OpeningShockEntryDelayMin,
+		DirectionEligibility:           fi.DirectionEligibility,
+		CommissionPerSide:              fi.CommissionPerSide,
+		MaxCommissionToRisk:            fi.MaxCommissionToRisk,
+		RiskMultiplier:                 fi.RiskMultiplier,
+		MaxNotionalUSD:                 fi.MaxNotionalUSD,
+		BreakEvenR:                     fi.BreakEvenR,
+		TrailATRMult:                   fi.TrailATRMult,
+		TrailAfterR:                    fi.TrailAfterR,
+		PartialTakeProfitR:             fi.PartialTakeProfitR,
+		PartialFraction:                fi.PartialFraction,
+		RunnerTakeProfitR:              fi.RunnerTakeProfitR,
 	}
 }
 
@@ -1576,11 +1656,19 @@ var validBreakoutConfirmation = map[string]bool{
 }
 
 var validInstrumentStrategy = map[string]bool{
-	"": true, "orb": true, "trend_continuation": true,
+	"": true, "orb": true, "trend_continuation": true, "sweep_reclaim": true, "opening_shock": true,
 }
 
 var validTrendContinuationFilter = map[string]bool{
 	"": true, "none": true, "aligned": true, "contrarian": true,
+}
+
+var validStrategySideMode = map[string]bool{
+	"": true, "both": true, "long": true, "short": true,
+}
+
+var validSweepReclaimLevelSet = map[string]bool{
+	"prior_day": true, "overnight": true,
 }
 
 func validRangeBandSpec(s string) error {
@@ -1612,6 +1700,127 @@ func validRangeBandSpec(s string) error {
 		}
 	}
 	return nil
+}
+
+func validateInstrumentStrategyParams(prefix string, inst Instrument, defaultRR float64) []string {
+	var errs []string
+	if !validInstrumentStrategy[inst.Strategy] {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: strategy %q must be one of orb|trend_continuation|sweep_reclaim|opening_shock",
+			prefix, inst.Symbol, inst.Strategy))
+	}
+	if !validStrategySideMode[inst.SideMode] {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: side_mode %q must be one of both|long|short",
+			prefix, inst.Symbol, inst.SideMode))
+	}
+	if inst.RangeMinutes < 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: range_minutes must not be negative",
+			prefix, inst.Symbol))
+	}
+	if inst.RiskReward < 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: risk_reward %.2f must not be negative",
+			prefix, inst.Symbol, inst.RiskReward))
+	}
+	if inst.ContinuationDelayMinutes < 0 || inst.ContinuationConfirmBars < 0 || inst.ContinuationTrendLookbackMin < 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: trend-continuation minute/bar parameters must not be negative",
+			prefix, inst.Symbol))
+	}
+	if inst.ContinuationDepthMult < 0 || inst.ContinuationMinRangePips < 0 || inst.ContinuationMaxRangePips < 0 || inst.ContinuationMonthlyStopLossUSD < 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: trend-continuation numeric thresholds must not be negative",
+			prefix, inst.Symbol))
+	}
+	if inst.ContinuationMaxRangePips > 0 && inst.ContinuationMinRangePips > inst.ContinuationMaxRangePips {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: continuation_min_range_pips must not exceed continuation_max_range_pips",
+			prefix, inst.Symbol))
+	}
+	if !validTrendContinuationFilter[inst.ContinuationTrendFilter] {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: continuation_trend_filter %q must be one of none|aligned|contrarian",
+			prefix, inst.Symbol, inst.ContinuationTrendFilter))
+	}
+	if err := validRangeBandSpec(inst.ContinuationExcludeRangePips); err != nil {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: continuation_exclude_range_pips invalid: %v",
+			prefix, inst.Symbol, err))
+	}
+	if inst.Strategy == "trend_continuation" {
+		if inst.ContinuationDelayMinutes <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: continuation_delay_minutes must be > 0 for trend_continuation",
+				prefix, inst.Symbol))
+		}
+		if inst.ContinuationConfirmBars <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: continuation_confirm_bars must be > 0 for trend_continuation",
+				prefix, inst.Symbol))
+		}
+		if inst.ContinuationDepthMult <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: continuation_depth_mult must be > 0 for trend_continuation",
+				prefix, inst.Symbol))
+		}
+		if (inst.ContinuationTrendFilter == "aligned" || inst.ContinuationTrendFilter == "contrarian") && inst.ContinuationTrendLookbackMin <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: continuation_trend_lookback_minutes must be > 0 when continuation_trend_filter is %q",
+				prefix, inst.Symbol, inst.ContinuationTrendFilter))
+		}
+	}
+	if inst.Strategy == "sweep_reclaim" {
+		if !validSweepReclaimLevelSet[inst.SweepReclaimLevelSet] {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: sweep_reclaim_level_set must be prior_day or overnight",
+				prefix, inst.Symbol))
+		}
+		if inst.SweepReclaimDepthMult <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: sweep_reclaim_depth_mult must be > 0 for sweep_reclaim",
+				prefix, inst.Symbol))
+		}
+		if inst.SweepReclaimEntryWindowMinutes <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: sweep_reclaim_entry_window_minutes must be > 0 for sweep_reclaim",
+				prefix, inst.Symbol))
+		}
+	}
+	if inst.Strategy == "opening_shock" {
+		if inst.OpeningShockWindowMinutes <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: opening_shock_window_minutes must be > 0 for opening_shock",
+				prefix, inst.Symbol))
+		}
+		if inst.OpeningShockLookback <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: opening_shock_lookback must be > 0 for opening_shock",
+				prefix, inst.Symbol))
+		}
+		if inst.OpeningShockPercentile <= 0 || inst.OpeningShockPercentile >= 100 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: opening_shock_percentile must be in (0,100)",
+				prefix, inst.Symbol))
+		}
+		if inst.OpeningShockStopMult <= 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: opening_shock_stop_mult must be > 0 for opening_shock",
+				prefix, inst.Symbol))
+		}
+		if inst.OpeningShockEntryDelayMin < 0 {
+			errs = append(errs, fmt.Sprintf(
+				"%s instrument %q: opening_shock_entry_delay_minutes must not be negative",
+				prefix, inst.Symbol))
+		}
+	}
+	if (inst.Strategy == "trend_continuation" || inst.Strategy == "sweep_reclaim" || inst.Strategy == "opening_shock") && inst.RiskReward <= 0 && defaultRR <= 0 {
+		errs = append(errs, fmt.Sprintf(
+			"%s instrument %q: risk_reward or strategy default risk_reward must be > 0 for %s",
+			prefix, inst.Symbol, inst.Strategy))
+	}
+	return errs
 }
 
 func Validate(cfg *Config) []string {
@@ -1837,67 +2046,11 @@ func Validate(cfg *Config) []string {
 		// of silently disabling the confirmation gate. All five modes are now live-wired
 		// (retest_swing/retest_range entered the live path alongside stop_touch/close_*).
 		for _, inst := range cfg.ForexORB.Instruments {
-			if !validInstrumentStrategy[inst.Strategy] {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: strategy %q must be one of orb|trend_continuation",
-					inst.Symbol, inst.Strategy))
-			}
+			errs = append(errs, validateInstrumentStrategyParams("forex_orb", inst, cfg.ForexORB.RiskReward)...)
 			if !validBreakoutConfirmation[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
 					"forex_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",
 					inst.Symbol, inst.BreakoutConfirmation))
-			}
-			if inst.RiskReward < 0 {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: risk_reward %.2f must not be negative",
-					inst.Symbol, inst.RiskReward))
-			}
-			if inst.ContinuationDelayMinutes < 0 || inst.ContinuationConfirmBars < 0 || inst.ContinuationTrendLookbackMin < 0 {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: trend-continuation minute/bar parameters must not be negative",
-					inst.Symbol))
-			}
-			if inst.ContinuationDepthMult < 0 || inst.ContinuationMinRangePips < 0 || inst.ContinuationMaxRangePips < 0 || inst.ContinuationMonthlyStopLossUSD < 0 {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: trend-continuation numeric thresholds must not be negative",
-					inst.Symbol))
-			}
-			if inst.ContinuationMaxRangePips > 0 && inst.ContinuationMinRangePips > inst.ContinuationMaxRangePips {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: continuation_min_range_pips must not exceed continuation_max_range_pips",
-					inst.Symbol))
-			}
-			if !validTrendContinuationFilter[inst.ContinuationTrendFilter] {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: continuation_trend_filter %q must be one of none|aligned|contrarian",
-					inst.Symbol, inst.ContinuationTrendFilter))
-			}
-			if err := validRangeBandSpec(inst.ContinuationExcludeRangePips); err != nil {
-				errs = append(errs, fmt.Sprintf(
-					"forex_orb instrument %q: continuation_exclude_range_pips invalid: %v",
-					inst.Symbol, err))
-			}
-			if inst.Strategy == "trend_continuation" {
-				if inst.ContinuationDelayMinutes <= 0 {
-					errs = append(errs, fmt.Sprintf(
-						"forex_orb instrument %q: continuation_delay_minutes must be > 0 for trend_continuation",
-						inst.Symbol))
-				}
-				if inst.ContinuationConfirmBars <= 0 {
-					errs = append(errs, fmt.Sprintf(
-						"forex_orb instrument %q: continuation_confirm_bars must be > 0 for trend_continuation",
-						inst.Symbol))
-				}
-				if inst.ContinuationDepthMult <= 0 {
-					errs = append(errs, fmt.Sprintf(
-						"forex_orb instrument %q: continuation_depth_mult must be > 0 for trend_continuation",
-						inst.Symbol))
-				}
-				if (inst.ContinuationTrendFilter == "aligned" || inst.ContinuationTrendFilter == "contrarian") && inst.ContinuationTrendLookbackMin <= 0 {
-					errs = append(errs, fmt.Sprintf(
-						"forex_orb instrument %q: continuation_trend_lookback_minutes must be > 0 when continuation_trend_filter is %q",
-						inst.Symbol, inst.ContinuationTrendFilter))
-				}
 			}
 			// Close-position guard: the threshold is compared against CloseFrac, which is
 			// normalised to [0,1]. A value >= 1 makes the buy condition (CloseFrac >= t)
@@ -1968,6 +2121,7 @@ func Validate(cfg *Config) []string {
 			continue
 		}
 		for _, inst := range cfgFut.Instruments {
+			errs = append(errs, validateInstrumentStrategyParams("futures_orb", inst.ToInstrument(), cfgFut.RiskReward)...)
 			if !validBreakoutConfirmation[inst.BreakoutConfirmation] {
 				errs = append(errs, fmt.Sprintf(
 					"futures_orb instrument %q: breakout_confirmation %q must be one of stop_touch|close_1m|close_3m|retest_swing|retest_range",

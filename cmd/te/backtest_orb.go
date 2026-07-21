@@ -264,7 +264,8 @@ const (
 )
 
 func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketDataProvider, providerName string) (*backtestUniverse, error) {
-	if len(fcfg.Instruments) == 0 {
+	futuresInstruments := researchFuturesInstruments(fcfg.Instruments)
+	if len(futuresInstruments) == 0 {
 		return nil, fmt.Errorf("no futures_orb instruments configured")
 	}
 	providerProxies, ok := futuresProxiesByProvider[providerName]
@@ -272,7 +273,7 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 		return nil, fmt.Errorf("--asset-class futures has no index-CFD proxy mapping for provider %q (use histdata, dukascopy, or exness)", providerName)
 	}
 	available := make([]string, 0, len(providerProxies))
-	for _, fi := range fcfg.Instruments {
+	for _, fi := range futuresInstruments {
 		if _, ok := providerProxies[fi.Symbol]; ok {
 			available = append(available, fi.Symbol)
 		}
@@ -287,7 +288,7 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 	var instruments []config.Instrument
 	costs := make(map[string]orbreplay.CostModel)
 	proxies := make(map[string]string)
-	for _, fi := range fcfg.Instruments {
+	for _, fi := range futuresInstruments {
 		if len(want) > 0 && !want[fi.Symbol] {
 			continue
 		}
@@ -339,6 +340,35 @@ func buildFuturesUniverse(fcfg config.FuturesORBConfig, provider data.MarketData
 		provider: proxySymbolProvider{MarketDataProvider: provider, proxies: proxies},
 		sessions: []string{"newyork_et"},
 	}, nil
+}
+
+// researchFuturesInstruments makes the backtest/research universe broader than the
+// currently armed live config. User-configured contracts override defaults, while
+// default micro-index contracts remain available for historical research.
+func researchFuturesInstruments(configured []config.FuturesInstrument) []config.FuturesInstrument {
+	defaults := config.Defaults().FuturesORB.Instruments
+	bySymbol := make(map[string]config.FuturesInstrument, len(defaults)+len(configured))
+	order := make([]string, 0, len(defaults)+len(configured))
+	add := func(inst config.FuturesInstrument) {
+		if inst.Symbol == "" {
+			return
+		}
+		if _, ok := bySymbol[inst.Symbol]; !ok {
+			order = append(order, inst.Symbol)
+		}
+		bySymbol[inst.Symbol] = inst
+	}
+	for _, inst := range defaults {
+		add(inst)
+	}
+	for _, inst := range configured {
+		add(inst)
+	}
+	out := make([]config.FuturesInstrument, 0, len(order))
+	for _, sym := range order {
+		out = append(out, bySymbol[sym])
+	}
+	return out
 }
 
 // proxySymbolProvider translates instrument symbols to their proxy data series on fetch,
