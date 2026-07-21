@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -204,6 +205,56 @@ func TestHandlePortfolioHistory_BrokerEquityCurve(t *testing.T) {
 	alpaca := resp["alpaca"].([]any)
 	if len(alpaca) != 2 {
 		t.Errorf("alpaca points: want 2, got %d", len(alpaca))
+	}
+}
+
+// Alpaca pads long windows (period=1A on a young account) with equity=0 bars
+// for every day before the account existed. Those are not real readings — the
+// handler must drop them so the chart starts at account inception instead of
+// drawing a flat $0 line across the pre-history.
+func TestHandlePortfolioHistory_DropsZeroEquityPadding(t *testing.T) {
+	bv := &stubBrokerView{
+		history: execution.EquityHistory{
+			Period:    "1A",
+			Timeframe: "1D",
+			BaseValue: 100_000,
+			Points: []execution.EquityPoint{
+				// Pre-inception padding.
+				{Time: time.Date(2025, 7, 22, 0, 0, 0, 0, time.UTC), Equity: 0},
+				{Time: time.Date(2025, 8, 1, 0, 0, 0, 0, time.UTC), Equity: 0},
+				// Real history.
+				{Time: time.Date(2026, 2, 26, 0, 0, 0, 0, time.UTC), Equity: 100_000},
+				// Interior gap — also dropped; the chart connects across it.
+				{Time: time.Date(2026, 2, 27, 0, 0, 0, 0, time.UTC), Equity: 0},
+				{Time: time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC), Equity: 102_000},
+			},
+		},
+	}
+	srv := NewServer(Config{}, nil, nil)
+	srv.SetBrokerView(stubCache(bv))
+
+	w := httptest.NewRecorder()
+	srv.handlePortfolioHistory(w, httptest.NewRequest("GET", "/api/portfolio/history?period=1A&timeframe=1D", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	alpaca := resp["alpaca"].([]any)
+	if len(alpaca) != 2 {
+		t.Fatalf("alpaca points: want 2 (zeros dropped), got %d", len(alpaca))
+	}
+	first := alpaca[0].(map[string]any)
+	if got := first["t"].(string); !strings.HasPrefix(got, "2026-02-26") {
+		t.Errorf("series must start at account inception, got %q", got)
+	}
+	for i, p := range alpaca {
+		if v := p.(map[string]any)["v"].(float64); v == 0 {
+			t.Errorf("point %d has zero equity; padding was not dropped", i)
+		}
 	}
 }
 

@@ -77,6 +77,28 @@ function fmt$(n: number) {
   return '$' + (n / 1000).toFixed(1) + 'K';
 }
 
+// Recharts' default numeric domain is anchored at 0, which renders a portfolio
+// oscillating between $99K and $103K as a dead-flat line pinned to the top of a
+// $0–$120K axis. Fit the axis to the visible series instead, with 8% headroom
+// so the curve doesn't touch the frame.
+function equityDomain(
+  data: Array<{ alpaca?: number; te?: number }>,
+  showAlpaca: boolean,
+  showTE: boolean,
+): [number, number] | undefined {
+  const vals: number[] = [];
+  for (const d of data) {
+    if (showAlpaca && d.alpaca != null) vals.push(d.alpaca);
+    if (showTE && d.te != null) vals.push(d.te);
+  }
+  if (vals.length === 0) return undefined;
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  // A perfectly flat series would give a zero-height band — pad it to ±1%.
+  const pad = max === min ? Math.abs(max) * 0.01 || 1 : (max - min) * 0.08;
+  return [min - pad, max + pad];
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function CustomTooltip({ active, payload, label }: any) {
   if (!active || !payload?.length) return null;
@@ -122,6 +144,11 @@ export default function OverlayChart({ alpaca, tradeEngine, mode }: OverlayChart
   const showAlpaca = mode === 'overlay' || mode === 'alpaca';
   const showTE     = mode === 'overlay' || mode === 'te';
 
+  const domain = useMemo(
+    () => equityDomain(data, showAlpaca, showTE),
+    [data, showAlpaca, showTE],
+  );
+
   return (
     <div className={styles.wrapper} aria-label="Portfolio equity chart">
       <ResponsiveContainer width="100%" height="100%">
@@ -144,6 +171,7 @@ export default function OverlayChart({ alpaca, tradeEngine, mode }: OverlayChart
             tickLine={false}
           />
           <YAxis
+            domain={domain ?? ['auto', 'auto']}
             tickFormatter={fmt$}
             tick={{ fontFamily: 'var(--font-mono)', fontSize: 10, fill: TOKENS.textFaint }}
             axisLine={false}

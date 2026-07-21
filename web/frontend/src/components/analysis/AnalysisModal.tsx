@@ -75,6 +75,7 @@ interface AnalysisDetail {
   AnalystResults?: AnalystResult[] | null;
 }
 
+
 export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
   // Heavy JSONB fields (ArbiterReasoning, AnalystResults) are trimmed from
@@ -129,6 +130,14 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
   const confPct = (analysis.Confidence * 100).toFixed(0);
   const action = analysis.Action.toUpperCase();
+
+  // DissentSummary is not independent content: the arbiter prompt asks the
+  // model to BEGIN its reasoning with "DISSENT:" (ensemble.go), and
+  // extractDissent stores everything after that marker. It is therefore always
+  // a substring of the reasoning body rendered below — printing it again
+  // duplicated the entire summary. Surface it as a header badge instead, so the
+  // "analysts disagreed" signal survives without the repetition.
+  const hasDissent = !!analysis.DissentSummary;
 
   return (
     <>
@@ -192,19 +201,16 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
           {/* Full Reasoning — prefer arbiter text (loaded from /api/analyses/{id});
               fall back to top-level Reasoning while detail is loading or absent. */}
           <div className={styles.section}>
-            <div className={styles.sectionLabel}>FULL REASONING</div>
+            <div className={styles.sectionLabel}>
+              FULL REASONING
+              {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
+            </div>
             {detail?.ArbiterReasoning ? (
               <div className={styles.reasoning}>{detail.ArbiterReasoning}</div>
             ) : detailLoading ? (
               <div className={styles.reasoning} aria-busy="true">Loading reasoning…</div>
             ) : (
               <div className={styles.reasoning}>{analysis.Reasoning}</div>
-            )}
-            {analysis.DissentSummary && (
-              <div className={styles.dissentBlock}>
-                <span className={styles.dissentLabel}>DISSENT</span>
-                <div className={styles.reasoning}>{analysis.DissentSummary}</div>
-              </div>
             )}
           </div>
 
