@@ -281,6 +281,7 @@ type adoptionStore interface {
 	// UpdateTradeTrailing pre-seeds the recovery row's high-water mark
 	// (stopLoss 0 leaves the stop untouched — see store.UpdateTradeTrailing).
 	UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error
+	GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]store.Signal, error)
 }
 
 type adoptionStoreAdapter struct{}
@@ -291,6 +292,10 @@ func (adoptionStoreAdapter) InsertTrade(ctx context.Context, t store.Trade) (str
 
 func (adoptionStoreAdapter) UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error {
 	return store.UpdateTradeTrailing(ctx, id, stopLoss, highWaterMark)
+}
+
+func (adoptionStoreAdapter) GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]store.Signal, error) {
+	return store.GetSignalsByTicker(ctx, ticker, limit)
 }
 
 // AdoptBrokerOrphans inserts recovery trade rows for broker positions the DB
@@ -330,6 +335,18 @@ func AdoptBrokerOrphans(ctx context.Context, db adoptionStore, drifts []BrokerDr
 			qty = math.Copysign(surplus, d.BrokerQty)
 		default:
 			continue
+		}
+
+		if qty < 0 {
+			if action, ok := latestLiveSignalAction(ctx, db, d.Ticker); !ok || action != "SELL" {
+				logger.Warn("orphan adoption: broker-only short lacks matching short intent — leaving as drift",
+					"ticker", d.Ticker,
+					"broker_qty", d.BrokerQty,
+					"db_qty", d.DBQty,
+					"source", d.Source,
+				)
+				continue
+			}
 		}
 
 		direction := "long"
@@ -392,6 +409,25 @@ func AdoptBrokerOrphans(ctx context.Context, db adoptionStore, drifts []BrokerDr
 		adopted = append(adopted, d.Ticker)
 	}
 	return adopted
+}
+
+// latestLiveSignalAction returns the newest BUY/SELL signal that still
+// represents live intent. Blocked/expired/stale rows are ignored.
+func latestLiveSignalAction(ctx context.Context, db adoptionStore, ticker string) (string, bool) {
+	signals, err := db.GetSignalsByTicker(ctx, ticker, 10)
+	if err != nil {
+		return "", false
+	}
+	for _, sig := range signals {
+		switch strings.ToLower(sig.Status) {
+		case "pending", "approved", "executed":
+			action := strings.ToUpper(strings.TrimSpace(sig.Action))
+			if action == "BUY" || action == "SELL" {
+				return action, true
+			}
+		}
+	}
+	return "", false
 }
 
 // AdoptBrokerOrphansWithStore is the production wrapper over AdoptBrokerOrphans.

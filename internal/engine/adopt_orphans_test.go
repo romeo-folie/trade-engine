@@ -10,6 +10,7 @@ import (
 type fakeAdoptionStore struct {
 	inserted []store.Trade
 	hwmSeeds map[string]float64 // trade id → seeded high-water mark
+	signals  map[string][]store.Signal
 }
 
 func (f *fakeAdoptionStore) InsertTrade(_ context.Context, t store.Trade) (string, error) {
@@ -28,13 +29,30 @@ func (f *fakeAdoptionStore) UpdateTradeTrailing(_ context.Context, id string, st
 	return nil
 }
 
+func (f *fakeAdoptionStore) GetSignalsByTicker(_ context.Context, ticker string, limit int) ([]store.Signal, error) {
+	if f.signals == nil {
+		return nil, nil
+	}
+	sigs := f.signals[ticker]
+	if len(sigs) > limit {
+		sigs = sigs[:limit]
+	}
+	return sigs, nil
+}
+
 // AdoptBrokerOrphans: broker_only adopts in full; a same-direction mismatch
 // adopts only the untracked surplus; over-recorded DB and side_mismatch/db_only
 // are never adopted. Stops anchor on the broker's CURRENT price so a deep
 // underwater orphan (NOK: entry 16.69, current 11.78) is not instantly
 // stopped out at market on the first monitor pass.
 func TestAdoptBrokerOrphans(t *testing.T) {
-	fs := &fakeAdoptionStore{}
+	fs := &fakeAdoptionStore{
+		signals: map[string][]store.Signal{
+			"SHRT": {
+				{Ticker: "SHRT", Action: "SELL", Status: "executed"},
+			},
+		},
+	}
 	drifts := []BrokerDrift{
 		// NOK shape: full orphan, deep underwater.
 		{Ticker: "NOK", BrokerQty: 178.009073, DBQty: 0, Source: "broker_only", AvgEntryPrice: 16.6925, CurrentPrice: 11.775},
@@ -110,5 +128,20 @@ func TestAdoptBrokerOrphans(t *testing.T) {
 	}
 	if _, seeded := fs.hwmSeeds["trade-NOPX"]; seeded {
 		t.Error("no-current-price adoption must not seed an HWM")
+	}
+}
+
+func TestAdoptBrokerOrphans_ShortWithoutIntentStaysUnadopted(t *testing.T) {
+	fs := &fakeAdoptionStore{}
+	drifts := []BrokerDrift{
+		{Ticker: "PHANTOM", BrokerQty: -25, DBQty: 0, Source: "broker_only", AvgEntryPrice: 10, CurrentPrice: 9},
+	}
+
+	adopted := AdoptBrokerOrphans(context.Background(), fs, drifts, 2.0, 4.0)
+	if len(adopted) != 0 {
+		t.Fatalf("adopted = %v, want none", adopted)
+	}
+	if len(fs.inserted) != 0 {
+		t.Fatalf("expected no recovery trade insert, got %+v", fs.inserted)
 	}
 }
