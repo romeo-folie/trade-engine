@@ -87,3 +87,19 @@ func (e *Engine) cancelProtectiveStopForResize(ctx context.Context, existing sto
 	}
 	return nil
 }
+
+// advanceProtectedQuantity records coverage only after the broker operation
+// succeeds. Leaving the prior quantity unchanged on error makes the next fill
+// poll retry an otherwise-identical partial or terminal fill.
+func advanceProtectedQuantity(
+	protectedQty, filledQty float64,
+	ensure func() error,
+) (float64, error) {
+	if filledQty <= protectedQty {
+		return protectedQty, nil
+	}
+	if err := ensure(); err != nil {
+		return protectedQty, err
+	}
+	return filledQty, nil
+}

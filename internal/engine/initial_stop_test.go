@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -95,5 +96,37 @@ func TestEnsureUncappedProtectiveStopGrowsWithPartialFill(t *testing.T) {
 	}
 	if stop.BrokerOrderID != "full-stop" || stop.Quantity != 5 {
 		t.Fatalf("full stop = %+v", stop)
+	}
+}
+
+func TestAdvanceProtectedQuantityRetriesFailedCoverage(t *testing.T) {
+	attempts := 0
+	ensure := func() error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("temporary cancel confirmation failure")
+		}
+		return nil
+	}
+
+	protected, err := advanceProtectedQuantity(2, 5, ensure)
+	if err == nil {
+		t.Fatal("first coverage attempt unexpectedly succeeded")
+	}
+	if protected != 2 {
+		t.Fatalf("failed coverage advanced quantity to %v, want 2", protected)
+	}
+
+	protected, err = advanceProtectedQuantity(protected, 5, ensure)
+	if err != nil {
+		t.Fatalf("retry coverage: %v", err)
+	}
+	if protected != 5 || attempts != 2 {
+		t.Fatalf("retry produced protected=%v attempts=%d, want 5/2", protected, attempts)
+	}
+
+	protected, err = advanceProtectedQuantity(protected, 5, ensure)
+	if err != nil || protected != 5 || attempts != 2 {
+		t.Fatalf("already-covered fill retried: protected=%v attempts=%d err=%v", protected, attempts, err)
 	}
 }

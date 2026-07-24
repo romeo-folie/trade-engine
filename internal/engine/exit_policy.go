@@ -16,11 +16,19 @@ func uncappedTakeProfitEnabled(risk config.RiskConfig, side execution.OrderSide)
 		risk.TrailingStop.Enabled
 }
 
-// resolveUncappedEntry keeps the uncapped/GTC-protected path on whole shares.
-// Alpaca rejects GTC stops for fractional equity quantities, so quantities
-// below one share fail safe to the baseline fixed-TP/software-exit behavior.
-func resolveUncappedEntry(risk config.RiskConfig, side execution.OrderSide, quantity float64) (bool, float64) {
+// resolveUncappedEntry keeps the uncapped/GTC-protected path on whole shares
+// with a coherent hard stop. Alpaca rejects GTC stops for fractional equity
+// quantities, and removing the TP without a usable stop would leave the
+// position unprotected, so either condition fails safe to baseline behavior.
+func resolveUncappedEntry(
+	risk config.RiskConfig,
+	side execution.OrderSide,
+	quantity, signalPrice, stopLoss float64,
+) (bool, float64) {
 	if !uncappedTakeProfitEnabled(risk, side) {
+		return false, quantity
+	}
+	if signalPrice <= 0 || stopLoss <= 0 || stopLoss >= signalPrice {
 		return false, quantity
 	}
 	whole := math.Floor(quantity)

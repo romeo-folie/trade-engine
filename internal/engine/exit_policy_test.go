@@ -39,7 +39,7 @@ func TestUncappedTakeProfitDisablesBrokerAndSoftwareCaps(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 5.8)
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 5.8, 100, 95)
 	if !active || qty != 5 {
 		t.Fatalf("uncapped entry active=%v qty=%v, want true/5 whole shares", active, qty)
 	}
@@ -67,7 +67,7 @@ func TestUncappedFractionalEntryFailsSafeToBaseline(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 0.75)
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 0.75, 100, 95)
 	if active {
 		t.Fatal("sub-one-share entry must not activate uncapped/GTC policy")
 	}
@@ -76,6 +76,30 @@ func TestUncappedFractionalEntryFailsSafeToBaseline(t *testing.T) {
 	}
 	if got := persistedTakeProfit(110, active); got != 110 {
 		t.Fatalf("fallback take profit = %v, want baseline 110", got)
+	}
+}
+
+func TestUncappedEntryRequiresCoherentHardStop(t *testing.T) {
+	risk := config.RiskConfig{
+		UncapTakeProfit: true,
+		TrailingStop: config.TrailingStopConfig{
+			Enabled: true,
+			Rule:    "ema9",
+		},
+	}
+	for _, stopLoss := range []float64{0, -1, 100, 105} {
+		active, qty := resolveUncappedEntry(
+			risk, execution.OrderSideBuy, 5, 100, stopLoss,
+		)
+		if active {
+			t.Fatalf("stop loss %v activated uncapped entry", stopLoss)
+		}
+		if qty != 5 {
+			t.Fatalf("stop loss %v changed fallback quantity to %v", stopLoss, qty)
+		}
+		if got := persistedTakeProfit(110, active); got != 110 {
+			t.Fatalf("stop loss %v removed baseline take profit", stopLoss)
+		}
 	}
 }
 

@@ -2001,13 +2001,17 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// trail owns the winning exit. Keeping the manager requirement here makes
 	// an accidentally-partial config fail safe to the existing fixed TP.
 	uncapRequested := uncappedTakeProfitEnabled(e.cfg.Risk, side)
-	uncapTakeProfit, uncappedQty := resolveUncappedEntry(e.cfg.Risk, side, qty)
+	uncapTakeProfit, uncappedQty := resolveUncappedEntry(
+		e.cfg.Risk, side, qty, sig.SignalPrice, sig.StopLoss,
+	)
 	if uncapTakeProfit {
 		orderReq.Quantity = uncappedQty
 	} else if uncapRequested {
-		logger.Warn("exit policy: uncapped entry sized under one whole share; keeping baseline fixed take-profit",
+		logger.Warn("exit policy: uncapped entry lacks whole-share sizing or a coherent hard stop; keeping baseline fixed take-profit",
 			"ticker", sig.Ticker,
 			"qty", qty,
+			"signal_price", sig.SignalPrice,
+			"stop_loss", sig.StopLoss,
 		)
 	}
 
@@ -2181,21 +2185,25 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					logger.Warn("fill poll: update order fill price",
 						"broker_order_id", brokerOrderID, "err", err)
 				}
-				if uncapTakeProfit && status.FilledQty > 0 {
-					if err := e.ensureUncappedProtectiveStop(
-						bfCtx, tradeID, sig.Ticker, status.FilledQty, sig.StopLoss,
-					); err != nil {
-						logger.Error("fill poll: uncapped position lacks full broker-stop coverage",
-							"trade_id", tradeID,
-							"ticker", sig.Ticker,
-							"filled_qty", status.FilledQty,
-							"stop_loss", sig.StopLoss,
-							"err", err,
-						)
-					}
-				}
 			}
-			var lastQty float64
+			protect := func(status execution.OrderResult) error {
+				bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer bfCancel()
+				if err := e.ensureUncappedProtectiveStop(
+					bfCtx, tradeID, sig.Ticker, status.FilledQty, sig.StopLoss,
+				); err != nil {
+					logger.Error("fill poll: uncapped position lacks full broker-stop coverage",
+						"trade_id", tradeID,
+						"ticker", sig.Ticker,
+						"filled_qty", status.FilledQty,
+						"stop_loss", sig.StopLoss,
+						"err", err,
+					)
+					return err
+				}
+				return nil
+			}
+			var lastRecordedQty, lastProtectedQty float64
 			for i := 0; i < maxRetries; i++ {
 				time.Sleep(retryDelay)
 				pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2206,18 +2214,39 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 						"broker_order_id", brokerOrderID, "attempt", i+1, "err", err)
 					continue
 				}
-				if status.FilledPrice > 0 && status.FilledQty != lastQty {
+				if status.FilledPrice > 0 && status.FilledQty != lastRecordedQty {
 					backfill(status)
-					lastQty = status.FilledQty
+					lastRecordedQty = status.FilledQty
+				}
+				if uncapTakeProfit && status.FilledQty > lastProtectedQty {
+					// Protection progress is deliberately independent from
+					// fill persistence. A transient resize error leaves this
+					// quantity behind so the next identical poll retries it.
+					nextProtectedQty, err := advanceProtectedQuantity(
+						lastProtectedQty, status.FilledQty,
+						func() error { return protect(status) },
+					)
+					if err == nil {
+						lastProtectedQty = nextProtectedQty
+					}
 				}
 				if execution.IsTerminalOrderStatus(status.Status) {
-					if status.FilledQty == 0 && lastQty == 0 {
+					if status.FilledQty == 0 && lastRecordedQty == 0 {
 						// Terminal with ZERO fill (expired / cancelled /
 						// rejected): the entry never happened. Without this,
 						// the qty-0 row stayed "open" forever — the IREN/MU/
 						// TSLA phantom rows that inflated the position count.
 						e.cancelUnfilledEntry(tradeID, brokerOrderID, sig.Ticker)
 						return
+					}
+					if uncapTakeProfit && status.FilledQty > lastProtectedQty {
+						logger.Warn("fill poll: terminal fill still lacks full broker-stop coverage; retrying",
+							"trade_id", tradeID,
+							"ticker", sig.Ticker,
+							"filled_qty", status.FilledQty,
+							"protected_qty", lastProtectedQty,
+						)
+						continue
 					}
 					logger.Info("fill poll: order terminal",
 						"trade_id", tradeID,
@@ -2231,7 +2260,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				logger.Debug("fill poll: order not terminal yet, retrying",
 					"broker_order_id", brokerOrderID, "attempt", i+1, "status", status.Status, "filled_qty", status.FilledQty)
 			}
-			if lastQty == 0 {
+			if lastRecordedQty == 0 {
 				// Two minutes of polling an in-hours market order with zero
 				// fill: something is wrong. Cancel rather than leave a qty-0
 				// "open" trade the position counter treats as real.
@@ -2242,7 +2271,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"trade_id", tradeID,
 				"broker_order_id", brokerOrderID,
 				"ticker", sig.Ticker,
-				"last_filled_qty", lastQty,
+				"last_filled_qty", lastRecordedQty,
+				"protected_qty", lastProtectedQty,
 			)
 		}()
 	}
