@@ -184,7 +184,11 @@ func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnl
 	return nil
 }
 
-func (f *fakeStore) UpdateOrderStopPriceAndID(_ context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+func (f *fakeStore) UpdateOrderStopPriceAndID(
+	_ context.Context,
+	orderID, newBrokerOrderID string,
+	newStopPrice, newQuantity float64,
+) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o, ok := f.orders[orderID]
@@ -192,6 +196,7 @@ func (f *fakeStore) UpdateOrderStopPriceAndID(_ context.Context, orderID, newBro
 		return errors.New("order not found")
 	}
 	o.StopPrice = newStopPrice
+	o.Quantity = newQuantity
 	if newBrokerOrderID != "" {
 		o.BrokerOrderID = newBrokerOrderID
 	}
@@ -475,6 +480,38 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 5,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "partial-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100)}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+
+	m.UpdateAll(context.Background())
+
+	if len(fb.cancelled) != 1 || fb.cancelled[0] != "partial-stop" {
+		t.Fatalf("cancelled = %v, want partial-stop", fb.cancelled)
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Quantity != 5 {
+		t.Fatalf("replacement stop = %+v, want quantity 5", fb.placed)
+	}
+	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || stop == nil {
+		t.Fatalf("LatestStopLossOrderForTrade: %v (nil=%v)", err, stop == nil)
+	}
+	if stop.Quantity != 5 {
+		t.Fatalf("stored stop quantity = %v, want 5", stop.Quantity)
+	}
+}
+
 func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
@@ -652,6 +689,30 @@ func TestManager_FirstTickSeedsHWM(t *testing.T) {
 	}
 	if got < 100 {
 		t.Fatalf("HWM should be >= entry_price (100), got %v", got)
+	}
+}
+
+func TestManager_ATRDoesNotSubmitZeroPriceStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 0, Quantity: 10,
+	}
+	candles := make([]data.Candle, 30)
+	for i := range candles {
+		candles[i] = candle(100, 100, 100, 100)
+	}
+	fp := &fakePrices{candles: candles}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("zero-price ATR input placed broker orders: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].HighWaterMark; got != 100 {
+		t.Fatalf("high-water mark = %v, want 100 preserved for retry", got)
 	}
 }
 
@@ -1103,7 +1164,7 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	if _, err := ls.InsertOrder(ctx, store.Order{}); err == nil {
 		t.Fatalf("InsertOrder(no DB): want error, got nil")
 	}
-	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0); err == nil {
+	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0, 1.0); err == nil {
 		t.Fatalf("UpdateOrderStopPriceAndID(no DB): want error, got nil")
 	}
 	if err := ls.CloseTrade(ctx, "t1", 100, 1, 1); err == nil {

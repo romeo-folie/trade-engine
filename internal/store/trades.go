@@ -138,18 +138,22 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 	return &out[0], nil
 }
 
-// UpdateOrderStopPriceAndID updates the stop price and broker order id of an
-// existing order row. The trailing-stop manager (#322) calls this after
-// successfully replacing the broker STOP — Alpaca returns a fresh order id
-// on PATCH so we have to track the new id.
-func UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+// UpdateOrderStopPriceAndID updates the stop price, quantity, and broker order
+// id of an existing order row. The trailing-stop manager (#322) calls this
+// after replacing or resizing the broker STOP.
+func UpdateOrderStopPriceAndID(
+	ctx context.Context,
+	orderID, newBrokerOrderID string,
+	newStopPrice, newQuantity float64,
+) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
+		    quantity = $3,
 		    updated_at = NOW()
-		WHERE id = $3`,
-		newStopPrice, newBrokerOrderID, orderID)
+		WHERE id = $4`,
+		newStopPrice, newBrokerOrderID, newQuantity, orderID)
 	return err
 }
 

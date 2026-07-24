@@ -115,7 +115,7 @@ type TradeStore interface {
 	// exit or the broker rejects the sell for insufficient free quantity.
 	OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]store.Order, error)
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
-	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error
+	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
 	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
 	// + closed_at. Called after a successful trail-driven market exit so the
 	// trade isn't picked up again on the next tick (which would place a
@@ -302,6 +302,16 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	newStop = roundToTick(newStop, dp)
 	persistedStop := roundToTick(t.StopLoss, dp)
 
+	if newStop <= 0 {
+		// A missing original stop plus unavailable/zero ATR cannot produce a
+		// valid broker order. Preserve the HWM and retry when price history can
+		// derive a positive stop instead of submitting stop_price=0 every tick.
+		if hwm != t.HighWaterMark {
+			return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
+		}
+		return nil
+	}
+
 	// If the trail says we should already be out (stop ≥ current price)
 	// the broker stop would fill instantly anyway. Don't leave a stale stop
 	// sitting at the old price — exit at market immediately so the band's
@@ -331,7 +341,8 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	if err != nil {
 		return fmt.Errorf("lookup protective stop: %w", err)
 	}
-	if newStop != persistedStop || existingStop == nil {
+	if newStop != persistedStop || existingStop == nil ||
+		stopQuantityDiffers(existingStop, t.Quantity) {
 		if err := m.submitOrReplaceStop(ctx, t, newStop); err != nil {
 			// Persist HWM even on broker failure so the next tick has the
 			// updated baseline; log WARN and retry next tick.
@@ -430,12 +441,16 @@ func (m *Manager) ensureProtectiveStop(ctx context.Context, t store.Trade) error
 	if err != nil {
 		return fmt.Errorf("lookup protective stop: %w", err)
 	}
-	if existing == nil {
+	if existing == nil || stopQuantityDiffers(existing, t.Quantity) {
 		if err := m.submitOrReplaceStop(ctx, t, t.StopLoss); err != nil {
-			return fmt.Errorf("seed protective stop: %w", err)
+			return fmt.Errorf("seed/resize protective stop: %w", err)
 		}
 	}
 	return nil
+}
+
+func stopQuantityDiffers(existing *store.Order, quantity float64) bool {
+	return existing != nil && math.Abs(existing.Quantity-quantity) > 1e-9
 }
 
 // priceAndATR fetches recent 1h candles and returns (last close, ATR).
@@ -566,11 +581,14 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 
 	side := execution.OrderSideSell // long-only scope: exit a long via SELL
 	if existing != nil && existing.BrokerOrderID != "" {
+		quantityChanged := stopQuantityDiffers(existing, t.Quantity)
 		// Replace path — atomic on the broker side, no double-stop window.
-		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok {
+		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok && !quantityChanged {
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
-				return m.store.UpdateOrderStopPriceAndID(ctx, existing.ID, res.BrokerOrderID, newStop)
+				return m.store.UpdateOrderStopPriceAndID(
+					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
+				)
 			}
 			if existing.ParentOrderID != "" {
 				// Bracket child leg (#435): cancel+resubmit is FORBIDDEN —
@@ -610,7 +628,9 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
-		return m.store.UpdateOrderStopPriceAndID(ctx, existing.ID, res.BrokerOrderID, newStop)
+		return m.store.UpdateOrderStopPriceAndID(
+			ctx, existing.ID, res.BrokerOrderID, newStop, t.Quantity,
+		)
 	}
 	_, err = m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,

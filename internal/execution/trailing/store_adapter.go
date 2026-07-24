@@ -64,11 +64,17 @@ func (liveStore) InsertOrder(ctx context.Context, o store.Order) (string, error)
 	return store.InsertOrder(ctx, o)
 }
 
-func (liveStore) UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+func (liveStore) UpdateOrderStopPriceAndID(
+	ctx context.Context,
+	orderID, newBrokerOrderID string,
+	newStopPrice, newQuantity float64,
+) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected
 	}
-	return store.UpdateOrderStopPriceAndID(ctx, orderID, newBrokerOrderID, newStopPrice)
+	return store.UpdateOrderStopPriceAndID(
+		ctx, orderID, newBrokerOrderID, newStopPrice, newQuantity,
+	)
 }
 
 func (liveStore) CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
