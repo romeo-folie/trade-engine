@@ -213,6 +213,7 @@ Modes:
 					ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
 					Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
 					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
+					MarketOpen:  engine.IsMarketOpen,
 				}
 				mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
 				go mgr.Run(ctx)

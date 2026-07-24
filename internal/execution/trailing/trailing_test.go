@@ -428,6 +428,9 @@ func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
 	fb := &fakeBroker{}
 
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
 	m.UpdateAll(context.Background())
 
 	if fp.lastTF != data.Timeframe1Day {
@@ -456,6 +459,9 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	fb := &fakeBroker{}
 
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
 	m.UpdateAll(context.Background())
 
 	if fs.trades["t1"].Status != "closed" {
@@ -466,6 +472,90 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	}
 	if got := fs.trades["t1"].ExitPrice; got != 90 {
 		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
+	}
+}
+
+func TestManager_EMA9AfterCloseKeepsHardStopUntilNextSession(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 16, 5, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("after-close EMA signal must leave trade tracked overnight")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("after-close orders = %+v, want only the protective stop", fb.placed)
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("after-close stop was cancelled: %v", fb.cancelled)
+	}
+
+	// The same completed-close signal is retried during the next regular
+	// session. Only then may the manager cancel the stop and market-exit.
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 27, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "closed" {
+		t.Fatal("EMA signal must exit during the next regular session")
+	}
+	if len(fb.cancelled) != 1 {
+		t.Fatalf("cancelled = %v, want protective stop cancelled at eligible exit", fb.cancelled)
+	}
+	if len(fb.placed) != 2 || fb.placed[1].Type != execution.OrderTypeMarket {
+		t.Fatalf("orders = %+v, want stop followed by market exit", fb.placed)
+	}
+}
+
+func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{}
+	m := NewManager(Config{
+		Enabled: true,
+		Rule:    RuleEMA9,
+		MarketOpen: func(time.Time) bool {
+			return false // e.g. an exchange holiday during normal clock hours
+		},
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 3, 10, 0, 0, 0, newYorkLocation)
+	}
+
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("closed-calendar EMA signal must remain tracked")
+	}
+	if len(fb.placed) != 0 || len(fb.cancelled) != 0 {
+		t.Fatalf("closed-calendar manager touched broker orders: placed=%+v cancelled=%v", fb.placed, fb.cancelled)
+	}
+}
+
+func TestProtectiveStopTIF(t *testing.T) {
+	if got := protectiveStopTIF(10); got != "gtc" {
+		t.Fatalf("whole-share TIF = %q, want gtc", got)
+	}
+	if got := protectiveStopTIF(10.5); got != "day" {
+		t.Fatalf("fractional TIF = %q, want day", got)
 	}
 }
 

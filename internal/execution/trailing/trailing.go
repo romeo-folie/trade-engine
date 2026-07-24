@@ -131,6 +131,10 @@ type Config struct {
 	ATRMultiple float64
 	Interval    time.Duration
 	ATRPeriod   int
+	// MarketOpen is the production market-calendar predicate. The command
+	// wiring supplies engine.IsMarketOpen (including exchange holidays);
+	// tests and other callers fall back to regular weekday session hours.
+	MarketOpen func(time.Time) bool
 }
 
 // Normalize fills in defaults so callers can hand the manager a partially
@@ -154,19 +158,28 @@ func (c Config) Normalize() Config {
 
 // Manager runs the trailing stop loop.
 type Manager struct {
-	cfg    Config
-	store  TradeStore
-	prices PriceFetcher
-	exec   execution.Executor
+	cfg        Config
+	store      TradeStore
+	prices     PriceFetcher
+	exec       execution.Executor
+	now        func() time.Time
+	marketOpen func(time.Time) bool
 }
 
 // NewManager constructs a trailing-stop Manager.
 func NewManager(cfg Config, ts TradeStore, prices PriceFetcher, exec execution.Executor) *Manager {
+	normalized := cfg.Normalize()
+	marketOpen := normalized.MarketOpen
+	if marketOpen == nil {
+		marketOpen = regularStockSession
+	}
 	return &Manager{
-		cfg:    cfg.Normalize(),
-		store:  ts,
-		prices: prices,
-		exec:   exec,
+		cfg:        normalized,
+		store:      ts,
+		prices:     prices,
+		exec:       exec,
+		now:        time.Now,
+		marketOpen: marketOpen,
 	}
 }
 
@@ -359,7 +372,8 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return errors.New("ema9 rule requires a positive protective stop")
 	}
 
-	closePrice, ema, err := m.priceAndEMA9(ctx, t.Ticker)
+	now := m.now()
+	closePrice, ema, err := m.priceAndEMA9(ctx, t.Ticker, now)
 	if err != nil {
 		return fmt.Errorf("price/ema9: %w", err)
 	}
@@ -368,6 +382,22 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 	}
 
 	if closePrice < ema {
+		if !m.marketOpen(now) {
+			// A market sell submitted after 16:00 ET can sit queued until the
+			// next open. Keep the trade row and broker hard stop live overnight,
+			// then retry this same completed-close signal during the next
+			// eligible session.
+			if err := m.ensureProtectiveStop(ctx, t); err != nil {
+				return err
+			}
+			logger.Info("trailing-stop: daily close below ema9; deferring market exit until regular session",
+				"trade_id", t.ID,
+				"ticker", t.Ticker,
+				"daily_close", closePrice,
+				"ema9", ema,
+			)
+			return nil
+		}
 		logger.Info("trailing-stop: daily close below ema9; exiting at market",
 			"trade_id", t.ID,
 			"ticker", t.Ticker,
@@ -379,6 +409,10 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 
 	// Uncapped entries do not have OCO bracket children. Ensure their original
 	// hard stop is resident at the broker while the EMA winning exit waits.
+	return m.ensureProtectiveStop(ctx, t)
+}
+
+func (m *Manager) ensureProtectiveStop(ctx context.Context, t store.Trade) error {
 	existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
 	if err != nil {
 		return fmt.Errorf("lookup protective stop: %w", err)
@@ -412,7 +446,7 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 // priceAndEMA9 fetches daily candles so the live rule uses the same timeframe
 // as the exit-policy study. The provider's latest returned daily bar is the
 // close evidence used by the rule.
-func (m *Manager) priceAndEMA9(ctx context.Context, ticker string) (float64, float64, error) {
+func (m *Manager) priceAndEMA9(ctx context.Context, ticker string, now time.Time) (float64, float64, error) {
 	if m.prices == nil {
 		return 0, 0, errors.New("no price provider configured")
 	}
@@ -420,12 +454,28 @@ func (m *Manager) priceAndEMA9(ctx context.Context, ticker string) (float64, flo
 	if err != nil {
 		return 0, 0, err
 	}
-	candles = completedDailyCandles(candles, time.Now())
+	candles = completedDailyCandles(candles, now)
 	if len(candles) < EMAPeriod {
 		return 0, 0, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))
 	}
 	ema := emaClose(candles, EMAPeriod)
 	return candles[len(candles)-1].Close, ema, nil
+}
+
+// regularStockSession is deliberately conservative: EMA exits are eligible
+// only during the normal US equity session. Outside this window the existing
+// broker stop remains live and the manager retries on its next tick.
+func regularStockSession(now time.Time) bool {
+	nowNY := now.In(newYorkLocation)
+	if nowNY.Weekday() == time.Saturday || nowNY.Weekday() == time.Sunday {
+		return false
+	}
+	minuteOfDay := nowNY.Hour()*60 + nowNY.Minute()
+	const (
+		openMinute  = 9*60 + 30
+		closeMinute = 16 * 60
+	)
+	return minuteOfDay >= openMinute && minuteOfDay < closeMinute
 }
 
 // completedDailyCandles excludes today's still-forming US session bar before
@@ -526,7 +576,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		Quantity:    t.Quantity,
 		StopPrice:   newStop,
 		TradeID:     t.ID,
-		TimeInForce: "gtc",
+		TimeInForce: protectiveStopTIF(t.Quantity),
 	})
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
@@ -548,6 +598,14 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		IsStopLoss:    true,
 	})
 	return err
+}
+
+func protectiveStopTIF(quantity float64) string {
+	if quantity != math.Trunc(quantity) {
+		// Alpaca accepts fractional equity stop/stop-limit orders only as DAY.
+		return "day"
+	}
+	return "gtc"
 }
 
 // exitAndClose submits the market exit and immediately closes the trade row so

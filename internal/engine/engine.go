@@ -2000,7 +2000,16 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// guarantees the position retains a broker hard stop while the selected
 	// trail owns the winning exit. Keeping the manager requirement here makes
 	// an accidentally-partial config fail safe to the existing fixed TP.
-	uncapTakeProfit := uncappedTakeProfitEnabled(e.cfg.Risk, side)
+	uncapRequested := uncappedTakeProfitEnabled(e.cfg.Risk, side)
+	uncapTakeProfit, uncappedQty := resolveUncappedEntry(e.cfg.Risk, side, qty)
+	if uncapTakeProfit {
+		orderReq.Quantity = uncappedQty
+	} else if uncapRequested {
+		logger.Warn("exit policy: uncapped entry sized under one whole share; keeping baseline fixed take-profit",
+			"ticker", sig.Ticker,
+			"qty", qty,
+		)
+	}
 
 	// Broker-resident bracket exits (#435, see bracket_exits.go). BUYs with a
 	// coherent stop/target become one atomic bracket: entry + TP limit + SL
@@ -2008,7 +2017,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// Alpaca rejects fractional complex orders — so sub-one-share sizings
 	// fall back to the plain market entry with app-managed exits.
 	bracketed := false
-	if stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit) {
+	if stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
 		if whole := math.Floor(qty); whole >= 1 {
 			orderReq.Quantity = whole
 			orderReq.OrderClass = "bracket"

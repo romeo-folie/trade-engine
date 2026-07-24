@@ -1,6 +1,8 @@
 package engine
 
 import (
+	"math"
+
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 )
@@ -14,8 +16,22 @@ func uncappedTakeProfitEnabled(risk config.RiskConfig, side execution.OrderSide)
 		risk.TrailingStop.Enabled
 }
 
-func stockBracketEligible(risk config.RiskConfig, side execution.OrderSide, signalPrice, stopLoss, takeProfit float64) bool {
-	return !uncappedTakeProfitEnabled(risk, side) &&
+// resolveUncappedEntry keeps the uncapped/GTC-protected path on whole shares.
+// Alpaca rejects GTC stops for fractional equity quantities, so quantities
+// below one share fail safe to the baseline fixed-TP/software-exit behavior.
+func resolveUncappedEntry(risk config.RiskConfig, side execution.OrderSide, quantity float64) (bool, float64) {
+	if !uncappedTakeProfitEnabled(risk, side) {
+		return false, quantity
+	}
+	whole := math.Floor(quantity)
+	if whole < 1 {
+		return false, quantity
+	}
+	return true, whole
+}
+
+func stockBracketEligible(risk config.RiskConfig, side execution.OrderSide, signalPrice, stopLoss, takeProfit float64, uncapped bool) bool {
+	return !uncapped &&
 		risk.BracketExitsEnabled &&
 		side == execution.OrderSideBuy &&
 		stopLoss > 0 && takeProfit > 0 &&

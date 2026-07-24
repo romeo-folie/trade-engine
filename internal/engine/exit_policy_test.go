@@ -39,7 +39,11 @@ func TestUncappedTakeProfitDisablesBrokerAndSoftwareCaps(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	if stockBracketEligible(risk, execution.OrderSideBuy, 100, 95, 110) {
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 5.8)
+	if !active || qty != 5 {
+		t.Fatalf("uncapped entry active=%v qty=%v, want true/5 whole shares", active, qty)
+	}
+	if stockBracketEligible(risk, execution.OrderSideBuy, 100, 95, 110, active) {
 		t.Fatal("uncapped entry must not attach a TP/SL bracket")
 	}
 	if got := persistedTakeProfit(110, true); got != 0 {
@@ -47,11 +51,31 @@ func TestUncappedTakeProfitDisablesBrokerAndSoftwareCaps(t *testing.T) {
 	}
 
 	risk.UncapTakeProfit = false
-	if !stockBracketEligible(risk, execution.OrderSideBuy, 100, 95, 110) {
+	if !stockBracketEligible(risk, execution.OrderSideBuy, 100, 95, 110, false) {
 		t.Fatal("baseline bracket behavior must remain enabled when uncap is off")
 	}
 	if got := persistedTakeProfit(110, false); got != 110 {
 		t.Fatalf("baseline persisted take profit = %v, want 110", got)
+	}
+}
+
+func TestUncappedFractionalEntryFailsSafeToBaseline(t *testing.T) {
+	risk := config.RiskConfig{
+		UncapTakeProfit: true,
+		TrailingStop: config.TrailingStopConfig{
+			Enabled: true,
+			Rule:    "ema9",
+		},
+	}
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 0.75)
+	if active {
+		t.Fatal("sub-one-share entry must not activate uncapped/GTC policy")
+	}
+	if qty != 0.75 {
+		t.Fatalf("fallback quantity = %v, want original fractional 0.75", qty)
+	}
+	if got := persistedTakeProfit(110, active); got != 110 {
+		t.Fatalf("fallback take profit = %v, want baseline 110", got)
 	}
 }
 
