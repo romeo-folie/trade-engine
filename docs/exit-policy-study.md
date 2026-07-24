@@ -5,6 +5,29 @@
 ## Why this exists
 Our stock swing path sits at ~27% win rate; prior work (`te study execution`, PR #433) found **exits, not entries, are the leak** (~+1.53%/trade left on the table). A study of the 2025 US Investing Champion's pullback method (Martin Luk) pointed at the same thing: he runs a low win rate but wins via **asymmetry** — tight stops, and letting winners run on a **close-below-9-EMA** trailing stop instead of a fixed take-profit. We built a backtest harness to test whether our **fixed take-profit truncates winners**, and it does.
 
+## Source method — Martin Luk's pullback strategy (video transcript)
+Source: https://youtu.be/F0vssXyWizc (breakdown of the 2025 US Investing Champion's pullback method). Watched via the `watch` skill (full captions + chart/stat frames). Captured here so the lineage from source → study → plan is complete — Phase 2 (the entry filter) is essentially this setup.
+
+**Who / track record:** Martin Luk — ~969% return in the championship year, ~283% the year before (after a ~50% drawdown early in his career). The pullback entry is his own technique (broader style inspired by Kristjan Kullamägi).
+
+**Core philosophy — asymmetry via tiny risk:** "risk as little as possible while maximizing upside." He describes a *parabolic* relationship between stop width and reward: tightening a stop from 3%→1.5% adds ~8 extra R on a 25% winner, ~17 R on a 50% winner. So he obsesses over **tight entries**, not accuracy.
+
+**Universe / scan:** strongest momentum stocks — best performers over 1/3/6-month, up **>30%** in those windows, take the top 20–30%; filter mcap > $100M and $-volume > $1M.
+
+**Setup (buy weakness in *strength*, never weakness in weakness):** a long consolidation (8+ weeks ideal) *inside an uptrend* — **higher lows, narrowing range, price surfing rising 9 & 21 EMA, and reclaiming an anchored VWAP (AVWAP)** anchored to the consolidation's swing high/low. Avoids stocks below *declining* 9/21 EMAs making lower highs/lows.
+
+**Entry:** buy the **intraday flush** down to *stacked* support (AVWAP + 9 EMA, or AVWAP + a horizontal level) the moment price turns positive on the day / closes back above support. **Stop at the low of the day → very tight (often 1–4%, sometimes <1%).**
+
+**Exit:** **no fixed profit target.** Trail with a **close below the 9 EMA** (tight) or **21 EMA** (looser, bigger). His cited examples ran 24%→126% = **20R–31R**.
+
+**Stats (from the on-screen championship table):** 2025 ≈ **22% win rate** (205W / 731L), avg win ~14% vs avg loss ~2%; 2024 ≈ 34% win rate (164W / 319L), avg win 14.76% / avg loss −2.71%; winners held **~4–5 days**. Wrong ~85% of the time; **average win ≈ 5–7× average loss.** The edge is entirely payoff asymmetry, not hit rate.
+
+**Chart examples cited (for reference):** IonQ (2025), Tesla, AMPX, SanDisk (SNDK), RMLD, SYRE. (The channel's own variant applies the same technicals on *weekly* charts for a more passive version.)
+
+**How it maps to our work:**
+- **What our study tested (exits only):** uncapping the fixed TP + trailing (9-EMA vs ATR) and a high-conviction SELL gate. Confirmed the exit truncation and the payoff-asymmetry thesis. → **Branch 2 (#471).**
+- **What we have NOT tested / built yet:** the **tight-stop lever** (stop-width sweep — our model stops look too wide), and **AVWAP + 9/21 EMA indicators** (we only compute 20/50/200 EMA + session VWAP), and the **pullback-in-strength entry** (scan strong momentum → consolidation w/ higher lows + EMA/AVWAP reclaim → flush entry to stacked support → day's-low stop). → **Phase 2 (#472)**, plus optional follow-ups noted below.
+
 ## The study
 - **Harness:** `te backtest run` with exit-policy flags (see below). Replays the SAME cached entry signals under different exit rules — so comparing exits costs no LLM calls after the first (baseline) pass per ticker.
 - **Setup:** recent 6-month window `2026-01-15 → 2026-07-15`, daily candles, `trend_following`. Universe = the 6 longest-tenured watchlist names: **NVDA, IBKR, META, HIMS** (tradeable, baseline PF > 1) and **OPEN, JMIA** (underperformers, baseline PF < 1).
