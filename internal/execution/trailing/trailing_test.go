@@ -614,6 +614,37 @@ func TestManager_EMA9AfterCloseKeepsHardStopUntilNextSession(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9WaitsForConfirmedStopCancellation(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "pending"}}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("trade closed before hard-stop cancellation was confirmed")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want no market exit while hard stop remains live", fb.placed)
+	}
+	if len(fb.cancelled) != 1 || fb.cancelled[0] != "hard-stop" {
+		t.Fatalf("cancelled = %v, want attempted hard-stop cancellation", fb.cancelled)
+	}
+}
+
 func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{

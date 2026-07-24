@@ -68,9 +68,38 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		Status:        execution.NormalizeOrderStatus(res.Status),
 		IsStopLoss:    true,
 	}); err != nil {
-		return fmt.Errorf("record protective stop: %w", err)
+		if rollbackErr := rollbackUnrecordedProtectiveStop(ctx, e.executor, res.BrokerOrderID); rollbackErr != nil {
+			return fmt.Errorf("record protective stop: %w; rollback unrecorded broker stop: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("record protective stop: %w (broker stop rolled back)", err)
 	}
 	return nil
+}
+
+// rollbackUnrecordedProtectiveStop prevents a broker-accepted stop whose DB
+// insert failed from surviving invisibly. A later retry must not place another
+// full-quantity stop until the unrecorded one is confirmed gone.
+func rollbackUnrecordedProtectiveStop(
+	ctx context.Context,
+	executor execution.Executor,
+	brokerOrderID string,
+) error {
+	cancelErr := executor.CancelOrder(ctx, brokerOrderID)
+	status, statusErr := executor.GetOrderStatus(ctx, brokerOrderID)
+	if statusErr != nil {
+		if errors.Is(statusErr, execution.ErrOrderNotFound) {
+			return nil
+		}
+		return fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
+	}
+	switch execution.NormalizeOrderStatus(status.Status) {
+	case "cancelled", "rejected":
+		return nil
+	case "filled":
+		return errors.New("protective stop filled before rollback completed")
+	default:
+		return fmt.Errorf("cancel=%v order remains %s", cancelErr, status.Status)
+	}
 }
 
 func (e *Engine) cancelProtectiveStopForResize(ctx context.Context, existing store.Order) error {

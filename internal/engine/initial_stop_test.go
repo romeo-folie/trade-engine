@@ -177,3 +177,51 @@ func TestShouldPollEntryFill(t *testing.T) {
 		})
 	}
 }
+
+func TestRollbackUnrecordedProtectiveStop(t *testing.T) {
+	tests := []struct {
+		name      string
+		status    execution.OrderResult
+		statusErr error
+		wantErr   bool
+	}{
+		{
+			name:   "confirmed cancelled",
+			status: execution.OrderResult{Status: "cancelled"},
+		},
+		{
+			name:      "broker already purged order",
+			statusErr: execution.ErrOrderNotFound,
+		},
+		{
+			name:    "order still working",
+			status:  execution.OrderResult{Status: "pending"},
+			wantErr: true,
+		},
+		{
+			name:    "order filled during rollback",
+			status:  execution.OrderResult{Status: "filled"},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exec := &fakeBracketExec{
+				statuses:  map[string]execution.OrderResult{"stop-1": tt.status},
+				statusErr: map[string]error{},
+				cancelErr: map[string]error{},
+			}
+			if tt.statusErr != nil {
+				exec.statusErr["stop-1"] = tt.statusErr
+			}
+			err := rollbackUnrecordedProtectiveStop(context.Background(), exec, "stop-1")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("rollback error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if len(exec.cancelled) != 1 || exec.cancelled[0] != "stop-1" {
+				t.Fatalf("cancelled = %v, want stop-1", exec.cancelled)
+			}
+		})
+	}
+}

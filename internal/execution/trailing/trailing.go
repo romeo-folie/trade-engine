@@ -738,24 +738,11 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.Or
 	// Cancel every working exit leg first — not just the latest stop. For
 	// bracket-managed trades the stop AND take-profit legs each hold the
 	// trade's shares at the broker; a market sell with either leg still
-	// working is rejected for insufficient free quantity. Failure is logged
-	// but doesn't block the market exit (the exit is the safety move).
-	if legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID); err == nil {
-		for _, leg := range legs {
-			if leg.BrokerOrderID == "" {
-				continue
-			}
-			if err := m.exec.CancelOrder(ctx, leg.BrokerOrderID); err != nil {
-				logger.Warn("trailing-stop: cancel of exit leg before market exit failed",
-					"trade_id", t.ID,
-					"broker_order_id", leg.BrokerOrderID,
-					"err", err,
-				)
-			}
-		}
-	} else {
-		logger.Warn("trailing-stop: exit-leg lookup before market exit failed",
-			"trade_id", t.ID, "err", err)
+	// working is rejected for insufficient free quantity. More importantly,
+	// submitting while a stop remains live can double-sell. Fail closed and
+	// retry on the next manager tick unless every leg is confirmed gone.
+	if err := m.cancelExitLegsForMarketExit(ctx, t); err != nil {
+		return execution.OrderResult{}, err
 	}
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:   t.Ticker,
@@ -790,6 +777,38 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.Or
 		return res, insErr
 	}
 	return res, nil
+}
+
+func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) error {
+	legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("lookup exit legs before market exit: %w", err)
+	}
+	for _, leg := range legs {
+		if leg.BrokerOrderID == "" {
+			continue
+		}
+		cancelErr := m.exec.CancelOrder(ctx, leg.BrokerOrderID)
+		status, statusErr := m.exec.GetOrderStatus(ctx, leg.BrokerOrderID)
+		if statusErr != nil {
+			if errors.Is(statusErr, execution.ErrOrderNotFound) {
+				continue
+			}
+			return fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
+				leg.BrokerOrderID, cancelErr, statusErr)
+		}
+		switch execution.NormalizeOrderStatus(status.Status) {
+		case "cancelled", "rejected":
+			// Safe to release these shares to the market exit.
+		case "filled":
+			return fmt.Errorf("exit leg %s filled while cancelling; refusing duplicate market exit",
+				leg.BrokerOrderID)
+		default:
+			return fmt.Errorf("exit leg %s remains %s after cancel: %v",
+				leg.BrokerOrderID, status.Status, cancelErr)
+		}
+	}
+	return nil
 }
 
 // brokerTickDecimals returns the price-tick precision for the ticker. US
