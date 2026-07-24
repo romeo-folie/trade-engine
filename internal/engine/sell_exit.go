@@ -36,6 +36,14 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		})
 	}
 
+	if minConf := e.cfg.Risk.ExitConfMin; !sellExitConfidenceAllowed(sig.Confidence, minConf) {
+		blockSignal(
+			fmt.Sprintf("SELL confidence %.3f is below exit minimum %.3f; trailing stop remains in control", sig.Confidence, minConf),
+			"exit_confidence",
+		)
+		return
+	}
+
 	// The lots this SELL exits. DB quantity is broker-truth maintained by
 	// the fill polls and reconcilers; if it drifts, checkExitResidue flags
 	// the difference after the exit settles.
@@ -163,4 +171,8 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		})
 	}
 	e.checkExitResidue(sig.Ticker)
+}
+
+func sellExitConfidenceAllowed(confidence, minimum float64) bool {
+	return minimum <= 0 || confidence >= minimum
 }

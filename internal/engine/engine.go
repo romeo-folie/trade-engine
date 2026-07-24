@@ -1996,15 +1996,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	}
 
+	// The uncapped exit policy is active only with the trailing manager: this
+	// guarantees the position retains a broker hard stop while the selected
+	// trail owns the winning exit. Keeping the manager requirement here makes
+	// an accidentally-partial config fail safe to the existing fixed TP.
+	uncapTakeProfit := uncappedTakeProfitEnabled(e.cfg.Risk, side)
+
 	// Broker-resident bracket exits (#435, see bracket_exits.go). BUYs with a
 	// coherent stop/target become one atomic bracket: entry + TP limit + SL
 	// stop, GTC so the legs survive the session close. Whole shares only —
 	// Alpaca rejects fractional complex orders — so sub-one-share sizings
 	// fall back to the plain market entry with app-managed exits.
 	bracketed := false
-	if e.cfg.Risk.BracketExitsEnabled && side == execution.OrderSideBuy &&
-		sig.StopLoss > 0 && sig.TakeProfit > 0 &&
-		sig.StopLoss < sig.SignalPrice && sig.TakeProfit > sig.SignalPrice {
+	if stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit) {
 		if whole := math.Floor(qty); whole >= 1 {
 			orderReq.Quantity = whole
 			orderReq.OrderClass = "bracket"
@@ -2016,6 +2020,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("bracket exits: sized under one whole share — falling back to app-managed exits",
 				"ticker", sig.Ticker, "qty", qty)
 		}
+	}
+	if uncapTakeProfit {
+		logger.Info("exit policy: fixed take-profit uncapped; trailing manager owns winning exit",
+			"ticker", sig.Ticker,
+			"trailing_rule", e.cfg.Risk.TrailingStop.Rule,
+		)
 	}
 
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
@@ -2030,6 +2040,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 
 	// Create trade record.
+	// The software position monitor reads trades.take_profit. Clearing the
+	// persisted value is load-bearing: merely omitting the broker bracket
+	// would still let the hourly monitor cap the winner at the model TP.
+	tradeTakeProfit := persistedTakeProfit(sig.TakeProfit, uncapTakeProfit)
 	trade := store.Trade{
 		SignalID:   sigID,
 		Ticker:     sig.Ticker,
@@ -2038,7 +2052,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		EntryPrice: result.FilledPrice,
 		Quantity:   result.FilledQty,
 		StopLoss:   sig.StopLoss,
-		TakeProfit: sig.TakeProfit,
+		TakeProfit: tradeTakeProfit,
 		Status:     "open",
 	}
 	tradeID, err := store.InsertTrade(ctx, trade)

@@ -278,9 +278,12 @@ risk:
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
   trailing_stop:               # Server-side trailing stop manager (#322)
     enabled: false             # Opt-in; disabled by default
+    rule: atr                  # atr = hourly broker-stop ratchet; ema9 = exit on daily close below daily 9-EMA
     atr_multiple: 1.5          # new_stop = hwm - atr_multiple * ATR (absolute-price ATR)
     interval_sec: 60           # Recompute cadence
     atr_period: 14             # Wilder ATR lookback in 1h candles
+  uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
+  exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
   bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.
   # Entry-quality gates from the May–Jul 2026 execution study. All default off;
   # BUY-only; fail open when the prior daily close is unavailable.

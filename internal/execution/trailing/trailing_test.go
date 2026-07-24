@@ -204,12 +204,14 @@ type fakePrices struct {
 	mu      sync.Mutex
 	candles []data.Candle
 	calls   int
+	lastTF  data.Timeframe
 }
 
-func (f *fakePrices) FetchHistory(_ context.Context, _ string, _ data.Timeframe, _ int) ([]data.Candle, error) {
+func (f *fakePrices) FetchHistory(_ context.Context, _ string, tf data.Timeframe, _ int) ([]data.Candle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.lastTF = tf
 	out := make([]data.Candle, len(f.candles))
 	copy(out, f.candles)
 	return out, nil
@@ -366,6 +368,105 @@ func makeFlatPriceCandles(last float64, tail ...data.Candle) []data.Candle {
 	}
 	out = append(out, tail...)
 	return out
+}
+
+func dailyCloses(values ...float64) []data.Candle {
+	out := make([]data.Candle, 0, len(values))
+	for _, closePrice := range values {
+		out = append(out, data.Candle{
+			Timeframe: data.Timeframe1Day,
+			Open:      closePrice,
+			High:      closePrice,
+			Low:       closePrice,
+			Close:     closePrice,
+		})
+	}
+	return out
+}
+
+func TestEMA9UsesBacktestSeedingConvention(t *testing.T) {
+	candles := dailyCloses(1, 2, 3, 4, 5, 6, 7, 8, 9)
+	if got := emaClose(candles, EMAPeriod); got != 5 {
+		t.Fatalf("seed ema = %v, want SMA seed 5", got)
+	}
+	candles = append(candles, dailyCloses(10)...)
+	// k=2/(9+1)=0.2 => 10*0.2 + 5*0.8 = 6
+	if got := emaClose(candles, EMAPeriod); got != 6 {
+		t.Fatalf("next ema = %v, want 6", got)
+	}
+}
+
+func TestCompletedDailyCandlesDropsCurrentPartialSession(t *testing.T) {
+	now := time.Date(2026, time.July, 24, 15, 30, 0, 0, newYorkLocation)
+	previous := data.Candle{
+		Timestamp: time.Date(2026, time.July, 23, 0, 0, 0, 0, newYorkLocation),
+		Close:     100,
+	}
+	current := data.Candle{
+		Timestamp: time.Date(2026, time.July, 24, 0, 0, 0, 0, newYorkLocation),
+		Close:     90,
+	}
+	got := completedDailyCandles([]data.Candle{previous, current}, now)
+	if len(got) != 1 || got[0].Close != 100 {
+		t.Fatalf("completed candles = %+v, want only previous session", got)
+	}
+
+	afterClose := time.Date(2026, time.July, 24, 16, 5, 0, 0, newYorkLocation)
+	got = completedDailyCandles([]data.Candle{previous, current}, afterClose)
+	if len(got) != 2 {
+		t.Fatalf("after-close candles = %d, want current session included", len(got))
+	}
+}
+
+func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 110)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if fp.lastTF != data.Timeframe1Day {
+		t.Fatalf("timeframe = %s, want daily to match study", fp.lastTF)
+	}
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("close above ema9 must keep trade open")
+	}
+	if len(fb.placed) != 1 {
+		t.Fatalf("placed = %d, want one protective stop", len(fb.placed))
+	}
+	stop := fb.placed[0]
+	if stop.Type != execution.OrderTypeStop || stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
+		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	}
+}
+
+func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	// Nine closes at 100 seed EMA=100; the final 90 close produces EMA=98.
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "closed" {
+		t.Fatal("daily close below ema9 must close the trade")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("placed = %+v, want exactly one market exit", fb.placed)
+	}
+	if got := fs.trades["t1"].ExitPrice; got != 90 {
+		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
+	}
 }
 
 // TestManager_FirstTickSeedsHWM confirms that on the first observation the

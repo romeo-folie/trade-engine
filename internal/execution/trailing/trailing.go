@@ -1,9 +1,12 @@
 // Package trailing implements a server-side trailing stop manager (#322).
 //
-// On each tick the manager iterates open long stock trades, recomputes the
-// trailing stop using the formula:
+// On each tick the manager iterates open long stock trades and applies one
+// of two rules:
 //
-//	new_stop = max(current_stop, high_water_mark − atr_multiple × ATR)
+//   - atr: ratchet a broker stop using
+//     new_stop = max(current_stop, high_water_mark − atr_multiple × ATR)
+//   - ema9: retain the original broker hard stop and exit at market when the
+//     latest daily candle closes below its daily 9-EMA
 //
 // where ATR is the absolute-price Average True Range (same units as
 // high_water_mark) and atr_multiple is a unitless coefficient (default 1.5).
@@ -38,6 +41,9 @@ import (
 )
 
 const (
+	RuleATR  = "atr"
+	RuleEMA9 = "ema9"
+
 	// DefaultATRMultiple is the unitless coefficient applied to absolute-price
 	// ATR to derive the trailing band. 1.5 is the recommended default per the
 	// task spec — small enough to lock in gains, wide enough to ride normal
@@ -51,11 +57,24 @@ const (
 	// DefaultATRPeriod is Wilder's standard ATR lookback.
 	DefaultATRPeriod = 14
 
+	// EMAPeriod is the daily close EMA used by the evidence-backed exit-policy
+	// study. It is deliberately fixed so "ema9" has one stable meaning across
+	// backtest and live execution.
+	EMAPeriod = 9
+
 	// candleHistory is the number of 1h candles fetched per tick to compute
 	// ATR. Wilder's ATR is path-dependent; period+1 is the strict minimum but
 	// in practice 30+ stabilises the smoothing.
 	candleHistory = 50
 )
+
+var newYorkLocation = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}()
 
 // ComputeNewStop applies the trailing-stop formula. The clamp guarantees the
 // stop ratchets upward only — even if a transient ATR spike or stale price
@@ -108,6 +127,7 @@ type TradeStore interface {
 // Config controls the trailing-stop manager.
 type Config struct {
 	Enabled     bool
+	Rule        string
 	ATRMultiple float64
 	Interval    time.Duration
 	ATRPeriod   int
@@ -116,6 +136,10 @@ type Config struct {
 // Normalize fills in defaults so callers can hand the manager a partially
 // configured Config and still get sensible behaviour.
 func (c Config) Normalize() Config {
+	c.Rule = strings.ToLower(strings.TrimSpace(c.Rule))
+	if c.Rule == "" {
+		c.Rule = RuleATR
+	}
 	if c.ATRMultiple <= 0 {
 		c.ATRMultiple = DefaultATRMultiple
 	}
@@ -155,6 +179,7 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	logger.Info("trailing-stop manager started",
 		"interval", m.cfg.Interval,
+		"rule", m.cfg.Rule,
 		"atr_multiple", m.cfg.ATRMultiple,
 		"atr_period", m.cfg.ATRPeriod,
 	)
@@ -220,6 +245,9 @@ func isLongStockTrade(t store.Trade) bool {
 // recent price + ATR, ratchets the high-water-mark, computes a new stop, and
 // places or replaces the broker STOP order.
 func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
+	if m.cfg.Rule == RuleEMA9 {
+		return m.updateOneEMA9(ctx, t)
+	}
 	if t.Quantity <= 0 {
 		return fmt.Errorf("non-positive quantity %f", t.Quantity)
 	}
@@ -269,54 +297,37 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			"new_stop", newStop,
 			"current_price", currentPrice,
 		)
-		exitRes, err := m.exitAtMarket(ctx, t)
-		if err != nil {
+		if err := m.exitAndClose(ctx, t, currentPrice); err != nil {
 			// Persist HWM so the next tick has fresh baseline; surface error.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("market exit: %w", err)
-		}
-		// Close the trade row immediately. Without this the trade stays
-		// status='open', GetOpenTrades returns it again on the next tick,
-		// and the manager places a duplicate market sell. Mirrors the
-		// close-side bookkeeping in engine.monitorPositions.
-		//
-		// Prefer the broker's reported FilledPrice when present so the
-		// trade row + pnl reflect the real fill rather than the snapshot
-		// price that crossed the trail. Falls back to currentPrice for
-		// brokers that return 0 on a still-pending fill (Alpaca paper).
-		exitPrice := exitRes.FilledPrice
-		if exitPrice == 0 {
-			exitPrice = currentPrice
-		}
-		pnl := (exitPrice - t.EntryPrice) * t.Quantity
-		pnlPct := 0.0
-		if t.EntryPrice > 0 {
-			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-		}
-		if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
-			// Best-effort persist HWM so the next tick has updated baseline.
-			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
-			return fmt.Errorf("close trade after market exit: %w", err)
 		}
 		// Persist HWM after CloseTrade so the trail snapshot is intact for
 		// post-mortem queries.
 		return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 	}
 
-	// If the stop hasn't moved (and the HWM hasn't either), nothing to do.
-	if newStop == persistedStop && hwm == t.HighWaterMark {
-		return nil
+	// Submit/replace the broker STOP whenever it moved. Also seed a missing
+	// broker stop even when the ATR candidate still equals the original hard
+	// stop; uncapped entries are deliberately not brackets, so their first
+	// manager tick must establish protection immediately.
+	existingStop, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("lookup protective stop: %w", err)
 	}
-
-	// Submit/replace broker STOP order whenever the stop_loss actually
-	// moved. HWM-only updates skip the broker call.
-	if newStop != persistedStop {
+	if newStop != persistedStop || existingStop == nil {
 		if err := m.submitOrReplaceStop(ctx, t, newStop); err != nil {
 			// Persist HWM even on broker failure so the next tick has the
 			// updated baseline; log WARN and retry next tick.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("broker stop submit/replace: %w", err)
 		}
+	}
+
+	// If neither trailing state nor the stop price changed, the only work on
+	// this tick was seeding a previously-missing broker stop.
+	if newStop == persistedStop && hwm == t.HighWaterMark {
+		return nil
 	}
 
 	if err := m.store.UpdateTradeTrailing(ctx, t.ID, newStop, hwm); err != nil {
@@ -332,6 +343,51 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 		"atr", atr,
 		"current_price", currentPrice,
 	)
+	return nil
+}
+
+// updateOneEMA9 implements the study's exact EMA rule: preserve the original
+// hard stop at the broker, then exit when the latest daily close is below the
+// daily 9-EMA. It intentionally does not move the broker stop to the EMA;
+// doing so would create an intraday touch exit and would not match the tested
+// close-confirmed policy.
+func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
+	if t.Quantity <= 0 {
+		return fmt.Errorf("non-positive quantity %f", t.Quantity)
+	}
+	if t.StopLoss <= 0 {
+		return errors.New("ema9 rule requires a positive protective stop")
+	}
+
+	closePrice, ema, err := m.priceAndEMA9(ctx, t.Ticker)
+	if err != nil {
+		return fmt.Errorf("price/ema9: %w", err)
+	}
+	if closePrice <= 0 || ema <= 0 {
+		return errors.New("non-positive close or ema9")
+	}
+
+	if closePrice < ema {
+		logger.Info("trailing-stop: daily close below ema9; exiting at market",
+			"trade_id", t.ID,
+			"ticker", t.Ticker,
+			"daily_close", closePrice,
+			"ema9", ema,
+		)
+		return m.exitAndClose(ctx, t, closePrice)
+	}
+
+	// Uncapped entries do not have OCO bracket children. Ensure their original
+	// hard stop is resident at the broker while the EMA winning exit waits.
+	existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("lookup protective stop: %w", err)
+	}
+	if existing == nil {
+		if err := m.submitOrReplaceStop(ctx, t, t.StopLoss); err != nil {
+			return fmt.Errorf("seed protective stop: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -351,6 +407,68 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 	}
 	atrVal := indicators.ComputeATR(candles, m.cfg.ATRPeriod)
 	return candles[len(candles)-1].Close, atrVal, nil
+}
+
+// priceAndEMA9 fetches daily candles so the live rule uses the same timeframe
+// as the exit-policy study. The provider's latest returned daily bar is the
+// close evidence used by the rule.
+func (m *Manager) priceAndEMA9(ctx context.Context, ticker string) (float64, float64, error) {
+	if m.prices == nil {
+		return 0, 0, errors.New("no price provider configured")
+	}
+	candles, err := m.prices.FetchHistory(ctx, ticker, data.Timeframe1Day, candleHistory)
+	if err != nil {
+		return 0, 0, err
+	}
+	candles = completedDailyCandles(candles, time.Now())
+	if len(candles) < EMAPeriod {
+		return 0, 0, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))
+	}
+	ema := emaClose(candles, EMAPeriod)
+	return candles[len(candles)-1].Close, ema, nil
+}
+
+// completedDailyCandles excludes today's still-forming US session bar before
+// the regular 16:00 New York close. Some providers expose a partial 1Day bar
+// during the session; treating it as a close would turn the tested close-based
+// rule into an intraday touch rule. Zero timestamps are retained for providers
+// and deterministic fixtures that do not timestamp history.
+func completedDailyCandles(candles []data.Candle, now time.Time) []data.Candle {
+	if len(candles) == 0 {
+		return candles
+	}
+	last := candles[len(candles)-1]
+	if last.Timestamp.IsZero() {
+		return candles
+	}
+	nowNY := now.In(newYorkLocation)
+	barNY := last.Timestamp.In(newYorkLocation)
+	sameSessionDate := nowNY.Year() == barNY.Year() &&
+		nowNY.YearDay() == barNY.YearDay()
+	beforeRegularClose := nowNY.Hour() < 16
+	if sameSessionDate && beforeRegularClose {
+		return candles[:len(candles)-1]
+	}
+	return candles
+}
+
+// emaClose returns the final EMA value for candle closes, seeded with the
+// simple average of the first period values (the same convention used by the
+// backtest harness).
+func emaClose(candles []data.Candle, period int) float64 {
+	if period <= 0 || len(candles) < period {
+		return 0
+	}
+	var ema float64
+	for i := 0; i < period; i++ {
+		ema += candles[i].Close
+	}
+	ema /= float64(period)
+	k := 2.0 / float64(period+1)
+	for i := period; i < len(candles); i++ {
+		ema = candles[i].Close*k + ema*(1-k)
+	}
+	return ema
 }
 
 // submitOrReplaceStop sends the new stop price to the broker. If a broker
@@ -402,12 +520,13 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	}
 
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
-		Ticker:    t.Ticker,
-		Side:      side,
-		Type:      execution.OrderTypeStop,
-		Quantity:  t.Quantity,
-		StopPrice: newStop,
-		TradeID:   t.ID,
+		Ticker:      t.Ticker,
+		Side:        side,
+		Type:        execution.OrderTypeStop,
+		Quantity:    t.Quantity,
+		StopPrice:   newStop,
+		TradeID:     t.ID,
+		TimeInForce: "gtc",
 	})
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
@@ -429,6 +548,30 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		IsStopLoss:    true,
 	})
 	return err
+}
+
+// exitAndClose submits the market exit and immediately closes the trade row so
+// the next manager tick cannot submit a duplicate sell. The broker fill wins
+// when available; asynchronous brokers fall back to the candle close that
+// triggered the policy and are later reconciled to broker truth.
+func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, fallbackPrice float64) error {
+	exitRes, err := m.exitAtMarket(ctx, t)
+	if err != nil {
+		return err
+	}
+	exitPrice := exitRes.FilledPrice
+	if exitPrice == 0 {
+		exitPrice = fallbackPrice
+	}
+	pnl := (exitPrice - t.EntryPrice) * t.Quantity
+	pnlPct := 0.0
+	if t.EntryPrice > 0 {
+		pnlPct = pnl / (t.EntryPrice * t.Quantity) * 100
+	}
+	if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+		return fmt.Errorf("close trade after market exit: %w", err)
+	}
+	return nil
 }
 
 // cancelAndConfirm cancels a broker order and only returns nil once the

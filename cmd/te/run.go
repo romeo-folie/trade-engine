@@ -209,6 +209,7 @@ Modes:
 			} else {
 				tsCfg := trailing.Config{
 					Enabled:     true,
+					Rule:        cfg.Risk.TrailingStop.Rule,
 					ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
 					Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
 					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
