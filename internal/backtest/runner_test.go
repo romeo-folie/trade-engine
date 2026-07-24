@@ -90,7 +90,7 @@ func TestCandleDuration(t *testing.T) {
 	}
 }
 
-// ── checkSLTP ─────────────────────────────────────────────────────────────────
+// ── evaluateExit (baseline policy) ────────────────────────────────────────────
 
 func newPos(sl, tp float64) *openPos {
 	return &openPos{
@@ -113,7 +113,7 @@ func makeCandle(low, high float64) data.Candle {
 func TestCheckSLTP_NoTrigger(t *testing.T) {
 	pos := newPos(90, 120)
 	candle := makeCandle(95, 115) // neither SL nor TP reached
-	_, triggered := checkSLTP(pos, candle)
+	_, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if triggered {
 		t.Error("expected no trigger")
 	}
@@ -122,7 +122,7 @@ func TestCheckSLTP_NoTrigger(t *testing.T) {
 func TestCheckSLTP_StopLoss(t *testing.T) {
 	pos := newPos(95, 120)
 	candle := makeCandle(93, 115) // low touches SL
-	trade, triggered := checkSLTP(pos, candle)
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if !triggered {
 		t.Fatal("expected SL trigger")
 	}
@@ -137,7 +137,7 @@ func TestCheckSLTP_StopLoss(t *testing.T) {
 func TestCheckSLTP_TakeProfit(t *testing.T) {
 	pos := newPos(90, 110)
 	candle := makeCandle(95, 115) // high touches TP
-	trade, triggered := checkSLTP(pos, candle)
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if !triggered {
 		t.Fatal("expected TP trigger")
 	}
@@ -153,7 +153,7 @@ func TestCheckSLTP_SLWinsOverTP(t *testing.T) {
 	// Both SL and TP triggered in same candle — SL must win (conservative).
 	pos := newPos(95, 105)
 	candle := makeCandle(90, 110)
-	trade, triggered := checkSLTP(pos, candle)
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if !triggered {
 		t.Fatal("expected trigger")
 	}
@@ -167,7 +167,7 @@ func TestCheckSLTP_ExitSignal(t *testing.T) {
 	pos.exitSignal = true
 	candle := makeCandle(95, 115)
 	candle.Open = 102
-	trade, triggered := checkSLTP(pos, candle)
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if !triggered {
 		t.Fatal("expected exit signal trigger")
 	}
@@ -182,9 +182,90 @@ func TestCheckSLTP_ExitSignal(t *testing.T) {
 func TestCheckSLTP_NoSLNoTP(t *testing.T) {
 	pos := newPos(0, 0) // no SL or TP configured
 	candle := makeCandle(50, 200)
-	_, triggered := checkSLTP(pos, candle)
+	_, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{})
 	if triggered {
 		t.Error("zero SL/TP should not trigger")
+	}
+}
+
+func TestResolveExitPolicy_Defaults(t *testing.T) {
+	// Zero-value options reproduce baseline (no trail) with sane defaults.
+	p := resolveExitPolicy(RunOptions{})
+	if p.trail || p.useEMA {
+		t.Errorf("empty options should be baseline, got trail=%v useEMA=%v", p.trail, p.useEMA)
+	}
+	if p.atrMult != 1.5 || p.emaPeriod != 9 {
+		t.Errorf("expected defaults atrMult=1.5 emaPeriod=9, got %.1f/%d", p.atrMult, p.emaPeriod)
+	}
+	// Explicit values pass through; stopWidth converts pct→fraction.
+	p2 := resolveExitPolicy(RunOptions{ExitMode: "trail", TrailRule: "ema", TrailATRMult: 2, TrailEMAPeriod: 21, ExitConfMin: 0.7, StopWidthPct: 2})
+	if !p2.trail || !p2.useEMA || p2.atrMult != 2 || p2.emaPeriod != 21 || p2.exitConfMin != 0.7 || p2.stopWidth != 0.02 {
+		t.Errorf("unexpected resolved policy: %+v", p2)
+	}
+}
+
+// ── evaluateExit (trail / uncap / R-multiple) ─────────────────────────────────
+
+func TestEvaluateExit_TrailATR_ClosesBelowTrail(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.highWater = 130
+	pos.trailStop = 120
+	candle := data.Candle{Timestamp: time.Now(), Open: 122, High: 124, Low: 115, Close: 118} // close < trailStop
+	trade, triggered := evaluateExit(pos, candle, 0 /*no ratchet*/, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if !triggered {
+		t.Fatal("expected ATR-trail exit when close falls below the trailing stop")
+	}
+	if trade.ExitReason != "trail_atr" || trade.ExitPrice != 118 {
+		t.Errorf("expected trail_atr @118, got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	}
+}
+
+func TestEvaluateExit_TrailATR_RatchetsUp(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.highWater = 100
+	pos.trailStop = 90
+	// New high 150 with ATR 10, mult 1.5 → candidate trail 150-15=135; close 140 stays above → no exit yet.
+	candle := data.Candle{Timestamp: time.Now(), Open: 145, High: 150, Low: 138, Close: 140}
+	_, triggered := evaluateExit(pos, candle, 10, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if triggered {
+		t.Fatal("should not exit while close holds above the ratcheted trail")
+	}
+	if pos.trailStop != 135 {
+		t.Errorf("expected trailStop ratcheted to 135, got %.2f", pos.trailStop)
+	}
+}
+
+func TestEvaluateExit_TrailEMA(t *testing.T) {
+	pos := newPos(90, 0)
+	candle := data.Candle{Timestamp: time.Now(), Open: 98, High: 99, Low: 92, Close: 95} // close < ema
+	trade, triggered := evaluateExit(pos, candle, 0, 97 /*ema*/, exitPolicy{trail: true, useEMA: true, emaPeriod: 9})
+	if !triggered {
+		t.Fatal("expected EMA-trail exit when close falls below the EMA")
+	}
+	if trade.ExitReason != "trail_ema" || trade.ExitPrice != 95 {
+		t.Errorf("expected trail_ema @95, got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	}
+}
+
+func TestEvaluateExit_TrailUncapsTakeProfit(t *testing.T) {
+	pos := newPos(90, 110) // has a take-profit at 110
+	pos.trailStop = 88     // far below price → won't trigger
+	// High 130 blows through the TP, but in trail mode the fixed TP is ignored.
+	candle := data.Candle{Timestamp: time.Now(), Open: 118, High: 130, Low: 116, Close: 128}
+	_, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if triggered {
+		t.Error("trail mode must ignore the fixed take-profit (winners uncapped)")
+	}
+}
+
+func TestClosePosition_RMultiple(t *testing.T) {
+	pos := &openPos{ticker: "T", direction: "buy", entryTS: time.Now(), entryPrice: 100, quantity: 10, cost: 1000, riskPerShare: 5}
+	trade := closePosition(pos, time.Now(), 130, "trail_atr")
+	if trade.RiskPerShare != 5 {
+		t.Errorf("expected RiskPerShare 5, got %.2f", trade.RiskPerShare)
+	}
+	if trade.RMultiple != 6 { // (130-100)/5
+		t.Errorf("expected 6R, got %.2fR", trade.RMultiple)
 	}
 }
 

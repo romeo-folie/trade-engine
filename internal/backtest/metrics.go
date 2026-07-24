@@ -21,6 +21,16 @@ type Metrics struct {
 	AvgHoldHours        float64
 	BestTradePct        float64
 	WorstTradePct       float64
+
+	// Asymmetry / risk-relative stats (exit-policy-study). These are the metrics
+	// that reveal a low-win-rate / high-payoff edge, which raw win rate hides.
+	AvgWinPct      float64        // mean PnL% of winning trades
+	AvgLossPct     float64        // mean PnL% of losing trades (negative)
+	PayoffRatio    float64        // |AvgWinPct| / |AvgLossPct| — the asymmetry ratio
+	AvgRMultiple   float64        // mean trade P&L in units of entry risk (1R)
+	MaxRMultiple   float64        // largest single-trade R
+	RunnersOver10R int            // trades that reached ≥10R (the fat right tail)
+	ExitReasons    map[string]int // exit-reason breakdown (stop_loss/take_profit/trail_*/signal/…)
 }
 
 // Compute calculates all metrics from a completed trade list.
@@ -53,6 +63,11 @@ func Compute(trades []SimulatedTrade, startCash, finalCash float64, from, to tim
 	m.WorstTradePct = math.Inf(1)
 	var totalExpectancy float64
 
+	var winPctSum, lossPctSum, rSum float64
+	var rCount, over10R int
+	maxR := math.Inf(-1)
+	exitReasons := map[string]int{}
+
 	for _, t := range closed {
 		pnlPct := t.PnLPct
 		if pnlPct > m.BestTradePct {
@@ -66,11 +81,47 @@ func Compute(trades []SimulatedTrade, startCash, finalCash float64, from, to tim
 		if t.PnL >= 0 {
 			wins++
 			totalWin += t.PnL
+			winPctSum += pnlPct
 		} else {
 			losses++
 			totalLoss += math.Abs(t.PnL)
+			lossPctSum += pnlPct
+		}
+		if t.ExitReason != "" {
+			exitReasons[t.ExitReason]++
+		}
+		// R-multiples only meaningful when an entry risk was recorded.
+		if t.RiskPerShare > 0 {
+			rSum += t.RMultiple
+			rCount++
+			if t.RMultiple > maxR {
+				maxR = t.RMultiple
+			}
+			if t.RMultiple >= 10 {
+				over10R++
+			}
 		}
 	}
+
+	if wins > 0 {
+		m.AvgWinPct = winPctSum / float64(wins)
+	}
+	if losses > 0 {
+		m.AvgLossPct = lossPctSum / float64(losses)
+	}
+	if m.AvgLossPct != 0 {
+		m.PayoffRatio = math.Abs(m.AvgWinPct) / math.Abs(m.AvgLossPct)
+	} else if m.AvgWinPct != 0 {
+		m.PayoffRatio = math.Inf(1) // wins but no losses (mirrors ProfitFactor)
+	}
+	if rCount > 0 {
+		m.AvgRMultiple = rSum / float64(rCount)
+	}
+	if !math.IsInf(maxR, -1) {
+		m.MaxRMultiple = maxR
+	}
+	m.RunnersOver10R = over10R
+	m.ExitReasons = exitReasons
 
 	if math.IsInf(m.BestTradePct, -1) {
 		m.BestTradePct = 0

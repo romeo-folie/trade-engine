@@ -28,6 +28,15 @@ var (
 	btNoCache   bool
 	btCompareID []string
 	btLimit     int
+
+	// Exit-policy research knobs (exit-policy-study). Defaults reproduce the
+	// original baseline exit behavior.
+	btExitMode       string
+	btTrailRule      string
+	btTrailATRMult   float64
+	btTrailEMAPeriod int
+	btExitConfMin    float64
+	btStopWidthPct   float64
 )
 
 // ── Command tree ──────────────────────────────────────────────────────────────
@@ -45,6 +54,12 @@ func init() {
 	runBTCmd.Flags().StringVar(&btFrom, "from", "", "Start date YYYY-MM-DD (required)")
 	runBTCmd.Flags().StringVar(&btTo, "to", "", "End date YYYY-MM-DD (required)")
 	runBTCmd.Flags().BoolVar(&btNoCache, "no-cache", false, "Bypass prompt cache")
+	runBTCmd.Flags().StringVar(&btExitMode, "exit-mode", "baseline", "Exit policy: baseline (fixed SL/TP) | trail (uncap TP, ride a trailing stop)")
+	runBTCmd.Flags().StringVar(&btTrailRule, "trail-rule", "atr", "Trailing rule when --exit-mode=trail: atr (ATR below high-water) | ema (close below EMA)")
+	runBTCmd.Flags().Float64Var(&btTrailATRMult, "trail-atr-mult", 1.5, "ATR multiple for the trailing stop (matches live trailing_stop)")
+	runBTCmd.Flags().IntVar(&btTrailEMAPeriod, "trail-ema-period", 9, "EMA period for the close-below-EMA trailing rule")
+	runBTCmd.Flags().Float64Var(&btExitConfMin, "exit-conf-min", 0, "Require SELL confidence ≥ this to exit on signal (0 = ungated)")
+	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override initial stop to entry×(1-pct/100) (0 = use model stop)")
 	_ = runBTCmd.MarkFlagRequired("ticker")
 	_ = runBTCmd.MarkFlagRequired("from")
 	_ = runBTCmd.MarkFlagRequired("to")
@@ -111,6 +126,13 @@ var runBTCmd = &cobra.Command{
 			To:        to,
 			Model:     btModel,
 			NoCache:   btNoCache,
+
+			ExitMode:       btExitMode,
+			TrailRule:      btTrailRule,
+			TrailATRMult:   btTrailATRMult,
+			TrailEMAPeriod: btTrailEMAPeriod,
+			ExitConfMin:    btExitConfMin,
+			StopWidthPct:   btStopWidthPct,
 		}
 
 		fmt.Printf("Backtesting %s · %s · %s → %s\n",
@@ -239,6 +261,7 @@ func printMetrics(r *backtest.RunResult) {
 	fmt.Printf("  Strategy:   %s\n", r.Options.Strategy)
 	fmt.Printf("  Period:     %s → %s\n",
 		r.Options.From.Format("2006-01-02"), r.Options.To.Format("2006-01-02"))
+	fmt.Printf("  Exit:       %s\n", exitPolicyDesc(r.Options))
 	fmt.Printf("  Cache:      %d hits / %d misses (%.0f%%)\n\n", hits, misses, hitPct)
 
 	fmt.Println("  Performance")
@@ -260,6 +283,59 @@ func printMetrics(r *backtest.RunResult) {
 	printRow("Best Trade", fmt.Sprintf("%.2f%%", m.BestTradePct))
 	printRow("Worst Trade", fmt.Sprintf("%.2f%%", m.WorstTradePct))
 	fmt.Println()
+
+	fmt.Println("  Asymmetry / R-Multiples")
+	fmt.Println("  ───────────────────────────────────")
+	printRow("Avg Win", fmt.Sprintf("%.2f%%", m.AvgWinPct))
+	printRow("Avg Loss", fmt.Sprintf("%.2f%%", m.AvgLossPct))
+	printRow("Payoff Ratio", fmt.Sprintf("%.2f", m.PayoffRatio))
+	printRow("Avg R-Multiple", fmt.Sprintf("%.2fR", m.AvgRMultiple))
+	printRow("Max R-Multiple", fmt.Sprintf("%.1fR", m.MaxRMultiple))
+	printRow("Runners >=10R", fmt.Sprintf("%d", m.RunnersOver10R))
+	fmt.Println()
+
+	if len(m.ExitReasons) > 0 {
+		fmt.Println("  Exit Reasons")
+		fmt.Println("  ───────────────────────────────────")
+		for _, k := range []string{"stop_loss", "take_profit", "trail_atr", "trail_ema", "signal", "end_of_data"} {
+			if n, ok := m.ExitReasons[k]; ok {
+				printRow(k, fmt.Sprintf("%d", n))
+			}
+		}
+		fmt.Println()
+	}
+}
+
+// exitPolicyDesc renders a compact one-line description of the active exit
+// policy for the run header.
+func exitPolicyDesc(o backtest.RunOptions) string {
+	mode := o.ExitMode
+	if mode == "" {
+		mode = "baseline"
+	}
+	s := mode
+	if mode == "trail" {
+		if o.TrailRule == "ema" {
+			p := o.TrailEMAPeriod
+			if p <= 0 {
+				p = 9
+			}
+			s += fmt.Sprintf(" (ema-%d)", p)
+		} else {
+			mult := o.TrailATRMult
+			if mult <= 0 {
+				mult = 1.5
+			}
+			s += fmt.Sprintf(" (atr×%.1f)", mult)
+		}
+	}
+	if o.ExitConfMin > 0 {
+		s += fmt.Sprintf(" · exit-conf>=%.2f", o.ExitConfMin)
+	}
+	if o.StopWidthPct > 0 {
+		s += fmt.Sprintf(" · stop=%.1f%%", o.StopWidthPct)
+	}
+	return s
 }
 
 func printComparison(runs []*store.BacktestRun) {
