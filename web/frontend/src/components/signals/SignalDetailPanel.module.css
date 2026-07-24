@@ -240,7 +240,7 @@
 .analystDesc {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs);
-  color: var(--text-muted);
+  color: var(--text-primary);
   line-height: 1.4;
 }
 

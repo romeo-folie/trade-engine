@@ -175,7 +175,7 @@
 .reasoning {
   font-family: var(--font-mono);
   font-size: 13px;
-  color: var(--text-muted);
+  color: var(--text-primary);
   line-height: 1.6;
   white-space: pre-wrap;
 }
@@ -310,7 +310,7 @@
 .analystDesc {
   font-family: var(--font-mono);
   font-size: var(--font-size-xs, 11px);
-  color: var(--text-muted);
+  color: var(--text-primary);
   line-height: 1.5;
   white-space: pre-wrap;
   overflow: visible;
