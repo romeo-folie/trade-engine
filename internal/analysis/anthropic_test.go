@@ -160,3 +160,48 @@ func TestExtractAnalysisJSON_RecoversTruncatedJSON(t *testing.T) {
 		t.Fatalf("confidence = %v, want 0.75", got.Confidence)
 	}
 }
+
+// ── JSON-extraction hardening (gpt-5-nano malformed output) ───────────────────
+
+func TestSanitizeJSONControlChars(t *testing.T) {
+	if got := sanitizeJSONControlChars(`{"a":"b"}`); got != `{"a":"b"}` {
+		t.Errorf("well-formed JSON should round-trip unchanged, got %q", got)
+	}
+	// A literal newline INSIDE a string value must be escaped; whitespace outside
+	// strings is left alone.
+	got := sanitizeJSONControlChars("{\n  \"r\":\"a\nb\"}")
+	want := "{\n  \"r\":\"a\\nb\"}"
+	if got != want {
+		t.Errorf("sanitize = %q, want %q", got, want)
+	}
+}
+
+func TestExtractAnalysisJSON_LiteralNewlineInString(t *testing.T) {
+	// gpt-5-nano emits reasoning with real newlines inside the string value —
+	// invalid JSON. Sanitizing recovers the FULL structured response.
+	raw := "{\n  \"action\": \"BUY\",\n  \"confidence\": 0.70,\n  \"size_pct\": 2.5,\n  \"stop_loss\": 580.0,\n  \"take_profit\": 644.47,\n  \"reasoning\": \"Signal at 601\nsupport near 580\"\n}"
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionBuy || got.Confidence != 0.70 {
+		t.Fatalf("action/confidence = %q/%v, want BUY/0.70", got.Action, got.Confidence)
+	}
+	if got.StopLoss != 580.0 || got.TakeProfit != 644.47 {
+		t.Fatalf("SL/TP = %v/%v, want full parse 580/644.47", got.StopLoss, got.TakeProfit)
+	}
+}
+
+func TestExtractAnalysisJSON_RecoversMalformed(t *testing.T) {
+	// A stray JS-style comment breaks strict parsing and can't be sanitized —
+	// the regex fallback must still recover action + confidence (previously this
+	// only fired on truncation, so the vote was dropped).
+	raw := "{\"action\": \"SELL\", \"confidence\": 0.75, // note\n \"size_pct\": 1.5, \"stop_loss\": 100, \"take_profit\": 90, \"reasoning\": \"bearish\"}"
+	got, err := extractAnalysisJSON(raw)
+	if err != nil {
+		t.Fatalf("extractAnalysisJSON error: %v", err)
+	}
+	if got.Action != ActionSell || got.Confidence != 0.75 {
+		t.Fatalf("action/confidence = %q/%v, want SELL/0.75", got.Action, got.Confidence)
+	}
+}

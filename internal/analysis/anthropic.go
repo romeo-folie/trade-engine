@@ -215,9 +215,22 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 
 	var result AnalysisResponse
 	if err := json.Unmarshal([]byte(text), &result); err != nil {
-		// Recovery path for truncated model output (common with long reasoning):
-		// best-effort extraction of required fields from partial JSON text.
-		if strings.Contains(err.Error(), "unexpected end of JSON input") {
+		parsed := false
+		// Some models (notably gpt-5-nano) emit invalid JSON with literal newlines
+		// or tabs inside string values ("invalid character '\n' in string
+		// literal"). Escaping control chars inside strings recovers the FULL
+		// structured response — preferred over the lossy regex fallback below.
+		if sanitized := sanitizeJSONControlChars(text); sanitized != text {
+			if json.Unmarshal([]byte(sanitized), &result) == nil {
+				parsed = true
+			}
+		}
+		if !parsed {
+			// Best-effort field extraction for ANY remaining parse failure —
+			// truncated output OR other malformations (stray comments/slashes,
+			// etc.). Previously this only fired on "unexpected end of JSON input",
+			// so a malformed-but-complete response was dropped and that analyst's
+			// vote was silently lost, shrinking the ensemble.
 			if recovered, ok := recoverPartialAnalysis(text); ok {
 				result = recovered
 			} else {
@@ -227,12 +240,6 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 				}
 				return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 			}
-		} else {
-			preview := text
-			if utf8.RuneCountInString(preview) > 120 {
-				preview = string([]rune(preview)[:120])
-			}
-			return AnalysisResponse{}, fmt.Errorf("unmarshal analysis: %w (text: %q)", err, preview)
 		}
 	}
 
@@ -260,6 +267,50 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 	}
 
 	return result, nil
+}
+
+// sanitizeJSONControlChars escapes literal newline / carriage-return / tab
+// characters that appear INSIDE JSON string values, which some models (e.g.
+// gpt-5-nano) emit unescaped — invalid JSON that json.Unmarshal rejects with
+// "invalid character '\n' in string literal". Whitespace between tokens (the
+// pretty-print indentation outside strings) is left untouched, so a well-formed
+// document round-trips unchanged.
+func sanitizeJSONControlChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 16)
+	inStr := false
+	escaped := false
+	for _, r := range s {
+		if !inStr {
+			if r == '"' {
+				inStr = true
+			}
+			b.WriteRune(r)
+			continue
+		}
+		if escaped {
+			b.WriteRune(r)
+			escaped = false
+			continue
+		}
+		switch r {
+		case '\\':
+			b.WriteRune(r)
+			escaped = true
+		case '"':
+			b.WriteRune(r)
+			inStr = false
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '\t':
+			b.WriteString(`\t`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 func recoverPartialAnalysis(text string) (AnalysisResponse, bool) {
