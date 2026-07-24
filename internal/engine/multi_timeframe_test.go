@@ -37,6 +37,21 @@ func TestShouldRunSecondPass_BorderlineWAITTriggers(t *testing.T) {
 	}
 }
 
+func TestShouldRunSecondPass_SpecialistModeSkipped(t *testing.T) {
+	// Specialist mode resolves borderline WAITs with its own 3-of-4 role
+	// majority + risk-manager veto. The multi-timeframe second pass fans out to
+	// the REGULAR ensemble and would concatenate regular analyst votes onto the
+	// specialist role set — duplicate "regular + specialist" analyst blocks in
+	// the UI (Issue #323). It must be suppressed under specialist mode even when
+	// the borderline band would otherwise trigger it.
+	cfg := borderlineCfg()
+	cfg.SpecialistModeEnabled = true
+	resp := analysis.AnalysisResponse{Action: analysis.ActionWait, Confidence: 0.62}
+	if alt, ok := shouldRunSecondPass(cfg, resp, "1h", false); ok || alt != "" {
+		t.Fatalf("expected second pass suppressed under specialist mode, got ok=%v alt=%q", ok, alt)
+	}
+}
+
 func TestShouldRunSecondPass_BoundsAreInclusive(t *testing.T) {
 	cfg := borderlineCfg()
 	for _, conf := range []float64{0.55, 0.70} {

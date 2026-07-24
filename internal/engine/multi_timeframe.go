@@ -37,6 +37,18 @@ func shouldRunSecondPass(cfg config.AnalysisConfig, resp analysis.AnalysisRespon
 	if isSecondPass {
 		return "", false // recursion guard — never trigger a third pass.
 	}
+	// Specialist mode (Issue #323) resolves borderline WAITs with its own
+	// 3-of-4 role majority + risk-manager veto over the specialist analysts.
+	// The multi-timeframe second pass fans out to the REGULAR ensemble
+	// (AnalyzeEnsembleWithSet) and re-arbitrates with the plain arbiter, which
+	// (a) bypasses specialist resolution and (b) concatenates regular analyst
+	// votes onto the specialist role set — surfacing as duplicate "regular +
+	// specialist" analyst blocks in the UI (7 instead of 4). The two mechanisms
+	// are mutually exclusive, so skip the second pass entirely under specialist
+	// mode.
+	if cfg.SpecialistModeEnabled {
+		return "", false
+	}
 	if !cfg.MultiTimeframeBorderlineEnabled {
 		return "", false
 	}
