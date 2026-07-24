@@ -448,6 +448,33 @@ func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	// Fewer than nine completed daily candles makes EMA calculation fail.
+	fp := &fakePrices{candles: dailyCloses(100, 101, 102)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("missing EMA history must leave the trade open")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("orders = %+v, want a protective stop despite missing EMA history", fb.placed)
+	}
+	if stop := fb.placed[0]; stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
+		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	}
+}
+
 func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
@@ -467,8 +494,10 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	if fs.trades["t1"].Status != "closed" {
 		t.Fatal("daily close below ema9 must close the trade")
 	}
-	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
-		t.Fatalf("placed = %+v, want exactly one market exit", fb.placed)
+	if len(fb.placed) != 2 ||
+		fb.placed[0].Type != execution.OrderTypeStop ||
+		fb.placed[1].Type != execution.OrderTypeMarket {
+		t.Fatalf("placed = %+v, want protective stop followed by market exit", fb.placed)
 	}
 	if got := fs.trades["t1"].ExitPrice; got != 90 {
 		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)

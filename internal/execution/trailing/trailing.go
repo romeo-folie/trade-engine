@@ -372,6 +372,13 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return errors.New("ema9 rule requires a positive protective stop")
 	}
 
+	// Protection does not depend on market-data availability. Seed the hard
+	// stop before fetching EMA inputs so a provider outage or short history
+	// cannot leave an existing open position exposed.
+	if err := m.ensureProtectiveStop(ctx, t); err != nil {
+		return err
+	}
+
 	now := m.now()
 	closePrice, ema, closeCompletedAt, err := m.priceAndEMA9(ctx, t.Ticker, now)
 	if err != nil {
@@ -386,16 +393,13 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 			!closeCompletedAt.After(t.OpenedAt) {
 			// The close signal existed before this position did. Acting on it
 			// would churn a brand-new BUY on the manager's first tick.
-			return m.ensureProtectiveStop(ctx, t)
+			return nil
 		}
 		if !m.marketOpen(now) {
 			// A market sell submitted after 16:00 ET can sit queued until the
 			// next open. Keep the trade row and broker hard stop live overnight,
 			// then retry this same completed-close signal during the next
 			// eligible session.
-			if err := m.ensureProtectiveStop(ctx, t); err != nil {
-				return err
-			}
 			logger.Info("trailing-stop: daily close below ema9; deferring market exit until regular session",
 				"trade_id", t.ID,
 				"ticker", t.Ticker,
@@ -413,9 +417,9 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return m.exitAndClose(ctx, t, closePrice)
 	}
 
-	// Uncapped entries do not have OCO bracket children. Ensure their original
-	// hard stop is resident at the broker while the EMA winning exit waits.
-	return m.ensureProtectiveStop(ctx, t)
+	// The original hard stop seeded above remains resident at the broker while
+	// the EMA winning exit waits.
+	return nil
 }
 
 func (m *Manager) ensureProtectiveStop(ctx context.Context, t store.Trade) error {
