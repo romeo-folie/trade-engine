@@ -373,7 +373,7 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 	}
 
 	now := m.now()
-	closePrice, ema, err := m.priceAndEMA9(ctx, t.Ticker, now)
+	closePrice, ema, closeCompletedAt, err := m.priceAndEMA9(ctx, t.Ticker, now)
 	if err != nil {
 		return fmt.Errorf("price/ema9: %w", err)
 	}
@@ -382,6 +382,12 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 	}
 
 	if closePrice < ema {
+		if !t.OpenedAt.IsZero() && !closeCompletedAt.IsZero() &&
+			!closeCompletedAt.After(t.OpenedAt) {
+			// The close signal existed before this position did. Acting on it
+			// would churn a brand-new BUY on the manager's first tick.
+			return m.ensureProtectiveStop(ctx, t)
+		}
 		if !m.marketOpen(now) {
 			// A market sell submitted after 16:00 ET can sit queued until the
 			// next open. Keep the trade row and broker hard stop live overnight,
@@ -446,20 +452,33 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 // priceAndEMA9 fetches daily candles so the live rule uses the same timeframe
 // as the exit-policy study. The provider's latest returned daily bar is the
 // close evidence used by the rule.
-func (m *Manager) priceAndEMA9(ctx context.Context, ticker string, now time.Time) (float64, float64, error) {
+func (m *Manager) priceAndEMA9(ctx context.Context, ticker string, now time.Time) (float64, float64, time.Time, error) {
 	if m.prices == nil {
-		return 0, 0, errors.New("no price provider configured")
+		return 0, 0, time.Time{}, errors.New("no price provider configured")
 	}
 	candles, err := m.prices.FetchHistory(ctx, ticker, data.Timeframe1Day, candleHistory)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, time.Time{}, err
 	}
 	candles = completedDailyCandles(candles, now)
 	if len(candles) < EMAPeriod {
-		return 0, 0, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))
+		return 0, 0, time.Time{}, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))
 	}
 	ema := emaClose(candles, EMAPeriod)
-	return candles[len(candles)-1].Close, ema, nil
+	last := candles[len(candles)-1]
+	return last.Close, ema, dailyCloseCompletedAt(last), nil
+}
+
+// dailyCloseCompletedAt converts a daily bar's session date into the regular
+// US equity close instant. Provider timestamps identify the daily session's
+// start; comparing that raw timestamp with Trade.OpenedAt would incorrectly
+// reject a same-day close that completed after a morning entry.
+func dailyCloseCompletedAt(candle data.Candle) time.Time {
+	if candle.Timestamp.IsZero() {
+		return time.Time{}
+	}
+	session := candle.Timestamp.In(newYorkLocation)
+	return time.Date(session.Year(), session.Month(), session.Day(), 16, 0, 0, 0, newYorkLocation)
 }
 
 // regularStockSession is deliberately conservative: EMA exits are eligible

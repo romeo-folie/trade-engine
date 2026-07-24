@@ -550,6 +550,36 @@ func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9IgnoresClosePredatingTrade(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+		OpenedAt: time.Date(2026, time.July, 24, 9, 35, 0, 0, newYorkLocation),
+	}
+	candles := dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)
+	for i := range candles {
+		candles[i].Timestamp = time.Date(2026, time.July, 14+i, 0, 0, 0, 0, newYorkLocation)
+	}
+	fp := &fakePrices{candles: candles}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("pre-entry EMA close must not churn the new trade")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("orders = %+v, want only the protective stop", fb.placed)
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("pre-entry EMA close cancelled protection: %v", fb.cancelled)
+	}
+}
+
 func TestProtectiveStopTIF(t *testing.T) {
 	if got := protectiveStopTIF(10); got != "gtc" {
 		t.Fatalf("whole-share TIF = %q, want gtc", got)

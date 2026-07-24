@@ -2089,6 +2089,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
 	}
 
+	if uncapTakeProfit && result.FilledQty > 0 {
+		if err := e.ensureUncappedProtectiveStop(
+			ctx, tradeID, sig.Ticker, result.FilledQty, sig.StopLoss,
+		); err != nil {
+			logger.Error("uncapped entry filled without immediate broker stop",
+				"trade_id", tradeID,
+				"ticker", sig.Ticker,
+				"qty", result.FilledQty,
+				"stop_loss", sig.StopLoss,
+				"err", err,
+			)
+		}
+	}
+
 	// Persist the bracket's child exit legs so the monitor knows the trade
 	// is broker-managed (reconcileBracketTrade) and the trailing manager
 	// finds the SL leg to PATCH-ratchet. ChildOrderIDs is [TP, SL]. A broker
@@ -2166,6 +2180,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				if err := store.UpdateOrderFillPrice(bfCtx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
 					logger.Warn("fill poll: update order fill price",
 						"broker_order_id", brokerOrderID, "err", err)
+				}
+				if uncapTakeProfit && status.FilledQty > 0 {
+					if err := e.ensureUncappedProtectiveStop(
+						bfCtx, tradeID, sig.Ticker, status.FilledQty, sig.StopLoss,
+					); err != nil {
+						logger.Error("fill poll: uncapped position lacks full broker-stop coverage",
+							"trade_id", tradeID,
+							"ticker", sig.Ticker,
+							"filled_qty", status.FilledQty,
+							"stop_loss", sig.StopLoss,
+							"err", err,
+						)
+					}
 				}
 			}
 			var lastQty float64
