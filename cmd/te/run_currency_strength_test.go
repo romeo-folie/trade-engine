@@ -10,6 +10,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
 func TestIsIBKRPaperAccountID(t *testing.T) {
@@ -187,11 +188,57 @@ func (c *captureNotifier) Notify(_ context.Context, msg string) error {
 	return nil
 }
 
+func TestBuildCurrencyStrengthEntryMessage(t *testing.T) {
+	sig := currencystrength.Signal{
+		Symbol: "GBP/USD",
+		Side:   "buy",
+		Strong: "GBP",
+		Weak:   "USD",
+		Gap:    0.0123,
+	}
+	msg := buildCurrencyStrengthEntryMessage(sig, 100000, "OID-9", "Submitted")
+	for _, want := range []string{
+		"order placed",
+		"BUY GBP/USD · 100000 units",
+		"Strongest GBP · Weakest USD · gap 0.0123",
+		"Order OID-9 · Submitted",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("entry message missing %q\ngot:\n%s", want, msg)
+		}
+	}
+}
+
+func TestBuildCurrencyStrengthNoOrderMessage(t *testing.T) {
+	if msg := buildCurrencyStrengthNoOrderMessage("min_gap"); !strings.Contains(msg, "Reason: min_gap") {
+		t.Errorf("no-order message missing reason; got:\n%s", msg)
+	}
+	// Empty reason falls back to a human-readable default rather than a blank line.
+	if msg := buildCurrencyStrengthNoOrderMessage(""); !strings.Contains(msg, "no qualifying signal") {
+		t.Errorf("empty reason should default; got:\n%s", msg)
+	}
+}
+
+func TestBuildCurrencyStrengthExitMessage(t *testing.T) {
+	msg := buildCurrencyStrengthExitMessage("USD/JPY", execution.OrderSideSell, 100000, "OID-X", "Filled")
+	for _, want := range []string{
+		"position flattened",
+		"SELL USD/JPY · 100000 units",
+		"Order OID-X · Filled",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("exit message missing %q\ngot:\n%s", want, msg)
+		}
+	}
+}
+
 func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
+	notifier := &captureNotifier{}
 	runner := &currencyStrengthPaperRunner{
 		cfg: config.CurrencyStrengthConfig{
 			TradeInstruments: []string{"GBP/USD"},
 		},
+		notifier:  notifier,
 		market:    fakeMarketDataProvider{},
 		broker:    fakeExecutor{positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}}},
 		statePath: t.TempDir() + "/currency-strength.json",
@@ -209,6 +256,9 @@ func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
 	}
 	if runner.decisionDoneFor != "2026-07-21" {
 		t.Fatalf("decisionDoneFor = %q, want 2026-07-21", runner.decisionDoneFor)
+	}
+	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "no order today") {
+		t.Fatalf("expected one no-order notification, got %v", notifier.msgs)
 	}
 }
 

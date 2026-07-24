@@ -116,6 +116,37 @@ func buildCurrencyStrengthSessionStartMessage(cfg config.CurrencyStrengthConfig)
 	return sb.String()
 }
 
+// buildCurrencyStrengthEntryMessage announces a placed paper entry — the
+// currency-strength analogue of the ORB "Brackets Placed" message. Reports the
+// routed pair, side/size, and the strong/weak ranking that produced the signal.
+func buildCurrencyStrengthEntryMessage(sig currencystrength.Signal, units int, orderID, status string) string {
+	var sb strings.Builder
+	sb.WriteString("✅ FX Currency-Strength — order placed\n")
+	fmt.Fprintf(&sb, "%s %s · %d units (market)\n", strings.ToUpper(sig.Side), sig.Symbol, units)
+	fmt.Fprintf(&sb, "Strongest %s · Weakest %s · gap %.4f\n", sig.Strong, sig.Weak, sig.Gap)
+	fmt.Fprintf(&sb, "Order %s · %s", orderID, status)
+	return sb.String()
+}
+
+// buildCurrencyStrengthNoOrderMessage explains why no paper order was placed on a
+// decision day, so a silent session is distinguishable from an inactive one.
+func buildCurrencyStrengthNoOrderMessage(reason string) string {
+	if reason == "" {
+		reason = "no qualifying signal"
+	}
+	return "💤 FX Currency-Strength — no order today\nReason: " + reason
+}
+
+// buildCurrencyStrengthExitMessage announces the flattening order placed at the
+// configured exit time (or on a stale carried-over position).
+func buildCurrencyStrengthExitMessage(symbol string, side execution.OrderSide, qty float64, orderID, status string) string {
+	var sb strings.Builder
+	sb.WriteString("🏁 FX Currency-Strength — position flattened\n")
+	fmt.Fprintf(&sb, "%s %s · %.0f units (market)\n", strings.ToUpper(string(side)), symbol, qty)
+	fmt.Fprintf(&sb, "Order %s · %s", orderID, status)
+	return sb.String()
+}
+
 func shouldRunCurrencyStrengthForForexSession(session string) bool {
 	switch strings.ToLower(strings.TrimSpace(session)) {
 	case "", "london", "both":
@@ -175,6 +206,7 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 					logger.Info("currency-strength: entry window expired; no paper order placed",
 						"date", dateKey, "strength_end", strengthEnd.Format(time.RFC3339), "grace", currencyStrengthEntryGrace.String())
 					r.decisionDoneFor = dateKey
+					r.notify(ctx, buildCurrencyStrengthNoOrderMessage("entry window expired before evaluation"))
 				} else if err := r.evaluateAndEnter(ctx, dateKey, strengthStart, strengthEnd); err != nil {
 					return err
 				}
@@ -202,11 +234,14 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	if existing, err := r.configuredPosition(ctx); err != nil {
 		logger.Warn("currency-strength: skipping entry after position check failure", "date", dateKey, "err", err)
 		r.decisionDoneFor = dateKey
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage("position check failed: "+err.Error()))
 		return nil
 	} else if existing != nil {
 		logger.Info("currency-strength: skipping entry because configured IBKR position already exists without runner state",
 			"date", dateKey, "ticker", existing.Ticker, "quantity", existing.Quantity)
 		r.decisionDoneFor = dateKey
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(fmt.Sprintf("existing %s position (%.0f units) held outside runner state",
+			existing.Ticker, existing.Quantity)))
 		return nil
 	}
 
@@ -228,6 +263,7 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	r.decisionDoneFor = dateKey
 	if decision.Signal == nil {
 		logger.Info("currency-strength: no paper order", "date", dateKey, "reason", decision.SkipReason)
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(decision.SkipReason))
 		return nil
 	}
 
@@ -265,6 +301,7 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		"date", dateKey, "symbol", decision.Signal.Symbol, "side", decision.Signal.Side,
 		"quantity", r.cfg.Units, "order_id", result.BrokerOrderID, "status", result.Status,
 		"strong", decision.Signal.Strong, "weak", decision.Signal.Weak, "gap", decision.Signal.Gap)
+	r.notify(ctx, buildCurrencyStrengthEntryMessage(*decision.Signal, r.cfg.Units, result.BrokerOrderID, result.Status))
 	return nil
 }
 
@@ -308,6 +345,7 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	logger.Info("currency-strength: IBKR paper exit submitted",
 		"date", r.state.Date, "symbol", r.state.Symbol, "side", exitSide,
 		"quantity", qty, "order_id", result.BrokerOrderID, "status", result.Status)
+	r.notify(ctx, buildCurrencyStrengthExitMessage(r.state.Symbol, exitSide, qty, result.BrokerOrderID, result.Status))
 	return r.clearState()
 }
 
