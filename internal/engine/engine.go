@@ -2537,10 +2537,11 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	for _, t := range trades {
-		// Broker-resident bracket exits (#435): a trade with working exit
-		// legs is protected at the broker — reconcile leg fills into the
-		// trades table and NEVER run the software price-compare exit on top
-		// of live legs (double-sell). Deliberately NOT gated on
+		// Broker-resident exits (#435): a trade with working bracket legs, or
+		// an uncapped trade with a standalone hard stop, is protected at the
+		// broker — reconcile fills into the trades table and NEVER run the
+		// software price-compare exit on top of live legs (double-sell).
+		// Deliberately NOT gated on
 		// bracket_exits_enabled: the flag only decides whether NEW entries
 		// become brackets — an existing bracket trade must stay
 		// broker-managed even after the flag is flipped off, or this loop

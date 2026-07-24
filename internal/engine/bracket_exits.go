@@ -20,12 +20,12 @@ import (
 // live at the broker; monitorPositions then only reconciles leg fills into
 // the trades table instead of running its own price-compare exits.
 //
-// Scope note: everything here keys on OCO-linked bracket CHILDREN
-// (parent_order_id set, migration 044). The trailing manager's standalone
-// stops are is_stop_loss orders too, but trades carrying only those must
-// keep the software take-profit monitoring they have today — treating them
-// as broker-managed would silently disable TP exits for every trailing
-// trade (Codex P2 on #435).
+// Scope note: OCO-linked bracket CHILDREN (parent_order_id set, migration 044)
+// are always broker-managed. A standalone trailing stop is broker-managed only
+// when the trade has no software take-profit; otherwise the software monitor
+// must retain ownership of that TP (Codex P2 on #435). The no-TP case covers
+// uncapped ATR/EMA trades and prevents the monitor from double-selling after
+// their broker-resident hard stop fills.
 //
 // Degradation is graceful in both directions: a bracket entry whose broker
 // returns no child legs (e.g. the no-API-key PaperExecutor) simply stays
@@ -51,13 +51,32 @@ func bracketChildren(legs []store.Order) []store.Order {
 	return out
 }
 
-// reconcileBracketTrade books broker-side bracket leg fills into the trades
-// table and reports whether the trade's exits are broker-resident this tick.
-// true  → monitorPositions must NOT run its own price-compare exit (the
-//         position is either still protected by working OCO legs, was just
-//         closed here, or its state is unknown — never risk a double-sell).
-// false → the trade has no working bracket legs (standalone trailing stops
-//         don't count); app-managed monitoring applies.
+// brokerManagedExitLegs returns the broker orders that own all exits for this
+// trade. Bracket children always qualify. A standalone stop qualifies only
+// when no software take-profit remains; in that case there is no app-managed
+// winning exit for monitorPositions to preserve.
+func brokerManagedExitLegs(t store.Trade, legs []store.Order) []store.Order {
+	if children := bracketChildren(legs); len(children) > 0 {
+		return children
+	}
+	if t.TakeProfit > 0 {
+		return nil
+	}
+	out := legs[:0:0]
+	for _, leg := range legs {
+		if leg.ParentOrderID == "" && leg.IsStopLoss {
+			out = append(out, leg)
+		}
+	}
+	return out
+}
+
+// reconcileBracketTrade books broker-side exit fills into the trades table and
+// reports whether the trade's exits are broker-resident this tick. A true
+// result means monitorPositions must not run its own price-compare exit: the
+// position is protected by working legs, was closed here, or has unknown broker
+// state. A false result means app-managed monitoring applies. Standalone stops
+// on trades with a software TP deliberately do not count.
 func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool {
 	all, err := store.OpenExitLegsForTrade(ctx, t.ID)
 	if err != nil {
@@ -67,7 +86,7 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
 		return true
 	}
-	legs := bracketChildren(all)
+	legs := brokerManagedExitLegs(t, all)
 	if len(legs) == 0 {
 		return false
 	}

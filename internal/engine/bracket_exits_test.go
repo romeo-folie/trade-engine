@@ -145,6 +145,73 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 	}
 }
 
+func TestReconcileBracket_UncappedStandaloneStopIsBrokerManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "USTP", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 0, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "uncapped-stop", Ticker: "USTP", Side: "sell",
+		OrderType: "stop", Quantity: 5, StopPrice: 95, Status: "pending",
+		IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"uncapped-stop": {Status: "accepted"},
+	}}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("uncapped standalone stop must suppress the software stop path")
+	}
+	if tr := getTrade(t, tradeID); tr.ID == "" {
+		t.Fatal("working standalone stop must leave the trade open")
+	}
+}
+
+func TestReconcileBracket_UncappedStandaloneStopFillClosesTrade(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "USFL", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 0, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "uncapped-stop-fill", Ticker: "USFL", Side: "sell",
+		OrderType: "stop", Quantity: 5, StopPrice: 95, Status: "pending",
+		IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"uncapped-stop-fill": {Status: "filled", FilledPrice: 94.75, FilledQty: 5},
+	}}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("filled uncapped standalone stop must be reconciled")
+	}
+	if tr := getTrade(t, tradeID); tr.ID != "" {
+		t.Fatal("standalone broker stop fill must close the DB trade")
+	}
+	if e.portfolio.CurrentState().LastLossAt.IsZero() {
+		t.Fatal("standalone stop loss must record loss cooldown")
+	}
+}
+
 // TestReconcileBracket_WorkingLegsSkipSoftwareExit: pending OCO legs →
 // handled=true, trade stays open, nothing cancelled.
 func TestReconcileBracket_WorkingLegsSkipSoftwareExit(t *testing.T) {
