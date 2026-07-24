@@ -135,6 +135,9 @@ type Config struct {
 	// wiring supplies engine.IsMarketOpen (including exchange holidays);
 	// tests and other callers fall back to regular weekday session hours.
 	MarketOpen func(time.Time) bool
+	// RecordLoss updates engine-level cooldown state after a trailing exit
+	// realizes a loss. It is optional for standalone/tests callers.
+	RecordLoss func()
 }
 
 // Normalize fills in defaults so callers can hand the manager a partially
@@ -651,6 +654,9 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, fallbackPrice
 	}
 	if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
 		return fmt.Errorf("close trade after market exit: %w", err)
+	}
+	if pnl < 0 && m.cfg.RecordLoss != nil {
+		m.cfg.RecordLoss()
 	}
 	return nil
 }

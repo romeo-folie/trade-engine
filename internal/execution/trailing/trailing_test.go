@@ -484,8 +484,13 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	// Nine closes at 100 seed EMA=100; the final 90 close produces EMA=98.
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
 	fb := &fakeBroker{}
+	losses := 0
 
-	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m := NewManager(Config{
+		Enabled:    true,
+		Rule:       RuleEMA9,
+		RecordLoss: func() { losses++ },
+	}, fs, fp, fb)
 	m.now = func() time.Time {
 		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
 	}
@@ -501,6 +506,9 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	}
 	if got := fs.trades["t1"].ExitPrice; got != 90 {
 		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
+	}
+	if losses != 1 {
+		t.Fatalf("loss cooldown callbacks = %d, want 1", losses)
 	}
 }
 

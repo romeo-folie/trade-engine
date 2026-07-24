@@ -15,18 +15,21 @@ func TestUncappedTakeProfitRequiresEnabledTrailingManager(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	if !uncappedTakeProfitEnabled(risk, execution.OrderSideBuy) {
+	if !uncappedTakeProfitEnabled(risk, execution.OrderSideBuy, true) {
 		t.Fatal("BUY with uncap + enabled trailing manager must uncap")
 	}
 
 	risk.TrailingStop.Enabled = false
-	if uncappedTakeProfitEnabled(risk, execution.OrderSideBuy) {
+	if uncappedTakeProfitEnabled(risk, execution.OrderSideBuy, true) {
 		t.Fatal("uncap without the trailing manager must fail safe to baseline")
 	}
 
 	risk.TrailingStop.Enabled = true
-	if uncappedTakeProfitEnabled(risk, execution.OrderSideSell) {
+	if uncappedTakeProfitEnabled(risk, execution.OrderSideSell, true) {
 		t.Fatal("SELL must never use the entry take-profit policy")
+	}
+	if uncappedTakeProfitEnabled(risk, execution.OrderSideBuy, false) {
+		t.Fatal("uncap must fail safe when the configured trailing worker cannot start")
 	}
 }
 
@@ -39,7 +42,7 @@ func TestUncappedTakeProfitDisablesBrokerAndSoftwareCaps(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 5.8, 100, 95)
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 5.8, 100, 95, true)
 	if !active || qty != 5 {
 		t.Fatalf("uncapped entry active=%v qty=%v, want true/5 whole shares", active, qty)
 	}
@@ -67,7 +70,7 @@ func TestUncappedFractionalEntryFailsSafeToBaseline(t *testing.T) {
 			Rule:    "ema9",
 		},
 	}
-	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 0.75, 100, 95)
+	active, qty := resolveUncappedEntry(risk, execution.OrderSideBuy, 0.75, 100, 95, true)
 	if active {
 		t.Fatal("sub-one-share entry must not activate uncapped/GTC policy")
 	}
@@ -89,7 +92,7 @@ func TestUncappedEntryRequiresCoherentHardStop(t *testing.T) {
 	}
 	for _, stopLoss := range []float64{0, -1, 100, 105} {
 		active, qty := resolveUncappedEntry(
-			risk, execution.OrderSideBuy, 5, 100, stopLoss,
+			risk, execution.OrderSideBuy, 5, 100, stopLoss, true,
 		)
 		if active {
 			t.Fatalf("stop loss %v activated uncapped entry", stopLoss)

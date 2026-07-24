@@ -101,6 +101,11 @@ type Engine struct {
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
 
+	// trailingManagerAvailable is set by command wiring only when every
+	// dependency needed to run the trailing worker is present. Config alone is
+	// insufficient: uncapping without a running worker removes the winning exit.
+	trailingManagerAvailable bool
+
 	// todayStartingEquity tracks the equity at 00:00 UTC for the current day.
 	todayStartingEquity float64
 	todaySummaryDate    string
@@ -1536,6 +1541,13 @@ func (e *Engine) SetBatchFlusher(f BatchFlusher) {
 	e.batchFlusher = f
 }
 
+// SetTrailingManagerAvailable records whether command wiring actually started
+// the trailing worker. Uncapped entries fail safe to their baseline TP unless
+// this runtime capability is present.
+func (e *Engine) SetTrailingManagerAvailable(available bool) {
+	e.trailingManagerAvailable = available
+}
+
 // SetMode updates the engine's active trading mode at runtime.
 func (e *Engine) SetMode(mode string) {
 	e.modeMu.Lock()
@@ -2000,14 +2012,15 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// guarantees the position retains a broker hard stop while the selected
 	// trail owns the winning exit. Keeping the manager requirement here makes
 	// an accidentally-partial config fail safe to the existing fixed TP.
-	uncapRequested := uncappedTakeProfitEnabled(e.cfg.Risk, side)
+	uncapRequested := side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
 	uncapTakeProfit, uncappedQty := resolveUncappedEntry(
 		e.cfg.Risk, side, qty, sig.SignalPrice, sig.StopLoss,
+		e.trailingManagerAvailable,
 	)
 	if uncapTakeProfit {
 		orderReq.Quantity = uncappedQty
 	} else if uncapRequested {
-		logger.Warn("exit policy: uncapped entry lacks whole-share sizing or a coherent hard stop; keeping baseline fixed take-profit",
+		logger.Warn("exit policy: uncapped entry lacks a running trail, whole-share sizing, or a coherent hard stop; keeping baseline fixed take-profit",
 			"ticker", sig.Ticker,
 			"qty", qty,
 			"signal_price", sig.SignalPrice,

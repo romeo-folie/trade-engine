@@ -10,10 +10,15 @@ import (
 // uncappedTakeProfitEnabled deliberately requires the trailing manager. This
 // keeps a partial config (uncap=true, trailing disabled) on the proven baseline
 // instead of silently removing its only winning exit.
-func uncappedTakeProfitEnabled(risk config.RiskConfig, side execution.OrderSide) bool {
+func uncappedTakeProfitEnabled(
+	risk config.RiskConfig,
+	side execution.OrderSide,
+	trailingManagerAvailable bool,
+) bool {
 	return side == execution.OrderSideBuy &&
 		risk.UncapTakeProfit &&
-		risk.TrailingStop.Enabled
+		risk.TrailingStop.Enabled &&
+		trailingManagerAvailable
 }
 
 // resolveUncappedEntry keeps the uncapped/GTC-protected path on whole shares
@@ -24,8 +29,9 @@ func resolveUncappedEntry(
 	risk config.RiskConfig,
 	side execution.OrderSide,
 	quantity, signalPrice, stopLoss float64,
+	trailingManagerAvailable bool,
 ) (bool, float64) {
-	if !uncappedTakeProfitEnabled(risk, side) {
+	if !uncappedTakeProfitEnabled(risk, side, trailingManagerAvailable) {
 		return false, quantity
 	}
 	if signalPrice <= 0 || stopLoss <= 0 || stopLoss >= signalPrice {

@@ -214,8 +214,12 @@ Modes:
 					Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
 					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
 					MarketOpen:  engine.IsMarketOpen,
+					RecordLoss:  eng.Portfolio().RecordLoss,
 				}
 				mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
+				// Only advertise the uncapped-exit capability after every
+				// dependency check above has passed and the worker is ready to run.
+				eng.SetTrailingManagerAvailable(true)
 				go mgr.Run(ctx)
 			}
 		}
