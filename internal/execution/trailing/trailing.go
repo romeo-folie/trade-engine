@@ -386,11 +386,15 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return errors.New("ema9 rule requires a positive protective stop")
 	}
 
-	// Protection does not depend on market-data availability. Seed the hard
-	// stop before fetching EMA inputs so a provider outage or short history
-	// cannot leave an existing open position exposed.
-	if err := m.ensureProtectiveStop(ctx, t); err != nil {
-		return err
+	// Uncapped EMA trades have no software take-profit, so their hard stop
+	// must live at the broker even when market data is unavailable. Capped
+	// trades remain entirely app-managed here: adding a standalone stop
+	// alongside their software take-profit creates two independent exit
+	// owners and can double-sell when the broker stop fills.
+	if t.TakeProfit <= 0 {
+		if err := m.ensureProtectiveStop(ctx, t); err != nil {
+			return err
+		}
 	}
 
 	now := m.now()
@@ -431,8 +435,8 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 		return m.exitAndClose(ctx, t, closePrice)
 	}
 
-	// The original hard stop seeded above remains resident at the broker while
-	// the EMA winning exit waits.
+	// For uncapped trades, the original hard stop seeded above remains resident
+	// at the broker while the EMA winning exit waits.
 	return nil
 }
 

@@ -9,6 +9,14 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// shouldPollEntryFill keeps tracking every broker order that can still add
+// fills. FilledPrice may already be nonzero for a partial fill, so status—not
+// price—is the completion signal.
+func shouldPollEntryFill(result execution.OrderResult) bool {
+	return result.BrokerOrderID != "" &&
+		!execution.IsTerminalOrderStatus(result.Status)
+}
+
 // ensureUncappedProtectiveStop establishes broker protection as soon as an
 // uncapped entry fill is known. It also grows a stop seeded against a partial
 // fill when later polls report more shares.

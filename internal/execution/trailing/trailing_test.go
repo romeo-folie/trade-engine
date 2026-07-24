@@ -453,6 +453,29 @@ func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9CappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, TakeProfit: 110, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 105)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("close above ema9 must keep capped trade open")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want no standalone stop beside software take-profit", fb.placed)
+	}
+}
+
 func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{

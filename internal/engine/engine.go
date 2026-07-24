@@ -2106,6 +2106,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
 	}
 
+	initialProtectedQty := 0.0
 	if uncapTakeProfit && result.FilledQty > 0 {
 		if err := e.ensureUncappedProtectiveStop(
 			ctx, tradeID, sig.Ticker, result.FilledQty, sig.StopLoss,
@@ -2117,6 +2118,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"stop_loss", sig.StopLoss,
 				"err", err,
 			)
+		} else {
+			initialProtectedQty = result.FilledQty
 		}
 	}
 
@@ -2171,15 +2174,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Quantity: result.FilledQty, Strategy: sig.Strategy,
 	})
 
-	// If the broker returned a zero fill price (Alpaca market orders fill async),
-	// poll GetOrderStatus and backfill the trade record — until the order reaches
-	// a TERMINAL state, not merely until a price appears. The old `FilledPrice >
-	// 0 → done` condition froze PARTIAL fills as trade truth: NOK's 148.31-share
-	// fractional entry was recorded at its first partial (30 shares), the exit
-	// later sold only those 30, and 118 shares were orphaned at the broker with
-	// no stop and analyst SELLs blocked by the ownership guard. Every poll now
-	// re-backfills, so quantity tracks upward while the order keeps filling.
-	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
+	// Poll every nonterminal broker order and backfill until it reaches a final
+	// state. A nonzero price does not imply completion: Alpaca can return an
+	// immediate partial fill, then continue filling the remaining quantity.
+	// Stopping at that first partial freezes the smaller quantity as trade truth
+	// and leaves later shares untracked and under-protected.
+	if shouldPollEntryFill(result) {
 		brokerOrderID := result.BrokerOrderID
 		executor := e.executor
 		go func() {
@@ -2216,7 +2216,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				}
 				return nil
 			}
-			var lastRecordedQty, lastProtectedQty float64
+			lastRecordedQty := result.FilledQty
+			lastProtectedQty := initialProtectedQty
 			for i := 0; i < maxRetries; i++ {
 				time.Sleep(retryDelay)
 				pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

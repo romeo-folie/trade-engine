@@ -130,3 +130,50 @@ func TestAdvanceProtectedQuantityRetriesFailedCoverage(t *testing.T) {
 		t.Fatalf("already-covered fill retried: protected=%v attempts=%d err=%v", protected, attempts, err)
 	}
 }
+
+func TestShouldPollEntryFill(t *testing.T) {
+	tests := []struct {
+		name   string
+		result execution.OrderResult
+		want   bool
+	}{
+		{
+			name: "immediate partial fill with price",
+			result: execution.OrderResult{
+				BrokerOrderID: "partial-1",
+				Status:        "partially_filled",
+				FilledPrice:   100,
+				FilledQty:     2,
+			},
+			want: true,
+		},
+		{
+			name:   "accepted with no fill",
+			result: execution.OrderResult{BrokerOrderID: "pending-1", Status: "accepted"},
+			want:   true,
+		},
+		{
+			name:   "fully filled",
+			result: execution.OrderResult{BrokerOrderID: "filled-1", Status: "filled", FilledPrice: 100, FilledQty: 5},
+			want:   false,
+		},
+		{
+			name:   "cancelled",
+			result: execution.OrderResult{BrokerOrderID: "cancelled-1", Status: "cancelled"},
+			want:   false,
+		},
+		{
+			name:   "no broker order",
+			result: execution.OrderResult{Status: "accepted"},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldPollEntryFill(tt.result); got != tt.want {
+				t.Fatalf("shouldPollEntryFill(%+v) = %v, want %v", tt.result, got, tt.want)
+			}
+		})
+	}
+}
