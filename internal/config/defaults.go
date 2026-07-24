@@ -58,7 +58,7 @@ func Defaults() *Config {
 				"arbiter": {
 					ModelConfig: ModelConfig{
 						Provider:    "anthropic",
-						Model:       "claude-sonnet-4-6",
+						Model:       "claude-haiku-4-5",
 						APIKeyEnv:   "ANTHROPIC_API_KEY",
 						MaxTokens:   4096,
 						Temperature: 0.1,
