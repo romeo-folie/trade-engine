@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,6 +100,91 @@ func TestShouldRunCurrencyStrengthPaperOrders(t *testing.T) {
 			t.Errorf("shouldRunCurrencyStrengthPaperOrders(%q) = %v, want %v", tc.mode, got, tc.want)
 		}
 	}
+}
+
+func TestBuildCurrencyStrengthSessionStartMessage(t *testing.T) {
+	cfg := config.CurrencyStrengthConfig{
+		RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY", "EUR/JPY", "GBP/JPY"},
+		TradeInstruments: []string{"GBP/USD", "USD/JPY"},
+		Timezone:         "UTC",
+		StrengthStart:    "06:00",
+		StrengthEnd:      "09:00",
+		ExitTime:         "18:00",
+	}
+
+	msg := buildCurrencyStrengthSessionStartMessage(cfg)
+
+	for _, want := range []string{
+		"FX Currency-Strength",
+		"EUR/USD, GBP/USD, USD/JPY, EUR/JPY, GBP/JPY", // full ranking basket
+		"Tradeable: GBP/USD, USD/JPY",                 // order-eligible subset only
+		"06:00–09:00 UTC",
+		"decision ~09:00",
+		"exit 18:00",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("session-start message missing %q\ngot:\n%s", want, msg)
+		}
+	}
+}
+
+func TestBuildCurrencyStrengthSessionStartMessageDefaultsTimezone(t *testing.T) {
+	msg := buildCurrencyStrengthSessionStartMessage(config.CurrencyStrengthConfig{
+		RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+		TradeInstruments: []string{"GBP/USD"},
+		StrengthStart:    "06:00",
+		StrengthEnd:      "09:00",
+		ExitTime:         "18:00",
+	})
+	if !strings.Contains(msg, "06:00–09:00 UTC") {
+		t.Errorf("empty timezone should render as UTC; got:\n%s", msg)
+	}
+}
+
+func TestCurrencyStrengthRunEmitsSessionStartNotification(t *testing.T) {
+	notifier := &captureNotifier{}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			TradeInstruments: []string{"GBP/USD"},
+			Timezone:         "UTC",
+			StrengthStart:    "06:00",
+			StrengthEnd:      "09:00",
+			ExitTime:         "18:00",
+			Units:            100000,
+		},
+		market:    fakeMarketDataProvider{},
+		broker:    fakeExecutor{},
+		statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time {
+			// Before the strength window closes, so Run announces the basket and
+			// then blocks on the ticker without evaluating/entering — cancel to exit.
+			return time.Date(2026, 7, 21, 6, 30, 0, 0, time.UTC)
+		},
+	}
+	runner.SetNotifier(notifier)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Run announces before the first ticker wait, then returns on ctx.Done.
+
+	if err := runner.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned unexpected error: %v", err)
+	}
+	if len(notifier.msgs) == 0 {
+		t.Fatal("expected a session-start notification, got none")
+	}
+	if !strings.Contains(notifier.msgs[0], "FX Currency-Strength") {
+		t.Errorf("first notification is not the session-start listing: %q", notifier.msgs[0])
+	}
+}
+
+type captureNotifier struct {
+	msgs []string
+}
+
+func (c *captureNotifier) Notify(_ context.Context, msg string) error {
+	c.msgs = append(c.msgs, msg)
+	return nil
 }
 
 func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {

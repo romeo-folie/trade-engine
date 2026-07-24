@@ -19,6 +19,13 @@ import (
 
 const currencyStrengthEntryGrace = 15 * time.Minute
 
+// sessionNotifier delivers currency-strength session notifications (e.g. Telegram).
+// Structurally satisfied by *orbTelegramNotifier, so the currency-strength runner
+// reuses the same Telegram adapter the ORB scheduler uses without importing orb.
+type sessionNotifier interface {
+	Notify(ctx context.Context, msg string) error
+}
+
 type currencyStrengthRunState struct {
 	Date         string  `json:"date"`
 	Symbol       string  `json:"symbol"`
@@ -35,6 +42,7 @@ type currencyStrengthPaperRunner struct {
 	broker    execution.Executor
 	statePath string
 	now       func() time.Time
+	notifier  sessionNotifier // optional; nil disables Telegram notifications
 
 	state           *currencyStrengthRunState
 	decisionDoneFor string
@@ -72,6 +80,42 @@ func newCurrencyStrengthPaperRunner(cfg config.CurrencyStrengthConfig, market da
 	}
 }
 
+// SetNotifier wires a notification sink (e.g. Telegram) for session-start and
+// entry messages. Call before Run. If not called, notifications are no-ops.
+func (r *currencyStrengthPaperRunner) SetNotifier(n sessionNotifier) {
+	r.notifier = n
+}
+
+// notify sends a message through the configured notifier. No-op when unset;
+// a delivery error is logged and swallowed so notifications never abort the runner.
+func (r *currencyStrengthPaperRunner) notify(ctx context.Context, msg string) {
+	if r.notifier == nil {
+		return
+	}
+	if err := r.notifier.Notify(ctx, msg); err != nil {
+		logger.Warn("currency-strength: notify failed", "err", err)
+	}
+}
+
+// buildCurrencyStrengthSessionStartMessage renders the session-start Telegram
+// listing for the FX-major basket — the currency-strength analogue of the ORB
+// "Scan Complete" message. Lists the pairs ranked for strength, the subset
+// eligible for orders, and the decision/exit clock so the operator knows when a
+// paper order can appear.
+func buildCurrencyStrengthSessionStartMessage(cfg config.CurrencyStrengthConfig) string {
+	tz := cfg.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
+	var sb strings.Builder
+	sb.WriteString("💱 FX Currency-Strength — session start\n")
+	fmt.Fprintf(&sb, "Ranking basket: %s\n", strings.Join(cfg.RankInstruments, ", "))
+	fmt.Fprintf(&sb, "Tradeable: %s\n", strings.Join(cfg.TradeInstruments, ", "))
+	fmt.Fprintf(&sb, "Strength window: %s–%s %s · decision ~%s · exit %s",
+		cfg.StrengthStart, cfg.StrengthEnd, tz, cfg.StrengthEnd, cfg.ExitTime)
+	return sb.String()
+}
+
 func shouldRunCurrencyStrengthForForexSession(session string) bool {
 	switch strings.ToLower(strings.TrimSpace(session)) {
 	case "", "london", "both":
@@ -102,6 +146,11 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("currency_strength.exit_time: %w", err)
 	}
+
+	// Announce the FX-major basket once at session start — the currency-strength
+	// analogue of the ORB "Scan Complete" listing. Fires per process launch, which
+	// (via te-switch) is once per London session.
+	r.notify(ctx, buildCurrencyStrengthSessionStartMessage(r.cfg))
 
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()

@@ -430,6 +430,9 @@ Modes:
 							return err
 						}
 						runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
+						if tgBot != nil {
+							runner.SetNotifier(&orbTelegramNotifier{bot: tgBot})
+						}
 						if err := runner.loadState(); err != nil {
 							return err
 						}
