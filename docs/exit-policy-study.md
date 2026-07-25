@@ -171,6 +171,43 @@ complete pullback-strength entry, then compare expectancy, payoff ratio, stop
 width, and failure-stage distributions. Do not weaken the entry definition just
 to manufacture trades in the legacy sample.
 
+### Expanded setup-frequency study
+
+`te study pullback-frequency` now measures the deterministic setup without LLM
+calls. It loads one warm-up year, evaluates each date from candle prefixes only,
+applies the $1M daily dollar-volume floor and >=30% momentum floor, ranks the
+qualifying supplied cohort point-in-time by the same top-quartile composite, and
+collapses nearby eligible days into distinct setup episodes.
+
+The first exploratory run used every recorded stock-watchlist ticker as a fixed
+cohort from 2024-07-25 through 2026-07-24:
+
+| Stage | Count |
+|---|---:|
+| Cohort tickers | 157 |
+| Observed symbol-days | 73,397 |
+| >=$1M dollar-volume days | 36,701 |
+| >=30% momentum days | 14,233 |
+| Daily top-quartile candidate-days | 3,745 |
+| Complete eligible setup-days | 14 |
+| Distinct setup episodes | **12** |
+
+That is a **0.374% setup-day rate** among selected candidate-days and roughly
+**six distinct chart setups per year** across this fixed cohort, before
+requiring an analyst BUY, confidence/risk approval, or a valid next-open fill.
+The 12 episodes occurred in PLTR (2), PYPL, PAYO, CRDO, SOFI, HOOD, NFLX, ABVX,
+JMIA (2), and DOCN.
+
+A second run honored the membership dates retained on the watchlist rows. That
+smaller observable history contained 2,113 symbol-days and 209 top-quartile
+candidate-days, with zero complete setups. Stored watchlist rows do not preserve
+every candidate considered or every reactivation interval, so neither run is a
+survivorship-free reconstruction of the historical live scanner. Historical
+market-cap snapshots are also unavailable, so the scanner's $100M floor could
+not be reconstructed. Treat 12 episodes as an exploratory setup-frequency
+ceiling, not 12 guaranteed trades. Prospective scanner snapshots are still
+required for the definitive frequency/performance study.
+
 ## Conventions (for the takeover agent)
 - Every feature: dedicated **branch → PR → `feature-dev:code-reviewer` before push → Monitor the PR**. Never push to `main` directly. Use a plain branch (NOT a worktree) unless asked.
 - All new trading behavior is **default-off config + PAPER-first**. Live config is `~/.tradeengine/config.yaml` (NOT the repo's gitignored `./config.yaml`).
