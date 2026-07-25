@@ -89,15 +89,17 @@ type ArbiterInvokedPayload struct {
 
 // SignalGeneratedPayload is emitted when a new signal is created (passed risk).
 type SignalGeneratedPayload struct {
-	SignalID    string
-	Ticker      string
-	Action      string
-	Confidence  float64
-	SignalPrice float64
-	StopLoss    float64
-	TakeProfit  float64
-	Mode        string // auto | paper | manual
-	SourceNode  string `json:"source_node,omitempty"`
+	SignalID      string
+	Ticker        string
+	Action        string
+	Confidence    float64
+	SignalPrice   float64
+	StopLoss      float64
+	TakeProfit    float64
+	Mode          string // auto | paper | manual
+	SourceNode    string `json:"source_node,omitempty"`
+	EntrySetup    string `json:"entry_setup,omitempty"`
+	SetupEvidence string `json:"setup_evidence,omitempty"`
 }
 
 // SignalBlockedPayload is emitted when a signal fails risk checks.
@@ -141,13 +143,15 @@ type RiskCheckResult struct {
 
 // TradeExecutedPayload is emitted when a trade is opened via the executor.
 type TradeExecutedPayload struct {
-	TradeID    string  `json:"trade_id"`
-	SignalID   string  `json:"signal_id"`
-	Ticker     string  `json:"ticker"`
-	Direction  string  `json:"direction"` // buy | sell
-	EntryPrice float64 `json:"entry_price"`
-	Quantity   float64 `json:"quantity"`
-	Strategy   string  `json:"strategy"`
+	TradeID       string  `json:"trade_id"`
+	SignalID      string  `json:"signal_id"`
+	Ticker        string  `json:"ticker"`
+	Direction     string  `json:"direction"` // buy | sell
+	EntryPrice    float64 `json:"entry_price"`
+	Quantity      float64 `json:"quantity"`
+	Strategy      string  `json:"strategy"`
+	EntrySetup    string  `json:"entry_setup,omitempty"`
+	SetupEvidence string  `json:"setup_evidence,omitempty"`
 }
 
 // TradeSimulatedPayload is emitted for paper trades (same data as executed).

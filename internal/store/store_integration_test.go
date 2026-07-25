@@ -225,6 +225,8 @@ func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
 		SignalPrice: 100, StopLoss: 98, Confidence: 0.8, SizePct: 1,
 		Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
 		StalePriceMovePct: 2, PullbackStrength: true, CreatedAt: observedAt,
+		EntrySetup:         store.EntrySetupPullbackStrength,
+		EntrySetupEvidence: "reclaimed $99.00 support",
 	})
 	if err != nil {
 		t.Fatalf("InsertSignal: %v", err)
@@ -236,8 +238,32 @@ func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
 	if !got.PullbackStrength {
 		t.Fatal("pullback-strength execution marker was not persisted")
 	}
+	if got.EntrySetup != store.EntrySetupPullbackStrength ||
+		got.EntrySetupEvidence != "reclaimed $99.00 support" {
+		t.Fatalf("signal entry attribution = %q / %q",
+			got.EntrySetup, got.EntrySetupEvidence)
+	}
 	if !got.CreatedAt.Equal(observedAt) {
 		t.Fatalf("pullback observation boundary = %s, want %s", got.CreatedAt, observedAt)
+	}
+
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		SignalID: id, Ticker: "TEST_PB", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 1, StopLoss: 98,
+		EntrySetup:         store.EntrySetupPullbackStrength,
+		EntrySetupEvidence: "reclaimed $99.00 support",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if trade.EntrySetup != store.EntrySetupPullbackStrength ||
+		trade.EntrySetupEvidence != "reclaimed $99.00 support" {
+		t.Fatalf("trade entry attribution = %q / %q",
+			trade.EntrySetup, trade.EntrySetupEvidence)
 	}
 }
 

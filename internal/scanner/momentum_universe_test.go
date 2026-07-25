@@ -97,3 +97,36 @@ func TestFilterActiveCandidatesDoesNotPromoteLowerQuartiles(t *testing.T) {
 		t.Fatalf("active top quartile should leave no candidates: %+v", got)
 	}
 }
+
+func TestMarkPullbackQualifiedKeepsStandardCandidates(t *testing.T) {
+	all := []SwingCandidate{
+		{Ticker: "STANDARD", Price: 10},
+		{Ticker: "PULLBACK", Price: 20},
+	}
+	qualified := []SwingCandidate{{
+		Ticker: "PULLBACK", Price: 20,
+		Return1M: 35, Return3M: 50, Return6M: 80,
+		MarketCapMM: 500, DollarVolume: 2_000_000,
+	}}
+
+	got := markPullbackQualified(all, qualified)
+	if len(got) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(got))
+	}
+	if got[0].PullbackQualified {
+		t.Fatal("standard candidate was marked pullback-qualified")
+	}
+	if !got[1].PullbackQualified || got[1].Return6M != 80 ||
+		got[1].MarketCapMM != 500 || got[1].DollarVolume != 2_000_000 {
+		t.Fatalf("qualified candidate metadata = %+v", got[1])
+	}
+}
+
+func TestCandidateStrategiesAddsPullbackPath(t *testing.T) {
+	if got := strings.Join(candidateStrategies("momentum", false), ","); got != "momentum" {
+		t.Fatalf("standard strategies = %q", got)
+	}
+	if got := strings.Join(candidateStrategies("momentum", true), ","); got != "momentum,pullback_strength" {
+		t.Fatalf("pullback strategies = %q", got)
+	}
+}

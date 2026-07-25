@@ -172,11 +172,18 @@ func (b *TelegramBot) handleTradeExecuted(ev events.Event) {
 		return
 	}
 	if b.batcher != nil {
+		note := fmt.Sprintf("$%.2f qty=%.4f", p.EntryPrice, p.Quantity)
+		if p.EntrySetup == "pullback_strength" {
+			note += " · Pullback in Strength"
+			if p.SetupEvidence != "" {
+				note += " · " + p.SetupEvidence
+			}
+		}
 		b.batcher.Add(BatchItem{
 			Kind:   "trade",
 			Ticker: p.Ticker,
 			Action: strings.ToUpper(p.Direction),
-			Note:   fmt.Sprintf("$%.2f qty=%.4f", p.EntryPrice, p.Quantity),
+			Note:   note,
 		})
 		return
 	}
@@ -184,10 +191,10 @@ func (b *TelegramBot) handleTradeExecuted(ev events.Event) {
 		"📈 *Trade Executed*\n"+
 			"Ticker: `%s` | %s\n"+
 			"Entry: $%.2f | Qty: %.4f\n"+
-			"Strategy: %s",
+			"Strategy: %s%s",
 		p.Ticker, strings.ToUpper(p.Direction),
 		p.EntryPrice, p.Quantity,
-		p.Strategy,
+		p.Strategy, entrySetupNotification(p.EntrySetup, p.SetupEvidence),
 	)
 	if err := b.sendMessage(msg, nil); err != nil {
 		logger.Warn("telegram: send trade alert failed", "error", err)
@@ -244,15 +251,26 @@ func (b *TelegramBot) handleSignalGenerated(ev events.Event) {
 			"Ticker: `%s` | %s\n"+
 			"Confidence: %.0f%%\n"+
 			"Price: $%.2f | SL: $%.2f | TP: $%.2f\n"+
-			"Mode: %s",
+			"Mode: %s%s",
 		p.Ticker, p.Action,
 		p.Confidence*100,
 		p.SignalPrice, p.StopLoss, p.TakeProfit,
-		p.Mode,
+		p.Mode, entrySetupNotification(p.EntrySetup, p.SetupEvidence),
 	)
 	if err := b.sendMessage(msg, nil); err != nil {
 		logger.Warn("telegram: send signal alert failed", "error", err)
 	}
+}
+
+func entrySetupNotification(entrySetup, evidence string) string {
+	if entrySetup != "pullback_strength" {
+		return ""
+	}
+	detail := "\nSetup: Pullback in Strength"
+	if evidence != "" {
+		detail += "\nOutcome: " + evidence
+	}
+	return detail
 }
 
 func (b *TelegramBot) handleSignalQueued(ev events.Event) {

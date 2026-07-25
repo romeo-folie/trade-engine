@@ -7,6 +7,8 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
 
 func trendCandles(closes ...float64) []data.Candle {
@@ -65,6 +67,44 @@ func TestStockTimeframesForEntryAddsDailyWithoutMutation(t *testing.T) {
 	}
 	if got := primaryStockTimeframe([]string{"1h", "1d"}); got != data.Timeframe1Day {
 		t.Fatalf("explicit daily timeframe should remain preferred, got %s", got)
+	}
+}
+
+func TestPullbackEntryAttributionHelpers(t *testing.T) {
+	if !hasEntryStrategy([]string{"momentum", "PULLBACK_STRENGTH"}, "pullback_strength") {
+		t.Fatal("pullback strategy tag was not detected")
+	}
+	if hasEntryStrategy([]string{"momentum"}, "pullback_strength") {
+		t.Fatal("standard strategy was misclassified as pullback")
+	}
+	evidence := pullbackEntryEvidence(pullback.Result{
+		Return1M: 35.1, Return3M: 50.2, Return6M: 80.3,
+		Support: 101.25, StopLoss: 99.5, StopWidthPct: 1.73,
+	})
+	for _, want := range []string{"35.1/50.2/80.3%", "$101.25 support", "$99.50", "1.73% risk"} {
+		if !strings.Contains(evidence, want) {
+			t.Fatalf("evidence %q missing %q", evidence, want)
+		}
+	}
+}
+
+func TestResolveAdditiveEntryFallsBackToStandard(t *testing.T) {
+	fallback := resolveAdditiveEntry(pullback.Result{
+		Eligible: false, FailedCheck: "reclaim",
+	})
+	if fallback.PullbackConfirmed || fallback.EntrySetup != store.EntrySetupStandard ||
+		fallback.Evidence != "" {
+		t.Fatalf("incomplete setup did not fall back to standard: %+v", fallback)
+	}
+
+	confirmed := resolveAdditiveEntry(pullback.Result{
+		Eligible: true, Return1M: 35, Return3M: 50, Return6M: 80,
+		Support: 101.25, StopLoss: 99.5, StopWidthPct: 1.73,
+	})
+	if !confirmed.PullbackConfirmed ||
+		confirmed.EntrySetup != store.EntrySetupPullbackStrength ||
+		confirmed.Evidence == "" {
+		t.Fatalf("complete setup was not attributed: %+v", confirmed)
 	}
 }
 

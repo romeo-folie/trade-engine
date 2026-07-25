@@ -132,12 +132,14 @@ func TestTradeExecutedNotification(t *testing.T) {
 	startCount := msgs.Len()
 
 	bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
-		TradeID:    "t1",
-		Ticker:     "AAPL",
-		Direction:  "buy",
-		EntryPrice: 150.00,
-		Quantity:   10,
-		Strategy:   "momentum",
+		TradeID:       "t1",
+		Ticker:        "AAPL",
+		Direction:     "buy",
+		EntryPrice:    150.00,
+		Quantity:      10,
+		Strategy:      "momentum",
+		EntrySetup:    "pullback_strength",
+		SetupEvidence: "Momentum 35.0/50.0/80.0%; reclaimed $149.00 support",
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -147,6 +149,16 @@ func TestTradeExecutedNotification(t *testing.T) {
 	text := msgs.At(startCount)["text"].(string)
 	if !strings.Contains(text, "AAPL") || !strings.Contains(text, "Trade Executed") {
 		t.Errorf("trade msg = %q", text)
+	}
+	if !strings.Contains(text, "Setup: Pullback in Strength") ||
+		!strings.Contains(text, "Outcome: Momentum 35.0/50.0/80.0%") {
+		t.Errorf("trade setup attribution missing: %q", text)
+	}
+}
+
+func TestEntrySetupNotificationHidesStandardPath(t *testing.T) {
+	if got := entrySetupNotification("standard", "unused"); got != "" {
+		t.Fatalf("standard entry detail = %q, want empty", got)
 	}
 }
 
@@ -303,12 +315,12 @@ func TestDailySummary(t *testing.T) {
 		TotalValue:       105000,
 		DailyChange:      5000,
 		DailyChangePct:   5.0,
-		TradesOpened:      3,
-		TradesClosed:      2,
-		Wins:              2,
-		Losses:            0,
-		SignalsGenerated:  5,
-		SignalsBlocked:    1,
+		TradesOpened:     3,
+		TradesClosed:     2,
+		Wins:             2,
+		Losses:           0,
+		SignalsGenerated: 5,
+		SignalsBlocked:   1,
 	})
 
 	if msgs.Len() < 1 {

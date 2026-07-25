@@ -162,15 +162,17 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return nil
 	}
 
-	// 3. Rank the complete pullback universe before removing active names.
-	// Otherwise every later scan promotes the next-best quartile after the
-	// current winners have been filtered out, eventually admitting names that
-	// were never in the full universe's top quartile.
+	// 3. Mark the complete pullback universe before removing active names.
+	// The universe is an additive entry path: standard scanner candidates stay
+	// in the pool, while qualified names carry a durable pullback strategy tag.
+	// Ranking before active-name removal prevents later scans from promoting
+	// names that were never in the full universe's top quartile.
 	if s.PullbackUniverseEnabled {
-		candidates = s.qualifyPullbackUniverse(ctx, candidates)
-		if len(candidates) == 0 {
+		qualified := s.qualifyPullbackUniverse(ctx, candidates)
+		if len(qualified) == 0 {
 			slog.Info("scanner: no candidates passed pullback-strength universe")
-			return nil
+		} else {
+			candidates = markPullbackQualified(candidates, qualified)
 		}
 	}
 
@@ -238,10 +240,11 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		if len(timeframes) == 0 {
 			timeframes = []string{"1H", "4H"}
 		}
+		strategies := candidateStrategies(sc.score.Strategy, sc.candidate.PullbackQualified)
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
-			Strategies: []string{sc.score.Strategy},
+			Strategies: strategies,
 			Timeframes: timeframes,
 			// Persist scanner conviction in MinConfidence so downstream
 			// engine logic (#317 RSI loosen) can read it without going
@@ -300,6 +303,35 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func markPullbackQualified(all, qualified []SwingCandidate) []SwingCandidate {
+	qualifiedByTicker := make(map[string]SwingCandidate, len(qualified))
+	for _, candidate := range qualified {
+		qualifiedByTicker[candidate.Ticker] = candidate
+	}
+	out := append([]SwingCandidate(nil), all...)
+	for i := range out {
+		qualifiedCandidate, ok := qualifiedByTicker[out[i].Ticker]
+		if !ok {
+			continue
+		}
+		out[i].PullbackQualified = true
+		out[i].Return1M = qualifiedCandidate.Return1M
+		out[i].Return3M = qualifiedCandidate.Return3M
+		out[i].Return6M = qualifiedCandidate.Return6M
+		out[i].MarketCapMM = qualifiedCandidate.MarketCapMM
+		out[i].DollarVolume = qualifiedCandidate.DollarVolume
+	}
+	return out
+}
+
+func candidateStrategies(primary string, pullbackQualified bool) []string {
+	strategies := []string{primary}
+	if pullbackQualified && primary != "pullback_strength" {
+		strategies = append(strategies, "pullback_strength")
+	}
+	return strategies
 }
 
 // fetchCandidates pulls top movers and most-active stocks and merges them.

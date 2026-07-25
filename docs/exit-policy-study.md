@@ -90,7 +90,11 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 
 ## Phase 2 — complete pullback-in-strength entry (DONE — PR #476; issue #472)
 
-`risk.entry_gates.pullback_strength_enabled` is default-off and PAPER-first. When enabled, a stock BUY fails closed unless all of the following deterministic evidence is present:
+`risk.entry_gates.pullback_strength_enabled` is default-off and PAPER-first.
+When enabled, it adds a separately attributed entry path for
+universe-qualified scanner candidates. Candidates that do not complete the
+setup continue through the standard entry gates; candidates that do complete
+it use all of the following deterministic evidence:
 
 1. **Universe:** scanner candidates clear $100M market cap and $1M snapshot dollar volume, return at least 30% on a 1/3/6-month horizon, and rank in the top quartile of the qualifying pool by the equal-weighted horizon return.
 2. **Strength and structure:** at least six months of split-adjusted daily history; rising EMA9 and EMA21; a 40-session (~8-week) consolidation whose recent half makes a higher low and whose recent range is narrower than its opening range.
@@ -98,7 +102,14 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 4. **Entry timing:** the current session must flush into stacked support, then trade positive on the day and reclaim that support.
 5. **Risk:** the current session low replaces the analyst's generic stop. Entries wider than the configured maximum (4% by default) are rejected.
 
-The live engine always fetches daily history for this gate, even when a scanner item asks the analyst to use 1H/4H. Missing evidence blocks instead of failing open. The separate conservative `trend_alignment_enabled` gate remains available for operators who only want downtrend rejection.
+The scanner keeps its standard candidate pool and tags the point-in-time
+pullback universe as an additional strategy. The live engine fetches daily
+history for those tagged candidates even when the analyst uses 1H/4H. Missing
+or incomplete pullback evidence falls back to the standard path. A confirmed
+setup is persisted on both the signal and trade, and Telegram identifies the
+entry as **Pullback in Strength** with concise momentum/support/stop evidence.
+The separate conservative `trend_alignment_enabled` gate remains available for
+the standard path.
 
 The backtest flag is `--pullback-strength`. It loads a separate one-year warm-up slice for the deterministic entry evaluator while leaving the analyst request window unchanged, preserving the existing prompt-cache keys. A gap below the signal day's low cancels the next-open simulated fill.
 
