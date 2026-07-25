@@ -23,6 +23,9 @@ func TestAlpacaFetchCandles_Success(t *testing.T) {
 		if r.Header.Get("APCA-API-KEY-ID") != "test-key" {
 			t.Errorf("missing or wrong API key header")
 		}
+		if got := r.URL.Query().Get("adjustment"); got != "split" {
+			t.Errorf("adjustment = %q, want split", got)
+		}
 		resp := alpacaBarsResponse{
 			Symbol: "AAPL",
 			Bars: []alpacaBar{
@@ -137,6 +140,9 @@ func TestAlpacaFetchHistory_Success(t *testing.T) {
 		limit := r.URL.Query().Get("limit")
 		if limit != "10" {
 			t.Errorf("expected limit=10, got %s", limit)
+		}
+		if got := r.URL.Query().Get("adjustment"); got != "split" {
+			t.Errorf("adjustment = %q, want split", got)
 		}
 		resp := alpacaBarsResponse{
 			Symbol: "TSLA",

@@ -40,6 +40,41 @@ func testModelMeta() analysis.ModelCallMeta {
 	}
 }
 
+func TestCandles_UpsertRefreshesSameTimestampBar(t *testing.T) {
+	ctx := context.Background()
+	ts := time.Date(2026, time.July, 25, 13, 0, 0, 0, time.UTC)
+	first := data.Candle{
+		Ticker: "TEST_CANDLE_REFRESH", Timeframe: data.Timeframe1Day,
+		Timestamp: ts, Open: 100, High: 101, Low: 99, Close: 100,
+		Volume: 1000, VWAP: 100,
+	}
+	revised := data.Candle{
+		Ticker: "TEST_CANDLE_REFRESH", Timeframe: data.Timeframe1Day,
+		Timestamp: ts, Open: 100, High: 105, Low: 98, Close: 104,
+		Volume: 2500, VWAP: 102.5,
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{first}); err != nil {
+		t.Fatalf("first UpsertCandles: %v", err)
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{first, revised}); err != nil {
+		t.Fatalf("revised UpsertCandles: %v", err)
+	}
+	got, err := store.GetCandles(
+		ctx, revised.Ticker, revised.Timeframe, ts, ts,
+	)
+	if err != nil {
+		t.Fatalf("GetCandles: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("candles = %d, want 1", len(got))
+	}
+	if got[0].Open != revised.Open || got[0].High != revised.High ||
+		got[0].Low != revised.Low || got[0].Close != revised.Close ||
+		got[0].Volume != revised.Volume || got[0].VWAP != revised.VWAP {
+		t.Fatalf("stored candle = %+v, want revised %+v", got[0], revised)
+	}
+}
+
 // ─── Analyses ─────────────────────────────────────────────────────────────────
 
 func TestAnalysis_InsertAndQuery(t *testing.T) {

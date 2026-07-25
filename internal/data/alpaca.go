@@ -22,6 +22,11 @@ var alpacaTimeframes = map[Timeframe]string{
 	Timeframe1Day:  "1Day",
 }
 
+// alpacaStockAdjustment keeps pre/post-split history on the same price scale
+// as the current quote. Raw history fabricates price collapses at split dates
+// and corrupts every rolling indicator that spans the event.
+const alpacaStockAdjustment = "split"
+
 // AlpacaClient implements MarketDataProvider using the Alpaca REST market data API.
 // Alpaca free tier: 200 requests/minute.
 type AlpacaClient struct {
@@ -164,7 +169,7 @@ func (c *AlpacaClient) FetchCandles(ctx context.Context, ticker string, tf Timef
 		params.Set("start", from.UTC().Format(time.RFC3339))
 		params.Set("end", to.UTC().Format(time.RFC3339))
 		params.Set("limit", "1000")
-		params.Set("adjustment", "raw")
+		params.Set("adjustment", alpacaStockAdjustment)
 		params.Set("feed", "iex")
 		if nextPageToken != "" {
 			params.Set("page_token", nextPageToken)
@@ -219,7 +224,7 @@ func (c *AlpacaClient) FetchHistory(ctx context.Context, ticker string, tf Timef
 	params := url.Values{}
 	params.Set("timeframe", alpacaTF)
 	params.Set("limit", fmt.Sprintf("%d", limit))
-	params.Set("adjustment", "raw")
+	params.Set("adjustment", alpacaStockAdjustment)
 	params.Set("feed", "iex")
 
 	resp, err := c.get(ctx, fmt.Sprintf("/v2/stocks/%s/bars", ticker), params)
