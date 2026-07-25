@@ -2051,6 +2051,7 @@ func (e *Engine) generateSignal(
 			e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 				SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 				Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+				EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 			})
 			return
 		}
@@ -2061,6 +2062,7 @@ func (e *Engine) generateSignal(
 		e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 			SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 			Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+			EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 		})
 	default:
 		logger.Warn("unknown mode, defaulting to manual", "mode", mode)

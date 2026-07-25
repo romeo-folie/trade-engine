@@ -243,6 +243,7 @@ func (b *TelegramBot) handleSignalGenerated(ev events.Event) {
 			Ticker:     p.Ticker,
 			Action:     p.Action,
 			Confidence: p.Confidence,
+			Note:       entrySetupBatchNote(p.EntrySetup, p.SetupEvidence),
 		})
 		return
 	}
@@ -273,6 +274,17 @@ func entrySetupNotification(entrySetup, evidence string) string {
 	return detail
 }
 
+func entrySetupBatchNote(entrySetup, evidence string) string {
+	if entrySetup != "pullback_strength" {
+		return ""
+	}
+	detail := "Pullback in Strength"
+	if evidence != "" {
+		detail += " · " + evidence
+	}
+	return detail
+}
+
 func (b *TelegramBot) handleSignalQueued(ev events.Event) {
 	if !b.notifyOn["signal"] {
 		return
@@ -285,10 +297,11 @@ func (b *TelegramBot) handleSignalQueued(ev events.Event) {
 		"⏳ *Signal Awaiting Approval*\n"+
 			"Ticker: `%s` | %s\n"+
 			"Confidence: %.0f%%\n"+
-			"Expires in: %s",
+			"Expires in: %s%s",
 		p.Ticker, p.Action,
 		p.Confidence*100,
 		formatDuration(p.ExpiresIn),
+		entrySetupNotification(p.EntrySetup, p.SetupEvidence),
 	)
 	keyboard := inlineKeyboard(p.SignalID)
 	if err := b.sendMessage(msg, keyboard); err != nil {

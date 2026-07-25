@@ -120,11 +120,13 @@ type SignalExpiredPayload struct {
 
 // SignalQueuedPayload is emitted in manual mode when a signal is queued for approval.
 type SignalQueuedPayload struct {
-	SignalID   string
-	Ticker     string
-	Action     string
-	Confidence float64
-	ExpiresIn  time.Duration
+	SignalID      string
+	Ticker        string
+	Action        string
+	Confidence    float64
+	ExpiresIn     time.Duration
+	EntrySetup    string
+	SetupEvidence string
 }
 
 // RiskCheckCompletedPayload is emitted after all risk checks run for a signal.

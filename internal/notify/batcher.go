@@ -12,7 +12,7 @@ import (
 
 // BatchItem represents a single collected tick event for the summary.
 type BatchItem struct {
-	Kind       string  // signal | trade | blocked
+	Kind       string // signal | trade | blocked
 	Ticker     string
 	Action     string
 	Confidence float64
@@ -139,7 +139,14 @@ func formatBatchSummary(items []BatchItem) string {
 	if len(signals) > 0 {
 		sb.WriteString("\n*Signals:*\n")
 		for _, s := range signals {
-			sb.WriteString(fmt.Sprintf("• `%s` — %s %.0f%%\n", s.Ticker, s.Action, s.Confidence*100))
+			note := ""
+			if s.Note != "" {
+				note = " — " + s.Note
+			}
+			sb.WriteString(fmt.Sprintf(
+				"• `%s` — %s %.0f%%%s\n",
+				s.Ticker, s.Action, s.Confidence*100, note,
+			))
 		}
 	}
 	if len(trades) > 0 {
