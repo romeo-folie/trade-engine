@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
@@ -190,15 +191,17 @@ var listBTCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-10s %-8s %-14s %-10s %-10s %8s %8s %8s\n",
-			"Label", "Ticker", "Strategy", "From", "To", "Return%", "Sharpe", "MaxDD%")
-		fmt.Println(strings.Repeat("─", 80))
+		fmt.Printf("%-10s %-8s %-14s %-22s %-10s %-10s %8s %8s %8s\n",
+			"Label", "Ticker", "Strategy", "Policy", "From", "To", "Return%", "Sharpe", "MaxDD%")
+		fmt.Println(strings.Repeat("─", 104))
 		for _, r := range runs {
 			ret := fmtPct(r.TotalReturnPct)
 			sharpe := fmtF(r.SharpeRatio)
 			dd := fmtPct(r.MaxDrawdownPct)
-			fmt.Printf("%-10s %-8s %-14s %-10s %-10s %8s %8s %8s\n",
+			policy := exitPolicyDesc(persistedRunOptions(&r))
+			fmt.Printf("%-10s %-8s %-14s %-22s %-10s %-10s %8s %8s %8s\n",
 				r.Label, r.Ticker, truncate(r.Strategy, 14),
+				truncate(policy, 22),
 				r.FromDate.Format("2006-01-02"), r.ToDate.Format("2006-01-02"),
 				ret, sharpe, dd,
 			)
@@ -383,6 +386,10 @@ func printComparison(runs []*store.BacktestRun) {
 		{"Ticker", nil},
 		{"Period", nil},
 		{"Strategy", nil},
+		{"Policy", nil},
+		{"Entry Candidates", nil},
+		{"Entry Qualified", nil},
+		{"Gap Invalidations", nil},
 		{"Total Return %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.TotalReturnPct })},
 		{"Annualised Return %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.AnnualizedReturnPct })},
 		{"Max Drawdown %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.MaxDrawdownPct })},
@@ -407,6 +414,14 @@ func printComparison(runs []*store.BacktestRun) {
 				cell = r.FromDate.Format("2006-01-02") + "…"
 			case "Strategy":
 				cell = truncate(r.Strategy, colW)
+			case "Policy":
+				cell = exitPolicyDesc(persistedRunOptions(r))
+			case "Entry Candidates":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Candidates)
+			case "Entry Qualified":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Qualified)
+			case "Gap Invalidations":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Blocks["gap_invalidation"])
 			case "Total Trades":
 				cell = fmt.Sprintf("%d", r.TotalTrades)
 			default:
@@ -456,4 +471,19 @@ func ptrSlice(runs []*store.BacktestRun, fn func(*store.BacktestRun) *float64) [
 		out[i] = fn(r)
 	}
 	return out
+}
+
+func persistedRunOptions(run *store.BacktestRun) backtest.RunOptions {
+	var opts backtest.RunOptions
+	_ = json.Unmarshal(run.RunOptions, &opts)
+	return opts
+}
+
+func persistedEntryDiagnostics(run *store.BacktestRun) backtest.EntryDiagnostics {
+	var diagnostics backtest.EntryDiagnostics
+	_ = json.Unmarshal(run.EntryDiagnostics, &diagnostics)
+	if diagnostics.Blocks == nil {
+		diagnostics.Blocks = map[string]int{}
+	}
+	return diagnostics
 }

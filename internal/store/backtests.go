@@ -21,6 +21,8 @@ type BacktestRun struct {
 	FromDate            time.Time
 	ToDate              time.Time
 	ConfigSnapshot      json.RawMessage
+	RunOptions          json.RawMessage
+	EntryDiagnostics    json.RawMessage
 	TotalReturnPct      *float64
 	AnnualizedReturnPct *float64
 	SharpeRatio         *float64
@@ -41,19 +43,19 @@ type BacktestRun struct {
 // BacktestTrade represents a single simulated trade within a backtest run.
 // Mirrors the backtest_trades table.
 type BacktestTrade struct {
-	ID            string
-	RunID         string
-	Ticker        string
-	Direction     string // buy | sell
-	EntryTS       time.Time
-	ExitTS        *time.Time
-	EntryPrice    float64
-	ExitPrice     *float64
-	Quantity      float64
-	PnL           *float64
-	PnLPct        *float64
-	ExitReason    string // stop_loss | take_profit | signal | end_of_data
-	CreatedAt     time.Time
+	ID         string
+	RunID      string
+	Ticker     string
+	Direction  string // buy | sell
+	EntryTS    time.Time
+	ExitTS     *time.Time
+	EntryPrice float64
+	ExitPrice  *float64
+	Quantity   float64
+	PnL        *float64
+	PnLPct     *float64
+	ExitReason string // stop_loss | take_profit | signal | end_of_data
+	CreatedAt  time.Time
 }
 
 // ── Insert ────────────────────────────────────────────────────────────────────
@@ -64,6 +66,12 @@ type BacktestTrade struct {
 // reads MAX(label) and increments it, eliminating the COUNT→INSERT race that
 // exists when label generation and insertion are separate statements.
 func InsertRun(ctx context.Context, r BacktestRun) (string, error) {
+	if len(r.RunOptions) == 0 {
+		r.RunOptions = json.RawMessage(`{}`)
+	}
+	if len(r.EntryDiagnostics) == 0 {
+		r.EntryDiagnostics = json.RawMessage(`{}`)
+	}
 	var label string
 	err := GetDB().QueryRow(ctx, `
 		WITH next_label AS (
@@ -83,12 +91,13 @@ func InsertRun(ctx context.Context, r BacktestRun) (string, error) {
 			sharpe_ratio, sortino_ratio, calmar_ratio,
 			max_drawdown_pct, win_rate_pct, profit_factor,
 			expectancy, total_trades, avg_hold_hours,
-			best_trade_pct, worst_trade_pct, cache_hit_rate
+			best_trade_pct, worst_trade_pct, cache_hit_rate,
+			run_options, entry_diagnostics
 		)
 		SELECT
 			next_label.label, $1,$2,$3,$4,$5,$6,$7,
 			$8,$9,$10,$11,$12,$13,$14,$15,
-			$16,$17,$18,$19,$20,$21
+			$16,$17,$18,$19,$20,$21,$22,$23
 		FROM next_label
 		RETURNING label`,
 		r.Ticker, r.Strategy, r.ModelProvider, r.ModelName,
@@ -98,6 +107,7 @@ func InsertRun(ctx context.Context, r BacktestRun) (string, error) {
 		r.MaxDrawdownPct, r.WinRatePct, r.ProfitFactor,
 		r.Expectancy, r.TotalTrades, r.AvgHoldHours,
 		r.BestTradePct, r.WorstTradePct, r.CacheHitRate,
+		r.RunOptions, r.EntryDiagnostics,
 	).Scan(&label)
 	if err != nil {
 		return "", fmt.Errorf("insert backtest run: %w", err)
@@ -137,7 +147,8 @@ func GetRun(ctx context.Context, id string) (BacktestRun, error) {
 		       sharpe_ratio, sortino_ratio, calmar_ratio,
 		       max_drawdown_pct, win_rate_pct, profit_factor,
 		       expectancy, total_trades, avg_hold_hours,
-		       best_trade_pct, worst_trade_pct, cache_hit_rate, created_at
+		       best_trade_pct, worst_trade_pct, cache_hit_rate,
+		       run_options, entry_diagnostics, created_at
 		FROM backtest_runs WHERE id = $1`, id)
 	r, err := scanRun(row)
 	if err != nil {
@@ -157,7 +168,8 @@ func GetRunByLabel(ctx context.Context, label string) (*BacktestRun, error) {
 		       sharpe_ratio, sortino_ratio, calmar_ratio,
 		       max_drawdown_pct, win_rate_pct, profit_factor,
 		       expectancy, total_trades, avg_hold_hours,
-		       best_trade_pct, worst_trade_pct, cache_hit_rate, created_at
+		       best_trade_pct, worst_trade_pct, cache_hit_rate,
+		       run_options, entry_diagnostics, created_at
 		FROM backtest_runs WHERE label = $1`, label)
 	return scanRun(row)
 }
@@ -174,7 +186,8 @@ func ListRuns(ctx context.Context, limit int) ([]BacktestRun, error) {
 		       sharpe_ratio, sortino_ratio, calmar_ratio,
 		       max_drawdown_pct, win_rate_pct, profit_factor,
 		       expectancy, total_trades, avg_hold_hours,
-		       best_trade_pct, worst_trade_pct, cache_hit_rate, created_at
+		       best_trade_pct, worst_trade_pct, cache_hit_rate,
+		       run_options, entry_diagnostics, created_at
 		FROM backtest_runs
 		ORDER BY created_at DESC
 		LIMIT $1`, limit)
@@ -241,7 +254,8 @@ func scanRun(s scanner) (*BacktestRun, error) {
 		&r.SharpeRatio, &r.SortinoRatio, &r.CalmarRatio,
 		&r.MaxDrawdownPct, &r.WinRatePct, &r.ProfitFactor,
 		&r.Expectancy, &r.TotalTrades, &r.AvgHoldHours,
-		&r.BestTradePct, &r.WorstTradePct, &r.CacheHitRate, &r.CreatedAt,
+		&r.BestTradePct, &r.WorstTradePct, &r.CacheHitRate,
+		&r.RunOptions, &r.EntryDiagnostics, &r.CreatedAt,
 	)
 	if err != nil {
 		if isNoRows(err) {

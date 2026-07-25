@@ -115,6 +115,14 @@ type RunResult struct {
 	EntryBlocks     map[string]int
 }
 
+// EntryDiagnostics is persisted with each run so zero-trade pullback replays
+// remain attributable and comparable after the CLI process exits.
+type EntryDiagnostics struct {
+	Candidates int            `json:"candidates"`
+	Qualified  int            `json:"qualified"`
+	Blocks     map[string]int `json:"blocks,omitempty"`
+}
+
 // ProgressFunc is called after each candle is processed with (current, total).
 type ProgressFunc func(current, total int)
 
@@ -288,6 +296,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 			if order.requireValidStop && order.stopLoss >= candle.Open {
 				// A gap through the signal day's low invalidates the setup before
 				// the next-open fill. Do not fabricate an entry above its stop.
+				entryBlocks["gap_invalidation"]++
 			} else if qty >= 1 {
 				cost := qty * candle.Open
 				cash -= cost
@@ -403,6 +412,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 
 	// 7. Persist to database.
 	cfgSnap, _ := json.Marshal(r.cfg)
+	runOptionsJSON, _ := json.Marshal(opts)
+	entryDiagnosticsJSON, _ := json.Marshal(EntryDiagnostics{
+		Candidates: entryCandidates,
+		Qualified:  entryQualified,
+		Blocks:     entryBlocks,
+	})
 	hitRate := r.cache.HitRate()
 	hits, misses := r.cache.Stats()
 
@@ -414,6 +429,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 		FromDate:            opts.From,
 		ToDate:              opts.To,
 		ConfigSnapshot:      cfgSnap,
+		RunOptions:          runOptionsJSON,
+		EntryDiagnostics:    entryDiagnosticsJSON,
 		TotalReturnPct:      ptr(m.TotalReturnPct),
 		AnnualizedReturnPct: ptr(m.AnnualizedReturnPct),
 		SharpeRatio:         ptr(m.SharpeRatio),

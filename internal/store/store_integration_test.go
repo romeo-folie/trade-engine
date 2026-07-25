@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,14 +30,14 @@ func testAnalysisResp(action analysis.Action) analysis.AnalysisResponse {
 // testModelMeta returns a minimal ModelCallMeta.
 func testModelMeta() analysis.ModelCallMeta {
 	return analysis.ModelCallMeta{
-		Provider:    "anthropic",
-		Model:       "claude-test",
-		PromptHash:  "abc123",
-		RawPrompt:   "test prompt",
-		RawResponse: `{"action":"BUY"}`,
-		InputTokens: 100,
+		Provider:     "anthropic",
+		Model:        "claude-test",
+		PromptHash:   "abc123",
+		RawPrompt:    "test prompt",
+		RawResponse:  `{"action":"BUY"}`,
+		InputTokens:  100,
 		OutputTokens: 50,
-		LatencyMs:   200,
+		LatencyMs:    200,
 	}
 }
 
@@ -216,19 +217,41 @@ func TestAnalysis_GetModelPerformance(t *testing.T) {
 
 // ─── Backtests ────────────────────────────────────────────────────────────────
 
+func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	id, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_PB", Action: "BUY", Strategy: "momentum",
+		SignalPrice: 100, StopLoss: 98, Confidence: 0.8, SizePct: 1,
+		Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
+		StalePriceMovePct: 2, PullbackStrength: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertSignal: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("GetSignalByID: %v", err)
+	}
+	if !got.PullbackStrength {
+		t.Fatal("pullback-strength execution marker was not persisted")
+	}
+}
+
 func TestBacktest_FullLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	label := "INTG-BACKTEST-" + time.Now().Format("150405")
 	run := store.BacktestRun{
-		Label:          label,
-		Ticker:         "TEST_BT_SPY",
-		Strategy:       "momentum",
-		ModelProvider:  "anthropic",
-		ModelName:      "claude-test",
-		FromDate:       time.Now().Add(-30 * 24 * time.Hour),
-		ToDate:         time.Now(),
-		ConfigSnapshot: json.RawMessage(`{}`),
+		Label:            label,
+		Ticker:           "TEST_BT_SPY",
+		Strategy:         "momentum",
+		ModelProvider:    "anthropic",
+		ModelName:        "claude-test",
+		FromDate:         time.Now().Add(-30 * 24 * time.Hour),
+		ToDate:           time.Now(),
+		ConfigSnapshot:   json.RawMessage(`{}`),
+		RunOptions:       json.RawMessage(`{"pullback_strength":true}`),
+		EntryDiagnostics: json.RawMessage(`{"candidates":3,"qualified":1,"blocks":{"gap_invalidation":1}}`),
 	}
 
 	runLabel, err := store.InsertRun(ctx, run)
@@ -248,6 +271,11 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 	}
 	if got.Ticker != "TEST_BT_SPY" {
 		t.Errorf("Ticker: got %q, want TEST_BT_SPY", got.Ticker)
+	}
+	if !strings.Contains(string(got.RunOptions), "pullback_strength") ||
+		!strings.Contains(string(got.EntryDiagnostics), "gap_invalidation") {
+		t.Errorf("replay metadata not persisted: options=%s diagnostics=%s",
+			got.RunOptions, got.EntryDiagnostics)
 	}
 
 	// Insert a trade for this run.

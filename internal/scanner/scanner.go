@@ -68,6 +68,9 @@ type MarketScanner struct {
 	// >$100M market cap, >$1M dollar volume, >=30% on a 1/3/6-month horizon,
 	// then retain the top momentum quartile.
 	PullbackUniverseEnabled bool
+	// PullbackMinMomentumReturnPct mirrors the entry-gate threshold so universe
+	// ranking and execution eligibility cannot diverge. Zero resolves to 30%.
+	PullbackMinMomentumReturnPct float64
 
 	// sympathyFired tracks (seed, neighbour) pairs already surfaced by
 	// news-sympathy sourcing, pruned after the configured cooldown so one
@@ -389,6 +392,10 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		return nil
 	}
 	qualified := make([]SwingCandidate, 0, len(candidates))
+	minMomentumReturn := s.PullbackMinMomentumReturnPct
+	if minMomentumReturn <= 0 {
+		minMomentumReturn = 30
+	}
 	for _, candidate := range candidates {
 		if ctx.Err() != nil {
 			break
@@ -421,7 +428,7 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		candidate.Return1M = scannerHorizonReturn(price, history, 21)
 		candidate.Return3M = scannerHorizonReturn(price, history, 63)
 		candidate.Return6M = scannerHorizonReturn(price, history, 126)
-		if maxScannerReturn(candidate) < 30 {
+		if maxScannerReturn(candidate) < minMomentumReturn {
 			continue
 		}
 		qualified = append(qualified, candidate)

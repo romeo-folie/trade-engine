@@ -123,20 +123,18 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 
 	tolerance := cfg.SupportTolerancePct / 100
 	horizontal := minLow(consolidation[len(consolidation)-quarter:])
-	avwap := closer(r.EMA9, r.AVWAPHigh, r.AVWAPLow)
-	stackedWithEMA := relativeDistance(avwap, r.EMA9) <= tolerance
-	stackedWithHorizontal := relativeDistance(avwap, horizontal) <= tolerance
-	if !stackedWithEMA && !stackedWithHorizontal {
+	avwap, companion, stacked := selectStack(
+		[]float64{r.AVWAPHigh, r.AVWAPLow},
+		[]float64{r.EMA9, horizontal},
+		tolerance,
+	)
+	if !stacked {
 		r.Reason = fmt.Sprintf(
-			"pullback strength: AVWAP %.2f is not stacked with EMA9 %.2f or horizontal support %.2f",
-			avwap, r.EMA9, horizontal,
+			"pullback strength: neither AVWAP %.2f/%.2f is stacked with EMA9 %.2f or horizontal support %.2f",
+			r.AVWAPHigh, r.AVWAPLow, r.EMA9, horizontal,
 		)
 		r.FailedCheck = "stacked_support"
 		return r
-	}
-	companion := r.EMA9
-	if !stackedWithEMA {
-		companion = horizontal
 	}
 	r.Support = math.Max(avwap, companion)
 	if session.Low > r.Support*(1+tolerance) {
@@ -172,6 +170,32 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 		r.Return1M, r.Return3M, r.Return6M, r.Support, r.StopLoss, r.StopWidthPct,
 	)
 	return r
+}
+
+// ValidateExecutionMark rechecks that a delayed/manual entry still has a
+// coherent low-of-day stop and remains within the configured tight-risk cap.
+// An empty reason means execution may proceed.
+func ValidateExecutionMark(mark, stopLoss, maxStopWidthPct float64) string {
+	if mark <= 0 {
+		return "pullback strength: current execution mark unavailable"
+	}
+	if stopLoss <= 0 || mark <= stopLoss {
+		return fmt.Sprintf(
+			"pullback strength: setup invalidated before execution (mark %.2f at/below low-of-day stop %.2f)",
+			mark, stopLoss,
+		)
+	}
+	if maxStopWidthPct <= 0 {
+		maxStopWidthPct = 4
+	}
+	width := (mark - stopLoss) / mark * 100
+	if width > maxStopWidthPct {
+		return fmt.Sprintf(
+			"pullback strength: execution stop widened to %.2f%% (max %.2f%%)",
+			width, maxStopWidthPct,
+		)
+	}
+	return ""
 }
 
 func withDefaults(cfg Config) Config {
@@ -268,11 +292,20 @@ func appendCopy(candles []data.Candle, candle data.Candle) []data.Candle {
 	return append(out, candle)
 }
 
-func closer(target, a, b float64) float64 {
-	if math.Abs(target-a) <= math.Abs(target-b) {
-		return a
+func selectStack(avwaps, supports []float64, tolerance float64) (avwap, support float64, ok bool) {
+	bestDistance := math.Inf(1)
+	for _, candidateAVWAP := range avwaps {
+		for _, candidateSupport := range supports {
+			distance := relativeDistance(candidateAVWAP, candidateSupport)
+			if distance <= tolerance && distance < bestDistance {
+				avwap = candidateAVWAP
+				support = candidateSupport
+				bestDistance = distance
+				ok = true
+			}
+		}
 	}
-	return b
+	return avwap, support, ok
 }
 
 func relativeDistance(a, b float64) float64 {

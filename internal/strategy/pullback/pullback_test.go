@@ -108,3 +108,31 @@ func TestEvaluateFailsClosedWithoutSixMonthHistory(t *testing.T) {
 		t.Fatalf("thin-history result: %+v", got)
 	}
 }
+
+func TestValidateExecutionMark(t *testing.T) {
+	if reason := ValidateExecutionMark(100, 98, 4); reason != "" {
+		t.Fatalf("valid mark rejected: %s", reason)
+	}
+	if reason := ValidateExecutionMark(98, 98, 4); !strings.Contains(reason, "invalidated") {
+		t.Fatalf("stop breach accepted: %q", reason)
+	}
+	if reason := ValidateExecutionMark(110, 100, 4); !strings.Contains(reason, "widened") {
+		t.Fatalf("wide delayed entry accepted: %q", reason)
+	}
+	if reason := ValidateExecutionMark(0, 98, 4); !strings.Contains(reason, "unavailable") {
+		t.Fatalf("missing mark accepted: %q", reason)
+	}
+}
+
+func TestSelectStackEvaluatesEveryAnchorSupportPair(t *testing.T) {
+	// The first AVWAP is closer to EMA9 but outside tolerance. The second is a
+	// valid horizontal stack and must not be discarded by preselection.
+	avwap, support, ok := selectStack(
+		[]float64{101.6, 95.4},
+		[]float64{100, 95},
+		0.01,
+	)
+	if !ok || avwap != 95.4 || support != 95 {
+		t.Fatalf("selected (%v, %v, %v), want valid horizontal pair", avwap, support, ok)
+	}
+}

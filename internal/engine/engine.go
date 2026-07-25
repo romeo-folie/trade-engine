@@ -591,9 +591,10 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
 	// so the execution gate never silently fails open because of watchlist
 	// timeframe selection.
-	fetchTimeframes := stockTimeframesForEntry(
-		timeframes, e.cfg.Risk.EntryGates.PullbackStrengthEnabled,
-	)
+	entryGates := e.cfg.Risk.EntryGates
+	needsDailyEvidence := entryGates.PullbackStrengthEnabled ||
+		entryGates.TrendAlignmentEnabled
+	fetchTimeframes := stockTimeframesForEntry(timeframes, needsDailyEvidence)
 
 	for _, tfStr := range fetchTimeframes {
 		tf := data.Timeframe(tfStr)
@@ -1685,20 +1686,22 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 	if resp.Action == "BUY" {
 		var entryGateReason string
 		entryGateFailedCheck := "entry_gates"
-		if eg.PullbackStrengthEnabled {
-			entryDailyCandles := candles
-			if data.Timeframe(timeframe) != data.Timeframe1Day {
-				var err error
-				entryDailyCandles, err = store.GetCandles(
-					ctx, ticker, data.Timeframe1Day,
-					time.Now().AddDate(-2, 0, 0), time.Now(),
-				)
-				if err != nil {
-					logger.Warn("pullback strength: load daily evidence",
-						"ticker", ticker, "err", err)
-					entryDailyCandles = nil
-				}
+		entryDailyCandles := candles
+		needsDailyEvidence := eg.PullbackStrengthEnabled ||
+			eg.TrendAlignmentEnabled
+		if needsDailyEvidence && data.Timeframe(timeframe) != data.Timeframe1Day {
+			var err error
+			entryDailyCandles, err = store.GetCandles(
+				ctx, ticker, data.Timeframe1Day,
+				time.Now().AddDate(-2, 0, 0), time.Now(),
+			)
+			if err != nil {
+				logger.Warn("entry gates: load daily evidence",
+					"ticker", ticker, "err", err)
+				entryDailyCandles = nil
 			}
+		}
+		if eg.PullbackStrengthEnabled {
 			setup := pullback.Evaluate(entryDailyCandles, signalPrice, pullback.Config{
 				MinMomentumReturnPct:  eg.PullbackMinMomentumReturnPct,
 				ConsolidationSessions: eg.PullbackConsolidationSessions,
@@ -1713,6 +1716,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 				// invalidation. Replace the analyst's generic stop before risk
 				// sizing, persistence, and bracket submission.
 				sig.StopLoss = setup.StopLoss
+				sig.PullbackStrength = true
 				logger.Info("pullback strength entry confirmed",
 					"ticker", ticker,
 					"return_1m_pct", fmt.Sprintf("%.2f", setup.Return1M),
@@ -1730,8 +1734,8 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		} else if eg.TrendAlignmentEnabled {
 			var evaluated bool
 			entryGateReason, evaluated = evaluateTrendAlignmentGate(
-				string(resp.Action), signalPrice, data.Timeframe(timeframe),
-				candles, time.Now(), eg,
+				string(resp.Action), signalPrice, data.Timeframe1Day,
+				entryDailyCandles, time.Now(), eg,
 			)
 			if !evaluated {
 				logger.Warn("entry gates: daily trend evidence unavailable — trend gate fails open",
@@ -2064,6 +2068,32 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if sig.Action == string(analysis.ActionSell) {
 		e.executeSellExit(ctx, sigID, sig)
 		return
+	}
+
+	// A pullback entry's edge and risk are anchored to the signal-session low.
+	// Revalidate against a fresh mark immediately before sizing/order placement:
+	// LLM latency, manual approval, or a restart may otherwise leave an already
+	// breached/inverted stop attached to a new position.
+	if sig.PullbackStrength {
+		mark := e.freshStockMark(ctx, sig.Ticker, time.Now())
+		if reason := pullback.ValidateExecutionMark(
+			mark, sig.StopLoss,
+			e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+		); reason != "" {
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "mark", mark,
+				"stop_loss", sig.StopLoss, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_stop",
+			})
+			return
+		}
+		sig.SignalPrice = mark
+		if err := store.UpdateSignalPrice(ctx, sigID, mark); err != nil {
+			logger.Warn("update pullback execution price", "id", sigID, "err", err)
+		}
 	}
 
 	// An `exiting` trade still owns broker quantity until reconciliation
@@ -3027,7 +3057,7 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 		// usually the same bar that priced the signal on the previous tick —
 		// "confirming" against it would observe no new information at all
 		// (Codex P1 on #434). Stored candles are only a fallback.
-		confirmPrice := e.deferredConfirmPrice(ctx, sig.Ticker, now)
+		confirmPrice := e.freshStockMark(ctx, sig.Ticker, now)
 		if confirmPrice <= 0 {
 			// No mark to confirm against — keep pending; either a later tick
 			// confirms or the expiry loop cleans up.
@@ -3086,16 +3116,19 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 	}
 }
 
-// deferredConfirmPrice returns the freshest available mark for confirming a
-// deferred signal: a live quote mid when the provider answers with a
+// freshStockMark returns the freshest available stock mark: a live quote mid
+// when the provider answers with a
 // two-sided quote, else the freshest stored candle within its recency
 // window, else 0 (no mark). One-sided quotes (pre-market / thin books) are
 // rejected — FetchQuote's mid is (bid+ask)/2, so a missing side halves the
 // price and would wrongly stale a legitimate signal (same guard as the ORB
 // spread gate).
-func (e *Engine) deferredConfirmPrice(ctx context.Context, ticker string, now time.Time) float64 {
+func (e *Engine) freshStockMark(ctx context.Context, ticker string, now time.Time) float64 {
+	if e.marketData == nil {
+		return 0
+	}
 	if q, err := e.marketData.FetchQuote(ctx, ticker); err != nil {
-		logger.Warn("deferred confirm: quote fetch failed — falling back to stored candles",
+		logger.Warn("fresh stock mark: quote fetch failed — falling back to stored candles",
 			"ticker", ticker, "err", err)
 	} else if q != nil && q.Bid > 0 && q.Ask > 0 {
 		return q.Last

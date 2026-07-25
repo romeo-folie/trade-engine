@@ -102,6 +102,13 @@ The live engine always fetches daily history for this gate, even when a scanner 
 
 The backtest flag is `--pullback-strength`. It loads a separate one-year warm-up slice for the deterministic entry evaluator while leaving the analyst request window unchanged, preserving the existing prompt-cache keys. A gap below the signal day's low cancels the next-open simulated fill.
 
+Review hardening on PR #476 also persists the complete run options and entry
+diagnostics on `backtest_runs`, including gap invalidations, so `backtest list`
+and `backtest compare` remain reproducible after the process exits. Migration
+053 clears recoverable bare-symbol candle caches once when switching from raw
+to split-adjusted Alpaca history; this prevents old and new adjustment scales
+from coexisting in a two-year indicator series.
+
 ### Phase 2 cached six-ticker comparison
 
 All six runs used **87 cache hits / 0 misses (100%)**. The comparison used the

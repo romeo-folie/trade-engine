@@ -70,4 +70,6 @@ For the research-defined pullback-in-strength entry, pass
 momentum/consolidation/AVWAP evidence, but keeps the original analyst request
 window unchanged so existing prompt-cache entries remain reusable. Eligible
 BUYs use the signal day's low as their initial stop; a next-session gap through
-that low cancels the simulated fill.
+that low cancels the simulated fill and is recorded as `gap_invalidation`.
+Run options and entry diagnostics are persisted with `backtest_runs`, so list
+and comparison output can distinguish Phase 2 experiments from baselines.

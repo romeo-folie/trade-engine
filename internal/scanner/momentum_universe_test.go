@@ -75,4 +75,11 @@ func TestQualifyPullbackUniverseKeepsTopQuartile(t *testing.T) {
 	if got[0].MarketCapMM != 500 || got[0].DollarVolume != 2_000_000 {
 		t.Fatalf("universe metrics missing: %+v", got[0])
 	}
+
+	scan.PullbackMinMomentumReturnPct = 400
+	if got := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
+		{Ticker: "AAA", Price: 200, Volume: 10_000},
+	}); len(got) != 0 {
+		t.Fatalf("configured 400%% floor ignored: %+v", got)
+	}
 }
