@@ -165,6 +165,24 @@ func TestFilterUnavailableRequalifications(t *testing.T) {
 	}
 }
 
+func TestDisabledModeQualificationOnlyAcknowledgesQuarantinedTickers(t *testing.T) {
+	candidates := []SwingCandidate{
+		{Ticker: "LEGACY"},
+		{Ticker: "UNRELATED"},
+	}
+	got := markQuarantinedQualificationKnown(
+		candidates,
+		map[string]struct{}{"LEGACY": {}, "UNRELATED": {}},
+		map[string]struct{}{"LEGACY": {}},
+	)
+	if !got[0].PullbackQualificationKnown || got[0].PullbackQualified {
+		t.Fatalf("legacy outcome = %+v", got[0])
+	}
+	if got[1].PullbackQualificationKnown || got[1].PullbackQualified {
+		t.Fatalf("unrelated candidate inherited disabled pullback state: %+v", got[1])
+	}
+}
+
 func TestQualifyPullbackUniverseUnavailableRemainsUnknown(t *testing.T) {
 	result := (&MarketScanner{}).qualifyPullbackUniverse(
 		context.Background(),

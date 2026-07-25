@@ -7,13 +7,12 @@ ALTER TABLE watchlist
 
 -- There is no reliable durable evidence that a legacy row was created while
 -- the old exclusive pullback universe was enabled. Require every active legacy
--- scanner row to complete a definitive point-in-time universe check before it
--- can be reactivated as either pullback-qualified or standard. Provider/history
--- failures leave the marker set and the row inactive.
+-- scanner row, active or inactive, to complete a definitive point-in-time
+-- universe check before it can be reactivated as either pullback-qualified or
+-- standard. Provider/history failures leave the marker set and the row inactive.
 UPDATE watchlist
 SET active = FALSE,
     pullback_requalification_required = TRUE,
     updated_at = NOW()
 WHERE platform = 'stock'
-  AND source = 'scanner'
-  AND active = TRUE;
+  AND source = 'scanner';

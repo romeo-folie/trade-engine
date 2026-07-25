@@ -176,7 +176,13 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		if len(qualification.qualified) == 0 {
 			slog.Info("scanner: no candidates passed pullback-strength universe")
 		}
-		candidates = markPullbackQualification(candidates, qualification)
+		if s.PullbackUniverseEnabled {
+			candidates = markPullbackQualification(candidates, qualification)
+		} else {
+			candidates = markQuarantinedQualificationKnown(
+				candidates, qualification.known, requalificationRequired,
+			)
+		}
 		candidates = filterUnavailableRequalifications(candidates, requalificationRequired)
 	}
 
@@ -349,6 +355,20 @@ func filterUnavailableRequalifications(
 		filtered = append(filtered, candidate)
 	}
 	return filtered
+}
+
+func markQuarantinedQualificationKnown(
+	candidates []SwingCandidate,
+	known map[string]struct{},
+	required map[string]struct{},
+) []SwingCandidate {
+	out := append([]SwingCandidate(nil), candidates...)
+	for i := range out {
+		_, quarantined := required[out[i].Ticker]
+		_, definitive := known[out[i].Ticker]
+		out[i].PullbackQualificationKnown = quarantined && definitive
+	}
+	return out
 }
 
 func pullbackRequalificationRequired(ctx context.Context) (map[string]struct{}, error) {
