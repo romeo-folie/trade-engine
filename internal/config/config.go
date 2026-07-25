@@ -1991,6 +1991,11 @@ func Validate(cfg *Config) []string {
 		} {
 			addWithFallback(k)
 		}
+		if cfg.Analysis.SpecialistModeEnabled {
+			for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
+				addWithFallback(cfg.Analysis.SpecialistRoles[role])
+			}
+		}
 
 		// Validate all registry entries have provider + model.
 		for key, entry := range cfg.Models.Registry {

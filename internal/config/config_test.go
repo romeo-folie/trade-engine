@@ -225,6 +225,41 @@ func TestValidateSpecialistModeRequiresEveryRole(t *testing.T) {
 	}
 }
 
+func TestValidateSpecialistModeChecksRoleAPIKeysAndFallbacks(t *testing.T) {
+	cfg := Defaults()
+	cfg.Analysis.SpecialistModeEnabled = true
+	cfg.Analysis.SpecialistRoles = map[string]string{
+		"fundamental":  "analyst_frontier",
+		"technical":    "analyst_mid",
+		"sentiment":    "analyst_cheap",
+		"risk_manager": "specialist_risk",
+	}
+	cfg.Models.Registry["specialist_risk"] = ModelRegistryEntry{
+		ModelConfig: ModelConfig{
+			Provider:  "special-provider",
+			Model:     "risk-model",
+			APIKeyEnv: "TE_TEST_SPECIALIST_KEY_NOTSET",
+		},
+		Fallback: "specialist_fallback",
+	}
+	cfg.Models.Registry["specialist_fallback"] = ModelRegistryEntry{
+		ModelConfig: ModelConfig{
+			Provider:  "fallback-provider",
+			Model:     "fallback-model",
+			APIKeyEnv: "TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET",
+		},
+	}
+	os.Unsetenv("TE_TEST_SPECIALIST_KEY_NOTSET")
+	os.Unsetenv("TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET")
+
+	errs := Validate(cfg)
+	for _, envName := range []string{"TE_TEST_SPECIALIST_KEY_NOTSET", "TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET"} {
+		if !containsStr(errs, envName) {
+			t.Errorf("expected missing specialist API key error for %s, got: %v", envName, errs)
+		}
+	}
+}
+
 func TestResolveEnvEmpty(t *testing.T) {
 	if got := resolveEnv(""); got != "" {
 		t.Errorf("resolveEnv(\"\") = %q, want empty", got)

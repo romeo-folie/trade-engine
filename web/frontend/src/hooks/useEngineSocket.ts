@@ -301,6 +301,10 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                     ? `specialist-${vote.role.replace(/_/g, '-')}`
                     : nodeIdByLabelRef.current.get(vote.model);
                   if (!nodeId) continue;
+                  // The generic event envelope already counted source/target.
+                  // Avoid counting the sequential Risk Specialist twice when
+                  // SpecialistReviewCompleted originates from that same node.
+                  if (nodeId === webEv.source || nodeId === webEv.target) continue;
                   const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
                   next[nodeId] = {
                     eventCount: existing.eventCount + 1,
