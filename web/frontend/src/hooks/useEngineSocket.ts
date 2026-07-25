@@ -223,20 +223,23 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         const indexed: IndexedWebEvent = { ...webEv, _seqId: ++seqRef.current };
         setEvents(prev => [indexed, ...prev].slice(0, MAX_EVENTS));
 
-        // Update per-node metrics for source and target nodes.
-        // Use a Set to avoid double-counting self-loop events (source === target).
-        setNodeMetrics(prev => {
-          const next = { ...prev };
-          for (const nodeId of new Set([webEv.source, webEv.target])) {
-            if (!nodeId) continue;
-            const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
-            next[nodeId] = {
-              eventCount: existing.eventCount + 1,
-              lastEventAt: now,
-            };
-          }
-          return next;
-        });
+        // Update per-node metrics for source and target nodes. Routing-only
+        // analyst pulses are already counted from the aggregate vote payload.
+        if (webEv.type !== 'AnalystVoteRouted') {
+          // Use a Set to avoid double-counting self-loop events.
+          setNodeMetrics(prev => {
+            const next = { ...prev };
+            for (const nodeId of new Set([webEv.source, webEv.target])) {
+              if (!nodeId) continue;
+              const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
+              next[nodeId] = {
+                eventCount: existing.eventCount + 1,
+                lastEventAt: now,
+              };
+            }
+            return next;
+          });
+        }
 
         // Track last signal time
         if (webEv.type === 'SignalGenerated') {

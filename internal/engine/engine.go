@@ -1165,7 +1165,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	e.bus.Publish(events.AnalysisCompleted, events.AnalysisCompletedPayload{
 		Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
 		Reasoning: resp.Reasoning, Provider: meta.Provider, Model: meta.Model, LatencyMs: meta.LatencyMs,
-		FastPathed: result.FastPathed,
+		FastPathed: result.FastPathed, SourceNode: e.analysisSourceNode(result),
 	})
 	if !result.FastPathed && result.Arbiter != nil {
 		e.bus.Publish(events.ArbiterInvoked, events.ArbiterInvokedPayload{
@@ -1210,7 +1210,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	// its degraded-mode handling.
 	e.generateSignal(
 		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
-		prefetchedOpenTrades,
+		prefetchedOpenTrades, e.analysisSourceNode(result),
 	)
 
 	// Update material-change gate state for next tick.
@@ -1228,6 +1228,25 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 		LastAnalysedAt: time.Now(),
 	}
 	e.tickerStateMu.Unlock()
+}
+
+// analysisSourceNode identifies the configured analysis stage that produced the
+// final verdict. Web clients use this semantic ID to route live events across
+// the same nodes advertised by the topology snapshot.
+func (e *Engine) analysisSourceNode(result analysis.AnalyzeResult) string {
+	if e.cfg.Analysis.SpecialistModeEnabled {
+		return "specialist-risk-manager"
+	}
+	if result.Arbiter != nil && !result.FastPathed {
+		return "arbiter_node"
+	}
+	if e.cfg.Models.Consensus.Enabled && len(result.AnalystResults) > 1 {
+		return "consensus"
+	}
+	if len(e.cfg.Models.Roles.Analysts) > 0 {
+		return "analyst-" + e.cfg.Models.Roles.Analysts[0]
+	}
+	return "llm_analysis"
 }
 
 func min(a, b int) int {
@@ -1658,7 +1677,7 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 // runAnalysis loads openTrades up front for the SELL-only short-circuit probe
 // (#319) and threads the same slice through here so a typical analysis cycle
 // only hits the trades store once. Pass nil to force a fresh query.
-func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade) {
+func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade, analysisSourceNode string) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
 		// no signal fires. No cooldown is applied so the ticker is re-evaluated
@@ -1982,6 +2001,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 		Confidence: resp.Confidence, SignalPrice: signalPrice,
 		StopLoss: sig.StopLoss, TakeProfit: sig.TakeProfit, Mode: e.Mode(),
+		SourceNode: analysisSourceNode,
 	})
 
 	// Route based on mode.

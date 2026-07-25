@@ -80,7 +80,7 @@ interface HubGraphProps {
   nodes: NodeState[];
   topology: PipelineTopology | null;
   nodeMetrics: Record<string, NodeMetrics>;
-  recentEventSignatures: Record<string, { type: string; seqId: number }>;
+  recentEventSignatures: Record<string, { type: string; seqId: number; target: string }>;
   onNodeClick: (nodeId: string) => void;
 }
 
@@ -255,19 +255,21 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     const arbiterActive = isNodeRecentlyActive('arbiter_node');
 
     const makeEdge = (src: string, tgt: string, edgeKind: string) => {
-      let active = isNodeRecentlyActive(src);
+      const exactEventActive = recentEventSignatures[src]?.target === tgt && isNodeRecentlyActive(src);
+      let active = exactEventActive;
       if (src === 'indicator_engine' && rfNodes.find(n => n.id === tgt)?.data.kind === 'analyst') {
         active = selectedAnalysts.includes(tgt) && isNodeRecentlyActive(tgt);
       }
       if (edgeKind === 'bypass') {
-        active = isNodeRecentlyActive(src) && !arbiterActive;
+        active = exactEventActive;
       }
       if (edgeKind === 'conditional') {
-        active = arbiterActive;
+        const isArbiterPath = src === 'arbiter_node' || tgt === 'arbiter_node';
+        active = isArbiterPath ? exactEventActive && arbiterActive : exactEventActive;
       }
       if (src === 'risk_manager' && tgt === 'executor') {
         const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
-        active = isNodeRecentlyActive(src) && allRiskPassed;
+        active = exactEventActive && allRiskPassed;
       }
       return {
         id: `e-${src}-${tgt}`,
@@ -298,7 +300,7 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     return topology.edges
       .filter(edge => rfNodes.some(n => n.id === edge.source) && rfNodes.some(n => n.id === edge.target))
       .map(edge => makeEdge(edge.source, edge.target, edge.kind));
-  }, [rfNodes, topology, nodeMetrics, lastRiskChecks, selectedAnalysts]);
+  }, [rfNodes, topology, nodeMetrics, recentEventSignatures, lastRiskChecks, selectedAnalysts]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
@@ -361,22 +363,20 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     return m;
   }, [rfN]);
 
-  const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
+  const prevSignatures = useRef<Record<string, { type: string; seqId: number; target: string }>>({});
   useEffect(() => {
     for (const [nodeId, sig] of Object.entries(recentEventSignatures)) {
       const prev = prevSignatures.current[nodeId];
       if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue;
       prevSignatures.current[nodeId] = sig;
 
-      // Find the edge(s) this node is a source of.
-      // For the consensus node, only spawn particles on the path actually taken:
-      //   AnalysisCompleted → fast path (consensus → risk_manager), suppress arbiter edge
-      //   ArbiterInvoked    → arbiter path (consensus → arbiter_node), suppress direct edge
-      const outgoingEdges = rfE.filter(e => {
-        if (e.source !== 'consensus') return e.source === nodeId;
-        if (sig.type === 'ArbiterInvoked') return e.target === 'arbiter_node';
-        return e.target === 'risk_manager';
-      });
+      // AnalysisCompleted updates the verdict-producing node itself. The
+      // subsequent SignalGenerated event is what traverses into risk controls.
+      if (sig.type === 'AnalysisCompleted') continue;
+
+      // Route only across the exact edge named by the event contract. This
+      // prevents a source with several outcomes from lighting every branch.
+      const outgoingEdges = rfE.filter(e => e.source === nodeId && e.target === sig.target);
       outgoingEdges.forEach(edge => {
         const src = rfNodeMap.get(edge.source);
         const tgt = rfNodeMap.get(edge.target);

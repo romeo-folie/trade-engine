@@ -24,14 +24,17 @@ export default function PipelineScreen() {
 
   const handleClose = useCallback(() => setSelectedNodeId(null), []);
 
-  // Build map of nodeId → event signature for particle spawning.
+  // Build map of source node → event signature for particle spawning. Targets
+  // receive metrics/status updates, but must not immediately retransmit the
+  // same event along every outgoing edge.
   // Uses _seqId (monotonic counter) so back-to-back events with identical timestamps
   // still produce distinct signatures and always spawn particles.
-  const recentEventSignatures = useMemo<Record<string, { type: string; seqId: number }>>(() => {
-    const result: Record<string, { type: string; seqId: number }> = {};
+  const recentEventSignatures = useMemo<Record<string, { type: string; seqId: number; target: string }>>(() => {
+    const result: Record<string, { type: string; seqId: number; target: string }> = {};
     for (const ev of events) {
-      if (ev.source && !result[ev.source]) result[ev.source] = { type: ev.type, seqId: ev._seqId };
-      if (ev.target && !result[ev.target]) result[ev.target] = { type: ev.type, seqId: ev._seqId };
+      if (ev.source && !result[ev.source]) {
+        result[ev.source] = { type: ev.type, seqId: ev._seqId, target: ev.target };
+      }
     }
     return result;
   }, [events]);

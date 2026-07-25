@@ -215,7 +215,7 @@ func (s *Server) broadcastLoop(ctx context.Context) {
 			if !ok {
 				return
 			}
-			msgs := toWebEvents(ev)
+			msgs := toWebEvents(ev, s.engineCfg)
 			for _, msg := range msgs {
 				s.hub.broadcast(ctx, msg)
 			}
@@ -394,7 +394,7 @@ func serveNoFrontend(w http.ResponseWriter, _ *http.Request) {
 
 // toWebEvents converts an internal engine event to one or more wire-format WebEvents.
 // Returns an empty slice for event types that should not be forwarded.
-func toWebEvents(ev events.Event) []*WebEvent {
+func toWebEvents(ev events.Event, cfg *appconfig.Config) []*WebEvent {
 	// Handle fan-out events that produce multiple web pulses (Complex Routing).
 	switch ev.Type {
 	case events.AnalysisStarted:
@@ -427,25 +427,59 @@ func toWebEvents(ev events.Event) []*WebEvent {
 			return nil
 		}
 		raw, _ := json.Marshal(payload)
-		source, target, webType := "llm_analysis", "consensus", "AnalystVotesPublished"
+		activeAnalysts := routedAnalystNodeIDs(cfg, payload.Votes)
+		source, target, webType := activeAnalysts[0], "consensus", "AnalystVotesPublished"
 		for _, vote := range payload.Votes {
 			if vote.Role == "risk_manager" {
 				source, target, webType = "specialist-risk-manager", "risk_manager", "SpecialistReviewCompleted"
 				break
 			}
 		}
-		if len(payload.Votes) == 1 {
+		if topologyMode(cfg) == "single" || len(payload.Votes) <= 1 {
 			target = "risk_manager"
 		}
-		// Emit a single AnalystVotesPublished event per cycle — frontend reads all votes
-		// from the payload. Emitting one per non-skipped vote was redundant and inflated WS traffic.
-		return []*WebEvent{{
+		msgs := []*WebEvent{{
 			Type:      webType,
 			Timestamp: ev.Timestamp,
 			Source:    source,
 			Target:    target,
 			Payload:   json.RawMessage(raw),
 		}}
+		// Carry the complete vote payload once. Routing-only events animate the
+		// remaining analyst fan-in without duplicating votes in frontend stores.
+		if webType == "AnalystVotesPublished" && target == "consensus" {
+			for _, analystID := range activeAnalysts[1:] {
+				msgs = append(msgs, &WebEvent{
+					Type:      "AnalystVoteRouted",
+					Timestamp: ev.Timestamp,
+					Source:    analystID,
+					Target:    target,
+				})
+			}
+		}
+		return msgs
+
+	case events.AnalysisCompleted:
+		payload, ok := ev.Payload.(events.AnalysisCompletedPayload)
+		if !ok {
+			return nil
+		}
+		source := payload.SourceNode
+		if source == "" {
+			source = finalAnalysisNodeID(cfg, payload.FastPathed)
+		}
+		return singleWebEvent(ev, "AnalysisCompleted", source, source)
+
+	case events.SignalGenerated:
+		payload, ok := ev.Payload.(events.SignalGeneratedPayload)
+		if !ok {
+			return nil
+		}
+		source := payload.SourceNode
+		if source == "" {
+			source = finalAnalysisNodeID(cfg, false)
+		}
+		return singleWebEvent(ev, "SignalGenerated", source, "risk_manager")
 	}
 
 	src, dst, evType := mapEventEdge(ev.Type)
@@ -465,4 +499,98 @@ func toWebEvents(ev events.Event) []*WebEvent {
 		Target:    dst,
 		Payload:   json.RawMessage(payload),
 	}}
+}
+
+func singleWebEvent(ev events.Event, eventType, source, target string) []*WebEvent {
+	payload, err := json.Marshal(ev.Payload)
+	if err != nil {
+		logger.Warn("web: failed to marshal event payload",
+			"type", string(ev.Type), "err", err.Error())
+		payload = nil
+	}
+	return []*WebEvent{{
+		Type: eventType, Timestamp: ev.Timestamp, Source: source, Target: target,
+		Payload: json.RawMessage(payload),
+	}}
+}
+
+func analystNodeIDs(cfg *appconfig.Config) []string {
+	nodes, _ := pipelineTopology(cfg)
+	var ids []string
+	for _, node := range nodes {
+		if node.Kind == "analyst" {
+			ids = append(ids, node.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return []string{"llm_analysis"}
+	}
+	return ids
+}
+
+func firstAnalystNodeID(cfg *appconfig.Config) string {
+	return analystNodeIDs(cfg)[0]
+}
+
+func routedAnalystNodeIDs(cfg *appconfig.Config, votes []events.AnalystVotePayload) []string {
+	nodes, _ := pipelineTopology(cfg)
+	var analysts []NodeState
+	for _, node := range nodes {
+		if node.Kind == "analyst" {
+			analysts = append(analysts, node)
+		}
+	}
+	if len(analysts) == 0 {
+		return []string{"llm_analysis"}
+	}
+
+	used := make(map[string]bool, len(analysts))
+	ids := make([]string, 0, len(votes))
+	for _, vote := range votes {
+		for _, node := range analysts {
+			if used[node.ID] {
+				continue
+			}
+			model, _ := node.Meta["model"].(string)
+			provider, _ := node.Meta["provider"].(string)
+			role, _ := node.Meta["role"].(string)
+			if (vote.Role != "" && vote.Role == role) ||
+				(vote.Model == model && (vote.Provider == "" || vote.Provider == provider)) {
+				ids = append(ids, node.ID)
+				used[node.ID] = true
+				break
+			}
+		}
+	}
+	for _, node := range analysts {
+		if len(ids) >= len(votes) {
+			break
+		}
+		if !used[node.ID] {
+			ids = append(ids, node.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return []string{analysts[0].ID}
+	}
+	return ids
+}
+
+func topologyMode(cfg *appconfig.Config) string {
+	_, topology := pipelineTopology(cfg)
+	return topology.AnalysisMode
+}
+
+func finalAnalysisNodeID(cfg *appconfig.Config, fastPathed bool) string {
+	switch topologyMode(cfg) {
+	case "specialist":
+		return "specialist-risk-manager"
+	case "ensemble":
+		if !fastPathed && cfg != nil && cfg.Models.ArbiterConfig().Model != "" {
+			return "arbiter_node"
+		}
+		return "consensus"
+	default:
+		return firstAnalystNodeID(cfg)
+	}
 }

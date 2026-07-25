@@ -76,6 +76,7 @@ type AnalysisCompletedPayload struct {
 	Model      string  `json:"model"`
 	LatencyMs  int64   `json:"latency_ms"`
 	FastPathed bool    `json:"fast_pathed"` // true = unanimous analysts, arbiter skipped
+	SourceNode string  `json:"source_node,omitempty"`
 }
 
 // ArbiterInvokedPayload is emitted when the arbiter resolves analyst dissent.
@@ -96,6 +97,7 @@ type SignalGeneratedPayload struct {
 	StopLoss    float64
 	TakeProfit  float64
 	Mode        string // auto | paper | manual
+	SourceNode  string `json:"source_node,omitempty"`
 }
 
 // SignalBlockedPayload is emitted when a signal fails risk checks.

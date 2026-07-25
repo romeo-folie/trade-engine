@@ -120,6 +120,23 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
           <div className={styles.nodeTitle}>{d.label}</div>
         )}
 
+        {/* ── Outcome Template ── */}
+        {d.kind === 'outcome' && (
+          <div className={styles.sourceContent}>
+            <div className={styles.subValue}>
+              {d.nodeId === 'approvals' ? 'MANUAL REVIEW' : 'RISK OUTCOME'}
+            </div>
+            <div className={styles.metricValue}>
+              {d.eventCount > 0 ? d.eventCount.toLocaleString() : '—'}
+            </div>
+            <div className={styles.feedStatusRow}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? (d.nodeId === 'approvals' ? 'WAITING APPROVAL' : 'BLOCKED') : 'IDLE'}
+              </span>
+            </div>
+          </div>
+        )}
+
         {/* ── Source Template ── */}
         {d.kind === 'source' && (
           <div className={styles.sourceContent}>

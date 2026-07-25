@@ -35,12 +35,14 @@ func TestPipelineTopologySingleModelCollapsesEnsemble(t *testing.T) {
 	}
 	assertNodeIDs(t, nodes,
 		"news_api", "alpaca", "news_enricher", "indicator_engine",
-		"analyst-cheap", "risk_manager", "executor", "portfolio",
+		"analyst-cheap", "risk_manager", "executor", "blocked_signals", "approvals", "portfolio",
 	)
 	assertMissingNode(t, nodes, "analyst-mid")
 	assertMissingNode(t, nodes, "consensus")
 	assertMissingNode(t, nodes, "arbiter_node")
 	assertEdge(t, topology.Edges, "analyst-cheap", "risk_manager", "primary")
+	assertEdge(t, topology.Edges, "risk_manager", "blocked_signals", "conditional")
+	assertEdge(t, topology.Edges, "risk_manager", "approvals", "conditional")
 }
 
 func TestPipelineTopologyEnsembleKeepsConditionalArbiter(t *testing.T) {
@@ -57,6 +59,7 @@ func TestPipelineTopologyEnsembleKeepsConditionalArbiter(t *testing.T) {
 	assertEdge(t, topology.Edges, "consensus", "risk_manager", "bypass")
 	assertEdge(t, topology.Edges, "consensus", "arbiter_node", "conditional")
 	assertEdge(t, topology.Edges, "arbiter_node", "risk_manager", "conditional")
+	assertEdge(t, topology.Edges, "analyst-cheap", "risk_manager", "bypass")
 }
 
 func TestPipelineTopologySpecialistUsesMandatoryRiskSpecialist(t *testing.T) {
@@ -87,6 +90,15 @@ func TestPipelineTopologySpecialistUsesMandatoryRiskSpecialist(t *testing.T) {
 	assertEdge(t, topology.Edges, "specialist-risk-manager", "risk_manager", "primary")
 }
 
+func TestPipelineTopologyIncludesRuntimeApprovalBranch(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Models.Consensus.Enabled = false
+
+	nodes, topology := pipelineTopology(cfg)
+	assertHasNode(t, nodes, "approvals")
+	assertEdge(t, topology.Edges, "risk_manager", "approvals", "conditional")
+}
+
 func TestToWebEventsSpecialistRiskReviewFansInFromDirectionalRoles(t *testing.T) {
 	sources := []string{"specialist-fundamental", "specialist-technical", "specialist-sentiment"}
 	msgs := toWebEvents(events.Event{
@@ -94,7 +106,7 @@ func TestToWebEventsSpecialistRiskReviewFansInFromDirectionalRoles(t *testing.T)
 		Payload: events.AnalysisStartedPayload{
 			Ticker: "AAPL", SelectedAnalysts: []string{"specialist-risk-manager"}, SourceNodes: sources,
 		},
-	})
+	}, topologyTestConfig())
 	if len(msgs) != len(sources) {
 		t.Fatalf("message count = %d, want %d", len(msgs), len(sources))
 	}
@@ -116,7 +128,7 @@ func TestToWebEventsSpecialistVotesRouteIntoRiskControls(t *testing.T) {
 				{Model: "risk-model", Role: "risk_manager"},
 			},
 		},
-	})
+	}, topologyTestConfig())
 	if len(msgs) != 1 {
 		t.Fatalf("message count = %d, want 1", len(msgs))
 	}
@@ -126,6 +138,107 @@ func TestToWebEventsSpecialistVotesRouteIntoRiskControls(t *testing.T) {
 	if msgs[0].Source != "specialist-risk-manager" || msgs[0].Target != "risk_manager" {
 		t.Fatalf("message = %s -> %s, want specialist-risk-manager -> risk_manager",
 			msgs[0].Source, msgs[0].Target)
+	}
+}
+
+func TestToWebEventsEnsembleVotesUseConfiguredAnalystEdges(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Models.Consensus.Enabled = true
+	msgs := toWebEvents(events.Event{
+		Type: events.AnalystVotesPublished, Timestamp: time.Now(),
+		Payload: events.AnalystVotesPublishedPayload{
+			Ticker: "AAPL",
+			Votes: []events.AnalystVotePayload{
+				{Model: "cheap-model"}, {Model: "mid-model"}, {Model: "front-model"},
+			},
+		},
+	}, cfg)
+	if len(msgs) != 3 {
+		t.Fatalf("message count = %d, want 3", len(msgs))
+	}
+	for i, source := range []string{"analyst-cheap", "analyst-mid", "analyst-front"} {
+		if msgs[i].Source != source || msgs[i].Target != "consensus" {
+			t.Fatalf("message[%d] = %s -> %s, want %s -> consensus",
+				i, msgs[i].Source, msgs[i].Target, source)
+		}
+	}
+	if msgs[0].Type != "AnalystVotesPublished" ||
+		msgs[1].Type != "AnalystVoteRouted" || msgs[2].Type != "AnalystVoteRouted" {
+		t.Fatalf("unexpected message types: %q, %q, %q", msgs[0].Type, msgs[1].Type, msgs[2].Type)
+	}
+}
+
+func TestToWebEventsDepthOneBypassesConfiguredConsensus(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Models.Consensus.Enabled = true
+	msgs := toWebEvents(events.Event{
+		Type: events.AnalystVotesPublished, Timestamp: time.Now(),
+		Payload: events.AnalystVotesPublishedPayload{
+			Ticker: "AAPL",
+			Votes:  []events.AnalystVotePayload{{Provider: "deepseek", Model: "cheap-model"}},
+		},
+	}, cfg)
+	if len(msgs) != 1 {
+		t.Fatalf("message count = %d, want 1", len(msgs))
+	}
+	if msgs[0].Source != "analyst-cheap" || msgs[0].Target != "risk_manager" {
+		t.Fatalf("message = %s -> %s, want analyst-cheap -> risk_manager",
+			msgs[0].Source, msgs[0].Target)
+	}
+}
+
+func TestToWebEventsUsesPayloadSourceForAnalysisAndSignal(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Models.Consensus.Enabled = true
+	now := time.Now()
+
+	analysisMsgs := toWebEvents(events.Event{
+		Type: events.AnalysisCompleted, Timestamp: now,
+		Payload: events.AnalysisCompletedPayload{
+			Ticker: "AAPL", SourceNode: "arbiter_node",
+		},
+	}, cfg)
+	if len(analysisMsgs) != 1 ||
+		analysisMsgs[0].Source != "arbiter_node" || analysisMsgs[0].Target != "arbiter_node" {
+		t.Fatalf("analysis route = %+v, want arbiter_node self update", analysisMsgs)
+	}
+
+	signalMsgs := toWebEvents(events.Event{
+		Type: events.SignalGenerated, Timestamp: now,
+		Payload: events.SignalGeneratedPayload{
+			Ticker: "AAPL", SourceNode: "arbiter_node",
+		},
+	}, cfg)
+	if len(signalMsgs) != 1 ||
+		signalMsgs[0].Source != "arbiter_node" || signalMsgs[0].Target != "risk_manager" {
+		t.Fatalf("signal route = %+v, want arbiter_node -> risk_manager", signalMsgs)
+	}
+}
+
+func TestConfiguredPipelineEventsOnlyReferenceSnapshotNodes(t *testing.T) {
+	cfg := topologyTestConfig()
+	cfg.Models.Consensus.Enabled = false
+	nodes, _ := pipelineTopology(cfg)
+	nodeIDs := make(map[string]bool, len(nodes))
+	for _, node := range nodes {
+		nodeIDs[node.ID] = true
+	}
+
+	for _, eventType := range []events.Type{
+		events.DataFetched, events.NewsFetched, events.NewsEnriched,
+		events.IndicatorsComputed, events.SignalBlocked, events.SignalExpired,
+		events.SignalQueued, events.RiskCheckCompleted, events.TradeExecuted,
+		events.TradeSimulated, events.TradeClosed, events.PositionUpdated,
+		events.PortfolioSnapshotTaken,
+	} {
+		msgs := toWebEvents(events.Event{Type: eventType, Timestamp: time.Now()}, cfg)
+		if len(msgs) != 1 {
+			t.Fatalf("%s message count = %d, want 1", eventType, len(msgs))
+		}
+		if !nodeIDs[msgs[0].Source] || !nodeIDs[msgs[0].Target] {
+			t.Fatalf("%s route %s -> %s references a node absent from snapshot",
+				eventType, msgs[0].Source, msgs[0].Target)
+		}
 	}
 }
 

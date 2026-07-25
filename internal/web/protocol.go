@@ -87,7 +87,7 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	case events.NewsEnriched:
 		return "news_enricher", "indicator_engine", "NewsEnriched"
 	case events.IndicatorsComputed:
-		return "indicator_engine", "prompt_assembly", "IndicatorsComputed"
+		return "indicator_engine", "indicator_engine", "IndicatorsComputed"
 	case events.AnalysisCompleted:
 		return "llm_analysis", "consensus", "AnalysisCompleted"
 	case events.AnalystVotesPublished:
@@ -108,7 +108,7 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 	case events.SignalQueued:
 		return "risk_manager", "approvals", "SignalQueued"
 	case events.RiskCheckCompleted:
-		return "risk_manager", "executor", "RiskCheckCompleted"
+		return "risk_manager", "risk_manager", "RiskCheckCompleted"
 
 	// ── Execution & portfolio ────────────────────────────────────────────
 	case events.TradeExecuted:
@@ -320,6 +320,12 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 					ID: "e-" + analyst.ID + "-consensus", Source: analyst.ID, Target: "consensus", Kind: "primary",
 				})
 			}
+			// Adaptive depth can collapse an otherwise configured ensemble to
+			// its first analyst for a cycle. Keep that runtime bypass routable.
+			edges = append(edges, PipelineEdge{
+				ID:     "e-" + analystNodes[0].ID + "-risk-controls",
+				Source: analystNodes[0].ID, Target: "risk_manager", Kind: "bypass",
+			})
 			riskStage = 6
 			arbCfg := cfg.Models.ArbiterConfig()
 			if arbCfg.Model != "" {
@@ -347,10 +353,14 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 	nodes = append(nodes,
 		NodeState{ID: "risk_manager", Label: "Risk Controls", Kind: "synthesis", Stage: riskStage},
 		NodeState{ID: "executor", Label: "Executor", Kind: "execution", Stage: riskStage + 1},
+		NodeState{ID: "blocked_signals", Label: "Blocked", Kind: "outcome", Stage: riskStage + 1},
+		NodeState{ID: "approvals", Label: "Approval Queue", Kind: "outcome", Stage: riskStage + 1},
 		NodeState{ID: "portfolio", Label: "Portfolio", Kind: "execution", Stage: riskStage + 2},
 	)
 	edges = append(edges,
 		PipelineEdge{ID: "e-risk-controls-executor", Source: "risk_manager", Target: "executor", Kind: "primary"},
+		PipelineEdge{ID: "e-risk-controls-blocked", Source: "risk_manager", Target: "blocked_signals", Kind: "conditional"},
+		PipelineEdge{ID: "e-risk-controls-approvals", Source: "risk_manager", Target: "approvals", Kind: "conditional"},
 		PipelineEdge{ID: "e-executor-portfolio", Source: "executor", Target: "portfolio", Kind: "primary"},
 	)
 
