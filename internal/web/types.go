@@ -9,6 +9,7 @@ import (
 // APIAnalystResult is the frontend-friendly projection of an AnalystResult.
 type APIAnalystResult struct {
 	Name        string  `json:"name"`
+	Role        string  `json:"role,omitempty"`
 	Verdict     string  `json:"verdict"`
 	Confidence  float64 `json:"confidence"`
 	Description string  `json:"description"`
@@ -67,6 +68,7 @@ func truncate(s string, maxLen int) string {
 type analystResultJSON struct {
 	Provider  string                    `json:"Provider"`
 	Model     string                    `json:"Model"`
+	Role      string                    `json:"Role"`
 	Response  analysis.AnalysisResponse `json:"Response"`
 	Meta      analysis.ModelCallMeta    `json:"Meta"`
 	LatencyMs int64                     `json:"LatencyMs"`
@@ -105,8 +107,14 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 
 		active := r.Response.Action != ""
 
+		name := analystName(i)
+		if r.Role != "" {
+			name = specialistRoleName(r.Role)
+		}
+
 		analysts[i] = APIAnalystResult{
-			Name:        analystName(i),
+			Name:        name,
+			Role:        r.Role,
 			Verdict:     mapVerdict(r.Response.Action),
 			Confidence:  r.Response.Confidence,
 			Description: r.Response.Reasoning,
@@ -152,4 +160,19 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 	}
 
 	return analysts, ensemble
+}
+
+func specialistRoleName(role string) string {
+	switch role {
+	case "fundamental":
+		return "Fundamental"
+	case "technical":
+		return "Technical"
+	case "sentiment":
+		return "Sentiment"
+	case "risk_manager":
+		return "Risk Manager"
+	default:
+		return role
+	}
 }

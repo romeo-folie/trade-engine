@@ -108,11 +108,12 @@ func parseLevel(level string) slog.Level {
 // If Init/InitWithRotation was never called, it initialises with defaults via
 // once.Do so that a subsequent Init call doesn't open a second writer.
 func Get() *slog.Logger {
-	if std == nil {
-		once.Do(func() {
-			_ = initLogger("info", "text", DefaultRotationConfig())
-		})
-	}
+	// Always enter sync.Once. Checking std before Once.Do races with the
+	// goroutine that is publishing std inside initLogger; Once.Do supplies the
+	// required happens-before edge even after initialization has completed.
+	once.Do(func() {
+		_ = initLogger("info", "text", DefaultRotationConfig())
+	})
 	return std
 }
 

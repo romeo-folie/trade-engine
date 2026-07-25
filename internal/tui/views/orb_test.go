@@ -12,11 +12,19 @@ func TestRenderORBPanelEmpty(t *testing.T) {
 		Status: "pending",
 	}
 	out := RenderORBPanel(data, 80)
-	if !strings.Contains(out, "Spec Session") {
-		t.Error("expected 'Spec Session' title")
+	if !strings.Contains(out, "Intraday Session") {
+		t.Error("expected 'Intraday Session' title")
 	}
 	if !strings.Contains(out, "2026-03-20") {
 		t.Error("expected date in output")
+	}
+}
+
+func TestRenderORBViewEmptyUsesIntradayVocabulary(t *testing.T) {
+	out := RenderORBView(ORBViewData{}, 80, 20, 0)
+	if !strings.Contains(out, "Intraday Flow") ||
+		!strings.Contains(out, "No intraday sessions found") {
+		t.Fatalf("unexpected empty intraday view:\n%s", out)
 	}
 }
 
@@ -171,7 +179,7 @@ func TestRenderORBViewWindowedFitsHeight(t *testing.T) {
 	if n := strings.Count(out, "\n") + 1; n > height {
 		t.Errorf("rendered %d lines, exceeds height %d", n, height)
 	}
-	if !strings.Contains(out, "Spec Flow") {
+	if !strings.Contains(out, "Intraday Flow") {
 		t.Error("expected the view title on the first page")
 	}
 	if !strings.Contains(out, "below") {

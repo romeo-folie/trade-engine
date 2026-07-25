@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/tui/views"
 )
 
 func TestNew_DefaultView(t *testing.T) {
@@ -164,12 +166,32 @@ func TestViewLabels(t *testing.T) {
 		ViewWatchlist: "Watchlist",
 		ViewSignals:   "Signals",
 		ViewConfig:    "Config",
+		ViewORB:       "Intraday",
 	}
 	for v, want := range labels {
 		got := viewLabel(v)
 		if got != want {
 			t.Errorf("viewLabel(%d) = %q, want %q", v, got, want)
 		}
+	}
+}
+
+func TestConfigReadonlyItemExplainsHowToChangeIt(t *testing.T) {
+	m := New(nil, "paper", nil)
+	m.activeView = ViewConfig
+	m.configData.Items = []views.ConfigItem{{
+		Key: "risk.max_position_pct", Kind: "readonly",
+	}}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if !strings.Contains(m.statusMsg, "config.yaml") ||
+		!strings.Contains(m.statusMsg, "restart") {
+		t.Fatalf("read-only config status = %q", m.statusMsg)
+	}
+	if m.configEditing {
+		t.Fatal("read-only config item unexpectedly entered edit mode")
 	}
 }
 

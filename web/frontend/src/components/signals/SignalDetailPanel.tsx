@@ -9,6 +9,7 @@ import styles from './SignalDetailPanel.module.css';
 
 export interface AnalystData {
   name: string;
+  role?: string;
   verdict: string;       // 'LONG' | 'SHORT' | 'NEUTRAL'
   confidence: number;    // 0–1
   description: string;
@@ -115,6 +116,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
   const analysts = signal.Analysts && signal.Analysts.length > 0 ? signal.Analysts : [];
   const ensemble = signal.Ensemble ?? null;
   const activeAnalysts = analysts.filter(a => a.active);
+  const isSpecialist = analysts.some(a => !!a.role);
   const exec = executionLabel(signal.Status);
 
   return (
@@ -207,7 +209,7 @@ export default function SignalDetailPanel({ signal, onClose }: SignalDetailPanel
           </div>
 
           {/* Ensemble synthesis — only shown when analyst data is available */}
-          {analysts.length > 0 && <div className={styles.ensembleSection}>
+          {analysts.length > 0 && !isSpecialist && <div className={styles.ensembleSection}>
             <div className={styles.sectionLabel}>ENSEMBLE SYNTHESIS</div>
             {activeAnalysts.map((a) => (
               <div key={a.name} className={styles.ensembleRow}>

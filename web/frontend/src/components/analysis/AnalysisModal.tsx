@@ -130,6 +130,8 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
   const confPct = (analysis.Confidence * 100).toFixed(0);
   const action = analysis.Action.toUpperCase();
+  const analystResults = detail?.AnalystResults ?? [];
+  const isSpecialist = analystResults.some(a => !!a.role);
 
   // DissentSummary is not independent content: the arbiter prompt asks the
   // model to BEGIN its reasoning with "DISSENT:" (ensemble.go), and
@@ -200,7 +202,7 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
         <div className={styles.body}>
           {/* Full Reasoning — prefer arbiter text (loaded from /api/analyses/{id});
               fall back to top-level Reasoning while detail is loading or absent. */}
-          <div className={styles.section}>
+          {!isSpecialist && <div className={styles.section}>
             <div className={styles.sectionLabel}>
               FULL REASONING
               {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
@@ -212,16 +214,16 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
             ) : (
               <div className={styles.reasoning}>{analysis.Reasoning}</div>
             )}
-          </div>
+          </div>}
 
           {/* Per-analyst breakdown — lazy-loaded with the rest of the detail payload. */}
-          {detail?.AnalystResults && detail.AnalystResults.length > 0 && (
+          {analystResults.length > 0 && (
             <div className={styles.section}>
               <div className={styles.sectionLabel}>
                 ANALYST BREAKDOWN{analysis.FastPathed ? ' · FAST-PATH' : ''}
               </div>
               <div className={styles.analystList}>
-                {detail.AnalystResults.map((a, idx) => (
+                {analystResults.map((a, idx) => (
                   <CornerCard
                     key={a.name}
                     bracketColor={analystBracketColor(idx, a.active)}

@@ -19,6 +19,7 @@ import styles from './Analysis.module.css';
 
 export interface AnalystResult {
   name: string;
+  role?: string;
   verdict: string;
   confidence: number;
   description: string;

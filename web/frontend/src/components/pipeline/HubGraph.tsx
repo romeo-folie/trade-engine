@@ -7,7 +7,7 @@
  * Animated particles travel along edges powered by framer-motion.
  * Clicking a node opens the DrillDownPanel.
  */
-import { useCallback, useMemo, useEffect, useRef, useState } from 'react';
+import { useCallback, useMemo, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { LayoutGrid, Lock, LockOpen, Crosshair } from 'lucide-react';
 import {
@@ -363,7 +363,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         selectable: true,
       };
     });
-  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, analystVotes, currentTicker, lastRiskChecks, lastTrade, portfolioState, verdictHistory]);
+  }, [nodes, nodeMetrics, recentEventSignatures, onNodeClick, watchlistTickers, modelEnsemble, isOrbMode, analystConsensus, analystVotes, currentTicker, lastRiskChecks, lastTrade, portfolioState, selectedAnalysts, verdictHistory]);
 
   // ── Build React Flow edges ──────────────────────────────────────────────
 
@@ -474,36 +474,43 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     edges.push(makeEdge('executor', 'portfolio'));
 
     return edges;
-  }, [rfNodes, nodeMetrics, analystVotes, lastRiskChecks]);
+  }, [rfNodes, nodeMetrics, lastRiskChecks, selectedAnalysts]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
 
-  // Sync edges simply (they don't have user-managed state like positions)
-  useEffect(() => { setRfEdges(rfEdges); }, [rfEdges, setRfEdges]);
-
-  // Sync nodes smarter: preserve user-dragged positions and handle lock state
-  // This prevents the "snap-back" bug where nodes reset to defaults on every event.
-  useEffect(() => {
+  // Reconcile nodes and edges before paint. Live engine events update card data
+  // many times per second; replacing nodes after paint discarded React Flow's
+  // measured dimensions/handle internals and briefly left edges without valid
+  // endpoints. Preserve the complete existing node shell while overlaying fresh
+  // application data, and batch both topology updates in one layout effect.
+  useLayoutEffect(() => {
     setRfNodes((nds) => {
-      const currentMap = new Map(nds.map(n => [n.id, { 
-        position: n.position, 
-        dragging: n.dragging, 
-        selected: n.selected 
-      }]));
-      
+      const currentMap = new Map(nds.map(n => [n.id, n]));
+
       return rfNodes.map(n => {
         const existing = currentMap.get(n.id);
+        if (!existing) {
+          return { ...n, draggable: !layoutLocked };
+        }
         return {
+          ...existing,
           ...n,
-          position: existing?.position || n.position,
-          dragging: existing?.dragging,
-          selected: existing?.selected,
-          draggable: !layoutLocked, // Update lock state on all nodes
+          position: existing.position,
+          dragging: existing.dragging,
+          selected: existing.selected,
+          draggable: !layoutLocked,
         };
       });
     });
-  }, [rfNodes, layoutLocked, setRfNodes]);
+    setRfEdges((edges) => {
+      const currentMap = new Map(edges.map(edge => [edge.id, edge]));
+      return rfEdges.map(edge => {
+        const existing = currentMap.get(edge.id);
+        return existing ? { ...existing, ...edge, selected: existing.selected } : edge;
+      });
+    });
+  }, [rfNodes, rfEdges, layoutLocked, setRfNodes, setRfEdges]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
     onNodeClick(node.id);
