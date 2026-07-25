@@ -270,6 +270,70 @@ func TestApplyPartialExitIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestApplyPartialExitRebasesRevisedCumulativeAverage(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name, direction string
+		firstPrice      float64
+		revisedPrice    float64
+		wantPnL         float64
+	}{
+		{name: "long", direction: "long", firstPrice: 90, revisedPrice: 95, wantPnL: -20},
+		{name: "short", direction: "short", firstPrice: 110, revisedPrice: 105, wantPnL: -20},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			exitSide := "sell"
+			if tt.direction == "short" {
+				exitSide = "buy"
+			}
+			tradeID, err := store.InsertTrade(ctx, store.Trade{
+				Ticker: "TEST_XRC_REPRICE_" + tt.name, Direction: tt.direction,
+				Strategy: "test", EntryPrice: 100, Quantity: 4,
+			})
+			if err != nil {
+				t.Fatalf("InsertTrade: %v", err)
+			}
+			if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+				t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+			}
+			orderID, err := store.InsertOrder(ctx, store.Order{
+				TradeID: tradeID, BrokerOrderID: "brk-xrc-reprice-" + tt.name,
+				Ticker: "TEST_XRC_REPRICE_" + tt.name, Side: exitSide,
+				OrderType: "market", Quantity: 4, Status: "partial",
+			})
+			if err != nil {
+				t.Fatalf("InsertOrder: %v", err)
+			}
+
+			remaining, applied, err := store.ApplyPartialExit(
+				ctx, tradeID, orderID, tt.firstPrice, 4, "partial",
+			)
+			if err != nil || remaining != 0 || applied != 4 {
+				t.Fatalf("first apply = remaining %v applied %v err %v, want 0/4/nil",
+					remaining, applied, err)
+			}
+			remaining, applied, err = store.ApplyPartialExit(
+				ctx, tradeID, orderID, tt.revisedPrice, 4, "filled",
+			)
+			if err != nil || remaining != 0 || applied != 0 {
+				t.Fatalf("reprice = remaining %v applied %v err %v, want 0/0/nil",
+					remaining, applied, err)
+			}
+
+			result, err := store.FinalizeTradeExit(ctx, tradeID)
+			if err != nil {
+				t.Fatalf("FinalizeTradeExit: %v", err)
+			}
+			if result.ExitQty != 4 || result.ExitPrice != tt.revisedPrice ||
+				result.PnL != tt.wantPnL || result.PnLPct != -5 {
+				t.Fatalf("repriced result = %+v, want qty=4 exit=%v pnl=%v pct=-5",
+					result, tt.revisedPrice, tt.wantPnL)
+			}
+		})
+	}
+}
+
 func TestApplyPartialExitAppliesPreviouslyRecordedButUnappliedFill(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
