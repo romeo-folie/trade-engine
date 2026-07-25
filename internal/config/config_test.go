@@ -43,6 +43,9 @@ func TestDefaultsTrailingRulePreservesATRBehavior(t *testing.T) {
 	if cfg.Risk.EntryGates.TrendAlignmentEnabled {
 		t.Fatal("entry trend-alignment gate must default off")
 	}
+	if cfg.Risk.EntryGates.PullbackStrengthEnabled {
+		t.Fatal("complete pullback-strength gate must default off")
+	}
 }
 
 func TestValidateExitPolicyConfig(t *testing.T) {
@@ -62,6 +65,23 @@ func TestValidateExitPolicyConfig(t *testing.T) {
 	cfg.Risk.ExitConfMin = 1.01
 	if !containsStr(Validate(cfg), "risk.exit_conf_min") {
 		t.Fatalf("invalid confidence minimum not rejected: %v", Validate(cfg))
+	}
+}
+
+func TestValidatePullbackStrengthConfig(t *testing.T) {
+	cfg := Defaults()
+	cfg.Risk.EntryGates.PullbackStrengthEnabled = true
+	cfg.Risk.EntryGates.PullbackMinMomentumReturnPct = 30
+	cfg.Risk.EntryGates.PullbackConsolidationSessions = 40
+	cfg.Risk.EntryGates.PullbackSupportTolerancePct = 1.5
+	cfg.Risk.EntryGates.PullbackMaxStopWidthPct = 4
+	if errs := Validate(cfg); containsStr(errs, "risk.entry_gates.pullback") {
+		t.Fatalf("valid pullback config rejected: %v", errs)
+	}
+
+	cfg.Risk.EntryGates.PullbackConsolidationSessions = 10
+	if !containsStr(Validate(cfg), "risk.entry_gates.pullback_consolidation_sessions") {
+		t.Fatal("short consolidation window should be rejected")
 	}
 }
 

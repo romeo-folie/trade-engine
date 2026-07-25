@@ -285,10 +285,15 @@ risk:
   uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
   exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
   bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.
-  # Evidence-driven entry-quality gates. All default off, BUY-only, and fail
-  # open when their required daily market evidence is unavailable.
+  # Evidence-driven entry-quality gates. All default off and BUY-only. Legacy
+  # filters fail open on missing evidence; the complete pullback setup fails closed.
   entry_gates:
     trend_alignment_enabled: false  # Block BUYs when price is below declining daily EMA9 + EMA21 (#472)
+    pullback_strength_enabled: false  # Require the complete momentum → consolidation → AVWAP flush/reclaim setup; missing evidence blocks
+    pullback_min_momentum_return_pct: 30  # Minimum return on at least one of the 1/3/6-month horizons
+    pullback_consolidation_sessions: 40  # Eight trading weeks of higher-low, narrowing structure
+    pullback_support_tolerance_pct: 1.5  # AVWAP stacking/touch tolerance around EMA9 or horizontal support
+    pullback_max_stop_width_pct: 4.0  # Maximum entry-to-low-of-day risk; the session low becomes the stop
     news_min_runup_pct: 0      # news_sentiment BUY needs price >= this % above prior close (tape confirms headline); 0 disables. Recommended 2.0
     momentum_max_runup_pct: 0  # momentum BUY blocked when already > this % above prior close (anti-chase); 0 disables. Recommended 2.0
     first_tick_defer: false    # Hold first-session-tick BUYs pending; execute next tick only if price held (breaks the overnight-headline burst)

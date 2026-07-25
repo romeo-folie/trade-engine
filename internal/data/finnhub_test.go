@@ -72,6 +72,25 @@ func TestFinnhubFetchNews_Success(t *testing.T) {
 	}
 }
 
+func TestFinnhubFetchCompanyFundamentals(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/stock/profile2" {
+			t.Fatalf("path = %q, want /api/v1/stock/profile2", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"name":"Example Corp","marketCapitalization":1234.5}`))
+	}))
+	defer srv.Close()
+
+	client := newTestFinnhubClient(srv.URL)
+	got, err := client.FetchCompanyFundamentals(context.Background(), "EX")
+	if err != nil {
+		t.Fatalf("FetchCompanyFundamentals: %v", err)
+	}
+	if got.Name != "Example Corp" || got.MarketCapitalization != 1234.5 {
+		t.Fatalf("unexpected fundamentals: %+v", got)
+	}
+}
+
 func TestFinnhubFetchNews_FiltersOldArticles(t *testing.T) {
 	since := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
 	articles := []finnhubArticle{

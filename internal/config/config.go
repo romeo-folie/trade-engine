@@ -1432,14 +1432,36 @@ type RiskConfig struct {
 
 // EntryGatesConfig holds per-strategy entry-quality gates. Zero values
 // disable every gate so existing configs upgrade without behavior change.
-// Gates apply to BUY signals only and fail OPEN when their required market
-// evidence is unavailable — they are alpha filters, not safety guards.
+// Gates apply to BUY signals only. Legacy cohort filters fail open when their
+// evidence is unavailable; the complete pullback strategy fails closed because
+// every evidence component defines setup eligibility.
 type EntryGatesConfig struct {
 	// TrendAlignmentEnabled blocks stock BUYs in a confirmed daily downtrend:
 	// price below both the 9- and 21-day EMAs while both completed-session
 	// EMAs are declining. False preserves existing behavior. The gate fails
 	// open when daily history is unavailable or insufficient.
 	TrendAlignmentEnabled bool `yaml:"trend_alignment_enabled"`
+	// PullbackStrengthEnabled requires the complete Phase 2 pullback-in-strength
+	// setup before a stock BUY can proceed: strong multi-month momentum, an
+	// eight-week higher-low/narrowing consolidation around rising EMA9/EMA21,
+	// an intraday flush into stacked AVWAP support, a positive reclaim, and a
+	// sufficiently tight low-of-day stop. Unlike the legacy trend-rejection
+	// gate, missing evidence fails closed because every component defines the
+	// strategy. False preserves existing behavior.
+	PullbackStrengthEnabled bool `yaml:"pullback_strength_enabled"`
+	// PullbackMinMomentumReturnPct is the minimum return on at least one of the
+	// 1/3/6-month horizons. Zero defaults to the study's 30%.
+	PullbackMinMomentumReturnPct float64 `yaml:"pullback_min_momentum_return_pct"`
+	// PullbackConsolidationSessions is the completed-session structure window.
+	// Zero defaults to 40 trading sessions (approximately eight weeks).
+	PullbackConsolidationSessions int `yaml:"pullback_consolidation_sessions"`
+	// PullbackSupportTolerancePct controls both AVWAP/EMA stacking and how far
+	// above support the session low may trade and still count as a touch.
+	// Zero defaults to 1.5%.
+	PullbackSupportTolerancePct float64 `yaml:"pullback_support_tolerance_pct"`
+	// PullbackMaxStopWidthPct caps the entry-to-low-of-day risk. Zero defaults
+	// to the study's upper bound of 4%.
+	PullbackMaxStopWidthPct float64 `yaml:"pullback_max_stop_width_pct"`
 	// NewsMinRunupPct blocks news_sentiment BUYs unless the price is at
 	// least this % above the prior daily close — the market's reaction
 	// must confirm the headline (its absence is information). 0 disables.
@@ -1914,6 +1936,19 @@ func Validate(cfg *Config) []string {
 	}
 	if cfg.Risk.ExitConfMin < 0 || cfg.Risk.ExitConfMin > 1 {
 		errs = append(errs, fmt.Sprintf("risk.exit_conf_min must be within [0,1], got %.4f", cfg.Risk.ExitConfMin))
+	}
+	entryGates := cfg.Risk.EntryGates
+	if entryGates.PullbackMinMomentumReturnPct < 0 || entryGates.PullbackMinMomentumReturnPct > 500 {
+		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_min_momentum_return_pct must be 0 or within (0,500], got %.4f", entryGates.PullbackMinMomentumReturnPct))
+	}
+	if n := entryGates.PullbackConsolidationSessions; n != 0 && n < 20 {
+		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_consolidation_sessions must be 0 or >= 20, got %d", n))
+	}
+	if v := entryGates.PullbackSupportTolerancePct; v < 0 || v > 10 {
+		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_support_tolerance_pct must be within [0,10], got %.4f", v))
+	}
+	if v := entryGates.PullbackMaxStopWidthPct; v < 0 || v > 20 {
+		errs = append(errs, fmt.Sprintf("risk.entry_gates.pullback_max_stop_width_pct must be within [0,20], got %.4f", v))
 	}
 
 	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative

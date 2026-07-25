@@ -2,12 +2,44 @@ package engine
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 )
+
+// stockTimeframesForEntry returns a normalized copy and ensures the complete
+// pullback gate has its required daily evidence without mutating the watchlist.
+func stockTimeframesForEntry(timeframes []string, pullbackEnabled bool) []string {
+	if len(timeframes) == 0 {
+		return []string{string(data.Timeframe1Day)}
+	}
+	out := make([]string, len(timeframes))
+	hasDaily := false
+	for i, timeframe := range timeframes {
+		out[i] = strings.ToLower(timeframe)
+		hasDaily = hasDaily || out[i] == string(data.Timeframe1Day)
+	}
+	if pullbackEnabled && !hasDaily {
+		out = append(out, string(data.Timeframe1Day))
+	}
+	return out
+}
+
+func primaryStockTimeframe(timeframes []string) data.Timeframe {
+	if len(timeframes) == 0 {
+		return data.Timeframe1Day
+	}
+	primary := data.Timeframe(timeframes[0])
+	for _, timeframe := range timeframes {
+		if timeframe == string(data.Timeframe1Day) {
+			return data.Timeframe1Day
+		}
+	}
+	return primary
+}
 
 const (
 	entryTrendFastEMAPeriod = 9

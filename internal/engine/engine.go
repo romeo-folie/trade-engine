@@ -29,6 +29,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
 
 const (
@@ -585,28 +586,24 @@ func (e *Engine) tick(ctx context.Context) error {
 // 038); it is prepended to the knowledge-graph prompt section so the trading
 // analysts see WHY the ticker is on the watchlist.
 func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64, graphContext string) {
-	if len(timeframes) == 0 {
-		timeframes = []string{string(data.Timeframe1Day)}
-	}
+	requestedTimeframes := stockTimeframesForEntry(timeframes, false)
+	// The complete pullback setup is defined on daily history even when a
+	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
+	// so the execution gate never silently fails open because of watchlist
+	// timeframe selection.
+	fetchTimeframes := stockTimeframesForEntry(
+		timeframes, e.cfg.Risk.EntryGates.PullbackStrengthEnabled,
+	)
 
-	// Normalize to lowercase — LLM may return uppercase like "4H" or "1D".
-	for i, tf := range timeframes {
-		timeframes[i] = strings.ToLower(tf)
-	}
-
-	for _, tfStr := range timeframes {
+	for _, tfStr := range fetchTimeframes {
 		tf := data.Timeframe(tfStr)
 		e.fetchAndStoreCandles(ctx, ticker, tf)
 	}
 
 	// Compute indicators on the primary timeframe (prefer "1d", fall back to first).
-	primaryTF := data.Timeframe(timeframes[0])
-	for _, tf := range timeframes {
-		if tf == string(data.Timeframe1Day) {
-			primaryTF = data.Timeframe1Day
-			break
-		}
-	}
+	// Only requested timeframes participate: an evidence-only daily fetch must
+	// not silently change a scanner item's 1H/4H analyst prompt to daily.
+	primaryTF := primaryStockTimeframe(requestedTimeframes)
 
 	// Determine the ticker's primary strategy for prompt-context capping.
 	// NOTE: HistoryWindowByStrategy caps how many candles reach the prompt
@@ -1681,12 +1678,56 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 
 	// Entry-quality gates (entry_gates.go): daily trend alignment, news
 	// tape-confirmation, and momentum anti-chase. Checked before the generic
-	// risk gates so the block reason names the specific losing cohort. Fail
-	// OPEN on missing evidence — these are alpha filters, not safety guards.
+	// risk gates so the block reason names the specific losing cohort. Legacy
+	// cohort gates fail open on missing evidence; the complete pullback setup
+	// fails closed because every component is required.
 	eg := e.cfg.Risk.EntryGates
 	if resp.Action == "BUY" {
 		var entryGateReason string
-		if eg.TrendAlignmentEnabled {
+		entryGateFailedCheck := "entry_gates"
+		if eg.PullbackStrengthEnabled {
+			entryDailyCandles := candles
+			if data.Timeframe(timeframe) != data.Timeframe1Day {
+				var err error
+				entryDailyCandles, err = store.GetCandles(
+					ctx, ticker, data.Timeframe1Day,
+					time.Now().AddDate(-2, 0, 0), time.Now(),
+				)
+				if err != nil {
+					logger.Warn("pullback strength: load daily evidence",
+						"ticker", ticker, "err", err)
+					entryDailyCandles = nil
+				}
+			}
+			setup := pullback.Evaluate(entryDailyCandles, signalPrice, pullback.Config{
+				MinMomentumReturnPct:  eg.PullbackMinMomentumReturnPct,
+				ConsolidationSessions: eg.PullbackConsolidationSessions,
+				SupportTolerancePct:   eg.PullbackSupportTolerancePct,
+				MaxStopWidthPct:       eg.PullbackMaxStopWidthPct,
+			})
+			if !setup.Eligible {
+				entryGateReason = setup.Reason
+				entryGateFailedCheck = "pullback_" + setup.FailedCheck
+			} else {
+				// The research entry is inseparable from its tight low-of-day
+				// invalidation. Replace the analyst's generic stop before risk
+				// sizing, persistence, and bracket submission.
+				sig.StopLoss = setup.StopLoss
+				logger.Info("pullback strength entry confirmed",
+					"ticker", ticker,
+					"return_1m_pct", fmt.Sprintf("%.2f", setup.Return1M),
+					"return_3m_pct", fmt.Sprintf("%.2f", setup.Return3M),
+					"return_6m_pct", fmt.Sprintf("%.2f", setup.Return6M),
+					"ema9", fmt.Sprintf("%.2f", setup.EMA9),
+					"ema21", fmt.Sprintf("%.2f", setup.EMA21),
+					"avwap_high", fmt.Sprintf("%.2f", setup.AVWAPHigh),
+					"avwap_low", fmt.Sprintf("%.2f", setup.AVWAPLow),
+					"support", fmt.Sprintf("%.2f", setup.Support),
+					"stop_loss", fmt.Sprintf("%.2f", setup.StopLoss),
+					"stop_width_pct", fmt.Sprintf("%.2f", setup.StopWidthPct),
+				)
+			}
+		} else if eg.TrendAlignmentEnabled {
 			var evaluated bool
 			entryGateReason, evaluated = evaluateTrendAlignmentGate(
 				string(resp.Action), signalPrice, data.Timeframe(timeframe),
@@ -1719,7 +1760,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 			logger.Warn("signal blocked", "ticker", ticker, "reason", entryGateReason)
 			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 				Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
-				BlockReason: entryGateReason, FailedCheck: "entry_gates",
+				BlockReason: entryGateReason, FailedCheck: entryGateFailedCheck,
 			})
 			return
 		}

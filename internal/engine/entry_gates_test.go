@@ -47,6 +47,27 @@ func TestEvaluateTrendAlignmentGate_BlocksConfirmedDailyDowntrend(t *testing.T) 
 	}
 }
 
+func TestStockTimeframesForEntryAddsDailyWithoutMutation(t *testing.T) {
+	input := []string{"1H", "4H"}
+	got := stockTimeframesForEntry(input, true)
+	if strings.Join(got, ",") != "1h,4h,1d" {
+		t.Fatalf("timeframes = %v", got)
+	}
+	if strings.Join(input, ",") != "1H,4H" {
+		t.Fatalf("input mutated: %v", input)
+	}
+	disabled := stockTimeframesForEntry(input, false)
+	if strings.Join(disabled, ",") != "1h,4h" {
+		t.Fatalf("disabled timeframes = %v", disabled)
+	}
+	if got := primaryStockTimeframe(disabled); got != data.Timeframe1Hour {
+		t.Fatalf("evidence-only daily fetch changed primary timeframe to %s", got)
+	}
+	if got := primaryStockTimeframe([]string{"1h", "1d"}); got != data.Timeframe1Day {
+		t.Fatalf("explicit daily timeframe should remain preferred, got %s", got)
+	}
+}
+
 func TestEvaluateTrendAlignmentGate_RequiresAlignedEvidence(t *testing.T) {
 	cfg := config.EntryGatesConfig{TrendAlignmentEnabled: true}
 	declining := trendCandles(descendingCloses(30, 130)...)

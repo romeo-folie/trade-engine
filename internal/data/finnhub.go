@@ -54,15 +54,15 @@ func (c *FinnhubClient) throttle(ctx context.Context) error {
 
 // finnhubArticle is the raw JSON article shape from Finnhub's /company-news endpoint.
 type finnhubArticle struct {
-	ID       int64   `json:"id"`
-	Category string  `json:"category"`
-	DateTime int64   `json:"datetime"` // Unix timestamp
-	Headline string  `json:"headline"`
-	Source   string  `json:"source"`
-	Summary  string  `json:"summary"`
-	URL      string  `json:"url"`
-	Related  string  `json:"related"` // comma-separated tickers
-	Image    string  `json:"image"`
+	ID        int64  `json:"id"`
+	Category  string `json:"category"`
+	DateTime  int64  `json:"datetime"` // Unix timestamp
+	Headline  string `json:"headline"`
+	Source    string `json:"source"`
+	Summary   string `json:"summary"`
+	URL       string `json:"url"`
+	Related   string `json:"related"` // comma-separated tickers
+	Image     string `json:"image"`
 	Sentiment struct {
 		BullishPercent float64 `json:"bullishPercent"`
 		BearishPercent float64 `json:"bearishPercent"`
@@ -71,7 +71,8 @@ type finnhubArticle struct {
 
 // finnhubProfile is the raw JSON shape from Finnhub's /stock/profile2 endpoint.
 type finnhubProfile struct {
-	Name string `json:"name"`
+	Name                 string  `json:"name"`
+	MarketCapitalization float64 `json:"marketCapitalization"` // USD millions
 }
 
 // FetchCompanyProfile returns the company's full name for a ticker via
@@ -80,8 +81,22 @@ type finnhubProfile struct {
 // rather than a 404, so "no profile" is returned as ("", nil) — only
 // transport/API failures produce an error.
 func (c *FinnhubClient) FetchCompanyProfile(ctx context.Context, ticker string) (string, error) {
+	p, err := c.FetchCompanyFundamentals(ctx, ticker)
+	return p.Name, err
+}
+
+// CompanyFundamentals contains the free profile fields used by deterministic
+// universe filters. Finnhub reports MarketCapitalization in USD millions.
+type CompanyFundamentals struct {
+	Name                 string
+	MarketCapitalization float64
+}
+
+// FetchCompanyFundamentals returns company identity and market capitalization
+// from Finnhub's free /stock/profile2 endpoint.
+func (c *FinnhubClient) FetchCompanyFundamentals(ctx context.Context, ticker string) (CompanyFundamentals, error) {
 	if err := c.throttle(ctx); err != nil {
-		return "", err
+		return CompanyFundamentals{}, err
 	}
 
 	params := url.Values{}
@@ -110,15 +125,18 @@ func (c *FinnhubClient) FetchCompanyProfile(ctx context.Context, ticker string) 
 		return resp, nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("finnhub profile get: %w", err)
+		return CompanyFundamentals{}, fmt.Errorf("finnhub profile get: %w", err)
 	}
 	defer resp.Body.Close()
 
 	var p finnhubProfile
 	if err := json.NewDecoder(resp.Body).Decode(&p); err != nil {
-		return "", fmt.Errorf("finnhub profile decode: %w", err)
+		return CompanyFundamentals{}, fmt.Errorf("finnhub profile decode: %w", err)
 	}
-	return strings.TrimSpace(p.Name), nil
+	return CompanyFundamentals{
+		Name:                 strings.TrimSpace(p.Name),
+		MarketCapitalization: p.MarketCapitalization,
+	}, nil
 }
 
 // EarningsRelease is one scheduled/historical earnings date from Finnhub's calendar.

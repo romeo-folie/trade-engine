@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,12 +32,13 @@ var (
 
 	// Exit-policy research knobs (exit-policy-study). Defaults reproduce the
 	// original baseline exit behavior.
-	btExitMode       string
-	btTrailRule      string
-	btTrailATRMult   float64
-	btTrailEMAPeriod int
-	btExitConfMin    float64
-	btStopWidthPct   float64
+	btExitMode         string
+	btTrailRule        string
+	btTrailATRMult     float64
+	btTrailEMAPeriod   int
+	btExitConfMin      float64
+	btStopWidthPct     float64
+	btPullbackStrength bool
 )
 
 // ── Command tree ──────────────────────────────────────────────────────────────
@@ -60,6 +62,7 @@ func init() {
 	runBTCmd.Flags().IntVar(&btTrailEMAPeriod, "trail-ema-period", 9, "EMA period for the close-below-EMA trailing rule")
 	runBTCmd.Flags().Float64Var(&btExitConfMin, "exit-conf-min", 0, "Require SELL confidence ≥ this to exit on signal (0 = ungated)")
 	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override initial stop to entry×(1-pct/100) (0 = use model stop)")
+	runBTCmd.Flags().BoolVar(&btPullbackStrength, "pullback-strength", false, "Require the complete Phase 2 momentum/consolidation/AVWAP flush-reclaim entry and use its low-of-day stop")
 	_ = runBTCmd.MarkFlagRequired("ticker")
 	_ = runBTCmd.MarkFlagRequired("from")
 	_ = runBTCmd.MarkFlagRequired("to")
@@ -127,12 +130,13 @@ var runBTCmd = &cobra.Command{
 			Model:     btModel,
 			NoCache:   btNoCache,
 
-			ExitMode:       btExitMode,
-			TrailRule:      btTrailRule,
-			TrailATRMult:   btTrailATRMult,
-			TrailEMAPeriod: btTrailEMAPeriod,
-			ExitConfMin:    btExitConfMin,
-			StopWidthPct:   btStopWidthPct,
+			ExitMode:         btExitMode,
+			TrailRule:        btTrailRule,
+			TrailATRMult:     btTrailATRMult,
+			TrailEMAPeriod:   btTrailEMAPeriod,
+			ExitConfMin:      btExitConfMin,
+			StopWidthPct:     btStopWidthPct,
+			PullbackStrength: btPullbackStrength,
 		}
 
 		fmt.Printf("Backtesting %s · %s · %s → %s\n",
@@ -206,8 +210,8 @@ var listBTCmd = &cobra.Command{
 // ── te backtest compare ───────────────────────────────────────────────────────
 
 var compareBTCmd = &cobra.Command{
-	Use:   "compare",
-	Short: "Compare two or more backtest runs side-by-side",
+	Use:     "compare",
+	Short:   "Compare two or more backtest runs side-by-side",
 	Example: `  te backtest compare --id BT-00001 --id BT-00002`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(btCompareID) < 2 {
@@ -263,6 +267,21 @@ func printMetrics(r *backtest.RunResult) {
 		r.Options.From.Format("2006-01-02"), r.Options.To.Format("2006-01-02"))
 	fmt.Printf("  Exit:       %s\n", exitPolicyDesc(r.Options))
 	fmt.Printf("  Cache:      %d hits / %d misses (%.0f%%)\n\n", hits, misses, hitPct)
+	if r.Options.PullbackStrength {
+		fmt.Println("  Pullback Entry Qualification")
+		fmt.Println("  ───────────────────────────────────")
+		printRow("Analyst BUY candidates", fmt.Sprintf("%d", r.EntryCandidates))
+		printRow("Qualified setups", fmt.Sprintf("%d", r.EntryQualified))
+		keys := make([]string, 0, len(r.EntryBlocks))
+		for key := range r.EntryBlocks {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			printRow("Blocked: "+key, fmt.Sprintf("%d", r.EntryBlocks[key]))
+		}
+		fmt.Println()
+	}
 
 	fmt.Println("  Performance")
 	fmt.Println("  ───────────────────────────────────")
@@ -334,6 +353,9 @@ func exitPolicyDesc(o backtest.RunOptions) string {
 	}
 	if o.StopWidthPct > 0 {
 		s += fmt.Sprintf(" · stop=%.1f%%", o.StopWidthPct)
+	}
+	if o.PullbackStrength {
+		s += " · pullback-strength"
 	}
 	return s
 }

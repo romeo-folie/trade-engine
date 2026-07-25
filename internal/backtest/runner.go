@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -18,6 +19,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -43,6 +45,11 @@ type RunOptions struct {
 	TrailEMAPeriod int     // EMA period for the close-below-EMA trail (default 9, Martin's rule)
 	ExitConfMin    float64 // require SELL confidence ≥ this to exit on signal (0 = ungated, original behavior)
 	StopWidthPct   float64 // override initial stop to entry×(1-pct/100) (0 = use the model's stop_loss)
+
+	// PullbackStrength applies the complete Phase 2 deterministic entry setup
+	// after the cached analyst BUY. The analyst request is left unchanged, so a
+	// replay can reuse the original response cache and isolate entry selection.
+	PullbackStrength bool
 }
 
 // exitPolicy is the resolved, defaulted view of the exit knobs on RunOptions.
@@ -96,13 +103,16 @@ type SimulatedTrade struct {
 
 // RunResult contains the outcome of a completed backtest.
 type RunResult struct {
-	Label   string
-	RunID   string
-	Options RunOptions
-	Trades  []SimulatedTrade
-	Metrics Metrics
-	Hits    int64
-	Misses  int64
+	Label           string
+	RunID           string
+	Options         RunOptions
+	Trades          []SimulatedTrade
+	Metrics         Metrics
+	Hits            int64
+	Misses          int64
+	EntryCandidates int
+	EntryQualified  int
+	EntryBlocks     map[string]int
 }
 
 // ProgressFunc is called after each candle is processed with (current, total).
@@ -187,6 +197,15 @@ func candleDuration(tf data.Timeframe) time.Duration {
 	}
 }
 
+// candlesThrough returns history ending at ts (inclusive). Candle slices are
+// DB-canonical ascending order, so this is logarithmic and allocation-free.
+func candlesThrough(candles []data.Candle, ts time.Time) []data.Candle {
+	end := sort.Search(len(candles), func(i int) bool {
+		return candles[i].Timestamp.After(ts)
+	})
+	return candles[:end]
+}
+
 // ── Replay engine (task 7.3) ───────────────────────────────────────────────────
 
 const minCandlesForIndicators = 30 // minimum history before signalling
@@ -201,6 +220,22 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 	if len(candles) < minCandlesForIndicators+1 {
 		return nil, fmt.Errorf("insufficient candle data: need at least %d candles, got %d",
 			minCandlesForIndicators+1, len(candles))
+	}
+
+	var pullbackCandles []data.Candle
+	if opts.PullbackStrength {
+		if opts.Timeframe != data.Timeframe1Day {
+			return nil, fmt.Errorf("pullback-strength replay requires timeframe 1d")
+		}
+		// Load a separate warm-up slice. Signal requests continue using
+		// `candles` below, preserving their exact cache fingerprints.
+		pullbackCandles, err = r.LoadCandles(
+			ctx, opts.Ticker, data.Timeframe1Day,
+			opts.From.AddDate(-1, 0, 0), opts.To,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("load pullback warm-up: %w", err)
+		}
 	}
 
 	cash := r.cfg.Backtest.InitialCash
@@ -219,6 +254,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 	var trades []SimulatedTrade
 	var pendingEntry *pendingOrder // entry scheduled for next candle's open
 	var openPosition *openPos
+	entryBlocks := make(map[string]int)
+	entryCandidates := 0
+	entryQualified := 0
 
 	// Exit-policy replay state: resolve the (defaulted) policy and precompute the
 	// per-candle ATR/EMA series once so the exit check is O(1) per bar.
@@ -244,13 +282,18 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 		// 2. Execute a pending entry at this candle's open price
 		//    (prevents look-ahead bias: signal at i-1, entry at i).
 		if pendingEntry != nil {
-			qty := math.Floor(pendingEntry.cashAlloc / candle.Open)
-			if qty >= 1 {
+			order := pendingEntry
+			pendingEntry = nil
+			qty := math.Floor(order.cashAlloc / candle.Open)
+			if order.requireValidStop && order.stopLoss >= candle.Open {
+				// A gap through the signal day's low invalidates the setup before
+				// the next-open fill. Do not fabricate an entry above its stop.
+			} else if qty >= 1 {
 				cost := qty * candle.Open
 				cash -= cost
 				entryPx := candle.Open
 				// Initial protective stop: model's stop, or a fixed width override.
-				stop := pendingEntry.stopLoss
+				stop := order.stopLoss
 				if policy.stopWidth > 0 {
 					stop = entryPx * (1 - policy.stopWidth)
 				}
@@ -266,13 +309,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 					quantity:     qty,
 					cost:         cost,
 					stopLoss:     stop,
-					takeProfit:   pendingEntry.takeProfit,
+					takeProfit:   order.takeProfit,
 					riskPerShare: risk,
 					highWater:    entryPx,
 					trailStop:    stop, // ratchets upward in ATR-trail mode
 				}
 			}
-			pendingEntry = nil
 		}
 
 		// 3. Generate signal for this candle (requires enough history).
@@ -300,14 +342,32 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 			if resp.Confidence < r.cfg.Risk.ConfidenceThreshold {
 				continue
 			}
+			stopLoss := resp.StopLoss
+			if opts.PullbackStrength {
+				entryCandidates++
+				setupWindow := candlesThrough(pullbackCandles, candle.Timestamp)
+				setup := pullback.Evaluate(setupWindow, candle.Close, pullback.Config{
+					MinMomentumReturnPct:  r.cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
+					ConsolidationSessions: r.cfg.Risk.EntryGates.PullbackConsolidationSessions,
+					SupportTolerancePct:   r.cfg.Risk.EntryGates.PullbackSupportTolerancePct,
+					MaxStopWidthPct:       r.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+				})
+				if !setup.Eligible {
+					entryBlocks[setup.FailedCheck]++
+					continue
+				}
+				entryQualified++
+				stopLoss = setup.StopLoss
+			}
 			sizePct := resp.SizePct
 			if sizePct <= 0 {
 				sizePct = r.cfg.Risk.MaxPositionPct
 			}
 			pendingEntry = &pendingOrder{
-				cashAlloc:  cash * (sizePct / 100),
-				stopLoss:   resp.StopLoss,
-				takeProfit: resp.TakeProfit,
+				cashAlloc:        cash * (sizePct / 100),
+				stopLoss:         stopLoss,
+				takeProfit:       resp.TakeProfit,
+				requireValidStop: opts.PullbackStrength,
 			}
 
 		case analysis.ActionSell:
@@ -406,22 +466,26 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 	}
 
 	return &RunResult{
-		Label:   label,
-		RunID:   created.ID,
-		Options: opts,
-		Trades:  trades,
-		Metrics: m,
-		Hits:    hits,
-		Misses:  misses,
+		Label:           label,
+		RunID:           created.ID,
+		Options:         opts,
+		Trades:          trades,
+		Metrics:         m,
+		Hits:            hits,
+		Misses:          misses,
+		EntryCandidates: entryCandidates,
+		EntryQualified:  entryQualified,
+		EntryBlocks:     entryBlocks,
 	}, nil
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 type pendingOrder struct {
-	cashAlloc  float64
-	stopLoss   float64
-	takeProfit float64
+	cashAlloc        float64
+	stopLoss         float64
+	takeProfit       float64
+	requireValidStop bool
 }
 
 type openPos struct {

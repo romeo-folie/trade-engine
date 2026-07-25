@@ -1,6 +1,6 @@
 # Exit-policy study — findings & apply-plan (handoff)
 
-**Status (2026-07-25):** study and harness complete (PR #470); Branch 1 JSON recovery merged (PR #473); Branch 2 live exit policy merged and enabled in paper config (PR #474); cumulative partial-exit accounting merged (PR #475). The full six-ticker/five-variant matrix was replayed from cache after implementation and reproduced every documented profit factor exactly. **Phase 2 is active in issue #472.**
+**Status (2026-07-25):** study and harness complete (PR #470); Branch 1 JSON recovery merged (PR #473); Branch 2 live exit policy merged and enabled in paper config (PR #474); cumulative partial-exit accounting merged (PR #475). The full six-ticker/five-variant matrix was replayed from cache after implementation and reproduced every documented profit factor exactly. **Phase 2 is implemented on PR #476 and is awaiting its cached comparison/review before merge.**
 
 ## Why this exists
 Our stock swing path sits at ~27% win rate; prior work (`te study execution`, PR #433) found **exits, not entries, are the leak** (~+1.53%/trade left on the table). A study of the 2025 US Investing Champion's pullback method (Martin Luk) pointed at the same thing: he runs a low win rate but wins via **asymmetry** — tight stops, and letting winners run on a **close-below-9-EMA** trailing stop instead of a fixed take-profit. We built a backtest harness to test whether our **fixed take-profit truncates winners**, and it does.
@@ -26,7 +26,7 @@ Source: https://youtu.be/F0vssXyWizc (breakdown of the 2025 US Investing Champio
 
 **How it maps to our work:**
 - **What our study tested (exits only):** uncapping the fixed TP + trailing (9-EMA vs ATR) and a high-conviction SELL gate. Confirmed the exit truncation and the payoff-asymmetry thesis. → **Branch 2 (#471).**
-- **What we have NOT tested / built yet:** the **tight-stop lever** (stop-width sweep — our model stops look too wide), and **AVWAP + 9/21 EMA indicators** (we only compute 20/50/200 EMA + session VWAP), and the **pullback-in-strength entry** (scan strong momentum → consolidation w/ higher lows + EMA/AVWAP reclaim → flush entry to stacked support → day's-low stop). → **Phase 2 (#472)**, plus optional follow-ups noted below.
+- **Phase 2 implementation:** PR #476 adds the complete deterministic pullback-in-strength path: the momentum/liquidity universe, 9/21 EMA structure, swing-high/low AVWAP, higher-low/narrowing consolidation, flush/reclaim entry, low-of-day stop, and cache-preserving replay flag. Its comparison results are recorded below once run.
 
 ## The study
 - **Harness:** `te backtest run` with exit-policy flags (see below). Replays the SAME cached entry signals under different exit rules — so comparing exits costs no LLM calls after the first (baseline) pass per ticker.
@@ -88,10 +88,61 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 
 ---
 
-## Phase 2 — entry-quality filter (ACTIVE — issue #472)
-**Goal:** "buy strength, not weakness" — stop opening longs in downtrends (the OPEN/JMIA lesson: exits can't rescue bad entries). Add a trend-alignment gate: don't open a long when price is below declining 9/21 EMAs / making lower highs. Builds on existing `entry_gates` (PR #434: news tape-confirm, momentum anti-chase, first-tick deferral). Bigger piece — scope as its own effort after Branch 2. Consider adding 9/21 EMA + anchored-VWAP indicators (we only have 20/50/200 EMA + session VWAP today) since the pullback pattern keys on them.
+## Phase 2 — complete pullback-in-strength entry (PR #476; issue #472)
 
-**Initial implementation:** `risk.entry_gates.trend_alignment_enabled` is a default-off, BUY-only daily gate. It blocks only when live price is below both EMA9 and EMA21 and both completed-session EMAs are declining; non-daily or insufficient history fails open. Anchored VWAP, lower-high structure, and the full pullback-in-strength setup remain possible follow-ups rather than prerequisites for this conservative first gate.
+`risk.entry_gates.pullback_strength_enabled` is default-off and PAPER-first. When enabled, a stock BUY fails closed unless all of the following deterministic evidence is present:
+
+1. **Universe:** scanner candidates clear $100M market cap and $1M snapshot dollar volume, return at least 30% on a 1/3/6-month horizon, and rank in the top quartile of the qualifying pool by the equal-weighted horizon return.
+2. **Strength and structure:** at least six months of split-adjusted daily history; rising EMA9 and EMA21; a 40-session (~8-week) consolidation whose recent half makes a higher low and whose recent range is narrower than its opening range.
+3. **Anchored VWAP:** AVWAPs are computed from the consolidation's deterministic swing-high and swing-low anchors. One must stack within the configured tolerance of EMA9 or recent horizontal support.
+4. **Entry timing:** the current session must flush into stacked support, then trade positive on the day and reclaim that support.
+5. **Risk:** the current session low replaces the analyst's generic stop. Entries wider than the configured maximum (4% by default) are rejected.
+
+The live engine always fetches daily history for this gate, even when a scanner item asks the analyst to use 1H/4H. Missing evidence blocks instead of failing open. The separate conservative `trend_alignment_enabled` gate remains available for operators who only want downtrend rejection.
+
+The backtest flag is `--pullback-strength`. It loads a separate one-year warm-up slice for the deterministic entry evaluator while leaving the analyst request window unchanged, preserving the existing prompt-cache keys. A gap below the signal day's low cancels the next-open simulated fill.
+
+### Phase 2 cached six-ticker comparison
+
+All six runs used **87 cache hits / 0 misses (100%)**. The comparison used the
+final exit policy (`trail-ema-9` + `exit-conf-min=0.72`) and the complete
+`--pullback-strength` entry:
+
+| Ticker | cached analyst BUYs | complete setups | first failed checks |
+|---|---:|---:|---|
+| NVDA | 66 | 0 | momentum 66 |
+| IBKR | 79 | 0 | momentum 52; narrowing 20; EMA trend 5; reclaim 2 |
+| META | 60 | 0 | momentum 60 |
+| HIMS | 74 | 0 | momentum 21; EMA trend 15; higher low 13; narrowing 12; stacked support 11; reclaim 1; stop width 1 |
+| OPEN | 67 | 0 | momentum 67 |
+| JMIA | 54 | 0 | momentum 54 |
+
+This is a valid zero-trade result, not a replay failure: the legacy six-ticker
+watchlist was selected by tenure, not by Martin's >30% momentum universe, and
+none formed the complete daily proxy setup during the cached window. The
+filter correctly removed both historical losers, but also proves that this
+dataset cannot estimate the strategy's expectancy. A performance study needs
+cached signals for a universe selected by the new scanner; do not weaken the
+entry definition merely to make these six names trade.
+
+### Cached stop-width sweep
+
+The previously untested 1–4% lever was replayed with the final EMA9/0.72 exit
+policy; all 24 runs were 100% cache hits. Profit factor:
+
+| Ticker | 1% stop | 2% stop | 3% stop | 4% stop |
+|---|---:|---:|---:|---:|
+| NVDA | **3.72** | 2.24 | 1.99 | 2.10 |
+| IBKR | **5.07** | 2.67 | 1.89 | 2.03 |
+| META | 1.09 | 0.76 | **1.50** | 0.64 |
+| HIMS | 1.77 | **3.54** | 2.67 | 2.36 |
+| OPEN | **1.77** | 1.44 | 1.00 | 0.94 |
+| JMIA | **1.35** | 0.82 | 0.59 | 0.51 |
+
+The tight-stop thesis is strongly supported but not by one universal fixed
+width: 1% won on four names, 2% on HIMS, and 3% on META. Phase 2 therefore uses
+the setup's actual low of day and caps its width at 4%, rather than imposing a
+single fixed percentage across different price structures.
 
 ## Conventions (for the takeover agent)
 - Every feature: dedicated **branch → PR → `feature-dev:code-reviewer` before push → Monitor the PR**. Never push to `main` directly. Use a plain branch (NOT a worktree) unless asked.
