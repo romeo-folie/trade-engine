@@ -177,10 +177,9 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 					}
 				}
 			}
-			// Known limitation shared with the wider partial-fill lineage
-			// (#369): the partial slice's realized pnl is carried on the
-			// leg order rows, not the trade row — the trade's eventual
-			// close books pnl over the remaining shares only.
+			// ApplyPartialExit also advances the trade's durable realized
+			// totals, so the eventual close includes this slice in weighted
+			// exit price, P&L, and return.
 			logger.Warn("bracket exits: legs died after a partial exit — tracked quantity reduced",
 				"trade_id", t.ID, "ticker", t.Ticker,
 				"sold_qty", partialQty, "remaining_qty", remaining)
@@ -286,20 +285,12 @@ func (e *Engine) closeBracketTrade(ctx context.Context, t store.Trade, states []
 // emits the same observability as the software exit path. Returns false when
 // the close could not be persisted (caller retries next sweep).
 func (e *Engine) bookBracketClose(ctx context.Context, t store.Trade, exitPrice, soldQty float64, exitReason string) bool {
-	pnl := (exitPrice - t.EntryPrice) * soldQty
-	if t.Direction == "short" { // defensive: brackets are only placed on BUYs
-		pnl = -pnl
-	}
-	var pnlPct float64
-	if t.EntryPrice > 0 && soldQty > 0 {
-		pnlPct = pnl / (t.EntryPrice * soldQty) * 100
-	}
-
-	if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+	realized, err := store.CloseTradeRealized(ctx, t.ID, exitPrice)
+	if err != nil {
 		logger.Warn("bracket exits: close trade", "trade_id", t.ID, "err", err)
 		return false
 	}
-	if pnl < 0 {
+	if realized.PnL < 0 {
 		// Same cooldown bookkeeping as the software exit path — without it,
 		// risk.cooldown_after_loss never fires on bracket stop-outs.
 		e.portfolio.RecordLoss()
@@ -309,15 +300,15 @@ func (e *Engine) bookBracketClose(ctx context.Context, t store.Trade, exitPrice,
 		"trade_id", t.ID,
 		"ticker", t.Ticker,
 		"reason", exitReason,
-		"exit_price", exitPrice,
-		"sold_qty", soldQty,
-		"pnl", fmt.Sprintf("%.2f", pnl),
-		"pnl_pct", fmt.Sprintf("%.2f%%", pnlPct),
+		"exit_price", realized.ExitPrice,
+		"sold_qty", realized.ExitQty,
+		"pnl", fmt.Sprintf("%.2f", realized.PnL),
+		"pnl_pct", fmt.Sprintf("%.2f%%", realized.PnLPct),
 	)
 	e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 		TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
-		EntryPrice: t.EntryPrice, ExitPrice: exitPrice,
-		PnL: pnl, PnLPct: pnlPct, Reason: exitReason,
+		EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
+		PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: exitReason,
 	})
 	e.checkExitResidue(t.Ticker)
 	return true

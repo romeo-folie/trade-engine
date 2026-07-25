@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 )
@@ -110,6 +111,9 @@ func ApplyPartialExit(
 	filledPrice, cumulativeFilledQty float64,
 	status string,
 ) (remaining, applied float64, err error) {
+	if cumulativeFilledQty > 0 && filledPrice <= 0 {
+		return 0, 0, fmt.Errorf("partial exit fill price must be positive")
+	}
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return 0, 0, err
@@ -147,10 +151,16 @@ func ApplyPartialExit(
 	}
 	if err = tx.QueryRow(ctx, `
 		UPDATE trades
-		SET quantity=GREATEST(0, quantity-$1)
+		SET quantity=GREATEST(0, quantity-$1),
+		    realized_exit_qty=realized_exit_qty+$1,
+		    realized_exit_proceeds=realized_exit_proceeds+($1*$3),
+		    realized_pnl=realized_pnl+CASE
+		        WHEN direction='short' THEN (entry_price-$3)*$1
+		        ELSE ($3-entry_price)*$1
+		    END
 		WHERE id=$2 AND status IN ('open','exiting')
 		RETURNING quantity`,
-		applied, tradeID,
+		applied, tradeID, filledPrice,
 	).Scan(&remaining); err != nil {
 		return 0, 0, err
 	}

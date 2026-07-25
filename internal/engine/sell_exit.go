@@ -173,26 +173,26 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		if lotQuantity <= 0 {
 			continue
 		}
-		pnl, pnlPct := tradePnL("long", t.EntryPrice, lotQuantity, result.FilledPrice)
-		if err := store.CloseTrade(ctx, t.ID, result.FilledPrice, pnl, pnlPct); err != nil {
+		realized, err := store.CloseTradeRealized(ctx, t.ID, result.FilledPrice)
+		if err != nil {
 			logger.Warn("sell exit: close confirmed trade", "trade_id", t.ID, "err", err)
 			continue
 		}
-		if pnl < 0 {
+		if realized.PnL < 0 {
 			e.portfolio.RecordLoss()
 		}
 		logger.Info("trade closed by sell signal",
 			"trade_id", t.ID,
 			"ticker", sig.Ticker,
-			"exit_price", result.FilledPrice,
-			"qty", lotQuantity,
-			"pnl", fmt.Sprintf("%.2f", pnl),
+			"exit_price", realized.ExitPrice,
+			"qty", realized.ExitQty,
+			"pnl", fmt.Sprintf("%.2f", realized.PnL),
 			"fill_confirmed", true,
 		)
 		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 			TradeID: t.ID, Ticker: sig.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: result.FilledPrice,
-			PnL: pnl, PnLPct: pnlPct, Reason: "sell signal",
+			EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
+			PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: "sell signal",
 		})
 	}
 	e.checkExitResidue(sig.Ticker)

@@ -92,6 +92,72 @@ func UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64
 	return err
 }
 
+// TradeRealization is the cumulative realized result across every exit slice
+// assigned to a trade, including cancellation-race partials.
+type TradeRealization struct {
+	ExitPrice float64
+	PnL       float64
+	PnLPct    float64
+	ExitQty   float64
+	Remaining float64
+	Status    string
+}
+
+// CloseTradeRealized adds the trade's currently-held quantity as the final
+// realized slice, then closes it with a fill-weighted exit price and cumulative
+// P&L derived from the locked trade row.
+func CloseTradeRealized(
+	ctx context.Context,
+	id string,
+	exitPrice float64,
+) (TradeRealization, error) {
+	var result TradeRealization
+	err := GetDB().QueryRow(ctx, `
+		UPDATE trades
+		SET realized_exit_qty = realized_exit_qty + quantity,
+		    realized_exit_proceeds = realized_exit_proceeds + quantity * $1,
+		    realized_pnl = realized_pnl + CASE
+		        WHEN direction = 'short'
+		        THEN (entry_price - $1) * quantity
+		        ELSE ($1 - entry_price) * quantity
+		    END,
+		    exit_price = CASE
+		        WHEN realized_exit_qty + quantity > 0
+		        THEN (realized_exit_proceeds + quantity * $1)
+		             / (realized_exit_qty + quantity)
+		        ELSE $1
+		    END,
+		    pnl = realized_pnl + CASE
+		        WHEN direction = 'short'
+		        THEN (entry_price - $1) * quantity
+		        ELSE ($1 - entry_price) * quantity
+		    END,
+		    pnl_pct = CASE
+		        WHEN entry_price > 0 AND realized_exit_qty + quantity > 0
+		        THEN (
+		            realized_pnl + CASE
+		                WHEN direction = 'short'
+		                THEN (entry_price - $1) * quantity
+		                ELSE ($1 - entry_price) * quantity
+		            END
+		        )
+		             / (entry_price * (realized_exit_qty + quantity)) * 100
+		        ELSE 0
+		    END,
+		    quantity = realized_exit_qty + quantity,
+		    status = 'closed',
+		    closed_at = NOW(),
+		    exit_claimed_at = NULL
+		WHERE id = $2 AND status IN ('open','exiting')
+		RETURNING exit_price, pnl, pnl_pct, realized_exit_qty, 0::NUMERIC, status`,
+		exitPrice, id,
+	).Scan(
+		&result.ExitPrice, &result.PnL, &result.PnLPct,
+		&result.ExitQty, &result.Remaining, &result.Status,
+	)
+	return result, err
+}
+
 // ApplyEntryFill atomically records a cumulative entry fill and derives the
 // trade's currently-held quantity after subtracting every exit fill already
 // applied to that trade. A late entry poll must never resurrect shares that a
@@ -153,7 +219,18 @@ func ApplyEntryFill(
 		if _, err := tx.Exec(ctx, `
 			UPDATE trades
 			SET entry_price=COALESCE(NULLIF($1::NUMERIC,0::NUMERIC),entry_price),
-			    quantity=GREATEST(0::NUMERIC, $2::NUMERIC-$3::NUMERIC)
+			    quantity=GREATEST(0::NUMERIC, $2::NUMERIC-$3::NUMERIC),
+			    realized_pnl=CASE
+			        WHEN direction='short'
+			        THEN (
+			            COALESCE(NULLIF($1::NUMERIC,0::NUMERIC),entry_price)
+			            * realized_exit_qty
+			        ) - realized_exit_proceeds
+			        ELSE realized_exit_proceeds - (
+			            COALESCE(NULLIF($1::NUMERIC,0::NUMERIC),entry_price)
+			            * realized_exit_qty
+			        )
+			    END
 			WHERE id=$4 AND status IN ('open','exiting')`,
 			filledPrice, targetEntryQty, appliedExits, tradeID,
 		); err != nil {
@@ -233,25 +310,145 @@ func UpdateOrderStopPriceAndID(
 }
 
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
-	_, err := GetDB().Exec(ctx, `
-		UPDATE trades
-		SET exit_price=$1, pnl=$2, pnl_pct=$3, status='closed',
-		    closed_at=NOW(), exit_claimed_at=NULL
-		WHERE id=$4`,
-		exitPrice, pnl, pnlPct, id)
+	_, err := CloseTradeRealized(ctx, id, exitPrice)
 	return err
 }
 
-// UpdateTradeExit corrects an already-closed exit or finalizes a durably
-// claimed (`exiting`) trade once the broker confirms the full fill.
+// FinalizeTradeExit closes an exiting trade after ApplyPartialExit has
+// assigned every sold share to the cumulative realized totals.
+func FinalizeTradeExit(ctx context.Context, id string) (TradeRealization, error) {
+	var result TradeRealization
+	err := GetDB().QueryRow(ctx, `
+		UPDATE trades
+		SET exit_price = realized_exit_proceeds / realized_exit_qty,
+		    pnl = realized_pnl,
+		    pnl_pct = CASE
+		        WHEN entry_price > 0
+		        THEN realized_pnl / (entry_price * realized_exit_qty) * 100
+		        ELSE 0
+		    END,
+		    quantity = realized_exit_qty,
+		    status = 'closed',
+		    closed_at = COALESCE(closed_at, NOW()),
+		    exit_claimed_at = NULL
+		WHERE id = $1
+		  AND status = 'exiting'
+		  AND quantity <= 0.000000001
+		  AND realized_exit_qty > 0
+		RETURNING exit_price, pnl, pnl_pct, realized_exit_qty, 0::NUMERIC, status`,
+		id,
+	).Scan(
+		&result.ExitPrice, &result.PnL, &result.PnLPct,
+		&result.ExitQty, &result.Remaining, &result.Status,
+	)
+	return result, err
+}
+
+// ApplyRecoveredExit records broker-position-delta recovery when no durable
+// order row survived. Partial recovery reopens the remaining position; a full
+// recovery finalizes the cumulative trade result.
+func ApplyRecoveredExit(
+	ctx context.Context,
+	id string,
+	exitPrice, soldQty float64,
+) (TradeRealization, error) {
+	var result TradeRealization
+	err := GetDB().QueryRow(ctx, `
+		WITH target AS (
+		    SELECT id, LEAST(quantity, GREATEST(0, $2::NUMERIC)) AS sold
+		    FROM trades
+		    WHERE id = $1 AND status = 'exiting'
+		    FOR UPDATE
+		)
+		UPDATE trades t
+		SET realized_exit_qty = t.realized_exit_qty + target.sold,
+		    realized_exit_proceeds = t.realized_exit_proceeds + target.sold * $3,
+		    realized_pnl = t.realized_pnl + CASE
+		        WHEN t.direction = 'short'
+		        THEN (t.entry_price - $3) * target.sold
+		        ELSE ($3 - t.entry_price) * target.sold
+		    END,
+		    quantity = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		        THEN t.realized_exit_qty + target.sold
+		        ELSE t.quantity - target.sold
+		    END,
+		    exit_price = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		        THEN (t.realized_exit_proceeds + target.sold * $3)
+		             / NULLIF(t.realized_exit_qty + target.sold, 0)
+		        ELSE t.exit_price
+		    END,
+		    pnl = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		        THEN t.realized_pnl + CASE
+		            WHEN t.direction = 'short'
+		            THEN (t.entry_price - $3) * target.sold
+		            ELSE ($3 - t.entry_price) * target.sold
+		        END
+		        ELSE t.pnl
+		    END,
+		    pnl_pct = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		             AND t.entry_price > 0
+		             AND t.realized_exit_qty + target.sold > 0
+		        THEN (
+		            t.realized_pnl + CASE
+		                WHEN t.direction = 'short'
+		                THEN (t.entry_price - $3) * target.sold
+		                ELSE ($3 - t.entry_price) * target.sold
+		            END
+		        ) / (t.entry_price * (t.realized_exit_qty + target.sold)) * 100
+		        ELSE t.pnl_pct
+		    END,
+		    status = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		        THEN 'closed'::trade_status
+		        ELSE 'open'::trade_status
+		    END,
+		    closed_at = CASE
+		        WHEN t.quantity - target.sold <= 0.000000001
+		        THEN COALESCE(t.closed_at, NOW())
+		        ELSE t.closed_at
+		    END,
+		    exit_claimed_at = NULL
+		FROM target
+		WHERE t.id = target.id
+		RETURNING COALESCE(
+		              t.realized_exit_proceeds / NULLIF(t.realized_exit_qty,0),
+		              0
+		          ),
+		          t.realized_pnl,
+		          CASE
+		              WHEN t.entry_price > 0 AND t.realized_exit_qty > 0
+		              THEN t.realized_pnl
+		                   / (t.entry_price * t.realized_exit_qty) * 100
+		              ELSE 0
+		          END,
+		          t.realized_exit_qty,
+		          CASE WHEN t.status='closed' THEN 0 ELSE t.quantity END,
+		          t.status`,
+		id, soldQty, exitPrice,
+	).Scan(
+		&result.ExitPrice, &result.PnL, &result.PnLPct,
+		&result.ExitQty, &result.Remaining, &result.Status,
+	)
+	return result, err
+}
+
+// UpdateTradeExit corrects legacy already-closed exits whose original broker
+// fill was asynchronous. Exiting trades must use ApplyPartialExit followed by
+// FinalizeTradeExit so cumulative realized slices cannot be discarded.
 func UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
 		SET exit_price=$1, pnl=$2, pnl_pct=$3,
+		    realized_pnl=$2,
+		    realized_exit_proceeds=realized_exit_qty*$1,
 		    status='closed',
 		    closed_at=COALESCE(closed_at, NOW()),
 		    exit_claimed_at=NULL
-		WHERE id=$4 AND status IN ('closed','exiting')`,
+		WHERE id=$4 AND status='closed'`,
 		exitPrice, pnl, pnlPct, id)
 	return err
 }

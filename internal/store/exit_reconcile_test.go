@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"math"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -325,6 +326,131 @@ func TestApplyPartialExitClampsAggregateFillToLotQuantity(t *testing.T) {
 	}
 }
 
+func TestCloseTradeRealizedIncludesEarlierPartialExit(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_CUMULATIVE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-cumulative-partial",
+		Ticker: "TEST_XRC_CUMULATIVE", Side: "sell", OrderType: "limit",
+		Quantity: 4, LimitPrice: 110, Status: "partial",
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if remaining, applied, err := store.ApplyPartialExit(
+		ctx, tradeID, orderID, 110, 4, "cancelled",
+	); err != nil || remaining != 6 || applied != 4 {
+		t.Fatalf("ApplyPartialExit = remaining %v applied %v err %v", remaining, applied, err)
+	}
+
+	result, err := store.CloseTradeRealized(ctx, tradeID, 90)
+	if err != nil {
+		t.Fatalf("CloseTradeRealized: %v", err)
+	}
+	if result.ExitQty != 10 || result.ExitPrice != 98 ||
+		result.PnL != -20 || result.PnLPct != -2 {
+		t.Fatalf("cumulative result = %+v, want qty=10 exit=98 pnl=-20 pct=-2", result)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if trade.Quantity != 10 || trade.ExitPrice != 98 ||
+		trade.PnL != -20 || trade.PnLPct != -2 {
+		t.Fatalf("closed trade = %+v", trade)
+	}
+}
+
+func TestFinalizeTradeExitUsesEveryAppliedSlice(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_FINALIZE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+	firstID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-finalize-1",
+		Ticker: "TEST_XRC_FINALIZE", Side: "sell", OrderType: "limit",
+		Quantity: 4, LimitPrice: 110, Status: "partial",
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder first: %v", err)
+	}
+	secondID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-finalize-2",
+		Ticker: "TEST_XRC_FINALIZE", Side: "sell", OrderType: "stop",
+		Quantity: 6, StopPrice: 90, Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder second: %v", err)
+	}
+	if _, _, err := store.ApplyPartialExit(
+		ctx, tradeID, firstID, 110, 4, "cancelled",
+	); err != nil {
+		t.Fatalf("ApplyPartialExit first: %v", err)
+	}
+	if _, _, err := store.ApplyPartialExit(
+		ctx, tradeID, secondID, 90, 6, "filled",
+	); err != nil {
+		t.Fatalf("ApplyPartialExit second: %v", err)
+	}
+
+	result, err := store.FinalizeTradeExit(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("FinalizeTradeExit: %v", err)
+	}
+	if result.ExitQty != 10 || result.ExitPrice != 98 ||
+		result.PnL != -20 || result.PnLPct != -2 {
+		t.Fatalf("finalized result = %+v, want qty=10 exit=98 pnl=-20 pct=-2", result)
+	}
+}
+
+func TestApplyRecoveredExitAccumulatesAndReopensRemainder(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_RECOVER_REALIZED", Direction: "short", Strategy: "test",
+		EntryPrice: 100, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+
+	partial, err := store.ApplyRecoveredExit(ctx, tradeID, 90, 4)
+	if err != nil {
+		t.Fatalf("ApplyRecoveredExit partial: %v", err)
+	}
+	if partial.Status != "open" || partial.Remaining != 6 ||
+		partial.ExitQty != 4 || partial.ExitPrice != 90 ||
+		partial.PnL != 40 || partial.PnLPct != 10 {
+		t.Fatalf("partial recovery = %+v", partial)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("second ClaimTradeExit = %v, %v", claimed, err)
+	}
+	closed, err := store.ApplyRecoveredExit(ctx, tradeID, 110, 6)
+	if err != nil {
+		t.Fatalf("ApplyRecoveredExit final: %v", err)
+	}
+	if closed.Status != "closed" || closed.ExitQty != 10 ||
+		closed.ExitPrice != 102 || closed.PnL != -20 || closed.PnLPct != -2 {
+		t.Fatalf("closed recovery = %+v", closed)
+	}
+}
+
 func TestApplyEntryFillKeepsPreviouslyExitedSharesSubtracted(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
@@ -369,6 +495,14 @@ func TestApplyEntryFillKeepsPreviouslyExitedSharesSubtracted(t *testing.T) {
 	}
 	if trade.EntryPrice != 10.2 {
 		t.Fatalf("entry price = %v, want broker cumulative average 10.2", trade.EntryPrice)
+	}
+	result, err := store.CloseTradeRealized(ctx, tradeID, 11)
+	if err != nil {
+		t.Fatalf("CloseTradeRealized: %v", err)
+	}
+	if result.ExitQty != 5 || result.ExitPrice != 10.7 ||
+		result.PnL != 2.5 || math.Abs(result.PnLPct-4.902) > 1e-8 {
+		t.Fatalf("rebased cumulative result = %+v", result)
 	}
 }
 

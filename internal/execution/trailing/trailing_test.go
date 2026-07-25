@@ -229,12 +229,24 @@ func (f *fakeStore) UpdateExitingTradeQuantity(_ context.Context, id string, qua
 	return nil
 }
 
-func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+func (f *fakeStore) CloseTradeRealized(
+	_ context.Context,
+	id string,
+	exitPrice float64,
+) (store.TradeRealization, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	t, ok := f.trades[id]
 	if !ok {
-		return errors.New("trade not found")
+		return store.TradeRealization{}, errors.New("trade not found")
+	}
+	pnl := (exitPrice - t.EntryPrice) * t.Quantity
+	if t.Direction == "short" {
+		pnl = -pnl
+	}
+	pnlPct := 0.0
+	if t.EntryPrice > 0 && t.Quantity > 0 {
+		pnlPct = pnl / (t.EntryPrice * t.Quantity) * 100
 	}
 	t.Status = "closed"
 	t.ExitPrice = exitPrice
@@ -242,7 +254,13 @@ func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnl
 	t.PnLPct = pnlPct
 	t.ClosedAt = time.Now()
 	f.trades[id] = t
-	return nil
+	return store.TradeRealization{
+		ExitPrice: exitPrice,
+		PnL:       pnl,
+		PnLPct:    pnlPct,
+		ExitQty:   t.Quantity,
+		Status:    "closed",
+	}, nil
 }
 
 func (f *fakeStore) UpdateOrderStopPriceAndID(
@@ -1490,8 +1508,8 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0, 1.0); err == nil {
 		t.Fatalf("UpdateOrderStopPriceAndID(no DB): want error, got nil")
 	}
-	if err := ls.CloseTrade(ctx, "t1", 100, 1, 1); err == nil {
-		t.Fatalf("CloseTrade(no DB): want error, got nil")
+	if _, err := ls.CloseTradeRealized(ctx, "t1", 100); err == nil {
+		t.Fatalf("CloseTradeRealized(no DB): want error, got nil")
 	}
 }
 
