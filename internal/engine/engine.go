@@ -1012,10 +1012,9 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	}
 
 	impact := e.calculateImpactScore(ticker, snippets, candles)
-	// Issue #323: when specialist mode is enabled, route to the 4-role
-	// specialist arbiter (fundamental / technical / sentiment / risk_manager)
-	// instead of the duplicate-prompt ensemble. Both paths return AnalyzeResult
-	// so all downstream cost-tracking, persistence and UI code is unchanged.
+	// Specialist mode runs three directional roles followed by a mandatory
+	// Risk Specialist instead of the generalist ensemble. Both paths return
+	// AnalyzeResult so downstream cost tracking and persistence stay shared.
 	var result analysis.AnalyzeResult
 	var err error
 	if e.cfg.Analysis.SpecialistModeEnabled {
@@ -1139,6 +1138,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 				votes = append(votes, events.AnalystVotePayload{
 					Provider:   ar.Provider,
 					Model:      ar.Model,
+					Role:       ar.Role,
 					Action:     action,
 					Confidence: conf,
 					Skipped:    skipped,

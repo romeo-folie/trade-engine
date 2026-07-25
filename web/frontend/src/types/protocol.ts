@@ -11,17 +11,32 @@ export interface WebEvent {
 export interface NodeState {
   id: string;
   label: string;
-  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter' | 'ticker' | 'arbiter_final' | 'enricher';
+  kind: 'source' | 'processing' | 'output' | 'analyst' | 'synthesis' | 'execution' | 'arbiter' | 'ticker' | 'arbiter_final' | 'risk_specialist' | 'enricher';
   event_count: number;
   last_event_at?: string;
   avg_latency_ms?: number;
   meta?: Record<string, unknown>;
+  stage: number;
+}
+
+export interface PipelineEdge {
+  id: string;
+  source: string;
+  target: string;
+  kind: 'primary' | 'conditional' | 'bypass';
+}
+
+export interface PipelineTopology {
+  revision: string;
+  analysis_mode: 'single' | 'ensemble' | 'specialist';
+  edges: PipelineEdge[];
 }
 
 export interface SnapshotEvent {
   type: 'snapshot';
   timestamp: string;
   nodes: NodeState[];
+  topology: PipelineTopology;
 }
 
 // ── Particle colors by event type (PRD §14.6) ──────────────────────────────
@@ -39,6 +54,7 @@ export const PARTICLE_COLORS: Record<string, string> = {
   AnalysisCompleted:    '#8B5CF6', // violet
   AnalysisStarted:      '#6366F1', // indigo
   AnalystVotesPublished:'#A855F7', // light purple
+  SpecialistReviewCompleted:'#F59E0B', // amber
   ArbiterInvoked:       '#EC4899', // pink — resolution
   // Signal flow
   SignalGenerated:      '#6366F1', // indigo
@@ -72,6 +88,7 @@ export const EVENT_LABELS: Record<string, string> = {
   AnalysisCompleted:    'Analysis',
   AnalysisStarted:      'Dispatch',
   AnalystVotesPublished:'Votes',
+  SpecialistReviewCompleted:'Risk Review',
   ArbiterInvoked:       'Resolver',
   SignalGenerated:    'Signal',
   SignalBlocked:      'Blocked',

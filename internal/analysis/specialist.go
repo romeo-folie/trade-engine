@@ -1,19 +1,16 @@
 package analysis
 
-// specialist.go — Issue #323: 4-role specialist arbiter path.
+// specialist.go — sequential specialist analysis path.
 //
 // Inspired by Grok 4.20's Alpha Arena stock-contest winning entry, which used
-// four role-specialised agents (fundamental / technical / sentiment / risk
-// manager) in debate before deciding. The previous ensemble used N copies of
-// the same prompt across providers — diversity came only from model weights.
+// role-specialised agents. Fundamental, technical, and sentiment analysis run
+// in parallel; their findings then flow through a mandatory Risk Specialist.
 //
-// This path is gated by analysis.specialist_mode_enabled (default false) so
-// the existing arbiter remains the production path until operators opt in.
+// This path is gated by analysis.specialist_mode_enabled (default false).
 
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -26,8 +23,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
-// specialistRoleOrder is the canonical ordering used in reasoning concatenation
-// and table-driven tests. Risk-manager is last so its veto reads naturally.
+// specialistRoleOrder is the canonical order used in persisted reasoning and UI.
 var specialistRoleOrder = []string{"fundamental", "technical", "sentiment", "risk_manager"}
 
 // specialistBuildProvider is the seam used by AnalyzeSpecialist to construct a
@@ -45,18 +41,10 @@ type specialistResult struct {
 	Err      error
 }
 
-// AnalyzeSpecialist runs one specialist analyst per configured role and
-// resolves disagreement via 3-of-4 majority + risk-manager veto.
-//
-// Resolution rules:
-//  1. If 3+ roles agree on action, use that action.
-//  2. Otherwise, when the risk-manager returned WAIT or HOLD that verdict is
-//     decisive — final action is whichever of WAIT/HOLD it returned.
-//  3. If risk-manager isn't configured or didn't return successfully, fall
-//     back to majority vote (the existing behavior).
-//
-// Confidence is the average over returning roles. Reasoning is concatenated
-// per-role and prefixed by the role label so downstream UI can split it back.
+// AnalyzeSpecialist runs the three directional specialists in parallel, then
+// passes their completed findings through a mandatory Risk Specialist review.
+// The Risk Specialist owns the final analytical outcome; deterministic
+// portfolio risk controls still run later in the engine.
 func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _ depth.ImpactScore) (AnalyzeResult, error) {
 	specialistCfg := a.specialistRolesConfig()
 	if len(specialistCfg) == 0 {
@@ -69,7 +57,8 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		registryKey string
 		provider    ModelProvider
 	}
-	var rps []roleProvider
+	var directional []roleProvider
+	var riskReviewer *roleProvider
 	for _, role := range specialistRoleOrder {
 		key, ok := specialistCfg[role]
 		if !ok || key == "" {
@@ -88,24 +77,30 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 				"role", role, "provider", p.ProviderName(), "model", p.ModelName())
 			continue
 		}
-		rps = append(rps, roleProvider{role: role, registryKey: key, provider: p})
+		rp := roleProvider{role: role, registryKey: key, provider: p}
+		if role == "risk_manager" {
+			riskReviewer = &rp
+		} else {
+			directional = append(directional, rp)
+		}
 	}
-	if len(rps) < 2 {
-		return AnalyzeResult{}, fmt.Errorf("specialist mode: only %d/%d roles available — need at least 2", len(rps), len(specialistRoleOrder))
+	if len(directional) != 3 {
+		return AnalyzeResult{}, fmt.Errorf("specialist mode: only %d/3 directional roles available — all three are required", len(directional))
+	}
+	if riskReviewer == nil {
+		return AnalyzeResult{}, fmt.Errorf("specialist mode: mandatory risk_manager role is unavailable")
 	}
 
-	// Emit AnalysisStarted so the pipeline graph / WebSocket consumers can pulse
-	// the selected analyst nodes — mirrors AnalyzeFull's behavior. SelectedAnalysts
-	// reflects only the roles that will actually run (skipped/missing roles are
-	// excluded). Naming convention: "analyst-<registry_key>".
+	// First stage: fan out only to directional specialists. Role-based node IDs
+	// stay unique even when multiple roles share one registry model.
 	if a.bus != nil {
-		selected := make([]string, 0, len(rps))
-		for _, rp := range rps {
-			selected = append(selected, "analyst-"+rp.registryKey)
+		selected := make([]string, 0, len(directional))
+		for _, rp := range directional {
+			selected = append(selected, specialistNodeID(rp.role))
 		}
 		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
 			Ticker:           req.Ticker,
-			Depth:            len(rps),
+			Depth:            len(directional),
 			SelectedAnalysts: selected,
 		})
 	}
@@ -118,10 +113,10 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	promptSimilar := toPromptSimilarSetups(req.SimilarAnalyses)
 
 	mu := &sync.Mutex{}
-	results := make([]specialistResult, 0, len(rps))
+	results := make([]specialistResult, 0, len(directional)+1)
 	var wg sync.WaitGroup
 
-	for _, rp := range rps {
+	for _, rp := range directional {
 		rp := rp
 		sys, user := prompts.BuildRolePrompt(
 			rp.role, req.Ticker, req.Strategy, req.Timeframe,
@@ -172,214 +167,133 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	}
 	wg.Wait()
 
-	// Project per-role results into AnalystResults so cost-tracking / UI keep working.
-	analystResults := make([]AnalystResult, 0, len(results))
-	successes := 0
 	// Sort by canonical role order for deterministic output and stable telemetry.
 	sort.Slice(results, func(i, j int) bool {
 		return roleIndex(results[i].Role) < roleIndex(results[j].Role)
 	})
+	successes := 0
 	for _, r := range results {
-		analystResults = append(analystResults, AnalystResult{
-			Provider:  r.Meta.Provider,
-			Model:     r.Meta.Model,
-			Role:      r.Role,
-			Response:  r.Response,
-			Meta:      r.Meta,
-			Err:       r.Err,
-			LatencyMs: r.Meta.LatencyMs,
-		})
 		if r.Err == nil {
 			successes++
 		}
 	}
-	if successes < 2 {
-		return AnalyzeResult{AnalystResults: analystResults}, fmt.Errorf("specialist: only %d/%d roles succeeded (minimum 2)", successes, len(results))
+	if successes != 3 {
+		return AnalyzeResult{
+			AnalystResults: projectSpecialistResults(results),
+		}, fmt.Errorf("specialist: only %d/3 directional roles succeeded — risk review requires all three", successes)
 	}
 
-	final := resolveSpecialist(results)
-	logger.Info("specialist arbitrated",
+	// Second stage: all successful directional findings feed the mandatory
+	// Risk Specialist. Publish the fan-in so the canvas shows the real path.
+	sourceNodes := make([]string, 0, successes)
+	for _, r := range results {
+		if r.Err == nil {
+			sourceNodes = append(sourceNodes, specialistNodeID(r.Role))
+		}
+	}
+	if a.bus != nil {
+		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+			Ticker:           req.Ticker,
+			Depth:            1,
+			SelectedAnalysts: []string{"specialist-risk-manager"},
+			SourceNodes:      sourceNodes,
+		})
+	}
+
+	sys, user := prompts.BuildRiskManagerReviewPrompt(
+		req.Ticker, req.Strategy, req.Timeframe,
+		promptCandles, promptInd, promptNews, promptPortfolio,
+		req.KnowledgeContext, promptSimilar, req.PerformanceContext,
+		formatDirectionalFindings(results),
+	)
+	if sys == "" || user == "" {
+		return AnalyzeResult{AnalystResults: projectSpecialistResults(results)},
+			fmt.Errorf("specialist: failed to build mandatory risk-manager review prompt")
+	}
+	riskReq := req
+	riskReq.CustomSystemPrompt = sys
+	riskReq.CustomUserMessage = user
+	timeout := modelTimeoutForRegistry(riskReviewer.registryKey, riskReviewer.provider, a.cfg)
+	riskCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	t0 := time.Now()
+	riskResp, riskMeta, riskErr := riskReviewer.provider.Analyze(riskCtx, riskReq)
+	riskMeta.LatencyMs = time.Since(t0).Milliseconds()
+	riskResult := specialistResult{
+		Role: "risk_manager", Provider: riskReviewer.provider,
+		Response: riskResp, Meta: riskMeta, Err: riskErr,
+	}
+	results = append(results, riskResult)
+	if riskErr != nil {
+		logger.Warn("mandatory risk specialist failed",
+			"ticker", req.Ticker,
+			"provider", riskReviewer.provider.ProviderName(),
+			"model", riskReviewer.provider.ModelName(),
+			"err", riskErr)
+		return AnalyzeResult{AnalystResults: projectSpecialistResults(results)},
+			fmt.Errorf("specialist: mandatory risk-manager review failed: %w", riskErr)
+	}
+
+	final := riskResp
+	final.Reasoning = composeSequentialSpecialistReasoning(results, riskResp)
+	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),
-		"successes", successes,
-		"roles", len(results),
+		"directional_successes", successes,
+		"risk_reviewer", riskReviewer.provider.ModelName(),
 	)
 	return AnalyzeResult{
 		Response:       final,
-		Meta:           pickPrimarySpecialistMeta(results),
-		AnalystResults: analystResults,
+		Meta:           riskMeta,
+		AnalystResults: projectSpecialistResults(results),
 	}, nil
 }
 
-// resolveSpecialist applies the 3-of-4 majority + risk-manager veto rules.
-// Exposed at package scope so tests can exercise it without standing up a
-// full Analyzer + provider stack.
-func resolveSpecialist(results []specialistResult) AnalysisResponse {
-	successes := make([]specialistResult, 0, len(results))
-	for _, r := range results {
-		if r.Err == nil {
-			successes = append(successes, r)
-		}
-	}
-	if len(successes) == 0 {
-		return AnalysisResponse{Action: ActionHold, Reasoning: "[specialist] no successful roles; defaulting to HOLD"}
-	}
-
-	// Tally action votes.
-	counts := map[Action]int{}
-	for _, r := range successes {
-		counts[r.Response.Action]++
-	}
-
-	// Rule 1: 3+ roles agree → use that action.
-	var majorityAction Action
-	for action, c := range counts {
-		if c >= 3 {
-			majorityAction = action
-			break
-		}
-	}
-
-	// Locate the risk-manager response (if it succeeded).
-	var rm *specialistResult
-	for i := range successes {
-		if successes[i].Role == "risk_manager" {
-			rm = &successes[i]
-			break
-		}
-	}
-
-	var finalAction Action
-	switch {
-	case majorityAction != "":
-		finalAction = majorityAction
-	case rm != nil && (rm.Response.Action == ActionWait || rm.Response.Action == ActionHold):
-		// Rule 2: risk-manager veto — its WAIT or HOLD is decisive when no majority.
-		finalAction = rm.Response.Action
-	default:
-		// Rule 3: fallback to existing majority-vote helper. Wrap successes
-		// into AnalystResult shape so we can reuse majorityVote() unchanged.
-		fallback := make([]AnalystResult, 0, len(successes))
-		for _, r := range successes {
-			fallback = append(fallback, AnalystResult{
-				Provider: r.Meta.Provider,
-				Model:    r.Meta.Model,
-				Response: r.Response,
-			})
-		}
-		mv, ok := majorityVote(fallback)
-		if !ok {
-			finalAction = ActionHold
-		} else {
-			finalAction = mv.Action
-		}
-	}
-
-	// Confidence averages over ALL successful roles (it expresses overall
-	// committee certainty, not just the winners' certainty).
-	var sumConf float64
-	for _, r := range successes {
-		sumConf += r.Response.Confidence
-	}
-	n := float64(len(successes))
-	avgConf := math.Round(sumConf/n*1000) / 1000
-
-	// Sizing / SL / TP must average ONLY over roles whose action matches the
-	// final action. Otherwise a 3-of-4 BUY decision would inherit the dissenting
-	// SELL voter's opposite-direction stop-loss / take-profit, corrupting the
-	// risk levels on the resulting signal. See Codex review on PR #342.
-	var winners []specialistResult
-	for _, r := range successes {
-		if r.Response.Action == finalAction {
-			winners = append(winners, r)
-		}
-	}
-	var avgSize, avgSL, avgTP float64
-	if len(winners) == 0 {
-		// Safety fallback — finalAction came from majority/veto, so at least one
-		// successful role should match. If none do (e.g. majority-vote helper
-		// returned a cascade winner that no role actually voted for), keep risk
-		// levels at zero rather than averaging across opposite-direction voters.
-		logger.Warn("specialist: no roles matched finalAction — zeroing sizing",
-			"final_action", string(finalAction))
-	} else {
-		var sumSize, sumSL, sumTP float64
-		var nSL, nTP int
-		for _, r := range winners {
-			sumSize += r.Response.SizePct
-			if r.Response.StopLoss > 0 {
-				sumSL += r.Response.StopLoss
-				nSL++
-			}
-			if r.Response.TakeProfit > 0 {
-				sumTP += r.Response.TakeProfit
-				nTP++
-			}
-		}
-		w := float64(len(winners))
-		avgSize = math.Round(sumSize/w*100) / 100
-		if nSL > 0 {
-			avgSL = math.Round(sumSL/float64(nSL)*10000) / 10000
-		}
-		if nTP > 0 {
-			avgTP = math.Round(sumTP/float64(nTP)*10000) / 10000
-		}
-	}
-
-	// Suppress sizing for non-actionable verdicts (mirrors arbiter behavior).
-	if finalAction == ActionHold || finalAction == ActionWait {
-		avgSize = 0
-		avgSL = 0
-		avgTP = 0
-	}
-
-	return AnalysisResponse{
-		Action:     finalAction,
-		Confidence: avgConf,
-		SizePct:    avgSize,
-		StopLoss:   avgSL,
-		TakeProfit: avgTP,
-		Reasoning:  composeSpecialistReasoning(successes, finalAction, majorityAction != "", rm),
-	}
+func specialistNodeID(role string) string {
+	return "specialist-" + strings.ReplaceAll(role, "_", "-")
 }
 
-// composeSpecialistReasoning concatenates per-role reasoning prefixed by the
-// role label, then appends a one-line resolution note.
-func composeSpecialistReasoning(successes []specialistResult, finalAction Action, hadMajority bool, rm *specialistResult) string {
+func projectSpecialistResults(results []specialistResult) []AnalystResult {
+	projected := make([]AnalystResult, 0, len(results))
+	sort.Slice(results, func(i, j int) bool {
+		return roleIndex(results[i].Role) < roleIndex(results[j].Role)
+	})
+	for _, r := range results {
+		projected = append(projected, AnalystResult{
+			Provider: r.Meta.Provider, Model: r.Meta.Model, Role: r.Role,
+			Response: r.Response, Meta: r.Meta, Err: r.Err, LatencyMs: r.Meta.LatencyMs,
+		})
+	}
+	return projected
+}
+
+func formatDirectionalFindings(results []specialistResult) string {
 	var b strings.Builder
-	// Sort so the output is deterministic (canonical role order).
-	sort.Slice(successes, func(i, j int) bool { return roleIndex(successes[i].Role) < roleIndex(successes[j].Role) })
-
-	for _, r := range successes {
-		// Cast the Action defined-string-type to string so %s formats as the
-		// literal action verb instead of "%!s(analysis.Action=BUY)".
-		fmt.Fprintf(&b, "[%s] %s — %s (conf %.2f)\n", r.Role, string(r.Response.Action), strings.TrimSpace(r.Response.Reasoning), r.Response.Confidence)
+	for _, r := range results {
+		if r.Err != nil || r.Role == "risk_manager" {
+			continue
+		}
+		fmt.Fprintf(&b, "[%s] action=%s confidence=%.2f size_pct=%.2f stop_loss=%.4f take_profit=%.4f\n%s\n\n",
+			r.Role, string(r.Response.Action), r.Response.Confidence, r.Response.SizePct,
+			r.Response.StopLoss, r.Response.TakeProfit, strings.TrimSpace(r.Response.Reasoning))
 	}
-
-	switch {
-	case hadMajority:
-		fmt.Fprintf(&b, "[specialist] resolved by 3-of-%d majority → %s", len(successes), string(finalAction))
-	case rm != nil && (rm.Response.Action == ActionWait || rm.Response.Action == ActionHold):
-		fmt.Fprintf(&b, "[specialist] resolved by risk-manager veto (%s) → %s", string(rm.Response.Action), string(finalAction))
-	default:
-		fmt.Fprintf(&b, "[specialist] resolved by majority-vote fallback → %s", string(finalAction))
-	}
-	return b.String()
+	return strings.TrimSpace(b.String())
 }
 
-// pickPrimarySpecialistMeta returns the first successful role's meta so callers
-// have a non-empty Provider/Model for cost telemetry. Falls back to the first
-// result of any kind.
-func pickPrimarySpecialistMeta(results []specialistResult) ModelCallMeta {
+func composeSequentialSpecialistReasoning(results []specialistResult, final AnalysisResponse) string {
+	var b strings.Builder
+	sort.Slice(results, func(i, j int) bool {
+		return roleIndex(results[i].Role) < roleIndex(results[j].Role)
+	})
 	for _, r := range results {
-		if r.Err == nil {
-			return r.Meta
+		if r.Err != nil {
+			continue
 		}
+		fmt.Fprintf(&b, "[%s] %s — %s (conf %.2f)\n",
+			r.Role, string(r.Response.Action), strings.TrimSpace(r.Response.Reasoning), r.Response.Confidence)
 	}
-	if len(results) > 0 {
-		return results[0].Meta
-	}
-	return ModelCallMeta{}
+	fmt.Fprintf(&b, "[specialist] resolved by mandatory risk-manager review → %s", string(final.Action))
+	return b.String()
 }
 
 // roleIndex returns the canonical position of role in specialistRoleOrder.

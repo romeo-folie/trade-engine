@@ -21,7 +21,7 @@ type Analyzer struct {
 	cfg      config.ModelsConfig
 	bus      *events.Bus
 
-	// specialist is the optional 4-role specialist sub-config (Issue #323).
+	// specialist is the optional sequential specialist sub-config.
 	// Wired by the engine via SetSpecialistConfig when
 	// analysis.specialist_mode_enabled is true. Nil means specialist mode is
 	// off and AnalyzeSpecialist will refuse to run.
@@ -84,6 +84,15 @@ func (a *Analyzer) Analyze(ctx context.Context, req AnalysisRequest, impact dept
 // based on consensus config.
 func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) (AnalyzeResult, error) {
 	if !a.cfg.Consensus.Enabled || len(a.analysts) <= 1 {
+		if a.bus != nil {
+			selected := []string{"llm_analysis"}
+			if len(a.cfg.Roles.Analysts) > 0 {
+				selected[0] = "analyst-" + a.cfg.Roles.Analysts[0]
+			}
+			a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
+				Ticker: req.Ticker, Depth: 1, SelectedAnalysts: selected,
+			})
+		}
 		resp, meta, err := a.analyzeSingle(ctx, req)
 		single := AnalystResult{Provider: meta.Provider, Model: meta.Model, Response: resp, Meta: meta, Err: err, LatencyMs: meta.LatencyMs}
 		return AnalyzeResult{Response: resp, Meta: meta, AnalystResults: []AnalystResult{single}}, err

@@ -92,8 +92,9 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
 
   const isArbiterFinal = d.kind === 'arbiter_final';
+  const isRiskSpecialist = d.kind === 'risk_specialist';
   const isTicker = d.kind === 'ticker';
-  const cardBorder = isArbiterFinal ? colors.amber
+  const cardBorder = (isArbiterFinal || isRiskSpecialist) ? colors.amber
                    : isAnalyst ? accentColor
                    : colors.border;
 
@@ -109,8 +110,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         <Handle type="source" position={Position.Right} style={{ opacity: 0 }} />
 
         <div className={styles.analystHeader}>
-          <span className={styles.kindLabel} style={{ color: isAnalyst ? accentColor : isArbiterFinal ? colors.amber : undefined }}>
-            {d.kind === 'arbiter_final' ? 'ARBITER' : d.kind.toUpperCase()}
+          <span className={styles.kindLabel} style={{ color: isAnalyst ? accentColor : (isArbiterFinal || isRiskSpecialist) ? colors.amber : undefined }}>
+            {isArbiterFinal ? 'ARBITER' : isRiskSpecialist ? 'RISK SPECIALIST' : d.kind.toUpperCase()}
           </span>
           <div className={`${styles.statusDot} ${statusDot}`} />
         </div>
@@ -212,6 +213,39 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                 </>
               );
             })()}
+          </div>
+        )}
+
+        {isRiskSpecialist && (
+          <div>
+            <div className={styles.subValue}>
+              {((d.meta as Record<string, unknown>)?.model as string) || 'MODEL NOT CONFIGURED'}
+            </div>
+            <div className={styles.subValue} style={{ marginTop: 4 }}>
+              {d.provider ? d.provider.toUpperCase() : 'SPECIALIST REVIEW'}
+            </div>
+            <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 6, opacity: 0.65 }}>
+              REVIEWS ALL SPECIALIST FINDINGS
+            </div>
+            <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
+              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+                {nodeActive ? 'REVIEWING' : 'MANDATORY'}
+              </span>
+            </div>
+            {d.verdict ? (
+              <div
+                className={`${styles.analystVerdict} ${
+                  d.verdict === 'BUY' ? styles.verdictLong :
+                  d.verdict === 'SELL' ? styles.verdictShort :
+                  styles.verdictNeutral
+                }`}
+                style={{ fontSize: 13, marginTop: 8 }}
+              >
+                {typeof d.currentTicker === 'string' && <span style={{ opacity: 0.6, fontSize: 9, marginRight: 6 }}>{d.currentTicker}</span>}
+                {d.verdict as string}
+                {typeof d.voteConfidence === 'number' && <span style={{ marginLeft: 8 }}>{d.voteConfidence.toFixed(2)}</span>}
+              </div>
+            ) : null}
           </div>
         )}
 

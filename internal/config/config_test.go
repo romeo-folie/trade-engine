@@ -204,6 +204,27 @@ func TestValidateMissingAPIKey(t *testing.T) {
 	}
 }
 
+func TestValidateSpecialistModeRequiresEveryRole(t *testing.T) {
+	cfg := Defaults()
+	cfg.Analysis.SpecialistModeEnabled = true
+	cfg.Analysis.SpecialistRoles = map[string]string{
+		"fundamental": "analyst_frontier",
+		"technical":   "analyst_mid",
+		"sentiment":   "analyst_cheap",
+		// risk_manager intentionally missing
+	}
+	errs := Validate(cfg)
+	if !containsStr(errs, "analysis.specialist_roles.risk_manager is required") {
+		t.Fatalf("expected mandatory risk-manager validation error, got: %v", errs)
+	}
+
+	cfg.Analysis.SpecialistRoles["risk_manager"] = "does_not_exist"
+	errs = Validate(cfg)
+	if !containsStr(errs, `analysis.specialist_roles.risk_manager: key "does_not_exist" not found`) {
+		t.Fatalf("expected unresolved risk-manager registry error, got: %v", errs)
+	}
+}
+
 func TestResolveEnvEmpty(t *testing.T) {
 	if got := resolveEnv(""); got != "" {
 		t.Errorf("resolveEnv(\"\") = %q, want empty", got)

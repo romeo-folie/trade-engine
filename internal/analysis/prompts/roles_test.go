@@ -17,9 +17,8 @@ func TestRolePrompts_RoleSpecificMarkers(t *testing.T) {
 		{"fundamental", []string{"fundamental research analyst", "earnings", "catalyst"}},
 		{"technical", []string{"technical analyst", "EMA", "indicator"}},
 		{"sentiment", []string{"sentiment analyst", "news", "headline"}},
-		// Risk-manager: must use the words "veto" and "discipline" (the spec
-		// asks the prompt to bias toward WAIT when discipline is breached).
-		{"risk_manager", []string{"risk manager", "veto", "discipline"}},
+		// Risk Specialist is a mandatory sequential review, not a fourth vote.
+		{"risk_manager", []string{"Risk Specialist", "mandatory", "discipline"}},
 	}
 
 	for _, tc := range cases {

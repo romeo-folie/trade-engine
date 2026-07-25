@@ -331,20 +331,18 @@ analysis:
     llm_fallback_enabled: false      # If true, a SKIP from rules is confirmed by LLM
     llm_fallback_model: classifier   # Role name (from models.roles) for the LLM fallback — not a direct registry key
 
-  # Specialist analysts (Issue #323, Grok 4.20 Alpha Arena lesson).
+  # Sequential specialist analysis.
   # When enabled, the engine routes signal-generation calls to
-  # Analyzer.AnalyzeSpecialist instead of AnalyzeFull. Four role-specialised
-  # prompts (fundamental, technical, sentiment, risk_manager) run in parallel;
-  # resolution is 3-of-4 majority + risk-manager veto, with a majority-vote
-  # fallback when risk-manager is missing or failed. AnalyzeFull itself is
-  # unchanged. DEFAULT OFF — opt in only after verifying provider keys for
-  # every mapped role.
+  # Analyzer.AnalyzeSpecialist instead of AnalyzeFull. Fundamental, technical,
+  # and sentiment prompts run in parallel. Their completed findings then pass
+  # through a mandatory risk_manager review before deterministic risk controls.
+  # AnalyzeFull itself is unchanged. DEFAULT OFF. Opt in only after verifying
+  # provider keys for every mapped role.
   specialist_mode_enabled: false
   # Map each specialist role to a key declared in models.registry above.
   # The mapping below is illustrative — operators should swap in whichever
-  # provider+model they want behind each role. Any role whose mapped registry
-  # key is missing or whose provider is unavailable is skipped at runtime
-  # with a WARN log (no crash).
+  # provider+model they want behind each role. All four mappings and providers
+  # are required; specialist analysis fails closed when one is unavailable.
   specialist_roles:
     fundamental: analyst_frontier   # frontier model for catalysts/earnings reasoning
     technical: analyst_mid          # mid-tier for indicator/structure analysis

@@ -78,7 +78,6 @@ type Server struct {
 	brokerView *brokerCache
 }
 
-
 // NewServer creates a Server with a reference to the live portfolio tracker.
 func NewServer(cfg Config, bus *events.Bus, tracker *portfolio.Tracker) *Server {
 	s := &Server{
@@ -406,13 +405,19 @@ func toWebEvents(ev events.Event) []*WebEvent {
 		var msgs []*WebEvent
 		tickerJSON, _ := json.Marshal(map[string]string{"ticker": payload.Ticker})
 		for _, target := range payload.SelectedAnalysts {
-			msgs = append(msgs, &WebEvent{
-				Type:      "AnalysisStarted",
-				Timestamp: ev.Timestamp,
-				Source:    "prompt_assembly",
-				Target:    target,
-				Payload:   json.RawMessage(tickerJSON),
-			})
+			sources := payload.SourceNodes
+			if len(sources) == 0 {
+				sources = []string{"indicator_engine"}
+			}
+			for _, source := range sources {
+				msgs = append(msgs, &WebEvent{
+					Type:      "AnalysisStarted",
+					Timestamp: ev.Timestamp,
+					Source:    source,
+					Target:    target,
+					Payload:   json.RawMessage(tickerJSON),
+				})
+			}
 		}
 		return msgs
 
@@ -422,13 +427,23 @@ func toWebEvents(ev events.Event) []*WebEvent {
 			return nil
 		}
 		raw, _ := json.Marshal(payload)
+		source, target, webType := "llm_analysis", "consensus", "AnalystVotesPublished"
+		for _, vote := range payload.Votes {
+			if vote.Role == "risk_manager" {
+				source, target, webType = "specialist-risk-manager", "risk_manager", "SpecialistReviewCompleted"
+				break
+			}
+		}
+		if len(payload.Votes) == 1 {
+			target = "risk_manager"
+		}
 		// Emit a single AnalystVotesPublished event per cycle — frontend reads all votes
 		// from the payload. Emitting one per non-skipped vote was redundant and inflated WS traffic.
 		return []*WebEvent{{
-			Type:      "AnalystVotesPublished",
+			Type:      webType,
 			Timestamp: ev.Timestamp,
-			Source:    "llm_analysis",
-			Target:    "consensus",
+			Source:    source,
+			Target:    target,
 			Payload:   json.RawMessage(raw),
 		}}
 	}

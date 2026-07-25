@@ -201,6 +201,7 @@ type NewsFetchedPayload struct {
 type AnalystVotePayload struct {
 	Provider   string  `json:"provider"`
 	Model      string  `json:"model"`
+	Role       string  `json:"role,omitempty"`
 	Action     string  `json:"action"` // BUY | SELL | HOLD | ""
 	Confidence float64 `json:"confidence"`
 	Skipped    bool    `json:"skipped"` // true = analyst errored or wasn't invoked
@@ -218,6 +219,7 @@ type AnalysisStartedPayload struct {
 	Ticker           string   `json:"ticker"`
 	Depth            int      `json:"depth"`
 	SelectedAnalysts []string `json:"selected_analysts"` // e.g. ["analyst-cheap", "analyst-mid"]
+	SourceNodes      []string `json:"source_nodes,omitempty"`
 }
 
 // NewsEnrichedPayload is emitted after the news enricher LLM extracts sentiment.

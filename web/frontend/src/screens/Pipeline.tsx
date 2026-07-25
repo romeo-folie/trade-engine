@@ -15,7 +15,7 @@ import DrillDownPanel from '../components/pipeline/DrillDownPanel';
 import styles from './Pipeline.module.css';
 
 export default function PipelineScreen() {
-  const { nodes, events, nodeMetrics } = useEngineSocketContext();
+  const { nodes, topology, events, nodeMetrics } = useEngineSocketContext();
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
 
   const handleNodeClick = useCallback((id: string) => {
@@ -41,6 +41,7 @@ export default function PipelineScreen() {
       <div className={styles.innerFrame}>
         <HubGraph
           nodes={nodes}
+          topology={topology}
           nodeMetrics={nodeMetrics}
           recentEventSignatures={recentEventSignatures}
           onNodeClick={handleNodeClick}

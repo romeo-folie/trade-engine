@@ -264,8 +264,8 @@ type AnalysisConfig struct {
 	// borderline confidence band. Defaults to 0.70.
 	MultiTimeframeBorderlineConfMax float64 `yaml:"multi_timeframe_borderline_conf_max"`
 
-	// SpecialistModeEnabled toggles the 4-role specialist arbiter path
-	// (Issue #323, inspired by Grok 4.20's Alpha Arena 4-agent debate).
+	// SpecialistModeEnabled toggles the sequential specialist path: three
+	// directional roles followed by a mandatory risk-manager review.
 	// When true, the engine routes signal-generation calls to
 	// AnalyzeSpecialist instead of AnalyzeFull. AnalyzeFull itself is
 	// unchanged. Default: false (safe-rollout).
@@ -273,8 +273,8 @@ type AnalysisConfig struct {
 
 	// SpecialistRoles maps each specialist role name to a registry key in
 	// models.registry. Recognised roles: fundamental, technical, sentiment,
-	// risk_manager. Roles whose mapped provider is missing or unavailable
-	// are skipped at runtime with a WARN log (no crash).
+	// risk_manager. All four roles are required in specialist mode; analysis
+	// fails closed if a mapped provider is missing or unavailable.
 	// Example: {fundamental: claude, technical: deepseek, sentiment: gemini,
 	//           risk_manager: grok}
 	SpecialistRoles map[string]string `yaml:"specialist_roles"`
@@ -2056,6 +2056,19 @@ func Validate(cfg *Config) []string {
 		// Legacy single-model validation.
 		if len(cfg.Models.Analysts) == 0 && cfg.Models.Primary.APIKeyEnv != "" && os.Getenv(cfg.Models.Primary.APIKeyEnv) == "" {
 			errs = append(errs, fmt.Sprintf("env var %s (models.primary.api_key_env) is not set", cfg.Models.Primary.APIKeyEnv))
+		}
+	}
+
+	if cfg.Analysis.SpecialistModeEnabled {
+		for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
+			key := cfg.Analysis.SpecialistRoles[role]
+			if key == "" {
+				errs = append(errs, fmt.Sprintf("analysis.specialist_roles.%s is required when specialist mode is enabled", role))
+				continue
+			}
+			if _, ok := cfg.Models.Registry[key]; !ok {
+				errs = append(errs, fmt.Sprintf("analysis.specialist_roles.%s: key %q not found in models.registry", role, key))
+			}
 		}
 	}
 
