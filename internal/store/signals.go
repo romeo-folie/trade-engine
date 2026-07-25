@@ -23,6 +23,13 @@ type Signal struct {
 	AnalysisIDs       []string
 	ExpiresAt         time.Time
 	StalePriceMovePct float64
+	// PullbackStrength marks signals whose stop and eligibility came from the
+	// complete pullback setup. It survives manual approval/restarts so execution
+	// can revalidate the low-of-day stop against a fresh mark. For these signals,
+	// CreatedAt is the observation boundary captured immediately after the
+	// qualification-time daily snapshot returned; exact trade scanning starts
+	// there, before gate evaluation and persistence.
+	PullbackStrength bool
 	// Deferred marks a signal the engine held back for first-tick
 	// confirmation (entry gates, migration 043). Only deferred signals are
 	// eligible for the deferred-execution sweep — manual-approval pendings
@@ -38,18 +45,24 @@ func InsertSignal(ctx context.Context, s Signal) (string, error) {
 	if ids == nil {
 		ids = []string{}
 	}
+	createdAt := s.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO signals (
 			ticker, action, strategy, signal_price, stop_loss, take_profit,
 			confidence, size_pct, status, block_reason,
-			analysis_ids, expires_at, stale_threshold_pct, deferred
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			analysis_ids, expires_at, stale_threshold_pct, deferred,
+			pullback_strength, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		RETURNING id`,
 		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
 		ids, s.ExpiresAt, s.StalePriceMovePct, s.Deferred,
+		s.PullbackStrength, createdAt,
 	).Scan(&id)
 	return id, err
 }
@@ -77,7 +90,7 @@ func GetPendingSignals(ctx context.Context) ([]Signal, error) {
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals WHERE status IN ('pending','approved')
 		ORDER BY created_at DESC`)
 	if err != nil {
@@ -96,7 +109,7 @@ func GetDeferredSignals(ctx context.Context) ([]Signal, error) {
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals WHERE status = 'pending' AND deferred = TRUE
 		ORDER BY created_at ASC`)
 	if err != nil {
@@ -117,7 +130,7 @@ func GetSignalsByTicker(ctx context.Context, ticker string, limit int) ([]Signal
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals WHERE ticker=$1
 		ORDER BY created_at DESC LIMIT $2`, ticker, limit)
 	if err != nil {
@@ -134,7 +147,7 @@ func GetSignalByID(ctx context.Context, id string) (*Signal, error) {
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status,
 		       COALESCE(block_reason,''), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
@@ -160,7 +173,7 @@ func scanSignals(rows interface {
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.ExpiresAt, &s.StalePriceMovePct,
-			&s.CreatedAt, &s.UpdatedAt,
+			&s.PullbackStrength, &s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -176,7 +189,7 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals
 		ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
@@ -192,7 +205,7 @@ func GetRecentSignals(ctx context.Context, limit int) ([]Signal, error) {
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
-			&s.CreatedAt, &s.UpdatedAt,
+			&s.PullbackStrength, &s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -241,7 +254,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 		       COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       confidence, COALESCE(size_pct,0), status, COALESCE(block_reason,''),
 		       COALESCE(analysis_ids, '{}'), expires_at, stale_threshold_pct,
-		       created_at, updated_at
+		       pullback_strength, created_at, updated_at
 		FROM signals
 		%s
 		ORDER BY created_at DESC, id DESC
@@ -261,7 +274,7 @@ func ListSignals(ctx context.Context, opts ListSignalsOpts) ([]Signal, error) {
 			&s.StopLoss, &s.TakeProfit,
 			&s.Confidence, &s.SizePct, &s.Status,
 			&s.BlockReason, &s.AnalysisIDs, &s.ExpiresAt, &s.StalePriceMovePct,
-			&s.CreatedAt, &s.UpdatedAt,
+			&s.PullbackStrength, &s.CreatedAt, &s.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}

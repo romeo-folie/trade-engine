@@ -9,12 +9,40 @@ import (
 )
 
 // UpsertCandles bulk-inserts candles for any mix of tickers/timeframes.
-// Uses ON CONFLICT DO NOTHING — reinserting the same candle is a no-op.
+// Same-timestamp bars are refreshed because providers return the current
+// session's still-forming candle on every poll. Completed bars may also be
+// revised for corrections or corporate-action adjustments.
 // Batches into chunks of 500 rows to stay well within Postgres parameter limits.
 func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 	if len(candles) == 0 {
 		return nil
 	}
+	// PostgreSQL rejects an INSERT ... ON CONFLICT DO UPDATE statement that
+	// would affect the same target row twice. Collapse duplicate provider
+	// snapshots before batching; the newest occurrence is the one callers
+	// expect to persist.
+	type candleKey struct {
+		ticker    string
+		timeframe data.Timeframe
+		timestamp time.Time
+	}
+	unique := make([]data.Candle, 0, len(candles))
+	indexByKey := make(map[candleKey]int, len(candles))
+	for _, candle := range candles {
+		key := candleKey{
+			ticker:    candle.Ticker,
+			timeframe: candle.Timeframe,
+			timestamp: candle.Timestamp.UTC(),
+		}
+		if index, ok := indexByKey[key]; ok {
+			unique[index] = candle
+			continue
+		}
+		indexByKey[key] = len(unique)
+		unique = append(unique, candle)
+	}
+	candles = unique
+
 	const batchSize = 500
 	for i := 0; i < len(candles); i += batchSize {
 		end := i + batchSize
@@ -43,7 +71,18 @@ func upsertCandleBatch(ctx context.Context, candles []data.Candle) error {
 			c.Open, c.High, c.Low, c.Close, c.Volume, c.VWAP,
 		)
 	}
-	q += " ON CONFLICT (ticker, timeframe, ts) DO NOTHING"
+	q += ` ON CONFLICT (ticker, timeframe, ts) DO UPDATE SET
+		open=EXCLUDED.open,
+		high=EXCLUDED.high,
+		low=EXCLUDED.low,
+		close=EXCLUDED.close,
+		volume=EXCLUDED.volume,
+		vwap=EXCLUDED.vwap
+		WHERE (candles.open, candles.high, candles.low, candles.close,
+		       candles.volume, candles.vwap)
+		      IS DISTINCT FROM
+		      (EXCLUDED.open, EXCLUDED.high, EXCLUDED.low, EXCLUDED.close,
+		       EXCLUDED.volume, EXCLUDED.vwap)`
 	_, err := GetDB().Exec(ctx, q, args...)
 	return err
 }

@@ -64,3 +64,18 @@ Pass `RunOptions.NoCache = true` to bypass the cache (useful for testing prompt 
 ## Candle Coverage
 
 `LoadCandles()` uses a two-step approach: query the DB first, then backfill from the data provider only if the cached slice does not cover the full `[from, to]` window. Coverage is checked with a `2 × candleDuration(tf)` boundary tolerance to account for market holidays.
+
+For the research-defined pullback-in-strength entry, pass
+`--pullback-strength`. The runner loads a separate one-year daily warm-up for
+momentum/consolidation/AVWAP evidence, but keeps the original analyst request
+window unchanged so existing prompt-cache entries remain reusable. Eligible
+BUYs use the signal day's low as their initial stop. At the next-session open,
+replay revalidates stop width, confidence tiers, and R:R geometry, then evaluates
+the remainder of the entry candle with conservative stop-before-target ordering.
+The structural low-of-day stop takes precedence over `--stop-width-pct` when
+the pullback gate is enabled.
+A gap through the low is recorded as `gap_invalidation`; widened stops, degraded
+confidence tiers, and degraded R:R are recorded as `fill_stop_width`,
+`fill_confidence_tier`, and `fill_risk_reward`.
+Run options and entry diagnostics are persisted with `backtest_runs`, so list
+and comparison output can distinguish Phase 2 experiments from baselines.

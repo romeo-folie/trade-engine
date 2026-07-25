@@ -191,7 +191,16 @@ func upsert(ctx context.Context, date time.Time, scope, scopeKey, metric, window
 
 // runReview executes the full nightly feedback computation for all configured windows.
 func (r *Reviewer) runReview(ctx context.Context) error {
-	now := r.now().UTC()
+	// Trade closed_at values are stamped by PostgreSQL (NOW()), so the review
+	// window must use that same clock. A host-clock upper bound can sit a few
+	// milliseconds behind the database and exclude trades that were closed
+	// immediately before this review, causing an entire nightly insight window
+	// (including ORB auto-throttle) to be silently skipped.
+	var now time.Time
+	if err := r.db.QueryRow(ctx, `SELECT NOW()`).Scan(&now); err != nil {
+		return fmt.Errorf("feedback: read database review time: %w", err)
+	}
+	now = now.UTC()
 	today := now.Truncate(24 * time.Hour)
 
 	var allInsights []store.FeedbackInsight

@@ -10,13 +10,18 @@ import (
 
 // SwingCandidate is the enriched candidate passed to the LLM for scoring.
 type SwingCandidate struct {
-	Ticker     string
-	Price      float64
-	ChangePct  float64 // % price change today (from movers); 0 if from most-actives only
-	Volume     int64   // today's volume
-	TradeCount int64   // number of trades today
-	Sources    []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
-	News       []SwingNewsItem
+	Ticker       string
+	Price        float64
+	ChangePct    float64 // % price change today (from movers); 0 if from most-actives only
+	Volume       int64   // today's volume
+	TradeCount   int64   // number of trades today
+	Return1M     float64
+	Return3M     float64
+	Return6M     float64
+	MarketCapMM  float64
+	DollarVolume float64
+	Sources      []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
+	News         []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
@@ -94,6 +99,16 @@ Rules:
 	}
 	if candidate.TradeCount > 0 {
 		sb.WriteString(fmt.Sprintf("Trade count:  %d\n", candidate.TradeCount))
+	}
+	if candidate.MarketCapMM > 0 {
+		sb.WriteString(fmt.Sprintf("Market cap:   $%.1fM\n", candidate.MarketCapMM))
+	}
+	if candidate.DollarVolume > 0 {
+		sb.WriteString(fmt.Sprintf("Dollar vol:   $%.0f\n", candidate.DollarVolume))
+	}
+	if candidate.Return1M != 0 || candidate.Return3M != 0 || candidate.Return6M != 0 {
+		sb.WriteString(fmt.Sprintf("Momentum:     1m %+.1f%% · 3m %+.1f%% · 6m %+.1f%%\n",
+			candidate.Return1M, candidate.Return3M, candidate.Return6M))
 	}
 	sb.WriteString(fmt.Sprintf("Surfaced by:  %s\n", strings.Join(candidate.Sources, ", ")))
 	if candidate.GraphContext != "" {

@@ -23,6 +23,9 @@ func TestAlpacaFetchCandles_Success(t *testing.T) {
 		if r.Header.Get("APCA-API-KEY-ID") != "test-key" {
 			t.Errorf("missing or wrong API key header")
 		}
+		if got := r.URL.Query().Get("adjustment"); got != "split" {
+			t.Errorf("adjustment = %q, want split", got)
+		}
 		resp := alpacaBarsResponse{
 			Symbol: "AAPL",
 			Bars: []alpacaBar{
@@ -138,6 +141,9 @@ func TestAlpacaFetchHistory_Success(t *testing.T) {
 		if limit != "10" {
 			t.Errorf("expected limit=10, got %s", limit)
 		}
+		if got := r.URL.Query().Get("adjustment"); got != "split" {
+			t.Errorf("adjustment = %q, want split", got)
+		}
 		resp := alpacaBarsResponse{
 			Symbol: "TSLA",
 			Bars: []alpacaBar{
@@ -199,6 +205,50 @@ func TestAlpacaFetchQuote_Success(t *testing.T) {
 	}
 	if quote.Bid != 184.50 {
 		t.Errorf("expected bid 184.50, got %f", quote.Bid)
+	}
+}
+
+func TestAlpacaFetchTradesUsesExactBoundsAndPaginates(t *testing.T) {
+	from := time.Date(2026, 7, 25, 14, 0, 30, 123000000, time.UTC)
+	to := from.Add(2 * time.Minute)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/v2/stocks/AAPL/trades" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("start") != from.Format(time.RFC3339Nano) ||
+			r.URL.Query().Get("end") != to.Format(time.RFC3339Nano) {
+			t.Errorf("bounds = %q..%q", r.URL.Query().Get("start"), r.URL.Query().Get("end"))
+		}
+		if r.URL.Query().Get("feed") != "iex" ||
+			r.URL.Query().Get("limit") != "10000" ||
+			r.URL.Query().Get("sort") != "asc" {
+			t.Errorf("query = %v", r.URL.Query())
+		}
+		payload := alpacaTradesResponse{
+			Symbol: "AAPL",
+			Trades: []alpacaTrade{{
+				Timestamp: from.Add(time.Second).Format(time.RFC3339Nano),
+				Price:     99, Size: 10,
+			}},
+		}
+		if requests == 1 {
+			payload.NextPageToken = "next"
+		} else if r.URL.Query().Get("page_token") != "next" {
+			t.Errorf("page token = %q", r.URL.Query().Get("page_token"))
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	defer srv.Close()
+
+	client := newTestAlpacaClient(srv.URL)
+	trades, err := client.FetchTrades(context.Background(), "AAPL", from, to)
+	if err != nil {
+		t.Fatalf("FetchTrades: %v", err)
+	}
+	if requests != 2 || len(trades) != 2 || trades[0].Price != 99 {
+		t.Fatalf("requests=%d trades=%+v", requests, trades)
 	}
 }
 

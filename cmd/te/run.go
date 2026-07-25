@@ -857,11 +857,16 @@ Modes:
 			} else {
 				scanAnalyzer := analysis.NewAnalyzer(cfg.Models, eng.Bus())
 				mscanner := &scanner.MarketScanner{
-					AlpacaClient: alpacaClient,
-					Analyzer:     scanAnalyzer,
-					News:         newsProvider,
-					Bus:          eng.Bus(),
-					Cfg:          cfg.Scanner,
+					AlpacaClient:                 alpacaClient,
+					Analyzer:                     scanAnalyzer,
+					News:                         newsProvider,
+					Bus:                          eng.Bus(),
+					Cfg:                          cfg.Scanner,
+					PullbackUniverseEnabled:      cfg.Risk.EntryGates.PullbackStrengthEnabled,
+					PullbackMinMomentumReturnPct: cfg.Risk.EntryGates.PullbackMinMomentumReturnPct,
+				}
+				if fh, ok := newsProvider.(*data.FinnhubClient); ok {
+					mscanner.Fundamentals = fh
 				}
 				if tgBot != nil {
 					mscanner.Notifier = tgBot

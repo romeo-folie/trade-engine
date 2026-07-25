@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -31,12 +33,13 @@ var (
 
 	// Exit-policy research knobs (exit-policy-study). Defaults reproduce the
 	// original baseline exit behavior.
-	btExitMode       string
-	btTrailRule      string
-	btTrailATRMult   float64
-	btTrailEMAPeriod int
-	btExitConfMin    float64
-	btStopWidthPct   float64
+	btExitMode         string
+	btTrailRule        string
+	btTrailATRMult     float64
+	btTrailEMAPeriod   int
+	btExitConfMin      float64
+	btStopWidthPct     float64
+	btPullbackStrength bool
 )
 
 // ── Command tree ──────────────────────────────────────────────────────────────
@@ -59,7 +62,8 @@ func init() {
 	runBTCmd.Flags().Float64Var(&btTrailATRMult, "trail-atr-mult", 1.5, "ATR multiple for the trailing stop (matches live trailing_stop)")
 	runBTCmd.Flags().IntVar(&btTrailEMAPeriod, "trail-ema-period", 9, "EMA period for the close-below-EMA trailing rule")
 	runBTCmd.Flags().Float64Var(&btExitConfMin, "exit-conf-min", 0, "Require SELL confidence ≥ this to exit on signal (0 = ungated)")
-	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override initial stop to entry×(1-pct/100) (0 = use model stop)")
+	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override non-pullback stop to entry×(1-pct/100) (ignored with --pullback-strength)")
+	runBTCmd.Flags().BoolVar(&btPullbackStrength, "pullback-strength", false, "Require the complete Phase 2 momentum/consolidation/AVWAP flush-reclaim entry and use its low-of-day stop")
 	_ = runBTCmd.MarkFlagRequired("ticker")
 	_ = runBTCmd.MarkFlagRequired("from")
 	_ = runBTCmd.MarkFlagRequired("to")
@@ -127,12 +131,13 @@ var runBTCmd = &cobra.Command{
 			Model:     btModel,
 			NoCache:   btNoCache,
 
-			ExitMode:       btExitMode,
-			TrailRule:      btTrailRule,
-			TrailATRMult:   btTrailATRMult,
-			TrailEMAPeriod: btTrailEMAPeriod,
-			ExitConfMin:    btExitConfMin,
-			StopWidthPct:   btStopWidthPct,
+			ExitMode:         btExitMode,
+			TrailRule:        btTrailRule,
+			TrailATRMult:     btTrailATRMult,
+			TrailEMAPeriod:   btTrailEMAPeriod,
+			ExitConfMin:      btExitConfMin,
+			StopWidthPct:     btStopWidthPct,
+			PullbackStrength: btPullbackStrength,
 		}
 
 		fmt.Printf("Backtesting %s · %s · %s → %s\n",
@@ -186,15 +191,17 @@ var listBTCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-10s %-8s %-14s %-10s %-10s %8s %8s %8s\n",
-			"Label", "Ticker", "Strategy", "From", "To", "Return%", "Sharpe", "MaxDD%")
-		fmt.Println(strings.Repeat("─", 80))
+		fmt.Printf("%-10s %-8s %-14s %-22s %-10s %-10s %8s %8s %8s\n",
+			"Label", "Ticker", "Strategy", "Policy", "From", "To", "Return%", "Sharpe", "MaxDD%")
+		fmt.Println(strings.Repeat("─", 104))
 		for _, r := range runs {
 			ret := fmtPct(r.TotalReturnPct)
 			sharpe := fmtF(r.SharpeRatio)
 			dd := fmtPct(r.MaxDrawdownPct)
-			fmt.Printf("%-10s %-8s %-14s %-10s %-10s %8s %8s %8s\n",
+			policy := exitPolicyDesc(persistedRunOptions(&r))
+			fmt.Printf("%-10s %-8s %-14s %-22s %-10s %-10s %8s %8s %8s\n",
 				r.Label, r.Ticker, truncate(r.Strategy, 14),
+				truncate(policy, 22),
 				r.FromDate.Format("2006-01-02"), r.ToDate.Format("2006-01-02"),
 				ret, sharpe, dd,
 			)
@@ -206,8 +213,8 @@ var listBTCmd = &cobra.Command{
 // ── te backtest compare ───────────────────────────────────────────────────────
 
 var compareBTCmd = &cobra.Command{
-	Use:   "compare",
-	Short: "Compare two or more backtest runs side-by-side",
+	Use:     "compare",
+	Short:   "Compare two or more backtest runs side-by-side",
 	Example: `  te backtest compare --id BT-00001 --id BT-00002`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(btCompareID) < 2 {
@@ -263,6 +270,21 @@ func printMetrics(r *backtest.RunResult) {
 		r.Options.From.Format("2006-01-02"), r.Options.To.Format("2006-01-02"))
 	fmt.Printf("  Exit:       %s\n", exitPolicyDesc(r.Options))
 	fmt.Printf("  Cache:      %d hits / %d misses (%.0f%%)\n\n", hits, misses, hitPct)
+	if r.Options.PullbackStrength {
+		fmt.Println("  Pullback Entry Qualification")
+		fmt.Println("  ───────────────────────────────────")
+		printRow("Analyst BUY candidates", fmt.Sprintf("%d", r.EntryCandidates))
+		printRow("Qualified setups", fmt.Sprintf("%d", r.EntryQualified))
+		keys := make([]string, 0, len(r.EntryBlocks))
+		for key := range r.EntryBlocks {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			printRow("Blocked: "+key, fmt.Sprintf("%d", r.EntryBlocks[key]))
+		}
+		fmt.Println()
+	}
 
 	fmt.Println("  Performance")
 	fmt.Println("  ───────────────────────────────────")
@@ -332,8 +354,11 @@ func exitPolicyDesc(o backtest.RunOptions) string {
 	if o.ExitConfMin > 0 {
 		s += fmt.Sprintf(" · exit-conf>=%.2f", o.ExitConfMin)
 	}
-	if o.StopWidthPct > 0 {
+	if o.StopWidthPct > 0 && !o.PullbackStrength {
 		s += fmt.Sprintf(" · stop=%.1f%%", o.StopWidthPct)
+	}
+	if o.PullbackStrength {
+		s += " · pullback-strength · stop=low-of-day"
 	}
 	return s
 }
@@ -361,6 +386,10 @@ func printComparison(runs []*store.BacktestRun) {
 		{"Ticker", nil},
 		{"Period", nil},
 		{"Strategy", nil},
+		{"Policy", nil},
+		{"Entry Candidates", nil},
+		{"Entry Qualified", nil},
+		{"Gap Invalidations", nil},
 		{"Total Return %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.TotalReturnPct })},
 		{"Annualised Return %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.AnnualizedReturnPct })},
 		{"Max Drawdown %", ptrSlice(runs, func(r *store.BacktestRun) *float64 { return r.MaxDrawdownPct })},
@@ -385,6 +414,14 @@ func printComparison(runs []*store.BacktestRun) {
 				cell = r.FromDate.Format("2006-01-02") + "…"
 			case "Strategy":
 				cell = truncate(r.Strategy, colW)
+			case "Policy":
+				cell = exitPolicyDesc(persistedRunOptions(r))
+			case "Entry Candidates":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Candidates)
+			case "Entry Qualified":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Qualified)
+			case "Gap Invalidations":
+				cell = fmt.Sprintf("%d", persistedEntryDiagnostics(r).Blocks["gap_invalidation"])
 			case "Total Trades":
 				cell = fmt.Sprintf("%d", r.TotalTrades)
 			default:
@@ -434,4 +471,19 @@ func ptrSlice(runs []*store.BacktestRun, fn func(*store.BacktestRun) *float64) [
 		out[i] = fn(r)
 	}
 	return out
+}
+
+func persistedRunOptions(run *store.BacktestRun) backtest.RunOptions {
+	var opts backtest.RunOptions
+	_ = json.Unmarshal(run.RunOptions, &opts)
+	return opts
+}
+
+func persistedEntryDiagnostics(run *store.BacktestRun) backtest.EntryDiagnostics {
+	var diagnostics backtest.EntryDiagnostics
+	_ = json.Unmarshal(run.EntryDiagnostics, &diagnostics)
+	if diagnostics.Blocks == nil {
+		diagnostics.Blocks = map[string]int{}
+	}
+	return diagnostics
 }

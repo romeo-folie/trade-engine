@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,14 +30,49 @@ func testAnalysisResp(action analysis.Action) analysis.AnalysisResponse {
 // testModelMeta returns a minimal ModelCallMeta.
 func testModelMeta() analysis.ModelCallMeta {
 	return analysis.ModelCallMeta{
-		Provider:    "anthropic",
-		Model:       "claude-test",
-		PromptHash:  "abc123",
-		RawPrompt:   "test prompt",
-		RawResponse: `{"action":"BUY"}`,
-		InputTokens: 100,
+		Provider:     "anthropic",
+		Model:        "claude-test",
+		PromptHash:   "abc123",
+		RawPrompt:    "test prompt",
+		RawResponse:  `{"action":"BUY"}`,
+		InputTokens:  100,
 		OutputTokens: 50,
-		LatencyMs:   200,
+		LatencyMs:    200,
+	}
+}
+
+func TestCandles_UpsertRefreshesSameTimestampBar(t *testing.T) {
+	ctx := context.Background()
+	ts := time.Date(2026, time.July, 25, 13, 0, 0, 0, time.UTC)
+	first := data.Candle{
+		Ticker: "TEST_CANDLE_REFRESH", Timeframe: data.Timeframe1Day,
+		Timestamp: ts, Open: 100, High: 101, Low: 99, Close: 100,
+		Volume: 1000, VWAP: 100,
+	}
+	revised := data.Candle{
+		Ticker: "TEST_CANDLE_REFRESH", Timeframe: data.Timeframe1Day,
+		Timestamp: ts, Open: 100, High: 105, Low: 98, Close: 104,
+		Volume: 2500, VWAP: 102.5,
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{first}); err != nil {
+		t.Fatalf("first UpsertCandles: %v", err)
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{first, revised}); err != nil {
+		t.Fatalf("revised UpsertCandles: %v", err)
+	}
+	got, err := store.GetCandles(
+		ctx, revised.Ticker, revised.Timeframe, ts, ts,
+	)
+	if err != nil {
+		t.Fatalf("GetCandles: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("candles = %d, want 1", len(got))
+	}
+	if got[0].Open != revised.Open || got[0].High != revised.High ||
+		got[0].Low != revised.Low || got[0].Close != revised.Close ||
+		got[0].Volume != revised.Volume || got[0].VWAP != revised.VWAP {
+		t.Fatalf("stored candle = %+v, want revised %+v", got[0], revised)
 	}
 }
 
@@ -181,19 +217,45 @@ func TestAnalysis_GetModelPerformance(t *testing.T) {
 
 // ─── Backtests ────────────────────────────────────────────────────────────────
 
+func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	observedAt := time.Now().Add(-5 * time.Minute).Truncate(time.Microsecond)
+	id, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "TEST_PB", Action: "BUY", Strategy: "momentum",
+		SignalPrice: 100, StopLoss: 98, Confidence: 0.8, SizePct: 1,
+		Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
+		StalePriceMovePct: 2, PullbackStrength: true, CreatedAt: observedAt,
+	})
+	if err != nil {
+		t.Fatalf("InsertSignal: %v", err)
+	}
+	got, err := store.GetSignalByID(ctx, id)
+	if err != nil || got == nil {
+		t.Fatalf("GetSignalByID: %v", err)
+	}
+	if !got.PullbackStrength {
+		t.Fatal("pullback-strength execution marker was not persisted")
+	}
+	if !got.CreatedAt.Equal(observedAt) {
+		t.Fatalf("pullback observation boundary = %s, want %s", got.CreatedAt, observedAt)
+	}
+}
+
 func TestBacktest_FullLifecycle(t *testing.T) {
 	ctx := context.Background()
 
 	label := "INTG-BACKTEST-" + time.Now().Format("150405")
 	run := store.BacktestRun{
-		Label:          label,
-		Ticker:         "TEST_BT_SPY",
-		Strategy:       "momentum",
-		ModelProvider:  "anthropic",
-		ModelName:      "claude-test",
-		FromDate:       time.Now().Add(-30 * 24 * time.Hour),
-		ToDate:         time.Now(),
-		ConfigSnapshot: json.RawMessage(`{}`),
+		Label:            label,
+		Ticker:           "TEST_BT_SPY",
+		Strategy:         "momentum",
+		ModelProvider:    "anthropic",
+		ModelName:        "claude-test",
+		FromDate:         time.Now().Add(-30 * 24 * time.Hour),
+		ToDate:           time.Now(),
+		ConfigSnapshot:   json.RawMessage(`{}`),
+		RunOptions:       json.RawMessage(`{"pullback_strength":true}`),
+		EntryDiagnostics: json.RawMessage(`{"candidates":3,"qualified":1,"blocks":{"gap_invalidation":1}}`),
 	}
 
 	runLabel, err := store.InsertRun(ctx, run)
@@ -213,6 +275,11 @@ func TestBacktest_FullLifecycle(t *testing.T) {
 	}
 	if got.Ticker != "TEST_BT_SPY" {
 		t.Errorf("Ticker: got %q, want TEST_BT_SPY", got.Ticker)
+	}
+	if !strings.Contains(string(got.RunOptions), "pullback_strength") ||
+		!strings.Contains(string(got.EntryDiagnostics), "gap_invalidation") {
+		t.Errorf("replay metadata not persisted: options=%s diagnostics=%s",
+			got.RunOptions, got.EntryDiagnostics)
 	}
 
 	// Insert a trade for this run.

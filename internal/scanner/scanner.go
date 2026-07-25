@@ -38,7 +38,15 @@ const (
 	sentimentPositiveThreshold = 0.3
 	sentimentNegativeThreshold = -0.3
 	maxNewsPerTicker           = 5
+	pullbackMinMarketCapMM     = 100.0
+	pullbackMinDollarVolume    = 1_000_000.0
 )
+
+// CompanyFundamentalsProvider supplies the free profile data needed by the
+// research universe's market-cap floor.
+type CompanyFundamentalsProvider interface {
+	FetchCompanyFundamentals(ctx context.Context, ticker string) (data.CompanyFundamentals, error)
+}
 
 // Notifier is satisfied by notify.TelegramBot (and any test double).
 type Notifier interface {
@@ -51,10 +59,18 @@ type MarketScanner struct {
 	AlpacaClient *data.AlpacaClient
 	Analyzer     *analysis.Analyzer
 	News         data.NewsProvider
+	Fundamentals CompanyFundamentalsProvider
 	Notifier     Notifier // optional — nil disables Telegram notifications
 	Bus          bus
 	Cfg          config.ScannerConfig
 	Now          func() time.Time // injectable for tests; defaults to time.Now
+	// PullbackUniverseEnabled applies the research universe before LLM scoring:
+	// >$100M market cap, >$1M dollar volume, >=30% on a 1/3/6-month horizon,
+	// then retain the top momentum quartile.
+	PullbackUniverseEnabled bool
+	// PullbackMinMomentumReturnPct mirrors the entry-gate threshold so universe
+	// ranking and execution eligibility cannot diverge. Zero resolves to 30%.
+	PullbackMinMomentumReturnPct float64
 
 	// sympathyFired tracks (seed, neighbour) pairs already surfaced by
 	// news-sympathy sourcing, pruned after the configured cooldown so one
@@ -146,7 +162,19 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return nil
 	}
 
-	// 3. Dedup against existing active watchlist to avoid re-scoring known tickers.
+	// 3. Rank the complete pullback universe before removing active names.
+	// Otherwise every later scan promotes the next-best quartile after the
+	// current winners have been filtered out, eventually admitting names that
+	// were never in the full universe's top quartile.
+	if s.PullbackUniverseEnabled {
+		candidates = s.qualifyPullbackUniverse(ctx, candidates)
+		if len(candidates) == 0 {
+			slog.Info("scanner: no candidates passed pullback-strength universe")
+			return nil
+		}
+	}
+
+	// 3.5 Dedup against the active watchlist only after universe selection.
 	candidates, err = s.filterExistingWatchlist(ctx, candidates)
 	if err != nil {
 		return fmt.Errorf("filter watchlist: %w", err)
@@ -349,13 +377,112 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 		existing[item.Ticker] = struct{}{}
 	}
 
-	var filtered []SwingCandidate
-	for _, c := range candidates {
-		if _, found := existing[c.Ticker]; !found {
-			filtered = append(filtered, c)
+	return filterActiveCandidates(candidates, existing), nil
+}
+
+func filterActiveCandidates(
+	candidates []SwingCandidate, existing map[string]struct{},
+) []SwingCandidate {
+	filtered := make([]SwingCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, found := existing[candidate.Ticker]; !found {
+			filtered = append(filtered, candidate)
 		}
 	}
-	return filtered, nil
+	return filtered
+}
+
+// qualifyPullbackUniverse applies the study's objective liquidity/strength
+// screen and retains the top quartile by equal-weighted 1/3/6-month return.
+// Missing fundamentals or history fail closed because this screen defines the
+// strategy universe.
+func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates []SwingCandidate) []SwingCandidate {
+	if s.AlpacaClient == nil || s.Fundamentals == nil {
+		slog.Warn("scanner: pullback universe unavailable — market data or fundamentals provider missing")
+		return nil
+	}
+	qualified := make([]SwingCandidate, 0, len(candidates))
+	minMomentumReturn := s.PullbackMinMomentumReturnPct
+	if minMomentumReturn <= 0 {
+		minMomentumReturn = 30
+	}
+	for _, candidate := range candidates {
+		if ctx.Err() != nil {
+			break
+		}
+		history, err := s.AlpacaClient.FetchHistory(ctx, candidate.Ticker, data.Timeframe1Day, 130)
+		if err != nil || len(history) < 127 {
+			slog.Warn("scanner: pullback universe history unavailable", "ticker", candidate.Ticker, "err", err)
+			continue
+		}
+		fundamentals, err := s.Fundamentals.FetchCompanyFundamentals(ctx, candidate.Ticker)
+		if err != nil || fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
+			continue
+		}
+		price := candidate.Price
+		if price <= 0 {
+			price = history[len(history)-1].Close
+		}
+		volume := candidate.Volume
+		if volume <= 0 {
+			volume = history[len(history)-1].Volume
+		}
+		dollarVolume := price * float64(volume)
+		if dollarVolume < pullbackMinDollarVolume {
+			continue
+		}
+		candidate.Price = price
+		candidate.Volume = volume
+		candidate.MarketCapMM = fundamentals.MarketCapitalization
+		candidate.DollarVolume = dollarVolume
+		candidate.Return1M = scannerHorizonReturn(price, history, 21)
+		candidate.Return3M = scannerHorizonReturn(price, history, 63)
+		candidate.Return6M = scannerHorizonReturn(price, history, 126)
+		if maxScannerReturn(candidate) < minMomentumReturn {
+			continue
+		}
+		qualified = append(qualified, candidate)
+	}
+	for i := 1; i < len(qualified); i++ {
+		for j := i; j > 0 && momentumComposite(qualified[j]) > momentumComposite(qualified[j-1]); j-- {
+			qualified[j], qualified[j-1] = qualified[j-1], qualified[j]
+		}
+	}
+	keep := (len(qualified) + 3) / 4
+	if keep < len(qualified) {
+		qualified = qualified[:keep]
+	}
+	slog.Info("scanner: pullback universe qualified",
+		"input", len(candidates), "qualified_top_quartile", len(qualified))
+	return qualified
+}
+
+func scannerHorizonReturn(price float64, history []data.Candle, sessions int) float64 {
+	// FetchHistory includes the current daily bar, so a 21-session return uses
+	// index len-1-21 (not len-21, which would be only 20 intervals).
+	if len(history) <= sessions {
+		return -100
+	}
+	base := history[len(history)-1-sessions].Close
+	if price <= 0 || base <= 0 {
+		return -100
+	}
+	return (price/base - 1) * 100
+}
+
+func maxScannerReturn(c SwingCandidate) float64 {
+	v := c.Return1M
+	if c.Return3M > v {
+		v = c.Return3M
+	}
+	if c.Return6M > v {
+		v = c.Return6M
+	}
+	return v
+}
+
+func momentumComposite(c SwingCandidate) float64 {
+	return (c.Return1M + c.Return3M + c.Return6M) / 3
 }
 
 // enrichWithNews fetches news for each candidate and attaches it.
