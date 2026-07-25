@@ -57,18 +57,66 @@ func (liveStore) OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]st
 	return store.OpenExitLegsForTrade(ctx, tradeID)
 }
 
+func (liveStore) ClaimTradeExit(ctx context.Context, id string) (bool, error) {
+	if !store.IsConnected() {
+		return false, errStoreNotConnected
+	}
+	return store.ClaimTradeExit(ctx, id)
+}
+
+func (liveStore) ReleaseTradeExitClaim(ctx context.Context, id string) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.ReleaseTradeExitClaim(ctx, id)
+}
+
 func (liveStore) InsertOrder(ctx context.Context, o store.Order) (string, error) {
 	if !store.IsConnected() {
 		return "", errStoreNotConnected
 	}
-	return store.InsertOrder(ctx, o)
+	return store.InsertOrderWithRetry(ctx, o)
 }
 
-func (liveStore) UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+func (liveStore) UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected
 	}
-	return store.UpdateOrderStopPriceAndID(ctx, orderID, newBrokerOrderID, newStopPrice)
+	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
+}
+
+func (liveStore) ApplyPartialExit(
+	ctx context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (float64, float64, error) {
+	if !store.IsConnected() {
+		return 0, 0, errStoreNotConnected
+	}
+	return store.ApplyPartialExit(
+		ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status,
+	)
+}
+
+func (liveStore) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
+}
+
+func (liveStore) UpdateOrderStopPriceAndID(
+	ctx context.Context,
+	orderID, newBrokerOrderID string,
+	newStopPrice, newQuantity float64,
+) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.UpdateOrderStopPriceAndID(
+		ctx, orderID, newBrokerOrderID, newStopPrice, newQuantity,
+	)
 }
 
 func (liveStore) CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {

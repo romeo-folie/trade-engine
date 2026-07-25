@@ -1399,10 +1399,21 @@ type RiskConfig struct {
 	StalePriceMovePct    float64 `yaml:"stale_price_move_pct"`
 
 	// TrailingStop configures the server-side trailing stop manager (#322).
-	// When Enabled, a goroutine periodically recomputes per-trade trailing
-	// stops via `new_stop = max(current_stop, hwm - atr_multiple * ATR)` and
-	// submits/replaces a broker STOP order. Disabled by default.
+	// When Enabled, a goroutine manages broker-resident protective stops and
+	// applies the selected ATR or daily-close EMA9 exit rule. Disabled by
+	// default.
 	TrailingStop TrailingStopConfig `yaml:"trailing_stop"`
+
+	// UncapTakeProfit removes the fixed take-profit from stock-path long
+	// entries when the trailing-stop manager is enabled. The initial hard
+	// stop remains active; the selected trailing rule owns the winning exit.
+	// Default false preserves the existing bracket/software TP behavior.
+	UncapTakeProfit bool `yaml:"uncap_take_profit"`
+
+	// ExitConfMin is the minimum confidence required for an analyst SELL to
+	// close an existing stock-path long. Zero preserves the current ungated
+	// behavior. Protective and trailing stops are not subject to this gate.
+	ExitConfMin float64 `yaml:"exit_conf_min"`
 
 	// BracketExitsEnabled submits stock-path BUY entries as broker bracket
 	// orders (GTC, whole shares): the take-profit and stop-loss live at the
@@ -1450,12 +1461,15 @@ type EntryGatesConfig struct {
 }
 
 // TrailingStopConfig governs the server-side trailing stop manager (#322).
-// ATRMultiple is a unitless coefficient applied to absolute-price ATR; the
-// trailing stop is `high_water_mark - ATRMultiple * ATR`. With a default of
-// 1.5 a $50 stock with ATR=$1 trails at $48.50 from each new high-water mark.
-// IntervalSec defaults to 60s when zero. ATRPeriod defaults to 14 (Wilder).
+// Rule is "atr" (the existing hourly ATR ratchet) or "ema9" (exit when the
+// latest daily candle closes below its daily 9-EMA). The zero value defaults
+// to "atr" for backward compatibility. ATRMultiple is a unitless coefficient
+// applied to absolute-price ATR; the trailing stop is
+// `high_water_mark - ATRMultiple * ATR`. IntervalSec defaults to 60s when
+// zero. ATRPeriod defaults to 14 (Wilder).
 type TrailingStopConfig struct {
 	Enabled     bool    `yaml:"enabled"`
+	Rule        string  `yaml:"rule"`
 	ATRMultiple float64 `yaml:"atr_multiple"`
 	IntervalSec int     `yaml:"interval_sec"`
 	ATRPeriod   int     `yaml:"atr_period"`
@@ -1889,6 +1903,14 @@ func Validate(cfg *Config) []string {
 	}
 	if cfg.Logging.MaxAgeDays < 0 {
 		errs = append(errs, fmt.Sprintf("logging.max_age_days must be >= 0, got %d", cfg.Logging.MaxAgeDays))
+	}
+
+	trailingRule := strings.ToLower(strings.TrimSpace(cfg.Risk.TrailingStop.Rule))
+	if trailingRule != "" && trailingRule != "atr" && trailingRule != "ema9" {
+		errs = append(errs, fmt.Sprintf("risk.trailing_stop.rule must be one of atr|ema9, got %q", cfg.Risk.TrailingStop.Rule))
+	}
+	if cfg.Risk.ExitConfMin < 0 || cfg.Risk.ExitConfMin > 1 {
+		errs = append(errs, fmt.Sprintf("risk.exit_conf_min must be within [0,1], got %.4f", cfg.Risk.ExitConfMin))
 	}
 
 	// Validate cost budgets. Guardrail.Check gates on budget > 0, so negative

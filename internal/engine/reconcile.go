@@ -38,7 +38,7 @@ type reconcilerStore interface {
 type storeAdapter struct{}
 
 func (storeAdapter) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
-	return store.GetOpenTrades(ctx)
+	return store.GetOwnedPositionTrades(ctx)
 }
 
 // signedBrokerQty returns the broker quantity with the sign implied by the

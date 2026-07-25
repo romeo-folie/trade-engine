@@ -200,6 +200,9 @@ func Defaults() *Config {
 			DefaultTakeProfitPct: 4.0,
 			SignalExpiryMin:      120,
 			StalePriceMovePct:    2.0,
+			TrailingStop: TrailingStopConfig{
+				Rule: "atr",
+			},
 		},
 		Notifications: NotificationsConfig{
 			Telegram: TelegramConfig{

@@ -1,0 +1,3 @@
+ALTER TABLE orders
+    ADD COLUMN IF NOT EXISTS exit_fill_applied_qty NUMERIC(20,8)
+    NOT NULL DEFAULT 0;

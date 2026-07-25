@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -55,6 +56,41 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 	return id, err
 }
 
+// InsertOrderWithRetry closes the small but safety-critical window after a
+// broker accepts an exit and before its identity is durable. The same broker
+// ID makes retries idempotent at the lifecycle level; callers keep the trade
+// claimed if all attempts fail.
+func InsertOrderWithRetry(ctx context.Context, o Order) (string, error) {
+	var id string
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		id, err = InsertOrder(ctx, o)
+		if err == nil {
+			return id, nil
+		}
+		if o.BrokerOrderID != "" {
+			lookupErr := GetDB().QueryRow(ctx, `
+				SELECT id FROM orders
+				WHERE broker_order_id=$1
+				  AND COALESCE(trade_id::text,'')=$2
+				ORDER BY created_at DESC LIMIT 1`,
+				o.BrokerOrderID, o.TradeID,
+			).Scan(&id)
+			if lookupErr == nil {
+				return id, nil
+			}
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	return "", err
+}
+
 // UpdateOrderFill sets filled_price, filled_qty, and status after a fill event.
 func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty float64, status string) error {
 	_, err := GetDB().Exec(ctx, `
@@ -62,6 +98,66 @@ func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty floa
 		WHERE id=$4`,
 		filledPrice, filledQty, status, id)
 	return err
+}
+
+// ApplyPartialExit atomically advances an order's cumulative fill and reduces
+// its trade by only the newly observed shares. Replaying the same broker
+// result is a no-op, which keeps cancellation-race recovery safe across
+// process restarts and failures between otherwise separate writes.
+func ApplyPartialExit(
+	ctx context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (remaining, applied float64, err error) {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var recorded, appliedAlready, orderQuantity float64
+	if err = tx.QueryRow(ctx, `
+		SELECT COALESCE(filled_qty,0), COALESCE(exit_fill_applied_qty,0),
+		       quantity
+		FROM orders
+		WHERE id=$1
+		FOR UPDATE`, orderID).Scan(
+		&recorded, &appliedAlready, &orderQuantity,
+	); err != nil {
+		return 0, 0, err
+	}
+	targetFill := math.Max(appliedAlready, math.Max(recorded, cumulativeFilledQty))
+	if orderQuantity > 0 {
+		// Broker responses for aggregate orders carry the aggregate fill on
+		// every lookup. A per-lot row can never own more than its assigned
+		// quantity, even if a caller accidentally forwards that aggregate.
+		targetFill = math.Min(targetFill, math.Max(orderQuantity, appliedAlready))
+	}
+	applied = math.Max(0, targetFill-appliedAlready)
+
+	if _, err = tx.Exec(ctx, `
+		UPDATE orders
+		SET filled_price=$1, filled_qty=$2, status=$3,
+		    exit_fill_applied_qty=$2, updated_at=NOW()
+		WHERE id=$4`,
+		filledPrice, targetFill, status, orderID,
+	); err != nil {
+		return 0, 0, err
+	}
+	if err = tx.QueryRow(ctx, `
+		UPDATE trades
+		SET quantity=GREATEST(0, quantity-$1)
+		WHERE id=$2 AND status IN ('open','exiting')
+		RETURNING quantity`,
+		applied, tradeID,
+	).Scan(&remaining); err != nil {
+		return 0, 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return remaining, applied, nil
 }
 
 // GetOrdersByTrade retrieves all orders linked to a trade UUID.

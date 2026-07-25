@@ -1,9 +1,12 @@
 // Package trailing implements a server-side trailing stop manager (#322).
 //
-// On each tick the manager iterates open long stock trades, recomputes the
-// trailing stop using the formula:
+// On each tick the manager iterates open long stock trades and applies one
+// of two rules:
 //
-//	new_stop = max(current_stop, high_water_mark − atr_multiple × ATR)
+//   - atr: ratchet a broker stop using
+//     new_stop = max(current_stop, high_water_mark − atr_multiple × ATR)
+//   - ema9: retain the original broker hard stop and exit at market when the
+//     latest daily candle closes below its daily 9-EMA
 //
 // where ATR is the absolute-price Average True Range (same units as
 // high_water_mark) and atr_multiple is a unitless coefficient (default 1.5).
@@ -38,6 +41,9 @@ import (
 )
 
 const (
+	RuleATR  = "atr"
+	RuleEMA9 = "ema9"
+
 	// DefaultATRMultiple is the unitless coefficient applied to absolute-price
 	// ATR to derive the trailing band. 1.5 is the recommended default per the
 	// task spec — small enough to lock in gains, wide enough to ride normal
@@ -51,11 +57,27 @@ const (
 	// DefaultATRPeriod is Wilder's standard ATR lookback.
 	DefaultATRPeriod = 14
 
+	// EMAPeriod is the daily close EMA used by the evidence-backed exit-policy
+	// study. It is deliberately fixed so "ema9" has one stable meaning across
+	// backtest and live execution.
+	EMAPeriod = 9
+
 	// candleHistory is the number of 1h candles fetched per tick to compute
 	// ATR. Wilder's ATR is path-dependent; period+1 is the strict minimum but
 	// in practice 30+ stabilises the smoothing.
 	candleHistory = 50
 )
+
+var errStopFilledDuringRollback = errors.New("stop filled before rollback completed")
+var errExitClaimMustRemain = errors.New("partial broker exit is durable; exit claim must remain")
+
+var newYorkLocation = func() *time.Location {
+	loc, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.UTC
+	}
+	return loc
+}()
 
 // ComputeNewStop applies the trailing-stop formula. The clamp guarantees the
 // stop ratchets upward only — even if a transient ATR spike or stale price
@@ -95,8 +117,13 @@ type TradeStore interface {
 	// hold the trade's shares — ALL of them must be cancelled before a market
 	// exit or the broker rejects the sell for insufficient free quantity.
 	OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]store.Order, error)
+	ClaimTradeExit(ctx context.Context, id string) (bool, error)
+	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
-	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error
+	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
+	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
+	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
+	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
 	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
 	// + closed_at. Called after a successful trail-driven market exit so the
 	// trade isn't picked up again on the next tick (which would place a
@@ -108,14 +135,26 @@ type TradeStore interface {
 // Config controls the trailing-stop manager.
 type Config struct {
 	Enabled     bool
+	Rule        string
 	ATRMultiple float64
 	Interval    time.Duration
 	ATRPeriod   int
+	// MarketOpen is the production market-calendar predicate. The command
+	// wiring supplies engine.IsMarketOpen (including exchange holidays);
+	// tests and other callers fall back to regular weekday session hours.
+	MarketOpen func(time.Time) bool
+	// RecordLoss updates engine-level cooldown state after a trailing exit
+	// realizes a loss. It is optional for standalone/tests callers.
+	RecordLoss func()
 }
 
 // Normalize fills in defaults so callers can hand the manager a partially
 // configured Config and still get sensible behaviour.
 func (c Config) Normalize() Config {
+	c.Rule = strings.ToLower(strings.TrimSpace(c.Rule))
+	if c.Rule == "" {
+		c.Rule = RuleATR
+	}
 	if c.ATRMultiple <= 0 {
 		c.ATRMultiple = DefaultATRMultiple
 	}
@@ -130,19 +169,28 @@ func (c Config) Normalize() Config {
 
 // Manager runs the trailing stop loop.
 type Manager struct {
-	cfg    Config
-	store  TradeStore
-	prices PriceFetcher
-	exec   execution.Executor
+	cfg        Config
+	store      TradeStore
+	prices     PriceFetcher
+	exec       execution.Executor
+	now        func() time.Time
+	marketOpen func(time.Time) bool
 }
 
 // NewManager constructs a trailing-stop Manager.
 func NewManager(cfg Config, ts TradeStore, prices PriceFetcher, exec execution.Executor) *Manager {
+	normalized := cfg.Normalize()
+	marketOpen := normalized.MarketOpen
+	if marketOpen == nil {
+		marketOpen = regularStockSession
+	}
 	return &Manager{
-		cfg:    cfg.Normalize(),
-		store:  ts,
-		prices: prices,
-		exec:   exec,
+		cfg:        normalized,
+		store:      ts,
+		prices:     prices,
+		exec:       exec,
+		now:        time.Now,
+		marketOpen: marketOpen,
 	}
 }
 
@@ -155,6 +203,7 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 	logger.Info("trailing-stop manager started",
 		"interval", m.cfg.Interval,
+		"rule", m.cfg.Rule,
 		"atr_multiple", m.cfg.ATRMultiple,
 		"atr_period", m.cfg.ATRPeriod,
 	)
@@ -220,6 +269,9 @@ func isLongStockTrade(t store.Trade) bool {
 // recent price + ATR, ratchets the high-water-mark, computes a new stop, and
 // places or replaces the broker STOP order.
 func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
+	if m.cfg.Rule == RuleEMA9 {
+		return m.updateOneEMA9(ctx, t)
+	}
 	if t.Quantity <= 0 {
 		return fmt.Errorf("non-positive quantity %f", t.Quantity)
 	}
@@ -258,6 +310,16 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	newStop = roundToTick(newStop, dp)
 	persistedStop := roundToTick(t.StopLoss, dp)
 
+	if newStop <= 0 {
+		// A missing original stop plus unavailable/zero ATR cannot produce a
+		// valid broker order. Preserve the HWM and retry when price history can
+		// derive a positive stop instead of submitting stop_price=0 every tick.
+		if hwm != t.HighWaterMark {
+			return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
+		}
+		return nil
+	}
+
 	// If the trail says we should already be out (stop ≥ current price)
 	// the broker stop would fill instantly anyway. Don't leave a stale stop
 	// sitting at the old price — exit at market immediately so the band's
@@ -269,54 +331,40 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			"new_stop", newStop,
 			"current_price", currentPrice,
 		)
-		exitRes, err := m.exitAtMarket(ctx, t)
-		if err != nil {
+		if err := m.exitAndClose(ctx, t, currentPrice); err != nil {
 			// Persist HWM so the next tick has fresh baseline; surface error.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("market exit: %w", err)
-		}
-		// Close the trade row immediately. Without this the trade stays
-		// status='open', GetOpenTrades returns it again on the next tick,
-		// and the manager places a duplicate market sell. Mirrors the
-		// close-side bookkeeping in engine.monitorPositions.
-		//
-		// Prefer the broker's reported FilledPrice when present so the
-		// trade row + pnl reflect the real fill rather than the snapshot
-		// price that crossed the trail. Falls back to currentPrice for
-		// brokers that return 0 on a still-pending fill (Alpaca paper).
-		exitPrice := exitRes.FilledPrice
-		if exitPrice == 0 {
-			exitPrice = currentPrice
-		}
-		pnl := (exitPrice - t.EntryPrice) * t.Quantity
-		pnlPct := 0.0
-		if t.EntryPrice > 0 {
-			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-		}
-		if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
-			// Best-effort persist HWM so the next tick has updated baseline.
-			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
-			return fmt.Errorf("close trade after market exit: %w", err)
 		}
 		// Persist HWM after CloseTrade so the trail snapshot is intact for
 		// post-mortem queries.
 		return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 	}
 
-	// If the stop hasn't moved (and the HWM hasn't either), nothing to do.
-	if newStop == persistedStop && hwm == t.HighWaterMark {
-		return nil
+	// Submit/replace the broker STOP whenever it moved. Also seed a missing
+	// broker stop even when the ATR candidate still equals the original hard
+	// stop; uncapped entries are deliberately not brackets, so their first
+	// manager tick must establish protection immediately.
+	existingStop, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("lookup protective stop: %w", err)
 	}
-
-	// Submit/replace broker STOP order whenever the stop_loss actually
-	// moved. HWM-only updates skip the broker call.
-	if newStop != persistedStop {
+	needsStopUpdate := existingStop != nil &&
+		(newStop != persistedStop || stopQuantityDiffers(existingStop, t.Quantity))
+	needsUncappedSeed := existingStop == nil && t.TakeProfit <= 0
+	if needsStopUpdate || needsUncappedSeed {
 		if err := m.submitOrReplaceStop(ctx, t, newStop); err != nil {
 			// Persist HWM even on broker failure so the next tick has the
 			// updated baseline; log WARN and retry next tick.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("broker stop submit/replace: %w", err)
 		}
+	}
+
+	// If neither trailing state nor the stop price changed, the only work on
+	// this tick was seeding a previously-missing broker stop.
+	if newStop == persistedStop && hwm == t.HighWaterMark {
+		return nil
 	}
 
 	if err := m.store.UpdateTradeTrailing(ctx, t.ID, newStop, hwm); err != nil {
@@ -335,6 +383,90 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	return nil
 }
 
+// updateOneEMA9 implements the study's exact EMA rule: preserve the original
+// hard stop at the broker, then exit when the latest daily close is below the
+// daily 9-EMA. It intentionally does not move the broker stop to the EMA;
+// doing so would create an intraday touch exit and would not match the tested
+// close-confirmed policy.
+func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
+	if t.Quantity <= 0 {
+		return fmt.Errorf("non-positive quantity %f", t.Quantity)
+	}
+	if t.StopLoss <= 0 {
+		return errors.New("ema9 rule requires a positive protective stop")
+	}
+
+	// Uncapped EMA trades have no software take-profit, so their hard stop
+	// must live at the broker even when market data is unavailable. Capped
+	// trades remain entirely app-managed here: adding a standalone stop
+	// alongside their software take-profit creates two independent exit
+	// owners and can double-sell when the broker stop fills.
+	if t.TakeProfit <= 0 {
+		if err := m.ensureProtectiveStop(ctx, t); err != nil {
+			return err
+		}
+	}
+
+	now := m.now()
+	closePrice, ema, closeCompletedAt, err := m.priceAndEMA9(ctx, t.Ticker, now)
+	if err != nil {
+		return fmt.Errorf("price/ema9: %w", err)
+	}
+	if closePrice <= 0 || ema <= 0 {
+		return errors.New("non-positive close or ema9")
+	}
+
+	if closePrice < ema {
+		if !t.OpenedAt.IsZero() && !closeCompletedAt.IsZero() &&
+			!closeCompletedAt.After(t.OpenedAt) {
+			// The close signal existed before this position did. Acting on it
+			// would churn a brand-new BUY on the manager's first tick.
+			return nil
+		}
+		if !m.marketOpen(now) {
+			// A market sell submitted after 16:00 ET can sit queued until the
+			// next open. Keep the trade row and broker hard stop live overnight,
+			// then retry this same completed-close signal during the next
+			// eligible session.
+			logger.Info("trailing-stop: daily close below ema9; deferring market exit until regular session",
+				"trade_id", t.ID,
+				"ticker", t.Ticker,
+				"daily_close", closePrice,
+				"ema9", ema,
+			)
+			return nil
+		}
+		logger.Info("trailing-stop: daily close below ema9; exiting at market",
+			"trade_id", t.ID,
+			"ticker", t.Ticker,
+			"daily_close", closePrice,
+			"ema9", ema,
+		)
+		return m.exitAndClose(ctx, t, closePrice)
+	}
+
+	// For uncapped trades, the original hard stop seeded above remains resident
+	// at the broker while the EMA winning exit waits.
+	return nil
+}
+
+func (m *Manager) ensureProtectiveStop(ctx context.Context, t store.Trade) error {
+	existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("lookup protective stop: %w", err)
+	}
+	if existing == nil || stopQuantityDiffers(existing, t.Quantity) {
+		if err := m.submitOrReplaceStop(ctx, t, t.StopLoss); err != nil {
+			return fmt.Errorf("seed/resize protective stop: %w", err)
+		}
+	}
+	return nil
+}
+
+func stopQuantityDiffers(existing *store.Order, quantity float64) bool {
+	return existing != nil && math.Abs(existing.Quantity-quantity) > 1e-9
+}
+
 // priceAndATR fetches recent 1h candles and returns (last close, ATR).
 // ATR honours the configured `risk.trailing_stop.atr_period` so the operator
 // knob actually flows through to the trailing band.
@@ -351,6 +483,97 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 	}
 	atrVal := indicators.ComputeATR(candles, m.cfg.ATRPeriod)
 	return candles[len(candles)-1].Close, atrVal, nil
+}
+
+// priceAndEMA9 fetches daily candles so the live rule uses the same timeframe
+// as the exit-policy study. The provider's latest returned daily bar is the
+// close evidence used by the rule.
+func (m *Manager) priceAndEMA9(ctx context.Context, ticker string, now time.Time) (float64, float64, time.Time, error) {
+	if m.prices == nil {
+		return 0, 0, time.Time{}, errors.New("no price provider configured")
+	}
+	candles, err := m.prices.FetchHistory(ctx, ticker, data.Timeframe1Day, candleHistory)
+	if err != nil {
+		return 0, 0, time.Time{}, err
+	}
+	candles = completedDailyCandles(candles, now)
+	if len(candles) < EMAPeriod {
+		return 0, 0, time.Time{}, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))
+	}
+	ema := emaClose(candles, EMAPeriod)
+	last := candles[len(candles)-1]
+	return last.Close, ema, dailyCloseCompletedAt(last), nil
+}
+
+// dailyCloseCompletedAt converts a daily bar's session date into the regular
+// US equity close instant. Provider timestamps identify the daily session's
+// start; comparing that raw timestamp with Trade.OpenedAt would incorrectly
+// reject a same-day close that completed after a morning entry.
+func dailyCloseCompletedAt(candle data.Candle) time.Time {
+	if candle.Timestamp.IsZero() {
+		return time.Time{}
+	}
+	session := candle.Timestamp.In(newYorkLocation)
+	return time.Date(session.Year(), session.Month(), session.Day(), 16, 0, 0, 0, newYorkLocation)
+}
+
+// regularStockSession is deliberately conservative: EMA exits are eligible
+// only during the normal US equity session. Outside this window the existing
+// broker stop remains live and the manager retries on its next tick.
+func regularStockSession(now time.Time) bool {
+	nowNY := now.In(newYorkLocation)
+	if nowNY.Weekday() == time.Saturday || nowNY.Weekday() == time.Sunday {
+		return false
+	}
+	minuteOfDay := nowNY.Hour()*60 + nowNY.Minute()
+	const (
+		openMinute  = 9*60 + 30
+		closeMinute = 16 * 60
+	)
+	return minuteOfDay >= openMinute && minuteOfDay < closeMinute
+}
+
+// completedDailyCandles excludes today's still-forming US session bar before
+// the regular 16:00 New York close. Some providers expose a partial 1Day bar
+// during the session; treating it as a close would turn the tested close-based
+// rule into an intraday touch rule. Zero timestamps are retained for providers
+// and deterministic fixtures that do not timestamp history.
+func completedDailyCandles(candles []data.Candle, now time.Time) []data.Candle {
+	if len(candles) == 0 {
+		return candles
+	}
+	last := candles[len(candles)-1]
+	if last.Timestamp.IsZero() {
+		return candles
+	}
+	nowNY := now.In(newYorkLocation)
+	barNY := last.Timestamp.In(newYorkLocation)
+	sameSessionDate := nowNY.Year() == barNY.Year() &&
+		nowNY.YearDay() == barNY.YearDay()
+	beforeRegularClose := nowNY.Hour() < 16
+	if sameSessionDate && beforeRegularClose {
+		return candles[:len(candles)-1]
+	}
+	return candles
+}
+
+// emaClose returns the final EMA value for candle closes, seeded with the
+// simple average of the first period values (the same convention used by the
+// backtest harness).
+func emaClose(candles []data.Candle, period int) float64 {
+	if period <= 0 || len(candles) < period {
+		return 0
+	}
+	var ema float64
+	for i := 0; i < period; i++ {
+		ema += candles[i].Close
+	}
+	ema /= float64(period)
+	k := 2.0 / float64(period+1)
+	for i := period; i < len(candles); i++ {
+		ema = candles[i].Close*k + ema*(1-k)
+	}
+	return ema
 }
 
 // submitOrReplaceStop sends the new stop price to the broker. If a broker
@@ -372,11 +595,30 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 
 	side := execution.OrderSideSell // long-only scope: exit a long via SELL
 	if existing != nil && existing.BrokerOrderID != "" {
+		quantityChanged := stopQuantityDiffers(existing, t.Quantity)
 		// Replace path — atomic on the broker side, no double-stop window.
-		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok {
+		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok && !quantityChanged {
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
-				return m.store.UpdateOrderStopPriceAndID(ctx, existing.ID, res.BrokerOrderID, newStop)
+				status := execution.NormalizeOrderStatus(res.Status)
+				if persistErr := m.store.UpdateOrderStopPriceAndID(
+					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
+				); persistErr != nil {
+					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
+						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
+					}
+					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
+				}
+				if status == "filled" || res.FilledQty > 0 {
+					if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
+						return fmt.Errorf("claim replacement-stop fill: %w", claimErr)
+					}
+					return errStopFilledDuringRollback
+				}
+				if status == "cancelled" || status == "rejected" {
+					return fmt.Errorf("replacement stop became %s before providing coverage", status)
+				}
+				return nil
 			}
 			if existing.ParentOrderID != "" {
 				// Bracket child leg (#435): cancel+resubmit is FORBIDDEN —
@@ -402,20 +644,50 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	}
 
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
-		Ticker:    t.Ticker,
-		Side:      side,
-		Type:      execution.OrderTypeStop,
-		Quantity:  t.Quantity,
-		StopPrice: newStop,
-		TradeID:   t.ID,
+		Ticker:      t.Ticker,
+		Side:        side,
+		Type:        execution.OrderTypeStop,
+		Quantity:    t.Quantity,
+		StopPrice:   newStop,
+		TradeID:     t.ID,
+		TimeInForce: protectiveStopTIF(t.Quantity),
 	})
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
+	status := execution.NormalizeOrderStatus(res.Status)
+	fillQty := res.FilledQty
+	if status == "filled" && fillQty <= 0 {
+		fillQty = t.Quantity
+	}
+	fillPrice := res.FilledPrice
+	if fillQty > 0 && fillPrice <= 0 {
+		fillPrice = newStop
+	}
+	fillObserved := fillQty > 0
+	if fillObserved {
+		if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
+			return fmt.Errorf("claim immediate stop fill: %w", claimErr)
+		}
+	}
 
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
-		return m.store.UpdateOrderStopPriceAndID(ctx, existing.ID, res.BrokerOrderID, newStop)
+		if err := m.store.UpdateOrderStopPriceAndID(
+			ctx, existing.ID, res.BrokerOrderID, newStop, t.Quantity,
+		); err != nil {
+			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
+				return fmt.Errorf("persist replacement stop: %w; rollback: %v", err, rollbackErr)
+			}
+			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
+		}
+		if fillObserved {
+			return errStopFilledDuringRollback
+		}
+		if status == "cancelled" || status == "rejected" {
+			return fmt.Errorf("replacement stop became %s before providing coverage", status)
+		}
+		return nil
 	}
 	_, err = m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,
@@ -425,10 +697,151 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		OrderType:     string(execution.OrderTypeStop),
 		Quantity:      t.Quantity,
 		StopPrice:     newStop,
-		Status:        execution.NormalizeOrderStatus(res.Status),
+		FilledPrice:   fillPrice,
+		FilledQty:     fillQty,
+		Status:        status,
 		IsStopLoss:    true,
 	})
-	return err
+	if err != nil {
+		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
+			return fmt.Errorf("persist new stop: %w; rollback: %v", err, rollbackErr)
+		}
+		return fmt.Errorf("persist new stop: %w (broker stop cancelled)", err)
+	}
+	if fillObserved {
+		return errStopFilledDuringRollback
+	}
+	if status == "cancelled" || status == "rejected" {
+		return fmt.Errorf("new stop became %s before providing coverage", status)
+	}
+	return nil
+}
+
+func (m *Manager) rollbackUnrecordedStop(
+	ctx context.Context,
+	t store.Trade,
+	stopPrice float64,
+	brokerOrderID string,
+) error {
+	cancelErr := m.exec.CancelOrder(ctx, brokerOrderID)
+	status, statusErr := m.exec.GetOrderStatus(ctx, brokerOrderID)
+	if statusErr != nil {
+		if errors.Is(statusErr, execution.ErrOrderNotFound) {
+			return nil
+		}
+		return fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
+	}
+	switch execution.NormalizeOrderStatus(status.Status) {
+	case "cancelled", "rejected":
+		if status.FilledQty <= 0 {
+			return nil
+		}
+		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		if _, err := m.store.InsertOrder(ctx, store.Order{
+			TradeID: t.ID, BrokerOrderID: brokerOrderID,
+			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
+			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+		}); err != nil {
+			return fmt.Errorf("%w; persist partial rollback stop: %v", errStopFilledDuringRollback, err)
+		}
+		return errStopFilledDuringRollback
+	case "filled":
+		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		if _, err := m.store.InsertOrder(ctx, store.Order{
+			TradeID: t.ID, BrokerOrderID: brokerOrderID,
+			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
+			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+		}); err != nil {
+			return fmt.Errorf("%w; persist filled rollback stop: %v", errStopFilledDuringRollback, err)
+		}
+		return errStopFilledDuringRollback
+	default:
+		return fmt.Errorf("cancel=%v order remains %s", cancelErr, status.Status)
+	}
+}
+
+func protectiveStopTIF(quantity float64) string {
+	if quantity != math.Trunc(quantity) {
+		// Alpaca accepts fractional equity stop/stop-limit orders only as DAY.
+		return "day"
+	}
+	return "gtc"
+}
+
+// exitAndClose submits the market exit and immediately closes the trade row so
+// the next manager tick cannot submit a duplicate sell. The broker fill wins
+// when available; asynchronous brokers fall back to the candle close that
+// triggered the policy and are later reconciled to broker truth.
+func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) error {
+	claimed, err := m.store.ClaimTradeExit(ctx, t.ID)
+	if err != nil {
+		return fmt.Errorf("claim trade exit: %w", err)
+	}
+	if !claimed {
+		return nil
+	}
+	releaseClaim := true
+	defer func() {
+		if releaseClaim {
+			_ = m.store.ReleaseTradeExitClaim(context.Background(), t.ID)
+		}
+	}()
+
+	exitRes, exitQty, err := m.exitAtMarket(ctx, t)
+	if err != nil {
+		if errors.Is(err, errExitClaimMustRemain) {
+			releaseClaim = false
+		}
+		return err
+	}
+	t.Quantity = exitQty
+	// Once the broker accepts the sell, keep the durable exit claim even if
+	// persistence fails. Releasing it would let another worker submit a second
+	// full sell on its next stale/open read.
+	releaseClaim = false
+	if _, err := m.store.InsertOrder(ctx, store.Order{
+		TradeID:       t.ID,
+		BrokerOrderID: exitRes.BrokerOrderID,
+		Ticker:        t.Ticker,
+		Side:          string(execution.OrderSideSell),
+		OrderType:     string(execution.OrderTypeMarket),
+		Quantity:      t.Quantity,
+		FilledPrice:   exitRes.FilledPrice,
+		FilledQty:     exitRes.FilledQty,
+		Status:        execution.NormalizeOrderStatus(exitRes.Status),
+		IsStopLoss:    true,
+	}); err != nil {
+		return fmt.Errorf("record accepted market exit: %w", err)
+	}
+
+	status := execution.NormalizeOrderStatus(exitRes.Status)
+	if (status == "cancelled" || status == "rejected") && exitRes.FilledQty == 0 {
+		releaseClaim = true
+		return nil
+	}
+	fullFill := status == "filled" &&
+		exitRes.FilledPrice > 0 && exitRes.FilledQty >= t.Quantity-1e-9
+	if !fullFill {
+		// The engine exit reconciler owns this durable `exiting` trade until
+		// the broker reports a complete fill. Partial/pending positions remain
+		// tracked and cannot be selected by another exit worker.
+		return nil
+	}
+	exitPrice := exitRes.FilledPrice
+	pnl := (exitPrice - t.EntryPrice) * t.Quantity
+	pnlPct := 0.0
+	if t.EntryPrice > 0 {
+		pnlPct = pnl / (t.EntryPrice * t.Quantity) * 100
+	}
+	if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+		return fmt.Errorf("close trade after market exit: %w", err)
+	}
+	if pnl < 0 && m.cfg.RecordLoss != nil {
+		m.cfg.RecordLoss()
+	}
+	return nil
 }
 
 // cancelAndConfirm cancels a broker order and only returns nil once the
@@ -463,8 +876,10 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 		return fmt.Errorf("cancel reported success but status check failed: %w", statusErr)
 	}
 	switch execution.NormalizeOrderStatus(status.Status) {
-	case "cancelled", "filled", "rejected":
+	case "cancelled", "rejected":
 		return nil
+	case "filled":
+		return errors.New("stop filled while cancellation was in flight; refusing replacement")
 	}
 	if cancelErr != nil {
 		return fmt.Errorf("cancel failed and order still %s: %w", status.Status, cancelErr)
@@ -480,62 +895,93 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 // Returns the broker's OrderResult so the caller can use the actual
 // FilledPrice/FilledQty for trade close + pnl. Mirrors the field set
 // engine.monitorPositions persists on its non-trailing exit path.
-func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, error) {
+func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, float64, error) {
 	// Cancel every working exit leg first — not just the latest stop. For
 	// bracket-managed trades the stop AND take-profit legs each hold the
 	// trade's shares at the broker; a market sell with either leg still
-	// working is rejected for insufficient free quantity. Failure is logged
-	// but doesn't block the market exit (the exit is the safety move).
-	if legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID); err == nil {
-		for _, leg := range legs {
-			if leg.BrokerOrderID == "" {
-				continue
-			}
-			if err := m.exec.CancelOrder(ctx, leg.BrokerOrderID); err != nil {
-				logger.Warn("trailing-stop: cancel of exit leg before market exit failed",
-					"trade_id", t.ID,
-					"broker_order_id", leg.BrokerOrderID,
-					"err", err,
-				)
-			}
-		}
-	} else {
-		logger.Warn("trailing-stop: exit-leg lookup before market exit failed",
-			"trade_id", t.ID, "err", err)
+	// working is rejected for insufficient free quantity. More importantly,
+	// submitting while a stop remains live can double-sell. Fail closed and
+	// retry on the next manager tick unless every leg is confirmed gone.
+	exitQty, err := m.cancelExitLegsForMarketExit(ctx, t)
+	if err != nil {
+		return execution.OrderResult{}, 0, err
 	}
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:   t.Ticker,
 		Side:     execution.OrderSideSell,
 		Type:     execution.OrderTypeMarket,
-		Quantity: t.Quantity,
+		Quantity: exitQty,
 		TradeID:  t.ID,
 	})
 	if err != nil {
-		return execution.OrderResult{}, fmt.Errorf("place market sell: %w", err)
+		return execution.OrderResult{}, 0, fmt.Errorf(
+			"%w: ambiguous market-sell placement: %v", errExitClaimMustRemain, err,
+		)
 	}
-	// Persist the order with the broker's actual fill data when present so
-	// downstream pnl/order-history queries see the real exit, not just the
-	// snapshot price that triggered the trail. Falls back to t.Quantity for
-	// FilledQty when the broker hasn't reported a fill yet (Status=pending).
-	filledQty := res.FilledQty
-	if filledQty == 0 {
-		filledQty = t.Quantity
+	return res, exitQty, nil
+}
+
+func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) (float64, error) {
+	legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID)
+	if err != nil {
+		return 0, fmt.Errorf("lookup exit legs before market exit: %w", err)
 	}
-	if _, insErr := m.store.InsertOrder(ctx, store.Order{
-		TradeID:       t.ID,
-		BrokerOrderID: res.BrokerOrderID,
-		Ticker:        t.Ticker,
-		Side:          string(execution.OrderSideSell),
-		OrderType:     string(execution.OrderTypeMarket),
-		Quantity:      t.Quantity,
-		FilledPrice:   res.FilledPrice,
-		FilledQty:     filledQty,
-		Status:        execution.NormalizeOrderStatus(res.Status),
-		IsStopLoss:    true, // counts toward the trade's exit bookkeeping
-	}); insErr != nil {
-		return res, insErr
+	remaining := t.Quantity
+	for _, leg := range legs {
+		if leg.BrokerOrderID == "" {
+			continue
+		}
+		cancelErr := m.exec.CancelOrder(ctx, leg.BrokerOrderID)
+		status, statusErr := m.exec.GetOrderStatus(ctx, leg.BrokerOrderID)
+		if statusErr != nil {
+			if errors.Is(statusErr, execution.ErrOrderNotFound) {
+				continue
+			}
+			return 0, fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
+				leg.BrokerOrderID, cancelErr, statusErr)
+		}
+		switch execution.NormalizeOrderStatus(status.Status) {
+		case "cancelled", "rejected":
+			if status.FilledQty > 0 {
+				fillPrice := status.FilledPrice
+				if fillPrice <= 0 {
+					if leg.IsTakeProfit {
+						fillPrice = leg.LimitPrice
+					} else {
+						fillPrice = leg.StopPrice
+					}
+				}
+				var applied float64
+				remaining, applied, err = m.store.ApplyPartialExit(
+					ctx, t.ID, leg.ID, fillPrice, status.FilledQty,
+					execution.NormalizeOrderStatus(status.Status),
+				)
+				if err != nil {
+					return 0, fmt.Errorf("%w: persist partial exit-leg fill: %v",
+						errExitClaimMustRemain, err)
+				}
+				_ = applied
+			} else if err := m.store.UpdateOrderFill(
+				ctx, leg.ID, status.FilledPrice, 0,
+				execution.NormalizeOrderStatus(status.Status),
+			); err != nil {
+				return 0, fmt.Errorf("persist terminal exit-leg status: %w", err)
+			}
+		case "filled":
+			return 0, fmt.Errorf(
+				"%w: exit leg %s filled while cancelling; refusing duplicate market exit",
+				errExitClaimMustRemain, leg.BrokerOrderID,
+			)
+		default:
+			return 0, fmt.Errorf("exit leg %s remains %s after cancel: %v",
+				leg.BrokerOrderID, status.Status, cancelErr)
+		}
 	}
-	return res, nil
+	if remaining <= 0 {
+		return 0, fmt.Errorf("%w: exit legs sold the full position while cancelling",
+			errExitClaimMustRemain)
+	}
+	return remaining, nil
 }
 
 // brokerTickDecimals returns the price-tick precision for the ticker. US

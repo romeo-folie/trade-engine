@@ -101,6 +101,11 @@ type Engine struct {
 	modeMu sync.RWMutex
 	mode   string // auto | paper | manual
 
+	// trailingManagerAvailable is set by command wiring only when every
+	// dependency needed to run the trailing worker is present. Config alone is
+	// insufficient: uncapping without a running worker removes the winning exit.
+	trailingManagerAvailable bool
+
 	// todayStartingEquity tracks the equity at 00:00 UTC for the current day.
 	todayStartingEquity float64
 	todaySummaryDate    string
@@ -1264,6 +1269,15 @@ func tickerHasOpenLongIn(openTrades []store.Trade, ticker string) bool {
 	return false
 }
 
+func tickerHasExitingLongIn(trades []store.Trade, ticker string) bool {
+	for _, t := range trades {
+		if t.Ticker == ticker && t.Direction == "long" && t.Status == "exiting" {
+			return true
+		}
+	}
+	return false
+}
+
 // buildOwnershipShortCircuitBlock returns the synthetic blocked SELL signal
 // and the two event payloads that the SELL-only pre-LLM short-circuit emits
 // so the cycle is still visible in the signals table and on the dashboard
@@ -1536,6 +1550,13 @@ func (e *Engine) SetBatchFlusher(f BatchFlusher) {
 	e.batchFlusher = f
 }
 
+// SetTrailingManagerAvailable records whether command wiring actually started
+// the trailing worker. Uncapped entries fail safe to their baseline TP unless
+// this runtime capability is present.
+func (e *Engine) SetTrailingManagerAvailable(available bool) {
+	e.trailingManagerAvailable = available
+}
+
 // SetMode updates the engine's active trading mode at runtime.
 func (e *Engine) SetMode(mode string) {
 	e.modeMu.Lock()
@@ -1691,6 +1712,11 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		// Reuse the slice already loaded by runAnalysis's SELL-ownership probe
 		// so a normal analysis cycle costs one GetOpenTrades query, not two.
 		openTrades = prefetchedOpenTrades
+	} else if resp.Action == "BUY" {
+		// A durable in-flight exit remains a real broker position until
+		// reconciliation completes, so it must count against entry limits and
+		// duplicate/pyramid policy.
+		openTrades, openTradesErr = store.GetOwnedPositionTrades(ctx)
 	} else {
 		openTrades, openTradesErr = store.GetOpenTrades(ctx)
 	}
@@ -1707,6 +1733,18 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 			logger.Warn("signal blocked", "ticker", ticker, "reason", sig.BlockReason)
 			return
 		}
+	}
+	if resp.Action == "BUY" && tickerHasExitingLongIn(openTrades, ticker) {
+		sig.Status = "blocked"
+		sig.BlockReason = "prior long exit is still reconciling"
+		if _, err := store.InsertSignal(ctx, sig); err != nil {
+			logger.Warn("store blocked signal", "ticker", ticker, "err", err)
+		}
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
+			BlockReason: sig.BlockReason, FailedCheck: "exit_ownership",
+		})
+		return
 	}
 
 	// Pyramiding (#324): the new lot's stop will be tightened to
@@ -1966,6 +2004,30 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		return
 	}
 
+	// An `exiting` trade still owns broker quantity until reconciliation
+	// proves the sell terminal. Never layer a fresh BUY onto that in-flight
+	// state: it defeats per-trade order attribution and can make a late exit
+	// fill sell shares from the new position.
+	if store.IsConnected() {
+		owned, err := store.GetOwnedPositionTrades(ctx)
+		if err != nil {
+			reason := "unable to verify in-flight exits (DB error)"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
+		if tickerHasExitingLongIn(owned, sig.Ticker) {
+			reason := "prior long exit is still reconciling"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "exit_ownership",
+			})
+			return
+		}
+	}
+
 	// Size: use signal's size_pct of portfolio cash.
 	pState := e.portfolio.CurrentState()
 	positionValue := pState.Cash * (sig.SizePct / 100)
@@ -1996,15 +2058,33 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	}
 
+	// The uncapped exit policy is active only with the trailing manager: this
+	// guarantees the position retains a broker hard stop while the selected
+	// trail owns the winning exit. Keeping the manager requirement here makes
+	// an accidentally-partial config fail safe to the existing fixed TP.
+	uncapRequested := side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
+	uncapTakeProfit, uncappedQty := resolveUncappedEntry(
+		e.cfg.Risk, side, qty, sig.SignalPrice, sig.StopLoss,
+		e.trailingManagerAvailable,
+	)
+	if uncapTakeProfit {
+		orderReq.Quantity = uncappedQty
+	} else if uncapRequested {
+		logger.Warn("exit policy: uncapped entry lacks a running trail, whole-share sizing, or a coherent hard stop; keeping baseline fixed take-profit",
+			"ticker", sig.Ticker,
+			"qty", qty,
+			"signal_price", sig.SignalPrice,
+			"stop_loss", sig.StopLoss,
+		)
+	}
+
 	// Broker-resident bracket exits (#435, see bracket_exits.go). BUYs with a
 	// coherent stop/target become one atomic bracket: entry + TP limit + SL
 	// stop, GTC so the legs survive the session close. Whole shares only —
 	// Alpaca rejects fractional complex orders — so sub-one-share sizings
 	// fall back to the plain market entry with app-managed exits.
 	bracketed := false
-	if e.cfg.Risk.BracketExitsEnabled && side == execution.OrderSideBuy &&
-		sig.StopLoss > 0 && sig.TakeProfit > 0 &&
-		sig.StopLoss < sig.SignalPrice && sig.TakeProfit > sig.SignalPrice {
+	if stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
 		if whole := math.Floor(qty); whole >= 1 {
 			orderReq.Quantity = whole
 			orderReq.OrderClass = "bracket"
@@ -2016,6 +2096,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("bracket exits: sized under one whole share — falling back to app-managed exits",
 				"ticker", sig.Ticker, "qty", qty)
 		}
+	}
+	if uncapTakeProfit {
+		logger.Info("exit policy: fixed take-profit uncapped; trailing manager owns winning exit",
+			"ticker", sig.Ticker,
+			"trailing_rule", e.cfg.Risk.TrailingStop.Rule,
+		)
 	}
 
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
@@ -2030,6 +2116,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 
 	// Create trade record.
+	// The software position monitor reads trades.take_profit. Clearing the
+	// persisted value is load-bearing: merely omitting the broker bracket
+	// would still let the hourly monitor cap the winner at the model TP.
+	tradeTakeProfit := persistedTakeProfit(sig.TakeProfit, uncapTakeProfit)
 	trade := store.Trade{
 		SignalID:   sigID,
 		Ticker:     sig.Ticker,
@@ -2038,7 +2128,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		EntryPrice: result.FilledPrice,
 		Quantity:   result.FilledQty,
 		StopLoss:   sig.StopLoss,
-		TakeProfit: sig.TakeProfit,
+		TakeProfit: tradeTakeProfit,
 		Status:     "open",
 	}
 	tradeID, err := store.InsertTrade(ctx, trade)
@@ -2064,6 +2154,38 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
+	}
+	if result.FilledQty == 0 && execution.IsTerminalOrderStatus(result.Status) {
+		// A synchronously rejected/cancelled entry never enters the fill poll.
+		// Remove its zero-quantity trade immediately so it cannot occupy a
+		// position slot forever.
+		if cancelled, err := store.CancelUnfilledTrade(ctx, tradeID); err != nil {
+			logger.Warn("cancel synchronous zero-fill trade", "trade_id", tradeID, "err", err)
+		} else if cancelled && result.BrokerOrderID != "" {
+			if err := store.MarkOrderStatus(
+				ctx, result.BrokerOrderID, execution.NormalizeOrderStatus(result.Status),
+			); err != nil {
+				logger.Warn("mark synchronous zero-fill order", "trade_id", tradeID, "err", err)
+			}
+		}
+		return
+	}
+
+	initialProtectedQty := 0.0
+	if uncapTakeProfit && result.FilledQty > 0 {
+		if err := e.ensureUncappedProtectiveStop(
+			ctx, tradeID, sig.Ticker, result.FilledQty, sig.StopLoss,
+		); err != nil {
+			logger.Error("uncapped entry filled without immediate broker stop",
+				"trade_id", tradeID,
+				"ticker", sig.Ticker,
+				"qty", result.FilledQty,
+				"stop_loss", sig.StopLoss,
+				"err", err,
+			)
+		} else {
+			initialProtectedQty = result.FilledQty
+		}
 	}
 
 	// Persist the bracket's child exit legs so the monitor knows the trade
@@ -2117,15 +2239,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Quantity: result.FilledQty, Strategy: sig.Strategy,
 	})
 
-	// If the broker returned a zero fill price (Alpaca market orders fill async),
-	// poll GetOrderStatus and backfill the trade record — until the order reaches
-	// a TERMINAL state, not merely until a price appears. The old `FilledPrice >
-	// 0 → done` condition froze PARTIAL fills as trade truth: NOK's 148.31-share
-	// fractional entry was recorded at its first partial (30 shares), the exit
-	// later sold only those 30, and 118 shares were orphaned at the broker with
-	// no stop and analyst SELLs blocked by the ownership guard. Every poll now
-	// re-backfills, so quantity tracks upward while the order keeps filling.
-	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
+	// Poll every nonterminal broker order and backfill until it reaches a final
+	// state. A nonzero price does not imply completion: Alpaca can return an
+	// immediate partial fill, then continue filling the remaining quantity.
+	// Stopping at that first partial freezes the smaller quantity as trade truth
+	// and leaves later shares untracked and under-protected.
+	if shouldPollEntryFill(result) {
 		brokerOrderID := result.BrokerOrderID
 		executor := e.executor
 		go func() {
@@ -2136,16 +2255,34 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			backfill := func(status execution.OrderResult) {
 				bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer bfCancel()
-				if err := store.UpdateTradeEntryPrice(bfCtx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
-					logger.Warn("fill poll: update trade entry price",
-						"trade_id", tradeID, "err", err)
-				}
-				if err := store.UpdateOrderFillPrice(bfCtx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
-					logger.Warn("fill poll: update order fill price",
-						"broker_order_id", brokerOrderID, "err", err)
+				if err := store.ApplyEntryFill(
+					bfCtx, tradeID, brokerOrderID,
+					status.FilledPrice, status.FilledQty,
+					execution.NormalizeOrderStatus(status.Status),
+				); err != nil {
+					logger.Warn("fill poll: atomically apply entry fill",
+						"trade_id", tradeID, "broker_order_id", brokerOrderID, "err", err)
 				}
 			}
-			var lastQty float64
+			protect := func(status execution.OrderResult) error {
+				bfCtx, bfCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer bfCancel()
+				if err := e.ensureUncappedProtectiveStop(
+					bfCtx, tradeID, sig.Ticker, status.FilledQty, sig.StopLoss,
+				); err != nil {
+					logger.Error("fill poll: uncapped position lacks full broker-stop coverage",
+						"trade_id", tradeID,
+						"ticker", sig.Ticker,
+						"filled_qty", status.FilledQty,
+						"stop_loss", sig.StopLoss,
+						"err", err,
+					)
+					return err
+				}
+				return nil
+			}
+			lastRecordedQty := result.FilledQty
+			lastProtectedQty := initialProtectedQty
 			for i := 0; i < maxRetries; i++ {
 				time.Sleep(retryDelay)
 				pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2156,18 +2293,63 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 						"broker_order_id", brokerOrderID, "attempt", i+1, "err", err)
 					continue
 				}
-				if status.FilledPrice > 0 && status.FilledQty != lastQty {
+				if status.FilledPrice > 0 && status.FilledQty != lastRecordedQty {
 					backfill(status)
-					lastQty = status.FilledQty
+					lastRecordedQty = status.FilledQty
+				}
+				exitInFlight := false
+				stateCtx, stateCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				trade, getErr := store.GetTradeByID(stateCtx, tradeID)
+				stateCancel()
+				if getErr == nil &&
+					trade != nil && trade.Status == "exiting" {
+					exitInFlight = true
+					// A protective stop or another exit worker has started
+					// selling this partial entry. Stop the still-working BUY
+					// from adding new, unprotected shares behind that exit.
+					if !execution.IsTerminalOrderStatus(status.Status) {
+						cancelCtx, cancelEntry := context.WithTimeout(context.Background(), 5*time.Second)
+						if cancelErr := executor.CancelOrder(
+							cancelCtx, brokerOrderID,
+						); cancelErr != nil {
+							logger.Warn("fill poll: cancel entry after exit ownership transfer",
+								"trade_id", tradeID,
+								"broker_order_id", brokerOrderID,
+								"err", cancelErr)
+						}
+						cancelEntry()
+					}
+				}
+				if uncapTakeProfit && !exitInFlight &&
+					status.FilledQty > lastProtectedQty {
+					// Protection progress is deliberately independent from
+					// fill persistence. A transient resize error leaves this
+					// quantity behind so the next identical poll retries it.
+					nextProtectedQty, err := advanceProtectedQuantity(
+						lastProtectedQty, status.FilledQty,
+						func() error { return protect(status) },
+					)
+					if err == nil {
+						lastProtectedQty = nextProtectedQty
+					}
 				}
 				if execution.IsTerminalOrderStatus(status.Status) {
-					if status.FilledQty == 0 && lastQty == 0 {
+					if status.FilledQty == 0 && lastRecordedQty == 0 {
 						// Terminal with ZERO fill (expired / cancelled /
 						// rejected): the entry never happened. Without this,
 						// the qty-0 row stayed "open" forever — the IREN/MU/
 						// TSLA phantom rows that inflated the position count.
 						e.cancelUnfilledEntry(tradeID, brokerOrderID, sig.Ticker)
 						return
+					}
+					if uncapTakeProfit && status.FilledQty > lastProtectedQty {
+						logger.Warn("fill poll: terminal fill still lacks full broker-stop coverage; retrying",
+							"trade_id", tradeID,
+							"ticker", sig.Ticker,
+							"filled_qty", status.FilledQty,
+							"protected_qty", lastProtectedQty,
+						)
+						continue
 					}
 					logger.Info("fill poll: order terminal",
 						"trade_id", tradeID,
@@ -2181,7 +2363,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				logger.Debug("fill poll: order not terminal yet, retrying",
 					"broker_order_id", brokerOrderID, "attempt", i+1, "status", status.Status, "filled_qty", status.FilledQty)
 			}
-			if lastQty == 0 {
+			if lastRecordedQty == 0 {
 				// Two minutes of polling an in-hours market order with zero
 				// fill: something is wrong. Cancel rather than leave a qty-0
 				// "open" trade the position counter treats as real.
@@ -2192,7 +2374,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"trade_id", tradeID,
 				"broker_order_id", brokerOrderID,
 				"ticker", sig.Ticker,
-				"last_filled_qty", lastQty,
+				"last_filled_qty", lastRecordedQty,
+				"protected_qty", lastProtectedQty,
 			)
 		}()
 	}
@@ -2430,7 +2613,9 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			defer e.exitReconcileInFlight.Store(false)
 			sweepCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			ReconcileExitOrderFillsWithStore(sweepCtx, e.executor, DefaultExitReconcileBatch)
+			ReconcileExitOrderFillsWithStoreAndLoss(
+				sweepCtx, e.executor, DefaultExitReconcileBatch, e.portfolio.RecordLoss,
+			)
 		}()
 	}
 
@@ -2444,10 +2629,11 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 	}
 
 	for _, t := range trades {
-		// Broker-resident bracket exits (#435): a trade with working exit
-		// legs is protected at the broker — reconcile leg fills into the
-		// trades table and NEVER run the software price-compare exit on top
-		// of live legs (double-sell). Deliberately NOT gated on
+		// Broker-resident exits (#435): a trade with working bracket legs, or
+		// an uncapped trade with a standalone hard stop, is protected at the
+		// broker — reconcile fills into the trades table and NEVER run the
+		// software price-compare exit on top of live legs (double-sell).
+		// Deliberately NOT gated on
 		// bracket_exits_enabled: the flag only decides whether NEW entries
 		// become brackets — an existing bracket trade must stay
 		// broker-managed even after the flag is flipped off, or this loop
@@ -2514,6 +2700,38 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
+		claimed, err := store.ClaimTradeExit(ctx, t.ID)
+		if err != nil {
+			logger.Warn("claim trade exit", "trade_id", t.ID, "err", err)
+			continue
+		}
+		if !claimed {
+			// Another worker (EMA manager, analyst SELL, or this monitor on
+			// an overlapping sweep) already owns the broker exit.
+			continue
+		}
+
+		// A capped ATR trade can carry a standalone broker stop while its
+		// winning take-profit remains software-managed. Cancel and confirm
+		// every such leg after winning exit ownership but before submitting
+		// the market order; otherwise the TP sell races a still-live stop and
+		// can flip the account short.
+		remainingByTrade, remainingQty, clear, releaseSafe :=
+			e.cancelClaimedExitLegs(ctx, []store.Trade{t}, t.Ticker)
+		if !clear {
+			if releaseSafe {
+				_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+			}
+			logger.Warn("position monitor: exit legs could not be confirmed cancelled",
+				"trade_id", t.ID, "ticker", t.Ticker, "reason", exitReason)
+			continue
+		}
+		if remaining := remainingByTrade[t.ID]; remaining > 0 {
+			t.Quantity = remaining
+		} else {
+			t.Quantity = remainingQty
+		}
+
 		// Place exit order.
 		exitSide := execution.OrderSideSell
 		if t.Direction == "short" {
@@ -2528,46 +2746,19 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			TradeID:    t.ID,
 		})
 		if err != nil {
-			logger.Warn("exit order failed", "trade_id", t.ID, "reason", exitReason, "err", err)
+			// A POST can fail after broker acceptance. Retain ownership and
+			// let aged orderless-exit recovery inspect broker truth.
+			logger.Warn("exit order placement ambiguous — claim retained",
+				"trade_id", t.ID, "reason", exitReason, "err", err)
 			continue
 		}
 
-		// Prefer the broker's confirmed fill as the exit price. Alpaca market
-		// orders fill async, so PlaceOrder usually returns FilledPrice=0 —
-		// poll briefly for the real fill before recording anything (LAC was
-		// recorded at a stale trigger price 44% away from the actual fill).
-		// Only if the fill still hasn't confirmed do we fall back to
-		// currentPrice; the exit-fill reconciler sweep corrects the row once
-		// the broker reports the fill.
-		exitPrice := result.FilledPrice
-		if exitPrice == 0 && result.BrokerOrderID != "" {
+		if result.FilledPrice == 0 && result.BrokerOrderID != "" {
 			if filled, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
-				exitPrice = filled.FilledPrice
 				result = filled
 			}
 		}
-		exitFillConfirmed := exitPrice > 0
-		if exitPrice == 0 {
-			exitPrice = currentPrice
-			logger.Warn("exit fill unconfirmed at close time — recording trigger price, reconciler will correct",
-				"trade_id", t.ID, "ticker", t.Ticker, "broker_order_id", result.BrokerOrderID)
-		}
-		pnl := (exitPrice - t.EntryPrice) * t.Quantity
-		if t.Direction == "short" {
-			pnl = (t.EntryPrice - exitPrice) * t.Quantity
-		}
-		pnlPct := 0.0
-		if t.EntryPrice > 0 {
-			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-		}
 
-		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
-			logger.Warn("close trade", "trade_id", t.ID, "err", err)
-		}
-
-		// Record exit order. FilledPrice is only persisted once the broker
-		// confirmed the fill — an unconfirmed row keeps status='pending' and
-		// empty fill columns so the exit-fill reconciler picks it up.
 		exitOrder := store.Order{
 			TradeID:       t.ID,
 			BrokerOrderID: result.BrokerOrderID,
@@ -2580,13 +2771,35 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
 		}
-		if exitFillConfirmed {
-			exitOrder.FilledPrice = exitPrice
-		}
-		if _, err := store.InsertOrder(ctx, exitOrder); err != nil {
-			logger.Warn("insert exit order", "trade_id", t.ID, "err", err)
+		exitOrder.FilledPrice = result.FilledPrice
+		if _, err := store.InsertOrderWithRetry(ctx, exitOrder); err != nil {
+			// Keep the durable claim: releasing it after broker acceptance can
+			// submit a duplicate sell. Startup reconciliation still counts the
+			// exiting quantity and surfaces the missing order for repair.
+			logger.Error("insert accepted exit order — trade remains exiting",
+				"trade_id", t.ID, "broker_order_id", result.BrokerOrderID, "err", err)
+			continue
 		}
 
+		status := execution.NormalizeOrderStatus(result.Status)
+		if (status == "cancelled" || status == "rejected") && result.FilledQty == 0 {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+			continue
+		}
+		fullFill := status == "filled" && result.FilledPrice > 0 &&
+			result.FilledQty >= t.Quantity-1e-9
+		if !fullFill {
+			// Reconciler finalizes a full fill or reopens only the unsold
+			// remainder after a terminal partial/cancel.
+			continue
+		}
+
+		exitPrice := result.FilledPrice
+		pnl, pnlPct := tradePnL(t.Direction, t.EntryPrice, t.Quantity, exitPrice)
+		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+			logger.Warn("close confirmed trade", "trade_id", t.ID, "err", err)
+			continue
+		}
 		if pnl < 0 {
 			e.portfolio.RecordLoss()
 		}
@@ -2706,8 +2919,8 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 	// signals_blocked columns now reflect reality too.
 	e.portfolio.MaybeDailySummary(ctx,
 		e.todayStartingEquity,
-		0,                       // tradesOpened (placeholder, could track in engine if needed)
-		len(trades),             // tradesClosed
+		0,           // tradesOpened (placeholder, could track in engine if needed)
+		len(trades), // tradesClosed
 		wins,
 		losses,
 		counters.SignalsTotal,   // signalGenerated — total daily signals
@@ -2780,7 +2993,7 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 		// Re-validate the portfolio-level gates before firing. Fetched per
 		// signal (not per sweep) so an execution earlier in this loop counts
 		// against the next signal's position budget.
-		openTrades, otErr := store.GetOpenTrades(ctx)
+		openTrades, otErr := store.GetOwnedPositionTrades(ctx)
 		if otErr != nil {
 			logger.Warn("deferred signal: open trades unavailable — retrying next tick",
 				"id", sig.ID, "ticker", sig.Ticker, "err", otErr)

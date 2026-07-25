@@ -29,6 +29,39 @@ func TestDefaultsRiskThreshold(t *testing.T) {
 	}
 }
 
+func TestDefaultsTrailingRulePreservesATRBehavior(t *testing.T) {
+	cfg := Defaults()
+	if cfg.Risk.TrailingStop.Rule != "atr" {
+		t.Fatalf("default trailing rule = %q, want atr", cfg.Risk.TrailingStop.Rule)
+	}
+	if cfg.Risk.UncapTakeProfit {
+		t.Fatal("take-profit uncapping must default off")
+	}
+	if cfg.Risk.ExitConfMin != 0 {
+		t.Fatalf("default exit confidence minimum = %v, want 0", cfg.Risk.ExitConfMin)
+	}
+}
+
+func TestValidateExitPolicyConfig(t *testing.T) {
+	cfg := Defaults()
+	cfg.Risk.TrailingStop.Rule = "ema9"
+	cfg.Risk.ExitConfMin = 0.72
+	if containsStr(Validate(cfg), "risk.trailing_stop.rule") ||
+		containsStr(Validate(cfg), "risk.exit_conf_min") {
+		t.Fatalf("valid exit policy rejected: %v", Validate(cfg))
+	}
+
+	cfg.Risk.TrailingStop.Rule = "bollinger"
+	if !containsStr(Validate(cfg), "risk.trailing_stop.rule") {
+		t.Fatalf("invalid trailing rule not rejected: %v", Validate(cfg))
+	}
+	cfg.Risk.TrailingStop.Rule = "atr"
+	cfg.Risk.ExitConfMin = 1.01
+	if !containsStr(Validate(cfg), "risk.exit_conf_min") {
+		t.Fatalf("invalid confidence minimum not rejected: %v", Validate(cfg))
+	}
+}
+
 func TestSaveAndReload(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")

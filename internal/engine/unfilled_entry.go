@@ -56,11 +56,12 @@ func (e *Engine) cancelUnfilledEntry(tradeID, brokerOrderID, ticker string) {
 			logger.Info("unfilled entry: late fill detected — backfilling instead of cancelling",
 				"trade_id", tradeID, "ticker", ticker,
 				"filled_qty", status.FilledQty, "filled_price", status.FilledPrice)
-			if err := store.UpdateTradeEntryPrice(ctx, tradeID, status.FilledPrice, status.FilledQty); err != nil {
-				logger.Warn("unfilled entry: backfill trade", "trade_id", tradeID, "err", err)
-			}
-			if err := store.UpdateOrderFillPrice(ctx, brokerOrderID, status.FilledPrice, status.FilledQty); err != nil {
-				logger.Warn("unfilled entry: backfill order", "broker_order_id", brokerOrderID, "err", err)
+			if err := store.ApplyEntryFill(
+				ctx, tradeID, brokerOrderID, status.FilledPrice, status.FilledQty,
+				execution.NormalizeOrderStatus(status.Status),
+			); err != nil {
+				logger.Warn("unfilled entry: atomically backfill late fill",
+					"trade_id", tradeID, "broker_order_id", brokerOrderID, "err", err)
 			}
 			return
 		}

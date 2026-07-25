@@ -156,6 +156,7 @@ func TestSellExit_LegCancelFailureBlocks(t *testing.T) {
 	_, _, slID := insertBracketFixture(t, ticker, 3)
 	exec := &fakeBracketExec{
 		cancelErr: map[string]error{slID: fmt.Errorf("simulated cancel failure")},
+		statuses:  map[string]execution.OrderResult{slID: {Status: "pending"}},
 		placeRes:  execution.OrderResult{Status: "filled", FilledPrice: 120},
 	}
 	e := newBracketTestEngine(exec)
@@ -176,9 +177,38 @@ func TestSellExit_LegCancelFailureBlocks(t *testing.T) {
 	}
 }
 
-// TestSellExit_OrderErrorKeepsLongsOpen: broker rejects the sell — the lots
-// must stay open (software monitoring resumes since the legs are gone).
-func TestSellExit_OrderErrorKeepsLongsOpen(t *testing.T) {
+func TestSellExit_LegCancellationFillRetainsClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	const ticker = "SLFF"
+	tradeID, _, slID := insertBracketFixture(t, ticker, 3)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		slID: {Status: "cancelled", FilledPrice: 95, FilledQty: 3},
+	}}
+	e := newBracketTestEngine(exec)
+	sigID := insertSellSignal(t, ticker)
+
+	e.executeSellExit(context.Background(), sigID, store.Signal{
+		ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 94,
+	})
+	if len(exec.placed) != 0 {
+		t.Fatalf("market sell placed after leg flattened lot: %+v", exec.placed)
+	}
+	trade, err := store.GetTradeByID(context.Background(), tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if trade.Status != "exiting" || trade.Quantity != 0 {
+		t.Fatalf("trade = status %s qty %v, want exiting/0 for reconciliation",
+			trade.Status, trade.Quantity)
+	}
+}
+
+// TestSellExit_OrderErrorKeepsClaimForRecovery: placement errors are
+// ambiguous, so the lot remains exiting until broker recovery proves whether
+// the POST survived.
+func TestSellExit_OrderErrorKeepsClaimForRecovery(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
@@ -192,8 +222,20 @@ func TestSellExit_OrderErrorKeepsLongsOpen(t *testing.T) {
 		ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 119,
 	})
 	open, closed, short := tradeRowsForTicker(t, ticker)
-	if open != 1 || closed != 0 || short != 0 {
-		t.Fatalf("rows open=%d closed=%d short=%d, want 1/0/0", open, closed, short)
+	if open != 0 || closed != 0 || short != 0 {
+		t.Fatalf("rows open=%d closed=%d short=%d, want 0/0/0 while claim is retained", open, closed, short)
+	}
+	owned, err := store.GetOwnedPositionTrades(context.Background())
+	if err != nil {
+		t.Fatalf("GetOwnedPositionTrades: %v", err)
+	}
+	foundExiting := false
+	for _, trade := range owned {
+		foundExiting = foundExiting ||
+			(trade.Ticker == ticker && trade.Status == "exiting")
+	}
+	if !foundExiting {
+		t.Fatal("ambiguous placement released the exit claim")
 	}
 	if got := signalStatus(t, sigID); got != "blocked" {
 		t.Fatalf("signal status = %s, want blocked", got)

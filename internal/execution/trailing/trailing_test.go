@@ -3,6 +3,7 @@ package trailing
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -158,6 +159,29 @@ func (f *fakeStore) OpenExitLegsForTrade(_ context.Context, tradeID string) ([]s
 	return out, nil
 }
 
+func (f *fakeStore) ClaimTradeExit(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr, ok := f.trades[id]
+	if !ok || tr.Status != "open" {
+		return false, nil
+	}
+	tr.Status = "exiting"
+	f.trades[id] = tr
+	return true, nil
+}
+
+func (f *fakeStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr, ok := f.trades[id]
+	if ok && tr.Status == "exiting" {
+		tr.Status = "open"
+		f.trades[id] = tr
+	}
+	return nil
+}
+
 func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -166,6 +190,43 @@ func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error
 	o.ID = id
 	f.orders[id] = o
 	return id, nil
+}
+
+func (f *fakeStore) UpdateOrderFill(_ context.Context, orderID string, filledPrice, filledQty float64, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	o.FilledPrice, o.FilledQty, o.Status = filledPrice, filledQty, status
+	f.orders[orderID] = o
+	return nil
+}
+
+func (f *fakeStore) ApplyPartialExit(
+	_ context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (float64, float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	applied := math.Max(0, cumulativeFilledQty-o.FilledQty)
+	o.FilledPrice, o.FilledQty, o.Status =
+		filledPrice, math.Max(o.FilledQty, cumulativeFilledQty), status
+	f.orders[orderID] = o
+	tr := f.trades[tradeID]
+	tr.Quantity = math.Max(0, tr.Quantity-applied)
+	f.trades[tradeID] = tr
+	return tr.Quantity, applied, nil
+}
+
+func (f *fakeStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr := f.trades[id]
+	tr.Quantity = quantity
+	f.trades[id] = tr
+	return nil
 }
 
 func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnlPct float64) error {
@@ -184,7 +245,11 @@ func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnl
 	return nil
 }
 
-func (f *fakeStore) UpdateOrderStopPriceAndID(_ context.Context, orderID, newBrokerOrderID string, newStopPrice float64) error {
+func (f *fakeStore) UpdateOrderStopPriceAndID(
+	_ context.Context,
+	orderID, newBrokerOrderID string,
+	newStopPrice, newQuantity float64,
+) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o, ok := f.orders[orderID]
@@ -192,6 +257,7 @@ func (f *fakeStore) UpdateOrderStopPriceAndID(_ context.Context, orderID, newBro
 		return errors.New("order not found")
 	}
 	o.StopPrice = newStopPrice
+	o.Quantity = newQuantity
 	if newBrokerOrderID != "" {
 		o.BrokerOrderID = newBrokerOrderID
 	}
@@ -204,12 +270,14 @@ type fakePrices struct {
 	mu      sync.Mutex
 	candles []data.Candle
 	calls   int
+	lastTF  data.Timeframe
 }
 
-func (f *fakePrices) FetchHistory(_ context.Context, _ string, _ data.Timeframe, _ int) ([]data.Candle, error) {
+func (f *fakePrices) FetchHistory(_ context.Context, _ string, tf data.Timeframe, _ int) ([]data.Candle, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
+	f.lastTF = tf
 	out := make([]data.Candle, len(f.candles))
 	copy(out, f.candles)
 	return out, nil
@@ -234,6 +302,7 @@ type fakeBroker struct {
 	// works; tests can set it to "pending" or "" to simulate broker
 	// timeouts where the cancel didn't actually take.
 	statusOverride map[string]string
+	statusResults  map[string]execution.OrderResult
 	// notFoundIDs contains broker order ids GetOrderStatus must report as
 	// ErrOrderNotFound — exercises the cancelAndConfirm sentinel path.
 	notFoundIDs map[string]bool
@@ -243,6 +312,7 @@ type fakeBroker struct {
 	nextFillPrice float64
 	nextFillQty   float64
 	nextStatus    string // optional override of "pending" on PlaceOrder
+	placeErr      error
 }
 
 type replaceCall struct {
@@ -254,6 +324,9 @@ func (b *fakeBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.placed = append(b.placed, req)
+	if b.placeErr != nil {
+		return execution.OrderResult{}, b.placeErr
+	}
 	b.nextID++
 	status := "pending"
 	if b.nextStatus != "" {
@@ -295,6 +368,9 @@ func (b *fakeBroker) GetOrderStatus(_ context.Context, brokerOrderID string) (ex
 	defer b.mu.Unlock()
 	if b.notFoundIDs[brokerOrderID] {
 		return execution.OrderResult{}, execution.ErrOrderNotFound
+	}
+	if result, ok := b.statusResults[brokerOrderID]; ok {
+		return result, nil
 	}
 	if s, ok := b.statusOverride[brokerOrderID]; ok {
 		return execution.OrderResult{Status: s}, nil
@@ -368,6 +444,507 @@ func makeFlatPriceCandles(last float64, tail ...data.Candle) []data.Candle {
 	return out
 }
 
+func dailyCloses(values ...float64) []data.Candle {
+	out := make([]data.Candle, 0, len(values))
+	for _, closePrice := range values {
+		out = append(out, data.Candle{
+			Timeframe: data.Timeframe1Day,
+			Open:      closePrice,
+			High:      closePrice,
+			Low:       closePrice,
+			Close:     closePrice,
+		})
+	}
+	return out
+}
+
+func TestEMA9UsesBacktestSeedingConvention(t *testing.T) {
+	candles := dailyCloses(1, 2, 3, 4, 5, 6, 7, 8, 9)
+	if got := emaClose(candles, EMAPeriod); got != 5 {
+		t.Fatalf("seed ema = %v, want SMA seed 5", got)
+	}
+	candles = append(candles, dailyCloses(10)...)
+	// k=2/(9+1)=0.2 => 10*0.2 + 5*0.8 = 6
+	if got := emaClose(candles, EMAPeriod); got != 6 {
+		t.Fatalf("next ema = %v, want 6", got)
+	}
+}
+
+func TestCompletedDailyCandlesDropsCurrentPartialSession(t *testing.T) {
+	now := time.Date(2026, time.July, 24, 15, 30, 0, 0, newYorkLocation)
+	previous := data.Candle{
+		Timestamp: time.Date(2026, time.July, 23, 0, 0, 0, 0, newYorkLocation),
+		Close:     100,
+	}
+	current := data.Candle{
+		Timestamp: time.Date(2026, time.July, 24, 0, 0, 0, 0, newYorkLocation),
+		Close:     90,
+	}
+	got := completedDailyCandles([]data.Candle{previous, current}, now)
+	if len(got) != 1 || got[0].Close != 100 {
+		t.Fatalf("completed candles = %+v, want only previous session", got)
+	}
+
+	afterClose := time.Date(2026, time.July, 24, 16, 5, 0, 0, newYorkLocation)
+	got = completedDailyCandles([]data.Candle{previous, current}, afterClose)
+	if len(got) != 2 {
+		t.Fatalf("after-close candles = %d, want current session included", len(got))
+	}
+}
+
+func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 110)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fp.lastTF != data.Timeframe1Day {
+		t.Fatalf("timeframe = %s, want daily to match study", fp.lastTF)
+	}
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("close above ema9 must keep trade open")
+	}
+	if len(fb.placed) != 1 {
+		t.Fatalf("placed = %d, want one protective stop", len(fb.placed))
+	}
+	stop := fb.placed[0]
+	if stop.Type != execution.OrderTypeStop || stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
+		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	}
+}
+
+func TestManager_EMA9CappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, TakeProfit: 110, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 105)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("close above ema9 must keep capped trade open")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want no standalone stop beside software take-profit", fb.placed)
+	}
+}
+
+func TestManager_ATRCappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, TakeProfit: 110, Quantity: 10,
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 101, 99, 100))}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleATR}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want capped ATR trade to remain app-managed", fb.placed)
+	}
+}
+
+func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	// Fewer than nine completed daily candles makes EMA calculation fail.
+	fp := &fakePrices{candles: dailyCloses(100, 101, 102)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("missing EMA history must leave the trade open")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("orders = %+v, want a protective stop despite missing EMA history", fb.placed)
+	}
+	if stop := fb.placed[0]; stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
+		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	}
+}
+
+func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 5,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "partial-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100)}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+
+	m.UpdateAll(context.Background())
+
+	if len(fb.cancelled) != 1 || fb.cancelled[0] != "partial-stop" {
+		t.Fatalf("cancelled = %v, want partial-stop", fb.cancelled)
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Quantity != 5 {
+		t.Fatalf("replacement stop = %+v, want quantity 5", fb.placed)
+	}
+	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || stop == nil {
+		t.Fatalf("LatestStopLossOrderForTrade: %v (nil=%v)", err, stop == nil)
+	}
+	if stop.Quantity != 5 {
+		t.Fatalf("stored stop quantity = %v, want 5", stop.Quantity)
+	}
+}
+
+func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	// Nine closes at 100 seed EMA=100; the final 90 close produces EMA=98.
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{
+		nextFillPrice: 90,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
+	losses := 0
+
+	m := NewManager(Config{
+		Enabled:    true,
+		Rule:       RuleEMA9,
+		RecordLoss: func() { losses++ },
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "closed" {
+		t.Fatal("daily close below ema9 must close the trade")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("placed = %+v, want one market exit after cancelling hard stop", fb.placed)
+	}
+	if got := fs.trades["t1"].ExitPrice; got != 90 {
+		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
+	}
+	if losses != 1 {
+		t.Fatalf("loss cooldown callbacks = %d, want 1", losses)
+	}
+}
+
+func TestManager_EMA9AfterCloseKeepsHardStopUntilNextSession(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 16, 5, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("after-close EMA signal must leave trade tracked overnight")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("after-close orders = %+v, want only the protective stop", fb.placed)
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("after-close stop was cancelled: %v", fb.cancelled)
+	}
+
+	// The same completed-close signal is retried during the next regular
+	// session. Only then may the manager cancel the stop and market-exit.
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 27, 10, 0, 0, 0, newYorkLocation)
+	}
+	fb.nextFillPrice = 90
+	fb.nextFillQty = 10
+	fb.nextStatus = "filled"
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "closed" {
+		t.Fatal("EMA signal must exit during the next regular session")
+	}
+	if len(fb.cancelled) != 1 {
+		t.Fatalf("cancelled = %v, want protective stop cancelled at eligible exit", fb.cancelled)
+	}
+	if len(fb.placed) != 2 || fb.placed[1].Type != execution.OrderTypeMarket {
+		t.Fatalf("orders = %+v, want stop followed by market exit", fb.placed)
+	}
+}
+
+func TestManager_EMA9WaitsForConfirmedStopCancellation(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "pending"}}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("trade closed before hard-stop cancellation was confirmed")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want no market exit while hard stop remains live", fb.placed)
+	}
+	if len(fb.cancelled) != 1 || fb.cancelled[0] != "hard-stop" {
+		t.Fatalf("cancelled = %v, want attempted hard-stop cancellation", fb.cancelled)
+	}
+}
+
+func TestManager_EMA9PendingExitRemainsDurablyExiting(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{nextStatus: "partially_filled", nextFillPrice: 99, nextFillQty: 4}
+	losses := 0
+
+	m := NewManager(Config{
+		Enabled: true, Rule: RuleEMA9, RecordLoss: func() { losses++ },
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting until full broker fill", got)
+	}
+	if losses != 0 {
+		t.Fatalf("loss cooldown recorded from partial fill: %d", losses)
+	}
+	placed := len(fb.placed)
+	m.UpdateAll(context.Background())
+	if len(fb.placed) != placed {
+		t.Fatal("pending EMA exit was submitted again")
+	}
+}
+
+func TestExitAndCloseRetainsClaimAfterAmbiguousPlacementError(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 10,
+	}
+	fs.trades[trade.ID] = trade
+	fb := &fakeBroker{placeErr: errors.New("response decode timed out")}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 99)
+	if err == nil {
+		t.Fatal("ambiguous placement unexpectedly succeeded")
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for broker recovery", got)
+	}
+}
+
+func TestExitAndCloseRetainsClaimWhenCancelledLegFlattensTrade(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 5,
+	}
+	fs.trades[trade.ID] = trade
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "hard-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5,
+		Status: "pending", IsStopLoss: true,
+	})
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"hard-stop": {
+			Status: "cancelled", FilledPrice: 95, FilledQty: 5,
+		},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 95)
+	if !errors.Is(err, errExitClaimMustRemain) {
+		t.Fatalf("error = %v, want claim-retention sentinel", err)
+	}
+	got := fs.trades[trade.ID]
+	if got.Status != "exiting" || got.Quantity != 0 {
+		t.Fatalf("trade = status %q qty %v, want exiting/0 for reconciliation",
+			got.Status, got.Quantity)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market sell placed after leg already flattened trade: %+v", fb.placed)
+	}
+}
+
+func TestExitAndCloseRetainsClaimWhenLegReportsFilledDuringCancel(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 5,
+	}
+	fs.trades[trade.ID] = trade
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "hard-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5,
+		Status: "pending", IsStopLoss: true,
+	})
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"hard-stop": {
+			Status: "filled", FilledPrice: 95, FilledQty: 5,
+		},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 95)
+	if !errors.Is(err, errExitClaimMustRemain) {
+		t.Fatalf("error = %v, want claim-retention sentinel", err)
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fill reconciliation", got)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market sell placed after leg filled: %+v", fb.placed)
+	}
+}
+
+func TestCancelAndConfirmRejectsStopFillRace(t *testing.T) {
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "filled"}}
+	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
+
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop"); err == nil {
+		t.Fatal("filled stop must abort cancel-and-resubmit")
+	}
+}
+
+func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{
+		nextFillPrice: 110,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
+	m := NewManager(Config{
+		Enabled: true,
+		Rule:    RuleEMA9,
+		MarketOpen: func(time.Time) bool {
+			return false // e.g. an exchange holiday during normal clock hours
+		},
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 3, 10, 0, 0, 0, newYorkLocation)
+	}
+
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("closed-calendar EMA signal must remain tracked")
+	}
+	if len(fb.placed) != 0 || len(fb.cancelled) != 0 {
+		t.Fatalf("closed-calendar manager touched broker orders: placed=%+v cancelled=%v", fb.placed, fb.cancelled)
+	}
+}
+
+func TestManager_EMA9IgnoresClosePredatingTrade(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+		OpenedAt: time.Date(2026, time.July, 24, 9, 35, 0, 0, newYorkLocation),
+	}
+	candles := dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)
+	for i := range candles {
+		candles[i].Timestamp = time.Date(2026, time.July, 14+i, 0, 0, 0, 0, newYorkLocation)
+	}
+	fp := &fakePrices{candles: candles}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+
+	m.UpdateAll(context.Background())
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("pre-entry EMA close must not churn the new trade")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("orders = %+v, want only the protective stop", fb.placed)
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("pre-entry EMA close cancelled protection: %v", fb.cancelled)
+	}
+}
+
+func TestProtectiveStopTIF(t *testing.T) {
+	if got := protectiveStopTIF(10); got != "gtc" {
+		t.Fatalf("whole-share TIF = %q, want gtc", got)
+	}
+	if got := protectiveStopTIF(10.5); got != "day" {
+		t.Fatalf("fractional TIF = %q, want day", got)
+	}
+}
+
 // TestManager_FirstTickSeedsHWM confirms that on the first observation the
 // manager seeds high_water_mark from MAX(entry_price, current_price).
 func TestManager_FirstTickSeedsHWM(t *testing.T) {
@@ -394,6 +971,30 @@ func TestManager_FirstTickSeedsHWM(t *testing.T) {
 	}
 	if got < 100 {
 		t.Fatalf("HWM should be >= entry_price (100), got %v", got)
+	}
+}
+
+func TestManager_ATRDoesNotSubmitZeroPriceStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 0, Quantity: 10,
+	}
+	candles := make([]data.Candle, 30)
+	for i := range candles {
+		candles[i] = candle(100, 100, 100, 100)
+	}
+	fp := &fakePrices{candles: candles}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("zero-price ATR input placed broker orders: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].HighWaterMark; got != 100 {
+		t.Fatalf("high-water mark = %v, want 100 preserved for retry", got)
 	}
 }
 
@@ -695,7 +1296,11 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 		return t
 	}()
 	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
-	fb := &fakeBroker{}
+	fb := &fakeBroker{
+		nextFillPrice: 110,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
 	m.UpdateAll(context.Background())
@@ -733,6 +1338,43 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	if len(fb.placed) != placedBefore {
 		t.Fatalf("duplicate market exit on second tick: placed %d → %d",
 			placedBefore, len(fb.placed))
+	}
+}
+
+func TestManager_NewProtectiveStopImmediateFillTransfersOwnership(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, TakeProfit: 0,
+		HighWaterMark: 100,
+	}
+	fs.trades[trade.ID] = trade
+	fp := &fakePrices{candles: makeFlatPriceCandles(
+		110, candle(109, 110, 108, 110),
+	)}
+	fb := &fakeBroker{
+		nextStatus: "filled", nextFillPrice: 108.5, nextFillQty: 10,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+
+	err := m.updateOne(context.Background(), trade)
+	if !errors.Is(err, errStopFilledDuringRollback) {
+		t.Fatalf("error = %v, want immediate-fill sentinel", err)
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for reconciliation", got)
+	}
+	var found bool
+	for _, order := range fs.orders {
+		if order.BrokerOrderID == "broker-1" {
+			found = true
+			if order.Status != "filled" || order.FilledQty != 10 {
+				t.Fatalf("immediate fill order = %+v", order)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("immediate stop fill was not persisted")
 	}
 }
 
@@ -845,7 +1487,7 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	if _, err := ls.InsertOrder(ctx, store.Order{}); err == nil {
 		t.Fatalf("InsertOrder(no DB): want error, got nil")
 	}
-	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0); err == nil {
+	if err := ls.UpdateOrderStopPriceAndID(ctx, "o1", "broker-x", 1.0, 1.0); err == nil {
 		t.Fatalf("UpdateOrderStopPriceAndID(no DB): want error, got nil")
 	}
 	if err := ls.CloseTrade(ctx, "t1", 100, 1, 1); err == nil {

@@ -36,6 +36,14 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		})
 	}
 
+	if minConf := e.cfg.Risk.ExitConfMin; !sellExitConfidenceAllowed(sig.Confidence, minConf) {
+		blockSignal(
+			fmt.Sprintf("SELL confidence %.3f is below exit minimum %.3f; trailing stop remains in control", sig.Confidence, minConf),
+			"exit_confidence",
+		)
+		return
+	}
+
 	// The lots this SELL exits. DB quantity is broker-truth maintained by
 	// the fill polls and reconcilers; if it drifts, checkExitResidue flags
 	// the difference after the exit settles.
@@ -59,13 +67,37 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		return
 	}
 
+	claimed := make([]store.Trade, 0, len(longs))
+	releaseClaims := func() {
+		for _, t := range claimed {
+			if err := store.ReleaseTradeExitClaim(ctx, t.ID); err != nil {
+				logger.Warn("sell exit: release trade claim", "trade_id", t.ID, "err", err)
+			}
+		}
+	}
+	for _, t := range longs {
+		ok, err := store.ClaimTradeExit(ctx, t.ID)
+		if err != nil || !ok {
+			releaseClaims()
+			blockSignal("another exit worker already owns this position", "exit_ownership")
+			return
+		}
+		claimed = append(claimed, t)
+	}
+
 	// Working exit legs and broker-resident stops hold the long's shares;
 	// they must be confirmed gone before the sell or the broker rejects it
 	// (and a still-live leg would race the fill).
-	if !e.cancelBracketLegsForTicker(ctx, sig.Ticker) {
+	remainingByTrade, remainingQty, clear, releaseSafe :=
+		e.cancelClaimedExitLegs(ctx, claimed, sig.Ticker)
+	if !clear {
+		if releaseSafe {
+			releaseClaims()
+		}
 		blockSignal("working exit legs could not be confirmed cancelled — sell would race a live leg", "bracket_leg_cancel")
 		return
 	}
+	totalQty = remainingQty
 
 	result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:     sig.Ticker,
@@ -75,10 +107,10 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	})
 	if err != nil {
-		// Legs are already cancelled: the position is UNPROTECTED until the
-		// software monitor resumes on the next tick (it will — no working
-		// legs means app-managed monitoring applies).
-		logger.Error("sell exit order failed — position temporarily unprotected until the monitor resumes",
+		// Broker POST/response failures are ambiguous: the order may have
+		// been accepted before the transport failed. Keep every claim so
+		// orderless-exit recovery can inspect working orders/positions.
+		logger.Error("sell exit placement ambiguous — claims retained for broker recovery",
 			"ticker", sig.Ticker, "qty", totalQty, "err", err)
 		blockSignal(fmt.Sprintf("sell order failed: %v", err), "order placement")
 		return
@@ -89,48 +121,20 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	}
 	e.costTracker.RecordTrade()
 
-	// Confirm the fill; fall back to the signal price when the broker
-	// hasn't reported yet — the exit-fill reconciler heals the rows to
-	// broker truth within its 10-minute sweep.
-	exitPrice := result.FilledPrice
-	confirmed := exitPrice > 0
-	if !confirmed && result.BrokerOrderID != "" {
-		if res, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok && res.FilledPrice > 0 {
+	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
+		if res, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
 			result = res
-			exitPrice = res.FilledPrice
-			confirmed = true
 		}
-	}
-	if exitPrice <= 0 {
-		exitPrice = sig.SignalPrice
-	}
-	if exitPrice <= 0 {
-		// Defensive: executeSignal validates SignalPrice before routing
-		// here, so this is unreachable in the normal flow. If it ever
-		// fires, leave the lots OPEN — the shares are sold at the broker,
-		// which checkExitResidue and the broker-drift reconciler surface —
-		// rather than closing rows at a fabricated zero price that no
-		// reconciler heals in paper mode.
-		logger.Error("sell exit: no usable exit price — lots left open for reconciliation",
-			"ticker", sig.Ticker, "broker_order_id", result.BrokerOrderID)
-		e.checkExitResidue(sig.Ticker)
-		return
 	}
 
-	// Close every lot at the (single) fill, per-lot P&L. One exit order row
-	// per lot shares the broker order id so the reconciler heals each.
+	status := execution.NormalizeOrderStatus(result.Status)
+	fullFill := status == "filled" && result.FilledPrice > 0 &&
+		result.FilledQty >= totalQty-1e-9
+	persistFailed := false
 	for _, t := range longs {
-		pnl := (exitPrice - t.EntryPrice) * t.Quantity
-		var pnlPct float64
-		if t.EntryPrice > 0 {
-			pnlPct = pnl / (t.EntryPrice * t.Quantity) * 100
-		}
-		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
-			logger.Warn("sell exit: close trade", "trade_id", t.ID, "err", err)
+		lotQuantity := remainingByTrade[t.ID]
+		if lotQuantity <= 0 {
 			continue
-		}
-		if pnl < 0 {
-			e.portfolio.RecordLoss()
 		}
 		exitOrder := store.Order{
 			TradeID:       t.ID,
@@ -138,29 +142,62 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			Ticker:        sig.Ticker,
 			Side:          string(execution.OrderSideSell),
 			OrderType:     string(execution.OrderTypeMarket),
-			Quantity:      t.Quantity,
-			Status:        execution.NormalizeOrderStatus(result.Status),
+			Quantity:      lotQuantity,
+			Status:        status,
 		}
-		if confirmed {
-			exitOrder.FilledPrice = exitPrice
-			exitOrder.FilledQty = t.Quantity
+		if fullFill {
+			exitOrder.FilledPrice = result.FilledPrice
+			exitOrder.FilledQty = lotQuantity
 		}
-		if _, err := store.InsertOrder(ctx, exitOrder); err != nil {
-			logger.Warn("sell exit: insert exit order", "trade_id", t.ID, "err", err)
+		if _, err := store.InsertOrderWithRetry(ctx, exitOrder); err != nil {
+			persistFailed = true
+			logger.Error("sell exit: record accepted aggregate order — lot remains exiting",
+				"trade_id", t.ID, "broker_order_id", result.BrokerOrderID, "err", err)
+		}
+	}
+	if persistFailed {
+		return
+	}
+	if (status == "cancelled" || status == "rejected") && result.FilledQty == 0 {
+		releaseClaims()
+		return
+	}
+	if !fullFill {
+		return
+	}
+
+	// A broker-confirmed aggregate fill closes every lot at the same execution
+	// price. Pending and partial responses remain durably exiting.
+	for _, t := range longs {
+		lotQuantity := remainingByTrade[t.ID]
+		if lotQuantity <= 0 {
+			continue
+		}
+		pnl, pnlPct := tradePnL("long", t.EntryPrice, lotQuantity, result.FilledPrice)
+		if err := store.CloseTrade(ctx, t.ID, result.FilledPrice, pnl, pnlPct); err != nil {
+			logger.Warn("sell exit: close confirmed trade", "trade_id", t.ID, "err", err)
+			continue
+		}
+		if pnl < 0 {
+			e.portfolio.RecordLoss()
 		}
 		logger.Info("trade closed by sell signal",
 			"trade_id", t.ID,
 			"ticker", sig.Ticker,
-			"exit_price", exitPrice,
-			"qty", t.Quantity,
+			"exit_price", result.FilledPrice,
+			"qty", lotQuantity,
 			"pnl", fmt.Sprintf("%.2f", pnl),
-			"fill_confirmed", confirmed,
+			"fill_confirmed", true,
 		)
 		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 			TradeID: t.ID, Ticker: sig.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: exitPrice,
+			EntryPrice: t.EntryPrice, ExitPrice: result.FilledPrice,
 			PnL: pnl, PnLPct: pnlPct, Reason: "sell signal",
 		})
 	}
 	e.checkExitResidue(sig.Ticker)
+}
+
+func sellExitConfidenceAllowed(confidence, minimum float64) bool {
+	return minimum <= 0 || confidence >= minimum
 }
