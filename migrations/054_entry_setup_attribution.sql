@@ -21,13 +21,15 @@ WHERE t.signal_id = s.id;
 CREATE INDEX idx_trades_entry_setup_opened_at
     ON trades (entry_setup, opened_at DESC);
 
--- Before this release, enabling pullback_strength made the scanner universe
--- exclusive, but watchlist rows did not retain that qualification. Preserve
--- those active in-flight candidates across the additive rollout. The tag is
--- inert when the feature remains disabled, and newly scanned standard
--- candidates after this migration are deliberately left untagged.
+-- Before this release, watchlist rows did not retain whether they passed the
+-- optional pullback universe. There is therefore no reliable way to distinguish
+-- a qualified row created while the feature was enabled from a standard row
+-- created while it was disabled. Deactivate these unknown in-flight rows so the
+-- next scanner cycle re-screens them and reactivates each one with the correct
+-- additive-path strategy tags. This also prevents an old qualified row from
+-- reaching the standard BUY path during rollout.
 UPDATE watchlist
-SET strategies = array_append(strategies, 'pullback_strength'),
+SET active = FALSE,
     updated_at = NOW()
 WHERE platform = 'stock'
   AND source = 'scanner'
