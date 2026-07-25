@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"time"
 )
@@ -102,28 +103,33 @@ func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty floa
 
 // ApplyPartialExit atomically advances an order's cumulative fill and reduces
 // its trade by only the newly observed shares. Replaying the same broker
-// result is a no-op, which keeps cancellation-race recovery safe across
-// process restarts and failures between otherwise separate writes.
+// result is quantity-idempotent; a revised cumulative average reprices the
+// order's existing contribution without selling shares twice. This keeps
+// cancellation-race recovery safe across process restarts and failures
+// between otherwise separate writes.
 func ApplyPartialExit(
 	ctx context.Context,
 	tradeID, orderID string,
 	filledPrice, cumulativeFilledQty float64,
 	status string,
 ) (remaining, applied float64, err error) {
+	if cumulativeFilledQty > 0 && filledPrice <= 0 {
+		return 0, 0, fmt.Errorf("partial exit fill price must be positive")
+	}
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return 0, 0, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var recorded, appliedAlready, orderQuantity float64
+	var recorded, recordedPrice, appliedAlready, orderQuantity float64
 	if err = tx.QueryRow(ctx, `
-		SELECT COALESCE(filled_qty,0), COALESCE(exit_fill_applied_qty,0),
-		       quantity
+		SELECT COALESCE(filled_qty,0), COALESCE(filled_price,0),
+		       COALESCE(exit_fill_applied_qty,0), quantity
 		FROM orders
 		WHERE id=$1
 		FOR UPDATE`, orderID).Scan(
-		&recorded, &appliedAlready, &orderQuantity,
+		&recorded, &recordedPrice, &appliedAlready, &orderQuantity,
 	); err != nil {
 		return 0, 0, err
 	}
@@ -135,6 +141,11 @@ func ApplyPartialExit(
 		targetFill = math.Min(targetFill, math.Max(orderQuantity, appliedAlready))
 	}
 	applied = math.Max(0, targetFill-appliedAlready)
+	// FilledPrice is the broker's cumulative average for this order. A later
+	// response can revise that average without advancing FilledQty, so replace
+	// the contribution of every previously applied share as well as adding any
+	// newly observed shares.
+	proceedsDelta := targetFill*filledPrice - appliedAlready*recordedPrice
 
 	if _, err = tx.Exec(ctx, `
 		UPDATE orders
@@ -147,10 +158,16 @@ func ApplyPartialExit(
 	}
 	if err = tx.QueryRow(ctx, `
 		UPDATE trades
-		SET quantity=GREATEST(0, quantity-$1)
+		SET quantity=GREATEST(0, quantity-$1),
+		    realized_exit_qty=realized_exit_qty+$1,
+		    realized_exit_proceeds=realized_exit_proceeds+$3,
+		    realized_pnl=realized_pnl+CASE
+		        WHEN direction='short' THEN entry_price*$1-$3
+		        ELSE $3-entry_price*$1
+		    END
 		WHERE id=$2 AND status IN ('open','exiting')
 		RETURNING quantity`,
-		applied, tradeID,
+		applied, tradeID, proceedsDelta,
 	).Scan(&remaining); err != nil {
 		return 0, 0, err
 	}

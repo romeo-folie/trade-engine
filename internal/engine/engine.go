@@ -2795,12 +2795,12 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 		}
 
 		exitPrice := result.FilledPrice
-		pnl, pnlPct := tradePnL(t.Direction, t.EntryPrice, t.Quantity, exitPrice)
-		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+		realized, err := store.CloseTradeRealized(ctx, t.ID, exitPrice)
+		if err != nil {
 			logger.Warn("close confirmed trade", "trade_id", t.ID, "err", err)
 			continue
 		}
-		if pnl < 0 {
+		if realized.PnL < 0 {
 			e.portfolio.RecordLoss()
 		}
 
@@ -2808,13 +2808,13 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			"trade_id", t.ID,
 			"ticker", t.Ticker,
 			"reason", exitReason,
-			"pnl", fmt.Sprintf("%.2f", pnl),
-			"pnl_pct", fmt.Sprintf("%.2f%%", pnlPct),
+			"pnl", fmt.Sprintf("%.2f", realized.PnL),
+			"pnl_pct", fmt.Sprintf("%.2f%%", realized.PnLPct),
 		)
 		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
 			TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: exitPrice,
-			PnL: pnl, PnLPct: pnlPct, Reason: exitReason,
+			EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
+			PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: exitReason,
 		})
 
 		// Residue check: after the exit settles, the broker must hold no more

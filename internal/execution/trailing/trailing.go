@@ -124,12 +124,13 @@ type TradeStore interface {
 	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
 	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
-	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
-	// + closed_at. Called after a successful trail-driven market exit so the
-	// trade isn't picked up again on the next tick (which would place a
-	// duplicate market sell). Mirrors what engine.monitorPositions does on
-	// a stop/take-profit fill.
-	CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
+	// CloseTradeRealized closes the trade after a confirmed market exit and
+	// returns lifecycle-cumulative P&L across any earlier partial exits.
+	CloseTradeRealized(
+		ctx context.Context,
+		id string,
+		exitPrice float64,
+	) (store.TradeRealization, error)
 }
 
 // Config controls the trailing-stop manager.
@@ -830,15 +831,11 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 		return nil
 	}
 	exitPrice := exitRes.FilledPrice
-	pnl := (exitPrice - t.EntryPrice) * t.Quantity
-	pnlPct := 0.0
-	if t.EntryPrice > 0 {
-		pnlPct = pnl / (t.EntryPrice * t.Quantity) * 100
-	}
-	if err := m.store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+	realized, err := m.store.CloseTradeRealized(ctx, t.ID, exitPrice)
+	if err != nil {
 		return fmt.Errorf("close trade after market exit: %w", err)
 	}
-	if pnl < 0 && m.cfg.RecordLoss != nil {
+	if realized.PnL < 0 && m.cfg.RecordLoss != nil {
 		m.cfg.RecordLoss()
 	}
 	return nil

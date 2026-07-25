@@ -77,6 +77,40 @@ func (f *recoveryExitStore) InsertOrderWithRetry(_ context.Context, o store.Orde
 	return o.BrokerOrderID, nil
 }
 
+func (f *recoveryExitStore) ApplyRecoveredExit(
+	_ context.Context,
+	id string,
+	exitPrice, soldQty float64,
+) (store.TradeRealization, error) {
+	var trade store.Trade
+	for _, candidate := range f.orderless {
+		if candidate.ID == id {
+			trade = candidate
+			break
+		}
+	}
+	remaining := math.Max(0, trade.Quantity-soldQty)
+	pnl, pnlPct := tradePnL(
+		trade.Direction, trade.EntryPrice, soldQty, exitPrice,
+	)
+	result := store.TradeRealization{
+		ExitPrice: exitPrice,
+		PnL:       pnl,
+		PnLPct:    pnlPct,
+		ExitQty:   soldQty,
+		Remaining: remaining,
+		Status:    "open",
+	}
+	if remaining > 0 {
+		f.tradeQty[id] = remaining
+		f.released = append(f.released, id)
+		return result, nil
+	}
+	result.Status = "closed"
+	f.tradeExits[id] = [3]float64{exitPrice, pnl, pnlPct}
+	return result, nil
+}
+
 func (f *recoveryExitStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
 	f.released = append(f.released, id)
 	return nil
@@ -130,6 +164,22 @@ func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl,
 	}
 	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
 	return nil
+}
+func (f *fakeExitStore) FinalizeTradeExit(
+	_ context.Context,
+	id string,
+	exit, pnl, pnlPct float64,
+) (store.TradeRealization, error) {
+	if f.tradeExitErr != nil {
+		return store.TradeRealization{}, f.tradeExitErr
+	}
+	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
+	return store.TradeRealization{
+		ExitPrice: exit,
+		PnL:       pnl,
+		PnLPct:    pnlPct,
+		Status:    "closed",
+	}, nil
 }
 func (f *fakeExitStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {
 	f.tradeQty[id] = quantity

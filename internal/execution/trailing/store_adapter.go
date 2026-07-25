@@ -119,9 +119,13 @@ func (liveStore) UpdateOrderStopPriceAndID(
 	)
 }
 
-func (liveStore) CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+func (liveStore) CloseTradeRealized(
+	ctx context.Context,
+	id string,
+	exitPrice float64,
+) (store.TradeRealization, error) {
 	if !store.IsConnected() {
-		return errStoreNotConnected
+		return store.TradeRealization{}, errStoreNotConnected
 	}
-	return store.CloseTrade(ctx, id, exitPrice, pnl, pnlPct)
+	return store.CloseTradeRealized(ctx, id, exitPrice)
 }

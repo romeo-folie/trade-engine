@@ -35,6 +35,7 @@ type orderlessExitStore interface {
 	GetOwnedPositionTrades(ctx context.Context) ([]store.Trade, error)
 	GetDurableExitOrderOwnership(ctx context.Context) ([]store.DurableExitOrderOwnership, error)
 	InsertOrderWithRetry(ctx context.Context, o store.Order) (string, error)
+	ApplyRecoveredExit(ctx context.Context, id string, exitPrice, soldQty float64) (store.TradeRealization, error)
 }
 
 // exitReconcileStore is the minimum store surface used by the exit-fill
@@ -50,6 +51,7 @@ type exitReconcileStore interface {
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
 	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
 	UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
+	FinalizeTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) (store.TradeRealization, error)
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error
@@ -70,6 +72,9 @@ func (exitStoreAdapter) ApplyPartialExit(ctx context.Context, tradeID, orderID s
 func (exitStoreAdapter) UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	return store.UpdateTradeExit(ctx, id, exitPrice, pnl, pnlPct)
 }
+func (exitStoreAdapter) FinalizeTradeExit(ctx context.Context, id string, _, _, _ float64) (store.TradeRealization, error) {
+	return store.FinalizeTradeExit(ctx, id)
+}
 func (exitStoreAdapter) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
 	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
 }
@@ -87,6 +92,9 @@ func (exitStoreAdapter) GetOwnedPositionTrades(ctx context.Context) ([]store.Tra
 }
 func (exitStoreAdapter) GetDurableExitOrderOwnership(ctx context.Context) ([]store.DurableExitOrderOwnership, error) {
 	return store.GetDurableExitOrderOwnership(ctx)
+}
+func (exitStoreAdapter) ApplyRecoveredExit(ctx context.Context, id string, exitPrice, soldQty float64) (store.TradeRealization, error) {
+	return store.ApplyRecoveredExit(ctx, id, exitPrice, soldQty)
 }
 func (exitStoreAdapter) InsertOrderWithRetry(ctx context.Context, o store.Order) (string, error) {
 	return store.InsertOrderWithRetry(ctx, o)
@@ -352,11 +360,14 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			pnl, pnlPct := tradePnL(
 				state.direction, state.entryPrice, state.fillQty, exitPrice,
 			)
-			if err := db.UpdateTradeExit(ctx, tradeID, exitPrice, pnl, pnlPct); err != nil {
+			realized, err := db.FinalizeTradeExit(
+				ctx, tradeID, exitPrice, pnl, pnlPct,
+			)
+			if err != nil {
 				stats.Errors++
 				continue
 			}
-			if pnl < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
+			if realized.PnL < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
 				recordLoss[0]()
 			}
 			continue
@@ -563,35 +574,24 @@ func recoverOrderlessExits(
 			continue
 		}
 		sold := math.Min(t.Quantity, missing)
-		remaining := math.Max(0, t.Quantity-sold)
 		recoveryPrice := brokerPrice[t.Ticker]
-		if remaining > 1e-9 {
-			if err := db.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
-				stats.Errors++
-				continue
-			}
-			if err := db.ReleaseTradeExitClaim(ctx, t.ID); err != nil {
-				stats.Errors++
-				continue
-			}
-		} else {
-			price := recoveryPrice
-			if price <= 0 {
-				// A flat position has no live quote in GetPositions. Close
-				// conservatively at cost so the zero-quantity claim cannot
-				// strand forever; the ERROR log preserves the accounting
-				// exception for broker-activity backfill.
-				price = t.EntryPrice
-			}
-			recoveryPrice = price
-			pnl, pnlPct := tradePnL(t.Direction, t.EntryPrice, t.Quantity, price)
-			if err := db.UpdateTradeExit(ctx, t.ID, price, pnl, pnlPct); err != nil {
-				stats.Errors++
-				continue
-			}
-			if pnl < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
-				recordLoss[0]()
-			}
+		if recoveryPrice <= 0 {
+			// A flat position has no live quote in GetPositions. Realize the
+			// inferred slice conservatively at cost; the ERROR log preserves
+			// the accounting exception for broker-activity backfill.
+			recoveryPrice = t.EntryPrice
+		}
+		realized, err := recoveryDB.ApplyRecoveredExit(
+			ctx, t.ID, recoveryPrice, sold,
+		)
+		if err != nil {
+			stats.Errors++
+			continue
+		}
+		remaining := realized.Remaining
+		if realized.Status == "closed" && realized.PnL < 0 &&
+			len(recordLoss) > 0 && recordLoss[0] != nil {
+			recordLoss[0]()
 		}
 		shortage[t.Ticker] = math.Max(0, missing-sold)
 		stats.Recovered++
