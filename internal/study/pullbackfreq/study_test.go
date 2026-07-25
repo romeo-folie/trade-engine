@@ -3,6 +3,7 @@ package pullbackfreq
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,12 +22,12 @@ func (p stubProvider) FetchCandles(
 	return p.candles, p.err
 }
 
-func TestRunRecordsLoadFailures(t *testing.T) {
+func TestRunRejectsIncompleteCohort(t *testing.T) {
 	day := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	result, err := Run(context.Background(), stubProvider{err: errors.New("feed unavailable")},
 		[]Member{{Ticker: "A"}}, Config{From: day, To: day})
-	if err != nil {
-		t.Fatalf("Run() error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "incomplete cohort") {
+		t.Fatalf("Run() error = %v, want incomplete cohort", err)
 	}
 	if result.LoadErrors["A"] != "feed unavailable" {
 		t.Fatalf("load error = %q, want feed unavailable", result.LoadErrors["A"])
@@ -34,8 +35,8 @@ func TestRunRecordsLoadFailures(t *testing.T) {
 
 	result, err = Run(context.Background(), stubProvider{},
 		[]Member{{Ticker: "A"}}, Config{From: day, To: day})
-	if err != nil {
-		t.Fatalf("Run() empty result error = %v", err)
+	if err == nil || !strings.Contains(err.Error(), "incomplete cohort") {
+		t.Fatalf("Run() empty result error = %v, want incomplete cohort", err)
 	}
 	if result.LoadErrors["A"] != "no daily candles returned" {
 		t.Fatalf("empty load error = %q, want no daily candles returned", result.LoadErrors["A"])
@@ -49,6 +50,15 @@ func TestRunHonorsCancelledContext(t *testing.T) {
 	_, err := Run(ctx, stubProvider{}, []Member{{Ticker: "A"}}, Config{From: day, To: day})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+}
+
+func TestRunRejectsEmptyNormalizedCohort(t *testing.T) {
+	day := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	_, err := Run(context.Background(), stubProvider{},
+		[]Member{{Ticker: " "}}, Config{From: day, To: day})
+	if err == nil || !strings.Contains(err.Error(), "cohort is empty") {
+		t.Fatalf("Run() error = %v, want empty cohort", err)
 	}
 }
 

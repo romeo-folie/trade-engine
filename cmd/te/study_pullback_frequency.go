@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
-	"github.com/romeo-folie/trade-engine/internal/backtest"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -57,14 +55,24 @@ survivorship-free reconstruction of the live scanner universe.`,
 	RunE: runPullbackFrequencyStudy,
 }
 
-type cachedDailyLoader struct {
-	runner *backtest.Runner
+type refreshingDailyLoader struct {
+	provider data.MarketDataProvider
 }
 
-func (l cachedDailyLoader) FetchCandles(
+func (l refreshingDailyLoader) FetchCandles(
 	ctx context.Context, ticker string, tf data.Timeframe, from, to time.Time,
 ) ([]data.Candle, error) {
-	return l.runner.LoadCandles(ctx, ticker, tf, from, to)
+	candles, err := l.provider.FetchCandles(ctx, ticker, tf, from, to)
+	if err != nil {
+		return nil, err
+	}
+	if len(candles) == 0 {
+		return nil, nil
+	}
+	if err := store.UpsertCandles(ctx, candles); err != nil {
+		return nil, fmt.Errorf("cache refreshed candles: %w", err)
+	}
+	return candles, nil
 }
 
 func runPullbackFrequencyStudy(cmd *cobra.Command, _ []string) error {
@@ -76,7 +84,7 @@ func runPullbackFrequencyStudy(cmd *cobra.Command, _ []string) error {
 	if err := logger.Init(cfg.Logging.Level, cfg.Logging.Format); err != nil {
 		return err
 	}
-	to := time.Now()
+	to := pullbackFrequencyDay(time.Now())
 	if pullbackFreqTo != "" {
 		to, err = time.Parse("2006-01-02", pullbackFreqTo)
 		if err != nil {
@@ -115,13 +123,12 @@ func runPullbackFrequencyStudy(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("Alpaca credentials unset: export %s and %s", stocks.APIKeyEnv, stocks.SecretEnv)
 	}
 	client := data.NewAlpacaClient(apiKey, secret, stocks.DataURL)
-	cacheRunner := backtest.NewRunner(cfg, client, nil)
 
 	fmt.Fprintf(cmd.OutOrStdout(), "Cohort: %s · %d tickers · %s → %s\n",
 		cohortLabel, len(members), from.Format("2006-01-02"), to.Format("2006-01-02"))
 	fmt.Fprintln(cmd.OutOrStdout(),
 		"Historical market-cap snapshots are unavailable; the $100M scanner floor is not reconstructed.")
-	result, err := pullbackfreq.Run(ctx, cachedDailyLoader{runner: cacheRunner}, members, pullbackfreq.Config{
+	result, err := pullbackfreq.Run(ctx, refreshingDailyLoader{provider: client}, members, pullbackfreq.Config{
 		From: from, To: to,
 		MinDollarVolume:    pullbackFreqMinDollarVolume,
 		TopFraction:        pullbackFreqTopFraction,
@@ -147,16 +154,12 @@ func runPullbackFrequencyStudy(cmd *cobra.Command, _ []string) error {
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "\nEpisode rows written to %s\n", pullbackFreqCSV)
 	}
-	if len(result.LoadErrors) > 0 {
-		tickers := make([]string, 0, len(result.LoadErrors))
-		for ticker := range result.LoadErrors {
-			tickers = append(tickers, ticker)
-		}
-		sort.Strings(tickers)
-		fmt.Fprintf(cmd.ErrOrStderr(), "Candle-load failures (%d): %s\n",
-			len(tickers), strings.Join(tickers, ","))
-	}
 	return nil
+}
+
+func pullbackFrequencyDay(t time.Time) time.Time {
+	year, month, day := t.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, t.Location())
 }
 
 func pullbackFrequencyMembers(ctx context.Context) ([]pullbackfreq.Member, string, error) {

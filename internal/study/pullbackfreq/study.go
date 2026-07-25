@@ -96,6 +96,9 @@ func Run(ctx context.Context, provider CandleProvider, members []Member, cfg Con
 	series := make(map[string][]data.Candle, len(members))
 	loadErrors := make(map[string]string)
 	normalized := normalizeMembers(members)
+	if len(normalized) == 0 {
+		return Result{}, fmt.Errorf("pullback frequency: cohort is empty")
+	}
 	for i, member := range normalized {
 		if err := ctx.Err(); err != nil {
 			return Result{}, err
@@ -117,9 +120,31 @@ func Run(ctx context.Context, provider CandleProvider, members []Member, cfg Con
 		}
 		series[member.Ticker] = candles
 	}
+	if len(loadErrors) > 0 {
+		return Result{
+			CohortSize: len(normalized),
+			LoadErrors: loadErrors,
+		}, cohortLoadError(loadErrors, len(normalized))
+	}
 	result := analyze(series, members, cfg, pullback.Evaluate)
 	result.LoadErrors = loadErrors
 	return result, nil
+}
+
+func cohortLoadError(loadErrors map[string]string, cohortSize int) error {
+	tickers := make([]string, 0, len(loadErrors))
+	for ticker := range loadErrors {
+		tickers = append(tickers, ticker)
+	}
+	sort.Strings(tickers)
+	details := make([]string, 0, len(tickers))
+	for _, ticker := range tickers {
+		details = append(details, fmt.Sprintf("%s: %s", ticker, loadErrors[ticker]))
+	}
+	return fmt.Errorf(
+		"pullback frequency: incomplete cohort (%d of %d ticker loads failed): %s",
+		len(loadErrors), cohortSize, strings.Join(details, "; "),
+	)
 }
 
 func analyze(series map[string][]data.Candle, members []Member, cfg Config, evaluate evaluator) Result {
