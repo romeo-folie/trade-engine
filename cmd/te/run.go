@@ -1094,7 +1094,7 @@ var statusCmd = &cobra.Command{
 
 var modeCmd = &cobra.Command{
 	Use:   "mode <manual|auto|paper>",
-	Short: "Switch engine mode at runtime (persists to DB)",
+	Short: "Set the engine mode startup override (persists to DB)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		mode := args[0]
@@ -1113,7 +1113,7 @@ var modeCmd = &cobra.Command{
 		if err := store.SetOverride(ctx, "engine.mode", mode); err != nil {
 			return fmt.Errorf("set mode override: %w", err)
 		}
-		fmt.Printf("Mode set to %q (DB override — takes effect on next engine tick).\n", mode)
+		fmt.Printf("Mode set to %q (DB override — restart the engine and dashboard to apply).\n", mode)
 		return nil
 	},
 }

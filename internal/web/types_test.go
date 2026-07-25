@@ -156,6 +156,38 @@ func TestMapAnalystResults_inactiveAnalyst(t *testing.T) {
 	}
 }
 
+func TestMapAnalystResults_preservesSpecialistRoles(t *testing.T) {
+	results := []analysis.AnalystResult{
+		{
+			Role: "fundamental",
+			Response: analysis.AnalysisResponse{
+				Action: analysis.ActionBuy, Confidence: 0.82, Reasoning: "Strong earnings",
+			},
+			Meta: analysis.ModelCallMeta{Model: "model-a"},
+		},
+		{
+			Role: "risk_manager",
+			Response: analysis.AnalysisResponse{
+				Action: analysis.ActionHold, Confidence: 0.71, Reasoning: "Stop is too wide",
+			},
+			Meta: analysis.ModelCallMeta{Model: "model-b"},
+		},
+	}
+
+	raw, _ := json.Marshal(results)
+	analysts, _ := mapAnalystResults(raw)
+
+	if len(analysts) != 2 {
+		t.Fatalf("expected 2 analysts, got %d", len(analysts))
+	}
+	if analysts[0].Role != "fundamental" || analysts[0].Name != "Fundamental" {
+		t.Fatalf("fundamental analyst = %+v", analysts[0])
+	}
+	if analysts[1].Role != "risk_manager" || analysts[1].Name != "Risk Manager" {
+		t.Fatalf("risk manager analyst = %+v", analysts[1])
+	}
+}
+
 func TestMapAnalystResults_tieBreakLongShort(t *testing.T) {
 	// When LONG and SHORT have equal votes, ensemble should be NEUTRAL (not LONG).
 	results := []analysis.AnalystResult{

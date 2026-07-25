@@ -108,10 +108,16 @@ func parseLevel(level string) slog.Level {
 // If Init/InitWithRotation was never called, it initialises with defaults via
 // once.Do so that a subsequent Init call doesn't open a second writer.
 func Get() *slog.Logger {
+	// Always enter sync.Once. Checking std before Once.Do races with the
+	// goroutine that is publishing std inside initLogger; Once.Do supplies the
+	// required happens-before edge even after initialization has completed.
+	once.Do(func() {
+		_ = initLogger("info", "text", DefaultRotationConfig())
+	})
+	// Init can fail before publishing std (for example, an unwritable log
+	// directory). Logging must remain safe even in that degraded state.
 	if std == nil {
-		once.Do(func() {
-			_ = initLogger("info", "text", DefaultRotationConfig())
-		})
+		return slog.Default()
 	}
 	return std
 }
@@ -150,7 +156,10 @@ func Error(msg string, args ...any) { Get().Error(msg, args...) }
 // Not safe for concurrent test use across goroutines unless the callers
 // serialise themselves.
 func SetForTesting(l *slog.Logger) (restore func()) {
-	prev := std
+	// Complete lazy initialization before swapping the logger. Otherwise the
+	// first wrapper call would run once.Do, overwrite l, and leave std nil after
+	// restore while the Once remained spent.
+	prev := Get()
 	prevDefault := slog.Default()
 	std = l
 	slog.SetDefault(l)

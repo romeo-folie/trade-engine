@@ -27,6 +27,8 @@ const brokerReconInterval = 60 * time.Second
 // before a position is reported as diverging.
 const brokerReconTolerance = 0.02
 
+const modeRestartNotice = "restart engine and dashboard to apply"
+
 // View represents the active screen in the TUI.
 type View int
 
@@ -53,7 +55,7 @@ func viewLabel(v View) string {
 	case ViewConfig:
 		return "Config"
 	case ViewORB:
-		return "Spec"
+		return "Intraday"
 	default:
 		return "Unknown"
 	}
@@ -286,10 +288,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.statusMsg = fmt.Sprintf("Config update failed: %s", err)
 					} else {
 						m.configData.Items[m.selectedConfig].Value = next
-						if item.Key == "engine.mode" {
-							m.mode = next
-						}
-						m.statusMsg = fmt.Sprintf("✓ Updated %s=%s", item.Key, next)
+						m.configData.Items[m.selectedConfig].Source = "DB override"
+						m.statusMsg = fmt.Sprintf(
+							"✓ Saved %s=%s; %s", item.Key, next, modeRestartNotice,
+						)
 					}
 					m.statusMsgTime = time.Now()
 					return m, nil
@@ -297,6 +299,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.configEditing = true
 					m.configInput = item.Value
 					m.statusMsg = fmt.Sprintf("Editing %s (Enter to save, Esc to cancel)", item.Key)
+					m.statusMsgTime = time.Now()
+					return m, nil
+				case "readonly":
+					m.statusMsg = "Read-only snapshot; edit config.yaml and restart the engine"
 					m.statusMsgTime = time.Now()
 					return m, nil
 				}
@@ -681,7 +687,7 @@ func (m Model) renderBody(height int) string {
 	case ViewSignals:
 		return views.RenderSignalFeed(m.signalData, m.width, height)
 	case ViewConfig:
-		return views.RenderConfig(m.configData, m.width)
+		return views.RenderConfig(m.configData, m.width, height)
 	case ViewORB:
 		return views.RenderORBView(m.orbData, m.width, height, m.orbScroll)
 	default:
@@ -698,7 +704,7 @@ func (m Model) renderStatusBar() string {
 		if m.configEditing {
 			left = fmt.Sprintf(" editing value: %s", m.configInput)
 		} else {
-			left = " [j/k] nav  [enter] edit/toggle  [q] quit"
+			left = " [j/k] nav  [enter] change Mode  [q] quit"
 		}
 	}
 	if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && len(m.dashData.PendingSignals) > 0 && !m.showDetail {
