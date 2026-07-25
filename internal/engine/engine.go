@@ -1662,6 +1662,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 	if analysisID != "" {
 		analysisIDs = []string{analysisID}
 	}
+	createdAt := time.Now()
 	sig := store.Signal{
 		Ticker:            ticker,
 		Action:            string(resp.Action),
@@ -1672,9 +1673,10 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		Confidence:        resp.Confidence,
 		SizePct:           resp.SizePct,
 		Status:            "pending",
-		ExpiresAt:         time.Now().Add(time.Duration(expiryMin) * time.Minute),
+		ExpiresAt:         createdAt.Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
 		AnalysisIDs:       analysisIDs,
+		CreatedAt:         createdAt,
 	}
 
 	// Entry-quality gates (entry_gates.go): daily trend alignment, news
@@ -2075,7 +2077,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// LLM latency, manual approval, or a restart may otherwise leave an already
 	// breached/inverted stop attached to a new position.
 	if sig.PullbackStrength {
-		mark := e.freshStockMark(ctx, sig.Ticker, time.Now())
+		now := time.Now()
+		mark := e.freshStockMark(ctx, sig.Ticker, now)
 		if reason := pullback.ValidateExecutionMark(
 			mark, sig.StopLoss,
 			e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
@@ -2090,9 +2093,59 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			})
 			return
 		}
+		minTraded, err := e.minimumStockPriceSince(ctx, sig.Ticker, sig.CreatedAt, now)
+		if err != nil {
+			reason := "pullback strength: unable to verify price path since signal creation"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_path",
+			})
+			return
+		}
+		if minTraded <= sig.StopLoss {
+			reason := fmt.Sprintf(
+				"pullback strength: setup invalidated before execution (minimum traded %.2f at/below low-of-day stop %.2f)",
+				minTraded, sig.StopLoss,
+			)
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "mark", mark, "minimum_traded", minTraded,
+				"stop_loss", sig.StopLoss, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_path",
+			})
+			return
+		}
 		sig.SignalPrice = mark
 		if err := store.UpdateSignalPrice(ctx, sigID, mark); err != nil {
 			logger.Warn("update pullback execution price", "id", sigID, "err", err)
+		}
+
+		openTrades, err := store.GetOwnedPositionTrades(ctx)
+		if err != nil {
+			reason := "pullback execution risk re-check failed: unable to verify open positions"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
+		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
+			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, mark,
+			e.portfolio.CurrentState(), openTrades)
+		if results, passed := risk.CheckAll(riskIn); !passed {
+			reason := "pullback execution risk re-check failed: " + risk.BlockReason(results)
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "mark", mark, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: risk.BlockReason(results),
+			})
+			return
 		}
 	}
 
@@ -3140,6 +3193,44 @@ func (e *Engine) freshStockMark(ctx context.Context, ticker string, now time.Tim
 		return 0
 	}
 	return latest.Close
+}
+
+// minimumStockPriceSince returns the lowest one-minute trade range observed
+// since a signal was created. Pullback invalidation is path-dependent: a later
+// rebound above the stop must not resurrect a setup that already breached it.
+func (e *Engine) minimumStockPriceSince(
+	ctx context.Context, ticker string, since, now time.Time,
+) (float64, error) {
+	if e.marketData == nil {
+		return 0, fmt.Errorf("market data unavailable")
+	}
+	if since.IsZero() || now.Before(since) {
+		return 0, fmt.Errorf("invalid signal creation time")
+	}
+	candles, err := e.marketData.FetchCandles(
+		ctx, ticker, data.Timeframe1Min, since.Truncate(time.Minute), now,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("fetch one-minute execution path: %w", err)
+	}
+	minimum, ok := minimumCandleLow(candles)
+	if !ok {
+		return 0, fmt.Errorf("no one-minute execution path available")
+	}
+	return minimum, nil
+}
+
+func minimumCandleLow(candles []data.Candle) (float64, bool) {
+	minimum := math.Inf(1)
+	for _, candle := range candles {
+		if candle.Low > 0 && candle.Low < minimum {
+			minimum = candle.Low
+		}
+	}
+	if math.IsInf(minimum, 1) {
+		return 0, false
+	}
+	return minimum, true
 }
 
 // buildRiskInput assembles risk.CheckInput for a signal against a portfolio

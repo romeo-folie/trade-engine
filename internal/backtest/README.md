@@ -69,7 +69,10 @@ For the research-defined pullback-in-strength entry, pass
 `--pullback-strength`. The runner loads a separate one-year daily warm-up for
 momentum/consolidation/AVWAP evidence, but keeps the original analyst request
 window unchanged so existing prompt-cache entries remain reusable. Eligible
-BUYs use the signal day's low as their initial stop; a next-session gap through
-that low cancels the simulated fill and is recorded as `gap_invalidation`.
+BUYs use the signal day's low as their initial stop. At the next-session open,
+replay revalidates the stop-width and R:R geometry, then evaluates the remainder
+of the entry candle with conservative stop-before-target ordering. A gap through
+the low is recorded as `gap_invalidation`; widened stops and degraded R:R are
+recorded as `fill_stop_width` and `fill_risk_reward`.
 Run options and entry diagnostics are persisted with `backtest_runs`, so list
 and comparison output can distinguish Phase 2 experiments from baselines.

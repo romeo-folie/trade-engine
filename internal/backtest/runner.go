@@ -293,11 +293,17 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 			order := pendingEntry
 			pendingEntry = nil
 			qty := math.Floor(order.cashAlloc / candle.Open)
-			if order.requireValidStop && order.stopLoss >= candle.Open {
-				// A gap through the signal day's low invalidates the setup before
-				// the next-open fill. Do not fabricate an entry above its stop.
-				entryBlocks["gap_invalidation"]++
-			} else if qty >= 1 {
+			validFill := true
+			if order.requireValidStop {
+				if block := pullbackFillBlock(
+					candle.Open, order.stopLoss, order.takeProfit,
+					order.maxStopWidthPct, order.minRiskReward,
+				); block != "" {
+					entryBlocks[block]++
+					validFill = false
+				}
+			}
+			if validFill && qty >= 1 {
 				cost := qty * candle.Open
 				cash -= cost
 				entryPx := candle.Open
@@ -322,6 +328,15 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 					riskPerShare: risk,
 					highWater:    entryPx,
 					trailStop:    stop, // ratchets upward in ATR-trail mode
+				}
+				// The entry fills at the open, so the rest of this candle can
+				// legitimately hit the new stop or target. evaluateExit checks
+				// the hard stop before the target, providing the conservative
+				// ordering when both levels lie inside the same OHLC bar.
+				if t, hit := evaluateExit(openPosition, candle, atrSer[i], emaSer[i], policy); hit {
+					trades = append(trades, t)
+					cash += t.PnL + openPosition.cost
+					openPosition = nil
 				}
 			}
 		}
@@ -377,6 +392,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 				stopLoss:         stopLoss,
 				takeProfit:       resp.TakeProfit,
 				requireValidStop: opts.PullbackStrength,
+				maxStopWidthPct:  r.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
+				minRiskReward:    r.cfg.Risk.MinRiskReward,
 			}
 
 		case analysis.ActionSell:
@@ -503,6 +520,29 @@ type pendingOrder struct {
 	stopLoss         float64
 	takeProfit       float64
 	requireValidStop bool
+	maxStopWidthPct  float64
+	minRiskReward    float64
+}
+
+func pullbackFillBlock(mark, stopLoss, takeProfit, maxStopWidthPct, minRiskReward float64) string {
+	if pullback.ValidateExecutionMark(mark, stopLoss, maxStopWidthPct) == "" {
+		if takeProfit <= 0 {
+			return ""
+		}
+		riskPerShare := mark - stopLoss
+		rewardPerShare := takeProfit - mark
+		if rewardPerShare > 0 &&
+			(minRiskReward <= 0 || rewardPerShare/riskPerShare >= minRiskReward) {
+			return ""
+		}
+		return "fill_risk_reward"
+	}
+	if stopLoss >= mark {
+		return "gap_invalidation"
+	}
+	// The only remaining invalid fill with a positive open above its stop is
+	// an entry-to-stop width beyond the configured production cap.
+	return "fill_stop_width"
 }
 
 type openPos struct {

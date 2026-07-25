@@ -109,6 +109,12 @@ and `backtest compare` remain reproducible after the process exits. Migration
 to split-adjusted Alpaca history; this prevents old and new adjustment scales
 from coexisting in a two-year indicator series.
 
+Delayed live/paper entries now fail closed if any one-minute bar since signal
+creation breached the signal-day low, and the full risk suite is re-run at the
+fresh execution mark. Replay applies the same stop-width and R:R revalidation
+at the next open and evaluates stop/target touches on the entry candle, using
+the stop first when both levels occur in one OHLC bar.
+
 ### Phase 2 cached six-ticker comparison
 
 All six runs used **87 cache hits / 0 misses (100%)**. The comparison used the

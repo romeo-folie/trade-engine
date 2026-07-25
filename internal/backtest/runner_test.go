@@ -36,8 +36,8 @@ func TestCoversRange_WithinTolerance(t *testing.T) {
 	from := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	to := time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC)
 	candles := []data.Candle{
-		{Timestamp: from.Add(12 * time.Hour)},   // within 2d tolerance
-		{Timestamp: to.Add(-12 * time.Hour)},    // within 2d tolerance
+		{Timestamp: from.Add(12 * time.Hour)}, // within 2d tolerance
+		{Timestamp: to.Add(-12 * time.Hour)},  // within 2d tolerance
 	}
 	if !coversRange(candles, from, to, data.Timeframe1Day) {
 		t.Error("candles within tolerance should cover range")
@@ -49,7 +49,7 @@ func TestCoversRange_OutsideTolerance(t *testing.T) {
 	to := time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC)
 	// First candle starts 3 days late — outside 2d daily tolerance
 	candles := []data.Candle{
-		{Timestamp: from.Add(72 * time.Hour + time.Minute)},
+		{Timestamp: from.Add(72*time.Hour + time.Minute)},
 		{Timestamp: to},
 	}
 	if coversRange(candles, from, to, data.Timeframe1Day) {
@@ -159,6 +159,48 @@ func TestCheckSLTP_SLWinsOverTP(t *testing.T) {
 	}
 	if trade.ExitReason != "stop_loss" {
 		t.Errorf("expected stop_loss to win over take_profit, got %q", trade.ExitReason)
+	}
+}
+
+func TestPullbackFillBlock(t *testing.T) {
+	tests := []struct {
+		name       string
+		mark       float64
+		stop       float64
+		target     float64
+		maxWidth   float64
+		minRR      float64
+		wantReason string
+	}{
+		{name: "valid", mark: 100, stop: 98, target: 104, maxWidth: 4, minRR: 1.5},
+		{name: "gap through stop", mark: 97, stop: 98, target: 104, maxWidth: 4, minRR: 1.5, wantReason: "gap_invalidation"},
+		{name: "upward gap widens stop", mark: 110, stop: 100, target: 125, maxWidth: 4, minRR: 1.5, wantReason: "fill_stop_width"},
+		{name: "gap ruins reward", mark: 103, stop: 100, target: 105, maxWidth: 4, minRR: 1.5, wantReason: "fill_risk_reward"},
+		{name: "gap above target", mark: 106, stop: 103, target: 105, maxWidth: 4, minRR: 1.5, wantReason: "fill_risk_reward"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pullbackFillBlock(
+				tt.mark, tt.stop, tt.target, tt.maxWidth, tt.minRR,
+			); got != tt.wantReason {
+				t.Fatalf("pullbackFillBlock() = %q, want %q", got, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestEntryCandleExitUsesConservativeStopFirst(t *testing.T) {
+	pos := newPos(98, 105)
+	entryCandle := data.Candle{
+		Timestamp: pos.entryTS,
+		Open:      100,
+		High:      106,
+		Low:       97,
+		Close:     104,
+	}
+	trade, triggered := evaluateExit(pos, entryCandle, 0, 0, exitPolicy{})
+	if !triggered || trade.ExitReason != "stop_loss" || trade.ExitTS != pos.entryTS {
+		t.Fatalf("entry-candle exit = %+v triggered=%v, want same-candle stop", trade, triggered)
 	}
 }
 
@@ -276,7 +318,7 @@ func TestClosePosition_PnLCalculation(t *testing.T) {
 	ts := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
 	trade := closePosition(pos, ts, 110, "take_profit")
 
-	expectedPnL := 10*110 - 1000.0   // proceeds - cost
+	expectedPnL := 10*110 - 1000.0 // proceeds - cost
 	expectedPct := expectedPnL / 1000 * 100
 
 	if trade.PnL != expectedPnL {
