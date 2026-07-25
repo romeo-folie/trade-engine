@@ -2105,6 +2105,21 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
 	}
+	if result.FilledQty == 0 && execution.IsTerminalOrderStatus(result.Status) {
+		// A synchronously rejected/cancelled entry never enters the fill poll.
+		// Remove its zero-quantity trade immediately so it cannot occupy a
+		// position slot forever.
+		if cancelled, err := store.CancelUnfilledTrade(ctx, tradeID); err != nil {
+			logger.Warn("cancel synchronous zero-fill trade", "trade_id", tradeID, "err", err)
+		} else if cancelled && result.BrokerOrderID != "" {
+			if err := store.MarkOrderStatus(
+				ctx, result.BrokerOrderID, execution.NormalizeOrderStatus(result.Status),
+			); err != nil {
+				logger.Warn("mark synchronous zero-fill order", "trade_id", tradeID, "err", err)
+			}
+		}
+		return
+	}
 
 	initialProtectedQty := 0.0
 	if uncapTakeProfit && result.FilledQty > 0 {
@@ -2524,7 +2539,9 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			defer e.exitReconcileInFlight.Store(false)
 			sweepCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 			defer cancel()
-			ReconcileExitOrderFillsWithStore(sweepCtx, e.executor, DefaultExitReconcileBatch)
+			ReconcileExitOrderFillsWithStoreAndLoss(
+				sweepCtx, e.executor, DefaultExitReconcileBatch, e.portfolio.RecordLoss,
+			)
 		}()
 	}
 
@@ -2609,6 +2626,17 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
+		claimed, err := store.ClaimTradeExit(ctx, t.ID)
+		if err != nil {
+			logger.Warn("claim trade exit", "trade_id", t.ID, "err", err)
+			continue
+		}
+		if !claimed {
+			// Another worker (EMA manager, analyst SELL, or this monitor on
+			// an overlapping sweep) already owns the broker exit.
+			continue
+		}
+
 		// Place exit order.
 		exitSide := execution.OrderSideSell
 		if t.Direction == "short" {
@@ -2623,6 +2651,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			TradeID:    t.ID,
 		})
 		if err != nil {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
 			logger.Warn("exit order failed", "trade_id", t.ID, "reason", exitReason, "err", err)
 			continue
 		}

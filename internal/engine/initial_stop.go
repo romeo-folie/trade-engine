@@ -112,8 +112,22 @@ func (e *Engine) cancelProtectiveStopForResize(ctx context.Context, existing sto
 	} else {
 		switch execution.NormalizeOrderStatus(status.Status) {
 		case "cancelled", "rejected":
+			if status.FilledQty > 0 {
+				if err := store.UpdateOrderFill(
+					ctx, existing.ID, status.FilledPrice, status.FilledQty, "partial",
+				); err != nil {
+					return fmt.Errorf("record partial protective-stop fill: %w", err)
+				}
+				return fmt.Errorf("protective stop sold %f shares while resizing; deferring replacement to exit reconciliation",
+					status.FilledQty)
+			}
 			// Safe to replace below.
 		case "filled":
+			if err := store.UpdateOrderFill(
+				ctx, existing.ID, status.FilledPrice, status.FilledQty, "filled",
+			); err != nil {
+				return fmt.Errorf("record protective-stop fill: %w", err)
+			}
 			return errors.New("protective stop filled while resizing; refusing replacement")
 		default:
 			return fmt.Errorf("protective stop remains %s after cancel; refusing duplicate", status.Status)

@@ -33,6 +33,7 @@ type fakeExitStore struct {
 	orderFills   map[string][2]float64 // broker_order_id → {price, qty}
 	tradeExits   map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
 	orderStatus  map[string]string     // broker_order_id → status
+	tradeQty     map[string]float64
 }
 
 func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
@@ -41,6 +42,7 @@ func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 		orderFills:  map[string][2]float64{},
 		tradeExits:  map[string][3]float64{},
 		orderStatus: map[string]string{},
+		tradeQty:    map[string]float64{},
 	}
 }
 
@@ -58,8 +60,15 @@ func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl,
 	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
 	return nil
 }
+func (f *fakeExitStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {
+	f.tradeQty[id] = quantity
+	return nil
+}
 func (f *fakeExitStore) MarkOrderStatus(_ context.Context, id, status string) error {
 	f.orderStatus[id] = status
+	return nil
+}
+func (f *fakeExitStore) ReleaseTradeExitClaim(_ context.Context, _ string) error {
 	return nil
 }
 
@@ -103,6 +112,47 @@ func TestExitReconcileCorrectsToBrokerFill(t *testing.T) {
 	}
 	if got[1] >= 0 {
 		t.Fatalf("pnl = %.4f, want a loss — the recorded +42%% gain was phantom", got[1])
+	}
+}
+
+func TestExitReconcileFinalizesExitingTradeAndRecordsConfirmedLoss(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.ExitPrice = 0
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: p.Quantity},
+	}}
+	losses := 0
+
+	stats := ReconcileExitOrderFills(
+		context.Background(), ex, db, 0, func() { losses++ },
+	)
+
+	if stats.Corrected != 1 || losses != 1 {
+		t.Fatalf("stats=%+v losses=%d, want finalized loss", stats, losses)
+	}
+	if _, ok := db.tradeExits[p.TradeID]; !ok {
+		t.Fatal("exiting trade was not finalized at broker fill")
+	}
+}
+
+func TestExitReconcileCancelledPartialReopensOnlyRemainder(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 10
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "cancelled", FilledPrice: 3.80, FilledQty: 4},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.Terminal != 1 || db.tradeQty[p.TradeID] != 6 {
+		t.Fatalf("stats=%+v remaining=%v, want reopened remainder 6", stats, db.tradeQty[p.TradeID])
+	}
+	if fill := db.orderFills[p.OrderID]; fill != [2]float64{3.80, 4} {
+		t.Fatalf("partial order fill = %v, want price 3.80 qty 4", fill)
 	}
 }
 
@@ -175,7 +225,7 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 	db := newFakeExitStore(lacExit(), p2, p3)
 	ex := &fakeExitExecutor{
 		results: map[string]execution.OrderResult{
-			"b1": {Status: "accepted"},                                    // still working
+			"b1": {Status: "accepted"},                                          // still working
 			"b2": {Status: "partially_filled", FilledPrice: 3.9, FilledQty: 10}, // partial — #363/#369 own the qty model
 		},
 		errs: map[string]error{

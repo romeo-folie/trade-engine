@@ -312,8 +312,12 @@ func (e *Engine) cancelBracketLegsForTicker(ctx context.Context, ticker string) 
 		logger.Warn("bracket exits: open-trades lookup for leg cancel failed", "ticker", ticker, "err", err)
 		return false
 	}
+	return e.cancelExitLegsForTrades(ctx, openTrades, ticker)
+}
+
+func (e *Engine) cancelExitLegsForTrades(ctx context.Context, trades []store.Trade, ticker string) bool {
 	allClear := true
-	for _, t := range openTrades {
+	for _, t := range trades {
 		if t.Ticker != ticker {
 			continue
 		}

@@ -19,7 +19,7 @@ type Trade struct {
 	TakeProfit    float64
 	PnL           float64
 	PnLPct        float64
-	Status        string // open | closed | cancelled
+	Status        string // open | exiting | closed | cancelled
 	ModelProvider string
 	ModelName     string
 	OpenedAt      time.Time
@@ -76,6 +76,33 @@ func CancelUnfilledTrade(ctx context.Context, id string) (bool, error) {
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+// ClaimTradeExit atomically transfers exit ownership from any worker that
+// observed the trade as open. Only the winner may cancel legs or submit a
+// broker sell; all other exit paths see zero affected rows and stand down.
+func ClaimTradeExit(ctx context.Context, id string) (bool, error) {
+	tag, err := GetDB().Exec(ctx, `
+		UPDATE trades SET status='exiting'
+		WHERE id=$1 AND status='open'`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+func ReleaseTradeExitClaim(ctx context.Context, id string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades SET status='open'
+		WHERE id=$1 AND status='exiting'`, id)
+	return err
+}
+
+func UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades SET quantity=$1
+		WHERE id=$2 AND status='exiting'`, quantity, id)
+	return err
 }
 
 // UpdateOrderFillPrice backfills filled_price and filled_qty on an order row.
@@ -166,16 +193,15 @@ func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) 
 	return err
 }
 
-// UpdateTradeExit corrects exit_price / pnl / pnl_pct on an already-closed
-// trade without touching closed_at. Used by the exit-fill reconciler when the
-// broker's confirmed fill differs from the trigger price recorded at close
-// time (the close path falls back to the candle price when the broker fill
-// is still pending).
+// UpdateTradeExit corrects an already-closed exit or finalizes a durably
+// claimed (`exiting`) trade once the broker confirms the full fill.
 func UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
-		SET exit_price=$1, pnl=$2, pnl_pct=$3
-		WHERE id=$4 AND status='closed'`,
+		SET exit_price=$1, pnl=$2, pnl_pct=$3,
+		    status='closed',
+		    closed_at=COALESCE(closed_at, NOW())
+		WHERE id=$4 AND status IN ('closed','exiting')`,
 		exitPrice, pnl, pnlPct, id)
 	return err
 }
@@ -203,10 +229,11 @@ type PendingExitOrder struct {
 	EntryPrice    float64
 	Quantity      float64
 	ExitPrice     float64 // exit price currently recorded on the trade row
+	TradeStatus   string  // closed (price correction) | exiting (finalization)
 }
 
 // GetPendingExitOrders returns orders still marked 'pending' or 'partial'
-// whose trade is already closed and whose side opposes the trade direction —
+// whose trade is closed or durably exiting and whose side opposes direction —
 // i.e. the exit order for that trade. This shape covers every close path
 // (stop/TP monitor, trailing-stop market exits) regardless of the
 // is_stop_loss/is_take_profit flags. Entry orders (side matching direction)
@@ -216,12 +243,14 @@ type PendingExitOrder struct {
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT o.id, o.broker_order_id, o.ticker,
-		       t.id, t.direction, t.entry_price, t.quantity, COALESCE(t.exit_price,0)
+		       t.id, t.direction, t.entry_price, t.quantity,
+		       COALESCE(t.exit_price,0), t.status
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
-		WHERE o.status IN ('pending','partial')
+		WHERE o.status IN ('pending','partial','filled')
 		  AND COALESCE(o.broker_order_id,'') <> ''
-		  AND t.status = 'closed'
+		  AND t.status IN ('closed','exiting')
+		  AND NOT (t.status='closed' AND o.status='filled')
 		  AND ((t.direction = 'long'  AND o.side = 'sell')
 		    OR (t.direction = 'short' AND o.side = 'buy'))
 		ORDER BY o.created_at
@@ -235,7 +264,8 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 	for rows.Next() {
 		var p PendingExitOrder
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker,
-			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity, &p.ExitPrice); err != nil {
+			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
+			&p.ExitPrice, &p.TradeStatus); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

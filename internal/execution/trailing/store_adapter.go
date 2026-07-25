@@ -57,6 +57,20 @@ func (liveStore) OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]st
 	return store.OpenExitLegsForTrade(ctx, tradeID)
 }
 
+func (liveStore) ClaimTradeExit(ctx context.Context, id string) (bool, error) {
+	if !store.IsConnected() {
+		return false, errStoreNotConnected
+	}
+	return store.ClaimTradeExit(ctx, id)
+}
+
+func (liveStore) ReleaseTradeExitClaim(ctx context.Context, id string) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.ReleaseTradeExitClaim(ctx, id)
+}
+
 func (liveStore) InsertOrder(ctx context.Context, o store.Order) (string, error) {
 	if !store.IsConnected() {
 		return "", errStoreNotConnected

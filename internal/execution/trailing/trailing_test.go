@@ -158,6 +158,29 @@ func (f *fakeStore) OpenExitLegsForTrade(_ context.Context, tradeID string) ([]s
 	return out, nil
 }
 
+func (f *fakeStore) ClaimTradeExit(_ context.Context, id string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr, ok := f.trades[id]
+	if !ok || tr.Status != "open" {
+		return false, nil
+	}
+	tr.Status = "exiting"
+	f.trades[id] = tr
+	return true, nil
+}
+
+func (f *fakeStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr, ok := f.trades[id]
+	if ok && tr.Status == "exiting" {
+		tr.Status = "open"
+		f.trades[id] = tr
+	}
+	return nil
+}
+
 func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -476,6 +499,23 @@ func TestManager_EMA9CappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
 	}
 }
 
+func TestManager_ATRCappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, TakeProfit: 110, Quantity: 10,
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 101, 99, 100))}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleATR}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("orders = %+v, want capped ATR trade to remain app-managed", fb.placed)
+	}
+}
+
 func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
@@ -541,9 +581,18 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
 		EntryPrice: 100, StopLoss: 95, Quantity: 10,
 	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
 	// Nine closes at 100 seed EMA=100; the final 90 close produces EMA=98.
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
-	fb := &fakeBroker{}
+	fb := &fakeBroker{
+		nextFillPrice: 90,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
 	losses := 0
 
 	m := NewManager(Config{
@@ -559,10 +608,8 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	if fs.trades["t1"].Status != "closed" {
 		t.Fatal("daily close below ema9 must close the trade")
 	}
-	if len(fb.placed) != 2 ||
-		fb.placed[0].Type != execution.OrderTypeStop ||
-		fb.placed[1].Type != execution.OrderTypeMarket {
-		t.Fatalf("placed = %+v, want protective stop followed by market exit", fb.placed)
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("placed = %+v, want one market exit after cancelling hard stop", fb.placed)
 	}
 	if got := fs.trades["t1"].ExitPrice; got != 90 {
 		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
@@ -602,6 +649,9 @@ func TestManager_EMA9AfterCloseKeepsHardStopUntilNextSession(t *testing.T) {
 	m.now = func() time.Time {
 		return time.Date(2026, time.July, 27, 10, 0, 0, 0, newYorkLocation)
 	}
+	fb.nextFillPrice = 90
+	fb.nextFillQty = 10
+	fb.nextStatus = "filled"
 	m.UpdateAll(context.Background())
 	if fs.trades["t1"].Status != "closed" {
 		t.Fatal("EMA signal must exit during the next regular session")
@@ -645,6 +695,51 @@ func TestManager_EMA9WaitsForConfirmedStopCancellation(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9PendingExitRemainsDurablyExiting(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "hard-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
+	fb := &fakeBroker{nextStatus: "partially_filled", nextFillPrice: 99, nextFillQty: 4}
+	losses := 0
+
+	m := NewManager(Config{
+		Enabled: true, Rule: RuleEMA9, RecordLoss: func() { losses++ },
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting until full broker fill", got)
+	}
+	if losses != 0 {
+		t.Fatalf("loss cooldown recorded from partial fill: %d", losses)
+	}
+	placed := len(fb.placed)
+	m.UpdateAll(context.Background())
+	if len(fb.placed) != placed {
+		t.Fatal("pending EMA exit was submitted again")
+	}
+}
+
+func TestCancelAndConfirmRejectsStopFillRace(t *testing.T) {
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "filled"}}
+	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
+
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop"); err == nil {
+		t.Fatal("filled stop must abort cancel-and-resubmit")
+	}
+}
+
 func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
@@ -657,7 +752,11 @@ func TestManager_EMA9HonorsInjectedMarketCalendar(t *testing.T) {
 		Status: "pending", IsStopLoss: true,
 	})
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100, 90)}
-	fb := &fakeBroker{}
+	fb := &fakeBroker{
+		nextFillPrice: 110,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
 	m := NewManager(Config{
 		Enabled: true,
 		Rule:    RuleEMA9,
@@ -1068,7 +1167,11 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 		return t
 	}()
 	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
-	fb := &fakeBroker{}
+	fb := &fakeBroker{
+		nextFillPrice: 110,
+		nextFillQty:   10,
+		nextStatus:    "filled",
+	}
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
 	m.UpdateAll(context.Background())

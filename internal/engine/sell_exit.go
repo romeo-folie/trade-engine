@@ -67,10 +67,29 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		return
 	}
 
+	claimed := make([]store.Trade, 0, len(longs))
+	releaseClaims := func() {
+		for _, t := range claimed {
+			if err := store.ReleaseTradeExitClaim(ctx, t.ID); err != nil {
+				logger.Warn("sell exit: release trade claim", "trade_id", t.ID, "err", err)
+			}
+		}
+	}
+	for _, t := range longs {
+		ok, err := store.ClaimTradeExit(ctx, t.ID)
+		if err != nil || !ok {
+			releaseClaims()
+			blockSignal("another exit worker already owns this position", "exit_ownership")
+			return
+		}
+		claimed = append(claimed, t)
+	}
+
 	// Working exit legs and broker-resident stops hold the long's shares;
 	// they must be confirmed gone before the sell or the broker rejects it
 	// (and a still-live leg would race the fill).
-	if !e.cancelBracketLegsForTicker(ctx, sig.Ticker) {
+	if !e.cancelExitLegsForTrades(ctx, claimed, sig.Ticker) {
+		releaseClaims()
 		blockSignal("working exit legs could not be confirmed cancelled — sell would race a live leg", "bracket_leg_cancel")
 		return
 	}
@@ -83,6 +102,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	})
 	if err != nil {
+		releaseClaims()
 		// Legs are already cancelled: the position is UNPROTECTED until the
 		// software monitor resumes on the next tick (it will — no working
 		// legs means app-managed monitoring applies).

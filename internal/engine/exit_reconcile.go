@@ -37,6 +37,8 @@ type exitReconcileStore interface {
 	// lot's row.
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
 	UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
+	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
+	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error
 }
 
@@ -51,6 +53,12 @@ func (exitStoreAdapter) UpdateOrderFill(ctx context.Context, orderID string, fil
 }
 func (exitStoreAdapter) UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	return store.UpdateTradeExit(ctx, id, exitPrice, pnl, pnlPct)
+}
+func (exitStoreAdapter) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
+	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
+}
+func (exitStoreAdapter) ReleaseTradeExitClaim(ctx context.Context, id string) error {
+	return store.ReleaseTradeExitClaim(ctx, id)
 }
 func (exitStoreAdapter) MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error {
 	return store.MarkOrderStatus(ctx, brokerOrderID, status)
@@ -101,7 +109,7 @@ func tradePnL(direction string, entryPrice, quantity, exitPrice float64) (pnl, p
 // async). With stale candle data that trigger price can be wildly wrong — a
 // LAC trade was recorded as +$787 at 5.50 when the broker filled at 3.82 for
 // −$19 (2026-07-02).
-func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int) ExitReconcileStats {
+func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor, db exitReconcileStore, limit int, recordLoss ...func()) ExitReconcileStats {
 	var stats ExitReconcileStats
 	if executor == nil {
 		return stats
@@ -147,13 +155,18 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			// exit price would stick forever. Trade-first is safe because
 			// UpdateTradeExit is idempotent: if the order write then fails,
 			// the next sweep redoes both.
-			corrected := math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
+			corrected := p.TradeStatus == "exiting" ||
+				math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
 			if corrected {
 				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, p.Quantity, res.FilledPrice)
 				if err := db.UpdateTradeExit(ctx, p.TradeID, res.FilledPrice, pnl, pnlPct); err != nil {
 					stats.Errors++
 					logger.Warn("exit reconcile: update trade exit", "trade_id", p.TradeID, "err", err)
 					continue
+				}
+				if p.TradeStatus == "exiting" && pnl < 0 &&
+					len(recordLoss) > 0 && recordLoss[0] != nil {
+					recordLoss[0]()
 				}
 				logger.Info("exit reconcile: corrected trade exit to broker fill",
 					"ticker", p.Ticker,
@@ -181,12 +194,56 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				stats.Confirmed++
 			}
 		case "cancelled", "rejected":
-			if err := db.MarkOrderStatus(ctx, p.BrokerOrderID, execution.NormalizeOrderStatus(res.Status)); err != nil {
+			terminalStatus := execution.NormalizeOrderStatus(res.Status)
+			if res.FilledQty > 0 {
+				if err := db.UpdateOrderFill(
+					ctx, p.OrderID, res.FilledPrice, res.FilledQty, terminalStatus,
+				); err != nil {
+					stats.Errors++
+					logger.Warn("exit reconcile: persist terminal partial fill",
+						"order_id", p.OrderID, "err", err)
+					continue
+				}
+			} else if err := db.MarkOrderStatus(ctx, p.BrokerOrderID, terminalStatus); err != nil {
 				stats.Errors++
 				logger.Warn("exit reconcile: mark order status", "broker_order_id", p.BrokerOrderID, "err", err)
 				continue
 			}
 			stats.Terminal++
+			if p.TradeStatus == "exiting" {
+				if res.FilledQty > 0 {
+					remaining := math.Max(0, p.Quantity-res.FilledQty)
+					if remaining <= 1e-9 && res.FilledPrice > 0 {
+						pnl, pnlPct := tradePnL(
+							p.Direction, p.EntryPrice, p.Quantity, res.FilledPrice,
+						)
+						if err := db.UpdateTradeExit(
+							ctx, p.TradeID, res.FilledPrice, pnl, pnlPct,
+						); err != nil {
+							stats.Errors++
+							continue
+						}
+						if pnl < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
+							recordLoss[0]()
+						}
+						continue
+					}
+					if err := db.UpdateExitingTradeQuantity(
+						ctx, p.TradeID, remaining,
+					); err != nil {
+						stats.Errors++
+						logger.Warn("exit reconcile: reduce quantity after partial exit",
+							"trade_id", p.TradeID, "err", err)
+						continue
+					}
+				}
+				if err := db.ReleaseTradeExitClaim(ctx, p.TradeID); err != nil {
+					stats.Errors++
+					logger.Warn("exit reconcile: release failed exit claim",
+						"trade_id", p.TradeID, "err", err)
+					continue
+				}
+			}
 			logger.Error("exit reconcile: closed trade's exit order never executed at broker — position may still be live",
 				"ticker", p.Ticker,
 				"trade_id", p.TradeID,
@@ -217,4 +274,13 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 // the one-shot cmd/reconcile-exits tool.
 func ReconcileExitOrderFillsWithStore(ctx context.Context, executor exitReconcileExecutor, limit int) ExitReconcileStats {
 	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit)
+}
+
+func ReconcileExitOrderFillsWithStoreAndLoss(
+	ctx context.Context,
+	executor exitReconcileExecutor,
+	limit int,
+	recordLoss func(),
+) ExitReconcileStats {
+	return ReconcileExitOrderFills(ctx, executor, exitStoreAdapter{}, limit, recordLoss)
 }
