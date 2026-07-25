@@ -75,6 +75,50 @@ interface AnalysisDetail {
   AnalystResults?: AnalystResult[] | null;
 }
 
+interface SpecialistOutcome {
+  method: string;
+  detail: string;
+}
+
+// Specialist reasoning is persisted as one line per role followed by a unique
+// "[specialist] resolved by …" line. The role cards already render every
+// individual explanation, so translate only that final line into an
+// outcome-oriented summary instead of repeating the full reasoning paragraph.
+function formatSpecialistOutcome(reasoning: string, action: string): SpecialistOutcome {
+  const resolution = reasoning
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line.startsWith('[specialist] resolved by '));
+
+  const majority = resolution?.match(/resolved by (3-of-\d+) majority/);
+  if (majority) {
+    return {
+      method: `${majority[1]} specialist majority`,
+      detail: `${action} received the required three-role consensus.`,
+    };
+  }
+
+  const veto = resolution?.match(/resolved by risk-manager veto \(([^)]+)\)/);
+  if (veto) {
+    return {
+      method: 'Risk-manager veto',
+      detail: `No three-role majority formed; the risk manager's ${veto[1]} verdict determined the outcome.`,
+    };
+  }
+
+  if (resolution?.includes('majority-vote fallback')) {
+    return {
+      method: 'Fallback vote',
+      detail: `No three-role majority or risk veto resolved the committee; the fallback vote selected ${action}.`,
+    };
+  }
+
+  return {
+    method: 'Specialist committee',
+    detail: `${action} was selected as the final specialist outcome.`,
+  };
+}
+
 
 export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps) {
   const panelRef = useRef<HTMLDivElement>(null);
@@ -131,7 +175,13 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
   const confPct = (analysis.Confidence * 100).toFixed(0);
   const action = analysis.Action.toUpperCase();
   const analystResults = detail?.AnalystResults ?? [];
-  const isSpecialist = analystResults.some(a => !!a.role);
+  const hasSpecialistResolution = analysis.Reasoning
+    .split('\n')
+    .some(line => line.trim().startsWith('[specialist] resolved by '));
+  const isSpecialist = hasSpecialistResolution || analystResults.some(a => !!a.role);
+  const specialistOutcome = isSpecialist
+    ? formatSpecialistOutcome(analysis.Reasoning, action)
+    : null;
 
   // DissentSummary is not independent content: the arbiter prompt asks the
   // model to BEGIN its reasoning with "DISSENT:" (ensemble.go), and
@@ -200,21 +250,41 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
 
         {/* Body */}
         <div className={styles.body}>
-          {/* Full Reasoning — prefer arbiter text (loaded from /api/analyses/{id});
-              fall back to top-level Reasoning while detail is loading or absent. */}
-          {!isSpecialist && <div className={styles.section}>
-            <div className={styles.sectionLabel}>
-              FULL REASONING
-              {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
+          {specialistOutcome ? (
+            <div className={styles.section}>
+              <div className={styles.sectionLabel}>DECISION OUTCOME</div>
+              <div
+                className={styles.outcomeCard}
+                style={{ borderLeftColor: actionColors(analysis.Action) }}
+              >
+                <span
+                  className={styles.outcomeAction}
+                  style={{ color: actionColors(analysis.Action) }}
+                >
+                  {action}
+                </span>
+                <div className={styles.outcomeCopy}>
+                  <div className={styles.outcomeMethod}>{specialistOutcome.method}</div>
+                  <div className={styles.outcomeDetail}>{specialistOutcome.detail}</div>
+                </div>
+              </div>
             </div>
-            {detail?.ArbiterReasoning ? (
-              <div className={styles.reasoning}>{detail.ArbiterReasoning}</div>
-            ) : detailLoading ? (
-              <div className={styles.reasoning} aria-busy="true">Loading reasoning…</div>
-            ) : (
-              <div className={styles.reasoning}>{analysis.Reasoning}</div>
-            )}
-          </div>}
+          ) : !isSpecialist && (
+            /* Generalist ensembles retain the useful arbiter synthesis. */
+            <div className={styles.section}>
+              <div className={styles.sectionLabel}>
+                FULL REASONING
+                {hasDissent && <span className={styles.dissentLabel}>DISSENT</span>}
+              </div>
+              {detail?.ArbiterReasoning ? (
+                <div className={styles.reasoning}>{detail.ArbiterReasoning}</div>
+              ) : detailLoading ? (
+                <div className={styles.reasoning} aria-busy="true">Loading reasoning…</div>
+              ) : (
+                <div className={styles.reasoning}>{analysis.Reasoning}</div>
+              )}
+            </div>
+          )}
 
           {/* Per-analyst breakdown — lazy-loaded with the rest of the detail payload. */}
           {analystResults.length > 0 && (

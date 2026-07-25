@@ -180,6 +180,50 @@
   white-space: pre-wrap;
 }
 
+.outcomeCard {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4, 16px);
+  padding: var(--space-4, 16px);
+  background: var(--card-bg);
+  border: 1px solid var(--border-muted);
+  border-left: 3px solid currentColor;
+}
+
+.outcomeAction {
+  flex: 0 0 auto;
+  min-width: 64px;
+  font-family: var(--font-display);
+  font-size: 20px;
+  font-weight: 800;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  text-align: center;
+}
+
+.outcomeCopy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.outcomeMethod {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.outcomeDetail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
 /* ── Key-value rows ───────────────────────────────────────────────────────── */
 
 .kvList {
