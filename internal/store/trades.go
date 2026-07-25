@@ -232,6 +232,7 @@ type PendingExitOrder struct {
 	Quantity      float64 // current trade quantity
 	OrderQuantity float64 // lot quantity assigned to this broker order row
 	RecordedFill  float64 // fill already durably assigned to this lot
+	RecordedPrice float64 // fill price already durably assigned to this lot
 	AggregateFill float64 // fill assigned across every row sharing the broker id
 	ExitPrice     float64 // exit price currently recorded on the trade row
 	TradeStatus   string  // closed (price correction) | exiting (finalization)
@@ -247,9 +248,29 @@ type PendingExitOrder struct {
 // the row must stay sweepable until the broker reports the fill complete.
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
+		WITH selected_trades AS (
+		  SELECT t.id, MIN(o.created_at) AS first_order_at
+		  FROM orders o
+		  JOIN trades t ON t.id=o.trade_id
+		  WHERE (
+		          (t.status='closed' AND o.status IN ('pending','partial'))
+		       OR (t.status='exiting' AND (
+		            o.status IN ('pending','partial')
+		         OR (o.status IN ('filled','cancelled','rejected')
+		             AND o.updated_at >= t.exit_claimed_at)
+		          ))
+		        )
+		    AND COALESCE(o.broker_order_id,'') <> ''
+		    AND ((t.direction='long' AND o.side='sell')
+		      OR (t.direction='short' AND o.side='buy'))
+		  GROUP BY t.id
+		  ORDER BY first_order_at
+		  LIMIT $1
+		)
 		SELECT o.id, o.broker_order_id, o.ticker,
 		       t.id, t.direction, t.entry_price, t.quantity,
 		       o.quantity, COALESCE(o.filled_qty,0),
+		       COALESCE(o.filled_price,0),
 		       COALESCE((
 		         SELECT SUM(COALESCE(allocated.filled_qty,0))
 		         FROM orders allocated
@@ -258,15 +279,20 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		       COALESCE(t.exit_price,0), t.status
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
+		JOIN selected_trades selected ON selected.id=t.id
 		WHERE (
 		        (t.status='closed' AND o.status IN ('pending','partial'))
-		     OR (t.status='exiting' AND o.status IN ('pending','partial','filled','cancelled','rejected'))
+		     OR (t.status='exiting' AND (
+		          o.status IN ('pending','partial')
+		       OR (o.status IN ('filled','cancelled','rejected')
+		           AND o.updated_at >= t.exit_claimed_at)
+		        ))
 		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''
 		  AND ((t.direction = 'long'  AND o.side = 'sell')
 		    OR (t.direction = 'short' AND o.side = 'buy'))
 		ORDER BY o.created_at
-		LIMIT $1`, limit)
+		`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +303,8 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		var p PendingExitOrder
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
-			&p.OrderQuantity, &p.RecordedFill, &p.AggregateFill,
+			&p.OrderQuantity, &p.RecordedFill, &p.RecordedPrice,
+			&p.AggregateFill,
 			&p.ExitPrice, &p.TradeStatus); err != nil {
 			return nil, err
 		}
@@ -349,6 +376,7 @@ func GetOrderlessExitingTrades(ctx context.Context, limit int) ([]Trade, error) 
 		FROM trades t
 		WHERE t.status='exiting'
 		  AND t.exit_claimed_at IS NOT NULL
+		  AND t.exit_claimed_at <= NOW() - INTERVAL '2 minutes'
 		  AND NOT EXISTS (
 		    SELECT 1 FROM orders o
 		    WHERE o.trade_id=t.id

@@ -2651,8 +2651,10 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			TradeID:    t.ID,
 		})
 		if err != nil {
-			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
-			logger.Warn("exit order failed", "trade_id", t.ID, "reason", exitReason, "err", err)
+			// A POST can fail after broker acceptance. Retain ownership and
+			// let aged orderless-exit recovery inspect broker truth.
+			logger.Warn("exit order placement ambiguous — claim retained",
+				"trade_id", t.ID, "reason", exitReason, "err", err)
 			continue
 		}
 
@@ -2822,8 +2824,8 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 	// signals_blocked columns now reflect reality too.
 	e.portfolio.MaybeDailySummary(ctx,
 		e.todayStartingEquity,
-		0,                       // tradesOpened (placeholder, could track in engine if needed)
-		len(trades),             // tradesClosed
+		0,           // tradesOpened (placeholder, could track in engine if needed)
+		len(trades), // tradesClosed
 		wins,
 		losses,
 		counters.SignalsTotal,   // signalGenerated — total daily signals

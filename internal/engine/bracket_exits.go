@@ -432,5 +432,5 @@ func (e *Engine) cancelClaimedExitLegs(
 		remainingByTrade[t.ID] = remaining
 		totalRemaining += remaining
 	}
-	return remainingByTrade, totalRemaining, totalRemaining > 0, true
+	return remainingByTrade, totalRemaining, totalRemaining > 0, totalRemaining > 0
 }

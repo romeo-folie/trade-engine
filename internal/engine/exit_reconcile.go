@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -46,6 +47,7 @@ type exitReconcileStore interface {
 	// broker id would stamp the broker's AGGREGATE filled qty onto every
 	// lot's row.
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
+	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
 	UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
@@ -60,6 +62,9 @@ func (exitStoreAdapter) GetPendingExitOrders(ctx context.Context, limit int) ([]
 }
 func (exitStoreAdapter) UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error {
 	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
+}
+func (exitStoreAdapter) ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (float64, float64, error) {
+	return store.ApplyPartialExit(ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status)
 }
 func (exitStoreAdapter) UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	return store.UpdateTradeExit(ctx, id, exitPrice, pnl, pnlPct)
@@ -147,10 +152,39 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 
 	remainingTerminalFill := make(map[string]float64)
 	terminalFillSeen := make(map[string]bool)
+	type terminalTradeState struct {
+		ticker      string
+		direction   string
+		entryPrice  float64
+		remaining   float64
+		fillQty     float64
+		proceeds    float64
+		canFinalize bool
+	}
+	terminalTrades := make(map[string]*terminalTradeState)
+	stateFor := func(p store.PendingExitOrder) *terminalTradeState {
+		s := terminalTrades[p.TradeID]
+		if s == nil {
+			s = &terminalTradeState{
+				ticker: p.Ticker, direction: p.Direction,
+				entryPrice: p.EntryPrice, remaining: p.Quantity,
+				canFinalize: true,
+			}
+			terminalTrades[p.TradeID] = s
+		}
+		return s
+	}
 	for _, p := range pending {
 		stats.Scanned++
+		var tradeState *terminalTradeState
+		if p.TradeStatus == "exiting" {
+			tradeState = stateFor(p)
+		}
 		res, err := executor.GetOrderStatus(ctx, p.BrokerOrderID)
 		if err != nil {
+			if tradeState != nil {
+				tradeState.canFinalize = false
+			}
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				stats.NotFound++
 				logger.Warn("exit reconcile: order unknown at broker — cannot confirm fill",
@@ -166,48 +200,45 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		switch execution.NormalizeOrderStatus(res.Status) {
 		case "filled":
 			if res.FilledPrice <= 0 {
+				if tradeState != nil {
+					tradeState.canFinalize = false
+				}
 				stats.Errors++
 				logger.Warn("exit reconcile: broker says filled but returned no fill price",
 					"ticker", p.Ticker, "broker_order_id", p.BrokerOrderID)
 				continue
 			}
-			// Correct the trade BEFORE flipping the order row to 'filled':
-			// the sweep only selects unfilled orders, so writing the order
-			// first would make a failed trade update unretryable — the bad
-			// exit price would stick forever. Trade-first is safe because
-			// UpdateTradeExit is idempotent: if the order write then fails,
-			// the next sweep redoes both.
-			corrected := p.TradeStatus == "exiting" ||
-				math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
-			if corrected {
-				lotQuantity := p.OrderQuantity
-				if lotQuantity <= 0 {
-					lotQuantity = p.Quantity
+			lotQty := p.OrderQuantity
+			if lotQty <= 0 {
+				lotQty = p.Quantity
+			}
+			if p.TradeStatus == "exiting" {
+				remaining, _, err := db.ApplyPartialExit(
+					ctx, p.TradeID, p.OrderID, res.FilledPrice, lotQty, "filled",
+				)
+				if err != nil {
+					tradeState.canFinalize = false
+					stats.Errors++
+					logger.Warn("exit reconcile: atomically apply filled exit",
+						"trade_id", p.TradeID, "order_id", p.OrderID, "err", err)
+					continue
 				}
-				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, lotQuantity, res.FilledPrice)
+				tradeState.remaining = remaining
+				tradeState.fillQty += lotQty
+				tradeState.proceeds += lotQty * res.FilledPrice
+				stats.Corrected++
+				continue
+			}
+
+			// Legacy already-closed rows only need broker-price correction.
+			corrected := math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
+			if corrected {
+				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, lotQty, res.FilledPrice)
 				if err := db.UpdateTradeExit(ctx, p.TradeID, res.FilledPrice, pnl, pnlPct); err != nil {
 					stats.Errors++
 					logger.Warn("exit reconcile: update trade exit", "trade_id", p.TradeID, "err", err)
 					continue
 				}
-				if p.TradeStatus == "exiting" && pnl < 0 &&
-					len(recordLoss) > 0 && recordLoss[0] != nil {
-					recordLoss[0]()
-				}
-				logger.Info("exit reconcile: corrected trade exit to broker fill",
-					"ticker", p.Ticker,
-					"trade_id", p.TradeID,
-					"recorded_exit", p.ExitPrice,
-					"broker_fill", res.FilledPrice,
-					"pnl", pnl,
-				)
-			}
-			// Per-lot fill qty: the broker reports the AGGREGATE fill for
-			// the order, which spans multiple lots on a #436 SELL exit —
-			// each row records at most its own lot's quantity.
-			lotQty := p.OrderQuantity
-			if lotQty <= 0 {
-				lotQty = p.Quantity
 			}
 			if err := db.UpdateOrderFill(ctx, p.OrderID, res.FilledPrice, lotQty, "filled"); err != nil {
 				stats.Errors++
@@ -239,60 +270,37 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			remainingTerminalFill[p.BrokerOrderID] =
 				math.Max(0, remainingTerminalFill[p.BrokerOrderID]-lotFillDelta)
 			lotFill := p.RecordedFill + lotFillDelta
-			if lotFill > 0 {
+			fillPrice := res.FilledPrice
+			if fillPrice <= 0 {
+				fillPrice = p.RecordedPrice
+			}
+			if p.TradeStatus == "exiting" {
+				remaining, _, err := db.ApplyPartialExit(
+					ctx, p.TradeID, p.OrderID, fillPrice, lotFill, terminalStatus,
+				)
+				if err != nil {
+					tradeState.canFinalize = false
+					stats.Errors++
+					logger.Warn("exit reconcile: atomically apply terminal exit",
+						"trade_id", p.TradeID, "order_id", p.OrderID, "err", err)
+					continue
+				}
+				tradeState.remaining = remaining
+				if lotFill > 0 {
+					tradeState.fillQty += lotFill
+					tradeState.proceeds += lotFill * fillPrice
+				}
+			} else {
 				if err := db.UpdateOrderFill(
-					ctx, p.OrderID, res.FilledPrice, lotFill, terminalStatus,
+					ctx, p.OrderID, fillPrice, lotFill, terminalStatus,
 				); err != nil {
 					stats.Errors++
-					logger.Warn("exit reconcile: persist terminal partial fill",
+					logger.Warn("exit reconcile: persist closed-trade terminal exit",
 						"order_id", p.OrderID, "err", err)
 					continue
 				}
-			} else if err := db.UpdateOrderFill(
-				ctx, p.OrderID, res.FilledPrice, 0, terminalStatus,
-			); err != nil {
-				stats.Errors++
-				logger.Warn("exit reconcile: mark lot order status", "order_id", p.OrderID, "err", err)
-				continue
 			}
 			stats.Terminal++
-			if p.TradeStatus == "exiting" {
-				if lotFill > 0 {
-					// Set the absolute remaining lot quantity. This is
-					// idempotent across either write failing: a retry cannot
-					// subtract the same cumulative broker fill twice.
-					remaining := math.Max(0, lotCapacity-lotFill)
-					if remaining <= 1e-9 && res.FilledPrice > 0 {
-						pnl, pnlPct := tradePnL(
-							p.Direction, p.EntryPrice, lotCapacity, res.FilledPrice,
-						)
-						if err := db.UpdateTradeExit(
-							ctx, p.TradeID, res.FilledPrice, pnl, pnlPct,
-						); err != nil {
-							stats.Errors++
-							continue
-						}
-						if pnl < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
-							recordLoss[0]()
-						}
-						continue
-					}
-					if err := db.UpdateExitingTradeQuantity(
-						ctx, p.TradeID, remaining,
-					); err != nil {
-						stats.Errors++
-						logger.Warn("exit reconcile: reduce quantity after partial exit",
-							"trade_id", p.TradeID, "err", err)
-						continue
-					}
-				}
-				if err := db.ReleaseTradeExitClaim(ctx, p.TradeID); err != nil {
-					stats.Errors++
-					logger.Warn("exit reconcile: release failed exit claim",
-						"trade_id", p.TradeID, "err", err)
-					continue
-				}
-			}
 			logger.Error("exit reconcile: closed trade's exit order never executed at broker — position may still be live",
 				"ticker", p.Ticker,
 				"trade_id", p.TradeID,
@@ -300,7 +308,41 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				"broker_status", res.Status,
 			)
 		default: // pending / partial — leave for the next sweep
+			if tradeState != nil {
+				tradeState.canFinalize = false
+			}
 			stats.StillPending++
+		}
+	}
+
+	for tradeID, state := range terminalTrades {
+		if !state.canFinalize {
+			continue
+		}
+		if state.remaining <= 1e-9 {
+			if state.fillQty <= 0 || state.proceeds <= 0 {
+				stats.Errors++
+				logger.Error("exit reconcile: flattened trade lacks durable fill price",
+					"trade_id", tradeID, "ticker", state.ticker)
+				continue
+			}
+			exitPrice := state.proceeds / state.fillQty
+			pnl, pnlPct := tradePnL(
+				state.direction, state.entryPrice, state.fillQty, exitPrice,
+			)
+			if err := db.UpdateTradeExit(ctx, tradeID, exitPrice, pnl, pnlPct); err != nil {
+				stats.Errors++
+				continue
+			}
+			if pnl < 0 && len(recordLoss) > 0 && recordLoss[0] != nil {
+				recordLoss[0]()
+			}
+			continue
+		}
+		if err := db.ReleaseTradeExitClaim(ctx, tradeID); err != nil {
+			stats.Errors++
+			logger.Warn("exit reconcile: release settled exit claim",
+				"trade_id", tradeID, "err", err)
 		}
 	}
 
@@ -363,32 +405,65 @@ func recoverOrderlessExits(
 		durableBrokerID[p.BrokerOrderID] = true
 		durableTicker[p.Ticker] = true
 	}
+	type recoveryGroup struct {
+		trades     []store.Trade
+		candidates []execution.WorkingOrder
+	}
+	groups := make(map[string]*recoveryGroup)
 	for _, t := range orderless {
 		wantSide := "sell"
 		if t.Direction == "short" {
 			wantSide = "buy"
 		}
+		key := t.Ticker + "\x00" + wantSide
+		group := groups[key]
+		if group == nil {
+			group = &recoveryGroup{}
+			groups[key] = group
+		}
+		group.trades = append(group.trades, t)
+	}
+	for key, group := range groups {
 		for _, w := range working {
-			if w.Ticker != t.Ticker || w.Side != wantSide || w.OrderID == "" ||
-				durableBrokerID[w.OrderID] {
+			wantTicker, wantSide, _ := strings.Cut(key, "\x00")
+			if w.Ticker != wantTicker || w.Side != wantSide ||
+				w.OrderID == "" || durableBrokerID[w.OrderID] {
 				continue
 			}
-			if _, err := recoveryDB.InsertOrderWithRetry(ctx, store.Order{
-				TradeID: t.ID, BrokerOrderID: w.OrderID, Ticker: t.Ticker,
-				Side: wantSide, OrderType: string(execution.OrderTypeMarket),
-				Quantity: t.Quantity, Status: w.Status, IsStopLoss: true,
-			}); err != nil {
-				stats.Errors++
-				logger.Warn("exit reconcile: persist recovered working exit",
-					"trade_id", t.ID, "broker_order_id", w.OrderID, "err", err)
-				break
-			}
-			recoveredTrade[t.ID] = true
-			stats.Recovered++
-			logger.Warn("exit reconcile: reconstructed missing exit order row",
-				"trade_id", t.ID, "broker_order_id", w.OrderID)
-			break
+			group.candidates = append(group.candidates, w)
 		}
+	}
+	ambiguousWorkingTicker := make(map[string]bool)
+	for _, group := range groups {
+		if len(group.trades) != 1 || len(group.candidates) != 1 {
+			if len(group.candidates) > 0 {
+				ambiguousWorkingTicker[group.trades[0].Ticker] = true
+				logger.Error("exit reconcile: ambiguous working-order attribution; retaining claims",
+					"ticker", group.trades[0].Ticker,
+					"orderless_trades", len(group.trades),
+					"candidate_orders", len(group.candidates))
+			}
+			continue
+		}
+		t, w := group.trades[0], group.candidates[0]
+		wantSide := "sell"
+		if t.Direction == "short" {
+			wantSide = "buy"
+		}
+		if _, err := recoveryDB.InsertOrderWithRetry(ctx, store.Order{
+			TradeID: t.ID, BrokerOrderID: w.OrderID, Ticker: t.Ticker,
+			Side: wantSide, OrderType: string(execution.OrderTypeMarket),
+			Quantity: t.Quantity, Status: w.Status, IsStopLoss: true,
+		}); err != nil {
+			stats.Errors++
+			logger.Warn("exit reconcile: persist recovered working exit",
+				"trade_id", t.ID, "broker_order_id", w.OrderID, "err", err)
+			continue
+		}
+		recoveredTrade[t.ID] = true
+		stats.Recovered++
+		logger.Warn("exit reconcile: reconstructed missing exit order row",
+			"trade_id", t.ID, "broker_order_id", w.OrderID)
 	}
 
 	positions, err := broker.GetPositions(ctx)
@@ -438,6 +513,9 @@ func recoverOrderlessExits(
 			// residual shortage to the orderless claim.
 			continue
 		}
+		if ambiguousWorkingTicker[t.Ticker] {
+			continue
+		}
 		missing := shortage[t.Ticker]
 		if missing <= 1e-9 {
 			// Broker still holds the full DB-owned quantity and exposes no
@@ -453,6 +531,7 @@ func recoverOrderlessExits(
 		}
 		sold := math.Min(t.Quantity, missing)
 		remaining := math.Max(0, t.Quantity-sold)
+		recoveryPrice := brokerPrice[t.Ticker]
 		if remaining > 1e-9 {
 			if err := db.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
 				stats.Errors++
@@ -463,13 +542,15 @@ func recoverOrderlessExits(
 				continue
 			}
 		} else {
-			price := brokerPrice[t.Ticker]
+			price := recoveryPrice
 			if price <= 0 {
-				stats.Errors++
-				logger.Error("exit reconcile: broker position proves orderless exit filled but no recovery price is available",
-					"trade_id", t.ID, "ticker", t.Ticker)
-				continue
+				// A flat position has no live quote in GetPositions. Close
+				// conservatively at cost so the zero-quantity claim cannot
+				// strand forever; the ERROR log preserves the accounting
+				// exception for broker-activity backfill.
+				price = t.EntryPrice
 			}
+			recoveryPrice = price
 			pnl, pnlPct := tradePnL(t.Direction, t.EntryPrice, t.Quantity, price)
 			if err := db.UpdateTradeExit(ctx, t.ID, price, pnl, pnlPct); err != nil {
 				stats.Errors++
@@ -484,7 +565,7 @@ func recoverOrderlessExits(
 		logger.Error("exit reconcile: recovered orderless exit from broker position delta",
 			"trade_id", t.ID, "ticker", t.Ticker,
 			"sold_qty", sold, "remaining_qty", remaining,
-			"recovery_price", brokerPrice[t.Ticker])
+			"recovery_price", recoveryPrice)
 	}
 }
 

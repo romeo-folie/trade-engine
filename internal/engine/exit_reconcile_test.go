@@ -17,6 +17,20 @@ type fakeExitExecutor struct {
 	calls   []string
 }
 
+type recoveryExitExecutor struct {
+	*fakeExitExecutor
+	positions []execution.Position
+	working   []execution.WorkingOrder
+}
+
+func (f *recoveryExitExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	return f.positions, nil
+}
+
+func (f *recoveryExitExecutor) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
+	return f.working, nil
+}
+
 func (f *fakeExitExecutor) GetOrderStatus(_ context.Context, brokerOrderID string) (execution.OrderResult, error) {
 	f.calls = append(f.calls, brokerOrderID)
 	if err, ok := f.errs[brokerOrderID]; ok {
@@ -34,6 +48,33 @@ type fakeExitStore struct {
 	tradeExits   map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
 	orderStatus  map[string]string     // broker_order_id → status
 	tradeQty     map[string]float64
+	appliedFill  map[string]float64
+}
+
+type recoveryExitStore struct {
+	*fakeExitStore
+	orderless []store.Trade
+	owned     []store.Trade
+	inserted  []store.Order
+	released  []string
+}
+
+func (f *recoveryExitStore) GetOrderlessExitingTrades(context.Context, int) ([]store.Trade, error) {
+	return f.orderless, nil
+}
+
+func (f *recoveryExitStore) GetOwnedPositionTrades(context.Context) ([]store.Trade, error) {
+	return f.owned, nil
+}
+
+func (f *recoveryExitStore) InsertOrderWithRetry(_ context.Context, o store.Order) (string, error) {
+	f.inserted = append(f.inserted, o)
+	return o.BrokerOrderID, nil
+}
+
+func (f *recoveryExitStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
+	f.released = append(f.released, id)
+	return nil
 }
 
 func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
@@ -43,6 +84,7 @@ func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 		tradeExits:  map[string][3]float64{},
 		orderStatus: map[string]string{},
 		tradeQty:    map[string]float64{},
+		appliedFill: map[string]float64{},
 	}
 }
 
@@ -53,6 +95,29 @@ func (f *fakeExitStore) UpdateOrderFill(_ context.Context, id string, price, qty
 	f.orderFills[id] = [2]float64{price, qty}
 	f.orderStatus[id] = status
 	return nil
+}
+func (f *fakeExitStore) ApplyPartialExit(
+	_ context.Context,
+	tradeID, orderID string,
+	price, cumulativeQty float64,
+	status string,
+) (float64, float64, error) {
+	current, known := f.tradeQty[tradeID]
+	if !known {
+		for _, p := range f.pending {
+			if p.TradeID == tradeID {
+				current = p.Quantity
+				break
+			}
+		}
+	}
+	applied := math.Max(0, cumulativeQty-f.appliedFill[orderID])
+	f.appliedFill[orderID] += applied
+	current = math.Max(0, current-applied)
+	f.tradeQty[tradeID] = current
+	f.orderFills[orderID] = [2]float64{price, cumulativeQty}
+	f.orderStatus[orderID] = status
+	return current, applied, nil
 }
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
 	if f.tradeExitErr != nil {
@@ -200,6 +265,45 @@ func TestExitReconcileTerminalFillSubtractsAllocationsOutsideBatch(t *testing.T)
 	}
 }
 
+func TestExitReconcileAccumulatesMultipleTerminalRowsForOneTrade(t *testing.T) {
+	p1 := lacExit()
+	p1.OrderID, p1.BrokerOrderID = "o1", "b1"
+	p1.TradeStatus, p1.Quantity, p1.OrderQuantity = "exiting", 10, 10
+	p2 := p1
+	p2.OrderID, p2.BrokerOrderID = "o2", "b2"
+	db := newFakeExitStore(p1, p2)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "cancelled", FilledPrice: 9, FilledQty: 3},
+		"b2": {Status: "cancelled", FilledPrice: 8, FilledQty: 2},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.tradeQty[p1.TradeID]; got != 5 {
+		t.Fatalf("remaining quantity = %v, want both terminal fills deducted to 5", got)
+	}
+}
+
+func TestExitReconcileFilledResizeStopLeavesRemainderOpen(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 10
+	p.OrderQuantity = 5
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledPrice: 9, FilledQty: 5},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.tradeQty[p.TradeID]; got != 5 {
+		t.Fatalf("remaining quantity = %v, want 5 after older stop filled", got)
+	}
+	if _, closed := db.tradeExits[p.TradeID]; closed {
+		t.Fatal("partial-size stop fill closed the entire larger trade")
+	}
+}
+
 func TestExitReconcileShortDirectionPnL(t *testing.T) {
 	p := lacExit()
 	p.Direction = "short"
@@ -339,5 +443,65 @@ func TestExitReconcileStoreFetchError(t *testing.T) {
 	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
 	if stats.Errors != 1 || len(ex.calls) != 0 {
 		t.Fatalf("stats = %+v calls=%v, want Errors=1 and no broker calls", stats, ex.calls)
+	}
+}
+
+func TestOrderlessRecoveryDoesNotGuessBetweenMultipleWorkingOrders(t *testing.T) {
+	t1 := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5,
+	}
+	t2 := t1
+	t2.ID = "t2"
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(),
+		orderless:     []store.Trade{t1, t2},
+		owned:         []store.Trade{t1, t2},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{},
+		positions: []execution.Position{
+			{Ticker: "AAPL", Quantity: 10, Side: "long"},
+		},
+		working: []execution.WorkingOrder{
+			{OrderID: "w1", Ticker: "AAPL", Side: "sell", Status: "pending"},
+			{OrderID: "w2", Ticker: "AAPL", Side: "sell", Status: "pending"},
+		},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if len(db.inserted) != 0 || len(db.released) != 0 {
+		t.Fatalf("ambiguous recovery mutated state: inserted=%v released=%v",
+			db.inserted, db.released)
+	}
+	if stats.Recovered != 0 {
+		t.Fatalf("stats = %+v, want no guessed recovery", stats)
+	}
+}
+
+func TestOrderlessRecoveryClosesFlatTradeAtConservativePrice(t *testing.T) {
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5,
+	}
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(),
+		orderless:     []store.Trade{trade},
+		owned:         []store.Trade{trade},
+	}
+	ex := &recoveryExitExecutor{fakeExitExecutor: &fakeExitExecutor{}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	exit, ok := db.tradeExits[trade.ID]
+	if !ok {
+		t.Fatal("flat orderless trade remained exiting")
+	}
+	if exit[0] != trade.EntryPrice || exit[1] != 0 {
+		t.Fatalf("conservative exit = %v, want entry-price close with zero estimated pnl", exit)
+	}
+	if stats.Recovered != 1 {
+		t.Fatalf("stats = %+v, want one recovery", stats)
 	}
 }

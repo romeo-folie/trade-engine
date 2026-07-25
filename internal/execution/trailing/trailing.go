@@ -875,7 +875,9 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.Or
 		TradeID:  t.ID,
 	})
 	if err != nil {
-		return execution.OrderResult{}, 0, fmt.Errorf("place market sell: %w", err)
+		return execution.OrderResult{}, 0, fmt.Errorf(
+			"%w: ambiguous market-sell placement: %v", errExitClaimMustRemain, err,
+		)
 	}
 	return res, exitQty, nil
 }
@@ -927,7 +929,8 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 		}
 	}
 	if remaining <= 0 {
-		return 0, errors.New("exit legs sold the full position while cancelling")
+		return 0, fmt.Errorf("%w: exit legs sold the full position while cancelling",
+			errExitClaimMustRemain)
 	}
 	return remaining, nil
 }

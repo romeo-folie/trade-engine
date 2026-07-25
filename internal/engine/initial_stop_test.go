@@ -99,6 +99,95 @@ func TestEnsureUncappedProtectiveStopGrowsWithPartialFill(t *testing.T) {
 	}
 }
 
+func TestEnsureUncappedProtectiveStopReprotectsRemainderAfterFilledOldStop(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "UCPF", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "old-filled-stop", Ticker: "UCPF",
+		Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			"old-filled-stop": {
+				Status: "filled", FilledPrice: 94, FilledQty: 2,
+			},
+		},
+		placeRes: execution.OrderResult{
+			BrokerOrderID: "remainder-stop", Status: "accepted",
+		},
+	}
+	e := newBracketTestEngine(exec)
+
+	if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCPF", 5, 95); err != nil {
+		t.Fatalf("resize after old stop fill: %v", err)
+	}
+	if len(exec.placed) != 1 || exec.placed[0].Quantity != 3 {
+		t.Fatalf("replacement = %+v, want remainder qty 3", exec.placed)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if trade.Status != "open" || trade.Quantity != 3 {
+		t.Fatalf("trade = status %s qty %v, want open/3", trade.Status, trade.Quantity)
+	}
+}
+
+func TestCancelProtectiveStopDoesNotReleaseAnotherWorkersClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "UCPO", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "owned-stop", Ticker: "UCPO",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("pre-claim trade = %v, %v", claimed, err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"owned-stop": {Status: "cancelled", FilledPrice: 94, FilledQty: 1},
+	}}
+	e := newBracketTestEngine(exec)
+	_, err = e.cancelProtectiveStopForResize(ctx, store.Order{
+		ID: orderID, TradeID: tradeID, BrokerOrderID: "owned-stop",
+		Quantity: 5,
+	}, 5)
+	if err == nil {
+		t.Fatal("resize mutated a stop while another exit worker owned the trade")
+	}
+	trade, getErr := store.GetTradeByID(ctx, tradeID)
+	if getErr != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", getErr)
+	}
+	if trade.Status != "exiting" || trade.Quantity != 5 {
+		t.Fatalf("other claim was disturbed: status %s qty %v", trade.Status, trade.Quantity)
+	}
+}
+
 func TestAdvanceProtectedQuantityRetriesFailedCoverage(t *testing.T) {
 	attempts := 0
 	ensure := func() error {

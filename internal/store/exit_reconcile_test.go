@@ -246,6 +246,35 @@ func TestApplyPartialExitIsAtomicAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestApplyPartialExitAppliesPreviouslyRecordedButUnappliedFill(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_LEGACY_APPLY", Direction: "long", Strategy: "test",
+		EntryPrice: 10, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-legacy-apply",
+		Ticker: "TEST_XRC_LEGACY_APPLY", Side: "sell", OrderType: "stop",
+		Quantity: 5, Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if err := store.UpdateOrderFill(ctx, orderID, 9.50, 2, "cancelled"); err != nil {
+		t.Fatalf("record split fill: %v", err)
+	}
+	remaining, applied, err := store.ApplyPartialExit(
+		ctx, tradeID, orderID, 9.50, 2, "cancelled",
+	)
+	if err != nil || remaining != 3 || applied != 2 {
+		t.Fatalf("recovery apply = remaining %v applied %v err %v, want 3/2/nil",
+			remaining, applied, err)
+	}
+}
+
 func TestGetOrderlessExitingTradesTracksClaimWindow(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
@@ -262,12 +291,26 @@ func TestGetOrderlessExitingTradesTracksClaimWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetOrderlessExitingTrades: %v", err)
 	}
+	for _, row := range rows {
+		if row.ID == tradeID {
+			t.Fatal("fresh claim was recovered while its submitting worker may still be active")
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE trades SET exit_claimed_at=NOW()-INTERVAL '3 minutes'
+		WHERE id=$1`, tradeID); err != nil {
+		t.Fatalf("age exit claim: %v", err)
+	}
+	rows, err = store.GetOrderlessExitingTrades(ctx, 100)
+	if err != nil {
+		t.Fatalf("aged GetOrderlessExitingTrades: %v", err)
+	}
 	found := false
 	for _, row := range rows {
 		found = found || row.ID == tradeID
 	}
 	if !found {
-		t.Fatal("fresh exit claim without an order was not discoverable")
+		t.Fatal("aged exit claim without an order was not discoverable")
 	}
 
 	if _, err := store.InsertOrder(ctx, store.Order{

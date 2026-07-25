@@ -107,11 +107,10 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		LimitPrice: sig.SignalPrice, // paper executor fills at this price
 	})
 	if err != nil {
-		releaseClaims()
-		// Legs are already cancelled: the position is UNPROTECTED until the
-		// software monitor resumes on the next tick (it will — no working
-		// legs means app-managed monitoring applies).
-		logger.Error("sell exit order failed — position temporarily unprotected until the monitor resumes",
+		// Broker POST/response failures are ambiguous: the order may have
+		// been accepted before the transport failed. Keep every claim so
+		// orderless-exit recovery can inspect working orders/positions.
+		logger.Error("sell exit placement ambiguous — claims retained for broker recovery",
 			"ticker", sig.Ticker, "qty", totalQty, "err", err)
 		blockSignal(fmt.Sprintf("sell order failed: %v", err), "order placement")
 		return

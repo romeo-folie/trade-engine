@@ -141,15 +141,22 @@ func (e *Engine) cancelProtectiveStopForResize(
 		switch execution.NormalizeOrderStatus(status.Status) {
 		case "cancelled", "rejected":
 			if status.FilledQty > 0 {
-				if _, err := store.ClaimTradeExit(ctx, existing.TradeID); err != nil {
+				claimed, err := store.ClaimTradeExit(ctx, existing.TradeID)
+				if err != nil {
 					return 0, fmt.Errorf("claim partial stop exit: %w", err)
 				}
-				_, applied, err := store.ApplyPartialExit(
+				if !claimed {
+					return 0, errors.New("partial stop filled while another exit worker owns the trade")
+				}
+				remaining, applied, err := store.ApplyPartialExit(
 					ctx, existing.TradeID, existing.ID,
 					status.FilledPrice, status.FilledQty, "cancelled",
 				)
 				if err != nil {
 					return 0, fmt.Errorf("atomically record partial protective-stop fill: %w", err)
+				}
+				if remaining <= 1e-9 {
+					return 0, errors.New("protective stop flattened trade while resizing; exit reconciler owns trade")
 				}
 				if err := store.ReleaseTradeExitClaim(ctx, existing.TradeID); err != nil {
 					return 0, fmt.Errorf("release reconciled partial stop claim: %w", err)
@@ -158,13 +165,29 @@ func (e *Engine) cancelProtectiveStopForResize(
 			}
 			// Safe to replace below.
 		case "filled":
-			if _, err := store.ClaimTradeExit(ctx, existing.TradeID); err != nil {
+			claimed, err := store.ClaimTradeExit(ctx, existing.TradeID)
+			if err != nil {
 				return 0, fmt.Errorf("claim filled stop exit: %w", err)
 			}
-			if err := store.UpdateOrderFill(
-				ctx, existing.ID, status.FilledPrice, status.FilledQty, "filled",
-			); err != nil {
-				return 0, fmt.Errorf("record protective-stop fill: %w", err)
+			if !claimed {
+				return 0, errors.New("protective stop filled while another exit worker owns the trade")
+			}
+			fillQty := status.FilledQty
+			if fillQty <= 0 {
+				fillQty = existing.Quantity
+			}
+			remaining, applied, err := store.ApplyPartialExit(
+				ctx, existing.TradeID, existing.ID,
+				status.FilledPrice, fillQty, "filled",
+			)
+			if err != nil {
+				return 0, fmt.Errorf("atomically record protective-stop fill: %w", err)
+			}
+			if remaining > 1e-9 {
+				if err := store.ReleaseTradeExitClaim(ctx, existing.TradeID); err != nil {
+					return 0, fmt.Errorf("release partially filled stop claim: %w", err)
+				}
+				return applied, nil
 			}
 			return 0, errors.New("protective stop filled while resizing; exit reconciler owns trade")
 		default:

@@ -302,6 +302,7 @@ type fakeBroker struct {
 	// works; tests can set it to "pending" or "" to simulate broker
 	// timeouts where the cancel didn't actually take.
 	statusOverride map[string]string
+	statusResults  map[string]execution.OrderResult
 	// notFoundIDs contains broker order ids GetOrderStatus must report as
 	// ErrOrderNotFound — exercises the cancelAndConfirm sentinel path.
 	notFoundIDs map[string]bool
@@ -311,6 +312,7 @@ type fakeBroker struct {
 	nextFillPrice float64
 	nextFillQty   float64
 	nextStatus    string // optional override of "pending" on PlaceOrder
+	placeErr      error
 }
 
 type replaceCall struct {
@@ -322,6 +324,9 @@ func (b *fakeBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.placed = append(b.placed, req)
+	if b.placeErr != nil {
+		return execution.OrderResult{}, b.placeErr
+	}
 	b.nextID++
 	status := "pending"
 	if b.nextStatus != "" {
@@ -363,6 +368,9 @@ func (b *fakeBroker) GetOrderStatus(_ context.Context, brokerOrderID string) (ex
 	defer b.mu.Unlock()
 	if b.notFoundIDs[brokerOrderID] {
 		return execution.OrderResult{}, execution.ErrOrderNotFound
+	}
+	if result, ok := b.statusResults[brokerOrderID]; ok {
+		return result, nil
 	}
 	if s, ok := b.statusOverride[brokerOrderID]; ok {
 		return execution.OrderResult{Status: s}, nil
@@ -766,6 +774,58 @@ func TestManager_EMA9PendingExitRemainsDurablyExiting(t *testing.T) {
 	m.UpdateAll(context.Background())
 	if len(fb.placed) != placed {
 		t.Fatal("pending EMA exit was submitted again")
+	}
+}
+
+func TestExitAndCloseRetainsClaimAfterAmbiguousPlacementError(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 10,
+	}
+	fs.trades[trade.ID] = trade
+	fb := &fakeBroker{placeErr: errors.New("response decode timed out")}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 99)
+	if err == nil {
+		t.Fatal("ambiguous placement unexpectedly succeeded")
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for broker recovery", got)
+	}
+}
+
+func TestExitAndCloseRetainsClaimWhenCancelledLegFlattensTrade(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 5,
+	}
+	fs.trades[trade.ID] = trade
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "hard-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5,
+		Status: "pending", IsStopLoss: true,
+	})
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"hard-stop": {
+			Status: "cancelled", FilledPrice: 95, FilledQty: 5,
+		},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 95)
+	if !errors.Is(err, errExitClaimMustRemain) {
+		t.Fatalf("error = %v, want claim-retention sentinel", err)
+	}
+	got := fs.trades[trade.ID]
+	if got.Status != "exiting" || got.Quantity != 0 {
+		t.Fatalf("trade = status %q qty %v, want exiting/0 for reconciliation",
+			got.Status, got.Quantity)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market sell placed after leg already flattened trade: %+v", fb.placed)
 	}
 }
 

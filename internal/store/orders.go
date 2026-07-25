@@ -116,21 +116,23 @@ func ApplyPartialExit(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var recorded float64
+	var recorded, appliedAlready float64
 	if err = tx.QueryRow(ctx, `
-		SELECT COALESCE(filled_qty,0)
+		SELECT COALESCE(filled_qty,0), COALESCE(exit_fill_applied_qty,0)
 		FROM orders
 		WHERE id=$1
-		FOR UPDATE`, orderID).Scan(&recorded); err != nil {
+		FOR UPDATE`, orderID).Scan(&recorded, &appliedAlready); err != nil {
 		return 0, 0, err
 	}
-	applied = math.Max(0, cumulativeFilledQty-recorded)
+	targetFill := math.Max(recorded, cumulativeFilledQty)
+	applied = math.Max(0, targetFill-appliedAlready)
 
 	if _, err = tx.Exec(ctx, `
 		UPDATE orders
-		SET filled_price=$1, filled_qty=$2, status=$3, updated_at=NOW()
+		SET filled_price=$1, filled_qty=$2, status=$3,
+		    exit_fill_applied_qty=$2, updated_at=NOW()
 		WHERE id=$4`,
-		filledPrice, math.Max(recorded, cumulativeFilledQty), status, orderID,
+		filledPrice, targetFill, status, orderID,
 	); err != nil {
 		return 0, 0, err
 	}
