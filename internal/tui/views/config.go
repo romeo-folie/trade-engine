@@ -84,7 +84,7 @@ func buildConfigItems(cfg *config.Config, mode, modeSource string) []ConfigItem 
 			Key: "engine.mode", Label: "ENGINE · Mode", Value: mode,
 			Kind: "select", Options: []string{"manual", "auto", "paper"},
 			Source:      modeSource,
-			Description: "DB startup override. Restart the engine after changing it.",
+			Description: "DB startup override. Restart the engine and dashboard after changing it.",
 		},
 		{
 			Key: "engine.tick_interval_sec", Label: "ENGINE · Tick Interval",

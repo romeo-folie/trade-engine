@@ -195,6 +195,13 @@ func TestConfigReadonlyItemExplainsHowToChangeIt(t *testing.T) {
 	}
 }
 
+func TestModeRestartNoticeIncludesStandaloneDashboard(t *testing.T) {
+	if !strings.Contains(modeRestartNotice, "engine") ||
+		!strings.Contains(modeRestartNotice, "dashboard") {
+		t.Fatalf("mode restart notice does not cover both processes: %q", modeRestartNotice)
+	}
+}
+
 func TestQuitKey(t *testing.T) {
 	m := New(nil, "paper", nil)
 	m.width = 120

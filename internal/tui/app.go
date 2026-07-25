@@ -27,6 +27,8 @@ const brokerReconInterval = 60 * time.Second
 // before a position is reported as diverging.
 const brokerReconTolerance = 0.02
 
+const modeRestartNotice = "restart engine and dashboard to apply"
+
 // View represents the active screen in the TUI.
 type View int
 
@@ -288,7 +290,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.configData.Items[m.selectedConfig].Value = next
 						m.configData.Items[m.selectedConfig].Source = "DB override"
 						m.statusMsg = fmt.Sprintf(
-							"✓ Saved %s=%s; restart engine to apply", item.Key, next,
+							"✓ Saved %s=%s; %s", item.Key, next, modeRestartNotice,
 						)
 					}
 					m.statusMsgTime = time.Now()

@@ -1113,7 +1113,7 @@ var modeCmd = &cobra.Command{
 		if err := store.SetOverride(ctx, "engine.mode", mode); err != nil {
 			return fmt.Errorf("set mode override: %w", err)
 		}
-		fmt.Printf("Mode set to %q (DB override — restart the engine to apply).\n", mode)
+		fmt.Printf("Mode set to %q (DB override — restart the engine and dashboard to apply).\n", mode)
 		return nil
 	},
 }
