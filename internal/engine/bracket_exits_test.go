@@ -8,6 +8,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
@@ -142,6 +143,57 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 	trade := getTrade(t, tradeID)
 	if handled := e.reconcileBracketTrade(ctx, trade); handled {
 		t.Fatal("standalone trailing stop must not mark the trade broker-managed")
+	}
+}
+
+func TestMonitorSoftwareTakeProfitCancelsStandaloneStopBeforeSell(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "CAPA", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110,
+		Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "standalone-stop", Ticker: "CAPA",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 97,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{{
+		Ticker: "CAPA", Timeframe: data.Timeframe1Hour,
+		Timestamp: time.Now(), Open: 110, High: 112, Low: 109, Close: 111,
+	}}); err != nil {
+		t.Fatalf("UpsertCandles: %v", err)
+	}
+
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			"standalone-stop": {Status: "cancelled"},
+		},
+		placeRes: execution.OrderResult{
+			BrokerOrderID: "tp-market", Status: "filled",
+			FilledPrice: 111, FilledQty: 5,
+		},
+	}
+	e := newBracketTestEngine(exec)
+	e.lastExitReconcile = time.Now()
+	e.monitorPositions(ctx)
+
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != "standalone-stop" {
+		t.Fatalf("standalone stop was not cancelled first: %+v", exec.cancelled)
+	}
+	if len(exec.placed) != 1 || exec.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("market TP exit = %+v, want one market order", exec.placed)
+	}
+	if tr := getTrade(t, tradeID); tr.ID != "" {
+		t.Fatal("trade remained open after confirmed software TP fill")
 	}
 }
 

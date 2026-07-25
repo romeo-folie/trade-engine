@@ -54,6 +54,45 @@ func TestEnsureUncappedProtectiveStopSeedsImmediately(t *testing.T) {
 	}
 }
 
+func TestEnsureUncappedProtectiveStopImmediateFillTransfersOwnership(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "UCFI", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	exec := &fakeBracketExec{placeRes: execution.OrderResult{
+		BrokerOrderID: "instant-stop-fill", Status: "filled",
+		FilledPrice: 94.75, FilledQty: 5,
+	}}
+	e := newBracketTestEngine(exec)
+
+	err = e.ensureUncappedProtectiveStop(ctx, tradeID, "UCFI", 5, 95)
+	if !errors.Is(err, errProtectiveStopFilledDuringRollback) {
+		t.Fatalf("error = %v, want immediate-fill sentinel", err)
+	}
+	trade, getErr := store.GetTradeByID(ctx, tradeID)
+	if getErr != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", getErr)
+	}
+	if trade.Status != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fill reconciliation", trade.Status)
+	}
+	orders, getErr := store.GetOrdersByTrade(ctx, tradeID)
+	if getErr != nil || len(orders) != 1 {
+		t.Fatalf("orders = %+v err=%v", orders, getErr)
+	}
+	if orders[0].Status != "filled" || orders[0].FilledQty != 5 ||
+		orders[0].FilledPrice != 94.75 {
+		t.Fatalf("immediate stop fill not durable: %+v", orders[0])
+	}
+}
+
 func TestEnsureUncappedProtectiveStopGrowsWithPartialFill(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

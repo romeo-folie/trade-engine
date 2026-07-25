@@ -600,6 +600,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok && !quantityChanged {
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
+				status := execution.NormalizeOrderStatus(res.Status)
 				if persistErr := m.store.UpdateOrderStopPriceAndID(
 					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
 				); persistErr != nil {
@@ -607,6 +608,15 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
 					}
 					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
+				}
+				if status == "filled" || res.FilledQty > 0 {
+					if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
+						return fmt.Errorf("claim replacement-stop fill: %w", claimErr)
+					}
+					return errStopFilledDuringRollback
+				}
+				if status == "cancelled" || status == "rejected" {
+					return fmt.Errorf("replacement stop became %s before providing coverage", status)
 				}
 				return nil
 			}
@@ -645,6 +655,21 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
+	status := execution.NormalizeOrderStatus(res.Status)
+	fillQty := res.FilledQty
+	if status == "filled" && fillQty <= 0 {
+		fillQty = t.Quantity
+	}
+	fillPrice := res.FilledPrice
+	if fillQty > 0 && fillPrice <= 0 {
+		fillPrice = newStop
+	}
+	fillObserved := fillQty > 0
+	if fillObserved {
+		if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
+			return fmt.Errorf("claim immediate stop fill: %w", claimErr)
+		}
+	}
 
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
@@ -656,6 +681,12 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			}
 			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
 		}
+		if fillObserved {
+			return errStopFilledDuringRollback
+		}
+		if status == "cancelled" || status == "rejected" {
+			return fmt.Errorf("replacement stop became %s before providing coverage", status)
+		}
 		return nil
 	}
 	_, err = m.store.InsertOrder(ctx, store.Order{
@@ -666,7 +697,9 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		OrderType:     string(execution.OrderTypeStop),
 		Quantity:      t.Quantity,
 		StopPrice:     newStop,
-		Status:        execution.NormalizeOrderStatus(res.Status),
+		FilledPrice:   fillPrice,
+		FilledQty:     fillQty,
+		Status:        status,
 		IsStopLoss:    true,
 	})
 	if err != nil {
@@ -674,6 +707,12 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			return fmt.Errorf("persist new stop: %w; rollback: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("persist new stop: %w (broker stop cancelled)", err)
+	}
+	if fillObserved {
+		return errStopFilledDuringRollback
+	}
+	if status == "cancelled" || status == "rejected" {
+		return fmt.Errorf("new stop became %s before providing coverage", status)
 	}
 	return nil
 }
@@ -904,9 +943,17 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 		switch execution.NormalizeOrderStatus(status.Status) {
 		case "cancelled", "rejected":
 			if status.FilledQty > 0 {
+				fillPrice := status.FilledPrice
+				if fillPrice <= 0 {
+					if leg.IsTakeProfit {
+						fillPrice = leg.LimitPrice
+					} else {
+						fillPrice = leg.StopPrice
+					}
+				}
 				var applied float64
 				remaining, applied, err = m.store.ApplyPartialExit(
-					ctx, t.ID, leg.ID, status.FilledPrice, status.FilledQty,
+					ctx, t.ID, leg.ID, fillPrice, status.FilledQty,
 					execution.NormalizeOrderStatus(status.Status),
 				)
 				if err != nil {
@@ -921,8 +968,10 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 				return 0, fmt.Errorf("persist terminal exit-leg status: %w", err)
 			}
 		case "filled":
-			return 0, fmt.Errorf("exit leg %s filled while cancelling; refusing duplicate market exit",
-				leg.BrokerOrderID)
+			return 0, fmt.Errorf(
+				"%w: exit leg %s filled while cancelling; refusing duplicate market exit",
+				errExitClaimMustRemain, leg.BrokerOrderID,
+			)
 		default:
 			return 0, fmt.Errorf("exit leg %s remains %s after cancel: %v",
 				leg.BrokerOrderID, status.Status, cancelErr)

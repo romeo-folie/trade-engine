@@ -407,9 +407,17 @@ func (e *Engine) cancelClaimedExitLegs(
 			switch execution.NormalizeOrderStatus(res.Status) {
 			case "cancelled", "rejected":
 				if res.FilledQty > 0 {
+					fillPrice := res.FilledPrice
+					if fillPrice <= 0 {
+						if leg.IsTakeProfit {
+							fillPrice = leg.LimitPrice
+						} else {
+							fillPrice = leg.StopPrice
+						}
+					}
 					var err error
 					remaining, _, err = store.ApplyPartialExit(
-						ctx, t.ID, leg.ID, res.FilledPrice, res.FilledQty,
+						ctx, t.ID, leg.ID, fillPrice, res.FilledQty,
 						execution.NormalizeOrderStatus(res.Status),
 					)
 					if err != nil {

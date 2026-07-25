@@ -5,6 +5,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func TestUncappedTakeProfitRequiresEnabledTrailingManager(t *testing.T) {
@@ -123,5 +124,22 @@ func TestSellExitConfidenceGate(t *testing.T) {
 				t.Fatalf("allowed = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestTickerHasExitingLongBlocksOnlyMatchingInflightExit(t *testing.T) {
+	trades := []store.Trade{
+		{Ticker: "AAPL", Direction: "long", Status: "open"},
+		{Ticker: "MSFT", Direction: "long", Status: "exiting"},
+		{Ticker: "AAPL", Direction: "short", Status: "exiting"},
+	}
+	if tickerHasExitingLongIn(trades, "AAPL") {
+		t.Fatal("open long or exiting short must not look like an exiting AAPL long")
+	}
+	trades = append(trades, store.Trade{
+		Ticker: "AAPL", Direction: "long", Status: "exiting",
+	})
+	if !tickerHasExitingLongIn(trades, "AAPL") {
+		t.Fatal("matching exiting long was not detected")
 	}
 }

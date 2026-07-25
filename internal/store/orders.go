@@ -116,15 +116,24 @@ func ApplyPartialExit(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
-	var recorded, appliedAlready float64
+	var recorded, appliedAlready, orderQuantity float64
 	if err = tx.QueryRow(ctx, `
-		SELECT COALESCE(filled_qty,0), COALESCE(exit_fill_applied_qty,0)
+		SELECT COALESCE(filled_qty,0), COALESCE(exit_fill_applied_qty,0),
+		       quantity
 		FROM orders
 		WHERE id=$1
-		FOR UPDATE`, orderID).Scan(&recorded, &appliedAlready); err != nil {
+		FOR UPDATE`, orderID).Scan(
+		&recorded, &appliedAlready, &orderQuantity,
+	); err != nil {
 		return 0, 0, err
 	}
-	targetFill := math.Max(recorded, cumulativeFilledQty)
+	targetFill := math.Max(appliedAlready, math.Max(recorded, cumulativeFilledQty))
+	if orderQuantity > 0 {
+		// Broker responses for aggregate orders carry the aggregate fill on
+		// every lookup. A per-lot row can never own more than its assigned
+		// quantity, even if a caller accidentally forwards that aggregate.
+		targetFill = math.Min(targetFill, math.Max(orderQuantity, appliedAlready))
+	}
 	applied = math.Max(0, targetFill-appliedAlready)
 
 	if _, err = tx.Exec(ctx, `

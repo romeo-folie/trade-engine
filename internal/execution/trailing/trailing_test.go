@@ -829,6 +829,37 @@ func TestExitAndCloseRetainsClaimWhenCancelledLegFlattensTrade(t *testing.T) {
 	}
 }
 
+func TestExitAndCloseRetainsClaimWhenLegReportsFilledDuringCancel(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 5,
+	}
+	fs.trades[trade.ID] = trade
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "hard-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5,
+		Status: "pending", IsStopLoss: true,
+	})
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"hard-stop": {
+			Status: "filled", FilledPrice: 95, FilledQty: 5,
+		},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.exitAndClose(context.Background(), trade, 95)
+	if !errors.Is(err, errExitClaimMustRemain) {
+		t.Fatalf("error = %v, want claim-retention sentinel", err)
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fill reconciliation", got)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market sell placed after leg filled: %+v", fb.placed)
+	}
+}
+
 func TestCancelAndConfirmRejectsStopFillRace(t *testing.T) {
 	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "filled"}}
 	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
@@ -1307,6 +1338,43 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	if len(fb.placed) != placedBefore {
 		t.Fatalf("duplicate market exit on second tick: placed %d → %d",
 			placedBefore, len(fb.placed))
+	}
+}
+
+func TestManager_NewProtectiveStopImmediateFillTransfersOwnership(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, TakeProfit: 0,
+		HighWaterMark: 100,
+	}
+	fs.trades[trade.ID] = trade
+	fp := &fakePrices{candles: makeFlatPriceCandles(
+		110, candle(109, 110, 108, 110),
+	)}
+	fb := &fakeBroker{
+		nextStatus: "filled", nextFillPrice: 108.5, nextFillQty: 10,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
+
+	err := m.updateOne(context.Background(), trade)
+	if !errors.Is(err, errStopFilledDuringRollback) {
+		t.Fatalf("error = %v, want immediate-fill sentinel", err)
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for reconciliation", got)
+	}
+	var found bool
+	for _, order := range fs.orders {
+		if order.BrokerOrderID == "broker-1" {
+			found = true
+			if order.Status != "filled" || order.FilledQty != 10 {
+				t.Fatalf("immediate fill order = %+v", order)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("immediate stop fill was not persisted")
 	}
 }
 

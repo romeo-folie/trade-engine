@@ -53,10 +53,11 @@ type fakeExitStore struct {
 
 type recoveryExitStore struct {
 	*fakeExitStore
-	orderless []store.Trade
-	owned     []store.Trade
-	inserted  []store.Order
-	released  []string
+	orderless        []store.Trade
+	owned            []store.Trade
+	durableOwnership []store.DurableExitOrderOwnership
+	inserted         []store.Order
+	released         []string
 }
 
 func (f *recoveryExitStore) GetOrderlessExitingTrades(context.Context, int) ([]store.Trade, error) {
@@ -65,6 +66,10 @@ func (f *recoveryExitStore) GetOrderlessExitingTrades(context.Context, int) ([]s
 
 func (f *recoveryExitStore) GetOwnedPositionTrades(context.Context) ([]store.Trade, error) {
 	return f.owned, nil
+}
+
+func (f *recoveryExitStore) GetDurableExitOrderOwnership(context.Context) ([]store.DurableExitOrderOwnership, error) {
+	return f.durableOwnership, nil
 }
 
 func (f *recoveryExitStore) InsertOrderWithRetry(_ context.Context, o store.Order) (string, error) {
@@ -219,6 +224,49 @@ func TestExitReconcileCancelledPartialReopensOnlyRemainder(t *testing.T) {
 	}
 	if fill := db.orderFills[p.OrderID]; fill != [2]float64{3.80, 4} {
 		t.Fatalf("partial order fill = %v, want price 3.80 qty 4", fill)
+	}
+}
+
+func TestExitReconcileCancelledStopFillFallsBackToStopPrice(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	p.StopPrice = 3.75
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "cancelled", FilledQty: 2},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.orderFills[p.OrderID]; got != [2]float64{3.75, 2} {
+		t.Fatalf("terminal stop fill = %v, want stop-price fallback 3.75/2", got)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 3 {
+		t.Fatalf("remaining quantity = %v, want 3", got)
+	}
+}
+
+func TestExitReconcileFilledStopFallsBackToRecordedPrice(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	p.RecordedPrice = 3.80
+	p.StopPrice = 3.75
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "filled", FilledQty: 5},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.orderFills[p.OrderID]; got != [2]float64{3.80, 5} {
+		t.Fatalf("filled stop = %v, want recorded-price fallback 3.80/5", got)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 0 {
+		t.Fatalf("remaining quantity = %v, want 0", got)
 	}
 }
 
@@ -477,6 +525,88 @@ func TestOrderlessRecoveryDoesNotGuessBetweenMultipleWorkingOrders(t *testing.T)
 	}
 	if stats.Recovered != 0 {
 		t.Fatalf("stats = %+v, want no guessed recovery", stats)
+	}
+}
+
+func TestOrderlessRecoveryExcludesDurableOrdersOutsideWorkBatch(t *testing.T) {
+	orderless := store.Trade{
+		ID: "orderless", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5,
+	}
+	other := orderless
+	other.ID = "durable"
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(), // current LIMIT batch is empty
+		orderless:     []store.Trade{orderless},
+		owned:         []store.Trade{orderless, other},
+		durableOwnership: []store.DurableExitOrderOwnership{{
+			BrokerOrderID: "known-outside-batch",
+			Ticker:        "AAPL",
+			Side:          "sell",
+			TradeStatus:   "exiting",
+			ClaimOwned:    true,
+		}},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{},
+		positions: []execution.Position{{
+			Ticker: "AAPL", Quantity: 5, Side: "long",
+		}},
+		working: []execution.WorkingOrder{{
+			OrderID: "known-outside-batch", Ticker: "AAPL",
+			Side: "sell", Status: "pending",
+		}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 1)
+
+	if len(db.inserted) != 0 || len(db.released) != 0 {
+		t.Fatalf("out-of-batch durable order was misattributed: inserted=%v released=%v",
+			db.inserted, db.released)
+	}
+	if stats.Recovered != 0 {
+		t.Fatalf("stats = %+v, want no guessed recovery", stats)
+	}
+}
+
+func TestOrderlessRecoveryReleasesClaimWithPreexistingProtectiveStop(t *testing.T) {
+	trade := store.Trade{
+		ID: "orderless", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5,
+	}
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(),
+		orderless:     []store.Trade{trade},
+		owned:         []store.Trade{trade},
+		durableOwnership: []store.DurableExitOrderOwnership{{
+			BrokerOrderID: "old-protective-stop",
+			Ticker:        "AAPL",
+			Side:          "sell",
+			TradeStatus:   "exiting",
+			ClaimOwned:    false,
+		}},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{},
+		positions: []execution.Position{{
+			Ticker: "AAPL", Quantity: 5, Side: "long",
+		}},
+		working: []execution.WorkingOrder{{
+			OrderID: "old-protective-stop", Ticker: "AAPL",
+			Side: "sell", Status: "pending",
+		}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 1)
+
+	if len(db.inserted) != 0 {
+		t.Fatalf("pre-existing stop reconstructed as claim order: %+v", db.inserted)
+	}
+	if len(db.released) != 1 || db.released[0] != trade.ID {
+		t.Fatalf("claim was not safely reopened: released=%v", db.released)
+	}
+	if stats.Recovered != 1 {
+		t.Fatalf("stats = %+v, want one recovered claim", stats)
 	}
 }
 

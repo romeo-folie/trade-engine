@@ -33,6 +33,7 @@ type orderlessExitBroker interface {
 type orderlessExitStore interface {
 	GetOrderlessExitingTrades(ctx context.Context, limit int) ([]store.Trade, error)
 	GetOwnedPositionTrades(ctx context.Context) ([]store.Trade, error)
+	GetDurableExitOrderOwnership(ctx context.Context) ([]store.DurableExitOrderOwnership, error)
 	InsertOrderWithRetry(ctx context.Context, o store.Order) (string, error)
 }
 
@@ -83,6 +84,9 @@ func (exitStoreAdapter) GetOrderlessExitingTrades(ctx context.Context, limit int
 }
 func (exitStoreAdapter) GetOwnedPositionTrades(ctx context.Context) ([]store.Trade, error) {
 	return store.GetOwnedPositionTrades(ctx)
+}
+func (exitStoreAdapter) GetDurableExitOrderOwnership(ctx context.Context) ([]store.DurableExitOrderOwnership, error) {
+	return store.GetDurableExitOrderOwnership(ctx)
 }
 func (exitStoreAdapter) InsertOrderWithRetry(ctx context.Context, o store.Order) (string, error) {
 	return store.InsertOrderWithRetry(ctx, o)
@@ -199,7 +203,18 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 
 		switch execution.NormalizeOrderStatus(res.Status) {
 		case "filled":
-			if res.FilledPrice <= 0 {
+			fillPrice := res.FilledPrice
+			if fillPrice <= 0 {
+				fillPrice = p.RecordedPrice
+			}
+			if fillPrice <= 0 {
+				if p.LimitPrice > 0 {
+					fillPrice = p.LimitPrice
+				} else {
+					fillPrice = p.StopPrice
+				}
+			}
+			if fillPrice <= 0 {
 				if tradeState != nil {
 					tradeState.canFinalize = false
 				}
@@ -214,7 +229,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			}
 			if p.TradeStatus == "exiting" {
 				remaining, _, err := db.ApplyPartialExit(
-					ctx, p.TradeID, p.OrderID, res.FilledPrice, lotQty, "filled",
+					ctx, p.TradeID, p.OrderID, fillPrice, lotQty, "filled",
 				)
 				if err != nil {
 					tradeState.canFinalize = false
@@ -225,22 +240,22 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				}
 				tradeState.remaining = remaining
 				tradeState.fillQty += lotQty
-				tradeState.proceeds += lotQty * res.FilledPrice
+				tradeState.proceeds += lotQty * fillPrice
 				stats.Corrected++
 				continue
 			}
 
 			// Legacy already-closed rows only need broker-price correction.
-			corrected := math.Abs(res.FilledPrice-p.ExitPrice) > exitPriceEpsilon
+			corrected := math.Abs(fillPrice-p.ExitPrice) > exitPriceEpsilon
 			if corrected {
-				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, lotQty, res.FilledPrice)
-				if err := db.UpdateTradeExit(ctx, p.TradeID, res.FilledPrice, pnl, pnlPct); err != nil {
+				pnl, pnlPct := tradePnL(p.Direction, p.EntryPrice, lotQty, fillPrice)
+				if err := db.UpdateTradeExit(ctx, p.TradeID, fillPrice, pnl, pnlPct); err != nil {
 					stats.Errors++
 					logger.Warn("exit reconcile: update trade exit", "trade_id", p.TradeID, "err", err)
 					continue
 				}
 			}
-			if err := db.UpdateOrderFill(ctx, p.OrderID, res.FilledPrice, lotQty, "filled"); err != nil {
+			if err := db.UpdateOrderFill(ctx, p.OrderID, fillPrice, lotQty, "filled"); err != nil {
 				stats.Errors++
 				logger.Warn("exit reconcile: update order fill", "order_id", p.OrderID, "err", err)
 				continue
@@ -273,6 +288,13 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			fillPrice := res.FilledPrice
 			if fillPrice <= 0 {
 				fillPrice = p.RecordedPrice
+			}
+			if fillPrice <= 0 {
+				if p.LimitPrice > 0 {
+					fillPrice = p.LimitPrice
+				} else {
+					fillPrice = p.StopPrice
+				}
 			}
 			if p.TradeStatus == "exiting" {
 				remaining, _, err := db.ApplyPartialExit(
@@ -358,7 +380,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		)
 	}
 	recoverOrderlessExits(
-		ctx, executor, db, pending, limit, &stats, recordLoss...,
+		ctx, executor, db, limit, &stats, recordLoss...,
 	)
 	return stats
 }
@@ -367,7 +389,6 @@ func recoverOrderlessExits(
 	ctx context.Context,
 	executor exitReconcileExecutor,
 	db exitReconcileStore,
-	durable []store.PendingExitOrder,
 	limit int,
 	stats *ExitReconcileStats,
 	recordLoss ...func(),
@@ -399,11 +420,19 @@ func recoverOrderlessExits(
 		}
 	}
 	recoveredTrade := make(map[string]bool)
-	durableBrokerID := make(map[string]bool, len(durable))
-	durableTicker := make(map[string]bool, len(durable))
-	for _, p := range durable {
-		durableBrokerID[p.BrokerOrderID] = true
-		durableTicker[p.Ticker] = true
+	ownership, err := recoveryDB.GetDurableExitOrderOwnership(ctx)
+	if err != nil {
+		stats.Errors++
+		logger.Warn("exit reconcile: fetch complete durable exit ownership", "err", err)
+		return
+	}
+	durableBrokerID := make(map[string]bool, len(ownership))
+	durableExitGroup := make(map[string]bool, len(ownership))
+	for _, owner := range ownership {
+		durableBrokerID[owner.BrokerOrderID] = true
+		if owner.TradeStatus == "exiting" && owner.ClaimOwned {
+			durableExitGroup[owner.Ticker+"\x00"+owner.Side] = true
+		}
 	}
 	type recoveryGroup struct {
 		trades     []store.Trade
@@ -507,7 +536,11 @@ func recoverOrderlessExits(
 		if recoveredTrade[t.ID] {
 			continue
 		}
-		if durableTicker[t.Ticker] {
+		wantSide := "sell"
+		if t.Direction == "short" {
+			wantSide = "buy"
+		}
+		if durableExitGroup[t.Ticker+"\x00"+wantSide] {
 			// A known order can itself explain the broker/DB quantity delta.
 			// Wait until its durable rows settle before attributing any
 			// residual shortage to the orderless claim.

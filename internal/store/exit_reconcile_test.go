@@ -162,6 +162,29 @@ func TestInsertOrder_PersistsFillColumns(t *testing.T) {
 	t.Fatal("inserted order not found")
 }
 
+func TestInsertOrderRejectsSecondActiveStopForTrade(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_STOP_OWNER", Direction: "long",
+		Strategy: "test", EntryPrice: 10, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	first := store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-stop-owner-1",
+		Ticker: "TEST_XRC_STOP_OWNER", Side: "sell", OrderType: "stop",
+		Quantity: 5, StopPrice: 9, Status: "pending", IsStopLoss: true,
+	}
+	if _, err := store.InsertOrder(ctx, first); err != nil {
+		t.Fatalf("InsertOrder first stop: %v", err)
+	}
+	first.BrokerOrderID = "brk-stop-owner-2"
+	if _, err := store.InsertOrder(ctx, first); err == nil {
+		t.Fatal("second active STOP row was accepted for the same trade")
+	}
+}
+
 func TestUpdateTradeExit_RewritesPnLPreservesClosedAt(t *testing.T) {
 	ctx := context.Background()
 	tradeID := mustInsertClosedTradeWithPendingExit(t, ctx, "TEST_XRC_UPD", "long", "sell", "brk-xrc-upd")
@@ -275,6 +298,80 @@ func TestApplyPartialExitAppliesPreviouslyRecordedButUnappliedFill(t *testing.T)
 	}
 }
 
+func TestApplyPartialExitClampsAggregateFillToLotQuantity(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_CLAMP", Direction: "long", Strategy: "test",
+		EntryPrice: 10, Quantity: 10,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-clamp",
+		Ticker: "TEST_XRC_CLAMP", Side: "sell", OrderType: "market",
+		Quantity: 4, Status: "partial",
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	remaining, applied, err := store.ApplyPartialExit(
+		ctx, tradeID, orderID, 9.5, 9, "cancelled",
+	)
+	if err != nil || remaining != 6 || applied != 4 {
+		t.Fatalf("clamped apply = remaining %v applied %v err %v, want 6/4/nil",
+			remaining, applied, err)
+	}
+}
+
+func TestApplyEntryFillKeepsPreviouslyExitedSharesSubtracted(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_ENTRY_NET", Direction: "long", Strategy: "test",
+		EntryPrice: 10, Quantity: 2,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-entry-net",
+		Ticker: "TEST_XRC_ENTRY_NET", Side: "buy", OrderType: "market",
+		Quantity: 5, FilledPrice: 10, FilledQty: 2, Status: "partial",
+	}); err != nil {
+		t.Fatalf("InsertOrder entry: %v", err)
+	}
+	exitOrderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-entry-net-stop",
+		Ticker: "TEST_XRC_ENTRY_NET", Side: "sell", OrderType: "stop",
+		Quantity: 2, Status: "partial", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder exit: %v", err)
+	}
+	if _, _, err := store.ApplyPartialExit(
+		ctx, tradeID, exitOrderID, 9.5, 1, "cancelled",
+	); err != nil {
+		t.Fatalf("ApplyPartialExit: %v", err)
+	}
+
+	if err := store.ApplyEntryFill(
+		ctx, tradeID, "brk-xrc-entry-net", 10.2, 5, "filled",
+	); err != nil {
+		t.Fatalf("ApplyEntryFill: %v", err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if trade.Quantity != 4 {
+		t.Fatalf("net quantity = %v, want cumulative entry 5 minus exited 1", trade.Quantity)
+	}
+	if trade.EntryPrice != 10.2 {
+		t.Fatalf("entry price = %v, want broker cumulative average 10.2", trade.EntryPrice)
+	}
+}
+
 func TestGetOrderlessExitingTradesTracksClaimWindow(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
@@ -329,4 +426,40 @@ func TestGetOrderlessExitingTradesTracksClaimWindow(t *testing.T) {
 			t.Fatal("claim remained orderless after its exit order became durable")
 		}
 	}
+}
+
+func TestGetDurableExitOrderOwnershipIsNotBatchLimited(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_OWNER", Direction: "long", Strategy: "test",
+		EntryPrice: 10, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-owner",
+		Ticker: "TEST_XRC_OWNER", Side: "sell", OrderType: "market",
+		Quantity: 5, Status: "pending",
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	owners, err := store.GetDurableExitOrderOwnership(ctx)
+	if err != nil {
+		t.Fatalf("GetDurableExitOrderOwnership: %v", err)
+	}
+	for _, owner := range owners {
+		if owner.BrokerOrderID == "brk-xrc-owner" {
+			if owner.Ticker != "TEST_XRC_OWNER" || owner.Side != "sell" ||
+				owner.TradeStatus != "exiting" || !owner.ClaimOwned {
+				t.Fatalf("owner = %+v", owner)
+			}
+			return
+		}
+	}
+	t.Fatal("durable exiting order missing from complete ownership snapshot")
 }
