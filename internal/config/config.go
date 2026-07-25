@@ -1423,20 +1423,23 @@ type RiskConfig struct {
 	// one whole share fall back to app-managed exits. Default off.
 	BracketExitsEnabled bool `yaml:"bracket_exits_enabled"`
 
-	// EntryGates are evidence-driven entry-quality filters from the
-	// May–Jul 2026 execution study: news_sentiment entries the tape never
-	// confirmed ran a 16% win rate, momentum entries chasing >2% run-ups
-	// ran 14% vs 55% when not chasing, and the session's first analysis
-	// tick (the overnight-headline burst) was the worst recurring entry
-	// cohort. All gates default OFF; each is independent.
+	// EntryGates are evidence-driven entry-quality filters from the execution
+	// and exit-policy studies: daily downtrend alignment, news tape
+	// confirmation, momentum anti-chase, and first-tick deferral. All gates
+	// default OFF; each is independent.
 	EntryGates EntryGatesConfig `yaml:"entry_gates"`
 }
 
 // EntryGatesConfig holds per-strategy entry-quality gates. Zero values
 // disable every gate so existing configs upgrade without behavior change.
-// Gates apply to BUY signals only and fail OPEN when the prior daily close
-// is unavailable — they are alpha filters, not safety guards.
+// Gates apply to BUY signals only and fail OPEN when their required market
+// evidence is unavailable — they are alpha filters, not safety guards.
 type EntryGatesConfig struct {
+	// TrendAlignmentEnabled blocks stock BUYs in a confirmed daily downtrend:
+	// price below both the 9- and 21-day EMAs while both completed-session
+	// EMAs are declining. False preserves existing behavior. The gate fails
+	// open when daily history is unavailable or insufficient.
+	TrendAlignmentEnabled bool `yaml:"trend_alignment_enabled"`
 	// NewsMinRunupPct blocks news_sentiment BUYs unless the price is at
 	// least this % above the prior daily close — the market's reaction
 	// must confirm the headline (its absence is information). 0 disables.

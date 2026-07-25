@@ -40,6 +40,9 @@ func TestDefaultsTrailingRulePreservesATRBehavior(t *testing.T) {
 	if cfg.Risk.ExitConfMin != 0 {
 		t.Fatalf("default exit confidence minimum = %v, want 0", cfg.Risk.ExitConfMin)
 	}
+	if cfg.Risk.EntryGates.TrendAlignmentEnabled {
+		t.Fatal("entry trend-alignment gate must default off")
+	}
 }
 
 func TestValidateExitPolicyConfig(t *testing.T) {

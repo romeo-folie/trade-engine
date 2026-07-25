@@ -1,6 +1,6 @@
 # Exit-policy study — findings & apply-plan (handoff)
 
-**Status (2026-07-24):** study complete, harness merged (PR #470). Branch 1 (gpt-5-nano JSON fix) done in `fix/analysis-json-extraction-hardening`. **Branch 2 and Phase 2 are open work — see the specs below and GitHub issues.** A fresh agent can pick up from here.
+**Status (2026-07-25):** study and harness complete (PR #470); Branch 1 JSON recovery merged (PR #473); Branch 2 live exit policy merged and enabled in paper config (PR #474); cumulative partial-exit accounting merged (PR #475). The full six-ticker/five-variant matrix was replayed from cache after implementation and reproduced every documented profit factor exactly. **Phase 2 is active in issue #472.**
 
 ## Why this exists
 Our stock swing path sits at ~27% win rate; prior work (`te study execution`, PR #433) found **exits, not entries, are the leak** (~+1.53%/trade left on the table). A study of the 2025 US Investing Champion's pullback method (Martin Luk) pointed at the same thing: he runs a low win rate but wins via **asymmetry** — tight stops, and letting winners run on a **close-below-9-EMA** trailing stop instead of a fixed take-profit. We built a backtest harness to test whether our **fixed take-profit truncates winners**, and it does.
@@ -67,7 +67,7 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 
 ---
 
-## Branch 2 — apply the exit findings (OPEN)
+## Branch 2 — apply the exit findings (DONE — PR #474)
 **Goal:** in the LIVE stock exit path, uncap the fixed take-profit and ride a **close-below-9-EMA** trailing stop, plus a **high-conviction SELL gate**. Default-off config, PAPER-first.
 
 **IMPORTANT:** the backtest proved the *concept*; the LIVE exit path is different code (broker brackets + a trailing manager), so this is a fresh implementation, not a reuse of `evaluateExit`. After implementing, validate by running the harness over the cached signals for the 6 study tickers and confirming the live rule's behavior matches.
@@ -88,8 +88,10 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 
 ---
 
-## Phase 2 — entry-quality filter (OPEN, later)
+## Phase 2 — entry-quality filter (ACTIVE — issue #472)
 **Goal:** "buy strength, not weakness" — stop opening longs in downtrends (the OPEN/JMIA lesson: exits can't rescue bad entries). Add a trend-alignment gate: don't open a long when price is below declining 9/21 EMAs / making lower highs. Builds on existing `entry_gates` (PR #434: news tape-confirm, momentum anti-chase, first-tick deferral). Bigger piece — scope as its own effort after Branch 2. Consider adding 9/21 EMA + anchored-VWAP indicators (we only have 20/50/200 EMA + session VWAP today) since the pullback pattern keys on them.
+
+**Initial implementation:** `risk.entry_gates.trend_alignment_enabled` is a default-off, BUY-only daily gate. It blocks only when live price is below both EMA9 and EMA21 and both completed-session EMAs are declining; non-daily or insufficient history fails open. Anchored VWAP, lower-high structure, and the full pullback-in-strength setup remain possible follow-ups rather than prerequisites for this conservative first gate.
 
 ## Conventions (for the takeover agent)
 - Every feature: dedicated **branch → PR → `feature-dev:code-reviewer` before push → Monitor the PR**. Never push to `main` directly. Use a plain branch (NOT a worktree) unless asked.

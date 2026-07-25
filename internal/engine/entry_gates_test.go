@@ -6,7 +6,99 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 )
+
+func trendCandles(closes ...float64) []data.Candle {
+	out := make([]data.Candle, len(closes))
+	for i, closePrice := range closes {
+		out[i] = data.Candle{
+			Timeframe: data.Timeframe1Day,
+			Timestamp: time.Time{},
+			High:      closePrice + 1,
+			Low:       closePrice - 1,
+			Close:     closePrice,
+		}
+	}
+	return out
+}
+
+func descendingCloses(count int, start float64) []float64 {
+	out := make([]float64, count)
+	for i := range out {
+		out[i] = start - float64(i)
+	}
+	return out
+}
+
+func TestEvaluateTrendAlignmentGate_BlocksConfirmedDailyDowntrend(t *testing.T) {
+	cfg := config.EntryGatesConfig{TrendAlignmentEnabled: true}
+	candles := trendCandles(descendingCloses(30, 130)...)
+
+	reason, evaluated := evaluateTrendAlignmentGate(
+		"BUY", 90, data.Timeframe1Day, candles, time.Now(), cfg,
+	)
+	if !evaluated || reason == "" {
+		t.Fatalf("confirmed daily downtrend should block: evaluated=%v reason=%q",
+			evaluated, reason)
+	}
+	if !strings.Contains(reason, "declining daily EMA9") {
+		t.Fatalf("unexpected reason: %s", reason)
+	}
+}
+
+func TestEvaluateTrendAlignmentGate_RequiresAlignedEvidence(t *testing.T) {
+	cfg := config.EntryGatesConfig{TrendAlignmentEnabled: true}
+	declining := trendCandles(descendingCloses(30, 130)...)
+	rising := trendCandles(append(descendingCloses(22, 130),
+		110, 112, 114, 116, 118, 120, 122, 124)...)
+
+	tests := []struct {
+		name       string
+		action     string
+		price      float64
+		timeframe  data.Timeframe
+		candles    []data.Candle
+		cfg        config.EntryGatesConfig
+		evaluated  bool
+		wantReason bool
+	}{
+		{name: "price above EMAs passes", action: "BUY", price: 200, timeframe: data.Timeframe1Day, candles: declining, cfg: cfg, evaluated: true},
+		{name: "rising EMAs pass", action: "BUY", price: 90, timeframe: data.Timeframe1Day, candles: rising, cfg: cfg, evaluated: true},
+		{name: "sell out of scope", action: "SELL", price: 90, timeframe: data.Timeframe1Day, candles: declining, cfg: cfg},
+		{name: "disabled", action: "BUY", price: 90, timeframe: data.Timeframe1Day, candles: declining, cfg: config.EntryGatesConfig{}},
+		{name: "non-daily fails open", action: "BUY", price: 90, timeframe: data.Timeframe1Hour, candles: declining, cfg: cfg},
+		{name: "thin history fails open", action: "BUY", price: 90, timeframe: data.Timeframe1Day, candles: declining[:21], cfg: cfg},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, evaluated := evaluateTrendAlignmentGate(
+				tt.action, tt.price, tt.timeframe, tt.candles, time.Now(), tt.cfg,
+			)
+			if evaluated != tt.evaluated || (reason != "") != tt.wantReason {
+				t.Fatalf("evaluated=%v reason=%q, want evaluated=%v reason=%v",
+					evaluated, reason, tt.evaluated, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestEvaluateTrendAlignmentGate_ExcludesCurrentPartialDailyBar(t *testing.T) {
+	cfg := config.EntryGatesConfig{TrendAlignmentEnabled: true}
+	closes := descendingCloses(30, 130)
+	candles := trendCandles(append(closes, 500)...)
+	now := time.Date(2026, time.July, 24, 10, 0, 0, 0, nyLoc)
+	candles[len(candles)-1].Timestamp =
+		time.Date(2026, time.July, 24, 0, 0, 0, 0, nyLoc)
+
+	reason, evaluated := evaluateTrendAlignmentGate(
+		"BUY", 90, data.Timeframe1Day, candles, now, cfg,
+	)
+	if !evaluated || reason == "" {
+		t.Fatalf("partial rebound must not reverse completed trend: evaluated=%v reason=%q",
+			evaluated, reason)
+	}
+}
 
 func TestEvaluateRunupGates_NewsTapeConfirmation(t *testing.T) {
 	cfg := config.EntryGatesConfig{NewsMinRunupPct: 2.0}

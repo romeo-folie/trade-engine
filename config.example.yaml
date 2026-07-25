@@ -285,9 +285,10 @@ risk:
   uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
   exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
   bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.
-  # Entry-quality gates from the May–Jul 2026 execution study. All default off;
-  # BUY-only; fail open when the prior daily close is unavailable.
+  # Evidence-driven entry-quality gates. All default off, BUY-only, and fail
+  # open when their required daily market evidence is unavailable.
   entry_gates:
+    trend_alignment_enabled: false  # Block BUYs when price is below declining daily EMA9 + EMA21 (#472)
     news_min_runup_pct: 0      # news_sentiment BUY needs price >= this % above prior close (tape confirms headline); 0 disables. Recommended 2.0
     momentum_max_runup_pct: 0  # momentum BUY blocked when already > this % above prior close (anti-chase); 0 disables. Recommended 2.0
     first_tick_defer: false    # Hold first-session-tick BUYs pending; execute next tick only if price held (breaks the overnight-headline burst)

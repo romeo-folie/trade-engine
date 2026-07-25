@@ -1205,7 +1205,10 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	// dual-direction strategies and no-DB / probe-failed cycles all leave the
 	// prefetch unset, and generateSignal then re-fetches on-demand and applies
 	// its degraded-mode handling.
-	e.generateSignal(ctx, ticker, strategy, candles, resp, analysisID, prefetchedOpenTrades)
+	e.generateSignal(
+		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
+		prefetchedOpenTrades,
+	)
 
 	// Update material-change gate state for next tick.
 	latestClose := 0.0
@@ -1634,7 +1637,7 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 // runAnalysis loads openTrades up front for the SELL-only short-circuit probe
 // (#319) and threads the same slice through here so a typical analysis cycle
 // only hits the trades store once. Pass nil to force a fresh query.
-func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade) {
+func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
 		// no signal fires. No cooldown is applied so the ticker is re-evaluated
@@ -1676,29 +1679,47 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, strategy string, ca
 		AnalysisIDs:       analysisIDs,
 	}
 
-	// Entry-quality run-up gates (entry_gates.go): news tape-confirmation and
-	// momentum anti-chase. Checked before the generic risk gates so the block
-	// reason names the specific losing cohort. Fail OPEN on a missing prior
-	// close — these are alpha filters, not safety guards.
+	// Entry-quality gates (entry_gates.go): daily trend alignment, news
+	// tape-confirmation, and momentum anti-chase. Checked before the generic
+	// risk gates so the block reason names the specific losing cohort. Fail
+	// OPEN on missing evidence — these are alpha filters, not safety guards.
 	eg := e.cfg.Risk.EntryGates
-	if resp.Action == "BUY" && (eg.NewsMinRunupPct > 0 || eg.MomentumMaxRunupPct > 0) {
-		nowET := time.Now().In(nyLoc)
-		dayStartET := time.Date(nowET.Year(), nowET.Month(), nowET.Day(), 0, 0, 0, 0, nyLoc)
-		prevClose, pcErr := store.GetPrevDailyClose(ctx, ticker, dayStartET)
-		if pcErr != nil || prevClose <= 0 {
-			logger.Warn("entry gates: prior daily close unavailable — run-up gates fail open",
-				"ticker", ticker, "err", pcErr)
+	if resp.Action == "BUY" {
+		var entryGateReason string
+		if eg.TrendAlignmentEnabled {
+			var evaluated bool
+			entryGateReason, evaluated = evaluateTrendAlignmentGate(
+				string(resp.Action), signalPrice, data.Timeframe(timeframe),
+				candles, time.Now(), eg,
+			)
+			if !evaluated {
+				logger.Warn("entry gates: daily trend evidence unavailable — trend gate fails open",
+					"ticker", ticker, "timeframe", timeframe, "candles", len(candles))
+			}
 		}
-		if reason := evaluateRunupGates(strategy, string(resp.Action), signalPrice, prevClose, eg); reason != "" {
+		if entryGateReason == "" &&
+			(eg.NewsMinRunupPct > 0 || eg.MomentumMaxRunupPct > 0) {
+			nowET := time.Now().In(nyLoc)
+			dayStartET := time.Date(nowET.Year(), nowET.Month(), nowET.Day(), 0, 0, 0, 0, nyLoc)
+			prevClose, pcErr := store.GetPrevDailyClose(ctx, ticker, dayStartET)
+			if pcErr != nil || prevClose <= 0 {
+				logger.Warn("entry gates: prior daily close unavailable — run-up gates fail open",
+					"ticker", ticker, "err", pcErr)
+			}
+			entryGateReason = evaluateRunupGates(
+				strategy, string(resp.Action), signalPrice, prevClose, eg,
+			)
+		}
+		if entryGateReason != "" {
 			sig.Status = "blocked"
-			sig.BlockReason = reason
+			sig.BlockReason = entryGateReason
 			if _, err := store.InsertSignal(ctx, sig); err != nil {
 				logger.Warn("store blocked signal", "ticker", ticker, "err", err)
 			}
-			logger.Warn("signal blocked", "ticker", ticker, "reason", reason)
+			logger.Warn("signal blocked", "ticker", ticker, "reason", entryGateReason)
 			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 				Ticker: ticker, Action: string(resp.Action), Confidence: resp.Confidence,
-				BlockReason: reason, FailedCheck: "entry_gates",
+				BlockReason: entryGateReason, FailedCheck: "entry_gates",
 			})
 			return
 		}
