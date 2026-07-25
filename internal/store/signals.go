@@ -42,20 +42,24 @@ func InsertSignal(ctx context.Context, s Signal) (string, error) {
 	if ids == nil {
 		ids = []string{}
 	}
+	createdAt := s.CreatedAt
+	if createdAt.IsZero() {
+		createdAt = time.Now()
+	}
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO signals (
 			ticker, action, strategy, signal_price, stop_loss, take_profit,
 			confidence, size_pct, status, block_reason,
 			analysis_ids, expires_at, stale_threshold_pct, deferred,
-			pullback_strength
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			pullback_strength, created_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		RETURNING id`,
 		s.Ticker, s.Action, s.Strategy, s.SignalPrice,
 		nullableFloat(s.StopLoss), nullableFloat(s.TakeProfit),
 		s.Confidence, s.SizePct, s.Status, nullableString(s.BlockReason),
 		ids, s.ExpiresAt, s.StalePriceMovePct, s.Deferred,
-		s.PullbackStrength,
+		s.PullbackStrength, createdAt,
 	).Scan(&id)
 	return id, err
 }

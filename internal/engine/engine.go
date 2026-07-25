@@ -49,6 +49,11 @@ const (
 	// signalExpiryCheckInterval is how often the background goroutine checks for stale/expired signals.
 	signalExpiryCheckInterval = time.Minute
 
+	// Stored candle fallbacks may be minutes or hours old; pullback execution
+	// requires a current two-sided quote for stop-width and R:R validation.
+	pullbackQuoteMaxAge          = 15 * time.Second
+	pullbackQuoteFutureTolerance = 10 * time.Second
+
 	// retentionInterval is how often the retention cleanup runs (once per day).
 	retentionInterval = 24 * time.Hour
 )
@@ -2078,7 +2083,21 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// breached/inverted stop attached to a new position.
 	if sig.PullbackStrength {
 		now := time.Now()
-		mark := e.freshStockMark(ctx, sig.Ticker, now)
+		evidence, err := e.pullbackExecutionEvidence(
+			ctx, sig.Ticker, sig.CreatedAt, now,
+		)
+		if err != nil {
+			reason := "pullback strength: unable to verify fresh execution price and post-signal path"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked",
+				"ticker", sig.Ticker, "reason", reason, "err", err)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "pullback_execution_evidence",
+			})
+			return
+		}
+		mark := evidence.Mark
 		if reason := pullback.ValidateExecutionMark(
 			mark, sig.StopLoss,
 			e.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
@@ -2093,18 +2112,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			})
 			return
 		}
-		minTraded, err := e.minimumStockPriceSince(ctx, sig.Ticker, sig.CreatedAt, now)
-		if err != nil {
-			reason := "pullback strength: unable to verify price path since signal creation"
-			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
-			logger.Warn("pullback execution blocked",
-				"ticker", sig.Ticker, "reason", reason, "err", err)
-			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
-				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
-				BlockReason: reason, FailedCheck: "pullback_execution_path",
-			})
-			return
-		}
+		minTraded := evidence.MinimumTraded
 		if minTraded <= sig.StopLoss {
 			reason := fmt.Sprintf(
 				"pullback strength: setup invalidated before execution (minimum traded %.2f at/below low-of-day stop %.2f)",
@@ -3195,42 +3203,74 @@ func (e *Engine) freshStockMark(ctx context.Context, ticker string, now time.Tim
 	return latest.Close
 }
 
-// minimumStockPriceSince returns the lowest one-minute trade range observed
-// since a signal was created. Pullback invalidation is path-dependent: a later
-// rebound above the stop must not resurrect a setup that already breached it.
-func (e *Engine) minimumStockPriceSince(
-	ctx context.Context, ticker string, since, now time.Time,
-) (float64, error) {
-	if e.marketData == nil {
-		return 0, fmt.Errorf("market data unavailable")
-	}
-	if since.IsZero() || now.Before(since) {
-		return 0, fmt.Errorf("invalid signal creation time")
-	}
-	candles, err := e.marketData.FetchCandles(
-		ctx, ticker, data.Timeframe1Min, since.Truncate(time.Minute), now,
-	)
-	if err != nil {
-		return 0, fmt.Errorf("fetch one-minute execution path: %w", err)
-	}
-	minimum, ok := minimumCandleLow(candles)
-	if !ok {
-		return 0, fmt.Errorf("no one-minute execution path available")
-	}
-	return minimum, nil
+type pullbackExecutionEvidence struct {
+	Mark          float64
+	MinimumTraded float64
 }
 
-func minimumCandleLow(candles []data.Candle) (float64, bool) {
-	minimum := math.Inf(1)
-	for _, candle := range candles {
-		if candle.Low > 0 && candle.Low < minimum {
-			minimum = candle.Low
+// pullbackExecutionEvidence requires a current two-sided quote and exact trade
+// prints from the signal timestamp. Minute OHLC cannot distinguish a qualifying
+// pre-signal flush from a genuine post-signal stop breach inside the same
+// bucket, so providers without the high-resolution trade-path capability fail
+// closed for pullback execution.
+func (e *Engine) pullbackExecutionEvidence(
+	ctx context.Context, ticker string, since, now time.Time,
+) (pullbackExecutionEvidence, error) {
+	if e.marketData == nil {
+		return pullbackExecutionEvidence{}, fmt.Errorf("market data unavailable")
+	}
+	if since.IsZero() || now.Before(since) {
+		return pullbackExecutionEvidence{}, fmt.Errorf("invalid signal creation time")
+	}
+
+	quote, err := e.marketData.FetchQuote(ctx, ticker)
+	if err != nil {
+		return pullbackExecutionEvidence{}, fmt.Errorf("fetch execution quote: %w", err)
+	}
+	if quote == nil || quote.Bid <= 0 || quote.Ask <= 0 || quote.Last <= 0 {
+		return pullbackExecutionEvidence{}, fmt.Errorf("current two-sided execution quote unavailable")
+	}
+	quoteAge := now.Sub(quote.Timestamp)
+	if quote.Timestamp.IsZero() || quoteAge > pullbackQuoteMaxAge ||
+		quoteAge < -pullbackQuoteFutureTolerance {
+		return pullbackExecutionEvidence{}, fmt.Errorf(
+			"execution quote timestamp is not fresh (age %s)", quoteAge,
+		)
+	}
+	if quote.Timestamp.Before(since) {
+		return pullbackExecutionEvidence{}, fmt.Errorf(
+			"latest execution quote predates signal creation",
+		)
+	}
+
+	evidence := pullbackExecutionEvidence{
+		// A BUY market order crosses toward the ask. Validate and paper-fill at
+		// that conservative executable side rather than the quote midpoint.
+		Mark:          quote.Ask,
+		MinimumTraded: quote.Ask,
+	}
+	tradeProvider, ok := e.marketData.(data.TradePathProvider)
+	if !ok {
+		return pullbackExecutionEvidence{}, fmt.Errorf(
+			"market data provider cannot verify exact post-signal trades",
+		)
+	}
+	// Use the quote timestamp as the coherent validation boundary: every trade
+	// print through the mark being risk-checked is included, even when the
+	// provider timestamp is a few milliseconds ahead of the host clock.
+	trades, err := tradeProvider.FetchTrades(ctx, ticker, since, quote.Timestamp)
+	if err != nil {
+		return pullbackExecutionEvidence{}, fmt.Errorf("fetch exact execution path: %w", err)
+	}
+	for _, trade := range trades {
+		if trade.Timestamp.Before(since) || trade.Timestamp.After(quote.Timestamp) || trade.Price <= 0 {
+			continue
+		}
+		if trade.Price < evidence.MinimumTraded {
+			evidence.MinimumTraded = trade.Price
 		}
 	}
-	if math.IsInf(minimum, 1) {
-		return 0, false
-	}
-	return minimum, true
+	return evidence, nil
 }
 
 // buildRiskInput assembles risk.CheckInput for a signal against a portfolio

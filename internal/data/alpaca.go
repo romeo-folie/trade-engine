@@ -150,6 +150,18 @@ type alpacaQuoteResponse struct {
 	Symbol string      `json:"symbol"`
 }
 
+type alpacaTrade struct {
+	Timestamp string  `json:"t"`
+	Price     float64 `json:"p"`
+	Size      int64   `json:"s"`
+}
+
+type alpacaTradesResponse struct {
+	Trades        []alpacaTrade `json:"trades"`
+	Symbol        string        `json:"symbol"`
+	NextPageToken string        `json:"next_page_token"`
+}
+
 // ── MarketDataProvider implementation ────────────────────────────────────────
 
 // FetchCandles retrieves OHLCV bars for the given ticker, timeframe, and date range.
@@ -283,4 +295,51 @@ func (c *AlpacaClient) FetchQuote(ctx context.Context, ticker string) (*Quote, e
 		Last:      mid,
 		Timestamp: ts,
 	}, nil
+}
+
+// FetchTrades returns exact IEX trade prints in [from, to]. Unlike one-minute
+// OHLC, these timestamps can distinguish a qualifying pre-signal flush from a
+// genuine post-signal stop breach in the same minute.
+func (c *AlpacaClient) FetchTrades(
+	ctx context.Context, ticker string, from, to time.Time,
+) ([]MarketTrade, error) {
+	var all []MarketTrade
+	var nextPageToken string
+	for {
+		params := url.Values{}
+		params.Set("start", from.UTC().Format(time.RFC3339Nano))
+		params.Set("end", to.UTC().Format(time.RFC3339Nano))
+		params.Set("limit", "10000")
+		params.Set("feed", "iex")
+		params.Set("sort", "asc")
+		if nextPageToken != "" {
+			params.Set("page_token", nextPageToken)
+		}
+
+		resp, err := c.get(ctx, fmt.Sprintf("/v2/stocks/%s/trades", ticker), params)
+		if err != nil {
+			return nil, fmt.Errorf("fetch trades %s: %w", ticker, err)
+		}
+		var payload alpacaTradesResponse
+		if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decode trades response: %w", err)
+		}
+		resp.Body.Close()
+
+		for _, trade := range payload.Trades {
+			ts, err := time.Parse(time.RFC3339Nano, trade.Timestamp)
+			if err != nil || ts.Before(from) || ts.After(to) || trade.Price <= 0 {
+				continue
+			}
+			all = append(all, MarketTrade{
+				Ticker: ticker, Price: trade.Price, Size: trade.Size, Timestamp: ts,
+			})
+		}
+		if payload.NextPageToken == "" {
+			break
+		}
+		nextPageToken = payload.NextPageToken
+	}
+	return all, nil
 }

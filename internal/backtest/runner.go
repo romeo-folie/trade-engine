@@ -18,6 +18,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/risk"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
@@ -297,7 +298,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 			if order.requireValidStop {
 				if block := pullbackFillBlock(
 					candle.Open, order.stopLoss, order.takeProfit,
-					order.maxStopWidthPct, order.minRiskReward,
+					order.maxStopWidthPct, order.confidence, order.riskCfg,
 				); block != "" {
 					entryBlocks[block]++
 					validFill = false
@@ -393,7 +394,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 				takeProfit:       resp.TakeProfit,
 				requireValidStop: opts.PullbackStrength,
 				maxStopWidthPct:  r.cfg.Risk.EntryGates.PullbackMaxStopWidthPct,
-				minRiskReward:    r.cfg.Risk.MinRiskReward,
+				confidence:       resp.Confidence,
+				riskCfg:          r.cfg.Risk,
 			}
 
 		case analysis.ActionSell:
@@ -521,19 +523,28 @@ type pendingOrder struct {
 	takeProfit       float64
 	requireValidStop bool
 	maxStopWidthPct  float64
-	minRiskReward    float64
+	confidence       float64
+	riskCfg          config.RiskConfig
 }
 
-func pullbackFillBlock(mark, stopLoss, takeProfit, maxStopWidthPct, minRiskReward float64) string {
+func pullbackFillBlock(
+	mark, stopLoss, takeProfit, maxStopWidthPct, confidence float64,
+	riskCfg config.RiskConfig,
+) string {
 	if pullback.ValidateExecutionMark(mark, stopLoss, maxStopWidthPct) == "" {
-		if takeProfit <= 0 {
+		results, passed := risk.CheckEntryQuality(risk.CheckInput{
+			Cfg:         riskCfg,
+			Action:      "BUY",
+			Confidence:  confidence,
+			StopLoss:    stopLoss,
+			TakeProfit:  takeProfit,
+			SignalPrice: mark,
+		})
+		if passed {
 			return ""
 		}
-		riskPerShare := mark - stopLoss
-		rewardPerShare := takeProfit - mark
-		if rewardPerShare > 0 &&
-			(minRiskReward <= 0 || rewardPerShare/riskPerShare >= minRiskReward) {
-			return ""
+		if len(results) > 0 && results[len(results)-1].Name == "confidence_threshold" {
+			return "fill_confidence_tier"
 		}
 		return "fill_risk_reward"
 	}

@@ -83,3 +83,17 @@ func TestQualifyPullbackUniverseKeepsTopQuartile(t *testing.T) {
 		t.Fatalf("configured 400%% floor ignored: %+v", got)
 	}
 }
+
+func TestFilterActiveCandidatesDoesNotPromoteLowerQuartiles(t *testing.T) {
+	// Universe qualification has already selected AAA as the sole top-quartile
+	// name. Removing active AAA must leave the scan empty; BBB must not be
+	// promoted from the unselected lower quartiles on the next scan.
+	selectedTopQuartile := []SwingCandidate{{Ticker: "AAA"}}
+	got := filterActiveCandidates(
+		selectedTopQuartile,
+		map[string]struct{}{"AAA": {}},
+	)
+	if len(got) != 0 {
+		t.Fatalf("active top quartile should leave no candidates: %+v", got)
+	}
+}

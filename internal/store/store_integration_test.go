@@ -219,11 +219,12 @@ func TestAnalysis_GetModelPerformance(t *testing.T) {
 
 func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
 	ctx := context.Background()
+	createdAt := time.Now().Add(-5 * time.Minute).Truncate(time.Microsecond)
 	id, err := store.InsertSignal(ctx, store.Signal{
 		Ticker: "TEST_PB", Action: "BUY", Strategy: "momentum",
 		SignalPrice: 100, StopLoss: 98, Confidence: 0.8, SizePct: 1,
 		Status: "pending", ExpiresAt: time.Now().Add(time.Hour),
-		StalePriceMovePct: 2, PullbackStrength: true,
+		StalePriceMovePct: 2, PullbackStrength: true, CreatedAt: createdAt,
 	})
 	if err != nil {
 		t.Fatalf("InsertSignal: %v", err)
@@ -234,6 +235,9 @@ func TestSignal_PullbackStrengthRoundTrip(t *testing.T) {
 	}
 	if !got.PullbackStrength {
 		t.Fatal("pullback-strength execution marker was not persisted")
+	}
+	if !got.CreatedAt.Equal(createdAt) {
+		t.Fatalf("pullback path boundary = %s, want %s", got.CreatedAt, createdAt)
 	}
 }
 

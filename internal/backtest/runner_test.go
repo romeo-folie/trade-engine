@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 )
 
@@ -169,19 +170,32 @@ func TestPullbackFillBlock(t *testing.T) {
 		stop       float64
 		target     float64
 		maxWidth   float64
-		minRR      float64
+		confidence float64
+		riskCfg    config.RiskConfig
 		wantReason string
 	}{
-		{name: "valid", mark: 100, stop: 98, target: 104, maxWidth: 4, minRR: 1.5},
-		{name: "gap through stop", mark: 97, stop: 98, target: 104, maxWidth: 4, minRR: 1.5, wantReason: "gap_invalidation"},
-		{name: "upward gap widens stop", mark: 110, stop: 100, target: 125, maxWidth: 4, minRR: 1.5, wantReason: "fill_stop_width"},
-		{name: "gap ruins reward", mark: 103, stop: 100, target: 105, maxWidth: 4, minRR: 1.5, wantReason: "fill_risk_reward"},
-		{name: "gap above target", mark: 106, stop: 103, target: 105, maxWidth: 4, minRR: 1.5, wantReason: "fill_risk_reward"},
+		{name: "valid", mark: 100, stop: 98, target: 104, maxWidth: 4, confidence: 0.8, riskCfg: config.RiskConfig{MinRiskReward: 1.5}},
+		{name: "gap through stop", mark: 97, stop: 98, target: 104, maxWidth: 4, confidence: 0.8, riskCfg: config.RiskConfig{MinRiskReward: 1.5}, wantReason: "gap_invalidation"},
+		{name: "upward gap widens stop", mark: 110, stop: 100, target: 125, maxWidth: 4, confidence: 0.8, riskCfg: config.RiskConfig{MinRiskReward: 1.5}, wantReason: "fill_stop_width"},
+		{name: "gap ruins reward", mark: 103, stop: 100, target: 105, maxWidth: 4, confidence: 0.8, riskCfg: config.RiskConfig{MinRiskReward: 1.5}, wantReason: "fill_risk_reward"},
+		{name: "gap above target", mark: 106, stop: 103, target: 105, maxWidth: 4, confidence: 0.8, riskCfg: config.RiskConfig{MinRiskReward: 1.5}, wantReason: "fill_risk_reward"},
+		{
+			name: "gap moves into stricter confidence tier", mark: 100, stop: 96, target: 106,
+			maxWidth: 4, confidence: 0.56,
+			riskCfg: config.RiskConfig{
+				MinRiskReward: 1.2,
+				ConfidenceTiers: []config.ConfidenceTier{
+					{RRMin: 2, ConfMin: 0.55},
+					{RRMin: 1.4, ConfMin: 0.58},
+				},
+			},
+			wantReason: "fill_confidence_tier",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := pullbackFillBlock(
-				tt.mark, tt.stop, tt.target, tt.maxWidth, tt.minRR,
+				tt.mark, tt.stop, tt.target, tt.maxWidth, tt.confidence, tt.riskCfg,
 			); got != tt.wantReason {
 				t.Fatalf("pullbackFillBlock() = %q, want %q", got, tt.wantReason)
 			}

@@ -42,6 +42,21 @@ type Quote struct {
 	Timestamp time.Time
 }
 
+// MarketTrade is an individual exchange trade print. Exact trade timestamps
+// are used when an OHLC bucket would straddle a signal boundary.
+type MarketTrade struct {
+	Ticker    string
+	Price     float64
+	Size      int64
+	Timestamp time.Time
+}
+
+// TradePathProvider is an optional high-resolution capability for providers
+// that can return exact trade prints over a bounded interval.
+type TradePathProvider interface {
+	FetchTrades(ctx context.Context, ticker string, from, to time.Time) ([]MarketTrade, error)
+}
+
 // MarketDataProvider is the interface all stock/market data adapters must satisfy.
 // It allows swapping between Alpaca, mock data, and any future provider without
 // changing the engine code.
@@ -55,4 +70,3 @@ type MarketDataProvider interface {
 	// FetchHistory retrieves the most recent N candles for a ticker.
 	FetchHistory(ctx context.Context, ticker string, tf Timeframe, limit int) ([]Candle, error)
 }
-

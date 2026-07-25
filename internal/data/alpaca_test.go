@@ -208,6 +208,50 @@ func TestAlpacaFetchQuote_Success(t *testing.T) {
 	}
 }
 
+func TestAlpacaFetchTradesUsesExactBoundsAndPaginates(t *testing.T) {
+	from := time.Date(2026, 7, 25, 14, 0, 30, 123000000, time.UTC)
+	to := from.Add(2 * time.Minute)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/v2/stocks/AAPL/trades" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.URL.Query().Get("start") != from.Format(time.RFC3339Nano) ||
+			r.URL.Query().Get("end") != to.Format(time.RFC3339Nano) {
+			t.Errorf("bounds = %q..%q", r.URL.Query().Get("start"), r.URL.Query().Get("end"))
+		}
+		if r.URL.Query().Get("feed") != "iex" ||
+			r.URL.Query().Get("limit") != "10000" ||
+			r.URL.Query().Get("sort") != "asc" {
+			t.Errorf("query = %v", r.URL.Query())
+		}
+		payload := alpacaTradesResponse{
+			Symbol: "AAPL",
+			Trades: []alpacaTrade{{
+				Timestamp: from.Add(time.Second).Format(time.RFC3339Nano),
+				Price:     99, Size: 10,
+			}},
+		}
+		if requests == 1 {
+			payload.NextPageToken = "next"
+		} else if r.URL.Query().Get("page_token") != "next" {
+			t.Errorf("page token = %q", r.URL.Query().Get("page_token"))
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	defer srv.Close()
+
+	client := newTestAlpacaClient(srv.URL)
+	trades, err := client.FetchTrades(context.Background(), "AAPL", from, to)
+	if err != nil {
+		t.Fatalf("FetchTrades: %v", err)
+	}
+	if requests != 2 || len(trades) != 2 || trades[0].Price != 99 {
+		t.Fatalf("requests=%d trades=%+v", requests, trades)
+	}
+}
+
 func TestAlpacaGet_RetriesOn5xx(t *testing.T) {
 	var calls int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

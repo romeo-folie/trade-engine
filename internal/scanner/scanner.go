@@ -162,21 +162,25 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return nil
 	}
 
-	// 3. Dedup against existing active watchlist to avoid re-scoring known tickers.
-	candidates, err = s.filterExistingWatchlist(ctx, candidates)
-	if err != nil {
-		return fmt.Errorf("filter watchlist: %w", err)
-	}
-	if len(candidates) == 0 {
-		return nil
-	}
-
+	// 3. Rank the complete pullback universe before removing active names.
+	// Otherwise every later scan promotes the next-best quartile after the
+	// current winners have been filtered out, eventually admitting names that
+	// were never in the full universe's top quartile.
 	if s.PullbackUniverseEnabled {
 		candidates = s.qualifyPullbackUniverse(ctx, candidates)
 		if len(candidates) == 0 {
 			slog.Info("scanner: no candidates passed pullback-strength universe")
 			return nil
 		}
+	}
+
+	// 3.5 Dedup against the active watchlist only after universe selection.
+	candidates, err = s.filterExistingWatchlist(ctx, candidates)
+	if err != nil {
+		return fmt.Errorf("filter watchlist: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil
 	}
 
 	// 4. Check how much headroom remains under the cap.
@@ -373,13 +377,19 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 		existing[item.Ticker] = struct{}{}
 	}
 
-	var filtered []SwingCandidate
-	for _, c := range candidates {
-		if _, found := existing[c.Ticker]; !found {
-			filtered = append(filtered, c)
+	return filterActiveCandidates(candidates, existing), nil
+}
+
+func filterActiveCandidates(
+	candidates []SwingCandidate, existing map[string]struct{},
+) []SwingCandidate {
+	filtered := make([]SwingCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, found := existing[candidate.Ticker]; !found {
+			filtered = append(filtered, candidate)
 		}
 	}
-	return filtered, nil
+	return filtered
 }
 
 // qualifyPullbackUniverse applies the study's objective liquidity/strength

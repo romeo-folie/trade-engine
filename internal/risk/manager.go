@@ -78,14 +78,14 @@ type CheckResult struct {
 // reorder has no impact on BUY-side latency or behaviour.
 func CheckAll(in CheckInput) ([]CheckResult, bool) {
 	checks := []func(CheckInput) CheckResult{
-		checkPositionOwnership,    // #337 — runs first; SELL on no-long blocks cleanly
-		checkPyramidPolicy,        // #324 — pyramid eligibility on existing long
-		checkConfidenceTiered,     // #339 — replaces checkConfidence
+		checkPositionOwnership, // #337 — runs first; SELL on no-long blocks cleanly
+		checkPyramidPolicy,     // #324 — pyramid eligibility on existing long
+		checkConfidenceTiered,  // #339 — replaces checkConfidence
 		checkRiskReward,
 		checkPositionSize,
-		checkMaxDollarRisk,        // #335
+		checkMaxDollarRisk, // #335
 		checkMaxOpenPositions,
-		checkMaxPerTicker,         // #312 (Epic A)
+		checkMaxPerTicker, // #312 (Epic A)
 		checkDailyLossLimit,
 		checkMaxDrawdown,
 		checkCooldownAfterLoss,
@@ -96,6 +96,27 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 		r := fn(in)
 		results = append(results, r)
 		if !r.Passed {
+			return results, false
+		}
+	}
+	return results, true
+}
+
+// CheckEntryQuality runs the price-sensitive signal-quality checks shared by
+// live execution and historical replay. It deliberately excludes portfolio
+// capacity, cooldown, and drawdown checks that a single-ticker replay does not
+// model, while preserving the exact confidence-tier and R:R semantics used by
+// CheckAll after an execution price changes.
+func CheckEntryQuality(in CheckInput) ([]CheckResult, bool) {
+	checks := []func(CheckInput) CheckResult{
+		checkConfidenceTiered,
+		checkRiskReward,
+	}
+	results := make([]CheckResult, 0, len(checks))
+	for _, fn := range checks {
+		result := fn(in)
+		results = append(results, result)
+		if !result.Passed {
 			return results, false
 		}
 	}
