@@ -125,6 +125,8 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		return stats
 	}
 
+	remainingTerminalFill := make(map[string]float64)
+	terminalFillSeen := make(map[string]bool)
 	for _, p := range pending {
 		stats.Scanned++
 		res, err := executor.GetOrderStatus(ctx, p.BrokerOrderID)
@@ -195,9 +197,16 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			}
 		case "cancelled", "rejected":
 			terminalStatus := execution.NormalizeOrderStatus(res.Status)
-			if res.FilledQty > 0 {
+			if !terminalFillSeen[p.BrokerOrderID] {
+				remainingTerminalFill[p.BrokerOrderID] = res.FilledQty
+				terminalFillSeen[p.BrokerOrderID] = true
+			}
+			lotFill := math.Min(p.Quantity, remainingTerminalFill[p.BrokerOrderID])
+			remainingTerminalFill[p.BrokerOrderID] =
+				math.Max(0, remainingTerminalFill[p.BrokerOrderID]-lotFill)
+			if lotFill > 0 {
 				if err := db.UpdateOrderFill(
-					ctx, p.OrderID, res.FilledPrice, res.FilledQty, terminalStatus,
+					ctx, p.OrderID, res.FilledPrice, lotFill, terminalStatus,
 				); err != nil {
 					stats.Errors++
 					logger.Warn("exit reconcile: persist terminal partial fill",
@@ -211,8 +220,8 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			}
 			stats.Terminal++
 			if p.TradeStatus == "exiting" {
-				if res.FilledQty > 0 {
-					remaining := math.Max(0, p.Quantity-res.FilledQty)
+				if lotFill > 0 {
+					remaining := math.Max(0, p.Quantity-lotFill)
 					if remaining <= 1e-9 && res.FilledPrice > 0 {
 						pnl, pnlPct := tradePnL(
 							p.Direction, p.EntryPrice, p.Quantity, res.FilledPrice,

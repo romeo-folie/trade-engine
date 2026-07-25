@@ -68,6 +68,8 @@ const (
 	candleHistory = 50
 )
 
+var errStopFilledDuringRollback = errors.New("stop filled before rollback completed")
+
 var newYorkLocation = func() *time.Location {
 	loc, err := time.LoadLocation("America/New_York")
 	if err != nil {
@@ -117,6 +119,8 @@ type TradeStore interface {
 	ClaimTradeExit(ctx context.Context, id string) (bool, error)
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
+	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
+	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
 	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
 	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
 	// + closed_at. Called after a successful trail-driven market exit so the
@@ -597,7 +601,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 				if persistErr := m.store.UpdateOrderStopPriceAndID(
 					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
 				); persistErr != nil {
-					if rollbackErr := m.rollbackUnrecordedStop(ctx, res.BrokerOrderID); rollbackErr != nil {
+					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
 						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
 					}
 					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
@@ -645,7 +649,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		if err := m.store.UpdateOrderStopPriceAndID(
 			ctx, existing.ID, res.BrokerOrderID, newStop, t.Quantity,
 		); err != nil {
-			if rollbackErr := m.rollbackUnrecordedStop(ctx, res.BrokerOrderID); rollbackErr != nil {
+			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
 				return fmt.Errorf("persist replacement stop: %w; rollback: %v", err, rollbackErr)
 			}
 			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
@@ -664,7 +668,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		IsStopLoss:    true,
 	})
 	if err != nil {
-		if rollbackErr := m.rollbackUnrecordedStop(ctx, res.BrokerOrderID); rollbackErr != nil {
+		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
 			return fmt.Errorf("persist new stop: %w; rollback: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("persist new stop: %w (broker stop cancelled)", err)
@@ -672,7 +676,12 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	return nil
 }
 
-func (m *Manager) rollbackUnrecordedStop(ctx context.Context, brokerOrderID string) error {
+func (m *Manager) rollbackUnrecordedStop(
+	ctx context.Context,
+	t store.Trade,
+	stopPrice float64,
+	brokerOrderID string,
+) error {
 	cancelErr := m.exec.CancelOrder(ctx, brokerOrderID)
 	status, statusErr := m.exec.GetOrderStatus(ctx, brokerOrderID)
 	if statusErr != nil {
@@ -685,7 +694,17 @@ func (m *Manager) rollbackUnrecordedStop(ctx context.Context, brokerOrderID stri
 	case "cancelled", "rejected":
 		return nil
 	case "filled":
-		return errors.New("stop filled before rollback completed")
+		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		if _, err := m.store.InsertOrder(ctx, store.Order{
+			TradeID: t.ID, BrokerOrderID: brokerOrderID,
+			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
+			StopPrice: stopPrice, FilledPrice: status.FilledPrice,
+			FilledQty: status.FilledQty, Status: "filled", IsStopLoss: true,
+		}); err != nil {
+			return fmt.Errorf("%w; persist filled rollback stop: %v", errStopFilledDuringRollback, err)
+		}
+		return errStopFilledDuringRollback
 	default:
 		return fmt.Errorf("cancel=%v order remains %s", cancelErr, status.Status)
 	}
@@ -718,10 +737,11 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 		}
 	}()
 
-	exitRes, err := m.exitAtMarket(ctx, t)
+	exitRes, exitQty, err := m.exitAtMarket(ctx, t)
 	if err != nil {
 		return err
 	}
+	t.Quantity = exitQty
 	// Once the broker accepts the sell, keep the durable exit claim even if
 	// persistence fails. Releasing it would let another worker submit a second
 	// full sell on its next stale/open read.
@@ -741,7 +761,12 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 		return fmt.Errorf("record accepted market exit: %w", err)
 	}
 
-	fullFill := execution.NormalizeOrderStatus(exitRes.Status) == "filled" &&
+	status := execution.NormalizeOrderStatus(exitRes.Status)
+	if (status == "cancelled" || status == "rejected") && exitRes.FilledQty == 0 {
+		releaseClaim = true
+		return nil
+	}
+	fullFill := status == "filled" &&
 		exitRes.FilledPrice > 0 && exitRes.FilledQty >= t.Quantity-1e-9
 	if !fullFill {
 		// The engine exit reconciler owns this durable `exiting` trade until
@@ -815,34 +840,36 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 // Returns the broker's OrderResult so the caller can use the actual
 // FilledPrice/FilledQty for trade close + pnl. Mirrors the field set
 // engine.monitorPositions persists on its non-trailing exit path.
-func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, error) {
+func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.OrderResult, float64, error) {
 	// Cancel every working exit leg first — not just the latest stop. For
 	// bracket-managed trades the stop AND take-profit legs each hold the
 	// trade's shares at the broker; a market sell with either leg still
 	// working is rejected for insufficient free quantity. More importantly,
 	// submitting while a stop remains live can double-sell. Fail closed and
 	// retry on the next manager tick unless every leg is confirmed gone.
-	if err := m.cancelExitLegsForMarketExit(ctx, t); err != nil {
-		return execution.OrderResult{}, err
+	exitQty, err := m.cancelExitLegsForMarketExit(ctx, t)
+	if err != nil {
+		return execution.OrderResult{}, 0, err
 	}
 	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:   t.Ticker,
 		Side:     execution.OrderSideSell,
 		Type:     execution.OrderTypeMarket,
-		Quantity: t.Quantity,
+		Quantity: exitQty,
 		TradeID:  t.ID,
 	})
 	if err != nil {
-		return execution.OrderResult{}, fmt.Errorf("place market sell: %w", err)
+		return execution.OrderResult{}, 0, fmt.Errorf("place market sell: %w", err)
 	}
-	return res, nil
+	return res, exitQty, nil
 }
 
-func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) error {
+func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) (float64, error) {
 	legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID)
 	if err != nil {
-		return fmt.Errorf("lookup exit legs before market exit: %w", err)
+		return 0, fmt.Errorf("lookup exit legs before market exit: %w", err)
 	}
+	remaining := t.Quantity
 	for _, leg := range legs {
 		if leg.BrokerOrderID == "" {
 			continue
@@ -853,21 +880,37 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 			if errors.Is(statusErr, execution.ErrOrderNotFound) {
 				continue
 			}
-			return fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
+			return 0, fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
 				leg.BrokerOrderID, cancelErr, statusErr)
 		}
 		switch execution.NormalizeOrderStatus(status.Status) {
 		case "cancelled", "rejected":
-			// Safe to release these shares to the market exit.
+			if status.FilledQty > 0 {
+				if err := m.store.UpdateOrderFill(
+					ctx, leg.ID, status.FilledPrice, status.FilledQty,
+					execution.NormalizeOrderStatus(status.Status),
+				); err != nil {
+					return 0, fmt.Errorf("persist partial exit-leg fill: %w", err)
+				}
+				remaining = math.Max(0, remaining-status.FilledQty)
+			}
 		case "filled":
-			return fmt.Errorf("exit leg %s filled while cancelling; refusing duplicate market exit",
+			return 0, fmt.Errorf("exit leg %s filled while cancelling; refusing duplicate market exit",
 				leg.BrokerOrderID)
 		default:
-			return fmt.Errorf("exit leg %s remains %s after cancel: %v",
+			return 0, fmt.Errorf("exit leg %s remains %s after cancel: %v",
 				leg.BrokerOrderID, status.Status, cancelErr)
 		}
 	}
-	return nil
+	if remaining <= 0 {
+		return 0, errors.New("exit legs sold the full position while cancelling")
+	}
+	if remaining < t.Quantity {
+		if err := m.store.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
+			return 0, fmt.Errorf("persist remaining quantity after partial leg fill: %w", err)
+		}
+	}
+	return remaining, nil
 }
 
 // brokerTickDecimals returns the price-tick precision for the ticker. US

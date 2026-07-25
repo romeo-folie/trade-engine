@@ -75,7 +75,21 @@ func (liveStore) InsertOrder(ctx context.Context, o store.Order) (string, error)
 	if !store.IsConnected() {
 		return "", errStoreNotConnected
 	}
-	return store.InsertOrder(ctx, o)
+	return store.InsertOrderWithRetry(ctx, o)
+}
+
+func (liveStore) UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
+}
+
+func (liveStore) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
 }
 
 func (liveStore) UpdateOrderStopPriceAndID(

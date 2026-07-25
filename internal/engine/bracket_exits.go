@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -340,4 +341,62 @@ func (e *Engine) cancelExitLegsForTrades(ctx context.Context, trades []store.Tra
 		}
 	}
 	return allClear
+}
+
+// cancelClaimedExitLegs confirms every cancellation and returns the actual
+// remaining aggregate quantity after any cancellation-race partial fills.
+func (e *Engine) cancelClaimedExitLegs(
+	ctx context.Context,
+	trades []store.Trade,
+	ticker string,
+) (float64, bool, bool) {
+	var totalRemaining float64
+	for _, t := range trades {
+		if t.Ticker != ticker {
+			continue
+		}
+		remaining := t.Quantity
+		legs, err := store.OpenExitLegsForTrade(ctx, t.ID)
+		if err != nil {
+			return 0, false, true
+		}
+		for _, leg := range legs {
+			cancelErr := e.executor.CancelOrder(ctx, leg.BrokerOrderID)
+			res, statusErr := e.executor.GetOrderStatus(ctx, leg.BrokerOrderID)
+			if statusErr != nil {
+				if errors.Is(statusErr, execution.ErrOrderNotFound) {
+					continue
+				}
+				logger.Warn("analyst exit: cannot confirm leg cancellation",
+					"broker_order_id", leg.BrokerOrderID,
+					"cancel_err", cancelErr, "status_err", statusErr)
+				return 0, false, true
+			}
+			switch execution.NormalizeOrderStatus(res.Status) {
+			case "cancelled", "rejected":
+				if res.FilledQty > 0 {
+					if err := store.UpdateOrderFill(
+						ctx, leg.ID, res.FilledPrice, res.FilledQty,
+						execution.NormalizeOrderStatus(res.Status),
+					); err != nil {
+						return 0, false, false
+					}
+					remaining = math.Max(0, remaining-res.FilledQty)
+				}
+			case "filled":
+				// The exit reconciler owns this claimed trade now. Releasing
+				// it would permit a duplicate analyst/software sell.
+				return 0, false, false
+			default:
+				return 0, false, true
+			}
+		}
+		if remaining < t.Quantity {
+			if err := store.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
+				return 0, false, false
+			}
+		}
+		totalRemaining += remaining
+	}
+	return totalRemaining, totalRemaining > 0, true
 }

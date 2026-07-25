@@ -191,6 +191,24 @@ func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error
 	return id, nil
 }
 
+func (f *fakeStore) UpdateOrderFill(_ context.Context, orderID string, filledPrice, filledQty float64, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	o.FilledPrice, o.FilledQty, o.Status = filledPrice, filledQty, status
+	f.orders[orderID] = o
+	return nil
+}
+
+func (f *fakeStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tr := f.trades[id]
+	tr.Quantity = quantity
+	f.trades[id] = tr
+	return nil
+}
+
 func (f *fakeStore) CloseTrade(_ context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

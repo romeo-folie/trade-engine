@@ -55,6 +55,41 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 	return id, err
 }
 
+// InsertOrderWithRetry closes the small but safety-critical window after a
+// broker accepts an exit and before its identity is durable. The same broker
+// ID makes retries idempotent at the lifecycle level; callers keep the trade
+// claimed if all attempts fail.
+func InsertOrderWithRetry(ctx context.Context, o Order) (string, error) {
+	var id string
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		id, err = InsertOrder(ctx, o)
+		if err == nil {
+			return id, nil
+		}
+		if o.BrokerOrderID != "" {
+			lookupErr := GetDB().QueryRow(ctx, `
+				SELECT id FROM orders
+				WHERE broker_order_id=$1
+				  AND COALESCE(trade_id::text,'')=$2
+				ORDER BY created_at DESC LIMIT 1`,
+				o.BrokerOrderID, o.TradeID,
+			).Scan(&id)
+			if lookupErr == nil {
+				return id, nil
+			}
+		}
+		if attempt < 2 {
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+	}
+	return "", err
+}
+
 // UpdateOrderFill sets filled_price, filled_qty, and status after a fill event.
 func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty float64, status string) error {
 	_, err := GetDB().Exec(ctx, `

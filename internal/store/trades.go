@@ -247,10 +247,11 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		       COALESCE(t.exit_price,0), t.status
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
-		WHERE o.status IN ('pending','partial','filled')
+		WHERE (
+		        (t.status='closed' AND o.status IN ('pending','partial'))
+		     OR (t.status='exiting' AND o.status IN ('pending','partial','filled','cancelled','rejected'))
+		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''
-		  AND t.status IN ('closed','exiting')
-		  AND NOT (t.status='closed' AND o.status='filled')
 		  AND ((t.direction = 'long'  AND o.side = 'sell')
 		    OR (t.direction = 'short' AND o.side = 'buy'))
 		ORDER BY o.created_at
@@ -293,6 +294,26 @@ func GetOpenTrades(ctx context.Context) ([]Trade, error) {
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades WHERE status='open'
+		ORDER BY opened_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTrades(rows)
+}
+
+// GetOwnedPositionTrades includes durable in-flight exits so startup broker
+// reconciliation never mistakes their still-held shares for adoptable orphans.
+func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
+		       entry_price, COALESCE(exit_price,0),
+		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
+		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0)
+		FROM trades WHERE status IN ('open','exiting')
 		ORDER BY opened_at DESC`)
 	if err != nil {
 		return nil, err

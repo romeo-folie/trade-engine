@@ -2656,42 +2656,12 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
-		// Prefer the broker's confirmed fill as the exit price. Alpaca market
-		// orders fill async, so PlaceOrder usually returns FilledPrice=0 —
-		// poll briefly for the real fill before recording anything (LAC was
-		// recorded at a stale trigger price 44% away from the actual fill).
-		// Only if the fill still hasn't confirmed do we fall back to
-		// currentPrice; the exit-fill reconciler sweep corrects the row once
-		// the broker reports the fill.
-		exitPrice := result.FilledPrice
-		if exitPrice == 0 && result.BrokerOrderID != "" {
+		if result.FilledPrice == 0 && result.BrokerOrderID != "" {
 			if filled, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
-				exitPrice = filled.FilledPrice
 				result = filled
 			}
 		}
-		exitFillConfirmed := exitPrice > 0
-		if exitPrice == 0 {
-			exitPrice = currentPrice
-			logger.Warn("exit fill unconfirmed at close time — recording trigger price, reconciler will correct",
-				"trade_id", t.ID, "ticker", t.Ticker, "broker_order_id", result.BrokerOrderID)
-		}
-		pnl := (exitPrice - t.EntryPrice) * t.Quantity
-		if t.Direction == "short" {
-			pnl = (t.EntryPrice - exitPrice) * t.Quantity
-		}
-		pnlPct := 0.0
-		if t.EntryPrice > 0 {
-			pnlPct = (pnl / (t.EntryPrice * t.Quantity)) * 100
-		}
 
-		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
-			logger.Warn("close trade", "trade_id", t.ID, "err", err)
-		}
-
-		// Record exit order. FilledPrice is only persisted once the broker
-		// confirmed the fill — an unconfirmed row keeps status='pending' and
-		// empty fill columns so the exit-fill reconciler picks it up.
 		exitOrder := store.Order{
 			TradeID:       t.ID,
 			BrokerOrderID: result.BrokerOrderID,
@@ -2704,13 +2674,35 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
 		}
-		if exitFillConfirmed {
-			exitOrder.FilledPrice = exitPrice
-		}
-		if _, err := store.InsertOrder(ctx, exitOrder); err != nil {
-			logger.Warn("insert exit order", "trade_id", t.ID, "err", err)
+		exitOrder.FilledPrice = result.FilledPrice
+		if _, err := store.InsertOrderWithRetry(ctx, exitOrder); err != nil {
+			// Keep the durable claim: releasing it after broker acceptance can
+			// submit a duplicate sell. Startup reconciliation still counts the
+			// exiting quantity and surfaces the missing order for repair.
+			logger.Error("insert accepted exit order — trade remains exiting",
+				"trade_id", t.ID, "broker_order_id", result.BrokerOrderID, "err", err)
+			continue
 		}
 
+		status := execution.NormalizeOrderStatus(result.Status)
+		if (status == "cancelled" || status == "rejected") && result.FilledQty == 0 {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+			continue
+		}
+		fullFill := status == "filled" && result.FilledPrice > 0 &&
+			result.FilledQty >= t.Quantity-1e-9
+		if !fullFill {
+			// Reconciler finalizes a full fill or reopens only the unsold
+			// remainder after a terminal partial/cancel.
+			continue
+		}
+
+		exitPrice := result.FilledPrice
+		pnl, pnlPct := tradePnL(t.Direction, t.EntryPrice, t.Quantity, exitPrice)
+		if err := store.CloseTrade(ctx, t.ID, exitPrice, pnl, pnlPct); err != nil {
+			logger.Warn("close confirmed trade", "trade_id", t.ID, "err", err)
+			continue
+		}
 		if pnl < 0 {
 			e.portfolio.RecordLoss()
 		}

@@ -156,6 +156,7 @@ func TestSellExit_LegCancelFailureBlocks(t *testing.T) {
 	_, _, slID := insertBracketFixture(t, ticker, 3)
 	exec := &fakeBracketExec{
 		cancelErr: map[string]error{slID: fmt.Errorf("simulated cancel failure")},
+		statuses:  map[string]execution.OrderResult{slID: {Status: "pending"}},
 		placeRes:  execution.OrderResult{Status: "filled", FilledPrice: 120},
 	}
 	e := newBracketTestEngine(exec)
