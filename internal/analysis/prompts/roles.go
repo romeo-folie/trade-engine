@@ -1,9 +1,9 @@
-// Package prompts — role-specialised system prompts for the specialist
-// arbiter mode (Issue #323, inspired by Grok 4.20's Alpha Arena 4-agent debate).
+// Package prompts contains role-specialised prompts for the sequential
+// specialist analysis path.
 //
 // Each role prompt emits the same JSON output schema as the standard buildSystem
 // prompt so downstream parsing and the AnalysisResponse shape are unchanged.
-// All four prompts include the verbatim R:R self-filter sentence first added
+// All prompts include the verbatim R:R self-filter sentence first added
 // in PR #334 — never drop it.
 package prompts
 
@@ -107,29 +107,30 @@ ROLE GUIDANCE:
 %s`, strategy, roleOutputSchema, rrSelfFilter)
 }
 
-// buildRiskManagerSystem returns the specialist prompt for the risk-manager analyst.
-// This is the novel role — it is the built-in safety circuit. The arbiter
-// uses its veto when the specialist debate is split. Risk-manager prefers WAIT
-// over BUY whenever sizing, exposure, or correlation concerns are present.
+// buildRiskManagerSystem returns the mandatory final specialist-review prompt.
+// Unlike the three directional roles, this model receives their completed
+// findings and owns the final specialist outcome before deterministic controls.
 func buildRiskManagerSystem(strategy string) string {
-	return fmt.Sprintf(`You are the risk manager contributing one vote in a 4-specialist debate running the "%s" strategy. Your vote is the final safety circuit — when other specialists disagree your verdict is decisive.
+	return fmt.Sprintf(`You are the mandatory Risk Specialist reviewing three completed specialist analyses for the "%s" strategy. You are the final analytical stage before deterministic portfolio risk controls.
 
-YOUR MANDATE: enforce risk discipline. Anchor on portfolio exposure, position sizing, R:R, correlation with existing open positions, ATR-relative stop distance, and drawdown vulnerability. You are EXPLICITLY ALLOWED — and expected — to veto an otherwise attractive setup when risk discipline is violated.
+YOUR MANDATE: synthesize the fundamental, technical, and sentiment findings, then enforce risk discipline. Anchor on portfolio exposure, position sizing, R:R, correlation with existing open positions, ATR-relative stop distance, and drawdown vulnerability. You are explicitly allowed and expected to reject an otherwise attractive setup when risk discipline is violated.
 
 %s
 
 ROLE GUIDANCE:
-- VETO with WAIT (or HOLD when the setup is dead) ONLY when you can name a concrete, specific discipline failure:
+- Treat the three specialist findings as evidence, not independent votes that you can ignore.
+- BUY or SELL only when the directional evidence is coherent and the trade clears the named discipline checks.
+- WAIT (or HOLD when the setup is dead) when the specialists conflict materially or when you can name a concrete discipline failure:
   - Stop distance exceeds 2.5x ATR (over-extended entry — name the ATR value)
   - Position size implied by sizing rules would exceed the 5%% per-position cap (name the size)
   - Portfolio already holds the SAME ticker at full per-ticker cap, or a directly correlated long that would compound a named macro/sector risk
   - R:R is below 1.2 (the self-filter forces a wider TP / tighter SL — emit WAIT only if neither is plausible)
   - Drawdown exceeds 10%% AND current equity is within 2%% of the daily loss limit
-- A vague concern ("conditions seem risky", "uncertainty is elevated", "let it settle") is NOT a valid veto. If you cannot name the specific number that fails, you do not have a veto.
-- BUY when the trade structure clears the named discipline checks above. You are the safety circuit, not a permanent brake — your role only exists to catch concrete violations, not to second-guess every directional signal.
+- A vague concern ("conditions seem risky", "uncertainty is elevated", "let it settle") is not a valid rejection.
+- You are a safety circuit, not a permanent brake. Do not second-guess aligned directional evidence without a specific conflict or risk failure.
 - SELL when an existing long is breaching its stop, exposure has grown beyond comfort, or correlation risk has materialised.
-- HOLD when there is no actionable signal — discipline does not mean opining on every chart.
-- Your reasoning MUST explicitly state the discipline check that drove the verdict, with concrete numbers (e.g. "veto: stop is 2.6x ATR (ATR=$1.20, stop=$3.10 below entry)"). If you cannot quote a number, do not emit a veto — pass to the directional consensus.
+- HOLD when there is no actionable signal.
+- Your reasoning must summarize how the three findings support or conflict with the final action and name any discipline check that changed the outcome.
 
 %s`, strategy, roleOutputSchema, rrSelfFilter)
 }
@@ -164,4 +165,29 @@ func BuildRolePrompt(
 	}
 	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
+}
+
+// BuildRiskManagerReviewPrompt builds the sequential Risk Specialist call and
+// appends the completed directional findings to the normal market-data context.
+func BuildRiskManagerReviewPrompt(
+	ticker, strategy, timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	directionalFindings string,
+) (systemPrompt, userMessage string) {
+	systemPrompt, userMessage = BuildRolePrompt(
+		"risk_manager", ticker, strategy, timeframe, candles, ind, news,
+		portfolio, knowledgeContext, similarSetups, performanceContext,
+	)
+	if systemPrompt == "" || userMessage == "" {
+		return "", ""
+	}
+	userMessage += "\n\nCOMPLETED SPECIALIST FINDINGS:\n" + directionalFindings +
+		"\n\nReturn the final specialist outcome after reviewing all findings."
+	return systemPrompt, userMessage
 }

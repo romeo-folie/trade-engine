@@ -24,7 +24,7 @@ import {
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { useAnimationFrame } from 'framer-motion';
-import type { NodeState } from '../../types/protocol';
+import type { NodeState, PipelineTopology } from '../../types/protocol';
 import type { NodeMetrics } from '../../hooks/useEngineSocket';
 import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import { useWatchlist } from '../../hooks/useWatchlist';
@@ -41,20 +41,9 @@ import OrganicEdge from './OrganicEdge';
 const NODE_TYPES = { pipelineNode: PipelineNodeCard };
 const EDGE_TYPES = { organic: OrganicEdge };
 
-// Column X-offsets — 400px gap (NODE_W=280 + 120 spacer)
-const COL = {
-  source: 60,
-  enricher: 460,
-  indicators: 860,
-  analysts: 1360,     // Extra spacer for analyst stack
-  consensus: 1860,
-  arbiter: 2360,       // Center point between consensus and risk
-  risk: 2860,
-  execution: 3360,
-  portfolio: 3800,
-};
-
 const CY = 400;
+const STAGE_X = 460;
+const STAGE_ORIGIN_X = 60;
 
 // Node dimensions
 const NODE_W = 280;
@@ -64,24 +53,16 @@ const EDGE_ACTIVE = colors.acidGreen;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function getColumnX(nodeId: string, kind: string): number {
-  // Priority 1: Specific node IDs for key pipeline stages
-  if (nodeId === 'consensus') return COL.consensus;
-  if (nodeId === 'arbiter_node') return COL.arbiter;
-  if (nodeId === 'risk_manager') return COL.risk;
-  if (nodeId === 'indicator_engine') return COL.indicators;
-  if (nodeId === 'portfolio') return COL.portfolio;
-  if (nodeId === 'alpaca') return COL.enricher; // Move Alpaca to process col to avoid crossing
-  if (nodeId === 'news_api') return COL.source;
+function getStageX(stage: number): number {
+  return STAGE_ORIGIN_X + stage * STAGE_X;
+}
 
-  // Priority 2: General kinds
-  switch (kind) {
-    case 'source': return COL.source;
-    case 'enricher': return COL.enricher;
-    case 'analyst': return COL.analysts;
-    case 'execution': return COL.execution;
-    default: return COL.source;
-  }
+function estimatedNodeHeight(nodeId: string, kind: string): number {
+  if (nodeId === 'consensus' || nodeId === 'risk_manager') return 180;
+  if (nodeId === 'portfolio') return 240;
+  if (nodeId === 'executor') return 160;
+  if (kind === 'execution' || kind === 'enricher' || kind === 'analyst' || kind === 'risk_specialist') return 180;
+  return NODE_H;
 }
 
 function modelAccentColor(provider: string): string {
@@ -97,8 +78,9 @@ function modelAccentColor(provider: string): string {
 
 interface HubGraphProps {
   nodes: NodeState[];
+  topology: PipelineTopology | null;
   nodeMetrics: Record<string, NodeMetrics>;
-  recentEventSignatures: Record<string, { type: string; seqId: number }>;
+  recentEventSignatures: Record<string, { type: string; seqId: number; target: string }>;
   onNodeClick: (nodeId: string) => void;
 }
 
@@ -155,7 +137,7 @@ function CanvasIconButton({ icon, onClick, title, active }: CanvasIconButtonProp
 
 // ── Component ────────────────────────────────────────────────────────────────
 
-export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, onNodeClick }: HubGraphProps) {
+export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSignatures, onNodeClick }: HubGraphProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const particlesRef = useRef<Particle[]>([]);
@@ -173,149 +155,30 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
   const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
-    // Config-seeded analyst nodes: prefer "analyst-*" prefixed nodes (config-seeded).
-    // Fall back to "llm_analysis" only when no analyst-* nodes exist (legacy single-model config).
-    const prefixedAnalysts = nodes.filter(n => n.id.startsWith('analyst-'));
-    const snapshotAnalystNodes = prefixedAnalysts.length > 0
-      ? prefixedAnalysts
-      : nodes.filter(n => n.id === 'llm_analysis');
-
-    // Build base analyst list from snapshot nodes (config-seeded, always complete).
-    // modelEnsemble is only used to ENRICH snapshot nodes with performance data (accuracy,
-    // totalSignals) — it never replaces the list, because /api/node/models filters to models
-    // with ≥5 historical trades and would drop analysts that haven't fired enough yet.
-    const baseAnalysts: NodeState[] = snapshotAnalystNodes.length > 0
-      ? snapshotAnalystNodes.map(n => ({
-        id: n.id,
-        label: n.label,
-        kind: 'analyst' as const,
-        event_count: 0,
-        last_event_at: undefined,
-        meta: { provider: (n.meta?.provider as string) ?? '' },
-      }))
-      : [{ id: 'llm_analysis', label: 'LLM Analysis', kind: 'analyst' as const, event_count: 0, last_event_at: undefined }];
-
-    // Overlay performance data from modelEnsemble where available (matched by model label).
-    const analystNodes: NodeState[] = baseAnalysts.map(base => {
-      const perf = modelEnsemble.find(m => m.modelName === base.label);
-      if (!perf) return base;
+    // The snapshot is the configured graph. Performance data enriches analyst
+    // cards but must never add models that are absent from this topology.
+    const configuredNodes = nodes.map(node => {
+      if (node.kind !== 'analyst') return node;
+      const model = (node.meta?.model as string | undefined) ?? node.label;
+      const perf = modelEnsemble.find(m => m.modelName === model);
+      if (!perf) return node;
       return {
-        ...base,
+        ...node,
         event_count: perf.totalSignals,
-        meta: { ...(base.meta ?? {}), provider: perf.provider, accuracy: perf.accuracy },
+        meta: { ...(node.meta ?? {}), provider: perf.provider, accuracy: perf.accuracy },
       };
     });
 
-    // Pipeline nodes with real backend IDs mapped to visual stages.
-    const PIPELINE_NODES: NodeState[] = [
-      // Sources (col 0)
-      { id: 'alpaca', label: 'Alpaca Feed', kind: 'source', event_count: 0, last_event_at: undefined },
-      { id: 'news_api', label: nodes.find(n => n.id === 'news_api')?.label ?? 'News Feed', kind: 'source', event_count: 0, last_event_at: undefined },
-      // Enricher (col 0.5)
-      { id: 'news_enricher', label: 'News Enricher', kind: 'enricher', event_count: 0, last_event_at: undefined },
-      // Arbiter (col 1)
-      { id: 'indicator_engine', label: 'Indicator Engine', kind: 'arbiter', event_count: 0, last_event_at: undefined },
-      // Analyst (col 2) — dynamic
-      ...analystNodes,
-      // Consensus (col 3)
-      { id: 'consensus', label: 'Consensus', kind: 'synthesis', event_count: 0, last_event_at: undefined },
-      // Arbiter Final (col 4) — handles dissent
-      {
-        id: 'arbiter_node',
-        label: nodes.find(n => n.id === 'arbiter_node')?.label ?? 'Ensemble Arbiter',
-        kind: 'arbiter_final',
-        event_count: 0,
-        last_event_at: undefined
-      },
-      // Risk Manager (col 5)
-      { id: 'risk_manager', label: 'Risk Manager', kind: 'synthesis', event_count: 0, last_event_at: undefined },
-      // Execution (col 6)
-      { id: 'executor', label: 'Executor', kind: 'execution', event_count: 0, last_event_at: undefined },
-      { id: 'portfolio', label: 'Portfolio', kind: 'execution', event_count: 0, last_event_at: undefined },
-    ];
-
-    // Merge live metrics and metadata from backend into pipeline nodes.
-    const mergedPipeline = PIPELINE_NODES.map(pn => {
-      const live = nodes.find(n => n.id === pn.id);
-      if (!live) return pn;
-      return {
-        ...pn,
-        label: live.label || pn.label,
-        event_count: live.event_count,
-        last_event_at: live.last_event_at,
-        meta: { ...(pn.meta ?? {}), ...(live.meta ?? {}) }
-      };
-    });
-
-    const allNodes = [...mergedPipeline];
-
-    // Stack nodes vertically within each kind group
-    const kindGroups: Record<string, typeof allNodes> = {};
-    for (const n of allNodes) {
-      if (!kindGroups[n.kind]) kindGroups[n.kind] = [];
-      kindGroups[n.kind].push(n);
-    }
-
-    // Calculate global allRiskPassed state
     const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
 
-    return allNodes.map((n) => {
-      // Grouping logic for vertical stacking. 
-      // Group Alpaca with Enricher for vertical stacking to clear the path.
-      const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') 
-        ? n.id 
-        : (n.id === 'alpaca' || n.kind === 'enricher') ? 'entry_processing' : n.kind;
-      const group = allNodes.filter(an => {
-        const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') 
-          ? an.id 
-          : (an.id === 'alpaca' || an.kind === 'enricher') ? 'entry_processing' : an.kind;
-        return ak === groupKey;
-      });
-
-      // Layout coordinates (center-to-center symmetry)
-      const groupGap = (n.kind === 'analyst' || n.kind === 'enricher') ? 200 : 260;
+    return configuredNodes.map((n) => {
+      const group = configuredNodes.filter(candidate => candidate.stage === n.stage);
+      const groupGap = group.length > 2 ? 200 : 240;
       const groupIdx = group.findIndex(gn => gn.id === n.id);
-
-      const x = getColumnX(n.id, n.kind);
-
-      // Variable height estimation for centering (Data-backed from CSS + Content)
-      let estimatedH = NODE_H;
-      if (n.id === 'consensus') estimatedH = 180;
-      if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
-      if (n.id === 'portfolio') estimatedH = 240;
-      if (n.id === 'executor') estimatedH = 160;
-      if (n.kind === 'execution' || n.kind === 'enricher' || n.kind === 'analyst') estimatedH = 180;
-
-      // Center the whole group vertically around CY
+      const estimatedH = estimatedNodeHeight(n.id, n.kind);
+      const x = getStageX(n.stage);
       let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
-
-      // Arbiter offset to clarify bypass path
-      if (n.id === 'arbiter_node') {
-        y -= 245;
-      }
-
-      // Pin risk_manager Y to match consensus's midpoint so the connecting edge
-      // stays horizontally level regardless of risk_manager card height.
-      // consensus estimatedH = 180, so its midpoint = y_consensus + 90.
-      // We want risk_manager's midpoint to equal consensus's midpoint:
-      //   y_risk + estimatedH_risk/2 = y_consensus + 90
-      // Since risk_manager is a single-node group, y_consensus === CY - (180/2) = CY - 90.
-      // Therefore y_risk = CY - 90 - estimatedH_risk/2 ... but estimatedH varies.
-      // Simplest approach: pin risk_manager top to CY - 90 so its top aligns with
-      // consensus's top, and the edge mid connects at the same horizontal band.
-      if (n.id === 'risk_manager') {
-        const consensusEstH = 180;
-        y = CY - consensusEstH / 2 - 20;
-      }
-
-      // Execution phase stagger as per desired layout: 
-      // Risk (Center) -> Executor (Down) -> Portfolio (Up)
-      if (n.id === 'executor') {
-        y += 100;
-      }
-      if (n.id === 'portfolio') {
-        y -= 150;
-      }
+      if (n.id === 'arbiter_node') y -= 245;
 
       const metrics = nodeMetrics[n.id] ?? null;
       const liveLastEventAt = metrics?.lastEventAt
@@ -325,10 +188,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       // Pass extra model data through for analyst cards
       const provider = n.meta?.provider as string | undefined;
       const accuracy = n.meta?.accuracy as number | undefined;
+      const role = n.meta?.role as string | undefined;
+      const model = n.meta?.model as string | undefined;
 
-      // Match analyst vote by node label (analyst name) only — provider is not
-      // a stable key and causes mis-assignment when multiple analysts share a provider.
-      const vote = analystVotes.find(v => v.model === n.label);
+      // Specialist roles are stable even when two roles share a model.
+      const vote = analystVotes.find(v => role ? v.role === role : v.model === (model ?? n.label));
 
       return {
         id: n.id,
@@ -345,16 +209,20 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
           lastEventType: recentEventSignatures[n.id]?.type ?? null,
           onNodeClick,
           provider,
+          meta: n.meta,
           accuracy,
           accentColor: provider ? modelAccentColor(provider) : undefined,
           // Per-analyst live vote
           ...(vote ? { verdict: vote.action, voteConfidence: vote.confidence, skipped: vote.skipped } : {}),
           isChosen: selectedAnalysts.includes(n.id),
-          verdictEntries: n.label ? (verdictHistory[n.label] ?? []) : [],
+          verdictEntries: role
+            ? (verdictHistory[`role:${role}`] ?? [])
+            : model ? (verdictHistory[model] ?? []) : (verdictHistory[n.label] ?? []),
           // Alpaca Feed: pass watchlist for marquee display
           ...(n.id === 'alpaca' ? { watchlistTickers, isOrbMode } : {}),
           // Live pipeline data
           ...(n.id === 'consensus' ? { analystConsensus, analystVotes, currentTicker } : {}),
+          ...(n.id === 'specialist-risk-manager' ? { analystVotes, currentTicker } : {}),
           ...(n.id === 'risk_manager' ? { riskChecks: lastRiskChecks } : {}),
           ...(n.id === 'executor' ? { lastTrade, allRiskPassed } : {}),
           ...(n.id === 'portfolio' ? { portfolioState, allRiskPassed } : {}),
@@ -383,16 +251,26 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       return Date.now() - lastEventAt < 10_000;
     };
 
-    const edges: Edge[] = [];
-    const sourceIds = rfNodes.filter(n => n.data.kind === 'source').map(n => n.id);
-    const arbiterId = rfNodes.find(n => n.data.kind === 'arbiter')?.id;
-    const analystIds = rfNodes.filter(n => n.data.kind === 'analyst').map(n => n.id);
-    const arbiterFinalId = rfNodes.find(n => n.data.kind === 'arbiter_final')?.id;
+    if (!topology) return [];
+    const arbiterActive = isNodeRecentlyActive('arbiter_node');
 
-    const makeEdge = (src: string, tgt: string, opts?: { forceInactive?: boolean; activeOverride?: boolean }) => {
-      const active = opts?.activeOverride !== undefined
-        ? opts.activeOverride
-        : !opts?.forceInactive && isNodeRecentlyActive(src);
+    const makeEdge = (src: string, tgt: string, edgeKind: string) => {
+      const exactEventActive = recentEventSignatures[src]?.target === tgt && isNodeRecentlyActive(src);
+      let active = exactEventActive;
+      if (src === 'indicator_engine' && rfNodes.find(n => n.id === tgt)?.data.kind === 'analyst') {
+        active = selectedAnalysts.includes(tgt) && isNodeRecentlyActive(tgt);
+      }
+      if (edgeKind === 'bypass') {
+        active = exactEventActive;
+      }
+      if (edgeKind === 'conditional') {
+        const isArbiterPath = src === 'arbiter_node' || tgt === 'arbiter_node';
+        active = isArbiterPath ? exactEventActive && arbiterActive : exactEventActive;
+      }
+      if (src === 'risk_manager' && tgt === 'executor') {
+        const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
+        active = exactEventActive && allRiskPassed;
+      }
       return {
         id: `e-${src}-${tgt}`,
         source: src,
@@ -419,65 +297,14 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
       };
     };
 
-    if (arbiterId) {
-      sourceIds.forEach(sid => {
-        // News source goes to enricher, others to indicator_engine
-        if (sid === 'news_api') {
-          edges.push(makeEdge(sid, 'news_enricher'));
-          edges.push(makeEdge('news_enricher', arbiterId));
-        } else {
-          edges.push(makeEdge(sid, arbiterId));
-        }
-      });
-
-      analystIds.forEach(aid => {
-        // Selective pulsing based on selectedAnalysts set (from AnalysisStarted)
-        // Edge lights up only while the analyst is actively selected for this dispatch.
-        // selectedAnalysts is cleared on TickStarted so the edge goes dark at cycle reset.
-        // wasInvoked (from analystVotes) was removed: it persisted the entire tick duration,
-        // keeping edges lit long after analysis completed.
-        const isSelected = selectedAnalysts.includes(aid) && isNodeRecentlyActive(aid);
-        edges.push(makeEdge(arbiterId, aid, { activeOverride: isSelected }));
-      });
-    }
-
-    // All analysts → consensus
-    analystIds.forEach(aid => edges.push(makeEdge(aid, 'consensus')));
-
-    // The two post-consensus paths are mutually exclusive:
-    //   Fast path:    consensus → risk_manager        (when arbiter was NOT invoked)
-    //   Arbiter path: consensus → arbiter_node → risk_manager (when ArbiterInvoked fired)
-    //
-    // arbiter_node nodeMetrics are only ever updated by ArbiterInvoked events
-    // (protocol.go maps ArbiterInvoked → source=consensus, target=arbiter_node).
-    // So isNodeRecentlyActive('arbiter_node') is a reliable "was arbiter used?" flag
-    // with no new state required.
-    const arbiterActive = arbiterFinalId ? isNodeRecentlyActive(arbiterFinalId) : false;
-    edges.push(makeEdge('consensus', 'risk_manager', {
-      activeOverride: isNodeRecentlyActive('consensus') && !arbiterActive,
-    }));
-    if (arbiterFinalId) {
-      edges.push(makeEdge('consensus', arbiterFinalId, { activeOverride: arbiterActive }));
-      edges.push(makeEdge(arbiterFinalId, 'risk_manager'));
-    }
-
-    // Causal flow: Risk → Executor → Portfolio
-    const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
-    const riskActive = isNodeRecentlyActive('risk_manager');
-
-    // Risk → Executor (Lights only on PASS)
-    edges.push(makeEdge('risk_manager', 'executor', {
-      activeOverride: riskActive && allRiskPassed
-    }));
-
-    // Executor → Portfolio (Pulse on trade activity)
-    edges.push(makeEdge('executor', 'portfolio'));
-
-    return edges;
-  }, [rfNodes, nodeMetrics, lastRiskChecks, selectedAnalysts]);
+    return topology.edges
+      .filter(edge => rfNodes.some(n => n.id === edge.source) && rfNodes.some(n => n.id === edge.target))
+      .map(edge => makeEdge(edge.source, edge.target, edge.kind));
+  }, [rfNodes, topology, nodeMetrics, recentEventSignatures, lastRiskChecks, selectedAnalysts]);
 
   const [rfN, setRfNodes, onNodesChange] = useNodesState(rfNodes);
   const [rfE, setRfEdges, onEdgesChange] = useEdgesState(rfEdges);
+  const previousTopologyRevision = useRef(topology?.revision ?? '');
 
   // Reconcile nodes and edges before paint. Live engine events update card data
   // many times per second; replacing nodes after paint discarded React Flow's
@@ -485,6 +312,8 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
   // endpoints. Preserve the complete existing node shell while overlaying fresh
   // application data, and batch both topology updates in one layout effect.
   useLayoutEffect(() => {
+    const nextRevision = topology?.revision ?? '';
+    const topologyChanged = previousTopologyRevision.current !== nextRevision;
     setRfNodes((nds) => {
       const currentMap = new Map(nds.map(n => [n.id, n]));
 
@@ -496,7 +325,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return {
           ...existing,
           ...n,
-          position: existing.position,
+          position: topologyChanged ? n.position : existing.position,
           dragging: existing.dragging,
           selected: existing.selected,
           draggable: !layoutLocked,
@@ -510,7 +339,11 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
         return existing ? { ...existing, ...edge, selected: existing.selected } : edge;
       });
     });
-  }, [rfNodes, rfEdges, layoutLocked, setRfNodes, setRfEdges]);
+    previousTopologyRevision.current = nextRevision;
+    if (topologyChanged) {
+      window.setTimeout(() => fitViewRef.current?.({ padding: 0.15, duration: 400 }), 50);
+    }
+  }, [rfNodes, rfEdges, topology?.revision, layoutLocked, setRfNodes, setRfEdges]);
 
   const handleNodeClick: NodeMouseHandler = useCallback((_evt, node) => {
     onNodeClick(node.id);
@@ -530,55 +363,29 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     return m;
   }, [rfN]);
 
-  const prevSignatures = useRef<Record<string, { type: string; seqId: number }>>({});
+  const prevSignatures = useRef<Record<string, { type: string; seqId: number; target: string }>>({});
   useEffect(() => {
     for (const [nodeId, sig] of Object.entries(recentEventSignatures)) {
       const prev = prevSignatures.current[nodeId];
       if (prev && prev.type === sig.type && prev.seqId === sig.seqId) continue;
       prevSignatures.current[nodeId] = sig;
 
-      // Find the edge(s) this node is a source of.
-      // For the consensus node, only spawn particles on the path actually taken:
-      //   AnalysisCompleted → fast path (consensus → risk_manager), suppress arbiter edge
-      //   ArbiterInvoked    → arbiter path (consensus → arbiter_node), suppress direct edge
-      const outgoingEdges = rfE.filter(e => {
-        if (e.source !== 'consensus') return e.source === nodeId;
-        if (sig.type === 'ArbiterInvoked') return e.target === 'arbiter_node';
-        return e.target === 'risk_manager';
-      });
+      // AnalysisCompleted updates the verdict-producing node itself. The
+      // subsequent SignalGenerated event is what traverses into risk controls.
+      if (sig.type === 'AnalysisCompleted') continue;
+
+      // Route only across the exact edge named by the event contract. This
+      // prevents a source with several outcomes from lighting every branch.
+      const outgoingEdges = rfE.filter(e => e.source === nodeId && e.target === sig.target);
       outgoingEdges.forEach(edge => {
         const src = rfNodeMap.get(edge.source);
         const tgt = rfNodeMap.get(edge.target);
         if (!src || !tgt) return;
 
-        const getEstimatedH = (id: string, kind: string) => {
-          if (id === 'consensus') return 180;
-          if (id === 'risk_manager') return 180;
-          if (id === 'portfolio') return 240;
-          if (id === 'executor') return 160;
-          if (kind === 'execution' || kind === 'enricher' || kind === 'analyst') return 180;
-          return NODE_H;
-        };
-
-        const srcH = getEstimatedH(src.id, src.data.kind);
-        const tgtH = getEstimatedH(tgt.id, tgt.data.kind);
-
-        // Recalculate positions with the same offsets used in the node mapping
-        let fromY = src.position.y + srcH / 2;
-        if (src.id === 'executor') {
-          fromY += 100;
-        }
-        if (src.id === 'portfolio') {
-          fromY -= 150;
-        }
-
-        let toY = tgt.position.y + tgtH / 2;
-        if (tgt.id === 'executor') {
-          toY += 100;
-        }
-        if (tgt.id === 'portfolio') {
-          toY -= 150;
-        }
+        const srcH = estimatedNodeHeight(src.id, src.data.kind);
+        const tgtH = estimatedNodeHeight(tgt.id, tgt.data.kind);
+        const fromY = src.position.y + srcH / 2;
+        const toY = tgt.position.y + tgtH / 2;
 
         particlesRef.current.push({
           id: `${nodeId}-${edge.target}-${Date.now()}-${Math.random()}`,
@@ -654,54 +461,17 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
 
   const resetLayout = useCallback(() => {
     setRfNodes((currentNodes) => {
-      const groups: Record<string, typeof currentNodes> = {};
-      for (const n of currentNodes) {
-        if (!groups[n.data.kind]) groups[n.data.kind] = [];
-        groups[n.data.kind].push(n);
-      }
       return currentNodes.map(n => {
-        const groupKey = (n.id === 'consensus' || n.id === 'risk_manager' || n.id === 'executor' || n.id === 'portfolio') 
-          ? n.id 
-          : (n.id === 'alpaca' || n.data.kind === 'enricher') ? 'entry_processing' : n.data.kind;
-        const group = currentNodes.filter(an => {
-          const ak = (an.id === 'consensus' || an.id === 'risk_manager' || an.id === 'executor' || an.id === 'portfolio') 
-            ? an.id 
-            : (an.id === 'alpaca' || an.data.kind === 'enricher') ? 'entry_processing' : an.data.kind;
-          return ak === groupKey;
-        });
-
-        // Variable height estimation for centering (Data-backed from CSS + Content)
-        let estimatedH = NODE_H;
-        if (n.id === 'consensus') estimatedH = 180;
-        if (n.id === 'risk_manager') estimatedH = 180; // Refined height estimate
-        if (n.id === 'portfolio') estimatedH = 240;
-        if (n.id === 'executor') estimatedH = 160;
-        if (n.data.kind === 'execution' || n.data.kind === 'enricher' || n.data.kind === 'analyst') estimatedH = 180;
-
-        const groupGap = (n.data.kind === 'analyst' || n.data.kind === 'enricher') ? 200 : 260;
+        const stage = nodes.find(configured => configured.id === n.id)?.stage ?? 0;
+        const group = currentNodes.filter(candidate =>
+          (nodes.find(configured => configured.id === candidate.id)?.stage ?? 0) === stage
+        );
+        const estimatedH = estimatedNodeHeight(n.id, n.data.kind);
+        const groupGap = group.length > 2 ? 200 : 240;
         const groupIdx = group.findIndex(gn => gn.id === n.id);
-        const x = getColumnX(n.id, n.data.kind);
-
-        // Center vertically around CY
+        const x = getStageX(stage);
         let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
-
-        // Arbiter offset to clarify bypass path
-        if (n.id === 'arbiter_node') {
-          y -= 245;
-        }
-
-        // Minor vertical correction for Risk Manager to align with Consensus spline
-        if (n.id === 'risk_manager') {
-          y -= 20;
-        }
-
-        // Execution phase stagger: Risk (Center) -> Executor (Down) -> Portfolio (Up)
-        if (n.id === 'executor') {
-          y += 100;
-        }
-        if (n.id === 'portfolio') {
-          y -= 150;
-        }
+        if (n.id === 'arbiter_node') y -= 245;
 
         return { ...n, position: { x, y } };
       });
@@ -710,7 +480,7 @@ export default function HubGraph({ nodes, nodeMetrics, recentEventSignatures, on
     setTimeout(() => {
       fitViewRef.current?.({ padding: 0.15, duration: 400 });
     }, 50);
-  }, [setRfNodes]);
+  }, [nodes, setRfNodes]);
 
   return (
     <div ref={wrapperRef} className={styles.wrapper}>

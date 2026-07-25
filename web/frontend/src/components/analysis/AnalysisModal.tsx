@@ -90,6 +90,13 @@ function formatSpecialistOutcome(reasoning: string, action: string): SpecialistO
     .map(line => line.trim())
     .find(line => line.startsWith('[specialist] resolved by '));
 
+  if (resolution?.includes('mandatory risk-manager review')) {
+    return {
+      method: 'Risk Specialist review',
+      detail: `${action} was selected as the final outcome after reviewing all three specialist findings.`,
+    };
+  }
+
   const majority = resolution?.match(/resolved by (3-of-\d+) majority/);
   if (majority) {
     return {

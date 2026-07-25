@@ -76,6 +76,7 @@ type AnalysisCompletedPayload struct {
 	Model      string  `json:"model"`
 	LatencyMs  int64   `json:"latency_ms"`
 	FastPathed bool    `json:"fast_pathed"` // true = unanimous analysts, arbiter skipped
+	SourceNode string  `json:"source_node,omitempty"`
 }
 
 // ArbiterInvokedPayload is emitted when the arbiter resolves analyst dissent.
@@ -96,6 +97,7 @@ type SignalGeneratedPayload struct {
 	StopLoss    float64
 	TakeProfit  float64
 	Mode        string // auto | paper | manual
+	SourceNode  string `json:"source_node,omitempty"`
 }
 
 // SignalBlockedPayload is emitted when a signal fails risk checks.
@@ -201,6 +203,7 @@ type NewsFetchedPayload struct {
 type AnalystVotePayload struct {
 	Provider   string  `json:"provider"`
 	Model      string  `json:"model"`
+	Role       string  `json:"role,omitempty"`
 	Action     string  `json:"action"` // BUY | SELL | HOLD | ""
 	Confidence float64 `json:"confidence"`
 	Skipped    bool    `json:"skipped"` // true = analyst errored or wasn't invoked
@@ -218,6 +221,7 @@ type AnalysisStartedPayload struct {
 	Ticker           string   `json:"ticker"`
 	Depth            int      `json:"depth"`
 	SelectedAnalysts []string `json:"selected_analysts"` // e.g. ["analyst-cheap", "analyst-mid"]
+	SourceNodes      []string `json:"source_nodes,omitempty"`
 }
 
 // NewsEnrichedPayload is emitted after the news enricher LLM extracts sentiment.

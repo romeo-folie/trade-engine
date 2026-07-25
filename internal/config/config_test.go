@@ -204,6 +204,62 @@ func TestValidateMissingAPIKey(t *testing.T) {
 	}
 }
 
+func TestValidateSpecialistModeRequiresEveryRole(t *testing.T) {
+	cfg := Defaults()
+	cfg.Analysis.SpecialistModeEnabled = true
+	cfg.Analysis.SpecialistRoles = map[string]string{
+		"fundamental": "analyst_frontier",
+		"technical":   "analyst_mid",
+		"sentiment":   "analyst_cheap",
+		// risk_manager intentionally missing
+	}
+	errs := Validate(cfg)
+	if !containsStr(errs, "analysis.specialist_roles.risk_manager is required") {
+		t.Fatalf("expected mandatory risk-manager validation error, got: %v", errs)
+	}
+
+	cfg.Analysis.SpecialistRoles["risk_manager"] = "does_not_exist"
+	errs = Validate(cfg)
+	if !containsStr(errs, `analysis.specialist_roles.risk_manager: key "does_not_exist" not found`) {
+		t.Fatalf("expected unresolved risk-manager registry error, got: %v", errs)
+	}
+}
+
+func TestValidateSpecialistModeChecksRoleAPIKeysAndFallbacks(t *testing.T) {
+	cfg := Defaults()
+	cfg.Analysis.SpecialistModeEnabled = true
+	cfg.Analysis.SpecialistRoles = map[string]string{
+		"fundamental":  "analyst_frontier",
+		"technical":    "analyst_mid",
+		"sentiment":    "analyst_cheap",
+		"risk_manager": "specialist_risk",
+	}
+	cfg.Models.Registry["specialist_risk"] = ModelRegistryEntry{
+		ModelConfig: ModelConfig{
+			Provider:  "special-provider",
+			Model:     "risk-model",
+			APIKeyEnv: "TE_TEST_SPECIALIST_KEY_NOTSET",
+		},
+		Fallback: "specialist_fallback",
+	}
+	cfg.Models.Registry["specialist_fallback"] = ModelRegistryEntry{
+		ModelConfig: ModelConfig{
+			Provider:  "fallback-provider",
+			Model:     "fallback-model",
+			APIKeyEnv: "TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET",
+		},
+	}
+	os.Unsetenv("TE_TEST_SPECIALIST_KEY_NOTSET")
+	os.Unsetenv("TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET")
+
+	errs := Validate(cfg)
+	for _, envName := range []string{"TE_TEST_SPECIALIST_KEY_NOTSET", "TE_TEST_SPECIALIST_FALLBACK_KEY_NOTSET"} {
+		if !containsStr(errs, envName) {
+			t.Errorf("expected missing specialist API key error for %s, got: %v", envName, errs)
+		}
+	}
+}
+
 func TestResolveEnvEmpty(t *testing.T) {
 	if got := resolveEnv(""); got != "" {
 		t.Errorf("resolveEnv(\"\") = %q, want empty", got)
@@ -551,6 +607,24 @@ func TestLegacyAnalystsFallback(t *testing.T) {
 	}
 	if analysts[0].Model != "claude-sonnet-4-5" {
 		t.Errorf("legacy analyst model = %q, want claude-sonnet-4-5", analysts[0].Model)
+	}
+}
+
+func TestAnalystNodeIDIsStableAcrossRegistryAndLegacyConfigs(t *testing.T) {
+	registry := ModelsConfig{Roles: ModelRoles{Analysts: []string{"cheap", "frontier"}}}
+	if got := registry.AnalystNodeID(0); got != "analyst-cheap" {
+		t.Fatalf("registry primary ID = %q, want analyst-cheap", got)
+	}
+	if got := registry.AnalystNodeID(1); got != "analyst-frontier" {
+		t.Fatalf("registry secondary ID = %q, want analyst-frontier", got)
+	}
+
+	legacy := ModelsConfig{}
+	if got := legacy.AnalystNodeID(0); got != "llm_analysis" {
+		t.Fatalf("legacy primary ID = %q, want llm_analysis", got)
+	}
+	if got := legacy.AnalystNodeID(1); got != "analyst-1" {
+		t.Fatalf("legacy secondary ID = %q, want analyst-1", got)
 	}
 }
 

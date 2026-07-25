@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import type { WebEvent, SnapshotEvent, NodeState } from '../types/protocol';
+import type { WebEvent, SnapshotEvent, NodeState, PipelineTopology } from '../types/protocol';
 
 /** WebEvent with a stable monotonic ID for React keys. */
 export interface IndexedWebEvent extends WebEvent {
@@ -27,6 +27,7 @@ export interface AnalystConsensusEntry {
 export interface AnalystVote {
   provider: string;
   model: string;
+  role?: string;
   action: string;   // 'BUY' | 'SELL' | 'HOLD' | ''
   confidence: number;
   skipped: boolean;
@@ -74,6 +75,7 @@ export interface PortfolioState {
 export interface EngineSocketState {
   status: ConnectionStatus;
   nodes: NodeState[];
+  topology: PipelineTopology | null;
   events: IndexedWebEvent[];
   eventsPerSecond: number;
   paused: boolean;
@@ -102,6 +104,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
 
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
   const [nodes, setNodes] = useState<NodeState[]>([]);
+  const [topology, setTopology] = useState<PipelineTopology | null>(null);
   const nodesRef = useRef<NodeState[]>([]);
   const nodeIdByLabelRef = useRef<Map<string, string>>(new Map());
   const [events, setEvents] = useState<IndexedWebEvent[]>([]);
@@ -188,6 +191,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         if (msg.type === 'snapshot') {
           const snapNodes = (msg as SnapshotEvent).nodes;
           setNodes(snapNodes);
+          setTopology((msg as SnapshotEvent).topology ?? null);
           // Reset incremental metrics on snapshot (e.g. reconnect) to avoid
           // double-counting with the snapshot's event_count baseline.
           setNodeMetrics({});
@@ -219,20 +223,23 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         const indexed: IndexedWebEvent = { ...webEv, _seqId: ++seqRef.current };
         setEvents(prev => [indexed, ...prev].slice(0, MAX_EVENTS));
 
-        // Update per-node metrics for source and target nodes.
-        // Use a Set to avoid double-counting self-loop events (source === target).
-        setNodeMetrics(prev => {
-          const next = { ...prev };
-          for (const nodeId of new Set([webEv.source, webEv.target])) {
-            if (!nodeId) continue;
-            const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
-            next[nodeId] = {
-              eventCount: existing.eventCount + 1,
-              lastEventAt: now,
-            };
-          }
-          return next;
-        });
+        // Update per-node metrics for source and target nodes. Routing-only
+        // analyst pulses are already counted from the aggregate vote payload.
+        if (webEv.type !== 'AnalystVoteRouted') {
+          // Use a Set to avoid double-counting self-loop events.
+          setNodeMetrics(prev => {
+            const next = { ...prev };
+            for (const nodeId of new Set([webEv.source, webEv.target])) {
+              if (!nodeId) continue;
+              const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
+              next[nodeId] = {
+                eventCount: existing.eventCount + 1,
+                lastEventAt: now,
+              };
+            }
+            return next;
+          });
+        }
 
         // Track last signal time
         if (webEv.type === 'SignalGenerated') {
@@ -278,7 +285,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
         }
 
         // Track per-analyst votes and accumulate verdict history for marquee
-        if (webEv.type === 'AnalystVotesPublished' && webEv.payload) {
+        if ((webEv.type === 'AnalystVotesPublished' || webEv.type === 'SpecialistReviewCompleted') && webEv.payload) {
           try {
             const p = typeof webEv.payload === 'string'
               ? JSON.parse(webEv.payload)
@@ -293,8 +300,14 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                 const next = { ...prev };
                 for (const vote of votes) {
                   if (vote.skipped) continue;
-                  const nodeId = nodeIdByLabelRef.current.get(vote.model);
+                  const nodeId = vote.role
+                    ? `specialist-${vote.role.replace(/_/g, '-')}`
+                    : nodeIdByLabelRef.current.get(vote.model);
                   if (!nodeId) continue;
+                  // The generic event envelope already counted source/target.
+                  // Avoid counting the sequential Risk Specialist twice when
+                  // SpecialistReviewCompleted originates from that same node.
+                  if (nodeId === webEv.source || nodeId === webEv.target) continue;
                   const existing = next[nodeId] ?? { eventCount: 0, lastEventAt: null };
                   next[nodeId] = {
                     eventCount: existing.eventCount + 1,
@@ -320,7 +333,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
                   const next = { ...base };
                   for (const vote of votes) {
                     if (vote.skipped) continue;
-                    const key = vote.model;
+                    const key = vote.role ? `role:${vote.role}` : vote.model;
                     const existing = next[key] ?? [];
                     const updated = [...existing, { ticker, action: vote.action, confidence: vote.confidence }];
                     next[key] = updated.length > MAX_VERDICT_HISTORY ? updated.slice(-MAX_VERDICT_HISTORY) : updated;
@@ -439,7 +452,7 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     };
   }, [connect]);
 
-  return { status, nodes, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, currentTicker, selectedAnalysts, verdictHistory, consensusHistory };
+  return { status, nodes, topology, events, eventsPerSecond, paused, setPaused, nodeMetrics, lastSignalAt, avgLatencyMs, analystConsensus, lastRiskChecks, lastTrade, portfolioState, analystVotes, currentTicker, selectedAnalysts, verdictHistory, consensusHistory };
 }
 
 function buildWsUrl(): string {

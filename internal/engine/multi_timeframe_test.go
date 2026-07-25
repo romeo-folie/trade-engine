@@ -38,8 +38,8 @@ func TestShouldRunSecondPass_BorderlineWAITTriggers(t *testing.T) {
 }
 
 func TestShouldRunSecondPass_SpecialistModeSkipped(t *testing.T) {
-	// Specialist mode resolves borderline WAITs with its own 3-of-4 role
-	// majority + risk-manager veto. The multi-timeframe second pass fans out to
+	// Specialist mode resolves borderline WAITs through its mandatory Risk
+	// Specialist. The multi-timeframe second pass fans out to
 	// the REGULAR ensemble and would concatenate regular analyst votes onto the
 	// specialist role set — duplicate "regular + specialist" analyst blocks in
 	// the UI (Issue #323). It must be suppressed under specialist mode even when

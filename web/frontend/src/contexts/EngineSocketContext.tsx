@@ -6,11 +6,12 @@
  */
 import { createContext, useContext } from 'react';
 import type { ConnectionStatus, NodeMetrics, IndexedWebEvent, AnalystConsensusEntry, AnalystVote, RiskCheckResult, LastTrade, PortfolioState, VerdictHistory, VerdictEntry } from '../hooks/useEngineSocket';
-import type { NodeState } from '../types/protocol';
+import type { NodeState, PipelineTopology } from '../types/protocol';
 
 export interface EngineSocketContextValue {
   status: ConnectionStatus;
   nodes: NodeState[];
+  topology: PipelineTopology | null;
   events: IndexedWebEvent[];
   eventsPerSecond: number;
   paused: boolean;
