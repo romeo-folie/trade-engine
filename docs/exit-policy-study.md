@@ -1,6 +1,6 @@
 # Exit-policy study — findings & apply-plan (handoff)
 
-**Status (2026-07-25):** study and harness complete (PR #470); Branch 1 JSON recovery merged (PR #473); Branch 2 live exit policy merged and enabled in paper config (PR #474); cumulative partial-exit accounting merged (PR #475). The full six-ticker/five-variant matrix was replayed from cache after implementation and reproduced every documented profit factor exactly. **Phase 2 is implemented on PR #476 and is awaiting its cached comparison/review before merge.**
+**Status (2026-07-25):** study and harness complete (PR #470); Branch 1 JSON recovery merged (PR #473); Branch 2 live exit policy merged and enabled in paper config (PR #474); cumulative partial-exit accounting merged (PR #475); and the complete Phase 2 pullback-in-strength entry merged after cached comparison and comprehensive review (PR #476, issue #472). The full six-ticker/five-variant exit matrix reproduced every documented profit factor exactly, and the Phase 2 six-ticker replay completed at 100% cache hits with the zero-trade result documented below. The paper configuration currently enables the EMA9/0.72 uncapped exit policy and `pullback_strength_enabled`. Follow-on observability work refreshed the CLI/web configuration views and stabilized the live canvas (PR #477), then made the HubGraph topology and event routing adapt to single, ensemble, specialist, adaptive-depth, blocked, and approval paths (PR #478).
 
 ## Why this exists
 Our stock swing path sits at ~27% win rate; prior work (`te study execution`, PR #433) found **exits, not entries, are the leak** (~+1.53%/trade left on the table). A study of the 2025 US Investing Champion's pullback method (Martin Luk) pointed at the same thing: he runs a low win rate but wins via **asymmetry** — tight stops, and letting winners run on a **close-below-9-EMA** trailing stop instead of a fixed take-profit. We built a backtest harness to test whether our **fixed take-profit truncates winners**, and it does.
@@ -88,7 +88,7 @@ The `analyst_frontier`/fundamental role (`gpt-5-nano`) emitted invalid JSON (lit
 
 ---
 
-## Phase 2 — complete pullback-in-strength entry (PR #476; issue #472)
+## Phase 2 — complete pullback-in-strength entry (DONE — PR #476; issue #472)
 
 `risk.entry_gates.pullback_strength_enabled` is default-off and PAPER-first. When enabled, a stock BUY fails closed unless all of the following deterministic evidence is present:
 
@@ -159,6 +159,17 @@ The tight-stop thesis is strongly supported but not by one universal fixed
 width: 1% won on four names, 2% on HIMS, and 3% on META. Phase 2 therefore uses
 the setup's actual low of day and caps its width at 4%, rather than imposing a
 single fixed percentage across different price structures.
+
+### Next evidence milestone
+
+The next substantive strategy task is a performance study on a universe chosen
+by the new momentum/liquidity scanner. The legacy six-ticker cache was selected
+by watchlist tenure and produced no complete pullback-strength setups, so it
+validates fail-closed filtering but cannot estimate expectancy. Build/cache a
+scanner-selected sample, replay it with the enabled EMA9/0.72 exit policy and
+complete pullback-strength entry, then compare expectancy, payoff ratio, stop
+width, and failure-stage distributions. Do not weaken the entry definition just
+to manufacture trades in the legacy sample.
 
 ## Conventions (for the takeover agent)
 - Every feature: dedicated **branch → PR → `feature-dev:code-reviewer` before push → Monitor the PR**. Never push to `main` directly. Use a plain branch (NOT a worktree) unless asked.
