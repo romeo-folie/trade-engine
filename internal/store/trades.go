@@ -83,7 +83,7 @@ func CancelUnfilledTrade(ctx context.Context, id string) (bool, error) {
 // broker sell; all other exit paths see zero affected rows and stand down.
 func ClaimTradeExit(ctx context.Context, id string) (bool, error) {
 	tag, err := GetDB().Exec(ctx, `
-		UPDATE trades SET status='exiting'
+		UPDATE trades SET status='exiting', exit_claimed_at=NOW()
 		WHERE id=$1 AND status='open'`, id)
 	if err != nil {
 		return false, err
@@ -93,7 +93,7 @@ func ClaimTradeExit(ctx context.Context, id string) (bool, error) {
 
 func ReleaseTradeExitClaim(ctx context.Context, id string) error {
 	_, err := GetDB().Exec(ctx, `
-		UPDATE trades SET status='open'
+		UPDATE trades SET status='open', exit_claimed_at=NULL
 		WHERE id=$1 AND status='exiting'`, id)
 	return err
 }
@@ -187,7 +187,8 @@ func UpdateOrderStopPriceAndID(
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
-		SET exit_price=$1, pnl=$2, pnl_pct=$3, status='closed', closed_at=NOW()
+		SET exit_price=$1, pnl=$2, pnl_pct=$3, status='closed',
+		    closed_at=NOW(), exit_claimed_at=NULL
 		WHERE id=$4`,
 		exitPrice, pnl, pnlPct, id)
 	return err
@@ -200,7 +201,8 @@ func UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct floa
 		UPDATE trades
 		SET exit_price=$1, pnl=$2, pnl_pct=$3,
 		    status='closed',
-		    closed_at=COALESCE(closed_at, NOW())
+		    closed_at=COALESCE(closed_at, NOW()),
+		    exit_claimed_at=NULL
 		WHERE id=$4 AND status IN ('closed','exiting')`,
 		exitPrice, pnl, pnlPct, id)
 	return err
@@ -227,7 +229,10 @@ type PendingExitOrder struct {
 	TradeID       string
 	Direction     string // long | short
 	EntryPrice    float64
-	Quantity      float64
+	Quantity      float64 // current trade quantity
+	OrderQuantity float64 // lot quantity assigned to this broker order row
+	RecordedFill  float64 // fill already durably assigned to this lot
+	AggregateFill float64 // fill assigned across every row sharing the broker id
 	ExitPrice     float64 // exit price currently recorded on the trade row
 	TradeStatus   string  // closed (price correction) | exiting (finalization)
 }
@@ -244,6 +249,12 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 	rows, err := GetDB().Query(ctx, `
 		SELECT o.id, o.broker_order_id, o.ticker,
 		       t.id, t.direction, t.entry_price, t.quantity,
+		       o.quantity, COALESCE(o.filled_qty,0),
+		       COALESCE((
+		         SELECT SUM(COALESCE(allocated.filled_qty,0))
+		         FROM orders allocated
+		         WHERE allocated.broker_order_id=o.broker_order_id
+		       ),0),
 		       COALESCE(t.exit_price,0), t.status
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
@@ -266,6 +277,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		var p PendingExitOrder
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
+			&p.OrderQuantity, &p.RecordedFill, &p.AggregateFill,
 			&p.ExitPrice, &p.TradeStatus); err != nil {
 			return nil, err
 		}
@@ -315,6 +327,38 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 		       COALESCE(high_water_mark,0)
 		FROM trades WHERE status IN ('open','exiting')
 		ORDER BY opened_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTrades(rows)
+}
+
+// GetOrderlessExitingTrades returns claimed trades whose claim has no exit
+// order created after it. These are the crash/failure window between winning
+// exit ownership and making the broker order identity durable.
+func GetOrderlessExitingTrades(ctx context.Context, limit int) ([]Trade, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
+		       entry_price, COALESCE(exit_price,0),
+		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
+		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0)
+		FROM trades t
+		WHERE t.status='exiting'
+		  AND t.exit_claimed_at IS NOT NULL
+		  AND NOT EXISTS (
+		    SELECT 1 FROM orders o
+		    WHERE o.trade_id=t.id
+		      AND o.created_at >= t.exit_claimed_at
+		      AND COALESCE(o.broker_order_id,'') <> ''
+		      AND ((t.direction='long' AND o.side='sell')
+		        OR (t.direction='short' AND o.side='buy'))
+		  )
+		ORDER BY t.exit_claimed_at
+		LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}

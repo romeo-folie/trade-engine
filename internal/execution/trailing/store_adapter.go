@@ -85,6 +85,20 @@ func (liveStore) UpdateOrderFill(ctx context.Context, orderID string, filledPric
 	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
 }
 
+func (liveStore) ApplyPartialExit(
+	ctx context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (float64, float64, error) {
+	if !store.IsConnected() {
+		return 0, 0, errStoreNotConnected
+	}
+	return store.ApplyPartialExit(
+		ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status,
+	)
+}
+
 func (liveStore) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected

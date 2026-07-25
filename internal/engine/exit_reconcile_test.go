@@ -49,8 +49,9 @@ func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 func (f *fakeExitStore) GetPendingExitOrders(_ context.Context, _ int) ([]store.PendingExitOrder, error) {
 	return f.pending, f.pendingErr
 }
-func (f *fakeExitStore) UpdateOrderFill(_ context.Context, id string, price, qty float64, _ string) error {
+func (f *fakeExitStore) UpdateOrderFill(_ context.Context, id string, price, qty float64, status string) error {
 	f.orderFills[id] = [2]float64{price, qty}
+	f.orderStatus[id] = status
 	return nil
 }
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
@@ -156,6 +157,49 @@ func TestExitReconcileCancelledPartialReopensOnlyRemainder(t *testing.T) {
 	}
 }
 
+func TestExitReconcileTerminalFillReplayUsesDurableAllocation(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	p.RecordedFill = 2
+	p.AggregateFill = 2
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "cancelled", FilledPrice: 3.80, FilledQty: 2},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.tradeQty[p.TradeID]; got != 3 {
+		t.Fatalf("remaining quantity = %v, want 3 after replaying already-recorded fill", got)
+	}
+	if got := db.orderFills[p.OrderID][1]; got != 2 {
+		t.Fatalf("recorded fill = %v, want cumulative 2", got)
+	}
+}
+
+func TestExitReconcileTerminalFillSubtractsAllocationsOutsideBatch(t *testing.T) {
+	p := lacExit()
+	p.TradeStatus = "exiting"
+	p.Quantity = 5
+	p.OrderQuantity = 5
+	p.AggregateFill = 2 // another lot, omitted by LIMIT, already owns 2 shares
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"b1": {Status: "cancelled", FilledPrice: 3.80, FilledQty: 4},
+	}}
+
+	ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if got := db.orderFills[p.OrderID][1]; got != 2 {
+		t.Fatalf("new lot allocation = %v, want only unallocated aggregate remainder 2", got)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 3 {
+		t.Fatalf("remaining quantity = %v, want 3", got)
+	}
+}
+
 func TestExitReconcileShortDirectionPnL(t *testing.T) {
 	p := lacExit()
 	p.Direction = "short"
@@ -209,8 +253,8 @@ func TestExitReconcileCancelledMarksOrderNotTrade(t *testing.T) {
 	if stats.Terminal != 1 {
 		t.Fatalf("stats = %+v, want Terminal=1", stats)
 	}
-	if db.orderStatus["b1"] != "cancelled" {
-		t.Fatalf("order status = %q, want cancelled", db.orderStatus["b1"])
+	if db.orderStatus["o1"] != "cancelled" {
+		t.Fatalf("order status = %q, want cancelled", db.orderStatus["o1"])
 	}
 	if len(db.tradeExits) != 0 {
 		t.Fatal("trade must not be rewritten from a cancelled exit — no fill exists")

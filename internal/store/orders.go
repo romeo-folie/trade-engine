@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"time"
 )
 
@@ -97,6 +98,55 @@ func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty floa
 		WHERE id=$4`,
 		filledPrice, filledQty, status, id)
 	return err
+}
+
+// ApplyPartialExit atomically advances an order's cumulative fill and reduces
+// its trade by only the newly observed shares. Replaying the same broker
+// result is a no-op, which keeps cancellation-race recovery safe across
+// process restarts and failures between otherwise separate writes.
+func ApplyPartialExit(
+	ctx context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (remaining, applied float64, err error) {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var recorded float64
+	if err = tx.QueryRow(ctx, `
+		SELECT COALESCE(filled_qty,0)
+		FROM orders
+		WHERE id=$1
+		FOR UPDATE`, orderID).Scan(&recorded); err != nil {
+		return 0, 0, err
+	}
+	applied = math.Max(0, cumulativeFilledQty-recorded)
+
+	if _, err = tx.Exec(ctx, `
+		UPDATE orders
+		SET filled_price=$1, filled_qty=$2, status=$3, updated_at=NOW()
+		WHERE id=$4`,
+		filledPrice, math.Max(recorded, cumulativeFilledQty), status, orderID,
+	); err != nil {
+		return 0, 0, err
+	}
+	if err = tx.QueryRow(ctx, `
+		UPDATE trades
+		SET quantity=GREATEST(0, quantity-$1)
+		WHERE id=$2 AND status IN ('open','exiting')
+		RETURNING quantity`,
+		applied, tradeID,
+	).Scan(&remaining); err != nil {
+		return 0, 0, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, 0, err
+	}
+	return remaining, applied, nil
 }
 
 // GetOrdersByTrade retrieves all orders linked to a trade UUID.

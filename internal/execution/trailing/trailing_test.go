@@ -3,6 +3,7 @@ package trailing
 import (
 	"context"
 	"errors"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -198,6 +199,25 @@ func (f *fakeStore) UpdateOrderFill(_ context.Context, orderID string, filledPri
 	o.FilledPrice, o.FilledQty, o.Status = filledPrice, filledQty, status
 	f.orders[orderID] = o
 	return nil
+}
+
+func (f *fakeStore) ApplyPartialExit(
+	_ context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+) (float64, float64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	applied := math.Max(0, cumulativeFilledQty-o.FilledQty)
+	o.FilledPrice, o.FilledQty, o.Status =
+		filledPrice, math.Max(o.FilledQty, cumulativeFilledQty), status
+	f.orders[orderID] = o
+	tr := f.trades[tradeID]
+	tr.Quantity = math.Max(0, tr.Quantity-applied)
+	f.trades[tradeID] = tr
+	return tr.Quantity, applied, nil
 }
 
 func (f *fakeStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {

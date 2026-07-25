@@ -69,6 +69,7 @@ const (
 )
 
 var errStopFilledDuringRollback = errors.New("stop filled before rollback completed")
+var errExitClaimMustRemain = errors.New("partial broker exit is durable; exit claim must remain")
 
 var newYorkLocation = func() *time.Location {
 	loc, err := time.LoadLocation("America/New_York")
@@ -120,6 +121,7 @@ type TradeStore interface {
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
+	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
 	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
 	// CloseTrade flips the trade row to status='closed' with exit_price + pnl
@@ -692,15 +694,26 @@ func (m *Manager) rollbackUnrecordedStop(
 	}
 	switch execution.NormalizeOrderStatus(status.Status) {
 	case "cancelled", "rejected":
-		return nil
+		if status.FilledQty <= 0 {
+			return nil
+		}
+		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		if _, err := m.store.InsertOrder(ctx, store.Order{
+			TradeID: t.ID, BrokerOrderID: brokerOrderID,
+			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
+			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
+			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+		}); err != nil {
+			return fmt.Errorf("%w; persist partial rollback stop: %v", errStopFilledDuringRollback, err)
+		}
+		return errStopFilledDuringRollback
 	case "filled":
 		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
 		if _, err := m.store.InsertOrder(ctx, store.Order{
 			TradeID: t.ID, BrokerOrderID: brokerOrderID,
 			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
 			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
-			StopPrice: stopPrice, FilledPrice: status.FilledPrice,
-			FilledQty: status.FilledQty, Status: "filled", IsStopLoss: true,
+			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
 		}); err != nil {
 			return fmt.Errorf("%w; persist filled rollback stop: %v", errStopFilledDuringRollback, err)
 		}
@@ -739,6 +752,9 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 
 	exitRes, exitQty, err := m.exitAtMarket(ctx, t)
 	if err != nil {
+		if errors.Is(err, errExitClaimMustRemain) {
+			releaseClaim = false
+		}
 		return err
 	}
 	t.Quantity = exitQty
@@ -886,13 +902,21 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 		switch execution.NormalizeOrderStatus(status.Status) {
 		case "cancelled", "rejected":
 			if status.FilledQty > 0 {
-				if err := m.store.UpdateOrderFill(
-					ctx, leg.ID, status.FilledPrice, status.FilledQty,
+				var applied float64
+				remaining, applied, err = m.store.ApplyPartialExit(
+					ctx, t.ID, leg.ID, status.FilledPrice, status.FilledQty,
 					execution.NormalizeOrderStatus(status.Status),
-				); err != nil {
-					return 0, fmt.Errorf("persist partial exit-leg fill: %w", err)
+				)
+				if err != nil {
+					return 0, fmt.Errorf("%w: persist partial exit-leg fill: %v",
+						errExitClaimMustRemain, err)
 				}
-				remaining = math.Max(0, remaining-status.FilledQty)
+				_ = applied
+			} else if err := m.store.UpdateOrderFill(
+				ctx, leg.ID, status.FilledPrice, 0,
+				execution.NormalizeOrderStatus(status.Status),
+			); err != nil {
+				return 0, fmt.Errorf("persist terminal exit-leg status: %w", err)
 			}
 		case "filled":
 			return 0, fmt.Errorf("exit leg %s filled while cancelling; refusing duplicate market exit",
@@ -904,11 +928,6 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 	}
 	if remaining <= 0 {
 		return 0, errors.New("exit legs sold the full position while cancelling")
-	}
-	if remaining < t.Quantity {
-		if err := m.store.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
-			return 0, fmt.Errorf("persist remaining quantity after partial leg fill: %w", err)
-		}
 	}
 	return remaining, nil
 }

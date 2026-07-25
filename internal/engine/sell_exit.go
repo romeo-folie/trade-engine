@@ -88,7 +88,8 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	// Working exit legs and broker-resident stops hold the long's shares;
 	// they must be confirmed gone before the sell or the broker rejects it
 	// (and a still-live leg would race the fill).
-	remainingQty, clear, releaseSafe := e.cancelClaimedExitLegs(ctx, claimed, sig.Ticker)
+	remainingByTrade, remainingQty, clear, releaseSafe :=
+		e.cancelClaimedExitLegs(ctx, claimed, sig.Ticker)
 	if !clear {
 		if releaseSafe {
 			releaseClaims()
@@ -132,18 +133,22 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		result.FilledQty >= totalQty-1e-9
 	persistFailed := false
 	for _, t := range longs {
+		lotQuantity := remainingByTrade[t.ID]
+		if lotQuantity <= 0 {
+			continue
+		}
 		exitOrder := store.Order{
 			TradeID:       t.ID,
 			BrokerOrderID: result.BrokerOrderID,
 			Ticker:        sig.Ticker,
 			Side:          string(execution.OrderSideSell),
 			OrderType:     string(execution.OrderTypeMarket),
-			Quantity:      t.Quantity,
+			Quantity:      lotQuantity,
 			Status:        status,
 		}
 		if fullFill {
 			exitOrder.FilledPrice = result.FilledPrice
-			exitOrder.FilledQty = t.Quantity
+			exitOrder.FilledQty = lotQuantity
 		}
 		if _, err := store.InsertOrderWithRetry(ctx, exitOrder); err != nil {
 			persistFailed = true
@@ -165,7 +170,11 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	// A broker-confirmed aggregate fill closes every lot at the same execution
 	// price. Pending and partial responses remain durably exiting.
 	for _, t := range longs {
-		pnl, pnlPct := tradePnL("long", t.EntryPrice, t.Quantity, result.FilledPrice)
+		lotQuantity := remainingByTrade[t.ID]
+		if lotQuantity <= 0 {
+			continue
+		}
+		pnl, pnlPct := tradePnL("long", t.EntryPrice, lotQuantity, result.FilledPrice)
 		if err := store.CloseTrade(ctx, t.ID, result.FilledPrice, pnl, pnlPct); err != nil {
 			logger.Warn("sell exit: close confirmed trade", "trade_id", t.ID, "err", err)
 			continue
@@ -177,7 +186,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			"trade_id", t.ID,
 			"ticker", sig.Ticker,
 			"exit_price", result.FilledPrice,
-			"qty", t.Quantity,
+			"qty", lotQuantity,
 			"pnl", fmt.Sprintf("%.2f", pnl),
 			"fill_confirmed", true,
 		)

@@ -190,6 +190,11 @@ func TestRollbackUnrecordedProtectiveStop(t *testing.T) {
 			status: execution.OrderResult{Status: "cancelled"},
 		},
 		{
+			name:    "cancelled after partial fill is reported",
+			status:  execution.OrderResult{Status: "cancelled", FilledPrice: 94, FilledQty: 1},
+			wantErr: false,
+		},
+		{
 			name:      "broker already purged order",
 			statusErr: execution.ErrOrderNotFound,
 		},
@@ -215,7 +220,7 @@ func TestRollbackUnrecordedProtectiveStop(t *testing.T) {
 			if tt.statusErr != nil {
 				exec.statusErr["stop-1"] = tt.statusErr
 			}
-			err := rollbackUnrecordedProtectiveStop(context.Background(), exec, "stop-1")
+			_, err := rollbackUnrecordedProtectiveStop(context.Background(), exec, "stop-1")
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("rollback error = %v, wantErr %v", err, tt.wantErr)
 			}

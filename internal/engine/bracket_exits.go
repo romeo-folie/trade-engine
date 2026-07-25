@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -118,12 +117,8 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 		case "filled":
 			filledIdx = len(states) - 1
 		case "cancelled", "rejected":
-			// Persist any partial fill the leg accumulated before its OCO
-			// sibling terminated it — those shares were genuinely sold and
-			// belong in the exit accounting below.
-			if uErr := store.UpdateOrderFill(ctx, leg.ID, res.FilledPrice, res.FilledQty, "cancelled"); uErr != nil {
-				logger.Warn("bracket exits: mark cancelled leg", "order_id", leg.ID, "err", uErr)
-			}
+			// Persist only after the corresponding trade-quantity transition
+			// below. ApplyPartialExit commits both writes atomically.
 		default: // pending | partial — still working at the broker
 			working++
 		}
@@ -154,11 +149,33 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 			return true
 		}
 		if partialQty > 0 {
-			remaining := t.Quantity - partialQty
-			if uErr := store.UpdateTradeEntryPrice(ctx, t.ID, t.EntryPrice, remaining); uErr != nil {
-				logger.Warn("bracket exits: reduce tracked quantity after partial leg exit failed — retrying next sweep",
-					"trade_id", t.ID, "err", uErr)
-				return true // don't hand an over-sized quantity to the software exit
+			remaining := t.Quantity
+			for _, s := range states {
+				if !s.ok || s.res.FilledQty <= 0 {
+					continue
+				}
+				var uErr error
+				remaining, _, uErr = store.ApplyPartialExit(
+					ctx, t.ID, s.leg.ID, fillPriceOf(s), s.res.FilledQty,
+					execution.NormalizeOrderStatus(s.res.Status),
+				)
+				if uErr != nil {
+					logger.Warn("bracket exits: atomically apply partial leg exit failed — retrying next sweep",
+						"trade_id", t.ID, "order_id", s.leg.ID, "err", uErr)
+					return true // order remains sweepable; quantity is unchanged
+				}
+			}
+			for _, s := range states {
+				if s.ok && s.res.FilledQty == 0 {
+					if uErr := store.UpdateOrderFill(
+						ctx, s.leg.ID, s.res.FilledPrice, 0,
+						execution.NormalizeOrderStatus(s.res.Status),
+					); uErr != nil {
+						logger.Warn("bracket exits: terminalize zero-fill leg",
+							"order_id", s.leg.ID, "err", uErr)
+						return true
+					}
+				}
 			}
 			// Known limitation shared with the wider partial-fill lineage
 			// (#369): the partial slice's realized pnl is carried on the
@@ -167,6 +184,20 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 			logger.Warn("bracket exits: legs died after a partial exit — tracked quantity reduced",
 				"trade_id", t.ID, "ticker", t.Ticker,
 				"sold_qty", partialQty, "remaining_qty", remaining)
+		} else {
+			for _, s := range states {
+				if !s.ok {
+					continue
+				}
+				if uErr := store.UpdateOrderFill(
+					ctx, s.leg.ID, s.res.FilledPrice, 0,
+					execution.NormalizeOrderStatus(s.res.Status),
+				); uErr != nil {
+					logger.Warn("bracket exits: terminalize zero-fill leg",
+						"order_id", s.leg.ID, "err", uErr)
+					return true
+				}
+			}
 		}
 		// Position (or its remainder) is now UNPROTECTED — hand it back to
 		// app-managed monitoring, which resumes on this very sweep.
@@ -349,7 +380,8 @@ func (e *Engine) cancelClaimedExitLegs(
 	ctx context.Context,
 	trades []store.Trade,
 	ticker string,
-) (float64, bool, bool) {
+) (map[string]float64, float64, bool, bool) {
+	remainingByTrade := make(map[string]float64, len(trades))
 	var totalRemaining float64
 	for _, t := range trades {
 		if t.Ticker != ticker {
@@ -358,7 +390,7 @@ func (e *Engine) cancelClaimedExitLegs(
 		remaining := t.Quantity
 		legs, err := store.OpenExitLegsForTrade(ctx, t.ID)
 		if err != nil {
-			return 0, false, true
+			return nil, 0, false, true
 		}
 		for _, leg := range legs {
 			cancelErr := e.executor.CancelOrder(ctx, leg.BrokerOrderID)
@@ -370,33 +402,35 @@ func (e *Engine) cancelClaimedExitLegs(
 				logger.Warn("analyst exit: cannot confirm leg cancellation",
 					"broker_order_id", leg.BrokerOrderID,
 					"cancel_err", cancelErr, "status_err", statusErr)
-				return 0, false, true
+				return nil, 0, false, true
 			}
 			switch execution.NormalizeOrderStatus(res.Status) {
 			case "cancelled", "rejected":
 				if res.FilledQty > 0 {
-					if err := store.UpdateOrderFill(
-						ctx, leg.ID, res.FilledPrice, res.FilledQty,
+					var err error
+					remaining, _, err = store.ApplyPartialExit(
+						ctx, t.ID, leg.ID, res.FilledPrice, res.FilledQty,
 						execution.NormalizeOrderStatus(res.Status),
-					); err != nil {
-						return 0, false, false
+					)
+					if err != nil {
+						return nil, 0, false, false
 					}
-					remaining = math.Max(0, remaining-res.FilledQty)
+				} else if err := store.UpdateOrderFill(
+					ctx, leg.ID, res.FilledPrice, 0,
+					execution.NormalizeOrderStatus(res.Status),
+				); err != nil {
+					return nil, 0, false, false
 				}
 			case "filled":
 				// The exit reconciler owns this claimed trade now. Releasing
 				// it would permit a duplicate analyst/software sell.
-				return 0, false, false
+				return nil, 0, false, false
 			default:
-				return 0, false, true
+				return nil, 0, false, true
 			}
 		}
-		if remaining < t.Quantity {
-			if err := store.UpdateExitingTradeQuantity(ctx, t.ID, remaining); err != nil {
-				return 0, false, false
-			}
-		}
+		remainingByTrade[t.ID] = remaining
 		totalRemaining += remaining
 	}
-	return totalRemaining, totalRemaining > 0, true
+	return remainingByTrade, totalRemaining, totalRemaining > 0, true
 }
