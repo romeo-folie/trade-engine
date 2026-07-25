@@ -1243,10 +1243,7 @@ func (e *Engine) analysisSourceNode(result analysis.AnalyzeResult) string {
 	if e.cfg.Models.Consensus.Enabled && len(result.AnalystResults) > 1 {
 		return "consensus"
 	}
-	if len(e.cfg.Models.Roles.Analysts) > 0 {
-		return "analyst-" + e.cfg.Models.Roles.Analysts[0]
-	}
-	return "llm_analysis"
+	return e.cfg.Models.AnalystNodeID(0)
 }
 
 func min(a, b int) int {

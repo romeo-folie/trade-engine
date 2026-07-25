@@ -85,12 +85,8 @@ func (a *Analyzer) Analyze(ctx context.Context, req AnalysisRequest, impact dept
 func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact depth.ImpactScore) (AnalyzeResult, error) {
 	if !a.cfg.Consensus.Enabled || len(a.analysts) <= 1 {
 		if a.bus != nil {
-			selected := []string{"llm_analysis"}
-			if len(a.cfg.Roles.Analysts) > 0 {
-				selected[0] = "analyst-" + a.cfg.Roles.Analysts[0]
-			}
 			a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
-				Ticker: req.Ticker, Depth: 1, SelectedAnalysts: selected,
+				Ticker: req.Ticker, Depth: 1, SelectedAnalysts: []string{a.cfg.AnalystNodeID(0)},
 			})
 		}
 		resp, meta, err := a.analyzeSingle(ctx, req)
@@ -112,14 +108,10 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 			Response: resp, Meta: meta, Err: err, LatencyMs: meta.LatencyMs,
 		}
 		if a.bus != nil {
-			selected := []string{"llm_analysis"}
-			if len(a.cfg.Roles.Analysts) > 0 {
-				selected = []string{"analyst-" + a.cfg.Roles.Analysts[0]}
-			}
 			a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
 				Ticker:           req.Ticker,
 				Depth:            impact.Depth,
-				SelectedAnalysts: selected,
+				SelectedAnalysts: []string{a.cfg.AnalystNodeID(0)},
 			})
 		}
 		return AnalyzeResult{Response: resp, Meta: meta, AnalystResults: []AnalystResult{single}}, err
@@ -129,11 +121,7 @@ func (a *Analyzer) AnalyzeFull(ctx context.Context, req AnalysisRequest, impact 
 	if a.bus != nil {
 		selected := make([]string, len(activeAnalysts))
 		for i := range activeAnalysts {
-			if i < len(a.cfg.Roles.Analysts) {
-				selected[i] = "analyst-" + a.cfg.Roles.Analysts[i]
-			} else {
-				selected[i] = fmt.Sprintf("analyst-%d", i)
-			}
+			selected[i] = a.cfg.AnalystNodeID(i)
 		}
 		a.bus.Publish(events.AnalysisStarted, events.AnalysisStartedPayload{
 			Ticker:           req.Ticker,

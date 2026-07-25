@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/events"
 )
 
 // cfgAnalyst is a fully controllable fake: fixed response, optional error, and
@@ -25,6 +27,45 @@ func (c *cfgAnalyst) Analyze(_ context.Context, _ AnalysisRequest) (AnalysisResp
 func (c *cfgAnalyst) ProviderName() string { return c.name }
 func (c *cfgAnalyst) ModelName() string    { return "m" }
 func (c *cfgAnalyst) IsAvailable() bool    { return c.avail }
+
+func TestAnalyzeFullLegacyIDsMatchTopologyAtEveryDepth(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		depth int
+		want  []string
+	}{
+		{name: "adaptive depth one", depth: 1, want: []string{"llm_analysis"}},
+		{name: "ensemble", depth: 2, want: []string{"llm_analysis", "analyst-1"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			bus := events.New()
+			sub := bus.Subscribe(events.AnalysisStarted)
+			defer bus.Unsubscribe(sub)
+			an := &Analyzer{
+				analysts: []ModelProvider{
+					&cfgAnalyst{name: "one", resp: AnalysisResponse{Action: ActionBuy, Confidence: 0.8}, avail: true},
+					&cfgAnalyst{name: "two", resp: AnalysisResponse{Action: ActionBuy, Confidence: 0.8}, avail: true},
+				},
+				cfg: config.ModelsConfig{Consensus: config.ConsensusConfig{Enabled: true}},
+				bus: bus,
+			}
+
+			if _, err := an.AnalyzeFull(context.Background(), AnalysisRequest{Ticker: "X"}, depth.ImpactScore{Depth: tt.depth}); err != nil {
+				t.Fatalf("AnalyzeFull() error = %v", err)
+			}
+			ev := <-sub.C
+			got := ev.Payload.(events.AnalysisStartedPayload).SelectedAnalysts
+			if len(got) != len(tt.want) {
+				t.Fatalf("selected analysts = %v, want %v", got, tt.want)
+			}
+			for i := range tt.want {
+				if got[i] != tt.want[i] {
+					t.Fatalf("selected analysts = %v, want %v", got, tt.want)
+				}
+			}
+		})
+	}
+}
 
 // TestAnalyzeAnalysts_OneAvailableNoArbiter: the ORB scan must keep scoring with a
 // SINGLE reachable analyst and must never consult the arbiter.

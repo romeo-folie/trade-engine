@@ -3,7 +3,6 @@ package web
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 
@@ -124,19 +123,19 @@ func mapEventEdge(t events.Type) (source, target, eventType string) {
 
 	// ── System ───────────────────────────────────────────────────────────
 	case events.ErrorOccurred:
-		return "engine", "error_bus", "ErrorOccurred"
+		return "", "", "ErrorOccurred"
 	case events.TickStarted:
-		return "engine", "engine", "TickStarted"
+		return "", "", "TickStarted"
 
 	// ── ORB ──────────────────────────────────────────────────────────────
 	case events.ORBStateChanged:
-		return "orb_scheduler", "orb_session", "ORBStateChanged"
+		return "", "", "ORBStateChanged"
 	case events.ORBCandidatesReady:
-		return "orb_scanner", "orb_scheduler", "ORBCandidatesReady"
+		return "", "", "ORBCandidatesReady"
 	case events.ORBRangeLocked:
-		return "market_data", "orb_scheduler", "ORBRangeLocked"
+		return "", "", "ORBRangeLocked"
 	case events.ORBTradeUpdate:
-		return "orb_scheduler", "executor", "ORBTradeUpdate"
+		return "", "", "ORBTradeUpdate"
 
 	default:
 		return "", "", ""
@@ -280,16 +279,12 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 			roleAnalysts := cfg.Models.Roles.Analysts
 			configs := cfg.Models.AnalystConfigs()
 			for i, ac := range configs {
-				id := "llm_analysis"
 				var roleKey string
 				if i < len(roleAnalysts) {
 					roleKey = roleAnalysts[i]
-					id = "analyst-" + roleKey
-				} else if len(configs) > 1 {
-					id = fmt.Sprintf("analyst-%d", i)
 				}
 				analystNodes = append(analystNodes, NodeState{
-					ID: id, Label: ac.Model, Kind: "analyst", Stage: 3,
+					ID: cfg.Models.AnalystNodeID(i), Label: ac.Model, Kind: "analyst", Stage: 3,
 					Meta: map[string]any{"provider": ac.Provider, "model": ac.Model, "registry_key": roleKey},
 				})
 			}

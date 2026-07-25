@@ -610,6 +610,24 @@ func TestLegacyAnalystsFallback(t *testing.T) {
 	}
 }
 
+func TestAnalystNodeIDIsStableAcrossRegistryAndLegacyConfigs(t *testing.T) {
+	registry := ModelsConfig{Roles: ModelRoles{Analysts: []string{"cheap", "frontier"}}}
+	if got := registry.AnalystNodeID(0); got != "analyst-cheap" {
+		t.Fatalf("registry primary ID = %q, want analyst-cheap", got)
+	}
+	if got := registry.AnalystNodeID(1); got != "analyst-frontier" {
+		t.Fatalf("registry secondary ID = %q, want analyst-frontier", got)
+	}
+
+	legacy := ModelsConfig{}
+	if got := legacy.AnalystNodeID(0); got != "llm_analysis" {
+		t.Fatalf("legacy primary ID = %q, want llm_analysis", got)
+	}
+	if got := legacy.AnalystNodeID(1); got != "analyst-1" {
+		t.Fatalf("legacy secondary ID = %q, want analyst-1", got)
+	}
+}
+
 // ── ORB validation tests ──────────────────────────────────────────────────
 
 func TestValidateORBInvalidRangeMinutes(t *testing.T) {

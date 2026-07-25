@@ -495,6 +495,20 @@ func (m *ModelsConfig) AnalystConfigs() []ModelConfig {
 	return m.Analysts
 }
 
+// AnalystNodeID returns the stable runtime/topology ID for an analyst slot.
+// Registry roles provide semantic IDs. Legacy configurations retain
+// llm_analysis for the primary slot because single-model and adaptive depth-1
+// execution both publish against that ID.
+func (m *ModelsConfig) AnalystNodeID(index int) string {
+	if index >= 0 && index < len(m.Roles.Analysts) {
+		return "analyst-" + m.Roles.Analysts[index]
+	}
+	if index <= 0 {
+		return "llm_analysis"
+	}
+	return fmt.Sprintf("analyst-%d", index)
+}
+
 // ArbiterConfig returns the arbiter ModelConfig.
 // Uses registry roles when available; falls back to legacy Arbiter field.
 func (m *ModelsConfig) ArbiterConfig() ModelConfig {

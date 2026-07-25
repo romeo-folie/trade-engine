@@ -45,6 +45,27 @@ func TestPipelineTopologySingleModelCollapsesEnsemble(t *testing.T) {
 	assertEdge(t, topology.Edges, "risk_manager", "approvals", "conditional")
 }
 
+func TestPipelineTopologyLegacyPrimaryIDMatchesRuntime(t *testing.T) {
+	cfg := &config.Config{Models: config.ModelsConfig{
+		Analysts: []config.ModelConfig{
+			{Provider: "one", Model: "primary"},
+			{Provider: "two", Model: "secondary"},
+		},
+	}}
+
+	nodes, _ := pipelineTopology(cfg)
+	assertHasNode(t, nodes, "llm_analysis")
+	assertMissingNode(t, nodes, "analyst-0")
+
+	cfg.Models.Consensus.Enabled = true
+	nodes, topology := pipelineTopology(cfg)
+	assertHasNode(t, nodes, "llm_analysis")
+	assertHasNode(t, nodes, "analyst-1")
+	assertMissingNode(t, nodes, "analyst-0")
+	assertEdge(t, topology.Edges, "llm_analysis", "consensus", "primary")
+	assertEdge(t, topology.Edges, "llm_analysis", "risk_manager", "bypass")
+}
+
 func TestPipelineTopologyEnsembleKeepsConditionalArbiter(t *testing.T) {
 	cfg := topologyTestConfig()
 	cfg.Models.Consensus.Enabled = true
@@ -237,6 +258,23 @@ func TestConfiguredPipelineEventsOnlyReferenceSnapshotNodes(t *testing.T) {
 		}
 		if !nodeIDs[msgs[0].Source] || !nodeIDs[msgs[0].Target] {
 			t.Fatalf("%s route %s -> %s references a node absent from snapshot",
+				eventType, msgs[0].Source, msgs[0].Target)
+		}
+	}
+}
+
+func TestSystemAndORBEventsRemainInformational(t *testing.T) {
+	cfg := topologyTestConfig()
+	for _, eventType := range []events.Type{
+		events.ErrorOccurred, events.TickStarted, events.ORBStateChanged,
+		events.ORBCandidatesReady, events.ORBRangeLocked, events.ORBTradeUpdate,
+	} {
+		msgs := toWebEvents(events.Event{Type: eventType, Timestamp: time.Now()}, cfg)
+		if len(msgs) != 1 {
+			t.Fatalf("%s message count = %d, want 1", eventType, len(msgs))
+		}
+		if msgs[0].Source != "" || msgs[0].Target != "" {
+			t.Fatalf("%s route = %q -> %q, want informational event without graph endpoints",
 				eventType, msgs[0].Source, msgs[0].Target)
 		}
 	}
