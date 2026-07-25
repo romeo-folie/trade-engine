@@ -11,13 +11,24 @@ import (
 
 type pullbackEvidenceMarket struct {
 	quote     *data.Quote
+	quotes    []*data.Quote
+	quoteCall int
 	quoteErr  error
 	trades    []data.MarketTrade
 	tradesErr error
 	fetchFrom time.Time
+	fetches   [][2]time.Time
 }
 
 func (m *pullbackEvidenceMarket) FetchQuote(context.Context, string) (*data.Quote, error) {
+	if len(m.quotes) > 0 {
+		i := m.quoteCall
+		if i >= len(m.quotes) {
+			i = len(m.quotes) - 1
+		}
+		m.quoteCall++
+		return m.quotes[i], m.quoteErr
+	}
 	return m.quote, m.quoteErr
 }
 
@@ -35,9 +46,10 @@ func (*pullbackEvidenceMarket) FetchHistory(
 }
 
 func (m *pullbackEvidenceMarket) FetchTrades(
-	_ context.Context, _ string, from, _ time.Time,
+	_ context.Context, _ string, from, to time.Time,
 ) ([]data.MarketTrade, error) {
 	m.fetchFrom = from
+	m.fetches = append(m.fetches, [2]time.Time{from, to})
 	return m.trades, m.tradesErr
 }
 
@@ -49,7 +61,7 @@ func freshEvidenceQuote(now time.Time, mark float64) *data.Quote {
 }
 
 func TestPullbackExecutionEvidenceIgnoresSignalMinuteFlush(t *testing.T) {
-	now := time.Date(2026, 7, 25, 14, 0, 40, 0, time.UTC)
+	now := time.Now().UTC()
 	since := now.Add(-10 * time.Second)
 	market := &pullbackEvidenceMarket{
 		quote: freshEvidenceQuote(now, 101),
@@ -74,8 +86,8 @@ func TestPullbackExecutionEvidenceIgnoresSignalMinuteFlush(t *testing.T) {
 }
 
 func TestPullbackExecutionEvidenceTracksOnlyPostSignalTrades(t *testing.T) {
-	since := time.Date(2026, 7, 25, 14, 0, 30, 0, time.UTC)
-	now := time.Date(2026, 7, 25, 14, 2, 30, 0, time.UTC)
+	now := time.Now().UTC()
+	since := now.Add(-2 * time.Minute)
 	market := &pullbackEvidenceMarket{
 		quote: freshEvidenceQuote(now, 103),
 		trades: []data.MarketTrade{
@@ -97,6 +109,41 @@ func TestPullbackExecutionEvidenceTracksOnlyPostSignalTrades(t *testing.T) {
 	}
 	if !market.fetchFrom.Equal(since) {
 		t.Fatalf("path started at %s, want %s", market.fetchFrom, since)
+	}
+}
+
+func TestPullbackExecutionEvidenceExtendsThroughRefreshedQuote(t *testing.T) {
+	now := time.Now().UTC()
+	since := now.Add(-2 * time.Minute)
+	firstBoundary := now.Add(-5 * time.Second)
+	secondBoundary := now.Add(-time.Second)
+	market := &pullbackEvidenceMarket{
+		quotes: []*data.Quote{
+			{Bid: 102.98, Ask: 103, Last: 102.99, Timestamp: firstBoundary},
+			{Bid: 101.98, Ask: 102, Last: 101.99, Timestamp: secondBoundary},
+		},
+		trades: []data.MarketTrade{
+			{Timestamp: firstBoundary.Add(time.Second), Price: 97.5},
+		},
+	}
+	engine := &Engine{marketData: market}
+
+	got, err := engine.pullbackExecutionEvidence(
+		context.Background(), "TEST", since, now,
+	)
+	if err != nil {
+		t.Fatalf("pullbackExecutionEvidence: %v", err)
+	}
+	if got.Mark != 102 || got.MinimumTraded != 97.5 {
+		t.Fatalf("refreshed evidence = %+v, want mark 102/min 97.5", got)
+	}
+	if len(market.fetches) != 2 {
+		t.Fatalf("trade path fetches = %d, want initial plus extension", len(market.fetches))
+	}
+	extension := market.fetches[1]
+	if !extension[0].Equal(firstBoundary) || !extension[1].Equal(secondBoundary) {
+		t.Fatalf("extension = [%s,%s], want [%s,%s]",
+			extension[0], extension[1], firstBoundary, secondBoundary)
 	}
 }
 

@@ -72,6 +72,8 @@ window unchanged so existing prompt-cache entries remain reusable. Eligible
 BUYs use the signal day's low as their initial stop. At the next-session open,
 replay revalidates stop width, confidence tiers, and R:R geometry, then evaluates
 the remainder of the entry candle with conservative stop-before-target ordering.
+The structural low-of-day stop takes precedence over `--stop-width-pct` when
+the pullback gate is enabled.
 A gap through the low is recorded as `gap_invalidation`; widened stops, degraded
 confidence tiers, and degraded R:R are recorded as `fill_stop_width`,
 `fill_confidence_tier`, and `fill_risk_reward`.

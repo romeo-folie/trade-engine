@@ -3208,6 +3208,25 @@ type pullbackExecutionEvidence struct {
 	MinimumTraded float64
 }
 
+func validatePullbackExecutionQuote(
+	quote *data.Quote, since, now time.Time,
+) error {
+	if quote == nil || quote.Bid <= 0 || quote.Ask <= 0 || quote.Last <= 0 {
+		return fmt.Errorf("current two-sided execution quote unavailable")
+	}
+	quoteAge := now.Sub(quote.Timestamp)
+	if quote.Timestamp.IsZero() || quoteAge > pullbackQuoteMaxAge ||
+		quoteAge < -pullbackQuoteFutureTolerance {
+		return fmt.Errorf(
+			"execution quote timestamp is not fresh (age %s)", quoteAge,
+		)
+	}
+	if quote.Timestamp.Before(since) {
+		return fmt.Errorf("latest execution quote predates signal creation")
+	}
+	return nil
+}
+
 // pullbackExecutionEvidence requires a current two-sided quote and exact trade
 // prints from the signal timestamp. Minute OHLC cannot distinguish a qualifying
 // pre-signal flush from a genuine post-signal stop breach inside the same
@@ -3227,20 +3246,8 @@ func (e *Engine) pullbackExecutionEvidence(
 	if err != nil {
 		return pullbackExecutionEvidence{}, fmt.Errorf("fetch execution quote: %w", err)
 	}
-	if quote == nil || quote.Bid <= 0 || quote.Ask <= 0 || quote.Last <= 0 {
-		return pullbackExecutionEvidence{}, fmt.Errorf("current two-sided execution quote unavailable")
-	}
-	quoteAge := now.Sub(quote.Timestamp)
-	if quote.Timestamp.IsZero() || quoteAge > pullbackQuoteMaxAge ||
-		quoteAge < -pullbackQuoteFutureTolerance {
-		return pullbackExecutionEvidence{}, fmt.Errorf(
-			"execution quote timestamp is not fresh (age %s)", quoteAge,
-		)
-	}
-	if quote.Timestamp.Before(since) {
-		return pullbackExecutionEvidence{}, fmt.Errorf(
-			"latest execution quote predates signal creation",
-		)
+	if err := validatePullbackExecutionQuote(quote, since, now); err != nil {
+		return pullbackExecutionEvidence{}, err
 	}
 
 	evidence := pullbackExecutionEvidence{
@@ -3255,21 +3262,55 @@ func (e *Engine) pullbackExecutionEvidence(
 			"market data provider cannot verify exact post-signal trades",
 		)
 	}
-	// Use the quote timestamp as the coherent validation boundary: every trade
-	// print through the mark being risk-checked is included, even when the
-	// provider timestamp is a few milliseconds ahead of the host clock.
-	trades, err := tradeProvider.FetchTrades(ctx, ticker, since, quote.Timestamp)
-	if err != nil {
+	scanTrades := func(from, to time.Time) error {
+		trades, err := tradeProvider.FetchTrades(ctx, ticker, from, to)
+		if err != nil {
+			return err
+		}
+		for _, trade := range trades {
+			if trade.Timestamp.Before(from) || trade.Timestamp.After(to) || trade.Price <= 0 {
+				continue
+			}
+			if trade.Price < evidence.MinimumTraded {
+				evidence.MinimumTraded = trade.Price
+			}
+		}
+		return nil
+	}
+
+	// Scan through the first quote, then refresh the quote and extend the exact
+	// trade-print scan through that newer boundary. This closes the otherwise
+	// unobserved interval while the first (possibly several-seconds-old) quote
+	// and paginated path were being fetched.
+	if err := scanTrades(since, quote.Timestamp); err != nil {
 		return pullbackExecutionEvidence{}, fmt.Errorf("fetch exact execution path: %w", err)
 	}
-	for _, trade := range trades {
-		if trade.Timestamp.Before(since) || trade.Timestamp.After(quote.Timestamp) || trade.Price <= 0 {
-			continue
-		}
-		if trade.Price < evidence.MinimumTraded {
-			evidence.MinimumTraded = trade.Price
+	refreshed, err := e.marketData.FetchQuote(ctx, ticker)
+	if err != nil {
+		return pullbackExecutionEvidence{}, fmt.Errorf("refresh execution quote: %w", err)
+	}
+	// The exact path can require several paginated requests. Judge the refreshed
+	// quote against the clock after that work, rather than incorrectly rejecting
+	// a legitimate timestamp that advanced beyond the initial `now` snapshot.
+	if err := validatePullbackExecutionQuote(refreshed, since, time.Now()); err != nil {
+		return pullbackExecutionEvidence{}, err
+	}
+	if refreshed.Timestamp.Before(quote.Timestamp) {
+		return pullbackExecutionEvidence{}, fmt.Errorf(
+			"refreshed execution quote moved backwards",
+		)
+	}
+	if refreshed.Ask < evidence.MinimumTraded {
+		evidence.MinimumTraded = refreshed.Ask
+	}
+	if refreshed.Timestamp.After(quote.Timestamp) {
+		if err := scanTrades(quote.Timestamp, refreshed.Timestamp); err != nil {
+			return pullbackExecutionEvidence{}, fmt.Errorf(
+				"extend exact execution path: %w", err,
+			)
 		}
 	}
+	evidence.Mark = refreshed.Ask
 	return evidence, nil
 }
 

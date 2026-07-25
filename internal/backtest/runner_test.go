@@ -203,6 +203,33 @@ func TestPullbackFillBlock(t *testing.T) {
 	}
 }
 
+func TestPullbackSignalBlockUsesConfidenceTiers(t *testing.T) {
+	riskCfg := config.RiskConfig{
+		ConfidenceThreshold: 0.65,
+		MinRiskReward:       1.2,
+		ConfidenceTiers: []config.ConfidenceTier{
+			{RRMin: 2, ConfMin: 0.55},
+			{RRMin: 1.4, ConfMin: 0.58},
+		},
+	}
+	if got := pullbackSignalBlock(100, 98, 104, 0.60, riskCfg); got != "" {
+		t.Fatalf("high-R:R tier-eligible signal blocked with %q", got)
+	}
+	if got := pullbackSignalBlock(100, 98, 103, 0.56, riskCfg); got != "signal_confidence_tier" {
+		t.Fatalf("stricter tier block = %q, want signal_confidence_tier", got)
+	}
+}
+
+func TestPullbackStopTakesPrecedenceOverReplayStopOverride(t *testing.T) {
+	policy := resolveExitPolicy(RunOptions{StopWidthPct: 10})
+	if got := initialEntryStop(100, 98, policy.stopWidth, true); got != 98 {
+		t.Fatalf("pullback stop = %.2f, want qualified low-of-day 98", got)
+	}
+	if got := initialEntryStop(100, 98, policy.stopWidth, false); got != 90 {
+		t.Fatalf("generic overridden stop = %.2f, want 90", got)
+	}
+}
+
 func TestEntryCandleExitUsesConservativeStopFirst(t *testing.T) {
 	pos := newPos(98, 105)
 	entryCandle := data.Candle{

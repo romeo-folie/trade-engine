@@ -45,7 +45,7 @@ type RunOptions struct {
 	TrailATRMult   float64 // ATR multiple below the high-water mark (default 1.5, matches live trailing_stop)
 	TrailEMAPeriod int     // EMA period for the close-below-EMA trail (default 9, Martin's rule)
 	ExitConfMin    float64 // require SELL confidence ≥ this to exit on signal (0 = ungated, original behavior)
-	StopWidthPct   float64 // override initial stop to entry×(1-pct/100) (0 = use the model's stop_loss)
+	StopWidthPct   float64 // override non-pullback stop to entry×(1-pct/100) (0 = use model stop)
 
 	// PullbackStrength applies the complete Phase 2 deterministic entry setup
 	// after the cached analyst BUY. The analyst request is left unchanged, so a
@@ -309,10 +309,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 				cash -= cost
 				entryPx := candle.Open
 				// Initial protective stop: model's stop, or a fixed width override.
-				stop := order.stopLoss
-				if policy.stopWidth > 0 {
-					stop = entryPx * (1 - policy.stopWidth)
-				}
+				// Pullback entries always retain the qualified signal-session low:
+				// a generic replay override must not replace the strategy's
+				// structural invalidation point.
+				stop := initialEntryStop(
+					entryPx, order.stopLoss, policy.stopWidth,
+					order.requireValidStop,
+				)
 				risk := 0.0
 				if stop > 0 && stop < entryPx {
 					risk = entryPx - stop
@@ -364,7 +367,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 			if openPosition != nil {
 				continue // already long, skip duplicate buy
 			}
-			if resp.Confidence < r.cfg.Risk.ConfidenceThreshold {
+			if !opts.PullbackStrength && resp.Confidence < r.cfg.Risk.ConfidenceThreshold {
 				continue
 			}
 			stopLoss := resp.StopLoss
@@ -379,6 +382,13 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions, progress ProgressFunc
 				})
 				if !setup.Eligible {
 					entryBlocks[setup.FailedCheck]++
+					continue
+				}
+				if block := pullbackSignalBlock(
+					candle.Close, setup.StopLoss, resp.TakeProfit,
+					resp.Confidence, r.cfg.Risk,
+				); block != "" {
+					entryBlocks[block]++
 					continue
 				}
 				entryQualified++
@@ -525,6 +535,35 @@ type pendingOrder struct {
 	maxStopWidthPct  float64
 	confidence       float64
 	riskCfg          config.RiskConfig
+}
+
+func initialEntryStop(
+	entryPrice, signalStop, overrideWidth float64, preserveSignalStop bool,
+) float64 {
+	if overrideWidth > 0 && !preserveSignalStop {
+		return entryPrice * (1 - overrideWidth)
+	}
+	return signalStop
+}
+
+func pullbackSignalBlock(
+	mark, stopLoss, takeProfit, confidence float64, riskCfg config.RiskConfig,
+) string {
+	results, passed := risk.CheckEntryQuality(risk.CheckInput{
+		Cfg:         riskCfg,
+		Action:      "BUY",
+		Confidence:  confidence,
+		StopLoss:    stopLoss,
+		TakeProfit:  takeProfit,
+		SignalPrice: mark,
+	})
+	if passed {
+		return ""
+	}
+	if len(results) > 0 && results[len(results)-1].Name == "confidence_threshold" {
+		return "signal_confidence_tier"
+	}
+	return "signal_risk_reward"
 }
 
 func pullbackFillBlock(

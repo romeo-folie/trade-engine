@@ -62,7 +62,7 @@ func init() {
 	runBTCmd.Flags().Float64Var(&btTrailATRMult, "trail-atr-mult", 1.5, "ATR multiple for the trailing stop (matches live trailing_stop)")
 	runBTCmd.Flags().IntVar(&btTrailEMAPeriod, "trail-ema-period", 9, "EMA period for the close-below-EMA trailing rule")
 	runBTCmd.Flags().Float64Var(&btExitConfMin, "exit-conf-min", 0, "Require SELL confidence ≥ this to exit on signal (0 = ungated)")
-	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override initial stop to entry×(1-pct/100) (0 = use model stop)")
+	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override non-pullback stop to entry×(1-pct/100) (ignored with --pullback-strength)")
 	runBTCmd.Flags().BoolVar(&btPullbackStrength, "pullback-strength", false, "Require the complete Phase 2 momentum/consolidation/AVWAP flush-reclaim entry and use its low-of-day stop")
 	_ = runBTCmd.MarkFlagRequired("ticker")
 	_ = runBTCmd.MarkFlagRequired("from")
@@ -354,11 +354,11 @@ func exitPolicyDesc(o backtest.RunOptions) string {
 	if o.ExitConfMin > 0 {
 		s += fmt.Sprintf(" · exit-conf>=%.2f", o.ExitConfMin)
 	}
-	if o.StopWidthPct > 0 {
+	if o.StopWidthPct > 0 && !o.PullbackStrength {
 		s += fmt.Sprintf(" · stop=%.1f%%", o.StopWidthPct)
 	}
 	if o.PullbackStrength {
-		s += " · pullback-strength"
+		s += " · pullback-strength · stop=low-of-day"
 	}
 	return s
 }
