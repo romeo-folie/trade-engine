@@ -7,17 +7,21 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 type pullbackEvidenceMarket struct {
-	quote     *data.Quote
-	quotes    []*data.Quote
-	quoteCall int
-	quoteErr  error
-	trades    []data.MarketTrade
-	tradesErr error
-	fetchFrom time.Time
-	fetches   [][2]time.Time
+	quote      *data.Quote
+	quotes     []*data.Quote
+	quoteCall  int
+	quoteErr   error
+	trades     []data.MarketTrade
+	tradesErr  error
+	fetchFrom  time.Time
+	fetches    [][2]time.Time
+	history    []data.Candle
+	historyErr error
 }
 
 func (m *pullbackEvidenceMarket) FetchQuote(context.Context, string) (*data.Quote, error) {
@@ -39,10 +43,10 @@ func (m *pullbackEvidenceMarket) FetchCandles(
 	return nil, nil
 }
 
-func (*pullbackEvidenceMarket) FetchHistory(
+func (m *pullbackEvidenceMarket) FetchHistory(
 	context.Context, string, data.Timeframe, int,
 ) ([]data.Candle, error) {
-	return nil, nil
+	return m.history, m.historyErr
 }
 
 func (m *pullbackEvidenceMarket) FetchTrades(
@@ -170,5 +174,53 @@ func TestPullbackExecutionEvidencePropagatesQuoteFailure(t *testing.T) {
 		context.Background(), "TEST", now.Add(-time.Minute), now,
 	); err == nil {
 		t.Fatal("quote failure accepted")
+	}
+}
+
+func TestPullbackDailyRefreshReturnsObservationBoundary(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	candleTS := time.Now().UTC().Truncate(24 * time.Hour)
+	market := &pullbackEvidenceMarket{
+		history: []data.Candle{{
+			Ticker: "TEST_PB_OBS", Timeframe: data.Timeframe1Day,
+			Timestamp: candleTS, Open: 100, High: 103, Low: 98,
+			Close: 102, Volume: 1000,
+		}},
+	}
+	engine := &Engine{marketData: market, bus: events.New()}
+
+	before := time.Now()
+	observedAt, err := engine.fetchAndStoreCandlesObserved(
+		ctx, "TEST_PB_OBS", data.Timeframe1Day,
+	)
+	after := time.Now()
+	if err != nil {
+		t.Fatalf("refresh daily evidence: %v", err)
+	}
+	if observedAt.Before(before) || observedAt.After(after) {
+		t.Fatalf("observation boundary %s outside refresh interval [%s,%s]",
+			observedAt, before, after)
+	}
+	stored, err := store.GetCandles(
+		ctx, "TEST_PB_OBS", data.Timeframe1Day,
+		candleTS.Add(-time.Hour), candleTS.Add(time.Hour),
+	)
+	if err != nil || len(stored) != 1 || stored[0].Low != 98 {
+		t.Fatalf("refreshed daily snapshot = %+v, err=%v", stored, err)
+	}
+}
+
+func TestPullbackDailyRefreshRejectsEmptySnapshot(t *testing.T) {
+	engine := &Engine{
+		marketData: &pullbackEvidenceMarket{},
+		bus:        events.New(),
+	}
+	if _, err := engine.fetchAndStoreCandlesObserved(
+		context.Background(), "TEST", data.Timeframe1Day,
+	); err == nil {
+		t.Fatal("empty daily snapshot accepted")
 	}
 }

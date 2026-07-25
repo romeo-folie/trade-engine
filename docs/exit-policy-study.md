@@ -110,8 +110,10 @@ to split-adjusted Alpaca history; this prevents old and new adjustment scales
 from coexisting in a two-year indicator series.
 
 Delayed live/paper entries require a fresh two-sided quote and exact Alpaca
-trade prints from the signal timestamp; any intervening print through the
-signal-day low invalidates the setup. The full risk suite is re-run at that
+trade prints from the qualification-time daily evidence snapshot; any later
+print through the signal-day low invalidates the setup. The daily partial bar
+is refreshed after analysis and its fresh close drives reclaim, stop width,
+persistence, and the initial risk pass. The full risk suite is re-run at the
 fresh execution mark. Replay applies the same stop-width, confidence-tier, and
 R:R revalidation at the next open and evaluates stop/target touches on the
 entry candle, using the stop first when both levels occur in one OHLC bar.

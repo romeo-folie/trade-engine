@@ -25,7 +25,10 @@ type Signal struct {
 	StalePriceMovePct float64
 	// PullbackStrength marks signals whose stop and eligibility came from the
 	// complete pullback setup. It survives manual approval/restarts so execution
-	// can revalidate the low-of-day stop against a fresh mark.
+	// can revalidate the low-of-day stop against a fresh mark. For these signals,
+	// CreatedAt is the observation boundary captured immediately after the
+	// qualification-time daily snapshot returned; exact trade scanning starts
+	// there, before gate evaluation and persistence.
 	PullbackStrength bool
 	// Deferred marks a signal the engine held back for first-tick
 	// confirmation (entry gates, migration 043). Only deferred signals are

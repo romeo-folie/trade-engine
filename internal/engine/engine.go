@@ -1443,22 +1443,40 @@ func sentimentLabel(score float64) string {
 // fetchAndStoreCandles fetches recent candles from the market data provider and
 // upserts them into the database. Uses FetchHistory for the live loop (recent bars only).
 func (e *Engine) fetchAndStoreCandles(ctx context.Context, ticker string, tf data.Timeframe) {
+	_, _ = e.fetchAndStoreCandlesObserved(ctx, ticker, tf)
+}
+
+// fetchAndStoreCandlesObserved is the checked variant used when callers need
+// the exact boundary at which the returned provider snapshot became observable.
+func (e *Engine) fetchAndStoreCandlesObserved(
+	ctx context.Context, ticker string, tf data.Timeframe,
+) (time.Time, error) {
 	if e.marketData == nil {
-		return
+		return time.Time{}, fmt.Errorf("market data unavailable")
 	}
 	candles, err := e.marketData.FetchHistory(ctx, ticker, tf, historyCandles)
 	if err != nil {
 		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
-		return
+		return time.Time{}, err
 	}
+	if len(candles) == 0 {
+		err := fmt.Errorf("provider returned no candles")
+		logger.Warn("fetch candles", "ticker", ticker, "tf", string(tf), "err", err.Error())
+		return time.Time{}, err
+	}
+	// Exact post-setup invalidation starts when this provider snapshot became
+	// observable. Capture the boundary immediately after FetchHistory returns,
+	// before DB persistence or any subsequent qualification work.
+	observedAt := time.Now()
 	if err := store.UpsertCandles(ctx, candles); err != nil {
 		logger.Warn("upsert candles", "ticker", ticker, "err", err.Error())
-		return
+		return time.Time{}, err
 	}
 	logger.Info("candles upserted", "ticker", ticker, "tf", string(tf), "count", len(candles))
 	e.bus.Publish(events.DataFetched, events.DataFetchedPayload{
 		Ticker: ticker, Timeframe: string(tf), Count: len(candles),
 	})
+	return observedAt, nil
 }
 
 // fetchAndStoreNews fetches recent news for a ticker (respecting the cadence limit)
@@ -1694,9 +1712,24 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		var entryGateReason string
 		entryGateFailedCheck := "entry_gates"
 		entryDailyCandles := candles
+		var pullbackObservedAt time.Time
 		needsDailyEvidence := eg.PullbackStrengthEnabled ||
 			eg.TrendAlignmentEnabled
-		if needsDailyEvidence && data.Timeframe(timeframe) != data.Timeframe1Day {
+		if eg.PullbackStrengthEnabled {
+			// The analyst may take long enough for the session low to change.
+			// Refresh the partial daily bar at qualification time, then scan
+			// every exact trade print from the returned snapshot boundary.
+			var err error
+			pullbackObservedAt, err = e.fetchAndStoreCandlesObserved(
+				ctx, ticker, data.Timeframe1Day,
+			)
+			if err != nil {
+				entryGateReason = "pullback strength: unable to refresh daily setup evidence"
+				entryGateFailedCheck = "pullback_history"
+			}
+		}
+		if needsDailyEvidence &&
+			(data.Timeframe(timeframe) != data.Timeframe1Day || eg.PullbackStrengthEnabled) {
 			var err error
 			entryDailyCandles, err = store.GetCandles(
 				ctx, ticker, data.Timeframe1Day,
@@ -1708,7 +1741,14 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 				entryDailyCandles = nil
 			}
 		}
-		if eg.PullbackStrengthEnabled {
+		if eg.PullbackStrengthEnabled && entryGateReason == "" {
+			// Use the refreshed daily snapshot's close for reclaim, stop width,
+			// signal persistence, and the initial risk pass. The pre-analysis
+			// primary-timeframe close may be minutes old by this point.
+			if len(entryDailyCandles) > 0 {
+				signalPrice = entryDailyCandles[len(entryDailyCandles)-1].Close
+				sig.SignalPrice = signalPrice
+			}
 			setup := pullback.Evaluate(entryDailyCandles, signalPrice, pullback.Config{
 				MinMomentumReturnPct:  eg.PullbackMinMomentumReturnPct,
 				ConsolidationSessions: eg.PullbackConsolidationSessions,
@@ -1724,6 +1764,13 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 				// sizing, persistence, and bracket submission.
 				sig.StopLoss = setup.StopLoss
 				sig.PullbackStrength = true
+				// CreatedAt is the durable exact-print boundary for pullback
+				// signals. It begins at the refreshed evidence snapshot rather
+				// than after qualification, risk checks, and persistence.
+				sig.CreatedAt = pullbackObservedAt
+				sig.ExpiresAt = pullbackObservedAt.Add(
+					time.Duration(expiryMin) * time.Minute,
+				)
 				logger.Info("pullback strength entry confirmed",
 					"ticker", ticker,
 					"return_1m_pct", fmt.Sprintf("%.2f", setup.Return1M),
@@ -3222,16 +3269,16 @@ func validatePullbackExecutionQuote(
 		)
 	}
 	if quote.Timestamp.Before(since) {
-		return fmt.Errorf("latest execution quote predates signal creation")
+		return fmt.Errorf("latest execution quote predates pullback evidence snapshot")
 	}
 	return nil
 }
 
 // pullbackExecutionEvidence requires a current two-sided quote and exact trade
-// prints from the signal timestamp. Minute OHLC cannot distinguish a qualifying
-// pre-signal flush from a genuine post-signal stop breach inside the same
-// bucket, so providers without the high-resolution trade-path capability fail
-// closed for pullback execution.
+// prints from the qualification-time daily evidence snapshot. Minute OHLC
+// cannot distinguish a qualifying pre-snapshot flush from a genuine later stop
+// breach inside the same bucket, so providers without the high-resolution
+// trade-path capability fail closed for pullback execution.
 func (e *Engine) pullbackExecutionEvidence(
 	ctx context.Context, ticker string, since, now time.Time,
 ) (pullbackExecutionEvidence, error) {
@@ -3239,7 +3286,9 @@ func (e *Engine) pullbackExecutionEvidence(
 		return pullbackExecutionEvidence{}, fmt.Errorf("market data unavailable")
 	}
 	if since.IsZero() || now.Before(since) {
-		return pullbackExecutionEvidence{}, fmt.Errorf("invalid signal creation time")
+		return pullbackExecutionEvidence{}, fmt.Errorf(
+			"invalid pullback evidence observation time",
+		)
 	}
 
 	quote, err := e.marketData.FetchQuote(ctx, ticker)
