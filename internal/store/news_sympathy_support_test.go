@@ -172,7 +172,7 @@ func TestAddWatchlistItemUnlessActivePreservesConcurrentPromotion(t *testing.T) 
 		"00000000-0000-0000-0000-000000000492",
 	)
 
-	promotionExpiry := time.Now().Add(72 * time.Hour)
+	promotionExpiry := time.Now().UTC().Truncate(time.Microsecond).Add(72 * time.Hour)
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock",
 		Strategies: []string{"momentum", "weekly_leader"},
@@ -184,7 +184,7 @@ func TestAddWatchlistItemUnlessActivePreservesConcurrentPromotion(t *testing.T) 
 		t.Fatalf("seed concurrent promotion: %v", err)
 	}
 
-	fallbackExpiry := time.Now().Add(24 * time.Hour)
+	fallbackExpiry := time.Now().UTC().Truncate(time.Microsecond).Add(24 * time.Hour)
 	err := store.AddWatchlistItemUnlessActive(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock", Strategies: []string{"breakout"},
 		Timeframes: []string{"1H"}, MinConfidence: 0.72, Source: "scanner",
@@ -229,7 +229,7 @@ func TestAddWatchlistItemUnlessActiveReplacesExpiredItem(t *testing.T) {
 		"00000000-0000-0000-0000-000000000494",
 	)
 
-	expiredAt := time.Now().Add(-time.Hour)
+	expiredAt := time.Now().UTC().Truncate(time.Microsecond).Add(-time.Hour)
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock", Strategies: []string{"weekly_leader"},
 		Timeframes: []string{"4H"}, MinConfidence: 0.91, Source: "scanner",
@@ -239,7 +239,7 @@ func TestAddWatchlistItemUnlessActiveReplacesExpiredItem(t *testing.T) {
 		t.Fatalf("seed expired item: %v", err)
 	}
 
-	fallbackExpiry := time.Now().Add(24 * time.Hour)
+	fallbackExpiry := time.Now().UTC().Truncate(time.Microsecond).Add(24 * time.Hour)
 	if err := store.AddWatchlistItemUnlessActive(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock", Strategies: []string{"breakout"},
 		Timeframes: []string{"1H"}, MinConfidence: 0.72, Source: "scanner",
