@@ -81,9 +81,11 @@ CREATE TABLE weekly_leader_qualifications (
     qualified_since DATE,
     promotion_status TEXT NOT NULL DEFAULT 'not_requested'
         CHECK (promotion_status IN (
-            'not_requested', 'pending', 'promoted', 'active_watchlist',
-            'cap_suppressed', 'failed', 'superseded'
+            'not_requested', 'pending', 'processing', 'promoted', 'rejected',
+            'active_watchlist', 'cap_suppressed', 'failed', 'superseded'
         )),
+    promotion_claim_token TEXT,
+    promotion_claimed_at TIMESTAMPTZ,
     scanner_run_id UUID REFERENCES scanner_runs(id),
     promoted_at TIMESTAMPTZ,
     promotion_reason TEXT,

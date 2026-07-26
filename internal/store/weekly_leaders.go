@@ -3,12 +3,15 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+var ErrWeeklyLeaderPromotionClaimLost = errors.New("weekly leader promotion claim is no longer current")
 
 type WeeklyLeaderRun struct {
 	ID                     string
@@ -132,6 +135,7 @@ type WeeklyLeaderCandidate struct {
 	Return60             float64
 	Return126            float64
 	MedianDollarVolume20 float64
+	PromotionClaimToken  string
 }
 
 // ClaimWeeklyLeaderRun atomically creates or reclaims a failed/expired run.
@@ -155,9 +159,16 @@ func ClaimWeeklyLeaderRun(
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		ON CONFLICT (session_date, universe_version_id, config_hash) DO UPDATE SET
 			status='running',
+			as_of=EXCLUDED.as_of,
+			decision_at=EXCLUDED.decision_at,
 			started_at=EXCLUDED.started_at,
 			lease_until=EXCLUDED.lease_until,
 			attempt_count=weekly_leader_runs.attempt_count+1,
+			config_snapshot=EXCLUDED.config_snapshot,
+			feature_version=EXCLUDED.feature_version,
+			benchmark=EXCLUDED.benchmark,
+			benchmark_bar_set_hash=NULL,
+			history_provider=EXCLUDED.history_provider,
 			completed_at=NULL,
 			error=NULL
 		WHERE weekly_leader_runs.status='failed'
@@ -269,9 +280,10 @@ func CompleteWeeklyLeaderRun(
 	if _, err := tx.Exec(ctx, `
 		UPDATE weekly_leader_qualifications q
 		SET promotion_status='superseded',
-		    promotion_reason='newer completed leader run'
+		    promotion_reason='newer completed leader run',
+		    promotion_claim_token=NULL, promotion_claimed_at=NULL
 		FROM weekly_leader_runs r
-		WHERE q.run_id=r.id AND q.promotion_status='pending'
+		WHERE q.run_id=r.id AND q.promotion_status IN ('pending','processing')
 		  AND r.status='completed' AND r.session_date < $1`,
 		run.SessionDate,
 	); err != nil {
@@ -364,31 +376,54 @@ func CompleteWeeklyLeaderRun(
 	return tx.Commit(ctx)
 }
 
-func ListPendingWeeklyLeaderCandidatesAsOf(
-	ctx context.Context, asOf time.Time,
+// ClaimWeeklyLeaderCandidatesAsOf atomically moves every pending candidate in
+// the latest visible run to a token-fenced processing state. Concurrent scanner
+// processes therefore cannot score the same leader.
+func ClaimWeeklyLeaderCandidatesAsOf(
+	ctx context.Context,
+	asOf, claimedAt time.Time,
+	claimToken string,
 ) ([]WeeklyLeaderCandidate, error) {
+	if strings.TrimSpace(claimToken) == "" {
+		return nil, fmt.Errorf("weekly leader promotion claim token is required")
+	}
 	rows, err := GetDB().Query(ctx, `
+		WITH latest AS (
+			SELECT id FROM weekly_leader_runs
+			WHERE status='completed'
+			  AND decision_at <= $1::timestamptz
+			  AND completed_at <= $1::timestamptz
+			ORDER BY decision_at DESC, completed_at DESC LIMIT 1
+		), claimable AS (
+			SELECT q.run_id, q.ticker
+			FROM weekly_leader_qualifications q
+			JOIN latest l ON l.id=q.run_id
+			WHERE q.outcome='qualified'
+			  AND q.promotion_status='pending'
+			FOR UPDATE OF q SKIP LOCKED
+		), claimed AS (
+			UPDATE weekly_leader_qualifications q
+			SET promotion_status='processing',
+			    promotion_claim_token=$3,
+			    promotion_claimed_at=$2,
+			    promotion_reason=NULL
+			FROM claimable c
+			WHERE q.run_id=c.run_id AND q.ticker=c.ticker
+			RETURNING q.*
+		)
 		SELECT q.run_id, q.universe_version_id, v.as_of, q.ticker,
 		       q.composite_score, q.rank, q.sector, q.industry,
 		       COALESCE(m.price,0), COALESCE(m.market_cap_mm,0),
 		       q.return_20d, q.return_60d, q.return_126d,
-		       q.median_dollar_volume_20d
-		FROM weekly_leader_qualifications q
-		JOIN weekly_leader_runs r ON r.id=q.run_id
+		       q.median_dollar_volume_20d, q.promotion_claim_token
+		FROM claimed q
 		JOIN swing_universe_versions v ON v.id=q.universe_version_id
 		JOIN swing_universe_members m
 		  ON m.universe_version_id=q.universe_version_id AND m.ticker=q.ticker
-		WHERE r.status='completed'
-		  AND r.decision_at <= $1 AND r.completed_at <= $1
-		  AND q.outcome='qualified' AND q.promotion_status='pending'
-		  AND r.id=(
-		      SELECT id FROM weekly_leader_runs
-		      WHERE status='completed' AND decision_at <= $1 AND completed_at <= $1
-		      ORDER BY decision_at DESC, completed_at DESC LIMIT 1
-		  )
-		ORDER BY q.rank, q.ticker`, asOf)
+		ORDER BY q.rank, q.ticker`,
+		asOf, claimedAt, claimToken)
 	if err != nil {
-		return nil, fmt.Errorf("list pending weekly leader candidates: %w", err)
+		return nil, fmt.Errorf("claim pending weekly leader candidates: %w", err)
 	}
 	defer rows.Close()
 	var out []WeeklyLeaderCandidate
@@ -400,7 +435,7 @@ func ListPendingWeeklyLeaderCandidatesAsOf(
 			&candidate.Sector, &candidate.Industry, &candidate.Price,
 			&candidate.MarketCapMM, &candidate.Return20,
 			&candidate.Return60, &candidate.Return126,
-			&candidate.MedianDollarVolume20,
+			&candidate.MedianDollarVolume20, &candidate.PromotionClaimToken,
 		); err != nil {
 			return nil, err
 		}
@@ -409,28 +444,103 @@ func ListPendingWeeklyLeaderCandidatesAsOf(
 	return out, rows.Err()
 }
 
+// ReleaseWeeklyLeaderPromotionClaims returns only unfinished rows owned by the
+// caller's token to pending; terminal outcomes are untouched.
+func ReleaseWeeklyLeaderPromotionClaims(
+	ctx context.Context, claimToken, reason string,
+) error {
+	if strings.TrimSpace(claimToken) == "" {
+		return nil
+	}
+	_, err := GetDB().Exec(ctx, `
+		UPDATE weekly_leader_qualifications
+		SET promotion_status='pending', promotion_claim_token=NULL,
+		    promotion_claimed_at=NULL, promotion_reason=$2
+		WHERE promotion_status='processing' AND promotion_claim_token=$1`,
+		claimToken, nullableString(reason))
+	if err != nil {
+		return fmt.Errorf("release weekly leader promotion claims: %w", err)
+	}
+	return nil
+}
+
 func MarkWeeklyLeaderPromotion(
 	ctx context.Context,
-	runID, ticker, status, scannerRunID, reason string,
+	runID, ticker, claimToken, status, scannerRunID, reason string,
 	at time.Time,
 ) error {
 	status = normalizePromotionStatus(status)
-	if status == "pending" || status == "not_requested" {
+	if status == "pending" || status == "processing" ||
+		status == "not_requested" || status == "superseded" {
 		return fmt.Errorf("terminal weekly leader promotion status required")
 	}
 	tag, err := GetDB().Exec(ctx, `
 		UPDATE weekly_leader_qualifications
-		SET promotion_status=$3, scanner_run_id=$4, promoted_at=$5, promotion_reason=$6
+		SET promotion_status=$4, scanner_run_id=$5, promoted_at=$6,
+		    promotion_reason=$7, promotion_claim_token=NULL,
+		    promotion_claimed_at=NULL
 		WHERE run_id=$1 AND ticker=$2 AND outcome='qualified'
-		  AND promotion_status='pending'`,
-		runID, ticker, status, nullableUUID(scannerRunID), at, nullableString(reason))
+		  AND promotion_status='processing' AND promotion_claim_token=$3`,
+		runID, ticker, claimToken, status, nullableUUID(scannerRunID), at,
+		nullableString(reason))
 	if err != nil {
 		return fmt.Errorf("mark weekly leader promotion: %w", err)
 	}
-	if tag.RowsAffected() > 1 {
-		return fmt.Errorf("mark weekly leader promotion: multiple rows updated")
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mark weekly leader promotion: claim is no longer current")
 	}
 	return nil
+}
+
+// PromoteWeeklyLeaderToWatchlist validates the token fence, writes the
+// watchlist, and records the successful promotion in one transaction. A stale
+// worker can neither overwrite the watchlist nor publish a terminal status.
+func PromoteWeeklyLeaderToWatchlist(
+	ctx context.Context,
+	item WatchlistItem,
+	runID, ticker, claimToken, reason string,
+	at time.Time,
+) error {
+	if item.Ticker != ticker || strings.TrimSpace(runID) == "" ||
+		strings.TrimSpace(claimToken) == "" {
+		return fmt.Errorf("weekly leader watchlist promotion lineage is incomplete")
+	}
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var currentToken, status string
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(promotion_claim_token,''), promotion_status
+		FROM weekly_leader_qualifications
+		WHERE run_id=$1 AND ticker=$2 AND outcome='qualified'
+		FOR UPDATE`, runID, ticker,
+	).Scan(&currentToken, &status); err != nil {
+		return fmt.Errorf("lock weekly leader promotion: %w", err)
+	}
+	if status != "processing" || currentToken != claimToken {
+		return ErrWeeklyLeaderPromotionClaimLost
+	}
+	if err := addWatchlistItem(ctx, tx, item); err != nil {
+		return err
+	}
+	tag, err := tx.Exec(ctx, `
+		UPDATE weekly_leader_qualifications
+		SET promotion_status='promoted', scanner_run_id=$4, promoted_at=$5,
+		    promotion_reason=$6, promotion_claim_token=NULL,
+		    promotion_claimed_at=NULL
+		WHERE run_id=$1 AND ticker=$2 AND promotion_status='processing'
+		  AND promotion_claim_token=$3`,
+		runID, ticker, claimToken, nullableUUID(item.ScannerRunID), at,
+		nullableString(reason))
+	if err != nil {
+		return fmt.Errorf("complete weekly leader watchlist promotion: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrWeeklyLeaderPromotionClaimLost
+	}
+	return tx.Commit(ctx)
 }
 
 func GetLatestCompletedWeeklyLeaderRunAsOf(
@@ -707,7 +817,8 @@ func scanWeeklyLeaderRun(row pgx.Row) (*WeeklyLeaderRun, error) {
 
 func normalizePromotionStatus(status string) string {
 	switch status {
-	case "pending", "promoted", "active_watchlist", "cap_suppressed", "failed", "superseded":
+	case "pending", "processing", "promoted", "rejected", "active_watchlist",
+		"cap_suppressed", "failed", "superseded":
 		return status
 	default:
 		return "not_requested"

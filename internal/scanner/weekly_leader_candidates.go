@@ -2,8 +2,11 @@ package scanner
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -13,7 +16,14 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 		!store.IsConnected() {
 		return nil, nil
 	}
-	rows, err := store.ListPendingWeeklyLeaderCandidatesAsOf(ctx, s.now())
+	claimToken, err := newWeeklyLeaderPromotionClaimToken()
+	if err != nil {
+		return nil, err
+	}
+	claimedAt := s.now()
+	rows, err := store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, claimedAt, claimedAt, claimToken,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -25,22 +35,23 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 			taxonomyStatus = "unknown"
 		}
 		out = append(out, SwingCandidate{
-			Ticker:            row.Ticker,
-			Price:             row.Price,
-			Return1M:          row.Return20 * 100,
-			Return3M:          row.Return60 * 100,
-			Return6M:          row.Return126 * 100,
-			DollarVolume:      row.MedianDollarVolume20,
-			MarketCapMM:       row.MarketCapMM,
-			Sources:           []string{"weekly_leader"},
-			SourceScores:      map[string]float64{"weekly_leader": row.Score},
-			UniverseMember:    &member,
-			Sector:            row.Sector,
-			Industry:          row.Industry,
-			TaxonomyStatus:    taxonomyStatus,
-			WeeklyLeaderRunID: row.RunID,
-			UniverseVersionID: row.UniverseVersionID,
-			UniverseAsOf:      row.UniverseAsOf,
+			Ticker:                 row.Ticker,
+			Price:                  row.Price,
+			Return1M:               row.Return20 * 100,
+			Return3M:               row.Return60 * 100,
+			Return6M:               row.Return126 * 100,
+			DollarVolume:           row.MedianDollarVolume20,
+			MarketCapMM:            row.MarketCapMM,
+			Sources:                []string{"weekly_leader"},
+			SourceScores:           map[string]float64{"weekly_leader": row.Score},
+			UniverseMember:         &member,
+			Sector:                 row.Sector,
+			Industry:               row.Industry,
+			TaxonomyStatus:         taxonomyStatus,
+			WeeklyLeaderRunID:      row.RunID,
+			WeeklyLeaderClaimToken: row.PromotionClaimToken,
+			UniverseVersionID:      row.UniverseVersionID,
+			UniverseAsOf:           row.UniverseAsOf,
 			GraphContext: fmt.Sprintf(
 				"Weekly leader outcome: rank %d, composite score %.3f across the full eligible universe.",
 				row.Rank, row.Score,
@@ -80,6 +91,7 @@ func mergeWeeklyLeaderCandidates(
 		candidate.Sector, candidate.Industry = leader.Sector, leader.Industry
 		candidate.TaxonomyStatus = leader.TaxonomyStatus
 		candidate.WeeklyLeaderRunID = leader.WeeklyLeaderRunID
+		candidate.WeeklyLeaderClaimToken = leader.WeeklyLeaderClaimToken
 		candidate.UniverseVersionID = leader.UniverseVersionID
 		candidate.UniverseAsOf = leader.UniverseAsOf
 		if candidate.GraphContext == "" {
@@ -117,10 +129,38 @@ func (s *MarketScanner) markWeeklyLeaderCandidate(
 		return
 	}
 	if err := store.MarkWeeklyLeaderPromotion(
-		ctx, candidate.WeeklyLeaderRunID, candidate.Ticker, status,
+		ctx, candidate.WeeklyLeaderRunID, candidate.Ticker,
+		candidate.WeeklyLeaderClaimToken, status,
 		scannerRunID, reason, s.now(),
 	); err != nil {
 		slog.Warn("scanner: mark weekly leader promotion",
 			"ticker", candidate.Ticker, "status", status, "err", err)
 	}
+}
+
+func (s *MarketScanner) releaseWeeklyLeaderClaims(
+	ctx context.Context, candidates []SwingCandidate,
+) {
+	if len(candidates) == 0 || !store.IsConnected() {
+		return
+	}
+	claimToken := candidates[0].WeeklyLeaderClaimToken
+	if claimToken == "" {
+		return
+	}
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if err := store.ReleaseWeeklyLeaderPromotionClaims(
+		releaseCtx, claimToken, "scanner cycle ended before a terminal outcome",
+	); err != nil {
+		slog.Warn("scanner: release weekly leader promotion claims", "err", err)
+	}
+}
+
+func newWeeklyLeaderPromotionClaimToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate weekly leader promotion claim token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
 }

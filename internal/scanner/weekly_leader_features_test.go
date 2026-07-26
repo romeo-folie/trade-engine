@@ -60,6 +60,7 @@ func TestWeeklyLeaderCompatibilityHashIgnoresOperationalSettings(t *testing.T) {
 	}
 	cfg.Enabled = !cfg.Enabled
 	cfg.PromoteCandidates = !cfg.PromoteCandidates
+	cfg.MaxPromotionsPerRun++
 	cfg.AfterCloseDelayMinutes++
 	cfg.BatchSize++
 	cfg.RunLeaseMinutes++
@@ -77,6 +78,45 @@ func TestWeeklyLeaderCompatibilityHashIgnoresOperationalSettings(t *testing.T) {
 	}
 	if original == scoring {
 		t.Fatal("scoring change did not change compatibility hash")
+	}
+}
+
+func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
+	score := 0.9
+	evaluations := []WeeklyLeaderEvaluation{
+		{Ticker: "AAA", Outcome: "qualified", Qualified: true, CompositeScore: &score},
+		{Ticker: "BBB", Outcome: "failed", FailureStage: "provider_history"},
+	}
+	suppressWeeklyLeaderQualificationsOnProviderFailure(evaluations, 1, 2)
+	if evaluations[0].Qualified || evaluations[0].Outcome != "not_qualified" ||
+		evaluations[0].FailureStage != "cross_section_incomplete" {
+		t.Fatalf("partial provider survivors remained promotable: %+v", evaluations[0])
+	}
+	if evaluations[1].Outcome != "failed" ||
+		evaluations[1].FailureStage != "provider_history" {
+		t.Fatalf("original provider failure was overwritten: %+v", evaluations[1])
+	}
+}
+
+func TestWeeklyLeaderPromotionIsBoundedByRank(t *testing.T) {
+	rank1, rank21 := 1, 21
+	qualifications, err := weeklyLeaderQualifications(
+		"run", "universe", "test", time.Now(),
+		[]WeeklyLeaderEvaluation{
+			{Ticker: "AAA", Outcome: "qualified", Qualified: true, Rank: &rank1},
+			{Ticker: "BBB", Outcome: "qualified", Qualified: true, Rank: &rank21},
+		},
+		config.WeeklyLeaderConfig{
+			PromoteCandidates: true, MaxPromotionsPerRun: 20,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qualifications[0].PromotionStatus != "pending" ||
+		qualifications[1].PromotionStatus != "not_requested" {
+		t.Fatalf("promotion statuses = %s/%s",
+			qualifications[0].PromotionStatus, qualifications[1].PromotionStatus)
 	}
 }
 

@@ -101,18 +101,60 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		got.LeaderBreadth != 0.5 || got.EvaluationCoverage != 0.5 {
 		t.Fatalf("incorrect run diagnostics: %+v", got)
 	}
-	pending, err := store.ListPendingWeeklyLeaderCandidatesAsOf(ctx, completedAt)
-	if err != nil || len(pending) != 1 || pending[0].Ticker != "TEST_WL_AAA" {
-		t.Fatalf("pending candidates = %+v/%v", pending, err)
+	claimedCandidates, err := store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt, "promotion-claim-1",
+	)
+	if err != nil || len(claimedCandidates) != 1 ||
+		claimedCandidates[0].Ticker != "TEST_WL_AAA" {
+		t.Fatalf("claimed candidates = %+v/%v", claimedCandidates, err)
 	}
-	if err := store.MarkWeeklyLeaderPromotion(
-		ctx, first.ID, "TEST_WL_AAA", "promoted", "", "fixture", completedAt,
+	concurrent, err := store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt, "promotion-claim-2",
+	)
+	if err != nil || len(concurrent) != 0 {
+		t.Fatalf("concurrent promotion claim duplicated work: %+v/%v", concurrent, err)
+	}
+	if err := store.ReleaseWeeklyLeaderPromotionClaims(
+		ctx, "promotion-claim-1", "fixture retry",
 	); err != nil {
 		t.Fatal(err)
 	}
-	pending, err = store.ListPendingWeeklyLeaderCandidatesAsOf(ctx, completedAt)
-	if err != nil || len(pending) != 0 {
-		t.Fatalf("consumed candidate remained pending: %+v/%v", pending, err)
+	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt.Add(time.Minute),
+		"promotion-claim-2",
+	)
+	if err != nil || len(claimedCandidates) != 1 {
+		t.Fatalf("released promotion was not reclaimable: %+v/%v", claimedCandidates, err)
+	}
+	watchlistItem := store.WatchlistItem{
+		Ticker: "TEST_WL_AAA", Platform: "stock",
+		Strategies: []string{"momentum", "weekly_leader"},
+		Timeframes: []string{"1D"}, MinConfidence: 0.8, Source: "scanner",
+	}
+	if err := store.PromoteWeeklyLeaderToWatchlist(
+		ctx, watchlistItem, first.ID, "TEST_WL_AAA", "promotion-claim-1",
+		"stale fixture", completedAt,
+	); !errors.Is(err, store.ErrWeeklyLeaderPromotionClaimLost) {
+		t.Fatalf("stale claim reached watchlist transaction: %v", err)
+	}
+	if err := store.PromoteWeeklyLeaderToWatchlist(
+		ctx, watchlistItem, first.ID, "TEST_WL_AAA", "promotion-claim-2",
+		"fixture", completedAt,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var active bool
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT active FROM watchlist WHERE ticker='TEST_WL_AAA' AND platform='stock'
+	`).Scan(&active); err != nil || !active {
+		t.Fatalf("atomic watchlist promotion missing: active=%v err=%v", active, err)
+	}
+	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt.Add(2*time.Minute),
+		"promotion-claim-3",
+	)
+	if err != nil || len(claimedCandidates) != 0 {
+		t.Fatalf("consumed candidate remained claimable: %+v/%v", claimedCandidates, err)
 	}
 
 	secondInput := runInput
@@ -197,12 +239,24 @@ func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 		t.Fatal(err)
 	}
 	input.StartedAt = input.StartedAt.Add(2 * time.Minute)
+	input.DecisionAt = input.DecisionAt.Add(time.Minute)
+	input.ConfigSnapshot = json.RawMessage(`{"promotion":"changed"}`)
+	input.HistoryProvider = "test-reclaimed"
 	reclaimed, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)
 	if err != nil || !claimed {
 		t.Fatalf("reclaim = %+v/%v/%v", reclaimed, claimed, err)
 	}
 	if reclaimed.ID != first.ID || reclaimed.AttemptCount != 2 {
 		t.Fatalf("reclaimed run = %+v, want same ID and attempt 2", reclaimed)
+	}
+	var reclaimedConfig map[string]string
+	if err := json.Unmarshal(reclaimed.ConfigSnapshot, &reclaimedConfig); err != nil {
+		t.Fatal(err)
+	}
+	if !reclaimed.DecisionAt.Equal(input.DecisionAt) ||
+		reclaimedConfig["promotion"] != "changed" ||
+		reclaimed.HistoryProvider != input.HistoryProvider {
+		t.Fatalf("reclaimed evidence stayed stale: %+v", reclaimed)
 	}
 	if err := store.FailWeeklyLeaderRun(
 		ctx, first.ID, first.AttemptCount,

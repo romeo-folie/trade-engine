@@ -1191,6 +1191,7 @@ type ScannerConfig struct {
 type WeeklyLeaderConfig struct {
 	Enabled                bool    `yaml:"enabled"`
 	PromoteCandidates      bool    `yaml:"promote_candidates"`
+	MaxPromotionsPerRun    int     `yaml:"max_promotions_per_run"`
 	AfterCloseDelayMinutes int     `yaml:"after_close_delay_minutes"`
 	UniverseMaxAgeHours    int     `yaml:"universe_max_age_hours"`
 	HistoryCalendarDays    int     `yaml:"history_calendar_days"`
@@ -2076,6 +2077,9 @@ func Validate(cfg *Config) []string {
 		}
 		if leader.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, "scanner.weekly_leader.after_close_delay_minutes must be >= 0")
+		}
+		if leader.MaxPromotionsPerRun <= 0 {
+			errs = append(errs, "scanner.weekly_leader.max_promotions_per_run must be > 0")
 		}
 		if leader.UniverseMaxAgeHours <= 0 {
 			errs = append(errs, "scanner.weekly_leader.universe_max_age_hours must be > 0")

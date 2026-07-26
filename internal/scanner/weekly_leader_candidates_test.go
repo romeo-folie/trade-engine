@@ -15,8 +15,9 @@ func TestMergeWeeklyLeaderCandidatesPreservesIndependentSources(t *testing.T) {
 		Sources:        []string{"weekly_leader"},
 		SourceScores:   map[string]float64{"weekly_leader": 0.91},
 		UniverseMember: &member, Sector: "Technology", Industry: "Semiconductors",
-		WeeklyLeaderRunID: "run-1", UniverseVersionID: "universe-1",
-		GraphContext: "Weekly leader outcome.",
+		WeeklyLeaderRunID: "run-1", WeeklyLeaderClaimToken: "claim-1",
+		UniverseVersionID: "universe-1",
+		GraphContext:      "Weekly leader outcome.",
 	}}
 	got := mergeWeeklyLeaderCandidates(existing, leaders)
 	if len(got) != 1 {
@@ -32,6 +33,7 @@ func TestMergeWeeklyLeaderCandidatesPreservesIndependentSources(t *testing.T) {
 		t.Fatalf("intraday source evidence overwritten: %+v", candidate)
 	}
 	if candidate.WeeklyLeaderRunID != "run-1" ||
+		candidate.WeeklyLeaderClaimToken != "claim-1" ||
 		candidate.UniverseVersionID != "universe-1" ||
 		candidate.Return6M != 40 {
 		t.Fatalf("weekly leader evidence missing: %+v", candidate)

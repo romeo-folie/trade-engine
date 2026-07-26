@@ -141,6 +141,12 @@ func (r *WeeklyLeaderRunner) RunSession(
 			evaluations[i].FailureReason = failure.Error()
 		}
 	}
+	providerFailureCount := 0
+	for ticker := range history.Failures {
+		if ticker != benchmark {
+			providerFailureCount++
+		}
+	}
 	if failure, exists := history.Failures[benchmark]; exists {
 		for i := range evaluations {
 			evaluations[i].Outcome = "failed"
@@ -148,10 +154,14 @@ func (r *WeeklyLeaderRunner) RunSession(
 			evaluations[i].FailureStage = "benchmark_history"
 			evaluations[i].FailureReason = failure.Error()
 		}
+	} else if providerFailureCount > 0 {
+		suppressWeeklyLeaderQualificationsOnProviderFailure(
+			evaluations, providerFailureCount, len(members),
+		)
 	}
 	qualifications, err := weeklyLeaderQualifications(
 		claimed.ID, universe.ID, universe.Provider, session.Close,
-		evaluations, r.Cfg.PromoteCandidates,
+		evaluations, r.Cfg,
 	)
 	if err != nil {
 		return err
@@ -178,13 +188,35 @@ func (r *WeeklyLeaderRunner) RunSession(
 	return nil
 }
 
+func suppressWeeklyLeaderQualificationsOnProviderFailure(
+	evaluations []WeeklyLeaderEvaluation, failed, eligible int,
+) {
+	reason := fmt.Sprintf(
+		"cross-sectional provider coverage incomplete: %d of %d eligible symbols failed",
+		failed, eligible,
+	)
+	for i := range evaluations {
+		if !evaluations[i].Qualified {
+			continue
+		}
+		evaluations[i].Qualified = false
+		evaluations[i].Outcome = "not_qualified"
+		evaluations[i].FailureStage = "cross_section_incomplete"
+		evaluations[i].FailureReason = reason
+	}
+}
+
 func weeklyLeaderQualifications(
 	runID, universeVersionID, provider string,
 	asOf time.Time,
 	evaluations []WeeklyLeaderEvaluation,
-	promote bool,
+	cfg config.WeeklyLeaderConfig,
 ) ([]store.WeeklyLeaderQualification, error) {
 	out := make([]store.WeeklyLeaderQualification, 0, len(evaluations))
+	maxPromotions := cfg.MaxPromotionsPerRun
+	if maxPromotions <= 0 {
+		maxPromotions = 20
+	}
 	for _, evaluation := range evaluations {
 		q := store.WeeklyLeaderQualification{
 			RunID: runID, UniverseVersionID: universeVersionID,
@@ -207,7 +239,8 @@ func weeklyLeaderQualifications(
 			"as_of":        asOf.UTC().Format(time.RFC3339Nano),
 			"bar_set_hash": evaluation.BarSetHash,
 		})
-		if promote && evaluation.Qualified {
+		if cfg.PromoteCandidates && evaluation.Qualified &&
+			evaluation.Rank != nil && *evaluation.Rank <= maxPromotions {
 			q.PromotionStatus = "pending"
 		}
 		if evaluation.Features != nil {

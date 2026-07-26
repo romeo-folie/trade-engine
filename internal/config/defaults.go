@@ -430,6 +430,7 @@ func Defaults() *Config {
 			WeeklyLeader: WeeklyLeaderConfig{
 				Enabled:                false,
 				PromoteCandidates:      false,
+				MaxPromotionsPerRun:    20,
 				AfterCloseDelayMinutes: 15,
 				UniverseMaxAgeHours:    36,
 				HistoryCalendarDays:    420,

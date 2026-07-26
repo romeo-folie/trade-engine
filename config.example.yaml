@@ -884,6 +884,7 @@ scanner:
   weekly_leader:
     enabled: false                         # Full-universe after-close leadership lens; default off
     promote_candidates: false              # When true, qualified leaders enter the normal LLM/watchlist gate
+    max_promotions_per_run: 20             # Bound qualified names sent through the paid LLM gate
     after_close_delay_minutes: 15          # Wait for the provider to finalize the completed daily bar
     universe_max_age_hours: 36             # Maximum age of the completed point-in-time universe
     history_calendar_days: 420             # Fetch window supporting 252 completed sessions plus holidays

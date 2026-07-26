@@ -125,6 +125,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	if err != nil {
 		return fmt.Errorf("load weekly leader candidates: %w", err)
 	}
+	defer s.releaseWeeklyLeaderClaims(ctx, weeklyCandidates)
 	recorder := newScanRecorder(s, start)
 	if len(weeklyCandidates) > 0 {
 		recorder.run.UniverseVersionID = weeklyCandidates[0].UniverseVersionID
@@ -265,12 +266,13 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		result, err := s.scoreCandidate(ctx, c)
 		recorder.scored(c, result, err, s.Cfg.MinConviction)
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			s.markWeeklyLeaderCandidate(ctx, c, "failed", recorder.run.ID, err.Error())
 			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
 		}
-		s.markWeeklyLeaderCandidate(ctx, c, "promoted", recorder.run.ID,
-			"evaluated by normal scanner conviction gate")
 		slog.Info("scanner: candidate scored",
 			"ticker", c.Ticker,
 			"action", result.Action,
@@ -280,12 +282,24 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		)
 		if result.Action == "add" && result.Conviction >= s.Cfg.MinConviction {
 			scored = append(scored, scoredCandidate{candidate: c, score: result})
+		} else {
+			reason := fmt.Sprintf(
+				"normal scanner rejected candidate: action=%s conviction=%.3f threshold=%.3f",
+				result.Action, result.Conviction, s.Cfg.MinConviction,
+			)
+			s.markWeeklyLeaderCandidate(ctx, c, "rejected", recorder.run.ID, reason)
 		}
 	}
 
 	// 7. Sort by conviction descending, take only as many as available slots.
 	sortByConviction(scored)
 	if len(scored) > slots {
+		for _, suppressed := range scored[slots:] {
+			s.markWeeklyLeaderCandidate(
+				ctx, suppressed.candidate, "cap_suppressed", recorder.run.ID,
+				"candidate ranked beyond available scanner slots",
+			)
+		}
 		scored = scored[:slots]
 	}
 	recorder.selected(scored)
@@ -320,9 +334,23 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ExpiresAt:                       &expiresAt,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
-		if err := store.AddWatchlistItem(ctx, item); err != nil {
-			recorder.watchlistResult(sc.candidate, sc.score, strategies, err)
-			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)
+		var addErr error
+		if sc.candidate.WeeklyLeaderRunID != "" {
+			addErr = store.PromoteWeeklyLeaderToWatchlist(
+				ctx, item, sc.candidate.WeeklyLeaderRunID, sc.candidate.Ticker,
+				sc.candidate.WeeklyLeaderClaimToken,
+				"passed conviction and was added to the watchlist", s.now(),
+			)
+		} else {
+			addErr = store.AddWatchlistItem(ctx, item)
+		}
+		if addErr != nil {
+			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
+			s.markWeeklyLeaderCandidate(
+				ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
+			)
+			slog.Warn("scanner: failed to add watchlist item",
+				"ticker", sc.candidate.Ticker, "err", addErr)
 			continue
 		}
 		recorder.watchlistResult(sc.candidate, sc.score, strategies, nil)

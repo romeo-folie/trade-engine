@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var ErrWatchlistRequalificationRequired = errors.New("watchlist item requires pullback requalification")
@@ -42,13 +44,23 @@ type WatchlistItem struct {
 // If the ticker+platform pair already exists and was disabled, it is re-enabled.
 // For scanner-sourced items, ExpiresAt is written and updated on re-activation.
 func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
+	return addWatchlistItem(ctx, GetDB(), item)
+}
+
+type watchlistExecer interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func addWatchlistItem(
+	ctx context.Context, db watchlistExecer, item WatchlistItem,
+) error {
 	if item.Platform == "" {
 		item.Platform = "stock"
 	}
 	if item.Source == "" {
 		item.Source = "manual"
 	}
-	tag, err := GetDB().Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		INSERT INTO watchlist (
 			ticker, platform, strategies, timeframes, min_confidence, source,
 			graph_context, scanner_run_id, active, expires_at

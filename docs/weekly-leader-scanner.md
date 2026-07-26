@@ -40,6 +40,10 @@ The run records the exact universe version, configuration hash, feature version,
 provider, benchmark, first/last input bar, and completed-session count. Names
 with incomplete history or provider failures remain in the eligible denominator
 as explicit failed observations. Missing values never become numeric zero.
+If even one requested universe symbol has a provider-history failure, the run
+retains all available measurements for diagnosis but suppresses every
+qualification. A partial surviving batch is never renormalized into promotable
+leaders.
 
 The default history requirement is 253 completed sessions. New IPOs with less
 history receive `insufficient_history`; the scanner does not redefine their
@@ -109,6 +113,16 @@ leased run is a no-op; failed and expired claims are reclaimable. Results,
 transitions, breadth, and the completed status publish in one transaction, so
 readers never observe a partial run.
 
+Candidate promotion has a separate atomic, token-fenced claim. Concurrent scanner
+processes cannot score or write the same pending leader. Unfinished claims are
+released at the end of the scanner cycle; terminal status is recorded only
+after the actual outcome is known (`rejected`, `cap_suppressed`, `failed`,
+`active_watchlist`, or successfully `promoted` to the watchlist).
+
+Only the highest-ranked `max_promotions_per_run` qualified rows are made
+pending (20 by default). This bounds paid LLM work even when a 90th-percentile
+cutoff identifies hundreds of leaders in a large universe.
+
 ## Persistence and breadth
 
 `weekly_leader_qualifications` contains one row for every eligible member:
@@ -143,6 +157,7 @@ scanner:
   weekly_leader:
     enabled: true
     promote_candidates: false
+    max_promotions_per_run: 20
 ```
 
 Start in observation mode (`promote_candidates: false`). Ensure a completed

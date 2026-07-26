@@ -155,9 +155,9 @@ func isUSHoliday(t time.Time) bool {
 	day := et.Day()
 	d := time.Date(year, month, day, 0, 0, 0, 0, nyLoc)
 
-	// A Friday observed holiday for a Saturday New Year might fall on 12-31 of year-1.
-	// A Monday observed holiday for a Sunday New Year might fall on 01-02 of year.
-	// We check the target year, previous year, and next year to catch observed shifts.
+	// A Monday observed holiday for a Sunday New Year falls on 01-02. We check
+	// adjacent years for observed shifts, but NYSE does not close the preceding
+	// Friday when New Year's Day itself falls on Saturday.
 	for _, y := range []int{year - 1, year, year + 1} {
 		holidays := usHolidays(y)
 		for _, h := range holidays {
@@ -172,18 +172,28 @@ func isUSHoliday(t time.Time) bool {
 // usHolidays returns the observed NYSE holiday dates for a given year.
 func usHolidays(year int) []time.Time {
 	h := []time.Time{
-		observeHoliday(time.Date(year, time.January, 1, 0, 0, 0, 0, nyLoc)),   // New Year's Day
-		nthWeekday(year, time.January, time.Monday, 3),                         // MLK Day (3rd Mon Jan)
-		nthWeekday(year, time.February, time.Monday, 3),                        // Presidents' Day (3rd Mon Feb)
-		goodFriday(year),                                                       // Good Friday
-		lastWeekday(year, time.May, time.Monday),                               // Memorial Day (last Mon May)
-		observeHoliday(time.Date(year, time.June, 19, 0, 0, 0, 0, nyLoc)),      // Juneteenth
-		observeHoliday(time.Date(year, time.July, 4, 0, 0, 0, 0, nyLoc)),       // Independence Day
-		nthWeekday(year, time.September, time.Monday, 1),                        // Labor Day (1st Mon Sep)
-		nthWeekday(year, time.November, time.Thursday, 4),                       // Thanksgiving (4th Thu Nov)
+		observeNewYearsDay(year),                                              // New Year's Day
+		nthWeekday(year, time.January, time.Monday, 3),                        // MLK Day (3rd Mon Jan)
+		nthWeekday(year, time.February, time.Monday, 3),                       // Presidents' Day (3rd Mon Feb)
+		goodFriday(year),                                                      // Good Friday
+		lastWeekday(year, time.May, time.Monday),                              // Memorial Day (last Mon May)
+		observeHoliday(time.Date(year, time.June, 19, 0, 0, 0, 0, nyLoc)),     // Juneteenth
+		observeHoliday(time.Date(year, time.July, 4, 0, 0, 0, 0, nyLoc)),      // Independence Day
+		nthWeekday(year, time.September, time.Monday, 1),                      // Labor Day (1st Mon Sep)
+		nthWeekday(year, time.November, time.Thursday, 4),                     // Thanksgiving (4th Thu Nov)
 		observeHoliday(time.Date(year, time.December, 25, 0, 0, 0, 0, nyLoc)), // Christmas
 	}
 	return h
+}
+
+func observeNewYearsDay(year int) time.Time {
+	day := time.Date(year, time.January, 1, 0, 0, 0, 0, nyLoc)
+	if day.Weekday() == time.Sunday {
+		return day.AddDate(0, 0, 1)
+	}
+	// A Saturday is already closed as a weekend. Unlike the generic federal
+	// observation rule, NYSE remains open on the preceding Friday.
+	return day
 }
 
 // observeHoliday shifts a holiday to Friday if it falls on Saturday,

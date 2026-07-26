@@ -30,7 +30,9 @@ func TestIsMarketOpen(t *testing.T) {
 		{name: "sunday", ts: "2024-03-17T12:00:00", want: false},
 		{name: "holiday new year", ts: "2024-01-01T12:00:00", want: false},
 		{name: "holiday christmas", ts: "2024-12-25T12:00:00", want: false},
-		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00", want: false},
+		{name: "friday before saturday new year remains open", ts: "2021-12-31T12:00:00", want: true},
+		{name: "next friday before saturday new year remains open", ts: "2027-12-31T12:00:00", want: true},
+		{name: "sunday new year observed monday", ts: "2023-01-02T12:00:00", want: false},
 		{name: "black friday before early close", ts: "2024-11-29T12:59:59", want: true},
 		{name: "black friday early close", ts: "2024-11-29T13:00:00", want: false},
 	}

@@ -91,6 +91,7 @@ func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
 		t.Fatal("weekly leader discovery and promotion must default off")
 	}
 	if leader.AfterCloseDelayMinutes != 15 ||
+		leader.MaxPromotionsPerRun != 20 ||
 		leader.UniverseMaxAgeHours != 36 ||
 		leader.HistoryCalendarDays != 420 ||
 		leader.MinHistorySessions != 253 ||
@@ -128,6 +129,7 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		{"scanner master", "requires scanner.enabled", func(c *Config) { c.Scanner.Enabled = false }},
 		{"universe master", "requires scanner.universe.enabled", func(c *Config) { c.Scanner.Universe.Enabled = false }},
 		{"delay", "after_close_delay_minutes", func(c *Config) { c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = -1 }},
+		{"promotion cap", "max_promotions_per_run", func(c *Config) { c.Scanner.WeeklyLeader.MaxPromotionsPerRun = 0 }},
 		{"universe age", "universe_max_age_hours", func(c *Config) { c.Scanner.WeeklyLeader.UniverseMaxAgeHours = 0 }},
 		{"calendar history", "history_calendar_days", func(c *Config) { c.Scanner.WeeklyLeader.HistoryCalendarDays = 399 }},
 		{"session history", "min_history_sessions", func(c *Config) { c.Scanner.WeeklyLeader.MinHistorySessions = 252 }},
