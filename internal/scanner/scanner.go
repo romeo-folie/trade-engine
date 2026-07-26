@@ -402,15 +402,16 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:       sc.candidate.Ticker,
-				Conviction:   sc.score.Conviction,
-				SetupType:    sc.score.SetupType,
-				Strategy:     sc.score.Strategy,
-				Timeframes:   timeframes,
-				Reasoning:    sc.score.Reasoning,
-				ExpiresAt:    expiresAt.Format(time.RFC3339),
-				Sources:      sc.candidate.Sources,
-				GraphContext: sc.candidate.GraphContext,
+				Ticker:               sc.candidate.Ticker,
+				Conviction:           sc.score.Conviction,
+				SetupType:            sc.score.SetupType,
+				Strategy:             sc.score.Strategy,
+				Timeframes:           timeframes,
+				Reasoning:            sc.score.Reasoning,
+				ExpiresAt:            expiresAt.Format(time.RFC3339),
+				Sources:              sc.candidate.Sources,
+				GraphContext:         sc.candidate.GraphContext,
+				WeeklyLeaderEvidence: sc.candidate.WeeklyLeaderEvidence,
 			})
 		}
 	}
@@ -946,6 +947,11 @@ func (s *MarketScanner) buildTelegramMessage(added []scoredCandidate, expired in
 			sc.candidate.Ticker, sc.score.SetupType, sc.score.Conviction*100))
 		if sc.candidate.GraphContext != "" {
 			sb.WriteString(fmt.Sprintf("  🔗 _%s_\n", sc.candidate.GraphContext))
+		}
+		if sc.candidate.WeeklyLeaderEvidence != "" {
+			sb.WriteString(fmt.Sprintf(
+				"  📈 _Weekly leader: %s_\n", sc.candidate.WeeklyLeaderEvidence,
+			))
 		}
 		if sc.score.Reasoning != "" {
 			sb.WriteString(fmt.Sprintf("  _%s_\n", sc.score.Reasoning))

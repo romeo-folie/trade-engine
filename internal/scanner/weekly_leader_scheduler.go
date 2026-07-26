@@ -20,6 +20,11 @@ type weeklyLeaderRunLeaseActiveError struct {
 	retryAt     time.Time
 }
 
+const (
+	weeklyLeaderFailureRetryBase  = 5 * time.Minute
+	weeklyLeaderFailureRetryLimit = 3
+)
+
 func (e *weeklyLeaderRunLeaseActiveError) Error() string {
 	return fmt.Sprintf("weekly leader session %s is leased until %s",
 		e.sessionDate.Format("2006-01-02"), e.retryAt.Format(time.RFC3339))
@@ -45,6 +50,7 @@ func (s *WeeklyLeaderScheduler) Run(ctx context.Context) error {
 	now := s.now()
 	session := engine.MostRecentCompletedMarketSession(now, delay)
 	decisionAt := session.Close.Add(delay)
+	failureCount := 0
 	for {
 		err := s.Job.RunSession(ctx, session, decisionAt)
 		if ctx.Err() != nil {
@@ -56,16 +62,27 @@ func (s *WeeklyLeaderScheduler) Run(ctx context.Context) error {
 			slog.Info("weekly leader: session actively claimed; retrying at lease boundary",
 				"session_date", session.Date.Format("2006-01-02"),
 				"retry_at", activeLease.retryAt)
+			blockedSession := session
 			session, decisionAt, waitUntil = nextWeeklyLeaderLeaseAttempt(
 				s.now(), session, decisionAt, delay, activeLease.retryAt,
 			)
+			if session.Date.After(blockedSession.Date) {
+				failureCount = 0
+			}
 		} else if err != nil {
+			failureCount++
 			slog.Error("weekly leader: session failed; scheduling retry",
-				"session_date", session.Date.Format("2006-01-02"), "err", err)
+				"session_date", session.Date.Format("2006-01-02"),
+				"failure_count", failureCount, "err", err)
+			failedSession := session
 			session, decisionAt, waitUntil = nextWeeklyLeaderAttempt(
-				s.now(), session, delay,
+				s.now(), session, delay, failureCount,
 			)
+			if session.Date.After(failedSession.Date) {
+				failureCount = 0
+			}
 		} else {
+			failureCount = 0
 			session, waitUntil = engine.NextMarketCloseRun(s.now(), delay)
 			decisionAt = waitUntil
 		}
@@ -104,7 +121,10 @@ func nextWeeklyLeaderLeaseAttempt(
 }
 
 func nextWeeklyLeaderAttempt(
-	now time.Time, failed engine.USMarketSession, delay time.Duration,
+	now time.Time,
+	failed engine.USMarketSession,
+	delay time.Duration,
+	failureCount int,
 ) (engine.USMarketSession, time.Time, time.Time) {
 	latest := engine.MostRecentCompletedMarketSession(now, delay)
 	if latest.Date.After(failed.Date) {
@@ -112,8 +132,15 @@ func nextWeeklyLeaderAttempt(
 		return latest, decisionAt, now
 	}
 	nextSession, nextRun := engine.NextMarketCloseRun(now, delay)
-	retryAt := now.Add(5 * time.Minute)
-	if nextRun.Before(retryAt) {
+	if failureCount > weeklyLeaderFailureRetryLimit {
+		return nextSession, nextRun, nextRun
+	}
+	retryDelay := weeklyLeaderFailureRetryBase
+	for attempt := 1; attempt < failureCount; attempt++ {
+		retryDelay *= 2
+	}
+	retryAt := now.Add(retryDelay)
+	if !nextRun.After(retryAt) {
 		return nextSession, nextRun, nextRun
 	}
 	return failed, failed.Close.Add(delay), retryAt

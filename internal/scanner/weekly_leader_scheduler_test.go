@@ -2,6 +2,8 @@ package scanner
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
@@ -76,7 +78,7 @@ func TestWeeklyLeaderRetryCannotStarveANewerSession(t *testing.T) {
 	failed := engine.MostRecentCompletedMarketSession(fridayNow, 15*time.Minute)
 	mondayAfterClose, _ := time.Parse(time.RFC3339, "2024-03-18T20:20:00Z")
 	next, decisionAt, waitUntil := nextWeeklyLeaderAttempt(
-		mondayAfterClose, failed, 15*time.Minute,
+		mondayAfterClose, failed, 15*time.Minute, 1,
 	)
 	if got := next.Date.Format("2006-01-02"); got != "2024-03-18" {
 		t.Fatalf("retry remained stuck on %s", got)
@@ -84,6 +86,86 @@ func TestWeeklyLeaderRetryCannotStarveANewerSession(t *testing.T) {
 	if !decisionAt.Equal(next.Close.Add(15*time.Minute)) ||
 		!waitUntil.Equal(mondayAfterClose) {
 		t.Fatalf("new-session retry timing = decision %v wait %v", decisionAt, waitUntil)
+	}
+}
+
+func TestWeeklyLeaderFailureRetriesAreBoundedAndExponential(t *testing.T) {
+	now, _ := time.Parse(time.RFC3339, "2024-03-15T20:20:00Z")
+	session := engine.MostRecentCompletedMarketSession(now, 15*time.Minute)
+	wantDelays := []time.Duration{5 * time.Minute, 10 * time.Minute, 20 * time.Minute}
+	for i, wantDelay := range wantDelays {
+		gotSession, gotDecision, gotWait := nextWeeklyLeaderAttempt(
+			now, session, 15*time.Minute, i+1,
+		)
+		if !gotSession.Date.Equal(session.Date) ||
+			!gotDecision.Equal(session.Close.Add(15*time.Minute)) ||
+			!gotWait.Equal(now.Add(wantDelay)) {
+			t.Fatalf(
+				"failure %d retry = session %v decision %v wait %v, want same session/%v/%v",
+				i+1, gotSession.Date, gotDecision, gotWait,
+				session.Close.Add(15*time.Minute), now.Add(wantDelay),
+			)
+		}
+	}
+
+	nextSession, nextRun := engine.NextMarketCloseRun(now, 15*time.Minute)
+	gotSession, gotDecision, gotWait := nextWeeklyLeaderAttempt(
+		now, session, 15*time.Minute, weeklyLeaderFailureRetryLimit+1,
+	)
+	if !gotSession.Date.Equal(nextSession.Date) ||
+		!gotDecision.Equal(nextRun) || !gotWait.Equal(nextRun) {
+		t.Fatalf(
+			"exhausted retry = session %v decision %v wait %v, want %v/%v/%v",
+			gotSession.Date, gotDecision, gotWait,
+			nextSession.Date, nextRun, nextRun,
+		)
+	}
+}
+
+func TestWeeklyLeaderSchedulerDefersPersistentWeekendFailure(t *testing.T) {
+	now, _ := time.Parse(time.RFC3339, "2024-03-15T20:20:00Z")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	var waits []time.Duration
+	scheduler := WeeklyLeaderScheduler{
+		Cfg: config.WeeklyLeaderConfig{
+			Enabled: true, AfterCloseDelayMinutes: 15,
+		},
+		Now: func() time.Time { return now },
+		After: func(wait time.Duration) <-chan time.Time {
+			waits = append(waits, wait)
+			if len(waits) == weeklyLeaderFailureRetryLimit+1 {
+				cancel()
+				return make(chan time.Time)
+			}
+			now = now.Add(wait)
+			ch := make(chan time.Time, 1)
+			ch <- now
+			return ch
+		},
+		Job: weeklyLeaderJobFunc(func(
+			context.Context, engine.USMarketSession, time.Time,
+		) error {
+			calls++
+			return errors.New("target session unavailable")
+		}),
+	}
+	if err := scheduler.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != weeklyLeaderFailureRetryLimit+1 {
+		t.Fatalf("persistent failure calls = %d, want %d",
+			calls, weeklyLeaderFailureRetryLimit+1)
+	}
+	if len(waits) != weeklyLeaderFailureRetryLimit+1 {
+		t.Fatalf("persistent failure waits = %v", waits)
+	}
+	if want := []time.Duration{
+		5 * time.Minute, 10 * time.Minute, 20 * time.Minute,
+		71*time.Hour + 20*time.Minute,
+	}; !slices.Equal(waits, want) {
+		t.Fatalf("persistent failure waits = %v, want %v", waits, want)
 	}
 }
 

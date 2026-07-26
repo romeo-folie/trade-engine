@@ -54,8 +54,8 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 			WeeklyLeaderClaimToken: row.PromotionClaimToken,
 			UniverseVersionID:      row.UniverseVersionID,
 			UniverseAsOf:           row.UniverseAsOf,
-			GraphContext: fmt.Sprintf(
-				"Weekly leader outcome: rank %d, composite score %.3f across the full eligible universe.",
+			WeeklyLeaderEvidence: fmt.Sprintf(
+				"rank %d, composite score %.3f across the full eligible universe",
 				row.Rank, row.Score,
 			),
 		})
@@ -92,6 +92,9 @@ func mergeWeeklyLeaderCandidates(
 		candidate.Return1M, candidate.Return3M, candidate.Return6M =
 			leader.Return1M, leader.Return3M, leader.Return6M
 		candidate.DollarVolume = leader.DollarVolume
+		if leader.MarketCapMM > 0 {
+			candidate.MarketCapMM = leader.MarketCapMM
+		}
 		candidate.UniverseMember = leader.UniverseMember
 		candidate.Sector, candidate.Industry = leader.Sector, leader.Industry
 		candidate.TaxonomyStatus = leader.TaxonomyStatus
@@ -99,11 +102,7 @@ func mergeWeeklyLeaderCandidates(
 		candidate.WeeklyLeaderClaimToken = leader.WeeklyLeaderClaimToken
 		candidate.UniverseVersionID = leader.UniverseVersionID
 		candidate.UniverseAsOf = leader.UniverseAsOf
-		if candidate.GraphContext == "" {
-			candidate.GraphContext = leader.GraphContext
-		} else {
-			candidate.GraphContext += " " + leader.GraphContext
-		}
+		candidate.WeeklyLeaderEvidence = leader.WeeklyLeaderEvidence
 	}
 	return out
 }
@@ -128,6 +127,7 @@ func ordinaryCandidateAfterWeeklyClaimLoss(
 	delete(fallback.SourceScores, "weekly_leader")
 	fallback.WeeklyLeaderRunID = ""
 	fallback.WeeklyLeaderClaimToken = ""
+	fallback.WeeklyLeaderEvidence = ""
 	fallback.UniverseVersionID = ""
 	fallback.UniverseAsOf = time.Time{}
 	fallback.weeklyLeaderFallback = nil

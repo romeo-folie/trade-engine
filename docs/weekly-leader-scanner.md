@@ -15,7 +15,9 @@ A weekly-leader result is discovery evidence, not permission to trade.
 
 When `promote_candidates` is enabled, only qualified rows are handed to the
 ordinary market scanner with source `weekly_leader` and their independent
-composite score. They still face:
+composite score. Rank and score are labeled as weekly-leader evidence in the
+scoring prompt, audit snapshot, event payload, and Telegram notification; they
+are never represented as a knowledge-graph relationship. They still face:
 
 1. active-watchlist deduplication;
 2. the scanner candidate cap;
@@ -69,8 +71,8 @@ All returns use completed-session log returns.
 - Stock-minus-SPY relative strength over every return horizon.
 - Stock-minus-median-industry 60-session strength, requiring known point-in-time
   taxonomy and the configured minimum peer count.
-- Relative-strength acceleration: short-horizon cross-sectional ranks minus
-  long-horizon ranks.
+- Relative-strength acceleration: short-horizon blended relative-strength
+  scores minus long-horizon scores.
 - Annualized 60-session log-price regression slope and R².
 - 60-session price-path efficiency and 126-session close-to-close max drawdown.
 - ATR(14) divided by price and volatility-adjusted 60-session return.
@@ -90,6 +92,16 @@ display rank. Global ranks are blended with market-cap-band and
 volatility-band ranks when a band has at least five observations. This prevents
 a raw high-volatility or small-cap spike from winning merely because its return
 has a larger magnitude, without imposing artificial small-cap quotas.
+
+Market-relative strength blends that deterministic percentile with a bounded
+score of the stock's annualized excess log return over the configured benchmark
+(SPY by default). The absolute term is centered at 0.5 for matching the
+benchmark and bounded with `tanh`, so an extreme observation cannot dominate.
+This preserves both cross-sectional leadership and actual benchmark
+outperformance; subtracting the same benchmark return from every stock would
+otherwise leave its percentile identical to the raw-return percentile.
+Relative-strength acceleration uses the same blended scores across short and
+long horizons.
 
 The composite weights are:
 
@@ -119,7 +131,9 @@ Christmas Eve when open, the applicable pre-Independence-Day early close, and
 explicit modern-era exceptional NYSE closures. A missing target-session
 benchmark bar fails the attempt instead of publishing an empty run, providing
 a safety fence for a future unscheduled closure. On startup it catches up the
-most recent completed session.
+most recent completed session. Ordinary failures retry after 5, 10, and 20
+minutes, then defer to the next scheduled close so a persistent outage cannot
+hammer the full-universe provider through a weekend.
 
 The database atomically claims
 `(session_date, universe_version_id, config_hash)`. A completed run is a no-op;

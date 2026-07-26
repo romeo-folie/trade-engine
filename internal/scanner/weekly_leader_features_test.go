@@ -265,6 +265,74 @@ func TestWeeklyLeaderRankingIsDeterministicAndKeepsHighAndRSSeparate(t *testing.
 	}
 }
 
+func TestWeeklyLeaderScoreRespondsToBenchmarkReturn(t *testing.T) {
+	asOf := time.Date(2026, time.July, 24, 20, 0, 0, 0, time.UTC)
+	members := []store.SwingUniverseMember{
+		{Ticker: "AAA", Eligible: true},
+		{Ticker: "BBB", Eligible: true},
+	}
+	bars := map[string][]data.Candle{
+		"AAA": leaderTestBars(asOf, 260, 0.0012, 1_000_000),
+		"BBB": leaderTestBars(asOf, 260, 0.0008, 1_000_000),
+	}
+	cfg := leaderTestConfig()
+	cfg.SelectionPercentile = 0.49
+	weakBenchmark := EvaluateWeeklyLeaders(
+		members, bars, leaderTestBars(asOf, 260, 0.0001, 2_000_000),
+		asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	)
+	strongBenchmark := EvaluateWeeklyLeaders(
+		members, bars, leaderTestBars(asOf, 260, 0.0015, 2_000_000),
+		asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	)
+
+	weakAAA := weeklyLeaderEvaluationByTicker(t, weakBenchmark, "AAA")
+	strongAAA := weeklyLeaderEvaluationByTicker(t, strongBenchmark, "AAA")
+	if weakAAA.Components.MarketRS <= strongAAA.Components.MarketRS {
+		t.Fatalf("market RS did not respond to benchmark: weak %.6f, strong %.6f",
+			weakAAA.Components.MarketRS, strongAAA.Components.MarketRS)
+	}
+	if *weakAAA.CompositeScore <= *strongAAA.CompositeScore {
+		t.Fatalf("composite score did not respond to benchmark: weak %.6f, strong %.6f",
+			*weakAAA.CompositeScore, *strongAAA.CompositeScore)
+	}
+	if weakAAA.Features.MarketRS60 <= strongAAA.Features.MarketRS60 {
+		t.Fatalf("raw market RS did not respond to benchmark: weak %.6f, strong %.6f",
+			weakAAA.Features.MarketRS60, strongAAA.Features.MarketRS60)
+	}
+
+	cfg.MinCompositeScore = (*weakAAA.CompositeScore + *strongAAA.CompositeScore) / 2
+	weakGate := weeklyLeaderEvaluationByTicker(t, EvaluateWeeklyLeaders(
+		members, bars, leaderTestBars(asOf, 260, 0.0001, 2_000_000),
+		asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	), "AAA")
+	strongGate := weeklyLeaderEvaluationByTicker(t, EvaluateWeeklyLeaders(
+		members, bars, leaderTestBars(asOf, 260, 0.0015, 2_000_000),
+		asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	), "AAA")
+	if !weakGate.Qualified || strongGate.Qualified {
+		t.Fatalf("benchmark-relative score did not change qualification: weak=%v strong=%v",
+			weakGate.Qualified, strongGate.Qualified)
+	}
+}
+
+func weeklyLeaderEvaluationByTicker(
+	t *testing.T, evaluations []WeeklyLeaderEvaluation, ticker string,
+) WeeklyLeaderEvaluation {
+	t.Helper()
+	for _, evaluation := range evaluations {
+		if evaluation.Ticker == ticker {
+			if evaluation.Features == nil || evaluation.Components == nil ||
+				evaluation.CompositeScore == nil {
+				t.Fatalf("%s evaluation is incomplete: %+v", ticker, evaluation)
+			}
+			return evaluation
+		}
+	}
+	t.Fatalf("%s evaluation not found", ticker)
+	return WeeklyLeaderEvaluation{}
+}
+
 func TestPercentilesUseMidrankForTies(t *testing.T) {
 	rows := []weeklyLeaderRaw{
 		{member: store.SwingUniverseMember{Ticker: "BBB"}, capBand: "large", volBand: "low"},

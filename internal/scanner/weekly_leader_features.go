@@ -16,7 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-const weeklyLeaderFeatureVersion = "weekly-leader-v2"
+const weeklyLeaderFeatureVersion = "weekly-leader-v3"
 
 // WeeklyLeaderFeatures are immutable, auditable measurements derived only from
 // bars completed by the run's decision cutoff. Returns are decimal fractions.
@@ -376,8 +376,15 @@ func scoreWeeklyLeaderRows(
 		scores[name] = bandAwarePercentiles(rows, getter)
 	}
 	for i := range rows {
-		shortRS := mean(scores["mrs5"][rows[i].member.Ticker], scores["mrs20"][rows[i].member.Ticker])
-		longRS := mean(scores["mrs60"][rows[i].member.Ticker], scores["mrs126"][rows[i].member.Ticker])
+		ticker := rows[i].member.Ticker
+		shortRS := mean(
+			marketRelativeScore(scores["mrs5"][ticker], rows[i].f.MarketRS5, 5),
+			marketRelativeScore(scores["mrs20"][ticker], rows[i].f.MarketRS20, 20),
+		)
+		longRS := mean(
+			marketRelativeScore(scores["mrs60"][ticker], rows[i].f.MarketRS60, 60),
+			marketRelativeScore(scores["mrs126"][ticker], rows[i].f.MarketRS126, 126),
+		)
 		rows[i].f.RSAcceleration = shortRS - longRS
 	}
 	accelerationScores := bandAwarePercentiles(rows, func(r weeklyLeaderRaw) (float64, bool) {
@@ -395,7 +402,11 @@ func scoreWeeklyLeaderRows(
 			0.25*scores["return20"][ticker] +
 			0.35*scores["return60"][ticker] +
 			0.30*scores["return126"][ticker]
-		marketRS := mean(scores["mrs20"][ticker], scores["mrs60"][ticker], scores["mrs126"][ticker])
+		marketRS := mean(
+			marketRelativeScore(scores["mrs20"][ticker], row.f.MarketRS20, 20),
+			marketRelativeScore(scores["mrs60"][ticker], row.f.MarketRS60, 60),
+			marketRelativeScore(scores["mrs126"][ticker], row.f.MarketRS126, 126),
+		)
 		trend := mean(scores["slope"][ticker], scores["r2"][ticker],
 			scores["efficiency"][ticker], scores["drawdown"][ticker])
 		accumulation := mean(scores["obv"][ticker], scores["cmf"][ticker])
@@ -489,6 +500,21 @@ func scoreWeeklyLeaderRows(
 		}
 		start = end
 	}
+}
+
+// marketRelativeScore retains both kinds of leadership evidence: where the
+// stock ranks within this run and whether it actually outperformed the market.
+// Subtracting one benchmark return from every stock preserves cross-sectional
+// ordering, so a percentile alone would be identical to raw momentum. The
+// bounded annualized excess-return term makes the benchmark level material
+// without allowing an extreme short-horizon observation to dominate.
+func marketRelativeScore(percentile, excessLogReturn float64, sessions int) float64 {
+	if sessions <= 0 {
+		return percentile
+	}
+	annualizedExcess := excessLogReturn * 252 / float64(sessions)
+	absolute := 0.5 + 0.5*math.Tanh(annualizedExcess)
+	return 0.5*percentile + 0.5*absolute
 }
 
 func bandAwarePercentiles(
