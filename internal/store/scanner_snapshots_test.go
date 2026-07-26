@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -15,6 +16,13 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	}
 	ctx := context.Background()
 	startedAt := time.Now().UTC()
+	universeAsOf := startedAt.Add(-time.Minute)
+	universeID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+		Provider: "scanner-snapshot-test", AsOf: universeAsOf, CapturedAt: universeAsOf,
+	})
+	if err != nil {
+		t.Fatalf("BeginSwingUniverseVersion: %v", err)
+	}
 	runID, err := store.BeginScannerRun(ctx, store.ScannerRun{
 		StartedAt:                    startedAt,
 		PullbackUniverseEnabled:      true,
@@ -24,6 +32,9 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		CandidateCap:                 10,
 		MinConviction:                .55,
 		TTLDays:                      3,
+		UniverseVersionID:            universeID,
+		UniverseAsOf:                 &universeAsOf,
+		RegimeReference:              "pending",
 	})
 	if err != nil {
 		t.Fatalf("BeginScannerRun: %v", err)
@@ -54,6 +65,14 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 			WatchlistAdded:      true,
 			Strategies:          []string{"momentum", "pullback_strength"},
 			FinalStage:          "watchlist_added",
+			SourceScores:        map[string]float64{"mover": 0},
+			UniverseMember:      boolPtr(true),
+			Sector:              "Technology",
+			Industry:            "Software",
+			TaxonomyStatus:      "known",
+			TaxonomyAsOf:        &universeAsOf,
+			TaxonomyProvider:    "scanner-snapshot-test",
+			TaxonomyEvidence:    json.RawMessage(`{"confidence":0}`),
 		},
 		{
 			ScannerRunID:       runID,
@@ -69,6 +88,22 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("FinishScannerRun: %v", err)
+	}
+	var storedUniverseID, regime string
+	var sourceScores json.RawMessage
+	var universeMember bool
+	err = store.GetDB().QueryRow(ctx, `
+		SELECT r.universe_version_id::text, r.regime_reference,
+		       c.source_scores, c.universe_member
+		FROM scanner_runs r
+		JOIN scanner_candidate_snapshots c ON c.scanner_run_id=r.id
+		WHERE r.id=$1 AND c.ticker='SNAP_A'`,
+		runID,
+	).Scan(&storedUniverseID, &regime, &sourceScores, &universeMember)
+	if err != nil || storedUniverseID != universeID || regime != "pending" ||
+		!universeMember || string(sourceScores) != `{"mover": 0}` {
+		t.Fatalf("extended snapshot = universe=%q regime=%q scores=%s member=%v err=%v",
+			storedUniverseID, regime, sourceScores, universeMember, err)
 	}
 
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
@@ -151,3 +186,5 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Fatalf("stage distributions missing: %+v", funnel)
 	}
 }
+
+func boolPtr(value bool) *bool { return &value }

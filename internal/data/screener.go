@@ -218,8 +218,11 @@ func FetchMostActive(ctx context.Context, client *AlpacaClient, top int) ([]Most
 
 // alpacaSnapshot represents the relevant subset of an Alpaca stock snapshot.
 type alpacaSnapshot struct {
-	MinuteBar *alpacaBar `json:"minuteBar"`
-	DailyBar  *alpacaBar `json:"dailyBar"`
+	MinuteBar        *alpacaBar   `json:"minuteBar"`
+	DailyBar         *alpacaBar   `json:"dailyBar"`
+	PreviousDailyBar *alpacaBar   `json:"prevDailyBar"`
+	LatestTrade      *alpacaTrade `json:"latestTrade"`
+	LatestQuote      *alpacaQuote `json:"latestQuote"`
 }
 
 // fetchSnapshotVolumes fetches the daily bar volume for the given tickers

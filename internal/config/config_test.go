@@ -48,6 +48,92 @@ func TestDefaultsTrailingRulePreservesATRBehavior(t *testing.T) {
 	}
 }
 
+func TestDefaultsScannerUniverseDisabled(t *testing.T) {
+	universe := Defaults().Scanner.Universe
+	if universe.Enabled {
+		t.Fatal("full-market scanner universe must default off")
+	}
+	if universe.Provider != "alpaca" ||
+		universe.MinPrice != 5 ||
+		universe.MinMarketCapMM != 100 ||
+		universe.MinMedianDollarVolume != 1_000_000 ||
+		universe.DollarVolumeLookbackDays != 20 ||
+		universe.MaxSpreadBPS != 0 ||
+		universe.SnapshotTTLHours != 24 ||
+		universe.TaxonomyMaxAgeHours != 168 ||
+		universe.BatchSize != 200 ||
+		universe.MaxConcurrency != 4 ||
+		universe.TaxonomyRefreshLimit != 200 {
+		t.Fatalf("unexpected scanner universe defaults: %+v", universe)
+	}
+	if len(universe.AllowedSecurityTypes) != 1 ||
+		universe.AllowedSecurityTypes[0] != "us_equity" {
+		t.Fatalf("unexpected default security types: %v", universe.AllowedSecurityTypes)
+	}
+	if len(universe.AllowedExchanges) != 3 ||
+		universe.AllowedExchanges[0] != "NYSE" ||
+		universe.AllowedExchanges[1] != "NASDAQ" ||
+		universe.AllowedExchanges[2] != "AMEX" {
+		t.Fatalf("unexpected default exchanges: %v", universe.AllowedExchanges)
+	}
+	if !universe.RequireActive || !universe.RequireTradable || !universe.RequireMarketData {
+		t.Fatalf("default universe eligibility must fail closed: %+v", universe)
+	}
+	if universe.MissingFundamentalsPolicy != "exclude" ||
+		universe.MissingMarketDataPolicy != "exclude" {
+		t.Fatalf("default missing-data policies must exclude: %+v", universe)
+	}
+}
+
+func TestValidateScannerUniverseConfig(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.Universe.Enabled = true
+	if errs := Validate(cfg); containsStr(errs, "scanner.universe") {
+		t.Fatalf("valid scanner universe config rejected: %v", errs)
+	}
+
+	disabled := Defaults()
+	disabled.Scanner.Universe = UniverseConfig{}
+	if errs := Validate(disabled); containsStr(errs, "scanner.universe") {
+		t.Fatalf("disabled zero-value universe must preserve existing configs: %v", errs)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*UniverseConfig)
+		field  string
+	}{
+		{"provider missing", func(c *UniverseConfig) { c.Provider = "" }, "provider"},
+		{"provider unknown", func(c *UniverseConfig) { c.Provider = "unknown" }, "provider"},
+		{"min price", func(c *UniverseConfig) { c.MinPrice = -1 }, "min_price"},
+		{"market cap", func(c *UniverseConfig) { c.MinMarketCapMM = -1 }, "min_market_cap_mm"},
+		{"dollar volume", func(c *UniverseConfig) { c.MinMedianDollarVolume = -1 }, "min_median_dollar_volume"},
+		{"lookback", func(c *UniverseConfig) { c.DollarVolumeLookbackDays = 0 }, "dollar_volume_lookback_days"},
+		{"security types empty", func(c *UniverseConfig) { c.AllowedSecurityTypes = nil }, "allowed_security_types"},
+		{"security types blank", func(c *UniverseConfig) { c.AllowedSecurityTypes = []string{""} }, "allowed_security_types"},
+		{"exchanges empty", func(c *UniverseConfig) { c.AllowedExchanges = nil }, "allowed_exchanges"},
+		{"exchanges blank", func(c *UniverseConfig) { c.AllowedExchanges = []string{" "} }, "allowed_exchanges"},
+		{"spread", func(c *UniverseConfig) { c.MaxSpreadBPS = -1 }, "max_spread_bps"},
+		{"snapshot ttl", func(c *UniverseConfig) { c.SnapshotTTLHours = 0 }, "snapshot_ttl_hours"},
+		{"taxonomy age", func(c *UniverseConfig) { c.TaxonomyMaxAgeHours = 0 }, "taxonomy_max_age_hours"},
+		{"batch size", func(c *UniverseConfig) { c.BatchSize = 0 }, "batch_size"},
+		{"concurrency", func(c *UniverseConfig) { c.MaxConcurrency = 0 }, "max_concurrency"},
+		{"taxonomy limit", func(c *UniverseConfig) { c.TaxonomyRefreshLimit = 0 }, "taxonomy_refresh_limit"},
+		{"fundamentals policy", func(c *UniverseConfig) { c.MissingFundamentalsPolicy = "keep" }, "missing_fundamentals_policy"},
+		{"market data policy", func(c *UniverseConfig) { c.MissingMarketDataPolicy = "keep" }, "missing_market_data_policy"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Scanner.Universe.Enabled = true
+			tt.mutate(&cfg.Scanner.Universe)
+			if !containsStr(Validate(cfg), "scanner.universe."+tt.field) {
+				t.Fatalf("invalid %s not rejected: %v", tt.field, Validate(cfg))
+			}
+		})
+	}
+}
+
 func TestValidateExitPolicyConfig(t *testing.T) {
 	cfg := Defaults()
 	cfg.Risk.TrailingStop.Rule = "ema9"

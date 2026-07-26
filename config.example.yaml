@@ -861,6 +861,26 @@ scanner:
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
   top_actives: 20              # Most-active-by-volume fetched per scan
+  universe:
+    enabled: false                         # Full-market point-in-time universe; off preserves movers/actives-only discovery
+    provider: alpaca                       # Provider adapter used for bulk membership and eligibility evidence
+    min_price: 5.0                         # Exclude lower-priced securities once the universe is enabled
+    min_market_cap_mm: 100.0               # Minimum market cap in USD millions
+    min_median_dollar_volume: 1000000.0    # Minimum median daily dollar volume over the lookback
+    dollar_volume_lookback_days: 20        # Completed sessions used for median dollar volume
+    allowed_security_types: [us_equity]     # Alpaca's reliable asset class; narrower types require a richer asset-master provider
+    allowed_exchanges: [NYSE, NASDAQ, AMEX]
+    max_spread_bps: 0.0                    # Maximum quoted spread in basis points; 0 disables this ceiling
+    require_active: true                   # Fail closed when the provider marks a security inactive
+    require_tradable: true                 # Fail closed when the broker marks a security untradable
+    require_market_data: true              # Require sufficient price/liquidity evidence
+    snapshot_ttl_hours: 24                 # Maximum age for reusing a complete universe snapshot
+    taxonomy_max_age_hours: 168            # Stale/unknown taxonomy cannot qualify an industry signal
+    batch_size: 200                        # Maximum symbols requested per provider batch
+    max_concurrency: 4                     # Maximum concurrent provider batches
+    taxonomy_refresh_limit: 200            # Maximum stale classifications refreshed per update
+    missing_fundamentals_policy: exclude   # exclude = fail closed; include = retain with missing evidence recorded
+    missing_market_data_policy: exclude    # exclude = fail closed; include = retain with missing evidence recorded
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

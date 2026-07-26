@@ -1164,6 +1164,12 @@ type ScannerConfig struct {
 	// Default: 20.
 	TopActives int `yaml:"top_actives"`
 
+	// Universe configures the point-in-time, full-market stock universe used by
+	// leadership and industry scanners. It is independent of the daily
+	// movers/actives pool and defaults off so existing scanner behavior is
+	// unchanged until an operator explicitly opts in.
+	Universe UniverseConfig `yaml:"universe"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1172,6 +1178,49 @@ type ScannerConfig struct {
 	// sentiment-strong news on a manually-watched ticker fans out to its graph
 	// neighbours as candidates, carrying the triggering headline as the thesis.
 	NewsSympathy NewsSympathyConfig `yaml:"news_sympathy"`
+}
+
+// UniverseConfig controls construction and caching of the point-in-time stock
+// universe. Eligibility evidence and taxonomy are recorded as-of the requested
+// snapshot; a provider must never substitute current data for unavailable
+// historical data. Missing-data policies apply per symbol so a partial provider
+// failure does not discard successful results from the same bulk request.
+type UniverseConfig struct {
+	// Enabled opts into full-universe discovery. Default: false.
+	Enabled bool `yaml:"enabled"`
+
+	// Provider selects the provider-neutral universe adapter. Default: "alpaca".
+	Provider string `yaml:"provider"`
+
+	// Objective eligibility thresholds. A zero MaxSpreadBPS disables only the
+	// spread ceiling; the remaining defaults are active once Enabled is true.
+	MinPrice                 float64  `yaml:"min_price"`
+	MinMarketCapMM           float64  `yaml:"min_market_cap_mm"`
+	MinMedianDollarVolume    float64  `yaml:"min_median_dollar_volume"`
+	DollarVolumeLookbackDays int      `yaml:"dollar_volume_lookback_days"`
+	AllowedSecurityTypes     []string `yaml:"allowed_security_types"`
+	AllowedExchanges         []string `yaml:"allowed_exchanges"`
+	MaxSpreadBPS             float64  `yaml:"max_spread_bps"`
+	RequireActive            bool     `yaml:"require_active"`
+	RequireTradable          bool     `yaml:"require_tradable"`
+	RequireMarketData        bool     `yaml:"require_market_data"`
+
+	// SnapshotTTLHours bounds reuse of a complete universe snapshot.
+	// TaxonomyMaxAgeHours independently prevents stale classifications from
+	// qualifying an industry-level signal.
+	SnapshotTTLHours    int `yaml:"snapshot_ttl_hours"`
+	TaxonomyMaxAgeHours int `yaml:"taxonomy_max_age_hours"`
+
+	// Bulk-operation controls keep provider calls bounded and rate-limit aware.
+	BatchSize            int `yaml:"batch_size"`
+	MaxConcurrency       int `yaml:"max_concurrency"`
+	TaxonomyRefreshLimit int `yaml:"taxonomy_refresh_limit"`
+
+	// MissingFundamentalsPolicy and MissingMarketDataPolicy are "exclude" or
+	// "include". The safe defaults are "exclude"; "include" is an explicit
+	// fail-open choice whose missing evidence remains visible in snapshots.
+	MissingFundamentalsPolicy string `yaml:"missing_fundamentals_policy"`
+	MissingMarketDataPolicy   string `yaml:"missing_market_data_policy"`
 }
 
 // NewsSympathyConfig controls news-triggered sympathy candidate sourcing. Where
@@ -1921,6 +1970,78 @@ func Validate(cfg *Config) []string {
 	validClassifierModes := map[string]bool{"disabled": true, "shadow": true, "active": true}
 	if mode := cfg.Analysis.Classifier.Mode; mode != "" && !validClassifierModes[mode] {
 		errs = append(errs, fmt.Sprintf("analysis.classifier.mode must be one of disabled|shadow|active, got %q", mode))
+	}
+
+	if universe := cfg.Scanner.Universe; universe.Enabled {
+		validUniverseProviders := map[string]bool{"alpaca": true}
+		if !validUniverseProviders[universe.Provider] {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.provider must be one of alpaca, got %q",
+				universe.Provider))
+		}
+		if universe.MinPrice < 0 {
+			errs = append(errs, "scanner.universe.min_price must be >= 0")
+		}
+		if universe.MinMarketCapMM < 0 {
+			errs = append(errs, "scanner.universe.min_market_cap_mm must be >= 0")
+		}
+		if universe.MinMedianDollarVolume < 0 {
+			errs = append(errs, "scanner.universe.min_median_dollar_volume must be >= 0")
+		}
+		if universe.DollarVolumeLookbackDays <= 0 {
+			errs = append(errs, "scanner.universe.dollar_volume_lookback_days must be > 0")
+		}
+		if len(universe.AllowedSecurityTypes) == 0 {
+			errs = append(errs, "scanner.universe.allowed_security_types must not be empty")
+		} else {
+			for _, securityType := range universe.AllowedSecurityTypes {
+				if strings.TrimSpace(securityType) == "" {
+					errs = append(errs, "scanner.universe.allowed_security_types must not contain blank values")
+					break
+				}
+			}
+		}
+		if len(universe.AllowedExchanges) == 0 {
+			errs = append(errs, "scanner.universe.allowed_exchanges must not be empty")
+		} else {
+			for _, exchange := range universe.AllowedExchanges {
+				if strings.TrimSpace(exchange) == "" {
+					errs = append(errs, "scanner.universe.allowed_exchanges must not contain blank values")
+					break
+				}
+			}
+		}
+		if universe.MaxSpreadBPS < 0 {
+			errs = append(errs, "scanner.universe.max_spread_bps must be >= 0")
+		}
+		if universe.SnapshotTTLHours <= 0 {
+			errs = append(errs, "scanner.universe.snapshot_ttl_hours must be > 0")
+		}
+		if universe.TaxonomyMaxAgeHours <= 0 {
+			errs = append(errs, "scanner.universe.taxonomy_max_age_hours must be > 0")
+		}
+		if universe.BatchSize <= 0 {
+			errs = append(errs, "scanner.universe.batch_size must be > 0")
+		}
+		if universe.MaxConcurrency <= 0 {
+			errs = append(errs, "scanner.universe.max_concurrency must be > 0")
+		}
+		if universe.TaxonomyRefreshLimit <= 0 {
+			errs = append(errs, "scanner.universe.taxonomy_refresh_limit must be > 0")
+		}
+		validMissingPolicy := func(policy string) bool {
+			return policy == "exclude" || policy == "include"
+		}
+		if !validMissingPolicy(universe.MissingFundamentalsPolicy) {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.missing_fundamentals_policy must be one of exclude|include, got %q",
+				universe.MissingFundamentalsPolicy))
+		}
+		if !validMissingPolicy(universe.MissingMarketDataPolicy) {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.universe.missing_market_data_policy must be one of exclude|include, got %q",
+				universe.MissingMarketDataPolicy))
+		}
 	}
 
 	// Validate cost profile. Empty string is not valid — Defaults() always sets

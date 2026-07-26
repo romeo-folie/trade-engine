@@ -77,7 +77,13 @@ func TestFinnhubFetchCompanyFundamentals(t *testing.T) {
 		if r.URL.Path != "/api/v1/stock/profile2" {
 			t.Fatalf("path = %q, want /api/v1/stock/profile2", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"name":"Example Corp","marketCapitalization":1234.5}`))
+		_, _ = w.Write([]byte(`{
+			"name":"Example Corp",
+			"marketCapitalization":1234.5,
+			"country":"US",
+			"exchange":"NASDAQ",
+			"finnhubIndustry":"Technology"
+		}`))
 	}))
 	defer srv.Close()
 
@@ -88,6 +94,12 @@ func TestFinnhubFetchCompanyFundamentals(t *testing.T) {
 	}
 	if got.Name != "Example Corp" || got.MarketCapitalization != 1234.5 {
 		t.Fatalf("unexpected fundamentals: %+v", got)
+	}
+	if got.Country != "US" || got.Exchange != "NASDAQ" || got.Industry != "Technology" {
+		t.Fatalf("missing taxonomy evidence: %+v", got)
+	}
+	if got.Provider != "finnhub" || got.ObservedAt.IsZero() {
+		t.Fatalf("missing provider/as-of evidence: %+v", got)
 	}
 }
 
