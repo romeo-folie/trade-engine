@@ -53,7 +53,9 @@ The default history requirement is 253 completed sessions. New IPOs with less
 history receive `insufficient_history`; the scanner does not redefine their
 52-week high as a since-IPO high. Configuration validation converts any custom
 session requirement to a conservative calendar-day window (252 sessions/year
-plus a two-week buffer), preventing an impossible fetch configuration.
+plus a two-week buffer), preventing an impossible fetch configuration. Fetch
+windows are capped at 36,525 calendar days (100 years) so an extreme integer
+cannot wrap Go's date arithmetic.
 
 ## Measurements
 

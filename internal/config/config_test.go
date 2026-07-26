@@ -136,6 +136,13 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 			c.Scanner.WeeklyLeader.MinHistorySessions = 500
 			c.Scanner.WeeklyLeader.HistoryCalendarDays = 500
 		}},
+		{"calendar history too large", "history_calendar_days", func(c *Config) {
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = weeklyLeaderMaxHistoryCalendarDays + 1
+		}},
+		{"session history overflow", "min_history_sessions", func(c *Config) {
+			c.Scanner.WeeklyLeader.MinHistorySessions = int(^uint(0) >> 1)
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = int(^uint(0) >> 1)
+		}},
 		{"session history", "min_history_sessions", func(c *Config) { c.Scanner.WeeklyLeader.MinHistorySessions = 252 }},
 		{"benchmark", "benchmark", func(c *Config) { c.Scanner.WeeklyLeader.Benchmark = " " }},
 		{"peers", "industry_min_peers", func(c *Config) { c.Scanner.WeeklyLeader.IndustryMinPeers = 0 }},
@@ -165,7 +172,10 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		cfg.Scanner.Universe.Enabled = true
 		cfg.Scanner.WeeklyLeader.Enabled = true
 		cfg.Scanner.WeeklyLeader.MinHistorySessions = 500
-		required := weeklyLeaderHistoryCalendarDays(500)
+		required, ok := weeklyLeaderHistoryCalendarDays(500)
+		if !ok {
+			t.Fatal("ordinary session count unexpectedly overflowed")
+		}
 		cfg.Scanner.WeeklyLeader.HistoryCalendarDays = required
 		if errs := Validate(cfg); containsStr(errs, "scanner.weekly_leader") {
 			t.Fatalf("exact calendar/session boundary rejected: %v", errs)

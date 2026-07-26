@@ -2091,15 +2091,23 @@ func Validate(cfg *Config) []string {
 		if leader.MinHistorySessions < 253 {
 			errs = append(errs, "scanner.weekly_leader.min_history_sessions must be >= 253")
 		}
-		requiredCalendarDays := weeklyLeaderHistoryCalendarDays(
+		requiredCalendarDays, historyWindowOK := weeklyLeaderHistoryCalendarDays(
 			leader.MinHistorySessions,
 		)
-		if leader.MinHistorySessions > 0 &&
+		if !historyWindowOK {
+			errs = append(errs,
+				"scanner.weekly_leader.min_history_sessions is too large to convert to a safe calendar window")
+		} else if leader.MinHistorySessions > 0 &&
 			leader.HistoryCalendarDays < requiredCalendarDays {
 			errs = append(errs, fmt.Sprintf(
 				"scanner.weekly_leader.history_calendar_days must be >= %d for min_history_sessions=%d",
 				requiredCalendarDays, leader.MinHistorySessions,
 			))
+		}
+		if leader.HistoryCalendarDays > weeklyLeaderMaxHistoryCalendarDays {
+			errs = append(errs, fmt.Sprintf(
+				"scanner.weekly_leader.history_calendar_days must be <= %d",
+				weeklyLeaderMaxHistoryCalendarDays))
 		}
 		if strings.TrimSpace(leader.Benchmark) == "" {
 			errs = append(errs, "scanner.weekly_leader.benchmark must not be blank")
@@ -2524,23 +2532,25 @@ func Validate(cfg *Config) []string {
 	return errs
 }
 
+const weeklyLeaderMaxHistoryCalendarDays = 36525
+
 // weeklyLeaderHistoryCalendarDays converts a trading-session requirement to a
 // conservative calendar fetch window using 252 sessions/year plus a two-week
 // provider/holiday buffer.
-func weeklyLeaderHistoryCalendarDays(sessions int) int {
+func weeklyLeaderHistoryCalendarDays(sessions int) (int, bool) {
 	if sessions <= 0 {
-		return 0
+		return 0, true
 	}
 	maxInt := int(^uint(0) >> 1)
 	maxInt64 := int64(^uint64(0) >> 1)
 	if int64(sessions) > (maxInt64-251)/365 {
-		return maxInt
+		return 0, false
 	}
 	required := (int64(sessions)*365+251)/252 + 14
 	if required > int64(maxInt) {
-		return maxInt
+		return 0, false
 	}
-	return int(required)
+	return int(required), true
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
