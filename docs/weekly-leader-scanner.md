@@ -55,7 +55,8 @@ history receive `insufficient_history`; the scanner does not redefine their
 session requirement to a conservative calendar-day window (252 sessions/year
 plus a two-week buffer), preventing an impossible fetch configuration. Fetch
 windows are capped at 36,525 calendar days (100 years) so an extreme integer
-cannot wrap Go's date arithmetic.
+cannot wrap Go's date arithmetic. Delay, universe-age, and claim-lease settings
+are also rejected when their configured units cannot fit in `time.Duration`.
 
 ## Measurements
 

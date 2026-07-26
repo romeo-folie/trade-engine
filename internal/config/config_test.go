@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefaultsEngineMode(t *testing.T) {
@@ -129,8 +130,14 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		{"scanner master", "requires scanner.enabled", func(c *Config) { c.Scanner.Enabled = false }},
 		{"universe master", "requires scanner.universe.enabled", func(c *Config) { c.Scanner.Universe.Enabled = false }},
 		{"delay", "after_close_delay_minutes", func(c *Config) { c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = -1 }},
+		{"delay overflow", "after_close_delay_minutes", func(c *Config) {
+			c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = int((time.Duration(1<<63-1) / time.Minute) + 1)
+		}},
 		{"promotion cap", "max_promotions_per_run", func(c *Config) { c.Scanner.WeeklyLeader.MaxPromotionsPerRun = 0 }},
 		{"universe age", "universe_max_age_hours", func(c *Config) { c.Scanner.WeeklyLeader.UniverseMaxAgeHours = 0 }},
+		{"universe age overflow", "universe_max_age_hours", func(c *Config) {
+			c.Scanner.WeeklyLeader.UniverseMaxAgeHours = int((time.Duration(1<<63-1) / time.Hour) + 1)
+		}},
 		{"calendar history", "history_calendar_days", func(c *Config) { c.Scanner.WeeklyLeader.HistoryCalendarDays = 399 }},
 		{"calendar/session mismatch", "history_calendar_days", func(c *Config) {
 			c.Scanner.WeeklyLeader.MinHistorySessions = 500
@@ -151,6 +158,9 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		{"coverage", "min_feature_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinFeatureCoverage = 0 }},
 		{"batch", "batch_size", func(c *Config) { c.Scanner.WeeklyLeader.BatchSize = 0 }},
 		{"lease", "run_lease_minutes", func(c *Config) { c.Scanner.WeeklyLeader.RunLeaseMinutes = 0 }},
+		{"lease overflow", "run_lease_minutes", func(c *Config) {
+			c.Scanner.WeeklyLeader.RunLeaseMinutes = int((time.Duration(1<<63-1) / time.Minute) + 1)
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -165,6 +175,25 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("duration boundaries", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Scanner.Enabled = true
+		cfg.Scanner.Universe.Enabled = true
+		cfg.Scanner.WeeklyLeader.Enabled = true
+		cfg.Scanner.WeeklyLeader.AfterCloseDelayMinutes = int(
+			time.Duration(1<<63-1) / time.Minute,
+		)
+		cfg.Scanner.WeeklyLeader.UniverseMaxAgeHours = int(
+			time.Duration(1<<63-1) / time.Hour,
+		)
+		cfg.Scanner.WeeklyLeader.RunLeaseMinutes = int(
+			time.Duration(1<<63-1) / time.Minute,
+		)
+		if errs := Validate(cfg); containsStr(errs, "overflows time.Duration") {
+			t.Fatalf("safe duration boundary rejected: %v", errs)
+		}
+	})
 
 	t.Run("calendar session boundary", func(t *testing.T) {
 		cfg := Defaults()

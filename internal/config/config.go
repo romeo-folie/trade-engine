@@ -2078,12 +2078,18 @@ func Validate(cfg *Config) []string {
 		}
 		if leader.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, "scanner.weekly_leader.after_close_delay_minutes must be >= 0")
+		} else if !durationConfigFits(leader.AfterCloseDelayMinutes, time.Minute) {
+			errs = append(errs,
+				"scanner.weekly_leader.after_close_delay_minutes overflows time.Duration")
 		}
 		if leader.MaxPromotionsPerRun <= 0 {
 			errs = append(errs, "scanner.weekly_leader.max_promotions_per_run must be > 0")
 		}
 		if leader.UniverseMaxAgeHours <= 0 {
 			errs = append(errs, "scanner.weekly_leader.universe_max_age_hours must be > 0")
+		} else if !durationConfigFits(leader.UniverseMaxAgeHours, time.Hour) {
+			errs = append(errs,
+				"scanner.weekly_leader.universe_max_age_hours overflows time.Duration")
 		}
 		if leader.HistoryCalendarDays < 400 {
 			errs = append(errs, "scanner.weekly_leader.history_calendar_days must be >= 400")
@@ -2129,6 +2135,9 @@ func Validate(cfg *Config) []string {
 		}
 		if leader.RunLeaseMinutes <= 0 {
 			errs = append(errs, "scanner.weekly_leader.run_lease_minutes must be > 0")
+		} else if !durationConfigFits(leader.RunLeaseMinutes, time.Minute) {
+			errs = append(errs,
+				"scanner.weekly_leader.run_lease_minutes overflows time.Duration")
 		}
 	}
 
@@ -2533,6 +2542,14 @@ func Validate(cfg *Config) []string {
 }
 
 const weeklyLeaderMaxHistoryCalendarDays = 36525
+
+func durationConfigFits(value int, unit time.Duration) bool {
+	if value < 0 || unit <= 0 {
+		return false
+	}
+	const maxDuration = time.Duration(1<<63 - 1)
+	return uint64(value) <= uint64(maxDuration)/uint64(unit)
+}
 
 // weeklyLeaderHistoryCalendarDays converts a trading-session requirement to a
 // conservative calendar fetch window using 252 sessions/year plus a two-week
