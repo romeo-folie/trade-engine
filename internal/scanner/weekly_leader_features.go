@@ -16,11 +16,12 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
-const weeklyLeaderFeatureVersion = "weekly-leader-v1"
+const weeklyLeaderFeatureVersion = "weekly-leader-v2"
 
 // WeeklyLeaderFeatures are immutable, auditable measurements derived only from
 // bars completed by the run's decision cutoff. Returns are decimal fractions.
 type WeeklyLeaderFeatures struct {
+	ClosePrice                float64  `json:"close_price"`
 	Return5                   float64  `json:"return_5d"`
 	Return20                  float64  `json:"return_20d"`
 	Return60                  float64  `json:"return_60d"`
@@ -105,7 +106,7 @@ func EvaluateWeeklyLeaders(
 	members []store.SwingUniverseMember,
 	barsByTicker map[string][]data.Candle,
 	benchmarkBars []data.Candle,
-	asOf, decisionAt time.Time,
+	targetSession, asOf, decisionAt time.Time,
 	cfg config.WeeklyLeaderConfig,
 ) []WeeklyLeaderEvaluation {
 	results := make([]WeeklyLeaderEvaluation, 0, len(members))
@@ -113,7 +114,9 @@ func EvaluateWeeklyLeaders(
 	if minHistory <= 0 {
 		minHistory = 253
 	}
-	benchmark, benchmarkErr := completedDailyBars(benchmarkBars, asOf)
+	benchmark, benchmarkErr := completedDailyBars(
+		benchmarkBars, targetSession, asOf,
+	)
 	var benchmarkFeatures WeeklyLeaderFeatures
 	if benchmarkErr == nil && len(benchmark) >= minHistory {
 		benchmarkFeatures, benchmarkErr = extractWeeklyLeaderFeatures(benchmark)
@@ -133,7 +136,9 @@ func EvaluateWeeklyLeaders(
 			results = append(results, evaluation)
 			continue
 		}
-		bars, err := completedDailyBars(barsByTicker[member.Ticker], asOf)
+		bars, err := completedDailyBars(
+			barsByTicker[member.Ticker], targetSession, asOf,
+		)
 		if len(bars) > 0 {
 			first, last := bars[0].Timestamp, bars[len(bars)-1].Timestamp
 			evaluation.HistoryFirstAt, evaluation.HistoryLastAt = &first, &last
@@ -178,7 +183,10 @@ func EvaluateWeeklyLeaders(
 	return results
 }
 
-func completedDailyBars(input []data.Candle, asOf time.Time) ([]data.Candle, error) {
+func completedDailyBars(
+	input []data.Candle, targetSession, asOf time.Time,
+) ([]data.Candle, error) {
+	location := targetSession.Location()
 	bySession := make(map[string]data.Candle, len(input))
 	for _, bar := range input {
 		if bar.Timestamp.After(asOf) {
@@ -190,7 +198,7 @@ func completedDailyBars(input []data.Candle, asOf time.Time) ([]data.Candle, err
 			bar.Low > math.Min(bar.Open, bar.Close) || bar.Low > bar.High {
 			return nil, fmt.Errorf("invalid OHLCV at %s", bar.Timestamp.Format(time.RFC3339))
 		}
-		key := bar.Timestamp.In(asOf.Location()).Format("2006-01-02")
+		key := bar.Timestamp.In(location).Format("2006-01-02")
 		if previous, ok := bySession[key]; !ok || bar.Timestamp.After(previous.Timestamp) {
 			bySession[key] = bar
 		}
@@ -200,6 +208,17 @@ func completedDailyBars(input []data.Candle, asOf time.Time) ([]data.Candle, err
 		out = append(out, bar)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Timestamp.Before(out[j].Timestamp) })
+	targetDate := targetSession.In(location).Format("2006-01-02")
+	latestDate := "none"
+	if len(out) > 0 {
+		latestDate = out[len(out)-1].Timestamp.In(location).Format("2006-01-02")
+	}
+	if latestDate != targetDate {
+		return out, fmt.Errorf(
+			"target session %s completed bar is unavailable; latest is %s",
+			targetDate, latestDate,
+		)
+	}
 	return out, nil
 }
 
@@ -231,7 +250,8 @@ func extractWeeklyLeaderFeatures(bars []data.Candle) (WeeklyLeaderFeatures, erro
 	obv, cmf := accumulationStats(bars[n-21:])
 	gapDominance, largestGap, positiveProgress := gapDomination(bars[n-61:])
 	return WeeklyLeaderFeatures{
-		Return5: ret(5), Return20: ret(20), Return60: r60, Return126: ret(126),
+		ClosePrice: bars[n-1].Close,
+		Return5:    ret(5), Return20: ret(20), Return60: r60, Return126: ret(126),
 		High52WeekProximity:       clamp(bars[n-1].Close/high, 0, 1),
 		RegressionAnnualizedSlope: annualizedSlope,
 		RegressionR2:              r2,

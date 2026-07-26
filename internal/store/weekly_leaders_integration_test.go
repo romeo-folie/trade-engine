@@ -23,12 +23,15 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	capMM := 5_000.0
+	universePrice := 91.0
 	dollarVolume := 50_000_000.0
 	members := []store.SwingUniverseMember{
 		{Ticker: "TEST_WL_AAA", Eligible: true, MarketCapMM: &capMM,
+			Price:        &universePrice,
 			DollarVolume: &dollarVolume, Sector: "Technology",
 			Industry: "Software", TaxonomyStatus: "known"},
 		{Ticker: "TEST_WL_BBB", Eligible: true, MarketCapMM: &capMM,
+			Price:        &universePrice,
 			DollarVolume: &dollarVolume, Sector: "Technology",
 			Industry: "Software", TaxonomyStatus: "known"},
 	}
@@ -44,7 +47,7 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
 		ConfigHash:     "weekly-leader-integration-v1",
 		ConfigSnapshot: json.RawMessage(`{"selection_percentile":0.9}`),
-		FeatureVersion: "weekly-leader-v1", Benchmark: "SPY",
+		FeatureVersion: "weekly-leader-v2", Benchmark: "SPY",
 		HistoryProvider: "test",
 	}
 	first, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour)
@@ -57,6 +60,7 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatalf("duplicate active claim = %+v/%v/%v, want existing lease", activeRun, claimed, err)
 	}
 	scoreA, coverage, rankA := 0.91, 1.0, 1
+	closePrice := 125.0
 	return20, return60, return126 := 0.10, 0.20, 0.35
 	medianDV := 50_000_000.0
 	qualifications := []store.WeeklyLeaderQualification{
@@ -64,7 +68,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 			RunID: first.ID, UniverseVersionID: versionID, Ticker: "TEST_WL_AAA",
 			Outcome: "qualified", Sector: "Technology", Industry: "Software",
 			MarketCapBand: "mid", VolatilityBand: "medium",
-			Return20: &return20, Return60: &return60, Return126: &return126,
+			ClosePrice: &closePrice,
+			Return20:   &return20, Return60: &return60, Return126: &return126,
 			MedianDollarVolume20: &medianDV, CompositeScore: &scoreA,
 			ScorePercentile: &coverage, Rank: &rankA, FeatureCoverage: &coverage,
 			BarSetHash:      "fixture-bars-a",
@@ -108,7 +113,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		ctx, completedAt, completedAt, time.Hour, "promotion-claim-1",
 	)
 	if err != nil || len(claimedCandidates) != 1 ||
-		claimedCandidates[0].Ticker != "TEST_WL_AAA" {
+		claimedCandidates[0].Ticker != "TEST_WL_AAA" ||
+		claimedCandidates[0].Price != closePrice {
 		t.Fatalf("claimed candidates = %+v/%v", claimedCandidates, err)
 	}
 	concurrent, err := store.ClaimWeeklyLeaderCandidatesAsOf(
@@ -203,7 +209,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		RunID: alternate.ID, UniverseVersionID: versionID, Ticker: "TEST_WL_BBB",
 		Outcome: "qualified", Sector: "Technology", Industry: "Software",
 		MarketCapBand: "mid", VolatilityBand: "medium", Return20: &return20,
-		Return60: &return60, Return126: &return126,
+		ClosePrice: &closePrice,
+		Return60:   &return60, Return126: &return126,
 		MedianDollarVolume20: &medianDV, CompositeScore: &scoreB,
 		ScorePercentile: &percentileB, Rank: &rankB, FeatureCoverage: &coverage,
 		BarSetHash: "fixture-bars-b", PromotionStatus: "pending",
@@ -339,7 +346,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		RunID: second.ID, UniverseVersionID: versionID, Ticker: "TEST_WL_BBB",
 		Outcome: "qualified", Sector: "Technology", Industry: "Software",
 		MarketCapBand: "mid", VolatilityBand: "medium", Return20: &return20,
-		Return60: &return60, Return126: &return126,
+		ClosePrice: &closePrice,
+		Return60:   &return60, Return126: &return126,
 		MedianDollarVolume20: &medianDV, CompositeScore: &scoreB,
 		ScorePercentile: &percentileB, Rank: &rankB, FeatureCoverage: &coverage,
 		BarSetHash: "fixture-bars-b",
@@ -468,7 +476,7 @@ func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
 		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
 		ConfigHash:     "weekly-leader-integration-reclaim",
-		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v1",
+		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v2",
 		Benchmark: "SPY", HistoryProvider: "test",
 	}
 	first, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)
@@ -529,7 +537,7 @@ func TestWeeklyLeaderRunLeaseBoundaryCanBeReclaimed(t *testing.T) {
 		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
 		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
 		ConfigHash:     "weekly-leader-integration-lease-boundary",
-		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v1",
+		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v2",
 		Benchmark: "SPY", HistoryProvider: "test",
 	}
 	first, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)

@@ -36,6 +36,10 @@ Each run fixes two timestamps:
 - `decision_at`: close plus the configured provider-finalization delay. The
   universe must have been effective, captured, and completed by this boundary.
 
+Both the benchmark and every successfully evaluated stock must contain the
+target session's completed daily bar. A long but stale history ending on the
+prior session fails closed rather than being mislabeled as the current run.
+
 The run records the exact universe version, configuration hash, feature version,
 provider, benchmark, first/last input bar, and completed-session count. Names
 with incomplete history or provider failures remain in the eligible denominator
@@ -53,6 +57,8 @@ history receive `insufficient_history`; the scanner does not redefine their
 
 All returns use completed-session log returns.
 
+- The exact final close used by every qualified evaluation and downstream
+  scanner prompt.
 - 5-, 20-, 60-, and 126-session returns.
 - Closing-price proximity to the highest daily high in the last 252 sessions.
 - Stock-minus-SPY relative strength over every return horizon.
@@ -108,8 +114,9 @@ Christmas Eve when open, and the applicable pre-Independence-Day early close.
 On startup it catches up the most recent completed session.
 
 The database atomically claims
-`(session_date, universe_version_id, config_hash)`. A completed or actively
-leased run is a no-op; failed and expired claims are reclaimable. Results,
+`(session_date, universe_version_id, config_hash)`. A completed run is a no-op;
+an actively leased run is retried at its exact lease boundary, and failed or
+expired claims are reclaimable. Results,
 transitions, breadth, and the completed status publish in one transaction, so
 readers never observe a partial run.
 

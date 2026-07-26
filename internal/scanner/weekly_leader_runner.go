@@ -138,13 +138,13 @@ func (r *WeeklyLeaderRunner) RunSession(
 	}
 	benchmarkBarSetHash := ""
 	if completedBenchmark, validationErr := completedDailyBars(
-		history.Bars[benchmark], session.Close,
+		history.Bars[benchmark], session.Date, session.Close,
 	); validationErr == nil {
 		benchmarkBarSetHash = weeklyLeaderBarSetHash(completedBenchmark)
 	}
 	evaluations := EvaluateWeeklyLeaders(
 		members, history.Bars, history.Bars[benchmark],
-		session.Close, decisionAt, r.Cfg,
+		session.Date, session.Close, decisionAt, r.Cfg,
 	)
 	for i := range evaluations {
 		if failure, exists := history.Failures[evaluations[i].Ticker]; exists {
@@ -283,6 +283,7 @@ func weeklyLeaderQualifications(
 		}
 		if evaluation.Features != nil {
 			f := evaluation.Features
+			q.ClosePrice = floatPtr(f.ClosePrice)
 			q.Return5, q.Return20, q.Return60, q.Return126 =
 				floatPtr(f.Return5), floatPtr(f.Return20), floatPtr(f.Return60), floatPtr(f.Return126)
 			q.High52WeekProximity = floatPtr(f.High52WeekProximity)

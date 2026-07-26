@@ -51,6 +51,7 @@ CREATE TABLE weekly_leader_qualifications (
     industry TEXT NOT NULL DEFAULT 'Unknown',
     market_cap_band TEXT NOT NULL DEFAULT 'unknown',
     volatility_band TEXT NOT NULL DEFAULT 'unknown',
+    close_price DOUBLE PRECISION CHECK (close_price > 0),
     return_5d DOUBLE PRECISION,
     return_20d DOUBLE PRECISION,
     return_60d DOUBLE PRECISION,
@@ -89,6 +90,7 @@ CREATE TABLE weekly_leader_qualifications (
     scanner_run_id UUID REFERENCES scanner_runs(id),
     promoted_at TIMESTAMPTZ,
     promotion_reason TEXT,
+    CHECK (outcome <> 'qualified' OR close_price IS NOT NULL),
     PRIMARY KEY (run_id, ticker),
     FOREIGN KEY (universe_version_id, ticker)
         REFERENCES swing_universe_members(universe_version_id, ticker)
@@ -137,6 +139,8 @@ COMMENT ON COLUMN weekly_leader_runs.leader_breadth IS
     'Qualified names divided by the full eligible universe denominator, never only successfully evaluated names.';
 COMMENT ON COLUMN weekly_leader_qualifications.bar_set_hash IS
     'SHA-256 over the normalized, ordered completed daily OHLCV inputs.';
+COMMENT ON COLUMN weekly_leader_qualifications.close_price IS
+    'Final close of the required target-session bar used by this evaluation.';
 COMMENT ON COLUMN weekly_leader_runs.benchmark_bar_set_hash IS
     'SHA-256 over the normalized benchmark bars used for relative strength.';
 COMMENT ON COLUMN weekly_leader_runs.as_of IS

@@ -61,6 +61,7 @@ type WeeklyLeaderQualification struct {
 	Industry                  string
 	MarketCapBand             string
 	VolatilityBand            string
+	ClosePrice                *float64
 	Return5                   *float64
 	Return20                  *float64
 	Return60                  *float64
@@ -463,7 +464,7 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		)
 		SELECT q.run_id, q.universe_version_id, v.as_of, q.ticker,
 		       q.composite_score, q.rank, q.sector, q.industry,
-		       COALESCE(m.price,0), COALESCE(m.market_cap_mm,0),
+		       q.close_price, COALESCE(m.market_cap_mm,0),
 		       q.return_20d, q.return_60d, q.return_126d,
 		       q.median_dollar_volume_20d, q.promotion_claim_token
 		FROM claimed q
@@ -668,6 +669,7 @@ func insertWeeklyLeaderQualification(
 	}
 	if q.Outcome == "qualified" &&
 		(q.CompositeScore == nil || q.ScorePercentile == nil || q.Rank == nil ||
+			q.ClosePrice == nil ||
 			q.Return20 == nil || q.Return60 == nil || q.Return126 == nil ||
 			q.MedianDollarVolume20 == nil || strings.TrimSpace(q.BarSetHash) == "") {
 		return fmt.Errorf("weekly leader qualification %q lacks required score/input evidence",
@@ -678,8 +680,8 @@ func insertWeeklyLeaderQualification(
 			run_id, universe_version_id, ticker, outcome, failure_stage, failure_reason,
 			history_first_at, history_last_at, history_sessions, bar_set_hash,
 			source_evidence, sector, industry,
-			market_cap_band, volatility_band, return_5d, return_20d, return_60d,
-			return_126d, high_52w_proximity, market_relative_strength,
+			market_cap_band, volatility_band, close_price, return_5d, return_20d,
+			return_60d, return_126d, high_52w_proximity, market_relative_strength,
 			industry_relative_strength, rs_acceleration, regression_annualized_slope,
 			regression_r2, efficiency_60d, max_drawdown_126d, natr_14,
 			volatility_adjusted_return, median_dollar_volume_20d,
@@ -690,7 +692,7 @@ func insertWeeklyLeaderQualification(
 		) VALUES (
 			$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 			$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-			$35,$36,$37,$38,$39,$40,$41,$42,$43,$44
+			$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45
 		)`,
 		q.RunID, q.UniverseVersionID, q.Ticker, q.Outcome,
 		nullableString(q.FailureStage), nullableString(q.FailureReason),
@@ -699,7 +701,8 @@ func insertWeeklyLeaderQualification(
 		normalizeTaxonomyValue(q.Sector), normalizeTaxonomyValue(q.Industry),
 		defaultString(q.MarketCapBand, "unknown"),
 		defaultString(q.VolatilityBand, "unknown"),
-		q.Return5, q.Return20, q.Return60, q.Return126, q.High52WeekProximity,
+		q.ClosePrice, q.Return5, q.Return20, q.Return60, q.Return126,
+		q.High52WeekProximity,
 		q.MarketRelativeStrength, q.IndustryRelativeStrength, q.RSAcceleration,
 		q.RegressionAnnualizedSlope, q.RegressionR2, q.Efficiency60,
 		q.MaxDrawdown126, q.NATR14, q.VolatilityAdjustedReturn,

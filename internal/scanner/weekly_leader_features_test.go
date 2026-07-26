@@ -30,10 +30,10 @@ func TestEvaluateWeeklyLeadersNoLookaheadAndCompleteDenominator(t *testing.T) {
 	cfg := leaderTestConfig()
 	first := EvaluateWeeklyLeaders(members, map[string][]data.Candle{
 		"AAA": aaa, "BBB": bbb,
-	}, benchmark, asOf, asOf.Add(15*time.Minute), cfg)
+	}, benchmark, asOf, asOf, asOf.Add(15*time.Minute), cfg)
 	second := EvaluateWeeklyLeaders(members, map[string][]data.Candle{
 		"AAA": withFuture, "BBB": bbb,
-	}, append(benchmark, future), asOf, asOf.Add(15*time.Minute), cfg)
+	}, append(benchmark, future), asOf, asOf, asOf.Add(15*time.Minute), cfg)
 	if len(first) != len(members) || len(second) != len(members) {
 		t.Fatalf("evaluations = %d/%d, want full denominator %d",
 			len(first), len(second), len(members))
@@ -49,6 +49,39 @@ func TestEvaluateWeeklyLeadersNoLookaheadAndCompleteDenominator(t *testing.T) {
 	}
 	if first[1].Outcome != "failed" || first[1].FailureStage != "insufficient_history" {
 		t.Fatalf("short-history outcome = %+v", first[1])
+	}
+}
+
+func TestEvaluateWeeklyLeadersRequiresTargetSessionBar(t *testing.T) {
+	target := time.Date(2026, time.July, 24, 20, 0, 0, 0, time.UTC)
+	stale := leaderTestBars(target.AddDate(0, 0, -1), 260, 0.001, 500_000)
+	current := leaderTestBars(target, 260, 0.001, 500_000)
+	future := current[len(current)-1]
+	future.Timestamp = target.AddDate(0, 0, 1)
+	member := store.SwingUniverseMember{
+		Ticker: "AAA", Eligible: true, Sector: "Tech", Industry: "Software",
+	}
+	cfg := leaderTestConfig()
+
+	staleTicker := EvaluateWeeklyLeaders(
+		[]store.SwingUniverseMember{member},
+		map[string][]data.Candle{"AAA": append(stale, future)},
+		current, target, target, target.Add(15*time.Minute), cfg,
+	)
+	if staleTicker[0].Outcome != "failed" ||
+		staleTicker[0].FailureStage != "bar_validation" ||
+		staleTicker[0].Features != nil || staleTicker[0].Rank != nil {
+		t.Fatalf("stale ticker was evaluated as current: %+v", staleTicker[0])
+	}
+
+	staleBenchmark := EvaluateWeeklyLeaders(
+		[]store.SwingUniverseMember{member},
+		map[string][]data.Candle{"AAA": current},
+		append(stale, future), target, target, target.Add(15*time.Minute), cfg,
+	)
+	if staleBenchmark[0].Outcome != "failed" ||
+		staleBenchmark[0].FailureStage != "benchmark_history" {
+		t.Fatalf("stale benchmark was accepted: %+v", staleBenchmark[0])
 	}
 }
 
@@ -137,6 +170,10 @@ func TestWeeklyLeaderFeatureDefinitions(t *testing.T) {
 	if features.High52WeekProximity <= 0 || features.High52WeekProximity > 1 {
 		t.Fatalf("52-week proximity = %v", features.High52WeekProximity)
 	}
+	if features.ClosePrice != smooth[len(smooth)-1].Close {
+		t.Fatalf("feature close = %v, want %v",
+			features.ClosePrice, smooth[len(smooth)-1].Close)
+	}
 	if features.Return126 <= features.Return20 {
 		t.Fatalf("independent horizons collapsed: 20=%v 126=%v",
 			features.Return20, features.Return126)
@@ -184,8 +221,12 @@ func TestWeeklyLeaderRankingIsDeterministicAndKeepsHighAndRSSeparate(t *testing.
 	cfg.IndustryMinPeers = 5
 	cfg.SelectionPercentile = 0.80
 	cfg.MinCompositeScore = 0.10
-	first := EvaluateWeeklyLeaders(members, bars, benchmark, asOf, asOf.Add(15*time.Minute), cfg)
-	second := EvaluateWeeklyLeaders(members, bars, benchmark, asOf, asOf.Add(15*time.Minute), cfg)
+	first := EvaluateWeeklyLeaders(
+		members, bars, benchmark, asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	)
+	second := EvaluateWeeklyLeaders(
+		members, bars, benchmark, asOf, asOf, asOf.Add(15*time.Minute), cfg,
+	)
 	for i := range first {
 		if first[i].Ticker != second[i].Ticker ||
 			*first[i].Rank != *second[i].Rank ||
@@ -216,7 +257,8 @@ func TestWeeklyLeaderRankingIsDeterministicAndKeepsHighAndRSSeparate(t *testing.
 	futureTaxonomy := asOf.Add(time.Hour)
 	futureTaxonomyMembers[0].TaxonomyAsOf = &futureTaxonomy
 	withoutFutureTaxonomy := EvaluateWeeklyLeaders(
-		futureTaxonomyMembers, bars, benchmark, asOf, asOf.Add(15*time.Minute), cfg,
+		futureTaxonomyMembers, bars, benchmark,
+		asOf, asOf, asOf.Add(15*time.Minute), cfg,
 	)
 	if withoutFutureTaxonomy[0].Features.IndustryRS60 != nil {
 		t.Fatal("taxonomy first effective after the decision cutoff leaked into industry RS")
@@ -273,7 +315,7 @@ func TestFragileOneGapSmallCapDoesNotOutrankSmoothLeadership(t *testing.T) {
 	cfg.SelectionPercentile = 0.80
 	cfg.MinCompositeScore = 0.10
 	evaluations := EvaluateWeeklyLeaders(
-		members, bars, benchmark, asOf, asOf.Add(15*time.Minute), cfg,
+		members, bars, benchmark, asOf, asOf, asOf.Add(15*time.Minute), cfg,
 	)
 	var gapScore float64
 	bestSmooth := 0.0
