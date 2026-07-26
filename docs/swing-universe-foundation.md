@@ -79,7 +79,8 @@ Company profiles are rate-limited and cached as observations. A refresh bounds
 the amount of missing/stale taxonomy it will fetch in one run. Never-attempted
 symbols are prioritized, while fresh Unknown/Unavailable observations wait for
 the taxonomy-age retry window so a fixed ticker prefix cannot consume every
-refresh quota. Successful
+refresh quota. Provider errors are persisted as timestamped Unavailable
+observations for the same reason. Successful
 members are retained when an individual profile or market-data batch fails, and
 the failed members receive an explicit failure stage. The configured missing
 evidence policies decide whether those members remain eligible; the decision is

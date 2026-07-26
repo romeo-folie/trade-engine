@@ -34,6 +34,10 @@ func NewFinnhubClient(apiKey string) *FinnhubClient {
 	}
 }
 
+// ProviderName identifies the provenance used when the universe builder records
+// successful and unavailable fundamentals observations.
+func (c *FinnhubClient) ProviderName() string { return "finnhub" }
+
 // throttle enforces the per-client rate limit. Returns ctx.Err() if the context
 // is cancelled during the wait rather than blocking until the interval elapses.
 func (c *FinnhubClient) throttle(ctx context.Context) error {

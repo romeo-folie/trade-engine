@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,8 @@ func (f fakeMarketData) FetchDailyBars(
 }
 
 type fakeFundamentals map[string]data.CompanyFundamentals
+
+func (f fakeFundamentals) ProviderName() string { return "fake-fundamentals" }
 
 func (f fakeFundamentals) FetchCompanyFundamentals(
 	_ context.Context, ticker string,
@@ -238,6 +241,21 @@ func TestRefreshRejectsTotalMarketDataOutage(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "daily bars are truncated below completed lookback",
+			market: fakeMarketData{
+				snapshots: data.StockSnapshotBatchResult{
+					Snapshots: map[string]data.StockSnapshotEvidence{
+						"A": {Symbol: "A", LatestTradePrice: 100},
+					},
+					Failures: map[string]error{},
+				},
+				bars: data.DailyBarsBatchResult{
+					Bars:     map[string][]data.Candle{"A": dailyBars("A", 19, 100, 20_000)},
+					Failures: map[string]error{},
+				},
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -300,6 +318,46 @@ func TestTaxonomyRefreshPrioritizesUnattemptedSymbols(t *testing.T) {
 	if result.TaxonomyRefreshes != 1 || repo.taxonomy["B"] == nil ||
 		repo.taxonomy["B"].Industry != "Software" {
 		t.Fatalf("unattempted symbol was starved: result=%+v taxonomy=%+v", result, repo.taxonomy)
+	}
+}
+
+func TestFailedTaxonomyAttemptAdvancesBoundedRefresh(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.TaxonomyRefreshLimit = 1
+	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	market := completeMarkets([]string{"A", "B"}, 20)
+	builder := Builder{
+		Config: cfg,
+		Assets: fakeAssets{assets: []data.StockAsset{
+			{Symbol: "A", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "B", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+		}},
+		Snapshots: market, Bars: market,
+		Fundamentals: fakeFundamentals{
+			"B": {MarketCapitalization: 600, Industry: "Software", Provider: "fake-fundamentals"},
+		},
+		Repository: repo,
+		Now:        func() time.Time { return now },
+	}
+
+	if _, err := builder.Refresh(context.Background()); err == nil {
+		t.Fatal("first refresh without any market-cap evidence unexpectedly completed")
+	}
+	failedAttempt := repo.taxonomy["A"]
+	if failedAttempt == nil || failedAttempt.Status != "unavailable" ||
+		failedAttempt.Provider != "fake-fundamentals" ||
+		!strings.Contains(string(failedAttempt.Evidence), "profile unavailable") {
+		t.Fatalf("failed attempt was not persisted: %+v", failedAttempt)
+	}
+
+	result, err := builder.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("second Refresh: %v", err)
+	}
+	if result.TaxonomyRefreshes != 1 || repo.taxonomy["B"] == nil ||
+		repo.taxonomy["B"].Industry != "Software" {
+		t.Fatalf("later symbol remained starved: result=%+v taxonomy=%+v", result, repo.taxonomy)
 	}
 }
 

@@ -175,7 +175,9 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			bars.Failures[symbol] = barsErr
 		}
 	}
-	if !hasCoherentMarketData(symbols, snapshots, bars) {
+	if !hasCoherentMarketData(
+		symbols, snapshots, bars, b.Config.DollarVolumeLookbackDays, startedAt,
+	) {
 		return result, errors.New(
 			"market-data refresh produced no symbol with both snapshot and daily-bar evidence",
 		)
@@ -239,13 +241,34 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 				ctx, candidate.symbol,
 			)
 			if fetchErr != nil {
+				if errors.Is(fetchErr, context.Canceled) ||
+					errors.Is(fetchErr, context.DeadlineExceeded) {
+					return result, fetchErr
+				}
+				observation := taxonomyUnavailableObservation(
+					candidate.symbol,
+					fundamentalsProviderName(b.Fundamentals),
+					fetchErr,
+					b.now(),
+				)
+				if _, insertErr := b.Repository.InsertTaxonomy(
+					ctx, *observation,
+				); insertErr != nil {
+					return result, fmt.Errorf(
+						"persist unavailable taxonomy for %s: %w",
+						candidate.symbol, insertErr,
+					)
+				}
+				taxonomy[candidate.symbol] = observation
 				taxonomyErrors[candidate.symbol] = fetchErr
 				continue
 			}
 			observation := taxonomyObservation(candidate.symbol, fundamentals, b.now())
 			taxonomy[candidate.symbol] = observation
 			if _, insertErr := b.Repository.InsertTaxonomy(ctx, *observation); insertErr != nil {
-				taxonomyErrors[candidate.symbol] = insertErr
+				return result, fmt.Errorf(
+					"persist taxonomy for %s: %w", candidate.symbol, insertErr,
+				)
 			}
 		}
 	}
@@ -496,6 +519,33 @@ func taxonomyObservation(
 	}
 }
 
+func taxonomyUnavailableObservation(
+	ticker, provider string,
+	cause error,
+	observedAt time.Time,
+) *store.CompanyTaxonomyObservation {
+	if strings.TrimSpace(provider) == "" {
+		provider = "unknown"
+	}
+	evidence, _ := json.Marshal(map[string]string{
+		"provider_error": errorString(cause),
+	})
+	return &store.CompanyTaxonomyObservation{
+		Ticker: ticker, Provider: provider,
+		EffectiveAt: observedAt, ObservedAt: observedAt,
+		Sector: store.UnknownTaxonomy, Industry: store.UnknownTaxonomy,
+		Status: "unavailable", Evidence: evidence,
+	}
+}
+
+func fundamentalsProviderName(provider FundamentalsProvider) string {
+	named, ok := provider.(interface{ ProviderName() string })
+	if !ok {
+		return "unknown"
+	}
+	return strings.TrimSpace(named.ProviderName())
+}
+
 func taxonomyRefreshPriority(
 	observation *store.CompanyTaxonomyObservation,
 	asOf time.Time,
@@ -583,6 +633,8 @@ func hasCoherentMarketData(
 	symbols []string,
 	snapshots data.StockSnapshotBatchResult,
 	bars data.DailyBarsBatchResult,
+	lookback int,
+	asOf time.Time,
 ) bool {
 	for _, symbol := range symbols {
 		snapshot, snapshotOK := snapshots.Snapshots[symbol]
@@ -590,10 +642,8 @@ func hasCoherentMarketData(
 			continue
 		}
 		if history, barsOK := bars.Bars[symbol]; barsOK {
-			for _, bar := range history {
-				if bar.Close > 0 && bar.Volume > 0 {
-					return true
-				}
+			if _, usable := medianDollarVolume(history, lookback, asOf); usable {
+				return true
 			}
 		}
 	}
