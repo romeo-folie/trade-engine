@@ -16,6 +16,7 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -344,11 +345,53 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		} else {
 			addErr = store.AddWatchlistItem(ctx, item)
 		}
+		if errors.Is(addErr, store.ErrWeeklyLeaderPromotionClaimLost) {
+			fallback, ok := ordinaryCandidateAfterWeeklyClaimLoss(sc.candidate)
+			if ok {
+				fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
+				recorder.fallbackScored(
+					fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
+				)
+				if scoreErr != nil {
+					if ctx.Err() != nil {
+						return ctx.Err()
+					}
+					slog.Warn("scanner: ordinary fallback score failed",
+						"ticker", fallback.Ticker, "err", scoreErr)
+					continue
+				}
+				if fallbackScore.Action != "add" ||
+					fallbackScore.Conviction < s.Cfg.MinConviction {
+					slog.Info("scanner: ordinary fallback rejected after leader claim loss",
+						"ticker", fallback.Ticker,
+						"action", fallbackScore.Action,
+						"conviction", fallbackScore.Conviction)
+					continue
+				}
+				timeframes = fallbackScore.Timeframes
+				if len(timeframes) == 0 {
+					timeframes = []string{"1H", "4H"}
+				}
+				strategies = candidateStrategies(
+					fallbackScore.Strategy, fallback.PullbackQualified,
+				)
+				item.Strategies = strategies
+				item.Timeframes = timeframes
+				item.MinConfidence = fallbackScore.Conviction
+				item.GraphContext = fallback.GraphContext
+				item.PullbackRequalificationComplete =
+					fallback.PullbackQualificationKnown
+				addErr = store.AddWatchlistItem(ctx, item)
+				sc = scoredCandidate{candidate: fallback, score: fallbackScore}
+			}
+		}
 		if addErr != nil {
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
-			s.markWeeklyLeaderCandidate(
-				ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
-			)
+			if !errors.Is(addErr, store.ErrWeeklyLeaderPromotionClaimLost) {
+				s.markWeeklyLeaderCandidate(
+					ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
+				)
+			}
 			slog.Warn("scanner: failed to add watchlist item",
 				"ticker", sc.candidate.Ticker, "err", addErr)
 			continue
@@ -421,6 +464,22 @@ func markPullbackQualification(all []SwingCandidate, result pullbackQualificatio
 	out := append([]SwingCandidate(nil), all...)
 	for i := range out {
 		_, out[i].PullbackQualificationKnown = result.known[out[i].Ticker]
+		if out[i].weeklyLeaderFallback != nil {
+			fallback := cloneSwingCandidate(*out[i].weeklyLeaderFallback)
+			outcome := result.outcomes[out[i].Ticker]
+			fallback.PullbackQualificationKnown = outcome.known
+			fallback.PullbackQualified = outcome.qualified
+			if outcome.known {
+				fallback.Price = outcome.candidate.Price
+				fallback.Volume = outcome.candidate.Volume
+				fallback.Return1M = outcome.candidate.Return1M
+				fallback.Return3M = outcome.candidate.Return3M
+				fallback.Return6M = outcome.candidate.Return6M
+				fallback.MarketCapMM = outcome.candidate.MarketCapMM
+				fallback.DollarVolume = outcome.candidate.DollarVolume
+			}
+			out[i].weeklyLeaderFallback = &fallback
+		}
 		qualifiedCandidate, ok := qualifiedByTicker[out[i].Ticker]
 		if !ok {
 			continue
@@ -471,6 +530,11 @@ func markQuarantinedQualificationKnown(
 		_, quarantined := required[out[i].Ticker]
 		_, definitive := known[out[i].Ticker]
 		out[i].PullbackQualificationKnown = quarantined && definitive
+		if out[i].weeklyLeaderFallback != nil {
+			fallback := cloneSwingCandidate(*out[i].weeklyLeaderFallback)
+			fallback.PullbackQualificationKnown = quarantined && definitive
+			out[i].weeklyLeaderFallback = &fallback
+		}
 	}
 	return out
 }

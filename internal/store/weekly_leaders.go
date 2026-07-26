@@ -190,7 +190,25 @@ func ClaimWeeklyLeaderRun(
 	claimed, err := scanWeeklyLeaderRun(row)
 	if err != nil {
 		if IsNoRows(err) {
-			return nil, false, nil
+			existing, lookupErr := scanWeeklyLeaderRun(GetDB().QueryRow(ctx, `
+				SELECT id, session_date, as_of, decision_at, universe_version_id,
+				       status, started_at, completed_at, lease_until, attempt_count,
+				       config_hash, config_snapshot, feature_version, benchmark,
+				       history_provider, COALESCE(error,''), eligible_universe_count,
+				       evaluated_count, qualified_count, failure_count, added_count,
+				       removed_count, persistent_count, leader_breadth,
+				       evaluation_coverage, failure_rate,
+				       COALESCE(previous_completed_run_id::text,'')
+				FROM weekly_leader_runs
+				WHERE session_date=$1 AND universe_version_id=$2 AND config_hash=$3`,
+				run.SessionDate, run.UniverseVersionID, run.ConfigHash,
+			))
+			if lookupErr != nil {
+				return nil, false, fmt.Errorf(
+					"load declined weekly leader run claim: %w", lookupErr,
+				)
+			}
+			return existing, false, nil
 		}
 		return nil, false, fmt.Errorf("claim weekly leader run: %w", err)
 	}
@@ -367,6 +385,11 @@ func CompleteWeeklyLeaderRun(
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("complete weekly leader run %q: lost claim", id)
+	}
+	if err := repairWeeklyLeaderSuccessors(
+		ctx, tx, run.ConfigHash, run.SessionDate,
+	); err != nil {
+		return err
 	}
 	if _, err := tx.Exec(ctx, `
 		WITH latest AS (
@@ -699,7 +722,8 @@ func previousWeeklyLeaders(
 	err := tx.QueryRow(ctx, `
 		SELECT id FROM weekly_leader_runs
 		WHERE status='completed' AND session_date < $1 AND config_hash=$2
-		ORDER BY session_date DESC, completed_at DESC LIMIT 1`,
+		ORDER BY session_date DESC, decision_at DESC, completed_at DESC, id DESC
+		LIMIT 1`,
 		sessionDate, configHash,
 	).Scan(&previousID)
 	if err != nil {
@@ -728,6 +752,180 @@ func previousWeeklyLeaders(
 		out[q.Ticker] = q
 	}
 	return previousID, out, rows.Err()
+}
+
+// repairWeeklyLeaderSuccessors rebuilds the mutable, lineage-derived projection
+// after a late predecessor completes. Raw measurements, scores, outcomes, and
+// promotion state remain untouched.
+func repairWeeklyLeaderSuccessors(
+	ctx context.Context,
+	tx pgx.Tx,
+	configHash string,
+	afterSession time.Time,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT id, session_date
+		FROM weekly_leader_runs
+		WHERE status='completed' AND config_hash=$1 AND session_date>$2
+		ORDER BY session_date, decision_at, completed_at, id`,
+		configHash, afterSession,
+	)
+	if err != nil {
+		return fmt.Errorf("list weekly leader lineage successors: %w", err)
+	}
+	type successor struct {
+		id          string
+		sessionDate time.Time
+	}
+	var successors []successor
+	for rows.Next() {
+		var item successor
+		if err := rows.Scan(&item.id, &item.sessionDate); err != nil {
+			rows.Close()
+			return err
+		}
+		successors = append(successors, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	for _, item := range successors {
+		previousID, previous, err := previousWeeklyLeaders(
+			ctx, tx, item.sessionDate, configHash,
+		)
+		if err != nil {
+			return err
+		}
+		qualifications, err := loadWeeklyLeaderLineageQualifications(
+			ctx, tx, item.id,
+		)
+		if err != nil {
+			return err
+		}
+		current := make(map[string]WeeklyLeaderQualification, len(qualifications))
+		for i := range qualifications {
+			q := &qualifications[i]
+			prior, wasLeader := previous[q.Ticker]
+			q.WasQualifiedPrevious = wasLeader
+			if q.Outcome == "qualified" {
+				if wasLeader {
+					q.QualificationStreak = prior.QualificationStreak + 1
+					q.QualifiedSince = prior.QualifiedSince
+				} else {
+					q.QualificationStreak = 1
+					date := item.sessionDate
+					q.QualifiedSince = &date
+				}
+			} else {
+				q.QualificationStreak = 0
+				q.QualifiedSince = nil
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE weekly_leader_qualifications
+				SET was_qualified_previous=$3, qualification_streak=$4,
+				    qualified_since=$5
+				WHERE run_id=$1 AND ticker=$2`,
+				item.id, q.Ticker, q.WasQualifiedPrevious,
+				q.QualificationStreak, q.QualifiedSince,
+			); err != nil {
+				return fmt.Errorf("repair weekly leader qualification lineage: %w", err)
+			}
+			current[q.Ticker] = *q
+		}
+		if _, err := tx.Exec(ctx,
+			"DELETE FROM weekly_leader_transitions WHERE run_id=$1", item.id,
+		); err != nil {
+			return fmt.Errorf("clear repaired weekly leader transitions: %w", err)
+		}
+		transitions := buildWeeklyLeaderTransitions(
+			item.id, previousID, previous, current,
+		)
+		for _, transition := range transitions {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO weekly_leader_transitions (
+					run_id, ticker, event, previous_run_id, previous_score,
+					current_score, previous_rank, current_rank, reason
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+				transition.RunID, transition.Ticker, transition.Event,
+				nullableUUID(transition.PreviousRunID), transition.PreviousScore,
+				transition.CurrentScore, transition.PreviousRank,
+				transition.CurrentRank, transition.Reason,
+			); err != nil {
+				return fmt.Errorf("insert repaired weekly leader transition: %w", err)
+			}
+		}
+		if _, err := tx.Exec(ctx,
+			"DELETE FROM weekly_leader_breadth WHERE run_id=$1", item.id,
+		); err != nil {
+			return fmt.Errorf("clear repaired weekly leader breadth: %w", err)
+		}
+		breadth := buildWeeklyLeaderBreadth(item.id, qualifications, transitions)
+		for _, row := range breadth {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO weekly_leader_breadth (
+					run_id, dimension_type, dimension_value, eligible_count,
+					evaluated_count, qualified_count, failed_count, added_count,
+					removed_count, persistent_count, breadth, coverage
+				) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+				row.RunID, row.DimensionType, row.DimensionValue,
+				row.EligibleCount, row.EvaluatedCount, row.QualifiedCount,
+				row.FailedCount, row.AddedCount, row.RemovedCount,
+				row.PersistentCount, row.Breadth, row.Coverage,
+			); err != nil {
+				return fmt.Errorf("insert repaired weekly leader breadth: %w", err)
+			}
+		}
+		overall := breadth[0]
+		if _, err := tx.Exec(ctx, `
+			UPDATE weekly_leader_runs
+			SET previous_completed_run_id=$2, eligible_universe_count=$3,
+			    evaluated_count=$4, qualified_count=$5, failure_count=$6,
+			    added_count=$7, removed_count=$8, persistent_count=$9,
+			    leader_breadth=$10, evaluation_coverage=$11, failure_rate=$12
+			WHERE id=$1 AND status='completed'`,
+			item.id, nullableUUID(previousID), overall.EligibleCount,
+			overall.EvaluatedCount, overall.QualifiedCount, overall.FailedCount,
+			overall.AddedCount, overall.RemovedCount, overall.PersistentCount,
+			overall.Breadth, overall.Coverage,
+			ratio(overall.FailedCount, overall.EligibleCount),
+		); err != nil {
+			return fmt.Errorf("update repaired weekly leader run lineage: %w", err)
+		}
+	}
+	return nil
+}
+
+func loadWeeklyLeaderLineageQualifications(
+	ctx context.Context, tx pgx.Tx, runID string,
+) ([]WeeklyLeaderQualification, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT ticker, outcome, sector, industry, market_cap_band,
+		       composite_score, rank, was_qualified_previous,
+		       qualification_streak, qualified_since
+		FROM weekly_leader_qualifications
+		WHERE run_id=$1
+		ORDER BY ticker`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("load weekly leader lineage qualifications: %w", err)
+	}
+	defer rows.Close()
+	var out []WeeklyLeaderQualification
+	for rows.Next() {
+		var q WeeklyLeaderQualification
+		q.RunID = runID
+		if err := rows.Scan(
+			&q.Ticker, &q.Outcome, &q.Sector, &q.Industry, &q.MarketCapBand,
+			&q.CompositeScore, &q.Rank, &q.WasQualifiedPrevious,
+			&q.QualificationStreak, &q.QualifiedSince,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
 }
 
 func buildWeeklyLeaderTransitions(

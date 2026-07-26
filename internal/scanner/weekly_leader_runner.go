@@ -83,10 +83,23 @@ func (r *WeeklyLeaderRunner) RunSession(
 		return err
 	}
 	if !ok {
-		slog.Info("weekly leader: session already completed or actively claimed",
-			"session_date", session.Date.Format("2006-01-02"),
-			"universe_version_id", universe.ID)
-		return nil
+		if claimed != nil && claimed.Status == "completed" {
+			slog.Info("weekly leader: session already completed",
+				"session_date", session.Date.Format("2006-01-02"),
+				"universe_version_id", universe.ID)
+			return nil
+		}
+		if claimed != nil && claimed.Status == "running" {
+			return &weeklyLeaderRunLeaseActiveError{
+				sessionDate: session.Date,
+				retryAt:     claimed.LeaseUntil,
+			}
+		}
+		status := "missing"
+		if claimed != nil {
+			status = claimed.Status
+		}
+		return fmt.Errorf("weekly leader run claim declined with unexpected status %s", status)
 	}
 	defer func() {
 		if runErr == nil {

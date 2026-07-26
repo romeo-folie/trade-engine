@@ -2,6 +2,8 @@ package scanner
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -11,6 +13,16 @@ import (
 
 type weeklyLeaderSessionJob interface {
 	RunSession(context.Context, engine.USMarketSession, time.Time) error
+}
+
+type weeklyLeaderRunLeaseActiveError struct {
+	sessionDate time.Time
+	retryAt     time.Time
+}
+
+func (e *weeklyLeaderRunLeaseActiveError) Error() string {
+	return fmt.Sprintf("weekly leader session %s is leased until %s",
+		e.sessionDate.Format("2006-01-02"), e.retryAt.Format(time.RFC3339))
 }
 
 // WeeklyLeaderScheduler uses one-shot timers so a DST transition, weekend, or
@@ -39,7 +51,15 @@ func (s *WeeklyLeaderScheduler) Run(ctx context.Context) error {
 			return nil
 		}
 		var waitUntil time.Time
-		if err != nil {
+		var activeLease *weeklyLeaderRunLeaseActiveError
+		if errors.As(err, &activeLease) {
+			slog.Info("weekly leader: session actively claimed; retrying at lease boundary",
+				"session_date", session.Date.Format("2006-01-02"),
+				"retry_at", activeLease.retryAt)
+			session, decisionAt, waitUntil = nextWeeklyLeaderLeaseAttempt(
+				s.now(), session, decisionAt, delay, activeLease.retryAt,
+			)
+		} else if err != nil {
 			slog.Error("weekly leader: session failed; scheduling retry",
 				"session_date", session.Date.Format("2006-01-02"), "err", err)
 			session, decisionAt, waitUntil = nextWeeklyLeaderAttempt(
@@ -59,6 +79,28 @@ func (s *WeeklyLeaderScheduler) Run(ctx context.Context) error {
 		case <-s.after(wait):
 		}
 	}
+}
+
+func nextWeeklyLeaderLeaseAttempt(
+	now time.Time,
+	blocked engine.USMarketSession,
+	decisionAt time.Time,
+	delay time.Duration,
+	leaseUntil time.Time,
+) (engine.USMarketSession, time.Time, time.Time) {
+	latest := engine.MostRecentCompletedMarketSession(now, delay)
+	if latest.Date.After(blocked.Date) {
+		latestDecision := latest.Close.Add(delay)
+		return latest, latestDecision, now
+	}
+	if leaseUntil.Before(now) {
+		leaseUntil = now
+	}
+	nextSession, nextRun := engine.NextMarketCloseRun(now, delay)
+	if !nextRun.After(leaseUntil) {
+		return nextSession, nextRun, nextRun
+	}
+	return blocked, decisionAt, leaseUntil
 }
 
 func nextWeeklyLeaderAttempt(

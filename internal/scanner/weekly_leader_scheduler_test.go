@@ -86,3 +86,83 @@ func TestWeeklyLeaderRetryCannotStarveANewerSession(t *testing.T) {
 		t.Fatalf("new-session retry timing = decision %v wait %v", decisionAt, waitUntil)
 	}
 }
+
+func TestWeeklyLeaderLeaseRetryKeepsSessionAndDecisionBoundary(t *testing.T) {
+	now, _ := time.Parse(time.RFC3339, "2024-03-15T20:20:00Z")
+	session := engine.MostRecentCompletedMarketSession(now, 15*time.Minute)
+	decisionAt := session.Close.Add(15 * time.Minute)
+	retryAt := now.Add(45 * time.Minute)
+	gotSession, gotDecision, gotWait := nextWeeklyLeaderLeaseAttempt(
+		now, session, decisionAt, 15*time.Minute, retryAt,
+	)
+	if !gotSession.Date.Equal(session.Date) ||
+		!gotDecision.Equal(decisionAt) || !gotWait.Equal(retryAt) {
+		t.Fatalf("lease retry changed boundary: session=%v decision=%v wait=%v",
+			gotSession.Date, gotDecision, gotWait)
+	}
+}
+
+func TestWeeklyLeaderLeaseRetryRollsToNewerCompletedSession(t *testing.T) {
+	fridayNow, _ := time.Parse(time.RFC3339, "2024-03-15T20:20:00Z")
+	friday := engine.MostRecentCompletedMarketSession(fridayNow, 15*time.Minute)
+	mondayNow, _ := time.Parse(time.RFC3339, "2024-03-18T20:20:00Z")
+	next, decisionAt, waitUntil := nextWeeklyLeaderLeaseAttempt(
+		mondayNow, friday, friday.Close.Add(15*time.Minute), 15*time.Minute,
+		mondayNow.Add(time.Hour),
+	)
+	if got := next.Date.Format("2006-01-02"); got != "2024-03-18" ||
+		!decisionAt.Equal(next.Close.Add(15*time.Minute)) ||
+		!waitUntil.Equal(mondayNow) {
+		t.Fatalf("lease rollover = %s/%v/%v", got, decisionAt, waitUntil)
+	}
+}
+
+func TestWeeklyLeaderSchedulerRetriesActiveLeaseAtBoundary(t *testing.T) {
+	now, _ := time.Parse(time.RFC3339, "2024-03-15T20:20:00Z")
+	retryAt := now.Add(45 * time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls int
+	var firstSession, secondSession engine.USMarketSession
+	var firstDecision, secondDecision time.Time
+	var waits []time.Duration
+	scheduler := WeeklyLeaderScheduler{
+		Cfg: config.WeeklyLeaderConfig{
+			Enabled: true, AfterCloseDelayMinutes: 15,
+		},
+		Now: func() time.Time { return now },
+		After: func(wait time.Duration) <-chan time.Time {
+			waits = append(waits, wait)
+			now = now.Add(wait)
+			ch := make(chan time.Time, 1)
+			ch <- now
+			return ch
+		},
+		Job: weeklyLeaderJobFunc(func(
+			_ context.Context, session engine.USMarketSession, decisionAt time.Time,
+		) error {
+			calls++
+			if calls == 1 {
+				firstSession, firstDecision = session, decisionAt
+				return &weeklyLeaderRunLeaseActiveError{
+					sessionDate: session.Date, retryAt: retryAt,
+				}
+			}
+			secondSession, secondDecision = session, decisionAt
+			cancel()
+			return nil
+		}),
+	}
+	if err := scheduler.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 || len(waits) != 1 || waits[0] != 45*time.Minute ||
+		!firstSession.Date.Equal(secondSession.Date) ||
+		!firstDecision.Equal(secondDecision) {
+		t.Fatalf(
+			"active lease retry = calls %d waits %v sessions %v/%v decisions %v/%v",
+			calls, waits, firstSession.Date, secondSession.Date,
+			firstDecision, secondDecision,
+		)
+	}
+}

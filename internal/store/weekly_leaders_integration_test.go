@@ -51,8 +51,10 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("first claim = %+v/%v/%v", first, claimed, err)
 	}
-	if _, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour); err != nil || claimed {
-		t.Fatalf("duplicate active claim = %v/%v, want no claim", claimed, err)
+	activeRun, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour)
+	if err != nil || claimed || activeRun == nil || activeRun.Status != "running" ||
+		activeRun.ID != first.ID || !activeRun.LeaseUntil.Equal(first.LeaseUntil) {
+		t.Fatalf("duplicate active claim = %+v/%v/%v, want existing lease", activeRun, claimed, err)
 	}
 	scoreA, coverage, rankA := 0.91, 1.0, 1
 	return20, return60, return126 := 0.10, 0.20, 0.35
@@ -84,8 +86,9 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
-	if _, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour); err != nil || claimed {
-		t.Fatalf("completed rerun claim = %v/%v, want no claim", claimed, err)
+	completed, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour)
+	if err != nil || claimed || completed == nil || completed.Status != "completed" {
+		t.Fatalf("completed rerun claim = %+v/%v/%v, want completed row", completed, claimed, err)
 	}
 	if got, err := store.GetLatestCompletedWeeklyLeaderRunAsOf(
 		ctx, runInput.DecisionAt.Add(-time.Nanosecond),
@@ -371,6 +374,84 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	if streak != 2 {
 		t.Fatalf("persistent qualification streak = %d, want 2", streak)
 	}
+
+	thirdInput := runInput
+	thirdInput.SessionDate = base.AddDate(0, 0, 2)
+	thirdInput.AsOf = thirdInput.SessionDate
+	thirdInput.DecisionAt = thirdInput.AsOf.Add(15 * time.Minute)
+	thirdInput.StartedAt = thirdInput.AsOf.Add(16 * time.Minute)
+	third, claimed, err := store.ClaimWeeklyLeaderRun(ctx, thirdInput, 7*24*time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("third session claim = %+v/%v/%v", third, claimed, err)
+	}
+
+	fourthInput := runInput
+	fourthInput.SessionDate = base.AddDate(0, 0, 3)
+	fourthInput.AsOf = fourthInput.SessionDate
+	fourthInput.DecisionAt = fourthInput.AsOf.Add(15 * time.Minute)
+	fourthInput.StartedAt = fourthInput.AsOf.Add(16 * time.Minute)
+	fourth, claimed, err := store.ClaimWeeklyLeaderRun(ctx, fourthInput, time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("fourth session claim = %+v/%v/%v", fourth, claimed, err)
+	}
+	lineageQualifications := append(
+		[]store.WeeklyLeaderQualification(nil), qualifications...,
+	)
+	lineageQualifications[0].Outcome = "not_qualified"
+	lineageQualifications[0].PromotionStatus = "not_requested"
+	lineageQualifications[1].PromotionStatus = "pending"
+	for i := range lineageQualifications {
+		lineageQualifications[i].RunID = fourth.ID
+	}
+	fourthCompletedAt := fourthInput.StartedAt.Add(time.Minute)
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, fourth.ID, fourth.AttemptCount, fourthCompletedAt,
+		lineageQualifications, "fixture-benchmark-4",
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	lateThirdQualifications := append(
+		[]store.WeeklyLeaderQualification(nil), lineageQualifications...,
+	)
+	for i := range lateThirdQualifications {
+		lateThirdQualifications[i].RunID = third.ID
+		lateThirdQualifications[i].PromotionStatus = "not_requested"
+	}
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, third.ID, third.AttemptCount, fourthCompletedAt.Add(time.Minute),
+		lateThirdQualifications, "fixture-benchmark-3",
+	); err != nil {
+		t.Fatal(err)
+	}
+	var repairedPreviousID, repairedPromotionStatus string
+	var repairedStreak, repairedAdded, repairedPersistent, repairedRemoved int
+	var repairedScore float64
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COALESCE(r.previous_completed_run_id::text,''),
+		       r.added_count, r.persistent_count, r.removed_count,
+		       q.qualification_streak, q.promotion_status, q.composite_score
+		FROM weekly_leader_runs r
+		JOIN weekly_leader_qualifications q
+		  ON q.run_id=r.id AND q.ticker='TEST_WL_BBB'
+		WHERE r.id=$1`, fourth.ID,
+	).Scan(
+		&repairedPreviousID, &repairedAdded, &repairedPersistent,
+		&repairedRemoved, &repairedStreak, &repairedPromotionStatus,
+		&repairedScore,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if repairedPreviousID != third.ID || repairedStreak != 3 ||
+		repairedAdded != 0 || repairedPersistent != 1 || repairedRemoved != 0 ||
+		repairedPromotionStatus != "pending" || repairedScore != scoreB {
+		t.Fatalf(
+			"repaired successor = previous %s streak %d transitions %d/%d/%d promotion %s score %.2f",
+			repairedPreviousID, repairedStreak, repairedAdded,
+			repairedPersistent, repairedRemoved, repairedPromotionStatus,
+			repairedScore,
+		)
+	}
 }
 
 func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
@@ -429,6 +510,47 @@ func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 	if err := store.FailWeeklyLeaderRun(
 		ctx, reclaimed.ID, reclaimed.AttemptCount,
 		input.StartedAt.Add(4*time.Minute), errors.New("fixture cleanup"),
+	); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWeeklyLeaderRunLeaseBoundaryCanBeReclaimed(t *testing.T) {
+	ctx := context.Background()
+	var versionID string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT id FROM swing_universe_versions
+		WHERE provider='test-weekly-leader' AND status='completed'
+		ORDER BY as_of DESC LIMIT 1`).Scan(&versionID); err != nil {
+		t.Skip("weekly leader lifecycle fixture unavailable")
+	}
+	base := time.Date(2026, time.July, 24, 20, 0, 0, 0, time.UTC)
+	input := store.WeeklyLeaderRun{
+		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
+		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
+		ConfigHash:     "weekly-leader-integration-lease-boundary",
+		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v1",
+		Benchmark: "SPY", HistoryProvider: "test",
+	}
+	first, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("initial lease claim = %+v/%v/%v", first, claimed, err)
+	}
+	input.StartedAt = first.LeaseUntil.Add(-time.Nanosecond)
+	active, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)
+	if err != nil || claimed || active == nil || active.ID != first.ID ||
+		active.AttemptCount != first.AttemptCount {
+		t.Fatalf("pre-boundary claim = %+v/%v/%v", active, claimed, err)
+	}
+	input.StartedAt = first.LeaseUntil
+	reclaimed, claimed, err := store.ClaimWeeklyLeaderRun(ctx, input, time.Hour)
+	if err != nil || !claimed || reclaimed == nil || reclaimed.ID != first.ID ||
+		reclaimed.AttemptCount != first.AttemptCount+1 {
+		t.Fatalf("boundary reclaim = %+v/%v/%v", reclaimed, claimed, err)
+	}
+	if err := store.FailWeeklyLeaderRun(
+		ctx, reclaimed.ID, reclaimed.AttemptCount,
+		reclaimed.StartedAt.Add(time.Minute), errors.New("fixture cleanup"),
 	); err != nil {
 		t.Fatal(err)
 	}

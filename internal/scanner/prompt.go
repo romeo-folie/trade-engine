@@ -45,6 +45,7 @@ type SwingCandidate struct {
 	// evaluation. It is empty for all other discovery sources.
 	WeeklyLeaderRunID      string
 	WeeklyLeaderClaimToken string
+	weeklyLeaderFallback   *SwingCandidate
 	UniverseVersionID      string
 	UniverseAsOf           time.Time
 	RemovalStage           string

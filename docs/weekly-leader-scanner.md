@@ -113,6 +113,11 @@ leased run is a no-op; failed and expired claims are reclaimable. Results,
 transitions, breadth, and the completed status publish in one transaction, so
 readers never observe a partial run.
 
+Raw point-in-time measurements, scores, and outcomes remain immutable. Streaks,
+transitions, breadth turnover, and predecessor links are derived projections:
+if an earlier session completes late, the database transactionally repairs that
+session's later same-config lineage so chronological history remains coherent.
+
 Candidate promotion has a separate atomic, token-fenced claim. Concurrent scanner
 processes cannot score or write the same pending leader. It uses the configured
 run lease so a crashed scanner cannot strand the latest leaders in `processing`.

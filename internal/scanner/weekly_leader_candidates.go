@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"time"
@@ -78,6 +79,9 @@ func mergeWeeklyLeaderCandidates(
 			continue
 		}
 		candidate := &out[index]
+		fallback := cloneSwingCandidate(*candidate)
+		fallback.weeklyLeaderFallback = nil
+		candidate.weeklyLeaderFallback = &fallback
 		candidate.Sources = mergeSources(candidate.Sources, leader.Sources)
 		if candidate.SourceScores == nil {
 			candidate.SourceScores = make(map[string]float64)
@@ -102,6 +106,54 @@ func mergeWeeklyLeaderCandidates(
 		}
 	}
 	return out
+}
+
+func ordinaryCandidateAfterWeeklyClaimLoss(
+	candidate SwingCandidate,
+) (SwingCandidate, bool) {
+	if candidate.weeklyLeaderFallback == nil {
+		return SwingCandidate{}, false
+	}
+	fallback := cloneSwingCandidate(*candidate.weeklyLeaderFallback)
+	fallback.News = append([]SwingNewsItem(nil), candidate.News...)
+	fallback.PullbackQualified = candidate.PullbackQualified
+	fallback.PullbackQualificationKnown = candidate.PullbackQualificationKnown
+	filteredSources := fallback.Sources[:0]
+	for _, source := range fallback.Sources {
+		if source != "weekly_leader" {
+			filteredSources = append(filteredSources, source)
+		}
+	}
+	fallback.Sources = filteredSources
+	delete(fallback.SourceScores, "weekly_leader")
+	fallback.WeeklyLeaderRunID = ""
+	fallback.WeeklyLeaderClaimToken = ""
+	fallback.UniverseVersionID = ""
+	fallback.UniverseAsOf = time.Time{}
+	fallback.weeklyLeaderFallback = nil
+	return fallback, len(fallback.Sources) > 0
+}
+
+func cloneSwingCandidate(candidate SwingCandidate) SwingCandidate {
+	clone := candidate
+	clone.Sources = append([]string(nil), candidate.Sources...)
+	clone.News = append([]SwingNewsItem(nil), candidate.News...)
+	clone.TaxonomyEvidence = append(json.RawMessage(nil), candidate.TaxonomyEvidence...)
+	if candidate.SourceScores != nil {
+		clone.SourceScores = make(map[string]float64, len(candidate.SourceScores))
+		for source, score := range candidate.SourceScores {
+			clone.SourceScores[source] = score
+		}
+	}
+	if candidate.UniverseMember != nil {
+		member := *candidate.UniverseMember
+		clone.UniverseMember = &member
+	}
+	if candidate.TaxonomyAsOf != nil {
+		asOf := *candidate.TaxonomyAsOf
+		clone.TaxonomyAsOf = &asOf
+	}
+	return clone
 }
 
 func (s *MarketScanner) markWeeklyLeaderCandidates(
