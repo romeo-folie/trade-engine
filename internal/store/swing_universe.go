@@ -200,26 +200,46 @@ func ListEligibleSwingUniverseMembers(
 }
 
 // ListSwingUniverseMembers enumerates the complete immutable asset-master
-// snapshot. eligibleOnly selects the scanner denominator without losing the
-// ability to audit every excluded or failed symbol.
+// snapshot, but only after its parent version completed successfully.
+// eligibleOnly selects the scanner denominator.
 func ListSwingUniverseMembers(
 	ctx context.Context, versionID string, eligibleOnly bool,
 ) ([]SwingUniverseMember, error) {
+	return listSwingUniverseMembers(ctx, versionID, eligibleOnly, true)
+}
+
+// ListSwingUniverseMembersForAudit is the explicit forensic path for inspecting
+// partial members from building or failed versions. Trading and research
+// consumers must use ListSwingUniverseMembers or ListEligibleSwingUniverseMembers.
+func ListSwingUniverseMembersForAudit(
+	ctx context.Context, versionID string,
+) ([]SwingUniverseMember, error) {
+	return listSwingUniverseMembers(ctx, versionID, false, false)
+}
+
+func listSwingUniverseMembers(
+	ctx context.Context, versionID string, eligibleOnly, completedOnly bool,
+) ([]SwingUniverseMember, error) {
 	eligiblePredicate := ""
 	if eligibleOnly {
-		eligiblePredicate = " AND eligible"
+		eligiblePredicate = " AND m.eligible"
+	}
+	completedPredicate := ""
+	if completedOnly {
+		completedPredicate = " AND v.status='completed'"
 	}
 	rows, err := GetDB().Query(ctx, `
-		SELECT universe_version_id, ticker, eligible, COALESCE(removal_stage,''),
-		       COALESCE(failure_stage,''), COALESCE(failure_reason,''),
-		       COALESCE(asset_id,''), COALESCE(name,''),
-		       COALESCE(security_type,''), COALESCE(exchange,''), active, tradable, price,
-		       market_cap_mm, dollar_volume, spread_bps, data_available,
-		       sector, industry, taxonomy_status, taxonomy_as_of,
-		       COALESCE(taxonomy_provider,''), taxonomy_evidence, source_evidence
-		FROM swing_universe_members
-		WHERE universe_version_id=$1`+eligiblePredicate+`
-		ORDER BY ticker`, versionID,
+		SELECT m.universe_version_id, m.ticker, m.eligible, COALESCE(m.removal_stage,''),
+		       COALESCE(m.failure_stage,''), COALESCE(m.failure_reason,''),
+		       COALESCE(m.asset_id,''), COALESCE(m.name,''),
+		       COALESCE(m.security_type,''), COALESCE(m.exchange,''), m.active, m.tradable, m.price,
+		       m.market_cap_mm, m.dollar_volume, m.spread_bps, m.data_available,
+		       m.sector, m.industry, m.taxonomy_status, m.taxonomy_as_of,
+		       COALESCE(m.taxonomy_provider,''), m.taxonomy_evidence, m.source_evidence
+		FROM swing_universe_members m
+		JOIN swing_universe_versions v ON v.id=m.universe_version_id
+		WHERE m.universe_version_id=$1`+completedPredicate+eligiblePredicate+`
+		ORDER BY m.ticker`, versionID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("list swing universe members: %w", err)
@@ -234,6 +254,37 @@ func ListSwingUniverseMembers(
 		members = append(members, member)
 	}
 	return members, rows.Err()
+}
+
+// GetCompletedSwingUniverseVersionByIDAsOf validates exact scanner lineage.
+// The version must have been effective, captured, and completed by asOf; an
+// invalid, unfinished, failed, or future version returns nil without fallback.
+func GetCompletedSwingUniverseVersionByIDAsOf(
+	ctx context.Context, versionID string, asOf time.Time,
+) (*SwingUniverseVersion, error) {
+	if strings.TrimSpace(versionID) == "" {
+		return nil, nil
+	}
+	row := GetDB().QueryRow(ctx, `
+		SELECT id, provider, as_of, captured_at, completed_at, status,
+		       COALESCE(error,''), filters, source_evidence, member_count,
+		       eligible_count, unknown_taxonomy_count, stale_taxonomy_count
+		FROM swing_universe_versions
+		WHERE id=$1
+		  AND status='completed'
+		  AND as_of <= $2
+		  AND captured_at <= $2
+		  AND completed_at <= $2`,
+		versionID, asOf,
+	)
+	version, err := scanSwingUniverseVersion(row)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get completed swing universe %q as of: %w", versionID, err)
+	}
+	return version, nil
 }
 
 func GetLatestCompletedSwingUniverseVersionAsOf(
@@ -252,20 +303,14 @@ func GetLatestCompletedSwingUniverseVersionAsOf(
 		LIMIT 1`,
 		asOf,
 	)
-	var version SwingUniverseVersion
-	err := row.Scan(
-		&version.ID, &version.Provider, &version.AsOf, &version.CapturedAt,
-		&version.CompletedAt, &version.Status, &version.Error, &version.Filters,
-		&version.SourceEvidence, &version.MemberCount, &version.EligibleCount,
-		&version.UnknownTaxonomyCount, &version.StaleTaxonomyCount,
-	)
+	version, err := scanSwingUniverseVersion(row)
 	if err != nil {
 		if IsNoRows(err) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("get completed swing universe as of: %w", err)
 	}
-	return &version, nil
+	return version, nil
 }
 
 // GetUsableSwingUniverseVersion returns only a version that both existed at the
@@ -451,6 +496,20 @@ func nullableInterval(value time.Duration) any {
 
 type rowScanner interface {
 	Scan(dest ...any) error
+}
+
+func scanSwingUniverseVersion(row rowScanner) (*SwingUniverseVersion, error) {
+	var version SwingUniverseVersion
+	err := row.Scan(
+		&version.ID, &version.Provider, &version.AsOf, &version.CapturedAt,
+		&version.CompletedAt, &version.Status, &version.Error, &version.Filters,
+		&version.SourceEvidence, &version.MemberCount, &version.EligibleCount,
+		&version.UnknownTaxonomyCount, &version.StaleTaxonomyCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &version, nil
 }
 
 func scanSwingUniverseMember(row rowScanner) (SwingUniverseMember, error) {

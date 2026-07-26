@@ -2,6 +2,7 @@ package universe
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -160,15 +161,145 @@ func TestRefreshUnknownTaxonomyDoesNotInventClassification(t *testing.T) {
 }
 
 func TestMedianDollarVolumeRequiresCompleteLookback(t *testing.T) {
-	if _, ok := medianDollarVolume(dailyBars("A", 19, 10, 100), 20); ok {
+	asOf := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	if _, ok := medianDollarVolume(dailyBars("A", 19, 10, 100), 20, asOf); ok {
 		t.Fatal("short history unexpectedly qualified")
 	}
 	got, ok := medianDollarVolume([]data.Candle{
 		{Close: 10, Volume: 10}, {Close: 20, Volume: 10},
 		{Close: 30, Volume: 10}, {Close: 40, Volume: 10},
-	}, 4)
+	}, 4, asOf)
 	if !ok || got != 250 {
 		t.Fatalf("median = %v, %v; want 250, true", got, ok)
+	}
+}
+
+func TestMedianDollarVolumeExcludesInProgressSession(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatalf("load New York timezone: %v", err)
+	}
+	asOf := time.Date(2026, 7, 24, 15, 0, 0, 0, location)
+	bars := []data.Candle{
+		{
+			Timestamp: time.Date(2026, 7, 22, 0, 0, 0, 0, location),
+			Close:     10, Volume: 10,
+		},
+		{
+			Timestamp: time.Date(2026, 7, 23, 0, 0, 0, 0, location),
+			Close:     20, Volume: 10,
+		},
+		{
+			Timestamp: time.Date(2026, 7, 24, 0, 0, 0, 0, location),
+			Close:     1, Volume: 1,
+		},
+	}
+	got, ok := medianDollarVolume(bars, 2, asOf)
+	if !ok || got != 150 {
+		t.Fatalf("pre-close median = %v, %v; want 150, true", got, ok)
+	}
+	got, ok = medianDollarVolume(bars, 2, asOf.Add(time.Hour))
+	if !ok || got != 100.5 {
+		t.Fatalf("post-close median = %v, %v; want 100.5, true", got, ok)
+	}
+}
+
+func TestRefreshRejectsTotalMarketDataOutage(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name   string
+		market fakeMarketData
+	}{
+		{
+			name: "all snapshot batches fail",
+			market: fakeMarketData{
+				snapshots: data.StockSnapshotBatchResult{
+					Snapshots: map[string]data.StockSnapshotEvidence{},
+					Failures:  map[string]error{"A": errors.New("snapshot outage")},
+				},
+				bars: data.DailyBarsBatchResult{
+					Bars:     map[string][]data.Candle{"A": dailyBars("A", 20, 100, 20_000)},
+					Failures: map[string]error{},
+				},
+			},
+		},
+		{
+			name: "all daily bar batches fail",
+			market: fakeMarketData{
+				snapshots: data.StockSnapshotBatchResult{
+					Snapshots: map[string]data.StockSnapshotEvidence{
+						"A": {Symbol: "A", LatestTradePrice: 100},
+					},
+					Failures: map[string]error{},
+				},
+				bars: data.DailyBarsBatchResult{
+					Bars:     map[string][]data.Candle{},
+					Failures: map[string]error{"A": errors.New("bars outage")},
+				},
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+			builder := Builder{
+				Config: testConfig(),
+				Assets: fakeAssets{assets: []data.StockAsset{{
+					Symbol: "A", Status: "active", AssetClass: "us_equity",
+					Exchange: "NASDAQ", Tradable: true,
+				}}},
+				Snapshots: test.market, Bars: test.market,
+				Fundamentals: fakeFundamentals{
+					"A": {MarketCapitalization: 500, Industry: "Technology", Provider: "finnhub"},
+				},
+				Repository: repo,
+				Now:        func() time.Time { return now },
+			}
+
+			if _, err := builder.Refresh(context.Background()); err == nil {
+				t.Fatal("total market-data outage unexpectedly published a universe")
+			}
+			if repo.version.ID != "" || len(repo.members) != 0 {
+				t.Fatalf("outage published state: version=%+v members=%+v", repo.version, repo.members)
+			}
+		})
+	}
+}
+
+func TestTaxonomyRefreshPrioritizesUnattemptedSymbols(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	cfg.TaxonomyRefreshLimit = 1
+	unknownEvidence, _ := json.Marshal(fundamentalsEvidence{MarketCapMM: 500})
+	repo := &fakeRepository{taxonomy: map[string]*store.CompanyTaxonomyObservation{
+		"A": {
+			Ticker: "A", Provider: "finnhub", EffectiveAt: now.Add(-time.Hour),
+			ObservedAt: now.Add(-time.Hour), Sector: store.UnknownTaxonomy,
+			Industry: store.UnknownTaxonomy, Status: "unknown", Evidence: unknownEvidence,
+		},
+	}}
+	market := completeMarkets([]string{"A", "B"}, 20)
+	builder := Builder{
+		Config: cfg,
+		Assets: fakeAssets{assets: []data.StockAsset{
+			{Symbol: "A", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "B", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+		}},
+		Snapshots: market, Bars: market,
+		Fundamentals: fakeFundamentals{
+			"B": {MarketCapitalization: 600, Industry: "Software", Provider: "finnhub"},
+		},
+		Repository: repo,
+		Now:        func() time.Time { return now },
+	}
+
+	result, err := builder.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if result.TaxonomyRefreshes != 1 || repo.taxonomy["B"] == nil ||
+		repo.taxonomy["B"].Industry != "Software" {
+		t.Fatalf("unattempted symbol was starved: result=%+v taxonomy=%+v", result, repo.taxonomy)
 	}
 }
 
@@ -253,11 +384,15 @@ func TestRefreshAppliesAssetMasterEligibilityFlags(t *testing.T) {
 				},
 				Repository: repo, Now: func() time.Time { return now },
 			}
-			if _, err := builder.Refresh(context.Background()); err != nil {
+			result, err := builder.Refresh(context.Background())
+			if err != nil {
 				t.Fatalf("Refresh: %v", err)
 			}
 			if got := repo.members[0]; got.Eligible || got.RemovalStage != test.stage {
 				t.Fatalf("member = %+v, want removal stage %q", got, test.stage)
+			}
+			if result.TaxonomyRefreshes != 0 {
+				t.Fatalf("objectively excluded asset consumed taxonomy quota: %+v", result)
 			}
 		})
 	}
@@ -276,15 +411,23 @@ func testConfig() config.UniverseConfig {
 }
 
 func completeMarket(symbol string, days int) fakeMarketData {
+	return completeMarkets([]string{symbol}, days)
+}
+
+func completeMarkets(symbols []string, days int) fakeMarketData {
+	snapshots := make(map[string]data.StockSnapshotEvidence, len(symbols))
+	bars := make(map[string][]data.Candle, len(symbols))
+	for _, symbol := range symbols {
+		snapshots[symbol] = data.StockSnapshotEvidence{Symbol: symbol, LatestTradePrice: 100}
+		bars[symbol] = dailyBars(symbol, days, 100, 20_000)
+	}
 	return fakeMarketData{
 		snapshots: data.StockSnapshotBatchResult{
-			Snapshots: map[string]data.StockSnapshotEvidence{
-				symbol: {Symbol: symbol, LatestTradePrice: 100},
-			},
-			Failures: map[string]error{},
+			Snapshots: snapshots,
+			Failures:  map[string]error{},
 		},
 		bars: data.DailyBarsBatchResult{
-			Bars:     map[string][]data.Candle{symbol: dailyBars(symbol, days, 100, 20_000)},
+			Bars:     bars,
 			Failures: map[string]error{},
 		},
 	}

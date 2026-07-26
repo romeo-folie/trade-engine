@@ -10,10 +10,12 @@ import (
 )
 
 type scanRecorder struct {
-	run              store.ScannerRun
-	candidates       map[string]*store.ScannerCandidateSnapshot
-	universeEnabled  bool
-	universeTTLHours int
+	run                   store.ScannerRun
+	candidates            map[string]*store.ScannerCandidateSnapshot
+	universeEnabled       bool
+	universeTTLHours      int
+	resolveUniverseByID   func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error)
+	resolveUsableUniverse func(context.Context, time.Time, time.Duration) (*store.SwingUniverseVersion, error)
 }
 
 func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
@@ -39,9 +41,11 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 			UniverseAsOf:                 s.UniverseAsOf,
 			RegimeReference:              s.RegimeReference,
 		},
-		candidates:       make(map[string]*store.ScannerCandidateSnapshot),
-		universeEnabled:  s.Cfg.Universe.Enabled,
-		universeTTLHours: s.Cfg.Universe.SnapshotTTLHours,
+		candidates:            make(map[string]*store.ScannerCandidateSnapshot),
+		universeEnabled:       s.Cfg.Universe.Enabled,
+		universeTTLHours:      s.Cfg.Universe.SnapshotTTLHours,
+		resolveUniverseByID:   store.GetCompletedSwingUniverseVersionByIDAsOf,
+		resolveUsableUniverse: store.GetUsableSwingUniverseVersion,
 	}
 }
 
@@ -49,24 +53,8 @@ func (r *scanRecorder) begin(ctx context.Context) {
 	if !store.IsConnected() {
 		return
 	}
-	if r.run.UniverseVersionID == "" {
-		ttl := time.Duration(0)
-		if r.run.StartedAt.IsZero() {
-			r.run.StartedAt = time.Now()
-		}
-		// A zero TTL intentionally means no age bound. newScanRecorder only
-		// enables this lookup when the operator has opted into the universe.
-		if r.universeEnabled {
-			ttl = time.Duration(r.universeTTLHours) * time.Hour
-			version, err := store.GetUsableSwingUniverseVersion(ctx, r.run.StartedAt, ttl)
-			if err != nil {
-				slog.Warn("scanner: resolve universe snapshot", "err", err)
-			} else if version != nil {
-				r.run.UniverseVersionID = version.ID
-				asOf := version.AsOf
-				r.run.UniverseAsOf = &asOf
-			}
-		}
+	if err := r.resolveUniverseLineage(ctx); err != nil {
+		slog.Warn("scanner: resolve universe snapshot", "err", err)
 	}
 	id, err := store.BeginScannerRun(ctx, r.run)
 	if err != nil {
@@ -74,6 +62,62 @@ func (r *scanRecorder) begin(ctx context.Context) {
 		return
 	}
 	r.run.ID = id
+}
+
+func (r *scanRecorder) resolveUniverseLineage(ctx context.Context) error {
+	if r.run.StartedAt.IsZero() {
+		r.run.StartedAt = time.Now()
+	}
+	if r.run.UniverseVersionID != "" {
+		requestedVersionID := r.run.UniverseVersionID
+		resolver := r.resolveUniverseByID
+		if resolver == nil {
+			resolver = store.GetCompletedSwingUniverseVersionByIDAsOf
+		}
+		version, err := resolver(ctx, r.run.UniverseVersionID, r.run.StartedAt)
+		if err != nil {
+			r.clearUniverseLineage()
+			return err
+		}
+		if version == nil || version.ID != requestedVersionID {
+			r.clearUniverseLineage()
+			return nil
+		}
+		r.setUniverseLineage(version)
+		return nil
+	}
+
+	if r.run.UniverseVersionID == "" {
+		ttl := time.Duration(0)
+		// A zero TTL intentionally means no age bound. newScanRecorder only
+		// enables this lookup when the operator has opted into the universe.
+		if r.universeEnabled {
+			ttl = time.Duration(r.universeTTLHours) * time.Hour
+			resolver := r.resolveUsableUniverse
+			if resolver == nil {
+				resolver = store.GetUsableSwingUniverseVersion
+			}
+			version, err := resolver(ctx, r.run.StartedAt, ttl)
+			if err != nil {
+				r.clearUniverseLineage()
+				return err
+			} else if version != nil {
+				r.setUniverseLineage(version)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *scanRecorder) setUniverseLineage(version *store.SwingUniverseVersion) {
+	r.run.UniverseVersionID = version.ID
+	asOf := version.AsOf
+	r.run.UniverseAsOf = &asOf
+}
+
+func (r *scanRecorder) clearUniverseLineage() {
+	r.run.UniverseVersionID = ""
+	r.run.UniverseAsOf = nil
 }
 
 func (r *scanRecorder) register(candidates []SwingCandidate) {

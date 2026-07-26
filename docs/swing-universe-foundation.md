@@ -67,17 +67,26 @@ unrelated methods.
   payload, so the safe built-in security type is the evidenced `us_equity`
   asset class. A narrower filter requires a richer asset-master provider.
 - Alpaca's market-data API supplies bounded batches of split-adjusted daily bars
-  and current snapshots.
+  and current snapshots. Liquidity uses completed US sessions only; an
+  in-progress daily candle is excluded.
 - Finnhub's free company profile supplies market capitalization and a broad
   `finnhubIndustry` label. That label is stored with provider provenance; it is
-  not represented as full GICS sector/industry data.
+  not represented as full GICS sector/industry data. Universe refresh requires
+  the configured news provider and credential to actually be Finnhub; a
+  Benzinga key is never forwarded to the Finnhub endpoint.
 
 Company profiles are rate-limited and cached as observations. A refresh bounds
-the amount of missing/stale taxonomy it will fetch in one run. Successful
+the amount of missing/stale taxonomy it will fetch in one run. Never-attempted
+symbols are prioritized, while fresh Unknown/Unavailable observations wait for
+the taxonomy-age retry window so a fixed ticker prefix cannot consume every
+refresh quota. Successful
 members are retained when an individual profile or market-data batch fails, and
 the failed members receive an explicit failure stage. The configured missing
 evidence policies decide whether those members remain eligible; the decision is
 persisted with the snapshot.
+
+A total snapshot or daily-bar outage publishes no version, preventing an empty
+failed-data universe from superseding the last healthy completed snapshot.
 
 ## Eligibility stages
 

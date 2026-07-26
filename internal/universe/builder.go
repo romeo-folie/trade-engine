@@ -175,12 +175,26 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			bars.Failures[symbol] = barsErr
 		}
 	}
+	if !hasCoherentMarketData(symbols, snapshots, bars) {
+		return result, errors.New(
+			"market-data refresh produced no symbol with both snapshot and daily-bar evidence",
+		)
+	}
 
 	taxonomy := make(map[string]*store.CompanyTaxonomyObservation, len(symbols))
 	taxonomyErrors := make(map[string]error)
 	lookupAt := b.now()
 	maxTaxonomyAge := time.Duration(b.Config.TaxonomyMaxAgeHours) * time.Hour
-	refreshes := 0
+	assetsBySymbol := make(map[string]data.StockAsset, len(assets))
+	for _, asset := range assets {
+		assetsBySymbol[asset.Symbol] = asset
+	}
+	fundamentalsRequiredSymbols := make([]string, 0, len(symbols))
+	type refreshCandidate struct {
+		symbol   string
+		priority int
+	}
+	refreshCandidates := make([]refreshCandidate, 0, len(symbols))
 	for _, symbol := range symbols {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -190,26 +204,58 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			taxonomyErrors[symbol] = lookupErr
 			continue
 		}
-		if needsTaxonomyRefresh(observation) {
-			switch {
-			case b.Fundamentals == nil:
-				taxonomyErrors[symbol] = errors.New("fundamentals provider unavailable")
-			case refreshes >= b.Config.TaxonomyRefreshLimit:
-				taxonomyErrors[symbol] = errors.New("taxonomy refresh limit reached")
-			default:
-				refreshes++
-				fundamentals, fetchErr := b.Fundamentals.FetchCompanyFundamentals(ctx, symbol)
-				if fetchErr != nil {
-					taxonomyErrors[symbol] = fetchErr
-				} else {
-					observation = taxonomyObservation(symbol, fundamentals, b.now())
-					if _, insertErr := b.Repository.InsertTaxonomy(ctx, *observation); insertErr != nil {
-						taxonomyErrors[symbol] = insertErr
-					}
-				}
+		taxonomy[symbol] = observation
+		if !b.passesNonFundamentalFilters(
+			assetsBySymbol[symbol], snapshots, bars, lookupAt,
+		) {
+			continue
+		}
+		fundamentalsRequiredSymbols = append(fundamentalsRequiredSymbols, symbol)
+		if priority := taxonomyRefreshPriority(observation, lookupAt, maxTaxonomyAge); priority > 0 {
+			refreshCandidates = append(refreshCandidates, refreshCandidate{
+				symbol: symbol, priority: priority,
+			})
+		}
+	}
+	sort.SliceStable(refreshCandidates, func(i, j int) bool {
+		if refreshCandidates[i].priority == refreshCandidates[j].priority {
+			return refreshCandidates[i].symbol < refreshCandidates[j].symbol
+		}
+		return refreshCandidates[i].priority < refreshCandidates[j].priority
+	})
+	refreshes := 0
+	for _, candidate := range refreshCandidates {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		switch {
+		case b.Fundamentals == nil:
+			taxonomyErrors[candidate.symbol] = errors.New("fundamentals provider unavailable")
+		case refreshes >= b.Config.TaxonomyRefreshLimit:
+			taxonomyErrors[candidate.symbol] = errors.New("taxonomy refresh limit reached")
+		default:
+			refreshes++
+			fundamentals, fetchErr := b.Fundamentals.FetchCompanyFundamentals(
+				ctx, candidate.symbol,
+			)
+			if fetchErr != nil {
+				taxonomyErrors[candidate.symbol] = fetchErr
+				continue
+			}
+			observation := taxonomyObservation(candidate.symbol, fundamentals, b.now())
+			taxonomy[candidate.symbol] = observation
+			if _, insertErr := b.Repository.InsertTaxonomy(ctx, *observation); insertErr != nil {
+				taxonomyErrors[candidate.symbol] = insertErr
 			}
 		}
-		taxonomy[symbol] = observation
+	}
+	if b.Config.MinMarketCapMM > 0 &&
+		b.Config.MissingFundamentalsPolicy != "include" &&
+		len(fundamentalsRequiredSymbols) > 0 &&
+		!hasFundamentalsEvidence(fundamentalsRequiredSymbols, taxonomy) {
+		return result, errors.New(
+			"fundamentals refresh produced no usable market-cap evidence",
+		)
 	}
 
 	asOf := b.now()
@@ -243,7 +289,9 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		if symbol == "" {
 			continue
 		}
-		member := b.evaluate(asset, snapshots, bars, taxonomy[symbol], taxonomyErrors[symbol])
+		member := b.evaluate(
+			asset, snapshots, bars, taxonomy[symbol], taxonomyErrors[symbol], asOf,
+		)
 		member.UniverseVersionID = versionID
 		members = append(members, member)
 		if member.Eligible {
@@ -266,12 +314,44 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	return result, nil
 }
 
+func (b *Builder) passesNonFundamentalFilters(
+	asset data.StockAsset,
+	snapshots data.StockSnapshotBatchResult,
+	bars data.DailyBarsBatchResult,
+	decisionAt time.Time,
+) bool {
+	securityType := strings.ToLower(asset.AssetClass)
+	exchange := strings.ToUpper(asset.Exchange)
+	if !allowedValue(securityType, b.Config.AllowedSecurityTypes) ||
+		!allowedValue(exchange, b.Config.AllowedExchanges) ||
+		(b.Config.RequireActive && !strings.EqualFold(asset.Status, "active")) ||
+		(b.Config.RequireTradable && !asset.Tradable) {
+		return false
+	}
+	snapshot, snapshotOK := snapshots.Snapshots[asset.Symbol]
+	price := stockSnapshotPrice(snapshot)
+	history, barsOK := bars.Bars[asset.Symbol]
+	_, volumeOK := medianDollarVolume(
+		history, b.Config.DollarVolumeLookbackDays, decisionAt,
+	)
+	available := snapshotOK && price > 0 && barsOK && volumeOK
+	if !available && b.Config.RequireMarketData &&
+		b.Config.MissingMarketDataPolicy != "include" {
+		return false
+	}
+	if price > 0 && price < b.Config.MinPrice {
+		return false
+	}
+	return true
+}
+
 func (b *Builder) evaluate(
 	asset data.StockAsset,
 	snapshots data.StockSnapshotBatchResult,
 	bars data.DailyBarsBatchResult,
 	taxonomy *store.CompanyTaxonomyObservation,
 	taxonomyErr error,
+	decisionAt time.Time,
 ) store.SwingUniverseMember {
 	symbol := normalizeSymbol(asset.Symbol)
 	member := store.SwingUniverseMember{
@@ -306,10 +386,7 @@ func (b *Builder) evaluate(
 
 	snapshot, snapshotOK := snapshots.Snapshots[symbol]
 	history, barsOK := bars.Bars[symbol]
-	price := snapshot.LatestTradePrice
-	if price <= 0 && snapshot.DailyBar != nil {
-		price = snapshot.DailyBar.Close
-	}
+	price := stockSnapshotPrice(snapshot)
 	if price > 0 {
 		member.Price = &price
 	}
@@ -321,7 +398,9 @@ func (b *Builder) evaluate(
 		}
 	}
 	if barsOK {
-		if median, ok := medianDollarVolume(history, b.Config.DollarVolumeLookbackDays); ok {
+		if median, ok := medianDollarVolume(
+			history, b.Config.DollarVolumeLookbackDays, decisionAt,
+		); ok {
 			member.DollarVolume = &median
 		}
 	}
@@ -357,7 +436,8 @@ func (b *Builder) evaluate(
 		member.RemovalStage = "market_data"
 	case member.Price != nil && *member.Price < b.Config.MinPrice:
 		member.RemovalStage = "price"
-	case member.MarketCapMM == nil && b.Config.MissingFundamentalsPolicy != "include":
+	case b.Config.MinMarketCapMM > 0 && member.MarketCapMM == nil &&
+		b.Config.MissingFundamentalsPolicy != "include":
 		member.RemovalStage = "fundamentals"
 	case member.MarketCapMM != nil && *member.MarketCapMM < b.Config.MinMarketCapMM:
 		member.RemovalStage = "market_cap"
@@ -416,9 +496,24 @@ func taxonomyObservation(
 	}
 }
 
-func needsTaxonomyRefresh(observation *store.CompanyTaxonomyObservation) bool {
-	return observation == nil || observation.Status == "stale" ||
-		observation.Status == "unknown" || observation.Status == "unavailable"
+func taxonomyRefreshPriority(
+	observation *store.CompanyTaxonomyObservation,
+	asOf time.Time,
+	retryAfter time.Duration,
+) int {
+	if observation == nil {
+		return 1
+	}
+	if observation.Status == "stale" {
+		return 2
+	}
+	if observation.Status != "unknown" && observation.Status != "unavailable" {
+		return 0
+	}
+	if retryAfter <= 0 || asOf.Sub(observation.ObservedAt) >= retryAfter {
+		return 3
+	}
+	return 0
 }
 
 func marketCapFromEvidence(raw json.RawMessage) float64 {
@@ -429,12 +524,15 @@ func marketCapFromEvidence(raw json.RawMessage) float64 {
 	return evidence.MarketCapMM
 }
 
-func medianDollarVolume(bars []data.Candle, lookback int) (float64, bool) {
-	if lookback <= 0 || len(bars) < lookback {
+func medianDollarVolume(
+	bars []data.Candle, lookback int, asOf time.Time,
+) (float64, bool) {
+	completed := completedDailyBars(bars, asOf)
+	if lookback <= 0 || len(completed) < lookback {
 		return 0, false
 	}
 	values := make([]float64, 0, lookback)
-	for _, bar := range bars[len(bars)-lookback:] {
+	for _, bar := range completed[len(completed)-lookback:] {
 		if bar.Close <= 0 || bar.Volume <= 0 {
 			return 0, false
 		}
@@ -446,6 +544,83 @@ func medianDollarVolume(bars []data.Candle, lookback int) (float64, bool) {
 		return values[mid], true
 	}
 	return (values[mid-1] + values[mid]) / 2, true
+}
+
+func completedDailyBars(bars []data.Candle, asOf time.Time) []data.Candle {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		// Conservative fallback: only prior UTC dates are unambiguously
+		// complete. Production binaries embed tzdata.
+		cutoff := time.Date(asOf.UTC().Year(), asOf.UTC().Month(), asOf.UTC().Day(), 0, 0, 0, 0, time.UTC)
+		completed := make([]data.Candle, 0, len(bars))
+		for _, bar := range bars {
+			if bar.Timestamp.Before(cutoff) {
+				completed = append(completed, bar)
+			}
+		}
+		return completed
+	}
+	decision := asOf.In(location)
+	decisionDate := time.Date(
+		decision.Year(), decision.Month(), decision.Day(), 0, 0, 0, 0, location,
+	)
+	marketClosed := decision.Hour() >= 16
+	completed := make([]data.Candle, 0, len(bars))
+	for _, bar := range bars {
+		session := bar.Timestamp.In(location)
+		sessionDate := time.Date(
+			session.Year(), session.Month(), session.Day(), 0, 0, 0, 0, location,
+		)
+		if sessionDate.Before(decisionDate) ||
+			(sessionDate.Equal(decisionDate) && marketClosed) {
+			completed = append(completed, bar)
+		}
+	}
+	return completed
+}
+
+func hasCoherentMarketData(
+	symbols []string,
+	snapshots data.StockSnapshotBatchResult,
+	bars data.DailyBarsBatchResult,
+) bool {
+	for _, symbol := range symbols {
+		snapshot, snapshotOK := snapshots.Snapshots[symbol]
+		if !snapshotOK || stockSnapshotPrice(snapshot) <= 0 {
+			continue
+		}
+		if history, barsOK := bars.Bars[symbol]; barsOK {
+			for _, bar := range history {
+				if bar.Close > 0 && bar.Volume > 0 {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func stockSnapshotPrice(snapshot data.StockSnapshotEvidence) float64 {
+	if snapshot.LatestTradePrice > 0 {
+		return snapshot.LatestTradePrice
+	}
+	if snapshot.DailyBar != nil && snapshot.DailyBar.Close > 0 {
+		return snapshot.DailyBar.Close
+	}
+	return 0
+}
+
+func hasFundamentalsEvidence(
+	symbols []string,
+	taxonomy map[string]*store.CompanyTaxonomyObservation,
+) bool {
+	for _, symbol := range symbols {
+		observation := taxonomy[symbol]
+		if observation != nil && marketCapFromEvidence(observation.Evidence) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func allowedValue(value string, allowed []string) bool {

@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"text/tabwriter"
 	"time"
 
@@ -38,6 +39,10 @@ This command intentionally cannot backfill a historical date from current APIs.`
 		if cfg.Markets.Stocks.APIKey == "" || cfg.Markets.Stocks.Secret == "" {
 			return fmt.Errorf("Alpaca stock API credentials are required")
 		}
+		fundamentals, err := universeFundamentalsProvider(cfg.Markets.News)
+		if err != nil {
+			return err
+		}
 		if err := connectDB(); err != nil {
 			return err
 		}
@@ -47,10 +52,6 @@ This command intentionally cannot backfill a historical date from current APIs.`
 			cfg.Markets.Stocks.APIKey, cfg.Markets.Stocks.Secret, cfg.Markets.Stocks.DataURL,
 		)
 		provider := data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL)
-		var fundamentals swinguniverse.FundamentalsProvider
-		if cfg.Markets.News.APIKey != "" {
-			fundamentals = data.NewFinnhubClient(cfg.Markets.News.APIKey)
-		}
 		builder := swinguniverse.Builder{
 			Config: cfg.Scanner.Universe, Assets: provider, Snapshots: provider,
 			Bars: provider, Fundamentals: fundamentals,
@@ -67,6 +68,32 @@ This command intentionally cannot backfill a historical date from current APIs.`
 		)
 		return nil
 	},
+}
+
+// universeFundamentalsProvider keeps provider identity and credentials coupled.
+// The refresh currently needs Finnhub's company-profile endpoint for market-cap
+// and taxonomy evidence. A news key belonging to Benzinga (or any future news
+// provider) must never be sent to Finnhub. Cached-only refreshes are not an
+// explicit operating mode yet, so missing Finnhub configuration fails before
+// opening the database or starting provider work.
+func universeFundamentalsProvider(news config.NewsAPIConfig) (swinguniverse.FundamentalsProvider, error) {
+	if !strings.EqualFold(strings.TrimSpace(news.Provider), "finnhub") {
+		return nil, fmt.Errorf(
+			"universe refresh requires Finnhub fundamentals: markets.news.provider must be %q, got %q",
+			"finnhub", news.Provider,
+		)
+	}
+	if strings.TrimSpace(news.APIKey) == "" {
+		apiKeyEnv := strings.TrimSpace(news.APIKeyEnv)
+		if apiKeyEnv == "" {
+			apiKeyEnv = "FINNHUB_API_KEY"
+		}
+		return nil, fmt.Errorf(
+			"universe refresh requires Finnhub fundamentals credentials: export %s",
+			apiKeyEnv,
+		)
+	}
+	return data.NewFinnhubClient(news.APIKey), nil
 }
 
 var (

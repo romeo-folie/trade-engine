@@ -77,11 +77,23 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 	); err != nil || got != nil {
 		t.Fatalf("future completed version leaked: got=%+v err=%v", got, err)
 	}
+	if got, err := store.GetCompletedSwingUniverseVersionByIDAsOf(
+		ctx, versionID, completedAt.Add(-time.Nanosecond),
+	); err != nil || got != nil {
+		t.Fatalf("future exact version leaked: got=%+v err=%v", got, err)
+	}
 	version, err := store.GetLatestCompletedSwingUniverseVersionAsOf(
 		ctx, completedAt.Add(time.Nanosecond),
 	)
 	if err != nil || version == nil || version.ID != versionID {
 		t.Fatalf("latest completed version = %+v, err=%v", version, err)
+	}
+	exactVersion, err := store.GetCompletedSwingUniverseVersionByIDAsOf(
+		ctx, versionID, completedAt.Add(time.Nanosecond),
+	)
+	if err != nil || exactVersion == nil || exactVersion.ID != versionID ||
+		!exactVersion.AsOf.Equal(base) {
+		t.Fatalf("exact completed version = %+v, err=%v", exactVersion, err)
 	}
 	if version.MemberCount != 2 || version.EligibleCount != 1 ||
 		version.UnknownTaxonomyCount != 1 {
@@ -129,6 +141,55 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 		ctx, completedAt.Add(3*time.Hour), time.Hour,
 	); err != nil || got != nil {
 		t.Fatalf("expired cached version = %+v, err=%v", got, err)
+	}
+}
+
+func TestSwingUniverseMemberListsRequireCompletedVersion(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	now := time.Now().UTC().Add(-time.Minute).Truncate(time.Microsecond)
+	id, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+		Provider: "unfinished-list-test", AsOf: now, CapturedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("BeginSwingUniverseVersion: %v", err)
+	}
+	if err := store.ReplaceSwingUniverseMembers(ctx, id, []store.SwingUniverseMember{{
+		Ticker: "BUILDING", Eligible: true, TaxonomyStatus: "unknown",
+	}}); err != nil {
+		t.Fatalf("ReplaceSwingUniverseMembers: %v", err)
+	}
+
+	if got, err := store.ListSwingUniverseMembers(ctx, id, false); err != nil || len(got) != 0 {
+		t.Fatalf("building universe exposed by general list: got=%+v err=%v", got, err)
+	}
+	if got, err := store.ListEligibleSwingUniverseMembers(ctx, id); err != nil || len(got) != 0 {
+		t.Fatalf("building universe exposed by eligible list: got=%+v err=%v", got, err)
+	}
+	if got, err := store.ListSwingUniverseMembersForAudit(ctx, id); err != nil ||
+		len(got) != 1 || got[0].Ticker != "BUILDING" {
+		t.Fatalf("building audit list = %+v, err=%v", got, err)
+	}
+
+	if err := store.FailSwingUniverseVersion(ctx, id, now.Add(time.Second), errors.New("provider failed")); err != nil {
+		t.Fatalf("FailSwingUniverseVersion: %v", err)
+	}
+	if got, err := store.ListSwingUniverseMembers(ctx, id, false); err != nil || len(got) != 0 {
+		t.Fatalf("failed universe exposed by general list: got=%+v err=%v", got, err)
+	}
+	if got, err := store.ListEligibleSwingUniverseMembers(ctx, id); err != nil || len(got) != 0 {
+		t.Fatalf("failed universe exposed by eligible list: got=%+v err=%v", got, err)
+	}
+	if got, err := store.ListSwingUniverseMembersForAudit(ctx, id); err != nil ||
+		len(got) != 1 || got[0].Ticker != "BUILDING" {
+		t.Fatalf("failed audit list = %+v, err=%v", got, err)
+	}
+	if got, err := store.GetCompletedSwingUniverseVersionByIDAsOf(
+		ctx, id, now.Add(time.Hour),
+	); err != nil || got != nil {
+		t.Fatalf("failed version validated as completed: got=%+v err=%v", got, err)
 	}
 }
 
