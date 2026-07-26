@@ -27,6 +27,9 @@ func (selectiveFundamentals) FetchCompanyFundamentals(
 	if ticker == "FUNDAMENTALS_UNAVAILABLE" {
 		return data.CompanyFundamentals{}, errors.New("provider unavailable")
 	}
+	if ticker == "EMPTY_FUNDAMENTALS" {
+		return data.CompanyFundamentals{}, nil
+	}
 	if ticker == "DEFINITIVELY_INELIGIBLE" {
 		return data.CompanyFundamentals{MarketCapitalization: 50}, nil
 	}
@@ -235,6 +238,7 @@ func TestQualifyPullbackUniverseDistinguishesUnavailableFromIneligible(t *testin
 	result := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
 		{Ticker: "HISTORY_UNAVAILABLE", Price: 50, Volume: 50_000},
 		{Ticker: "FUNDAMENTALS_UNAVAILABLE", Price: 50, Volume: 50_000},
+		{Ticker: "EMPTY_FUNDAMENTALS", Price: 50, Volume: 50_000},
 		{Ticker: "DEFINITIVELY_INELIGIBLE", Price: 50, Volume: 50_000},
 	})
 	if _, ok := result.known["HISTORY_UNAVAILABLE"]; ok {
@@ -242,6 +246,9 @@ func TestQualifyPullbackUniverseDistinguishesUnavailableFromIneligible(t *testin
 	}
 	if _, ok := result.known["FUNDAMENTALS_UNAVAILABLE"]; ok {
 		t.Fatal("fundamentals provider error was treated as a definitive outcome")
+	}
+	if _, ok := result.known["EMPTY_FUNDAMENTALS"]; ok {
+		t.Fatal("empty fundamentals profile was treated as a definitive outcome")
 	}
 	if _, ok := result.known["DEFINITIVELY_INELIGIBLE"]; !ok {
 		t.Fatal("objective market-cap failure was not treated as definitive")

@@ -527,6 +527,11 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		if err != nil {
 			continue
 		}
+		if fundamentals.MarketCapitalization <= 0 {
+			slog.Warn("scanner: pullback universe fundamentals unavailable",
+				"ticker", candidate.Ticker)
+			continue
+		}
 		result.known[candidate.Ticker] = struct{}{}
 		if fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
 			continue
