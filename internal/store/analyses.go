@@ -34,6 +34,18 @@ type StoredAnalysis struct {
 
 // InsertAnalysis persists a completed analysis record and returns its UUID.
 func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta) (string, error) {
+	return InsertAnalysisWithScannerRun(ctx, ticker, strategy, resp, meta, "")
+}
+
+// InsertAnalysisWithScannerRun persists a completed analysis with optional
+// prospective scanner lineage.
+func InsertAnalysisWithScannerRun(
+	ctx context.Context,
+	ticker, strategy string,
+	resp analysis.AnalysisResponse,
+	meta analysis.ModelCallMeta,
+	scannerRunID string,
+) (string, error) {
 	q := `
 		INSERT INTO analyses (
 			ticker, strategy, action, confidence, size_pct,
@@ -41,14 +53,14 @@ func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.
 			raw_response, raw_prompt, prompt_hash,
 			model_provider, model_name,
 			token_count_input, token_count_output, latency_ms,
-			indicators
+			indicators, scanner_run_id
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
 			$9, $10, $11,
 			$12, $13,
 			$14, $15, $16,
-			$17
+			$17, $18
 		) RETURNING id`
 	var id string
 	err := GetDB().QueryRow(ctx, q,
@@ -57,7 +69,7 @@ func InsertAnalysis(ctx context.Context, ticker, strategy string, resp analysis.
 		meta.RawResponse, meta.RawPrompt, meta.PromptHash,
 		meta.Provider, meta.Model,
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
-		meta.IndicatorJSON,
+		meta.IndicatorJSON, nullableString(scannerRunID),
 	).Scan(&id)
 	return id, err
 }
@@ -68,6 +80,7 @@ type EnsembleRecord struct {
 	ArbiterResponse []byte // JSON-serialised ArbiterResult; nil if fast-pathed
 	FastPathed      bool
 	DissentSummary  string
+	ScannerRunID    string
 }
 
 // InsertEnsembleAnalysis persists an ensemble analysis record (Phase 12).
@@ -80,7 +93,8 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			model_provider, model_name,
 			token_count_input, token_count_output, latency_ms,
 			indicators,
-			ensemble_results, arbiter_response, fast_pathed, dissent_summary
+			ensemble_results, arbiter_response, fast_pathed, dissent_summary,
+			scanner_run_id
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -88,7 +102,7 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			$12, $13,
 			$14, $15, $16,
 			$17,
-			$18, $19, $20, $21
+			$18, $19, $20, $21, $22
 		) RETURNING id`
 	var id string
 	err := GetDB().QueryRow(ctx, q,
@@ -99,7 +113,7 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
 		meta.IndicatorJSON,
 		ensemble.EnsembleResults, ensemble.ArbiterResponse, ensemble.FastPathed,
-		nullableString(ensemble.DissentSummary),
+		nullableString(ensemble.DissentSummary), nullableString(ensemble.ScannerRunID),
 	).Scan(&id)
 	return id, err
 }

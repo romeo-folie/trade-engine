@@ -121,6 +121,17 @@ func TestBuildOwnershipShortCircuitBlock(t *testing.T) {
 	}
 }
 
+func TestBuildOwnershipShortCircuitBlockCarriesScannerLineage(t *testing.T) {
+	cfg := config.RiskConfig{SignalExpiryMin: 30, StalePriceMovePct: 2.0}
+	sig, _, _ := buildOwnershipShortCircuitBlock(
+		cfg, "AAPL", "sell_only", []data.Candle{{Close: 100}},
+		risk.NoPositionBlockReason("AAPL"), time.Now(), "scanner-run-id",
+	)
+	if sig.ScannerRunID != "scanner-run-id" {
+		t.Fatalf("scanner run ID = %q, want scanner-run-id", sig.ScannerRunID)
+	}
+}
+
 // TestShouldPrefetchOpenTrades verifies the gating predicate that controls
 // whether runAnalysis issues an up-front store.GetOpenTrades query (#319,
 // PR #337 round-3). The prefetch must run only when both conditions hold:

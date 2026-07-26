@@ -67,6 +67,112 @@ func init() {
 		RunE:  runReportBacktestCompare,
 	}
 	reportCmd.AddCommand(btCompareCmd)
+
+	// prospective scanner-universe conversion study
+	scannerFunnelCmd := &cobra.Command{
+		Use:   "scanner-funnel",
+		Short: "Report prospective scanner candidate conversion and realized outcomes",
+		RunE:  runReportScannerFunnel,
+	}
+	scannerFunnelCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
+	scannerFunnelCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
+	reportCmd.AddCommand(scannerFunnelCmd)
+}
+
+func runReportScannerFunnel(cmd *cobra.Command, _ []string) error {
+	if _, err := config.Load(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := store.Connect(ctx); err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+
+	now := time.Now()
+	from := now.AddDate(0, 0, -30)
+	to := now
+	if value, _ := cmd.Flags().GetString("from"); value != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+		if err != nil {
+			return fmt.Errorf("invalid --from date: %w", err)
+		}
+		from = parsed
+	}
+	if value, _ := cmd.Flags().GetString("to"); value != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+		if err != nil {
+			return fmt.Errorf("invalid --to date: %w", err)
+		}
+		to = parsed.AddDate(0, 0, 1)
+	}
+	if !from.Before(to) {
+		return fmt.Errorf("--from must be before --to")
+	}
+
+	funnel, err := store.GetScannerFunnel(ctx, from, to)
+	if err != nil {
+		return fmt.Errorf("load scanner funnel: %w", err)
+	}
+	printScannerFunnel(funnel, from, to)
+	return nil
+}
+
+func printScannerFunnel(f store.ScannerFunnel, from, to time.Time) {
+	rate := func(numerator, denominator int) string {
+		if denominator == 0 {
+			return "—"
+		}
+		return fmt.Sprintf("%.1f%%", float64(numerator)/float64(denominator)*100)
+	}
+
+	fmt.Printf("Prospective scanner funnel  %s → %s\n",
+		from.Format("2006-01-02"), to.Add(-time.Nanosecond).Format("2006-01-02"))
+	fmt.Printf("Scan runs: %d\n\n", f.Runs)
+	fmt.Printf("%-26s %8s %13s\n", "STAGE", "COUNT", "CONVERSION")
+	fmt.Println(strings.Repeat("─", 51))
+	fmt.Printf("%-26s %8d %13s\n", "Candidates sourced", f.Sourced, "—")
+	fmt.Printf("%-26s %8d %13s\n", "Qualification known", f.QualificationKnown,
+		rate(f.QualificationKnown, f.Sourced))
+	fmt.Printf("%-26s %8d %13s\n", "Pullback qualified", f.PullbackQualified,
+		rate(f.PullbackQualified, f.QualificationKnown))
+	fmt.Printf("%-26s %8d %13s\n", "Eligible for scoring", f.ScoringEligible,
+		rate(f.ScoringEligible, f.Sourced))
+	fmt.Printf("%-26s %8d %13s\n", "LLM scored", f.Scored,
+		rate(f.Scored, f.ScoringEligible))
+	fmt.Printf("%-26s %8d %13s\n", "LLM recommended", f.Recommended,
+		rate(f.Recommended, f.Scored))
+	fmt.Printf("%-26s %8d %13s\n", "Passed conviction", f.PassedConviction,
+		rate(f.PassedConviction, f.Scored))
+	fmt.Printf("%-26s %8d %13s\n", "Added to watchlist", f.WatchlistAdded,
+		rate(f.WatchlistAdded, f.PassedConviction))
+	fmt.Printf("%-26s %8d %13s\n", "Candidates analyzed", f.AnalyzedCandidates,
+		rate(f.AnalyzedCandidates, f.WatchlistAdded))
+	fmt.Printf("%-26s %8d %13s\n", "HOLD/WAIT candidates", f.HoldWaitCandidates,
+		rate(f.HoldWaitCandidates, f.AnalyzedCandidates))
+	fmt.Printf("%-26s %8d %13s\n", "Pre-analysis outcomes", f.EngineOutcomeCandidates,
+		rate(f.EngineOutcomeCandidates, f.WatchlistAdded))
+	fmt.Printf("%-26s %8d %13s\n", "Candidates with signals", f.SignalCandidates,
+		rate(f.SignalCandidates, f.WatchlistAdded))
+	fmt.Printf("%-26s %8d %13s\n", "Candidates with trades", f.ExecutedTradeCandidates,
+		rate(f.ExecutedTradeCandidates, f.WatchlistAdded))
+
+	winRate := rate(f.Wins, f.ClosedTrades)
+	fmt.Printf("\nAnalyses: %d · Engine outcomes: %d · Signals: %d · Trades: %d · Closed: %d · Win rate: %s · Realized P&L: $%+.2f\n",
+		f.Analyses, f.EngineOutcomes, f.Signals, f.Trades, f.ClosedTrades, winRate, f.RealizedPnL)
+	printScannerStages("Qualification outcomes", f.QualificationStages)
+	printScannerStages("Terminal outcomes", f.FinalStages)
+	printScannerStages("Pre-analysis engine outcomes", f.EngineStages)
+}
+
+func printScannerStages(title string, stages []store.ScannerStageCount) {
+	if len(stages) == 0 {
+		return
+	}
+	fmt.Printf("\n%s:\n", title)
+	for _, stage := range stages {
+		fmt.Printf("  %-30s %d\n", strings.ReplaceAll(stage.Stage, "_", " "), stage.Count)
+	}
 }
 
 // ── Performance report ────────────────────────────────────────────────────────
