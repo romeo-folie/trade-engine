@@ -63,10 +63,11 @@ func (timeoutFundamentals) FetchCompanyFundamentals(
 }
 
 type fakeRepository struct {
-	taxonomy map[string]*store.CompanyTaxonomyObservation
-	version  store.SwingUniverseVersion
-	members  []store.SwingUniverseMember
-	failed   error
+	taxonomy          map[string]*store.CompanyTaxonomyObservation
+	taxonomyLookupErr error
+	version           store.SwingUniverseVersion
+	members           []store.SwingUniverseMember
+	failed            error
 }
 
 func (f *fakeRepository) Begin(_ context.Context, v store.SwingUniverseVersion) (string, error) {
@@ -87,6 +88,9 @@ func (f *fakeRepository) Fail(_ context.Context, _ string, _ time.Time, err erro
 func (f *fakeRepository) TaxonomyAsOf(
 	_ context.Context, ticker string, _ time.Time, _ time.Duration,
 ) (*store.CompanyTaxonomyObservation, error) {
+	if f.taxonomyLookupErr != nil {
+		return nil, f.taxonomyLookupErr
+	}
 	return f.taxonomy[ticker], nil
 }
 func (f *fakeRepository) InsertTaxonomy(
@@ -328,6 +332,41 @@ func TestTaxonomyRefreshPrioritizesUnattemptedSymbols(t *testing.T) {
 	if result.TaxonomyRefreshes != 1 || repo.taxonomy["B"] == nil ||
 		repo.taxonomy["B"].Industry != "Software" {
 		t.Fatalf("unattempted symbol was starved: result=%+v taxonomy=%+v", result, repo.taxonomy)
+	}
+}
+
+func TestTaxonomyLookupFailureAbortsRefresh(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	lookupErr := errors.New("taxonomy database unavailable")
+	repo := &fakeRepository{
+		taxonomy:          make(map[string]*store.CompanyTaxonomyObservation),
+		taxonomyLookupErr: lookupErr,
+	}
+	market := completeMarket("LOOKUP", 20)
+	builder := Builder{
+		Config: testConfig(),
+		Assets: fakeAssets{assets: []data.StockAsset{{
+			Symbol: "LOOKUP", Status: "active", AssetClass: "us_equity",
+			Exchange: "NASDAQ", Tradable: true,
+		}}},
+		Snapshots: market,
+		Bars:      market,
+		Fundamentals: fakeFundamentals{
+			"LOOKUP": {
+				MarketCapitalization: 600,
+				Industry:             "Software",
+				Provider:             "fake-fundamentals",
+			},
+		},
+		Repository: repo,
+		Now:        func() time.Time { return now },
+	}
+
+	if _, err := builder.Refresh(context.Background()); !errors.Is(err, lookupErr) {
+		t.Fatalf("Refresh error = %v, want taxonomy lookup failure", err)
+	}
+	if repo.version.ID != "" || len(repo.members) != 0 {
+		t.Fatalf("taxonomy lookup failure published state: version=%+v members=%+v", repo.version, repo.members)
 	}
 }
 

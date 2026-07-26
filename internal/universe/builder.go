@@ -203,8 +203,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		}
 		observation, lookupErr := b.Repository.TaxonomyAsOf(ctx, symbol, lookupAt, maxTaxonomyAge)
 		if lookupErr != nil {
-			taxonomyErrors[symbol] = lookupErr
-			continue
+			return result, fmt.Errorf("load taxonomy for %s: %w", symbol, lookupErr)
 		}
 		taxonomy[symbol] = observation
 		if !b.passesNonFundamentalFilters(

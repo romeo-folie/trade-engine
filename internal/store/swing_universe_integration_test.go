@@ -72,6 +72,37 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, nil); err == nil {
 		t.Fatal("completed universe accepted member replacement")
 	}
+	buildingID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+		Provider: "move-target", AsOf: base, CapturedAt: completedAt.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("BeginSwingUniverseVersion move target: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE swing_universe_members
+		SET universe_version_id=$1
+		WHERE universe_version_id=$2 AND ticker='ZERO'`,
+		buildingID, versionID,
+	); err == nil {
+		t.Fatal("completed universe member moved to a building version")
+	}
+	var completedCount, buildingCount int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT
+			COUNT(*) FILTER (WHERE universe_version_id=$1),
+			COUNT(*) FILTER (WHERE universe_version_id=$2)
+		FROM swing_universe_members
+		WHERE ticker='ZERO'`,
+		versionID, buildingID,
+	).Scan(&completedCount, &buildingCount); err != nil {
+		t.Fatalf("verify member parent after rejected move: %v", err)
+	}
+	if completedCount != 1 || buildingCount != 0 {
+		t.Fatalf(
+			"rejected move changed member lineage: completed=%d building=%d",
+			completedCount, buildingCount,
+		)
+	}
 	if got, err := store.GetLatestCompletedSwingUniverseVersionAsOf(
 		ctx, completedAt.Add(-time.Nanosecond),
 	); err != nil || got != nil {
