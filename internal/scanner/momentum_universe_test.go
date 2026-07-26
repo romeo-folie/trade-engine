@@ -183,6 +183,21 @@ func TestDisabledModeQualificationOnlyAcknowledgesQuarantinedTickers(t *testing.
 	}
 }
 
+func TestDisabledModeQualificationInputOnlyIncludesQuarantinedTickers(t *testing.T) {
+	candidates := []SwingCandidate{
+		{Ticker: "LEGACY_A"},
+		{Ticker: "UNRELATED"},
+		{Ticker: "LEGACY_B"},
+	}
+	got := filterCandidatesByTicker(candidates, map[string]struct{}{
+		"LEGACY_A": {},
+		"LEGACY_B": {},
+	})
+	if len(got) != 2 || got[0].Ticker != "LEGACY_A" || got[1].Ticker != "LEGACY_B" {
+		t.Fatalf("qualification input = %+v", got)
+	}
+}
+
 func TestQualifyPullbackUniverseUnavailableRemainsUnknown(t *testing.T) {
 	result := (&MarketScanner{}).qualifyPullbackUniverse(
 		context.Background(),

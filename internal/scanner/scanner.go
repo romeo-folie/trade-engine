@@ -172,7 +172,11 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return fmt.Errorf("load pullback requalification state: %w", err)
 	}
 	if s.PullbackUniverseEnabled || len(requalificationRequired) > 0 {
-		qualification := s.qualifyPullbackUniverse(ctx, candidates)
+		qualificationInput := candidates
+		if !s.PullbackUniverseEnabled {
+			qualificationInput = filterCandidatesByTicker(candidates, requalificationRequired)
+		}
+		qualification := s.qualifyPullbackUniverse(ctx, qualificationInput)
 		if len(qualification.qualified) == 0 {
 			slog.Info("scanner: no candidates passed pullback-strength universe")
 		}
@@ -353,6 +357,18 @@ func filterUnavailableRequalifications(
 			continue
 		}
 		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func filterCandidatesByTicker(
+	candidates []SwingCandidate, included map[string]struct{},
+) []SwingCandidate {
+	filtered := make([]SwingCandidate, 0, len(included))
+	for _, candidate := range candidates {
+		if _, ok := included[candidate.Ticker]; ok {
+			filtered = append(filtered, candidate)
+		}
 	}
 	return filtered
 }

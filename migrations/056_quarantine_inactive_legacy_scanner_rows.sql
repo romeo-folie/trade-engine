@@ -8,4 +8,5 @@ SET active = FALSE,
     updated_at = NOW()
 WHERE platform = 'stock'
   AND source = 'scanner'
+  AND active = FALSE
   AND pullback_requalification_required = FALSE;
