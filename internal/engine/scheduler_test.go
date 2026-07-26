@@ -163,6 +163,30 @@ func TestMarketCloseScheduling(t *testing.T) {
 		}
 	})
 
+	t.Run("multi-day delay preserves pending prior session on Thursday", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-14T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 48*time.Hour)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-13" {
+			t.Fatalf("next session = %s, want 2024-03-13", got)
+		}
+		want := mustParseNY(t, "2024-03-15T16:00:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
+
+	t.Run("multi-day delay preserves pending Friday session on Saturday", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-16T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 48*time.Hour)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-15" {
+			t.Fatalf("next session = %s, want 2024-03-15", got)
+		}
+		want := mustParseNY(t, "2024-03-17T16:00:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
+
 	t.Run("completed session skips national day of mourning", func(t *testing.T) {
 		now := mustParseNY(t, "2018-12-05T17:00:00")
 		session := MostRecentCompletedMarketSession(now, 15*time.Minute)

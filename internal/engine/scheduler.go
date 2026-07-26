@@ -73,11 +73,15 @@ func MostRecentCompletedMarketSession(now time.Time, delay time.Duration) USMark
 	}
 }
 
-// NextMarketCloseRun returns the first future session close plus delay.
+// NextMarketCloseRun returns the first future session close plus delay. The
+// owning session can be before today's calendar date when delay spans one or
+// more days. Since close+delay is after now exactly when close is after
+// now-delay, starting at that cutoff finds the owning session without scanning
+// backward across the entire delay.
 func NextMarketCloseRun(now time.Time, delay time.Duration) (USMarketSession, time.Time) {
-	et := now.In(nyLoc)
+	cutoff := now.Add(-delay).In(nyLoc)
 	for offset := 0; ; offset++ {
-		candidate := et.AddDate(0, 0, offset)
+		candidate := cutoff.AddDate(0, 0, offset)
 		session, ok := MarketSessionForDate(candidate)
 		if !ok {
 			continue
