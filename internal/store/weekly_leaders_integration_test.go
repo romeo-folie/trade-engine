@@ -91,6 +91,20 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	tokyo, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionBoundary := time.Date(2026, time.July, 20, 23, 59, 0, 0, tokyo)
+	reportRuns, err := store.ListCompletedWeeklyLeaderRunsBySessionDate(
+		ctx, sessionBoundary, sessionBoundary,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reportRuns) != 1 || reportRuns[0].ID != first.ID {
+		t.Fatalf("inclusive session-date report = %+v, want run %s", reportRuns, first.ID)
+	}
 	completed, claimed, err := store.ClaimWeeklyLeaderRun(ctx, runInput, time.Hour)
 	if err != nil || claimed || completed == nil || completed.Status != "completed" {
 		t.Fatalf("completed rerun claim = %+v/%v/%v, want completed row", completed, claimed, err)

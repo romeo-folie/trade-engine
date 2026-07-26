@@ -47,7 +47,7 @@ func MarketSessionForDate(t time.Time) (session USMarketSession, ok bool) {
 func IsTradingDay(t time.Time) bool {
 	et := t.In(nyLoc)
 	return et.Weekday() != time.Saturday && et.Weekday() != time.Sunday &&
-		!isUSHoliday(et)
+		!isUSHoliday(et) && !isExceptionalNYSEClosure(et)
 }
 
 // IsMarketOpen returns true if the stock market is open at the given time.
@@ -168,6 +168,34 @@ func isUSHoliday(t time.Time) bool {
 		}
 	}
 	return false
+}
+
+// isExceptionalNYSEClosure covers full-day NYSE closures that cannot be
+// derived from the recurring holiday rules. Keep these explicit: unlike
+// exchange holidays, national days of mourning and emergency closures do not
+// follow a calendar rule that can safely predict future dates.
+//
+// The list covers the modern electronic-market era, including the September
+// 11 attacks, presidential days of mourning, Hurricane Sandy, and the closures
+// for Presidents George H. W. Bush and Jimmy Carter.
+func isExceptionalNYSEClosure(t time.Time) bool {
+	et := t.In(nyLoc)
+	dateKey := et.Year()*10_000 + int(et.Month())*100 + et.Day()
+	switch dateKey {
+	case 20010911, // September 11 attacks
+		20010912,
+		20010913,
+		20010914,
+		20040611, // National Day of Mourning for President Ronald Reagan
+		20070102, // National Day of Mourning for President Gerald Ford
+		20121029, // Hurricane Sandy
+		20121030,
+		20181205, // National Day of Mourning for President George H. W. Bush
+		20250109: // National Day of Mourning for President Jimmy Carter
+		return true
+	default:
+		return false
+	}
 }
 
 // usHolidays returns the observed NYSE holiday dates for a given year.

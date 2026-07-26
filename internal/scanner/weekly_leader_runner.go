@@ -136,12 +136,19 @@ func (r *WeeklyLeaderRunner) RunSession(
 	if err != nil {
 		return fmt.Errorf("fetch weekly leader daily bars: %w", err)
 	}
-	benchmarkBarSetHash := ""
-	if completedBenchmark, validationErr := completedDailyBars(
-		history.Bars[benchmark], session.Date, session.Close,
-	); validationErr == nil {
-		benchmarkBarSetHash = weeklyLeaderBarSetHash(completedBenchmark)
+	if failure, exists := history.Failures[benchmark]; exists {
+		return fmt.Errorf("weekly leader benchmark %s history: %w", benchmark, failure)
 	}
+	// A missing target-session benchmark bar means the provider has not
+	// finalized the supposed session (or the exchange closed exceptionally).
+	// Fail the attempt instead of publishing an empty run and false removals.
+	completedBenchmark, err := completedDailyBars(
+		history.Bars[benchmark], session.Date, session.Close,
+	)
+	if err != nil {
+		return fmt.Errorf("weekly leader benchmark %s target session: %w", benchmark, err)
+	}
+	benchmarkBarSetHash := weeklyLeaderBarSetHash(completedBenchmark)
 	evaluations := EvaluateWeeklyLeaders(
 		members, history.Bars, history.Bars[benchmark],
 		session.Date, session.Close, decisionAt, r.Cfg,
@@ -160,14 +167,7 @@ func (r *WeeklyLeaderRunner) RunSession(
 			providerFailureCount++
 		}
 	}
-	if failure, exists := history.Failures[benchmark]; exists {
-		for i := range evaluations {
-			evaluations[i].Outcome = "failed"
-			evaluations[i].Qualified = false
-			evaluations[i].FailureStage = "benchmark_history"
-			evaluations[i].FailureReason = failure.Error()
-		}
-	} else if providerFailureCount > 0 {
+	if providerFailureCount > 0 {
 		suppressWeeklyLeaderQualificationsOnProviderFailure(
 			evaluations, providerFailureCount, len(members),
 		)

@@ -98,31 +98,18 @@ func runReportWeeklyLeaders(cmd *cobra.Command, _ []string) error {
 	}
 	defer store.Close()
 
-	now := time.Now()
-	from, to := now.AddDate(0, 0, -30), now.AddDate(0, 0, 1)
-	if value, _ := cmd.Flags().GetString("from"); value != "" {
-		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
-		if err != nil {
-			return fmt.Errorf("invalid --from date: %w", err)
-		}
-		from = parsed
+	fromValue, _ := cmd.Flags().GetString("from")
+	toValue, _ := cmd.Flags().GetString("to")
+	from, to, err := weeklyLeaderReportDateRange(time.Now(), fromValue, toValue)
+	if err != nil {
+		return err
 	}
-	if value, _ := cmd.Flags().GetString("to"); value != "" {
-		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
-		if err != nil {
-			return fmt.Errorf("invalid --to date: %w", err)
-		}
-		to = parsed.AddDate(0, 0, 1)
-	}
-	if !from.Before(to) {
-		return fmt.Errorf("--from must be before --to")
-	}
-	runs, err := store.ListCompletedWeeklyLeaderRuns(ctx, from, to)
+	runs, err := store.ListCompletedWeeklyLeaderRunsBySessionDate(ctx, from, to)
 	if err != nil {
 		return err
 	}
 	fmt.Printf("Prospective weekly-leader study  %s → %s\n",
-		from.Format("2006-01-02"), to.Add(-time.Nanosecond).Format("2006-01-02"))
+		from.Format("2006-01-02"), to.Format("2006-01-02"))
 	if len(runs) == 0 {
 		fmt.Println("No completed weekly-leader runs.")
 		return nil
@@ -155,6 +142,37 @@ func runReportWeeklyLeaders(cmd *cobra.Command, _ []string) error {
 		added, removed, persistent, breadth/float64(len(runs))*100,
 		coverage/float64(len(runs))*100)
 	return nil
+}
+
+func weeklyLeaderReportDateRange(
+	now time.Time, fromValue, toValue string,
+) (time.Time, time.Time, error) {
+	exchangeLocation, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("load exchange timezone: %w", err)
+	}
+	exchangeToday := now.In(exchangeLocation)
+	to := time.Date(
+		exchangeToday.Year(), exchangeToday.Month(), exchangeToday.Day(),
+		0, 0, 0, 0, time.UTC,
+	)
+	from := to.AddDate(0, 0, -30)
+	if fromValue != "" {
+		from, err = time.Parse("2006-01-02", fromValue)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid --from date: %w", err)
+		}
+	}
+	if toValue != "" {
+		to, err = time.Parse("2006-01-02", toValue)
+		if err != nil {
+			return time.Time{}, time.Time{}, fmt.Errorf("invalid --to date: %w", err)
+		}
+	}
+	if from.After(to) {
+		return time.Time{}, time.Time{}, fmt.Errorf("--from must be on or before --to")
+	}
+	return from, to, nil
 }
 
 func runReportScannerFunnel(cmd *cobra.Command, _ []string) error {

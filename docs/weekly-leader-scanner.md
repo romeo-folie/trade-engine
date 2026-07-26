@@ -115,8 +115,11 @@ score floor, and selection percentile.
 
 The scheduler uses the exchange calendar rather than a 24-hour ticker. It
 handles weekends, observed holidays, daylight-saving changes, Black Friday,
-Christmas Eve when open, and the applicable pre-Independence-Day early close.
-On startup it catches up the most recent completed session.
+Christmas Eve when open, the applicable pre-Independence-Day early close, and
+explicit modern-era exceptional NYSE closures. A missing target-session
+benchmark bar fails the attempt instead of publishing an empty run, providing
+a safety fence for a future unscheduled closure. On startup it catches up the
+most recent completed session.
 
 The database atomically claims
 `(session_date, universe_version_id, config_hash)`. A completed run is a no-op;

@@ -631,9 +631,14 @@ func GetLatestCompletedWeeklyLeaderRunAsOf(
 	return run, nil
 }
 
-func ListCompletedWeeklyLeaderRuns(
-	ctx context.Context, from, to time.Time,
+// ListCompletedWeeklyLeaderRunsBySessionDate returns completed runs whose
+// exchange session dates fall within the inclusive calendar-date range. Each
+// argument's written calendar date is used directly without timezone conversion.
+func ListCompletedWeeklyLeaderRunsBySessionDate(
+	ctx context.Context, fromDate, toDate time.Time,
 ) ([]WeeklyLeaderRun, error) {
+	fromKey := fromDate.Format("2006-01-02")
+	toKey := toDate.Format("2006-01-02")
 	rows, err := GetDB().Query(ctx, `
 		SELECT id, session_date, as_of, decision_at, universe_version_id, status,
 		       started_at, completed_at, lease_until, attempt_count, config_hash,
@@ -643,8 +648,10 @@ func ListCompletedWeeklyLeaderRuns(
 		       persistent_count, leader_breadth, evaluation_coverage, failure_rate,
 		       COALESCE(previous_completed_run_id::text,'')
 		FROM weekly_leader_runs
-		WHERE status='completed' AND decision_at >= $1 AND decision_at < $2
-		ORDER BY session_date, completed_at`, from, to)
+		WHERE status='completed'
+		  AND session_date >= $1::date
+		  AND session_date <= $2::date
+		ORDER BY session_date, completed_at`, fromKey, toKey)
 	if err != nil {
 		return nil, fmt.Errorf("list completed weekly leader runs: %w", err)
 	}
