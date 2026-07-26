@@ -881,6 +881,21 @@ scanner:
     taxonomy_refresh_limit: 200            # Maximum stale classifications refreshed per update
     missing_fundamentals_policy: exclude   # exclude = fail closed; include = retain with missing evidence recorded
     missing_market_data_policy: exclude    # exclude = fail closed; include = retain with missing evidence recorded
+  weekly_leader:
+    enabled: false                         # Full-universe after-close leadership lens; default off
+    promote_candidates: false              # When true, qualified leaders enter the normal LLM/watchlist gate
+    max_promotions_per_run: 20             # Bound qualified names sent through the paid LLM gate
+    after_close_delay_minutes: 15          # Wait for the provider to finalize the completed daily bar
+    universe_max_age_hours: 36             # Maximum age of the completed point-in-time universe
+    history_calendar_days: 420             # Fetch window supporting 253 sessions plus weekends, holidays, and buffer
+    min_history_sessions: 253              # True 52-week history; shorter-history names fail explicitly
+    benchmark: SPY                         # Market-relative-strength benchmark
+    industry_min_peers: 5                  # Minimum known/fresh peers for industry-relative strength
+    selection_percentile: 0.90             # Cross-sectional leader cutoff
+    min_composite_score: 0.70              # Absolute quality floor in addition to the percentile cutoff
+    min_feature_coverage: 0.90              # Missing components never silently become neutral scores
+    batch_size: 200                        # Maximum symbols requested per daily-bars provider batch
+    run_lease_minutes: 60                  # Reclaim stale run or candidate-promotion claims after this lease
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

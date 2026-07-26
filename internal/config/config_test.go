@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestDefaultsEngineMode(t *testing.T) {
@@ -83,6 +84,136 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 		universe.MissingMarketDataPolicy != "exclude" {
 		t.Fatalf("default missing-data policies must exclude: %+v", universe)
 	}
+}
+
+func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
+	leader := Defaults().Scanner.WeeklyLeader
+	if leader.Enabled || leader.PromoteCandidates {
+		t.Fatal("weekly leader discovery and promotion must default off")
+	}
+	if leader.AfterCloseDelayMinutes != 15 ||
+		leader.MaxPromotionsPerRun != 20 ||
+		leader.UniverseMaxAgeHours != 36 ||
+		leader.HistoryCalendarDays != 420 ||
+		leader.MinHistorySessions != 253 ||
+		leader.Benchmark != "SPY" ||
+		leader.IndustryMinPeers != 5 ||
+		leader.SelectionPercentile != 0.90 ||
+		leader.MinCompositeScore != 0.70 ||
+		leader.MinFeatureCoverage != 0.90 ||
+		leader.BatchSize != 200 ||
+		leader.RunLeaseMinutes != 60 {
+		t.Fatalf("unexpected weekly leader defaults: %+v", leader)
+	}
+}
+
+func TestValidateWeeklyLeaderConfig(t *testing.T) {
+	valid := Defaults()
+	valid.Scanner.Enabled = true
+	valid.Scanner.Universe.Enabled = true
+	valid.Scanner.WeeklyLeader.Enabled = true
+	if errs := Validate(valid); containsStr(errs, "scanner.weekly_leader") {
+		t.Fatalf("valid weekly leader config rejected: %v", errs)
+	}
+
+	disabled := Defaults()
+	disabled.Scanner.WeeklyLeader = WeeklyLeaderConfig{}
+	if errs := Validate(disabled); containsStr(errs, "scanner.weekly_leader") {
+		t.Fatalf("disabled zero-value weekly leader must preserve existing configs: %v", errs)
+	}
+
+	tests := []struct {
+		name  string
+		field string
+		apply func(*Config)
+	}{
+		{"scanner master", "requires scanner.enabled", func(c *Config) { c.Scanner.Enabled = false }},
+		{"universe master", "requires scanner.universe.enabled", func(c *Config) { c.Scanner.Universe.Enabled = false }},
+		{"delay", "after_close_delay_minutes", func(c *Config) { c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = -1 }},
+		{"delay overflow", "after_close_delay_minutes", func(c *Config) {
+			c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = int((time.Duration(1<<63-1) / time.Minute) + 1)
+		}},
+		{"promotion cap", "max_promotions_per_run", func(c *Config) { c.Scanner.WeeklyLeader.MaxPromotionsPerRun = 0 }},
+		{"universe age", "universe_max_age_hours", func(c *Config) { c.Scanner.WeeklyLeader.UniverseMaxAgeHours = 0 }},
+		{"universe age overflow", "universe_max_age_hours", func(c *Config) {
+			c.Scanner.WeeklyLeader.UniverseMaxAgeHours = int((time.Duration(1<<63-1) / time.Hour) + 1)
+		}},
+		{"calendar history", "history_calendar_days", func(c *Config) { c.Scanner.WeeklyLeader.HistoryCalendarDays = 399 }},
+		{"calendar/session mismatch", "history_calendar_days", func(c *Config) {
+			c.Scanner.WeeklyLeader.MinHistorySessions = 500
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = 500
+		}},
+		{"calendar history too large", "history_calendar_days", func(c *Config) {
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = weeklyLeaderMaxHistoryCalendarDays + 1
+		}},
+		{"session history overflow", "min_history_sessions", func(c *Config) {
+			c.Scanner.WeeklyLeader.MinHistorySessions = int(^uint(0) >> 1)
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = int(^uint(0) >> 1)
+		}},
+		{"session history", "min_history_sessions", func(c *Config) { c.Scanner.WeeklyLeader.MinHistorySessions = 252 }},
+		{"benchmark", "benchmark", func(c *Config) { c.Scanner.WeeklyLeader.Benchmark = " " }},
+		{"peers", "industry_min_peers", func(c *Config) { c.Scanner.WeeklyLeader.IndustryMinPeers = 0 }},
+		{"selection", "selection_percentile", func(c *Config) { c.Scanner.WeeklyLeader.SelectionPercentile = 1 }},
+		{"score", "min_composite_score", func(c *Config) { c.Scanner.WeeklyLeader.MinCompositeScore = 1.1 }},
+		{"coverage", "min_feature_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinFeatureCoverage = 0 }},
+		{"batch", "batch_size", func(c *Config) { c.Scanner.WeeklyLeader.BatchSize = 0 }},
+		{"lease", "run_lease_minutes", func(c *Config) { c.Scanner.WeeklyLeader.RunLeaseMinutes = 0 }},
+		{"lease overflow", "run_lease_minutes", func(c *Config) {
+			c.Scanner.WeeklyLeader.RunLeaseMinutes = int((time.Duration(1<<63-1) / time.Minute) + 1)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Scanner.Enabled = true
+			cfg.Scanner.Universe.Enabled = true
+			cfg.Scanner.WeeklyLeader.Enabled = true
+			tt.apply(cfg)
+			if !containsStr(Validate(cfg), "scanner.weekly_leader."+tt.field) &&
+				!containsStr(Validate(cfg), "scanner.weekly_leader "+tt.field) {
+				t.Fatalf("invalid %s not rejected: %v", tt.field, Validate(cfg))
+			}
+		})
+	}
+
+	t.Run("duration boundaries", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Scanner.Enabled = true
+		cfg.Scanner.Universe.Enabled = true
+		cfg.Scanner.WeeklyLeader.Enabled = true
+		cfg.Scanner.WeeklyLeader.AfterCloseDelayMinutes = int(
+			time.Duration(1<<63-1) / time.Minute,
+		)
+		cfg.Scanner.WeeklyLeader.UniverseMaxAgeHours = int(
+			time.Duration(1<<63-1) / time.Hour,
+		)
+		cfg.Scanner.WeeklyLeader.RunLeaseMinutes = int(
+			time.Duration(1<<63-1) / time.Minute,
+		)
+		if errs := Validate(cfg); containsStr(errs, "overflows time.Duration") {
+			t.Fatalf("safe duration boundary rejected: %v", errs)
+		}
+	})
+
+	t.Run("calendar session boundary", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Scanner.Enabled = true
+		cfg.Scanner.Universe.Enabled = true
+		cfg.Scanner.WeeklyLeader.Enabled = true
+		cfg.Scanner.WeeklyLeader.MinHistorySessions = 500
+		required, ok := weeklyLeaderHistoryCalendarDays(500)
+		if !ok {
+			t.Fatal("ordinary session count unexpectedly overflowed")
+		}
+		cfg.Scanner.WeeklyLeader.HistoryCalendarDays = required
+		if errs := Validate(cfg); containsStr(errs, "scanner.weekly_leader") {
+			t.Fatalf("exact calendar/session boundary rejected: %v", errs)
+		}
+		cfg.Scanner.WeeklyLeader.HistoryCalendarDays = required - 1
+		if !containsStr(Validate(cfg), "history_calendar_days") {
+			t.Fatalf("undersized calendar window accepted: %v", Validate(cfg))
+		}
+	})
 }
 
 func TestValidateScannerUniverseConfig(t *testing.T) {

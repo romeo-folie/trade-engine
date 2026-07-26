@@ -30,7 +30,11 @@ func TestIsMarketOpen(t *testing.T) {
 		{name: "sunday", ts: "2024-03-17T12:00:00", want: false},
 		{name: "holiday new year", ts: "2024-01-01T12:00:00", want: false},
 		{name: "holiday christmas", ts: "2024-12-25T12:00:00", want: false},
-		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00", want: false},
+		{name: "friday before saturday new year remains open", ts: "2021-12-31T12:00:00", want: true},
+		{name: "next friday before saturday new year remains open", ts: "2027-12-31T12:00:00", want: true},
+		{name: "sunday new year observed monday", ts: "2023-01-02T12:00:00", want: false},
+		{name: "black friday before early close", ts: "2024-11-29T12:59:59", want: true},
+		{name: "black friday early close", ts: "2024-11-29T13:00:00", want: false},
 	}
 
 	for _, tt := range tests {
@@ -41,6 +45,167 @@ func TestIsMarketOpen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExceptionalNYSEClosures(t *testing.T) {
+	for _, date := range []string{
+		"2001-09-11",
+		"2001-09-12",
+		"2001-09-13",
+		"2001-09-14",
+		"2004-06-11",
+		"2007-01-02",
+		"2012-10-29",
+		"2012-10-30",
+		"2018-12-05",
+		"2025-01-09",
+	} {
+		t.Run(date, func(t *testing.T) {
+			atNoon := mustParseNY(t, date+"T12:00:00")
+			if IsTradingDay(atNoon) {
+				t.Fatalf("IsTradingDay(%s) = true, want false", date)
+			}
+			if _, ok := MarketSessionForDate(atNoon); ok {
+				t.Fatalf("MarketSessionForDate(%s) returned a session", date)
+			}
+			if IsMarketOpen(atNoon) {
+				t.Fatalf("IsMarketOpen(%s) = true, want false", date)
+			}
+		})
+	}
+
+	t.Run("ordinary sessions surrounding exceptional closure remain open", func(t *testing.T) {
+		for _, date := range []string{"2018-12-04", "2018-12-06", "2025-01-08", "2025-01-10"} {
+			if !IsTradingDay(mustParseNY(t, date+"T12:00:00")) {
+				t.Fatalf("IsTradingDay(%s) = false, want true", date)
+			}
+		}
+	})
+}
+
+func TestMarketCloseScheduling(t *testing.T) {
+	t.Run("regular session and DST-safe UTC conversion", func(t *testing.T) {
+		winter, ok := MarketSessionForDate(mustParseNY(t, "2024-01-16T12:00:00"))
+		if !ok {
+			t.Fatal("winter trading session not found")
+		}
+		summer, ok := MarketSessionForDate(mustParseNY(t, "2024-07-08T12:00:00"))
+		if !ok {
+			t.Fatal("summer trading session not found")
+		}
+		if got := winter.Close.UTC().Hour(); got != 21 {
+			t.Fatalf("winter close UTC hour = %d, want 21", got)
+		}
+		if got := summer.Close.UTC().Hour(); got != 20 {
+			t.Fatalf("summer close UTC hour = %d, want 20", got)
+		}
+	})
+
+	t.Run("black friday closes at thirteen hundred", func(t *testing.T) {
+		session, ok := MarketSessionForDate(mustParseNY(t, "2024-11-29T09:00:00"))
+		if !ok {
+			t.Fatal("black Friday trading session not found")
+		}
+		if got := session.Close.In(nyLoc).Hour(); got != 13 {
+			t.Fatalf("Black Friday close = %d:00, want 13:00", got)
+		}
+	})
+
+	for _, test := range []struct {
+		date     string
+		wantHour int
+	}{
+		{date: "2020-07-02T09:00:00", wantHour: 16},
+		{date: "2021-07-02T09:00:00", wantHour: 16},
+		{date: "2022-07-01T09:00:00", wantHour: 16},
+		{date: "2024-07-03T09:00:00", wantHour: 13},
+		{date: "2027-07-02T09:00:00", wantHour: 16},
+	} {
+		t.Run("independence day close "+test.date, func(t *testing.T) {
+			session, ok := MarketSessionForDate(mustParseNY(t, test.date))
+			if !ok {
+				t.Fatal("expected trading session")
+			}
+			if got := session.Close.In(nyLoc).Hour(); got != test.wantHour {
+				t.Fatalf("close hour = %d, want %d", got, test.wantHour)
+			}
+		})
+	}
+
+	t.Run("sunday independence day preserves regular friday close", func(t *testing.T) {
+		now := mustParseNY(t, "2021-07-02T13:15:00")
+		session := MostRecentCompletedMarketSession(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2021-07-01" {
+			t.Fatalf("completed session = %s, want 2021-07-01", got)
+		}
+		if got := session.Close.In(nyLoc).Hour(); got != 16 {
+			t.Fatalf("completed session close = %d:00, want 16:00", got)
+		}
+	})
+
+	t.Run("startup after weekend catches up Friday once", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-17T10:00:00")
+		session := MostRecentCompletedMarketSession(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-15" {
+			t.Fatalf("completed session = %s, want Friday 2024-03-15", got)
+		}
+	})
+
+	t.Run("next run skips holiday and uses close delay", func(t *testing.T) {
+		now := mustParseNY(t, "2024-01-12T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2024-01-16" {
+			t.Fatalf("next session = %s, want 2024-01-16", got)
+		}
+		want := mustParseNY(t, "2024-01-16T16:15:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
+
+	t.Run("multi-day delay preserves pending prior session on Thursday", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-14T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 48*time.Hour)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-13" {
+			t.Fatalf("next session = %s, want 2024-03-13", got)
+		}
+		want := mustParseNY(t, "2024-03-15T16:00:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
+
+	t.Run("multi-day delay preserves pending Friday session on Saturday", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-16T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 48*time.Hour)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-15" {
+			t.Fatalf("next session = %s, want 2024-03-15", got)
+		}
+		want := mustParseNY(t, "2024-03-17T16:00:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
+
+	t.Run("completed session skips national day of mourning", func(t *testing.T) {
+		now := mustParseNY(t, "2018-12-05T17:00:00")
+		session := MostRecentCompletedMarketSession(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2018-12-04" {
+			t.Fatalf("completed session = %s, want 2018-12-04", got)
+		}
+	})
+
+	t.Run("next run skips national day of mourning", func(t *testing.T) {
+		now := mustParseNY(t, "2025-01-08T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2025-01-10" {
+			t.Fatalf("next session = %s, want 2025-01-10", got)
+		}
+		want := mustParseNY(t, "2025-01-10T16:15:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
 }
 
 func TestNextTickTime(t *testing.T) {
@@ -101,6 +266,15 @@ func TestNextTickTime(t *testing.T) {
 		want := mustParseNY(t, "2024-01-16T09:30:00")
 		if !got.Equal(want) {
 			t.Errorf("NextTickTime(holiday) = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("exceptional closure skips to next trading day", func(t *testing.T) {
+		now := mustParseNY(t, "2025-01-09T11:00:00")
+		got := NextTickTime(now, interval)
+		want := mustParseNY(t, "2025-01-10T09:30:00")
+		if !got.Equal(want) {
+			t.Errorf("NextTickTime(exceptional closure) = %v, want %v", got, want)
 		}
 	})
 
@@ -173,7 +347,7 @@ func TestStartupSkipDecision(t *testing.T) {
 	tests := []struct {
 		name         string
 		now          string
-		lastAnalysis *time.Time  // nil → no prior analyses
+		lastAnalysis *time.Time // nil → no prior analyses
 		wantSkip     bool
 		wantNextTick string // empty string → zero value (don't check)
 	}{
@@ -211,7 +385,7 @@ func TestStartupSkipDecision(t *testing.T) {
 		},
 		{
 			name:         "recent analysis on friday, next tick falls on weekend — routes to monday",
-			now:          "2024-03-15T15:45:00", // Friday
+			now:          "2024-03-15T15:45:00",                      // Friday
 			lastAnalysis: ptr(mustParseNY(t, "2024-03-15T15:30:00")), // 15 min ago
 			wantSkip:     true,
 			wantNextTick: "2024-03-18T09:30:00", // 15:30+1h=16:30 Friday → Monday open

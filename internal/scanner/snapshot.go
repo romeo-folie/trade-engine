@@ -142,6 +142,9 @@ func (r *scanRecorder) register(candidates []SwingCandidate) {
 		if c.GraphContext != "" {
 			snapshot.GraphContext = c.GraphContext
 		}
+		if c.WeeklyLeaderEvidence != "" {
+			snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
+		}
 		snapshot.Price = c.Price
 		snapshot.ChangePct = c.ChangePct
 		snapshot.Volume = c.Volume
@@ -292,6 +295,78 @@ func (r *scanRecorder) scored(c SwingCandidate, score SwingScoreResult, err erro
 	snapshot.LLMReasoning = score.Reasoning
 	snapshot.LLMRisks = append([]string(nil), score.Risks...)
 	snapshot.PassedMinConviction = score.Action == "add" && score.Conviction >= minConviction
+	if snapshot.PassedMinConviction {
+		snapshot.FinalStage = "passed_conviction"
+	} else if score.Action != "add" {
+		snapshot.FinalStage = "llm_skipped"
+	} else {
+		snapshot.FinalStage = "below_conviction"
+	}
+}
+
+func (r *scanRecorder) fallbackScored(
+	c SwingCandidate, score SwingScoreResult, err error, minConviction float64,
+) {
+	snapshot := r.candidates[c.Ticker]
+	if snapshot == nil {
+		return
+	}
+	snapshot.Sources = append([]string(nil), c.Sources...)
+	snapshot.SourceScores = make(map[string]float64, len(c.SourceScores))
+	for source, sourceScore := range c.SourceScores {
+		snapshot.SourceScores[source] = sourceScore
+	}
+	snapshot.GraphContext = c.GraphContext
+	snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
+	snapshot.Price = c.Price
+	snapshot.ChangePct = c.ChangePct
+	snapshot.Volume = c.Volume
+	snapshot.TradeCount = c.TradeCount
+	snapshot.DollarVolume = c.DollarVolume
+	snapshot.MarketCapMM = c.MarketCapMM
+	snapshot.Return1M = c.Return1M
+	snapshot.Return3M = c.Return3M
+	snapshot.Return6M = c.Return6M
+	snapshot.UniverseMember = nil
+	if c.UniverseMember != nil {
+		member := *c.UniverseMember
+		snapshot.UniverseMember = &member
+	}
+	snapshot.Sector = c.Sector
+	snapshot.Industry = c.Industry
+	snapshot.TaxonomyStatus = c.TaxonomyStatus
+	snapshot.TaxonomyAsOf = c.TaxonomyAsOf
+	snapshot.TaxonomyProvider = c.TaxonomyProvider
+	snapshot.TaxonomyEvidence = append(
+		snapshot.TaxonomyEvidence[:0], c.TaxonomyEvidence...,
+	)
+	snapshot.LLMError = ""
+	snapshot.FailureStage = ""
+	snapshot.FailureReason = ""
+	snapshot.LLMAction = ""
+	snapshot.LLMConviction = 0
+	snapshot.LLMSetupType = ""
+	snapshot.LLMStrategy = ""
+	snapshot.LLMTimeframes = nil
+	snapshot.LLMReasoning = ""
+	snapshot.LLMRisks = nil
+	snapshot.PassedMinConviction = false
+	if err != nil {
+		snapshot.LLMError = err.Error()
+		snapshot.FailureStage = "scoring"
+		snapshot.FailureReason = err.Error()
+		snapshot.FinalStage = "scoring_error"
+		return
+	}
+	snapshot.LLMAction = score.Action
+	snapshot.LLMConviction = score.Conviction
+	snapshot.LLMSetupType = score.SetupType
+	snapshot.LLMStrategy = score.Strategy
+	snapshot.LLMTimeframes = append([]string(nil), score.Timeframes...)
+	snapshot.LLMReasoning = score.Reasoning
+	snapshot.LLMRisks = append([]string(nil), score.Risks...)
+	snapshot.PassedMinConviction =
+		score.Action == "add" && score.Conviction >= minConviction
 	if snapshot.PassedMinConviction {
 		snapshot.FinalStage = "passed_conviction"
 	} else if score.Action != "add" {

@@ -7,16 +7,42 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var pool *pgxpool.Pool
+var (
+	// lifecycleMu serializes Connect and Close. Runtime pool replacement is not
+	// supported: callers may retain the pointer returned by GetDB for the
+	// lifetime of the process, so replacing and closing it would invalidate
+	// concurrent users.
+	lifecycleMu sync.Mutex
+	poolMu      sync.RWMutex
+	pool        *pgxpool.Pool
+	poolDSN     string
+)
 
-// Connect initialises the global connection pool from DATABASE_URL.
+// Connect initialises the global connection pool from DATABASE_URL. It is
+// idempotent while connected; changing DATABASE_URL requires an explicit Close
+// after all pool users have stopped, followed by Connect.
 func Connect(ctx context.Context) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	dsn := os.Getenv("DATABASE_URL")
+	poolMu.RLock()
+	connected := pool != nil
+	connectedDSN := poolDSN
+	poolMu.RUnlock()
+	if connected {
+		if dsn != connectedDSN {
+			return fmt.Errorf("database already connected; call Close before changing DATABASE_URL")
+		}
+		return nil
+	}
+
 	if dsn == "" {
 		return fmt.Errorf("DATABASE_URL environment variable is not set")
 	}
@@ -29,33 +55,53 @@ func Connect(ctx context.Context) error {
 	cfg.MaxConnLifetime = time.Hour
 	cfg.MaxConnIdleTime = 30 * time.Minute
 
-	pool, err = pgxpool.NewWithConfig(ctx, cfg)
+	candidate, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open pool: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	if err := candidate.Ping(ctx); err != nil {
+		candidate.Close()
 		return fmt.Errorf("ping database: %w", err)
 	}
+
+	poolMu.Lock()
+	pool = candidate
+	poolDSN = dsn
+	poolMu.Unlock()
 	return nil
 }
 
-// GetDB returns the global pool. Panics if Connect was not called.
 // IsConnected returns true if the database pool has been initialized.
 func IsConnected() bool {
+	poolMu.RLock()
+	defer poolMu.RUnlock()
 	return pool != nil
 }
 
+// GetDB returns the global pool. Panics if Connect was not called.
 func GetDB() *pgxpool.Pool {
-	if pool == nil {
+	poolMu.RLock()
+	db := pool
+	poolMu.RUnlock()
+	if db == nil {
 		panic("store.Connect() must be called before GetDB()")
 	}
-	return pool
+	return db
 }
 
-// Close shuts down the pool gracefully.
+// Close shuts down the pool gracefully. Callers must stop all users of the
+// pointer returned by GetDB before calling Close.
 func Close() {
-	if pool != nil {
-		pool.Close()
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
+	poolMu.Lock()
+	db := pool
+	pool = nil
+	poolDSN = ""
+	poolMu.Unlock()
+	if db != nil {
+		db.Close()
 	}
 }
 

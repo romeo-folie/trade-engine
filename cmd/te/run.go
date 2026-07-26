@@ -871,6 +871,35 @@ Modes:
 				if tgBot != nil {
 					mscanner.Notifier = tgBot
 				}
+				if shouldStartWeeklyLeaderScheduler(
+					cfg.Scanner.WeeklyLeader.Enabled, store.IsConnected(),
+				) {
+					leaderRunner := &scanner.WeeklyLeaderRunner{
+						Provider: data.NewAlpacaUniverseClient(
+							alpacaClient, cfg.Markets.Stocks.BaseURL,
+						),
+						Cfg: cfg.Scanner.WeeklyLeader,
+					}
+					leaderScheduler := &scanner.WeeklyLeaderScheduler{
+						Cfg: cfg.Scanner.WeeklyLeader,
+						Job: leaderRunner,
+					}
+					go func() {
+						if err := leaderScheduler.Run(ctx); err != nil &&
+							err != context.Canceled {
+							logger.Warn("weekly leader scheduler stopped with error",
+								"err", err.Error())
+						}
+					}()
+					logger.Info("weekly leader scanner started",
+						"after_close_delay_minutes",
+						cfg.Scanner.WeeklyLeader.AfterCloseDelayMinutes,
+						"promote_candidates",
+						cfg.Scanner.WeeklyLeader.PromoteCandidates,
+					)
+				} else if cfg.Scanner.WeeklyLeader.Enabled {
+					logger.Warn("weekly leader scanner requested but DB not connected; skipping startup")
+				}
 				go func() {
 					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
 						logger.Warn("market scanner stopped with error", "err", err.Error())
@@ -946,6 +975,10 @@ Modes:
 		fmt.Println("TradeEngine stopped.")
 		return nil
 	},
+}
+
+func shouldStartWeeklyLeaderScheduler(enabled, dbConnected bool) bool {
+	return enabled && dbConnected
 }
 
 func startDetachedRun() error {
