@@ -10,8 +10,12 @@ import (
 )
 
 type scanRecorder struct {
-	run        store.ScannerRun
-	candidates map[string]*store.ScannerCandidateSnapshot
+	run                   store.ScannerRun
+	candidates            map[string]*store.ScannerCandidateSnapshot
+	universeEnabled       bool
+	universeTTLHours      int
+	resolveUniverseByID   func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error)
+	resolveUsableUniverse func(context.Context, time.Time, time.Duration) (*store.SwingUniverseVersion, error)
 }
 
 func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
@@ -33,8 +37,15 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 			CandidateCap:                 cap,
 			MinConviction:                s.Cfg.MinConviction,
 			TTLDays:                      s.ttlDays(),
+			UniverseVersionID:            s.UniverseVersionID,
+			UniverseAsOf:                 s.UniverseAsOf,
+			RegimeReference:              s.RegimeReference,
 		},
-		candidates: make(map[string]*store.ScannerCandidateSnapshot),
+		candidates:            make(map[string]*store.ScannerCandidateSnapshot),
+		universeEnabled:       s.Cfg.Universe.Enabled,
+		universeTTLHours:      s.Cfg.Universe.SnapshotTTLHours,
+		resolveUniverseByID:   store.GetCompletedSwingUniverseVersionByIDAsOf,
+		resolveUsableUniverse: store.GetUsableSwingUniverseVersion,
 	}
 }
 
@@ -42,12 +53,71 @@ func (r *scanRecorder) begin(ctx context.Context) {
 	if !store.IsConnected() {
 		return
 	}
+	if err := r.resolveUniverseLineage(ctx); err != nil {
+		slog.Warn("scanner: resolve universe snapshot", "err", err)
+	}
 	id, err := store.BeginScannerRun(ctx, r.run)
 	if err != nil {
 		slog.Warn("scanner: begin universe snapshot", "err", err)
 		return
 	}
 	r.run.ID = id
+}
+
+func (r *scanRecorder) resolveUniverseLineage(ctx context.Context) error {
+	if r.run.StartedAt.IsZero() {
+		r.run.StartedAt = time.Now()
+	}
+	if r.run.UniverseVersionID != "" {
+		requestedVersionID := r.run.UniverseVersionID
+		resolver := r.resolveUniverseByID
+		if resolver == nil {
+			resolver = store.GetCompletedSwingUniverseVersionByIDAsOf
+		}
+		version, err := resolver(ctx, r.run.UniverseVersionID, r.run.StartedAt)
+		if err != nil {
+			r.clearUniverseLineage()
+			return err
+		}
+		if version == nil || version.ID != requestedVersionID {
+			r.clearUniverseLineage()
+			return nil
+		}
+		r.setUniverseLineage(version)
+		return nil
+	}
+
+	if r.run.UniverseVersionID == "" {
+		ttl := time.Duration(0)
+		// A zero TTL intentionally means no age bound. newScanRecorder only
+		// enables this lookup when the operator has opted into the universe.
+		if r.universeEnabled {
+			ttl = time.Duration(r.universeTTLHours) * time.Hour
+			resolver := r.resolveUsableUniverse
+			if resolver == nil {
+				resolver = store.GetUsableSwingUniverseVersion
+			}
+			version, err := resolver(ctx, r.run.StartedAt, ttl)
+			if err != nil {
+				r.clearUniverseLineage()
+				return err
+			} else if version != nil {
+				r.setUniverseLineage(version)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *scanRecorder) setUniverseLineage(version *store.SwingUniverseVersion) {
+	r.run.UniverseVersionID = version.ID
+	asOf := version.AsOf
+	r.run.UniverseAsOf = &asOf
+}
+
+func (r *scanRecorder) clearUniverseLineage() {
+	r.run.UniverseVersionID = ""
+	r.run.UniverseAsOf = nil
 }
 
 func (r *scanRecorder) register(candidates []SwingCandidate) {
@@ -62,8 +132,16 @@ func (r *scanRecorder) register(candidates []SwingCandidate) {
 			}
 			r.candidates[c.Ticker] = snapshot
 		}
-		snapshot.Sources = append([]string(nil), c.Sources...)
-		snapshot.GraphContext = c.GraphContext
+		snapshot.Sources = mergeSources(snapshot.Sources, c.Sources)
+		if snapshot.SourceScores == nil {
+			snapshot.SourceScores = make(map[string]float64)
+		}
+		for source, score := range c.SourceScores {
+			snapshot.SourceScores[source] = score
+		}
+		if c.GraphContext != "" {
+			snapshot.GraphContext = c.GraphContext
+		}
 		snapshot.Price = c.Price
 		snapshot.ChangePct = c.ChangePct
 		snapshot.Volume = c.Volume
@@ -73,8 +151,57 @@ func (r *scanRecorder) register(candidates []SwingCandidate) {
 		snapshot.Return1M = c.Return1M
 		snapshot.Return3M = c.Return3M
 		snapshot.Return6M = c.Return6M
+		if c.UniverseMember != nil {
+			member := *c.UniverseMember
+			snapshot.UniverseMember = &member
+		}
+		if c.Sector != "" {
+			snapshot.Sector = c.Sector
+		}
+		if c.Industry != "" {
+			snapshot.Industry = c.Industry
+		}
+		if c.TaxonomyStatus != "" {
+			snapshot.TaxonomyStatus = c.TaxonomyStatus
+		}
+		if c.TaxonomyAsOf != nil {
+			snapshot.TaxonomyAsOf = c.TaxonomyAsOf
+		}
+		if c.TaxonomyProvider != "" {
+			snapshot.TaxonomyProvider = c.TaxonomyProvider
+		}
+		if len(c.TaxonomyEvidence) > 0 {
+			snapshot.TaxonomyEvidence = append(snapshot.TaxonomyEvidence[:0], c.TaxonomyEvidence...)
+		}
+		if c.RemovalStage != "" {
+			snapshot.RemovalStage = c.RemovalStage
+		}
+		if c.FailureStage != "" {
+			snapshot.FailureStage = c.FailureStage
+		}
+		if c.FailureReason != "" {
+			snapshot.FailureReason = c.FailureReason
+		}
 	}
 	r.run.RawCandidateCount = len(r.candidates)
+}
+
+func mergeSources(existing, incoming []string) []string {
+	seen := make(map[string]struct{}, len(existing)+len(incoming))
+	merged := make([]string, 0, len(existing)+len(incoming))
+	for _, sources := range [][]string{existing, incoming} {
+		for _, source := range sources {
+			if source == "" {
+				continue
+			}
+			if _, ok := seen[source]; ok {
+				continue
+			}
+			seen[source] = struct{}{}
+			merged = append(merged, source)
+		}
+	}
+	return merged
 }
 
 func (r *scanRecorder) qualification(result pullbackQualification) {
@@ -116,6 +243,7 @@ func (r *scanRecorder) markRemoved(before, after []SwingCandidate, stage string)
 			continue
 		}
 		snapshot.FinalStage = stage
+		snapshot.RemovalStage = stage
 		switch stage {
 		case "active_watchlist":
 			snapshot.ActiveWatchlistDuplicate = true
@@ -150,6 +278,8 @@ func (r *scanRecorder) scored(c SwingCandidate, score SwingScoreResult, err erro
 	}
 	if err != nil {
 		snapshot.LLMError = err.Error()
+		snapshot.FailureStage = "scoring"
+		snapshot.FailureReason = err.Error()
 		snapshot.FinalStage = "scoring_error"
 		return
 	}
@@ -199,6 +329,8 @@ func (r *scanRecorder) watchlistResult(
 	snapshot.Strategies = append([]string(nil), strategies...)
 	if err != nil {
 		snapshot.WatchlistError = err.Error()
+		snapshot.FailureStage = "watchlist"
+		snapshot.FailureReason = err.Error()
 		snapshot.FinalStage = "watchlist_error"
 		return
 	}

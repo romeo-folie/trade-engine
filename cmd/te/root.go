@@ -56,6 +56,9 @@ func init() {
 	// Knowledge graph
 	rootCmd.AddCommand(graphCmd)
 
+	// Point-in-time swing universe
+	rootCmd.AddCommand(universeCmd)
+
 	// Embeddings
 	rootCmd.AddCommand(embeddingsCmd)
 

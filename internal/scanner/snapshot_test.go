@@ -1,8 +1,11 @@
 package scanner
 
 import (
+	"context"
 	"errors"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -56,5 +59,133 @@ func TestScanRecorderRetainsEveryTerminalStage(t *testing.T) {
 		recorder.run.ScoredCandidateCount != 2 ||
 		recorder.run.AddedCandidateCount != 1 {
 		t.Fatalf("run counts = %+v", recorder.run)
+	}
+}
+
+func TestScanRecorderRegisterPreservesMultiSourceLineage(t *testing.T) {
+	recorder := &scanRecorder{
+		candidates: make(map[string]*store.ScannerCandidateSnapshot),
+	}
+	member := true
+	asOf := time.Date(2026, 7, 24, 20, 0, 0, 0, time.UTC)
+
+	recorder.register([]SwingCandidate{{
+		Ticker:         "NVDA",
+		Sources:        []string{"mover"},
+		SourceScores:   map[string]float64{"mover": 0},
+		UniverseMember: &member,
+		Sector:         "Technology",
+		Industry:       "Semiconductors",
+		TaxonomyStatus: "known",
+		TaxonomyAsOf:   &asOf,
+	}})
+	recorder.register([]SwingCandidate{{
+		Ticker:       "NVDA",
+		Sources:      []string{"active", "mover"},
+		SourceScores: map[string]float64{"active": 0.73},
+	}})
+
+	got := recorder.candidates["NVDA"]
+	if want := []string{"mover", "active"}; !reflect.DeepEqual(got.Sources, want) {
+		t.Fatalf("sources = %v, want %v", got.Sources, want)
+	}
+	if want := map[string]float64{"mover": 0, "active": 0.73}; !reflect.DeepEqual(got.SourceScores, want) {
+		t.Fatalf("source scores = %v, want %v", got.SourceScores, want)
+	}
+	if got.UniverseMember == nil || !*got.UniverseMember {
+		t.Fatal("universe membership lineage was not preserved")
+	}
+	if got.Industry != "Semiconductors" || got.TaxonomyStatus != "known" {
+		t.Fatalf("taxonomy lineage was not preserved: %+v", got)
+	}
+}
+
+func TestScanRecorderValidatesExplicitUniverseLineage(t *testing.T) {
+	startedAt := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	storedAsOf := startedAt.Add(-time.Hour)
+	callerAsOf := startedAt.Add(-24 * time.Hour)
+	recorder := &scanRecorder{
+		run: store.ScannerRun{
+			StartedAt:         startedAt,
+			UniverseVersionID: "completed-version",
+			UniverseAsOf:      &callerAsOf,
+		},
+		resolveUniverseByID: func(
+			_ context.Context, id string, asOf time.Time,
+		) (*store.SwingUniverseVersion, error) {
+			if id != "completed-version" || !asOf.Equal(startedAt) {
+				t.Fatalf("resolver called with id=%q asOf=%s", id, asOf)
+			}
+			return &store.SwingUniverseVersion{
+				ID: "completed-version", AsOf: storedAsOf, Status: "completed",
+			}, nil
+		},
+	}
+
+	if err := recorder.resolveUniverseLineage(context.Background()); err != nil {
+		t.Fatalf("resolveUniverseLineage: %v", err)
+	}
+	if recorder.run.UniverseVersionID != "completed-version" ||
+		recorder.run.UniverseAsOf == nil || !recorder.run.UniverseAsOf.Equal(storedAsOf) {
+		t.Fatalf("validated lineage = %+v", recorder.run)
+	}
+}
+
+func TestScanRecorderClearsInvalidExplicitUniverseLineage(t *testing.T) {
+	startedAt := time.Date(2026, 7, 26, 14, 0, 0, 0, time.UTC)
+	untrustedAsOf := startedAt.Add(time.Hour)
+	tests := []struct {
+		name    string
+		resolve func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error)
+		wantErr bool
+	}{
+		{
+			name: "unfinished failed or future version",
+			resolve: func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error) {
+				return nil, nil
+			},
+		},
+		{
+			name: "resolver returns mismatched version",
+			resolve: func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error) {
+				return &store.SwingUniverseVersion{
+					ID: "different-version", AsOf: startedAt.Add(-time.Hour),
+				}, nil
+			},
+		},
+		{
+			name: "lookup failure",
+			resolve: func(context.Context, string, time.Time) (*store.SwingUniverseVersion, error) {
+				return nil, errors.New("database unavailable")
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			recorder := &scanRecorder{
+				run: store.ScannerRun{
+					StartedAt:         startedAt,
+					UniverseVersionID: "untrusted-version",
+					UniverseAsOf:      &untrustedAsOf,
+				},
+				universeEnabled:     true,
+				resolveUniverseByID: tc.resolve,
+				resolveUsableUniverse: func(
+					context.Context, time.Time, time.Duration,
+				) (*store.SwingUniverseVersion, error) {
+					t.Fatal("invalid explicit lineage must not silently fall back")
+					return nil, nil
+				},
+			}
+
+			err := recorder.resolveUniverseLineage(context.Background())
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("error = %v, wantErr=%v", err, tc.wantErr)
+			}
+			if recorder.run.UniverseVersionID != "" || recorder.run.UniverseAsOf != nil {
+				t.Fatalf("invalid lineage retained: %+v", recorder.run)
+			}
+		})
 	}
 }

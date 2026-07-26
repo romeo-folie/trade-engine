@@ -2,7 +2,11 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ScannerRun captures the configuration and aggregate outcome of one scan.
@@ -24,6 +28,9 @@ type ScannerRun struct {
 	ScoredCandidateCount         int
 	AddedCandidateCount          int
 	ExpiredItemCount             int
+	UniverseVersionID            string
+	UniverseAsOf                 *time.Time
+	RegimeReference              string
 }
 
 // ScannerCandidateSnapshot records every stage reached by a sourced candidate.
@@ -64,6 +71,17 @@ type ScannerCandidateSnapshot struct {
 	WatchlistError           string
 	Strategies               []string
 	FinalStage               string
+	SourceScores             map[string]float64
+	UniverseMember           *bool
+	Sector                   string
+	Industry                 string
+	TaxonomyStatus           string
+	TaxonomyAsOf             *time.Time
+	TaxonomyProvider         string
+	TaxonomyEvidence         json.RawMessage
+	RemovalStage             string
+	FailureStage             string
+	FailureReason            string
 }
 
 type ScannerEngineOutcome struct {
@@ -89,19 +107,61 @@ func InsertScannerEngineOutcome(ctx context.Context, outcome ScannerEngineOutcom
 }
 
 func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var universeAsOf *time.Time
+	if run.UniverseVersionID != "" {
+		var storedAsOf time.Time
+		err = tx.QueryRow(ctx, `
+			SELECT as_of
+			FROM swing_universe_versions
+			WHERE id=$1
+			  AND status='completed'
+			  AND completed_at IS NOT NULL
+			  AND as_of <= $2
+			  AND captured_at <= $2
+			  AND completed_at <= $2
+			FOR SHARE`,
+			run.UniverseVersionID, run.StartedAt,
+		).Scan(&storedAsOf)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return "", fmt.Errorf(
+					"universe version %s is not completed and available at scanner start: %w",
+					run.UniverseVersionID, err,
+				)
+			}
+			return "", fmt.Errorf("validate scanner universe lineage: %w", err)
+		}
+		universeAsOf = &storedAsOf
+	}
+
 	var id string
-	err := GetDB().QueryRow(ctx, `
-		INSERT INTO scanner_runs (
-			started_at, pullback_universe_enabled,
-			pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
-			pullback_min_dollar_volume, candidate_cap, min_conviction, ttl_days
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-		RETURNING id`,
+	err = tx.QueryRow(ctx, `
+			INSERT INTO scanner_runs (
+				started_at, pullback_universe_enabled,
+				pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
+				pullback_min_dollar_volume, candidate_cap, min_conviction, ttl_days,
+				universe_version_id, universe_as_of, regime_reference
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+			RETURNING id`,
 		run.StartedAt, run.PullbackUniverseEnabled,
 		run.PullbackMinMomentumReturnPct, run.PullbackMinMarketCapMM,
 		run.PullbackMinDollarVolume, run.CandidateCap, run.MinConviction, run.TTLDays,
+		nullableString(run.UniverseVersionID), universeAsOf,
+		nullableString(run.RegimeReference),
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerCandidateSnapshot) error {
@@ -124,6 +184,9 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 		if c.Strategies == nil {
 			c.Strategies = []string{}
 		}
+		if c.SourceScores == nil {
+			c.SourceScores = map[string]float64{}
+		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scanner_candidate_snapshots (
 				scanner_run_id, ticker, sources, graph_context, price, change_pct,
@@ -134,12 +197,14 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 				eligible_for_scoring, llm_action, llm_conviction, llm_setup_type,
 				llm_strategy, llm_timeframes, llm_reasoning, llm_risks, llm_error,
 				passed_min_conviction, cap_selected, watchlist_added, watchlist_error,
-				strategies, final_stage
-			) VALUES (
-				$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
-				$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-				$35,$36
-			)`,
+					strategies, final_stage, source_scores, universe_member, sector,
+					industry, taxonomy_status, taxonomy_as_of, taxonomy_provider,
+					taxonomy_evidence, removal_stage, failure_stage, failure_reason
+				) VALUES (
+					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
+					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
+					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47
+				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableFloat(c.Price), nullableFloat(c.ChangePct), c.Volume, c.TradeCount,
 			nullableFloat(c.DollarVolume), nullableFloat(c.MarketCapMM),
@@ -153,6 +218,11 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 			c.LLMTimeframes, nullableString(c.LLMReasoning), c.LLMRisks,
 			nullableString(c.LLMError), c.PassedMinConviction, c.CapSelected,
 			c.WatchlistAdded, nullableString(c.WatchlistError), c.Strategies, c.FinalStage,
+			c.SourceScores, c.UniverseMember, nullableString(c.Sector),
+			nullableString(c.Industry), nullableString(c.TaxonomyStatus),
+			c.TaxonomyAsOf, nullableString(c.TaxonomyProvider),
+			nonNilJSON(c.TaxonomyEvidence), nullableString(c.RemovalStage),
+			nullableString(c.FailureStage), nullableString(c.FailureReason),
 		)
 		if err != nil {
 			return err

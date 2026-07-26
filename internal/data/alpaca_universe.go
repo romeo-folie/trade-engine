@@ -1,0 +1,393 @@
+package data
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	defaultAlpacaTradingURL = "https://paper-api.alpaca.markets"
+	alpacaProviderName      = "alpaca"
+)
+
+var errAlpacaSymbolMissing = errors.New("alpaca response omitted symbol")
+
+// AlpacaUniverseClient adds trading-host asset discovery and bulk market-data
+// capabilities to an AlpacaClient. Wrapping the existing client intentionally
+// shares its authentication, retry policy, and rate limiter.
+type AlpacaUniverseClient struct {
+	client     *AlpacaClient
+	tradingURL string
+	now        func() time.Time
+}
+
+func NewAlpacaUniverseClient(client *AlpacaClient, tradingURL string) *AlpacaUniverseClient {
+	if tradingURL == "" {
+		tradingURL = defaultAlpacaTradingURL
+	}
+	return &AlpacaUniverseClient{
+		client:     client,
+		tradingURL: strings.TrimRight(tradingURL, "/"),
+		now:        time.Now,
+	}
+}
+
+type alpacaAsset struct {
+	ID           string   `json:"id"`
+	Class        string   `json:"class"`
+	Exchange     string   `json:"exchange"`
+	Symbol       string   `json:"symbol"`
+	Name         string   `json:"name"`
+	Status       string   `json:"status"`
+	Tradable     bool     `json:"tradable"`
+	Marginable   bool     `json:"marginable"`
+	Shortable    bool     `json:"shortable"`
+	Fractionable bool     `json:"fractionable"`
+	Attributes   []string `json:"attributes"`
+}
+
+// FetchStockAssets returns Alpaca's complete US-equity asset master, sorted and
+// deduplicated by normalized symbol. Active/tradable status is evidence for the
+// caller's configurable filter, so this provider must not pre-filter it.
+func (c *AlpacaUniverseClient) FetchStockAssets(ctx context.Context) ([]StockAsset, error) {
+	if err := c.ready(); err != nil {
+		return nil, err
+	}
+	params := url.Values{}
+	params.Set("asset_class", "us_equity")
+	resp, err := c.client.getFrom(ctx, c.tradingURL, "/v2/assets", params)
+	if err != nil {
+		return nil, fmt.Errorf("fetch alpaca stock assets: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var payload []alpacaAsset
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, fmt.Errorf("decode alpaca stock assets: %w", err)
+	}
+	sort.Slice(payload, func(i, j int) bool {
+		left, right := normalizeStockSymbol(payload[i].Symbol), normalizeStockSymbol(payload[j].Symbol)
+		if left == right {
+			leftActive := payload[i].Status == "active"
+			rightActive := payload[j].Status == "active"
+			if leftActive != rightActive {
+				return leftActive
+			}
+			if payload[i].Tradable != payload[j].Tradable {
+				return payload[i].Tradable
+			}
+			return payload[i].ID < payload[j].ID
+		}
+		return left < right
+	})
+
+	observedAt := c.now().UTC()
+	assets := make([]StockAsset, 0, len(payload))
+	seen := make(map[string]struct{}, len(payload))
+	for _, raw := range payload {
+		symbol := normalizeStockSymbol(raw.Symbol)
+		if symbol == "" || raw.Class != "us_equity" {
+			continue
+		}
+		if _, duplicate := seen[symbol]; duplicate {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		attributes := append([]string(nil), raw.Attributes...)
+		sort.Strings(attributes)
+		assets = append(assets, StockAsset{
+			AssetID:      raw.ID,
+			Symbol:       symbol,
+			Name:         strings.TrimSpace(raw.Name),
+			Status:       raw.Status,
+			AssetClass:   raw.Class,
+			Exchange:     strings.ToUpper(strings.TrimSpace(raw.Exchange)),
+			Tradable:     raw.Tradable,
+			Marginable:   raw.Marginable,
+			Shortable:    raw.Shortable,
+			Fractionable: raw.Fractionable,
+			Attributes:   attributes,
+			Provider:     alpacaProviderName,
+			ObservedAt:   observedAt,
+		})
+	}
+	return assets, nil
+}
+
+type alpacaBulkBarsResponse struct {
+	Bars          map[string][]alpacaBar `json:"bars"`
+	NextPageToken string                 `json:"next_page_token"`
+}
+
+// FetchStockSnapshots fetches the IEX snapshot evidence in deterministic,
+// caller-bounded batches. Non-context batch failures are attributed to every
+// symbol in that batch and later batches continue.
+func (c *AlpacaUniverseClient) FetchStockSnapshots(
+	ctx context.Context, symbols []string, batchSize int,
+) (StockSnapshotBatchResult, error) {
+	result := StockSnapshotBatchResult{
+		Snapshots: make(map[string]StockSnapshotEvidence),
+		Failures:  make(map[string]error),
+	}
+	if err := c.ready(); err != nil {
+		return result, err
+	}
+	normalized, err := normalizedSymbolList(symbols, batchSize)
+	if err != nil {
+		return result, err
+	}
+	for start := 0; start < len(normalized); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			markSymbolFailures(result.Failures, normalized[start:], err)
+			return result, err
+		}
+		end := min(start+batchSize, len(normalized))
+		batch := normalized[start:end]
+		params := url.Values{}
+		params.Set("symbols", strings.Join(batch, ","))
+		params.Set("feed", "iex")
+		resp, fetchErr := c.client.get(ctx, "/v2/stocks/snapshots", params)
+		if fetchErr != nil {
+			markSymbolFailures(result.Failures, batch, fetchErr)
+			if ctx.Err() != nil {
+				markSymbolFailures(result.Failures, normalized[end:], ctx.Err())
+				return result, ctx.Err()
+			}
+			continue
+		}
+		var payload map[string]alpacaSnapshot
+		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if decodeErr != nil {
+			markSymbolFailures(result.Failures, batch, fmt.Errorf("decode alpaca snapshots: %w", decodeErr))
+			continue
+		}
+		observedAt := c.now().UTC()
+		for _, symbol := range batch {
+			raw, ok := snapshotForSymbol(payload, symbol)
+			if !ok {
+				result.Failures[symbol] = errAlpacaSymbolMissing
+				continue
+			}
+			result.Snapshots[symbol] = stockSnapshotEvidence(symbol, raw, observedAt)
+		}
+	}
+	return result, nil
+}
+
+// FetchDailyBars retrieves split-adjusted IEX daily bars using Alpaca's
+// multi-symbol endpoint. Pagination is completed independently for each batch;
+// a failed batch never makes a partial page look like complete evidence.
+func (c *AlpacaUniverseClient) FetchDailyBars(
+	ctx context.Context,
+	symbols []string,
+	from, to time.Time,
+	batchSize int,
+) (DailyBarsBatchResult, error) {
+	result := DailyBarsBatchResult{
+		Bars:     make(map[string][]Candle),
+		Failures: make(map[string]error),
+	}
+	if err := c.ready(); err != nil {
+		return result, err
+	}
+	if !to.After(from) {
+		return result, fmt.Errorf("daily bars end must be after start")
+	}
+	normalized, err := normalizedSymbolList(symbols, batchSize)
+	if err != nil {
+		return result, err
+	}
+	for start := 0; start < len(normalized); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			markSymbolFailures(result.Failures, normalized[start:], err)
+			return result, err
+		}
+		end := min(start+batchSize, len(normalized))
+		batch := normalized[start:end]
+		batchBars, fetchErr := c.fetchDailyBarsBatch(ctx, batch, from, to)
+		if fetchErr != nil {
+			markSymbolFailures(result.Failures, batch, fetchErr)
+			if ctx.Err() != nil {
+				markSymbolFailures(result.Failures, normalized[end:], ctx.Err())
+				return result, ctx.Err()
+			}
+			continue
+		}
+		for _, symbol := range batch {
+			bars := batchBars[symbol]
+			if len(bars) == 0 {
+				result.Failures[symbol] = errAlpacaSymbolMissing
+				continue
+			}
+			result.Bars[symbol] = bars
+		}
+	}
+	return result, nil
+}
+
+func (c *AlpacaUniverseClient) fetchDailyBarsBatch(
+	ctx context.Context, batch []string, from, to time.Time,
+) (map[string][]Candle, error) {
+	collected := make(map[string][]Candle, len(batch))
+	nextPageToken := ""
+	for {
+		params := url.Values{}
+		params.Set("symbols", strings.Join(batch, ","))
+		params.Set("timeframe", "1Day")
+		params.Set("start", from.UTC().Format(time.RFC3339))
+		params.Set("end", to.UTC().Format(time.RFC3339))
+		params.Set("limit", "10000")
+		params.Set("adjustment", alpacaStockAdjustment)
+		params.Set("feed", "iex")
+		params.Set("sort", "asc")
+		if nextPageToken != "" {
+			params.Set("page_token", nextPageToken)
+		}
+		resp, err := c.client.get(ctx, "/v2/stocks/bars", params)
+		if err != nil {
+			return nil, fmt.Errorf("fetch alpaca daily bars: %w", err)
+		}
+		var payload alpacaBulkBarsResponse
+		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+		resp.Body.Close()
+		if decodeErr != nil {
+			return nil, fmt.Errorf("decode alpaca daily bars: %w", decodeErr)
+		}
+		for rawSymbol, rawBars := range payload.Bars {
+			symbol := normalizeStockSymbol(rawSymbol)
+			for _, rawBar := range rawBars {
+				if candle, ok := alpacaCandle(symbol, Timeframe1Day, rawBar); ok {
+					collected[symbol] = append(collected[symbol], candle)
+				}
+			}
+		}
+		if payload.NextPageToken == "" {
+			break
+		}
+		nextPageToken = payload.NextPageToken
+	}
+	for symbol, bars := range collected {
+		collected[symbol] = dedupeAndSortCandles(bars)
+	}
+	return collected, nil
+}
+
+func (c *AlpacaUniverseClient) ready() error {
+	if c == nil || c.client == nil {
+		return fmt.Errorf("alpaca universe client is nil")
+	}
+	return nil
+}
+
+func normalizedSymbolList(symbols []string, batchSize int) ([]string, error) {
+	if batchSize <= 0 {
+		return nil, fmt.Errorf("batch size must be positive")
+	}
+	seen := make(map[string]struct{}, len(symbols))
+	normalized := make([]string, 0, len(symbols))
+	for _, raw := range symbols {
+		symbol := normalizeStockSymbol(raw)
+		if symbol == "" {
+			continue
+		}
+		if _, ok := seen[symbol]; ok {
+			continue
+		}
+		seen[symbol] = struct{}{}
+		normalized = append(normalized, symbol)
+	}
+	sort.Strings(normalized)
+	return normalized, nil
+}
+
+func normalizeStockSymbol(symbol string) string {
+	return strings.ToUpper(strings.TrimSpace(symbol))
+}
+
+func markSymbolFailures(failures map[string]error, symbols []string, err error) {
+	for _, symbol := range symbols {
+		if _, alreadySet := failures[symbol]; !alreadySet {
+			failures[symbol] = err
+		}
+	}
+}
+
+func snapshotForSymbol(payload map[string]alpacaSnapshot, symbol string) (alpacaSnapshot, bool) {
+	if snap, ok := payload[symbol]; ok {
+		return snap, true
+	}
+	for rawSymbol, snap := range payload {
+		if normalizeStockSymbol(rawSymbol) == symbol {
+			return snap, true
+		}
+	}
+	return alpacaSnapshot{}, false
+}
+
+func stockSnapshotEvidence(symbol string, raw alpacaSnapshot, observedAt time.Time) StockSnapshotEvidence {
+	evidence := StockSnapshotEvidence{
+		Symbol:     symbol,
+		Provider:   alpacaProviderName,
+		ObservedAt: observedAt,
+	}
+	if candle, ok := alpacaCandle(symbol, Timeframe1Min, derefAlpacaBar(raw.MinuteBar)); ok && raw.MinuteBar != nil {
+		evidence.MinuteBar = &candle
+	}
+	if candle, ok := alpacaCandle(symbol, Timeframe1Day, derefAlpacaBar(raw.DailyBar)); ok && raw.DailyBar != nil {
+		evidence.DailyBar = &candle
+	}
+	if candle, ok := alpacaCandle(symbol, Timeframe1Day, derefAlpacaBar(raw.PreviousDailyBar)); ok && raw.PreviousDailyBar != nil {
+		evidence.PreviousDailyBar = &candle
+	}
+	if raw.LatestTrade != nil {
+		evidence.LatestTradePrice = raw.LatestTrade.Price
+		evidence.LatestTradeAt, _ = time.Parse(time.RFC3339Nano, raw.LatestTrade.Timestamp)
+	}
+	if raw.LatestQuote != nil {
+		evidence.LatestBidPrice = raw.LatestQuote.BidPrice
+		evidence.LatestAskPrice = raw.LatestQuote.AskPrice
+		evidence.LatestQuoteAt, _ = time.Parse(time.RFC3339Nano, raw.LatestQuote.Timestamp)
+	}
+	return evidence
+}
+
+func derefAlpacaBar(bar *alpacaBar) alpacaBar {
+	if bar == nil {
+		return alpacaBar{}
+	}
+	return *bar
+}
+
+func alpacaCandle(symbol string, timeframe Timeframe, raw alpacaBar) (Candle, bool) {
+	ts, err := time.Parse(time.RFC3339Nano, raw.Timestamp)
+	if err != nil {
+		return Candle{}, false
+	}
+	return Candle{
+		Ticker: symbol, Timeframe: timeframe, Timestamp: ts,
+		Open: raw.Open, High: raw.High, Low: raw.Low, Close: raw.Close,
+		Volume: raw.Volume, VWAP: raw.VWAP,
+	}, true
+}
+
+func dedupeAndSortCandles(bars []Candle) []Candle {
+	sort.SliceStable(bars, func(i, j int) bool {
+		return bars[i].Timestamp.Before(bars[j].Timestamp)
+	})
+	out := bars[:0]
+	for _, bar := range bars {
+		if len(out) > 0 && out[len(out)-1].Timestamp.Equal(bar.Timestamp) {
+			out[len(out)-1] = bar
+			continue
+		}
+		out = append(out, bar)
+	}
+	return out
+}

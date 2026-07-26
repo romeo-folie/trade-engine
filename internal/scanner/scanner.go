@@ -71,6 +71,12 @@ type MarketScanner struct {
 	// PullbackMinMomentumReturnPct mirrors the entry-gate threshold so universe
 	// ranking and execution eligibility cannot diverge. Zero resolves to 30%.
 	PullbackMinMomentumReturnPct float64
+	// UniverseVersionID and its evidence timestamps link a scan to the exact
+	// immutable eligible-universe denominator used by newer discovery sources.
+	// They remain empty for legacy scans and while scanner.universe is disabled.
+	UniverseVersionID string
+	UniverseAsOf      *time.Time
+	RegimeReference   string
 
 	// sympathyFired tracks (seed, neighbour) pairs already surfaced by
 	// news-sympathy sourcing, pruned after the configured cooldown so one

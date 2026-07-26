@@ -34,6 +34,10 @@ func NewFinnhubClient(apiKey string) *FinnhubClient {
 	}
 }
 
+// ProviderName identifies the provenance used when the universe builder records
+// successful and unavailable fundamentals observations.
+func (c *FinnhubClient) ProviderName() string { return "finnhub" }
+
 // throttle enforces the per-client rate limit. Returns ctx.Err() if the context
 // is cancelled during the wait rather than blocking until the interval elapses.
 func (c *FinnhubClient) throttle(ctx context.Context) error {
@@ -73,6 +77,9 @@ type finnhubArticle struct {
 type finnhubProfile struct {
 	Name                 string  `json:"name"`
 	MarketCapitalization float64 `json:"marketCapitalization"` // USD millions
+	Country              string  `json:"country"`
+	Exchange             string  `json:"exchange"`
+	FinnhubIndustry      string  `json:"finnhubIndustry"`
 }
 
 // FetchCompanyProfile returns the company's full name for a ticker via
@@ -90,6 +97,13 @@ func (c *FinnhubClient) FetchCompanyProfile(ctx context.Context, ticker string) 
 type CompanyFundamentals struct {
 	Name                 string
 	MarketCapitalization float64
+	Country              string
+	Exchange             string
+	// Industry is Finnhub's broad, provider-defined industry label. It is not a
+	// GICS sector/industry hierarchy and must not be represented as one.
+	Industry   string
+	Provider   string
+	ObservedAt time.Time
 }
 
 // FetchCompanyFundamentals returns company identity and market capitalization
@@ -136,6 +150,11 @@ func (c *FinnhubClient) FetchCompanyFundamentals(ctx context.Context, ticker str
 	return CompanyFundamentals{
 		Name:                 strings.TrimSpace(p.Name),
 		MarketCapitalization: p.MarketCapitalization,
+		Country:              strings.TrimSpace(p.Country),
+		Exchange:             strings.TrimSpace(p.Exchange),
+		Industry:             strings.TrimSpace(p.FinnhubIndustry),
+		Provider:             "finnhub",
+		ObservedAt:           time.Now().UTC(),
 	}, nil
 }
 
