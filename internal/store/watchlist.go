@@ -8,7 +8,13 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-var ErrWatchlistRequalificationRequired = errors.New("watchlist item requires pullback requalification")
+var (
+	ErrWatchlistRequalificationRequired = errors.New("watchlist item requires pullback requalification")
+	// ErrWatchlistActiveItemExists means a fallback write lost a race to an
+	// already-active watchlist entry. The caller must leave that newer entry
+	// untouched rather than replacing its strategy or scanner lineage.
+	ErrWatchlistActiveItemExists = errors.New("active watchlist item already exists")
+)
 
 // WatchlistItem represents a row in the watchlist table.
 type WatchlistItem struct {
@@ -44,7 +50,15 @@ type WatchlistItem struct {
 // If the ticker+platform pair already exists and was disabled, it is re-enabled.
 // For scanner-sourced items, ExpiresAt is written and updated on re-activation.
 func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
-	return addWatchlistItem(ctx, GetDB(), item)
+	return addWatchlistItem(ctx, GetDB(), item, false)
+}
+
+// AddWatchlistItemUnlessActive inserts a watchlist item, or reactivates an
+// inactive/expired item, without replacing a currently active item. It is used
+// after a weekly-leader claim loss, where another worker may have promoted the
+// same ticker between the failed fenced promotion and the ordinary fallback.
+func AddWatchlistItemUnlessActive(ctx context.Context, item WatchlistItem) error {
+	return addWatchlistItem(ctx, GetDB(), item, true)
 }
 
 type watchlistExecer interface {
@@ -53,6 +67,7 @@ type watchlistExecer interface {
 
 func addWatchlistItem(
 	ctx context.Context, db watchlistExecer, item WatchlistItem,
+	preserveActive bool,
 ) error {
 	if item.Platform == "" {
 		item.Platform = "stock"
@@ -82,16 +97,32 @@ func addWatchlistItem(
 			AND EXCLUDED.source = 'scanner'
 			AND NOT $10
 		)
+		AND NOT (
+			$11
+			AND watchlist.active
+			AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
+		)
 	`,
 		item.Ticker, item.Platform, item.Strategies, item.Timeframes,
 		item.MinConfidence, item.Source, nullableString(item.GraphContext),
 		nullableString(item.ScannerRunID), item.ExpiresAt,
-		item.PullbackRequalificationComplete,
+		item.PullbackRequalificationComplete, preserveActive,
 	)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() == 0 {
+		if preserveActive {
+			var currentlyActive bool
+			err := GetDB().QueryRow(ctx, `
+				SELECT active AND (expires_at IS NULL OR expires_at > NOW())
+				FROM watchlist
+				WHERE ticker=$1 AND platform=$2
+			`, item.Ticker, item.Platform).Scan(&currentlyActive)
+			if err == nil && currentlyActive {
+				return ErrWatchlistActiveItemExists
+			}
+		}
 		return ErrWatchlistRequalificationRequired
 	}
 	return nil

@@ -91,26 +91,81 @@ func TestWeeklyLeaderCompatibilityHashIgnoresOperationalSettings(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg.Enabled = !cfg.Enabled
-	cfg.PromoteCandidates = !cfg.PromoteCandidates
-	cfg.MaxPromotionsPerRun++
-	cfg.AfterCloseDelayMinutes++
-	cfg.BatchSize++
-	cfg.RunLeaseMinutes++
-	_, operational, err := weeklyLeaderConfigEvidence(cfg)
+	operationalChanges := []struct {
+		name   string
+		change func(*config.WeeklyLeaderConfig)
+	}{
+		{"enabled", func(c *config.WeeklyLeaderConfig) { c.Enabled = !c.Enabled }},
+		{"promotion enabled", func(c *config.WeeklyLeaderConfig) {
+			c.PromoteCandidates = !c.PromoteCandidates
+		}},
+		{"promotion cap", func(c *config.WeeklyLeaderConfig) { c.MaxPromotionsPerRun++ }},
+		{"after-close delay", func(c *config.WeeklyLeaderConfig) {
+			c.AfterCloseDelayMinutes++
+		}},
+		{"universe maximum age", func(c *config.WeeklyLeaderConfig) {
+			c.UniverseMaxAgeHours++
+		}},
+		{"provider batch size", func(c *config.WeeklyLeaderConfig) { c.BatchSize++ }},
+		{"run lease", func(c *config.WeeklyLeaderConfig) { c.RunLeaseMinutes++ }},
+	}
+	for _, tc := range operationalChanges {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := cfg
+			tc.change(&changed)
+			_, operational, err := weeklyLeaderConfigEvidence(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if original != operational {
+				t.Fatal("operational deployment setting broke scoring-history compatibility")
+			}
+		})
+	}
+}
+
+func TestWeeklyLeaderCompatibilityHashIncludesEvaluationSettings(t *testing.T) {
+	cfg := config.Defaults().Scanner.WeeklyLeader
+	_, original, err := weeklyLeaderConfigEvidence(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if original != operational {
-		t.Fatal("operational deployment settings broke scoring-history compatibility")
+	evaluationChanges := []struct {
+		name   string
+		change func(*config.WeeklyLeaderConfig)
+	}{
+		{"history calendar days", func(c *config.WeeklyLeaderConfig) {
+			c.HistoryCalendarDays++
+		}},
+		{"minimum history sessions", func(c *config.WeeklyLeaderConfig) {
+			c.MinHistorySessions++
+		}},
+		{"benchmark", func(c *config.WeeklyLeaderConfig) { c.Benchmark = "QQQ" }},
+		{"industry minimum peers", func(c *config.WeeklyLeaderConfig) {
+			c.IndustryMinPeers++
+		}},
+		{"selection percentile", func(c *config.WeeklyLeaderConfig) {
+			c.SelectionPercentile += 0.01
+		}},
+		{"minimum composite score", func(c *config.WeeklyLeaderConfig) {
+			c.MinCompositeScore += 0.01
+		}},
+		{"minimum feature coverage", func(c *config.WeeklyLeaderConfig) {
+			c.MinFeatureCoverage += 0.01
+		}},
 	}
-	cfg.MinCompositeScore += 0.01
-	_, scoring, err := weeklyLeaderConfigEvidence(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if original == scoring {
-		t.Fatal("scoring change did not change compatibility hash")
+	for _, tc := range evaluationChanges {
+		t.Run(tc.name, func(t *testing.T) {
+			changed := cfg
+			tc.change(&changed)
+			_, evaluation, err := weeklyLeaderConfigEvidence(changed)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if original == evaluation {
+				t.Fatal("evaluation change did not change compatibility hash")
+			}
+		})
 	}
 }
 
@@ -343,6 +398,73 @@ func TestPercentilesUseMidrankForTies(t *testing.T) {
 	})
 	if got["AAA"] != 0.5 || got["BBB"] != 0.5 {
 		t.Fatalf("tie percentiles = %v, want both 0.5", got)
+	}
+}
+
+func TestBandAwarePercentilesRequireFiveValidObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		assignBand func(*weeklyLeaderRaw, int)
+	}{
+		{
+			name: "market cap band",
+			assignBand: func(row *weeklyLeaderRaw, index int) {
+				if index < 5 {
+					row.capBand = "target"
+				} else {
+					row.capBand = "other"
+				}
+				row.volBand = row.member.Ticker
+			},
+		},
+		{
+			name: "volatility band",
+			assignBand: func(row *weeklyLeaderRaw, index int) {
+				row.capBand = row.member.Ticker
+				if index < 5 {
+					row.volBand = "target"
+				} else {
+					row.volBand = "other"
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := make([]weeklyLeaderRaw, 10)
+			values := make(map[string]float64, len(rows))
+			for i := range rows {
+				ticker := string(rune('A'+i)) + "AA"
+				rows[i].member.Ticker = ticker
+				tc.assignBand(&rows[i], i)
+				values[ticker] = float64(i)
+			}
+			getter := func(row weeklyLeaderRaw) (float64, bool) {
+				value, ok := values[row.member.Ticker]
+				return value, ok
+			}
+
+			delete(values, rows[4].member.Ticker)
+			global := percentileForRows(rows, getter)
+			got := bandAwarePercentiles(rows, getter)
+			targetTicker := rows[3].member.Ticker
+			if math.Abs(got[targetTicker]-global[targetTicker]) > 1e-12 {
+				t.Fatalf("four-valid-observation score = %v, want global %v",
+					got[targetTicker], global[targetTicker])
+			}
+
+			values[rows[4].member.Ticker] = 100
+			global = percentileForRows(rows, getter)
+			got = bandAwarePercentiles(rows, getter)
+			band := percentileForRows(rows[:5], getter)
+			want := (0.70*global[targetTicker] + 0.15*band[targetTicker]) / 0.85
+			if math.Abs(got[targetTicker]-want) > 1e-12 {
+				t.Fatalf("five-valid-observation score = %v, want blended %v",
+					got[targetTicker], want)
+			}
+			if got[targetTicker] == global[targetTicker] {
+				t.Fatalf("five valid observations did not activate band blending")
+			}
+		})
 	}
 }
 

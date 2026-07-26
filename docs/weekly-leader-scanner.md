@@ -27,7 +27,9 @@ are never represented as a knowledge-graph relationship. They still face:
 
 If a leader reaches the watchlist, `weekly_leader` is retained as an additive
 strategy tag beside the LLM's setup strategy. A ticker that was also a mover or
-most-active stock retains every source and every independent source score.
+most-active stock retains every source and every independent source score. If
+a stale leader claim falls back to an ordinary source, its conditional upsert
+never overwrites an active concurrent watchlist entry or its newer lineage.
 
 ## Point-in-time contract
 
@@ -46,6 +48,10 @@ The run records the exact universe version, configuration hash, feature version,
 provider, benchmark, first/last input bar, and completed-session count. Names
 with incomplete history or provider failures remain in the eligible denominator
 as explicit failed observations. Missing values never become numeric zero.
+The compatibility hash includes the calendar fetch window because it can change
+the observations available for sparse histories. Deployment-only controls such
+as enablement, scheduling delay, universe age, batch size, promotion, and claim
+lease settings remain excluded so they do not break leadership lineage.
 If even one requested universe symbol has a provider-history failure, the run
 retains all available measurements for diagnosis but suppresses every
 qualification. A partial surviving batch is never renormalized into promotable

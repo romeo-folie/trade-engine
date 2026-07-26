@@ -332,11 +332,12 @@ func weeklyLeaderConfigEvidence(
 	if err != nil {
 		return nil, "", fmt.Errorf("marshal weekly leader config: %w", err)
 	}
-	// Operational switches and timer/lease/batch settings do not change a
-	// ticker's score. Keeping them out of the compatibility hash preserves
+	// Operational switches and timer/lease/batch settings do not change the
+	// evaluation output. Keeping them out of the compatibility hash preserves
 	// transition history across observation/promotion and deployment changes.
-	scoringConfig := struct {
+	compatibilityConfig := struct {
 		FeatureVersion      string  `json:"feature_version"`
+		HistoryCalendarDays int     `json:"history_calendar_days"`
 		MinHistorySessions  int     `json:"min_history_sessions"`
 		Benchmark           string  `json:"benchmark"`
 		IndustryMinPeers    int     `json:"industry_min_peers"`
@@ -345,6 +346,7 @@ func weeklyLeaderConfigEvidence(
 		MinFeatureCoverage  float64 `json:"min_feature_coverage"`
 	}{
 		FeatureVersion:      weeklyLeaderFeatureVersion,
+		HistoryCalendarDays: cfg.HistoryCalendarDays,
 		MinHistorySessions:  cfg.MinHistorySessions,
 		Benchmark:           strings.ToUpper(strings.TrimSpace(cfg.Benchmark)),
 		IndustryMinPeers:    cfg.IndustryMinPeers,
@@ -352,11 +354,11 @@ func weeklyLeaderConfigEvidence(
 		MinCompositeScore:   cfg.MinCompositeScore,
 		MinFeatureCoverage:  cfg.MinFeatureCoverage,
 	}
-	scoringEvidence, err := json.Marshal(scoringConfig)
+	compatibilityEvidence, err := json.Marshal(compatibilityConfig)
 	if err != nil {
-		return nil, "", fmt.Errorf("marshal weekly leader scoring config: %w", err)
+		return nil, "", fmt.Errorf("marshal weekly leader compatibility config: %w", err)
 	}
-	sum := sha256.Sum256(scoringEvidence)
+	sum := sha256.Sum256(compatibilityEvidence)
 	return encoded, hex.EncodeToString(sum[:]), nil
 }
 

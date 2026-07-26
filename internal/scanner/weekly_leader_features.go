@@ -528,14 +528,16 @@ func bandAwarePercentiles(
 	}
 	capScores := make(map[string]map[string]float64, len(capGroups))
 	for band, group := range capGroups {
-		if len(group) >= 5 {
-			capScores[band] = percentileForRows(group, getter)
+		groupScores := percentileForRows(group, getter)
+		if len(groupScores) >= 5 {
+			capScores[band] = groupScores
 		}
 	}
 	volScores := make(map[string]map[string]float64, len(volGroups))
 	for band, group := range volGroups {
-		if len(group) >= 5 {
-			volScores[band] = percentileForRows(group, getter)
+		groupScores := percentileForRows(group, getter)
+		if len(groupScores) >= 5 {
+			volScores[band] = groupScores
 		}
 	}
 	out := make(map[string]float64, len(global))

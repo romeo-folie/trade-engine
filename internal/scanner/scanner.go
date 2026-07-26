@@ -381,8 +381,15 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				item.GraphContext = fallback.GraphContext
 				item.PullbackRequalificationComplete =
 					fallback.PullbackQualificationKnown
-				addErr = store.AddWatchlistItem(ctx, item)
 				sc = scoredCandidate{candidate: fallback, score: fallbackScore}
+				addErr = store.AddWatchlistItemUnlessActive(ctx, item)
+				if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
+					slog.Info(
+						"scanner: ordinary fallback lost to active watchlist item",
+						"ticker", fallback.Ticker,
+					)
+					continue
+				}
 			}
 		}
 		if addErr != nil {

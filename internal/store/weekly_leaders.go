@@ -586,7 +586,7 @@ func PromoteWeeklyLeaderToWatchlist(
 	if !currentRun || status != "processing" || currentToken != claimToken {
 		return ErrWeeklyLeaderPromotionClaimLost
 	}
-	if err := addWatchlistItem(ctx, tx, item); err != nil {
+	if err := addWatchlistItem(ctx, tx, item, false); err != nil {
 		return err
 	}
 	tag, err := tx.Exec(ctx, `
