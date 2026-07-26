@@ -637,17 +637,23 @@ func (e *Engine) processStock(
 		historyFrom, time.Now())
 	if err != nil {
 		logger.Warn("get candles for indicators", "ticker", ticker, "err", err.Error())
+		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "candles_unavailable", err.Error(), "")
 		return
 	}
 
 	if len(candles) < 20 {
 		logger.Info("insufficient candles for indicators", "ticker", ticker, "count", len(candles))
+		e.recordScannerEngineOutcome(
+			ctx, scannerRunID, ticker, "insufficient_candles",
+			fmt.Sprintf("need 20 candles; got %d", len(candles)), "",
+		)
 		return
 	}
 
 	set, err := indicators.Compute(candles)
 	if err != nil {
 		logger.Warn("compute indicators", "ticker", ticker, "err", err.Error())
+		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_failed", err.Error(), "")
 		return
 	}
 
@@ -725,6 +731,9 @@ func (e *Engine) processStock(
 			"price_move_pct", fmt.Sprintf("%.2f", deltas["price_move_pct"]),
 			"hold_elapsed_min", fmt.Sprintf("%.1f", deltas["hold_elapsed_min"]),
 			"hold_cooldown_min", fmt.Sprintf("%.0f", deltas["hold_cooldown_min"]),
+		)
+		e.recordScannerEngineOutcome(
+			ctx, scannerRunID, ticker, "material_change_skip", string(skipReason), "",
 		)
 		return
 	}
@@ -834,10 +843,12 @@ func (e *Engine) runAnalysis(
 	pullbackCandidate bool,
 ) {
 	if set == nil {
+		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "indicators_missing", "", "")
 		return
 	}
 	if e.analyzer == nil || !e.analyzer.Primary().IsAvailable() {
 		logger.Debug("analysis skipped — primary model not available", "ticker", ticker)
+		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "model_unavailable", "", "")
 		return
 	}
 
@@ -893,7 +904,9 @@ func (e *Engine) runAnalysis(
 					"timeframe", timeframe,
 					"reason", reason,
 				)
-				e.emitOwnershipShortCircuitBlock(ctx, ticker, strategy, candles, reason)
+				e.emitOwnershipShortCircuitBlock(
+					ctx, ticker, strategy, candles, reason, scannerRunID,
+				)
 				return
 			}
 		}
@@ -1130,6 +1143,7 @@ func (e *Engine) runAnalysis(
 
 	if err != nil {
 		logger.Warn("analysis failed", "ticker", ticker, "err", err.Error())
+		e.recordScannerEngineOutcome(ctx, scannerRunID, ticker, "analysis_failed", err.Error(), "")
 		return
 	}
 	resp, meta := result.Response, result.Meta
@@ -1215,12 +1229,18 @@ func (e *Engine) runAnalysis(
 			ArbiterResponse: arbJSON,
 			FastPathed:      result.FastPathed,
 			DissentSummary:  dissentSummary,
+			ScannerRunID:    scannerRunID,
 		})
 	} else {
-		analysisID, err = store.InsertAnalysis(ctx, ticker, strategy, resp, meta)
+		analysisID, err = store.InsertAnalysisWithScannerRun(
+			ctx, ticker, strategy, resp, meta, scannerRunID,
+		)
 	}
 	if err != nil {
 		logger.Warn("store analysis", "ticker", ticker, "err", err.Error())
+		e.recordScannerEngineOutcome(
+			ctx, scannerRunID, ticker, "analysis_persistence_failed", err.Error(), "",
+		)
 	}
 
 	// Phase 4: generate and potentially execute a signal from this analysis.
@@ -1331,7 +1351,14 @@ func tickerHasExitingLongIn(trades []store.Trade, ticker string) bool {
 // Pure (no DB / no event bus) so it can be unit-tested without spinning up a
 // Postgres test database. emitOwnershipShortCircuitBlock wires the result to
 // store.InsertSignal and the engine event bus.
-func buildOwnershipShortCircuitBlock(cfg config.RiskConfig, ticker, strategy string, candles []data.Candle, reason string, now time.Time) (store.Signal, events.RiskCheckCompletedPayload, events.SignalBlockedPayload) {
+func buildOwnershipShortCircuitBlock(
+	cfg config.RiskConfig,
+	ticker, strategy string,
+	candles []data.Candle,
+	reason string,
+	now time.Time,
+	scannerRunIDs ...string,
+) (store.Signal, events.RiskCheckCompletedPayload, events.SignalBlockedPayload) {
 	var signalPrice float64
 	if len(candles) > 0 {
 		signalPrice = candles[len(candles)-1].Close
@@ -1353,6 +1380,9 @@ func buildOwnershipShortCircuitBlock(cfg config.RiskConfig, ticker, strategy str
 		BlockReason:       reason,
 		ExpiresAt:         now.Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
+	}
+	if len(scannerRunIDs) > 0 {
+		sig.ScannerRunID = scannerRunIDs[0]
 	}
 	riskEv := events.RiskCheckCompletedPayload{
 		Ticker: ticker,
@@ -1382,10 +1412,25 @@ func buildOwnershipShortCircuitBlock(cfg config.RiskConfig, ticker, strategy str
 // is nil — but we still publish the in-process events so the TUI/Telegram/
 // dashboard surfaces continue to see the block. Only the persistent record is
 // lost (Copilot crash review on PR #337 round-2).
-func (e *Engine) emitOwnershipShortCircuitBlock(ctx context.Context, ticker, strategy string, candles []data.Candle, reason string) {
-	sig, riskEv, blockEv := buildOwnershipShortCircuitBlock(e.cfg.Risk, ticker, strategy, candles, reason, time.Now())
+func (e *Engine) emitOwnershipShortCircuitBlock(
+	ctx context.Context,
+	ticker, strategy string,
+	candles []data.Candle,
+	reason string,
+	scannerRunIDs ...string,
+) {
+	var scannerRunID string
+	if len(scannerRunIDs) > 0 {
+		scannerRunID = scannerRunIDs[0]
+	}
+	sig, riskEv, blockEv := buildOwnershipShortCircuitBlock(
+		e.cfg.Risk, ticker, strategy, candles, reason, time.Now(), scannerRunID,
+	)
+	var signalID string
 	if store.IsConnected() {
-		if _, err := store.InsertSignal(ctx, sig); err != nil {
+		var err error
+		signalID, err = store.InsertSignal(ctx, sig)
+		if err != nil {
 			logger.Warn("store ownership short-circuit blocked signal",
 				"ticker", ticker, "err", err)
 		}
@@ -1393,8 +1438,33 @@ func (e *Engine) emitOwnershipShortCircuitBlock(ctx context.Context, ticker, str
 		logger.Info("signal blocked (no-DB; not persisted)",
 			"ticker", ticker, "strategy", strategy, "reason", reason)
 	}
+	e.recordScannerEngineOutcome(
+		ctx, scannerRunID, ticker, "ownership_short_circuit", reason, signalID,
+	)
 	e.bus.Publish(events.RiskCheckCompleted, riskEv)
 	e.bus.Publish(events.SignalBlocked, blockEv)
+}
+
+// recordScannerEngineOutcome durably marks scanner-originated engine attempts
+// that intentionally produce no analysis row. Observability stays fail-open:
+// a snapshot write can never change signal generation or execution.
+func (e *Engine) recordScannerEngineOutcome(
+	ctx context.Context,
+	scannerRunID, ticker, stage, reason, signalID string,
+) {
+	if scannerRunID == "" || !store.IsConnected() {
+		return
+	}
+	if err := store.InsertScannerEngineOutcome(ctx, store.ScannerEngineOutcome{
+		ScannerRunID: scannerRunID,
+		Ticker:       ticker,
+		Stage:        stage,
+		Reason:       reason,
+		SignalID:     signalID,
+	}); err != nil {
+		logger.Warn("store scanner engine outcome",
+			"ticker", ticker, "stage", stage, "err", err)
+	}
 }
 
 // resolveEnricherProvider returns the ModelProvider to use for knowledge

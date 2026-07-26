@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -82,6 +83,25 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Fatalf("watchlist lineage = %+v, err=%v", watch, err)
 	}
 
+	analysisID, err := store.InsertAnalysisWithScannerRun(
+		ctx, "SNAP_A", "momentum",
+		analysis.AnalysisResponse{Action: analysis.ActionHold, Confidence: .7},
+		analysis.ModelCallMeta{
+			Provider: "test", Model: "test", PromptHash: "scanner-lineage-test",
+		},
+		runID,
+	)
+	if err != nil || analysisID == "" {
+		t.Fatalf("InsertAnalysisWithScannerRun: id=%q err=%v", analysisID, err)
+	}
+	if err := store.InsertScannerEngineOutcome(ctx, store.ScannerEngineOutcome{
+		ScannerRunID: runID,
+		Ticker:       "SNAP_B",
+		Stage:        "model_unavailable",
+	}); err != nil {
+		t.Fatalf("InsertScannerEngineOutcome: %v", err)
+	}
+
 	signalID, err := store.InsertSignal(ctx, store.Signal{
 		Ticker: "SNAP_A", Action: "BUY", Strategy: "momentum",
 		SignalPrice: 100, Confidence: .8, SizePct: .1, Status: "executed",
@@ -118,12 +138,16 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	if funnel.Runs != 1 || funnel.Sourced != 2 || funnel.QualificationKnown != 2 ||
 		funnel.PullbackQualified != 1 || funnel.Scored != 2 ||
 		funnel.Recommended != 1 || funnel.WatchlistAdded != 1 ||
+		funnel.AnalyzedCandidates != 1 || funnel.Analyses != 1 ||
+		funnel.HoldWaitCandidates != 1 ||
+		funnel.EngineOutcomeCandidates != 1 || funnel.EngineOutcomes != 1 ||
 		funnel.SignalCandidates != 1 || funnel.Signals != 1 ||
 		funnel.ExecutedTradeCandidates != 1 || funnel.Trades != 1 ||
 		funnel.ClosedTrades != 1 || funnel.Wins != 1 || funnel.RealizedPnL != 12.5 {
 		t.Fatalf("unexpected funnel: %+v", funnel)
 	}
-	if len(funnel.QualificationStages) != 2 || len(funnel.FinalStages) != 2 {
+	if len(funnel.QualificationStages) != 2 || len(funnel.FinalStages) != 2 ||
+		len(funnel.EngineStages) != 1 {
 		t.Fatalf("stage distributions missing: %+v", funnel)
 	}
 }

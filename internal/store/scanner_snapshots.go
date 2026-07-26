@@ -66,6 +66,28 @@ type ScannerCandidateSnapshot struct {
 	FinalStage               string
 }
 
+type ScannerEngineOutcome struct {
+	ScannerRunID string
+	Ticker       string
+	Stage        string
+	Reason       string
+	SignalID     string
+}
+
+func InsertScannerEngineOutcome(ctx context.Context, outcome ScannerEngineOutcome) error {
+	if outcome.ScannerRunID == "" {
+		return nil
+	}
+	_, err := GetDB().Exec(ctx, `
+		INSERT INTO scanner_engine_outcomes (
+			scanner_run_id, ticker, stage, reason, signal_id
+		) VALUES ($1,$2,$3,$4,$5)`,
+		outcome.ScannerRunID, outcome.Ticker, outcome.Stage,
+		nullableString(outcome.Reason), nullableString(outcome.SignalID),
+	)
+	return err
+}
+
 func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
 	var id string
 	err := GetDB().QueryRow(ctx, `
@@ -164,6 +186,11 @@ type ScannerFunnel struct {
 	Recommended             int
 	PassedConviction        int
 	WatchlistAdded          int
+	AnalyzedCandidates      int
+	Analyses                int
+	HoldWaitCandidates      int
+	EngineOutcomeCandidates int
+	EngineOutcomes          int
 	SignalCandidates        int
 	Signals                 int
 	ExecutedTradeCandidates int
@@ -173,6 +200,7 @@ type ScannerFunnel struct {
 	RealizedPnL             float64
 	QualificationStages     []ScannerStageCount
 	FinalStages             []ScannerStageCount
+	EngineStages            []ScannerStageCount
 }
 
 type ScannerStageCount struct {
@@ -201,6 +229,17 @@ func GetScannerFunnel(ctx context.Context, from, to time.Time) (ScannerFunnel, e
 			SELECT COUNT(DISTINCT s.scanner_run_id::text || ':' || s.ticker) AS candidates,
 			       COUNT(*) AS signals
 			FROM signals s JOIN selected_runs r ON r.id = s.scanner_run_id
+		), analysis_rollup AS (
+			SELECT COUNT(DISTINCT a.scanner_run_id::text || ':' || a.ticker) AS candidates,
+			       COUNT(*) AS analyses,
+			       COUNT(DISTINCT a.scanner_run_id::text || ':' || a.ticker)
+			           FILTER (WHERE a.action::text IN ('HOLD', 'WAIT')) AS hold_wait
+			FROM analyses a JOIN selected_runs r ON r.id = a.scanner_run_id
+		), outcome_rollup AS (
+			SELECT COUNT(DISTINCT o.scanner_run_id::text || ':' || o.ticker) AS candidates,
+			       COUNT(*) AS outcomes
+			FROM scanner_engine_outcomes o
+			JOIN selected_runs r ON r.id = o.scanner_run_id
 		), trade_rollup AS (
 			SELECT COUNT(DISTINCT s.scanner_run_id::text || ':' || s.ticker) AS candidates,
 			       COUNT(*) AS trades,
@@ -217,15 +256,23 @@ func GetScannerFunnel(ctx context.Context, from, to time.Time) (ScannerFunnel, e
 			COALESCE(c.pullback_qualified,0), COALESCE(c.scoring_eligible,0),
 			COALESCE(c.scored,0), COALESCE(c.recommended,0),
 			COALESCE(c.passed_conviction,0), COALESCE(c.watchlist_added,0),
+			COALESCE(a.candidates,0), COALESCE(a.analyses,0), COALESCE(a.hold_wait,0),
+			COALESCE(o.candidates,0), COALESCE(o.outcomes,0),
 			COALESCE(s.candidates,0), COALESCE(s.signals,0),
 			COALESCE(t.candidates,0), COALESCE(t.trades,0), COALESCE(t.closed,0),
 			COALESCE(t.wins,0), COALESCE(t.pnl,0)
-		FROM candidate_rollup c CROSS JOIN signal_rollup s CROSS JOIN trade_rollup t`,
+		FROM candidate_rollup c
+		CROSS JOIN analysis_rollup a
+		CROSS JOIN outcome_rollup o
+		CROSS JOIN signal_rollup s
+		CROSS JOIN trade_rollup t`,
 		from, to,
 	).Scan(
 		&f.Runs, &f.Sourced, &f.QualificationKnown, &f.PullbackQualified,
 		&f.ScoringEligible, &f.Scored, &f.Recommended, &f.PassedConviction,
-		&f.WatchlistAdded, &f.SignalCandidates, &f.Signals,
+		&f.WatchlistAdded, &f.AnalyzedCandidates, &f.Analyses, &f.HoldWaitCandidates,
+		&f.EngineOutcomeCandidates, &f.EngineOutcomes,
+		&f.SignalCandidates, &f.Signals,
 		&f.ExecutedTradeCandidates, &f.Trades, &f.ClosedTrades, &f.Wins,
 		&f.RealizedPnL,
 	)
@@ -239,7 +286,38 @@ func GetScannerFunnel(ctx context.Context, from, to time.Time) (ScannerFunnel, e
 		return f, err
 	}
 	f.FinalStages, err = getScannerStageCounts(ctx, from, to, "final_stage")
+	if err != nil {
+		return f, err
+	}
+	f.EngineStages, err = getScannerEngineStageCounts(ctx, from, to)
 	return f, err
+}
+
+func getScannerEngineStageCounts(
+	ctx context.Context, from, to time.Time,
+) ([]ScannerStageCount, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT o.stage, COUNT(*)
+		FROM scanner_engine_outcomes o
+		JOIN scanner_runs r ON r.id = o.scanner_run_id
+		WHERE r.started_at >= $1 AND r.started_at < $2
+		GROUP BY o.stage
+		ORDER BY COUNT(*) DESC, o.stage`,
+		from, to,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var counts []ScannerStageCount
+	for rows.Next() {
+		var count ScannerStageCount
+		if err := rows.Scan(&count.Stage, &count.Count); err != nil {
+			return nil, err
+		}
+		counts = append(counts, count)
+	}
+	return counts, rows.Err()
 }
 
 func getScannerStageCounts(

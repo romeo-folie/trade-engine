@@ -146,16 +146,23 @@ func printScannerFunnel(f store.ScannerFunnel, from, to time.Time) {
 		rate(f.PassedConviction, f.Scored))
 	fmt.Printf("%-26s %8d %13s\n", "Added to watchlist", f.WatchlistAdded,
 		rate(f.WatchlistAdded, f.PassedConviction))
+	fmt.Printf("%-26s %8d %13s\n", "Candidates analyzed", f.AnalyzedCandidates,
+		rate(f.AnalyzedCandidates, f.WatchlistAdded))
+	fmt.Printf("%-26s %8d %13s\n", "HOLD/WAIT candidates", f.HoldWaitCandidates,
+		rate(f.HoldWaitCandidates, f.AnalyzedCandidates))
+	fmt.Printf("%-26s %8d %13s\n", "Pre-analysis outcomes", f.EngineOutcomeCandidates,
+		rate(f.EngineOutcomeCandidates, f.WatchlistAdded))
 	fmt.Printf("%-26s %8d %13s\n", "Candidates with signals", f.SignalCandidates,
 		rate(f.SignalCandidates, f.WatchlistAdded))
 	fmt.Printf("%-26s %8d %13s\n", "Candidates with trades", f.ExecutedTradeCandidates,
 		rate(f.ExecutedTradeCandidates, f.WatchlistAdded))
 
 	winRate := rate(f.Wins, f.ClosedTrades)
-	fmt.Printf("\nSignals: %d · Trades: %d · Closed: %d · Win rate: %s · Realized P&L: $%+.2f\n",
-		f.Signals, f.Trades, f.ClosedTrades, winRate, f.RealizedPnL)
+	fmt.Printf("\nAnalyses: %d · Engine outcomes: %d · Signals: %d · Trades: %d · Closed: %d · Win rate: %s · Realized P&L: $%+.2f\n",
+		f.Analyses, f.EngineOutcomes, f.Signals, f.Trades, f.ClosedTrades, winRate, f.RealizedPnL)
 	printScannerStages("Qualification outcomes", f.QualificationStages)
 	printScannerStages("Terminal outcomes", f.FinalStages)
+	printScannerStages("Pre-analysis engine outcomes", f.EngineStages)
 }
 
 func printScannerStages(title string, stages []store.ScannerStageCount) {
