@@ -15,7 +15,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Skip("DATABASE_URL not set; skipping store integration test")
 	}
 	ctx := context.Background()
-	startedAt := time.Now().UTC()
+	startedAt := time.Now().UTC().Truncate(time.Microsecond)
 	universeAsOf := startedAt.Add(-time.Minute)
 	universeID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
 		Provider: "scanner-snapshot-test", AsOf: universeAsOf, CapturedAt: universeAsOf,
