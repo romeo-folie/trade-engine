@@ -8,6 +8,8 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
+	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
 )
 
 // stockTimeframesForEntry returns a normalized copy and ensures the complete
@@ -39,6 +41,40 @@ func primaryStockTimeframe(timeframes []string) data.Timeframe {
 		}
 	}
 	return primary
+}
+
+func hasEntryStrategy(strategies []string, want string) bool {
+	for _, strategy := range strategies {
+		if strings.EqualFold(strings.TrimSpace(strategy), want) {
+			return true
+		}
+	}
+	return false
+}
+
+func pullbackEntryEvidence(setup pullback.Result) string {
+	return fmt.Sprintf(
+		"Momentum %.1f/%.1f/%.1f%%; reclaimed $%.2f support; low-of-day stop $%.2f (%.2f%% risk)",
+		setup.Return1M, setup.Return3M, setup.Return6M,
+		setup.Support, setup.StopLoss, setup.StopWidthPct,
+	)
+}
+
+type additiveEntryDecision struct {
+	PullbackConfirmed bool
+	EntrySetup        string
+	Evidence          string
+}
+
+func resolveAdditiveEntry(setup pullback.Result) additiveEntryDecision {
+	if !setup.Eligible {
+		return additiveEntryDecision{EntrySetup: store.EntrySetupStandard}
+	}
+	return additiveEntryDecision{
+		PullbackConfirmed: true,
+		EntrySetup:        store.EntrySetupPullbackStrength,
+		Evidence:          pullbackEntryEvidence(setup),
+	}
 }
 
 const (

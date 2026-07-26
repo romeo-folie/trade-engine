@@ -20,8 +20,17 @@ type SwingCandidate struct {
 	Return6M     float64
 	MarketCapMM  float64
 	DollarVolume float64
-	Sources      []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
-	News         []SwingNewsItem
+	// PullbackQualified marks candidates that cleared the point-in-time
+	// liquidity, market-cap, momentum, and top-quartile research universe.
+	// It is persisted as an additional watchlist strategy so the engine can
+	// evaluate the setup without making this universe the scanner's only path.
+	PullbackQualified bool
+	// PullbackQualificationKnown means the required history and fundamentals
+	// were available, so a legacy quarantined row may safely be reactivated
+	// whether it qualified or definitively failed the objective screen.
+	PullbackQualificationKnown bool
+	Sources                    []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
+	News                       []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.

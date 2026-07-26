@@ -162,16 +162,32 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return nil
 	}
 
-	// 3. Rank the complete pullback universe before removing active names.
-	// Otherwise every later scan promotes the next-best quartile after the
-	// current winners have been filtered out, eventually admitting names that
-	// were never in the full universe's top quartile.
-	if s.PullbackUniverseEnabled {
-		candidates = s.qualifyPullbackUniverse(ctx, candidates)
-		if len(candidates) == 0 {
-			slog.Info("scanner: no candidates passed pullback-strength universe")
-			return nil
+	// 3. Mark the complete pullback universe before removing active names.
+	// The universe is an additive entry path: standard scanner candidates stay
+	// in the pool, while qualified names carry a durable pullback strategy tag.
+	// Ranking before active-name removal prevents later scans from promoting
+	// names that were never in the full universe's top quartile.
+	requalificationRequired, err := pullbackRequalificationRequired(ctx)
+	if err != nil {
+		return fmt.Errorf("load pullback requalification state: %w", err)
+	}
+	if s.PullbackUniverseEnabled || len(requalificationRequired) > 0 {
+		qualificationInput := candidates
+		if !s.PullbackUniverseEnabled {
+			qualificationInput = filterCandidatesByTicker(candidates, requalificationRequired)
 		}
+		qualification := s.qualifyPullbackUniverse(ctx, qualificationInput)
+		if len(qualification.qualified) == 0 {
+			slog.Info("scanner: no candidates passed pullback-strength universe")
+		}
+		if s.PullbackUniverseEnabled {
+			candidates = markPullbackQualification(candidates, qualification)
+		} else {
+			candidates = markQuarantinedQualificationKnown(
+				candidates, qualification.known, requalificationRequired,
+			)
+		}
+		candidates = filterUnavailableRequalifications(candidates, requalificationRequired)
 	}
 
 	// 3.5 Dedup against the active watchlist only after universe selection.
@@ -238,10 +254,11 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		if len(timeframes) == 0 {
 			timeframes = []string{"1H", "4H"}
 		}
+		strategies := candidateStrategies(sc.score.Strategy, sc.candidate.PullbackQualified)
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
-			Strategies: []string{sc.score.Strategy},
+			Strategies: strategies,
 			Timeframes: timeframes,
 			// Persist scanner conviction in MinConfidence so downstream
 			// engine logic (#317 RSI loosen) can read it without going
@@ -251,8 +268,9 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			// Persist WHY this candidate was sourced (graph link / sympathy
 			// trigger) so the engine's deep-analysis prompt carries the origin
 			// thesis instead of losing it after this pass.
-			GraphContext: sc.candidate.GraphContext,
-			ExpiresAt:    &expiresAt,
+			GraphContext:                    sc.candidate.GraphContext,
+			ExpiresAt:                       &expiresAt,
+			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
 			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)
@@ -300,6 +318,95 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+type pullbackQualification struct {
+	qualified []SwingCandidate
+	known     map[string]struct{}
+}
+
+func markPullbackQualification(all []SwingCandidate, result pullbackQualification) []SwingCandidate {
+	qualifiedByTicker := make(map[string]SwingCandidate, len(result.qualified))
+	for _, candidate := range result.qualified {
+		qualifiedByTicker[candidate.Ticker] = candidate
+	}
+	out := append([]SwingCandidate(nil), all...)
+	for i := range out {
+		_, out[i].PullbackQualificationKnown = result.known[out[i].Ticker]
+		qualifiedCandidate, ok := qualifiedByTicker[out[i].Ticker]
+		if !ok {
+			continue
+		}
+		out[i].PullbackQualified = true
+		out[i].Return1M = qualifiedCandidate.Return1M
+		out[i].Return3M = qualifiedCandidate.Return3M
+		out[i].Return6M = qualifiedCandidate.Return6M
+		out[i].MarketCapMM = qualifiedCandidate.MarketCapMM
+		out[i].DollarVolume = qualifiedCandidate.DollarVolume
+	}
+	return out
+}
+
+func filterUnavailableRequalifications(
+	candidates []SwingCandidate, required map[string]struct{},
+) []SwingCandidate {
+	filtered := make([]SwingCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, quarantined := required[candidate.Ticker]; quarantined &&
+			!candidate.PullbackQualificationKnown {
+			continue
+		}
+		filtered = append(filtered, candidate)
+	}
+	return filtered
+}
+
+func filterCandidatesByTicker(
+	candidates []SwingCandidate, included map[string]struct{},
+) []SwingCandidate {
+	filtered := make([]SwingCandidate, 0, len(included))
+	for _, candidate := range candidates {
+		if _, ok := included[candidate.Ticker]; ok {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered
+}
+
+func markQuarantinedQualificationKnown(
+	candidates []SwingCandidate,
+	known map[string]struct{},
+	required map[string]struct{},
+) []SwingCandidate {
+	out := append([]SwingCandidate(nil), candidates...)
+	for i := range out {
+		_, quarantined := required[out[i].Ticker]
+		_, definitive := known[out[i].Ticker]
+		out[i].PullbackQualificationKnown = quarantined && definitive
+	}
+	return out
+}
+
+func pullbackRequalificationRequired(ctx context.Context) (map[string]struct{}, error) {
+	items, err := store.GetWatchlistItems(ctx, false)
+	if err != nil {
+		return nil, err
+	}
+	required := make(map[string]struct{})
+	for _, item := range items {
+		if item.PullbackRequalificationRequired {
+			required[item.Ticker] = struct{}{}
+		}
+	}
+	return required, nil
+}
+
+func candidateStrategies(primary string, pullbackQualified bool) []string {
+	strategies := []string{primary}
+	if pullbackQualified && primary != "pullback_strength" {
+		strategies = append(strategies, "pullback_strength")
+	}
+	return strategies
 }
 
 // fetchCandidates pulls top movers and most-active stocks and merges them.
@@ -396,10 +503,11 @@ func filterActiveCandidates(
 // screen and retains the top quartile by equal-weighted 1/3/6-month return.
 // Missing fundamentals or history fail closed because this screen defines the
 // strategy universe.
-func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates []SwingCandidate) []SwingCandidate {
+func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates []SwingCandidate) pullbackQualification {
+	result := pullbackQualification{known: make(map[string]struct{}, len(candidates))}
 	if s.AlpacaClient == nil || s.Fundamentals == nil {
 		slog.Warn("scanner: pullback universe unavailable — market data or fundamentals provider missing")
-		return nil
+		return result
 	}
 	qualified := make([]SwingCandidate, 0, len(candidates))
 	minMomentumReturn := s.PullbackMinMomentumReturnPct
@@ -416,7 +524,16 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 			continue
 		}
 		fundamentals, err := s.Fundamentals.FetchCompanyFundamentals(ctx, candidate.Ticker)
-		if err != nil || fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
+		if err != nil {
+			continue
+		}
+		if fundamentals.MarketCapitalization <= 0 {
+			slog.Warn("scanner: pullback universe fundamentals unavailable",
+				"ticker", candidate.Ticker)
+			continue
+		}
+		result.known[candidate.Ticker] = struct{}{}
+		if fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
 			continue
 		}
 		price := candidate.Price
@@ -454,7 +571,8 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 	}
 	slog.Info("scanner: pullback universe qualified",
 		"input", len(candidates), "qualified_top_quartile", len(qualified))
-	return qualified
+	result.qualified = qualified
+	return result
 }
 
 func scannerHorizonReturn(price float64, history []data.Candle, sessions int) float64 {

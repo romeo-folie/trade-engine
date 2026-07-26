@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,23 @@ type fakeFundamentals struct{}
 
 func (fakeFundamentals) FetchCompanyFundamentals(context.Context, string) (data.CompanyFundamentals, error) {
 	return data.CompanyFundamentals{Name: "Test", MarketCapitalization: 500}, nil
+}
+
+type selectiveFundamentals struct{}
+
+func (selectiveFundamentals) FetchCompanyFundamentals(
+	_ context.Context, ticker string,
+) (data.CompanyFundamentals, error) {
+	if ticker == "FUNDAMENTALS_UNAVAILABLE" {
+		return data.CompanyFundamentals{}, errors.New("provider unavailable")
+	}
+	if ticker == "EMPTY_FUNDAMENTALS" {
+		return data.CompanyFundamentals{}, nil
+	}
+	if ticker == "DEFINITIVELY_INELIGIBLE" {
+		return data.CompanyFundamentals{MarketCapitalization: 50}, nil
+	}
+	return data.CompanyFundamentals{MarketCapitalization: 500}, nil
 }
 
 func TestScannerHorizonReturnsAndRanking(t *testing.T) {
@@ -63,14 +81,18 @@ func TestQualifyPullbackUniverseKeepsTopQuartile(t *testing.T) {
 		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
 		Fundamentals: fakeFundamentals{},
 	}
-	got := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
+	result := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
 		{Ticker: "AAA", Price: 200, Volume: 10_000},
 		{Ticker: "BBB", Price: 150, Volume: 10_000},
 		{Ticker: "CCC", Price: 120, Volume: 10_000},
 		{Ticker: "DDD", Price: 100, Volume: 10_000}, // below 30% on every horizon
 	})
+	got := result.qualified
 	if len(got) != 1 || got[0].Ticker != "AAA" {
 		t.Fatalf("top quartile = %+v, want AAA", got)
+	}
+	if len(result.known) != 4 {
+		t.Fatalf("known qualification count = %d, want 4", len(result.known))
 	}
 	if got[0].MarketCapMM != 500 || got[0].DollarVolume != 2_000_000 {
 		t.Fatalf("universe metrics missing: %+v", got[0])
@@ -79,8 +101,8 @@ func TestQualifyPullbackUniverseKeepsTopQuartile(t *testing.T) {
 	scan.PullbackMinMomentumReturnPct = 400
 	if got := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
 		{Ticker: "AAA", Price: 200, Volume: 10_000},
-	}); len(got) != 0 {
-		t.Fatalf("configured 400%% floor ignored: %+v", got)
+	}); len(got.qualified) != 0 {
+		t.Fatalf("configured 400%% floor ignored: %+v", got.qualified)
 	}
 }
 
@@ -95,5 +117,149 @@ func TestFilterActiveCandidatesDoesNotPromoteLowerQuartiles(t *testing.T) {
 	)
 	if len(got) != 0 {
 		t.Fatalf("active top quartile should leave no candidates: %+v", got)
+	}
+}
+
+func TestMarkPullbackQualificationKeepsStandardCandidates(t *testing.T) {
+	all := []SwingCandidate{
+		{Ticker: "STANDARD", Price: 10},
+		{Ticker: "PULLBACK", Price: 20},
+	}
+	qualified := []SwingCandidate{{
+		Ticker: "PULLBACK", Price: 20,
+		Return1M: 35, Return3M: 50, Return6M: 80,
+		MarketCapMM: 500, DollarVolume: 2_000_000,
+	}}
+
+	got := markPullbackQualification(all, pullbackQualification{
+		qualified: qualified,
+		known: map[string]struct{}{
+			"STANDARD": {},
+			"PULLBACK": {},
+		},
+	})
+	if len(got) != 2 {
+		t.Fatalf("candidate count = %d, want 2", len(got))
+	}
+	if got[0].PullbackQualified {
+		t.Fatal("standard candidate was marked pullback-qualified")
+	}
+	if !got[0].PullbackQualificationKnown || !got[1].PullbackQualificationKnown {
+		t.Fatal("definitive qualification outcomes were not retained")
+	}
+	if !got[1].PullbackQualified || got[1].Return6M != 80 ||
+		got[1].MarketCapMM != 500 || got[1].DollarVolume != 2_000_000 {
+		t.Fatalf("qualified candidate metadata = %+v", got[1])
+	}
+}
+
+func TestFilterUnavailableRequalifications(t *testing.T) {
+	candidates := []SwingCandidate{
+		{Ticker: "UNKNOWN"},
+		{Ticker: "INELIGIBLE", PullbackQualificationKnown: true},
+		{Ticker: "NEW"},
+	}
+	got := filterUnavailableRequalifications(candidates, map[string]struct{}{
+		"UNKNOWN":    {},
+		"INELIGIBLE": {},
+	})
+	if len(got) != 2 || got[0].Ticker != "INELIGIBLE" || got[1].Ticker != "NEW" {
+		t.Fatalf("filtered candidates = %+v", got)
+	}
+}
+
+func TestDisabledModeQualificationOnlyAcknowledgesQuarantinedTickers(t *testing.T) {
+	candidates := []SwingCandidate{
+		{Ticker: "LEGACY"},
+		{Ticker: "UNRELATED"},
+	}
+	got := markQuarantinedQualificationKnown(
+		candidates,
+		map[string]struct{}{"LEGACY": {}, "UNRELATED": {}},
+		map[string]struct{}{"LEGACY": {}},
+	)
+	if !got[0].PullbackQualificationKnown || got[0].PullbackQualified {
+		t.Fatalf("legacy outcome = %+v", got[0])
+	}
+	if got[1].PullbackQualificationKnown || got[1].PullbackQualified {
+		t.Fatalf("unrelated candidate inherited disabled pullback state: %+v", got[1])
+	}
+}
+
+func TestDisabledModeQualificationInputOnlyIncludesQuarantinedTickers(t *testing.T) {
+	candidates := []SwingCandidate{
+		{Ticker: "LEGACY_A"},
+		{Ticker: "UNRELATED"},
+		{Ticker: "LEGACY_B"},
+	}
+	got := filterCandidatesByTicker(candidates, map[string]struct{}{
+		"LEGACY_A": {},
+		"LEGACY_B": {},
+	})
+	if len(got) != 2 || got[0].Ticker != "LEGACY_A" || got[1].Ticker != "LEGACY_B" {
+		t.Fatalf("qualification input = %+v", got)
+	}
+}
+
+func TestQualifyPullbackUniverseUnavailableRemainsUnknown(t *testing.T) {
+	result := (&MarketScanner{}).qualifyPullbackUniverse(
+		context.Background(),
+		[]SwingCandidate{{Ticker: "LEGACY"}},
+	)
+	if len(result.qualified) != 0 || len(result.known) != 0 {
+		t.Fatalf("unavailable qualification must remain unknown: %+v", result)
+	}
+}
+
+func TestQualifyPullbackUniverseDistinguishesUnavailableFromIneligible(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		parts := strings.Split(r.URL.Path, "/")
+		ticker := parts[len(parts)-2]
+		count := 130
+		if ticker == "HISTORY_UNAVAILABLE" {
+			count = 10
+		}
+		bars := make([]map[string]any, count)
+		start := time.Date(2025, time.January, 1, 0, 0, 0, 0, time.UTC)
+		for i := range bars {
+			bars[i] = map[string]any{
+				"t": start.AddDate(0, 0, i).Format(time.RFC3339),
+				"o": 50, "h": 51, "l": 49, "c": 50, "v": 50_000, "vw": 50,
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"bars": bars})
+	}))
+	defer server.Close()
+
+	scan := &MarketScanner{
+		AlpacaClient: data.NewAlpacaClient("key", "secret", server.URL),
+		Fundamentals: selectiveFundamentals{},
+	}
+	result := scan.qualifyPullbackUniverse(context.Background(), []SwingCandidate{
+		{Ticker: "HISTORY_UNAVAILABLE", Price: 50, Volume: 50_000},
+		{Ticker: "FUNDAMENTALS_UNAVAILABLE", Price: 50, Volume: 50_000},
+		{Ticker: "EMPTY_FUNDAMENTALS", Price: 50, Volume: 50_000},
+		{Ticker: "DEFINITIVELY_INELIGIBLE", Price: 50, Volume: 50_000},
+	})
+	if _, ok := result.known["HISTORY_UNAVAILABLE"]; ok {
+		t.Fatal("insufficient history was treated as a definitive outcome")
+	}
+	if _, ok := result.known["FUNDAMENTALS_UNAVAILABLE"]; ok {
+		t.Fatal("fundamentals provider error was treated as a definitive outcome")
+	}
+	if _, ok := result.known["EMPTY_FUNDAMENTALS"]; ok {
+		t.Fatal("empty fundamentals profile was treated as a definitive outcome")
+	}
+	if _, ok := result.known["DEFINITIVELY_INELIGIBLE"]; !ok {
+		t.Fatal("objective market-cap failure was not treated as definitive")
+	}
+}
+
+func TestCandidateStrategiesAddsPullbackPath(t *testing.T) {
+	if got := strings.Join(candidateStrategies("momentum", false), ","); got != "momentum" {
+		t.Fatalf("standard strategies = %q", got)
+	}
+	if got := strings.Join(candidateStrategies("momentum", true), ","); got != "momentum,pullback_strength" {
+		t.Fatalf("pullback strategies = %q", got)
 	}
 }

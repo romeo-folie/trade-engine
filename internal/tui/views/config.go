@@ -213,7 +213,7 @@ func buildConfigItems(cfg *config.Config, mode, modeSource string) []ConfigItem 
 			Key:   "risk.entry_gates.pullback_strength_enabled",
 			Label: "ENTRY · Pullback Strength", Value: enabled(entry.PullbackStrengthEnabled),
 			Kind: "readonly", Source: configSourceFile,
-			Description: "Complete momentum, consolidation, AVWAP, flush, and reclaim gate.",
+			Description: "Adds the momentum, consolidation, AVWAP, flush, and reclaim entry path.",
 		},
 		{
 			Key: "risk.entry_gates.pullback_setup", Label: "ENTRY · Pullback Setup",

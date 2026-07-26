@@ -8,24 +8,26 @@ import (
 
 // Trade mirrors a row from the trades table.
 type Trade struct {
-	ID            string
-	SignalID      string
-	Ticker        string
-	Direction     string // long | short — value the engine actually persists
-	Strategy      string
-	EntryPrice    float64
-	ExitPrice     float64
-	Quantity      float64
-	StopLoss      float64
-	TakeProfit    float64
-	PnL           float64
-	PnLPct        float64
-	Status        string // open | exiting | closed | cancelled
-	ModelProvider string
-	ModelName     string
-	OpenedAt      time.Time
-	ClosedAt      time.Time
-	CreatedAt     time.Time
+	ID                 string
+	SignalID           string
+	Ticker             string
+	Direction          string // long | short — value the engine actually persists
+	Strategy           string
+	EntryPrice         float64
+	ExitPrice          float64
+	Quantity           float64
+	StopLoss           float64
+	TakeProfit         float64
+	PnL                float64
+	PnLPct             float64
+	Status             string // open | exiting | closed | cancelled
+	ModelProvider      string
+	ModelName          string
+	EntrySetup         string
+	EntrySetupEvidence string
+	OpenedAt           time.Time
+	ClosedAt           time.Time
+	CreatedAt          time.Time
 	// HighWaterMark is the running maximum price observed for an open trade,
 	// used by the trailing-stop manager (#322). 0 when the manager has not
 	// yet observed the trade (column is NULL in DB).
@@ -34,18 +36,23 @@ type Trade struct {
 
 // InsertTrade creates a new open trade record and returns its UUID.
 func InsertTrade(ctx context.Context, t Trade) (string, error) {
+	entrySetup := t.EntrySetup
+	if entrySetup == "" {
+		entrySetup = EntrySetupStandard
+	}
 	var id string
 	err := GetDB().QueryRow(ctx, `
 		INSERT INTO trades (
 			signal_id, ticker, direction, strategy,
 			entry_price, quantity, stop_loss, take_profit,
-			status, model_provider, model_name
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10)
+			status, model_provider, model_name, entry_setup, entry_setup_evidence
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$11,$12)
 		RETURNING id`,
 		nullableString(t.SignalID), t.Ticker, t.Direction, t.Strategy,
 		t.EntryPrice, t.Quantity,
 		nullableFloat(t.StopLoss), nullableFloat(t.TakeProfit),
 		nullableString(t.ModelProvider), nullableString(t.ModelName),
+		entrySetup, nullableString(t.EntrySetupEvidence),
 	).Scan(&id)
 	return id, err
 }
@@ -636,6 +643,7 @@ func GetOpenTrades(ctx context.Context) ([]Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades WHERE status='open'
@@ -656,6 +664,7 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades WHERE status IN ('open','exiting')
@@ -677,6 +686,7 @@ func GetOrderlessExitingTrades(ctx context.Context, limit int) ([]Trade, error) 
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades t
@@ -708,6 +718,7 @@ func GetRecentTrades(ctx context.Context, limit int) ([]Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades ORDER BY opened_at DESC LIMIT $1`, limit)
@@ -726,6 +737,7 @@ func GetTradeByID(ctx context.Context, id string) (*Trade, error) {
 		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
 		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
 		       COALESCE(high_water_mark,0)
 		FROM trades WHERE id=$1`, id)
@@ -754,6 +766,7 @@ func scanTrades(rows interface {
 			&t.Quantity, &t.StopLoss, &t.TakeProfit,
 			&t.PnL, &t.PnLPct, &t.Status,
 			&t.ModelProvider, &t.ModelName,
+			&t.EntrySetup, &t.EntrySetupEvidence,
 			&t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
 			&t.HighWaterMark,
 		); err != nil {

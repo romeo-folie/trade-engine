@@ -26,7 +26,10 @@ func TestBatcherAccumulatesAndFlushes(t *testing.T) {
 		return nil
 	})
 
-	b.Add(BatchItem{Kind: "signal", Ticker: "AAPL", Action: "BUY", Confidence: 0.80})
+	b.Add(BatchItem{
+		Kind: "signal", Ticker: "AAPL", Action: "BUY", Confidence: 0.80,
+		Note: "Pullback in Strength · reclaimed $190 support",
+	})
 	b.Add(BatchItem{Kind: "trade", Ticker: "TSLA", Action: "LONG", Note: "$200 qty=1"})
 	b.Flush()
 
@@ -35,6 +38,10 @@ func TestBatcherAccumulatesAndFlushes(t *testing.T) {
 	}
 	if !strings.Contains(sent[0], "AAPL") || !strings.Contains(sent[0], "TSLA") {
 		t.Errorf("batch message missing expected tickers: %s", sent[0])
+	}
+	if !strings.Contains(sent[0], "Pullback in Strength") ||
+		!strings.Contains(sent[0], "reclaimed $190 support") {
+		t.Errorf("batch message missing setup attribution: %s", sent[0])
 	}
 }
 

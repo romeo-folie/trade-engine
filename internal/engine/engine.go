@@ -597,7 +597,9 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	// so the execution gate never silently fails open because of watchlist
 	// timeframe selection.
 	entryGates := e.cfg.Risk.EntryGates
-	needsDailyEvidence := entryGates.PullbackStrengthEnabled ||
+	pullbackCandidate := entryGates.PullbackStrengthEnabled &&
+		hasEntryStrategy(strategies, store.EntrySetupPullbackStrength)
+	needsDailyEvidence := pullbackCandidate ||
 		entryGates.TrendAlignmentEnabled
 	fetchTimeframes := stockTimeframesForEntry(timeframes, needsDailyEvidence)
 
@@ -718,7 +720,10 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	}
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
-	e.runAnalysis(ctx, ticker, string(primaryTF), primaryStrategy, candles, set, newsHash, source, graphContext)
+	e.runAnalysis(
+		ctx, ticker, string(primaryTF), primaryStrategy, candles, set,
+		newsHash, source, graphContext, pullbackCandidate,
+	)
 }
 
 // buildPortfolioContext maps live portfolio state into the analysis request so
@@ -810,7 +815,14 @@ func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.Portfol
 
 // runAnalysis builds the analysis request, calls the configured model, stores
 // the result, and logs the recommendation summary.
-func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, set *indicators.IndicatorSet, newsHash string, source string, graphContext string) {
+func (e *Engine) runAnalysis(
+	ctx context.Context,
+	ticker, timeframe, strategy string,
+	candles []data.Candle,
+	set *indicators.IndicatorSet,
+	newsHash, source, graphContext string,
+	pullbackCandidate bool,
+) {
 	if set == nil {
 		return
 	}
@@ -1210,7 +1222,7 @@ func (e *Engine) runAnalysis(ctx context.Context, ticker, timeframe, strategy st
 	// its degraded-mode handling.
 	e.generateSignal(
 		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
-		prefetchedOpenTrades, e.analysisSourceNode(result),
+		prefetchedOpenTrades, e.analysisSourceNode(result), pullbackCandidate,
 	)
 
 	// Update material-change gate state for next tick.
@@ -1674,7 +1686,16 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 // runAnalysis loads openTrades up front for the SELL-only short-circuit probe
 // (#319) and threads the same slice through here so a typical analysis cycle
 // only hits the trades store once. Pass nil to force a fresh query.
-func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy string, candles []data.Candle, resp analysis.AnalysisResponse, analysisID string, prefetchedOpenTrades []store.Trade, analysisSourceNode string) {
+func (e *Engine) generateSignal(
+	ctx context.Context,
+	ticker, timeframe, strategy string,
+	candles []data.Candle,
+	resp analysis.AnalysisResponse,
+	analysisID string,
+	prefetchedOpenTrades []store.Trade,
+	analysisSourceNode string,
+	pullbackCandidate bool,
+) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
 		// WAIT: real catalyst but poor entry timing — analysis is recorded,
 		// no signal fires. No cooldown is applied so the ticker is re-evaluated
@@ -1714,24 +1735,28 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		Status:            "pending",
 		ExpiresAt:         createdAt.Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
+		EntrySetup:        store.EntrySetupStandard,
 		AnalysisIDs:       analysisIDs,
 		CreatedAt:         createdAt,
 	}
 
 	// Entry-quality gates (entry_gates.go): daily trend alignment, news
 	// tape-confirmation, and momentum anti-chase. Checked before the generic
-	// risk gates so the block reason names the specific losing cohort. Legacy
-	// cohort gates fail open on missing evidence; the complete pullback setup
-	// fails closed because every component is required.
+	// risk gates so the block reason names the specific losing cohort. The
+	// pullback setup is an additive path: universe-qualified candidates that
+	// complete it receive its low-of-day stop and execution revalidation;
+	// candidates that do not complete it continue through the standard gates.
 	eg := e.cfg.Risk.EntryGates
 	if resp.Action == "BUY" {
 		var entryGateReason string
 		entryGateFailedCheck := "entry_gates"
 		entryDailyCandles := candles
 		var pullbackObservedAt time.Time
-		needsDailyEvidence := eg.PullbackStrengthEnabled ||
+		pullbackCandidate = eg.PullbackStrengthEnabled && pullbackCandidate
+		pullbackConfirmed := false
+		needsDailyEvidence := pullbackCandidate ||
 			eg.TrendAlignmentEnabled
-		if eg.PullbackStrengthEnabled {
+		if pullbackCandidate {
 			// The analyst may take long enough for the session low to change.
 			// Refresh the partial daily bar at qualification time, then scan
 			// every exact trade print from the returned snapshot boundary.
@@ -1740,12 +1765,12 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 				ctx, ticker, data.Timeframe1Day,
 			)
 			if err != nil {
-				entryGateReason = "pullback strength: unable to refresh daily setup evidence"
-				entryGateFailedCheck = "pullback_history"
+				logger.Warn("pullback strength: unable to refresh setup evidence; using standard entry path",
+					"ticker", ticker, "err", err)
 			}
 		}
 		if needsDailyEvidence &&
-			(data.Timeframe(timeframe) != data.Timeframe1Day || eg.PullbackStrengthEnabled) {
+			(data.Timeframe(timeframe) != data.Timeframe1Day || pullbackCandidate) {
 			var err error
 			entryDailyCandles, err = store.GetCandles(
 				ctx, ticker, data.Timeframe1Day,
@@ -1757,29 +1782,32 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 				entryDailyCandles = nil
 			}
 		}
-		if eg.PullbackStrengthEnabled && entryGateReason == "" {
+		if pullbackCandidate && !pullbackObservedAt.IsZero() {
 			// Use the refreshed daily snapshot's close for reclaim, stop width,
 			// signal persistence, and the initial risk pass. The pre-analysis
 			// primary-timeframe close may be minutes old by this point.
+			pullbackSignalPrice := signalPrice
 			if len(entryDailyCandles) > 0 {
-				signalPrice = entryDailyCandles[len(entryDailyCandles)-1].Close
-				sig.SignalPrice = signalPrice
+				pullbackSignalPrice = entryDailyCandles[len(entryDailyCandles)-1].Close
 			}
-			setup := pullback.Evaluate(entryDailyCandles, signalPrice, pullback.Config{
+			setup := pullback.Evaluate(entryDailyCandles, pullbackSignalPrice, pullback.Config{
 				MinMomentumReturnPct:  eg.PullbackMinMomentumReturnPct,
 				ConsolidationSessions: eg.PullbackConsolidationSessions,
 				SupportTolerancePct:   eg.PullbackSupportTolerancePct,
 				MaxStopWidthPct:       eg.PullbackMaxStopWidthPct,
 			})
-			if !setup.Eligible {
-				entryGateReason = setup.Reason
-				entryGateFailedCheck = "pullback_" + setup.FailedCheck
-			} else {
+			entryDecision := resolveAdditiveEntry(setup)
+			if entryDecision.PullbackConfirmed {
 				// The research entry is inseparable from its tight low-of-day
 				// invalidation. Replace the analyst's generic stop before risk
 				// sizing, persistence, and bracket submission.
 				sig.StopLoss = setup.StopLoss
+				signalPrice = pullbackSignalPrice
+				sig.SignalPrice = pullbackSignalPrice
 				sig.PullbackStrength = true
+				sig.EntrySetup = entryDecision.EntrySetup
+				sig.EntrySetupEvidence = entryDecision.Evidence
+				pullbackConfirmed = true
 				// CreatedAt is the durable exact-print boundary for pullback
 				// signals. It begins at the refreshed evidence snapshot rather
 				// than after qualification, risk checks, and persistence.
@@ -1800,8 +1828,15 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 					"stop_loss", fmt.Sprintf("%.2f", setup.StopLoss),
 					"stop_width_pct", fmt.Sprintf("%.2f", setup.StopWidthPct),
 				)
+			} else {
+				logger.Info("pullback strength not confirmed; using standard entry path",
+					"ticker", ticker,
+					"failed_check", setup.FailedCheck,
+					"reason", setup.Reason,
+				)
 			}
-		} else if eg.TrendAlignmentEnabled {
+		}
+		if !pullbackConfirmed && eg.TrendAlignmentEnabled {
 			var evaluated bool
 			entryGateReason, evaluated = evaluateTrendAlignmentGate(
 				string(resp.Action), signalPrice, data.Timeframe1Day,
@@ -1812,7 +1847,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 					"ticker", ticker, "timeframe", timeframe, "candles", len(candles))
 			}
 		}
-		if entryGateReason == "" &&
+		if !pullbackConfirmed && entryGateReason == "" &&
 			(eg.NewsMinRunupPct > 0 || eg.MomentumMaxRunupPct > 0) {
 			nowET := time.Now().In(nyLoc)
 			dayStartET := time.Date(nowET.Year(), nowET.Month(), nowET.Day(), 0, 0, 0, 0, nyLoc)
@@ -1999,6 +2034,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		Confidence: resp.Confidence, SignalPrice: signalPrice,
 		StopLoss: sig.StopLoss, TakeProfit: sig.TakeProfit, Mode: e.Mode(),
 		SourceNode: analysisSourceNode,
+		EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 	})
 
 	// Route based on mode.
@@ -2015,6 +2051,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 			e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 				SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 				Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+				EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 			})
 			return
 		}
@@ -2025,6 +2062,7 @@ func (e *Engine) generateSignal(ctx context.Context, ticker, timeframe, strategy
 		e.bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
 			SignalID: sigID, Ticker: ticker, Action: string(resp.Action),
 			Confidence: resp.Confidence, ExpiresIn: time.Until(sig.ExpiresAt),
+			EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 		})
 	default:
 		logger.Warn("unknown mode, defaulting to manual", "mode", mode)
@@ -2338,15 +2376,17 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// would still let the hourly monitor cap the winner at the model TP.
 	tradeTakeProfit := persistedTakeProfit(sig.TakeProfit, uncapTakeProfit)
 	trade := store.Trade{
-		SignalID:   sigID,
-		Ticker:     sig.Ticker,
-		Direction:  direction,
-		Strategy:   sig.Strategy,
-		EntryPrice: result.FilledPrice,
-		Quantity:   result.FilledQty,
-		StopLoss:   sig.StopLoss,
-		TakeProfit: tradeTakeProfit,
-		Status:     "open",
+		SignalID:           sigID,
+		Ticker:             sig.Ticker,
+		Direction:          direction,
+		Strategy:           sig.Strategy,
+		EntryPrice:         result.FilledPrice,
+		Quantity:           result.FilledQty,
+		StopLoss:           sig.StopLoss,
+		TakeProfit:         tradeTakeProfit,
+		EntrySetup:         sig.EntrySetup,
+		EntrySetupEvidence: sig.EntrySetupEvidence,
+		Status:             "open",
 	}
 	tradeID, err := store.InsertTrade(ctx, trade)
 	if err != nil {
@@ -2454,6 +2494,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		TradeID: tradeID, SignalID: sigID, Ticker: sig.Ticker,
 		Direction: direction, EntryPrice: result.FilledPrice,
 		Quantity: result.FilledQty, Strategy: sig.Strategy,
+		EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
 	})
 
 	// Poll every nonterminal broker order and backfill until it reaches a final

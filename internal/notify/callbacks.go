@@ -60,13 +60,7 @@ func handleDetail(ctx context.Context, signalID string) (string, error) {
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "📋 *Signal Detail*\n\n")
-	fmt.Fprintf(&sb, "Ticker: `%s` | %s\n", sig.Ticker, sig.Action)
-	fmt.Fprintf(&sb, "Confidence: %.0f%%\n", sig.Confidence*100)
-	fmt.Fprintf(&sb, "Price: $%.2f\n", sig.SignalPrice)
-	fmt.Fprintf(&sb, "SL: $%.2f | TP: $%.2f\n", sig.StopLoss, sig.TakeProfit)
-	fmt.Fprintf(&sb, "Status: %s\n", sig.Status)
-	fmt.Fprintf(&sb, "Strategy: %s\n\n", sig.Strategy)
+	writeSignalDetailSummary(&sb, sig)
 
 	// Fetch linked analysis reasoning.
 	if len(sig.AnalysisIDs) > 0 {
@@ -81,6 +75,17 @@ func handleDetail(ctx context.Context, signalID string) (string, error) {
 	}
 
 	return sb.String(), nil
+}
+
+func writeSignalDetailSummary(sb *strings.Builder, sig *store.Signal) {
+	fmt.Fprintf(sb, "📋 *Signal Detail*\n\n")
+	fmt.Fprintf(sb, "Ticker: `%s` | %s\n", sig.Ticker, sig.Action)
+	fmt.Fprintf(sb, "Confidence: %.0f%%\n", sig.Confidence*100)
+	fmt.Fprintf(sb, "Price: $%.2f\n", sig.SignalPrice)
+	fmt.Fprintf(sb, "SL: $%.2f | TP: $%.2f\n", sig.StopLoss, sig.TakeProfit)
+	fmt.Fprintf(sb, "Status: %s\n", sig.Status)
+	fmt.Fprintf(sb, "Strategy: %s%s\n\n",
+		sig.Strategy, entrySetupNotification(sig.EntrySetup, sig.EntrySetupEvidence))
 }
 
 func truncate(s string, maxLen int) string {

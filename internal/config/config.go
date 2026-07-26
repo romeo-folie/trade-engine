@@ -1446,22 +1446,22 @@ type RiskConfig struct {
 
 // EntryGatesConfig holds per-strategy entry-quality gates. Zero values
 // disable every gate so existing configs upgrade without behavior change.
-// Gates apply to BUY signals only. Legacy cohort filters fail open when their
-// evidence is unavailable; the complete pullback strategy fails closed because
-// every evidence component defines setup eligibility.
+// Gates apply to BUY signals only. The pullback strategy is an additive path:
+// missing or incomplete pullback evidence falls back to the standard entry
+// gates, while a confirmed setup receives its dedicated stop and revalidation.
 type EntryGatesConfig struct {
 	// TrendAlignmentEnabled blocks stock BUYs in a confirmed daily downtrend:
 	// price below both the 9- and 21-day EMAs while both completed-session
 	// EMAs are declining. False preserves existing behavior. The gate fails
 	// open when daily history is unavailable or insufficient.
 	TrendAlignmentEnabled bool `yaml:"trend_alignment_enabled"`
-	// PullbackStrengthEnabled requires the complete Phase 2 pullback-in-strength
-	// setup before a stock BUY can proceed: strong multi-month momentum, an
+	// PullbackStrengthEnabled adds the complete Phase 2 pullback-in-strength
+	// path for universe-qualified scanner candidates: strong multi-month momentum, an
 	// eight-week higher-low/narrowing consolidation around rising EMA9/EMA21,
 	// an intraday flush into stacked AVWAP support, a positive reclaim, and a
-	// sufficiently tight low-of-day stop. Unlike the legacy trend-rejection
-	// gate, missing evidence fails closed because every component defines the
-	// strategy. False preserves existing behavior.
+	// sufficiently tight low-of-day stop. Candidates that do not complete the
+	// setup continue through the standard entry path. False preserves existing
+	// behavior.
 	PullbackStrengthEnabled bool `yaml:"pullback_strength_enabled"`
 	// PullbackMinMomentumReturnPct is the minimum return on at least one of the
 	// 1/3/6-month horizons. Zero defaults to the study's 30%.

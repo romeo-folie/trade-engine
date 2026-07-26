@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 )
+
+var ErrWatchlistRequalificationRequired = errors.New("watchlist item requires pullback requalification")
 
 // WatchlistItem represents a row in the watchlist table.
 type WatchlistItem struct {
@@ -21,8 +24,15 @@ type WatchlistItem struct {
 	GraphContext string
 	Active       bool
 	ExpiresAt    *time.Time // non-nil for scanner-sourced items
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// PullbackRequalificationRequired quarantines legacy scanner rows whose
+	// pullback-universe status was not persisted before migration 055.
+	PullbackRequalificationRequired bool
+	// PullbackRequalificationComplete is a write-only acknowledgement from the
+	// scanner that all objective universe inputs were available. It permits a
+	// quarantined row to be reactivated as either qualified or standard.
+	PullbackRequalificationComplete bool
+	CreatedAt                       time.Time
+	UpdatedAt                       time.Time
 }
 
 // AddWatchlistItem inserts or re-activates a watchlist entry.
@@ -35,7 +45,7 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 	if item.Source == "" {
 		item.Source = "manual"
 	}
-	_, err := GetDB().Exec(ctx, `
+	tag, err := GetDB().Exec(ctx, `
 		INSERT INTO watchlist (ticker, platform, strategies, timeframes, min_confidence, source, graph_context, active, expires_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
 		ON CONFLICT (ticker, platform) DO UPDATE SET
@@ -46,12 +56,25 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 			graph_context  = EXCLUDED.graph_context,
 			active         = true,
 			expires_at     = EXCLUDED.expires_at,
+			pullback_requalification_required = false,
 			updated_at     = NOW()
+		WHERE NOT (
+			watchlist.pullback_requalification_required
+			AND EXCLUDED.source = 'scanner'
+			AND NOT $9
+		)
 	`,
 		item.Ticker, item.Platform, item.Strategies, item.Timeframes,
 		item.MinConfidence, item.Source, nullableString(item.GraphContext), item.ExpiresAt,
+		item.PullbackRequalificationComplete,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrWatchlistRequalificationRequired
+	}
+	return nil
 }
 
 // RemoveWatchlistItem soft-deletes a watchlist item by setting active = false.
@@ -72,7 +95,8 @@ func RemoveWatchlistItem(ctx context.Context, ticker, platform string) error {
 func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, error) {
 	q := `
 		SELECT id, ticker, platform, strategies, timeframes,
-		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at, created_at, updated_at
+		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at,
+		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 	`
 	if activeOnly {
@@ -91,7 +115,8 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		var w WatchlistItem
 		if err := rows.Scan(
 			&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-			&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt, &w.CreatedAt, &w.UpdatedAt,
+			&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt,
+			&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -108,7 +133,8 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	}
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, ticker, platform, strategies, timeframes,
-		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at, created_at, updated_at
+		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at,
+		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 		WHERE ticker = $1 AND platform = $2
 	`, ticker, platform)
@@ -116,7 +142,8 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	var w WatchlistItem
 	err := row.Scan(
 		&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-		&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt, &w.CreatedAt, &w.UpdatedAt,
+		&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt,
+		&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {
 		if isNoRows(err) {

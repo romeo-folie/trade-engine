@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -44,6 +45,53 @@ func TestUpsertNewsItems_ReturnsIDsForDuplicates(t *testing.T) {
 	}
 	if id1 != id2 {
 		t.Fatalf("duplicate upsert returned a different ID: %s vs %s", id1, id2)
+	}
+}
+
+func TestWatchlistPullbackRequalificationQuarantine(t *testing.T) {
+	ctx := context.Background()
+	const ticker = "PULLBACK_REQUAL_RT"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", ticker)
+	})
+
+	exp := time.Now().Add(72 * time.Hour)
+	item := store.WatchlistItem{
+		Ticker: ticker, Platform: "stock", Strategies: []string{"momentum"},
+		Timeframes: []string{"1H"}, Source: "scanner", ExpiresAt: &exp,
+	}
+	if err := store.AddWatchlistItem(ctx, item); err != nil {
+		t.Fatalf("seed watchlist item: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE watchlist
+		SET active = false, pullback_requalification_required = true
+		WHERE ticker = $1
+	`, ticker); err != nil {
+		t.Fatalf("quarantine watchlist item: %v", err)
+	}
+
+	if err := store.AddWatchlistItem(ctx, item); !errors.Is(err, store.ErrWatchlistRequalificationRequired) {
+		t.Fatalf("unqualified scanner reactivation error = %v", err)
+	}
+	got, err := store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || got == nil {
+		t.Fatalf("read quarantined item: %v (item=%v)", err, got)
+	}
+	if got.Active || !got.PullbackRequalificationRequired {
+		t.Fatalf("quarantine was cleared without evidence: %+v", got)
+	}
+
+	item.PullbackRequalificationComplete = true
+	if err := store.AddWatchlistItem(ctx, item); err != nil {
+		t.Fatalf("definitive requalification: %v", err)
+	}
+	got, err = store.GetWatchlistItem(ctx, ticker, "stock")
+	if err != nil || got == nil {
+		t.Fatalf("read requalified item: %v (item=%v)", err, got)
+	}
+	if !got.Active || got.PullbackRequalificationRequired {
+		t.Fatalf("definitive requalification did not reactivate row: %+v", got)
 	}
 }
 

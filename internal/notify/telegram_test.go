@@ -12,6 +12,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // capturedMsgs is a thread-safe container for messages captured by captureServer.
@@ -132,12 +133,14 @@ func TestTradeExecutedNotification(t *testing.T) {
 	startCount := msgs.Len()
 
 	bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
-		TradeID:    "t1",
-		Ticker:     "AAPL",
-		Direction:  "buy",
-		EntryPrice: 150.00,
-		Quantity:   10,
-		Strategy:   "momentum",
+		TradeID:       "t1",
+		Ticker:        "AAPL",
+		Direction:     "buy",
+		EntryPrice:    150.00,
+		Quantity:      10,
+		Strategy:      "momentum",
+		EntrySetup:    "pullback_strength",
+		SetupEvidence: "Momentum 35.0/50.0/80.0%; reclaimed $149.00 support",
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -147,6 +150,73 @@ func TestTradeExecutedNotification(t *testing.T) {
 	text := msgs.At(startCount)["text"].(string)
 	if !strings.Contains(text, "AAPL") || !strings.Contains(text, "Trade Executed") {
 		t.Errorf("trade msg = %q", text)
+	}
+	if !strings.Contains(text, "Setup: Pullback in Strength") ||
+		!strings.Contains(text, "Outcome: Momentum 35.0/50.0/80.0%") {
+		t.Errorf("trade setup attribution missing: %q", text)
+	}
+}
+
+func TestEntrySetupNotificationHidesStandardPath(t *testing.T) {
+	if got := entrySetupNotification("standard", "unused"); got != "" {
+		t.Fatalf("standard entry detail = %q, want empty", got)
+	}
+}
+
+func TestSignalDetailIncludesPullbackAttribution(t *testing.T) {
+	var detail strings.Builder
+	writeSignalDetailSummary(&detail, &store.Signal{
+		Ticker: "AMD", Action: "BUY", Confidence: 0.8,
+		SignalPrice: 200, StopLoss: 195, TakeProfit: 220,
+		Status: "pending", Strategy: "momentum",
+		EntrySetup:         store.EntrySetupPullbackStrength,
+		EntrySetupEvidence: "reclaimed $198.00 support",
+	})
+	got := detail.String()
+	if !strings.Contains(got, "Setup: Pullback in Strength") ||
+		!strings.Contains(got, "Outcome: reclaimed $198.00 support") {
+		t.Fatalf("signal detail setup attribution missing: %q", got)
+	}
+}
+
+func TestBatchedSignalIncludesPullbackAttribution(t *testing.T) {
+	srv, msgs := captureServer(t)
+	defer srv.Close()
+
+	bus := events.New()
+	cfg := config.TelegramConfig{
+		Enabled: true, BotToken: "test-token", ChatID: "123",
+		NotifyOn: []string{"signal"}, BatchEnabled: true,
+		BatchWindowSec: 60, MaxItemsPerBatch: 10,
+		MinConfidenceForAlert: 0.65,
+	}
+	bot := NewTelegramBot(cfg, bus)
+	bot.apiBase = srv.URL + "/bot"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := bot.Start(ctx); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer bot.Stop()
+	time.Sleep(100 * time.Millisecond)
+	startCount := msgs.Len()
+
+	bus.Publish(events.SignalGenerated, events.SignalGeneratedPayload{
+		Ticker: "NVDA", Action: "BUY", Confidence: 0.8,
+		EntrySetup:    "pullback_strength",
+		SetupEvidence: "reclaimed $170.00 support",
+	})
+	time.Sleep(100 * time.Millisecond)
+	bot.FlushBatch()
+	time.Sleep(200 * time.Millisecond)
+
+	if msgs.Len() <= startCount {
+		t.Fatal("expected batched signal message")
+	}
+	text := msgs.At(startCount)["text"].(string)
+	if !strings.Contains(text, "Pullback in Strength") ||
+		!strings.Contains(text, "reclaimed $170.00 support") {
+		t.Fatalf("batched signal setup attribution missing: %q", text)
 	}
 }
 
@@ -207,11 +277,13 @@ func TestSignalQueuedWithInlineButtons(t *testing.T) {
 	startCount := msgs.Len()
 
 	bus.Publish(events.SignalQueued, events.SignalQueuedPayload{
-		SignalID:   "sig1",
-		Ticker:     "GOOG",
-		Action:     "BUY",
-		Confidence: 0.85,
-		ExpiresIn:  25 * time.Minute,
+		SignalID:      "sig1",
+		Ticker:        "GOOG",
+		Action:        "BUY",
+		Confidence:    0.85,
+		ExpiresIn:     25 * time.Minute,
+		EntrySetup:    "pullback_strength",
+		SetupEvidence: "reclaimed $200.00 support",
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -222,6 +294,10 @@ func TestSignalQueuedWithInlineButtons(t *testing.T) {
 	text := msg["text"].(string)
 	if !strings.Contains(text, "Awaiting Approval") || !strings.Contains(text, "GOOG") {
 		t.Errorf("queued msg = %q", text)
+	}
+	if !strings.Contains(text, "Setup: Pullback in Strength") ||
+		!strings.Contains(text, "Outcome: reclaimed $200.00 support") {
+		t.Errorf("queued setup attribution missing: %q", text)
 	}
 	// Should have inline keyboard.
 	if msg["reply_markup"] == nil {
@@ -303,12 +379,12 @@ func TestDailySummary(t *testing.T) {
 		TotalValue:       105000,
 		DailyChange:      5000,
 		DailyChangePct:   5.0,
-		TradesOpened:      3,
-		TradesClosed:      2,
-		Wins:              2,
-		Losses:            0,
-		SignalsGenerated:  5,
-		SignalsBlocked:    1,
+		TradesOpened:     3,
+		TradesClosed:     2,
+		Wins:             2,
+		Losses:           0,
+		SignalsGenerated: 5,
+		SignalsBlocked:   1,
 	})
 
 	if msgs.Len() < 1 {
