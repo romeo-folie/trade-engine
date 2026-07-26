@@ -241,9 +241,8 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 				ctx, candidate.symbol,
 			)
 			if fetchErr != nil {
-				if errors.Is(fetchErr, context.Canceled) ||
-					errors.Is(fetchErr, context.DeadlineExceeded) {
-					return result, fetchErr
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return result, ctxErr
 				}
 				observation := taxonomyUnavailableObservation(
 					candidate.symbol,

@@ -52,6 +52,16 @@ func (f fakeFundamentals) FetchCompanyFundamentals(
 	return value, nil
 }
 
+type timeoutFundamentals struct{}
+
+func (timeoutFundamentals) ProviderName() string { return "timeout-fundamentals" }
+
+func (timeoutFundamentals) FetchCompanyFundamentals(
+	context.Context, string,
+) (data.CompanyFundamentals, error) {
+	return data.CompanyFundamentals{}, context.DeadlineExceeded
+}
+
 type fakeRepository struct {
 	taxonomy map[string]*store.CompanyTaxonomyObservation
 	version  store.SwingUniverseVersion
@@ -358,6 +368,35 @@ func TestFailedTaxonomyAttemptAdvancesBoundedRefresh(t *testing.T) {
 	if result.TaxonomyRefreshes != 1 || repo.taxonomy["B"] == nil ||
 		repo.taxonomy["B"].Industry != "Software" {
 		t.Fatalf("later symbol remained starved: result=%+v taxonomy=%+v", result, repo.taxonomy)
+	}
+}
+
+func TestProviderLocalTimeoutPersistsTaxonomyAttempt(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	cfg := testConfig()
+	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	market := completeMarket("TIMEOUT", 20)
+	builder := Builder{
+		Config: cfg,
+		Assets: fakeAssets{assets: []data.StockAsset{{
+			Symbol: "TIMEOUT", Status: "active", AssetClass: "us_equity",
+			Exchange: "NASDAQ", Tradable: true,
+		}}},
+		Snapshots:    market,
+		Bars:         market,
+		Fundamentals: timeoutFundamentals{},
+		Repository:   repo,
+		Now:          func() time.Time { return now },
+	}
+
+	if _, err := builder.Refresh(context.Background()); err == nil {
+		t.Fatal("refresh without any market-cap evidence unexpectedly completed")
+	}
+	failedAttempt := repo.taxonomy["TIMEOUT"]
+	if failedAttempt == nil || failedAttempt.Status != "unavailable" ||
+		failedAttempt.Provider != "timeout-fundamentals" ||
+		!strings.Contains(string(failedAttempt.Evidence), context.DeadlineExceeded.Error()) {
+		t.Fatalf("provider-local timeout was not persisted: %+v", failedAttempt)
 	}
 }
 
