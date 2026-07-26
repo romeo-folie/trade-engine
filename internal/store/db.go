@@ -14,13 +14,35 @@ import (
 )
 
 var (
-	poolMu sync.RWMutex
-	pool   *pgxpool.Pool
+	// lifecycleMu serializes Connect and Close. Runtime pool replacement is not
+	// supported: callers may retain the pointer returned by GetDB for the
+	// lifetime of the process, so replacing and closing it would invalidate
+	// concurrent users.
+	lifecycleMu sync.Mutex
+	poolMu      sync.RWMutex
+	pool        *pgxpool.Pool
+	poolDSN     string
 )
 
-// Connect initialises the global connection pool from DATABASE_URL.
+// Connect initialises the global connection pool from DATABASE_URL. It is
+// idempotent while connected; changing DATABASE_URL requires an explicit Close
+// after all pool users have stopped, followed by Connect.
 func Connect(ctx context.Context) error {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	dsn := os.Getenv("DATABASE_URL")
+	poolMu.RLock()
+	connected := pool != nil
+	connectedDSN := poolDSN
+	poolMu.RUnlock()
+	if connected {
+		if dsn != connectedDSN {
+			return fmt.Errorf("database already connected; call Close before changing DATABASE_URL")
+		}
+		return nil
+	}
+
 	if dsn == "" {
 		return fmt.Errorf("DATABASE_URL environment variable is not set")
 	}
@@ -43,12 +65,9 @@ func Connect(ctx context.Context) error {
 	}
 
 	poolMu.Lock()
-	previous := pool
 	pool = candidate
+	poolDSN = dsn
 	poolMu.Unlock()
-	if previous != nil {
-		previous.Close()
-	}
 	return nil
 }
 
@@ -70,11 +89,16 @@ func GetDB() *pgxpool.Pool {
 	return db
 }
 
-// Close shuts down the pool gracefully.
+// Close shuts down the pool gracefully. Callers must stop all users of the
+// pointer returned by GetDB before calling Close.
 func Close() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+
 	poolMu.Lock()
 	db := pool
 	pool = nil
+	poolDSN = ""
 	poolMu.Unlock()
 	if db != nil {
 		db.Close()

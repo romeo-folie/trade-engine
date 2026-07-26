@@ -498,6 +498,100 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	}
 }
 
+func TestWeeklyLeaderReportSelectsCanonicalRunPerSession(t *testing.T) {
+	ctx := context.Background()
+	sessionDate := time.Date(2040, time.January, 3, 0, 0, 0, 0, time.UTC)
+	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+		Provider:       "test-weekly-leader-report-canonical",
+		AsOf:           sessionDate.Add(-time.Hour),
+		CapturedAt:     sessionDate.Add(-50 * time.Minute),
+		Filters:        json.RawMessage(`{"test":true}`),
+		SourceEvidence: json.RawMessage(`{"fixture":"report-canonical"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := store.GetDB().Exec(
+			ctx, "DELETE FROM swing_universe_versions WHERE id=$1", versionID,
+		); err != nil {
+			t.Errorf("clean up report universe: %v", err)
+		}
+	}()
+
+	var olderID, canonicalID string
+	for i, fixture := range []struct {
+		configHash    string
+		decisionAt    time.Time
+		completedAt   time.Time
+		eligibleCount int
+		id            *string
+	}{
+		{
+			configHash: "report-lineage-v1",
+			decisionAt: sessionDate.Add(20*time.Hour + 15*time.Minute),
+			completedAt: sessionDate.Add(
+				20*time.Hour + 20*time.Minute,
+			),
+			eligibleCount: 11,
+			id:            &olderID,
+		},
+		{
+			configHash: "report-lineage-v2",
+			decisionAt: sessionDate.Add(20*time.Hour + 30*time.Minute),
+			completedAt: sessionDate.Add(
+				20*time.Hour + 35*time.Minute,
+			),
+			eligibleCount: 23,
+			id:            &canonicalID,
+		},
+	} {
+		err := store.GetDB().QueryRow(ctx, `
+			INSERT INTO weekly_leader_runs (
+				session_date, as_of, decision_at, universe_version_id, status,
+				started_at, completed_at, lease_until, config_hash,
+				config_snapshot, feature_version, benchmark, history_provider,
+				eligible_universe_count
+			) VALUES (
+				$1,$2,$3,$4,'completed',$5,$6,$7,$8,'{}',
+				'weekly-leader-v3','SPY','test',$9
+			)
+			RETURNING id`,
+			sessionDate, sessionDate, fixture.decisionAt, versionID,
+			fixture.decisionAt.Add(time.Minute), fixture.completedAt,
+			fixture.completedAt, fixture.configHash, fixture.eligibleCount,
+		).Scan(fixture.id)
+		if err != nil {
+			t.Fatalf("insert report run %d: %v", i, err)
+		}
+	}
+	defer func() {
+		if _, err := store.GetDB().Exec(
+			ctx, "DELETE FROM weekly_leader_runs WHERE id=ANY($1::uuid[])",
+			[]string{olderID, canonicalID},
+		); err != nil {
+			t.Errorf("clean up report runs: %v", err)
+		}
+	}()
+
+	runs, err := store.ListCompletedWeeklyLeaderRunsBySessionDate(
+		ctx, sessionDate, sessionDate,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 {
+		t.Fatalf("report runs = %+v, want one canonical observation", runs)
+	}
+	if runs[0].ID != canonicalID || runs[0].ConfigHash != "report-lineage-v2" ||
+		runs[0].EligibleUniverseCount != 23 {
+		t.Fatalf(
+			"report run = %+v, want latest compatible lineage %s",
+			runs[0], canonicalID,
+		)
+	}
+}
+
 func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 	ctx := context.Background()
 	var versionID string

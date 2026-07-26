@@ -647,15 +647,33 @@ func GetLatestCompletedWeeklyLeaderRunAsOf(
 	return run, nil
 }
 
-// ListCompletedWeeklyLeaderRunsBySessionDate returns completed runs whose
-// exchange session dates fall within the inclusive calendar-date range. Each
-// argument's written calendar date is used directly without timezone conversion.
+// ListCompletedWeeklyLeaderRunsBySessionDate returns the canonical completed run
+// for each exchange session date in the inclusive calendar-date range. A session
+// can have multiple completed runs when its universe or compatible evaluation
+// config changes; selecting the latest decision prevents reports from combining
+// incompatible observations. Each argument's written calendar date is used
+// directly without timezone conversion.
 func ListCompletedWeeklyLeaderRunsBySessionDate(
 	ctx context.Context, fromDate, toDate time.Time,
 ) ([]WeeklyLeaderRun, error) {
 	fromKey := fromDate.Format("2006-01-02")
 	toKey := toDate.Format("2006-01-02")
 	rows, err := GetDB().Query(ctx, `
+		WITH canonical AS (
+			SELECT DISTINCT ON (session_date)
+			       id, session_date, as_of, decision_at, universe_version_id, status,
+			       started_at, completed_at, lease_until, attempt_count, config_hash,
+			       config_snapshot, feature_version, benchmark, history_provider,
+			       error, eligible_universe_count, evaluated_count, qualified_count,
+			       failure_count, added_count, removed_count, persistent_count,
+			       leader_breadth, evaluation_coverage, failure_rate,
+			       previous_completed_run_id
+			FROM weekly_leader_runs
+			WHERE status='completed'
+			  AND session_date >= $1::date
+			  AND session_date <= $2::date
+			ORDER BY session_date, decision_at DESC, completed_at DESC, id DESC
+		)
 		SELECT id, session_date, as_of, decision_at, universe_version_id, status,
 		       started_at, completed_at, lease_until, attempt_count, config_hash,
 		       config_snapshot, feature_version, benchmark, history_provider,
@@ -663,11 +681,8 @@ func ListCompletedWeeklyLeaderRunsBySessionDate(
 		       qualified_count, failure_count, added_count, removed_count,
 		       persistent_count, leader_breadth, evaluation_coverage, failure_rate,
 		       COALESCE(previous_completed_run_id::text,'')
-		FROM weekly_leader_runs
-		WHERE status='completed'
-		  AND session_date >= $1::date
-		  AND session_date <= $2::date
-		ORDER BY session_date, completed_at`, fromKey, toKey)
+		FROM canonical
+		ORDER BY session_date`, fromKey, toKey)
 	if err != nil {
 		return nil, fmt.Errorf("list completed weekly leader runs: %w", err)
 	}
