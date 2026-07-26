@@ -114,10 +114,12 @@ transitions, breadth, and the completed status publish in one transaction, so
 readers never observe a partial run.
 
 Candidate promotion has a separate atomic, token-fenced claim. Concurrent scanner
-processes cannot score or write the same pending leader. Unfinished claims are
-released at the end of the scanner cycle; terminal status is recorded only
-after the actual outcome is known (`rejected`, `cap_suppressed`, `failed`,
-`active_watchlist`, or successfully `promoted` to the watchlist).
+processes cannot score or write the same pending leader. It uses the configured
+run lease so a crashed scanner cannot strand the latest leaders in `processing`.
+Unfinished claims are released at the end of the scanner cycle; terminal status
+is recorded only after the actual outcome is known (`rejected`,
+`cap_suppressed`, `failed`, `active_watchlist`, or successfully `promoted` to
+the watchlist).
 
 Only the highest-ranked `max_promotions_per_run` qualified rows are made
 pending (20 by default). This bounds paid LLM work even when a 90th-percentile

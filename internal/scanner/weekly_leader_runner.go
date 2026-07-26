@@ -217,7 +217,33 @@ func weeklyLeaderQualifications(
 	if maxPromotions <= 0 {
 		maxPromotions = 20
 	}
-	for _, evaluation := range evaluations {
+	promotionIndexes := make(map[int]struct{})
+	if cfg.PromoteCandidates {
+		type rankedEvaluation struct {
+			index  int
+			rank   int
+			ticker string
+		}
+		ranked := make([]rankedEvaluation, 0, len(evaluations))
+		for i, evaluation := range evaluations {
+			if evaluation.Qualified && evaluation.Outcome == "qualified" &&
+				evaluation.Rank != nil {
+				ranked = append(ranked, rankedEvaluation{
+					index: i, rank: *evaluation.Rank, ticker: evaluation.Ticker,
+				})
+			}
+		}
+		sort.Slice(ranked, func(i, j int) bool {
+			if ranked[i].rank != ranked[j].rank {
+				return ranked[i].rank < ranked[j].rank
+			}
+			return ranked[i].ticker < ranked[j].ticker
+		})
+		for i := 0; i < len(ranked) && i < maxPromotions; i++ {
+			promotionIndexes[ranked[i].index] = struct{}{}
+		}
+	}
+	for i, evaluation := range evaluations {
 		q := store.WeeklyLeaderQualification{
 			RunID: runID, UniverseVersionID: universeVersionID,
 			Ticker: evaluation.Ticker, Outcome: evaluation.Outcome,
@@ -239,8 +265,7 @@ func weeklyLeaderQualifications(
 			"as_of":        asOf.UTC().Format(time.RFC3339Nano),
 			"bar_set_hash": evaluation.BarSetHash,
 		})
-		if cfg.PromoteCandidates && evaluation.Qualified &&
-			evaluation.Rank != nil && *evaluation.Rank <= maxPromotions {
+		if _, promote := promotionIndexes[i]; promote {
 			q.PromotionStatus = "pending"
 		}
 		if evaluation.Features != nil {

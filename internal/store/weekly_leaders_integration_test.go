@@ -102,29 +102,32 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatalf("incorrect run diagnostics: %+v", got)
 	}
 	claimedCandidates, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt, "promotion-claim-1",
+		ctx, completedAt, completedAt, time.Hour, "promotion-claim-1",
 	)
 	if err != nil || len(claimedCandidates) != 1 ||
 		claimedCandidates[0].Ticker != "TEST_WL_AAA" {
 		t.Fatalf("claimed candidates = %+v/%v", claimedCandidates, err)
 	}
 	concurrent, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt, "promotion-claim-2",
+		ctx, completedAt, completedAt, time.Hour, "promotion-claim-2",
 	)
 	if err != nil || len(concurrent) != 0 {
 		t.Fatalf("concurrent promotion claim duplicated work: %+v/%v", concurrent, err)
 	}
-	if err := store.ReleaseWeeklyLeaderPromotionClaims(
-		ctx, "promotion-claim-1", "fixture retry",
-	); err != nil {
-		t.Fatal(err)
+	concurrent, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt.Add(time.Hour-time.Nanosecond),
+		time.Hour, "promotion-claim-2",
+	)
+	if err != nil || len(concurrent) != 0 {
+		t.Fatalf("fresh promotion lease was stolen: %+v/%v", concurrent, err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Minute),
+		ctx, completedAt, completedAt.Add(time.Hour), time.Hour,
 		"promotion-claim-2",
 	)
-	if err != nil || len(claimedCandidates) != 1 {
-		t.Fatalf("released promotion was not reclaimable: %+v/%v", claimedCandidates, err)
+	if err != nil || len(claimedCandidates) != 1 ||
+		claimedCandidates[0].PromotionClaimToken != "promotion-claim-2" {
+		t.Fatalf("expired promotion lease was not reclaimable: %+v/%v", claimedCandidates, err)
 	}
 	watchlistItem := store.WatchlistItem{
 		Ticker: "TEST_WL_AAA", Platform: "stock",
@@ -137,8 +140,32 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	); !errors.Is(err, store.ErrWeeklyLeaderPromotionClaimLost) {
 		t.Fatalf("stale claim reached watchlist transaction: %v", err)
 	}
+	if err := store.ReleaseWeeklyLeaderPromotionClaims(
+		ctx, "promotion-claim-1", "stale fixture release",
+	); err != nil {
+		t.Fatal(err)
+	}
+	concurrent, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt.Add(time.Hour+time.Minute),
+		time.Hour, "promotion-claim-3",
+	)
+	if err != nil || len(concurrent) != 0 {
+		t.Fatalf("stale release reset the current claim: %+v/%v", concurrent, err)
+	}
+	if err := store.ReleaseWeeklyLeaderPromotionClaims(
+		ctx, "promotion-claim-2", "fixture retry",
+	); err != nil {
+		t.Fatal(err)
+	}
+	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, completedAt, completedAt.Add(time.Hour+2*time.Minute), time.Hour,
+		"promotion-claim-3",
+	)
+	if err != nil || len(claimedCandidates) != 1 {
+		t.Fatalf("released promotion was not reclaimable: %+v/%v", claimedCandidates, err)
+	}
 	if err := store.PromoteWeeklyLeaderToWatchlist(
-		ctx, watchlistItem, first.ID, "TEST_WL_AAA", "promotion-claim-2",
+		ctx, watchlistItem, first.ID, "TEST_WL_AAA", "promotion-claim-3",
 		"fixture", completedAt,
 	); err != nil {
 		t.Fatal(err)
@@ -150,11 +177,147 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatalf("atomic watchlist promotion missing: active=%v err=%v", active, err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(2*time.Minute),
-		"promotion-claim-3",
+		ctx, completedAt, completedAt.Add(time.Hour+3*time.Minute), time.Hour,
+		"promotion-claim-4",
 	)
 	if err != nil || len(claimedCandidates) != 0 {
 		t.Fatalf("consumed candidate remained claimable: %+v/%v", claimedCandidates, err)
+	}
+
+	alternateInput := runInput
+	alternateInput.ConfigHash = "weekly-leader-integration-v2"
+	alternateInput.ConfigSnapshot = json.RawMessage(`{"selection_percentile":0.85}`)
+	alternateInput.StartedAt = base.Add(21 * time.Minute)
+	alternate, claimed, err := store.ClaimWeeklyLeaderRun(ctx, alternateInput, time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("alternate same-session claim = %+v/%v/%v", alternate, claimed, err)
+	}
+	scoreB, percentileB, rankB := 0.82, 0.90, 2
+	alternateQualifications := append([]store.WeeklyLeaderQualification(nil), qualifications...)
+	alternateQualifications[0].RunID = alternate.ID
+	alternateQualifications[0].PromotionStatus = "not_requested"
+	alternateQualifications[1] = store.WeeklyLeaderQualification{
+		RunID: alternate.ID, UniverseVersionID: versionID, Ticker: "TEST_WL_BBB",
+		Outcome: "qualified", Sector: "Technology", Industry: "Software",
+		MarketCapBand: "mid", VolatilityBand: "medium", Return20: &return20,
+		Return60: &return60, Return126: &return126,
+		MedianDollarVolume20: &medianDV, CompositeScore: &scoreB,
+		ScorePercentile: &percentileB, Rank: &rankB, FeatureCoverage: &coverage,
+		BarSetHash: "fixture-bars-b", PromotionStatus: "pending",
+	}
+	alternateCompletedAt := base.Add(22 * time.Minute)
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, alternate.ID, alternate.AttemptCount, alternateCompletedAt,
+		alternateQualifications, "fixture-benchmark-2",
+	); err != nil {
+		t.Fatal(err)
+	}
+	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, alternateCompletedAt, alternateCompletedAt, time.Hour,
+		"same-session-old-claim",
+	)
+	if err != nil || len(claimedCandidates) != 1 ||
+		claimedCandidates[0].Ticker != "TEST_WL_BBB" {
+		t.Fatalf("alternate same-session candidates = %+v/%v", claimedCandidates, err)
+	}
+
+	newestInput := alternateInput
+	newestInput.ConfigHash = "weekly-leader-integration-v3"
+	newestInput.ConfigSnapshot = json.RawMessage(`{"selection_percentile":0.8}`)
+	newestInput.DecisionAt = alternateInput.DecisionAt.Add(time.Minute)
+	newestInput.StartedAt = base.Add(23 * time.Minute)
+	newest, claimed, err := store.ClaimWeeklyLeaderRun(ctx, newestInput, time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("newest same-session claim = %+v/%v/%v", newest, claimed, err)
+	}
+	newestQualifications := append(
+		[]store.WeeklyLeaderQualification(nil), alternateQualifications...,
+	)
+	for i := range newestQualifications {
+		newestQualifications[i].RunID = newest.ID
+		newestQualifications[i].PromotionStatus = "not_requested"
+	}
+	newestCompletedAt := base.Add(24 * time.Minute)
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, newest.ID, newest.AttemptCount, newestCompletedAt,
+		newestQualifications, "fixture-benchmark-3",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkWeeklyLeaderPromotion(
+		ctx, alternate.ID, "TEST_WL_BBB", "same-session-old-claim",
+		"rejected", "", "stale same-session worker", newestCompletedAt,
+	); err == nil {
+		t.Fatal("older same-session worker retained a valid promotion claim")
+	}
+	staleWatchlistItem := watchlistItem
+	staleWatchlistItem.Ticker = "TEST_WL_BBB"
+	if err := store.PromoteWeeklyLeaderToWatchlist(
+		ctx, staleWatchlistItem, alternate.ID, "TEST_WL_BBB",
+		"same-session-old-claim", "stale same-session worker", newestCompletedAt,
+	); !errors.Is(err, store.ErrWeeklyLeaderPromotionClaimLost) {
+		t.Fatalf("older same-session worker reached watchlist transaction: %v", err)
+	}
+	var staleWatchlistCount int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT COUNT(*) FROM watchlist
+		WHERE ticker='TEST_WL_BBB' AND platform='stock'`,
+	).Scan(&staleWatchlistCount); err != nil {
+		t.Fatal(err)
+	}
+	if staleWatchlistCount != 0 {
+		t.Fatal("older same-session worker wrote a watchlist row")
+	}
+	var alternatePromotionStatus string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status FROM weekly_leader_qualifications
+		WHERE run_id=$1 AND ticker='TEST_WL_BBB'`, alternate.ID,
+	).Scan(&alternatePromotionStatus); err != nil {
+		t.Fatal(err)
+	}
+	if alternatePromotionStatus != "superseded" {
+		t.Fatalf("older same-session status = %s, want superseded", alternatePromotionStatus)
+	}
+	latest, err := store.GetLatestCompletedWeeklyLeaderRunAsOf(ctx, newestCompletedAt)
+	if err != nil || latest == nil || latest.ID != newest.ID {
+		t.Fatalf("latest same-session run = %+v/%v, want %s", latest, err, newest.ID)
+	}
+
+	laggingInput := alternateInput
+	laggingInput.ConfigHash = "weekly-leader-integration-v4"
+	laggingInput.ConfigSnapshot = json.RawMessage(`{"selection_percentile":0.95}`)
+	laggingInput.StartedAt = base.Add(25 * time.Minute)
+	lagging, claimed, err := store.ClaimWeeklyLeaderRun(ctx, laggingInput, time.Hour)
+	if err != nil || !claimed {
+		t.Fatalf("lagging same-session claim = %+v/%v/%v", lagging, claimed, err)
+	}
+	laggingQualifications := append(
+		[]store.WeeklyLeaderQualification(nil), alternateQualifications...,
+	)
+	for i := range laggingQualifications {
+		laggingQualifications[i].RunID = lagging.ID
+	}
+	laggingQualifications[1].PromotionStatus = "pending"
+	laggingCompletedAt := base.Add(26 * time.Minute)
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, lagging.ID, lagging.AttemptCount, laggingCompletedAt,
+		laggingQualifications, "fixture-benchmark-4",
+	); err != nil {
+		t.Fatal(err)
+	}
+	var laggingPromotionStatus string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT promotion_status FROM weekly_leader_qualifications
+		WHERE run_id=$1 AND ticker='TEST_WL_BBB'`, lagging.ID,
+	).Scan(&laggingPromotionStatus); err != nil {
+		t.Fatal(err)
+	}
+	if laggingPromotionStatus != "superseded" {
+		t.Fatalf("lagging same-session status = %s, want superseded", laggingPromotionStatus)
+	}
+	latest, err = store.GetLatestCompletedWeeklyLeaderRunAsOf(ctx, laggingCompletedAt)
+	if err != nil || latest == nil || latest.ID != newest.ID {
+		t.Fatalf("lagging completion displaced latest run = %+v/%v", latest, err)
 	}
 
 	secondInput := runInput
@@ -166,7 +329,6 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	if err != nil || !claimed {
 		t.Fatalf("second session claim = %+v/%v/%v", second, claimed, err)
 	}
-	scoreB, percentileB, rankB := 0.82, 0.90, 2
 	qualifications[0].RunID = second.ID
 	qualifications[0].CompositeScore = &scoreA
 	qualifications[0].PromotionStatus = "not_requested"

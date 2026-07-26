@@ -13,6 +13,8 @@ import (
 
 var ErrWeeklyLeaderPromotionClaimLost = errors.New("weekly leader promotion claim is no longer current")
 
+const weeklyLeaderCompletionLock = "weekly-leader-completion"
+
 type WeeklyLeaderRun struct {
 	ID                     string
 	SessionDate            time.Time
@@ -263,6 +265,12 @@ func CompleteWeeklyLeaderRun(
 		return fmt.Errorf("complete weekly leader run %q: claim attempt %d was superseded by %d",
 			id, attempt, run.AttemptCount)
 	}
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		weeklyLeaderCompletionLock,
+	); err != nil {
+		return fmt.Errorf("serialize weekly leader completion: %w", err)
+	}
 
 	previousID, previous, err := previousWeeklyLeaders(
 		ctx, tx, run.SessionDate, run.ConfigHash,
@@ -277,19 +285,6 @@ func CompleteWeeklyLeaderRun(
 			return fmt.Errorf("clear %s: %w", table, err)
 		}
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE weekly_leader_qualifications q
-		SET promotion_status='superseded',
-		    promotion_reason='newer completed leader run',
-		    promotion_claim_token=NULL, promotion_claimed_at=NULL
-		FROM weekly_leader_runs r
-		WHERE q.run_id=r.id AND q.promotion_status IN ('pending','processing')
-		  AND r.status='completed' AND r.session_date < $1`,
-		run.SessionDate,
-	); err != nil {
-		return fmt.Errorf("supersede stale weekly leader promotions: %w", err)
-	}
-
 	current := make(map[string]WeeklyLeaderQualification, len(qualifications))
 	for i := range qualifications {
 		q := &qualifications[i]
@@ -373,19 +368,42 @@ func CompleteWeeklyLeaderRun(
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("complete weekly leader run %q: lost claim", id)
 	}
+	if _, err := tx.Exec(ctx, `
+		WITH latest AS (
+			SELECT id FROM weekly_leader_runs
+			WHERE status='completed'
+			ORDER BY decision_at DESC, completed_at DESC, id DESC
+			LIMIT 1
+		)
+		UPDATE weekly_leader_qualifications q
+		SET promotion_status='superseded',
+		    promotion_reason='newer completed leader run',
+		    promotion_claim_token=NULL, promotion_claimed_at=NULL
+		FROM weekly_leader_runs r, latest l
+		WHERE q.run_id=r.id AND q.run_id<>l.id
+		  AND q.promotion_status IN ('pending','processing')
+		  AND r.status='completed'`,
+	); err != nil {
+		return fmt.Errorf("supersede stale weekly leader promotions: %w", err)
+	}
 	return tx.Commit(ctx)
 }
 
-// ClaimWeeklyLeaderCandidatesAsOf atomically moves every pending candidate in
-// the latest visible run to a token-fenced processing state. Concurrent scanner
-// processes therefore cannot score the same leader.
+// ClaimWeeklyLeaderCandidatesAsOf atomically moves every pending candidate, or
+// processing candidate whose lease expired, in the latest visible run to a
+// token-fenced processing state. Concurrent scanner processes therefore cannot
+// score the same leader, while a crashed process cannot strand work forever.
 func ClaimWeeklyLeaderCandidatesAsOf(
 	ctx context.Context,
 	asOf, claimedAt time.Time,
+	lease time.Duration,
 	claimToken string,
 ) ([]WeeklyLeaderCandidate, error) {
 	if strings.TrimSpace(claimToken) == "" {
 		return nil, fmt.Errorf("weekly leader promotion claim token is required")
+	}
+	if lease <= 0 {
+		lease = time.Hour
 	}
 	rows, err := GetDB().Query(ctx, `
 		WITH latest AS (
@@ -393,13 +411,22 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 			WHERE status='completed'
 			  AND decision_at <= $1::timestamptz
 			  AND completed_at <= $1::timestamptz
-			ORDER BY decision_at DESC, completed_at DESC LIMIT 1
+			ORDER BY decision_at DESC, completed_at DESC, id DESC LIMIT 1
 		), claimable AS (
 			SELECT q.run_id, q.ticker
 			FROM weekly_leader_qualifications q
 			JOIN latest l ON l.id=q.run_id
 			WHERE q.outcome='qualified'
-			  AND q.promotion_status='pending'
+			  AND (
+			    q.promotion_status='pending'
+			    OR (
+			      q.promotion_status='processing'
+			      AND (
+			        q.promotion_claimed_at IS NULL
+			        OR q.promotion_claimed_at <= $4
+			      )
+			    )
+			  )
 			FOR UPDATE OF q SKIP LOCKED
 		), claimed AS (
 			UPDATE weekly_leader_qualifications q
@@ -421,7 +448,7 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		JOIN swing_universe_members m
 		  ON m.universe_version_id=q.universe_version_id AND m.ticker=q.ticker
 		ORDER BY q.rank, q.ticker`,
-		asOf, claimedAt, claimToken)
+		asOf, claimedAt, claimToken, claimedAt.Add(-lease))
 	if err != nil {
 		return nil, fmt.Errorf("claim pending weekly leader candidates: %w", err)
 	}
@@ -510,16 +537,29 @@ func PromoteWeeklyLeaderToWatchlist(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		weeklyLeaderCompletionLock,
+	); err != nil {
+		return fmt.Errorf("serialize weekly leader promotion: %w", err)
+	}
 	var currentToken, status string
+	var currentRun bool
 	if err := tx.QueryRow(ctx, `
-		SELECT COALESCE(promotion_claim_token,''), promotion_status
-		FROM weekly_leader_qualifications
-		WHERE run_id=$1 AND ticker=$2 AND outcome='qualified'
-		FOR UPDATE`, runID, ticker,
-	).Scan(&currentToken, &status); err != nil {
+		SELECT COALESCE(q.promotion_claim_token,''), q.promotion_status,
+		       COALESCE(q.run_id = (
+		         SELECT r.id FROM weekly_leader_runs r
+		         WHERE r.status='completed'
+		         ORDER BY r.decision_at DESC, r.completed_at DESC, r.id DESC
+		         LIMIT 1
+		       ), false)
+		FROM weekly_leader_qualifications q
+		WHERE q.run_id=$1 AND q.ticker=$2 AND q.outcome='qualified'
+		FOR UPDATE OF q`, runID, ticker,
+	).Scan(&currentToken, &status, &currentRun); err != nil {
 		return fmt.Errorf("lock weekly leader promotion: %w", err)
 	}
-	if status != "processing" || currentToken != claimToken {
+	if !currentRun || status != "processing" || currentToken != claimToken {
 		return ErrWeeklyLeaderPromotionClaimLost
 	}
 	if err := addWatchlistItem(ctx, tx, item); err != nil {
@@ -556,7 +596,7 @@ func GetLatestCompletedWeeklyLeaderRunAsOf(
 		       COALESCE(previous_completed_run_id::text,'')
 		FROM weekly_leader_runs
 		WHERE status='completed' AND decision_at <= $1 AND completed_at <= $1
-		ORDER BY decision_at DESC, completed_at DESC LIMIT 1`, asOf)
+		ORDER BY decision_at DESC, completed_at DESC, id DESC LIMIT 1`, asOf)
 	run, err := scanWeeklyLeaderRun(row)
 	if err != nil {
 		if IsNoRows(err) {

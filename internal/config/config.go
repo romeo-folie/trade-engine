@@ -1202,7 +1202,8 @@ type WeeklyLeaderConfig struct {
 	MinCompositeScore      float64 `yaml:"min_composite_score"`
 	MinFeatureCoverage     float64 `yaml:"min_feature_coverage"`
 	BatchSize              int     `yaml:"batch_size"`
-	RunLeaseMinutes        int     `yaml:"run_lease_minutes"`
+	// RunLeaseMinutes bounds both scheduled-run and candidate-promotion claims.
+	RunLeaseMinutes int `yaml:"run_lease_minutes"`
 }
 
 // UniverseConfig controls construction and caching of the point-in-time stock

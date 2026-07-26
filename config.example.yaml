@@ -895,7 +895,7 @@ scanner:
     min_composite_score: 0.70              # Absolute quality floor in addition to the percentile cutoff
     min_feature_coverage: 0.90              # Missing components never silently become neutral scores
     batch_size: 200                        # Maximum symbols requested per daily-bars provider batch
-    run_lease_minutes: 60                  # Reclaim a crashed/stale in-progress session after this lease
+    run_lease_minutes: 60                  # Reclaim stale run or candidate-promotion claims after this lease
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

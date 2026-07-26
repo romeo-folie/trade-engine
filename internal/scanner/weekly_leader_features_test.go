@@ -98,25 +98,32 @@ func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
 	}
 }
 
-func TestWeeklyLeaderPromotionIsBoundedByRank(t *testing.T) {
-	rank1, rank21 := 1, 21
+func TestWeeklyLeaderPromotionSelectsFirstNQualifiedRows(t *testing.T) {
+	rank1, rank3, rank9, rank21 := 1, 3, 9, 21
 	qualifications, err := weeklyLeaderQualifications(
 		"run", "universe", "test", time.Now(),
 		[]WeeklyLeaderEvaluation{
-			{Ticker: "AAA", Outcome: "qualified", Qualified: true, Rank: &rank1},
-			{Ticker: "BBB", Outcome: "qualified", Qualified: true, Rank: &rank21},
+			{Ticker: "ZZZ", Outcome: "qualified", Qualified: true, Rank: &rank21},
+			{Ticker: "AAA", Outcome: "not_qualified", Rank: &rank1},
+			{Ticker: "CCC", Outcome: "qualified", Qualified: true, Rank: &rank9},
+			{Ticker: "BBB", Outcome: "qualified", Qualified: true, Rank: &rank3},
 		},
 		config.WeeklyLeaderConfig{
-			PromoteCandidates: true, MaxPromotionsPerRun: 20,
+			PromoteCandidates: true, MaxPromotionsPerRun: 2,
 		},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if qualifications[0].PromotionStatus != "pending" ||
-		qualifications[1].PromotionStatus != "not_requested" {
-		t.Fatalf("promotion statuses = %s/%s",
-			qualifications[0].PromotionStatus, qualifications[1].PromotionStatus)
+	if qualifications[0].PromotionStatus != "not_requested" ||
+		qualifications[1].PromotionStatus != "not_requested" ||
+		qualifications[2].PromotionStatus != "pending" ||
+		qualifications[3].PromotionStatus != "pending" {
+		t.Fatalf("promotion statuses = %s/%s/%s/%s",
+			qualifications[0].PromotionStatus,
+			qualifications[1].PromotionStatus,
+			qualifications[2].PromotionStatus,
+			qualifications[3].PromotionStatus)
 	}
 }
 

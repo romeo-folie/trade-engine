@@ -21,8 +21,9 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 		return nil, err
 	}
 	claimedAt := s.now()
+	claimLease := time.Duration(s.Cfg.WeeklyLeader.RunLeaseMinutes) * time.Minute
 	rows, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, claimedAt, claimedAt, claimToken,
+		ctx, claimedAt, claimedAt, claimLease, claimToken,
 	)
 	if err != nil {
 		return nil, err
