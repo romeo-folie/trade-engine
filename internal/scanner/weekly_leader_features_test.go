@@ -175,7 +175,11 @@ func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
 		{Ticker: "AAA", Outcome: "qualified", Qualified: true, CompositeScore: &score},
 		{Ticker: "BBB", Outcome: "failed", FailureStage: "provider_history"},
 	}
-	suppressWeeklyLeaderQualificationsOnProviderFailure(evaluations, 1, 2)
+	failed := weeklyLeaderIncompleteCoverageCount(evaluations)
+	if failed != 1 {
+		t.Fatalf("incomplete coverage count = %d, want 1", failed)
+	}
+	suppressWeeklyLeaderQualificationsOnIncompleteCoverage(evaluations, failed, 2)
 	if evaluations[0].Qualified || evaluations[0].Outcome != "not_qualified" ||
 		evaluations[0].FailureStage != "cross_section_incomplete" {
 		t.Fatalf("partial provider survivors remained promotable: %+v", evaluations[0])
@@ -183,6 +187,90 @@ func TestProviderFailureSuppressesCrossSectionalQualification(t *testing.T) {
 	if evaluations[1].Outcome != "failed" ||
 		evaluations[1].FailureStage != "provider_history" {
 		t.Fatalf("original provider failure was overwritten: %+v", evaluations[1])
+	}
+}
+
+func TestTargetSessionBarFailureSuppressesPromotionsButShortHistoryDoesNot(t *testing.T) {
+	target := time.Date(2026, time.July, 24, 20, 0, 0, 0, time.UTC)
+	benchmark := leaderTestBars(target, 260, 0.0004, 1_000_000)
+	leader := leaderTestBars(target, 260, 0.0020, 500_000)
+	members := []store.SwingUniverseMember{
+		{Ticker: "AAA", Eligible: true, Sector: "Tech", Industry: "Software"},
+		{Ticker: "BBB", Eligible: true, Sector: "Tech", Industry: "Software"},
+	}
+	tests := []struct {
+		name                string
+		excludedBars        []data.Candle
+		wantFailureStage    string
+		wantIncomplete      int
+		wantPromotionStatus string
+		wantSurvivorOutcome string
+		wantSurvivorFailure string
+	}{
+		{
+			name:                "missing or invalid target-session bar",
+			excludedBars:        leaderTestBars(target.AddDate(0, 0, -1), 260, 0.001, 500_000),
+			wantFailureStage:    "bar_validation",
+			wantIncomplete:      1,
+			wantPromotionStatus: "not_requested",
+			wantSurvivorOutcome: "not_qualified",
+			wantSurvivorFailure: "cross_section_incomplete",
+		},
+		{
+			name:                "genuine short history",
+			excludedBars:        leaderTestBars(target, 252, 0.001, 500_000),
+			wantFailureStage:    "insufficient_history",
+			wantIncomplete:      0,
+			wantPromotionStatus: "pending",
+			wantSurvivorOutcome: "qualified",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := leaderTestConfig()
+			cfg.PromoteCandidates = true
+			cfg.MaxPromotionsPerRun = 20
+			evaluations := EvaluateWeeklyLeaders(
+				members,
+				map[string][]data.Candle{
+					"AAA": leader,
+					"BBB": tc.excludedBars,
+				},
+				benchmark, target, target, target.Add(15*time.Minute), cfg,
+			)
+			if len(evaluations) != 2 || evaluations[0].Ticker != "AAA" ||
+				!evaluations[0].Qualified || evaluations[0].Rank == nil {
+				t.Fatalf("leader was not initially promotable: %+v", evaluations)
+			}
+			failed := weeklyLeaderIncompleteCoverageCount(evaluations)
+			if failed != tc.wantIncomplete {
+				t.Fatalf("incomplete coverage count = %d, want %d",
+					failed, tc.wantIncomplete)
+			}
+			if failed > 0 {
+				suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
+					evaluations, failed, len(evaluations),
+				)
+			}
+			qualifications, err := weeklyLeaderQualifications(
+				"run", "universe", "test", target, evaluations, cfg,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if qualifications[0].PromotionStatus != tc.wantPromotionStatus {
+				t.Fatalf("promotion status = %s, want %s",
+					qualifications[0].PromotionStatus, tc.wantPromotionStatus)
+			}
+			if evaluations[0].Outcome != tc.wantSurvivorOutcome ||
+				evaluations[0].FailureStage != tc.wantSurvivorFailure {
+				t.Fatalf("survivor = %+v", evaluations[0])
+			}
+			if evaluations[1].Outcome != "failed" ||
+				evaluations[1].FailureStage != tc.wantFailureStage {
+				t.Fatalf("source exclusion was overwritten: %+v", evaluations[1])
+			}
+		})
 	}
 }
 

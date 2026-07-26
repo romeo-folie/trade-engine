@@ -7,12 +7,16 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var pool *pgxpool.Pool
+var (
+	poolMu sync.RWMutex
+	pool   *pgxpool.Pool
+)
 
 // Connect initialises the global connection pool from DATABASE_URL.
 func Connect(ctx context.Context) error {
@@ -29,33 +33,51 @@ func Connect(ctx context.Context) error {
 	cfg.MaxConnLifetime = time.Hour
 	cfg.MaxConnIdleTime = 30 * time.Minute
 
-	pool, err = pgxpool.NewWithConfig(ctx, cfg)
+	candidate, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("open pool: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
+	if err := candidate.Ping(ctx); err != nil {
+		candidate.Close()
 		return fmt.Errorf("ping database: %w", err)
+	}
+
+	poolMu.Lock()
+	previous := pool
+	pool = candidate
+	poolMu.Unlock()
+	if previous != nil {
+		previous.Close()
 	}
 	return nil
 }
 
-// GetDB returns the global pool. Panics if Connect was not called.
 // IsConnected returns true if the database pool has been initialized.
 func IsConnected() bool {
+	poolMu.RLock()
+	defer poolMu.RUnlock()
 	return pool != nil
 }
 
+// GetDB returns the global pool. Panics if Connect was not called.
 func GetDB() *pgxpool.Pool {
-	if pool == nil {
+	poolMu.RLock()
+	db := pool
+	poolMu.RUnlock()
+	if db == nil {
 		panic("store.Connect() must be called before GetDB()")
 	}
-	return pool
+	return db
 }
 
 // Close shuts down the pool gracefully.
 func Close() {
-	if pool != nil {
-		pool.Close()
+	poolMu.Lock()
+	db := pool
+	pool = nil
+	poolMu.Unlock()
+	if db != nil {
+		db.Close()
 	}
 }
 

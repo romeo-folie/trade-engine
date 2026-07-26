@@ -161,15 +161,10 @@ func (r *WeeklyLeaderRunner) RunSession(
 			evaluations[i].FailureReason = failure.Error()
 		}
 	}
-	providerFailureCount := 0
-	for ticker := range history.Failures {
-		if ticker != benchmark {
-			providerFailureCount++
-		}
-	}
-	if providerFailureCount > 0 {
-		suppressWeeklyLeaderQualificationsOnProviderFailure(
-			evaluations, providerFailureCount, len(members),
+	incompleteCoverageCount := weeklyLeaderIncompleteCoverageCount(evaluations)
+	if incompleteCoverageCount > 0 {
+		suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
+			evaluations, incompleteCoverageCount, len(members),
 		)
 	}
 	qualifications, err := weeklyLeaderQualifications(
@@ -201,7 +196,18 @@ func (r *WeeklyLeaderRunner) RunSession(
 	return nil
 }
 
-func suppressWeeklyLeaderQualificationsOnProviderFailure(
+func weeklyLeaderIncompleteCoverageCount(evaluations []WeeklyLeaderEvaluation) int {
+	failed := 0
+	for _, evaluation := range evaluations {
+		switch evaluation.FailureStage {
+		case "provider_history", "bar_validation":
+			failed++
+		}
+	}
+	return failed
+}
+
+func suppressWeeklyLeaderQualificationsOnIncompleteCoverage(
 	evaluations []WeeklyLeaderEvaluation, failed, eligible int,
 ) {
 	reason := fmt.Sprintf(

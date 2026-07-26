@@ -21,6 +21,9 @@ func titleCase(s string) string {
 // instrument and model performance for use in LLM prompts.
 // Returns an empty string when no data is available.
 func GetPerformanceContext(ctx context.Context, ticker string) (string, error) {
+	if !store.IsConnected() {
+		return "", fmt.Errorf("feedback: database not connected")
+	}
 	// Instrument-level insights for this ticker (last 30 days, up to 5 rows).
 	instrInsights, err := store.GetFeedbackInsights(ctx, "instrument", ticker, "30d", 5)
 	if err != nil {
