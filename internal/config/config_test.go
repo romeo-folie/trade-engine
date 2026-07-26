@@ -132,6 +132,10 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 		{"promotion cap", "max_promotions_per_run", func(c *Config) { c.Scanner.WeeklyLeader.MaxPromotionsPerRun = 0 }},
 		{"universe age", "universe_max_age_hours", func(c *Config) { c.Scanner.WeeklyLeader.UniverseMaxAgeHours = 0 }},
 		{"calendar history", "history_calendar_days", func(c *Config) { c.Scanner.WeeklyLeader.HistoryCalendarDays = 399 }},
+		{"calendar/session mismatch", "history_calendar_days", func(c *Config) {
+			c.Scanner.WeeklyLeader.MinHistorySessions = 500
+			c.Scanner.WeeklyLeader.HistoryCalendarDays = 500
+		}},
 		{"session history", "min_history_sessions", func(c *Config) { c.Scanner.WeeklyLeader.MinHistorySessions = 252 }},
 		{"benchmark", "benchmark", func(c *Config) { c.Scanner.WeeklyLeader.Benchmark = " " }},
 		{"peers", "industry_min_peers", func(c *Config) { c.Scanner.WeeklyLeader.IndustryMinPeers = 0 }},
@@ -154,6 +158,23 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("calendar session boundary", func(t *testing.T) {
+		cfg := Defaults()
+		cfg.Scanner.Enabled = true
+		cfg.Scanner.Universe.Enabled = true
+		cfg.Scanner.WeeklyLeader.Enabled = true
+		cfg.Scanner.WeeklyLeader.MinHistorySessions = 500
+		required := weeklyLeaderHistoryCalendarDays(500)
+		cfg.Scanner.WeeklyLeader.HistoryCalendarDays = required
+		if errs := Validate(cfg); containsStr(errs, "scanner.weekly_leader") {
+			t.Fatalf("exact calendar/session boundary rejected: %v", errs)
+		}
+		cfg.Scanner.WeeklyLeader.HistoryCalendarDays = required - 1
+		if !containsStr(Validate(cfg), "history_calendar_days") {
+			t.Fatalf("undersized calendar window accepted: %v", Validate(cfg))
+		}
+	})
 }
 
 func TestValidateScannerUniverseConfig(t *testing.T) {

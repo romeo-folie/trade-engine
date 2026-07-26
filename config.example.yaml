@@ -887,7 +887,7 @@ scanner:
     max_promotions_per_run: 20             # Bound qualified names sent through the paid LLM gate
     after_close_delay_minutes: 15          # Wait for the provider to finalize the completed daily bar
     universe_max_age_hours: 36             # Maximum age of the completed point-in-time universe
-    history_calendar_days: 420             # Fetch window supporting 252 completed sessions plus holidays
+    history_calendar_days: 420             # Fetch window supporting 253 sessions plus weekends, holidays, and buffer
     min_history_sessions: 253              # True 52-week history; shorter-history names fail explicitly
     benchmark: SPY                         # Market-relative-strength benchmark
     industry_min_peers: 5                  # Minimum known/fresh peers for industry-relative strength

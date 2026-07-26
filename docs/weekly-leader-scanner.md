@@ -51,7 +51,9 @@ leaders.
 
 The default history requirement is 253 completed sessions. New IPOs with less
 history receive `insufficient_history`; the scanner does not redefine their
-52-week high as a since-IPO high.
+52-week high as a since-IPO high. Configuration validation converts any custom
+session requirement to a conservative calendar-day window (252 sessions/year
+plus a two-week buffer), preventing an impossible fetch configuration.
 
 ## Measurements
 
