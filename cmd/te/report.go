@@ -77,6 +77,84 @@ func init() {
 	scannerFunnelCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
 	scannerFunnelCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
 	reportCmd.AddCommand(scannerFunnelCmd)
+
+	weeklyLeadersCmd := &cobra.Command{
+		Use:   "weekly-leaders",
+		Short: "Report prospective full-universe leadership breadth and turnover",
+		RunE:  runReportWeeklyLeaders,
+	}
+	weeklyLeadersCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
+	weeklyLeadersCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
+	reportCmd.AddCommand(weeklyLeadersCmd)
+}
+
+func runReportWeeklyLeaders(cmd *cobra.Command, _ []string) error {
+	if _, err := config.Load(); err != nil {
+		return err
+	}
+	ctx := cmd.Context()
+	if err := store.Connect(ctx); err != nil {
+		return fmt.Errorf("database: %w", err)
+	}
+	defer store.Close()
+
+	now := time.Now()
+	from, to := now.AddDate(0, 0, -30), now.AddDate(0, 0, 1)
+	if value, _ := cmd.Flags().GetString("from"); value != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+		if err != nil {
+			return fmt.Errorf("invalid --from date: %w", err)
+		}
+		from = parsed
+	}
+	if value, _ := cmd.Flags().GetString("to"); value != "" {
+		parsed, err := time.ParseInLocation("2006-01-02", value, time.Local)
+		if err != nil {
+			return fmt.Errorf("invalid --to date: %w", err)
+		}
+		to = parsed.AddDate(0, 0, 1)
+	}
+	if !from.Before(to) {
+		return fmt.Errorf("--from must be before --to")
+	}
+	runs, err := store.ListCompletedWeeklyLeaderRuns(ctx, from, to)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Prospective weekly-leader study  %s → %s\n",
+		from.Format("2006-01-02"), to.Add(-time.Nanosecond).Format("2006-01-02"))
+	if len(runs) == 0 {
+		fmt.Println("No completed weekly-leader runs.")
+		return nil
+	}
+	fmt.Printf("%-12s %9s %9s %9s %9s %9s %9s %10s %10s\n",
+		"SESSION", "ELIGIBLE", "SCORED", "LEADERS", "ADDED", "REMOVED",
+		"PERSIST", "BREADTH", "COVERAGE")
+	fmt.Println(strings.Repeat("─", 102))
+	var eligible, evaluated, qualified, failures, added, removed, persistent int
+	var breadth, coverage float64
+	for _, run := range runs {
+		fmt.Printf("%-12s %9d %9d %9d %9d %9d %9d %9.2f%% %9.2f%%\n",
+			run.SessionDate.Format("2006-01-02"), run.EligibleUniverseCount,
+			run.EvaluatedCount, run.QualifiedCount, run.AddedCount,
+			run.RemovedCount, run.PersistentCount, run.LeaderBreadth*100,
+			run.EvaluationCoverage*100)
+		eligible += run.EligibleUniverseCount
+		evaluated += run.EvaluatedCount
+		qualified += run.QualifiedCount
+		failures += run.FailureCount
+		added += run.AddedCount
+		removed += run.RemovedCount
+		persistent += run.PersistentCount
+		breadth += run.LeaderBreadth
+		coverage += run.EvaluationCoverage
+	}
+	fmt.Printf("\nRuns: %d · observations: %d · evaluated: %d · leaders: %d · failures: %d\n",
+		len(runs), eligible, evaluated, qualified, failures)
+	fmt.Printf("Transitions: +%d / −%d / %d persistent · average breadth %.2f%% · average coverage %.2f%%\n",
+		added, removed, persistent, breadth/float64(len(runs))*100,
+		coverage/float64(len(runs))*100)
+	return nil
 }
 
 func runReportScannerFunnel(cmd *cobra.Command, _ []string) error {

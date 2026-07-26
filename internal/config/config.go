@@ -1170,6 +1170,11 @@ type ScannerConfig struct {
 	// unchanged until an operator explicitly opts in.
 	Universe UniverseConfig `yaml:"universe"`
 
+	// WeeklyLeader configures the deterministic, full-universe leadership scan.
+	// It runs after completed US sessions and only contributes candidates to the
+	// normal scanner gate; it never grants trade permission by itself.
+	WeeklyLeader WeeklyLeaderConfig `yaml:"weekly_leader"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1178,6 +1183,25 @@ type ScannerConfig struct {
 	// sentiment-strong news on a manually-watched ticker fans out to its graph
 	// neighbours as candidates, carrying the triggering headline as the thesis.
 	NewsSympathy NewsSympathyConfig `yaml:"news_sympathy"`
+}
+
+// WeeklyLeaderConfig controls the point-in-time weekly-leadership lens. The
+// name describes its multi-week horizons; snapshots run after every completed
+// session so breadth expansion and contraction remain observable.
+type WeeklyLeaderConfig struct {
+	Enabled                bool    `yaml:"enabled"`
+	PromoteCandidates      bool    `yaml:"promote_candidates"`
+	AfterCloseDelayMinutes int     `yaml:"after_close_delay_minutes"`
+	UniverseMaxAgeHours    int     `yaml:"universe_max_age_hours"`
+	HistoryCalendarDays    int     `yaml:"history_calendar_days"`
+	MinHistorySessions     int     `yaml:"min_history_sessions"`
+	Benchmark              string  `yaml:"benchmark"`
+	IndustryMinPeers       int     `yaml:"industry_min_peers"`
+	SelectionPercentile    float64 `yaml:"selection_percentile"`
+	MinCompositeScore      float64 `yaml:"min_composite_score"`
+	MinFeatureCoverage     float64 `yaml:"min_feature_coverage"`
+	BatchSize              int     `yaml:"batch_size"`
+	RunLeaseMinutes        int     `yaml:"run_lease_minutes"`
 }
 
 // UniverseConfig controls construction and caching of the point-in-time stock
@@ -2041,6 +2065,47 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, fmt.Sprintf(
 				"scanner.universe.missing_market_data_policy must be one of exclude|include, got %q",
 				universe.MissingMarketDataPolicy))
+		}
+	}
+	if leader := cfg.Scanner.WeeklyLeader; leader.Enabled {
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, "scanner.weekly_leader requires scanner.enabled=true")
+		}
+		if !cfg.Scanner.Universe.Enabled {
+			errs = append(errs, "scanner.weekly_leader requires scanner.universe.enabled=true")
+		}
+		if leader.AfterCloseDelayMinutes < 0 {
+			errs = append(errs, "scanner.weekly_leader.after_close_delay_minutes must be >= 0")
+		}
+		if leader.UniverseMaxAgeHours <= 0 {
+			errs = append(errs, "scanner.weekly_leader.universe_max_age_hours must be > 0")
+		}
+		if leader.HistoryCalendarDays < 400 {
+			errs = append(errs, "scanner.weekly_leader.history_calendar_days must be >= 400")
+		}
+		if leader.MinHistorySessions < 253 {
+			errs = append(errs, "scanner.weekly_leader.min_history_sessions must be >= 253")
+		}
+		if strings.TrimSpace(leader.Benchmark) == "" {
+			errs = append(errs, "scanner.weekly_leader.benchmark must not be blank")
+		}
+		if leader.IndustryMinPeers <= 0 {
+			errs = append(errs, "scanner.weekly_leader.industry_min_peers must be > 0")
+		}
+		if leader.SelectionPercentile <= 0 || leader.SelectionPercentile >= 1 {
+			errs = append(errs, "scanner.weekly_leader.selection_percentile must be between 0 and 1")
+		}
+		if leader.MinCompositeScore <= 0 || leader.MinCompositeScore > 1 {
+			errs = append(errs, "scanner.weekly_leader.min_composite_score must be in (0,1]")
+		}
+		if leader.MinFeatureCoverage <= 0 || leader.MinFeatureCoverage > 1 {
+			errs = append(errs, "scanner.weekly_leader.min_feature_coverage must be in (0,1]")
+		}
+		if leader.BatchSize <= 0 {
+			errs = append(errs, "scanner.weekly_leader.batch_size must be > 0")
+		}
+		if leader.RunLeaseMinutes <= 0 {
+			errs = append(errs, "scanner.weekly_leader.run_lease_minutes must be > 0")
 		}
 	}
 

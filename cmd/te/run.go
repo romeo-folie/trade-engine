@@ -871,6 +871,31 @@ Modes:
 				if tgBot != nil {
 					mscanner.Notifier = tgBot
 				}
+				if cfg.Scanner.WeeklyLeader.Enabled {
+					leaderRunner := &scanner.WeeklyLeaderRunner{
+						Provider: data.NewAlpacaUniverseClient(
+							alpacaClient, cfg.Markets.Stocks.BaseURL,
+						),
+						Cfg: cfg.Scanner.WeeklyLeader,
+					}
+					leaderScheduler := &scanner.WeeklyLeaderScheduler{
+						Cfg: cfg.Scanner.WeeklyLeader,
+						Job: leaderRunner,
+					}
+					go func() {
+						if err := leaderScheduler.Run(ctx); err != nil &&
+							err != context.Canceled {
+							logger.Warn("weekly leader scheduler stopped with error",
+								"err", err.Error())
+						}
+					}()
+					logger.Info("weekly leader scanner started",
+						"after_close_delay_minutes",
+						cfg.Scanner.WeeklyLeader.AfterCloseDelayMinutes,
+						"promote_candidates",
+						cfg.Scanner.WeeklyLeader.PromoteCandidates,
+					)
+				}
 				go func() {
 					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
 						logger.Warn("market scanner stopped with error", "err", err.Error())

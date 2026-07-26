@@ -15,20 +15,78 @@ var nyLoc = func() *time.Location {
 	return loc
 }()
 
-// IsMarketOpen returns true if the stock market is open at the given time.
-// Open = Monday–Friday, 09:30–16:00 US/Eastern, excluding US stock exchange holidays.
-func IsMarketOpen(t time.Time) bool {
+// USMarketSession is an official regular-hours US equity session. Date, Open,
+// and Close are expressed in America/New_York and therefore remain DST-safe.
+type USMarketSession struct {
+	Date  time.Time
+	Open  time.Time
+	Close time.Time
+}
+
+// MarketSessionForDate returns the regular session for the Eastern calendar
+// date containing t. Weekends and exchange holidays return ok=false.
+func MarketSessionForDate(t time.Time) (session USMarketSession, ok bool) {
 	et := t.In(nyLoc)
-	weekday := et.Weekday()
-	if weekday == time.Saturday || weekday == time.Sunday {
+	date := time.Date(et.Year(), et.Month(), et.Day(), 0, 0, 0, 0, nyLoc)
+	if !IsTradingDay(date) {
+		return USMarketSession{}, false
+	}
+	closeHour := 16
+	if isEarlyClose(date) {
+		closeHour = 13
+	}
+	return USMarketSession{
+		Date:  date,
+		Open:  time.Date(et.Year(), et.Month(), et.Day(), 9, 30, 0, 0, nyLoc),
+		Close: time.Date(et.Year(), et.Month(), et.Day(), closeHour, 0, 0, 0, nyLoc),
+	}, true
+}
+
+// IsTradingDay reports whether t's Eastern calendar date is an exchange
+// session, independently of the time of day.
+func IsTradingDay(t time.Time) bool {
+	et := t.In(nyLoc)
+	return et.Weekday() != time.Saturday && et.Weekday() != time.Sunday &&
+		!isUSHoliday(et)
+}
+
+// IsMarketOpen returns true if the stock market is open at the given time.
+// The close is 13:00 on recognized early-close sessions and 16:00 otherwise.
+func IsMarketOpen(t time.Time) bool {
+	session, ok := MarketSessionForDate(t)
+	if !ok {
 		return false
 	}
-	if isUSHoliday(et) {
-		return false
+	return !t.Before(session.Open) && t.Before(session.Close)
+}
+
+// MostRecentCompletedMarketSession returns the newest session whose
+// close+delay is at or before now. It supports durable startup catch-up.
+func MostRecentCompletedMarketSession(now time.Time, delay time.Duration) USMarketSession {
+	et := now.In(nyLoc)
+	for offset := 0; ; offset++ {
+		candidate := et.AddDate(0, 0, -offset)
+		session, ok := MarketSessionForDate(candidate)
+		if ok && !now.Before(session.Close.Add(delay)) {
+			return session
+		}
 	}
-	h, m, _ := et.Clock()
-	openMinutes := h*60 + m
-	return openMinutes >= 9*60+30 && openMinutes < 16*60
+}
+
+// NextMarketCloseRun returns the first future session close plus delay.
+func NextMarketCloseRun(now time.Time, delay time.Duration) (USMarketSession, time.Time) {
+	et := now.In(nyLoc)
+	for offset := 0; ; offset++ {
+		candidate := et.AddDate(0, 0, offset)
+		session, ok := MarketSessionForDate(candidate)
+		if !ok {
+			continue
+		}
+		runAt := session.Close.Add(delay)
+		if runAt.After(now) {
+			return session, runAt
+		}
+	}
 }
 
 // NextTickTime returns the next scheduled tick time starting from 'now'.
@@ -51,12 +109,38 @@ func nextMarketOpen(t time.Time) time.Time {
 		candidate = candidate.AddDate(0, 0, 1)
 	}
 	for {
-		wd := candidate.Weekday()
-		if wd != time.Saturday && wd != time.Sunday && !isUSHoliday(candidate) {
+		if IsTradingDay(candidate) {
 			return candidate
 		}
 		candidate = candidate.AddDate(0, 0, 1)
 	}
+}
+
+// isEarlyClose covers the recurring NYSE 13:00 closes used by the scanner:
+// the day after Thanksgiving, Christmas Eve when it is a trading day, and the
+// final trading session before a Saturday Independence Day.
+func isEarlyClose(t time.Time) bool {
+	et := t.In(nyLoc)
+	year := et.Year()
+	thanksgiving := nthWeekday(year, time.November, time.Thursday, 4)
+	if sameDate(et, thanksgiving.AddDate(0, 0, 1)) {
+		return true
+	}
+	if et.Month() == time.December && et.Day() == 24 {
+		return true
+	}
+	if et.Month() == time.July && et.Day() == 3 {
+		return true
+	}
+	julyFourth := time.Date(year, time.July, 4, 0, 0, 0, 0, nyLoc)
+	return julyFourth.Weekday() == time.Saturday &&
+		et.Month() == time.July && et.Day() == 2
+}
+
+func sameDate(left, right time.Time) bool {
+	ly, lm, ld := left.In(nyLoc).Date()
+	ry, rm, rd := right.In(nyLoc).Date()
+	return ly == ry && lm == rm && ld == rd
 }
 
 // ── US stock exchange holiday calendar ───────────────────────────────────────
@@ -89,14 +173,14 @@ func isUSHoliday(t time.Time) bool {
 func usHolidays(year int) []time.Time {
 	h := []time.Time{
 		observeHoliday(time.Date(year, time.January, 1, 0, 0, 0, 0, nyLoc)),   // New Year's Day
-		nthWeekday(year, time.January, time.Monday, 3),                          // MLK Day (3rd Mon Jan)
-		nthWeekday(year, time.February, time.Monday, 3),                         // Presidents' Day (3rd Mon Feb)
-		goodFriday(year),                                                          // Good Friday
-		lastWeekday(year, time.May, time.Monday),                                 // Memorial Day (last Mon May)
+		nthWeekday(year, time.January, time.Monday, 3),                         // MLK Day (3rd Mon Jan)
+		nthWeekday(year, time.February, time.Monday, 3),                        // Presidents' Day (3rd Mon Feb)
+		goodFriday(year),                                                       // Good Friday
+		lastWeekday(year, time.May, time.Monday),                               // Memorial Day (last Mon May)
 		observeHoliday(time.Date(year, time.June, 19, 0, 0, 0, 0, nyLoc)),      // Juneteenth
 		observeHoliday(time.Date(year, time.July, 4, 0, 0, 0, 0, nyLoc)),       // Independence Day
-		nthWeekday(year, time.September, time.Monday, 1),                         // Labor Day (1st Mon Sep)
-		nthWeekday(year, time.November, time.Thursday, 4),                        // Thanksgiving (4th Thu Nov)
+		nthWeekday(year, time.September, time.Monday, 1),                        // Labor Day (1st Mon Sep)
+		nthWeekday(year, time.November, time.Thursday, 4),                       // Thanksgiving (4th Thu Nov)
 		observeHoliday(time.Date(year, time.December, 25, 0, 0, 0, 0, nyLoc)), // Christmas
 	}
 	return h

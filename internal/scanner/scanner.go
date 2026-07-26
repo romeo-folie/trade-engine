@@ -121,7 +121,16 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 // runScan executes one full scan cycle.
 func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
+	weeklyCandidates, err := s.weeklyLeaderCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("load weekly leader candidates: %w", err)
+	}
 	recorder := newScanRecorder(s, start)
+	if len(weeklyCandidates) > 0 {
+		recorder.run.UniverseVersionID = weeklyCandidates[0].UniverseVersionID
+		asOf := weeklyCandidates[0].UniverseAsOf
+		recorder.run.UniverseAsOf = &asOf
+	}
 	recorder.begin(ctx)
 	defer func() { recorder.finish(scanErr) }()
 
@@ -167,6 +176,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		candidates = append(candidates, graphCands...)
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
+	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	recorder.register(candidates)
 
 	if len(candidates) == 0 {
@@ -203,6 +213,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		beforeRequalificationFilter := candidates
 		candidates = filterUnavailableRequalifications(candidates, requalificationRequired)
 		recorder.markRemoved(beforeRequalificationFilter, candidates, "requalification_unavailable")
+		s.markWeeklyLeaderCandidates(ctx, beforeRequalificationFilter, candidates,
+			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
 	// 3.5 Dedup against the active watchlist only after universe selection.
@@ -212,6 +224,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("filter watchlist: %w", err)
 	}
 	recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
+	s.markWeeklyLeaderCandidates(ctx, beforeWatchlistFilter, candidates,
+		"active_watchlist", recorder.run.ID, "already active on watchlist")
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -232,6 +246,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				snapshot.FinalStage = "candidate_cap"
 			}
 		}
+		s.markWeeklyLeaderCandidates(ctx, candidates, nil,
+			"cap_suppressed", recorder.run.ID, "scanner candidate cap reached")
 		return nil // cap reached; nothing to add until items expire
 	}
 
@@ -249,9 +265,12 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		result, err := s.scoreCandidate(ctx, c)
 		recorder.scored(c, result, err, s.Cfg.MinConviction)
 		if err != nil {
+			s.markWeeklyLeaderCandidate(ctx, c, "failed", recorder.run.ID, err.Error())
 			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
 		}
+		s.markWeeklyLeaderCandidate(ctx, c, "promoted", recorder.run.ID,
+			"evaluated by normal scanner conviction gate")
 		slog.Info("scanner: candidate scored",
 			"ticker", c.Ticker,
 			"action", result.Action,
@@ -280,6 +299,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			timeframes = []string{"1H", "4H"}
 		}
 		strategies := candidateStrategies(sc.score.Strategy, sc.candidate.PullbackQualified)
+		if hasSource(sc.candidate.Sources, "weekly_leader") {
+			strategies = appendUniqueStrategy(strategies, "weekly_leader")
+		}
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -445,6 +467,24 @@ func candidateStrategies(primary string, pullbackQualified bool) []string {
 		strategies = append(strategies, "pullback_strength")
 	}
 	return strategies
+}
+
+func hasSource(sources []string, target string) bool {
+	for _, source := range sources {
+		if source == target {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniqueStrategy(strategies []string, strategy string) []string {
+	for _, existing := range strategies {
+		if existing == strategy {
+			return strategies
+		}
+	}
+	return append(strategies, strategy)
 }
 
 // fetchCandidates pulls top movers and most-active stocks and merges them.

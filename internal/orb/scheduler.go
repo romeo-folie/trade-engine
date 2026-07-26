@@ -2824,7 +2824,5 @@ func parseORBResult(rawResponse string, fallback analysis.AnalysisResponse) ORBA
 
 // IsTradingDay checks if the given time falls on a trading day.
 func IsTradingDay(t time.Time) bool {
-	et := t.In(nyLoc)
-	noon := time.Date(et.Year(), et.Month(), et.Day(), 12, 0, 0, 0, nyLoc)
-	return engine.IsMarketOpen(noon)
+	return engine.IsTradingDay(t)
 }

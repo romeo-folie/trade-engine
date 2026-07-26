@@ -1,0 +1,316 @@
+package scanner
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/engine"
+	"github.com/romeo-folie/trade-engine/internal/store"
+)
+
+// WeeklyLeaderRunner evaluates the complete eligible point-in-time universe.
+// It has no execution dependency: qualified rows become optional inputs to the
+// existing scanner/LLM/watchlist path only.
+type WeeklyLeaderRunner struct {
+	Provider data.BulkDailyBarsProvider
+	Cfg      config.WeeklyLeaderConfig
+	Now      func() time.Time
+}
+
+func (r *WeeklyLeaderRunner) RunSession(
+	ctx context.Context, session engine.USMarketSession, decisionAt time.Time,
+) (runErr error) {
+	if !r.Cfg.Enabled {
+		return nil
+	}
+	if r.Provider == nil {
+		return fmt.Errorf("weekly leader daily-bars provider is required")
+	}
+	if decisionAt.Before(session.Close) {
+		return fmt.Errorf("weekly leader decision time precedes session close")
+	}
+	startedAt := r.now().UTC()
+	maxAge := time.Duration(r.Cfg.UniverseMaxAgeHours) * time.Hour
+	if maxAge <= 0 {
+		maxAge = 36 * time.Hour
+	}
+	universe, err := store.GetUsableSwingUniverseVersion(ctx, decisionAt, maxAge)
+	if err != nil {
+		return fmt.Errorf("load weekly leader universe: %w", err)
+	}
+	if universe == nil {
+		return fmt.Errorf("no completed swing universe available at %s within %s",
+			decisionAt.Format(time.RFC3339), maxAge)
+	}
+	members, err := store.ListEligibleSwingUniverseMembers(ctx, universe.ID)
+	if err != nil {
+		return fmt.Errorf("list weekly leader universe members: %w", err)
+	}
+	snapshot, configHash, err := weeklyLeaderConfigEvidence(r.Cfg)
+	if err != nil {
+		return err
+	}
+	benchmark := strings.ToUpper(strings.TrimSpace(r.Cfg.Benchmark))
+	if benchmark == "" {
+		benchmark = "SPY"
+	}
+	lease := time.Duration(r.Cfg.RunLeaseMinutes) * time.Minute
+	if lease <= 0 {
+		lease = time.Hour
+	}
+	claimed, ok, err := store.ClaimWeeklyLeaderRun(ctx, store.WeeklyLeaderRun{
+		SessionDate:       session.Date,
+		AsOf:              session.Close,
+		DecisionAt:        decisionAt,
+		UniverseVersionID: universe.ID,
+		StartedAt:         startedAt,
+		ConfigHash:        configHash,
+		ConfigSnapshot:    snapshot,
+		FeatureVersion:    weeklyLeaderFeatureVersion,
+		Benchmark:         benchmark,
+		HistoryProvider:   universe.Provider,
+	}, lease)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		slog.Info("weekly leader: session already completed or actively claimed",
+			"session_date", session.Date.Format("2006-01-02"),
+			"universe_version_id", universe.ID)
+		return nil
+	}
+	defer func() {
+		if runErr == nil {
+			return
+		}
+		failCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		if err := store.FailWeeklyLeaderRun(
+			failCtx, claimed.ID, claimed.AttemptCount, r.now().UTC(), runErr,
+		); err != nil {
+			slog.Error("weekly leader: failed to persist run failure",
+				"run_id", claimed.ID, "err", err)
+		}
+	}()
+
+	symbols := make([]string, 0, len(members)+1)
+	for _, member := range members {
+		symbols = append(symbols, member.Ticker)
+	}
+	symbols = append(symbols, benchmark)
+	sort.Strings(symbols)
+	symbols = deduplicateStrings(symbols)
+	historyDays := r.Cfg.HistoryCalendarDays
+	if historyDays <= 0 {
+		historyDays = 420
+	}
+	batchSize := r.Cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = 200
+	}
+	history, err := r.Provider.FetchDailyBars(
+		ctx, symbols, session.Close.AddDate(0, 0, -historyDays), session.Close, batchSize,
+	)
+	if err != nil {
+		return fmt.Errorf("fetch weekly leader daily bars: %w", err)
+	}
+	benchmarkBarSetHash := ""
+	if completedBenchmark, validationErr := completedDailyBars(
+		history.Bars[benchmark], session.Close,
+	); validationErr == nil {
+		benchmarkBarSetHash = weeklyLeaderBarSetHash(completedBenchmark)
+	}
+	evaluations := EvaluateWeeklyLeaders(
+		members, history.Bars, history.Bars[benchmark],
+		session.Close, decisionAt, r.Cfg,
+	)
+	for i := range evaluations {
+		if failure, exists := history.Failures[evaluations[i].Ticker]; exists {
+			evaluations[i].Outcome = "failed"
+			evaluations[i].Qualified = false
+			evaluations[i].FailureStage = "provider_history"
+			evaluations[i].FailureReason = failure.Error()
+		}
+	}
+	if failure, exists := history.Failures[benchmark]; exists {
+		for i := range evaluations {
+			evaluations[i].Outcome = "failed"
+			evaluations[i].Qualified = false
+			evaluations[i].FailureStage = "benchmark_history"
+			evaluations[i].FailureReason = failure.Error()
+		}
+	}
+	qualifications, err := weeklyLeaderQualifications(
+		claimed.ID, universe.ID, universe.Provider, session.Close,
+		evaluations, r.Cfg.PromoteCandidates,
+	)
+	if err != nil {
+		return err
+	}
+	if err := store.CompleteWeeklyLeaderRun(
+		ctx, claimed.ID, claimed.AttemptCount, r.now().UTC(), qualifications,
+		benchmarkBarSetHash,
+	); err != nil {
+		return err
+	}
+	qualified := 0
+	for _, evaluation := range evaluations {
+		if evaluation.Qualified {
+			qualified++
+		}
+	}
+	slog.Info("weekly leader: session completed",
+		"run_id", claimed.ID,
+		"session_date", session.Date.Format("2006-01-02"),
+		"eligible", len(members),
+		"qualified", qualified,
+		"breadth", fraction(qualified, len(members)),
+	)
+	return nil
+}
+
+func weeklyLeaderQualifications(
+	runID, universeVersionID, provider string,
+	asOf time.Time,
+	evaluations []WeeklyLeaderEvaluation,
+	promote bool,
+) ([]store.WeeklyLeaderQualification, error) {
+	out := make([]store.WeeklyLeaderQualification, 0, len(evaluations))
+	for _, evaluation := range evaluations {
+		q := store.WeeklyLeaderQualification{
+			RunID: runID, UniverseVersionID: universeVersionID,
+			Ticker: evaluation.Ticker, Outcome: evaluation.Outcome,
+			FailureStage: evaluation.FailureStage, FailureReason: evaluation.FailureReason,
+			HistoryFirstAt: evaluation.HistoryFirstAt, HistoryLastAt: evaluation.HistoryLastAt,
+			HistorySessions: evaluation.HistorySessions, BarSetHash: evaluation.BarSetHash,
+			Sector:   evaluation.Sector,
+			Industry: evaluation.Industry, MarketCapBand: evaluation.MarketCapBand,
+			VolatilityBand:  evaluation.VolatilityBand,
+			CompositeScore:  evaluation.CompositeScore,
+			ScorePercentile: evaluation.Percentile, Rank: evaluation.Rank,
+			PromotionStatus: "not_requested",
+		}
+		q.SourceEvidence, _ = json.Marshal(map[string]any{
+			"provider":     provider,
+			"timeframe":    string(data.Timeframe1Day),
+			"adjustment":   "split",
+			"feed":         "iex",
+			"as_of":        asOf.UTC().Format(time.RFC3339Nano),
+			"bar_set_hash": evaluation.BarSetHash,
+		})
+		if promote && evaluation.Qualified {
+			q.PromotionStatus = "pending"
+		}
+		if evaluation.Features != nil {
+			f := evaluation.Features
+			q.Return5, q.Return20, q.Return60, q.Return126 =
+				floatPtr(f.Return5), floatPtr(f.Return20), floatPtr(f.Return60), floatPtr(f.Return126)
+			q.High52WeekProximity = floatPtr(f.High52WeekProximity)
+			marketRS := mean(f.MarketRS20, f.MarketRS60, f.MarketRS126)
+			q.MarketRelativeStrength = floatPtr(marketRS)
+			q.IndustryRelativeStrength = f.IndustryRS60
+			q.RSAcceleration = floatPtr(f.RSAcceleration)
+			q.RegressionAnnualizedSlope = floatPtr(f.RegressionAnnualizedSlope)
+			q.RegressionR2 = floatPtr(f.RegressionR2)
+			q.Efficiency60 = floatPtr(f.Efficiency60)
+			q.MaxDrawdown126 = floatPtr(f.MaxDrawdown126)
+			q.NATR14 = floatPtr(f.NATR14)
+			q.VolatilityAdjustedReturn = floatPtr(f.VolAdjustedReturn60)
+			q.MedianDollarVolume20 = floatPtr(f.MedianDollarVolume20)
+			q.DollarVolumeStability20 = floatPtr(f.DollarVolumeStability20)
+			q.NormalizedOBV20 = floatPtr(f.NormalizedOBV20)
+			q.CMF20 = floatPtr(f.CMF20)
+			q.GapDomination60 = floatPtr(f.GapDomination60)
+			encoded, err := json.Marshal(f)
+			if err != nil {
+				return nil, fmt.Errorf("marshal %s weekly leader features: %w", q.Ticker, err)
+			}
+			q.Features = encoded
+		}
+		if evaluation.Components != nil {
+			q.FeatureCoverage = floatPtr(evaluation.Components.FeatureCoverage)
+			encoded, err := json.Marshal(evaluation.Components)
+			if err != nil {
+				return nil, fmt.Errorf("marshal %s weekly leader components: %w", q.Ticker, err)
+			}
+			q.Components = encoded
+		}
+		out = append(out, q)
+	}
+	return out, nil
+}
+
+func weeklyLeaderConfigEvidence(
+	cfg config.WeeklyLeaderConfig,
+) (json.RawMessage, string, error) {
+	evidence := struct {
+		FeatureVersion string                    `json:"feature_version"`
+		Config         config.WeeklyLeaderConfig `json:"config"`
+	}{FeatureVersion: weeklyLeaderFeatureVersion, Config: cfg}
+	encoded, err := json.Marshal(evidence)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal weekly leader config: %w", err)
+	}
+	// Operational switches and timer/lease/batch settings do not change a
+	// ticker's score. Keeping them out of the compatibility hash preserves
+	// transition history across observation/promotion and deployment changes.
+	scoringConfig := struct {
+		FeatureVersion      string  `json:"feature_version"`
+		MinHistorySessions  int     `json:"min_history_sessions"`
+		Benchmark           string  `json:"benchmark"`
+		IndustryMinPeers    int     `json:"industry_min_peers"`
+		SelectionPercentile float64 `json:"selection_percentile"`
+		MinCompositeScore   float64 `json:"min_composite_score"`
+		MinFeatureCoverage  float64 `json:"min_feature_coverage"`
+	}{
+		FeatureVersion:      weeklyLeaderFeatureVersion,
+		MinHistorySessions:  cfg.MinHistorySessions,
+		Benchmark:           strings.ToUpper(strings.TrimSpace(cfg.Benchmark)),
+		IndustryMinPeers:    cfg.IndustryMinPeers,
+		SelectionPercentile: cfg.SelectionPercentile,
+		MinCompositeScore:   cfg.MinCompositeScore,
+		MinFeatureCoverage:  cfg.MinFeatureCoverage,
+	}
+	scoringEvidence, err := json.Marshal(scoringConfig)
+	if err != nil {
+		return nil, "", fmt.Errorf("marshal weekly leader scoring config: %w", err)
+	}
+	sum := sha256.Sum256(scoringEvidence)
+	return encoded, hex.EncodeToString(sum[:]), nil
+}
+
+func deduplicateStrings(values []string) []string {
+	if len(values) < 2 {
+		return values
+	}
+	out := values[:1]
+	for _, value := range values[1:] {
+		if value != out[len(out)-1] {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func (r *WeeklyLeaderRunner) now() time.Time {
+	if r.Now != nil {
+		return r.Now()
+	}
+	return time.Now()
+}
+
+func fraction(numerator, denominator int) float64 {
+	if denominator == 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
+}

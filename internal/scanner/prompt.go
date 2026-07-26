@@ -30,7 +30,7 @@ type SwingCandidate struct {
 	// were available, so a legacy quarantined row may safely be reactivated
 	// whether it qualified or definitively failed the objective screen.
 	PullbackQualificationKnown bool
-	Sources                    []string // "mover" | "active" | "graph_neighbor" — what surfaced this ticker
+	Sources                    []string // "mover" | "active" | "graph_neighbor" | "weekly_leader"
 	// SourceScores retains each discovery source's independent score, including
 	// an explicit zero. It is evidence/lineage rather than an aggregate rank.
 	SourceScores     map[string]float64
@@ -41,10 +41,15 @@ type SwingCandidate struct {
 	TaxonomyAsOf     *time.Time
 	TaxonomyProvider string
 	TaxonomyEvidence json.RawMessage
-	RemovalStage     string
-	FailureStage     string
-	FailureReason    string
-	News             []SwingNewsItem
+	// WeeklyLeaderRunID links this source to its immutable full-universe
+	// evaluation. It is empty for all other discovery sources.
+	WeeklyLeaderRunID string
+	UniverseVersionID string
+	UniverseAsOf      time.Time
+	RemovalStage      string
+	FailureStage      string
+	FailureReason     string
+	News              []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.

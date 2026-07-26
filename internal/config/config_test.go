@@ -85,6 +85,75 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 	}
 }
 
+func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
+	leader := Defaults().Scanner.WeeklyLeader
+	if leader.Enabled || leader.PromoteCandidates {
+		t.Fatal("weekly leader discovery and promotion must default off")
+	}
+	if leader.AfterCloseDelayMinutes != 15 ||
+		leader.UniverseMaxAgeHours != 36 ||
+		leader.HistoryCalendarDays != 420 ||
+		leader.MinHistorySessions != 253 ||
+		leader.Benchmark != "SPY" ||
+		leader.IndustryMinPeers != 5 ||
+		leader.SelectionPercentile != 0.90 ||
+		leader.MinCompositeScore != 0.70 ||
+		leader.MinFeatureCoverage != 0.90 ||
+		leader.BatchSize != 200 ||
+		leader.RunLeaseMinutes != 60 {
+		t.Fatalf("unexpected weekly leader defaults: %+v", leader)
+	}
+}
+
+func TestValidateWeeklyLeaderConfig(t *testing.T) {
+	valid := Defaults()
+	valid.Scanner.Enabled = true
+	valid.Scanner.Universe.Enabled = true
+	valid.Scanner.WeeklyLeader.Enabled = true
+	if errs := Validate(valid); containsStr(errs, "scanner.weekly_leader") {
+		t.Fatalf("valid weekly leader config rejected: %v", errs)
+	}
+
+	disabled := Defaults()
+	disabled.Scanner.WeeklyLeader = WeeklyLeaderConfig{}
+	if errs := Validate(disabled); containsStr(errs, "scanner.weekly_leader") {
+		t.Fatalf("disabled zero-value weekly leader must preserve existing configs: %v", errs)
+	}
+
+	tests := []struct {
+		name  string
+		field string
+		apply func(*Config)
+	}{
+		{"scanner master", "requires scanner.enabled", func(c *Config) { c.Scanner.Enabled = false }},
+		{"universe master", "requires scanner.universe.enabled", func(c *Config) { c.Scanner.Universe.Enabled = false }},
+		{"delay", "after_close_delay_minutes", func(c *Config) { c.Scanner.WeeklyLeader.AfterCloseDelayMinutes = -1 }},
+		{"universe age", "universe_max_age_hours", func(c *Config) { c.Scanner.WeeklyLeader.UniverseMaxAgeHours = 0 }},
+		{"calendar history", "history_calendar_days", func(c *Config) { c.Scanner.WeeklyLeader.HistoryCalendarDays = 399 }},
+		{"session history", "min_history_sessions", func(c *Config) { c.Scanner.WeeklyLeader.MinHistorySessions = 252 }},
+		{"benchmark", "benchmark", func(c *Config) { c.Scanner.WeeklyLeader.Benchmark = " " }},
+		{"peers", "industry_min_peers", func(c *Config) { c.Scanner.WeeklyLeader.IndustryMinPeers = 0 }},
+		{"selection", "selection_percentile", func(c *Config) { c.Scanner.WeeklyLeader.SelectionPercentile = 1 }},
+		{"score", "min_composite_score", func(c *Config) { c.Scanner.WeeklyLeader.MinCompositeScore = 1.1 }},
+		{"coverage", "min_feature_coverage", func(c *Config) { c.Scanner.WeeklyLeader.MinFeatureCoverage = 0 }},
+		{"batch", "batch_size", func(c *Config) { c.Scanner.WeeklyLeader.BatchSize = 0 }},
+		{"lease", "run_lease_minutes", func(c *Config) { c.Scanner.WeeklyLeader.RunLeaseMinutes = 0 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Defaults()
+			cfg.Scanner.Enabled = true
+			cfg.Scanner.Universe.Enabled = true
+			cfg.Scanner.WeeklyLeader.Enabled = true
+			tt.apply(cfg)
+			if !containsStr(Validate(cfg), "scanner.weekly_leader."+tt.field) &&
+				!containsStr(Validate(cfg), "scanner.weekly_leader "+tt.field) {
+				t.Fatalf("invalid %s not rejected: %v", tt.field, Validate(cfg))
+			}
+		})
+	}
+}
+
 func TestValidateScannerUniverseConfig(t *testing.T) {
 	cfg := Defaults()
 	cfg.Scanner.Universe.Enabled = true

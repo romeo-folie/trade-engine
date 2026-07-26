@@ -31,6 +31,8 @@ func TestIsMarketOpen(t *testing.T) {
 		{name: "holiday new year", ts: "2024-01-01T12:00:00", want: false},
 		{name: "holiday christmas", ts: "2024-12-25T12:00:00", want: false},
 		{name: "holiday new year observed prior year", ts: "2021-12-31T12:00:00", want: false},
+		{name: "black friday before early close", ts: "2024-11-29T12:59:59", want: true},
+		{name: "black friday early close", ts: "2024-11-29T13:00:00", want: false},
 	}
 
 	for _, tt := range tests {
@@ -41,6 +43,55 @@ func TestIsMarketOpen(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMarketCloseScheduling(t *testing.T) {
+	t.Run("regular session and DST-safe UTC conversion", func(t *testing.T) {
+		winter, ok := MarketSessionForDate(mustParseNY(t, "2024-01-16T12:00:00"))
+		if !ok {
+			t.Fatal("winter trading session not found")
+		}
+		summer, ok := MarketSessionForDate(mustParseNY(t, "2024-07-08T12:00:00"))
+		if !ok {
+			t.Fatal("summer trading session not found")
+		}
+		if got := winter.Close.UTC().Hour(); got != 21 {
+			t.Fatalf("winter close UTC hour = %d, want 21", got)
+		}
+		if got := summer.Close.UTC().Hour(); got != 20 {
+			t.Fatalf("summer close UTC hour = %d, want 20", got)
+		}
+	})
+
+	t.Run("black friday closes at thirteen hundred", func(t *testing.T) {
+		session, ok := MarketSessionForDate(mustParseNY(t, "2024-11-29T09:00:00"))
+		if !ok {
+			t.Fatal("black Friday trading session not found")
+		}
+		if got := session.Close.In(nyLoc).Hour(); got != 13 {
+			t.Fatalf("Black Friday close = %d:00, want 13:00", got)
+		}
+	})
+
+	t.Run("startup after weekend catches up Friday once", func(t *testing.T) {
+		now := mustParseNY(t, "2024-03-17T10:00:00")
+		session := MostRecentCompletedMarketSession(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2024-03-15" {
+			t.Fatalf("completed session = %s, want Friday 2024-03-15", got)
+		}
+	})
+
+	t.Run("next run skips holiday and uses close delay", func(t *testing.T) {
+		now := mustParseNY(t, "2024-01-12T17:00:00")
+		session, runAt := NextMarketCloseRun(now, 15*time.Minute)
+		if got := session.Date.Format("2006-01-02"); got != "2024-01-16" {
+			t.Fatalf("next session = %s, want 2024-01-16", got)
+		}
+		want := mustParseNY(t, "2024-01-16T16:15:00")
+		if !runAt.Equal(want) {
+			t.Fatalf("next run = %v, want %v", runAt, want)
+		}
+	})
 }
 
 func TestNextTickTime(t *testing.T) {
@@ -173,7 +224,7 @@ func TestStartupSkipDecision(t *testing.T) {
 	tests := []struct {
 		name         string
 		now          string
-		lastAnalysis *time.Time  // nil → no prior analyses
+		lastAnalysis *time.Time // nil → no prior analyses
 		wantSkip     bool
 		wantNextTick string // empty string → zero value (don't check)
 	}{
@@ -211,7 +262,7 @@ func TestStartupSkipDecision(t *testing.T) {
 		},
 		{
 			name:         "recent analysis on friday, next tick falls on weekend — routes to monday",
-			now:          "2024-03-15T15:45:00", // Friday
+			now:          "2024-03-15T15:45:00",                      // Friday
 			lastAnalysis: ptr(mustParseNY(t, "2024-03-15T15:30:00")), // 15 min ago
 			wantSkip:     true,
 			wantNextTick: "2024-03-18T09:30:00", // 15:30+1h=16:30 Friday → Monday open

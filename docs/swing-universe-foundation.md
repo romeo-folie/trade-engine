@@ -116,8 +116,9 @@ already completed at that decision time. It lists eligible members by default;
 
 When enabled, each ordinary scanner run links itself to the latest completed
 version inside `snapshot_ttl_hours`. A missing or expired version remains
-explicit rather than falling forward. Later scanner PRs will schedule the
-refresh itself after the close and consume this linked denominator.
+explicit rather than falling forward. The after-close weekly-leader scanner
+consumes this linked denominator using its own fixed decision cutoff; see
+[`weekly-leader-scanner.md`](weekly-leader-scanner.md).
 
 Before any leadership scanner affects the watchlist, universe refreshes must run
 in observation mode and the prospective reports must show stable member counts,
