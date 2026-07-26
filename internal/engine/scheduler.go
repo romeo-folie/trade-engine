@@ -118,7 +118,7 @@ func nextMarketOpen(t time.Time) time.Time {
 
 // isEarlyClose covers the recurring NYSE 13:00 closes used by the scanner:
 // the day after Thanksgiving, Christmas Eve when it is a trading day, and the
-// the exchange's Independence Day early-close session.
+// exchange's Independence Day early-close session.
 func isEarlyClose(t time.Time) bool {
 	et := t.In(nyLoc)
 	year := et.Year()
@@ -133,8 +133,6 @@ func isEarlyClose(t time.Time) bool {
 	switch julyFourth.Weekday() {
 	case time.Tuesday, time.Wednesday, time.Thursday, time.Friday:
 		return et.Month() == time.July && et.Day() == 3
-	case time.Saturday, time.Sunday:
-		return et.Month() == time.July && et.Day() == 2
 	default:
 		return false
 	}

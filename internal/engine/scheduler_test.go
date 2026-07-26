@@ -79,11 +79,11 @@ func TestMarketCloseScheduling(t *testing.T) {
 		date     string
 		wantHour int
 	}{
-		{date: "2020-07-02T09:00:00", wantHour: 13},
-		{date: "2021-07-02T09:00:00", wantHour: 13},
+		{date: "2020-07-02T09:00:00", wantHour: 16},
+		{date: "2021-07-02T09:00:00", wantHour: 16},
 		{date: "2022-07-01T09:00:00", wantHour: 16},
 		{date: "2024-07-03T09:00:00", wantHour: 13},
-		{date: "2027-07-02T09:00:00", wantHour: 13},
+		{date: "2027-07-02T09:00:00", wantHour: 16},
 	} {
 		t.Run("independence day close "+test.date, func(t *testing.T) {
 			session, ok := MarketSessionForDate(mustParseNY(t, test.date))
@@ -96,14 +96,14 @@ func TestMarketCloseScheduling(t *testing.T) {
 		})
 	}
 
-	t.Run("sunday independence day boundary propagates to catch-up", func(t *testing.T) {
+	t.Run("sunday independence day preserves regular friday close", func(t *testing.T) {
 		now := mustParseNY(t, "2021-07-02T13:15:00")
 		session := MostRecentCompletedMarketSession(now, 15*time.Minute)
-		if got := session.Date.Format("2006-01-02"); got != "2021-07-02" {
-			t.Fatalf("completed session = %s, want 2021-07-02", got)
+		if got := session.Date.Format("2006-01-02"); got != "2021-07-01" {
+			t.Fatalf("completed session = %s, want 2021-07-01", got)
 		}
-		if got := session.Close.In(nyLoc).Hour(); got != 13 {
-			t.Fatalf("completed session close = %d:00, want 13:00", got)
+		if got := session.Close.In(nyLoc).Hour(); got != 16 {
+			t.Fatalf("completed session close = %d:00, want 16:00", got)
 		}
 	})
 
