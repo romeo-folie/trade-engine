@@ -132,6 +132,10 @@ type WeeklyLeaderCandidate struct {
 	Rank                 int
 	Sector               string
 	Industry             string
+	TaxonomyStatus       string
+	TaxonomyAsOf         *time.Time
+	TaxonomyProvider     string
+	TaxonomyEvidence     json.RawMessage
 	Price                float64
 	MarketCapMM          float64
 	Return20             float64
@@ -415,31 +419,37 @@ func CompleteWeeklyLeaderRun(
 
 // ClaimWeeklyLeaderCandidatesAsOf atomically moves every pending candidate, or
 // processing candidate whose lease expired, in the latest visible run to a
-// token-fenced processing state. Concurrent scanner processes therefore cannot
-// score the same leader, while a crashed process cannot strand work forever.
+// token-fenced processing state, but only when that run belongs to the exact
+// exchange session the caller expects. The session fence prevents a startup
+// scan from promoting stale leaders while the scheduler calculates its catch-up
+// run. Concurrent scanner processes cannot score the same leader, while a
+// crashed process cannot strand work forever.
 func ClaimWeeklyLeaderCandidatesAsOf(
 	ctx context.Context,
-	asOf, claimedAt time.Time,
+	expectedSessionDate, asOf, claimedAt time.Time,
 	lease time.Duration,
 	claimToken string,
 ) ([]WeeklyLeaderCandidate, error) {
 	if strings.TrimSpace(claimToken) == "" {
 		return nil, fmt.Errorf("weekly leader promotion claim token is required")
 	}
+	if expectedSessionDate.IsZero() {
+		return nil, fmt.Errorf("expected weekly leader promotion session is required")
+	}
 	if lease <= 0 {
 		lease = time.Hour
 	}
 	rows, err := GetDB().Query(ctx, `
 		WITH latest AS (
-			SELECT id FROM weekly_leader_runs
+			SELECT id, session_date FROM weekly_leader_runs
 			WHERE status='completed'
-			  AND decision_at <= $1::timestamptz
-			  AND completed_at <= $1::timestamptz
+			  AND decision_at <= $2::timestamptz
+			  AND completed_at <= $2::timestamptz
 			ORDER BY decision_at DESC, completed_at DESC, id DESC LIMIT 1
 		), claimable AS (
 			SELECT q.run_id, q.ticker
 			FROM weekly_leader_qualifications q
-			JOIN latest l ON l.id=q.run_id
+			JOIN latest l ON l.id=q.run_id AND l.session_date=$1::date
 			WHERE q.outcome='qualified'
 			  AND (
 			    q.promotion_status='pending'
@@ -447,7 +457,7 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 			      q.promotion_status='processing'
 			      AND (
 			        q.promotion_claimed_at IS NULL
-			        OR q.promotion_claimed_at <= $4
+			        OR q.promotion_claimed_at <= $5
 			      )
 			    )
 			  )
@@ -455,8 +465,8 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		), claimed AS (
 			UPDATE weekly_leader_qualifications q
 			SET promotion_status='processing',
-			    promotion_claim_token=$3,
-			    promotion_claimed_at=$2,
+			    promotion_claim_token=$4,
+			    promotion_claimed_at=$3,
 			    promotion_reason=NULL
 			FROM claimable c
 			WHERE q.run_id=c.run_id AND q.ticker=c.ticker
@@ -464,6 +474,8 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		)
 		SELECT q.run_id, q.universe_version_id, v.as_of, q.ticker,
 		       q.composite_score, q.rank, q.sector, q.industry,
+		       m.taxonomy_status, m.taxonomy_as_of,
+		       COALESCE(m.taxonomy_provider,''), m.taxonomy_evidence,
 		       q.close_price, COALESCE(m.market_cap_mm,0),
 		       q.return_20d, q.return_60d, q.return_126d,
 		       q.median_dollar_volume_20d, q.promotion_claim_token
@@ -472,7 +484,8 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		JOIN swing_universe_members m
 		  ON m.universe_version_id=q.universe_version_id AND m.ticker=q.ticker
 		ORDER BY q.rank, q.ticker`,
-		asOf, claimedAt, claimToken, claimedAt.Add(-lease))
+		expectedSessionDate.Format("2006-01-02"), asOf, claimedAt, claimToken,
+		claimedAt.Add(-lease))
 	if err != nil {
 		return nil, fmt.Errorf("claim pending weekly leader candidates: %w", err)
 	}
@@ -483,7 +496,10 @@ func ClaimWeeklyLeaderCandidatesAsOf(
 		if err := rows.Scan(
 			&candidate.RunID, &candidate.UniverseVersionID, &candidate.UniverseAsOf,
 			&candidate.Ticker, &candidate.Score, &candidate.Rank,
-			&candidate.Sector, &candidate.Industry, &candidate.Price,
+			&candidate.Sector, &candidate.Industry,
+			&candidate.TaxonomyStatus, &candidate.TaxonomyAsOf,
+			&candidate.TaxonomyProvider, &candidate.TaxonomyEvidence,
+			&candidate.Price,
 			&candidate.MarketCapMM, &candidate.Return20,
 			&candidate.Return60, &candidate.Return126,
 			&candidate.MedianDollarVolume20, &candidate.PromotionClaimToken,

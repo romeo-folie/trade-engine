@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -24,7 +25,10 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 	claimedAt := s.now()
 	claimLease := time.Duration(s.Cfg.WeeklyLeader.RunLeaseMinutes) * time.Minute
 	rows, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, claimedAt, claimedAt, claimLease, claimToken,
+		ctx, expectedWeeklyLeaderPromotionSession(
+			claimedAt, s.Cfg.WeeklyLeader.AfterCloseDelayMinutes,
+		),
+		claimedAt, claimedAt, claimLease, claimToken,
 	)
 	if err != nil {
 		return nil, err
@@ -32,10 +36,6 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 	out := make([]SwingCandidate, 0, len(rows))
 	for _, row := range rows {
 		member := true
-		taxonomyStatus := "known"
-		if row.Industry == "" || row.Industry == store.UnknownTaxonomy {
-			taxonomyStatus = "unknown"
-		}
 		out = append(out, SwingCandidate{
 			Ticker:                 row.Ticker,
 			Price:                  row.Price,
@@ -49,7 +49,10 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 			UniverseMember:         &member,
 			Sector:                 row.Sector,
 			Industry:               row.Industry,
-			TaxonomyStatus:         taxonomyStatus,
+			TaxonomyStatus:         row.TaxonomyStatus,
+			TaxonomyAsOf:           row.TaxonomyAsOf,
+			TaxonomyProvider:       row.TaxonomyProvider,
+			TaxonomyEvidence:       append(json.RawMessage(nil), row.TaxonomyEvidence...),
 			WeeklyLeaderRunID:      row.RunID,
 			WeeklyLeaderClaimToken: row.PromotionClaimToken,
 			UniverseVersionID:      row.UniverseVersionID,
@@ -61,6 +64,16 @@ func (s *MarketScanner) weeklyLeaderCandidates(ctx context.Context) ([]SwingCand
 		})
 	}
 	return out, nil
+}
+
+func expectedWeeklyLeaderPromotionSession(
+	now time.Time, afterCloseDelayMinutes int,
+) time.Time {
+	delay := time.Duration(afterCloseDelayMinutes) * time.Minute
+	if delay < 0 {
+		delay = 0
+	}
+	return engine.MostRecentCompletedMarketSession(now, delay).Date
 }
 
 func mergeWeeklyLeaderCandidates(
@@ -98,6 +111,15 @@ func mergeWeeklyLeaderCandidates(
 		candidate.UniverseMember = leader.UniverseMember
 		candidate.Sector, candidate.Industry = leader.Sector, leader.Industry
 		candidate.TaxonomyStatus = leader.TaxonomyStatus
+		candidate.TaxonomyAsOf = nil
+		if leader.TaxonomyAsOf != nil {
+			asOf := *leader.TaxonomyAsOf
+			candidate.TaxonomyAsOf = &asOf
+		}
+		candidate.TaxonomyProvider = leader.TaxonomyProvider
+		candidate.TaxonomyEvidence = append(
+			json.RawMessage(nil), leader.TaxonomyEvidence...,
+		)
 		candidate.WeeklyLeaderRunID = leader.WeeklyLeaderRunID
 		candidate.WeeklyLeaderClaimToken = leader.WeeklyLeaderClaimToken
 		candidate.UniverseVersionID = leader.UniverseVersionID

@@ -25,11 +25,14 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	capMM := 5_000.0
 	universePrice := 91.0
 	dollarVolume := 50_000_000.0
+	taxonomyAt := base.Add(-30 * 24 * time.Hour)
 	members := []store.SwingUniverseMember{
 		{Ticker: "TEST_WL_AAA", Eligible: true, MarketCapMM: &capMM,
 			Price:        &universePrice,
 			DollarVolume: &dollarVolume, Sector: "Technology",
-			Industry: "Software", TaxonomyStatus: "known"},
+			Industry: "Software", TaxonomyStatus: "stale",
+			TaxonomyAsOf: &taxonomyAt, TaxonomyProvider: "fixture-taxonomy",
+			TaxonomyEvidence: json.RawMessage(`{"fixture":"stale-taxonomy"}`)},
 		{Ticker: "TEST_WL_BBB", Eligible: true, MarketCapMM: &capMM,
 			Price:        &universePrice,
 			DollarVolume: &dollarVolume, Sector: "Technology",
@@ -123,29 +126,46 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		got.LeaderBreadth != 0.5 || got.EvaluationCoverage != 0.5 {
 		t.Fatalf("incorrect run diagnostics: %+v", got)
 	}
+	staleCandidates, err := store.ClaimWeeklyLeaderCandidatesAsOf(
+		ctx, runInput.SessionDate.AddDate(0, 0, 1),
+		completedAt, completedAt, time.Hour, "stale-session-claim",
+	)
+	if err != nil || len(staleCandidates) != 0 {
+		t.Fatalf("stale completed session was claimable during catch-up: %+v/%v",
+			staleCandidates, err)
+	}
 	claimedCandidates, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt, time.Hour, "promotion-claim-1",
+		ctx, runInput.SessionDate, completedAt, completedAt, time.Hour,
+		"promotion-claim-1",
 	)
 	if err != nil || len(claimedCandidates) != 1 ||
 		claimedCandidates[0].Ticker != "TEST_WL_AAA" ||
-		claimedCandidates[0].Price != closePrice {
+		claimedCandidates[0].Price != closePrice ||
+		claimedCandidates[0].TaxonomyStatus != "stale" ||
+		claimedCandidates[0].TaxonomyAsOf == nil ||
+		!claimedCandidates[0].TaxonomyAsOf.Equal(taxonomyAt) ||
+		claimedCandidates[0].TaxonomyProvider != "fixture-taxonomy" ||
+		string(claimedCandidates[0].TaxonomyEvidence) !=
+			`{"fixture": "stale-taxonomy"}` {
 		t.Fatalf("claimed candidates = %+v/%v", claimedCandidates, err)
 	}
 	concurrent, err := store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt, time.Hour, "promotion-claim-2",
+		ctx, runInput.SessionDate, completedAt, completedAt, time.Hour,
+		"promotion-claim-2",
 	)
 	if err != nil || len(concurrent) != 0 {
 		t.Fatalf("concurrent promotion claim duplicated work: %+v/%v", concurrent, err)
 	}
 	concurrent, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Hour-time.Nanosecond),
+		ctx, runInput.SessionDate, completedAt,
+		completedAt.Add(time.Hour-time.Nanosecond),
 		time.Hour, "promotion-claim-2",
 	)
 	if err != nil || len(concurrent) != 0 {
 		t.Fatalf("fresh promotion lease was stolen: %+v/%v", concurrent, err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Hour), time.Hour,
+		ctx, runInput.SessionDate, completedAt, completedAt.Add(time.Hour), time.Hour,
 		"promotion-claim-2",
 	)
 	if err != nil || len(claimedCandidates) != 1 ||
@@ -169,7 +189,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	concurrent, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Hour+time.Minute),
+		ctx, runInput.SessionDate, completedAt,
+		completedAt.Add(time.Hour+time.Minute),
 		time.Hour, "promotion-claim-3",
 	)
 	if err != nil || len(concurrent) != 0 {
@@ -181,8 +202,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Hour+2*time.Minute), time.Hour,
-		"promotion-claim-3",
+		ctx, runInput.SessionDate, completedAt,
+		completedAt.Add(time.Hour+2*time.Minute), time.Hour, "promotion-claim-3",
 	)
 	if err != nil || len(claimedCandidates) != 1 {
 		t.Fatalf("released promotion was not reclaimable: %+v/%v", claimedCandidates, err)
@@ -200,8 +221,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatalf("atomic watchlist promotion missing: active=%v err=%v", active, err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, completedAt, completedAt.Add(time.Hour+3*time.Minute), time.Hour,
-		"promotion-claim-4",
+		ctx, runInput.SessionDate, completedAt,
+		completedAt.Add(time.Hour+3*time.Minute), time.Hour, "promotion-claim-4",
 	)
 	if err != nil || len(claimedCandidates) != 0 {
 		t.Fatalf("consumed candidate remained claimable: %+v/%v", claimedCandidates, err)
@@ -237,7 +258,8 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimedCandidates, err = store.ClaimWeeklyLeaderCandidatesAsOf(
-		ctx, alternateCompletedAt, alternateCompletedAt, time.Hour,
+		ctx, alternateInput.SessionDate, alternateCompletedAt, alternateCompletedAt,
+		time.Hour,
 		"same-session-old-claim",
 	)
 	if err != nil || len(claimedCandidates) != 1 ||

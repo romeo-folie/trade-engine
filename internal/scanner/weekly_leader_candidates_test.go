@@ -1,10 +1,67 @@
 package scanner
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+func TestExpectedWeeklyLeaderPromotionSession(t *testing.T) {
+	ny, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parse := func(value string) time.Time {
+		t.Helper()
+		got, err := time.ParseInLocation("2006-01-02 15:04", value, ny)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+	for _, tt := range []struct {
+		name string
+		now  string
+		want string
+	}{
+		{
+			name: "intraday waits for regular close delay",
+			now:  "2026-07-20 16:14",
+			want: "2026-07-17",
+		},
+		{
+			name: "exact regular close delay advances session",
+			now:  "2026-07-20 16:15",
+			want: "2026-07-20",
+		},
+		{
+			name: "weekend retains friday session",
+			now:  "2026-07-25 10:00",
+			want: "2026-07-24",
+		},
+		{
+			name: "early close waits for delay",
+			now:  "2024-11-29 13:14",
+			want: "2024-11-27",
+		},
+		{
+			name: "exact early close delay advances session",
+			now:  "2024-11-29 13:15",
+			want: "2024-11-29",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := expectedWeeklyLeaderPromotionSession(parse(tt.now), 15)
+			if got.Format("2006-01-02") != tt.want {
+				t.Fatalf("promotion session = %s, want %s",
+					got.Format("2006-01-02"), tt.want)
+			}
+		})
+	}
+}
 
 func TestMergeWeeklyLeaderCandidatesPreservesIndependentSources(t *testing.T) {
 	member := true
@@ -90,6 +147,46 @@ func TestWeeklyLeaderMergeKeepsGraphThesisIndependent(t *testing.T) {
 	if strings.Count(user, "Graph link:") != 1 ||
 		strings.Count(user, "Weekly leader evidence:") != 1 {
 		t.Fatalf("independent evidence was not rendered independently:\n%s", user)
+	}
+}
+
+func TestWeeklyLeaderMergeAndSnapshotPreserveStaleTaxonomyLineage(t *testing.T) {
+	ordinaryAsOf := time.Date(2026, 7, 25, 20, 0, 0, 0, time.UTC)
+	leaderAsOf := ordinaryAsOf.Add(-30 * 24 * time.Hour)
+	existing := []SwingCandidate{{
+		Ticker: "NVDA", Sources: []string{"mover"},
+		Sector: "Technology", Industry: "Semiconductors",
+		TaxonomyStatus: "known", TaxonomyAsOf: &ordinaryAsOf,
+		TaxonomyProvider: "ordinary-provider",
+		TaxonomyEvidence: json.RawMessage(`{"source":"ordinary"}`),
+	}}
+	leaders := []SwingCandidate{{
+		Ticker: "NVDA", Sources: []string{"weekly_leader"},
+		Sector: "Technology", Industry: "Semiconductors",
+		TaxonomyStatus: "stale", TaxonomyAsOf: &leaderAsOf,
+		TaxonomyProvider: "universe-provider",
+		TaxonomyEvidence: json.RawMessage(`{"source":"point-in-time-universe"}`),
+	}}
+
+	merged := mergeWeeklyLeaderCandidates(existing, leaders)
+	got := merged[0]
+	if got.TaxonomyStatus != "stale" || got.TaxonomyAsOf == nil ||
+		!got.TaxonomyAsOf.Equal(leaderAsOf) ||
+		got.TaxonomyProvider != "universe-provider" ||
+		string(got.TaxonomyEvidence) != `{"source":"point-in-time-universe"}` {
+		t.Fatalf("weekly taxonomy lineage was not authoritative: %+v", got)
+	}
+
+	recorder := &scanRecorder{
+		candidates: make(map[string]*store.ScannerCandidateSnapshot),
+	}
+	recorder.register(merged)
+	snapshot := recorder.candidates["NVDA"]
+	if snapshot.TaxonomyStatus != "stale" || snapshot.TaxonomyAsOf == nil ||
+		!snapshot.TaxonomyAsOf.Equal(leaderAsOf) ||
+		snapshot.TaxonomyProvider != "universe-provider" ||
+		string(snapshot.TaxonomyEvidence) != `{"source":"point-in-time-universe"}` {
+		t.Fatalf("snapshot lost stale taxonomy lineage: %+v", snapshot)
 	}
 }
 
