@@ -22,6 +22,9 @@ type WatchlistItem struct {
 	// prompt can carry the origin thesis. Empty for manual/config items and
 	// plain screener finds.
 	GraphContext string
+	// ScannerRunID links scanner-sourced rows to their prospective universe
+	// snapshot. Empty for manual/config watchlist items.
+	ScannerRunID string
 	Active       bool
 	ExpiresAt    *time.Time // non-nil for scanner-sourced items
 	// PullbackRequalificationRequired quarantines legacy scanner rows whose
@@ -46,14 +49,18 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 		item.Source = "manual"
 	}
 	tag, err := GetDB().Exec(ctx, `
-		INSERT INTO watchlist (ticker, platform, strategies, timeframes, min_confidence, source, graph_context, active, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8)
+		INSERT INTO watchlist (
+			ticker, platform, strategies, timeframes, min_confidence, source,
+			graph_context, scanner_run_id, active, expires_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9)
 		ON CONFLICT (ticker, platform) DO UPDATE SET
 			strategies     = EXCLUDED.strategies,
 			timeframes     = EXCLUDED.timeframes,
 			min_confidence = EXCLUDED.min_confidence,
 			source         = EXCLUDED.source,
 			graph_context  = EXCLUDED.graph_context,
+			scanner_run_id = EXCLUDED.scanner_run_id,
 			active         = true,
 			expires_at     = EXCLUDED.expires_at,
 			pullback_requalification_required = false,
@@ -61,11 +68,12 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 		WHERE NOT (
 			watchlist.pullback_requalification_required
 			AND EXCLUDED.source = 'scanner'
-			AND NOT $9
+			AND NOT $10
 		)
 	`,
 		item.Ticker, item.Platform, item.Strategies, item.Timeframes,
-		item.MinConfidence, item.Source, nullableString(item.GraphContext), item.ExpiresAt,
+		item.MinConfidence, item.Source, nullableString(item.GraphContext),
+		nullableString(item.ScannerRunID), item.ExpiresAt,
 		item.PullbackRequalificationComplete,
 	)
 	if err != nil {
@@ -95,7 +103,8 @@ func RemoveWatchlistItem(ctx context.Context, ticker, platform string) error {
 func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, error) {
 	q := `
 		SELECT id, ticker, platform, strategies, timeframes,
-		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at,
+		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
+		       COALESCE(scanner_run_id::text, ''), active, expires_at,
 		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 	`
@@ -115,7 +124,8 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 		var w WatchlistItem
 		if err := rows.Scan(
 			&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-			&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt,
+			&w.MinConfidence, &w.Source, &w.GraphContext, &w.ScannerRunID,
+			&w.Active, &w.ExpiresAt,
 			&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -133,7 +143,8 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	}
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, ticker, platform, strategies, timeframes,
-		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''), active, expires_at,
+		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
+		       COALESCE(scanner_run_id::text, ''), active, expires_at,
 		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 		WHERE ticker = $1 AND platform = $2
@@ -142,7 +153,8 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	var w WatchlistItem
 	err := row.Scan(
 		&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-		&w.MinConfidence, &w.Source, &w.GraphContext, &w.Active, &w.ExpiresAt,
+		&w.MinConfidence, &w.Source, &w.GraphContext, &w.ScannerRunID,
+		&w.Active, &w.ExpiresAt,
 		&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 	)
 	if err != nil {

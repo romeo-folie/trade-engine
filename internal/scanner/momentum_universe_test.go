@@ -94,6 +94,20 @@ func TestQualifyPullbackUniverseKeepsTopQuartile(t *testing.T) {
 	if len(result.known) != 4 {
 		t.Fatalf("known qualification count = %d, want 4", len(result.known))
 	}
+	if outcome := result.outcomes["AAA"]; outcome.stage != "qualified" ||
+		outcome.rank != 1 || !outcome.qualified {
+		t.Fatalf("AAA outcome = %+v, want qualified rank 1", outcome)
+	}
+	if outcome := result.outcomes["DDD"]; outcome.stage != "momentum" ||
+		!outcome.known || outcome.qualified {
+		t.Fatalf("DDD outcome = %+v, want definitive momentum rejection", outcome)
+	}
+	for _, ticker := range []string{"BBB", "CCC"} {
+		if outcome := result.outcomes[ticker]; outcome.stage != "below_top_quartile" ||
+			outcome.rank < 2 || outcome.qualified {
+			t.Fatalf("%s outcome = %+v, want ranked top-quartile rejection", ticker, outcome)
+		}
+	}
 	if got[0].MarketCapMM != 500 || got[0].DollarVolume != 2_000_000 {
 		t.Fatalf("universe metrics missing: %+v", got[0])
 	}
@@ -252,6 +266,17 @@ func TestQualifyPullbackUniverseDistinguishesUnavailableFromIneligible(t *testin
 	}
 	if _, ok := result.known["DEFINITIVELY_INELIGIBLE"]; !ok {
 		t.Fatal("objective market-cap failure was not treated as definitive")
+	}
+	wantStages := map[string]string{
+		"HISTORY_UNAVAILABLE":      "history_unavailable",
+		"FUNDAMENTALS_UNAVAILABLE": "fundamentals_unavailable",
+		"EMPTY_FUNDAMENTALS":       "fundamentals_unavailable",
+		"DEFINITIVELY_INELIGIBLE":  "market_cap",
+	}
+	for ticker, want := range wantStages {
+		if got := result.outcomes[ticker].stage; got != want {
+			t.Fatalf("%s stage = %q, want %q", ticker, got, want)
+		}
 	}
 }
 

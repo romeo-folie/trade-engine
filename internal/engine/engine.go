@@ -559,7 +559,10 @@ func (e *Engine) tick(ctx context.Context) error {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			e.processStock(ctx, item.Ticker, item.Timeframes, item.Strategies, item.Source, item.MinConfidence, item.GraphContext)
+			e.processStock(
+				ctx, item.Ticker, item.Timeframes, item.Strategies, item.Source,
+				item.MinConfidence, item.GraphContext, item.ScannerRunID,
+			)
 		}(item)
 	}
 
@@ -590,7 +593,14 @@ func (e *Engine) tick(ctx context.Context) error {
 // scanner-sourced candidate (graph link / news-sympathy trigger, migration
 // 038); it is prepended to the knowledge-graph prompt section so the trading
 // analysts see WHY the ticker is on the watchlist.
-func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, strategies []string, source string, scannerConviction float64, graphContext string) {
+func (e *Engine) processStock(
+	ctx context.Context,
+	ticker string,
+	timeframes, strategies []string,
+	source string,
+	scannerConviction float64,
+	graphContext, scannerRunID string,
+) {
 	requestedTimeframes := stockTimeframesForEntry(timeframes, false)
 	// The complete pullback setup is defined on daily history even when a
 	// scanner candidate uses 1H/4H for its analyst prompt. Fetch 1D explicitly
@@ -722,7 +732,7 @@ func (e *Engine) processStock(ctx context.Context, ticker string, timeframes, st
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
 	e.runAnalysis(
 		ctx, ticker, string(primaryTF), primaryStrategy, candles, set,
-		newsHash, source, graphContext, pullbackCandidate,
+		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
 	)
 }
 
@@ -820,7 +830,7 @@ func (e *Engine) runAnalysis(
 	ticker, timeframe, strategy string,
 	candles []data.Candle,
 	set *indicators.IndicatorSet,
-	newsHash, source, graphContext string,
+	newsHash, source, graphContext, scannerRunID string,
 	pullbackCandidate bool,
 ) {
 	if set == nil {
@@ -1222,7 +1232,8 @@ func (e *Engine) runAnalysis(
 	// its degraded-mode handling.
 	e.generateSignal(
 		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
-		prefetchedOpenTrades, e.analysisSourceNode(result), pullbackCandidate,
+		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
+		pullbackCandidate,
 	)
 
 	// Update material-change gate state for next tick.
@@ -1694,6 +1705,7 @@ func (e *Engine) generateSignal(
 	analysisID string,
 	prefetchedOpenTrades []store.Trade,
 	analysisSourceNode string,
+	scannerRunID string,
 	pullbackCandidate bool,
 ) {
 	if resp.Action == analysis.ActionHold || resp.Action == analysis.ActionWait {
@@ -1736,6 +1748,7 @@ func (e *Engine) generateSignal(
 		ExpiresAt:         createdAt.Add(time.Duration(expiryMin) * time.Minute),
 		StalePriceMovePct: stalePct,
 		EntrySetup:        store.EntrySetupStandard,
+		ScannerRunID:      scannerRunID,
 		AnalysisIDs:       analysisIDs,
 		CreatedAt:         createdAt,
 	}

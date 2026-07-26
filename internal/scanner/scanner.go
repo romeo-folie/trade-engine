@@ -113,8 +113,11 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 }
 
 // runScan executes one full scan cycle.
-func (s *MarketScanner) runScan(ctx context.Context) error {
+func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
+	recorder := newScanRecorder(s, start)
+	recorder.begin(ctx)
+	defer func() { recorder.finish(scanErr) }()
 
 	if s.Bus != nil {
 		s.Bus.Publish(events.ScanStarted, events.ScanStartedPayload{})
@@ -127,6 +130,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	if err != nil {
 		slog.Warn("scanner: expire stale items", "err", err)
 	}
+	recorder.run.ExpiredItemCount = len(expired)
 
 	// 2. Fetch candidates from both screeners.
 	candidates, err := s.fetchCandidates(ctx)
@@ -157,6 +161,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		candidates = append(candidates, graphCands...)
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
+	recorder.register(candidates)
 
 	if len(candidates) == 0 {
 		return nil
@@ -172,11 +177,13 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 		return fmt.Errorf("load pullback requalification state: %w", err)
 	}
 	if s.PullbackUniverseEnabled || len(requalificationRequired) > 0 {
+		recorder.setQuarantine(requalificationRequired)
 		qualificationInput := candidates
 		if !s.PullbackUniverseEnabled {
 			qualificationInput = filterCandidatesByTicker(candidates, requalificationRequired)
 		}
 		qualification := s.qualifyPullbackUniverse(ctx, qualificationInput)
+		recorder.qualification(qualification)
 		if len(qualification.qualified) == 0 {
 			slog.Info("scanner: no candidates passed pullback-strength universe")
 		}
@@ -187,14 +194,18 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 				candidates, qualification.known, requalificationRequired,
 			)
 		}
+		beforeRequalificationFilter := candidates
 		candidates = filterUnavailableRequalifications(candidates, requalificationRequired)
+		recorder.markRemoved(beforeRequalificationFilter, candidates, "requalification_unavailable")
 	}
 
 	// 3.5 Dedup against the active watchlist only after universe selection.
+	beforeWatchlistFilter := candidates
 	candidates, err = s.filterExistingWatchlist(ctx, candidates)
 	if err != nil {
 		return fmt.Errorf("filter watchlist: %w", err)
 	}
+	recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -210,12 +221,18 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	}
 	slots := cap - activeCount
 	if slots <= 0 {
+		for _, c := range candidates {
+			if snapshot := recorder.candidates[c.Ticker]; snapshot != nil {
+				snapshot.FinalStage = "candidate_cap"
+			}
+		}
 		return nil // cap reached; nothing to add until items expire
 	}
 
 	// 5. Enrich candidates with news.
 	since := s.now().Add(-time.Duration(s.Cfg.NewsLookbackHours) * time.Hour)
 	candidates = s.enrichWithNews(ctx, candidates, since)
+	recorder.setEligible(candidates)
 
 	// 6. LLM-score each candidate.
 	var scored []scoredCandidate
@@ -224,6 +241,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			return ctx.Err()
 		}
 		result, err := s.scoreCandidate(ctx, c)
+		recorder.scored(c, result, err, s.Cfg.MinConviction)
 		if err != nil {
 			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
@@ -245,6 +263,7 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 	if len(scored) > slots {
 		scored = scored[:slots]
 	}
+	recorder.selected(scored)
 
 	// 8. Add to watchlist and notify.
 	var added []scoredCandidate
@@ -269,13 +288,16 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 			// trigger) so the engine's deep-analysis prompt carries the origin
 			// thesis instead of losing it after this pass.
 			GraphContext:                    sc.candidate.GraphContext,
+			ScannerRunID:                    recorder.run.ID,
 			ExpiresAt:                       &expiresAt,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		if err := store.AddWatchlistItem(ctx, item); err != nil {
+			recorder.watchlistResult(sc.candidate, sc.score, strategies, err)
 			slog.Warn("scanner: failed to add watchlist item", "ticker", sc.candidate.Ticker, "err", err)
 			continue
 		}
+		recorder.watchlistResult(sc.candidate, sc.score, strategies, nil)
 		slog.Info("scanner: added to watchlist", "ticker", sc.candidate.Ticker, "conviction", sc.score.Conviction, "setup", sc.score.SetupType, "strategy", sc.score.Strategy)
 		added = append(added, sc)
 
@@ -323,6 +345,16 @@ func (s *MarketScanner) runScan(ctx context.Context) error {
 type pullbackQualification struct {
 	qualified []SwingCandidate
 	known     map[string]struct{}
+	outcomes  map[string]pullbackQualificationOutcome
+}
+
+type pullbackQualificationOutcome struct {
+	candidate SwingCandidate
+	stage     string
+	reason    string
+	known     bool
+	qualified bool
+	rank      int
 }
 
 func markPullbackQualification(all []SwingCandidate, result pullbackQualification) []SwingCandidate {
@@ -504,9 +536,23 @@ func filterActiveCandidates(
 // Missing fundamentals or history fail closed because this screen defines the
 // strategy universe.
 func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates []SwingCandidate) pullbackQualification {
-	result := pullbackQualification{known: make(map[string]struct{}, len(candidates))}
+	result := pullbackQualification{
+		known:    make(map[string]struct{}, len(candidates)),
+		outcomes: make(map[string]pullbackQualificationOutcome, len(candidates)),
+	}
+	for _, candidate := range candidates {
+		result.outcomes[candidate.Ticker] = pullbackQualificationOutcome{
+			candidate: candidate,
+			stage:     "not_evaluated",
+		}
+	}
 	if s.AlpacaClient == nil || s.Fundamentals == nil {
 		slog.Warn("scanner: pullback universe unavailable — market data or fundamentals provider missing")
+		for ticker, outcome := range result.outcomes {
+			outcome.stage = "provider_unavailable"
+			outcome.reason = "market data or fundamentals provider missing"
+			result.outcomes[ticker] = outcome
+		}
 		return result
 	}
 	qualified := make([]SwingCandidate, 0, len(candidates))
@@ -521,21 +567,34 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		history, err := s.AlpacaClient.FetchHistory(ctx, candidate.Ticker, data.Timeframe1Day, 130)
 		if err != nil || len(history) < 127 {
 			slog.Warn("scanner: pullback universe history unavailable", "ticker", candidate.Ticker, "err", err)
+			outcome := result.outcomes[candidate.Ticker]
+			outcome.stage = "history_unavailable"
+			if err != nil {
+				outcome.reason = err.Error()
+			} else {
+				outcome.reason = fmt.Sprintf("need 127 daily bars; got %d", len(history))
+			}
+			result.outcomes[candidate.Ticker] = outcome
 			continue
 		}
 		fundamentals, err := s.Fundamentals.FetchCompanyFundamentals(ctx, candidate.Ticker)
 		if err != nil {
+			outcome := result.outcomes[candidate.Ticker]
+			outcome.stage = "fundamentals_unavailable"
+			outcome.reason = err.Error()
+			result.outcomes[candidate.Ticker] = outcome
 			continue
 		}
 		if fundamentals.MarketCapitalization <= 0 {
 			slog.Warn("scanner: pullback universe fundamentals unavailable",
 				"ticker", candidate.Ticker)
+			outcome := result.outcomes[candidate.Ticker]
+			outcome.stage = "fundamentals_unavailable"
+			outcome.reason = "market capitalization unavailable"
+			result.outcomes[candidate.Ticker] = outcome
 			continue
 		}
 		result.known[candidate.Ticker] = struct{}{}
-		if fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
-			continue
-		}
 		price := candidate.Price
 		if price <= 0 {
 			price = history[len(history)-1].Close
@@ -545,9 +604,6 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 			volume = history[len(history)-1].Volume
 		}
 		dollarVolume := price * float64(volume)
-		if dollarVolume < pullbackMinDollarVolume {
-			continue
-		}
 		candidate.Price = price
 		candidate.Volume = volume
 		candidate.MarketCapMM = fundamentals.MarketCapitalization
@@ -555,9 +611,32 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		candidate.Return1M = scannerHorizonReturn(price, history, 21)
 		candidate.Return3M = scannerHorizonReturn(price, history, 63)
 		candidate.Return6M = scannerHorizonReturn(price, history, 126)
-		if maxScannerReturn(candidate) < minMomentumReturn {
+		outcome := result.outcomes[candidate.Ticker]
+		outcome.candidate = candidate
+		outcome.known = true
+		if fundamentals.MarketCapitalization < pullbackMinMarketCapMM {
+			outcome.stage = "market_cap"
+			outcome.reason = fmt.Sprintf("%.2fM below %.2fM minimum",
+				fundamentals.MarketCapitalization, pullbackMinMarketCapMM)
+			result.outcomes[candidate.Ticker] = outcome
 			continue
 		}
+		if dollarVolume < pullbackMinDollarVolume {
+			outcome.stage = "dollar_volume"
+			outcome.reason = fmt.Sprintf("%.2f below %.2f minimum",
+				dollarVolume, pullbackMinDollarVolume)
+			result.outcomes[candidate.Ticker] = outcome
+			continue
+		}
+		if maxScannerReturn(candidate) < minMomentumReturn {
+			outcome.stage = "momentum"
+			outcome.reason = fmt.Sprintf("best horizon %.2f%% below %.2f%% minimum",
+				maxScannerReturn(candidate), minMomentumReturn)
+			result.outcomes[candidate.Ticker] = outcome
+			continue
+		}
+		outcome.stage = "momentum_eligible"
+		result.outcomes[candidate.Ticker] = outcome
 		qualified = append(qualified, candidate)
 	}
 	for i := 1; i < len(qualified); i++ {
@@ -566,6 +645,18 @@ func (s *MarketScanner) qualifyPullbackUniverse(ctx context.Context, candidates 
 		}
 	}
 	keep := (len(qualified) + 3) / 4
+	for i, candidate := range qualified {
+		outcome := result.outcomes[candidate.Ticker]
+		outcome.rank = i + 1
+		if i < keep {
+			outcome.stage = "qualified"
+			outcome.qualified = true
+		} else {
+			outcome.stage = "below_top_quartile"
+			outcome.reason = fmt.Sprintf("momentum rank %d of %d", i+1, len(qualified))
+		}
+		result.outcomes[candidate.Ticker] = outcome
+	}
 	if keep < len(qualified) {
 		qualified = qualified[:keep]
 	}
