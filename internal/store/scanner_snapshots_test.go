@@ -23,6 +23,18 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BeginSwingUniverseVersion: %v", err)
 	}
+	if _, err := store.BeginScannerRun(ctx, store.ScannerRun{
+		StartedAt:         startedAt,
+		UniverseVersionID: universeID,
+		UniverseAsOf:      &universeAsOf,
+	}); err == nil {
+		t.Fatal("BeginScannerRun accepted a building universe")
+	}
+	completedAt := universeAsOf.Add(30 * time.Second)
+	if err := store.CompleteSwingUniverseVersion(ctx, universeID, completedAt); err != nil {
+		t.Fatalf("CompleteSwingUniverseVersion: %v", err)
+	}
+	callerUniverseAsOf := startedAt.Add(time.Hour)
 	runID, err := store.BeginScannerRun(ctx, store.ScannerRun{
 		StartedAt:                    startedAt,
 		PullbackUniverseEnabled:      true,
@@ -33,7 +45,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		MinConviction:                .55,
 		TTLDays:                      3,
 		UniverseVersionID:            universeID,
-		UniverseAsOf:                 &universeAsOf,
+		UniverseAsOf:                 &callerUniverseAsOf,
 		RegimeReference:              "pending",
 	})
 	if err != nil {
@@ -90,20 +102,27 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Fatalf("FinishScannerRun: %v", err)
 	}
 	var storedUniverseID, regime string
+	var storedUniverseAsOf time.Time
 	var sourceScores json.RawMessage
 	var universeMember bool
 	err = store.GetDB().QueryRow(ctx, `
-		SELECT r.universe_version_id::text, r.regime_reference,
+		SELECT r.universe_version_id::text, r.universe_as_of, r.regime_reference,
 		       c.source_scores, c.universe_member
 		FROM scanner_runs r
 		JOIN scanner_candidate_snapshots c ON c.scanner_run_id=r.id
 		WHERE r.id=$1 AND c.ticker='SNAP_A'`,
 		runID,
-	).Scan(&storedUniverseID, &regime, &sourceScores, &universeMember)
+	).Scan(
+		&storedUniverseID, &storedUniverseAsOf, &regime,
+		&sourceScores, &universeMember,
+	)
 	if err != nil || storedUniverseID != universeID || regime != "pending" ||
+		!storedUniverseAsOf.Equal(universeAsOf) ||
 		!universeMember || string(sourceScores) != `{"mover": 0}` {
-		t.Fatalf("extended snapshot = universe=%q regime=%q scores=%s member=%v err=%v",
-			storedUniverseID, regime, sourceScores, universeMember, err)
+		t.Fatalf(
+			"extended snapshot = universe=%q as_of=%s regime=%q scores=%s member=%v err=%v",
+			storedUniverseID, storedUniverseAsOf, regime, sourceScores, universeMember, err,
+		)
 	}
 
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{

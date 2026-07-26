@@ -3,7 +3,10 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ScannerRun captures the configuration and aggregate outcome of one scan.
@@ -104,8 +107,41 @@ func InsertScannerEngineOutcome(ctx context.Context, outcome ScannerEngineOutcom
 }
 
 func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	var universeAsOf *time.Time
+	if run.UniverseVersionID != "" {
+		var storedAsOf time.Time
+		err = tx.QueryRow(ctx, `
+			SELECT as_of
+			FROM swing_universe_versions
+			WHERE id=$1
+			  AND status='completed'
+			  AND completed_at IS NOT NULL
+			  AND as_of <= $2
+			  AND captured_at <= $2
+			  AND completed_at <= $2
+			FOR SHARE`,
+			run.UniverseVersionID, run.StartedAt,
+		).Scan(&storedAsOf)
+		if err != nil {
+			if err == pgx.ErrNoRows {
+				return "", fmt.Errorf(
+					"universe version %s is not completed and available at scanner start: %w",
+					run.UniverseVersionID, err,
+				)
+			}
+			return "", fmt.Errorf("validate scanner universe lineage: %w", err)
+		}
+		universeAsOf = &storedAsOf
+	}
+
 	var id string
-	err := GetDB().QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 			INSERT INTO scanner_runs (
 				started_at, pullback_universe_enabled,
 				pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
@@ -116,10 +152,16 @@ func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
 		run.StartedAt, run.PullbackUniverseEnabled,
 		run.PullbackMinMomentumReturnPct, run.PullbackMinMarketCapMM,
 		run.PullbackMinDollarVolume, run.CandidateCap, run.MinConviction, run.TTLDays,
-		nullableString(run.UniverseVersionID), run.UniverseAsOf,
+		nullableString(run.UniverseVersionID), universeAsOf,
 		nullableString(run.RegimeReference),
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerCandidateSnapshot) error {
