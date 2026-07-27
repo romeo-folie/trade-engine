@@ -837,6 +837,73 @@ func TestCurrencyStrengthFullExitNeverRetriesStalePortfolio(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthExecutionCreatedReversalIsCorrected(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 5, 0, 0, time.UTC)
+	priorFillAt := now.Add(-4 * time.Minute)
+	retryFillAt := now.Add(-3 * time.Minute)
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-CORRECTION", Status: "filled",
+			FilledPrice: 1.102, FilledQty: 30000,
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: -30000}},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "EXIT-PRIOR", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 70000,
+				FilledAvgPx: 1.104, FilledAt: priorFillAt,
+			},
+			{
+				BrokerOrderID: "EXIT-RETRY", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 60000,
+				FilledAvgPx: 1.105, FilledAt: retryFillAt,
+			},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-RETRY", ExitTradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+			ExitStatus: "filled", ExitFillPrice: 1.105, ExitFilledQty: 60000,
+			ExitRequestedQty: 60000, ExitFillTimeQty: 60000,
+			ExitCumulativeQty: 130000,
+			ExitFillObserved:  now.Add(-currencyStrengthPortfolioPropagationGrace - time.Second).Format(time.RFC3339),
+			ExitedAt:          retryFillAt.Format(time.RFC3339),
+		},
+		now: func() time.Time { return now },
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || !runner.state.ExitCorrection ||
+		!runner.state.ExitRetry || runner.state.ExitOrderID != "" ||
+		runner.state.ExitRetryMaxQty != 30000 {
+		t.Fatalf("reversal was not converted to corrective obligation: %+v", runner.state)
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.calls != 1 || len(broker.requests) != 1 ||
+		broker.requests[0].Side != execution.OrderSideBuy ||
+		broker.requests[0].Quantity != 30000 || runner.state != nil {
+		t.Fatalf("corrective flatten did not close reversal: calls=%d requests=%+v state=%+v",
+			broker.calls, broker.requests, runner.state)
+	}
+	if len(journal.exits) != 2 ||
+		journal.exits[0].ExitStatus != "residual" ||
+		journal.exits[1].ExitStatus != "correction_filled" ||
+		journal.exits[1].ExitFilledQty != -30000 ||
+		journal.exits[1].RealizedPnL == nil ||
+		*journal.exits[1].RealizedPnL > -59.99 ||
+		*journal.exits[1].RealizedPnL < -60.01 {
+		t.Fatalf("reversal correction audit was not signed: %+v", journal.exits)
+	}
+}
+
 func TestCurrencyStrengthPartialExitWaitsForPortfolioPropagation(t *testing.T) {
 	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
 	broker := &successfulCurrencyStrengthExecutor{
@@ -2032,6 +2099,57 @@ func TestCurrencyStrengthRecoveryCancelsOversizedWorkingRetry(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthPartialRetryHydrationCancelsOversizedRemainder(t *testing.T) {
+	firstFillAt := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	base := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-PARTIAL-RETRY", Status: "partial",
+			FilledPrice: 1.106, FilledQty: 10000,
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 20000}},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "EXIT-PRIOR", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 70000,
+				FilledAvgPx: 1.104, FilledAt: firstFillAt,
+			},
+			{
+				BrokerOrderID: "EXIT-PARTIAL-RETRY", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 10000,
+				FilledAvgPx: 1.106, FilledAt: firstFillAt.Add(time.Minute),
+			},
+		},
+	}
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: base,
+		orders: []execution.WorkingOrder{{
+			OrderID: "EXIT-PARTIAL-RETRY",
+			TradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+			Ticker:  "GBP/USD", Side: "sell", Status: "partial", RemainingQty: 50000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR",
+			ExitCumulativeQty: 70000, ExitRetryMaxQty: 30000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.cancels != 1 || base.calls != 0 || runner.state == nil ||
+		runner.state.ExitOrderID != "EXIT-PARTIAL-RETRY" ||
+		runner.state.ExitFilledQty != 10000 ||
+		runner.state.ExitRetryMaxQty != 20000 {
+		t.Fatalf("partial retry left oversized remainder live: cancels=%d calls=%d state=%+v",
+			broker.cancels, base.calls, runner.state)
+	}
+}
+
 func TestCurrencyStrengthFlatRecoveryCancelsWorkingRetryBeforeBrokerFlat(t *testing.T) {
 	base := &successfulCurrencyStrengthExecutor{
 		statusResult: execution.OrderResult{
@@ -2684,6 +2802,36 @@ func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
 				t.Fatalf("terminal exit restored as working: %+v", state)
 			}
 		})
+	}
+	correction := currencyStrengthStateFromRun(store.CurrencyStrengthRun{
+		SessionDate:    time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+		Status:         "exit_failed",
+		SignalSymbol:   "GBP/USD",
+		SignalSide:     "buy",
+		EntryStatus:    "filled",
+		EntryFilledQty: 100000,
+		ExitOrderID:    "EXIT-CORRECTION",
+		ExitStatus:     "correction_cancelled",
+		ExitFilledQty:  120000,
+	})
+	if !correction.ExitCorrection || !correction.ExitRetry ||
+		correction.ExitRetryMaxQty != 20000 ||
+		correction.ExitPriorOrderID != "EXIT-CORRECTION" {
+		t.Fatalf("cancelled correction did not restore remaining reversal: %+v", correction)
+	}
+	overfilled := currencyStrengthStateFromRun(store.CurrencyStrengthRun{
+		SessionDate:    time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+		Status:         "exit_failed",
+		SignalSymbol:   "GBP/USD",
+		SignalSide:     "buy",
+		EntryStatus:    "filled",
+		EntryFilledQty: 100000,
+		ExitOrderID:    "EXIT-OVERFILLED",
+		ExitStatus:     "residual",
+		ExitFilledQty:  130000,
+	})
+	if !overfilled.ExitCorrection || overfilled.ExitRetryMaxQty != 30000 {
+		t.Fatalf("durable overfill did not restore corrective obligation: %+v", overfilled)
 	}
 }
 

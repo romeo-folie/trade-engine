@@ -57,6 +57,7 @@ type currencyStrengthRunState struct {
 	ExitRequestedQty  float64                     `json:"exit_requested_qty,omitempty"`
 	ExitRetryMaxQty   float64                     `json:"exit_retry_max_qty,omitempty"`
 	ExitPriorOrderID  string                      `json:"exit_prior_order_id,omitempty"`
+	ExitCorrection    bool                        `json:"exit_correction,omitempty"`
 	ExitFillObserved  string                      `json:"exit_fill_observed_at,omitempty"`
 	ExitFillTimeQty   float64                     `json:"exit_fill_time_qty,omitempty"`
 	ExitedAt          string                      `json:"exited_at,omitempty"`
@@ -866,14 +867,17 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if r.state.ExitOrderID != "" {
 		return r.finalizeExitedState(ctx)
 	}
+	exitSide := r.currencyStrengthRecoveryExitSide()
 	if adopted, err := r.adoptFilledExit(ctx); err != nil {
 		return err
 	} else if adopted {
+		status := normalizeCurrencyStrengthOrderStatus(r.state.ExitStatus)
+		if status == "pending" || status == "partial" {
+			if _, workingErr := r.adoptWorkingExit(ctx, exitSide); workingErr != nil {
+				return workingErr
+			}
+		}
 		return r.finalizeExitedState(ctx)
-	}
-	exitSide := execution.OrderSideSell
-	if r.state.Side == "sell" {
-		exitSide = execution.OrderSideBuy
 	}
 	if adopted, err := r.adoptWorkingExit(ctx, exitSide); err != nil {
 		return err
@@ -881,8 +885,11 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		return r.finalizeExitedState(ctx)
 	}
 	if r.state.ExitRetry &&
-		r.state.Quantity > 0 &&
-		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity {
+		currencyStrengthCumulativeCovered(
+			r.state.Quantity,
+			r.state.ExitCumulativeQty,
+			r.state.ExitCorrection,
+		) {
 		logger.Warn("currency-strength: cumulative executions cover exit; awaiting broker detail or flat portfolio",
 			"cumulative_filled_qty", r.state.ExitCumulativeQty,
 			"entry_qty", r.state.Quantity)
@@ -1049,6 +1056,38 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	return r.finalizeExitedState(ctx)
 }
 
+func (r *currencyStrengthPaperRunner) currencyStrengthRecoveryExitSide() execution.OrderSide {
+	if r.state.ExitCorrection {
+		if r.state.Side == "sell" {
+			return execution.OrderSideSell
+		}
+		return execution.OrderSideBuy
+	}
+	if r.state.Side == "sell" {
+		return execution.OrderSideBuy
+	}
+	return execution.OrderSideSell
+}
+
+func (r *currencyStrengthPaperRunner) currencyStrengthExitProgressSign(side string) float64 {
+	if r.state.Side == "sell" {
+		if strings.EqualFold(side, "buy") {
+			return 1
+		}
+		if strings.EqualFold(side, "sell") {
+			return -1
+		}
+		return 0
+	}
+	if strings.EqualFold(side, "sell") {
+		return 1
+	}
+	if strings.EqualFold(side, "buy") {
+		return -1
+	}
+	return 0
+}
+
 func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool, error) {
 	if r.state == nil {
 		return false, nil
@@ -1073,6 +1112,7 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	type fillCandidate struct {
 		orderID, tradeID        string
 		filledQty, fillNotional float64
+		netExitQty              float64
 		filledAt                time.Time
 		reservedAt              int64
 		attempt                 int
@@ -1093,6 +1133,7 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 		}
 		candidate.filledQty += record.Qty
 		candidate.fillNotional += record.Price * record.Qty
+		candidate.netExitQty += r.currencyStrengthExitProgressSign(record.Side) * record.Qty
 		if record.FilledAt.After(candidate.filledAt) {
 			candidate.filledAt = record.FilledAt
 		}
@@ -1139,27 +1180,36 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	if selected == nil {
 		return false, nil
 	}
+	retryRequestQty := r.state.ExitRetryMaxQty
 	var observedCumulativeQty float64
 	for _, candidate := range candidates {
-		observedCumulativeQty += candidate.filledQty
+		observedCumulativeQty += candidate.netExitQty
 	}
-	cumulativeAdvanced := observedCumulativeQty > r.state.ExitCumulativeQty
-	if cumulativeAdvanced {
+	cumulativeChanged := (!r.state.ExitCorrection &&
+		observedCumulativeQty > r.state.ExitCumulativeQty+1e-6) ||
+		(r.state.ExitCorrection &&
+			observedCumulativeQty+1e-6 < r.state.ExitCumulativeQty)
+	if cumulativeChanged {
 		r.state.ExitCumulativeQty = observedCumulativeQty
 	}
-	derivedRetryMax := math.Max(
-		r.state.Quantity-r.state.ExitCumulativeQty,
-		0,
+	derivedRetryMax := currencyStrengthCumulativeRemainder(
+		r.state.Quantity,
+		r.state.ExitCumulativeQty,
+		r.state.ExitCorrection,
 	)
 	retryCapChanged := recoveringUnpersistedRetry &&
 		math.Abs(r.state.ExitRetryMaxQty-derivedRetryMax) > 1e-6
 	if retryCapChanged {
 		r.state.ExitRetryMaxQty = derivedRetryMax
 	}
-	cumulativeCoversEntry := r.state.Quantity > 0 &&
-		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity
-	if selected.orderID == r.state.ExitPriorOrderID && !cumulativeCoversEntry {
-		if cumulativeAdvanced || retryCapChanged {
+	cumulativeCoversEntry := currencyStrengthCumulativeCovered(
+		r.state.Quantity,
+		r.state.ExitCumulativeQty,
+		r.state.ExitCorrection,
+	)
+	if selected.orderID == r.state.ExitPriorOrderID &&
+		(!cumulativeCoversEntry || r.state.ExitCorrection) {
+		if cumulativeChanged || retryCapChanged {
 			if err := r.saveState(); err != nil {
 				logger.Warn("currency-strength: failed to persist late prior-order executions",
 					"order_id", selected.orderID, "err", err)
@@ -1171,8 +1221,12 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 		}
 		return false, nil
 	}
-	if cumulativeCoversEntry &&
-		observedCumulativeQty+1e-6 < r.state.Quantity {
+	observedCoversEntry := currencyStrengthCumulativeCovered(
+		r.state.Quantity,
+		observedCumulativeQty,
+		r.state.ExitCorrection,
+	)
+	if cumulativeCoversEntry && !observedCoversEntry {
 		// Durable cumulative history already proves the strategy obligation is
 		// covered, but broker execution detail is still lagging. Suppress every
 		// retry until records can hydrate the terminal order accurately.
@@ -1183,13 +1237,17 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	}
 	requestedQty := r.state.ExitRequestedQty
 	if recoveringUnpersistedRetry {
-		var priorFilledQty float64
-		for _, candidate := range candidates {
-			if candidate != selected {
-				priorFilledQty += candidate.filledQty
+		if r.state.ExitCorrection {
+			requestedQty = retryRequestQty
+		} else {
+			var priorFilledQty float64
+			for _, candidate := range candidates {
+				if candidate != selected {
+					priorFilledQty += candidate.netExitQty
+				}
 			}
+			requestedQty = r.state.Quantity - priorFilledQty
 		}
-		requestedQty = r.state.Quantity - priorFilledQty
 		if r.state.ExitRetryMaxQty > 0 && requestedQty > r.state.ExitRetryMaxQty {
 			requestedQty = r.state.ExitRetryMaxQty
 		}
@@ -1272,10 +1330,13 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	if matched == nil {
 		return false, nil
 	}
+	sameOrder := r.state.ExitOrderID == matched.OrderID
 	r.state.ExitOrderID = matched.OrderID
 	r.state.ExitTradeID = matched.TradeID
-	r.state.ExitStatus = "pending"
-	r.state.ExitFillTimeQty = 0
+	if !sameOrder {
+		r.state.ExitStatus = "pending"
+		r.state.ExitFillTimeQty = 0
+	}
 	if r.state.ExitRequestedQty <= 0 {
 		r.state.ExitRequestedQty = r.state.ExitRetryMaxQty
 		if r.state.ExitRequestedQty <= 0 {
@@ -1286,8 +1347,11 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	if err := r.saveState(); err != nil {
 		logger.Warn("currency-strength: failed to persist adopted working exit", "err", err)
 	}
-	cumulativeCoversEntry := r.state.Quantity > 0 &&
-		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity
+	cumulativeCoversEntry := currencyStrengthCumulativeCovered(
+		r.state.Quantity,
+		r.state.ExitCumulativeQty,
+		r.state.ExitCorrection,
+	)
 	oversizedRetry := r.state.ExitRetry &&
 		matched.RemainingQty > r.state.ExitRetryMaxQty+1e-6 &&
 		(r.state.ExitRetryMaxQty > 0 || cumulativeCoversEntry)
@@ -1350,6 +1414,29 @@ func currencyStrengthExitReferenceSequence(
 		return 0, 0, false
 	}
 	return reservedAt, int(attempt64), true
+}
+
+func currencyStrengthCumulativeRemainder(
+	entryQty, cumulativeExitQty float64,
+	correction bool,
+) float64 {
+	if correction {
+		return math.Max(cumulativeExitQty-entryQty, 0)
+	}
+	return math.Max(entryQty-cumulativeExitQty, 0)
+}
+
+func currencyStrengthCumulativeCovered(
+	entryQty, cumulativeExitQty float64,
+	correction bool,
+) bool {
+	if entryQty <= 0 {
+		return false
+	}
+	if correction {
+		return cumulativeExitQty <= entryQty+1e-6
+	}
+	return cumulativeExitQty+1e-6 >= entryQty
 }
 
 func (r *currencyStrengthPaperRunner) reserveExitTradeID() (string, error) {
@@ -1731,6 +1818,11 @@ func currencyStrengthRunHasEntry(status string) bool {
 }
 
 func currencyStrengthStateFromRun(run store.CurrencyStrengthRun) *currencyStrengthRunState {
+	exitStatus := strings.ToLower(strings.TrimSpace(run.ExitStatus))
+	exitCorrection := strings.HasPrefix(exitStatus, "correction_")
+	if exitCorrection {
+		exitStatus = strings.TrimPrefix(exitStatus, "correction_")
+	}
 	state := &currencyStrengthRunState{
 		AccountID:         run.AccountID,
 		Date:              run.SessionDate.Format("2006-01-02"),
@@ -1745,8 +1837,9 @@ func currencyStrengthStateFromRun(run store.CurrencyStrengthRun) *currencyStreng
 		Weakest:           run.WeakestCurrency,
 		StrengthGap:       run.StrengthGap,
 		ExitOrderID:       run.ExitOrderID,
-		ExitStatus:        run.ExitStatus,
+		ExitStatus:        exitStatus,
 		ExitCumulativeQty: run.ExitFilledQty,
+		ExitCorrection:    exitCorrection,
 	}
 	if run.EnteredAt != nil {
 		state.EnteredAt = run.EnteredAt.UTC().Format(time.RFC3339)
@@ -1757,13 +1850,24 @@ func currencyStrengthStateFromRun(run store.CurrencyStrengthRun) *currencyStreng
 	if state.EntryFilledQty > 0 {
 		state.Quantity = state.EntryFilledQty
 	}
-	switch strings.ToLower(strings.TrimSpace(run.ExitStatus)) {
+	switch exitStatus {
 	case "residual", "cancelled", "canceled", "rejected":
 		// The recorded order is terminal and the durable run remains
 		// exit_failed. Restore the obligation to find or submit its successor,
 		// not the old order as though it were still working.
+		if !state.ExitCorrection &&
+			state.Quantity > 0 &&
+			state.ExitCumulativeQty > state.Quantity+1e-6 {
+			// Signed durable attempts prove the exits crossed through flat even
+			// if the sidecar correction transition was unavailable.
+			state.ExitCorrection = true
+		}
 		state.ExitPriorOrderID = state.ExitOrderID
-		state.ExitRetryMaxQty = math.Max(state.Quantity-state.ExitCumulativeQty, 0)
+		state.ExitRetryMaxQty = currencyStrengthCumulativeRemainder(
+			state.Quantity,
+			state.ExitCumulativeQty,
+			state.ExitCorrection,
+		)
 		state.ExitOrderID = ""
 		state.ExitStatus = ""
 		state.ExitFillPrice = 0
@@ -1803,13 +1907,26 @@ func mergeCurrencyStrengthRunIntoState(
 	if run.EnteredAt != nil && state.EnteredAt == "" {
 		state.EnteredAt = run.EnteredAt.UTC().Format(time.RFC3339)
 	}
-	if run.ExitFilledQty > state.ExitCumulativeQty {
+	runExitStatus := strings.ToLower(strings.TrimSpace(run.ExitStatus))
+	runCorrection := strings.HasPrefix(runExitStatus, "correction_")
+	if runCorrection {
+		runExitStatus = strings.TrimPrefix(runExitStatus, "correction_")
+	}
+	if (!runCorrection && run.ExitFilledQty > state.ExitCumulativeQty) ||
+		(runCorrection && run.ExitFilledQty < state.ExitCumulativeQty) {
 		state.ExitCumulativeQty = run.ExitFilledQty
 	}
+	if state.ExitRetry && state.ExitOrderID == "" &&
+		!state.ExitCorrection &&
+		state.Quantity > 0 &&
+		state.ExitCumulativeQty > state.Quantity+1e-6 {
+		state.ExitCorrection = true
+	}
 	if state.ExitRetry && state.ExitPriorOrderID != "" {
-		state.ExitRetryMaxQty = math.Max(
-			state.Quantity-state.ExitCumulativeQty,
-			0,
+		state.ExitRetryMaxQty = currencyStrengthCumulativeRemainder(
+			state.Quantity,
+			state.ExitCumulativeQty,
+			state.ExitCorrection,
 		)
 	}
 	if run.ExitOrderID != "" &&
@@ -1818,7 +1935,8 @@ func mergeCurrencyStrengthRunIntoState(
 		sameOrder := state.ExitOrderID != "" &&
 			state.ExitOrderID == run.ExitOrderID
 		state.ExitOrderID = run.ExitOrderID
-		state.ExitStatus = run.ExitStatus
+		state.ExitStatus = runExitStatus
+		state.ExitCorrection = state.ExitCorrection || runCorrection
 		if !sameOrder {
 			// The daily row aggregates all exit attempts. It can seed a
 			// journal-only order identity, but broker records must hydrate that
@@ -1892,8 +2010,11 @@ func (r *currencyStrengthPaperRunner) exitExecutionFullyCovered() bool {
 	if r.state.ExitRequestedQty > 0 {
 		return r.state.ExitFilledQty+1e-6 >= r.state.ExitRequestedQty
 	}
-	return r.state.Quantity > 0 &&
-		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity
+	return currencyStrengthCumulativeCovered(
+		r.state.Quantity,
+		r.state.ExitCumulativeQty,
+		r.state.ExitCorrection,
+	)
 }
 
 func (r *currencyStrengthPaperRunner) exitRetryRemainder(positionQty float64) float64 {
@@ -1901,9 +2022,55 @@ func (r *currencyStrengthPaperRunner) exitRetryRemainder(positionQty float64) fl
 		return math.Max(r.state.ExitRequestedQty-r.state.ExitFilledQty, 0)
 	}
 	if r.state.ExitCumulativeQty > 0 {
-		return math.Max(r.state.Quantity-r.state.ExitCumulativeQty, 0)
+		return currencyStrengthCumulativeRemainder(
+			r.state.Quantity,
+			r.state.ExitCumulativeQty,
+			r.state.ExitCorrection,
+		)
 	}
 	return math.Abs(positionQty)
+}
+
+func (r *currencyStrengthPaperRunner) positionOpposesEntry(pos *execution.Position) bool {
+	if pos == nil {
+		return false
+	}
+	if r.state.Side == "sell" {
+		return pos.Quantity > 0
+	}
+	return pos.Quantity < 0
+}
+
+func (r *currencyStrengthPaperRunner) prepareCorrectiveExit(
+	ctx context.Context,
+	pos *execution.Position,
+) error {
+	r.state.ExitStatus = "residual"
+	r.capturePendingExitAudit()
+	if err := r.syncPendingExitAudit(ctx); err != nil {
+		logger.Warn("currency-strength: reversal exit history sync failed; will retry", "err", err)
+	}
+	r.state.ExitPriorOrderID = r.state.ExitOrderID
+	r.state.ExitOrderID = ""
+	r.state.ExitTradeID = ""
+	r.state.ExitStatus = ""
+	r.state.ExitFillPrice = 0
+	r.state.ExitFilledQty = 0
+	r.state.ExitRequestedQty = 0
+	r.state.ExitFillObserved = ""
+	r.state.ExitFillTimeQty = 0
+	r.state.ExitedAt = ""
+	r.state.ExitRetry = true
+	r.state.ExitCorrection = true
+	r.state.ExitRetryMaxQty = math.Abs(pos.Quantity)
+	if err := r.saveState(); err != nil {
+		return fmt.Errorf("currency-strength persist corrective exit state: %w", err)
+	}
+	logger.Error("currency-strength: exit reversal detected; corrective flatten required",
+		"symbol", r.state.Symbol,
+		"position_qty", pos.Quantity,
+		"correction_qty", r.state.ExitRetryMaxQty)
+	return nil
 }
 
 func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) error {
@@ -2025,6 +2192,11 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	case "filled":
 		if pos != nil {
 			now := r.currencyStrengthNow().UTC()
+			if !r.state.ExitCorrection && r.positionOpposesEntry(pos) {
+				// An opposite-signed position cannot be a pre-fill snapshot.
+				// Correct the execution-created reversal immediately.
+				return r.prepareCorrectiveExit(ctx, pos)
+			}
 			observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
 			if observedAt.IsZero() {
 				r.state.ExitFillObserved = now.Format(time.RFC3339)
@@ -2127,7 +2299,7 @@ func (r *currencyStrengthPaperRunner) ensureExitFillTime(ctx context.Context) (b
 	for _, record := range records {
 		if record.OrderID == r.state.ExitOrderID ||
 			currencyStrengthExitReferenceMatches(record.TradeID, baseRef, baseRef, false) {
-			cumulativeQty += record.Qty
+			cumulativeQty += r.currencyStrengthExitProgressSign(record.Side) * record.Qty
 		}
 		if record.OrderID == r.state.ExitOrderID {
 			filledQty += record.Qty
@@ -2137,7 +2309,10 @@ func (r *currencyStrengthPaperRunner) ensureExitFillTime(ctx context.Context) (b
 			}
 		}
 	}
-	cumulativeChanged := cumulativeQty > r.state.ExitCumulativeQty
+	cumulativeChanged := (!r.state.ExitCorrection &&
+		cumulativeQty > r.state.ExitCumulativeQty+1e-6) ||
+		(r.state.ExitCorrection &&
+			cumulativeQty+1e-6 < r.state.ExitCumulativeQty)
 	if cumulativeChanged {
 		r.state.ExitCumulativeQty = cumulativeQty
 	}
@@ -2229,13 +2404,7 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 	if r.journal == nil {
 		return nil
 	}
-	audit := currencyStrengthExitAudit{
-		OrderID:   r.state.ExitOrderID,
-		Status:    r.state.ExitStatus,
-		FillPrice: r.state.ExitFillPrice,
-		FilledQty: r.state.ExitFilledQty,
-		ExitedAt:  r.state.ExitedAt,
-	}
+	audit := r.currentExitAudit()
 	realizedPnL, err := r.realizedPnLUSD(ctx, audit)
 	if err != nil {
 		return err
@@ -2243,14 +2412,24 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 	return r.writeExitJournal(ctx, audit, realizedPnL)
 }
 
-func (r *currencyStrengthPaperRunner) capturePendingExitAudit() {
-	r.state.PendingExitAudits = append(r.state.PendingExitAudits, currencyStrengthExitAudit{
+func (r *currencyStrengthPaperRunner) currentExitAudit() currencyStrengthExitAudit {
+	status := r.state.ExitStatus
+	filledQty := r.state.ExitFilledQty
+	if r.state.ExitCorrection {
+		status = "correction_" + normalizeCurrencyStrengthOrderStatus(status)
+		filledQty = -math.Abs(filledQty)
+	}
+	return currencyStrengthExitAudit{
 		OrderID:   r.state.ExitOrderID,
-		Status:    r.state.ExitStatus,
+		Status:    status,
 		FillPrice: r.state.ExitFillPrice,
-		FilledQty: r.state.ExitFilledQty,
+		FilledQty: filledQty,
 		ExitedAt:  r.state.ExitedAt,
-	})
+	}
+}
+
+func (r *currencyStrengthPaperRunner) capturePendingExitAudit() {
+	r.state.PendingExitAudits = append(r.state.PendingExitAudits, r.currentExitAudit())
 }
 
 func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) error {
@@ -2283,7 +2462,7 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 	audit currencyStrengthExitAudit,
 ) (*float64, error) {
 	if normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus) != "filled" ||
-		audit.FillPrice <= 0 || audit.FilledQty <= 0 || r.state.EntryFillPrice <= 0 {
+		audit.FillPrice <= 0 || math.Abs(audit.FilledQty) <= 0 || r.state.EntryFillPrice <= 0 {
 		return nil, nil
 	}
 	parts := strings.Split(strings.ToUpper(r.state.Symbol), "/")

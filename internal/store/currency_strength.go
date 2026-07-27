@@ -184,23 +184,57 @@ func RecordCurrencyStrengthExit(
 			run_id, broker_order_id, status, fill_price, filled_qty, exited_at, realized_pnl
 		) VALUES ($1, $2, $3, NULLIF($4, 0::double precision), $5, $6, $7)
 		ON CONFLICT (run_id, broker_order_id) DO UPDATE SET
-			status=EXCLUDED.status,
-			fill_price=COALESCE(EXCLUDED.fill_price, currency_strength_exit_attempts.fill_price),
-			filled_qty=GREATEST(EXCLUDED.filled_qty, currency_strength_exit_attempts.filled_qty),
-			exited_at=COALESCE(EXCLUDED.exited_at, currency_strength_exit_attempts.exited_at),
-			realized_pnl=COALESCE(EXCLUDED.realized_pnl, currency_strength_exit_attempts.realized_pnl),
+			status=CASE
+			    WHEN ABS(EXCLUDED.filled_qty) >= ABS(currency_strength_exit_attempts.filled_qty)
+			        THEN EXCLUDED.status
+			    ELSE currency_strength_exit_attempts.status
+			END,
+			fill_price=CASE
+			    WHEN ABS(EXCLUDED.filled_qty) >= ABS(currency_strength_exit_attempts.filled_qty)
+			        THEN COALESCE(EXCLUDED.fill_price, currency_strength_exit_attempts.fill_price)
+			    ELSE currency_strength_exit_attempts.fill_price
+			END,
+			filled_qty=CASE
+			    WHEN EXCLUDED.filled_qty < 0
+			      OR currency_strength_exit_attempts.filled_qty < 0
+			        THEN LEAST(EXCLUDED.filled_qty, currency_strength_exit_attempts.filled_qty)
+			    ELSE GREATEST(EXCLUDED.filled_qty, currency_strength_exit_attempts.filled_qty)
+			END,
+			exited_at=CASE
+			    WHEN ABS(EXCLUDED.filled_qty) >= ABS(currency_strength_exit_attempts.filled_qty)
+			        THEN COALESCE(EXCLUDED.exited_at, currency_strength_exit_attempts.exited_at)
+			    ELSE currency_strength_exit_attempts.exited_at
+			END,
+			realized_pnl=CASE
+			    WHEN ABS(EXCLUDED.filled_qty) >= ABS(currency_strength_exit_attempts.filled_qty)
+			        THEN COALESCE(EXCLUDED.realized_pnl, currency_strength_exit_attempts.realized_pnl)
+			    ELSE currency_strength_exit_attempts.realized_pnl
+			END,
 			updated_at=NOW()`,
 		runID, run.ExitOrderID, run.ExitStatus, run.ExitFillPrice,
 		run.ExitFilledQty, run.ExitedAt, run.RealizedPnL,
 	); err != nil {
 		return err
 	}
+	var effectiveStatus string
+	var effectiveExitedAt *time.Time
+	if err := tx.QueryRow(ctx, `
+		SELECT status, exited_at
+		FROM currency_strength_exit_attempts
+		WHERE run_id=$1 AND broker_order_id=$2`,
+		runID, run.ExitOrderID,
+	).Scan(&effectiveStatus, &effectiveExitedAt); err != nil {
+		return err
+	}
 
 	tag, err := tx.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status=CASE
-		        WHEN LOWER($4)='filled' THEN 'exited'
-		        WHEN LOWER($4) IN ('cancelled','rejected','residual') THEN 'exit_failed'
+		        WHEN LOWER($4) IN ('filled','correction_filled') THEN 'exited'
+		        WHEN LOWER($4) IN (
+		            'cancelled','rejected','residual',
+		            'correction_cancelled','correction_rejected','correction_residual'
+		        ) THEN 'exit_failed'
 		        ELSE 'exit_submitted'
 		    END,
 		    exit_order_id=$3, exit_status=$4,
@@ -228,10 +262,10 @@ func RecordCurrencyStrengthExit(
 		      OR (
 		          status='exited'
 		          AND exit_order_id=$3
-		          AND LOWER($4)='filled'
+		          AND LOWER($4) IN ('filled','correction_filled')
 		      )
 		  )`,
-		runID, run.AccountID, run.ExitOrderID, run.ExitStatus, run.ExitedAt,
+		runID, run.AccountID, run.ExitOrderID, effectiveStatus, effectiveExitedAt,
 	)
 	if err := requireCurrencyStrengthRow(tag.RowsAffected(), err, "record exit"); err != nil {
 		return err

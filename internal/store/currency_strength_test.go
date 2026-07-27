@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"fmt"
+	"math"
 	"testing"
 	"time"
 
@@ -169,6 +170,89 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	if active == nil || !active.SessionDate.Equal(dates[2]) ||
 		active.ExitOrderID != "EXIT-PENDING" {
 		t.Fatalf("active prior-day obligation not found: %+v", active)
+	}
+}
+
+func TestCurrencyStrengthCorrectionAttemptsNetFilledQuantityAndPnL(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	accountID := "DU-CURRENCY-CORRECTION-TEST"
+	sessionDate := time.Date(2197, 7, 27, 0, 0, 0, 0, time.UTC)
+	t.Cleanup(func() {
+		_, _ = db.Exec(
+			context.Background(),
+			`DELETE FROM currency_strength_runs WHERE account_id=$1 AND session_date=$2`,
+			accountID, sessionDate,
+		)
+	})
+	if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate, Timezone: "UTC",
+		StrengthStart: "06:00", StrengthEnd: "09:00", ExitTime: "18:00",
+		RankInstruments: []string{"GBP/USD"}, TradeInstruments: []string{"GBP/USD"},
+		Units: 100000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	enteredAt := sessionDate.Add(9 * time.Hour)
+	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate,
+		SignalSymbol: "GBP/USD", SignalSide: "buy",
+		EntryOrderID: "ENTRY-CORRECTION", EntryStatus: "filled",
+		EntryFillPrice: 1.1, EntryFilledQty: 100000, EnteredAt: &enteredAt,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	overfillAt := sessionDate.Add(18 * time.Hour)
+	overfillPnL := 650.0
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate,
+		ExitOrderID: "EXIT-OVERFILLED", ExitStatus: "residual",
+		ExitFillPrice: 1.105, ExitFilledQty: 130000,
+		ExitedAt: &overfillAt, RealizedPnL: &overfillPnL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	correctionAt := overfillAt.Add(time.Minute)
+	partialCorrectionPnL := -50.0
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate,
+		ExitOrderID: "EXIT-CORRECTION", ExitStatus: "correction_partial",
+		ExitFillPrice: 1.100, ExitFilledQty: -10000,
+		ExitedAt: &correctionAt, RealizedPnL: &partialCorrectionPnL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	finalCorrectionPnL := -150.0
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate,
+		ExitOrderID: "EXIT-CORRECTION", ExitStatus: "correction_filled",
+		ExitFillPrice: 1.100, ExitFilledQty: -30000,
+		ExitedAt: &correctionAt, RealizedPnL: &finalCorrectionPnL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A stale partial snapshot replayed after the terminal correction must not
+	// regress signed quantity, status, timestamp, or realized P&L.
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate,
+		ExitOrderID: "EXIT-CORRECTION", ExitStatus: "correction_partial",
+		ExitFillPrice: 1.100, ExitFilledQty: -10000,
+		ExitedAt: &correctionAt, RealizedPnL: &partialCorrectionPnL,
+	}); err != nil {
+		t.Fatalf("stale correction replay: %v", err)
+	}
+	run, err := store.GetCurrencyStrengthRunByDate(ctx, db, accountID, sessionDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run == nil || run.Status != "exited" ||
+		run.ExitStatus != "correction_filled" ||
+		math.Abs(run.ExitFilledQty-100000) > 1e-6 ||
+		run.RealizedPnL == nil || math.Abs(*run.RealizedPnL-500) > 1e-6 {
+		t.Fatalf("signed correction attempts did not net accurately: %+v", run)
 	}
 }
 
