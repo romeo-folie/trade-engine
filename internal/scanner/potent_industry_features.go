@@ -845,6 +845,18 @@ func rankPotentIndustryMembers(
 	for _, prepared := range groups {
 		group := &result.Groups[prepared.index]
 		if !group.Qualified || group.Features == nil {
+			for _, item := range prepared.members {
+				evaluation := memberByTicker[item.member.Ticker]
+				if evaluation == nil || evaluation.Outcome != "not_ranked" {
+					continue
+				}
+				evaluation.Outcome = "not_qualified"
+				evaluation.FailureStage = "group_not_qualified"
+				evaluation.FailureReason = fmt.Sprintf(
+					"industry group %q did not qualify at %s: %s",
+					group.Industry, group.FailureStage, group.FailureReason,
+				)
+			}
 			continue
 		}
 		type ranked struct {

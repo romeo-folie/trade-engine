@@ -3,6 +3,7 @@ package scanner
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,6 +250,13 @@ func TestEvaluatePotentIndustriesRequiresMappedCompletedBenchmarks(t *testing.T)
 		unmapped.Groups[0].Features.AdvanceShare != 1 {
 		t.Fatalf("available breadth diagnostics were erased by missing benchmark: %+v",
 			unmapped.Groups[0].Features)
+	}
+	for _, member := range unmapped.Members {
+		if member.Outcome != "not_qualified" ||
+			member.FailureStage != "group_not_qualified" ||
+			!strings.Contains(member.FailureReason, "benchmark_unmapped") {
+			t.Fatalf("unmapped group left an unpersistable member outcome: %+v", member)
+		}
 	}
 
 	policy.SectorBenchmarks["FINANCIALS"] = "XLF"

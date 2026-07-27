@@ -278,6 +278,47 @@ func TestPotentIndustryStoreRowsRetainsUnknownTaxonomyDenominator(t *testing.T) 
 	}
 }
 
+func TestPotentIndustryStoreRowsUsePersistableOutcomeForUnqualifiedGroup(
+	t *testing.T,
+) {
+	target, asOf, decisionAt := potentTestTimes()
+	members := potentTestMembers(
+		decisionAt, "Banks", "Financials", []float64{1000, 900, 800, 700, 600},
+	)
+	bars := make(map[string][]data.Candle, len(members))
+	for _, member := range members {
+		bars[member.Ticker] = potentTestBars(
+			member.Ticker, target, 20, constantPotentReturns(253, .002), 1.5,
+		)
+	}
+	market := potentTestBars(
+		"SPY", target, 100, constantPotentReturns(253, .0001), 1,
+	)
+	policy := potentTestPolicy()
+	delete(policy.SectorBenchmarks, "FINANCIALS")
+	evaluation := EvaluatePotentIndustries(
+		members, bars, market, nil, target, asOf, decisionAt, policy,
+	)
+	universe := &store.SwingUniverseVersion{
+		ID: "universe-1", Provider: "fixture", AsOf: asOf,
+	}
+	_, rows, err := potentIndustryStoreRows(
+		"run-1", universe, members, asOf, evaluation,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != len(members) {
+		t.Fatalf("persisted rows = %d, want %d", len(rows), len(members))
+	}
+	for _, row := range rows {
+		if row.Outcome != "not_qualified" ||
+			row.FailureStage != "group_not_qualified" {
+			t.Fatalf("unpersistable non-qualifying member row: %+v", row)
+		}
+	}
+}
+
 func TestPotentIndustryRunnerAttributesPartialProviderFailures(t *testing.T) {
 	target, _, decisionAt := potentTestTimes()
 	session := potentTestSession(target)
