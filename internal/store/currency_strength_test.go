@@ -77,6 +77,43 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+		SessionDate:      dates[1],
+		Timezone:         "America/New_York",
+		StrengthStart:    "07:00",
+		StrengthEnd:      "10:00",
+		ExitTime:         "19:00",
+		RankInstruments:  []string{"AUD/USD", "NZD/USD", "USD/CAD"},
+		TradeInstruments: []string{"AUD/USD"},
+		Units:            250000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	immutable, err := store.GetCurrencyStrengthRunByDate(ctx, db, dates[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if immutable == nil || immutable.Timezone != "UTC" || immutable.Units != 100000 ||
+		immutable.StrengthStart != "06:00" {
+		t.Fatalf("completed run configuration was mutated: %+v", immutable)
+	}
+	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		SessionDate:    dates[2],
+		SignalSymbol:   "GBP/USD",
+		SignalSide:     "buy",
+		EntryOrderID:   "ENTRY-PENDING",
+		EntryStatus:    "pending",
+		EntryFilledQty: 0,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	submitted, err := store.GetCurrencyStrengthRunByDate(ctx, db, dates[2])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submitted == nil || submitted.Status != "entry_submitted" {
+		t.Fatalf("pending entry presented as entered: %+v", submitted)
+	}
 	pendingExitAt := dates[2].Add(18 * time.Hour)
 	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
 		SessionDate: dates[2],

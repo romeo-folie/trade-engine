@@ -130,9 +130,16 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 	switch run.Status {
 	case "no_signal":
 		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Outcome: "), displayText(run.SkipReason, "no qualifying signal"))
+	case "entry_failed":
+		fmt.Fprintf(
+			&b, "%sorder %s · %s\n",
+			labelStyle.Render("Entry failed: "),
+			displayText(run.EntryOrderID, "unknown"),
+			displayText(run.EntryStatus, "rejected"),
+		)
 	case "failed":
 		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Failure: "), displayText(run.Error, "unknown error"))
-	case "entered", "exit_submitted", "exited":
+	case "entry_submitted", "entered", "exit_submitted", "exit_failed", "exited":
 		if run.StrongestCurrency != "" || run.WeakestCurrency != "" {
 			fmt.Fprintf(
 				&b, "%s%s strongest · %s weakest · gap %.4f\n",
@@ -148,7 +155,7 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 			displayText(run.EntryStatus, "unknown"),
 			formatFill(run.EntryFillPrice, run.EntryFilledQty),
 		)
-		if run.Status == "exit_submitted" || run.Status == "exited" {
+		if run.Status == "exit_submitted" || run.Status == "exit_failed" || run.Status == "exited" {
 			fmt.Fprintf(
 				&b, "%sorder %s · %s%s",
 				labelStyle.Render("Exit: "),
@@ -170,11 +177,11 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 func renderCurrencyStrengthStatus(status string) string {
 	label := strings.ReplaceAll(status, "_", " ")
 	switch status {
-	case "entered", "exit_submitted":
+	case "entry_submitted", "entered", "exit_submitted":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(label)
 	case "exited", "no_signal":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Render(label)
-	case "failed":
+	case "entry_failed", "exit_failed", "failed":
 		return lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Render(label)
 	default:
 		return dimText.Render(label)

@@ -3,8 +3,9 @@ CREATE TABLE currency_strength_runs (
     session_date DATE NOT NULL UNIQUE,
     status TEXT NOT NULL DEFAULT 'scheduled'
         CHECK (status IN (
-            'scheduled', 'evaluating', 'no_signal', 'entered',
-            'exit_submitted', 'exited', 'failed'
+            'scheduled', 'evaluating', 'no_signal',
+            'entry_submitted', 'entered', 'entry_failed',
+            'exit_submitted', 'exit_failed', 'exited', 'failed'
         )),
     timezone TEXT NOT NULL,
     strength_start TEXT NOT NULL,

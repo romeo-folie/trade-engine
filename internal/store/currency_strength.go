@@ -2,8 +2,11 @@ package store
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -57,6 +60,10 @@ func StartCurrencyStrengthRun(
 			rank_instruments, trade_instruments, units
 		) VALUES ($1, 'scheduled', $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (session_date) DO UPDATE SET
+			status=CASE
+			    WHEN currency_strength_runs.status='failed' THEN 'scheduled'
+			    ELSE currency_strength_runs.status
+			END,
 			timezone=EXCLUDED.timezone,
 			strength_start=EXCLUDED.strength_start,
 			strength_end=EXCLUDED.strength_end,
@@ -64,7 +71,9 @@ func StartCurrencyStrengthRun(
 			rank_instruments=EXCLUDED.rank_instruments,
 			trade_instruments=EXCLUDED.trade_instruments,
 			units=EXCLUDED.units,
-			updated_at=NOW()`,
+			error=NULL,
+			updated_at=NOW()
+		WHERE currency_strength_runs.status IN ('scheduled', 'evaluating', 'failed')`,
 		run.SessionDate, run.Timezone, run.StrengthStart, run.StrengthEnd,
 		run.ExitTime, run.RankInstruments, run.TradeInstruments, run.Units,
 	)
@@ -78,13 +87,13 @@ func MarkCurrencyStrengthEvaluating(
 	db *pgxpool.Pool,
 	sessionDate time.Time,
 ) error {
-	_, err := db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status='evaluating', error=NULL, updated_at=NOW()
 		WHERE session_date=$1 AND status IN ('scheduled', 'evaluating')`,
 		sessionDate,
 	)
-	return err
+	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "mark evaluating")
 }
 
 // RecordCurrencyStrengthNoSignal stores a completed decision that placed no
@@ -95,13 +104,14 @@ func RecordCurrencyStrengthNoSignal(
 	sessionDate time.Time,
 	reason string,
 ) error {
-	_, err := db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status='no_signal', skip_reason=$2, error=NULL, updated_at=NOW()
-		WHERE session_date=$1`,
+		WHERE session_date=$1
+		  AND status IN ('scheduled', 'evaluating')`,
 		sessionDate, reason,
 	)
-	return err
+	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record no-signal")
 }
 
 // RecordCurrencyStrengthEntry persists the ranked currencies, chosen pair, and
@@ -111,23 +121,31 @@ func RecordCurrencyStrengthEntry(
 	db *pgxpool.Pool,
 	run CurrencyStrengthRun,
 ) error {
-	_, err := db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
-		SET status='entered',
+		SET status=CASE
+		        WHEN LOWER($8)='filled' THEN 'entered'
+		        WHEN LOWER($8) IN ('cancelled','rejected') THEN 'entry_failed'
+		        ELSE 'entry_submitted'
+		    END,
 		    strongest_currency=COALESCE(NULLIF($2,''), strongest_currency),
 		    weakest_currency=COALESCE(NULLIF($3,''), weakest_currency),
 		    strength_gap=COALESCE(NULLIF($4, 0), strength_gap),
 		    signal_symbol=$5, signal_side=$6, skip_reason=NULL,
 		    entry_order_id=$7, entry_status=$8,
-		    entry_fill_price=NULLIF($9, 0), entry_filled_qty=NULLIF($10, 0),
+		    entry_fill_price=COALESCE(NULLIF($9, 0), entry_fill_price),
+		    entry_filled_qty=COALESCE(NULLIF($10, 0), entry_filled_qty),
 		    entered_at=COALESCE($11, entered_at), error=NULL, updated_at=NOW()
-		WHERE session_date=$1`,
+		WHERE session_date=$1
+		  AND status IN (
+		      'scheduled', 'evaluating', 'entry_submitted', 'entered', 'entry_failed'
+		  )`,
 		run.SessionDate, run.StrongestCurrency, run.WeakestCurrency,
 		run.StrengthGap, run.SignalSymbol, run.SignalSide,
 		run.EntryOrderID, run.EntryStatus, run.EntryFillPrice,
 		run.EntryFilledQty, run.EnteredAt,
 	)
-	return err
+	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record entry")
 }
 
 // RecordCurrencyStrengthExit persists the flatten order acknowledgement. A
@@ -138,17 +156,56 @@ func RecordCurrencyStrengthExit(
 	db *pgxpool.Pool,
 	run CurrencyStrengthRun,
 ) error {
-	_, err := db.Exec(ctx, `
+	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
-		SET status=CASE WHEN LOWER($3)='filled' THEN 'exited' ELSE 'exit_submitted' END,
+		SET status=CASE
+		        WHEN LOWER($3)='filled' THEN 'exited'
+		        WHEN LOWER($3) IN ('cancelled','rejected') THEN 'exit_failed'
+		        ELSE 'exit_submitted'
+		    END,
 		    exit_order_id=$2, exit_status=$3,
-		    exit_fill_price=NULLIF($4, 0), exit_filled_qty=NULLIF($5, 0),
+		    exit_fill_price=COALESCE(NULLIF($4, 0), exit_fill_price),
+		    exit_filled_qty=COALESCE(NULLIF($5, 0), exit_filled_qty),
 		    exited_at=$6, realized_pnl=$7, error=NULL, updated_at=NOW()
-		WHERE session_date=$1`,
+		WHERE session_date=$1
+		  AND status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')`,
 		run.SessionDate, run.ExitOrderID, run.ExitStatus, run.ExitFillPrice,
 		run.ExitFilledQty, run.ExitedAt, run.RealizedPnL,
 	)
-	return err
+	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record exit")
+}
+
+// GetCurrencyStrengthRunByDate returns the durable daily state used to restore
+// decision and order lifecycle state after a process restart.
+func GetCurrencyStrengthRunByDate(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	sessionDate time.Time,
+) (*CurrencyStrengthRun, error) {
+	row := db.QueryRow(ctx, `
+		SELECT id, session_date, status, timezone, strength_start, strength_end,
+		       exit_time, rank_instruments, trade_instruments, units,
+		       COALESCE(strongest_currency,''), COALESCE(weakest_currency,''),
+		       COALESCE(strength_gap,0), COALESCE(signal_symbol,''),
+		       COALESCE(signal_side,''), COALESCE(skip_reason,''),
+		       COALESCE(entry_order_id,''), COALESCE(entry_status,''),
+		       COALESCE(entry_fill_price,0), COALESCE(entry_filled_qty,0),
+		       entered_at, COALESCE(exit_order_id,''), COALESCE(exit_status,''),
+		       COALESCE(exit_fill_price,0), COALESCE(exit_filled_qty,0),
+		       exited_at, realized_pnl, COALESCE(error,''),
+		       created_at, updated_at
+		FROM currency_strength_runs
+		WHERE session_date=$1`,
+		sessionDate,
+	)
+	var run CurrencyStrengthRun
+	if err := scanCurrencyStrengthRun(row, &run); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &run, nil
 }
 
 // RecordCurrencyStrengthFailure keeps strategy failures visible instead of
@@ -162,7 +219,8 @@ func RecordCurrencyStrengthFailure(
 	_, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status='failed', error=$2, updated_at=NOW()
-		WHERE session_date=$1`,
+		WHERE session_date=$1
+		  AND status IN ('scheduled', 'evaluating')`,
 		sessionDate, message,
 	)
 	return err
@@ -206,21 +264,39 @@ func ListCurrencyStrengthRunsPage(
 	var out []CurrencyStrengthRun
 	for rows.Next() {
 		var run CurrencyStrengthRun
-		if err := rows.Scan(
-			&run.ID, &run.SessionDate, &run.Status, &run.Timezone,
-			&run.StrengthStart, &run.StrengthEnd, &run.ExitTime,
-			&run.RankInstruments, &run.TradeInstruments, &run.Units,
-			&run.StrongestCurrency, &run.WeakestCurrency, &run.StrengthGap,
-			&run.SignalSymbol, &run.SignalSide, &run.SkipReason,
-			&run.EntryOrderID, &run.EntryStatus, &run.EntryFillPrice,
-			&run.EntryFilledQty, &run.EnteredAt, &run.ExitOrderID,
-			&run.ExitStatus, &run.ExitFillPrice, &run.ExitFilledQty,
-			&run.ExitedAt, &run.RealizedPnL, &run.Error,
-			&run.CreatedAt, &run.UpdatedAt,
-		); err != nil {
+		if err := scanCurrencyStrengthRun(rows, &run); err != nil {
 			return nil, err
 		}
 		out = append(out, run)
 	}
 	return out, rows.Err()
+}
+
+type currencyStrengthScanner interface {
+	Scan(...any) error
+}
+
+func scanCurrencyStrengthRun(scanner currencyStrengthScanner, run *CurrencyStrengthRun) error {
+	return scanner.Scan(
+		&run.ID, &run.SessionDate, &run.Status, &run.Timezone,
+		&run.StrengthStart, &run.StrengthEnd, &run.ExitTime,
+		&run.RankInstruments, &run.TradeInstruments, &run.Units,
+		&run.StrongestCurrency, &run.WeakestCurrency, &run.StrengthGap,
+		&run.SignalSymbol, &run.SignalSide, &run.SkipReason,
+		&run.EntryOrderID, &run.EntryStatus, &run.EntryFillPrice,
+		&run.EntryFilledQty, &run.EnteredAt, &run.ExitOrderID,
+		&run.ExitStatus, &run.ExitFillPrice, &run.ExitFilledQty,
+		&run.ExitedAt, &run.RealizedPnL, &run.Error,
+		&run.CreatedAt, &run.UpdatedAt,
+	)
+}
+
+func requireCurrencyStrengthRow(rows int64, err error, operation string) error {
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("currency-strength %s affected %d rows, want 1", operation, rows)
+	}
+	return nil
 }
