@@ -37,13 +37,32 @@ func init() {
 	webCmd.Flags().StringVarP(&webPort, "port", "p", "8080", "Port to listen on")
 }
 
+// webServerConfig builds the standalone web server's configuration.
+//
+// EngineConfig must be carried through: internal/web derives the pipeline
+// snapshot (nodes, edges, analysis mode) from it. A nil config makes the
+// snapshot fall back to a generic single-analyst graph, which silently
+// misrepresents an ensemble or specialist-mode deployment.
+func webServerConfig(port string, cfg *config.Config) web.Config {
+	return web.Config{
+		Port:           port,
+		Host:           "127.0.0.1",
+		AllowedOrigins: []string{"http://localhost:" + port, "http://127.0.0.1:" + port},
+		EngineConfig:   cfg,
+	}
+}
+
 func runWebCmd(cmd *cobra.Command, _ []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
 	// Load engine config so /api/system/config reflects real values instead of
-	// 503ing. Non-fatal: the UI still loads without it.
-	if _, err := config.Load(); err != nil {
+	// 503ing, and so the pipeline snapshot describes the configured topology.
+	// Non-fatal: the UI still loads without it, but on a nil config the snapshot
+	// degrades to the single-analyst fallback graph.
+	cfg, err := config.Load()
+	if err != nil {
+		cfg = nil
 		cmd.PrintErrf("Warning: config unavailable — settings page will show no data (%v)\n", err)
 	}
 
@@ -58,11 +77,7 @@ func runWebCmd(cmd *cobra.Command, _ []string) error {
 
 	bus := events.New()
 
-	srv := web.NewServer(web.Config{
-		Port:           webPort,
-		Host:           "127.0.0.1",
-		AllowedOrigins: []string{"http://localhost:" + webPort, "http://127.0.0.1:" + webPort},
-	}, bus, nil)
+	srv := web.NewServer(webServerConfig(webPort, cfg), bus, nil)
 	if err := srv.Start(ctx); err != nil {
 		return fmt.Errorf("web server failed to start: %w", err)
 	}

@@ -195,14 +195,18 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {/* ── Analyst Template ── */}
         {isAnalyst && (
           <div>
-            {d.provider && (
-              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>
-                {d.provider.toUpperCase()}
-              </div>
-            )}
-            {!d.provider && (
-              <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>LLM ENSEMBLE</div>
-            )}
+            {/* Identify the analyst by model, never by provider. Card titles
+                differ by mode — specialist cards are titled by role
+                ("Technical"), ensemble cards by model — so this line is
+                suppressed when the title already carries the model name. */}
+            {(() => {
+              const model = (d.meta as Record<string, unknown> | undefined)?.model as string | undefined;
+              if (!model) {
+                return <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>LLM ENSEMBLE</div>;
+              }
+              if (model.toLowerCase() === d.label.toLowerCase()) return null;
+              return <div className={styles.subValue} style={{ fontSize: 9, marginBottom: 8 }}>{model}</div>;
+            })()}
             {(() => {
               const entries = d.verdictEntries as VerdictEntry[] | undefined;
               const hasVerdicts = entries && entries.length > 0;
@@ -235,14 +239,10 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
 
         {isRiskSpecialist && (
           <div>
+            {/* Model only — the provider line and the static role description
+                were redundant with the card's own RISK SPECIALIST heading. */}
             <div className={styles.subValue}>
               {((d.meta as Record<string, unknown>)?.model as string) || 'MODEL NOT CONFIGURED'}
-            </div>
-            <div className={styles.subValue} style={{ marginTop: 4 }}>
-              {d.provider ? d.provider.toUpperCase() : 'SPECIALIST REVIEW'}
-            </div>
-            <div className={styles.subValue} style={{ borderTop: `1px solid ${colors.border}`, marginTop: 8, paddingTop: 6, opacity: 0.65 }}>
-              REVIEWS ALL SPECIALIST FINDINGS
             </div>
             <div className={styles.feedStatusRow} style={{ marginTop: 8 }}>
               <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>

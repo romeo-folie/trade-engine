@@ -8,7 +8,7 @@
  * Clicking a node opens the DrillDownPanel.
  */
 import { useCallback, useMemo, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 import { LayoutGrid, Lock, LockOpen, Crosshair } from 'lucide-react';
 import {
   ReactFlow,
@@ -25,7 +25,7 @@ import {
 import '@xyflow/react/dist/style.css';
 import { useAnimationFrame } from 'framer-motion';
 import type { NodeState, PipelineTopology } from '../../types/protocol';
-import type { NodeMetrics } from '../../hooks/useEngineSocket';
+import type { AnalystVote, NodeMetrics } from '../../hooks/useEngineSocket';
 import { useEngineSocketContext } from '../../contexts/EngineSocketContext';
 import { useWatchlist } from '../../hooks/useWatchlist';
 import { useModelEnsemble } from '../../hooks/useModelEnsemble';
@@ -74,6 +74,44 @@ function modelAccentColor(provider: string): string {
   }
 }
 
+interface StagedNode {
+  id: string;
+  stage: number;
+  kind: string;
+}
+
+/**
+ * Lays nodes out in one vertical column per stage and returns an id → position
+ * lookup.
+ *
+ * Bucketing by stage up front replaces the previous per-node rescans of the
+ * whole node list (filter + findIndex inside a map, i.e. O(n²) — and O(n³) in
+ * resetLayout, which nested a `find` inside that filter). It also removes the
+ * duplicated layout arithmetic that had to be kept in sync by hand between the
+ * initial build and the reset handler.
+ */
+function computeStagePositions(items: StagedNode[]): Map<string, { x: number; y: number }> {
+  const byStage = new Map<number, StagedNode[]>();
+  for (const item of items) {
+    const bucket = byStage.get(item.stage);
+    if (bucket) bucket.push(item);
+    else byStage.set(item.stage, [item]);
+  }
+
+  const positions = new Map<string, { x: number; y: number }>();
+  for (const [stage, group] of byStage) {
+    const groupGap = group.length > 2 ? 200 : 240;
+    const x = getStageX(stage);
+    group.forEach((item, groupIdx) => {
+      const estimatedH = estimatedNodeHeight(item.id, item.kind);
+      let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
+      if (item.id === 'arbiter_node') y -= 245;
+      positions.set(item.id, { x, y });
+    });
+  }
+  return positions;
+}
+
 // ── Types ────────────────────────────────────────────────────────────────────
 
 interface HubGraphProps {
@@ -115,32 +153,47 @@ interface CanvasIconButtonProps {
   active?: boolean;
 }
 
+// Hoisted out of the component: these two objects are otherwise reallocated on
+// every render of a component that re-renders with each engine event.
+const CANVAS_BUTTON_BASE: CSSProperties = {
+  width: 28,
+  height: 28,
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  borderRadius: 4,
+  cursor: 'pointer',
+  backdropFilter: 'blur(4px)',
+  transition: 'all 0.15s ease',
+  padding: 0,
+};
+
+const CANVAS_BUTTON_ACTIVE: CSSProperties = {
+  ...CANVAS_BUTTON_BASE,
+  background: 'rgba(57, 255, 20, 0.1)',
+  border: '1px solid rgba(57, 255, 20, 0.4)',
+  color: colors.acidGreen,
+};
+
+const CANVAS_BUTTON_IDLE: CSSProperties = {
+  ...CANVAS_BUTTON_BASE,
+  background: 'rgba(13, 13, 17, 0.85)',
+  border: '1px solid rgba(26, 26, 34, 0.8)',
+  color: colors.textDim,
+};
+
 function CanvasIconButton({ icon, onClick, title, active }: CanvasIconButtonProps) {
   return (
     <button
+      type="button"
       onClick={onClick}
       title={title}
-      style={{
-        width: 28,
-        height: 28,
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        background: active ? 'rgba(57, 255, 20, 0.1)' : 'rgba(13, 13, 17, 0.85)',
-        border: `1px solid ${active ? 'rgba(57, 255, 20, 0.4)' : 'rgba(26, 26, 34, 0.8)'}`,
-        borderRadius: 4,
-        color: active ? '#39FF14' : '#6B7280',
-        cursor: 'pointer',
-        backdropFilter: 'blur(4px)',
-        transition: 'all 0.15s ease',
-        padding: 0,
-      }}
-      onMouseEnter={e => {
-        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#F0F0F0';
-      }}
-      onMouseLeave={e => {
-        if (!active) (e.currentTarget as HTMLButtonElement).style.color = '#6B7280';
-      }}
+      aria-label={title}
+      aria-pressed={active}
+      // Hover is a CSS concern; the previous inline mouseenter/mouseleave
+      // handlers wrote to element.style on every pointer crossing.
+      className={active ? styles.canvasButtonActive : styles.canvasButton}
+      style={active ? CANVAS_BUTTON_ACTIVE : CANVAS_BUTTON_IDLE}
     >
       {icon}
     </button>
@@ -167,12 +220,23 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
   // ── Build React Flow nodes ──────────────────────────────────────────────
 
   const rfNodes = useMemo<Node<PipelineNodeData>[]>(() => {
+    // Index the lookups this pass performs once per node, so the map below stays
+    // linear instead of rescanning these arrays for every node.
+    const perfByModel = new Map(modelEnsemble.map(m => [m.modelName, m]));
+    const selectedAnalystSet = new Set(selectedAnalysts);
+    const voteByRole = new Map<string, AnalystVote>();
+    const voteByModel = new Map<string, AnalystVote>();
+    for (const vote of analystVotes) {
+      if (vote.role != null && !voteByRole.has(vote.role)) voteByRole.set(vote.role, vote);
+      if (!voteByModel.has(vote.model)) voteByModel.set(vote.model, vote);
+    }
+
     // The snapshot is the configured graph. Performance data enriches analyst
     // cards but must never add models that are absent from this topology.
     const configuredNodes = nodes.map(node => {
       if (node.kind !== 'analyst') return node;
       const model = (node.meta?.model as string | undefined) ?? node.label;
-      const perf = modelEnsemble.find(m => m.modelName === model);
+      const perf = perfByModel.get(model);
       if (!perf) return node;
       return {
         ...node,
@@ -182,15 +246,10 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     });
 
     const allRiskPassed = lastRiskChecks.length === 0 || lastRiskChecks.every(c => c.passed);
+    const positions = computeStagePositions(configuredNodes);
 
     return configuredNodes.map((n) => {
-      const group = configuredNodes.filter(candidate => candidate.stage === n.stage);
-      const groupGap = group.length > 2 ? 200 : 240;
-      const groupIdx = group.findIndex(gn => gn.id === n.id);
-      const estimatedH = estimatedNodeHeight(n.id, n.kind);
-      const x = getStageX(n.stage);
-      let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
-      if (n.id === 'arbiter_node') y -= 245;
+      const { x, y } = positions.get(n.id) ?? { x: getStageX(n.stage), y: CY };
 
       const metrics = nodeMetrics[n.id] ?? null;
       const liveLastEventAt = metrics?.lastEventAt
@@ -204,7 +263,7 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
       const model = n.meta?.model as string | undefined;
 
       // Specialist roles are stable even when two roles share a model.
-      const vote = analystVotes.find(v => role ? v.role === role : v.model === (model ?? n.label));
+      const vote = role ? voteByRole.get(role) : voteByModel.get(model ?? n.label);
 
       return {
         id: n.id,
@@ -226,7 +285,7 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
           accentColor: provider ? modelAccentColor(provider) : undefined,
           // Per-analyst live vote
           ...(vote ? { verdict: vote.action, voteConfidence: vote.confidence, skipped: vote.skipped } : {}),
-          isChosen: selectedAnalysts.includes(n.id),
+          isChosen: selectedAnalystSet.has(n.id),
           verdictEntries: role
             ? (verdictHistory[`role:${role}`] ?? [])
             : model ? (verdictHistory[model] ?? []) : (verdictHistory[n.label] ?? []),
@@ -248,13 +307,18 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
   // ── Build React Flow edges ──────────────────────────────────────────────
 
   const rfEdges = useMemo<Edge[]>(() => {
+    // One index for the three per-edge lookups below (source exists, target
+    // exists, source kind) — previously three linear scans on every edge.
+    const nodeById = new Map(rfNodes.map(n => [n.id, n]));
+    const selectedAnalystSet = new Set(selectedAnalysts);
+
     const isNodeRecentlyActive = (nodeId: string): boolean => {
       const lastEventAt = nodeMetrics[nodeId]?.lastEventAt;
       if (!lastEventAt) return false;
       // Execution cards (executor, portfolio): treat as active if data is present.
       // Trades/positions are infrequent — a recency gate would show IDLE immediately
       // after the 5s window even though the last trade data is still displayed.
-      const node = rfNodes.find(n => n.id === nodeId);
+      const node = nodeById.get(nodeId);
       if (node?.data.kind === 'execution') {
         const allPassed = node.data.allRiskPassed !== false;
         if (node.id === 'executor') return !!(node.data.lastTrade) && allPassed;
@@ -269,8 +333,8 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     const makeEdge = (src: string, tgt: string, edgeKind: string) => {
       const exactEventActive = recentEventSignatures[src]?.target === tgt && isNodeRecentlyActive(src);
       let active = exactEventActive;
-      if (src === 'indicator_engine' && rfNodes.find(n => n.id === tgt)?.data.kind === 'analyst') {
-        active = selectedAnalysts.includes(tgt) && isNodeRecentlyActive(tgt);
+      if (src === 'indicator_engine' && nodeById.get(tgt)?.data.kind === 'analyst') {
+        active = selectedAnalystSet.has(tgt) && isNodeRecentlyActive(tgt);
       }
       if (edgeKind === 'bypass') {
         active = exactEventActive;
@@ -310,7 +374,7 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     };
 
     return topology.edges
-      .filter(edge => rfNodes.some(n => n.id === edge.source) && rfNodes.some(n => n.id === edge.target))
+      .filter(edge => nodeById.has(edge.source) && nodeById.has(edge.target))
       .map(edge => makeEdge(edge.source, edge.target, edge.kind));
   }, [rfNodes, topology, nodeMetrics, recentEventSignatures, lastRiskChecks, selectedAnalysts]);
 
@@ -498,19 +562,13 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
 
   const resetLayout = useCallback(() => {
     setRfNodes((currentNodes) => {
+      const stageById = new Map(nodes.map(configured => [configured.id, configured.stage]));
+      const positions = computeStagePositions(
+        currentNodes.map(n => ({ id: n.id, stage: stageById.get(n.id) ?? 0, kind: n.data.kind })),
+      );
       return currentNodes.map(n => {
-        const stage = nodes.find(configured => configured.id === n.id)?.stage ?? 0;
-        const group = currentNodes.filter(candidate =>
-          (nodes.find(configured => configured.id === candidate.id)?.stage ?? 0) === stage
-        );
-        const estimatedH = estimatedNodeHeight(n.id, n.data.kind);
-        const groupGap = group.length > 2 ? 200 : 240;
-        const groupIdx = group.findIndex(gn => gn.id === n.id);
-        const x = getStageX(stage);
-        let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);
-        if (n.id === 'arbiter_node') y -= 245;
-
-        return { ...n, position: { x, y } };
+        const position = positions.get(n.id);
+        return position ? { ...n, position } : n;
       });
     });
     // Give React a tick to apply new positions before fitting
@@ -555,15 +613,7 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
       <canvas ref={canvasRef} className={styles.particleCanvas} style={{ pointerEvents: 'none' }} />
 
       {/* Floating Controls — vertical icon stack, bottom left */}
-      <div style={{
-        position: 'absolute',
-        bottom: 20,
-        left: 20,
-        zIndex: 10,
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 8,
-      }}>
+      <div className={styles.canvasControls}>
         <CanvasIconButton
           icon={<Crosshair size={14} />}
           onClick={() => fitViewRef.current?.({ padding: 0.15, duration: 400 })}
