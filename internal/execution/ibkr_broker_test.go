@@ -20,6 +20,37 @@ func newTestIBKRBroker(serverURL string) *IBKRBroker {
 	})
 }
 
+func TestIBKRGetOrderStatusAggregatesAllExecutions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/orders":
+			_, _ = w.Write([]byte(`{"orders":[]}`))
+		case "/v1/api/iserver/account/trades":
+			if got := r.URL.Query().Get("days"); got != "7" {
+				t.Errorf("trades days = %q, want 7", got)
+			}
+			_, _ = w.Write([]byte(`[
+				{"orderId":42,"status":"Filled","price":"1.105","size":"40000"},
+				{"orderId":42,"status":"Filled","price":"1.106","size":"60000"},
+				{"orderId":99,"status":"Filled","price":"1.200","size":"1000"}
+			]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := newTestIBKRBroker(srv.URL).GetOrderStatus(t.Context(), "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Status != "filled" || result.FilledQty != 100000 ||
+		result.FilledPrice < 1.10559 || result.FilledPrice > 1.10561 {
+		t.Fatalf("executions were not aggregated: %+v", result)
+	}
+}
+
 // ─── PlaceOrder ───────────────────────────────────────────────────────────────
 
 func TestIBKRPlaceOrder(t *testing.T) {

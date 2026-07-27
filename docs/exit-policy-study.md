@@ -223,4 +223,17 @@ required for the definitive frequency/performance study.
 - Every feature: dedicated **branch → PR → `feature-dev:code-reviewer` before push → Monitor the PR**. Never push to `main` directly. Use a plain branch (NOT a worktree) unless asked.
 - All new trading behavior is **default-off config + PAPER-first**. Live config is `~/.tradeengine/config.yaml` (NOT the repo's gitignored `./config.yaml`).
 - After a PR merges, save a `project` memory summarizing it (see `MEMORY.md`).
+- Every feature and every review fix requires an end-to-end verification record
+  before push. Trace the complete path from config/input through strategy
+  decision, broker/provider response, sidecar and journal persistence, database
+  state, restart/recovery, UI/API rendering, and notifications wherever those
+  surfaces apply. For order-lifecycle work, cover accepted, filled, partial,
+  cancelled, rejected, delayed, retried, duplicate, stale-snapshot, outage, and
+  opposite-position cases as applicable. A unit test for the edited branch is
+  not sufficient; the invariant must hold across every boundary and after
+  restart. Scope-expanding fixes must pause for a state-machine map and new
+  acceptance tests rather than being patched incrementally.
+- The pre-push record must include focused tests, full `go test ./...`, `go vet
+  ./...`, `go build ./...`, relevant race tests, a complete diff self-review,
+  and a fresh unresolved-thread check immediately before pushing.
 - Relevant memories: `project_te_exit_policy_study_pr470`, `project_te_stock_signal_baseline`, `project_te_execution_study_pr433`, `project_te_bracket_exits_pr435`, `project_te_sell_exit_and_rth_guard`, `project_te_entry_quality_gates_pr434`.

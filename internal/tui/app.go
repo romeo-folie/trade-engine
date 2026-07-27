@@ -122,22 +122,26 @@ type Model struct {
 	OnReject  func(ctx context.Context, signalID string) error
 
 	// View data (refreshed on poll ticks)
-	tradeData     views.TradeHistoryData
-	signalData    views.SignalFeedData
-	watchlistData views.WatchlistData
-	configData    views.ConfigData
-	orbData       views.ORBViewData
+	tradeData            views.TradeHistoryData
+	signalData           views.SignalFeedData
+	watchlistData        views.WatchlistData
+	configData           views.ConfigData
+	orbData              views.ORBViewData
+	currencyStrengthData views.CurrencyStrengthViewData
 
 	// Selection state for sub-views
-	selectedTrade     int
-	selectedSignal    int
-	selectedWatchlist int
-	selectedConfig    int
-	orbScroll         int // line offset into the ORB view (it scrolls by line, not by row selection)
-	showTradeDetail   bool
-	tradeDetail       views.TradeDetailData // cached on open; avoids per-frame DB query
-	configEditing     bool
-	configInput       string
+	selectedTrade        int
+	selectedSignal       int
+	selectedWatchlist    int
+	selectedConfig       int
+	intradayStrategy     string // "orb" | "currency"
+	intradayScroll       int    // line offset within the active Intraday strategy page
+	orbPage              int
+	currencyStrengthPage int
+	showTradeDetail      bool
+	tradeDetail          views.TradeDetailData // cached on open; avoids per-frame DB query
+	configEditing        bool
+	configInput          string
 
 	// Status message (briefly shown after actions)
 	statusMsg     string
@@ -160,10 +164,11 @@ func New(bus *events.Bus, mode string, brokerView execution.BrokerView) Model {
 		mode = "paper"
 	}
 	m := Model{
-		activeView: ViewDashboard,
-		bus:        bus,
-		mode:       mode,
-		brokerView: brokerView,
+		activeView:       ViewDashboard,
+		bus:              bus,
+		mode:             mode,
+		brokerView:       brokerView,
+		intradayStrategy: "orb",
 	}
 	// Subscribe eagerly in New() so the subscription is part of the model value
 	// returned to Bubble Tea — Init() has a value receiver, so setting fields
@@ -354,7 +359,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedPos = (m.selectedPos + 1) % len(m.dashData.Positions)
 				}
 			case ViewORB:
-				m.scrollORB(1)
+				m.scrollIntraday(1)
 			}
 			return m, nil
 		case "k", "up":
@@ -389,9 +394,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.selectedPos = (m.selectedPos - 1 + len(m.dashData.Positions)) % len(m.dashData.Positions)
 				}
 			case ViewORB:
-				m.scrollORB(-1)
+				m.scrollIntraday(-1)
 			}
 			return m, nil
+		case "o":
+			if m.activeView == ViewORB {
+				m.intradayStrategy = "orb"
+				m.intradayScroll = 0
+				return m, nil
+			}
+		case "c":
+			if m.activeView == ViewORB {
+				m.intradayStrategy = "currency"
+				m.intradayScroll = 0
+				return m, nil
+			}
+		case "h", "left":
+			if m.activeView == ViewORB {
+				m.pageIntraday(-1)
+				return m, nil
+			}
+		case "l", "right":
+			if m.activeView == ViewORB {
+				m.pageIntraday(1)
+				return m, nil
+			}
 		case "a":
 			// Approve pending signal
 			if m.activeView == ViewDashboard && m.dashData.Mode == "manual" && !m.showDetail && len(m.dashData.PendingSignals) > 0 {
@@ -481,7 +508,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh ORB view on any ORB-related event.
 		switch evt.Type {
 		case events.ORBStateChanged, events.ORBCandidatesReady, events.ORBTradeUpdate:
-			m.orbData = views.FetchORBViewData(ctx)
+			snapshot := m.orbData.SnapshotAt
+			if m.orbPage == 0 {
+				snapshot = time.Time{}
+			}
+			m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, snapshot)
 		}
 		// Continue listening for events.
 		if m.sub != nil {
@@ -497,7 +528,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.signalData = views.FetchSignalFeed(ctx, 50)
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.configData = views.FetchConfigData(ctx, m.mode)
-		m.orbData = views.FetchORBViewData(ctx)
+		snapshot := m.orbData.SnapshotAt
+		if m.orbPage == 0 {
+			snapshot = time.Time{}
+		}
+		m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, snapshot)
+		currencySnapshot := m.currencyStrengthData.SnapshotAt
+		if m.currencyStrengthPage == 0 {
+			currencySnapshot = time.Time{}
+		}
+		m.currencyStrengthData = views.FetchCurrencyStrengthViewDataAt(
+			ctx, m.currencyStrengthPage, currencySnapshot,
+		)
 		// Next engine run-cycle time, published by the engine process to engine_state.
 		m.nextCycleAt = time.Time{}
 		if v, ok, err := store.GetEngineState(ctx, store.EngineStateNextCycleAt); err == nil && ok {
@@ -549,13 +591,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// scrollORB moves the ORB view's line offset by delta, clamped to the content
-// bounds at the current terminal size. Clamping against fresh data here (not
-// just at render time) keeps the stored offset in range, so one keypress after
-// a data shrink responds immediately instead of draining a stale offset.
-func (m *Model) scrollORB(delta int) {
-	maxScroll := views.ORBMaxScroll(m.orbData, m.width, m.bodyHeight())
-	m.orbScroll = min(max(m.orbScroll+delta, 0), maxScroll)
+// scrollIntraday moves within the already-loaded strategy page. History
+// pagination is deliberately separate so j/k never changes the DB result set.
+func (m *Model) scrollIntraday(delta int) {
+	var maxScroll int
+	if m.intradayStrategy == "currency" {
+		maxScroll = views.CurrencyStrengthMaxScroll(
+			m.currencyStrengthData, m.width, m.bodyHeight(),
+		)
+	} else {
+		maxScroll = views.ORBMaxScroll(m.orbData, m.width, m.bodyHeight())
+	}
+	m.intradayScroll = min(max(m.intradayScroll+delta, 0), maxScroll)
+}
+
+// pageIntraday loads an adjacent history page for the active strategy. delta=1
+// means older and delta=-1 means newer.
+func (m *Model) pageIntraday(delta int) {
+	ctx := context.Background()
+	if m.intradayStrategy == "currency" {
+		if delta > 0 && !m.currencyStrengthData.HasOlder {
+			return
+		}
+		if delta < 0 && !m.currencyStrengthData.HasNewer {
+			return
+		}
+		m.currencyStrengthPage = max(m.currencyStrengthPage+delta, 0)
+		m.currencyStrengthData = views.FetchCurrencyStrengthViewDataAt(
+			ctx, m.currencyStrengthPage, m.currencyStrengthData.SnapshotAt,
+		)
+	} else {
+		if delta > 0 && !m.orbData.HasOlder {
+			return
+		}
+		if delta < 0 && !m.orbData.HasNewer {
+			return
+		}
+		m.orbPage = max(m.orbPage+delta, 0)
+		m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, m.orbData.SnapshotAt)
+	}
+	m.intradayScroll = 0
 }
 
 // bodyHeight is the terminal rows available to the body:
@@ -689,7 +764,12 @@ func (m Model) renderBody(height int) string {
 	case ViewConfig:
 		return views.RenderConfig(m.configData, m.width, height)
 	case ViewORB:
-		return views.RenderORBView(m.orbData, m.width, height, m.orbScroll)
+		if m.intradayStrategy == "currency" {
+			return views.RenderCurrencyStrengthView(
+				m.currencyStrengthData, m.width, height, m.intradayScroll,
+			)
+		}
+		return views.RenderORBView(m.orbData, m.width, height, m.intradayScroll)
 	default:
 		return "unknown view"
 	}
@@ -698,7 +778,7 @@ func (m Model) renderBody(height int) string {
 func (m Model) renderStatusBar() string {
 	left := " [1-6] switch view  [tab] next  [q] quit"
 	if m.activeView == ViewORB {
-		left = " [j/k] scroll  [1-6] switch view  [q] quit"
+		left = " [o/c] strategy  [j/k] scroll  [h/l or ←/→] pages  [q] quit"
 	}
 	if m.activeView == ViewConfig {
 		if m.configEditing {

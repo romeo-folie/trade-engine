@@ -97,6 +97,7 @@ type OrderResult struct {
 // bracket confirmation flow does not reliably return them).
 type WorkingOrder struct {
 	OrderID      string
+	TradeID      string  // client/order reference supplied when the order was placed
 	Ticker       string  // resolved symbol when the broker provides one (else raw conid)
 	Conid        string  // IBKR contract id (empty for non-IBKR brokers)
 	Side         string  // "buy" | "sell"

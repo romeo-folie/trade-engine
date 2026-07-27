@@ -138,6 +138,7 @@ func (b *IBKRBroker) EquityCurve(_ context.Context, _, _ string) (EquityHistory,
 // without relying on child order IDs that may not have been captured at placement.
 type IBKRTradeRecord struct {
 	OrderID  string
+	TradeID  string
 	Conid    string
 	Symbol   string // human-readable when conid is resolved (e.g. "EUR/USD"); otherwise the raw API symbol
 	Side     string // "buy" | "sell"
@@ -158,6 +159,7 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 	}
 	var resp []struct {
 		OrderID   int64     `json:"orderId"`
+		OrderRef  string    `json:"order_ref"`
 		Symbol    string    `json:"symbol"`
 		Side      string    `json:"side"` // "B" | "S"
 		Size      ibkrFloat `json:"size"`
@@ -192,6 +194,7 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 		}
 		out = append(out, IBKRTradeRecord{
 			OrderID:  fmt.Sprintf("%d", o.OrderID),
+			TradeID:  o.OrderRef,
 			Conid:    conidStr,
 			Symbol:   symbol,
 			Side:     side,
@@ -239,6 +242,7 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 		}
 		out = append(out, WorkingOrder{
 			OrderID:      o.OrderID.String(),
+			TradeID:      o.OrderRef,
 			Ticker:       ticker,
 			Conid:        conidStr,
 			Side:         side,
@@ -258,6 +262,7 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 // take-profit/stop-loss leg; both are 0 when the gateway omits them.
 type ibkrOrderRow struct {
 	OrderID      ibkrID    `json:"orderId"`
+	OrderRef     string    `json:"order_ref"`
 	Conid        int       `json:"conid"`
 	Ticker       string    `json:"ticker"`
 	Side         string    `json:"side"`   // "BUY" | "SELL" (sometimes "B" | "S")
@@ -271,6 +276,7 @@ type ibkrOrderRow struct {
 func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 	var resp []struct {
 		OrderID   int64     `json:"orderId"`
+		OrderRef  string    `json:"order_ref"`
 		Symbol    string    `json:"symbol"`
 		Side      string    `json:"side"` // "B" | "S"
 		Size      ibkrFloat `json:"size"`
@@ -305,6 +311,7 @@ func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 		}
 		out = append(out, BrokerOrder{
 			BrokerOrderID: fmt.Sprintf("%d", o.OrderID),
+			TradeID:       o.OrderRef,
 			Symbol:        symbol,
 			Side:          side,
 			Qty:           float64(o.Size),

@@ -443,9 +443,40 @@ func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fi
 // forex session) — all sharing the same date, so a date-only sort would drop same-date
 // sessions arbitrarily under LIMIT (which hid the futures session from the dashboard).
 func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBSession, error) {
+	return GetRecentORBSessionsPage(ctx, db, limit, 0)
+}
+
+// GetRecentORBSessionsPage returns up to limit ORB sessions at a zero-based
+// offset. It powers explicit history pagination in the Intraday dashboard while
+// GetRecentORBSessions preserves the original newest-page API for other callers.
+func GetRecentORBSessionsPage(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	limit, offset int,
+) ([]ORBSession, error) {
+	return GetRecentORBSessionsPageAt(ctx, db, limit, offset, time.Time{})
+}
+
+// GetRecentORBSessionsPageAt pins OFFSET pagination to a database-time
+// snapshot. Sessions inserted after snapshotAt cannot shift rows between pages.
+func GetRecentORBSessionsPageAt(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	limit, offset int,
+	snapshotAt time.Time,
+) ([]ORBSession, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	rows, err := db.Query(ctx, `
 		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
-		FROM orb_sessions ORDER BY date DESC, created_at DESC LIMIT $1`, limit)
+		FROM orb_sessions
+		WHERE ($3::timestamptz IS NULL OR created_at <= $3)
+		ORDER BY date DESC, created_at DESC, id DESC
+		LIMIT $1 OFFSET $2`, limit, offset, optionalSnapshotTime(snapshotAt))
 	if err != nil {
 		return nil, err
 	}
@@ -463,6 +494,27 @@ func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]O
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// ORBSessionsSnapshotTime returns a database-clock boundary for stable history
+// pagination. Using the DB clock avoids client/server clock skew.
+func ORBSessionsSnapshotTime(ctx context.Context, db *pgxpool.Pool) (time.Time, error) {
+	return HistorySnapshotTime(ctx, db)
+}
+
+// HistorySnapshotTime returns a shared database-clock boundary for stable
+// dashboard pagination.
+func HistorySnapshotTime(ctx context.Context, db *pgxpool.Pool) (time.Time, error) {
+	var snapshot time.Time
+	err := db.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&snapshot)
+	return snapshot, err
+}
+
+func optionalSnapshotTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t
 }
 
 // GetRecentORBTrades returns up to limit ORB trades ordered by created_at descending.

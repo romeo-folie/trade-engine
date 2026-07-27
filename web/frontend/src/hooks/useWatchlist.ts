@@ -7,11 +7,13 @@ export interface WatchlistTicker {
   timeframes: string[];
 }
 
+const EMPTY_WATCHLIST: WatchlistTicker[] = [];
+
 export function useWatchlist(): WatchlistTicker[] {
   const { data } = useSWR<{ tickers: WatchlistTicker[] }>(
     '/api/node/watchlist',
     jsonFetcher,
     { refreshInterval: 30_000 },
   );
-  return data?.tickers ?? [];
+  return data?.tickers ?? EMPTY_WATCHLIST;
 }
