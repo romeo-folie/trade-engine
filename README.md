@@ -274,28 +274,62 @@ te options backfill-iv                Backfill options implied-volatility histor
 te orb stats                          Inspect opening-range performance
 ```
 
-### Models, knowledge, and research
+### Models and knowledge
 
 ```text
-te models list|test|compare|performance
-te graph seed|entities|relationships|review
-te embeddings status|reindex
+te models list                         List configured analyst models
+te models test <prompt>                Send a prompt to each enabled model
+te models compare <ticker>             Compare model analysis for one ticker
+te models performance                  Summarize realized performance by model
+te graph seed                          Seed the knowledge graph
+te graph entities                      List graph entities
+te graph relationships <ticker>        Inspect a ticker's graph relationships
+te graph review                        Review extracted relationships
+te embeddings status                   Show embedding provider and index status
+te embeddings reindex                  Rebuild stored embeddings
+```
 
-te report daily|weekly|performance
-te report scanner-funnel
-te report weekly-leaders
-te report potent-industries
-te report premarket-episodic
-te report backtest <id>
-te report compare <id1> <id2>
+### Reports
 
-te backtest run|list|compare
-te backtest orb|orb-compare|orb-options|orb-sweep|orb-fade
-te backtest opening-shock|trend-continuation|sweep-reclaim
-te backtest currency-strength
+```text
+te report daily                        Generate the daily trading summary
+te report weekly                       Generate the weekly trading summary
+te report performance                  Report portfolio and model performance
+te report scanner-funnel               Audit scanner conversion and outcomes
+te report weekly-leaders               Review full-universe leadership studies
+te report potent-industries            Review industry potency and breadth
+te report premarket-episodic           Review premarket gap/catalyst observations
+te report backtest <id>                Generate one backtest report
+te report compare <id1> <id2>          Compare two backtest reports
+```
 
-te study execution
-te study pullback-frequency
+Use `te report <command> --help` for date ranges, filters, output paths, and
+report-specific options.
+
+### Backtests
+
+```text
+te backtest run                         Run a general historical backtest
+te backtest list                        List saved backtest runs
+te backtest compare                     Compare saved runs
+te backtest orb                         Replay the forex/CFD ORB strategy
+te backtest orb-compare                 Compare ORB rule variants
+te backtest orb-options                 Replay options ORB
+te backtest orb-sweep                   Search ORB parameter robustness
+te backtest orb-fade                    Replay failed-break fades
+te backtest opening-shock               Replay opening-shock reversals
+te backtest trend-continuation          Replay delayed trend continuation
+te backtest sweep-reclaim               Replay liquidity sweep/reclaim entries
+te backtest currency-strength           Replay FX currency-strength rotation
+```
+
+### Offline studies
+
+Studies audit recorded data without starting the trading engine.
+
+```text
+te study execution                      Replay stock trades against 1m bars
+te study pullback-frequency             Measure deterministic pullback frequency
 ```
 
 ## Build Phase Status
