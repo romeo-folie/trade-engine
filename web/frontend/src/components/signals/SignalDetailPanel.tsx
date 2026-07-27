@@ -3,6 +3,7 @@ import { fmtPrice, fmtDate } from '../../utils/format';
 import { ChamferedBox } from '../common/ChamferedBox';
 import { colors } from '../../styles/tokens';
 import CornerCard from '../CornerCard';
+import { verdictColor } from '../../utils/verdict';
 import styles from './SignalDetailPanel.module.css';
 
 /* ── Types ─────────────────────────────────────────────────────────────────── */
@@ -10,7 +11,9 @@ import styles from './SignalDetailPanel.module.css';
 export interface AnalystData {
   name: string;
   role?: string;
-  verdict: string;       // 'LONG' | 'SHORT' | 'NEUTRAL'
+  // 'LONG' | 'SHORT' | 'HOLD' | 'WAIT' | 'TRADE' | 'SKIP' | 'ADD' | 'NEUTRAL'.
+  // See utils/verdict.ts — NEUTRAL now means only "no classifiable action".
+  verdict: string;
   confidence: number;    // 0–1
   description: string;
   weight: number;
@@ -64,12 +67,6 @@ function analystBracketColor(index: number, active: boolean): string {
 
 function analystBarColor(index: number): string {
   return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
-}
-
-function verdictColor(verdict: string): string {
-  if (verdict === 'LONG') return 'var(--accent)';
-  if (verdict === 'SHORT') return 'var(--red)';
-  return 'var(--amber)';
 }
 
 function executionLabel(status: string): { label: string; dotClass: string } {

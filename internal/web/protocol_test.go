@@ -35,7 +35,7 @@ func TestPipelineTopologySingleModelCollapsesEnsemble(t *testing.T) {
 	}
 	assertNodeIDs(t, nodes,
 		"news_api", "alpaca", "news_enricher", "indicator_engine",
-		"analyst-cheap", "risk_manager", "executor", "blocked_signals", "approvals", "portfolio",
+		"analyst-cheap", "risk_manager", "blocked_signals", "approvals", "executor", "portfolio",
 	)
 	assertMissingNode(t, nodes, "analyst-mid")
 	assertMissingNode(t, nodes, "consensus")
@@ -118,6 +118,46 @@ func TestPipelineTopologyIncludesRuntimeApprovalBranch(t *testing.T) {
 	nodes, topology := pipelineTopology(cfg)
 	assertHasNode(t, nodes, "approvals")
 	assertEdge(t, topology.Edges, "risk_manager", "approvals", "conditional")
+}
+
+// The approval queue is a gate, not an outcome: Engine.ApproveSignal executes
+// the signal it approves, so the queue must have an outgoing edge into the
+// executor and must sit upstream of it. Blocked is the only terminal branch —
+// signals are dropped there. Both previously sat at the executor's own depth
+// with no edge leaving the queue, drawing manual approval as a dead end.
+func TestPipelineTopologyApprovalQueueGatesTheExecutor(t *testing.T) {
+	for _, specialist := range []bool{false, true} {
+		cfg := topologyTestConfig()
+		cfg.Analysis.SpecialistModeEnabled = specialist
+
+		nodes, topology := pipelineTopology(cfg)
+		assertEdge(t, topology.Edges, "approvals", "executor", "conditional")
+
+		stage := map[string]int{}
+		for _, n := range nodes {
+			stage[n.ID] = n.Stage
+		}
+		if stage["approvals"] >= stage["executor"] {
+			t.Errorf("specialist=%v: approvals stage %d must precede executor stage %d",
+				specialist, stage["approvals"], stage["executor"])
+		}
+		if stage["executor"] >= stage["portfolio"] {
+			t.Errorf("specialist=%v: executor stage %d must precede portfolio stage %d",
+				specialist, stage["executor"], stage["portfolio"])
+		}
+		if stage["blocked_signals"] != stage["approvals"] {
+			t.Errorf("specialist=%v: blocked_signals stage %d should share the risk-outcome stage %d",
+				specialist, stage["blocked_signals"], stage["approvals"])
+		}
+
+		// Blocked is terminal — nothing may leave it.
+		for _, e := range topology.Edges {
+			if e.Source == "blocked_signals" {
+				t.Errorf("specialist=%v: blocked_signals is terminal but has outgoing edge → %s",
+					specialist, e.Target)
+			}
+		}
+	}
 }
 
 func TestToWebEventsSpecialistRiskReviewFansInFromDirectionalRoles(t *testing.T) {

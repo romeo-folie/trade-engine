@@ -130,7 +130,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
               {d.eventCount > 0 ? d.eventCount.toLocaleString() : '—'}
             </div>
             <div className={styles.feedStatusRow}>
-              <span className={nodeActive ? styles.feedBadgeActive : styles.feedBadgeIdle}>
+              {/* A live Blocked card means signals were rejected, so it takes the
+                  red badge rather than the acid green used for healthy activity. */}
+              <span className={
+                !nodeActive ? styles.feedBadgeIdle
+                  : d.nodeId === 'blocked_signals' ? styles.feedBadgeBlocked
+                    : styles.feedBadgeActive
+              }>
                 {nodeActive ? (d.nodeId === 'approvals' ? 'WAITING APPROVAL' : 'BLOCKED') : 'IDLE'}
               </span>
             </div>

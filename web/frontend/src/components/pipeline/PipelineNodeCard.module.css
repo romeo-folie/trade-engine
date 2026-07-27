@@ -114,6 +114,21 @@
   letter-spacing: 0.05em;
 }
 
+/* Active badge for a negative outcome. The generic active badge is the acid
+   green used for healthy live activity, which read as approval on the Blocked
+   card — the one node whose activity means signals were rejected. */
+.feedBadgeBlocked {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--red);
+  background: rgba(239, 68, 68, 0.12);
+  border: 1px solid rgba(239, 68, 68, 0.4);
+  border-radius: 2px;
+  padding: 2px 6px;
+  letter-spacing: 0.05em;
+}
+
 /* Arbiter (Signal Router) */
 .arbiter {
   display: flex;

@@ -1,0 +1,1 @@
+function t(e){const r=(e??"").trim().toUpperCase();return r==="BUY"||r==="LONG"?"LONG":r==="SELL"||r==="SHORT"?"SHORT":r||"NEUTRAL"}function a(e){switch(t(e)){case"LONG":return"var(--accent)";case"SHORT":return"var(--red)";case"TRADE":return"var(--accent)";case"WAIT":case"ADD":return"var(--amber)";default:return"var(--text-dim)"}}export{t as a,a as v};

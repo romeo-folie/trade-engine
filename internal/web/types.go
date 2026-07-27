@@ -39,13 +39,80 @@ func analystName(idx int) string {
 	return "Analyst"
 }
 
-// mapVerdict converts BUY/SELL/HOLD → LONG/SHORT/NEUTRAL.
+// mapVerdict converts an engine Action into the dashboard's verdict vocabulary.
+//
+// Directional actions are renamed to the position they imply (BUY→LONG,
+// SELL→SHORT). Every other action passes through unchanged.
+//
+// This used to be a `default:` that returned NEUTRAL for everything that was
+// not BUY or SELL, which erased five distinct decisions:
+//
+//	HOLD  — drop this ticker; genuine disengagement
+//	WAIT  — real catalyst, poor entry timing; re-evaluate next tick
+//	TRADE — ORB candidate passed the gate
+//	SKIP  — ORB candidate was filtered out
+//	ADD   — scanner wants the ticker on the watchlist
+//
+// HOLD and WAIT are opposite intentions, and rendering a passing ORB candidate
+// (TRADE) identically to a rejected one (SKIP) was actively misleading.
+//
+// NEUTRAL is now reserved for an action the dashboard genuinely cannot
+// classify — in practice the empty action left by an analyst that errored.
 func mapVerdict(action analysis.Action) string {
 	switch action {
 	case analysis.ActionBuy:
 		return "LONG"
 	case analysis.ActionSell:
 		return "SHORT"
+	case analysis.ActionHold, analysis.ActionWait, analysis.ActionTrade,
+		analysis.ActionSkip, analysis.ActionAdd:
+		return string(action)
+	default:
+		return "NEUTRAL"
+	}
+}
+
+// deriveEnsembleVerdict picks the majority verdict across active analysts.
+//
+// Ties resolve in the same order internal/analysis/ensemble.go uses, so this
+// summary agrees with the decision the engine actually reached: HOLD (genuine
+// disengagement) wins outright, opposed LONG/SHORT ties fall to HOLD rather
+// than inventing a direction, a directional verdict beats WAIT, and SKIP beats
+// TRADE so ORB stays conservative.
+//
+// Resolving against a fixed precedence list rather than ranging over the votes
+// map also keeps the outcome deterministic — Go randomises map iteration order,
+// so a tie would otherwise resolve differently from one request to the next.
+func deriveEnsembleVerdict(votes map[string]int) string {
+	maxVotes := 0
+	for _, n := range votes {
+		if n > maxVotes {
+			maxVotes = n
+		}
+	}
+	if maxVotes == 0 {
+		// No active analysts — there is no opinion to summarise.
+		return "NEUTRAL"
+	}
+
+	leads := func(v string) bool { return votes[v] == maxVotes }
+	switch {
+	case leads("HOLD"):
+		return "HOLD"
+	case leads("LONG") && leads("SHORT"):
+		return "HOLD"
+	case leads("LONG"):
+		return "LONG"
+	case leads("SHORT"):
+		return "SHORT"
+	case leads("SKIP"):
+		return "SKIP"
+	case leads("TRADE"):
+		return "TRADE"
+	case leads("WAIT"):
+		return "WAIT"
+	case leads("ADD"):
+		return "ADD"
 	default:
 		return "NEUTRAL"
 	}
@@ -136,18 +203,10 @@ func mapAnalystResults(raw []byte) ([]APIAnalystResult, *APIEnsembleResult) {
 		}
 	}
 
-	ensembleVerdict := "NEUTRAL"
-	maxVotes := 0
-	for _, v := range []string{"LONG", "SHORT", "NEUTRAL"} {
-		if votes[v] > maxVotes {
-			maxVotes = votes[v]
-			ensembleVerdict = v
-		}
-	}
-	// Tie-break: if LONG and SHORT have equal non-zero votes, return NEUTRAL
-	if votes["LONG"] > 0 && votes["LONG"] == votes["SHORT"] {
-		ensembleVerdict = "NEUTRAL"
-	}
+	// Tallies every verdict the analysts actually produced. The previous version
+	// only ever counted LONG/SHORT/NEUTRAL, so once mapVerdict stopped folding
+	// HOLD and WAIT into NEUTRAL those votes would have gone uncounted entirely.
+	ensembleVerdict := deriveEnsembleVerdict(votes)
 
 	var ensembleConf float64
 	if activeCount > 0 {
