@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -827,6 +829,102 @@ func TestCurrencyStrengthStateRejectsAnotherAccount(t *testing.T) {
 	}
 	if reader.state != nil {
 		t.Fatalf("cross-account state was loaded: %+v", reader.state)
+	}
+}
+
+func TestCurrencyStrengthMigratesLegacyStateToConfiguredAccount(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "currency_strength_state.json")
+	statePath := filepath.Join(dir, "currency_strength_state_du123.json")
+	legacy := currencyStrengthRunState{
+		Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+		EntryOrderID: "ENTRY-LEGACY", EntryStatus: "filled",
+	}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &currencyStrengthPaperRunner{
+		accountID: "DU123", statePath: statePath, legacyStatePath: legacyPath,
+	}
+	if err := runner.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.AccountID != "DU123" ||
+		runner.state.EntryOrderID != "ENTRY-LEGACY" {
+		t.Fatalf("legacy obligation was not adopted: %+v", runner.state)
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("account-scoped sidecar was not persisted: %v", err)
+	}
+	if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy sidecar was not retired: %v", err)
+	}
+	restarted := &currencyStrengthPaperRunner{accountID: "DU123", statePath: statePath}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.state == nil || restarted.state.AccountID != "DU123" {
+		t.Fatalf("migrated state was not restart-safe: %+v", restarted.state)
+	}
+}
+
+func TestCurrencyStrengthRejectsLegacyStateTaggedForAnotherAccount(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "currency_strength_state.json")
+	state := currencyStrengthRunState{
+		AccountID: "DU111", Date: "2026-07-27", Symbol: "GBP/USD",
+		Side: "buy", Quantity: 100000,
+	}
+	b, err := json.Marshal(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &currencyStrengthPaperRunner{
+		accountID: "DU222", statePath: filepath.Join(dir, "currency_strength_state_du222.json"),
+		legacyStatePath: legacyPath,
+	}
+	if err := runner.loadState(); err == nil {
+		t.Fatal("legacy state tagged for another account was accepted")
+	}
+	if runner.state != nil {
+		t.Fatalf("cross-account legacy state was loaded: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthLegacyMigrationFailureRetainsActiveState(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "currency_strength_state.json")
+	statePath := filepath.Join(dir, "currency_strength_state_du123.json")
+	legacy := currencyStrengthRunState{
+		Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+		EntryOrderID: "ENTRY-STILL-MANAGED", EntryStatus: "filled",
+	}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0500); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Chmod(dir, 0750) }()
+	runner := &currencyStrengthPaperRunner{
+		accountID: "DU123", statePath: statePath, legacyStatePath: legacyPath,
+	}
+	if err := runner.loadState(); err != nil {
+		t.Fatalf("migration failure blocked active recovery: %v", err)
+	}
+	if runner.state == nil || runner.state.EntryOrderID != "ENTRY-STILL-MANAGED" {
+		t.Fatalf("migration failure discarded active obligation: %+v", runner.state)
 	}
 }
 

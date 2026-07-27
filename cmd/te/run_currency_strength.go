@@ -125,9 +125,12 @@ type currencyStrengthPaperRunner struct {
 	market    data.MarketDataProvider
 	broker    execution.Executor
 	statePath string
-	now       func() time.Time
-	notifier  sessionNotifier // optional; nil disables Telegram notifications
-	journal   currencyStrengthJournal
+	// legacyStatePath is read only when the account-scoped sidecar does not
+	// exist. It supports one-time migration from the pre-account-scoping file.
+	legacyStatePath string
+	now             func() time.Time
+	notifier        sessionNotifier // optional; nil disables Telegram notifications
+	journal         currencyStrengthJournal
 
 	state              *currencyStrengthRunState
 	decisionDoneFor    string
@@ -165,12 +168,13 @@ func newCurrencyStrengthPaperRunner(
 	broker execution.Executor,
 ) *currencyStrengthPaperRunner {
 	return &currencyStrengthPaperRunner{
-		cfg:       cfg,
-		accountID: normalizeCurrencyStrengthAccountID(accountID),
-		market:    market,
-		broker:    broker,
-		statePath: defaultCurrencyStrengthStatePath(accountID),
-		now:       time.Now,
+		cfg:             cfg,
+		accountID:       normalizeCurrencyStrengthAccountID(accountID),
+		market:          market,
+		broker:          broker,
+		statePath:       defaultCurrencyStrengthStatePath(accountID),
+		legacyStatePath: defaultLegacyCurrencyStrengthStatePath(),
+		now:             time.Now,
 	}
 }
 
@@ -2046,27 +2050,75 @@ func (r *currencyStrengthPaperRunner) positionFor(ctx context.Context, symbol st
 
 func (r *currencyStrengthPaperRunner) loadState() error {
 	b, err := os.ReadFile(r.statePath)
+	loadedPath := r.statePath
+	legacy := false
+	if os.IsNotExist(err) && r.legacyStatePath != "" {
+		b, err = os.ReadFile(r.legacyStatePath)
+		loadedPath = r.legacyStatePath
+		legacy = err == nil
+	}
 	if os.IsNotExist(err) {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("currency-strength read state: %w", err)
+		return fmt.Errorf("currency-strength read state %s: %w", loadedPath, err)
 	}
 	var state currencyStrengthRunState
 	if err := json.Unmarshal(b, &state); err != nil {
-		return fmt.Errorf("currency-strength decode state: %w", err)
+		return fmt.Errorf("currency-strength decode state %s: %w", loadedPath, err)
 	}
-	if r.accountID != "" &&
-		normalizeCurrencyStrengthAccountID(state.AccountID) != r.accountID {
+	stateAccountID := normalizeCurrencyStrengthAccountID(state.AccountID)
+	if r.accountID != "" && stateAccountID != "" && stateAccountID != r.accountID {
 		return fmt.Errorf(
 			"currency-strength state belongs to account %q, current account is %q",
 			state.AccountID, r.accountID,
 		)
 	}
-	state.AccountID = normalizeCurrencyStrengthAccountID(state.AccountID)
+	if r.accountID != "" && stateAccountID == "" && !legacy {
+		return fmt.Errorf(
+			"currency-strength account-scoped state %s has no account id",
+			loadedPath,
+		)
+	}
+	if legacy && r.accountID != "" {
+		stateAccountID = r.accountID
+	}
+	state.AccountID = stateAccountID
 	if state.Symbol != "" && state.Quantity > 0 {
 		r.state = &state
 	}
+	if legacy && r.state != nil {
+		if err := r.migrateLegacyState(); err != nil {
+			// Migration durability is secondary to managing the obligation
+			// already recovered into memory. Retry migration on the next start.
+			logger.Warn("currency-strength: legacy sidecar migration deferred; continuing recovery",
+				"path", r.legacyStatePath, "err", err)
+		}
+	}
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) migrateLegacyState() error {
+	// Tag the source first. If the process stops before the account-scoped copy
+	// is durable, another configured account cannot subsequently claim it.
+	b, err := json.MarshalIndent(r.state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("currency-strength encode legacy state migration: %w", err)
+	}
+	if err := writeCurrencyStrengthStateAtomic(r.legacyStatePath, b); err != nil {
+		return fmt.Errorf("currency-strength tag legacy state migration: %w", err)
+	}
+	if err := r.saveState(); err != nil {
+		return fmt.Errorf("currency-strength persist account-scoped state migration: %w", err)
+	}
+	if err := os.Remove(r.legacyStatePath); err != nil && !os.IsNotExist(err) {
+		// The tagged legacy copy is safe to leave behind: a different account
+		// will reject it, while this account now prefers its scoped sidecar.
+		logger.Warn("currency-strength: migrated legacy sidecar but could not remove tagged source",
+			"path", r.legacyStatePath, "err", err)
+	}
+	logger.Info("currency-strength: migrated legacy recovery sidecar",
+		"from", r.legacyStatePath, "to", r.statePath, "account_id", r.accountID)
 	return nil
 }
 
@@ -2150,6 +2202,14 @@ func defaultCurrencyStrengthStatePath(accountID string) string {
 		return filepath.Join(os.TempDir(), "tradeengine-"+filename)
 	}
 	return filepath.Join(home, ".tradeengine", filename)
+}
+
+func defaultLegacyCurrencyStrengthStatePath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return filepath.Join(os.TempDir(), "tradeengine-currency-strength-state.json")
+	}
+	return filepath.Join(home, ".tradeengine", "currency_strength_state.json")
 }
 
 func isIBKRPaperAccountID(accountID string) bool {

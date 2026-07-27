@@ -31,6 +31,8 @@ func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
 			EntryStatus:       "filled",
 			ExitOrderID:       "EXIT-1",
 			ExitStatus:        "filled",
+			ExitFillPrice:     1.105,
+			ExitFilledQty:     100000,
 			RealizedPnL:       &pnl,
 		}},
 	}
@@ -44,8 +46,9 @@ func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
 		"USD weakest",
 		"BUY GBP/USD",
 		"ENTRY-1",
-		"EXIT-1",
-		"PnL:",
+		"latest order EXIT-1",
+		"cumulative fill 1.10500 × 100000",
+		"Cumulative PnL:",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("currency-strength view missing %q:\n%s", want, out)

@@ -186,14 +186,14 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 		)
 		if run.Status == "exit_submitted" || run.Status == "exit_failed" || run.Status == "exited" {
 			fmt.Fprintf(
-				&b, "%sorder %s · %s%s",
+				&b, "%slatest order %s · %s%s",
 				labelStyle.Render("Exit: "),
 				displayText(run.ExitOrderID, "pending"),
 				displayText(run.ExitStatus, "unknown"),
-				formatFill(run.ExitFillPrice, run.ExitFilledQty),
+				formatCumulativeFill(run.ExitFillPrice, run.ExitFilledQty),
 			)
 			if run.RealizedPnL != nil {
-				fmt.Fprintf(&b, "  PnL:%s", colorPnL(*run.RealizedPnL))
+				fmt.Fprintf(&b, "  Cumulative PnL:%s", colorPnL(*run.RealizedPnL))
 			}
 			b.WriteString("\n")
 		}
@@ -232,4 +232,14 @@ func formatFill(price, qty float64) string {
 		return fmt.Sprintf("  fill %.5f × %.0f", price, qty)
 	}
 	return fmt.Sprintf("  fill %.5f", price)
+}
+
+func formatCumulativeFill(price, qty float64) string {
+	if price <= 0 {
+		return ""
+	}
+	if qty > 0 {
+		return fmt.Sprintf("  cumulative fill %.5f × %.0f", price, qty)
+	}
+	return fmt.Sprintf("  cumulative fill %.5f", price)
 }
