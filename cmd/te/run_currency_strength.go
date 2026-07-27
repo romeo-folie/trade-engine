@@ -14,6 +14,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
@@ -27,13 +28,60 @@ type sessionNotifier interface {
 }
 
 type currencyStrengthRunState struct {
-	Date         string  `json:"date"`
-	Symbol       string  `json:"symbol"`
-	Side         string  `json:"side"`
-	Quantity     float64 `json:"quantity"`
-	EntryOrderID string  `json:"entry_order_id"`
-	EntryStatus  string  `json:"entry_status"`
-	EnteredAt    string  `json:"entered_at"`
+	Date           string  `json:"date"`
+	Symbol         string  `json:"symbol"`
+	Side           string  `json:"side"`
+	Quantity       float64 `json:"quantity"`
+	EntryOrderID   string  `json:"entry_order_id"`
+	EntryStatus    string  `json:"entry_status"`
+	EntryFillPrice float64 `json:"entry_fill_price,omitempty"`
+	EntryFilledQty float64 `json:"entry_filled_qty,omitempty"`
+	EnteredAt      string  `json:"entered_at"`
+	Strongest      string  `json:"strongest,omitempty"`
+	Weakest        string  `json:"weakest,omitempty"`
+	StrengthGap    float64 `json:"strength_gap,omitempty"`
+	ExitOrderID    string  `json:"exit_order_id,omitempty"`
+	ExitStatus     string  `json:"exit_status,omitempty"`
+	ExitFillPrice  float64 `json:"exit_fill_price,omitempty"`
+	ExitFilledQty  float64 `json:"exit_filled_qty,omitempty"`
+	ExitedAt       string  `json:"exited_at,omitempty"`
+}
+
+// currencyStrengthJournal is the strategy's durable audit seam. Production
+// writes to PostgreSQL; tests may omit it or supply a lightweight recorder.
+type currencyStrengthJournal interface {
+	Start(context.Context, store.CurrencyStrengthRun) error
+	MarkEvaluating(context.Context, time.Time) error
+	RecordNoSignal(context.Context, time.Time, string) error
+	RecordEntry(context.Context, store.CurrencyStrengthRun) error
+	RecordExit(context.Context, store.CurrencyStrengthRun) error
+	RecordFailure(context.Context, time.Time, string) error
+}
+
+type dbCurrencyStrengthJournal struct{}
+
+func (dbCurrencyStrengthJournal) Start(ctx context.Context, run store.CurrencyStrengthRun) error {
+	return store.StartCurrencyStrengthRun(ctx, store.GetDB(), run)
+}
+
+func (dbCurrencyStrengthJournal) MarkEvaluating(ctx context.Context, date time.Time) error {
+	return store.MarkCurrencyStrengthEvaluating(ctx, store.GetDB(), date)
+}
+
+func (dbCurrencyStrengthJournal) RecordNoSignal(ctx context.Context, date time.Time, reason string) error {
+	return store.RecordCurrencyStrengthNoSignal(ctx, store.GetDB(), date, reason)
+}
+
+func (dbCurrencyStrengthJournal) RecordEntry(ctx context.Context, run store.CurrencyStrengthRun) error {
+	return store.RecordCurrencyStrengthEntry(ctx, store.GetDB(), run)
+}
+
+func (dbCurrencyStrengthJournal) RecordExit(ctx context.Context, run store.CurrencyStrengthRun) error {
+	return store.RecordCurrencyStrengthExit(ctx, store.GetDB(), run)
+}
+
+func (dbCurrencyStrengthJournal) RecordFailure(ctx context.Context, date time.Time, message string) error {
+	return store.RecordCurrencyStrengthFailure(ctx, store.GetDB(), date, message)
 }
 
 type currencyStrengthPaperRunner struct {
@@ -43,9 +91,12 @@ type currencyStrengthPaperRunner struct {
 	statePath string
 	now       func() time.Time
 	notifier  sessionNotifier // optional; nil disables Telegram notifications
+	journal   currencyStrengthJournal
 
-	state           *currencyStrengthRunState
-	decisionDoneFor string
+	state              *currencyStrengthRunState
+	decisionDoneFor    string
+	sessionRecordedFor string
+	entryRecorded      bool
 }
 
 func validateCurrencyStrengthPaperConfig(cfg *config.Config, dryRun bool) error {
@@ -84,6 +135,10 @@ func newCurrencyStrengthPaperRunner(cfg config.CurrencyStrengthConfig, market da
 // entry messages. Call before Run. If not called, notifications are no-ops.
 func (r *currencyStrengthPaperRunner) SetNotifier(n sessionNotifier) {
 	r.notifier = n
+}
+
+func (r *currencyStrengthPaperRunner) SetJournal(j currencyStrengthJournal) {
+	r.journal = j
 }
 
 // notify sends a message through the configured notifier. No-op when unset;
@@ -194,6 +249,22 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 		exitTime := applyCurrencyStrengthClock(day, exitHM)
 		dateKey := day.Format("2006-01-02")
 
+		if r.sessionRecordedFor != dateKey {
+			if err := r.startJournal(ctx, day); err != nil {
+				return err
+			}
+			r.sessionRecordedFor = dateKey
+		}
+
+		if r.state != nil && !r.entryRecorded {
+			if err := r.syncActiveEntryJournal(ctx); err != nil {
+				// The position sidecar remains authoritative while the DB is
+				// unavailable. Retry on the next tick without interrupting the
+				// broker-managed position or submitting another order.
+				logger.Warn("currency-strength: entry history sync failed; will retry", "err", err)
+			}
+		}
+
 		if currencyStrengthShouldExitState(r.state, dateKey, now, exitTime) {
 			if err := r.exitActive(ctx); err != nil {
 				return err
@@ -206,8 +277,12 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 					logger.Info("currency-strength: entry window expired; no paper order placed",
 						"date", dateKey, "strength_end", strengthEnd.Format(time.RFC3339), "grace", currencyStrengthEntryGrace.String())
 					r.decisionDoneFor = dateKey
+					if err := r.recordNoSignal(ctx, day, "entry window expired before evaluation"); err != nil {
+						return err
+					}
 					r.notify(ctx, buildCurrencyStrengthNoOrderMessage("entry window expired before evaluation"))
 				} else if err := r.evaluateAndEnter(ctx, dateKey, strengthStart, strengthEnd); err != nil {
+					r.recordFailure(ctx, day, err)
 					return err
 				}
 			}
@@ -222,6 +297,16 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 }
 
 func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, dateKey string, strengthStart, strengthEnd time.Time) error {
+	sessionDate := time.Date(
+		strengthStart.Year(), strengthStart.Month(), strengthStart.Day(),
+		0, 0, 0, 0, strengthStart.Location(),
+	)
+	if r.journal != nil {
+		if err := r.journal.MarkEvaluating(ctx, sessionDate); err != nil {
+			return fmt.Errorf("currency-strength record evaluation start: %w", err)
+		}
+	}
+
 	pairs, err := currencystrength.PairsFromSymbols(r.cfg.RankInstruments)
 	if err != nil {
 		return err
@@ -234,14 +319,22 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	if existing, err := r.configuredPosition(ctx); err != nil {
 		logger.Warn("currency-strength: skipping entry after position check failure", "date", dateKey, "err", err)
 		r.decisionDoneFor = dateKey
-		r.notify(ctx, buildCurrencyStrengthNoOrderMessage("position check failed: "+err.Error()))
+		reason := "position check failed: " + err.Error()
+		if journalErr := r.recordNoSignal(ctx, sessionDate, reason); journalErr != nil {
+			return journalErr
+		}
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(reason))
 		return nil
 	} else if existing != nil {
 		logger.Info("currency-strength: skipping entry because configured IBKR position already exists without runner state",
 			"date", dateKey, "ticker", existing.Ticker, "quantity", existing.Quantity)
 		r.decisionDoneFor = dateKey
-		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(fmt.Sprintf("existing %s position (%.0f units) held outside runner state",
-			existing.Ticker, existing.Quantity)))
+		reason := fmt.Sprintf("existing %s position (%.0f units) held outside runner state",
+			existing.Ticker, existing.Quantity)
+		if err := r.recordNoSignal(ctx, sessionDate, reason); err != nil {
+			return err
+		}
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(reason))
 		return nil
 	}
 
@@ -263,6 +356,9 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	r.decisionDoneFor = dateKey
 	if decision.Signal == nil {
 		logger.Info("currency-strength: no paper order", "date", dateKey, "reason", decision.SkipReason)
+		if err := r.recordNoSignal(ctx, sessionDate, decision.SkipReason); err != nil {
+			return err
+		}
 		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(decision.SkipReason))
 		return nil
 	}
@@ -285,17 +381,28 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		return fmt.Errorf("currency-strength place paper entry %s %s: %w", decision.Signal.Symbol, decision.Signal.Side, err)
 	}
 
+	enteredAt := r.now().UTC()
 	r.state = &currencyStrengthRunState{
-		Date:         dateKey,
-		Symbol:       decision.Signal.Symbol,
-		Side:         decision.Signal.Side,
-		Quantity:     float64(r.cfg.Units),
-		EntryOrderID: result.BrokerOrderID,
-		EntryStatus:  result.Status,
-		EnteredAt:    r.now().UTC().Format(time.RFC3339),
+		Date:           dateKey,
+		Symbol:         decision.Signal.Symbol,
+		Side:           decision.Signal.Side,
+		Quantity:       float64(r.cfg.Units),
+		EntryOrderID:   result.BrokerOrderID,
+		EntryStatus:    result.Status,
+		EntryFillPrice: result.FilledPrice,
+		EntryFilledQty: result.FilledQty,
+		EnteredAt:      enteredAt.Format(time.RFC3339),
+		Strongest:      decision.Signal.Strong,
+		Weakest:        decision.Signal.Weak,
+		StrengthGap:    decision.Signal.Gap,
 	}
 	if err := r.saveState(); err != nil {
 		return err
+	}
+	if err := r.syncActiveEntryJournal(ctx); err != nil {
+		// Do not stop after the broker has accepted an order. The saved sidecar
+		// lets this process (or a restart) retry the history write safely.
+		logger.Warn("currency-strength: entry history sync failed; will retry", "err", err)
 	}
 	logger.Info("currency-strength: IBKR paper entry submitted",
 		"date", dateKey, "symbol", decision.Signal.Symbol, "side", decision.Signal.Side,
@@ -308,6 +415,12 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if r.state == nil {
 		return nil
+	}
+	// A prior iteration already submitted the flatten order and persisted its
+	// acknowledgement in the sidecar. Retry only the DB journal write; never
+	// place a second exit.
+	if r.state.ExitOrderID != "" {
+		return r.finalizeExitedState(ctx)
 	}
 	qty := math.Abs(r.state.Quantity)
 	exitSide := execution.OrderSideSell
@@ -342,11 +455,157 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("currency-strength place paper exit %s qty %.2f: %w", r.state.Symbol, qty, err)
 	}
+	exitedAt := r.now().UTC()
+	r.state.ExitOrderID = result.BrokerOrderID
+	r.state.ExitStatus = result.Status
+	r.state.ExitFillPrice = result.FilledPrice
+	r.state.ExitFilledQty = result.FilledQty
+	r.state.ExitedAt = exitedAt.Format(time.RFC3339)
+	if err := r.saveState(); err != nil {
+		// Keep the in-memory exit acknowledgement so this process still cannot
+		// submit a duplicate. The journal write below provides a second durable
+		// recovery path if the sidecar filesystem is temporarily unavailable.
+		logger.Warn("currency-strength: failed to persist exit acknowledgement sidecar", "err", err)
+	}
 	logger.Info("currency-strength: IBKR paper exit submitted",
 		"date", r.state.Date, "symbol", r.state.Symbol, "side", exitSide,
 		"quantity", qty, "order_id", result.BrokerOrderID, "status", result.Status)
 	r.notify(ctx, buildCurrencyStrengthExitMessage(r.state.Symbol, exitSide, qty, result.BrokerOrderID, result.Status))
+	return r.finalizeExitedState(ctx)
+}
+
+func (r *currencyStrengthPaperRunner) syncActiveEntryJournal(ctx context.Context) error {
+	if r.journal == nil || r.state == nil {
+		r.entryRecorded = true
+		return nil
+	}
+	sessionDate, err := time.Parse("2006-01-02", r.state.Date)
+	if err != nil {
+		return fmt.Errorf("parse state date %q: %w", r.state.Date, err)
+	}
+	if err := r.journal.Start(ctx, store.CurrencyStrengthRun{
+		SessionDate:      sessionDate,
+		Timezone:         r.cfg.Timezone,
+		StrengthStart:    r.cfg.StrengthStart,
+		StrengthEnd:      r.cfg.StrengthEnd,
+		ExitTime:         r.cfg.ExitTime,
+		RankInstruments:  r.cfg.RankInstruments,
+		TradeInstruments: r.cfg.TradeInstruments,
+		Units:            r.cfg.Units,
+	}); err != nil {
+		return fmt.Errorf("record session for active entry: %w", err)
+	}
+	enteredAt, _ := time.Parse(time.RFC3339, r.state.EnteredAt)
+	if err := r.journal.RecordEntry(ctx, store.CurrencyStrengthRun{
+		SessionDate:       sessionDate,
+		StrongestCurrency: r.state.Strongest,
+		WeakestCurrency:   r.state.Weakest,
+		StrengthGap:       r.state.StrengthGap,
+		SignalSymbol:      r.state.Symbol,
+		SignalSide:        r.state.Side,
+		EntryOrderID:      r.state.EntryOrderID,
+		EntryStatus:       r.state.EntryStatus,
+		EntryFillPrice:    r.state.EntryFillPrice,
+		EntryFilledQty:    r.state.EntryFilledQty,
+		EnteredAt:         optionalTime(enteredAt),
+	}); err != nil {
+		return fmt.Errorf("record active entry: %w", err)
+	}
+	r.entryRecorded = true
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) error {
+	if r.state == nil || r.state.ExitOrderID == "" {
+		return nil
+	}
+	if r.journal != nil {
+		if !r.entryRecorded {
+			if err := r.syncActiveEntryJournal(ctx); err != nil {
+				logger.Warn("currency-strength: entry history sync before exit failed; will retry", "err", err)
+				return nil
+			}
+		}
+		sessionDate, err := time.Parse("2006-01-02", r.state.Date)
+		if err != nil {
+			return fmt.Errorf("currency-strength parse state date %q: %w", r.state.Date, err)
+		}
+		exitedAt, _ := time.Parse(time.RFC3339, r.state.ExitedAt)
+		var realizedPnL *float64
+		if r.state.EntryFillPrice > 0 && r.state.ExitFillPrice > 0 {
+			pnl := (r.state.ExitFillPrice - r.state.EntryFillPrice) * math.Abs(r.state.Quantity)
+			if r.state.Side == "sell" {
+				pnl = -pnl
+			}
+			realizedPnL = &pnl
+		}
+		if err := r.journal.RecordExit(ctx, store.CurrencyStrengthRun{
+			SessionDate:   sessionDate,
+			ExitOrderID:   r.state.ExitOrderID,
+			ExitStatus:    r.state.ExitStatus,
+			ExitFillPrice: r.state.ExitFillPrice,
+			ExitFilledQty: r.state.ExitFilledQty,
+			ExitedAt:      optionalTime(exitedAt),
+			RealizedPnL:   realizedPnL,
+		}); err != nil {
+			logger.Warn("currency-strength: exit history sync failed; will retry", "err", err)
+			return nil
+		}
+	}
 	return r.clearState()
+}
+
+func optionalTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
+}
+
+func (r *currencyStrengthPaperRunner) startJournal(ctx context.Context, sessionDate time.Time) error {
+	if r.journal == nil {
+		return nil
+	}
+	if err := r.journal.Start(ctx, store.CurrencyStrengthRun{
+		SessionDate:      sessionDate,
+		Timezone:         r.cfg.Timezone,
+		StrengthStart:    r.cfg.StrengthStart,
+		StrengthEnd:      r.cfg.StrengthEnd,
+		ExitTime:         r.cfg.ExitTime,
+		RankInstruments:  r.cfg.RankInstruments,
+		TradeInstruments: r.cfg.TradeInstruments,
+		Units:            r.cfg.Units,
+	}); err != nil {
+		return fmt.Errorf("currency-strength record session: %w", err)
+	}
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) recordNoSignal(
+	ctx context.Context,
+	sessionDate time.Time,
+	reason string,
+) error {
+	if r.journal == nil {
+		return nil
+	}
+	if err := r.journal.RecordNoSignal(ctx, sessionDate, reason); err != nil {
+		return fmt.Errorf("currency-strength record no-signal outcome: %w", err)
+	}
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) recordFailure(
+	ctx context.Context,
+	sessionDate time.Time,
+	runErr error,
+) {
+	if r.journal == nil || runErr == nil {
+		return
+	}
+	if err := r.journal.RecordFailure(ctx, sessionDate, runErr.Error()); err != nil {
+		logger.Warn("currency-strength: failed to record run failure", "err", err)
+	}
 }
 
 func (r *currencyStrengthPaperRunner) fetchWindow(ctx context.Context, symbol string, strengthStart, strengthEnd time.Time) (float64, float64, error) {

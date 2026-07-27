@@ -443,9 +443,28 @@ func UpdateORBTrade(ctx context.Context, db *pgxpool.Pool, id, status string, fi
 // forex session) — all sharing the same date, so a date-only sort would drop same-date
 // sessions arbitrarily under LIMIT (which hid the futures session from the dashboard).
 func GetRecentORBSessions(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORBSession, error) {
+	return GetRecentORBSessionsPage(ctx, db, limit, 0)
+}
+
+// GetRecentORBSessionsPage returns up to limit ORB sessions at a zero-based
+// offset. It powers explicit history pagination in the Intraday dashboard while
+// GetRecentORBSessions preserves the original newest-page API for other callers.
+func GetRecentORBSessionsPage(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	limit, offset int,
+) ([]ORBSession, error) {
+	if limit < 1 {
+		return nil, nil
+	}
+	if offset < 0 {
+		offset = 0
+	}
 	rows, err := db.Query(ctx, `
 		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
-		FROM orb_sessions ORDER BY date DESC, created_at DESC LIMIT $1`, limit)
+		FROM orb_sessions
+		ORDER BY date DESC, created_at DESC
+		LIMIT $1 OFFSET $2`, limit, offset)
 	if err != nil {
 		return nil, err
 	}

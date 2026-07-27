@@ -436,6 +436,7 @@ Modes:
 							return err
 						}
 						runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
+						runner.SetJournal(dbCurrencyStrengthJournal{})
 						if tgBot != nil {
 							runner.SetNotifier(&orbTelegramNotifier{bot: tgBot})
 						}

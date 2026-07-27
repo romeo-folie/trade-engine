@@ -16,7 +16,13 @@ import (
 type ORBViewData struct {
 	Sessions   []ORBSessionData
 	LastUpdate time.Time
+	Page       int
+	HasNewer   bool
+	HasOlder   bool
+	Err        string
 }
+
+const IntradaySessionPageSize = 6
 
 // ORBSessionData holds all data needed to render one ORB session panel.
 type ORBSessionData struct {
@@ -206,8 +212,21 @@ func assetBadge(assetClass string) string {
 // several concurrent sessions: equities/forex/futures, plus a morning london session) and
 // their trades. Safe to call when DB is unavailable — returns an empty result.
 func FetchORBViewData(ctx context.Context) (d ORBViewData) {
+	return FetchORBViewDataPage(ctx, 0)
+}
+
+// FetchORBViewDataPage loads one explicit page of ORB sessions. A seventh row
+// is requested only to determine whether the operator can navigate farther
+// into history; it is never rendered on the current page.
+func FetchORBViewDataPage(ctx context.Context, page int) (d ORBViewData) {
+	if page < 0 {
+		page = 0
+	}
 	d.LastUpdate = time.Now()
+	d.Page = page
+	d.HasNewer = page > 0
 	if !store.IsConnected() {
+		d.Err = "database not connected"
 		return d
 	}
 	db := store.GetDB()
@@ -217,9 +236,18 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 	// hid the futures panel. 6 covers a full day plus a little history; the view scrolls
 	// (j/k) so panels past the first screenful stay reachable. created_at-DESC ordering
 	// puts the newest sessions (today's, incl. futures) FIRST.
-	sessions, err := store.GetRecentORBSessions(ctx, db, 6)
+	sessions, err := store.GetRecentORBSessionsPage(
+		ctx, db, IntradaySessionPageSize+1, page*IntradaySessionPageSize,
+	)
 	if err != nil || len(sessions) == 0 {
+		if err != nil {
+			d.Err = err.Error()
+		}
 		return d
+	}
+	if len(sessions) > IntradaySessionPageSize {
+		d.HasOlder = true
+		sessions = sessions[:IntradaySessionPageSize]
 	}
 
 	for _, s := range sessions {
@@ -326,13 +354,20 @@ func ORBMaxScroll(d ORBViewData, width, height int) int {
 // before clipping).
 func orbViewLines(d ORBViewData, width int) []string {
 	var content string
-	if len(d.Sessions) == 0 {
-		content = sectionTitle.Render("Intraday Flow") + "\n" +
-			dimText.Render("  No intraday sessions found")
+	if d.Err != "" {
+		content = renderIntradayTabs("orb") +
+			dimText.Render(fmt.Sprintf("  page %d", d.Page+1)) + "\n\n" +
+			lipgloss.NewStyle().Foreground(lipgloss.Color("196")).
+				Render("  ORB history unavailable: "+d.Err)
+	} else if len(d.Sessions) == 0 {
+		content = renderIntradayTabs("orb") +
+			dimText.Render(fmt.Sprintf("  page %d", d.Page+1)) + "\n\n" +
+			dimText.Render("  No intraday sessions found on this ORB page")
 	} else {
 		var b strings.Builder
-		b.WriteString(sectionTitle.Render("Intraday Flow") +
-			dimText.Render(fmt.Sprintf("  updated %s", d.LastUpdate.Format("15:04:05"))) + "\n\n")
+		b.WriteString(renderIntradayTabs("orb") +
+			dimText.Render(fmt.Sprintf("  page %d · updated %s", d.Page+1, d.LastUpdate.Format("15:04:05"))) +
+			"\n\n")
 		for i, s := range d.Sessions {
 			b.WriteString(RenderORBPanel(s, width))
 			if i < len(d.Sessions)-1 {
@@ -345,6 +380,21 @@ func orbViewLines(d ORBViewData, width int) []string {
 		content = lipgloss.NewStyle().Width(width).Render(content)
 	}
 	return strings.Split(content, "\n")
+}
+
+func renderIntradayTabs(active string) string {
+	activeStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("229"))
+	inactiveStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
+	tab := func(key, label, id string) string {
+		text := fmt.Sprintf("[%s] %s", key, label)
+		if active == id {
+			return activeStyle.Render(text)
+		}
+		return inactiveStyle.Render(text)
+	}
+	return sectionTitle.Render("Intraday Flow") + "  " +
+		tab("o", "ORB", "orb") + "  " +
+		tab("c", "Currency Strength", "currency")
 }
 
 // RenderORBPanel renders a single ORB session panel.

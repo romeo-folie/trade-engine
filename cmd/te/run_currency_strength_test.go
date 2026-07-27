@@ -10,6 +10,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
@@ -188,6 +189,50 @@ func (c *captureNotifier) Notify(_ context.Context, msg string) error {
 	return nil
 }
 
+type captureCurrencyStrengthJournal struct {
+	started    []store.CurrencyStrengthRun
+	evaluating []time.Time
+	noSignals  []string
+	entries    []store.CurrencyStrengthRun
+	exits      []store.CurrencyStrengthRun
+	failures   []string
+	exitErrors int
+}
+
+func (j *captureCurrencyStrengthJournal) Start(_ context.Context, run store.CurrencyStrengthRun) error {
+	j.started = append(j.started, run)
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) MarkEvaluating(_ context.Context, date time.Time) error {
+	j.evaluating = append(j.evaluating, date)
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) RecordNoSignal(_ context.Context, _ time.Time, reason string) error {
+	j.noSignals = append(j.noSignals, reason)
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) RecordEntry(_ context.Context, run store.CurrencyStrengthRun) error {
+	j.entries = append(j.entries, run)
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) RecordExit(_ context.Context, run store.CurrencyStrengthRun) error {
+	j.exits = append(j.exits, run)
+	if j.exitErrors > 0 {
+		j.exitErrors--
+		return errors.New("temporary journal failure")
+	}
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) RecordFailure(_ context.Context, _ time.Time, message string) error {
+	j.failures = append(j.failures, message)
+	return nil
+}
+
 func TestBuildCurrencyStrengthEntryMessage(t *testing.T) {
 	sig := currencystrength.Signal{
 		Symbol: "GBP/USD",
@@ -234,6 +279,7 @@ func TestBuildCurrencyStrengthExitMessage(t *testing.T) {
 
 func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
 	notifier := &captureNotifier{}
+	journal := &captureCurrencyStrengthJournal{}
 	runner := &currencyStrengthPaperRunner{
 		cfg: config.CurrencyStrengthConfig{
 			TradeInstruments: []string{"GBP/USD"},
@@ -246,6 +292,7 @@ func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
 			return time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
 		},
 	}
+	runner.SetJournal(journal)
 
 	err := runner.evaluateAndEnter(context.Background(), "2026-07-21",
 		time.Date(2026, 7, 21, 6, 0, 0, 0, time.UTC),
@@ -259,6 +306,118 @@ func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
 	}
 	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "no order today") {
 		t.Fatalf("expected one no-order notification, got %v", notifier.msgs)
+	}
+	if len(journal.evaluating) != 1 || len(journal.noSignals) != 1 ||
+		!strings.Contains(journal.noSignals[0], "existing GBP/USD position") {
+		t.Fatalf("expected durable evaluating/no-signal history, got %+v", journal)
+	}
+}
+
+type successfulCurrencyStrengthExecutor struct {
+	result execution.OrderResult
+	calls  int
+}
+
+func (f *successfulCurrencyStrengthExecutor) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+	f.calls++
+	return f.result, nil
+}
+
+func (*successfulCurrencyStrengthExecutor) CancelOrder(context.Context, string) error {
+	return nil
+}
+
+func (*successfulCurrencyStrengthExecutor) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, nil
+}
+
+func (*successfulCurrencyStrengthExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+
+func (*successfulCurrencyStrengthExecutor) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+
+func TestCurrencyStrengthExitPersistsRealizedPnL(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
+		BrokerOrderID: "EXIT-1",
+		Status:        "filled",
+		FilledPrice:   1.105,
+		FilledQty:     100000,
+	}}
+	runner := &currencyStrengthPaperRunner{
+		broker:    broker,
+		statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time {
+			return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+		},
+		state: &currencyStrengthRunState{
+			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
+			Side:           "buy",
+			Quantity:       100000,
+			EntryFillPrice: 1.100,
+		},
+		journal: journal,
+	}
+
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatalf("exitActive: %v", err)
+	}
+	if len(journal.exits) != 1 || journal.exits[0].RealizedPnL == nil {
+		t.Fatalf("expected one journaled exit with P&L, got %+v", journal.exits)
+	}
+	if got := *journal.exits[0].RealizedPnL; got < 499.99 || got > 500.01 {
+		t.Fatalf("realized P&L = %.2f, want 500.00", got)
+	}
+	if runner.state != nil {
+		t.Fatal("runner state was not cleared after journaled exit")
+	}
+}
+
+func TestCurrencyStrengthExitJournalRetryDoesNotResubmitOrder(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
+	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
+		BrokerOrderID: "EXIT-RETRY",
+		Status:        "pending",
+	}}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Timezone:      "UTC",
+			StrengthStart: "06:00",
+			StrengthEnd:   "09:00",
+			ExitTime:      "18:00",
+			Units:         100000,
+		},
+		broker:        broker,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		now:           func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date:     "2026-07-27",
+			Symbol:   "GBP/USD",
+			Side:     "buy",
+			Quantity: 100000,
+		},
+		journal: journal,
+	}
+
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatalf("first exitActive: %v", err)
+	}
+	if broker.calls != 1 || runner.state == nil || runner.state.ExitOrderID == "" {
+		t.Fatalf("failed journal write did not retain submitted exit safely: calls=%d state=%+v", broker.calls, runner.state)
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatalf("retry exitActive: %v", err)
+	}
+	if broker.calls != 1 {
+		t.Fatalf("journal retry submitted a duplicate exit: calls=%d", broker.calls)
+	}
+	if runner.state != nil {
+		t.Fatal("state was not cleared after successful journal retry")
 	}
 }
 

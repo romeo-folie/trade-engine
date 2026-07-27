@@ -176,6 +176,57 @@ func TestViewLabels(t *testing.T) {
 	}
 }
 
+func TestIntradayStrategyTabsAndPagingKeys(t *testing.T) {
+	m := New(nil, "paper", nil)
+	m.activeView = ViewORB
+	m.width = 120
+	m.height = 30
+	m.orbData.HasOlder = true
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("l")})
+	m = updated.(Model)
+	if m.orbPage != 1 {
+		t.Fatalf("l did not load the older ORB page: page=%d", m.orbPage)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = updated.(Model)
+	if m.intradayStrategy != "currency" {
+		t.Fatalf("c did not select currency strength: %q", m.intradayStrategy)
+	}
+
+	m.currencyStrengthData.HasOlder = true
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRight})
+	m = updated.(Model)
+	if m.currencyStrengthPage != 1 {
+		t.Fatalf("right did not load the older currency page: page=%d", m.currencyStrengthPage)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyLeft})
+	m = updated.(Model)
+	if m.currencyStrengthPage != 0 {
+		t.Fatalf("left did not return to the newer currency page: page=%d", m.currencyStrengthPage)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("o")})
+	m = updated.(Model)
+	if m.intradayStrategy != "orb" {
+		t.Fatalf("o did not return to ORB: %q", m.intradayStrategy)
+	}
+}
+
+func TestIntradayStatusBarDocumentsIndependentNavigation(t *testing.T) {
+	m := New(nil, "paper", nil)
+	m.activeView = ViewORB
+	m.width = 140
+	out := m.renderStatusBar()
+	for _, want := range []string{"[o/c] strategy", "[j/k] scroll", "[h/l or ←/→] pages"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("Intraday status bar missing %q: %s", want, out)
+		}
+	}
+}
+
 func TestConfigReadonlyItemExplainsHowToChangeIt(t *testing.T) {
 	m := New(nil, "paper", nil)
 	m.activeView = ViewConfig
