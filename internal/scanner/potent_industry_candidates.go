@@ -142,6 +142,14 @@ func mergePotentIndustryCandidates(
 func candidateAfterPromotionClaimLoss(
 	candidate SwingCandidate, source string,
 ) (SwingCandidate, bool) {
+	// Premarket evidence is the freshest dynamic state for a merged name.
+	// The older weekly/industry fallback snapshots predate that merge, so
+	// rebuilding a partially attributed candidate from them could silently
+	// replace point-in-time price/liquidity evidence. Fail closed and release
+	// the remaining claims at cycle end instead.
+	if candidate.PremarketEpisodicRunID != "" {
+		return SwingCandidate{}, false
+	}
 	switch source {
 	case "potent_industry":
 		if candidate.potentIndustryFallback == nil {
@@ -246,6 +254,7 @@ func (s *MarketScanner) markDiscoveryCandidate(
 ) {
 	s.markWeeklyLeaderCandidate(ctx, candidate, status, scannerRunID, reason)
 	s.markPotentIndustryCandidate(ctx, candidate, status, scannerRunID, reason)
+	s.markPremarketEpisodicCandidate(ctx, candidate, status, scannerRunID, reason)
 }
 
 func (s *MarketScanner) markDiscoveryCandidates(
@@ -301,6 +310,12 @@ func scannerSourcePromotionClaims(
 			Ticker:    candidate.Ticker, Token: candidate.PotentIndustryClaimToken,
 		}
 	}
+	if candidate.PremarketEpisodicRunID != "" {
+		claims.PremarketEpisodic = &store.PremarketEpisodicPromotionClaim{
+			RunID: candidate.PremarketEpisodicRunID, Ticker: candidate.Ticker,
+			Token: candidate.PremarketEpisodicClaimToken,
+		}
+	}
 	return claims
 }
 
@@ -308,7 +323,8 @@ func (s *MarketScanner) promoteDiscoveryCandidate(
 	ctx context.Context, item store.WatchlistItem, candidate SwingCandidate,
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
-	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil {
+	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
+		claims.PremarketEpisodic == nil {
 		return store.AddWatchlistItem(ctx, item)
 	}
 	return store.PromoteScannerSourcesToWatchlist(
@@ -320,7 +336,8 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 	ctx context.Context, item store.WatchlistItem, candidate SwingCandidate,
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
-	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil {
+	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
+		claims.PremarketEpisodic == nil {
 		return store.AddWatchlistItemUnlessActive(ctx, item)
 	}
 	return store.PromoteScannerSourcesToWatchlistUnlessActive(

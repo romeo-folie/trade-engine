@@ -1181,6 +1181,11 @@ type ScannerConfig struct {
 	// fallback for members whose finer taxonomy is not sufficiently fresh.
 	PotentIndustry PotentIndustryConfig `yaml:"potent_industry"`
 
+	// PremarketEpisodic configures a pre-open, catalyst-aware gap scanner.
+	// Qualified rows are only additive inputs to the normal scanner/analyst/risk
+	// path; this source never places orders or grants trade permission.
+	PremarketEpisodic PremarketEpisodicConfig `yaml:"premarket_episodic"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1241,6 +1246,34 @@ type PotentIndustryConfig struct {
 	BatchSize                  int               `yaml:"batch_size"`
 	// RunLeaseMinutes bounds scheduled-run claims.
 	RunLeaseMinutes int `yaml:"run_lease_minutes"`
+}
+
+// PremarketEpisodicConfig controls deterministic premarket gap observations.
+// Times are interpreted in America/New_York. Every checkpoint must precede the
+// hard cutoff so a slow scan can never overlap opening-range construction.
+type PremarketEpisodicConfig struct {
+	Enabled             bool     `yaml:"enabled"`
+	PromoteCandidates   bool     `yaml:"promote_candidates"`
+	Checkpoints         []string `yaml:"checkpoints"`
+	HardCutoff          string   `yaml:"hard_cutoff"`
+	Feed                string   `yaml:"feed"`
+	UniverseMaxAgeHours int      `yaml:"universe_max_age_hours"`
+	HistorySessions     int      `yaml:"history_sessions"`
+	NewsLookbackHours   int      `yaml:"news_lookback_hours"`
+	MaxCandidatesPerRun int      `yaml:"max_candidates_per_run"`
+	MaxPromotionsPerRun int      `yaml:"max_promotions_per_run"`
+	MinGapPct           float64  `yaml:"min_gap_pct"`
+	MinPremarketVolume  int64    `yaml:"min_premarket_volume"`
+	MinTimeAdjustedRVOL float64  `yaml:"min_time_adjusted_rvol"`
+	MinDollarVolume     float64  `yaml:"min_dollar_volume"`
+	MinTradeCount       int64    `yaml:"min_trade_count"`
+	MaxSpreadBPS        float64  `yaml:"max_spread_bps"`
+	MaxQuoteAgeSeconds  int      `yaml:"max_quote_age_seconds"`
+	MinBarCoverage      float64  `yaml:"min_bar_coverage"`
+	MinPrice            float64  `yaml:"min_price"`
+	MinMarketCapMM      float64  `yaml:"min_market_cap_mm"`
+	BatchSize           int      `yaml:"batch_size"`
+	RunLeaseMinutes     int      `yaml:"run_lease_minutes"`
 }
 
 // UniverseConfig controls construction and caching of the point-in-time stock
@@ -2312,6 +2345,101 @@ func Validate(cfg *Config) []string {
 		if industry.MinPersistenceSessions > 5 {
 			errs = append(errs,
 				prefix+".min_persistence_sessions must be <= 5")
+		}
+	}
+	if premarket := cfg.Scanner.PremarketEpisodic; premarket.Enabled {
+		const prefix = "scanner.premarket_episodic"
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, prefix+" requires scanner.enabled=true")
+		}
+		if !cfg.Scanner.Universe.Enabled {
+			errs = append(errs, prefix+" requires scanner.universe.enabled=true")
+		}
+		if strings.ToLower(strings.TrimSpace(premarket.Feed)) != "sip" {
+			errs = append(errs, prefix+".feed must be sip; executable premarket liquidity cannot use IEX")
+		}
+		cutoff, cutoffErr := time.Parse("15:04", premarket.HardCutoff)
+		if cutoffErr != nil || cutoff.Format("15:04") != premarket.HardCutoff {
+			errs = append(errs, prefix+".hard_cutoff must use HH:MM")
+		} else {
+			open, _ := time.Parse("15:04", "09:30")
+			if !cutoff.Before(open) {
+				errs = append(errs, prefix+".hard_cutoff must be before 09:30")
+			}
+		}
+		if len(premarket.Checkpoints) == 0 {
+			errs = append(errs, prefix+".checkpoints must not be empty")
+		}
+		seenCheckpoints := make(map[string]struct{}, len(premarket.Checkpoints))
+		for _, raw := range premarket.Checkpoints {
+			checkpoint, err := time.Parse("15:04", raw)
+			if err != nil || checkpoint.Format("15:04") != raw {
+				errs = append(errs, prefix+".checkpoints must use HH:MM")
+				break
+			}
+			if _, duplicate := seenCheckpoints[raw]; duplicate {
+				errs = append(errs, prefix+".checkpoints must be unique")
+				break
+			}
+			seenCheckpoints[raw] = struct{}{}
+			premarketOpen, _ := time.Parse("15:04", "04:00")
+			if checkpoint.Before(premarketOpen) {
+				errs = append(errs, prefix+".checkpoints must be at or after 04:00")
+				break
+			}
+			if cutoffErr == nil && !checkpoint.Before(cutoff) {
+				errs = append(errs, prefix+".checkpoints must precede hard_cutoff")
+				break
+			}
+		}
+		for field, value := range map[string]int{
+			"universe_max_age_hours": premarket.UniverseMaxAgeHours,
+			"history_sessions":       premarket.HistorySessions,
+			"news_lookback_hours":    premarket.NewsLookbackHours,
+			"max_candidates_per_run": premarket.MaxCandidatesPerRun,
+			"max_promotions_per_run": premarket.MaxPromotionsPerRun,
+			"max_quote_age_seconds":  premarket.MaxQuoteAgeSeconds,
+			"batch_size":             premarket.BatchSize,
+			"run_lease_minutes":      premarket.RunLeaseMinutes,
+		} {
+			if value <= 0 {
+				errs = append(errs, prefix+"."+field+" must be > 0")
+			}
+		}
+		for field, duration := range map[string]struct {
+			value int
+			unit  time.Duration
+		}{
+			"universe_max_age_hours": {premarket.UniverseMaxAgeHours, time.Hour},
+			"news_lookback_hours":    {premarket.NewsLookbackHours, time.Hour},
+			"max_quote_age_seconds":  {premarket.MaxQuoteAgeSeconds, time.Second},
+			"run_lease_minutes":      {premarket.RunLeaseMinutes, time.Minute},
+		} {
+			if duration.value > 0 && !durationConfigFits(duration.value, duration.unit) {
+				errs = append(errs, prefix+"."+field+" overflows time.Duration")
+			}
+		}
+		for field, value := range map[string]float64{
+			"min_gap_pct":            premarket.MinGapPct,
+			"min_time_adjusted_rvol": premarket.MinTimeAdjustedRVOL,
+			"min_dollar_volume":      premarket.MinDollarVolume,
+			"max_spread_bps":         premarket.MaxSpreadBPS,
+			"min_price":              premarket.MinPrice,
+			"min_market_cap_mm":      premarket.MinMarketCapMM,
+		} {
+			if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
+				errs = append(errs, prefix+"."+field+" must be > 0")
+			}
+		}
+		if premarket.MinPremarketVolume <= 0 {
+			errs = append(errs, prefix+".min_premarket_volume must be > 0")
+		}
+		if premarket.MinTradeCount <= 0 {
+			errs = append(errs, prefix+".min_trade_count must be > 0")
+		}
+		if premarket.MinBarCoverage <= 0 || premarket.MinBarCoverage > 1 ||
+			math.IsNaN(premarket.MinBarCoverage) {
+			errs = append(errs, prefix+".min_bar_coverage must be in (0,1]")
 		}
 	}
 

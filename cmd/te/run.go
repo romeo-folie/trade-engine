@@ -921,10 +921,38 @@ Modes:
 					logger.Info("potent industry scanner started",
 						"after_close_delay_minutes",
 						cfg.Scanner.PotentIndustry.AfterCloseDelayMinutes,
-						"observation_only", true,
+						"promote_candidates",
+						cfg.Scanner.PotentIndustry.PromoteCandidates,
 					)
 				} else if cfg.Scanner.PotentIndustry.Enabled {
 					logger.Warn("potent industry scanner requested but DB not connected; skipping startup")
+				}
+				if cfg.Scanner.PremarketEpisodic.Enabled && store.IsConnected() {
+					premarketRunner := &scanner.PremarketEpisodicRunner{
+						Provider: data.NewAlpacaPremarketClient(alpacaClient),
+						News:     newsProvider,
+						Cfg:      cfg.Scanner.PremarketEpisodic,
+					}
+					premarketScheduler := &scanner.PremarketEpisodicScheduler{
+						Cfg: cfg.Scanner.PremarketEpisodic,
+						Job: premarketRunner,
+					}
+					go func() {
+						if err := premarketScheduler.Run(ctx); err != nil &&
+							err != context.Canceled {
+							logger.Warn("premarket episodic scheduler stopped with error",
+								"err", err.Error())
+						}
+					}()
+					logger.Info("premarket episodic scanner started",
+						"checkpoints", cfg.Scanner.PremarketEpisodic.Checkpoints,
+						"hard_cutoff", cfg.Scanner.PremarketEpisodic.HardCutoff,
+						"feed", cfg.Scanner.PremarketEpisodic.Feed,
+						"promote_candidates",
+						cfg.Scanner.PremarketEpisodic.PromoteCandidates,
+					)
+				} else if cfg.Scanner.PremarketEpisodic.Enabled {
+					logger.Warn("premarket episodic scanner requested but DB not connected; skipping startup")
 				}
 				go func() {
 					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
