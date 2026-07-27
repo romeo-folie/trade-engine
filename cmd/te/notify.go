@@ -19,6 +19,16 @@ type telegramImmediateSender interface {
 	SendImmediate(context.Context, string) error
 }
 
+func validateTelegramConnectivityConfig(cfg config.TelegramConfig) error {
+	if cfg.BotToken == "" {
+		return fmt.Errorf("telegram bot token not set (env: %s)", cfg.BotTokenEnv)
+	}
+	if cfg.ChatID == "" {
+		return fmt.Errorf("telegram chat_id not set in config")
+	}
+	return nil
+}
+
 func sendTelegramConnectivityTest(
 	ctx context.Context, sender telegramImmediateSender,
 ) error {
@@ -38,14 +48,10 @@ var notifyTestCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("load config: %w", err)
 		}
-		if !cfg.Notifications.Telegram.Enabled {
-			return fmt.Errorf("telegram notifications are not enabled in config")
-		}
-		if cfg.Notifications.Telegram.BotToken == "" {
-			return fmt.Errorf("telegram bot token not set (env: %s)", cfg.Notifications.Telegram.BotTokenEnv)
-		}
-		if cfg.Notifications.Telegram.ChatID == "" {
-			return fmt.Errorf("telegram chat_id not set in config")
+		if err := validateTelegramConnectivityConfig(
+			cfg.Notifications.Telegram,
+		); err != nil {
+			return err
 		}
 
 		bot := notify.NewTelegramBot(cfg.Notifications.Telegram, nil)

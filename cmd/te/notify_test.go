@@ -5,6 +5,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/config"
 )
 
 type stubTelegramImmediateSender struct {
@@ -33,5 +35,21 @@ func TestSendTelegramConnectivityTestIsUngatedAndReturnsSendError(t *testing.T) 
 	err := sendTelegramConnectivityTest(context.Background(), sender)
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("send error = %v; want wrapped sentinel", err)
+	}
+}
+
+func TestValidateTelegramConnectivityConfigDoesNotRequireDeliveryEnabled(t *testing.T) {
+	cfg := config.TelegramConfig{
+		Enabled: false, BotToken: "token", ChatID: "chat",
+	}
+	if err := validateTelegramConnectivityConfig(cfg); err != nil {
+		t.Fatalf("disabled delivery blocked connectivity test: %v", err)
+	}
+
+	cfg.BotToken = ""
+	cfg.BotTokenEnv = "TELEGRAM_TOKEN"
+	if err := validateTelegramConnectivityConfig(cfg); err == nil ||
+		!strings.Contains(err.Error(), "TELEGRAM_TOKEN") {
+		t.Fatalf("missing-token error = %v", err)
 	}
 }
