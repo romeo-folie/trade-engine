@@ -1650,6 +1650,153 @@ func TestCurrencyStrengthHistoricalAuditRemainsQueuedUntilPnLEnrichment(t *testi
 	}
 }
 
+func TestCurrencyStrengthLegacyAuditSessionDateUsesConfiguredTimezone(t *testing.T) {
+	cases := []struct {
+		name, exitedAt, want string
+	}{
+		{name: "midnight boundary", exitedAt: "2026-07-28T01:30:00Z", want: "2026-07-27"},
+		{name: "spring DST", exitedAt: "2026-03-08T06:30:00Z", want: "2026-03-08"},
+		{name: "fall DST", exitedAt: "2026-11-01T05:30:00Z", want: "2026-11-01"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &currencyStrengthPaperRunner{
+				cfg: config.CurrencyStrengthConfig{Timezone: "America/New_York"},
+				state: &currencyStrengthRunState{
+					Date: "2026-07-28", AuditOnly: true,
+					PendingExitAudits: []currencyStrengthExitAudit{{
+						OrderID: "EXIT-LEGACY-TZ", ExitedAt: tc.exitedAt,
+					}},
+				},
+			}
+			audits := runner.pendingExitAudits()
+			if len(audits) != 1 || audits[0].SessionDate != tc.want {
+				t.Fatalf("legacy audit was assigned the wrong local session date: %+v", audits)
+			}
+		})
+	}
+}
+
+func TestCurrencyStrengthLegacyAuditWithoutDateRemainsQueued(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{}
+	runner := &currencyStrengthPaperRunner{
+		cfg:     config.CurrencyStrengthConfig{Timezone: "America/New_York"},
+		journal: journal,
+		state: &currencyStrengthRunState{
+			Date: "2026-07-28", AuditOnly: true, Symbol: "EUR/JPY", Side: "buy",
+			EntryStatus: "filled", EntryFillPrice: 160,
+			PendingExitAudits: []currencyStrengthExitAudit{{OrderID: "EXIT-LEGACY-UNKNOWN"}},
+		},
+	}
+	if err := runner.syncPendingExitAudit(context.Background()); err == nil {
+		t.Fatal("legacy audit without a recoverable date should remain queued")
+	}
+	if len(runner.state.PendingExitAudits) != 1 || len(journal.exits) != 0 {
+		t.Fatalf("undated legacy audit was not retained safely: state=%+v exits=%v", runner.state, journal.exits)
+	}
+}
+
+func TestCurrencyStrengthLegacyAuditUnrecoverableInputsRemainQueued(t *testing.T) {
+	cases := []struct {
+		name, timezone, exitedAt string
+	}{
+		{name: "malformed timestamp", timezone: "America/New_York", exitedAt: "not-a-timestamp"},
+		{name: "invalid timezone", timezone: "Not/AZone", exitedAt: "2026-07-28T01:30:00Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			journal := &captureCurrencyStrengthJournal{}
+			runner := &currencyStrengthPaperRunner{
+				cfg: config.CurrencyStrengthConfig{Timezone: tc.timezone}, journal: journal,
+				state: &currencyStrengthRunState{
+					Date: "2026-07-28", AuditOnly: true,
+					PendingExitAudits: []currencyStrengthExitAudit{{OrderID: "EXIT-LEGACY-UNRECOVERABLE", ExitedAt: tc.exitedAt}},
+				},
+			}
+			if err := runner.syncPendingExitAudit(context.Background()); err == nil {
+				t.Fatal("unrecoverable legacy audit should remain queued")
+			}
+			if len(runner.state.PendingExitAudits) != 1 || len(journal.exits) != 0 {
+				t.Fatalf("unrecoverable legacy audit was not retained safely: state=%+v exits=%v", runner.state, journal.exits)
+			}
+		})
+	}
+}
+
+func TestCurrencyStrengthDatedLegacyAuditMissingEconomicsRemainsQueued(t *testing.T) {
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{Timezone: "UTC"},
+		state: &currencyStrengthRunState{
+			Date: "2026-07-28", Symbol: "EUR/USD", AuditOnly: false,
+			PendingExitAudits: []currencyStrengthExitAudit{{
+				OrderID: "EXIT-LEGACY-MISSING-ECONOMICS", SessionDate: "2026-07-27",
+				FillPrice: 1.1, FilledQty: 100000, ExitedAt: "2026-07-27T18:00:00Z",
+			}},
+		},
+	}
+	if err := runner.syncPendingExitAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.state.PendingExitAudits) != 1 {
+		t.Fatalf("dated legacy audit was dequeued: %+v", runner.state.PendingExitAudits)
+	}
+}
+
+func TestCurrencyStrengthLoadsQueueOnlySidecarAsAuditOnly(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "currency-strength.json")
+	b, err := json.Marshal(currencyStrengthRunState{
+		Date: "2026-07-28",
+		PendingExitAudits: []currencyStrengthExitAudit{{
+			OrderID: "EXIT-QUEUE-ONLY", SessionDate: "2026-07-27",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(statePath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &currencyStrengthPaperRunner{statePath: statePath, cfg: config.CurrencyStrengthConfig{Timezone: "UTC"}}
+	if err := runner.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || !runner.state.AuditOnly || len(runner.state.PendingExitAudits) != 1 {
+		t.Fatalf("queue-only sidecar was not isolated as audit-only: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthLegacyAuditSessionDateIsPersistedBeforeEnrichment(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "currency-strength.json")
+	runner := &currencyStrengthPaperRunner{
+		cfg:       config.CurrencyStrengthConfig{Timezone: "America/New_York"},
+		journal:   &captureCurrencyStrengthJournal{},
+		market:    fakeMarketDataProvider{},
+		statePath: statePath,
+		state: &currencyStrengthRunState{
+			Date: "2026-07-28", AuditOnly: true, Symbol: "EUR/JPY", Side: "buy",
+			EntryStatus: "filled", EntryFillPrice: 160,
+			PendingExitAudits: []currencyStrengthExitAudit{{
+				OrderID: "EXIT-LEGACY-PERSIST", FillPrice: 161, FilledQty: 100000,
+				ExitedAt: "2026-07-28T01:30:00Z",
+			}},
+		},
+	}
+	if err := runner.syncPendingExitAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted currencyStrengthRunState
+	if err := json.Unmarshal(b, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted.PendingExitAudits) != 1 || persisted.PendingExitAudits[0].SessionDate != "2026-07-27" {
+		t.Fatalf("normalized session date was not persisted: %+v", persisted)
+	}
+}
+
 func TestCurrencyStrengthTerminalExitRetainsHistoricalAuditQueue(t *testing.T) {
 	exitedAt := time.Date(2026, 7, 27, 18, 0, 30, 0, time.UTC)
 	journal := &captureCurrencyStrengthJournal{}

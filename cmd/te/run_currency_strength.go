@@ -84,6 +84,8 @@ type currencyStrengthExitAudit struct {
 	SessionDate    string  `json:"session_date,omitempty"`
 }
 
+const currencyStrengthUnknownSessionDate = "unknown"
+
 // currencyStrengthJournal is the strategy's durable audit seam. Production
 // writes to PostgreSQL; tests may omit it or supply a lightweight recorder.
 type currencyStrengthJournal interface {
@@ -875,20 +877,31 @@ func (r *currencyStrengthPaperRunner) pendingExitAudits() []currencyStrengthExit
 				}
 			}
 			if audits[i].SessionDate == "" {
-				audits[i].SessionDate = r.state.Date
+				// A legacy audit has no safe attribution when its timestamp is
+				// absent or malformed. Keep it queued rather than silently
+				// attaching it to whichever session currently owns the sidecar.
+				audits[i].SessionDate = currencyStrengthUnknownSessionDate
 			}
 		}
 		if audits[i].Symbol == "" {
-			audits[i].Symbol = r.state.Symbol
+			if audits[i].SessionDate == r.state.Date {
+				audits[i].Symbol = r.state.Symbol
+			}
 		}
 		if audits[i].Side == "" {
-			audits[i].Side = r.state.Side
+			if audits[i].SessionDate == r.state.Date {
+				audits[i].Side = r.state.Side
+			}
 		}
 		if audits[i].EntryStatus == "" {
-			audits[i].EntryStatus = r.state.EntryStatus
+			if audits[i].SessionDate == r.state.Date {
+				audits[i].EntryStatus = r.state.EntryStatus
+			}
 		}
 		if audits[i].EntryFillPrice <= 0 {
-			audits[i].EntryFillPrice = r.state.EntryFillPrice
+			if audits[i].SessionDate == r.state.Date {
+				audits[i].EntryFillPrice = r.state.EntryFillPrice
+			}
 		}
 	}
 	return audits
@@ -2595,9 +2608,25 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 	}
 	// Normalize legacy queue entries before replay. This snapshots the
 	// originating trade economics/date while they are still available.
-	r.state.PendingExitAudits = r.pendingExitAudits()
+	normalizedAudits := r.pendingExitAudits()
+	normalized := false
+	for i := range normalizedAudits {
+		if normalizedAudits[i] != r.state.PendingExitAudits[i] {
+			normalized = true
+			break
+		}
+	}
+	r.state.PendingExitAudits = normalizedAudits
+	if normalized && r.statePath != "" {
+		if err := r.saveState(); err != nil {
+			return fmt.Errorf("persist normalized currency-strength exit audits: %w", err)
+		}
+	}
 	for len(r.state.PendingExitAudits) > 0 {
 		audit := r.state.PendingExitAudits[0]
+		if audit.SessionDate == currencyStrengthUnknownSessionDate {
+			return fmt.Errorf("currency-strength historical audit %q has no recoverable session date", audit.OrderID)
+		}
 		realizedPnL, err := r.realizedPnLUSD(ctx, audit)
 		enrichmentPending := false
 		if err != nil {
@@ -2642,6 +2671,9 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 	}
 	if normalizeCurrencyStrengthOrderStatus(entryStatus) != "filled" ||
 		audit.FillPrice <= 0 || math.Abs(audit.FilledQty) <= 0 || entryFillPrice <= 0 {
+		if r.state != nil && audit.SessionDate != "" && audit.SessionDate != r.state.Date {
+			return nil, fmt.Errorf("currency-strength historical audit %q lacks entry economics", audit.OrderID)
+		}
 		return nil, nil
 	}
 	symbol := audit.Symbol
@@ -2926,7 +2958,10 @@ func (r *currencyStrengthPaperRunner) loadState() error {
 		stateAccountID = r.accountID
 	}
 	state.AccountID = stateAccountID
-	if state.Symbol != "" && state.Quantity > 0 {
+	if len(state.PendingExitAudits) > 0 && (state.Symbol == "" || state.Quantity <= 0) {
+		state.AuditOnly = true
+	}
+	if (state.Symbol != "" && state.Quantity > 0) || len(state.PendingExitAudits) > 0 {
 		r.state = &state
 	}
 	if legacy && r.state != nil {
