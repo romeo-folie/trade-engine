@@ -63,28 +63,29 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	}
 	err = store.FinishScannerRun(ctx, run, []store.ScannerCandidateSnapshot{
 		{
-			ScannerRunID:        runID,
-			Ticker:              "SNAP_A",
-			Sources:             []string{"mover"},
-			QualificationKnown:  true,
-			PullbackQualified:   true,
-			QualificationStage:  "qualified",
-			EligibleForScoring:  true,
-			LLMAction:           "add",
-			LLMConviction:       .8,
-			PassedMinConviction: true,
-			CapSelected:         true,
-			WatchlistAdded:      true,
-			Strategies:          []string{"momentum", "pullback_strength"},
-			FinalStage:          "watchlist_added",
-			SourceScores:        map[string]float64{"mover": 0},
-			UniverseMember:      boolPtr(true),
-			Sector:              "Technology",
-			Industry:            "Software",
-			TaxonomyStatus:      "known",
-			TaxonomyAsOf:        &universeAsOf,
-			TaxonomyProvider:    "scanner-snapshot-test",
-			TaxonomyEvidence:    json.RawMessage(`{"confidence":0}`),
+			ScannerRunID:           runID,
+			Ticker:                 "SNAP_A",
+			Sources:                []string{"mover"},
+			QualificationKnown:     true,
+			PullbackQualified:      true,
+			QualificationStage:     "qualified",
+			EligibleForScoring:     true,
+			LLMAction:              "add",
+			LLMConviction:          .8,
+			PassedMinConviction:    true,
+			CapSelected:            true,
+			WatchlistAdded:         true,
+			Strategies:             []string{"momentum", "pullback_strength"},
+			FinalStage:             "watchlist_added",
+			SourceScores:           map[string]float64{"mover": 0},
+			UniverseMember:         boolPtr(true),
+			Sector:                 "Technology",
+			Industry:               "Software",
+			TaxonomyStatus:         "known",
+			TaxonomyAsOf:           &universeAsOf,
+			TaxonomyProvider:       "scanner-snapshot-test",
+			TaxonomyEvidence:       json.RawMessage(`{"confidence":0}`),
+			PotentIndustryEvidence: "Software broad_strong; member rank 1",
 		},
 		{
 			ScannerRunID:       runID,
@@ -105,20 +106,22 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	var storedUniverseAsOf time.Time
 	var sourceScores json.RawMessage
 	var universeMember bool
+	var potentIndustryEvidence string
 	err = store.GetDB().QueryRow(ctx, `
 		SELECT r.universe_version_id::text, r.universe_as_of, r.regime_reference,
-		       c.source_scores, c.universe_member
+		       c.source_scores, c.universe_member, c.potent_industry_evidence
 		FROM scanner_runs r
 		JOIN scanner_candidate_snapshots c ON c.scanner_run_id=r.id
 		WHERE r.id=$1 AND c.ticker='SNAP_A'`,
 		runID,
 	).Scan(
 		&storedUniverseID, &storedUniverseAsOf, &regime,
-		&sourceScores, &universeMember,
+		&sourceScores, &universeMember, &potentIndustryEvidence,
 	)
 	if err != nil || storedUniverseID != universeID || regime != "pending" ||
 		!storedUniverseAsOf.Equal(universeAsOf) ||
-		!universeMember || string(sourceScores) != `{"mover": 0}` {
+		!universeMember || string(sourceScores) != `{"mover": 0}` ||
+		potentIndustryEvidence != "Software broad_strong; member rank 1" {
 		t.Fatalf(
 			"extended snapshot = universe=%q as_of=%s regime=%q scores=%s member=%v err=%v",
 			storedUniverseID, storedUniverseAsOf, regime, sourceScores, universeMember, err,

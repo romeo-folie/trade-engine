@@ -897,9 +897,9 @@ scanner:
     batch_size: 200                        # Maximum symbols requested per daily-bars provider batch
     run_lease_minutes: 60                  # Reclaim stale run or candidate-promotion claims after this lease
   potent_industry:
-    enabled: false                         # Full-universe industry-rotation lens; observation-only by default
-    promote_candidates: false              # Reserved; true is rejected in this observation-only release
-    max_promotions_per_run: 20             # Future promotion cap; excluded from scoring-history compatibility
+    enabled: false                         # Full-universe industry-rotation lens; default off
+    promote_candidates: false              # Add top members to normal scanner scoring; keep false for observation only
+    max_promotions_per_run: 20             # Global promotion cap; excluded from scoring-history compatibility
     after_close_delay_minutes: 15          # Wait for finalized completed-session bars
     universe_max_age_hours: 36             # Maximum age of the immutable universe snapshot
     taxonomy_max_age_hours: 168            # Maximum age of taxonomy used to form a group

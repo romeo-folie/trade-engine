@@ -1,9 +1,10 @@
 # Potent industry scanner
 
-The potent-industry scanner is a default-off, observation-only discovery lens.
+The potent-industry scanner is a default-off discovery lens.
 It measures whether capital is rotating into an industry broadly enough to be
-useful for later candidate selection. It does not authorize orders and, in this
-release, cannot promote candidates into the normal scanner funnel.
+useful for later candidate selection. It does not authorize orders. When both
+the scanner and its explicit promotion switch are enabled, the highest-ranked
+members enter the normal scanner funnel for independent LLM scoring.
 
 ## Decision boundary
 
@@ -103,15 +104,16 @@ strength baseline.
 
 A member must exceed the absolute member-score floor, have positive 5- and
 20-session stock-versus-industry strength, and remain inside the configured
-per-group rank limit. Qualified rows still receive
-`promotion_status=not_requested` in this release.
+per-group rank limit. Qualified rows receive `promotion_status=not_requested`
+unless promotion is enabled. When enabled, at most
+`max_promotions_per_run` unique tickers are queued globally in deterministic
+group/member rank order.
 
 ## Configuration
 
 The complete example lives in `config.example.yaml` under
 `scanner.potent_industry`. Both `enabled` and `promote_candidates` default to
-false. Setting `promote_candidates: true` is rejected until the follow-up
-multi-source promotion work is installed.
+false.
 
 Important controls include:
 
@@ -122,11 +124,21 @@ Important controls include:
 - `min_advance_share` and `min_persistence_sessions`
 - `max_cap_equal_divergence`
 - `min_member_score` and `max_members_per_group`
+- `promote_candidates` and `max_promotions_per_run`
+
+Promotion is additive. A potent-industry candidate must still pass the normal
+scanner conviction gate, candidate cap, and downstream engine controls. Its
+group/member evidence is preserved in the prospective snapshot, event,
+watchlist strategy tags, and Telegram notification. If the same ticker also
+came from a weekly-leader or ordinary scanner source, every source tag and
+score is retained. Claimed discovery sources are validated and completed in
+the same transaction as the watchlist write; a stale claim cannot publish
+partial attribution.
 
 Changing a scoring or mapping control—or the after-close delay that sets the
 taxonomy decision cutoff—changes the compatibility hash and starts a new
 transition lineage. Operational batching, leases, universe staleness selection,
-and the future promotion switch do not change scoring-history identity.
+and the promotion switch do not change scoring-history identity.
 
 ## Reporting
 
@@ -149,10 +161,10 @@ top members.
 
 The current Alpaca stock-history adapter requests the IEX feed. IEX is not
 consolidated market volume, so volume-derived diagnostics must be treated as
-prospective research evidence rather than execution-grade proof. The scanner
-remains observation-only until:
+prospective research evidence rather than execution-grade proof. Promotion
+therefore defaults off and should remain in PAPER until:
 
 1. taxonomy and benchmark coverage are measured;
 2. data-feed limitations are resolved or explicitly accepted;
 3. prospective conversion and outcome results are reviewed; and
-4. the follow-up atomic multi-source promotion path passes PAPER validation.
+4. atomic multi-source promotion behavior passes PAPER validation.

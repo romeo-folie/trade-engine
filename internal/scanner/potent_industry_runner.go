@@ -64,8 +64,8 @@ func (potentIndustryStoreRepository) CompleteRun(
 }
 
 // PotentIndustryRunner observes coordinated industry rotation across the
-// immutable point-in-time universe. It never authorizes a trade and PR A always
-// persists promotion_status=not_requested.
+// immutable point-in-time universe. It never authorizes a trade; when explicitly
+// configured, its highest-ranked members become pending scanner candidates.
 type PotentIndustryRunner struct {
 	Provider   data.BulkDailyBarsProvider
 	Cfg        config.PotentIndustryConfig
@@ -215,6 +215,7 @@ func (r *PotentIndustryRunner) RunSession(
 	if err != nil {
 		return err
 	}
+	markPotentIndustryPromotions(groups, memberRows, r.Cfg)
 	benchmarkEvidence, err := potentIndustryBenchmarkEvidence(
 		completedMarket, marketBenchmark, benchmarkHistories, history.Failures,
 		session.Date, session.Close, minHistory,
@@ -246,6 +247,75 @@ func (r *PotentIndustryRunner) RunSession(
 		"members", len(memberRows), "selected_members", selectedMembers,
 	)
 	return nil
+}
+
+func markPotentIndustryPromotions(
+	groups []store.IndustryRotationGroup,
+	members []store.IndustryRotationMember,
+	cfg config.PotentIndustryConfig,
+) {
+	if !cfg.PromoteCandidates {
+		return
+	}
+	limit := cfg.MaxPromotionsPerRun
+	if limit <= 0 {
+		limit = 20
+	}
+	type rankedMember struct {
+		index       int
+		groupRank   int
+		memberRank  int
+		memberScore float64
+		ticker      string
+	}
+	groupRanks := make(map[string]int, len(groups))
+	for _, group := range groups {
+		if group.Outcome == "qualified" && group.Rank != nil {
+			groupRanks[potentPromotionGroupKey(group.GroupType, group.GroupKey)] = *group.Rank
+		}
+	}
+	ranked := make([]rankedMember, 0, len(members))
+	for i, member := range members {
+		groupRank, groupQualified := groupRanks[potentPromotionGroupKey(
+			member.GroupType, member.GroupKey,
+		)]
+		if !groupQualified || member.Outcome != "qualified" ||
+			member.MemberRank == nil || member.MemberScore == nil {
+			continue
+		}
+		ranked = append(ranked, rankedMember{
+			index: i, groupRank: groupRank, memberRank: *member.MemberRank,
+			memberScore: *member.MemberScore, ticker: member.Ticker,
+		})
+	}
+	sort.Slice(ranked, func(i, j int) bool {
+		if ranked[i].groupRank != ranked[j].groupRank {
+			return ranked[i].groupRank < ranked[j].groupRank
+		}
+		if ranked[i].memberRank != ranked[j].memberRank {
+			return ranked[i].memberRank < ranked[j].memberRank
+		}
+		if ranked[i].memberScore != ranked[j].memberScore {
+			return ranked[i].memberScore > ranked[j].memberScore
+		}
+		return ranked[i].ticker < ranked[j].ticker
+	})
+	selectedTickers := make(map[string]struct{}, limit)
+	for _, candidate := range ranked {
+		if len(selectedTickers) >= limit {
+			break
+		}
+		if _, exists := selectedTickers[candidate.ticker]; exists {
+			continue
+		}
+		members[candidate.index].PromotionStatus = "pending"
+		selectedTickers[candidate.ticker] = struct{}{}
+	}
+}
+
+func potentPromotionGroupKey(groupType, groupKey string) string {
+	return strings.ToLower(strings.TrimSpace(groupType)) + "\x00" +
+		normalizePotentLabel(groupKey)
 }
 
 func potentIndustryPolicy(cfg config.PotentIndustryConfig) PotentIndustryScoringPolicy {

@@ -80,23 +80,30 @@ func TestScanRecorderRegisterPreservesMultiSourceLineage(t *testing.T) {
 		TaxonomyAsOf:   &asOf,
 	}})
 	recorder.register([]SwingCandidate{{
-		Ticker:               "NVDA",
-		Sources:              []string{"active", "mover", "weekly_leader"},
-		SourceScores:         map[string]float64{"active": 0.73, "weekly_leader": 0.91},
-		WeeklyLeaderEvidence: "rank 4, composite score 0.910 across the full eligible universe",
+		Ticker:  "NVDA",
+		Sources: []string{"active", "mover", "weekly_leader", "potent_industry"},
+		SourceScores: map[string]float64{
+			"active": 0.73, "weekly_leader": 0.91, "potent_industry": 0.82,
+		},
+		WeeklyLeaderEvidence:   "rank 4, composite score 0.910 across the full eligible universe",
+		PotentIndustryEvidence: "Semiconductors broad_strong; member rank 1",
 	}})
 
 	got := recorder.candidates["NVDA"]
-	if want := []string{"mover", "active", "weekly_leader"}; !reflect.DeepEqual(got.Sources, want) {
+	if want := []string{
+		"mover", "active", "weekly_leader", "potent_industry",
+	}; !reflect.DeepEqual(got.Sources, want) {
 		t.Fatalf("sources = %v, want %v", got.Sources, want)
 	}
 	if want := map[string]float64{
 		"mover": 0, "active": 0.73, "weekly_leader": 0.91,
+		"potent_industry": 0.82,
 	}; !reflect.DeepEqual(got.SourceScores, want) {
 		t.Fatalf("source scores = %v, want %v", got.SourceScores, want)
 	}
-	if got.WeeklyLeaderEvidence == "" || got.GraphContext != "" {
-		t.Fatalf("weekly evidence was not stored independently: %+v", got)
+	if got.WeeklyLeaderEvidence == "" || got.PotentIndustryEvidence == "" ||
+		got.GraphContext != "" {
+		t.Fatalf("discovery evidence was not stored independently: %+v", got)
 	}
 	if got.UniverseMember == nil || !*got.UniverseMember {
 		t.Fatal("universe membership lineage was not preserved")

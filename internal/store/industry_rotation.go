@@ -150,6 +150,34 @@ type IndustryRotationTransition struct {
 	Reason        string
 }
 
+type IndustryRotationCandidate struct {
+	RunID               string
+	UniverseVersionID   string
+	UniverseAsOf        time.Time
+	GroupType           string
+	GroupKey            string
+	GroupArchetype      string
+	GroupScore          float64
+	GroupRank           int
+	Ticker              string
+	MemberScore         float64
+	MemberRank          int
+	Price               float64
+	Return20            float64
+	StockVsIndustryRS   float64
+	StockVsSectorRS     float64
+	StockVsMarketRS     float64
+	MarketCapMM         float64
+	DollarVolume        float64
+	Sector              string
+	Industry            string
+	TaxonomyStatus      string
+	TaxonomyAsOf        *time.Time
+	TaxonomyProvider    string
+	TaxonomyEvidence    json.RawMessage
+	PromotionClaimToken string
+}
+
 // ClaimIndustryRotationRun creates or reclaims one deterministic run identity.
 // Active leases and completed runs are immutable to concurrent engine processes.
 func ClaimIndustryRotationRun(
@@ -398,7 +426,167 @@ func CompleteIndustryRotationRun(
 	); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `
+		WITH latest AS (
+			SELECT id FROM industry_rotation_runs
+			WHERE status='completed'
+			ORDER BY decision_at DESC, completed_at DESC, id DESC
+			LIMIT 1
+		)
+		UPDATE industry_rotation_members m
+		SET promotion_status='superseded',
+		    promotion_reason='newer completed industry rotation run',
+		    promotion_claim_token=NULL, promotion_claimed_at=NULL
+		FROM industry_rotation_runs r, latest l
+		WHERE m.run_id=r.id AND m.run_id<>l.id
+		  AND m.promotion_status IN ('pending','processing')
+		  AND r.status='completed'`,
+	); err != nil {
+		return fmt.Errorf("supersede stale potent industry promotions: %w", err)
+	}
 	return tx.Commit(ctx)
+}
+
+func ClaimIndustryRotationCandidatesAsOf(
+	ctx context.Context,
+	expectedSessionDate, asOf, claimedAt time.Time,
+	lease time.Duration,
+	claimToken string,
+) ([]IndustryRotationCandidate, error) {
+	if strings.TrimSpace(claimToken) == "" {
+		return nil, fmt.Errorf("potent industry promotion claim token is required")
+	}
+	if expectedSessionDate.IsZero() {
+		return nil, fmt.Errorf("expected potent industry promotion session is required")
+	}
+	if lease <= 0 {
+		lease = time.Hour
+	}
+	rows, err := GetDB().Query(ctx, `
+		WITH latest AS (
+			SELECT id, session_date FROM industry_rotation_runs
+			WHERE status='completed'
+			  AND decision_at <= $2::timestamptz
+			  AND completed_at <= $2::timestamptz
+			ORDER BY decision_at DESC, completed_at DESC, id DESC LIMIT 1
+		), claimable AS (
+			SELECT m.run_id, m.group_type, m.group_key, m.ticker
+			FROM industry_rotation_members m
+			JOIN latest l ON l.id=m.run_id AND l.session_date=$1::date
+			WHERE m.outcome='qualified'
+			  AND (
+			    m.promotion_status='pending'
+			    OR (
+			      m.promotion_status='processing'
+			      AND (
+			        m.promotion_claimed_at IS NULL
+			        OR m.promotion_claimed_at <= $5
+			      )
+			    )
+			  )
+			FOR UPDATE OF m SKIP LOCKED
+		), claimed AS (
+			UPDATE industry_rotation_members m
+			SET promotion_status='processing', promotion_claim_token=$4,
+			    promotion_claimed_at=$3, promotion_reason=NULL
+			FROM claimable c
+			WHERE m.run_id=c.run_id AND m.group_type=c.group_type
+			  AND m.group_key=c.group_key AND m.ticker=c.ticker
+			RETURNING m.*
+		)
+		SELECT m.run_id, m.universe_version_id, v.as_of,
+		       m.group_type, m.group_key, g.archetype, g.potency_score, g.rank,
+		       m.ticker, m.member_score, m.member_rank, m.close_price,
+		       COALESCE(m.return_20d,0), COALESCE(m.stock_vs_industry_rs,0),
+		       COALESCE(m.stock_vs_sector_rs,0), COALESCE(m.stock_vs_market_rs,0),
+		       COALESCE(u.market_cap_mm,0), COALESCE(u.dollar_volume,0),
+		       u.sector, u.industry, u.taxonomy_status, u.taxonomy_as_of,
+		       COALESCE(u.taxonomy_provider,''), u.taxonomy_evidence,
+		       m.promotion_claim_token
+		FROM claimed m
+		JOIN industry_rotation_groups g
+		  ON g.run_id=m.run_id AND g.group_type=m.group_type
+		 AND g.group_key=m.group_key
+		JOIN swing_universe_versions v ON v.id=m.universe_version_id
+		JOIN swing_universe_members u
+		  ON u.universe_version_id=m.universe_version_id AND u.ticker=m.ticker
+		ORDER BY g.rank, m.member_rank, m.member_score DESC, m.ticker`,
+		expectedSessionDate.Format("2006-01-02"), asOf, claimedAt, claimToken,
+		claimedAt.Add(-lease),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("claim pending potent industry candidates: %w", err)
+	}
+	defer rows.Close()
+	var out []IndustryRotationCandidate
+	for rows.Next() {
+		var candidate IndustryRotationCandidate
+		if err := rows.Scan(
+			&candidate.RunID, &candidate.UniverseVersionID, &candidate.UniverseAsOf,
+			&candidate.GroupType, &candidate.GroupKey, &candidate.GroupArchetype,
+			&candidate.GroupScore, &candidate.GroupRank, &candidate.Ticker,
+			&candidate.MemberScore, &candidate.MemberRank, &candidate.Price,
+			&candidate.Return20, &candidate.StockVsIndustryRS,
+			&candidate.StockVsSectorRS, &candidate.StockVsMarketRS,
+			&candidate.MarketCapMM, &candidate.DollarVolume,
+			&candidate.Sector, &candidate.Industry, &candidate.TaxonomyStatus,
+			&candidate.TaxonomyAsOf, &candidate.TaxonomyProvider,
+			&candidate.TaxonomyEvidence, &candidate.PromotionClaimToken,
+		); err != nil {
+			return nil, err
+		}
+		out = append(out, candidate)
+	}
+	return out, rows.Err()
+}
+
+func ReleaseIndustryRotationPromotionClaims(
+	ctx context.Context, claimToken, reason string,
+) error {
+	if strings.TrimSpace(claimToken) == "" {
+		return nil
+	}
+	_, err := GetDB().Exec(ctx, `
+		UPDATE industry_rotation_members
+		SET promotion_status='pending', promotion_claim_token=NULL,
+		    promotion_claimed_at=NULL, promotion_reason=$2
+		WHERE promotion_status='processing' AND promotion_claim_token=$1`,
+		claimToken, nullableString(reason),
+	)
+	if err != nil {
+		return fmt.Errorf("release potent industry promotion claims: %w", err)
+	}
+	return nil
+}
+
+func MarkIndustryRotationPromotion(
+	ctx context.Context,
+	runID, groupType, groupKey, ticker, claimToken, status, scannerRunID, reason string,
+	at time.Time,
+) error {
+	status = normalizePromotionStatus(status)
+	if status == "pending" || status == "processing" ||
+		status == "not_requested" || status == "superseded" {
+		return fmt.Errorf("terminal potent industry promotion status required")
+	}
+	tag, err := GetDB().Exec(ctx, `
+		UPDATE industry_rotation_members
+		SET promotion_status=$6, scanner_run_id=$7, promoted_at=$8,
+		    promotion_reason=$9, promotion_claim_token=NULL,
+		    promotion_claimed_at=NULL
+		WHERE run_id=$1 AND group_type=$2 AND group_key=$3 AND ticker=$4
+		  AND outcome='qualified' AND promotion_status='processing'
+		  AND promotion_claim_token=$5`,
+		runID, groupType, groupKey, ticker, claimToken, status,
+		nullableUUID(scannerRunID), at, nullableString(reason),
+	)
+	if err != nil {
+		return fmt.Errorf("mark potent industry promotion: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("mark potent industry promotion: claim is no longer current")
+	}
+	return nil
 }
 
 func GetLatestCompletedIndustryRotationRunAsOf(

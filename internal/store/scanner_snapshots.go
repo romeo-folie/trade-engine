@@ -40,6 +40,7 @@ type ScannerCandidateSnapshot struct {
 	Sources                  []string
 	GraphContext             string
 	WeeklyLeaderEvidence     string
+	PotentIndustryEvidence   string
 	Price                    float64
 	ChangePct                float64
 	Volume                   int64
@@ -191,6 +192,7 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scanner_candidate_snapshots (
 				scanner_run_id, ticker, sources, graph_context, weekly_leader_evidence,
+				potent_industry_evidence,
 				price, change_pct,
 				volume, trade_count, dollar_volume, market_cap_mm,
 				return_1m, return_3m, return_6m, momentum_composite, momentum_rank,
@@ -205,10 +207,11 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 				) VALUES (
 					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48
+					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49
 				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableString(c.WeeklyLeaderEvidence),
+			nullableString(c.PotentIndustryEvidence),
 			nullableFloat(c.Price), nullableFloat(c.ChangePct), c.Volume, c.TradeCount,
 			nullableFloat(c.DollarVolume), nullableFloat(c.MarketCapMM),
 			nullableFloat(c.Return1M), nullableFloat(c.Return3M), nullableFloat(c.Return6M),
