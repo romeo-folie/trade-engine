@@ -35,55 +35,56 @@ type ScannerRun struct {
 
 // ScannerCandidateSnapshot records every stage reached by a sourced candidate.
 type ScannerCandidateSnapshot struct {
-	ScannerRunID             string
-	Ticker                   string
-	Sources                  []string
-	GraphContext             string
-	WeeklyLeaderEvidence     string
-	PotentIndustryEvidence   string
-	Price                    float64
-	ChangePct                float64
-	Volume                   int64
-	TradeCount               int64
-	DollarVolume             float64
-	MarketCapMM              float64
-	Return1M                 float64
-	Return3M                 float64
-	Return6M                 float64
-	MomentumComposite        float64
-	MomentumRank             int
-	QualificationKnown       bool
-	PullbackQualified        bool
-	QualificationStage       string
-	QualificationReason      string
-	QuarantineRequired       bool
-	ActiveWatchlistDuplicate bool
-	EligibleForScoring       bool
-	LLMAction                string
-	LLMConviction            float64
-	LLMSetupType             string
-	LLMStrategy              string
-	LLMTimeframes            []string
-	LLMReasoning             string
-	LLMRisks                 []string
-	LLMError                 string
-	PassedMinConviction      bool
-	CapSelected              bool
-	WatchlistAdded           bool
-	WatchlistError           string
-	Strategies               []string
-	FinalStage               string
-	SourceScores             map[string]float64
-	UniverseMember           *bool
-	Sector                   string
-	Industry                 string
-	TaxonomyStatus           string
-	TaxonomyAsOf             *time.Time
-	TaxonomyProvider         string
-	TaxonomyEvidence         json.RawMessage
-	RemovalStage             string
-	FailureStage             string
-	FailureReason            string
+	ScannerRunID              string
+	Ticker                    string
+	Sources                   []string
+	GraphContext              string
+	WeeklyLeaderEvidence      string
+	PotentIndustryEvidence    string
+	PremarketEpisodicEvidence string
+	Price                     float64
+	ChangePct                 float64
+	Volume                    int64
+	TradeCount                int64
+	DollarVolume              float64
+	MarketCapMM               float64
+	Return1M                  float64
+	Return3M                  float64
+	Return6M                  float64
+	MomentumComposite         float64
+	MomentumRank              int
+	QualificationKnown        bool
+	PullbackQualified         bool
+	QualificationStage        string
+	QualificationReason       string
+	QuarantineRequired        bool
+	ActiveWatchlistDuplicate  bool
+	EligibleForScoring        bool
+	LLMAction                 string
+	LLMConviction             float64
+	LLMSetupType              string
+	LLMStrategy               string
+	LLMTimeframes             []string
+	LLMReasoning              string
+	LLMRisks                  []string
+	LLMError                  string
+	PassedMinConviction       bool
+	CapSelected               bool
+	WatchlistAdded            bool
+	WatchlistError            string
+	Strategies                []string
+	FinalStage                string
+	SourceScores              map[string]float64
+	UniverseMember            *bool
+	Sector                    string
+	Industry                  string
+	TaxonomyStatus            string
+	TaxonomyAsOf              *time.Time
+	TaxonomyProvider          string
+	TaxonomyEvidence          json.RawMessage
+	RemovalStage              string
+	FailureStage              string
+	FailureReason             string
 }
 
 type ScannerEngineOutcome struct {
@@ -192,7 +193,7 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scanner_candidate_snapshots (
 				scanner_run_id, ticker, sources, graph_context, weekly_leader_evidence,
-				potent_industry_evidence,
+				potent_industry_evidence, premarket_episodic_evidence,
 				price, change_pct,
 				volume, trade_count, dollar_volume, market_cap_mm,
 				return_1m, return_3m, return_6m, momentum_composite, momentum_rank,
@@ -207,11 +208,12 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 				) VALUES (
 					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49
+					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50
 				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableString(c.WeeklyLeaderEvidence),
 			nullableString(c.PotentIndustryEvidence),
+			nullableString(c.PremarketEpisodicEvidence),
 			nullableFloat(c.Price), nullableFloat(c.ChangePct), c.Volume, c.TradeCount,
 			nullableFloat(c.DollarVolume), nullableFloat(c.MarketCapMM),
 			nullableFloat(c.Return1M), nullableFloat(c.Return3M), nullableFloat(c.Return6M),

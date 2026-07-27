@@ -30,7 +30,7 @@ type SwingCandidate struct {
 	// were available, so a legacy quarantined row may safely be reactivated
 	// whether it qualified or definitively failed the objective screen.
 	PullbackQualificationKnown bool
-	Sources                    []string // "mover" | "active" | "graph_neighbor" | "weekly_leader" | "potent_industry"
+	Sources                    []string // includes mover, active, graph, weekly, industry, and premarket sources
 	// SourceScores retains each discovery source's independent score, including
 	// an explicit zero. It is evidence/lineage rather than an aggregate rank.
 	SourceScores     map[string]float64
@@ -60,12 +60,17 @@ type SwingCandidate struct {
 	PotentIndustryEvidence   string
 	potentIndustryFallback   *SwingCandidate
 	potentIndustrySource     *SwingCandidate
-	UniverseVersionID        string
-	UniverseAsOf             time.Time
-	RemovalStage             string
-	FailureStage             string
-	FailureReason            string
-	News                     []SwingNewsItem
+	// PremarketEpisodic lineage token-fences a consolidated, catalyst-aware
+	// pre-open observation when it joins the ordinary scanner cycle.
+	PremarketEpisodicRunID      string
+	PremarketEpisodicClaimToken string
+	PremarketEpisodicEvidence   string
+	UniverseVersionID           string
+	UniverseAsOf                time.Time
+	RemovalStage                string
+	FailureStage                string
+	FailureReason               string
+	News                        []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
@@ -126,6 +131,7 @@ Rules:
 - if the Graph link begins with "SYMPATHY TRIGGER", fresh news just hit the RELATED ticker, not this one. Reason through the spillover explicitly: (1) direction — a supplier/partner/sector peer usually moves WITH the news, while a competitor may move AGAINST it (their loss can be this company's gain); judge from the specific relationship, not a fixed rule. (2) magnitude — how much of the related ticker's news plausibly transfers to this name's revenue or sentiment. (3) timing — check this candidate's own price/volume: if it has already repriced with the story, the sympathy edge is gone ("skip"); if it has not yet reacted and the spillover logic is sound, that unpriced lag IS the setup.
 - if "Weekly leader evidence" is shown, treat it as quantitative multi-week momentum and trend-quality evidence from the full eligible universe. It is not a graph relationship or permission to add; confirm that the candidate still has a credible swing setup and reasonable entry.
 - if "Potent industry evidence" is shown, treat it as quantitative sector/industry breadth, relative-strength, and member-leadership evidence. It is not permission to add; confirm that the stock itself still has a credible swing setup and reasonable entry.
+- if "Premarket episodic evidence" is shown, treat it as point-in-time consolidated gap, participation, executable-liquidity, volatility-fit, and catalyst evidence captured before the open. It is discovery evidence, not entry permission; reject names that are already extended or lack a credible swing follow-through.
 - This is a discovery watchlist — add anything with a credible setup worth monitoring; the trading engine applies its own signal gates before acting.`, convictionStr)
 
 	var sb strings.Builder
@@ -168,6 +174,12 @@ Rules:
 	if candidate.PotentIndustryEvidence != "" {
 		sb.WriteString(fmt.Sprintf(
 			"Potent industry evidence: %s\n", candidate.PotentIndustryEvidence,
+		))
+	}
+	if candidate.PremarketEpisodicEvidence != "" {
+		sb.WriteString(fmt.Sprintf(
+			"Premarket episodic evidence: %s\n",
+			candidate.PremarketEpisodicEvidence,
 		))
 	}
 	sb.WriteString("\n")

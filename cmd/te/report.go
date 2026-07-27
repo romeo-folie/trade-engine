@@ -97,6 +97,16 @@ func init() {
 	potentIndustriesCmd.Flags().String("industry", "", "Optional exact industry label")
 	potentIndustriesCmd.Flags().Int("top-members", 3, "Qualified members shown per industry")
 	reportCmd.AddCommand(potentIndustriesCmd)
+
+	premarketEpisodicCmd := &cobra.Command{
+		Use:   "premarket-episodic",
+		Short: "Report prospective premarket gap and catalyst observations",
+		RunE:  runReportPremarketEpisodic,
+	}
+	premarketEpisodicCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
+	premarketEpisodicCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
+	premarketEpisodicCmd.Flags().Bool("qualified-only", false, "Show only qualified candidates")
+	reportCmd.AddCommand(premarketEpisodicCmd)
 }
 
 func runReportWeeklyLeaders(cmd *cobra.Command, _ []string) error {

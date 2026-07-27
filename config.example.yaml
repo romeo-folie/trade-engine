@@ -932,6 +932,29 @@ scanner:
     max_members_per_group: 3               # Deterministic member-selection cap for each qualified group
     batch_size: 200                        # Maximum symbols per historical-bars provider request
     run_lease_minutes: 60                  # Reclaim failed or expired scheduled-run claims
+  premarket_episodic:
+    enabled: false                         # Pre-open episodic-gap observations; default off
+    promote_candidates: false              # Qualified gaps enter the normal LLM/watchlist gate only
+    checkpoints: ["08:00", "09:00", "09:20"] # America/New_York; exchange calendar and DST aware
+    hard_cutoff: "09:25"                   # No result may publish after opening-range preparation begins
+    feed: sip                              # Consolidated executable evidence; IEX is rejected
+    universe_max_age_hours: 36             # Maximum age of the immutable eligible universe
+    history_sessions: 20                   # Same-clock premarket volume sessions used by RVOL
+    news_lookback_hours: 24                # Catalyst freshness window ending at the checkpoint
+    max_candidates_per_run: 50             # Detailed-evidence shortlist cap
+    max_promotions_per_run: 10             # Paid LLM/watchlist funnel cap
+    min_gap_pct: 3.0                       # Absolute premarket gap from completed prior close
+    min_premarket_volume: 100000            # Consolidated shares through the checkpoint
+    min_time_adjusted_rvol: 2.0            # Same-clock volume / historical same-clock median
+    min_dollar_volume: 1000000.0           # Premarket shares × last price
+    min_trade_count: 500                   # Consolidated prints through the checkpoint
+    max_spread_bps: 50.0                   # Executable consolidated bid/ask ceiling
+    max_quote_age_seconds: 120             # Staler quotes fail closed
+    min_bar_coverage: 0.80                 # Expected premarket-minute coverage
+    min_price: 5.0                         # Lower-price risk floor
+    min_market_cap_mm: 100.0               # Market-cap risk floor in USD millions
+    batch_size: 200                        # Maximum symbols per snapshot request
+    run_lease_minutes: 15                  # Reclaim a crashed checkpoint worker
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

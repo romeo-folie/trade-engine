@@ -132,6 +132,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("load potent industry candidates: %w", err)
 	}
 	defer s.releasePotentIndustryClaims(ctx, industryCandidates)
+	premarketCandidates, err := s.premarketEpisodicCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("load premarket episodic candidates: %w", err)
+	}
+	defer s.releasePremarketEpisodicClaims(ctx, premarketCandidates)
 	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
 		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
 		return fmt.Errorf(
@@ -141,7 +146,16 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		)
 	}
 	recorder := newScanRecorder(s, start)
-	if len(weeklyCandidates) > 0 {
+	// Premarket observations normally use today's newest eligible universe,
+	// while after-close weekly/industry claims may still belong to the previous
+	// completed session. Prefer the newest premarket denominator for the scanner
+	// run; every source's exact universe remains independently linked by its
+	// token-fenced source row.
+	if len(premarketCandidates) > 0 {
+		recorder.run.UniverseVersionID = premarketCandidates[0].UniverseVersionID
+		asOf := premarketCandidates[0].UniverseAsOf
+		recorder.run.UniverseAsOf = &asOf
+	} else if len(weeklyCandidates) > 0 {
 		recorder.run.UniverseVersionID = weeklyCandidates[0].UniverseVersionID
 		asOf := weeklyCandidates[0].UniverseAsOf
 		recorder.run.UniverseAsOf = &asOf
@@ -197,6 +211,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	}
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
+	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
 	recorder.register(candidates)
 
 	if len(candidates) == 0 {
@@ -338,6 +353,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if hasSource(sc.candidate.Sources, "potent_industry") {
 			strategies = appendUniqueStrategy(strategies, "potent_industry")
 		}
+		if hasSource(sc.candidate.Sources, "premarket_episodic") {
+			strategies = appendUniqueStrategy(strategies, "premarket_episodic")
+		}
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -414,6 +432,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if hasSource(fallback.Sources, "potent_industry") {
 				strategies = appendUniqueStrategy(strategies, "potent_industry")
 			}
+			if hasSource(fallback.Sources, "premarket_episodic") {
+				strategies = appendUniqueStrategy(strategies, "premarket_episodic")
+			}
 			item.Strategies = strategies
 			item.Timeframes = timeframes
 			item.MinConfidence = fallbackScore.Conviction
@@ -451,17 +472,18 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:                 sc.candidate.Ticker,
-				Conviction:             sc.score.Conviction,
-				SetupType:              sc.score.SetupType,
-				Strategy:               sc.score.Strategy,
-				Timeframes:             timeframes,
-				Reasoning:              sc.score.Reasoning,
-				ExpiresAt:              expiresAt.Format(time.RFC3339),
-				Sources:                sc.candidate.Sources,
-				GraphContext:           sc.candidate.GraphContext,
-				WeeklyLeaderEvidence:   sc.candidate.WeeklyLeaderEvidence,
-				PotentIndustryEvidence: sc.candidate.PotentIndustryEvidence,
+				Ticker:                    sc.candidate.Ticker,
+				Conviction:                sc.score.Conviction,
+				SetupType:                 sc.score.SetupType,
+				Strategy:                  sc.score.Strategy,
+				Timeframes:                timeframes,
+				Reasoning:                 sc.score.Reasoning,
+				ExpiresAt:                 expiresAt.Format(time.RFC3339),
+				Sources:                   sc.candidate.Sources,
+				GraphContext:              sc.candidate.GraphContext,
+				WeeklyLeaderEvidence:      sc.candidate.WeeklyLeaderEvidence,
+				PotentIndustryEvidence:    sc.candidate.PotentIndustryEvidence,
+				PremarketEpisodicEvidence: sc.candidate.PremarketEpisodicEvidence,
 			})
 		}
 	}
@@ -1034,6 +1056,12 @@ func (s *MarketScanner) buildTelegramMessage(added []scoredCandidate, expired in
 			sb.WriteString(fmt.Sprintf(
 				"  🧭 _Potent industry: %s_\n",
 				sc.candidate.PotentIndustryEvidence,
+			))
+		}
+		if sc.candidate.PremarketEpisodicEvidence != "" {
+			sb.WriteString(fmt.Sprintf(
+				"  🌅 _Premarket episodic: %s_\n",
+				sc.candidate.PremarketEpisodicEvidence,
 			))
 		}
 		if sc.score.Reasoning != "" {

@@ -40,9 +40,16 @@ type PotentIndustryPromotionClaim struct {
 	Token     string
 }
 
+type PremarketEpisodicPromotionClaim struct {
+	RunID  string
+	Ticker string
+	Token  string
+}
+
 type ScannerSourcePromotionClaims struct {
-	WeeklyLeader   *WeeklyLeaderPromotionClaim
-	PotentIndustry *PotentIndustryPromotionClaim
+	WeeklyLeader      *WeeklyLeaderPromotionClaim
+	PotentIndustry    *PotentIndustryPromotionClaim
+	PremarketEpisodic *PremarketEpisodicPromotionClaim
 }
 
 // PromoteScannerSourcesToWatchlist validates every discovery-source claim,
@@ -80,7 +87,8 @@ func promoteScannerSourcesToWatchlist(
 	preserveActive bool,
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
-		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil) {
+		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
+			claims.PremarketEpisodic == nil) {
 		return fmt.Errorf("scanner source watchlist promotion lineage is incomplete")
 	}
 	if claims.WeeklyLeader != nil &&
@@ -96,6 +104,12 @@ func promoteScannerSourcesToWatchlist(
 			strings.TrimSpace(claims.PotentIndustry.GroupKey) == "" ||
 			strings.TrimSpace(claims.PotentIndustry.Token) == "") {
 		return fmt.Errorf("potent industry watchlist promotion lineage is incomplete")
+	}
+	if claims.PremarketEpisodic != nil &&
+		(claims.PremarketEpisodic.Ticker != item.Ticker ||
+			strings.TrimSpace(claims.PremarketEpisodic.RunID) == "" ||
+			strings.TrimSpace(claims.PremarketEpisodic.Token) == "") {
+		return fmt.Errorf("premarket episodic watchlist promotion lineage is incomplete")
 	}
 
 	tx, err := GetDB().Begin(ctx)
@@ -121,6 +135,14 @@ func promoteScannerSourcesToWatchlist(
 			industryRotationCompletionLock,
 		); err != nil {
 			return fmt.Errorf("serialize potent industry promotion: %w", err)
+		}
+	}
+	if claims.PremarketEpisodic != nil {
+		if _, err := tx.Exec(ctx, `
+			SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+			premarketEpisodicCompletionLock,
+		); err != nil {
+			return fmt.Errorf("serialize premarket episodic promotion: %w", err)
 		}
 	}
 
@@ -174,6 +196,32 @@ func promoteScannerSourcesToWatchlist(
 		}
 		if !currentRun || status != "processing" || token != claim.Token {
 			return &ScannerSourcePromotionClaimError{Source: "potent_industry"}
+		}
+	}
+	if claim := claims.PremarketEpisodic; claim != nil {
+		var token, status string
+		var currentRun bool
+		err := tx.QueryRow(ctx, `
+			SELECT COALESCE(c.promotion_claim_token,''), c.promotion_status,
+			       COALESCE(c.run_id = (
+			         SELECT r.id FROM premarket_episodic_runs r
+			         WHERE r.status='completed'
+			         ORDER BY r.checkpoint_at DESC, r.completed_at DESC, r.id DESC
+			         LIMIT 1
+			       ), false)
+			FROM premarket_episodic_candidates c
+			WHERE c.run_id=$1 AND c.ticker=$2 AND c.outcome='qualified'
+			FOR UPDATE OF c`,
+			claim.RunID, claim.Ticker,
+		).Scan(&token, &status, &currentRun)
+		if err != nil {
+			if IsNoRows(err) {
+				return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
+			}
+			return fmt.Errorf("lock premarket episodic promotion: %w", err)
+		}
+		if !currentRun || status != "processing" || token != claim.Token {
+			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
 		}
 	}
 
@@ -242,6 +290,24 @@ func completeScannerSourcePromotionClaims(
 		}
 		if tag.RowsAffected() != 1 {
 			return &ScannerSourcePromotionClaimError{Source: "potent_industry"}
+		}
+	}
+	if claim := claims.PremarketEpisodic; claim != nil {
+		tag, err := tx.Exec(ctx, `
+			UPDATE premarket_episodic_candidates
+			SET promotion_status=$4, scanner_run_id=$5, promoted_at=$6,
+			    promotion_reason=$7, promotion_claim_token=NULL,
+			    promotion_claimed_at=NULL
+			WHERE run_id=$1 AND ticker=$2 AND promotion_status='processing'
+			  AND promotion_claim_token=$3`,
+			claim.RunID, claim.Ticker, claim.Token, status,
+			nullableUUID(item.ScannerRunID), at, nullableString(reason),
+		)
+		if err != nil {
+			return fmt.Errorf("complete premarket episodic watchlist promotion: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
 		}
 	}
 	return nil

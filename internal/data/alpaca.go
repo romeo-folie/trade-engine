@@ -124,13 +124,14 @@ func (c *AlpacaClient) getFrom(ctx context.Context, baseURL, path string, params
 // ── Alpaca response types ─────────────────────────────────────────────────────
 
 type alpacaBar struct {
-	Timestamp string  `json:"t"`
-	Open      float64 `json:"o"`
-	High      float64 `json:"h"`
-	Low       float64 `json:"l"`
-	Close     float64 `json:"c"`
-	Volume    int64   `json:"v"`
-	VWAP      float64 `json:"vw"`
+	Timestamp  string  `json:"t"`
+	Open       float64 `json:"o"`
+	High       float64 `json:"h"`
+	Low        float64 `json:"l"`
+	Close      float64 `json:"c"`
+	Volume     int64   `json:"v"`
+	VWAP       float64 `json:"vw"`
+	TradeCount int64   `json:"n"`
 }
 
 type alpacaBarsResponse struct {
