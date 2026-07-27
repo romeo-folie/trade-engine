@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-func TestDefaultsPotentIndustryObservationOnly(t *testing.T) {
+func TestDefaultsPotentIndustryDisabled(t *testing.T) {
 	got := Defaults().Scanner.PotentIndustry
 	if got.Enabled || got.PromoteCandidates {
 		t.Fatal("potent industry discovery and promotion must default off")
@@ -49,7 +49,6 @@ func TestValidatePotentIndustry(t *testing.T) {
 	}{
 		{"requires scanner.enabled", func(c *Config) { c.Scanner.Enabled = false }},
 		{"requires scanner.universe.enabled", func(c *Config) { c.Scanner.Universe.Enabled = false }},
-		{"promote_candidates", func(c *Config) { c.Scanner.PotentIndustry.PromoteCandidates = true }},
 		{"after_close_delay_minutes", func(c *Config) { c.Scanner.PotentIndustry.AfterCloseDelayMinutes = -1 }},
 		{"after_close_delay_minutes", func(c *Config) {
 			c.Scanner.PotentIndustry.AfterCloseDelayMinutes =
@@ -97,6 +96,12 @@ func TestValidatePotentIndustry(t *testing.T) {
 				t.Fatalf("expected %s validation error, got %v", tt.field, Validate(&cfg))
 			}
 		})
+	}
+
+	promotion := *valid
+	promotion.Scanner.PotentIndustry.PromoteCandidates = true
+	if errs := Validate(&promotion); containsStr(errs, "scanner.potent_industry") {
+		t.Fatalf("enabled potent industry promotion rejected: %v", errs)
 	}
 }
 

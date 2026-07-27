@@ -2185,10 +2185,6 @@ func Validate(cfg *Config) []string {
 		if !cfg.Scanner.Universe.Enabled {
 			errs = append(errs, prefix+" requires scanner.universe.enabled=true")
 		}
-		if industry.PromoteCandidates {
-			errs = append(errs, prefix+
-				".promote_candidates is not available in the observation-only release")
-		}
 		if industry.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
 		} else if !durationConfigFits(industry.AfterCloseDelayMinutes, time.Minute) {

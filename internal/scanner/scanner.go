@@ -127,10 +127,27 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("load weekly leader candidates: %w", err)
 	}
 	defer s.releaseWeeklyLeaderClaims(ctx, weeklyCandidates)
+	industryCandidates, err := s.potentIndustryCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("load potent industry candidates: %w", err)
+	}
+	defer s.releasePotentIndustryClaims(ctx, industryCandidates)
+	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
+		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
+		return fmt.Errorf(
+			"discovery source universe mismatch: weekly leader=%s potent industry=%s",
+			weeklyCandidates[0].UniverseVersionID,
+			industryCandidates[0].UniverseVersionID,
+		)
+	}
 	recorder := newScanRecorder(s, start)
 	if len(weeklyCandidates) > 0 {
 		recorder.run.UniverseVersionID = weeklyCandidates[0].UniverseVersionID
 		asOf := weeklyCandidates[0].UniverseAsOf
+		recorder.run.UniverseAsOf = &asOf
+	} else if len(industryCandidates) > 0 {
+		recorder.run.UniverseVersionID = industryCandidates[0].UniverseVersionID
+		asOf := industryCandidates[0].UniverseAsOf
 		recorder.run.UniverseAsOf = &asOf
 	}
 	recorder.begin(ctx)
@@ -179,6 +196,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		slog.Info("scanner: graph neighbors added to pool", "count", len(graphCands))
 	}
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
+	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	recorder.register(candidates)
 
 	if len(candidates) == 0 {
@@ -215,7 +233,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		beforeRequalificationFilter := candidates
 		candidates = filterUnavailableRequalifications(candidates, requalificationRequired)
 		recorder.markRemoved(beforeRequalificationFilter, candidates, "requalification_unavailable")
-		s.markWeeklyLeaderCandidates(ctx, beforeRequalificationFilter, candidates,
+		s.markDiscoveryCandidates(ctx, beforeRequalificationFilter, candidates,
 			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
@@ -226,7 +244,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("filter watchlist: %w", err)
 	}
 	recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
-	s.markWeeklyLeaderCandidates(ctx, beforeWatchlistFilter, candidates,
+	s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 		"active_watchlist", recorder.run.ID, "already active on watchlist")
 	if len(candidates) == 0 {
 		return nil
@@ -248,7 +266,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				snapshot.FinalStage = "candidate_cap"
 			}
 		}
-		s.markWeeklyLeaderCandidates(ctx, candidates, nil,
+		s.markDiscoveryCandidates(ctx, candidates, nil,
 			"cap_suppressed", recorder.run.ID, "scanner candidate cap reached")
 		return nil // cap reached; nothing to add until items expire
 	}
@@ -270,7 +288,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			s.markWeeklyLeaderCandidate(ctx, c, "failed", recorder.run.ID, err.Error())
+			s.markDiscoveryCandidate(ctx, c, "failed", recorder.run.ID, err.Error())
 			slog.Warn("scanner: score candidate failed", "ticker", c.Ticker, "err", err)
 			continue
 		}
@@ -288,7 +306,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				"normal scanner rejected candidate: action=%s conviction=%.3f threshold=%.3f",
 				result.Action, result.Conviction, s.Cfg.MinConviction,
 			)
-			s.markWeeklyLeaderCandidate(ctx, c, "rejected", recorder.run.ID, reason)
+			s.markDiscoveryCandidate(ctx, c, "rejected", recorder.run.ID, reason)
 		}
 	}
 
@@ -296,7 +314,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	sortByConviction(scored)
 	if len(scored) > slots {
 		for _, suppressed := range scored[slots:] {
-			s.markWeeklyLeaderCandidate(
+			s.markDiscoveryCandidate(
 				ctx, suppressed.candidate, "cap_suppressed", recorder.run.ID,
 				"candidate ranked beyond available scanner slots",
 			)
@@ -317,6 +335,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if hasSource(sc.candidate.Sources, "weekly_leader") {
 			strategies = appendUniqueStrategy(strategies, "weekly_leader")
 		}
+		if hasSource(sc.candidate.Sources, "potent_industry") {
+			strategies = appendUniqueStrategy(strategies, "potent_industry")
+		}
 		item := store.WatchlistItem{
 			Ticker:     sc.candidate.Ticker,
 			Platform:   "stock",
@@ -335,18 +356,14 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			ExpiresAt:                       &expiresAt,
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
-		var addErr error
-		if sc.candidate.WeeklyLeaderRunID != "" {
-			addErr = store.PromoteWeeklyLeaderToWatchlist(
-				ctx, item, sc.candidate.WeeklyLeaderRunID, sc.candidate.Ticker,
-				sc.candidate.WeeklyLeaderClaimToken,
-				"passed conviction and was added to the watchlist", s.now(),
-			)
-		} else {
-			addErr = store.AddWatchlistItem(ctx, item)
-		}
-		if errors.Is(addErr, store.ErrWeeklyLeaderPromotionClaimLost) {
-			fallback, ok := ordinaryCandidateAfterWeeklyClaimLoss(sc.candidate)
+		addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate)
+		if errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+			var claimErr *store.ScannerSourcePromotionClaimError
+			source := ""
+			if errors.As(addErr, &claimErr) {
+				source = claimErr.Source
+			}
+			fallback, ok := candidateAfterPromotionClaimLoss(sc.candidate, source)
 			if ok {
 				fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
 				recorder.fallbackScored(
@@ -356,13 +373,24 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
-					slog.Warn("scanner: ordinary fallback score failed",
+					s.markDiscoveryCandidate(
+						ctx, fallback, "failed", recorder.run.ID, scoreErr.Error(),
+					)
+					slog.Warn("scanner: source fallback score failed",
 						"ticker", fallback.Ticker, "err", scoreErr)
 					continue
 				}
 				if fallbackScore.Action != "add" ||
 					fallbackScore.Conviction < s.Cfg.MinConviction {
-					slog.Info("scanner: ordinary fallback rejected after leader claim loss",
+					s.markDiscoveryCandidate(
+						ctx, fallback, "rejected", recorder.run.ID,
+						fmt.Sprintf(
+							"fallback rejected: action=%s conviction=%.3f threshold=%.3f",
+							fallbackScore.Action, fallbackScore.Conviction,
+							s.Cfg.MinConviction,
+						),
+					)
+					slog.Info("scanner: source fallback rejected after claim loss",
 						"ticker", fallback.Ticker,
 						"action", fallbackScore.Action,
 						"conviction", fallbackScore.Conviction)
@@ -375,6 +403,12 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				strategies = candidateStrategies(
 					fallbackScore.Strategy, fallback.PullbackQualified,
 				)
+				if hasSource(fallback.Sources, "weekly_leader") {
+					strategies = appendUniqueStrategy(strategies, "weekly_leader")
+				}
+				if hasSource(fallback.Sources, "potent_industry") {
+					strategies = appendUniqueStrategy(strategies, "potent_industry")
+				}
 				item.Strategies = strategies
 				item.Timeframes = timeframes
 				item.MinConfidence = fallbackScore.Conviction
@@ -382,10 +416,10 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				item.PullbackRequalificationComplete =
 					fallback.PullbackQualificationKnown
 				sc = scoredCandidate{candidate: fallback, score: fallbackScore}
-				addErr = store.AddWatchlistItemUnlessActive(ctx, item)
+				addErr = s.promoteDiscoveryFallback(ctx, item, fallback)
 				if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
 					slog.Info(
-						"scanner: ordinary fallback lost to active watchlist item",
+						"scanner: source fallback lost to active watchlist item",
 						"ticker", fallback.Ticker,
 					)
 					continue
@@ -394,8 +428,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		}
 		if addErr != nil {
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
-			if !errors.Is(addErr, store.ErrWeeklyLeaderPromotionClaimLost) {
-				s.markWeeklyLeaderCandidate(
+			if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+				s.markDiscoveryCandidate(
 					ctx, sc.candidate, "failed", recorder.run.ID, addErr.Error(),
 				)
 			}
@@ -409,16 +443,17 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:               sc.candidate.Ticker,
-				Conviction:           sc.score.Conviction,
-				SetupType:            sc.score.SetupType,
-				Strategy:             sc.score.Strategy,
-				Timeframes:           timeframes,
-				Reasoning:            sc.score.Reasoning,
-				ExpiresAt:            expiresAt.Format(time.RFC3339),
-				Sources:              sc.candidate.Sources,
-				GraphContext:         sc.candidate.GraphContext,
-				WeeklyLeaderEvidence: sc.candidate.WeeklyLeaderEvidence,
+				Ticker:                 sc.candidate.Ticker,
+				Conviction:             sc.score.Conviction,
+				SetupType:              sc.score.SetupType,
+				Strategy:               sc.score.Strategy,
+				Timeframes:             timeframes,
+				Reasoning:              sc.score.Reasoning,
+				ExpiresAt:              expiresAt.Format(time.RFC3339),
+				Sources:                sc.candidate.Sources,
+				GraphContext:           sc.candidate.GraphContext,
+				WeeklyLeaderEvidence:   sc.candidate.WeeklyLeaderEvidence,
+				PotentIndustryEvidence: sc.candidate.PotentIndustryEvidence,
 			})
 		}
 	}
@@ -472,21 +507,21 @@ func markPullbackQualification(all []SwingCandidate, result pullbackQualificatio
 	out := append([]SwingCandidate(nil), all...)
 	for i := range out {
 		_, out[i].PullbackQualificationKnown = result.known[out[i].Ticker]
+		outcome := result.outcomes[out[i].Ticker]
 		if out[i].weeklyLeaderFallback != nil {
 			fallback := cloneSwingCandidate(*out[i].weeklyLeaderFallback)
-			outcome := result.outcomes[out[i].Ticker]
-			fallback.PullbackQualificationKnown = outcome.known
-			fallback.PullbackQualified = outcome.qualified
-			if outcome.known {
-				fallback.Price = outcome.candidate.Price
-				fallback.Volume = outcome.candidate.Volume
-				fallback.Return1M = outcome.candidate.Return1M
-				fallback.Return3M = outcome.candidate.Return3M
-				fallback.Return6M = outcome.candidate.Return6M
-				fallback.MarketCapMM = outcome.candidate.MarketCapMM
-				fallback.DollarVolume = outcome.candidate.DollarVolume
-			}
+			applyPullbackOutcome(&fallback, outcome)
 			out[i].weeklyLeaderFallback = &fallback
+		}
+		if out[i].potentIndustryFallback != nil {
+			fallback := cloneSwingCandidate(*out[i].potentIndustryFallback)
+			applyPullbackOutcome(&fallback, outcome)
+			out[i].potentIndustryFallback = &fallback
+		}
+		if out[i].potentIndustrySource != nil {
+			source := cloneSwingCandidate(*out[i].potentIndustrySource)
+			applyPullbackOutcome(&source, outcome)
+			out[i].potentIndustrySource = &source
 		}
 		qualifiedCandidate, ok := qualifiedByTicker[out[i].Ticker]
 		if !ok {
@@ -500,6 +535,23 @@ func markPullbackQualification(all []SwingCandidate, result pullbackQualificatio
 		out[i].DollarVolume = qualifiedCandidate.DollarVolume
 	}
 	return out
+}
+
+func applyPullbackOutcome(
+	candidate *SwingCandidate, outcome pullbackQualificationOutcome,
+) {
+	candidate.PullbackQualificationKnown = outcome.known
+	candidate.PullbackQualified = outcome.qualified
+	if !outcome.known {
+		return
+	}
+	candidate.Price = outcome.candidate.Price
+	candidate.Volume = outcome.candidate.Volume
+	candidate.Return1M = outcome.candidate.Return1M
+	candidate.Return3M = outcome.candidate.Return3M
+	candidate.Return6M = outcome.candidate.Return6M
+	candidate.MarketCapMM = outcome.candidate.MarketCapMM
+	candidate.DollarVolume = outcome.candidate.DollarVolume
 }
 
 func filterUnavailableRequalifications(
@@ -542,6 +594,16 @@ func markQuarantinedQualificationKnown(
 			fallback := cloneSwingCandidate(*out[i].weeklyLeaderFallback)
 			fallback.PullbackQualificationKnown = quarantined && definitive
 			out[i].weeklyLeaderFallback = &fallback
+		}
+		if out[i].potentIndustryFallback != nil {
+			fallback := cloneSwingCandidate(*out[i].potentIndustryFallback)
+			fallback.PullbackQualificationKnown = quarantined && definitive
+			out[i].potentIndustryFallback = &fallback
+		}
+		if out[i].potentIndustrySource != nil {
+			source := cloneSwingCandidate(*out[i].potentIndustrySource)
+			source.PullbackQualificationKnown = quarantined && definitive
+			out[i].potentIndustrySource = &source
 		}
 	}
 	return out
@@ -958,6 +1020,12 @@ func (s *MarketScanner) buildTelegramMessage(added []scoredCandidate, expired in
 		if sc.candidate.WeeklyLeaderEvidence != "" {
 			sb.WriteString(fmt.Sprintf(
 				"  📈 _Weekly leader: %s_\n", sc.candidate.WeeklyLeaderEvidence,
+			))
+		}
+		if sc.candidate.PotentIndustryEvidence != "" {
+			sb.WriteString(fmt.Sprintf(
+				"  🧭 _Potent industry: %s_\n",
+				sc.candidate.PotentIndustryEvidence,
 			))
 		}
 		if sc.score.Reasoning != "" {

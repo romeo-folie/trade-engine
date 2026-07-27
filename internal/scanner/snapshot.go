@@ -145,6 +145,9 @@ func (r *scanRecorder) register(candidates []SwingCandidate) {
 		if c.WeeklyLeaderEvidence != "" {
 			snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
 		}
+		if c.PotentIndustryEvidence != "" {
+			snapshot.PotentIndustryEvidence = c.PotentIndustryEvidence
+		}
 		snapshot.Price = c.Price
 		snapshot.ChangePct = c.ChangePct
 		snapshot.Volume = c.Volume
@@ -318,6 +321,7 @@ func (r *scanRecorder) fallbackScored(
 	}
 	snapshot.GraphContext = c.GraphContext
 	snapshot.WeeklyLeaderEvidence = c.WeeklyLeaderEvidence
+	snapshot.PotentIndustryEvidence = c.PotentIndustryEvidence
 	snapshot.Price = c.Price
 	snapshot.ChangePct = c.ChangePct
 	snapshot.Volume = c.Volume

@@ -303,14 +303,15 @@ type ScanCompletedPayload struct {
 
 // ScannerItemAddedPayload is emitted when a scanner candidate is added to the watchlist.
 type ScannerItemAddedPayload struct {
-	Ticker               string   `json:"ticker"`
-	Conviction           float64  `json:"conviction"`
-	SetupType            string   `json:"setup_type"`
-	Strategy             string   `json:"strategy"`
-	Timeframes           []string `json:"timeframes"`
-	Reasoning            string   `json:"reasoning"`
-	ExpiresAt            string   `json:"expires_at"`              // RFC3339
-	Sources              []string `json:"sources,omitempty"`       // "mover" | "active" | "graph_neighbor" | "weekly_leader"
-	GraphContext         string   `json:"graph_context,omitempty"` // why a graph neighbour was surfaced
-	WeeklyLeaderEvidence string   `json:"weekly_leader_evidence,omitempty"`
+	Ticker                 string   `json:"ticker"`
+	Conviction             float64  `json:"conviction"`
+	SetupType              string   `json:"setup_type"`
+	Strategy               string   `json:"strategy"`
+	Timeframes             []string `json:"timeframes"`
+	Reasoning              string   `json:"reasoning"`
+	ExpiresAt              string   `json:"expires_at"`              // RFC3339
+	Sources                []string `json:"sources,omitempty"`       // additive scanner discovery-source tags
+	GraphContext           string   `json:"graph_context,omitempty"` // why a graph neighbour was surfaced
+	WeeklyLeaderEvidence   string   `json:"weekly_leader_evidence,omitempty"`
+	PotentIndustryEvidence string   `json:"potent_industry_evidence,omitempty"`
 }

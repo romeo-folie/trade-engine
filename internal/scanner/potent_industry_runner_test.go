@@ -95,11 +95,11 @@ func (f *fakePotentIndustryRepository) CompleteRun(
 	return nil
 }
 
-func TestPotentIndustryRunnerCompletesObservationAtExactBoundary(t *testing.T) {
+func TestPotentIndustryRunnerQueuesPromotionsAtExactBoundary(t *testing.T) {
 	target, _, decisionAt := potentTestTimes()
 	session := potentTestSession(target)
 	cfg := potentRunnerConfig()
-	cfg.PromoteCandidates = true // PR A remains observation-only even if preconfigured.
+	cfg.PromoteCandidates = true
 	members := potentTestMembers(
 		decisionAt, "Software", "Technology",
 		[]float64{2000, 1500, 1000, 800, 600},
@@ -175,16 +175,18 @@ func TestPotentIndustryRunnerCompletesObservationAtExactBoundary(t *testing.T) {
 		if member.GroupKey != "Software" {
 			t.Fatalf("normalized member label lost canonical group FK: %+v", member)
 		}
-		if member.PromotionStatus != "not_requested" {
-			t.Fatalf("observation PR requested promotion: %+v", member)
-		}
 		if member.Outcome == "qualified" {
 			selected++
+			if member.PromotionStatus != "pending" {
+				t.Fatalf("qualified member was not queued for promotion: %+v", member)
+			}
 			if member.ClosePrice == nil || member.MemberScore == nil ||
 				member.MemberRank == nil || member.StockVsIndustryRS == nil ||
 				member.StockVsMarketRS == nil || len(member.SourceEvidence) == 0 {
 				t.Fatalf("selected member evidence incomplete: %+v", member)
 			}
+		} else if member.PromotionStatus != "not_requested" {
+			t.Fatalf("ineligible member was queued for promotion: %+v", member)
 		}
 	}
 	if selected == 0 {
