@@ -94,6 +94,18 @@ interface Particle {
   bezierIntensity: number; // For non-linear paths
 }
 
+function shallowEqualObject(
+  a: Record<string, unknown> | undefined,
+  b: Record<string, unknown> | undefined,
+): boolean {
+  if (a === b) return true;
+  if (!a || !b) return a === b;
+  const aKeys = Object.keys(a);
+  const bKeys = Object.keys(b);
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(key => Object.is(a[key], b[key]));
+}
+
 // ── CanvasIconButton ──────────────────────────────────────────────────────────
 
 interface CanvasIconButtonProps {
@@ -316,28 +328,53 @@ export default function HubGraph({ nodes, topology, nodeMetrics, recentEventSign
     const topologyChanged = previousTopologyRevision.current !== nextRevision;
     setRfNodes((nds) => {
       const currentMap = new Map(nds.map(n => [n.id, n]));
-
-      return rfNodes.map(n => {
+      let changed = nds.length !== rfNodes.length;
+      const nextNodes = rfNodes.map(n => {
         const existing = currentMap.get(n.id);
         if (!existing) {
+          changed = true;
           return { ...n, draggable: !layoutLocked };
         }
+        const position = topologyChanged ? n.position : existing.position;
+        const nodeChanged = topologyChanged
+          ? position.x !== existing.position.x || position.y !== existing.position.y
+          : false;
+        const dataChanged = !shallowEqualObject(
+          existing.data as unknown as Record<string, unknown>,
+          n.data as unknown as Record<string, unknown>,
+        );
+        const shellChanged = existing.draggable !== !layoutLocked;
+        if (nodeChanged || dataChanged || shellChanged) changed = true;
+        if (!nodeChanged && !dataChanged && !shellChanged) return existing;
         return {
           ...existing,
           ...n,
-          position: topologyChanged ? n.position : existing.position,
+          position,
           dragging: existing.dragging,
           selected: existing.selected,
           draggable: !layoutLocked,
         };
       });
+      return changed ? nextNodes : nds;
     });
     setRfEdges((edges) => {
       const currentMap = new Map(edges.map(edge => [edge.id, edge]));
-      return rfEdges.map(edge => {
+      let changed = edges.length !== rfEdges.length;
+      const nextEdges = rfEdges.map(edge => {
         const existing = currentMap.get(edge.id);
-        return existing ? { ...existing, ...edge, selected: existing.selected } : edge;
+        if (!existing) {
+          changed = true;
+          return edge;
+        }
+        const edgeChanged = existing.source !== edge.source ||
+          existing.target !== edge.target ||
+          existing.type !== edge.type ||
+          !shallowEqualObject(existing.style as Record<string, unknown> | undefined, edge.style as Record<string, unknown> | undefined) ||
+          !shallowEqualObject(existing.data as Record<string, unknown> | undefined, edge.data as Record<string, unknown> | undefined);
+        if (edgeChanged) changed = true;
+        return edgeChanged ? { ...existing, ...edge, selected: existing.selected } : existing;
       });
+      return changed ? nextEdges : edges;
     });
     previousTopologyRevision.current = nextRevision;
     if (topologyChanged) {

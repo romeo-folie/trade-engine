@@ -2492,15 +2492,22 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 	for len(r.state.PendingExitAudits) > 0 {
 		audit := r.state.PendingExitAudits[0]
 		realizedPnL, err := r.realizedPnLUSD(ctx, audit)
+		enrichmentPending := false
 		if err != nil {
 			// Historical attempt lifecycle is durable independently of FX
 			// enrichment. A later reconciliation can replay this idempotent
 			// attempt with a realized P&L once conversion data is available.
 			logger.Warn("currency-strength: historical exit P&L conversion unavailable; persisting NULL P&L", "order_id", audit.OrderID, "err", err)
 			realizedPnL = nil
+			enrichmentPending = true
 		}
 		if err := r.writeExitJournal(ctx, audit, realizedPnL); err != nil {
 			return err
+		}
+		if enrichmentPending {
+			// Keep the audit queued. The lifecycle row is now durable, and the
+			// same idempotent attempt can be replayed with enriched P&L later.
+			return nil
 		}
 		r.state.PendingExitAudits = r.state.PendingExitAudits[1:]
 		if err := r.saveState(); err != nil {

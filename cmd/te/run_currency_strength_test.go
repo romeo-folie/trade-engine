@@ -1618,6 +1618,38 @@ func TestCurrencyStrengthExitLifecycleSurvivesMissingPnLConversion(t *testing.T)
 	}
 }
 
+func TestCurrencyStrengthHistoricalAuditRemainsQueuedUntilPnLEnrichment(t *testing.T) {
+	exitedAt := time.Date(2026, 7, 27, 18, 0, 30, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
+	runner := &currencyStrengthPaperRunner{
+		market: fakeMarketDataProvider{}, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "EUR/JPY", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 160, EntryFilledQty: 100000,
+			PendingExitAudits: []currencyStrengthExitAudit{{
+				OrderID: "EXIT-HISTORICAL", Status: "residual", FillPrice: 161,
+				FilledQty: 50000, ExitedAt: exitedAt.Format(time.RFC3339),
+			}},
+		},
+	}
+	if err := runner.syncPendingExitAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.state.PendingExitAudits) != 1 || len(journal.exits) != 1 || journal.exits[0].RealizedPnL != nil {
+		t.Fatalf("historical audit was not retained after lifecycle-only write: state=%+v exits=%+v", runner.state, journal.exits)
+	}
+	runner.market = historicalConversionMarketData{candles: map[string][]data.Candle{
+		"JPY/USD": {{Timestamp: exitedAt.Add(-time.Minute), Close: 0.0067}},
+	}}
+	if err := runner.syncPendingExitAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.state.PendingExitAudits) != 0 || len(journal.exits) != 2 || journal.exits[1].RealizedPnL == nil {
+		t.Fatalf("historical audit was not enriched and dequeued: state=%+v exits=%+v", runner.state, journal.exits)
+	}
+}
+
 func TestCurrencyStrengthExitJournalRetryDoesNotResubmitOrder(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
 	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
