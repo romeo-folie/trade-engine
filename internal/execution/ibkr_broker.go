@@ -333,18 +333,24 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 		Price     ibkrFloat `json:"price"`
 		FilledQty ibkrFloat `json:"size"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades", nil, &trades); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades?days=7", nil, &trades); err != nil {
 		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found in live orders, and trades lookup failed: %w", brokerOrderID, err)
 	}
+	var filledQty, fillNotional float64
 	for _, t := range trades {
 		if fmt.Sprintf("%d", t.OrderID) == brokerOrderID {
-			return OrderResult{
-				BrokerOrderID: brokerOrderID,
-				Status:        NormalizeIBKROrderStatus(t.Status),
-				FilledPrice:   float64(t.Price),
-				FilledQty:     float64(t.FilledQty),
-			}, nil
+			qty := float64(t.FilledQty)
+			filledQty += qty
+			fillNotional += float64(t.Price) * qty
 		}
+	}
+	if filledQty > 0 {
+		return OrderResult{
+			BrokerOrderID: brokerOrderID,
+			Status:        "filled",
+			FilledPrice:   fillNotional / filledQty,
+			FilledQty:     filledQty,
+		}, nil
 	}
 
 	// Wrap ErrOrderNotFound so callers (e.g. trailing-stop's

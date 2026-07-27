@@ -340,6 +340,17 @@ func ListCurrencyStrengthRunsPage(
 	db *pgxpool.Pool,
 	limit, offset int,
 ) ([]CurrencyStrengthRun, error) {
+	return ListCurrencyStrengthRunsPageAt(ctx, db, limit, offset, time.Time{})
+}
+
+// ListCurrencyStrengthRunsPageAt pins OFFSET pagination to a snapshot so a new
+// account/session row cannot shift an operator's older history pages.
+func ListCurrencyStrengthRunsPageAt(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	limit, offset int,
+	snapshotAt time.Time,
+) ([]CurrencyStrengthRun, error) {
 	if limit < 1 {
 		return nil, nil
 	}
@@ -359,9 +370,10 @@ func ListCurrencyStrengthRunsPage(
 		       exited_at, realized_pnl, COALESCE(error,''),
 		       created_at, updated_at
 		FROM currency_strength_runs
+		WHERE ($3::timestamptz IS NULL OR created_at <= $3)
 		ORDER BY session_date DESC, created_at DESC, id DESC
 		LIMIT $1 OFFSET $2`,
-		limit, offset,
+		limit, offset, optionalSnapshotTime(snapshotAt),
 	)
 	if err != nil {
 		return nil, err

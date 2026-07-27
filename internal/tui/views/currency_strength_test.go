@@ -13,6 +13,7 @@ func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
 	data := CurrencyStrengthViewData{
 		LastUpdate: time.Date(2026, 7, 27, 10, 0, 0, 0, time.UTC),
 		Runs: []store.CurrencyStrengthRun{{
+			AccountID:         "DU123456",
 			SessionDate:       time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
 			Status:            "exited",
 			Timezone:          "Europe/London",
@@ -38,6 +39,7 @@ func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
 	for _, want := range []string{
 		"[o] ORB",
 		"[c] Currency Strength",
+		"DU123456",
 		"GBP strongest",
 		"USD weakest",
 		"BUY GBP/USD",

@@ -533,7 +533,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			snapshot = time.Time{}
 		}
 		m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, snapshot)
-		m.currencyStrengthData = views.FetchCurrencyStrengthViewData(ctx, m.currencyStrengthPage)
+		currencySnapshot := m.currencyStrengthData.SnapshotAt
+		if m.currencyStrengthPage == 0 {
+			currencySnapshot = time.Time{}
+		}
+		m.currencyStrengthData = views.FetchCurrencyStrengthViewDataAt(
+			ctx, m.currencyStrengthPage, currencySnapshot,
+		)
 		// Next engine run-cycle time, published by the engine process to engine_state.
 		m.nextCycleAt = time.Time{}
 		if v, ok, err := store.GetEngineState(ctx, store.EngineStateNextCycleAt); err == nil && ok {
@@ -611,7 +617,9 @@ func (m *Model) pageIntraday(delta int) {
 			return
 		}
 		m.currencyStrengthPage = max(m.currencyStrengthPage+delta, 0)
-		m.currencyStrengthData = views.FetchCurrencyStrengthViewData(ctx, m.currencyStrengthPage)
+		m.currencyStrengthData = views.FetchCurrencyStrengthViewDataAt(
+			ctx, m.currencyStrengthPage, m.currencyStrengthData.SnapshotAt,
+		)
 	} else {
 		if delta > 0 && !m.orbData.HasOlder {
 			return

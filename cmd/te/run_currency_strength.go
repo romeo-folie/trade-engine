@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 )
 
 const currencyStrengthEntryGrace = 15 * time.Minute
+const currencyStrengthTradeRecoveryInterval = time.Minute
 
 // sessionNotifier delivers currency-strength session notifications (e.g. Telegram).
 // Structurally satisfied by *orbTelegramNotifier, so the currency-strength runner
@@ -128,7 +130,7 @@ type currencyStrengthPaperRunner struct {
 	decisionDoneFor    string
 	sessionRecordedFor string
 	entryRecorded      bool
-	fillRecoveryFor    string
+	nextTradeRecovery  time.Time
 }
 
 func validateCurrencyStrengthPaperConfig(cfg *config.Config, dryRun bool) error {
@@ -331,11 +333,9 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 			}
 		}
 
-		if r.state == nil && r.fillRecoveryFor != dateKey {
-			if _, err := r.recoverFilledEntry(ctx); err != nil {
-				logger.Warn("currency-strength: filled-entry recovery failed; will retry", "err", err)
-			} else {
-				r.fillRecoveryFor = dateKey
+		if r.state == nil {
+			if _, err := r.recoverEntryObligation(ctx); err != nil {
+				logger.Warn("currency-strength: broker entry recovery failed; will retry", "err", err)
 			}
 		}
 
@@ -390,100 +390,199 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 	}
 }
 
-func (r *currencyStrengthPaperRunner) recoverFilledEntry(ctx context.Context) (bool, error) {
-	type tradeRecordFetcher interface {
-		FetchTradeRecords(context.Context, int) ([]execution.IBKRTradeRecord, error)
+func (r *currencyStrengthPaperRunner) recoverEntryObligation(ctx context.Context) (bool, error) {
+	if recovered, err := r.recoverWorkingEntry(ctx); recovered || err != nil {
+		return recovered, err
 	}
-	type recentFillFetcher interface {
-		RecentFills(context.Context) ([]execution.BrokerOrder, error)
-	}
-
-	var fills []execution.BrokerOrder
-	if fetcher, ok := r.broker.(tradeRecordFetcher); ok {
-		records, err := fetcher.FetchTradeRecords(ctx, 7)
-		if err != nil {
-			return false, fmt.Errorf("list strategy trade records: %w", err)
-		}
-		for _, record := range records {
-			fills = append(fills, execution.BrokerOrder{
-				BrokerOrderID: record.OrderID,
-				TradeID:       record.TradeID,
-				Symbol:        record.Symbol,
-				Side:          record.Side,
-				Qty:           record.Qty,
-				FilledQty:     record.Qty,
-				FilledAvgPx:   record.Price,
-				Status:        "filled",
-				FilledAt:      record.FilledAt,
-			})
-		}
-	} else if fetcher, ok := r.broker.(recentFillFetcher); ok {
-		var err error
-		fills, err = fetcher.RecentFills(ctx)
-		if err != nil {
-			return false, fmt.Errorf("list recent strategy fills: %w", err)
-		}
-	} else {
+	now := r.currencyStrengthNow()
+	if !r.nextTradeRecovery.IsZero() && now.Before(r.nextTradeRecovery) {
 		return false, nil
 	}
-
+	r.nextTradeRecovery = now.Add(currencyStrengthTradeRecoveryInterval)
+	records, err := r.currencyStrengthTradeRecords(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(records) == 0 {
+		return false, nil
+	}
 	positions, err := r.broker.GetPositions(ctx)
 	if err != nil {
 		return false, fmt.Errorf("list positions for filled-entry recovery: %w", err)
 	}
-	var recoveredFill *execution.BrokerOrder
-	var recoveredPosition *execution.Position
-	var recoveredDate, recoveredSymbol string
-	for i := range fills {
-		fill := fills[i]
-		dateKey, symbol, ok := parseCurrencyStrengthEntryTradeID(fill.TradeID)
-		if !ok {
+	sort.Slice(records, func(i, j int) bool {
+		return records[i].FilledAt.Before(records[j].FilledAt)
+	})
+
+	var recovered *currencyStrengthRunState
+	seenEntries := make(map[string]bool)
+	for i, entry := range records {
+		dateKey, symbol, ok := parseCurrencyStrengthEntryTradeID(entry.TradeID)
+		if !ok || seenEntries[entry.TradeID] || !r.currencyStrengthTradeable(symbol) {
+			continue
+		}
+		seenEntries[entry.TradeID] = true
+		entrySide := strings.ToLower(entry.Side)
+		entrySign := currencyStrengthSideSign(entrySide)
+		if entrySign == 0 {
+			continue
+		}
+		var entryQty, entryNotional float64
+		for j := i; j < len(records); j++ {
+			fill := records[j]
+			if fill.TradeID == entry.TradeID {
+				entryQty += fill.Qty
+				entryNotional += fill.Price * fill.Qty
+			}
+		}
+		var netQty float64
+		closed, contaminated := false, false
+		for j := i; j < len(records); j++ {
+			fill := records[j]
+			if !currencyStrengthRecordMatchesSymbol(fill, symbol) {
+				continue
+			}
+			netQty += currencyStrengthSideSign(fill.Side) * fill.Qty
+			if entryQty > 0 && math.Abs(netQty) > entryQty+1e-6 {
+				contaminated = true
+			}
+			if fill.TradeID != entry.TradeID && math.Abs(netQty) < 1e-6 {
+				closed = true
+				break
+			}
+		}
+		if closed || contaminated || entryQty <= 0 || entryNotional <= 0 ||
+			math.Abs(netQty) > entryQty+1e-6 || netQty*entrySign <= 0 {
 			continue
 		}
 		for j := range positions {
 			pos := positions[j]
 			if normalizeCurrencyStrengthTicker(pos.Ticker) != normalizeCurrencyStrengthTicker(symbol) ||
-				math.Abs(pos.Quantity) <= 0 ||
-				(pos.Quantity > 0) != strings.EqualFold(fill.Side, "buy") {
+				!currencyStrengthQuantitiesMatch(pos.Quantity, netQty) {
 				continue
 			}
-			if recoveredFill == nil || fill.FilledAt.After(recoveredFill.FilledAt) {
-				fillCopy, posCopy := fill, pos
-				recoveredFill, recoveredPosition = &fillCopy, &posCopy
-				recoveredDate, recoveredSymbol = dateKey, symbol
+			candidate := &currencyStrengthRunState{
+				AccountID:      r.accountID,
+				Date:           dateKey,
+				Symbol:         symbol,
+				Side:           entrySide,
+				Quantity:       math.Abs(netQty),
+				EntryOrderID:   entry.OrderID,
+				EntryStatus:    "filled",
+				EntryFillPrice: entryNotional / entryQty,
+				EntryFilledQty: entryQty,
+				EnteredAt:      entry.FilledAt.UTC().Format(time.RFC3339),
+			}
+			if recovered == nil || candidate.EnteredAt > recovered.EnteredAt {
+				recovered = candidate
 			}
 		}
 	}
-	if recoveredFill == nil {
+	if recovered == nil {
 		return false, nil
 	}
-	enteredAt := recoveredFill.FilledAt
-	if enteredAt.IsZero() {
-		enteredAt = r.now().UTC()
-	}
-	entryPrice := recoveredPosition.AvgCostBasis
-	if entryPrice <= 0 {
-		entryPrice = recoveredFill.FilledAvgPx
-	}
-	r.state = &currencyStrengthRunState{
-		AccountID:      r.accountID,
-		Date:           recoveredDate,
-		Symbol:         recoveredSymbol,
-		Side:           strings.ToLower(recoveredFill.Side),
-		Quantity:       math.Abs(recoveredPosition.Quantity),
-		EntryOrderID:   recoveredFill.BrokerOrderID,
-		EntryStatus:    "filled",
-		EntryFillPrice: entryPrice,
-		EntryFilledQty: math.Abs(recoveredPosition.Quantity),
-		EnteredAt:      enteredAt.UTC().Format(time.RFC3339),
-	}
+	r.state = recovered
 	if err := r.persistActiveEntryRecovery(ctx); err != nil {
 		logger.Warn("currency-strength: recovered filled entry remains non-durable", "err", err)
 	}
 	logger.Warn("currency-strength: recovered strategy-owned filled entry",
-		"symbol", recoveredSymbol, "order_id", recoveredFill.BrokerOrderID,
-		"trade_id", recoveredFill.TradeID)
+		"symbol", recovered.Symbol, "order_id", recovered.EntryOrderID)
 	return true, nil
+}
+
+func (r *currencyStrengthPaperRunner) recoverWorkingEntry(ctx context.Context) (bool, error) {
+	lister, ok := r.broker.(execution.WorkingOrdersLister)
+	if !ok {
+		return false, nil
+	}
+	orders, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list working entries for recovery: %w", err)
+	}
+	for _, order := range orders {
+		dateKey, symbol, owned := parseCurrencyStrengthEntryTradeID(order.TradeID)
+		if !owned || !r.currencyStrengthTradeable(symbol) ||
+			normalizeCurrencyStrengthTicker(order.Ticker) != normalizeCurrencyStrengthTicker(symbol) {
+			continue
+		}
+		r.state = &currencyStrengthRunState{
+			AccountID:    r.accountID,
+			Date:         dateKey,
+			Symbol:       symbol,
+			Side:         strings.ToLower(order.Side),
+			Quantity:     float64(r.cfg.Units),
+			EntryOrderID: order.OrderID,
+			EntryStatus:  order.Status,
+			EnteredAt:    r.currencyStrengthNow().UTC().Format(time.RFC3339),
+		}
+		if err := r.persistActiveEntryRecovery(ctx); err != nil {
+			logger.Warn("currency-strength: recovered working entry remains non-durable", "err", err)
+		}
+		logger.Warn("currency-strength: recovered strategy-owned working entry",
+			"symbol", symbol, "order_id", order.OrderID, "trade_id", order.TradeID)
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *currencyStrengthPaperRunner) currencyStrengthTradeRecords(
+	ctx context.Context,
+) ([]execution.IBKRTradeRecord, error) {
+	type tradeRecordFetcher interface {
+		FetchTradeRecords(context.Context, int) ([]execution.IBKRTradeRecord, error)
+	}
+	if fetcher, ok := r.broker.(tradeRecordFetcher); ok {
+		records, err := fetcher.FetchTradeRecords(ctx, 7)
+		if err != nil {
+			return nil, fmt.Errorf("list strategy trade records: %w", err)
+		}
+		return records, nil
+	}
+	type recentFillFetcher interface {
+		RecentFills(context.Context) ([]execution.BrokerOrder, error)
+	}
+	fetcher, ok := r.broker.(recentFillFetcher)
+	if !ok {
+		return nil, nil
+	}
+	fills, err := fetcher.RecentFills(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list recent strategy fills: %w", err)
+	}
+	records := make([]execution.IBKRTradeRecord, 0, len(fills))
+	for _, fill := range fills {
+		records = append(records, execution.IBKRTradeRecord{
+			OrderID: fill.BrokerOrderID, TradeID: fill.TradeID, Symbol: fill.Symbol,
+			Side: fill.Side, Qty: fill.FilledQty, Price: fill.FilledAvgPx,
+			FilledAt: fill.FilledAt,
+		})
+	}
+	return records, nil
+}
+
+func (r *currencyStrengthPaperRunner) currencyStrengthTradeable(symbol string) bool {
+	want := normalizeCurrencyStrengthTicker(symbol)
+	for _, configured := range r.cfg.TradeInstruments {
+		if normalizeCurrencyStrengthTicker(configured) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func currencyStrengthSideSign(side string) float64 {
+	if strings.EqualFold(side, "buy") {
+		return 1
+	}
+	if strings.EqualFold(side, "sell") {
+		return -1
+	}
+	return 0
+}
+
+func currencyStrengthQuantitiesMatch(positionQty, expectedQty float64) bool {
+	tolerance := math.Max(1e-6, math.Abs(expectedQty)*1e-8)
+	return math.Abs(positionQty-expectedQty) <= tolerance
 }
 
 func parseCurrencyStrengthEntryTradeID(tradeID string) (dateKey, symbol string, ok bool) {
@@ -503,6 +602,36 @@ func parseCurrencyStrengthEntryTradeID(tradeID string) (dateKey, symbol string, 
 		return "", "", false
 	}
 	return dateKey, compact[:3] + "/" + compact[3:], true
+}
+
+func parseCurrencyStrengthExitTradeID(tradeID string) (dateKey, symbol string, ok bool) {
+	const prefix = "currency-strength-exit-"
+	if !strings.HasPrefix(tradeID, prefix) {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(tradeID, prefix)
+	if len(rest) < len("2006-01-02-XXXXXX") || rest[10] != '-' {
+		return "", "", false
+	}
+	dateKey, compact := rest[:10], rest[11:]
+	if _, err := time.Parse("2006-01-02", dateKey); err != nil || len(compact) < 6 {
+		return "", "", false
+	}
+	compact = compact[:6]
+	return dateKey, compact[:3] + "/" + compact[3:], true
+}
+
+func currencyStrengthRecordMatchesSymbol(record execution.IBKRTradeRecord, symbol string) bool {
+	if normalizeCurrencyStrengthTicker(record.Symbol) == normalizeCurrencyStrengthTicker(symbol) {
+		return true
+	}
+	if _, ownedSymbol, ok := parseCurrencyStrengthEntryTradeID(record.TradeID); ok {
+		return normalizeCurrencyStrengthTicker(ownedSymbol) == normalizeCurrencyStrengthTicker(symbol)
+	}
+	if _, ownedSymbol, ok := parseCurrencyStrengthExitTradeID(record.TradeID); ok {
+		return normalizeCurrencyStrengthTicker(ownedSymbol) == normalizeCurrencyStrengthTicker(symbol)
+	}
+	return false
 }
 
 func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, dateKey string, strengthStart, strengthEnd time.Time) error {
@@ -702,6 +831,11 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if r.state.ExitOrderID != "" {
 		return r.finalizeExitedState(ctx)
 	}
+	if adopted, err := r.adoptFilledExit(ctx); err != nil {
+		return err
+	} else if adopted {
+		return r.finalizeExitedState(ctx)
+	}
 	exitSide := execution.OrderSideSell
 	if r.state.Side == "sell" {
 		exitSide = execution.OrderSideBuy
@@ -856,6 +990,54 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		"quantity", qty, "order_id", result.BrokerOrderID, "status", result.Status)
 	r.notify(ctx, buildCurrencyStrengthExitMessage(r.state.Symbol, exitSide, qty, result.BrokerOrderID, result.Status))
 	return r.finalizeExitedState(ctx)
+}
+
+func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool, error) {
+	if r.state == nil || r.state.ExitTradeID == "" {
+		return false, nil
+	}
+	records, err := r.currencyStrengthTradeRecords(ctx)
+	if err != nil {
+		return false, fmt.Errorf("currency-strength recover filled exit: %w", err)
+	}
+	var orderID string
+	var filledQty, fillNotional float64
+	var filledAt time.Time
+	for _, record := range records {
+		if record.TradeID != r.state.ExitTradeID {
+			continue
+		}
+		if orderID != "" && record.OrderID != orderID {
+			return false, fmt.Errorf(
+				"currency-strength exit reference %q maps to multiple broker orders",
+				r.state.ExitTradeID,
+			)
+		}
+		orderID = record.OrderID
+		filledQty += record.Qty
+		fillNotional += record.Price * record.Qty
+		if record.FilledAt.After(filledAt) {
+			filledAt = record.FilledAt
+		}
+	}
+	if orderID == "" || filledQty <= 0 {
+		return false, nil
+	}
+	r.state.ExitOrderID = orderID
+	r.state.ExitStatus = "filled"
+	r.state.ExitFilledQty = filledQty
+	r.state.ExitFillPrice = fillNotional / filledQty
+	if filledAt.IsZero() {
+		filledAt = r.currencyStrengthNow().UTC()
+	}
+	r.state.ExitedAt = filledAt.UTC().Format(time.RFC3339)
+	if err := r.saveState(); err != nil {
+		logger.Warn("currency-strength: failed to persist recovered filled exit", "err", err)
+	}
+	logger.Warn("currency-strength: recovered strategy-owned filled exit",
+		"symbol", r.state.Symbol, "order_id", orderID,
+		"trade_id", r.state.ExitTradeID, "filled_qty", filledQty)
+	return true, nil
 }
 
 func (r *currencyStrengthPaperRunner) adoptWorkingExit(
@@ -1884,6 +2066,13 @@ func isIBKRPaperAccountID(accountID string) bool {
 
 func normalizeCurrencyStrengthAccountID(accountID string) string {
 	return strings.ToUpper(strings.TrimSpace(accountID))
+}
+
+func (r *currencyStrengthPaperRunner) currencyStrengthNow() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
 }
 
 func currencyStrengthShouldExitState(state *currencyStrengthRunState, dateKey string, now, exitTime time.Time) bool {

@@ -20,10 +20,19 @@ type CurrencyStrengthViewData struct {
 	Page       int
 	HasNewer   bool
 	HasOlder   bool
+	SnapshotAt time.Time
 	Err        string
 }
 
 func FetchCurrencyStrengthViewData(ctx context.Context, page int) (d CurrencyStrengthViewData) {
+	return FetchCurrencyStrengthViewDataAt(ctx, page, time.Time{})
+}
+
+func FetchCurrencyStrengthViewDataAt(
+	ctx context.Context,
+	page int,
+	snapshotAt time.Time,
+) (d CurrencyStrengthViewData) {
 	if page < 0 {
 		page = 0
 	}
@@ -34,8 +43,18 @@ func FetchCurrencyStrengthViewData(ctx context.Context, page int) (d CurrencyStr
 		d.Err = "database not connected"
 		return d
 	}
-	runs, err := store.ListCurrencyStrengthRunsPage(
-		ctx, store.GetDB(), CurrencyStrengthPageSize+1, page*CurrencyStrengthPageSize,
+	db := store.GetDB()
+	if snapshotAt.IsZero() {
+		var err error
+		snapshotAt, err = store.HistorySnapshotTime(ctx, db)
+		if err != nil {
+			d.Err = err.Error()
+			return d
+		}
+	}
+	d.SnapshotAt = snapshotAt
+	runs, err := store.ListCurrencyStrengthRunsPageAt(
+		ctx, db, CurrencyStrengthPageSize+1, page*CurrencyStrengthPageSize, snapshotAt,
 	)
 	if err != nil {
 		d.Err = err.Error()
@@ -108,10 +127,11 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 
 	var b strings.Builder
 	fmt.Fprintf(
-		&b, "%s  %s  %s\n",
+		&b, "%s  %s  %s  %s\n",
 		titleStyle.Render("Currency Strength"),
 		run.SessionDate.Format("2006-01-02"),
 		renderCurrencyStrengthStatus(run.Status),
+		labelStyle.Render(displayText(run.AccountID, "unknown account")),
 	)
 	fmt.Fprintf(
 		&b, "%s%s–%s %s  %s%d units\n",

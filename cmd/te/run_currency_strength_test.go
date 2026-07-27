@@ -448,25 +448,36 @@ func TestCurrencyStrengthRecoversImmediatelyFilledEntryByTradeID(t *testing.T) {
 		positions: []execution.Position{{
 			Ticker: "GBP/USD", Quantity: 75000, AvgCostBasis: 1.10125,
 		}},
-		recentFills: []execution.BrokerOrder{{
-			BrokerOrderID: "ENTRY-FILLED",
-			TradeID:       "currency-strength-2026-07-27-GBPUSD",
-			Symbol:        "GBP",
-			Side:          "buy",
-			FilledQty:     100000,
-			FilledAvgPx:   1.1,
-			FilledAt:      time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC),
-		}},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "ENTRY-FILLED",
+				TradeID:       "currency-strength-2026-07-27-GBPUSD",
+				Symbol:        "GBP",
+				Side:          "buy",
+				FilledQty:     100000,
+				FilledAvgPx:   1.1,
+				FilledAt:      time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC),
+			},
+			{
+				BrokerOrderID: "MANUAL-REDUCTION",
+				Symbol:        "GBP/USD",
+				Side:          "sell",
+				FilledQty:     25000,
+				FilledAvgPx:   1.101,
+				FilledAt:      time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+			},
+		},
 	}
 	runner := &currencyStrengthPaperRunner{
 		accountID: "DU123",
 		cfg: config.CurrencyStrengthConfig{
-			Units: 100000,
+			Units:            100000,
+			TradeInstruments: []string{"GBP/USD"},
 		},
 		broker:    broker,
 		statePath: t.TempDir() + "/currency-strength.json",
 	}
-	recovered, err := runner.recoverFilledEntry(context.Background())
+	recovered, err := runner.recoverEntryObligation(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,9 +485,149 @@ func TestCurrencyStrengthRecoversImmediatelyFilledEntryByTradeID(t *testing.T) {
 		t.Fatalf("filled strategy entry was not recovered: %+v", runner.state)
 	}
 	if runner.state.AccountID != "DU123" || runner.state.Symbol != "GBP/USD" ||
-		runner.state.Quantity != 75000 || runner.state.EntryFilledQty != 75000 ||
-		runner.state.EntryFillPrice != 1.10125 {
-		t.Fatalf("recovery did not adopt broker position truth: %+v", runner.state)
+		runner.state.Quantity != 75000 || runner.state.EntryFilledQty != 100000 ||
+		runner.state.EntryFillPrice != 1.1 {
+		t.Fatalf("recovery did not reconstruct broker execution truth: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthDoesNotClaimReopenedManualPosition(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 100000, AvgCostBasis: 1.2,
+		}},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "ENTRY-OLD",
+				TradeID:       "currency-strength-2026-07-24-GBPUSD",
+				Symbol:        "GBP/USD", Side: "buy", FilledQty: 100000,
+				FilledAvgPx: 1.1, FilledAt: time.Date(2026, 7, 24, 9, 0, 0, 0, time.UTC),
+			},
+			{
+				BrokerOrderID: "EXIT-OLD",
+				TradeID:       "currency-strength-exit-2026-07-24-GBPUSD-1",
+				Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
+				FilledAvgPx: 1.11, FilledAt: time.Date(2026, 7, 24, 18, 0, 0, 0, time.UTC),
+			},
+			{
+				BrokerOrderID: "MANUAL-NEW",
+				Symbol:        "GBP/USD", Side: "buy", FilledQty: 100000,
+				FilledAvgPx: 1.2, FilledAt: time.Date(2026, 7, 27, 8, 0, 0, 0, time.UTC),
+			},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time { return time.Date(2026, 7, 27, 19, 0, 0, 0, time.UTC) },
+	}
+	recovered, err := runner.recoverEntryObligation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered || runner.state != nil {
+		t.Fatalf("historical strategy lifecycle claimed a manual position: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthRecoversWorkingEntryOutsideDecisionWindow(t *testing.T) {
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: &successfulCurrencyStrengthExecutor{},
+		orders: []execution.WorkingOrder{{
+			OrderID: "ENTRY-WORKING",
+			TradeID: "currency-strength-2026-07-27-GBPUSD",
+			Ticker:  "GBP.USD", Side: "buy", Status: "pending", RemainingQty: 100000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time { return time.Date(2026, 7, 27, 19, 0, 0, 0, time.UTC) },
+	}
+	recovered, err := runner.recoverEntryObligation(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || runner.state == nil || runner.state.EntryOrderID != "ENTRY-WORKING" {
+		t.Fatalf("working entry was not recovered independently of decision time: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthRetriesFilledEntryRecoveryUntilVisible(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 30, 0, 0, time.UTC)
+	broker := &successfulCurrencyStrengthExecutor{
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 100000, AvgCostBasis: 1.1,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, statePath: t.TempDir() + "/currency-strength.json",
+		now: func() time.Time { return now },
+	}
+	recovered, err := runner.recoverEntryObligation(context.Background())
+	if err != nil || recovered {
+		t.Fatalf("initial invisible fill recovery = %v, %v", recovered, err)
+	}
+	broker.recentFills = []execution.BrokerOrder{{
+		BrokerOrderID: "ENTRY-DELAYED-VISIBILITY",
+		TradeID:       "currency-strength-2026-07-27-GBPUSD",
+		Symbol:        "GBP/USD", Side: "buy", FilledQty: 100000,
+		FilledAvgPx: 1.1, FilledAt: now.Add(-time.Minute),
+	}}
+	now = now.Add(currencyStrengthTradeRecoveryInterval + time.Second)
+	recovered, err = runner.recoverEntryObligation(context.Background())
+	if err != nil || !recovered || runner.state == nil {
+		t.Fatalf("later-visible fill was not recovered: recovered=%v err=%v state=%+v",
+			recovered, err, runner.state)
+	}
+}
+
+func TestCurrencyStrengthRecoversReservedFilledExitBeforeBrokerFlat(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "EXIT-FILLED",
+				TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-123-1",
+				Symbol:        "GBP/USD", Side: "sell", FilledQty: 40000,
+				FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
+			},
+			{
+				BrokerOrderID: "EXIT-FILLED",
+				TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-123-1",
+				Symbol:        "GBP/USD", Side: "sell", FilledQty: 60000,
+				FilledAvgPx: 1.106, FilledAt: time.Date(2026, 7, 27, 18, 0, 1, 0, time.UTC),
+			},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitTradeID: "currency-strength-exit-2026-07-27-GBPUSD-123-1",
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil || len(journal.exits) != 1 {
+		t.Fatalf("filled exit was not recovered and finalized: state=%+v exits=%+v",
+			runner.state, journal.exits)
+	}
+	got := journal.exits[0]
+	if got.ExitOrderID != "EXIT-FILLED" || got.ExitFilledQty != 100000 ||
+		got.ExitFillPrice < 1.10559 || got.ExitFillPrice > 1.10561 ||
+		got.RealizedPnL == nil {
+		t.Fatalf("recovered exit economics incomplete: %+v", got)
 	}
 }
 

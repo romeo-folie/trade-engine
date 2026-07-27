@@ -499,6 +499,12 @@ func GetRecentORBSessionsPageAt(
 // ORBSessionsSnapshotTime returns a database-clock boundary for stable history
 // pagination. Using the DB clock avoids client/server clock skew.
 func ORBSessionsSnapshotTime(ctx context.Context, db *pgxpool.Pool) (time.Time, error) {
+	return HistorySnapshotTime(ctx, db)
+}
+
+// HistorySnapshotTime returns a shared database-clock boundary for stable
+// dashboard pagination.
+func HistorySnapshotTime(ctx context.Context, db *pgxpool.Pool) (time.Time, error) {
 	var snapshot time.Time
 	err := db.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&snapshot)
 	return snapshot, err
