@@ -81,6 +81,7 @@ type currencyStrengthExitAudit struct {
 	Side           string  `json:"side,omitempty"`
 	EntryStatus    string  `json:"entry_status,omitempty"`
 	EntryFillPrice float64 `json:"entry_fill_price,omitempty"`
+	SessionDate    string  `json:"session_date,omitempty"`
 }
 
 // currencyStrengthJournal is the strategy's durable audit seam. Production
@@ -500,17 +501,18 @@ func (r *currencyStrengthPaperRunner) recoverEntryObligation(ctx context.Context
 				return false, statusErr
 			}
 			candidate := &currencyStrengthRunState{
-				AccountID:        r.accountID,
-				Date:             dateKey,
-				Symbol:           symbol,
-				Side:             entrySide,
-				Quantity:         math.Abs(netQty),
-				EntryOrderID:     entry.OrderID,
-				EntryStatus:      entryStatus,
-				EntryFillPrice:   entryNotional / entryQty,
-				EntryFilledQty:   entryQty,
-				EntryFillTimeQty: entryQty,
-				EnteredAt:        entry.FilledAt.UTC().Format(time.RFC3339),
+				AccountID:         r.accountID,
+				Date:              dateKey,
+				Symbol:            symbol,
+				Side:              entrySide,
+				Quantity:          math.Abs(netQty),
+				EntryOrderID:      entry.OrderID,
+				EntryStatus:       entryStatus,
+				EntryFillPrice:    entryNotional / entryQty,
+				EntryFilledQty:    entryQty,
+				EntryFillTimeQty:  entryQty,
+				EnteredAt:         entry.FilledAt.UTC().Format(time.RFC3339),
+				PendingExitAudits: r.pendingExitAudits(),
 			}
 			if recovered == nil || candidate.EnteredAt > recovered.EnteredAt {
 				recovered = candidate
@@ -864,7 +866,25 @@ func (r *currencyStrengthPaperRunner) pendingExitAudits() []currencyStrengthExit
 	if r.state == nil || len(r.state.PendingExitAudits) == 0 {
 		return nil
 	}
-	return append([]currencyStrengthExitAudit(nil), r.state.PendingExitAudits...)
+	audits := append([]currencyStrengthExitAudit(nil), r.state.PendingExitAudits...)
+	for i := range audits {
+		if audits[i].SessionDate == "" {
+			audits[i].SessionDate = r.state.Date
+		}
+		if audits[i].Symbol == "" {
+			audits[i].Symbol = r.state.Symbol
+		}
+		if audits[i].Side == "" {
+			audits[i].Side = r.state.Side
+		}
+		if audits[i].EntryStatus == "" {
+			audits[i].EntryStatus = r.state.EntryStatus
+		}
+		if audits[i].EntryFillPrice <= 0 {
+			audits[i].EntryFillPrice = r.state.EntryFillPrice
+		}
+	}
+	return audits
 }
 
 func (r *currencyStrengthPaperRunner) persistActiveEntryRecovery(ctx context.Context) error {
@@ -1256,15 +1276,16 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 					filledQty = -math.Abs(filledQty)
 				}
 				audit := currencyStrengthExitAudit{
-					OrderID:   selected.orderID,
-					Status:    status,
-					FillPrice: selected.fillNotional / selected.filledQty,
-					FilledQty: filledQty,
-					ExitedAt:  selected.filledAt.UTC().Format(time.RFC3339),
-					Symbol:    r.state.Symbol,
-					Side:      r.state.Side,
-					EntryStatus: r.state.EntryStatus,
+					OrderID:        selected.orderID,
+					Status:         status,
+					FillPrice:      selected.fillNotional / selected.filledQty,
+					FilledQty:      filledQty,
+					ExitedAt:       selected.filledAt.UTC().Format(time.RFC3339),
+					Symbol:         r.state.Symbol,
+					Side:           r.state.Side,
+					EntryStatus:    r.state.EntryStatus,
 					EntryFillPrice: r.state.EntryFillPrice,
+					SessionDate:    r.state.Date,
 				}
 				r.state.PendingExitAudits = append(r.state.PendingExitAudits, audit)
 				if err := r.syncPendingExitAudit(ctx); err != nil {
@@ -2139,6 +2160,15 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	if r.state == nil || r.state.ExitOrderID == "" {
 		return nil
 	}
+	if r.state.AuditOnly {
+		if err := r.syncPendingExitAudit(ctx); err != nil {
+			return err
+		}
+		if len(r.state.PendingExitAudits) == 0 {
+			return r.clearState()
+		}
+		return r.saveState()
+	}
 
 	status := normalizeCurrencyStrengthOrderStatus(r.state.ExitStatus)
 	if r.state.ExitOrderID != "broker-flat" && status != "filled" {
@@ -2345,6 +2375,21 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		return nil
 	}
 	if r.state.ExitPnLPending {
+		// Keep the current terminal attempt in the same durable retry queue as
+		// historical attempts; audit-only reconciliation must be able to enrich
+		// it without routing through broker exit handling.
+		currentAudit := r.currentExitAudit()
+		if len(r.state.PendingExitAudits) == 0 ||
+			r.state.PendingExitAudits[len(r.state.PendingExitAudits)-1].OrderID != currentAudit.OrderID {
+			r.state.PendingExitAudits = append(r.state.PendingExitAudits, currentAudit)
+		}
+		if !r.state.ExitConfirmed {
+			r.notify(ctx, buildCurrencyStrengthFlattenedMessage(
+				r.state.Symbol, r.state.ExitOrderID, r.state.ExitFilledQty, r.state.ExitFillPrice,
+			))
+			r.state.ExitConfirmed = true
+		}
+		r.state.AuditOnly = true
 		if err := r.saveState(); err != nil {
 			logger.Warn("currency-strength: failed to persist pending P&L enrichment", "err", err)
 		}
@@ -2529,6 +2574,7 @@ func (r *currencyStrengthPaperRunner) currentExitAudit() currencyStrengthExitAud
 		Side:           r.state.Side,
 		EntryStatus:    r.state.EntryStatus,
 		EntryFillPrice: r.state.EntryFillPrice,
+		SessionDate:    r.state.Date,
 	}
 }
 
@@ -2540,6 +2586,9 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 	if r.state == nil || len(r.state.PendingExitAudits) == 0 {
 		return nil
 	}
+	// Normalize legacy queue entries before replay. This snapshots the
+	// originating trade economics/date while they are still available.
+	r.state.PendingExitAudits = r.pendingExitAudits()
 	for len(r.state.PendingExitAudits) > 0 {
 		audit := r.state.PendingExitAudits[0]
 		realizedPnL, err := r.realizedPnLUSD(ctx, audit)
@@ -2578,10 +2627,10 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 ) (*float64, error) {
 	entryStatus := audit.EntryStatus
 	entryFillPrice := audit.EntryFillPrice
-	if entryStatus == "" && r.state != nil {
+	if entryStatus == "" && r.state != nil && (audit.SessionDate == "" || audit.SessionDate == r.state.Date) {
 		entryStatus = r.state.EntryStatus
 	}
-	if entryFillPrice <= 0 && r.state != nil {
+	if entryFillPrice <= 0 && r.state != nil && (audit.SessionDate == "" || audit.SessionDate == r.state.Date) {
 		entryFillPrice = r.state.EntryFillPrice
 	}
 	if normalizeCurrencyStrengthOrderStatus(entryStatus) != "filled" ||
@@ -2589,16 +2638,16 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 		return nil, nil
 	}
 	symbol := audit.Symbol
-	if symbol == "" && r.state != nil {
+	if symbol == "" && r.state != nil && (audit.SessionDate == "" || audit.SessionDate == r.state.Date) {
 		symbol = r.state.Symbol
 	}
 	parts := strings.Split(strings.ToUpper(symbol), "/")
 	if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
-		return nil, fmt.Errorf("currency-strength convert P&L for invalid pair %q", r.state.Symbol)
+		return nil, fmt.Errorf("currency-strength convert P&L for invalid pair %q", symbol)
 	}
 	pnl := (audit.FillPrice - entryFillPrice) * audit.FilledQty
 	side := audit.Side
-	if side == "" && r.state != nil {
+	if side == "" && r.state != nil && (audit.SessionDate == "" || audit.SessionDate == r.state.Date) {
 		side = r.state.Side
 	}
 	if side == "sell" {
@@ -2678,14 +2727,18 @@ func (r *currencyStrengthPaperRunner) writeExitJournal(
 	if r.journal == nil {
 		return nil
 	}
-	if !r.entryRecorded {
+	if !r.entryRecorded && !(r.state != nil && r.state.AuditOnly) {
 		if err := r.syncActiveEntryJournal(ctx); err != nil {
 			return fmt.Errorf("entry history sync before exit: %w", err)
 		}
 	}
-	sessionDate, err := time.Parse("2006-01-02", r.state.Date)
+	sessionDateKey := audit.SessionDate
+	if sessionDateKey == "" && r.state != nil {
+		sessionDateKey = r.state.Date
+	}
+	sessionDate, err := time.Parse("2006-01-02", sessionDateKey)
 	if err != nil {
-		return fmt.Errorf("parse state date %q: %w", r.state.Date, err)
+		return fmt.Errorf("parse state date %q: %w", sessionDateKey, err)
 	}
 	exitedAt, _ := time.Parse(time.RFC3339, audit.ExitedAt)
 	return r.journal.RecordExit(ctx, store.CurrencyStrengthRun{

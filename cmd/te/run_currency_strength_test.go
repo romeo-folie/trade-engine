@@ -1672,7 +1672,7 @@ func TestCurrencyStrengthTerminalExitRetainsHistoricalAuditQueue(t *testing.T) {
 	if err := runner.finalizeExitedState(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if runner.state == nil || len(runner.state.PendingExitAudits) != 1 {
+	if runner.state == nil || len(runner.state.PendingExitAudits) < 1 || !runner.state.AuditOnly {
 		t.Fatalf("terminal cleanup discarded historical audit queue: state=%+v", runner.state)
 	}
 }
