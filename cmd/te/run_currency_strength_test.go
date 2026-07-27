@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -599,6 +600,28 @@ func TestCurrencyStrengthAcceptedEntryFallsBackToJournalWhenSidecarFails(t *test
 	}
 }
 
+func TestCurrencyStrengthCorruptSidecarFallsBackToJournal(t *testing.T) {
+	statePath := t.TempDir() + "/currency-strength.json"
+	if err := os.WriteFile(statePath, []byte("{not-json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &currencyStrengthPaperRunner{
+		statePath: statePath,
+		journal:   &captureCurrencyStrengthJournal{},
+	}
+	if err := loadCurrencyStrengthRecovery(runner); err != nil {
+		t.Fatalf("healthy journal should tolerate corrupt sidecar: %v", err)
+	}
+	if runner.state != nil {
+		t.Fatalf("corrupt sidecar state was retained: %+v", runner.state)
+	}
+
+	withoutJournal := &currencyStrengthPaperRunner{statePath: statePath}
+	if err := loadCurrencyStrengthRecovery(withoutJournal); err == nil {
+		t.Fatal("corrupt sidecar without journal should remain fatal")
+	}
+}
+
 func TestCurrencyStrengthExitPersistsRealizedPnL(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
@@ -869,6 +892,42 @@ func TestCurrencyStrengthAdoptsBrokerWorkingExitWhenDurabilityFailed(t *testing.
 	}
 }
 
+func TestCurrencyStrengthAdoptsDeterministicWorkingEntryAfterDurabilityFailure(t *testing.T) {
+	base := &successfulCurrencyStrengthExecutor{}
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: base,
+		orders: []execution.WorkingOrder{{
+			OrderID:      "ENTRY-WORKING",
+			TradeID:      "currency-strength-2026-07-27-GBPUSD",
+			Ticker:       "GBP/USD",
+			Side:         "buy",
+			Status:       "pending",
+			RemainingQty: 100000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg:       config.CurrencyStrengthConfig{Units: 100000},
+		broker:    broker,
+		statePath: t.TempDir(), // force the sidecar write to fail
+		journal:   &captureCurrencyStrengthJournal{entryErrors: 1},
+		now:       func() time.Time { return time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC) },
+	}
+	adopted, err := runner.adoptWorkingEntry(
+		context.Background(),
+		"2026-07-27",
+		currencystrength.Signal{Symbol: "GBP/USD", Side: "buy"},
+		"currency-strength-2026-07-27-GBPUSD",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !adopted || runner.state == nil ||
+		runner.state.EntryOrderID != "ENTRY-WORKING" || base.calls != 0 {
+		t.Fatalf("strategy-owned working entry was not adopted: adopted=%v state=%+v calls=%d",
+			adopted, runner.state, base.calls)
+	}
+}
+
 func TestCurrencyStrengthExitReferenceMatchesReservedProductionID(t *testing.T) {
 	base := "currency-strength-exit-2026-07-27-GBPUSD"
 	reserved := base + "-1785146400000000000-1"
@@ -880,6 +939,24 @@ func TestCurrencyStrengthExitReferenceMatchesReservedProductionID(t *testing.T) 
 	}
 	if currencyStrengthExitReferenceMatches(base+"-other", reserved, base, true) {
 		t.Fatal("sidecar-owned reference did not require an exact match")
+	}
+}
+
+func TestCurrencyStrengthExitReferenceDoesNotRequireWritableSidecar(t *testing.T) {
+	runner := &currencyStrengthPaperRunner{
+		statePath: t.TempDir(), // force saveState to fail
+		state: &currencyStrengthRunState{
+			Date:   "2026-07-27",
+			Symbol: "GBP/USD",
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	ref, err := runner.reserveExitTradeID()
+	if err != nil {
+		t.Fatalf("sidecar failure blocked exit reference: %v", err)
+	}
+	if !strings.HasPrefix(ref, "currency-strength-exit-2026-07-27-GBPUSD-") {
+		t.Fatalf("unexpected broker-discoverable exit reference: %q", ref)
 	}
 }
 
@@ -968,6 +1045,49 @@ func TestCurrencyStrengthRetainsPendingExitUntilTerminal(t *testing.T) {
 	}
 	if runner.state != nil || broker.calls != 1 {
 		t.Fatalf("terminal exit reconciliation failed: state=%+v calls=%d", runner.state, broker.calls)
+	}
+}
+
+func TestCurrencyStrengthCancelsWorkingExitBeforeAcceptingFlatSnapshot(t *testing.T) {
+	broker := &sequencedCurrencyStrengthExecutor{
+		statuses: []execution.OrderResult{
+			{BrokerOrderID: "EXIT-WORKING-FLAT", Status: "pending"},
+			{BrokerOrderID: "EXIT-WORKING-FLAT", Status: "pending"},
+			{BrokerOrderID: "EXIT-WORKING-FLAT", Status: "pending"},
+			{BrokerOrderID: "EXIT-WORKING-FLAT", Status: "cancelled"},
+		},
+		positions: [][]execution.Position{nil, nil},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:        broker,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		journal:       &captureCurrencyStrengthJournal{},
+		state: &currencyStrengthRunState{
+			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
+			Side:           "buy",
+			Quantity:       100000,
+			EntryStatus:    "filled",
+			EntryFilledQty: 100000,
+			ExitOrderID:    "EXIT-WORKING-FLAT",
+			ExitStatus:     "pending",
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID == "" || broker.cancels != 1 {
+		t.Fatalf("working exit was cleared before cancellation settled: state=%+v cancels=%d",
+			runner.state, broker.cancels)
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil || broker.cancels != 2 {
+		t.Fatalf("cancel-confirmed flat exit did not finalize: state=%+v cancels=%d",
+			runner.state, broker.cancels)
 	}
 }
 
@@ -1138,6 +1258,21 @@ func TestCurrencyStrengthMergePreservesLocalBrokerTruth(t *testing.T) {
 	}
 	if runner.entryRecorded {
 		t.Fatal("stale journal incorrectly cleared the dirty entry marker")
+	}
+
+	partial := &currencyStrengthRunState{
+		EntryStatus:    "partial",
+		EntryFillPrice: 1.101,
+		EntryFilledQty: 50000,
+		Quantity:       50000,
+	}
+	mergeCurrencyStrengthRunIntoState(partial, store.CurrencyStrengthRun{
+		EntryStatus:    "cancelled",
+		EntryFillPrice: 1.099,
+		EntryFilledQty: 25000,
+	})
+	if partial.EntryFillPrice != 1.101 || partial.EntryFilledQty != 50000 {
+		t.Fatalf("smaller terminal journal fill corrupted local economics: %+v", partial)
 	}
 }
 

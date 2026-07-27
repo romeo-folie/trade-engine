@@ -436,11 +436,13 @@ Modes:
 							return err
 						}
 						runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
-						runner.SetJournal(dbCurrencyStrengthJournal{})
+						if store.IsConnected() {
+							runner.SetJournal(dbCurrencyStrengthJournal{})
+						}
 						if tgBot != nil {
 							runner.SetNotifier(&orbTelegramNotifier{bot: tgBot})
 						}
-						if err := runner.loadState(); err != nil {
+						if err := loadCurrencyStrengthRecovery(runner); err != nil {
 							return err
 						}
 						active = append(active, "currency_strength")

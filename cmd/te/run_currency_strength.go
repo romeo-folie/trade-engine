@@ -164,6 +164,19 @@ func (r *currencyStrengthPaperRunner) SetJournal(j currencyStrengthJournal) {
 	r.journal = j
 }
 
+func loadCurrencyStrengthRecovery(r *currencyStrengthPaperRunner) error {
+	if err := r.loadState(); err != nil {
+		if r.journal == nil {
+			return err
+		}
+		// PostgreSQL is an independent recovery source. A corrupt/unreadable
+		// sidecar must not prevent it from restoring an active obligation.
+		logger.Warn("currency-strength: sidecar unavailable; falling back to journal recovery", "err", err)
+		r.state = nil
+	}
+	return nil
+}
+
 // notify sends a message through the configured notifier. No-op when unset;
 // a delivery error is logged and swallowed so notifications never abort the runner.
 func (r *currencyStrengthPaperRunner) notify(ctx context.Context, msg string) {
@@ -415,6 +428,11 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		side = execution.OrderSideSell
 	}
 	tradeID := fmt.Sprintf("currency-strength-%s-%s", dateKey, strings.ReplaceAll(decision.Signal.Symbol, "/", ""))
+	if adopted, adoptErr := r.adoptWorkingEntry(ctx, dateKey, *decision.Signal, tradeID); adoptErr != nil {
+		return adoptErr
+	} else if adopted {
+		return nil
+	}
 	result, err := r.broker.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:      decision.Signal.Symbol,
 		Side:        side,
@@ -452,6 +470,51 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		"strong", decision.Signal.Strong, "weak", decision.Signal.Weak, "gap", decision.Signal.Gap)
 	r.notify(ctx, buildCurrencyStrengthEntryMessage(*decision.Signal, r.cfg.Units, result.BrokerOrderID, result.Status))
 	return nil
+}
+
+func (r *currencyStrengthPaperRunner) adoptWorkingEntry(
+	ctx context.Context,
+	dateKey string,
+	signal currencystrength.Signal,
+	tradeID string,
+) (bool, error) {
+	lister, ok := r.broker.(execution.WorkingOrdersLister)
+	if !ok {
+		return false, nil
+	}
+	orders, err := lister.GetWorkingOrders(ctx)
+	if err != nil {
+		return false, fmt.Errorf("currency-strength list working entries: %w", err)
+	}
+	wantTicker := normalizeCurrencyStrengthTicker(signal.Symbol)
+	for _, order := range orders {
+		if order.TradeID != tradeID ||
+			normalizeCurrencyStrengthTicker(order.Ticker) != wantTicker ||
+			!strings.EqualFold(order.Side, signal.Side) {
+			continue
+		}
+		r.state = &currencyStrengthRunState{
+			Date:         dateKey,
+			Symbol:       signal.Symbol,
+			Side:         signal.Side,
+			Quantity:     float64(r.cfg.Units),
+			EntryOrderID: order.OrderID,
+			EntryStatus:  order.Status,
+			EnteredAt:    r.now().UTC().Format(time.RFC3339),
+			Strongest:    signal.Strong,
+			Weakest:      signal.Weak,
+			StrengthGap:  signal.Gap,
+		}
+		if persistErr := r.persistActiveEntryRecovery(ctx); persistErr != nil {
+			// In-memory ownership plus deterministic broker discovery still
+			// prevents a duplicate during this process and after restart.
+			logger.Warn("currency-strength: adopted entry recovery remains non-durable", "err", persistErr)
+		}
+		logger.Warn("currency-strength: adopted strategy-owned working entry during recovery",
+			"symbol", signal.Symbol, "order_id", order.OrderID, "trade_id", tradeID)
+		return true, nil
+	}
+	return false, nil
 }
 
 func (r *currencyStrengthPaperRunner) persistActiveEntryRecovery(ctx context.Context) error {
@@ -705,9 +768,10 @@ func (r *currencyStrengthPaperRunner) reserveExitTradeID() (string, error) {
 	r.state.ExitTradeID = fmt.Sprintf("%s-%d-%d",
 		r.exitTradeID(), r.now().UTC().UnixNano(), r.state.ExitAttempt)
 	if err := r.saveState(); err != nil {
-		r.state.ExitTradeID = ""
-		r.state.ExitAttempt--
-		return "", fmt.Errorf("persist currency-strength exit ownership reference: %w", err)
+		// The strategy-specific prefix remains discoverable through IBKR
+		// working orders and journal-restored state. Filesystem durability must
+		// not block exposure reduction.
+		logger.Warn("currency-strength: exit ownership sidecar unavailable; continuing with broker-discoverable reference", "err", err)
 	}
 	return r.state.ExitTradeID, nil
 }
@@ -1064,8 +1128,9 @@ func mergeCurrencyStrengthRunIntoState(
 	}
 	if run.EntryFillPrice > 0 &&
 		(state.EntryFillPrice <= 0 ||
-			remoteEntryRank > localEntryRank ||
-			run.EntryFilledQty > state.EntryFilledQty) {
+			(run.EntryFilledQty >= state.EntryFilledQty &&
+				(remoteEntryRank > localEntryRank ||
+					run.EntryFilledQty > state.EntryFilledQty))) {
 		state.EntryFillPrice = run.EntryFillPrice
 	}
 	if run.EntryFilledQty > state.EntryFilledQty {
@@ -1143,7 +1208,7 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 			if posErr != nil {
 				return fmt.Errorf("exit order status: %w (position check: %v)", err, posErr)
 			}
-			if pos == nil {
+			if pos == nil && errors.Is(err, execution.ErrOrderNotFound) {
 				status = "filled"
 				r.state.ExitStatus = status
 			} else {
@@ -1174,8 +1239,14 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	switch status {
 	case "pending", "partial":
 		if pos == nil {
-			r.state.ExitStatus = "filled"
-			status = "filled"
+			settled, settleErr := r.cancelFlatWorkingExit(ctx)
+			if settleErr != nil {
+				return settleErr
+			}
+			if !settled {
+				return nil
+			}
+			status = normalizeCurrencyStrengthOrderStatus(r.state.ExitStatus)
 		} else {
 			if err := r.recordExitJournal(ctx); err != nil {
 				logger.Warn("currency-strength: pending exit history sync failed; will retry", "err", err)
@@ -1238,6 +1309,55 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		return nil
 	}
 	return r.clearState()
+}
+
+func (r *currencyStrengthPaperRunner) cancelFlatWorkingExit(ctx context.Context) (bool, error) {
+	if err := r.broker.CancelOrder(ctx, r.state.ExitOrderID); err != nil &&
+		!errors.Is(err, execution.ErrOrderNotFound) {
+		return false, fmt.Errorf("cancel flat-account currency-strength exit remainder: %w", err)
+	}
+	result, err := r.broker.GetOrderStatus(ctx, r.state.ExitOrderID)
+	if err != nil {
+		if !errors.Is(err, execution.ErrOrderNotFound) {
+			return false, fmt.Errorf("confirm flat-account currency-strength exit cancellation: %w", err)
+		}
+		r.state.ExitStatus = "filled"
+		return true, nil
+	}
+	status := normalizeCurrencyStrengthOrderStatus(result.Status)
+	r.state.ExitStatus = status
+	if result.FilledPrice > 0 {
+		r.state.ExitFillPrice = result.FilledPrice
+	}
+	if result.FilledQty > 0 {
+		r.state.ExitFilledQty = result.FilledQty
+	}
+	switch status {
+	case "pending", "partial":
+		if err := r.saveState(); err != nil {
+			logger.Warn("currency-strength: failed to persist working flat-account exit", "err", err)
+		}
+		return false, nil
+	case "filled":
+		return true, nil
+	case "cancelled", "rejected":
+		r.capturePendingExitAudit()
+		if err := r.syncPendingExitAudit(ctx); err != nil {
+			logger.Warn("currency-strength: cancelled flat-account exit audit sync failed; will retry", "err", err)
+		}
+		r.state.ExitOrderID = "broker-flat"
+		r.state.ExitTradeID = ""
+		r.state.ExitStatus = "filled"
+		r.state.ExitFillPrice = 0
+		r.state.ExitFilledQty = 0
+		r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
+		if err := r.saveState(); err != nil {
+			logger.Warn("currency-strength: failed to persist broker-flat exit recovery", "err", err)
+		}
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) error {
