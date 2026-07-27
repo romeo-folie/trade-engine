@@ -307,3 +307,18 @@
   font-weight: 900;
   letter-spacing: 0.2em;
 }
+
+/* Active badge for work parked awaiting release (manual approval, or a
+   first-tick deferral). Not a failure like Blocked, and not healthy throughput
+   like the acid-green active badge — amber is the token palette's hold colour. */
+.feedBadgePending {
+  font-family: var(--font-mono);
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--amber);
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  border-radius: 2px;
+  padding: 2px 6px;
+  letter-spacing: 0.05em;
+}

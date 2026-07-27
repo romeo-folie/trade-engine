@@ -57,10 +57,22 @@ function getStageX(stage: number): number {
   return STAGE_ORIGIN_X + stage * STAGE_X;
 }
 
+/**
+ * Approximate rendered card height, used to centre a node on the spine and to
+ * anchor particle endpoints.
+ *
+ * These are calibrated against measured heights: a node whose estimate is too
+ * small is placed too low, because placement subtracts half the estimate but
+ * the browser lays out half the real height. risk_manager was the worst
+ * offender at 180 against a measured 222 — enough to drop Risk Controls ~20px
+ * below the queue and executor it is supposed to line up with.
+ */
 function estimatedNodeHeight(nodeId: string, kind: string): number {
-  if (nodeId === 'consensus' || nodeId === 'risk_manager') return 180;
-  if (nodeId === 'portfolio') return 240;
-  if (nodeId === 'executor') return 160;
+  // Renders one row per configured risk check, so it is the tallest card here.
+  if (nodeId === 'risk_manager') return 220;
+  if (nodeId === 'consensus') return 180;
+  if (nodeId === 'portfolio') return 205;
+  if (nodeId === 'executor') return 150;
   if (kind === 'execution' || kind === 'enricher' || kind === 'analyst' || kind === 'risk_specialist') return 180;
   return NODE_H;
 }
@@ -81,6 +93,20 @@ interface StagedNode {
 }
 
 /**
+ * Nodes lifted off the main spine by a fixed offset instead of being centred
+ * within their stage.
+ *
+ * `blocked_signals` is a terminal branch, not a step in the flow. Centring it
+ * alongside the pending queue pushed the queue below the spine, so the run of
+ * Risk Controls → queue → Executor no longer read as one horizontal line.
+ * Excluding it from the centring keeps the queue on the spine and hangs Blocked
+ * above it, matching how signals actually move.
+ */
+const OFF_SPINE_OFFSET: Record<string, number> = {
+  blocked_signals: -240,
+};
+
+/**
  * Lays nodes out in one vertical column per stage and returns an id → position
  * lookup.
  *
@@ -99,9 +125,22 @@ function computeStagePositions(items: StagedNode[]): Map<string, { x: number; y:
   }
 
   const positions = new Map<string, { x: number; y: number }>();
-  for (const [stage, group] of byStage) {
-    const groupGap = group.length > 2 ? 200 : 240;
+  for (const [stage, members] of byStage) {
     const x = getStageX(stage);
+
+    // Off-spine nodes are positioned relative to the centre line and take no
+    // part in centring the rest of the column.
+    const group = members.filter(item => OFF_SPINE_OFFSET[item.id] === undefined);
+    for (const item of members) {
+      const offset = OFF_SPINE_OFFSET[item.id];
+      if (offset === undefined) continue;
+      positions.set(item.id, {
+        x,
+        y: CY + offset - estimatedNodeHeight(item.id, item.kind) / 2,
+      });
+    }
+
+    const groupGap = group.length > 2 ? 200 : 240;
     group.forEach((item, groupIdx) => {
       const estimatedH = estimatedNodeHeight(item.id, item.kind);
       let y = CY - ((group.length - 1) * groupGap) / 2 + (groupIdx * groupGap) - (estimatedH / 2);

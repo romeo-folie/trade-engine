@@ -356,18 +356,32 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 	// leaving the approval queue, which drew manual approval as a dead end
 	// equal to Blocked. The queue now sits one stage ahead of the executor and
 	// keeps its outgoing edge; Blocked remains the leaf.
+	queueLabel, queueCaption, queueActiveLabel := queueNodeLabel(cfg)
 	nodes = append(nodes,
 		NodeState{ID: "risk_manager", Label: "Risk Controls", Kind: "synthesis", Stage: riskStage},
 		NodeState{ID: "blocked_signals", Label: "Blocked", Kind: "outcome", Stage: riskStage + 1},
-		NodeState{ID: "approvals", Label: "Approval Queue", Kind: "outcome", Stage: riskStage + 1},
+		NodeState{
+			ID: "approvals", Label: queueLabel, Kind: "outcome", Stage: riskStage + 1,
+			Meta: map[string]any{"caption": queueCaption, "active_label": queueActiveLabel},
+		},
 		NodeState{ID: "executor", Label: "Executor", Kind: "execution", Stage: riskStage + 2},
 		NodeState{ID: "portfolio", Label: "Portfolio", Kind: "execution", Stage: riskStage + 3},
 	)
+	// The direct risk → executor edge exists only where risk approval alone can
+	// execute. In manual mode every cleared signal is parked pending and reaches
+	// the executor solely through Engine.ApproveSignal, so drawing a direct edge
+	// would show a path that mode cannot take. In auto/paper the direct edge is
+	// the dominant path and the queue holds only first-tick-deferred BUYs, which
+	// processDeferredSignals later releases into the executor — both are real.
+	if !isManualMode(cfg) {
+		edges = append(edges,
+			PipelineEdge{ID: "e-risk-controls-executor", Source: "risk_manager", Target: "executor", Kind: "primary"},
+		)
+	}
 	edges = append(edges,
-		PipelineEdge{ID: "e-risk-controls-executor", Source: "risk_manager", Target: "executor", Kind: "primary"},
 		PipelineEdge{ID: "e-risk-controls-blocked", Source: "risk_manager", Target: "blocked_signals", Kind: "conditional"},
-		PipelineEdge{ID: "e-risk-controls-approvals", Source: "risk_manager", Target: "approvals", Kind: "conditional"},
-		PipelineEdge{ID: "e-approvals-executor", Source: "approvals", Target: "executor", Kind: "conditional"},
+		PipelineEdge{ID: "e-risk-controls-approvals", Source: "risk_manager", Target: "approvals", Kind: queueEntryKind(cfg)},
+		PipelineEdge{ID: "e-approvals-executor", Source: "approvals", Target: "executor", Kind: queueEntryKind(cfg)},
 		PipelineEdge{ID: "e-executor-portfolio", Source: "executor", Target: "portfolio", Kind: "primary"},
 	)
 
@@ -391,6 +405,48 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 		AnalysisMode: mode,
 		Edges:        edges,
 	}
+}
+
+// executionSourceNode reads the pipeline node an execution was released from,
+// as stamped by Engine.executeSignal. Returns "" for anything that is not a
+// trade payload or that executed straight off risk approval, leaving the
+// caller's default attribution in place.
+func executionSourceNode(payload any) string {
+	p, ok := payload.(events.TradeExecutedPayload)
+	if !ok {
+		return ""
+	}
+	return p.SourceNode
+}
+
+// isManualMode reports whether every risk-cleared signal must be approved by a
+// human before it can execute. Engine.generateSignal routes "auto" and "paper"
+// identically (execute unless first-tick-deferred); only "manual" parks every
+// signal pending.
+func isManualMode(cfg *appconfig.Config) bool {
+	return cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Engine.Mode), "manual")
+}
+
+// queueEntryKind describes how signals reach — and leave — the pending queue.
+// In manual mode that is the only route to the executor, so it is the primary
+// path; elsewhere it is the conditional first-tick deferral branch.
+func queueEntryKind(cfg *appconfig.Config) string {
+	if isManualMode(cfg) {
+		return "primary"
+	}
+	return "conditional"
+}
+
+// queueNodeLabel names the pending queue for what it actually holds, and gives
+// the card the wording for its populated state. Outside manual mode nothing is
+// awaiting human review — the queue holds first-tick deferred BUYs that
+// processDeferredSignals releases on the next tick. Resolving this server-side
+// keeps the mode rule in one place rather than restating it in the client.
+func queueNodeLabel(cfg *appconfig.Config) (label, caption, activeLabel string) {
+	if isManualMode(cfg) {
+		return "Approval Queue", "MANUAL REVIEW", "WAITING APPROVAL"
+	}
+	return "Pending Queue", "DEFERRED ENTRY", "AWAITING RELEASE"
 }
 
 func specialistNodeLabel(role string) string {

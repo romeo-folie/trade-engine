@@ -124,20 +124,29 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
         {d.kind === 'outcome' && (
           <div className={styles.sourceContent}>
             <div className={styles.subValue}>
-              {d.nodeId === 'approvals' ? 'MANUAL REVIEW' : 'RISK OUTCOME'}
+              {d.nodeId === 'approvals'
+                // Server-supplied: the queue holds signals awaiting a human in
+                // manual mode, but first-tick-deferred entries in auto/paper.
+                ? ((d.meta as Record<string, unknown> | undefined)?.caption as string | undefined) ?? 'PENDING'
+                : 'RISK OUTCOME'}
             </div>
             <div className={styles.metricValue}>
               {d.eventCount > 0 ? d.eventCount.toLocaleString() : '—'}
             </div>
             <div className={styles.feedStatusRow}>
-              {/* A live Blocked card means signals were rejected, so it takes the
-                  red badge rather than the acid green used for healthy activity. */}
+              {/* Neither risk outcome is healthy live activity, so neither takes
+                  the acid-green badge: Blocked is a rejection (red), and a
+                  populated queue is work parked awaiting release (amber). */}
               <span className={
                 !nodeActive ? styles.feedBadgeIdle
                   : d.nodeId === 'blocked_signals' ? styles.feedBadgeBlocked
-                    : styles.feedBadgeActive
+                    : d.nodeId === 'approvals' ? styles.feedBadgePending
+                      : styles.feedBadgeActive
               }>
-                {nodeActive ? (d.nodeId === 'approvals' ? 'WAITING APPROVAL' : 'BLOCKED') : 'IDLE'}
+                {!nodeActive ? 'IDLE'
+                  : d.nodeId === 'approvals'
+                    ? ((d.meta as Record<string, unknown> | undefined)?.active_label as string | undefined) ?? 'PENDING'
+                    : 'BLOCKED'}
               </span>
             </div>
           </div>
