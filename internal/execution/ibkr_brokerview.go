@@ -239,6 +239,7 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 		}
 		out = append(out, WorkingOrder{
 			OrderID:      o.OrderID.String(),
+			TradeID:      o.OrderRef,
 			Ticker:       ticker,
 			Conid:        conidStr,
 			Side:         side,
@@ -258,6 +259,7 @@ func (b *IBKRBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, erro
 // take-profit/stop-loss leg; both are 0 when the gateway omits them.
 type ibkrOrderRow struct {
 	OrderID      ibkrID    `json:"orderId"`
+	OrderRef     string    `json:"order_ref"`
 	Conid        int       `json:"conid"`
 	Ticker       string    `json:"ticker"`
 	Side         string    `json:"side"`   // "BUY" | "SELL" (sometimes "B" | "S")

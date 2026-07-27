@@ -167,6 +167,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		Qty       string `json:"qty"`
 		FilledQty string `json:"filled_qty"`
 		LimitPx   string `json:"limit_price"`
+		ClientID  string `json:"client_order_id"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/orders?status=open&nested=false&limit=500", nil, &resp); err != nil {
 		return nil, fmt.Errorf("alpaca GetWorkingOrders: %w", err)
@@ -178,6 +179,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 		px, _ := parseFloat(o.LimitPx)
 		out = append(out, WorkingOrder{
 			OrderID:      o.ID,
+			TradeID:      o.ClientID,
 			Ticker:       o.Symbol,
 			Side:         o.Side,
 			Status:       NormalizeOrderStatus(o.Status),

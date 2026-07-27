@@ -160,7 +160,7 @@ func RecordCurrencyStrengthExit(
 		UPDATE currency_strength_runs
 		SET status=CASE
 		        WHEN LOWER($3)='filled' THEN 'exited'
-		        WHEN LOWER($3) IN ('cancelled','rejected') THEN 'exit_failed'
+		        WHEN LOWER($3) IN ('cancelled','rejected','residual') THEN 'exit_failed'
 		        ELSE 'exit_submitted'
 		    END,
 		    exit_order_id=$2, exit_status=$3,

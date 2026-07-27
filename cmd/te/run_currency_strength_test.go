@@ -197,6 +197,7 @@ type captureCurrencyStrengthJournal struct {
 	exits       []store.CurrencyStrengthRun
 	failures    []string
 	exitErrors  int
+	entryErrors int
 	startErrors int
 	runs        map[string]*store.CurrencyStrengthRun
 }
@@ -222,6 +223,10 @@ func (j *captureCurrencyStrengthJournal) RecordNoSignal(_ context.Context, _ tim
 
 func (j *captureCurrencyStrengthJournal) RecordEntry(_ context.Context, run store.CurrencyStrengthRun) error {
 	j.entries = append(j.entries, run)
+	if j.entryErrors > 0 {
+		j.entryErrors--
+		return errors.New("temporary entry journal failure")
+	}
 	return nil
 }
 
@@ -330,6 +335,7 @@ type successfulCurrencyStrengthExecutor struct {
 	result             execution.OrderResult
 	statusResult       execution.OrderResult
 	positions          []execution.Position
+	requests           []execution.OrderRequest
 	calls              int
 	keepPositionOnFill bool
 }
@@ -339,12 +345,54 @@ type workingExitExecutor struct {
 	orders []execution.WorkingOrder
 }
 
+type sequencedCurrencyStrengthExecutor struct {
+	statuses  []execution.OrderResult
+	positions [][]execution.Position
+	requests  []execution.OrderRequest
+	cancels   int
+}
+
+func (f *sequencedCurrencyStrengthExecutor) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	f.requests = append(f.requests, req)
+	return execution.OrderResult{BrokerOrderID: "EXIT-SEQUENCED", Status: "pending"}, nil
+}
+
+func (f *sequencedCurrencyStrengthExecutor) CancelOrder(context.Context, string) error {
+	f.cancels++
+	return nil
+}
+
+func (f *sequencedCurrencyStrengthExecutor) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	if len(f.statuses) == 0 {
+		return execution.OrderResult{}, execution.ErrOrderNotFound
+	}
+	result := f.statuses[0]
+	f.statuses = f.statuses[1:]
+	return result, nil
+}
+
+func (f *sequencedCurrencyStrengthExecutor) GetPositions(context.Context) ([]execution.Position, error) {
+	if len(f.positions) == 0 {
+		return nil, nil
+	}
+	result := f.positions[0]
+	if len(f.positions) > 1 {
+		f.positions = f.positions[1:]
+	}
+	return result, nil
+}
+
+func (*sequencedCurrencyStrengthExecutor) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+
 func (f *workingExitExecutor) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
 	return f.orders, nil
 }
 
-func (f *successfulCurrencyStrengthExecutor) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+func (f *successfulCurrencyStrengthExecutor) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
 	f.calls++
+	f.requests = append(f.requests, req)
 	if normalizeCurrencyStrengthOrderStatus(f.result.Status) == "filled" &&
 		!f.keepPositionOnFill {
 		f.positions = nil
@@ -370,6 +418,113 @@ func (f *successfulCurrencyStrengthExecutor) GetPositions(context.Context) ([]ex
 
 func (*successfulCurrencyStrengthExecutor) GetAccount(context.Context) (execution.AccountInfo, error) {
 	return execution.AccountInfo{}, nil
+}
+
+func TestCurrencyStrengthCancelledEntryWithFillRetainsExposure(t *testing.T) {
+	broker := &sequencedCurrencyStrengthExecutor{
+		statuses: []execution.OrderResult{{
+			BrokerOrderID: "ENTRY-PARTIAL-CANCELLED",
+			Status:        "cancelled",
+			FilledPrice:   1.101,
+			FilledQty:     40000,
+		}},
+		positions: [][]execution.Position{{
+			{Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.101},
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:    broker,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date:         "2026-07-27",
+			Symbol:       "GBP/USD",
+			Side:         "buy",
+			Quantity:     100000,
+			EntryOrderID: "ENTRY-PARTIAL-CANCELLED",
+			EntryStatus:  "pending",
+		},
+	}
+	if err := runner.reconcileActiveEntry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.EntryStatus != "filled" ||
+		runner.state.EntryFilledQty != 40000 || runner.state.Quantity != 40000 {
+		t.Fatalf("cancelled partial fill lost broker exposure: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthWaitsForTerminalCancellationAndRefreshesExitSize(t *testing.T) {
+	broker := &sequencedCurrencyStrengthExecutor{
+		statuses: []execution.OrderResult{
+			{BrokerOrderID: "ENTRY-CANCEL", Status: "pending", FilledQty: 25000},
+			{BrokerOrderID: "ENTRY-CANCEL", Status: "cancelled", FilledQty: 40000},
+		},
+		positions: [][]execution.Position{
+			{{Ticker: "GBP/USD", Quantity: 25000, AvgCostBasis: 1.10}},
+			{{Ticker: "GBP/USD", Quantity: 25000, AvgCostBasis: 1.10}},
+			{{Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.10}},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:        broker,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date:         "2026-07-27",
+			Symbol:       "GBP/USD",
+			Side:         "buy",
+			Quantity:     100000,
+			EntryOrderID: "ENTRY-CANCEL",
+			EntryStatus:  "partial",
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.requests) != 0 {
+		t.Fatalf("exit submitted before cancellation became terminal: %+v", broker.requests)
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.requests) != 1 || broker.requests[0].Quantity != 40000 {
+		t.Fatalf("exit did not use refreshed post-cancel position: %+v", broker.requests)
+	}
+}
+
+func TestCurrencyStrengthJournalFailureDoesNotBlockPostCancelExit(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{entryErrors: 1}
+	broker := &sequencedCurrencyStrengthExecutor{
+		statuses: []execution.OrderResult{{
+			BrokerOrderID: "ENTRY-CANCEL", Status: "cancelled", FilledQty: 40000,
+		}},
+		positions: [][]execution.Position{
+			{{Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.10}},
+			{{Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.10}},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg:    config.CurrencyStrengthConfig{Units: 100000},
+		broker: broker, journal: journal,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date:         "2026-07-27",
+			Symbol:       "GBP/USD",
+			Side:         "buy",
+			Quantity:     100000,
+			EntryOrderID: "ENTRY-CANCEL",
+			EntryStatus:  "partial",
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.requests) != 1 {
+		t.Fatalf("journal outage prevented broker flatten: requests=%+v", broker.requests)
+	}
 }
 
 func TestCurrencyStrengthExitPersistsRealizedPnL(t *testing.T) {
@@ -581,6 +736,7 @@ func TestCurrencyStrengthAdoptsBrokerWorkingExitWhenDurabilityFailed(t *testing.
 		successfulCurrencyStrengthExecutor: base,
 		orders: []execution.WorkingOrder{{
 			OrderID:      "EXIT-WORKING",
+			TradeID:      "currency-strength-exit-2026-07-27-GBPUSD",
 			Ticker:       "GBP.USD",
 			Side:         "sell",
 			Status:       "pending",
@@ -610,6 +766,47 @@ func TestCurrencyStrengthAdoptsBrokerWorkingExitWhenDurabilityFailed(t *testing.
 	}
 	if runner.state != nil {
 		t.Fatalf("filled adopted exit did not clear state: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthDoesNotAdoptAnotherStrategysWorkingOrder(t *testing.T) {
+	base := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-OWNED",
+			Status:        "pending",
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+	}
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: base,
+		orders: []execution.WorkingOrder{{
+			OrderID:      "ORB-SELL",
+			TradeID:      "orb-GBP/USD-123",
+			Ticker:       "GBP/USD",
+			Side:         "sell",
+			Status:       "pending",
+			RemainingQty: 100000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:        broker,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
+			Side:           "buy",
+			Quantity:       100000,
+			EntryStatus:    "filled",
+			EntryFilledQty: 100000,
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if base.calls != 1 || runner.state.ExitOrderID != "EXIT-OWNED" {
+		t.Fatalf("foreign working order was adopted: calls=%d state=%+v", base.calls, runner.state)
 	}
 }
 
@@ -708,9 +905,70 @@ func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *te
 	if broker.calls != 2 || runner.state != nil {
 		t.Fatalf("residual flatten was not completed: calls=%d state=%+v", broker.calls, runner.state)
 	}
+	if broker.requests[0].TradeID == broker.requests[1].TradeID {
+		t.Fatalf("residual exits reused broker client order id %q", broker.requests[0].TradeID)
+	}
 	last := journal.exits[len(journal.exits)-1]
 	if last.RealizedPnL != nil {
 		t.Fatalf("multi-order exit published incomplete realized P&L: %+v", last)
+	}
+}
+
+func TestCurrencyStrengthResidualRetryProceedsWhileJournalIsDown(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-RESIDUAL",
+			Status:        "filled",
+			FilledQty:     50000,
+		},
+		positions:          []execution.Position{{Ticker: "GBP/USD", Quantity: 50000}},
+		keepPositionOnFill: true,
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:        broker,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
+			Side:           "buy",
+			EntryStatus:    "filled",
+			EntryFilledQty: 100000,
+		},
+		journal: journal,
+		now:     func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "" || !runner.state.ExitRetry ||
+		len(runner.state.PendingExitAudits) != 1 {
+		t.Fatalf("journal outage pinned terminal residual order: %+v", runner.state)
+	}
+	if err := runner.syncPendingExitAudit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.state.PendingExitAudits) != 0 {
+		t.Fatalf("durable audit snapshot was not retried: %+v", runner.state.PendingExitAudits)
+	}
+}
+
+func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
+	run := store.CurrencyStrengthRun{
+		SessionDate:    time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+		Status:         "exit_failed",
+		SignalSymbol:   "GBP/USD",
+		SignalSide:     "buy",
+		EntryStatus:    "filled",
+		EntryFilledQty: 100000,
+		ExitOrderID:    "EXIT-TERMINAL",
+		ExitStatus:     "residual",
+		ExitFilledQty:  50000,
+	}
+	state := currencyStrengthStateFromRun(run)
+	if state.ExitOrderID != "" || !state.ExitRetry {
+		t.Fatalf("terminal residual restored as working: %+v", state)
 	}
 }
 

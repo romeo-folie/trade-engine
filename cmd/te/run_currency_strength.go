@@ -29,24 +29,35 @@ type sessionNotifier interface {
 }
 
 type currencyStrengthRunState struct {
-	Date           string  `json:"date"`
-	Symbol         string  `json:"symbol"`
-	Side           string  `json:"side"`
-	Quantity       float64 `json:"quantity"`
-	EntryOrderID   string  `json:"entry_order_id"`
-	EntryStatus    string  `json:"entry_status"`
-	EntryFillPrice float64 `json:"entry_fill_price,omitempty"`
-	EntryFilledQty float64 `json:"entry_filled_qty,omitempty"`
-	EnteredAt      string  `json:"entered_at"`
-	Strongest      string  `json:"strongest,omitempty"`
-	Weakest        string  `json:"weakest,omitempty"`
-	StrengthGap    float64 `json:"strength_gap,omitempty"`
-	ExitOrderID    string  `json:"exit_order_id,omitempty"`
-	ExitStatus     string  `json:"exit_status,omitempty"`
-	ExitFillPrice  float64 `json:"exit_fill_price,omitempty"`
-	ExitFilledQty  float64 `json:"exit_filled_qty,omitempty"`
-	ExitedAt       string  `json:"exited_at,omitempty"`
-	ExitRetry      bool    `json:"exit_retry,omitempty"`
+	Date              string                      `json:"date"`
+	Symbol            string                      `json:"symbol"`
+	Side              string                      `json:"side"`
+	Quantity          float64                     `json:"quantity"`
+	EntryOrderID      string                      `json:"entry_order_id"`
+	EntryStatus       string                      `json:"entry_status"`
+	EntryFillPrice    float64                     `json:"entry_fill_price,omitempty"`
+	EntryFilledQty    float64                     `json:"entry_filled_qty,omitempty"`
+	EnteredAt         string                      `json:"entered_at"`
+	Strongest         string                      `json:"strongest,omitempty"`
+	Weakest           string                      `json:"weakest,omitempty"`
+	StrengthGap       float64                     `json:"strength_gap,omitempty"`
+	ExitOrderID       string                      `json:"exit_order_id,omitempty"`
+	ExitTradeID       string                      `json:"exit_trade_id,omitempty"`
+	ExitAttempt       int                         `json:"exit_attempt,omitempty"`
+	ExitStatus        string                      `json:"exit_status,omitempty"`
+	ExitFillPrice     float64                     `json:"exit_fill_price,omitempty"`
+	ExitFilledQty     float64                     `json:"exit_filled_qty,omitempty"`
+	ExitedAt          string                      `json:"exited_at,omitempty"`
+	ExitRetry         bool                        `json:"exit_retry,omitempty"`
+	PendingExitAudits []currencyStrengthExitAudit `json:"pending_exit_audits,omitempty"`
+}
+
+type currencyStrengthExitAudit struct {
+	OrderID   string  `json:"order_id"`
+	Status    string  `json:"status"`
+	FillPrice float64 `json:"fill_price,omitempty"`
+	FilledQty float64 `json:"filled_qty,omitempty"`
+	ExitedAt  string  `json:"exited_at,omitempty"`
 }
 
 // currencyStrengthJournal is the strategy's durable audit seam. Production
@@ -447,6 +458,11 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if r.state == nil {
 		return nil
 	}
+	if err := r.syncPendingExitAudit(ctx); err != nil {
+		// Audit retry is independent of broker-truth risk management. Retain
+		// the durable snapshot and continue flattening any live exposure.
+		logger.Warn("currency-strength: prior exit audit sync failed; continuing broker exit", "err", err)
+	}
 	// A prior iteration already submitted the flatten order and persisted its
 	// acknowledgement in the sidecar. Retry only the DB journal write; never
 	// place a second exit.
@@ -466,20 +482,14 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		// remained unfilled, or a prior unrecorded flatten may already have made
 		// the broker flat.
 		entryStatus := normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus)
-		if entryStatus == "pending" &&
+		if (entryStatus == "pending" || entryStatus == "partial") &&
 			r.state.EntryOrderID != "" {
-			cancelErr := r.broker.CancelOrder(ctx, r.state.EntryOrderID)
-			cancelConfirmed := cancelErr == nil
-			if cancelErr != nil {
-				if !errors.Is(cancelErr, execution.ErrOrderNotFound) {
-					return fmt.Errorf("cancel unfilled currency-strength entry: %w", cancelErr)
-				}
-				statusResult, statusErr := r.broker.GetOrderStatus(ctx, r.state.EntryOrderID)
-				if statusErr != nil {
-					return fmt.Errorf("confirm vanished entry order before clearing state: %w", statusErr)
-				}
-				entryStatus = normalizeCurrencyStrengthOrderStatus(statusResult.Status)
-				cancelConfirmed = entryStatus == "cancelled" || entryStatus == "rejected"
+			settled, settleErr := r.cancelAndSettleEntry(ctx)
+			if settleErr != nil {
+				return settleErr
+			}
+			if !settled {
+				return nil
 			}
 			// Close the cancel/fill race before discarding recovery state.
 			// A market entry can fill between the first position snapshot and
@@ -490,14 +500,16 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 				return positionErr
 			}
 			if pos == nil {
-				if !cancelConfirmed {
-					return fmt.Errorf("entry order %s is %s but no broker position is visible; retaining recovery state",
-						r.state.EntryOrderID, entryStatus)
+				entryStatus = normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus)
+				if entryStatus == "filled" || r.state.EntryFilledQty > 0 {
+					logger.Warn("currency-strength: terminal entry has fills but broker position is not visible; retaining recovery state",
+						"order_id", r.state.EntryOrderID, "status", entryStatus,
+						"filled_qty", r.state.EntryFilledQty)
+					return nil
 				}
-				r.state.EntryStatus = "cancelled"
 				r.entryRecorded = false
 				if err := r.syncActiveEntryJournal(ctx); err != nil {
-					return err
+					logger.Warn("currency-strength: cancelled entry history sync failed; clearing broker-flat state", "err", err)
 				}
 				return r.clearState()
 			}
@@ -510,12 +522,8 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 				return err
 			}
 			if err := r.syncActiveEntryJournal(ctx); err != nil {
-				return err
+				logger.Warn("currency-strength: filled entry history sync failed; continuing broker exit", "err", err)
 			}
-		}
-		if pos == nil && entryStatus == "partial" {
-			return fmt.Errorf("currency-strength partial entry %s has no visible broker position; refusing blind flatten",
-				r.state.EntryOrderID)
 		}
 		if pos == nil {
 			r.state.ExitOrderID = "broker-flat"
@@ -532,9 +540,27 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		r.state.EntryOrderID != "" {
 		// Freeze the entry quantity before flattening so an unfilled remainder
 		// cannot execute after the exit and recreate exposure.
-		if err := r.broker.CancelOrder(ctx, r.state.EntryOrderID); err != nil &&
-			!errors.Is(err, execution.ErrOrderNotFound) {
-			return fmt.Errorf("cancel currency-strength entry remainder: %w", err)
+		settled, err := r.cancelAndSettleEntry(ctx)
+		if err != nil {
+			return err
+		}
+		if !settled {
+			return nil
+		}
+		// Cancellation acceptance is not cancellation completion at IBKR.
+		// Refresh broker truth only after the order reaches a terminal state.
+		pos, err = r.positionFor(ctx, r.state.Symbol)
+		if err != nil {
+			return err
+		}
+		if pos == nil {
+			r.state.ExitOrderID = "broker-flat"
+			r.state.ExitStatus = "filled"
+			r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
+			if err := r.saveState(); err != nil {
+				logger.Warn("currency-strength: failed to persist broker-flat recovery", "err", err)
+			}
+			return r.finalizeExitedState(ctx)
 		}
 		r.state.EntryStatus = "filled"
 		r.state.EntryFillPrice = pos.AvgCostBasis
@@ -545,7 +571,7 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 			return fmt.Errorf("persist finalized entry quantity: %w", err)
 		}
 		if err := r.syncActiveEntryJournal(ctx); err != nil {
-			return err
+			logger.Warn("currency-strength: finalized entry history sync failed; continuing broker exit", "err", err)
 		}
 	}
 	qty := math.Abs(pos.Quantity)
@@ -564,6 +590,10 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		return r.finalizeExitedState(ctx)
 	}
 
+	exitTradeID, err := r.reserveExitTradeID()
+	if err != nil {
+		return err
+	}
 	result, err := r.broker.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:      r.state.Symbol,
 		Side:        exitSide,
@@ -571,7 +601,7 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		Quantity:    qty,
 		TimeInForce: "day",
 		SecType:     "CASH",
-		TradeID:     fmt.Sprintf("currency-strength-exit-%s-%s", r.state.Date, strings.ReplaceAll(r.state.Symbol, "/", "")),
+		TradeID:     exitTradeID,
 	})
 	if err != nil {
 		return fmt.Errorf("currency-strength place paper exit %s qty %.2f: %w", r.state.Symbol, qty, err)
@@ -608,9 +638,11 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 		return false, fmt.Errorf("currency-strength list working exits: %w", err)
 	}
 	wantTicker := normalizeCurrencyStrengthTicker(r.state.Symbol)
+	wantTradeID := r.exitTradeID()
 	for _, order := range orders {
 		if normalizeCurrencyStrengthTicker(order.Ticker) != wantTicker ||
-			!strings.EqualFold(order.Side, string(exitSide)) {
+			!strings.EqualFold(order.Side, string(exitSide)) ||
+			order.TradeID != wantTradeID {
 			continue
 		}
 		r.state.ExitOrderID = order.OrderID
@@ -624,6 +656,66 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 		return true, nil
 	}
 	return false, nil
+}
+
+func (r *currencyStrengthPaperRunner) exitTradeID() string {
+	if r.state.ExitTradeID != "" {
+		return r.state.ExitTradeID
+	}
+	return fmt.Sprintf("currency-strength-exit-%s-%s",
+		r.state.Date, strings.ReplaceAll(r.state.Symbol, "/", ""))
+}
+
+func (r *currencyStrengthPaperRunner) reserveExitTradeID() (string, error) {
+	if r.state.ExitTradeID != "" {
+		return r.state.ExitTradeID, nil
+	}
+	r.state.ExitAttempt++
+	r.state.ExitTradeID = fmt.Sprintf("%s-%d-%d",
+		r.exitTradeID(), r.now().UTC().UnixNano(), r.state.ExitAttempt)
+	if err := r.saveState(); err != nil {
+		r.state.ExitTradeID = ""
+		r.state.ExitAttempt--
+		return "", fmt.Errorf("persist currency-strength exit ownership reference: %w", err)
+	}
+	return r.state.ExitTradeID, nil
+}
+
+// cancelAndSettleEntry requests cancellation and observes the order until the
+// broker reports a terminal state. A successful cancellation HTTP response is
+// only an acknowledgement at IBKR, so callers must defer flatten sizing until
+// this returns settled=true on a later reconciliation tick.
+func (r *currencyStrengthPaperRunner) cancelAndSettleEntry(ctx context.Context) (bool, error) {
+	if err := r.broker.CancelOrder(ctx, r.state.EntryOrderID); err != nil &&
+		!errors.Is(err, execution.ErrOrderNotFound) {
+		return false, fmt.Errorf("cancel currency-strength entry remainder: %w", err)
+	}
+	result, err := r.broker.GetOrderStatus(ctx, r.state.EntryOrderID)
+	if err != nil {
+		if errors.Is(err, execution.ErrOrderNotFound) {
+			// A purged order is no longer working. Broker position truth,
+			// refreshed by the caller, determines whether anything filled.
+			return true, nil
+		}
+		return false, fmt.Errorf("confirm currency-strength entry cancellation: %w", err)
+	}
+	r.state.EntryStatus = normalizeCurrencyStrengthOrderStatus(result.Status)
+	if result.FilledPrice > 0 {
+		r.state.EntryFillPrice = result.FilledPrice
+	}
+	if result.FilledQty > 0 {
+		r.state.EntryFilledQty = result.FilledQty
+	}
+	r.entryRecorded = false
+	if err := r.saveState(); err != nil {
+		return false, fmt.Errorf("persist currency-strength entry cancellation status: %w", err)
+	}
+	switch r.state.EntryStatus {
+	case "filled", "cancelled", "rejected":
+		return true, nil
+	default:
+		return false, nil
+	}
 }
 
 func normalizeCurrencyStrengthTicker(raw string) string {
@@ -754,6 +846,26 @@ func (r *currencyStrengthPaperRunner) reconcileActiveEntry(ctx context.Context) 
 	switch r.state.EntryStatus {
 	case "cancelled", "rejected":
 		r.decisionDoneFor = r.state.Date
+		pos, posErr := r.positionFor(ctx, r.state.Symbol)
+		if posErr != nil {
+			return posErr
+		}
+		if pos != nil {
+			// A cancelled/rejected order can still contain an earlier partial
+			// fill. Preserve that broker-truth exposure so the scheduled exit
+			// remains responsible for flattening it.
+			r.state.EntryStatus = "filled"
+			r.state.EntryFillPrice = pos.AvgCostBasis
+			r.state.EntryFilledQty = math.Abs(pos.Quantity)
+			r.state.Quantity = math.Abs(pos.Quantity)
+			if err := r.saveState(); err != nil {
+				return err
+			}
+			if err := r.syncActiveEntryJournal(ctx); err != nil {
+				logger.Warn("currency-strength: partially-filled cancelled entry history sync failed; retaining exposure", "err", err)
+			}
+			return nil
+		}
 		if err := r.syncActiveEntryJournal(ctx); err != nil {
 			return err
 		}
@@ -851,6 +963,17 @@ func currencyStrengthStateFromRun(run store.CurrencyStrengthRun) *currencyStreng
 	if state.EntryFilledQty > 0 {
 		state.Quantity = state.EntryFilledQty
 	}
+	if strings.EqualFold(run.ExitStatus, "residual") {
+		// The recorded order is terminal; its fill left broker exposure.
+		// Restore the strategy's obligation to submit another flatten, not the
+		// old order as though it were still working.
+		state.ExitOrderID = ""
+		state.ExitStatus = ""
+		state.ExitFillPrice = 0
+		state.ExitFilledQty = 0
+		state.ExitedAt = ""
+		state.ExitRetry = true
+	}
 	return state
 }
 
@@ -875,7 +998,8 @@ func mergeCurrencyStrengthRunIntoState(
 		state.Quantity = run.EntryFilledQty
 	}
 	if run.ExitOrderID != "" &&
-		(run.Status == "exit_submitted" || run.Status == "exited") {
+		(run.Status == "exit_submitted" || run.Status == "exited") &&
+		!(state.ExitRetry && normalizeCurrencyStrengthOrderStatus(run.ExitStatus) == "partial") {
 		state.ExitOrderID = run.ExitOrderID
 		state.ExitStatus = run.ExitStatus
 		state.ExitFillPrice = run.ExitFillPrice
@@ -943,11 +1067,12 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 			r.state.ExitStatus = "filled"
 			status = "filled"
 		} else {
-			if err := r.recordExitJournal(ctx); err != nil {
+			r.capturePendingExitAudit()
+			if err := r.syncPendingExitAudit(ctx); err != nil {
 				logger.Warn("currency-strength: failed exit history sync; will retry", "err", err)
-				return nil
 			}
 			r.state.ExitOrderID = ""
+			r.state.ExitTradeID = ""
 			r.state.ExitStatus = ""
 			r.state.ExitFillPrice = 0
 			r.state.ExitFilledQty = 0
@@ -962,12 +1087,13 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 			// The order is terminal but residual exposure remains. Journal the
 			// partial outcome, then release this order ID so the next tick
 			// submits a new flatten for broker-truth remaining quantity.
-			r.state.ExitStatus = "partial"
-			if err := r.recordExitJournal(ctx); err != nil {
+			r.state.ExitStatus = "residual"
+			r.capturePendingExitAudit()
+			if err := r.syncPendingExitAudit(ctx); err != nil {
 				logger.Warn("currency-strength: residual exit history sync failed; will retry", "err", err)
-				return nil
 			}
 			r.state.ExitOrderID = ""
+			r.state.ExitTradeID = ""
 			r.state.ExitStatus = ""
 			r.state.ExitFillPrice = 0
 			r.state.ExitFilledQty = 0
@@ -983,6 +1109,10 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	if status != "filled" {
 		return nil
 	}
+	if err := r.syncPendingExitAudit(ctx); err != nil {
+		logger.Warn("currency-strength: prior exit audit sync failed; retaining terminal state", "err", err)
+		return nil
+	}
 	if err := r.recordExitJournal(ctx); err != nil {
 		logger.Warn("currency-strength: terminal exit history sync failed; will retry", "err", err)
 		return nil
@@ -994,16 +1124,6 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 	if r.journal == nil {
 		return nil
 	}
-	if !r.entryRecorded {
-		if err := r.syncActiveEntryJournal(ctx); err != nil {
-			return fmt.Errorf("entry history sync before exit: %w", err)
-		}
-	}
-	sessionDate, err := time.Parse("2006-01-02", r.state.Date)
-	if err != nil {
-		return fmt.Errorf("parse state date %q: %w", r.state.Date, err)
-	}
-	exitedAt, _ := time.Parse(time.RFC3339, r.state.ExitedAt)
 	var realizedPnL *float64
 	if normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus) == "filled" &&
 		normalizeCurrencyStrengthOrderStatus(r.state.ExitStatus) == "filled" &&
@@ -1018,12 +1138,62 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 			realizedPnL = &pnl
 		}
 	}
+	return r.writeExitJournal(ctx, currencyStrengthExitAudit{
+		OrderID:   r.state.ExitOrderID,
+		Status:    r.state.ExitStatus,
+		FillPrice: r.state.ExitFillPrice,
+		FilledQty: r.state.ExitFilledQty,
+		ExitedAt:  r.state.ExitedAt,
+	}, realizedPnL)
+}
+
+func (r *currencyStrengthPaperRunner) capturePendingExitAudit() {
+	r.state.PendingExitAudits = append(r.state.PendingExitAudits, currencyStrengthExitAudit{
+		OrderID:   r.state.ExitOrderID,
+		Status:    r.state.ExitStatus,
+		FillPrice: r.state.ExitFillPrice,
+		FilledQty: r.state.ExitFilledQty,
+		ExitedAt:  r.state.ExitedAt,
+	})
+}
+
+func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) error {
+	if r.state == nil || len(r.state.PendingExitAudits) == 0 {
+		return nil
+	}
+	for len(r.state.PendingExitAudits) > 0 {
+		if err := r.writeExitJournal(ctx, r.state.PendingExitAudits[0], nil); err != nil {
+			return err
+		}
+		r.state.PendingExitAudits = r.state.PendingExitAudits[1:]
+	}
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) writeExitJournal(
+	ctx context.Context,
+	audit currencyStrengthExitAudit,
+	realizedPnL *float64,
+) error {
+	if r.journal == nil {
+		return nil
+	}
+	if !r.entryRecorded {
+		if err := r.syncActiveEntryJournal(ctx); err != nil {
+			return fmt.Errorf("entry history sync before exit: %w", err)
+		}
+	}
+	sessionDate, err := time.Parse("2006-01-02", r.state.Date)
+	if err != nil {
+		return fmt.Errorf("parse state date %q: %w", r.state.Date, err)
+	}
+	exitedAt, _ := time.Parse(time.RFC3339, audit.ExitedAt)
 	return r.journal.RecordExit(ctx, store.CurrencyStrengthRun{
 		SessionDate:   sessionDate,
-		ExitOrderID:   r.state.ExitOrderID,
-		ExitStatus:    r.state.ExitStatus,
-		ExitFillPrice: r.state.ExitFillPrice,
-		ExitFilledQty: r.state.ExitFilledQty,
+		ExitOrderID:   audit.OrderID,
+		ExitStatus:    audit.Status,
+		ExitFillPrice: audit.FillPrice,
+		ExitFilledQty: audit.FilledQty,
 		ExitedAt:      optionalTime(exitedAt),
 		RealizedPnL:   realizedPnL,
 	})
