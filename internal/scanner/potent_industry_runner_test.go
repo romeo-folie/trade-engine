@@ -208,6 +208,53 @@ func TestPotentIndustryRunnerCompletesObservationAtExactBoundary(t *testing.T) {
 	}
 }
 
+func TestPotentIndustryRunnerReusesMarketHistoryAsGroupBenchmark(t *testing.T) {
+	target, _, decisionAt := potentTestTimes()
+	session := potentTestSession(target)
+	cfg := potentRunnerConfig()
+	cfg.SectorBenchmarks["Technology"] = "SPY"
+	members := potentTestMembers(
+		decisionAt, "Software", "Technology",
+		[]float64{2000, 1500, 1000, 800, 600},
+	)
+	bars := potentRunnerHistory(target, members, "SPY", "XLK")
+	provider := &fakePotentIndustryProvider{result: data.DailyBarsBatchResult{
+		Bars: bars, Failures: map[string]error{},
+	}}
+	repository := &fakePotentIndustryRepository{
+		universe: &store.SwingUniverseVersion{
+			ID: "universe-1", Provider: "fixture", AsOf: decisionAt.Add(-time.Hour),
+		},
+		members: members,
+		claim: &store.IndustryRotationRun{
+			ID: "rotation-1", Status: "running", AttemptCount: 1,
+		},
+		claimed: true,
+	}
+	runner := PotentIndustryRunner{
+		Provider: provider, Cfg: cfg, Repository: repository,
+		Now: func() time.Time {
+			return decisionAt.Add(time.Minute)
+		},
+	}
+	if err := runner.RunSession(context.Background(), session, decisionAt); err != nil {
+		t.Fatal(err)
+	}
+	if len(repository.completeGroups) != 1 {
+		t.Fatalf("completed groups = %+v", repository.completeGroups)
+	}
+	group := repository.completeGroups[0]
+	if group.Benchmark != "SPY" || group.FailureStage == "sector_benchmark" ||
+		group.Outcome == "failed" {
+		t.Fatalf("market history was not reused as group benchmark: %+v", group)
+	}
+	if !slices.Contains(provider.symbols, "SPY") ||
+		slices.Contains(provider.symbols, "XLK") {
+		t.Fatalf("market/group benchmark request was not deduplicated: %v",
+			provider.symbols)
+	}
+}
+
 func TestPotentIndustryRunnerMarketFailureFailsClaimedRun(t *testing.T) {
 	target, _, decisionAt := potentTestTimes()
 	session := potentTestSession(target)

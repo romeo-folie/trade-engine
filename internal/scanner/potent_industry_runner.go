@@ -202,9 +202,6 @@ func (r *PotentIndustryRunner) RunSession(
 	scoringBars := potentIndustryHistoryWithoutFailures(history.Bars, history.Failures)
 	benchmarkHistories := make(map[string][]data.Candle)
 	for _, symbol := range benchmarkSymbols {
-		if symbol == marketBenchmark {
-			continue
-		}
 		benchmarkHistories[symbol] = potentHistoryBars(scoringBars, symbol)
 	}
 	evaluation := EvaluatePotentIndustries(
