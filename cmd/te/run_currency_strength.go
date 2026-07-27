@@ -1020,9 +1020,7 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	r.state.ExitStatus = result.Status
 	r.state.ExitFillPrice = result.FilledPrice
 	r.state.ExitFilledQty = result.FilledQty
-	if normalizeCurrencyStrengthOrderStatus(result.Status) == "filled" {
-		r.state.ExitFillTimeQty = result.FilledQty
-	}
+	r.state.ExitFillTimeQty = 0
 	r.state.ExitedAt = exitedAt.Format(time.RFC3339)
 	if err := r.saveState(); err != nil {
 		// Keep the in-memory exit acknowledgement so this process still cannot
@@ -1123,9 +1121,6 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	ctx context.Context,
 	exitSide execution.OrderSide,
 ) (bool, error) {
-	if r.state.ExitRetry && r.state.ExitTradeID == "" {
-		return false, nil
-	}
 	lister, ok := r.broker.(execution.WorkingOrdersLister)
 	if !ok {
 		return false, nil
@@ -1137,27 +1132,41 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	wantTicker := normalizeCurrencyStrengthTicker(r.state.Symbol)
 	wantTradeID := r.exitTradeID()
 	baseTradeID := r.baseExitTradeID()
+	var matched *execution.WorkingOrder
 	for _, order := range orders {
 		if normalizeCurrencyStrengthTicker(order.Ticker) != wantTicker ||
 			!strings.EqualFold(order.Side, string(exitSide)) ||
 			!currencyStrengthExitReferenceMatches(order.TradeID, wantTradeID, baseTradeID, r.state.ExitTradeID != "") {
 			continue
 		}
-		r.state.ExitOrderID = order.OrderID
-		r.state.ExitStatus = "pending"
-		r.state.ExitFillTimeQty = 0
-		if r.state.ExitRequestedQty <= 0 {
-			r.state.ExitRequestedQty = r.state.Quantity
+		if matched != nil &&
+			(matched.OrderID != order.OrderID || matched.TradeID != order.TradeID) {
+			return false, fmt.Errorf(
+				"currency-strength working exit prefix %q maps to multiple broker orders",
+				baseTradeID,
+			)
 		}
-		r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
-		if err := r.saveState(); err != nil {
-			logger.Warn("currency-strength: failed to persist adopted working exit", "err", err)
-		}
-		logger.Warn("currency-strength: adopted broker working exit during recovery",
-			"symbol", r.state.Symbol, "order_id", order.OrderID)
-		return true, nil
+		candidate := order
+		matched = &candidate
 	}
-	return false, nil
+	if matched == nil {
+		return false, nil
+	}
+	r.state.ExitOrderID = matched.OrderID
+	r.state.ExitTradeID = matched.TradeID
+	r.state.ExitStatus = "pending"
+	r.state.ExitFillTimeQty = 0
+	if r.state.ExitRequestedQty <= 0 {
+		r.state.ExitRequestedQty = r.state.Quantity
+	}
+	r.state.ExitedAt = r.currencyStrengthNow().UTC().Format(time.RFC3339)
+	if err := r.saveState(); err != nil {
+		logger.Warn("currency-strength: failed to persist adopted working exit", "err", err)
+	}
+	logger.Warn("currency-strength: adopted broker working exit during recovery",
+		"symbol", r.state.Symbol, "order_id", matched.OrderID,
+		"trade_id", matched.TradeID)
+	return true, nil
 }
 
 func (r *currencyStrengthPaperRunner) exitTradeID() string {
@@ -1719,23 +1728,19 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		}
 	case "filled":
 		if pos != nil {
-			provenPartial := r.state.ExitRequestedQty > 0 &&
-				r.state.ExitFilledQty+1e-6 < r.state.ExitRequestedQty
-			if !provenPartial {
-				now := r.currencyStrengthNow().UTC()
-				observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
-				if observedAt.IsZero() {
-					r.state.ExitFillObserved = now.Format(time.RFC3339)
-					if err := r.saveState(); err != nil {
-						return fmt.Errorf("persist currency-strength fill propagation guard: %w", err)
-					}
-					logger.Info("currency-strength: filled exit awaiting portfolio propagation",
-						"order_id", r.state.ExitOrderID, "position_qty", pos.Quantity)
-					return nil
+			now := r.currencyStrengthNow().UTC()
+			observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
+			if observedAt.IsZero() {
+				r.state.ExitFillObserved = now.Format(time.RFC3339)
+				if err := r.saveState(); err != nil {
+					return fmt.Errorf("persist currency-strength fill propagation guard: %w", err)
 				}
-				if now.Sub(observedAt) < currencyStrengthPortfolioPropagationGrace {
-					return nil
-				}
+				logger.Info("currency-strength: filled exit awaiting portfolio propagation",
+					"order_id", r.state.ExitOrderID, "position_qty", pos.Quantity)
+				return nil
+			}
+			if now.Sub(observedAt) < currencyStrengthPortfolioPropagationGrace {
+				return nil
 			}
 			// The order is terminal but residual exposure remains. Journal the
 			// partial outcome, then release this order ID so the next tick
