@@ -99,7 +99,7 @@ const MAX_VERDICT_HISTORY = 50; // per analyst and for consensus
 const RATE_WINDOW_MS = 5000;
 
 export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocketState {
-  const url = opts.url ?? buildWsUrl();
+  const url = opts.url ?? DEFAULT_WS_URL;
   const reconnectDelay = opts.reconnectDelayMs ?? 3000;
 
   const [status, setStatus] = useState<ConnectionStatus>('connecting');
@@ -459,3 +459,8 @@ function buildWsUrl(): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   return `${proto}//${window.location.host}/ws`;
 }
+
+// Resolved once at module load — the location cannot change without a document
+// reload, and recomputing it per render put a string allocation in the path of
+// every engine event.
+const DEFAULT_WS_URL = buildWsUrl();
