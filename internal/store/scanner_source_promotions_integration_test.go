@@ -200,4 +200,60 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 		t.Fatalf("claims not completed together: weekly=%s industry=%s",
 			weeklyStatus, industryStatus)
 	}
+
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE weekly_leader_qualifications
+		SET promotion_status='processing', promotion_claim_token='weekly-fallback',
+		    promotion_claimed_at=$3
+		WHERE run_id=$1 AND ticker=$2`,
+		weeklyRun.ID, ticker, base.Add(25*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE industry_rotation_members
+		SET promotion_status='processing', promotion_claim_token='industry-fallback',
+		    promotion_claimed_at=$5
+		WHERE run_id=$1 AND group_type=$2 AND group_key=$3 AND ticker=$4`,
+		industryRun.ID, "industry", "Software", ticker, base.Add(25*time.Minute),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE watchlist
+		SET strategies=ARRAY['newer_worker'], min_confidence=.99
+		WHERE ticker=$1 AND platform='stock'`, ticker,
+	); err != nil {
+		t.Fatal(err)
+	}
+	claims.WeeklyLeader.Token = "weekly-fallback"
+	claims.PotentIndustry.Token = "industry-fallback"
+	err = store.PromoteScannerSourcesToWatchlistUnlessActive(
+		ctx, item, claims, "fallback must preserve active row", base.Add(26*time.Minute),
+	)
+	if !errors.Is(err, store.ErrWatchlistActiveItemExists) {
+		t.Fatalf("active-row fallback race = %v", err)
+	}
+	var strategies []string
+	var confidence float64
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT w.strategies, w.min_confidence, q.promotion_status,
+		       i.promotion_status
+		FROM watchlist w
+		JOIN weekly_leader_qualifications q ON q.ticker=w.ticker
+		JOIN industry_rotation_members i ON i.ticker=w.ticker
+		WHERE w.ticker=$1 AND w.platform='stock'
+		  AND q.run_id=$2 AND i.run_id=$3`,
+		ticker, weeklyRun.ID, industryRun.ID,
+	).Scan(&strategies, &confidence, &weeklyStatus, &industryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if len(strategies) != 1 || strategies[0] != "newer_worker" ||
+		confidence != .99 || weeklyStatus != "active_watchlist" ||
+		industryStatus != "active_watchlist" {
+		t.Fatalf(
+			"fallback overwrote active row or stranded claims: strategies=%v confidence=%v weekly=%s industry=%s",
+			strategies, confidence, weeklyStatus, industryStatus,
+		)
+	}
 }

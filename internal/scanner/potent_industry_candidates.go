@@ -180,6 +180,15 @@ func candidateAfterPromotionClaimLoss(
 			fallback.WeeklyLeaderEvidence = ""
 			fallback.weeklyLeaderFallback = nil
 			fallback.potentIndustrySource = nil
+			fallback.potentIndustryFallback = nil
+			if candidate.potentIndustryFallback != nil {
+				ordinary, ordinaryOK := ordinaryCandidateAfterWeeklyClaimLoss(
+					*candidate.potentIndustryFallback,
+				)
+				if ordinaryOK {
+					fallback.potentIndustryFallback = &ordinary
+				}
+			}
 			return fallback, len(fallback.Sources) > 0
 		}
 		return ordinaryCandidateAfterWeeklyClaimLoss(candidate)
@@ -314,7 +323,7 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil {
 		return store.AddWatchlistItemUnlessActive(ctx, item)
 	}
-	return store.PromoteScannerSourcesToWatchlist(
+	return store.PromoteScannerSourcesToWatchlistUnlessActive(
 		ctx, item, claims,
 		"remaining source passed conviction after another source claim was lost",
 		s.now(),

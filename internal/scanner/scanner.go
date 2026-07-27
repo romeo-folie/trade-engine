@@ -357,74 +357,82 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			PullbackRequalificationComplete: sc.candidate.PullbackQualificationKnown,
 		}
 		addErr := s.promoteDiscoveryCandidate(ctx, item, sc.candidate)
-		if errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
+		skipCandidate := false
+		for errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 			var claimErr *store.ScannerSourcePromotionClaimError
 			source := ""
 			if errors.As(addErr, &claimErr) {
 				source = claimErr.Source
 			}
 			fallback, ok := candidateAfterPromotionClaimLoss(sc.candidate, source)
-			if ok {
-				fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
-				recorder.fallbackScored(
-					fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
-				)
-				if scoreErr != nil {
-					if ctx.Err() != nil {
-						return ctx.Err()
-					}
-					s.markDiscoveryCandidate(
-						ctx, fallback, "failed", recorder.run.ID, scoreErr.Error(),
-					)
-					slog.Warn("scanner: source fallback score failed",
-						"ticker", fallback.Ticker, "err", scoreErr)
-					continue
-				}
-				if fallbackScore.Action != "add" ||
-					fallbackScore.Conviction < s.Cfg.MinConviction {
-					s.markDiscoveryCandidate(
-						ctx, fallback, "rejected", recorder.run.ID,
-						fmt.Sprintf(
-							"fallback rejected: action=%s conviction=%.3f threshold=%.3f",
-							fallbackScore.Action, fallbackScore.Conviction,
-							s.Cfg.MinConviction,
-						),
-					)
-					slog.Info("scanner: source fallback rejected after claim loss",
-						"ticker", fallback.Ticker,
-						"action", fallbackScore.Action,
-						"conviction", fallbackScore.Conviction)
-					continue
-				}
-				timeframes = fallbackScore.Timeframes
-				if len(timeframes) == 0 {
-					timeframes = []string{"1H", "4H"}
-				}
-				strategies = candidateStrategies(
-					fallbackScore.Strategy, fallback.PullbackQualified,
-				)
-				if hasSource(fallback.Sources, "weekly_leader") {
-					strategies = appendUniqueStrategy(strategies, "weekly_leader")
-				}
-				if hasSource(fallback.Sources, "potent_industry") {
-					strategies = appendUniqueStrategy(strategies, "potent_industry")
-				}
-				item.Strategies = strategies
-				item.Timeframes = timeframes
-				item.MinConfidence = fallbackScore.Conviction
-				item.GraphContext = fallback.GraphContext
-				item.PullbackRequalificationComplete =
-					fallback.PullbackQualificationKnown
-				sc = scoredCandidate{candidate: fallback, score: fallbackScore}
-				addErr = s.promoteDiscoveryFallback(ctx, item, fallback)
-				if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
-					slog.Info(
-						"scanner: source fallback lost to active watchlist item",
-						"ticker", fallback.Ticker,
-					)
-					continue
-				}
+			if !ok {
+				break
 			}
+			fallbackScore, scoreErr := s.scoreCandidate(ctx, fallback)
+			recorder.fallbackScored(
+				fallback, fallbackScore, scoreErr, s.Cfg.MinConviction,
+			)
+			if scoreErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				s.markDiscoveryCandidate(
+					ctx, fallback, "failed", recorder.run.ID, scoreErr.Error(),
+				)
+				slog.Warn("scanner: source fallback score failed",
+					"ticker", fallback.Ticker, "err", scoreErr)
+				skipCandidate = true
+				break
+			}
+			if fallbackScore.Action != "add" ||
+				fallbackScore.Conviction < s.Cfg.MinConviction {
+				s.markDiscoveryCandidate(
+					ctx, fallback, "rejected", recorder.run.ID,
+					fmt.Sprintf(
+						"fallback rejected: action=%s conviction=%.3f threshold=%.3f",
+						fallbackScore.Action, fallbackScore.Conviction,
+						s.Cfg.MinConviction,
+					),
+				)
+				slog.Info("scanner: source fallback rejected after claim loss",
+					"ticker", fallback.Ticker,
+					"action", fallbackScore.Action,
+					"conviction", fallbackScore.Conviction)
+				skipCandidate = true
+				break
+			}
+			timeframes = fallbackScore.Timeframes
+			if len(timeframes) == 0 {
+				timeframes = []string{"1H", "4H"}
+			}
+			strategies = candidateStrategies(
+				fallbackScore.Strategy, fallback.PullbackQualified,
+			)
+			if hasSource(fallback.Sources, "weekly_leader") {
+				strategies = appendUniqueStrategy(strategies, "weekly_leader")
+			}
+			if hasSource(fallback.Sources, "potent_industry") {
+				strategies = appendUniqueStrategy(strategies, "potent_industry")
+			}
+			item.Strategies = strategies
+			item.Timeframes = timeframes
+			item.MinConfidence = fallbackScore.Conviction
+			item.GraphContext = fallback.GraphContext
+			item.PullbackRequalificationComplete =
+				fallback.PullbackQualificationKnown
+			sc = scoredCandidate{candidate: fallback, score: fallbackScore}
+			addErr = s.promoteDiscoveryFallback(ctx, item, fallback)
+		}
+		if skipCandidate {
+			continue
+		}
+		if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
+			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
+			slog.Info(
+				"scanner: source fallback lost to active watchlist item",
+				"ticker", sc.candidate.Ticker,
+			)
+			continue
 		}
 		if addErr != nil {
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)

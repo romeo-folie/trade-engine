@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var ErrScannerSourcePromotionClaimLost = errors.New(
@@ -52,6 +54,30 @@ func PromoteScannerSourcesToWatchlist(
 	claims ScannerSourcePromotionClaims,
 	reason string,
 	at time.Time,
+) error {
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false)
+}
+
+// PromoteScannerSourcesToWatchlistUnlessActive consumes all still-current
+// source claims without replacing a watchlist row that won the race after the
+// scanner's initial active-row filter.
+func PromoteScannerSourcesToWatchlistUnlessActive(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+) error {
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true)
+}
+
+func promoteScannerSourcesToWatchlist(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+	preserveActive bool,
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
 		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil) {
@@ -151,19 +177,47 @@ func PromoteScannerSourcesToWatchlist(
 		}
 	}
 
-	if err := addWatchlistItem(ctx, tx, item, false); err != nil {
+	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+		if !errors.Is(err, ErrWatchlistActiveItemExists) {
+			return err
+		}
+		if completionErr := completeScannerSourcePromotionClaims(
+			ctx, tx, item, claims, "active_watchlist",
+			"active watchlist item won fallback promotion race", at,
+		); completionErr != nil {
+			return completionErr
+		}
+		if commitErr := tx.Commit(ctx); commitErr != nil {
+			return commitErr
+		}
+		return ErrWatchlistActiveItemExists
+	}
+	if err := completeScannerSourcePromotionClaims(
+		ctx, tx, item, claims, "promoted", reason, at,
+	); err != nil {
 		return err
 	}
+	return tx.Commit(ctx)
+}
+
+func completeScannerSourcePromotionClaims(
+	ctx context.Context,
+	tx pgx.Tx,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	status, reason string,
+	at time.Time,
+) error {
 	if claim := claims.WeeklyLeader; claim != nil {
 		tag, err := tx.Exec(ctx, `
 			UPDATE weekly_leader_qualifications
-			SET promotion_status='promoted', scanner_run_id=$4, promoted_at=$5,
-			    promotion_reason=$6, promotion_claim_token=NULL,
+			SET promotion_status=$4, scanner_run_id=$5, promoted_at=$6,
+			    promotion_reason=$7, promotion_claim_token=NULL,
 			    promotion_claimed_at=NULL
 			WHERE run_id=$1 AND ticker=$2 AND promotion_status='processing'
 			  AND promotion_claim_token=$3`,
-			claim.RunID, claim.Ticker, claim.Token, nullableUUID(item.ScannerRunID),
-			at, nullableString(reason),
+			claim.RunID, claim.Ticker, claim.Token, status,
+			nullableUUID(item.ScannerRunID), at, nullableString(reason),
 		)
 		if err != nil {
 			return fmt.Errorf("complete weekly leader watchlist promotion: %w", err)
@@ -175,13 +229,13 @@ func PromoteScannerSourcesToWatchlist(
 	if claim := claims.PotentIndustry; claim != nil {
 		tag, err := tx.Exec(ctx, `
 			UPDATE industry_rotation_members
-			SET promotion_status='promoted', scanner_run_id=$6, promoted_at=$7,
-			    promotion_reason=$8, promotion_claim_token=NULL,
+			SET promotion_status=$6, scanner_run_id=$7, promoted_at=$8,
+			    promotion_reason=$9, promotion_claim_token=NULL,
 			    promotion_claimed_at=NULL
 			WHERE run_id=$1 AND group_type=$2 AND group_key=$3 AND ticker=$4
 			  AND promotion_status='processing' AND promotion_claim_token=$5`,
 			claim.RunID, claim.GroupType, claim.GroupKey, claim.Ticker, claim.Token,
-			nullableUUID(item.ScannerRunID), at, nullableString(reason),
+			status, nullableUUID(item.ScannerRunID), at, nullableString(reason),
 		)
 		if err != nil {
 			return fmt.Errorf("complete potent industry watchlist promotion: %w", err)
@@ -190,5 +244,5 @@ func PromoteScannerSourcesToWatchlist(
 			return &ScannerSourcePromotionClaimError{Source: "potent_industry"}
 		}
 	}
-	return tx.Commit(ctx)
+	return nil
 }

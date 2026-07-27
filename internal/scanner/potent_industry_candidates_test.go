@@ -44,6 +44,11 @@ func TestMarkPotentIndustryPromotionsUsesGlobalDeterministicCap(t *testing.T) {
 
 func TestMergePotentIndustryCandidateRetainsEverySource(t *testing.T) {
 	taxonomyAt := time.Date(2026, 7, 24, 20, 0, 0, 0, time.UTC)
+	ordinary := SwingCandidate{
+		Ticker: "AAA", Price: 99, ChangePct: 4,
+		Sources:      []string{"mover"},
+		SourceScores: map[string]float64{"mover": 0},
+	}
 	existing := SwingCandidate{
 		Ticker: "AAA", Price: 100, ChangePct: 4,
 		Sources: []string{"mover", "weekly_leader"},
@@ -53,6 +58,7 @@ func TestMergePotentIndustryCandidateRetainsEverySource(t *testing.T) {
 		WeeklyLeaderRunID: "weekly-run", WeeklyLeaderClaimToken: "weekly-token",
 		WeeklyLeaderEvidence: "rank 1",
 		Return1M:             10, Return3M: 20, Return6M: 30,
+		weeklyLeaderFallback: &ordinary,
 	}
 	industry := SwingCandidate{
 		Ticker: "AAA", Price: 101, Return1M: 8,
@@ -89,6 +95,30 @@ func TestMergePotentIndustryCandidateRetainsEverySource(t *testing.T) {
 		!hasSource(withoutWeekly.Sources, "potent_industry") ||
 		withoutWeekly.Return3M != 0 || withoutWeekly.WeeklyLeaderEvidence != "" {
 		t.Fatalf("weekly claim fallback retained stale evidence: %+v", withoutWeekly)
+	}
+	ordinaryAfterBothLost, ok := candidateAfterPromotionClaimLoss(
+		withoutWeekly, "potent_industry",
+	)
+	if !ok || len(ordinaryAfterBothLost.Sources) != 1 ||
+		ordinaryAfterBothLost.Sources[0] != "mover" ||
+		ordinaryAfterBothLost.WeeklyLeaderRunID != "" ||
+		ordinaryAfterBothLost.PotentIndustryRunID != "" {
+		t.Fatalf("two stale claims did not retain ordinary source: %+v",
+			ordinaryAfterBothLost)
+	}
+	weeklyAfterIndustryLost, ok := candidateAfterPromotionClaimLoss(
+		got[0], "potent_industry",
+	)
+	if !ok {
+		t.Fatal("industry fallback unexpectedly unavailable")
+	}
+	ordinaryAfterReverseLoss, ok := candidateAfterPromotionClaimLoss(
+		weeklyAfterIndustryLost, "weekly_leader",
+	)
+	if !ok || len(ordinaryAfterReverseLoss.Sources) != 1 ||
+		ordinaryAfterReverseLoss.Sources[0] != "mover" {
+		t.Fatalf("reverse stale-claim order lost ordinary source: %+v",
+			ordinaryAfterReverseLoss)
 	}
 }
 
