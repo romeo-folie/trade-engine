@@ -33,46 +33,54 @@ type sessionNotifier interface {
 }
 
 type currencyStrengthRunState struct {
-	AccountID         string                      `json:"account_id"`
-	Date              string                      `json:"date"`
-	Symbol            string                      `json:"symbol"`
-	Side              string                      `json:"side"`
-	Quantity          float64                     `json:"quantity"`
-	EntryOrderID      string                      `json:"entry_order_id"`
-	EntryStatus       string                      `json:"entry_status"`
-	EntryFillPrice    float64                     `json:"entry_fill_price,omitempty"`
-	EntryFilledQty    float64                     `json:"entry_filled_qty,omitempty"`
-	EntryFillTimeQty  float64                     `json:"entry_fill_time_qty,omitempty"`
-	EnteredAt         string                      `json:"entered_at"`
-	Strongest         string                      `json:"strongest,omitempty"`
-	Weakest           string                      `json:"weakest,omitempty"`
-	StrengthGap       float64                     `json:"strength_gap,omitempty"`
-	ExitOrderID       string                      `json:"exit_order_id,omitempty"`
-	ExitTradeID       string                      `json:"exit_trade_id,omitempty"`
-	ExitAttempt       int                         `json:"exit_attempt,omitempty"`
-	ExitStatus        string                      `json:"exit_status,omitempty"`
-	ExitFillPrice     float64                     `json:"exit_fill_price,omitempty"`
-	ExitFilledQty     float64                     `json:"exit_filled_qty,omitempty"`
-	ExitCumulativeQty float64                     `json:"exit_cumulative_filled_qty,omitempty"`
-	ExitRequestedQty  float64                     `json:"exit_requested_qty,omitempty"`
-	ExitRetryMaxQty   float64                     `json:"exit_retry_max_qty,omitempty"`
-	ExitPriorOrderID  string                      `json:"exit_prior_order_id,omitempty"`
-	ExitCorrection    bool                        `json:"exit_correction,omitempty"`
-	ExitFillObserved  string                      `json:"exit_fill_observed_at,omitempty"`
-	ExitFillTimeQty   float64                     `json:"exit_fill_time_qty,omitempty"`
-	ExitedAt          string                      `json:"exited_at,omitempty"`
-	ExitRetry         bool                        `json:"exit_retry,omitempty"`
-	ExitConfirmed     bool                        `json:"exit_confirmed_notified,omitempty"`
-	ExitPnLPending    bool                        `json:"exit_pnl_pending,omitempty"`
+	AccountID         string  `json:"account_id"`
+	Date              string  `json:"date"`
+	Symbol            string  `json:"symbol"`
+	Side              string  `json:"side"`
+	Quantity          float64 `json:"quantity"`
+	EntryOrderID      string  `json:"entry_order_id"`
+	EntryStatus       string  `json:"entry_status"`
+	EntryFillPrice    float64 `json:"entry_fill_price,omitempty"`
+	EntryFilledQty    float64 `json:"entry_filled_qty,omitempty"`
+	EntryFillTimeQty  float64 `json:"entry_fill_time_qty,omitempty"`
+	EnteredAt         string  `json:"entered_at"`
+	Strongest         string  `json:"strongest,omitempty"`
+	Weakest           string  `json:"weakest,omitempty"`
+	StrengthGap       float64 `json:"strength_gap,omitempty"`
+	ExitOrderID       string  `json:"exit_order_id,omitempty"`
+	ExitTradeID       string  `json:"exit_trade_id,omitempty"`
+	ExitAttempt       int     `json:"exit_attempt,omitempty"`
+	ExitStatus        string  `json:"exit_status,omitempty"`
+	ExitFillPrice     float64 `json:"exit_fill_price,omitempty"`
+	ExitFilledQty     float64 `json:"exit_filled_qty,omitempty"`
+	ExitCumulativeQty float64 `json:"exit_cumulative_filled_qty,omitempty"`
+	ExitRequestedQty  float64 `json:"exit_requested_qty,omitempty"`
+	ExitRetryMaxQty   float64 `json:"exit_retry_max_qty,omitempty"`
+	ExitPriorOrderID  string  `json:"exit_prior_order_id,omitempty"`
+	ExitCorrection    bool    `json:"exit_correction,omitempty"`
+	ExitFillObserved  string  `json:"exit_fill_observed_at,omitempty"`
+	ExitFillTimeQty   float64 `json:"exit_fill_time_qty,omitempty"`
+	ExitedAt          string  `json:"exited_at,omitempty"`
+	ExitRetry         bool    `json:"exit_retry,omitempty"`
+	ExitConfirmed     bool    `json:"exit_confirmed_notified,omitempty"`
+	ExitPnLPending    bool    `json:"exit_pnl_pending,omitempty"`
+	// AuditOnly means the trade is terminal and the sidecar is retained solely
+	// to retry historical exit-audit enrichment. It must not block a new
+	// session or cause another broker exit.
+	AuditOnly         bool                        `json:"audit_only,omitempty"`
 	PendingExitAudits []currencyStrengthExitAudit `json:"pending_exit_audits,omitempty"`
 }
 
 type currencyStrengthExitAudit struct {
-	OrderID   string  `json:"order_id"`
-	Status    string  `json:"status"`
-	FillPrice float64 `json:"fill_price,omitempty"`
-	FilledQty float64 `json:"filled_qty,omitempty"`
-	ExitedAt  string  `json:"exited_at,omitempty"`
+	OrderID        string  `json:"order_id"`
+	Status         string  `json:"status"`
+	FillPrice      float64 `json:"fill_price,omitempty"`
+	FilledQty      float64 `json:"filled_qty,omitempty"`
+	ExitedAt       string  `json:"exited_at,omitempty"`
+	Symbol         string  `json:"symbol,omitempty"`
+	Side           string  `json:"side,omitempty"`
+	EntryStatus    string  `json:"entry_status,omitempty"`
+	EntryFillPrice float64 `json:"entry_fill_price,omitempty"`
 }
 
 // currencyStrengthJournal is the strategy's durable audit seam. Production
@@ -346,13 +354,25 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 			}
 		}
 
-		if r.state == nil {
+		if r.state != nil && r.state.AuditOnly {
+			if err := r.syncPendingExitAudit(ctx); err != nil {
+				logger.Warn("currency-strength: audit-only history sync failed; will retry", "err", err)
+			}
+			if r.state != nil && len(r.state.PendingExitAudits) == 0 {
+				if err := r.clearState(); err != nil {
+					logger.Warn("currency-strength: failed to clear completed audit-only state", "err", err)
+				}
+			}
+		}
+
+		activeState := r.state != nil && !r.state.AuditOnly
+		if !activeState {
 			if _, err := r.recoverEntryObligation(ctx); err != nil {
 				logger.Warn("currency-strength: broker entry recovery failed; will retry", "err", err)
 			}
 		}
 
-		if r.state != nil {
+		if r.state != nil && !r.state.AuditOnly {
 			if err := r.mergeActiveStateFromJournal(ctx); err != nil {
 				logger.Warn("currency-strength: active-state history merge failed; using broker recovery", "err", err)
 			}
@@ -371,14 +391,14 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 			}
 		}
 
-		if r.state != nil && (r.state.ExitOrderID != "" ||
+		if r.state != nil && !r.state.AuditOnly && (r.state.ExitOrderID != "" ||
 			currencyStrengthShouldExitState(r.state, dateKey, now, exitTime)) {
 			if err := r.exitActive(ctx); err != nil {
 				return err
 			}
 		}
 
-		if r.state == nil && r.journal != nil && r.sessionRecordedFor == dateKey &&
+		if (r.state == nil || (r.state != nil && r.state.AuditOnly)) && r.journal != nil && r.sessionRecordedFor == dateKey &&
 			!now.Before(strengthEnd) && now.Before(exitTime) {
 			if r.decisionDoneFor != dateKey {
 				if now.Sub(strengthEnd) > currencyStrengthEntryGrace {
@@ -546,14 +566,16 @@ func (r *currencyStrengthPaperRunner) recoverWorkingEntry(ctx context.Context) (
 			normalizeCurrencyStrengthTicker(order.Ticker) != normalizeCurrencyStrengthTicker(symbol) {
 			continue
 		}
+		pendingAudits := r.pendingExitAudits()
 		r.state = &currencyStrengthRunState{
-			AccountID:    r.accountID,
-			Date:         dateKey,
-			Symbol:       symbol,
-			Side:         strings.ToLower(order.Side),
-			Quantity:     float64(r.cfg.Units),
-			EntryOrderID: order.OrderID,
-			EntryStatus:  order.Status,
+			AccountID:         r.accountID,
+			Date:              dateKey,
+			Symbol:            symbol,
+			Side:              strings.ToLower(order.Side),
+			Quantity:          float64(r.cfg.Units),
+			EntryOrderID:      order.OrderID,
+			EntryStatus:       order.Status,
+			PendingExitAudits: pendingAudits,
 		}
 		if err := r.persistActiveEntryRecovery(ctx); err != nil {
 			logger.Warn("currency-strength: recovered working entry remains non-durable", "err", err)
@@ -764,19 +786,21 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		return fmt.Errorf("currency-strength place paper entry %s %s: %w", decision.Signal.Symbol, decision.Signal.Side, err)
 	}
 
+	pendingAudits := r.pendingExitAudits()
 	r.state = &currencyStrengthRunState{
-		AccountID:      r.accountID,
-		Date:           dateKey,
-		Symbol:         decision.Signal.Symbol,
-		Side:           decision.Signal.Side,
-		Quantity:       float64(r.cfg.Units),
-		EntryOrderID:   result.BrokerOrderID,
-		EntryStatus:    result.Status,
-		EntryFillPrice: result.FilledPrice,
-		EntryFilledQty: result.FilledQty,
-		Strongest:      decision.Signal.Strong,
-		Weakest:        decision.Signal.Weak,
-		StrengthGap:    decision.Signal.Gap,
+		AccountID:         r.accountID,
+		Date:              dateKey,
+		Symbol:            decision.Signal.Symbol,
+		Side:              decision.Signal.Side,
+		Quantity:          float64(r.cfg.Units),
+		EntryOrderID:      result.BrokerOrderID,
+		EntryStatus:       result.Status,
+		EntryFillPrice:    result.FilledPrice,
+		EntryFilledQty:    result.FilledQty,
+		Strongest:         decision.Signal.Strong,
+		Weakest:           decision.Signal.Weak,
+		StrengthGap:       decision.Signal.Gap,
+		PendingExitAudits: pendingAudits,
 	}
 	if err := r.persistActiveEntryRecovery(ctx); err != nil {
 		return err
@@ -810,17 +834,19 @@ func (r *currencyStrengthPaperRunner) adoptWorkingEntry(
 			!strings.EqualFold(order.Side, signal.Side) {
 			continue
 		}
+		pendingAudits := r.pendingExitAudits()
 		r.state = &currencyStrengthRunState{
-			AccountID:    r.accountID,
-			Date:         dateKey,
-			Symbol:       signal.Symbol,
-			Side:         signal.Side,
-			Quantity:     float64(r.cfg.Units),
-			EntryOrderID: order.OrderID,
-			EntryStatus:  order.Status,
-			Strongest:    signal.Strong,
-			Weakest:      signal.Weak,
-			StrengthGap:  signal.Gap,
+			AccountID:         r.accountID,
+			Date:              dateKey,
+			Symbol:            signal.Symbol,
+			Side:              signal.Side,
+			Quantity:          float64(r.cfg.Units),
+			EntryOrderID:      order.OrderID,
+			EntryStatus:       order.Status,
+			Strongest:         signal.Strong,
+			Weakest:           signal.Weak,
+			StrengthGap:       signal.Gap,
+			PendingExitAudits: pendingAudits,
 		}
 		if persistErr := r.persistActiveEntryRecovery(ctx); persistErr != nil {
 			// In-memory ownership plus deterministic broker discovery still
@@ -832,6 +858,13 @@ func (r *currencyStrengthPaperRunner) adoptWorkingEntry(
 		return true, nil
 	}
 	return false, nil
+}
+
+func (r *currencyStrengthPaperRunner) pendingExitAudits() []currencyStrengthExitAudit {
+	if r.state == nil || len(r.state.PendingExitAudits) == 0 {
+		return nil
+	}
+	return append([]currencyStrengthExitAudit(nil), r.state.PendingExitAudits...)
 }
 
 func (r *currencyStrengthPaperRunner) persistActiveEntryRecovery(ctx context.Context) error {
@@ -1228,6 +1261,10 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 					FillPrice: selected.fillNotional / selected.filledQty,
 					FilledQty: filledQty,
 					ExitedAt:  selected.filledAt.UTC().Format(time.RFC3339),
+					Symbol:    r.state.Symbol,
+					Side:      r.state.Side,
+					EntryStatus: r.state.EntryStatus,
+					EntryFillPrice: r.state.EntryFillPrice,
 				}
 				r.state.PendingExitAudits = append(r.state.PendingExitAudits, audit)
 				if err := r.syncPendingExitAudit(ctx); err != nil {
@@ -2317,6 +2354,7 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		// The current terminal attempt is durable, but an older attempt still
 		// needs FX enrichment. Keep the sidecar alive so clearState cannot erase
 		// that queued audit before a later retry succeeds.
+		r.state.AuditOnly = true
 		if err := r.saveState(); err != nil {
 			logger.Warn("currency-strength: failed to persist pending historical audit queue", "err", err)
 		}
@@ -2482,11 +2520,15 @@ func (r *currencyStrengthPaperRunner) currentExitAudit() currencyStrengthExitAud
 		filledQty = -math.Abs(filledQty)
 	}
 	return currencyStrengthExitAudit{
-		OrderID:   r.state.ExitOrderID,
-		Status:    status,
-		FillPrice: r.state.ExitFillPrice,
-		FilledQty: filledQty,
-		ExitedAt:  r.state.ExitedAt,
+		OrderID:        r.state.ExitOrderID,
+		Status:         status,
+		FillPrice:      r.state.ExitFillPrice,
+		FilledQty:      filledQty,
+		ExitedAt:       r.state.ExitedAt,
+		Symbol:         r.state.Symbol,
+		Side:           r.state.Side,
+		EntryStatus:    r.state.EntryStatus,
+		EntryFillPrice: r.state.EntryFillPrice,
 	}
 }
 
@@ -2534,16 +2576,32 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 	ctx context.Context,
 	audit currencyStrengthExitAudit,
 ) (*float64, error) {
-	if normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus) != "filled" ||
-		audit.FillPrice <= 0 || math.Abs(audit.FilledQty) <= 0 || r.state.EntryFillPrice <= 0 {
+	entryStatus := audit.EntryStatus
+	entryFillPrice := audit.EntryFillPrice
+	if entryStatus == "" && r.state != nil {
+		entryStatus = r.state.EntryStatus
+	}
+	if entryFillPrice <= 0 && r.state != nil {
+		entryFillPrice = r.state.EntryFillPrice
+	}
+	if normalizeCurrencyStrengthOrderStatus(entryStatus) != "filled" ||
+		audit.FillPrice <= 0 || math.Abs(audit.FilledQty) <= 0 || entryFillPrice <= 0 {
 		return nil, nil
 	}
-	parts := strings.Split(strings.ToUpper(r.state.Symbol), "/")
+	symbol := audit.Symbol
+	if symbol == "" && r.state != nil {
+		symbol = r.state.Symbol
+	}
+	parts := strings.Split(strings.ToUpper(symbol), "/")
 	if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
 		return nil, fmt.Errorf("currency-strength convert P&L for invalid pair %q", r.state.Symbol)
 	}
-	pnl := (audit.FillPrice - r.state.EntryFillPrice) * audit.FilledQty
-	if r.state.Side == "sell" {
+	pnl := (audit.FillPrice - entryFillPrice) * audit.FilledQty
+	side := audit.Side
+	if side == "" && r.state != nil {
+		side = r.state.Side
+	}
+	if side == "sell" {
 		pnl = -pnl
 	}
 	base, quote := parts[0], parts[1]
