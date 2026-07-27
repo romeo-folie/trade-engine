@@ -758,7 +758,7 @@ func TestCurrencyStrengthFilledExitWaitsForPortfolioPropagation(t *testing.T) {
 			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
 			ExitOrderID: "EXIT-PROPAGATING", ExitStatus: "filled",
 			ExitFillPrice: 1.105, ExitFilledQty: 100000, ExitRequestedQty: 100000,
-			ExitFillTimeKnown: true, ExitedAt: now.Format(time.RFC3339),
+			ExitFillTimeQty: 100000, ExitedAt: now.Format(time.RFC3339),
 		},
 		now: func() time.Time { return now },
 	}
@@ -1772,6 +1772,83 @@ func TestCurrencyStrengthRetainsPendingExitUntilTerminal(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthRetriesPurgedZeroFillExitWithOpenPosition(t *testing.T) {
+	broker := &sequencedCurrencyStrengthExecutor{
+		positions: [][]execution.Position{{
+			{Ticker: "GBP/USD", Quantity: 100000},
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: &captureCurrencyStrengthJournal{}, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-PURGED", ExitTradeID: "currency-strength-exit-old",
+			ExitStatus: "pending", ExitRequestedQty: 100000,
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "" || !runner.state.ExitRetry {
+		t.Fatalf("purged exit remained pinned: %+v", runner.state)
+	}
+	broker.statuses = []execution.OrderResult{{
+		BrokerOrderID: "EXIT-SEQUENCED", Status: "pending",
+	}}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.requests) != 1 || runner.state.ExitOrderID != "EXIT-SEQUENCED" {
+		t.Fatalf("purged exit did not release a replacement flatten: requests=%+v state=%+v",
+			broker.requests, runner.state)
+	}
+}
+
+func TestCurrencyStrengthLaterFillRefreshesExecutionTimestamp(t *testing.T) {
+	firstFillAt := time.Date(2026, 7, 27, 18, 1, 0, 0, time.UTC)
+	finalFillAt := firstFillAt.Add(4 * time.Minute)
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-MULTI-FILL", Status: "filled",
+			FilledPrice: 1.1056, FilledQty: 100000,
+		},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "EXIT-MULTI-FILL", Symbol: "GBP/USD",
+				Side: "sell", FilledQty: 40000, FilledAvgPx: 1.105,
+				FilledAt: firstFillAt,
+			},
+			{
+				BrokerOrderID: "EXIT-MULTI-FILL", Symbol: "GBP/USD",
+				Side: "sell", FilledQty: 60000, FilledAvgPx: 1.106,
+				FilledAt: finalFillAt,
+			},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-MULTI-FILL", ExitStatus: "partial",
+			ExitFillPrice: 1.105, ExitFilledQty: 40000,
+			ExitFillTimeQty: 40000, ExitedAt: firstFillAt.Format(time.RFC3339),
+		},
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(journal.exits) != 1 || journal.exits[0].ExitedAt == nil ||
+		!journal.exits[0].ExitedAt.Equal(finalFillAt) {
+		t.Fatalf("later fill did not refresh execution timestamp: %+v", journal.exits)
+	}
+}
+
 func TestCurrencyStrengthCancelsWorkingExitBeforeAcceptingFlatSnapshot(t *testing.T) {
 	broker := &sequencedCurrencyStrengthExecutor{
 		statuses: []execution.OrderResult{
@@ -1858,6 +1935,12 @@ func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *te
 	if runner.state == nil || runner.state.ExitOrderID != "" || !runner.state.ExitRetry {
 		t.Fatalf("residual position was not prepared for a safe retry: %+v", runner.state)
 	}
+	broker.recentFills = []execution.BrokerOrder{{
+		BrokerOrderID: "EXIT-PART-1",
+		TradeID:       broker.requests[0].TradeID,
+		Symbol:        "GBP/USD", Side: "sell", FilledQty: 50000,
+		FilledAvgPx: 1.102, FilledAt: now.Add(-time.Minute),
+	}}
 
 	broker.result = execution.OrderResult{
 		BrokerOrderID: "EXIT-PART-2",
