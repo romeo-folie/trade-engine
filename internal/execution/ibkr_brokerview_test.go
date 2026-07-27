@@ -64,6 +64,7 @@ func TestFetchTradeRecords(t *testing.T) {
 		w.Write([]byte(`[
 			{
 				"orderId": 123456789,
+				"order_ref": "currency-strength-2026-04-28-EURUSD",
 				"symbol": "EUR.USD",
 				"side": "B",
 				"size": 5000,
@@ -97,6 +98,9 @@ func TestFetchTradeRecords(t *testing.T) {
 	r := records[0]
 	if r.OrderID != "123456789" {
 		t.Errorf("OrderID = %q; want 123456789", r.OrderID)
+	}
+	if r.TradeID != "currency-strength-2026-04-28-EURUSD" {
+		t.Errorf("TradeID = %q; want propagated order_ref", r.TradeID)
 	}
 	// conid 12087792 reverse-resolves to "EUR/USD" via the hardcoded map.
 	if r.Symbol != "EUR/USD" {

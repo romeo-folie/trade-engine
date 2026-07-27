@@ -138,6 +138,7 @@ func (b *IBKRBroker) EquityCurve(_ context.Context, _, _ string) (EquityHistory,
 // without relying on child order IDs that may not have been captured at placement.
 type IBKRTradeRecord struct {
 	OrderID  string
+	TradeID  string
 	Conid    string
 	Symbol   string // human-readable when conid is resolved (e.g. "EUR/USD"); otherwise the raw API symbol
 	Side     string // "buy" | "sell"
@@ -158,6 +159,7 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 	}
 	var resp []struct {
 		OrderID   int64     `json:"orderId"`
+		OrderRef  string    `json:"order_ref"`
 		Symbol    string    `json:"symbol"`
 		Side      string    `json:"side"` // "B" | "S"
 		Size      ibkrFloat `json:"size"`
@@ -192,6 +194,7 @@ func (b *IBKRBroker) FetchTradeRecords(ctx context.Context, days int) ([]IBKRTra
 		}
 		out = append(out, IBKRTradeRecord{
 			OrderID:  fmt.Sprintf("%d", o.OrderID),
+			TradeID:  o.OrderRef,
 			Conid:    conidStr,
 			Symbol:   symbol,
 			Side:     side,
@@ -273,6 +276,7 @@ type ibkrOrderRow struct {
 func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 	var resp []struct {
 		OrderID   int64     `json:"orderId"`
+		OrderRef  string    `json:"order_ref"`
 		Symbol    string    `json:"symbol"`
 		Side      string    `json:"side"` // "B" | "S"
 		Size      ibkrFloat `json:"size"`
@@ -307,6 +311,7 @@ func (b *IBKRBroker) RecentFills(ctx context.Context) ([]BrokerOrder, error) {
 		}
 		out = append(out, BrokerOrder{
 			BrokerOrderID: fmt.Sprintf("%d", o.OrderID),
+			TradeID:       o.OrderRef,
 			Symbol:        symbol,
 			Side:          side,
 			Qty:           float64(o.Size),

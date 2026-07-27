@@ -29,6 +29,7 @@ type sessionNotifier interface {
 }
 
 type currencyStrengthRunState struct {
+	AccountID         string                      `json:"account_id"`
 	Date              string                      `json:"date"`
 	Symbol            string                      `json:"symbol"`
 	Side              string                      `json:"side"`
@@ -49,6 +50,7 @@ type currencyStrengthRunState struct {
 	ExitFilledQty     float64                     `json:"exit_filled_qty,omitempty"`
 	ExitedAt          string                      `json:"exited_at,omitempty"`
 	ExitRetry         bool                        `json:"exit_retry,omitempty"`
+	ExitConfirmed     bool                        `json:"exit_confirmed_notified,omitempty"`
 	PendingExitAudits []currencyStrengthExitAudit `json:"pending_exit_audits,omitempty"`
 }
 
@@ -73,42 +75,48 @@ type currencyStrengthJournal interface {
 	GetActive(context.Context, time.Time) (*store.CurrencyStrengthRun, error)
 }
 
-type dbCurrencyStrengthJournal struct{}
+type dbCurrencyStrengthJournal struct {
+	accountID string
+}
 
-func (dbCurrencyStrengthJournal) Start(ctx context.Context, run store.CurrencyStrengthRun) error {
+func (d dbCurrencyStrengthJournal) Start(ctx context.Context, run store.CurrencyStrengthRun) error {
+	run.AccountID = d.accountID
 	return store.StartCurrencyStrengthRun(ctx, store.GetDB(), run)
 }
 
-func (dbCurrencyStrengthJournal) MarkEvaluating(ctx context.Context, date time.Time) error {
-	return store.MarkCurrencyStrengthEvaluating(ctx, store.GetDB(), date)
+func (d dbCurrencyStrengthJournal) MarkEvaluating(ctx context.Context, date time.Time) error {
+	return store.MarkCurrencyStrengthEvaluating(ctx, store.GetDB(), d.accountID, date)
 }
 
-func (dbCurrencyStrengthJournal) RecordNoSignal(ctx context.Context, date time.Time, reason string) error {
-	return store.RecordCurrencyStrengthNoSignal(ctx, store.GetDB(), date, reason)
+func (d dbCurrencyStrengthJournal) RecordNoSignal(ctx context.Context, date time.Time, reason string) error {
+	return store.RecordCurrencyStrengthNoSignal(ctx, store.GetDB(), d.accountID, date, reason)
 }
 
-func (dbCurrencyStrengthJournal) RecordEntry(ctx context.Context, run store.CurrencyStrengthRun) error {
+func (d dbCurrencyStrengthJournal) RecordEntry(ctx context.Context, run store.CurrencyStrengthRun) error {
+	run.AccountID = d.accountID
 	return store.RecordCurrencyStrengthEntry(ctx, store.GetDB(), run)
 }
 
-func (dbCurrencyStrengthJournal) RecordExit(ctx context.Context, run store.CurrencyStrengthRun) error {
+func (d dbCurrencyStrengthJournal) RecordExit(ctx context.Context, run store.CurrencyStrengthRun) error {
+	run.AccountID = d.accountID
 	return store.RecordCurrencyStrengthExit(ctx, store.GetDB(), run)
 }
 
-func (dbCurrencyStrengthJournal) RecordFailure(ctx context.Context, date time.Time, message string) error {
-	return store.RecordCurrencyStrengthFailure(ctx, store.GetDB(), date, message)
+func (d dbCurrencyStrengthJournal) RecordFailure(ctx context.Context, date time.Time, message string) error {
+	return store.RecordCurrencyStrengthFailure(ctx, store.GetDB(), d.accountID, date, message)
 }
 
-func (dbCurrencyStrengthJournal) Get(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
-	return store.GetCurrencyStrengthRunByDate(ctx, store.GetDB(), date)
+func (d dbCurrencyStrengthJournal) Get(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
+	return store.GetCurrencyStrengthRunByDate(ctx, store.GetDB(), d.accountID, date)
 }
 
-func (dbCurrencyStrengthJournal) GetActive(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
-	return store.GetActiveCurrencyStrengthRun(ctx, store.GetDB(), date)
+func (d dbCurrencyStrengthJournal) GetActive(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
+	return store.GetActiveCurrencyStrengthRun(ctx, store.GetDB(), d.accountID, date)
 }
 
 type currencyStrengthPaperRunner struct {
 	cfg       config.CurrencyStrengthConfig
+	accountID string
 	market    data.MarketDataProvider
 	broker    execution.Executor
 	statePath string
@@ -120,6 +128,7 @@ type currencyStrengthPaperRunner struct {
 	decisionDoneFor    string
 	sessionRecordedFor string
 	entryRecorded      bool
+	fillRecoveryFor    string
 }
 
 func validateCurrencyStrengthPaperConfig(cfg *config.Config, dryRun bool) error {
@@ -144,12 +153,18 @@ func validateCurrencyStrengthPaperConfig(cfg *config.Config, dryRun bool) error 
 	return nil
 }
 
-func newCurrencyStrengthPaperRunner(cfg config.CurrencyStrengthConfig, market data.MarketDataProvider, broker execution.Executor) *currencyStrengthPaperRunner {
+func newCurrencyStrengthPaperRunner(
+	cfg config.CurrencyStrengthConfig,
+	accountID string,
+	market data.MarketDataProvider,
+	broker execution.Executor,
+) *currencyStrengthPaperRunner {
 	return &currencyStrengthPaperRunner{
 		cfg:       cfg,
+		accountID: normalizeCurrencyStrengthAccountID(accountID),
 		market:    market,
 		broker:    broker,
-		statePath: defaultCurrencyStrengthStatePath(),
+		statePath: defaultCurrencyStrengthStatePath(accountID),
 		now:       time.Now,
 	}
 }
@@ -228,13 +243,24 @@ func buildCurrencyStrengthNoOrderMessage(reason string) string {
 	return "💤 FX Currency-Strength — no order today\nReason: " + reason
 }
 
-// buildCurrencyStrengthExitMessage announces the flattening order placed at the
-// configured exit time (or on a stale carried-over position).
+// buildCurrencyStrengthExitMessage announces submission without claiming that
+// the broker has already flattened the position.
 func buildCurrencyStrengthExitMessage(symbol string, side execution.OrderSide, qty float64, orderID, status string) string {
 	var sb strings.Builder
-	sb.WriteString("🏁 FX Currency-Strength — position flattened\n")
+	sb.WriteString("⏳ FX Currency-Strength — exit submitted\n")
 	fmt.Fprintf(&sb, "%s %s · %.0f units (market)\n", strings.ToUpper(string(side)), symbol, qty)
 	fmt.Fprintf(&sb, "Order %s · %s", orderID, status)
+	return sb.String()
+}
+
+func buildCurrencyStrengthFlattenedMessage(symbol, orderID string, qty, price float64) string {
+	var sb strings.Builder
+	sb.WriteString("🏁 FX Currency-Strength — position flattened\n")
+	fmt.Fprintf(&sb, "%s · %.0f units confirmed closed\n", symbol, qty)
+	fmt.Fprintf(&sb, "Order %s", orderID)
+	if price > 0 {
+		fmt.Fprintf(&sb, " · fill %.5f", price)
+	}
 	return sb.String()
 }
 
@@ -305,6 +331,14 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 			}
 		}
 
+		if r.state == nil && r.fillRecoveryFor != dateKey {
+			if _, err := r.recoverFilledEntry(ctx); err != nil {
+				logger.Warn("currency-strength: filled-entry recovery failed; will retry", "err", err)
+			} else {
+				r.fillRecoveryFor = dateKey
+			}
+		}
+
 		if r.state != nil {
 			if err := r.mergeActiveStateFromJournal(ctx); err != nil {
 				logger.Warn("currency-strength: active-state history merge failed; using broker recovery", "err", err)
@@ -354,6 +388,121 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (r *currencyStrengthPaperRunner) recoverFilledEntry(ctx context.Context) (bool, error) {
+	type tradeRecordFetcher interface {
+		FetchTradeRecords(context.Context, int) ([]execution.IBKRTradeRecord, error)
+	}
+	type recentFillFetcher interface {
+		RecentFills(context.Context) ([]execution.BrokerOrder, error)
+	}
+
+	var fills []execution.BrokerOrder
+	if fetcher, ok := r.broker.(tradeRecordFetcher); ok {
+		records, err := fetcher.FetchTradeRecords(ctx, 7)
+		if err != nil {
+			return false, fmt.Errorf("list strategy trade records: %w", err)
+		}
+		for _, record := range records {
+			fills = append(fills, execution.BrokerOrder{
+				BrokerOrderID: record.OrderID,
+				TradeID:       record.TradeID,
+				Symbol:        record.Symbol,
+				Side:          record.Side,
+				Qty:           record.Qty,
+				FilledQty:     record.Qty,
+				FilledAvgPx:   record.Price,
+				Status:        "filled",
+				FilledAt:      record.FilledAt,
+			})
+		}
+	} else if fetcher, ok := r.broker.(recentFillFetcher); ok {
+		var err error
+		fills, err = fetcher.RecentFills(ctx)
+		if err != nil {
+			return false, fmt.Errorf("list recent strategy fills: %w", err)
+		}
+	} else {
+		return false, nil
+	}
+
+	positions, err := r.broker.GetPositions(ctx)
+	if err != nil {
+		return false, fmt.Errorf("list positions for filled-entry recovery: %w", err)
+	}
+	var recoveredFill *execution.BrokerOrder
+	var recoveredPosition *execution.Position
+	var recoveredDate, recoveredSymbol string
+	for i := range fills {
+		fill := fills[i]
+		dateKey, symbol, ok := parseCurrencyStrengthEntryTradeID(fill.TradeID)
+		if !ok {
+			continue
+		}
+		for j := range positions {
+			pos := positions[j]
+			if normalizeCurrencyStrengthTicker(pos.Ticker) != normalizeCurrencyStrengthTicker(symbol) ||
+				math.Abs(pos.Quantity) <= 0 ||
+				(pos.Quantity > 0) != strings.EqualFold(fill.Side, "buy") {
+				continue
+			}
+			if recoveredFill == nil || fill.FilledAt.After(recoveredFill.FilledAt) {
+				fillCopy, posCopy := fill, pos
+				recoveredFill, recoveredPosition = &fillCopy, &posCopy
+				recoveredDate, recoveredSymbol = dateKey, symbol
+			}
+		}
+	}
+	if recoveredFill == nil {
+		return false, nil
+	}
+	enteredAt := recoveredFill.FilledAt
+	if enteredAt.IsZero() {
+		enteredAt = r.now().UTC()
+	}
+	entryPrice := recoveredPosition.AvgCostBasis
+	if entryPrice <= 0 {
+		entryPrice = recoveredFill.FilledAvgPx
+	}
+	r.state = &currencyStrengthRunState{
+		AccountID:      r.accountID,
+		Date:           recoveredDate,
+		Symbol:         recoveredSymbol,
+		Side:           strings.ToLower(recoveredFill.Side),
+		Quantity:       math.Abs(recoveredPosition.Quantity),
+		EntryOrderID:   recoveredFill.BrokerOrderID,
+		EntryStatus:    "filled",
+		EntryFillPrice: entryPrice,
+		EntryFilledQty: math.Abs(recoveredPosition.Quantity),
+		EnteredAt:      enteredAt.UTC().Format(time.RFC3339),
+	}
+	if err := r.persistActiveEntryRecovery(ctx); err != nil {
+		logger.Warn("currency-strength: recovered filled entry remains non-durable", "err", err)
+	}
+	logger.Warn("currency-strength: recovered strategy-owned filled entry",
+		"symbol", recoveredSymbol, "order_id", recoveredFill.BrokerOrderID,
+		"trade_id", recoveredFill.TradeID)
+	return true, nil
+}
+
+func parseCurrencyStrengthEntryTradeID(tradeID string) (dateKey, symbol string, ok bool) {
+	const prefix = "currency-strength-"
+	if !strings.HasPrefix(tradeID, prefix) || strings.HasPrefix(tradeID, prefix+"exit-") {
+		return "", "", false
+	}
+	rest := strings.TrimPrefix(tradeID, prefix)
+	if len(rest) < len("2006-01-02-X") || rest[10] != '-' {
+		return "", "", false
+	}
+	dateKey, compact := rest[:10], rest[11:]
+	if _, err := time.Parse("2006-01-02", dateKey); err != nil || compact == "" {
+		return "", "", false
+	}
+	if len(compact) != 6 {
+		return "", "", false
+	}
+	return dateKey, compact[:3] + "/" + compact[3:], true
 }
 
 func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, dateKey string, strengthStart, strengthEnd time.Time) error {
@@ -448,6 +597,7 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 
 	enteredAt := r.now().UTC()
 	r.state = &currencyStrengthRunState{
+		AccountID:      r.accountID,
 		Date:           dateKey,
 		Symbol:         decision.Signal.Symbol,
 		Side:           decision.Signal.Side,
@@ -494,6 +644,7 @@ func (r *currencyStrengthPaperRunner) adoptWorkingEntry(
 			continue
 		}
 		r.state = &currencyStrengthRunState{
+			AccountID:    r.accountID,
 			Date:         dateKey,
 			Symbol:       signal.Symbol,
 			Side:         signal.Side,
@@ -1072,6 +1223,7 @@ func currencyStrengthRunHasEntry(status string) bool {
 
 func currencyStrengthStateFromRun(run store.CurrencyStrengthRun) *currencyStrengthRunState {
 	state := &currencyStrengthRunState{
+		AccountID:      run.AccountID,
 		Date:           run.SessionDate.Format("2006-01-02"),
 		Symbol:         run.SignalSymbol,
 		Side:           run.SignalSide,
@@ -1308,6 +1460,16 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		logger.Warn("currency-strength: terminal exit history sync failed; will retry", "err", err)
 		return nil
 	}
+	if !r.state.ExitConfirmed {
+		r.notify(ctx, buildCurrencyStrengthFlattenedMessage(
+			r.state.Symbol, r.state.ExitOrderID, r.state.ExitFilledQty, r.state.ExitFillPrice,
+		))
+		r.state.ExitConfirmed = true
+		if err := r.saveState(); err != nil {
+			logger.Warn("currency-strength: failed to persist terminal notification state", "err", err)
+			return nil
+		}
+	}
 	return r.clearState()
 }
 
@@ -1364,27 +1526,18 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 	if r.journal == nil {
 		return nil
 	}
-	var realizedPnL *float64
-	if normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus) == "filled" &&
-		normalizeCurrencyStrengthOrderStatus(r.state.ExitStatus) == "filled" &&
-		!r.state.ExitRetry &&
-		r.state.EntryFillPrice > 0 && r.state.ExitFillPrice > 0 {
-		matchedQty := math.Min(r.state.EntryFilledQty, r.state.ExitFilledQty)
-		if matchedQty > 0 {
-			pnl := (r.state.ExitFillPrice - r.state.EntryFillPrice) * matchedQty
-			if r.state.Side == "sell" {
-				pnl = -pnl
-			}
-			realizedPnL = &pnl
-		}
-	}
-	return r.writeExitJournal(ctx, currencyStrengthExitAudit{
+	audit := currencyStrengthExitAudit{
 		OrderID:   r.state.ExitOrderID,
 		Status:    r.state.ExitStatus,
 		FillPrice: r.state.ExitFillPrice,
 		FilledQty: r.state.ExitFilledQty,
 		ExitedAt:  r.state.ExitedAt,
-	}, realizedPnL)
+	}
+	realizedPnL, err := r.realizedPnLUSD(ctx, audit)
+	if err != nil {
+		return err
+	}
+	return r.writeExitJournal(ctx, audit, realizedPnL)
 }
 
 func (r *currencyStrengthPaperRunner) capturePendingExitAudit() {
@@ -1403,7 +1556,11 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 	}
 	for len(r.state.PendingExitAudits) > 0 {
 		audit := r.state.PendingExitAudits[0]
-		if err := r.writeExitJournal(ctx, audit, nil); err != nil {
+		realizedPnL, err := r.realizedPnLUSD(ctx, audit)
+		if err != nil {
+			return err
+		}
+		if err := r.writeExitJournal(ctx, audit, realizedPnL); err != nil {
 			return err
 		}
 		r.state.PendingExitAudits = r.state.PendingExitAudits[1:]
@@ -1416,6 +1573,64 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 		}
 	}
 	return nil
+}
+
+func (r *currencyStrengthPaperRunner) realizedPnLUSD(
+	ctx context.Context,
+	audit currencyStrengthExitAudit,
+) (*float64, error) {
+	if normalizeCurrencyStrengthOrderStatus(r.state.EntryStatus) != "filled" ||
+		audit.FillPrice <= 0 || audit.FilledQty <= 0 || r.state.EntryFillPrice <= 0 {
+		return nil, nil
+	}
+	parts := strings.Split(strings.ToUpper(r.state.Symbol), "/")
+	if len(parts) != 2 || len(parts[0]) != 3 || len(parts[1]) != 3 {
+		return nil, fmt.Errorf("currency-strength convert P&L for invalid pair %q", r.state.Symbol)
+	}
+	pnl := (audit.FillPrice - r.state.EntryFillPrice) * audit.FilledQty
+	if r.state.Side == "sell" {
+		pnl = -pnl
+	}
+	base, quote := parts[0], parts[1]
+	switch {
+	case quote == "USD":
+		return &pnl, nil
+	case base == "USD":
+		pnl /= audit.FillPrice
+		return &pnl, nil
+	}
+
+	rate, err := r.currencyConversionRate(ctx, quote+"/USD")
+	if err == nil {
+		pnl *= rate
+		return &pnl, nil
+	}
+	inverse, inverseErr := r.currencyConversionRate(ctx, "USD/"+quote)
+	if inverseErr != nil {
+		return nil, fmt.Errorf(
+			"currency-strength convert %s P&L to USD: direct: %v; inverse: %w",
+			quote, err, inverseErr,
+		)
+	}
+	pnl /= inverse
+	return &pnl, nil
+}
+
+func (r *currencyStrengthPaperRunner) currencyConversionRate(ctx context.Context, symbol string) (float64, error) {
+	quote, err := r.market.FetchQuote(ctx, symbol)
+	if err != nil {
+		return 0, err
+	}
+	rate := quote.Last
+	if quote.Bid > 0 && quote.Ask > 0 {
+		rate = (quote.Bid + quote.Ask) / 2
+	} else if rate <= 0 {
+		rate = math.Max(quote.Bid, quote.Ask)
+	}
+	if rate <= 0 {
+		return 0, fmt.Errorf("%s quote has no positive price", symbol)
+	}
+	return rate, nil
 }
 
 func (r *currencyStrengthPaperRunner) writeExitJournal(
@@ -1567,6 +1782,14 @@ func (r *currencyStrengthPaperRunner) loadState() error {
 	if err := json.Unmarshal(b, &state); err != nil {
 		return fmt.Errorf("currency-strength decode state: %w", err)
 	}
+	if r.accountID != "" &&
+		normalizeCurrencyStrengthAccountID(state.AccountID) != r.accountID {
+		return fmt.Errorf(
+			"currency-strength state belongs to account %q, current account is %q",
+			state.AccountID, r.accountID,
+		)
+	}
+	state.AccountID = normalizeCurrencyStrengthAccountID(state.AccountID)
 	if state.Symbol != "" && state.Quantity > 0 {
 		r.state = &state
 	}
@@ -1580,11 +1803,14 @@ func (r *currencyStrengthPaperRunner) saveState() error {
 	if err := os.MkdirAll(filepath.Dir(r.statePath), 0750); err != nil {
 		return fmt.Errorf("currency-strength create state dir: %w", err)
 	}
+	if r.accountID != "" {
+		r.state.AccountID = r.accountID
+	}
 	b, err := json.MarshalIndent(r.state, "", "  ")
 	if err != nil {
 		return fmt.Errorf("currency-strength encode state: %w", err)
 	}
-	return os.WriteFile(r.statePath, b, 0600)
+	return writeCurrencyStrengthStateAtomic(r.statePath, b)
 }
 
 func (r *currencyStrengthPaperRunner) clearState() error {
@@ -1595,16 +1821,69 @@ func (r *currencyStrengthPaperRunner) clearState() error {
 	return nil
 }
 
-func defaultCurrencyStrengthStatePath() string {
+func writeCurrencyStrengthStateAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("currency-strength create temporary state: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return fmt.Errorf("currency-strength chmod temporary state: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("currency-strength write temporary state: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("currency-strength sync temporary state: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("currency-strength close temporary state: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("currency-strength replace state: %w", err)
+	}
+	if dirHandle, err := os.Open(dir); err == nil {
+		if syncErr := dirHandle.Sync(); syncErr != nil {
+			_ = dirHandle.Close()
+			return fmt.Errorf("currency-strength sync state directory: %w", syncErr)
+		}
+		_ = dirHandle.Close()
+	}
+	return nil
+}
+
+func defaultCurrencyStrengthStatePath(accountID string) string {
+	accountKey := strings.ToLower(normalizeCurrencyStrengthAccountID(accountID))
+	accountKey = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		default:
+			return '-'
+		}
+	}, accountKey)
+	if accountKey == "" {
+		accountKey = "unknown"
+	}
+	filename := "currency_strength_state_" + accountKey + ".json"
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
-		return filepath.Join(os.TempDir(), "tradeengine-currency-strength-state.json")
+		return filepath.Join(os.TempDir(), "tradeengine-"+filename)
 	}
-	return filepath.Join(home, ".tradeengine", "currency_strength_state.json")
+	return filepath.Join(home, ".tradeengine", filename)
 }
 
 func isIBKRPaperAccountID(accountID string) bool {
-	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(accountID)), "DU")
+	return strings.HasPrefix(normalizeCurrencyStrengthAccountID(accountID), "DU")
+}
+
+func normalizeCurrencyStrengthAccountID(accountID string) string {
+	return strings.ToUpper(strings.TrimSpace(accountID))
 }
 
 func currencyStrengthShouldExitState(state *currencyStrengthRunState, dateKey string, now, exitTime time.Time) bool {

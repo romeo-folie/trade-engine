@@ -15,6 +15,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
+	accountID := "DU-CURRENCY-STRENGTH-TEST"
 	base := time.Date(2198, 7, 27, 0, 0, 0, 0, time.UTC)
 	dates := []time.Time{base, base.AddDate(0, 0, -1), base.AddDate(0, 0, -2)}
 	t.Cleanup(func() {
@@ -27,6 +28,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 
 	for _, date := range dates {
 		if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+			AccountID:        accountID,
 			SessionDate:      date,
 			Timezone:         "UTC",
 			StrengthStart:    "06:00",
@@ -41,10 +43,11 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 
 	enteredAt := base.Add(9 * time.Hour)
-	if err := store.MarkCurrencyStrengthEvaluating(ctx, db, base); err != nil {
+	if err := store.MarkCurrencyStrengthEvaluating(ctx, db, accountID, base); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		AccountID:         accountID,
 		SessionDate:       base,
 		StrongestCurrency: "GBP",
 		WeakestCurrency:   "USD",
@@ -62,6 +65,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	exitedAt := base.Add(18 * time.Hour)
 	pnl := 500.0
 	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID:     accountID,
 		SessionDate:   base,
 		ExitOrderID:   "EXIT-TEST",
 		ExitStatus:    "filled",
@@ -74,6 +78,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 	// Replaying the same terminal acknowledgement after a crash is idempotent.
 	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID:     accountID,
 		SessionDate:   base,
 		ExitOrderID:   "EXIT-TEST",
 		ExitStatus:    "filled",
@@ -85,11 +90,12 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 		t.Fatalf("terminal exit replay: %v", err)
 	}
 	if err := store.RecordCurrencyStrengthNoSignal(
-		ctx, db, dates[1], "minimum strength gap not met",
+		ctx, db, accountID, dates[1], "minimum strength gap not met",
 	); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+		AccountID:        accountID,
 		SessionDate:      dates[1],
 		Timezone:         "America/New_York",
 		StrengthStart:    "07:00",
@@ -101,7 +107,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	immutable, err := store.GetCurrencyStrengthRunByDate(ctx, db, dates[1])
+	immutable, err := store.GetCurrencyStrengthRunByDate(ctx, db, accountID, dates[1])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,6 +116,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 		t.Fatalf("completed run configuration was mutated: %+v", immutable)
 	}
 	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		AccountID:      accountID,
 		SessionDate:    dates[2],
 		SignalSymbol:   "GBP/USD",
 		SignalSide:     "buy",
@@ -119,7 +126,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	submitted, err := store.GetCurrencyStrengthRunByDate(ctx, db, dates[2])
+	submitted, err := store.GetCurrencyStrengthRunByDate(ctx, db, accountID, dates[2])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,6 +135,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 	pendingExitAt := dates[2].Add(18 * time.Hour)
 	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID:   accountID,
 		SessionDate: dates[2],
 		ExitOrderID: "EXIT-PENDING",
 		ExitStatus:  "pending",
@@ -154,7 +162,7 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	if second[0].Status != "exit_submitted" {
 		t.Fatalf("pending flatten presented as %q, want exit_submitted", second[0].Status)
 	}
-	active, err := store.GetActiveCurrencyStrengthRun(ctx, db, base)
+	active, err := store.GetActiveCurrencyStrengthRun(ctx, db, accountID, base)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +184,7 @@ func TestGetRecentORBSessionsPageUsesOffset(t *testing.T) {
 		fmt.Sprintf("page-%d-0", suffix),
 		fmt.Sprintf("page-%d-1", suffix),
 		fmt.Sprintf("page-%d-2", suffix),
+		fmt.Sprintf("page-%d-new", suffix),
 	}
 	t.Cleanup(func() {
 		_, _ = db.Exec(
@@ -184,18 +193,25 @@ func TestGetRecentORBSessionsPageUsesOffset(t *testing.T) {
 			names,
 		)
 	})
-	for _, name := range names {
+	for _, name := range names[:3] {
 		if _, err := store.CreateORBSession(ctx, db, date, name); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(3 * time.Millisecond)
 	}
 
-	first, err := store.GetRecentORBSessionsPage(ctx, db, 2, 0)
+	snapshot, err := store.ORBSessionsSnapshotTime(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.GetRecentORBSessionsPage(ctx, db, 2, 2)
+	first, err := store.GetRecentORBSessionsPageAt(ctx, db, 2, 0, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateORBSession(ctx, db, date, names[3]); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.GetRecentORBSessionsPageAt(ctx, db, 2, 2, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,5 +221,85 @@ func TestGetRecentORBSessionsPageUsesOffset(t *testing.T) {
 	}
 	if len(second) == 0 || second[0].SessionName != names[0] {
 		t.Fatalf("unexpected second ORB page: %+v", second)
+	}
+}
+
+func TestCurrencyStrengthRunsAreAccountScopedAndAggregateExitAttempts(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	sessionDate := time.Date(2197, 7, 27, 0, 0, 0, 0, time.UTC)
+	t.Cleanup(func() {
+		_, _ = db.Exec(context.Background(),
+			`DELETE FROM currency_strength_runs WHERE session_date=$1`, sessionDate)
+	})
+	start := func(account string) {
+		t.Helper()
+		if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+			AccountID: account, SessionDate: sessionDate, Timezone: "UTC",
+			StrengthStart: "06:00", StrengthEnd: "09:00", ExitTime: "18:00",
+			RankInstruments: []string{"GBP/USD"}, TradeInstruments: []string{"GBP/USD"},
+			Units: 100000,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	start("DU-ACCOUNT-A")
+	start("DU-ACCOUNT-B")
+
+	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		AccountID: "DU-ACCOUNT-A", SessionDate: sessionDate,
+		SignalSymbol: "GBP/USD", SignalSide: "buy", EntryOrderID: "ENTRY-A",
+		EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	firstPnL, secondPnL := 200.0, 360.0
+	for _, attempt := range []store.CurrencyStrengthRun{
+		{
+			AccountID: "DU-ACCOUNT-A", SessionDate: sessionDate,
+			ExitOrderID: "EXIT-A-1", ExitStatus: "residual",
+			ExitFillPrice: 1.105, ExitFilledQty: 40000, RealizedPnL: &firstPnL,
+		},
+		{
+			AccountID: "DU-ACCOUNT-A", SessionDate: sessionDate,
+			ExitOrderID: "EXIT-A-2", ExitStatus: "filled",
+			ExitFillPrice: 1.106, ExitFilledQty: 60000, RealizedPnL: &secondPnL,
+		},
+	} {
+		if err := store.RecordCurrencyStrengthExit(ctx, db, attempt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Replaying the second acknowledgement must not double-count it.
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: "DU-ACCOUNT-A", SessionDate: sessionDate,
+		ExitOrderID: "EXIT-A-2", ExitStatus: "filled",
+		ExitFillPrice: 1.106, ExitFilledQty: 60000, RealizedPnL: &secondPnL,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	runA, err := store.GetCurrencyStrengthRunByDate(ctx, db, "DU-ACCOUNT-A", sessionDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runB, err := store.GetCurrencyStrengthRunByDate(ctx, db, "DU-ACCOUNT-B", sessionDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runA == nil || runA.ExitFilledQty != 100000 || runA.RealizedPnL == nil ||
+		*runA.RealizedPnL != 560 || runA.ExitFillPrice < 1.10559 ||
+		runA.ExitFillPrice > 1.10561 {
+		if runA == nil {
+			t.Fatal("account A run missing")
+		}
+		t.Fatalf("exit attempts were not aggregated idempotently: qty=%.2f price=%.8f pnl=%v run=%+v",
+			runA.ExitFilledQty, runA.ExitFillPrice, runA.RealizedPnL, runA)
+	}
+	if runB == nil || runB.Status != "scheduled" || runB.EntryOrderID != "" {
+		t.Fatalf("account B was contaminated by account A: %+v", runB)
 	}
 }

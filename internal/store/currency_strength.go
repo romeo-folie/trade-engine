@@ -15,6 +15,7 @@ import (
 // market order before reporting its execution.
 type CurrencyStrengthRun struct {
 	ID                string
+	AccountID         string
 	SessionDate       time.Time
 	Status            string
 	Timezone          string
@@ -56,10 +57,10 @@ func StartCurrencyStrengthRun(
 ) error {
 	_, err := db.Exec(ctx, `
 		INSERT INTO currency_strength_runs (
-			session_date, status, timezone, strength_start, strength_end, exit_time,
+			account_id, session_date, status, timezone, strength_start, strength_end, exit_time,
 			rank_instruments, trade_instruments, units
-		) VALUES ($1, 'scheduled', $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (session_date) DO UPDATE SET
+		) VALUES ($1, $2, 'scheduled', $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (account_id, session_date) DO UPDATE SET
 			status=CASE
 			    WHEN currency_strength_runs.status='failed' THEN 'scheduled'
 			    ELSE currency_strength_runs.status
@@ -74,7 +75,7 @@ func StartCurrencyStrengthRun(
 			error=NULL,
 			updated_at=NOW()
 		WHERE currency_strength_runs.status IN ('scheduled', 'evaluating', 'failed')`,
-		run.SessionDate, run.Timezone, run.StrengthStart, run.StrengthEnd,
+		run.AccountID, run.SessionDate, run.Timezone, run.StrengthStart, run.StrengthEnd,
 		run.ExitTime, run.RankInstruments, run.TradeInstruments, run.Units,
 	)
 	return err
@@ -85,13 +86,15 @@ func StartCurrencyStrengthRun(
 func MarkCurrencyStrengthEvaluating(
 	ctx context.Context,
 	db *pgxpool.Pool,
+	accountID string,
 	sessionDate time.Time,
 ) error {
 	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status='evaluating', error=NULL, updated_at=NOW()
-		WHERE session_date=$1 AND status IN ('scheduled', 'evaluating')`,
-		sessionDate,
+		WHERE account_id=$1 AND session_date=$2
+		  AND status IN ('scheduled', 'evaluating')`,
+		accountID, sessionDate,
 	)
 	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "mark evaluating")
 }
@@ -101,15 +104,16 @@ func MarkCurrencyStrengthEvaluating(
 func RecordCurrencyStrengthNoSignal(
 	ctx context.Context,
 	db *pgxpool.Pool,
+	accountID string,
 	sessionDate time.Time,
 	reason string,
 ) error {
 	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
-		SET status='no_signal', skip_reason=$2, error=NULL, updated_at=NOW()
-		WHERE session_date=$1
+		SET status='no_signal', skip_reason=$3, error=NULL, updated_at=NOW()
+		WHERE account_id=$1 AND session_date=$2
 		  AND status IN ('scheduled', 'evaluating')`,
-		sessionDate, reason,
+		accountID, sessionDate, reason,
 	)
 	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record no-signal")
 }
@@ -124,23 +128,23 @@ func RecordCurrencyStrengthEntry(
 	tag, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status=CASE
-		        WHEN LOWER($8)='filled' THEN 'entered'
-		        WHEN LOWER($8) IN ('cancelled','rejected') THEN 'entry_failed'
+		        WHEN LOWER($9)='filled' THEN 'entered'
+		        WHEN LOWER($9) IN ('cancelled','rejected') THEN 'entry_failed'
 		        ELSE 'entry_submitted'
 		    END,
-		    strongest_currency=COALESCE(NULLIF($2,''), strongest_currency),
-		    weakest_currency=COALESCE(NULLIF($3,''), weakest_currency),
-		    strength_gap=COALESCE(NULLIF($4, 0), strength_gap),
-		    signal_symbol=$5, signal_side=$6, skip_reason=NULL,
-		    entry_order_id=$7, entry_status=$8,
-		    entry_fill_price=COALESCE(NULLIF($9, 0), entry_fill_price),
-		    entry_filled_qty=COALESCE(NULLIF($10, 0), entry_filled_qty),
-		    entered_at=COALESCE($11, entered_at), error=NULL, updated_at=NOW()
-		WHERE session_date=$1
+		    strongest_currency=COALESCE(NULLIF($3,''), strongest_currency),
+		    weakest_currency=COALESCE(NULLIF($4,''), weakest_currency),
+		    strength_gap=COALESCE(NULLIF($5, 0::double precision), strength_gap),
+		    signal_symbol=$6, signal_side=$7, skip_reason=NULL,
+		    entry_order_id=$8, entry_status=$9,
+		    entry_fill_price=COALESCE(NULLIF($10, 0::double precision), entry_fill_price),
+		    entry_filled_qty=COALESCE(NULLIF($11, 0::double precision), entry_filled_qty),
+		    entered_at=COALESCE($12, entered_at), error=NULL, updated_at=NOW()
+		WHERE account_id=$1 AND session_date=$2
 		  AND status IN (
 		      'scheduled', 'evaluating', 'entry_submitted', 'entered', 'entry_failed'
 		  )`,
-		run.SessionDate, run.StrongestCurrency, run.WeakestCurrency,
+		run.AccountID, run.SessionDate, run.StrongestCurrency, run.WeakestCurrency,
 		run.StrengthGap, run.SignalSymbol, run.SignalSide,
 		run.EntryOrderID, run.EntryStatus, run.EntryFillPrice,
 		run.EntryFilledQty, run.EnteredAt,
@@ -156,32 +160,83 @@ func RecordCurrencyStrengthExit(
 	db *pgxpool.Pool,
 	run CurrencyStrengthRun,
 ) error {
-	tag, err := db.Exec(ctx, `
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var runID string
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM currency_strength_runs
+		WHERE account_id=$1 AND session_date=$2
+		FOR UPDATE`,
+		run.AccountID, run.SessionDate,
+	).Scan(&runID); err != nil {
+		return err
+	}
+	if run.ExitOrderID == "" {
+		return fmt.Errorf("currency-strength record exit requires broker order id")
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO currency_strength_exit_attempts (
+			run_id, broker_order_id, status, fill_price, filled_qty, exited_at, realized_pnl
+		) VALUES ($1, $2, $3, NULLIF($4, 0::double precision), $5, $6, $7)
+		ON CONFLICT (run_id, broker_order_id) DO UPDATE SET
+			status=EXCLUDED.status,
+			fill_price=COALESCE(EXCLUDED.fill_price, currency_strength_exit_attempts.fill_price),
+			filled_qty=GREATEST(EXCLUDED.filled_qty, currency_strength_exit_attempts.filled_qty),
+			exited_at=COALESCE(EXCLUDED.exited_at, currency_strength_exit_attempts.exited_at),
+			realized_pnl=COALESCE(EXCLUDED.realized_pnl, currency_strength_exit_attempts.realized_pnl),
+			updated_at=NOW()`,
+		runID, run.ExitOrderID, run.ExitStatus, run.ExitFillPrice,
+		run.ExitFilledQty, run.ExitedAt, run.RealizedPnL,
+	); err != nil {
+		return err
+	}
+
+	tag, err := tx.Exec(ctx, `
 		UPDATE currency_strength_runs
 		SET status=CASE
-		        WHEN LOWER($3)='filled' THEN 'exited'
-		        WHEN LOWER($3) IN ('cancelled','rejected','residual') THEN 'exit_failed'
+		        WHEN LOWER($4)='filled' THEN 'exited'
+		        WHEN LOWER($4) IN ('cancelled','rejected','residual') THEN 'exit_failed'
 		        ELSE 'exit_submitted'
 		    END,
-		    exit_order_id=$2, exit_status=$3,
-		    exit_fill_price=COALESCE(NULLIF($4, 0), exit_fill_price),
-		    exit_filled_qty=COALESCE(NULLIF($5, 0), exit_filled_qty),
-		    exited_at=COALESCE($6, exited_at),
-		    realized_pnl=COALESCE($7, realized_pnl),
+		    exit_order_id=$3, exit_status=$4,
+		    exit_fill_price=(
+		        SELECT CASE WHEN SUM(filled_qty) > 0
+		            THEN SUM(fill_price * filled_qty) / SUM(filled_qty)
+		            ELSE NULL END
+		        FROM currency_strength_exit_attempts
+		        WHERE run_id=$1 AND fill_price IS NOT NULL
+		    ),
+		    exit_filled_qty=(
+		        SELECT COALESCE(SUM(filled_qty), 0)
+		        FROM currency_strength_exit_attempts WHERE run_id=$1
+		    ),
+		    exited_at=COALESCE($5, exited_at),
+		    realized_pnl=(
+		        SELECT CASE WHEN COUNT(realized_pnl) > 0
+		            THEN SUM(realized_pnl) ELSE NULL END
+		        FROM currency_strength_exit_attempts WHERE run_id=$1
+		    ),
 		    error=NULL, updated_at=NOW()
-		WHERE session_date=$1
+		WHERE id=$1 AND account_id=$2
 		  AND (
 		      status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')
 		      OR (
 		          status='exited'
-		          AND exit_order_id=$2
-		          AND LOWER($3)='filled'
+		          AND exit_order_id=$3
+		          AND LOWER($4)='filled'
 		      )
 		  )`,
-		run.SessionDate, run.ExitOrderID, run.ExitStatus, run.ExitFillPrice,
-		run.ExitFilledQty, run.ExitedAt, run.RealizedPnL,
+		runID, run.AccountID, run.ExitOrderID, run.ExitStatus, run.ExitedAt,
 	)
-	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record exit")
+	if err := requireCurrencyStrengthRow(tag.RowsAffected(), err, "record exit"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // GetCurrencyStrengthRunByDate returns the durable daily state used to restore
@@ -189,10 +244,11 @@ func RecordCurrencyStrengthExit(
 func GetCurrencyStrengthRunByDate(
 	ctx context.Context,
 	db *pgxpool.Pool,
+	accountID string,
 	sessionDate time.Time,
 ) (*CurrencyStrengthRun, error) {
 	row := db.QueryRow(ctx, `
-		SELECT id, session_date, status, timezone, strength_start, strength_end,
+		SELECT id, account_id, session_date, status, timezone, strength_start, strength_end,
 		       exit_time, rank_instruments, trade_instruments, units,
 		       COALESCE(strongest_currency,''), COALESCE(weakest_currency,''),
 		       COALESCE(strength_gap,0), COALESCE(signal_symbol,''),
@@ -204,8 +260,8 @@ func GetCurrencyStrengthRunByDate(
 		       exited_at, realized_pnl, COALESCE(error,''),
 		       created_at, updated_at
 		FROM currency_strength_runs
-		WHERE session_date=$1`,
-		sessionDate,
+		WHERE account_id=$1 AND session_date=$2`,
+		accountID, sessionDate,
 	)
 	var run CurrencyStrengthRun
 	if err := scanCurrencyStrengthRun(row, &run); err != nil {
@@ -223,10 +279,11 @@ func GetCurrencyStrengthRunByDate(
 func GetActiveCurrencyStrengthRun(
 	ctx context.Context,
 	db *pgxpool.Pool,
+	accountID string,
 	sessionDate time.Time,
 ) (*CurrencyStrengthRun, error) {
 	row := db.QueryRow(ctx, `
-		SELECT id, session_date, status, timezone, strength_start, strength_end,
+		SELECT id, account_id, session_date, status, timezone, strength_start, strength_end,
 		       exit_time, rank_instruments, trade_instruments, units,
 		       COALESCE(strongest_currency,''), COALESCE(weakest_currency,''),
 		       COALESCE(strength_gap,0), COALESCE(signal_symbol,''),
@@ -238,14 +295,14 @@ func GetActiveCurrencyStrengthRun(
 		       exited_at, realized_pnl, COALESCE(error,''),
 		       created_at, updated_at
 		FROM currency_strength_runs
-		WHERE session_date <= $1
+		WHERE account_id=$1 AND session_date <= $2
 		  AND (
 		      status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')
 		      OR (status='entry_failed' AND entry_filled_qty > 0)
 		  )
 		ORDER BY session_date DESC
 		LIMIT 1`,
-		sessionDate,
+		accountID, sessionDate,
 	)
 	var run CurrencyStrengthRun
 	if err := scanCurrencyStrengthRun(row, &run); err != nil {
@@ -262,15 +319,16 @@ func GetActiveCurrencyStrengthRun(
 func RecordCurrencyStrengthFailure(
 	ctx context.Context,
 	db *pgxpool.Pool,
+	accountID string,
 	sessionDate time.Time,
 	message string,
 ) error {
 	_, err := db.Exec(ctx, `
 		UPDATE currency_strength_runs
-		SET status='failed', error=$2, updated_at=NOW()
-		WHERE session_date=$1
+		SET status='failed', error=$3, updated_at=NOW()
+		WHERE account_id=$1 AND session_date=$2
 		  AND status IN ('scheduled', 'evaluating')`,
-		sessionDate, message,
+		accountID, sessionDate, message,
 	)
 	return err
 }
@@ -289,7 +347,7 @@ func ListCurrencyStrengthRunsPage(
 		offset = 0
 	}
 	rows, err := db.Query(ctx, `
-		SELECT id, session_date, status, timezone, strength_start, strength_end,
+		SELECT id, account_id, session_date, status, timezone, strength_start, strength_end,
 		       exit_time, rank_instruments, trade_instruments, units,
 		       COALESCE(strongest_currency,''), COALESCE(weakest_currency,''),
 		       COALESCE(strength_gap,0), COALESCE(signal_symbol,''),
@@ -301,7 +359,7 @@ func ListCurrencyStrengthRunsPage(
 		       exited_at, realized_pnl, COALESCE(error,''),
 		       created_at, updated_at
 		FROM currency_strength_runs
-		ORDER BY session_date DESC, created_at DESC
+		ORDER BY session_date DESC, created_at DESC, id DESC
 		LIMIT $1 OFFSET $2`,
 		limit, offset,
 	)
@@ -327,7 +385,7 @@ type currencyStrengthScanner interface {
 
 func scanCurrencyStrengthRun(scanner currencyStrengthScanner, run *CurrencyStrengthRun) error {
 	return scanner.Scan(
-		&run.ID, &run.SessionDate, &run.Status, &run.Timezone,
+		&run.ID, &run.AccountID, &run.SessionDate, &run.Status, &run.Timezone,
 		&run.StrengthStart, &run.StrengthEnd, &run.ExitTime,
 		&run.RankInstruments, &run.TradeInstruments, &run.Units,
 		&run.StrongestCurrency, &run.WeakestCurrency, &run.StrengthGap,

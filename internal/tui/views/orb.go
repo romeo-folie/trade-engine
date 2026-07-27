@@ -19,6 +19,7 @@ type ORBViewData struct {
 	Page       int
 	HasNewer   bool
 	HasOlder   bool
+	SnapshotAt time.Time
 	Err        string
 }
 
@@ -219,6 +220,12 @@ func FetchORBViewData(ctx context.Context) (d ORBViewData) {
 // is requested only to determine whether the operator can navigate farther
 // into history; it is never rendered on the current page.
 func FetchORBViewDataPage(ctx context.Context, page int) (d ORBViewData) {
+	return FetchORBViewDataPageAt(ctx, page, time.Time{})
+}
+
+// FetchORBViewDataPageAt keeps a browsing session pinned to one database
+// snapshot so newly inserted sessions do not repeat or skip rows.
+func FetchORBViewDataPageAt(ctx context.Context, page int, snapshotAt time.Time) (d ORBViewData) {
 	if page < 0 {
 		page = 0
 	}
@@ -230,14 +237,23 @@ func FetchORBViewDataPage(ctx context.Context, page int) (d ORBViewData) {
 		return d
 	}
 	db := store.GetDB()
+	if snapshotAt.IsZero() {
+		var err error
+		snapshotAt, err = store.ORBSessionsSnapshotTime(ctx, db)
+		if err != nil {
+			d.Err = err.Error()
+			return d
+		}
+	}
+	d.SnapshotAt = snapshotAt
 
 	// A single trading day has up to 4 concurrent sessions (equities + forex + futures for
 	// orb-newyork, plus a morning london forex session), so a limit of 3 truncated a day and
 	// hid the futures panel. 6 covers a full day plus a little history; the view scrolls
 	// (j/k) so panels past the first screenful stay reachable. created_at-DESC ordering
 	// puts the newest sessions (today's, incl. futures) FIRST.
-	sessions, err := store.GetRecentORBSessionsPage(
-		ctx, db, IntradaySessionPageSize+1, page*IntradaySessionPageSize,
+	sessions, err := store.GetRecentORBSessionsPageAt(
+		ctx, db, IntradaySessionPageSize+1, page*IntradaySessionPageSize, snapshotAt,
 	)
 	if err != nil || len(sessions) == 0 {
 		if err != nil {

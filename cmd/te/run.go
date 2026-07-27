@@ -435,9 +435,13 @@ Modes:
 						if err := validateCurrencyStrengthPaperConfig(cfg, runDryRun); err != nil {
 							return err
 						}
-						runner := newCurrencyStrengthPaperRunner(cfg.CurrencyStrength, ibkrData, ibkrBroker)
+						runner := newCurrencyStrengthPaperRunner(
+							cfg.CurrencyStrength, cfg.Markets.IBKR.AccountID, ibkrData, ibkrBroker,
+						)
 						if store.IsConnected() {
-							runner.SetJournal(dbCurrencyStrengthJournal{})
+							runner.SetJournal(dbCurrencyStrengthJournal{
+								accountID: normalizeCurrencyStrengthAccountID(cfg.Markets.IBKR.AccountID),
+							})
 						}
 						if tgBot != nil {
 							runner.SetNotifier(&orbTelegramNotifier{bot: tgBot})

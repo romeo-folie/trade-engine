@@ -508,7 +508,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh ORB view on any ORB-related event.
 		switch evt.Type {
 		case events.ORBStateChanged, events.ORBCandidatesReady, events.ORBTradeUpdate:
-			m.orbData = views.FetchORBViewDataPage(ctx, m.orbPage)
+			snapshot := m.orbData.SnapshotAt
+			if m.orbPage == 0 {
+				snapshot = time.Time{}
+			}
+			m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, snapshot)
 		}
 		// Continue listening for events.
 		if m.sub != nil {
@@ -524,7 +528,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.signalData = views.FetchSignalFeed(ctx, 50)
 		m.watchlistData = views.FetchWatchlistData(ctx)
 		m.configData = views.FetchConfigData(ctx, m.mode)
-		m.orbData = views.FetchORBViewDataPage(ctx, m.orbPage)
+		snapshot := m.orbData.SnapshotAt
+		if m.orbPage == 0 {
+			snapshot = time.Time{}
+		}
+		m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, snapshot)
 		m.currencyStrengthData = views.FetchCurrencyStrengthViewData(ctx, m.currencyStrengthPage)
 		// Next engine run-cycle time, published by the engine process to engine_state.
 		m.nextCycleAt = time.Time{}
@@ -612,7 +620,7 @@ func (m *Model) pageIntraday(delta int) {
 			return
 		}
 		m.orbPage = max(m.orbPage+delta, 0)
-		m.orbData = views.FetchORBViewDataPage(ctx, m.orbPage)
+		m.orbData = views.FetchORBViewDataPageAt(ctx, m.orbPage, m.orbData.SnapshotAt)
 	}
 	m.intradayScroll = 0
 }

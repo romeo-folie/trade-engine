@@ -55,6 +55,7 @@ type EquityHistory struct {
 // BrokerOrder is an order as reported by the broker (typically a recent fill).
 type BrokerOrder struct {
 	BrokerOrderID string    `json:"broker_order_id"`
+	TradeID       string    `json:"trade_id,omitempty"`
 	Symbol        string    `json:"symbol"`
 	Side          string    `json:"side"`
 	Qty           float64   `json:"qty"`

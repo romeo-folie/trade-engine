@@ -294,12 +294,21 @@ func TestBuildCurrencyStrengthNoOrderMessage(t *testing.T) {
 func TestBuildCurrencyStrengthExitMessage(t *testing.T) {
 	msg := buildCurrencyStrengthExitMessage("USD/JPY", execution.OrderSideSell, 100000, "OID-X", "Filled")
 	for _, want := range []string{
-		"position flattened",
+		"exit submitted",
 		"SELL USD/JPY · 100000 units",
 		"Order OID-X · Filled",
 	} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("exit message missing %q\ngot:\n%s", want, msg)
+		}
+	}
+}
+
+func TestBuildCurrencyStrengthFlattenedMessage(t *testing.T) {
+	msg := buildCurrencyStrengthFlattenedMessage("USD/JPY", "OID-X", 100000, 151.25)
+	for _, want := range []string{"position flattened", "confirmed closed", "fill 151.25000"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("flattened message missing %q\ngot:\n%s", want, msg)
 		}
 	}
 }
@@ -344,6 +353,7 @@ type successfulCurrencyStrengthExecutor struct {
 	result             execution.OrderResult
 	statusResult       execution.OrderResult
 	positions          []execution.Position
+	recentFills        []execution.BrokerOrder
 	requests           []execution.OrderRequest
 	calls              int
 	keepPositionOnFill bool
@@ -427,6 +437,102 @@ func (f *successfulCurrencyStrengthExecutor) GetPositions(context.Context) ([]ex
 
 func (*successfulCurrencyStrengthExecutor) GetAccount(context.Context) (execution.AccountInfo, error) {
 	return execution.AccountInfo{}, nil
+}
+
+func (f *successfulCurrencyStrengthExecutor) RecentFills(context.Context) ([]execution.BrokerOrder, error) {
+	return f.recentFills, nil
+}
+
+func TestCurrencyStrengthRecoversImmediatelyFilledEntryByTradeID(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 75000, AvgCostBasis: 1.10125,
+		}},
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "ENTRY-FILLED",
+			TradeID:       "currency-strength-2026-07-27-GBPUSD",
+			Symbol:        "GBP",
+			Side:          "buy",
+			FilledQty:     100000,
+			FilledAvgPx:   1.1,
+			FilledAt:      time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC),
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		accountID: "DU123",
+		cfg: config.CurrencyStrengthConfig{
+			Units: 100000,
+		},
+		broker:    broker,
+		statePath: t.TempDir() + "/currency-strength.json",
+	}
+	recovered, err := runner.recoverFilledEntry(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !recovered || runner.state == nil {
+		t.Fatalf("filled strategy entry was not recovered: %+v", runner.state)
+	}
+	if runner.state.AccountID != "DU123" || runner.state.Symbol != "GBP/USD" ||
+		runner.state.Quantity != 75000 || runner.state.EntryFilledQty != 75000 ||
+		runner.state.EntryFillPrice != 1.10125 {
+		t.Fatalf("recovery did not adopt broker position truth: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthNotifiesSubmittedThenConfirmedFlat(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-NOTIFY",
+			Status:        "filled",
+			FilledPrice:   1.105,
+			FilledQty:     100000,
+		},
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 100000, AvgCostBasis: 1.1,
+		}},
+	}
+	notifier := &captureNotifier{}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, notifier: notifier,
+		statePath:     t.TempDir() + "/currency-strength.json",
+		entryRecorded: true,
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+		},
+		now: func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(notifier.msgs) != 2 ||
+		!strings.Contains(notifier.msgs[0], "exit submitted") ||
+		!strings.Contains(notifier.msgs[1], "position flattened") {
+		t.Fatalf("exit lifecycle notifications were not truthful: %v", notifier.msgs)
+	}
+}
+
+func TestCurrencyStrengthStateRejectsAnotherAccount(t *testing.T) {
+	path := t.TempDir() + "/currency-strength.json"
+	writer := &currencyStrengthPaperRunner{
+		accountID: "DU111",
+		statePath: path,
+		state: &currencyStrengthRunState{
+			AccountID: "DU111", Date: "2026-07-27", Symbol: "GBP/USD",
+			Side: "buy", Quantity: 100000,
+		},
+	}
+	if err := writer.saveState(); err != nil {
+		t.Fatal(err)
+	}
+	reader := &currencyStrengthPaperRunner{accountID: "DU222", statePath: path}
+	if err := reader.loadState(); err == nil {
+		t.Fatal("state from a different IBKR account was accepted")
+	}
+	if reader.state != nil {
+		t.Fatalf("cross-account state was loaded: %+v", reader.state)
+	}
 }
 
 func TestCurrencyStrengthCancelledEntryWithFillRetainsExposure(t *testing.T) {
@@ -1143,8 +1249,8 @@ func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *te
 		t.Fatalf("residual exits reused broker client order id %q", broker.requests[0].TradeID)
 	}
 	last := journal.exits[len(journal.exits)-1]
-	if last.RealizedPnL != nil {
-		t.Fatalf("multi-order exit published incomplete realized P&L: %+v", last)
+	if last.RealizedPnL == nil || *last.RealizedPnL < 149.99 || *last.RealizedPnL > 150.01 {
+		t.Fatalf("second exit attempt P&L was not recorded independently: %+v", last)
 	}
 }
 
@@ -1283,6 +1389,7 @@ func TestCurrencyStrengthPnLUsesMatchedFilledQuantity(t *testing.T) {
 		journal:       journal,
 		state: &currencyStrengthRunState{
 			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
 			Side:           "buy",
 			EntryStatus:    "filled",
 			EntryFillPrice: 1.100,
@@ -1302,6 +1409,27 @@ func TestCurrencyStrengthPnLUsesMatchedFilledQuantity(t *testing.T) {
 	}
 	if got := *journal.exits[0].RealizedPnL; got < 199.99 || got > 200.01 {
 		t.Fatalf("matched-fill P&L = %.2f, want 200.00", got)
+	}
+}
+
+func TestCurrencyStrengthPnLConvertsUSDJPYQuoteCurrencyToUSD(t *testing.T) {
+	runner := &currencyStrengthPaperRunner{
+		state: &currencyStrengthRunState{
+			Symbol:         "USD/JPY",
+			Side:           "buy",
+			EntryStatus:    "filled",
+			EntryFillPrice: 150,
+		},
+	}
+	pnl, err := runner.realizedPnLUSD(context.Background(), currencyStrengthExitAudit{
+		FillPrice: 151,
+		FilledQty: 100000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pnl == nil || *pnl < 662.24 || *pnl > 662.26 {
+		t.Fatalf("USD/JPY P&L = %v, want about 662.25 USD", pnl)
 	}
 }
 
