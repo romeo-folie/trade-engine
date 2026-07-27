@@ -217,7 +217,10 @@ func EvaluatePotentIndustries(
 			return groupMembers[i].Ticker < groupMembers[j].Ticker
 		})
 		industry := strings.TrimSpace(groupMembers[0].Industry)
-		sector, sectorAmbiguous := potentGroupSector(groupMembers)
+		freshTaxonomyMembers := potentFreshTaxonomyMembers(
+			groupMembers, decisionAt, policy.TaxonomyMaxAge,
+		)
+		sector, sectorAmbiguous := potentGroupSector(freshTaxonomyMembers)
 		benchmark := resolvePotentBenchmark(industry, sector, policy)
 		evaluation := PotentIndustryGroupEvaluation{
 			Industry: industry, Sector: sector, Benchmark: benchmark, Outcome: "failed",
@@ -225,7 +228,7 @@ func EvaluatePotentIndustries(
 		groupIndex := len(result.Groups)
 		result.Groups = append(result.Groups, evaluation)
 		prepared := potentIndustryPreparedGroup{index: groupIndex, marketBars: completedMarket}
-		freshTaxonomyCount := 0
+		freshTaxonomyCount := len(freshTaxonomyMembers)
 
 		if marketErr != nil {
 			result.Groups[groupIndex].FailureStage = "market_benchmark"
@@ -275,7 +278,6 @@ func EvaluatePotentIndustries(
 				result.Members[memberIndex].FailureReason = reason
 				continue
 			}
-			freshTaxonomyCount++
 			if member.MarketCapMM == nil || *member.MarketCapMM <= 0 ||
 				math.IsNaN(*member.MarketCapMM) || math.IsInf(*member.MarketCapMM, 0) {
 				result.Members[memberIndex].FailureStage = "market_cap"
@@ -457,6 +459,20 @@ func potentTaxonomyFailure(
 		return "taxonomy is stale at the decision cutoff"
 	}
 	return ""
+}
+
+func potentFreshTaxonomyMembers(
+	members []store.SwingUniverseMember,
+	decisionAt time.Time,
+	maxAge time.Duration,
+) []store.SwingUniverseMember {
+	fresh := make([]store.SwingUniverseMember, 0, len(members))
+	for _, member := range members {
+		if potentTaxonomyFailure(member, decisionAt, maxAge) == "" {
+			fresh = append(fresh, member)
+		}
+	}
+	return fresh
 }
 
 func potentMemberFeatures(bars []data.Candle) PotentIndustryMemberFeatures {

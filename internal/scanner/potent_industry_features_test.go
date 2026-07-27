@@ -201,6 +201,49 @@ func TestEvaluatePotentIndustriesFailsClosedOnCoverageAndTaxonomy(t *testing.T) 
 	}
 }
 
+func TestEvaluatePotentIndustriesDerivesSectorOnlyFromFreshTaxonomy(t *testing.T) {
+	target, asOf, decisionAt := potentTestTimes()
+	market := potentTestBars("SPY", target, 100, constantPotentReturns(253, .0001), 1)
+	sector := potentTestBars("XLK", target, 100, constantPotentReturns(253, .0001), 1)
+	members := potentTestMembers(
+		decisionAt, "Software", store.UnknownTaxonomy,
+		[]float64{1000, 900, 800, 700, 600, 500},
+	)
+	stale := decisionAt.Add(-8 * 24 * time.Hour)
+	members[5].Sector = "Technology"
+	members[5].TaxonomyAsOf = &stale
+	bars := make(map[string][]data.Candle, len(members))
+	for _, member := range members {
+		bars[member.Ticker] = potentTestBars(
+			member.Ticker, target, 20, constantPotentReturns(253, .002), 1.5,
+		)
+	}
+	policy := potentTestPolicy()
+	policy.MinGroupCoverage = .8
+	policy.MinFreshTaxonomyCoverage = .8
+	unmapped := EvaluatePotentIndustries(
+		members, bars, market, map[string][]data.Candle{"XLK": sector},
+		target, asOf, decisionAt, policy,
+	)
+	if group := unmapped.Groups[0]; group.Sector != store.UnknownTaxonomy ||
+		group.Benchmark != "" || group.FailureStage != "benchmark_unmapped" {
+		t.Fatalf("stale taxonomy selected the sector benchmark: %+v", group)
+	}
+
+	for i := range members[:5] {
+		members[i].Sector = "Technology"
+	}
+	members[5].Sector = "Financials"
+	freshConsensus := EvaluatePotentIndustries(
+		members, bars, market, map[string][]data.Candle{"XLK": sector},
+		target, asOf, decisionAt, policy,
+	)
+	if group := freshConsensus.Groups[0]; group.Sector != "Technology" ||
+		group.Benchmark != "XLK" || group.FailureStage == "sector_taxonomy" {
+		t.Fatalf("stale conflict contaminated fresh sector consensus: %+v", group)
+	}
+}
+
 func TestEvaluatePotentIndustriesRetainsUnknownTaxonomyDenominator(t *testing.T) {
 	target, asOf, decisionAt := potentTestTimes()
 	market := potentTestBars("SPY", target, 100, constantPotentReturns(253, .0001), 1)

@@ -245,6 +245,33 @@ func TestPotentIndustryRunnerMarketFailureFailsClaimedRun(t *testing.T) {
 	}
 }
 
+func TestPotentIndustryBenchmarkPrefetchUsesFreshTaxonomy(t *testing.T) {
+	_, _, decisionAt := potentTestTimes()
+	cfg := potentRunnerConfig()
+	members := potentTestMembers(
+		decisionAt, "Software", store.UnknownTaxonomy,
+		[]float64{1000, 900, 800, 700, 600, 500},
+	)
+	stale := decisionAt.Add(-8 * 24 * time.Hour)
+	members[5].Sector = "Technology"
+	members[5].TaxonomyAsOf = &stale
+	got := potentIndustryResolvedBenchmarkSymbols(
+		members, "SPY", cfg, decisionAt,
+	)
+	if !slices.Equal(got, []string{"SPY"}) {
+		t.Fatalf("stale taxonomy caused benchmark prefetch: %v", got)
+	}
+	for i := range members[:5] {
+		members[i].Sector = "Technology"
+	}
+	got = potentIndustryResolvedBenchmarkSymbols(
+		members, "SPY", cfg, decisionAt,
+	)
+	if !slices.Equal(got, []string{"SPY", "XLK"}) {
+		t.Fatalf("fresh taxonomy benchmark prefetch = %v", got)
+	}
+}
+
 func TestPotentIndustryStoreRowsRetainsUnknownTaxonomyDenominator(t *testing.T) {
 	target, asOf, decisionAt := potentTestTimes()
 	member := potentTestMembers(

@@ -164,7 +164,7 @@ func (r *PotentIndustryRunner) RunSession(
 	}()
 
 	benchmarkSymbols := potentIndustryResolvedBenchmarkSymbols(
-		members, marketBenchmark, r.Cfg,
+		members, marketBenchmark, r.Cfg, decisionAt,
 	)
 	symbols := potentIndustryHistorySymbols(members, benchmarkSymbols)
 	historyDays := r.Cfg.HistoryCalendarDays
@@ -288,6 +288,7 @@ func potentIndustryResolvedBenchmarkSymbols(
 	members []store.SwingUniverseMember,
 	marketBenchmark string,
 	cfg config.PotentIndustryConfig,
+	decisionAt time.Time,
 ) []string {
 	symbols := []string{strings.ToUpper(strings.TrimSpace(marketBenchmark))}
 	groups := make(map[string][]store.SwingUniverseMember)
@@ -302,7 +303,13 @@ func potentIndustryResolvedBenchmarkSymbols(
 	}
 	policy := potentIndustryPolicy(cfg)
 	for _, group := range groups {
-		sector, _ := potentGroupSector(group)
+		fresh := potentFreshTaxonomyMembers(
+			group, decisionAt, policy.TaxonomyMaxAge,
+		)
+		if len(fresh) == 0 {
+			continue
+		}
+		sector, _ := potentGroupSector(fresh)
 		if symbol := resolvePotentBenchmark(group[0].Industry, sector, policy); symbol != "" {
 			symbols = append(symbols, symbol)
 		}
