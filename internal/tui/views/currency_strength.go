@@ -132,11 +132,20 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Outcome: "), displayText(run.SkipReason, "no qualifying signal"))
 	case "entry_failed":
 		fmt.Fprintf(
-			&b, "%sorder %s · %s\n",
+			&b, "%s%s %s  order %s · %s%s\n",
 			labelStyle.Render("Entry failed: "),
+			strings.ToUpper(run.SignalSide),
+			displayText(run.SignalSymbol, "unknown instrument"),
 			displayText(run.EntryOrderID, "unknown"),
 			displayText(run.EntryStatus, "rejected"),
+			formatFill(run.EntryFillPrice, run.EntryFilledQty),
 		)
+		if run.EntryFilledQty > 0 {
+			fmt.Fprintf(
+				&b, "%s%.0f units filled; broker exposure requires reconciliation\n",
+				labelStyle.Render("Exposure: "), run.EntryFilledQty,
+			)
+		}
 	case "failed":
 		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Failure: "), displayText(run.Error, "unknown error"))
 	case "entry_submitted", "entered", "exit_submitted", "exit_failed", "exited":

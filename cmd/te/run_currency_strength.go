@@ -443,19 +443,33 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		Weakest:        decision.Signal.Weak,
 		StrengthGap:    decision.Signal.Gap,
 	}
-	if err := r.saveState(); err != nil {
+	if err := r.persistActiveEntryRecovery(ctx); err != nil {
 		return err
-	}
-	if err := r.syncActiveEntryJournal(ctx); err != nil {
-		// Do not stop after the broker has accepted an order. The saved sidecar
-		// lets this process (or a restart) retry the history write safely.
-		logger.Warn("currency-strength: entry history sync failed; will retry", "err", err)
 	}
 	logger.Info("currency-strength: IBKR paper entry submitted",
 		"date", dateKey, "symbol", decision.Signal.Symbol, "side", decision.Signal.Side,
 		"quantity", r.cfg.Units, "order_id", result.BrokerOrderID, "status", result.Status,
 		"strong", decision.Signal.Strong, "weak", decision.Signal.Weak, "gap", decision.Signal.Gap)
 	r.notify(ctx, buildCurrencyStrengthEntryMessage(*decision.Signal, r.cfg.Units, result.BrokerOrderID, result.Status))
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) persistActiveEntryRecovery(ctx context.Context) error {
+	sidecarErr := r.saveState()
+	journalErr := r.syncActiveEntryJournal(ctx)
+	switch {
+	case sidecarErr != nil && (journalErr != nil || r.journal == nil):
+		return fmt.Errorf(
+			"currency-strength entry accepted but no recovery source persisted (sidecar: %v; journal: %v)",
+			sidecarErr, journalErr,
+		)
+	case sidecarErr != nil:
+		logger.Warn("currency-strength: entry sidecar unavailable; durable journal will drive recovery", "err", sidecarErr)
+	case journalErr != nil:
+		// Do not stop after the broker has accepted an order. The saved sidecar
+		// lets this process (or a restart) retry the history write safely.
+		logger.Warn("currency-strength: entry history sync failed; will retry", "err", journalErr)
+	}
 	return nil
 }
 
@@ -958,8 +972,9 @@ func (r *currencyStrengthPaperRunner) restoreCurrencyStrengthRun(run store.Curre
 		return
 	}
 	if r.state.Date == run.SessionDate.Format("2006-01-02") {
+		journalCoversEntry := currencyStrengthJournalCoversEntry(r.state, run)
 		mergeCurrencyStrengthRunIntoState(r.state, run)
-		r.entryRecorded = currencyStrengthRunHasEntry(run.Status)
+		r.entryRecorded = currencyStrengthRunHasEntry(run.Status) && journalCoversEntry
 	}
 }
 
@@ -975,8 +990,9 @@ func (r *currencyStrengthPaperRunner) mergeActiveStateFromJournal(ctx context.Co
 	if err != nil || run == nil {
 		return err
 	}
+	journalCoversEntry := currencyStrengthJournalCoversEntry(r.state, *run)
 	mergeCurrencyStrengthRunIntoState(r.state, *run)
-	r.entryRecorded = currencyStrengthRunHasEntry(run.Status)
+	r.entryRecorded = currencyStrengthRunHasEntry(run.Status) && journalCoversEntry
 	return nil
 }
 
@@ -1041,13 +1057,18 @@ func mergeCurrencyStrengthRunIntoState(
 	if state.EntryOrderID == "" {
 		state.EntryOrderID = run.EntryOrderID
 	}
+	localEntryRank := currencyStrengthEntryStatusRank(state.EntryStatus)
+	remoteEntryRank := currencyStrengthEntryStatusRank(run.EntryStatus)
 	if shouldMergeCurrencyStrengthEntryStatus(state.EntryStatus, run.EntryStatus) {
 		state.EntryStatus = run.EntryStatus
 	}
-	if run.EntryFillPrice > 0 {
+	if run.EntryFillPrice > 0 &&
+		(state.EntryFillPrice <= 0 ||
+			remoteEntryRank > localEntryRank ||
+			run.EntryFilledQty > state.EntryFilledQty) {
 		state.EntryFillPrice = run.EntryFillPrice
 	}
-	if run.EntryFilledQty > 0 {
+	if run.EntryFilledQty > state.EntryFilledQty {
 		state.EntryFilledQty = run.EntryFilledQty
 		state.Quantity = run.EntryFilledQty
 	}
@@ -1068,21 +1089,45 @@ func shouldMergeCurrencyStrengthEntryStatus(local, remote string) bool {
 	if remote == "" {
 		return false
 	}
-	rank := func(status string) int {
-		switch normalizeCurrencyStrengthOrderStatus(status) {
-		case "pending":
-			return 1
-		case "partial":
-			return 2
-		case "cancelled", "rejected":
-			return 3
-		case "filled":
-			return 4
-		default:
-			return 0
+	return currencyStrengthEntryStatusRank(remote) >= currencyStrengthEntryStatusRank(local)
+}
+
+func currencyStrengthEntryStatusRank(status string) int {
+	switch normalizeCurrencyStrengthOrderStatus(status) {
+	case "pending":
+		return 1
+	case "partial":
+		return 2
+	case "cancelled", "rejected":
+		return 3
+	case "filled":
+		return 4
+	default:
+		return 0
+	}
+}
+
+func currencyStrengthJournalCoversEntry(
+	state *currencyStrengthRunState,
+	run store.CurrencyStrengthRun,
+) bool {
+	if state == nil || !currencyStrengthRunHasEntry(run.Status) {
+		return false
+	}
+	if currencyStrengthEntryStatusRank(run.EntryStatus) <
+		currencyStrengthEntryStatusRank(state.EntryStatus) {
+		return false
+	}
+	if run.EntryFilledQty < state.EntryFilledQty {
+		return false
+	}
+	if state.EntryFillPrice > 0 {
+		if run.EntryFillPrice <= 0 ||
+			math.Abs(run.EntryFillPrice-state.EntryFillPrice) > 1e-9 {
+			return false
 		}
 	}
-	return rank(remote) >= rank(local)
+	return true
 }
 
 func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) error {

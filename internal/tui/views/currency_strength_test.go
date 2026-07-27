@@ -69,6 +69,31 @@ func TestRenderCurrencyStrengthViewSurfacesHistoryFailure(t *testing.T) {
 	}
 }
 
+func TestRenderCurrencyStrengthFailedEntryShowsPartialFillExposure(t *testing.T) {
+	out := RenderCurrencyStrengthView(CurrencyStrengthViewData{
+		Runs: []store.CurrencyStrengthRun{{
+			SessionDate:    time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+			Status:         "entry_failed",
+			SignalSymbol:   "GBP/USD",
+			SignalSide:     "buy",
+			EntryOrderID:   "ENTRY-PARTIAL",
+			EntryStatus:    "cancelled",
+			EntryFillPrice: 1.101,
+			EntryFilledQty: 40000,
+		}},
+	}, 120, 30, 0)
+	for _, want := range []string{
+		"BUY GBP/USD",
+		"ENTRY-PARTIAL",
+		"fill 1.10100 × 40000",
+		"broker exposure requires reconciliation",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("failed entry view missing %q:\n%s", want, out)
+		}
+	}
+}
+
 func TestCurrencyStrengthViewWindowingReachesOlderRuns(t *testing.T) {
 	data := CurrencyStrengthViewData{LastUpdate: time.Now()}
 	for i := 0; i < CurrencyStrengthPageSize; i++ {

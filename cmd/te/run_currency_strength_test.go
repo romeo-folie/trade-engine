@@ -573,6 +573,32 @@ func TestCurrencyStrengthJournalFailureDoesNotBlockPostCancelExit(t *testing.T) 
 	}
 }
 
+func TestCurrencyStrengthAcceptedEntryFallsBackToJournalWhenSidecarFails(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{}
+	runner := &currencyStrengthPaperRunner{
+		cfg:       config.CurrencyStrengthConfig{Units: 100000},
+		statePath: t.TempDir(), // Writing a file over this directory must fail.
+		journal:   journal,
+		state: &currencyStrengthRunState{
+			Date:           "2026-07-27",
+			Symbol:         "GBP/USD",
+			Side:           "buy",
+			Quantity:       100000,
+			EntryOrderID:   "ENTRY-DURABLE",
+			EntryStatus:    "pending",
+			EntryFilledQty: 0,
+			EnteredAt:      "2026-07-27T09:00:00Z",
+		},
+	}
+	if err := runner.persistActiveEntryRecovery(context.Background()); err != nil {
+		t.Fatalf("journal fallback should preserve accepted entry: %v", err)
+	}
+	if len(journal.entries) != 1 ||
+		journal.entries[0].EntryOrderID != "ENTRY-DURABLE" {
+		t.Fatalf("accepted entry was not journaled after sidecar failure: %+v", journal.entries)
+	}
+}
+
 func TestCurrencyStrengthExitPersistsRealizedPnL(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
@@ -1070,20 +1096,48 @@ func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
 
 func TestCurrencyStrengthMergePreservesLocalBrokerTruth(t *testing.T) {
 	state := &currencyStrengthRunState{
-		EntryStatus: "filled",
-		ExitRetry:   true,
+		EntryStatus:    "filled",
+		EntryFillPrice: 1.101,
+		EntryFilledQty: 100000,
+		Quantity:       100000,
+		ExitRetry:      true,
 	}
-	mergeCurrencyStrengthRunIntoState(state, store.CurrencyStrengthRun{
-		Status:      "exit_submitted",
-		EntryStatus: "pending",
-		ExitOrderID: "STALE-EXIT",
-		ExitStatus:  "pending",
-	})
+	stale := store.CurrencyStrengthRun{
+		Status:         "exit_submitted",
+		EntryStatus:    "partial",
+		EntryFillPrice: 1.099,
+		EntryFilledQty: 25000,
+		ExitOrderID:    "STALE-EXIT",
+		ExitStatus:     "pending",
+	}
+	mergeCurrencyStrengthRunIntoState(state, stale)
 	if state.EntryStatus != "filled" {
 		t.Fatalf("stale journal downgraded broker-confirmed entry: %+v", state)
 	}
+	if state.EntryFilledQty != 100000 || state.EntryFillPrice != 1.101 {
+		t.Fatalf("stale journal overwrote newer fill economics: %+v", state)
+	}
 	if state.ExitOrderID != "" {
 		t.Fatalf("stale journal replaced residual retry state: %+v", state)
+	}
+	if currencyStrengthJournalCoversEntry(state, stale) {
+		t.Fatal("stale journal was incorrectly considered caught up")
+	}
+	date := time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
+	stale.SessionDate = date
+	state.Date = "2026-07-27"
+	runner := &currencyStrengthPaperRunner{
+		state:         state,
+		entryRecorded: false,
+		journal: &captureCurrencyStrengthJournal{runs: map[string]*store.CurrencyStrengthRun{
+			"2026-07-27": &stale,
+		}},
+	}
+	if err := runner.mergeActiveStateFromJournal(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.entryRecorded {
+		t.Fatal("stale journal incorrectly cleared the dirty entry marker")
 	}
 }
 
