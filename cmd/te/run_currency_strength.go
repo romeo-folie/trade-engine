@@ -1660,7 +1660,12 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	if err != nil {
 		return err
 	}
-	if r.state.ExitFilledQty > r.state.ExitFillTimeQty+1e-6 {
+	needsFilledExecution := status == "filled" &&
+		r.state.ExitOrderID != "broker-flat" &&
+		r.state.ExitFilledQty <= 0 &&
+		(r.state.ExitRequestedQty > 0 || r.state.Quantity > 0)
+	if needsFilledExecution ||
+		r.state.ExitFilledQty > r.state.ExitFillTimeQty+1e-6 {
 		ready, readyErr := r.ensureExitFillTime(ctx)
 		if readyErr != nil {
 			logger.Warn("currency-strength: exit fill timestamp recovery failed; will retry",
@@ -1791,8 +1796,10 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 }
 
 func (r *currencyStrengthPaperRunner) ensureExitFillTime(ctx context.Context) (bool, error) {
-	if r.state == nil || r.state.ExitFilledQty <= 0 ||
-		r.state.ExitOrderID == "broker-flat" ||
+	if r.state == nil || r.state.ExitOrderID == "broker-flat" {
+		return true, nil
+	}
+	if r.state.ExitFilledQty > 0 &&
 		r.state.ExitFillTimeQty+1e-6 >= r.state.ExitFilledQty {
 		return true, nil
 	}
@@ -1801,21 +1808,29 @@ func (r *currencyStrengthPaperRunner) ensureExitFillTime(ctx context.Context) (b
 		return false, err
 	}
 	var filledAt time.Time
-	var filledQty float64
+	var filledQty, fillNotional float64
 	for _, record := range records {
 		if record.OrderID == r.state.ExitOrderID {
 			filledQty += record.Qty
+			fillNotional += record.Price * record.Qty
 			if record.FilledAt.After(filledAt) {
 				filledAt = record.FilledAt
 			}
 		}
 	}
-	if filledAt.IsZero() || filledQty+1e-6 < r.state.ExitFilledQty {
+	if filledQty <= 0 || fillNotional <= 0 || filledAt.IsZero() ||
+		(r.state.ExitFilledQty > 0 && filledQty+1e-6 < r.state.ExitFilledQty) {
 		logger.Info("currency-strength: filled exit awaiting execution timestamp",
 			"order_id", r.state.ExitOrderID,
 			"status_filled_qty", r.state.ExitFilledQty,
 			"timestamped_filled_qty", filledQty)
 		return false, nil
+	}
+	if filledQty > r.state.ExitFilledQty {
+		r.state.ExitFilledQty = filledQty
+	}
+	if fillNotional > 0 {
+		r.state.ExitFillPrice = fillNotional / filledQty
 	}
 	r.state.ExitedAt = filledAt.UTC().Format(time.RFC3339)
 	r.state.ExitFillTimeQty = filledQty

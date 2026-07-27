@@ -1236,7 +1236,16 @@ func TestCurrencyStrengthExitJournalRetryDoesNotResubmitOrder(t *testing.T) {
 	}, statusResult: execution.OrderResult{
 		BrokerOrderID: "EXIT-RETRY",
 		Status:        "filled",
-	}, positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}}}
+		FilledPrice:   1.105,
+		FilledQty:     100000,
+	}, positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "EXIT-RETRY",
+			Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
+			FilledAvgPx: 1.105,
+			FilledAt:    time.Date(2026, 7, 27, 18, 0, 10, 0, time.UTC),
+		}},
+	}
 	runner := &currencyStrengthPaperRunner{
 		cfg: config.CurrencyStrengthConfig{
 			Timezone:      "UTC",
@@ -1318,6 +1327,56 @@ func TestCurrencyStrengthReconciledFillUsesExecutionTimestamp(t *testing.T) {
 		*journal.exits[0].RealizedPnL < 669.99 ||
 		*journal.exits[0].RealizedPnL > 670.01 {
 		t.Fatalf("reconciled exit used submission-time FX conversion: %+v", journal.exits[0])
+	}
+}
+
+func TestCurrencyStrengthImmediateFilledAckWaitsForExecutionEconomics(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-ACK-ONLY", Status: "filled",
+		},
+		positions:          []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+		keepPositionOnFill: true,
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+		},
+		now: func() time.Time { return now },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "EXIT-ACK-ONLY" ||
+		runner.state.ExitRetry || runner.state.ExitFilledQty != 0 ||
+		len(journal.exits) != 0 {
+		t.Fatalf("status-only filled acknowledgement was finalized or retried: state=%+v exits=%+v",
+			runner.state, journal.exits)
+	}
+
+	filledAt := now.Add(20 * time.Second)
+	broker.recentFills = []execution.BrokerOrder{{
+		BrokerOrderID: "EXIT-ACK-ONLY",
+		TradeID:       runner.state.ExitTradeID,
+		Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
+		FilledAvgPx: 1.105, FilledAt: filledAt,
+	}}
+	broker.positions = nil
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil || len(journal.exits) != 1 ||
+		journal.exits[0].ExitFilledQty != 100000 ||
+		journal.exits[0].ExitFillPrice != 1.105 ||
+		journal.exits[0].ExitedAt == nil ||
+		!journal.exits[0].ExitedAt.Equal(filledAt) {
+		t.Fatalf("execution economics were not recovered before finalization: state=%+v exits=%+v",
+			runner.state, journal.exits)
 	}
 }
 
@@ -1528,7 +1587,7 @@ func TestCurrencyStrengthRestoresExitAckWithoutResubmission(t *testing.T) {
 			BrokerOrderID: "EXIT-RECOVERED",
 			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-1-1",
 			Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
-			FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
+			FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
 		}},
 	}
 	runner := &currencyStrengthPaperRunner{
@@ -1570,7 +1629,7 @@ func TestCurrencyStrengthAdoptsBrokerWorkingExitWhenDurabilityFailed(t *testing.
 			BrokerOrderID: "EXIT-WORKING",
 			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD",
 			Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
-			FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
+			FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
 		}},
 	}
 	broker := &workingExitExecutor{
@@ -1762,7 +1821,7 @@ func TestCurrencyStrengthRetainsPendingExitUntilTerminal(t *testing.T) {
 		BrokerOrderID: "EXIT-PENDING",
 		TradeID:       runner.state.ExitTradeID,
 		Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
-		FilledAt: time.Date(2026, 7, 27, 18, 1, 0, 0, time.UTC),
+		FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 1, 0, 0, time.UTC),
 	}}
 	if err := runner.exitActive(context.Background()); err != nil {
 		t.Fatal(err)
