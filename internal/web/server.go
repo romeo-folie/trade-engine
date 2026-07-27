@@ -486,6 +486,22 @@ func toWebEvents(ev events.Event, cfg *appconfig.Config) []*WebEvent {
 	if evType == "" {
 		return nil
 	}
+	// mapEventEdge attributes executions to risk_manager, which is only true for
+	// signals that executed straight off risk approval. Executions released from
+	// the pending queue — a manual approval, or a first-tick deferral picked up
+	// by processDeferredSignals — carry SourceNode="approvals" and must be
+	// routed from there. Without this the approvals → executor edge is declared
+	// in the topology but no event ever traverses it, so the path renders
+	// permanently idle: in manual mode that is the *only* route to the executor,
+	// and in auto/paper it is the entire first-tick deferral flow.
+	//
+	// Keyed off the payload rather than the configured mode, because auto/paper
+	// have both paths live and the mode alone cannot tell them apart.
+	if src == "risk_manager" && dst == "executor" {
+		if node := executionSourceNode(ev.Payload); node != "" {
+			src = node
+		}
+	}
 	payload, err := json.Marshal(ev.Payload)
 	if err != nil {
 		logger.Warn("web: failed to marshal event payload",

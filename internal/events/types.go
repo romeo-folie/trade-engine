@@ -154,6 +154,13 @@ type TradeExecutedPayload struct {
 	Strategy      string  `json:"strategy"`
 	EntrySetup    string  `json:"entry_setup,omitempty"`
 	SetupEvidence string  `json:"setup_evidence,omitempty"`
+	// SourceNode names the pipeline node the execution came out of, for
+	// observability routing. Empty means the default risk-controls path.
+	// Set to "approvals" when the signal was released from the pending queue —
+	// a manual approval, or a first-tick deferral picked up by
+	// processDeferredSignals — so the dashboard animates the path the signal
+	// actually took instead of always attributing it to risk controls.
+	SourceNode string `json:"source_node,omitempty"`
 }
 
 // TradeSimulatedPayload is emitted for paper trades (same data as executed).

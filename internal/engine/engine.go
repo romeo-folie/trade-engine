@@ -2138,7 +2138,8 @@ func (e *Engine) generateSignal(
 			})
 			return
 		}
-		e.executeSignal(ctx, sigID, sig)
+		// Straight off risk approval — no queue involved.
+		e.executeSignal(ctx, sigID, sig, false)
 	case "manual":
 		// Signal stays pending — user approves via CLI or Telegram.
 		logger.Info("signal queued for manual approval", "id", sigID, "ticker", ticker)
@@ -2195,9 +2196,25 @@ func maxFallbackCandleAge(tf data.Timeframe) time.Duration {
 	}
 }
 
+// executionSourceNode names the observability node an execution leaves from.
+// Empty keeps the default risk-controls attribution; queue-released executions
+// name the pending queue so the dashboard lights the path actually taken.
+func executionSourceNode(fromQueue bool) string {
+	if fromQueue {
+		return "approvals"
+	}
+	return ""
+}
+
 // executeSignal places the order via the executor, creates a trade record, and
 // records the entry order.
-func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal) {
+//
+// fromQueue marks an execution released from the pending queue — a manual
+// approval, or a first-tick deferral picked up by processDeferredSignals — as
+// opposed to executing straight off risk approval. It only rides along on the
+// emitted event so the dashboard can animate the path the signal actually took;
+// it has no effect on execution itself.
+func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Signal, fromQueue bool) {
 	// Market-hours guard (#437): a tick that STARTS before the close can
 	// spend 20+ minutes in analysis and reach execution after 16:00 ET —
 	// 17% of recorded entries landed in the 16:00 hour. After-hours market
@@ -2578,6 +2595,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Direction: direction, EntryPrice: result.FilledPrice,
 		Quantity: result.FilledQty, Strategy: sig.Strategy,
 		EntrySetup: sig.EntrySetup, SetupEvidence: sig.EntrySetupEvidence,
+		SourceNode: executionSourceNode(fromQueue),
 	})
 
 	// Poll every nonterminal broker order and backfill until it reaches a final
@@ -2755,7 +2773,8 @@ func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {
 		}
 	}
 
-	e.executeSignal(ctx, sigID, *sig)
+	// Released by a human from the approval queue.
+	e.executeSignal(ctx, sigID, *sig, true)
 
 	// executeSignal reports blocks by updating the signal row, not by
 	// returning an error — re-fetch so a manual approver (CLI/Telegram)
@@ -3361,7 +3380,8 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 
 		logger.Info("deferred signal confirmed — executing",
 			"id", sig.ID, "ticker", sig.Ticker, "confirm_price", confirmPrice)
-		e.executeSignal(ctx, sig.ID, sig)
+		// Released from the deferred queue after first-tick confirmation.
+		e.executeSignal(ctx, sig.ID, sig, true)
 	}
 }
 
