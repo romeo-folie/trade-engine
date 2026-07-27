@@ -70,6 +70,7 @@ type currencyStrengthJournal interface {
 	RecordExit(context.Context, store.CurrencyStrengthRun) error
 	RecordFailure(context.Context, time.Time, string) error
 	Get(context.Context, time.Time) (*store.CurrencyStrengthRun, error)
+	GetActive(context.Context, time.Time) (*store.CurrencyStrengthRun, error)
 }
 
 type dbCurrencyStrengthJournal struct{}
@@ -100,6 +101,10 @@ func (dbCurrencyStrengthJournal) RecordFailure(ctx context.Context, date time.Ti
 
 func (dbCurrencyStrengthJournal) Get(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
 	return store.GetCurrencyStrengthRunByDate(ctx, store.GetDB(), date)
+}
+
+func (dbCurrencyStrengthJournal) GetActive(ctx context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
+	return store.GetActiveCurrencyStrengthRun(ctx, store.GetDB(), date)
 }
 
 type currencyStrengthPaperRunner struct {
@@ -639,10 +644,11 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	}
 	wantTicker := normalizeCurrencyStrengthTicker(r.state.Symbol)
 	wantTradeID := r.exitTradeID()
+	baseTradeID := r.baseExitTradeID()
 	for _, order := range orders {
 		if normalizeCurrencyStrengthTicker(order.Ticker) != wantTicker ||
 			!strings.EqualFold(order.Side, string(exitSide)) ||
-			order.TradeID != wantTradeID {
+			!currencyStrengthExitReferenceMatches(order.TradeID, wantTradeID, baseTradeID, r.state.ExitTradeID != "") {
 			continue
 		}
 		r.state.ExitOrderID = order.OrderID
@@ -662,8 +668,19 @@ func (r *currencyStrengthPaperRunner) exitTradeID() string {
 	if r.state.ExitTradeID != "" {
 		return r.state.ExitTradeID
 	}
+	return r.baseExitTradeID()
+}
+
+func (r *currencyStrengthPaperRunner) baseExitTradeID() string {
 	return fmt.Sprintf("currency-strength-exit-%s-%s",
 		r.state.Date, strings.ReplaceAll(r.state.Symbol, "/", ""))
+}
+
+func currencyStrengthExitReferenceMatches(orderRef, wantRef, baseRef string, exact bool) bool {
+	if exact {
+		return orderRef == wantRef
+	}
+	return orderRef == baseRef || strings.HasPrefix(orderRef, baseRef+"-")
 }
 
 func (r *currencyStrengthPaperRunner) reserveExitTradeID() (string, error) {
@@ -866,6 +883,18 @@ func (r *currencyStrengthPaperRunner) reconcileActiveEntry(ctx context.Context) 
 			}
 			return nil
 		}
+		if r.state.EntryFilledQty > 0 {
+			// IBKR can expose terminal order fills before the corresponding
+			// position appears. Keep recovery state until broker position truth
+			// catches up instead of orphaning delayed exposure.
+			if err := r.saveState(); err != nil {
+				return err
+			}
+			if err := r.syncActiveEntryJournal(ctx); err != nil {
+				logger.Warn("currency-strength: terminal entry fill history sync failed; retaining recovery state", "err", err)
+			}
+			return nil
+		}
 		if err := r.syncActiveEntryJournal(ctx); err != nil {
 			return err
 		}
@@ -884,29 +913,54 @@ func (r *currencyStrengthPaperRunner) restoreJournalState(
 	}
 	run, err := r.journal.Get(ctx, sessionDate)
 	if err != nil || run == nil {
-		return err
+		if err != nil {
+			return err
+		}
+	} else {
+		r.restoreCurrencyStrengthRun(*run)
 	}
+
+	if r.state == nil {
+		active, activeErr := r.journal.GetActive(ctx, sessionDate)
+		if activeErr != nil {
+			return activeErr
+		}
+		if active != nil {
+			r.restoreCurrencyStrengthRun(*active)
+		}
+	}
+	return nil
+}
+
+func (r *currencyStrengthPaperRunner) restoreCurrencyStrengthRun(run store.CurrencyStrengthRun) {
 	switch run.Status {
 	case "scheduled", "evaluating", "failed":
-		return nil
+		return
 	case "no_signal", "entry_submitted", "entered", "entry_failed",
 		"exit_submitted", "exit_failed", "exited":
-		r.decisionDoneFor = run.SessionDate.Format("2006-01-02")
+		runDate := run.SessionDate.Format("2006-01-02")
+		if runDate > r.decisionDoneFor {
+			r.decisionDoneFor = runDate
+		}
 	}
 
 	if r.state == nil {
 		switch run.Status {
 		case "entry_submitted", "entered", "exit_submitted", "exit_failed":
-			r.state = currencyStrengthStateFromRun(*run)
+			r.state = currencyStrengthStateFromRun(run)
 			r.entryRecorded = true
+		case "entry_failed":
+			if run.EntryFilledQty > 0 {
+				r.state = currencyStrengthStateFromRun(run)
+				r.entryRecorded = true
+			}
 		}
-		return nil
+		return
 	}
 	if r.state.Date == run.SessionDate.Format("2006-01-02") {
-		mergeCurrencyStrengthRunIntoState(r.state, *run)
+		mergeCurrencyStrengthRunIntoState(r.state, run)
 		r.entryRecorded = currencyStrengthRunHasEntry(run.Status)
 	}
-	return nil
 }
 
 func (r *currencyStrengthPaperRunner) mergeActiveStateFromJournal(ctx context.Context) error {
@@ -987,7 +1041,7 @@ func mergeCurrencyStrengthRunIntoState(
 	if state.EntryOrderID == "" {
 		state.EntryOrderID = run.EntryOrderID
 	}
-	if run.EntryStatus != "" {
+	if shouldMergeCurrencyStrengthEntryStatus(state.EntryStatus, run.EntryStatus) {
 		state.EntryStatus = run.EntryStatus
 	}
 	if run.EntryFillPrice > 0 {
@@ -999,7 +1053,7 @@ func mergeCurrencyStrengthRunIntoState(
 	}
 	if run.ExitOrderID != "" &&
 		(run.Status == "exit_submitted" || run.Status == "exited") &&
-		!(state.ExitRetry && normalizeCurrencyStrengthOrderStatus(run.ExitStatus) == "partial") {
+		!state.ExitRetry {
 		state.ExitOrderID = run.ExitOrderID
 		state.ExitStatus = run.ExitStatus
 		state.ExitFillPrice = run.ExitFillPrice
@@ -1008,6 +1062,27 @@ func mergeCurrencyStrengthRunIntoState(
 			state.ExitedAt = run.ExitedAt.UTC().Format(time.RFC3339)
 		}
 	}
+}
+
+func shouldMergeCurrencyStrengthEntryStatus(local, remote string) bool {
+	if remote == "" {
+		return false
+	}
+	rank := func(status string) int {
+		switch normalizeCurrencyStrengthOrderStatus(status) {
+		case "pending":
+			return 1
+		case "partial":
+			return 2
+		case "cancelled", "rejected":
+			return 3
+		case "filled":
+			return 4
+		default:
+			return 0
+		}
+	}
+	return rank(remote) >= rank(local)
 }
 
 func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) error {
@@ -1162,10 +1237,18 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 		return nil
 	}
 	for len(r.state.PendingExitAudits) > 0 {
-		if err := r.writeExitJournal(ctx, r.state.PendingExitAudits[0], nil); err != nil {
+		audit := r.state.PendingExitAudits[0]
+		if err := r.writeExitJournal(ctx, audit, nil); err != nil {
 			return err
 		}
 		r.state.PendingExitAudits = r.state.PendingExitAudits[1:]
+		if err := r.saveState(); err != nil {
+			r.state.PendingExitAudits = append(
+				[]currencyStrengthExitAudit{audit},
+				r.state.PendingExitAudits...,
+			)
+			return fmt.Errorf("persist currency-strength exit audit dequeue: %w", err)
+		}
 	}
 	return nil
 }

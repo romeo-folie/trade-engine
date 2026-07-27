@@ -200,6 +200,7 @@ type captureCurrencyStrengthJournal struct {
 	entryErrors int
 	startErrors int
 	runs        map[string]*store.CurrencyStrengthRun
+	activeRun   *store.CurrencyStrengthRun
 }
 
 func (j *captureCurrencyStrengthJournal) Start(_ context.Context, run store.CurrencyStrengthRun) error {
@@ -249,6 +250,13 @@ func (j *captureCurrencyStrengthJournal) Get(_ context.Context, date time.Time) 
 		return nil, nil
 	}
 	return j.runs[date.Format("2006-01-02")], nil
+}
+
+func (j *captureCurrencyStrengthJournal) GetActive(_ context.Context, date time.Time) (*store.CurrencyStrengthRun, error) {
+	if j.activeRun != nil && !j.activeRun.SessionDate.After(date) {
+		return j.activeRun, nil
+	}
+	return nil, nil
 }
 
 func TestBuildCurrencyStrengthEntryMessage(t *testing.T) {
@@ -450,6 +458,44 @@ func TestCurrencyStrengthCancelledEntryWithFillRetainsExposure(t *testing.T) {
 	if runner.state == nil || runner.state.EntryStatus != "filled" ||
 		runner.state.EntryFilledQty != 40000 || runner.state.Quantity != 40000 {
 		t.Fatalf("cancelled partial fill lost broker exposure: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthTerminalFillWaitsForDelayedPosition(t *testing.T) {
+	broker := &sequencedCurrencyStrengthExecutor{
+		statuses: []execution.OrderResult{
+			{BrokerOrderID: "ENTRY-DELAYED", Status: "cancelled", FilledQty: 40000},
+			{BrokerOrderID: "ENTRY-DELAYED", Status: "cancelled", FilledQty: 40000},
+		},
+		positions: [][]execution.Position{
+			nil,
+			{{Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.101}},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker:    broker,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date:         "2026-07-27",
+			Symbol:       "GBP/USD",
+			Side:         "buy",
+			Quantity:     100000,
+			EntryOrderID: "ENTRY-DELAYED",
+			EntryStatus:  "pending",
+		},
+	}
+	if err := runner.reconcileActiveEntry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.EntryFilledQty != 40000 {
+		t.Fatalf("terminal fill evidence was cleared before position appeared: %+v", runner.state)
+	}
+	if err := runner.reconcileActiveEntry(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.EntryStatus != "filled" ||
+		runner.state.Quantity != 40000 {
+		t.Fatalf("delayed broker position was not adopted: %+v", runner.state)
 	}
 }
 
@@ -675,6 +721,34 @@ func TestCurrencyStrengthRestoresCompletedDecision(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthRestoresPriorDayActiveRunWithoutSidecar(t *testing.T) {
+	today := time.Date(2026, 7, 28, 0, 0, 0, 0, time.UTC)
+	yesterday := today.AddDate(0, 0, -1)
+	journal := &captureCurrencyStrengthJournal{
+		runs: map[string]*store.CurrencyStrengthRun{
+			"2026-07-28": {SessionDate: today, Status: "scheduled"},
+		},
+		activeRun: &store.CurrencyStrengthRun{
+			SessionDate:    yesterday,
+			Status:         "entered",
+			SignalSymbol:   "GBP/USD",
+			SignalSide:     "buy",
+			Units:          100000,
+			EntryOrderID:   "ENTRY-OVERNIGHT",
+			EntryStatus:    "filled",
+			EntryFilledQty: 100000,
+		},
+	}
+	runner := &currencyStrengthPaperRunner{journal: journal}
+	if err := runner.restoreJournalState(context.Background(), today); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.Date != "2026-07-27" ||
+		runner.state.EntryOrderID != "ENTRY-OVERNIGHT" {
+		t.Fatalf("prior-day obligation was not restored: %+v", runner.state)
+	}
+}
+
 func TestCurrencyStrengthRestoresExitAckWithoutResubmission(t *testing.T) {
 	date := time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
 	journal := &captureCurrencyStrengthJournal{runs: map[string]*store.CurrencyStrengthRun{
@@ -766,6 +840,20 @@ func TestCurrencyStrengthAdoptsBrokerWorkingExitWhenDurabilityFailed(t *testing.
 	}
 	if runner.state != nil {
 		t.Fatalf("filled adopted exit did not clear state: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthExitReferenceMatchesReservedProductionID(t *testing.T) {
+	base := "currency-strength-exit-2026-07-27-GBPUSD"
+	reserved := base + "-1785146400000000000-1"
+	if !currencyStrengthExitReferenceMatches(reserved, base, base, false) {
+		t.Fatal("journal-restored state did not recognize strategy-owned suffixed reference")
+	}
+	if currencyStrengthExitReferenceMatches("orb-GBP/USD-1", base, base, false) {
+		t.Fatal("foreign strategy reference matched currency-strength ownership")
+	}
+	if currencyStrengthExitReferenceMatches(base+"-other", reserved, base, true) {
+		t.Fatal("sidecar-owned reference did not require an exact match")
 	}
 }
 
@@ -933,6 +1021,7 @@ func TestCurrencyStrengthResidualRetryProceedsWhileJournalIsDown(t *testing.T) {
 			Date:           "2026-07-27",
 			Symbol:         "GBP/USD",
 			Side:           "buy",
+			Quantity:       100000,
 			EntryStatus:    "filled",
 			EntryFilledQty: 100000,
 		},
@@ -952,6 +1041,13 @@ func TestCurrencyStrengthResidualRetryProceedsWhileJournalIsDown(t *testing.T) {
 	if len(runner.state.PendingExitAudits) != 0 {
 		t.Fatalf("durable audit snapshot was not retried: %+v", runner.state.PendingExitAudits)
 	}
+	restarted := &currencyStrengthPaperRunner{statePath: runner.statePath}
+	if err := restarted.loadState(); err != nil {
+		t.Fatal(err)
+	}
+	if restarted.state == nil || len(restarted.state.PendingExitAudits) != 0 {
+		t.Fatalf("successful audit dequeue was not persisted: %+v", restarted.state)
+	}
 }
 
 func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
@@ -969,6 +1065,25 @@ func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
 	state := currencyStrengthStateFromRun(run)
 	if state.ExitOrderID != "" || !state.ExitRetry {
 		t.Fatalf("terminal residual restored as working: %+v", state)
+	}
+}
+
+func TestCurrencyStrengthMergePreservesLocalBrokerTruth(t *testing.T) {
+	state := &currencyStrengthRunState{
+		EntryStatus: "filled",
+		ExitRetry:   true,
+	}
+	mergeCurrencyStrengthRunIntoState(state, store.CurrencyStrengthRun{
+		Status:      "exit_submitted",
+		EntryStatus: "pending",
+		ExitOrderID: "STALE-EXIT",
+		ExitStatus:  "pending",
+	})
+	if state.EntryStatus != "filled" {
+		t.Fatalf("stale journal downgraded broker-confirmed entry: %+v", state)
+	}
+	if state.ExitOrderID != "" {
+		t.Fatalf("stale journal replaced residual retry state: %+v", state)
 	}
 }
 

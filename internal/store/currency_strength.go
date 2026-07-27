@@ -166,9 +166,18 @@ func RecordCurrencyStrengthExit(
 		    exit_order_id=$2, exit_status=$3,
 		    exit_fill_price=COALESCE(NULLIF($4, 0), exit_fill_price),
 		    exit_filled_qty=COALESCE(NULLIF($5, 0), exit_filled_qty),
-		    exited_at=$6, realized_pnl=$7, error=NULL, updated_at=NOW()
+		    exited_at=COALESCE($6, exited_at),
+		    realized_pnl=COALESCE($7, realized_pnl),
+		    error=NULL, updated_at=NOW()
 		WHERE session_date=$1
-		  AND status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')`,
+		  AND (
+		      status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')
+		      OR (
+		          status='exited'
+		          AND exit_order_id=$2
+		          AND LOWER($3)='filled'
+		      )
+		  )`,
 		run.SessionDate, run.ExitOrderID, run.ExitStatus, run.ExitFillPrice,
 		run.ExitFilledQty, run.ExitedAt, run.RealizedPnL,
 	)
@@ -196,6 +205,46 @@ func GetCurrencyStrengthRunByDate(
 		       created_at, updated_at
 		FROM currency_strength_runs
 		WHERE session_date=$1`,
+		sessionDate,
+	)
+	var run CurrencyStrengthRun
+	if err := scanCurrencyStrengthRun(row, &run); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &run, nil
+}
+
+// GetActiveCurrencyStrengthRun returns the newest unclosed strategy obligation
+// on or before sessionDate. It lets restart recovery find a prior-day position
+// even when the sidecar is unavailable after midnight.
+func GetActiveCurrencyStrengthRun(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	sessionDate time.Time,
+) (*CurrencyStrengthRun, error) {
+	row := db.QueryRow(ctx, `
+		SELECT id, session_date, status, timezone, strength_start, strength_end,
+		       exit_time, rank_instruments, trade_instruments, units,
+		       COALESCE(strongest_currency,''), COALESCE(weakest_currency,''),
+		       COALESCE(strength_gap,0), COALESCE(signal_symbol,''),
+		       COALESCE(signal_side,''), COALESCE(skip_reason,''),
+		       COALESCE(entry_order_id,''), COALESCE(entry_status,''),
+		       COALESCE(entry_fill_price,0), COALESCE(entry_filled_qty,0),
+		       entered_at, COALESCE(exit_order_id,''), COALESCE(exit_status,''),
+		       COALESCE(exit_fill_price,0), COALESCE(exit_filled_qty,0),
+		       exited_at, realized_pnl, COALESCE(error,''),
+		       created_at, updated_at
+		FROM currency_strength_runs
+		WHERE session_date <= $1
+		  AND (
+		      status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')
+		      OR (status='entry_failed' AND entry_filled_qty > 0)
+		  )
+		ORDER BY session_date DESC
+		LIMIT 1`,
 		sessionDate,
 	)
 	var run CurrencyStrengthRun

@@ -72,6 +72,18 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// Replaying the same terminal acknowledgement after a crash is idempotent.
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		SessionDate:   base,
+		ExitOrderID:   "EXIT-TEST",
+		ExitStatus:    "filled",
+		ExitFillPrice: 1.105,
+		ExitFilledQty: 100000,
+		ExitedAt:      &exitedAt,
+		RealizedPnL:   &pnl,
+	}); err != nil {
+		t.Fatalf("terminal exit replay: %v", err)
+	}
 	if err := store.RecordCurrencyStrengthNoSignal(
 		ctx, db, dates[1], "minimum strength gap not met",
 	); err != nil {
@@ -141,6 +153,14 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 	if second[0].Status != "exit_submitted" {
 		t.Fatalf("pending flatten presented as %q, want exit_submitted", second[0].Status)
+	}
+	active, err := store.GetActiveCurrencyStrengthRun(ctx, db, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active == nil || !active.SessionDate.Equal(dates[2]) ||
+		active.ExitOrderID != "EXIT-PENDING" {
+		t.Fatalf("active prior-day obligation not found: %+v", active)
 	}
 }
 
