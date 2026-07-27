@@ -233,19 +233,23 @@ te run [--mode <mode>] [--session <session>] [--detach] [--dry-run]
                                       Start the engine
 te run --web [--web-port 8080]       Start the engine with web observability
 te stop                              Stop the running engine process (SIGTERM)
-te status                            Show engine, database, and active-mode status
+te status                            Show process, database, and configured/DB mode
 te mode <manual|auto|paper>          Persist the startup mode override; restart required
 te dashboard                         Open the terminal dashboard (aliases: ui, tui)
 te web                               Start the standalone web observability interface
 te logs tail                         Tail the engine log
 te logs search <query>               Search the engine log
-te notify test                       Send a Telegram connectivity test
+te notify test                       Send an ungated Telegram API connectivity test
 ```
 
 Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb`,
 `forex` (`orb-forex` compatibility alias), `orb-futures`,
 `orb-futures-metals`, and `orb-newyork`. Forex mode accepts
 `--session london|newyork`.
+
+`te run --web` starts in-process web observability only on the standard
+`manual`, `auto`, or `paper` path. Use standalone `te web` while a specialized
+ORB, forex, futures, metals, or combined session is running.
 
 ### Configuration and database
 
