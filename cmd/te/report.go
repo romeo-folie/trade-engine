@@ -86,6 +86,17 @@ func init() {
 	weeklyLeadersCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
 	weeklyLeadersCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
 	reportCmd.AddCommand(weeklyLeadersCmd)
+
+	potentIndustriesCmd := &cobra.Command{
+		Use:   "potent-industries",
+		Short: "Report prospective industry potency, breadth, and member leadership",
+		RunE:  runReportPotentIndustries,
+	}
+	potentIndustriesCmd.Flags().String("from", "", "Start date (YYYY-MM-DD); defaults to 30 days ago")
+	potentIndustriesCmd.Flags().String("to", "", "End date (YYYY-MM-DD, inclusive); defaults to today")
+	potentIndustriesCmd.Flags().String("industry", "", "Optional exact industry label")
+	potentIndustriesCmd.Flags().Int("top-members", 3, "Qualified members shown per industry")
+	reportCmd.AddCommand(potentIndustriesCmd)
 }
 
 func runReportWeeklyLeaders(cmd *cobra.Command, _ []string) error {
