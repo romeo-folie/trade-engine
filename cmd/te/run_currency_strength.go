@@ -22,6 +22,7 @@ import (
 
 const currencyStrengthEntryGrace = 15 * time.Minute
 const currencyStrengthTradeRecoveryInterval = time.Minute
+const currencyStrengthPortfolioPropagationGrace = 2 * time.Minute
 
 // sessionNotifier delivers currency-strength session notifications (e.g. Telegram).
 // Structurally satisfied by *orbTelegramNotifier, so the currency-strength runner
@@ -50,6 +51,8 @@ type currencyStrengthRunState struct {
 	ExitStatus        string                      `json:"exit_status,omitempty"`
 	ExitFillPrice     float64                     `json:"exit_fill_price,omitempty"`
 	ExitFilledQty     float64                     `json:"exit_filled_qty,omitempty"`
+	ExitRequestedQty  float64                     `json:"exit_requested_qty,omitempty"`
+	ExitFillObserved  string                      `json:"exit_fill_observed_at,omitempty"`
 	ExitedAt          string                      `json:"exited_at,omitempty"`
 	ExitRetry         bool                        `json:"exit_retry,omitempty"`
 	ExitConfirmed     bool                        `json:"exit_confirmed_notified,omitempty"`
@@ -461,6 +464,10 @@ func (r *currencyStrengthPaperRunner) recoverEntryObligation(ctx context.Context
 				!currencyStrengthQuantitiesMatch(pos.Quantity, netQty) {
 				continue
 			}
+			entryStatus, statusErr := r.recoveredEntryStatus(ctx, entry.OrderID, entryQty)
+			if statusErr != nil {
+				return false, statusErr
+			}
 			candidate := &currencyStrengthRunState{
 				AccountID:      r.accountID,
 				Date:           dateKey,
@@ -468,7 +475,7 @@ func (r *currencyStrengthPaperRunner) recoverEntryObligation(ctx context.Context
 				Side:           entrySide,
 				Quantity:       math.Abs(netQty),
 				EntryOrderID:   entry.OrderID,
-				EntryStatus:    "filled",
+				EntryStatus:    entryStatus,
 				EntryFillPrice: entryNotional / entryQty,
 				EntryFilledQty: entryQty,
 				EnteredAt:      entry.FilledAt.UTC().Format(time.RFC3339),
@@ -488,6 +495,28 @@ func (r *currencyStrengthPaperRunner) recoverEntryObligation(ctx context.Context
 	logger.Warn("currency-strength: recovered strategy-owned filled entry",
 		"symbol", recovered.Symbol, "order_id", recovered.EntryOrderID)
 	return true, nil
+}
+
+func (r *currencyStrengthPaperRunner) recoveredEntryStatus(
+	ctx context.Context,
+	orderID string,
+	filledQty float64,
+) (string, error) {
+	result, err := r.broker.GetOrderStatus(ctx, orderID)
+	if err != nil {
+		if !errors.Is(err, execution.ErrOrderNotFound) {
+			return "", fmt.Errorf("currency-strength recover entry status %s: %w", orderID, err)
+		}
+		if filledQty+1e-6 >= float64(r.cfg.Units) {
+			return "filled", nil
+		}
+		return "cancelled", nil
+	}
+	status := normalizeCurrencyStrengthOrderStatus(result.Status)
+	if status == "pending" && filledQty > 0 {
+		status = "partial"
+	}
+	return status, nil
 }
 
 func (r *currencyStrengthPaperRunner) recoverWorkingEntry(ctx context.Context) (bool, error) {
@@ -895,6 +924,8 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		if pos == nil {
 			r.state.ExitOrderID = "broker-flat"
 			r.state.ExitStatus = "filled"
+			r.state.ExitRequestedQty = 0
+			r.state.ExitFillObserved = ""
 			r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
 			if err := r.saveState(); err != nil {
 				logger.Warn("currency-strength: failed to persist broker-flat recovery", "err", err)
@@ -923,6 +954,8 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		if pos == nil {
 			r.state.ExitOrderID = "broker-flat"
 			r.state.ExitStatus = "filled"
+			r.state.ExitRequestedQty = 0
+			r.state.ExitFillObserved = ""
 			r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
 			if err := r.saveState(); err != nil {
 				logger.Warn("currency-strength: failed to persist broker-flat recovery", "err", err)
@@ -957,6 +990,8 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		return r.finalizeExitedState(ctx)
 	}
 
+	r.state.ExitRequestedQty = qty
+	r.state.ExitFillObserved = ""
 	exitTradeID, err := r.reserveExitTradeID()
 	if err != nil {
 		return err
@@ -993,27 +1028,32 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 }
 
 func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool, error) {
-	if r.state == nil || r.state.ExitTradeID == "" {
+	if r.state == nil {
 		return false, nil
 	}
 	records, err := r.currencyStrengthTradeRecords(ctx)
 	if err != nil {
 		return false, fmt.Errorf("currency-strength recover filled exit: %w", err)
 	}
-	var orderID string
+	wantRef := r.exitTradeID()
+	baseRef := r.baseExitTradeID()
+	exact := r.state.ExitTradeID != ""
+	var orderID, discoveredRef string
 	var filledQty, fillNotional float64
 	var filledAt time.Time
 	for _, record := range records {
-		if record.TradeID != r.state.ExitTradeID {
+		if !currencyStrengthExitReferenceMatches(record.TradeID, wantRef, baseRef, exact) {
 			continue
 		}
-		if orderID != "" && record.OrderID != orderID {
+		if (orderID != "" && record.OrderID != orderID) ||
+			(discoveredRef != "" && record.TradeID != discoveredRef) {
 			return false, fmt.Errorf(
-				"currency-strength exit reference %q maps to multiple broker orders",
-				r.state.ExitTradeID,
+				"currency-strength exit prefix %q maps to multiple broker orders",
+				baseRef,
 			)
 		}
 		orderID = record.OrderID
+		discoveredRef = record.TradeID
 		filledQty += record.Qty
 		fillNotional += record.Price * record.Qty
 		if record.FilledAt.After(filledAt) {
@@ -1023,10 +1063,35 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	if orderID == "" || filledQty <= 0 {
 		return false, nil
 	}
+	result, statusErr := r.broker.GetOrderStatus(ctx, orderID)
+	status := ""
+	if statusErr != nil {
+		if !errors.Is(statusErr, execution.ErrOrderNotFound) {
+			return false, fmt.Errorf("currency-strength recover exit status %s: %w", orderID, statusErr)
+		}
+		requested := r.state.ExitRequestedQty
+		if requested <= 0 {
+			requested = r.state.Quantity
+		}
+		if requested > 0 && filledQty+1e-6 < requested {
+			status = "cancelled"
+		} else {
+			status = "filled"
+		}
+	} else {
+		status = normalizeCurrencyStrengthOrderStatus(result.Status)
+		if status == "pending" && filledQty > 0 {
+			status = "partial"
+		}
+	}
+	r.state.ExitTradeID = discoveredRef
 	r.state.ExitOrderID = orderID
-	r.state.ExitStatus = "filled"
+	r.state.ExitStatus = status
 	r.state.ExitFilledQty = filledQty
 	r.state.ExitFillPrice = fillNotional / filledQty
+	if r.state.ExitRequestedQty <= 0 {
+		r.state.ExitRequestedQty = r.state.Quantity
+	}
 	if filledAt.IsZero() {
 		filledAt = r.currencyStrengthNow().UTC()
 	}
@@ -1036,7 +1101,7 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	}
 	logger.Warn("currency-strength: recovered strategy-owned filled exit",
 		"symbol", r.state.Symbol, "order_id", orderID,
-		"trade_id", r.state.ExitTradeID, "filled_qty", filledQty)
+		"trade_id", discoveredRef, "status", status, "filled_qty", filledQty)
 	return true, nil
 }
 
@@ -1063,6 +1128,9 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 		}
 		r.state.ExitOrderID = order.OrderID
 		r.state.ExitStatus = "pending"
+		if r.state.ExitRequestedQty <= 0 {
+			r.state.ExitRequestedQty = r.state.Quantity
+		}
 		r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
 		if err := r.saveState(); err != nil {
 			logger.Warn("currency-strength: failed to persist adopted working exit", "err", err)
@@ -1601,6 +1669,8 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 			r.state.ExitStatus = ""
 			r.state.ExitFillPrice = 0
 			r.state.ExitFilledQty = 0
+			r.state.ExitRequestedQty = 0
+			r.state.ExitFillObserved = ""
 			r.state.ExitedAt = ""
 			if err := r.saveState(); err != nil {
 				return fmt.Errorf("currency-strength persist exit retry state: %w", err)
@@ -1609,6 +1679,24 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		}
 	case "filled":
 		if pos != nil {
+			provenPartial := r.state.ExitRequestedQty > 0 &&
+				r.state.ExitFilledQty+1e-6 < r.state.ExitRequestedQty
+			if !provenPartial {
+				now := r.currencyStrengthNow().UTC()
+				observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
+				if observedAt.IsZero() {
+					r.state.ExitFillObserved = now.Format(time.RFC3339)
+					if err := r.saveState(); err != nil {
+						return fmt.Errorf("persist currency-strength fill propagation guard: %w", err)
+					}
+					logger.Info("currency-strength: filled exit awaiting portfolio propagation",
+						"order_id", r.state.ExitOrderID, "position_qty", pos.Quantity)
+					return nil
+				}
+				if now.Sub(observedAt) < currencyStrengthPortfolioPropagationGrace {
+					return nil
+				}
+			}
 			// The order is terminal but residual exposure remains. Journal the
 			// partial outcome, then release this order ID so the next tick
 			// submits a new flatten for broker-truth remaining quantity.
@@ -1622,6 +1710,8 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 			r.state.ExitStatus = ""
 			r.state.ExitFillPrice = 0
 			r.state.ExitFilledQty = 0
+			r.state.ExitRequestedQty = 0
+			r.state.ExitFillObserved = ""
 			r.state.ExitedAt = ""
 			r.state.ExitRetry = true
 			if err := r.saveState(); err != nil {
@@ -1694,6 +1784,8 @@ func (r *currencyStrengthPaperRunner) cancelFlatWorkingExit(ctx context.Context)
 		r.state.ExitStatus = "filled"
 		r.state.ExitFillPrice = 0
 		r.state.ExitFilledQty = 0
+		r.state.ExitRequestedQty = 0
+		r.state.ExitFillObserved = ""
 		r.state.ExitedAt = r.now().UTC().Format(time.RFC3339)
 		if err := r.saveState(); err != nil {
 			logger.Warn("currency-strength: failed to persist broker-flat exit recovery", "err", err)

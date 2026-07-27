@@ -445,6 +445,10 @@ func (f *successfulCurrencyStrengthExecutor) RecentFills(context.Context) ([]exe
 
 func TestCurrencyStrengthRecoversImmediatelyFilledEntryByTradeID(t *testing.T) {
 	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "ENTRY-FILLED", Status: "filled",
+			FilledPrice: 1.1, FilledQty: 100000,
+		},
 		positions: []execution.Position{{
 			Ticker: "GBP/USD", Quantity: 75000, AvgCostBasis: 1.10125,
 		}},
@@ -488,6 +492,38 @@ func TestCurrencyStrengthRecoversImmediatelyFilledEntryByTradeID(t *testing.T) {
 		runner.state.Quantity != 75000 || runner.state.EntryFilledQty != 100000 ||
 		runner.state.EntryFillPrice != 1.1 {
 		t.Fatalf("recovery did not reconstruct broker execution truth: %+v", runner.state)
+	}
+}
+
+func TestCurrencyStrengthRecoveredPartialEntryRemainsCancellable(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "ENTRY-PARTIAL", Status: "partial",
+			FilledPrice: 1.1, FilledQty: 40000,
+		},
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 40000, AvgCostBasis: 1.1,
+		}},
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "ENTRY-PARTIAL",
+			TradeID:       "currency-strength-2026-07-27-GBPUSD",
+			Symbol:        "GBP/USD", Side: "buy", FilledQty: 40000,
+			FilledAvgPx: 1.1, FilledAt: time.Date(2026, 7, 27, 9, 0, 0, 0, time.UTC),
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, statePath: t.TempDir() + "/currency-strength.json",
+	}
+	recovered, err := runner.recoverEntryObligation(context.Background())
+	if err != nil || !recovered {
+		t.Fatalf("partial entry recovery = %v, %v", recovered, err)
+	}
+	if runner.state == nil || runner.state.EntryStatus != "partial" ||
+		runner.state.EntryFilledQty != 40000 {
+		t.Fatalf("working entry remainder was incorrectly marked terminal: %+v", runner.state)
 	}
 }
 
@@ -592,6 +628,10 @@ func TestCurrencyStrengthRetriesFilledEntryRecoveryUntilVisible(t *testing.T) {
 func TestCurrencyStrengthRecoversReservedFilledExitBeforeBrokerFlat(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-FILLED", Status: "filled",
+			FilledPrice: 1.1056, FilledQty: 100000,
+		},
 		recentFills: []execution.BrokerOrder{
 			{
 				BrokerOrderID: "EXIT-FILLED",
@@ -628,6 +668,110 @@ func TestCurrencyStrengthRecoversReservedFilledExitBeforeBrokerFlat(t *testing.T
 		got.ExitFillPrice < 1.10559 || got.ExitFillPrice > 1.10561 ||
 		got.RealizedPnL == nil {
 		t.Fatalf("recovered exit economics incomplete: %+v", got)
+	}
+}
+
+func TestCurrencyStrengthRecoversFilledExitFromJournalOnlyPrefix(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-JOURNAL-ONLY", Status: "filled",
+			FilledPrice: 1.105, FilledQty: 100000,
+		},
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "EXIT-JOURNAL-ONLY",
+			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-999-1",
+			Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
+			FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil || len(journal.exits) != 1 ||
+		journal.exits[0].ExitOrderID != "EXIT-JOURNAL-ONLY" {
+		t.Fatalf("journal-only exit fill was not recovered: state=%+v exits=%+v",
+			runner.state, journal.exits)
+	}
+}
+
+func TestCurrencyStrengthRecoveredPartialExitRemainsWorking(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-PARTIAL", Status: "partial",
+			FilledPrice: 1.105, FilledQty: 40000,
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 60000}},
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "EXIT-PARTIAL",
+			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-999-1",
+			Symbol:        "GBP/USD", Side: "sell", FilledQty: 40000,
+			FilledAvgPx: 1.105, FilledAt: time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC),
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitTradeID: "currency-strength-exit-2026-07-27-GBPUSD-999-1",
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "EXIT-PARTIAL" ||
+		runner.state.ExitStatus != "partial" || runner.state.ExitFilledQty != 40000 {
+		t.Fatalf("working exit remainder was incorrectly marked terminal: %+v", runner.state)
+	}
+	if broker.calls != 0 {
+		t.Fatalf("partial exit recovery submitted a duplicate order: calls=%d", broker.calls)
+	}
+}
+
+func TestCurrencyStrengthFilledExitWaitsForPortfolioPropagation(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-PROPAGATING", Status: "filled",
+			FilledPrice: 1.105, FilledQty: 100000,
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-PROPAGATING", ExitStatus: "filled",
+			ExitFillPrice: 1.105, ExitFilledQty: 100000, ExitRequestedQty: 100000,
+		},
+		now: func() time.Time { return now },
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "EXIT-PROPAGATING" ||
+		runner.state.ExitFillObserved == "" {
+		t.Fatalf("filled exit was released before portfolio propagation: %+v", runner.state)
+	}
+	broker.positions = nil
+	now = now.Add(30 * time.Second)
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil {
+		t.Fatalf("broker-flat propagated exit was not finalized: %+v", runner.state)
 	}
 }
 
@@ -1349,6 +1493,7 @@ func TestCurrencyStrengthCancelsWorkingExitBeforeAcceptingFlatSnapshot(t *testin
 }
 
 func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
 	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{
 		result: execution.OrderResult{
@@ -1374,8 +1519,16 @@ func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *te
 			EntryFilledQty: 100000,
 		},
 		journal: journal,
-		now:     func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+		now:     func() time.Time { return now },
 	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "EXIT-PART-1" ||
+		runner.state.ExitFillObserved == "" {
+		t.Fatalf("filled exit did not wait for portfolio propagation: %+v", runner.state)
+	}
+	now = now.Add(currencyStrengthPortfolioPropagationGrace + time.Second)
 	if err := runner.exitActive(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -1406,6 +1559,7 @@ func TestCurrencyStrengthResubmitsConfirmedResidualWithoutPnLOverstatement(t *te
 }
 
 func TestCurrencyStrengthResidualRetryProceedsWhileJournalIsDown(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
 	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
 	broker := &successfulCurrencyStrengthExecutor{
 		result: execution.OrderResult{
@@ -1429,8 +1583,16 @@ func TestCurrencyStrengthResidualRetryProceedsWhileJournalIsDown(t *testing.T) {
 			EntryFilledQty: 100000,
 		},
 		journal: journal,
-		now:     func() time.Time { return time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC) },
+		now:     func() time.Time { return now },
 	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || runner.state.ExitOrderID != "EXIT-RESIDUAL" ||
+		runner.state.ExitFillObserved == "" {
+		t.Fatalf("filled exit did not wait for portfolio propagation: %+v", runner.state)
+	}
+	now = now.Add(currencyStrengthPortfolioPropagationGrace + time.Second)
 	if err := runner.exitActive(context.Background()); err != nil {
 		t.Fatal(err)
 	}
