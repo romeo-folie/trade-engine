@@ -869,7 +869,14 @@ func (r *currencyStrengthPaperRunner) pendingExitAudits() []currencyStrengthExit
 	audits := append([]currencyStrengthExitAudit(nil), r.state.PendingExitAudits...)
 	for i := range audits {
 		if audits[i].SessionDate == "" {
-			audits[i].SessionDate = r.state.Date
+			if exitedAt, err := time.Parse(time.RFC3339, audits[i].ExitedAt); err == nil {
+				if loc, locErr := time.LoadLocation(r.cfg.Timezone); locErr == nil {
+					audits[i].SessionDate = exitedAt.In(loc).Format("2006-01-02")
+				}
+			}
+			if audits[i].SessionDate == "" {
+				audits[i].SessionDate = r.state.Date
+			}
 		}
 		if audits[i].Symbol == "" {
 			audits[i].Symbol = r.state.Symbol
