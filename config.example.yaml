@@ -896,6 +896,42 @@ scanner:
     min_feature_coverage: 0.90              # Missing components never silently become neutral scores
     batch_size: 200                        # Maximum symbols requested per daily-bars provider batch
     run_lease_minutes: 60                  # Reclaim stale run or candidate-promotion claims after this lease
+  potent_industry:
+    enabled: false                         # Full-universe industry-rotation lens; observation-only by default
+    promote_candidates: false              # Reserved; true is rejected in this observation-only release
+    max_promotions_per_run: 20             # Future promotion cap; excluded from scoring-history compatibility
+    after_close_delay_minutes: 15          # Wait for finalized completed-session bars
+    universe_max_age_hours: 36             # Maximum age of the immutable universe snapshot
+    taxonomy_max_age_hours: 168            # Maximum age of taxonomy used to form a group
+    history_calendar_days: 420             # Calendar fetch window supporting true 52-week diagnostics
+    min_history_sessions: 253              # Minimum completed sessions per evaluated member
+    market_benchmark: SPY                  # Market-relative return benchmark
+    sector_benchmarks:                     # Exact immutable sector labels only; no fuzzy remapping
+      Communication Services: XLC
+      Consumer Discretionary: XLY
+      Consumer Staples: XLP
+      Energy: XLE
+      Financials: XLF
+      Health Care: XLV
+      Industrials: XLI
+      Materials: XLB
+      Real Estate: XLRE
+      Technology: XLK
+      Utilities: XLU
+    industry_benchmark_overrides: {}       # Optional exact industry label → tradeable benchmark symbol
+    min_fresh_taxonomy_coverage: 1.0       # Fail closed unless every grouped member has fresh taxonomy
+    min_group_members: 5                   # Minimum point-in-time constituents for an industry evaluation
+    min_group_coverage: 0.80               # Successfully evaluated members / eligible group members
+    min_potency_score: 0.70                # Absolute deterministic group-quality floor
+    min_member_score: 0.65                 # Absolute member-quality floor before top-N selection
+    selection_percentile: 0.80             # Cross-sectional potency percentile floor
+    min_advance_share: 0.60                # Minimum fraction of advancing constituents
+    min_median_return_5d: 0.0              # Broad group median must not be negative by default
+    max_cap_equal_divergence: 0.08         # Prevent one large constituent masking weak equal-weight breadth
+    min_persistence_sessions: 3            # Required qualifying sessions among the last five
+    max_members_per_group: 3               # Deterministic member-selection cap for each qualified group
+    batch_size: 200                        # Maximum symbols per historical-bars provider request
+    run_lease_minutes: 60                  # Reclaim failed or expired scheduled-run claims
   graph_neighbors:
     enabled: false             # Source candidates from knowledge-graph neighbors of manually-watched tickers
     max_per_scan: 5            # Cap graph candidates per scan so they don't crowd out screener picks

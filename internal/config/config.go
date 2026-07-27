@@ -5,6 +5,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1175,6 +1176,11 @@ type ScannerConfig struct {
 	// normal scanner gate; it never grants trade permission by itself.
 	WeeklyLeader WeeklyLeaderConfig `yaml:"weekly_leader"`
 
+	// PotentIndustry configures the observation-first industry rotation lens.
+	// Industry is the primary grouping; sector benchmarks provide context and a
+	// fallback for members whose finer taxonomy is not sufficiently fresh.
+	PotentIndustry PotentIndustryConfig `yaml:"potent_industry"`
+
 	// GraphNeighbors configures sourcing scanner candidates from the knowledge
 	// graph — tradeable companies one hop from a manually-watched ticker.
 	GraphNeighbors GraphNeighborsConfig `yaml:"graph_neighbors"`
@@ -1203,6 +1209,37 @@ type WeeklyLeaderConfig struct {
 	MinFeatureCoverage     float64 `yaml:"min_feature_coverage"`
 	BatchSize              int     `yaml:"batch_size"`
 	// RunLeaseMinutes bounds both scheduled-run and candidate-promotion claims.
+	RunLeaseMinutes int `yaml:"run_lease_minutes"`
+}
+
+// PotentIndustryConfig controls deterministic, point-in-time industry breadth
+// evaluation and member ranking. Promotion is independently gated so operators
+// can collect prospective observations before allowing candidates downstream.
+type PotentIndustryConfig struct {
+	Enabled                    bool              `yaml:"enabled"`
+	PromoteCandidates          bool              `yaml:"promote_candidates"`
+	MaxPromotionsPerRun        int               `yaml:"max_promotions_per_run"`
+	AfterCloseDelayMinutes     int               `yaml:"after_close_delay_minutes"`
+	UniverseMaxAgeHours        int               `yaml:"universe_max_age_hours"`
+	TaxonomyMaxAgeHours        int               `yaml:"taxonomy_max_age_hours"`
+	HistoryCalendarDays        int               `yaml:"history_calendar_days"`
+	MinHistorySessions         int               `yaml:"min_history_sessions"`
+	MarketBenchmark            string            `yaml:"market_benchmark"`
+	SectorBenchmarks           map[string]string `yaml:"sector_benchmarks"`
+	IndustryBenchmarkOverrides map[string]string `yaml:"industry_benchmark_overrides"`
+	MinFreshTaxonomyCoverage   float64           `yaml:"min_fresh_taxonomy_coverage"`
+	MinGroupMembers            int               `yaml:"min_group_members"`
+	MinGroupCoverage           float64           `yaml:"min_group_coverage"`
+	MinPotencyScore            float64           `yaml:"min_potency_score"`
+	MinMemberScore             float64           `yaml:"min_member_score"`
+	SelectionPercentile        float64           `yaml:"selection_percentile"`
+	MinAdvanceShare            float64           `yaml:"min_advance_share"`
+	MinMedianReturn5D          float64           `yaml:"min_median_return_5d"`
+	MaxCapEqualDivergence      float64           `yaml:"max_cap_equal_divergence"`
+	MinPersistenceSessions     int               `yaml:"min_persistence_sessions"`
+	MaxMembersPerGroup         int               `yaml:"max_members_per_group"`
+	BatchSize                  int               `yaml:"batch_size"`
+	// RunLeaseMinutes bounds scheduled-run claims.
 	RunLeaseMinutes int `yaml:"run_lease_minutes"`
 }
 
@@ -2138,6 +2175,147 @@ func Validate(cfg *Config) []string {
 		} else if !durationConfigFits(leader.RunLeaseMinutes, time.Minute) {
 			errs = append(errs,
 				"scanner.weekly_leader.run_lease_minutes overflows time.Duration")
+		}
+	}
+	if industry := cfg.Scanner.PotentIndustry; industry.Enabled {
+		const prefix = "scanner.potent_industry"
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, prefix+" requires scanner.enabled=true")
+		}
+		if !cfg.Scanner.Universe.Enabled {
+			errs = append(errs, prefix+" requires scanner.universe.enabled=true")
+		}
+		if industry.PromoteCandidates {
+			errs = append(errs, prefix+
+				".promote_candidates is not available in the observation-only release")
+		}
+		if industry.AfterCloseDelayMinutes < 0 {
+			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")
+		} else if !durationConfigFits(industry.AfterCloseDelayMinutes, time.Minute) {
+			errs = append(errs, prefix+".after_close_delay_minutes overflows time.Duration")
+		}
+		if industry.UniverseMaxAgeHours <= 0 {
+			errs = append(errs, prefix+".universe_max_age_hours must be > 0")
+		} else if !durationConfigFits(industry.UniverseMaxAgeHours, time.Hour) {
+			errs = append(errs, prefix+".universe_max_age_hours overflows time.Duration")
+		}
+		if industry.TaxonomyMaxAgeHours <= 0 {
+			errs = append(errs, prefix+".taxonomy_max_age_hours must be > 0")
+		} else if !durationConfigFits(industry.TaxonomyMaxAgeHours, time.Hour) {
+			errs = append(errs, prefix+".taxonomy_max_age_hours overflows time.Duration")
+		}
+		if industry.RunLeaseMinutes <= 0 {
+			errs = append(errs, prefix+".run_lease_minutes must be > 0")
+		} else if !durationConfigFits(industry.RunLeaseMinutes, time.Minute) {
+			errs = append(errs, prefix+".run_lease_minutes overflows time.Duration")
+		}
+		if industry.HistoryCalendarDays < 400 {
+			errs = append(errs, prefix+".history_calendar_days must be >= 400")
+		}
+		if industry.MinHistorySessions < 253 {
+			errs = append(errs, prefix+".min_history_sessions must be >= 253")
+		}
+		requiredCalendarDays, historyWindowOK := weeklyLeaderHistoryCalendarDays(
+			industry.MinHistorySessions,
+		)
+		if !historyWindowOK {
+			errs = append(errs, prefix+
+				".min_history_sessions is too large to convert to a safe calendar window")
+		} else if industry.MinHistorySessions > 0 &&
+			industry.HistoryCalendarDays < requiredCalendarDays {
+			errs = append(errs, fmt.Sprintf(
+				"%s.history_calendar_days must be >= %d for min_history_sessions=%d",
+				prefix, requiredCalendarDays, industry.MinHistorySessions))
+		}
+		if industry.HistoryCalendarDays > weeklyLeaderMaxHistoryCalendarDays {
+			errs = append(errs, fmt.Sprintf(
+				"%s.history_calendar_days must be <= %d",
+				prefix, weeklyLeaderMaxHistoryCalendarDays))
+		}
+		if strings.TrimSpace(industry.MarketBenchmark) == "" ||
+			industry.MarketBenchmark != strings.TrimSpace(industry.MarketBenchmark) ||
+			industry.MarketBenchmark != strings.ToUpper(industry.MarketBenchmark) {
+			errs = append(errs, prefix+".market_benchmark must be a normalized nonblank symbol")
+		}
+		validateBenchmarkMap := func(field string, values map[string]string, allowEmpty bool) {
+			if len(values) == 0 && !allowEmpty {
+				errs = append(errs, prefix+"."+field+" must not be empty")
+				return
+			}
+			normalizedGroups := make(map[string]struct{}, len(values))
+			for group, benchmark := range values {
+				if strings.TrimSpace(group) == "" || strings.TrimSpace(benchmark) == "" ||
+					group != strings.TrimSpace(group) ||
+					benchmark != strings.TrimSpace(benchmark) ||
+					benchmark != strings.ToUpper(benchmark) {
+					errs = append(errs, prefix+"."+field+
+						" must contain normalized nonblank group and benchmark values")
+					return
+				}
+				normalizedGroup := normalizedBenchmarkLabel(group)
+				if _, duplicate := normalizedGroups[normalizedGroup]; duplicate {
+					errs = append(errs, prefix+"."+field+
+						" must not contain duplicate normalized group labels")
+					return
+				}
+				normalizedGroups[normalizedGroup] = struct{}{}
+			}
+		}
+		validateBenchmarkMap("sector_benchmarks", industry.SectorBenchmarks, false)
+		validateBenchmarkMap(
+			"industry_benchmark_overrides", industry.IndustryBenchmarkOverrides, true,
+		)
+		validateUnitInterval := func(field string, value float64, inclusiveZero bool) {
+			valid := !math.IsNaN(value) && !math.IsInf(value, 0) &&
+				value > 0 && value <= 1
+			if inclusiveZero {
+				valid = !math.IsNaN(value) && !math.IsInf(value, 0) &&
+					value >= 0 && value <= 1
+			}
+			if !valid {
+				interval := "(0,1]"
+				if inclusiveZero {
+					interval = "[0,1]"
+				}
+				errs = append(errs, prefix+"."+field+" must be in "+interval)
+			}
+		}
+		validateUnitInterval(
+			"min_fresh_taxonomy_coverage", industry.MinFreshTaxonomyCoverage, false,
+		)
+		validateUnitInterval("min_group_coverage", industry.MinGroupCoverage, false)
+		validateUnitInterval("min_potency_score", industry.MinPotencyScore, false)
+		validateUnitInterval("min_member_score", industry.MinMemberScore, false)
+		if math.IsNaN(industry.SelectionPercentile) ||
+			math.IsInf(industry.SelectionPercentile, 0) ||
+			industry.SelectionPercentile <= 0 || industry.SelectionPercentile >= 1 {
+			errs = append(errs, prefix+".selection_percentile must be between 0 and 1")
+		}
+		validateUnitInterval("min_advance_share", industry.MinAdvanceShare, false)
+		if math.IsNaN(industry.MinMedianReturn5D) ||
+			math.IsInf(industry.MinMedianReturn5D, 0) ||
+			industry.MinMedianReturn5D < -1 {
+			errs = append(errs, prefix+".min_median_return_5d must be >= -1")
+		}
+		if math.IsNaN(industry.MaxCapEqualDivergence) ||
+			math.IsInf(industry.MaxCapEqualDivergence, 0) ||
+			industry.MaxCapEqualDivergence <= 0 {
+			errs = append(errs, prefix+".max_cap_equal_divergence must be > 0")
+		}
+		for field, value := range map[string]int{
+			"max_promotions_per_run":   industry.MaxPromotionsPerRun,
+			"min_group_members":        industry.MinGroupMembers,
+			"min_persistence_sessions": industry.MinPersistenceSessions,
+			"max_members_per_group":    industry.MaxMembersPerGroup,
+			"batch_size":               industry.BatchSize,
+		} {
+			if value <= 0 {
+				errs = append(errs, prefix+"."+field+" must be > 0")
+			}
+		}
+		if industry.MinPersistenceSessions > 5 {
+			errs = append(errs,
+				prefix+".min_persistence_sessions must be <= 5")
 		}
 	}
 

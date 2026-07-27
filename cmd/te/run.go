@@ -900,6 +900,32 @@ Modes:
 				} else if cfg.Scanner.WeeklyLeader.Enabled {
 					logger.Warn("weekly leader scanner requested but DB not connected; skipping startup")
 				}
+				if cfg.Scanner.PotentIndustry.Enabled && store.IsConnected() {
+					industryRunner := &scanner.PotentIndustryRunner{
+						Provider: data.NewAlpacaUniverseClient(
+							alpacaClient, cfg.Markets.Stocks.BaseURL,
+						),
+						Cfg: cfg.Scanner.PotentIndustry,
+					}
+					industryScheduler := &scanner.PotentIndustryScheduler{
+						Cfg: cfg.Scanner.PotentIndustry,
+						Job: industryRunner,
+					}
+					go func() {
+						if err := industryScheduler.Run(ctx); err != nil &&
+							err != context.Canceled {
+							logger.Warn("potent industry scheduler stopped with error",
+								"err", err.Error())
+						}
+					}()
+					logger.Info("potent industry scanner started",
+						"after_close_delay_minutes",
+						cfg.Scanner.PotentIndustry.AfterCloseDelayMinutes,
+						"observation_only", true,
+					)
+				} else if cfg.Scanner.PotentIndustry.Enabled {
+					logger.Warn("potent industry scanner requested but DB not connected; skipping startup")
+				}
 				go func() {
 					if err := mscanner.Run(ctx); err != nil && err != context.Canceled {
 						logger.Warn("market scanner stopped with error", "err", err.Error())
