@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -896,12 +897,77 @@ func TestCurrencyStrengthRejectsLegacyStateTaggedForAnotherAccount(t *testing.T)
 	if runner.state != nil {
 		t.Fatalf("cross-account legacy state was loaded: %+v", runner.state)
 	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		t.Fatalf("mismatched legacy claim was not restored: %v", err)
+	}
+	rightful := &currencyStrengthPaperRunner{
+		accountID: "DU111", statePath: filepath.Join(dir, "currency_strength_state_du111.json"),
+		legacyStatePath: legacyPath,
+	}
+	if err := rightful.loadState(); err != nil || rightful.state == nil {
+		t.Fatalf("rightful account could not recover restored legacy state: state=%+v err=%v",
+			rightful.state, err)
+	}
+}
+
+func TestCurrencyStrengthLegacyStateHasSingleConcurrentAccountClaim(t *testing.T) {
+	dir := t.TempDir()
+	legacyPath := filepath.Join(dir, "currency_strength_state.json")
+	legacy := currencyStrengthRunState{
+		Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+		EntryOrderID: "ENTRY-ONE-OWNER", EntryStatus: "filled",
+	}
+	b, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	runners := []*currencyStrengthPaperRunner{
+		{
+			accountID: "DU111", statePath: filepath.Join(dir, "currency_strength_state_du111.json"),
+			legacyStatePath: legacyPath,
+		},
+		{
+			accountID: "DU222", statePath: filepath.Join(dir, "currency_strength_state_du222.json"),
+			legacyStatePath: legacyPath,
+		},
+	}
+	start := make(chan struct{})
+	errs := make(chan error, len(runners))
+	for _, runner := range runners {
+		go func() {
+			<-start
+			errs <- runner.loadState()
+		}()
+	}
+	close(start)
+	for range runners {
+		if err := <-errs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	owners := 0
+	for _, runner := range runners {
+		if runner.state != nil {
+			owners++
+			if runner.state.AccountID != runner.accountID {
+				t.Fatalf("legacy state assigned across accounts: runner=%s state=%+v",
+					runner.accountID, runner.state)
+			}
+		}
+	}
+	if owners != 1 {
+		t.Fatalf("legacy obligation claimed by %d accounts, want exactly one", owners)
+	}
 }
 
 func TestCurrencyStrengthLegacyMigrationFailureRetainsActiveState(t *testing.T) {
 	dir := t.TempDir()
 	legacyPath := filepath.Join(dir, "currency_strength_state.json")
 	statePath := filepath.Join(dir, "currency_strength_state_du123.json")
+	claimPath := statePath + ".legacy-claim"
 	legacy := currencyStrengthRunState{
 		Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
 		EntryOrderID: "ENTRY-STILL-MANAGED", EntryStatus: "filled",
@@ -910,7 +976,7 @@ func TestCurrencyStrengthLegacyMigrationFailureRetainsActiveState(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(legacyPath, b, 0600); err != nil {
+	if err := os.WriteFile(claimPath, b, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chmod(dir, 0500); err != nil {
@@ -1249,6 +1315,75 @@ func TestCurrencyStrengthActivePositionSurvivesJournalStartupFailure(t *testing.
 	}
 	if broker.calls != 1 {
 		t.Fatalf("journal startup failure disabled broker exit management: calls=%d", broker.calls)
+	}
+}
+
+func TestCurrencyStrengthBrokerRecoverySurvivesJournalStartupFailure(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 1, 0, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{startErrors: 10}
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "ENTRY-BROKER-ONLY", Status: "filled",
+			FilledPrice: 1.1, FilledQty: 100000,
+		},
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-BROKER-ONLY", Status: "filled",
+			FilledPrice: 1.105, FilledQty: 100000,
+		},
+		positions: []execution.Position{{
+			Ticker: "GBP/USD", Quantity: 100000, AvgCostBasis: 1.1,
+		}},
+		keepPositionOnFill: true,
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "ENTRY-BROKER-ONLY",
+			TradeID:       "currency-strength-2026-07-27-GBPUSD",
+			Symbol:        "GBP/USD", Side: "buy", FilledQty: 100000,
+			FilledAvgPx: 1.1, FilledAt: now.Add(-9 * time.Hour),
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Timezone: "UTC", StrengthStart: "06:00", StrengthEnd: "09:00",
+			ExitTime: "18:00", Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, journal: journal,
+		statePath: t.TempDir() + "/currency-strength.json",
+		now:       func() time.Time { return now },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runner.Run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if broker.calls != 1 || len(broker.requests) != 1 ||
+		broker.requests[0].TradeID == "" {
+		t.Fatalf("journal outage blocked broker-only recovery/flatten: calls=%d requests=%+v state=%+v",
+			broker.calls, broker.requests, runner.state)
+	}
+}
+
+func TestCurrencyStrengthJournalOutageSuppressesNewEntry(t *testing.T) {
+	journal := &captureCurrencyStrengthJournal{startErrors: 10}
+	broker := &successfulCurrencyStrengthExecutor{}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			Timezone: "UTC", StrengthStart: "06:00", StrengthEnd: "09:00",
+			ExitTime: "18:00", Units: 100000, TradeInstruments: []string{"GBP/USD"},
+		},
+		broker: broker, journal: journal, market: fakeMarketDataProvider{},
+		statePath: t.TempDir() + "/currency-strength.json",
+		now:       func() time.Time { return time.Date(2026, 7, 27, 9, 1, 0, 0, time.UTC) },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := runner.Run(ctx)
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
+	}
+	if broker.calls != 0 || len(journal.evaluating) != 0 {
+		t.Fatalf("new entry evaluation ran without durable session journal: calls=%d evaluating=%d",
+			broker.calls, len(journal.evaluating))
 	}
 }
 
@@ -1841,6 +1976,60 @@ func TestCurrencyStrengthPnLConvertsUSDJPYQuoteCurrencyToUSD(t *testing.T) {
 	}
 	if pnl == nil || *pnl < 662.24 || *pnl > 662.26 {
 		t.Fatalf("USD/JPY P&L = %v, want about 662.25 USD", pnl)
+	}
+}
+
+type historicalConversionMarketData struct {
+	candles map[string][]data.Candle
+}
+
+func (f historicalConversionMarketData) FetchCandles(
+	_ context.Context,
+	symbol string,
+	_ data.Timeframe,
+	_, _ time.Time,
+) ([]data.Candle, error) {
+	candles, ok := f.candles[symbol]
+	if !ok {
+		return nil, fmt.Errorf("unexpected historical conversion request for %s", symbol)
+	}
+	return candles, nil
+}
+
+func (historicalConversionMarketData) FetchQuote(context.Context, string) (*data.Quote, error) {
+	return nil, errors.New("spot quote must not be used for deferred P&L")
+}
+
+func (historicalConversionMarketData) FetchHistory(
+	context.Context,
+	string,
+	data.Timeframe,
+	int,
+) ([]data.Candle, error) {
+	return nil, errors.New("unexpected history fetch")
+}
+
+func TestCurrencyStrengthCrossPnLUsesExitTimestampConversion(t *testing.T) {
+	exitedAt := time.Date(2026, 7, 27, 18, 0, 30, 0, time.UTC)
+	runner := &currencyStrengthPaperRunner{
+		market: historicalConversionMarketData{candles: map[string][]data.Candle{
+			"JPY/USD": {
+				{Timestamp: exitedAt.Add(-time.Minute), Close: 0.0067},
+				{Timestamp: exitedAt.Add(time.Minute), Close: 0.0099},
+			},
+		}},
+		state: &currencyStrengthRunState{
+			Symbol: "EUR/JPY", Side: "buy", EntryStatus: "filled", EntryFillPrice: 160,
+		},
+	}
+	pnl, err := runner.realizedPnLUSD(context.Background(), currencyStrengthExitAudit{
+		FillPrice: 161, FilledQty: 100000, ExitedAt: exitedAt.Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pnl == nil || *pnl < 669.99 || *pnl > 670.01 {
+		t.Fatalf("EUR/JPY historical-conversion P&L = %v, want 670.00 USD", pnl)
 	}
 }
 

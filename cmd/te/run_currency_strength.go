@@ -127,10 +127,11 @@ type currencyStrengthPaperRunner struct {
 	statePath string
 	// legacyStatePath is read only when the account-scoped sidecar does not
 	// exist. It supports one-time migration from the pre-account-scoping file.
-	legacyStatePath string
-	now             func() time.Time
-	notifier        sessionNotifier // optional; nil disables Telegram notifications
-	journal         currencyStrengthJournal
+	legacyStatePath   string
+	claimedLegacyPath string
+	now               func() time.Time
+	notifier          sessionNotifier // optional; nil disables Telegram notifications
+	journal           currencyStrengthJournal
 
 	state              *currencyStrengthRunState
 	decisionDoneFor    string
@@ -322,18 +323,15 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 
 		if r.sessionRecordedFor != dateKey {
 			if err := r.startJournal(ctx, day); err != nil {
-				if r.state == nil {
-					return err
-				}
-				// Audit storage must never disable management of an existing
-				// broker position. Leave the marker unset and retry next tick.
-				logger.Warn("currency-strength: session history unavailable while position is active; will retry", "err", err)
+				// Broker-only recovery can become visible after startup, so a
+				// journal outage must never stop reconciliation even when no
+				// sidecar obligation has been restored yet. Leave the marker
+				// unset, retry next tick, and suppress new entries until the
+				// daily audit row is available.
+				logger.Warn("currency-strength: session history unavailable; continuing broker recovery", "err", err)
 			} else {
 				if err := r.restoreJournalState(ctx, day); err != nil {
-					if r.state == nil {
-						return err
-					}
-					logger.Warn("currency-strength: history restore failed while position is active; will retry", "err", err)
+					logger.Warn("currency-strength: history restore failed; continuing broker recovery", "err", err)
 				} else {
 					r.sessionRecordedFor = dateKey
 				}
@@ -372,7 +370,8 @@ func (r *currencyStrengthPaperRunner) Run(ctx context.Context) error {
 			}
 		}
 
-		if r.state == nil && !now.Before(strengthEnd) && now.Before(exitTime) {
+		if r.state == nil && r.sessionRecordedFor == dateKey &&
+			!now.Before(strengthEnd) && now.Before(exitTime) {
 			if r.decisionDoneFor != dateKey {
 				if now.Sub(strengthEnd) > currencyStrengthEntryGrace {
 					logger.Info("currency-strength: entry window expired; no paper order placed",
@@ -1878,12 +1877,19 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 		return &pnl, nil
 	}
 
-	rate, err := r.currencyConversionRate(ctx, quote+"/USD")
+	exitedAt, parseErr := time.Parse(time.RFC3339, audit.ExitedAt)
+	if parseErr != nil {
+		return nil, fmt.Errorf(
+			"currency-strength convert %s P&L: invalid exit timestamp %q: %w",
+			quote, audit.ExitedAt, parseErr,
+		)
+	}
+	rate, err := r.currencyConversionRateAt(ctx, quote+"/USD", exitedAt)
 	if err == nil {
 		pnl *= rate
 		return &pnl, nil
 	}
-	inverse, inverseErr := r.currencyConversionRate(ctx, "USD/"+quote)
+	inverse, inverseErr := r.currencyConversionRateAt(ctx, "USD/"+quote, exitedAt)
 	if inverseErr != nil {
 		return nil, fmt.Errorf(
 			"currency-strength convert %s P&L to USD: direct: %v; inverse: %w",
@@ -1894,19 +1900,36 @@ func (r *currencyStrengthPaperRunner) realizedPnLUSD(
 	return &pnl, nil
 }
 
-func (r *currencyStrengthPaperRunner) currencyConversionRate(ctx context.Context, symbol string) (float64, error) {
-	quote, err := r.market.FetchQuote(ctx, symbol)
+func (r *currencyStrengthPaperRunner) currencyConversionRateAt(
+	ctx context.Context,
+	symbol string,
+	at time.Time,
+) (float64, error) {
+	if at.IsZero() {
+		return 0, fmt.Errorf("%s conversion requires an exit timestamp", symbol)
+	}
+	candles, err := r.market.FetchCandles(
+		ctx,
+		symbol,
+		data.Timeframe1Min,
+		at.Add(-15*time.Minute),
+		at.Add(time.Minute),
+	)
 	if err != nil {
 		return 0, err
 	}
-	rate := quote.Last
-	if quote.Bid > 0 && quote.Ask > 0 {
-		rate = (quote.Bid + quote.Ask) / 2
-	} else if rate <= 0 {
-		rate = math.Max(quote.Bid, quote.Ask)
+	var rate float64
+	var latest time.Time
+	for _, candle := range candles {
+		if candle.Close > 0 && !candle.Timestamp.After(at) &&
+			(latest.IsZero() || candle.Timestamp.After(latest)) {
+			rate = candle.Close
+			latest = candle.Timestamp
+		}
 	}
 	if rate <= 0 {
-		return 0, fmt.Errorf("%s quote has no positive price", symbol)
+		return 0, fmt.Errorf("%s has no positive conversion candle at or before %s",
+			symbol, at.UTC().Format(time.RFC3339))
 	}
 	return rate, nil
 }
@@ -2053,9 +2076,24 @@ func (r *currencyStrengthPaperRunner) loadState() error {
 	loadedPath := r.statePath
 	legacy := false
 	if os.IsNotExist(err) && r.legacyStatePath != "" {
-		b, err = os.ReadFile(r.legacyStatePath)
-		loadedPath = r.legacyStatePath
+		claimPath := r.statePath + ".legacy-claim"
+		b, err = os.ReadFile(claimPath)
+		if os.IsNotExist(err) {
+			// Rename before reading: only one account-specific runner can claim
+			// an untagged legacy obligation during a concurrent first upgrade.
+			if renameErr := os.Rename(r.legacyStatePath, claimPath); renameErr != nil {
+				if os.IsNotExist(renameErr) {
+					return nil
+				}
+				return fmt.Errorf("currency-strength claim legacy state: %w", renameErr)
+			}
+			b, err = os.ReadFile(claimPath)
+		}
+		loadedPath = claimPath
 		legacy = err == nil
+		if legacy {
+			r.claimedLegacyPath = claimPath
+		}
 	}
 	if os.IsNotExist(err) {
 		return nil
@@ -2069,6 +2107,14 @@ func (r *currencyStrengthPaperRunner) loadState() error {
 	}
 	stateAccountID := normalizeCurrencyStrengthAccountID(state.AccountID)
 	if r.accountID != "" && stateAccountID != "" && stateAccountID != r.accountID {
+		if legacy {
+			if restoreErr := r.restoreLegacyClaim(); restoreErr != nil {
+				return fmt.Errorf(
+					"currency-strength state belongs to account %q, current account is %q (restore claim: %v)",
+					state.AccountID, r.accountID, restoreErr,
+				)
+			}
+		}
 		return fmt.Errorf(
 			"currency-strength state belongs to account %q, current account is %q",
 			state.AccountID, r.accountID,
@@ -2098,6 +2144,22 @@ func (r *currencyStrengthPaperRunner) loadState() error {
 	return nil
 }
 
+func (r *currencyStrengthPaperRunner) restoreLegacyClaim() error {
+	if r.claimedLegacyPath == "" {
+		return nil
+	}
+	if _, err := os.Stat(r.legacyStatePath); err == nil {
+		return fmt.Errorf("legacy source %s already exists", r.legacyStatePath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Rename(r.claimedLegacyPath, r.legacyStatePath); err != nil {
+		return err
+	}
+	r.claimedLegacyPath = ""
+	return nil
+}
+
 func (r *currencyStrengthPaperRunner) migrateLegacyState() error {
 	// Tag the source first. If the process stops before the account-scoped copy
 	// is durable, another configured account cannot subsequently claim it.
@@ -2105,20 +2167,21 @@ func (r *currencyStrengthPaperRunner) migrateLegacyState() error {
 	if err != nil {
 		return fmt.Errorf("currency-strength encode legacy state migration: %w", err)
 	}
-	if err := writeCurrencyStrengthStateAtomic(r.legacyStatePath, b); err != nil {
+	if err := writeCurrencyStrengthStateAtomic(r.claimedLegacyPath, b); err != nil {
 		return fmt.Errorf("currency-strength tag legacy state migration: %w", err)
 	}
 	if err := r.saveState(); err != nil {
 		return fmt.Errorf("currency-strength persist account-scoped state migration: %w", err)
 	}
-	if err := os.Remove(r.legacyStatePath); err != nil && !os.IsNotExist(err) {
+	if err := os.Remove(r.claimedLegacyPath); err != nil && !os.IsNotExist(err) {
 		// The tagged legacy copy is safe to leave behind: a different account
 		// will reject it, while this account now prefers its scoped sidecar.
 		logger.Warn("currency-strength: migrated legacy sidecar but could not remove tagged source",
-			"path", r.legacyStatePath, "err", err)
+			"path", r.claimedLegacyPath, "err", err)
 	}
 	logger.Info("currency-strength: migrated legacy recovery sidecar",
-		"from", r.legacyStatePath, "to", r.statePath, "account_id", r.accountID)
+		"from", r.claimedLegacyPath, "to", r.statePath, "account_id", r.accountID)
+	r.claimedLegacyPath = ""
 	return nil
 }
 
