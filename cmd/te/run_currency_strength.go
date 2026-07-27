@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -874,6 +875,19 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 	if r.state.Side == "sell" {
 		exitSide = execution.OrderSideBuy
 	}
+	if adopted, err := r.adoptWorkingExit(ctx, exitSide); err != nil {
+		return err
+	} else if adopted {
+		return r.finalizeExitedState(ctx)
+	}
+	if r.state.ExitRetry &&
+		r.state.Quantity > 0 &&
+		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity {
+		logger.Warn("currency-strength: cumulative executions cover exit; awaiting broker detail or flat portfolio",
+			"cumulative_filled_qty", r.state.ExitCumulativeQty,
+			"entry_qty", r.state.Quantity)
+		return nil
+	}
 	pos, err := r.positionFor(ctx, r.state.Symbol)
 	if err != nil {
 		return err
@@ -996,12 +1010,6 @@ func (r *currencyStrengthPaperRunner) exitActive(ctx context.Context) error {
 		qty = r.state.ExitRetryMaxQty
 	}
 
-	if adopted, err := r.adoptWorkingExit(ctx, exitSide); err != nil {
-		return err
-	} else if adopted {
-		return r.finalizeExitedState(ctx)
-	}
-
 	r.state.ExitRequestedQty = qty
 	r.state.ExitFillObserved = ""
 	r.state.ExitFillTimeQty = 0
@@ -1066,6 +1074,9 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 		orderID, tradeID        string
 		filledQty, fillNotional float64
 		filledAt                time.Time
+		reservedAt              int64
+		attempt                 int
+		hasSequence             bool
 	}
 	candidates := make(map[string]*fillCandidate)
 	for _, record := range records {
@@ -1076,6 +1087,8 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 		candidate := candidates[key]
 		if candidate == nil {
 			candidate = &fillCandidate{orderID: record.OrderID, tradeID: record.TradeID}
+			candidate.reservedAt, candidate.attempt, candidate.hasSequence =
+				currencyStrengthExitReferenceSequence(record.TradeID, baseRef)
 			candidates[key] = candidate
 		}
 		candidate.filledQty += record.Qty
@@ -1095,13 +1108,25 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	}
 	var selected *fillCandidate
 	for _, candidate := range candidates {
-		if selected == nil || candidate.filledAt.After(selected.filledAt) {
+		if selected == nil ||
+			(candidate.hasSequence && !selected.hasSequence) ||
+			(candidate.hasSequence && selected.hasSequence &&
+				(candidate.reservedAt > selected.reservedAt ||
+					(candidate.reservedAt == selected.reservedAt &&
+						candidate.attempt > selected.attempt))) ||
+			(!candidate.hasSequence && !selected.hasSequence &&
+				candidate.filledAt.After(selected.filledAt)) {
 			selected = candidate
 		}
 	}
 	latestCount := 0
 	for _, candidate := range candidates {
-		if candidate.filledAt.Equal(selected.filledAt) {
+		sameSequence := candidate.hasSequence && selected.hasSequence &&
+			candidate.reservedAt == selected.reservedAt &&
+			candidate.attempt == selected.attempt
+		sameLegacyFillTime := !candidate.hasSequence && !selected.hasSequence &&
+			candidate.filledAt.Equal(selected.filledAt)
+		if sameSequence || sameLegacyFillTime {
 			latestCount++
 		}
 	}
@@ -1111,8 +1136,47 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 			baseRef,
 		)
 	}
-	if selected == nil || selected.orderID == r.state.ExitPriorOrderID {
+	if selected == nil {
 		return false, nil
+	}
+	var observedCumulativeQty float64
+	for _, candidate := range candidates {
+		observedCumulativeQty += candidate.filledQty
+	}
+	cumulativeAdvanced := observedCumulativeQty > r.state.ExitCumulativeQty
+	if cumulativeAdvanced {
+		r.state.ExitCumulativeQty = observedCumulativeQty
+	}
+	derivedRetryMax := math.Max(
+		r.state.Quantity-r.state.ExitCumulativeQty,
+		0,
+	)
+	retryCapChanged := recoveringUnpersistedRetry &&
+		math.Abs(r.state.ExitRetryMaxQty-derivedRetryMax) > 1e-6
+	if retryCapChanged {
+		r.state.ExitRetryMaxQty = derivedRetryMax
+	}
+	cumulativeCoversEntry := r.state.Quantity > 0 &&
+		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity
+	if selected.orderID == r.state.ExitPriorOrderID && !cumulativeCoversEntry {
+		if cumulativeAdvanced || retryCapChanged {
+			if err := r.saveState(); err != nil {
+				logger.Warn("currency-strength: failed to persist late prior-order executions",
+					"order_id", selected.orderID, "err", err)
+			}
+			logger.Warn("currency-strength: late prior-order executions reduced retry remainder",
+				"order_id", selected.orderID,
+				"cumulative_filled_qty", r.state.ExitCumulativeQty,
+				"max_retry_qty", r.state.ExitRetryMaxQty)
+		}
+		return false, nil
+	}
+	if cumulativeCoversEntry &&
+		observedCumulativeQty+1e-6 < r.state.Quantity {
+		// Durable cumulative history already proves the strategy obligation is
+		// covered, but broker execution detail is still lagging. Suppress every
+		// retry until records can hydrate the terminal order accurately.
+		return true, nil
 	}
 	if selected.filledQty <= 0 || selected.fillNotional <= 0 || selected.filledAt.IsZero() {
 		return false, nil
@@ -1164,13 +1228,6 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	r.state.ExitFillTimeQty = selected.filledQty
 	r.state.ExitRequestedQty = requestedQty
 	r.state.ExitedAt = selected.filledAt.UTC().Format(time.RFC3339)
-	var observedCumulativeQty float64
-	for _, candidate := range candidates {
-		observedCumulativeQty += candidate.filledQty
-	}
-	if observedCumulativeQty > r.state.ExitCumulativeQty {
-		r.state.ExitCumulativeQty = observedCumulativeQty
-	}
 	if err := r.saveState(); err != nil {
 		logger.Warn("currency-strength: failed to persist recovered filled exit", "err", err)
 	}
@@ -1229,6 +1286,25 @@ func (r *currencyStrengthPaperRunner) adoptWorkingExit(
 	if err := r.saveState(); err != nil {
 		logger.Warn("currency-strength: failed to persist adopted working exit", "err", err)
 	}
+	cumulativeCoversEntry := r.state.Quantity > 0 &&
+		r.state.ExitCumulativeQty+1e-6 >= r.state.Quantity
+	oversizedRetry := r.state.ExitRetry &&
+		matched.RemainingQty > r.state.ExitRetryMaxQty+1e-6 &&
+		(r.state.ExitRetryMaxQty > 0 || cumulativeCoversEntry)
+	if oversizedRetry {
+		if err := r.broker.CancelOrder(ctx, matched.OrderID); err != nil &&
+			!errors.Is(err, execution.ErrOrderNotFound) {
+			return false, fmt.Errorf(
+				"cancel oversized recovered currency-strength retry %s: %w",
+				matched.OrderID,
+				err,
+			)
+		}
+		logger.Warn("currency-strength: cancelling oversized working retry after late executions",
+			"order_id", matched.OrderID,
+			"remaining_qty", matched.RemainingQty,
+			"max_retry_qty", r.state.ExitRetryMaxQty)
+	}
 	logger.Warn("currency-strength: adopted broker working exit during recovery",
 		"symbol", r.state.Symbol, "order_id", matched.OrderID,
 		"trade_id", matched.TradeID)
@@ -1252,6 +1328,28 @@ func currencyStrengthExitReferenceMatches(orderRef, wantRef, baseRef string, exa
 		return orderRef == wantRef
 	}
 	return orderRef == baseRef || strings.HasPrefix(orderRef, baseRef+"-")
+}
+
+func currencyStrengthExitReferenceSequence(
+	orderRef, baseRef string,
+) (reservedAt int64, attempt int, ok bool) {
+	suffix := strings.TrimPrefix(orderRef, baseRef+"-")
+	if suffix == orderRef {
+		return 0, 0, false
+	}
+	parts := strings.Split(suffix, "-")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	reservedAt, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	attempt64, err := strconv.ParseInt(parts[1], 10, 32)
+	if err != nil {
+		return 0, 0, false
+	}
+	return reservedAt, int(attempt64), true
 }
 
 func (r *currencyStrengthPaperRunner) reserveExitTradeID() (string, error) {
@@ -1707,6 +1805,12 @@ func mergeCurrencyStrengthRunIntoState(
 	}
 	if run.ExitFilledQty > state.ExitCumulativeQty {
 		state.ExitCumulativeQty = run.ExitFilledQty
+	}
+	if state.ExitRetry && state.ExitPriorOrderID != "" {
+		state.ExitRetryMaxQty = math.Max(
+			state.Quantity-state.ExitCumulativeQty,
+			0,
+		)
 	}
 	if run.ExitOrderID != "" &&
 		(run.Status == "exit_submitted" || run.Status == "exited") &&

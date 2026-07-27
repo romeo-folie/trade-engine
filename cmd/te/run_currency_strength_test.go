@@ -364,7 +364,8 @@ type successfulCurrencyStrengthExecutor struct {
 
 type workingExitExecutor struct {
 	*successfulCurrencyStrengthExecutor
-	orders []execution.WorkingOrder
+	orders  []execution.WorkingOrder
+	cancels int
 }
 
 type sequencedCurrencyStrengthExecutor struct {
@@ -410,6 +411,11 @@ func (*sequencedCurrencyStrengthExecutor) GetAccount(context.Context) (execution
 
 func (f *workingExitExecutor) GetWorkingOrders(context.Context) ([]execution.WorkingOrder, error) {
 	return f.orders, nil
+}
+
+func (f *workingExitExecutor) CancelOrder(context.Context, string) error {
+	f.cancels++
+	return nil
 }
 
 func (f *successfulCurrencyStrengthExecutor) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
@@ -1991,9 +1997,182 @@ func TestCurrencyStrengthResidualRecoveryAdoptsUniqueWorkingRetry(t *testing.T) 
 	}
 }
 
+func TestCurrencyStrengthRecoveryCancelsOversizedWorkingRetry(t *testing.T) {
+	base := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-OVERSIZED-WORKING", Status: "pending",
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+	}
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: base,
+		orders: []execution.WorkingOrder{{
+			OrderID: "EXIT-OVERSIZED-WORKING",
+			TradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+			Ticker:  "GBP/USD", Side: "sell", Status: "pending", RemainingQty: 60000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR",
+			ExitCumulativeQty: 70000, ExitRetryMaxQty: 30000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.cancels != 1 || base.calls != 0 || runner.state == nil ||
+		runner.state.ExitOrderID != "EXIT-OVERSIZED-WORKING" {
+		t.Fatalf("oversized working retry remained live: cancels=%d calls=%d state=%+v",
+			broker.cancels, base.calls, runner.state)
+	}
+}
+
+func TestCurrencyStrengthFlatRecoveryCancelsWorkingRetryBeforeBrokerFlat(t *testing.T) {
+	base := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-FLAT-WORKING", Status: "pending",
+		},
+	}
+	broker := &workingExitExecutor{
+		successfulCurrencyStrengthExecutor: base,
+		orders: []execution.WorkingOrder{{
+			OrderID: "EXIT-FLAT-WORKING",
+			TradeID: "currency-strength-exit-2026-07-27-GBPUSD-2-2",
+			Ticker:  "GBP/USD", Side: "sell", Status: "pending", RemainingQty: 60000,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: &captureCurrencyStrengthJournal{}, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR",
+			ExitCumulativeQty: 40000, ExitRetryMaxQty: 60000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.cancels != 1 || base.calls != 0 || runner.state == nil ||
+		runner.state.ExitOrderID != "EXIT-FLAT-WORKING" {
+		t.Fatalf("flat recovery left working retry live: cancels=%d calls=%d state=%+v",
+			broker.cancels, base.calls, runner.state)
+	}
+}
+
+func TestCurrencyStrengthLatePriorFillsShrinkResidualRetry(t *testing.T) {
+	firstFillAt := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-LATE-CAPPED-RETRY", Status: "pending",
+		},
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+		recentFills: []execution.BrokerOrder{
+			{
+				BrokerOrderID: "EXIT-PRIOR-LATE", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 40000,
+				FilledAvgPx: 1.104, FilledAt: firstFillAt,
+			},
+			{
+				BrokerOrderID: "EXIT-PRIOR-LATE", TradeID: "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+				Symbol: "GBP/USD", Side: "sell", FilledQty: 30000,
+				FilledAvgPx: 1.105, FilledAt: firstFillAt.Add(time.Minute),
+			},
+		},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR-LATE",
+			ExitCumulativeQty: 40000, ExitRetryMaxQty: 60000,
+		},
+		now: func() time.Time { return firstFillAt.Add(2 * time.Minute) },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.calls != 1 || len(broker.requests) != 1 ||
+		broker.requests[0].Quantity != 30000 ||
+		runner.state.ExitCumulativeQty != 70000 {
+		t.Fatalf("late prior fills did not shrink retry: calls=%d requests=%+v state=%+v",
+			broker.calls, broker.requests, runner.state)
+	}
+}
+
+func TestCurrencyStrengthLatePriorFillsSuppressCoveredRetry(t *testing.T) {
+	filledAt := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	broker := &successfulCurrencyStrengthExecutor{
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-PRIOR-FULL", Status: "filled",
+			FilledPrice: 1.105, FilledQty: 100000,
+		},
+		positions:          []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+		keepPositionOnFill: true,
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "EXIT-PRIOR-FULL",
+			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+			Symbol:        "GBP/USD", Side: "sell", FilledQty: 100000,
+			FilledAvgPx: 1.105, FilledAt: filledAt,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR-FULL",
+			ExitCumulativeQty: 40000, ExitRetryMaxQty: 60000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.calls != 0 || runner.state == nil ||
+		runner.state.ExitOrderID != "EXIT-PRIOR-FULL" ||
+		runner.state.ExitCumulativeQty != 100000 {
+		t.Fatalf("fully covered prior order released another retry: calls=%d state=%+v",
+			broker.calls, runner.state)
+	}
+}
+
+func TestCurrencyStrengthDurableCumulativeCoverageSuppressesRetryWithoutTradeDetail(t *testing.T) {
+	broker := &successfulCurrencyStrengthExecutor{
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFilledQty: 100000,
+			ExitRetry: true, ExitPriorOrderID: "EXIT-PRIOR-FULL",
+			ExitCumulativeQty: 100000,
+		},
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.calls != 0 || runner.state == nil || !runner.state.ExitRetry {
+		t.Fatalf("durable cumulative coverage submitted a blind retry: calls=%d state=%+v",
+			broker.calls, runner.state)
+	}
+}
+
 func TestCurrencyStrengthResidualRecoveryAdoptsNewestFilledRetry(t *testing.T) {
 	oldFilledAt := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
-	newFilledAt := oldFilledAt.Add(3 * time.Minute)
+	// The prior order can report a later execution after the retry filled.
+	// Reservation sequence, not fill time, identifies the newer retry order.
+	newFilledAt := oldFilledAt.Add(-time.Minute)
 	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{
 		statusResult: execution.OrderResult{
