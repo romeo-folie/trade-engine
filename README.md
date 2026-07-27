@@ -252,15 +252,16 @@ Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb`,
 ```text
 te config show                       Print resolved config with secrets masked
 te config set <key> <value>          Persist a value to config.yaml
-te config set <key> <value> --runtime
-                                      Persist a DB override
+te config set engine.mode <mode> --runtime
+                                      Persist the supported DB startup override
 te config validate                   Validate the resolved configuration
 te migrate                           Apply pending database migrations
 te db --help                         Database reset and summary-backfill operations
 ```
 
-Runtime overrides persist to the database without editing YAML. Components
-that read configuration during startup require an engine restart to apply them.
+`engine.mode` is currently the only DB runtime-override key consumed by the
+engine and dashboard. It persists without editing YAML and requires an engine
+restart to apply. Use ordinary `te config set` for every other key.
 
 ### Trading data and operations
 
@@ -278,7 +279,7 @@ te orb stats                          Inspect opening-range performance
 
 ```text
 te models list                         List configured analyst models
-te models test <prompt>                Send a prompt to each enabled model
+te models test <prompt>                Test available analyst providers (not arbiter)
 te models compare <ticker>             Compare model analysis for one ticker
 te models performance                  Summarize realized performance by model
 te graph seed                          Seed the knowledge graph
@@ -286,7 +287,8 @@ te graph entities                      List graph entities
 te graph relationships <ticker>        Inspect a ticker's graph relationships
 te graph review                        Review extracted relationships
 te embeddings status                   Show embedding provider and index status
-te embeddings reindex                  Rebuild stored embeddings
+te embeddings reindex                  Fill missing stored embeddings
+te embeddings reindex --force          Clear and rebuild all stored embeddings
 ```
 
 ### Reports
@@ -303,8 +305,9 @@ te report backtest <id>                Generate one backtest report
 te report compare <id1> <id2>          Compare two backtest reports
 ```
 
-Use `te report <command> --help` for date ranges, filters, output paths, and
-report-specific options.
+Use `te report <command> --help` for date ranges, filters, and report-specific
+options. Generated HTML output locations are controlled by the `reports`
+configuration.
 
 ### Backtests
 
