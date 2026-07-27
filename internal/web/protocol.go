@@ -345,17 +345,29 @@ func pipelineTopology(cfg *appconfig.Config) ([]NodeState, PipelineTopology) {
 		}
 	}
 
+	// Risk evaluation has two immediate outcomes, and they are not equivalent:
+	//
+	//   blocked_signals — terminal. The signal is dropped here.
+	//   approvals       — a gate, not an end state. Engine.ApproveSignal
+	//                     ("approves a pending signal and executes it") feeds
+	//                     the approved signal straight into the executor.
+	//
+	// Both used to sit alongside the executor at the same depth with no edge
+	// leaving the approval queue, which drew manual approval as a dead end
+	// equal to Blocked. The queue now sits one stage ahead of the executor and
+	// keeps its outgoing edge; Blocked remains the leaf.
 	nodes = append(nodes,
 		NodeState{ID: "risk_manager", Label: "Risk Controls", Kind: "synthesis", Stage: riskStage},
-		NodeState{ID: "executor", Label: "Executor", Kind: "execution", Stage: riskStage + 1},
 		NodeState{ID: "blocked_signals", Label: "Blocked", Kind: "outcome", Stage: riskStage + 1},
 		NodeState{ID: "approvals", Label: "Approval Queue", Kind: "outcome", Stage: riskStage + 1},
-		NodeState{ID: "portfolio", Label: "Portfolio", Kind: "execution", Stage: riskStage + 2},
+		NodeState{ID: "executor", Label: "Executor", Kind: "execution", Stage: riskStage + 2},
+		NodeState{ID: "portfolio", Label: "Portfolio", Kind: "execution", Stage: riskStage + 3},
 	)
 	edges = append(edges,
 		PipelineEdge{ID: "e-risk-controls-executor", Source: "risk_manager", Target: "executor", Kind: "primary"},
 		PipelineEdge{ID: "e-risk-controls-blocked", Source: "risk_manager", Target: "blocked_signals", Kind: "conditional"},
 		PipelineEdge{ID: "e-risk-controls-approvals", Source: "risk_manager", Target: "approvals", Kind: "conditional"},
+		PipelineEdge{ID: "e-approvals-executor", Source: "approvals", Target: "executor", Kind: "conditional"},
 		PipelineEdge{ID: "e-executor-portfolio", Source: "executor", Target: "portfolio", Kind: "primary"},
 	)
 

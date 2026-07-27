@@ -3,6 +3,7 @@ import type { AnalysisRecord, AnalystResult } from '../../screens/Analysis';
 import { ChamferedBox } from '../common/ChamferedBox';
 import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
+import { verdictColor } from '../../utils/verdict';
 import styles from './AnalysisModal.module.css';
 
 const ANALYST_PALETTE = [
@@ -19,12 +20,6 @@ function analystBracketColor(index: number, active: boolean): string {
 
 function analystBarColor(index: number): string {
   return ANALYST_PALETTE[index % ANALYST_PALETTE.length];
-}
-
-function verdictColor(verdict: string): string {
-  if (verdict === 'LONG') return 'var(--accent)';
-  if (verdict === 'SHORT') return 'var(--red)';
-  return 'var(--amber)';
 }
 
 interface AnalysisModalProps {

@@ -86,8 +86,10 @@ func TestMapAnalystResults_validResults(t *testing.T) {
 	if analysts[0].Verdict != "LONG" {
 		t.Errorf("expected LONG, got %s", analysts[0].Verdict)
 	}
-	if analysts[2].Verdict != "NEUTRAL" {
-		t.Errorf("expected NEUTRAL, got %s", analysts[2].Verdict)
+	// HOLD stays HOLD — it is a decision to drop the ticker, not an absence of
+	// one, and must not be flattened into NEUTRAL alongside WAIT.
+	if analysts[2].Verdict != "HOLD" {
+		t.Errorf("expected HOLD, got %s", analysts[2].Verdict)
 	}
 
 	// Check all active
@@ -206,8 +208,11 @@ func TestMapAnalystResults_tieBreakLongShort(t *testing.T) {
 	if ensemble == nil {
 		t.Fatal("expected non-nil ensemble")
 	}
-	if ensemble.Verdict != "NEUTRAL" {
-		t.Errorf("expected tie-break verdict NEUTRAL, got %s", ensemble.Verdict)
+	// An opposed BUY-vs-SELL tie resolves to HOLD, matching the engine's own
+	// rule in internal/analysis/ensemble.go ("no directional bias, fall to
+	// HOLD"). It previously reported NEUTRAL, which no engine action produces.
+	if ensemble.Verdict != "HOLD" {
+		t.Errorf("expected tie-break verdict HOLD, got %s", ensemble.Verdict)
 	}
 }
 
@@ -227,6 +232,10 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
+// mapVerdict once returned NEUTRAL for every non-directional action, so the
+// signal and analysis side panels could not tell HOLD ("drop this ticker") from
+// WAIT ("re-evaluate next tick"), nor an ORB candidate that passed the gate
+// (TRADE) from one that was filtered out (SKIP).
 func TestMapVerdict(t *testing.T) {
 	cases := []struct {
 		in   analysis.Action
@@ -234,12 +243,68 @@ func TestMapVerdict(t *testing.T) {
 	}{
 		{analysis.ActionBuy, "LONG"},
 		{analysis.ActionSell, "SHORT"},
-		{analysis.ActionHold, "NEUTRAL"},
+		{analysis.ActionHold, "HOLD"},
+		{analysis.ActionWait, "WAIT"},
+		{analysis.ActionTrade, "TRADE"},
+		{analysis.ActionSkip, "SKIP"},
+		{analysis.ActionAdd, "ADD"},
+		// Only a genuinely unclassifiable action stays NEUTRAL. An analyst that
+		// errored leaves the action empty.
 		{"", "NEUTRAL"},
+		{"SOMETHING_NEW", "NEUTRAL"},
 	}
 	for _, c := range cases {
 		if got := mapVerdict(c.in); got != c.want {
 			t.Errorf("mapVerdict(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// HOLD and WAIT must never map to the same string, or the panels regress to the
+// ambiguity this change exists to remove.
+func TestMapVerdictDistinguishesHoldFromWait(t *testing.T) {
+	if mapVerdict(analysis.ActionHold) == mapVerdict(analysis.ActionWait) {
+		t.Fatalf("HOLD and WAIT both render as %q", mapVerdict(analysis.ActionHold))
+	}
+	if mapVerdict(analysis.ActionTrade) == mapVerdict(analysis.ActionSkip) {
+		t.Fatalf("TRADE and SKIP both render as %q", mapVerdict(analysis.ActionTrade))
+	}
+}
+
+// Tie-breaks mirror internal/analysis/ensemble.go so the panel's summary agrees
+// with the decision the engine actually reached.
+func TestDeriveEnsembleVerdict(t *testing.T) {
+	cases := []struct {
+		name  string
+		votes map[string]int
+		want  string
+	}{
+		{"no active analysts", map[string]int{}, "NEUTRAL"},
+		{"clear majority long", map[string]int{"LONG": 2, "HOLD": 1}, "LONG"},
+		{"clear majority wait", map[string]int{"WAIT": 2, "LONG": 1}, "WAIT"},
+		{"hold wins ties outright", map[string]int{"HOLD": 1, "LONG": 1}, "HOLD"},
+		{"opposed directional tie falls to hold", map[string]int{"LONG": 2, "SHORT": 2}, "HOLD"},
+		{"directional beats wait on a tie", map[string]int{"LONG": 1, "WAIT": 1}, "LONG"},
+		{"short beats wait on a tie", map[string]int{"SHORT": 1, "WAIT": 1}, "SHORT"},
+		{"skip beats trade on a tie", map[string]int{"SKIP": 1, "TRADE": 1}, "SKIP"},
+		{"unanimous hold", map[string]int{"HOLD": 3}, "HOLD"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := deriveEnsembleVerdict(c.votes); got != c.want {
+				t.Errorf("deriveEnsembleVerdict(%v) = %q, want %q", c.votes, got, c.want)
+			}
+		})
+	}
+}
+
+// Go randomises map iteration order; the resolution must not depend on it.
+func TestDeriveEnsembleVerdictIsDeterministic(t *testing.T) {
+	votes := map[string]int{"LONG": 1, "SHORT": 1, "WAIT": 1, "TRADE": 1, "SKIP": 1}
+	first := deriveEnsembleVerdict(votes)
+	for i := range 200 {
+		if got := deriveEnsembleVerdict(votes); got != first {
+			t.Fatalf("iteration %d returned %q, want a stable %q", i, got, first)
 		}
 	}
 }

@@ -9,6 +9,7 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import useSWR from 'swr';
 import { jsonFetcher } from '../hooks/swr';
+import { verdictColor } from '../utils/verdict';
 import DataTable from '../components/table/DataTable';
 import FilterBar from '../components/table/FilterBar';
 import CornerCard from '../components/CornerCard';
@@ -85,12 +86,6 @@ const ANALYST_PILL_COLORS: Record<string, string> = {
   Sentiment: 'var(--violet)',
   Macro:     'var(--blue)',
 };
-
-function verdictColor(v: string): string {
-  if (v === 'LONG') return 'var(--accent)';
-  if (v === 'SHORT') return 'var(--red)';
-  return 'var(--amber)';
-}
 
 /* ── Date filter helpers ───────────────────────────────────────────────────── */
 
