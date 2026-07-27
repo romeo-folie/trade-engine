@@ -223,21 +223,79 @@ TE=/path/to/scripts/te-switch.sh
 
 ## CLI Reference
 
+The command tree evolves with the engine. Use `te --help` and
+`te <command> --help` as the canonical flag reference.
+
+### Engine and operator controls
+
+```text
+te run [--mode <mode>] [--session <session>] [--detach] [--dry-run]
+                                      Start the engine
+te run --web [--web-port 8080]       Start the engine with web observability
+te stop                              Stop the running engine process (SIGTERM)
+te status                            Show engine, database, and active-mode status
+te mode <manual|auto|paper>          Persist the startup mode override; restart required
+te dashboard                         Open the terminal dashboard (aliases: ui, tui)
+te web                               Start the standalone web observability interface
+te logs tail                         Tail the engine log
+te logs search <query>               Search the engine log
+te notify test                       Send a Telegram connectivity test
 ```
-te run                              Start the engine
-te stop                             Stop the engine (SIGTERM)
-te status                           Show engine + DB status
-te mode <manual|auto|paper>         Switch trading mode at runtime
-te watchlist add <ticker>           Add ticker + trigger backfill
-te watchlist remove <ticker>        Remove ticker
-te watchlist show                   List all watchlist items
-te config show                      Show active config (masked secrets)
-te config set <key> <value>         Set config value (persists to YAML)
-te config set --runtime <key> <val> Set config override (persists to DB, no restart)
-te config validate                  Check config validity
-te migrate                          Run pending database migrations
-te logs tail                        Tail engine log file
-te logs search <query>              Search log file
+
+Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb`,
+`forex` (`orb-forex` compatibility alias), `orb-futures`,
+`orb-futures-metals`, and `orb-newyork`. Forex mode accepts
+`--session london|newyork`.
+
+### Configuration and database
+
+```text
+te config show                       Print resolved config with secrets masked
+te config set <key> <value>          Persist a value to config.yaml
+te config set <key> <value> --runtime
+                                      Persist a DB override
+te config validate                   Validate the resolved configuration
+te migrate                           Apply pending database migrations
+te db --help                         Database reset and summary-backfill operations
+```
+
+Runtime overrides persist to the database without editing YAML. Components
+that read configuration during startup require an engine restart to apply them.
+
+### Trading data and operations
+
+```text
+te watchlist add|remove|show          Manage scanner and engine watchlist items
+te trades list|show|pending           Inspect trades and pending manual signals
+te trades approve|reject <signal-id>  Resolve a manual-mode signal
+te universe refresh|list              Build or inspect immutable swing universes
+te earnings sync|seed|list            Manage the options earnings calendar
+te options backfill-iv                Backfill options implied-volatility history
+te orb stats                          Inspect opening-range performance
+```
+
+### Models, knowledge, and research
+
+```text
+te models list|test|compare|performance
+te graph seed|entities|relationships|review
+te embeddings status|reindex
+
+te report daily|weekly|performance
+te report scanner-funnel
+te report weekly-leaders
+te report potent-industries
+te report premarket-episodic
+te report backtest <id>
+te report compare <id1> <id2>
+
+te backtest run|list|compare
+te backtest orb|orb-compare|orb-options|orb-sweep|orb-fade
+te backtest opening-shock|trend-continuation|sweep-reclaim
+te backtest currency-strength
+
+te study execution
+te study pullback-frequency
 ```
 
 ## Build Phase Status

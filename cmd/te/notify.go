@@ -47,5 +47,4 @@ var notifyTestCmd = &cobra.Command{
 
 func init() {
 	notifyCmd.AddCommand(notifyTestCmd)
-	rootCmd.AddCommand(notifyCmd)
 }
