@@ -223,21 +223,120 @@ TE=/path/to/scripts/te-switch.sh
 
 ## CLI Reference
 
+The command tree evolves with the engine. Use `te --help` and
+`te <command> --help` as the canonical flag reference.
+
+### Engine and operator controls
+
+```text
+te run [--mode <mode>] [--session <session>] [--detach] [--dry-run]
+                                      Start the engine
+te run --web [--web-port 8080]       Start the engine with web observability
+te stop                              Stop the running engine process (SIGTERM)
+te status                            Show process, database, and configured/DB mode
+te mode <manual|auto|paper>          Persist the startup mode override; restart required
+te dashboard                         Open the terminal dashboard (aliases: ui, tui)
+te web                               Start the standalone web observability interface
+te logs tail                         Tail the engine log
+te logs search <query>               Search the engine log
+te notify test                       Send an ungated Telegram API connectivity test
 ```
-te run                              Start the engine
-te stop                             Stop the engine (SIGTERM)
-te status                           Show engine + DB status
-te mode <manual|auto|paper>         Switch trading mode at runtime
-te watchlist add <ticker>           Add ticker + trigger backfill
-te watchlist remove <ticker>        Remove ticker
-te watchlist show                   List all watchlist items
-te config show                      Show active config (masked secrets)
-te config set <key> <value>         Set config value (persists to YAML)
-te config set --runtime <key> <val> Set config override (persists to DB, no restart)
-te config validate                  Check config validity
-te migrate                          Run pending database migrations
-te logs tail                        Tail engine log file
-te logs search <query>              Search log file
+
+Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb`,
+`forex` (`orb-forex` compatibility alias), `orb-futures`,
+`orb-futures-metals`, and `orb-newyork`. Forex mode accepts
+`--session london|newyork`.
+
+`te run --web` starts in-process web observability only on the standard
+`manual`, `auto`, or `paper` path. Use standalone `te web` while a specialized
+ORB, forex, futures, metals, or combined session is running.
+
+### Configuration and database
+
+```text
+te config show                       Print resolved config with secrets masked
+te config set <key> <value>          Persist a value to config.yaml
+te config set engine.mode <mode> --runtime
+                                      Persist the supported DB startup override
+te config validate                   Validate the resolved configuration
+te migrate                           Apply pending database migrations
+te db --help                         Database reset and summary-backfill operations
+```
+
+`engine.mode` is currently the only DB runtime-override key consumed by the
+engine and dashboard. It persists without editing YAML and requires an engine
+restart to apply. Use ordinary `te config set` for every other key.
+
+### Trading data and operations
+
+```text
+te watchlist add|remove|show          Manage scanner and engine watchlist items
+te trades list|show|pending           Inspect trades and pending manual signals
+te trades approve|reject <signal-id>  Resolve a manual-mode signal
+te universe refresh|list              Build or inspect immutable swing universes
+te earnings sync|seed|list            Manage the options earnings calendar
+te options backfill-iv                Backfill options implied-volatility history
+te orb stats                          Inspect opening-range performance
+```
+
+### Models and knowledge
+
+```text
+te models list                         List configured analyst models
+te models test <prompt>                Test available analyst providers (not arbiter)
+te models compare <ticker>             Compare model analysis for one ticker
+te models performance                  Summarize realized performance by model
+te graph seed                          Seed the knowledge graph
+te graph entities                      List graph entities
+te graph relationships <ticker>        Inspect a ticker's graph relationships
+te graph review                        Review extracted relationships
+te embeddings status                   Show embedding provider and index status
+te embeddings reindex                  Fill missing stored embeddings
+te embeddings reindex --force          Clear and rebuild all stored embeddings
+```
+
+### Reports
+
+```text
+te report daily                        Generate the daily trading summary
+te report weekly                       Generate the weekly trading summary
+te report performance                  Report portfolio and model performance
+te report scanner-funnel               Audit scanner conversion and outcomes
+te report weekly-leaders               Review full-universe leadership studies
+te report potent-industries            Review industry potency and breadth
+te report premarket-episodic           Review premarket gap/catalyst observations
+te report backtest <id>                Generate one backtest report
+te report compare <id1> <id2>          Compare two backtest reports
+```
+
+Use `te report <command> --help` for date ranges, filters, and report-specific
+options. Generated HTML output locations are controlled by the `reports`
+configuration.
+
+### Backtests
+
+```text
+te backtest run                         Run a general historical backtest
+te backtest list                        List saved backtest runs
+te backtest compare                     Compare saved runs
+te backtest orb                         Replay the forex/CFD ORB strategy
+te backtest orb-compare                 Compare ORB rule variants
+te backtest orb-options                 Replay options ORB
+te backtest orb-sweep                   Search ORB parameter robustness
+te backtest orb-fade                    Replay failed-break fades
+te backtest opening-shock               Replay opening-shock reversals
+te backtest trend-continuation          Replay delayed trend continuation
+te backtest sweep-reclaim               Replay liquidity sweep/reclaim entries
+te backtest currency-strength           Replay FX currency-strength rotation
+```
+
+### Offline studies
+
+Studies audit recorded data without starting the trading engine.
+
+```text
+te study execution                      Replay stock trades against 1m bars
+te study pullback-frequency             Measure deterministic pullback frequency
 ```
 
 ## Build Phase Status
