@@ -115,6 +115,22 @@ func TestEvaluatePotentIndustriesMegaCapCannotQualifyWeakGroup(t *testing.T) {
 	}
 }
 
+func TestPotentCapLeadershipDivergenceDoesNotPenalizeEqualWeightLeadership(
+	t *testing.T,
+) {
+	features := PotentIndustryGroupFeatures{
+		EqualReturn1: .02, EqualReturn5: .08, EqualReturn20: .15,
+		CapReturn1: .01, CapReturn5: .04, CapReturn20: .10,
+	}
+	if got := potentCapLeadershipDivergence(features); got != 0 {
+		t.Fatalf("equal-weight leadership was treated as mega-cap dominance: %v", got)
+	}
+	features.CapReturn20 = .22
+	if got := potentCapLeadershipDivergence(features); math.Abs(got-.07) > 1e-12 {
+		t.Fatalf("positive cap-weight leadership divergence = %v, want .07", got)
+	}
+}
+
 func TestPotentIndustryArchetypesDistinguishNarrowAndWeak(t *testing.T) {
 	policy := potentTestPolicy()
 	base := PotentIndustryGroupFeatures{

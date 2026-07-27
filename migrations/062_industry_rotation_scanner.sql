@@ -213,4 +213,4 @@ COMMENT ON TABLE industry_rotation_members IS
 COMMENT ON COLUMN industry_rotation_runs.decision_at IS
     'Fixed point-in-time cutoff bounding universe, taxonomy, history, and completion visibility.';
 COMMENT ON COLUMN industry_rotation_groups.cap_equal_divergence IS
-    'Absolute cap-weighted versus equal-weighted return divergence used to prevent one large constituent from masking weak breadth.';
+    'Positive cap-weighted leadership over equal-weighted return used to prevent one large constituent from masking weak breadth.';

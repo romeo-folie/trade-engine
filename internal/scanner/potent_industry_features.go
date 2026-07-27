@@ -588,12 +588,21 @@ func potentGroupFeatures(
 	if len(market) >= 5 && len(sector) >= 5 {
 		f.PersistenceSessions = potentPersistence(members, market, sector)
 	}
-	f.CapEqualDivergence = math.Max(
-		math.Abs(f.CapReturn1-f.EqualReturn1),
-		math.Max(math.Abs(f.CapReturn5-f.EqualReturn5),
-			math.Abs(f.CapReturn20-f.EqualReturn20)),
-	)
+	f.CapEqualDivergence = potentCapLeadershipDivergence(f)
 	return f
+}
+
+func potentCapLeadershipDivergence(f PotentIndustryGroupFeatures) float64 {
+	return math.Max(
+		0,
+		math.Max(
+			f.CapReturn1-f.EqualReturn1,
+			math.Max(
+				f.CapReturn5-f.EqualReturn5,
+				f.CapReturn20-f.EqualReturn20,
+			),
+		),
+	)
 }
 
 func potentBreadthAcceleration(members []*potentIndustryPreparedMember) float64 {

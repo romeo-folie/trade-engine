@@ -60,7 +60,7 @@ For each group, the scorer retains:
 - breadth acceleration versus the preceding five sessions;
 - the number of the last five sessions that showed positive broad,
   market-relative and benchmark-relative participation; and
-- divergence between capitalisation-weighted and equal-weighted returns.
+- positive capitalisation-weighted leadership over equal-weighted returns.
 
 Capitalisation-weighted return is diagnostic and confirmatory. It is not the
 primary strength input. A dominance penalty reduces the final score when one
