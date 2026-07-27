@@ -2313,6 +2313,15 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		}
 		return nil
 	}
+	if len(r.state.PendingExitAudits) > 0 {
+		// The current terminal attempt is durable, but an older attempt still
+		// needs FX enrichment. Keep the sidecar alive so clearState cannot erase
+		// that queued audit before a later retry succeeds.
+		if err := r.saveState(); err != nil {
+			logger.Warn("currency-strength: failed to persist pending historical audit queue", "err", err)
+		}
+		return nil
+	}
 	if !r.state.ExitConfirmed {
 		r.notify(ctx, buildCurrencyStrengthFlattenedMessage(
 			r.state.Symbol, r.state.ExitOrderID, r.state.ExitFilledQty, r.state.ExitFillPrice,

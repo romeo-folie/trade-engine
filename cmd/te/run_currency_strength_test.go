@@ -1650,6 +1650,33 @@ func TestCurrencyStrengthHistoricalAuditRemainsQueuedUntilPnLEnrichment(t *testi
 	}
 }
 
+func TestCurrencyStrengthTerminalExitRetainsHistoricalAuditQueue(t *testing.T) {
+	exitedAt := time.Date(2026, 7, 27, 18, 0, 30, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
+	runner := &currencyStrengthPaperRunner{
+		broker: &successfulCurrencyStrengthExecutor{}, market: fakeMarketDataProvider{},
+		journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "EUR/JPY", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 160, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-CURRENT", ExitStatus: "filled", ExitFillPrice: 161,
+			ExitFilledQty: 100000, ExitRequestedQty: 100000, ExitFillTimeQty: 100000,
+			ExitedAt: exitedAt.Format(time.RFC3339),
+			PendingExitAudits: []currencyStrengthExitAudit{{
+				OrderID: "EXIT-OLDER", Status: "residual", FillPrice: 159,
+				FilledQty: 50000, ExitedAt: exitedAt.Add(-time.Minute).Format(time.RFC3339),
+			}},
+		},
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || len(runner.state.PendingExitAudits) != 1 {
+		t.Fatalf("terminal cleanup discarded historical audit queue: state=%+v", runner.state)
+	}
+}
+
 func TestCurrencyStrengthExitJournalRetryDoesNotResubmitOrder(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
 	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
