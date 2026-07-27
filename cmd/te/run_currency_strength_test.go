@@ -904,6 +904,35 @@ func TestCurrencyStrengthExecutionCreatedReversalIsCorrected(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthCorrectiveFillReversalIsCorrectedAgain(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 10, 0, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
+	broker := &successfulCurrencyStrengthExecutor{
+		positions: []execution.Position{{Ticker: "GBP/USD", Quantity: -10000}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-CORRECTION-1", ExitStatus: "filled", ExitCorrection: true,
+			ExitFillPrice: 1.102, ExitFilledQty: 20000, ExitRequestedQty: 20000,
+			ExitFillTimeQty:  20000,
+			ExitFillObserved: now.Add(-currencyStrengthPortfolioPropagationGrace - time.Second).Format(time.RFC3339),
+			ExitedAt:         now.Add(-3 * time.Minute).Format(time.RFC3339),
+		},
+		now: func() time.Time { return now },
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || !runner.state.ExitCorrection || !runner.state.ExitRetry ||
+		runner.state.ExitOrderID != "" || runner.state.ExitRetryMaxQty != 10000 {
+		t.Fatalf("late corrective reversal was not converted to another correction: %+v", runner.state)
+	}
+}
+
 func TestCurrencyStrengthPartialExitWaitsForPortfolioPropagation(t *testing.T) {
 	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
 	broker := &successfulCurrencyStrengthExecutor{
@@ -2186,6 +2215,7 @@ func TestCurrencyStrengthFlatRecoveryCancelsWorkingRetryBeforeBrokerFlat(t *test
 
 func TestCurrencyStrengthLatePriorFillsShrinkResidualRetry(t *testing.T) {
 	firstFillAt := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
 	broker := &successfulCurrencyStrengthExecutor{
 		result: execution.OrderResult{
 			BrokerOrderID: "EXIT-LATE-CAPPED-RETRY", Status: "pending",
@@ -2205,7 +2235,7 @@ func TestCurrencyStrengthLatePriorFillsShrinkResidualRetry(t *testing.T) {
 		},
 	}
 	runner := &currencyStrengthPaperRunner{
-		broker: broker, entryRecorded: true,
+		broker: broker, journal: journal, entryRecorded: true,
 		statePath: t.TempDir() + "/currency-strength.json",
 		state: &currencyStrengthRunState{
 			Date: "2026-07-27", Symbol: "GBP/USD", Side: "buy", Quantity: 100000,
@@ -2223,6 +2253,10 @@ func TestCurrencyStrengthLatePriorFillsShrinkResidualRetry(t *testing.T) {
 		runner.state.ExitCumulativeQty != 70000 {
 		t.Fatalf("late prior fills did not shrink retry: calls=%d requests=%+v state=%+v",
 			broker.calls, broker.requests, runner.state)
+	}
+	if len(journal.exits) < 1 || journal.exits[0].ExitOrderID != "EXIT-PRIOR-LATE" ||
+		journal.exits[0].ExitStatus != "residual" || journal.exits[0].ExitFilledQty != 70000 {
+		t.Fatalf("late prior fill was not persisted as cumulative attempt truth: %+v", journal.exits)
 	}
 }
 

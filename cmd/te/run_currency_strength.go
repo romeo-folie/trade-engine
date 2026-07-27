@@ -1210,6 +1210,30 @@ func (r *currencyStrengthPaperRunner) adoptFilledExit(ctx context.Context) (bool
 	if selected.orderID == r.state.ExitPriorOrderID &&
 		(!cumulativeCoversEntry || r.state.ExitCorrection) {
 		if cumulativeChanged || retryCapChanged {
+			// The sidecar is not the history of record.  Persist the newly
+			// observed execution against the prior attempt as well, so a journal
+			// backed restart cannot reconstruct an oversized retry from stale
+			// attempt economics.
+			if selected.filledQty > 0 && selected.fillNotional > 0 && !selected.filledAt.IsZero() {
+				status := "residual"
+				filledQty := selected.filledQty
+				if r.state.ExitCorrection {
+					status = "correction_residual"
+					filledQty = -math.Abs(filledQty)
+				}
+				audit := currencyStrengthExitAudit{
+					OrderID:   selected.orderID,
+					Status:    status,
+					FillPrice: selected.fillNotional / selected.filledQty,
+					FilledQty: filledQty,
+					ExitedAt:  selected.filledAt.UTC().Format(time.RFC3339),
+				}
+				r.state.PendingExitAudits = append(r.state.PendingExitAudits, audit)
+				if err := r.syncPendingExitAudit(ctx); err != nil {
+					logger.Warn("currency-strength: failed to persist late prior-order execution",
+						"order_id", selected.orderID, "err", err)
+				}
+			}
 			if err := r.saveState(); err != nil {
 				logger.Warn("currency-strength: failed to persist late prior-order executions",
 					"order_id", selected.orderID, "err", err)
@@ -2192,9 +2216,10 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	case "filled":
 		if pos != nil {
 			now := r.currencyStrengthNow().UTC()
-			if !r.state.ExitCorrection && r.positionOpposesEntry(pos) {
+			if r.positionOpposesEntry(pos) {
 				// An opposite-signed position cannot be a pre-fill snapshot.
-				// Correct the execution-created reversal immediately.
+				// Correct the execution-created reversal immediately, including
+				// one created by a late fill after a corrective order.
 				return r.prepareCorrectiveExit(ctx, pos)
 			}
 			observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
