@@ -63,6 +63,7 @@ type currencyStrengthRunState struct {
 	ExitedAt          string                      `json:"exited_at,omitempty"`
 	ExitRetry         bool                        `json:"exit_retry,omitempty"`
 	ExitConfirmed     bool                        `json:"exit_confirmed_notified,omitempty"`
+	ExitPnLPending    bool                        `json:"exit_pnl_pending,omitempty"`
 	PendingExitAudits []currencyStrengthExitAudit `json:"pending_exit_audits,omitempty"`
 }
 
@@ -2217,6 +2218,19 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 		if pos != nil {
 			now := r.currencyStrengthNow().UTC()
 			if r.positionOpposesEntry(pos) {
+				if r.state.ExitCorrection {
+					observedAt, _ := time.Parse(time.RFC3339, r.state.ExitFillObserved)
+					if observedAt.IsZero() {
+						r.state.ExitFillObserved = now.Format(time.RFC3339)
+						if err := r.saveState(); err != nil {
+							return fmt.Errorf("persist corrective fill propagation guard: %w", err)
+						}
+						return nil
+					}
+					if now.Sub(observedAt) < currencyStrengthPortfolioPropagationGrace {
+						return nil
+					}
+				}
 				// An opposite-signed position cannot be a pre-fill snapshot.
 				// Correct the execution-created reversal immediately, including
 				// one created by a late fill after a corrective order.
@@ -2291,6 +2305,12 @@ func (r *currencyStrengthPaperRunner) finalizeExitedState(ctx context.Context) e
 	}
 	if err := r.recordExitJournal(ctx); err != nil {
 		logger.Warn("currency-strength: terminal exit history sync failed; will retry", "err", err)
+		return nil
+	}
+	if r.state.ExitPnLPending {
+		if err := r.saveState(); err != nil {
+			logger.Warn("currency-strength: failed to persist pending P&L enrichment", "err", err)
+		}
 		return nil
 	}
 	if !r.state.ExitConfirmed {
@@ -2432,7 +2452,15 @@ func (r *currencyStrengthPaperRunner) recordExitJournal(ctx context.Context) err
 	audit := r.currentExitAudit()
 	realizedPnL, err := r.realizedPnLUSD(ctx, audit)
 	if err != nil {
-		return err
+		// Exit lifecycle truth must not be blocked by a temporary/missing FX
+		// candle. Persist the terminal attempt with NULL P&L and retain the
+		// sidecar marker so a later tick can enrich it when conversion data is
+		// available.
+		r.state.ExitPnLPending = true
+		logger.Warn("currency-strength: exit P&L conversion unavailable; persisting lifecycle for later enrichment", "err", err)
+		realizedPnL = nil
+	} else {
+		r.state.ExitPnLPending = false
 	}
 	return r.writeExitJournal(ctx, audit, realizedPnL)
 }
@@ -2465,7 +2493,11 @@ func (r *currencyStrengthPaperRunner) syncPendingExitAudit(ctx context.Context) 
 		audit := r.state.PendingExitAudits[0]
 		realizedPnL, err := r.realizedPnLUSD(ctx, audit)
 		if err != nil {
-			return err
+			// Historical attempt lifecycle is durable independently of FX
+			// enrichment. A later reconciliation can replay this idempotent
+			// attempt with a realized P&L once conversion data is available.
+			logger.Warn("currency-strength: historical exit P&L conversion unavailable; persisting NULL P&L", "order_id", audit.OrderID, "err", err)
+			realizedPnL = nil
 		}
 		if err := r.writeExitJournal(ctx, audit, realizedPnL); err != nil {
 			return err

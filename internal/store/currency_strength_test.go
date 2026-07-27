@@ -173,6 +173,46 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthPartialFailedEntryCanRecordBrokerFlatExit(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	accountID := "DU-CURRENCY-FAILED-ENTRY-TEST"
+	sessionDate := time.Date(2196, 7, 27, 0, 0, 0, 0, time.UTC)
+	t.Cleanup(func() {
+		_, _ = db.Exec(ctx, `DELETE FROM currency_strength_runs WHERE account_id=$1 AND session_date=$2`, accountID, sessionDate)
+	})
+	if err := store.StartCurrencyStrengthRun(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate, Timezone: "UTC",
+		StrengthStart: "06:00", StrengthEnd: "09:00", ExitTime: "18:00",
+		RankInstruments: []string{"EUR/USD", "GBP/USD"}, TradeInstruments: []string{"GBP/USD"}, Units: 100000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate, SignalSymbol: "GBP/USD",
+		SignalSide: "buy", EntryOrderID: "ENTRY-PARTIAL", EntryStatus: "cancelled",
+		EntryFilledQty: 50000,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordCurrencyStrengthExit(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: sessionDate, ExitOrderID: "broker-flat",
+		ExitStatus: "filled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run, err := store.GetCurrencyStrengthRunByDate(ctx, db, accountID, sessionDate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if run == nil || run.Status != "exited" {
+		t.Fatalf("partial failed entry could not finalize broker-flat exit: %+v", run)
+	}
+}
+
 func TestCurrencyStrengthCorrectionAttemptsNetFilledQuantityAndPnL(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping store integration test")

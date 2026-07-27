@@ -258,7 +258,7 @@ func RecordCurrencyStrengthExit(
 		    error=NULL, updated_at=NOW()
 		WHERE id=$1 AND account_id=$2
 		  AND (
-		      status IN ('entry_submitted', 'entered', 'exit_submitted', 'exit_failed')
+		      status IN ('entry_submitted', 'entered', 'entry_failed', 'exit_submitted', 'exit_failed')
 		      OR (
 		          status='exited'
 		          AND exit_order_id=$3

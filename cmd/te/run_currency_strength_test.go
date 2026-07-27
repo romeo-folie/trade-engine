@@ -1585,6 +1585,39 @@ func TestCurrencyStrengthExitPersistsRealizedPnL(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthExitLifecycleSurvivesMissingPnLConversion(t *testing.T) {
+	exitedAt := time.Date(2026, 7, 27, 18, 0, 30, 0, time.UTC)
+	journal := &captureCurrencyStrengthJournal{}
+	runner := &currencyStrengthPaperRunner{
+		broker: &successfulCurrencyStrengthExecutor{}, market: fakeMarketDataProvider{},
+		journal: journal, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: &currencyStrengthRunState{
+			Date: "2026-07-27", Symbol: "EUR/JPY", Side: "buy", Quantity: 100000,
+			EntryStatus: "filled", EntryFillPrice: 160, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-NO-FX", ExitStatus: "filled", ExitFillPrice: 161,
+			ExitFilledQty: 100000, ExitRequestedQty: 100000, ExitFillTimeQty: 100000,
+			ExitedAt: exitedAt.Format(time.RFC3339),
+		},
+	}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || !runner.state.ExitPnLPending || len(journal.exits) != 1 ||
+		journal.exits[0].RealizedPnL != nil {
+		t.Fatalf("missing conversion blocked lifecycle or was not persisted as NULL P&L: state=%+v exits=%+v", runner.state, journal.exits)
+	}
+	runner.market = historicalConversionMarketData{candles: map[string][]data.Candle{
+		"JPY/USD": {{Timestamp: exitedAt.Add(-time.Minute), Close: 0.0067}},
+	}}
+	if err := runner.finalizeExitedState(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state != nil || len(journal.exits) != 2 || journal.exits[1].RealizedPnL == nil {
+		t.Fatalf("pending P&L was not enriched on retry: state=%+v exits=%+v", runner.state, journal.exits)
+	}
+}
+
 func TestCurrencyStrengthExitJournalRetryDoesNotResubmitOrder(t *testing.T) {
 	journal := &captureCurrencyStrengthJournal{exitErrors: 1}
 	broker := &successfulCurrencyStrengthExecutor{result: execution.OrderResult{
