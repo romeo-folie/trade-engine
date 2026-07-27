@@ -879,6 +879,59 @@ func TestCurrencyStrengthPartialExitWaitsForPortfolioPropagation(t *testing.T) {
 	}
 }
 
+func TestCurrencyStrengthJournalRestoredPartialCapsStalePortfolioRetry(t *testing.T) {
+	now := time.Date(2026, 7, 27, 18, 0, 0, 0, time.UTC)
+	filledAt := now.Add(-time.Minute)
+	broker := &successfulCurrencyStrengthExecutor{
+		result: execution.OrderResult{
+			BrokerOrderID: "EXIT-JOURNAL-RETRY", Status: "pending",
+		},
+		statusResult: execution.OrderResult{
+			BrokerOrderID: "EXIT-JOURNAL-PARTIAL", Status: "filled",
+			FilledPrice: 1.104, FilledQty: 40000,
+		},
+		positions:          []execution.Position{{Ticker: "GBP/USD", Quantity: 100000}},
+		keepPositionOnFill: true,
+		recentFills: []execution.BrokerOrder{{
+			BrokerOrderID: "EXIT-JOURNAL-PARTIAL",
+			TradeID:       "currency-strength-exit-2026-07-27-GBPUSD-1-1",
+			Symbol:        "GBP/USD", Side: "sell", FilledQty: 40000,
+			FilledAvgPx: 1.104, FilledAt: filledAt,
+		}},
+	}
+	runner := &currencyStrengthPaperRunner{
+		broker: broker, journal: &captureCurrencyStrengthJournal{}, entryRecorded: true,
+		statePath: t.TempDir() + "/currency-strength.json",
+		state: currencyStrengthStateFromRun(store.CurrencyStrengthRun{
+			SessionDate: time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC),
+			Status:      "exit_submitted", SignalSymbol: "GBP/USD", SignalSide: "buy",
+			EntryStatus: "filled", EntryFillPrice: 1.1, EntryFilledQty: 100000,
+			ExitOrderID: "EXIT-JOURNAL-PARTIAL", ExitStatus: "pending",
+			ExitFillPrice: 1.104, ExitFilledQty: 40000,
+		}),
+		now: func() time.Time { return now },
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	now = now.Add(currencyStrengthPortfolioPropagationGrace + time.Second)
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.state == nil || !runner.state.ExitRetry ||
+		runner.state.ExitRetryMaxQty != 60000 {
+		t.Fatalf("journal-restored cumulative fill did not derive safe remainder: %+v", runner.state)
+	}
+	if err := runner.exitActive(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if broker.calls != 1 || len(broker.requests) != 1 ||
+		broker.requests[0].Quantity != 60000 {
+		t.Fatalf("journal-only retry used stale portfolio quantity: calls=%d requests=%+v",
+			broker.calls, broker.requests)
+	}
+}
+
 func TestCurrencyStrengthNotifiesSubmittedThenConfirmedFlat(t *testing.T) {
 	broker := &successfulCurrencyStrengthExecutor{
 		result: execution.OrderResult{
@@ -2447,7 +2500,8 @@ func TestCurrencyStrengthRestoresResidualAsExitRetry(t *testing.T) {
 			state := currencyStrengthStateFromRun(run)
 			if state.ExitOrderID != "" || !state.ExitRetry ||
 				state.ExitPriorOrderID != "EXIT-TERMINAL" ||
-				state.ExitRetryMaxQty != 50000 {
+				state.ExitRetryMaxQty != 50000 ||
+				state.ExitCumulativeQty != 50000 {
 				t.Fatalf("terminal exit restored as working: %+v", state)
 			}
 		})
@@ -2499,6 +2553,26 @@ func TestCurrencyStrengthMergePreservesLocalBrokerTruth(t *testing.T) {
 	mergeCurrencyStrengthRunIntoState(timestamped, staleTimestamp)
 	if timestamped.EnteredAt != brokerEnteredAt.Format(time.RFC3339) {
 		t.Fatalf("stale journal replaced broker execution timestamp: %+v", timestamped)
+	}
+	currentExit := &currencyStrengthRunState{
+		ExitOrderID: "EXIT-CURRENT", ExitStatus: "partial",
+		ExitFillPrice: 1.105, ExitFilledQty: 30000, ExitFillTimeQty: 30000,
+	}
+	cumulativeExit := store.CurrencyStrengthRun{
+		Status: "exit_submitted", ExitOrderID: "EXIT-CURRENT",
+		ExitStatus: "partial", ExitFillPrice: 1.104, ExitFilledQty: 70000,
+	}
+	mergeCurrencyStrengthRunIntoState(currentExit, cumulativeExit)
+	if currentExit.ExitFilledQty != 30000 || currentExit.ExitFillPrice != 1.105 ||
+		currentExit.ExitCumulativeQty != 70000 {
+		t.Fatalf("cumulative journal overwrote current-order economics: %+v", currentExit)
+	}
+	journalOnlyExit := &currencyStrengthRunState{}
+	mergeCurrencyStrengthRunIntoState(journalOnlyExit, cumulativeExit)
+	if journalOnlyExit.ExitOrderID != "EXIT-CURRENT" ||
+		journalOnlyExit.ExitFilledQty != 0 ||
+		journalOnlyExit.ExitCumulativeQty != 70000 {
+		t.Fatalf("journal aggregate was mistaken for current-order economics: %+v", journalOnlyExit)
 	}
 	date := time.Date(2026, 7, 27, 0, 0, 0, 0, time.UTC)
 	stale.SessionDate = date
