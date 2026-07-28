@@ -133,3 +133,36 @@ func TestSpecialistConsensusLens_SplitAndErrors(t *testing.T) {
 }
 
 var errTest = fmt.Errorf("specialist failed")
+
+// TestSpecialistConsensusRejections: the risk manager runs the lens contract
+// too, so its own rejection map must not survive next to a consensus-derived
+// selection — otherwise the aggregate can list its selected lens as rejected.
+func TestSpecialistConsensusRejections(t *testing.T) {
+	results := []specialistResult{
+		{Role: "fundamental", Response: AnalysisResponse{
+			Action: ActionBuy, SelectedStrategy: "momentum",
+			RejectedStrategies: map[string]string{"mean_reversion": "trending"},
+		}},
+		{Role: "technical", Response: AnalysisResponse{
+			Action: ActionBuy, SelectedStrategy: "momentum",
+			RejectedStrategies: map[string]string{"news_sentiment": "no catalyst"},
+		}},
+		// Risk manager picked differently; its rejections must not leak through.
+		{Role: "risk_manager", Response: AnalysisResponse{
+			Action: ActionBuy, SelectedStrategy: "mean_reversion",
+			RejectedStrategies: map[string]string{"momentum": "chasing"},
+		}},
+	}
+	got := specialistConsensusRejections(results, ActionBuy, "momentum")
+	if _, bad := got["momentum"]; bad {
+		t.Error("selected lens appears in its own rejection map")
+	}
+	for _, want := range []string{"mean_reversion", "news_sentiment"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("missing rejection for %q: %#v", want, got)
+		}
+	}
+	if got := specialistConsensusRejections(results, ActionBuy, ""); got != nil {
+		t.Errorf("no consensus selection must yield nil rejections, got %#v", got)
+	}
+}

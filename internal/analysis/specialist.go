@@ -243,6 +243,13 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	// selected-lens entry gates silently fall back to the configured primary
 	// (the same defect fixed for the ensemble aggregation paths).
 	final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
+	// The risk manager runs the full candidate-lens contract too, so riskResp
+	// carries ITS OWN rejection map. Left in place beside a consensus-derived
+	// SelectedStrategy, the aggregate could name its selected lens as a
+	// rejected one. Inert today (only len() is read, and the field is not
+	// persisted), but the two fields must describe the same decision before
+	// anything is ever wired to them.
+	final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
 	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),
@@ -360,4 +367,34 @@ func specialistConsensusLens(results []specialistResult, winner Action) (selecte
 		}
 	}
 	return selected, regime
+}
+
+// specialistConsensusRejections returns the rejection reasons that belong with
+// a consensus-derived selection: the union of what the winning directional
+// specialists rejected, minus the lens that was actually selected.
+//
+// Returns nil when there is no consensus selection, so an aggregate never
+// carries rejections that no longer correspond to a decision.
+func specialistConsensusRejections(results []specialistResult, winner Action, selected string) map[string]string {
+	if selected == "" {
+		return nil
+	}
+	var out map[string]string
+	for _, r := range results {
+		if r.Err != nil || r.Role == "risk_manager" || r.Response.Action != winner {
+			continue
+		}
+		for lens, reason := range r.Response.RejectedStrategies {
+			if lens == selected {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string, len(r.Response.RejectedStrategies))
+			}
+			if _, seen := out[lens]; !seen {
+				out[lens] = reason
+			}
+		}
+	}
+	return out
 }
