@@ -68,6 +68,19 @@ func TestAlpacaUniverseFetchStockAssetsDeterministicDedupe(t *testing.T) {
 	}
 }
 
+func TestRequestableAlpacaSymbolsQuarantinesMalformedAssetMasterValues(t *testing.T) {
+	got, failures := requestableAlpacaSymbols([]string{
+		"A", "123", "BRK.B", "BF-B", "0029900E0", "TOO_LONG9", "BAD/SLASH",
+	})
+	if strings.Join(got, ",") != "A,123,BRK.B,BF-B" {
+		t.Fatalf("requestable = %v, want valid symbols preserved", got)
+	}
+	if len(failures) != 3 || failures["0029900E0"] == nil ||
+		failures["TOO_LONG9"] == nil || failures["BAD/SLASH"] == nil {
+		t.Fatalf("failures = %+v, want all malformed symbols", failures)
+	}
+}
+
 func TestAlpacaUniverseSnapshotsBatchBoundPartialFailureAndDedupe(t *testing.T) {
 	var mu sync.Mutex
 	var requests [][]string

@@ -18,6 +18,7 @@ const (
 )
 
 var errAlpacaSymbolMissing = errors.New("alpaca response omitted symbol")
+var errAlpacaSymbolInvalidFormat = errors.New("alpaca symbol has invalid format")
 
 // AlpacaUniverseClient adds trading-host asset discovery and bulk market-data
 // capabilities to an AlpacaClient. Wrapping the existing client intentionally
@@ -143,6 +144,8 @@ func (c *AlpacaUniverseClient) FetchStockSnapshots(
 	if err != nil {
 		return result, err
 	}
+	normalized, invalid := requestableAlpacaSymbols(normalized)
+	mergeFailures(result.Failures, invalid)
 	for start := 0; start < len(normalized); start += batchSize {
 		if err := ctx.Err(); err != nil {
 			markSymbolFailures(result.Failures, normalized[start:], err)
@@ -240,6 +243,8 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 	if err != nil {
 		return result, err
 	}
+	normalized, invalid := requestableAlpacaSymbols(normalized)
+	mergeFailures(result.Failures, invalid)
 	for start := 0; start < len(normalized); start += batchSize {
 		if err := ctx.Err(); err != nil {
 			markSymbolFailures(result.Failures, normalized[start:], err)
@@ -387,6 +392,37 @@ func normalizedSymbolList(symbols []string, batchSize int) ([]string, error) {
 	}
 	sort.Strings(normalized)
 	return normalized, nil
+}
+
+// requestableAlpacaSymbols quarantines asset-master identifiers that cannot be
+// sent to Alpaca's stock endpoints. The provider's equity-symbol contract is
+// ASCII alphanumeric text with optional dots/hyphens and a maximum length of
+// eight characters. Quarantined symbols remain explicit failures so the
+// universe audit retains the original denominator.
+func requestableAlpacaSymbols(symbols []string) ([]string, map[string]error) {
+	requestable := make([]string, 0, len(symbols))
+	failures := make(map[string]error)
+	for _, symbol := range symbols {
+		if !validAlpacaSymbol(symbol) {
+			failures[symbol] = errAlpacaSymbolInvalidFormat
+			continue
+		}
+		requestable = append(requestable, symbol)
+	}
+	return requestable, failures
+}
+
+func validAlpacaSymbol(symbol string) bool {
+	if symbol == "" || len(symbol) > 8 {
+		return false
+	}
+	for _, char := range symbol {
+		if (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '.' && char != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func normalizeStockSymbol(symbol string) string {
