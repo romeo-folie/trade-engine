@@ -33,9 +33,10 @@ type PromotionSelection struct {
 }
 
 type PromotionRejection struct {
-	Candidate   PromotionCandidate
-	Reason      string
-	ConflictKey string
+	Candidate           PromotionCandidate
+	Reason              string
+	ConflictKey         string
+	ConflictCorrelation float64
 }
 
 // SelectPromotionCandidates ranks candidates by descending score (then key),
@@ -103,15 +104,15 @@ func SelectPromotionCandidates(
 			continue
 		}
 		if maxAbsCorrelation > 0 {
-			if conflict := promotionExposureConflict(candidate, maxAbsCorrelation); conflict != "" {
+			if conflict, correlation := promotionExposureConflict(candidate, maxAbsCorrelation); conflict != "" {
 				result.Rejected = append(result.Rejected, PromotionRejection{
-					Candidate: candidate, Reason: "exposure_correlation_cap", ConflictKey: conflict,
+					Candidate: candidate, Reason: "exposure_correlation_cap", ConflictKey: conflict, ConflictCorrelation: correlation,
 				})
 				continue
 			}
-			if conflict := promotionCorrelationConflict(candidate, result.Selected, maxAbsCorrelation); conflict != "" {
+			if conflict, correlation := promotionCorrelationConflict(candidate, result.Selected, maxAbsCorrelation); conflict != "" {
 				result.Rejected = append(result.Rejected, PromotionRejection{
-					Candidate: candidate, Reason: "correlation_cap", ConflictKey: conflict,
+					Candidate: candidate, Reason: "correlation_cap", ConflictKey: conflict, ConflictCorrelation: correlation,
 				})
 				continue
 			}
@@ -124,7 +125,7 @@ func SelectPromotionCandidates(
 	return result
 }
 
-func promotionExposureConflict(candidate PromotionCandidate, threshold float64) string {
+func promotionExposureConflict(candidate PromotionCandidate, threshold float64) (string, float64) {
 	keys := make([]string, 0, len(candidate.ExposureCorrelations))
 	for key := range candidate.ExposureCorrelations {
 		keys = append(keys, normalizePromotionKey(key))
@@ -133,10 +134,10 @@ func promotionExposureConflict(candidate PromotionCandidate, threshold float64) 
 	for _, key := range keys {
 		correlation, ok := normalizedCorrelation(candidate.ExposureCorrelations, key)
 		if ok && math.Abs(correlation) >= threshold {
-			return key
+			return key, correlation
 		}
 	}
-	return ""
+	return "", 0
 }
 
 func selectScoredForPromotion(
@@ -240,7 +241,7 @@ func promotionScore(score float64) float64 {
 
 func promotionCorrelationConflict(
 	candidate PromotionCandidate, selected []PromotionCandidate, threshold float64,
-) string {
+) (string, float64) {
 	for _, prior := range selected {
 		correlation, ok := candidate.Correlations[prior.Key]
 		if !ok {
@@ -253,10 +254,10 @@ func promotionCorrelationConflict(
 			correlation, ok = normalizedCorrelation(prior.Correlations, candidate.Key)
 		}
 		if ok && math.Abs(correlation) >= threshold {
-			return prior.Key
+			return prior.Key, correlation
 		}
 	}
-	return ""
+	return "", 0
 }
 
 func normalizedCorrelation(values map[string]float64, target string) (float64, bool) {

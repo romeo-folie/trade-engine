@@ -1,9 +1,11 @@
 package scanner
 
 import (
+	"context"
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -96,6 +98,13 @@ func TestSelectPromotionCandidatesRejectsCorrelatedExposure(t *testing.T) {
 	if len(result.Rejected) != 1 || result.Rejected[0].Reason != "exposure_correlation_cap" ||
 		result.Rejected[0].ConflictKey != "HELD" {
 		t.Fatalf("rejected = %+v, want held exposure attribution", result.Rejected)
+	}
+}
+
+func TestCorrelationModeRequiresDailyBarsProvider(t *testing.T) {
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{PromotionCorrelationEnabled: true}}
+	if err := scanner.runScan(context.Background()); err == nil {
+		t.Fatal("correlation mode accepted a missing daily-bars provider")
 	}
 }
 

@@ -90,6 +90,7 @@ type ScannerCandidateSnapshot struct {
 	RemovalStage              string
 	FailureStage              string
 	FailureReason             string
+	PromotionEvidence         json.RawMessage
 }
 
 type ScannerEngineOutcome struct {
@@ -212,6 +213,9 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 		if c.SourceScores == nil {
 			c.SourceScores = map[string]float64{}
 		}
+		if c.PromotionEvidence == nil {
+			c.PromotionEvidence = json.RawMessage(`{}`)
+		}
 		_, err = tx.Exec(ctx, `
 			INSERT INTO scanner_candidate_snapshots (
 				scanner_run_id, ticker, sources, graph_context, weekly_leader_evidence,
@@ -226,11 +230,12 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 				passed_min_conviction, cap_selected, watchlist_added, watchlist_error,
 					strategies, final_stage, source_scores, universe_member, sector,
 					industry, taxonomy_status, taxonomy_as_of, taxonomy_provider,
-					taxonomy_evidence, removal_stage, failure_stage, failure_reason
+				taxonomy_evidence, removal_stage, failure_stage, failure_reason,
+				promotion_evidence
 				) VALUES (
 					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50
+					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51
 				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableString(c.WeeklyLeaderEvidence),
@@ -253,6 +258,7 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 			c.TaxonomyAsOf, nullableString(c.TaxonomyProvider),
 			nonNilJSON(c.TaxonomyEvidence), nullableString(c.RemovalStage),
 			nullableString(c.FailureStage), nullableString(c.FailureReason),
+			nonNilJSON(c.PromotionEvidence),
 		)
 		if err != nil {
 			return err

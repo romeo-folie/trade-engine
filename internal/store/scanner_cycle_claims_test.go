@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,5 +32,43 @@ func TestScannerCycleClaimIsIdempotent(t *testing.T) {
 	third, err := store.ClaimScannerCycle(ctx, key, "owner-b", time.Hour)
 	if err != nil || third {
 		t.Fatalf("completed claim = %v/%v, want false", third, err)
+	}
+}
+
+func TestScannerCycleClaimConcurrentWinners(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	key := "test-cycle-concurrent-" + time.Now().UTC().Format("20060102150405.000000000")
+	t.Cleanup(func() { _, _ = store.GetDB().Exec(ctx, "DELETE FROM scanner_cycle_claims WHERE run_key=$1", key) })
+	var wg sync.WaitGroup
+	results := make(chan bool, 2)
+	errs := make(chan error, 2)
+	for _, owner := range []string{"owner-a", "owner-b"} {
+		wg.Add(1)
+		go func(owner string) {
+			defer wg.Done()
+			claimed, err := store.ClaimScannerCycle(ctx, key, owner, time.Hour)
+			results <- claimed
+			errs <- err
+		}(owner)
+	}
+	wg.Wait()
+	close(results)
+	close(errs)
+	winners := 0
+	for claimed := range results {
+		if claimed {
+			winners++
+		}
+	}
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent claim error: %v", err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("concurrent winners = %d, want 1", winners)
 	}
 }

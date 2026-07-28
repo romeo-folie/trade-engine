@@ -21,23 +21,24 @@ func ClaimScannerCycle(ctx context.Context, runKey, ownerToken string, lease tim
 		return false, err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	var status string
-	var leaseUntil time.Time
-	err = tx.QueryRow(ctx, `
-		SELECT status, lease_until FROM scanner_cycle_claims
-		WHERE run_key=$1 FOR UPDATE`, runKey).Scan(&status, &leaseUntil)
-	if IsNoRows(err) {
-		_, err = tx.Exec(ctx, `
-			INSERT INTO scanner_cycle_claims (run_key,status,owner_token,lease_until)
-			VALUES ($1,'running',$2,$3)`, runKey, ownerToken, time.Now().UTC().Add(lease))
-		if err != nil {
-			return false, err
-		}
+	inserted, err := tx.Exec(ctx, `
+		INSERT INTO scanner_cycle_claims (run_key,status,owner_token,lease_until)
+		VALUES ($1,'running',$2,$3)
+		ON CONFLICT (run_key) DO NOTHING`, runKey, ownerToken, time.Now().UTC().Add(lease))
+	if err != nil {
+		return false, err
+	}
+	if inserted.RowsAffected() == 1 {
 		if err := tx.Commit(ctx); err != nil {
 			return false, err
 		}
 		return true, nil
 	}
+	var status string
+	var leaseUntil time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT status, lease_until FROM scanner_cycle_claims
+		WHERE run_key=$1 FOR UPDATE`, runKey).Scan(&status, &leaseUntil)
 	if err != nil {
 		return false, err
 	}

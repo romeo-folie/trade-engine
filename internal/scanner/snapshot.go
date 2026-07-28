@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sort"
 	"time"
@@ -412,6 +413,20 @@ func (r *scanRecorder) promotionRejected(ticker, reason string) {
 		snapshot.FailureStage = "promotion"
 		snapshot.FailureReason = reason
 		snapshot.FinalStage = "promotion_suppressed"
+	}
+}
+
+func (r *scanRecorder) promotionRejectedWithEvidence(ticker string, rejection PromotionRejection) {
+	r.promotionRejected(ticker, rejection.Reason)
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		evidence, err := json.Marshal(map[string]any{
+			"reason":               rejection.Reason,
+			"conflict_key":         rejection.ConflictKey,
+			"conflict_correlation": rejection.ConflictCorrelation,
+		})
+		if err == nil {
+			snapshot.PromotionEvidence = evidence
+		}
 	}
 }
 

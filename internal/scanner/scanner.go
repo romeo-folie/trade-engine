@@ -125,6 +125,9 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 // runScan executes one full scan cycle.
 func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
+	if s.Cfg.PromotionCorrelationEnabled && s.DailyBars == nil {
+		return fmt.Errorf("promotion correlation enabled but daily-bars provider is unavailable")
+	}
 	cycleKey := ""
 	cycleOwner := s.CycleOwnerToken
 	if cycleOwner == "" {
@@ -307,24 +310,34 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			"failed", recorder.run.ID, "pullback requalification evidence unavailable")
 	}
 
-	// 3.5 Dedup against the active watchlist only after universe selection.
-	beforeWatchlistFilter := candidates
-	candidates, err = s.filterExistingWatchlist(ctx, candidates)
-	if err != nil {
-		return fmt.Errorf("filter watchlist: %w", err)
-	}
-	recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
-	s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
-		"active_watchlist", recorder.run.ID, "already active on watchlist")
+	// 3.5 Dedup against active watchlist/position exposure only after universe
+	// selection. Correlation mode takes one normalized exposure snapshot and
+	// reuses it for both same-ticker guards and pairwise selection.
+	var exposure promotionExposure
 	if s.Cfg.PromotionCorrelationEnabled {
-		beforeExposureFilter := candidates
-		candidates, err = s.filterOpenPositionExposure(ctx, candidates)
+		exposure, err = loadPromotionExposure(ctx)
 		if err != nil {
-			return fmt.Errorf("filter open-position exposure: %w", err)
+			return fmt.Errorf("load promotion exposure: %w", err)
 		}
+		beforeWatchlistFilter := candidates
+		candidates = filterActiveCandidates(candidates, exposure.watchlist)
+		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
+		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
+			"active_watchlist", recorder.run.ID, "already active on watchlist")
+		beforeExposureFilter := candidates
+		candidates = filterActiveCandidates(candidates, exposure.positions)
 		recorder.markRemoved(beforeExposureFilter, candidates, "open_position")
 		s.markDiscoveryCandidates(ctx, beforeExposureFilter, candidates,
 			"open_position", recorder.run.ID, "ticker already has an open position")
+	} else {
+		beforeWatchlistFilter := candidates
+		candidates, err = s.filterExistingWatchlist(ctx, candidates)
+		if err != nil {
+			return fmt.Errorf("filter watchlist: %w", err)
+		}
+		recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
+		s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
+			"active_watchlist", recorder.run.ID, "already active on watchlist")
 	}
 	if len(candidates) == 0 {
 		return nil
@@ -391,7 +404,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	}
 
 	// 7. Sort by conviction descending, take only as many as available slots.
-	s.enrichPromotionCorrelations(ctx, scored, start)
+	if err := s.enrichPromotionCorrelations(ctx, scored, start, exposure); err != nil {
+		return err
+	}
 	sortByConviction(scored)
 	correlationCapActive := s.Cfg.PromotionCorrelationEnabled && s.DailyBars != nil &&
 		s.Cfg.PromotionMaxAbsCorrelation > 0
@@ -413,7 +428,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if rejected.Candidate.Index >= 0 && rejected.Candidate.Index < len(promotionInput) {
 				sc := promotionInput[rejected.Candidate.Index]
 				s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
-				recorder.promotionRejected(sc.candidate.Ticker, reason)
+				recorder.promotionRejectedWithEvidence(sc.candidate.Ticker, rejected)
 			}
 		}
 	}
@@ -961,35 +976,12 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 	}
 	existing := make(map[string]struct{}, len(items))
 	for _, item := range items {
-		existing[item.Ticker] = struct{}{}
-	}
-
-	return filterActiveCandidates(candidates, existing), nil
-}
-
-// filterOpenPositionExposure applies the same-ticker exposure guard to durable
-// open/exiting trades. Watchlist filtering above covers active discovery rows;
-// this second set prevents a scanner retry from proposing a ticker already held
-// by the execution engine.
-func (s *MarketScanner) filterOpenPositionExposure(ctx context.Context, candidates []SwingCandidate) ([]SwingCandidate, error) {
-	trades, err := store.GetOwnedPositionTrades(ctx)
-	if err != nil {
-		return nil, err
-	}
-	existing := make(map[string]struct{}, len(trades))
-	for _, trade := range trades {
-		key := normalizePromotionKey(trade.Ticker)
-		if key != "" {
+		if key := normalizePromotionKey(item.Ticker); key != "" {
 			existing[key] = struct{}{}
 		}
 	}
-	filtered := make([]SwingCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		if _, found := existing[normalizePromotionKey(candidate.Ticker)]; !found {
-			filtered = append(filtered, candidate)
-		}
-	}
-	return filtered, nil
+
+	return filterActiveCandidates(candidates, existing), nil
 }
 
 func filterActiveCandidates(
@@ -997,7 +989,7 @@ func filterActiveCandidates(
 ) []SwingCandidate {
 	filtered := make([]SwingCandidate, 0, len(candidates))
 	for _, candidate := range candidates {
-		if _, found := existing[candidate.Ticker]; !found {
+		if _, found := existing[normalizePromotionKey(candidate.Ticker)]; !found {
 			filtered = append(filtered, candidate)
 		}
 	}

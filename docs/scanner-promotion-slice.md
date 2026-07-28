@@ -25,10 +25,6 @@ against active watchlist/open-position exposure and already-selected
 candidates. Missing bars fail open and every rejection retains its conflict
 ticker in the scanner snapshot. The default remains disabled.
 
-Regime routing is intentionally separate: its immutable observation-only
-contract is documented in `docs/regime-router.md` and is referenced by a
-scanner run when enabled.
-
 Weekly-leader and potent-industry candidates use source-specific TTLs
 (`ttl_days`, defaults 10 and 5) so a slower after-close observation is not
 expired by the regular intraday default. Regular scanner cycles also acquire a

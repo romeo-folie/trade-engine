@@ -2,9 +2,8 @@ package scanner
 
 import (
 	"context"
-	"log/slog"
+	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -13,9 +12,15 @@ import (
 // enrichPromotionCorrelations attaches pairwise daily-return evidence to the
 // scored candidates. Data failures fail open: a missing pair cannot be treated
 // as correlated, and the candidate remains in the auditable funnel.
-func (s *MarketScanner) enrichPromotionCorrelations(ctx context.Context, scored []scoredCandidate, asOf time.Time) {
+type promotionExposure struct {
+	watchlist map[string]struct{}
+	positions map[string]struct{}
+	all       []string
+}
+
+func (s *MarketScanner) enrichPromotionCorrelations(ctx context.Context, scored []scoredCandidate, asOf time.Time, exposure promotionExposure) error {
 	if !s.Cfg.PromotionCorrelationEnabled || len(scored) == 0 || s.DailyBars == nil {
-		return
+		return nil
 	}
 	lookback := s.Cfg.PromotionCorrelationLookbackDays
 	if lookback <= 0 {
@@ -25,13 +30,8 @@ func (s *MarketScanner) enrichPromotionCorrelations(ctx context.Context, scored 
 	if minOverlap <= 0 {
 		minOverlap = correlationMinOverlap
 	}
-	exposure, err := promotionExposureSymbols(ctx)
-	if err != nil {
-		slog.Warn("scanner: load promotion exposure for correlation", "err", err)
-		return
-	}
-	symbols := make([]string, 0, len(scored)+len(exposure))
-	seen := make(map[string]struct{}, len(scored)+len(exposure))
+	symbols := make([]string, 0, len(scored)+len(exposure.all))
+	seen := make(map[string]struct{}, len(scored)+len(exposure.all))
 	add := func(symbol string) {
 		key := normalizePromotionKey(symbol)
 		if key == "" {
@@ -46,18 +46,27 @@ func (s *MarketScanner) enrichPromotionCorrelations(ctx context.Context, scored 
 	for _, item := range scored {
 		add(item.candidate.Ticker)
 	}
-	for _, symbol := range exposure {
+	for _, symbol := range exposure.all {
 		add(symbol)
 	}
 	sort.Strings(symbols)
 	if len(symbols) < 2 {
-		return
+		return nil
 	}
-	from := asOf.AddDate(0, 0, -(lookback + 7))
-	result, err := s.DailyBars.FetchDailyBars(ctx, symbols, from, asOf, 200)
+	from := asOf.AddDate(0, 0, -(lookback * 2))
+	// Daily bars must be completed sessions. The scanner may run intraday, so
+	// bound the provider request at the prior UTC day to exclude a partial bar.
+	to := asOf.UTC().Truncate(24 * time.Hour).Add(-time.Nanosecond)
+	batchSize := s.Cfg.Universe.BatchSize
+	if batchSize <= 0 {
+		batchSize = 200
+	}
+	result, err := s.DailyBars.FetchDailyBars(ctx, symbols, from, to, batchSize)
 	if err != nil {
-		slog.Warn("scanner: fetch promotion correlation bars", "err", err)
-		return
+		return fmt.Errorf("fetch promotion correlation bars: %w", err)
+	}
+	if len(result.Failures) > 0 {
+		return fmt.Errorf("promotion correlation bars unavailable for %d symbols", len(result.Failures))
 	}
 	for i := range scored {
 		key := normalizePromotionKey(scored[i].candidate.Ticker)
@@ -73,51 +82,48 @@ func (s *MarketScanner) enrichPromotionCorrelations(ctx context.Context, scored 
 			if !ok {
 				continue
 			}
-			if containsPromotionSymbol(exposure, peer) {
+			if _, ok := exposure.watchlist[peer]; ok {
+				scored[i].exposureCorrelations[peer] = correlation
+			} else if _, ok := exposure.positions[peer]; ok {
 				scored[i].exposureCorrelations[peer] = correlation
 			} else {
 				scored[i].correlations[peer] = correlation
 			}
 		}
 	}
+	return nil
 }
 
-func promotionExposureSymbols(ctx context.Context) ([]string, error) {
+func loadPromotionExposure(ctx context.Context) (promotionExposure, error) {
 	items, err := store.GetWatchlistItems(ctx, true)
 	if err != nil {
-		return nil, err
+		return promotionExposure{}, err
 	}
 	trades, err := store.GetOwnedPositionTrades(ctx)
 	if err != nil {
-		return nil, err
+		return promotionExposure{}, err
+	}
+	exposure := promotionExposure{
+		watchlist: make(map[string]struct{}, len(items)),
+		positions: make(map[string]struct{}, len(trades)),
 	}
 	seen := make(map[string]struct{}, len(items)+len(trades))
-	var out []string
-	add := func(symbol string) {
+	add := func(target map[string]struct{}, symbol string) {
 		key := normalizePromotionKey(symbol)
 		if key != "" {
+			target[key] = struct{}{}
 			if _, ok := seen[key]; !ok {
 				seen[key] = struct{}{}
-				out = append(out, key)
+				exposure.all = append(exposure.all, key)
 			}
 		}
 	}
 	for _, item := range items {
-		add(item.Ticker)
+		add(exposure.watchlist, item.Ticker)
 	}
 	for _, trade := range trades {
-		add(trade.Ticker)
+		add(exposure.positions, trade.Ticker)
 	}
-	sort.Strings(out)
-	return out, nil
-}
-
-func containsPromotionSymbol(symbols []string, target string) bool {
-	target = normalizePromotionKey(target)
-	for _, symbol := range symbols {
-		if strings.EqualFold(normalizePromotionKey(symbol), target) {
-			return true
-		}
-	}
-	return false
+	sort.Strings(exposure.all)
+	return exposure, nil
 }
