@@ -1,6 +1,9 @@
 package analysis
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func lensResult(action Action, conf float64, selected, regime string) AnalystResult {
 	return AnalystResult{
@@ -89,3 +92,44 @@ func TestMajorityVote_CarriesLens(t *testing.T) {
 		t.Errorf("majority vote dropped SelectedStrategy: %q", resp.SelectedStrategy)
 	}
 }
+
+// TestSpecialistConsensusLens excludes the risk manager: it reviews the
+// directional findings rather than voting, and is never asked to select a lens.
+// Without this backfill, specialist mode returns the risk manager's response
+// verbatim — with empty lens fields — and the engine's selected-lens entry
+// gates silently revert to the configured primary.
+func TestSpecialistConsensusLens(t *testing.T) {
+	results := []specialistResult{
+		{Role: "fundamental", Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "news_sentiment", Regime: "trending"}},
+		{Role: "technical", Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "news_sentiment", Regime: "trending"}},
+		// The risk manager carries no selection and must not blank the result.
+		{Role: "risk_manager", Response: AnalysisResponse{Action: ActionBuy}},
+	}
+	selected, regime := specialistConsensusLens(results, ActionBuy)
+	if selected != "news_sentiment" {
+		t.Errorf("selected = %q, want news_sentiment (risk manager must be excluded)", selected)
+	}
+	if regime != "trending" {
+		t.Errorf("regime = %q, want trending", regime)
+	}
+}
+
+// Failed specialists must not contribute, and a genuine split still yields empty.
+func TestSpecialistConsensusLens_SplitAndErrors(t *testing.T) {
+	split := []specialistResult{
+		{Role: "fundamental", Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "momentum"}},
+		{Role: "technical", Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "trend_following"}},
+	}
+	if selected, _ := specialistConsensusLens(split, ActionBuy); selected != "" {
+		t.Errorf("split must yield empty, got %q", selected)
+	}
+	withErr := []specialistResult{
+		{Role: "fundamental", Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "momentum"}},
+		{Role: "technical", Err: errTest, Response: AnalysisResponse{Action: ActionBuy, SelectedStrategy: "trend_following"}},
+	}
+	if selected, _ := specialistConsensusLens(withErr, ActionBuy); selected != "momentum" {
+		t.Errorf("failed specialist must not dilute consensus, got %q", selected)
+	}
+}
+
+var errTest = fmt.Errorf("specialist failed")

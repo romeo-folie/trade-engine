@@ -36,7 +36,7 @@ func TestLenses_FiltersToAnalysisLenses(t *testing.T) {
 // TestCandidateLensBlock_ListsEveryAdmissibleLens is the core of the multi-lens
 // change: an analyst must see every candidate, not just the configured primary.
 func TestCandidateLensBlock_ListsEveryAdmissibleLens(t *testing.T) {
-	sys := buildSystem(lensContract([]string{"mean_reversion", "trend_following"}), Lenses([]string{"mean_reversion", "trend_following"}))
+	sys := buildSystem(lensContract([]string{"mean_reversion", "trend_following"}), ExitOnlyOverride([]string{"mean_reversion", "trend_following"}), Lenses([]string{"mean_reversion", "trend_following"}))
 	if !strings.Contains(sys, "CANDIDATE LENSES: mean_reversion, trend_following") {
 		t.Errorf("system prompt does not list both admissible lenses:\n%s", sys)
 	}
@@ -50,8 +50,8 @@ func TestCandidateLensBlock_ListsEveryAdmissibleLens(t *testing.T) {
 // exist: no admissible lens fits, so HOLD on regime grounds is correct.
 func TestCandidateLensBlock_EscapeHatch(t *testing.T) {
 	for _, sys := range []string{
-		buildSystem(lensContract([]string{"mean_reversion"}), Lenses([]string{"mean_reversion"})),
-		buildMomentumSystem(lensContract([]string{"momentum"}), Lenses([]string{"momentum"})),
+		buildSystem(lensContract([]string{"mean_reversion"}), ExitOnlyOverride([]string{"mean_reversion"}), Lenses([]string{"mean_reversion"})),
+		buildMomentumSystem(lensContract([]string{"momentum"}), ExitOnlyOverride([]string{"momentum"}), Lenses([]string{"momentum"})),
 	} {
 		if !strings.Contains(sys, "regime mismatch:") {
 			t.Error("prompt is missing the regime-mismatch escape hatch")
@@ -70,7 +70,7 @@ func TestCandidateLensBlock_EscapeHatch(t *testing.T) {
 // the only thing standing between those two readings — without it the change
 // is strictly more permissive than the single-assignment framing it replaced.
 func TestCandidateLensBlock_LensShoppingGuard(t *testing.T) {
-	sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"}))
+	sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), ExitOnlyOverride([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"}))
 	for _, want := range []string{
 		"why every REJECTED lens does not fit",
 		"Selecting a lens because it yields a tradeable setup",
@@ -131,11 +131,11 @@ func TestOutputSchema_RecoverableFieldsPrecedeProse(t *testing.T) {
 // including when it is not first.
 func TestLensGuidance_AttachedWhenCandidate(t *testing.T) {
 	const marker = "STRATEGY GUIDANCE — news_sentiment"
-	sys := buildSystem(lensContract([]string{"momentum", "news_sentiment"}), Lenses([]string{"momentum", "news_sentiment"}))
+	sys := buildSystem(lensContract([]string{"momentum", "news_sentiment"}), ExitOnlyOverride([]string{"momentum", "news_sentiment"}), Lenses([]string{"momentum", "news_sentiment"}))
 	if !strings.Contains(sys, marker) {
 		t.Error("news_sentiment guidance missing when it is a non-primary candidate")
 	}
-	if sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"})); strings.Contains(sys, marker) {
+	if sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), ExitOnlyOverride([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"})); strings.Contains(sys, marker) {
 		t.Error("news_sentiment guidance leaked into a set that does not admit it")
 	}
 }
@@ -145,8 +145,8 @@ func TestLensGuidance_AttachedWhenCandidate(t *testing.T) {
 func TestPrompts_NoLeakedFormatVerbs_MultiLens(t *testing.T) {
 	lenses := Lenses([]string{"momentum", "news_sentiment", "trend_following"})
 	rendered := map[string]string{
-		"generalist": buildSystem(lensContract(lenses), lenses),
-		"momentum":   buildMomentumSystem(lensContract(lenses), lenses),
+		"generalist": buildSystem(lensContract(lenses), ExitOnlyOverride(lenses), lenses),
+		"momentum":   buildMomentumSystem(lensContract(lenses), ExitOnlyOverride(lenses), lenses),
 	}
 	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
 		sys, _ := BuildRolePrompt(role, "AAPL", lenses, "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
@@ -198,7 +198,7 @@ func TestBuildUser_RendersEveryProvidedCandle(t *testing.T) {
 // "simplification" of that regex would silently drop the field.
 func TestExtractionContract_NestedRejectedMap(t *testing.T) {
 	lenses := Lenses([]string{"mean_reversion", "trend_following"})
-	sys := buildSystem(lensContract(lenses), lenses)
+	sys := buildSystem(lensContract(lenses), ExitOnlyOverride(lenses), lenses)
 	if !strings.Contains(sys, `"rejected_strategies": {"<lens>": "<one clause on why it does not fit>"}`) {
 		t.Error("schema no longer asks for a nested rejected_strategies object")
 	}
@@ -222,7 +222,7 @@ func TestExitOnlyStrategies_GetMandateNotLenses(t *testing.T) {
 			if strings.Contains(contract, defaultLens) {
 				t.Errorf("exit-only row leaked the %s fallback", defaultLens)
 			}
-			sys := buildSystem(contract, Lenses([]string{strategy}))
+			sys := buildSystem(contract, ExitOnlyOverride([]string{strategy}), Lenses([]string{strategy}))
 			if !strings.Contains(sys, "Never propose BUY") {
 				t.Error("exit-only system prompt does not forbid BUY")
 			}
@@ -254,5 +254,46 @@ func TestTechnicalRole_NoStaleCandleLimit(t *testing.T) {
 	}
 	if !strings.Contains(sys, "full OHLCV candle history") {
 		t.Error("technical role does not point at the full provided history")
+	}
+}
+
+// TestExitOnlyOverride_ReachesEveryPromptPath: the EXIT MANDATE alone was not
+// enough. The specialist ROLE GUIDANCE blocks and the arbiter prompt authorise
+// BUY unconditionally and were never exit-aware, so an exit-only ticker could
+// still be turned into a BUY by a downstream stage. Nothing blocks that: the
+// position-ownership gate only constrains SELL.
+func TestExitOnlyOverride_ReachesEveryPromptPath(t *testing.T) {
+	exit := []string{"close_position"}
+	paths := map[string]string{
+		"generalist": buildSystem(lensContract(exit), ExitOnlyOverride(exit), Lenses(exit)),
+		"momentum":   buildMomentumSystem(lensContract(exit), ExitOnlyOverride(exit), Lenses(exit)),
+	}
+	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
+		sys, _ := BuildRolePrompt(role, "KO", exit, "1d", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+		paths["role:"+role] = sys
+	}
+	for name, sys := range paths {
+		if !strings.Contains(sys, "EXIT-ONLY OVERRIDE") {
+			t.Errorf("%s prompt is missing the exit-only override", name)
+		}
+		if !strings.Contains(sys, "takes precedence over every instruction above") {
+			t.Errorf("%s override does not assert precedence", name)
+		}
+		// Precedence is positional: the override must be the LAST instruction,
+		// after any earlier block that authorises BUY.
+		if idx := strings.LastIndex(sys, "EXIT-ONLY OVERRIDE"); idx < strings.LastIndex(sys, "BUY only when") {
+			t.Errorf("%s override appears before BUY-authorising guidance", name)
+		}
+	}
+}
+
+// A non-exit row must never see the override.
+func TestExitOnlyOverride_AbsentForOrdinaryRows(t *testing.T) {
+	if got := ExitOnlyOverride([]string{"momentum", "trend_following"}); got != "" {
+		t.Errorf("ordinary row got an exit override: %q", got)
+	}
+	sys := buildSystem(lensContract([]string{"momentum"}), ExitOnlyOverride([]string{"momentum"}), Lenses([]string{"momentum"}))
+	if strings.Contains(sys, "EXIT-ONLY OVERRIDE") {
+		t.Error("exit override leaked into an ordinary lens prompt")
 	}
 }

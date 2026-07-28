@@ -183,7 +183,7 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	}
 
 	arbReq := AnalysisRequest{
-		CustomSystemPrompt: arbiterSystemPrompt(),
+		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()),
 		CustomUserMessage:  buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()),
 		Ticker:             req.Ticker,
 	}
@@ -201,13 +201,16 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		"confidence", fmt.Sprintf("%.3f", resp.Confidence),
 		"dissent", dissentSummary != "", "latency_ms", meta.LatencyMs,
 	)
-	// The arbiter's own schema carries no lens fields, so backfill them from the
+	// The arbiter's own schema carries no lens fields, so derive them from the
 	// analysts who reached the same verdict. Without this the arbitrated path —
 	// which produces the majority of live signals — would always report an empty
 	// selection and silently disarm the selected-lens entry gates.
-	if resp.SelectedStrategy == "" {
-		resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
-	}
+	//
+	// Assigned UNCONDITIONALLY, overwriting anything the arbiter emitted: the
+	// prompt never asks for these fields, so a non-empty value from it is a
+	// hallucination rather than a selection, and letting it stand would hand
+	// gate control to a field no analyst voted for.
+	resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
 }
 

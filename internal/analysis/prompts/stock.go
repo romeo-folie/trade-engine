@@ -144,6 +144,33 @@ func lensContract(strategies []string) string {
 	return candidateLensBlock(Lenses(strategies))
 }
 
+// ExitOnlyOverride returns a trailing override block for exit-only rows, or ""
+// for every other row.
+//
+// The generic guidance in the specialist ROLE GUIDANCE blocks and in the
+// arbiter prompt authorises BUY unconditionally — neither was ever exit-aware
+// (they predate this change). On an exit-only ticker that guidance directly
+// contradicts the EXIT MANDATE, and the contradiction is resolvable in the
+// wrong direction: nothing downstream blocks a BUY on a row the operator put on
+// the watchlist to close, because the position-ownership gate only constrains
+// SELL.
+//
+// Callers MUST append this LAST, after all role/arbiter guidance, so the
+// override is the final instruction the model reads.
+func ExitOnlyOverride(strategies []string) string {
+	for _, s := range strategies {
+		if !IsExitOnlyStrategy(s) {
+			continue
+		}
+		return fmt.Sprintf(`
+
+EXIT-ONLY OVERRIDE (takes precedence over every instruction above):
+This ticker is on the watchlist under %q, an exit-only strategy. Any guidance above that authorises BUY does not apply here. The only valid directional recommendation is SELL; otherwise return HOLD or WAIT. Set "selected_strategy" to %q and "rejected_strategies" to {}.`,
+			strings.ToLower(strings.TrimSpace(s)), strings.ToLower(strings.TrimSpace(s)))
+	}
+	return ""
+}
+
 // Lenses filters a raw watchlist strategies list down to the analytical lenses
 // an analyst may choose among, preserving order and dropping duplicates,
 // unknown labels, and entry-gate tags. Never returns empty: a row with no
@@ -335,10 +362,11 @@ func BuildStockPrompt(
 ) (systemPrompt, userMessage string) {
 	lenses := Lenses(strategies)
 	contract := lensContract(strategies)
+	exitOverride := ExitOnlyOverride(strategies)
 	if momentumPlay {
-		systemPrompt = buildMomentumSystem(contract, lenses)
+		systemPrompt = buildMomentumSystem(contract, exitOverride, lenses)
 	} else {
-		systemPrompt = buildSystem(contract, lenses)
+		systemPrompt = buildSystem(contract, exitOverride, lenses)
 	}
 	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
@@ -347,7 +375,7 @@ func BuildStockPrompt(
 // buildMomentumSystem returns a system prompt for scanner-sourced tickers.
 // It reframes the question from "swing-trade evaluation" to "is this momentum
 // entry still valid?" — appropriate for intraday movers and news catalysts.
-func buildMomentumSystem(contract string, lenses []string) string {
+func buildMomentumSystem(contract, exitOverride string, lenses []string) string {
 	return fmt.Sprintf(`You are a short-term momentum trader evaluating a live entry opportunity.
 
 This ticker was flagged by an intraday screener (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
@@ -371,8 +399,8 @@ R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_p
 
 SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.
 
-%s%s`, contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
-		lensGuidance(lenses))
+%s%s%s`, contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
+		lensGuidance(lenses), exitOverride)
 }
 
 // buildSystem returns the generalist analyst system prompt.
@@ -383,7 +411,7 @@ SIZING: momentum trades carry higher short-term risk — keep size_pct conservat
 // entries — not merely penalized. This is intentional (the one ticker
 // currently qualifying, SBET, ran 20% over 5 trades); revisit the ceiling if
 // the gate ever moves.
-func buildSystem(contract string, lenses []string) string {
+func buildSystem(contract, exitOverride string, lenses []string) string {
 	return fmt.Sprintf(`You are a disciplined quantitative trading analyst.
 
 Your task is to analyse the provided market data and return a trade recommendation.
@@ -419,9 +447,9 @@ USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trad
 USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
 - If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
-- Entries marked "outcome unknown" carry no weight.%s`,
+- Entries marked "outcome unknown" carry no weight.%s%s`,
 		contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
-		lensGuidance(lenses))
+		lensGuidance(lenses), exitOverride)
 }
 
 func buildUser(

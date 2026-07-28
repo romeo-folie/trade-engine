@@ -40,7 +40,7 @@ const roleOutputSchema = OutputSchema + `
 // buildFundamentalSystem returns the specialist prompt for the fundamental analyst.
 // Focus: earnings, catalysts, sector context, business quality. Downweights
 // purely technical signals.
-func buildFundamentalSystem(contract string) string {
+func buildFundamentalSystem(contract, exitOverride string) string {
 	return fmt.Sprintf(`You are a fundamental research analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on business and catalyst quality. Anchor on earnings outlook, sector tailwinds/headwinds, recent corporate news, and management guidance. Treat the technical indicator block as secondary context — do not let chart structure override a weak or strong fundamental story.
@@ -56,12 +56,12 @@ ROLE GUIDANCE:
 - SELL when fundamentals have deteriorated (downgrades, guidance cuts, sector breakdown) and an existing long should exit.
 - Cite specific news headlines, earnings cadence, or sector context in your reasoning. Do not list indicator readings.
 
-%s`, contract, roleOutputSchema, rrSelfFilter)
+%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
 }
 
 // buildTechnicalSystem returns the specialist prompt for the technical analyst.
 // Focus: indicators, structure, levels. Downweights catalyst noise.
-func buildTechnicalSystem(contract string) string {
+func buildTechnicalSystem(contract, exitOverride string) string {
 	return fmt.Sprintf(`You are a technical analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on chart structure and indicator alignment. Anchor on trend (EMA stack, ADX), momentum (RSI, MACD, Stoch), volatility (ATR, Bollinger Bands), volume confirmation (VolRatio, OBV), and the full OHLCV candle history provided in the user message. Treat news as background — do not let a single headline override a clear technical setup or breakdown.
@@ -77,12 +77,12 @@ ROLE GUIDANCE:
 - HOLD when the chart is choppy, indicators conflict, or there is no actionable structure.
 - Cite specific indicator values, candle patterns, and price levels in your reasoning. Do not lead with news.
 
-%s`, contract, roleOutputSchema, rrSelfFilter)
+%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
 }
 
 // buildSentimentSystem returns the specialist prompt for the sentiment analyst.
 // Focus: news flow, catalyst quality, social/headline tone.
-func buildSentimentSystem(contract string) string {
+func buildSentimentSystem(contract, exitOverride string) string {
 	return fmt.Sprintf(`You are a sentiment analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on news flow and catalyst quality. Anchor on the recency, source, and tone of the news block, the freshness of the catalyst (hours-old beats days-old), and whether sentiment is aligned with price action. Treat raw indicators as secondary — your edge is reading the narrative.
@@ -98,13 +98,13 @@ ROLE GUIDANCE:
 - HOLD when news is stale, neutral, or absent — there is no narrative edge to trade.
 - Cite specific headlines, sources, and the age of each catalyst in your reasoning. A bullish two-day-old headline is not a fresh signal.
 
-%s`, contract, roleOutputSchema, rrSelfFilter)
+%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
 }
 
 // buildRiskManagerSystem returns the mandatory final specialist-review prompt.
 // Unlike the three directional roles, this model receives their completed
 // findings and owns the final specialist outcome before deterministic controls.
-func buildRiskManagerSystem(contract string) string {
+func buildRiskManagerSystem(contract, exitOverride string) string {
 	return fmt.Sprintf(`You are the mandatory Risk Specialist reviewing three completed specialist analyses. You are the final analytical stage before deterministic portfolio risk controls.
 
 YOUR MANDATE: synthesize the fundamental, technical, and sentiment findings, then enforce risk discipline. Anchor on portfolio exposure, position sizing, R:R, correlation with existing open positions, ATR-relative stop distance, and drawdown vulnerability. You are explicitly allowed and expected to reject an otherwise attractive setup when risk discipline is violated.
@@ -128,7 +128,7 @@ ROLE GUIDANCE:
 - HOLD when there is no actionable signal.
 - Your reasoning must summarize how the three findings support or conflict with the final action and name any discipline check that changed the outcome.
 
-%s`, contract, roleOutputSchema, rrSelfFilter)
+%s%s`, contract, roleOutputSchema, rrSelfFilter, exitOverride)
 }
 
 // BuildRolePrompt returns (system, user) prompts for a single specialist role.
@@ -150,15 +150,16 @@ func BuildRolePrompt(
 	performanceContext string,
 ) (systemPrompt, userMessage string) {
 	contract := lensContract(strategies)
+	exitOverride := ExitOnlyOverride(strategies)
 	switch role {
 	case "fundamental":
-		systemPrompt = buildFundamentalSystem(contract)
+		systemPrompt = buildFundamentalSystem(contract, exitOverride)
 	case "technical":
-		systemPrompt = buildTechnicalSystem(contract)
+		systemPrompt = buildTechnicalSystem(contract, exitOverride)
 	case "sentiment":
-		systemPrompt = buildSentimentSystem(contract)
+		systemPrompt = buildSentimentSystem(contract, exitOverride)
 	case "risk_manager":
-		systemPrompt = buildRiskManagerSystem(contract)
+		systemPrompt = buildRiskManagerSystem(contract, exitOverride)
 	default:
 		return "", ""
 	}

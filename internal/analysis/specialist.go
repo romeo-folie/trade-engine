@@ -236,6 +236,13 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 
 	final := riskResp
 	final.Reasoning = composeSequentialSpecialistReasoning(results, riskResp)
+	// The risk manager synthesises the directional findings but is not asked to
+	// re-select a lens, so its response carries no usable lens fields. Derive
+	// them from the directional specialists who reached the same verdict —
+	// without this, specialist mode reports an empty selection and the engine's
+	// selected-lens entry gates silently fall back to the configured primary
+	// (the same defect fixed for the ensemble aggregation paths).
+	final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
 	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),
@@ -328,4 +335,29 @@ func (a *Analyzer) specialistRolesConfig() map[string]string {
 // analysis.specialist_mode_enabled is true.
 func (a *Analyzer) SetSpecialistConfig(cfg *config.AnalysisConfig) {
 	a.specialist = cfg
+}
+
+// specialistConsensusLens mirrors consensusLens over specialist results:
+// unanimous selection among the directional specialists who voted for the
+// winning action, empty when they disagree. The risk manager is excluded — it
+// reviews rather than votes, and is not asked to select a lens.
+func specialistConsensusLens(results []specialistResult, winner Action) (selected, regime string) {
+	first := true
+	for _, r := range results {
+		if r.Err != nil || r.Role == "risk_manager" || r.Response.Action != winner {
+			continue
+		}
+		if first {
+			selected, regime = r.Response.SelectedStrategy, r.Response.Regime
+			first = false
+			continue
+		}
+		if r.Response.SelectedStrategy != selected {
+			selected = ""
+		}
+		if r.Response.Regime != regime {
+			regime = ""
+		}
+	}
+	return selected, regime
 }
