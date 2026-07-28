@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -55,20 +56,27 @@ func (b *IBKRBroker) resolveConidForex(ctx context.Context, pair string, secType
 		secType = "CASH"
 	}
 
-	var results []struct {
-		Conid       int    `json:"conid"`
-		CompanyName string `json:"companyName"`
-		Description string `json:"description"`
-		Exchange    string `json:"exchange"`
-	}
 	path := "/v1/api/iserver/secdef/search?symbol=" + base + "&secType=" + secType
-	if err := b.do(ctx, "GET", path, nil, &results); err != nil {
+	var rawResults []json.RawMessage
+	if err := b.do(ctx, "GET", path, nil, &rawResults); err != nil {
 		return "", fmt.Errorf("ibkr resolveConid: search %q: %w", pair, err)
 	}
 
-	for _, r := range results {
+	for _, raw := range rawResults {
+		var r struct {
+			Conid       ibkrconids.Conid `json:"conid"`
+			CompanyName string           `json:"companyName"`
+			Description string           `json:"description"`
+			Exchange    string           `json:"exchange"`
+		}
+		if err := json.Unmarshal(raw, &r); err != nil {
+			continue
+		}
+		if r.Conid <= 0 {
+			continue
+		}
 		if r.Exchange == "IDEALPRO" && (r.Description == pair || r.CompanyName == strings.Replace(pair, "/", ".", 1)) {
-			conid := fmt.Sprintf("%d", r.Conid)
+			conid := strconv.Itoa(int(r.Conid))
 			b.conidMu.Lock()
 			b.conidCache[pair] = conid
 			b.conidMu.Unlock()

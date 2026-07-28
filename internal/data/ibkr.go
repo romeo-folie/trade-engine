@@ -166,38 +166,10 @@ func (c *IBKRClient) resolveConid(ctx context.Context, pair string) (string, err
 }
 
 type ibkrSecdefSearchResult struct {
-	Conid       ibkrConid `json:"conid"`
-	CompanyName string    `json:"companyName"`
-	Description string    `json:"description"`
-	Exchange    string    `json:"exchange"`
-}
-
-// ibkrConid accepts both forms returned by IBKR's secdef endpoint. Although
-// conid is normally a JSON number, the endpoint occasionally serializes it as
-// a quoted number (notably for some forex contracts).
-type ibkrConid int
-
-func (c *ibkrConid) UnmarshalJSON(data []byte) error {
-	if strings.TrimSpace(string(data)) == "null" {
-		*c = 0
-		return nil
-	}
-	var value int
-	if err := json.Unmarshal(data, &value); err == nil {
-		*c = ibkrConid(value)
-		return nil
-	}
-
-	var text string
-	if err := json.Unmarshal(data, &text); err != nil {
-		return fmt.Errorf("conid must be an integer or quoted integer: %w", err)
-	}
-	parsed, err := strconv.Atoi(strings.TrimSpace(text))
-	if err != nil {
-		return fmt.Errorf("conid must be an integer or quoted integer: %w", err)
-	}
-	*c = ibkrConid(parsed)
-	return nil
+	Conid       ibkrconids.Conid `json:"conid"`
+	CompanyName string           `json:"companyName"`
+	Description string           `json:"description"`
+	Exchange    string           `json:"exchange"`
 }
 
 func (c *IBKRClient) resolveConidForexDynamic(ctx context.Context, pair string) (string, error) {
