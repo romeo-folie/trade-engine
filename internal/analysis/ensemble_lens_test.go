@@ -1,6 +1,7 @@
 package analysis
 
 import (
+	"context"
 	"fmt"
 	"testing"
 )
@@ -13,6 +14,12 @@ func lensResult(action Action, conf float64, selected, regime string) AnalystRes
 			SelectedStrategy: selected, Regime: regime,
 		},
 	}
+}
+
+func lensResultWithRejections(action Action, conf float64, selected, regime string, rejected map[string]string) AnalystResult {
+	r := lensResult(action, conf, selected, regime)
+	r.Response.RejectedStrategies = rejected
+	return r
 }
 
 // TestConsensusLens_UnanimousAmongWinners: aggregation rebuilds the response
@@ -59,8 +66,8 @@ func TestConsensusLens_IgnoresLosingVoters(t *testing.T) {
 // a unanimous lens must survive it.
 func TestTryFastPath_CarriesLens(t *testing.T) {
 	results := []AnalystResult{
-		lensResult(ActionBuy, 0.80, "news_sentiment", "trending"),
-		lensResult(ActionBuy, 0.78, "news_sentiment", "trending"),
+		lensResultWithRejections(ActionBuy, 0.80, "news_sentiment", "trending", map[string]string{"momentum": "no volume"}),
+		lensResultWithRejections(ActionBuy, 0.78, "news_sentiment", "trending", map[string]string{"mean_reversion": "no band touch", "news_sentiment": "malformed"}),
 	}
 	resp, ok := TryFastPath(results, 0.70, 0.20)
 	if !ok {
@@ -72,13 +79,19 @@ func TestTryFastPath_CarriesLens(t *testing.T) {
 	if resp.Regime != "trending" {
 		t.Errorf("fast path dropped Regime: %q", resp.Regime)
 	}
+	if len(resp.RejectedStrategies) != 2 {
+		t.Errorf("fast path rejected strategies = %#v, want the two non-selected lenses", resp.RejectedStrategies)
+	}
+	if _, ok := resp.RejectedStrategies["news_sentiment"]; ok {
+		t.Error("fast path must not report the selected lens as rejected")
+	}
 }
 
 // TestMajorityVote_CarriesLens: same invariant on the fallback route.
 func TestMajorityVote_CarriesLens(t *testing.T) {
 	results := []AnalystResult{
-		lensResult(ActionBuy, 0.72, "momentum", "trending"),
-		lensResult(ActionBuy, 0.68, "momentum", "trending"),
+		lensResultWithRejections(ActionBuy, 0.72, "momentum", "trending", map[string]string{"news_sentiment": "no catalyst"}),
+		lensResultWithRejections(ActionBuy, 0.68, "momentum", "trending", map[string]string{"mean_reversion": "trend intact"}),
 		lensResult(ActionHold, 0.50, "mean_reversion", "ranging"),
 	}
 	resp, ok := majorityVote(results)
@@ -90,6 +103,27 @@ func TestMajorityVote_CarriesLens(t *testing.T) {
 	}
 	if resp.SelectedStrategy != "momentum" {
 		t.Errorf("majority vote dropped SelectedStrategy: %q", resp.SelectedStrategy)
+	}
+	if len(resp.RejectedStrategies) != 2 {
+		t.Errorf("majority vote rejected strategies = %#v, want both winning-voter rejections", resp.RejectedStrategies)
+	}
+}
+
+func TestArbitrate_CarriesLensRejections(t *testing.T) {
+	results := []AnalystResult{
+		lensResultWithRejections(ActionBuy, 0.72, "momentum", "trending", map[string]string{"news_sentiment": "no catalyst"}),
+		lensResultWithRejections(ActionBuy, 0.70, "momentum", "trending", map[string]string{"mean_reversion": "trend intact"}),
+	}
+	cap := &captureArbiter{response: AnalysisResponse{Action: ActionBuy, Confidence: 0.8, Reasoning: "agreement"}}
+	result, err := Arbitrate(context.Background(), cap, AnalysisRequest{Ticker: "TEST"}, results)
+	if err != nil {
+		t.Fatalf("Arbitrate returned error: %v", err)
+	}
+	if len(result.Final.RejectedStrategies) != 2 {
+		t.Errorf("arbiter rejected strategies = %#v, want both winning-voter rejections", result.Final.RejectedStrategies)
+	}
+	if _, ok := result.Final.RejectedStrategies["momentum"]; ok {
+		t.Error("arbiter must not report the selected lens as rejected")
 	}
 }
 

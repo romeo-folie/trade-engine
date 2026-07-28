@@ -12,10 +12,14 @@ import (
 // arbiter prompt produced by Arbitrate without making any real LLM call.
 type captureArbiter struct {
 	captured string
+	response AnalysisResponse
 }
 
 func (c *captureArbiter) Analyze(_ context.Context, req AnalysisRequest) (AnalysisResponse, ModelCallMeta, error) {
 	c.captured = req.CustomUserMessage
+	if c.response.Action != "" {
+		return c.response, ModelCallMeta{Provider: "test", Model: "arbiter"}, nil
+	}
 	return AnalysisResponse{Action: ActionHold, Confidence: 0.5, Reasoning: "ok"}, ModelCallMeta{Provider: "test", Model: "arbiter"}, nil
 }
 func (c *captureArbiter) ProviderName() string { return "test" }

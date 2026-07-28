@@ -87,14 +87,15 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 
 	fpSelected, fpRegime := consensusLens(results, action)
 	return AnalysisResponse{
-		Action:           action,
-		Confidence:       avg,
-		SizePct:          avgSizePct,
-		StopLoss:         avgSL,
-		TakeProfit:       avgTP,
-		Reasoning:        "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
-		SelectedStrategy: fpSelected,
-		Regime:           fpRegime,
+		Action:             action,
+		Confidence:         avg,
+		SizePct:            avgSizePct,
+		StopLoss:           avgSL,
+		TakeProfit:         avgTP,
+		Reasoning:          "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		SelectedStrategy:   fpSelected,
+		Regime:             fpRegime,
+		RejectedStrategies: consensusRejections(results, action, fpSelected),
 	}, true
 }
 
@@ -132,6 +133,36 @@ func consensusLens(results []AnalystResult, winner Action) (selected, regime str
 		}
 	}
 	return selected, regime
+}
+
+// consensusRejections carries the rejection evidence from the analysts who
+// voted for the winning action into an aggregated response. Aggregation builds
+// a fresh response, so omitting this field makes the lens-shopping audit report
+// zero rejected lenses on fast-path, majority, and arbiter decisions.
+//
+// When the winning analysts agree on a selected lens, that lens is excluded as
+// a defensive consistency guard: malformed model output must not make a lens
+// appear both selected and rejected. With no consensus selection, the union of
+// the winning analysts' evidence is still useful telemetry and is preserved.
+func consensusRejections(results []AnalystResult, winner Action, selected string) map[string]string {
+	var out map[string]string
+	for _, r := range successfulResults(results) {
+		if r.Response.Action != winner {
+			continue
+		}
+		for lens, reason := range r.Response.RejectedStrategies {
+			if selected != "" && lens == selected {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string, len(r.Response.RejectedStrategies))
+			}
+			if _, exists := out[lens]; !exists {
+				out[lens] = reason
+			}
+		}
+	}
+	return out
 }
 
 // ─── Arbiter ───────────────────────────────────────────────────────────────────
@@ -211,6 +242,7 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	// hallucination rather than a selection, and letting it stand would hand
 	// gate control to a field no analyst voted for.
 	resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
+	resp.RejectedStrategies = consensusRejections(results, resp.Action, resp.SelectedStrategy)
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
 }
 
@@ -328,9 +360,10 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 	return AnalysisResponse{
 		Action: winner, Confidence: avgConf,
 		SizePct: ref.SizePct, StopLoss: ref.StopLoss, TakeProfit: ref.TakeProfit,
-		Reasoning:        fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
-		SelectedStrategy: mvSelected,
-		Regime:           mvRegime,
+		Reasoning:          fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		SelectedStrategy:   mvSelected,
+		Regime:             mvRegime,
+		RejectedStrategies: consensusRejections(results, winner, mvSelected),
 	}, true
 }
 
