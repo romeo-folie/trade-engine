@@ -172,6 +172,68 @@ func TestIBKRResolveConid_ForexDynamic(t *testing.T) {
 	}
 }
 
+func TestIBKRResolveConid_ForexDynamic_StringConid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/iserver/secdef/search" {
+			t.Errorf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+		]`))
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
+	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	if err != nil {
+		t.Fatalf("resolveConid forex with string conid: %v", err)
+	}
+	if conid != "12087799" {
+		t.Errorf("conid = %q; want 12087799", conid)
+	}
+}
+
+func TestIBKRResolveConid_ForexDynamic_NullConid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"conid":null,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"SMART"},
+			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+		]`))
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
+	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	if err != nil {
+		t.Fatalf("resolveConid forex with null plus valid conid: %v", err)
+	}
+	if conid != "12087799" {
+		t.Errorf("conid = %q; want 12087799", conid)
+	}
+}
+
+func TestIBKRResolveConid_ForexDynamic_MalformedConid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"conid":"not-a-number","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"},
+			{"conid":12087799,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+		]`))
+	}))
+	defer srv.Close()
+
+	client := newTestIBKRClient(srv.URL)
+	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	if err != nil {
+		t.Fatalf("resolveConid forex with malformed plus valid conid: %v", err)
+	}
+	if conid != "12087799" {
+		t.Errorf("conid = %q; want 12087799", conid)
+	}
+}
+
 func TestIBKRResolveConid_FuturesDynamic(t *testing.T) {
 	// A futures symbol absent from the static maps must resolve via /trsrv/futures
 	// (nearest expiry >= today) and then serve from cache — mirroring the broker so

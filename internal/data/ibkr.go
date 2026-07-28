@@ -166,10 +166,10 @@ func (c *IBKRClient) resolveConid(ctx context.Context, pair string) (string, err
 }
 
 type ibkrSecdefSearchResult struct {
-	Conid       int    `json:"conid"`
-	CompanyName string `json:"companyName"`
-	Description string `json:"description"`
-	Exchange    string `json:"exchange"`
+	Conid       ibkrconids.Conid `json:"conid"`
+	CompanyName string           `json:"companyName"`
+	Description string           `json:"description"`
+	Exchange    string           `json:"exchange"`
 }
 
 func (c *IBKRClient) resolveConidForexDynamic(ctx context.Context, pair string) (string, error) {
@@ -195,18 +195,24 @@ func (c *IBKRClient) resolveConidForexDynamic(ctx context.Context, pair string) 
 	}
 	defer resp.Body.Close()
 
-	var results []ibkrSecdefSearchResult
-	if err := json.NewDecoder(resp.Body).Decode(&results); err != nil {
+	var rawResults []json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&rawResults); err != nil {
 		return "", fmt.Errorf("ibkr: decode secdef/search for %q: %w", pair, err)
 	}
 
 	companyName := strings.Replace(pair, "/", ".", 1)
-	for _, r := range results {
+	for _, raw := range rawResults {
+		var r ibkrSecdefSearchResult
+		if err := json.Unmarshal(raw, &r); err != nil {
+			// IBKR may include unrelated or partially populated contracts. Ignore
+			// malformed rows and continue looking for the requested IDEALPRO pair.
+			continue
+		}
 		if r.Conid <= 0 {
 			continue
 		}
 		if r.Exchange == "IDEALPRO" && (r.Description == pair || r.CompanyName == companyName) {
-			conid := strconv.Itoa(r.Conid)
+			conid := strconv.Itoa(int(r.Conid))
 			c.fxConidMu.Lock()
 			c.fxConidCache[cacheKey] = conid
 			c.fxConidMu.Unlock()

@@ -639,6 +639,49 @@ func TestResolveConid_APIFallback(t *testing.T) {
 	}
 }
 
+func TestResolveConid_APIFallback_StringConid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/api/iserver/secdef/search" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+		]`))
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	conid, err := b.resolveConid(t.Context(), "EUR/JPY", "CASH")
+	if err != nil {
+		t.Fatalf("resolveConid string conid error: %v", err)
+	}
+	if conid != "12087799" {
+		t.Errorf("conid = %q; want 12087799", conid)
+	}
+}
+
+func TestResolveConid_APIFallback_SkipsZeroConid(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`[
+			{"conid":null,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"},
+			{"conid":12087799,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+		]`))
+	}))
+	defer srv.Close()
+
+	b := newTestIBKRBroker(srv.URL)
+	conid, err := b.resolveConid(t.Context(), "EUR/JPY", "CASH")
+	if err != nil {
+		t.Fatalf("resolveConid null plus valid conid error: %v", err)
+	}
+	if conid != "12087799" {
+		t.Errorf("conid = %q; want 12087799", conid)
+	}
+}
+
 func TestResolveConidFutures_TrsrvDynamic(t *testing.T) {
 	// "XYZ" is not in the static FuturesConids map, so FUT resolution falls through
 	// to the dynamic /trsrv/futures path. The chain has an expired contract and two
