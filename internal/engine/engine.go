@@ -16,6 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -1165,6 +1166,28 @@ func (e *Engine) runAnalysis(
 		"reasoning_len", len(resp.Reasoning),
 		"reasoning_truncated", len(resp.Reasoning) > len(reasoningPreview),
 	)
+	// Lens selection (issue #509), logged as its own event so
+	// configured-vs-selected divergence is greppable rather than requiring a
+	// regex over analyses.raw_response. A ticker whose analyst systematically
+	// selects something other than its configured strategy — or "none", the
+	// regime-mismatch answer — is a mislabelled watchlist row.
+	//
+	// Emitted only when the analyst actually reported a selection: older
+	// models and truncation-recovered responses leave it empty, and logging
+	// those as divergent=false would poison the very measurement this exists
+	// for. This is the phase-1 evidence that decides whether persisting
+	// selected_strategy is worth a migration.
+	if resp.SelectedStrategy != "" {
+		logger.Info("lens selection",
+			"ticker", ticker,
+			"configured", strategy,
+			"selected", resp.SelectedStrategy,
+			"regime", resp.Regime,
+			"divergent", resp.SelectedStrategy != strategy,
+			"admissible", strings.Join(prompts.Lenses(strategies), ","),
+			"rejected_count", len(resp.RejectedStrategies),
+		)
+	}
 	// Broadcast per-analyst votes so the frontend can render individual cards.
 	{
 		var votes []events.AnalystVotePayload

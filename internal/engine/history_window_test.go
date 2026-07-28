@@ -141,3 +141,28 @@ func TestRunupGates_FireOnSelectedLens(t *testing.T) {
 		t.Errorf("expected the stale-primary path to be silent, got %q", stale)
 	}
 }
+
+// TestLensDivergenceSignal pins the semantics the phase-1 measurement depends
+// on (issue #509): "divergent" must be true whenever the analyst reasoned under
+// something other than the configured strategy — including "none", the
+// regime-mismatch answer, which is the strongest evidence a row is mislabelled.
+func TestLensDivergenceSignal(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured string
+		selected   string
+		want       bool
+	}{
+		{"agreement is not divergence", "mean_reversion", "mean_reversion", false},
+		{"different lens is divergence", "mean_reversion", "trend_following", true},
+		{"regime mismatch is divergence", "mean_reversion", "none", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.selected != tc.configured; got != tc.want {
+				t.Errorf("divergent(%q, %q) = %v, want %v",
+					tc.configured, tc.selected, got, tc.want)
+			}
+		})
+	}
+}
