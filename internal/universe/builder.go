@@ -125,16 +125,26 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	if len(assets) == 0 {
 		return result, errors.New("stock asset master contained no valid symbols")
 	}
+	// Do not spend bulk market-data and taxonomy requests on assets that the
+	// configured universe would reject from the asset-master filters anyway.
+	// The full asset list is still retained for the snapshot audit and member
+	// counts; only the evidence workload is narrowed here.
+	marketSymbols := make([]string, 0, len(symbols))
+	for _, asset := range assets {
+		if b.passesAssetMasterFilters(asset) {
+			marketSymbols = append(marketSymbols, asset.Symbol)
+		}
+	}
 
 	from := startedAt.AddDate(0, 0, -(b.Config.DollarVolumeLookbackDays*2 + 10))
 	var snapshots data.StockSnapshotBatchResult
 	var bars data.DailyBarsBatchResult
 	var snapshotErr, barsErr error
 	fetchSnapshots := func() {
-		snapshots, snapshotErr = b.Snapshots.FetchStockSnapshots(ctx, symbols, b.Config.BatchSize)
+		snapshots, snapshotErr = b.Snapshots.FetchStockSnapshots(ctx, marketSymbols, b.Config.BatchSize)
 	}
 	fetchBars := func() {
-		bars, barsErr = b.Bars.FetchDailyBars(ctx, symbols, from, startedAt, b.Config.BatchSize)
+		bars, barsErr = b.Bars.FetchDailyBars(ctx, marketSymbols, from, startedAt, b.Config.BatchSize)
 	}
 	if b.Config.MaxConcurrency <= 1 {
 		fetchSnapshots()
@@ -167,7 +177,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	if bars.Failures == nil {
 		bars.Failures = make(map[string]error)
 	}
-	for _, symbol := range symbols {
+	for _, symbol := range marketSymbols {
 		if snapshotErr != nil && snapshots.Failures[symbol] == nil {
 			snapshots.Failures[symbol] = snapshotErr
 		}
@@ -175,8 +185,11 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			bars.Failures[symbol] = barsErr
 		}
 	}
-	if !hasCoherentMarketData(
-		symbols, snapshots, bars, b.Config.DollarVolumeLookbackDays, startedAt,
+	// An all-ineligible asset master is still a valid audit snapshot: every
+	// member will be excluded by asset-master filters, so no market evidence is
+	// required or expected in that case.
+	if len(marketSymbols) > 0 && !hasCoherentMarketData(
+		marketSymbols, snapshots, bars, b.Config.DollarVolumeLookbackDays, startedAt,
 	) {
 		return result, errors.New(
 			"market-data refresh produced no symbol with both snapshot and daily-bar evidence",
@@ -191,12 +204,16 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	for _, asset := range assets {
 		assetsBySymbol[asset.Symbol] = asset
 	}
-	fundamentalsRequiredSymbols := make([]string, 0, len(symbols))
+	fundamentalsRequiredSymbols := make([]string, 0, len(marketSymbols))
 	type refreshCandidate struct {
 		symbol   string
 		priority int
 	}
-	refreshCandidates := make([]refreshCandidate, 0, len(symbols))
+	refreshCandidates := make([]refreshCandidate, 0, len(marketSymbols))
+	marketSymbolSet := make(map[string]struct{}, len(marketSymbols))
+	for _, symbol := range marketSymbols {
+		marketSymbolSet[symbol] = struct{}{}
+	}
 	for _, symbol := range symbols {
 		if err := ctx.Err(); err != nil {
 			return result, err
@@ -206,6 +223,12 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			return result, fmt.Errorf("load taxonomy for %s: %w", symbol, lookupErr)
 		}
 		taxonomy[symbol] = observation
+		// Cached taxonomy is retained for every audited asset, including ones
+		// excluded by asset-master filters. Only eligible assets can consume
+		// market evidence or enter the external taxonomy-refresh workload.
+		if _, eligibleForEvidence := marketSymbolSet[symbol]; !eligibleForEvidence {
+			continue
+		}
 		if !b.passesNonFundamentalFilters(
 			assetsBySymbol[symbol], snapshots, bars, lookupAt,
 		) {
@@ -333,6 +356,15 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 	result.MemberCount = len(members)
 	result.TaxonomyRefreshes = refreshes
 	return result, nil
+}
+
+func (b *Builder) passesAssetMasterFilters(asset data.StockAsset) bool {
+	securityType := strings.ToLower(asset.AssetClass)
+	exchange := strings.ToUpper(asset.Exchange)
+	return allowedValue(securityType, b.Config.AllowedSecurityTypes) &&
+		allowedValue(exchange, b.Config.AllowedExchanges) &&
+		(!b.Config.RequireActive || strings.EqualFold(asset.Status, "active")) &&
+		(!b.Config.RequireTradable || asset.Tradable)
 }
 
 func (b *Builder) passesNonFundamentalFilters(

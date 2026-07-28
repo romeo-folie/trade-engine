@@ -27,6 +27,25 @@ type fakeMarketData struct {
 	bars      data.DailyBarsBatchResult
 }
 
+type recordingMarketData struct {
+	snapshotSymbols []string
+	barSymbols      []string
+}
+
+func (r *recordingMarketData) FetchStockSnapshots(
+	_ context.Context, symbols []string, _ int,
+) (data.StockSnapshotBatchResult, error) {
+	r.snapshotSymbols = append([]string(nil), symbols...)
+	return completeMarkets(symbols, 20).snapshots, nil
+}
+
+func (r *recordingMarketData) FetchDailyBars(
+	_ context.Context, symbols []string, _ time.Time, _ time.Time, _ int,
+) (data.DailyBarsBatchResult, error) {
+	r.barSymbols = append([]string(nil), symbols...)
+	return completeMarkets(symbols, 20).bars, nil
+}
+
 func (f fakeMarketData) FetchStockSnapshots(
 	context.Context, []string, int,
 ) (data.StockSnapshotBatchResult, error) {
@@ -148,6 +167,66 @@ func TestRefreshEnumeratesFullAssetMasterAndRecordsPartialFailures(t *testing.T)
 	}
 	if !repo.version.AsOf.Equal(now) || repo.version.AsOf.Before(repo.version.CapturedAt) {
 		t.Fatalf("invalid point-in-time version = %+v", repo.version)
+	}
+}
+
+func TestRefreshNarrowsEvidenceRequestsToAssetMasterEligibleSymbols(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	repo.taxonomy["OTC"] = &store.CompanyTaxonomyObservation{
+		Ticker: "OTC", Industry: "Cached Industry", Sector: "Cached Sector", Status: "known",
+		ObservedAt: now,
+	}
+	market := &recordingMarketData{}
+	builder := Builder{
+		Config: testConfig(),
+		Assets: fakeAssets{assets: []data.StockAsset{
+			{Symbol: "GOOD", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "OTC", Status: "active", AssetClass: "us_equity", Exchange: "OTC", Tradable: true},
+		}},
+		Snapshots: market, Bars: market,
+		Fundamentals: fakeFundamentals{
+			"GOOD": {MarketCapitalization: 500, Industry: "Technology", Provider: "finnhub"},
+		},
+		Repository: repo,
+		Now:        func() time.Time { return now },
+	}
+	if _, err := builder.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if strings.Join(market.snapshotSymbols, ",") != "GOOD" ||
+		strings.Join(market.barSymbols, ",") != "GOOD" {
+		t.Fatalf("evidence requests = snapshots %v bars %v, want only GOOD",
+			market.snapshotSymbols, market.barSymbols)
+	}
+	if len(repo.members) != 2 || repo.members[1].Eligible || repo.members[1].RemovalStage != "exchange" ||
+		repo.members[1].Industry != "Cached Industry" {
+		t.Fatalf("members = %+v, want GOOD eligible and OTC excluded at exchange stage", repo.members)
+	}
+}
+
+func TestRefreshPublishesAllIneligibleSnapshotWithoutEvidenceRequests(t *testing.T) {
+	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	market := &recordingMarketData{}
+	builder := Builder{
+		Config: testConfig(),
+		Assets: fakeAssets{assets: []data.StockAsset{{
+			Symbol: "OTC", Status: "active", AssetClass: "us_equity", Exchange: "OTC", Tradable: true,
+		}}},
+		Snapshots: market, Bars: market, Repository: repo,
+		Now: func() time.Time { return time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC) },
+	}
+	result, err := builder.Refresh(context.Background())
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if result.MemberCount != 1 || len(repo.members) != 1 || repo.members[0].Eligible ||
+		repo.members[0].RemovalStage != "exchange" {
+		t.Fatalf("result/members = %+v / %+v", result, repo.members)
+	}
+	if len(market.snapshotSymbols) != 0 || len(market.barSymbols) != 0 {
+		t.Fatalf("evidence requests = snapshots %v bars %v, want none",
+			market.snapshotSymbols, market.barSymbols)
 	}
 }
 
