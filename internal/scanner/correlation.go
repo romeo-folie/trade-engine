@@ -51,9 +51,10 @@ func dailyReturnPearsonWindow(a, b []data.Candle, lookback, minOverlap int) (flo
 		return 0, false
 	}
 
-	// Build the intersection before applying the lookback. This makes the
-	// window genuinely pairwise: a missing bar in one ticker cannot cause the
-	// other ticker's older, non-overlapping bars to consume the window.
+	// Build the intersection before applying the lookback. A return is accepted
+	// only when both symbols use the same immediately preceding observation;
+	// this prevents a missing middle bar from becoming a misleading multi-day
+	// return.
 	days := make([]time.Time, 0, correlationMinInt(len(pricesA), len(pricesB)))
 	for day := range pricesA {
 		if _, ok := pricesB[day]; ok {
@@ -61,39 +62,51 @@ func dailyReturnPearsonWindow(a, b []data.Candle, lookback, minOverlap int) (flo
 		}
 	}
 	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
-	if len(days) > lookback+1 {
-		days = days[len(days)-(lookback+1):]
-	}
-	if len(days) < minOverlap+1 {
+	if len(days) < 2 {
 		return 0, false
 	}
+	previous := func(prices map[time.Time]float64) map[time.Time]time.Time {
+		ordered := make([]time.Time, 0, len(prices))
+		for day := range prices {
+			ordered = append(ordered, day)
+		}
+		sort.Slice(ordered, func(i, j int) bool { return ordered[i].Before(ordered[j]) })
+		out := make(map[time.Time]time.Time, len(ordered))
+		for i := 1; i < len(ordered); i++ {
+			out[ordered[i]] = ordered[i-1]
+		}
+		return out
+	}
+	priorDatesA, priorDatesB := previous(pricesA), previous(pricesB)
 
 	returnsA := make([]float64, 0, len(days)-1)
 	returnsB := make([]float64, 0, len(days)-1)
-	for i := 1; i < len(days); i++ {
-		prior, current := days[i-1], days[i]
-		previousA, currentA := pricesA[prior], pricesA[current]
-		previousB, currentB := pricesB[prior], pricesB[current]
-		if previousA <= 0 || currentA <= 0 || previousB <= 0 || currentB <= 0 {
+	for _, current := range days {
+		priorA, okA := priorDatesA[current]
+		priorB, okB := priorDatesB[current]
+		if !okA || !okB || !priorA.Equal(priorB) {
 			continue
 		}
-		returnA := currentA/previousA - 1
-		returnB := currentB/previousB - 1
+		prior := priorA
+		priorCloseA, currentCloseA := pricesA[prior], pricesA[current]
+		priorCloseB, currentCloseB := pricesB[prior], pricesB[current]
+		if priorCloseA <= 0 || currentCloseA <= 0 || priorCloseB <= 0 || currentCloseB <= 0 {
+			continue
+		}
+		returnA := currentCloseA/priorCloseA - 1
+		returnB := currentCloseB/priorCloseB - 1
 		if !correlationFinite(returnA) || !correlationFinite(returnB) {
 			continue
 		}
 		returnsA = append(returnsA, returnA)
 		returnsB = append(returnsB, returnB)
 	}
-	if len(returnsA) < minOverlap {
-		return 0, false
-	}
-
-	// The slices are already in date order. Keep only the latest observations
-	// if invalid prices reduced the usable count inside the selected window.
 	if len(returnsA) > lookback {
 		returnsA = returnsA[len(returnsA)-lookback:]
 		returnsB = returnsB[len(returnsB)-lookback:]
+	}
+	if len(returnsA) < minOverlap {
+		return 0, false
 	}
 	return pearson(returnsA, returnsB, minOverlap)
 }

@@ -128,6 +128,14 @@ func TestValidatePromotionCorrelationRequiresScanner(t *testing.T) {
 	}
 }
 
+func TestValidatePromotionCorrelationThresholdEvenWhenDisabled(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.PromotionMaxAbsCorrelation = 0
+	if errs := Validate(cfg); !containsStr(errs, "promotion_max_abs_correlation") {
+		t.Fatalf("expected threshold validation error while disabled, got %v", errs)
+	}
+}
+
 func TestValidateWeeklyLeaderConfig(t *testing.T) {
 	valid := Defaults()
 	valid.Scanner.Enabled = true

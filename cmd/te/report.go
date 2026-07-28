@@ -232,6 +232,16 @@ func runReportScannerFunnel(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("load scanner funnel: %w", err)
 	}
 	printScannerFunnel(funnel, from, to)
+	evidence, err := store.ListScannerPromotionEvidence(ctx, from, to)
+	if err != nil {
+		return fmt.Errorf("load scanner promotion evidence: %w", err)
+	}
+	if len(evidence) > 0 {
+		fmt.Printf("\nPromotion evidence (%d records):\n", len(evidence))
+		for _, item := range evidence {
+			fmt.Printf("- %s %s: %s %s\n", item.StartedAt.Format(time.RFC3339), item.Ticker, item.Stage, item.Evidence)
+		}
+	}
 	return nil
 }
 
@@ -362,10 +372,20 @@ func runReportPerformance(cmd *cobra.Command, _ []string) error {
 		fmt.Println(strings.Repeat("─", 75))
 		for _, r := range modelRows {
 			pnl, wr := "─", "─"
-			if r.AvgPnLPct != nil { pnl = fmt.Sprintf("%+.2f%%", *r.AvgPnLPct) }
-			if r.WinRate != nil    { wr  = fmt.Sprintf("%.1f%%", *r.WinRate*100) }
-			provider := "unknown"; if r.Provider != nil { provider = *r.Provider }
-			model := "unknown"; if r.Model != nil { model = *r.Model }
+			if r.AvgPnLPct != nil {
+				pnl = fmt.Sprintf("%+.2f%%", *r.AvgPnLPct)
+			}
+			if r.WinRate != nil {
+				wr = fmt.Sprintf("%.1f%%", *r.WinRate*100)
+			}
+			provider := "unknown"
+			if r.Provider != nil {
+				provider = *r.Provider
+			}
+			model := "unknown"
+			if r.Model != nil {
+				model = *r.Model
+			}
 			fmt.Printf("%-14s  %-28s  %8d  %10s  %8s\n", provider, model, r.TradeCount, pnl, wr)
 		}
 	}

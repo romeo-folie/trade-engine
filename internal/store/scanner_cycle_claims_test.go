@@ -29,6 +29,21 @@ func TestScannerCycleClaimIsIdempotent(t *testing.T) {
 	if err := store.CompleteScannerCycle(ctx, key, "owner-a", false); err != nil {
 		t.Fatalf("complete claim: %v", err)
 	}
+	if renewed, err := store.RenewScannerCycle(ctx, key, "owner-a", time.Hour); err != nil || renewed {
+		t.Fatalf("completed lease renewal = %v/%v, want false", renewed, err)
+	}
+	expiredKey := key + "-expired"
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(ctx, "DELETE FROM scanner_cycle_claims WHERE run_key=$1", expiredKey)
+	})
+	claimed, err := store.ClaimScannerCycle(ctx, expiredKey, "owner-a", time.Millisecond)
+	if err != nil || !claimed {
+		t.Fatalf("expired-test claim = %v/%v", claimed, err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if renewed, err := store.RenewScannerCycle(ctx, expiredKey, "owner-a", time.Hour); err != nil || renewed {
+		t.Fatalf("expired lease renewal = %v/%v, want false", renewed, err)
+	}
 	third, err := store.ClaimScannerCycle(ctx, key, "owner-b", time.Hour)
 	if err != nil || third {
 		t.Fatalf("completed claim = %v/%v, want false", third, err)

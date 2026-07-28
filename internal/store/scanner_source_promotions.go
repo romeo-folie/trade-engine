@@ -62,7 +62,20 @@ func PromoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, nil)
+}
+
+// PromoteScannerSourcesToWatchlistWithScannerLease fences source-claim
+// consumption and the watchlist write with the scanner cycle lease.
+func PromoteScannerSourcesToWatchlistWithScannerLease(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+	lease ScannerCycleLease,
+) error {
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, false, &lease)
 }
 
 // PromoteScannerSourcesToWatchlistUnlessActive consumes all still-current
@@ -75,7 +88,20 @@ func PromoteScannerSourcesToWatchlistUnlessActive(
 	reason string,
 	at time.Time,
 ) error {
-	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true)
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, nil)
+}
+
+// PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease is the fenced
+// fallback variant that preserves an already-active winner.
+func PromoteScannerSourcesToWatchlistUnlessActiveWithScannerLease(
+	ctx context.Context,
+	item WatchlistItem,
+	claims ScannerSourcePromotionClaims,
+	reason string,
+	at time.Time,
+	lease ScannerCycleLease,
+) error {
+	return promoteScannerSourcesToWatchlist(ctx, item, claims, reason, at, true, &lease)
 }
 
 func promoteScannerSourcesToWatchlist(
@@ -85,6 +111,7 @@ func promoteScannerSourcesToWatchlist(
 	reason string,
 	at time.Time,
 	preserveActive bool,
+	lease *ScannerCycleLease,
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
 		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
@@ -225,6 +252,17 @@ func promoteScannerSourcesToWatchlist(
 		}
 	}
 
+	// Take all potentially blocking source/advisory locks before touching the
+	// lease row. This leaves an expired lease reclaimable while this transaction
+	// waits, then fences the final watchlist write with the current owner.
+	if lease != nil {
+		if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
+			return err
+		}
+		if err := renewScannerCycleTx(ctx, tx, *lease); err != nil {
+			return err
+		}
+	}
 	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
 		if !errors.Is(err, ErrWatchlistActiveItemExists) {
 			return err

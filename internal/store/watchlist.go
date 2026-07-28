@@ -3,8 +3,11 @@ package store
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -53,12 +56,75 @@ func AddWatchlistItem(ctx context.Context, item WatchlistItem) error {
 	return addWatchlistItem(ctx, GetDB(), item, false)
 }
 
+// AddWatchlistItemWithScannerLease fences a scanner promotion and its lease
+// renewal in one transaction.
+func AddWatchlistItemWithScannerLease(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+) error {
+	return addWatchlistItemWithScannerLease(ctx, item, lease, false)
+}
+
 // AddWatchlistItemUnlessActive inserts a watchlist item, or reactivates an
 // inactive/expired item, without replacing a currently active item. It is used
 // after a weekly-leader claim loss, where another worker may have promoted the
 // same ticker between the failed fenced promotion and the ordinary fallback.
 func AddWatchlistItemUnlessActive(ctx context.Context, item WatchlistItem) error {
 	return addWatchlistItem(ctx, GetDB(), item, true)
+}
+
+// AddWatchlistItemUnlessActiveWithScannerLease is the fenced fallback variant.
+func AddWatchlistItemUnlessActiveWithScannerLease(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+) error {
+	return addWatchlistItemWithScannerLease(ctx, item, lease, true)
+}
+
+func addWatchlistItemWithScannerLease(
+	ctx context.Context, item WatchlistItem, lease ScannerCycleLease,
+	preserveActive bool,
+) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := lockScannerWatchlistItem(ctx, tx, item); err != nil {
+		return err
+	}
+	if err := renewScannerCycleTx(ctx, tx, lease); err != nil {
+		return err
+	}
+	if err := addWatchlistItem(ctx, tx, item, preserveActive); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// lockScannerWatchlistItem serializes scanner writes for one ticker and waits
+// for an existing row lock before the cycle lease is renewed. Any contention
+// therefore happens while another worker can still reclaim an expired lease.
+func lockScannerWatchlistItem(ctx context.Context, tx pgx.Tx, item WatchlistItem) error {
+	platform := strings.TrimSpace(item.Platform)
+	if platform == "" {
+		platform = "stock"
+	}
+	ticker := strings.ToUpper(strings.TrimSpace(item.Ticker))
+	if ticker == "" {
+		return fmt.Errorf("watchlist ticker is required")
+	}
+	if _, err := tx.Exec(ctx, `
+		SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`,
+		"scanner-watchlist:"+platform+":"+ticker); err != nil {
+		return err
+	}
+	var id string
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM watchlist WHERE ticker=$1 AND platform=$2 FOR UPDATE`,
+		ticker, platform).Scan(&id)
+	if err != nil && !isNoRows(err) {
+		return err
+	}
+	return nil
 }
 
 type watchlistExecer interface {
@@ -114,7 +180,13 @@ func addWatchlistItem(
 	if tag.RowsAffected() == 0 {
 		if preserveActive {
 			var currentlyActive bool
-			err := GetDB().QueryRow(ctx, `
+			queryer, ok := db.(interface {
+				QueryRow(context.Context, string, ...any) pgx.Row
+			})
+			if !ok {
+				queryer = GetDB()
+			}
+			err := queryer.QueryRow(ctx, `
 				SELECT active AND (expires_at IS NULL OR expires_at > NOW())
 				FROM watchlist
 				WHERE ticker=$1 AND platform=$2

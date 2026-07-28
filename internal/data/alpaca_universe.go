@@ -260,13 +260,16 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 			result.Failures[symbol] = failure
 		}
 		if fetchErr != nil {
-			markSymbolFailures(result.Failures, batch, fetchErr)
-			markSymbolFailures(result.Failures, normalized[end:], fetchErr)
 			if ctx.Err() != nil {
-				markSymbolFailures(result.Failures, normalized[end:], ctx.Err())
+				markSymbolFailures(result.Failures, normalized[start:], ctx.Err())
 				return result, ctx.Err()
 			}
-			continue
+			// The current and all later batches were not successfully
+			// retrieved; preserve that denominator for the universe audit.
+			markSymbolFailures(result.Failures, normalized[start:], fetchErr)
+			return result, &DailyBarsBatchError{
+				Symbols: append([]string(nil), batch...), Err: fetchErr,
+			}
 		}
 		for _, symbol := range batch {
 			if _, failed := batchFailures[symbol]; failed {
@@ -295,8 +298,7 @@ func (c *AlpacaUniverseClient) fetchDailyBarsIsolated(
 		return batchBars, failures, ctx.Err()
 	}
 	if !shouldIsolateInvalidSymbolBatch(fetchErr) {
-		markSymbolFailures(failures, batch, fetchErr)
-		return batchBars, failures, nil
+		return batchBars, failures, fetchErr
 	}
 	if len(batch) == 1 {
 		failures[batch[0]] = fetchErr

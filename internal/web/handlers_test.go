@@ -293,6 +293,21 @@ func TestPortfolioHandlers_NoDB(t *testing.T) {
 	})
 }
 
+func TestScannerPromotionEvidenceRoute_NoDB(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	mux := http.NewServeMux()
+	srv.registerAPIHandlers(mux)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/scanner/promotion-evidence", nil))
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
+	}
+	if !strings.Contains(rec.Body.String(), "database not connected") {
+		t.Fatalf("body = %q, want database error", rec.Body.String())
+	}
+}
+
 // ─── DailyCounters Handler ───────────────────────────────────────────────────
 
 // Without a DB, the counters endpoint should 500 with "database not connected"

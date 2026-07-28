@@ -101,6 +101,40 @@ type ScannerEngineOutcome struct {
 	SignalID     string
 }
 
+type ScannerPromotionEvidence struct {
+	ScannerRunID string
+	Ticker       string
+	StartedAt    time.Time
+	Stage        string
+	Reason       string
+	Evidence     json.RawMessage
+}
+
+func ListScannerPromotionEvidence(ctx context.Context, from, to time.Time) ([]ScannerPromotionEvidence, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT c.scanner_run_id::text, c.ticker, r.started_at,
+		       c.final_stage, COALESCE(c.failure_reason,''), c.promotion_evidence
+		FROM scanner_candidate_snapshots c
+		JOIN scanner_runs r ON r.id=c.scanner_run_id
+		WHERE r.started_at >= $1 AND r.started_at < $2
+		  AND c.promotion_evidence <> '{}'::jsonb
+		ORDER BY r.started_at, c.ticker`, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("list scanner promotion evidence: %w", err)
+	}
+	defer rows.Close()
+	var out []ScannerPromotionEvidence
+	for rows.Next() {
+		var evidence ScannerPromotionEvidence
+		if err := rows.Scan(&evidence.ScannerRunID, &evidence.Ticker, &evidence.StartedAt,
+			&evidence.Stage, &evidence.Reason, &evidence.Evidence); err != nil {
+			return nil, err
+		}
+		out = append(out, evidence)
+	}
+	return out, rows.Err()
+}
+
 func InsertScannerEngineOutcome(ctx context.Context, outcome ScannerEngineOutcome) error {
 	if outcome.ScannerRunID == "" {
 		return nil

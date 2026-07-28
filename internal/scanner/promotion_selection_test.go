@@ -2,12 +2,20 @@ package scanner
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+type emptyDailyBarsProvider struct{}
+
+func (emptyDailyBarsProvider) FetchDailyBars(context.Context, []string, time.Time, time.Time, int) (data.DailyBarsBatchResult, error) {
+	return data.DailyBarsBatchResult{}, nil
+}
 
 func TestSelectPromotionCandidatesDeterministicCaps(t *testing.T) {
 	result := SelectPromotionCandidates([]PromotionCandidate{
@@ -105,6 +113,20 @@ func TestCorrelationModeRequiresDailyBarsProvider(t *testing.T) {
 	scanner := &MarketScanner{Cfg: config.ScannerConfig{PromotionCorrelationEnabled: true}}
 	if err := scanner.runScan(context.Background()); err == nil {
 		t.Fatal("correlation mode accepted a missing daily-bars provider")
+	}
+}
+
+func TestCorrelationModeRequiresDatabase(t *testing.T) {
+	if store.IsConnected() {
+		t.Skip("requires the database to be disconnected")
+	}
+	scanner := &MarketScanner{
+		Cfg:       config.ScannerConfig{PromotionCorrelationEnabled: true},
+		DailyBars: emptyDailyBarsProvider{},
+	}
+	err := scanner.runScan(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "database is unavailable") {
+		t.Fatalf("correlation mode database guard = %v", err)
 	}
 }
 

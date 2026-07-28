@@ -189,7 +189,10 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			snapshots.Failures[symbol] = snapshotErr
 		}
 		if barsErr != nil && bars.Failures[symbol] == nil {
-			bars.Failures[symbol] = barsErr
+			var batchErr *data.DailyBarsBatchError
+			if !errors.As(barsErr, &batchErr) {
+				bars.Failures[symbol] = barsErr
+			}
 		}
 	}
 	// An all-ineligible asset master is still a valid audit snapshot: every

@@ -60,6 +60,34 @@ func TestDailyReturnPearsonRequires30OverlappingReturns(t *testing.T) {
 	}
 }
 
+func TestDailyReturnPearsonSkipsUnalignedMiddleBars(t *testing.T) {
+	returns := make([]float64, correlationMinOverlap)
+	for i := range returns {
+		returns[i] = .01
+		if i%2 == 0 {
+			returns[i] = -.005
+		}
+	}
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	a := correlationTestCandlesFromReturns("A", start, returns)
+	b := correlationTestCandlesFromReturns("B", start, returns)
+	// Remove one middle bar from B. The two neighboring observations must not
+	// be turned into a single multi-day return.
+	b = append(b[:16], b[17:]...)
+	if _, ok := dailyReturnPearson(a, b); ok {
+		t.Fatal("expected unaligned middle bar to reduce usable overlap below the minimum")
+	}
+}
+
+func TestDailyReturnPearsonFailsClosedWithoutOverlappingDays(t *testing.T) {
+	start := time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC)
+	a := correlationTestCandlesFromReturns("A", start, []float64{0.01, -0.005})
+	b := correlationTestCandlesFromReturns("B", start.AddDate(0, 0, 10), []float64{0.01, -0.005})
+	if _, ok := dailyReturnPearson(a, b); ok {
+		t.Fatal("expected no overlapping days to fail closed")
+	}
+}
+
 func TestDailyReturnCorrelationIsOrderIndependentAndHandlesDuplicateDays(t *testing.T) {
 	returns := make([]float64, 35)
 	for i := range returns {

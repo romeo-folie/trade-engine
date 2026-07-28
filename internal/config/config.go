@@ -2068,13 +2068,13 @@ func Validate(cfg *Config) []string {
 		errs = append(errs,
 			"scanner.max_promotions_per_industry requires scanner.universe.enabled=true")
 	}
+	if cfg.Scanner.PromotionMaxAbsCorrelation <= 0 || cfg.Scanner.PromotionMaxAbsCorrelation > 1 ||
+		math.IsNaN(cfg.Scanner.PromotionMaxAbsCorrelation) || math.IsInf(cfg.Scanner.PromotionMaxAbsCorrelation, 0) {
+		errs = append(errs, "scanner.promotion_max_abs_correlation must be in (0,1]")
+	}
 	if cfg.Scanner.PromotionCorrelationEnabled {
 		if !cfg.Scanner.Enabled {
 			errs = append(errs, "scanner.promotion_correlation_enabled requires scanner.enabled=true")
-		}
-		if cfg.Scanner.PromotionMaxAbsCorrelation <= 0 || cfg.Scanner.PromotionMaxAbsCorrelation > 1 ||
-			math.IsNaN(cfg.Scanner.PromotionMaxAbsCorrelation) || math.IsInf(cfg.Scanner.PromotionMaxAbsCorrelation, 0) {
-			errs = append(errs, "scanner.promotion_max_abs_correlation must be in (0,1]")
 		}
 		if cfg.Scanner.PromotionCorrelationLookbackDays <= 0 {
 			errs = append(errs, "scanner.promotion_correlation_lookback_days must be > 0")

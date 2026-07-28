@@ -419,14 +419,37 @@ func (r *scanRecorder) promotionRejected(ticker, reason string) {
 func (r *scanRecorder) promotionRejectedWithEvidence(ticker string, rejection PromotionRejection) {
 	r.promotionRejected(ticker, rejection.Reason)
 	if snapshot := r.candidates[ticker]; snapshot != nil {
-		evidence, err := json.Marshal(map[string]any{
+		r.mergePromotionEvidence(snapshot, map[string]any{
 			"reason":               rejection.Reason,
 			"conflict_key":         rejection.ConflictKey,
 			"conflict_correlation": rejection.ConflictCorrelation,
 		})
-		if err == nil {
-			snapshot.PromotionEvidence = evidence
-		}
+	}
+}
+
+func (r *scanRecorder) promotionCorrelationUnavailable(
+	ticker string, unavailable map[string]string,
+) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"correlation_unavailable": unavailable,
+		})
+	}
+}
+
+func (r *scanRecorder) mergePromotionEvidence(
+	snapshot *store.ScannerCandidateSnapshot, additions map[string]any,
+) {
+	evidence := make(map[string]any)
+	if len(snapshot.PromotionEvidence) > 0 {
+		_ = json.Unmarshal(snapshot.PromotionEvidence, &evidence)
+	}
+	for key, value := range additions {
+		evidence[key] = value
+	}
+	encoded, err := json.Marshal(evidence)
+	if err == nil {
+		snapshot.PromotionEvidence = encoded
 	}
 }
 
