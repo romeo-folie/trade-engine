@@ -196,7 +196,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		)
 	}
 
-	taxonomy := make(map[string]*store.CompanyTaxonomyObservation, len(marketSymbols))
+	taxonomy := make(map[string]*store.CompanyTaxonomyObservation, len(symbols))
 	taxonomyErrors := make(map[string]error)
 	lookupAt := b.now()
 	maxTaxonomyAge := time.Duration(b.Config.TaxonomyMaxAgeHours) * time.Hour
@@ -210,7 +210,11 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		priority int
 	}
 	refreshCandidates := make([]refreshCandidate, 0, len(marketSymbols))
+	marketSymbolSet := make(map[string]struct{}, len(marketSymbols))
 	for _, symbol := range marketSymbols {
+		marketSymbolSet[symbol] = struct{}{}
+	}
+	for _, symbol := range symbols {
 		if err := ctx.Err(); err != nil {
 			return result, err
 		}
@@ -219,6 +223,12 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			return result, fmt.Errorf("load taxonomy for %s: %w", symbol, lookupErr)
 		}
 		taxonomy[symbol] = observation
+		// Cached taxonomy is retained for every audited asset, including ones
+		// excluded by asset-master filters. Only eligible assets can consume
+		// market evidence or enter the external taxonomy-refresh workload.
+		if _, eligibleForEvidence := marketSymbolSet[symbol]; !eligibleForEvidence {
+			continue
+		}
 		if !b.passesNonFundamentalFilters(
 			assetsBySymbol[symbol], snapshots, bars, lookupAt,
 		) {

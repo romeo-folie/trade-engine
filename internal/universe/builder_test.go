@@ -173,6 +173,10 @@ func TestRefreshEnumeratesFullAssetMasterAndRecordsPartialFailures(t *testing.T)
 func TestRefreshNarrowsEvidenceRequestsToAssetMasterEligibleSymbols(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	repo.taxonomy["OTC"] = &store.CompanyTaxonomyObservation{
+		Ticker: "OTC", Industry: "Cached Industry", Sector: "Cached Sector", Status: "known",
+		ObservedAt: now,
+	}
 	market := &recordingMarketData{}
 	builder := Builder{
 		Config: testConfig(),
@@ -195,7 +199,8 @@ func TestRefreshNarrowsEvidenceRequestsToAssetMasterEligibleSymbols(t *testing.T
 		t.Fatalf("evidence requests = snapshots %v bars %v, want only GOOD",
 			market.snapshotSymbols, market.barSymbols)
 	}
-	if len(repo.members) != 2 || repo.members[1].Eligible || repo.members[1].RemovalStage != "exchange" {
+	if len(repo.members) != 2 || repo.members[1].Eligible || repo.members[1].RemovalStage != "exchange" ||
+		repo.members[1].Industry != "Cached Industry" {
 		t.Fatalf("members = %+v, want GOOD eligible and OTC excluded at exchange stage", repo.members)
 	}
 }
