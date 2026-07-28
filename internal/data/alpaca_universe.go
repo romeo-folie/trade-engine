@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"sort"
 	"strings"
@@ -149,36 +150,71 @@ func (c *AlpacaUniverseClient) FetchStockSnapshots(
 		}
 		end := min(start+batchSize, len(normalized))
 		batch := normalized[start:end]
-		params := url.Values{}
-		params.Set("symbols", strings.Join(batch, ","))
-		params.Set("feed", "iex")
-		resp, fetchErr := c.client.get(ctx, "/v2/stocks/snapshots", params)
+		snapshots, failures, fetchErr := c.fetchStockSnapshotsBatch(ctx, batch)
+		for symbol, snapshot := range snapshots {
+			result.Snapshots[symbol] = snapshot
+		}
+		for symbol, failure := range failures {
+			result.Failures[symbol] = failure
+		}
 		if fetchErr != nil {
 			markSymbolFailures(result.Failures, batch, fetchErr)
-			if ctx.Err() != nil {
-				markSymbolFailures(result.Failures, normalized[end:], ctx.Err())
-				return result, ctx.Err()
-			}
-			continue
-		}
-		var payload map[string]alpacaSnapshot
-		decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
-		resp.Body.Close()
-		if decodeErr != nil {
-			markSymbolFailures(result.Failures, batch, fmt.Errorf("decode alpaca snapshots: %w", decodeErr))
-			continue
-		}
-		observedAt := c.now().UTC()
-		for _, symbol := range batch {
-			raw, ok := snapshotForSymbol(payload, symbol)
-			if !ok {
-				result.Failures[symbol] = errAlpacaSymbolMissing
-				continue
-			}
-			result.Snapshots[symbol] = stockSnapshotEvidence(symbol, raw, observedAt)
+			markSymbolFailures(result.Failures, normalized[end:], fetchErr)
+			return result, fetchErr
 		}
 	}
 	return result, nil
+}
+
+func (c *AlpacaUniverseClient) fetchStockSnapshotsBatch(
+	ctx context.Context, batch []string,
+) (map[string]StockSnapshotEvidence, map[string]error, error) {
+	snapshots := make(map[string]StockSnapshotEvidence)
+	failures := make(map[string]error)
+	params := url.Values{}
+	params.Set("symbols", strings.Join(batch, ","))
+	params.Set("feed", "iex")
+	resp, fetchErr := c.client.get(ctx, "/v2/stocks/snapshots", params)
+	if fetchErr != nil {
+		if ctx.Err() != nil {
+			return snapshots, failures, ctx.Err()
+		}
+		if shouldIsolateInvalidSymbolBatch(fetchErr) && len(batch) > 1 {
+			left, right := splitSymbolBatch(batch)
+			leftSnapshots, leftFailures, err := c.fetchStockSnapshotsBatch(ctx, left)
+			if err != nil {
+				return snapshots, failures, err
+			}
+			rightSnapshots, rightFailures, err := c.fetchStockSnapshotsBatch(ctx, right)
+			if err != nil {
+				return snapshots, failures, err
+			}
+			mergeSnapshots(snapshots, leftSnapshots)
+			mergeSnapshots(snapshots, rightSnapshots)
+			mergeFailures(failures, leftFailures)
+			mergeFailures(failures, rightFailures)
+			return snapshots, failures, nil
+		}
+		markSymbolFailures(failures, batch, fetchErr)
+		return snapshots, failures, nil
+	}
+	var payload map[string]alpacaSnapshot
+	decodeErr := json.NewDecoder(resp.Body).Decode(&payload)
+	resp.Body.Close()
+	if decodeErr != nil {
+		markSymbolFailures(failures, batch, fmt.Errorf("decode alpaca snapshots: %w", decodeErr))
+		return snapshots, failures, nil
+	}
+	observedAt := c.now().UTC()
+	for _, symbol := range batch {
+		raw, ok := snapshotForSymbol(payload, symbol)
+		if !ok {
+			failures[symbol] = errAlpacaSymbolMissing
+			continue
+		}
+		snapshots[symbol] = stockSnapshotEvidence(symbol, raw, observedAt)
+	}
+	return snapshots, failures, nil
 }
 
 // FetchDailyBars retrieves split-adjusted IEX daily bars using Alpaca's
@@ -211,9 +247,16 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 		}
 		end := min(start+batchSize, len(normalized))
 		batch := normalized[start:end]
-		batchBars, fetchErr := c.fetchDailyBarsBatch(ctx, batch, from, to)
+		batchBars, batchFailures, fetchErr := c.fetchDailyBarsIsolated(ctx, batch, from, to)
+		for symbol, bars := range batchBars {
+			result.Bars[symbol] = bars
+		}
+		for symbol, failure := range batchFailures {
+			result.Failures[symbol] = failure
+		}
 		if fetchErr != nil {
 			markSymbolFailures(result.Failures, batch, fetchErr)
+			markSymbolFailures(result.Failures, normalized[end:], fetchErr)
 			if ctx.Err() != nil {
 				markSymbolFailures(result.Failures, normalized[end:], ctx.Err())
 				return result, ctx.Err()
@@ -221,6 +264,9 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 			continue
 		}
 		for _, symbol := range batch {
+			if _, failed := batchFailures[symbol]; failed {
+				continue
+			}
 			bars := batchBars[symbol]
 			if len(bars) == 0 {
 				result.Failures[symbol] = errAlpacaSymbolMissing
@@ -230,6 +276,42 @@ func (c *AlpacaUniverseClient) FetchDailyBars(
 		}
 	}
 	return result, nil
+}
+
+func (c *AlpacaUniverseClient) fetchDailyBarsIsolated(
+	ctx context.Context, batch []string, from, to time.Time,
+) (map[string][]Candle, map[string]error, error) {
+	failures := make(map[string]error)
+	batchBars, fetchErr := c.fetchDailyBarsBatch(ctx, batch, from, to)
+	if fetchErr == nil {
+		return batchBars, failures, nil
+	}
+	if ctx.Err() != nil {
+		return batchBars, failures, ctx.Err()
+	}
+	if !shouldIsolateInvalidSymbolBatch(fetchErr) {
+		markSymbolFailures(failures, batch, fetchErr)
+		return batchBars, failures, nil
+	}
+	if len(batch) == 1 {
+		failures[batch[0]] = fetchErr
+		return batchBars, failures, nil
+	}
+	left, right := splitSymbolBatch(batch)
+	leftBars, leftFailures, err := c.fetchDailyBarsIsolated(ctx, left, from, to)
+	if err != nil {
+		return batchBars, failures, err
+	}
+	rightBars, rightFailures, err := c.fetchDailyBarsIsolated(ctx, right, from, to)
+	if err != nil {
+		return batchBars, failures, err
+	}
+	if leftBars == nil {
+		leftBars = make(map[string][]Candle)
+	}
+	mergeBars(leftBars, rightBars)
+	mergeFailures(leftFailures, rightFailures)
+	return leftBars, leftFailures, nil
 }
 
 func (c *AlpacaUniverseClient) fetchDailyBarsBatch(
@@ -316,6 +398,45 @@ func markSymbolFailures(failures map[string]error, symbols []string, err error) 
 		if _, alreadySet := failures[symbol]; !alreadySet {
 			failures[symbol] = err
 		}
+	}
+}
+
+func shouldIsolateInvalidSymbolBatch(err error) bool {
+	// Alpaca rejects an entire bulk request when any member is malformed. Only
+	// its explicit client-side invalid-symbol responses are safe to bisect;
+	// auth, rate-limit, and transient provider failures must remain batch errors.
+	var apiErr *httpError
+	if !errors.As(err, &apiErr) || (apiErr.status != http.StatusBadRequest && apiErr.status != http.StatusUnprocessableEntity) {
+		return false
+	}
+	return strings.Contains(strings.ToLower(apiErr.msg), "invalid symbol")
+}
+
+func splitSymbolBatch(batch []string) ([]string, []string) {
+	mid := len(batch) / 2
+	return batch[:mid], batch[mid:]
+}
+
+func mergeSnapshots(dst, src map[string]StockSnapshotEvidence) {
+	for symbol, snapshot := range src {
+		dst[symbol] = snapshot
+	}
+}
+
+func mergeFailures(dst, src map[string]error) {
+	for symbol, failure := range src {
+		if _, exists := dst[symbol]; !exists {
+			dst[symbol] = failure
+		}
+	}
+}
+
+func mergeBars(dst, src map[string][]Candle) {
+	if dst == nil {
+		return
+	}
+	for symbol, bars := range src {
+		dst[symbol] = bars
 	}
 }
 
