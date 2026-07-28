@@ -144,6 +144,43 @@ func TestAlpacaUniverseSnapshotsCancellationMarksAllSymbols(t *testing.T) {
 	}
 }
 
+func TestAlpacaUniverseSnapshotsIsolatesInvalidSymbolFromBatch(t *testing.T) {
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		symbols := r.URL.Query().Get("symbols")
+		requests = append(requests, symbols)
+		if strings.Contains(symbols, "BAD") {
+			http.Error(w, `{"message":"invalid symbol: BAD"}`, http.StatusBadRequest)
+			return
+		}
+		payload := make(map[string]alpacaSnapshot)
+		for _, symbol := range strings.Split(symbols, ",") {
+			payload[symbol] = alpacaSnapshot{DailyBar: &alpacaBar{
+				Timestamp: "2026-07-24T04:00:00Z", Close: 100, Volume: 500,
+			}}
+		}
+		_ = json.NewEncoder(w).Encode(payload)
+	}))
+	defer srv.Close()
+
+	got, err := newTestAlpacaUniverseClient(srv.URL).FetchStockSnapshots(
+		context.Background(), []string{"C", "BAD", "A"}, 3,
+	)
+	if err != nil {
+		t.Fatalf("FetchStockSnapshots: %v", err)
+	}
+	if len(got.Snapshots) != 2 || got.Snapshots["A"].DailyBar == nil ||
+		got.Snapshots["C"].DailyBar == nil {
+		t.Fatalf("snapshots = %+v, want valid symbols preserved", got.Snapshots)
+	}
+	if len(got.Failures) != 1 || got.Failures["BAD"] == nil {
+		t.Fatalf("failures = %+v, want only BAD", got.Failures)
+	}
+	if len(requests) < 4 || requests[0] != "A,BAD,C" {
+		t.Fatalf("requests = %v, want initial mixed batch followed by isolation", requests)
+	}
+}
+
 func TestAlpacaUniverseDailyBarsPaginationBatchBoundAndDedupe(t *testing.T) {
 	var mu sync.Mutex
 	requests := make([]string, 0, 3)
@@ -241,5 +278,62 @@ func TestAlpacaUniverseDailyBarsPartialBatchFailure(t *testing.T) {
 	}
 	if len(got.Bars) != 2 || got.Failures["C"] == nil {
 		t.Fatalf("partial result = %+v", got)
+	}
+}
+
+func TestAlpacaUniverseDailyBarsCancellationMarksCurrentBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		cancel()
+		http.Error(w, "request canceled", http.StatusRequestTimeout)
+	}))
+	defer srv.Close()
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC)
+	got, err := newTestAlpacaUniverseClient(srv.URL).FetchDailyBars(
+		ctx, []string{"B", "A"}, from, to, 2,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context canceled", err)
+	}
+	if !errors.Is(got.Failures["A"], context.Canceled) ||
+		!errors.Is(got.Failures["B"], context.Canceled) {
+		t.Fatalf("failures = %+v, want every symbol canceled", got.Failures)
+	}
+}
+
+func TestAlpacaUniverseDailyBarsIsolatesInvalidSymbolFromBatch(t *testing.T) {
+	var requests []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		symbols := r.URL.Query().Get("symbols")
+		requests = append(requests, symbols)
+		if strings.Contains(symbols, "BAD") {
+			http.Error(w, `{"message":"invalid symbol: BAD"}`, http.StatusBadRequest)
+			return
+		}
+		bars := make(map[string][]alpacaBar)
+		for _, symbol := range strings.Split(symbols, ",") {
+			bars[symbol] = []alpacaBar{{Timestamp: "2026-07-24T04:00:00Z", Close: 10}}
+		}
+		_ = json.NewEncoder(w).Encode(alpacaBulkBarsResponse{Bars: bars})
+	}))
+	defer srv.Close()
+
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC)
+	got, err := newTestAlpacaUniverseClient(srv.URL).FetchDailyBars(
+		context.Background(), []string{"C", "BAD", "A"}, from, to, 3,
+	)
+	if err != nil {
+		t.Fatalf("FetchDailyBars: %v", err)
+	}
+	if len(got.Bars) != 2 || len(got.Bars["A"]) != 1 || len(got.Bars["C"]) != 1 {
+		t.Fatalf("bars = %+v, want valid symbols preserved", got.Bars)
+	}
+	if len(got.Failures) != 1 || got.Failures["BAD"] == nil {
+		t.Fatalf("failures = %+v, want only BAD", got.Failures)
+	}
+	if len(requests) < 4 || requests[0] != "A,BAD,C" {
+		t.Fatalf("requests = %v, want initial mixed batch followed by isolation", requests)
 	}
 }
