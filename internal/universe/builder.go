@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -58,13 +59,14 @@ func (StoreRepository) InsertTaxonomy(
 }
 
 type Builder struct {
-	Config       config.UniverseConfig
-	Assets       data.AssetUniverseProvider
-	Snapshots    data.BulkStockSnapshotProvider
-	Bars         data.BulkDailyBarsProvider
-	Fundamentals FundamentalsProvider
-	Repository   Repository
-	Now          func() time.Time
+	Config               config.UniverseConfig
+	Assets               data.AssetUniverseProvider
+	Snapshots            data.BulkStockSnapshotProvider
+	Bars                 data.BulkDailyBarsProvider
+	Fundamentals         FundamentalsProvider
+	Repository           Repository
+	Now                  func() time.Time
+	excludedNamePatterns []*regexp.Regexp
 }
 
 type RefreshResult struct {
@@ -87,6 +89,11 @@ type fundamentalsEvidence struct {
 // argument: calling live providers to fill a past date would introduce
 // lookahead. Historical callers must select an already-recorded version.
 func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error) {
+	patterns, err := compileExcludedNamePatterns(b.Config.ExcludedNamePatterns)
+	if err != nil {
+		return result, err
+	}
+	b.excludedNamePatterns = patterns
 	if err := b.ready(); err != nil {
 		return result, err
 	}
@@ -363,6 +370,7 @@ func (b *Builder) passesAssetMasterFilters(asset data.StockAsset) bool {
 	exchange := strings.ToUpper(asset.Exchange)
 	return allowedValue(securityType, b.Config.AllowedSecurityTypes) &&
 		allowedValue(exchange, b.Config.AllowedExchanges) &&
+		!matchesExcludedAssetName(asset.Name, b.excludedNamePatterns) &&
 		(!b.Config.RequireActive || strings.EqualFold(asset.Status, "active")) &&
 		(!b.Config.RequireTradable || asset.Tradable)
 }
@@ -377,6 +385,7 @@ func (b *Builder) passesNonFundamentalFilters(
 	exchange := strings.ToUpper(asset.Exchange)
 	if !allowedValue(securityType, b.Config.AllowedSecurityTypes) ||
 		!allowedValue(exchange, b.Config.AllowedExchanges) ||
+		matchesExcludedAssetName(asset.Name, b.excludedNamePatterns) ||
 		(b.Config.RequireActive && !strings.EqualFold(asset.Status, "active")) ||
 		(b.Config.RequireTradable && !asset.Tradable) {
 		return false
@@ -396,6 +405,30 @@ func (b *Builder) passesNonFundamentalFilters(
 		return false
 	}
 	return true
+}
+
+func compileExcludedNamePatterns(patterns []string) ([]*regexp.Regexp, error) {
+	compiled := make([]*regexp.Regexp, 0, len(patterns))
+	for _, pattern := range patterns {
+		if strings.TrimSpace(pattern) == "" {
+			return nil, errors.New("scanner.universe.excluded_name_patterns must not contain blank values")
+		}
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("invalid scanner.universe.excluded_name_patterns pattern %q: %w", pattern, err)
+		}
+		compiled = append(compiled, re)
+	}
+	return compiled, nil
+}
+
+func matchesExcludedAssetName(name string, patterns []*regexp.Regexp) bool {
+	for _, pattern := range patterns {
+		if pattern.MatchString(name) {
+			return true
+		}
+	}
+	return false
 }
 
 func (b *Builder) evaluate(
@@ -480,6 +513,8 @@ func (b *Builder) evaluate(
 		member.RemovalStage = "security_type"
 	case !allowedValue(member.Exchange, b.Config.AllowedExchanges):
 		member.RemovalStage = "exchange"
+	case matchesExcludedAssetName(asset.Name, b.excludedNamePatterns):
+		member.RemovalStage = "asset_name"
 	case b.Config.RequireActive && !strings.EqualFold(asset.Status, "active"):
 		member.RemovalStage = "active"
 	case b.Config.RequireTradable && !asset.Tradable:

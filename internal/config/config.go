@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1296,6 +1297,7 @@ type UniverseConfig struct {
 	DollarVolumeLookbackDays int      `yaml:"dollar_volume_lookback_days"`
 	AllowedSecurityTypes     []string `yaml:"allowed_security_types"`
 	AllowedExchanges         []string `yaml:"allowed_exchanges"`
+	ExcludedNamePatterns     []string `yaml:"excluded_name_patterns"`
 	MaxSpreadBPS             float64  `yaml:"max_spread_bps"`
 	RequireActive            bool     `yaml:"require_active"`
 	RequireTradable          bool     `yaml:"require_tradable"`
@@ -2105,6 +2107,15 @@ func Validate(cfg *Config) []string {
 					errs = append(errs, "scanner.universe.allowed_exchanges must not contain blank values")
 					break
 				}
+			}
+		}
+		for _, pattern := range universe.ExcludedNamePatterns {
+			if strings.TrimSpace(pattern) == "" {
+				errs = append(errs, "scanner.universe.excluded_name_patterns must not contain blank values")
+				break
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				errs = append(errs, fmt.Sprintf("scanner.universe.excluded_name_patterns contains invalid pattern %q: %v", pattern, err))
 			}
 		}
 		if universe.MaxSpreadBPS < 0 {

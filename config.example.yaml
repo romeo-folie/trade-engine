@@ -870,6 +870,7 @@ scanner:
     dollar_volume_lookback_days: 20        # Completed sessions used for median dollar volume
     allowed_security_types: [us_equity]     # Alpaca's reliable asset class; narrower types require a richer asset-master provider
     allowed_exchanges: [NYSE, NASDAQ, AMEX]
+    excluded_name_patterns: ['(?i)\bwarrants?\b', '(?i)\brights?\b', '(?i)\bunits?(?:\s*(?:[,(]|$))', '(?i)\bnotes?\s+due\b', '(?i)\betns?\b', '(?i)\bdebentures?\b', '(?i)\bpreferred\s+(?:stock|shares?)(?:,\s*series\b.*)?\s*$', '(?i)\bpreference\s+shares?(?:,\s*series\b.*)?\s*$'] # Exclude non-common instruments while retaining ETFs/common stock
     max_spread_bps: 0.0                    # Maximum quoted spread in basis points; 0 disables this ceiling
     require_active: true                   # Fail closed when the provider marks a security inactive
     require_tradable: true                 # Fail closed when the broker marks a security untradable
