@@ -17,10 +17,23 @@ the scanner candidate snapshot. Ticker keys and industry labels are normalized
 before selection, and the original candidate index is carried through the
 selector so duplicate aliases cannot misattribute the rejection.
 
-This slice deliberately does not enable pairwise-correlation limits or regime
-routing. Those require their own point-in-time price/evidence and immutable
-regime-snapshot contracts; they remain follow-up work in Epic #482 rather than
-being exposed as inert configuration here.
+Correlation-aware promotion is an additive opt-in. With
+`scanner.promotion_correlation_enabled: true`, the scanner fetches up to 60
+completed daily bars, requires 30 overlapping returns, rejects same-ticker
+open-position exposure first, and then applies an absolute Pearson threshold
+against active watchlist/open-position exposure and already-selected
+candidates. Missing bars fail open and every rejection retains its conflict
+ticker in the scanner snapshot. The default remains disabled.
+
+Regime routing is intentionally separate: its immutable observation-only
+contract is documented in `docs/regime-router.md` and is referenced by a
+scanner run when enabled.
+
+Weekly-leader and potent-industry candidates use source-specific TTLs
+(`ttl_days`, defaults 10 and 5) so a slower after-close observation is not
+expired by the regular intraday default. Regular scanner cycles also acquire a
+durable interval lease, making restarts and concurrent engine processes
+idempotent.
 
 Validation currently covers the selector, scanner-to-recorder flow, and all
 existing package/store tests. A live `MarketScanner.runScan` test against a

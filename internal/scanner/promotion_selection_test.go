@@ -85,6 +85,20 @@ func TestSelectPromotionCandidatesCorrelationEitherDirection(t *testing.T) {
 	}
 }
 
+func TestSelectPromotionCandidatesRejectsCorrelatedExposure(t *testing.T) {
+	result := SelectPromotionCandidates([]PromotionCandidate{
+		{Key: "NEW", Score: .9, ExposureCorrelations: map[string]float64{"held": .91}},
+		{Key: "OTHER", Score: .8, ExposureCorrelations: map[string]float64{"held": .20}},
+	}, 0, 0, .85)
+	if len(result.Selected) != 1 || result.Selected[0].Key != "OTHER" {
+		t.Fatalf("selected = %+v, want only uncorrelated candidate", result.Selected)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != "exposure_correlation_cap" ||
+		result.Rejected[0].ConflictKey != "HELD" {
+		t.Fatalf("rejected = %+v, want held exposure attribution", result.Rejected)
+	}
+}
+
 func TestSelectPromotionCandidatesDuplicateAndUnknownIndustry(t *testing.T) {
 	result := SelectPromotionCandidates([]PromotionCandidate{
 		{Key: " A ", Score: 1},

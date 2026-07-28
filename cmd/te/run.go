@@ -865,6 +865,7 @@ Modes:
 				scanAnalyzer := analysis.NewAnalyzer(cfg.Models, eng.Bus())
 				mscanner := &scanner.MarketScanner{
 					AlpacaClient:                 alpacaClient,
+					DailyBars:                    data.NewAlpacaUniverseClient(alpacaClient, cfg.Markets.Stocks.BaseURL),
 					Analyzer:                     scanAnalyzer,
 					News:                         newsProvider,
 					Bus:                          eng.Bus(),

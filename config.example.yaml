@@ -862,6 +862,10 @@ scanner:
   top_movers: 20               # Top gainers+losers fetched per scan
   top_actives: 20              # Most-active-by-volume fetched per scan
   max_promotions_per_industry: 0 # Optional per-industry promotion cap; 0 disables
+  promotion_correlation_enabled: false # Additive exposure/correlation selector; off preserves legacy behavior
+  promotion_max_abs_correlation: 0.85    # Absolute daily-return Pearson ceiling
+  promotion_correlation_lookback_days: 60
+  promotion_correlation_min_overlap: 30
   universe:
     enabled: false                         # Full-market point-in-time universe; off preserves movers/actives-only discovery
     provider: alpaca                       # Provider adapter used for bulk membership and eligibility evidence
@@ -898,6 +902,7 @@ scanner:
     min_feature_coverage: 0.90              # Missing components never silently become neutral scores
     batch_size: 200                        # Maximum symbols requested per daily-bars provider batch
     run_lease_minutes: 60                  # Reclaim stale run or candidate-promotion claims after this lease
+    ttl_days: 10                            # Slower weekly evidence remains available longer than intraday picks
   potent_industry:
     enabled: false                         # Full-universe industry-rotation lens; default off
     promote_candidates: false              # Add top members to normal scanner scoring; keep false for observation only
@@ -934,6 +939,7 @@ scanner:
     max_members_per_group: 3               # Deterministic member-selection cap for each qualified group
     batch_size: 200                        # Maximum symbols per historical-bars provider request
     run_lease_minutes: 60                  # Reclaim failed or expired scheduled-run claims
+    ttl_days: 5                             # Industry rotation candidates retain a multi-session horizon
   premarket_episodic:
     enabled: false                         # Pre-open episodic-gap observations; default off
     promote_candidates: false              # Qualified gaps enter the normal LLM/watchlist gate only

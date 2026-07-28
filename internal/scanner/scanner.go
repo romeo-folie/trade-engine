@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strings"
 	"time"
 
@@ -57,14 +58,16 @@ type Notifier interface {
 // MarketScanner discovers swing-trade candidates and manages a time-bounded
 // watchlist of scanner-sourced tickers.
 type MarketScanner struct {
-	AlpacaClient *data.AlpacaClient
-	Analyzer     *analysis.Analyzer
-	News         data.NewsProvider
-	Fundamentals CompanyFundamentalsProvider
-	Notifier     Notifier // optional — nil disables Telegram notifications
-	Bus          bus
-	Cfg          config.ScannerConfig
-	Now          func() time.Time // injectable for tests; defaults to time.Now
+	AlpacaClient    *data.AlpacaClient
+	Analyzer        *analysis.Analyzer
+	News            data.NewsProvider
+	Fundamentals    CompanyFundamentalsProvider
+	DailyBars       data.BulkDailyBarsProvider // optional; required only for correlation-aware promotion
+	Notifier        Notifier                   // optional — nil disables Telegram notifications
+	Bus             bus
+	Cfg             config.ScannerConfig
+	Now             func() time.Time // injectable for tests; defaults to time.Now
+	CycleOwnerToken string           // optional stable process token for regular-scan leases
 	// PullbackUniverseEnabled applies the research universe before LLM scoring:
 	// >$100M market cap, >$1M dollar volume, >=30% on a 1/3/6-month horizon,
 	// then retain the top momentum quartile.
@@ -122,6 +125,33 @@ func (s *MarketScanner) Run(ctx context.Context) error {
 // runScan executes one full scan cycle.
 func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	start := s.now()
+	cycleKey := ""
+	cycleOwner := s.CycleOwnerToken
+	if cycleOwner == "" {
+		cycleOwner = fmt.Sprintf("pid-%d", os.Getpid())
+	}
+	interval := time.Duration(s.Cfg.ScanIntervalHours) * time.Hour
+	if interval <= 0 {
+		interval = 2 * time.Hour
+	}
+	if store.IsConnected() {
+		cycleKey = "regular:" + start.UTC().Truncate(interval).Format(time.RFC3339)
+		claimed, claimErr := store.ClaimScannerCycle(ctx, cycleKey, cycleOwner, interval)
+		if claimErr != nil {
+			return fmt.Errorf("claim scanner cycle: %w", claimErr)
+		}
+		if !claimed {
+			slog.Info("scanner: cycle already claimed", "run_key", cycleKey)
+			return nil
+		}
+		defer func() {
+			completeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			if err := store.CompleteScannerCycle(completeCtx, cycleKey, cycleOwner, scanErr != nil); err != nil {
+				slog.Warn("scanner: complete cycle lease", "run_key", cycleKey, "err", err)
+			}
+		}()
+	}
 	weeklyCandidates, err := s.weeklyLeaderCandidates(ctx)
 	if err != nil {
 		return fmt.Errorf("load weekly leader candidates: %w", err)
@@ -286,6 +316,16 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	recorder.markRemoved(beforeWatchlistFilter, candidates, "active_watchlist")
 	s.markDiscoveryCandidates(ctx, beforeWatchlistFilter, candidates,
 		"active_watchlist", recorder.run.ID, "already active on watchlist")
+	if s.Cfg.PromotionCorrelationEnabled {
+		beforeExposureFilter := candidates
+		candidates, err = s.filterOpenPositionExposure(ctx, candidates)
+		if err != nil {
+			return fmt.Errorf("filter open-position exposure: %w", err)
+		}
+		recorder.markRemoved(beforeExposureFilter, candidates, "open_position")
+		s.markDiscoveryCandidates(ctx, beforeExposureFilter, candidates,
+			"open_position", recorder.run.ID, "ticker already has an open position")
+	}
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -351,11 +391,20 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	}
 
 	// 7. Sort by conviction descending, take only as many as available slots.
+	s.enrichPromotionCorrelations(ctx, scored, start)
 	sortByConviction(scored)
-	if promotionCapActive {
+	correlationCapActive := s.Cfg.PromotionCorrelationEnabled && s.DailyBars != nil &&
+		s.Cfg.PromotionMaxAbsCorrelation > 0
+	if promotionCapActive || correlationCapActive {
 		promotionInput := scored
 		var rejected []PromotionRejection
-		scored, rejected = selectScoredForPromotion(scored, slots, promotionMaxPerIndustry)
+		maxCorrelation := 0.0
+		if correlationCapActive {
+			maxCorrelation = s.Cfg.PromotionMaxAbsCorrelation
+		}
+		scored, rejected = selectScoredForPromotionWithCorrelation(
+			scored, slots, promotionMaxPerIndustry, maxCorrelation,
+		)
 		for _, rejected := range rejected {
 			reason := rejected.Reason
 			if rejected.ConflictKey != "" {
@@ -381,11 +430,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 	// 8. Add to watchlist and notify.
 	var added []scoredCandidate
-	expiresAt := s.now().AddDate(0, 0, s.ttlDays())
 	promotionState := append([]scoredCandidate(nil), scored...)
 	promotionActive := make([]bool, len(scored))
 	for index := range scored {
 		sc := scored[index]
+		expiresAt := s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
 		// A claim-loss fallback may change the candidate's effective taxonomy.
 		// Re-check later candidates against peers that were actually admitted,
 		// without allowing unattempted lower-ranked candidates to consume the cap.
@@ -515,6 +564,8 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			}
 			promotionState[index] = sc
 			scored[index] = sc
+			expiresAt = s.now().AddDate(0, 0, s.candidateTTLDays(sc.candidate))
+			item.ExpiresAt = &expiresAt
 			addErr = s.promoteDiscoveryFallback(ctx, item, fallback)
 		}
 		if skipCandidate {
@@ -916,6 +967,31 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 	return filterActiveCandidates(candidates, existing), nil
 }
 
+// filterOpenPositionExposure applies the same-ticker exposure guard to durable
+// open/exiting trades. Watchlist filtering above covers active discovery rows;
+// this second set prevents a scanner retry from proposing a ticker already held
+// by the execution engine.
+func (s *MarketScanner) filterOpenPositionExposure(ctx context.Context, candidates []SwingCandidate) ([]SwingCandidate, error) {
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		return nil, err
+	}
+	existing := make(map[string]struct{}, len(trades))
+	for _, trade := range trades {
+		key := normalizePromotionKey(trade.Ticker)
+		if key != "" {
+			existing[key] = struct{}{}
+		}
+	}
+	filtered := make([]SwingCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		if _, found := existing[normalizePromotionKey(candidate.Ticker)]; !found {
+			filtered = append(filtered, candidate)
+		}
+	}
+	return filtered, nil
+}
+
 func filterActiveCandidates(
 	candidates []SwingCandidate, existing map[string]struct{},
 ) []SwingCandidate {
@@ -1247,6 +1323,17 @@ func (s *MarketScanner) ttlDays() int {
 	return 3
 }
 
+func (s *MarketScanner) candidateTTLDays(candidate SwingCandidate) int {
+	days := s.ttlDays()
+	if hasSource(candidate.Sources, "weekly_leader") && s.Cfg.WeeklyLeader.TTLDays > days {
+		days = s.Cfg.WeeklyLeader.TTLDays
+	}
+	if hasSource(candidate.Sources, "potent_industry") && s.Cfg.PotentIndustry.TTLDays > days {
+		days = s.Cfg.PotentIndustry.TTLDays
+	}
+	return days
+}
+
 // isMarketOpen returns true if the current time falls within US equity market
 // hours (9:30am–4:00pm US/Eastern, Monday–Friday).
 func (s *MarketScanner) isMarketOpen() bool {
@@ -1266,8 +1353,10 @@ func (s *MarketScanner) isMarketOpen() bool {
 
 // scoredCandidate pairs a candidate with its LLM score.
 type scoredCandidate struct {
-	candidate SwingCandidate
-	score     SwingScoreResult
+	candidate            SwingCandidate
+	score                SwingScoreResult
+	correlations         map[string]float64
+	exposureCorrelations map[string]float64
 }
 
 // sortByConviction sorts in-place, highest conviction first.

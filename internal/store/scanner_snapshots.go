@@ -11,27 +11,31 @@ import (
 
 // ScannerRun captures the configuration and aggregate outcome of one scan.
 type ScannerRun struct {
-	ID                           string
-	StartedAt                    time.Time
-	CompletedAt                  time.Time
-	Status                       string
-	Error                        string
-	PullbackUniverseEnabled      bool
-	PullbackMinMomentumReturnPct float64
-	PullbackMinMarketCapMM       float64
-	PullbackMinDollarVolume      float64
-	CandidateCap                 int
-	MinConviction                float64
-	TTLDays                      int
-	PromotionMaxPerIndustry      int
-	RawCandidateCount            int
-	EvaluatedCandidateCount      int
-	ScoredCandidateCount         int
-	AddedCandidateCount          int
-	ExpiredItemCount             int
-	UniverseVersionID            string
-	UniverseAsOf                 *time.Time
-	RegimeReference              string
+	ID                               string
+	StartedAt                        time.Time
+	CompletedAt                      time.Time
+	Status                           string
+	Error                            string
+	PullbackUniverseEnabled          bool
+	PullbackMinMomentumReturnPct     float64
+	PullbackMinMarketCapMM           float64
+	PullbackMinDollarVolume          float64
+	CandidateCap                     int
+	MinConviction                    float64
+	TTLDays                          int
+	PromotionMaxPerIndustry          int
+	PromotionCorrelationEnabled      bool
+	PromotionMaxAbsCorrelation       float64
+	PromotionCorrelationLookbackDays int
+	PromotionCorrelationMinOverlap   int
+	RawCandidateCount                int
+	EvaluatedCandidateCount          int
+	ScoredCandidateCount             int
+	AddedCandidateCount              int
+	ExpiredItemCount                 int
+	UniverseVersionID                string
+	UniverseAsOf                     *time.Time
+	RegimeReference                  string
 }
 
 // ScannerCandidateSnapshot records every stage reached by a sourced candidate.
@@ -111,6 +115,17 @@ func InsertScannerEngineOutcome(ctx context.Context, outcome ScannerEngineOutcom
 }
 
 func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
+	correlationLookback := run.PromotionCorrelationLookbackDays
+	if correlationLookback <= 0 {
+		correlationLookback = 60
+	}
+	correlationOverlap := run.PromotionCorrelationMinOverlap
+	if correlationOverlap <= 0 || correlationOverlap > correlationLookback {
+		correlationOverlap = 30
+		if correlationOverlap > correlationLookback {
+			correlationOverlap = correlationLookback
+		}
+	}
 	tx, err := GetDB().Begin(ctx)
 	if err != nil {
 		return "", err
@@ -150,14 +165,18 @@ func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
 				started_at, pullback_universe_enabled,
 				pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
 				pullback_min_dollar_volume, candidate_cap, min_conviction, ttl_days,
-				promotion_max_per_industry, universe_version_id, universe_as_of,
+				promotion_max_per_industry, promotion_correlation_enabled,
+				promotion_max_abs_correlation, promotion_correlation_lookback_days,
+				promotion_correlation_min_overlap, universe_version_id, universe_as_of,
 				regime_reference
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 			RETURNING id`,
 		run.StartedAt, run.PullbackUniverseEnabled,
 		run.PullbackMinMomentumReturnPct, run.PullbackMinMarketCapMM,
 		run.PullbackMinDollarVolume, run.CandidateCap, run.MinConviction, run.TTLDays,
-		run.PromotionMaxPerIndustry,
+		run.PromotionMaxPerIndustry, run.PromotionCorrelationEnabled,
+		run.PromotionMaxAbsCorrelation, correlationLookback,
+		correlationOverlap,
 		nullableString(run.UniverseVersionID), universeAsOf,
 		nullableString(run.RegimeReference),
 	).Scan(&id)
