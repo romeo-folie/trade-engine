@@ -540,6 +540,43 @@ func TestManager_EMA9CloseAboveKeepsTradeAndSeedsHardStop(t *testing.T) {
 	}
 }
 
+func TestManager_EMA9PreCloseIgnoresCurrentPartialDailyBar(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10,
+	}
+
+	// Nine completed closes at 100 establish EMA9=100. The current session's
+	// partial bar is 50, but it must not trigger a close before 16:00 ET.
+	candles := make([]data.Candle, 0, 10)
+	for i := 0; i < 9; i++ {
+		candles = append(candles, data.Candle{
+			Timestamp: time.Date(2026, time.July, 13+i, 0, 0, 0, 0, newYorkLocation),
+			Close:     100,
+		})
+	}
+	candles = append(candles, data.Candle{
+		Timestamp: time.Date(2026, time.July, 24, 0, 0, 0, 0, newYorkLocation),
+		Close:     50,
+	})
+	fp := &fakePrices{candles: candles}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
+	}
+	m.UpdateAll(context.Background())
+
+	if fs.trades["t1"].Status != "open" {
+		t.Fatal("current partial daily bar must not trigger an EMA9 exit")
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop {
+		t.Fatalf("orders = %+v, want one protective stop", fb.placed)
+	}
+}
+
 func TestManager_EMA9CappedTradeDoesNotSeedStandaloneStop(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
