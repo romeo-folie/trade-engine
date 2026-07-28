@@ -230,6 +230,87 @@ func TestRefreshPublishesAllIneligibleSnapshotWithoutEvidenceRequests(t *testing
 	}
 }
 
+func TestRefreshExcludesNonCommonInstrumentsBeforeEvidenceRequests(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	market := &recordingMarketData{}
+	builder := Builder{
+		Config: testConfig(),
+		Assets: fakeAssets{assets: []data.StockAsset{
+			{Symbol: "GOOD", Name: "Common Stock", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "WARRANT", Name: "Example Acquisition Corp. Warrants", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+			{Symbol: "ETF", Name: "Example Trust ETF", Status: "active", AssetClass: "us_equity", Exchange: "NASDAQ", Tradable: true},
+		}},
+		Snapshots: market, Bars: market, Repository: repo,
+		Fundamentals: fakeFundamentals{
+			"GOOD": {MarketCapitalization: 500, Industry: "Technology", Provider: "finnhub"},
+			"ETF":  {MarketCapitalization: 500, Industry: "Funds", Provider: "finnhub"},
+		},
+		Now: func() time.Time { return now },
+	}
+	if _, err := builder.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if strings.Join(market.snapshotSymbols, ",") != "ETF,GOOD" ||
+		strings.Join(market.barSymbols, ",") != "ETF,GOOD" {
+		t.Fatalf("evidence requests = snapshots %v bars %v, want ETF and GOOD only", market.snapshotSymbols, market.barSymbols)
+	}
+	var warrant store.SwingUniverseMember
+	for _, member := range repo.members {
+		if member.Ticker == "WARRANT" {
+			warrant = member
+		}
+	}
+	if len(repo.members) != 3 || warrant.RemovalStage != "asset_name" || warrant.Eligible {
+		t.Fatalf("members = %+v, want Warrant excluded at asset_name stage", repo.members)
+	}
+}
+
+func TestExcludedNamePatternsPreserveIssuerAndETFNames(t *testing.T) {
+	patterns, err := compileExcludedNamePatterns(testConfig().ExcludedNamePatterns)
+	if err != nil {
+		t.Fatalf("compileExcludedNamePatterns: %v", err)
+	}
+	for _, name := range []string{
+		"Preferred Bank Common Stock",
+		"iShares Preferred and Income Securities ETF",
+		"Preferred Stock ETF",
+		"Notes Live, Inc. Common Stock",
+		"Unit Corporation Common Stock",
+	} {
+		if matchesExcludedAssetName(name, patterns) {
+			t.Errorf("name %q was excluded, want preserved", name)
+		}
+	}
+	for _, name := range []string{
+		"Example Acquisition Corp. Warrants",
+		"Example Acquisition Corp. Warrants Class A Common Stock",
+		"Example Acquisition Corp. Units (1 Ord & 1/2 Wt)",
+		"Example Corp. Preferred Stock",
+		"Example Corp. Preferred Stock, Series A",
+		"MicroSectors FANG+ Index 3X Leveraged ETN",
+		"Senior Notes due 2030",
+		"6.35% Fixed-to-Floating Rate Perpetual Non-Cumulative Preference Share, Series A",
+	} {
+		if !matchesExcludedAssetName(name, patterns) {
+			t.Errorf("name %q was preserved, want excluded", name)
+		}
+	}
+	explicit, err := compileExcludedNamePatterns([]string{`(?i)acme`})
+	if err != nil || !matchesExcludedAssetName("Acme Corp. Common Stock", explicit) {
+		t.Fatalf("explicit exclusion pattern did not override common-stock naming: err=%v", err)
+	}
+}
+
+func TestRefreshRejectsInvalidExcludedNamePattern(t *testing.T) {
+	cfg := testConfig()
+	cfg.ExcludedNamePatterns = []string{"["}
+	builder := Builder{Config: cfg}
+	if _, err := builder.Refresh(context.Background()); err == nil || !strings.Contains(err.Error(), "excluded_name_patterns") {
+		t.Fatalf("Refresh error = %v, want invalid excluded_name_patterns error", err)
+	}
+}
+
 func TestRefreshUnknownTaxonomyDoesNotInventClassification(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	cfg := testConfig()
@@ -619,6 +700,7 @@ func testConfig() config.UniverseConfig {
 		MinMedianDollarVolume: 1_000_000, DollarVolumeLookbackDays: 20,
 		AllowedSecurityTypes: []string{"us_equity"},
 		AllowedExchanges:     []string{"NYSE", "NASDAQ", "AMEX"},
+		ExcludedNamePatterns: []string{`(?i)\bwarrants?\b`, `(?i)\brights?\b`, `(?i)\bunits?(?:\s*(?:[,(]|$))`, `(?i)\bnotes?\s+due\b`, `(?i)\betns?\b`, `(?i)\bdebentures?\b`, `(?i)\bpreferred\s+(?:stock|shares?)(?:,\s*series\b.*)?\s*$`, `(?i)\bpreference\s+shares?(?:,\s*series\b.*)?\s*$`},
 		RequireActive:        true, RequireTradable: true, RequireMarketData: true,
 		BatchSize: 200, TaxonomyMaxAgeHours: 168, TaxonomyRefreshLimit: 200,
 		MissingFundamentalsPolicy: "exclude", MissingMarketDataPolicy: "exclude",

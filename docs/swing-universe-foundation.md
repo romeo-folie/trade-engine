@@ -65,7 +65,10 @@ unrelated methods.
   tradable state are retained for the configurable eligibility gates. Alpaca does
   not reliably distinguish common stock, ETFs, ADRs, and warrants in this
   payload, so the safe built-in security type is the evidenced `us_equity`
-  asset class. A narrower filter requires a richer asset-master provider.
+  asset class. The refresh also applies configurable, name-based exclusions for
+  clearly labeled warrants, rights, units, notes, ETNs, debentures, and
+  preferred listings; these are heuristics, not a substitute for richer asset
+  classification.
 - Alpaca's market-data API supplies bounded batches of split-adjusted daily bars
   and current snapshots. Liquidity uses completed US sessions only; an
   in-progress daily candle is excluded.
@@ -95,13 +98,14 @@ The filter is deterministic and records the first failing stage:
 
 1. security type;
 2. exchange;
-3. active status;
-4. tradability;
-5. market-data availability;
-6. minimum price;
-7. minimum market capitalization;
-8. minimum median dollar volume;
-9. maximum spread.
+3. asset-name exclusion;
+4. active status;
+5. tradability;
+6. market-data availability;
+7. minimum price;
+8. minimum market capitalization;
+9. minimum median dollar volume;
+10. maximum spread.
 
 Unknown taxonomy is not a universe-exclusion stage. It is persisted and later
 fails closed only for scanners whose thesis depends on an industry group.

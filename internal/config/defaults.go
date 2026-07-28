@@ -415,6 +415,7 @@ func Defaults() *Config {
 				DollarVolumeLookbackDays:  20,
 				AllowedSecurityTypes:      []string{"us_equity"},
 				AllowedExchanges:          []string{"NYSE", "NASDAQ", "AMEX"},
+				ExcludedNamePatterns:      []string{`(?i)\bwarrants?\b`, `(?i)\brights?\b`, `(?i)\bunits?(?:\s*(?:[,(]|$))`, `(?i)\bnotes?\s+due\b`, `(?i)\betns?\b`, `(?i)\bdebentures?\b`, `(?i)\bpreferred\s+(?:stock|shares?)(?:,\s*series\b.*)?\s*$`, `(?i)\bpreference\s+shares?(?:,\s*series\b.*)?\s*$`},
 				MaxSpreadBPS:              0,
 				RequireActive:             true,
 				RequireTradable:           true,
