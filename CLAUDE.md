@@ -12,7 +12,11 @@ After each PR is **merged**, save a `project` memory summarising the feature —
 
 # Code review
 
-Before every push to a PR branch, always run the `feature-dev:code-reviewer` agent over the changes first. Address (or consciously dismiss with a reason) its findings before pushing. This applies to the initial push and every follow-up push to an existing PR.
+Before every push to a PR branch, always run Codex's built-in `/review` against
+the complete branch diff, followed by the `feature-dev:code-reviewer` agent over
+the changes. Address (or consciously dismiss with a reason) all findings before
+pushing. This applies to the initial push and every follow-up push to an existing
+PR.
 
 ## End-to-end correctness requirement
 
