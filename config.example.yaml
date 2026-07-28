@@ -861,6 +861,7 @@ scanner:
   news_lookback_hours: 24      # News window when enriching candidates before scoring
   top_movers: 20               # Top gainers+losers fetched per scan
   top_actives: 20              # Most-active-by-volume fetched per scan
+  max_promotions_per_industry: 0 # Optional per-industry promotion cap; 0 disables
   universe:
     enabled: false                         # Full-market point-in-time universe; off preserves movers/actives-only discovery
     provider: alpaca                       # Provider adapter used for bulk membership and eligibility evidence

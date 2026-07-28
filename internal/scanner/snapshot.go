@@ -37,6 +37,7 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 			CandidateCap:                 cap,
 			MinConviction:                s.Cfg.MinConviction,
 			TTLDays:                      s.ttlDays(),
+			PromotionMaxPerIndustry:     s.Cfg.PromotionMaxPerIndustry,
 			UniverseVersionID:            s.UniverseVersionID,
 			UniverseAsOf:                 s.UniverseAsOf,
 			RegimeReference:              s.RegimeReference,
@@ -387,18 +388,26 @@ func (r *scanRecorder) fallbackScored(
 func (r *scanRecorder) selected(selected []scoredCandidate) {
 	selectedTickers := make(map[string]struct{}, len(selected))
 	for _, sc := range selected {
-		selectedTickers[sc.candidate.Ticker] = struct{}{}
+		selectedTickers[normalizePromotionKey(sc.candidate.Ticker)] = struct{}{}
 		if snapshot := r.candidates[sc.candidate.Ticker]; snapshot != nil {
 			snapshot.CapSelected = true
 			snapshot.FinalStage = "selected"
 		}
 	}
 	for _, snapshot := range r.candidates {
-		if snapshot.PassedMinConviction {
-			if _, ok := selectedTickers[snapshot.Ticker]; !ok {
+		if snapshot.PassedMinConviction && snapshot.FinalStage == "passed_conviction" {
+			if _, ok := selectedTickers[normalizePromotionKey(snapshot.Ticker)]; !ok {
 				snapshot.FinalStage = "candidate_cap"
 			}
 		}
+	}
+}
+
+func (r *scanRecorder) promotionRejected(ticker, reason string) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		snapshot.FailureStage = "promotion"
+		snapshot.FailureReason = reason
+		snapshot.FinalStage = "promotion_suppressed"
 	}
 }
 

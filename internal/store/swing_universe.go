@@ -199,6 +199,47 @@ func ListEligibleSwingUniverseMembers(
 	return ListSwingUniverseMembers(ctx, versionID, true)
 }
 
+// GetEligibleSwingUniverseMemberAsOf returns the immutable taxonomy evidence
+// for one eligible ticker in a completed universe that was available at asOf.
+// Missing rows are returned as (nil, nil); callers must leave candidates
+// uncapped when point-in-time taxonomy is unavailable.
+func GetEligibleSwingUniverseMemberAsOf(
+	ctx context.Context, versionID, ticker string, asOf time.Time,
+) (*SwingUniverseMember, error) {
+	if strings.TrimSpace(versionID) == "" || strings.TrimSpace(ticker) == "" {
+		return nil, nil
+	}
+	row := GetDB().QueryRow(ctx, `
+		SELECT m.universe_version_id, m.ticker, m.eligible, COALESCE(m.removal_stage,''),
+		       COALESCE(m.failure_stage,''), COALESCE(m.failure_reason,''),
+		       COALESCE(m.asset_id,''), COALESCE(m.name,''),
+		       COALESCE(m.security_type,''), COALESCE(m.exchange,''), m.active, m.tradable,
+		       m.price, m.market_cap_mm, m.dollar_volume, m.spread_bps, m.data_available,
+		       m.sector, m.industry, m.taxonomy_status, m.taxonomy_as_of,
+		       COALESCE(m.taxonomy_provider,''), m.taxonomy_evidence, m.source_evidence
+		FROM swing_universe_members m
+		JOIN swing_universe_versions v ON v.id=m.universe_version_id
+		WHERE m.universe_version_id=$1
+		  AND UPPER(m.ticker)=UPPER($2)
+		  AND m.eligible
+		  AND v.status='completed'
+		  AND v.as_of <= $3
+		  AND v.captured_at <= $3
+		  AND v.completed_at <= $3
+		  AND m.taxonomy_as_of IS NOT NULL
+		  AND m.taxonomy_as_of <= $3`,
+		versionID, ticker, asOf,
+	)
+	member, err := scanSwingUniverseMember(row)
+	if err != nil {
+		if IsNoRows(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get eligible swing universe member %q as of: %w", ticker, err)
+	}
+	return &member, nil
+}
+
 // ListSwingUniverseMembers enumerates the complete immutable asset-master
 // snapshot, but only after its parent version completed successfully.
 // eligibleOnly selects the scanner denominator.

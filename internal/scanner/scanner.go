@@ -212,6 +212,31 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
+	promotionCapActive := s.Cfg.PromotionMaxPerIndustry > 0
+	if promotionCapActive {
+		if strings.TrimSpace(recorder.run.UniverseVersionID) == "" || !store.IsConnected() {
+			slog.Warn("scanner: point-in-time universe unavailable; continuing without industry cap")
+			// Diversification is optional. A transient taxonomy failure must not
+			// suppress the legacy movers/actives scan; leave the pool uncapped for
+			// this run and retain the error in logs for operational visibility.
+			promotionCapActive = false
+		} else {
+			hydratedCandidates, hydrateErr := s.hydrateCandidateTaxonomy(
+				ctx, candidates, recorder.run.UniverseVersionID, recorder.run.StartedAt,
+			)
+			if hydrateErr != nil {
+				slog.Warn("scanner: hydrate candidate taxonomy failed; continuing without industry cap",
+					"err", hydrateErr)
+				promotionCapActive = false
+			} else {
+				candidates = hydratedCandidates
+			}
+		}
+	}
+	promotionMaxPerIndustry := 0
+	if promotionCapActive {
+		promotionMaxPerIndustry = s.Cfg.PromotionMaxPerIndustry
+	}
 	recorder.register(candidates)
 
 	if len(candidates) == 0 {
@@ -327,6 +352,22 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 	// 7. Sort by conviction descending, take only as many as available slots.
 	sortByConviction(scored)
+	if promotionCapActive {
+		promotionInput := scored
+		var rejected []PromotionRejection
+		scored, rejected = selectScoredForPromotion(scored, slots, promotionMaxPerIndustry)
+		for _, rejected := range rejected {
+			reason := rejected.Reason
+			if rejected.ConflictKey != "" {
+				reason += ": " + rejected.ConflictKey
+			}
+			if rejected.Candidate.Index >= 0 && rejected.Candidate.Index < len(promotionInput) {
+				sc := promotionInput[rejected.Candidate.Index]
+				s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
+				recorder.promotionRejected(sc.candidate.Ticker, reason)
+			}
+		}
+	}
 	if len(scored) > slots {
 		for _, suppressed := range scored[slots:] {
 			s.markDiscoveryCandidate(
@@ -341,7 +382,24 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	// 8. Add to watchlist and notify.
 	var added []scoredCandidate
 	expiresAt := s.now().AddDate(0, 0, s.ttlDays())
-	for _, sc := range scored {
+	promotionState := append([]scoredCandidate(nil), scored...)
+	promotionActive := make([]bool, len(scored))
+	for index := range scored {
+		sc := scored[index]
+		// A claim-loss fallback may change the candidate's effective taxonomy.
+		// Re-check later candidates against peers that were actually admitted,
+		// without allowing unattempted lower-ranked candidates to consume the cap.
+		if conflict := promotionIndustryConflict(
+			sc.candidate,
+			activePromotionPeers(promotionState, promotionActive, index),
+			promotionMaxPerIndustry,
+		); conflict != "" {
+			reason := "industry_cap: " + conflict
+			s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
+			recorder.promotionRejected(sc.candidate.Ticker, reason)
+			promotionActive[index] = false
+			continue
+		}
 		timeframes := sc.score.Timeframes
 		if len(timeframes) == 0 {
 			timeframes = []string{"1H", "4H"}
@@ -399,6 +457,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				)
 				slog.Warn("scanner: source fallback score failed",
 					"ticker", fallback.Ticker, "err", scoreErr)
+				promotionActive[index] = false
 				skipCandidate = true
 				break
 			}
@@ -416,6 +475,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 					"ticker", fallback.Ticker,
 					"action", fallbackScore.Action,
 					"conviction", fallbackScore.Conviction)
+				promotionActive[index] = false
 				skipCandidate = true
 				break
 			}
@@ -442,12 +502,26 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			item.PullbackRequalificationComplete =
 				fallback.PullbackQualificationKnown
 			sc = scoredCandidate{candidate: fallback, score: fallbackScore}
+			peers := activePromotionPeers(promotionState, promotionActive, index)
+			if conflict := promotionIndustryConflict(fallback, peers, promotionMaxPerIndustry); conflict != "" {
+				reason := "industry_cap: " + conflict
+				s.markDiscoveryCandidate(ctx, fallback, "cap_suppressed", recorder.run.ID, reason)
+				recorder.promotionRejected(fallback.Ticker, reason)
+				slog.Info("scanner: source fallback suppressed by promotion cap",
+					"ticker", fallback.Ticker, "conflict", conflict)
+				promotionActive[index] = false
+				skipCandidate = true
+				break
+			}
+			promotionState[index] = sc
+			scored[index] = sc
 			addErr = s.promoteDiscoveryFallback(ctx, item, fallback)
 		}
 		if skipCandidate {
 			continue
 		}
 		if errors.Is(addErr, store.ErrWatchlistActiveItemExists) {
+			promotionActive[index] = false
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			slog.Info(
 				"scanner: source fallback lost to active watchlist item",
@@ -456,6 +530,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			continue
 		}
 		if addErr != nil {
+			promotionActive[index] = false
 			recorder.watchlistResult(sc.candidate, sc.score, strategies, addErr)
 			if !errors.Is(addErr, store.ErrScannerSourcePromotionClaimLost) {
 				s.markDiscoveryCandidate(
@@ -466,6 +541,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 				"ticker", sc.candidate.Ticker, "err", addErr)
 			continue
 		}
+		// Only candidates that have actually been admitted to the watchlist
+		// may consume the industry cap for later fallback decisions. Keeping
+		// future candidates inactive prevents a lower-ranked, not-yet-attempted
+		// peer from suppressing a higher-ranked fallback.
+		promotionActive[index] = true
 		recorder.watchlistResult(sc.candidate, sc.score, strategies, nil)
 		slog.Info("scanner: added to watchlist", "ticker", sc.candidate.Ticker, "conviction", sc.score.Conviction, "setup", sc.score.SetupType, "strategy", sc.score.Strategy)
 		added = append(added, sc)
@@ -741,6 +821,85 @@ func (s *MarketScanner) fetchCandidates(ctx context.Context) ([]SwingCandidate, 
 		candidates = append(candidates, *c)
 	}
 	return candidates, nil
+}
+
+// hydrateCandidateTaxonomy joins ordinary mover/active candidates to the
+// immutable universe selected for this scan. Discovery sources that already
+// carry taxonomy are refreshed from the same point-in-time member when one is
+// available; missing members remain uncapped by the promotion selector.
+func (s *MarketScanner) hydrateCandidateTaxonomy(
+	ctx context.Context, candidates []SwingCandidate, versionID string, asOf time.Time,
+) ([]SwingCandidate, error) {
+	if s.Cfg.PromotionMaxPerIndustry <= 0 ||
+		strings.TrimSpace(versionID) == "" || !store.IsConnected() {
+		return candidates, nil
+	}
+	out := append([]SwingCandidate(nil), candidates...)
+	for i := range out {
+		member, err := store.GetEligibleSwingUniverseMemberAsOf(
+			ctx, versionID, out[i].Ticker, asOf,
+		)
+		if err != nil {
+			return nil, err
+		}
+		if member == nil {
+			excludeUniverseTaxonomyFromPromotion(&out[i])
+			continue
+		}
+		applyUniverseTaxonomyToLineage(&out[i], member)
+	}
+	return out, nil
+}
+
+func applyUniverseTaxonomyToLineage(candidate *SwingCandidate, member *store.SwingUniverseMember) {
+	if candidate == nil || member == nil {
+		return
+	}
+	applyUniverseTaxonomy(candidate, member)
+	for _, nested := range []*SwingCandidate{
+		candidate.weeklyLeaderFallback,
+		candidate.potentIndustryFallback,
+		candidate.potentIndustrySource,
+	} {
+		applyUniverseTaxonomy(nested, member)
+	}
+}
+
+func excludeUniverseTaxonomyFromPromotion(candidate *SwingCandidate) {
+	if candidate == nil {
+		return
+	}
+	candidate.promotionTaxonomyExcluded = true
+	for _, nested := range []*SwingCandidate{
+		candidate.weeklyLeaderFallback,
+		candidate.potentIndustryFallback,
+		candidate.potentIndustrySource,
+	} {
+		if nested != nil {
+			nested.promotionTaxonomyExcluded = true
+		}
+	}
+}
+
+func applyUniverseTaxonomy(candidate *SwingCandidate, member *store.SwingUniverseMember) {
+	if candidate == nil || member == nil {
+		return
+	}
+	candidate.Sector = member.Sector
+	candidate.Industry = member.Industry
+	candidate.TaxonomyStatus = member.TaxonomyStatus
+	candidate.promotionTaxonomyExcluded = false
+	memberFlag := true
+	candidate.UniverseMember = &memberFlag
+	candidate.TaxonomyAsOf = cloneTimePointer(member.TaxonomyAsOf)
+	candidate.TaxonomyProvider = member.TaxonomyProvider
+	candidate.TaxonomyEvidence = append(json.RawMessage(nil), member.TaxonomyEvidence...)
+	if candidate.MarketCapMM == 0 && member.MarketCapMM != nil {
+		candidate.MarketCapMM = *member.MarketCapMM
+	}
+	if candidate.DollarVolume == 0 && member.DollarVolume != nil {
+		candidate.DollarVolume = *member.DollarVolume
+	}
 }
 
 // filterExistingWatchlist removes tickers that are already active on the watchlist.

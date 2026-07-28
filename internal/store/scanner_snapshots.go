@@ -23,6 +23,7 @@ type ScannerRun struct {
 	CandidateCap                 int
 	MinConviction                float64
 	TTLDays                      int
+	PromotionMaxPerIndustry      int
 	RawCandidateCount            int
 	EvaluatedCandidateCount      int
 	ScoredCandidateCount         int
@@ -149,12 +150,14 @@ func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
 				started_at, pullback_universe_enabled,
 				pullback_min_momentum_return_pct, pullback_min_market_cap_mm,
 				pullback_min_dollar_volume, candidate_cap, min_conviction, ttl_days,
-				universe_version_id, universe_as_of, regime_reference
-			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+				promotion_max_per_industry, universe_version_id, universe_as_of,
+				regime_reference
+			) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
 			RETURNING id`,
 		run.StartedAt, run.PullbackUniverseEnabled,
 		run.PullbackMinMomentumReturnPct, run.PullbackMinMarketCapMM,
 		run.PullbackMinDollarVolume, run.CandidateCap, run.MinConviction, run.TTLDays,
+		run.PromotionMaxPerIndustry,
 		nullableString(run.UniverseVersionID), universeAsOf,
 		nullableString(run.RegimeReference),
 	).Scan(&id)
