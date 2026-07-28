@@ -87,7 +87,7 @@ func promotionExposureSymbols(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	trades, err := store.GetOpenTrades(ctx)
+	trades, err := store.GetOwnedPositionTrades(ctx)
 	if err != nil {
 		return nil, err
 	}

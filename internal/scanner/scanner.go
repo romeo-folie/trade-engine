@@ -972,7 +972,7 @@ func (s *MarketScanner) filterExistingWatchlist(ctx context.Context, candidates 
 // this second set prevents a scanner retry from proposing a ticker already held
 // by the execution engine.
 func (s *MarketScanner) filterOpenPositionExposure(ctx context.Context, candidates []SwingCandidate) ([]SwingCandidate, error) {
-	trades, err := store.GetOpenTrades(ctx)
+	trades, err := store.GetOwnedPositionTrades(ctx)
 	if err != nil {
 		return nil, err
 	}
