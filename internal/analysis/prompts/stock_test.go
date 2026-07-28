@@ -8,7 +8,7 @@ import (
 
 func TestBuildStockPrompt_MomentumPlay(t *testing.T) {
 	sys, _ := BuildStockPrompt(
-		"NVDA", "momentum", "1h",
+		"NVDA", []string{"momentum"}, "1h",
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
 	)
 	momentumMarkers := []string{
@@ -29,7 +29,7 @@ func TestBuildStockPrompt_MomentumPlay(t *testing.T) {
 func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 	sys, user := BuildStockPrompt(
 		"AAPL",
-		"momentum",
+		[]string{"momentum"},
 		"1d",
 		[]Candle{{Timestamp: time.Now().UTC(), Open: 100, High: 101, Low: 99, Close: 100.5, Volume: 12345, VWAP: 100.2}},
 		Indicators{RSI: 55.2, EMA20: 99.1, VolSMA20: 12000, VolRatio: 1.2},
@@ -64,11 +64,11 @@ func TestBuildStockPrompt_IncludesRequiredSections(t *testing.T) {
 // model honest at the source rather than relying on the gate.
 func TestBuildStockPrompt_RRSelfFilter(t *testing.T) {
 	standardSys, _ := BuildStockPrompt(
-		"AAPL", "trend_following", "1d",
+		"AAPL", []string{"trend_following"}, "1d",
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "", false,
 	)
 	momentumSys, _ := BuildStockPrompt(
-		"NVDA", "momentum", "1h",
+		"NVDA", []string{"momentum"}, "1h",
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "", true,
 	)
 

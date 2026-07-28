@@ -119,7 +119,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	for _, rp := range directional {
 		rp := rp
 		sys, user := prompts.BuildRolePrompt(
-			rp.role, req.Ticker, req.Strategy, req.Timeframe,
+			rp.role, req.Ticker, req.LensSet(), req.Timeframe,
 			promptCandles, promptInd, promptNews, promptPortfolio,
 			req.KnowledgeContext, promptSimilar, req.PerformanceContext,
 		)
@@ -201,7 +201,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	}
 
 	sys, user := prompts.BuildRiskManagerReviewPrompt(
-		req.Ticker, req.Strategy, req.Timeframe,
+		req.Ticker, req.LensSet(), req.Timeframe,
 		promptCandles, promptInd, promptNews, promptPortfolio,
 		req.KnowledgeContext, promptSimilar, req.PerformanceContext,
 		formatDirectionalFindings(results),

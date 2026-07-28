@@ -24,26 +24,14 @@ const RRSelfFilter = rrSelfFilter
 // roleOutputSchema is the shared JSON-schema block all role prompts emit.
 //
 // NB: this const is substituted via a %s verb (an argument, not a format
-// string), so percent signs must be SINGLE here — the previous double-escaped
-// `%%` rendered literally as "%%" in the prompts the specialist models saw.
-// It ends with the shared ConfidenceAnchors block (stock.go) so every role
-// scores on the same calibrated scale.
-const roleOutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
-{
-  "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
-  "confidence":  <float 0.0–1.0>,
-  "size_pct":    <float, recommended position size as % of portfolio>,
-  "stop_loss":   <float price, or 0 if HOLD/WAIT>,
-  "take_profit": <float price, or 0 if HOLD/WAIT>,
-  "reasoning":   "<concise explanation referencing specific data points>"
-}
-
-RULES:
-- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
-- confidence must be between 0.0 and 1.0.
-- size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
-- Do not output markdown, explanations, or any text outside the JSON object.
-- Never recommend size_pct > 0 for a HOLD or WAIT action.
+// string), so percent signs must be SINGLE throughout — the previous
+// double-escaped `%%` rendered literally as "%%" in the prompts the specialist
+// models saw.
+//
+// It is the shared OutputSchema (stock.go) followed by ConfidenceAnchors and
+// PortfolioRules, so every role emits the same JSON contract — including the
+// lens-selection fields — and scores on the same calibrated scale.
+const roleOutputSchema = OutputSchema + `
 
 ` + ConfidenceAnchors + `
 
@@ -52,10 +40,12 @@ RULES:
 // buildFundamentalSystem returns the specialist prompt for the fundamental analyst.
 // Focus: earnings, catalysts, sector context, business quality. Downweights
 // purely technical signals.
-func buildFundamentalSystem(strategy string) string {
-	return fmt.Sprintf(`You are a fundamental research analyst contributing one vote in a 4-specialist debate running the "%s" strategy.
+func buildFundamentalSystem(lenses []string) string {
+	return fmt.Sprintf(`You are a fundamental research analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on business and catalyst quality. Anchor on earnings outlook, sector tailwinds/headwinds, recent corporate news, and management guidance. Treat the technical indicator block as secondary context — do not let chart structure override a weak or strong fundamental story.
+
+%s
 
 %s
 
@@ -66,15 +56,17 @@ ROLE GUIDANCE:
 - SELL when fundamentals have deteriorated (downgrades, guidance cuts, sector breakdown) and an existing long should exit.
 - Cite specific news headlines, earnings cadence, or sector context in your reasoning. Do not list indicator readings.
 
-%s`, strategy, roleOutputSchema, rrSelfFilter)
+%s`, candidateLensBlock(lenses), roleOutputSchema, rrSelfFilter)
 }
 
 // buildTechnicalSystem returns the specialist prompt for the technical analyst.
 // Focus: indicators, structure, levels. Downweights catalyst noise.
-func buildTechnicalSystem(strategy string) string {
-	return fmt.Sprintf(`You are a technical analyst contributing one vote in a 4-specialist debate running the "%s" strategy.
+func buildTechnicalSystem(lenses []string) string {
+	return fmt.Sprintf(`You are a technical analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on chart structure and indicator alignment. Anchor on trend (EMA stack, ADX), momentum (RSI, MACD, Stoch), volatility (ATR, Bollinger Bands), volume confirmation (VolRatio, OBV), and the last 10 OHLCV candles. Treat news as background — do not let a single headline override a clear technical setup or breakdown.
+
+%s
 
 %s
 
@@ -85,15 +77,17 @@ ROLE GUIDANCE:
 - HOLD when the chart is choppy, indicators conflict, or there is no actionable structure.
 - Cite specific indicator values, candle patterns, and price levels in your reasoning. Do not lead with news.
 
-%s`, strategy, roleOutputSchema, rrSelfFilter)
+%s`, candidateLensBlock(lenses), roleOutputSchema, rrSelfFilter)
 }
 
 // buildSentimentSystem returns the specialist prompt for the sentiment analyst.
 // Focus: news flow, catalyst quality, social/headline tone.
-func buildSentimentSystem(strategy string) string {
-	return fmt.Sprintf(`You are a sentiment analyst contributing one vote in a 4-specialist debate running the "%s" strategy.
+func buildSentimentSystem(lenses []string) string {
+	return fmt.Sprintf(`You are a sentiment analyst contributing one vote in a 4-specialist debate.
 
 YOUR MANDATE: judge this trade on news flow and catalyst quality. Anchor on the recency, source, and tone of the news block, the freshness of the catalyst (hours-old beats days-old), and whether sentiment is aligned with price action. Treat raw indicators as secondary — your edge is reading the narrative.
+
+%s
 
 %s
 
@@ -104,16 +98,18 @@ ROLE GUIDANCE:
 - HOLD when news is stale, neutral, or absent — there is no narrative edge to trade.
 - Cite specific headlines, sources, and the age of each catalyst in your reasoning. A bullish two-day-old headline is not a fresh signal.
 
-%s`, strategy, roleOutputSchema, rrSelfFilter)
+%s`, candidateLensBlock(lenses), roleOutputSchema, rrSelfFilter)
 }
 
 // buildRiskManagerSystem returns the mandatory final specialist-review prompt.
 // Unlike the three directional roles, this model receives their completed
 // findings and owns the final specialist outcome before deterministic controls.
-func buildRiskManagerSystem(strategy string) string {
-	return fmt.Sprintf(`You are the mandatory Risk Specialist reviewing three completed specialist analyses for the "%s" strategy. You are the final analytical stage before deterministic portfolio risk controls.
+func buildRiskManagerSystem(lenses []string) string {
+	return fmt.Sprintf(`You are the mandatory Risk Specialist reviewing three completed specialist analyses. You are the final analytical stage before deterministic portfolio risk controls.
 
 YOUR MANDATE: synthesize the fundamental, technical, and sentiment findings, then enforce risk discipline. Anchor on portfolio exposure, position sizing, R:R, correlation with existing open positions, ATR-relative stop distance, and drawdown vulnerability. You are explicitly allowed and expected to reject an otherwise attractive setup when risk discipline is violated.
+
+%s
 
 %s
 
@@ -132,7 +128,7 @@ ROLE GUIDANCE:
 - HOLD when there is no actionable signal.
 - Your reasoning must summarize how the three findings support or conflict with the final action and name any discipline check that changed the outcome.
 
-%s`, strategy, roleOutputSchema, rrSelfFilter)
+%s`, candidateLensBlock(lenses), roleOutputSchema, rrSelfFilter)
 }
 
 // BuildRolePrompt returns (system, user) prompts for a single specialist role.
@@ -142,7 +138,9 @@ ROLE GUIDANCE:
 // role must be one of: "fundamental", "technical", "sentiment", "risk_manager".
 // Unknown roles return ("", "") so the caller can detect the misconfiguration.
 func BuildRolePrompt(
-	role, ticker, strategy, timeframe string,
+	role, ticker string,
+	strategies []string,
+	timeframe string,
 	candles []Candle,
 	ind Indicators,
 	news []NewsItem,
@@ -151,15 +149,16 @@ func BuildRolePrompt(
 	similarSetups []SimilarPastSetup,
 	performanceContext string,
 ) (systemPrompt, userMessage string) {
+	lenses := Lenses(strategies)
 	switch role {
 	case "fundamental":
-		systemPrompt = buildFundamentalSystem(strategy)
+		systemPrompt = buildFundamentalSystem(lenses)
 	case "technical":
-		systemPrompt = buildTechnicalSystem(strategy)
+		systemPrompt = buildTechnicalSystem(lenses)
 	case "sentiment":
-		systemPrompt = buildSentimentSystem(strategy)
+		systemPrompt = buildSentimentSystem(lenses)
 	case "risk_manager":
-		systemPrompt = buildRiskManagerSystem(strategy)
+		systemPrompt = buildRiskManagerSystem(lenses)
 	default:
 		return "", ""
 	}
@@ -170,7 +169,9 @@ func BuildRolePrompt(
 // BuildRiskManagerReviewPrompt builds the sequential Risk Specialist call and
 // appends the completed directional findings to the normal market-data context.
 func BuildRiskManagerReviewPrompt(
-	ticker, strategy, timeframe string,
+	ticker string,
+	strategies []string,
+	timeframe string,
 	candles []Candle,
 	ind Indicators,
 	news []NewsItem,
@@ -181,7 +182,7 @@ func BuildRiskManagerReviewPrompt(
 	directionalFindings string,
 ) (systemPrompt, userMessage string) {
 	systemPrompt, userMessage = BuildRolePrompt(
-		"risk_manager", ticker, strategy, timeframe, candles, ind, news,
+		"risk_manager", ticker, strategies, timeframe, candles, ind, news,
 		portfolio, knowledgeContext, similarSetups, performanceContext,
 	)
 	if systemPrompt == "" || userMessage == "" {

@@ -31,6 +31,8 @@ var sizePctFieldRe = regexp.MustCompile(`"size_pct"\s*:\s*([-+]?[0-9]*\.?[0-9]+)
 var stopLossFieldRe = regexp.MustCompile(`"stop_loss"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
 var takeProfitFieldRe = regexp.MustCompile(`"take_profit"\s*:\s*([-+]?[0-9]*\.?[0-9]+)`)
 var reasoningFieldRe = regexp.MustCompile(`"reasoning"\s*:\s*"([^"]*)`)
+var regimeFieldRe = regexp.MustCompile(`"regime"\s*:\s*"([^"]*)"`)
+var selectedStrategyFieldRe = regexp.MustCompile(`"selected_strategy"\s*:\s*"([^"]*)"`)
 
 // AnthropicClient implements ModelProvider using the Anthropic Messages API.
 type AnthropicClient struct {
@@ -70,7 +72,7 @@ func (c *AnthropicClient) Analyze(ctx context.Context, req AnalysisRequest) (Ana
 		systemPrompt = req.CustomSystemPrompt
 		userMessage = req.CustomUserMessage
 	} else {
-		systemPrompt, userMessage = prompts.BuildStockPrompt(req.Ticker, req.Strategy, req.Timeframe,
+		systemPrompt, userMessage = prompts.BuildStockPrompt(req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles),
 			toPromptIndicators(req.Indicators),
 			toPromptNews(req.News),
@@ -247,6 +249,20 @@ func extractAnalysisJSON(text string) (AnalysisResponse, error) {
 	normAction := Action(strings.ToUpper(strings.TrimSpace(string(result.Action))))
 	result.Action = normAction
 
+	// Normalize the lens-selection fields to the lower-case form the watchlist
+	// and prompt use, so "Mean_Reversion" and "mean_reversion" compare equal
+	// downstream. Both are observation-only and are never validated into an
+	// error: a model that omits or garbles them must still cast its vote.
+	result.Regime = strings.ToLower(strings.TrimSpace(result.Regime))
+	result.SelectedStrategy = strings.ToLower(strings.TrimSpace(result.SelectedStrategy))
+	if len(result.RejectedStrategies) > 0 {
+		normalized := make(map[string]string, len(result.RejectedStrategies))
+		for lens, reason := range result.RejectedStrategies {
+			normalized[strings.ToLower(strings.TrimSpace(lens))] = strings.TrimSpace(reason)
+		}
+		result.RejectedStrategies = normalized
+	}
+
 	// Validate required fields.
 	switch result.Action {
 	case ActionBuy, ActionSell, ActionHold, ActionWait, ActionTrade, ActionSkip, ActionAdd:
@@ -343,6 +359,16 @@ func recoverPartialAnalysis(text string) (AnalysisResponse, bool) {
 	}
 	if m := reasoningFieldRe.FindStringSubmatch(text); len(m) == 2 {
 		out.Reasoning = strings.TrimSpace(m[1])
+	}
+	// Lens-selection fields (issue #509). Both precede "action" in the emitted
+	// key order, so a truncated response that still yielded an action will
+	// almost always carry them — but they stay optional: a model that omits
+	// them must not lose its vote.
+	if m := regimeFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		out.Regime = strings.TrimSpace(m[1])
+	}
+	if m := selectedStrategyFieldRe.FindStringSubmatch(text); len(m) == 2 {
+		out.SelectedStrategy = strings.TrimSpace(m[1])
 	}
 	return out, true
 }

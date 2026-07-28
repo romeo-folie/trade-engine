@@ -740,7 +740,7 @@ func (e *Engine) processStock(
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
 	e.runAnalysis(
-		ctx, ticker, string(primaryTF), primaryStrategy, candles, set,
+		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
 	)
 }
@@ -837,6 +837,7 @@ func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.Portfol
 func (e *Engine) runAnalysis(
 	ctx context.Context,
 	ticker, timeframe, strategy string,
+	strategies []string,
 	candles []data.Candle,
 	set *indicators.IndicatorSet,
 	newsHash, source, graphContext, scannerRunID string,
@@ -921,8 +922,12 @@ func (e *Engine) runAnalysis(
 	if candleCap <= 0 {
 		candleCap = 20
 	}
+	// The analyst may now select ANY admissible lens, so cap at the WIDEST
+	// configured window across the set — capping at the primary's window would
+	// starve a lens that needs more history (momentum 14 vs trend_following 20)
+	// of the bars required to confirm or reject it.
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n, ok := windows[strategy]; ok && n > 0 {
+		if n := widestHistoryWindow(windows, strategy, strategies); n > 0 {
 			candleCap = n // strategy window overrides; MaxCandlesPerPrompt clamps below
 		}
 	}
@@ -1020,6 +1025,7 @@ func (e *Engine) runAnalysis(
 	req := analysis.AnalysisRequest{
 		Ticker:             ticker,
 		Strategy:           strategy,
+		Strategies:         strategies,
 		Timeframe:          timeframe,
 		MomentumPlay:       source == "scanner",
 		RecentCandles:      snaps,
@@ -1940,7 +1946,8 @@ func (e *Engine) generateSignal(
 					"ticker", ticker, "err", pcErr)
 			}
 			entryGateReason = evaluateRunupGates(
-				strategy, string(resp.Action), signalPrice, prevClose, eg,
+				effectiveGateStrategy(strategy, resp.SelectedStrategy),
+				string(resp.Action), signalPrice, prevClose, eg,
 			)
 		}
 		if entryGateReason != "" {

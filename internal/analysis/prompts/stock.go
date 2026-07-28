@@ -68,7 +68,148 @@ type SimilarPastSetup struct {
 	TradeOutcomePct *float64
 }
 
+// ─── Candidate lenses ─────────────────────────────────────────────────────────
+
+// analysisLenses is the set of strategy labels naming an analytical LENS — a
+// way of reading the chart. The watchlist strategies column also carries entry
+// -gate TAGS (notably store.EntrySetupPullbackStrength, appended by the
+// scanner's candidateStrategies), which are not lenses and must never be
+// offered to an analyst as one.
+var analysisLenses = map[string]bool{
+	"trend_following": true,
+	"mean_reversion":  true,
+	"momentum":        true,
+	"news_sentiment":  true,
+}
+
+// defaultLens matches the engine's historical fallback for a watchlist row
+// carrying no usable strategy.
+const defaultLens = "trend_following"
+
+// IsLens reports whether s names an analytical lens. Callers use it to decide
+// whether a model-reported selected_strategy can be trusted to key
+// strategy-specific behaviour — a hallucinated or unknown label must fall back
+// to the configured value rather than silently disabling that behaviour.
+func IsLens(s string) bool {
+	return analysisLenses[strings.ToLower(strings.TrimSpace(s))]
+}
+
+// Lenses filters a raw watchlist strategies list down to the analytical lenses
+// an analyst may choose among, preserving order and dropping duplicates,
+// unknown labels, and entry-gate tags. Never returns empty: a row with no
+// recognisable lens falls back to defaultLens, matching prior engine behaviour.
+func Lenses(strategies []string) []string {
+	out := make([]string, 0, len(strategies))
+	seen := make(map[string]bool, len(strategies))
+	for _, s := range strategies {
+		s = strings.ToLower(strings.TrimSpace(s))
+		if !analysisLenses[s] || seen[s] {
+			continue
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if len(out) == 0 {
+		return []string{defaultLens}
+	}
+	return out
+}
+
+// candidateLensBlock renders the lens-selection contract.
+//
+// The strategy label used to be injected as an IDENTITY ("You are an analyst
+// running the X strategy"), which made the model an advocate for X: a
+// mean_reversion analyst finds something to revert because that is who it is,
+// and no prompt path permitted the answer "this strategy does not fit this
+// ticker". Since the per-strategy config knobs are read nowhere (issue #509),
+// that framing pressure was the label's ENTIRE practical effect.
+//
+// Presenting the admissible lenses as candidates removes the advocacy — but a
+// menu of lenses is also a menu of justifications, and unconstrained it is
+// strictly MORE permissive than a single assignment (trending? trend_following
+// says buy; ranging? mean_reversion says buy the dip). Step 3 is the guard:
+// naming why the rejected lenses do not fit is cheap when the selection is
+// honest and awkward when it is post-hoc, and leaves an audit trail either way.
+// Step 4 is the escape hatch that did not previously exist.
+func candidateLensBlock(lenses []string) string {
+	return fmt.Sprintf(`CANDIDATE LENSES: %s
+
+These are the lenses admissible for this ticker. They are candidates, not
+assignments. Before evaluating any setup:
+
+1. Classify the current regime from the indicator block and price action alone.
+2. Name which candidate lens that regime supports — if any.
+3. State, in one clause each, why every REJECTED lens does not fit.
+4. If no candidate fits, return HOLD, set "selected_strategy" to "none", and
+   open your reasoning with "regime mismatch: <named reading>". This is a
+   CORRECT and expected answer, not a failure to find a trade.
+
+You may not evaluate a setup under a lens whose stated preconditions the data
+contradicts. Selecting a lens because it yields a tradeable setup — rather than
+because the regime supports it — is the specific failure this structure exists
+to prevent.`, strings.Join(lenses, ", "))
+}
+
+// newsSentimentGuidance targets the news_sentiment failure mode measured in
+// live trading: it produced 2/3 of all closed trades at a 25% win rate, and its
+// worst losers (OPTU −26%, SBET −20%, TE −15%) were longs chasing catalysts
+// after the move. Language mirrors the sentiment specialist prompt in roles.go,
+// which already had it right.
+const newsSentimentGuidance = `
+
+STRATEGY GUIDANCE — news_sentiment:
+- Your edge is FRESHNESS: a catalyst under ~24h old that price has not yet fully absorbed. A bullish two-day-old headline is not a fresh signal.
+- If price has already gapped or moved materially since the headline published, the edge is gone — do not select this lens. Do not chase a move that already happened; late entries on stale catalysts are this lens's primary historical failure mode.
+- Sentiment must be CONFIRMED by the price/volume response, not assumed from the headline alone. A bullish headline with flat or fading volume is a warning, not an entry.
+- Weigh source credibility: multiple independent credible sources beat one aggregator restating the same item.`
+
+// lensGuidance returns the per-lens decision blocks for every admissible lens.
+// Guidance is attached when a lens is a CANDIDATE (not merely when it is the
+// configured primary), because the analyst may now select any of them.
+func lensGuidance(lenses []string) string {
+	var b strings.Builder
+	for _, lens := range lenses {
+		if lens == "news_sentiment" {
+			b.WriteString(newsSentimentGuidance)
+		}
+	}
+	return b.String()
+}
+
 // ─── Shared calibration blocks ────────────────────────────────────────────────
+
+// OutputSchema is the JSON contract shared by every analyst prompt.
+//
+// NB: substituted via a %s verb (an argument, not a format string), so percent
+// signs must be SINGLE here — a double-escaped %% renders literally.
+//
+// "reasoning" is deliberately the FIRST key. Models generate left-to-right, so
+// the previous schema (action first, reasoning last) committed to an action and
+// then produced a justification for it: the stored reasoning was post-hoc
+// rationalisation, not the process that reached the decision.
+const OutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
+{
+  "reasoning":           "<work through the evidence BEFORE committing to an action>",
+  "regime":              "trending" | "ranging" | "transitional",
+  "selected_strategy":   "<the candidate lens you selected, or none>",
+  "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
+  "action":              "BUY" | "SELL" | "HOLD" | "WAIT",
+  "confidence":          <float 0.0–1.0>,
+  "size_pct":            <float, recommended position size as % of portfolio>,
+  "stop_loss":           <float price, or 0 if HOLD/WAIT>,
+  "take_profit":         <float price, or 0 if HOLD/WAIT>
+}
+
+RULES:
+- Emit the keys in the order shown. "reasoning" comes FIRST — reach your decision by writing it out; do not justify a decision already made.
+- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
+- confidence must be between 0.0 and 1.0.
+- size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
+- selected_strategy must be exactly one of the candidate lenses listed above, or "none".
+- rejected_strategies must name every candidate lens you did not select, each with a one-clause reason. Use {} only when a single lens was offered and you selected it.
+- Do not output markdown, explanations, or any text outside the JSON object.
+- If data is insufficient, return HOLD with low confidence.
+- Never recommend size_pct > 0 for a HOLD or WAIT action.`
 
 // ConfidenceAnchors gives the confidence scale semantic meaning. Live outcome
 // data (89 closed trades, Mar–Jul 2026) showed win rate rises monotonically
@@ -111,8 +252,14 @@ const PortfolioRules = `USING PORTFOLIO CONTEXT:
 //  6. Knowledge graph (placeholder)
 //  7. Similar past analyses (placeholder)
 //  8. Performance context (feedback pipeline)
+//
+// strategies is the ticker's admissible lens set (the watchlist strategies
+// column). It is filtered through Lenses, so entry-gate tags and unknown labels
+// are dropped and an empty list falls back to defaultLens.
 func BuildStockPrompt(
-	ticker, strategy, timeframe string,
+	ticker string,
+	strategies []string,
+	timeframe string,
 	candles []Candle,
 	ind Indicators,
 	news []NewsItem,
@@ -122,10 +269,11 @@ func BuildStockPrompt(
 	performanceContext string,
 	momentumPlay bool,
 ) (systemPrompt, userMessage string) {
+	lenses := Lenses(strategies)
 	if momentumPlay {
-		systemPrompt = buildMomentumSystem(strategy)
+		systemPrompt = buildMomentumSystem(lenses)
 	} else {
-		systemPrompt = buildSystem(strategy)
+		systemPrompt = buildSystem(lenses)
 	}
 	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
@@ -134,28 +282,16 @@ func BuildStockPrompt(
 // buildMomentumSystem returns a system prompt for scanner-sourced tickers.
 // It reframes the question from "swing-trade evaluation" to "is this momentum
 // entry still valid?" — appropriate for intraday movers and news catalysts.
-func buildMomentumSystem(strategy string) string {
+func buildMomentumSystem(lenses []string) string {
 	return fmt.Sprintf(`You are a short-term momentum trader evaluating a live entry opportunity.
 
-This ticker was flagged by an intraday screener as a "%s" play (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
+This ticker was flagged by an intraday screener (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
 
-OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
-{
-  "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
-  "confidence":  <float 0.0–1.0>,
-  "size_pct":    <float, recommended position size as %% of portfolio>,
-  "stop_loss":   <float price, or 0 if HOLD/WAIT>,
-  "take_profit": <float price, or 0 if HOLD/WAIT>,
-  "reasoning":   "<concise explanation referencing specific data points>"
-}
+%s
 
-RULES:
-- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
-- confidence must be between 0.0 and 1.0.
-- size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
-- Do not output markdown, explanations, or any text outside the JSON object.
-- If data is insufficient, return HOLD with low confidence.
-- Never recommend size_pct > 0 for a HOLD or WAIT action.
+%s
+
+TIMEFRAME FOCUS:
 - Focus on short/medium timeframe signals (1H, 4H candles) over daily trend context.
 
 %s
@@ -170,29 +306,8 @@ R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_p
 
 SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.
 
-%s`, strategy, ConfidenceAnchors, PortfolioRules)
-}
-
-// strategyGuidance returns a strategy-specific decision block appended to the
-// generalist system prompt. Before this, the strategy name interpolation was
-// the ONLY strategy-specific content — notably for news_sentiment, which
-// produced 2/3 of all closed trades at a 25% win rate. Its worst losers
-// (OPTU −26%, SBET −20%, TE −15%) were longs chasing catalysts after the move:
-// the guidance below targets exactly that failure mode. Language mirrors the
-// dormant sentiment specialist prompt in roles.go, which already had it right.
-func strategyGuidance(strategy string) string {
-	switch strategy {
-	case "news_sentiment":
-		return `
-
-STRATEGY GUIDANCE — news_sentiment:
-- Your edge is FRESHNESS: a catalyst under ~24h old that price has not yet fully absorbed. A bullish two-day-old headline is not a fresh signal.
-- If price has already gapped or moved materially since the headline published, the edge is gone — HOLD. Do not chase a move that already happened; late entries on stale catalysts are this strategy's primary historical failure mode.
-- Sentiment must be CONFIRMED by the price/volume response, not assumed from the headline alone. A bullish headline with flat or fading volume is a warning, not an entry.
-- Weigh source credibility: multiple independent credible sources beat one aggregator restating the same item.`
-	default:
-		return ""
-	}
+%s%s`, candidateLensBlock(lenses), OutputSchema, ConfidenceAnchors, PortfolioRules,
+		lensGuidance(lenses))
 }
 
 // buildSystem returns the generalist analyst system prompt.
@@ -203,28 +318,16 @@ STRATEGY GUIDANCE — news_sentiment:
 // entries — not merely penalized. This is intentional (the one ticker
 // currently qualifying, SBET, ran 20% over 5 trades); revisit the ceiling if
 // the gate ever moves.
-func buildSystem(strategy string) string {
-	return fmt.Sprintf(`You are a disciplined quantitative trading analyst running the "%s" strategy.
+func buildSystem(lenses []string) string {
+	return fmt.Sprintf(`You are a disciplined quantitative trading analyst.
 
 Your task is to analyse the provided market data and return a trade recommendation.
 
-OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
-{
-  "action":      "BUY" | "SELL" | "HOLD" | "WAIT",
-  "confidence":  <float 0.0–1.0>,
-  "size_pct":    <float, recommended position size as %% of portfolio>,
-  "stop_loss":   <float price, or 0 if HOLD/WAIT>,
-  "take_profit": <float price, or 0 if HOLD/WAIT>,
-  "reasoning":   "<concise explanation referencing specific data points>"
-}
+%s
 
-RULES:
-- action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
-- confidence must be between 0.0 and 1.0.
-- size_pct must be between 0.0 and 5.0 (max 5%% of portfolio per position).
-- Do not output markdown, explanations, or any text outside the JSON object.
-- If data is insufficient, return HOLD with low confidence.
-- Never recommend size_pct > 0 for a HOLD or WAIT action.
+%s
+
+DECISION RULES:
 - Use HOLD when there is no meaningful catalyst or setup worth tracking.
 - Use WAIT ONLY when you can name a specific, concrete blocker preventing
   entry on this cycle. Acceptable blockers are factual: "price is $2.40 above
@@ -251,7 +354,9 @@ USING PERFORMANCE CONTEXT (apply only when the ticker line shows at least 5 trad
 USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
 - If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
-- Entries marked "outcome unknown" carry no weight.%s`, strategy, ConfidenceAnchors, PortfolioRules, strategyGuidance(strategy))
+- Entries marked "outcome unknown" carry no weight.%s`,
+		candidateLensBlock(lenses), OutputSchema, ConfidenceAnchors, PortfolioRules,
+		lensGuidance(lenses))
 }
 
 func buildUser(
@@ -277,11 +382,17 @@ func buildUser(
 	b.WriteString("### RECENT OHLCV (most recent first)\n")
 	b.WriteString("Timestamp            | Open    | High    | Low     | Close   | Volume      | VWAP\n")
 	b.WriteString("---------------------|---------|---------|---------|---------|-------------|--------\n")
-	limit := len(candles)
-	if limit > 10 {
-		limit = 10
-	}
-	for _, c := range candles[:limit] {
+	// Render every candle the caller passed. CALLER CONTRACT: candles is
+	// already capped — the engine clamps it to min(history_window_by_strategy,
+	// analysis.max_candles_per_prompt) before building the request.
+	//
+	// This used to re-cap at a hardcoded 10, an undocumented third limit that
+	// silently overrode both config knobs: an operator setting
+	// max_candles_per_prompt: 20 with trend_following: 20 still got 10 candles,
+	// and widening the window across the candidate lens set would have changed
+	// nothing at all. Keeping the cap in exactly one config-driven place is the
+	// point; to restore the old payload size, set max_candles_per_prompt: 10.
+	for _, c := range candles {
 		b.WriteString(fmt.Sprintf("%-20s | %7.2f | %7.2f | %7.2f | %7.2f | %11d | %7.2f\n",
 			c.Timestamp.UTC().Format("2006-01-02 15:04"),
 			c.Open, c.High, c.Low, c.Close, c.Volume, c.VWAP))

@@ -24,7 +24,7 @@ func TestRolePrompts_RoleSpecificMarkers(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.role, func(t *testing.T) {
 			sys, user := BuildRolePrompt(
-				tc.role, "AAPL", "swing", "1h",
+				tc.role, "AAPL", []string{"trend_following"}, "1h",
 				nil, Indicators{}, nil, Portfolio{}, "", nil, "",
 			)
 			if sys == "" {
@@ -50,7 +50,7 @@ func TestRolePrompts_RetainRRSelfFilter(t *testing.T) {
 	for _, role := range roles {
 		t.Run(role, func(t *testing.T) {
 			sys, _ := BuildRolePrompt(
-				role, "AAPL", "swing", "1h",
+				role, "AAPL", []string{"trend_following"}, "1h",
 				nil, Indicators{}, nil, Portfolio{}, "", nil, "",
 			)
 			if !strings.Contains(sys, rrSelfFilterSentence) {
@@ -64,7 +64,7 @@ func TestRolePrompts_RetainRRSelfFilter(t *testing.T) {
 // the misconfiguration and skip the role with a WARN log instead of crashing.
 func TestRolePrompts_UnknownRole(t *testing.T) {
 	sys, user := BuildRolePrompt(
-		"astrologer", "AAPL", "swing", "1h",
+		"astrologer", "AAPL", []string{"trend_following"}, "1h",
 		nil, Indicators{}, nil, Portfolio{}, "", nil, "",
 	)
 	if sys != "" || user != "" {
@@ -77,8 +77,8 @@ func TestRolePrompts_UnknownRole(t *testing.T) {
 func TestRolePrompts_ShareJSONSchema(t *testing.T) {
 	roles := []string{"fundamental", "technical", "sentiment", "risk_manager"}
 	for _, role := range roles {
-		sys, _ := BuildRolePrompt(role, "AAPL", "swing", "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
-		if !strings.Contains(sys, `"action":      "BUY" | "SELL" | "HOLD" | "WAIT"`) {
+		sys, _ := BuildRolePrompt(role, "AAPL", []string{"trend_following"}, "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+		if !strings.Contains(sys, `"action":              "BUY" | "SELL" | "HOLD" | "WAIT"`) {
 			t.Errorf("role %q does not emit the standard action enum schema", role)
 		}
 		if !strings.Contains(sys, "ONLY a valid JSON object") {
