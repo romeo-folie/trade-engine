@@ -239,6 +239,22 @@ func (c *AlpacaClient) FetchHistory(ctx context.Context, ticker string, tf Timef
 	params.Set("limit", fmt.Sprintf("%d", limit))
 	params.Set("adjustment", alpacaStockAdjustment)
 	params.Set("feed", "iex")
+	if tf == Timeframe1Day {
+		// Without an explicit range Alpaca's bars endpoint defaults to the
+		// current session, so a request for 50 daily bars returns only today's
+		// in-progress bar. That leaves close-confirmed EMA9 with no completed
+		// history during the session. Request a calendar-day buffer for weekends
+		// and holidays, then ask for the newest bars and restore chronological
+		// order for indicator consumers.
+		now := time.Now().UTC()
+		lookbackDays := limit * 3
+		if lookbackDays < 30 {
+			lookbackDays = 30
+		}
+		params.Set("start", now.AddDate(0, 0, -lookbackDays).Format(time.RFC3339))
+		params.Set("end", now.Format(time.RFC3339))
+		params.Set("sort", "desc")
+	}
 
 	resp, err := c.get(ctx, fmt.Sprintf("/v2/stocks/%s/bars", ticker), params)
 	if err != nil {
@@ -268,6 +284,13 @@ func (c *AlpacaClient) FetchHistory(ctx context.Context, ticker string, tf Timef
 			Volume:    bar.Volume,
 			VWAP:      bar.VWAP,
 		})
+	}
+	if tf == Timeframe1Day {
+		// The API response is newest-first because of sort=desc; all callers of
+		// FetchHistory expect oldest-to-newest so the final element is current.
+		for i, j := 0, len(candles)-1; i < j; i, j = i+1, j-1 {
+			candles[i], candles[j] = candles[j], candles[i]
+		}
 	}
 	return candles, nil
 }

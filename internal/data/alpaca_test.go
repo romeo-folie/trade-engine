@@ -168,6 +168,57 @@ func TestAlpacaFetchHistory_Success(t *testing.T) {
 	}
 }
 
+func TestAlpacaFetchHistory_DailyUsesBufferedRangeAndChronologicalOrder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if q.Get("timeframe") != "1Day" {
+			t.Errorf("timeframe = %q, want 1Day", q.Get("timeframe"))
+		}
+		if q.Get("sort") != "desc" {
+			t.Errorf("sort = %q, want desc", q.Get("sort"))
+		}
+		start, err := time.Parse(time.RFC3339, q.Get("start"))
+		if err != nil {
+			t.Fatalf("start = %q: %v", q.Get("start"), err)
+		}
+		end, err := time.Parse(time.RFC3339, q.Get("end"))
+		if err != nil {
+			t.Fatalf("end = %q: %v", q.Get("end"), err)
+		}
+		if !start.Before(end) || end.Sub(start) < 30*24*time.Hour {
+			t.Fatalf("daily history range = %v..%v, want at least 30 calendar days", start, end)
+		}
+
+		// Alpaca returns newest-first when sort=desc. The client must restore
+		// oldest-to-newest ordering for EMA/indicator consumers.
+		resp := alpacaBarsResponse{
+			Symbol: "TSLA",
+			Bars: []alpacaBar{
+				{Timestamp: "2024-01-03T05:00:00Z", Close: 103},
+				{Timestamp: "2024-01-02T05:00:00Z", Close: 102},
+				{Timestamp: "2024-01-01T05:00:00Z", Close: 101},
+			},
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := newTestAlpacaClient(srv.URL)
+	candles, err := client.FetchHistory(context.Background(), "TSLA", Timeframe1Day, 3)
+	if err != nil {
+		t.Fatalf("FetchHistory error: %v", err)
+	}
+	if len(candles) != 3 {
+		t.Fatalf("got %d candles, want 3", len(candles))
+	}
+	for i, want := range []float64{101, 102, 103} {
+		if candles[i].Close != want {
+			t.Errorf("candles[%d].Close = %v, want %v", i, candles[i].Close, want)
+		}
+	}
+}
+
 func TestAlpacaFetchHistory_InvalidTimeframe(t *testing.T) {
 	client := newTestAlpacaClient("http://unused")
 	_, err := client.FetchHistory(context.Background(), "AAPL", Timeframe("bad"), 5)
