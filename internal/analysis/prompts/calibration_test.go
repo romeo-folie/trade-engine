@@ -14,10 +14,10 @@ const anchorSentinel = "0.70 = clear edge"
 // calibration bundle: every system prompt — generalist, momentum, and all four
 // specialist roles — must carry the shared confidence anchors.
 func TestConfidenceAnchors_InAllSystemPrompts(t *testing.T) {
-	if sys := buildSystem([]string{"trend_following"}); !strings.Contains(sys, anchorSentinel) {
+	if sys := buildSystem(lensContract([]string{"trend_following"}), Lenses([]string{"trend_following"})); !strings.Contains(sys, anchorSentinel) {
 		t.Error("generalist system prompt is missing the confidence anchors")
 	}
-	if sys := buildMomentumSystem([]string{"momentum"}); !strings.Contains(sys, anchorSentinel) {
+	if sys := buildMomentumSystem(lensContract([]string{"momentum"}), Lenses([]string{"momentum"})); !strings.Contains(sys, anchorSentinel) {
 		t.Error("momentum system prompt is missing the confidence anchors")
 	}
 	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
@@ -32,11 +32,11 @@ func TestConfidenceAnchors_InAllSystemPrompts(t *testing.T) {
 // attached to news_sentiment and not leaked into other strategies.
 func TestStrategyGuidance_NewsSentimentOnly(t *testing.T) {
 	const marker = "STRATEGY GUIDANCE — news_sentiment"
-	if sys := buildSystem([]string{"news_sentiment"}); !strings.Contains(sys, marker) {
+	if sys := buildSystem(lensContract([]string{"news_sentiment"}), Lenses([]string{"news_sentiment"})); !strings.Contains(sys, marker) {
 		t.Error("news_sentiment system prompt is missing its strategy guidance block")
 	}
 	for _, s := range []string{"trend_following", "mean_reversion", "momentum"} {
-		if sys := buildSystem([]string{s}); strings.Contains(sys, marker) {
+		if sys := buildSystem(lensContract([]string{s}), Lenses([]string{s})); strings.Contains(sys, marker) {
 			t.Errorf("strategy %q unexpectedly contains the news_sentiment guidance block", s)
 		}
 	}
@@ -66,8 +66,8 @@ func TestPrompts_NoLeakedFormatVerbs(t *testing.T) {
 		name string
 		text string
 	}{
-		{"generalist", buildSystem([]string{"news_sentiment"})},
-		{"momentum", buildMomentumSystem([]string{"momentum"})},
+		{"generalist", buildSystem(lensContract([]string{"news_sentiment"}), Lenses([]string{"news_sentiment"}))},
+		{"momentum", buildMomentumSystem(lensContract([]string{"momentum"}), Lenses([]string{"momentum"}))},
 	}
 	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
 		sys, _ := BuildRolePrompt(role, "AAPL", []string{"trend_following"}, "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
@@ -91,10 +91,10 @@ func TestPrompts_NoLeakedFormatVerbs(t *testing.T) {
 // must ride along wherever the anchors do.
 func TestPortfolioRules_InAllSystemPrompts(t *testing.T) {
 	const sentinel = "USING PORTFOLIO CONTEXT:"
-	if sys := buildSystem([]string{"trend_following"}); !strings.Contains(sys, sentinel) {
+	if sys := buildSystem(lensContract([]string{"trend_following"}), Lenses([]string{"trend_following"})); !strings.Contains(sys, sentinel) {
 		t.Error("generalist system prompt is missing the portfolio rules")
 	}
-	if sys := buildMomentumSystem([]string{"momentum"}); !strings.Contains(sys, sentinel) {
+	if sys := buildMomentumSystem(lensContract([]string{"momentum"}), Lenses([]string{"momentum"})); !strings.Contains(sys, sentinel) {
 		t.Error("momentum system prompt is missing the portfolio rules")
 	}
 	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {

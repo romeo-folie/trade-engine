@@ -76,13 +76,28 @@ func widestHistoryWindow(windows map[string]int, primary string, strategies []st
 // under news_sentiment, and keying on the primary would wave through exactly
 // the stale-catalyst chase these gates were built to block (PR #434).
 //
+// The selection is only honoured when it was actually OFFERED to the model for
+// this ticker. Parsing accepts and normalises the field without validating it,
+// so a model can report any lens at all — and both directions are dangerous:
+// a news_sentiment-only row whose model answers "trend_following" would DISARM
+// the news confirmation gate, while an unrelated news_sentiment hallucination
+// would spuriously ARM it. Membership in the admissible set is the check that
+// makes the value trustworthy.
+//
 // Falls back to the configured primary whenever the analyst reported no usable
-// selection — empty (older model, or dropped in truncation recovery), "none"
-// (a regime-mismatch HOLD), or an unrecognised label. Falling back preserves
-// prior behaviour; trusting a bad value would silently disable the gate.
-func effectiveGateStrategy(configured, selected string) string {
-	if prompts.IsLens(selected) {
-		return strings.ToLower(strings.TrimSpace(selected))
+// selection — empty (older model, dropped in truncation recovery, or no
+// ensemble consensus), "none" (a regime-mismatch HOLD), an unrecognised label,
+// or a lens that was never on this row's menu. Falling back preserves prior
+// behaviour; trusting a bad value would silently change which gate fires.
+func effectiveGateStrategy(configured, selected string, admissible []string) string {
+	selected = strings.ToLower(strings.TrimSpace(selected))
+	if !prompts.IsLens(selected) {
+		return configured
+	}
+	for _, lens := range prompts.Lenses(admissible) {
+		if lens == selected {
+			return selected
+		}
 	}
 	return configured
 }

@@ -94,6 +94,56 @@ func IsLens(s string) bool {
 	return analysisLenses[strings.ToLower(strings.TrimSpace(s))]
 }
 
+// exitOnlyStrategies are watchlist strategies whose ONLY valid directional
+// recommendation is SELL. They are not lenses — there is nothing to select
+// among — and they must never reach the candidate-lens contract: falling back
+// to defaultLens would hand an exit-only row a trend_following prompt that can
+// answer BUY, turning a position the operator wanted closed into a pyramid.
+//
+// MUST stay in sync with risk.IsSellOnlyStrategy, which is canonical. The list
+// is duplicated rather than imported to keep the prompt layer free of a
+// dependency on risk; TestExitOnlyStrategies_MatchRiskCanonicalList in the
+// engine package fails if the two ever drift.
+var exitOnlyStrategies = map[string]bool{
+	"sell_only":      true,
+	"exit_signal":    true,
+	"close_position": true,
+}
+
+// IsExitOnlyStrategy reports whether s is an exit-only strategy.
+func IsExitOnlyStrategy(s string) bool {
+	return exitOnlyStrategies[strings.ToLower(strings.TrimSpace(s))]
+}
+
+// exitOnlyMandate replaces the candidate-lens contract for exit-only rows. It
+// preserves the pre-existing contract the engine and risk manager rely on: the
+// post-LLM ownership gate discards anything but SELL for these strategies
+// (risk.IsSellOnlyStrategy), so offering the analyst a choice would only
+// produce signals that are thrown away — or worse, a BUY that reads as a
+// legitimate add.
+func exitOnlyMandate(strategy string) string {
+	return fmt.Sprintf(`EXIT MANDATE: this ticker is on the watchlist under %q, an exit-only strategy.
+
+You are being asked ONE question: should the existing long position be closed now?
+
+- SELL is the only valid directional recommendation. Never propose BUY — this row exists to exit a position, not to add to one.
+- HOLD when the position should stay open and there is nothing to act on.
+- WAIT when an exit is warranted but you can name a specific, concrete blocker on this cycle.
+- Do not treat this as a fresh entry evaluation, and do not classify a regime or select a lens: "selected_strategy" must be %q and "rejected_strategies" must be {}.`,
+		strategy, strategy)
+}
+
+// lensContract returns the framing block for a watchlist row: the exit mandate
+// when the row is exit-only, otherwise the candidate-lens contract.
+func lensContract(strategies []string) string {
+	for _, s := range strategies {
+		if IsExitOnlyStrategy(s) {
+			return exitOnlyMandate(strings.ToLower(strings.TrimSpace(s)))
+		}
+	}
+	return candidateLensBlock(Lenses(strategies))
+}
+
 // Lenses filters a raw watchlist strategies list down to the analytical lenses
 // an analyst may choose among, preserving order and dropping duplicates,
 // unknown labels, and entry-gate tags. Never returns empty: a row with no
@@ -183,25 +233,39 @@ func lensGuidance(lenses []string) string {
 // NB: substituted via a %s verb (an argument, not a format string), so percent
 // signs must be SINGLE here — a double-escaped %% renders literally.
 //
-// "reasoning" is deliberately the FIRST key. Models generate left-to-right, so
-// the previous schema (action first, reasoning last) committed to an action and
-// then produced a justification for it: the stored reasoning was post-hoc
-// rationalisation, not the process that reached the decision.
+// KEY ORDER IS A RECOVERABILITY CONTRACT, not a style choice. Every compact
+// decision field precedes the free-text ones, because models generate
+// left-to-right and recoverPartialAnalysis needs BOTH action and confidence to
+// salvage a vote from truncated output.
+//
+// An earlier revision of this schema put "reasoning" first, reasoning that
+// action-first makes the stored explanation post-hoc rationalisation rather
+// than the process that produced the decision. That is true, but it traded a
+// real failure for a speculative gain: with most models configured at
+// max_tokens 2048 and reasoning explicitly encouraged to work through the
+// evidence, hitting the cap mid-prose emitted NO action and NO confidence, so
+// the whole analyst vote was unrecoverable and ensemble quorum could break.
+// The previous order survived exactly that truncation. Revisit only with a
+// token-budget study behind it (see issue #509); the "reason before you
+// commit" instruction below is the cheap part of the idea, kept without the
+// truncation exposure.
 const OutputSchema = `OUTPUT FORMAT — respond with ONLY a valid JSON object and no other text:
 {
-  "reasoning":           "<work through the evidence BEFORE committing to an action>",
   "regime":              "trending" | "ranging" | "transitional",
   "selected_strategy":   "<the candidate lens you selected, or none>",
-  "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
   "action":              "BUY" | "SELL" | "HOLD" | "WAIT",
   "confidence":          <float 0.0–1.0>,
   "size_pct":            <float, recommended position size as % of portfolio>,
   "stop_loss":           <float price, or 0 if HOLD/WAIT>,
-  "take_profit":         <float price, or 0 if HOLD/WAIT>
+  "take_profit":         <float price, or 0 if HOLD/WAIT>,
+  "rejected_strategies": {"<lens>": "<one clause on why it does not fit>"},
+  "reasoning":           "<the evidence that decided it — specific values, not a summary>"
 }
 
 RULES:
-- Emit the keys in the order shown. "reasoning" comes FIRST — reach your decision by writing it out; do not justify a decision already made.
+- Emit the keys in the order shown.
+- Reason through the evidence BEFORE you commit to an action. "reasoning" is emitted last for reliability, but it must record the analysis that produced your decision — not a justification assembled after it.
+- Keep "reasoning" under 150 words. Exceeding your output limit mid-sentence discards the entire response.
 - action must be exactly "BUY", "SELL", "HOLD", or "WAIT" (uppercase).
 - confidence must be between 0.0 and 1.0.
 - size_pct must be between 0.0 and 5.0 (max 5% of portfolio per position).
@@ -270,10 +334,11 @@ func BuildStockPrompt(
 	momentumPlay bool,
 ) (systemPrompt, userMessage string) {
 	lenses := Lenses(strategies)
+	contract := lensContract(strategies)
 	if momentumPlay {
-		systemPrompt = buildMomentumSystem(lenses)
+		systemPrompt = buildMomentumSystem(contract, lenses)
 	} else {
-		systemPrompt = buildSystem(lenses)
+		systemPrompt = buildSystem(contract, lenses)
 	}
 	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
 	return
@@ -282,7 +347,7 @@ func BuildStockPrompt(
 // buildMomentumSystem returns a system prompt for scanner-sourced tickers.
 // It reframes the question from "swing-trade evaluation" to "is this momentum
 // entry still valid?" — appropriate for intraday movers and news catalysts.
-func buildMomentumSystem(lenses []string) string {
+func buildMomentumSystem(contract string, lenses []string) string {
 	return fmt.Sprintf(`You are a short-term momentum trader evaluating a live entry opportunity.
 
 This ticker was flagged by an intraday screener (momentum move, news catalyst, or volume surge). Your job is to determine whether the entry is STILL valid given the current market data — the stock has already moved, so assess entry quality, not the original catalyst.
@@ -306,7 +371,7 @@ R:R SELF-FILTER (MANDATORY): Compute R:R as: reward = abs(take_profit - signal_p
 
 SIZING: momentum trades carry higher short-term risk — keep size_pct conservative (1–3%% range) unless conviction is very high.
 
-%s%s`, candidateLensBlock(lenses), OutputSchema, ConfidenceAnchors, PortfolioRules,
+%s%s`, contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
 		lensGuidance(lenses))
 }
 
@@ -318,7 +383,7 @@ SIZING: momentum trades carry higher short-term risk — keep size_pct conservat
 // entries — not merely penalized. This is intentional (the one ticker
 // currently qualifying, SBET, ran 20% over 5 trades); revisit the ceiling if
 // the gate ever moves.
-func buildSystem(lenses []string) string {
+func buildSystem(contract string, lenses []string) string {
 	return fmt.Sprintf(`You are a disciplined quantitative trading analyst.
 
 Your task is to analyse the provided market data and return a trade recommendation.
@@ -355,7 +420,7 @@ USING SIMILAR PAST ANALYSES:
 - If the majority of setups with known outcomes were losses, treat this as a headwind — lower your confidence by at least 0.10.
 - If the majority of setups with known outcomes were gains, treat this as a tailwind — you may raise your confidence by up to 0.10.
 - Entries marked "outcome unknown" carry no weight.%s`,
-		candidateLensBlock(lenses), OutputSchema, ConfidenceAnchors, PortfolioRules,
+		contract, OutputSchema, ConfidenceAnchors, PortfolioRules,
 		lensGuidance(lenses))
 }
 

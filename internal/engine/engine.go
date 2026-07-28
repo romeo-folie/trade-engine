@@ -1280,7 +1280,7 @@ func (e *Engine) runAnalysis(
 	// prefetch unset, and generateSignal then re-fetches on-demand and applies
 	// its degraded-mode handling.
 	e.generateSignal(
-		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
+		ctx, ticker, timeframe, strategy, strategies, candles, resp, analysisID,
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
 		pullbackCandidate,
 	)
@@ -1799,6 +1799,7 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 func (e *Engine) generateSignal(
 	ctx context.Context,
 	ticker, timeframe, strategy string,
+	strategies []string,
 	candles []data.Candle,
 	resp analysis.AnalysisResponse,
 	analysisID string,
@@ -1969,7 +1970,7 @@ func (e *Engine) generateSignal(
 					"ticker", ticker, "err", pcErr)
 			}
 			entryGateReason = evaluateRunupGates(
-				effectiveGateStrategy(strategy, resp.SelectedStrategy),
+				effectiveGateStrategy(strategy, resp.SelectedStrategy, strategies),
 				string(resp.Action), signalPrice, prevClose, eg,
 			)
 		}

@@ -36,7 +36,7 @@ func TestLenses_FiltersToAnalysisLenses(t *testing.T) {
 // TestCandidateLensBlock_ListsEveryAdmissibleLens is the core of the multi-lens
 // change: an analyst must see every candidate, not just the configured primary.
 func TestCandidateLensBlock_ListsEveryAdmissibleLens(t *testing.T) {
-	sys := buildSystem(Lenses([]string{"mean_reversion", "trend_following"}))
+	sys := buildSystem(lensContract([]string{"mean_reversion", "trend_following"}), Lenses([]string{"mean_reversion", "trend_following"}))
 	if !strings.Contains(sys, "CANDIDATE LENSES: mean_reversion, trend_following") {
 		t.Errorf("system prompt does not list both admissible lenses:\n%s", sys)
 	}
@@ -50,8 +50,8 @@ func TestCandidateLensBlock_ListsEveryAdmissibleLens(t *testing.T) {
 // exist: no admissible lens fits, so HOLD on regime grounds is correct.
 func TestCandidateLensBlock_EscapeHatch(t *testing.T) {
 	for _, sys := range []string{
-		buildSystem(Lenses([]string{"mean_reversion"})),
-		buildMomentumSystem(Lenses([]string{"momentum"})),
+		buildSystem(lensContract([]string{"mean_reversion"}), Lenses([]string{"mean_reversion"})),
+		buildMomentumSystem(lensContract([]string{"momentum"}), Lenses([]string{"momentum"})),
 	} {
 		if !strings.Contains(sys, "regime mismatch:") {
 			t.Error("prompt is missing the regime-mismatch escape hatch")
@@ -70,7 +70,7 @@ func TestCandidateLensBlock_EscapeHatch(t *testing.T) {
 // the only thing standing between those two readings — without it the change
 // is strictly more permissive than the single-assignment framing it replaced.
 func TestCandidateLensBlock_LensShoppingGuard(t *testing.T) {
-	sys := buildSystem(Lenses([]string{"momentum", "trend_following"}))
+	sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"}))
 	for _, want := range []string{
 		"why every REJECTED lens does not fit",
 		"Selecting a lens because it yields a tradeable setup",
@@ -82,22 +82,46 @@ func TestCandidateLensBlock_LensShoppingGuard(t *testing.T) {
 	}
 }
 
-// TestOutputSchema_ReasoningPrecedesAction: models generate left-to-right, so
-// key order decides whether the reasoning produces the decision or merely
-// rationalises one already emitted.
-func TestOutputSchema_ReasoningPrecedesAction(t *testing.T) {
-	reasoning := strings.Index(OutputSchema, `"reasoning"`)
-	action := strings.Index(OutputSchema, `"action"`)
-	if reasoning < 0 || action < 0 {
-		t.Fatalf("schema missing reasoning (%d) or action (%d)", reasoning, action)
-	}
-	if reasoning > action {
-		t.Error("\"reasoning\" must precede \"action\" in the schema, else it is post-hoc")
-	}
-	for _, want := range []string{`"selected_strategy"`, `"rejected_strategies"`, `"regime"`} {
-		if !strings.Contains(OutputSchema, want) {
-			t.Errorf("schema missing %s", want)
+// TestOutputSchema_RecoverableFieldsPrecedeProse pins the key order as a
+// RECOVERABILITY contract. recoverPartialAnalysis needs both action and
+// confidence to salvage a vote from truncated output, and models generate
+// left-to-right — so every compact decision field must precede the two
+// free-text ones.
+//
+// An earlier revision put "reasoning" first (so the reasoning would produce the
+// decision rather than rationalise it). That traded a real failure for a
+// speculative gain: at max_tokens 2048, hitting the cap mid-prose emitted no
+// action and no confidence, losing the whole analyst vote and potentially
+// breaking ensemble quorum. Do not reorder without a token-budget study.
+func TestOutputSchema_RecoverableFieldsPrecedeProse(t *testing.T) {
+	idx := func(key string) int {
+		i := strings.Index(OutputSchema, `"`+key+`"`)
+		if i < 0 {
+			t.Fatalf("schema missing key %q", key)
 		}
+		return i
+	}
+	// The two fields recoverPartialAnalysis requires must come before any
+	// unbounded free-text field.
+	for _, prose := range []string{"rejected_strategies", "reasoning"} {
+		for _, required := range []string{"action", "confidence"} {
+			if idx(required) > idx(prose) {
+				t.Errorf("%q must precede %q — truncation would otherwise lose the vote", required, prose)
+			}
+		}
+	}
+	// Lens fields are also recoverable only if they precede the prose.
+	for _, lensField := range []string{"regime", "selected_strategy"} {
+		if idx(lensField) > idx("reasoning") {
+			t.Errorf("%q must precede \"reasoning\" to survive truncation", lensField)
+		}
+	}
+	// The reason-before-deciding intent survives as an instruction.
+	if !strings.Contains(OutputSchema, "Reason through the evidence BEFORE you commit") {
+		t.Error("schema dropped the reason-before-committing instruction")
+	}
+	if !strings.Contains(OutputSchema, "under 150 words") {
+		t.Error("schema no longer bounds reasoning length (truncation exposure)")
 	}
 }
 
@@ -107,11 +131,11 @@ func TestOutputSchema_ReasoningPrecedesAction(t *testing.T) {
 // including when it is not first.
 func TestLensGuidance_AttachedWhenCandidate(t *testing.T) {
 	const marker = "STRATEGY GUIDANCE — news_sentiment"
-	sys := buildSystem(Lenses([]string{"momentum", "news_sentiment"}))
+	sys := buildSystem(lensContract([]string{"momentum", "news_sentiment"}), Lenses([]string{"momentum", "news_sentiment"}))
 	if !strings.Contains(sys, marker) {
 		t.Error("news_sentiment guidance missing when it is a non-primary candidate")
 	}
-	if sys := buildSystem(Lenses([]string{"momentum", "trend_following"})); strings.Contains(sys, marker) {
+	if sys := buildSystem(lensContract([]string{"momentum", "trend_following"}), Lenses([]string{"momentum", "trend_following"})); strings.Contains(sys, marker) {
 		t.Error("news_sentiment guidance leaked into a set that does not admit it")
 	}
 }
@@ -121,8 +145,8 @@ func TestLensGuidance_AttachedWhenCandidate(t *testing.T) {
 func TestPrompts_NoLeakedFormatVerbs_MultiLens(t *testing.T) {
 	lenses := Lenses([]string{"momentum", "news_sentiment", "trend_following"})
 	rendered := map[string]string{
-		"generalist": buildSystem(lenses),
-		"momentum":   buildMomentumSystem(lenses),
+		"generalist": buildSystem(lensContract(lenses), lenses),
+		"momentum":   buildMomentumSystem(lensContract(lenses), lenses),
 	}
 	for _, role := range []string{"fundamental", "technical", "sentiment", "risk_manager"} {
 		sys, _ := BuildRolePrompt(role, "AAPL", lenses, "1h", nil, Indicators{}, nil, Portfolio{}, "", nil, "")
@@ -174,8 +198,61 @@ func TestBuildUser_RendersEveryProvidedCandle(t *testing.T) {
 // "simplification" of that regex would silently drop the field.
 func TestExtractionContract_NestedRejectedMap(t *testing.T) {
 	lenses := Lenses([]string{"mean_reversion", "trend_following"})
-	sys := buildSystem(lenses)
+	sys := buildSystem(lensContract(lenses), lenses)
 	if !strings.Contains(sys, `"rejected_strategies": {"<lens>": "<one clause on why it does not fit>"}`) {
 		t.Error("schema no longer asks for a nested rejected_strategies object")
+	}
+}
+
+// TestExitOnlyStrategies_GetMandateNotLenses is the regression guard for the
+// contract exit-only rows depend on. sell_only / exit_signal / close_position
+// are not lenses — Lenses() drops them — so routing them through the candidate
+// -lens path would fall back to trend_following and hand an exit row a prompt
+// that can answer BUY, pyramiding a position the operator wanted closed.
+func TestExitOnlyStrategies_GetMandateNotLenses(t *testing.T) {
+	for _, strategy := range []string{"sell_only", "exit_signal", "close_position"} {
+		t.Run(strategy, func(t *testing.T) {
+			contract := lensContract([]string{strategy})
+			if !strings.Contains(contract, "EXIT MANDATE") {
+				t.Fatalf("%s did not get the exit mandate:\n%s", strategy, contract)
+			}
+			if strings.Contains(contract, "CANDIDATE LENSES") {
+				t.Error("exit-only row was offered a lens menu")
+			}
+			if strings.Contains(contract, defaultLens) {
+				t.Errorf("exit-only row leaked the %s fallback", defaultLens)
+			}
+			sys := buildSystem(contract, Lenses([]string{strategy}))
+			if !strings.Contains(sys, "Never propose BUY") {
+				t.Error("exit-only system prompt does not forbid BUY")
+			}
+		})
+	}
+}
+
+// TestExitOnlyStrategy_WinsOverCoincidentLens: a row carrying both an exit-only
+// label and a lens is still an exit row — the mandate must not be diluted.
+func TestExitOnlyStrategy_WinsOverCoincidentLens(t *testing.T) {
+	contract := lensContract([]string{"momentum", "close_position"})
+	if !strings.Contains(contract, "EXIT MANDATE") {
+		t.Error("exit-only label did not take precedence over a coincident lens")
+	}
+	if strings.Contains(contract, "CANDIDATE LENSES") {
+		t.Error("exit row was still offered a lens menu")
+	}
+}
+
+// TestTechnicalRole_NoStaleCandleLimit: the technical specialist is the role
+// responsible for confirming the trend and momentum lenses, so a hardcoded
+// "last 10 candles" instruction would defeat the widened history window
+// precisely where it matters most.
+func TestTechnicalRole_NoStaleCandleLimit(t *testing.T) {
+	sys, _ := BuildRolePrompt("technical", "KO", []string{"trend_following"}, "1d",
+		nil, Indicators{}, nil, Portfolio{}, "", nil, "")
+	if strings.Contains(sys, "last 10 OHLCV candles") {
+		t.Error("technical role still caps the analyst at 10 candles")
+	}
+	if !strings.Contains(sys, "full OHLCV candle history") {
+		t.Error("technical role does not point at the full provided history")
 	}
 }

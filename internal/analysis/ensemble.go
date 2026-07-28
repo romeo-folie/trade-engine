@@ -47,8 +47,12 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 	}
 	maxC, minC := confs[0], confs[0]
 	for _, c := range confs[1:] {
-		if c > maxC { maxC = c }
-		if c < minC { minC = c }
+		if c > maxC {
+			maxC = c
+		}
+		if c < minC {
+			minC = c
+		}
 	}
 	if maxC < minConf || maxC-minC > maxSpread {
 		logger.Debug("fast-path rejected", "maxC", maxC, "minC", minC, "spread", maxC-minC, "minConf", minConf, "maxSpread", maxSpread)
@@ -81,14 +85,53 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 		avgTP = math.Round(sumTP/float64(countTP)*10000) / 10000
 	}
 
+	fpSelected, fpRegime := consensusLens(results, action)
 	return AnalysisResponse{
-		Action:     action,
-		Confidence: avg,
-		SizePct:    avgSizePct,
-		StopLoss:   avgSL,
-		TakeProfit: avgTP,
-		Reasoning:  "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		Action:           action,
+		Confidence:       avg,
+		SizePct:          avgSizePct,
+		StopLoss:         avgSL,
+		TakeProfit:       avgTP,
+		Reasoning:        "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		SelectedStrategy: fpSelected,
+		Regime:           fpRegime,
 	}, true
+}
+
+// consensusLens returns the lens fields the aggregated response should carry
+// for a given winning action (issue #509).
+//
+// Aggregation builds a fresh AnalysisResponse field by field, so anything not
+// copied here is silently lost. That matters beyond observability:
+// effectiveGateStrategy in the engine keys the news-tape-confirmation and
+// momentum anti-chase gates off SelectedStrategy, so dropping it through the
+// ensemble would leave those gates armed against the CONFIGURED primary — the
+// precise bypass the candidate-lens change set out to close.
+//
+// Only analysts who voted for the winning action are consulted, and only a
+// unanimous selection among them is carried: a split means the ensemble has no
+// single lens to attribute the decision to, and inventing one would corrupt
+// both the gate and the divergence measurement. Empty is the honest answer,
+// and every consumer already falls back safely on it.
+func consensusLens(results []AnalystResult, winner Action) (selected, regime string) {
+	first := true
+	for _, r := range successfulResults(results) {
+		if r.Response.Action != winner {
+			continue
+		}
+		if first {
+			selected, regime = r.Response.SelectedStrategy, r.Response.Regime
+			first = false
+			continue
+		}
+		if r.Response.SelectedStrategy != selected {
+			selected = ""
+		}
+		if r.Response.Regime != regime {
+			regime = ""
+		}
+	}
+	return selected, regime
 }
 
 // ─── Arbiter ───────────────────────────────────────────────────────────────────
@@ -158,6 +201,13 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		"confidence", fmt.Sprintf("%.3f", resp.Confidence),
 		"dissent", dissentSummary != "", "latency_ms", meta.LatencyMs,
 	)
+	// The arbiter's own schema carries no lens fields, so backfill them from the
+	// analysts who reached the same verdict. Without this the arbitrated path —
+	// which produces the majority of live signals — would always report an empty
+	// selection and silently disarm the selected-lens entry gates.
+	if resp.SelectedStrategy == "" {
+		resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
+	}
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
 }
 
@@ -271,10 +321,13 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 			break
 		}
 	}
+	mvSelected, mvRegime := consensusLens(results, winner)
 	return AnalysisResponse{
 		Action: winner, Confidence: avgConf,
 		SizePct: ref.SizePct, StopLoss: ref.StopLoss, TakeProfit: ref.TakeProfit,
-		Reasoning: fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		Reasoning:        fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		SelectedStrategy: mvSelected,
+		Regime:           mvRegime,
 	}, true
 }
 

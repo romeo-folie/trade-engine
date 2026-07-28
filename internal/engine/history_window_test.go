@@ -3,7 +3,9 @@ package engine
 import (
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/risk"
 )
 
 // TestWidestHistoryWindow: with every admissible lens now selectable by the
@@ -93,31 +95,52 @@ func TestEffectiveGateStrategy(t *testing.T) {
 		name       string
 		configured string
 		selected   string
+		admissible []string
 		want       string
 	}{
 		{
 			name:       "analyst selection wins over configured primary",
 			configured: "trend_following",
 			selected:   "news_sentiment",
+			admissible: []string{"trend_following", "news_sentiment"},
 			want:       "news_sentiment",
 		},
 		{
 			name:       "momentum selected on a non-momentum row still arms anti-chase",
 			configured: "mean_reversion",
 			selected:   "momentum",
+			admissible: []string{"mean_reversion", "momentum"},
 			want:       "momentum",
 		},
-		{"empty selection falls back", "news_sentiment", "", "news_sentiment"},
-		{"regime-mismatch none falls back", "news_sentiment", "none", "news_sentiment"},
-		{"unknown label falls back", "news_sentiment", "vibes", "news_sentiment"},
-		{"entry-gate tag is not a lens", "momentum", "pullback_strength", "momentum"},
-		{"case and space normalized", "momentum", " News_Sentiment ", "news_sentiment"},
+		{
+			// A lens the model was never offered must not be trusted: it would
+			// spuriously ARM the news gate on a row that never admitted it.
+			name:       "lens outside the admissible set falls back",
+			configured: "momentum",
+			selected:   "news_sentiment",
+			admissible: []string{"momentum"},
+			want:       "momentum",
+		},
+		{
+			// The mirror risk: a model answering trend_following on a
+			// news_sentiment-only row would DISARM the news confirmation gate.
+			name:       "off-menu selection cannot disarm a gate",
+			configured: "news_sentiment",
+			selected:   "trend_following",
+			admissible: []string{"news_sentiment"},
+			want:       "news_sentiment",
+		},
+		{"empty selection falls back", "news_sentiment", "", []string{"news_sentiment"}, "news_sentiment"},
+		{"regime-mismatch none falls back", "news_sentiment", "none", []string{"news_sentiment"}, "news_sentiment"},
+		{"unknown label falls back", "news_sentiment", "vibes", []string{"news_sentiment"}, "news_sentiment"},
+		{"entry-gate tag is not a lens", "momentum", "pullback_strength", []string{"momentum"}, "momentum"},
+		{"case and space normalized", "momentum", " News_Sentiment ", []string{"momentum", "news_sentiment"}, "news_sentiment"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := effectiveGateStrategy(tc.configured, tc.selected); got != tc.want {
-				t.Errorf("effectiveGateStrategy(%q, %q) = %q, want %q",
-					tc.configured, tc.selected, got, tc.want)
+			if got := effectiveGateStrategy(tc.configured, tc.selected, tc.admissible); got != tc.want {
+				t.Errorf("effectiveGateStrategy(%q, %q, %v) = %q, want %q",
+					tc.configured, tc.selected, tc.admissible, got, tc.want)
 			}
 		})
 	}
@@ -130,7 +153,8 @@ func TestRunupGates_FireOnSelectedLens(t *testing.T) {
 	cfg := config.EntryGatesConfig{NewsMinRunupPct: 2.0, MomentumMaxRunupPct: 2.0}
 	// Price flat vs prior close: the tape never confirmed the headline.
 	reason := evaluateRunupGates(
-		effectiveGateStrategy("trend_following", "news_sentiment"),
+		effectiveGateStrategy("trend_following", "news_sentiment",
+			[]string{"trend_following", "news_sentiment"}),
 		"BUY", 100.0, 100.0, cfg,
 	)
 	if reason == "" {
@@ -164,5 +188,27 @@ func TestLensDivergenceSignal(t *testing.T) {
 					tc.configured, tc.selected, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestExitOnlyStrategies_MatchRiskCanonicalList is the drift guard named in the
+// prompts package: prompts.IsExitOnlyStrategy duplicates risk.IsSellOnlyStrategy
+// to keep the prompt layer free of a dependency on risk. If the two ever
+// disagree, an exit-only row silently gets the candidate-lens prompt (which can
+// answer BUY) while the risk layer still discards everything but SELL.
+func TestExitOnlyStrategies_MatchRiskCanonicalList(t *testing.T) {
+	for _, s := range []string{"sell_only", "exit_signal", "close_position"} {
+		if !risk.IsSellOnlyStrategy(s) {
+			t.Errorf("risk.IsSellOnlyStrategy(%q) = false — canonical list changed", s)
+		}
+		if !prompts.IsExitOnlyStrategy(s) {
+			t.Errorf("prompts.IsExitOnlyStrategy(%q) = false — lists have drifted", s)
+		}
+	}
+	for _, s := range []string{"trend_following", "mean_reversion", "momentum", "news_sentiment"} {
+		if risk.IsSellOnlyStrategy(s) != prompts.IsExitOnlyStrategy(s) {
+			t.Errorf("lists disagree on %q: risk=%v prompts=%v",
+				s, risk.IsSellOnlyStrategy(s), prompts.IsExitOnlyStrategy(s))
+		}
 	}
 }
