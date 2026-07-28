@@ -1166,6 +1166,10 @@ type ScannerConfig struct {
 	// Default: 20.
 	TopActives int `yaml:"top_actives"`
 
+	// PromotionMaxPerIndustry bounds how many scanner candidates from one
+	// known industry may enter the watchlist in a scan. Zero preserves legacy behavior.
+	PromotionMaxPerIndustry int `yaml:"max_promotions_per_industry"`
+
 	// Universe configures the point-in-time, full-market stock universe used by
 	// leadership and industry scanners. It is independent of the daily
 	// movers/actives pool and defaults off so existing scanner behavior is
@@ -2047,6 +2051,9 @@ func validateInstrumentStrategyParams(prefix string, inst Instrument, defaultRR 
 
 func Validate(cfg *Config) []string {
 	var errs []string
+	if cfg.Scanner.PromotionMaxPerIndustry < 0 {
+		errs = append(errs, "scanner.max_promotions_per_industry must be >= 0")
+	}
 
 	validModes := map[string]bool{
 		"manual": true, "auto": true, "paper": true,

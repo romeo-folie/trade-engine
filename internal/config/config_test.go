@@ -265,6 +265,20 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 	}
 }
 
+func TestValidateScannerPromotionConstraints(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.PromotionMaxPerIndustry = 2
+	if errs := Validate(cfg); containsStr(errs, "scanner.max_") {
+		t.Fatalf("valid promotion constraints rejected: %v", errs)
+	}
+
+	cfg.Scanner.PromotionMaxPerIndustry = -1
+	if !containsStr(Validate(cfg), "scanner.max_promotions_per_industry") {
+		t.Fatal("negative per-industry cap should be rejected")
+	}
+
+}
+
 func TestValidateExitPolicyConfig(t *testing.T) {
 	cfg := Defaults()
 	cfg.Risk.TrailingStop.Rule = "ema9"

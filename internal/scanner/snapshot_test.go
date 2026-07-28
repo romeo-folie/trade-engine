@@ -62,6 +62,21 @@ func TestScanRecorderRetainsEveryTerminalStage(t *testing.T) {
 	}
 }
 
+func TestScanRecorderPreservesPromotionSuppressionReason(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	candidate := SwingCandidate{Ticker: "  SMALL  "}
+	recorder.register([]SwingCandidate{candidate})
+	recorder.scored(candidate, SwingScoreResult{Action: "add", Conviction: .9}, nil, .55)
+	recorder.promotionRejected(candidate.Ticker, "industry_cap")
+	recorder.selected(nil)
+
+	got := recorder.candidates[candidate.Ticker]
+	if got.FinalStage != "promotion_suppressed" || got.FailureStage != "promotion" ||
+		got.FailureReason != "industry_cap" {
+		t.Fatalf("promotion suppression was not preserved: %+v", got)
+	}
+}
+
 func TestScanRecorderRegisterPreservesMultiSourceLineage(t *testing.T) {
 	recorder := &scanRecorder{
 		candidates: make(map[string]*store.ScannerCandidateSnapshot),

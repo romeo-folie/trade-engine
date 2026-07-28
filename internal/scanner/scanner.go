@@ -327,6 +327,22 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 	// 7. Sort by conviction descending, take only as many as available slots.
 	sortByConviction(scored)
+	if s.Cfg.PromotionMaxPerIndustry > 0 {
+		promotionInput := scored
+		var rejected []PromotionRejection
+		scored, rejected = selectScoredForPromotion(scored, slots, s.Cfg.PromotionMaxPerIndustry)
+		for _, rejected := range rejected {
+			reason := rejected.Reason
+			if rejected.ConflictKey != "" {
+				reason += ": " + rejected.ConflictKey
+			}
+			if rejected.Candidate.Index >= 0 && rejected.Candidate.Index < len(promotionInput) {
+				sc := promotionInput[rejected.Candidate.Index]
+				s.markDiscoveryCandidate(ctx, sc.candidate, "cap_suppressed", recorder.run.ID, reason)
+				recorder.promotionRejected(sc.candidate.Ticker, reason)
+			}
+		}
+	}
 	if len(scored) > slots {
 		for _, suppressed := range scored[slots:] {
 			s.markDiscoveryCandidate(
