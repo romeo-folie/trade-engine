@@ -4,7 +4,28 @@ import (
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
+	"github.com/romeo-folie/trade-engine/internal/config"
 )
+
+func TestCandidateTTLDaysUsesSourcePolicy(t *testing.T) {
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{
+		TTLDays:        3,
+		WeeklyLeader:   config.WeeklyLeaderConfig{TTLDays: 10},
+		PotentIndustry: config.PotentIndustryConfig{TTLDays: 5},
+	}}
+	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"mover"}}); got != 3 {
+		t.Fatalf("ordinary TTL = %d, want 3", got)
+	}
+	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"weekly_leader"}}); got != 10 {
+		t.Fatalf("weekly TTL = %d, want 10", got)
+	}
+	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"potent_industry"}}); got != 5 {
+		t.Fatalf("industry TTL = %d, want 5", got)
+	}
+	if got := scanner.candidateTTLDays(SwingCandidate{Sources: []string{"weekly_leader", "potent_industry"}}); got != 10 {
+		t.Fatalf("multi-source TTL = %d, want longest source TTL 10", got)
+	}
+}
 
 func TestParseSwingResult_AcceptsLowercaseAdd(t *testing.T) {
 	raw := `{"action":"add","conviction":0.72,"setup_type":"news_catalyst","strategy":"news_sentiment","timeframes":["1D"],"reasoning":"earnings beat"}`

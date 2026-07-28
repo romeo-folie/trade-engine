@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"testing"
@@ -74,6 +75,30 @@ func TestScanRecorderPreservesPromotionSuppressionReason(t *testing.T) {
 	if got.FinalStage != "promotion_suppressed" || got.FailureStage != "promotion" ||
 		got.FailureReason != "industry_cap" {
 		t.Fatalf("promotion suppression was not preserved: %+v", got)
+	}
+}
+
+func TestScanRecorderMergesCorrelationAvailabilityEvidence(t *testing.T) {
+	recorder := &scanRecorder{candidates: make(map[string]*store.ScannerCandidateSnapshot)}
+	candidate := SwingCandidate{Ticker: "MERGE"}
+	recorder.register([]SwingCandidate{candidate})
+	recorder.promotionCorrelationUnavailable(candidate.Ticker, map[string]string{
+		"MISSING": "provider timeout",
+	})
+	recorder.promotionRejectedWithEvidence(candidate.Ticker, PromotionRejection{
+		Reason: "correlation_cap", ConflictKey: "HELD", ConflictCorrelation: .91,
+	})
+
+	var got map[string]any
+	if err := json.Unmarshal(recorder.candidates[candidate.Ticker].PromotionEvidence, &got); err != nil {
+		t.Fatalf("promotion evidence: %v", err)
+	}
+	if got["reason"] != "correlation_cap" || got["conflict_key"] != "HELD" {
+		t.Fatalf("rejection evidence = %+v", got)
+	}
+	missing, ok := got["correlation_unavailable"].(map[string]any)
+	if !ok || missing["MISSING"] != "provider timeout" {
+		t.Fatalf("availability evidence = %+v", got["correlation_unavailable"])
 	}
 }
 

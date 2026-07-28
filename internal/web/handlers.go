@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -60,6 +61,44 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/orb/performance", s.handleORBPerformance)
 	mux.HandleFunc("/api/orb/flags", s.handleORBFlags)
 	mux.HandleFunc("/api/orb/flags/", s.handleORBFlagResolve) // POST /api/orb/flags/:id/resolve
+	mux.HandleFunc("/api/scanner/promotion-evidence", s.handleScannerPromotionEvidence)
+}
+
+func (s *Server) handleScannerPromotionEvidence(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	to := time.Now().UTC()
+	from := to.AddDate(0, 0, -30)
+	if value := r.URL.Query().Get("from"); value != "" {
+		parsed, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			apiError(w, "invalid from date", err)
+			return
+		}
+		from = parsed.UTC()
+	}
+	if value := r.URL.Query().Get("to"); value != "" {
+		parsed, err := time.Parse("2006-01-02", value)
+		if err != nil {
+			apiError(w, "invalid to date", err)
+			return
+		}
+		to = parsed.UTC().AddDate(0, 0, 1)
+	}
+	if !from.Before(to) {
+		apiError(w, "invalid date range", fmt.Errorf("from must be before to"))
+		return
+	}
+	queryCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	evidence, err := store.ListScannerPromotionEvidence(queryCtx, from, to)
+	if err != nil {
+		apiError(w, "scanner promotion evidence query failed", err)
+		return
+	}
+	jsonResponse(w, map[string]any{"evidence": evidence})
 }
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
@@ -158,10 +197,10 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 			}
 
 			jsonResponse(w, map[string]any{
-				"TotalValue":       acct.Equity,
-				"Cash":             acct.Cash,
-				"Invested":         invested,
-				"UnrealizedPnL":    unrealizedPnL,
+				"TotalValue":    acct.Equity,
+				"Cash":          acct.Cash,
+				"Invested":      invested,
+				"UnrealizedPnL": unrealizedPnL,
 				// IBKR does not expose prior-day close; guard to avoid showing
 				// full equity as DayPnL when LastEquity is zero.
 				"DayPnL": func() float64 {

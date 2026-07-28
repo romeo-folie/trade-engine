@@ -107,6 +107,35 @@ func TestDefaultsWeeklyLeaderDisabled(t *testing.T) {
 	}
 }
 
+func TestDefaultsPromotionCorrelationDisabled(t *testing.T) {
+	scanner := Defaults().Scanner
+	if scanner.PromotionCorrelationEnabled || scanner.PromotionMaxAbsCorrelation != .85 ||
+		scanner.PromotionCorrelationLookbackDays != 60 || scanner.PromotionCorrelationMinOverlap != 30 {
+		t.Fatalf("unexpected promotion correlation defaults: %+v", scanner)
+	}
+}
+
+func TestValidatePromotionCorrelationRequiresScanner(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.PromotionCorrelationEnabled = true
+	if errs := Validate(cfg); !containsStr(errs, "promotion_correlation_enabled") {
+		t.Fatalf("expected scanner dependency validation error, got %v", errs)
+	}
+	cfg.Scanner.Enabled = true
+	cfg.Scanner.PromotionCorrelationMinOverlap = cfg.Scanner.PromotionCorrelationLookbackDays + 1
+	if errs := Validate(cfg); !containsStr(errs, "promotion_correlation_min_overlap") {
+		t.Fatalf("expected overlap validation error, got %v", errs)
+	}
+}
+
+func TestValidatePromotionCorrelationThresholdEvenWhenDisabled(t *testing.T) {
+	cfg := Defaults()
+	cfg.Scanner.PromotionMaxAbsCorrelation = 0
+	if errs := Validate(cfg); !containsStr(errs, "promotion_max_abs_correlation") {
+		t.Fatalf("expected threshold validation error while disabled, got %v", errs)
+	}
+}
+
 func TestValidateWeeklyLeaderConfig(t *testing.T) {
 	valid := Defaults()
 	valid.Scanner.Enabled = true

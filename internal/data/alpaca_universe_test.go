@@ -269,7 +269,7 @@ func TestAlpacaUniverseDailyBarsPartialBatchFailure(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		symbols := r.URL.Query().Get("symbols")
 		if symbols == "C" {
-			http.Error(w, "unsupported", http.StatusBadRequest)
+			http.Error(w, `{"message":"invalid symbol: C"}`, http.StatusBadRequest)
 			return
 		}
 		_ = json.NewEncoder(w).Encode(alpacaBulkBarsResponse{
@@ -291,6 +291,21 @@ func TestAlpacaUniverseDailyBarsPartialBatchFailure(t *testing.T) {
 	}
 	if len(got.Bars) != 2 || got.Failures["C"] == nil {
 		t.Fatalf("partial result = %+v", got)
+	}
+}
+
+func TestAlpacaUniverseDailyBarsTransportFailureReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "rate limited", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+	from := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	to := time.Date(2026, 7, 26, 0, 0, 0, 0, time.UTC)
+	got, err := newTestAlpacaUniverseClient(srv.URL).FetchDailyBars(
+		context.Background(), []string{"A", "B"}, from, to, 2,
+	)
+	if err == nil || !strings.Contains(err.Error(), "daily-bars batch") {
+		t.Fatalf("transport error = %v, result = %+v", err, got)
 	}
 }
 

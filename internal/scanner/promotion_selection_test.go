@@ -1,11 +1,21 @@
 package scanner
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+type emptyDailyBarsProvider struct{}
+
+func (emptyDailyBarsProvider) FetchDailyBars(context.Context, []string, time.Time, time.Time, int) (data.DailyBarsBatchResult, error) {
+	return data.DailyBarsBatchResult{}, nil
+}
 
 func TestSelectPromotionCandidatesDeterministicCaps(t *testing.T) {
 	result := SelectPromotionCandidates([]PromotionCandidate{
@@ -82,6 +92,41 @@ func TestSelectPromotionCandidatesCorrelationEitherDirection(t *testing.T) {
 	if len(result.Rejected) != 2 || result.Rejected[0].Reason != "correlation_cap" ||
 		result.Rejected[1].ConflictKey != "A" {
 		t.Fatalf("rejected = %+v, want correlation rejections against A", result.Rejected)
+	}
+}
+
+func TestSelectPromotionCandidatesRejectsCorrelatedExposure(t *testing.T) {
+	result := SelectPromotionCandidates([]PromotionCandidate{
+		{Key: "NEW", Score: .9, ExposureCorrelations: map[string]float64{"held": .91}},
+		{Key: "OTHER", Score: .8, ExposureCorrelations: map[string]float64{"held": .20}},
+	}, 0, 0, .85)
+	if len(result.Selected) != 1 || result.Selected[0].Key != "OTHER" {
+		t.Fatalf("selected = %+v, want only uncorrelated candidate", result.Selected)
+	}
+	if len(result.Rejected) != 1 || result.Rejected[0].Reason != "exposure_correlation_cap" ||
+		result.Rejected[0].ConflictKey != "HELD" {
+		t.Fatalf("rejected = %+v, want held exposure attribution", result.Rejected)
+	}
+}
+
+func TestCorrelationModeRequiresDailyBarsProvider(t *testing.T) {
+	scanner := &MarketScanner{Cfg: config.ScannerConfig{PromotionCorrelationEnabled: true}}
+	if err := scanner.runScan(context.Background()); err == nil {
+		t.Fatal("correlation mode accepted a missing daily-bars provider")
+	}
+}
+
+func TestCorrelationModeRequiresDatabase(t *testing.T) {
+	if store.IsConnected() {
+		t.Skip("requires the database to be disconnected")
+	}
+	scanner := &MarketScanner{
+		Cfg:       config.ScannerConfig{PromotionCorrelationEnabled: true},
+		DailyBars: emptyDailyBarsProvider{},
+	}
+	err := scanner.runScan(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "database is unavailable") {
+		t.Fatalf("correlation mode database guard = %v", err)
 	}
 }
 

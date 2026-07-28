@@ -2,8 +2,20 @@ package data
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
+
+// DailyBarsBatchError identifies a provider failure for one requested batch.
+// Callers that need an audit denominator can attribute it only to Symbols;
+// the error still propagates so safety-sensitive consumers fail closed.
+type DailyBarsBatchError struct {
+	Symbols []string
+	Err     error
+}
+
+func (e *DailyBarsBatchError) Error() string { return fmt.Sprintf("daily-bars batch: %v", e.Err) }
+func (e *DailyBarsBatchError) Unwrap() error { return e.Err }
 
 // StockAsset is provider-neutral evidence that a US equity existed and was
 // available to the provider at ObservedAt. AssetID is the provider's durable

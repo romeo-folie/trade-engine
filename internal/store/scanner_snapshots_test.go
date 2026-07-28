@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -98,6 +99,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 			LLMAction:          "skip",
 			LLMConviction:      .2,
 			FinalStage:         "llm_skipped",
+			PromotionEvidence:  json.RawMessage(`{"reason":"exposure_correlation_cap","conflict_key":"HELD","conflict_correlation":0.91}`),
 		},
 	})
 	if err != nil {
@@ -130,6 +132,19 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 			"extended snapshot = universe=%q as_of=%s regime=%q scores=%s member=%v err=%v",
 			storedUniverseID, storedUniverseAsOf, regime, sourceScores, universeMember, err,
 		)
+	}
+	evidence, err := store.ListScannerPromotionEvidence(
+		ctx, startedAt.Add(-time.Minute), startedAt.Add(time.Minute),
+	)
+	if err != nil || len(evidence) != 1 {
+		t.Fatalf("promotion evidence = %+v, err=%v", evidence, err)
+	}
+	var gotEvidence, wantEvidence map[string]any
+	_ = json.Unmarshal(evidence[0].Evidence, &gotEvidence)
+	_ = json.Unmarshal(json.RawMessage(`{"reason":"exposure_correlation_cap","conflict_key":"HELD","conflict_correlation":0.91}`), &wantEvidence)
+	if evidence[0].Ticker != "SNAP_B" ||
+		evidence[0].Stage != "llm_skipped" || !reflect.DeepEqual(gotEvidence, wantEvidence) {
+		t.Fatalf("promotion evidence = %+v, err=%v", evidence, err)
 	}
 
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{

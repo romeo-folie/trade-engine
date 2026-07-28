@@ -10,16 +10,19 @@ import (
 // bounded, diversified set of candidates for watchlist promotion. Key must be
 // stable (normally the normalized ticker). Correlations are keyed by the
 // other candidate's Key and may be supplied in either direction.
+// ExposureCorrelations are keyed by active watchlist/open-position ticker and
+// are checked before candidate-to-candidate caps.
 type PromotionCandidate struct {
 	// Index identifies the candidate in the caller's original slice. It keeps
 	// audit attribution correct when normalized keys collide.
-	Index               int
-	Key                 string
-	Industry            string
-	TaxonomyStatus      string
-	TaxonomyCapExcluded bool
-	Score               float64
-	Correlations        map[string]float64
+	Index                int
+	Key                  string
+	Industry             string
+	TaxonomyStatus       string
+	TaxonomyCapExcluded  bool
+	Score                float64
+	Correlations         map[string]float64
+	ExposureCorrelations map[string]float64
 }
 
 // PromotionSelection records both accepted candidates and deterministic
@@ -30,9 +33,10 @@ type PromotionSelection struct {
 }
 
 type PromotionRejection struct {
-	Candidate   PromotionCandidate
-	Reason      string
-	ConflictKey string
+	Candidate           PromotionCandidate
+	Reason              string
+	ConflictKey         string
+	ConflictCorrelation float64
 }
 
 // SelectPromotionCandidates ranks candidates by descending score (then key),
@@ -100,9 +104,15 @@ func SelectPromotionCandidates(
 			continue
 		}
 		if maxAbsCorrelation > 0 {
-			if conflict := promotionCorrelationConflict(candidate, result.Selected, maxAbsCorrelation); conflict != "" {
+			if conflict, correlation := promotionExposureConflict(candidate, maxAbsCorrelation); conflict != "" {
 				result.Rejected = append(result.Rejected, PromotionRejection{
-					Candidate: candidate, Reason: "correlation_cap", ConflictKey: conflict,
+					Candidate: candidate, Reason: "exposure_correlation_cap", ConflictKey: conflict, ConflictCorrelation: correlation,
+				})
+				continue
+			}
+			if conflict, correlation := promotionCorrelationConflict(candidate, result.Selected, maxAbsCorrelation); conflict != "" {
+				result.Rejected = append(result.Rejected, PromotionRejection{
+					Candidate: candidate, Reason: "correlation_cap", ConflictKey: conflict, ConflictCorrelation: correlation,
 				})
 				continue
 			}
@@ -115,20 +125,44 @@ func SelectPromotionCandidates(
 	return result
 }
 
+func promotionExposureConflict(candidate PromotionCandidate, threshold float64) (string, float64) {
+	keys := make([]string, 0, len(candidate.ExposureCorrelations))
+	for key := range candidate.ExposureCorrelations {
+		keys = append(keys, normalizePromotionKey(key))
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		correlation, ok := normalizedCorrelation(candidate.ExposureCorrelations, key)
+		if ok && math.Abs(correlation) >= threshold {
+			return key, correlation
+		}
+	}
+	return "", 0
+}
+
 func selectScoredForPromotion(
 	scored []scoredCandidate, slots, maxPerIndustry int,
+) ([]scoredCandidate, []PromotionRejection) {
+	return selectScoredForPromotionWithCorrelation(scored, slots, maxPerIndustry, 0)
+}
+
+func selectScoredForPromotionWithCorrelation(
+	scored []scoredCandidate, slots, maxPerIndustry int,
+	maxAbsCorrelation float64,
 ) ([]scoredCandidate, []PromotionRejection) {
 	candidates := make([]PromotionCandidate, 0, len(scored))
 	for index, scoredCandidate := range scored {
 		candidates = append(candidates, PromotionCandidate{
 			Index: index, Key: scoredCandidate.candidate.Ticker,
-			Industry:            scoredCandidate.candidate.Industry,
-			TaxonomyStatus:      scoredCandidate.candidate.TaxonomyStatus,
-			TaxonomyCapExcluded: scoredCandidate.candidate.promotionTaxonomyExcluded,
-			Score:               scoredCandidate.score.Conviction,
+			Industry:             scoredCandidate.candidate.Industry,
+			TaxonomyStatus:       scoredCandidate.candidate.TaxonomyStatus,
+			TaxonomyCapExcluded:  scoredCandidate.candidate.promotionTaxonomyExcluded,
+			Score:                scoredCandidate.score.Conviction,
+			Correlations:         scoredCandidate.correlations,
+			ExposureCorrelations: scoredCandidate.exposureCorrelations,
 		})
 	}
-	selection := SelectPromotionCandidates(candidates, slots, maxPerIndustry, 0)
+	selection := SelectPromotionCandidates(candidates, slots, maxPerIndustry, maxAbsCorrelation)
 	filtered := make([]scoredCandidate, 0, len(selection.Selected))
 	for _, candidate := range selection.Selected {
 		if candidate.Index >= 0 && candidate.Index < len(scored) {
@@ -207,7 +241,7 @@ func promotionScore(score float64) float64 {
 
 func promotionCorrelationConflict(
 	candidate PromotionCandidate, selected []PromotionCandidate, threshold float64,
-) string {
+) (string, float64) {
 	for _, prior := range selected {
 		correlation, ok := candidate.Correlations[prior.Key]
 		if !ok {
@@ -220,10 +254,10 @@ func promotionCorrelationConflict(
 			correlation, ok = normalizedCorrelation(prior.Correlations, candidate.Key)
 		}
 		if ok && math.Abs(correlation) >= threshold {
-			return prior.Key
+			return prior.Key, correlation
 		}
 	}
-	return ""
+	return "", 0
 }
 
 func normalizedCorrelation(values map[string]float64, target string) (float64, bool) {

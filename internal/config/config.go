@@ -1171,6 +1171,13 @@ type ScannerConfig struct {
 	// point-in-time scanner universe; zero preserves legacy behavior.
 	PromotionMaxPerIndustry int `yaml:"max_promotions_per_industry"`
 
+	// PromotionCorrelationEnabled enables the additive correlation/exposure
+	// selector. False preserves the legacy promotion path byte-for-byte.
+	PromotionCorrelationEnabled      bool    `yaml:"promotion_correlation_enabled"`
+	PromotionMaxAbsCorrelation       float64 `yaml:"promotion_max_abs_correlation"`
+	PromotionCorrelationLookbackDays int     `yaml:"promotion_correlation_lookback_days"`
+	PromotionCorrelationMinOverlap   int     `yaml:"promotion_correlation_min_overlap"`
+
 	// Universe configures the point-in-time, full-market stock universe used by
 	// leadership and industry scanners. It is independent of the daily
 	// movers/actives pool and defaults off so existing scanner behavior is
@@ -1221,6 +1228,7 @@ type WeeklyLeaderConfig struct {
 	BatchSize              int     `yaml:"batch_size"`
 	// RunLeaseMinutes bounds both scheduled-run and candidate-promotion claims.
 	RunLeaseMinutes int `yaml:"run_lease_minutes"`
+	TTLDays         int `yaml:"ttl_days"`
 }
 
 // PotentIndustryConfig controls deterministic, point-in-time industry breadth
@@ -1252,6 +1260,7 @@ type PotentIndustryConfig struct {
 	BatchSize                  int               `yaml:"batch_size"`
 	// RunLeaseMinutes bounds scheduled-run claims.
 	RunLeaseMinutes int `yaml:"run_lease_minutes"`
+	TTLDays         int `yaml:"ttl_days"`
 }
 
 // PremarketEpisodicConfig controls deterministic premarket gap observations.
@@ -2059,6 +2068,22 @@ func Validate(cfg *Config) []string {
 		errs = append(errs,
 			"scanner.max_promotions_per_industry requires scanner.universe.enabled=true")
 	}
+	if cfg.Scanner.PromotionMaxAbsCorrelation <= 0 || cfg.Scanner.PromotionMaxAbsCorrelation > 1 ||
+		math.IsNaN(cfg.Scanner.PromotionMaxAbsCorrelation) || math.IsInf(cfg.Scanner.PromotionMaxAbsCorrelation, 0) {
+		errs = append(errs, "scanner.promotion_max_abs_correlation must be in (0,1]")
+	}
+	if cfg.Scanner.PromotionCorrelationEnabled {
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, "scanner.promotion_correlation_enabled requires scanner.enabled=true")
+		}
+		if cfg.Scanner.PromotionCorrelationLookbackDays <= 0 {
+			errs = append(errs, "scanner.promotion_correlation_lookback_days must be > 0")
+		}
+		if cfg.Scanner.PromotionCorrelationMinOverlap <= 0 ||
+			cfg.Scanner.PromotionCorrelationMinOverlap > cfg.Scanner.PromotionCorrelationLookbackDays {
+			errs = append(errs, "scanner.promotion_correlation_min_overlap must be in (0,lookback]")
+		}
+	}
 
 	validModes := map[string]bool{
 		"manual": true, "auto": true, "paper": true,
@@ -2178,6 +2203,9 @@ func Validate(cfg *Config) []string {
 		if leader.MaxPromotionsPerRun <= 0 {
 			errs = append(errs, "scanner.weekly_leader.max_promotions_per_run must be > 0")
 		}
+		if leader.TTLDays <= 0 {
+			errs = append(errs, "scanner.weekly_leader.ttl_days must be > 0")
+		}
 		if leader.UniverseMaxAgeHours <= 0 {
 			errs = append(errs, "scanner.weekly_leader.universe_max_age_hours must be > 0")
 		} else if !durationConfigFits(leader.UniverseMaxAgeHours, time.Hour) {
@@ -2232,6 +2260,9 @@ func Validate(cfg *Config) []string {
 			errs = append(errs,
 				"scanner.weekly_leader.run_lease_minutes overflows time.Duration")
 		}
+	}
+	if industry := cfg.Scanner.PotentIndustry; industry.Enabled && industry.TTLDays <= 0 {
+		errs = append(errs, "scanner.potent_industry.ttl_days must be > 0")
 	}
 	if industry := cfg.Scanner.PotentIndustry; industry.Enabled {
 		const prefix = "scanner.potent_industry"

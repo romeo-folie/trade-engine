@@ -134,6 +134,16 @@ func TestFilterActiveCandidatesDoesNotPromoteLowerQuartiles(t *testing.T) {
 	}
 }
 
+func TestFilterActiveCandidatesNormalizesTickerKeys(t *testing.T) {
+	got := filterActiveCandidates(
+		[]SwingCandidate{{Ticker: " aapl "}, {Ticker: "MSFT"}},
+		map[string]struct{}{"AAPL": {}},
+	)
+	if len(got) != 1 || got[0].Ticker != "MSFT" {
+		t.Fatalf("normalized active filter = %+v", got)
+	}
+}
+
 func TestMarkPullbackQualificationKeepsStandardCandidates(t *testing.T) {
 	all := []SwingCandidate{
 		{Ticker: "STANDARD", Price: 10},

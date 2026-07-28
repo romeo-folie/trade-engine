@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"sort"
 	"time"
@@ -29,18 +30,22 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 	}
 	return &scanRecorder{
 		run: store.ScannerRun{
-			StartedAt:                    startedAt,
-			PullbackUniverseEnabled:      s.PullbackUniverseEnabled,
-			PullbackMinMomentumReturnPct: minMomentum,
-			PullbackMinMarketCapMM:       pullbackMinMarketCapMM,
-			PullbackMinDollarVolume:      pullbackMinDollarVolume,
-			CandidateCap:                 cap,
-			MinConviction:                s.Cfg.MinConviction,
-			TTLDays:                      s.ttlDays(),
-			PromotionMaxPerIndustry:     s.Cfg.PromotionMaxPerIndustry,
-			UniverseVersionID:            s.UniverseVersionID,
-			UniverseAsOf:                 s.UniverseAsOf,
-			RegimeReference:              s.RegimeReference,
+			StartedAt:                        startedAt,
+			PullbackUniverseEnabled:          s.PullbackUniverseEnabled,
+			PullbackMinMomentumReturnPct:     minMomentum,
+			PullbackMinMarketCapMM:           pullbackMinMarketCapMM,
+			PullbackMinDollarVolume:          pullbackMinDollarVolume,
+			CandidateCap:                     cap,
+			MinConviction:                    s.Cfg.MinConviction,
+			TTLDays:                          s.ttlDays(),
+			PromotionMaxPerIndustry:          s.Cfg.PromotionMaxPerIndustry,
+			PromotionCorrelationEnabled:      s.Cfg.PromotionCorrelationEnabled,
+			PromotionMaxAbsCorrelation:       s.Cfg.PromotionMaxAbsCorrelation,
+			PromotionCorrelationLookbackDays: s.Cfg.PromotionCorrelationLookbackDays,
+			PromotionCorrelationMinOverlap:   s.Cfg.PromotionCorrelationMinOverlap,
+			UniverseVersionID:                s.UniverseVersionID,
+			UniverseAsOf:                     s.UniverseAsOf,
+			RegimeReference:                  s.RegimeReference,
 		},
 		candidates:            make(map[string]*store.ScannerCandidateSnapshot),
 		universeEnabled:       s.Cfg.Universe.Enabled,
@@ -408,6 +413,43 @@ func (r *scanRecorder) promotionRejected(ticker, reason string) {
 		snapshot.FailureStage = "promotion"
 		snapshot.FailureReason = reason
 		snapshot.FinalStage = "promotion_suppressed"
+	}
+}
+
+func (r *scanRecorder) promotionRejectedWithEvidence(ticker string, rejection PromotionRejection) {
+	r.promotionRejected(ticker, rejection.Reason)
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"reason":               rejection.Reason,
+			"conflict_key":         rejection.ConflictKey,
+			"conflict_correlation": rejection.ConflictCorrelation,
+		})
+	}
+}
+
+func (r *scanRecorder) promotionCorrelationUnavailable(
+	ticker string, unavailable map[string]string,
+) {
+	if snapshot := r.candidates[ticker]; snapshot != nil {
+		r.mergePromotionEvidence(snapshot, map[string]any{
+			"correlation_unavailable": unavailable,
+		})
+	}
+}
+
+func (r *scanRecorder) mergePromotionEvidence(
+	snapshot *store.ScannerCandidateSnapshot, additions map[string]any,
+) {
+	evidence := make(map[string]any)
+	if len(snapshot.PromotionEvidence) > 0 {
+		_ = json.Unmarshal(snapshot.PromotionEvidence, &evidence)
+	}
+	for key, value := range additions {
+		evidence[key] = value
+	}
+	encoded, err := json.Marshal(evidence)
+	if err == nil {
+		snapshot.PromotionEvidence = encoded
 	}
 }
 
