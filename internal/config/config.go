@@ -1167,7 +1167,8 @@ type ScannerConfig struct {
 	TopActives int `yaml:"top_actives"`
 
 	// PromotionMaxPerIndustry bounds how many scanner candidates from one
-	// known industry may enter the watchlist in a scan. Zero preserves legacy behavior.
+	// known industry may enter the watchlist in a scan. It requires the
+	// point-in-time scanner universe; zero preserves legacy behavior.
 	PromotionMaxPerIndustry int `yaml:"max_promotions_per_industry"`
 
 	// Universe configures the point-in-time, full-market stock universe used by
@@ -2053,6 +2054,10 @@ func Validate(cfg *Config) []string {
 	var errs []string
 	if cfg.Scanner.PromotionMaxPerIndustry < 0 {
 		errs = append(errs, "scanner.max_promotions_per_industry must be >= 0")
+	}
+	if cfg.Scanner.PromotionMaxPerIndustry > 0 && !cfg.Scanner.Universe.Enabled {
+		errs = append(errs,
+			"scanner.max_promotions_per_industry requires scanner.universe.enabled=true")
 	}
 
 	validModes := map[string]bool{

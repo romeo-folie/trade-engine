@@ -37,6 +37,7 @@ func newScanRecorder(s *MarketScanner, startedAt time.Time) *scanRecorder {
 			CandidateCap:                 cap,
 			MinConviction:                s.Cfg.MinConviction,
 			TTLDays:                      s.ttlDays(),
+			PromotionMaxPerIndustry:     s.Cfg.PromotionMaxPerIndustry,
 			UniverseVersionID:            s.UniverseVersionID,
 			UniverseAsOf:                 s.UniverseAsOf,
 			RegimeReference:              s.RegimeReference,

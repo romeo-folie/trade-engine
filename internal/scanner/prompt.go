@@ -41,6 +41,10 @@ type SwingCandidate struct {
 	TaxonomyAsOf     *time.Time
 	TaxonomyProvider string
 	TaxonomyEvidence json.RawMessage
+	// promotionTaxonomyExcluded means this candidate's source taxonomy was not
+	// present in the scanner run's selected universe. Keep the source evidence
+	// for audit/prompting, but do not use it for this run's cap.
+	promotionTaxonomyExcluded bool
 	// WeeklyLeaderRunID links this source to its immutable full-universe
 	// evaluation. It is empty for all other discovery sources.
 	WeeklyLeaderRunID      string

@@ -6,6 +6,11 @@ ordering, and only counts known taxonomy labels. Blank, `Unknown`, and
 `Unavailable` taxonomy values are left uncapped so a taxonomy outage cannot
 silently suppress the legacy movers/actives path.
 
+The cap requires `scanner.universe.enabled: true`, because ordinary mover and
+active candidates must be hydrated from a completed, point-in-time universe
+before industry counts are applied. If that evidence cannot be loaded for a
+run, the scanner fails open and preserves the legacy uncapped path.
+
 Every suppressed candidate retains a `promotion_suppressed` terminal stage and
 the deterministic reason (`duplicate_key`, `industry_cap`, or `total_cap`) in
 the scanner candidate snapshot. Ticker keys and industry labels are normalized

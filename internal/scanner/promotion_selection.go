@@ -13,12 +13,13 @@ import (
 type PromotionCandidate struct {
 	// Index identifies the candidate in the caller's original slice. It keeps
 	// audit attribution correct when normalized keys collide.
-	Index          int
-	Key            string
-	Industry       string
-	TaxonomyStatus string
-	Score          float64
-	Correlations   map[string]float64
+	Index               int
+	Key                 string
+	Industry            string
+	TaxonomyStatus      string
+	TaxonomyCapExcluded bool
+	Score               float64
+	Correlations        map[string]float64
 }
 
 // PromotionSelection records both accepted candidates and deterministic
@@ -91,7 +92,7 @@ func SelectPromotionCandidates(
 		// a synthetic shared industry. Otherwise a taxonomy outage would make a
 		// per-industry cap suppress nearly every legacy mover/active candidate.
 		industryKey := strings.ToLower(industry)
-		if industry != "" && taxonomyCapEligible(candidate.TaxonomyStatus) &&
+		if industry != "" && !candidate.TaxonomyCapExcluded && taxonomyCapEligible(candidate.TaxonomyStatus) &&
 			maxPerIndustry > 0 && byIndustry[industryKey] >= maxPerIndustry {
 			result.Rejected = append(result.Rejected, PromotionRejection{
 				Candidate: candidate, Reason: "industry_cap",
@@ -107,7 +108,7 @@ func SelectPromotionCandidates(
 			}
 		}
 		result.Selected = append(result.Selected, candidate)
-		if industry != "" && taxonomyCapEligible(candidate.TaxonomyStatus) {
+		if industry != "" && !candidate.TaxonomyCapExcluded && taxonomyCapEligible(candidate.TaxonomyStatus) {
 			byIndustry[industryKey]++
 		}
 	}
@@ -121,23 +122,62 @@ func selectScoredForPromotion(
 	for index, scoredCandidate := range scored {
 		candidates = append(candidates, PromotionCandidate{
 			Index: index, Key: scoredCandidate.candidate.Ticker,
-			Industry:       scoredCandidate.candidate.Industry,
-			TaxonomyStatus: scoredCandidate.candidate.TaxonomyStatus,
-			Score:          scoredCandidate.score.Conviction,
+			Industry:            scoredCandidate.candidate.Industry,
+			TaxonomyStatus:      scoredCandidate.candidate.TaxonomyStatus,
+			TaxonomyCapExcluded: scoredCandidate.candidate.promotionTaxonomyExcluded,
+			Score:               scoredCandidate.score.Conviction,
 		})
 	}
 	selection := SelectPromotionCandidates(candidates, slots, maxPerIndustry, 0)
-	selected := make(map[int]struct{}, len(selection.Selected))
-	for _, candidate := range selection.Selected {
-		selected[candidate.Index] = struct{}{}
-	}
 	filtered := make([]scoredCandidate, 0, len(selection.Selected))
-	for index, candidate := range scored {
-		if _, ok := selected[index]; ok {
-			filtered = append(filtered, candidate)
+	for _, candidate := range selection.Selected {
+		if candidate.Index >= 0 && candidate.Index < len(scored) {
+			filtered = append(filtered, scored[candidate.Index])
 		}
 	}
 	return filtered, selection.Rejected
+}
+
+// promotionIndustryConflict checks a fallback candidate against the other
+// candidates already admitted by the promotion selector. Claim-loss fallbacks
+// are rescored later, so their effective taxonomy must be checked again before
+// the watchlist write.
+func promotionIndustryConflict(
+	candidate SwingCandidate, peers []scoredCandidate, maxPerIndustry int,
+) string {
+	if maxPerIndustry <= 0 || candidate.promotionTaxonomyExcluded || !taxonomyCapEligible(candidate.TaxonomyStatus) {
+		return ""
+	}
+	industry := strings.TrimSpace(candidate.Industry)
+	if isUnknownIndustry(industry) {
+		return ""
+	}
+	industryKey := strings.ToLower(industry)
+	count := 0
+	for _, peer := range peers {
+		if peer.candidate.promotionTaxonomyExcluded || !taxonomyCapEligible(peer.candidate.TaxonomyStatus) ||
+			isUnknownIndustry(peer.candidate.Industry) ||
+			strings.ToLower(strings.TrimSpace(peer.candidate.Industry)) != industryKey {
+			continue
+		}
+		count++
+		if count >= maxPerIndustry {
+			return normalizePromotionKey(peer.candidate.Ticker)
+		}
+	}
+	return ""
+}
+
+func activePromotionPeers(
+	state []scoredCandidate, active []bool, exclude int,
+) []scoredCandidate {
+	peers := make([]scoredCandidate, 0, len(state)-1)
+	for index, candidate := range state {
+		if index != exclude && index < len(active) && active[index] {
+			peers = append(peers, candidate)
+		}
+	}
+	return peers
 }
 
 func taxonomyCapEligible(status string) bool {

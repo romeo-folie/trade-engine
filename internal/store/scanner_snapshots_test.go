@@ -42,6 +42,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		PullbackMinMarketCapMM:       100,
 		PullbackMinDollarVolume:      1_000_000,
 		CandidateCap:                 10,
+		PromotionMaxPerIndustry:      2,
 		MinConviction:                .55,
 		TTLDays:                      3,
 		UniverseVersionID:            universeID,
@@ -103,22 +104,25 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Fatalf("FinishScannerRun: %v", err)
 	}
 	var storedUniverseID, regime string
+	var storedPromotionCap int
 	var storedUniverseAsOf time.Time
 	var sourceScores json.RawMessage
 	var universeMember bool
 	var potentIndustryEvidence string
 	err = store.GetDB().QueryRow(ctx, `
 		SELECT r.universe_version_id::text, r.universe_as_of, r.regime_reference,
+		       r.promotion_max_per_industry,
 		       c.source_scores, c.universe_member, c.potent_industry_evidence
 		FROM scanner_runs r
 		JOIN scanner_candidate_snapshots c ON c.scanner_run_id=r.id
 		WHERE r.id=$1 AND c.ticker='SNAP_A'`,
 		runID,
 	).Scan(
-		&storedUniverseID, &storedUniverseAsOf, &regime,
+		&storedUniverseID, &storedUniverseAsOf, &regime, &storedPromotionCap,
 		&sourceScores, &universeMember, &potentIndustryEvidence,
 	)
 	if err != nil || storedUniverseID != universeID || regime != "pending" ||
+		storedPromotionCap != 2 ||
 		!storedUniverseAsOf.Equal(universeAsOf) ||
 		!universeMember || string(sourceScores) != `{"mover": 0}` ||
 		potentIndustryEvidence != "Software broad_strong; member rank 1" {

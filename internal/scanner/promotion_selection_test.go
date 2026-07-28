@@ -2,6 +2,7 @@ package scanner
 
 import (
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -117,4 +118,116 @@ func TestSelectPromotionCandidatesDuplicateAndUnknownIndustry(t *testing.T) {
 	if len(result.Selected) != 2 {
 		t.Fatalf("missing taxonomy status should not consume the cap: %+v", result)
 	}
+	result = SelectPromotionCandidates([]PromotionCandidate{
+		{Key: "I", Industry: "Technology", TaxonomyStatus: "known", TaxonomyCapExcluded: true, Score: 0.9},
+		{Key: "J", Industry: "Technology", TaxonomyStatus: "known", TaxonomyCapExcluded: true, Score: 0.8},
+	}, 0, 1, 0)
+	if len(result.Selected) != 2 {
+		t.Fatalf("excluded source taxonomy should not consume the cap: %+v", result)
+	}
 }
+
+func TestPromotionIndustryConflictUsesEffectiveFallbackTaxonomy(t *testing.T) {
+	peers := []scoredCandidate{{candidate: SwingCandidate{
+		Ticker: "AAA", Industry: "Technology", TaxonomyStatus: "known",
+	}}}
+	if got := promotionIndustryConflict(SwingCandidate{
+		Ticker: "BBB", Industry: "technology", TaxonomyStatus: "known",
+	}, peers, 1); got != "AAA" {
+		t.Fatalf("conflict = %q, want AAA", got)
+	}
+	if got := promotionIndustryConflict(SwingCandidate{
+		Ticker: "BBB", Industry: "technology", TaxonomyStatus: "stale",
+	}, peers, 1); got != "" {
+		t.Fatalf("stale taxonomy conflict = %q, want none", got)
+	}
+}
+
+func TestFallbackPromotionCapUsesOnlyActivePeers(t *testing.T) {
+	state := []scoredCandidate{
+		{candidate: SwingCandidate{
+			Ticker: "FAILED", Industry: "Technology", TaxonomyStatus: "known",
+		}},
+		{candidate: SwingCandidate{
+			Ticker: "FALLBACK", Industry: "Technology", TaxonomyStatus: "known",
+		}},
+	}
+	active := []bool{false, true}
+	peers := activePromotionPeers(state, active, 1)
+	if got := promotionIndustryConflict(state[1].candidate, peers, 1); got != "" {
+		t.Fatalf("failed peer consumed cap: conflict=%q", got)
+	}
+	active[0] = true
+	peers = activePromotionPeers(state, active, 1)
+	if got := promotionIndustryConflict(state[1].candidate, peers, 1); got != "FAILED" {
+		t.Fatalf("active peer did not enforce cap: conflict=%q", got)
+	}
+}
+
+func TestActivePromotionPeersExcludeUnattemptedCandidates(t *testing.T) {
+	state := []scoredCandidate{
+		{candidate: SwingCandidate{Ticker: "ADMITTED", Industry: "Technology", TaxonomyStatus: "known"}},
+		{candidate: SwingCandidate{Ticker: "PENDING", Industry: "Technology", TaxonomyStatus: "known"}},
+	}
+	active := []bool{true, false}
+	peers := activePromotionPeers(state, active, 1)
+	if len(peers) != 1 || peers[0].candidate.Ticker != "ADMITTED" {
+		t.Fatalf("peers = %+v, want only admitted candidate", peers)
+	}
+	if got := promotionIndustryConflict(state[1].candidate, peers, 1); got != "ADMITTED" {
+		t.Fatalf("pending candidate conflict = %q, want ADMITTED", got)
+	}
+}
+
+func TestPromotionSelectionFailsOpenWhenPointInTimeTaxonomyUnavailable(t *testing.T) {
+	result := SelectPromotionCandidates([]PromotionCandidate{
+		{Key: "A", Industry: "Technology", TaxonomyStatus: "known", Score: .9},
+		{Key: "B", Industry: "Technology", TaxonomyStatus: "known", Score: .8},
+	}, 0, 0, 0)
+	if len(result.Selected) != 2 {
+		t.Fatalf("effective zero cap should preserve both candidates: %+v", result)
+	}
+}
+
+func TestApplyUniverseTaxonomyHydratesOrdinaryCandidate(t *testing.T) {
+	asOf := time.Date(2026, 7, 28, 12, 0, 0, 0, time.UTC)
+	candidate := SwingCandidate{
+		Ticker:               "AAPL",
+		weeklyLeaderFallback: &SwingCandidate{Ticker: "AAPL"},
+	}
+	member := &store.SwingUniverseMember{
+		Ticker: "AAPL", Sector: "Technology", Industry: "Software",
+		TaxonomyStatus: "known", TaxonomyAsOf: &asOf,
+		TaxonomyProvider: "universe", MarketCapMM: promotionFloatPtr(500),
+		DollarVolume: promotionFloatPtr(2_000_000),
+	}
+	applyUniverseTaxonomyToLineage(&candidate, member)
+	if candidate.Industry != "Software" || candidate.TaxonomyStatus != "known" ||
+		candidate.TaxonomyAsOf == nil || !candidate.TaxonomyAsOf.Equal(asOf) ||
+		candidate.MarketCapMM != 500 || candidate.DollarVolume != 2_000_000 ||
+		candidate.UniverseMember == nil || !*candidate.UniverseMember {
+		t.Fatalf("hydrated candidate = %+v", candidate)
+	}
+	if candidate.weeklyLeaderFallback.TaxonomyStatus != "known" ||
+		candidate.weeklyLeaderFallback.promotionTaxonomyExcluded {
+		t.Fatalf("fallback taxonomy was not hydrated: %+v", candidate.weeklyLeaderFallback)
+	}
+}
+
+func TestExcludeUniverseTaxonomyPreservesSourceEvidence(t *testing.T) {
+	asOf := time.Now()
+	member := true
+	candidate := SwingCandidate{
+		UniverseMember: &member, Sector: "Technology", Industry: "Software",
+		TaxonomyStatus: "known", TaxonomyAsOf: &asOf,
+		TaxonomyProvider: "old-universe", TaxonomyEvidence: []byte(`{"old":true}`),
+	}
+	excludeUniverseTaxonomyFromPromotion(&candidate)
+	if !candidate.promotionTaxonomyExcluded || candidate.Industry != "Software" ||
+		candidate.TaxonomyStatus != "known" || candidate.UniverseMember == nil ||
+		candidate.TaxonomyProvider != "old-universe" {
+		t.Fatalf("source taxonomy was not preserved while excluding cap: %+v", candidate)
+	}
+}
+
+func promotionFloatPtr(value float64) *float64 { return &value }
