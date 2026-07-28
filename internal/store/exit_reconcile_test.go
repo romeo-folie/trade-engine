@@ -131,6 +131,52 @@ func TestGetPendingExitOrders_IncludesPartialRows(t *testing.T) {
 	t.Fatal("partial exit order on closed trade not swept — a partially_filled PlaceOrder result would stay priceless forever")
 }
 
+func TestGetPendingExitOrdersExcludesStaleTerminalRowsOnExitingTrade(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_STALE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 10, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-stale", Ticker: "TEST_XRC_STALE",
+		Side: "sell", OrderType: "stop", Quantity: 10, Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder stale: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-current", Ticker: "TEST_XRC_STALE",
+		Side: "sell", OrderType: "market", Quantity: 10, Status: "pending", IsTakeProfit: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder current: %v", err)
+	}
+
+	rows, err := store.GetPendingExitOrders(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingExitOrders: %v", err)
+	}
+	seenCurrent := false
+	for _, row := range rows {
+		switch row.BrokerOrderID {
+		case "brk-xrc-stale":
+			t.Fatal("stale zero-fill terminal row leaked into exiting reconciliation")
+		case "brk-xrc-current":
+			seenCurrent = true
+		}
+	}
+	if !seenCurrent {
+		t.Fatal("current pending exit row missing from reconciliation")
+	}
+}
+
 func TestInsertOrder_PersistsFillColumns(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
@@ -267,6 +313,88 @@ func TestApplyPartialExitIsAtomicAndIdempotent(t *testing.T) {
 	if err != nil || remaining != 3 || applied != 0 {
 		t.Fatalf("replay = remaining %v applied %v err %v, want 3/0/nil",
 			remaining, applied, err)
+	}
+}
+
+func TestApplyPartialExitCapsConcurrentProtectiveFillsToTradeQuantity(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_OCO_CAP", Direction: "long", Strategy: "test",
+		EntryPrice: 10, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	insertLeg := func(brokerID string) string {
+		t.Helper()
+		id, insertErr := store.InsertOrder(ctx, store.Order{
+			TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_XRC_OCO_CAP",
+			Side: "sell", OrderType: "stop", Quantity: 5, Status: "cancelled",
+			FilledPrice: 9.5, FilledQty: 5, IsStopLoss: true,
+		})
+		if insertErr != nil {
+			t.Fatalf("InsertOrder %s: %v", brokerID, insertErr)
+		}
+		return id
+	}
+	firstID := insertLeg("brk-xrc-oco-1")
+	secondID := insertLeg("brk-xrc-oco-2")
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+	type result struct {
+		remaining, applied float64
+		err                error
+	}
+	results := make(chan result, 2)
+	go func() {
+		remaining, applied, applyErr := store.ApplyPartialExit(ctx, tradeID, firstID, 9.5, 5, "cancelled")
+		results <- result{remaining: remaining, applied: applied, err: applyErr}
+	}()
+	go func() {
+		remaining, applied, applyErr := store.ApplyPartialExit(ctx, tradeID, secondID, 9.5, 5, "cancelled")
+		results <- result{remaining: remaining, applied: applied, err: applyErr}
+	}()
+	var totalApplied float64
+	for range 2 {
+		got := <-results
+		if got.err != nil || got.remaining != 0 {
+			t.Fatalf("concurrent OCO fill = remaining %v applied %v err %v, want remaining 0 and no error", got.remaining, got.applied, got.err)
+		}
+		totalApplied += got.applied
+	}
+	if totalApplied != 5 {
+		t.Fatalf("concurrent OCO fills applied %.6f shares, want 5", totalApplied)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil {
+		t.Fatalf("GetTradeByID: %v (nil=%v)", err, trade == nil)
+	}
+	if trade.Quantity != 0 {
+		t.Fatalf("trade after dual OCO fills = qty %.6f, want 0", trade.Quantity)
+	}
+	final, err := store.FinalizeTradeExit(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("FinalizeTradeExit: %v", err)
+	}
+	if final.ExitQty != 5 {
+		t.Fatalf("finalized exit qty = %.6f, want 5", final.ExitQty)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	seenSecond := false
+	for _, order := range orders {
+		if order.ID == secondID {
+			seenSecond = true
+			if order.FilledQty != 5 {
+				t.Fatalf("second OCO audit fill = %.6f, want 5", order.FilledQty)
+			}
+		}
+	}
+	if !seenSecond {
+		t.Fatal("second OCO order missing from audit")
 	}
 }
 

@@ -112,11 +112,10 @@ type TradeStore interface {
 	GetOpenTrades(ctx context.Context) ([]store.Trade, error)
 	UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error
 	LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*store.Order, error)
-	// OpenExitLegsForTrade returns the trade's still-working stop/take-profit
-	// legs. Non-empty ParentOrderID marks OCO-linked bracket children, which
-	// hold the trade's shares — ALL of them must be cancelled before a market
-	// exit or the broker rejects the sell for insufficient free quantity.
-	OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]store.Order, error)
+	// ExitLegsForMarketExit returns one DB snapshot containing both working
+	// protective legs and terminal legs with fills. It closes the lookup gap
+	// where a leg can fill between separate working/filled queries.
+	ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]store.Order, error)
 	ClaimTradeExit(ctx context.Context, id string) (bool, error)
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
@@ -919,20 +918,130 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade) (execution.Or
 }
 
 func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) (float64, error) {
-	legs, err := m.store.OpenExitLegsForTrade(ctx, t.ID)
+	legs, err := m.store.ExitLegsForMarketExit(ctx, t.ID)
 	if err != nil {
 		return 0, fmt.Errorf("lookup exit legs before market exit: %w", err)
 	}
 	remaining := t.Quantity
 	for _, leg := range legs {
+		if leg.Status != "filled" && leg.Status != "cancelled" && leg.Status != "rejected" {
+			continue
+		}
 		if leg.BrokerOrderID == "" {
+			continue
+		}
+		// The DB row was only marked filled by a broker-status path. Confirm
+		// the broker still agrees before standing down; any disagreement is
+		// unknown state and must remain fail-closed rather than risk a second
+		// sell.
+		status, statusErr := m.exec.GetOrderStatus(ctx, leg.BrokerOrderID)
+		if statusErr != nil {
+			if errors.Is(statusErr, execution.ErrOrderNotFound) {
+				// Brokers may purge terminal orders after recording a fill. A
+				// durable cancelled/rejected partial fill is still authoritative;
+				// apply it from the DB row so the residual market exit is not
+				// stranded. A filled row without a durable quantity remains
+				// ambiguous and must fail closed.
+				terminalStatus := execution.NormalizeOrderStatus(leg.Status)
+				if terminalStatus == "filled" && leg.FilledQty <= 0 {
+					return 0, fmt.Errorf("%w: purged filled exit leg %s has no durable fill quantity",
+						errExitClaimMustRemain, leg.BrokerOrderID)
+				}
+				if leg.FilledQty > 0 {
+					fillPrice := leg.FilledPrice
+					if fillPrice <= 0 {
+						if leg.IsTakeProfit {
+							fillPrice = leg.LimitPrice
+						} else {
+							fillPrice = leg.StopPrice
+						}
+					}
+					if fillPrice <= 0 {
+						return 0, fmt.Errorf("%w: purged exit leg %s has a fill but no price",
+							errExitClaimMustRemain, leg.BrokerOrderID)
+					}
+					remaining, _, err = m.store.ApplyPartialExit(
+						ctx, t.ID, leg.ID, fillPrice, leg.FilledQty, terminalStatus,
+					)
+					if err != nil {
+						return 0, fmt.Errorf("%w: persist purged exit-leg fill: %v",
+							errExitClaimMustRemain, err)
+					}
+					if remaining <= 0 {
+						return 0, fmt.Errorf("%w: purged exit leg %s filled the full position",
+							errExitClaimMustRemain, leg.BrokerOrderID)
+					}
+				}
+				continue
+			}
+			return 0, fmt.Errorf(
+				"%w: cannot verify filled exit leg %s: %v",
+				errExitClaimMustRemain, leg.BrokerOrderID, statusErr,
+			)
+		}
+		brokerStatus := execution.NormalizeOrderStatus(status.Status)
+		if brokerStatus != "filled" && brokerStatus != "cancelled" && brokerStatus != "rejected" {
+			return 0, fmt.Errorf(
+				"%w: terminal exit leg %s has non-terminal broker status %s",
+				errExitClaimMustRemain, leg.BrokerOrderID, status.Status,
+			)
+		}
+		fillQty := status.FilledQty
+		if fillQty <= 0 {
+			fillQty = leg.FilledQty
+		}
+		if fillQty > 0 {
+			fillPrice := status.FilledPrice
+			if fillPrice <= 0 {
+				fillPrice = leg.FilledPrice
+			}
+			if fillPrice <= 0 {
+				if leg.IsTakeProfit {
+					fillPrice = leg.LimitPrice
+				} else {
+					fillPrice = leg.StopPrice
+				}
+			}
+			if fillPrice <= 0 {
+				return 0, fmt.Errorf("%w: exit leg %s has a fill but no price",
+					errExitClaimMustRemain, leg.BrokerOrderID)
+			}
+			remaining, _, err = m.store.ApplyPartialExit(
+				ctx, t.ID, leg.ID, fillPrice, fillQty, brokerStatus,
+			)
+			if err != nil {
+				return 0, fmt.Errorf("%w: persist recorded exit-leg fill: %v",
+					errExitClaimMustRemain, err)
+			}
+			if remaining <= 0 {
+				return 0, fmt.Errorf("%w: exit leg %s filled the full position",
+					errExitClaimMustRemain, leg.BrokerOrderID)
+			}
+			// A terminal protective leg filled only part of the position. Its
+			// contribution is durable; continue with the residual quantity.
+			continue
+		}
+		return 0, fmt.Errorf(
+			"%w: exit leg %s is terminal without a fill (broker status %s)",
+			errExitClaimMustRemain, leg.BrokerOrderID, status.Status,
+		)
+	}
+
+	for _, leg := range legs {
+		if leg.BrokerOrderID == "" {
+			continue
+		}
+		if leg.Status == "filled" || leg.Status == "cancelled" || leg.Status == "rejected" {
 			continue
 		}
 		cancelErr := m.exec.CancelOrder(ctx, leg.BrokerOrderID)
 		status, statusErr := m.exec.GetOrderStatus(ctx, leg.BrokerOrderID)
 		if statusErr != nil {
 			if errors.Is(statusErr, execution.ErrOrderNotFound) {
-				continue
+				return 0, fmt.Errorf(
+					"%w: working exit leg %s disappeared before cancellation was confirmed",
+					errExitClaimMustRemain, leg.BrokerOrderID,
+				)
 			}
 			return 0, fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
 				leg.BrokerOrderID, cancelErr, statusErr)

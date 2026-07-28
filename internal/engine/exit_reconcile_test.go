@@ -490,6 +490,31 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 	}
 }
 
+func TestExitReconcileAppliesDurableFillAfterPurgedTerminalOrder(t *testing.T) {
+	p := store.PendingExitOrder{
+		OrderID: "purged-row", BrokerOrderID: "purged-stop", Ticker: "AAPL",
+		TradeID: "purged-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 10, OrderQuantity: 10, RecordedFill: 4, RecordedPrice: 98,
+		OrderStatus: "filled", TradeStatus: "exiting",
+	}
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{errs: map[string]error{
+		"purged-stop": execution.ErrOrderNotFound,
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.NotFound != 1 || stats.DurableRecovered != 1 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want one not-found and one durable recovery", stats)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 6 {
+		t.Fatalf("remaining trade quantity = %.6f, want 6 after durable fill", got)
+	}
+	if got := db.appliedFill[p.OrderID]; got != 4 {
+		t.Fatalf("applied durable fill = %.6f, want 4", got)
+	}
+}
+
 func TestExitReconcileFilledWithoutPriceCountsError(t *testing.T) {
 	db := newFakeExitStore(lacExit())
 	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
@@ -657,6 +682,43 @@ func TestOrderlessRecoveryReleasesClaimWithPreexistingProtectiveStop(t *testing.
 	}
 	if stats.Recovered != 1 {
 		t.Fatalf("stats = %+v, want one recovered claim", stats)
+	}
+}
+
+func TestOrderlessRecoveryRetainsClaimForPreclaimPartialTerminalFill(t *testing.T) {
+	trade := store.Trade{
+		ID: "orderless-partial", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 10,
+	}
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(store.PendingExitOrder{
+			OrderID: "stop-row", BrokerOrderID: "old-partial-stop", Ticker: "AAPL",
+			TradeID: trade.ID, Direction: "long", EntryPrice: 100, Quantity: 10,
+			OrderQuantity: 10, RecordedFill: 4, RecordedPrice: 98,
+			TradeStatus: "exiting",
+		}),
+		orderless: []store.Trade{trade},
+		owned:     []store.Trade{trade},
+		durableOwnership: []store.DurableExitOrderOwnership{{
+			BrokerOrderID: "old-partial-stop", Ticker: "AAPL", Side: "sell",
+			TradeStatus: "exiting", ClaimOwned: true,
+		}},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{errs: map[string]error{
+			"old-partial-stop": execution.ErrOrderNotFound,
+		}},
+		positions: []execution.Position{{Ticker: "AAPL", Quantity: 6, Side: "long"}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 1)
+
+	if len(db.released) != 0 || len(db.tradeExits) != 0 || len(db.inserted) != 0 {
+		t.Fatalf("preclaim partial fill was recovered a second time: released=%v closed=%v inserted=%v",
+			db.released, db.tradeExits, db.inserted)
+	}
+	if stats.NotFound != 1 || stats.Recovered != 0 {
+		t.Fatalf("stats = %+v, want one not-found and no recovery", stats)
 	}
 }
 
