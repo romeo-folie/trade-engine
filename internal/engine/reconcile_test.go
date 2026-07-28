@@ -97,6 +97,34 @@ func TestReconcile_BothEmpty(t *testing.T) {
 	}
 }
 
+func TestCompareBrokerVsDBSnapshotsIsSilent(t *testing.T) {
+	collect, restore := captureLogs(t)
+	defer restore()
+
+	drifts := CompareBrokerVsDBSnapshots(
+		[]execution.BrokerPosition{{Symbol: "AAPL", Quantity: 10, Side: "long"}},
+		[]store.Trade{{Ticker: "AAPL", Quantity: 5, Direction: "buy", Status: "open"}},
+		0,
+	)
+	if len(drifts) != 1 || drifts[0].Source != "mismatch" {
+		t.Fatalf("drifts = %+v, want one mismatch", drifts)
+	}
+	if got := len(collect()); got != 0 {
+		t.Fatalf("silent snapshot comparison emitted %d log records", got)
+	}
+}
+
+func TestCompareBrokerVsDBSnapshotsNormalizesTickerCase(t *testing.T) {
+	drifts := CompareBrokerVsDBSnapshots(
+		[]execution.BrokerPosition{{Symbol: "aapl", Quantity: 10, Side: "long"}},
+		[]store.Trade{{Ticker: "AAPL", Quantity: 10, Direction: "buy", Status: "open"}},
+		0,
+	)
+	if len(drifts) != 0 {
+		t.Fatalf("drifts = %+v, want case-insensitive match", drifts)
+	}
+}
+
 func TestReconcile_MatchWithinTolerance(t *testing.T) {
 	collect, restore := captureLogs(t)
 	defer restore()

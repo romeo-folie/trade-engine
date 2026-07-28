@@ -50,11 +50,11 @@ func (liveStore) LatestStopLossOrderForTrade(ctx context.Context, tradeID string
 	return store.LatestStopLossOrderForTrade(ctx, tradeID)
 }
 
-func (liveStore) OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]store.Order, error) {
+func (liveStore) ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]store.Order, error) {
 	if !store.IsConnected() {
 		return nil, errStoreNotConnected
 	}
-	return store.OpenExitLegsForTrade(ctx, tradeID)
+	return store.ExitLegsForMarketExit(ctx, tradeID)
 }
 
 func (liveStore) ClaimTradeExit(ctx context.Context, id string) (bool, error) {

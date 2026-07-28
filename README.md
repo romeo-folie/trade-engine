@@ -273,11 +273,18 @@ restart to apply. Use ordinary `te config set` for every other key.
 te watchlist add|remove|show          Manage scanner and engine watchlist items
 te trades list|show|pending           Inspect trades and pending manual signals
 te trades approve|reject <signal-id>  Resolve a manual-mode signal
+te reconcile broker                    Read-only Alpaca-equities/DB drift report
+te reconcile broker --ticker IBKR      Narrow the report to one ticker
+te reconcile broker --json              Emit machine-readable drift JSON
 te universe refresh|list              Build or inspect immutable swing universes
 te earnings sync|seed|list            Manage the options earnings calendar
 te options backfill-iv                Backfill options implied-volatility history
 te orb stats                          Inspect opening-range performance
 ```
+
+`te reconcile broker` is intentionally limited to Alpaca equities and the
+standard engine's legacy `trades` ledger. Forex, futures, options, and ORB
+positions use separate ledgers and are not evaluated by this command.
 
 ### Models and knowledge
 

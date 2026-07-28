@@ -478,6 +478,7 @@ type PendingExitOrder struct {
 	OrderID       string
 	BrokerOrderID string
 	Ticker        string
+	OrderStatus   string // broker order status last durably recorded in the DB
 	TradeID       string
 	Direction     string // long | short
 	EntryPrice    float64
@@ -502,9 +503,10 @@ type DurableExitOrderOwnership struct {
 	Ticker        string
 	Side          string
 	TradeStatus   string
-	// ClaimOwned is true when this order was created by, or became terminal
-	// during, the trade's current exit claim. Pre-existing protective stops
-	// are known broker IDs but must not strand an orderless claim forever.
+	// ClaimOwned is true when this order was created by the current exit claim,
+	// or when a terminal fill can account for shares already missing at the
+	// broker. Zero-fill pre-existing protective stops remain known broker IDs
+	// but do not strand orderless recovery.
 	ClaimOwned bool
 }
 
@@ -513,8 +515,17 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		SELECT DISTINCT o.broker_order_id, o.ticker, o.side, t.status,
 		       CASE
 		         WHEN t.status='closed' THEN TRUE
-		         WHEN o.created_at >= t.exit_claimed_at THEN TRUE
-		         WHEN o.status IN ('filled','cancelled','rejected')
+		         WHEN t.status='exiting'
+		              AND o.status='filled' THEN TRUE
+		         WHEN t.status='exiting'
+		              AND o.status IN ('pending','partial')
+		              AND o.created_at >= t.exit_claimed_at THEN TRUE
+		         WHEN t.status='exiting'
+		              AND o.status IN ('cancelled','rejected')
+		              AND COALESCE(o.filled_qty,0) > 0 THEN TRUE
+		         WHEN t.status='exiting'
+		              AND o.status IN ('cancelled','rejected')
+		              AND COALESCE(o.filled_qty,0) = 0
 		              AND o.updated_at >= t.exit_claimed_at THEN TRUE
 		         ELSE FALSE
 		       END AS claim_owned
@@ -527,8 +538,9 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
 		          o.status IN ('pending','partial')
-		       OR (o.status IN ('filled','cancelled','rejected')
-		           AND o.updated_at >= t.exit_claimed_at)
+		       OR (o.status IN ('filled','cancelled','rejected') AND
+		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
+		            o.updated_at >= t.exit_claimed_at))
 		        ))
 		      )`)
 	if err != nil {
@@ -549,14 +561,19 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 	return out, rows.Err()
 }
 
-// GetPendingExitOrders returns orders still marked 'pending' or 'partial'
-// whose trade is closed or durably exiting and whose side opposes direction —
+// GetPendingExitOrders returns pending/partial exit orders plus terminal exit
+// rows eligible for reconciliation whose trade is closed or durably exiting
+// and whose side opposes direction —
 // i.e. the exit order for that trade. This shape covers every close path
 // (stop/TP monitor, trailing-stop market exits) regardless of the
 // is_stop_loss/is_take_profit flags. Entry orders (side matching direction)
 // and working broker stops on open trades are excluded by construction.
 // 'partial' is included because PlaceOrder can return partially_filled and
 // the row must stay sweepable until the broker reports the fill complete.
+// Filled terminal rows are included regardless of claim time because a
+// protective stop may have filled just before the worker claimed the trade.
+// Zero-fill cancelled/rejected rows are included only when they belong to the
+// current exit claim, so stale rows cannot suppress orderless recovery.
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
 		WITH selected_trades AS (
@@ -567,8 +584,9 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		          (t.status='closed' AND o.status IN ('pending','partial'))
 		       OR (t.status='exiting' AND (
 		            o.status IN ('pending','partial')
-		         OR (o.status IN ('filled','cancelled','rejected')
-		             AND o.updated_at >= t.exit_claimed_at)
+		         OR (o.status IN ('filled','cancelled','rejected') AND
+		             (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
+		              o.updated_at >= t.exit_claimed_at))
 		          ))
 		        )
 		    AND COALESCE(o.broker_order_id,'') <> ''
@@ -578,7 +596,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		  ORDER BY first_order_at
 		  LIMIT $1
 		)
-		SELECT o.id, o.broker_order_id, o.ticker,
+		SELECT o.id, o.broker_order_id, o.ticker, o.status,
 		       t.id, t.direction, t.entry_price, t.quantity,
 		       o.quantity, COALESCE(o.limit_price,0),
 		       COALESCE(o.stop_price,0), COALESCE(o.filled_qty,0),
@@ -596,8 +614,9 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
 		          o.status IN ('pending','partial')
-		       OR (o.status IN ('filled','cancelled','rejected')
-		           AND o.updated_at >= t.exit_claimed_at)
+		       OR (o.status IN ('filled','cancelled','rejected') AND
+		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
+		            o.updated_at >= t.exit_claimed_at))
 		        ))
 		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''
@@ -613,7 +632,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 	var out []PendingExitOrder
 	for rows.Next() {
 		var p PendingExitOrder
-		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker,
+		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker, &p.OrderStatus,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
 			&p.OrderQuantity, &p.LimitPrice, &p.StopPrice,
 			&p.RecordedFill, &p.RecordedPrice,

@@ -73,6 +73,9 @@ The pool is a package-level singleton initialized by `Connect(ctx)`. All other f
 **Orders (`orders.go`)**
 - `InsertOrder` records an entry or exit order with broker linkage
 - `UpdateOrderFill` updates filled price/qty/status after broker confirmation
+- `OpenExitLegsForTrade` returns still-working protective legs; `ExitLegsForMarketExit`
+  returns working legs and terminal protective fills in one snapshot for replacement
+  exits.
 - `GetOrdersByTrade` returns all orders linked to a trade (for `te trades show`)
 
 **Retention (`retention.go`)**

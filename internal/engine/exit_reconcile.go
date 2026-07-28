@@ -102,14 +102,15 @@ func (exitStoreAdapter) InsertOrderWithRetry(ctx context.Context, o store.Order)
 
 // ExitReconcileStats summarises one sweep of the exit-fill reconciler.
 type ExitReconcileStats struct {
-	Scanned      int // pending exit orders examined
-	Corrected    int // broker fill differed from recorded exit — trade P&L rewritten
-	Confirmed    int // broker fill matched recorded exit — order row backfilled only
-	Terminal     int // broker reported cancelled/rejected — order marked, trade NOT touched
-	StillPending int // broker still working the order (or partial fill)
-	NotFound     int // broker no longer knows the order id
-	Recovered    int // orderless exiting trades reconstructed or released
-	Errors       int // broker/store errors — row left for the next sweep
+	Scanned          int // pending exit orders examined
+	Corrected        int // broker fill differed from recorded exit — trade P&L rewritten
+	Confirmed        int // broker fill matched recorded exit — order row backfilled only
+	Terminal         int // broker reported cancelled/rejected — order marked, trade NOT touched
+	StillPending     int // broker still working the order (or partial fill)
+	NotFound         int // broker no longer knows the order id
+	DurableRecovered int // a purged terminal order was recovered from its DB fill
+	Recovered        int // orderless exiting trades reconstructed or released
+	Errors           int // broker/store errors — row left for the next sweep
 }
 
 // tradePnL computes P&L and P&L% for a trade closed at exitPrice, mirroring
@@ -194,14 +195,63 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		}
 		res, err := executor.GetOrderStatus(ctx, p.BrokerOrderID)
 		if err != nil {
-			if tradeState != nil {
-				tradeState.canFinalize = false
-			}
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				stats.NotFound++
-				logger.Warn("exit reconcile: order unknown at broker — cannot confirm fill",
+				if tradeState != nil {
+					// A terminal order can disappear from broker history after its
+					// fill. Re-apply the durable cumulative fill so a restart does
+					// not strand an exiting trade behind ClaimOwned. A filled row
+					// without a durable quantity is ambiguous and remains fail-closed.
+					terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
+					if terminalStatus == "filled" && p.RecordedFill <= 0 {
+						tradeState.canFinalize = false
+						stats.Errors++
+						logger.Warn("exit reconcile: purged filled order has no durable fill quantity",
+							"ticker", p.Ticker, "trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
+						continue
+					}
+					if terminalStatus == "filled" || terminalStatus == "cancelled" || terminalStatus == "rejected" {
+						if p.RecordedFill > 0 {
+							fillPrice := p.RecordedPrice
+							if fillPrice <= 0 {
+								if p.LimitPrice > 0 {
+									fillPrice = p.LimitPrice
+								} else {
+									fillPrice = p.StopPrice
+								}
+							}
+							if fillPrice <= 0 {
+								tradeState.canFinalize = false
+								stats.Errors++
+								logger.Warn("exit reconcile: purged terminal order has no durable fill price",
+									"ticker", p.Ticker, "trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
+								continue
+							}
+							remaining, _, applyErr := db.ApplyPartialExit(
+								ctx, p.TradeID, p.OrderID, fillPrice, p.RecordedFill, terminalStatus,
+							)
+							if applyErr != nil {
+								tradeState.canFinalize = false
+								stats.Errors++
+								logger.Warn("exit reconcile: apply durable purged fill",
+									"trade_id", p.TradeID, "order_id", p.OrderID, "err", applyErr)
+								continue
+							}
+							tradeState.remaining = remaining
+							tradeState.fillQty += p.RecordedFill
+							tradeState.proceeds += p.RecordedFill * fillPrice
+							stats.DurableRecovered++
+						}
+					} else {
+						tradeState.canFinalize = false
+					}
+				}
+				logger.Warn("exit reconcile: order unknown at broker — used durable fill if available",
 					"ticker", p.Ticker, "trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
 			} else {
+				if tradeState != nil {
+					tradeState.canFinalize = false
+				}
 				stats.Errors++
 				logger.Warn("exit reconcile: GetOrderStatus",
 					"ticker", p.Ticker, "broker_order_id", p.BrokerOrderID, "err", err)
@@ -387,6 +437,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			"terminal", stats.Terminal,
 			"still_pending", stats.StillPending,
 			"not_found", stats.NotFound,
+			"durable_recovered", stats.DurableRecovered,
 			"errors", stats.Errors,
 		)
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -98,14 +99,15 @@ func TestComputeNewStop_WrongFormulaWouldInvert(t *testing.T) {
 
 // fakeStore implements TradeStore in-memory.
 type fakeStore struct {
-	mu     sync.Mutex
-	trades map[string]store.Trade
-	orders map[string]store.Order // keyed by order id
-	nextID int
+	mu      sync.Mutex
+	trades  map[string]store.Trade
+	orders  map[string]store.Order // keyed by order id
+	applied map[string]float64
+	nextID  int
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}}
+	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}}
 }
 
 func (f *fakeStore) GetOpenTrades(_ context.Context) ([]store.Trade, error) {
@@ -146,16 +148,28 @@ func (f *fakeStore) LatestStopLossOrderForTrade(_ context.Context, tradeID strin
 	return nil, nil
 }
 
-func (f *fakeStore) OpenExitLegsForTrade(_ context.Context, tradeID string) ([]store.Order, error) {
+func (f *fakeStore) ExitLegsForMarketExit(_ context.Context, tradeID string) ([]store.Order, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []store.Order
 	for _, o := range f.orders {
-		if o.TradeID == tradeID && (o.IsStopLoss || o.IsTakeProfit) &&
-			(o.Status == "pending" || o.Status == "partial") && o.BrokerOrderID != "" {
+		if o.TradeID != tradeID || (!o.IsStopLoss && !o.IsTakeProfit) || o.BrokerOrderID == "" {
+			continue
+		}
+		working := o.Status == "pending" || o.Status == "partial"
+		terminalFill := (o.Status == "filled" || o.Status == "cancelled" || o.Status == "rejected") &&
+			(o.Status == "filled" || o.FilledQty > 0) &&
+			(o.OrderType == "stop" || o.OrderType == "stop_limit" || o.OrderType == "limit")
+		if working || terminalFill {
 			out = append(out, o)
 		}
 	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID < out[j].ID
+		}
+		return out[i].CreatedAt.Before(out[j].CreatedAt)
+	})
 	return out, nil
 }
 
@@ -210,7 +224,8 @@ func (f *fakeStore) ApplyPartialExit(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	o := f.orders[orderID]
-	applied := math.Max(0, cumulativeFilledQty-o.FilledQty)
+	applied := math.Max(0, cumulativeFilledQty-f.applied[orderID])
+	f.applied[orderID] = math.Max(f.applied[orderID], cumulativeFilledQty)
 	o.FilledPrice, o.FilledQty, o.Status =
 		filledPrice, math.Max(o.FilledQty, cumulativeFilledQty), status
 	f.orders[orderID] = o
@@ -1613,6 +1628,217 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 	}
 	if marketOrder.Quantity != 10 {
 		t.Fatalf("order.quantity: got %v want 10", marketOrder.Quantity)
+	}
+}
+
+func TestManager_MarketExitRefusesRecordedFilledExitLeg(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10,
+		HighWaterMark: 200, // forces the trail-crossed market-exit path
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-filled-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, FilledPrice: 108.5, FilledQty: 10,
+		Status: "filled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{
+		statusResults: map[string]execution.OrderResult{
+			"broker-filled-stop": {Status: "filled", FilledPrice: 108.5, FilledQty: 10},
+		},
+		nextStatus: "filled", nextFillPrice: 110, nextFillQty: 10,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted despite a recorded filled stop: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting so the reconciler owns the filled leg", got)
+	}
+}
+
+func TestManager_MarketExitFlattensResidualAfterPartialCancelledExitLeg(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-partial-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, FilledPrice: 108.5, FilledQty: 4,
+		Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"broker-partial-stop": {Status: "cancelled", FilledPrice: 108.5, FilledQty: 4},
+	}, nextStatus: "filled", nextFillPrice: 110, nextFillQty: 6}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
+		t.Fatalf("market exit = %+v, want one residual sell of 6", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "closed" {
+		t.Fatalf("trade status = %q, want closed after residual sell", got)
+	}
+}
+
+func TestManager_MarketExitUsesDurableFillWhenTerminalLegPurged(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-purged-partial-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, FilledPrice: 108.5, FilledQty: 4,
+		Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{
+		notFoundIDs: map[string]bool{"broker-purged-partial-stop": true},
+		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 6,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
+		t.Fatalf("market exit = %+v, want one residual sell of 6 after purged partial leg", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "closed" {
+		t.Fatalf("trade status = %q, want closed after residual sell", got)
+	}
+}
+
+func TestManager_MarketExitUsesDurableFilledLegWhenPurged(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-purged-filled-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, FilledPrice: 108.5, FilledQty: 4,
+		Status: "filled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{
+		notFoundIDs: map[string]bool{"broker-purged-filled-stop": true},
+		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 6,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
+		t.Fatalf("market exit = %+v, want one residual sell of 6 after purged filled leg", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "closed" {
+		t.Fatalf("trade status = %q, want closed after residual sell", got)
+	}
+}
+
+func TestManager_MarketExitFailsClosedForPurgedFilledLegWithoutQuantity(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-purged-filled-unknown", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, Status: "filled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{
+		notFoundIDs: map[string]bool{"broker-purged-filled-unknown": true},
+		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 10,
+	}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted despite ambiguous purged filled leg: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fail-closed retry", got)
+	}
+}
+
+func TestManager_MarketExitFailsClosedWhenTerminalLegIsWorkingAtBroker(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-stale-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, FilledPrice: 108.5, FilledQty: 4,
+		Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
+		"broker-stale-stop": {Status: "pending", FilledQty: 4},
+	}, nextStatus: "filled", nextFillPrice: 110, nextFillQty: 10}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted while protective leg remained working: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fail-closed retry", got)
+	}
+}
+
+func TestManager_MarketExitFailsClosedWhenWorkingLegIsPurged(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-purged-working-stop", Ticker: "AAPL",
+		Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+		Quantity: 10, StopPrice: 109, Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{notFoundIDs: map[string]bool{"broker-purged-working-stop": true}}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted after working leg disappeared: %+v", fb.placed)
+	}
+	if got := fs.trades["t1"].Status; got != "exiting" {
+		t.Fatalf("trade status = %q, want exiting for fail-closed retry", got)
 	}
 }
 

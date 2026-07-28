@@ -122,6 +122,14 @@ func ApplyPartialExit(
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
 
+	var tradeQuantity float64
+	if err = tx.QueryRow(ctx, `
+		SELECT quantity
+		FROM trades
+		WHERE id=$1 AND status IN ('open','exiting')
+		FOR UPDATE`, tradeID).Scan(&tradeQuantity); err != nil {
+		return 0, 0, err
+	}
 	var recorded, recordedPrice, appliedAlready, orderQuantity float64
 	if err = tx.QueryRow(ctx, `
 		SELECT COALESCE(filled_qty,0), COALESCE(filled_price,0),
@@ -133,26 +141,31 @@ func ApplyPartialExit(
 	); err != nil {
 		return 0, 0, err
 	}
-	targetFill := math.Max(appliedAlready, math.Max(recorded, cumulativeFilledQty))
+	observedFill := math.Max(appliedAlready, math.Max(recorded, cumulativeFilledQty))
 	if orderQuantity > 0 {
 		// Broker responses for aggregate orders carry the aggregate fill on
 		// every lookup. A per-lot row can never own more than its assigned
 		// quantity, even if a caller accidentally forwards that aggregate.
-		targetFill = math.Min(targetFill, math.Max(orderQuantity, appliedAlready))
+		observedFill = math.Min(observedFill, math.Max(orderQuantity, appliedAlready))
 	}
-	applied = math.Max(0, targetFill-appliedAlready)
+	// Two OCO legs can both report terminal fills during a broker race. The
+	// first leg owns the remaining trade quantity; later legs may still be
+	// persisted for audit, but cannot increase realized quantity/P&L beyond
+	// what remains on the trade.
+	appliedTarget := math.Min(observedFill, appliedAlready+math.Max(0, tradeQuantity))
+	applied = math.Max(0, appliedTarget-appliedAlready)
 	// FilledPrice is the broker's cumulative average for this order. A later
 	// response can revise that average without advancing FilledQty, so replace
 	// the contribution of every previously applied share as well as adding any
 	// newly observed shares.
-	proceedsDelta := targetFill*filledPrice - appliedAlready*recordedPrice
+	proceedsDelta := appliedTarget*filledPrice - appliedAlready*recordedPrice
 
 	if _, err = tx.Exec(ctx, `
 		UPDATE orders
 		SET filled_price=$1, filled_qty=$2, status=$3,
-		    exit_fill_applied_qty=$2, updated_at=NOW()
-		WHERE id=$4`,
-		filledPrice, targetFill, status, orderID,
+		    exit_fill_applied_qty=$4, updated_at=NOW()
+		WHERE id=$5`,
+		filledPrice, observedFill, status, appliedTarget, orderID,
 	); err != nil {
 		return 0, 0, err
 	}
@@ -238,6 +251,38 @@ func OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]Order, error) 
 		  AND (is_stop_loss = TRUE OR is_take_profit = TRUE)
 		  AND status IN ('pending','partial')
 		  AND COALESCE(broker_order_id,'') <> ''
+		ORDER BY created_at ASC`, tradeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanOrders(rows)
+}
+
+// ExitLegsForMarketExit returns one consistent snapshot of every broker-linked
+// protective leg that can still account for shares: working pending/partial
+// rows and terminal rows with a recorded fill. Callers preparing a replacement
+// market exit use this combined query to avoid a fill racing between separate
+// working and terminal lookups.
+func ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]Order, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity,
+		       COALESCE(limit_price,0), COALESCE(stop_price,0),
+		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
+		       status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''),
+		       created_at, updated_at
+		FROM orders
+		WHERE trade_id = $1
+		  AND (is_stop_loss = TRUE OR is_take_profit = TRUE)
+		  AND COALESCE(broker_order_id,'') <> ''
+		  AND (
+		        status IN ('pending','partial')
+		     OR (order_type IN ('stop','stop_limit','limit')
+		         AND status IN ('filled','cancelled','rejected')
+		         AND (status='filled' OR COALESCE(filled_qty,0) > 0))
+		      )
 		ORDER BY created_at ASC`, tradeID)
 	if err != nil {
 		return nil, err

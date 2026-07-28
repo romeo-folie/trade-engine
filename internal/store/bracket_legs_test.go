@@ -89,4 +89,67 @@ func TestBracketLegs_ParentRoundTripAndOpenLegs(t *testing.T) {
 	if len(legs) != 1 || !legs[0].IsTakeProfit {
 		t.Fatalf("got %+v, want only the TP leg after SL cancel", legs)
 	}
+
+	tpLegID := legs[0].ID
+	if err := store.UpdateOrderFill(ctx, tpLegID, 110, 3, "filled"); err != nil {
+		t.Fatalf("fill TP leg: %v", err)
+	}
+	legs, err = store.OpenExitLegsForTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("OpenExitLegsForTrade after fill: %v", err)
+	}
+	if len(legs) != 0 {
+		t.Fatalf("working legs after TP fill = %+v, want none", legs)
+	}
+	filled, err := store.ExitLegsForMarketExit(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("ExitLegsForMarketExit: %v", err)
+	}
+	if len(filled) != 1 || filled[0].ID != tpLegID {
+		t.Fatalf("filled legs = %+v, want the terminal TP leg", filled)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "leg-partial", Ticker: "BRKT",
+		Side: "sell", OrderType: "stop", Quantity: 3, StopPrice: 95,
+		FilledPrice: 96, FilledQty: 1, Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("insert partial terminal leg: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "leg-zero", Ticker: "BRKT",
+		Side: "sell", OrderType: "stop", Quantity: 3, StopPrice: 95,
+		Status: "cancelled", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("insert zero-fill terminal leg: %v", err)
+	}
+	workingID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "leg-working", Ticker: "BRKT",
+		Side: "sell", OrderType: "stop", Quantity: 3, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("insert working leg: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "entry-2", Ticker: "BRKT",
+		Side: "buy", OrderType: "market", Quantity: 3, Status: "filled",
+	}); err != nil {
+		t.Fatalf("insert second entry: %v", err)
+	}
+	all, err := store.ExitLegsForMarketExit(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("ExitLegsForMarketExit: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, leg := range all {
+		seen[leg.BrokerOrderID] = true
+	}
+	for _, id := range []string{"leg-partial", "leg-working", "leg-tp"} {
+		if !seen[id] {
+			t.Fatalf("combined leg snapshot missing %s: %+v", id, all)
+		}
+	}
+	if seen["leg-zero"] || seen["entry-2"] || seen["leg-sl"] || workingID == "" {
+		t.Fatalf("combined leg snapshot included excluded rows: %+v", all)
+	}
 }

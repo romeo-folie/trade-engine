@@ -137,6 +137,20 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		logger.Warn("reconciler: db open trades fetch failed", "err", err.Error())
 		return nil, false
 	}
+	return compareBrokerVsDBSnapshots(positions, openTrades, tolerance, true), true
+}
+
+// CompareBrokerVsDBSnapshots applies the broker-vs-DB comparison rules to
+// already-fetched snapshots without logging or mutating either side. It is
+// used by read-only reporting surfaces that need machine-readable output.
+func CompareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades []store.Trade, tolerance float64) []BrokerDrift {
+	return compareBrokerVsDBSnapshots(positions, openTrades, tolerance, false)
+}
+
+func compareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades []store.Trade, tolerance float64, emitLogs bool) []BrokerDrift {
+	if tolerance <= 0 {
+		tolerance = DefaultBrokerDriftToleranceShares
+	}
 
 	type aggregate struct {
 		brokerQty     float64 // signed: negative for short, positive for long
@@ -150,20 +164,21 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 	byTicker := make(map[string]*aggregate)
 
 	for _, p := range positions {
-		if p.Symbol == "" {
+		ticker := strings.ToUpper(strings.TrimSpace(p.Symbol))
+		if ticker == "" {
 			continue
 		}
 		// Options-ORB positions report their OCC symbol and are reconciled by their
 		// own OCC-keyed detector (#416). Skip them here so this ticker-keyed
 		// reconciler never treats an option position as drift or adopts it into the
 		// legacy trades table.
-		if execution.IsOCCSymbol(p.Symbol) {
+		if execution.IsOCCSymbol(ticker) {
 			continue
 		}
-		a, ok := byTicker[p.Symbol]
+		a, ok := byTicker[ticker]
 		if !ok {
 			a = &aggregate{}
-			byTicker[p.Symbol] = a
+			byTicker[ticker] = a
 		}
 		a.brokerQty += signedBrokerQty(p)
 		a.seenBroker = true
@@ -172,13 +187,14 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 	}
 
 	for _, t := range openTrades {
-		if t.Ticker == "" {
+		ticker := strings.ToUpper(strings.TrimSpace(t.Ticker))
+		if ticker == "" {
 			continue
 		}
-		a, ok := byTicker[t.Ticker]
+		a, ok := byTicker[ticker]
 		if !ok {
 			a = &aggregate{}
-			byTicker[t.Ticker] = a
+			byTicker[ticker] = a
 		}
 		a.dbQty += signedDBQty(t)
 		a.dbRowCount++
@@ -218,14 +234,16 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 			// that the abs-only check used to silently miss.
 			source = "side_mismatch"
 		}
-		logger.Warn("reconciler: broker/DB drift",
-			"ticker", ticker,
-			"broker_qty", a.brokerQty,
-			"db_qty", a.dbQty,
-			"db_row_count", a.dbRowCount,
-			"source", source,
-			"tolerance", tolerance,
-		)
+		if emitLogs {
+			logger.Warn("reconciler: broker/DB drift",
+				"ticker", ticker,
+				"broker_qty", a.brokerQty,
+				"db_qty", a.dbQty,
+				"db_row_count", a.dbRowCount,
+				"source", source,
+				"tolerance", tolerance,
+			)
+		}
 		drifts = append(drifts, BrokerDrift{
 			Ticker:        ticker,
 			BrokerQty:     a.brokerQty,
@@ -237,11 +255,13 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		})
 	}
 
-	logger.Info("reconciler complete",
-		"tickers_compared", len(tickers),
-		"drift_warnings", len(drifts),
-	)
-	return drifts, true
+	if emitLogs {
+		logger.Info("reconciler complete",
+			"tickers_compared", len(tickers),
+			"drift_warnings", len(drifts),
+		)
+	}
+	return drifts
 }
 
 // ReconcileBrokerVsDB reports broker-vs-DB drift, discarding the completed flag.
