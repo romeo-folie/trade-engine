@@ -119,7 +119,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	for _, rp := range directional {
 		rp := rp
 		sys, user := prompts.BuildRolePrompt(
-			rp.role, req.Ticker, req.Strategy, req.Timeframe,
+			rp.role, req.Ticker, req.LensSet(), req.Timeframe,
 			promptCandles, promptInd, promptNews, promptPortfolio,
 			req.KnowledgeContext, promptSimilar, req.PerformanceContext,
 		)
@@ -201,7 +201,7 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 	}
 
 	sys, user := prompts.BuildRiskManagerReviewPrompt(
-		req.Ticker, req.Strategy, req.Timeframe,
+		req.Ticker, req.LensSet(), req.Timeframe,
 		promptCandles, promptInd, promptNews, promptPortfolio,
 		req.KnowledgeContext, promptSimilar, req.PerformanceContext,
 		formatDirectionalFindings(results),
@@ -236,6 +236,20 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 
 	final := riskResp
 	final.Reasoning = composeSequentialSpecialistReasoning(results, riskResp)
+	// The risk manager synthesises the directional findings but is not asked to
+	// re-select a lens, so its response carries no usable lens fields. Derive
+	// them from the directional specialists who reached the same verdict —
+	// without this, specialist mode reports an empty selection and the engine's
+	// selected-lens entry gates silently fall back to the configured primary
+	// (the same defect fixed for the ensemble aggregation paths).
+	final.SelectedStrategy, final.Regime = specialistConsensusLens(results, final.Action)
+	// The risk manager runs the full candidate-lens contract too, so riskResp
+	// carries ITS OWN rejection map. Left in place beside a consensus-derived
+	// SelectedStrategy, the aggregate could name its selected lens as a
+	// rejected one. Inert today (only len() is read, and the field is not
+	// persisted), but the two fields must describe the same decision before
+	// anything is ever wired to them.
+	final.RejectedStrategies = specialistConsensusRejections(results, final.Action, final.SelectedStrategy)
 	logger.Info("specialist risk review complete",
 		"ticker", req.Ticker,
 		"action", string(final.Action),
@@ -328,4 +342,59 @@ func (a *Analyzer) specialistRolesConfig() map[string]string {
 // analysis.specialist_mode_enabled is true.
 func (a *Analyzer) SetSpecialistConfig(cfg *config.AnalysisConfig) {
 	a.specialist = cfg
+}
+
+// specialistConsensusLens mirrors consensusLens over specialist results:
+// unanimous selection among the directional specialists who voted for the
+// winning action, empty when they disagree. The risk manager is excluded — it
+// reviews rather than votes, and is not asked to select a lens.
+func specialistConsensusLens(results []specialistResult, winner Action) (selected, regime string) {
+	first := true
+	for _, r := range results {
+		if r.Err != nil || r.Role == "risk_manager" || r.Response.Action != winner {
+			continue
+		}
+		if first {
+			selected, regime = r.Response.SelectedStrategy, r.Response.Regime
+			first = false
+			continue
+		}
+		if r.Response.SelectedStrategy != selected {
+			selected = ""
+		}
+		if r.Response.Regime != regime {
+			regime = ""
+		}
+	}
+	return selected, regime
+}
+
+// specialistConsensusRejections returns the rejection reasons that belong with
+// a consensus-derived selection: the union of what the winning directional
+// specialists rejected, minus the lens that was actually selected.
+//
+// Returns nil when there is no consensus selection, so an aggregate never
+// carries rejections that no longer correspond to a decision.
+func specialistConsensusRejections(results []specialistResult, winner Action, selected string) map[string]string {
+	if selected == "" {
+		return nil
+	}
+	var out map[string]string
+	for _, r := range results {
+		if r.Err != nil || r.Role == "risk_manager" || r.Response.Action != winner {
+			continue
+		}
+		for lens, reason := range r.Response.RejectedStrategies {
+			if lens == selected {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string, len(r.Response.RejectedStrategies))
+			}
+			if _, seen := out[lens]; !seen {
+				out[lens] = reason
+			}
+		}
+	}
+	return out
 }

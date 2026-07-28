@@ -74,7 +74,7 @@ func (c *GeminiClient) Analyze(ctx context.Context, req AnalysisRequest) (Analys
 		userMessage = req.CustomUserMessage
 	} else {
 		systemPrompt, userMessage = prompts.BuildStockPrompt(
-			req.Ticker, req.Strategy, req.Timeframe,
+			req.Ticker, req.LensSet(), req.Timeframe,
 			toPromptCandles(req.RecentCandles), toPromptIndicators(req.Indicators),
 			toPromptNews(req.News), toPromptPortfolio(req.Portfolio, req.Ticker),
 			req.KnowledgeContext, toPromptSimilarSetups(req.SimilarAnalyses),

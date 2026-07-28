@@ -47,7 +47,7 @@ func main() {
 
 	ticker := flag.String("ticker", "NVDA", "ticker symbol to audit (must have closed trades for non-empty output)")
 	timeframe := flag.String("timeframe", "1d", "timeframe label to render in the prompt")
-	strategy := flag.String("strategy", "swing", "strategy label for the system prompt")
+	strategy := flag.String("strategy", "swing", "comma-separated candidate lenses for the system prompt")
 	requireInstrument := flag.Bool("require-instrument", true, "when true, exit non-zero if no instrument-scope feedback_insights row exists for the supplied ticker")
 	flag.Parse()
 
@@ -119,8 +119,8 @@ func main() {
 	ind := prompts.Indicators{
 		EMA20: 100.10, EMA50: 99.40, EMA200: 95.20,
 		SMA20: 100.05, SMA50: 99.10, SMA200: 94.80,
-		RSI:           58.4,
-		MACDLine:      0.42, MACDSignal: 0.31, MACDHistogram: 0.11,
+		RSI:      58.4,
+		MACDLine: 0.42, MACDSignal: 0.31, MACDHistogram: 0.11,
 		BBUpper: 102.30, BBMiddle: 100.10, BBLower: 97.90,
 		ADX: 22.1, ATR: 1.35, OBV: 145_000_000,
 		StochK: 62.0, StochD: 58.0,
@@ -132,9 +132,9 @@ func main() {
 	portfolio := prompts.Portfolio{CashAvailable: 0}
 
 	system, user := prompts.BuildStockPrompt(
-		*ticker, *strategy, *timeframe,
+		*ticker, splitStrategies(*strategy), *timeframe,
 		candles, ind, news, portfolio,
-		"", // knowledgeContext
+		"",  // knowledgeContext
 		nil, // similarSetups
 		pc,
 		false, // momentumPlay
@@ -165,4 +165,19 @@ func main() {
 	// Exit with status 3 to distinguish a strictness failure from a generic
 	// runtime error (1) or flag/usage error (2).
 	os.Exit(3)
+}
+
+// splitStrategies parses the --strategy flag into the candidate lens set the
+// prompt builder now takes. Unrecognised labels are dropped by prompts.Lenses,
+// so an operator passing the historical "swing" default still gets a rendered
+// prompt (falling back to the default lens) rather than an error.
+func splitStrategies(csv string) []string {
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

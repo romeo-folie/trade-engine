@@ -221,7 +221,7 @@ func (e *Engine) runSecondTimeframePass(ctx context.Context, primaryReq analysis
 		candleCap = 20
 	}
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n, ok := windows[primaryReq.Strategy]; ok && n > 0 {
+		if n := widestHistoryWindow(windows, primaryReq.Strategy, primaryReq.Strategies); n > 0 {
 			candleCap = n
 		}
 	}

@@ -25,9 +25,17 @@ const (
 
 // AnalysisRequest carries everything a model needs to produce a recommendation.
 type AnalysisRequest struct {
-	Ticker    string
-	Strategy  string
-	Timeframe string
+	Ticker string
+	// Strategy is the configured PRIMARY label (watchlist strategies[0]). It is
+	// retained for logging, persistence, and the history-window cap; it no
+	// longer decides how the analyst frames the setup.
+	Strategy string
+	// Strategies is the ticker's admissible lens set — the full watchlist
+	// strategies column. Prompts offer these as candidates and the analyst
+	// selects among them (issue #509), rather than being assigned Strategy as
+	// an identity to advocate for. Empty falls back to Strategy.
+	Strategies []string
+	Timeframe  string
 
 	// Market data — recent candles, most recent first.
 	RecentCandles []CandleSnapshot
@@ -69,6 +77,20 @@ type AnalysisRequest struct {
 	MomentumPlay bool
 }
 
+// LensSet returns the admissible lens set to offer the analyst, falling back to
+// the configured primary when Strategies is unset. Callers that construct an
+// AnalysisRequest without the watchlist list (tests, one-off tooling) therefore
+// keep single-lens behaviour instead of silently dropping to defaultLens.
+func (r AnalysisRequest) LensSet() []string {
+	if len(r.Strategies) > 0 {
+		return r.Strategies
+	}
+	if r.Strategy != "" {
+		return []string{r.Strategy}
+	}
+	return nil
+}
+
 // SimilarSetup describes a past analysis that resembles the current one,
 // used for prompt injection.  Mirrors store.SimilarAnalysis without importing
 // the store package into the analysis layer.
@@ -90,6 +112,24 @@ type AnalysisResponse struct {
 	StopLoss   float64 `json:"stop_loss"`
 	TakeProfit float64 `json:"take_profit"`
 	Reasoning  string  `json:"reasoning"`
+
+	// Regime is the analyst's classification of current conditions
+	// ("trending" | "ranging" | "transitional"). Observation-only.
+	Regime string `json:"regime"`
+	// SelectedStrategy is the candidate lens the analyst chose, or "none" when
+	// no admissible lens fits the regime (a regime-mismatch HOLD).
+	//
+	// This is the auditable output of the candidate-lens contract (issue #509):
+	// comparing it against the CONFIGURED strategy detects mislabelled
+	// watchlist rows, and it is the only way to attribute a trade to the lens
+	// actually applied. NOT persisted yet — phase 1 runs in shadow so the
+	// divergence rate can justify the migration before it is built.
+	SelectedStrategy string `json:"selected_strategy"`
+	// RejectedStrategies maps each candidate lens the analyst did not select to
+	// its one-clause rejection reason. Its presence is the guard against
+	// lens-shopping: a menu of lenses is also a menu of justifications, so the
+	// analyst must say why the others do not fit.
+	RejectedStrategies map[string]string `json:"rejected_strategies"`
 }
 
 // ModelCallMeta records operational metadata for a single model invocation.

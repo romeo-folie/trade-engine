@@ -16,6 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/cost"
 	"github.com/romeo-folie/trade-engine/internal/data"
@@ -740,7 +741,7 @@ func (e *Engine) processStock(
 
 	// Run LLM analysis — PRD §8. Errors are logged but non-fatal.
 	e.runAnalysis(
-		ctx, ticker, string(primaryTF), primaryStrategy, candles, set,
+		ctx, ticker, string(primaryTF), primaryStrategy, strategies, candles, set,
 		newsHash, source, graphContext, scannerRunID, pullbackCandidate,
 	)
 }
@@ -837,6 +838,7 @@ func (e *Engine) portfolioContextForPrompt(ctx context.Context) analysis.Portfol
 func (e *Engine) runAnalysis(
 	ctx context.Context,
 	ticker, timeframe, strategy string,
+	strategies []string,
 	candles []data.Candle,
 	set *indicators.IndicatorSet,
 	newsHash, source, graphContext, scannerRunID string,
@@ -921,8 +923,12 @@ func (e *Engine) runAnalysis(
 	if candleCap <= 0 {
 		candleCap = 20
 	}
+	// The analyst may now select ANY admissible lens, so cap at the WIDEST
+	// configured window across the set — capping at the primary's window would
+	// starve a lens that needs more history (momentum 14 vs trend_following 20)
+	// of the bars required to confirm or reject it.
 	if windows := e.cfg.Analysis.HistoryWindowByStrategy; len(windows) > 0 {
-		if n, ok := windows[strategy]; ok && n > 0 {
+		if n := widestHistoryWindow(windows, strategy, strategies); n > 0 {
 			candleCap = n // strategy window overrides; MaxCandlesPerPrompt clamps below
 		}
 	}
@@ -1020,6 +1026,7 @@ func (e *Engine) runAnalysis(
 	req := analysis.AnalysisRequest{
 		Ticker:             ticker,
 		Strategy:           strategy,
+		Strategies:         strategies,
 		Timeframe:          timeframe,
 		MomentumPlay:       source == "scanner",
 		RecentCandles:      snaps,
@@ -1159,6 +1166,28 @@ func (e *Engine) runAnalysis(
 		"reasoning_len", len(resp.Reasoning),
 		"reasoning_truncated", len(resp.Reasoning) > len(reasoningPreview),
 	)
+	// Lens selection (issue #509), logged as its own event so
+	// configured-vs-selected divergence is greppable rather than requiring a
+	// regex over analyses.raw_response. A ticker whose analyst systematically
+	// selects something other than its configured strategy — or "none", the
+	// regime-mismatch answer — is a mislabelled watchlist row.
+	//
+	// Emitted only when the analyst actually reported a selection: older
+	// models and truncation-recovered responses leave it empty, and logging
+	// those as divergent=false would poison the very measurement this exists
+	// for. This is the phase-1 evidence that decides whether persisting
+	// selected_strategy is worth a migration.
+	if resp.SelectedStrategy != "" {
+		logger.Info("lens selection",
+			"ticker", ticker,
+			"configured", strategy,
+			"selected", resp.SelectedStrategy,
+			"regime", resp.Regime,
+			"divergent", resp.SelectedStrategy != strategy,
+			"admissible", strings.Join(prompts.Lenses(strategies), ","),
+			"rejected_count", len(resp.RejectedStrategies),
+		)
+	}
 	// Broadcast per-analyst votes so the frontend can render individual cards.
 	{
 		var votes []events.AnalystVotePayload
@@ -1251,7 +1280,7 @@ func (e *Engine) runAnalysis(
 	// prefetch unset, and generateSignal then re-fetches on-demand and applies
 	// its degraded-mode handling.
 	e.generateSignal(
-		ctx, ticker, timeframe, strategy, candles, resp, analysisID,
+		ctx, ticker, timeframe, strategy, strategies, candles, resp, analysisID,
 		prefetchedOpenTrades, e.analysisSourceNode(result), scannerRunID,
 		pullbackCandidate,
 	)
@@ -1770,6 +1799,7 @@ func pyramidTightenedStop(analystStop, existingMaxStop, avgEntry, signalPrice fl
 func (e *Engine) generateSignal(
 	ctx context.Context,
 	ticker, timeframe, strategy string,
+	strategies []string,
 	candles []data.Candle,
 	resp analysis.AnalysisResponse,
 	analysisID string,
@@ -1940,7 +1970,8 @@ func (e *Engine) generateSignal(
 					"ticker", ticker, "err", pcErr)
 			}
 			entryGateReason = evaluateRunupGates(
-				strategy, string(resp.Action), signalPrice, prevClose, eg,
+				effectiveGateStrategy(strategy, resp.SelectedStrategy, strategies),
+				string(resp.Action), signalPrice, prevClose, eg,
 			)
 		}
 		if entryGateReason != "" {

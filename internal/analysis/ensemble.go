@@ -47,8 +47,12 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 	}
 	maxC, minC := confs[0], confs[0]
 	for _, c := range confs[1:] {
-		if c > maxC { maxC = c }
-		if c < minC { minC = c }
+		if c > maxC {
+			maxC = c
+		}
+		if c < minC {
+			minC = c
+		}
 	}
 	if maxC < minConf || maxC-minC > maxSpread {
 		logger.Debug("fast-path rejected", "maxC", maxC, "minC", minC, "spread", maxC-minC, "minConf", minConf, "maxSpread", maxSpread)
@@ -81,14 +85,84 @@ func TryFastPath(results []AnalystResult, minConf, maxSpread float64) (AnalysisR
 		avgTP = math.Round(sumTP/float64(countTP)*10000) / 10000
 	}
 
+	fpSelected, fpRegime := consensusLens(results, action)
 	return AnalysisResponse{
-		Action:     action,
-		Confidence: avg,
-		SizePct:    avgSizePct,
-		StopLoss:   avgSL,
-		TakeProfit: avgTP,
-		Reasoning:  "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		Action:             action,
+		Confidence:         avg,
+		SizePct:            avgSizePct,
+		StopLoss:           avgSL,
+		TakeProfit:         avgTP,
+		Reasoning:          "[fast-path] All analysts unanimous — confidence, size and risk levels averaged across analysts.",
+		SelectedStrategy:   fpSelected,
+		Regime:             fpRegime,
+		RejectedStrategies: consensusRejections(results, action, fpSelected),
 	}, true
+}
+
+// consensusLens returns the lens fields the aggregated response should carry
+// for a given winning action (issue #509).
+//
+// Aggregation builds a fresh AnalysisResponse field by field, so anything not
+// copied here is silently lost. That matters beyond observability:
+// effectiveGateStrategy in the engine keys the news-tape-confirmation and
+// momentum anti-chase gates off SelectedStrategy, so dropping it through the
+// ensemble would leave those gates armed against the CONFIGURED primary — the
+// precise bypass the candidate-lens change set out to close.
+//
+// Only analysts who voted for the winning action are consulted, and only a
+// unanimous selection among them is carried: a split means the ensemble has no
+// single lens to attribute the decision to, and inventing one would corrupt
+// both the gate and the divergence measurement. Empty is the honest answer,
+// and every consumer already falls back safely on it.
+func consensusLens(results []AnalystResult, winner Action) (selected, regime string) {
+	first := true
+	for _, r := range successfulResults(results) {
+		if r.Response.Action != winner {
+			continue
+		}
+		if first {
+			selected, regime = r.Response.SelectedStrategy, r.Response.Regime
+			first = false
+			continue
+		}
+		if r.Response.SelectedStrategy != selected {
+			selected = ""
+		}
+		if r.Response.Regime != regime {
+			regime = ""
+		}
+	}
+	return selected, regime
+}
+
+// consensusRejections carries the rejection evidence from the analysts who
+// voted for the winning action into an aggregated response. Aggregation builds
+// a fresh response, so omitting this field makes the lens-shopping audit report
+// zero rejected lenses on fast-path, majority, and arbiter decisions.
+//
+// When the winning analysts agree on a selected lens, that lens is excluded as
+// a defensive consistency guard: malformed model output must not make a lens
+// appear both selected and rejected. With no consensus selection, the union of
+// the winning analysts' evidence is still useful telemetry and is preserved.
+func consensusRejections(results []AnalystResult, winner Action, selected string) map[string]string {
+	var out map[string]string
+	for _, r := range successfulResults(results) {
+		if r.Response.Action != winner {
+			continue
+		}
+		for lens, reason := range r.Response.RejectedStrategies {
+			if selected != "" && lens == selected {
+				continue
+			}
+			if out == nil {
+				out = make(map[string]string, len(r.Response.RejectedStrategies))
+			}
+			if _, exists := out[lens]; !exists {
+				out[lens] = reason
+			}
+		}
+	}
+	return out
 }
 
 // ─── Arbiter ───────────────────────────────────────────────────────────────────
@@ -140,7 +214,7 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 	}
 
 	arbReq := AnalysisRequest{
-		CustomSystemPrompt: arbiterSystemPrompt(),
+		CustomSystemPrompt: arbiterSystemPrompt() + prompts.ExitOnlyOverride(req.LensSet()),
 		CustomUserMessage:  buildArbiterUserMessage(req.Ticker, currentPrice, sb.String()),
 		Ticker:             req.Ticker,
 	}
@@ -158,6 +232,17 @@ func Arbitrate(ctx context.Context, arbiter ModelProvider, req AnalysisRequest, 
 		"confidence", fmt.Sprintf("%.3f", resp.Confidence),
 		"dissent", dissentSummary != "", "latency_ms", meta.LatencyMs,
 	)
+	// The arbiter's own schema carries no lens fields, so derive them from the
+	// analysts who reached the same verdict. Without this the arbitrated path —
+	// which produces the majority of live signals — would always report an empty
+	// selection and silently disarm the selected-lens entry gates.
+	//
+	// Assigned UNCONDITIONALLY, overwriting anything the arbiter emitted: the
+	// prompt never asks for these fields, so a non-empty value from it is a
+	// hallucination rather than a selection, and letting it stand would hand
+	// gate control to a field no analyst voted for.
+	resp.SelectedStrategy, resp.Regime = consensusLens(results, resp.Action)
+	resp.RejectedStrategies = consensusRejections(results, resp.Action, resp.SelectedStrategy)
 	return ArbiterResult{Final: resp, DissentSummary: dissentSummary, ModelVotes: votes, FastPathed: false, Meta: meta}, nil
 }
 
@@ -271,10 +356,14 @@ func majorityVote(results []AnalystResult) (AnalysisResponse, bool) {
 			break
 		}
 	}
+	mvSelected, mvRegime := consensusLens(results, winner)
 	return AnalysisResponse{
 		Action: winner, Confidence: avgConf,
 		SizePct: ref.SizePct, StopLoss: ref.StopLoss, TakeProfit: ref.TakeProfit,
-		Reasoning: fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		Reasoning:          fmt.Sprintf("[majority vote: %d/%d analysts agreed on %s]", maxCount, len(successes), winner),
+		SelectedStrategy:   mvSelected,
+		Regime:             mvRegime,
+		RejectedStrategies: consensusRejections(results, winner, mvSelected),
 	}, true
 }
 

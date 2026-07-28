@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
@@ -41,6 +42,64 @@ func primaryStockTimeframe(timeframes []string) data.Timeframe {
 		}
 	}
 	return primary
+}
+
+// widestHistoryWindow returns the largest configured history window across the
+// admissible lens set, falling back to the primary label's window.
+//
+// The prompt now offers every admissible lens as a candidate, so the candle
+// budget must satisfy the most demanding one: a row of momentum,trend_following
+// capped at momentum's 14 candles would hand the analyst too little history to
+// honestly confirm or reject the trend read it is being asked to consider.
+// Only lenses with a configured window participate; unknown labels and
+// entry-gate tags contribute nothing.
+func widestHistoryWindow(windows map[string]int, primary string, strategies []string) int {
+	widest := 0
+	for _, lens := range prompts.Lenses(append([]string{primary}, strategies...)) {
+		if n, ok := windows[lens]; ok && n > widest {
+			widest = n
+		}
+	}
+	return widest
+}
+
+// effectiveGateStrategy returns the lens the entry-quality gates must judge
+// against: the one the analyst actually reasoned under, not the watchlist's
+// configured primary.
+//
+// The run-up gates below are keyed by strategy — the news tape-confirmation
+// gate fires only for news_sentiment, the anti-chase gate only for momentum.
+// Before the candidate-lens change the configured primary WAS the lens the
+// analyst reasoned under (it was injected as the model's identity), so keying
+// on it was safe. It no longer is: a row admitting
+// [trend_following, news_sentiment] can now produce a BUY reasoned entirely
+// under news_sentiment, and keying on the primary would wave through exactly
+// the stale-catalyst chase these gates were built to block (PR #434).
+//
+// The selection is only honoured when it was actually OFFERED to the model for
+// this ticker. Parsing accepts and normalises the field without validating it,
+// so a model can report any lens at all — and both directions are dangerous:
+// a news_sentiment-only row whose model answers "trend_following" would DISARM
+// the news confirmation gate, while an unrelated news_sentiment hallucination
+// would spuriously ARM it. Membership in the admissible set is the check that
+// makes the value trustworthy.
+//
+// Falls back to the configured primary whenever the analyst reported no usable
+// selection — empty (older model, dropped in truncation recovery, or no
+// ensemble consensus), "none" (a regime-mismatch HOLD), an unrecognised label,
+// or a lens that was never on this row's menu. Falling back preserves prior
+// behaviour; trusting a bad value would silently change which gate fires.
+func effectiveGateStrategy(configured, selected string, admissible []string) string {
+	selected = strings.ToLower(strings.TrimSpace(selected))
+	if !prompts.IsLens(selected) {
+		return configured
+	}
+	for _, lens := range prompts.Lenses(admissible) {
+		if lens == selected {
+			return selected
+		}
+	}
+	return configured
 }
 
 func hasEntryStrategy(strategies []string, want string) bool {
