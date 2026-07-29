@@ -94,6 +94,22 @@ func TestIBKRFetchCandles(t *testing.T) {
 	}
 }
 
+func TestIBKRResolveConid_StaticCurrencyStrengthCrosses(t *testing.T) {
+	client := newTestIBKRClient("http://127.0.0.1:0")
+	for pair, want := range map[string]string{
+		"EUR/JPY": "14321016",
+		"GBP/JPY": "14321015",
+	} {
+		got, err := client.resolveConid(context.Background(), pair)
+		if err != nil {
+			t.Fatalf("resolveConid(%q): %v", pair, err)
+		}
+		if got != want {
+			t.Errorf("resolveConid(%q) = %q, want %q", pair, got, want)
+		}
+	}
+}
+
 func TestIBKRFetchCandles_FiltersOutOfRange(t *testing.T) {
 	// Server returns three candles; the first is before `from` and the last is
 	// after `to`. Only the middle candle should survive.
@@ -147,8 +163,8 @@ func TestIBKRResolveConid_ForexDynamic(t *testing.T) {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write([]byte(`[
 				{"conid":11111111,"companyName":"GBP.USD","description":"GBP/USD","exchange":"IDEALPRO"},
-				{"conid":22222222,"companyName":"GBP.JPY","description":"GBP/JPY","exchange":"IDEALPRO"},
-				{"conid":99999999,"companyName":"GBP.JPY","description":"GBP/JPY","exchange":"SMART"}
+				{"conid":22222222,"companyName":"GBP.SEK","description":"GBP/SEK","exchange":"IDEALPRO"},
+				{"conid":99999999,"companyName":"GBP.SEK","description":"GBP/SEK","exchange":"SMART"}
 			]`))
 			return
 		}
@@ -157,14 +173,14 @@ func TestIBKRResolveConid_ForexDynamic(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestIBKRClient(srv.URL)
-	conid, err := client.resolveConid(context.Background(), "GBP/JPY")
+	conid, err := client.resolveConid(context.Background(), "GBP/SEK")
 	if err != nil {
 		t.Fatalf("resolveConid forex: %v", err)
 	}
 	if conid != "22222222" {
 		t.Errorf("conid = %q; want 22222222", conid)
 	}
-	if _, err := client.resolveConid(context.Background(), "GBP/JPY"); err != nil {
+	if _, err := client.resolveConid(context.Background(), "GBP/SEK"); err != nil {
 		t.Fatalf("resolveConid (cached): %v", err)
 	}
 	if hits != 1 {
@@ -179,13 +195,13 @@ func TestIBKRResolveConid_ForexDynamic_StringConid(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+			{"conid":"12087799","companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"}
 		]`))
 	}))
 	defer srv.Close()
 
 	client := newTestIBKRClient(srv.URL)
-	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	conid, err := client.resolveConid(context.Background(), "EUR/SEK")
 	if err != nil {
 		t.Fatalf("resolveConid forex with string conid: %v", err)
 	}
@@ -198,14 +214,14 @@ func TestIBKRResolveConid_ForexDynamic_NullConid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"conid":null,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"SMART"},
-			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+			{"conid":null,"companyName":"EUR.SEK","description":"EUR/SEK","exchange":"SMART"},
+			{"conid":"12087799","companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"}
 		]`))
 	}))
 	defer srv.Close()
 
 	client := newTestIBKRClient(srv.URL)
-	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	conid, err := client.resolveConid(context.Background(), "EUR/SEK")
 	if err != nil {
 		t.Fatalf("resolveConid forex with null plus valid conid: %v", err)
 	}
@@ -218,14 +234,14 @@ func TestIBKRResolveConid_ForexDynamic_MalformedConid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"conid":"not-a-number","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"},
-			{"conid":12087799,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+			{"conid":"not-a-number","companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"},
+			{"conid":12087799,"companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"}
 		]`))
 	}))
 	defer srv.Close()
 
 	client := newTestIBKRClient(srv.URL)
-	conid, err := client.resolveConid(context.Background(), "EUR/JPY")
+	conid, err := client.resolveConid(context.Background(), "EUR/SEK")
 	if err != nil {
 		t.Fatalf("resolveConid forex with malformed plus valid conid: %v", err)
 	}

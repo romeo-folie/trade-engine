@@ -587,6 +587,8 @@ func TestResolveConid_HardcodedMap(t *testing.T) {
 		"USD/CAD": "12087817",
 		"NZD/USD": "15016065",
 		"EUR/GBP": "12087811",
+		"EUR/JPY": "14321016",
+		"GBP/JPY": "14321015",
 		// Metals (CFD)
 		"XAU/USD": "69067924",
 		"XAG/USD": "77124483",
@@ -647,13 +649,13 @@ func TestResolveConid_APIFallback_StringConid(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"conid":"12087799","companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+			{"conid":"12087799","companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"}
 		]`))
 	}))
 	defer srv.Close()
 
 	b := newTestIBKRBroker(srv.URL)
-	conid, err := b.resolveConid(t.Context(), "EUR/JPY", "CASH")
+	conid, err := b.resolveConid(t.Context(), "EUR/SEK", "CASH")
 	if err != nil {
 		t.Fatalf("resolveConid string conid error: %v", err)
 	}
@@ -666,14 +668,14 @@ func TestResolveConid_APIFallback_SkipsZeroConid(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"conid":null,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"},
-			{"conid":12087799,"companyName":"EUR.JPY","description":"EUR/JPY","exchange":"IDEALPRO"}
+			{"conid":null,"companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"},
+			{"conid":12087799,"companyName":"EUR.SEK","description":"EUR/SEK","exchange":"IDEALPRO"}
 		]`))
 	}))
 	defer srv.Close()
 
 	b := newTestIBKRBroker(srv.URL)
-	conid, err := b.resolveConid(t.Context(), "EUR/JPY", "CASH")
+	conid, err := b.resolveConid(t.Context(), "EUR/SEK", "CASH")
 	if err != nil {
 		t.Fatalf("resolveConid null plus valid conid error: %v", err)
 	}

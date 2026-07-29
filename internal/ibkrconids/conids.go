@@ -14,6 +14,10 @@ var Conids = map[string]string{
 	"USD/CAD": "12087817",
 	"NZD/USD": "15016065",
 	"EUR/GBP": "12087811",
+	// Currency-strength ranking crosses, verified against the live IDEALPRO
+	// secdef/info response on 2026-07-29.
+	"EUR/JPY": "14321016",
+	"GBP/JPY": "14321015",
 	// Spot metals (IBKR CMDTY "loco London" — asset class "Commodities" on statements, NOT CFD).
 	// Verified against the live gateway: /iserver/contract/{conid}/info resolves these to
 	// XAUUSD "London Gold" and XAGUSD "London Silver", and /marketdata/history returns bars.
