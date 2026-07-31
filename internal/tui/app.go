@@ -86,7 +86,12 @@ type pollTickMsg time.Time
 type brokerReconTickMsg struct{}
 
 // brokerReconMsg carries the result of an async broker-vs-DB reconciliation.
-type brokerReconMsg struct{ result views.BrokerReconResult }
+type brokerReconMsg struct {
+	result       views.BrokerReconResult
+	snapshot     *views.BrokerDashboardSnapshot
+	scheduleNext bool
+	generation   uint64
+}
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
@@ -150,8 +155,15 @@ type Model struct {
 	// brokerView is the live (read-only) broker connection used to reconcile
 	// broker positions against the DB. Nil when no broker/creds are configured;
 	// reconciliation is then simply skipped.
-	brokerView  execution.BrokerView
-	brokerRecon views.BrokerReconResult
+	brokerView     execution.BrokerView
+	brokerRecon    views.BrokerReconResult
+	brokerSnapshot *views.BrokerDashboardSnapshot
+	// brokerReconGeneration rejects older async responses after a replacement
+	// reconciliation has started.
+	brokerReconGeneration uint64
+	brokerReconInFlight   bool
+	brokerRetryAfter      time.Time
+	brokerDrawdownPeak    float64
 }
 
 const maxRecentEvents = 50
@@ -164,11 +176,12 @@ func New(bus *events.Bus, mode string, brokerView execution.BrokerView) Model {
 		mode = "paper"
 	}
 	m := Model{
-		activeView:       ViewDashboard,
-		bus:              bus,
-		mode:             mode,
-		brokerView:       brokerView,
-		intradayStrategy: "orb",
+		activeView:          ViewDashboard,
+		bus:                 bus,
+		mode:                mode,
+		brokerView:          brokerView,
+		brokerReconInFlight: brokerView != nil,
+		intradayStrategy:    "orb",
 	}
 	// Subscribe eagerly in New() so the subscription is part of the model value
 	// returned to Bubble Tea — Init() has a value receiver, so setting fields
@@ -187,7 +200,7 @@ func (m Model) Init() tea.Cmd {
 	}
 	if m.brokerView != nil {
 		// Reconcile once immediately, then on the slow interval.
-		cmds = append(cmds, fetchBrokerRecon(m.brokerView))
+		cmds = append(cmds, fetchBrokerRecon(m.brokerView, true, m.brokerReconGeneration))
 	}
 	return tea.Batch(cmds...)
 }
@@ -495,6 +508,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case eventMsg:
 		evt := events.Event(msg)
+		var brokerRefresh tea.Cmd
 		m.recentEvents = append(m.recentEvents, evt)
 		if len(m.recentEvents) > maxRecentEvents {
 			m.recentEvents = m.recentEvents[len(m.recentEvents)-maxRecentEvents:]
@@ -502,8 +516,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		ctx := context.Background()
 		// Refresh dashboard data on trade/portfolio/signal events.
 		if views.ApplyEvent(&m.dashData, evt) {
+			if invalidatesBrokerSnapshot(evt.Type) {
+				// Exposure-changing events can be newer than the last slow
+				// broker reconciliation. Show the fresh DB lifecycle state
+				// until the next broker response supersedes it.
+				m.brokerSnapshot = nil
+				m.brokerRetryAfter = time.Time{}
+				if m.brokerView != nil {
+					// The regular reconciliation timer remains responsible for
+					// its own cadence; this replacement fetch is one-shot.
+					m.brokerReconGeneration++
+					m.brokerReconInFlight = true
+					brokerRefresh = fetchBrokerRecon(
+						m.brokerView, false, m.brokerReconGeneration,
+					)
+				}
+			}
 			dc := loadDisplayConfig()
-			m.dashData = views.FetchDashboardData(ctx, m.mode, dc.initialCapital)
+			m.refreshDashboard(ctx, dc)
 		}
 		// Refresh ORB view on any ORB-related event.
 		switch evt.Type {
@@ -516,14 +546,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// Continue listening for events.
 		if m.sub != nil {
-			return m, waitForEvent(m.sub)
+			return m, tea.Batch(waitForEvent(m.sub), brokerRefresh)
+		}
+		if brokerRefresh != nil {
+			return m, brokerRefresh
 		}
 
 	case pollTickMsg:
 		m.lastPoll = time.Time(msg)
 		ctx := context.Background()
 		dc := loadDisplayConfig()
-		m.dashData = views.FetchDashboardData(ctx, m.mode, dc.initialCapital)
+		m.refreshDashboard(ctx, dc)
 		m.tradeData = views.FetchTradeHistory(ctx, 50)
 		m.signalData = views.FetchSignalFeed(ctx, 50)
 		m.watchlistData = views.FetchWatchlistData(ctx)
@@ -575,20 +608,67 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.signalData.Selected = m.selectedSignal
 		m.watchlistData.Selected = m.selectedWatchlist
 		m.configData.Selected = m.selectedConfig
-		return m, pollTicker()
+		var brokerRefresh tea.Cmd
+		if m.brokerView != nil && !m.brokerReconInFlight && m.brokerSnapshot == nil &&
+			!time.Now().Before(m.brokerRetryAfter) {
+			m.brokerReconGeneration++
+			m.brokerReconInFlight = true
+			brokerRefresh = fetchBrokerRecon(
+				m.brokerView, false, m.brokerReconGeneration,
+			)
+		}
+		return m, tea.Batch(pollTicker(), brokerRefresh)
 
 	case brokerReconTickMsg:
 		if m.brokerView != nil {
-			return m, fetchBrokerRecon(m.brokerView)
+			if m.brokerReconInFlight {
+				return m, brokerReconTick()
+			}
+			m.brokerReconGeneration++
+			m.brokerReconInFlight = true
+			return m, fetchBrokerRecon(
+				m.brokerView, true, m.brokerReconGeneration,
+			)
 		}
 
 	case brokerReconMsg:
+		if msg.generation != m.brokerReconGeneration {
+			if msg.scheduleNext {
+				return m, brokerReconTick()
+			}
+			return m, nil
+		}
+		m.brokerReconInFlight = false
 		m.brokerRecon = msg.result
-		// Schedule the next reconciliation on the slow interval.
-		return m, brokerReconTick()
+		// Retain a successful point-in-time broker book across routine DB polls;
+		// exposure-changing events explicitly invalidate it above. A failed
+		// response clears the prior book rather than extending stale authority.
+		m.brokerSnapshot = msg.snapshot
+		if msg.snapshot == nil {
+			m.brokerRetryAfter = time.Now().Add(brokerReconInterval)
+		} else {
+			m.brokerRetryAfter = time.Time{}
+		}
+		dc := loadDisplayConfig()
+		m.refreshDashboard(context.Background(), dc)
+		if msg.scheduleNext {
+			// Only the periodic chain schedules its successor. One-shot event
+			// refreshes must not multiply reconciliation timers.
+			return m, brokerReconTick()
+		}
+		return m, nil
 	}
 
 	return m, nil
+}
+
+func invalidatesBrokerSnapshot(eventType events.Type) bool {
+	switch eventType {
+	case events.TradeExecuted, events.TradeClosed, events.PositionUpdated, events.PortfolioSnapshotTaken:
+		return true
+	default:
+		return false
+	}
 }
 
 // scrollIntraday moves within the already-loaded strategy page. History
@@ -840,7 +920,10 @@ func fmtNextCycle(t time.Time) string {
 
 // displayConfig holds per-tick config values needed by the TUI poll loop.
 type displayConfig struct {
-	initialCapital float64
+	initialCapital    float64
+	portfolioMode     string
+	portfolioBroker   string
+	dailyLossLimitPct float64
 }
 
 // loadDisplayConfig loads the config once and returns all TUI display settings.
@@ -850,9 +933,68 @@ func loadDisplayConfig() displayConfig {
 	if err != nil {
 		return displayConfig{initialCapital: 0}
 	}
+	portfolioMode, portfolioBroker := displayPortfolioScope(
+		cfg.Markets.Stocks.Enabled, cfg.Markets.Stocks.Paper, cfg.Markets.Stocks.APIKey,
+	)
 	return displayConfig{
-		initialCapital: cfg.Engine.InitialCapital,
+		initialCapital:    cfg.Engine.InitialCapital,
+		portfolioMode:     portfolioMode,
+		portfolioBroker:   portfolioBroker,
+		dailyLossLimitPct: cfg.Risk.DailyLossLimitPct,
 	}
+}
+
+func displayPortfolioScope(stocksEnabled, stocksPaper bool, apiKey string) (mode, broker string) {
+	mode = "live"
+	if stocksPaper {
+		mode = "paper"
+	}
+	if stocksEnabled && apiKey != "" {
+		broker = "alpaca"
+	} else {
+		// A credential-less standalone dashboard may be reading snapshots
+		// written by a separately running broker-backed engine.
+		mode = "*"
+		broker = "*"
+	}
+	return mode, broker
+}
+
+func (m *Model) refreshDashboard(ctx context.Context, cfg displayConfig) {
+	m.dashData = views.FetchDashboardData(
+		ctx, m.mode, cfg.initialCapital, cfg.portfolioMode, cfg.portfolioBroker,
+	)
+	if m.brokerDrawdownPeak > m.dashData.DrawdownPeak {
+		m.dashData.DrawdownPeak = m.brokerDrawdownPeak
+		m.dashData.DrawdownAvailable = m.dashData.PortfolioAvailable
+	}
+	if m.brokerSnapshot != nil {
+		if !brokerSnapshotMatchesDB(m.brokerSnapshot, m.dashData) {
+			// Standalone dashboards have no engine event stream. The fast DB
+			// poll still detects exposure changes and invalidates the book so
+			// its caller starts an immediate replacement broker fetch.
+			m.brokerSnapshot = nil
+			m.brokerRetryAfter = time.Time{}
+		} else {
+			if m.brokerSnapshot.Account != nil &&
+				m.brokerSnapshot.Account.Equity > m.dashData.DrawdownPeak {
+				m.dashData.DrawdownPeak = m.brokerSnapshot.Account.Equity
+			}
+			views.ApplyBrokerDashboardSnapshot(
+				&m.dashData, *m.brokerSnapshot, cfg.dailyLossLimitPct,
+			)
+			if m.dashData.DrawdownPeak > m.brokerDrawdownPeak {
+				m.brokerDrawdownPeak = m.dashData.DrawdownPeak
+			}
+		}
+	}
+}
+
+func brokerSnapshotMatchesDB(snapshot *views.BrokerDashboardSnapshot, data views.DashboardData) bool {
+	return snapshot == nil ||
+		!snapshot.DBExposureKnown ||
+		!data.DBExposureKnown ||
+		snapshot.DBExposureSignature == data.DBExposureSignature
 }
 
 // ── Commands ──────────────────────────────────────────────────────────────────
@@ -874,29 +1016,59 @@ func brokerReconTick() tea.Cmd {
 // fetchBrokerRecon fetches live broker positions and reconciles them against the
 // DB open-trade book, off the render path. Failures are surfaced as an
 // unavailable result rather than crashing the TUI.
-func fetchBrokerRecon(bv execution.BrokerView) tea.Cmd {
+func fetchBrokerRecon(bv execution.BrokerView, scheduleNext bool, generation uint64) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
-		// store.GetOpenTrades → store.GetDB() panics without a live connection,
-		// so bail out cleanly when the DB is unavailable (the rest of the TUI
-		// tolerates this too).
-		if !store.IsConnected() {
-			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: "database not connected"}}
-		}
-
 		positions, err := bv.PositionsSnapshot(ctx)
 		if err != nil {
-			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}}
+			return brokerReconMsg{result: views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}, scheduleNext: scheduleNext, generation: generation}
 		}
-		trades, err := store.GetOpenTrades(ctx)
+		account, err := bv.AccountSnapshot(ctx)
 		if err != nil {
-			return brokerReconMsg{views.BrokerReconResult{CheckedAt: time.Now(), Err: err.Error()}}
+			return brokerReconMsg{result: views.BrokerReconResult{
+				CheckedAt: time.Now(),
+				Err:       fmt.Sprintf("broker account snapshot: %v", err),
+			}, scheduleNext: scheduleNext, generation: generation}
 		}
+		fetchedAt := time.Now()
+		snapshot := &views.BrokerDashboardSnapshot{
+			Positions: positions,
+			Account:   &account,
+			FetchedAt: fetchedAt,
+		}
+
+		// Broker economics remain useful even when the DB is unavailable; only
+		// reconciliation and metadata enrichment are skipped.
+		if !store.IsConnected() {
+			return brokerReconMsg{
+				result: views.BrokerReconResult{
+					CheckedAt: fetchedAt,
+					Err:       "database not connected; showing broker-only snapshot",
+				},
+				snapshot:     snapshot,
+				scheduleNext: scheduleNext,
+				generation:   generation,
+			}
+		}
+		trades, err := store.GetOwnedPositionTrades(ctx)
+		if err != nil {
+			return brokerReconMsg{
+				result:       views.BrokerReconResult{CheckedAt: fetchedAt, Err: err.Error()},
+				snapshot:     snapshot,
+				scheduleNext: scheduleNext,
+				generation:   generation,
+			}
+		}
+		snapshot.DBExposureKnown = true
+		snapshot.DBExposureSignature = views.DBExposureSignature(trades)
 		res := views.ReconcilePositions(positions, trades, brokerReconTolerance)
-		res.CheckedAt = time.Now()
-		return brokerReconMsg{res}
+		res.CheckedAt = fetchedAt
+		return brokerReconMsg{
+			result: res, snapshot: snapshot,
+			scheduleNext: scheduleNext, generation: generation,
+		}
 	}
 }
 

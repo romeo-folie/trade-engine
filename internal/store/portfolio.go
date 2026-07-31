@@ -176,11 +176,28 @@ func GetPortfolioSnapshots(ctx context.Context, from, to time.Time) ([]Portfolio
 // cannot poison the drawdown metric. Returns 0 when no qualifying snapshot
 // exists (drawdown then reads 0).
 func GetPeakPortfolioValue(ctx context.Context, since time.Time) (float64, error) {
+	return GetPeakPortfolioValueByScope(ctx, since, "*", "*")
+}
+
+// GetPeakPortfolioValueByMode returns the rolling peak for one account mode.
+// An empty mode preserves the all-mode behavior for existing callers.
+func GetPeakPortfolioValueByMode(ctx context.Context, since time.Time, mode string) (float64, error) {
+	if mode == "" {
+		mode = "*"
+	}
+	return GetPeakPortfolioValueByScope(ctx, since, mode, "*")
+}
+
+// GetPeakPortfolioValueByScope returns the rolling peak for one broker book.
+func GetPeakPortfolioValueByScope(ctx context.Context, since time.Time, mode, broker string) (float64, error) {
 	var peak float64
 	err := GetDB().QueryRow(ctx, `
 		SELECT COALESCE(MAX(total_value), 0)
 		FROM portfolio_snapshots
-		WHERE total_value > 0 AND created_at >= $1`, since).Scan(&peak)
+		WHERE total_value > 0
+		  AND created_at >= $1
+		  AND ($2 = '*' OR COALESCE(mode, '') = $2)
+		  AND ($3 = '*' OR COALESCE(broker, '') = $3)`, since, mode, broker).Scan(&peak)
 	return peak, err
 }
 
@@ -189,15 +206,35 @@ func GetPeakPortfolioValue(ctx context.Context, since time.Time) (float64, error
 // cash/invested unknown, stored as 0) and must never be read as the current
 // account state.
 func GetLatestPortfolioSnapshot(ctx context.Context) (*PortfolioSnapshot, error) {
+	return GetLatestPortfolioSnapshotByScope(ctx, "*", "*")
+}
+
+// GetLatestPortfolioSnapshotByMode returns the newest non-backfill snapshot for
+// one account mode. An empty mode preserves the all-mode behavior.
+func GetLatestPortfolioSnapshotByMode(ctx context.Context, mode string) (*PortfolioSnapshot, error) {
+	if mode == "" {
+		mode = "*"
+	}
+	return GetLatestPortfolioSnapshotByScope(ctx, mode, "*")
+}
+
+// GetLatestPortfolioSnapshotByScope returns the newest non-backfill snapshot
+// for one broker book.
+func GetLatestPortfolioSnapshotByScope(ctx context.Context, mode, broker string) (*PortfolioSnapshot, error) {
 	var s PortfolioSnapshot
 	err := GetDB().QueryRow(ctx, `
 		SELECT id, total_value, cash, invested,
-		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		       unrealized_pnl, realized_pnl_today, open_positions,
+		       COALESCE(source, 'engine'), COALESCE(mode, ''),
+		       COALESCE(broker, ''), created_at
 		FROM portfolio_snapshots
 		WHERE source <> 'backfill'
-		ORDER BY created_at DESC LIMIT 1`).Scan(
+		  AND ($1 = '*' OR COALESCE(mode, '') = $1)
+		  AND ($2 = '*' OR COALESCE(broker, '') = $2)
+		ORDER BY created_at DESC LIMIT 1`, mode, broker).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+		&s.Source, &s.Mode, &s.Broker, &s.CreatedAt,
 	)
 	if err != nil {
 		if IsNoRows(err) {
@@ -206,6 +243,33 @@ func GetLatestPortfolioSnapshot(ctx context.Context) (*PortfolioSnapshot, error)
 		return nil, err
 	}
 	return &s, nil
+}
+
+// GetRealizedPnLByDateRange returns P&L for terminal exits recorded by every
+// durable strategy ledger in the half-open interval [from, to). The ledgers do
+// not yet share account/mode attribution or a timestamped partial-realization
+// journal, so callers must present this as an all-ledger closed-trade total, not
+// as one account's risk-budget consumption.
+func GetRealizedPnLByDateRange(ctx context.Context, from, to time.Time) (float64, error) {
+	var pnl float64
+	err := GetDB().QueryRow(ctx, `
+		SELECT
+		    (SELECT COALESCE(SUM(pnl), 0)
+		     FROM trades
+		     WHERE status='closed' AND closed_at >= $1 AND closed_at < $2)
+		  + (SELECT COALESCE(SUM(pnl), 0)
+		     FROM orb_trades
+		     WHERE status='closed' AND closed_at >= $1 AND closed_at < $2
+		       -- ORB forex P&L is stored in the symbol's quote currency.
+		       -- Only USD-quoted pairs can be added to this dollar total;
+		       -- slashless equities/futures are already account-currency P&L.
+		       AND (POSITION('/' IN ticker) = 0 OR ticker LIKE '%/USD'))
+		  + (SELECT COALESCE(SUM(realized_pnl), 0)
+		     FROM currency_strength_runs
+		     WHERE status='exited' AND exited_at >= $1 AND exited_at < $2)`,
+		from.UTC(), to.UTC(),
+	).Scan(&pnl)
+	return pnl, err
 }
 
 // GetFirstSnapshotOfDay returns the earliest snapshot on the given UTC date, or

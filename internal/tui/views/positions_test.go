@@ -10,15 +10,16 @@ import (
 
 func TestRenderPositionDetailStatic(t *testing.T) {
 	p := PositionRow{
-		Ticker:       "AAPL",
-		EntryPrice:   180,
-		CurrentPrice: 185,
-		Quantity:     10,
-		PnL:          50,
-		PnLPct:       2.78,
-		StopLoss:     175,
-		TakeProfit:   195,
-		Strategy:     "default",
+		Ticker:        "AAPL",
+		EntryPrice:    180,
+		CurrentPrice:  185,
+		Quantity:      10,
+		PnL:           50,
+		PnLPct:        2.78,
+		StopLoss:      175,
+		TakeProfit:    195,
+		Strategy:      "default",
+		MarkAvailable: true,
 	}
 
 	out := RenderPositionDetailStatic(p, 120, 40)
@@ -48,6 +49,7 @@ func TestRenderPositionDetail_Full(t *testing.T) {
 		CurrentPrice:      260,
 		PnL:               50,
 		PnLPct:            4.0,
+		MarkAvailable:     true,
 		AnalysisReasoning: "Strong momentum with RSI oversold bounce and MACD crossover",
 		AnalysisAction:    "BUY",
 		AnalysisModel:     "claude-sonnet-4-20250514",
@@ -63,6 +65,17 @@ func TestRenderPositionDetail_Full(t *testing.T) {
 		if !strings.Contains(out, c) {
 			t.Errorf("expected detail to contain %q", c)
 		}
+	}
+}
+
+func TestRenderPositionDetail_MissingMarkIsUnavailable(t *testing.T) {
+	d := PositionDetail{Trade: store.Trade{
+		Ticker: "NOMARK", Direction: "long", EntryPrice: 42, Quantity: 3,
+		Status: "open",
+	}}
+	out := RenderPositionDetail(d, 120, 40)
+	if !strings.Contains(out, "Mark: —") || !strings.Contains(out, "P&L: —") {
+		t.Fatalf("missing mark rendered as a real value: %q", out)
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -11,10 +12,13 @@ import (
 
 // PositionDetail holds expanded data for a single open position.
 type PositionDetail struct {
-	Trade        store.Trade
-	CurrentPrice float64
-	PnL          float64
-	PnLPct       float64
+	Trade         store.Trade
+	CurrentPrice  float64
+	PnL           float64
+	PnLPct        float64
+	MarkAvailable bool
+	MarkAsOf      time.Time
+	MarkSource    string
 
 	// Analysis context
 	AnalysisReasoning string
@@ -39,22 +43,26 @@ func FetchPositionDetail(ctx context.Context, tradeID string) (d PositionDetail,
 	}
 	d.Trade = *trade
 
-	// Current price — freshest candle across all timeframes, entry as fallback.
+	// Current price — freshest candle across all timeframes. Missing data stays
+	// explicitly unavailable rather than masquerading as breakeven.
 	if c, err := store.GetFreshestCandle(ctx, trade.Ticker); err == nil && c != nil && c.Close > 0 {
 		d.CurrentPrice = c.Close
-	} else {
-		d.CurrentPrice = trade.EntryPrice
+		d.MarkAvailable = true
+		d.MarkAsOf = c.Timestamp
+		d.MarkSource = "candle"
 	}
 
 	// P&L
-	d.PnL = (d.CurrentPrice - trade.EntryPrice) * trade.Quantity
-	if trade.EntryPrice > 0 {
-		d.PnLPct = (d.PnL / (trade.EntryPrice * trade.Quantity)) * 100
-	}
-	if trade.Direction == "short" {
-		d.PnL = (trade.EntryPrice - d.CurrentPrice) * trade.Quantity
+	if d.MarkAvailable {
+		d.PnL = (d.CurrentPrice - trade.EntryPrice) * trade.Quantity
 		if trade.EntryPrice > 0 {
 			d.PnLPct = (d.PnL / (trade.EntryPrice * trade.Quantity)) * 100
+		}
+		if trade.Direction == "short" {
+			d.PnL = (trade.EntryPrice - d.CurrentPrice) * trade.Quantity
+			if trade.EntryPrice > 0 {
+				d.PnLPct = (d.PnL / (trade.EntryPrice * trade.Quantity)) * 100
+			}
 		}
 	}
 
@@ -100,11 +108,15 @@ func RenderPositionDetail(d PositionDetail, width, height int) string {
 
 	// Trade details
 	b.WriteString(sectionTitle.Render("Trade") + "\n")
-	pnlStr := colorPnL(d.PnL)
-	pnlPctStr := colorPnLPct(d.PnLPct)
-	b.WriteString(fmt.Sprintf("  Entry: $%.2f   Current: $%.2f   Qty: %.4f\n", d.Trade.EntryPrice, d.CurrentPrice, d.Trade.Quantity))
-	b.WriteString(fmt.Sprintf("  P&L: %s (%s)\n", pnlStr, pnlPctStr))
-	b.WriteString(fmt.Sprintf("  Stop Loss: $%.2f   Take Profit: $%.2f\n", d.Trade.StopLoss, d.Trade.TakeProfit))
+	if d.MarkAvailable {
+		b.WriteString(fmt.Sprintf("  Entry: $%.2f   Mark: $%.2f   Qty: %.4f\n", d.Trade.EntryPrice, d.CurrentPrice, d.Trade.Quantity))
+		b.WriteString(fmt.Sprintf("  P&L: %s (%s)\n", colorPnL(d.PnL), colorPnLPct(d.PnLPct)))
+	} else {
+		b.WriteString(fmt.Sprintf("  Entry: $%.2f   Mark: —   Qty: %.4f\n", d.Trade.EntryPrice, d.Trade.Quantity))
+		b.WriteString("  P&L: —\n")
+	}
+	b.WriteString(fmt.Sprintf("  Stop Loss: %s   Target: %s\n",
+		formatStop(d.Trade.StopLoss), formatTarget(d.Trade.StopLoss, d.Trade.TakeProfit)))
 	b.WriteString(fmt.Sprintf("  Strategy: %s   Status: %s\n", d.Trade.Strategy, d.Trade.Status))
 	b.WriteString("\n")
 
@@ -160,17 +172,28 @@ func RenderPositionDetailStatic(p PositionRow, width, height int) string {
 	b.WriteString(sectionTitle.Render(titleText) + "\n")
 	b.WriteString(dimText.Render("  Press [esc] to return") + "\n\n")
 
-	pnlStr := colorPnL(p.PnL)
-	pnlPctStr := colorPnLPct(p.PnLPct)
-
 	entryLabel := "Entry"
 	if p.Lots > 1 {
 		entryLabel = fmt.Sprintf("Avg entry (%d lots)", p.Lots)
 	}
-	b.WriteString(fmt.Sprintf("  %s: $%.2f   Current: $%.2f   Qty: %.4f\n", entryLabel, p.EntryPrice, p.CurrentPrice, p.Quantity))
-	b.WriteString(fmt.Sprintf("  P&L: %s (%s)\n", pnlStr, pnlPctStr))
-	b.WriteString(fmt.Sprintf("  Stop Loss: $%.2f   Take Profit: $%.2f\n", p.StopLoss, p.TakeProfit))
-	b.WriteString(fmt.Sprintf("  Strategy: %s\n", p.Strategy))
+	if positionHasMark(p) {
+		b.WriteString(fmt.Sprintf("  %s: $%.2f   Mark: $%.2f   Qty: %.4f\n", entryLabel, p.EntryPrice, p.CurrentPrice, p.Quantity))
+		b.WriteString(fmt.Sprintf("  P&L: %s (%s)\n", colorPnL(p.PnL), colorPnLPct(p.PnLPct)))
+		b.WriteString(fmt.Sprintf("  Mark source: %s\n", formatMarkAge(p)))
+	} else {
+		b.WriteString(fmt.Sprintf("  %s: $%.2f   Mark: —   Qty: %.4f\n", entryLabel, p.EntryPrice, p.Quantity))
+		b.WriteString("  P&L: —\n")
+	}
+	stop, target := formatStop(p.StopLoss), formatTarget(p.StopLoss, p.TakeProfit)
+	strategy := p.Strategy
+	if p.ExitPolicyMixed {
+		stop, target = "MIXED", "MIXED"
+	}
+	if p.StrategyMixed {
+		strategy = "MIXED"
+	}
+	b.WriteString(fmt.Sprintf("  Stop Loss: %s   Target: %s\n", stop, target))
+	b.WriteString(fmt.Sprintf("  Strategy: %s\n", strategy))
 
 	return b.String()
 }
