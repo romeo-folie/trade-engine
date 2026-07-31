@@ -7,6 +7,7 @@ VERSION      := 0.1.0
 LDFLAGS      := -ldflags "-X main.version=$(VERSION)"
 FRONTEND_DIR := web/frontend
 EMBED_DIR    := internal/web/dist
+LOCAL_BIN_DIR ?= $(HOME)/.local/bin
 
 .PHONY: frontend-build
 frontend-build: ## Build the React frontend and copy dist to the Go embed target
@@ -27,6 +28,12 @@ build-go-only: ## Build the te binary without rebuilding the frontend
 install: build ## Build and install te to /usr/local/bin
 	install -m 755 $(BINARY) /usr/local/bin/$(BINARY)
 	@echo "Installed: /usr/local/bin/$(BINARY)"
+
+.PHONY: install-dev
+install-dev: ## Install an auto-building te launcher to ~/.local/bin
+	mkdir -p "$(LOCAL_BIN_DIR)"
+	ln -sfn "$(CURDIR)/scripts/te-dev" "$(LOCAL_BIN_DIR)/$(BINARY)"
+	@echo "Development launcher installed: $(LOCAL_BIN_DIR)/$(BINARY)"
 
 .PHONY: test
 test: ## Run all tests

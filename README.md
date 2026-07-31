@@ -60,27 +60,41 @@ docs/                — PRD + implementation plan + local-first embeddings guid
 ## Quick Start
 
 ```bash
-# Prerequisites: Go 1.22+, Docker (for local DB), Alpaca + Finnhub API keys
+# Prerequisites: Go 1.25+, Docker (for local DB), Alpaca + Finnhub API keys
 
-# 1) Start PostgreSQL + pgvector
+# 1) Install the development launcher (once, from the repository root)
+make install-dev
+
+# Ensure ~/.local/bin is on PATH for this shell
+export PATH="$HOME/.local/bin:$PATH"
+
+# 2) Start PostgreSQL + pgvector
 docker compose up -d db
 
-# 2) Configure
+# 3) Configure
 cp config.example.yaml ~/.tradeengine/config.yaml
 export DATABASE_URL="postgres://postgres:postgres@localhost:5432/tradeengine?sslmode=disable"
 export ALPACA_API_KEY="your-key"
 export ALPACA_API_SECRET="your-secret"
 export FINNHUB_API_KEY="your-key"
 
-# 3) Run migrations
+# 4) Run migrations
 te migrate
 
-# 4) Add a ticker to the watchlist (triggers 2y daily + 30d hourly backfill)
+# 5) Add a ticker to the watchlist (triggers 2y daily + 30d hourly backfill)
 te watchlist add AAPL --strategies=trend_following --timeframes=1h,1d
 
-# 5) Run the engine (paper trading mode by default)
+# 6) Run the engine (paper trading mode by default)
 te run
 ```
+
+`make install-dev` links `~/.local/bin/te` to the repository's development
+launcher. Each `te` command performs a cached Go build from the current checkout
+before it runs, so pulling or merging backend and terminal-dashboard changes does
+not require another install. Run `make build` separately when changing the React
+frontend locally so its embedded assets are regenerated. Persist the `PATH` export
+above in your shell profile (for example, `~/.zshrc`) if `~/.local/bin` is not
+already configured there.
 
 ### Embeddings provider (API vs local)
 
