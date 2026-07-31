@@ -62,9 +62,9 @@ export interface PortfolioState {
   totalValue: number;
   cash: number;
   invested: number;
-  unrealizedPnL: number;
+  unrealizedPnL: number | null;
   realizedPnlToday: number;
-  openPositions: number;
+  openPositions: number | null;
   // Count of DB rows with status='open'. Equals openPositions in steady state
   // (after Epic A consolidation work). Divergence is rendered in the canvas
   // portfolio card to surface drift or pending consolidation. May be null when
@@ -153,13 +153,14 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
     fetch('/api/node/portfolio', { signal: controller.signal })
       .then(r => r.json())
       .then(p => {
+        const positionStatsAvailable = p.PositionStatsAvailable !== false;
         setPortfolioState({
           totalValue: p.TotalValue ?? 0,
           cash: p.Cash ?? 0,
           invested: p.Invested ?? 0,
-          unrealizedPnL: p.UnrealizedPnL ?? 0,
+          unrealizedPnL: positionStatsAvailable ? (p.UnrealizedPnL ?? 0) : null,
           realizedPnlToday: p.DayPnL ?? 0,
-          openPositions: p.OpenPositions ?? 0,
+          openPositions: positionStatsAvailable ? (p.OpenPositions ?? 0) : null,
           openTradeRows: p.OpenTradeRows ?? null,
         });
       })
@@ -200,14 +201,15 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
           if (portfolioNode?.meta) {
             const m = portfolioNode.meta as Record<string, unknown>;
             if (m.total_value != null) {
+              const positionStatsAvailable = m.position_stats_available !== false;
               setPortfolioState({
                 totalValue: m.total_value as number,
                 cash: m.cash as number,
                 invested: m.invested as number,
-                unrealizedPnL: m.unrealized_pnl as number,
+                unrealizedPnL: positionStatsAvailable ? m.unrealized_pnl as number : null,
                 // day_pnl is 0 when broker unavailable (PaperExecutor); fall through to realized_pnl_today.
                 realizedPnlToday: (m.day_pnl != null ? m.day_pnl as number : null) || (m.realized_pnl_today as number) || 0,
-                openPositions: m.open_positions as number,
+                openPositions: positionStatsAvailable ? m.open_positions as number : null,
                 // Snapshot meta doesn't include trade-row count today; null hides divergence in the card.
                 openTradeRows: (m.open_trade_rows != null ? m.open_trade_rows as number : null),
               });
@@ -413,13 +415,18 @@ export function useEngineSocket(opts: UseEngineSocketOptions = {}): EngineSocket
             const p = typeof webEv.payload === 'string'
               ? JSON.parse(webEv.payload)
               : (webEv.payload as Record<string, unknown>);
+            // ORB publishes an unavailable snapshot event solely to trigger
+            // backend refresh consumers at session completion. It must not
+            // replace valid browser portfolio state with the payload's zeros.
+            if (p.available === false) return;
+            const positionStatsAvailable = p.position_stats_available !== false;
             setPortfolioState({
               totalValue: p.total_value as number,
               cash: p.cash as number,
               invested: p.invested as number,
-              unrealizedPnL: p.unrealized_pnl as number,
+              unrealizedPnL: positionStatsAvailable ? p.unrealized_pnl as number : null,
               realizedPnlToday: (p.day_pnl != null ? p.day_pnl as number : null) || (p.realized_pnl_today as number) || 0,
-              openPositions: p.open_positions as number,
+              openPositions: positionStatsAvailable ? p.open_positions as number : null,
               // PortfolioSnapshot WebSocket event doesn't carry the row count today.
               openTradeRows: (p.open_trade_rows != null ? p.open_trade_rows as number : null),
             });

@@ -196,14 +196,16 @@ type PositionUpdatedPayload struct {
 // encoded as null) so subscribers must treat absence as "unknown" — distinct
 // from a known zero. The frontend hides the divergence indicator in that case.
 type PortfolioSnapshotPayload struct {
-	TotalValue       float64 `json:"total_value"`
-	Cash             float64 `json:"cash"`
-	Invested         float64 `json:"invested"`
-	UnrealizedPnL    float64 `json:"unrealized_pnl"`
-	RealizedPnLToday float64 `json:"realized_pnl_today"` // realized P&L from closed trades today
-	DayPnL           float64 `json:"day_pnl"`            // net equity change since last session close (broker-reported)
-	OpenPositions    int     `json:"open_positions"`
-	OpenTradeRows    *int    `json:"open_trade_rows,omitempty"`
+	Available              bool    `json:"available"`
+	TotalValue             float64 `json:"total_value"`
+	Cash                   float64 `json:"cash"`
+	Invested               float64 `json:"invested"`
+	UnrealizedPnL          float64 `json:"unrealized_pnl"`
+	RealizedPnLToday       float64 `json:"realized_pnl_today"` // realized P&L from closed trades today
+	DayPnL                 float64 `json:"day_pnl"`            // net equity change since last session close (broker-reported)
+	OpenPositions          int     `json:"open_positions"`
+	PositionStatsAvailable bool    `json:"position_stats_available"`
+	OpenTradeRows          *int    `json:"open_trade_rows,omitempty"`
 }
 
 // NewsFetchedPayload is emitted after news articles are fetched and stored for a ticker.

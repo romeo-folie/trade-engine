@@ -86,7 +86,7 @@ func TestRenderDashboard_PositionsWindowedKeepsFooter(t *testing.T) {
 	d := sampleData()
 	d.Positions = make([]PositionRow, 80)
 	for i := range d.Positions {
-		d.Positions[i] = PositionRow{Ticker: "ZZZ", EntryPrice: 10, CurrentPrice: 11, Quantity: 1, Strategy: "x"}
+		d.Positions[i] = PositionRow{Ticker: "ZZZ", EntryPrice: 10, CurrentPrice: 11, Quantity: 1, Strategy: "x", MarkAvailable: true}
 	}
 	d.OpenPositionCnt = 80
 

@@ -24,7 +24,7 @@ func TestAggregateOpenPositions_WeightedAverageLong(t *testing.T) {
 		{Ticker: "AAA", Direction: "long", EntryPrice: 100, Quantity: 10},
 		{Ticker: "AAA", Direction: "long", EntryPrice: 120, Quantity: 30},
 	}
-	rows, lots, malformed, _ := aggregateOpenPositions(trades, flatMark(130, time.Now()))
+	rows, lots, malformed, _, _ := aggregateOpenPositions(trades, flatMark(130, time.Now()))
 	if len(rows) != 1 || lots != 2 || malformed != 0 {
 		t.Fatalf("rows=%d lots=%d malformed=%d, want 1/2/0", len(rows), lots, malformed)
 	}
@@ -46,7 +46,7 @@ func TestAggregateOpenPositions_WeightedAverageLong(t *testing.T) {
 func TestAggregateOpenPositions_ShortPnLSign(t *testing.T) {
 	// Short 10 @ $50, marked at $40 → profit (50-40)*10 = 100.
 	trades := []store.Trade{{Ticker: "SSS", Direction: "short", EntryPrice: 50, Quantity: 10}}
-	rows, _, _, _ := aggregateOpenPositions(trades, flatMark(40, time.Now()))
+	rows, _, _, _, _ := aggregateOpenPositions(trades, flatMark(40, time.Now()))
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d", len(rows))
 	}
@@ -63,7 +63,7 @@ func TestAggregateOpenPositions_LongAndShortSameTickerStaySeparate(t *testing.T)
 		{Ticker: "AMC", Direction: "long", EntryPrice: 2, Quantity: 100},
 		{Ticker: "AMC", Direction: "short", EntryPrice: 3, Quantity: 100},
 	}
-	rows, _, _, _ := aggregateOpenPositions(trades, flatMark(2.5, time.Now()))
+	rows, _, _, _, _ := aggregateOpenPositions(trades, flatMark(2.5, time.Now()))
 	if len(rows) != 2 {
 		t.Fatalf("long+short same ticker must be 2 rows, got %d", len(rows))
 	}
@@ -75,7 +75,7 @@ func TestAggregateOpenPositions_MalformedExcluded(t *testing.T) {
 		{Ticker: "ZERO_ENTRY", Direction: "long", EntryPrice: 0, Quantity: 5},
 		{Ticker: "ZERO_QTY", Direction: "long", EntryPrice: 10, Quantity: 0},
 	}
-	rows, lots, malformed, _ := aggregateOpenPositions(trades, flatMark(11, time.Now()))
+	rows, lots, malformed, _, _ := aggregateOpenPositions(trades, flatMark(11, time.Now()))
 	if len(rows) != 1 || lots != 1 || malformed != 2 {
 		t.Fatalf("rows=%d lots=%d malformed=%d, want 1/1/2", len(rows), lots, malformed)
 	}
@@ -85,43 +85,58 @@ func TestAggregateOpenPositions_MalformedExcluded(t *testing.T) {
 }
 
 func TestAggregateOpenPositions_FallbackToEntryWhenNoMark(t *testing.T) {
-	// markPrice returns 0 → row marks to entry, PnL 0, freshest stays zero.
+	// markPrice returns 0 → the row remains explicitly unmarked.
 	trades := []store.Trade{{Ticker: "NOCANDLE", Direction: "long", EntryPrice: 42, Quantity: 3}}
 	noMark := func(string) (float64, time.Time) { return 0, time.Time{} }
-	rows, _, _, freshest := aggregateOpenPositions(trades, noMark)
-	if !approx(rows[0].CurrentPrice, 42) {
-		t.Errorf("current = %.4f, want entry 42", rows[0].CurrentPrice)
+	rows, _, _, oldest, unmarked := aggregateOpenPositions(trades, noMark)
+	if rows[0].MarkAvailable {
+		t.Fatal("missing candle must not masquerade as an available mark")
 	}
-	if !approx(rows[0].PnL, 0) {
-		t.Errorf("PnL = %.4f, want 0 when marked to entry", rows[0].PnL)
+	if rows[0].CurrentPrice != 0 {
+		t.Errorf("current = %.4f, want zero-value unavailable mark", rows[0].CurrentPrice)
 	}
-	if !freshest.IsZero() {
-		t.Errorf("freshest should be zero when no mark available, got %v", freshest)
+	if !oldest.IsZero() || unmarked != 1 {
+		t.Errorf("oldest=%v unmarked=%d, want zero/1", oldest, unmarked)
 	}
 }
 
-func TestAggregateOpenPositions_MultiLotNoMarkValuesAtCost(t *testing.T) {
+func TestAggregateOpenPositions_MultiLotNoMarkRemainsUnavailable(t *testing.T) {
 	// Two lots, no candle: 10@$100 + 30@$120 → weighted avg $115, qty 40.
-	// With no mark, the aggregate must value at cost (PnL exactly 0), NOT at
-	// the last lot's entry price (which would fabricate +$200).
+	// With no mark, the aggregate must not fabricate a current value or P&L.
 	trades := []store.Trade{
 		{Ticker: "AAA", Direction: "long", EntryPrice: 100, Quantity: 10},
 		{Ticker: "AAA", Direction: "long", EntryPrice: 120, Quantity: 30},
 	}
 	noMark := func(string) (float64, time.Time) { return 0, time.Time{} }
-	rows, _, _, _ := aggregateOpenPositions(trades, noMark)
+	rows, _, _, _, unmarked := aggregateOpenPositions(trades, noMark)
 	if len(rows) != 1 {
 		t.Fatalf("want 1 row, got %d", len(rows))
 	}
-	if !approx(rows[0].CurrentPrice, 115) {
-		t.Errorf("unmarked current = %.4f, want weighted-avg entry 115", rows[0].CurrentPrice)
-	}
-	if !approx(rows[0].PnL, 0) {
-		t.Errorf("unmarked multi-lot PnL = %.4f, want exactly 0", rows[0].PnL)
+	if rows[0].MarkAvailable || rows[0].CurrentPrice != 0 || unmarked != 1 {
+		t.Errorf("unexpected unmarked row: %+v unmarked=%d", rows[0], unmarked)
 	}
 }
 
-func TestAggregateOpenPositions_FreshestIsMax(t *testing.T) {
+func TestAggregateOpenPositions_MixedLotMetadataIsExplicit(t *testing.T) {
+	trades := []store.Trade{
+		{Ticker: "MIX", Direction: "long", EntryPrice: 100, Quantity: 1, StopLoss: 95, TakeProfit: 120, Strategy: "momentum", Status: "open"},
+		{Ticker: "MIX", Direction: "long", EntryPrice: 101, Quantity: 1, StopLoss: 90, TakeProfit: 0, Strategy: "mean_reversion", Status: "exiting"},
+	}
+	rows, _, _, _, _ := aggregateOpenPositions(trades, flatMark(105, time.Now()))
+	if len(rows) != 1 {
+		t.Fatalf("rows = %d, want 1", len(rows))
+	}
+	p := rows[0]
+	if !p.ExitPolicyMixed || !p.StrategyMixed || !p.StatusMixed || p.Status != "mixed" {
+		t.Fatalf("mixed metadata was not retained: %+v", p)
+	}
+	out := renderPositionsTable(DashboardData{Positions: rows}, 160, 0, 0)
+	if strings.Count(out, "MIXED") < 4 {
+		t.Fatalf("mixed stop/target/state/strategy not explicit: %q", out)
+	}
+}
+
+func TestAggregateOpenPositions_OldestMarkIsMin(t *testing.T) {
 	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	newer := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	i := 0
@@ -134,9 +149,12 @@ func TestAggregateOpenPositions_FreshestIsMax(t *testing.T) {
 		{Ticker: "A", Direction: "long", EntryPrice: 9, Quantity: 1},
 		{Ticker: "B", Direction: "long", EntryPrice: 9, Quantity: 1},
 	}
-	_, _, _, freshest := aggregateOpenPositions(trades, mark)
-	if !freshest.Equal(newer) {
-		t.Errorf("freshest = %v, want %v", freshest, newer)
+	rows, _, _, oldest, unmarked := aggregateOpenPositions(trades, mark)
+	if !oldest.Equal(older) {
+		t.Errorf("oldest = %v, want %v", oldest, older)
+	}
+	if !rows[0].MarkAsOf.Equal(older) || !rows[1].MarkAsOf.Equal(newer) || unmarked != 0 {
+		t.Fatalf("per-row mark timestamps not retained: %+v", rows)
 	}
 }
 
@@ -145,10 +163,10 @@ func TestPositionsNote(t *testing.T) {
 		Positions:       make([]PositionRow, 25),
 		PositionLots:    39,
 		MalformedTrades: 3,
-		PriceAsOf:       time.Now().Add(-40 * time.Hour), // stale
+		OldestMarkAt:    time.Now().Add(-40 * time.Hour), // stale
 	}
 	note := positionsNote(d)
-	for _, want := range []string{"39 lots", "3 malformed hidden", "marked", "stale"} {
+	for _, want := range []string{"39 lots", "3 malformed hidden", "oldest mark", "stale"} {
 		if !strings.Contains(note, want) {
 			t.Errorf("note %q missing %q", note, want)
 		}

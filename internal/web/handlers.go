@@ -189,18 +189,25 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 			// doesn't expose it directly.
 			var unrealizedPnL float64
 			var openPositions int
+			positionStatsAvailable := false
 			if positions, pErr := s.brokerView.PositionsSnapshot(ctx); pErr == nil {
+				positionStatsAvailable = true
 				openPositions = len(positions)
 				for _, p := range positions {
 					unrealizedPnL += p.UnrealizedPL
 				}
+			}
+			var unrealizedValue, openPositionsValue any
+			if positionStatsAvailable {
+				unrealizedValue = unrealizedPnL
+				openPositionsValue = openPositions
 			}
 
 			jsonResponse(w, map[string]any{
 				"TotalValue":    acct.Equity,
 				"Cash":          acct.Cash,
 				"Invested":      invested,
-				"UnrealizedPnL": unrealizedPnL,
+				"UnrealizedPnL": unrealizedValue,
 				// IBKR does not expose prior-day close; guard to avoid showing
 				// full equity as DayPnL when LastEquity is zero.
 				"DayPnL": func() float64 {
@@ -209,12 +216,13 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 					}
 					return 0.0
 				}(),
-				"RealizedPnLToday": 0.0,
-				"OpenPositions":    openPositions,
-				"OpenTradeRows":    openTradeRows,
-				"BuyingPower":      acct.BuyingPower,
-				"source":           "broker",
-				"stale_at":         nil,
+				"RealizedPnLToday":       0.0,
+				"OpenPositions":          openPositionsValue,
+				"OpenTradeRows":          openTradeRows,
+				"PositionStatsAvailable": positionStatsAvailable,
+				"BuyingPower":            acct.BuyingPower,
+				"source":                 "broker",
+				"stale_at":               nil,
 			})
 			return
 		}
@@ -225,16 +233,17 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	if s.tracker != nil {
 		state := s.tracker.CurrentState()
 		jsonResponse(w, map[string]any{
-			"TotalValue":       state.TotalValue,
-			"Cash":             state.Cash,
-			"Invested":         state.Invested,
-			"UnrealizedPnL":    state.UnrealizedPnL,
-			"DayPnL":           state.DayPnL,
-			"RealizedPnLToday": state.RealizedPnLDay,
-			"OpenPositions":    state.OpenPositions,
-			"OpenTradeRows":    openTradeRows,
-			"source":           "tracker",
-			"stale_at":         nil,
+			"TotalValue":             state.TotalValue,
+			"Cash":                   state.Cash,
+			"Invested":               state.Invested,
+			"UnrealizedPnL":          state.UnrealizedPnL,
+			"DayPnL":                 state.DayPnL,
+			"RealizedPnLToday":       state.RealizedPnLDay,
+			"OpenPositions":          state.OpenPositions,
+			"OpenTradeRows":          openTradeRows,
+			"PositionStatsAvailable": true,
+			"source":                 "tracker",
+			"stale_at":               nil,
 		})
 		return
 	}
@@ -252,24 +261,35 @@ func (s *Server) handlePortfolio(w http.ResponseWriter, r *http.Request) {
 	if snap == nil {
 		jsonResponse(w, map[string]any{
 			"TotalValue": 0.0, "Cash": 0.0, "Invested": 0.0,
-			"UnrealizedPnL": 0.0, "DayPnL": 0.0, "RealizedPnLToday": 0.0,
-			"OpenPositions": 0, "OpenTradeRows": openTradeRows,
-			"source": "db", "stale_at": nil,
+			"UnrealizedPnL": nil, "DayPnL": 0.0, "RealizedPnLToday": 0.0,
+			"OpenPositions": nil, "OpenTradeRows": openTradeRows,
+			"PositionStatsAvailable": false,
+			"source":                 "db", "stale_at": nil,
 		})
 		return
 	}
-	jsonResponse(w, map[string]any{
-		"TotalValue":       snap.TotalValue,
-		"Cash":             snap.Cash,
-		"Invested":         snap.Invested,
-		"UnrealizedPnL":    snap.UnrealizedPnL,
-		"DayPnL":           0.0,
-		"RealizedPnLToday": snap.RealizedPnLToday,
-		"OpenPositions":    snap.OpenPositions,
-		"OpenTradeRows":    openTradeRows,
-		"source":           "db",
-		"stale_at":         snap.CreatedAt.UTC().Format(time.RFC3339),
-	})
+	jsonResponse(w, portfolioSnapshotResponse(snap, openTradeRows))
+}
+
+func portfolioSnapshotResponse(snap *store.PortfolioSnapshot, openTradeRows *int) map[string]any {
+	var unrealizedPnL, openPositions any
+	if snap.PositionStatsAvailable {
+		unrealizedPnL = snap.UnrealizedPnL
+		openPositions = snap.OpenPositions
+	}
+	return map[string]any{
+		"TotalValue":             snap.TotalValue,
+		"Cash":                   snap.Cash,
+		"Invested":               snap.Invested,
+		"UnrealizedPnL":          unrealizedPnL,
+		"DayPnL":                 0.0,
+		"RealizedPnLToday":       snap.RealizedPnLToday,
+		"OpenPositions":          openPositions,
+		"OpenTradeRows":          openTradeRows,
+		"PositionStatsAvailable": snap.PositionStatsAvailable,
+		"source":                 "db",
+		"stale_at":               snap.CreatedAt.UTC().Format(time.RFC3339),
+	}
 }
 
 // GET /api/portfolio/history?days=N&period=1M&timeframe=1D&mode=all

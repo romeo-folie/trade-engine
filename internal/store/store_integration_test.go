@@ -41,6 +41,170 @@ func testModelMeta() analysis.ModelCallMeta {
 	}
 }
 
+func TestGetRealizedPnLByDateRange_AggregatesUSDCompatibleStrategyExits(t *testing.T) {
+	ctx := context.Background()
+	db := store.GetDB()
+	from := time.Date(2040, time.January, 15, 0, 0, 0, 0, time.UTC)
+	to := from.Add(24 * time.Hour)
+	const ticker = "TEST_DASH_PNL"
+	const sessionName = "test-dashboard-pnl"
+	const accountID = "test-dashboard-pnl"
+
+	defer func() {
+		_, _ = db.Exec(ctx, `DELETE FROM currency_strength_runs WHERE account_id LIKE $1`, accountID+"%")
+		_, _ = db.Exec(ctx, `DELETE FROM orb_sessions WHERE date=$1 AND session_name=$2`, from, sessionName)
+		_, _ = db.Exec(ctx, `DELETE FROM trades WHERE ticker=$1`, ticker)
+	}()
+
+	if _, err := db.Exec(ctx, `
+		INSERT INTO trades (
+			ticker, direction, strategy, entry_price, exit_price, quantity,
+			pnl, pnl_pct, status, opened_at, closed_at, created_at
+		) VALUES
+			($1, 'long', 'test', 100, 101, 10, 10, 1, 'closed', $2, $3, $2),
+			($1, 'long', 'test', 100, 199, 10, 990, 99, 'closed', $2, $4, $2),
+			($1, 'long', 'test', 100, NULL, 10, 100, 10, 'open', $2, $5, $2)`,
+		ticker, from.Add(time.Hour), from.Add(2*time.Hour), to, from.Add(5*time.Hour)); err != nil {
+		t.Fatalf("insert stock P&L fixtures: %v", err)
+	}
+
+	var sessionID string
+	if err := db.QueryRow(ctx, `
+		INSERT INTO orb_sessions (date, status, session_name)
+		VALUES ($1, 'done', $2)
+		RETURNING id`, from, sessionName).Scan(&sessionID); err != nil {
+		t.Fatalf("insert ORB session fixture: %v", err)
+	}
+	if _, err := db.Exec(ctx, `
+		INSERT INTO orb_trades (
+			session_id, ticker, side, qty, status, fill_price, pnl, closed_at
+		) VALUES
+			($1, $2, 'buy', 1, 'closed', 100, -3, $3),
+			($1, $2, 'buy', 1, 'closed', 100, 2, $4),
+			($1, $2, 'buy', 1, 'closed', 100, NULL, $4),
+			($1, $2, 'buy', 1, 'filled', 100, 100, $3),
+			($1, 'USD/JPY', 'buy', 1, 'closed', 150, 10000, $3)`,
+		sessionID, ticker, from.Add(3*time.Hour), from); err != nil {
+		t.Fatalf("insert ORB P&L fixture: %v", err)
+	}
+
+	if _, err := db.Exec(ctx, `
+		INSERT INTO currency_strength_runs (
+			account_id, session_date, status, timezone, strength_start,
+			strength_end, exit_time, units, exited_at, realized_pnl
+		) VALUES
+			($1, $2, 'exited', 'UTC', '06:00', '09:00', '18:00', 100000, $3, 5),
+			($4, $2, 'exit_submitted', 'UTC', '06:00', '09:00', '18:00', 100000, $3, 100)`,
+		accountID, from, from.Add(4*time.Hour), accountID+"-pending"); err != nil {
+		t.Fatalf("insert currency-strength P&L fixture: %v", err)
+	}
+
+	got, err := store.GetRealizedPnLByDateRange(ctx, from, to)
+	if err != nil {
+		t.Fatalf("GetRealizedPnLByDateRange: %v", err)
+	}
+	if got != 14 {
+		t.Fatalf("terminal-exit P&L = %v, want 14", got)
+	}
+}
+
+func TestPortfolioSnapshotReads_AreScopedByMode(t *testing.T) {
+	ctx := context.Background()
+	db := store.GetDB()
+	at := time.Date(2041, time.February, 3, 12, 0, 0, 0, time.UTC)
+	const source = "test-dashboard-scope"
+
+	defer func() {
+		_, _ = db.Exec(ctx, `DELETE FROM portfolio_snapshots WHERE source=$1`, source)
+	}()
+	if _, err := db.Exec(ctx, `
+		INSERT INTO portfolio_snapshots (
+			total_value, cash, invested, unrealized_pnl, open_positions,
+			source, mode, broker, created_at
+		) VALUES
+			(101000, 90000, 11000, 1000, 1, $1, 'live', 'alpaca', $2),
+			(55000, 50000, 5000, 0, 2, $1, 'paper', 'alpaca', $3),
+			(777000, 700000, 77000, 0, 3, $1, 'live', 'ibkr', $3),
+			(333000, 300000, 33000, 0, 4, $1, 'live', NULL, $4),
+			(202000, 180000, 22000, 2000, 2, $1, 'live', 'alpaca', $5)`,
+		source, at, at.Add(time.Minute), at.Add(2*time.Minute), at.Add(3*time.Minute)); err != nil {
+		t.Fatalf("insert scoped portfolio fixtures: %v", err)
+	}
+	var backfillID string
+	if err := db.QueryRow(ctx, `
+		INSERT INTO portfolio_snapshots (
+			total_value, cash, invested, unrealized_pnl, open_positions,
+			source, mode, broker, created_at
+		) VALUES (250000, 0, 0, 0, 0, 'backfill', 'live', 'alpaca', $1)
+		RETURNING id`, at.Add(4*time.Minute)).Scan(&backfillID); err != nil {
+		t.Fatalf("insert backfill peak fixture: %v", err)
+	}
+	defer func() {
+		_, _ = db.Exec(ctx, `DELETE FROM portfolio_snapshots WHERE id=$1`, backfillID)
+	}()
+
+	live, err := store.GetLatestPortfolioSnapshotByScope(ctx, "live", "alpaca")
+	if err != nil {
+		t.Fatalf("GetLatestPortfolioSnapshotByMode(live): %v", err)
+	}
+	if live == nil || live.TotalValue != 202000 || live.Mode != "live" {
+		t.Fatalf("live snapshot = %+v, want latest Alpaca live 202000", live)
+	}
+	paper, err := store.GetLatestPortfolioSnapshotByMode(ctx, "paper")
+	if err != nil {
+		t.Fatalf("GetLatestPortfolioSnapshotByMode(paper): %v", err)
+	}
+	if paper == nil || paper.TotalValue != 55000 || paper.Mode != "paper" {
+		t.Fatalf("paper snapshot = %+v, want paper 55000", paper)
+	}
+	local, err := store.GetLatestPortfolioSnapshotByScope(ctx, "live", "")
+	if err != nil {
+		t.Fatalf("GetLatestPortfolioSnapshotByScope(local): %v", err)
+	}
+	if local == nil || local.TotalValue != 333000 || local.Broker != "" {
+		t.Fatalf("local snapshot = %+v, want untagged 333000", local)
+	}
+
+	peak, err := store.GetPeakPortfolioValueByScope(ctx, at.Add(-time.Hour), "live", "alpaca")
+	if err != nil {
+		t.Fatalf("GetPeakPortfolioValueByMode(live): %v", err)
+	}
+	if peak != 250000 {
+		t.Fatalf("live peak = %v, want backfilled broker equity peak 250000", peak)
+	}
+}
+
+func TestPortfolioSnapshot_PositionStatsAvailabilityRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	db := store.GetDB()
+	const source = "test-position-stats-availability"
+	defer func() {
+		_, _ = db.Exec(ctx, `DELETE FROM portfolio_snapshots WHERE source=$1`, source)
+	}()
+
+	for _, tt := range []struct {
+		broker    string
+		available bool
+	}{
+		{broker: "test-unavailable", available: false},
+		{broker: "test-available", available: true},
+	} {
+		if err := store.InsertPortfolioSnapshot(
+			ctx, 100000, 90000, 10000, 0, 0, 0,
+			tt.available, source, "paper", tt.broker,
+		); err != nil {
+			t.Fatalf("insert %s snapshot: %v", tt.broker, err)
+		}
+		got, err := store.GetLatestPortfolioSnapshotByScope(ctx, "paper", tt.broker)
+		if err != nil {
+			t.Fatalf("read %s snapshot: %v", tt.broker, err)
+		}
+		if got == nil || got.PositionStatsAvailable != tt.available {
+			t.Fatalf("%s availability = %+v, want %v", tt.broker, got, tt.available)
+		}
+	}
+}
+
 func TestCandles_UpsertRefreshesSameTimestampBar(t *testing.T) {
 	ctx := context.Background()
 	ts := time.Date(2026, time.July, 25, 13, 0, 0, 0, time.UTC)

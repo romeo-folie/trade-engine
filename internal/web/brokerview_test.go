@@ -15,7 +15,7 @@ import (
 // ── Stub BrokerView ───────────────────────────────────────────────────────────
 
 type stubBrokerView struct {
-	account   execution.BrokerAccount
+	account    execution.BrokerAccount
 	accountErr error
 
 	positions    []execution.BrokerPosition
@@ -78,6 +78,29 @@ func TestHandlePortfolio_BrokerPath(t *testing.T) {
 	dayPnL := resp["DayPnL"].(float64)
 	if dayPnL != 5_000 {
 		t.Errorf("DayPnL: want 5000, got %v", dayPnL)
+	}
+}
+
+func TestHandlePortfolio_BrokerPositionFailureMarksStatsUnavailable(t *testing.T) {
+	bv := &stubBrokerView{
+		account:      execution.BrokerAccount{Equity: 105_000, Cash: 20_000},
+		positionsErr: execution.ErrBrokerUnavailable,
+	}
+	srv := NewServer(Config{}, nil, nil)
+	srv.SetBrokerView(stubCache(bv))
+
+	w := httptest.NewRecorder()
+	srv.handlePortfolio(w, httptest.NewRequest("GET", "/api/node/portfolio", nil))
+
+	var resp map[string]any
+	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got := resp["PositionStatsAvailable"]; got != false {
+		t.Fatalf("position stats availability = %v, want false", got)
+	}
+	if resp["OpenPositions"] != nil || resp["UnrealizedPnL"] != nil {
+		t.Fatalf("failed position read published zero stats: %+v", resp)
 	}
 }
 
