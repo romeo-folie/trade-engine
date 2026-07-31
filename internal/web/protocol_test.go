@@ -6,6 +6,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 func topologyTestConfig() *config.Config {
@@ -22,6 +23,29 @@ func topologyTestConfig() *config.Config {
 				Arbiter:  "arb",
 			},
 		},
+	}
+}
+
+func TestPortfolioSnapshotMeta_OmitsUnavailablePositionStats(t *testing.T) {
+	meta := portfolioSnapshotMeta(&store.PortfolioSnapshot{
+		TotalValue: 100000, OpenPositions: 2, UnrealizedPnL: 50,
+		PositionStatsAvailable: false,
+	}, nil)
+	if meta["position_stats_available"] != false {
+		t.Fatalf("position stats availability = %v, want false", meta["position_stats_available"])
+	}
+	if _, ok := meta["open_positions"]; ok {
+		t.Fatalf("unavailable open positions were published: %+v", meta)
+	}
+	if _, ok := meta["unrealized_pnl"]; ok {
+		t.Fatalf("unavailable unrealized P&L was published: %+v", meta)
+	}
+
+	meta = portfolioSnapshotMeta(&store.PortfolioSnapshot{
+		PositionStatsAvailable: true,
+	}, nil)
+	if meta["open_positions"] != 0 || meta["unrealized_pnl"] != float64(0) {
+		t.Fatalf("legitimate flat snapshot did not publish zeros: %+v", meta)
 	}
 }
 

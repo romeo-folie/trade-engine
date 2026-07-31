@@ -156,7 +156,7 @@ func (t *Tracker) MaybeSnapshot(ctx context.Context) *State {
 	}
 	if err := store.InsertPortfolioSnapshot(
 		ctx, s.TotalValue, s.Cash, s.Invested, s.UnrealizedPnL, s.RealizedPnLDay,
-		s.OpenPositions, "engine", mode, broker,
+		s.OpenPositions, true, "engine", mode, broker,
 	); err != nil {
 		logger.Warn("portfolio snapshot failed", "err", err)
 		return nil

@@ -10,32 +10,34 @@ import (
 
 // PortfolioSnapshot mirrors a row from the portfolio_snapshots table.
 type PortfolioSnapshot struct {
-	ID               string
-	TotalValue       float64
-	Cash             float64
-	Invested         float64
-	UnrealizedPnL    float64
-	RealizedPnLToday float64
-	OpenPositions    int
-	Source           string // "engine" | "poller" | "backfill"
-	Mode             string // "live" | "paper" (empty for pre-migration rows)
-	Broker           string // "alpaca" | "ibkr" (empty for pre-migration rows)
-	CreatedAt        time.Time
+	ID                     string
+	TotalValue             float64
+	Cash                   float64
+	Invested               float64
+	UnrealizedPnL          float64
+	RealizedPnLToday       float64
+	OpenPositions          int
+	PositionStatsAvailable bool
+	Source                 string // "engine" | "poller" | "backfill"
+	Mode                   string // "live" | "paper" (empty for pre-migration rows)
+	Broker                 string // "alpaca" | "ibkr" (empty for pre-migration rows)
+	CreatedAt              time.Time
 }
 
 // InsertPortfolioSnapshot writes a snapshot row. source/mode/broker tag the
 // origin of the data (added by migration 021). Pass empty strings for
 // pre-migration compatibility — Postgres will use the column DEFAULT.
-func InsertPortfolioSnapshot(ctx context.Context, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, source, mode, broker string) error {
+func InsertPortfolioSnapshot(ctx context.Context, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, positionStatsAvailable bool, source, mode, broker string) error {
 	if source == "" {
 		source = "engine"
 	}
 	_, err := GetDB().Exec(ctx, `
 		INSERT INTO portfolio_snapshots
-		  (total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions, source, mode, broker)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		  (total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions,
+		   position_stats_available, source, mode, broker)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		totalValue, cash, invested, unrealizedPnL, realizedPnLToday, openPositions,
-		source, nullableText(mode), nullableText(broker),
+		positionStatsAvailable, source, nullableText(mode), nullableText(broker),
 	)
 	return err
 }
@@ -45,16 +47,17 @@ func InsertPortfolioSnapshot(ctx context.Context, totalValue, cash, invested, un
 // their own calendar day instead of the day the engine happened to restart —
 // otherwise year-old equity values masquerade as current ones and the
 // backfill's per-day dedup can never see its own prior inserts.
-func InsertPortfolioSnapshotAt(ctx context.Context, createdAt time.Time, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, source, mode, broker string) error {
+func InsertPortfolioSnapshotAt(ctx context.Context, createdAt time.Time, totalValue, cash, invested, unrealizedPnL, realizedPnLToday float64, openPositions int, positionStatsAvailable bool, source, mode, broker string) error {
 	if source == "" {
 		source = "engine"
 	}
 	_, err := GetDB().Exec(ctx, `
 		INSERT INTO portfolio_snapshots
-		  (created_at, total_value, cash, invested, unrealized_pnl, realized_pnl_today, open_positions, source, mode, broker)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		  (created_at, total_value, cash, invested, unrealized_pnl, realized_pnl_today,
+		   open_positions, position_stats_available, source, mode, broker)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		createdAt.UTC(), totalValue, cash, invested, unrealizedPnL, realizedPnLToday, openPositions,
-		source, nullableText(mode), nullableText(broker),
+		positionStatsAvailable, source, nullableText(mode), nullableText(broker),
 	)
 	return err
 }
@@ -74,14 +77,14 @@ func GetPortfolioSnapshotsByMode(ctx context.Context, from, to time.Time, mode s
 	var args []any
 	if mode == "" || mode == "all" {
 		query = `SELECT id, total_value, cash, invested, unrealized_pnl, realized_pnl_today,
-		                open_positions, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
+			        open_positions, position_stats_available, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
 		         FROM portfolio_snapshots
 		         WHERE created_at >= $1 AND created_at <= $2
 		         ORDER BY created_at ASC`
 		args = []any{from.UTC(), to.UTC()}
 	} else {
 		query = `SELECT id, total_value, cash, invested, unrealized_pnl, realized_pnl_today,
-		                open_positions, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
+			        open_positions, position_stats_available, COALESCE(source,'engine'), COALESCE(mode,''), COALESCE(broker,''), created_at
 		         FROM portfolio_snapshots
 		         WHERE created_at >= $1 AND created_at <= $2 AND mode = $3
 		         ORDER BY created_at ASC`
@@ -98,7 +101,7 @@ func GetPortfolioSnapshotsByMode(ctx context.Context, from, to time.Time, mode s
 		var s PortfolioSnapshot
 		if err := rows.Scan(
 			&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-			&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+			&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.PositionStatsAvailable,
 			&s.Source, &s.Mode, &s.Broker, &s.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -146,7 +149,8 @@ type DailySummary struct {
 func GetPortfolioSnapshots(ctx context.Context, from, to time.Time) ([]PortfolioSnapshot, error) {
 	rows, err := GetDB().Query(ctx, `
 		SELECT id, total_value, cash, invested,
-		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		       unrealized_pnl, realized_pnl_today, open_positions,
+		       position_stats_available, created_at
 		FROM portfolio_snapshots
 		WHERE created_at >= $1 AND created_at <= $2
 		ORDER BY created_at ASC`,
@@ -161,7 +165,8 @@ func GetPortfolioSnapshots(ctx context.Context, from, to time.Time) ([]Portfolio
 		var s PortfolioSnapshot
 		if err := rows.Scan(
 			&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-			&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+			&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+			&s.PositionStatsAvailable, &s.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -224,7 +229,7 @@ func GetLatestPortfolioSnapshotByScope(ctx context.Context, mode, broker string)
 	var s PortfolioSnapshot
 	err := GetDB().QueryRow(ctx, `
 		SELECT id, total_value, cash, invested,
-		       unrealized_pnl, realized_pnl_today, open_positions,
+		       unrealized_pnl, realized_pnl_today, open_positions, position_stats_available,
 		       COALESCE(source, 'engine'), COALESCE(mode, ''),
 		       COALESCE(broker, ''), created_at
 		FROM portfolio_snapshots
@@ -233,7 +238,7 @@ func GetLatestPortfolioSnapshotByScope(ctx context.Context, mode, broker string)
 		  AND ($2 = '*' OR COALESCE(broker, '') = $2)
 		ORDER BY created_at DESC LIMIT 1`, mode, broker).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.PositionStatsAvailable,
 		&s.Source, &s.Mode, &s.Broker, &s.CreatedAt,
 	)
 	if err != nil {
@@ -245,11 +250,12 @@ func GetLatestPortfolioSnapshotByScope(ctx context.Context, mode, broker string)
 	return &s, nil
 }
 
-// GetRealizedPnLByDateRange returns P&L for terminal exits recorded by every
-// durable strategy ledger in the half-open interval [from, to). The ledgers do
-// not yet share account/mode attribution or a timestamped partial-realization
-// journal, so callers must present this as an all-ledger closed-trade total, not
-// as one account's risk-budget consumption.
+// GetRealizedPnLByDateRange returns account-currency-compatible P&L for terminal
+// exits recorded by the durable strategy ledgers in [from, to). Non-USD quoted
+// ORB forex exits are excluded because their stored P&L is in quote currency
+// and no historical conversion is available. The ledgers do not yet share
+// account/mode attribution or a timestamped partial-realization journal, so
+// callers must not present this as one account's risk-budget consumption.
 func GetRealizedPnLByDateRange(ctx context.Context, from, to time.Time) (float64, error) {
 	var pnl float64
 	err := GetDB().QueryRow(ctx, `
@@ -281,13 +287,15 @@ func GetFirstSnapshotOfDay(ctx context.Context, day time.Time) (*PortfolioSnapsh
 	var s PortfolioSnapshot
 	err := GetDB().QueryRow(ctx, `
 		SELECT id, total_value, cash, invested,
-		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		       unrealized_pnl, realized_pnl_today, open_positions,
+		       position_stats_available, created_at
 		FROM portfolio_snapshots
 		WHERE created_at >= $1 AND created_at < $2 AND source <> 'backfill'
 		ORDER BY created_at ASC LIMIT 1`,
 		start, end).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+		&s.PositionStatsAvailable, &s.CreatedAt,
 	)
 	if err != nil {
 		if IsNoRows(err) {
@@ -305,13 +313,15 @@ func GetLastSnapshotBeforeDay(ctx context.Context, day time.Time) (*PortfolioSna
 	var s PortfolioSnapshot
 	err := GetDB().QueryRow(ctx, `
 		SELECT id, total_value, cash, invested,
-		       unrealized_pnl, realized_pnl_today, open_positions, created_at
+		       unrealized_pnl, realized_pnl_today, open_positions,
+		       position_stats_available, created_at
 		FROM portfolio_snapshots
 		WHERE created_at < $1 AND source <> 'backfill'
 		ORDER BY created_at DESC LIMIT 1`,
 		cutoff).Scan(
 		&s.ID, &s.TotalValue, &s.Cash, &s.Invested,
-		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions, &s.CreatedAt,
+		&s.UnrealizedPnL, &s.RealizedPnLToday, &s.OpenPositions,
+		&s.PositionStatsAvailable, &s.CreatedAt,
 	)
 	if err != nil {
 		if IsNoRows(err) {

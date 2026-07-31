@@ -13,15 +13,16 @@ import (
 
 func sampleData() DashboardData {
 	return DashboardData{
-		Mode:               "paper",
-		PaperMode:          true,
-		TotalValue:         100000,
-		Cash:               60000,
-		Invested:           40000,
-		TodayPnL:           250.50,
-		TodayPnLAvailable:  true,
-		UnrealizedPnL:      -120.30,
-		PortfolioAvailable: true,
+		Mode:                   "paper",
+		PaperMode:              true,
+		TotalValue:             100000,
+		Cash:                   60000,
+		Invested:               40000,
+		TodayPnL:               250.50,
+		TodayPnLAvailable:      true,
+		UnrealizedPnL:          -120.30,
+		UnrealizedPnLAvailable: true,
+		PortfolioAvailable:     true,
 		Positions: []PositionRow{
 			{Ticker: "AAPL", EntryPrice: 180, CurrentPrice: 185, Quantity: 10, PnL: 50, PnLPct: 2.78, StopLoss: 175, TakeProfit: 195, Strategy: "default", MarkAvailable: true, MarkAsOf: time.Now(), MarkSource: "broker"},
 			{Ticker: "TSLA", EntryPrice: 250, CurrentPrice: 245, Quantity: 5, PnL: -25, PnLPct: -1.0, StopLoss: 240, TakeProfit: 270, Strategy: "default", MarkAvailable: true, MarkAsOf: time.Now(), MarkSource: "broker"},
@@ -85,8 +86,75 @@ func TestRenderPortfolioSummary_ClosedTodayUnavailable(t *testing.T) {
 		Invested:           10000,
 	}
 	out := ansi.Strip(renderPortfolioSummary(d))
-	if !strings.Contains(out, "Closed today (all ledgers): —") {
+	if !strings.Contains(out, "Closed today (excl. non-USD ORB): —") {
 		t.Fatalf("unavailable closed-today P&L rendered as a value: %q", out)
+	}
+}
+
+func TestRenderPortfolioSummary_DisclosesExcludedORBForex(t *testing.T) {
+	out := ansi.Strip(renderPortfolioSummary(DashboardData{
+		PortfolioAvailable:     true,
+		TodayPnL:               14,
+		TodayPnLAvailable:      true,
+		UnrealizedPnLAvailable: true,
+	}))
+	if !strings.Contains(out, "Closed today (excl. non-USD ORB): +$14.00") {
+		t.Fatalf("closed-today label overstates currency coverage: %q", out)
+	}
+}
+
+func TestPositionMetricsFallback_PreservesAccountAndRecoversDBStats(t *testing.T) {
+	d := DashboardData{Positions: []PositionRow{{Ticker: "AAPL"}, {Ticker: "MSFT"}}}
+	snap := &store.PortfolioSnapshot{
+		TotalValue: 100000, Cash: 80000, Invested: 20000,
+		OpenPositions: 0, UnrealizedPnL: 0, PositionStatsAvailable: false,
+	}
+	if applyPortfolioSnapshot(&d, snap) {
+		t.Fatal("snapshot with omitted position stats reported them available")
+	}
+	applyPositionMetricFallback(&d, true, false, 0, 0, 0, 125.50, false)
+	if d.TotalValue != 100000 || d.Cash != 80000 || d.Invested != 20000 {
+		t.Fatalf("account snapshot metrics were not preserved: %+v", d)
+	}
+	if d.OpenPositionCnt != 2 || d.UnrealizedPnL != 125.50 || !d.UnrealizedPnLAvailable {
+		t.Fatalf("DB position metrics were not recovered: %+v", d)
+	}
+}
+
+func TestPositionMetricsFallback_DoesNotReplaceLegitimateSnapshotZeros(t *testing.T) {
+	d := DashboardData{Positions: []PositionRow{{Ticker: "STALE"}}}
+	snap := &store.PortfolioSnapshot{PositionStatsAvailable: true}
+	if !applyPortfolioSnapshot(&d, snap) {
+		t.Fatal("complete flat snapshot reported position stats unavailable")
+	}
+	applyPositionMetricFallback(&d, true, true, 0, 0, 0, 99, false)
+	if d.OpenPositionCnt != 0 || d.UnrealizedPnL != 0 || !d.UnrealizedPnLAvailable {
+		t.Fatalf("legitimate flat snapshot was overwritten: %+v", d)
+	}
+}
+
+func TestPositionMetricsFallback_MalformedLotsRemainUnavailable(t *testing.T) {
+	d := DashboardData{
+		Positions:       []PositionRow{{Ticker: "VALID"}},
+		MalformedTrades: 1,
+	}
+	applyPositionMetricFallback(&d, true, false, 0, 0, 0, 25, false)
+	if d.OpenPositionCnt != 1 {
+		t.Fatalf("visible position count = %d, want 1", d.OpenPositionCnt)
+	}
+	if d.UnrealizedPnLAvailable {
+		t.Fatalf("partial malformed book published unrealized P&L: %+v", d)
+	}
+	setLargestPositionRisk(&d, 5000, d.MalformedTrades == 0)
+	if d.LargestPosAvailable {
+		t.Fatalf("partial malformed book published largest-position risk: %+v", d)
+	}
+}
+
+func TestRenderPortfolioSummary_UnrealizedUnavailableIsNotZero(t *testing.T) {
+	out := ansi.Strip(renderPortfolioSummary(DashboardData{PortfolioAvailable: true}))
+	if !strings.Contains(out, "Unrealized: —") {
+		t.Fatalf("missing position stats rendered as zero: %q", out)
 	}
 }
 

@@ -62,9 +62,9 @@ interface PortfolioData {
   TotalValue?: number;
   Cash?: number;
   Invested?: number;
-  UnrealizedPnL?: number;
+  UnrealizedPnL?: number | null;
   RealizedPnLToday?: number;
-  OpenPositions?: number;
+  OpenPositions?: number | null;
   // Count of DB rows where status='open'. Equals OpenPositions in steady state
   // after Epic A consolidation. Divergence is surfaced in the card below to
   // make pending consolidation immediately visible.
@@ -270,9 +270,11 @@ function PortfolioPanel({ data }: { data: PortfolioData }) {
   // Mirror the canvas card: show plain count when distinct tickers and DB rows
   // agree (Epic A steady state); show "N (M rows)" when they diverge so
   // pending consolidation is immediately visible (Issue #315).
-  const distinct = data.OpenPositions ?? 0;
+  const distinct = data.OpenPositions;
   const rows = data.OpenTradeRows;
-  const positionsValue = (rows == null || rows === distinct)
+  const positionsValue = distinct == null
+    ? '—'
+    : (rows == null || rows === distinct)
     ? String(distinct)
     : `${distinct} (${rows} rows)`;
   return (
@@ -281,7 +283,7 @@ function PortfolioPanel({ data }: { data: PortfolioData }) {
         <StatCard label="Total Value" value={fmt$(data.TotalValue)} color="#22c55e" />
         <StatCard label="Cash" value={fmt$(data.Cash)} color="#00b4ff" />
         <StatCard label="Invested" value={fmt$(data.Invested)} color="#a855f7" />
-        <StatCard label="Unrealized P&L" value={fmtPnl(data.UnrealizedPnL)} color={pnlColor(data.UnrealizedPnL)} />
+        <StatCard label="Unrealized P&L" value={fmtPnl(data.UnrealizedPnL ?? undefined)} color={pnlColor(data.UnrealizedPnL ?? undefined)} />
       </div>
       <div style={{ marginTop: 10 }}>
         <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }}>

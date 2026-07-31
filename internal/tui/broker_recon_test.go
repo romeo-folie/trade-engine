@@ -8,12 +8,14 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 	"github.com/romeo-folie/trade-engine/internal/tui/views"
 )
 
 // stubBrokerView records whether the broker was queried; all methods are no-ops.
 type stubBrokerView struct {
 	positionsCalled bool
+	positionsFn     func() ([]execution.BrokerPosition, error)
 	accountErr      error
 }
 
@@ -174,6 +176,9 @@ func TestDisplayPortfolioScope(t *testing.T) {
 }
 func (s *stubBrokerView) PositionsSnapshot(context.Context) ([]execution.BrokerPosition, error) {
 	s.positionsCalled = true
+	if s.positionsFn != nil {
+		return s.positionsFn()
+	}
 	return nil, nil
 }
 func (s *stubBrokerView) EquityCurve(context.Context, string, string) (execution.EquityHistory, error) {
@@ -203,5 +208,43 @@ func TestFetchBrokerRecon_NoDBReturnsBrokerSnapshot(t *testing.T) {
 	}
 	if recon.snapshot == nil || recon.snapshot.Account == nil {
 		t.Error("expected a complete broker snapshot when DB reconciliation is unavailable")
+	}
+}
+
+func TestFetchBrokerRecon_DBSignaturePrecedesBrokerPositions(t *testing.T) {
+	oldBook := []store.Trade{{
+		ID: "old", Ticker: "AAPL", Direction: "long", Status: "open", Quantity: 1,
+	}}
+	currentBook := append([]store.Trade(nil), oldBook...)
+	dbRead := false
+	stub := &stubBrokerView{
+		positionsFn: func() ([]execution.BrokerPosition, error) {
+			if !dbRead {
+				t.Fatal("broker positions were read before the DB exposure signature")
+			}
+			currentBook = append(currentBook, store.Trade{
+				ID: "new", Ticker: "MSFT", Direction: "long", Status: "open", Quantity: 1,
+			})
+			return []execution.BrokerPosition{{
+				Symbol: "AAPL", Side: "long", Quantity: 1, CurrentPrice: 100,
+			}}, nil
+		},
+	}
+	readTrades := func(context.Context) ([]store.Trade, error) {
+		dbRead = true
+		return append([]store.Trade(nil), currentBook...), nil
+	}
+
+	msg := fetchBrokerReconWithExposureReader(stub, true, readTrades, false, 0)().(brokerReconMsg)
+	if msg.snapshot == nil || !msg.snapshot.DBExposureKnown {
+		t.Fatalf("snapshot did not retain the DB exposure signature: %+v", msg.snapshot)
+	}
+	if got, want := msg.snapshot.DBExposureSignature, views.DBExposureSignature(oldBook); got != want {
+		t.Fatalf("snapshot signature = %q, want pre-broker book %q", got, want)
+	}
+	if brokerSnapshotMatchesDB(msg.snapshot, views.DashboardData{
+		DBExposureKnown: true, DBExposureSignature: views.DBExposureSignature(currentBook),
+	}) {
+		t.Fatal("older broker snapshot was certified against the newer DB exposure")
 	}
 }

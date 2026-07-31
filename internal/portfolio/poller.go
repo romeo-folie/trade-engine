@@ -88,10 +88,10 @@ func (p *Poller) poll(ctx context.Context) {
 
 	// realized_pnl_today stays 0: it is not derivable from a broker account
 	// snapshot; the engine Tracker path is responsible for realized P&L.
-	openPositions, unrealized := p.positionStats(ctx)
+	openPositions, unrealized, positionStatsAvailable := p.positionStats(ctx)
 	if err := store.InsertPortfolioSnapshot(
 		ctx, equity, cash, invested, unrealized, 0, openPositions,
-		"poller", p.mode, p.broker,
+		positionStatsAvailable, "poller", p.mode, p.broker,
 	); err != nil {
 		logger.Warn("portfolio poller: snapshot write failed", "err", err)
 		return
@@ -101,20 +101,21 @@ func (p *Poller) poll(ctx context.Context) {
 }
 
 // positionStats returns the open-position count and aggregate unrealized P&L
-// from the broker. Best-effort: on error it logs and returns (0, 0) so the
-// snapshot still captures equity/cash/invested (the poller's primary purpose).
+// from the broker. Best-effort: on error it logs and marks the values
+// unavailable so the snapshot can still capture equity/cash/invested without
+// presenting missing position metrics as legitimate zeros.
 // Callers must only invoke it when about to write, to avoid a wasted broker
 // call during DB outages.
-func (p *Poller) positionStats(ctx context.Context) (count int, unrealized float64) {
+func (p *Poller) positionStats(ctx context.Context) (count int, unrealized float64, available bool) {
 	positions, err := p.bv.PositionsSnapshot(ctx)
 	if err != nil {
 		logger.Warn("portfolio poller: PositionsSnapshot failed; snapshot omits position stats", "err", err)
-		return 0, 0
+		return 0, 0, false
 	}
 	for _, pos := range positions {
 		unrealized += pos.UnrealizedPL
 	}
-	return len(positions), unrealized
+	return len(positions), unrealized, true
 }
 
 // pollIfSignificant is called at sub-interval cadence (future) or can be
@@ -136,10 +137,10 @@ func (p *Poller) pollIfSignificant(ctx context.Context) {
 		return
 	}
 	cash := acct.Cash
-	openPositions, unrealized := p.positionStats(ctx)
+	openPositions, unrealized, positionStatsAvailable := p.positionStats(ctx)
 	if err := store.InsertPortfolioSnapshot(
 		ctx, equity, cash, equity-cash, unrealized, 0, openPositions,
-		"poller", p.mode, p.broker,
+		positionStatsAvailable, "poller", p.mode, p.broker,
 	); err != nil {
 		logger.Warn("portfolio poller: significant-change snapshot failed", "err", err)
 		return

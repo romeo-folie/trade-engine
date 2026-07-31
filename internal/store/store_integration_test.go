@@ -41,7 +41,7 @@ func testModelMeta() analysis.ModelCallMeta {
 	}
 }
 
-func TestGetRealizedPnLByDateRange_AggregatesAllStrategyLedgers(t *testing.T) {
+func TestGetRealizedPnLByDateRange_AggregatesUSDCompatibleStrategyExits(t *testing.T) {
 	ctx := context.Background()
 	db := store.GetDB()
 	from := time.Date(2040, time.January, 15, 0, 0, 0, 0, time.UTC)
@@ -171,6 +171,37 @@ func TestPortfolioSnapshotReads_AreScopedByMode(t *testing.T) {
 	}
 	if peak != 250000 {
 		t.Fatalf("live peak = %v, want backfilled broker equity peak 250000", peak)
+	}
+}
+
+func TestPortfolioSnapshot_PositionStatsAvailabilityRoundTrips(t *testing.T) {
+	ctx := context.Background()
+	db := store.GetDB()
+	const source = "test-position-stats-availability"
+	defer func() {
+		_, _ = db.Exec(ctx, `DELETE FROM portfolio_snapshots WHERE source=$1`, source)
+	}()
+
+	for _, tt := range []struct {
+		broker    string
+		available bool
+	}{
+		{broker: "test-unavailable", available: false},
+		{broker: "test-available", available: true},
+	} {
+		if err := store.InsertPortfolioSnapshot(
+			ctx, 100000, 90000, 10000, 0, 0, 0,
+			tt.available, source, "paper", tt.broker,
+		); err != nil {
+			t.Fatalf("insert %s snapshot: %v", tt.broker, err)
+		}
+		got, err := store.GetLatestPortfolioSnapshotByScope(ctx, "paper", tt.broker)
+		if err != nil {
+			t.Fatalf("read %s snapshot: %v", tt.broker, err)
+		}
+		if got == nil || got.PositionStatsAvailable != tt.available {
+			t.Fatalf("%s availability = %+v, want %v", tt.broker, got, tt.available)
+		}
 	}
 }
 

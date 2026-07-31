@@ -27,10 +27,10 @@ interface PortfolioSnapshot {
   TotalValue: number;
   Cash: number;
   Invested: number;
-  UnrealizedPnL: number;
+  UnrealizedPnL: number | null;
   DayPnL: number;
   BuyingPower?: number;
-  OpenPositions: number;
+  OpenPositions: number | null;
   source: 'broker' | 'tracker' | 'db';
   stale_at: string | null;
 }
@@ -177,7 +177,7 @@ export default function PortfolioScreen() {
   const totalValue = snapshot?.TotalValue ?? 0;
   const cash       = snapshot?.Cash ?? 0;
   const invested   = snapshot?.Invested ?? 0;
-  const unrealizedPnl = snapshot?.UnrealizedPnL ?? 0;
+  const unrealizedPnl = snapshot?.UnrealizedPnL ?? null;
   const dayPnl     = snapshot?.DayPnL ?? 0;
 
   const alpacaSeries = useMemo(() => history?.alpaca ?? [], [history]);
@@ -223,8 +223,8 @@ export default function PortfolioScreen() {
         <KpiCard label="INVESTED" value={hasData ? fmt$(invested) : '—'} valueColor="var(--text-primary)" />
         <KpiCard
           label="UNREALIZED P&L"
-          value={hasData ? fmtPnl(unrealizedPnl) : '—'}
-          valueColor={hasData ? pnlColor(unrealizedPnl) : undefined}
+          value={hasData && unrealizedPnl != null ? fmtPnl(unrealizedPnl) : '—'}
+          valueColor={hasData && unrealizedPnl != null ? pnlColor(unrealizedPnl) : undefined}
           prominent
         />
         <KpiCard

@@ -1017,9 +1017,31 @@ func brokerReconTick() tea.Cmd {
 // DB open-trade book, off the render path. Failures are surfaced as an
 // unavailable result rather than crashing the TUI.
 func fetchBrokerRecon(bv execution.BrokerView, scheduleNext bool, generation uint64) tea.Cmd {
+	return fetchBrokerReconWithExposureReader(
+		bv, store.IsConnected(), store.GetOwnedPositionTrades,
+		scheduleNext, generation,
+	)
+}
+
+func fetchBrokerReconWithExposureReader(
+	bv execution.BrokerView,
+	dbConnected bool,
+	readTrades func(context.Context) ([]store.Trade, error),
+	scheduleNext bool,
+	generation uint64,
+) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
+
+		// Capture the DB lifecycle before reading broker positions. A signature
+		// taken afterward could include a newly inserted fill while certifying
+		// the older broker book read just before it.
+		var trades []store.Trade
+		var tradesErr error
+		if dbConnected {
+			trades, tradesErr = readTrades(ctx)
+		}
 
 		positions, err := bv.PositionsSnapshot(ctx)
 		if err != nil {
@@ -1041,7 +1063,7 @@ func fetchBrokerRecon(bv execution.BrokerView, scheduleNext bool, generation uin
 
 		// Broker economics remain useful even when the DB is unavailable; only
 		// reconciliation and metadata enrichment are skipped.
-		if !store.IsConnected() {
+		if !dbConnected {
 			return brokerReconMsg{
 				result: views.BrokerReconResult{
 					CheckedAt: fetchedAt,
@@ -1052,10 +1074,9 @@ func fetchBrokerRecon(bv execution.BrokerView, scheduleNext bool, generation uin
 				generation:   generation,
 			}
 		}
-		trades, err := store.GetOwnedPositionTrades(ctx)
-		if err != nil {
+		if tradesErr != nil {
 			return brokerReconMsg{
-				result:       views.BrokerReconResult{CheckedAt: fetchedAt, Err: err.Error()},
+				result:       views.BrokerReconResult{CheckedAt: fetchedAt, Err: tradesErr.Error()},
 				snapshot:     snapshot,
 				scheduleNext: scheduleNext,
 				generation:   generation,

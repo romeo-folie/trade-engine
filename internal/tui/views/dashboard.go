@@ -30,16 +30,17 @@ type DashboardData struct {
 	EngineRunning bool
 
 	// Portfolio summary
-	TotalValue         float64
-	Cash               float64
-	Invested           float64
-	TodayPnL           float64
-	TodayPnLAvailable  bool
-	UnrealizedPnL      float64
-	PortfolioAvailable bool
-	PortfolioEstimated bool
-	PortfolioAsOf      time.Time
-	PortfolioSource    string
+	TotalValue             float64
+	Cash                   float64
+	Invested               float64
+	TodayPnL               float64
+	TodayPnLAvailable      bool
+	UnrealizedPnL          float64
+	UnrealizedPnLAvailable bool
+	PortfolioAvailable     bool
+	PortfolioEstimated     bool
+	PortfolioAsOf          time.Time
+	PortfolioSource        string
 
 	// Open positions, aggregated per (ticker, direction).
 	Positions []PositionRow
@@ -177,6 +178,7 @@ func FetchDashboardData(
 	d.PortfolioEstimated = d.PortfolioAvailable
 
 	hasPortfolioSnapshot := false
+	hasSnapshotPositionStats := false
 	// Prefer the latest portfolio snapshot if available (Alpaca-backed).
 	if portfolioMode == "" {
 		portfolioMode = "live"
@@ -187,15 +189,7 @@ func FetchDashboardData(
 		// metrics must remain in that selected book; otherwise an older,
 		// higher-valued broker account can create a false drawdown.
 		portfolioMode, portfolioBroker = resolvedSnapshotScope(portfolioMode, portfolioBroker, snap)
-		d.PortfolioAvailable = true
-		d.PortfolioEstimated = false
-		d.PortfolioAsOf = snap.CreatedAt
-		d.PortfolioSource = snap.Source
-		d.Cash = snap.Cash
-		d.TotalValue = snap.TotalValue
-		d.Invested = snap.Invested
-		d.UnrealizedPnL = snap.UnrealizedPnL
-		d.OpenPositionCnt = snap.OpenPositions
+		hasSnapshotPositionStats = applyPortfolioSnapshot(&d, snap)
 	}
 
 	// Fetch owned trades and aggregate them per (ticker, direction), retaining
@@ -228,17 +222,11 @@ func FetchDashboardData(
 		}
 
 		// Distinct-position count (not raw lot count) is the honest exposure.
-		if !hasPortfolioSnapshot && len(d.Positions) > 0 {
-			d.OpenPositionCnt = len(d.Positions)
-		}
-
-		if !hasPortfolioSnapshot && d.UnmarkedCount == 0 && !hasShort {
-			// Fallback: derive the entire summary from the same candle marks.
-			// Never splice candle P&L into an otherwise broker-backed snapshot.
-			d.Invested = visibleInvested
-			d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
-			d.UnrealizedPnL = localUnrealizedPnL
-		} else if !hasPortfolioSnapshot && (d.UnmarkedCount > 0 || hasShort) {
+		applyPositionMetricFallback(
+			&d, hasPortfolioSnapshot, hasSnapshotPositionStats, initialCapital,
+			visibleInvested, totalCostBasis, localUnrealizedPnL, hasShort,
+		)
+		if !hasPortfolioSnapshot && (d.UnmarkedCount > 0 || hasShort) {
 			// A partial mark set or a short/margin book cannot produce a
 			// coherent account summary from position rows alone.
 			d.PortfolioAvailable = false
@@ -249,7 +237,7 @@ func FetchDashboardData(
 		// A partial mark set would understate the largest holding.
 		setLargestPositionRisk(
 			&d, largestVisiblePosValue,
-			d.PortfolioAvailable && d.UnmarkedCount == 0,
+			d.PortfolioAvailable && d.UnmarkedCount == 0 && d.MalformedTrades == 0,
 		)
 	}
 
@@ -287,9 +275,10 @@ func FetchDashboardData(
 		}
 	}
 
-	// This is explicitly an all-ledger terminal-exit total. The underlying
-	// ledgers cannot scope partial realizations to this dashboard account, so it
-	// must not be used as the live account's daily-loss budget.
+	// This combines USD-compatible terminal exits across ledgers. Non-USD ORB
+	// quote-currency results are excluded because no historical conversion is
+	// available. The ledgers also cannot scope partial realizations to this
+	// dashboard account, so this must not drive the live daily-loss budget.
 	today := time.Now().UTC().Truncate(24 * time.Hour)
 	if pnl, pnlErr := store.GetRealizedPnLByDateRange(ctx, today, today.Add(24*time.Hour)); pnlErr == nil {
 		d.TodayPnL = pnl
@@ -353,6 +342,47 @@ func resolvedSnapshotScope(mode, broker string, snap *store.PortfolioSnapshot) (
 		broker = snap.Broker
 	}
 	return mode, broker
+}
+
+func applyPortfolioSnapshot(d *DashboardData, snap *store.PortfolioSnapshot) bool {
+	d.PortfolioAvailable = true
+	d.PortfolioEstimated = false
+	d.PortfolioAsOf = snap.CreatedAt
+	d.PortfolioSource = snap.Source
+	d.Cash = snap.Cash
+	d.TotalValue = snap.TotalValue
+	d.Invested = snap.Invested
+	if !snap.PositionStatsAvailable {
+		return false
+	}
+	d.UnrealizedPnL = snap.UnrealizedPnL
+	d.UnrealizedPnLAvailable = true
+	d.OpenPositionCnt = snap.OpenPositions
+	return true
+}
+
+func applyPositionMetricFallback(
+	d *DashboardData,
+	hasPortfolioSnapshot, hasSnapshotPositionStats bool,
+	initialCapital, visibleInvested, totalCostBasis, localUnrealizedPnL float64,
+	hasShort bool,
+) {
+	if hasSnapshotPositionStats {
+		return
+	}
+	d.OpenPositionCnt = len(d.Positions)
+	if d.UnmarkedCount > 0 || d.MalformedTrades > 0 || hasShort {
+		return
+	}
+	// A poller account snapshot can remain authoritative for equity and cash
+	// while its failed positions request falls back to the complete DB/candle
+	// book for position count and unrealized P&L.
+	d.UnrealizedPnL = localUnrealizedPnL
+	d.UnrealizedPnLAvailable = true
+	if !hasPortfolioSnapshot {
+		d.Invested = visibleInvested
+		d.Cash, d.TotalValue = deriveCashAndTotal(initialCapital, totalCostBasis, d.Invested)
+	}
 }
 
 func setLargestPositionRisk(d *DashboardData, largest float64, complete bool) {
@@ -577,6 +607,7 @@ func ApplyBrokerDashboardSnapshot(d *DashboardData, snap BrokerDashboardSnapshot
 	d.Cash = snap.Account.Cash
 	d.Invested = grossExposure
 	d.UnrealizedPnL = unrealized
+	d.UnrealizedPnLAvailable = true
 	d.PortfolioAvailable = true
 	d.PortfolioEstimated = false
 	d.PortfolioAsOf = snap.FetchedAt
@@ -720,7 +751,10 @@ func renderPortfolioSummary(d DashboardData) string {
 	total := fmt.Sprintf("$%.2f", d.TotalValue)
 	cash := fmt.Sprintf("$%.2f", d.Cash)
 	invested := fmt.Sprintf("$%.2f", d.Invested)
-	unrealized := colorPnL(d.UnrealizedPnL)
+	unrealized := "—"
+	if d.UnrealizedPnLAvailable {
+		unrealized = colorPnL(d.UnrealizedPnL)
+	}
 	if !d.PortfolioAvailable {
 		total, cash, invested, unrealized = "—", "—", "—", "—"
 	}
@@ -735,7 +769,7 @@ func renderPortfolioSummary(d DashboardData) string {
 
 	return sectionTitle.Render(title) + "\n" +
 		fmt.Sprintf("  Total: %-14s  Cash: %-14s  %s: %-14s", total, cash, exposureLabel, invested) + "\n" +
-		fmt.Sprintf("  Closed today (all ledgers): %-14s  Unrealized: %s", pnl, unrealized)
+		fmt.Sprintf("  Closed today (excl. non-USD ORB): %-14s  Unrealized: %s", pnl, unrealized)
 }
 
 // positionsNote builds the dim annotation shown next to the "Open Positions"

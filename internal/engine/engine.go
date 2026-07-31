@@ -3232,14 +3232,16 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			}
 		}
 		e.bus.Publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{
-			TotalValue:       snap.TotalValue,
-			Cash:             snap.Cash,
-			Invested:         snap.Invested,
-			UnrealizedPnL:    snap.UnrealizedPnL,
-			RealizedPnLToday: snap.RealizedPnLDay,
-			DayPnL:           snap.DayPnL,
-			OpenPositions:    snap.OpenPositions,
-			OpenTradeRows:    openTradeRows,
+			Available:              true,
+			TotalValue:             snap.TotalValue,
+			Cash:                   snap.Cash,
+			Invested:               snap.Invested,
+			UnrealizedPnL:          snap.UnrealizedPnL,
+			RealizedPnLToday:       snap.RealizedPnLDay,
+			DayPnL:                 snap.DayPnL,
+			OpenPositions:          snap.OpenPositions,
+			PositionStatsAvailable: true,
+			OpenTradeRows:          openTradeRows,
 		})
 	}
 

@@ -104,12 +104,15 @@ func TestPositionStats_CountsAndSumsUnrealized(t *testing.T) {
 	}}
 	p := NewPoller(bv, time.Hour, 0.05, "paper", "alpaca")
 
-	count, unrealized := p.positionStats(context.Background())
+	count, unrealized, available := p.positionStats(context.Background())
 	if count != 3 {
 		t.Errorf("count = %d, want 3", count)
 	}
 	if want := 40.25; unrealized != want {
 		t.Errorf("unrealized = %.2f, want %.2f", unrealized, want)
+	}
+	if !available {
+		t.Error("successful broker position stats reported unavailable")
 	}
 }
 
@@ -119,9 +122,21 @@ func TestPositionStats_BestEffortOnError(t *testing.T) {
 	bv := &stubBrokerView{positionsErr: errors.New("broker down")}
 	p := NewPoller(bv, time.Hour, 0.05, "paper", "alpaca")
 
-	count, unrealized := p.positionStats(context.Background())
+	count, unrealized, available := p.positionStats(context.Background())
 	if count != 0 || unrealized != 0 {
 		t.Errorf("on error want (0,0), got (%d, %.2f)", count, unrealized)
+	}
+	if available {
+		t.Error("failed broker position stats reported available")
+	}
+}
+
+func TestPositionStats_EmptyBookIsAvailable(t *testing.T) {
+	p := NewPoller(&stubBrokerView{}, time.Hour, 0.05, "paper", "alpaca")
+	count, unrealized, available := p.positionStats(context.Background())
+	if count != 0 || unrealized != 0 || !available {
+		t.Fatalf("flat broker book = (%d, %.2f, %v), want (0, 0, true)",
+			count, unrealized, available)
 	}
 }
 

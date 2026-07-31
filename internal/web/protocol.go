@@ -164,22 +164,7 @@ func buildSnapshot(ctx context.Context, cfg *appconfig.Config, tracker *portfoli
 		logger.Warn("buildSnapshot: portfolio snapshot query failed", "err", err)
 	}
 	if snap != nil {
-		// Include day_pnl (broker-reported equity delta) only when the tracker has a
-		// non-zero value. Omitting the key when unavailable lets the frontend fall
-		// through to realized_pnl_today rather than masking it with a spurious 0.
-		meta := map[string]any{
-			"total_value":        snap.TotalValue,
-			"cash":               snap.Cash,
-			"invested":           snap.Invested,
-			"unrealized_pnl":     snap.UnrealizedPnL,
-			"realized_pnl_today": snap.RealizedPnLToday,
-			"open_positions":     snap.OpenPositions,
-		}
-		if tracker != nil {
-			if dpnl := tracker.CurrentState().DayPnL; dpnl != 0 {
-				meta["day_pnl"] = dpnl
-			}
-		}
+		meta := portfolioSnapshotMeta(snap, tracker)
 		for i := range nodes {
 			if nodes[i].ID == "portfolio" {
 				nodes[i].Meta = meta
@@ -194,6 +179,29 @@ func buildSnapshot(ctx context.Context, cfg *appconfig.Config, tracker *portfoli
 		Nodes:     nodes,
 		Topology:  topology,
 	}
+}
+
+func portfolioSnapshotMeta(snap *store.PortfolioSnapshot, tracker *portfolio.Tracker) map[string]any {
+	meta := map[string]any{
+		"total_value":              snap.TotalValue,
+		"cash":                     snap.Cash,
+		"invested":                 snap.Invested,
+		"realized_pnl_today":       snap.RealizedPnLToday,
+		"position_stats_available": snap.PositionStatsAvailable,
+	}
+	if snap.PositionStatsAvailable {
+		meta["unrealized_pnl"] = snap.UnrealizedPnL
+		meta["open_positions"] = snap.OpenPositions
+	}
+	// Include day_pnl (broker-reported equity delta) only when the tracker has a
+	// non-zero value. Omitting the key when unavailable lets the frontend fall
+	// through to realized_pnl_today rather than masking it with a spurious 0.
+	if tracker != nil {
+		if dpnl := tracker.CurrentState().DayPnL; dpnl != 0 {
+			meta["day_pnl"] = dpnl
+		}
+	}
+	return meta
 }
 
 // pipelineNodes is retained for callers that only need the configured nodes.

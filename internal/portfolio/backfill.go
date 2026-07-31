@@ -74,6 +74,7 @@ func Backfill(ctx context.Context, bv execution.BrokerView, mode, broker string)
 			0,         // unrealized_pnl unknown
 			0,         // realized_pnl_today unknown
 			0,         // open_positions unknown
+			false,     // position statistics unavailable from equity history
 			"backfill", mode, broker,
 		)
 		cancel()

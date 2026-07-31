@@ -501,6 +501,27 @@ func TestHandlePortfolio_NilTracker_NoDB(t *testing.T) {
 	}
 }
 
+func TestPortfolioSnapshotResponse_OmitsUnavailablePositionStats(t *testing.T) {
+	resp := portfolioSnapshotResponse(&store.PortfolioSnapshot{
+		TotalValue: 100000, Cash: 80000, Invested: 20000,
+		OpenPositions: 3, UnrealizedPnL: 125,
+		PositionStatsAvailable: false,
+	}, nil)
+	if resp["PositionStatsAvailable"] != false {
+		t.Fatalf("position stats availability = %v, want false", resp["PositionStatsAvailable"])
+	}
+	if resp["OpenPositions"] != nil || resp["UnrealizedPnL"] != nil {
+		t.Fatalf("unavailable snapshot published position values: %+v", resp)
+	}
+
+	resp = portfolioSnapshotResponse(&store.PortfolioSnapshot{
+		PositionStatsAvailable: true,
+	}, nil)
+	if resp["OpenPositions"] != 0 || resp["UnrealizedPnL"] != float64(0) {
+		t.Fatalf("legitimate flat snapshot did not publish zeros: %+v", resp)
+	}
+}
+
 func TestHandlePortfolioPositions_NilTracker_NoDB(t *testing.T) {
 	// With no tracker and no DB connection, expect 500 with a clear error.
 	srv := NewServer(Config{}, nil, nil)

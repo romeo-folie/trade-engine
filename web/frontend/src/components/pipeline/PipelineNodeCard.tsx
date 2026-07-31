@@ -421,8 +421,8 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                             title="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
                             aria-label="Distinct positions (ticker + direction) / total open trade rows. Divergence indicates pending consolidation work."
                           >
-                            {ps.openPositions}
-                            {ps.openTradeRows != null && ps.openTradeRows !== ps.openPositions && (
+                            {ps.openPositions ?? '—'}
+                            {ps.openPositions != null && ps.openTradeRows != null && ps.openTradeRows !== ps.openPositions && (
                               <span style={{ color: colors.acidGreen, marginLeft: 4, fontSize: 9 }}>
                                 ({ps.openTradeRows} rows)
                               </span>
@@ -434,9 +434,13 @@ function PipelineNodeCard({ data }: NodeProps<PipelineNodeType>) {
                         <div>
                           <div className={styles.subValue}>UNREAL P&L</div>
                           <div className={styles.kindLabel} style={{
-                            color: ps.unrealizedPnL >= 0 ? colors.acidGreen : colors.red
+                            color: ps.unrealizedPnL == null
+                              ? colors.textDim
+                              : ps.unrealizedPnL >= 0 ? colors.acidGreen : colors.red
                           }}>
-                            {ps.unrealizedPnL >= 0 ? '+' : ''}{ps.unrealizedPnL.toFixed(2)}
+                            {ps.unrealizedPnL == null
+                              ? '—'
+                              : `${ps.unrealizedPnL >= 0 ? '+' : ''}${ps.unrealizedPnL.toFixed(2)}`}
                           </div>
                         </div>
                         <div>
