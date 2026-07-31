@@ -89,12 +89,14 @@ te run
 ```
 
 `make install-dev` links `~/.local/bin/te` to the repository's development
-launcher. Each `te` command performs a cached Go build from the current checkout
-before it runs, so pulling or merging backend and terminal-dashboard changes does
-not require another install. Run `make build` separately when changing the React
-frontend locally so its embedded assets are regenerated. Persist the `PATH` export
-above in your shell profile (for example, `~/.zshrc`) if `~/.local/bin` is not
-already configured there.
+launcher. Each command except `te stop` performs a cached Go build from the current
+checkout before it runs, so pulling or merging backend and terminal-dashboard
+changes does not require another install. Run `make build` separately when changing
+the React frontend locally so its embedded assets are regenerated. Persist the
+`PATH` export above in your shell profile (for example, `~/.zshrc`) if
+`~/.local/bin` is not already configured there. The launcher keeps a last-known-good
+executable in the user cache so `te stop` remains available without rebuilding when
+the checkout temporarily cannot compile.
 
 ### Embeddings provider (API vs local)
 

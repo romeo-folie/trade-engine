@@ -14,7 +14,27 @@ while [ -L "$script_path" ]; do
 done
 script_dir="$(cd -P "$(dirname "$script_path")" >/dev/null 2>&1 && pwd)"
 repo_dir="$(cd "$script_dir/.." && pwd)"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/trade-engine"
+last_good="$cache_dir/te"
 
-cd "$repo_dir"
-make -s build-go-only
+if [[ "${1:-}" == "stop" ]]; then
+	for candidate in "$last_good" "$repo_dir/te"; do
+		if [[ -x "$candidate" ]]; then
+			exec "$candidate" "$@"
+		fi
+	done
+fi
+
+(cd "$repo_dir" && make -s build-go-only)
+
+cache_tmp="$last_good.$$"
+if mkdir -p "$cache_dir" &&
+	install -m 755 "$repo_dir/te" "$cache_tmp" &&
+	mv -f "$cache_tmp" "$last_good"; then
+	:
+else
+	rm -f "$cache_tmp" || true
+	printf 'te: warning: could not update last-known-good binary at %s\n' "$last_good" >&2
+fi
+
 exec "$repo_dir/te" "$@"
