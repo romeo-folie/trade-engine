@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+# Resolve the repository through this script's real path so the launcher keeps
+# working when ~/.local/bin/te is a symlink and the command is run elsewhere.
+set -euo pipefail
+
+script_path="${BASH_SOURCE[0]}"
+while [ -L "$script_path" ]; do
+	script_dir="$(cd -P "$(dirname "$script_path")" >/dev/null 2>&1 && pwd)"
+	script_path="$(readlink "$script_path")"
+	if [[ "$script_path" != /* ]]; then
+		script_path="$script_dir/$script_path"
+	fi
+done
+script_dir="$(cd -P "$(dirname "$script_path")" >/dev/null 2>&1 && pwd)"
+repo_dir="$(cd "$script_dir/.." && pwd)"
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/trade-engine"
+last_good="$cache_dir/te"
+
+if [[ "${1:-}" == "stop" ]]; then
+	for candidate in "$last_good" "$repo_dir/te"; do
+		if [[ -x "$candidate" ]]; then
+			exec "$candidate" "$@"
+		fi
+	done
+fi
+
+(cd "$repo_dir" && make -s build-go-only)
+
+cache_tmp="$last_good.$$"
+if mkdir -p "$cache_dir" &&
+	install -m 755 "$repo_dir/te" "$cache_tmp" &&
+	mv -f "$cache_tmp" "$last_good"; then
+	:
+else
+	rm -f "$cache_tmp" || true
+	printf 'te: warning: could not update last-known-good binary at %s\n' "$last_good" >&2
+fi
+
+exec "$repo_dir/te" "$@"
