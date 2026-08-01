@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"math"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -10,9 +11,9 @@ import (
 )
 
 // BrokerReconcileInterval is the cadence of the background broker-vs-DB
-// reconcile loop. Kept coarse — this is an observability backstop for drift
-// that develops between engine restarts, not a hot path.
-const BrokerReconcileInterval = 30 * time.Minute
+// reconcile loop. Matching the exit reconciler lets a fresh exit reduction
+// become alertable immediately after its two-sweep grace period.
+const BrokerReconcileInterval = ExitReconcileInterval
 
 // persistedDrift is the wire shape of one drift row stored under
 // EngineStateBrokerDrift. Lowercase JSON tags are a stable contract read by the
@@ -67,15 +68,55 @@ func PersistReconciliation(ctx context.Context, drifts []BrokerDrift) {
 }
 
 // RunReconcileLoop periodically reconciles broker positions against the DB and
-// persists the result to engine_state — observability only, no alerts and no
-// orphan adoption (those stay on the boot path). Blocks until ctx is cancelled.
+// persists the result to engine_state. An optional callback receives only new
+// or changed alertable drift; orphan adoption stays on the boot path. Blocks
+// until ctx is cancelled.
 // The first reconcile runs after the first interval; the caller is expected to
 // have already reconciled + persisted at boot. A nil broker or non-positive
 // interval disables the loop.
-func RunReconcileLoop(ctx context.Context, broker reconcilerBrokerView, interval time.Duration) {
+type ReconcileLoopOptions struct {
+	InitialDrifts []BrokerDrift
+	OnNewDrifts   func(context.Context, []BrokerDrift)
+}
+
+type driftAlertState map[string]BrokerDrift
+
+func newDriftAlertState(initial []BrokerDrift) driftAlertState {
+	state := make(driftAlertState)
+	for _, d := range alertableBrokerDrifts(initial) {
+		state[d.Ticker] = d
+	}
+	return state
+}
+
+func sameAlertableDrift(a BrokerDrift, exists bool, b BrokerDrift) bool {
+	return exists && a.Source == b.Source &&
+		math.Abs(a.BrokerQty-b.BrokerQty) <= DefaultBrokerDriftToleranceShares &&
+		math.Abs(a.DBQty-b.DBQty) <= DefaultBrokerDriftToleranceShares
+}
+
+func (s driftAlertState) advance(drifts []BrokerDrift) (driftAlertState, []BrokerDrift) {
+	next := make(driftAlertState)
+	var fresh []BrokerDrift
+	for _, d := range alertableBrokerDrifts(drifts) {
+		previous, exists := s[d.Ticker]
+		next[d.Ticker] = d
+		if !sameAlertableDrift(previous, exists, d) {
+			fresh = append(fresh, d)
+		}
+	}
+	return next, fresh
+}
+
+func RunReconcileLoop(ctx context.Context, broker reconcilerBrokerView, interval time.Duration, option ...ReconcileLoopOptions) {
 	if interval <= 0 || broker == nil {
 		return
 	}
+	var opts ReconcileLoopOptions
+	if len(option) > 0 {
+		opts = option[0]
+	}
+	last := newDriftAlertState(opts.InitialDrifts)
 	logger.Info("broker reconcile loop started", "interval", interval)
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -89,6 +130,11 @@ func RunReconcileLoop(ctx context.Context, broker reconcilerBrokerView, interval
 			// "in sync".
 			if drifts, ok := ReconcileBrokerVsDBWithStoreStatus(ctx, broker, 0); ok {
 				PersistReconciliation(ctx, drifts)
+				var fresh []BrokerDrift
+				last, fresh = last.advance(drifts)
+				if len(fresh) > 0 && opts.OnNewDrifts != nil {
+					opts.OnNewDrifts(ctx, fresh)
+				}
 			}
 		}
 	}

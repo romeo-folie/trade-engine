@@ -183,7 +183,6 @@ func TestMonitorSoftwareTakeProfitCancelsStandaloneStopBeforeSell(t *testing.T) 
 		},
 	}
 	e := newBracketTestEngine(exec)
-	e.lastExitReconcile = time.Now()
 	e.monitorPositions(ctx)
 
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != "standalone-stop" {

@@ -68,6 +68,10 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	}
 
 	claimed := make([]store.Trade, 0, len(longs))
+	intent := newExitIntent(store.ExitReasonSellSignal, map[string]any{
+		"signal_id": sigID, "confidence": sig.Confidence,
+		"signal_price": sig.SignalPrice,
+	})
 	releaseClaims := func() {
 		for _, t := range claimed {
 			if err := store.ReleaseTradeExitClaim(ctx, t.ID); err != nil {
@@ -76,7 +80,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		}
 	}
 	for _, t := range longs {
-		ok, err := store.ClaimTradeExit(ctx, t.ID)
+		ok, err := store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 		if err != nil || !ok {
 			releaseClaims()
 			blockSignal("another exit worker already owns this position", "exit_ownership")
@@ -144,6 +148,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			OrderType:     string(execution.OrderTypeMarket),
 			Quantity:      lotQuantity,
 			Status:        status,
+			FilledAt:      filledAtPtr(result.FilledAt),
 		}
 		if fullFill {
 			exitOrder.FilledPrice = result.FilledPrice
@@ -173,7 +178,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		if lotQuantity <= 0 {
 			continue
 		}
-		realized, err := store.CloseTradeRealized(ctx, t.ID, result.FilledPrice)
+		realized, err := store.CloseTradeRealizedWithIntent(ctx, t.ID, result.FilledPrice, result.FilledAt, intent)
 		if err != nil {
 			logger.Warn("sell exit: close confirmed trade", "trade_id", t.ID, "err", err)
 			continue
@@ -189,11 +194,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			"pnl", fmt.Sprintf("%.2f", realized.PnL),
 			"fill_confirmed", true,
 		)
-		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
-			TradeID: t.ID, Ticker: sig.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
-			PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: "sell signal",
-		})
+		e.publishTradeClosed(realized)
 	}
 	e.checkExitResidue(sig.Ticker)
 }

@@ -3,7 +3,10 @@
 // subscribe to specific event types and receive them via buffered channels.
 package events
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // Type identifies the kind of event.
 type Type string
@@ -175,7 +178,9 @@ type TradeClosedPayload struct {
 	ExitPrice  float64
 	PnL        float64
 	PnLPct     float64
-	Reason     string // "stop-loss hit" | "take-profit hit" | "manual"
+	Reason     string
+	Evidence   json.RawMessage
+	FilledAt   *time.Time
 }
 
 // PositionUpdatedPayload is emitted after position monitoring refreshes state.

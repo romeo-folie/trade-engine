@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/ibkrconids"
@@ -31,8 +32,8 @@ func TestIBKRGetOrderStatusAggregatesAllExecutions(t *testing.T) {
 				t.Errorf("trades days = %q, want 7", got)
 			}
 			_, _ = w.Write([]byte(`[
-				{"orderId":42,"status":"Filled","price":"1.105","size":"40000"},
-				{"orderId":42,"status":"Filled","price":"1.106","size":"60000"},
+				{"orderId":42,"status":"Filled","price":"1.105","size":"40000","trade_time":"20260801-14:05:00"},
+				{"orderId":42,"status":"Filled","price":"1.106","size":"60000","trade_time":"20260801-14:05:02"},
 				{"orderId":99,"status":"Filled","price":"1.200","size":"1000"}
 			]`))
 		default:
@@ -48,6 +49,58 @@ func TestIBKRGetOrderStatusAggregatesAllExecutions(t *testing.T) {
 	if result.Status != "filled" || result.FilledQty != 100000 ||
 		result.FilledPrice < 1.10559 || result.FilledPrice > 1.10561 {
 		t.Fatalf("executions were not aggregated: %+v", result)
+	}
+	wantFilledAt := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
+	if !result.FilledAt.Equal(wantFilledAt) {
+		t.Fatalf("filled_at = %v, want %v", result.FilledAt, wantFilledAt)
+	}
+}
+
+func TestIBKRGetOrderStatusEnrichesLiveFillTimeFromExecutions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/orders":
+			_, _ = w.Write([]byte(`{"orders":[{"orderId":42,"status":"Filled","avgPrice":"95","filledQuantity":10}]}`))
+		case "/v1/api/iserver/account/trades":
+			_, _ = w.Write([]byte(`[{"orderId":42,"status":"Filled","price":"95","size":"10","trade_time":"20260801-14:05:02"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := newTestIBKRBroker(srv.URL).GetOrderStatus(t.Context(), "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
+	if !result.FilledAt.Equal(want) || result.FilledQty != 10 || result.FilledPrice != 95 {
+		t.Fatalf("enriched live fill = %+v, want broker fill time %v", result, want)
+	}
+}
+
+func TestIBKRGetOrderStatusDoesNotReplaceLiveFillWithLaggingExecutions(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v1/api/iserver/account/orders":
+			_, _ = w.Write([]byte(`{"orders":[{"orderId":42,"status":"Filled","avgPrice":"95","filledQuantity":10}]}`))
+		case "/v1/api/iserver/account/trades":
+			_, _ = w.Write([]byte(`[{"orderId":42,"status":"Filled","price":"94","size":"4","trade_time":"20260801-14:05:01"}]`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	result, err := newTestIBKRBroker(srv.URL).GetOrderStatus(t.Context(), "42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantTime := time.Date(2026, 8, 1, 14, 5, 1, 0, time.UTC)
+	if result.FilledQty != 10 || result.FilledPrice != 95 || !result.FilledAt.Equal(wantTime) {
+		t.Fatalf("live fill replaced by lagging executions: %+v", result)
 	}
 }
 

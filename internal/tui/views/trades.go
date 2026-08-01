@@ -1,7 +1,9 @@
 package views
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,18 +14,21 @@ import (
 
 // TradeRow is a single row in the trade history table.
 type TradeRow struct {
-	ID         string
-	Ticker     string
-	Direction  string
-	Strategy   string
-	EntryPrice float64
-	ExitPrice  float64
-	Quantity   float64
-	PnL        float64
-	PnLPct     float64
-	Status     string // open | closed
-	OpenedAt   time.Time
-	ClosedAt   time.Time
+	ID           string
+	Ticker       string
+	Direction    string
+	Strategy     string
+	EntryPrice   float64
+	ExitPrice    float64
+	Quantity     float64
+	PnL          float64
+	PnLPct       float64
+	Status       string // open | closed
+	OpenedAt     time.Time
+	ClosedAt     time.Time
+	ExitReason   string
+	ExitEvidence json.RawMessage
+	ExitFilledAt *time.Time
 }
 
 // TradeHistoryData holds trade history for the TUI view.
@@ -73,18 +78,21 @@ func FetchTradeHistory(ctx context.Context, limit int) TradeHistoryData {
 	rows := make([]TradeRow, 0, len(trades))
 	for _, t := range trades {
 		rows = append(rows, TradeRow{
-			ID:         t.ID,
-			Ticker:     t.Ticker,
-			Direction:  t.Direction,
-			Strategy:   t.Strategy,
-			EntryPrice: t.EntryPrice,
-			ExitPrice:  t.ExitPrice,
-			Quantity:   t.Quantity,
-			PnL:        t.PnL,
-			PnLPct:     t.PnLPct,
-			Status:     t.Status,
-			OpenedAt:   t.OpenedAt,
-			ClosedAt:   t.ClosedAt,
+			ID:           t.ID,
+			Ticker:       t.Ticker,
+			Direction:    t.Direction,
+			Strategy:     t.Strategy,
+			EntryPrice:   t.EntryPrice,
+			ExitPrice:    t.ExitPrice,
+			Quantity:     t.Quantity,
+			PnL:          t.PnL,
+			PnLPct:       t.PnLPct,
+			Status:       t.Status,
+			OpenedAt:     t.OpenedAt,
+			ClosedAt:     t.ClosedAt,
+			ExitReason:   t.ExitReason,
+			ExitEvidence: t.ExitEvidence,
+			ExitFilledAt: t.ExitFilledAt,
 		})
 	}
 	return TradeHistoryData{Trades: rows, LastUpdate: time.Now()}
@@ -101,18 +109,21 @@ func FetchTradeDetail(ctx context.Context, tradeID string) (d TradeDetailData, o
 	}
 
 	d.Trade = TradeRow{
-		ID:         trade.ID,
-		Ticker:     trade.Ticker,
-		Direction:  trade.Direction,
-		Strategy:   trade.Strategy,
-		EntryPrice: trade.EntryPrice,
-		ExitPrice:  trade.ExitPrice,
-		Quantity:   trade.Quantity,
-		PnL:        trade.PnL,
-		PnLPct:     trade.PnLPct,
-		Status:     trade.Status,
-		OpenedAt:   trade.OpenedAt,
-		ClosedAt:   trade.ClosedAt,
+		ID:           trade.ID,
+		Ticker:       trade.Ticker,
+		Direction:    trade.Direction,
+		Strategy:     trade.Strategy,
+		EntryPrice:   trade.EntryPrice,
+		ExitPrice:    trade.ExitPrice,
+		Quantity:     trade.Quantity,
+		PnL:          trade.PnL,
+		PnLPct:       trade.PnLPct,
+		Status:       trade.Status,
+		OpenedAt:     trade.OpenedAt,
+		ClosedAt:     trade.ClosedAt,
+		ExitReason:   trade.ExitReason,
+		ExitEvidence: trade.ExitEvidence,
+		ExitFilledAt: trade.ExitFilledAt,
 	}
 	d.SignalID = trade.SignalID
 
@@ -250,6 +261,26 @@ func RenderTradeDetail(d TradeDetailData) string {
 		b.WriteString(fmt.Sprintf("  P&L:         %s\n",
 			pnlStyle.Render(fmt.Sprintf("%.2f (%.2f%%)", t.PnL, t.PnLPct))))
 		b.WriteString(fmt.Sprintf("  Closed At:   %s\n", t.ClosedAt.Format(time.RFC3339)))
+		reason := t.ExitReason
+		if reason == "" {
+			reason = "unknown"
+		}
+		b.WriteString(fmt.Sprintf("  Exit Reason: %s\n", reason))
+		if t.ExitFilledAt != nil {
+			b.WriteString(fmt.Sprintf("  Filled At:   %s\n", t.ExitFilledAt.Format(time.RFC3339)))
+		} else {
+			b.WriteString("  Filled At:   unknown\n")
+		}
+		if len(t.ExitEvidence) > 0 {
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, t.ExitEvidence); err == nil {
+				b.WriteString(fmt.Sprintf("  Evidence:    %s\n", compact.String()))
+			} else {
+				b.WriteString("  Evidence:    invalid\n")
+			}
+		} else {
+			b.WriteString("  Evidence:    unknown\n")
+		}
 	}
 	b.WriteString(fmt.Sprintf("  Opened At:   %s\n", t.OpenedAt.Format(time.RFC3339)))
 

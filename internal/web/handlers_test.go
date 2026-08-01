@@ -15,6 +15,38 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+func TestTradeWithAnalystsExitMetadataJSONContract(t *testing.T) {
+	filledAt := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
+	payload, err := json.Marshal(tradeWithAnalysts{Trade: store.Trade{
+		ID: "t1", Ticker: "PSN", ExitReason: store.ExitReasonEMA9Close,
+		ExitEvidence: []byte(`{"daily_close":95,"ema9":98}`), ExitFilledAt: &filledAt,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["ExitReason"] != store.ExitReasonEMA9Close {
+		t.Fatalf("ExitReason contract = %#v", decoded["ExitReason"])
+	}
+	if _, ok := decoded["ExitEvidence"].(map[string]any); !ok {
+		t.Fatalf("ExitEvidence encoded as %T, want JSON object: %s", decoded["ExitEvidence"], payload)
+	}
+	if decoded["ExitFilledAt"] != filledAt.Format(time.RFC3339) {
+		t.Fatalf("ExitFilledAt = %#v, want RFC3339", decoded["ExitFilledAt"])
+	}
+
+	legacy, err := json.Marshal(tradeWithAnalysts{Trade: store.Trade{ID: "legacy"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(legacy), `"ExitFilledAt":null`) {
+		t.Fatalf("legacy fill time contract changed: %s", legacy)
+	}
+}
+
 func TestMain(m *testing.M) {
 	// Create a dummy config file so config.Load() doesn't fail.
 	tmpCfg := "test_config.yaml"

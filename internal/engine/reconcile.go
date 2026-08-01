@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -30,6 +31,7 @@ type reconcilerBrokerView interface {
 // store.GetOpenTrades.
 type reconcilerStore interface {
 	GetOpenTrades(ctx context.Context) ([]store.Trade, error)
+	GetDurableExitOrderOwnership(context.Context) ([]store.DurableExitOrderOwnership, error)
 }
 
 // storeAdapter adapts the package-level store.GetOpenTrades to the
@@ -39,6 +41,10 @@ type storeAdapter struct{}
 
 func (storeAdapter) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	return store.GetOwnedPositionTrades(ctx)
+}
+
+func (storeAdapter) GetDurableExitOrderOwnership(ctx context.Context) ([]store.DurableExitOrderOwnership, error) {
+	return store.GetDurableExitOrderOwnership(ctx)
 }
 
 // signedBrokerQty returns the broker quantity with the sign implied by the
@@ -78,6 +84,10 @@ type BrokerDrift struct {
 	DBQty      float64 // signed
 	DBRowCount int
 	Source     string // broker_only | db_only | mismatch | side_mismatch
+	// ExitClaimedAt is set when Source=exit_pending. That is a temporary,
+	// non-alerting state while two independent exit-reconcile sweeps get a
+	// chance to finalize a broker-confirmed reduction.
+	ExitClaimedAt *time.Time
 	// AvgEntryPrice / CurrentPrice from the broker position (0 when db_only).
 	AvgEntryPrice float64
 	CurrentPrice  float64
@@ -137,17 +147,25 @@ func reconcileBrokerVsDB(ctx context.Context, broker reconcilerBrokerView, db re
 		logger.Warn("reconciler: db open trades fetch failed", "err", err.Error())
 		return nil, false
 	}
-	return compareBrokerVsDBSnapshots(positions, openTrades, tolerance, true), true
+	drifts := compareBrokerVsDBSnapshots(positions, openTrades, tolerance)
+	ownership, ownerErr := db.GetDurableExitOrderOwnership(ctx)
+	if ownerErr != nil {
+		logger.Warn("reconciler: durable exit ownership fetch failed", "err", ownerErr.Error())
+		return nil, false
+	}
+	drifts = classifyPendingExitDrifts(drifts, ownership, time.Now().UTC())
+	emitBrokerDriftLogs(drifts, tolerance)
+	return drifts, true
 }
 
 // CompareBrokerVsDBSnapshots applies the broker-vs-DB comparison rules to
 // already-fetched snapshots without logging or mutating either side. It is
 // used by read-only reporting surfaces that need machine-readable output.
 func CompareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades []store.Trade, tolerance float64) []BrokerDrift {
-	return compareBrokerVsDBSnapshots(positions, openTrades, tolerance, false)
+	return compareBrokerVsDBSnapshots(positions, openTrades, tolerance)
 }
 
-func compareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades []store.Trade, tolerance float64, emitLogs bool) []BrokerDrift {
+func compareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades []store.Trade, tolerance float64) []BrokerDrift {
 	if tolerance <= 0 {
 		tolerance = DefaultBrokerDriftToleranceShares
 	}
@@ -234,16 +252,6 @@ func compareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades
 			// that the abs-only check used to silently miss.
 			source = "side_mismatch"
 		}
-		if emitLogs {
-			logger.Warn("reconciler: broker/DB drift",
-				"ticker", ticker,
-				"broker_qty", a.brokerQty,
-				"db_qty", a.dbQty,
-				"db_row_count", a.dbRowCount,
-				"source", source,
-				"tolerance", tolerance,
-			)
-		}
 		drifts = append(drifts, BrokerDrift{
 			Ticker:        ticker,
 			BrokerQty:     a.brokerQty,
@@ -255,13 +263,80 @@ func compareBrokerVsDBSnapshots(positions []execution.BrokerPosition, openTrades
 		})
 	}
 
-	if emitLogs {
-		logger.Info("reconciler complete",
-			"tickers_compared", len(tickers),
-			"drift_warnings", len(drifts),
-		)
+	return drifts
+}
+
+const exitDriftGracePeriod = 2 * ExitReconcileInterval
+
+func classifyPendingExitDrifts(drifts []BrokerDrift, ownership []store.DurableExitOrderOwnership, now time.Time) []BrokerDrift {
+	type pendingClaim struct {
+		quantity float64
+		claimed  time.Time
+	}
+	claims := make(map[string]pendingClaim)
+	seenTrades := make(map[string]bool)
+	for _, owner := range ownership {
+		if !owner.ClaimOwned || owner.TradeStatus != "exiting" || owner.ExitClaimedAt == nil || seenTrades[owner.TradeID] {
+			continue
+		}
+		seenTrades[owner.TradeID] = true
+		if owner.ExitClaimedAt.After(now) || now.Sub(*owner.ExitClaimedAt) >= exitDriftGracePeriod {
+			continue
+		}
+		ticker := strings.ToUpper(strings.TrimSpace(owner.Ticker))
+		claim := claims[ticker]
+		claim.quantity += math.Abs(owner.TradeQuantity)
+		if claim.claimed.IsZero() || owner.ExitClaimedAt.Before(claim.claimed) {
+			claim.claimed = *owner.ExitClaimedAt
+		}
+		claims[ticker] = claim
+	}
+	for i := range drifts {
+		d := &drifts[i]
+		claim, ok := claims[d.Ticker]
+		if !ok {
+			continue
+		}
+		// Suppress only a same-direction broker reduction that the claimed exit
+		// can fully explain. Surplus and side flips remain immediately alertable.
+		reduction := math.Abs(d.DBQty) - math.Abs(d.BrokerQty)
+		sameDirection := d.BrokerQty == 0 || d.DBQty == 0 || (d.BrokerQty < 0) == (d.DBQty < 0)
+		if reduction > 0 && reduction <= claim.quantity+DefaultBrokerDriftToleranceShares && sameDirection {
+			d.Source = "exit_pending"
+			claimed := claim.claimed
+			d.ExitClaimedAt = &claimed
+		}
 	}
 	return drifts
+}
+
+func emitBrokerDriftLogs(drifts []BrokerDrift, tolerance float64) {
+	for _, d := range drifts {
+		levelMessage := "reconciler: broker/DB drift"
+		if d.Source == "exit_pending" {
+			levelMessage = "reconciler: broker/DB reduction awaiting exit finalization"
+		}
+		logger.Warn(levelMessage,
+			"ticker", d.Ticker, "broker_qty", d.BrokerQty, "db_qty", d.DBQty,
+			"db_row_count", d.DBRowCount, "source", d.Source, "tolerance", tolerance)
+	}
+	logger.Info("reconciler complete", "drift_warnings", len(alertableBrokerDrifts(drifts)))
+}
+
+func alertableBrokerDrifts(drifts []BrokerDrift) []BrokerDrift {
+	out := make([]BrokerDrift, 0, len(drifts))
+	for _, d := range drifts {
+		if d.Source != "exit_pending" {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// AlertableBrokerDrifts excludes fresh, durably-owned exit reductions. It is
+// exported for startup notification and adoption paths.
+func AlertableBrokerDrifts(drifts []BrokerDrift) []BrokerDrift {
+	return alertableBrokerDrifts(drifts)
 }
 
 // ReconcileBrokerVsDB reports broker-vs-DB drift, discarding the completed flag.

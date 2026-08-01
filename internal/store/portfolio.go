@@ -626,7 +626,8 @@ func GetClosedTradesByDateRange(ctx context.Context, from, to time.Time) ([]Trad
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades
 		WHERE status='closed'
 		  AND closed_at >= $1 AND closed_at < $2

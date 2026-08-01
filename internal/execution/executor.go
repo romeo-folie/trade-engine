@@ -86,6 +86,7 @@ type OrderResult struct {
 	Status        string  // pending | filled | partial | cancelled
 	FilledPrice   float64 // 0 if not yet filled
 	FilledQty     float64
+	FilledAt      time.Time // zero when the broker does not supply execution time
 	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
 	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
 	ChildOrderIDs []string

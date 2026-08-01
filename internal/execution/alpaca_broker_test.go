@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestGetAccount_DayPnL(t *testing.T) {
@@ -44,6 +45,23 @@ func TestGetAccount_DayPnL(t *testing.T) {
 	// DayPnL should be 105000.75 - 103500.50 = 1500.25
 	if acct.DayPnL != 1500.25 {
 		t.Errorf("DayPnL = %.2f, want 1500.25", acct.DayPnL)
+	}
+}
+
+func TestGetOrderStatusReturnsBrokerFillTime(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, `{"id":"o-1","status":"filled","filled_avg_price":"95.25","filled_qty":"10","filled_at":"2026-08-01T14:05:02Z"}`)
+	}))
+	defer ts.Close()
+
+	broker := &AlpacaBroker{apiKey: "k", secret: "s", baseURL: ts.URL, httpClient: ts.Client()}
+	result, err := broker.GetOrderStatus(context.Background(), "o-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
+	if !result.FilledAt.Equal(want) {
+		t.Fatalf("filled_at = %v, want %v", result.FilledAt, want)
 	}
 }
 

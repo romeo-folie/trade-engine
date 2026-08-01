@@ -1,6 +1,7 @@
 package views
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -60,11 +61,14 @@ func TestRenderTradeHistory_PnLStyling(t *testing.T) {
 }
 
 func TestRenderTradeDetail(t *testing.T) {
+	filledAt := time.Date(2026, 8, 1, 14, 5, 0, 0, time.UTC)
 	d := TradeDetailData{
 		Trade: TradeRow{
 			ID: "abc-123", Ticker: "AAPL", Direction: "buy", Strategy: "momentum",
 			Status: "closed", EntryPrice: 150, ExitPrice: 160, Quantity: 10,
 			PnL: 100, PnLPct: 6.67, OpenedAt: time.Now(), ClosedAt: time.Now(),
+			ExitReason: "ema9_close", ExitEvidence: json.RawMessage(`{"daily_close":160,"ema9":161}`),
+			ExitFilledAt: &filledAt,
 		},
 		SignalID:          "sig-789",
 		AnalysisReasoning: "Strong momentum with volume confirmation",
@@ -87,5 +91,26 @@ func TestRenderTradeDetail(t *testing.T) {
 	}
 	if !strings.Contains(out, "sig-789") {
 		t.Fatal("expected signal ID")
+	}
+	if !strings.Contains(out, "ema9_close") || !strings.Contains(out, "daily_close") || !strings.Contains(out, filledAt.Format(time.RFC3339)) {
+		t.Fatalf("exit provenance missing from detail: %q", out)
+	}
+}
+
+func TestRenderTradeDetailLegacyAndMalformedEvidence(t *testing.T) {
+	legacy := RenderTradeDetail(TradeDetailData{Trade: TradeRow{
+		ID: "legacy", Ticker: "OLD", Direction: "long", Status: "closed",
+		EntryPrice: 10, ExitPrice: 9, ClosedAt: time.Now(), OpenedAt: time.Now(),
+	}})
+	if strings.Count(legacy, "unknown") < 3 {
+		t.Fatalf("legacy provenance should render unknown values: %q", legacy)
+	}
+	malformed := RenderTradeDetail(TradeDetailData{Trade: TradeRow{
+		ID: "bad", Ticker: "BAD", Direction: "long", Status: "closed",
+		EntryPrice: 10, ExitPrice: 9, ClosedAt: time.Now(), OpenedAt: time.Now(),
+		ExitReason: "ema9_close", ExitEvidence: json.RawMessage(`{"broken":`),
+	}})
+	if !strings.Contains(malformed, "Evidence:    invalid") {
+		t.Fatalf("malformed evidence fallback missing: %q", malformed)
 	}
 }

@@ -215,6 +215,9 @@ Modes:
 					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
 					MarketOpen:  engine.IsMarketOpen,
 					RecordLoss:  eng.Portfolio().RecordLoss,
+					OnTradeClosed: func(payload events.TradeClosedPayload) {
+						eng.Bus().Publish(events.TradeClosed, payload)
+					},
 				}
 				mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
 				// Only advertise the uncapped-exit capability after every
@@ -975,6 +978,11 @@ Modes:
 			}
 		}
 
+		// Resolve broker-confirmed exits before comparing broker positions with
+		// DB ownership. Otherwise a stale exiting row can produce a false boot
+		// drift alert immediately before the exit sweep closes it.
+		eng.ReconcileExitsNow(ctx)
+
 		// Startup broker-vs-DB reconciler (Issue #313). Emits WARN per ticker
 		// where broker quantity diverges from summed DB open-trade quantity.
 		// Never crashes boot — broker errors are logged and swallowed inside
@@ -993,42 +1001,53 @@ Modes:
 		} else {
 			engine.ReconcileBrokerVsDBWithStoreStatus(ctx, nil, 0)
 		}
-		if len(drifts) > 0 {
+		alertDrifts := engine.AlertableBrokerDrifts(drifts)
+		sendDriftAlert := func(alertCtx context.Context, items []engine.BrokerDrift, adopted []string) {
+			if tgBot == nil || len(items) == 0 {
+				return
+			}
+			msg := fmt.Sprintf("⚠️ *Broker/DB drift*: %d ticker(s) diverged", len(items))
+			for i, d := range items {
+				if i == 8 {
+					msg += fmt.Sprintf("\n… and %d more (see engine.log)", len(items)-i)
+					break
+				}
+				msg += fmt.Sprintf("\n`%s` broker=%.4f db=%.4f (%s)", d.Ticker, d.BrokerQty, d.DBQty, d.Source)
+			}
+			if len(adopted) > 0 {
+				msg += fmt.Sprintf("\n✅ adopted as recovery trades: `%s`", strings.Join(adopted, ", "))
+			} else if !cfg.Engine.AdoptBrokerOrphans {
+				msg += "\n(adoption off — set engine.adopt_broker_orphans to recover orphans)"
+			}
+			if err := tgBot.SendImmediate(alertCtx, msg); err != nil {
+				logger.Warn("telegram: failed to send drift alert", "err", err)
+			}
+		}
+		if len(alertDrifts) > 0 {
 			var adopted []string
 			if cfg.Engine.AdoptBrokerOrphans {
-				adopted = engine.AdoptBrokerOrphansWithStore(ctx, drifts,
+				adopted = engine.AdoptBrokerOrphansWithStore(ctx, alertDrifts,
 					cfg.Risk.DefaultStopLossPct, cfg.Risk.DefaultTakeProfitPct)
 			}
-			if tgBot != nil {
-				msg := fmt.Sprintf("⚠️ *Broker/DB drift*: %d ticker(s) diverged", len(drifts))
-				for i, d := range drifts {
-					if i == 8 {
-						msg += fmt.Sprintf("\n… and %d more (see engine.log)", len(drifts)-i)
-						break
-					}
-					msg += fmt.Sprintf("\n`%s` broker=%.4f db=%.4f (%s)", d.Ticker, d.BrokerQty, d.DBQty, d.Source)
-				}
-				if len(adopted) > 0 {
-					msg += fmt.Sprintf("\n✅ adopted as recovery trades: `%s`", strings.Join(adopted, ", "))
-				} else if !cfg.Engine.AdoptBrokerOrphans {
-					msg += "\n(adoption off — set engine.adopt_broker_orphans to recover orphans)"
-				}
-				if err := tgBot.SendImmediate(ctx, msg); err != nil {
-					logger.Warn("telegram: failed to send drift alert", "err", err)
-				}
-			}
+			sendDriftAlert(ctx, alertDrifts, adopted)
 		}
 
 		// Persist the boot reconciliation and keep it fresh in the background,
 		// so readers (TUI, web) can surface drift that develops between engine
-		// restarts. Observability only — no alerts, no adoption on this path.
+		// restarts. Newly alertable transitions notify once; adoption remains a
+		// boot-only policy decision.
 		// Persist only a reconcile that completed, so a failed boot check does
 		// not record the book as "in sync".
 		if reconcileOK {
 			engine.PersistReconciliation(ctx, drifts)
 		}
 		if brokerRecon != nil {
-			go engine.RunReconcileLoop(ctx, brokerRecon, engine.BrokerReconcileInterval)
+			go engine.RunReconcileLoop(ctx, brokerRecon, engine.BrokerReconcileInterval, engine.ReconcileLoopOptions{
+				InitialDrifts: drifts,
+				OnNewDrifts: func(alertCtx context.Context, fresh []engine.BrokerDrift) {
+					sendDriftAlert(alertCtx, fresh, nil)
+				},
+			})
 		}
 
 		if err := eng.Run(ctx); err != nil {

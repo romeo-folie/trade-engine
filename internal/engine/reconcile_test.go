@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -28,11 +29,106 @@ func (f *fakeBrokerView) PositionsSnapshot(ctx context.Context) ([]execution.Bro
 
 // fakeStore returns a fixed slice of open trades.
 type fakeStore struct {
-	trades []store.Trade
+	trades    []store.Trade
+	ownership []store.DurableExitOrderOwnership
 }
 
 func (f *fakeStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	return f.trades, nil
+}
+
+func (f *fakeStore) GetDurableExitOrderOwnership(context.Context) ([]store.DurableExitOrderOwnership, error) {
+	return f.ownership, nil
+}
+
+func TestClassifyPendingExitDriftsRequiresFreshDurableOwnership(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	base := []BrokerDrift{{Ticker: "PSN", BrokerQty: 0, DBQty: 10, Source: "db_only"}}
+	owner := store.DurableExitOrderOwnership{
+		TradeID: "t1", Ticker: "PSN", TradeStatus: "exiting", TradeQuantity: 10,
+		ClaimOwned: true,
+	}
+
+	freshAt := now.Add(-19 * time.Minute)
+	owner.ExitClaimedAt = &freshAt
+	got := classifyPendingExitDrifts(append([]BrokerDrift(nil), base...), []store.DurableExitOrderOwnership{owner}, now)
+	if got[0].Source != "exit_pending" || len(AlertableBrokerDrifts(got)) != 0 {
+		t.Fatalf("fresh claimed reduction = %+v, want non-alerting exit_pending", got)
+	}
+
+	agedAt := now.Add(-20 * time.Minute)
+	owner.ExitClaimedAt = &agedAt
+	got = classifyPendingExitDrifts(append([]BrokerDrift(nil), base...), []store.DurableExitOrderOwnership{owner}, now)
+	if got[0].Source != "db_only" || len(AlertableBrokerDrifts(got)) != 1 {
+		t.Fatalf("aged claimed reduction = %+v, want alertable db_only", got)
+	}
+}
+
+func TestClassifyPendingExitDriftsDoesNotSuppressUnexplainedReduction(t *testing.T) {
+	now := time.Now().UTC()
+	claimed := now.Add(-time.Minute)
+	got := classifyPendingExitDrifts(
+		[]BrokerDrift{{Ticker: "MPLT", BrokerQty: 0, DBQty: 20, Source: "db_only"}},
+		[]store.DurableExitOrderOwnership{{
+			TradeID: "t1", Ticker: "MPLT", TradeStatus: "exiting", TradeQuantity: 5,
+			ClaimOwned: true, ExitClaimedAt: &claimed,
+		}}, now,
+	)
+	if got[0].Source != "db_only" {
+		t.Fatalf("unexplained reduction source = %q, want db_only", got[0].Source)
+	}
+}
+
+func TestClassifyPendingExitDriftsCountsOnlyFreshSameTickerClaims(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	oldClaim := now.Add(-30 * time.Minute)
+	freshClaim := now.Add(-5 * time.Minute)
+	ownership := []store.DurableExitOrderOwnership{
+		{TradeID: "old", Ticker: "PSN", TradeStatus: "exiting", TradeQuantity: 8, ClaimOwned: true, ExitClaimedAt: &oldClaim},
+		{TradeID: "fresh", Ticker: "PSN", TradeStatus: "exiting", TradeQuantity: 2, ClaimOwned: true, ExitClaimedAt: &freshClaim},
+	}
+
+	fullyFresh := classifyPendingExitDrifts(
+		[]BrokerDrift{{Ticker: "PSN", BrokerQty: 8, DBQty: 10, Source: "mismatch"}}, ownership, now,
+	)
+	if fullyFresh[0].Source != "exit_pending" {
+		t.Fatalf("freshly explainable reduction = %+v, want exit_pending", fullyFresh[0])
+	}
+	includesOld := classifyPendingExitDrifts(
+		[]BrokerDrift{{Ticker: "PSN", BrokerQty: 0, DBQty: 10, Source: "db_only"}}, ownership, now,
+	)
+	if includesOld[0].Source == "exit_pending" {
+		t.Fatalf("old+fresh reduction was fully suppressed: %+v", includesOld[0])
+	}
+}
+
+func TestClassifyPendingExitDriftsRejectsUnsafeGraceShapes(t *testing.T) {
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	fresh := now.Add(-time.Minute)
+	future := now.Add(time.Minute)
+	cases := []struct {
+		name  string
+		drift BrokerDrift
+		owner store.DurableExitOrderOwnership
+	}{
+		{"broker surplus", BrokerDrift{Ticker: "X", BrokerQty: 12, DBQty: 10, Source: "mismatch"}, store.DurableExitOrderOwnership{TradeQuantity: 10, ClaimOwned: true, ExitClaimedAt: &fresh}},
+		{"side flip", BrokerDrift{Ticker: "X", BrokerQty: -5, DBQty: 10, Source: "mismatch"}, store.DurableExitOrderOwnership{TradeQuantity: 10, ClaimOwned: true, ExitClaimedAt: &fresh}},
+		{"not claim owned", BrokerDrift{Ticker: "X", BrokerQty: 5, DBQty: 10, Source: "mismatch"}, store.DurableExitOrderOwnership{TradeQuantity: 10, ExitClaimedAt: &fresh}},
+		{"future claim", BrokerDrift{Ticker: "X", BrokerQty: 5, DBQty: 10, Source: "mismatch"}, store.DurableExitOrderOwnership{TradeQuantity: 10, ClaimOwned: true, ExitClaimedAt: &future}},
+		{"open owner", BrokerDrift{Ticker: "X", BrokerQty: 5, DBQty: 10, Source: "mismatch"}, store.DurableExitOrderOwnership{TradeQuantity: 10, TradeStatus: "open", ClaimOwned: true, ExitClaimedAt: &fresh}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.owner.TradeID, tc.owner.Ticker = "t1", "X"
+			if tc.owner.TradeStatus == "" {
+				tc.owner.TradeStatus = "exiting"
+			}
+			got := classifyPendingExitDrifts([]BrokerDrift{tc.drift}, []store.DurableExitOrderOwnership{tc.owner}, now)
+			if got[0].Source == "exit_pending" {
+				t.Fatalf("unsafe drift received grace: %+v owner=%+v", got[0], tc.owner)
+			}
+		})
+	}
 }
 
 // captureLogs swaps the package logger for a JSON handler writing to a buffer

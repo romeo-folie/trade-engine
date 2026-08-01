@@ -3,6 +3,7 @@ package trailing
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -57,11 +58,11 @@ func (liveStore) ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]s
 	return store.ExitLegsForMarketExit(ctx, tradeID)
 }
 
-func (liveStore) ClaimTradeExit(ctx context.Context, id string) (bool, error) {
+func (liveStore) ClaimTradeExitWithIntent(ctx context.Context, id string, intent store.ExitIntent) (bool, error) {
 	if !store.IsConnected() {
 		return false, errStoreNotConnected
 	}
-	return store.ClaimTradeExit(ctx, id)
+	return store.ClaimTradeExitWithIntent(ctx, id, intent)
 }
 
 func (liveStore) ReleaseTradeExitClaim(ctx context.Context, id string) error {
@@ -85,17 +86,18 @@ func (liveStore) UpdateOrderFill(ctx context.Context, orderID string, filledPric
 	return store.UpdateOrderFill(ctx, orderID, filledPrice, filledQty, status)
 }
 
-func (liveStore) ApplyPartialExit(
+func (liveStore) ApplyPartialExitAt(
 	ctx context.Context,
 	tradeID, orderID string,
 	filledPrice, cumulativeFilledQty float64,
 	status string,
+	filledAt time.Time,
 ) (float64, float64, error) {
 	if !store.IsConnected() {
 		return 0, 0, errStoreNotConnected
 	}
-	return store.ApplyPartialExit(
-		ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status,
+	return store.ApplyPartialExitAt(
+		ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status, filledAt,
 	)
 }
 
@@ -106,26 +108,32 @@ func (liveStore) UpdateExitingTradeQuantity(ctx context.Context, id string, quan
 	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
 }
 
-func (liveStore) UpdateOrderStopPriceAndID(
+func (liveStore) UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, newBrokerOrderID string,
 	newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
 ) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected
 	}
-	return store.UpdateOrderStopPriceAndID(
+	return store.UpdateOrderStopReplacement(
 		ctx, orderID, newBrokerOrderID, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt,
 	)
 }
 
-func (liveStore) CloseTradeRealized(
+func (liveStore) CloseTradeRealizedWithIntent(
 	ctx context.Context,
 	id string,
 	exitPrice float64,
+	filledAt time.Time,
+	intent store.ExitIntent,
 ) (store.TradeRealization, error) {
 	if !store.IsConnected() {
 		return store.TradeRealization{}, errStoreNotConnected
 	}
-	return store.CloseTradeRealized(ctx, id, exitPrice)
+	return store.CloseTradeRealizedWithIntent(ctx, id, exitPrice, filledAt, intent)
 }

@@ -27,6 +27,7 @@ package trailing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -34,6 +35,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
@@ -116,19 +118,21 @@ type TradeStore interface {
 	// protective legs and terminal legs with fills. It closes the lookup gap
 	// where a leg can fill between separate working/filled queries.
 	ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]store.Order, error)
-	ClaimTradeExit(ctx context.Context, id string) (bool, error)
+	ClaimTradeExitWithIntent(ctx context.Context, id string, intent store.ExitIntent) (bool, error)
 	ReleaseTradeExitClaim(ctx context.Context, id string) error
 	InsertOrder(ctx context.Context, o store.Order) (string, error)
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
-	ApplyPartialExit(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string) (remaining, applied float64, err error)
+	ApplyPartialExitAt(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (remaining, applied float64, err error)
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
-	UpdateOrderStopPriceAndID(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64) error
-	// CloseTradeRealized closes the trade after a confirmed market exit and
-	// returns lifecycle-cumulative P&L across any earlier partial exits.
-	CloseTradeRealized(
+	UpdateOrderStopReplacement(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64, status string, filledPrice, filledQty float64, filledAt time.Time) error
+	// CloseTradeRealizedWithIntent closes the trade after a confirmed market
+	// exit and returns lifecycle-cumulative P&L across earlier partial exits.
+	CloseTradeRealizedWithIntent(
 		ctx context.Context,
 		id string,
 		exitPrice float64,
+		filledAt time.Time,
+		intent store.ExitIntent,
 	) (store.TradeRealization, error)
 }
 
@@ -146,6 +150,9 @@ type Config struct {
 	// RecordLoss updates engine-level cooldown state after a trailing exit
 	// realizes a loss. It is optional for standalone/tests callers.
 	RecordLoss func()
+	// OnTradeClosed publishes the same lifecycle event as engine-owned exit
+	// paths after a trailing-policy close commits successfully.
+	OnTradeClosed func(events.TradeClosedPayload)
 }
 
 // Normalize fills in defaults so callers can hand the manager a partially
@@ -169,12 +176,13 @@ func (c Config) Normalize() Config {
 
 // Manager runs the trailing stop loop.
 type Manager struct {
-	cfg        Config
-	store      TradeStore
-	prices     PriceFetcher
-	exec       execution.Executor
-	now        func() time.Time
-	marketOpen func(time.Time) bool
+	cfg         Config
+	store       TradeStore
+	prices      PriceFetcher
+	exec        execution.Executor
+	now         func() time.Time
+	marketOpen  func(time.Time) bool
+	deferredEMA map[string]time.Time
 }
 
 // NewManager constructs a trailing-stop Manager.
@@ -185,12 +193,13 @@ func NewManager(cfg Config, ts TradeStore, prices PriceFetcher, exec execution.E
 		marketOpen = regularStockSession
 	}
 	return &Manager{
-		cfg:        normalized,
-		store:      ts,
-		prices:     prices,
-		exec:       exec,
-		now:        time.Now,
-		marketOpen: marketOpen,
+		cfg:         normalized,
+		store:       ts,
+		prices:      prices,
+		exec:        exec,
+		now:         time.Now,
+		marketOpen:  marketOpen,
+		deferredEMA: make(map[string]time.Time),
 	}
 }
 
@@ -230,16 +239,23 @@ func (m *Manager) UpdateAll(ctx context.Context) {
 		logger.Warn("trailing-stop: GetOpenTrades failed", "err", err)
 		return
 	}
+	active := make(map[string]bool, len(trades))
 	for _, t := range trades {
 		if !isLongStockTrade(t) {
 			continue
 		}
+		active[t.ID] = true
 		if err := m.updateOne(ctx, t); err != nil {
 			logger.Warn("trailing-stop: update failed",
 				"trade_id", t.ID,
 				"ticker", t.Ticker,
 				"err", err,
 			)
+		}
+	}
+	for tradeID := range m.deferredEMA {
+		if !active[tradeID] {
+			delete(m.deferredEMA, tradeID)
 		}
 	}
 }
@@ -331,7 +347,15 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			"new_stop", newStop,
 			"current_price", currentPrice,
 		)
-		if err := m.exitAndClose(ctx, t, currentPrice); err != nil {
+		intent := store.ExitIntent{
+			Reason: store.ExitReasonTrailingATR,
+			Evidence: exitEvidence(map[string]any{
+				"current_price": currentPrice, "trailing_stop": newStop,
+				"high_water_mark": hwm, "atr": atr,
+				"atr_multiple": m.cfg.ATRMultiple,
+			}),
+		}
+		if err := m.exitAndClose(ctx, t, intent, true); err != nil {
 			// Persist HWM so the next tick has fresh baseline; surface error.
 			_ = m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			return fmt.Errorf("market exit: %w", err)
@@ -428,22 +452,35 @@ func (m *Manager) updateOneEMA9(ctx context.Context, t store.Trade) error {
 			// next open. Keep the trade row and broker hard stop live overnight,
 			// then retry this same completed-close signal during the next
 			// eligible session.
-			logger.Info("trailing-stop: daily close below ema9; deferring market exit until regular session",
-				"trade_id", t.ID,
-				"ticker", t.Ticker,
-				"daily_close", closePrice,
-				"ema9", ema,
-			)
+			if previous, ok := m.deferredEMA[t.ID]; !ok || !previous.Equal(closeCompletedAt) {
+				logger.Info("trailing-stop: daily close below ema9; deferring market exit until regular session",
+					"trade_id", t.ID,
+					"ticker", t.Ticker,
+					"daily_close", closePrice,
+					"ema9", ema,
+				)
+				m.deferredEMA[t.ID] = closeCompletedAt
+			}
 			return nil
 		}
+		delete(m.deferredEMA, t.ID)
 		logger.Info("trailing-stop: daily close below ema9; exiting at market",
 			"trade_id", t.ID,
 			"ticker", t.Ticker,
 			"daily_close", closePrice,
 			"ema9", ema,
 		)
-		return m.exitAndClose(ctx, t, closePrice)
+		intent := store.ExitIntent{
+			Reason: store.ExitReasonEMA9Close,
+			Evidence: exitEvidence(map[string]any{
+				"daily_close": closePrice, "ema9": ema,
+				"signal_candle_closed_at": closeCompletedAt.UTC(),
+				"observed_at":             now.UTC(),
+			}),
+		}
+		return m.exitAndClose(ctx, t, intent, false)
 	}
+	delete(m.deferredEMA, t.ID)
 
 	// For uncapped trades, the original hard stop seeded above remains resident
 	// at the broker while the EMA winning exit waits.
@@ -601,18 +638,38 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
 				status := execution.NormalizeOrderStatus(res.Status)
-				if persistErr := m.store.UpdateOrderStopPriceAndID(
+				fillQty := res.FilledQty
+				if status == "filled" && fillQty <= 0 {
+					fillQty = existing.Quantity
+				}
+				fillPrice := res.FilledPrice
+				if fillQty > 0 && fillPrice <= 0 {
+					fillPrice = newStop
+				}
+				fillObserved := fillQty > 0
+				if fillObserved {
+					// Transfer ownership before terminalizing the only durable
+					// order row. A crash after this point leaves an orderless
+					// exiting trade, which the recovery sweep can safely resolve.
+					claimed, claimErr := m.store.ClaimTradeExitWithIntent(ctx, t.ID, stopExitIntent(newStop))
+					if claimErr != nil {
+						return fmt.Errorf("claim replacement-stop fill: %w", claimErr)
+					}
+					if !claimed {
+						logger.Warn("trailing-stop: replacement fill joined an existing exit owner",
+							"trade_id", t.ID, "broker_order_id", res.BrokerOrderID)
+					}
+				}
+				if persistErr := m.store.UpdateOrderStopReplacement(
 					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
+					status, fillPrice, fillQty, res.FilledAt,
 				); persistErr != nil {
 					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
 						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
 					}
 					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
 				}
-				if status == "filled" || res.FilledQty > 0 {
-					if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
-						return fmt.Errorf("claim replacement-stop fill: %w", claimErr)
-					}
+				if fillObserved {
 					return errStopFilledDuringRollback
 				}
 				if status == "cancelled" || status == "rejected" {
@@ -666,15 +723,16 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	}
 	fillObserved := fillQty > 0
 	if fillObserved {
-		if _, claimErr := m.store.ClaimTradeExit(ctx, t.ID); claimErr != nil {
+		if _, claimErr := m.store.ClaimTradeExitWithIntent(ctx, t.ID, stopExitIntent(newStop)); claimErr != nil {
 			return fmt.Errorf("claim immediate stop fill: %w", claimErr)
 		}
 	}
 
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
-		if err := m.store.UpdateOrderStopPriceAndID(
+		if err := m.store.UpdateOrderStopReplacement(
 			ctx, existing.ID, res.BrokerOrderID, newStop, t.Quantity,
+			status, fillPrice, fillQty, res.FilledAt,
 		); err != nil {
 			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
 				return fmt.Errorf("persist replacement stop: %w; rollback: %v", err, rollbackErr)
@@ -701,6 +759,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		FilledQty:     fillQty,
 		Status:        status,
 		IsStopLoss:    true,
+		FilledAt:      timePtr(res.FilledAt),
 	})
 	if err != nil {
 		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID); rollbackErr != nil {
@@ -731,28 +790,33 @@ func (m *Manager) rollbackUnrecordedStop(
 		}
 		return fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
 	}
-	switch execution.NormalizeOrderStatus(status.Status) {
+	terminalStatus := execution.NormalizeOrderStatus(status.Status)
+	switch terminalStatus {
 	case "cancelled", "rejected":
 		if status.FilledQty <= 0 {
 			return nil
 		}
-		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		_, _ = m.store.ClaimTradeExitWithIntent(ctx, t.ID, stopExitIntent(stopPrice))
 		if _, err := m.store.InsertOrder(ctx, store.Order{
 			TradeID: t.ID, BrokerOrderID: brokerOrderID,
 			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
 			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
-			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+			StopPrice: stopPrice, Status: terminalStatus, IsStopLoss: true,
+			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
+			FilledAt: timePtr(status.FilledAt),
 		}); err != nil {
 			return fmt.Errorf("%w; persist partial rollback stop: %v", errStopFilledDuringRollback, err)
 		}
 		return errStopFilledDuringRollback
 	case "filled":
-		_, _ = m.store.ClaimTradeExit(ctx, t.ID)
+		_, _ = m.store.ClaimTradeExitWithIntent(ctx, t.ID, stopExitIntent(stopPrice))
 		if _, err := m.store.InsertOrder(ctx, store.Order{
 			TradeID: t.ID, BrokerOrderID: brokerOrderID,
 			Ticker: t.Ticker, Side: string(execution.OrderSideSell),
 			OrderType: string(execution.OrderTypeStop), Quantity: t.Quantity,
-			StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+			StopPrice: stopPrice, Status: terminalStatus, IsStopLoss: true,
+			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
+			FilledAt: timePtr(status.FilledAt),
 		}); err != nil {
 			return fmt.Errorf("%w; persist filled rollback stop: %v", errStopFilledDuringRollback, err)
 		}
@@ -770,12 +834,11 @@ func protectiveStopTIF(quantity float64) string {
 	return "gtc"
 }
 
-// exitAndClose submits the market exit and immediately closes the trade row so
-// the next manager tick cannot submit a duplicate sell. The broker fill wins
-// when available; asynchronous brokers fall back to the candle close that
-// triggered the policy and are later reconciled to broker truth.
-func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) error {
-	claimed, err := m.store.ClaimTradeExit(ctx, t.ID)
+// exitAndClose submits the market exit and closes the trade only after a full
+// broker-confirmed fill. Asynchronous fills remain durably exiting for the
+// independent reconciler, preventing duplicate sells and trigger-price P&L.
+func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, intent store.ExitIntent, isStopLoss bool) error {
+	claimed, err := m.store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 	if err != nil {
 		return fmt.Errorf("claim trade exit: %w", err)
 	}
@@ -811,7 +874,8 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 		FilledPrice:   exitRes.FilledPrice,
 		FilledQty:     exitRes.FilledQty,
 		Status:        execution.NormalizeOrderStatus(exitRes.Status),
-		IsStopLoss:    true,
+		IsStopLoss:    isStopLoss,
+		FilledAt:      timePtr(exitRes.FilledAt),
 	}); err != nil {
 		return fmt.Errorf("record accepted market exit: %w", err)
 	}
@@ -830,14 +894,53 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, _ float64) er
 		return nil
 	}
 	exitPrice := exitRes.FilledPrice
-	realized, err := m.store.CloseTradeRealized(ctx, t.ID, exitPrice)
+	realized, err := m.store.CloseTradeRealizedWithIntent(ctx, t.ID, exitPrice, exitRes.FilledAt, intent)
 	if err != nil {
 		return fmt.Errorf("close trade after market exit: %w", err)
 	}
 	if realized.PnL < 0 && m.cfg.RecordLoss != nil {
 		m.cfg.RecordLoss()
 	}
+	if m.cfg.OnTradeClosed != nil && realized.JustClosed {
+		m.cfg.OnTradeClosed(events.TradeClosedPayload{
+			TradeID: realized.TradeID, Ticker: realized.Ticker,
+			Direction: realized.Direction, EntryPrice: realized.EntryPrice,
+			ExitPrice: realized.ExitPrice, PnL: realized.PnL,
+			PnLPct: realized.PnLPct, Reason: realized.ExitReason,
+			Evidence: realized.ExitEvidence, FilledAt: realized.ExitFilledAt,
+		})
+	}
 	return nil
+}
+
+func exitEvidence(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+func stopExitIntent(stopPrice float64) store.ExitIntent {
+	return store.ExitIntent{
+		Reason:   store.ExitReasonStopLoss,
+		Evidence: exitEvidence(map[string]any{"stop_loss": stopPrice}),
+	}
+}
+
+func timePtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	t = t.UTC()
+	return &t
+}
+
+func timeValue(t *time.Time) time.Time {
+	if t == nil {
+		return time.Time{}
+	}
+	return *t
 }
 
 // cancelAndConfirm cancels a broker order and only returns nil once the
@@ -960,8 +1063,8 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 						return 0, fmt.Errorf("%w: purged exit leg %s has a fill but no price",
 							errExitClaimMustRemain, leg.BrokerOrderID)
 					}
-					remaining, _, err = m.store.ApplyPartialExit(
-						ctx, t.ID, leg.ID, fillPrice, leg.FilledQty, terminalStatus,
+					remaining, _, err = m.store.ApplyPartialExitAt(
+						ctx, t.ID, leg.ID, fillPrice, leg.FilledQty, terminalStatus, timeValue(leg.FilledAt),
 					)
 					if err != nil {
 						return 0, fmt.Errorf("%w: persist purged exit-leg fill: %v",
@@ -1006,8 +1109,8 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 				return 0, fmt.Errorf("%w: exit leg %s has a fill but no price",
 					errExitClaimMustRemain, leg.BrokerOrderID)
 			}
-			remaining, _, err = m.store.ApplyPartialExit(
-				ctx, t.ID, leg.ID, fillPrice, fillQty, brokerStatus,
+			remaining, _, err = m.store.ApplyPartialExitAt(
+				ctx, t.ID, leg.ID, fillPrice, fillQty, brokerStatus, status.FilledAt,
 			)
 			if err != nil {
 				return 0, fmt.Errorf("%w: persist recorded exit-leg fill: %v",
@@ -1058,9 +1161,9 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 					}
 				}
 				var applied float64
-				remaining, applied, err = m.store.ApplyPartialExit(
+				remaining, applied, err = m.store.ApplyPartialExitAt(
 					ctx, t.ID, leg.ID, fillPrice, status.FilledQty,
-					execution.NormalizeOrderStatus(status.Status),
+					execution.NormalizeOrderStatus(status.Status), status.FilledAt,
 				)
 				if err != nil {
 					return 0, fmt.Errorf("%w: persist partial exit-leg fill: %v",

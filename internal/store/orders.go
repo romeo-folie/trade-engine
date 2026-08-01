@@ -28,6 +28,7 @@ type Order struct {
 	// PATCH-replace only (cancel+resubmit orphans the sibling leg), and both
 	// legs must be cancelled before selling the shares they hold.
 	ParentOrderID string
+	FilledAt      *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -44,15 +45,15 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 			trade_id, broker_order_id, ticker, side, order_type,
 			quantity, limit_price, stop_price, status,
 			is_stop_loss, is_take_profit, filled_price, filled_qty,
-			parent_order_id
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+			parent_order_id, filled_at
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 		RETURNING id`,
 		nullableString(o.TradeID), nullableString(o.BrokerOrderID),
 		o.Ticker, o.Side, o.OrderType,
 		o.Quantity, nullableFloat(o.LimitPrice), nullableFloat(o.StopPrice),
 		o.Status, o.IsStopLoss, o.IsTakeProfit,
 		nullableFloat(o.FilledPrice), nullableFloat(o.FilledQty),
-		nullableString(o.ParentOrderID),
+		nullableString(o.ParentOrderID), nullableTimePtr(o.FilledAt),
 	).Scan(&id)
 	return id, err
 }
@@ -94,10 +95,22 @@ func InsertOrderWithRetry(ctx context.Context, o Order) (string, error) {
 
 // UpdateOrderFill sets filled_price, filled_qty, and status after a fill event.
 func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty float64, status string) error {
+	return UpdateOrderFillAt(ctx, id, filledPrice, filledQty, status, time.Time{})
+}
+
+// UpdateOrderFillAt persists broker execution time when the adapter supplies
+// it. A zero timestamp deliberately leaves an existing broker timestamp intact.
+func UpdateOrderFillAt(ctx context.Context, id string, filledPrice, filledQty float64, status string, filledAt time.Time) error {
 	_, err := GetDB().Exec(ctx, `
-		UPDATE orders SET filled_price=$1, filled_qty=$2, status=$3, updated_at=NOW()
-		WHERE id=$4`,
-		filledPrice, filledQty, status, id)
+		UPDATE orders
+		SET filled_price=$1, filled_qty=$2, status=$3,
+		    filled_at=CASE
+		        WHEN $4::timestamptz IS NULL THEN filled_at
+		        WHEN filled_at IS NULL THEN $4::timestamptz
+		        ELSE GREATEST(filled_at,$4::timestamptz)
+		    END, updated_at=NOW()
+		WHERE id=$5`,
+		filledPrice, filledQty, status, nullableTime(filledAt), id)
 	return err
 }
 
@@ -112,6 +125,19 @@ func ApplyPartialExit(
 	tradeID, orderID string,
 	filledPrice, cumulativeFilledQty float64,
 	status string,
+) (remaining, applied float64, err error) {
+	return ApplyPartialExitAt(ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status, time.Time{})
+}
+
+// ApplyPartialExitAt is ApplyPartialExit with an optional broker execution
+// timestamp. The latest known fill time is carried onto the trade so final
+// reconciliation never substitutes its own wall clock for broker truth.
+func ApplyPartialExitAt(
+	ctx context.Context,
+	tradeID, orderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+	filledAt time.Time,
 ) (remaining, applied float64, err error) {
 	if cumulativeFilledQty > 0 && filledPrice <= 0 {
 		return 0, 0, fmt.Errorf("partial exit fill price must be positive")
@@ -163,9 +189,14 @@ func ApplyPartialExit(
 	if _, err = tx.Exec(ctx, `
 		UPDATE orders
 		SET filled_price=$1, filled_qty=$2, status=$3,
-		    exit_fill_applied_qty=$4, updated_at=NOW()
-		WHERE id=$5`,
-		filledPrice, observedFill, status, appliedTarget, orderID,
+		    exit_fill_applied_qty=$4,
+		    filled_at=CASE
+		        WHEN $5::timestamptz IS NULL THEN filled_at
+		        WHEN filled_at IS NULL THEN $5::timestamptz
+		        ELSE GREATEST(filled_at,$5::timestamptz)
+		    END, updated_at=NOW()
+		WHERE id=$6`,
+		filledPrice, observedFill, status, appliedTarget, nullableTime(filledAt), orderID,
 	); err != nil {
 		return 0, 0, err
 	}
@@ -177,10 +208,15 @@ func ApplyPartialExit(
 		    realized_pnl=realized_pnl+CASE
 		        WHEN direction='short' THEN entry_price*$1-$3
 		        ELSE $3-entry_price*$1
+		    END,
+		    exit_filled_at=CASE
+		        WHEN $4::timestamptz IS NULL THEN exit_filled_at
+		        WHEN exit_filled_at IS NULL THEN $4::timestamptz
+		        ELSE GREATEST(exit_filled_at, $4::timestamptz)
 		    END
 		WHERE id=$2 AND status IN ('open','exiting')
 		RETURNING quantity`,
-		applied, tradeID, proceedsDelta,
+		applied, tradeID, proceedsDelta, nullableTime(filledAt),
 	).Scan(&remaining); err != nil {
 		return 0, 0, err
 	}
@@ -198,7 +234,7 @@ func GetOrdersByTrade(ctx context.Context, tradeID string) ([]Order, error) {
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
-		       COALESCE(parent_order_id,''),
+		       COALESCE(parent_order_id,''), filled_at,
 		       created_at, updated_at
 		FROM orders WHERE trade_id=$1 ORDER BY created_at ASC`, tradeID)
 	if err != nil {
@@ -222,7 +258,7 @@ func scanOrders(rows interface {
 			&o.LimitPrice, &o.StopPrice,
 			&o.FilledPrice, &o.FilledQty,
 			&o.Status, &o.IsStopLoss, &o.IsTakeProfit,
-			&o.ParentOrderID,
+			&o.ParentOrderID, &o.FilledAt,
 			&o.CreatedAt, &o.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -244,7 +280,7 @@ func OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]Order, error) 
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
-		       COALESCE(parent_order_id,''),
+		       COALESCE(parent_order_id,''), filled_at,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1
@@ -271,7 +307,7 @@ func ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]Order, error)
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
-		       COALESCE(parent_order_id,''),
+		       COALESCE(parent_order_id,''), filled_at,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1
@@ -289,4 +325,18 @@ func ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]Order, error)
 	}
 	defer rows.Close()
 	return scanOrders(rows)
+}
+
+func nullableTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.UTC()
+}
+
+func nullableTimePtr(t *time.Time) any {
+	if t == nil || t.IsZero() {
+		return nil
+	}
+	return t.UTC()
 }

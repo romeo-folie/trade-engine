@@ -10,7 +10,6 @@ import (
 	"math"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/analysis"
@@ -120,12 +119,8 @@ type Engine struct {
 	// lastDailySummaryUpdate tracks when updateDailySummary last ran to throttle
 	// the expensive DB query + upsert cycle.
 	lastDailySummaryUpdate time.Time
-
-	// lastExitReconcile throttles the exit-fill reconciler sweep the same way.
-	// exitReconcileInFlight guards against overlapping background sweeps when
-	// a sweep outlives the throttle interval (slow broker API + backlog).
-	lastExitReconcile     time.Time
-	exitReconcileInFlight atomic.Bool
+	exitStartupMu          sync.Mutex
+	exitStartupPrepared    bool
 
 	feedbackReviewer *feedback.Reviewer
 
@@ -288,8 +283,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	// the sweeper calls store.DeleteExpiredCachedAnalyses which panics on
 	// an uninitialised pool.
 	if store.IsConnected() {
+		// Establish exit truth before the first trading tick. A stale exiting
+		// row must be finalized (and announced) before ownership gates evaluate
+		// new signals from the startup cycle.
+		e.ReconcileExitsNow(ctx)
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
+		go e.runExitReconcileLoop(ctx)
 	}
 
 	if e.feedbackReviewer != nil {
@@ -2936,10 +2936,6 @@ func (e *Engine) pollExitFill(ctx context.Context, brokerOrderID string) (execut
 	return execution.OrderResult{}, false
 }
 
-// exitReconcileInterval throttles the exit-fill reconciler sweep inside the
-// monitor loop.
-const exitReconcileInterval = 10 * time.Minute
-
 // monitorPositions checks all open trades for stop-loss and take-profit breaches.
 // checkExitResidue verifies, shortly after an exit, that the broker holds no
 // more of `ticker` than the DB's remaining open trades account for. Fires the
@@ -2990,25 +2986,6 @@ func (e *Engine) checkExitResidue(ticker string) {
 func (e *Engine) monitorPositions(ctx context.Context) {
 	// Refresh portfolio state from executor positions.
 	e.refreshPortfolio(ctx)
-
-	// Sweep exit orders whose broker fills were never confirmed and align the
-	// closed trades' recorded exits with broker truth. Runs in the background:
-	// a backlog is up to DefaultExitReconcileBatch GetOrderStatus calls, and a
-	// slow broker API must never sit between the tick and the safety-critical
-	// SL/TP checks below. The CAS guard prevents overlapping sweeps; the
-	// detached context keeps a sweep from being cancelled when the tick
-	// returns, bounded by its own timeout.
-	if time.Since(e.lastExitReconcile) >= exitReconcileInterval && e.exitReconcileInFlight.CompareAndSwap(false, true) {
-		e.lastExitReconcile = time.Now()
-		go func() {
-			defer e.exitReconcileInFlight.Store(false)
-			sweepCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-			defer cancel()
-			ReconcileExitOrderFillsWithStoreAndLoss(
-				sweepCtx, e.executor, DefaultExitReconcileBatch, e.portfolio.RecordLoss,
-			)
-		}()
-	}
 
 	trades, err := store.GetOpenTrades(ctx)
 	if err != nil {
@@ -3091,7 +3068,19 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			continue
 		}
 
-		claimed, err := store.ClaimTradeExit(ctx, t.ID)
+		evidence := map[string]any{
+			"current_price":   currentPrice,
+			"price_timestamp": priceTS.UTC(),
+		}
+		reasonCode := store.ExitReasonStopLoss
+		if exitReason == "stop-loss hit" {
+			evidence["stop_loss"] = t.StopLoss
+		} else {
+			reasonCode = store.ExitReasonTakeProfit
+			evidence["take_profit"] = t.TakeProfit
+		}
+		intent := newExitIntent(reasonCode, evidence)
+		claimed, err := store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
 		if err != nil {
 			logger.Warn("claim trade exit", "trade_id", t.ID, "err", err)
 			continue
@@ -3158,6 +3147,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			OrderType:     string(execution.OrderTypeMarket),
 			Quantity:      t.Quantity,
 			FilledQty:     result.FilledQty,
+			FilledAt:      filledAtPtr(result.FilledAt),
 			Status:        execution.NormalizeOrderStatus(result.Status),
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
@@ -3186,7 +3176,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 		}
 
 		exitPrice := result.FilledPrice
-		realized, err := store.CloseTradeRealized(ctx, t.ID, exitPrice)
+		realized, err := store.CloseTradeRealizedWithIntent(ctx, t.ID, exitPrice, result.FilledAt, intent)
 		if err != nil {
 			logger.Warn("close confirmed trade", "trade_id", t.ID, "err", err)
 			continue
@@ -3202,11 +3192,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			"pnl", fmt.Sprintf("%.2f", realized.PnL),
 			"pnl_pct", fmt.Sprintf("%.2f%%", realized.PnLPct),
 		)
-		e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
-			TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
-			EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
-			PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: exitReason,
-		})
+		e.publishTradeClosed(realized)
 
 		// Residue check: after the exit settles, the broker must hold no more
 		// of this ticker than the DB still tracks. This is how the NOK orphan
