@@ -203,6 +203,7 @@ Modes:
 		// Requires a live DB connection — the manager reads open trades and
 		// persists HWM/stop updates. If store.Connect() failed earlier we
 		// skip startup so the LiveStore adapter never panics in production.
+		var trailingMgr *trailing.Manager
 		if cfg.Risk.TrailingStop.Enabled && marketProvider != nil && broker != nil {
 			if !store.IsConnected() {
 				logger.Warn("trailing-stop manager requested but DB not connected; skipping startup")
@@ -219,11 +220,7 @@ Modes:
 						eng.Bus().Publish(events.TradeClosed, payload)
 					},
 				}
-				mgr := trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
-				// Only advertise the uncapped-exit capability after every
-				// dependency check above has passed and the worker is ready to run.
-				eng.SetTrailingManagerAvailable(true)
-				go mgr.Run(ctx)
+				trailingMgr = trailing.NewManager(tsCfg, trailing.LiveStore(), marketProvider, broker)
 			}
 		}
 
@@ -262,6 +259,13 @@ Modes:
 					logger.Warn("telegram: failed to send startup notification", "err", err)
 				}
 			}
+		}
+
+		if trailingMgr != nil {
+			// Manager.Run evaluates exits immediately. Start it only after event
+			// subscribers are registered so a boot-tick close cannot be lost.
+			eng.SetTrailingManagerAvailable(true)
+			go trailingMgr.Run(ctx)
 		}
 
 		sigs := make(chan os.Signal, 1)

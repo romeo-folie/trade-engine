@@ -115,13 +115,14 @@ func (liveStore) UpdateOrderStopReplacement(
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
+	intent store.ExitIntent,
 ) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected
 	}
 	return store.UpdateOrderStopReplacement(
 		ctx, orderID, newBrokerOrderID, newStopPrice, newQuantity,
-		status, filledPrice, filledQty, filledAt,
+		status, filledPrice, filledQty, filledAt, intent,
 	)
 }
 

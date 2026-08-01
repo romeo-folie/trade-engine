@@ -23,20 +23,21 @@ type PositionDivergence struct {
 	Ticker    string
 	BrokerQty float64
 	DBQty     float64
-	Kind      string // broker_only | db_only | qty_mismatch | side_mismatch
+	Kind      string // broker_only | db_only | qty_mismatch | side_mismatch | exit_pending
 }
 
 // BrokerReconResult is the outcome of comparing live broker positions against
 // the DB open-trade book. Available is false when no broker is configured or
 // the live call failed (Err then explains why).
 type BrokerReconResult struct {
-	Available   bool
-	CheckedAt   time.Time
-	Err         string
-	InSync      bool
-	Divergences []PositionDivergence
-	BrokerCount int
-	DBCount     int
+	Available    bool
+	CheckedAt    time.Time
+	Err          string
+	InSync       bool
+	Divergences  []PositionDivergence
+	PendingExits []PositionDivergence
+	BrokerCount  int
+	DBCount      int
 }
 
 // ReconcilePositions compares broker-reported positions against the DB open
@@ -134,12 +135,18 @@ func ParsePersistedRecon(blob string) BrokerReconResult {
 	if err := json.Unmarshal([]byte(blob), &pr); err != nil {
 		return BrokerReconResult{Err: "invalid persisted reconciliation"}
 	}
-	res := BrokerReconResult{Available: true, CheckedAt: pr.CheckedAt, InSync: len(pr.Drifts) == 0}
+	res := BrokerReconResult{Available: true, CheckedAt: pr.CheckedAt}
 	for _, d := range pr.Drifts {
-		res.Divergences = append(res.Divergences, PositionDivergence{
+		item := PositionDivergence{
 			Ticker: d.Ticker, BrokerQty: d.BrokerQty, DBQty: d.DBQty, Kind: d.Source,
-		})
+		}
+		if d.Source == "exit_pending" {
+			res.PendingExits = append(res.PendingExits, item)
+		} else {
+			res.Divergences = append(res.Divergences, item)
+		}
 	}
+	res.InSync = len(res.Divergences) == 0 && len(res.PendingExits) == 0
 	return res
 }
 
@@ -153,12 +160,30 @@ func renderBrokerReconLine(r BrokerReconResult) string {
 		}
 		return ""
 	}
-	if r.InSync {
+	if len(r.Divergences) == 0 && len(r.PendingExits) == 0 {
 		detail := "checked " + brokerReconAge(r.CheckedAt) + " ago"
 		if r.BrokerCount > 0 {
 			detail = fmt.Sprintf("%d positions, %s", r.BrokerCount, detail)
 		}
 		return greenText.Render("  ✓ broker in sync") + dimText.Render("  ("+detail+")")
+	}
+
+	if len(r.Divergences) == 0 {
+		parts := make([]string, 0, len(r.PendingExits))
+		for _, pending := range r.PendingExits {
+			parts = append(parts, pending.Ticker)
+		}
+		shown, extra := parts, 0
+		if len(shown) > 4 {
+			extra, shown = len(shown)-4, shown[:4]
+		}
+		line := scrollHintStyle.Render(fmt.Sprintf("  ↻ broker exits finalizing (%d):", len(parts))) +
+			" " + strings.Join(shown, dimText.Render(" · "))
+		if extra > 0 {
+			line += dimText.Render(fmt.Sprintf(" +%d more", extra))
+		}
+		line += dimText.Render("  (checked " + brokerReconAge(r.CheckedAt) + " ago)")
+		return line
 	}
 
 	parts := make([]string, 0, len(r.Divergences))
@@ -175,6 +200,9 @@ func renderBrokerReconLine(r BrokerReconResult) string {
 		" " + strings.Join(shown, dimText.Render(" · "))
 	if extra > 0 {
 		line += dimText.Render(fmt.Sprintf(" +%d more", extra))
+	}
+	if len(r.PendingExits) > 0 {
+		line += dimText.Render(fmt.Sprintf(" · %d exit finalizing", len(r.PendingExits)))
 	}
 	return line
 }

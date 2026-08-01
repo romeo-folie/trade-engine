@@ -68,6 +68,9 @@ func (p *PaperExecutor) PlaceOrder(_ context.Context, req OrderRequest) (OrderRe
 
 	// Market and limit orders fill immediately.
 	fillPrice := req.LimitPrice
+	if req.Type == OrderTypeMarket {
+		fillPrice = req.ReferencePrice
+	}
 	if fillPrice == 0 {
 		fillPrice = req.StopPrice
 	}

@@ -17,6 +17,11 @@ import (
 // so a backlog larger than the cap drains across consecutive runs.
 const DefaultExitReconcileBatch = 100
 
+// StartupExitReconcileBatch is deliberately much larger than the periodic
+// sweep. Startup must resolve the durable backlog before broker drift/adoption
+// runs; the ordinary cap could leave trade 101 hidden behind older rows.
+const StartupExitReconcileBatch = 10_000
+
 // ExitReconcileInterval is independent of market-data ticks so an exit can be
 // finalized and announced even when the market loop is idle or blocked.
 const ExitReconcileInterval = 10 * time.Minute
@@ -711,10 +716,14 @@ func ReconcileExitOrderFillsWithStoreAndLoss(
 }
 
 func (e *Engine) runExitReconcileSweep(ctx context.Context) ExitReconcileStats {
+	return e.runExitReconcileSweepLimit(ctx, DefaultExitReconcileBatch)
+}
+
+func (e *Engine) runExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
 	sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	stats := ReconcileExitOrderFillsWithStoreAndLoss(
-		sweepCtx, e.executor, DefaultExitReconcileBatch, e.portfolio.RecordLoss,
+		sweepCtx, e.executor, limit, e.portfolio.RecordLoss,
 	)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
@@ -735,7 +744,7 @@ func (e *Engine) ReconcileExitsNow(ctx context.Context) {
 	if e.exitStartupPrepared {
 		return
 	}
-	stats := e.runExitReconcileSweep(ctx)
+	stats := e.runExitReconcileSweepLimit(ctx, StartupExitReconcileBatch)
 	e.exitStartupPrepared = stats.Errors == 0
 }
 

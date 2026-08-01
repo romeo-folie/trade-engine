@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -299,17 +300,28 @@ func (e *Engine) bookBracketClose(
 	filledAt time.Time,
 	leg store.Order,
 ) bool {
-	reasonCode := store.ExitReasonStopLoss
+	reasonCode := leg.ExitReason
+	evidence := make(map[string]any)
+	if len(leg.ExitEvidence) > 0 {
+		_ = json.Unmarshal(leg.ExitEvidence, &evidence)
+	}
+	if evidence == nil {
+		evidence = make(map[string]any)
+	}
 	trigger := leg.StopPrice
+	if reasonCode == "" {
+		reasonCode = store.ExitReasonStopLoss
+		if leg.IsTakeProfit {
+			reasonCode = store.ExitReasonTakeProfit
+		}
+	}
 	if leg.IsTakeProfit {
-		reasonCode = store.ExitReasonTakeProfit
 		trigger = leg.LimitPrice
 	}
-	intent := newExitIntent(reasonCode, map[string]any{
-		"broker_order_id": leg.BrokerOrderID,
-		"trigger_price":   trigger,
-		"order_type":      leg.OrderType,
-	})
+	evidence["broker_order_id"] = leg.BrokerOrderID
+	evidence["trigger_price"] = trigger
+	evidence["order_type"] = leg.OrderType
+	intent := newExitIntent(reasonCode, evidence)
 	realized, err := store.CloseTradeRealizedWithIntent(ctx, t.ID, exitPrice, filledAt, intent)
 	if err != nil {
 		logger.Warn("bracket exits: close trade", "trade_id", t.ID, "err", err)

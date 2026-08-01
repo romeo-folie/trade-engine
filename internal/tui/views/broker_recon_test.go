@@ -110,4 +110,20 @@ func TestRenderBrokerReconLine(t *testing.T) {
 	if !strings.Contains(div, "divergence") || !strings.Contains(div, "NVDA") {
 		t.Errorf("expected divergence line, got %q", div)
 	}
+	// A persisted exit claim is transitional, not a red broker divergence.
+	pending := renderBrokerReconLine(BrokerReconResult{
+		Available:    true,
+		PendingExits: []PositionDivergence{{Ticker: "PSN", Kind: "exit_pending"}, {Ticker: "MPLT", Kind: "exit_pending"}},
+	})
+	if !strings.Contains(pending, "exits finalizing") || !strings.Contains(pending, "PSN") || strings.Contains(pending, "divergence") {
+		t.Errorf("expected pending-exit line, got %q", pending)
+	}
+	mixed := renderBrokerReconLine(BrokerReconResult{
+		Available:    true,
+		Divergences:  []PositionDivergence{{Ticker: "NVDA", Kind: "broker_only", BrokerQty: 2}},
+		PendingExits: []PositionDivergence{{Ticker: "PSN", Kind: "exit_pending"}},
+	})
+	if !strings.Contains(mixed, "divergence") || !strings.Contains(mixed, "exit finalizing") {
+		t.Errorf("expected mixed red divergence with pending count, got %q", mixed)
+	}
 }

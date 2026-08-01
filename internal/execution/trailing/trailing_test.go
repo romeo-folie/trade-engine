@@ -2,6 +2,7 @@ package trailing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"sort"
@@ -341,6 +342,7 @@ func (f *fakeStore) UpdateOrderStopReplacement(
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
+	intent store.ExitIntent,
 ) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -357,6 +359,7 @@ func (f *fakeStore) UpdateOrderStopReplacement(
 	o.FilledPrice = filledPrice
 	o.FilledQty = filledQty
 	o.FilledAt = timePtr(filledAt)
+	o.ExitReason, o.ExitEvidence = intent.Reason, intent.Evidence
 	if newBrokerOrderID != "" {
 		o.BrokerOrderID = newBrokerOrderID
 	}
@@ -799,6 +802,9 @@ func TestManager_EMA9CloseBelowExitsWithoutIntradayStopRewrite(t *testing.T) {
 	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
 		t.Fatalf("placed = %+v, want one market exit after cancelling hard stop", fb.placed)
 	}
+	if fb.placed[0].ReferencePrice != 90 {
+		t.Fatalf("EMA market reference price = %v, want close 90", fb.placed[0].ReferencePrice)
+	}
 	if got := fs.trades["t1"].ExitPrice; got != 90 {
 		t.Fatalf("fallback exit price = %v, want triggering daily close 90", got)
 	}
@@ -937,12 +943,31 @@ func TestExitAndCloseRetainsClaimAfterAmbiguousPlacementError(t *testing.T) {
 	fb := &fakeBroker{placeErr: errors.New("response decode timed out")}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
 
-	err := m.exitAndClose(context.Background(), trade, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
+	err := m.exitAndClose(context.Background(), trade, 90, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
 	if err == nil {
 		t.Fatal("ambiguous placement unexpectedly succeeded")
 	}
 	if got := fs.trades[trade.ID].Status; got != "exiting" {
 		t.Fatalf("trade status = %q, want exiting for broker recovery", got)
+	}
+}
+
+func TestExitAndClosePaperExecutorUsesReferencePrice(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "paper-exit", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 10,
+	}
+	fs.trades[trade.ID] = trade
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, execution.NewPaperExecutor())
+
+	intent := store.ExitIntent{Reason: store.ExitReasonTrailingATR}
+	if err := m.exitAndClose(context.Background(), trade, 90, intent, true); err != nil {
+		t.Fatalf("paper market exit: %v", err)
+	}
+	got := fs.trades[trade.ID]
+	if got.Status != "closed" || got.ExitPrice != 90 {
+		t.Fatalf("trade = status %q exit %.2f, want closed at 90", got.Status, got.ExitPrice)
 	}
 }
 
@@ -965,7 +990,7 @@ func TestExitAndCloseRetainsClaimWhenCancelledLegFlattensTrade(t *testing.T) {
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
 
-	err := m.exitAndClose(context.Background(), trade, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
+	err := m.exitAndClose(context.Background(), trade, 90, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
 	if !errors.Is(err, errExitClaimMustRemain) {
 		t.Fatalf("error = %v, want claim-retention sentinel", err)
 	}
@@ -998,7 +1023,7 @@ func TestExitAndCloseRetainsClaimWhenLegReportsFilledDuringCancel(t *testing.T) 
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
 
-	err := m.exitAndClose(context.Background(), trade, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
+	err := m.exitAndClose(context.Background(), trade, 90, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true)
 	if !errors.Is(err, errExitClaimMustRemain) {
 		t.Fatalf("error = %v, want claim-retention sentinel", err)
 	}
@@ -1280,6 +1305,15 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 		if o.TradeID == "t1" && o.BrokerOrderID == "broker-pre" {
 			t.Fatalf("orders row not repointed to new broker id: %+v", o)
 		}
+		if o.TradeID == "t1" {
+			if o.ExitReason != store.ExitReasonTrailingATR {
+				t.Fatalf("replacement exit reason = %q, want trailing_atr", o.ExitReason)
+			}
+			var evidence map[string]any
+			if err := json.Unmarshal(o.ExitEvidence, &evidence); err != nil || evidence["trailing_stop"] == nil {
+				t.Fatalf("replacement evidence = %s, err=%v", o.ExitEvidence, err)
+			}
+		}
 	}
 }
 
@@ -1464,6 +1498,9 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	if fb.placed[0].Side != execution.OrderSideSell {
 		t.Fatalf("expected SELL side for long exit, got %v", fb.placed[0].Side)
 	}
+	if fb.placed[0].ReferencePrice != 110 {
+		t.Fatalf("ATR market reference price = %v, want current price 110", fb.placed[0].ReferencePrice)
+	}
 	if len(fb.cancelled) == 0 {
 		t.Fatalf("expected stale stop to be cancelled before market exit")
 	}
@@ -1637,7 +1674,7 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	if _, err := ls.InsertOrder(ctx, store.Order{}); err == nil {
 		t.Fatalf("InsertOrder(no DB): want error, got nil")
 	}
-	if err := ls.UpdateOrderStopReplacement(ctx, "o1", "broker-x", 1.0, 1.0, "pending", 0, 0, time.Time{}); err == nil {
+	if err := ls.UpdateOrderStopReplacement(ctx, "o1", "broker-x", 1.0, 1.0, "pending", 0, 0, time.Time{}, store.ExitIntent{}); err == nil {
 		t.Fatalf("UpdateOrderStopReplacement(no DB): want error, got nil")
 	}
 	if _, err := ls.CloseTradeRealizedWithIntent(ctx, "t1", 100, time.Time{}, store.ExitIntent{}); err == nil {
@@ -2052,7 +2089,7 @@ func TestRollbackUnrecordedStopPersistsBrokerFillTruth(t *testing.T) {
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
 
-	err := m.rollbackUnrecordedStop(context.Background(), fs.trades["t1"], 95, "broker-rollback")
+	err := m.rollbackUnrecordedStop(context.Background(), fs.trades["t1"], 95, "broker-rollback", stopExitIntent(95))
 	if !errors.Is(err, errStopFilledDuringRollback) {
 		t.Fatalf("rollback error = %v, want fill sentinel", err)
 	}
@@ -2086,7 +2123,7 @@ func TestReplaceStopImmediateFillPersistsBrokerTruth(t *testing.T) {
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fakeBrokerWithReplace{fakeBroker: base})
 
-	err := m.submitOrReplaceStop(context.Background(), trade, 97)
+	err := m.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97))
 	if !errors.Is(err, errStopFilledDuringRollback) {
 		t.Fatalf("replacement error = %v, want fill sentinel", err)
 	}
@@ -2122,7 +2159,7 @@ func TestReplaceStopFillClaimsBeforeReplacementPersistence(t *testing.T) {
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fakeBrokerWithReplace{fakeBroker: base})
 
-	if err := m.submitOrReplaceStop(context.Background(), trade, 97); err == nil {
+	if err := m.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97)); err == nil {
 		t.Fatal("replacement persistence failure returned nil")
 	}
 	if fs.trades[trade.ID].Status != "exiting" {

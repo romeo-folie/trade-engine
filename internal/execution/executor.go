@@ -56,7 +56,10 @@ type OrderRequest struct {
 	Quantity   float64
 	LimitPrice float64 // 0 for market orders
 	StopPrice  float64 // for stop orders
-	TradeID    string  // internal trade UUID for linkage
+	// ReferencePrice supplies an observed price for local/paper valuation of a
+	// market order. Live broker adapters deliberately never serialize it.
+	ReferencePrice float64
+	TradeID        string // internal trade UUID for linkage
 
 	// Bracket order fields (Phase 15 ORB). When OrderClass is "bracket",
 	// the broker submits a parent + take-profit + stop-loss as one atomic order.

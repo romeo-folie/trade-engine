@@ -104,11 +104,11 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	totalQty = remainingQty
 
 	result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
-		Ticker:     sig.Ticker,
-		Side:       execution.OrderSideSell,
-		Type:       execution.OrderTypeMarket,
-		Quantity:   totalQty,
-		LimitPrice: sig.SignalPrice, // paper executor fills at this price
+		Ticker:         sig.Ticker,
+		Side:           execution.OrderSideSell,
+		Type:           execution.OrderTypeMarket,
+		Quantity:       totalQty,
+		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
 	})
 	if err != nil {
 		// Broker POST/response failures are ambiguous: the order may have

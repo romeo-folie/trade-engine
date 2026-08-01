@@ -2437,11 +2437,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 
 	orderReq := execution.OrderRequest{
-		Ticker:     sig.Ticker,
-		Side:       side,
-		Type:       execution.OrderTypeMarket,
-		Quantity:   qty,
-		LimitPrice: sig.SignalPrice, // paper executor fills at this price
+		Ticker:         sig.Ticker,
+		Side:           side,
+		Type:           execution.OrderTypeMarket,
+		Quantity:       qty,
+		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
 	}
 
 	// The uncapped exit policy is active only with the trailing manager: this
@@ -2590,6 +2590,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					OrderType: string(execution.OrderTypeLimit), Quantity: orderReq.Quantity,
 					LimitPrice: sig.TakeProfit, Status: "pending",
 					IsTakeProfit: true, ParentOrderID: result.BrokerOrderID,
+					ExitReason:   store.ExitReasonTakeProfit,
+					ExitEvidence: newExitIntent(store.ExitReasonTakeProfit, map[string]any{"take_profit": sig.TakeProfit}).Evidence,
 				},
 				{
 					TradeID: tradeID, BrokerOrderID: result.ChildOrderIDs[1],
@@ -2597,6 +2599,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					OrderType: string(execution.OrderTypeStop), Quantity: orderReq.Quantity,
 					StopPrice: sig.StopLoss, Status: "pending",
 					IsStopLoss: true, ParentOrderID: result.BrokerOrderID,
+					ExitReason:   store.ExitReasonStopLoss,
+					ExitEvidence: newExitIntent(store.ExitReasonStopLoss, map[string]any{"stop_loss": sig.StopLoss}).Evidence,
 				},
 			}
 			for _, leg := range legRows {
@@ -3118,12 +3122,12 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			exitSide = execution.OrderSideBuy
 		}
 		result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
-			Ticker:     t.Ticker,
-			Side:       exitSide,
-			Type:       execution.OrderTypeMarket,
-			Quantity:   t.Quantity,
-			LimitPrice: currentPrice,
-			TradeID:    t.ID,
+			Ticker:         t.Ticker,
+			Side:           exitSide,
+			Type:           execution.OrderTypeMarket,
+			Quantity:       t.Quantity,
+			ReferencePrice: currentPrice,
+			TradeID:        t.ID,
 		})
 		if err != nil {
 			// A POST can fail after broker acceptance. Retain ownership and

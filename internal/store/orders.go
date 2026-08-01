@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"time"
@@ -23,6 +24,8 @@ type Order struct {
 	Status        string // pending | filled | partial | cancelled
 	IsStopLoss    bool
 	IsTakeProfit  bool
+	ExitReason    string
+	ExitEvidence  json.RawMessage
 	// ParentOrderID is the broker order id of the bracket PARENT when this
 	// row is an OCO-linked child exit leg (migration 044). Non-empty means:
 	// PATCH-replace only (cancel+resubmit orphans the sibling leg), and both
@@ -45,8 +48,8 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 			trade_id, broker_order_id, ticker, side, order_type,
 			quantity, limit_price, stop_price, status,
 			is_stop_loss, is_take_profit, filled_price, filled_qty,
-			parent_order_id, filled_at
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			parent_order_id, filled_at, exit_reason, exit_evidence
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
 		RETURNING id`,
 		nullableString(o.TradeID), nullableString(o.BrokerOrderID),
 		o.Ticker, o.Side, o.OrderType,
@@ -54,6 +57,7 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 		o.Status, o.IsStopLoss, o.IsTakeProfit,
 		nullableFloat(o.FilledPrice), nullableFloat(o.FilledQty),
 		nullableString(o.ParentOrderID), nullableTimePtr(o.FilledAt),
+		nullableString(o.ExitReason), nullableRawJSON(o.ExitEvidence),
 	).Scan(&id)
 	return id, err
 }
@@ -235,6 +239,7 @@ func GetOrdersByTrade(ctx context.Context, tradeID string) ([]Order, error) {
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
 		       COALESCE(parent_order_id,''), filled_at,
+		       COALESCE(exit_reason,''), exit_evidence,
 		       created_at, updated_at
 		FROM orders WHERE trade_id=$1 ORDER BY created_at ASC`, tradeID)
 	if err != nil {
@@ -259,6 +264,7 @@ func scanOrders(rows interface {
 			&o.FilledPrice, &o.FilledQty,
 			&o.Status, &o.IsStopLoss, &o.IsTakeProfit,
 			&o.ParentOrderID, &o.FilledAt,
+			&o.ExitReason, &o.ExitEvidence,
 			&o.CreatedAt, &o.UpdatedAt,
 		); err != nil {
 			return nil, err
@@ -281,6 +287,7 @@ func OpenExitLegsForTrade(ctx context.Context, tradeID string) ([]Order, error) 
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
 		       COALESCE(parent_order_id,''), filled_at,
+		       COALESCE(exit_reason,''), exit_evidence,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1
@@ -308,6 +315,7 @@ func ExitLegsForMarketExit(ctx context.Context, tradeID string) ([]Order, error)
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
 		       COALESCE(parent_order_id,''), filled_at,
+		       COALESCE(exit_reason,''), exit_evidence,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1

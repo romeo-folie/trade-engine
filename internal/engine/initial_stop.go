@@ -96,6 +96,8 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		FilledQty:     fillQty,
 		Status:        status,
 		IsStopLoss:    true,
+		ExitReason:    stopIntent.Reason,
+		ExitEvidence:  stopIntent.Evidence,
 		FilledAt:      filledAtPtr(res.FilledAt),
 	}); err != nil {
 		rollbackRes, rollbackErr :=
@@ -115,7 +117,8 @@ func (e *Engine) ensureUncappedProtectiveStop(
 				OrderType: string(execution.OrderTypeStop), Quantity: quantity,
 				StopPrice: stopPrice, Status: rollbackStatus, IsStopLoss: true,
 				FilledPrice: rollbackRes.FilledPrice, FilledQty: rollbackRes.FilledQty,
-				FilledAt: filledAtPtr(rollbackRes.FilledAt),
+				FilledAt:   filledAtPtr(rollbackRes.FilledAt),
+				ExitReason: stopIntent.Reason, ExitEvidence: stopIntent.Evidence,
 			}); persistErr != nil {
 				return fmt.Errorf("record protective stop: %w; rollback fill also unpersisted: %v", err, persistErr)
 			}

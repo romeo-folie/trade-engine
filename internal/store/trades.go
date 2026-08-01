@@ -354,6 +354,7 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
 		       COALESCE(parent_order_id,''), filled_at,
+		       COALESCE(exit_reason,''), exit_evidence,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1
@@ -384,6 +385,7 @@ func UpdateOrderStopReplacement(
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
+	intent ExitIntent,
 ) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE orders
@@ -395,10 +397,13 @@ func UpdateOrderStopReplacement(
 		    filled_qty = $6::NUMERIC,
 		    exit_fill_applied_qty = 0,
 		    filled_at = $7::timestamptz,
+		    exit_reason = NULLIF($8, ''),
+		    exit_evidence = $9::jsonb,
 		    updated_at = NOW()
-		WHERE id = $8`,
+		WHERE id = $10`,
 		newStopPrice, newBrokerOrderID, newQuantity, status,
-		filledPrice, filledQty, nullableTime(filledAt), orderID)
+		filledPrice, filledQty, nullableTime(filledAt), intent.Reason,
+		nullableRawJSON(intent.Evidence), orderID)
 	return err
 }
 
