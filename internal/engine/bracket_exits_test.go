@@ -357,6 +357,9 @@ func TestReconcileBracket_RatchetedStopRetainsTrailingATRReason(t *testing.T) {
 	if err := store.UpdateOrderFillAt(ctx, stopLeg.ID, 96, 1, "partial", staleFillAt); err != nil {
 		t.Fatalf("seed stale replacement state: %v", err)
 	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET exit_fill_applied_qty=1 WHERE id=$1`, stopLeg.ID); err != nil {
+		t.Fatalf("seed stale applied quantity: %v", err)
+	}
 	ratchetedID := slID + "-ratcheted"
 	if err := store.UpdateOrderStopReplacement(ctx, stopLeg.ID, ratchetedID, 97.5, 3, "pending", 0, 0, time.Time{}, intent); err != nil {
 		t.Fatalf("tag ratcheted stop: %v", err)
@@ -373,6 +376,10 @@ func TestReconcileBracket_RatchetedStopRetainsTrailingATRReason(t *testing.T) {
 				t.Fatalf("durable ratcheted stop = %+v", leg)
 			}
 		}
+	}
+	var appliedQty float64
+	if err := store.GetDB().QueryRow(ctx, `SELECT exit_fill_applied_qty FROM orders WHERE id=$1`, stopLeg.ID).Scan(&appliedQty); err != nil || appliedQty != 0 {
+		t.Fatalf("replacement applied quantity = %v, err=%v; want reset to zero", appliedQty, err)
 	}
 	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
 		tpID:        {Status: "canceled"},

@@ -17,9 +17,10 @@ import (
 // so a backlog larger than the cap drains across consecutive runs.
 const DefaultExitReconcileBatch = 100
 
-// StartupExitReconcileBatch is deliberately much larger than the periodic
-// sweep. Startup must resolve the durable backlog before broker drift/adoption
-// runs; the ordinary cap could leave trade 101 hidden behind older rows.
+// StartupExitReconcileBatch is a bounded best-effort startup batch, deliberately
+// much larger than the periodic sweep. It prevents ordinary backlogs from
+// leaving trade 101 hidden before drift/adoption without making startup issue
+// unbounded broker calls; the periodic reconciler owns any remainder.
 const StartupExitReconcileBatch = 10_000
 
 // ExitReconcileInterval is independent of market-data ticks so an exit can be
@@ -731,10 +732,11 @@ func (e *Engine) runExitReconcileSweepLimit(ctx context.Context, limit int) Exit
 	return stats
 }
 
-// ReconcileExitsNow performs the engine's required startup sweep. The command
+// ReconcileExitsNow performs a bounded best-effort startup sweep. The command
 // invokes it before broker-drift alerting; Engine.Run invokes it as a safety
 // net for other callers before their first trading tick. Successful sweeps are
-// idempotent, while transient failures remain retryable by the safety call.
+// idempotent, while transient failures remain retryable by the safety call and
+// any backlog beyond the startup cap remains owned by the periodic reconciler.
 func (e *Engine) ReconcileExitsNow(ctx context.Context) {
 	if !store.IsConnected() {
 		return

@@ -186,6 +186,7 @@ func TestPlaceOrder_DefaultTIFAndNoLegs(t *testing.T) {
 	broker := &AlpacaBroker{apiKey: "k", secret: "s", baseURL: ts.URL, httpClient: ts.Client()}
 	res, err := broker.PlaceOrder(context.Background(), OrderRequest{
 		Ticker: "SPY", Side: OrderSideBuy, Type: OrderTypeMarket, Quantity: 1,
+		ReferencePrice: 500,
 	})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -195,6 +196,9 @@ func TestPlaceOrder_DefaultTIFAndNoLegs(t *testing.T) {
 	}
 	if _, ok := gotBody["order_class"]; ok {
 		t.Error("order_class must be absent on simple orders")
+	}
+	if _, ok := gotBody["limit_price"]; ok {
+		t.Error("paper-only ReferencePrice must not become an Alpaca limit_price")
 	}
 	if len(res.ChildOrderIDs) != 0 {
 		t.Errorf("ChildOrderIDs = %v, want empty", res.ChildOrderIDs)

@@ -422,11 +422,17 @@ func TestIBKRBracketLegVerifyParentResolvedChildrenNot(t *testing.T) {
 
 func TestIBKROrderConfirmation(t *testing.T) {
 	confirmCalled := false
+	var orderBody struct {
+		Orders []map[string]any `json:"orders"`
+	}
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/v1/api/iserver/account/U123456/orders":
+			if err := json.NewDecoder(r.Body).Decode(&orderBody); err != nil {
+				t.Errorf("decode order body: %v", err)
+			}
 			// First response: confirmation prompt (no order_id, has id).
 			w.Write([]byte(`[{"id":"REPLY-99","message":["Order requires confirmation"]}]`))
 
@@ -452,17 +458,24 @@ func TestIBKROrderConfirmation(t *testing.T) {
 
 	b := newTestIBKRBroker(srv.URL)
 	result, err := b.PlaceOrder(t.Context(), OrderRequest{
-		Ticker:   "EUR/USD",
-		Side:     OrderSideBuy,
-		Type:     OrderTypeMarket,
-		Quantity: 100000,
-		TradeID:  "trade-confirm",
+		Ticker:         "EUR/USD",
+		Side:           OrderSideBuy,
+		Type:           OrderTypeMarket,
+		Quantity:       100000,
+		TradeID:        "trade-confirm",
+		ReferencePrice: 1.10,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder (confirmation) error: %v", err)
 	}
 	if !confirmCalled {
 		t.Error("expected confirmation reply to be called, but it was not")
+	}
+	if len(orderBody.Orders) != 1 {
+		t.Fatalf("order body = %+v", orderBody)
+	}
+	if _, ok := orderBody.Orders[0]["price"]; ok {
+		t.Error("paper-only ReferencePrice must not become an IBKR market price")
 	}
 	if result.BrokerOrderID != "ORD003" {
 		t.Errorf("BrokerOrderID = %q; want ORD003", result.BrokerOrderID)
