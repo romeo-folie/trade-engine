@@ -99,6 +99,7 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		Status      string `json:"status"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
+		FilledAt    string `json:"filled_at"`
 		Legs        []struct {
 			ID   string `json:"id"`
 			Type string `json:"type"` // "limit" (take-profit) | "stop" (stop-loss)
@@ -123,6 +124,7 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
 	}
+	result.FilledAt, _ = time.Parse(time.RFC3339, resp.FilledAt)
 	// Bracket child legs, ordered [take-profit, stop-loss] per the
 	// ChildOrderIDs contract. Identified by leg type, not array position —
 	// Alpaca does not document leg ordering.
@@ -208,6 +210,7 @@ func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID strin
 		Status      string `json:"status"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
+		FilledAt    string `json:"filled_at"`
 	}
 	if err := b.do(ctx, http.MethodPatch, "/v2/orders/"+brokerOrderID, body, &resp); err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: %w", err)
@@ -220,11 +223,13 @@ func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID strin
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: parse filled_qty %q: %w", resp.FilledQty, err)
 	}
+	filledAt, _ := time.Parse(time.RFC3339, resp.FilledAt)
 	return OrderResult{
 		BrokerOrderID: resp.ID,
 		Status:        resp.Status,
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
+		FilledAt:      filledAt,
 	}, nil
 }
 
@@ -241,6 +246,7 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		Status      string `json:"status"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
+		FilledAt    string `json:"filled_at"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/orders/"+brokerOrderID, nil, &resp); err != nil {
 		// `do` formats 4xx responses as "alpaca METHOD path → CODE: body"
@@ -261,12 +267,14 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse filled_qty %q: %w", resp.FilledQty, err)
 	}
+	filledAt, _ := time.Parse(time.RFC3339, resp.FilledAt)
 
 	return OrderResult{
 		BrokerOrderID: resp.ID,
 		Status:        resp.Status,
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
+		FilledAt:      filledAt,
 	}, nil
 }
 

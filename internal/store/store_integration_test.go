@@ -764,12 +764,14 @@ func TestOrder_InsertAndUpdate(t *testing.T) {
 	}
 
 	orderID, err := store.InsertOrder(ctx, store.Order{
-		TradeID:   tradeID,
-		Ticker:    "TEST_ORD_NVDA",
-		Side:      "buy",
-		OrderType: "market",
-		Quantity:  5.0,
-		Status:    "pending",
+		TradeID:      tradeID,
+		Ticker:       "TEST_ORD_NVDA",
+		Side:         "buy",
+		OrderType:    "market",
+		Quantity:     5.0,
+		Status:       "pending",
+		ExitReason:   store.ExitReasonTrailingATR,
+		ExitEvidence: json.RawMessage(`{"trailing_stop":790}`),
 	})
 	if err != nil {
 		t.Fatalf("InsertOrder: %v", err)
@@ -786,6 +788,10 @@ func TestOrder_InsertAndUpdate(t *testing.T) {
 	for _, o := range orders {
 		if o.ID == orderID {
 			found = true
+			var evidence map[string]any
+			if err := json.Unmarshal(o.ExitEvidence, &evidence); err != nil || o.ExitReason != store.ExitReasonTrailingATR || evidence["trailing_stop"] != 790.0 {
+				t.Errorf("order exit provenance = %q %s", o.ExitReason, o.ExitEvidence)
+			}
 			break
 		}
 	}

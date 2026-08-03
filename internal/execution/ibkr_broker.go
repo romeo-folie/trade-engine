@@ -308,18 +308,26 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: %w", err)
 	}
 
+	var liveFilled *OrderResult
 	for _, o := range resp.Orders {
 		if o.OrderID.String() == brokerOrderID {
 			var fillPrice float64
 			if o.AvgPrice != "" {
 				fmt.Sscanf(o.AvgPrice, "%f", &fillPrice)
 			}
-			return OrderResult{
+			result := OrderResult{
 				BrokerOrderID: o.OrderID.String(),
 				Status:        NormalizeIBKROrderStatus(o.Status),
 				FilledPrice:   fillPrice,
 				FilledQty:     o.FilledQty,
-			}, nil
+			}
+			if result.Status != "filled" {
+				return result, nil
+			}
+			// Live-order payloads omit execution time. Keep the result as a
+			// fallback, then enrich it from the executions endpoint below.
+			liveFilled = &result
+			break
 		}
 	}
 
@@ -332,17 +340,32 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 		Status    string    `json:"status"`
 		Price     ibkrFloat `json:"price"`
 		FilledQty ibkrFloat `json:"size"`
+		TradeTime string    `json:"trade_time"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v1/api/iserver/account/trades?days=7", nil, &trades); err != nil {
+		if liveFilled != nil {
+			return *liveFilled, nil
+		}
 		return OrderResult{}, fmt.Errorf("ibkr GetOrderStatus: order %q not found in live orders, and trades lookup failed: %w", brokerOrderID, err)
 	}
 	var filledQty, fillNotional float64
+	var filledAt time.Time
 	for _, t := range trades {
 		if fmt.Sprintf("%d", t.OrderID) == brokerOrderID {
 			qty := float64(t.FilledQty)
 			filledQty += qty
 			fillNotional += float64(t.Price) * qty
+			if parsed, err := time.ParseInLocation("20060102-15:04:05", t.TradeTime, time.UTC); err == nil && parsed.After(filledAt) {
+				filledAt = parsed
+			}
 		}
+	}
+	if liveFilled != nil {
+		// The live-order snapshot is authoritative for final quantity and
+		// average price. Execution history can lag that snapshot, so use it
+		// only to supply the otherwise-missing broker execution timestamp.
+		liveFilled.FilledAt = filledAt
+		return *liveFilled, nil
 	}
 	if filledQty > 0 {
 		return OrderResult{
@@ -350,9 +373,9 @@ func (b *IBKRBroker) GetOrderStatus(ctx context.Context, brokerOrderID string) (
 			Status:        "filled",
 			FilledPrice:   fillNotional / filledQty,
 			FilledQty:     filledQty,
+			FilledAt:      filledAt,
 		}, nil
 	}
-
 	// Wrap ErrOrderNotFound so callers (e.g. trailing-stop's
 	// cancelAndConfirm) can detect the terminal "order purged from broker"
 	// case via errors.Is and treat it as cancelled rather than as an

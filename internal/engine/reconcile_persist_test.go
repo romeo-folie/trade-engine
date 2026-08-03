@@ -95,6 +95,48 @@ func TestRunReconcileLoop_DisabledReturns(t *testing.T) {
 	}
 }
 
+func TestDriftAlertStateDeduplicatesChangesAndRearmsAfterResolution(t *testing.T) {
+	initial := BrokerDrift{Ticker: "PSN", BrokerQty: 0, DBQty: 10, Source: "db_only"}
+	state := newDriftAlertState([]BrokerDrift{initial})
+
+	state, fresh := state.advance([]BrokerDrift{initial})
+	if len(fresh) != 0 {
+		t.Fatalf("unchanged boot drift alerted again: %+v", fresh)
+	}
+	changed := initial
+	changed.DBQty = 9
+	state, fresh = state.advance([]BrokerDrift{changed})
+	if len(fresh) != 1 {
+		t.Fatalf("changed drift alerts = %+v, want one", fresh)
+	}
+	state, fresh = state.advance([]BrokerDrift{{Ticker: "MPLT", DBQty: 5, Source: "exit_pending"}})
+	if len(fresh) != 0 || len(state) != 0 {
+		t.Fatalf("resolved/pending state = %v fresh=%v, want empty/no alert", state, fresh)
+	}
+	_, fresh = state.advance([]BrokerDrift{initial})
+	if len(fresh) != 1 {
+		t.Fatalf("reappearing drift alerts = %+v, want one", fresh)
+	}
+}
+
+func TestDriftAlertStateIgnoresSubToleranceQuantityNoise(t *testing.T) {
+	initial := BrokerDrift{Ticker: "PSN", Source: "mismatch", BrokerQty: 10, DBQty: 12}
+	state := newDriftAlertState([]BrokerDrift{initial})
+
+	next, fresh := state.advance([]BrokerDrift{{
+		Ticker: "PSN", Source: "mismatch", BrokerQty: 10.005, DBQty: 11.995,
+	}})
+	if len(fresh) != 0 {
+		t.Fatalf("sub-tolerance drift noise alerted: %+v", fresh)
+	}
+	_, fresh = next.advance([]BrokerDrift{{
+		Ticker: "PSN", Source: "mismatch", BrokerQty: 10.02, DBQty: 12,
+	}})
+	if len(fresh) != 1 {
+		t.Fatalf("material drift change alerts = %d, want 1", len(fresh))
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

@@ -222,10 +222,31 @@ func (b *TelegramBot) handleTradeClosed(ev events.Event) {
 		pnlEmoji, p.Ticker, strings.ToUpper(p.Direction),
 		p.EntryPrice, p.ExitPrice,
 		p.PnL, p.PnLPct,
-		p.Reason,
+		exitReasonLabel(p.Reason),
 	)
 	if err := b.sendMessage(msg, nil); err != nil {
 		logger.Warn("telegram: send trade closed failed", "error", err)
+	}
+}
+
+func exitReasonLabel(reason string) string {
+	switch reason {
+	case "stop_loss":
+		return "stop-loss hit"
+	case "take_profit":
+		return "take-profit hit"
+	case "sell_signal":
+		return "sell signal"
+	case "trailing_atr":
+		return "ATR trailing stop"
+	case "ema9_close":
+		return "daily close below EMA9"
+	case "broker_recovery":
+		return "broker recovery"
+	case "":
+		return "unknown"
+	default:
+		return reason
 	}
 }
 

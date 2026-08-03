@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
@@ -183,7 +184,6 @@ func TestMonitorSoftwareTakeProfitCancelsStandaloneStopBeforeSell(t *testing.T) 
 		},
 	}
 	e := newBracketTestEngine(exec)
-	e.lastExitReconcile = time.Now()
 	e.monitorPositions(ctx)
 
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != "standalone-stop" {
@@ -262,6 +262,13 @@ func TestReconcileBracket_UncappedStandaloneStopFillClosesTrade(t *testing.T) {
 	if e.portfolio.CurrentState().LastLossAt.IsZero() {
 		t.Fatal("standalone stop loss must record loss cooldown")
 	}
+	closed, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || closed == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if closed.ExitReason != store.ExitReasonStopLoss {
+		t.Fatalf("legacy standalone stop reason = %q, want stop_loss", closed.ExitReason)
+	}
 }
 
 // TestReconcileBracket_WorkingLegsSkipSoftwareExit: pending OCO legs →
@@ -323,6 +330,75 @@ func TestReconcileBracket_StopLegFillClosesTrade(t *testing.T) {
 	}
 	if e.portfolio.CurrentState().LastLossAt.IsZero() {
 		t.Fatal("losing bracket stop-out must record the loss cooldown (RecordLoss)")
+	}
+}
+
+func TestReconcileBracket_RatchetedStopRetainsTrailingATRReason(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "ATRF", 3)
+	legs, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	var stopLeg store.Order
+	for _, leg := range legs {
+		if leg.BrokerOrderID == slID {
+			stopLeg = leg
+			break
+		}
+	}
+	intent := newExitIntent(store.ExitReasonTrailingATR, map[string]any{
+		"trailing_stop": 97.5, "high_water_mark": 105.0, "atr": 5.0, "atr_multiple": 1.5,
+	})
+	staleFillAt := time.Date(2026, 7, 31, 15, 0, 0, 0, time.UTC)
+	if err := store.UpdateOrderFillAt(ctx, stopLeg.ID, 96, 1, "partial", staleFillAt); err != nil {
+		t.Fatalf("seed stale replacement state: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET exit_fill_applied_qty=1 WHERE id=$1`, stopLeg.ID); err != nil {
+		t.Fatalf("seed stale applied quantity: %v", err)
+	}
+	ratchetedID := slID + "-ratcheted"
+	if err := store.UpdateOrderStopReplacement(ctx, stopLeg.ID, ratchetedID, 97.5, 3, "pending", 0, 0, time.Time{}, intent); err != nil {
+		t.Fatalf("tag ratcheted stop: %v", err)
+	}
+	legs, err = store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("reload ratcheted stop: %v", err)
+	}
+	for _, leg := range legs {
+		if leg.ID == stopLeg.ID {
+			if leg.BrokerOrderID != ratchetedID || leg.StopPrice != 97.5 || leg.Quantity != 3 ||
+				leg.Status != "pending" || leg.FilledPrice != 0 || leg.FilledQty != 0 || leg.FilledAt != nil ||
+				leg.ExitReason != store.ExitReasonTrailingATR {
+				t.Fatalf("durable ratcheted stop = %+v", leg)
+			}
+		}
+	}
+	var appliedQty float64
+	if err := store.GetDB().QueryRow(ctx, `SELECT exit_fill_applied_qty FROM orders WHERE id=$1`, stopLeg.ID).Scan(&appliedQty); err != nil || appliedQty != 0 {
+		t.Fatalf("replacement applied quantity = %v, err=%v; want reset to zero", appliedQty, err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		tpID:        {Status: "canceled"},
+		ratchetedID: {Status: "filled", FilledPrice: 97.25, FilledQty: 3},
+	}}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("ratcheted stop fill must be handled")
+	}
+	closed, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || closed == nil {
+		t.Fatalf("GetTradeByID: %v", err)
+	}
+	if closed.ExitReason != store.ExitReasonTrailingATR {
+		t.Fatalf("exit reason = %q, want trailing_atr", closed.ExitReason)
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(closed.ExitEvidence, &evidence); err != nil || evidence["trailing_stop"] != 97.5 || evidence["broker_order_id"] != ratchetedID {
+		t.Fatalf("exit evidence = %s, err=%v", closed.ExitEvidence, err)
 	}
 }
 

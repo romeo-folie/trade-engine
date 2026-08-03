@@ -11,11 +11,11 @@ func TestPaperExecutor_PlaceAndGetStatus(t *testing.T) {
 	ctx := context.Background()
 
 	result, err := pe.PlaceOrder(ctx, OrderRequest{
-		Ticker:     "AAPL",
-		Side:       OrderSideBuy,
-		Type:       OrderTypeMarket,
-		Quantity:   10,
-		LimitPrice: 150.50,
+		Ticker:         "AAPL",
+		Side:           OrderSideBuy,
+		Type:           OrderTypeMarket,
+		Quantity:       10,
+		ReferencePrice: 150.50,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)
@@ -49,7 +49,7 @@ func TestPaperExecutor_Cancel(t *testing.T) {
 
 	result, _ := pe.PlaceOrder(ctx, OrderRequest{
 		Ticker: "TSLA", Side: OrderSideSell, Type: OrderTypeMarket,
-		Quantity: 5, LimitPrice: 200,
+		Quantity: 5, ReferencePrice: 200,
 	})
 	if err := pe.CancelOrder(ctx, result.BrokerOrderID); err != nil {
 		t.Fatalf("CancelOrder: %v", err)
@@ -165,7 +165,7 @@ func TestPaperExecutor_PendingStopOrders(t *testing.T) {
 	// Place a market order (fills immediately) and two stop orders.
 	pe.PlaceOrder(ctx, OrderRequest{
 		Ticker: "AAPL", Side: OrderSideBuy, Type: OrderTypeMarket,
-		Quantity: 10, LimitPrice: 150,
+		Quantity: 10, ReferencePrice: 150,
 	})
 	buyResult, _ := pe.PlaceOrder(ctx, OrderRequest{
 		Ticker: "EUR/USD", Side: OrderSideBuy, Type: OrderTypeStop,
@@ -223,7 +223,7 @@ func TestPaperExecutor_MarketOrderStillFillsImmediately(t *testing.T) {
 
 	result, err := pe.PlaceOrder(ctx, OrderRequest{
 		Ticker: "AAPL", Side: OrderSideBuy, Type: OrderTypeMarket,
-		Quantity: 10, LimitPrice: 150.50,
+		Quantity: 10, ReferencePrice: 150.50,
 	})
 	if err != nil {
 		t.Fatalf("PlaceOrder: %v", err)

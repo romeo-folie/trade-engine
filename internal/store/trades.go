@@ -2,9 +2,27 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"time"
 )
+
+const (
+	ExitReasonStopLoss    = "stop_loss"
+	ExitReasonTakeProfit  = "take_profit"
+	ExitReasonSellSignal  = "sell_signal"
+	ExitReasonTrailingATR = "trailing_atr"
+	ExitReasonEMA9Close   = "ema9_close"
+	ExitReasonRecovery    = "broker_recovery"
+)
+
+// ExitIntent is the durable policy decision that initiated an exit. Evidence
+// is JSON so each policy can preserve its own numerical trigger inputs without
+// growing the trades table for every new rule.
+type ExitIntent struct {
+	Reason   string
+	Evidence json.RawMessage
+}
 
 // Trade mirrors a row from the trades table.
 type Trade struct {
@@ -28,6 +46,10 @@ type Trade struct {
 	OpenedAt           time.Time
 	ClosedAt           time.Time
 	CreatedAt          time.Time
+	ExitClaimedAt      *time.Time
+	ExitReason         string
+	ExitEvidence       json.RawMessage
+	ExitFilledAt       *time.Time
 	// HighWaterMark is the running maximum price observed for an open trade,
 	// used by the trailing-stop manager (#322). 0 when the manager has not
 	// yet observed the trade (column is NULL in DB).
@@ -76,9 +98,18 @@ func CancelUnfilledTrade(ctx context.Context, id string) (bool, error) {
 // observed the trade as open. Only the winner may cancel legs or submit a
 // broker sell; all other exit paths see zero affected rows and stand down.
 func ClaimTradeExit(ctx context.Context, id string) (bool, error) {
+	return ClaimTradeExitWithIntent(ctx, id, ExitIntent{})
+}
+
+// ClaimTradeExitWithIntent atomically transfers exit ownership and persists
+// why it was taken. The intent therefore survives broker latency and process
+// restarts until the exit reconciler finishes the trade.
+func ClaimTradeExitWithIntent(ctx context.Context, id string, intent ExitIntent) (bool, error) {
 	tag, err := GetDB().Exec(ctx, `
-		UPDATE trades SET status='exiting', exit_claimed_at=NOW()
-		WHERE id=$1 AND status='open'`, id)
+		UPDATE trades
+		SET status='exiting', exit_claimed_at=NOW(),
+		    exit_reason=NULLIF($2,''), exit_evidence=$3::jsonb
+		WHERE id=$1 AND status='open'`, id, intent.Reason, nullableRawJSON(intent.Evidence))
 	if err != nil {
 		return false, err
 	}
@@ -87,9 +118,20 @@ func ClaimTradeExit(ctx context.Context, id string) (bool, error) {
 
 func ReleaseTradeExitClaim(ctx context.Context, id string) error {
 	_, err := GetDB().Exec(ctx, `
-		UPDATE trades SET status='open', exit_claimed_at=NULL
+		UPDATE trades
+		SET status='open', exit_claimed_at=NULL,
+		    exit_reason=NULL, exit_evidence=NULL, exit_filled_at=NULL
 		WHERE id=$1 AND status='exiting'`, id)
 	return err
+}
+
+func nullableRawJSON(v json.RawMessage) any {
+	if len(v) == 0 || string(v) == "null" {
+		return nil
+	}
+	// Bind as text: a bare []byte is encoded by pgx as bytea, which cannot be
+	// cast to jsonb. The explicit SQL cast validates this text as JSON.
+	return string(v)
 }
 
 func UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
@@ -102,12 +144,20 @@ func UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64
 // TradeRealization is the cumulative realized result across every exit slice
 // assigned to a trade, including cancellation-race partials.
 type TradeRealization struct {
-	ExitPrice float64
-	PnL       float64
-	PnLPct    float64
-	ExitQty   float64
-	Remaining float64
-	Status    string
+	TradeID      string
+	Ticker       string
+	Direction    string
+	EntryPrice   float64
+	ExitPrice    float64
+	PnL          float64
+	PnLPct       float64
+	ExitQty      float64
+	Remaining    float64
+	Status       string
+	ExitReason   string
+	ExitEvidence json.RawMessage
+	ExitFilledAt *time.Time
+	JustClosed   bool
 }
 
 // CloseTradeRealized adds the trade's currently-held quantity as the final
@@ -117,6 +167,19 @@ func CloseTradeRealized(
 	ctx context.Context,
 	id string,
 	exitPrice float64,
+) (TradeRealization, error) {
+	return CloseTradeRealizedWithIntent(ctx, id, exitPrice, time.Time{}, ExitIntent{})
+}
+
+// CloseTradeRealizedWithIntent closes a synchronously-filled trade while
+// preserving the policy decision and broker execution time. Existing intent
+// from ClaimTradeExitWithIntent wins when callers pass an empty value.
+func CloseTradeRealizedWithIntent(
+	ctx context.Context,
+	id string,
+	exitPrice float64,
+	filledAt time.Time,
+	intent ExitIntent,
 ) (TradeRealization, error) {
 	var result TradeRealization
 	err := GetDB().QueryRow(ctx, `
@@ -154,14 +217,27 @@ func CloseTradeRealized(
 		    quantity = realized_exit_qty + quantity,
 		    status = 'closed',
 		    closed_at = NOW(),
+		    exit_reason = COALESCE(NULLIF($3,''), exit_reason),
+		    exit_evidence = COALESCE($4::jsonb, exit_evidence),
+		    exit_filled_at = CASE
+		        WHEN $5::timestamptz IS NULL THEN exit_filled_at
+		        WHEN exit_filled_at IS NULL THEN $5::timestamptz
+		        ELSE GREATEST(exit_filled_at, $5::timestamptz)
+		    END,
 		    exit_claimed_at = NULL
 		WHERE id = $2 AND status IN ('open','exiting')
-		RETURNING exit_price, pnl, pnl_pct, realized_exit_qty, 0::NUMERIC, status`,
-		exitPrice, id,
+		RETURNING id, ticker, direction, entry_price,
+		          exit_price, pnl, pnl_pct, realized_exit_qty,
+		          0::NUMERIC, status, COALESCE(exit_reason,''),
+		          exit_evidence, exit_filled_at`,
+		exitPrice, id, intent.Reason, nullableRawJSON(intent.Evidence), nullableTime(filledAt),
 	).Scan(
+		&result.TradeID, &result.Ticker, &result.Direction, &result.EntryPrice,
 		&result.ExitPrice, &result.PnL, &result.PnLPct,
 		&result.ExitQty, &result.Remaining, &result.Status,
+		&result.ExitReason, &result.ExitEvidence, &result.ExitFilledAt,
 	)
+	result.JustClosed = err == nil
 	return result, err
 }
 
@@ -277,7 +353,8 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 		       COALESCE(limit_price,0), COALESCE(stop_price,0),
 		       COALESCE(filled_price,0), COALESCE(filled_qty,0),
 		       status, is_stop_loss, is_take_profit,
-		       COALESCE(parent_order_id,''),
+		       COALESCE(parent_order_id,''), filled_at,
+		       COALESCE(exit_reason,''), exit_evidence,
 		       created_at, updated_at
 		FROM orders
 		WHERE trade_id = $1
@@ -297,22 +374,36 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 	return &out[0], nil
 }
 
-// UpdateOrderStopPriceAndID updates the stop price, quantity, and broker order
-// id of an existing order row. The trailing-stop manager (#322) calls this
-// after replacing or resizing the broker STOP.
-func UpdateOrderStopPriceAndID(
+// UpdateOrderStopReplacement atomically repoints an existing protective order
+// row and preserves any fill returned with the broker replacement. A terminal
+// order may be purged before the next sweep, so its execution truth must be
+// durable in the same write as its new broker id.
+func UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, newBrokerOrderID string,
 	newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent ExitIntent,
 ) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
 		    quantity = $3,
+		    status = $4,
+		    filled_price = NULLIF($5::NUMERIC,0::NUMERIC),
+		    filled_qty = $6::NUMERIC,
+		    exit_fill_applied_qty = 0,
+		    filled_at = $7::timestamptz,
+		    exit_reason = NULLIF($8, ''),
+		    exit_evidence = $9::jsonb,
 		    updated_at = NOW()
-		WHERE id = $4`,
-		newStopPrice, newBrokerOrderID, newQuantity, orderID)
+		WHERE id = $10`,
+		newStopPrice, newBrokerOrderID, newQuantity, status,
+		filledPrice, filledQty, nullableTime(filledAt), intent.Reason,
+		nullableRawJSON(intent.Evidence), orderID)
 	return err
 }
 
@@ -342,12 +433,18 @@ func FinalizeTradeExit(ctx context.Context, id string) (TradeRealization, error)
 		  AND status = 'exiting'
 		  AND quantity <= 0.000000001
 		  AND realized_exit_qty > 0
-		RETURNING exit_price, pnl, pnl_pct, realized_exit_qty, 0::NUMERIC, status`,
+		RETURNING id, ticker, direction, entry_price,
+		          exit_price, pnl, pnl_pct, realized_exit_qty,
+		          0::NUMERIC, status, COALESCE(exit_reason,''),
+		          exit_evidence, exit_filled_at`,
 		id,
 	).Scan(
+		&result.TradeID, &result.Ticker, &result.Direction, &result.EntryPrice,
 		&result.ExitPrice, &result.PnL, &result.PnLPct,
 		&result.ExitQty, &result.Remaining, &result.Status,
+		&result.ExitReason, &result.ExitEvidence, &result.ExitFilledAt,
 	)
+	result.JustClosed = err == nil
 	return result, err
 }
 
@@ -418,10 +515,20 @@ func ApplyRecoveredExit(
 		        THEN COALESCE(t.closed_at, NOW())
 		        ELSE t.closed_at
 		    END,
+		    exit_reason = COALESCE(NULLIF(t.exit_reason, ''), $4),
+		    exit_evidence = COALESCE(
+		        t.exit_evidence,
+		        jsonb_build_object(
+		            'source', 'broker_position_delta',
+		            'recovered_quantity', target.sold,
+		            'recovery_price', $3::NUMERIC
+		        )
+		    ),
 		    exit_claimed_at = NULL
 		FROM target
 		WHERE t.id = target.id
-		RETURNING COALESCE(
+		RETURNING t.id, t.ticker, t.direction, t.entry_price,
+		          COALESCE(
 		              t.realized_exit_proceeds / NULLIF(t.realized_exit_qty,0),
 		              0
 		          ),
@@ -434,12 +541,16 @@ func ApplyRecoveredExit(
 		          END,
 		          t.realized_exit_qty,
 		          CASE WHEN t.status='closed' THEN 0 ELSE t.quantity END,
-		          t.status`,
-		id, soldQty, exitPrice,
+		          t.status, COALESCE(t.exit_reason,''),
+		          t.exit_evidence, t.exit_filled_at`,
+		id, soldQty, exitPrice, ExitReasonRecovery,
 	).Scan(
+		&result.TradeID, &result.Ticker, &result.Direction, &result.EntryPrice,
 		&result.ExitPrice, &result.PnL, &result.PnLPct,
 		&result.ExitQty, &result.Remaining, &result.Status,
+		&result.ExitReason, &result.ExitEvidence, &result.ExitFilledAt,
 	)
+	result.JustClosed = err == nil && result.Status == "closed"
 	return result, err
 }
 
@@ -447,16 +558,44 @@ func ApplyRecoveredExit(
 // fill was asynchronous. Exiting trades must use ApplyPartialExit followed by
 // FinalizeTradeExit so cumulative realized slices cannot be discarded.
 func UpdateTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
+	return UpdateTradeExitAt(ctx, id, exitPrice, pnl, pnlPct, time.Time{})
+}
+
+// UpdateTradeExitAt corrects a legacy already-closed asynchronous exit while
+// retaining closed_at as the database finalization timestamp and recording the
+// broker's execution timestamp separately when available.
+func UpdateTradeExitAt(ctx context.Context, id string, exitPrice, pnl, pnlPct float64, filledAt time.Time) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
 		SET exit_price=$1, pnl=$2, pnl_pct=$3,
 		    realized_pnl=$2,
 		    realized_exit_proceeds=realized_exit_qty*$1,
+		    exit_filled_at=CASE
+		        WHEN $5::timestamptz IS NULL THEN exit_filled_at
+		        WHEN exit_filled_at IS NULL THEN $5::timestamptz
+		        ELSE GREATEST(exit_filled_at,$5::timestamptz)
+		    END,
 		    status='closed',
 		    closed_at=COALESCE(closed_at, NOW()),
 		    exit_claimed_at=NULL
 		WHERE id=$4 AND status='closed'`,
-		exitPrice, pnl, pnlPct, id)
+		exitPrice, pnl, pnlPct, id, nullableTime(filledAt))
+	return err
+}
+
+// UpdateTradeExitFilledAt enriches an already-correct closed trade without
+// recalculating its lifecycle P&L from one order lot.
+func UpdateTradeExitFilledAt(ctx context.Context, id string, filledAt time.Time) error {
+	if filledAt.IsZero() {
+		return nil
+	}
+	_, err := GetDB().Exec(ctx, `
+		UPDATE trades
+		SET exit_filled_at=CASE
+		    WHEN exit_filled_at IS NULL THEN $2::timestamptz
+		    ELSE GREATEST(exit_filled_at,$2::timestamptz)
+		END
+		WHERE id=$1 AND status='closed'`, id, filledAt.UTC())
 	return err
 }
 
@@ -475,22 +614,25 @@ func MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error {
 // PendingExitOrder is a pending exit order row joined with the trade fields
 // needed to recompute P&L once the broker confirms the fill.
 type PendingExitOrder struct {
-	OrderID       string
-	BrokerOrderID string
-	Ticker        string
-	OrderStatus   string // broker order status last durably recorded in the DB
-	TradeID       string
-	Direction     string // long | short
-	EntryPrice    float64
-	Quantity      float64 // current trade quantity
-	OrderQuantity float64 // lot quantity assigned to this broker order row
-	LimitPrice    float64 // fallback when a terminal limit fill omits price
-	StopPrice     float64 // fallback when a terminal stop fill omits price
-	RecordedFill  float64 // fill already durably assigned to this lot
-	RecordedPrice float64 // fill price already durably assigned to this lot
-	AggregateFill float64 // fill assigned across every row sharing the broker id
-	ExitPrice     float64 // exit price currently recorded on the trade row
-	TradeStatus   string  // closed (price correction) | exiting (finalization)
+	OrderID          string
+	BrokerOrderID    string
+	Ticker           string
+	OrderStatus      string // broker order status last durably recorded in the DB
+	TradeID          string
+	Direction        string // long | short
+	EntryPrice       float64
+	Quantity         float64 // current trade quantity
+	OrderQuantity    float64 // lot quantity assigned to this broker order row
+	LimitPrice       float64 // fallback when a terminal limit fill omits price
+	StopPrice        float64 // fallback when a terminal stop fill omits price
+	RecordedFill     float64 // fill already durably assigned to this lot
+	RecordedPrice    float64 // fill price already durably assigned to this lot
+	RecordedFilledAt *time.Time
+	AggregateFill    float64 // fill assigned across every row sharing the broker id
+	ExitPrice        float64 // exit price currently recorded on the trade row
+	TradeStatus      string  // closed (price correction) | exiting (finalization)
+	ExitReason       string
+	ExitEvidence     json.RawMessage
 }
 
 // DurableExitOrderOwnership is the complete broker-order identity set that
@@ -499,10 +641,13 @@ type PendingExitOrder struct {
 // durable order just outside that batch must never be attributed to another
 // trade that happens to share its ticker and side.
 type DurableExitOrderOwnership struct {
+	TradeID       string
 	BrokerOrderID string
 	Ticker        string
 	Side          string
 	TradeStatus   string
+	TradeQuantity float64
+	ExitClaimedAt *time.Time
 	// ClaimOwned is true when this order was created by the current exit claim,
 	// or when a terminal fill can account for shares already missing at the
 	// broker. Zero-fill pre-existing protective stops remain known broker IDs
@@ -512,21 +657,22 @@ type DurableExitOrderOwnership struct {
 
 func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwnership, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT DISTINCT o.broker_order_id, o.ticker, o.side, t.status,
+		SELECT DISTINCT t.id, o.broker_order_id, o.ticker, o.side, t.status,
+		       t.quantity, t.exit_claimed_at,
 		       CASE
 		         WHEN t.status='closed' THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status='filled' THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status IN ('pending','partial')
-		              AND o.created_at >= t.exit_claimed_at THEN TRUE
+		              AND (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0) THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status IN ('cancelled','rejected')
 		              AND COALESCE(o.filled_qty,0) > 0 THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status IN ('cancelled','rejected')
 		              AND COALESCE(o.filled_qty,0) = 0
-		              AND o.updated_at >= t.exit_claimed_at THEN TRUE
+		              AND o.created_at >= t.exit_claimed_at THEN TRUE
 		         ELSE FALSE
 		       END AS claim_owned
 		FROM orders o
@@ -537,10 +683,11 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		  AND (
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
-		          o.status IN ('pending','partial')
+		          (o.status IN ('pending','partial') AND
+		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
 		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
-		            o.updated_at >= t.exit_claimed_at))
+		            o.created_at >= t.exit_claimed_at))
 		        ))
 		      )`)
 	if err != nil {
@@ -551,7 +698,8 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 	for rows.Next() {
 		var owner DurableExitOrderOwnership
 		if err := rows.Scan(
-			&owner.BrokerOrderID, &owner.Ticker, &owner.Side, &owner.TradeStatus,
+			&owner.TradeID, &owner.BrokerOrderID, &owner.Ticker, &owner.Side, &owner.TradeStatus,
+			&owner.TradeQuantity, &owner.ExitClaimedAt,
 			&owner.ClaimOwned,
 		); err != nil {
 			return nil, err
@@ -583,10 +731,11 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		  WHERE (
 		          (t.status='closed' AND o.status IN ('pending','partial'))
 		       OR (t.status='exiting' AND (
-		            o.status IN ('pending','partial')
+		            (o.status IN ('pending','partial') AND
+		             (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
 		         OR (o.status IN ('filled','cancelled','rejected') AND
 		             (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
-		              o.updated_at >= t.exit_claimed_at))
+		              o.created_at >= t.exit_claimed_at))
 		          ))
 		        )
 		    AND COALESCE(o.broker_order_id,'') <> ''
@@ -600,23 +749,25 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		       t.id, t.direction, t.entry_price, t.quantity,
 		       o.quantity, COALESCE(o.limit_price,0),
 		       COALESCE(o.stop_price,0), COALESCE(o.filled_qty,0),
-		       COALESCE(o.filled_price,0),
+		       COALESCE(o.filled_price,0), o.filled_at,
 		       COALESCE((
 		         SELECT SUM(COALESCE(allocated.filled_qty,0))
 		         FROM orders allocated
 		         WHERE allocated.broker_order_id=o.broker_order_id
 		       ),0),
-		       COALESCE(t.exit_price,0), t.status
+		       COALESCE(t.exit_price,0), t.status,
+		       COALESCE(t.exit_reason,''), t.exit_evidence
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
 		JOIN selected_trades selected ON selected.id=t.id
 		WHERE (
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
-		          o.status IN ('pending','partial')
+		          (o.status IN ('pending','partial') AND
+		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
 		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
-		            o.updated_at >= t.exit_claimed_at))
+		            o.created_at >= t.exit_claimed_at))
 		        ))
 		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''
@@ -635,9 +786,9 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker, &p.OrderStatus,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
 			&p.OrderQuantity, &p.LimitPrice, &p.StopPrice,
-			&p.RecordedFill, &p.RecordedPrice,
+			&p.RecordedFill, &p.RecordedPrice, &p.RecordedFilledAt,
 			&p.AggregateFill,
-			&p.ExitPrice, &p.TradeStatus); err != nil {
+			&p.ExitPrice, &p.TradeStatus, &p.ExitReason, &p.ExitEvidence); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -664,7 +815,8 @@ func GetOpenTrades(ctx context.Context) ([]Trade, error) {
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades WHERE status='open'
 		ORDER BY opened_at DESC`)
 	if err != nil {
@@ -685,7 +837,8 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades WHERE status IN ('open','exiting')
 		ORDER BY opened_at DESC`)
 	if err != nil {
@@ -707,7 +860,8 @@ func GetOrderlessExitingTrades(ctx context.Context, limit int) ([]Trade, error) 
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades t
 		WHERE t.status='exiting'
 		  AND t.exit_claimed_at IS NOT NULL
@@ -739,7 +893,8 @@ func GetRecentTrades(ctx context.Context, limit int) ([]Trade, error) {
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades ORDER BY opened_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -758,7 +913,8 @@ func GetTradeByID(ctx context.Context, id string) (*Trade, error) {
 		       COALESCE(model_provider,''), COALESCE(model_name,''),
 		       entry_setup, COALESCE(entry_setup_evidence,''),
 		       opened_at, COALESCE(closed_at, opened_at), created_at,
-		       COALESCE(high_water_mark,0)
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades WHERE id=$1`, id)
 	if err != nil {
 		return nil, err
@@ -787,7 +943,8 @@ func scanTrades(rows interface {
 			&t.ModelProvider, &t.ModelName,
 			&t.EntrySetup, &t.EntrySetupEvidence,
 			&t.OpenedAt, &t.ClosedAt, &t.CreatedAt,
-			&t.HighWaterMark,
+			&t.HighWaterMark, &t.ExitClaimedAt,
+			&t.ExitReason, &t.ExitEvidence, &t.ExitFilledAt,
 		); err != nil {
 			return nil, err
 		}

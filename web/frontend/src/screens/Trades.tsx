@@ -52,6 +52,9 @@ interface Trade {
   ModelName: string;
   OpenedAt: string;
   ClosedAt: string;
+  ExitReason?: string;
+  ExitEvidence?: unknown;
+  ExitFilledAt?: string;
   StopLoss?: number;
   TakeProfit?: number;
   Analysts?: AnalystData[];
@@ -167,6 +170,12 @@ const COLUMNS: Column<Trade>[] = [
     render: (t) => <span className={`${styles.numericCell} ${pnlClass(t.PnLPct)}`}>{fmtPct(t.PnLPct)}</span>,
   },
   {
+    key: 'ExitReason',
+    label: 'EXIT REASON',
+    sortable: true,
+    render: (t) => <span style={{ color: 'var(--text-muted)' }}>{t.ExitReason || '—'}</span>,
+  },
+  {
     key: 'ModelName',
     label: 'MODEL',
     render: (t) => <span style={{ color: 'var(--text-muted)' }}>{t.ModelName || '—'}</span>,
@@ -214,7 +223,7 @@ const COLUMNS: Column<Trade>[] = [
 
 function tradesToCsv(trades: Trade[]): string {
   const escape = (v: string) => `"${v.replace(/"/g, '""')}"`;
-  const header = 'ticker,direction,strategy,model,entry,exit,pnl,pnl_pct,status,opened';
+  const header = 'ticker,direction,strategy,model,entry,exit,pnl,pnl_pct,status,exit_reason,exit_evidence,exit_filled_at,opened,closed_at';
   const rows = trades.map(t =>
     [
       escape(t.Ticker),
@@ -226,7 +235,11 @@ function tradesToCsv(trades: Trade[]): string {
       t.PnL.toFixed(2),
       t.PnLPct.toFixed(2),
       escape(t.Status),
+      escape(t.ExitReason || ''),
+      escape(t.ExitEvidence ? JSON.stringify(t.ExitEvidence) : ''),
+      escape(t.ExitFilledAt || ''),
       escape(t.OpenedAt),
+      escape(t.ClosedAt || ''),
     ].join(',')
   );
   return [header, ...rows].join('\n');
@@ -319,6 +332,19 @@ export default function TradesScreen() {
             {trade.TakeProfit ? <> | TP <span className={styles.positive}>{fmtPrice(trade.TakeProfit)}</span></> : null}
           </span>
         </div>
+
+        {/* Exit provenance */}
+        {trade.Status.toLowerCase() === 'closed' ? (
+          <div className={styles.expandedMeta}>
+            <span>Exit reason: <strong>{trade.ExitReason || 'unknown'}</strong></span>
+            <span className={styles.expandedSep}>|</span>
+            <span>Broker fill: <span className={styles.expandedMuted}>{trade.ExitFilledAt ? fmtDate(trade.ExitFilledAt) : 'unknown'}</span></span>
+            <span className={styles.expandedSep}>|</span>
+            <span>DB finalized: <span className={styles.expandedMuted}>{trade.ClosedAt ? fmtDate(trade.ClosedAt) : 'unknown'}</span></span>
+            <span className={styles.expandedSep}>|</span>
+            <span>Evidence: <span className={styles.expandedMuted}>{trade.ExitEvidence ? JSON.stringify(trade.ExitEvidence) : 'unknown'}</span></span>
+          </div>
+        ) : null}
       </CornerCard>
     );
   }, []);

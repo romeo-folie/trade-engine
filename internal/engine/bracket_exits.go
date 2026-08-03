@@ -2,10 +2,11 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
-	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -144,8 +145,15 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 		}
 		if partialQty > 0 && partialQty >= t.Quantity-1e-9 {
 			// The partials add up to the whole position — that IS the exit.
+			var filledAt time.Time
+			var filledLeg store.Order
+			for _, s := range states {
+				if s.ok && s.res.FilledQty > 0 && (filledLeg.ID == "" || s.res.FilledAt.After(filledAt)) {
+					filledAt, filledLeg = s.res.FilledAt, s.leg
+				}
+			}
 			e.bookBracketClose(ctx, t, partialProceeds/partialQty, partialQty,
-				"bracket legs partially filled to completion")
+				"bracket legs partially filled to completion", filledAt, filledLeg)
 			return true
 		}
 		if partialQty > 0 {
@@ -155,9 +163,9 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 					continue
 				}
 				var uErr error
-				remaining, _, uErr = store.ApplyPartialExit(
+				remaining, _, uErr = store.ApplyPartialExitAt(
 					ctx, t.ID, s.leg.ID, fillPriceOf(s), s.res.FilledQty,
-					execution.NormalizeOrderStatus(s.res.Status),
+					execution.NormalizeOrderStatus(s.res.Status), s.res.FilledAt,
 				)
 				if uErr != nil {
 					logger.Warn("bracket exits: atomically apply partial leg exit failed — retrying next sweep",
@@ -256,14 +264,14 @@ func (e *Engine) closeBracketTrade(ctx context.Context, t store.Trade, states []
 		exitReason = "take-profit hit"
 	}
 
-	if !e.bookBracketClose(ctx, t, exitPrice, soldQty, exitReason) {
+	if !e.bookBracketClose(ctx, t, exitPrice, soldQty, exitReason, filled.res.FilledAt, filled.leg) {
 		return // leg row stays pending → retried next sweep
 	}
 	fq := filled.res.FilledQty
 	if fq == 0 {
 		fq = t.Quantity
 	}
-	if err := store.UpdateOrderFill(ctx, filled.leg.ID, fillPriceOf(filled), fq, "filled"); err != nil {
+	if err := store.UpdateOrderFillAt(ctx, filled.leg.ID, fillPriceOf(filled), fq, "filled", filled.res.FilledAt); err != nil {
 		logger.Warn("bracket exits: persist leg fill", "order_id", filled.leg.ID, "err", err)
 	}
 	for i, s := range states {
@@ -275,7 +283,7 @@ func (e *Engine) closeBracketTrade(ctx context.Context, t store.Trade, states []
 		if s.ok {
 			sq, sp = s.res.FilledQty, s.res.FilledPrice
 		}
-		if err := store.UpdateOrderFill(ctx, s.leg.ID, sp, sq, "cancelled"); err != nil {
+		if err := store.UpdateOrderFillAt(ctx, s.leg.ID, sp, sq, "cancelled", s.res.FilledAt); err != nil {
 			logger.Warn("bracket exits: mark OCO sibling cancelled", "order_id", s.leg.ID, "err", err)
 		}
 	}
@@ -284,8 +292,37 @@ func (e *Engine) closeBracketTrade(ctx context.Context, t store.Trade, states []
 // bookBracketClose writes the trade close, records the loss cooldown, and
 // emits the same observability as the software exit path. Returns false when
 // the close could not be persisted (caller retries next sweep).
-func (e *Engine) bookBracketClose(ctx context.Context, t store.Trade, exitPrice, soldQty float64, exitReason string) bool {
-	realized, err := store.CloseTradeRealized(ctx, t.ID, exitPrice)
+func (e *Engine) bookBracketClose(
+	ctx context.Context,
+	t store.Trade,
+	exitPrice, soldQty float64,
+	exitReason string,
+	filledAt time.Time,
+	leg store.Order,
+) bool {
+	reasonCode := leg.ExitReason
+	evidence := make(map[string]any)
+	if len(leg.ExitEvidence) > 0 {
+		_ = json.Unmarshal(leg.ExitEvidence, &evidence)
+	}
+	if evidence == nil {
+		evidence = make(map[string]any)
+	}
+	trigger := leg.StopPrice
+	if reasonCode == "" {
+		reasonCode = store.ExitReasonStopLoss
+		if leg.IsTakeProfit {
+			reasonCode = store.ExitReasonTakeProfit
+		}
+	}
+	if leg.IsTakeProfit {
+		trigger = leg.LimitPrice
+	}
+	evidence["broker_order_id"] = leg.BrokerOrderID
+	evidence["trigger_price"] = trigger
+	evidence["order_type"] = leg.OrderType
+	intent := newExitIntent(reasonCode, evidence)
+	realized, err := store.CloseTradeRealizedWithIntent(ctx, t.ID, exitPrice, filledAt, intent)
 	if err != nil {
 		logger.Warn("bracket exits: close trade", "trade_id", t.ID, "err", err)
 		return false
@@ -305,11 +342,7 @@ func (e *Engine) bookBracketClose(ctx context.Context, t store.Trade, exitPrice,
 		"pnl", fmt.Sprintf("%.2f", realized.PnL),
 		"pnl_pct", fmt.Sprintf("%.2f%%", realized.PnLPct),
 	)
-	e.bus.Publish(events.TradeClosed, events.TradeClosedPayload{
-		TradeID: t.ID, Ticker: t.Ticker, Direction: t.Direction,
-		EntryPrice: t.EntryPrice, ExitPrice: realized.ExitPrice,
-		PnL: realized.PnL, PnLPct: realized.PnLPct, Reason: exitReason,
-	})
+	e.publishTradeClosed(realized)
 	e.checkExitResidue(t.Ticker)
 	return true
 }
@@ -407,9 +440,9 @@ func (e *Engine) cancelClaimedExitLegs(
 						}
 					}
 					var err error
-					remaining, _, err = store.ApplyPartialExit(
+					remaining, _, err = store.ApplyPartialExitAt(
 						ctx, t.ID, leg.ID, fillPrice, res.FilledQty,
-						execution.NormalizeOrderStatus(res.Status),
+						execution.NormalizeOrderStatus(res.Status), res.FilledAt,
 					)
 					if err != nil {
 						return nil, 0, false, false

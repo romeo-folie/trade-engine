@@ -74,12 +74,13 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		fillPrice = stopPrice
 	}
 	fillObserved := fillQty > 0
+	stopIntent := newExitIntent(store.ExitReasonStopLoss, map[string]any{"stop_loss": stopPrice})
 	if fillObserved {
 		// Transfer ownership before making the terminal/partial order row
 		// durable. The exit reconciler selects such rows only for claimed
 		// trades; leaving this trade open would make an immediate stop fill
 		// invisible and a later manager tick could submit another sell.
-		if _, claimErr := store.ClaimTradeExit(ctx, tradeID); claimErr != nil {
+		if _, claimErr := store.ClaimTradeExitWithIntent(ctx, tradeID, stopIntent); claimErr != nil {
 			return fmt.Errorf("claim immediate protective-stop fill: %w", claimErr)
 		}
 	}
@@ -95,19 +96,29 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		FilledQty:     fillQty,
 		Status:        status,
 		IsStopLoss:    true,
+		ExitReason:    stopIntent.Reason,
+		ExitEvidence:  stopIntent.Evidence,
+		FilledAt:      filledAtPtr(res.FilledAt),
 	}); err != nil {
 		rollbackRes, rollbackErr :=
 			rollbackUnrecordedProtectiveStop(ctx, e.executor, res.BrokerOrderID)
 		if rollbackRes.FilledQty > 0 {
-			_, _ = store.ClaimTradeExit(ctx, tradeID)
-			// Keep the row sweepable even though the broker result is
-			// terminal. The exit reconciler will atomically assign the
-			// cumulative partial/full fill to this claimed trade.
+			_, _ = store.ClaimTradeExitWithIntent(ctx, tradeID, stopIntent)
+			// Preserve the fill itself before returning. If the broker purges
+			// this terminal order before the next sweep, the reconciler can
+			// still replay the durable quantity, price, and execution time.
+			rollbackStatus := execution.NormalizeOrderStatus(rollbackRes.Status)
+			if rollbackStatus == "" {
+				rollbackStatus = "filled"
+			}
 			if _, persistErr := store.InsertOrderWithRetry(ctx, store.Order{
 				TradeID: tradeID, BrokerOrderID: res.BrokerOrderID,
 				Ticker: ticker, Side: string(execution.OrderSideSell),
 				OrderType: string(execution.OrderTypeStop), Quantity: quantity,
-				StopPrice: stopPrice, Status: "pending", IsStopLoss: true,
+				StopPrice: stopPrice, Status: rollbackStatus, IsStopLoss: true,
+				FilledPrice: rollbackRes.FilledPrice, FilledQty: rollbackRes.FilledQty,
+				FilledAt:   filledAtPtr(rollbackRes.FilledAt),
+				ExitReason: stopIntent.Reason, ExitEvidence: stopIntent.Evidence,
 			}); persistErr != nil {
 				return fmt.Errorf("record protective stop: %w; rollback fill also unpersisted: %v", err, persistErr)
 			}
@@ -172,16 +183,17 @@ func (e *Engine) cancelProtectiveStopForResize(
 				if fillPrice <= 0 {
 					fillPrice = existing.StopPrice
 				}
-				claimed, err := store.ClaimTradeExit(ctx, existing.TradeID)
+				intent := newExitIntent(store.ExitReasonStopLoss, map[string]any{"stop_loss": existing.StopPrice})
+				claimed, err := store.ClaimTradeExitWithIntent(ctx, existing.TradeID, intent)
 				if err != nil {
 					return 0, fmt.Errorf("claim partial stop exit: %w", err)
 				}
 				if !claimed {
 					return 0, errors.New("partial stop filled while another exit worker owns the trade")
 				}
-				remaining, applied, err := store.ApplyPartialExit(
+				remaining, applied, err := store.ApplyPartialExitAt(
 					ctx, existing.TradeID, existing.ID,
-					fillPrice, status.FilledQty, "cancelled",
+					fillPrice, status.FilledQty, "cancelled", status.FilledAt,
 				)
 				if err != nil {
 					return 0, fmt.Errorf("atomically record partial protective-stop fill: %w", err)
@@ -200,7 +212,8 @@ func (e *Engine) cancelProtectiveStopForResize(
 			if fillPrice <= 0 {
 				fillPrice = existing.StopPrice
 			}
-			claimed, err := store.ClaimTradeExit(ctx, existing.TradeID)
+			intent := newExitIntent(store.ExitReasonStopLoss, map[string]any{"stop_loss": existing.StopPrice})
+			claimed, err := store.ClaimTradeExitWithIntent(ctx, existing.TradeID, intent)
 			if err != nil {
 				return 0, fmt.Errorf("claim filled stop exit: %w", err)
 			}
@@ -211,9 +224,9 @@ func (e *Engine) cancelProtectiveStopForResize(
 			if fillQty <= 0 {
 				fillQty = existing.Quantity
 			}
-			remaining, applied, err := store.ApplyPartialExit(
+			remaining, applied, err := store.ApplyPartialExitAt(
 				ctx, existing.TradeID, existing.ID,
-				fillPrice, fillQty, "filled",
+				fillPrice, fillQty, "filled", status.FilledAt,
 			)
 			if err != nil {
 				return 0, fmt.Errorf("atomically record protective-stop fill: %w", err)

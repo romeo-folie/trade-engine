@@ -2,8 +2,11 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"math"
+	"reflect"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -145,13 +148,35 @@ func TestGetPendingExitOrdersExcludesStaleTerminalRowsOnExitingTrade(t *testing.
 	}
 	if _, err := store.InsertOrder(ctx, store.Order{
 		TradeID: tradeID, BrokerOrderID: "brk-xrc-stale", Ticker: "TEST_XRC_STALE",
-		Side: "sell", OrderType: "stop", Quantity: 10, Status: "cancelled", IsStopLoss: true,
+		Side: "sell", OrderType: "stop", Quantity: 10, Status: "pending", IsStopLoss: true,
 	}); err != nil {
 		t.Fatalf("InsertOrder stale: %v", err)
 	}
 	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
 		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
 	}
+	assertStaleNotOwned := func(stage string) {
+		owners, err := store.GetDurableExitOrderOwnership(ctx)
+		if err != nil {
+			t.Fatalf("%s GetDurableExitOrderOwnership: %v", stage, err)
+		}
+		for _, owner := range owners {
+			if owner.BrokerOrderID == "brk-xrc-stale" && owner.ClaimOwned {
+				t.Fatalf("%s stale protective stop owns current claim: %+v", stage, owner)
+			}
+		}
+	}
+	assertStaleNotOwned("pending")
+	// Cancelling the old protective stop after winning the exit claim updates
+	// updated_at, but it must not become the current market exit order.
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("GetOrdersByTrade stale stop: %v rows=%d", err, len(orders))
+	}
+	if err := store.UpdateOrderFill(ctx, orders[0].ID, 0, 0, "cancelled"); err != nil {
+		t.Fatalf("cancel stale protective stop: %v", err)
+	}
+	assertStaleNotOwned("cancelled")
 	if _, err := store.InsertOrder(ctx, store.Order{
 		TradeID: tradeID, BrokerOrderID: "brk-xrc-current", Ticker: "TEST_XRC_STALE",
 		Side: "sell", OrderType: "market", Quantity: 10, Status: "pending", IsTakeProfit: true,
@@ -608,6 +633,115 @@ func TestFinalizeTradeExitUsesEveryAppliedSlice(t *testing.T) {
 	}
 }
 
+func TestFinalizeTradeExitPreservesReasonEvidenceAndBrokerFillTime(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_META", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	intent := store.ExitIntent{
+		Reason:   store.ExitReasonEMA9Close,
+		Evidence: []byte(`{"daily_close":95,"ema9":98}`),
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, intent); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-meta", Ticker: "TEST_XRC_META",
+		Side: "sell", OrderType: "market", Quantity: 2, Status: "pending",
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	filledAt := time.Date(2026, 8, 1, 14, 5, 6, 0, time.UTC)
+	if _, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, 95, 2, "filled", filledAt); err != nil {
+		t.Fatalf("ApplyPartialExitAt: %v", err)
+	}
+	realized, err := store.FinalizeTradeExit(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("FinalizeTradeExit: %v", err)
+	}
+	var evidence map[string]float64
+	if err := json.Unmarshal(realized.ExitEvidence, &evidence); err != nil {
+		t.Fatalf("unmarshal exit evidence: %v (%s)", err, realized.ExitEvidence)
+	}
+	if realized.ExitReason != store.ExitReasonEMA9Close || evidence["daily_close"] != 95 || evidence["ema9"] != 98 ||
+		realized.ExitFilledAt == nil || !realized.ExitFilledAt.Equal(filledAt) || !realized.JustClosed {
+		t.Fatalf("realized metadata = %+v evidence=%s", realized, realized.ExitEvidence)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.ClosedAt.IsZero() || trade.ExitFilledAt == nil || !trade.ExitFilledAt.Equal(filledAt) {
+		t.Fatalf("trade timestamps = trade=%+v err=%v", trade, err)
+	}
+	if replay, err := store.FinalizeTradeExit(ctx, tradeID); err == nil || replay.JustClosed {
+		t.Fatalf("replayed finalization = %+v err=%v, want no second close transition", replay, err)
+	}
+}
+
+func TestApplyPartialExitAtKeepsLatestBrokerTimestamp(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_TIME", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonSellSignal}); err != nil || !claimed {
+		t.Fatalf("claim = %v, %v", claimed, err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-time", Ticker: "TEST_XRC_TIME",
+		Side: "sell", OrderType: "market", Quantity: 2, Status: "partial",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
+	earlier := later.Add(-time.Minute)
+	latest := later.Add(time.Minute)
+	if _, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, 99, 1, "partial", later); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, 99, 1, "partial", earlier); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, 98, 2, "filled", latest); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].FilledAt == nil || !orders[0].FilledAt.Equal(latest) {
+		t.Fatalf("order fill time = %+v err=%v, want %v", orders, err, latest)
+	}
+	realized, err := store.FinalizeTradeExit(ctx, tradeID)
+	if err != nil || realized.ExitFilledAt == nil || !realized.ExitFilledAt.Equal(latest) {
+		t.Fatalf("realized fill time = %+v err=%v, want %v", realized, err, latest)
+	}
+}
+
+func TestClaimTradeExitRejectsInvalidEvidenceWithoutClaiming(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_BAD_JSON", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{
+		Reason: store.ExitReasonEMA9Close, Evidence: []byte(`{"broken":`),
+	}); err == nil || claimed {
+		t.Fatalf("invalid evidence claim = %v, %v; want false/error", claimed, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "open" || trade.ExitReason != "" {
+		t.Fatalf("invalid evidence mutated trade: %+v err=%v", trade, err)
+	}
+}
+
 func TestApplyRecoveredExitAccumulatesAndReopensRemainder(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
@@ -640,6 +774,45 @@ func TestApplyRecoveredExitAccumulatesAndReopensRemainder(t *testing.T) {
 	if closed.Status != "closed" || closed.ExitQty != 10 ||
 		closed.ExitPrice != 102 || closed.PnL != -20 || closed.PnLPct != -2 {
 		t.Fatalf("closed recovery = %+v", closed)
+	}
+	if !closed.JustClosed || closed.ExitReason != store.ExitReasonRecovery {
+		t.Fatalf("closed recovery provenance = %+v", closed)
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(closed.ExitEvidence, &evidence); err != nil {
+		t.Fatalf("decode recovery evidence: %v", err)
+	}
+	if evidence["source"] != "broker_position_delta" || evidence["recovered_quantity"] != float64(6) {
+		t.Fatalf("recovery evidence = %#v", evidence)
+	}
+}
+
+func TestApplyRecoveredExitPreservesExistingPolicyIntent(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_RECOVER_INTENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 3,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	intent := store.ExitIntent{
+		Reason: store.ExitReasonEMA9Close, Evidence: json.RawMessage(`{"daily_close":95}`),
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, intent); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	recovered, err := store.ApplyRecoveredExit(ctx, tradeID, 95, 3)
+	if err != nil {
+		t.Fatalf("ApplyRecoveredExit: %v", err)
+	}
+	var gotEvidence, wantEvidence map[string]any
+	gotErr := json.Unmarshal(recovered.ExitEvidence, &gotEvidence)
+	wantErr := json.Unmarshal(intent.Evidence, &wantEvidence)
+	if recovered.ExitReason != intent.Reason || gotErr != nil || wantErr != nil ||
+		!reflect.DeepEqual(gotEvidence, wantEvidence) {
+		t.Fatalf("recovered intent = %q %#v, want %q %#v",
+			recovered.ExitReason, gotEvidence, intent.Reason, wantEvidence)
 	}
 }
 
@@ -781,7 +954,8 @@ func TestGetDurableExitOrderOwnershipIsNotBatchLimited(t *testing.T) {
 	for _, owner := range owners {
 		if owner.BrokerOrderID == "brk-xrc-owner" {
 			if owner.Ticker != "TEST_XRC_OWNER" || owner.Side != "sell" ||
-				owner.TradeStatus != "exiting" || !owner.ClaimOwned {
+				owner.TradeStatus != "exiting" || !owner.ClaimOwned ||
+				owner.TradeID != tradeID || owner.TradeQuantity != 5 || owner.ExitClaimedAt == nil {
 				t.Fatalf("owner = %+v", owner)
 			}
 			return

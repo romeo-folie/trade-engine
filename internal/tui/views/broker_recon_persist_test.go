@@ -28,6 +28,23 @@ func TestParsePersistedRecon_Diverging(t *testing.T) {
 	}
 }
 
+func TestParsePersistedRecon_ExitPendingIsTransitional(t *testing.T) {
+	r := ParsePersistedRecon(`{"checked_at":"2026-07-09T12:00:00Z","drifts":[{"ticker":"PSN","broker_qty":0,"db_qty":12,"source":"exit_pending"}]}`)
+	if r.InSync || len(r.Divergences) != 0 || len(r.PendingExits) != 1 {
+		t.Fatalf("pending exit classified incorrectly: %+v", r)
+	}
+	if r.PendingExits[0].Ticker != "PSN" || r.PendingExits[0].Kind != "exit_pending" {
+		t.Fatalf("pending exit parsed wrong: %+v", r.PendingExits[0])
+	}
+}
+
+func TestParsePersistedRecon_MixedKeepsRealDivergence(t *testing.T) {
+	r := ParsePersistedRecon(`{"drifts":[{"ticker":"PSN","source":"exit_pending"},{"ticker":"NVDA","source":"broker_only","broker_qty":2}]}`)
+	if len(r.PendingExits) != 1 || len(r.Divergences) != 1 || r.InSync {
+		t.Fatalf("mixed reconciliation classified incorrectly: %+v", r)
+	}
+}
+
 func TestParsePersistedRecon_Invalid(t *testing.T) {
 	r := ParsePersistedRecon(`not json`)
 	if r.Available || r.Err == "" {

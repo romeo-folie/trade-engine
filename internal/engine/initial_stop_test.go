@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 
@@ -43,6 +44,11 @@ func TestEnsureUncappedProtectiveStopSeedsImmediately(t *testing.T) {
 	}
 	if stop.Quantity != 5 || stop.BrokerOrderID != "uncap-stop-1" {
 		t.Fatalf("stored stop = %+v", stop)
+	}
+	var evidence map[string]any
+	if err := json.Unmarshal(stop.ExitEvidence, &evidence); err != nil ||
+		stop.ExitReason != store.ExitReasonStopLoss || evidence["stop_loss"] != 95.0 {
+		t.Fatalf("stored stop provenance = %q %s, err=%v", stop.ExitReason, stop.ExitEvidence, err)
 	}
 
 	// Idempotent when the trailing manager or fill poll reaches the same fill.

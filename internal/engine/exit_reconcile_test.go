@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"math"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -15,6 +17,102 @@ type fakeExitExecutor struct {
 	results map[string]execution.OrderResult
 	errs    map[string]error
 	calls   []string
+}
+
+func TestExitReconcileTickerRunsWithoutOverlapAndStopsOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls, active, maxActive atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		runExitReconcileTicker(ctx, 2*time.Millisecond, func(context.Context) {
+			current := active.Add(1)
+			for {
+				previous := maxActive.Load()
+				if current <= previous || maxActive.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			calls.Add(1)
+			time.Sleep(6 * time.Millisecond)
+			active.Add(-1)
+		})
+		close(done)
+	}()
+
+	deadline := time.After(250 * time.Millisecond)
+	for calls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("independent reconcile ticker did not run twice")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("reconcile ticker did not stop after cancellation")
+	}
+	if maxActive.Load() != 1 {
+		t.Fatalf("max concurrent sweeps = %d, want 1", maxActive.Load())
+	}
+}
+
+func TestStartupExitReconcilePreventsFalseBrokerDrift(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_BOOT_EXIT_DRIFT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{
+		Reason: store.ExitReasonEMA9Close, Evidence: []byte(`{"daily_close":90}`),
+	}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET exit_claimed_at=NOW()-INTERVAL '30 minutes' WHERE id=$1`, tradeID); err != nil {
+		t.Fatalf("age exit claim: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "boot-exit-fill", Ticker: "TEST_BOOT_EXIT_DRIFT",
+		Side: "sell", OrderType: "market", Quantity: 5, Status: "pending",
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"boot-exit-fill": {Status: "filled", FilledPrice: 90, FilledQty: 5},
+	}}
+	eng := newBracketTestEngine(exec)
+
+	eng.ReconcileExitsNow(ctx)
+	drifts, ok := ReconcileBrokerVsDBWithStoreStatus(ctx, &fakeBrokerView{}, 0)
+	if !ok {
+		t.Fatal("post-exit startup reconciliation did not complete")
+	}
+	for _, drift := range drifts {
+		if drift.Ticker == "TEST_BOOT_EXIT_DRIFT" {
+			t.Fatalf("resolved startup exit still drifted: %+v", drift)
+		}
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("startup exit trade = %+v err=%v, want closed", trade, err)
+	}
+}
+
+func TestReconcileExitsNowWithoutDBDoesNotPanic(t *testing.T) {
+	if store.IsConnected() {
+		t.Skip("requires disconnected store")
+	}
+	eng := newBracketTestEngine(&fakeBracketExec{})
+	eng.ReconcileExitsNow(context.Background())
 }
 
 type recoveryExitExecutor struct {
@@ -49,6 +147,8 @@ type fakeExitStore struct {
 	orderStatus  map[string]string     // broker_order_id → status
 	tradeQty     map[string]float64
 	appliedFill  map[string]float64
+	orderFillAt  map[string]time.Time
+	tradeFillAt  map[string]time.Time
 }
 
 type recoveryExitStore struct {
@@ -94,12 +194,12 @@ func (f *recoveryExitStore) ApplyRecoveredExit(
 		trade.Direction, trade.EntryPrice, soldQty, exitPrice,
 	)
 	result := store.TradeRealization{
-		ExitPrice: exitPrice,
-		PnL:       pnl,
-		PnLPct:    pnlPct,
-		ExitQty:   soldQty,
-		Remaining: remaining,
-		Status:    "open",
+		TradeID: trade.ID, Ticker: trade.Ticker, Direction: trade.Direction,
+		EntryPrice: trade.EntryPrice, ExitPrice: exitPrice,
+		PnL: pnl, PnLPct: pnlPct, ExitQty: soldQty,
+		Remaining: remaining, Status: "open",
+		ExitReason: trade.ExitReason, ExitEvidence: trade.ExitEvidence,
+		ExitFilledAt: trade.ExitFilledAt,
 	}
 	if remaining > 0 {
 		f.tradeQty[id] = remaining
@@ -107,6 +207,7 @@ func (f *recoveryExitStore) ApplyRecoveredExit(
 		return result, nil
 	}
 	result.Status = "closed"
+	result.JustClosed = true
 	f.tradeExits[id] = [3]float64{exitPrice, pnl, pnlPct}
 	return result, nil
 }
@@ -124,6 +225,8 @@ func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 		orderStatus: map[string]string{},
 		tradeQty:    map[string]float64{},
 		appliedFill: map[string]float64{},
+		orderFillAt: map[string]time.Time{},
+		tradeFillAt: map[string]time.Time{},
 	}
 }
 
@@ -133,6 +236,15 @@ func (f *fakeExitStore) GetPendingExitOrders(_ context.Context, _ int) ([]store.
 func (f *fakeExitStore) UpdateOrderFill(_ context.Context, id string, price, qty float64, status string) error {
 	f.orderFills[id] = [2]float64{price, qty}
 	f.orderStatus[id] = status
+	return nil
+}
+func (f *fakeExitStore) UpdateOrderFillAt(ctx context.Context, id string, price, qty float64, status string, filledAt time.Time) error {
+	if err := f.UpdateOrderFill(ctx, id, price, qty, status); err != nil {
+		return err
+	}
+	if filledAt.After(f.orderFillAt[id]) {
+		f.orderFillAt[id] = filledAt
+	}
 	return nil
 }
 func (f *fakeExitStore) ApplyPartialExit(
@@ -158,11 +270,39 @@ func (f *fakeExitStore) ApplyPartialExit(
 	f.orderStatus[orderID] = status
 	return current, applied, nil
 }
+func (f *fakeExitStore) ApplyPartialExitAt(
+	ctx context.Context, tradeID, orderID string, price, cumulativeQty float64,
+	status string, filledAt time.Time,
+) (float64, float64, error) {
+	remaining, applied, err := f.ApplyPartialExit(ctx, tradeID, orderID, price, cumulativeQty, status)
+	if err == nil && filledAt.After(f.orderFillAt[orderID]) {
+		f.orderFillAt[orderID] = filledAt
+	}
+	if err == nil && filledAt.After(f.tradeFillAt[tradeID]) {
+		f.tradeFillAt[tradeID] = filledAt
+	}
+	return remaining, applied, err
+}
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
 	if f.tradeExitErr != nil {
 		return f.tradeExitErr
 	}
 	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
+	return nil
+}
+func (f *fakeExitStore) UpdateTradeExitAt(ctx context.Context, id string, exit, pnl, pnlPct float64, filledAt time.Time) error {
+	if err := f.UpdateTradeExit(ctx, id, exit, pnl, pnlPct); err != nil {
+		return err
+	}
+	if filledAt.After(f.tradeFillAt[id]) {
+		f.tradeFillAt[id] = filledAt
+	}
+	return nil
+}
+func (f *fakeExitStore) UpdateTradeExitFilledAt(_ context.Context, id string, filledAt time.Time) error {
+	if filledAt.After(f.tradeFillAt[id]) {
+		f.tradeFillAt[id] = filledAt
+	}
 	return nil
 }
 func (f *fakeExitStore) FinalizeTradeExit(
@@ -174,12 +314,24 @@ func (f *fakeExitStore) FinalizeTradeExit(
 		return store.TradeRealization{}, f.tradeExitErr
 	}
 	f.tradeExits[id] = [3]float64{exit, pnl, pnlPct}
-	return store.TradeRealization{
+	realized := store.TradeRealization{
+		TradeID:   id,
 		ExitPrice: exit,
 		PnL:       pnl,
 		PnLPct:    pnlPct,
-		Status:    "closed",
-	}, nil
+		Status:    "closed", JustClosed: true,
+	}
+	for _, p := range f.pending {
+		if p.TradeID == id {
+			realized.Ticker, realized.Direction, realized.EntryPrice = p.Ticker, p.Direction, p.EntryPrice
+			realized.ExitReason, realized.ExitEvidence = p.ExitReason, p.ExitEvidence
+			break
+		}
+	}
+	if filledAt := f.tradeFillAt[id]; !filledAt.IsZero() {
+		realized.ExitFilledAt = &filledAt
+	}
+	return realized, nil
 }
 func (f *fakeExitStore) UpdateExitingTradeQuantity(_ context.Context, id string, quantity float64) error {
 	f.tradeQty[id] = quantity
@@ -240,9 +392,12 @@ func TestExitReconcileFinalizesExitingTradeAndRecordsConfirmedLoss(t *testing.T)
 	p := lacExit()
 	p.TradeStatus = "exiting"
 	p.ExitPrice = 0
+	p.ExitReason = store.ExitReasonEMA9Close
+	p.ExitEvidence = []byte(`{"daily_close":3.82,"ema9":4.10}`)
 	db := newFakeExitStore(p)
+	filledAt := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
 	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
-		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: p.Quantity},
+		"b1": {Status: "filled", FilledPrice: 3.82, FilledQty: p.Quantity, FilledAt: filledAt},
 	}}
 	losses := 0
 
@@ -252,6 +407,15 @@ func TestExitReconcileFinalizesExitingTradeAndRecordsConfirmedLoss(t *testing.T)
 
 	if stats.Corrected != 1 || losses != 1 {
 		t.Fatalf("stats=%+v losses=%d, want finalized loss", stats, losses)
+	}
+	if len(stats.Closed) != 1 {
+		t.Fatalf("closed events = %d, want one newly finalized trade", len(stats.Closed))
+	}
+	closed := stats.Closed[0]
+	if closed.TradeID != p.TradeID || closed.Ticker != p.Ticker ||
+		closed.ExitReason != store.ExitReasonEMA9Close || string(closed.ExitEvidence) != string(p.ExitEvidence) ||
+		closed.ExitFilledAt == nil || !closed.ExitFilledAt.Equal(filledAt) || !closed.JustClosed {
+		t.Fatalf("reconciled close metadata = %+v evidence=%s", closed, closed.ExitEvidence)
 	}
 	if _, ok := db.tradeExits[p.TradeID]; !ok {
 		t.Fatal("exiting trade was not finalized at broker fill")
@@ -491,11 +655,12 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 }
 
 func TestExitReconcileAppliesDurableFillAfterPurgedTerminalOrder(t *testing.T) {
+	filledAt := time.Date(2026, 8, 1, 14, 5, 2, 0, time.UTC)
 	p := store.PendingExitOrder{
 		OrderID: "purged-row", BrokerOrderID: "purged-stop", Ticker: "AAPL",
 		TradeID: "purged-trade", Direction: "long", EntryPrice: 100,
 		Quantity: 10, OrderQuantity: 10, RecordedFill: 4, RecordedPrice: 98,
-		OrderStatus: "filled", TradeStatus: "exiting",
+		RecordedFilledAt: &filledAt, OrderStatus: "filled", TradeStatus: "exiting",
 	}
 	db := newFakeExitStore(p)
 	ex := &fakeExitExecutor{errs: map[string]error{
@@ -512,6 +677,9 @@ func TestExitReconcileAppliesDurableFillAfterPurgedTerminalOrder(t *testing.T) {
 	}
 	if got := db.appliedFill[p.OrderID]; got != 4 {
 		t.Fatalf("applied durable fill = %.6f, want 4", got)
+	}
+	if got := db.tradeFillAt[p.TradeID]; !got.Equal(filledAt) {
+		t.Fatalf("durable fill timestamp = %v, want %v", got, filledAt)
 	}
 }
 
@@ -600,6 +768,29 @@ func TestOrderlessRecoveryDoesNotGuessBetweenMultipleWorkingOrders(t *testing.T)
 	}
 	if stats.Recovered != 0 {
 		t.Fatalf("stats = %+v, want no guessed recovery", stats)
+	}
+}
+
+func TestOrderlessEMARecoveryDoesNotMarkMarketExitAsStopLoss(t *testing.T) {
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5, ExitReason: store.ExitReasonEMA9Close,
+	}
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(), orderless: []store.Trade{trade}, owned: []store.Trade{trade},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{},
+		positions:        []execution.Position{{Ticker: "AAPL", Quantity: 5, Side: "long"}},
+		working:          []execution.WorkingOrder{{OrderID: "ema-exit", Ticker: "AAPL", Side: "sell", Status: "pending"}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if stats.Recovered != 1 || len(db.inserted) != 1 {
+		t.Fatalf("stats=%+v inserted=%+v, want reconstructed EMA order", stats, db.inserted)
+	}
+	if db.inserted[0].IsStopLoss || db.inserted[0].IsTakeProfit {
+		t.Fatalf("EMA reconstructed order has bracket flags: %+v", db.inserted[0])
 	}
 }
 
@@ -725,7 +916,7 @@ func TestOrderlessRecoveryRetainsClaimForPreclaimPartialTerminalFill(t *testing.
 func TestOrderlessRecoveryClosesFlatTradeAtConservativePrice(t *testing.T) {
 	trade := store.Trade{
 		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "exiting",
-		EntryPrice: 100, Quantity: 5,
+		EntryPrice: 100, Quantity: 5, ExitReason: store.ExitReasonSellSignal,
 	}
 	db := &recoveryExitStore{
 		fakeExitStore: newFakeExitStore(),
@@ -745,5 +936,8 @@ func TestOrderlessRecoveryClosesFlatTradeAtConservativePrice(t *testing.T) {
 	}
 	if stats.Recovered != 1 {
 		t.Fatalf("stats = %+v, want one recovery", stats)
+	}
+	if len(stats.Closed) != 1 || stats.Closed[0].ExitReason != store.ExitReasonSellSignal {
+		t.Fatalf("recovered close events = %+v, want durable sell reason", stats.Closed)
 	}
 }

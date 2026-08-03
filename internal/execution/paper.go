@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/logger"
 )
@@ -67,6 +68,9 @@ func (p *PaperExecutor) PlaceOrder(_ context.Context, req OrderRequest) (OrderRe
 
 	// Market and limit orders fill immediately.
 	fillPrice := req.LimitPrice
+	if req.Type == OrderTypeMarket {
+		fillPrice = req.ReferencePrice
+	}
 	if fillPrice == 0 {
 		fillPrice = req.StopPrice
 	}
@@ -76,6 +80,7 @@ func (p *PaperExecutor) PlaceOrder(_ context.Context, req OrderRequest) (OrderRe
 		Status:        "filled",
 		FilledPrice:   fillPrice,
 		FilledQty:     req.Quantity,
+		FilledAt:      time.Now().UTC(),
 	}
 	p.orders[id] = &paperOrder{result: result, request: req}
 
@@ -181,6 +186,7 @@ func (p *PaperExecutor) SimulateFill(orderID string, price float64) error {
 	o.result.Status = "filled"
 	o.result.FilledPrice = price
 	o.result.FilledQty = o.request.Quantity
+	o.result.FilledAt = time.Now().UTC()
 	logger.Debug("paper stop order filled (simulated)",
 		"id", orderID,
 		"ticker", o.request.Ticker,

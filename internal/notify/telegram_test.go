@@ -244,7 +244,7 @@ func TestTradeClosedNotification(t *testing.T) {
 		ExitPrice:  220.0,
 		PnL:        200.0,
 		PnLPct:     10.0,
-		Reason:     "take-profit hit",
+		Reason:     "take_profit",
 	})
 
 	time.Sleep(200 * time.Millisecond)
@@ -257,6 +257,26 @@ func TestTradeClosedNotification(t *testing.T) {
 	}
 	if !strings.Contains(text, "🟢") {
 		t.Error("positive P&L should show green emoji")
+	}
+	if !strings.Contains(text, "take-profit hit") {
+		t.Errorf("canonical reason was not rendered for operators: %q", text)
+	}
+}
+
+func TestExitReasonLabel(t *testing.T) {
+	cases := map[string]string{
+		"stop_loss":       "stop-loss hit",
+		"take_profit":     "take-profit hit",
+		"sell_signal":     "sell signal",
+		"trailing_atr":    "ATR trailing stop",
+		"ema9_close":      "daily close below EMA9",
+		"broker_recovery": "broker recovery",
+		"":                "unknown",
+	}
+	for input, want := range cases {
+		if got := exitReasonLabel(input); got != want {
+			t.Errorf("exitReasonLabel(%q) = %q, want %q", input, got, want)
+		}
 	}
 }
 
