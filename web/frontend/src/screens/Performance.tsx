@@ -60,6 +60,7 @@ interface EntryPerformance {
   by_direction: Bucket[];
   by_analysts: Bucket[];
   by_role: Bucket[];
+  by_role_model: Bucket[];
   concentration: Concentration;
   confidence_gate: number;
 }
@@ -124,11 +125,26 @@ const MODE_LABELS: Record<string, string> = {
   arbitrated: 'Arbitrated',
   consensus: 'Consensus',
 };
-type Dim = 'mode' | 'strategy' | 'direction' | 'analysts' | 'role';
+type Dim = 'mode' | 'strategy' | 'direction' | 'analysts' | 'role' | 'role_model';
+
+// Both role cuts score directional calls, not executed trades: they show a hit
+// rate and omit Net (attributing a trade's P&L to a role that may have dissented
+// would be misleading — Codex #390).
+const isRoleDim = (dim: Dim): boolean => dim === 'role' || dim === 'role_model';
+
+function prettyRole(raw: string): string {
+  const s = raw.replace(/_/g, ' ');
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
 function prettyLabel(dim: Dim, raw: string): string {
   if (dim === 'mode') return MODE_LABELS[raw] ?? raw;
   if (dim === 'analysts') return `${raw} analyst${raw === '1' ? '' : 's'}`;
-  if (dim === 'role') { const s = raw.replace(/_/g, ' '); return s.charAt(0).toUpperCase() + s.slice(1); }
+  if (dim === 'role') return prettyRole(raw);
+  // "role · model" — prettify only the role half; model IDs are verbatim.
+  if (dim === 'role_model') {
+    const sep = raw.indexOf(' · ');
+    return sep < 0 ? prettyRole(raw) : `${prettyRole(raw.slice(0, sep))}${raw.slice(sep)}`;
+  }
   return raw.charAt(0).toUpperCase() + raw.slice(1);
 }
 
@@ -157,6 +173,7 @@ function ConfTooltip({ active, payload }: TooltipProps) {
 
 const DIM_HEADER: Record<Dim, string> = {
   mode: 'Decision mode', strategy: 'Strategy', direction: 'Direction', analysts: 'Analysts', role: 'Analyst role',
+  role_model: 'Role · model',
 };
 
 function BreakdownTable({
@@ -173,10 +190,8 @@ function BreakdownTable({
   const bestLabel = highlightBest && rows.length
     ? rows.reduce((a, b) => (b.win_rate_pct > a.win_rate_pct ? b : a)).label
     : null;
-  const winHeader = dim === 'role' ? 'Hit rate' : 'Win rate';
-  // Net is omitted for roles: attributing the executed trade's P&L to a role
-  // that may have dissented would be misleading (Codex #390).
-  const showNet = dim !== 'role';
+  const winHeader = isRoleDim(dim) ? 'Hit rate' : 'Win rate';
+  const showNet = !isRoleDim(dim);
   return (
     <CornerCard bracketColor="var(--border)" className={styles.tableCard}>
       <div className={styles.tableTitle}>{title}</div>
@@ -390,6 +405,11 @@ export default function Performance() {
               title="By analyst role — specialist mode" dim="role" rows={data.by_role} highlightBest
               emptyMsg="No role-tagged trades yet. Enable specialist mode (analysis.specialist_mode_enabled) — once it produces closed trades, each angle's hit rate appears here."
               caption="Hit rate = how often the angle's directional call matched the outcome: right when it backed the taken side and the trade won, or dissented and the trade lost (HOLD/WAIT abstentions excluded). Populates only under specialist mode."
+            />
+            <BreakdownTable
+              title="By role and model — specialist mode" dim="role_model" rows={data.by_role_model}
+              emptyMsg="No role-tagged trades yet. Enable specialist mode (analysis.specialist_mode_enabled) — once it produces closed trades, each angle's hit rate per model appears here."
+              caption="Same hit rate, split by the model that served the angle. Roles are remappable in analysis.specialist_roles, so the angle-only table above averages across every model ever assigned to a role — read this one when comparing models or after a reassignment."
             />
           </div>
 
