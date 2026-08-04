@@ -606,23 +606,55 @@ type openPos struct {
 	takeProfit float64
 	exitSignal bool // gated SELL signal received — close at next candle open
 
-	// Trailing / risk state (exit-policy-study). stopLoss is the fixed hard
-	// protective floor throughout the trade; trailStop rides above it.
+	// Trailing / risk state (exit-policy-study). stopLoss is the original hard
+	// stop recorded at entry and is never reassigned; it stays the floor and
+	// the 1R reference. Under the ATR rule trailStop is the level actually
+	// resting at the broker (it starts equal to stopLoss and only ratchets
+	// up), so activeStop reports it in place of stopLoss.
 	riskPerShare float64 // entryPrice - stopLoss (1R)
 	highWater    float64 // highest high seen since entry
 	trailStop    float64 // ratcheted ATR trailing stop (never decreases)
 }
 
-// evaluateExit decides whether the position exits on this candle under the given
-// policy, returning the closed trade when it does. barATR/barEMA are this
-// candle's ATR(14) and EMA(policy.emaPeriod) values (0 when unavailable).
+// activeStop returns the protective stop level resting at the broker during
+// this bar.
 //
-// Precedence: a gated SELL exits at the open; a catastrophic move through the
-// initial stop exits at that stop; then TP (baseline) or the trailing rule
-// (trail mode). Trailing is CLOSE-based to mirror the live trailing-stop
-// manager and Martin's "close below the N-EMA" rule.
-func evaluateExit(pos *openPos, candle data.Candle, barATR, barEMA float64, p exitPolicy) (SimulatedTrade, bool) {
-	// Ratchet trailing state on every candle first (uses this bar's high).
+// In ATR-trail mode the live manager REPLACES the broker stop with the
+// ratcheted level (trailing.submitOrReplaceStop), so there is only ever one
+// stop and it can never sit below the original hard stop — trailing.
+// ComputeNewStop clamps with max(currentStop, hwm-mult*atr). The max() here
+// restates that invariant defensively rather than trusting callers.
+//
+// The EMA rule deliberately leaves the broker stop where it started
+// (trailing.updateOneEMA9: moving it would turn a close-confirmed rule into an
+// intraday touch rule), so it always reports the original hard stop.
+func (pos *openPos) activeStop(p exitPolicy) float64 {
+	if p.trail && !p.useEMA {
+		return math.Max(pos.trailStop, pos.stopLoss)
+	}
+	return pos.stopLoss
+}
+
+// stopFill models a resting broker stop order. It triggers when the bar trades
+// at or below the stop and fills at the stop price — unless the bar gaps open
+// below it, in which case the stop is swept through and fills at the open.
+// Filling at the stop price on a gap-down would credit a price that never
+// traded.
+func stopFill(stop float64, candle data.Candle) float64 {
+	if candle.Open < stop {
+		return candle.Open
+	}
+	return stop
+}
+
+// ratchet advances trailing state using this bar's high.
+//
+// It deliberately runs only AFTER the bar's stop check. The stop resting during
+// a bar is the one the manager placed from previously observed prices; letting
+// this bar's own high raise the stop before testing that same bar's low would
+// be lookahead — the live manager cannot place a stop derived from a high that
+// has not printed yet.
+func (pos *openPos) ratchet(candle data.Candle, barATR float64, p exitPolicy) {
 	if candle.High > pos.highWater {
 		pos.highWater = candle.High
 	}
@@ -631,30 +663,51 @@ func evaluateExit(pos *openPos, candle data.Candle, barATR, barEMA float64, p ex
 			pos.trailStop = cand
 		}
 	}
+}
 
+// evaluateExit decides whether the position exits on this candle under the given
+// policy, returning the closed trade when it does. barATR/barEMA are this
+// candle's ATR(14) and EMA(policy.emaPeriod) values (0 when unavailable).
+//
+// Precedence: a gated SELL exits at the open; then the protective stop resting
+// at the broker (intrabar); then TP (baseline) or the EMA rule (close-based).
+//
+// The two trailing rules exit through different mechanisms because the live
+// ones do:
+//
+//   - atr:  the ratcheted stop REPLACES the broker stop, so it rests there and
+//     fills INTRABAR at its own price (trailing.submitOrReplaceStop).
+//   - ema9: the broker stop stays put and the winning exit is confirmed on the
+//     CLOSE below the EMA (trailing.updateOneEMA9).
+func evaluateExit(pos *openPos, candle data.Candle, barATR, barEMA float64, p exitPolicy) (SimulatedTrade, bool) {
 	// 1. Gated SELL signal from the previous candle — exit at this open.
 	if pos.exitSignal {
 		return closePosition(pos, candle.Timestamp, candle.Open, "signal"), true
 	}
-	// 2. Move through the hard protective stop (intrabar).
-	if pos.stopLoss > 0 && candle.Low <= pos.stopLoss {
-		return closePosition(pos, candle.Timestamp, pos.stopLoss, "stop_loss"), true
+	// 2. Move through the protective stop resting at the broker (intrabar).
+	//    Under the ATR rule this is the ratcheted level; attribute the exit to
+	//    the trail only once it has actually ratcheted above the hard stop, so
+	//    the exit-reason split stays meaningful.
+	if stop := pos.activeStop(p); stop > 0 && candle.Low <= stop {
+		reason := "stop_loss"
+		if p.trail && !p.useEMA && stop > pos.stopLoss {
+			reason = "trail_atr"
+		}
+		return closePosition(pos, candle.Timestamp, stopFill(stop, candle), reason), true
 	}
 	if p.trail {
-		// 3a. Trailing exit (close-based).
-		if p.useEMA {
-			if barEMA > 0 && candle.Close < barEMA {
-				return closePosition(pos, candle.Timestamp, candle.Close, "trail_ema"), true
-			}
-		} else if pos.trailStop > 0 && candle.Close < pos.trailStop {
-			return closePosition(pos, candle.Timestamp, candle.Close, "trail_atr"), true
+		// 3a. EMA trailing exit (close-based).
+		if p.useEMA && barEMA > 0 && candle.Close < barEMA {
+			return closePosition(pos, candle.Timestamp, candle.Close, "trail_ema"), true
 		}
+		pos.ratchet(candle, barATR, p)
 		return SimulatedTrade{}, false
 	}
 	// 3b. Baseline: fixed take-profit cap (intrabar high).
 	if pos.takeProfit > 0 && candle.High >= pos.takeProfit {
 		return closePosition(pos, candle.Timestamp, pos.takeProfit, "take_profit"), true
 	}
+	pos.ratchet(candle, barATR, p)
 	return SimulatedTrade{}, false
 }
 
