@@ -289,17 +289,85 @@ func TestResolveExitPolicy_Defaults(t *testing.T) {
 
 // ── evaluateExit (trail / uncap / R-multiple) ─────────────────────────────────
 
-func TestEvaluateExit_TrailATR_ClosesBelowTrail(t *testing.T) {
+// The live ATR rule replaces the broker stop with the ratcheted level, so it
+// rests there and fills INTRABAR at its own price. Exiting at the close (the
+// pre-fix behavior) both delayed the exit and credited the wrong fill.
+func TestEvaluateExit_TrailATR_FillsIntrabarAtTrailPrice(t *testing.T) {
 	pos := newPos(90, 0)
 	pos.highWater = 130
 	pos.trailStop = 120
-	candle := data.Candle{Timestamp: time.Now(), Open: 122, High: 124, Low: 115, Close: 118} // close < trailStop
+	// Low pierces the trail intrabar; the close recovers back above it.
+	candle := data.Candle{Timestamp: time.Now(), Open: 122, High: 124, Low: 115, Close: 121}
 	trade, triggered := evaluateExit(pos, candle, 0 /*no ratchet*/, 0, exitPolicy{trail: true, atrMult: 1.5})
 	if !triggered {
-		t.Fatal("expected ATR-trail exit when close falls below the trailing stop")
+		t.Fatal("expected ATR-trail exit when the bar trades through the resting stop")
 	}
-	if trade.ExitReason != "trail_atr" || trade.ExitPrice != 118 {
-		t.Errorf("expected trail_atr @118, got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	if trade.ExitReason != "trail_atr" || trade.ExitPrice != 120 {
+		t.Errorf("expected trail_atr @120 (the stop price), got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	}
+}
+
+// A bar that gaps open below the resting stop sweeps through it; filling at the
+// stop price would credit a price that never traded.
+func TestEvaluateExit_TrailATR_GapDownFillsAtOpen(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.trailStop = 120
+	candle := data.Candle{Timestamp: time.Now(), Open: 110, High: 112, Low: 105, Close: 108}
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if !triggered {
+		t.Fatal("expected exit when the bar gaps below the resting stop")
+	}
+	if trade.ExitPrice != 110 {
+		t.Errorf("gap-down must fill at the open (110), got %.2f", trade.ExitPrice)
+	}
+}
+
+// Before the trail ratchets above the entry stop the exit is an ordinary
+// stop-out, so the exit-reason split stays interpretable.
+func TestEvaluateExit_TrailATR_ReasonIsStopLossBeforeRatchet(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.trailStop = 90 // still at the entry stop
+	candle := data.Candle{Timestamp: time.Now(), Open: 95, High: 96, Low: 85, Close: 88}
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if !triggered {
+		t.Fatal("expected stop-out")
+	}
+	if trade.ExitReason != "stop_loss" || trade.ExitPrice != 90 {
+		t.Errorf("expected stop_loss @90, got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	}
+}
+
+// Lookahead guard: the stop resting during a bar is the one placed from
+// previously observed prices. Ratcheting on this bar's own high before testing
+// its low would let the stop clairvoyantly ride the bar it exits on.
+func TestEvaluateExit_TrailATR_NoLookaheadOnRatchetBar(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.highWater = 100
+	pos.trailStop = 90
+	// High 150 with ATR 10 × 1.5 implies a 135 trail. Low 130 is below that
+	// implied level but far above the stop actually resting during the bar (90).
+	candle := data.Candle{Timestamp: time.Now(), Open: 140, High: 150, Low: 130, Close: 145}
+	_, triggered := evaluateExit(pos, candle, 10, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if triggered {
+		t.Fatal("must not exit on the same bar whose high raised the trail (lookahead)")
+	}
+	if pos.trailStop != 135 {
+		t.Errorf("trail should ratchet to 135 for subsequent bars, got %.2f", pos.trailStop)
+	}
+}
+
+// trailStop can never loosen protection below the original hard stop; live
+// ComputeNewStop clamps with max(currentStop, ...).
+func TestEvaluateExit_TrailATR_NeverLoosensBelowHardStop(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.trailStop = 88 // below the hard stop — must not widen the exit
+	candle := data.Candle{Timestamp: time.Now(), Open: 95, High: 96, Low: 89, Close: 91}
+	trade, triggered := evaluateExit(pos, candle, 0, 0, exitPolicy{trail: true, atrMult: 1.5})
+	if !triggered {
+		t.Fatal("expected the hard stop to still protect at 90")
+	}
+	if trade.ExitPrice != 90 {
+		t.Errorf("expected fill at the hard stop 90, got %.2f", trade.ExitPrice)
 	}
 }
 
@@ -327,6 +395,40 @@ func TestEvaluateExit_TrailEMA(t *testing.T) {
 	}
 	if trade.ExitReason != "trail_ema" || trade.ExitPrice != 95 {
 		t.Errorf("expected trail_ema @95, got %q @%.2f", trade.ExitReason, trade.ExitPrice)
+	}
+}
+
+// updateOneEMA9 deliberately leaves the broker stop where it started: moving it
+// to the EMA would convert a close-confirmed rule into an intraday touch rule.
+// The replay must not ratchet it either, or the two arms stop being comparable.
+func TestEvaluateExit_TrailEMA_StopNeverRatchets(t *testing.T) {
+	pos := newPos(90, 0)
+	pos.trailStop = 90
+	p := exitPolicy{trail: true, useEMA: true, emaPeriod: 9, atrMult: 1.5}
+	// A large up-bar that would move an ATR trail well above the entry stop.
+	candle := data.Candle{Timestamp: time.Now(), Open: 150, High: 200, Low: 148, Close: 195}
+	if _, triggered := evaluateExit(pos, candle, 10, 100 /*ema below close*/, p); triggered {
+		t.Fatal("should hold while the close stays above the EMA")
+	}
+	if pos.trailStop != 90 {
+		t.Errorf("EMA rule must not ratchet the stop; got %.2f, want 90", pos.trailStop)
+	}
+	if got := pos.activeStop(p); got != 90 {
+		t.Errorf("EMA rule must keep the original hard stop resting; got %.2f, want 90", got)
+	}
+}
+
+// The hard stop is a resting broker order under the EMA rule too, so a gap
+// through it fills at the open rather than at the stop price.
+func TestEvaluateExit_TrailEMA_HardStopGapFillsAtOpen(t *testing.T) {
+	pos := newPos(90, 0)
+	candle := data.Candle{Timestamp: time.Now(), Open: 85, High: 88, Low: 83, Close: 87}
+	trade, triggered := evaluateExit(pos, candle, 0, 95, exitPolicy{trail: true, useEMA: true, emaPeriod: 9})
+	if !triggered {
+		t.Fatal("expected the hard stop to fire on the gap")
+	}
+	if trade.ExitReason != "stop_loss" || trade.ExitPrice != 85 {
+		t.Errorf("expected stop_loss @85 (the open), got %q @%.2f", trade.ExitReason, trade.ExitPrice)
 	}
 }
 
