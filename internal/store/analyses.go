@@ -263,6 +263,7 @@ type EntryPerformance struct {
 	ByDirection    []EntryPerfBucket      `json:"by_direction"`
 	ByAnalysts     []EntryPerfBucket      `json:"by_analysts"`
 	ByRole         []EntryPerfBucket      `json:"by_role"`
+	ByRoleModel    []EntryPerfBucket      `json:"by_role_model"`
 	Concentration  EntryPerfConcentration `json:"concentration"`
 	ConfidenceGate float64                `json:"confidence_gate"`
 }
@@ -303,7 +304,15 @@ func entryBuckets(ctx context.Context, labelExpr, groupOrder string) ([]EntryPer
 // win. HOLD/WAIT abstentions are excluded. Empty until specialist mode has run:
 // the "Role" key only exists in ensemble_results written after that feature is
 // enabled (rows without it are filtered out here).
-func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
+//
+// labelExpr/groupOrder select the cut: `v.role` groups by angle alone, while
+// `v.role || ' · ' || v.model` splits each angle by the model that served it.
+// Both are needed because analysis.specialist_roles is remappable — a single
+// role accumulates votes from every model ever assigned to it, so the angle-only
+// cut silently averages across model swaps (risk_manager has already been served
+// by three). Callers pass trusted, constant SQL fragments only (never user
+// input), matching the entryBuckets contract.
+func entryRoleAccuracy(ctx context.Context, labelExpr, groupOrder string) ([]EntryPerfBucket, error) {
 	// Net and avg-P&L are deliberately NULL for role rows. Summing the executed
 	// trade's realized P&L against a role would misattribute it: a role that
 	// dissented from the taken side (said SELL, engine went long) would book the
@@ -311,7 +320,7 @@ func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
 	// positive "net". The role cut measures hit rate, not executed profitability
 	// (Codex #390). n + hit rate + avg confidence are the honest columns.
 	q := entryBaseCTE + `
-		SELECT v.role,
+		SELECT ` + labelExpr + ` AS label,
 		       count(*)::int,
 		       round(100.0 * avg(v.correct::int)::numeric, 1)::float8,
 		       NULL::float8,
@@ -319,6 +328,13 @@ func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
 		       round(avg(v.conf)::numeric, 3)::float8
 		FROM (
 		    SELECT elem->>'Role' AS role,
+		           -- Model rides along in ensemble_results because AnalystResult
+		           -- has no JSON tags: encoding/json emits the Go field names, so
+		           -- Provider/Model have been persisted alongside Role since the
+		           -- role was first recorded. Coalesced so a vote whose call
+		           -- succeeded but whose call metadata is missing still counts
+		           -- toward accuracy instead of producing a dangling label.
+		           COALESCE(NULLIF(elem->>'Model', ''), 'unknown') AS model,
 		           (elem->'Response'->>'confidence')::float8 AS conf,
 		           CASE
 		               WHEN (CASE upper(elem->'Response'->>'action')
@@ -331,7 +347,7 @@ func entryRoleAccuracy(ctx context.Context) ([]EntryPerfBucket, error) {
 		    WHERE COALESCE(elem->>'Role', '') <> ''
 		      AND upper(elem->'Response'->>'action') IN ('BUY', 'SELL')
 		) v
-		GROUP BY 1 ORDER BY 3 DESC`
+		` + groupOrder
 	rows, err := GetDB().Query(ctx, q)
 	if err != nil {
 		return nil, err
@@ -400,7 +416,13 @@ func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 	if ep.ByAnalysts, err = entryBuckets(ctx, `n_analysts::text`, `GROUP BY 1 ORDER BY min(n_analysts)`); err != nil {
 		return nil, err
 	}
-	if ep.ByRole, err = entryRoleAccuracy(ctx); err != nil {
+	if ep.ByRole, err = entryRoleAccuracy(ctx, `v.role`, `GROUP BY 1 ORDER BY 3 DESC`); err != nil {
+		return nil, err
+	}
+	// Ordered by label, not hit rate: the label is role-prefixed, so alphabetical
+	// keeps each angle's models adjacent — which is the comparison this cut
+	// exists to make. Ranking across angles would interleave them.
+	if ep.ByRoleModel, err = entryRoleAccuracy(ctx, `v.role || ' · ' || v.model`, `GROUP BY 1 ORDER BY 1`); err != nil {
 		return nil, err
 	}
 

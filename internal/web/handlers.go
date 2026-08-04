@@ -844,9 +844,12 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 //
 // Signal-provenance study: every closed equity entry joined back to the
 // analysis that produced it, sliced by confidence band, decision mode
-// (fast-path / arbitrated / consensus), strategy, direction and analyst count.
-// Read-only. confidence_gate is the live risk.confidence_threshold so the UI can
-// mark the entry gate on the confidence chart.
+// (fast-path / arbitrated / consensus), strategy, direction and analyst count,
+// plus two specialist-mode cuts — by_role (per analytical angle) and
+// by_role_model (that angle split by the model that served it, since
+// analysis.specialist_roles is remappable). Read-only. confidence_gate is the
+// live risk.confidence_threshold so the UI can mark the entry gate on the
+// confidence chart.
 func (s *Server) handleEntryPerformance(w http.ResponseWriter, r *http.Request) {
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
