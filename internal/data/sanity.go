@@ -5,6 +5,7 @@ import (
 	"math"
 	"sort"
 	"sync"
+	"time"
 )
 
 // Candle sanity guards (issue #519). Providers occasionally serve a corrupt
@@ -208,6 +209,12 @@ func SanitizeCandlesWith(candles []Candle, cfg CandleSanityConfig) ([]Candle, []
 		kept := make([]Candle, 0, len(idxs))
 		pending := make([]int, 0, 4)
 		pendingRej := make(map[int]CandleRejection, 4)
+		// pendingTS sizes a run by DISTINCT timestamps. Providers legitimately
+		// re-send the still-forming bar, and a batch may carry several snapshots
+		// of one timestamp; counting slice entries would let repeated copies of a
+		// single corrupt bar reach the re-rating threshold and be restored as
+		// though the price had actually moved.
+		pendingTS := make(map[time.Time]struct{}, 4)
 
 		settle := func() { // the run was isolated corruption
 			for i, r := range pendingRej {
@@ -215,6 +222,7 @@ func SanitizeCandlesWith(candles []Candle, cfg CandleSanityConfig) ([]Candle, []
 			}
 			pending = pending[:0]
 			clear(pendingRej)
+			clear(pendingTS)
 		}
 		restore := func() { // the run was a real level shift
 			for _, i := range pending {
@@ -222,7 +230,26 @@ func SanitizeCandlesWith(candles []Candle, cfg CandleSanityConfig) ([]Candle, []
 			}
 			pending = pending[:0]
 			clear(pendingRej)
+			clear(pendingTS)
 		}
+
+		// regimeStart is the index in kept where the current price regime began.
+		// Restoring a run is not sufficient on its own: the median scale still
+		// looks back over ScaleWindow bars that are mostly the OLD regime, so
+		// the very next bar of the same genuine move is judged wide again and
+		// starts a fresh pending run. A move lasting more than
+		// MaxConsecutiveRejections bars would lose its tail — the exact data
+		// loss the restore path exists to prevent.
+		//
+		// Re-anchoring the scale rather than latching "accept everything" is
+		// what keeps this safe. After a restore the newly confirmed bars ARE
+		// the evidence for the new level, so they become the reference: a
+		// genuine continuation now measures ~1x and passes, while a fabricated
+		// spike is still enormous against that same reference and is rejected
+		// normally. A blanket latch would instead admit any wide bar — an
+		// unrelated corrupt print landing right after a real re-rating would
+		// bypass the threshold entirely.
+		regimeStart := 0
 
 		for _, i := range idxs {
 			c := candles[i]
@@ -236,16 +263,19 @@ func SanitizeCandlesWith(candles []Candle, cfg CandleSanityConfig) ([]Candle, []
 				kept = append(kept, c)
 				continue
 			}
-			if reason, detail, bad := excursive(c, kept, cfg); bad {
+			if reason, detail, bad := excursive(c, scaleWindow(kept, regimeStart, cfg), cfg); bad {
 				pending = append(pending, i)
 				pendingRej[i] = CandleRejection{Candle: c, Reason: reason, Detail: detail}
-				if len(pending) >= cfg.MaxConsecutiveRejections {
+				pendingTS[c.Timestamp.UTC()] = struct{}{}
+				if len(pendingTS) >= cfg.MaxConsecutiveRejections {
+					n := len(pending)
 					restore()
+					regimeStart = len(kept) - n
 				}
 				continue
 			}
-			// A bar that reconciles with the old reference proves the held run
-			// was an excursion, not a new level.
+			// A bar that reconciles with the current reference proves the held
+			// run was an excursion, not a new level.
 			settle()
 			kept = append(kept, c)
 		}
@@ -312,8 +342,40 @@ func intradayTimeframe(tf Timeframe) bool {
 	}
 }
 
+// scaleWindow returns the bars the median scale is derived from: the most
+// recent ScaleWindow kept bars, never reaching back past regimeStart.
+//
+// regimeStart moves forward when a run is restored as a genuine re-rating. That
+// re-anchoring is what makes the restore safe. Continuing to measure against
+// the pre-shift window would reject every later bar of the same real move; but
+// simply accepting whatever follows would let an unrelated corrupt print ride
+// in behind a legitimate re-rating. Measuring against the newly confirmed bars
+// does neither — a true continuation scores ~1x, a fabricated spike is still
+// enormous against the very bars that established the new level.
+//
+// Returns nil when there is not enough history to judge, in which case the bar
+// is admitted (it is structurally validated regardless). Before any confirmed
+// shift a full window is required, because judging on thin history at the start
+// of a fetch would reject ordinary bars. After a shift the restored run is
+// itself the evidence, so MaxConsecutiveRejections bars suffice — and are
+// guaranteed to exist, since that is exactly how many were just restored.
+func scaleWindow(kept []Candle, regimeStart int, cfg CandleSanityConfig) []Candle {
+	need := cfg.ScaleWindow + 1
+	if regimeStart > 0 {
+		need = cfg.MaxConsecutiveRejections
+	}
+	if len(kept)-regimeStart < need {
+		return nil
+	}
+	start := len(kept) - cfg.ScaleWindow
+	if start < regimeStart {
+		start = regimeStart
+	}
+	return kept[start:]
+}
+
 // excursive rejects an intraday bar whose OWN high-low range is implausibly
-// wide relative to the recent median range.
+// wide relative to the median range of the supplied window.
 //
 // Measuring the bar's own width rather than its distance from the previous
 // close is what makes this work, and the difference is not cosmetic. An
@@ -329,19 +391,15 @@ func intradayTimeframe(tf Timeframe) bool {
 // Both a range multiple and a percentage-of-price floor must be breached. The
 // floor stops a pathologically quiet reference window (median range near zero,
 // common in illiquid tape) from turning an ordinary bar into a large multiple.
-//
-// Returns false (accept) when there is not enough history to judge: silently
-// discarding the leading bars of every fetch would be worse than admitting
-// them, and they are structurally validated regardless.
-func excursive(c Candle, prior []Candle, cfg CandleSanityConfig) (reason, detail string, bad bool) {
+func excursive(c Candle, window []Candle, cfg CandleSanityConfig) (reason, detail string, bad bool) {
 	if !intradayTimeframe(c.Timeframe) {
 		return "", "", false
 	}
-	if len(prior) < cfg.ScaleWindow+1 {
+	if len(window) == 0 {
 		return "", "", false
 	}
-	scale := medianRange(prior[len(prior)-cfg.ScaleWindow:])
-	prevClose := prior[len(prior)-1].Close
+	scale := medianRange(window)
+	prevClose := window[len(window)-1].Close
 	if scale <= 0 || prevClose <= 0 {
 		// A flat window carries no volatility information to judge against.
 		return "", "", false

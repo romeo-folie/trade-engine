@@ -1,6 +1,7 @@
 package data
 
 import (
+	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -400,5 +401,123 @@ func TestSanitize_PendingRunAtSeriesEndIsFlushed(t *testing.T) {
 	}
 	if len(kept)+len(rejected) != len(bars) {
 		t.Errorf("bars lost: kept %d + rejected %d != %d input", len(kept), len(rejected), len(bars))
+	}
+}
+
+// Codex review finding 2: a genuine move lasting longer than
+// MaxConsecutiveRejections must not lose its tail. After the run is restored
+// the median window still looks back mostly at the OLD regime, so without a
+// latch the very next bar of the same move restarts a pending run and is
+// dropped at end-of-series.
+func TestSanitize_ReRatingLongerThanThresholdKeepsEveryBar(t *testing.T) {
+	cfg := DefaultCandleSanity() // MaxConsecutiveRejections = 3
+	for _, runLen := range []int{3, 4, 5, 7} {
+		t.Run(fmt.Sprintf("run_of_%d", runLen), func(t *testing.T) {
+			bars := series("ABVX", Timeframe1Hour, 25, 10.00, 0.20)
+			for range runLen {
+				bars = append(bars, Candle{
+					Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+					Open: 10.0, High: 16.0, Low: 9.8, Close: 15.5, Volume: 900,
+				})
+			}
+			kept, rejected := SanitizeCandlesWith(bars, cfg)
+			if len(rejected) != 0 {
+				t.Fatalf("run of %d: expected every bar restored, got %d rejections (first: %v)",
+					runLen, len(rejected), rejected[0])
+			}
+			if len(kept) != len(bars) {
+				t.Errorf("run of %d: kept %d, want %d", runLen, len(kept), len(bars))
+			}
+		})
+	}
+}
+
+// Guarding resumes normally once trade settles at the new level: a later
+// isolated spike is corruption again, judged against the new regime's own
+// scale rather than the pre-shift one.
+func TestSanitize_GuardingResumesAfterReRating(t *testing.T) {
+	cfg := DefaultCandleSanity()
+	bars := series("ABVX", Timeframe1Hour, 25, 10.00, 0.20)
+	for range 3 { // confirmed re-rating to ~15.5
+		bars = append(bars, Candle{
+			Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+			Open: 10.0, High: 16.0, Low: 9.8, Close: 15.5, Volume: 900,
+		})
+	}
+	// Ordinary trade at the new level. These are narrow relative to the
+	// restored run, so they pass immediately — the point is that the guard is
+	// live again, not that it needed 20 bars to recover.
+	for range 22 {
+		bars = append(bars, Candle{
+			Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+			Open: 15.5, High: 15.6, Low: 15.4, Close: 15.5, Volume: 900,
+		})
+	}
+	// Now an isolated corrupt spike, which must be caught again.
+	bars = append(bars, Candle{
+		Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+		Open: 15.5, High: 40.0, Low: 15.4, Close: 38.0, Volume: 900,
+	})
+	_, rejected := SanitizeCandlesWith(bars, cfg)
+	if len(rejected) != 1 {
+		t.Fatalf("guarding must resume after a re-rating; got %d rejections", len(rejected))
+	}
+	if rejected[0].Candle.High != 40.0 {
+		t.Errorf("wrong bar rejected: high %.2f", rejected[0].Candle.High)
+	}
+}
+
+// Re-review finding: a confirmed re-rating must NOT become a window through
+// which unrelated corruption walks in. An early fix latched "accept anything
+// wide" after a restore, so a fabricated spike landing on the very next bar was
+// admitted with no threshold at all — weaker than having no restore logic.
+//
+// Re-anchoring the scale to the restored bars is what closes it: a genuine
+// continuation measures ~1x against them, a fabricated spike remains enormous.
+func TestSanitize_CorruptSpikeRightAfterReRatingIsStillRejected(t *testing.T) {
+	cfg := DefaultCandleSanity()
+	bars := series("ABVX", Timeframe1Hour, 25, 10.00, 0.20)
+	for range 3 { // confirmed re-rating to ~15.5
+		bars = append(bars, Candle{
+			Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+			Open: 10.0, High: 16.0, Low: 9.8, Close: 15.5, Volume: 900,
+		})
+	}
+	// Immediately after the restore: a bar with nothing to do with ~15.5.
+	bars = append(bars, Candle{
+		Ticker: "ABVX", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+		Open: 15.5, High: 500.0, Low: 15.3, Close: 490.0, Volume: 900,
+	})
+
+	_, rejected := SanitizeCandlesWith(bars, cfg)
+	if len(rejected) != 1 {
+		t.Fatalf("corruption right after a re-rating must still be caught, got %d rejections", len(rejected))
+	}
+	if rejected[0].Candle.High != 500.0 {
+		t.Errorf("wrong bar rejected: high %.2f", rejected[0].Candle.High)
+	}
+}
+
+// Duplicate snapshots of ONE timestamp are not evidence of a sustained move.
+// The run is sized by distinct timestamps, so repeated copies of a single
+// corrupt bar can never reach the re-rating threshold — this holds for every
+// caller of the sanitizer, not just the DB write path.
+func TestSanitize_RepeatedSnapshotsOfOneBarCannotReachThreshold(t *testing.T) {
+	cfg := DefaultCandleSanity()
+	bars := series("ANET", Timeframe1Hour, 25, 190.34, 2.0)
+	corrupt := Candle{
+		Ticker: "ANET", Timeframe: Timeframe1Hour, Timestamp: at(bars, 1),
+		Open: 190.40, High: 224.98, Low: 190.20, Close: 211.47, Volume: 5000,
+	}
+	bars = append(bars, corrupt, corrupt, corrupt, corrupt)
+
+	kept, rejected := SanitizeCandlesWith(bars, cfg)
+	if len(rejected) != 4 {
+		t.Fatalf("all 4 snapshots of the corrupt bar must be rejected, got %d", len(rejected))
+	}
+	for _, c := range kept {
+		if c.High > 200 {
+			t.Errorf("a corrupt snapshot survived: high %.2f", c.High)
+		}
 	}
 }
