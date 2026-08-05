@@ -544,10 +544,47 @@ type MarketsConfig struct {
 	Dukascopy DukascopyConfig `yaml:"dukascopy"`
 	HistData  HistDataConfig  `yaml:"histdata"`
 	Exness    ExnessConfig    `yaml:"exness"`
+	// CandleSanity rejects corrupt provider bars before they reach the DB or
+	// the trailing manager (issue #519). Thresholds are calibrated in
+	// internal/data/sanity.go; leaving this block unset keeps those defaults.
+	CandleSanity CandleSanityConfig `yaml:"candle_sanity"`
 	// BacktestProvider selects the ORB backtest data source: "histdata" (default; free bulk
 	// tick ZIPs, no account/key/throttle), "dukascopy", "exness", or "oanda". Overridable
 	// per-run with `te backtest orb --provider`.
 	BacktestProvider string `yaml:"backtest_provider"`
+}
+
+// CandleSanityConfig mirrors data.CandleSanityConfig so the config package
+// stays a leaf (stdlib + yaml only) and never depends on internal/data.
+// Converted at wiring time; see cmd/te applyCandleSanity.
+//
+// Thresholds are calibrated against 4,440 real 1h bars — see the commentary in
+// internal/data/sanity.go before changing them. Zero values fall back to those
+// defaults rather than disabling the guard.
+type CandleSanityConfig struct {
+	// Enabled gates only the intraday range check. Structural validation
+	// (finite, positive, internally ordered OHLC) always runs — those bars are
+	// unambiguously corrupt and there is no legitimate reason to store one.
+	Enabled *bool `yaml:"enabled"`
+	// MaxRangeRatio caps an intraday bar's own high-low span in multiples of
+	// the window's median range.
+	MaxRangeRatio float64 `yaml:"max_range_ratio"`
+	// MaxRangePct is that same span as a percentage of the prior close. A bar
+	// must breach BOTH this and MaxRangeRatio to be rejected.
+	MaxRangePct float64 `yaml:"max_range_pct"`
+	// ScaleWindow is how many prior bars form the median-range scale.
+	ScaleWindow int `yaml:"scale_window"`
+	// MaxConsecutiveRejections is how many rejections in a row are
+	// reinterpreted as a genuine re-rating and restored.
+	MaxConsecutiveRejections int `yaml:"max_consecutive_rejections"`
+}
+
+// CandleSanityEnabled reports whether the continuity check runs, defaulting to
+// true when the operator has not set the key. A plain bool would make an
+// omitted key indistinguishable from an explicit `false`, silently disabling
+// the guard for every existing config file.
+func (c CandleSanityConfig) CandleSanityEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
 }
 
 // HistDataConfig configures the HistData.com historical tick provider — the preferred

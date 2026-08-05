@@ -524,11 +524,33 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 	if err != nil {
 		return 0, 0, err
 	}
+	// This path reads the provider directly and never touches the DB, so the
+	// UpsertCandles guard does not cover it (issue #519). A corrupt bar here
+	// feeds ATR and the high-water mark, and can therefore place a resting
+	// stop above the real market — closing a healthy position on bad data.
+	candles = sanitizeForTrailing(ticker, "1h", candles)
 	if len(candles) == 0 {
 		return 0, 0, errors.New("no candles returned")
 	}
 	atrVal := indicators.ComputeATR(candles, m.cfg.ATRPeriod)
 	return candles[len(candles)-1].Close, atrVal, nil
+}
+
+// sanitizeForTrailing drops corrupt bars before they reach ATR/EMA/high-water
+// computation and logs each rejection. Kept separate from the fetch so both
+// rules share one guard and one log shape.
+func sanitizeForTrailing(ticker, tf string, candles []data.Candle) []data.Candle {
+	clean, rejected := data.SanitizeCandles(candles)
+	for _, r := range rejected {
+		logger.Warn("trailing: rejected corrupt candle",
+			"ticker", ticker,
+			"timeframe", tf,
+			"ts", r.Candle.Timestamp.UTC().Format(time.RFC3339),
+			"reason", r.Reason,
+			"detail", r.Detail,
+		)
+	}
+	return clean
 }
 
 // priceAndEMA9 fetches daily candles so the live rule uses the same timeframe
@@ -542,6 +564,7 @@ func (m *Manager) priceAndEMA9(ctx context.Context, ticker string, now time.Time
 	if err != nil {
 		return 0, 0, time.Time{}, err
 	}
+	candles = sanitizeForTrailing(ticker, "1d", candles)
 	candles = completedDailyCandles(candles, now)
 	if len(candles) < EMAPeriod {
 		return 0, 0, time.Time{}, fmt.Errorf("need at least %d daily candles, got %d", EMAPeriod, len(candles))

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/spf13/cobra"
 )
 
@@ -14,6 +16,34 @@ It monitors markets, runs AI analysis via Claude and other models,
 manages a paper or live trading portfolio, and provides a full-featured
 terminal dashboard and Telegram integration.`,
 	SilenceUsage: true,
+	// config.Load() is called from ~20 subcommands, so the candle-sanity
+	// thresholds (issue #519) are installed once here instead of at every call
+	// site — a missed site would silently run a different guard than the
+	// operator configured. The guard's built-in defaults already apply without
+	// this, so a config-load failure downgrades to defaults rather than
+	// disabling protection.
+	PersistentPreRun: func(*cobra.Command, []string) {
+		applyCandleSanity()
+	},
+}
+
+// applyCandleSanity converts the operator's YAML into the data package's
+// process-wide guard configuration. The config package deliberately stays a
+// leaf (stdlib + yaml only), so the two structs are mirrored and translated
+// here rather than shared by import.
+func applyCandleSanity() {
+	cfg, err := config.Load()
+	if err != nil {
+		return // keep internal/data's calibrated defaults
+	}
+	cs := cfg.Markets.CandleSanity
+	data.SetCandleSanity(data.CandleSanityConfig{
+		Enabled:                  cs.CandleSanityEnabled(),
+		MaxRangeRatio:            cs.MaxRangeRatio,
+		MaxRangePct:              cs.MaxRangePct,
+		ScaleWindow:              cs.ScaleWindow,
+		MaxConsecutiveRejections: cs.MaxConsecutiveRejections,
+	})
 }
 
 func init() {

@@ -206,6 +206,31 @@ markets:
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/histdata)
   exness:
     data_dir: "docs"             # directory containing SYMBOL_M1_YEAR_exness.csv exports
+  # Corrupt-bar rejection (issue #519). Providers occasionally serve a bad
+  # aggregate: on 2026-08-04 Alpaca returned an ANET 1h bar at high 224.98 while
+  # the same session's daily high was 194.30 and the last trade was 190.53. That
+  # bar feeds ATR and the trailing high-water mark, so under trailing_stop.rule
+  # "atr" it would place a resting stop ABOVE the real market and close a healthy
+  # position at market on fabricated data.
+  #
+  # Structural validation (finite, positive, high>=low, high/low enclose the
+  # body) ALWAYS runs on every timeframe and is not configurable — such bars are
+  # unambiguously corrupt.
+  #
+  # The keys below tune the INTRADAY range check, which rejects a bar whose own
+  # high-low span is implausibly wide for the recent tape. It measures the bar's
+  # own width rather than its distance from the prior close, because real
+  # overnight gaps move further than the corrupt bar did (VOYG opened +30.6% on
+  # 2026-08-04 vs the corrupt bar's 18.2%) — a gap shifts the level without
+  # widening the bar. Daily bars are exempt entirely: their move distribution is
+  # too heavy-tailed to threshold (p99.9 = 110%), and gating them rejected real
+  # catalyst sessions such as ANET's -24% DeepSeek crash.
+  candle_sanity:
+    enabled: true                    # intraday range check on/off (structural checks always run). Unset = true
+    max_range_ratio: 15.0            # bar's own span as a multiple of the window's MEDIAN range (median, not mean: a mean is dragged up by the outlier being hunted). Widest legitimate intraday bar measured 10.13x; the corrupt bar was ~17.4x
+    max_range_pct: 10.0              # that span as % of prior close; BOTH this and the ratio must be exceeded to reject
+    scale_window: 20                 # prior bars forming the median-range scale
+    max_consecutive_rejections: 3    # a run this long is treated as a real re-rating and RESTORED, so a genuine level shift is never discarded
   dukascopy:
     base_url: ""                 # optional feed override (default datafeed.dukascopy.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/dukascopy)
