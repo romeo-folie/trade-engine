@@ -2232,3 +2232,58 @@ func TestBracketLeg_NoCancelResubmitFallback(t *testing.T) {
 		t.Fatalf("standalone stop was placed for a bracket-managed trade: %v", base.placed)
 	}
 }
+
+// TestManager_CorruptBarCannotRatchetStopAboveMarket is the live-path
+// regression for issue #519.
+//
+// priceAndATR reads the provider directly and never touches the DB, so the
+// UpsertCandles guard does not cover it. Without sanitisation the corrupt
+// 2026-08-04 ANET bar (high 224.98 against a real market near 190) would
+// ratchet the high-water mark to 224.98, compute a stop far above the current
+// price, and trip updateOne's "trail crossed price → exit at market" branch —
+// liquidating a healthy position on fabricated data.
+func TestManager_CorruptBarCannotRatchetStopAboveMarket(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "ANET", Direction: "long", Status: "open",
+		EntryPrice: 168.86, StopLoss: 156.87, Quantity: 10, HighWaterMark: 190,
+	}
+	fb := &fakeBroker{}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5, ATRPeriod: 14}, fs, nil, fb)
+
+	// 25 ordinary ~190 bars, then the corrupt spike. Ticker/Timeframe must be
+	// set: the guard groups per series and only gates intraday timeframes,
+	// exactly as real provider output is shaped.
+	base := time.Date(2026, 8, 4, 0, 0, 0, 0, time.UTC)
+	bars := make([]data.Candle, 0, 26)
+	for i := 0; i < 25; i++ {
+		bars = append(bars, data.Candle{
+			Ticker: "ANET", Timeframe: data.Timeframe1Hour,
+			Timestamp: base.Add(time.Duration(i) * time.Hour),
+			Open:      190.34, High: 191.34, Low: 189.34, Close: 190.34, Volume: 1000,
+		})
+	}
+	bars = append(bars, data.Candle{
+		Ticker: "ANET", Timeframe: data.Timeframe1Hour,
+		Timestamp: base.Add(25 * time.Hour),
+		Open:      190.40, High: 224.98, Low: 190.20, Close: 211.47, Volume: 5000,
+	})
+	m.prices = &fakePrices{candles: bars}
+	m.UpdateAll(context.Background())
+
+	got := fs.trades["t1"]
+	if got.HighWaterMark > 200 {
+		t.Errorf("corrupt bar ratcheted the high-water mark to %.2f", got.HighWaterMark)
+	}
+	if got.StopLoss > 190.34 {
+		t.Errorf("stop placed above the real market: %.2f (market ~190.34)", got.StopLoss)
+	}
+	if got.Status == "closed" {
+		t.Error("position liquidated on a corrupt bar")
+	}
+	for _, r := range fb.placed {
+		if r.StopPrice > 190.34 {
+			t.Errorf("submitted a stop above market: %.2f", r.StopPrice)
+		}
+	}
+}

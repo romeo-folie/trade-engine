@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/logger"
 )
 
 // UpsertCandles bulk-inserts candles for any mix of tickers/timeframes.
@@ -13,6 +14,12 @@ import (
 // session's still-forming candle on every poll. Completed bars may also be
 // revised for corrections or corporate-action adjustments.
 // Batches into chunks of 500 rows to stay well within Postgres parameter limits.
+//
+// Corrupt provider bars are dropped here (issue #519). This is the single
+// persistence chokepoint for every provider and every caller, so the guard
+// cannot be bypassed by adding a new ingest path. Rejections are logged rather
+// than swallowed — a bar disappearing silently would turn provider degradation
+// into an invisible failure.
 func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 	if len(candles) == 0 {
 		return nil
@@ -21,6 +28,13 @@ func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 	// would affect the same target row twice. Collapse duplicate provider
 	// snapshots before batching; the newest occurrence is the one callers
 	// expect to persist.
+	//
+	// This MUST run before sanitisation. The guard counts consecutive rejected
+	// entries toward its re-rating threshold, and repeated snapshots of ONE
+	// timestamp are not evidence of a sustained level shift — three copies of a
+	// single corrupt bar would reach the threshold, be "restored" as a genuine
+	// move, and then survive the collapse below and reach the database. Sizing
+	// the run in unique bars closes that.
 	type candleKey struct {
 		ticker    string
 		timeframe data.Timeframe
@@ -42,6 +56,20 @@ func UpsertCandles(ctx context.Context, candles []data.Candle) error {
 		unique = append(unique, candle)
 	}
 	candles = unique
+
+	candles, rejected := data.SanitizeCandles(candles)
+	for _, r := range rejected {
+		logger.Warn("rejected corrupt candle",
+			"ticker", r.Candle.Ticker,
+			"timeframe", string(r.Candle.Timeframe),
+			"ts", r.Candle.Timestamp.UTC().Format(time.RFC3339),
+			"reason", r.Reason,
+			"detail", r.Detail,
+		)
+	}
+	if len(candles) == 0 {
+		return nil
+	}
 
 	const batchSize = 500
 	for i := 0; i < len(candles); i += batchSize {
