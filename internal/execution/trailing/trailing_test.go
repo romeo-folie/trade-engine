@@ -550,6 +550,13 @@ func makeFlatPriceCandles(last float64, tail ...data.Candle) []data.Candle {
 	return out
 }
 
+// alwaysOpenSession pins the market calendar for tests that assert a market
+// exit actually prints. The ATR rule defers its market exit outside regular
+// hours (a DAY order submitted off-hours fills at the next open on stale
+// data), so without an injected calendar these tests would pass or fail
+// depending on the wall clock at which the suite happens to run.
+func alwaysOpenSession(time.Time) bool { return true }
+
 func dailyCloses(values ...float64) []data.Candle {
 	out := make([]data.Candle, 0, len(values))
 	for _, closePrice := range values {
@@ -1486,7 +1493,7 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 		nextStatus:    "filled",
 	}
 
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 1 {
@@ -1526,6 +1533,143 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 		t.Fatalf("duplicate market exit on second tick: placed %d → %d",
 			placedBefore, len(fb.placed))
 	}
+}
+
+// TestManager_ATRDefersMarketExitOutsideRegularSession is the ATR-rule
+// counterpart to TestManager_EMA9HonorsInjectedMarketCalendar.
+//
+// The gate only became load-bearing once the Alpaca 1h history fix landed:
+// before it, an off-hours FetchHistory returned zero bars (Alpaca's bars
+// endpoint defaults to the current session), so priceAndATR errored and the
+// ATR rule silently no-op'd overnight. With a real 30-day window the rule now
+// succeeds at 2am on the prior session's close, and an ungated
+// `newStop >= currentPrice` would submit a DAY market sell that queues until
+// the next open and fills on a decision never re-validated against the new
+// session. The resting broker stop must be left to do that job instead.
+func TestManager_ATRDefersMarketExitOutsideRegularSession(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-pre", Ticker: "AAPL",
+		Side:      string(execution.OrderSideSell),
+		OrderType: string(execution.OrderTypeStop),
+		Quantity:  10, StopPrice: 109, Status: "pending", IsStopLoss: true,
+	})
+	// HWM 200 against price 110 with a 0.1 multiple puts the trail far above
+	// the market — the exact condition that forces a market exit in session.
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{nextFillPrice: 110, nextFillQty: 10, nextStatus: "filled"}
+
+	m := NewManager(Config{
+		Enabled:     true,
+		ATRMultiple: 0.1,
+		MarketOpen:  func(time.Time) bool { return false },
+	}, fs, fp, fb)
+	m.now = func() time.Time {
+		return time.Date(2026, time.July, 24, 22, 15, 0, 0, newYorkLocation)
+	}
+
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("off-hours trail exit closed the trade: status=%q, want open", got)
+	}
+	for _, p := range fb.placed {
+		if p.Type == execution.OrderTypeMarket {
+			t.Fatalf("off-hours manager submitted a market order: %+v", p)
+		}
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("off-hours manager cancelled the protective stop: %v", fb.cancelled)
+	}
+	// The overnight protection must survive untouched.
+	leg, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || leg == nil {
+		t.Fatalf("protective stop missing after off-hours tick: leg=%+v err=%v", leg, err)
+	}
+	if leg.Status != "pending" || leg.StopPrice != 109 {
+		t.Fatalf("protective stop mutated off-hours: %+v", leg)
+	}
+
+	// Reopening the session must let the same condition fire immediately —
+	// the deferral is a delay, not a cancellation.
+	m.marketOpen = func(time.Time) bool { return true }
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got != "closed" {
+		t.Fatalf("deferred trail exit did not fire at the open: status=%q", got)
+	}
+	var markets int
+	for _, p := range fb.placed {
+		if p.Type == execution.OrderTypeMarket {
+			markets++
+		}
+	}
+	if markets != 1 {
+		t.Fatalf("market exits after reopen = %d, want exactly 1", markets)
+	}
+}
+
+// TestManager_ATRDeferralStillSeedsMissingProtectiveStop closes the hole the
+// off-hours gate would otherwise open. Uncapped entries are deliberately not
+// brackets, so the manager owns their only protection. If the trail has crossed
+// price overnight AND the leg is missing, returning early would leave the
+// position naked until the next session — the deferral must seed the original
+// hard stop first. The trail candidate itself is unusable here: a stop at or
+// above the market fills or is rejected on sight.
+func TestManager_ATRDeferralStillSeedsMissingProtectiveStop(t *testing.T) {
+	newManager := func(takeProfit float64) (*fakeStore, *fakeBroker, *Manager) {
+		fs := newFakeStore()
+		fs.trades["t1"] = store.Trade{
+			ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+			EntryPrice: 100, StopLoss: 95, Quantity: 10,
+			TakeProfit: takeProfit, HighWaterMark: 200,
+		}
+		// No protective leg exists at the broker.
+		fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+		fb := &fakeBroker{}
+		m := NewManager(Config{
+			Enabled:     true,
+			ATRMultiple: 0.1,
+			MarketOpen:  func(time.Time) bool { return false },
+		}, fs, fp, fb)
+		m.now = func() time.Time {
+			return time.Date(2026, time.July, 24, 22, 15, 0, 0, newYorkLocation)
+		}
+		return fs, fb, m
+	}
+
+	t.Run("uncapped trade is protected before deferring", func(t *testing.T) {
+		fs, fb, m := newManager(0)
+		m.UpdateAll(context.Background())
+
+		if len(fb.placed) != 1 {
+			t.Fatalf("orders placed = %+v, want exactly the protective stop", fb.placed)
+		}
+		if fb.placed[0].Type != execution.OrderTypeStop {
+			t.Fatalf("placed %v off-hours, want a STOP not a market exit", fb.placed[0].Type)
+		}
+		// Seeded at the original hard stop, never at the crossed trail
+		// candidate (which sits at 199.9, far above the 110 market).
+		if fb.placed[0].StopPrice != 95 {
+			t.Fatalf("seeded stop = %v, want the original hard stop 95", fb.placed[0].StopPrice)
+		}
+		if got := fs.trades["t1"].Status; got != "open" {
+			t.Fatalf("trade status = %q, want open (exit deferred)", got)
+		}
+	})
+
+	t.Run("capped trade keeps a single exit owner", func(t *testing.T) {
+		_, fb, m := newManager(130)
+		m.UpdateAll(context.Background())
+
+		if len(fb.placed) != 0 {
+			t.Fatalf("capped trade got a standalone stop off-hours: %+v", fb.placed)
+		}
+	})
 }
 
 func TestManager_NewProtectiveStopImmediateFillTransfersOwnership(t *testing.T) {
@@ -1708,7 +1852,7 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 		nextStatus:    "filled",
 	}
 
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	closed := fs.trades["t1"]
@@ -1771,7 +1915,7 @@ func TestManager_MarketExitRefusesRecordedFilledExitLeg(t *testing.T) {
 		},
 		nextStatus: "filled", nextFillPrice: 110, nextFillQty: 10,
 	}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 0 {
@@ -1801,7 +1945,7 @@ func TestManager_MarketExitFlattensResidualAfterPartialCancelledExitLeg(t *testi
 	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
 		"broker-partial-stop": {Status: "cancelled", FilledPrice: 108.5, FilledQty: 4},
 	}, nextStatus: "filled", nextFillPrice: 110, nextFillQty: 6}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
@@ -1832,7 +1976,7 @@ func TestManager_MarketExitUsesDurableFillWhenTerminalLegPurged(t *testing.T) {
 		notFoundIDs: map[string]bool{"broker-purged-partial-stop": true},
 		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 6,
 	}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
@@ -1863,7 +2007,7 @@ func TestManager_MarketExitUsesDurableFilledLegWhenPurged(t *testing.T) {
 		notFoundIDs: map[string]bool{"broker-purged-filled-stop": true},
 		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 6,
 	}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 1 || fb.placed[0].Quantity != 6 {
@@ -1893,7 +2037,7 @@ func TestManager_MarketExitFailsClosedForPurgedFilledLegWithoutQuantity(t *testi
 		notFoundIDs: map[string]bool{"broker-purged-filled-unknown": true},
 		nextStatus:  "filled", nextFillPrice: 110, nextFillQty: 10,
 	}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 0 {
@@ -1922,7 +2066,7 @@ func TestManager_MarketExitFailsClosedWhenTerminalLegIsWorkingAtBroker(t *testin
 	fb := &fakeBroker{statusResults: map[string]execution.OrderResult{
 		"broker-stale-stop": {Status: "pending", FilledQty: 4},
 	}, nextStatus: "filled", nextFillPrice: 110, nextFillQty: 10}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 0 {
@@ -1948,7 +2092,7 @@ func TestManager_MarketExitFailsClosedWhenWorkingLegIsPurged(t *testing.T) {
 	}
 	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
 	fb := &fakeBroker{notFoundIDs: map[string]bool{"broker-purged-working-stop": true}}
-	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
 	if len(fb.placed) != 0 {

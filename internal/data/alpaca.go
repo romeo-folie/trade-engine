@@ -234,65 +234,123 @@ func (c *AlpacaClient) FetchHistory(ctx context.Context, ticker string, tf Timef
 		return nil, fmt.Errorf("unsupported timeframe: %s", tf)
 	}
 
-	params := url.Values{}
-	params.Set("timeframe", alpacaTF)
-	params.Set("limit", fmt.Sprintf("%d", limit))
-	params.Set("adjustment", alpacaStockAdjustment)
-	params.Set("feed", "iex")
-	if tf == Timeframe1Day {
-		// Without an explicit range Alpaca's bars endpoint defaults to the
-		// current session, so a request for 50 daily bars returns only today's
-		// in-progress bar. That leaves close-confirmed EMA9 with no completed
-		// history during the session. Request a calendar-day buffer for weekends
-		// and holidays, then ask for the newest bars and restore chronological
-		// order for indicator consumers.
-		now := time.Now().UTC()
-		lookbackDays := limit * 3
-		if lookbackDays < 30 {
-			lookbackDays = 30
-		}
+	// Without an explicit range Alpaca's bars endpoint defaults to the CURRENT
+	// SESSION, so `limit` alone never reaches back past today: a request for 50
+	// 1h bars returns only the hours elapsed so far (and nothing at all before
+	// the open). Every rolling indicator downstream then degrades silently —
+	// ComputeATR returns 0 below period+1 bars, which parked the trailing stop
+	// at its entry value for every open position. Ask for a calendar-day buffer
+	// on every timeframe, request the newest bars, and restore chronological
+	// order for indicator consumers.
+	now := time.Now().UTC()
+	lookbackDays := historyLookbackDays(tf, limit)
+
+	// Alpaca may return fewer bars than `limit` and hand back a
+	// next_page_token instead, so a single request is not a guarantee of a
+	// full window — and a short window is precisely the failure this range fix
+	// exists to prevent. Follow the token until the window is full or the
+	// provider runs out of bars, exactly as FetchCandles does.
+	candles := make([]Candle, 0, limit)
+	var nextPageToken string
+	for len(candles) < limit {
+		before := len(candles)
+		params := url.Values{}
+		params.Set("timeframe", alpacaTF)
+		params.Set("limit", fmt.Sprintf("%d", limit-len(candles)))
+		params.Set("adjustment", alpacaStockAdjustment)
+		params.Set("feed", "iex")
 		params.Set("start", now.AddDate(0, 0, -lookbackDays).Format(time.RFC3339))
 		params.Set("end", now.Format(time.RFC3339))
 		params.Set("sort", "desc")
-	}
+		if nextPageToken != "" {
+			params.Set("page_token", nextPageToken)
+		}
 
-	resp, err := c.get(ctx, fmt.Sprintf("/v2/stocks/%s/bars", ticker), params)
-	if err != nil {
-		return nil, fmt.Errorf("fetch history %s: %w", ticker, err)
-	}
-	defer resp.Body.Close()
-
-	var data alpacaBarsResponse
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return nil, fmt.Errorf("decode bars response: %w", err)
-	}
-
-	candles := make([]Candle, 0, len(data.Bars))
-	for _, bar := range data.Bars {
-		ts, err := time.Parse(time.RFC3339, bar.Timestamp)
+		resp, err := c.get(ctx, fmt.Sprintf("/v2/stocks/%s/bars", ticker), params)
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("fetch history %s: %w", ticker, err)
 		}
-		candles = append(candles, Candle{
-			Ticker:    ticker,
-			Timeframe: tf,
-			Timestamp: ts,
-			Open:      bar.Open,
-			High:      bar.High,
-			Low:       bar.Low,
-			Close:     bar.Close,
-			Volume:    bar.Volume,
-			VWAP:      bar.VWAP,
-		})
+
+		var data alpacaBarsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+			resp.Body.Close()
+			return nil, fmt.Errorf("decode bars response: %w", err)
+		}
+		resp.Body.Close()
+
+		for _, bar := range data.Bars {
+			ts, err := time.Parse(time.RFC3339, bar.Timestamp)
+			if err != nil {
+				continue
+			}
+			candles = append(candles, Candle{
+				Ticker:    ticker,
+				Timeframe: tf,
+				Timestamp: ts,
+				Open:      bar.Open,
+				High:      bar.High,
+				Low:       bar.Low,
+				Close:     bar.Close,
+				Volume:    bar.Volume,
+				VWAP:      bar.VWAP,
+			})
+		}
+
+		// Terminate on the token, on a page that added no usable candle (bars
+		// whose timestamps fail to parse are skipped above, so a non-empty
+		// page can still be zero progress), and on a token that does not
+		// advance. Any of the three means asking again cannot help, and
+		// without all three a misbehaving provider spins this loop or fills
+		// the window with duplicates.
+		if data.NextPageToken == "" ||
+			len(candles) == before ||
+			data.NextPageToken == nextPageToken {
+			break
+		}
+		nextPageToken = data.NextPageToken
 	}
-	if tf == Timeframe1Day {
-		// The API response is newest-first because of sort=desc; all callers of
-		// FetchHistory expect oldest-to-newest so the final element is current.
-		for i, j := 0, len(candles)-1; i < j; i, j = i+1, j-1 {
-			candles[i], candles[j] = candles[j], candles[i]
-		}
+	// The API response is newest-first because of sort=desc; all callers of
+	// FetchHistory expect oldest-to-newest so the final element is current.
+	for i, j := 0, len(candles)-1; i < j; i, j = i+1, j-1 {
+		candles[i], candles[j] = candles[j], candles[i]
 	}
 	return candles, nil
+}
+
+// alpacaBarsPerSession approximates how many bars each timeframe produces in
+// one regular trading session (09:30–16:00 ET). It converts a caller's bar
+// count into the calendar lookback its range request needs.
+var alpacaBarsPerSession = map[Timeframe]int{
+	Timeframe1Min:  390,
+	Timeframe5Min:  78,
+	Timeframe15Min: 26,
+	Timeframe1Hour: 7,
+	Timeframe4Hour: 2,
+	Timeframe1Day:  1,
+}
+
+// historyLookbackDays returns how many calendar days back a bars request must
+// reach to cover `limit` bars of the given timeframe.
+//
+// Sessions convert to calendar days at 3x so weekends, holidays and half-days
+// cannot starve the window, with a 30-day floor so even a short request spans a
+// long weekend. Over-reaching is free: `limit` still caps the response, and
+// sort=desc keeps the newest bars.
+func historyLookbackDays(tf Timeframe, limit int) int {
+	if limit < 1 {
+		limit = 1
+	}
+	perSession, ok := alpacaBarsPerSession[tf]
+	if !ok || perSession < 1 {
+		// Unknown timeframe: assume one bar per session, the most
+		// conservative (widest) window.
+		perSession = 1
+	}
+	sessions := (limit + perSession - 1) / perSession // ceil
+	if days := sessions * 3; days > 30 {
+		return days
+	}
+	return 30
 }
 
 // FetchQuote retrieves the latest bid/ask quote for a ticker.
