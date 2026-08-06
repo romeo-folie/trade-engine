@@ -326,11 +326,20 @@ func ApplyEntryFill(
 // UpdateTradeTrailing persists the latest trailing-stop computation for a
 // trade: the new stop_loss and the high_water_mark. Used by the trailing-stop
 // manager (#322). Either field may be 0 to skip updating that column.
+//
+// The ::NUMERIC casts are load-bearing. A bare `NULLIF($1, 0)` makes Postgres
+// infer the parameter's type from the integer literal 0, so both placeholders
+// resolve to `integer` and pgx encodes the float64 stop into an int4 — silently
+// dropping the cents. Every trailing write landed as a whole dollar
+// (stop_loss 8.50 → 8, high_water_mark 9.13 → 9), which both understated the
+// stop against the broker's real resting leg and stopped the high-water mark
+// from ever accumulating. Casting pins the parameters to NUMERIC, matching the
+// columns.
 func UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error {
 	_, err := GetDB().Exec(ctx, `
 		UPDATE trades
-		SET stop_loss = COALESCE(NULLIF($1, 0), stop_loss),
-		    high_water_mark = COALESCE(NULLIF($2, 0), high_water_mark)
+		SET stop_loss = COALESCE(NULLIF($1::NUMERIC, 0::NUMERIC), stop_loss),
+		    high_water_mark = COALESCE(NULLIF($2::NUMERIC, 0::NUMERIC), high_water_mark)
 		WHERE id = $3`,
 		stopLoss, highWaterMark, id)
 	return err

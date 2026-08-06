@@ -183,6 +183,9 @@ type Manager struct {
 	now         func() time.Time
 	marketOpen  func(time.Time) bool
 	deferredEMA map[string]time.Time
+	// deferredATRExit dedupes the "trail crossed price but the market is
+	// closed" log so an overnight defer doesn't emit one line per tick.
+	deferredATRExit map[string]struct{}
 }
 
 // NewManager constructs a trailing-stop Manager.
@@ -193,13 +196,14 @@ func NewManager(cfg Config, ts TradeStore, prices PriceFetcher, exec execution.E
 		marketOpen = regularStockSession
 	}
 	return &Manager{
-		cfg:         normalized,
-		store:       ts,
-		prices:      prices,
-		exec:        exec,
-		now:         time.Now,
-		marketOpen:  marketOpen,
-		deferredEMA: make(map[string]time.Time),
+		cfg:             normalized,
+		store:           ts,
+		prices:          prices,
+		exec:            exec,
+		now:             time.Now,
+		marketOpen:      marketOpen,
+		deferredEMA:     make(map[string]time.Time),
+		deferredATRExit: make(map[string]struct{}),
 	}
 }
 
@@ -256,6 +260,11 @@ func (m *Manager) UpdateAll(ctx context.Context) {
 	for tradeID := range m.deferredEMA {
 		if !active[tradeID] {
 			delete(m.deferredEMA, tradeID)
+		}
+	}
+	for tradeID := range m.deferredATRExit {
+		if !active[tradeID] {
+			delete(m.deferredATRExit, tradeID)
 		}
 	}
 }
@@ -341,6 +350,43 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	// sitting at the old price — exit at market immediately so the band's
 	// implied "we're done" actually plays out.
 	if newStop >= currentPrice {
+		if !m.marketOpen(m.now()) {
+			// Same hazard the EMA9 rule guards against: a market sell
+			// submitted outside regular hours is a DAY order that sits queued
+			// until the next open, then fills on a decision derived from the
+			// prior session's stale close and never re-validated. The resting
+			// broker stop stays live meanwhile — if price really is through
+			// the band it fills on the open, which is the protection the trail
+			// is asking for — and this condition is re-evaluated on the first
+			// tick of the next eligible session.
+			//
+			// Only the market exit is gated — deferring must never leave the
+			// position naked. The trail candidate itself is unusable here (a
+			// stop at or above the market would fill or be rejected on sight),
+			// so an uncapped trade missing its leg is seeded at the original
+			// hard stop instead, exactly as the EMA9 rule does. Capped trades
+			// stay app-managed: a standalone stop beside their software
+			// take-profit creates two exit owners and can double-sell.
+			if t.TakeProfit <= 0 && t.StopLoss > 0 {
+				if err := m.ensureProtectiveStop(ctx, t); err != nil {
+					return fmt.Errorf("seed protective stop before deferral: %w", err)
+				}
+			}
+			if _, deferred := m.deferredATRExit[t.ID]; !deferred {
+				logger.Info("trailing-stop: trail crossed price outside regular session; deferring market exit",
+					"trade_id", t.ID,
+					"ticker", t.Ticker,
+					"trailing_stop", newStop,
+					"current_price", currentPrice,
+				)
+				m.deferredATRExit[t.ID] = struct{}{}
+			}
+			if hwm != t.HighWaterMark {
+				return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
+			}
+			return nil
+		}
+		delete(m.deferredATRExit, t.ID)
 		logger.Info("trailing-stop: trail crossed price; exiting at market",
 			"trade_id", t.ID,
 			"ticker", t.Ticker,
@@ -364,6 +410,9 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 		// post-mortem queries.
 		return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 	}
+
+	// The trail sits below price again, so any earlier deferral is resolved.
+	delete(m.deferredATRExit, t.ID)
 
 	// Submit/replace the broker STOP whenever it moved. Also seed a missing
 	// broker stop even when the ATR candidate still equals the original hard
