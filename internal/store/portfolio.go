@@ -585,19 +585,20 @@ func GetPortfolioStats(ctx context.Context) (*PortfolioStats, error) {
 	// counts when it is written, so it drops trades that close after the final
 	// upsert and never absorbs the retroactive pnl corrections made by the
 	// broker-truth reconcilers (#359, #383) — leaving it a point or two low and
-	// drifting. Counting the ledger directly is stable and correct, and matches
-	// the Performance screen (GetEntryPerformance). Definition: wins / all-closed
-	// × 100, break-even (pnl = 0) kept in the denominator.
-	var ledgerWins, ledgerTotal int
-	if err := GetDB().QueryRow(ctx, `
-		SELECT count(*) FILTER (WHERE pnl > 0), count(*)
-		FROM trades WHERE status = 'closed' AND pnl IS NOT NULL`).Scan(&ledgerWins, &ledgerTotal); err != nil {
+	// drifting. Counting the ledger directly is stable and correct.
+	//
+	// GetClosedLedgerStats is shared with the Performance screen
+	// (GetEntryPerformance) so the two surfaces report the same number by
+	// construction rather than by convention — they previously disagreed
+	// (27.7% vs 25.9%) because Performance reached the ledger through a join
+	// that dropped broker-adopted trades. TestClosedLedgerSurfacesAgree is the
+	// regression guard.
+	ledger, err := GetClosedLedgerStats(ctx)
+	if err != nil {
 		return nil, err
 	}
-	stats.TotalTrades = ledgerTotal
-	if ledgerTotal > 0 {
-		stats.WinRatePct = float64(ledgerWins) / float64(ledgerTotal) * 100
-	}
+	stats.TotalTrades = ledger.N
+	stats.WinRatePct = ledger.WinRatePct
 	if grossLoss > 0 {
 		stats.ProfitFactor = grossProfit / grossLoss
 	} else if grossProfit > 0 {
