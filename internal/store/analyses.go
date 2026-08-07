@@ -216,7 +216,13 @@ WITH attributed AS (
                 WHEN a.arbiter_response IS NOT NULL THEN 'arbitrated'
                 ELSE 'consensus' END AS mode,
            a.ensemble_results AS ensemble_raw
-    FROM trades t
+    -- The closed-book filter is applied inside this subquery, not as a trailing
+    -- WHERE, so it can reuse closedLedgerPredicate verbatim: only trades
+    -- columns are in scope here, whereas after the join the signals table also
+    -- carries status and confidence and the unqualified predicate would be
+    -- ambiguous. AttributedN <= N is the invariant the two-population split
+    -- rests on, and sharing this constant is what enforces it.
+    FROM (SELECT * FROM trades WHERE ` + closedLedgerPredicate + `) t
     JOIN signals s ON s.id = t.signal_id
     JOIN LATERAL (
         SELECT a.confidence, a.fast_pathed, a.arbiter_response, a.ensemble_results
@@ -225,7 +231,6 @@ WITH attributed AS (
         ORDER BY a.created_at DESC, a.id DESC
         LIMIT 1
     ) a ON true
-    WHERE t.status = 'closed' AND t.pnl IS NOT NULL
 ),
 base AS (
     SELECT ticker, dir, strategy, pnl, pnl_pct, opened_at, conf, mode,
@@ -284,17 +289,19 @@ type EntryPerfBucket struct {
 	AvgConf    *float64 `json:"avg_conf"`
 }
 
-// EntryPerfConcentration surfaces how top-heavy the P&L is — at small samples a
-// single trade can carry the whole book, so the UI must warn rather than imply
-// broad edge.
+// EntryPerfConcentration shows how top-heavy the book is — at small samples a
+// single trade can carry the whole net, so "top 3" sits next to net realized as
+// a sanity check on it.
+//
+// Both figures span the full ledger, matching the NET REALIZED card they render
+// under. The per-trade detail (ticker/strategy/confidence of the single largest
+// winner) was dropped along with the top-heavy warning card that consumed it:
+// it required a LEFT JOIN LATERAL back to analyses that nothing rendered and no
+// test covered, and unobservable SQL is how the jsonb_array_length defect
+// survived. Re-add it together with a consumer and a test, not ahead of them.
 type EntryPerfConcentration struct {
-	NetPnL      *float64 `json:"net_pnl"`
-	Top3PnL     *float64 `json:"top3_pnl"`
-	TopTicker   *string  `json:"top_ticker"`
-	TopStrategy *string  `json:"top_strategy"`
-	TopPnL      *float64 `json:"top_pnl"`
-	TopPnLPct   *float64 `json:"top_pnl_pct"`
-	TopConf     *float64 `json:"top_conf"`
+	NetPnL  *float64 `json:"net_pnl"`
+	Top3PnL *float64 `json:"top3_pnl"`
 }
 
 // EntryPerformance is the full payload for the Performance screen. ConfidenceGate
@@ -473,35 +480,19 @@ func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 		return nil, err
 	}
 
-	// Concentration: net, top-3 sum, and the single largest winner — over the
-	// whole ledger, so "top 3 = …" is denominated in the same book as the
-	// NET REALIZED card it sits under. Confidence is LEFT-joined because the
-	// largest trade may be an adopted row with no analysis behind it.
+	// Concentration: net and top-3 sum over the whole ledger, so "top 3 = …" is
+	// denominated in the same book as the NET REALIZED card it sits under. Both
+	// are scalar subqueries, so this always yields exactly one row — including
+	// on an empty ledger, where both come back NULL.
 	concQ := `
 		WITH ledger AS (
-		    SELECT ticker, strategy, signal_id,
-		           pnl::float8 AS pnl, pnl_pct::float8 AS pnl_pct
-		    FROM trades WHERE ` + closedLedgerPredicate + `
+		    SELECT pnl::float8 AS pnl FROM trades WHERE ` + closedLedgerPredicate + `
 		)
 		SELECT (SELECT round(sum(pnl)::numeric, 2)::float8 FROM ledger),
-		       (SELECT round(sum(pnl)::numeric, 2)::float8 FROM (SELECT pnl FROM ledger ORDER BY pnl DESC LIMIT 3) x),
-		       top.ticker, top.strategy,
-		       round(top.pnl::numeric, 2)::float8, round(top.pnl_pct::numeric, 2)::float8,
-		       round(conf.confidence::numeric, 3)::float8
-		FROM (SELECT ticker, strategy, signal_id, pnl, pnl_pct FROM ledger ORDER BY pnl DESC LIMIT 1) top
-		LEFT JOIN LATERAL (
-		    SELECT a.confidence
-		    FROM signals s
-		    CROSS JOIN LATERAL unnest(s.analysis_ids) AS aid
-		    JOIN analyses a ON a.id = aid
-		    WHERE s.id = top.signal_id
-		    ORDER BY a.created_at DESC, a.id DESC
-		    LIMIT 1
-		) conf ON true`
+		       (SELECT round(sum(pnl)::numeric, 2)::float8
+		          FROM (SELECT pnl FROM ledger ORDER BY pnl DESC LIMIT 3) x)`
 	c := &ep.Concentration
-	if err := GetDB().QueryRow(ctx, concQ).Scan(
-		&c.NetPnL, &c.Top3PnL, &c.TopTicker, &c.TopStrategy, &c.TopPnL, &c.TopPnLPct, &c.TopConf,
-	); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err := GetDB().QueryRow(ctx, concQ).Scan(&c.NetPnL, &c.Top3PnL); err != nil {
 		return nil, err
 	}
 

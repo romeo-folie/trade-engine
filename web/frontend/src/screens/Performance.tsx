@@ -48,14 +48,12 @@ interface Overall {
   attributed_n: number;
   attributed_net_pnl: number | null;
 }
+/** Both figures span the whole ledger, matching the NET REALIZED card they
+ *  render under. Per-trade detail was dropped with the top-heavy warning card
+ *  that consumed it — see EntryPerfConcentration in internal/store/analyses.go. */
 interface Concentration {
   net_pnl: number | null;
   top3_pnl: number | null;
-  top_ticker: string | null;
-  top_strategy: string | null;
-  top_pnl: number | null;
-  top_pnl_pct: number | null;
-  top_conf: number | null;
 }
 interface EntryPerformance {
   overall: Overall;
@@ -261,11 +259,17 @@ export default function Performance() {
   const o = data?.overall;
   const c = data?.concentration;
   // Net carried by trades the breakdowns cannot see. Both sides come from the
-  // same response, so this never disagrees with the cards above it.
-  const unattributedNet =
-    o?.net_pnl != null && o?.attributed_net_pnl != null
-      ? o.net_pnl - o.attributed_net_pnl
-      : null;
+  // same response, so this never disagrees with the cards above it. When
+  // nothing is attributed at all, SQL sums an empty set to NULL — but the
+  // remainder is then exactly the whole book, so treat that as zero rather
+  // than rendering "—" at the one moment the number is fully known.
+  const unattributedNet = (() => {
+    if (o?.net_pnl == null) return null;
+    if (o.attributed_net_pnl != null) return o.net_pnl - o.attributed_net_pnl;
+    // SQL summed an empty set: with nothing attributed the remainder is the
+    // whole book. Any other null here would be unexplained, so stay silent.
+    return o.attributed_n === 0 ? o.net_pnl : null;
+  })();
 
   return (
     <div className={styles.screen}>
@@ -333,9 +337,9 @@ export default function Performance() {
             <p className={styles.provenanceNote}>
               <span className={styles.provenanceTag}>SIGNAL PROVENANCE</span>
               Breakdowns below cover <strong>{o.attributed_n} of {o.n}</strong> closed trades.
-              The other {o.n - o.attributed_n} {o.n - o.attributed_n === 1 ? 'is a' : 'are'} broker-adopted
-              {o.n - o.attributed_n === 1 ? ' row' : ' rows'} with no analysis to attribute
-              ({fmtUsd(unattributedNet)}).
+              The other {o.n - o.attributed_n} ({fmtUsd(unattributedNet)}) could not be joined back
+              to an analysis — typically positions adopted from the broker rather than opened from a
+              signal — so there is no provenance to slice.
             </p>
           )}
 
