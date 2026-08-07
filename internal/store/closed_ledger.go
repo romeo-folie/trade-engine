@@ -35,6 +35,37 @@ type ClosedLedgerStats struct {
 	WindowEnd    *string
 }
 
+// TickerPnL is one ticker's slice of the closed ledger, for reconciliation
+// against broker fill history.
+type TickerPnL struct {
+	PnL    float64
+	Trades int
+}
+
+// ClosedPnLByTicker returns realized P&L per ticker over the same closed-book
+// population as GetClosedLedgerStats, so a reconciliation total rolls up to the
+// same number the Portfolio and Performance screens show.
+func ClosedPnLByTicker(ctx context.Context) (map[string]TickerPnL, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT ticker, round(sum(pnl)::numeric, 2)::float8, count(*)::int
+		FROM trades WHERE `+closedLedgerPredicate+`
+		GROUP BY ticker`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]TickerPnL{}
+	for rows.Next() {
+		var ticker string
+		var v TickerPnL
+		if err := rows.Scan(&ticker, &v.PnL, &v.Trades); err != nil {
+			return nil, err
+		}
+		out[ticker] = v
+	}
+	return out, rows.Err()
+}
+
 // GetClosedLedgerStats aggregates the closed-trade ledger. Every field is
 // nullable-safe: an empty ledger yields N = 0 and NULL money columns rather
 // than an error.
