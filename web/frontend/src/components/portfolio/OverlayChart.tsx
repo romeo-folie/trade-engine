@@ -21,6 +21,7 @@ import {
   Tooltip,
 } from 'recharts';
 import { TOKENS } from '../../styles/tokens';
+import { paddedEquityDomain } from './equityDomain';
 import styles from './OverlayChart.module.css';
 
 export type ChartMode = 'overlay' | 'alpaca' | 'te';
@@ -91,12 +92,7 @@ function equityDomain(
     if (showAlpaca && d.alpaca != null) vals.push(d.alpaca);
     if (showTE && d.te != null) vals.push(d.te);
   }
-  if (vals.length === 0) return undefined;
-  const min = Math.min(...vals);
-  const max = Math.max(...vals);
-  // A perfectly flat series would give a zero-height band — pad it to ±1%.
-  const pad = max === min ? Math.abs(max) * 0.01 || 1 : (max - min) * 0.08;
-  return [min - pad, max + pad];
+  return paddedEquityDomain(vals);
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

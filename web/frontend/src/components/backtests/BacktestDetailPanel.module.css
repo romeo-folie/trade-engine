@@ -1,4 +1,4 @@
-/* BacktestDetailPanel — slide-in detail panel from right, 400px */
+/* BacktestDetailPanel — wide slide-in detail panel for chart and trade review */
 
 .backdrop {
   position: fixed;
@@ -12,8 +12,8 @@
   top: 0;
   right: 0;
   bottom: 0;
-  width: 400px;
-  max-width: 90vw;
+  width: clamp(560px, 56vw, 840px);
+  max-width: 96vw;
   background: var(--panel-bg);
   border-left: 1px solid var(--border);
   z-index: var(--z-modal);
@@ -129,8 +129,22 @@
 
 /* Equity curve */
 .chartWrap {
-  height: 180px;
+  height: 240px;
   width: 100%;
+}
+
+@media (max-width: 600px) {
+  .panel {
+    width: 100vw;
+    max-width: 100vw;
+  }
+
+  .body,
+  .header,
+  .footer {
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
+  }
 }
 
 /* Trade table */

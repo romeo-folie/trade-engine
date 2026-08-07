@@ -1225,21 +1225,42 @@ func (s *Server) handleBacktestRunDetail(w http.ResponseWriter, r *http.Request)
 		backteststRunSummary
 		InitialCash float64 `json:"InitialCash"`
 	}
-	var initialCash float64
-	if len(run.ConfigSnapshot) > 0 {
-		var snap struct {
-			Backtest struct {
-				InitialCash float64 `json:"initial_cash"`
-			} `json:"backtest"`
-		}
-		if err := json.Unmarshal(run.ConfigSnapshot, &snap); err == nil && snap.Backtest.InitialCash > 0 {
-			initialCash = snap.Backtest.InitialCash
-		}
-	}
+	initialCash := backtestInitialCash(run.ConfigSnapshot)
 	jsonResponse(w, runDetail{
 		backteststRunSummary: toRunSummary(run),
 		InitialCash:          initialCash,
 	})
+}
+
+// backtestInitialCash accepts both the Go JSON shape emitted by json.Marshal on
+// config.Config (Backtest.InitialCash) and the legacy yaml-style shape used by
+// older snapshots (backtest.initial_cash). Only a positive scalar is exposed.
+func backtestInitialCash(snapshot json.RawMessage) float64 {
+	var root map[string]json.RawMessage
+	if len(snapshot) == 0 || json.Unmarshal(snapshot, &root) != nil {
+		return 0
+	}
+	for _, sectionKey := range []string{"Backtest", "backtest"} {
+		sectionJSON, ok := root[sectionKey]
+		if !ok {
+			continue
+		}
+		var section map[string]json.RawMessage
+		if json.Unmarshal(sectionJSON, &section) != nil {
+			continue
+		}
+		for _, valueKey := range []string{"InitialCash", "initial_cash"} {
+			valueJSON, ok := section[valueKey]
+			if !ok {
+				continue
+			}
+			var value float64
+			if json.Unmarshal(valueJSON, &value) == nil && value > 0 {
+				return value
+			}
+		}
+	}
+	return 0
 }
 
 // GET /api/system/cache

@@ -9,6 +9,7 @@ import { fmtPrice } from '../../utils/format';
 import EquityCurve from '../portfolio/EquityCurve';
 import CornerCard from '../CornerCard';
 import type { BacktestRun, BacktestTrade } from '../../screens/Backtests';
+import { buildBacktestEquityCurve } from './backtestCurve';
 import styles from './BacktestDetailPanel.module.css';
 
 interface BacktestDetailPanelProps {
@@ -28,31 +29,6 @@ function fmtDrawdown(v: number | null): string {
 }
 
 const DEFAULT_INITIAL_CASH = 100_000; // matches internal/config/defaults.go
-
-/**
- * Build equity curve from trades using cumulative dollar PnL.
- * Uses t.PnL (absolute dollar gain/loss per position) not t.PnLPct (position return %),
- * so the curve reflects actual portfolio-level performance, not per-position %.
- * Starting equity is seeded from the run's ConfigSnapshot.initial_cash (default 100,000).
- */
-function buildEquityCurve(
-  trades: BacktestTrade[],
-  initialCash: number,
-): { date: string; value: number }[] {
-  if (trades.length === 0) return [];
-  let equity = initialCash;
-  const points: { date: string; value: number }[] = [
-    { date: trades[0].EntryTS.slice(0, 10), value: equity },
-  ];
-  for (const t of trades) {
-    if (t.PnL != null) {
-      equity += t.PnL;
-    }
-    const dateStr = (t.ExitTS ?? t.EntryTS).slice(0, 10);
-    points.push({ date: dateStr, value: Math.round(equity * 100) / 100 });
-  }
-  return points;
-}
 
 export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPanelProps) {
   const [trades, setTrades] = useState<BacktestTrade[]>([]);
@@ -122,7 +98,7 @@ export default function BacktestDetailPanel({ run, onClose }: BacktestDetailPane
     return () => document.removeEventListener('keydown', handleKey);
   }, [handleKey]);
 
-  const equityData = buildEquityCurve(trades, initialCash);
+  const equityData = buildBacktestEquityCurve(trades, initialCash, run.FromDate);
 
   return (
     <>

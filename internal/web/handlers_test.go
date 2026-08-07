@@ -148,6 +148,26 @@ func TestIsNotFound(t *testing.T) {
 	}
 }
 
+func TestBacktestInitialCash(t *testing.T) {
+	tests := []struct {
+		name     string
+		snapshot json.RawMessage
+		want     float64
+	}{
+		{name: "current Go JSON shape", snapshot: json.RawMessage(`{"Backtest":{"InitialCash":250000}}`), want: 250000},
+		{name: "legacy yaml-style shape", snapshot: json.RawMessage(`{"backtest":{"initial_cash":75000}}`), want: 75000},
+		{name: "non-positive rejected", snapshot: json.RawMessage(`{"Backtest":{"InitialCash":0}}`)},
+		{name: "malformed rejected", snapshot: json.RawMessage(`{"Backtest":`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := backtestInitialCash(tt.snapshot); got != tt.want {
+				t.Fatalf("backtestInitialCash() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // errStr is a minimal error type for table-driven tests.
 type errStr string
 

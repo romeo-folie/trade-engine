@@ -174,9 +174,9 @@
 
 .reasoning {
   font-family: var(--font-mono);
-  font-size: 13px;
+  font-size: 15px;
   color: var(--text-primary);
-  line-height: 1.6;
+  line-height: 1.65;
   white-space: pre-wrap;
 }
 
@@ -219,9 +219,9 @@
 
 .outcomeDetail {
   font-family: var(--font-mono);
-  font-size: 11px;
-  color: var(--text-dim);
-  line-height: 1.5;
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.6;
 }
 
 /* ── Key-value rows ───────────────────────────────────────────────────────── */
@@ -331,8 +331,8 @@
 
 .analystModel {
   font-family: var(--font-mono);
-  font-size: 9px;
-  color: var(--text-dim);
+  font-size: 11px;
+  color: var(--text-muted);
   margin-top: 1px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -353,9 +353,9 @@
 
 .analystDesc {
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs, 11px);
+  font-size: 14px;
   color: var(--text-primary);
-  line-height: 1.5;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow: visible;
 }
