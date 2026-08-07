@@ -42,15 +42,20 @@ interface Overall {
   avg_conf: number | null;
   window_start: string | null;
   window_end: string | null;
+  /** Subset of `n` that joins back to an analysis — the denominator for every
+   *  breakdown below. Broker-adopted trades have no provenance to slice, so the
+   *  headline (all closed) and the breakdowns (attributed) differ on purpose. */
+  attributed_n: number;
+  attributed_net_pnl: number | null;
 }
+/** Both figures span the whole ledger. Only top3_pnl is rendered (the "top 3 ="
+ *  foot on NET REALIZED), which is why it must span the same book as that card;
+ *  net_pnl duplicates overall.net_pnl and is kept as a server-side cross-check.
+ *  Per-trade detail was dropped with the top-heavy warning card that consumed
+ *  it — see EntryPerfConcentration in internal/store/analyses.go. */
 interface Concentration {
   net_pnl: number | null;
   top3_pnl: number | null;
-  top_ticker: string | null;
-  top_strategy: string | null;
-  top_pnl: number | null;
-  top_pnl_pct: number | null;
-  top_conf: number | null;
 }
 interface EntryPerformance {
   overall: Overall;
@@ -255,6 +260,18 @@ export default function Performance() {
 
   const o = data?.overall;
   const c = data?.concentration;
+  // Net carried by trades the breakdowns cannot see. Both sides come from the
+  // same response, so this never disagrees with the cards above it. When
+  // nothing is attributed at all, SQL sums an empty set to NULL — but the
+  // remainder is then exactly the whole book, so treat that as zero rather
+  // than rendering "—" at the one moment the number is fully known.
+  const unattributedNet = (() => {
+    if (o?.net_pnl == null) return null;
+    if (o.attributed_net_pnl != null) return o.net_pnl - o.attributed_net_pnl;
+    // SQL summed an empty set: with nothing attributed the remainder is the
+    // whole book. Any other null here would be unexplained, so stay silent.
+    return o.attributed_n === 0 ? o.net_pnl : null;
+  })();
 
   return (
     <div className={styles.screen}>
@@ -311,9 +328,22 @@ export default function Performance() {
             <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
               <span className={styles.summaryLabel}>AVG CONFIDENCE</span>
               <span className={styles.summaryValue}>{o.avg_conf?.toFixed(3) ?? '—'}</span>
-              <span className={styles.summaryFoot}>gate {gate.toFixed(2)}</span>
+              <span className={styles.summaryFoot}>gate {gate.toFixed(2)} · {o.attributed_n} attributed</span>
             </CornerCard>
           </div>
+
+          {/* The headline above covers the whole closed book; everything below
+              covers only trades that join back to an analysis. State the gap
+              rather than letting the two populations look like one. */}
+          {o.attributed_n < o.n && (
+            <p className={styles.provenanceNote}>
+              <span className={styles.provenanceTag}>SIGNAL PROVENANCE</span>
+              Breakdowns below cover <strong>{o.attributed_n} of {o.n}</strong> closed trades.
+              The other {o.n - o.attributed_n} ({fmtUsd(unattributedNet)}) could not be joined back
+              to an analysis — typically positions adopted from the broker rather than opened from a
+              signal — so there is no provenance to slice.
+            </p>
+          )}
 
           {/* Confidence → win rate */}
           <CornerCard bracketColor="var(--border)" className={styles.chartCard}>
@@ -400,8 +430,10 @@ export default function Performance() {
           </div>
 
           <p className={styles.footNote}>
-            Ledger-direct: win rate = wins / all-closed × 100 over closed equity trades joined to their analysis.
-            ORB/forex excluded. Open positions not counted. Small sample — treat non-confidence cuts as suggestive.
+            Ledger-direct: win rate = wins / all-closed × 100 over every closed trade, break-even kept in the
+            denominator — the same figure, from the same query, that the Portfolio screen reports. The breakdowns
+            above cover only trades that join back to an analysis. ORB/forex keep a separate ledger and never
+            appear here. Open positions not counted. Small sample — treat non-confidence cuts as suggestive.
           </p>
         </>
       )}
