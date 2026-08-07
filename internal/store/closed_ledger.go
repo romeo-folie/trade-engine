@@ -1,6 +1,9 @@
 package store
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // closedLedgerPredicate defines "the closed book" in exactly one place: every
 // trade that reached a terminal state carrying a realized P&L.
@@ -33,6 +36,46 @@ type ClosedLedgerStats struct {
 	NetPnL       *float64
 	WindowStart  *string
 	WindowEnd    *string
+}
+
+// TickerPnL is one ticker's slice of the closed ledger, for reconciliation
+// against broker fill history.
+type TickerPnL struct {
+	PnL    float64
+	Trades int
+}
+
+// ClosedPnLByTicker returns realized P&L per ticker over the same closed-book
+// population as GetClosedLedgerStats, restricted to trades closed in
+// [after, before).
+//
+// The window is mandatory because the caller reconciles this against a windowed
+// pull of broker fills, and windowing only one side is not a comparison: a
+// symbol closed before the window would show its full ledger P&L against zero
+// broker P&L and read as total drift. Pass the zero time and a far-future time
+// for "everything", which is what the reconciler defaults to — a partial window
+// cannot see a position opened before it and will mis-sign the walk.
+func ClosedPnLByTicker(ctx context.Context, after, before time.Time) (map[string]TickerPnL, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT ticker, round(sum(pnl)::numeric, 2)::float8, count(*)::int
+		FROM trades
+		WHERE `+closedLedgerPredicate+`
+		  AND closed_at >= $1 AND closed_at < $2
+		GROUP BY ticker`, after, before)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]TickerPnL{}
+	for rows.Next() {
+		var ticker string
+		var v TickerPnL
+		if err := rows.Scan(&ticker, &v.PnL, &v.Trades); err != nil {
+			return nil, err
+		}
+		out[ticker] = v
+	}
+	return out, rows.Err()
 }
 
 // GetClosedLedgerStats aggregates the closed-trade ledger. Every field is
