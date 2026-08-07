@@ -10,6 +10,7 @@ import {
   ReferenceDot,
 } from 'recharts';
 import { TOKENS } from '../../styles/tokens';
+import { paddedEquityDomain } from './equityDomain';
 import styles from './EquityCurve.module.css';
 
 interface DataPoint {
@@ -22,8 +23,10 @@ interface EquityCurveProps {
 }
 
 export default function EquityCurve({ data }: EquityCurveProps) {
-  const { peakValue, lastPoint } = useMemo(() => {
-    if (data.length === 0) return { peakValue: 0, lastPoint: null };
+  const { peakValue, lastPoint, domain } = useMemo(() => {
+    if (data.length === 0) {
+      return { peakValue: 0, lastPoint: null, domain: undefined };
+    }
     let peak = data[0];
     for (const d of data) {
       if (d.value > peak.value) peak = d;
@@ -31,6 +34,7 @@ export default function EquityCurve({ data }: EquityCurveProps) {
     return {
       peakValue: peak.value,
       lastPoint: data[data.length - 1],
+      domain: paddedEquityDomain(data.map(d => d.value)),
     };
   }, [data]);
 
@@ -44,7 +48,12 @@ export default function EquityCurve({ data }: EquityCurveProps) {
     }
   };
 
-  const formatValue = (v: number) => `$${(v / 1000).toFixed(0)}K`;
+  const formatValue = (v: number) => {
+    if (Math.abs(v) >= 1000) {
+      return `$${(v / 1000).toLocaleString('en-US', { maximumFractionDigits: 1 })}K`;
+    }
+    return `$${v.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+  };
 
   /* SVG glow filter — unique id per instance to avoid collisions if rendered multiple times */
   const uid = useId();
@@ -83,6 +92,7 @@ export default function EquityCurve({ data }: EquityCurveProps) {
             tickLine={false}
           />
           <YAxis
+            domain={domain ?? ['auto', 'auto']}
             tickFormatter={formatValue}
             tick={{
               fontFamily: 'var(--font-mono)',

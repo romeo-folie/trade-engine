@@ -239,9 +239,9 @@
 
 .analystDesc {
   font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
+  font-size: 14px;
   color: var(--text-primary);
-  line-height: 1.4;
+  line-height: 1.6;
 }
 
 /* Ensemble synthesis */
