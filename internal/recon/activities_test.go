@@ -85,10 +85,21 @@ func TestFetchFillsPaginatesWithoutDuplicates(t *testing.T) {
 // truncated history reported as complete. Because the walk is ascending, the
 // rows lost would be the newest — silently erasing open positions.
 func TestFetchFillsRefusesToTruncate(t *testing.T) {
-	page := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, activityJSON(page*activityPageSize, activityPageSize))
-		page++
+	// The handler must be STATELESS. An earlier version held a mutable page
+	// counter, so any transport-level retry of an idempotent GET served the same
+	// block twice and tripped the walk's no-progress guard — failing in CI at
+	// page 301 with "unusable page token" instead of the exhaustion error this
+	// test is about. Deriving the block from the incoming token makes the
+	// response a pure function of the request, so retries are harmless.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := 0
+		if tok := r.URL.Query().Get("page_token"); tok != "" {
+			var n int
+			if _, err := fmt.Sscanf(tok, "id-%06d", &n); err == nil {
+				start = n + 1
+			}
+		}
+		fmt.Fprint(w, activityJSON(start, activityPageSize))
 	}))
 	defer srv.Close()
 
