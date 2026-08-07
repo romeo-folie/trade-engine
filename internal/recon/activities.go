@@ -85,7 +85,7 @@ func (f ActivityFetcher) FetchFills(ctx context.Context, after, until time.Time)
 			return nil, fmt.Errorf("decode activities page %d: %w", page, decErr)
 		}
 		if len(batch) == 0 {
-			break
+			return out, nil // end of history; the only terminator that cannot truncate
 		}
 
 		for _, a := range batch {
@@ -111,9 +111,21 @@ func (f ActivityFetcher) FetchFills(ctx context.Context, after, until time.Time)
 		}
 
 		if len(batch) < activityPageSize {
-			break
+			return out, nil
 		}
-		pageToken = batch[len(batch)-1].ID
+		// Pagination is by the last id seen. An empty id would omit page_token on
+		// the next request, restarting from page zero — silently returning the
+		// same rows over and over until the page cap, with a nil error.
+		next := batch[len(batch)-1].ID
+		if next == "" || next == pageToken {
+			return nil, fmt.Errorf("activities: page %d returned a full page with an unusable page token %q", page, next)
+		}
+		pageToken = next
 	}
-	return out, nil
+	// Falling out of the loop means every page came back full. Returning what we
+	// have would be a truncated history presented as a complete one — and since
+	// the walk is chronological, the rows dropped are the NEWEST, so open
+	// positions and recent exits would silently vanish from the report.
+	return nil, fmt.Errorf("activities: exceeded %d pages (%d fills) — narrow the window; refusing to report a truncated history as complete",
+		maxActivityPages, len(out))
 }

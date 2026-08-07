@@ -8,11 +8,14 @@
 // Usage:
 //
 //	DATABASE_URL=… go run ./cmd/reconcile-fills
-//	DATABASE_URL=… go run ./cmd/reconcile-fills --since 2026-06-01 --all
+//	DATABASE_URL=… go run ./cmd/reconcile-fills --all
 //
-// Only symbols whose position is FLAT compare exactly. An open position carries
-// unrealized P&L that neither side books, so those rows are reported separately
-// and excluded from the totals rather than silently mixed in.
+// Both sides are windowed by the same bounds, and the default window is "all of
+// it". Narrowing the window is supported but lossy in a way no filter can fix:
+// a position opened before the window has no acquisition inside it, so the walk
+// opens a phantom short and inverts the sign of everything after. Symbols where
+// that happened are flagged SOLD SHARES NEVER BOUGHT and excluded from the
+// totals rather than quietly corrupting them.
 package main
 
 import (
@@ -30,8 +33,8 @@ import (
 
 func main() {
 	var (
-		since     = flag.String("since", "2015-01-01", "fetch fills on/after this date (YYYY-MM-DD)")
-		until     = flag.String("until", "", "fetch fills before this date (YYYY-MM-DD); default now+1d")
+		since     = flag.String("since", "2015-01-01", "reconcile fills and trades on/after this date (YYYY-MM-DD)")
+		until     = flag.String("until", "", "reconcile before this date (YYYY-MM-DD); default tomorrow")
 		threshold = flag.Float64("threshold", 1.0, "only report symbols drifting by more than this many dollars")
 		showAll   = flag.Bool("all", false, "report every symbol, not just those over --threshold")
 	)
@@ -56,6 +59,9 @@ func run(since, until string, threshold float64, showAll bool) error {
 			return fmt.Errorf("--until: %w", err)
 		}
 	}
+	if !before.After(after) {
+		return fmt.Errorf("--until (%s) must be after --since (%s)", before.Format("2006-01-02"), since)
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -65,21 +71,28 @@ func run(since, until string, threshold float64, showAll bool) error {
 	if stocks.APIKey == "" || stocks.Secret == "" {
 		return fmt.Errorf("markets.stocks api_key/secret not configured")
 	}
+	if stocks.BaseURL == "" {
+		return fmt.Errorf("markets.stocks.base_url not configured")
+	}
 
 	if err := store.Connect(ctx); err != nil {
 		return fmt.Errorf("connect db: %w", err)
 	}
 	defer store.Close()
 
-	fills, err := recon.ActivityFetcher{
+	allFills, err := recon.ActivityFetcher{
 		BaseURL: stocks.BaseURL, APIKey: stocks.APIKey, Secret: stocks.Secret,
 	}.FetchFills(ctx, after, before)
 	if err != nil {
 		return fmt.Errorf("fetch fills: %w", err)
 	}
+	// Option fills share this Alpaca account but are recorded in orb_trades, not
+	// `trades`. Reconciling them here would flag every contract as off-ledger and
+	// would misprice them 100x (qty is contracts, price is per share).
+	fills, options := recon.PartitionFills(allFills)
 	broker := recon.RealizedBySymbol(fills)
 
-	ledger, err := store.ClosedPnLByTicker(ctx)
+	ledger, err := store.ClosedPnLByTicker(ctx, after, before)
 	if err != nil {
 		return fmt.Errorf("ledger totals: %w", err)
 	}
@@ -95,52 +108,58 @@ func run(since, until string, threshold float64, showAll bool) error {
 	for s := range symbols {
 		sorted = append(sorted, s)
 	}
+	drift := func(s string) float64 { return ledger[s].PnL - broker[s].Realized }
+	comparable := func(s string) bool { return broker[s].Flat() && broker[s].Trustworthy() }
 	sort.Slice(sorted, func(i, j int) bool {
-		di := ledger[sorted[i]].PnL - broker[sorted[i]].Realized
-		dj := ledger[sorted[j]].PnL - broker[sorted[j]].Realized
-		return absf(di) > absf(dj)
+		a, b := sorted[i], sorted[j]
+		// Comparable rows first, biggest drift on top; incomparable rows sort by
+		// name because their "drift" is not a number anyone should rank on.
+		if comparable(a) != comparable(b) {
+			return comparable(a)
+		}
+		if comparable(a) {
+			if da, db := absf(drift(a)), absf(drift(b)); da != db {
+				return da > db
+			}
+		}
+		return a < b
 	})
 
-	fmt.Printf("Alpaca fills: %d across %d symbols   window %s → %s\n\n",
-		len(fills), len(broker), after.Format("2006-01-02"), before.Format("2006-01-02"))
+	fmt.Printf("Alpaca fills: %d equity across %d symbols (%d option fills skipped — those live in orb_trades)\n",
+		len(fills), len(broker), len(options))
+	fmt.Printf("window %s → %s, applied to BOTH sides\n\n", after.Format("2006-01-02"), before.Format("2006-01-02"))
 	fmt.Printf("%-8s %12s %12s %12s %5s  %s\n", "SYMBOL", "LEDGER", "BROKER", "DRIFT", "n", "note")
-	fmt.Println("--------------------------------------------------------------------")
+	fmt.Println("---------------------------------------------------------------------------")
 
 	var flatLedger, flatBroker float64
-	var flatCount, reported int
-	var openSyms []string
+	var comparableCount, reported int
+	var excluded []string
 	for _, s := range sorted {
 		b, l := broker[s], ledger[s]
-		drift := l.PnL - b.Realized
-		note := ""
-		if b.Shorted {
-			note = "had short position"
-		}
-		if !b.Flat() {
-			note = fmt.Sprintf("OPEN %.4f — not comparable", b.Position)
-			openSyms = append(openSyms, s)
-		} else {
+		note := b.Note(l.Trades)
+		driftStr := "     —"
+		if comparable(s) {
 			flatLedger += l.PnL
 			flatBroker += b.Realized
-			flatCount++
+			comparableCount++
+			driftStr = fmt.Sprintf("%+12.2f", drift(s))
+		} else {
+			excluded = append(excluded, s)
 		}
-		if l.Trades == 0 && (b.Realized != 0 || !b.Flat()) {
-			note = "NO LEDGER ROWS — traded entirely off-ledger"
-		}
-		if showAll || absf(drift) > threshold || note != "" {
-			fmt.Printf("%-8s %12.2f %12.2f %+12.2f %5d  %s\n", s, l.PnL, b.Realized, drift, l.Trades, note)
+		if showAll || (comparable(s) && absf(drift(s)) > threshold) || note != "" {
+			fmt.Printf("%-8s %12.2f %12.2f %12s %5d  %s\n", s, l.PnL, b.Realized, driftStr, l.Trades, note)
 			reported++
 		}
 	}
 
-	fmt.Println("--------------------------------------------------------------------")
-	fmt.Printf("FLAT symbols only (%d of %d) — the exact comparison:\n", flatCount, len(sorted))
+	fmt.Println("---------------------------------------------------------------------------")
+	fmt.Printf("COMPARABLE symbols only (%d of %d) — flat position, complete history:\n", comparableCount, len(sorted))
 	fmt.Printf("  ledger %12.2f\n  broker %12.2f\n  drift  %+12.2f\n",
 		flatLedger, flatBroker, flatLedger-flatBroker)
-	if len(openSyms) > 0 {
-		fmt.Printf("\nExcluded (open positions): %v\n", openSyms)
+	if len(excluded) > 0 {
+		fmt.Printf("\nExcluded from the total (%d): %v\n", len(excluded), excluded)
 	}
-	fmt.Printf("\n%d symbol(s) reported; %d within $%.2f.\n", reported, len(sorted)-reported, threshold)
+	fmt.Printf("\n%d symbol(s) reported, %d suppressed as clean.\n", reported, len(sorted)-reported)
 	fmt.Println("\nRead-only: nothing was written. Broker fills are truth; drift means the ledger is wrong.")
 	return nil
 }

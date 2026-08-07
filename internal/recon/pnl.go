@@ -7,7 +7,10 @@
 package recon
 
 import (
+	"fmt"
+	"math"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -34,20 +37,74 @@ type Fill struct {
 // side ("sell", "sell_short") decreases it.
 func (f Fill) IsBuy() bool { return f.Side == "buy" }
 
+// IsOptionSymbol reports whether a symbol is an OCC option contract rather than
+// an equity ticker.
+//
+// This account trades both: options-ORB routes single-leg option orders through
+// the same Alpaca account as the stock path. Their outcomes live in orb_trades,
+// NOT in `trades`, so a reconciliation against `trades` must exclude them — and
+// their P&L would be wrong anyway, because Alpaca reports option qty in
+// contracts and price per share, understating by the 100x contract multiplier.
+//
+// OCC format is 21 characters: up to 6 of root padded with spaces, then
+// YYMMDD, then C/P, then an 8-digit strike. Equity tickers are never 21 chars.
+func IsOptionSymbol(symbol string) bool {
+	if len(symbol) != 21 {
+		return false
+	}
+	// positions 6..11 are the date, 12 is C or P, 13..20 the strike
+	if c := symbol[12]; c != 'C' && c != 'P' {
+		return false
+	}
+	for _, i := range []int{6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 19, 20} {
+		if symbol[i] < '0' || symbol[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// PartitionFills splits fills into equity and option contracts. Callers
+// reconciling against `trades` want only the equity half, and should report the
+// option count rather than dropping it silently.
+func PartitionFills(fills []Fill) (equity, options []Fill) {
+	for _, f := range fills {
+		if IsOptionSymbol(f.Symbol) {
+			options = append(options, f)
+		} else {
+			equity = append(equity, f)
+		}
+	}
+	return equity, options
+}
+
 // SymbolPnL is the broker-truth outcome for one symbol.
 type SymbolPnL struct {
 	Realized float64 // closed P&L, average-cost basis
-	Position float64 // signed quantity still open; ~0 means flat
+	Position float64 // signed quantity still open; exactly 0 means flat
 	Bought   float64 // gross shares bought
 	Sold     float64 // gross shares sold (including short sales)
-	Shorted  bool    // the symbol was short at some point
+
+	// Shorted reports whether the position was ever actually negative — a
+	// property of the position, not of the broker's side vocabulary.
+	Shorted bool
+
+	// SoldWithoutBuying reports that an ordinary "sell" (not "sell_short") drove
+	// the position below zero: the account disposed of shares this fill history
+	// never saw it acquire. That is the JMIA signature, and it is also what a
+	// truncated fetch window looks like from the inside — either way the walk's
+	// basis for this symbol is not trustworthy.
+	SoldWithoutBuying bool
 }
 
 // Flat reports whether the position closed out entirely. Only flat symbols
 // compare exactly against the ledger: an open position carries unrealized P&L
 // that neither side books, and per-lot accounting can legitimately diverge from
 // average cost while shares remain.
-func (s SymbolPnL) Flat() bool { return s.Position > -qtyEpsilon && s.Position < qtyEpsilon }
+func (s SymbolPnL) Flat() bool { return s.Position == 0 }
+
+// Trustworthy reports whether this symbol's walk rests on a complete history.
+func (s SymbolPnL) Trustworthy() bool { return !s.SoldWithoutBuying }
 
 // RealizedBySymbol walks each symbol's fills chronologically and returns
 // average-cost realized P&L.
@@ -65,6 +122,10 @@ func (s SymbolPnL) Flat() bool { return s.Position > -qtyEpsilon && s.Position <
 //  2. opposite direction, not exceeding the position → close some, realize
 //  3. opposite direction, exceeding the position → close all, realize, then
 //     re-open on the other side at this fill's price (a flip through zero)
+//
+// The caller must supply a COMPLETE fill history per symbol. A window that
+// starts mid-position inverts the sign of everything that follows; symbols
+// where that happened are flagged via SoldWithoutBuying.
 func RealizedBySymbol(fills []Fill) map[string]SymbolPnL {
 	bySymbol := map[string][]Fill{}
 	for _, f := range fills {
@@ -86,18 +147,22 @@ func RealizedBySymbol(fills []Fill) map[string]SymbolPnL {
 		var res SymbolPnL
 		for _, f := range symFills {
 			signed := f.Qty
-			if !f.IsBuy() {
+			if f.IsBuy() {
+				res.Bought += f.Qty
+			} else {
 				signed = -f.Qty
 				res.Sold += f.Qty
-			} else {
-				res.Bought += f.Qty
 			}
-			if f.Side != "buy" && f.Side != "sell" {
-				res.Shorted = true
+
+			// A plain "sell" that drives the position negative means shares left
+			// the account that this history never saw arrive. Checked against
+			// the position, before it moves, so an explicit short never trips it.
+			if f.Side == "sell" && pos-f.Qty < -qtyEpsilon {
+				res.SoldWithoutBuying = true
 			}
 
 			switch {
-			case pos > -qtyEpsilon && pos < qtyEpsilon:
+			case math.Abs(pos) < qtyEpsilon:
 				pos, avg = signed, f.Price
 
 			case (pos > 0) == (signed > 0):
@@ -106,26 +171,29 @@ func RealizedBySymbol(fills []Fill) map[string]SymbolPnL {
 				pos = newPos
 
 			default:
-				closing := min(abs(signed), abs(pos))
+				closing := min(math.Abs(signed), math.Abs(pos))
 				direction := 1.0 // long profits when price rises
 				if pos < 0 {
 					direction = -1.0 // short profits when price falls
 				}
 				realized += closing * (f.Price - avg) * direction
 
-				remaining := abs(signed) - closing
+				remaining := math.Abs(signed) - closing
 				pos += signed
 				switch {
-				case pos > -qtyEpsilon && pos < qtyEpsilon:
+				case math.Abs(pos) < qtyEpsilon:
 					pos, avg = 0, 0
 				case remaining > qtyEpsilon:
 					avg = f.Price // flipped through zero; new basis is this fill
 				}
 			}
+			if pos < -qtyEpsilon {
+				res.Shorted = true
+			}
 		}
 		// Never leave dust behind: a residual position is what makes the next
-		// caller divide by ~0.
-		if pos > -qtyEpsilon && pos < qtyEpsilon {
+		// caller divide by ~0, and it is why Flat() can test against exact zero.
+		if math.Abs(pos) < qtyEpsilon {
 			pos = 0
 		}
 		res.Realized, res.Position = realized, pos
@@ -134,16 +202,23 @@ func RealizedBySymbol(fills []Fill) map[string]SymbolPnL {
 	return out
 }
 
-func abs(v float64) float64 {
-	if v < 0 {
-		return -v
+// Note renders the operator-facing flags for one symbol, most severe first.
+// Every applicable flag appears: a symbol can be simultaneously untrustworthy,
+// open, and formerly short, and hiding any of those is how a real anomaly gets
+// read as routine.
+func (s SymbolPnL) Note(ledgerTrades int) string {
+	var notes []string
+	if s.SoldWithoutBuying {
+		notes = append(notes, "SOLD SHARES NEVER BOUGHT — history incomplete")
 	}
-	return v
-}
-
-func min(a, b float64) float64 {
-	if a < b {
-		return a
+	if ledgerTrades == 0 && (s.Realized != 0 || !s.Flat()) {
+		notes = append(notes, "NO LEDGER ROWS — traded entirely off-ledger")
 	}
-	return b
+	if !s.Flat() {
+		notes = append(notes, fmt.Sprintf("OPEN %g — not comparable", s.Position))
+	}
+	if s.Shorted {
+		notes = append(notes, "had short position")
+	}
+	return strings.Join(notes, "; ")
 }
