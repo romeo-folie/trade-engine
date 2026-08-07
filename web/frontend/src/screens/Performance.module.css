@@ -62,31 +62,6 @@
   padding: var(--space-4) 0;
 }
 
-/* ── Concentration warning ──────────────────────────────────────────────────── */
-
-.warnCard {
-  background: var(--card-bg);
-  padding: var(--space-3) var(--space-4);
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-3);
-  margin-bottom: var(--space-5);
-}
-.warnTag {
-  font-family: var(--font-mono);
-  font-size: var(--font-size-xs);
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  color: var(--amber);
-  border: 1px solid var(--amber);
-  padding: 2px 7px;
-  white-space: nowrap;
-  flex-shrink: 0;
-  margin-top: 1px;
-}
-.warnText { font-family: var(--font-sans); font-size: var(--font-size-md); color: var(--text-muted); line-height: 1.5; }
-.warnText strong { color: var(--amber); font-weight: 700; }
-
 /* ── Summary KPIs ───────────────────────────────────────────────────────────── */
 
 .summaryRow {

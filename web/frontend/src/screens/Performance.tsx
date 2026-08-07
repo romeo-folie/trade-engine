@@ -255,9 +255,6 @@ export default function Performance() {
 
   const o = data?.overall;
   const c = data?.concentration;
-  // Concentration warning: is the single best trade carrying most of the net book?
-  const topShare = c?.top_pnl && c?.net_pnl && c.net_pnl > 0 ? c.top_pnl / c.net_pnl : 0;
-  const topHeavy = topShare >= 0.5;
 
   return (
     <div className={styles.screen}>
@@ -294,17 +291,6 @@ export default function Performance() {
 
       {data && o && o.n > 0 && (
         <>
-          {topHeavy && c && (
-            <CornerCard bracketColor="var(--amber)" className={styles.warnCard}>
-              <span className={styles.warnTag}>READ FIRST</span>
-              <span className={styles.warnText}>
-                Top-heavy book — <strong>{c.top_ticker}</strong> ({prettyLabel('strategy', c.top_strategy ?? '')},
-                conf {c.top_conf?.toFixed(3)}) is {fmtUsd(c.top_pnl)} of {fmtUsd(c.net_pnl)} net
-                ({Math.round(topShare * 100)}%). Trust win rate over dollar totals at this sample size.
-              </span>
-            </CornerCard>
-          )}
-
           {/* Headline KPIs */}
           <div className={styles.summaryRow}>
             <CornerCard bracketColor={o.win_rate_pct >= 50 ? 'var(--accent)' : 'var(--amber)'} className={styles.summaryCard}>
