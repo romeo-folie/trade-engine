@@ -2431,3 +2431,149 @@ func TestManager_CorruptBarCannotRatchetStopAboveMarket(t *testing.T) {
 		}
 	}
 }
+
+// ── Activation gate (min gain before the trail takes over) ───────────────────
+
+func TestTrailArmedGatesOnPeakGain(t *testing.T) {
+	const entry, gate = 100.0, 5.0
+	for _, tc := range []struct {
+		name string
+		hwm  float64
+		want bool
+	}{
+		{"never moved", 100, false},
+		{"up 1.5% — the case that was exiting early", 101.5, false},
+		{"just under the gate", 104.99, false},
+		{"exactly at the gate arms", 105, true},
+		{"well past the gate", 130, true},
+		{"underwater never arms", 95, false},
+	} {
+		if got := TrailArmed(entry, tc.hwm, gate); got != tc.want {
+			t.Errorf("%s: TrailArmed(%v, %v, %v) = %v, want %v", tc.name, entry, tc.hwm, gate, got, tc.want)
+		}
+	}
+}
+
+// Arming must LATCH. The gate reads the high-water mark, which only ratchets up,
+// so a trade that earned the trail keeps it through a pullback. Keying on the
+// current price instead would arm and disarm on every oscillation across the
+// threshold — the trail would keep forgetting the peak it exists to protect.
+func TestTrailArmedLatchesThroughPullback(t *testing.T) {
+	// Peaked at +8%, price now back to +1%. HWM is what is passed, so it stays armed.
+	if !TrailArmed(100, 108, 5) {
+		t.Error("TrailArmed = false after peaking above the gate; arming must latch on the high-water mark")
+	}
+	// Sanity: had the caller passed current price (101) it would disarm — the
+	// bug this test exists to prevent.
+	if TrailArmed(100, 101, 5) {
+		t.Error("TrailArmed(entry, currentPrice=101, 5) = true; the 1%% case must not arm")
+	}
+}
+
+func TestTrailArmedZeroGateKeepsLegacyBehaviour(t *testing.T) {
+	for _, hwm := range []float64{0, 95, 100, 100.01} {
+		if !TrailArmed(100, hwm, 0) {
+			t.Errorf("TrailArmed(100, %v, 0) = false; a zero gate must trail from the first tick", hwm)
+		}
+	}
+}
+
+func TestTrailArmedRejectsUnusableInputs(t *testing.T) {
+	if TrailArmed(0, 110, 5) {
+		t.Error("armed with a zero entry price; percent gain is undefined without an entry")
+	}
+	if TrailArmed(100, 0, 5) {
+		t.Error("armed with no high-water mark yet")
+	}
+}
+
+// The live regression this feature exists for: a position that ticks up ~1.5%
+// and pulls back must NOT be closed by the trail. Before the gate, the ratchet
+// ran from the first tick and a pullback of atr_multiple × ATR from a trivial
+// high crossed the price and triggered a market exit.
+func TestManager_ATRDisarmedBelowGainGateDoesNotExit(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 101.5,
+	}
+	// Price has fallen back to 99 after peaking at 101.5 (+1.5%).
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(99, 99.5, 98.5, 99))}
+	fb := &fakeBroker{}
+
+	// The calendar MUST be pinned open. With the market closed, deleting the
+	// gate entirely still leaves the trade open — the ungated code would reach
+	// the exit branch, find the session shut and take the deferral path — so
+	// this assertion would pass against the very bug it exists to catch.
+	m := NewManager(Config{
+		Enabled: true, Rule: RuleATR, ATRMultiple: 1.5, ActivateAtGainPct: 5,
+		MarketOpen: alwaysOpenSession,
+	}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("trade status = %q, want open — a +1.5%% peak has not earned the trail", got)
+	}
+	// The original protective stop must be untouched: the trail owns nothing yet.
+	if got := fs.trades["t1"].StopLoss; got != 95 {
+		t.Errorf("stop_loss = %v, want the original 95 left in place while disarmed", got)
+	}
+}
+
+// Once the peak clears the gate the trail behaves exactly as before, including
+// closing the position when the band crosses price.
+func TestManager_ATRArmedAboveGainGateStillExits(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 120,
+	}
+	// Peaked +20%, now back to 100 — far below hwm - 1.5×ATR, so the trail fires.
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	fb := &fakeBroker{}
+
+	m := NewManager(Config{
+		Enabled: true, Rule: RuleATR, ATRMultiple: 1.5, ActivateAtGainPct: 5,
+	}, fs, fp, fb)
+	m.marketOpen = func(time.Time) bool { return true }
+	m.UpdateAll(context.Background())
+
+	if got := fs.trades["t1"].Status; got == "open" {
+		t.Fatal("trade still open; a +20% peak has earned the trail and the band is through price")
+	}
+}
+
+// The whole feature in one assertion: identical inputs, opposite outcomes.
+//
+// A trade that peaked at +1.5% and pulled back to -1% is exactly the shape that
+// was closing early. Ungated (activate_at_gain_pct: 0, the legacy behaviour)
+// the band lands at 99.95 against a price of 99 and the position is sold at
+// market. Gated at 5% the same trade is left alone for its original stop to
+// manage. This is also the opt-in guarantee: a zero gate changes nothing.
+func TestManager_ATRGateDecidesTheSameTrade(t *testing.T) {
+	newTrade := func() store.Trade {
+		return store.Trade{
+			ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+			EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 101.5,
+		}
+	}
+	run := func(gate float64) string {
+		fs := newFakeStore()
+		fs.trades["t1"] = newTrade()
+		fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(99, 99.5, 98.5, 99))}
+		m := NewManager(Config{
+			Enabled: true, Rule: RuleATR, ATRMultiple: 1.5, ActivateAtGainPct: gate,
+		}, fs, fp, &fakeBroker{})
+		m.marketOpen = func(time.Time) bool { return true }
+		m.UpdateAll(context.Background())
+		return fs.trades["t1"].Status
+	}
+
+	if got := run(0); got == "open" {
+		t.Errorf("ungated status = %q, want the legacy premature exit — otherwise this test is not "+
+			"exercising the behaviour the gate changes", got)
+	}
+	if got := run(5); got != "open" {
+		t.Errorf("gated status = %q, want open — a +1.5%% peak has not earned the trail", got)
+	}
+}

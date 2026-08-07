@@ -16,6 +16,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/risk"
@@ -40,12 +41,17 @@ type RunOptions struct {
 	// behavior (fixed model SL/TP + ungated SELL). They let us replay the SAME
 	// entry signals under different exit rules to measure how much the fixed
 	// take-profit truncates winners.
-	ExitMode       string  // "" | "baseline" | "trail" — "trail" uncaps TP and rides a trailing stop
-	TrailRule      string  // "atr" | "ema" — trailing rule when ExitMode=="trail" (default "atr")
-	TrailATRMult   float64 // ATR multiple below the high-water mark (default 1.5, matches live trailing_stop)
-	TrailEMAPeriod int     // EMA period for the close-below-EMA trail (default 9, Martin's rule)
-	ExitConfMin    float64 // require SELL confidence ≥ this to exit on signal (0 = ungated, original behavior)
-	StopWidthPct   float64 // override non-pullback stop to entry×(1-pct/100) (0 = use model stop)
+	ExitMode  string // "" | "baseline" | "trail" — "trail" uncaps TP and rides a trailing stop
+	TrailRule string // "atr" | "ema" — trailing rule when ExitMode=="trail" (default "atr")
+	// TrailActivateGainPct withholds the ATR trail until peak gain from entry
+	// reaches this percentage, mirroring risk.trailing_stop.activate_at_gain_pct.
+	// 0 = trail from entry. Uses trailing.TrailArmed so the arming rule cannot
+	// drift from the live manager's (the failure #518 was written to prevent).
+	TrailActivateGainPct float64
+	TrailATRMult         float64 // ATR multiple below the high-water mark (default 1.5, matches live trailing_stop)
+	TrailEMAPeriod       int     // EMA period for the close-below-EMA trail (default 9, Martin's rule)
+	ExitConfMin          float64 // require SELL confidence ≥ this to exit on signal (0 = ungated, original behavior)
+	StopWidthPct         float64 // override non-pullback stop to entry×(1-pct/100) (0 = use model stop)
 
 	// PullbackStrength applies the complete Phase 2 deterministic entry setup
 	// after the cached analyst BUY. The analyst request is left unchanged, so a
@@ -61,6 +67,8 @@ type exitPolicy struct {
 	emaPeriod   int
 	exitConfMin float64
 	stopWidth   float64 // fractional stop width (e.g. 0.02 = 2%); 0 = use model stop
+	// activateGainPct gates the ATR trail on peak gain from entry; 0 = ungated.
+	activateGainPct float64
 }
 
 func resolveExitPolicy(o RunOptions) exitPolicy {
@@ -71,6 +79,8 @@ func resolveExitPolicy(o RunOptions) exitPolicy {
 		emaPeriod:   o.TrailEMAPeriod,
 		exitConfMin: o.ExitConfMin,
 		stopWidth:   o.StopWidthPct / 100,
+
+		activateGainPct: o.TrailActivateGainPct,
 	}
 	if p.atrMult <= 0 {
 		p.atrMult = 1.5
@@ -658,7 +668,11 @@ func (pos *openPos) ratchet(candle data.Candle, barATR float64, p exitPolicy) {
 	if candle.High > pos.highWater {
 		pos.highWater = candle.High
 	}
-	if p.trail && !p.useEMA && barATR > 0 {
+	// The arming check runs AFTER highWater updates, so this bar's own high can
+	// arm the trail — matching the live manager, which seeds/ratchets the HWM
+	// from the current price before evaluating the gate.
+	if p.trail && !p.useEMA && barATR > 0 &&
+		trailing.TrailArmed(pos.entryPrice, pos.highWater, p.activateGainPct) {
 		if cand := pos.highWater - p.atrMult*barATR; cand > pos.trailStop {
 			pos.trailStop = cand
 		}
