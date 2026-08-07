@@ -48,9 +48,11 @@ interface Overall {
   attributed_n: number;
   attributed_net_pnl: number | null;
 }
-/** Both figures span the whole ledger, matching the NET REALIZED card they
- *  render under. Per-trade detail was dropped with the top-heavy warning card
- *  that consumed it — see EntryPerfConcentration in internal/store/analyses.go. */
+/** Both figures span the whole ledger. Only top3_pnl is rendered (the "top 3 ="
+ *  foot on NET REALIZED), which is why it must span the same book as that card;
+ *  net_pnl duplicates overall.net_pnl and is kept as a server-side cross-check.
+ *  Per-trade detail was dropped with the top-heavy warning card that consumed
+ *  it — see EntryPerfConcentration in internal/store/analyses.go. */
 interface Concentration {
   net_pnl: number | null;
   top3_pnl: number | null;

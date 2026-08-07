@@ -293,8 +293,12 @@ type EntryPerfBucket struct {
 // single trade can carry the whole net, so "top 3" sits next to net realized as
 // a sanity check on it.
 //
-// Both figures span the full ledger, matching the NET REALIZED card they render
-// under. The per-trade detail (ticker/strategy/confidence of the single largest
+// Both figures span the full ledger. Only Top3PnL is rendered today — as the
+// "top 3 =" foot on the NET REALIZED card, which is why it must be denominated
+// in the same book as that card. NetPnL is the same total the card itself shows
+// (via Overall.NetPnL) and is kept as the cross-check the delta test asserts on.
+//
+// The per-trade detail (ticker/strategy/confidence of the single largest
 // winner) was dropped along with the top-heavy warning card that consumed it:
 // it required a LEFT JOIN LATERAL back to analyses that nothing rendered and no
 // test covered, and unobservable SQL is how the jsonb_array_length defect
