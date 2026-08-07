@@ -211,8 +211,19 @@ func (s SymbolPnL) Note(ledgerTrades int) string {
 	if s.SoldWithoutBuying {
 		notes = append(notes, "SOLD SHARES NEVER BOUGHT — history incomplete")
 	}
-	if ledgerTrades == 0 && (s.Realized != 0 || !s.Flat()) {
-		notes = append(notes, "NO LEDGER ROWS — traded entirely off-ledger")
+	// Realized P&L with no closed ledger row means an exit happened that the
+	// ledger never recorded. Both conjuncts matter and neither may be widened:
+	//
+	//   - ledgerTrades counts CLOSED trades only, so testing it alone falsely
+	//     accuses every live holding — a position still open legitimately has
+	//     none yet, and a tool that cries wolf on the six positions the engine
+	//     is managing correctly teaches operators to ignore it.
+	//   - Gating on Flat() instead would go quiet on the case that matters most:
+	//     a ticker with an unrecorded round trip behind it that has since been
+	//     re-entered (pyramiding makes that ordinary). Realized != 0 catches it
+	//     in both states, which is why Flat() is deliberately NOT tested here.
+	if ledgerTrades == 0 && s.Realized != 0 {
+		notes = append(notes, "NO LEDGER ROWS — realized P&L with no closed trade")
 	}
 	if !s.Flat() {
 		notes = append(notes, fmt.Sprintf("OPEN %g — not comparable", s.Position))

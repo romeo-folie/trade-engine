@@ -2,6 +2,7 @@ package recon
 
 import (
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -238,4 +239,60 @@ func TestRealizedDeterministicWithinOneTimestamp(t *testing.T) {
 	b := RealizedBySymbol(shuffled)["HHH"]
 	near(t, a.Realized, b.Realized, "order-independent realized")
 	near(t, a.Realized, 100, "realized under ID ordering (basis 10, sold 10 @ 20)")
+}
+
+// An open position has no CLOSED ledger trades by definition, so keying the
+// off-ledger alarm off that count alone accuses every live holding of being
+// untracked. Found against SHOP: 18 shares open, with a trades row, 3 signals
+// and 5 analyses behind it — reported as "traded entirely off-ledger".
+func TestNoteDoesNotAccuseOpenPositionsOfBeingOffLedger(t *testing.T) {
+	open := SymbolPnL{Position: 18, Realized: 0}
+	if got := open.Note(0); strings.Contains(got, "NO LEDGER ROWS") {
+		t.Errorf("Note = %q; an open position with no closed trades is normal, not off-ledger", got)
+	}
+	if !strings.Contains(open.Note(0), "OPEN") {
+		t.Errorf("Note = %q, want it to still report the open position", open.Note(0))
+	}
+
+	// A flat symbol with realized P&L and no closed rows IS genuinely unrecorded
+	// (ARWR: bought 114 and sold 114 in one day, -$224.28, zero ledger rows).
+	flat := SymbolPnL{Position: 0, Realized: -224.28}
+	if got := flat.Note(0); !strings.Contains(got, "NO LEDGER ROWS") {
+		t.Errorf("Note = %q, want the genuine off-ledger case still flagged", got)
+	}
+
+	// The alarm must survive re-entry. A ticker with an unrecorded round trip
+	// behind it and a fresh position on top is still off-ledger — and gating on
+	// Flat() would silence exactly this, the case most likely to matter, since
+	// pyramiding makes re-entering a traded ticker ordinary.
+	reentered := SymbolPnL{Position: 18, Realized: 200}
+	if got := reentered.Note(0); !strings.Contains(got, "NO LEDGER ROWS") {
+		t.Errorf("Note = %q; realized P&L with no closed row is off-ledger even while re-entered", got)
+	}
+
+	// ledgerTrades must actually be read: a symbol WITH closed rows is recorded,
+	// whatever its P&L. Without this, an implementation ignoring the parameter
+	// entirely passes every other assertion here.
+	recorded := SymbolPnL{Position: 0, Realized: -224.28}
+	if got := recorded.Note(2); strings.Contains(got, "NO LEDGER ROWS") {
+		t.Errorf("Note = %q; 2 closed ledger rows is not off-ledger", got)
+	}
+
+	// Realized P&L must also be read: nothing realized is not an anomaly.
+	quiet := SymbolPnL{Position: 0, Realized: 0}
+	if got := quiet.Note(0); strings.Contains(got, "NO LEDGER ROWS") {
+		t.Errorf("Note = %q; a symbol that realized nothing is not off-ledger", got)
+	}
+}
+
+// Every applicable flag must appear; an earlier version overwrote each note
+// with the next and hid "OPEN" behind other markers.
+func TestNoteAccumulatesEveryFlag(t *testing.T) {
+	s := SymbolPnL{Position: -50, Shorted: true, SoldWithoutBuying: true}
+	got := s.Note(3)
+	for _, want := range []string{"SOLD SHARES NEVER BOUGHT", "OPEN", "had short position"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("Note = %q, missing %q", got, want)
+		}
+	}
 }
