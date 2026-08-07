@@ -33,13 +33,14 @@ var (
 
 	// Exit-policy research knobs (exit-policy-study). Defaults reproduce the
 	// original baseline exit behavior.
-	btExitMode         string
-	btTrailRule        string
-	btTrailATRMult     float64
-	btTrailEMAPeriod   int
-	btExitConfMin      float64
-	btStopWidthPct     float64
-	btPullbackStrength bool
+	btExitMode             string
+	btTrailRule            string
+	btTrailATRMult         float64
+	btTrailActivateGainPct float64
+	btTrailEMAPeriod       int
+	btExitConfMin          float64
+	btStopWidthPct         float64
+	btPullbackStrength     bool
 )
 
 // ── Command tree ──────────────────────────────────────────────────────────────
@@ -60,6 +61,8 @@ func init() {
 	runBTCmd.Flags().StringVar(&btExitMode, "exit-mode", "baseline", "Exit policy: baseline (fixed SL/TP) | trail (uncap TP, ride a trailing stop)")
 	runBTCmd.Flags().StringVar(&btTrailRule, "trail-rule", "atr", "Trailing rule when --exit-mode=trail: atr (ATR below high-water) | ema (close below EMA)")
 	runBTCmd.Flags().Float64Var(&btTrailATRMult, "trail-atr-mult", 1.5, "ATR multiple for the trailing stop (matches live trailing_stop)")
+	runBTCmd.Flags().Float64Var(&btTrailActivateGainPct, "trail-activate-gain-pct", 0,
+		"withhold the ATR trail until peak gain from entry reaches this % (matches risk.trailing_stop.activate_at_gain_pct; 0 = trail from entry)")
 	runBTCmd.Flags().IntVar(&btTrailEMAPeriod, "trail-ema-period", 9, "EMA period for the close-below-EMA trailing rule")
 	runBTCmd.Flags().Float64Var(&btExitConfMin, "exit-conf-min", 0, "Require SELL confidence ≥ this to exit on signal (0 = ungated)")
 	runBTCmd.Flags().Float64Var(&btStopWidthPct, "stop-width-pct", 0, "Override non-pullback stop to entry×(1-pct/100) (ignored with --pullback-strength)")
@@ -131,13 +134,14 @@ var runBTCmd = &cobra.Command{
 			Model:     btModel,
 			NoCache:   btNoCache,
 
-			ExitMode:         btExitMode,
-			TrailRule:        btTrailRule,
-			TrailATRMult:     btTrailATRMult,
-			TrailEMAPeriod:   btTrailEMAPeriod,
-			ExitConfMin:      btExitConfMin,
-			StopWidthPct:     btStopWidthPct,
-			PullbackStrength: btPullbackStrength,
+			ExitMode:             btExitMode,
+			TrailRule:            btTrailRule,
+			TrailATRMult:         btTrailATRMult,
+			TrailActivateGainPct: btTrailActivateGainPct,
+			TrailEMAPeriod:       btTrailEMAPeriod,
+			ExitConfMin:          btExitConfMin,
+			StopWidthPct:         btStopWidthPct,
+			PullbackStrength:     btPullbackStrength,
 		}
 
 		fmt.Printf("Backtesting %s · %s · %s → %s\n",
@@ -349,6 +353,11 @@ func exitPolicyDesc(o backtest.RunOptions) string {
 				mult = 1.5
 			}
 			s += fmt.Sprintf(" (atr×%.1f)", mult)
+		}
+		// Without this, two stored runs that differ only by the activation gate
+		// are indistinguishable in the results table.
+		if o.TrailActivateGainPct > 0 {
+			s += fmt.Sprintf(" [arm@+%.1f%%]", o.TrailActivateGainPct)
 		}
 	}
 	if o.ExitConfMin > 0 {

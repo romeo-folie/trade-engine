@@ -307,6 +307,9 @@ risk:
     atr_multiple: 1.5          # new_stop = hwm - atr_multiple * ATR (absolute-price ATR)
     interval_sec: 60           # Recompute cadence
     atr_period: 14             # Wilder ATR lookback in 1h candles
+    activate_at_gain_pct: 0    # Withhold the trail until PEAK gain from entry hits this % (0 = trail from the first tick).
+                               # Latches on the high-water mark, so once earned the trail stays on through a pullback.
+                               # Below it the original protective stop owns the exit. rule "atr" only.
   uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
   exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
   bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.

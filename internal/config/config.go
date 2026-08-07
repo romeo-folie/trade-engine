@@ -1710,6 +1710,17 @@ type TrailingStopConfig struct {
 	ATRMultiple float64 `yaml:"atr_multiple"`
 	IntervalSec int     `yaml:"interval_sec"`
 	ATRPeriod   int     `yaml:"atr_period"`
+
+	// ActivateAtGainPct withholds the trail until the position's PEAK gain from
+	// entry reaches this percentage, so a trade that ticks up and pulls back is
+	// left to its original protective stop instead of being trailed out before
+	// it has run. Keyed on the high-water mark, so arming latches: once earned,
+	// the trail stays on even if price falls back.
+	//
+	// 0 (default) keeps the pre-existing behaviour of trailing from the first
+	// tick. Applies to rule "atr" only — the "ema9" rule tracks no high-water
+	// mark, so it has nothing to latch on.
+	ActivateAtGainPct float64 `yaml:"activate_at_gain_pct"`
 }
 
 // ConfidenceTier expresses a (R:R floor → confidence floor) pair (#317).
@@ -2555,6 +2566,10 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("logging.max_age_days must be >= 0, got %d", cfg.Logging.MaxAgeDays))
 	}
 
+	if cfg.Risk.TrailingStop.ActivateAtGainPct < 0 {
+		errs = append(errs, fmt.Sprintf("risk.trailing_stop.activate_at_gain_pct must be >= 0, got %v",
+			cfg.Risk.TrailingStop.ActivateAtGainPct))
+	}
 	trailingRule := strings.ToLower(strings.TrimSpace(cfg.Risk.TrailingStop.Rule))
 	if trailingRule != "" && trailingRule != "atr" && trailingRule != "ema9" {
 		errs = append(errs, fmt.Sprintf("risk.trailing_stop.rule must be one of atr|ema9, got %q", cfg.Risk.TrailingStop.Rule))

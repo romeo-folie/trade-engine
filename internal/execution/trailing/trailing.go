@@ -101,6 +101,37 @@ func ComputeNewStop(currentStop, highWaterMark, atr, atrMultiple float64) float6
 	return currentStop
 }
 
+// TrailArmed reports whether the trailing rule has earned the right to manage
+// this position's exit yet.
+//
+// Without a gate the trail is live from the first tick, so a position that
+// ticks up slightly and pulls back is closed by the trail before it ever had a
+// thesis — observed live across 12 ATR exits, six of which peaked under 5% and
+// five of those exited flat or at a loss. One (CRDO) never traded above its
+// entry at all and the trail still owned its exit, at -9.41%. The original
+// protective stop is the correct owner for trades in that state.
+//
+// The gate keys on the HIGH-WATER MARK, not the current price, and that is what
+// makes arming latch: hwm only ratchets up, so once a trade has earned the
+// trail it keeps it even if price falls back. Gating on current price would arm
+// and disarm on every oscillation across the threshold — a materially different
+// and worse policy, since the trail would repeatedly forget the peak it is
+// supposed to be protecting.
+//
+// activateGainPct <= 0 disables the gate, preserving the original behaviour.
+// Callers must pass the ENTRY price, not the original stop: this threshold is a
+// percentage move, deliberately distinct from the R-multiple gate the forex/ORB
+// instrument config uses (Instrument.TrailAfterR).
+func TrailArmed(entryPrice, highWaterMark, activateGainPct float64) bool {
+	if activateGainPct <= 0 {
+		return true
+	}
+	if entryPrice <= 0 || highWaterMark <= 0 {
+		return false
+	}
+	return (highWaterMark-entryPrice)/entryPrice*100 >= activateGainPct
+}
+
 // PriceFetcher is the narrow data dependency the manager has on the market
 // data layer. The package's data.MarketDataProvider satisfies this directly;
 // tests inject in-memory fakes.
@@ -143,6 +174,10 @@ type Config struct {
 	ATRMultiple float64
 	Interval    time.Duration
 	ATRPeriod   int
+	// ActivateAtGainPct withholds the trail until the position's peak gain from
+	// entry reaches this percentage. 0 disables the gate (trail live from the
+	// first tick). Applies to the ATR rule only — see TrailArmed and updateOne.
+	ActivateAtGainPct float64
 	// MarketOpen is the production market-calendar predicate. The command
 	// wiring supplies engine.IsMarketOpen (including exchange holidays);
 	// tests and other callers fall back to regular weekday session hours.
@@ -218,6 +253,7 @@ func (m *Manager) Run(ctx context.Context) {
 		"interval", m.cfg.Interval,
 		"rule", m.cfg.Rule,
 		"atr_multiple", m.cfg.ATRMultiple,
+		"activate_at_gain_pct", m.cfg.ActivateAtGainPct,
 		"atr_period", m.cfg.ATRPeriod,
 	)
 	ticker := time.NewTicker(m.cfg.Interval)
@@ -317,6 +353,36 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 		hwm = currentPrice
 	}
 
+	// Withhold the trail until the position has earned it. Everything below
+	// this point either ratchets the broker stop or exits at market, and both
+	// are premature for a trade that has not yet run.
+	//
+	// Unlike the transient `newStop <= 0` case further down, an un-armed trade
+	// can stay in this state for its whole life, so the protective stop must be
+	// confirmed present rather than assumed — an uncapped trade whose entry
+	// bracket leg never landed would otherwise sit naked until it gained 5%.
+	// Capped trades stay app-managed: a standalone stop beside their software
+	// take-profit creates two exit owners and can double-sell.
+	if !TrailArmed(t.EntryPrice, hwm, m.cfg.ActivateAtGainPct) {
+		// Persist the peak FIRST, before anything that can fail. This branch runs
+		// every tick for the whole disarmed life of a trade, so a transient broker
+		// error below must not discard a high that already printed: losing it
+		// un-arms a trade that had already earned the trail, permanently, and
+		// recomputes the eventual band from a peak lower than the market made.
+		// 0 leaves stop_loss untouched (see UpdateTradeTrailing).
+		if hwm != t.HighWaterMark {
+			if err := m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm); err != nil {
+				return fmt.Errorf("persist high-water mark while disarmed: %w", err)
+			}
+		}
+		if t.TakeProfit <= 0 && t.StopLoss > 0 {
+			if err := m.ensureProtectiveStop(ctx, t); err != nil {
+				return fmt.Errorf("protective stop while trail disarmed: %w", err)
+			}
+		}
+		return nil
+	}
+
 	// `current_stop` is the most recent persisted stop_loss. The max clamp
 	// in ComputeNewStop guarantees the new stop is never lower than this,
 	// so the stop never widens (and never sinks below the original
@@ -367,6 +433,15 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			// hard stop instead, exactly as the EMA9 rule does. Capped trades
 			// stay app-managed: a standalone stop beside their software
 			// take-profit creates two exit owners and can double-sell.
+			// Persist the peak before the fallible seed, for the same reason as
+			// the disarmed branch above: a broker hiccup must never cost a high
+			// that already printed.
+			if hwm != t.HighWaterMark {
+				if err := m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm); err != nil {
+					return fmt.Errorf("persist high-water mark before deferral: %w", err)
+				}
+				t.HighWaterMark = hwm
+			}
 			if t.TakeProfit <= 0 && t.StopLoss > 0 {
 				if err := m.ensureProtectiveStop(ctx, t); err != nil {
 					return fmt.Errorf("seed protective stop before deferral: %w", err)

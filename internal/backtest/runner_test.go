@@ -548,3 +548,50 @@ func sampleRequest() analysis.AnalysisRequest {
 		Timeframe: "1d",
 	}
 }
+
+// The backtest must gate the trail on the same rule as the live manager, or the
+// two disagree about which trades the trail even owns — the class of divergence
+// PR #518 was written to close.
+func TestRatchetRespectsActivationGate(t *testing.T) {
+	pos := &openPos{entryPrice: 100, stopLoss: 95, trailStop: 95, highWater: 100}
+	gated := exitPolicy{trail: true, atrMult: 1.5, activateGainPct: 5}
+
+	// +1.5% high: below the gate, so the trail must not ratchet off it.
+	pos.ratchet(data.Candle{High: 101.5, Low: 99, Close: 99}, 1.0, gated)
+	if pos.trailStop != 95 {
+		t.Errorf("trailStop = %v, want 95 — a +1.5%% high has not armed the trail", pos.trailStop)
+	}
+	if pos.activeStop(gated) != 95 {
+		t.Errorf("activeStop = %v, want the original stop while disarmed", pos.activeStop(gated))
+	}
+
+	// +10% high: armed, and the trail ratchets from the high-water mark.
+	pos.ratchet(data.Candle{High: 110, Low: 105, Close: 108}, 1.0, gated)
+	if want := 110 - 1.5*1.0; pos.trailStop != want {
+		t.Errorf("trailStop = %v, want %v once armed", pos.trailStop, want)
+	}
+
+	// Arming latches: a later low high must not disarm or lower the stop.
+	pos.ratchet(data.Candle{High: 101, Low: 100, Close: 100}, 1.0, gated)
+	if want := 110 - 1.5*1.0; pos.trailStop != want {
+		t.Errorf("trailStop = %v, want %v — arming must latch and the stop must never widen", pos.trailStop, want)
+	}
+
+	// Discriminating bar: High 112 but Close 100. Keying arming on the close
+	// instead of the high-water mark would disarm here and leave the stop at
+	// 108.5 — and because ratchet only ever RAISES trailStop, the assertions
+	// above cannot tell the two implementations apart. This one can.
+	pos.ratchet(data.Candle{High: 112, Low: 99, Close: 100}, 1.0, gated)
+	if want := 112 - 1.5*1.0; pos.trailStop != want {
+		t.Errorf("trailStop = %v, want %v — arming must key on the high-water mark, not the close", pos.trailStop, want)
+	}
+}
+
+func TestRatchetUngatedMatchesLegacyBehaviour(t *testing.T) {
+	pos := &openPos{entryPrice: 100, stopLoss: 95, trailStop: 95, highWater: 100}
+	ungated := exitPolicy{trail: true, atrMult: 1.5, activateGainPct: 0}
+	pos.ratchet(data.Candle{High: 101.5, Low: 99, Close: 99}, 1.0, ungated)
+	if want := 101.5 - 1.5*1.0; pos.trailStop != want {
+		t.Errorf("trailStop = %v, want %v — a zero gate must trail from the first bar", pos.trailStop, want)
+	}
+}

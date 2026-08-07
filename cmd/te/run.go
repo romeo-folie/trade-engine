@@ -214,8 +214,10 @@ Modes:
 					ATRMultiple: cfg.Risk.TrailingStop.ATRMultiple,
 					Interval:    time.Duration(cfg.Risk.TrailingStop.IntervalSec) * time.Second,
 					ATRPeriod:   cfg.Risk.TrailingStop.ATRPeriod,
-					MarketOpen:  engine.IsMarketOpen,
-					RecordLoss:  eng.Portfolio().RecordLoss,
+
+					ActivateAtGainPct: cfg.Risk.TrailingStop.ActivateAtGainPct,
+					MarketOpen:        engine.IsMarketOpen,
+					RecordLoss:        eng.Portfolio().RecordLoss,
 					OnTradeClosed: func(payload events.TradeClosedPayload) {
 						eng.Bus().Publish(events.TradeClosed, payload)
 					},
