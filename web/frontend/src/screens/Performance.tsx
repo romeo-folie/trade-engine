@@ -42,6 +42,11 @@ interface Overall {
   avg_conf: number | null;
   window_start: string | null;
   window_end: string | null;
+  /** Subset of `n` that joins back to an analysis — the denominator for every
+   *  breakdown below. Broker-adopted trades have no provenance to slice, so the
+   *  headline (all closed) and the breakdowns (attributed) differ on purpose. */
+  attributed_n: number;
+  attributed_net_pnl: number | null;
 }
 interface Concentration {
   net_pnl: number | null;
@@ -255,6 +260,12 @@ export default function Performance() {
 
   const o = data?.overall;
   const c = data?.concentration;
+  // Net carried by trades the breakdowns cannot see. Both sides come from the
+  // same response, so this never disagrees with the cards above it.
+  const unattributedNet =
+    o?.net_pnl != null && o?.attributed_net_pnl != null
+      ? o.net_pnl - o.attributed_net_pnl
+      : null;
 
   return (
     <div className={styles.screen}>
@@ -311,9 +322,22 @@ export default function Performance() {
             <CornerCard bracketColor="var(--border)" className={styles.summaryCard}>
               <span className={styles.summaryLabel}>AVG CONFIDENCE</span>
               <span className={styles.summaryValue}>{o.avg_conf?.toFixed(3) ?? '—'}</span>
-              <span className={styles.summaryFoot}>gate {gate.toFixed(2)}</span>
+              <span className={styles.summaryFoot}>gate {gate.toFixed(2)} · {o.attributed_n} attributed</span>
             </CornerCard>
           </div>
+
+          {/* The headline above covers the whole closed book; everything below
+              covers only trades that join back to an analysis. State the gap
+              rather than letting the two populations look like one. */}
+          {o.attributed_n < o.n && (
+            <p className={styles.provenanceNote}>
+              <span className={styles.provenanceTag}>SIGNAL PROVENANCE</span>
+              Breakdowns below cover <strong>{o.attributed_n} of {o.n}</strong> closed trades.
+              The other {o.n - o.attributed_n} {o.n - o.attributed_n === 1 ? 'is a' : 'are'} broker-adopted
+              {o.n - o.attributed_n === 1 ? ' row' : ' rows'} with no analysis to attribute
+              ({fmtUsd(unattributedNet)}).
+            </p>
+          )}
 
           {/* Confidence → win rate */}
           <CornerCard bracketColor="var(--border)" className={styles.chartCard}>
@@ -400,8 +424,10 @@ export default function Performance() {
           </div>
 
           <p className={styles.footNote}>
-            Ledger-direct: win rate = wins / all-closed × 100 over closed equity trades joined to their analysis.
-            ORB/forex excluded. Open positions not counted. Small sample — treat non-confidence cuts as suggestive.
+            Ledger-direct: win rate = wins / all-closed × 100 over every closed trade, break-even kept in the
+            denominator — the same figure, from the same query, that the Portfolio screen reports. The breakdowns
+            above cover only trades that join back to an analysis. ORB/forex keep a separate ledger and never
+            appear here. Open positions not counted. Small sample — treat non-confidence cuts as suggestive.
           </p>
         </>
       )}

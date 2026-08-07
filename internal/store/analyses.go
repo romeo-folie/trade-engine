@@ -173,12 +173,22 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 // joined back to the analysis that produced it (trades → signals.analysis_ids →
 // analyses), then sliced by how the signal was made — confidence, decision mode
 // (fast-path / arbitrated / consensus), strategy, direction and analyst count.
-// ORB/forex live in orb_trades and are excluded by construction (they never
-// carry a signal_id into `signals`).
 //
-// Win rate is defined once, everywhere: wins / all-closed × 100, with
-// break-even (pnl = 0) trades kept in the denominator. The patched
-// GetPortfolioStats uses the same definition so the two surfaces agree.
+// Two populations, deliberately:
+//
+//   - The headline KPIs use GetClosedLedgerStats — every closed trade, joined to
+//     nothing. Same helper the Portfolio screen calls, so the two surfaces agree
+//     by construction rather than by convention.
+//   - The breakdowns use entryBaseCTE — only trades that join back to an
+//     analysis. A trade with no analysis has no provenance to slice.
+//
+// The gap between them is real and is surfaced in the UI, not hidden: ORB/forex
+// live in orb_trades and never reach this table at all, but broker-adopted
+// trades (#328, strategy 'recovery') DO land in `trades` with a NULL signal_id,
+// and were silently missing from the headline until this was split.
+//
+// Win rate is defined once, in GetClosedLedgerStats: wins / all-closed × 100,
+// with break-even (pnl = 0) trades kept in the denominator.
 
 // entryBaseCTE is the shared join — exactly one row per closed trade. `mode`
 // collapses the three provenance states (fast_pathed, arbiter_response present,
@@ -192,16 +202,20 @@ func GetModelPerformance(ctx context.Context, minTrades int) ([]ModelPerformance
 // below. The LATERAL … LIMIT 1 picks the most recent analysis per signal
 // deterministically (created_at DESC, id tie-break), mirroring the DISTINCT ON
 // (s.id) attribution used by the analyst batch path.
+// Note the population: this join reaches provenance through signals, and
+// trades.signal_id is nullable, so every broker-adopted trade (#328, strategy
+// 'recovery') is excluded. That is correct for the breakdowns — a trade with no
+// analysis has no provenance to attribute — but it is NOT the closed book. The
+// headline KPIs come from GetClosedLedgerStats instead; see GetEntryPerformance.
 const entryBaseCTE = `
-WITH base AS (
+WITH attributed AS (
     SELECT t.ticker, t.direction::text AS dir, t.strategy,
            t.pnl::float8 AS pnl, t.pnl_pct::float8 AS pnl_pct, t.opened_at,
            a.confidence::float8 AS conf,
            CASE WHEN a.fast_pathed THEN 'fast_path'
                 WHEN a.arbiter_response IS NOT NULL THEN 'arbitrated'
                 ELSE 'consensus' END AS mode,
-           jsonb_array_length(a.ensemble_results) AS n_analysts,
-           a.ensemble_results AS ensemble
+           a.ensemble_results AS ensemble_raw
     FROM trades t
     JOIN signals s ON s.id = t.signal_id
     JOIN LATERAL (
@@ -212,9 +226,33 @@ WITH base AS (
         LIMIT 1
     ) a ON true
     WHERE t.status = 'closed' AND t.pnl IS NOT NULL
+),
+base AS (
+    SELECT ticker, dir, strategy, pnl, pnl_pct, opened_at, conf, mode,
+           -- analyses.ensemble_results is a nullable JSONB, and rows written by
+           -- the zero-analyst path (engine.go: InsertAnalysisWithScannerRun)
+           -- leave it NULL while older rows can hold the JSON scalar 'null'.
+           -- jsonb_array_length raises on anything that is not an array
+           -- ("cannot get array length of a scalar"), and a NULL length would
+           -- surface as a NULL group label that fails the row scan — either way
+           -- a single bad row takes down the whole endpoint rather than one cut.
+           -- Normalising once, here, keeps every downstream cut safe. A missing
+           -- ensemble genuinely means zero analyst results, so 0 is the honest
+           -- count, not a sentinel.
+           CASE WHEN jsonb_typeof(ensemble_raw) = 'array'
+                THEN ensemble_raw ELSE '[]'::jsonb END AS ensemble,
+           CASE WHEN jsonb_typeof(ensemble_raw) = 'array'
+                THEN jsonb_array_length(ensemble_raw) ELSE 0 END AS n_analysts
+    FROM attributed
 )`
 
-// EntryPerfOverall is the headline row across all closed equity entries.
+// EntryPerfOverall is the headline row across the whole closed book.
+//
+// Two populations meet here, deliberately. N/Wins/Losses/Breakeven/WinRatePct/
+// AvgPnLPct/MedianPnLPct/NetPnL and the window cover every closed trade (the
+// shared ledger). AttributedN/AttributedNetPnL/AvgConf cover only the subset
+// that joins back to an analysis — the population every breakdown below uses.
+// The UI shows the difference explicitly; do not collapse the two.
 type EntryPerfOverall struct {
 	N            int      `json:"n"`
 	Wins         int      `json:"wins"`
@@ -227,6 +265,12 @@ type EntryPerfOverall struct {
 	AvgConf      *float64 `json:"avg_conf"`
 	WindowStart  *string  `json:"window_start"`
 	WindowEnd    *string  `json:"window_end"`
+
+	// AttributedN is the count of closed trades that join back to an analysis —
+	// the denominator for every breakdown. AttributedNetPnL is their net, so the
+	// UI can name the unattributed remainder without a second round trip.
+	AttributedN      int      `json:"attributed_n"`
+	AttributedNetPnL *float64 `json:"attributed_net_pnl"`
 }
 
 // EntryPerfBucket is one row of any breakdown (confidence band, decision mode,
@@ -370,30 +414,33 @@ func entryRoleAccuracy(ctx context.Context, labelExpr, groupOrder string) ([]Ent
 func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 	var ep EntryPerformance
 
-	// Overall headline.
-	overallQ := entryBaseCTE + `
-		SELECT count(*)::int,
-		       count(*) FILTER (WHERE pnl > 0)::int,
-		       count(*) FILTER (WHERE pnl < 0)::int,
-		       count(*) FILTER (WHERE pnl = 0)::int,
-		       COALESCE(round(100.0 * count(*) FILTER (WHERE pnl > 0)::numeric / NULLIF(count(*), 0), 1), 0)::float8,
-		       round(avg(pnl_pct)::numeric, 2)::float8,
-		       round((percentile_cont(0.5) WITHIN GROUP (ORDER BY pnl_pct))::numeric, 2)::float8,
-		       round(sum(pnl)::numeric, 2)::float8,
-		       round(avg(conf)::numeric, 3)::float8,
-		       min(opened_at)::date::text,
-		       max(opened_at)::date::text
-		FROM base`
-	o := &ep.Overall
-	if err := GetDB().QueryRow(ctx, overallQ).Scan(
-		&o.N, &o.Wins, &o.Losses, &o.Breakeven, &o.WinRatePct,
-		&o.AvgPnLPct, &o.MedianPnLPct, &o.NetPnL, &o.AvgConf,
-		&o.WindowStart, &o.WindowEnd,
-	); err != nil {
+	// Headline KPIs come from the shared closed-trade ledger, NOT from `base`.
+	// `base` inner-joins signals→analyses for provenance, which drops every
+	// broker-adopted trade (no signal_id) — real realized money that belongs in
+	// the headline even though it has no analysis to attribute. Using the shared
+	// helper also makes this screen agree with the Portfolio screen by
+	// construction (TestClosedLedgerSurfacesAgree).
+	ledger, err := GetClosedLedgerStats(ctx)
+	if err != nil {
 		return nil, err
 	}
+	o := &ep.Overall
+	o.N, o.Wins, o.Losses, o.Breakeven = ledger.N, ledger.Wins, ledger.Losses, ledger.Breakeven
+	o.WinRatePct = ledger.WinRatePct
+	o.AvgPnLPct, o.MedianPnLPct, o.NetPnL = ledger.AvgPnLPct, ledger.MedianPnLPct, ledger.NetPnL
+	o.WindowStart, o.WindowEnd = ledger.WindowStart, ledger.WindowEnd
 
-	var err error
+	// AttributedN / AttributedNetPnL / AvgConf describe the `base` population
+	// only — confidence does not exist for a trade with no analysis. The UI
+	// renders the gap between AttributedN and N so the two populations on one
+	// screen are stated rather than implied.
+	if err := GetDB().QueryRow(ctx, entryBaseCTE+`
+		SELECT count(*)::int,
+		       round(sum(pnl)::numeric, 2)::float8,
+		       round(avg(conf)::numeric, 3)::float8
+		FROM base`).Scan(&o.AttributedN, &o.AttributedNetPnL, &o.AvgConf); err != nil {
+		return nil, err
+	}
 	confLabel := `CASE WHEN conf < 0.60 THEN '<0.60'
 	                   WHEN conf < 0.68 THEN '0.60-0.68'
 	                   WHEN conf < 0.75 THEN '0.68-0.75'
@@ -426,13 +473,31 @@ func GetEntryPerformance(ctx context.Context) (*EntryPerformance, error) {
 		return nil, err
 	}
 
-	// Concentration: net, top-3 sum, and the single largest winner.
-	concQ := entryBaseCTE + `
-		SELECT (SELECT round(sum(pnl)::numeric, 2)::float8 FROM base),
-		       (SELECT round(sum(pnl)::numeric, 2)::float8 FROM (SELECT pnl FROM base ORDER BY pnl DESC LIMIT 3) x),
+	// Concentration: net, top-3 sum, and the single largest winner — over the
+	// whole ledger, so "top 3 = …" is denominated in the same book as the
+	// NET REALIZED card it sits under. Confidence is LEFT-joined because the
+	// largest trade may be an adopted row with no analysis behind it.
+	concQ := `
+		WITH ledger AS (
+		    SELECT ticker, strategy, signal_id,
+		           pnl::float8 AS pnl, pnl_pct::float8 AS pnl_pct
+		    FROM trades WHERE ` + closedLedgerPredicate + `
+		)
+		SELECT (SELECT round(sum(pnl)::numeric, 2)::float8 FROM ledger),
+		       (SELECT round(sum(pnl)::numeric, 2)::float8 FROM (SELECT pnl FROM ledger ORDER BY pnl DESC LIMIT 3) x),
 		       top.ticker, top.strategy,
-		       round(top.pnl::numeric, 2)::float8, round(top.pnl_pct::numeric, 2)::float8, round(top.conf::numeric, 3)::float8
-		FROM (SELECT ticker, strategy, pnl, pnl_pct, conf FROM base ORDER BY pnl DESC LIMIT 1) top`
+		       round(top.pnl::numeric, 2)::float8, round(top.pnl_pct::numeric, 2)::float8,
+		       round(conf.confidence::numeric, 3)::float8
+		FROM (SELECT ticker, strategy, signal_id, pnl, pnl_pct FROM ledger ORDER BY pnl DESC LIMIT 1) top
+		LEFT JOIN LATERAL (
+		    SELECT a.confidence
+		    FROM signals s
+		    CROSS JOIN LATERAL unnest(s.analysis_ids) AS aid
+		    JOIN analyses a ON a.id = aid
+		    WHERE s.id = top.signal_id
+		    ORDER BY a.created_at DESC, a.id DESC
+		    LIMIT 1
+		) conf ON true`
 	c := &ep.Concentration
 	if err := GetDB().QueryRow(ctx, concQ).Scan(
 		&c.NetPnL, &c.Top3PnL, &c.TopTicker, &c.TopStrategy, &c.TopPnL, &c.TopPnLPct, &c.TopConf,
