@@ -159,6 +159,11 @@ func ClaimWeeklyLeaderRun(
 	if lease <= 0 {
 		lease = time.Hour
 	}
+	if err := validateApprovedUniverseForDependentRun(
+		ctx, run.UniverseVersionID, run.DecisionAt, &run.SessionDate,
+	); err != nil {
+		return nil, false, err
+	}
 	row := GetDB().QueryRow(ctx, `
 		INSERT INTO weekly_leader_runs (
 			session_date, as_of, decision_at, universe_version_id, started_at, lease_until,

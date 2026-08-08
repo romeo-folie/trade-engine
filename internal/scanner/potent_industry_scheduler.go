@@ -30,6 +30,8 @@ func (e *potentIndustryRunLeaseActiveError) Error() string {
 		e.sessionDate.Format("2006-01-02"), e.retryAt.Format(time.RFC3339))
 }
 
+func (e *potentIndustryRunLeaseActiveError) RetryAtTime() time.Time { return e.retryAt }
+
 // PotentIndustryScheduler derives every run from the exchange calendar. Its
 // one-shot timers cannot drift across DST, holidays, or early closes.
 type PotentIndustryScheduler struct {

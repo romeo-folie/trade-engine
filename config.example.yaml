@@ -896,6 +896,9 @@ scanner:
   promotion_correlation_min_overlap: 30
   universe:
     enabled: false                         # Full-market point-in-time universe; off preserves movers/actives-only discovery
+    after_close_delay_minutes: 30          # Build after the official close; dependants wait for approval
+    run_lease_minutes: 120                 # Reclaim a build if its owner disappears beyond this lease
+    min_market_data_coverage: 0.90         # Reject plausible-looking snapshots with incomplete provider evidence
     provider: alpaca                       # Provider adapter used for bulk membership and eligibility evidence
     min_price: 5.0                         # Exclude lower-priced securities once the universe is enabled
     min_market_cap_mm: 100.0               # Minimum market cap in USD millions
@@ -919,7 +922,7 @@ scanner:
     enabled: false                         # Full-universe after-close leadership lens; default off
     promote_candidates: false              # When true, qualified leaders enter the normal LLM/watchlist gate
     max_promotions_per_run: 20             # Bound qualified names sent through the paid LLM gate
-    after_close_delay_minutes: 15          # Wait for the provider to finalize the completed daily bar
+    after_close_delay_minutes: 15          # Minimum delay; shared universe delay must be at least this long
     universe_max_age_hours: 36             # Maximum age of the completed point-in-time universe
     history_calendar_days: 420             # Fetch window supporting 253 sessions plus weekends, holidays, and buffer
     min_history_sessions: 253              # True 52-week history; shorter-history names fail explicitly
@@ -935,7 +938,7 @@ scanner:
     enabled: false                         # Full-universe industry-rotation lens; default off
     promote_candidates: false              # Add top members to normal scanner scoring; keep false for observation only
     max_promotions_per_run: 20             # Global promotion cap; excluded from scoring-history compatibility
-    after_close_delay_minutes: 15          # Wait for finalized completed-session bars
+    after_close_delay_minutes: 15          # Minimum delay; shared universe delay must be at least this long
     universe_max_age_hours: 36             # Maximum age of the immutable universe snapshot
     taxonomy_max_age_hours: 168            # Maximum age of taxonomy used to form a group
     history_calendar_days: 420             # Calendar fetch window supporting true 52-week diagnostics
@@ -974,7 +977,7 @@ scanner:
     checkpoints: ["08:00", "09:00", "09:20"] # America/New_York; exchange calendar and DST aware
     hard_cutoff: "09:25"                   # No result may publish after opening-range preparation begins
     feed: sip                              # Consolidated executable evidence; IEX is rejected
-    universe_max_age_hours: 36             # Maximum age of the immutable eligible universe
+    universe_max_age_hours: 36             # Deprecated compatibility field; freshness is exact prior-session based
     history_sessions: 20                   # Same-clock premarket volume sessions used by RVOL
     news_lookback_hours: 24                # Catalyst freshness window ending at the checkpoint
     max_candidates_per_run: 50             # Detailed-evidence shortlist cap

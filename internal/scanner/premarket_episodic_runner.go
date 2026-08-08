@@ -50,14 +50,27 @@ func (r *PremarketEpisodicRunner) RunCheckpoint(
 	if !startedAt.Before(hardCutoff) {
 		return errors.New("premarket checkpoint skipped after hard cutoff")
 	}
-	maxAge := time.Duration(r.Cfg.UniverseMaxAgeHours) * time.Hour
-	universe, err := store.GetUsableSwingUniverseVersion(ctx, checkpoint, maxAge)
+	universeSession := engine.MostRecentCompletedMarketSession(checkpoint, 0)
+	universe, err := store.GetLatestApprovedSwingUniverseForSessionAsOf(
+		ctx, universeSession.Date, checkpoint,
+	)
 	if err != nil {
 		return fmt.Errorf("load premarket universe: %w", err)
 	}
 	if universe == nil {
-		return fmt.Errorf("no completed swing universe available at %s within %s",
-			checkpoint.Format(time.RFC3339), maxAge)
+		cause := fmt.Errorf("no approved swing universe for prior session %s available at %s",
+			universeSession.Date.Format("2006-01-02"), checkpoint.Format(time.RFC3339))
+		if persistErr := store.RecordScannerDependencyBlock(
+			ctx, "premarket_episodic", session.Date, checkpoint, "swing_universe", cause,
+		); persistErr != nil {
+			return errors.Join(cause, persistErr)
+		}
+		return cause
+	}
+	if err := store.ResolveScannerDependencyBlock(
+		ctx, "premarket_episodic", session.Date, checkpoint, "swing_universe",
+	); err != nil {
+		return err
 	}
 	members, err := store.ListEligibleSwingUniverseMembers(ctx, universe.ID)
 	if err != nil {
@@ -396,6 +409,7 @@ func premarketConfigEvidence(
 	compatibility.Checkpoints = nil
 	compatibility.RunLeaseMinutes = 0
 	compatibility.BatchSize = 0
+	compatibility.UniverseMaxAgeHours = 0
 	encoded, err := json.Marshal(struct {
 		FeatureVersion string                         `json:"feature_version"`
 		Config         config.PremarketEpisodicConfig `json:"config"`

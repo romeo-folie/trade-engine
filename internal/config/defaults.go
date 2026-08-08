@@ -413,6 +413,9 @@ func Defaults() *Config {
 			PromotionCorrelationMinOverlap:   30,
 			Universe: UniverseConfig{
 				Enabled:                   false,
+				AfterCloseDelayMinutes:    30,
+				RunLeaseMinutes:           120,
+				MinMarketDataCoverage:     0.90,
 				Provider:                  "alpaca",
 				MinPrice:                  5,
 				MinMarketCapMM:            100,

@@ -14,17 +14,15 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 	ctx := context.Background()
 	base := time.Date(2099, time.January, 5, 20, 0, 0, 0, time.UTC)
 	const ticker = "TEST_MULTI_SOURCE"
-	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider: "test-multi-source-promotion", AsOf: base.Add(-time.Hour),
 		CapturedAt: base.Add(-50 * time.Minute),
 		Filters:    json.RawMessage(`{"test":"multi-source-promotion"}`),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	versionID := claim.ActiveVersionID
 	price, marketCap, dollarVolume := 120.0, 12_000.0, 90_000_000.0
 	taxonomyAt := base.Add(-24 * time.Hour)
-	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, []store.SwingUniverseMember{{
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, claim, []store.SwingUniverseMember{{
 		Ticker: ticker, Eligible: true, Price: &price, MarketCapMM: &marketCap,
 		DollarVolume: &dollarVolume, Sector: "Technology", Industry: "Software",
 		TaxonomyStatus: "known", TaxonomyAsOf: &taxonomyAt,
@@ -32,11 +30,7 @@ func TestScannerSourcePromotionIsAtomicAcrossWeeklyAndIndustryClaims(t *testing.
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CompleteSwingUniverseVersion(
-		ctx, versionID, base.Add(-40*time.Minute),
-	); err != nil {
-		t.Fatal(err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, base.Add(-40*time.Minute))
 	t.Cleanup(func() {
 		_, _ = store.GetDB().Exec(context.Background(),
 			"DELETE FROM watchlist WHERE ticker=$1", ticker)

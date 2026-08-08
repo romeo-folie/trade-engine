@@ -13,6 +13,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -26,36 +27,12 @@ type FundamentalsProvider interface {
 // makes partial-provider and no-lookahead behavior deterministic in tests.
 type Repository interface {
 	Begin(context.Context, store.SwingUniverseVersion) (string, error)
+	UpdateMetadata(context.Context, string, store.SwingUniverseVersion) error
 	ReplaceMembers(context.Context, string, []store.SwingUniverseMember) error
-	Complete(context.Context, string, time.Time) error
-	Fail(context.Context, string, time.Time, error) error
+	Complete(context.Context, string, time.Time, store.SwingUniverseQuality) error
+	Fail(context.Context, string, time.Time, store.SwingUniverseQuality, error) error
 	TaxonomyAsOf(context.Context, string, time.Time, time.Duration) (*store.CompanyTaxonomyObservation, error)
 	InsertTaxonomy(context.Context, store.CompanyTaxonomyObservation) (string, error)
-}
-
-type StoreRepository struct{}
-
-func (StoreRepository) Begin(ctx context.Context, v store.SwingUniverseVersion) (string, error) {
-	return store.BeginSwingUniverseVersion(ctx, v)
-}
-func (StoreRepository) ReplaceMembers(ctx context.Context, id string, members []store.SwingUniverseMember) error {
-	return store.ReplaceSwingUniverseMembers(ctx, id, members)
-}
-func (StoreRepository) Complete(ctx context.Context, id string, at time.Time) error {
-	return store.CompleteSwingUniverseVersion(ctx, id, at)
-}
-func (StoreRepository) Fail(ctx context.Context, id string, at time.Time, cause error) error {
-	return store.FailSwingUniverseVersion(ctx, id, at, cause)
-}
-func (StoreRepository) TaxonomyAsOf(
-	ctx context.Context, ticker string, asOf time.Time, maxAge time.Duration,
-) (*store.CompanyTaxonomyObservation, error) {
-	return store.GetCompanyTaxonomyAsOf(ctx, ticker, asOf, maxAge)
-}
-func (StoreRepository) InsertTaxonomy(
-	ctx context.Context, observation store.CompanyTaxonomyObservation,
-) (string, error) {
-	return store.InsertCompanyTaxonomyObservation(ctx, observation)
 }
 
 type Builder struct {
@@ -76,6 +53,7 @@ type RefreshResult struct {
 	EligibleCount       int
 	PartialFailureCount int
 	TaxonomyRefreshes   int
+	Quality             store.SwingUniverseQuality
 }
 
 type fundamentalsEvidence struct {
@@ -98,6 +76,26 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		return result, err
 	}
 	startedAt := b.now()
+	filters, _ := json.Marshal(b.Config)
+	versionID, err := b.Repository.Begin(ctx, store.SwingUniverseVersion{
+		Provider: b.Config.Provider, AsOf: startedAt, CapturedAt: startedAt,
+		Filters: filters, SourceEvidence: json.RawMessage(`{"build_stage":"started"}`),
+	})
+	if err != nil {
+		return result, err
+	}
+	result.VersionID = versionID
+	result.Quality.MinMarketDataCoverage = b.Config.MinMarketDataCoverage
+	if result.Quality.MinMarketDataCoverage <= 0 {
+		result.Quality.MinMarketDataCoverage = 0.90
+	}
+	defer func() {
+		if err != nil {
+			_ = b.Repository.Fail(
+				context.Background(), versionID, b.now(), result.Quality, err,
+			)
+		}
+	}()
 	assets, err := b.Assets.FetchStockAssets(ctx)
 	if err != nil {
 		return result, fmt.Errorf("fetch stock asset master: %w", err)
@@ -129,6 +127,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 		symbols = append(symbols, symbol)
 	}
 	assets = uniqueAssets
+	result.MemberCount = len(assets)
 	if len(assets) == 0 {
 		return result, errors.New("stock asset master contained no valid symbols")
 	}
@@ -142,6 +141,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			marketSymbols = append(marketSymbols, asset.Symbol)
 		}
 	}
+	result.Quality.EvidenceRequiredCount = len(marketSymbols)
 
 	from := startedAt.AddDate(0, 0, -(b.Config.DollarVolumeLookbackDays*2 + 10))
 	var snapshots data.StockSnapshotBatchResult
@@ -195,14 +195,28 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			}
 		}
 	}
-	// An all-ineligible asset master is still a valid audit snapshot: every
-	// member will be excluded by asset-master filters, so no market evidence is
-	// required or expected in that case.
-	if len(marketSymbols) > 0 && !hasCoherentMarketData(
-		marketSymbols, snapshots, bars, b.Config.DollarVolumeLookbackDays, startedAt,
-	) {
-		return result, errors.New(
-			"market-data refresh produced no symbol with both snapshot and daily-bar evidence",
+	result.Quality = marketDataQuality(
+		marketSymbols, snapshots, bars, b.Config.DollarVolumeLookbackDays,
+		startedAt, result.Quality.MinMarketDataCoverage,
+	)
+	if result.Quality.MarketDataCoverage < result.Quality.MinMarketDataCoverage {
+		members := make([]store.SwingUniverseMember, 0, len(assets))
+		for _, asset := range assets {
+			member := b.evaluate(asset, snapshots, bars, nil, nil, startedAt, false)
+			member.UniverseVersionID = versionID
+			members = append(members, member)
+			if member.FailureStage != "" {
+				result.PartialFailureCount++
+			}
+		}
+		result.Quality.PartialFailureCount = result.PartialFailureCount
+		if replaceErr := b.Repository.ReplaceMembers(ctx, versionID, members); replaceErr != nil {
+			return result, replaceErr
+		}
+		return result, fmt.Errorf(
+			"market-data coverage %.2f%% is below configured minimum %.2f%%",
+			result.Quality.MarketDataCoverage*100,
+			result.Quality.MinMarketDataCoverage*100,
 		)
 	}
 
@@ -303,39 +317,52 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			}
 		}
 	}
+	result.Quality.FundamentalsRequiredCount = len(fundamentalsRequiredSymbols)
+	for _, symbol := range fundamentalsRequiredSymbols {
+		observation := taxonomy[symbol]
+		if observation != nil && marketCapFromEvidence(observation.Evidence) > 0 {
+			result.Quality.UsableFundamentalsCount++
+		} else {
+			result.Quality.FundamentalsFailureCount++
+			// Fundamentals are required only after coherent market evidence
+			// passes, so this symbol is not already in the market-data failure
+			// union calculated above.
+			result.Quality.ProviderFailureCount++
+		}
+	}
+	if result.Quality.FundamentalsRequiredCount == 0 {
+		result.Quality.FundamentalsCoverage = 1
+	} else {
+		result.Quality.FundamentalsCoverage = float64(
+			result.Quality.UsableFundamentalsCount,
+		) / float64(result.Quality.FundamentalsRequiredCount)
+	}
+	var qualityErr error
 	if b.Config.MinMarketCapMM > 0 &&
 		b.Config.MissingFundamentalsPolicy != "include" &&
-		len(fundamentalsRequiredSymbols) > 0 &&
-		!hasFundamentalsEvidence(fundamentalsRequiredSymbols, taxonomy) {
-		return result, errors.New(
+		result.Quality.FundamentalsRequiredCount > 0 &&
+		result.Quality.UsableFundamentalsCount == 0 {
+		qualityErr = errors.New(
 			"fundamentals refresh produced no usable market-cap evidence",
 		)
 	}
 
 	asOf := b.now()
-	filters, _ := json.Marshal(b.Config)
 	sourceEvidence, _ := json.Marshal(map[string]any{
 		"asset_provider": b.Config.Provider,
 		"started_at":     startedAt,
 		"snapshot_error": errorString(snapshotErr),
 		"bars_error":     errorString(barsErr),
 	})
-	versionID, err := b.Repository.Begin(ctx, store.SwingUniverseVersion{
+	if updateErr := b.Repository.UpdateMetadata(ctx, versionID, store.SwingUniverseVersion{
 		Provider:       b.Config.Provider,
 		AsOf:           asOf,
 		CapturedAt:     startedAt,
 		Filters:        filters,
 		SourceEvidence: sourceEvidence,
-	})
-	if err != nil {
-		return result, err
+	}); updateErr != nil {
+		return result, updateErr
 	}
-	result.VersionID = versionID
-	defer func() {
-		if err != nil {
-			_ = b.Repository.Fail(context.Background(), versionID, b.now(), err)
-		}
-	}()
 
 	members := make([]store.SwingUniverseMember, 0, len(assets))
 	for _, asset := range assets {
@@ -344,7 +371,7 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			continue
 		}
 		member := b.evaluate(
-			asset, snapshots, bars, taxonomy[symbol], taxonomyErrors[symbol], asOf,
+			asset, snapshots, bars, taxonomy[symbol], taxonomyErrors[symbol], asOf, true,
 		)
 		member.UniverseVersionID = versionID
 		members = append(members, member)
@@ -355,11 +382,15 @@ func (b *Builder) Refresh(ctx context.Context) (result RefreshResult, err error)
 			result.PartialFailureCount++
 		}
 	}
+	result.Quality.PartialFailureCount = result.PartialFailureCount
 	if err = b.Repository.ReplaceMembers(ctx, versionID, members); err != nil {
 		return result, err
 	}
+	if qualityErr != nil {
+		return result, qualityErr
+	}
 	completedAt := b.now()
-	if err = b.Repository.Complete(ctx, versionID, completedAt); err != nil {
+	if err = b.Repository.Complete(ctx, versionID, completedAt, result.Quality); err != nil {
 		return result, err
 	}
 	result.AsOf = asOf
@@ -396,7 +427,7 @@ func (b *Builder) passesNonFundamentalFilters(
 	snapshot, snapshotOK := snapshots.Snapshots[asset.Symbol]
 	price := stockSnapshotPrice(snapshot)
 	history, barsOK := bars.Bars[asset.Symbol]
-	_, volumeOK := medianDollarVolume(
+	_, volumeOK := usableDailyBarHistory(
 		history, b.Config.DollarVolumeLookbackDays, decisionAt,
 	)
 	available := snapshotOK && price > 0 && barsOK && volumeOK
@@ -441,6 +472,7 @@ func (b *Builder) evaluate(
 	taxonomy *store.CompanyTaxonomyObservation,
 	taxonomyErr error,
 	decisionAt time.Time,
+	fundamentalsEvaluated bool,
 ) store.SwingUniverseMember {
 	symbol := normalizeSymbol(asset.Symbol)
 	member := store.SwingUniverseMember{
@@ -487,7 +519,7 @@ func (b *Builder) evaluate(
 		}
 	}
 	if barsOK {
-		if median, ok := medianDollarVolume(
+		if median, ok := usableDailyBarHistory(
 			history, b.Config.DollarVolumeLookbackDays, decisionAt,
 		); ok {
 			member.DollarVolume = &median
@@ -497,14 +529,22 @@ func (b *Builder) evaluate(
 	member.DataAvailable = &available
 
 	var failures []string
+	requiresMarketEvidence := b.passesAssetMasterFilters(asset)
 	if failure := snapshots.Failures[symbol]; failure != nil {
 		failures = append(failures, "snapshot: "+failure.Error())
+	} else if requiresMarketEvidence && (!snapshotOK || member.Price == nil) {
+		failures = append(failures, "snapshot: usable price evidence unavailable")
 	}
 	if failure := bars.Failures[symbol]; failure != nil {
 		failures = append(failures, "daily_bars: "+failure.Error())
+	} else if requiresMarketEvidence && member.DollarVolume == nil {
+		failures = append(failures, "daily_bars: completed lookback is unavailable")
 	}
 	if taxonomyErr != nil {
 		failures = append(failures, "fundamentals: "+taxonomyErr.Error())
+	} else if fundamentalsEvaluated && requiresMarketEvidence && b.Config.MinMarketCapMM > 0 &&
+		member.MarketCapMM == nil {
+		failures = append(failures, "fundamentals: market-cap evidence unavailable")
 	}
 	if len(failures) > 0 {
 		member.FailureStage = "provider_evidence"
@@ -527,7 +567,7 @@ func (b *Builder) evaluate(
 		member.RemovalStage = "market_data"
 	case member.Price != nil && *member.Price < b.Config.MinPrice:
 		member.RemovalStage = "price"
-	case b.Config.MinMarketCapMM > 0 && member.MarketCapMM == nil &&
+	case fundamentalsEvaluated && b.Config.MinMarketCapMM > 0 && member.MarketCapMM == nil &&
 		b.Config.MissingFundamentalsPolicy != "include":
 		member.RemovalStage = "fundamentals"
 	case member.MarketCapMM != nil && *member.MarketCapMM < b.Config.MinMarketCapMM:
@@ -683,6 +723,9 @@ func completedDailyBars(bars []data.Candle, asOf time.Time) []data.Candle {
 		decision.Year(), decision.Month(), decision.Day(), 0, 0, 0, 0, location,
 	)
 	marketClosed := decision.Hour() >= 16
+	if session, ok := engine.MarketSessionForDate(decision); ok {
+		marketClosed = !decision.Before(session.Close)
+	}
 	completed := make([]data.Candle, 0, len(bars))
 	for _, bar := range bars {
 		session := bar.Timestamp.In(location)
@@ -697,25 +740,75 @@ func completedDailyBars(bars []data.Candle, asOf time.Time) []data.Candle {
 	return completed
 }
 
-func hasCoherentMarketData(
+func marketDataQuality(
 	symbols []string,
 	snapshots data.StockSnapshotBatchResult,
 	bars data.DailyBarsBatchResult,
 	lookback int,
 	asOf time.Time,
-) bool {
+	minimum float64,
+) store.SwingUniverseQuality {
+	quality := store.SwingUniverseQuality{
+		EvidenceRequiredCount: len(symbols), MinMarketDataCoverage: minimum,
+	}
+	failedSymbols := make(map[string]struct{})
 	for _, symbol := range symbols {
 		snapshot, snapshotOK := snapshots.Snapshots[symbol]
-		if !snapshotOK || stockSnapshotPrice(snapshot) <= 0 {
-			continue
+		snapshotUsable := snapshotOK && stockSnapshotPrice(snapshot) > 0
+		if snapshotUsable {
+			quality.UsableSnapshotCount++
+		} else {
+			quality.SnapshotFailureCount++
+			failedSymbols[symbol] = struct{}{}
 		}
+		barsUsable := false
 		if history, barsOK := bars.Bars[symbol]; barsOK {
-			if _, usable := medianDollarVolume(history, lookback, asOf); usable {
-				return true
+			if _, usable := usableDailyBarHistory(history, lookback, asOf); usable {
+				barsUsable = true
 			}
 		}
+		if barsUsable {
+			quality.UsableBarHistoryCount++
+		} else {
+			quality.BarFailureCount++
+			failedSymbols[symbol] = struct{}{}
+		}
+		if snapshotUsable && barsUsable {
+			quality.CoherentMarketDataCount++
+		}
 	}
-	return false
+	quality.ProviderFailureCount = len(failedSymbols)
+	if len(symbols) == 0 {
+		quality.MarketDataCoverage = 1
+	} else {
+		quality.MarketDataCoverage = float64(
+			quality.CoherentMarketDataCount,
+		) / float64(len(symbols))
+	}
+	return quality
+}
+
+func usableDailyBarHistory(
+	bars []data.Candle, lookback int, asOf time.Time,
+) (float64, bool) {
+	median, usable := medianDollarVolume(bars, lookback, asOf)
+	return median, usable && hasLatestCompletedSessionBar(bars, asOf)
+}
+
+func hasLatestCompletedSessionBar(bars []data.Candle, asOf time.Time) bool {
+	completed := completedDailyBars(bars, asOf)
+	if len(completed) == 0 {
+		return false
+	}
+	target := engine.MostRecentCompletedMarketSession(asOf, 0)
+	latest := completed[0].Timestamp
+	for _, bar := range completed[1:] {
+		if bar.Timestamp.After(latest) {
+			latest = bar.Timestamp
+		}
+	}
+	return latest.In(target.Date.Location()).Format("2006-01-02") ==
+		target.Date.Format("2006-01-02")
 }
 
 func stockSnapshotPrice(snapshot data.StockSnapshotEvidence) float64 {

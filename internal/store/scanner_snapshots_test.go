@@ -18,12 +18,10 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 	ctx := context.Background()
 	startedAt := time.Now().UTC().Truncate(time.Microsecond)
 	universeAsOf := startedAt.Add(-time.Minute)
-	universeID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider: "scanner-snapshot-test", AsOf: universeAsOf, CapturedAt: universeAsOf,
 	})
-	if err != nil {
-		t.Fatalf("BeginSwingUniverseVersion: %v", err)
-	}
+	universeID := claim.ActiveVersionID
 	if _, err := store.BeginScannerRun(ctx, store.ScannerRun{
 		StartedAt:         startedAt,
 		UniverseVersionID: universeID,
@@ -32,9 +30,7 @@ func TestScannerSnapshotLineageAndFunnel(t *testing.T) {
 		t.Fatal("BeginScannerRun accepted a building universe")
 	}
 	completedAt := universeAsOf.Add(30 * time.Second)
-	if err := store.CompleteSwingUniverseVersion(ctx, universeID, completedAt); err != nil {
-		t.Fatalf("CompleteSwingUniverseVersion: %v", err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, completedAt)
 	callerUniverseAsOf := startedAt.Add(time.Hour)
 	runID, err := store.BeginScannerRun(ctx, store.ScannerRun{
 		StartedAt:                    startedAt,

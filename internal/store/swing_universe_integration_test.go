@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -16,23 +17,21 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 	}
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-2 * time.Hour).Truncate(time.Microsecond)
-	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider:       "test-provider",
 		AsOf:           base,
 		CapturedAt:     base.Add(time.Minute),
 		Filters:        json.RawMessage(`{"min_price":0}`),
 		SourceEvidence: json.RawMessage(`{"page_count":1}`),
 	})
-	if err != nil {
-		t.Fatalf("BeginSwingUniverseVersion: %v", err)
-	}
+	versionID := claim.ActiveVersionID
 
 	zero := 0.0
 	available := true
 	active := true
 	tradable := true
 	taxonomyAsOf := base.Add(-24 * time.Hour)
-	err = store.ReplaceSwingUniverseMembers(ctx, versionID, []store.SwingUniverseMember{
+	err := store.ReplaceClaimedSwingUniverseMembers(ctx, claim, []store.SwingUniverseMember{
 		{
 			Ticker:           "ZERO",
 			AssetID:          "asset-zero",
@@ -65,9 +64,7 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 		t.Fatalf("ReplaceSwingUniverseMembers: %v", err)
 	}
 	completedAt := base.Add(2 * time.Minute)
-	if err := store.CompleteSwingUniverseVersion(ctx, versionID, completedAt); err != nil {
-		t.Fatalf("CompleteSwingUniverseVersion: %v", err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, completedAt)
 
 	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, nil); err == nil {
 		t.Fatal("completed universe accepted member replacement")
@@ -105,7 +102,7 @@ func TestSwingUniversePointInTimeEvidence(t *testing.T) {
 	}
 	if got, err := store.GetLatestCompletedSwingUniverseVersionAsOf(
 		ctx, completedAt.Add(-time.Nanosecond),
-	); err != nil || got != nil {
+	); err != nil || (got != nil && got.ID == versionID) {
 		t.Fatalf("future completed version leaked: got=%+v err=%v", got, err)
 	}
 	if got, err := store.GetCompletedSwingUniverseVersionByIDAsOf(
@@ -292,5 +289,159 @@ func TestFailSwingUniverseVersionIsTerminal(t *testing.T) {
 	}
 	if err := store.CompleteSwingUniverseVersion(ctx, id, now); err == nil {
 		t.Fatal("failed version was completed")
+	}
+}
+
+func TestSwingUniverseBuildClaimLifecycleAndQualityGate(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	started := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Microsecond)
+	identity := fmt.Sprintf("claim-lifecycle-%d", started.UnixNano())
+	request := store.SwingUniverseBuildRequest{
+		SessionDate: started, Provider: identity, ConfigHash: identity,
+		ConfigSnapshot: json.RawMessage(`{"fixture":"claim-lifecycle"}`),
+		StartedAt:      started,
+	}
+	first, owned, err := store.ClaimSwingUniverseBuild(ctx, request, time.Hour)
+	if err != nil || !owned || first.AttemptCount != 1 || first.ActiveVersionID == "" {
+		t.Fatalf("first claim = %+v owned=%v err=%v", first, owned, err)
+	}
+	duplicate, owned, err := store.ClaimSwingUniverseBuild(ctx, request, time.Hour)
+	if err != nil || owned || duplicate.ID != first.ID ||
+		duplicate.ActiveVersionID != first.ActiveVersionID {
+		t.Fatalf("duplicate claim = %+v owned=%v err=%v", duplicate, owned, err)
+	}
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, *first, []store.SwingUniverseMember{{
+		Ticker: "OLD", Eligible: true, TaxonomyStatus: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rejected := store.SwingUniverseQuality{
+		EvidenceRequiredCount: 10, UsableSnapshotCount: 10,
+		UsableBarHistoryCount: 8, CoherentMarketDataCount: 8,
+		MarketDataCoverage: 0.8, FundamentalsCoverage: 1,
+		MinMarketDataCoverage: 0.9,
+	}
+	if err := store.FailClaimedSwingUniverseVersion(
+		ctx, *first, started.Add(2*time.Minute), rejected, errors.New("coverage rejected"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	request.StartedAt = started.Add(3 * time.Minute)
+	second, owned, err := store.ClaimSwingUniverseBuild(ctx, request, time.Hour)
+	if err != nil || !owned || second.AttemptCount != 2 ||
+		second.ActiveVersionID == first.ActiveVersionID {
+		t.Fatalf("reclaim = %+v owned=%v err=%v", second, owned, err)
+	}
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, *first, nil); err == nil {
+		t.Fatal("stale owner replaced members after reclaim")
+	}
+	if err := store.CompleteClaimedSwingUniverseVersion(ctx, *second, request.StartedAt.Add(time.Minute), store.SwingUniverseQuality{
+		EvidenceRequiredCount: 10, UsableSnapshotCount: 10,
+		UsableBarHistoryCount: 8, CoherentMarketDataCount: 8,
+		MarketDataCoverage: 0.8, FundamentalsCoverage: 1,
+		MinMarketDataCoverage: 0.9,
+	}); err == nil {
+		t.Fatal("below-threshold universe was approved")
+	}
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, *second, []store.SwingUniverseMember{{
+		Ticker: "NEW", Eligible: true, TaxonomyStatus: "unknown",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	approved := store.SwingUniverseQuality{
+		EvidenceRequiredCount: 10, UsableSnapshotCount: 10,
+		UsableBarHistoryCount: 9, CoherentMarketDataCount: 9,
+		BarFailureCount: 1, ProviderFailureCount: 1,
+		MarketDataCoverage: 0.9, FundamentalsCoverage: 1,
+		MinMarketDataCoverage: 0.9,
+	}
+	completedAt := request.StartedAt.Add(2 * time.Minute)
+	if err := store.CompleteClaimedSwingUniverseVersion(ctx, *second, completedAt, approved); err != nil {
+		t.Fatal(err)
+	}
+	request.StartedAt = completedAt.Add(time.Minute)
+	reused, owned, err := store.ClaimSwingUniverseBuild(ctx, request, time.Hour)
+	if err != nil || owned || reused.Status != "completed" ||
+		reused.PublishedVersionID != second.ActiveVersionID || reused.AttemptCount != 2 {
+		t.Fatalf("restart reuse = %+v owned=%v err=%v", reused, owned, err)
+	}
+	version, err := store.GetApprovedSwingUniverseForSessionAsOf(
+		ctx, request.SessionDate, request.StartedAt, request.Provider, request.ConfigHash,
+	)
+	if err != nil || version == nil || version.ID != second.ActiveVersionID ||
+		version.Quality.MarketDataCoverage != 0.9 {
+		t.Fatalf("approved session version = %+v err=%v", version, err)
+	}
+	oldMembers, err := store.ListSwingUniverseMembersForAudit(ctx, first.ActiveVersionID)
+	if err != nil || len(oldMembers) != 1 || oldMembers[0].Ticker != "OLD" {
+		t.Fatalf("immutable rejected attempt members = %+v err=%v", oldMembers, err)
+	}
+}
+
+func TestSwingUniverseExpiredLeaseCannotBeResurrected(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	started := time.Now().UTC().Add(-10 * time.Minute).Truncate(time.Microsecond)
+	identity := fmt.Sprintf("expired-lease-%d", started.UnixNano())
+	claim, owned, err := store.ClaimSwingUniverseBuild(ctx, store.SwingUniverseBuildRequest{
+		SessionDate: started, Provider: identity, ConfigHash: identity,
+		ConfigSnapshot: json.RawMessage(`{"fixture":"expired-lease"}`), StartedAt: started,
+	}, time.Minute)
+	if err != nil || !owned {
+		t.Fatalf("claim = %+v owned=%v err=%v", claim, owned, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE swing_universe_build_claims SET lease_until=clock_timestamp()-interval '1 second'
+		WHERE id=$1`, claim.ID); err != nil {
+		t.Fatal(err)
+	}
+	afterExpiry := time.Now().UTC()
+	if err := store.RenewSwingUniverseBuildLease(ctx, claim.ID, claim.OwnerToken, claim.AttemptCount, afterExpiry, time.Hour); err == nil {
+		t.Fatal("expired lease renewed")
+	}
+	if err := store.UpdateClaimedSwingUniverseMetadata(ctx, *claim, store.SwingUniverseVersion{
+		AsOf: afterExpiry,
+	}); err == nil {
+		t.Fatal("expired lease updated metadata")
+	}
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, *claim, []store.SwingUniverseMember{{
+		Ticker: "LATE", TaxonomyStatus: "unknown",
+	}}); err == nil {
+		t.Fatal("expired lease replaced members")
+	}
+	if err := store.FailClaimedSwingUniverseVersion(ctx, *claim, afterExpiry, store.SwingUniverseQuality{}, errors.New("late")); err == nil {
+		t.Fatal("expired lease failed version")
+	}
+}
+
+func TestApprovedUniverseSessionLookupSurvivesWeekendWithoutFallingBack(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	friday := time.Date(2026, time.August, 7, 16, 30, 0, 0, location)
+	monday := time.Date(2026, time.August, 10, 8, 0, 0, 0, location)
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "weekend-session-fixture", AsOf: friday,
+		CapturedAt: friday, Filters: json.RawMessage(`{"fixture":"weekend"}`),
+	})
+	completeClaimedSwingUniverseFixture(t, ctx, claim, friday.Add(time.Minute))
+	version, err := store.GetLatestApprovedSwingUniverseForSessionAsOf(ctx, friday, monday)
+	if err != nil || version == nil || version.ID != claim.ActiveVersionID {
+		t.Fatalf("Friday universe at Monday checkpoint = %+v err=%v", version, err)
+	}
+	thursday := friday.AddDate(0, 0, -1)
+	version, err = store.GetLatestApprovedSwingUniverseForSessionAsOf(ctx, thursday, monday)
+	if err != nil || version != nil {
+		t.Fatalf("missing Thursday session fell back = %+v err=%v", version, err)
 	}
 }

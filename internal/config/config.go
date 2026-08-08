@@ -1304,28 +1304,30 @@ type PotentIndustryConfig struct {
 // Times are interpreted in America/New_York. Every checkpoint must precede the
 // hard cutoff so a slow scan can never overlap opening-range construction.
 type PremarketEpisodicConfig struct {
-	Enabled             bool     `yaml:"enabled"`
-	PromoteCandidates   bool     `yaml:"promote_candidates"`
-	Checkpoints         []string `yaml:"checkpoints"`
-	HardCutoff          string   `yaml:"hard_cutoff"`
-	Feed                string   `yaml:"feed"`
-	UniverseMaxAgeHours int      `yaml:"universe_max_age_hours"`
-	HistorySessions     int      `yaml:"history_sessions"`
-	NewsLookbackHours   int      `yaml:"news_lookback_hours"`
-	MaxCandidatesPerRun int      `yaml:"max_candidates_per_run"`
-	MaxPromotionsPerRun int      `yaml:"max_promotions_per_run"`
-	MinGapPct           float64  `yaml:"min_gap_pct"`
-	MinPremarketVolume  int64    `yaml:"min_premarket_volume"`
-	MinTimeAdjustedRVOL float64  `yaml:"min_time_adjusted_rvol"`
-	MinDollarVolume     float64  `yaml:"min_dollar_volume"`
-	MinTradeCount       int64    `yaml:"min_trade_count"`
-	MaxSpreadBPS        float64  `yaml:"max_spread_bps"`
-	MaxQuoteAgeSeconds  int      `yaml:"max_quote_age_seconds"`
-	MinBarCoverage      float64  `yaml:"min_bar_coverage"`
-	MinPrice            float64  `yaml:"min_price"`
-	MinMarketCapMM      float64  `yaml:"min_market_cap_mm"`
-	BatchSize           int      `yaml:"batch_size"`
-	RunLeaseMinutes     int      `yaml:"run_lease_minutes"`
+	Enabled           bool     `yaml:"enabled"`
+	PromoteCandidates bool     `yaml:"promote_candidates"`
+	Checkpoints       []string `yaml:"checkpoints"`
+	HardCutoff        string   `yaml:"hard_cutoff"`
+	Feed              string   `yaml:"feed"`
+	// UniverseMaxAgeHours is retained for configuration compatibility. Freshness
+	// is now exact-session based so weekends and exchange holidays are safe.
+	UniverseMaxAgeHours int     `yaml:"universe_max_age_hours"`
+	HistorySessions     int     `yaml:"history_sessions"`
+	NewsLookbackHours   int     `yaml:"news_lookback_hours"`
+	MaxCandidatesPerRun int     `yaml:"max_candidates_per_run"`
+	MaxPromotionsPerRun int     `yaml:"max_promotions_per_run"`
+	MinGapPct           float64 `yaml:"min_gap_pct"`
+	MinPremarketVolume  int64   `yaml:"min_premarket_volume"`
+	MinTimeAdjustedRVOL float64 `yaml:"min_time_adjusted_rvol"`
+	MinDollarVolume     float64 `yaml:"min_dollar_volume"`
+	MinTradeCount       int64   `yaml:"min_trade_count"`
+	MaxSpreadBPS        float64 `yaml:"max_spread_bps"`
+	MaxQuoteAgeSeconds  int     `yaml:"max_quote_age_seconds"`
+	MinBarCoverage      float64 `yaml:"min_bar_coverage"`
+	MinPrice            float64 `yaml:"min_price"`
+	MinMarketCapMM      float64 `yaml:"min_market_cap_mm"`
+	BatchSize           int     `yaml:"batch_size"`
+	RunLeaseMinutes     int     `yaml:"run_lease_minutes"`
 }
 
 // UniverseConfig controls construction and caching of the point-in-time stock
@@ -1336,6 +1338,15 @@ type PremarketEpisodicConfig struct {
 type UniverseConfig struct {
 	// Enabled opts into full-universe discovery. Default: false.
 	Enabled bool `yaml:"enabled"`
+
+	// AfterCloseDelayMinutes schedules the durable universe build after an
+	// official session close. RunLeaseMinutes bounds one build claim.
+	AfterCloseDelayMinutes int `yaml:"after_close_delay_minutes"`
+	RunLeaseMinutes        int `yaml:"run_lease_minutes"`
+
+	// MinMarketDataCoverage is the minimum share of asset-master-eligible
+	// symbols with both a usable snapshot and completed daily-bar history.
+	MinMarketDataCoverage float64 `yaml:"min_market_data_coverage"`
 
 	// Provider selects the provider-neutral universe adapter. Default: "alpaca".
 	Provider string `yaml:"provider"`
@@ -2156,6 +2167,24 @@ func Validate(cfg *Config) []string {
 	}
 
 	if universe := cfg.Scanner.Universe; universe.Enabled {
+		if !cfg.Scanner.Enabled {
+			errs = append(errs, "scanner.universe requires scanner.enabled=true")
+		}
+		if universe.AfterCloseDelayMinutes < 0 {
+			errs = append(errs, "scanner.universe.after_close_delay_minutes must be >= 0")
+		} else if !durationConfigFits(universe.AfterCloseDelayMinutes, time.Minute) {
+			errs = append(errs, "scanner.universe.after_close_delay_minutes overflows time.Duration")
+		}
+		if universe.RunLeaseMinutes <= 0 {
+			errs = append(errs, "scanner.universe.run_lease_minutes must be > 0")
+		} else if !durationConfigFits(universe.RunLeaseMinutes, time.Minute) {
+			errs = append(errs, "scanner.universe.run_lease_minutes overflows time.Duration")
+		}
+		if math.IsNaN(universe.MinMarketDataCoverage) ||
+			math.IsInf(universe.MinMarketDataCoverage, 0) ||
+			universe.MinMarketDataCoverage <= 0 || universe.MinMarketDataCoverage > 1 {
+			errs = append(errs, "scanner.universe.min_market_data_coverage must be > 0 and <= 1")
+		}
 		validUniverseProviders := map[string]bool{"alpaca": true}
 		if !validUniverseProviders[universe.Provider] {
 			errs = append(errs, fmt.Sprintf(
@@ -2241,6 +2270,8 @@ func Validate(cfg *Config) []string {
 		}
 		if !cfg.Scanner.Universe.Enabled {
 			errs = append(errs, "scanner.weekly_leader requires scanner.universe.enabled=true")
+		} else if cfg.Scanner.Universe.AfterCloseDelayMinutes < leader.AfterCloseDelayMinutes {
+			errs = append(errs, "scanner.universe.after_close_delay_minutes must be >= scanner.weekly_leader.after_close_delay_minutes")
 		}
 		if leader.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, "scanner.weekly_leader.after_close_delay_minutes must be >= 0")
@@ -2319,6 +2350,8 @@ func Validate(cfg *Config) []string {
 		}
 		if !cfg.Scanner.Universe.Enabled {
 			errs = append(errs, prefix+" requires scanner.universe.enabled=true")
+		} else if cfg.Scanner.Universe.AfterCloseDelayMinutes < industry.AfterCloseDelayMinutes {
+			errs = append(errs, "scanner.universe.after_close_delay_minutes must be >= "+prefix+".after_close_delay_minutes")
 		}
 		if industry.AfterCloseDelayMinutes < 0 {
 			errs = append(errs, prefix+".after_close_delay_minutes must be >= 0")

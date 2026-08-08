@@ -193,6 +193,11 @@ func ClaimIndustryRotationRun(
 	if lease <= 0 {
 		lease = time.Hour
 	}
+	if err := validateApprovedUniverseForDependentRun(
+		ctx, run.UniverseVersionID, run.DecisionAt, &run.SessionDate,
+	); err != nil {
+		return nil, false, err
+	}
 	row := GetDB().QueryRow(ctx, `
 		INSERT INTO industry_rotation_runs (
 			session_date, as_of, decision_at, universe_version_id, started_at,

@@ -55,6 +55,7 @@ func TestPremarketConfigCompatibilitySeparatesOperationalAndOutputChanges(t *tes
 	operational.Checkpoints = []string{"08:30"}
 	operational.BatchSize = 50
 	operational.RunLeaseMinutes = 30
+	operational.UniverseMaxAgeHours = 999
 	_, gotHash, err := premarketConfigEvidence(operational)
 	if err != nil {
 		t.Fatal(err)

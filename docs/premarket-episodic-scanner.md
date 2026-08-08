@@ -29,7 +29,10 @@ published or promoted.
 ## Evidence and gates
 
 The scanner first applies the gap, price, and market-cap floors to consolidated
-snapshots from the immutable point-in-time stock universe. It then obtains
+snapshots from the quality-approved immutable universe for the immediately
+preceding exchange session that existed by the checkpoint. Friday therefore
+remains valid on Monday, but an older session cannot hide a missing expected
+build. Rejected and legacy-unassessed versions are never used. It then obtains
 detailed evidence only for the bounded shortlist:
 
 - gap from the completed prior-session close;

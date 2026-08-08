@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -21,27 +22,21 @@ func TestPremarketEpisodicLifecycleCutoffAndPromotion(t *testing.T) {
 	cutoff := time.Date(2099, time.January, 6, 9, 25, 0, 0, loc)
 	const ticker = "TEST_PREMARKET_EPISODIC"
 
-	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider: "fixture", AsOf: sessionDate.Add(-time.Hour),
 		CapturedAt: sessionDate.Add(-50 * time.Minute),
 		Filters:    json.RawMessage(`{"test":"premarket-episodic"}`),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	versionID := claim.ActiveVersionID
 	price, marketCap, dollarVolume := 10.5, 500.0, 20_000_000.0
-	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, []store.SwingUniverseMember{{
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, claim, []store.SwingUniverseMember{{
 		Ticker: ticker, Eligible: true, Price: &price, MarketCapMM: &marketCap,
 		DollarVolume: &dollarVolume, Sector: "Technology", Industry: "Software",
 		TaxonomyStatus: "known", TaxonomyProvider: "fixture",
 	}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CompleteSwingUniverseVersion(
-		ctx, versionID, sessionDate.Add(-40*time.Minute),
-	); err != nil {
-		t.Fatal(err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, sessionDate.Add(-40*time.Minute))
 	t.Cleanup(func() {
 		_, _ = store.GetDB().Exec(context.Background(),
 			"DELETE FROM watchlist WHERE ticker=$1", ticker)
@@ -135,6 +130,49 @@ func TestPremarketEpisodicLifecycleCutoffAndPromotion(t *testing.T) {
 	}
 	if promotionStatus != "promoted" {
 		t.Fatalf("promotion status = %q", promotionStatus)
+	}
+}
+
+func TestScannerDependencyBlockIsDurableAndResolvable(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	decisionAt := time.Now().UTC().Truncate(time.Microsecond)
+	sessionDate := decisionAt
+	for i := 0; i < 2; i++ {
+		if err := store.RecordScannerDependencyBlock(
+			ctx, "premarket_episodic", sessionDate, decisionAt,
+			"swing_universe", errors.New("expected session universe missing"),
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var status string
+	var attempts int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT status, attempt_count FROM scanner_dependency_blocks
+		WHERE scanner='premarket_episodic' AND session_date=$1::date
+		  AND decision_at=$2 AND dependency='swing_universe'`,
+		sessionDate, decisionAt,
+	).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "blocked" || attempts != 2 {
+		t.Fatalf("dependency block = status %q attempts %d", status, attempts)
+	}
+	if err := store.ResolveScannerDependencyBlock(
+		ctx, "premarket_episodic", sessionDate, decisionAt, "swing_universe",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT status FROM scanner_dependency_blocks
+		WHERE scanner='premarket_episodic' AND session_date=$1::date
+		  AND decision_at=$2 AND dependency='swing_universe'`,
+		sessionDate, decisionAt,
+	).Scan(&status); err != nil || status != "resolved" {
+		t.Fatalf("resolved dependency block = %q err=%v", status, err)
 	}
 }
 

@@ -175,6 +175,7 @@ func BeginScannerRun(ctx context.Context, run ScannerRun) (string, error) {
 			FROM swing_universe_versions
 			WHERE id=$1
 			  AND status='completed'
+			  AND quality_status='approved'
 			  AND completed_at IS NOT NULL
 			  AND as_of <= $2
 			  AND captured_at <= $2

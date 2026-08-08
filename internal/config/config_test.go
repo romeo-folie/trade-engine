@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,6 +56,9 @@ func TestDefaultsScannerUniverseDisabled(t *testing.T) {
 		t.Fatal("full-market scanner universe must default off")
 	}
 	if universe.Provider != "alpaca" ||
+		universe.AfterCloseDelayMinutes != 30 ||
+		universe.RunLeaseMinutes != 120 ||
+		universe.MinMarketDataCoverage != 0.90 ||
 		universe.MinPrice != 5 ||
 		universe.MinMarketCapMM != 100 ||
 		universe.MinMedianDollarVolume != 1_000_000 ||
@@ -247,6 +251,7 @@ func TestValidateWeeklyLeaderConfig(t *testing.T) {
 
 func TestValidateScannerUniverseConfig(t *testing.T) {
 	cfg := Defaults()
+	cfg.Scanner.Enabled = true
 	cfg.Scanner.Universe.Enabled = true
 	if errs := Validate(cfg); containsStr(errs, "scanner.universe") {
 		t.Fatalf("valid scanner universe config rejected: %v", errs)
@@ -264,6 +269,13 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 		field  string
 	}{
 		{"provider missing", func(c *UniverseConfig) { c.Provider = "" }, "provider"},
+		{"after-close delay", func(c *UniverseConfig) { c.AfterCloseDelayMinutes = -1 }, "after_close_delay_minutes"},
+		{"run lease", func(c *UniverseConfig) { c.RunLeaseMinutes = 0 }, "run_lease_minutes"},
+		{"market-data coverage zero", func(c *UniverseConfig) { c.MinMarketDataCoverage = 0 }, "min_market_data_coverage"},
+		{"market-data coverage high", func(c *UniverseConfig) { c.MinMarketDataCoverage = 1.01 }, "min_market_data_coverage"},
+		{"market-data coverage NaN", func(c *UniverseConfig) { c.MinMarketDataCoverage = math.NaN() }, "min_market_data_coverage"},
+		{"market-data coverage +Inf", func(c *UniverseConfig) { c.MinMarketDataCoverage = math.Inf(1) }, "min_market_data_coverage"},
+		{"market-data coverage -Inf", func(c *UniverseConfig) { c.MinMarketDataCoverage = math.Inf(-1) }, "min_market_data_coverage"},
 		{"provider unknown", func(c *UniverseConfig) { c.Provider = "unknown" }, "provider"},
 		{"min price", func(c *UniverseConfig) { c.MinPrice = -1 }, "min_price"},
 		{"market cap", func(c *UniverseConfig) { c.MinMarketCapMM = -1 }, "min_market_cap_mm"},
@@ -285,6 +297,7 @@ func TestValidateScannerUniverseConfig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := Defaults()
+			cfg.Scanner.Enabled = true
 			cfg.Scanner.Universe.Enabled = true
 			tt.mutate(&cfg.Scanner.Universe)
 			if !containsStr(Validate(cfg), "scanner.universe."+tt.field) {

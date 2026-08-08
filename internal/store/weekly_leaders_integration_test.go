@@ -13,15 +13,13 @@ import (
 func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, time.July, 20, 20, 0, 0, 0, time.UTC)
-	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider: "test-weekly-leader", AsOf: base.Add(-time.Hour),
 		CapturedAt:     base.Add(-50 * time.Minute),
 		Filters:        json.RawMessage(`{"test":true}`),
 		SourceEvidence: json.RawMessage(`{"fixture":"weekly-leader"}`),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	versionID := claim.ActiveVersionID
 	capMM := 5_000.0
 	universePrice := 91.0
 	dollarVolume := 50_000_000.0
@@ -38,12 +36,10 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 			DollarVolume: &dollarVolume, Sector: "Technology",
 			Industry: "Software", TaxonomyStatus: "known"},
 	}
-	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, members); err != nil {
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, claim, members); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CompleteSwingUniverseVersion(ctx, versionID, base.Add(-40*time.Minute)); err != nil {
-		t.Fatal(err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, base.Add(-40*time.Minute))
 
 	runInput := store.WeeklyLeaderRun{
 		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
@@ -371,15 +367,28 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	secondInput.AsOf = base.AddDate(0, 0, 1)
 	secondInput.DecisionAt = secondInput.AsOf.Add(15 * time.Minute)
 	secondInput.StartedAt = secondInput.AsOf.Add(16 * time.Minute)
+	secondUniverse := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "test-weekly-leader", AsOf: secondInput.AsOf.Add(-time.Hour),
+		CapturedAt: secondInput.AsOf.Add(-50 * time.Minute),
+		Filters:    json.RawMessage(`{"test":true}`),
+	})
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, secondUniverse, members); err != nil {
+		t.Fatal(err)
+	}
+	completeClaimedSwingUniverseFixture(
+		t, ctx, secondUniverse, secondInput.AsOf.Add(-40*time.Minute),
+	)
+	secondInput.UniverseVersionID = secondUniverse.ActiveVersionID
 	second, claimed, err := store.ClaimWeeklyLeaderRun(ctx, secondInput, time.Hour)
 	if err != nil || !claimed {
 		t.Fatalf("second session claim = %+v/%v/%v", second, claimed, err)
 	}
 	qualifications[0].RunID = second.ID
+	qualifications[0].UniverseVersionID = secondUniverse.ActiveVersionID
 	qualifications[0].CompositeScore = &scoreA
 	qualifications[0].PromotionStatus = "not_requested"
 	qualifications[1] = store.WeeklyLeaderQualification{
-		RunID: second.ID, UniverseVersionID: versionID, Ticker: "TEST_WL_BBB",
+		RunID: second.ID, UniverseVersionID: secondUniverse.ActiveVersionID, Ticker: "TEST_WL_BBB",
 		Outcome: "qualified", Sector: "Technology", Industry: "Software",
 		MarketCapBand: "mid", VolatilityBand: "medium", Return20: &return20,
 		ClosePrice: &closePrice,
@@ -424,6 +433,18 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	thirdInput.AsOf = thirdInput.SessionDate
 	thirdInput.DecisionAt = thirdInput.AsOf.Add(15 * time.Minute)
 	thirdInput.StartedAt = thirdInput.AsOf.Add(16 * time.Minute)
+	thirdUniverse := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "test-weekly-leader", AsOf: thirdInput.AsOf.Add(-time.Hour),
+		CapturedAt: thirdInput.AsOf.Add(-50 * time.Minute),
+		Filters:    json.RawMessage(`{"test":true}`),
+	})
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, thirdUniverse, members); err != nil {
+		t.Fatal(err)
+	}
+	completeClaimedSwingUniverseFixture(
+		t, ctx, thirdUniverse, thirdInput.AsOf.Add(-40*time.Minute),
+	)
+	thirdInput.UniverseVersionID = thirdUniverse.ActiveVersionID
 	third, claimed, err := store.ClaimWeeklyLeaderRun(ctx, thirdInput, 7*24*time.Hour)
 	if err != nil || !claimed {
 		t.Fatalf("third session claim = %+v/%v/%v", third, claimed, err)
@@ -434,6 +455,18 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	fourthInput.AsOf = fourthInput.SessionDate
 	fourthInput.DecisionAt = fourthInput.AsOf.Add(15 * time.Minute)
 	fourthInput.StartedAt = fourthInput.AsOf.Add(16 * time.Minute)
+	fourthUniverse := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "test-weekly-leader", AsOf: fourthInput.AsOf.Add(-time.Hour),
+		CapturedAt: fourthInput.AsOf.Add(-50 * time.Minute),
+		Filters:    json.RawMessage(`{"test":true}`),
+	})
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, fourthUniverse, members); err != nil {
+		t.Fatal(err)
+	}
+	completeClaimedSwingUniverseFixture(
+		t, ctx, fourthUniverse, fourthInput.AsOf.Add(-40*time.Minute),
+	)
+	fourthInput.UniverseVersionID = fourthUniverse.ActiveVersionID
 	fourth, claimed, err := store.ClaimWeeklyLeaderRun(ctx, fourthInput, time.Hour)
 	if err != nil || !claimed {
 		t.Fatalf("fourth session claim = %+v/%v/%v", fourth, claimed, err)
@@ -446,6 +479,7 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	lineageQualifications[1].PromotionStatus = "pending"
 	for i := range lineageQualifications {
 		lineageQualifications[i].RunID = fourth.ID
+		lineageQualifications[i].UniverseVersionID = fourthUniverse.ActiveVersionID
 	}
 	fourthCompletedAt := fourthInput.StartedAt.Add(time.Minute)
 	if err := store.CompleteWeeklyLeaderRun(
@@ -460,6 +494,7 @@ func TestWeeklyLeaderRunLifecycleAndHistory(t *testing.T) {
 	)
 	for i := range lateThirdQualifications {
 		lateThirdQualifications[i].RunID = third.ID
+		lateThirdQualifications[i].UniverseVersionID = thirdUniverse.ActiveVersionID
 		lateThirdQualifications[i].PromotionStatus = "not_requested"
 	}
 	if err := store.CompleteWeeklyLeaderRun(
@@ -594,17 +629,15 @@ func TestWeeklyLeaderReportSelectsCanonicalRunPerSession(t *testing.T) {
 
 func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 	ctx := context.Background()
-	var versionID string
-	if err := store.GetDB().QueryRow(ctx, `
-		SELECT id FROM swing_universe_versions
-		WHERE provider='test-weekly-leader' AND status='completed'
-		ORDER BY as_of DESC LIMIT 1`).Scan(&versionID); err != nil {
-		t.Skip("weekly leader lifecycle fixture unavailable")
-	}
 	base := time.Date(2026, time.July, 22, 20, 0, 0, 0, time.UTC)
+	universe := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "test-weekly-reclaim", AsOf: base.Add(-time.Hour),
+		CapturedAt: base.Add(-50 * time.Minute),
+	})
+	completeClaimedSwingUniverseFixture(t, ctx, universe, base.Add(-40*time.Minute))
 	input := store.WeeklyLeaderRun{
 		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
-		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
+		UniverseVersionID: universe.ActiveVersionID, StartedAt: base.Add(16 * time.Minute),
 		ConfigHash:     "weekly-leader-integration-reclaim",
 		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v2",
 		Benchmark: "SPY", HistoryProvider: "test",
@@ -655,17 +688,15 @@ func TestWeeklyLeaderFailedRunCanBeReclaimed(t *testing.T) {
 
 func TestWeeklyLeaderRunLeaseBoundaryCanBeReclaimed(t *testing.T) {
 	ctx := context.Background()
-	var versionID string
-	if err := store.GetDB().QueryRow(ctx, `
-		SELECT id FROM swing_universe_versions
-		WHERE provider='test-weekly-leader' AND status='completed'
-		ORDER BY as_of DESC LIMIT 1`).Scan(&versionID); err != nil {
-		t.Skip("weekly leader lifecycle fixture unavailable")
-	}
 	base := time.Date(2026, time.July, 24, 20, 0, 0, 0, time.UTC)
+	universe := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
+		Provider: "test-weekly-lease", AsOf: base.Add(-time.Hour),
+		CapturedAt: base.Add(-50 * time.Minute),
+	})
+	completeClaimedSwingUniverseFixture(t, ctx, universe, base.Add(-40*time.Minute))
 	input := store.WeeklyLeaderRun{
 		SessionDate: base, AsOf: base, DecisionAt: base.Add(15 * time.Minute),
-		UniverseVersionID: versionID, StartedAt: base.Add(16 * time.Minute),
+		UniverseVersionID: universe.ActiveVersionID, StartedAt: base.Add(16 * time.Minute),
 		ConfigHash:     "weekly-leader-integration-lease-boundary",
 		ConfigSnapshot: json.RawMessage(`{}`), FeatureVersion: "weekly-leader-v2",
 		Benchmark: "SPY", HistoryProvider: "test",

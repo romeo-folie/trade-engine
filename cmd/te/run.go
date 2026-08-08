@@ -30,6 +30,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/scanner"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	swinguniverse "github.com/romeo-folie/trade-engine/internal/universe"
 	"github.com/romeo-folie/trade-engine/internal/web"
 	"github.com/spf13/cobra"
 )
@@ -888,29 +889,17 @@ Modes:
 				if tgBot != nil {
 					mscanner.Notifier = tgBot
 				}
-				if shouldStartWeeklyLeaderScheduler(
-					cfg.Scanner.WeeklyLeader.Enabled, store.IsConnected(),
-				) {
+				universeProvider := data.NewAlpacaUniverseClient(
+					alpacaClient, cfg.Markets.Stocks.BaseURL,
+				)
+				var afterCloseJobs []swinguniverse.ApprovedUniverseJob
+				if cfg.Scanner.WeeklyLeader.Enabled && store.IsConnected() {
 					leaderRunner := &scanner.WeeklyLeaderRunner{
-						Provider: data.NewAlpacaUniverseClient(
-							alpacaClient, cfg.Markets.Stocks.BaseURL,
-						),
-						Cfg: cfg.Scanner.WeeklyLeader,
+						Provider: universeProvider,
+						Cfg:      cfg.Scanner.WeeklyLeader,
 					}
-					leaderScheduler := &scanner.WeeklyLeaderScheduler{
-						Cfg: cfg.Scanner.WeeklyLeader,
-						Job: leaderRunner,
-					}
-					go func() {
-						if err := leaderScheduler.Run(ctx); err != nil &&
-							err != context.Canceled {
-							logger.Warn("weekly leader scheduler stopped with error",
-								"err", err.Error())
-						}
-					}()
-					logger.Info("weekly leader scanner started",
-						"after_close_delay_minutes",
-						cfg.Scanner.WeeklyLeader.AfterCloseDelayMinutes,
+					afterCloseJobs = append(afterCloseJobs, leaderRunner)
+					logger.Info("weekly leader scanner registered with universe pipeline",
 						"promote_candidates",
 						cfg.Scanner.WeeklyLeader.PromoteCandidates,
 					)
@@ -919,30 +908,47 @@ Modes:
 				}
 				if cfg.Scanner.PotentIndustry.Enabled && store.IsConnected() {
 					industryRunner := &scanner.PotentIndustryRunner{
-						Provider: data.NewAlpacaUniverseClient(
-							alpacaClient, cfg.Markets.Stocks.BaseURL,
-						),
-						Cfg: cfg.Scanner.PotentIndustry,
+						Provider: universeProvider,
+						Cfg:      cfg.Scanner.PotentIndustry,
 					}
-					industryScheduler := &scanner.PotentIndustryScheduler{
-						Cfg: cfg.Scanner.PotentIndustry,
-						Job: industryRunner,
-					}
-					go func() {
-						if err := industryScheduler.Run(ctx); err != nil &&
-							err != context.Canceled {
-							logger.Warn("potent industry scheduler stopped with error",
-								"err", err.Error())
-						}
-					}()
-					logger.Info("potent industry scanner started",
-						"after_close_delay_minutes",
-						cfg.Scanner.PotentIndustry.AfterCloseDelayMinutes,
+					afterCloseJobs = append(afterCloseJobs, industryRunner)
+					logger.Info("potent industry scanner registered with universe pipeline",
 						"promote_candidates",
 						cfg.Scanner.PotentIndustry.PromoteCandidates,
 					)
 				} else if cfg.Scanner.PotentIndustry.Enabled {
 					logger.Warn("potent industry scanner requested but DB not connected; skipping startup")
+				}
+				if cfg.Scanner.Universe.Enabled && store.IsConnected() {
+					fundamentals, err := universeFundamentalsProvider(cfg.Markets.News)
+					if err != nil {
+						return fmt.Errorf("configure swing universe pipeline: %w", err)
+					}
+					sessionRunner := &swinguniverse.SessionRunner{
+						Config: cfg.Scanner.Universe,
+						Builder: swinguniverse.Builder{
+							Config: cfg.Scanner.Universe, Assets: universeProvider,
+							Snapshots: universeProvider, Bars: universeProvider,
+							Fundamentals: fundamentals,
+						},
+					}
+					universeScheduler := &swinguniverse.SessionScheduler{
+						Cfg: cfg.Scanner.Universe, Builder: sessionRunner,
+						Jobs: afterCloseJobs,
+					}
+					go func() {
+						if err := universeScheduler.Run(ctx); err != nil &&
+							err != context.Canceled {
+							logger.Warn("swing universe pipeline stopped with error",
+								"err", err.Error())
+						}
+					}()
+					logger.Info("swing universe pipeline started",
+						"after_close_delay_minutes", cfg.Scanner.Universe.AfterCloseDelayMinutes,
+						"min_market_data_coverage", cfg.Scanner.Universe.MinMarketDataCoverage,
+						"dependent_scanners", len(afterCloseJobs))
+				} else if cfg.Scanner.Universe.Enabled {
+					logger.Warn("swing universe pipeline requested but DB not connected; skipping startup")
 				}
 				if cfg.Scanner.PremarketEpisodic.Enabled && store.IsConnected() {
 					premarketRunner := &scanner.PremarketEpisodicRunner{
@@ -1062,10 +1068,6 @@ Modes:
 		fmt.Println("TradeEngine stopped.")
 		return nil
 	},
-}
-
-func shouldStartWeeklyLeaderScheduler(enabled, dbConnected bool) bool {
-	return enabled && dbConnected
 }
 
 func startDetachedRun() error {

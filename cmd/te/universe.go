@@ -9,6 +9,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	swinguniverse "github.com/romeo-folie/trade-engine/internal/universe"
 	"github.com/spf13/cobra"
@@ -21,10 +22,11 @@ var universeCmd = &cobra.Command{
 
 var universeRefreshCmd = &cobra.Command{
 	Use:   "refresh",
-	Short: "Build a current point-in-time universe snapshot",
+	Short: "Ensure the current completed session has an approved universe",
 	Long: `Fetches the current Alpaca asset master and market evidence, applies the
-configured objective eligibility filters, and stores one immutable snapshot.
-This command intentionally cannot backfill a historical date from current APIs.`,
+configured objective eligibility filters, and stores one immutable session snapshot.
+It reuses an existing approved attempt and intentionally refuses pre-close,
+weekend, holiday, or historical backfills from current live APIs.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := config.Load()
 		if err != nil {
@@ -52,19 +54,28 @@ This command intentionally cannot backfill a historical date from current APIs.`
 			cfg.Markets.Stocks.APIKey, cfg.Markets.Stocks.Secret, cfg.Markets.Stocks.DataURL,
 		)
 		provider := data.NewAlpacaUniverseClient(alpaca, cfg.Markets.Stocks.BaseURL)
-		builder := swinguniverse.Builder{
-			Config: cfg.Scanner.Universe, Assets: provider, Snapshots: provider,
-			Bars: provider, Fundamentals: fundamentals,
-			Repository: swinguniverse.StoreRepository{},
+		universeCfg := cfg.Scanner.Universe
+		// A manual refresh is an explicit one-shot opt-in even when the durable
+		// scheduler remains disabled in configuration.
+		universeCfg.Enabled = true
+		runner := swinguniverse.SessionRunner{
+			Config: universeCfg,
+			Builder: swinguniverse.Builder{
+				Config: universeCfg, Assets: provider, Snapshots: provider,
+				Bars: provider, Fundamentals: fundamentals,
+			},
 		}
-		result, err := builder.Refresh(cmd.Context())
+		now := time.Now()
+		session := engine.MostRecentCompletedMarketSession(now, 0)
+		version, err := runner.RunSession(cmd.Context(), session)
 		if err != nil {
 			return err
 		}
 		fmt.Printf(
-			"Universe %s completed as of %s: %d/%d eligible, %d partial failures, %d taxonomy refreshes.\n",
-			result.VersionID, result.AsOf.Format(time.RFC3339), result.EligibleCount,
-			result.MemberCount, result.PartialFailureCount, result.TaxonomyRefreshes,
+			"Universe %s approved as of %s: %d/%d eligible, %.1f%% market-data coverage, %d partial failures.\n",
+			version.ID, version.AsOf.Format(time.RFC3339), version.EligibleCount,
+			version.MemberCount, version.Quality.MarketDataCoverage*100,
+			version.Quality.PartialFailureCount,
 		)
 		return nil
 	},
