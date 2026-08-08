@@ -19,7 +19,7 @@ type fakeSessionBuilder struct {
 	run func(context.Context, engine.USMarketSession) (*store.SwingUniverseVersion, error)
 }
 
-func (f fakeSessionBuilder) RunSession(
+func (f fakeSessionBuilder) RunScheduledSession(
 	ctx context.Context, session engine.USMarketSession,
 ) (*store.SwingUniverseVersion, error) {
 	return f.run(ctx, session)

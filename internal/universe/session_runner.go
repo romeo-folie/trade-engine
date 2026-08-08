@@ -43,6 +43,21 @@ type SessionRunner struct {
 func (r *SessionRunner) RunSession(
 	ctx context.Context, session engine.USMarketSession,
 ) (*store.SwingUniverseVersion, error) {
+	return r.runSession(ctx, session, false)
+}
+
+// RunScheduledSession authorizes the configured delayed session even when its
+// due time crosses midnight. It still requires that session to be the latest
+// actually completed one, preventing current data from becoming a backfill.
+func (r *SessionRunner) RunScheduledSession(
+	ctx context.Context, session engine.USMarketSession,
+) (*store.SwingUniverseVersion, error) {
+	return r.runSession(ctx, session, true)
+}
+
+func (r *SessionRunner) runSession(
+	ctx context.Context, session engine.USMarketSession, scheduled bool,
+) (*store.SwingUniverseVersion, error) {
 	if !r.Config.Enabled {
 		return nil, nil
 	}
@@ -54,9 +69,7 @@ func (r *SessionRunner) RunSession(
 	if err != nil {
 		return nil, err
 	}
-	nowAtExchange := now.In(session.Date.Location())
-	if nowAtExchange.Year() != session.Date.Year() ||
-		nowAtExchange.YearDay() != session.Date.YearDay() {
+	if !r.sessionAuthorized(now, session, scheduled) {
 		existing, lookupErr := store.GetApprovedSwingUniverseForSessionAsOf(
 			ctx, session.Date, now, r.Config.Provider, configHash,
 		)
@@ -133,6 +146,30 @@ func (r *SessionRunner) RunSession(
 	return store.GetCompletedSwingUniverseVersionByIDAsOf(
 		ctx, result.VersionID, r.now().UTC(),
 	)
+}
+
+func (r *SessionRunner) sessionAuthorized(
+	now time.Time, session engine.USMarketSession, scheduled bool,
+) bool {
+	nowAtExchange := now.In(session.Date.Location())
+	sameDate := nowAtExchange.Year() == session.Date.Year() &&
+		nowAtExchange.YearDay() == session.Date.YearDay()
+	if !scheduled {
+		return sameDate
+	}
+	delay := time.Duration(r.Config.AfterCloseDelayMinutes) * time.Minute
+	if delay < 0 {
+		delay = 0
+	}
+	expected := engine.MostRecentCompletedMarketSession(now, delay)
+	latestCompleted := engine.MostRecentCompletedMarketSession(now, 0)
+	return sameSessionDate(expected, session) &&
+		sameSessionDate(latestCompleted, session)
+}
+
+func sameSessionDate(left, right engine.USMarketSession) bool {
+	return left.Date.Year() == right.Date.Year() &&
+		left.Date.YearDay() == right.Date.YearDay()
 }
 
 func UniverseConfigEvidence(

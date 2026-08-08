@@ -19,7 +19,7 @@ const (
 )
 
 type sessionUniverseBuilder interface {
-	RunSession(context.Context, engine.USMarketSession) (*store.SwingUniverseVersion, error)
+	RunScheduledSession(context.Context, engine.USMarketSession) (*store.SwingUniverseVersion, error)
 }
 
 // ApprovedUniverseJob is the deliberately small extension seam for scanners
@@ -50,7 +50,7 @@ func (s *SessionScheduler) Run(ctx context.Context) error {
 	session := engine.MostRecentCompletedMarketSession(s.now(), delay)
 	failureCount := 0
 	for {
-		universe, err := s.Builder.RunSession(ctx, session)
+		universe, err := s.Builder.RunScheduledSession(ctx, session)
 		if ctx.Err() != nil {
 			return nil
 		}
