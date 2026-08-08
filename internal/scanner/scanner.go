@@ -216,6 +216,11 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		return fmt.Errorf("load premarket episodic candidates: %w", err)
 	}
 	defer s.releasePremarketEpisodicClaims(ctx, premarketCandidates)
+	politicalCandidates, err := s.politicalDisclosureCandidates(ctx)
+	if err != nil {
+		return fmt.Errorf("load political disclosure candidates: %w", err)
+	}
+	defer s.releasePoliticalDisclosureClaims(ctx, politicalCandidates)
 	if len(weeklyCandidates) > 0 && len(industryCandidates) > 0 &&
 		weeklyCandidates[0].UniverseVersionID != industryCandidates[0].UniverseVersionID {
 		return fmt.Errorf(
@@ -291,6 +296,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = mergeWeeklyLeaderCandidates(candidates, weeklyCandidates)
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
+	candidates = mergePoliticalDisclosureCandidates(candidates, politicalCandidates)
 	promotionCapActive := s.Cfg.PromotionMaxPerIndustry > 0
 	if promotionCapActive {
 		if strings.TrimSpace(recorder.run.UniverseVersionID) == "" || !store.IsConnected() {
@@ -542,6 +548,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 		if hasSource(sc.candidate.Sources, "premarket_episodic") {
 			strategies = appendUniqueStrategy(strategies, "premarket_episodic")
 		}
+		if hasSource(sc.candidate.Sources, "political_disclosure") {
+			strategies = appendUniqueStrategy(strategies, "political_disclosure")
+		}
 		discoveryContext, executionProfile, profileErr := buildScannerTradeProfile(
 			sc.candidate, sc.score,
 		)
@@ -650,6 +659,9 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 			if hasSource(fallback.Sources, "premarket_episodic") {
 				strategies = appendUniqueStrategy(strategies, "premarket_episodic")
 			}
+			if hasSource(fallback.Sources, "political_disclosure") {
+				strategies = appendUniqueStrategy(strategies, "political_disclosure")
+			}
 			item.Strategies = strategies
 			item.Timeframes = timeframes
 			item.MinConfidence = fallbackScore.Conviction
@@ -717,18 +729,19 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 
 		if s.Bus != nil {
 			s.Bus.Publish(events.ScannerItemAdded, events.ScannerItemAddedPayload{
-				Ticker:                    sc.candidate.Ticker,
-				Conviction:                sc.score.Conviction,
-				SetupType:                 sc.score.SetupType,
-				Strategy:                  sc.score.Strategy,
-				Timeframes:                timeframes,
-				Reasoning:                 sc.score.Reasoning,
-				ExpiresAt:                 expiresAt.Format(time.RFC3339),
-				Sources:                   sc.candidate.Sources,
-				GraphContext:              sc.candidate.GraphContext,
-				WeeklyLeaderEvidence:      sc.candidate.WeeklyLeaderEvidence,
-				PotentIndustryEvidence:    sc.candidate.PotentIndustryEvidence,
-				PremarketEpisodicEvidence: sc.candidate.PremarketEpisodicEvidence,
+				Ticker:                      sc.candidate.Ticker,
+				Conviction:                  sc.score.Conviction,
+				SetupType:                   sc.score.SetupType,
+				Strategy:                    sc.score.Strategy,
+				Timeframes:                  timeframes,
+				Reasoning:                   sc.score.Reasoning,
+				ExpiresAt:                   expiresAt.Format(time.RFC3339),
+				Sources:                     sc.candidate.Sources,
+				GraphContext:                sc.candidate.GraphContext,
+				WeeklyLeaderEvidence:        sc.candidate.WeeklyLeaderEvidence,
+				PotentIndustryEvidence:      sc.candidate.PotentIndustryEvidence,
+				PremarketEpisodicEvidence:   sc.candidate.PremarketEpisodicEvidence,
+				PoliticalDisclosureEvidence: sc.candidate.PoliticalDisclosureEvidence,
 			})
 		}
 	}
@@ -1452,6 +1465,10 @@ func (s *MarketScanner) candidateTTLDays(candidate SwingCandidate) int {
 	if hasSource(candidate.Sources, "potent_industry") && s.Cfg.PotentIndustry.TTLDays > days {
 		days = s.Cfg.PotentIndustry.TTLDays
 	}
+	if hasSource(candidate.Sources, "political_disclosure") &&
+		s.Cfg.PoliticalDisclosures.TTLDays > days {
+		days = s.Cfg.PoliticalDisclosures.TTLDays
+	}
 	if days > 0 {
 		return days
 	}
@@ -1490,8 +1507,12 @@ type scoredCandidate struct {
 // sortByConviction sorts in-place, highest conviction first.
 func sortByConviction(items []scoredCandidate) {
 	for i := 1; i < len(items); i++ {
-		for j := i; j > 0 && items[j].score.Conviction > items[j-1].score.Conviction; j-- {
+		for j := i; j > 0 && promotionPriority(items[j]) > promotionPriority(items[j-1]); j-- {
 			items[j], items[j-1] = items[j-1], items[j]
 		}
 	}
+}
+
+func promotionPriority(item scoredCandidate) float64 {
+	return item.score.Conviction + 0.10*item.candidate.PoliticalDisclosureScore
 }

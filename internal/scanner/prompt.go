@@ -69,12 +69,18 @@ type SwingCandidate struct {
 	PremarketEpisodicRunID      string
 	PremarketEpisodicClaimToken string
 	PremarketEpisodicEvidence   string
-	UniverseVersionID           string
-	UniverseAsOf                time.Time
-	RemovalStage                string
-	FailureStage                string
-	FailureReason               string
-	News                        []SwingNewsItem
+	// PoliticalDisclosureClaimToken fences all pending filing rows for this
+	// ticker that were claimed by the current scanner cycle.
+	PoliticalDisclosureClaimToken string
+	PoliticalDisclosureEvidence   string
+	PoliticalDisclosureScore      float64
+	politicalDisclosureFallback   *SwingCandidate
+	UniverseVersionID             string
+	UniverseAsOf                  time.Time
+	RemovalStage                  string
+	FailureStage                  string
+	FailureReason                 string
+	News                          []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.
@@ -185,6 +191,13 @@ Rules:
 			"Premarket episodic evidence: %s\n",
 			candidate.PremarketEpisodicEvidence,
 		))
+	}
+	if candidate.PoliticalDisclosureEvidence != "" {
+		sb.WriteString(fmt.Sprintf(
+			"Congressional disclosure evidence: %s\n",
+			candidate.PoliticalDisclosureEvidence,
+		))
+		sb.WriteString(fmt.Sprintf("Political disclosure priority: %.2f (review signal only; does not override conviction/risk gates)\n", candidate.PoliticalDisclosureScore))
 	}
 	sb.WriteString("\n")
 

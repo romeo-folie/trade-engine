@@ -17,6 +17,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
+	"github.com/romeo-folie/trade-engine/internal/disclosures"
 	"github.com/romeo-folie/trade-engine/internal/earnings"
 	"github.com/romeo-folie/trade-engine/internal/embeddings"
 	"github.com/romeo-folie/trade-engine/internal/engine"
@@ -184,6 +185,27 @@ Modes:
 		// Graceful shutdown on SIGTERM / SIGINT.
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+
+		if cfg.Disclosures.Enabled {
+			if !store.IsConnected() {
+				logger.Warn("congressional disclosure ingestion requested but DB not connected; skipping startup")
+			} else {
+				disclosureRunner, err := disclosures.NewRunner(cfg.Disclosures)
+				if err != nil {
+					return fmt.Errorf("initialize congressional disclosure ingestion: %w", err)
+				}
+				go func() {
+					if err := disclosureRunner.Run(ctx); err != nil && err != context.Canceled {
+						logger.Warn("congressional disclosure ingestion stopped with error", "err", err.Error())
+					}
+				}()
+				logger.Info("congressional disclosure ingestion started",
+					"house", cfg.Disclosures.House.Enabled,
+					"senate", cfg.Disclosures.Senate.Enabled,
+					"interval_hours", cfg.Disclosures.SyncIntervalHours,
+				)
+			}
+		}
 
 		// Start independent portfolio poller for any broker that implements BrokerView.
 		// Backfill is Alpaca-only (IBKR has no history endpoint).

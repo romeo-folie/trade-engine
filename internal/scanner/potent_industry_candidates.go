@@ -200,6 +200,18 @@ func candidateAfterPromotionClaimLoss(
 			return fallback, len(fallback.Sources) > 0
 		}
 		return ordinaryCandidateAfterWeeklyClaimLoss(candidate)
+	case "political_disclosure":
+		if candidate.politicalDisclosureFallback == nil {
+			return SwingCandidate{}, false
+		}
+		fallback := cloneSwingCandidate(*candidate.politicalDisclosureFallback)
+		copyDynamicCandidateState(&fallback, candidate)
+		fallback.Sources = withoutSource(fallback.Sources, "political_disclosure")
+		delete(fallback.SourceScores, "political_disclosure")
+		fallback.PoliticalDisclosureClaimToken = ""
+		fallback.PoliticalDisclosureEvidence = ""
+		fallback.politicalDisclosureFallback = nil
+		return fallback, len(fallback.Sources) > 0
 	default:
 		return SwingCandidate{}, false
 	}
@@ -255,6 +267,7 @@ func (s *MarketScanner) markDiscoveryCandidate(
 	s.markWeeklyLeaderCandidate(ctx, candidate, status, scannerRunID, reason)
 	s.markPotentIndustryCandidate(ctx, candidate, status, scannerRunID, reason)
 	s.markPremarketEpisodicCandidate(ctx, candidate, status, scannerRunID, reason)
+	s.markPoliticalDisclosureCandidate(ctx, candidate, status, scannerRunID, reason)
 }
 
 func (s *MarketScanner) markDiscoveryCandidates(
@@ -316,6 +329,11 @@ func scannerSourcePromotionClaims(
 			Token: candidate.PremarketEpisodicClaimToken,
 		}
 	}
+	if candidate.PoliticalDisclosureClaimToken != "" {
+		claims.PoliticalDisclosure = &store.PoliticalDisclosurePromotionClaim{
+			Ticker: candidate.Ticker, Token: candidate.PoliticalDisclosureClaimToken,
+		}
+	}
 	return claims
 }
 
@@ -325,7 +343,7 @@ func (s *MarketScanner) promoteDiscoveryCandidate(
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-		claims.PremarketEpisodic == nil {
+		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
 			return store.AddWatchlistItemWithScannerLease(ctx, item, *lease)
 		}
@@ -347,7 +365,7 @@ func (s *MarketScanner) promoteDiscoveryFallback(
 ) error {
 	claims := scannerSourcePromotionClaims(candidate)
 	if claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-		claims.PremarketEpisodic == nil {
+		claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil {
 		if lease != nil {
 			return store.AddWatchlistItemUnlessActiveWithScannerLease(ctx, item, *lease)
 		}

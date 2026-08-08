@@ -89,6 +89,9 @@ func init() {
 	// Point-in-time swing universe
 	rootCmd.AddCommand(universeCmd)
 
+	// Congressional financial disclosures
+	rootCmd.AddCommand(disclosuresCmd)
+
 	// Embeddings
 	rootCmd.AddCommand(embeddingsCmd)
 

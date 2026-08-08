@@ -46,10 +46,16 @@ type PremarketEpisodicPromotionClaim struct {
 	Token  string
 }
 
+type PoliticalDisclosurePromotionClaim struct {
+	Ticker string
+	Token  string
+}
+
 type ScannerSourcePromotionClaims struct {
-	WeeklyLeader      *WeeklyLeaderPromotionClaim
-	PotentIndustry    *PotentIndustryPromotionClaim
-	PremarketEpisodic *PremarketEpisodicPromotionClaim
+	WeeklyLeader        *WeeklyLeaderPromotionClaim
+	PotentIndustry      *PotentIndustryPromotionClaim
+	PremarketEpisodic   *PremarketEpisodicPromotionClaim
+	PoliticalDisclosure *PoliticalDisclosurePromotionClaim
 }
 
 // PromoteScannerSourcesToWatchlist validates every discovery-source claim,
@@ -115,7 +121,7 @@ func promoteScannerSourcesToWatchlist(
 ) error {
 	if strings.TrimSpace(item.Ticker) == "" ||
 		(claims.WeeklyLeader == nil && claims.PotentIndustry == nil &&
-			claims.PremarketEpisodic == nil) {
+			claims.PremarketEpisodic == nil && claims.PoliticalDisclosure == nil) {
 		return fmt.Errorf("scanner source watchlist promotion lineage is incomplete")
 	}
 	if claims.WeeklyLeader != nil &&
@@ -137,6 +143,11 @@ func promoteScannerSourcesToWatchlist(
 			strings.TrimSpace(claims.PremarketEpisodic.RunID) == "" ||
 			strings.TrimSpace(claims.PremarketEpisodic.Token) == "") {
 		return fmt.Errorf("premarket episodic watchlist promotion lineage is incomplete")
+	}
+	if claims.PoliticalDisclosure != nil &&
+		(claims.PoliticalDisclosure.Ticker != item.Ticker ||
+			strings.TrimSpace(claims.PoliticalDisclosure.Token) == "") {
+		return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
 	}
 
 	tx, err := GetDB().Begin(ctx)
@@ -251,6 +262,36 @@ func promoteScannerSourcesToWatchlist(
 			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
 		}
 	}
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		rows, err := tx.Query(ctx, `
+			SELECT COALESCE(promotion_claim_token,''), promotion_status
+			FROM political_disclosure_candidates
+			WHERE ticker=$1 AND promotion_status='processing'
+			  AND promotion_claim_token=$2
+			FOR UPDATE`, claim.Ticker, claim.Token)
+		if err != nil {
+			return fmt.Errorf("lock political disclosure promotion: %w", err)
+		}
+		found := false
+		valid := true
+		for rows.Next() {
+			found = true
+			var token, status string
+			if err := rows.Scan(&token, &status); err != nil {
+				rows.Close()
+				return err
+			}
+			valid = valid && token == claim.Token && status == "processing"
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return err
+		}
+		if !found || !valid {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
+		}
+	}
 
 	// Take all potentially blocking source/advisory locks before touching the
 	// lease row. This leaves an expired lease reclaimable while this transaction
@@ -346,6 +387,24 @@ func completeScannerSourcePromotionClaims(
 		}
 		if tag.RowsAffected() != 1 {
 			return &ScannerSourcePromotionClaimError{Source: "premarket_episodic"}
+		}
+	}
+	if claim := claims.PoliticalDisclosure; claim != nil {
+		tag, err := tx.Exec(ctx, `
+			UPDATE political_disclosure_candidates
+			SET promotion_status=$3, scanner_run_id=$4, promoted_at=$5,
+			    promotion_reason=$6, promotion_claim_token=NULL,
+			    promotion_claimed_at=NULL
+			WHERE ticker=$1 AND promotion_status='processing'
+			  AND promotion_claim_token=$2`,
+			claim.Ticker, claim.Token, status, nullableUUID(item.ScannerRunID),
+			at, nullableString(reason),
+		)
+		if err != nil {
+			return fmt.Errorf("complete political disclosure watchlist promotion: %w", err)
+		}
+		if tag.RowsAffected() == 0 {
+			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 		}
 	}
 	return nil
