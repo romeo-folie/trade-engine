@@ -1,8 +1,8 @@
 # Full-universe weekly-leader scanner
 
 The weekly-leader scanner is the second discovery source in epic #482. It
-evaluates the complete eligible point-in-time stock universe created by
-`te universe refresh`; it does not derive its denominator from daily movers,
+evaluates the complete eligible point-in-time stock universe approved by the
+durable after-close universe pipeline; it does not derive its denominator from daily movers,
 the watchlist, or stocks for which market data happened to succeed.
 
 “Weekly leader” describes the multi-week leadership lens. The job runs after
@@ -37,8 +37,9 @@ Each run fixes two timestamps:
 
 - `as_of`: the official completed-session close. Daily bars after this boundary
   are discarded, including a forming or provider-corrected future bar.
-- `decision_at`: close plus the configured provider-finalization delay. The
-  universe must have been effective, captured, and completed by this boundary.
+- `decision_at`: the actual release time after the session universe is approved
+  (and never earlier than that universe's `completed_at`). The universe must
+  have been effective, captured, and completed by this boundary.
 
 Both the benchmark and every successfully evaluated stock must contain the
 target session's completed daily bar. A long but stale history ending on the
@@ -131,13 +132,14 @@ score floor, and selection percentile.
 
 ## Scheduling and idempotency
 
-The scheduler uses the exchange calendar rather than a 24-hour ticker. It
+The shared universe scheduler uses the exchange calendar rather than a 24-hour ticker. It
 handles weekends, observed holidays, daylight-saving changes, Black Friday,
 Christmas Eve when open, the applicable pre-Independence-Day early close, and
 explicit modern-era exceptional NYSE closures. A missing target-session
 benchmark bar fails the attempt instead of publishing an empty run, providing
-a safety fence for a future unscheduled closure. On startup it catches up the
-most recent completed session. Ordinary failures retry after 5, 10, and 20
+a safety fence for a future unscheduled closure. On startup it first reuses or
+builds the most recent safely available session universe, then releases this
+scanner with that exact approved version. Ordinary pipeline failures retry after 5, 10, and 20
 minutes, then defer to the next scheduled close so a persistent outage cannot
 hammer the full-universe provider through a weekend.
 
@@ -202,9 +204,9 @@ scanner:
     max_promotions_per_run: 20
 ```
 
-Start in observation mode (`promote_candidates: false`). Ensure a completed
-universe refresh exists before the scheduled decision time. Review prospective
-history with:
+Start in observation mode (`promote_candidates: false`). The shared pipeline
+builds and approves the session universe before releasing the scanner. Review
+prospective history with:
 
 ```text
 te report weekly-leaders --from YYYY-MM-DD --to YYYY-MM-DD

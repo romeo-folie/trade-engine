@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -87,11 +88,19 @@ type fakeRepository struct {
 	version           store.SwingUniverseVersion
 	members           []store.SwingUniverseMember
 	failed            error
+	completedQuality  store.SwingUniverseQuality
+	failedQuality     store.SwingUniverseQuality
 }
 
 func (f *fakeRepository) Begin(_ context.Context, v store.SwingUniverseVersion) (string, error) {
 	f.version = v
 	return "version-1", nil
+}
+func (f *fakeRepository) UpdateMetadata(
+	_ context.Context, _ string, v store.SwingUniverseVersion,
+) error {
+	f.version = v
+	return nil
 }
 func (f *fakeRepository) ReplaceMembers(
 	_ context.Context, _ string, members []store.SwingUniverseMember,
@@ -99,9 +108,17 @@ func (f *fakeRepository) ReplaceMembers(
 	f.members = members
 	return nil
 }
-func (f *fakeRepository) Complete(context.Context, string, time.Time) error { return nil }
-func (f *fakeRepository) Fail(_ context.Context, _ string, _ time.Time, err error) error {
+func (f *fakeRepository) Complete(
+	_ context.Context, _ string, _ time.Time, quality store.SwingUniverseQuality,
+) error {
+	f.completedQuality = quality
+	return nil
+}
+func (f *fakeRepository) Fail(
+	_ context.Context, _ string, _ time.Time, quality store.SwingUniverseQuality, err error,
+) error {
 	f.failed = err
+	f.failedQuality = quality
 	return nil
 }
 func (f *fakeRepository) TaxonomyAsOf(
@@ -123,6 +140,7 @@ func (f *fakeRepository) InsertTaxonomy(
 func TestRefreshEnumeratesFullAssetMasterAndRecordsPartialFailures(t *testing.T) {
 	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
 	cfg := testConfig()
+	cfg.MinMarketDataCoverage = 0.50
 	repo := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
 	bars := dailyBars("GOOD", 20, 100, 20_000)
 	market := fakeMarketData{
@@ -167,6 +185,12 @@ func TestRefreshEnumeratesFullAssetMasterAndRecordsPartialFailures(t *testing.T)
 	}
 	if !repo.version.AsOf.Equal(now) || repo.version.AsOf.Before(repo.version.CapturedAt) {
 		t.Fatalf("invalid point-in-time version = %+v", repo.version)
+	}
+	if repo.completedQuality.EvidenceRequiredCount != 2 ||
+		repo.completedQuality.CoherentMarketDataCount != 1 ||
+		repo.completedQuality.MarketDataCoverage != 0.50 ||
+		repo.completedQuality.ProviderFailureCount != 1 {
+		t.Fatalf("persisted completion quality = %+v", repo.completedQuality)
 	}
 }
 
@@ -451,8 +475,18 @@ func TestRefreshRejectsTotalMarketDataOutage(t *testing.T) {
 			if _, err := builder.Refresh(context.Background()); err == nil {
 				t.Fatal("total market-data outage unexpectedly published a universe")
 			}
-			if repo.version.ID != "" || len(repo.members) != 0 {
-				t.Fatalf("outage published state: version=%+v members=%+v", repo.version, repo.members)
+			if repo.version.Provider == "" || len(repo.members) != 1 || repo.failed == nil {
+				t.Fatalf("outage was not persisted for audit: version=%+v members=%+v failed=%v",
+					repo.version, repo.members, repo.failed)
+			}
+			if repo.failedQuality.EvidenceRequiredCount != 1 ||
+				repo.failedQuality.CoherentMarketDataCount != 0 ||
+				repo.failedQuality.MarketDataCoverage != 0 {
+				t.Fatalf("persisted rejection quality = %+v", repo.failedQuality)
+			}
+			if strings.Contains(repo.members[0].FailureReason, "fundamentals") ||
+				repo.members[0].RemovalStage != "market_data" {
+				t.Fatalf("unattempted fundamentals leaked into rejection audit: %+v", repo.members[0])
 			}
 		})
 	}
@@ -697,6 +731,7 @@ func TestRefreshAppliesAssetMasterEligibilityFlags(t *testing.T) {
 func testConfig() config.UniverseConfig {
 	return config.UniverseConfig{
 		Enabled: true, Provider: "alpaca", MinPrice: 5, MinMarketCapMM: 100,
+		MinMarketDataCoverage: 0.90,
 		MinMedianDollarVolume: 1_000_000, DollarVolumeLookbackDays: 20,
 		AllowedSecurityTypes: []string{"us_equity"},
 		AllowedExchanges:     []string{"NYSE", "NASDAQ", "AMEX"},
@@ -732,8 +767,139 @@ func completeMarkets(symbols []string, days int) fakeMarketData {
 
 func dailyBars(symbol string, count int, close float64, volume int64) []data.Candle {
 	bars := make([]data.Candle, count)
+	location, _ := time.LoadLocation("America/New_York")
+	last := time.Date(2026, 7, 24, 0, 0, 0, 0, location)
 	for i := range bars {
-		bars[i] = data.Candle{Ticker: symbol, Close: close, Volume: volume}
+		bars[i] = data.Candle{
+			Ticker: symbol, Close: close, Volume: volume,
+			Timestamp: last.AddDate(0, 0, i-count+1),
+		}
 	}
 	return bars
+}
+
+func TestMarketDataQualityUsesCoherentIntersection(t *testing.T) {
+	asOf := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	quality := marketDataQuality(
+		[]string{"A", "B", "C"},
+		data.StockSnapshotBatchResult{Snapshots: map[string]data.StockSnapshotEvidence{
+			"A": {LatestTradePrice: 10}, "B": {LatestTradePrice: 20},
+		}},
+		data.DailyBarsBatchResult{Bars: map[string][]data.Candle{
+			"B": dailyBars("B", 20, 20, 1_000), "C": dailyBars("C", 20, 30, 1_000),
+		}},
+		20, asOf, 0.90,
+	)
+	if quality.UsableSnapshotCount != 2 || quality.UsableBarHistoryCount != 2 ||
+		quality.CoherentMarketDataCount != 1 || quality.ProviderFailureCount != 2 ||
+		quality.MarketDataCoverage != 1.0/3.0 {
+		t.Fatalf("quality = %+v", quality)
+	}
+}
+
+func TestMarketDataQualityThresholdBoundaryAndEmptyDenominator(t *testing.T) {
+	asOf := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	var symbols []string
+	snapshots := make(map[string]data.StockSnapshotEvidence)
+	bars := make(map[string][]data.Candle)
+	for i := 0; i < 10; i++ {
+		symbol := fmt.Sprintf("S%02d", i)
+		symbols = append(symbols, symbol)
+		snapshots[symbol] = data.StockSnapshotEvidence{LatestTradePrice: 10}
+		if i < 9 {
+			bars[symbol] = dailyBars(symbol, 20, 10, 1_000)
+		}
+	}
+	quality := marketDataQuality(symbols,
+		data.StockSnapshotBatchResult{Snapshots: snapshots},
+		data.DailyBarsBatchResult{Bars: bars}, 20, asOf, 0.90)
+	if quality.CoherentMarketDataCount != 9 || quality.MarketDataCoverage != 0.90 ||
+		quality.MarketDataCoverage < quality.MinMarketDataCoverage {
+		t.Fatalf("boundary quality = %+v", quality)
+	}
+	empty := marketDataQuality(nil, data.StockSnapshotBatchResult{}, data.DailyBarsBatchResult{}, 20, asOf, 0.90)
+	if empty.EvidenceRequiredCount != 0 || empty.MarketDataCoverage != 1 {
+		t.Fatalf("empty-denominator quality = %+v", empty)
+	}
+}
+
+func TestCompletedDailyBarsUsesEarlyClose(t *testing.T) {
+	location, err := time.LoadLocation("America/New_York")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bar := data.Candle{Timestamp: time.Date(2024, 11, 29, 0, 0, 0, 0, location), Close: 100, Volume: 1_000}
+	before := time.Date(2024, 11, 29, 12, 59, 59, 0, location)
+	atClose := time.Date(2024, 11, 29, 13, 0, 0, 0, location)
+	if got := completedDailyBars([]data.Candle{bar}, before); len(got) != 0 {
+		t.Fatalf("pre-close bar included: %+v", got)
+	}
+	if got := completedDailyBars([]data.Candle{bar}, atClose); len(got) != 1 {
+		t.Fatalf("early-close bar excluded: %+v", got)
+	}
+}
+
+func TestMarketDataQualityRejectsHistoryMissingLatestSession(t *testing.T) {
+	asOf := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	history := dailyBars("STALE", 20, 10, 1_000)
+	for i := range history {
+		history[i].Timestamp = history[i].Timestamp.AddDate(0, 0, -1)
+	}
+	quality := marketDataQuality(
+		[]string{"STALE"},
+		data.StockSnapshotBatchResult{Snapshots: map[string]data.StockSnapshotEvidence{
+			"STALE": {LatestTradePrice: 10},
+		}},
+		data.DailyBarsBatchResult{Bars: map[string][]data.Candle{"STALE": history}},
+		20, asOf, 0.90,
+	)
+	if quality.UsableBarHistoryCount != 0 || quality.MarketDataCoverage != 0 {
+		t.Fatalf("stale history approved: %+v", quality)
+	}
+}
+
+func TestRefreshApprovesBoundaryButExcludesStaleSessionMember(t *testing.T) {
+	now := time.Date(2026, 7, 26, 12, 0, 0, 0, time.UTC)
+	assets := make([]data.StockAsset, 0, 10)
+	symbols := make([]string, 0, 10)
+	fundamentals := make(fakeFundamentals, 10)
+	for i := 0; i < 10; i++ {
+		symbol := fmt.Sprintf("B%02d", i)
+		symbols = append(symbols, symbol)
+		assets = append(assets, data.StockAsset{
+			Symbol: symbol, Status: "active", AssetClass: "us_equity",
+			Exchange: "NASDAQ", Tradable: true,
+		})
+		fundamentals[symbol] = data.CompanyFundamentals{
+			MarketCapitalization: 500, Industry: "Technology", Provider: "finnhub",
+		}
+	}
+	market := completeMarkets(symbols, 20)
+	stale := market.bars.Bars["B09"]
+	for i := range stale {
+		stale[i].Timestamp = stale[i].Timestamp.AddDate(0, 0, -1)
+	}
+	market.bars.Bars["B09"] = stale
+	repository := &fakeRepository{taxonomy: make(map[string]*store.CompanyTaxonomyObservation)}
+	result, err := (&Builder{
+		Config: testConfig(), Assets: fakeAssets{assets: assets},
+		Snapshots: market, Bars: market, Fundamentals: fundamentals,
+		Repository: repository, Now: func() time.Time { return now },
+	}).Refresh(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Quality.MarketDataCoverage != 0.90 || result.EligibleCount != 9 {
+		t.Fatalf("boundary result = %+v", result)
+	}
+	for _, member := range repository.members {
+		if member.Ticker == "B09" {
+			if member.Eligible || member.RemovalStage != "market_data" ||
+				member.FailureStage != "provider_evidence" {
+				t.Fatalf("stale boundary member = %+v", member)
+			}
+			return
+		}
+	}
+	t.Fatal("stale boundary member was not audited")
 }

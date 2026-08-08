@@ -33,7 +33,7 @@ capitalization, eligibility result, taxonomy value and taxonomy timestamps.
 `Unknown` is a real taxonomy state, not an empty sector that can accidentally
 form an industry group.
 
-Only a `completed` version is consumable. A refresh builds a new version; it
+Only a `completed` version whose quality status is `approved` is consumable. A refresh builds a new version; it
 never mutates a previous completed version. A partial provider failure remains
 visible on the affected member. If the refresh cannot establish a coherent
 asset list, no empty version is published and the last completed version
@@ -89,8 +89,12 @@ the failed members receive an explicit failure stage. The configured missing
 evidence policies decide whether those members remain eligible; the decision is
 persisted with the snapshot.
 
-A total snapshot or daily-bar outage publishes no version, preventing an empty
-failed-data universe from superseding the last healthy completed snapshot.
+Market-data quality is measured against assets that passed the inexpensive
+asset-master filters and therefore required evidence. The default gate requires
+90% of that denominator to have both a usable snapshot price and a complete
+daily-bar lookback. Snapshot, bar, fundamentals, and distinct-symbol failure
+counts are persisted separately. A rejected attempt and its member evidence
+remain auditable, but cannot supersede or be selected like an approved version.
 
 ## Eligibility stages
 
@@ -112,18 +116,30 @@ fails closed only for scanners whose thesis depends on an industry group.
 
 ## Operating model
 
-`scanner.universe.enabled` defaults to `false`. `te universe refresh` creates a
-current version and prints its counts; it deliberately accepts no historical
-date. `te universe list --as-of <RFC3339>` reads the latest version that had
+`scanner.universe.enabled` defaults to `false`. When enabled, `te run` owns a
+durable exchange-session pipeline. At the configured delay after the official
+close it claims `(session, provider, configuration)`, creates an immutable
+attempt, renews its lease during provider work, and either approves or rejects
+the result. Claims and failures survive restarts and concurrent engines cannot
+publish the same attempt. `te universe refresh` uses this same claim and
+quality path for the current day's completed session and reuses an existing
+approval. It deliberately refuses pre-close, weekend, holiday, and historical
+backfills because current live APIs cannot reconstruct point-in-time evidence.
+
+`te universe list --as-of <RFC3339>` reads the latest approved version that had
 already completed at that decision time. It lists eligible members by default;
 `--all` enumerates every excluded and failed asset-master row.
 
-When enabled, each ordinary scanner run links itself to the latest completed
-version inside `snapshot_ttl_hours`. A missing or expired version remains
-explicit rather than falling forward. The after-close weekly-leader scanner
-consumes this linked denominator using its own fixed decision cutoff; see
+After approval, the pipeline passes the exact version to enabled after-close
+consumers. Their `as_of` remains the target session close while `decision_at`
+is the truthful time at or after publication. A restart reuses the approved
+version and the consumers' own durable claims make re-release idempotent.
+Premarket checkpoints resolve the approved version for the immediately prior
+exchange session, so Friday remains valid on Monday without falling back past a
+missing expected session. Dependency blocks are persisted in
+`scanner_dependency_blocks` rather than existing only in logs. See
 [`weekly-leader-scanner.md`](weekly-leader-scanner.md).
 
-Before any leadership scanner affects the watchlist, universe refreshes must run
-in observation mode and the prospective reports must show stable member counts,
+Before any leadership scanner affects the watchlist, the after-close pipeline
+must run in observation mode and the prospective reports must show stable member counts,
 bounded failure rates, fresh taxonomy coverage, and reproducible as-of results.

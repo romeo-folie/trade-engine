@@ -67,10 +67,24 @@ func (potentIndustryStoreRepository) CompleteRun(
 // immutable point-in-time universe. It never authorizes a trade; when explicitly
 // configured, its highest-ranked members become pending scanner candidates.
 type PotentIndustryRunner struct {
-	Provider   data.BulkDailyBarsProvider
-	Cfg        config.PotentIndustryConfig
-	Now        func() time.Time
-	Repository potentIndustryRepository
+	Provider      data.BulkDailyBarsProvider
+	Cfg           config.PotentIndustryConfig
+	Now           func() time.Time
+	Repository    potentIndustryRepository
+	universe      *store.SwingUniverseVersion
+	exactUniverse bool
+}
+
+func (r *PotentIndustryRunner) Name() string { return "potent_industry" }
+
+func (r *PotentIndustryRunner) RunSessionWithUniverse(
+	ctx context.Context, session engine.USMarketSession,
+	universe *store.SwingUniverseVersion, decisionAt time.Time,
+) error {
+	copy := *r
+	copy.universe = universe
+	copy.exactUniverse = true
+	return copy.RunSession(ctx, session, decisionAt)
 }
 
 func (r *PotentIndustryRunner) RunSession(
@@ -91,13 +105,29 @@ func (r *PotentIndustryRunner) RunSession(
 	if maxAge <= 0 {
 		maxAge = 36 * time.Hour
 	}
-	universe, err := repository.GetUsableUniverse(ctx, decisionAt, maxAge)
-	if err != nil {
-		return fmt.Errorf("load potent industry universe: %w", err)
+	universe := r.universe
+	providedUniverse := r.exactUniverse
+	var err error
+	if providedUniverse && universe == nil {
+		return fmt.Errorf("potent industry requires an approved universe from the session pipeline")
+	}
+	if !providedUniverse {
+		universe, err = repository.GetUsableUniverse(ctx, decisionAt, maxAge)
+		if err != nil {
+			return fmt.Errorf("load potent industry universe: %w", err)
+		}
 	}
 	if universe == nil {
 		return fmt.Errorf("no completed swing universe available at %s within %s",
 			decisionAt.Format(time.RFC3339), maxAge)
+	}
+	if providedUniverse && (universe.Status != "completed" || universe.QualityStatus != "approved" ||
+		universe.CompletedAt == nil || universe.CompletedAt.After(decisionAt)) {
+		return fmt.Errorf("potent industry requires an approved universe available by decision time")
+	}
+	if providedUniverse && (universe.SessionDate == nil ||
+		universe.SessionDate.Format("2006-01-02") != session.Date.Format("2006-01-02")) {
+		return fmt.Errorf("potent industry universe does not belong to target session")
 	}
 	members, err := repository.ListEligibleMembers(ctx, universe.ID)
 	if err != nil {

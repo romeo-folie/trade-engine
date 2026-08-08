@@ -30,6 +30,8 @@ func (e *weeklyLeaderRunLeaseActiveError) Error() string {
 		e.sessionDate.Format("2006-01-02"), e.retryAt.Format(time.RFC3339))
 }
 
+func (e *weeklyLeaderRunLeaseActiveError) RetryAtTime() time.Time { return e.retryAt }
+
 // WeeklyLeaderScheduler uses one-shot timers so a DST transition, weekend, or
 // holiday cannot drift a fixed-duration ticker away from the exchange close.
 type WeeklyLeaderScheduler struct {

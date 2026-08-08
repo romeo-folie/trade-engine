@@ -21,9 +21,23 @@ import (
 // It has no execution dependency: qualified rows become optional inputs to the
 // existing scanner/LLM/watchlist path only.
 type WeeklyLeaderRunner struct {
-	Provider data.BulkDailyBarsProvider
-	Cfg      config.WeeklyLeaderConfig
-	Now      func() time.Time
+	Provider      data.BulkDailyBarsProvider
+	Cfg           config.WeeklyLeaderConfig
+	Now           func() time.Time
+	universe      *store.SwingUniverseVersion
+	exactUniverse bool
+}
+
+func (r *WeeklyLeaderRunner) Name() string { return "weekly_leader" }
+
+func (r *WeeklyLeaderRunner) RunSessionWithUniverse(
+	ctx context.Context, session engine.USMarketSession,
+	universe *store.SwingUniverseVersion, decisionAt time.Time,
+) error {
+	copy := *r
+	copy.universe = universe
+	copy.exactUniverse = true
+	return copy.RunSession(ctx, session, decisionAt)
 }
 
 func (r *WeeklyLeaderRunner) RunSession(
@@ -43,13 +57,29 @@ func (r *WeeklyLeaderRunner) RunSession(
 	if maxAge <= 0 {
 		maxAge = 36 * time.Hour
 	}
-	universe, err := store.GetUsableSwingUniverseVersion(ctx, decisionAt, maxAge)
-	if err != nil {
-		return fmt.Errorf("load weekly leader universe: %w", err)
+	universe := r.universe
+	providedUniverse := r.exactUniverse
+	var err error
+	if providedUniverse && universe == nil {
+		return fmt.Errorf("weekly leader requires an approved universe from the session pipeline")
+	}
+	if !providedUniverse {
+		universe, err = store.GetUsableSwingUniverseVersion(ctx, decisionAt, maxAge)
+		if err != nil {
+			return fmt.Errorf("load weekly leader universe: %w", err)
+		}
 	}
 	if universe == nil {
 		return fmt.Errorf("no completed swing universe available at %s within %s",
 			decisionAt.Format(time.RFC3339), maxAge)
+	}
+	if providedUniverse && (universe.Status != "completed" || universe.QualityStatus != "approved" ||
+		universe.CompletedAt == nil || universe.CompletedAt.After(decisionAt)) {
+		return fmt.Errorf("weekly leader requires an approved universe available by decision time")
+	}
+	if providedUniverse && (universe.SessionDate == nil ||
+		universe.SessionDate.Format("2006-01-02") != session.Date.Format("2006-01-02")) {
+		return fmt.Errorf("weekly leader universe does not belong to target session")
 	}
 	members, err := store.ListEligibleSwingUniverseMembers(ctx, universe.ID)
 	if err != nil {

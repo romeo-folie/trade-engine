@@ -12,14 +12,12 @@ import (
 func TestIndustryRotationRunLifecyclePersistsPointInTimeEvidence(t *testing.T) {
 	ctx := context.Background()
 	base := time.Date(2026, time.July, 23, 20, 0, 0, 0, time.UTC)
-	versionID, err := store.BeginSwingUniverseVersion(ctx, store.SwingUniverseVersion{
+	claim := beginClaimedSwingUniverseFixture(t, ctx, store.SwingUniverseVersion{
 		Provider: "test-industry-rotation", AsOf: base.Add(-time.Hour),
 		CapturedAt: base.Add(-50 * time.Minute),
 		Filters:    json.RawMessage(`{"test":true}`),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	versionID := claim.ActiveVersionID
 	price, marketCap, dollarVolume := 100.0, 10_000.0, 80_000_000.0
 	members := []store.SwingUniverseMember{
 		{Ticker: "TEST_IR_A", Eligible: true, Price: &price, MarketCapMM: &marketCap,
@@ -32,14 +30,10 @@ func TestIndustryRotationRunLifecyclePersistsPointInTimeEvidence(t *testing.T) {
 			DollarVolume: &dollarVolume, Sector: "Technology", Industry: "Software",
 			TaxonomyStatus: "known"},
 	}
-	if err := store.ReplaceSwingUniverseMembers(ctx, versionID, members); err != nil {
+	if err := store.ReplaceClaimedSwingUniverseMembers(ctx, claim, members); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.CompleteSwingUniverseVersion(
-		ctx, versionID, base.Add(-40*time.Minute),
-	); err != nil {
-		t.Fatal(err)
-	}
+	completeClaimedSwingUniverseFixture(t, ctx, claim, base.Add(-40*time.Minute))
 	t.Cleanup(func() {
 		_, _ = store.GetDB().Exec(
 			context.Background(),

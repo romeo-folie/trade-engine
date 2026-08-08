@@ -100,6 +100,11 @@ func ClaimPremarketEpisodicRun(
 	if lease <= 0 {
 		lease = 15 * time.Minute
 	}
+	if err := validateApprovedUniverseForDependentRun(
+		ctx, run.UniverseVersionID, run.CheckpointAt, nil,
+	); err != nil {
+		return nil, false, err
+	}
 	row := GetDB().QueryRow(ctx, `
 		INSERT INTO premarket_episodic_runs (
 			session_date, checkpoint_at, hard_cutoff_at, universe_version_id,
