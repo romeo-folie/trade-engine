@@ -10,11 +10,10 @@ EMBED_DIR    := internal/web/dist
 LOCAL_BIN_DIR ?= $(HOME)/.local/bin
 
 .PHONY: frontend-build
-frontend-build: ## Build the React frontend and copy dist to the Go embed target
+frontend-build: ## Build the React frontend directly into the Go embed target
 	cd $(FRONTEND_DIR) && npm install --silent && npm run build
-	rm -rf $(EMBED_DIR)
-	cp -r $(FRONTEND_DIR)/dist $(EMBED_DIR)
-	@echo "Frontend dist synced → $(EMBED_DIR)"
+	@touch $(EMBED_DIR)/.gitkeep
+	@echo "Frontend built → $(EMBED_DIR)"
 
 .PHONY: build
 build: frontend-build ## Build the te binary (includes frontend build)

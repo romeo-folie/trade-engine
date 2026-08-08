@@ -75,3 +75,8 @@ data/*.csv
 /orb-reconcile-statement
 /orb-backfill
 te-study
+
+# Generated frontend bundles. Vite writes directly to the Go embed target.
+/web/frontend/dist/
+/internal/web/dist/*
+!/internal/web/dist/.gitkeep

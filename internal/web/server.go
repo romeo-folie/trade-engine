@@ -30,16 +30,11 @@ import (
 )
 
 // frontendFS holds the compiled React app embedded at build time.
-// The embed path is relative to this file (internal/web/), so the frontend
-// dist must be copied here before go build. The Makefile handles this.
+// Vite writes directly to this package's dist directory before go build.
 //
 // NOTE: //go:embed requires the "dist" directory to exist at compile time.
-// For dev builds without a frontend, either:
-//   - Run `cd web/frontend && npm run build` first, or
-//   - Use the `nofrontend` build tag (planned) to skip embedding.
-//
-// At runtime, fs.Sub failing is not expected — it would indicate a build
-// toolchain issue, not a missing directory.
+// The tracked .gitkeep satisfies that requirement in a fresh checkout; run
+// `make frontend-build` before a production build to embed the complete UI.
 //
 //go:embed all:dist
 var frontendFS embed.FS
@@ -113,14 +108,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	mux := http.NewServeMux()
 
-	// Static frontend — strip the "frontend/dist" prefix from embedded paths.
-	distFS, err := fs.Sub(frontendFS, "dist")
-	if err != nil {
-		// Frontend assets not embedded (pre-build). Serve a placeholder page.
-		mux.HandleFunc("/", serveNoFrontend)
-	} else {
-		mux.Handle("/", spaFallback(http.FileServer(http.FS(distFS)), distFS))
-	}
+	// Static frontend. A fresh checkout embeds only dist/.gitkeep so ordinary
+	// Go builds remain valid; frontendHandler serves a placeholder until Vite
+	// has generated dist/index.html.
+	mux.Handle("/", frontendHandler(frontendFS))
 
 	mux.HandleFunc("/ws", s.handleWebSocket)
 	s.registerAPIHandlers(mux)
@@ -308,29 +299,55 @@ func (h *clientHub) broadcast(_ context.Context, msg any) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// frontendHandler serves the built SPA when index.html exists and otherwise
+// serves build instructions from the placeholder-only embed filesystem.
+func frontendHandler(root fs.FS) http.Handler {
+	distFS, err := fs.Sub(root, "dist")
+	if err != nil {
+		return noFrontendHandler()
+	}
+	if _, err := fs.Stat(distFS, "index.html"); err != nil {
+		return noFrontendHandler()
+	}
+	return spaFallback(http.FileServer(http.FS(distFS)), distFS)
+}
+
+func frontendRequestPath(w http.ResponseWriter, r *http.Request) (string, bool) {
+	// Frontend fallback applies only to navigational requests.
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.NotFound(w, r)
+		return "", false
+	}
+
+	cleaned := path.Clean(r.URL.Path)
+	if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
+		cleaned = "/"
+	}
+	// API and WebSocket paths must never fall through to either the SPA or its
+	// no-build placeholder; typos need to remain ordinary 404 responses.
+	if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" ||
+		cleaned == "/ws" || strings.HasPrefix(cleaned, "/ws/") {
+		http.NotFound(w, r)
+		return "", false
+	}
+	return cleaned, true
+}
+
+func noFrontendHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := frontendRequestPath(w, r); !ok {
+			return
+		}
+		serveNoFrontend(w, r)
+	})
+}
+
 // spaFallback wraps an http.FileServer so that requests for paths that don't
 // match a real file are served index.html, enabling HTML5 history-based routing.
 func spaFallback(fileServer http.Handler, root fs.FS) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// SPA fallback only applies to navigational requests.
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			http.NotFound(w, r)
-			return
-		}
-
-		// Try to open the requested path in the embedded FS.
-		cleaned := path.Clean(r.URL.Path)
-
-		// Guard against unusual requests (e.g. "OPTIONS *", empty path)
-		// where path.Clean returns non-/-prefixed values like "*" or ".".
-		if cleaned == "." || !strings.HasPrefix(cleaned, "/") {
-			cleaned = "/"
-		}
-
-		// API and WebSocket paths must never fall through to the SPA;
-		// let them 404 normally so typos don't return 200 HTML.
-		if strings.HasPrefix(cleaned, "/api/") || cleaned == "/api" || cleaned == "/ws" || strings.HasPrefix(cleaned, "/ws/") {
-			http.NotFound(w, r)
+		cleaned, ok := frontendRequestPath(w, r)
+		if !ok {
 			return
 		}
 		if cleaned == "/" {
@@ -387,7 +404,7 @@ func serveNoFrontend(w http.ResponseWriter, _ *http.Request) {
 <html><head><title>TradeEngine Web</title></head>
 <body style="background:#07060f;color:#00f5ff;font-family:monospace;padding:2rem">
 <h1>🔧 TradeEngine Observability</h1>
-<p>Frontend not built yet. Run <code>cd web/frontend && npm run build</code>.</p>
+<p>Frontend not built yet. Run <code>make build</code> (or <code>make frontend-build</code> then rebuild/restart the <code>te</code> binary).</p>
 <p>WebSocket endpoint: <code>ws://&lt;host&gt;/ws</code></p>
 </body></html>`))
 }
