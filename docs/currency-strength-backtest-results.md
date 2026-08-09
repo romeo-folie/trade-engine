@@ -6,6 +6,8 @@ This note records the corrected rolling-origin currency-strength experiment gene
 
 Further runtime work and the proposed paper pilot were deferred on 2026-08-09. The strategy is not being promoted or configured for operation. These results and the supporting backtest tooling are retained so the research can be resumed later without repeating the investigation.
 
+The `score_method` and `allow_partial_basket` settings below describe the researched candidate. They are not wired into the live currency-strength runner in this change. The existing runner remains on its legacy strict scoring policy, and no claim is made that it reproduces these research results.
+
 The corrected artifact covers 2022-01-03 through 2026-08-07, evaluates 480 parameter combinations, and uses the following 15-pair universe:
 
 - AUD/CHF, AUD/JPY, AUD/USD

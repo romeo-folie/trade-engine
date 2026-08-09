@@ -105,7 +105,7 @@ type strengthParam struct {
 }
 
 func (p strengthParam) label() string {
-	return fmt.Sprintf("strength/%s/%s-%s/exit%s/gap%.4f/broad%d/confirm%.4f/units%d", p.CurrencyModel, p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Confirm, p.Units)
+	return fmt.Sprintf("strength/%s/%s-%s/exit%s/gap%.4f/broad%d/confirm%.4f/units%d/partial%t", p.CurrencyModel, p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Confirm, p.Units, p.AllowPartial)
 }
 
 type strengthResult struct {

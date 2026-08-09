@@ -24,6 +24,18 @@ func TestRoutePairUsesDirectOrInversePair(t *testing.T) {
 	}
 }
 
+func TestStrongestWeakestBreaksTiesDeterministically(t *testing.T) {
+	for _, scores := range []map[string]float64{
+		{"EUR": 1, "USD": -2, "AUD": 1},
+		{"AUD": 1, "USD": -2, "EUR": 1},
+	} {
+		strong, weak, gap, ok := StrongestWeakest(scores)
+		if !ok || strong != "AUD" || weak != "USD" || gap != 3 {
+			t.Fatalf("rank = %s/%s gap=%v ok=%v, want AUD/USD gap=3", strong, weak, gap, ok)
+		}
+	}
+}
+
 func TestEvaluateRejectsNonFiniteWindowsWithSerializableDiagnostics(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

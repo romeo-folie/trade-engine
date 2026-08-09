@@ -410,6 +410,40 @@ func TestCurrencyStrengthPersistsAndNotifiesDetailedNoSignalDecision(t *testing.
 	}
 }
 
+func TestCurrencyStrengthRecordsMissingPairAsNoSignalWithoutStoppingRunner(t *testing.T) {
+	start := time.Date(2026, 7, 21, 6, 0, 0, 0, time.UTC)
+	end := start.Add(3 * time.Hour)
+	market := historicalConversionMarketData{candles: map[string][]data.Candle{
+		"EUR/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.10}, {Timestamp: end.Add(-time.Minute), Close: 1.101}},
+		"GBP/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.25}, {Timestamp: end.Add(-time.Minute), Close: 1.251}},
+	}}
+	journal := &captureCurrencyStrengthJournal{}
+	notifier := &captureNotifier{}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			TradeInstruments: []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			MinGap:           0.0001, BroadMin: 1, Units: 100000,
+		},
+		market: market, broker: fakeExecutor{}, notifier: notifier,
+		statePath: t.TempDir() + "/currency-strength.json",
+	}
+	runner.SetJournal(journal)
+
+	if err := runner.evaluateAndEnter(context.Background(), "2026-07-21", start, end); err != nil {
+		t.Fatalf("a missing pair stopped the runner: %v", err)
+	}
+	if runner.decisionDoneFor != "2026-07-21" {
+		t.Fatalf("decisionDoneFor = %q, want completed no-signal decision", runner.decisionDoneFor)
+	}
+	if len(journal.evaluations) != 1 || len(journal.noSignals) != 1 || journal.noSignals[0] != "missing_price_window" {
+		t.Fatalf("missing pair was not durably recorded: evaluations=%+v noSignals=%+v", journal.evaluations, journal.noSignals)
+	}
+	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "USD/JPY") {
+		t.Fatalf("missing-pair notification was not informative: %+v", notifier.msgs)
+	}
+}
+
 type successfulCurrencyStrengthExecutor struct {
 	result             execution.OrderResult
 	statusResult       execution.OrderResult

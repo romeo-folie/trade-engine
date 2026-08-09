@@ -27,6 +27,12 @@ func writeConsolidatedExnessFile(t *testing.T, dir, symbol, start, end, rows str
 	return path
 }
 
+func TestNewExnessCSVClient_DefaultsToDataDirectory(t *testing.T) {
+	if got := NewExnessCSVClient("").dir; got != "data" {
+		t.Fatalf("default data directory = %q, want data", got)
+	}
+}
+
 func TestExnessCSV_FetchCandles_FiltersNonMinutePrefix(t *testing.T) {
 	dir := t.TempDir()
 	writeExnessFile(t, dir, "XAGUSD", 2021,

@@ -482,9 +482,15 @@ func diagnosticCurrency(d DecisionDiagnostics, currency string) (float64, int) {
 }
 
 func StrongestWeakest(scores map[string]float64) (strong, weak string, gap float64, ok bool) {
+	currencies := make([]string, 0, len(scores))
+	for currency := range scores {
+		currencies = append(currencies, currency)
+	}
+	sort.Strings(currencies)
 	first := true
 	var strongScore, weakScore float64
-	for cur, score := range scores {
+	for _, cur := range currencies {
+		score := scores[cur]
 		if first || score > strongScore {
 			strong, strongScore = cur, score
 		}

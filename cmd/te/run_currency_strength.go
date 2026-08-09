@@ -749,14 +749,10 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	}
 
 	windows := make(map[string]currencystrength.Window, len(pairs))
-	var firstFetchErr error
 	for _, pair := range pairs {
 		start, end, err := r.fetchWindow(ctx, pair.Symbol, strengthStart, strengthEnd)
 		if err != nil {
 			windows[pair.Symbol] = currencystrength.Window{Error: err.Error()}
-			if firstFetchErr == nil {
-				firstFetchErr = err
-			}
 			continue
 		}
 		windows[pair.Symbol] = currencystrength.Window{Start: start, End: end}
@@ -784,9 +780,6 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		}); err != nil {
 			return fmt.Errorf("currency-strength record decision diagnostics: %w", err)
 		}
-	}
-	if firstFetchErr != nil {
-		return firstFetchErr
 	}
 	r.decisionDoneFor = dateKey
 	if decision.Signal == nil {

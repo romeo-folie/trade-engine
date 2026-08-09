@@ -31,11 +31,11 @@ type ExnessCSVClient struct {
 	yearBars map[string][]Candle // latest yearly export, or all years for one consolidated symbol
 }
 
-// NewExnessCSVClient creates a local Exness CSV provider. dir defaults to "docs" because the
-// current research exports live there; callers can override it with markets.exness.data_dir.
+// NewExnessCSVClient creates a local Exness CSV provider. dir defaults to "data";
+// callers can override it with markets.exness.data_dir.
 func NewExnessCSVClient(dir string) *ExnessCSVClient {
 	if strings.TrimSpace(dir) == "" {
-		dir = "docs"
+		dir = "data"
 	}
 	return &ExnessCSVClient{dir: dir, yearBars: make(map[string][]Candle)}
 }
@@ -97,12 +97,7 @@ func (c *ExnessCSVClient) yearMinuteBarsFor(ctx context.Context, symbol string, 
 	if err != nil {
 		return nil, err
 	}
-	var raw []Candle
-	if consolidated {
-		raw, err = parseExnessFile(ctx, path, symbol)
-	} else {
-		raw, err = parseExnessFile(ctx, path, symbol)
-	}
+	raw, err := parseExnessFile(ctx, path, symbol)
 	if err != nil {
 		return nil, err
 	}
@@ -187,10 +182,6 @@ func consolidatedExnessBounds(path, symbol string) (time.Time, time.Time, error)
 }
 
 func parseExnessFile(ctx context.Context, path, symbol string) ([]Candle, error) {
-	return parseExnessFileWindow(ctx, path, symbol, time.Time{}, time.Time{})
-}
-
-func parseExnessFileWindow(ctx context.Context, path, symbol string, from, to time.Time) ([]Candle, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("exness: open %s: %w", path, err)
@@ -228,9 +219,6 @@ func parseExnessFileWindow(ctx context.Context, path, symbol string, from, to ti
 		ts, err := parseExnessTime(fields[0], fields[1])
 		if err != nil {
 			return nil, fmt.Errorf("exness: %s:%d: %w", path, lineNo, err)
-		}
-		if !from.IsZero() && (ts.Before(from) || !ts.Before(to)) {
-			continue
 		}
 		open, err := strconv.ParseFloat(fields[2], 64)
 		if err != nil {
