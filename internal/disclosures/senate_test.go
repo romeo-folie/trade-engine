@@ -52,6 +52,15 @@ func TestParseSenatePTRTable(t *testing.T) {
 	}
 }
 
+func TestSanitizeSenateTicker(t *testing.T) {
+	if got := sanitizeSenateTicker("-- AMCR"); got != "AMCR" {
+		t.Fatalf("ticker = %q", got)
+	}
+	if got := sanitizeSenateTicker("N/A"); got != "" {
+		t.Fatalf("N/A ticker = %q", got)
+	}
+}
+
 func TestParseSenatePTRLiveTypeHeaderDoesNotMatchAssetType(t *testing.T) {
 	filing := SenateFiling{
 		ExternalID: "live-header", FilerName: "Jane Senator",

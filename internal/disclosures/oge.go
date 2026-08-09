@@ -50,6 +50,7 @@ func NewOGEClient(base string, timeout time.Duration) *OGEClient {
 type OGEFilingPage struct {
 	Filings         []OGEFiling
 	RowCount, Total int
+	BeforeRange     bool
 }
 
 func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, limit int) ([]OGEFiling, error) {
@@ -70,7 +71,7 @@ func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, lim
 			out = append(out, filing)
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || start >= page.Total {
+		if page.RowCount == 0 || page.BeforeRange || start >= page.Total {
 			break
 		}
 	}
@@ -111,6 +112,7 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		return OGEFilingPage{}, err
 	}
 	out := make([]OGEFiling, 0, len(raw.Data))
+	beforeRange := false
 	for _, row := range raw.Data {
 		link := ogePDF.FindString(html.UnescapeString(row.Type))
 		if link == "" {
@@ -120,14 +122,18 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		if d.IsZero() {
 			d, _ = time.Parse("2006-01-02", row.DocDate)
 		}
-		if d.Before(since) || d.After(until) {
+		if d.Before(since) {
+			beforeRange = true
+			continue
+		}
+		if d.After(until) {
 			continue
 		}
 		sum := sha256.Sum256([]byte(link))
 		meta, _ := json.Marshal(row)
 		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: html.UnescapeString(row.Name), Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type), FilingDate: d, DocumentURL: link, RawMetadata: meta})
 	}
-	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal}, nil
+	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal, BeforeRange: beforeRange}, nil
 }
 func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	const maxPDFSize = 25 << 20

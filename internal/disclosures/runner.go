@@ -335,7 +335,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			}
 		}
 		start += page.RowCount
-		if page.RowCount == 0 || start >= page.Total {
+		if page.RowCount == 0 || page.BeforeRange || start >= page.Total {
 			break
 		}
 	}

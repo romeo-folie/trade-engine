@@ -74,3 +74,29 @@ func TestPoliticalDisclosurePriorityBreaksCloseConvictionTies(t *testing.T) {
 		t.Fatalf("disclosure signal did not prioritize close score: %#v", items)
 	}
 }
+
+func TestPoliticalClaimLossPreservesPremarketCandidate(t *testing.T) {
+	premarket := SwingCandidate{
+		Ticker: "MSFT", Price: 425, ChangePct: 3.2,
+		Sources:                     []string{"premarket_episodic"},
+		SourceScores:                map[string]float64{"premarket_episodic": .82},
+		PremarketEpisodicRunID:      "premarket-run",
+		PremarketEpisodicClaimToken: "premarket-claim",
+		PremarketEpisodicEvidence:   "fresh catalyst",
+	}
+	disclosure := SwingCandidate{
+		Ticker: "MSFT", Sources: []string{"political_disclosure"},
+		SourceScores:                  map[string]float64{"political_disclosure": .9},
+		PoliticalDisclosureClaimToken: "political-claim",
+		PoliticalDisclosureEvidence:   "recent purchase",
+		PoliticalDisclosureScore:      .9,
+	}
+	merged := mergePoliticalDisclosureCandidates([]SwingCandidate{premarket}, []SwingCandidate{disclosure})
+	fallback, ok := candidateAfterPromotionClaimLoss(merged[0], "political_disclosure")
+	if !ok || !hasSource(fallback.Sources, "premarket_episodic") || hasSource(fallback.Sources, "political_disclosure") {
+		t.Fatalf("fallback = %+v, ok=%v", fallback, ok)
+	}
+	if fallback.PremarketEpisodicRunID != "premarket-run" || fallback.Price != 425 || fallback.PoliticalDisclosureClaimToken != "" {
+		t.Fatalf("premarket state was not preserved: %+v", fallback)
+	}
+}

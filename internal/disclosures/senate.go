@@ -438,9 +438,7 @@ func senateTransactions(document *html.Node) []Transaction {
 			amount, _ := cell(row, amountIndex)
 			minimum, maximum := parseAmount(amount)
 			ticker, _ := cell(row, tickerIndex)
-			if ticker == "--" || ticker == "N/A" {
-				ticker = ""
-			}
+			ticker = sanitizeSenateTicker(ticker)
 			if ticker == "" {
 				ticker = tickerFromAsset(asset)
 			}
@@ -460,6 +458,22 @@ func senateTransactions(document *html.Node) []Transaction {
 		return out
 	}
 	return nil
+}
+
+func sanitizeSenateTicker(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	value = strings.TrimSpace(strings.TrimLeft(value, "-–— "))
+	if value == "" || value == "N/A" || value == "NA" {
+		return ""
+	}
+	fields := strings.Fields(value)
+	if len(fields) > 0 {
+		value = fields[len(fields)-1]
+	}
+	if !regexp.MustCompile(`^[A-Z][A-Z0-9.-]{0,9}$`).MatchString(value) {
+		return ""
+	}
+	return value
 }
 
 func htmlTables(document *html.Node) [][][]string {
