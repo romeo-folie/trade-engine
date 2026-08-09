@@ -365,7 +365,7 @@ func parsePositiveFloatLevels(s string) ([]float64, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%q is not a number", p)
 		}
-		if v <= 0 {
+		if v <= 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, fmt.Errorf("value %v must be positive", v)
 		}
 		out = append(out, v)

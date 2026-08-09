@@ -28,7 +28,7 @@ type ExnessCSVClient struct {
 
 	mu       sync.Mutex
 	parseMu  sync.Mutex
-	yearBars map[string][]Candle // key: SYMBOL/YYYY, sanitized 1-minute bars
+	yearBars map[string][]Candle // latest yearly export, or all years for one consolidated symbol
 }
 
 // NewExnessCSVClient creates a local Exness CSV provider. dir defaults to "docs" because the
@@ -93,8 +93,16 @@ func (c *ExnessCSVClient) yearMinuteBarsFor(ctx context.Context, symbol string, 
 	}
 	c.mu.Unlock()
 
-	path := filepath.Join(c.dir, fmt.Sprintf("%s_M1_%04d_exness.csv", symbol, year))
-	raw, err := parseExnessFile(ctx, path, symbol)
+	path, consolidated, err := c.exnessSource(symbol, year)
+	if err != nil {
+		return nil, err
+	}
+	var raw []Candle
+	if consolidated {
+		raw, err = parseExnessFile(ctx, path, symbol)
+	} else {
+		raw, err = parseExnessFile(ctx, path, symbol)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -105,12 +113,84 @@ func (c *ExnessCSVClient) yearMinuteBarsFor(ctx context.Context, symbol string, 
 		c.mu.Unlock()
 		return cached, nil
 	}
-	c.yearBars[key] = bars
+	if consolidated {
+		// Keep one consolidated symbol resident. This bounds memory while allowing
+		// every requested year to reuse the single full-file parse.
+		clear(c.yearBars)
+		for _, bar := range bars {
+			yearKey := fmt.Sprintf("%s/%04d", symbol, bar.Timestamp.Year())
+			c.yearBars[yearKey] = append(c.yearBars[yearKey], bar)
+		}
+		bars = c.yearBars[key]
+	} else {
+		for cachedKey := range c.yearBars {
+			if strings.HasPrefix(cachedKey, symbol+"/") {
+				delete(c.yearBars, cachedKey)
+			}
+		}
+		c.yearBars[key] = bars
+	}
 	c.mu.Unlock()
 	return bars, nil
 }
 
+func (c *ExnessCSVClient) exnessSource(symbol string, year int) (string, bool, error) {
+	yearlyPattern := filepath.Join(c.dir, symbol+"_M1_*_exness.csv")
+	yearlyPaths, err := filepath.Glob(yearlyPattern)
+	if err != nil {
+		return "", false, fmt.Errorf("exness: find yearly exports for %s: %w", symbol, err)
+	}
+	pattern := filepath.Join(c.dir, symbol+"_M1_????????????_????????????.csv")
+	rangePaths, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", false, fmt.Errorf("exness: find consolidated export for %s: %w", symbol, err)
+	}
+	if len(yearlyPaths) > 0 && len(rangePaths) > 0 {
+		return "", false, fmt.Errorf("exness: mixed yearly and consolidated exports for %s in %s; use one layout", symbol, c.dir)
+	}
+	if len(rangePaths) > 1 {
+		return "", false, fmt.Errorf("exness: multiple consolidated M1 exports for %s in %s; remove stale or overlapping files: %s", symbol, c.dir, strings.Join(rangePaths, ", "))
+	}
+	if len(rangePaths) == 1 {
+		from, to, err := consolidatedExnessBounds(rangePaths[0], symbol)
+		if err != nil {
+			return "", false, err
+		}
+		if year < from.Year() || year > to.Year() {
+			return "", false, fmt.Errorf("exness: %s has no coverage for %d (export %s to %s)", symbol, year, from.Format(time.RFC3339), to.Format(time.RFC3339))
+		}
+		return rangePaths[0], true, nil
+	}
+	path := filepath.Join(c.dir, fmt.Sprintf("%s_M1_%04d_exness.csv", symbol, year))
+	if _, err := os.Stat(path); err != nil {
+		return "", false, fmt.Errorf("exness: no yearly or consolidated M1 export for %s/%d in %s: %w", symbol, year, c.dir, err)
+	}
+	return path, false, nil
+}
+
+func consolidatedExnessBounds(path, symbol string) (time.Time, time.Time, error) {
+	name := strings.TrimSuffix(filepath.Base(path), ".csv")
+	prefix := symbol + "_M1_"
+	parts := strings.Split(strings.TrimPrefix(name, prefix), "_")
+	if !strings.HasPrefix(name, prefix) || len(parts) != 2 {
+		return time.Time{}, time.Time{}, fmt.Errorf("exness: invalid consolidated filename %s", path)
+	}
+	from, err := time.Parse("200601021504", parts[0])
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("exness: invalid consolidated start in %s: %w", path, err)
+	}
+	to, err := time.Parse("200601021504", parts[1])
+	if err != nil || to.Before(from) {
+		return time.Time{}, time.Time{}, fmt.Errorf("exness: invalid consolidated end in %s", path)
+	}
+	return from.UTC(), to.UTC(), nil
+}
+
 func parseExnessFile(ctx context.Context, path, symbol string) ([]Candle, error) {
+	return parseExnessFileWindow(ctx, path, symbol, time.Time{}, time.Time{})
+}
+
+func parseExnessFileWindow(ctx context.Context, path, symbol string, from, to time.Time) ([]Candle, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("exness: open %s: %w", path, err)
@@ -148,6 +228,9 @@ func parseExnessFile(ctx context.Context, path, symbol string) ([]Candle, error)
 		ts, err := parseExnessTime(fields[0], fields[1])
 		if err != nil {
 			return nil, fmt.Errorf("exness: %s:%d: %w", path, lineNo, err)
+		}
+		if !from.IsZero() && (ts.Before(from) || !ts.Before(to)) {
+			continue
 		}
 		open, err := strconv.ParseFloat(fields[2], 64)
 		if err != nil {

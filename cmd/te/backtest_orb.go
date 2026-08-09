@@ -38,8 +38,18 @@ var (
 // the backtest cost model when nothing more specific is configured. Commissions and
 // spread dominate ORB economics (PR #359), so these must never be zero.
 var defaultSpreads = map[string]float64{
+	"AUD/CHF": 0.00012,
+	"AUD/JPY": 0.018,
+	"AUD/USD": 0.00010,
+	"EUR/AUD": 0.00016,
+	"EUR/CHF": 0.00014,
+	"EUR/GBP": 0.00012,
 	"EUR/USD": 0.00008,
+	"GBP/AUD": 0.00022,
+	"GBP/CHF": 0.00020,
 	"GBP/USD": 0.00010,
+	"CHF/JPY": 0.020,
+	"USD/CHF": 0.00012,
 	"USD/JPY": 0.012,
 	"EUR/JPY": 0.018,
 	"GBP/JPY": 0.022,
@@ -408,7 +418,11 @@ func resolveBacktestProviderName(cfg *config.Config) string {
 // buildBacktestProvider selects the ORB backtest data source. HistData is the default: free
 // bulk tick ZIPs with no account, API key, or rate limit. The --provider flag overrides config.
 func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) {
-	switch resolveBacktestProviderName(cfg) {
+	return buildBacktestProviderNamed(cfg, resolveBacktestProviderName(cfg), btORBDukaPaceMs)
+}
+
+func buildBacktestProviderNamed(cfg *config.Config, providerName string, dukaPaceMs int) (data.MarketDataProvider, error) {
+	switch strings.ToLower(cmpOr(providerName, "histdata")) {
 	case "histdata":
 		return data.NewHistDataClient(cfg.Markets.HistData.BaseURL, resolveBacktestCacheDir(cfg.Markets.HistData.CacheDir, "histdata-cache"))
 	case "dukascopy":
@@ -416,9 +430,9 @@ func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) 
 			FetchConcurrency:   cfg.Markets.Dukascopy.FetchConcurrency,
 			MinRequestInterval: time.Duration(cfg.Markets.Dukascopy.MinRequestIntervalMs) * time.Millisecond,
 		}
-		if btORBDukaPaceMs > 0 { // --duka-pace-ms: the polite, resumable-fill profile, overrides config
+		if dukaPaceMs > 0 { // --duka-pace-ms: the polite, resumable-fill profile, overrides config
 			opts.FetchConcurrency = 1
-			opts.MinRequestInterval = time.Duration(btORBDukaPaceMs) * time.Millisecond
+			opts.MinRequestInterval = time.Duration(dukaPaceMs) * time.Millisecond
 			opts.RequestTimeout = 60 * time.Second // the feed tarpits bulk fetchers to ~18s; be patient
 		}
 		return data.NewDukascopyClient(cfg.Markets.Dukascopy.BaseURL, resolveBacktestCacheDir(cfg.Markets.Dukascopy.CacheDir, "dukascopy-cache"), cfg.Markets.Dukascopy.PointScale, opts), nil
@@ -427,7 +441,7 @@ func buildBacktestProvider(cfg *config.Config) (data.MarketDataProvider, error) 
 	case "oanda":
 		return buildOANDAProvider(cfg.Markets.OANDA)
 	default:
-		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|exness|oanda)", resolveBacktestProviderName(cfg))
+		return nil, fmt.Errorf("unknown backtest data provider %q (use histdata|dukascopy|exness|oanda)", providerName)
 	}
 }
 
@@ -500,8 +514,8 @@ func researchForexInstruments(configured []config.Instrument) []config.Instrumen
 func researchForexDefaultInstruments() []config.Instrument {
 	defaults := config.Defaults().ForexORB.Instruments
 	exnessFX := []config.Instrument{
-		// JPY-pair PnL is naturally denominated in JPY. Use a static USD conversion
-		// proxy for research sizing/reporting; live broker fills remain the source of truth.
+		// Non-currency-strength backtests still use the legacy static conversion.
+		// Currency strength performs contemporaneous quote-to-USD conversion itself.
 		{Symbol: "USD/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},
 		{Symbol: "EUR/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},
 		{Symbol: "GBP/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, PointValue: 0.007, MaxHoldMinutes: 180},

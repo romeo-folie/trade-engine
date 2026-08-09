@@ -1,11 +1,13 @@
 package views
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
 func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
@@ -52,6 +54,30 @@ func TestRenderCurrencyStrengthViewShowsDedicatedTabAndDecision(t *testing.T) {
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("currency-strength view missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRenderCurrencyStrengthNoSignalExplainsThresholdAndRanking(t *testing.T) {
+	diagnostics, err := json.Marshal(currencystrength.DecisionDiagnostics{
+		Version: 1, Outcome: "no_signal", ReasonCode: "min_gap",
+		Thresholds: currencystrength.DiagnosticThresholds{MinGap: 0.005},
+		Strongest:  "GBP", Weakest: "JPY", Gap: 0.0037,
+		Currencies: []currencystrength.CurrencyDiagnostic{
+			{Currency: "GBP", Score: 0.0021, Votes: 2},
+			{Currency: "JPY", Score: -0.0016, Votes: -2},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := RenderCurrencyStrengthView(CurrencyStrengthViewData{Runs: []store.CurrencyStrengthRun{{
+		SessionDate: time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC),
+		Status:      "no_signal", SkipReason: "min_gap", DecisionDiagnostics: diagnostics,
+	}}}, 140, 20, 0)
+	for _, want := range []string{"strength gap 0.0037 < required 0.0050", "GBP strongest", "JPY weakest"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("detailed no-signal view missing %q:\n%s", want, out)
 		}
 	}
 }

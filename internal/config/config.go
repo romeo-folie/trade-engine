@@ -601,7 +601,8 @@ type HistDataConfig struct {
 // ExnessConfig configures a local Exness MetaTrader OHLC export directory. Data-only; live
 // trading and cost assumptions still come from the configured broker/execution model.
 type ExnessConfig struct {
-	// DataDir contains files named like XAUUSD_M1_2024_exness.csv. Empty defaults to docs.
+	// DataDir contains yearly XAUUSD_M1_2024_exness.csv files or consolidated
+	// XAUUSD_M1_YYYYMMDDHHMM_YYYYMMDDHHMM.csv range exports. Empty defaults to docs.
 	DataDir string `yaml:"data_dir"`
 }
 
