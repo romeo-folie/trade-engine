@@ -318,7 +318,12 @@ func SavePoliticalDisclosureReport(
 				evidence=EXCLUDED.evidence,
 				promotion_status=CASE
 					WHEN political_disclosure_candidates.promotion_status='superseded' THEN 'pending'
-					ELSE political_disclosure_candidates.promotion_status END`,
+					ELSE political_disclosure_candidates.promotion_status END,
+				promotion_claim_token=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_claim_token END,
+				promotion_claimed_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_claimed_at END,
+				scanner_run_id=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.scanner_run_id END,
+				promoted_at=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promoted_at END,
+				promotion_reason=CASE WHEN political_disclosure_candidates.promotion_status='superseded' THEN NULL ELSE political_disclosure_candidates.promotion_reason END`,
 			reportID, ticker, len(group.transactions), group.latest, evidence,
 		)
 		if err != nil {

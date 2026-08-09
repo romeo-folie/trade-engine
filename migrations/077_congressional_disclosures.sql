@@ -67,6 +67,10 @@ CREATE INDEX idx_political_disclosure_candidates_pending
     ON political_disclosure_candidates (latest_transaction_date DESC, ticker)
     WHERE promotion_status = 'pending';
 
+CREATE INDEX idx_political_disclosure_candidates_processing_claim
+    ON political_disclosure_candidates (promotion_claim_token, ticker)
+    WHERE promotion_status = 'processing';
+
 ALTER TABLE scanner_candidate_snapshots
     ADD COLUMN political_disclosure_evidence TEXT;
 

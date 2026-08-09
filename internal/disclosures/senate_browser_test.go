@@ -85,7 +85,7 @@ func TestSenateBrowserProfileLifecycle(t *testing.T) {
 	if err := os.MkdirAll(profile, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(profile, "marker"), []byte("fixture"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(profile, ".tradeengine-senate-profile"), []byte("fixture"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := RemoveSenateBrowserProfile(profile); err != nil {
@@ -93,6 +93,30 @@ func TestSenateBrowserProfileLifecycle(t *testing.T) {
 	}
 	if _, err := os.Stat(profile); !os.IsNotExist(err) {
 		t.Fatalf("profile still exists: %v", err)
+	}
+}
+
+func TestSenateBrowserRejectsUnmarkedExistingProfile(t *testing.T) {
+	profile := filepath.Join(t.TempDir(), "existing-chrome-profile")
+	if err := os.MkdirAll(profile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	personal := filepath.Join(profile, "Bookmarks")
+	if err := os.WriteFile(personal, []byte("personal"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	browser, err := NewSenateChromeTransport(SenateBrowserOptions{BaseURL: "https://efdsearch.senate.gov", ProfileDir: profile})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := browser.startLocked(); err == nil || !strings.Contains(err.Error(), "unmarked pre-existing") {
+		t.Fatalf("error = %v", err)
+	}
+	if _, err := os.Stat(personal); err != nil {
+		t.Fatalf("pre-existing profile was modified: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(profile, ".tradeengine-senate-profile")); !os.IsNotExist(err) {
+		t.Fatalf("marker unexpectedly created: %v", err)
 	}
 }
 

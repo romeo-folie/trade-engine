@@ -61,14 +61,13 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 					if transaction.TransactionType == "purchase" {
 						purchaseCount++
 					}
-					if len(transactionParts) >= 8 {
-						break
+					if len(transactionParts) < 8 {
+						transactionParts = append(transactionParts, fmt.Sprintf(
+							"%s %s %s (%s)", transaction.TransactionType,
+							transaction.TransactionDate.Format("2006-01-02"),
+							transaction.AmountText, transaction.AssetName,
+						))
 					}
-					transactionParts = append(transactionParts, fmt.Sprintf(
-						"%s %s %s (%s)", transaction.TransactionType,
-						transaction.TransactionDate.Format("2006-01-02"),
-						transaction.AmountText, transaction.AssetName,
-					))
 				}
 			}
 			sourceLabel := item.Source
@@ -84,19 +83,12 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 				item.DocumentURL,
 			))
 		}
-		recency := 0.0
-		if !latest.IsZero() {
-			recency = 1 - math.Min(1, math.Max(0, now.Sub(latest).Hours()/(24*float64(maxInt(1, cfg.TTLDays)))))
-		}
-		purchaseSignal := 0.0
-		if transactionCount > 0 {
-			purchaseSignal = float64(purchaseCount) / float64(transactionCount)
-		}
-		corroboration := math.Min(1, float64(len(items))/3)
-		disclosureScore := 0.45*recency + 0.35*purchaseSignal + 0.20*corroboration
+		disclosureScore := scorePoliticalDisclosure(
+			now, cfg.TTLDays, latest, transactionCount, purchaseCount, len(items),
+		)
 		out = append(out, SwingCandidate{
 			Ticker: ticker, Sources: []string{"political_disclosure"},
-			SourceScores:                  map[string]float64{"political_disclosure": 1},
+			SourceScores:                  map[string]float64{"political_disclosure": disclosureScore},
 			PoliticalDisclosureClaimToken: token,
 			PoliticalDisclosureEvidence: disclosureEvidence(
 				transactionCount, parts, transactionParts,
@@ -105,6 +97,24 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 		})
 	}
 	return out, nil
+}
+
+func scorePoliticalDisclosure(
+	now time.Time, ttlDays int, latest time.Time,
+	transactionCount, purchaseCount, filingCount int,
+) float64 {
+	recency := 0.0
+	if !latest.IsZero() {
+		recency = 1 - math.Min(1, math.Max(0,
+			now.Sub(latest).Hours()/(24*float64(maxInt(1, ttlDays))),
+		))
+	}
+	purchaseSignal := 0.0
+	if transactionCount > 0 {
+		purchaseSignal = float64(purchaseCount) / float64(transactionCount)
+	}
+	corroboration := math.Min(1, float64(filingCount)/3)
+	return 0.45*recency + 0.35*purchaseSignal + 0.20*corroboration
 }
 
 func maxInt(a, b int) int {
@@ -141,16 +151,34 @@ func mergePoliticalDisclosureCandidates(
 		fallback := cloneSwingCandidate(*candidate)
 		fallback.politicalDisclosureFallback = nil
 		candidate.politicalDisclosureFallback = &fallback
+		attachPoliticalFallback(candidate.weeklyLeaderFallback, source)
+		attachPoliticalFallback(candidate.potentIndustryFallback, source)
 		candidate.Sources = mergeSources(candidate.Sources, source.Sources)
 		if candidate.SourceScores == nil {
 			candidate.SourceScores = make(map[string]float64)
 		}
-		candidate.SourceScores["political_disclosure"] = 1
+		candidate.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
 		candidate.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
 		candidate.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
 		candidate.PoliticalDisclosureScore = source.PoliticalDisclosureScore
 	}
 	return out
+}
+
+func attachPoliticalFallback(fallback *SwingCandidate, source SwingCandidate) {
+	if fallback == nil {
+		return
+	}
+	copy := cloneSwingCandidate(*fallback)
+	copy.Sources = mergeSources(copy.Sources, source.Sources)
+	if copy.SourceScores == nil {
+		copy.SourceScores = make(map[string]float64)
+	}
+	copy.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
+	copy.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
+	copy.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
+	copy.PoliticalDisclosureScore = source.PoliticalDisclosureScore
+	fallback.politicalDisclosureFallback = &copy
 }
 
 func (s *MarketScanner) markPoliticalDisclosureCandidate(

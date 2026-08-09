@@ -35,7 +35,7 @@ type SenateFiling struct {
 // sees the browser's own cookies and network fingerprint. Tests and the legacy
 // HTTP fallback can leave it unset.
 type SenateTransport interface {
-	SearchPTRs(context.Context, time.Time, time.Time, int) ([]byte, error)
+	SearchPTRs(context.Context, time.Time, time.Time, int, int) ([]byte, error)
 	FetchPTR(context.Context, string) ([]byte, error)
 	Close() error
 }
@@ -65,7 +65,7 @@ func (c *SenateClient) ListPTRs(
 	ctx context.Context, since, until time.Time, maxReports int,
 ) ([]SenateFiling, error) {
 	if c.Transport != nil {
-		body, err := c.Transport.SearchPTRs(ctx, since, until, maxReports)
+		body, err := c.Transport.SearchPTRs(ctx, since, until, 0, maxReports)
 		if err != nil {
 			return nil, err
 		}
@@ -105,25 +105,70 @@ func (c *SenateClient) ListPTRs(
 	return parseSenateSearchResponse(c.BaseURL, body)
 }
 
+type SenateFilingPage struct {
+	Filings         []SenateFiling
+	RowCount, Total int
+}
+
+func (c *SenateClient) ListPTRPage(ctx context.Context, since, until time.Time, start, length int) (SenateFilingPage, error) {
+	var body []byte
+	var err error
+	if c.Transport != nil {
+		body, err = c.Transport.SearchPTRs(ctx, since, until, start, length)
+	} else {
+		// The HTTP fallback retains the existing agreement/session setup and is
+		// uncommon in production; request the prefix and slice the requested page.
+		var all []SenateFiling
+		all, err = c.ListPTRs(ctx, since, until, start+length)
+		if err == nil {
+			if start >= len(all) {
+				return SenateFilingPage{Total: len(all)}, nil
+			}
+			end := start + length
+			if end > len(all) {
+				end = len(all)
+			}
+			return SenateFilingPage{Filings: all[start:end], RowCount: end - start, Total: len(all)}, nil
+		}
+	}
+	if err != nil {
+		return SenateFilingPage{}, err
+	}
+	return parseSenateSearchPage(c.BaseURL, body)
+}
+
 func parseSenateSearchResponse(baseURL string, body []byte) ([]SenateFiling, error) {
+	page, err := parseSenateSearchPage(baseURL, body)
+	return page.Filings, err
+}
+
+func parseSenateSearchPage(baseURL string, body []byte) (SenateFilingPage, error) {
 	var response struct {
-		Data [][]any `json:"data"`
+		Data            [][]any `json:"data"`
+		RecordsFiltered int     `json:"recordsFiltered"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
-		return nil, fmt.Errorf("decode Senate eFD search response: %w", err)
+		return SenateFilingPage{}, fmt.Errorf("decode Senate eFD search response: %w", err)
 	}
 	filings := make([]SenateFiling, 0, len(response.Data))
-	for _, row := range response.Data {
-		cells := make([]string, 0, len(row))
-		for _, value := range row {
-			cells = append(cells, fmt.Sprint(value))
+	if len(response.Data) > 0 {
+		parsed := 0
+		for _, row := range response.Data {
+			cells := make([]string, 0, len(row))
+			for _, value := range row {
+				cells = append(cells, fmt.Sprint(value))
+			}
+			filing, ok := parseSenateSearchRow(baseURL, cells)
+			if ok {
+				filings = append(filings, filing)
+				parsed++
+			}
 		}
-		filing, ok := parseSenateSearchRow(baseURL, cells)
-		if ok {
-			filings = append(filings, filing)
+		if parsed == 0 {
+			return SenateFilingPage{}, fmt.Errorf("Senate eFD returned %d rows but none matched the expected filing shape", len(response.Data))
 		}
 	}
-	return filings, nil
+	return SenateFilingPage{Filings: filings, RowCount: len(response.Data), Total: response.RecordsFiltered}, nil
 }
 
 func (c *SenateClient) FetchPTR(ctx context.Context, filing SenateFiling) (Report, error) {

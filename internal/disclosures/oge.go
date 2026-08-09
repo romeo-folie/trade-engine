@@ -46,72 +46,91 @@ var ogeDate = regexp.MustCompile(`\b\d{1,2}/\d{1,2}/\d{4}\b`)
 func NewOGEClient(base string, timeout time.Duration) *OGEClient {
 	return &OGEClient{BaseURL: strings.TrimRight(base, "/"), HTTP: &http.Client{Timeout: timeout}}
 }
+
+type OGEFilingPage struct {
+	Filings         []OGEFiling
+	RowCount, Total int
+}
+
 func (c *OGEClient) ListFilings(ctx context.Context, since, until time.Time, limit int) ([]OGEFiling, error) {
 	if limit <= 0 {
 		return nil, fmt.Errorf("OGE filing limit must be positive")
 	}
 	out := make([]OGEFiling, 0)
 	start := 0
-	for {
-		if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
-			return out, err
-		}
-		u, err := url.Parse(c.BaseURL)
+	for len(out) < limit {
+		page, err := c.ListFilingsPage(ctx, since, until, start, 100)
 		if err != nil {
 			return out, err
 		}
-		q := u.Query()
-		q.Set("draw", "1")
-		q.Set("start", fmt.Sprint(start))
-		q.Set("length", "100")
-		u.RawQuery = q.Encode()
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
-		resp, err := c.HTTP.Do(req)
-		if err != nil {
-			return out, err
-		}
-		b, readErr := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if readErr != nil {
-			return out, readErr
-		}
-		if resp.StatusCode/100 != 2 {
-			return out, fmt.Errorf("OGE API returned %s", resp.Status)
-		}
-		var page ogePage
-		if err := json.Unmarshal(b, &page); err != nil {
-			return out, err
-		}
-		if len(page.Data) == 0 {
-			break
-		}
-		for _, row := range page.Data {
+		for _, filing := range page.Filings {
 			if len(out) >= limit {
 				break
 			}
-			link := ogePDF.FindString(html.UnescapeString(row.Type))
-			if link == "" {
-				continue
-			}
-			d, _ := time.Parse("2006-01-02T15:04:05", row.DocDate)
-			if d.IsZero() {
-				d, _ = time.Parse("2006-01-02", row.DocDate)
-			}
-			if d.Before(since) || d.After(until) {
-				continue
-			}
-			sum := sha256.Sum256([]byte(link))
-			meta, _ := json.Marshal(row)
-			out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: html.UnescapeString(row.Name), Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type), FilingDate: d, DocumentURL: link, RawMetadata: meta})
+			out = append(out, filing)
 		}
-		start += len(page.Data)
-		if len(out) >= limit || start >= page.RecordsTotal {
+		start += page.RowCount
+		if page.RowCount == 0 || start >= page.Total {
 			break
 		}
 	}
 	return out, nil
 }
+
+func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time, start, length int) (OGEFilingPage, error) {
+	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
+		return OGEFilingPage{}, err
+	}
+	u, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return OGEFilingPage{}, err
+	}
+	q := u.Query()
+	q.Set("draw", "1")
+	q.Set("start", fmt.Sprint(start))
+	q.Set("length", fmt.Sprint(length))
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return OGEFilingPage{}, err
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return OGEFilingPage{}, err
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return OGEFilingPage{}, err
+	}
+	if resp.StatusCode/100 != 2 {
+		return OGEFilingPage{}, fmt.Errorf("OGE API returned %s", resp.Status)
+	}
+	var raw ogePage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return OGEFilingPage{}, err
+	}
+	out := make([]OGEFiling, 0, len(raw.Data))
+	for _, row := range raw.Data {
+		link := ogePDF.FindString(html.UnescapeString(row.Type))
+		if link == "" {
+			continue
+		}
+		d, _ := time.Parse("2006-01-02T15:04:05", row.DocDate)
+		if d.IsZero() {
+			d, _ = time.Parse("2006-01-02", row.DocDate)
+		}
+		if d.Before(since) || d.After(until) {
+			continue
+		}
+		sum := sha256.Sum256([]byte(link))
+		meta, _ := json.Marshal(row)
+		out = append(out, OGEFiling{ExternalID: "oge-" + hex.EncodeToString(sum[:8]), FilerName: html.UnescapeString(row.Name), Office: strings.Trim(strings.Join([]string{row.Title, row.Agency}, " — "), " —"), ReportType: normalizeOGEReportType(row.Type), FilingDate: d, DocumentURL: link, RawMetadata: meta})
+	}
+	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal}, nil
+}
 func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
+	const maxPDFSize = 25 << 20
 	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {
 		return nil, err
 	}
@@ -127,7 +146,17 @@ func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	if resp.StatusCode/100 != 2 {
 		return nil, fmt.Errorf("OGE PDF returned %s", resp.Status)
 	}
-	return io.ReadAll(resp.Body)
+	if resp.ContentLength > maxPDFSize {
+		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxPDFSize)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxPDFSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxPDFSize {
+		return nil, fmt.Errorf("OGE PDF exceeds %d-byte limit", maxPDFSize)
+	}
+	return b, nil
 }
 func normalizeOGEReportType(v string) string {
 	v = stripHTML(html.UnescapeString(v))

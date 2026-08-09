@@ -17,7 +17,7 @@ type fixtureSenateTransport struct {
 }
 
 func (t *fixtureSenateTransport) SearchPTRs(
-	context.Context, time.Time, time.Time, int,
+	context.Context, time.Time, time.Time, int, int,
 ) ([]byte, error) {
 	return t.searchBody, nil
 }

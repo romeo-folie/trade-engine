@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -61,6 +62,16 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	if err != nil || !completed {
 		t.Fatalf("completed=%v err=%v", completed, err)
 	}
+	report2 := report
+	report2.ExternalID = "test-disclosure-claim-2"
+	report2.DocumentURL += "?second=1"
+	if err := store.SavePoliticalDisclosureReport(ctx, report2); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM watchlist WHERE ticker=$1", "TESTDISC")
+		_, _ = store.GetDB().Exec(context.Background(), "DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2", report2.Source, report2.ExternalID)
+	})
 
 	// Freshness is based on the filing date, not the older transaction date.
 	claimed, err := store.ClaimPoliticalDisclosureCandidates(
@@ -69,14 +80,30 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(claimed) != 1 || claimed[0].Ticker != "TESTDISC" ||
+	if len(claimed) != 2 || claimed[0].Ticker != "TESTDISC" ||
 		claimed[0].PromotionClaimToken != "claim-token" {
 		t.Fatalf("claimed = %+v", claimed)
 	}
-	if err := store.MarkPoliticalDisclosurePromotion(
-		ctx, "TESTDISC", "claim-token", "rejected", "",
-		"fixture rejection", now,
-	); err != nil {
+	item := store.WatchlistItem{Ticker: "TESTDISC", Platform: "stock", Strategies: []string{"political_disclosure"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "stale-token"}}, "stale", now)
+	var claimErr *store.ScannerSourcePromotionClaimError
+	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+		t.Fatalf("stale claim error = %v", err)
+	}
+	if err := store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token"}}, "fixture success", now); err != nil {
+		t.Fatal(err)
+	}
+	var promoted int
+	if err := store.GetDB().QueryRow(ctx, "SELECT count(*) FROM political_disclosure_candidates WHERE ticker=$1 AND promotion_status='promoted'", "TESTDISC").Scan(&promoted); err != nil {
+		t.Fatal(err)
+	}
+	if promoted != 2 {
+		t.Fatalf("promoted rows = %d", promoted)
+	}
+	if _, err := store.GetDB().Exec(ctx, "DELETE FROM watchlist WHERE ticker=$1", "TESTDISC"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, "UPDATE political_disclosure_candidates SET promotion_status='rejected' WHERE ticker=$1", "TESTDISC"); err != nil {
 		t.Fatal(err)
 	}
 

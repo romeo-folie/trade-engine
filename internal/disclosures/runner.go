@@ -149,6 +149,7 @@ func (r *Runner) SyncRange(
 	if r.Senate != nil && remaining > 0 {
 		processed, err := r.syncSenate(ctx, since, until, remaining)
 		result.SenateProcessed = processed
+		remaining -= processed
 		if err != nil {
 			failures = append(failures, err)
 		}
@@ -243,41 +244,48 @@ func (r *Runner) saveFailure(
 func (r *Runner) syncSenate(
 	ctx context.Context, since, now time.Time, limit int,
 ) (int, error) {
-	filings, err := r.Senate.ListPTRs(ctx, since, now, limit)
-	if err != nil {
-		return 0, err
-	}
 	processed := 0
 	var failures int
-	for _, filing := range filings {
-		if processed >= limit || ctx.Err() != nil {
+	start, pageSize := 0, 100
+	for processed < limit && ctx.Err() == nil {
+		page, err := r.Senate.ListPTRPage(ctx, since, now, start, pageSize)
+		if err != nil {
+			return processed, err
+		}
+		for _, filing := range page.Filings {
+			if processed >= limit || ctx.Err() != nil {
+				break
+			}
+			completed, err := store.PoliticalDisclosureReportCompleted(ctx, "senate", filing.ExternalID)
+			if err != nil {
+				return processed, err
+			}
+			if completed {
+				continue
+			}
+			processed++
+			report, err := r.Senate.FetchPTR(ctx, filing)
+			if err != nil {
+				failures++
+				failed := Report{
+					Source: "senate", ExternalID: filing.ExternalID, Chamber: "senate",
+					FilerName: filing.FilerName, Office: filing.Office,
+					ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
+					DocumentURL: filing.DocumentURL, ExtractionStatus: "failed",
+					ExtractionError: err.Error(),
+				}
+				if saveErr := saveReport(ctx, failed); saveErr != nil {
+					return processed, saveErr
+				}
+				continue
+			}
+			if err := saveReport(ctx, report); err != nil {
+				return processed, err
+			}
+		}
+		start += page.RowCount
+		if page.RowCount == 0 || (page.Total > 0 && start >= page.Total) {
 			break
-		}
-		completed, err := store.PoliticalDisclosureReportCompleted(ctx, "senate", filing.ExternalID)
-		if err != nil {
-			return processed, err
-		}
-		if completed {
-			continue
-		}
-		processed++
-		report, err := r.Senate.FetchPTR(ctx, filing)
-		if err != nil {
-			failures++
-			failed := Report{
-				Source: "senate", ExternalID: filing.ExternalID, Chamber: "senate",
-				FilerName: filing.FilerName, Office: filing.Office,
-				ReportType: "periodic_transaction", FilingDate: filing.FilingDate,
-				DocumentURL: filing.DocumentURL, ExtractionStatus: "failed",
-				ExtractionError: err.Error(),
-			}
-			if saveErr := saveReport(ctx, failed); saveErr != nil {
-				return processed, saveErr
-			}
-			continue
-		}
-		if err := saveReport(ctx, report); err != nil {
-			return processed, err
 		}
 	}
 	if failures > 0 {
@@ -287,37 +295,48 @@ func (r *Runner) syncSenate(
 }
 
 func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int) (int, error) {
-	filings, err := r.OGE.ListFilings(ctx, since, until, limit)
-	if err != nil {
-		return 0, err
-	}
 	processed, failures := 0, 0
-	for _, filing := range filings {
-		if ctx.Err() != nil {
+	start, pageSize := 0, 100
+	for processed < limit && ctx.Err() == nil {
+		page, err := r.OGE.ListFilingsPage(ctx, since, until, start, pageSize)
+		if err != nil {
+			return processed, err
+		}
+		for _, filing := range page.Filings {
+			if processed >= limit || ctx.Err() != nil {
+				break
+			}
+			completed, err := store.PoliticalDisclosureReportCompleted(ctx, "oge", filing.ExternalID)
+			if err != nil {
+				return processed, err
+			}
+			if completed {
+				continue
+			}
+			processed++
+			pdf, err := r.OGE.FetchPDF(ctx, filing)
+			if err != nil {
+				failures++
+				if saveErr := saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+					return processed, saveErr
+				}
+				continue
+			}
+			pages, err := r.Extractor.Extract(pdf)
+			if err != nil {
+				failures++
+				if saveErr := saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+					return processed, saveErr
+				}
+				continue
+			}
+			if err := saveReport(ctx, ParseOGEPDF(filing, pdf, pages)); err != nil {
+				return processed, err
+			}
+		}
+		start += page.RowCount
+		if page.RowCount == 0 || start >= page.Total {
 			break
-		}
-		completed, err := store.PoliticalDisclosureReportCompleted(ctx, "oge", filing.ExternalID)
-		if err != nil {
-			return processed, err
-		}
-		if completed {
-			continue
-		}
-		processed++
-		pdf, err := r.OGE.FetchPDF(ctx, filing)
-		if err != nil {
-			failures++
-			_ = saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata})
-			continue
-		}
-		pages, err := r.Extractor.Extract(pdf)
-		if err != nil {
-			failures++
-			_ = saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata})
-			continue
-		}
-		if err := saveReport(ctx, ParseOGEPDF(filing, pdf, pages)); err != nil {
-			return processed, err
 		}
 	}
 	if failures > 0 {

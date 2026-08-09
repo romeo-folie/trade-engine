@@ -152,7 +152,11 @@ Rules:
 
 	sb.WriteString("## CANDIDATE\n")
 	sb.WriteString(fmt.Sprintf("Ticker:       %s\n", candidate.Ticker))
-	sb.WriteString(fmt.Sprintf("Price:        %.2f\n", candidate.Price))
+	if candidate.Price > 0 {
+		sb.WriteString(fmt.Sprintf("Price:        %.2f\n", candidate.Price))
+	} else {
+		sb.WriteString("Market data:  unavailable; do not infer price, liquidity, or momentum\n")
+	}
 	if candidate.ChangePct != 0 {
 		sb.WriteString(fmt.Sprintf("Change:       %+.2f%% (%s)\n", candidate.ChangePct, direction))
 	}
@@ -194,7 +198,7 @@ Rules:
 	}
 	if candidate.PoliticalDisclosureEvidence != "" {
 		sb.WriteString(fmt.Sprintf(
-			"Congressional disclosure evidence: %s\n",
+			"Political disclosure evidence: %s\n",
 			candidate.PoliticalDisclosureEvidence,
 		))
 		sb.WriteString(fmt.Sprintf("Political disclosure priority: %.2f (review signal only; does not override conviction/risk gates)\n", candidate.PoliticalDisclosureScore))

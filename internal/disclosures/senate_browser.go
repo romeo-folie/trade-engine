@@ -106,13 +106,13 @@ func NewSenateChromeTransport(opts SenateBrowserOptions) (*SenateChromeTransport
 func (t *SenateChromeTransport) ProfileDir() string { return t.opts.ProfileDir }
 
 func (t *SenateChromeTransport) SearchPTRs(
-	ctx context.Context, since, until time.Time, maxReports int,
+	ctx context.Context, since, until time.Time, start, maxReports int,
 ) ([]byte, error) {
 	if maxReports <= 0 {
 		return nil, fmt.Errorf("Senate browser report limit must be positive")
 	}
 	form := url.Values{
-		"start":                {"0"},
+		"start":                {strconv.Itoa(start)},
 		"length":               {strconv.Itoa(maxReports)},
 		"report_types":         {"[11]"},
 		"filer_types":          {"[]"},
@@ -294,11 +294,27 @@ func (t *SenateChromeTransport) startLocked() error {
 	if t.browserContext != nil {
 		return nil
 	}
+	marker := filepath.Join(t.opts.ProfileDir, ".tradeengine-senate-profile")
+	_, statErr := os.Stat(t.opts.ProfileDir)
+	createdProfile := os.IsNotExist(statErr)
+	if statErr != nil && !createdProfile {
+		return fmt.Errorf("inspect Senate Chrome profile: %w", statErr)
+	}
+	if !createdProfile {
+		if _, err := os.Stat(marker); err != nil {
+			return fmt.Errorf("refusing unmarked pre-existing Senate Chrome profile %q", t.opts.ProfileDir)
+		}
+	}
 	if err := os.MkdirAll(t.opts.ProfileDir, 0o700); err != nil {
 		return fmt.Errorf("create Senate Chrome profile: %w", err)
 	}
 	if err := os.Chmod(t.opts.ProfileDir, 0o700); err != nil {
 		return fmt.Errorf("secure Senate Chrome profile: %w", err)
+	}
+	if createdProfile {
+		if err := os.WriteFile(marker, []byte("trade-engine Senate browser profile\n"), 0o600); err != nil {
+			return err
+		}
 	}
 	allocatorOptions := []chromedp.ExecAllocatorOption{
 		chromedp.NoFirstRun,
@@ -589,6 +605,10 @@ func RemoveSenateBrowserProfile(path string) error {
 	home, _ := os.UserHomeDir()
 	if resolved == string(filepath.Separator) || resolved == "." || resolved == filepath.Clean(home) {
 		return fmt.Errorf("refusing unsafe Senate Chrome profile path %q", resolved)
+	}
+	marker := filepath.Join(resolved, ".tradeengine-senate-profile")
+	if _, err := os.Stat(marker); err != nil {
+		return fmt.Errorf("refusing to remove unmarked Senate profile %q", resolved)
 	}
 	if err := os.RemoveAll(resolved); err != nil {
 		return fmt.Errorf("remove Senate Chrome profile: %w", err)

@@ -13,6 +13,12 @@ var (
 	assetTypePattern    = regexp.MustCompile(`\[([A-Z]{1,5})\]`)
 )
 
+var nonTickerParentheticals = map[string]struct{}{
+	"IRA": {}, "ROTH": {}, "ETF": {}, "ETN": {}, "EIF": {},
+	"LLC": {}, "LP": {}, "L.P": {}, "TRUST": {}, "JOINT": {},
+	"JT": {}, "SP": {}, "DC": {}, "DB": {}, "401K": {},
+}
+
 func parseDate(value string) (time.Time, error) {
 	value = strings.TrimSpace(value)
 	for _, layout := range []string{
@@ -47,10 +53,14 @@ func parseAmount(value string) (*int64, *int64) {
 
 func tickerFromAsset(asset string) string {
 	matches := tickerPattern.FindAllStringSubmatch(strings.ToUpper(asset), -1)
-	if len(matches) == 0 {
-		return ""
+	for i := len(matches) - 1; i >= 0; i-- {
+		candidate := matches[i][1]
+		if _, rejected := nonTickerParentheticals[candidate]; rejected {
+			continue
+		}
+		return candidate
 	}
-	return matches[len(matches)-1][1]
+	return ""
 }
 
 func normalizeTransactionType(value string) string {

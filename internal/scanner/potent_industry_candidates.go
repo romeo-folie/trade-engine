@@ -147,7 +147,7 @@ func candidateAfterPromotionClaimLoss(
 	// rebuilding a partially attributed candidate from them could silently
 	// replace point-in-time price/liquidity evidence. Fail closed and release
 	// the remaining claims at cycle end instead.
-	if candidate.PremarketEpisodicRunID != "" {
+	if candidate.PremarketEpisodicRunID != "" && source != "political_disclosure" {
 		return SwingCandidate{}, false
 	}
 	switch source {

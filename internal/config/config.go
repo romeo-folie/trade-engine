@@ -2800,7 +2800,8 @@ func Validate(cfg *Config) []string {
 			errs = append(errs, prefix+".house.base_url must not be blank")
 		}
 		if disclosures.House.RequestDelayMilliseconds < 0 ||
-			disclosures.Senate.RequestDelayMilliseconds < 0 {
+			disclosures.Senate.RequestDelayMilliseconds < 0 ||
+			disclosures.OGE.RequestDelayMilliseconds < 0 {
 			errs = append(errs, prefix+" source request delays must be >= 0")
 		}
 		if disclosures.Senate.Enabled {
