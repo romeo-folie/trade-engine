@@ -1535,6 +1535,140 @@ func TestManager_StopAtOrAbovePriceForcesMarketExit(t *testing.T) {
 	}
 }
 
+// A restart must not turn the immediately fetched, potentially stale candle
+// into a market sell. Run's private startup sweep leaves the existing HWM and
+// broker stop untouched, then the first ordinary tick re-fetches the inputs
+// and applies the crossed-band exit normally.
+func TestManager_RunDefersCrossedATRExitUntilNextNormalTick(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-pre", Ticker: "AAPL",
+		Side:      string(execution.OrderSideSell),
+		OrderType: string(execution.OrderTypeStop),
+		Quantity:  10, StopPrice: 109, Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{nextFillPrice: 110, nextFillQty: 10, nextStatus: "filled"}
+	m := NewManager(Config{
+		Enabled: true, ATRMultiple: 0.1, Interval: time.Hour,
+		MarketOpen: alwaysOpenSession,
+	}, fs, fp, fb)
+
+	// A pre-cancelled context makes Run return after its synchronous startup
+	// sweep, without waiting for an interval tick.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Run(ctx)
+
+	if got := fs.trades["t1"]; got.Status != "open" || got.HighWaterMark != 200 || got.StopLoss != 109 {
+		t.Fatalf("startup sweep mutated trade = %+v, want open with HWM 200 and stop 109", got)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("startup sweep placed orders: %+v", fb.placed)
+	}
+	if len(fb.cancelled) != 0 {
+		t.Fatalf("startup sweep cancelled protective stop: %v", fb.cancelled)
+	}
+	leg, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || leg == nil || leg.Status != "pending" || leg.StopPrice != 109 {
+		t.Fatalf("startup protection changed: leg=%+v err=%v", leg, err)
+	}
+
+	// An ordinary timer tick with the exact same provider observation is still
+	// stale and must not release the startup deferral.
+	m.UpdateAll(context.Background())
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("identical observation status = %q, want startup deferral to remain open", got)
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("identical observation placed orders: %+v", fb.placed)
+	}
+
+	// Once price/ATR evidence advances, the crossed band is revalidated and may
+	// flatten normally even though it is still the same hourly bar.
+	fp.candles = makeFlatPriceCandles(109, candle(109, 109.5, 108.5, 109))
+	m.UpdateAll(context.Background())
+	if got := fs.trades["t1"].Status; got != "closed" {
+		t.Fatalf("fresh normal tick status = %q, want crossed trail to close trade", got)
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeMarket {
+		t.Fatalf("normal tick orders = %+v, want exactly one market exit", fb.placed)
+	}
+}
+
+// Startup deferral shares the off-hours safety invariant: if an uncapped
+// position has lost its broker leg, restore only the original hard stop. The
+// crossed ATR candidate must never be installed as a stop at/above market.
+func TestManager_StartupDeferralSeedsMissingOriginalStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 200,
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{}
+	m := NewManager(Config{
+		Enabled: true, ATRMultiple: 0.1, Interval: time.Hour,
+		MarketOpen: alwaysOpenSession,
+	}, fs, fp, fb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Run(ctx)
+
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("startup sweep status = %q, want open", got)
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop || fb.placed[0].StopPrice != 95 {
+		t.Fatalf("startup orders = %+v, want original protective stop at 95", fb.placed)
+	}
+	if got := fs.trades["t1"].StopLoss; got != 95 {
+		t.Fatalf("persisted stop = %v, want original hard stop 95", got)
+	}
+}
+
+// The restart safety gate applies only to a crossed-band market exit. A normal
+// startup sweep must still ratchet broker protection immediately; otherwise
+// every restart creates an avoidable full-interval window at the stale stop.
+func TestManager_StartupSweepStillRatchetsNonCrossedStop(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 110,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-old", Ticker: "AAPL",
+		Side:      string(execution.OrderSideSell),
+		OrderType: string(execution.OrderTypeStop),
+		Quantity:  10, StopPrice: 95, Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{}
+	m := NewManager(Config{
+		Enabled: true, ATRMultiple: 2, Interval: time.Hour,
+		MarketOpen: alwaysOpenSession,
+	}, fs, fp, fb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Run(ctx)
+
+	got := fs.trades["t1"]
+	if got.Status != "open" || got.StopLoss <= 95 || got.StopLoss >= 110 {
+		t.Fatalf("startup sweep trade = %+v, want open with ratcheted stop between 95 and market", got)
+	}
+	if len(fb.cancelled) != 1 || fb.cancelled[0] != "broker-old" {
+		t.Fatalf("cancelled = %v, want old broker stop replaced", fb.cancelled)
+	}
+	if len(fb.placed) != 1 || fb.placed[0].Type != execution.OrderTypeStop || fb.placed[0].StopPrice != got.StopLoss {
+		t.Fatalf("startup orders = %+v, want one replacement stop at %v", fb.placed, got.StopLoss)
+	}
+}
+
 // TestManager_ATRDefersMarketExitOutsideRegularSession is the ATR-rule
 // counterpart to TestManager_EMA9HonorsInjectedMarketCalendar.
 //
@@ -1688,7 +1822,7 @@ func TestManager_NewProtectiveStopImmediateFillTransfersOwnership(t *testing.T) 
 	}
 	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
 
-	err := m.updateOne(context.Background(), trade)
+	err := m.updateOne(context.Background(), trade, false)
 	if !errors.Is(err, errStopFilledDuringRollback) {
 		t.Fatalf("error = %v, want immediate-fill sentinel", err)
 	}

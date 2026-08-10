@@ -158,6 +158,114 @@ func TestMatchExitsFromRecords_SLHit(t *testing.T) {
 	}
 }
 
+func TestMatchExitsFromRecords_UniqueBrokerFlattenWinsAwayFromBracket(t *testing.T) {
+	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+		AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5,
+		CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt,
+	}}
+	records := []execution.IBKRTradeRecord{{
+		OrderID: "54071206", Conid: "815824200", Symbol: "MYMU6", Side: "sell",
+		Qty: 3, Price: 54115, FilledAt: entryTime.AddDate(0, 0, 27),
+	}}
+	s := &ORBScheduler{reconciledSessions: map[string]struct{}{}, trackedTrades: map[string]*trackedTrade{}, now: func() time.Time { return records[0].FilledAt.Add(time.Minute) }}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+	if trades[0].Status != "closed" {
+		t.Fatalf("unique broker flatten away from bracket left status %q; want closed", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_AmbiguousAwayFromBracketDoesNotGuess(t *testing.T) {
+	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+		AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5,
+		CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt,
+	}}
+	records := []execution.IBKRTradeRecord{
+		{OrderID: "manual-1", Conid: "815824200", Symbol: "MYMU6", Side: "sell", Qty: 3, Price: 54115, FilledAt: entryTime.Add(time.Hour)},
+		{OrderID: "manual-2", Conid: "815824200", Symbol: "MYMU6", Side: "sell", Qty: 3, Price: 54050, FilledAt: entryTime.Add(2 * time.Hour)},
+	}
+
+	s := &ORBScheduler{reconciledSessions: map[string]struct{}{}, trackedTrades: map[string]*trackedTrade{}}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+	if trades[0].Status != "filled" {
+		t.Fatalf("ambiguous non-bracket fills changed status to %q; want filled", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_StaleUniqueAwayFromBracketDoesNotGuess(t *testing.T) {
+	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+		AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5,
+		CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt,
+	}}
+	record := execution.IBKRTradeRecord{OrderID: "unrelated", Conid: "815824200", Side: "sell", Qty: 3, Price: 54115, FilledAt: entryTime.AddDate(0, 0, 20)}
+	s := &ORBScheduler{now: func() time.Time { return record.FilledAt.Add(time.Hour) }}
+	s.matchExitsFromRecords(context.Background(), trades, []execution.IBKRTradeRecord{record})
+	if trades[0].Status != "filled" {
+		t.Fatalf("stale away-from-bracket fill changed status to %q", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_MissingFuturesPointValueFailsClosed(t *testing.T) {
+	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+		AssetClass: "futures", OwnerScope: "futures_index_orb",
+		CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt,
+	}}
+	records := []execution.IBKRTradeRecord{{
+		OrderID: "54071206", Conid: "815824200", Symbol: "MYMU6", Side: "sell",
+		Qty: 3, Price: 54115, FilledAt: entryTime.Add(time.Hour),
+	}}
+
+	s := &ORBScheduler{reconciledSessions: map[string]struct{}{}, trackedTrades: map[string]*trackedTrade{}, now: func() time.Time { return records[0].FilledAt.Add(time.Minute) }}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+	if trades[0].Status != "filled" {
+		t.Fatalf("missing point_value changed status to %q; want fail-closed filled row", trades[0].Status)
+	}
+}
+
+func TestMatchExitsFromRecords_UnhealthyRowDoesNotBlockHealthySibling(t *testing.T) {
+	entryTime := time.Date(2026, 8, 10, 11, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{
+		{ID: "bad", Ticker: "MYM", ConID: "bad-contract", Side: "buy", Qty: 3,
+			FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+			AssetClass: "futures", OwnerScope: "futures_index_orb",
+			CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt},
+		{ID: "healthy", Ticker: "MNQ", ConID: "healthy-contract", Side: "buy", Qty: 1,
+			FillPrice: 22000, TakeProfit: 22100, StopLoss: 21950, Status: "filled",
+			AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 2,
+			CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt},
+	}
+	records := []execution.IBKRTradeRecord{
+		{Conid: "bad-contract", Side: "sell", Qty: 3, Price: 53500, FilledAt: entryTime.Add(time.Minute)},
+		{Conid: "healthy-contract", Side: "sell", Qty: 1, Price: 22100, FilledAt: entryTime.Add(time.Minute)},
+	}
+	s := &ORBScheduler{now: func() time.Time { return entryTime.Add(2 * time.Minute) }}
+	if ok := s.matchExitsFromRecords(context.Background(), trades, records); !ok {
+		t.Fatal("row-local economics failure reported as a pass-wide failure")
+	}
+	if trades[0].Status != "filled" {
+		t.Fatalf("unhealthy row status = %q; want deferred filled", trades[0].Status)
+	}
+	if trades[1].Status != "closed" {
+		t.Fatalf("healthy sibling status = %q; want closed", trades[1].Status)
+	}
+}
+
 func TestMatchExitsFromRecords_SkipsWrongSymbol(t *testing.T) {
 	entryTime := time.Date(2026, 4, 28, 8, 17, 0, 0, time.UTC)
 	filledAt := entryTime

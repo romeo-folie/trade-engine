@@ -591,7 +591,11 @@ Modes:
 				Cfg:         *futuresCfg,
 			}
 			orbScheduler.SetScanner(futuresScanner)
-			orbScheduler.SetFuturesConfig(futuresCfg)
+			owner := store.ORBOwnerFuturesIndex
+			if isMetals {
+				owner = store.ORBOwnerFuturesMetals
+			}
+			orbScheduler.SetFuturesConfigOwned(futuresCfg, owner)
 
 			// 11. Wire optional news and bus.
 			if newsProvider != nil {
@@ -789,7 +793,7 @@ Modes:
 						MarketData:  ibkrData,
 						Cfg:         cfg.FuturesORB,
 					})
-					futuresScheduler.SetFuturesConfig(&cfg.FuturesORB)
+					futuresScheduler.SetFuturesConfigOwned(&cfg.FuturesORB, store.ORBOwnerFuturesIndex)
 					if newsProvider != nil {
 						futuresScheduler.SetNewsProvider(newsProvider)
 					}

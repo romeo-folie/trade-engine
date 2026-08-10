@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strings"
 
@@ -48,14 +49,41 @@ func signedPositionFor(positions []execution.Position, ticker string) float64 {
 // the phantom that stranded today's unprotected XAG short. Built once per reconcile pass so
 // the position read is shared across all candidate closes.
 type exitGuard struct {
-	active     bool               // forex/metals scheduler with a positions read attempted
-	readFailed bool               // positions read failed → fail CLOSED against fabrication
-	net        map[string]float64 // ticker → signed broker position
-	managed    map[string]int     // "ticker|side" → total open (filled) qty at pass start
-	claimed    map[string]int     // "ticker|side" → qty already approved-to-close THIS pass
+	active     bool                // forex/metals scheduler with a positions read attempted
+	readFailed bool                // positions read failed → fail CLOSED against fabrication
+	net        map[string]float64  // ticker → signed broker position
+	managed    map[string]int      // "ticker|side" → total open (filled) qty at pass start
+	claimed    map[string]int      // "ticker|side" → qty already approved-to-close THIS pass
+	ambiguous  map[string]struct{} // tickers with mixed legacy/durable identity; fail closed locally
 }
 
-func managedKey(ticker, side string) string { return ticker + "|" + strings.ToLower(side) }
+type exitGuardCode uint8
+
+const (
+	guardAllow exitGuardCode = iota
+	guardBrokerStillHeld
+	guardReadFailed
+	guardInvalidManagedBudget
+	guardAmbiguousIdentity
+)
+
+type exitGuardDecision struct {
+	Code      exitGuardCode
+	BrokerNet float64
+	Managed   int
+	Closing   int
+}
+
+func positionIdentity(ticker, conID string) string {
+	if conID != "" {
+		return "conid:" + conID
+	}
+	return "ticker:" + ticker
+}
+
+func managedKey(ticker, conID, side string) string {
+	return positionIdentity(ticker, conID) + "|" + strings.ToLower(side)
+}
 
 // newExitGuard reads live positions once and precomputes the managed open qty per side.
 // Active for forex AND futures schedulers (both place dual-sided/split brackets that the
@@ -83,22 +111,47 @@ func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
 		slog.Warn("orb: exit guard: account-wide filled-trades read failed — deferring inference-based closes", "err", err)
 		return &exitGuard{active: true, readFailed: true}
 	}
-	positions = s.ownedPositions(positions)
+	owned := s.ownedTradeRows(filled)
+	ambiguous := mixedIdentityTickers(owned)
+	positions = positionsForOwnedTrades(positions, owned)
 	net := make(map[string]float64)
 	for _, p := range positions {
-		net[p.Ticker] += p.Quantity
+		net[positionIdentity(p.Ticker, p.ConID)] += p.Quantity
 	}
 	managed := make(map[string]int)
-	for i := range filled {
-		// Scope to THIS scheduler's rows (asset-class aware): the read is account-wide so a
-		// same-instrument position in another session is still counted, but an equity row that
-		// shares a futures root symbol must not inflate the futures budget and rubber-stamp a
-		// close of a still-held futures position.
-		if filled[i].Status == "filled" && s.ownsTradeRow(filled[i]) {
-			managed[managedKey(filled[i].Ticker, filled[i].Side)] += filled[i].Qty
+	for i := range owned {
+		if owned[i].Status == "filled" {
+			managed[managedKey(owned[i].Ticker, owned[i].ConID, owned[i].Side)] += owned[i].Qty
 		}
 	}
-	return &exitGuard{active: true, net: net, managed: managed, claimed: make(map[string]int)}
+	return &exitGuard{active: true, net: net, managed: managed, claimed: make(map[string]int), ambiguous: ambiguous}
+}
+
+func hasMixedLegacyAndDurableIdentity(trades []store.ORBTrade) bool {
+	return len(mixedIdentityTickers(trades)) > 0
+}
+
+func mixedIdentityTickers(trades []store.ORBTrade) map[string]struct{} {
+	type identityState uint8
+	const (
+		legacy identityState = 1 << iota
+		durable
+	)
+	byTicker := make(map[string]identityState)
+	for _, t := range trades {
+		state := legacy
+		if t.ConID != "" {
+			state = durable
+		}
+		byTicker[t.Ticker] |= state
+	}
+	out := make(map[string]struct{})
+	for ticker, state := range byTicker {
+		if state == legacy|durable {
+			out[ticker] = struct{}{}
+		}
+	}
+	return out
 }
 
 // allows reports whether trade t's close may be recorded, and — when it returns true —
@@ -107,18 +160,64 @@ func (s *ORBScheduler) newExitGuard(ctx context.Context) *exitGuard {
 // pyramided legs would both pass the identical static check even though the broker reduced by
 // only one (re-approving the very phantom this guards against). A disabled guard allows; a
 // failed read blocks (fail closed).
-func (g *exitGuard) allows(t *store.ORBTrade) bool {
+func (g *exitGuard) check(t *store.ORBTrade) exitGuardDecision {
 	if !g.active {
-		return true
+		return exitGuardDecision{Code: guardAllow, Closing: t.Qty}
 	}
 	if g.readFailed {
-		return false
+		return exitGuardDecision{Code: guardReadFailed, Closing: t.Qty}
 	}
-	key := managedKey(t.Ticker, t.Side)
+	if _, ambiguous := g.ambiguous[t.Ticker]; ambiguous {
+		return exitGuardDecision{Code: guardAmbiguousIdentity, Closing: t.Qty}
+	}
+	key := managedKey(t.Ticker, t.ConID, t.Side)
 	remaining := g.managed[key] - g.claimed[key]
-	if !exitConsistentWithBroker(t.Side, g.net[t.Ticker], remaining, t.Qty) {
-		return false
+	d := exitGuardDecision{BrokerNet: g.net[positionIdentity(t.Ticker, t.ConID)], Managed: remaining, Closing: t.Qty}
+	if remaining < t.Qty {
+		d.Code = guardInvalidManagedBudget
+		return d
+	}
+	if !exitConsistentWithBroker(t.Side, d.BrokerNet, remaining, t.Qty) {
+		d.Code = guardBrokerStillHeld
+		return d
 	}
 	g.claimed[key] += t.Qty
-	return true
+	d.Code = guardAllow
+	return d
+}
+
+func (s *ORBScheduler) checkExitGuard(g *exitGuard, t *store.ORBTrade) exitGuardDecision {
+	d := g.check(t)
+	if d.Code == guardAllow {
+		delete(s.alertedGuardBlocks, t.ID)
+	}
+	return d
+}
+
+func (s *ORBScheduler) reportGuardBlock(ctx context.Context, stage string, t *store.ORBTrade, d exitGuardDecision) {
+	switch d.Code {
+	case guardBrokerStillHeld:
+		slog.Warn("orb: exit guard: broker still holds position — deferring close",
+			"stage", stage, "ticker", t.Ticker, "side", t.Side, "qty", t.Qty,
+			"broker_net", d.BrokerNet, "managed", d.Managed)
+	case guardInvalidManagedBudget:
+		slog.Error("orb: exit guard: row is outside managed ownership budget — deferring and alerting as orphan",
+			"stage", stage, "trade_id", t.ID, "ticker", t.Ticker, "side", t.Side,
+			"closing_qty", d.Closing, "managed_qty", d.Managed, "owner_scope", t.OwnerScope)
+		if s.alertedGuardBlocks == nil {
+			s.alertedGuardBlocks = make(map[string]struct{})
+		}
+		if _, alerted := s.alertedGuardBlocks[t.ID]; !alerted {
+			s.alertedGuardBlocks[t.ID] = struct{}{}
+			s.notify(ctx, fmt.Sprintf(
+				"⚠️ *ORB orphan row*: `%s` %s %d has managed budget %d in `%s`; close deferred for investigation.",
+				t.Ticker, t.Side, t.Qty, d.Managed, stage))
+		}
+	case guardReadFailed:
+		// The read failure was logged where the guard was built. Callers only need
+		// to preserve retry semantics.
+	case guardAmbiguousIdentity:
+		slog.Error("orb: exit guard: mixed legacy and durable contract identity — deferring affected ticker",
+			"stage", stage, "trade_id", t.ID, "ticker", t.Ticker)
+	}
 }

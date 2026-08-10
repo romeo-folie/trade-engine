@@ -18,6 +18,13 @@ type TradesFetcher interface {
 	FetchTradeRecords(ctx context.Context, days int) ([]execution.IBKRTradeRecord, error)
 }
 
+// ContractIDResolver exposes the exact broker contract selected for a symbol.
+// Persisting it lets reconciliation retain ownership after the symbol leaves
+// configuration and the broker cache is rebuilt on restart.
+type ContractIDResolver interface {
+	ResolveContractID(ctx context.Context, symbol, secType string) (string, error)
+}
+
 // BracketParams holds the computed bracket order parameters.
 type BracketParams struct {
 	Ticker     string

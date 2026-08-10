@@ -30,6 +30,13 @@ func (b *IBKRBroker) resolveConid(ctx context.Context, symbol string, secType st
 	return b.resolveConidForex(ctx, symbol, secType)
 }
 
+// ResolveContractID exposes the exact broker contract identity to lifecycle
+// stores after order placement. Resolution uses the same cache/static map as
+// PlaceOrder, so the usual post-placement call does not add a gateway lookup.
+func (b *IBKRBroker) ResolveContractID(ctx context.Context, symbol, secType string) (string, error) {
+	return b.resolveConid(ctx, symbol, secType)
+}
+
 // resolveConidForex resolves forex/CFD conids (CASH, CFD secTypes).
 func (b *IBKRBroker) resolveConidForex(ctx context.Context, pair string, secType string) (string, error) {
 	// 1. Hardcoded map.

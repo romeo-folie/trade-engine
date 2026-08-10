@@ -42,6 +42,22 @@ func TestSchedulerFuturesMode_IsFuturesMode(t *testing.T) {
 	}
 }
 
+func TestSchedulerFuturesOwnerComesFromLaunchModeNotInstrumentList(t *testing.T) {
+	empty := &config.FuturesORBConfig{Enabled: true}
+	s := newTestScheduler()
+	s.SetFuturesConfigOwned(empty, store.ORBOwnerFuturesMetals)
+	if got := s.ownerScope(); got != store.ORBOwnerFuturesMetals {
+		t.Fatalf("empty metals launch owner = %q; want durable metals owner", got)
+	}
+
+	mixed := *testFuturesCfg
+	mixed.Instruments = append(append([]config.FuturesInstrument(nil), mixed.Instruments...), config.FuturesInstrument{Symbol: "GC", AssetClass: "metal"})
+	s.SetFuturesConfigOwned(&mixed, store.ORBOwnerFuturesIndex)
+	if got := s.ownerScope(); got != store.ORBOwnerFuturesIndex {
+		t.Fatalf("mixed index launch owner = %q; want explicit index owner", got)
+	}
+}
+
 func TestSchedulerFuturesMode_NotForexMode(t *testing.T) {
 	s := newTestScheduler()
 	s.SetFuturesConfig(testFuturesCfg)
@@ -322,21 +338,20 @@ func TestSchedulerFutures_ExitBackstopScoping(t *testing.T) {
 		t.Errorf("MNQ secType = %q; want FUT", got)
 	}
 
-	// ownedPositions: keeps this scheduler's futures positions (resolved to symbols by
-	// reverseConid), drops others — so the exit guard counts them against the managed budget.
+	// Durable trade identity keeps the scheduler's futures positions and drops others.
 	positions := []execution.Position{
 		{Ticker: "MNQ", Quantity: 2},
 		{Ticker: "MES", Quantity: -1},
 		{Ticker: "AAPL", Quantity: 100},    // equities scheduler's — must be dropped
 		{Ticker: "747387490", Quantity: 3}, // an UNRESOLVED conid (belt-and-suspenders) — dropped
 	}
-	owned := s.ownedPositions(positions)
+	owned := positionsForOwnedTrades(positions, []store.ORBTrade{{Ticker: "MNQ"}, {Ticker: "MES"}})
 	if len(owned) != 2 {
-		t.Fatalf("ownedPositions kept %d; want 2 (MNQ, MES)", len(owned))
+		t.Fatalf("positionsForOwnedTrades kept %d; want 2 (MNQ, MES)", len(owned))
 	}
 	for _, p := range owned {
 		if p.Ticker != "MNQ" && p.Ticker != "MES" {
-			t.Errorf("ownedPositions kept unexpected %q", p.Ticker)
+			t.Errorf("positionsForOwnedTrades kept unexpected %q", p.Ticker)
 		}
 	}
 }
@@ -355,7 +370,7 @@ func TestSchedulerFutures_OwnsTradeRow_AssetClassCollision(t *testing.T) {
 
 	futuresES := store.ORBTrade{Ticker: "ES", AssetClass: "futures"}
 	equityES := store.ORBTrade{Ticker: "ES", AssetClass: "equity"}  // Eversource stock, same string
-	otherFut := store.ORBTrade{Ticker: "GC", AssetClass: "futures"} // not configured here
+	otherFut := store.ORBTrade{Ticker: "GC", AssetClass: "futures"} // removed from config, still durably owned
 
 	if !s.ownsTradeRow(futuresES) {
 		t.Error("futures-tagged ES must be owned")
@@ -363,22 +378,23 @@ func TestSchedulerFutures_OwnsTradeRow_AssetClassCollision(t *testing.T) {
 	if s.ownsTradeRow(equityES) {
 		t.Error("equity ES must NOT be owned by the futures scheduler (collision guard)")
 	}
-	if s.ownsTradeRow(otherFut) {
-		t.Error("GC future is not configured — must not be owned")
+	if !s.ownsTradeRow(otherFut) {
+		t.Error("deconfigured GC future must remain owned until its open row is terminal")
 	}
 
 	// ownedTradeRows filters and does not mutate the input.
 	rows := []store.ORBTrade{futuresES, equityES, otherFut}
 	owned := s.ownedTradeRows(rows)
-	if len(owned) != 1 || owned[0].Ticker != "ES" || owned[0].AssetClass != "futures" {
-		t.Errorf("ownedTradeRows = %+v; want just the futures ES", owned)
+	if len(owned) != 2 || owned[0].Ticker != "ES" || owned[1].Ticker != "GC" {
+		t.Errorf("ownedTradeRows = %+v; want both durable futures rows", owned)
 	}
 
-	// Forex mode: tradeAssetClass empty (rows default to equity), scoping by ownsInstrument.
+	// Forex mode stamps durable identity on new rows while still adopting legacy
+	// slash-ticker rows that predate the asset-class migration.
 	fs := newTestScheduler()
 	fs.SetForexConfig(&config.ForexORBConfig{Enabled: true, Instruments: []config.Instrument{{Symbol: "EUR/USD"}}})
-	if fs.tradeAssetClass() != "" {
-		t.Errorf("tradeAssetClass in forex mode = %q; want empty", fs.tradeAssetClass())
+	if fs.tradeAssetClass() != "forex" {
+		t.Errorf("tradeAssetClass in forex mode = %q; want forex", fs.tradeAssetClass())
 	}
 	if !fs.ownsTradeRow(store.ORBTrade{Ticker: "EUR/USD", AssetClass: "equity"}) {
 		t.Error("forex EUR/USD row must be owned in forex mode")

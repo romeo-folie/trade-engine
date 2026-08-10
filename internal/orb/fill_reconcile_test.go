@@ -132,10 +132,34 @@ func TestAvgCostFor(t *testing.T) {
 		{Ticker: "XAU/USD", AvgCostBasis: 4137.2},
 		{Ticker: "XAG/USD", AvgCostBasis: 60.1},
 	}
-	if got := avgCostFor(positions, "XAG/USD"); got != 60.1 {
+	if got := avgCostFor(positions, "XAG/USD", ""); got != 60.1 {
 		t.Errorf("avgCostFor XAG/USD = %v, want 60.1", got)
 	}
-	if got := avgCostFor(positions, "MISSING"); got != 0 {
+	if got := avgCostFor(positions, "MISSING", ""); got != 0 {
 		t.Errorf("missing ticker should return 0, got %v", got)
+	}
+}
+
+func TestFillReconcileKeepsFuturesExpiriesSeparate(t *testing.T) {
+	positions := []execution.Position{
+		{Ticker: "MYM", ConID: "old", Quantity: 2, AvgCostBasis: 42000},
+		{Ticker: "MYM", ConID: "new", Quantity: 3, AvgCostBasis: 43000},
+	}
+	filled := []store.ORBTrade{{Ticker: "MYM", ConID: "old", Side: "buy", Qty: 2}}
+	pending := []store.ORBTrade{
+		{Ticker: "MYM", ConID: "old", Side: "buy", Qty: 3, OrderID: "wrong-expiry"},
+		{Ticker: "MYM", ConID: "new", Side: "buy", Qty: 3, OrderID: "right-expiry"},
+	}
+
+	findings := findOrphanedPositions(positions, filled, orphanPositionTolerance)
+	if len(findings) != 1 || findings[0].ConID != "new" {
+		t.Fatalf("findings = %+v; want only new expiry", findings)
+	}
+	matched := matchOrphanEntries(findings[0], pending, orphanPositionTolerance)
+	if len(matched) != 1 || matched[0].OrderID != "right-expiry" {
+		t.Fatalf("matched = %v; want right-expiry", ids(matched))
+	}
+	if got := avgCostFor(positions, findings[0].Ticker, findings[0].ConID); got != 43000 {
+		t.Fatalf("fill cost = %v; want new-expiry cost 43000", got)
 	}
 }

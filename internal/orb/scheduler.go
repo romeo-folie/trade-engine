@@ -151,12 +151,16 @@ type ORBScheduler struct {
 	alertedOrphanLegs       map[string]struct{}      // order IDs already alerted as unprovable orphans (de-dups notifications)
 	lastOrphanPosCheckAt    time.Time                // wall time of the last broker-position orphan detection
 	alertedOrphanPositions  map[string]struct{}      // tickers already alerted as unmanaged broker positions (re-armed on resolve)
-	lastOrphanFillReconcile time.Time                // wall time of the last broker-truth entry-fill reconcile
-	directionDecisions      map[string][2]bool       // ticker → [longEligible, shortEligible], latched at the first executing tick
-	lastScan                time.Time                // Eastern Time of the last successful scan
-	fetchFailures           map[string]int           // ticker → consecutive candle-fetch failures
-	fetchLastAttempt        map[string]time.Time     // ticker → wall time of last candle-fetch attempt
-	optionsAttempted        map[string]bool          // ticker → the session's single options-ORB breakout entry has been spent (parity with the backtest's one as-of gate eval; prevents re-eval after a gate abort)
+	lastRowHealthCheckAt    time.Time
+	alertedRowHealth        map[string]struct{}  // tradeID|finding code, de-duped until repaired
+	alertedGuardBlocks      map[string]struct{}  // tradeID, invalid managed-budget alert de-dupe
+	lastOrphanFillReconcile time.Time            // wall time of the last broker-truth entry-fill reconcile
+	directionDecisions      map[string][2]bool   // ticker → [longEligible, shortEligible], latched at the first executing tick
+	lastScan                time.Time            // Eastern Time of the last successful scan
+	fetchFailures           map[string]int       // ticker → consecutive candle-fetch failures
+	fetchLastAttempt        map[string]time.Time // ticker → wall time of last candle-fetch attempt
+	optionsAttempted        map[string]bool      // ticker → the session's single options-ORB breakout entry has been spent (parity with the backtest's one as-of gate eval; prevents re-eval after a gate abort)
+	owner                   string               // durable lifecycle owner, assigned by the launcher/config mode
 }
 
 // trackedTrade holds per-order context needed to observe the full trade lifecycle.
@@ -175,7 +179,9 @@ type trackedTrade struct {
 	// breakout level while the fill is the option PREMIUM — orders of magnitude apart
 	// — so the sanitizer must be skipped or it would overwrite a $2 premium with the
 	// $550 underlying level and corrupt all downstream P&L.
-	isOption bool
+	isOption   bool
+	pointValue float64
+	conID      string
 }
 
 // NewORBScheduler creates a new ORB scheduler.
@@ -208,8 +214,11 @@ func NewORBScheduler(
 		fetchLastAttempt:       make(map[string]time.Time),
 		alertedOrphanLegs:      make(map[string]struct{}),
 		alertedOrphanPositions: make(map[string]struct{}),
+		alertedRowHealth:       make(map[string]struct{}),
+		alertedGuardBlocks:     make(map[string]struct{}),
 		pendingOptionExits:     make(map[string]pendingExit),
 		directionDecisions:     make(map[string][2]bool),
+		owner:                  store.ORBOwnerEquity,
 	}
 }
 
@@ -235,12 +244,21 @@ func (s *ORBScheduler) SetScanner(scanner CandidateScanner) {
 // Call before Run to switch the scheduler from equities to forex session timing.
 func (s *ORBScheduler) SetForexConfig(cfg *config.ForexORBConfig) {
 	s.forexCfg = cfg
+	s.owner = store.ORBOwnerForex
 }
 
 // SetFuturesConfig enables futures mode with the given configuration.
 // Call before Run to switch the scheduler from equities to futures session timing.
 func (s *ORBScheduler) SetFuturesConfig(cfg *config.FuturesORBConfig) {
+	s.SetFuturesConfigOwned(cfg, store.ORBOwnerFuturesIndex)
+}
+
+// SetFuturesConfigOwned assigns futures entry configuration and the durable
+// lifecycle owner independently. Launch mode, not today's instrument list,
+// determines whether the scheduler owns index or metals rows.
+func (s *ORBScheduler) SetFuturesConfigOwned(cfg *config.FuturesORBConfig, owner string) {
 	s.futuresCfg = cfg
+	s.owner = owner
 }
 
 // isFuturesMode reports whether the scheduler is running in futures mode.
@@ -273,6 +291,19 @@ func (s *ORBScheduler) pointValueForTicker(ticker string) float64 {
 	return PointValueForTicker(s.futuresCfg.Instruments, ticker)
 }
 
+// pointValueForTrade resolves realised-P&L identity from the durable row. A
+// futures close must never silently fall back to the forex-shaped $1/point
+// default after its instrument leaves configuration.
+func (s *ORBScheduler) pointValueForTrade(t store.ORBTrade) (float64, error) {
+	if strings.HasPrefix(t.OwnerScope, "futures_") || t.AssetClass == "futures" {
+		if t.PointValue <= 0 {
+			return 0, fmt.Errorf("futures trade %s (%s) has no durable point_value", t.ID, t.Ticker)
+		}
+		return t.PointValue, nil
+	}
+	return 1, nil
+}
+
 // SetFeedbackConfig wires feedback configuration for ORB prompt enrichment.
 // Call before Run. If not called, prompt enrichment is disabled.
 func (s *ORBScheduler) SetFeedbackConfig(cfg *config.FeedbackConfig) {
@@ -295,6 +326,21 @@ func (s *ORBScheduler) sessionName() string {
 		return s.forexCfg.Session
 	}
 	return ""
+}
+
+func (s *ORBScheduler) ownerScope() string {
+	if s.owner != "" {
+		return s.owner
+	}
+	// Compatibility for tests/embedders that construct the scheduler directly.
+	// Production launchers assign futures ownership explicitly.
+	if s.isFuturesMode() {
+		return store.ORBOwnerFuturesIndex
+	}
+	if s.isForexMode() {
+		return store.ORBOwnerForex
+	}
+	return store.ORBOwnerEquity
 }
 
 // instrumentForTicker returns the Instrument config for the given ticker symbol,
@@ -379,16 +425,24 @@ func (s *ORBScheduler) effectiveMaxHoldMinutes(ticker string) int {
 	return s.effectiveForexCfg().MaxHoldMinutes
 }
 
+func (s *ORBScheduler) persistedMaxHoldMinutes(ticker string) *int {
+	value := s.effectiveMaxHoldMinutes(ticker)
+	return &value
+}
+
 // tradeAssetClass is the asset_class to stamp on orb_trades rows this scheduler places.
-// "futures" in futures mode; "" otherwise (CreateORBTrade defaults it to "equity", so
-// forex/equity tagging is unchanged). Futures roots are BARE symbols (ES, NQ) that can
+// "futures" in futures mode, "forex" in forex mode, and "equity" otherwise.
+// Futures roots are BARE symbols (ES, NQ) that can
 // collide with a real equity ticker (ES = Eversource), so the tag is what lets the
 // account-wide exit/fill reconcilers tell a futures ES row from an equity ES row.
 func (s *ORBScheduler) tradeAssetClass() string {
 	if s.isFuturesMode() {
 		return "futures"
 	}
-	return ""
+	if s.isForexMode() {
+		return "forex"
+	}
+	return "equity"
 }
 
 // placeAndTrackBracket places one bracket, records its orb_trades row, and starts
@@ -406,6 +460,15 @@ func (s *ORBScheduler) placeAndTrackBracket(ctx context.Context, sessionID, tick
 	if parentDBID != "" {
 		parentPtr = &parentDBID
 	}
+	var conID string
+	if resolver, ok := s.executor.(ContractIDResolver); ok {
+		resolved, resolveErr := resolver.ResolveContractID(ctx, ticker, params.SecType)
+		if resolveErr != nil {
+			slog.Warn("orb: contract identity resolution failed — row will be health-alertable", "ticker", ticker, "err", resolveErr)
+		} else {
+			conID = resolved
+		}
+	}
 	dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
 		SessionID:        sessionID,
 		Ticker:           ticker,
@@ -417,6 +480,10 @@ func (s *ORBScheduler) placeAndTrackBracket(ctx context.Context, sessionID, tick
 		OrderID:          orderID,
 		Status:           "pending",
 		AssetClass:       s.tradeAssetClass(),
+		OwnerScope:       s.ownerScope(),
+		PointValue:       s.pointValueForTicker(ticker),
+		MaxHoldMinutes:   s.persistedMaxHoldMinutes(ticker),
+		ConID:            conID,
 		TpOrderID:        tpID,
 		SlOrderID:        slID,
 		ScaleOutRole:     role,
@@ -429,7 +496,7 @@ func (s *ORBScheduler) placeAndTrackBracket(ctx context.Context, sessionID, tick
 	s.trackedTrades[orderID] = &trackedTrade{
 		dbID: dbID, tpOrderID: tpID, slOrderID: slID,
 		side: side, ticker: ticker, qty: params.Qty,
-		entryStop: params.EntryStop,
+		entryStop: params.EntryStop, pointValue: s.pointValueForTicker(ticker), conID: conID,
 	}
 	label := ticker
 	if role != "" {
@@ -440,18 +507,18 @@ func (s *ORBScheduler) placeAndTrackBracket(ctx context.Context, sessionID, tick
 	return orderID, dbID
 }
 
-// ownsTradeRow reports whether an orb_trades row belongs to this scheduler — used to scope
-// the ACCOUNT-WIDE exit-guard and fill reconcilers (which must stay account-wide across
-// sessions for the same instrument, but must NOT count a different asset class). In futures
-// mode a row must be tagged "futures" AND name a configured contract, so an equity row that
-// shares a futures root symbol (equity ES vs futures ES) can't inflate the futures budget or
-// falsely explain a held futures position. In forex mode ownsInstrument alone suffices —
-// forex tickers ("BASE/QUOTE") never match a bare futures/equity symbol.
+// ownsTradeRow reports durable lifecycle ownership. Entry eligibility comes from
+// the current instrument config; ownership must not. Otherwise removing MYM from
+// tomorrow's universe also removes the only scheduler capable of reconciling an
+// already-open MYM row. OwnerScope is populated by migration 079. The asset-class
+// fallback keeps pre-migration/unit-test values safe and still distinguishes the
+// equity ticker ES from the ES futures contract.
 func (s *ORBScheduler) ownsTradeRow(t store.ORBTrade) bool {
-	if s.isFuturesMode() {
-		return t.AssetClass == "futures" && s.ownsInstrument(t.Ticker)
+	if t.OwnerScope != "" {
+		return t.OwnerScope == s.ownerScope()
 	}
-	return s.ownsInstrument(t.Ticker)
+	return t.AssetClass == s.tradeAssetClass() ||
+		(s.isForexMode() && strings.Contains(t.Ticker, "/"))
 }
 
 // ownedTradeRows returns the subset of rows this scheduler owns (see ownsTradeRow), so the
@@ -695,6 +762,7 @@ func (s *ORBScheduler) tick(ctx context.Context) error {
 	// (the July metals-short orphan shape — filled at the broker, 'cancelled' in
 	// the DB, invisible to every status='filled' reconciler). Places no orders.
 	s.detectOrphanedPositions(ctx)
+	s.detectUnhealthyORBRows(ctx)
 
 	// Cancel a split-bracket entry that never filled once its sibling has already exited: the
 	// logical trade is over, so a still-pending entry must not fill on a breakout retest and
@@ -744,18 +812,17 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 
 	// Sweep any prior-day sessions that never reached "done" — e.g. because the
 	// process was killed before the cleanup window fired.
-	if err := store.MarkStaleORBSessionsDone(ctx, s.db, today, s.sessionName()); err != nil {
+	if err := store.MarkStaleORBSessionsDoneOwned(ctx, s.db, today, s.sessionName(), s.ownerScope()); err != nil {
 		slog.Warn("orb: mark stale sessions done failed", "err", err)
 	}
 
 	// Once per process lifetime: reconcile any filled-but-unclosed trades across
 	// all recent done sessions (up to 7 days) using the IBKR trades feed.
 	if !s.backfillFired {
-		s.backfillFired = true
-		s.backfillRecentExits(ctx)
+		s.backfillFired = s.backfillRecentExits(ctx)
 	}
 
-	existing, err := store.GetORBSessionByDate(ctx, s.db, today, s.sessionName())
+	existing, err := store.GetORBSessionByDateOwned(ctx, s.db, today, s.sessionName(), s.ownerScope())
 	if err == nil && existing != nil {
 		if existing.Status == "done" || existing.Status == "skipped" {
 			// Reconcile any filled-but-unclosed trades whose TP/SL may have
@@ -786,7 +853,7 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	s.mu.Unlock()
 
 	if !hasSession {
-		session, err := store.CreateORBSession(ctx, s.db, today, s.sessionName())
+		session, err := store.CreateORBSessionOwned(ctx, s.db, today, s.sessionName(), s.tradeAssetClass(), s.ownerScope())
 		if err != nil {
 			return fmt.Errorf("create orb session: %w", err)
 		}
@@ -889,21 +956,25 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 					// Preserve the option flag across restarts so the fill-poll skips
 					// the underlying-level sanitizer when a pending option fills after
 					// a resume (else the premium is corrupted to the underlying level).
-					isOption: t.AssetClass == "option",
+					isOption:   t.AssetClass == "option",
+					pointValue: t.PointValue,
+					conID:      t.ConID,
 				}
 			}
 			// Restore exit watching for filled entries that haven't closed yet.
 			if t.Status == "filled" && (t.TpOrderID != "" || t.SlOrderID != "") {
 				s.trackedTrades[t.OrderID] = &trackedTrade{
-					dbID:      t.ID,
-					tpOrderID: t.TpOrderID,
-					slOrderID: t.SlOrderID,
-					side:      t.Side,
-					ticker:    t.Ticker,
-					qty:       t.Qty,
-					entryStop: t.EntryStop,
-					entryFill: t.FillPrice,
-					isOption:  t.AssetClass == "option",
+					dbID:       t.ID,
+					tpOrderID:  t.TpOrderID,
+					slOrderID:  t.SlOrderID,
+					side:       t.Side,
+					ticker:     t.Ticker,
+					qty:        t.Qty,
+					entryStop:  t.EntryStop,
+					entryFill:  t.FillPrice,
+					isOption:   t.AssetClass == "option",
+					pointValue: t.PointValue,
+					conID:      t.ConID,
 				}
 			}
 		}
@@ -1802,17 +1873,21 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				Status:  "pending",
 			})
 			dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-				SessionID:  sessionID,
-				Ticker:     ticker,
-				Side:       side,
-				EntryStop:  params.EntryStop,
-				StopLoss:   params.StopLoss,
-				TakeProfit: params.TakeProfit,
-				Qty:        params.Qty,
-				OrderID:    orderID,
-				Status:     "pending",
-				TpOrderID:  tpID,
-				SlOrderID:  slID,
+				SessionID:      sessionID,
+				Ticker:         ticker,
+				Side:           side,
+				EntryStop:      params.EntryStop,
+				StopLoss:       params.StopLoss,
+				TakeProfit:     params.TakeProfit,
+				Qty:            params.Qty,
+				OrderID:        orderID,
+				Status:         "pending",
+				TpOrderID:      tpID,
+				SlOrderID:      slID,
+				AssetClass:     s.tradeAssetClass(),
+				OwnerScope:     s.ownerScope(),
+				PointValue:     1,
+				MaxHoldMinutes: s.persistedMaxHoldMinutes(ticker),
 			})
 			if err != nil {
 				slog.Error("orb: store trade failed", "ticker", ticker, "err", err)
@@ -1820,7 +1895,7 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 				s.trackedTrades[orderID] = &trackedTrade{
 					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
 					side: side, ticker: ticker, qty: params.Qty,
-					entryStop: params.EntryStop,
+					entryStop: params.EntryStop, pointValue: 1,
 				}
 			}
 			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
@@ -2373,6 +2448,26 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 		slog.Warn("orb: bar replay: load filled trades failed", "err", err)
 		return
 	}
+	trades = s.ownedTradeRows(trades)
+	// Broker evidence always gets first refusal. This is especially important
+	// for manual/emergency flattens away from the original bracket: once replay
+	// commits a modelled close, the status CAS intentionally prevents overwrite.
+	if fetcher, ok := s.executor.(TradesFetcher); ok && len(trades) > 0 {
+		if records, fetchErr := fetcher.FetchTradeRecords(ctx, 7); fetchErr == nil {
+			if !s.matchExitsFromRecords(ctx, trades, records) {
+				return // broker-truth guard unavailable; retry the whole pass later
+			}
+			trades, err = store.GetOpenFilledORBTrades(ctx, s.db)
+			if err != nil {
+				slog.Warn("orb: bar replay: reload after broker reconcile failed", "err", err)
+				return
+			}
+			trades = s.ownedTradeRows(trades)
+		} else {
+			slog.Warn("orb: bar replay: broker trades read failed — deferring replay so broker evidence cannot be overwritten", "err", fetchErr)
+			return
+		}
+	}
 
 	// Broker-truth guard: bar replay infers a stop/TP touch from market data, which can
 	// fabricate a close on a position the broker still fully holds. Refuse any such close.
@@ -2424,13 +2519,16 @@ func (s *ORBScheduler) reconcileBarReplayExits(ctx context.Context) {
 		if !res.Found {
 			continue // still open — price path never reached a leg within the window
 		}
-		if !guard.allows(&t) {
-			slog.Warn("orb: bar replay: broker still holds the position — deferring replayed close to avoid a phantom",
-				"ticker", t.Ticker, "side", t.Side, "qty", t.Qty, "replay_exit", res.ExitType)
+		pointValue, pvErr := s.pointValueForTrade(t)
+		if pvErr != nil {
+			slog.Error("orb: bar replay: refusing close without durable P&L identity", "ticker", t.Ticker, "err", pvErr)
 			continue
 		}
-
-		pnl := exitPnLF(t.Side, t.FillPrice, res.ExitPrice, t.Qty, s.pointValueForTicker(t.Ticker))
+		if decision := s.checkExitGuard(guard, &t); decision.Code != guardAllow {
+			s.reportGuardBlock(ctx, "bar_replay", &t, decision)
+			continue
+		}
+		pnl := exitPnLF(t.Side, t.FillPrice, res.ExitPrice, t.Qty, pointValue)
 		slog.Info("orb: bar replay: resolved exit",
 			"ticker", t.Ticker, "side", t.Side, "exit_type", res.ExitType, "timeframe", res.Timeframe,
 			"exit_price", res.ExitPrice, "entry_price", t.FillPrice, "exit_time", res.ExitTime, "pnl", pnl,
@@ -2455,9 +2553,8 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 	if _, done := s.reconciledSessions[sessionID]; done {
 		return
 	}
-	// Marked processed at the END. It IS marked in every terminal case — nil db, a load
-	// error, no trades — EXCEPT when the trades-feed guard is fail-closed (a transient
-	// positions read failure), which must retry rather than strand genuine exits. The
+	// Marked processed at the END. Transient DB/broker failures remain unmarked so
+	// the idempotent order-ID path retries rather than stranding genuine exits. The
 	// order-ID fast path below is idempotent, so a retry is safe.
 	if s.db == nil {
 		s.reconciledSessions[sessionID] = struct{}{}
@@ -2466,15 +2563,16 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 	trades, err := store.GetORBTrades(ctx, s.db, sessionID)
 	if err != nil {
 		slog.Warn("orb: reconcile: load trades failed", "session_id", sessionID, "err", err)
-		s.reconciledSessions[sessionID] = struct{}{}
 		return
 	}
+	trades = s.ownedTradeRows(trades)
 
 	// Fast path: order-ID-based reconcile for trades where we captured child IDs.
 	// Guarded by broker truth like every other close path: mis-captured leg IDs can
 	// make an "exit leg" report filled (it was really the entry order) while the
 	// broker still holds the position. Guard built lazily on the first candidate.
 	var guard *exitGuard
+	closeFailed := false
 	for i := range trades {
 		t := &trades[i]
 		if t.Status != "filled" || (t.TpOrderID == "" && t.SlOrderID == "") {
@@ -2498,22 +2596,42 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 			if guard == nil {
 				guard = s.newExitGuard(ctx)
 			}
-			if !guard.allows(t) {
-				slog.Warn("orb: reconcile: exit leg reports filled but broker still holds the position — deferring close to avoid a phantom",
-					"ticker", t.Ticker, "side", t.Side, "qty", t.Qty,
-					"exit_type", ec.exitType, "order_id", ec.orderID)
+			if t.FillPrice <= 0 || t.Qty <= 0 || res.FilledPrice <= 0 {
+				slog.Error("orb: reconcile: refusing close with invalid entry/exit economics",
+					"trade_id", t.ID, "ticker", t.Ticker, "entry_price", t.FillPrice,
+					"exit_price", res.FilledPrice, "qty", t.Qty)
+				closeFailed = true
 				break
 			}
-			pnl := exitPnLF(t.Side, t.FillPrice, res.FilledPrice, t.Qty, s.pointValueForTicker(t.Ticker))
+			pointValue, pvErr := s.pointValueForTrade(*t)
+			if pvErr != nil {
+				slog.Error("orb: reconcile: refusing close without durable P&L identity", "ticker", t.Ticker, "err", pvErr)
+				closeFailed = true
+				break
+			}
+			if decision := s.checkExitGuard(guard, t); decision.Code != guardAllow {
+				s.reportGuardBlock(ctx, "done_session_order", t, decision)
+				break
+			}
+			pnl := exitPnLF(t.Side, t.FillPrice, res.FilledPrice, t.Qty, pointValue)
 			slog.Info("orb: reconcile: exit found",
 				"ticker", t.Ticker, "exit_type", ec.exitType,
 				"exit_price", res.FilledPrice, "pnl", pnl,
 			)
-			// Mark in-memory so the trades-feed fallback below doesn't re-close it.
-			t.Status = "closed"
-			if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
+			closed, dbErr := store.CloseORBTradeIfFilled(ctx, s.db, t.ID, ec.exitType, "broker", res.FilledPrice, pnl)
+			if dbErr != nil {
 				slog.Error("orb: reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
+				closeFailed = true
+				break
 			}
+			if !closed {
+				slog.Warn("orb: reconcile: durable close lost status race; retrying session", "ticker", t.Ticker, "trade_id", t.ID)
+				closeFailed = true
+				break
+			}
+			// Mark in-memory only after the durable CAS so the trades-feed fallback
+			// cannot hide a failed write.
+			t.Status = "closed"
 			break
 		}
 	}
@@ -2522,8 +2640,14 @@ func (s *ORBScheduler) reconcileDoneSessionTrades(ctx context.Context, sessionID
 	// (e.g. confirmation-prompt flow dropped them) or where GetOrderStatus aged out.
 	// A fail-closed guard read in EITHER pass leaves the session unprocessed so genuine
 	// exits are retried rather than stranded.
-	ok := s.reconcileExitsFromTrades(ctx, sessionID, trades)
+	ok := false
+	if !closeFailed {
+		ok = s.reconcileExitsFromTrades(ctx, sessionID, trades)
+	}
 	if guard != nil && guard.readFailed {
+		ok = false
+	}
+	if closeFailed {
 		ok = false
 	}
 	if ok {
@@ -2568,20 +2692,36 @@ func (s *ORBScheduler) pollExitLegs(ctx context.Context) {
 			if guard == nil {
 				guard = s.newExitGuard(ctx)
 			}
-			if !guard.allows(&store.ORBTrade{Ticker: tc.ticker, Side: tc.side, Qty: tc.qty}) {
-				slog.Warn("orb: exit leg reports filled but broker still holds the position — deferring close to avoid a phantom",
-					"ticker", tc.ticker, "side", tc.side, "qty", tc.qty,
-					"exit_type", ec.exitType, "order_id", ec.orderID)
+			trade := &store.ORBTrade{ID: tc.dbID, Ticker: tc.ticker, ConID: tc.conID, Side: tc.side, Qty: tc.qty, OwnerScope: s.ownerScope(), AssetClass: s.tradeAssetClass(), PointValue: tc.pointValue}
+			if tc.entryFill <= 0 || tc.qty <= 0 || res.FilledPrice <= 0 {
+				slog.Error("orb: exit poll: refusing close with invalid entry/exit economics",
+					"trade_id", tc.dbID, "ticker", tc.ticker, "entry_price", tc.entryFill,
+					"exit_price", res.FilledPrice, "qty", tc.qty)
+				break
+			}
+			pointValue, pvErr := s.pointValueForTrade(*trade)
+			if pvErr != nil {
+				slog.Error("orb: exit poll: refusing close without durable P&L identity", "ticker", tc.ticker, "err", pvErr)
+				break
+			}
+			if decision := s.checkExitGuard(guard, trade); decision.Code != guardAllow {
+				s.reportGuardBlock(ctx, "live_exit_order", trade, decision)
 				break // keep tracking; retry next tick once broker truth confirms the reduction
 			}
-			pnl := exitPnLF(tc.side, tc.entryFill, res.FilledPrice, tc.qty, s.pointValueForTicker(tc.ticker))
+			pnl := exitPnLF(tc.side, tc.entryFill, res.FilledPrice, tc.qty, pointValue)
 			slog.Info("orb: exit filled",
 				"ticker", tc.ticker, "side", tc.side,
 				"exit_type", ec.exitType, "exit_price", res.FilledPrice,
 				"entry_price", tc.entryFill, "pnl", pnl,
 			)
-			if dbErr := store.CloseORBTrade(ctx, s.db, tc.dbID, ec.exitType, "broker", res.FilledPrice, pnl); dbErr != nil {
+			closed, dbErr := store.CloseORBTradeIfFilled(ctx, s.db, tc.dbID, ec.exitType, "broker", res.FilledPrice, pnl)
+			if dbErr != nil {
 				slog.Error("orb: close trade failed", "ticker", tc.ticker, "err", dbErr)
+				break
+			}
+			if !closed {
+				slog.Warn("orb: close trade lost status race; retaining tracking for durable reload", "ticker", tc.ticker, "trade_id", tc.dbID)
+				break
 			}
 			delete(s.trackedTrades, entryOrderID)
 			break // one exit leg closes the trade
@@ -2621,14 +2761,16 @@ func (s *ORBScheduler) reconcileExitsFromTrades(ctx context.Context, sessionID s
 	records, err := fetcher.FetchTradeRecords(ctx, 7)
 	if err != nil {
 		slog.Warn("orb: exit reconcile: fetch trade records failed", "session_id", sessionID, "err", err)
-		return true
+		return false
 	}
 	return s.matchExitsFromRecords(ctx, trades, records)
 }
 
 // matchExitsFromRecords attributes IBKR fill records to filled-but-unclosed ORB trades
-// using a tuple match: same symbol, opposite side, same qty, fill time after entry, and
-// price within 10% of the TP–SL range of one of the bracket levels.
+// using a tuple match: same contract, opposite side, same qty, fill time after entry,
+// and price within 10% of one bracket level. A unique off-bracket fill is accepted
+// only while it is still fresh enough to be an operator/manual flatten observed by
+// this process; older ambiguous history belongs in the explicit repair workflow.
 // matchExitsFromRecords returns false when the broker-truth guard was fail-closed (a
 // positions/managed read failure), so a ONE-SHOT caller (done-session reconcile, backfill)
 // can decline to mark the session processed and retry rather than silently skipping genuine
@@ -2638,9 +2780,18 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 	// record that never reduced the position (today's XAG phantom stop on a still-held -850
 	// short). Read positions once and refuse any close the broker hasn't actually made.
 	guard := s.newExitGuard(ctx)
+	now := time.Now()
+	if s.now != nil {
+		now = s.now()
+	}
 	for i := range trades {
 		t := &trades[i]
-		if t.Status != "filled" || t.FillPrice == 0 {
+		if t.Status != "filled" {
+			continue
+		}
+		if t.FillPrice <= 0 || t.Qty <= 0 || (t.Side != "buy" && t.Side != "sell") {
+			slog.Error("orb: exit reconcile: invalid stored entry economics; repair required",
+				"trade_id", t.ID, "ticker", t.Ticker, "side", t.Side, "entry_price", t.FillPrice, "qty", t.Qty)
 			continue
 		}
 
@@ -2669,8 +2820,13 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			tolerance = t.FillPrice * 0.001 // fallback: 0.1% of fill price
 		}
 
+		eligible := make([]execution.IBKRTradeRecord, 0, 2)
 		for _, rec := range records {
-			if rec.Symbol != t.Ticker {
+			identityMatches := rec.Symbol == t.Ticker
+			if t.ConID != "" && rec.Conid != "" {
+				identityMatches = rec.Conid == t.ConID
+			}
+			if !identityMatches {
 				continue
 			}
 			if rec.Side != exitSide {
@@ -2682,70 +2838,92 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 			if !rec.FilledAt.After(entryTime) {
 				continue
 			}
+			eligible = append(eligible, rec)
+		}
+
+		for _, rec := range eligible {
 
 			diffTP := math.Abs(rec.Price - t.TakeProfit)
 			diffSL := math.Abs(rec.Price - t.StopLoss)
-			if diffTP > tolerance && diffSL > tolerance {
+			nearBracket := diffTP <= tolerance || diffSL <= tolerance
+			freshManualFill := !rec.FilledAt.Before(now.Add(-15*time.Minute)) && !rec.FilledAt.After(now.Add(time.Minute))
+			if !nearBracket && (len(eligible) != 1 || !freshManualFill) {
 				continue // fill price not near either bracket level
 			}
 
-			exitType := "tp"
-			if diffSL < diffTP {
+			exitType := "broker_exit"
+			if nearBracket && diffSL < diffTP {
 				exitType = "stop"
+			} else if nearBracket {
+				exitType = "tp"
 			}
 
+			pointValue, pvErr := s.pointValueForTrade(*t)
+			if pvErr != nil {
+				slog.Error("orb: exit reconcile: refusing close without durable P&L identity", "ticker", t.Ticker, "err", pvErr)
+				break
+			}
 			// Broker-truth gate: only book the close if the broker actually reduced. A match
 			// that leaves the full position held is a phantom — skip it; a genuine exit
 			// records on a later pass once the position read confirms the reduction.
-			if !guard.allows(t) {
-				slog.Warn("orb: exit reconcile: broker still holds the position — deferring matched close to avoid a phantom",
-					"ticker", t.Ticker, "side", t.Side, "qty", t.Qty, "matched_exit", exitType, "matched_price", rec.Price)
+			if decision := s.checkExitGuard(guard, t); decision.Code != guardAllow {
+				s.reportGuardBlock(ctx, "trades_feed", t, decision)
 				break
 			}
-
-			pnl := exitPnLF(t.Side, t.FillPrice, rec.Price, t.Qty, s.pointValueForTicker(t.Ticker))
+			pnl := exitPnLF(t.Side, t.FillPrice, rec.Price, t.Qty, pointValue)
 			slog.Info("orb: exit reconcile: matched",
 				"ticker", t.Ticker, "side", t.Side,
 				"exit_type", exitType, "exit_price", rec.Price,
 				"entry_price", t.FillPrice, "pnl", pnl,
 			)
-			// Mark in-memory so subsequent iterations in this pass skip it.
-			t.Status = "closed"
 			if s.db != nil {
-				if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, exitType, "broker", rec.Price, pnl); dbErr != nil {
+				closed, dbErr := store.CloseORBTradeIfFilled(ctx, s.db, t.ID, exitType, "broker", rec.Price, pnl)
+				if dbErr != nil {
 					slog.Error("orb: exit reconcile: close trade failed", "ticker", t.Ticker, "err", dbErr)
+					return false
+				}
+				if !closed {
+					slog.Warn("orb: exit reconcile: durable close lost status race; retrying", "ticker", t.Ticker, "trade_id", t.ID)
+					return false
 				}
 			}
+			// Mark in-memory only after the durable close succeeds. Tests with a
+			// nil DB still model the successful lifecycle transition.
+			t.Status = "closed"
 			break
 		}
 	}
+	// Row-local identity/economics failures are surfaced by the health detector
+	// and explicit repair workflow, but must not strand healthy sibling rows.
+	// False is reserved for pass-wide transient failures that warrant a retry.
 	return !guard.readFailed
 }
 
 // backfillRecentExits scans done sessions from the last 7 days for any
 // filled-but-unclosed trades and reconciles them via the IBKR trades feed.
 // Runs synchronously once per process lifetime from tickIdle.
-func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
+func (s *ORBScheduler) backfillRecentExits(ctx context.Context) bool {
 	fetcher, ok := s.executor.(TradesFetcher)
 	if !ok {
-		return
+		return true
 	}
 	if s.db == nil {
-		return
+		return true
 	}
 
 	records, err := fetcher.FetchTradeRecords(ctx, 7)
 	if err != nil {
 		slog.Warn("orb: backfill: fetch trade records failed", "err", err)
-		return
+		return false
 	}
 
 	sessions, err := store.GetRecentORBSessions(ctx, s.db, 20)
 	if err != nil {
 		slog.Warn("orb: backfill: load sessions failed", "err", err)
-		return
+		return false
 	}
 
+	allOK := true
 	for _, sess := range sessions {
 		if sess.Status != "done" {
 			continue
@@ -2755,8 +2933,10 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 		}
 		trades, err := store.GetORBTrades(ctx, s.db, sess.ID)
 		if err != nil {
+			allOK = false
 			continue
 		}
+		trades = s.ownedTradeRows(trades)
 		var hasFilled bool
 		for _, t := range trades {
 			if t.Status == "filled" {
@@ -2773,8 +2953,11 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) {
 		// consume this one-shot backfill and strand genuine exits before the records age out.
 		if s.matchExitsFromRecords(ctx, trades, records) {
 			s.backfilledSessions[sess.ID] = struct{}{}
+		} else {
+			allOK = false
 		}
 	}
+	return allOK
 }
 
 // orbRawResponse is the full JSON schema returned by the ORB custom system prompt.

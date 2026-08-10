@@ -1556,6 +1556,16 @@ func (s *Server) handleORBSessions(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/orb/session/today
 func (s *Server) handleORBSessionToday(w http.ResponseWriter, r *http.Request) {
+	sessionName := r.URL.Query().Get("session_name")
+	ownerScope := r.URL.Query().Get("owner_scope")
+	if sessionName == "futures" && ownerScope == "" {
+		http.Error(w, `{"error":"owner_scope is required for futures sessions"}`, http.StatusBadRequest)
+		return
+	}
+	if ownerScope != "" && !store.IsValidORBOwnerScope(ownerScope) {
+		http.Error(w, `{"error":"invalid owner_scope"}`, http.StatusBadRequest)
+		return
+	}
 	if !store.IsConnected() {
 		apiError(w, "database not connected", nil)
 		return
@@ -1565,8 +1575,13 @@ func (s *Server) handleORBSessionToday(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
-	sessionName := r.URL.Query().Get("session_name")
-	session, err := store.GetORBSessionByDate(ctx, store.GetDB(), today, sessionName)
+	var session *store.ORBSession
+	var err error
+	if ownerScope != "" {
+		session, err = store.GetORBSessionByDateOwned(ctx, store.GetDB(), today, sessionName, ownerScope)
+	} else {
+		session, err = store.GetORBSessionByDate(ctx, store.GetDB(), today, sessionName)
+	}
 	if err != nil {
 		apiError(w, "orb session query failed", err)
 		return

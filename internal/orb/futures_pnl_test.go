@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
 // TestExitPnLF_PointValues locks the futures-multiplier fix: exit P&L must scale by the
@@ -18,15 +19,30 @@ func TestExitPnLF_PointValues(t *testing.T) {
 		qty              int
 		pointValue, want float64
 	}{
-		{"MES long loss ($5/pt)", "buy", 7600, 7590, 5, 5.0, -250},   // (7590-7600)*5*5
+		{"MES long loss ($5/pt)", "buy", 7600, 7590, 5, 5.0, -250},      // (7590-7600)*5*5
 		{"MYM long loss ($0.50/pt)", "buy", 53000, 52900, 4, 0.5, -200}, // (52900-53000)*4*0.5
-		{"forex short ($1/pt)", "sell", 58, 59, 1000, 1.0, -1000},    // (58-59)*1000*1
+		{"forex short ($1/pt)", "sell", 58, 59, 1000, 1.0, -1000},       // (58-59)*1000*1
 		{"zero point value defaults to 1", "buy", 100, 110, 10, 0, 100},
 	}
 	for _, c := range cases {
 		if got := exitPnLF(c.side, c.entry, c.exit, c.qty, c.pointValue); math.Abs(got-c.want) > 1e-6 {
 			t.Errorf("%s: exitPnLF = %.4f; want %.4f", c.name, got, c.want)
 		}
+	}
+}
+
+func TestPointValueForTrade_FuturesRequiresDurableFractionalValue(t *testing.T) {
+	s := &ORBScheduler{}
+	got, err := s.pointValueForTrade(store.ORBTrade{ID: "mym", Ticker: "MYM", AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5})
+	if err != nil || got != 0.5 {
+		t.Fatalf("pointValueForTrade(MYM) = %v, %v; want 0.5, nil", got, err)
+	}
+	if _, err := s.pointValueForTrade(store.ORBTrade{ID: "unknown", Ticker: "UNKNOWN", AssetClass: "futures", OwnerScope: "futures_index_orb"}); err == nil {
+		t.Fatal("missing futures point_value must fail loudly, never fall back to 1")
+	}
+	got, err = s.pointValueForTrade(store.ORBTrade{Ticker: "XAG/USD", AssetClass: "forex", OwnerScope: "forex_orb"})
+	if err != nil || got != 1 {
+		t.Fatalf("forex point value = %v, %v; want 1, nil", got, err)
 	}
 }
 

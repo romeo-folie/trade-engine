@@ -69,9 +69,13 @@ func (b *IBKRBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderRes
 	if secType == "" {
 		secType = "CASH"
 	}
-	conid, err := b.resolveConid(ctx, req.Ticker, secType)
-	if err != nil {
-		return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: resolve conid for %q: %w", req.Ticker, err)
+	conid := req.ContractID
+	if conid == "" {
+		var err error
+		conid, err = b.resolveConid(ctx, req.Ticker, secType)
+		if err != nil {
+			return OrderResult{}, fmt.Errorf("ibkr PlaceOrder: resolve conid for %q: %w", req.Ticker, err)
+		}
 	}
 
 	orderType := mapOrderType(req.Type)
@@ -421,6 +425,7 @@ func (b *IBKRBroker) GetPositions(ctx context.Context) ([]Position, error) {
 		ticker := b.reverseConid(conidStr)
 		out = append(out, Position{
 			Ticker:       ticker,
+			ConID:        conidStr,
 			Quantity:     p.Position,
 			AvgCostBasis: p.AvgCost,
 			CurrentValue: p.MktValue,
