@@ -205,7 +205,7 @@ markets:
     base_url: ""                 # optional site override (default histdata.com)
     cache_dir: ""                # optional on-disk cache dir (default ~/.tradeengine/histdata)
   exness:
-    data_dir: "docs"             # directory containing SYMBOL_M1_YEAR_exness.csv exports
+    data_dir: "data"             # yearly SYMBOL_M1_YEAR_exness.csv or consolidated SYMBOL_M1_START_END.csv exports
   # Corrupt-bar rejection (issue #519). Providers occasionally serve a bad
   # aggregate: on 2026-08-04 Alpaca returned an ANET 1h bar at high 224.98 while
   # the same session's daily high was 194.30 and the last trade was 190.53. That

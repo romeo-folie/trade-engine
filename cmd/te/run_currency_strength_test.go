@@ -35,21 +35,37 @@ func TestIsIBKRPaperAccountID(t *testing.T) {
 	}
 }
 
-func TestCloseAtOrBefore(t *testing.T) {
+func TestCloseBefore(t *testing.T) {
 	base := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
 	candles := []data.Candle{
 		{Timestamp: base.Add(-2 * time.Minute), Close: 1.10},
 		{Timestamp: base.Add(-1 * time.Minute), Close: 1.11},
+		{Timestamp: base, Close: 9.99},
 		{Timestamp: base.Add(time.Minute), Close: 1.12},
 	}
 
-	got, ok := closeAtOrBefore(candles, base)
+	got, ok := closeBefore(candles, base)
 	if !ok || got != 1.11 {
-		t.Fatalf("closeAtOrBefore = %.2f/%v, want 1.11/true", got, ok)
+		t.Fatalf("closeBefore = %.2f/%v, want 1.11/true", got, ok)
 	}
 
-	if _, ok := closeAtOrBefore(candles, base.Add(-3*time.Minute)); ok {
-		t.Fatal("closeAtOrBefore before first candle returned ok=true")
+	if _, ok := closeBefore(candles, base.Add(-3*time.Minute)); ok {
+		t.Fatal("closeBefore before first candle returned ok=true")
+	}
+	if _, ok := closeBefore(candles[:1], base.Add(time.Minute)); ok {
+		t.Fatal("closeBefore accepted a three-minute-old candle")
+	}
+}
+
+func TestCloseBeforeSelectsLatestTimestampFromUnorderedCandles(t *testing.T) {
+	target := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+	candles := []data.Candle{
+		{Timestamp: target.Add(-time.Minute), Close: 1.11},
+		{Timestamp: target.Add(-3 * time.Minute), Close: 1.09},
+		{Timestamp: target.Add(time.Minute), Close: 1.12},
+	}
+	if got, ok := closeBefore(candles, target); !ok || got != 1.11 {
+		t.Fatalf("unordered close = %.2f/%v, want 1.11/true", got, ok)
 	}
 }
 
@@ -196,6 +212,7 @@ func (c *captureNotifier) Notify(_ context.Context, msg string) error {
 type captureCurrencyStrengthJournal struct {
 	started     []store.CurrencyStrengthRun
 	evaluating  []time.Time
+	evaluations []store.CurrencyStrengthRun
 	noSignals   []string
 	entries     []store.CurrencyStrengthRun
 	exits       []store.CurrencyStrengthRun
@@ -218,6 +235,11 @@ func (j *captureCurrencyStrengthJournal) Start(_ context.Context, run store.Curr
 
 func (j *captureCurrencyStrengthJournal) MarkEvaluating(_ context.Context, date time.Time) error {
 	j.evaluating = append(j.evaluating, date)
+	return nil
+}
+
+func (j *captureCurrencyStrengthJournal) RecordEvaluation(_ context.Context, run store.CurrencyStrengthRun) error {
+	j.evaluations = append(j.evaluations, run)
 	return nil
 }
 
@@ -349,6 +371,76 @@ func TestCurrencyStrengthSkipsConflictingPosition(t *testing.T) {
 	if len(journal.evaluating) != 1 || len(journal.noSignals) != 1 ||
 		!strings.Contains(journal.noSignals[0], "existing GBP/USD position") {
 		t.Fatalf("expected durable evaluating/no-signal history, got %+v", journal)
+	}
+}
+
+func TestCurrencyStrengthPersistsAndNotifiesDetailedNoSignalDecision(t *testing.T) {
+	start := time.Date(2026, 7, 21, 6, 0, 0, 0, time.UTC)
+	end := start.Add(3 * time.Hour)
+	market := historicalConversionMarketData{candles: map[string][]data.Candle{
+		"EUR/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.10}, {Timestamp: end.Add(-time.Minute), Close: 1.101}},
+		"GBP/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.25}, {Timestamp: end.Add(-time.Minute), Close: 1.251}},
+		"USD/JPY": {{Timestamp: start.Add(-time.Minute), Close: 150}, {Timestamp: end.Add(-time.Minute), Close: 150.1}},
+	}}
+	journal := &captureCurrencyStrengthJournal{}
+	notifier := &captureNotifier{}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			TradeInstruments: []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			MinGap:           1, BroadMin: 1, Units: 100000,
+		},
+		market: market, broker: fakeExecutor{}, notifier: notifier,
+		statePath: t.TempDir() + "/currency-strength.json",
+	}
+	runner.SetJournal(journal)
+
+	if err := runner.evaluateAndEnter(context.Background(), "2026-07-21", start, end); err != nil {
+		t.Fatal(err)
+	}
+	if len(journal.evaluations) != 1 || !json.Valid(journal.evaluations[0].DecisionDiagnostics) {
+		t.Fatalf("decision diagnostics were not persisted: %+v", journal.evaluations)
+	}
+	if len(journal.noSignals) != 1 || journal.noSignals[0] != "min_gap" {
+		t.Fatalf("stable reason code not retained: %+v", journal.noSignals)
+	}
+	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "strength gap") ||
+		!strings.Contains(notifier.msgs[0], "required 1.0000") {
+		t.Fatalf("notification did not explain the decision: %+v", notifier.msgs)
+	}
+}
+
+func TestCurrencyStrengthRecordsMissingPairAsNoSignalWithoutStoppingRunner(t *testing.T) {
+	start := time.Date(2026, 7, 21, 6, 0, 0, 0, time.UTC)
+	end := start.Add(3 * time.Hour)
+	market := historicalConversionMarketData{candles: map[string][]data.Candle{
+		"EUR/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.10}, {Timestamp: end.Add(-time.Minute), Close: 1.101}},
+		"GBP/USD": {{Timestamp: start.Add(-time.Minute), Close: 1.25}, {Timestamp: end.Add(-time.Minute), Close: 1.251}},
+	}}
+	journal := &captureCurrencyStrengthJournal{}
+	notifier := &captureNotifier{}
+	runner := &currencyStrengthPaperRunner{
+		cfg: config.CurrencyStrengthConfig{
+			RankInstruments:  []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			TradeInstruments: []string{"EUR/USD", "GBP/USD", "USD/JPY"},
+			MinGap:           0.0001, BroadMin: 1, Units: 100000,
+		},
+		market: market, broker: fakeExecutor{}, notifier: notifier,
+		statePath: t.TempDir() + "/currency-strength.json",
+	}
+	runner.SetJournal(journal)
+
+	if err := runner.evaluateAndEnter(context.Background(), "2026-07-21", start, end); err != nil {
+		t.Fatalf("a missing pair stopped the runner: %v", err)
+	}
+	if runner.decisionDoneFor != "2026-07-21" {
+		t.Fatalf("decisionDoneFor = %q, want completed no-signal decision", runner.decisionDoneFor)
+	}
+	if len(journal.evaluations) != 1 || len(journal.noSignals) != 1 || journal.noSignals[0] != "missing_price_window" {
+		t.Fatalf("missing pair was not durably recorded: evaluations=%+v noSignals=%+v", journal.evaluations, journal.noSignals)
+	}
+	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "USD/JPY") {
+		t.Fatalf("missing-pair notification was not informative: %+v", notifier.msgs)
 	}
 }
 

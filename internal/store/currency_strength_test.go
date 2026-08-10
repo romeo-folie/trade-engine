@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"testing"
@@ -45,6 +46,14 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 
 	enteredAt := base.Add(9 * time.Hour)
 	if err := store.MarkCurrencyStrengthEvaluating(ctx, db, accountID, base); err != nil {
+		t.Fatal(err)
+	}
+	diagnostics := json.RawMessage(`{"version":1,"outcome":"signal","reason_code":"","gap":0.0123}`)
+	if err := store.RecordCurrencyStrengthEvaluation(ctx, db, store.CurrencyStrengthRun{
+		AccountID: accountID, SessionDate: base,
+		StrongestCurrency: "GBP", WeakestCurrency: "USD", StrengthGap: 0.0123,
+		SignalSymbol: "GBP/USD", SignalSide: "buy", DecisionDiagnostics: diagnostics,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.RecordCurrencyStrengthEntry(ctx, db, store.CurrencyStrengthRun{
@@ -152,6 +161,9 @@ func TestCurrencyStrengthRunLifecycleAndPagination(t *testing.T) {
 	if len(first) != 2 || !first[0].SessionDate.Equal(base) ||
 		first[0].Status != "exited" || first[0].RealizedPnL == nil {
 		t.Fatalf("unexpected first page: %+v", first)
+	}
+	if string(first[0].DecisionDiagnostics) == "" || !json.Valid(first[0].DecisionDiagnostics) {
+		t.Fatalf("decision diagnostics did not round-trip: %s", first[0].DecisionDiagnostics)
 	}
 	second, err := store.ListCurrencyStrengthRunsPage(ctx, db, 2, 2)
 	if err != nil {

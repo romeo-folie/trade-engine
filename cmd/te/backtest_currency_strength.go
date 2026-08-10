@@ -18,26 +18,28 @@ import (
 )
 
 var (
-	btStrengthStarts    string
-	btStrengthRankEnds  string
-	btStrengthExits     string
-	btStrengthGaps      string
-	btStrengthBroadMin  int
-	btStrengthBroadMins string
-	btStrengthConfirms  string
-	btStrengthTradeSyms string
-	btStrengthUnits     int
-	btStrengthTop       int
-	btStrengthMinTrades int
-	btStrengthAnalysis  bool
-	btStrengthSlipMults string
-	btStrengthScoreMode string
-	btStrengthTrainFrom string
-	btStrengthTrainTo   string
-	btStrengthValFrom   string
-	btStrengthValTo     string
-	btStrengthFwdFrom   string
-	btStrengthFwdTo     string
+	btStrengthStarts        string
+	btStrengthRankEnds      string
+	btStrengthExits         string
+	btStrengthGaps          string
+	btStrengthBroadMin      int
+	btStrengthBroadMins     string
+	btStrengthConfirms      string
+	btStrengthTradeSyms     string
+	btStrengthUnits         int
+	btStrengthTop           int
+	btStrengthMinTrades     int
+	btStrengthAnalysis      bool
+	btStrengthSlipMults     string
+	btStrengthScoreMode     string
+	btStrengthCurrencyModel string
+	btStrengthAllowPartial  bool
+	btStrengthTrainFrom     string
+	btStrengthTrainTo       string
+	btStrengthValFrom       string
+	btStrengthValTo         string
+	btStrengthFwdFrom       string
+	btStrengthFwdTo         string
 )
 
 func init() {
@@ -59,7 +61,9 @@ func init() {
 	currencyStrengthCmd.Flags().IntVar(&btStrengthMinTrades, "min-trades", 100, "Minimum trades for printed candidates")
 	currencyStrengthCmd.Flags().BoolVar(&btStrengthAnalysis, "analysis", false, "Print robustness detail for the top candidate")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthSlipMults, "slippage-mults", "1,1.5,2,3", "Spread/slippage multipliers for --analysis")
-	currencyStrengthCmd.Flags().StringVar(&btStrengthScoreMode, "score-mode", "overall", "Candidate scoring mode: overall | walk-forward")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthScoreMode, "score-mode", "overall", "Candidate scoring mode: overall | walk-forward (train+validate selection; forward report only)")
+	currencyStrengthCmd.Flags().StringVar(&btStrengthCurrencyModel, "currency-model", "sum", "Currency score model: sum | least_squares")
+	currencyStrengthCmd.Flags().BoolVar(&btStrengthAllowPartial, "allow-partial-basket", false, "Allow connected degraded baskets (least_squares only)")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthTrainFrom, "train-from", "2022-01-01", "Analysis train window start")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthTrainTo, "train-to", "2024-12-31", "Analysis train window end")
 	currencyStrengthCmd.Flags().StringVar(&btStrengthValFrom, "validate-from", "2025-01-01", "Analysis validation window start")
@@ -89,24 +93,28 @@ type strengthPair struct {
 }
 
 type strengthParam struct {
-	Start    string
-	RankEnd  string
-	Exit     string
-	MinGap   float64
-	BroadMin int
-	Confirm  float64
-	Units    int
+	Start         string
+	RankEnd       string
+	Exit          string
+	MinGap        float64
+	BroadMin      int
+	Confirm       float64
+	Units         int
+	CurrencyModel string
+	AllowPartial  bool
 }
 
 func (p strengthParam) label() string {
-	return fmt.Sprintf("strength/%s-%s/exit%s/gap%.4f/broad%d/confirm%.4f/units%d", p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Confirm, p.Units)
+	return fmt.Sprintf("strength/%s/%s-%s/exit%s/gap%.4f/broad%d/confirm%.4f/units%d/partial%t", p.CurrencyModel, p.Start, p.RankEnd, p.Exit, p.MinGap, p.BroadMin, p.Confirm, p.Units, p.AllowPartial)
 }
 
 type strengthResult struct {
-	Param  strengthParam
-	Result orbreplay.Result
-	Score  float64
-	Gate   bool
+	Param           strengthParam
+	Result          orbreplay.Result
+	Score           float64
+	SelectionTrades int
+	SelectionNetPnL float64
+	Gate            bool
 }
 
 type strengthSnapshots map[time.Time]map[string]map[string]float64
@@ -115,6 +123,13 @@ type strengthEvalWindow struct {
 	Label string
 	From  time.Time
 	To    time.Time
+}
+
+const strengthSnapshotMaxLag = 2 * time.Minute
+
+type strengthDayOutcome struct {
+	Trade  *orbreplay.SimTrade
+	Reason string
 }
 
 func runCurrencyStrength(ctx context.Context) error {
@@ -146,6 +161,12 @@ func runCurrencyStrength(ctx context.Context) error {
 	if btStrengthUnits <= 0 {
 		return fmt.Errorf("--units must be positive")
 	}
+	if btStrengthCurrencyModel != "sum" && btStrengthCurrencyModel != "least_squares" {
+		return fmt.Errorf("--currency-model must be sum or least_squares")
+	}
+	if btStrengthAllowPartial && btStrengthCurrencyModel != "least_squares" {
+		return fmt.Errorf("--allow-partial-basket requires --currency-model least_squares")
+	}
 
 	starts, err := parseClockList(btStrengthStarts)
 	if err != nil {
@@ -176,7 +197,10 @@ func runCurrencyStrength(ctx context.Context) error {
 		return err
 	}
 
-	uni, err := buildBacktestUniverse(cfg)
+	researchCfg := *cfg
+	researchCfg.ForexORB = cfg.ForexORB
+	researchCfg.ForexORB.Instruments = currencyStrengthResearchInstruments(cfg.ForexORB.Instruments)
+	uni, err := buildBacktestUniverse(&researchCfg)
 	if err != nil {
 		return err
 	}
@@ -194,6 +218,53 @@ func runCurrencyStrength(ctx context.Context) error {
 		return err
 	}
 
+	params := buildStrengthParams(starts, rankEnds, exits, gaps, broadMins, confirms, btStrengthUnits, btStrengthCurrencyModel, btStrengthAllowPartial)
+	if len(params) == 0 {
+		return fmt.Errorf("no valid start/rank-end/exit combinations")
+	}
+
+	results := make([]strengthResult, 0, len(params))
+	for _, p := range params {
+		trades := runStrengthParam(snaps, pairs, uni.costs, p, from, to, tradeSymbols)
+		res := orbreplay.Summarize(p.label(), trades)
+		results = append(results, strengthResult{
+			Param: p, Result: res,
+			Score:           strengthScoreResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
+			SelectionTrades: strengthSelectionTradeCount(res, btStrengthScoreMode, scoreWindows),
+			SelectionNetPnL: strengthSelectionNetPnL(res, btStrengthScoreMode, scoreWindows),
+			Gate:            strengthGateResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
+		})
+	}
+	sortStrengthResults(results)
+
+	fmt.Printf("currency-strength · %s -> %s · %d sets · %d pairs · units=%d\n\n",
+		btORBFrom, btORBTo, len(params), len(pairs), btStrengthUnits)
+	printStrengthResults(results, btStrengthTop, btStrengthMinTrades)
+	if btStrengthAnalysis {
+		slips, err := parsePositiveFloatLevels(btStrengthSlipMults)
+		if err != nil {
+			return fmt.Errorf("invalid --slippage-mults %q: %w", btStrengthSlipMults, err)
+		}
+		if err := printStrengthAnalysis(snaps, pairs, uni.costs, results, from, to, slips, tradeSymbols, scoreWindows); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func sortStrengthResults(results []strengthResult) {
+	sort.Slice(results, func(i, j int) bool {
+		if results[i].Score == results[j].Score {
+			if results[i].SelectionNetPnL == results[j].SelectionNetPnL {
+				return results[i].Param.label() < results[j].Param.label()
+			}
+			return results[i].SelectionNetPnL > results[j].SelectionNetPnL
+		}
+		return results[i].Score > results[j].Score
+	})
+}
+
+func buildStrengthParams(starts, rankEnds, exits []string, gaps []float64, broadMins []int, confirms []float64, units int, model string, allowPartial bool) []strengthParam {
 	var params []strengthParam
 	for _, start := range starts {
 		for _, rankEnd := range rankEnds {
@@ -209,7 +280,9 @@ func runCurrencyStrength(ctx context.Context) error {
 						for _, confirm := range confirms {
 							params = append(params, strengthParam{
 								Start: start, RankEnd: rankEnd, Exit: exit,
-								MinGap: gap, BroadMin: broadMin, Confirm: confirm, Units: btStrengthUnits,
+								MinGap: gap, BroadMin: broadMin, Confirm: confirm, Units: units,
+								CurrencyModel: model,
+								AllowPartial:  allowPartial,
 							})
 						}
 					}
@@ -217,41 +290,40 @@ func runCurrencyStrength(ctx context.Context) error {
 			}
 		}
 	}
-	if len(params) == 0 {
-		return fmt.Errorf("no valid start/rank-end/exit combinations")
-	}
+	return params
+}
 
-	results := make([]strengthResult, 0, len(params))
-	for _, p := range params {
-		trades := runStrengthParam(snaps, pairs, uni.costs, p, from, to, tradeSymbols)
-		res := orbreplay.Summarize(p.label(), trades)
-		results = append(results, strengthResult{
-			Param:  p,
-			Result: res,
-			Score:  strengthScoreResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
-			Gate:   strengthGateResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows),
-		})
+func currencyStrengthResearchInstruments(configured []config.Instrument) []config.Instrument {
+	defaults := []config.Instrument{
+		{Symbol: "AUD/CHF", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "AUD/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, MaxHoldMinutes: 180},
+		{Symbol: "AUD/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "EUR/AUD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "EUR/CHF", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "EUR/GBP", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "EUR/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, MaxHoldMinutes: 180},
+		{Symbol: "EUR/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 240},
+		{Symbol: "GBP/AUD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "GBP/CHF", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "GBP/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, MaxHoldMinutes: 180},
+		{Symbol: "GBP/USD", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "CHF/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, MaxHoldMinutes: 180},
+		{Symbol: "USD/CHF", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.0002, MaxHoldMinutes: 180},
+		{Symbol: "USD/JPY", SecType: "CASH", MinLotSize: 5000, PipBuffer: 0.02, MaxHoldMinutes: 180},
 	}
-	sort.Slice(results, func(i, j int) bool {
-		if results[i].Score == results[j].Score {
-			return results[i].Result.Overall.NetPnL > results[j].Result.Overall.NetPnL
-		}
-		return results[i].Score > results[j].Score
-	})
-
-	fmt.Printf("currency-strength · %s -> %s · %d sets · %d pairs · units=%d\n\n",
-		btORBFrom, btORBTo, len(params), len(pairs), btStrengthUnits)
-	printStrengthResults(results, btStrengthTop, btStrengthMinTrades)
-	if btStrengthAnalysis {
-		slips, err := parsePositiveFloatLevels(btStrengthSlipMults)
-		if err != nil {
-			return fmt.Errorf("invalid --slippage-mults %q: %w", btStrengthSlipMults, err)
-		}
-		if err := printStrengthAnalysis(snaps, pairs, uni.costs, results, from, to, slips, tradeSymbols, scoreWindows); err != nil {
-			return err
-		}
+	configuredBySymbol := make(map[string]config.Instrument, len(configured))
+	for _, inst := range configured {
+		configuredBySymbol[inst.Symbol] = inst
 	}
-	return nil
+	out := make([]config.Instrument, 0, len(defaults))
+	for _, fallback := range defaults {
+		inst := fallback
+		if configured, ok := configuredBySymbol[fallback.Symbol]; ok {
+			inst = configured
+		}
+		out = append(out, withDefaultSpotFXCommission(inst))
+	}
+	return out
 }
 
 func strengthPairs(instruments []config.Instrument) ([]strengthPair, error) {
@@ -307,7 +379,7 @@ func parseNonNegativeFloatLevels(csv string) ([]float64, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%q is not a number", p)
 		}
-		if v < 0 {
+		if v < 0 || math.IsNaN(v) || math.IsInf(v, 0) {
 			return nil, fmt.Errorf("value %v must not be negative", v)
 		}
 		out = append(out, v)
@@ -392,29 +464,29 @@ func clockAfter(a, b string) bool {
 
 func loadStrengthSnapshots(ctx context.Context, provider data.MarketDataProvider, pairs []strengthPair, clockTimes []string, from, to time.Time) (strengthSnapshots, error) {
 	out := make(strengthSnapshots)
-	for day := fadeTruncateDay(from); !day.After(to); day = day.AddDate(0, 0, 1) {
-		if day.Before(fadeTruncateDay(from)) || day.After(to) {
-			continue
-		}
-		dayMap := make(map[string]map[string]float64)
-		for _, pair := range pairs {
+	// Load one symbol across the complete date range before moving to the next.
+	// This lets file-backed providers parse and cache a consolidated symbol once.
+	for _, pair := range pairs {
+		for day := fadeTruncateDay(from); !day.After(to); day = day.AddDate(0, 0, 1) {
 			values, err := strengthDayCloses(ctx, provider, pair.Instrument.Symbol, day, clockTimes)
 			if err != nil {
 				return nil, err
 			}
-			if len(values) == len(clockTimes) {
-				dayMap[pair.Instrument.Symbol] = values
+			if len(values) > 0 {
+				if out[day] == nil {
+					out[day] = make(map[string]map[string]float64)
+				}
+				out[day][pair.Instrument.Symbol] = values
 			}
-		}
-		if len(dayMap) == len(pairs) {
-			out[day] = dayMap
 		}
 	}
 	return out, nil
 }
 
 func strengthDayCloses(ctx context.Context, provider data.MarketDataProvider, symbol string, day time.Time, clockTimes []string) (map[string]float64, error) {
-	fetchStart := day
+	// A midnight decision needs the final completed minute from the prior day.
+	// Keep the lookback bounded by the same freshness rule used below.
+	fetchStart := day.Add(-strengthSnapshotMaxLag)
 	fetchEnd := day.Add(24 * time.Hour)
 	candles, err := provider.FetchCandles(ctx, symbol, data.Timeframe1Min, fetchStart, fetchEnd)
 	if err != nil {
@@ -429,7 +501,10 @@ func strengthDayCloses(ctx context.Context, provider data.MarketDataProvider, sy
 	}
 	for _, c := range candles {
 		for clock, target := range targets {
-			if !c.Timestamp.After(target) {
+			lag := target.Sub(c.Timestamp)
+			// Candle timestamps identify the minute's open. The close is only
+			// knowable one minute later, so the target-minute bar is future data.
+			if lag > 0 && lag <= strengthSnapshotMaxLag {
 				out[clock] = c.Close
 			}
 		}
@@ -438,6 +513,15 @@ func strengthDayCloses(ctx context.Context, provider data.MarketDataProvider, sy
 }
 
 func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, from, to time.Time, tradeSymbols map[string]bool) []orbreplay.SimTrade {
+	return runStrengthParamScoped(snaps, pairs, costs, p, from, to, strengthEvalScope{TradeSymbols: tradeSymbols})
+}
+
+type strengthEvalScope struct {
+	TradeSymbols map[string]bool
+	ScoreSymbols map[string]bool
+}
+
+func runStrengthParamScoped(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, from, to time.Time, scope strengthEvalScope) []orbreplay.SimTrade {
 	days := make([]time.Time, 0, len(snaps))
 	for day := range snaps {
 		if !day.Before(fadeTruncateDay(from)) && !day.After(to) {
@@ -447,7 +531,7 @@ func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[s
 	sort.Slice(days, func(i, j int) bool { return days[i].Before(days[j]) })
 	var trades []orbreplay.SimTrade
 	for _, day := range days {
-		if trade := simulateStrengthDay(snaps[day], pairs, costs, p, day, tradeSymbols); trade != nil {
+		if trade := evaluateStrengthDayScoped(snaps[day], pairs, costs, p, day, scope).Trade; trade != nil {
 			trades = append(trades, *trade)
 		}
 	}
@@ -455,39 +539,62 @@ func runStrengthParam(snaps strengthSnapshots, pairs []strengthPair, costs map[s
 }
 
 func simulateStrengthDay(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time, tradeSymbols map[string]bool) *orbreplay.SimTrade {
+	return evaluateStrengthDay(day, pairs, costs, p, date, tradeSymbols).Trade
+}
+
+func evaluateStrengthDay(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time, tradeSymbols map[string]bool) strengthDayOutcome {
+	return evaluateStrengthDayScoped(day, pairs, costs, p, date, strengthEvalScope{TradeSymbols: tradeSymbols})
+}
+
+func evaluateStrengthDayScoped(day map[string]map[string]float64, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, date time.Time, scope strengthEvalScope) strengthDayOutcome {
 	evalPairs := make([]currencystrength.Pair, 0, len(pairs))
 	windows := make(map[string]currencystrength.Window, len(pairs))
 	bySymbol := make(map[string]config.Instrument, len(pairs))
 	for _, pair := range pairs {
+		evalPairs = append(evalPairs, currencystrength.Pair{Symbol: pair.Instrument.Symbol, Base: pair.Base, Quote: pair.Quote})
+		bySymbol[pair.Instrument.Symbol] = pair.Instrument
 		values := day[pair.Instrument.Symbol]
 		start, okStart := values[p.Start]
 		end, okEnd := values[p.RankEnd]
-		exit, okExit := values[p.Exit]
-		if !okStart || !okEnd || !okExit || start <= 0 || end <= 0 {
-			return nil
+		if !okStart || !okEnd || start <= 0 || end <= 0 {
+			continue
 		}
-		if exit <= 0 {
-			return nil
-		}
-		evalPairs = append(evalPairs, currencystrength.Pair{Symbol: pair.Instrument.Symbol, Base: pair.Base, Quote: pair.Quote})
 		windows[pair.Instrument.Symbol] = currencystrength.Window{Start: start, End: end}
-		bySymbol[pair.Instrument.Symbol] = pair.Instrument
 	}
 	decision := currencystrength.Evaluate(evalPairs, windows, currencystrength.Config{
-		MinGap:           p.MinGap,
-		BroadMin:         p.BroadMin,
-		ConfirmMinMove:   p.Confirm,
-		TradeInstruments: tradeSymbols,
+		MinGap:             p.MinGap,
+		BroadMin:           p.BroadMin,
+		ConfirmMinMove:     p.Confirm,
+		TradeInstruments:   scope.TradeSymbols,
+		ScoreInstruments:   scope.ScoreSymbols,
+		ScoreMethod:        p.CurrencyModel,
+		AllowPartialBasket: p.AllowPartial,
 	})
 	if decision.Signal == nil {
-		return nil
+		return strengthDayOutcome{Reason: decision.SkipReason}
 	}
 	inst := bySymbol[decision.Signal.Symbol]
-	entryMid := day[decision.Signal.Symbol][p.RankEnd]
-	exitMid := day[decision.Signal.Symbol][p.Exit]
+	routed := day[decision.Signal.Symbol]
+	entryMid, entryOK := routed[p.RankEnd]
+	exitMid, exitOK := routed[p.Exit]
+	if !entryOK || !exitOK || entryMid <= 0 || exitMid <= 0 {
+		return strengthDayOutcome{Reason: "missing_routed_price"}
+	}
+	_, quote, ok := currencystrength.SplitPair(decision.Signal.Symbol)
+	if !ok {
+		return strengthDayOutcome{Reason: "invalid_routed_pair"}
+	}
+	entryQuoteUSD, entryConversionOK := strengthFXRate(day, pairs, p.RankEnd, quote, "USD")
+	exitQuoteUSD, exitConversionOK := strengthFXRate(day, pairs, p.Exit, quote, "USD")
+	if !entryConversionOK || !exitConversionOK {
+		return strengthDayOutcome{Reason: "missing_usd_conversion"}
+	}
 	entryTime := strengthTimestamp(date, p.RankEnd)
 	exitTime := strengthTimestamp(date, p.Exit)
-	return resolveStrengthTrade(inst, decision.Signal.Side, entryMid, exitMid, entryTime, exitTime, costs[decision.Signal.Symbol], p.Units)
+	return strengthDayOutcome{
+		Trade:  resolveStrengthTrade(inst, decision.Signal.Side, entryMid, exitMid, entryQuoteUSD, exitQuoteUSD, entryTime, exitTime, costs[decision.Signal.Symbol], p.Units),
+		Reason: "signal",
+	}
 }
 
 func strengthTimestamp(day time.Time, clock string) time.Time {
@@ -495,9 +602,8 @@ func strengthTimestamp(day time.Time, clock string) time.Time {
 	return day.Add(time.Duration(t.Hour())*time.Hour + time.Duration(t.Minute())*time.Minute)
 }
 
-func resolveStrengthTrade(inst config.Instrument, side string, entryMid, exitMid float64, entryTime, exitTime time.Time, cost orbreplay.CostModel, qty int) *orbreplay.SimTrade {
+func resolveStrengthTrade(inst config.Instrument, side string, entryMid, exitMid, entryQuoteUSD, exitQuoteUSD float64, entryTime, exitTime time.Time, cost orbreplay.CostModel, qty int) *orbreplay.SimTrade {
 	half := cost.Spread / 2
-	pv := strengthPointValue(inst)
 	entryFill := entryMid
 	exitFill := exitMid
 	if side == "buy" {
@@ -507,8 +613,11 @@ func resolveStrengthTrade(inst config.Instrument, side string, entryMid, exitMid
 		entryFill -= half
 		exitFill += half
 	}
-	gross := fadePnL(side, entryFill, exitFill, qty, pv)
-	commission := cost.PerFillCommission(qty, entryFill, pv) + cost.PerFillCommission(qty, exitFill, pv)
+	// Price PnL is denominated in the pair's quote currency. Convert it at
+	// the exit snapshot; use each fill's contemporaneous rate for commission
+	// notional so all reported results are in USD.
+	gross := fadePnL(side, entryFill, exitFill, qty, exitQuoteUSD)
+	commission := cost.PerFillCommission(qty, entryFill, entryQuoteUSD) + cost.PerFillCommission(qty, exitFill, exitQuoteUSD)
 	return &orbreplay.SimTrade{
 		Ticker: inst.Symbol, Side: side, EntryTime: entryTime, ExitTime: exitTime,
 		EntryPrice: entryFill, ExitPrice: exitFill, Qty: qty, ExitType: "time_exit",
@@ -517,11 +626,59 @@ func resolveStrengthTrade(inst config.Instrument, side string, entryMid, exitMid
 	}
 }
 
-func strengthPointValue(inst config.Instrument) float64 {
-	if inst.PointValue > 0 {
-		return inst.PointValue
+func strengthFXRate(day map[string]map[string]float64, pairs []strengthPair, clock, from, to string) (float64, bool) {
+	if from == to {
+		return 1, true
 	}
-	return 1
+	type edge struct {
+		to     string
+		rate   float64
+		symbol string
+	}
+	graph := make(map[string][]edge)
+	for _, pair := range pairs {
+		price, ok := day[pair.Instrument.Symbol][clock]
+		if !ok || price <= 0 || math.IsNaN(price) || math.IsInf(price, 0) {
+			continue
+		}
+		if pair.Base == from && pair.Quote == to {
+			return price, true
+		}
+		if pair.Base == to && pair.Quote == from {
+			return 1 / price, true
+		}
+		graph[pair.Base] = append(graph[pair.Base], edge{to: pair.Quote, rate: price, symbol: pair.Instrument.Symbol})
+		graph[pair.Quote] = append(graph[pair.Quote], edge{to: pair.Base, rate: 1 / price, symbol: pair.Instrument.Symbol})
+	}
+	for currency := range graph {
+		sort.Slice(graph[currency], func(i, j int) bool {
+			if graph[currency][i].to == graph[currency][j].to {
+				return graph[currency][i].symbol < graph[currency][j].symbol
+			}
+			return graph[currency][i].to < graph[currency][j].to
+		})
+	}
+	type node struct {
+		currency string
+		rate     float64
+	}
+	queue := []node{{currency: from, rate: 1}}
+	seen := map[string]bool{from: true}
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+		for _, next := range graph[current.currency] {
+			rate := current.rate * next.rate
+			if next.to == to {
+				return rate, true
+			}
+			if !seen[next.to] {
+				seen[next.to] = true
+				queue = append(queue, node{currency: next.to, rate: rate})
+			}
+		}
+	}
+	return 0, false
 }
 
 func strengthScore(m orbreplay.Metrics, minTrades int) float64 {
@@ -550,7 +707,8 @@ func strengthScoreResult(res orbreplay.Result, minTrades int, mode string, windo
 	}
 	windowMinTrades := strengthWindowMinTrades(minTrades)
 	worst := math.Inf(1)
-	for _, window := range windows {
+	selectionWindows := strengthSelectionWindows(windows)
+	for _, window := range selectionWindows {
 		trades := filterStrengthTrades(res.Trades, window.From, window.To)
 		score := strengthScore(orbreplay.Summarize(window.Label, trades).Overall, windowMinTrades)
 		if score < worst {
@@ -560,24 +718,65 @@ func strengthScoreResult(res orbreplay.Result, minTrades int, mode string, windo
 	if math.IsInf(worst, 1) {
 		return math.Inf(-1)
 	}
-	return worst + strengthScore(res.Overall, minTrades)*0.25
+	selectionTrades := filterStrengthTradesForWindows(res.Trades, selectionWindows)
+	return worst + strengthScore(orbreplay.Summarize("selection", selectionTrades).Overall, minTrades)*0.25
+}
+
+func strengthSelectionNetPnL(res orbreplay.Result, mode string, windows []strengthEvalWindow) float64 {
+	if mode != "walk-forward" {
+		return res.Overall.NetPnL
+	}
+	trades := filterStrengthTradesForWindows(res.Trades, strengthSelectionWindows(windows))
+	return orbreplay.Summarize("selection", trades).Overall.NetPnL
+}
+
+func strengthSelectionTradeCount(res orbreplay.Result, mode string, windows []strengthEvalWindow) int {
+	if mode != "walk-forward" {
+		return res.Overall.Trades
+	}
+	return len(filterStrengthTradesForWindows(res.Trades, strengthSelectionWindows(windows)))
 }
 
 func strengthGateResult(res orbreplay.Result, minTrades int, mode string, windows []strengthEvalWindow) bool {
 	if mode != "walk-forward" {
 		return strengthGate(res.Overall, minTrades)
 	}
-	if res.Overall.Trades < minTrades {
+	selectionWindows := strengthSelectionWindows(windows)
+	selectionTrades := filterStrengthTradesForWindows(res.Trades, selectionWindows)
+	if len(selectionTrades) < minTrades {
 		return false
 	}
 	windowMinTrades := strengthWindowMinTrades(minTrades)
-	for _, window := range windows {
+	for _, window := range selectionWindows {
 		trades := filterStrengthTrades(res.Trades, window.From, window.To)
 		if !strengthGate(orbreplay.Summarize(window.Label, trades).Overall, windowMinTrades) {
 			return false
 		}
 	}
 	return true
+}
+
+func strengthSelectionWindows(windows []strengthEvalWindow) []strengthEvalWindow {
+	out := make([]strengthEvalWindow, 0, len(windows))
+	for _, window := range windows {
+		if window.Label != "forward" {
+			out = append(out, window)
+		}
+	}
+	return out
+}
+
+func filterStrengthTradesForWindows(trades []orbreplay.SimTrade, windows []strengthEvalWindow) []orbreplay.SimTrade {
+	out := make([]orbreplay.SimTrade, 0, len(trades))
+	for _, trade := range trades {
+		for _, window := range windows {
+			if !trade.EntryTime.Before(window.From) && !trade.EntryTime.After(window.To) {
+				out = append(out, trade)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func strengthWindowMinTrades(minTrades int) int {
@@ -604,7 +803,7 @@ func printStrengthResults(results []strengthResult, top, minTrades int) {
 	printed := 0
 	for _, r := range results {
 		m := r.Result.Overall
-		if m.Trades < minTrades {
+		if r.SelectionTrades < minTrades {
 			continue
 		}
 		printed++
@@ -631,7 +830,7 @@ func printStrengthResults(results []strengthResult, top, minTrades int) {
 func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, results []strengthResult, from, to time.Time, slipMults []float64, tradeSymbols map[string]bool, scoreWindows []strengthEvalWindow) error {
 	bestIdx := -1
 	for i, r := range results {
-		if r.Result.Overall.Trades >= btStrengthMinTrades {
+		if r.SelectionTrades >= btStrengthMinTrades {
 			bestIdx = i
 			break
 		}
@@ -649,6 +848,7 @@ func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs 
 	printStrengthGrouped("Pair split", groupContTrades(trades, func(t orbreplay.SimTrade) string {
 		return t.Ticker
 	}))
+	printStrengthDecisionOutcomes(snaps, pairs, costs, best.Param, from, to, tradeSymbols)
 	printStrengthMonthlyDrawdown(trades)
 	if err := printStrengthWalkForward(snaps, pairs, costs, best.Param, tradeSymbols); err != nil {
 		return err
@@ -674,6 +874,36 @@ func printStrengthAnalysis(snaps strengthSnapshots, pairs []strengthPair, costs 
 			strengthScoreResult(res, btStrengthMinTrades, btStrengthScoreMode, scoreWindows), gate)
 	}
 	return nil
+}
+
+func printStrengthDecisionOutcomes(snaps strengthSnapshots, pairs []strengthPair, costs map[string]orbreplay.CostModel, p strengthParam, from, to time.Time, tradeSymbols map[string]bool) {
+	counts := make(map[string]int)
+	for day, snapshot := range snaps {
+		if day.Before(fadeTruncateDay(from)) || day.After(to) {
+			continue
+		}
+		outcome := evaluateStrengthDay(snapshot, pairs, costs, p, day, tradeSymbols)
+		counts[cmpOr(outcome.Reason, "unknown")]++
+	}
+	type row struct {
+		reason string
+		count  int
+	}
+	rows := make([]row, 0, len(counts))
+	for reason, count := range counts {
+		rows = append(rows, row{reason: reason, count: count})
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].count == rows[j].count {
+			return rows[i].reason < rows[j].reason
+		}
+		return rows[i].count > rows[j].count
+	})
+	fmt.Printf("\nDecision outcomes\n")
+	fmt.Printf("%-28s %7s\n", "OUTCOME", "DAYS")
+	for _, item := range rows {
+		fmt.Printf("%-28s %7d\n", item.reason, item.count)
+	}
 }
 
 func printStrengthMetricLine(label string, m orbreplay.Metrics) {

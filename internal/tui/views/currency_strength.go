@@ -2,12 +2,14 @@ package views
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/strategy/currencystrength"
 )
 
 const CurrencyStrengthPageSize = 8
@@ -149,7 +151,7 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 
 	switch run.Status {
 	case "no_signal":
-		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Outcome: "), displayText(run.SkipReason, "no qualifying signal"))
+		fmt.Fprintf(&b, "%s%s\n", labelStyle.Render("Outcome: "), currencyStrengthDecisionSummary(run))
 	case "entry_failed":
 		fmt.Fprintf(
 			&b, "%s%s %s  order %s · %s%s\n",
@@ -201,6 +203,21 @@ func renderCurrencyStrengthRun(run store.CurrencyStrengthRun) string {
 		b.WriteString(dimText.Render("Awaiting the London strength decision window") + "\n")
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+func currencyStrengthDecisionSummary(run store.CurrencyStrengthRun) string {
+	fallback := displayText(run.SkipReason, "no qualifying signal")
+	if len(run.DecisionDiagnostics) == 0 {
+		return fallback
+	}
+	var diagnostics currencystrength.DecisionDiagnostics
+	if err := json.Unmarshal(run.DecisionDiagnostics, &diagnostics); err != nil {
+		return fallback
+	}
+	if diagnostics.Version != 1 {
+		return fallback
+	}
+	return currencystrength.FormatDecisionSummary(diagnostics, fallback)
 }
 
 func renderCurrencyStrengthStatus(status string) string {

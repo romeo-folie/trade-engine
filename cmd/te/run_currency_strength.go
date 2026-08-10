@@ -91,6 +91,7 @@ const currencyStrengthUnknownSessionDate = "unknown"
 type currencyStrengthJournal interface {
 	Start(context.Context, store.CurrencyStrengthRun) error
 	MarkEvaluating(context.Context, time.Time) error
+	RecordEvaluation(context.Context, store.CurrencyStrengthRun) error
 	RecordNoSignal(context.Context, time.Time, string) error
 	RecordEntry(context.Context, store.CurrencyStrengthRun) error
 	RecordExit(context.Context, store.CurrencyStrengthRun) error
@@ -110,6 +111,11 @@ func (d dbCurrencyStrengthJournal) Start(ctx context.Context, run store.Currency
 
 func (d dbCurrencyStrengthJournal) MarkEvaluating(ctx context.Context, date time.Time) error {
 	return store.MarkCurrencyStrengthEvaluating(ctx, store.GetDB(), d.accountID, date)
+}
+
+func (d dbCurrencyStrengthJournal) RecordEvaluation(ctx context.Context, run store.CurrencyStrengthRun) error {
+	run.AccountID = d.accountID
+	return store.RecordCurrencyStrengthEvaluation(ctx, store.GetDB(), run)
 }
 
 func (d dbCurrencyStrengthJournal) RecordNoSignal(ctx context.Context, date time.Time, reason string) error {
@@ -746,7 +752,8 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 	for _, pair := range pairs {
 		start, end, err := r.fetchWindow(ctx, pair.Symbol, strengthStart, strengthEnd)
 		if err != nil {
-			return err
+			windows[pair.Symbol] = currencystrength.Window{Error: err.Error()}
+			continue
 		}
 		windows[pair.Symbol] = currencystrength.Window{Start: start, End: end}
 	}
@@ -757,13 +764,31 @@ func (r *currencyStrengthPaperRunner) evaluateAndEnter(ctx context.Context, date
 		ConfirmMinMove:   r.cfg.ConfirmMinMove,
 		TradeInstruments: tradeSet,
 	})
+	diagnostics, err := json.Marshal(decision.Diagnostics)
+	if err != nil {
+		return fmt.Errorf("currency-strength encode decision diagnostics: %w", err)
+	}
+	if r.journal != nil {
+		if err := r.journal.RecordEvaluation(ctx, store.CurrencyStrengthRun{
+			SessionDate:         sessionDate,
+			StrongestCurrency:   decision.Diagnostics.Strongest,
+			WeakestCurrency:     decision.Diagnostics.Weakest,
+			StrengthGap:         decision.Diagnostics.Gap,
+			SignalSymbol:        decision.Diagnostics.RoutedSymbol,
+			SignalSide:          decision.Diagnostics.RoutedSide,
+			DecisionDiagnostics: diagnostics,
+		}); err != nil {
+			return fmt.Errorf("currency-strength record decision diagnostics: %w", err)
+		}
+	}
 	r.decisionDoneFor = dateKey
 	if decision.Signal == nil {
-		logger.Info("currency-strength: no paper order", "date", dateKey, "reason", decision.SkipReason)
+		summary := currencystrength.FormatDecisionSummary(decision.Diagnostics, decision.SkipReason)
+		logger.Info("currency-strength: no paper order", "date", dateKey, "reason", decision.SkipReason, "detail", summary)
 		if err := r.recordNoSignal(ctx, sessionDate, decision.SkipReason); err != nil {
 			return err
 		}
-		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(decision.SkipReason))
+		r.notify(ctx, buildCurrencyStrengthNoOrderMessage(summary))
 		return nil
 	}
 
@@ -2849,22 +2874,27 @@ func (r *currencyStrengthPaperRunner) fetchWindow(ctx context.Context, symbol st
 	if err != nil {
 		return 0, 0, fmt.Errorf("currency-strength fetch %s: %w", symbol, err)
 	}
-	start, okStart := closeAtOrBefore(candles, strengthStart.UTC())
-	end, okEnd := closeAtOrBefore(candles, strengthEnd.UTC())
+	start, okStart := closeBefore(candles, strengthStart.UTC())
+	end, okEnd := closeBefore(candles, strengthEnd.UTC())
 	if !okStart || !okEnd || start <= 0 || end <= 0 {
 		return 0, 0, fmt.Errorf("currency-strength missing start/end price for %s at %s/%s", symbol, strengthStart.Format(time.RFC3339), strengthEnd.Format(time.RFC3339))
 	}
 	return start, end, nil
 }
 
-func closeAtOrBefore(candles []data.Candle, target time.Time) (float64, bool) {
+func closeBefore(candles []data.Candle, target time.Time) (float64, bool) {
 	var out float64
+	var latest time.Time
 	ok := false
 	for _, c := range candles {
-		if !c.Timestamp.After(target) {
+		if c.Timestamp.Before(target) && (!ok || c.Timestamp.After(latest)) {
 			out = c.Close
+			latest = c.Timestamp
 			ok = true
 		}
+	}
+	if !ok || target.Sub(latest) > strengthSnapshotMaxLag {
+		return 0, false
 	}
 	return out, ok
 }

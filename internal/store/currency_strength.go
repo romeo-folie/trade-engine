@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -14,37 +15,64 @@ import (
 // strategy. Order fill fields may remain zero when the broker acknowledges a
 // market order before reporting its execution.
 type CurrencyStrengthRun struct {
-	ID                string
-	AccountID         string
-	SessionDate       time.Time
-	Status            string
-	Timezone          string
-	StrengthStart     string
-	StrengthEnd       string
-	ExitTime          string
-	RankInstruments   []string
-	TradeInstruments  []string
-	Units             int
-	StrongestCurrency string
-	WeakestCurrency   string
-	StrengthGap       float64
-	SignalSymbol      string
-	SignalSide        string
-	SkipReason        string
-	EntryOrderID      string
-	EntryStatus       string
-	EntryFillPrice    float64
-	EntryFilledQty    float64
-	EnteredAt         *time.Time
-	ExitOrderID       string
-	ExitStatus        string
-	ExitFillPrice     float64
-	ExitFilledQty     float64
-	ExitedAt          *time.Time
-	RealizedPnL       *float64
-	Error             string
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID                  string
+	AccountID           string
+	SessionDate         time.Time
+	Status              string
+	Timezone            string
+	StrengthStart       string
+	StrengthEnd         string
+	ExitTime            string
+	RankInstruments     []string
+	TradeInstruments    []string
+	Units               int
+	StrongestCurrency   string
+	WeakestCurrency     string
+	StrengthGap         float64
+	SignalSymbol        string
+	SignalSide          string
+	SkipReason          string
+	EntryOrderID        string
+	EntryStatus         string
+	EntryFillPrice      float64
+	EntryFilledQty      float64
+	EnteredAt           *time.Time
+	ExitOrderID         string
+	ExitStatus          string
+	ExitFillPrice       float64
+	ExitFilledQty       float64
+	ExitedAt            *time.Time
+	RealizedPnL         *float64
+	Error               string
+	DecisionDiagnostics json.RawMessage
+	CreatedAt           time.Time
+	UpdatedAt           time.Time
+}
+
+// RecordCurrencyStrengthEvaluation persists the full decision explanation
+// before any broker order is submitted. The status remains evaluating until a
+// no-signal or entry outcome is recorded.
+func RecordCurrencyStrengthEvaluation(
+	ctx context.Context,
+	db *pgxpool.Pool,
+	run CurrencyStrengthRun,
+) error {
+	diagnostics := run.DecisionDiagnostics
+	if len(diagnostics) == 0 {
+		diagnostics = json.RawMessage(`{}`)
+	}
+	tag, err := db.Exec(ctx, `
+		UPDATE currency_strength_runs
+		SET strongest_currency=NULLIF($3,''), weakest_currency=NULLIF($4,''),
+		    strength_gap=NULLIF($5, 0::double precision),
+		    signal_symbol=NULLIF($6,''), signal_side=NULLIF($7,''),
+		    decision_diagnostics=$8::jsonb, updated_at=NOW()
+		WHERE account_id=$1 AND session_date=$2
+		  AND status IN ('scheduled', 'evaluating')`,
+		run.AccountID, run.SessionDate, run.StrongestCurrency, run.WeakestCurrency,
+		run.StrengthGap, run.SignalSymbol, run.SignalSide, diagnostics,
+	)
+	return requireCurrencyStrengthRow(tag.RowsAffected(), err, "record evaluation")
 }
 
 // StartCurrencyStrengthRun creates today's audit row without erasing a decision
@@ -72,6 +100,13 @@ func StartCurrencyStrengthRun(
 			rank_instruments=EXCLUDED.rank_instruments,
 			trade_instruments=EXCLUDED.trade_instruments,
 			units=EXCLUDED.units,
+			strongest_currency=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.strongest_currency END,
+			weakest_currency=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.weakest_currency END,
+			strength_gap=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.strength_gap END,
+			signal_symbol=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.signal_symbol END,
+			signal_side=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.signal_side END,
+			skip_reason=CASE WHEN currency_strength_runs.status='failed' THEN NULL ELSE currency_strength_runs.skip_reason END,
+			decision_diagnostics=CASE WHEN currency_strength_runs.status='failed' THEN '{}'::jsonb ELSE currency_strength_runs.decision_diagnostics END,
 			error=NULL,
 			updated_at=NOW()
 		WHERE currency_strength_runs.status IN ('scheduled', 'evaluating', 'failed')`,
@@ -292,7 +327,7 @@ func GetCurrencyStrengthRunByDate(
 		       entered_at, COALESCE(exit_order_id,''), COALESCE(exit_status,''),
 		       COALESCE(exit_fill_price,0), COALESCE(exit_filled_qty,0),
 		       exited_at, realized_pnl, COALESCE(error,''),
-		       created_at, updated_at
+		       decision_diagnostics, created_at, updated_at
 		FROM currency_strength_runs
 		WHERE account_id=$1 AND session_date=$2`,
 		accountID, sessionDate,
@@ -327,7 +362,7 @@ func GetActiveCurrencyStrengthRun(
 		       entered_at, COALESCE(exit_order_id,''), COALESCE(exit_status,''),
 		       COALESCE(exit_fill_price,0), COALESCE(exit_filled_qty,0),
 		       exited_at, realized_pnl, COALESCE(error,''),
-		       created_at, updated_at
+		       decision_diagnostics, created_at, updated_at
 		FROM currency_strength_runs
 		WHERE account_id=$1 AND session_date <= $2
 		  AND (
@@ -402,7 +437,7 @@ func ListCurrencyStrengthRunsPageAt(
 		       entered_at, COALESCE(exit_order_id,''), COALESCE(exit_status,''),
 		       COALESCE(exit_fill_price,0), COALESCE(exit_filled_qty,0),
 		       exited_at, realized_pnl, COALESCE(error,''),
-		       created_at, updated_at
+		       decision_diagnostics, created_at, updated_at
 		FROM currency_strength_runs
 		WHERE ($3::timestamptz IS NULL OR created_at <= $3)
 		ORDER BY session_date DESC, created_at DESC, id DESC
@@ -439,7 +474,7 @@ func scanCurrencyStrengthRun(scanner currencyStrengthScanner, run *CurrencyStren
 		&run.EntryOrderID, &run.EntryStatus, &run.EntryFillPrice,
 		&run.EntryFilledQty, &run.EnteredAt, &run.ExitOrderID,
 		&run.ExitStatus, &run.ExitFillPrice, &run.ExitFilledQty,
-		&run.ExitedAt, &run.RealizedPnL, &run.Error,
+		&run.ExitedAt, &run.RealizedPnL, &run.Error, &run.DecisionDiagnostics,
 		&run.CreatedAt, &run.UpdatedAt,
 	)
 }
