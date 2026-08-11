@@ -111,7 +111,7 @@ func (liveStore) UpdateExitingTradeQuantity(ctx context.Context, id string, quan
 func (liveStore) UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, expectedBrokerOrderID, newBrokerOrderID string,
-	expectedFilledQty, newStopPrice, newQuantity float64,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
@@ -121,7 +121,7 @@ func (liveStore) UpdateOrderStopReplacement(
 		return errStoreNotConnected
 	}
 	return store.UpdateOrderStopReplacement(
-		ctx, orderID, expectedBrokerOrderID, newBrokerOrderID, expectedFilledQty, newStopPrice, newQuantity,
+		ctx, orderID, expectedBrokerOrderID, newBrokerOrderID, expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
 		status, filledPrice, filledQty, filledAt, intent,
 	)
 }

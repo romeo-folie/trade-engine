@@ -264,13 +264,6 @@ Modes:
 			}
 		}
 
-		if trailingMgr != nil {
-			// Manager.Run evaluates exits immediately. Start it only after event
-			// subscribers are registered so a boot-tick close cannot be lost.
-			eng.SetTrailingManagerAvailable(true)
-			go trailingMgr.Run(ctx)
-		}
-
 		sigs := make(chan os.Signal, 1)
 		signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
 
@@ -999,7 +992,18 @@ Modes:
 		// drift alert immediately before the exit sweep closes it.
 		exitReconcileOK := eng.ReconcileExitsNow(ctx)
 		if !exitReconcileOK {
-			logger.Warn("startup exit reconciliation incomplete — deferring broker/DB drift comparison")
+			logger.Warn("startup exit reconciliation incomplete — blocking trading until broker exit truth is complete")
+			exitReconcileOK = retryExitReconciliation(ctx, 5*time.Second, eng.ReconcileExitsNow)
+			if !exitReconcileOK {
+				return ctx.Err()
+			}
+		}
+		if trailingMgr != nil {
+			// Manager.Run evaluates exits immediately. Start it only after event
+			// subscribers are registered and startup reconciliation has proved
+			// broker exit truth complete.
+			eng.SetTrailingManagerAvailable(true)
+			go trailingMgr.Run(ctx)
 		}
 
 		// Startup broker-vs-DB reconciler (Issue #313). Emits WARN per ticker
@@ -1014,7 +1018,7 @@ Modes:
 		var brokerRecon execution.BrokerView
 		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
 			brokerRecon = bv
-		} else if exitReconcileOK {
+		} else {
 			engine.ReconcileBrokerVsDBWithStoreStatus(ctx, nil, 0)
 		}
 		sendDriftAlert := func(alertCtx context.Context, items []engine.BrokerDrift, adopted []string) {
@@ -1064,24 +1068,10 @@ Modes:
 					},
 				})
 			}
-			if exitReconcileOK {
-				if initial, ok := initializeBrokerReconciliation(ctx); ok {
-					go startBrokerReconciliationLoop(ctx, initial)
-				} else {
-					go retryBrokerReconciliation(ctx, 5*time.Second, initializeBrokerReconciliation, startBrokerReconciliationLoop)
-				}
+			if initial, ok := initializeBrokerReconciliation(ctx); ok {
+				go startBrokerReconciliationLoop(ctx, initial)
 			} else {
-				// A transient protective-order failure must defer drift comparison,
-				// not disable orphan adoption for the rest of this process. Retry in
-				// the background and start the normal drift loop once exit truth is
-				// complete.
-				go retryExitReconciliation(ctx, 5*time.Second, eng.ReconcileExitsNow, func(reconcileCtx context.Context) {
-					if initial, ok := initializeBrokerReconciliation(reconcileCtx); ok {
-						startBrokerReconciliationLoop(reconcileCtx, initial)
-						return
-					}
-					retryBrokerReconciliation(reconcileCtx, 5*time.Second, initializeBrokerReconciliation, startBrokerReconciliationLoop)
-				})
+				go retryBrokerReconciliation(ctx, 5*time.Second, initializeBrokerReconciliation, startBrokerReconciliationLoop)
 			}
 		}
 
@@ -1121,21 +1111,19 @@ func retryExitReconciliation(
 	ctx context.Context,
 	interval time.Duration,
 	reconcile func(context.Context) bool,
-	onComplete func(context.Context),
-) {
-	if interval <= 0 || reconcile == nil || onComplete == nil {
-		return
+) bool {
+	if interval <= 0 || reconcile == nil {
+		return false
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return false
 		case <-ticker.C:
 			if reconcile(ctx) {
-				onComplete(ctx)
-				return
+				return true
 			}
 		}
 	}

@@ -24,6 +24,8 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 		selected   []string
 		want       string
 		collision  bool
+		nullSymbol bool
+		withTrade  bool
 	}
 	fixtures := []fixture{
 		{name: "selected index", day: 0, selected: []string{"MNQ", "MYM"}, want: "futures_index_orb"},
@@ -32,6 +34,8 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 		{name: "empty", day: 3, want: "equity_orb"},
 		{name: "target owner collision", day: 4, selected: []string{"MNQ"}, want: "equity_orb", collision: true},
 		{name: "recognized plus blank candidate", day: 5, selected: []string{"MNQ"}, candidates: `[{"score":{"summary":"missing gap identity"}}]`, want: "equity_orb"},
+		{name: "recognized plus null selected", day: 6, selected: []string{"MNQ"}, want: "equity_orb", nullSymbol: true},
+		{name: "session with trade", day: 7, selected: []string{"MNQ"}, want: "equity_orb", withTrade: true},
 	}
 	ids := make(map[string]string, len(fixtures))
 	cleanupIDs := make([]string, 0, len(fixtures)+1)
@@ -66,6 +70,18 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 		}
 		ids[f.name] = id
 		cleanupIDs = append(cleanupIDs, id)
+		if f.nullSymbol {
+			if _, err := db.Exec(ctx, `UPDATE orb_sessions SET selected=ARRAY['MNQ',NULL]::text[] WHERE id=$1`, id); err != nil {
+				t.Fatalf("%s: add null selected evidence: %v", f.name, err)
+			}
+		}
+		if f.withTrade {
+			if _, err := db.Exec(ctx, `
+				INSERT INTO orb_trades (session_id,ticker,side,status,asset_class,owner_scope)
+				VALUES ($1,'MNQ','buy','pending','futures','equity_orb')`, id); err != nil {
+				t.Fatalf("%s: seed existing trade: %v", f.name, err)
+			}
+		}
 	}
 
 	sql, err := os.ReadFile(filepath.Join(findMigrationsDir(), "081_orb_session_owner_backfill.sql"))

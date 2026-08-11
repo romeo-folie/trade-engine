@@ -340,7 +340,7 @@ func applyPartialExitAt(
 	).Scan(&remaining); err != nil {
 		return 0, 0, err
 	}
-	if intent != nil {
+	if intent != nil && applied > 0 {
 		if _, err = tx.Exec(ctx, `
 			UPDATE trades
 			SET exit_reason=NULLIF($2,''), exit_evidence=$3::jsonb

@@ -12,7 +12,7 @@ WITH symbol_evidence AS (
 
     UNION
 
-    SELECT s.id, UPPER(BTRIM(selected_symbol))
+    SELECT s.id, UPPER(BTRIM(COALESCE(selected_symbol, '')))
     FROM orb_sessions s
     CROSS JOIN LATERAL unnest(COALESCE(s.selected, ARRAY[]::TEXT[])) AS selected_symbol
     WHERE s.session_name = 'futures'
@@ -42,6 +42,10 @@ WITH symbol_evidence AS (
     JOIN inferred i ON i.session_id = s.id AND i.owner_scope IS NOT NULL
     WHERE s.session_name = 'futures'
       AND s.owner_scope = 'equity_orb'
+      AND NOT EXISTS (
+          SELECT 1 FROM orb_trades existing_trade
+          WHERE existing_trade.session_id = s.id
+      )
       AND NOT EXISTS (
           SELECT 1
           FROM orb_sessions sibling

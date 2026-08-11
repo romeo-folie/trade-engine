@@ -13,19 +13,24 @@ func TestRetryExitReconciliationRunsCompletionAfterTransientFailures(t *testing.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	var attempts atomic.Int32
-	completed := make(chan struct{})
-	go retryExitReconciliation(ctx, time.Millisecond, func(context.Context) bool {
+	if completed := retryExitReconciliation(ctx, time.Millisecond, func(context.Context) bool {
 		return attempts.Add(1) == 3
-	}, func(context.Context) {
-		close(completed)
-	})
-	select {
-	case <-completed:
-		if got := attempts.Load(); got != 3 {
-			t.Fatalf("attempts = %d, want 3", got)
-		}
-	case <-ctx.Done():
+	}); !completed {
 		t.Fatal("retry did not complete")
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("attempts = %d, want 3", got)
+	}
+}
+
+func TestRetryExitReconciliationStopsWhenStartupIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if completed := retryExitReconciliation(ctx, time.Millisecond, func(context.Context) bool {
+		t.Fatal("reconciliation ran after cancellation")
+		return true
+	}); completed {
+		t.Fatal("cancelled startup reported reconciliation complete")
 	}
 }
 

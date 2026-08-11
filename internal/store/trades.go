@@ -391,13 +391,35 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 func UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, expectedBrokerOrderID, newBrokerOrderID string,
-	expectedFilledQty, newStopPrice, newQuantity float64,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
 	intent ExitIntent,
 ) error {
-	tag, err := GetDB().Exec(ctx, `
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var actualBrokerOrderID string
+	var actualFilledQty, actualTradeQuantity float64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(o.broker_order_id,''), COALESCE(o.filled_qty,0), t.quantity
+		FROM trades t
+		JOIN orders o ON o.trade_id=t.id
+		WHERE o.id=$1
+		FOR UPDATE OF t, o`, orderID).Scan(
+		&actualBrokerOrderID, &actualFilledQty, &actualTradeQuantity,
+	); err != nil {
+		return err
+	}
+	if actualBrokerOrderID != expectedBrokerOrderID ||
+		math.Abs(actualFilledQty-expectedFilledQty) > 1e-9 ||
+		math.Abs(actualTradeQuantity-expectedTradeQuantity) > 1e-9 {
+		return fmt.Errorf("%w: stop row %s or its trade changed while broker replacement was in flight", ErrOrderBrokerIDChanged, orderID)
+	}
+	if _, err = tx.Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
@@ -410,19 +432,13 @@ func UpdateOrderStopReplacement(
 		    exit_reason = NULLIF($8, ''),
 		    exit_evidence = $9::jsonb,
 		    updated_at = NOW()
-		WHERE id = $10
-		  AND COALESCE(broker_order_id,'') = $11
-		  AND COALESCE(filled_qty,0) = $12::NUMERIC`,
+		WHERE id = $10`,
 		newStopPrice, newBrokerOrderID, newQuantity, status,
 		filledPrice, filledQty, nullableTime(filledAt), intent.Reason,
-		nullableRawJSON(intent.Evidence), orderID, expectedBrokerOrderID, expectedFilledQty)
-	if err != nil {
+		nullableRawJSON(intent.Evidence), orderID); err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%w: stop row %s changed while broker replacement was in flight", ErrOrderBrokerIDChanged, orderID)
-	}
-	return nil
+	return tx.Commit(ctx)
 }
 
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
@@ -743,11 +759,10 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 // the row must stay sweepable until the broker reports the fill complete.
 // Filled terminal rows are included regardless of claim time because a
 // protective stop may have filled just before the worker claimed the trade.
-// Protective rows remain eligible after a concurrent exit claim even when
-// they predate it: a stop can fill while the new owner is cancelling it, and
-// that broker result must remain retryable if immediate persistence fails.
-// Other zero-fill cancelled/rejected rows are included only when they belong
-// to the current exit claim, so stale rows cannot suppress orderless recovery.
+// Working protective rows remain eligible after a concurrent exit claim even
+// when they predate it: a stop can fill while the new owner is cancelling it.
+// Pre-claim terminal rows remain eligible only with unapplied durable fill
+// evidence; stale zero-fill cancellations must not suppress orderless recovery.
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
 		WITH selected_trades AS (
@@ -761,7 +776,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		             (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0 OR
 		              o.is_stop_loss OR o.is_take_profit))
 		         OR (o.status IN ('filled','cancelled','rejected') AND
-		             (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
+		             (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
 		              o.created_at >= t.exit_claimed_at))
 		          ))
 		        )
@@ -796,7 +811,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0 OR
 		            o.is_stop_loss OR o.is_take_profit))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
-		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
+		           (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
 		            o.created_at >= t.exit_claimed_at))
 		        ))
 		      )

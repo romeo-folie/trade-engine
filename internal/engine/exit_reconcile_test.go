@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	"sync/atomic"
@@ -245,6 +246,20 @@ func TestStartupExitReconcileReportsProtectivePollFailure(t *testing.T) {
 	}
 }
 
+func TestStartupClaimedExitTimeoutRemainsRetryable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if startupClaimedExitComplete(ctx, ExitReconcileStats{}) {
+		t.Fatal("timed-out claimed-exit sweep was cached as complete")
+	}
+	if startupClaimedExitComplete(context.Background(), ExitReconcileStats{Errors: 1}) {
+		t.Fatal("errored claimed-exit sweep was cached as complete")
+	}
+	if !startupClaimedExitComplete(context.Background(), ExitReconcileStats{}) {
+		t.Fatal("clean claimed-exit sweep was not cached as complete")
+	}
+}
+
 func TestClaimedExitReconcileDoesNotApplyReplacedProtectiveFill(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
@@ -276,7 +291,7 @@ func TestClaimedExitReconcileDoesNotApplyReplacedProtectiveFill(t *testing.T) {
 			return
 		}
 		if updateErr := store.UpdateOrderStopReplacement(
-			ctx, orderID, "exit-recon-old-stop", "exit-recon-new-stop", 0, 96, 5, "pending", 0, 0, time.Time{},
+			ctx, orderID, "exit-recon-old-stop", "exit-recon-new-stop", 0, 5, 96, 5, "pending", 0, 0, time.Time{},
 			store.ExitIntent{Reason: store.ExitReasonStopLoss},
 		); updateErr != nil {
 			t.Fatalf("UpdateOrderStopReplacement: %v", updateErr)
@@ -368,16 +383,17 @@ func (f *fakeExitExecutor) GetOrderStatus(_ context.Context, brokerOrderID strin
 
 // fakeExitStore records reconciler mutations in memory.
 type fakeExitStore struct {
-	pending      []store.PendingExitOrder
-	pendingErr   error
-	tradeExitErr error                 // injected UpdateTradeExit failure
-	orderFills   map[string][2]float64 // broker_order_id → {price, qty}
-	tradeExits   map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
-	orderStatus  map[string]string     // broker_order_id → status
-	tradeQty     map[string]float64
-	appliedFill  map[string]float64
-	orderFillAt  map[string]time.Time
-	tradeFillAt  map[string]time.Time
+	pending           []store.PendingExitOrder
+	pendingErr        error
+	tradeExitErr      error                 // injected UpdateTradeExit failure
+	orderFills        map[string][2]float64 // broker_order_id → {price, qty}
+	tradeExits        map[string][3]float64 // trade_id → {exit, pnl, pnlPct}
+	orderStatus       map[string]string     // broker_order_id → status
+	tradeQty          map[string]float64
+	appliedFill       map[string]float64
+	orderFillAt       map[string]time.Time
+	tradeFillAt       map[string]time.Time
+	protectiveIntents map[string]store.ExitIntent
 }
 
 type recoveryExitStore struct {
@@ -448,14 +464,15 @@ func (f *recoveryExitStore) ReleaseTradeExitClaim(_ context.Context, id string) 
 
 func newFakeExitStore(pending ...store.PendingExitOrder) *fakeExitStore {
 	return &fakeExitStore{
-		pending:     pending,
-		orderFills:  map[string][2]float64{},
-		tradeExits:  map[string][3]float64{},
-		orderStatus: map[string]string{},
-		tradeQty:    map[string]float64{},
-		appliedFill: map[string]float64{},
-		orderFillAt: map[string]time.Time{},
-		tradeFillAt: map[string]time.Time{},
+		pending:           pending,
+		orderFills:        map[string][2]float64{},
+		tradeExits:        map[string][3]float64{},
+		orderStatus:       map[string]string{},
+		tradeQty:          map[string]float64{},
+		appliedFill:       map[string]float64{},
+		orderFillAt:       map[string]time.Time{},
+		tradeFillAt:       map[string]time.Time{},
+		protectiveIntents: map[string]store.ExitIntent{},
 	}
 }
 
@@ -525,6 +542,7 @@ func (f *fakeExitStore) ApplyProtectiveExitAtForBrokerOrder(
 	ctx context.Context, tradeID, orderID, _ string, price, cumulativeQty float64,
 	status string, filledAt time.Time, intent store.ExitIntent,
 ) (float64, float64, error) {
+	f.protectiveIntents[orderID] = intent
 	return f.ApplyPartialExitAt(ctx, tradeID, orderID, price, cumulativeQty, status, filledAt)
 }
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
@@ -871,6 +889,34 @@ func TestExitReconcileCancelledMarksOrderNotTrade(t *testing.T) {
 	}
 }
 
+func TestZeroFillProtectiveOrderDoesNotOverwriteSoftwareExitIntent(t *testing.T) {
+	protective := store.PendingExitOrder{
+		OrderID: "protective-row", BrokerOrderID: "protective-order", Ticker: "AAPL",
+		TradeID: "claimed-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 5, OrderQuantity: 5, TradeStatus: "exiting",
+		IsStopLoss: true, OrderExitReason: store.ExitReasonStopLoss,
+	}
+	software := protective
+	software.OrderID = "software-row"
+	software.BrokerOrderID = "software-order"
+	software.IsStopLoss = false
+	software.OrderExitReason = store.ExitReasonSellSignal
+	db := newFakeExitStore(protective, software)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"protective-order": {Status: "cancelled", FilledQty: 0},
+		"software-order":   {Status: "filled", FilledPrice: 101, FilledQty: 5},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.Errors != 0 || len(stats.Closed) != 1 {
+		t.Fatalf("stats = %+v, want one clean software close", stats)
+	}
+	if _, overwritten := db.protectiveIntents[protective.OrderID]; overwritten {
+		t.Fatal("zero-fill protective order overwrote the software exit intent")
+	}
+}
+
 func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 	p2 := lacExit()
 	p2.OrderID, p2.BrokerOrderID, p2.TradeID = "o2", "b2", "t2"
@@ -895,6 +941,81 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 	if len(db.orderFills) != 0 || len(db.tradeExits) != 0 || len(db.orderStatus) != 0 {
 		t.Fatalf("no mutations expected; got fills=%v exits=%v status=%v",
 			db.orderFills, db.tradeExits, db.orderStatus)
+	}
+}
+
+func TestClaimedExitReconcilePersistsWorkingProtectivePartial(t *testing.T) {
+	p := store.PendingExitOrder{
+		OrderID: "partial-stop-row", BrokerOrderID: "partial-stop", Ticker: "AAPL",
+		TradeID: "claimed-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 10, OrderQuantity: 10, TradeStatus: "exiting",
+		IsStopLoss: true, OrderExitReason: store.ExitReasonTrailingATR,
+	}
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"partial-stop": {Status: "partially_filled", FilledPrice: 98, FilledQty: 4},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.StillPending != 1 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want one clean working partial", stats)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 6 {
+		t.Fatalf("remaining trade quantity = %.6f, want 6", got)
+	}
+	if got := db.appliedFill[p.OrderID]; got != 4 {
+		t.Fatalf("durable partial fill = %.6f, want 4", got)
+	}
+}
+
+func TestClaimedSoftwareProtectiveFillPreservesTradeIntentEvidence(t *testing.T) {
+	evidence := json.RawMessage(`{"current_price":111,"take_profit":110}`)
+	p := store.PendingExitOrder{
+		OrderID: "software-tp-row", BrokerOrderID: "software-tp", Ticker: "AAPL",
+		TradeID: "claimed-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 5, OrderQuantity: 5, TradeStatus: "exiting",
+		ExitReason: store.ExitReasonTakeProfit, ExitEvidence: evidence,
+		IsTakeProfit: true,
+	}
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"software-tp": {Status: "filled", FilledPrice: 111, FilledQty: 5},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if stats.Errors != 0 || len(stats.Closed) != 1 {
+		t.Fatalf("stats = %+v, want one clean close", stats)
+	}
+	got := db.protectiveIntents[p.OrderID]
+	if got.Reason != p.ExitReason || string(got.Evidence) != string(evidence) {
+		t.Fatalf("applied intent = %q %s, want trade intent %q %s",
+			got.Reason, got.Evidence, p.ExitReason, evidence)
+	}
+}
+
+func TestClaimedExitReconcileDoesNotDoubleApplyRecordedWorkingPartial(t *testing.T) {
+	p := store.PendingExitOrder{
+		OrderID: "recorded-partial-row", BrokerOrderID: "recorded-partial", Ticker: "AAPL",
+		TradeID: "claimed-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 10, OrderQuantity: 10, TradeStatus: "exiting",
+		RecordedFill: 4, RecordedPrice: 98,
+	}
+	db := newFakeExitStore(p)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"recorded-partial": {Status: "partially_filled", FilledPrice: 98, FilledQty: 4},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.StillPending != 1 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want one clean working partial", stats)
+	}
+	if got := db.tradeQty[p.TradeID]; got != 6 {
+		t.Fatalf("remaining trade quantity = %.6f, want 6", got)
+	}
+	if got := db.appliedFill[p.OrderID]; got != 4 {
+		t.Fatalf("durable applied fill = %.6f, want cumulative 4", got)
 	}
 }
 
@@ -1035,6 +1156,32 @@ func TestOrderlessEMARecoveryDoesNotMarkMarketExitAsStopLoss(t *testing.T) {
 	}
 	if db.inserted[0].IsStopLoss || db.inserted[0].IsTakeProfit {
 		t.Fatalf("EMA reconstructed order has bracket flags: %+v", db.inserted[0])
+	}
+}
+
+func TestOrderlessTrailingRecoveryPreservesExitIntent(t *testing.T) {
+	evidence := json.RawMessage(`{"trailing_stop":98}`)
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "exiting",
+		EntryPrice: 100, Quantity: 5,
+		ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence,
+	}
+	db := &recoveryExitStore{
+		fakeExitStore: newFakeExitStore(), orderless: []store.Trade{trade}, owned: []store.Trade{trade},
+	}
+	ex := &recoveryExitExecutor{
+		fakeExitExecutor: &fakeExitExecutor{},
+		positions:        []execution.Position{{Ticker: "AAPL", Quantity: 5, Side: "long"}},
+		working:          []execution.WorkingOrder{{OrderID: "trailing-exit", Ticker: "AAPL", Side: "sell", Status: "pending"}},
+	}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+	if stats.Recovered != 1 || len(db.inserted) != 1 {
+		t.Fatalf("stats=%+v inserted=%+v, want reconstructed trailing order", stats, db.inserted)
+	}
+	got := db.inserted[0]
+	if !got.IsStopLoss || got.ExitReason != store.ExitReasonTrailingATR || string(got.ExitEvidence) != string(evidence) {
+		t.Fatalf("reconstructed trailing intent = %+v, want reason/evidence preserved", got)
 	}
 }
 
