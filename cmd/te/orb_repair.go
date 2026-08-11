@@ -122,7 +122,7 @@ func runORBRepair(cmd *cobra.Command, _ []string) error {
 			return fmt.Errorf("trade %s status is %q, expected %q", t.ID, t.Status, action.ExpectStatus)
 		}
 		if action.Close != nil {
-			if err := validateORBRepairTarget(*t); err != nil {
+			if err := validateORBRepairCloseTarget(*t, action); err != nil {
 				return err
 			}
 			if _, err := orbRepairCloseTime(*t, action.Close.ClosedAt); err != nil {
@@ -370,6 +370,16 @@ func validateORBRepairTarget(t store.ORBTrade) error {
 	if t.FillPrice <= 0 || t.Qty <= 0 || (t.Side != "buy" && t.Side != "sell") {
 		return fmt.Errorf("trade %s has invalid stored entry economics (side=%q fill_price=%v qty=%d)",
 			t.ID, t.Side, t.FillPrice, t.Qty)
+	}
+	return nil
+}
+
+func validateORBRepairCloseTarget(t store.ORBTrade, action orbTradeRepair) error {
+	if err := validateORBRepairTarget(t); err != nil {
+		return err
+	}
+	if action.AssetClass == "option" && t.Multiplier <= 1 {
+		return fmt.Errorf("trade %s option repair requires a durable contract multiplier greater than 1 (stored=%d)", t.ID, t.Multiplier)
 	}
 	return nil
 }

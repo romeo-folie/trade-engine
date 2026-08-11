@@ -31,16 +31,31 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 		{name: "mixed", day: 2, selected: []string{"MNQ", "MGC"}, want: "equity_orb"},
 		{name: "empty", day: 3, want: "equity_orb"},
 		{name: "target owner collision", day: 4, selected: []string{"MNQ"}, want: "equity_orb", collision: true},
+		{name: "recognized plus blank candidate", day: 5, selected: []string{"MNQ"}, candidates: `[{"score":{"summary":"missing gap identity"}}]`, want: "equity_orb"},
 	}
 	ids := make(map[string]string, len(fixtures))
+	cleanupIDs := make([]string, 0, len(fixtures)+1)
+	t.Cleanup(func() {
+		if len(cleanupIDs) == 0 || !store.IsConnected() {
+			return
+		}
+		if _, err := store.GetDB().Exec(context.Background(),
+			`DELETE FROM orb_sessions WHERE id = ANY($1::uuid[])`, cleanupIDs,
+		); err != nil {
+			t.Errorf("cleanup migration 081 fixtures: %v", err)
+		}
+	})
 	for _, f := range fixtures {
 		date := base.AddDate(0, 0, f.day)
 		if f.collision {
-			if _, err := db.Exec(ctx, `
+			var collisionID string
+			if err := db.QueryRow(ctx, `
 				INSERT INTO orb_sessions (date,status,session_name,candidates,selected,asset_class,owner_scope)
-				VALUES ($1,'done','futures','[]'::jsonb,ARRAY['MNQ'],'futures','futures_index_orb')`, date); err != nil {
+				VALUES ($1,'done','futures','[]'::jsonb,ARRAY['MNQ'],'futures','futures_index_orb')
+				RETURNING id`, date).Scan(&collisionID); err != nil {
 				t.Fatalf("%s: seed collision: %v", f.name, err)
 			}
+			cleanupIDs = append(cleanupIDs, collisionID)
 		}
 		var id string
 		if err := db.QueryRow(ctx, `
@@ -50,6 +65,7 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 			t.Fatalf("%s: seed session: %v", f.name, err)
 		}
 		ids[f.name] = id
+		cleanupIDs = append(cleanupIDs, id)
 	}
 
 	sql, err := os.ReadFile(filepath.Join(findMigrationsDir(), "081_orb_session_owner_backfill.sql"))

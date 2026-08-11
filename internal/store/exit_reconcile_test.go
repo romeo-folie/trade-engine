@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"reflect"
 	"testing"
@@ -155,18 +156,27 @@ func TestGetPendingExitOrdersExcludesStaleTerminalRowsOnExitingTrade(t *testing.
 	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
 		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
 	}
-	assertStaleNotOwned := func(stage string) {
+	assertClaimOwned := func(stage string, want, requirePresent bool) {
 		owners, err := store.GetDurableExitOrderOwnership(ctx)
 		if err != nil {
 			t.Fatalf("%s GetDurableExitOrderOwnership: %v", stage, err)
 		}
 		for _, owner := range owners {
-			if owner.BrokerOrderID == "brk-xrc-stale" && owner.ClaimOwned {
-				t.Fatalf("%s stale protective stop owns current claim: %+v", stage, owner)
+			if owner.BrokerOrderID == "brk-xrc-stale" {
+				if owner.ClaimOwned != want {
+					t.Fatalf("%s protective stop ownership = %v, want %v: %+v", stage, owner.ClaimOwned, want, owner)
+				}
+				return
 			}
 		}
+		if requirePresent {
+			t.Fatalf("%s protective stop missing from durable ownership", stage)
+		}
 	}
-	assertStaleNotOwned("pending")
+	// The pre-claim stop must be present in the broker-ID ownership snapshot
+	// without owning the later software claim. That prevents duplicate order
+	// insertion while still allowing orderless recovery to release the claim.
+	assertClaimOwned("pending", false, true)
 	// Cancelling the old protective stop after winning the exit claim updates
 	// updated_at, but it must not become the current market exit order.
 	orders, err := store.GetOrdersByTrade(ctx, tradeID)
@@ -176,7 +186,7 @@ func TestGetPendingExitOrdersExcludesStaleTerminalRowsOnExitingTrade(t *testing.
 	if err := store.UpdateOrderFill(ctx, orders[0].ID, 0, 0, "cancelled"); err != nil {
 		t.Fatalf("cancel stale protective stop: %v", err)
 	}
-	assertStaleNotOwned("cancelled")
+	assertClaimOwned("cancelled", false, false)
 	if _, err := store.InsertOrder(ctx, store.Order{
 		TradeID: tradeID, BrokerOrderID: "brk-xrc-current", Ticker: "TEST_XRC_STALE",
 		Side: "sell", OrderType: "market", Quantity: 10, Status: "pending", IsTakeProfit: true,
@@ -199,6 +209,61 @@ func TestGetPendingExitOrdersExcludesStaleTerminalRowsOnExitingTrade(t *testing.
 	}
 	if !seenCurrent {
 		t.Fatal("current pending exit row missing from reconciliation")
+	}
+}
+
+func TestGetPendingExitOrdersIncludesProtectiveOrderPredatingClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_PROTECTIVE_RACE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 10, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "brk-xrc-protective-race", Ticker: "TEST_XRC_PROTECTIVE_RACE",
+		Side: "sell", OrderType: "stop", Quantity: 10, Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET created_at=NOW()-INTERVAL '10 minutes' WHERE id=$1`, orderID); err != nil {
+		t.Fatalf("age protective order: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExit(ctx, tradeID); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExit = %v, %v", claimed, err)
+	}
+
+	rows, err := store.GetPendingExitOrders(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetPendingExitOrders: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.BrokerOrderID == "brk-xrc-protective-race" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("protective order predating the exit claim was not retryable")
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET exit_claimed_at=NOW()-INTERVAL '3 minutes' WHERE id=$1`, tradeID); err != nil {
+		t.Fatalf("age claim: %v", err)
+	}
+	orderless, err := store.GetOrderlessExitingTrades(ctx, 100)
+	if err != nil {
+		t.Fatalf("GetOrderlessExitingTrades: %v", err)
+	}
+	foundOrderless := false
+	for _, trade := range orderless {
+		foundOrderless = foundOrderless || trade.ID == tradeID
+	}
+	if !foundOrderless {
+		t.Fatal("pre-claim protective order suppressed orderless claim recovery")
 	}
 }
 
@@ -678,6 +743,73 @@ func TestFinalizeTradeExitPreservesReasonEvidenceAndBrokerFillTime(t *testing.T)
 	}
 	if replay, err := store.FinalizeTradeExit(ctx, tradeID); err == nil || replay.JustClosed {
 		t.Fatalf("replayed finalization = %+v err=%v, want no second close transition", replay, err)
+	}
+}
+
+func TestStopReplacementRejectsFillCommittedAfterSnapshot(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_REPLACE_CAS", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "replace-cas-old", Ticker: "TEST_XRC_REPLACE_CAS",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if _, _, err := store.ApplyPartialExitAtForBrokerOrder(
+		ctx, tradeID, orderID, "replace-cas-old", 94, 2, "partial", time.Now(),
+	); err != nil {
+		t.Fatalf("ApplyPartialExitAtForBrokerOrder: %v", err)
+	}
+	err = store.UpdateOrderStopReplacement(
+		ctx, orderID, "replace-cas-old", "replace-cas-new", 0,
+		96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonStopLoss},
+	)
+	if !errors.Is(err, store.ErrOrderBrokerIDChanged) {
+		t.Fatalf("UpdateOrderStopReplacement after concurrent fill = %v, want change error", err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 3 {
+		t.Fatalf("trade after rejected replacement = %+v err=%v; want quantity 3", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "replace-cas-old" || orders[0].FilledQty != 2 {
+		t.Fatalf("order after rejected replacement = %+v err=%v", orders, err)
+	}
+}
+
+func TestStopReplacementMatchesNullBrokerIDSnapshot(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_REPLACE_NULL", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, Ticker: "TEST_XRC_REPLACE_NULL", Side: "sell",
+		OrderType: "stop", Quantity: 5, StopPrice: 95, Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if err := store.UpdateOrderStopReplacement(
+		ctx, orderID, "", "replace-null-new", 0,
+		96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonStopLoss},
+	); err != nil {
+		t.Fatalf("UpdateOrderStopReplacement(NULL broker snapshot): %v", err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "replace-null-new" {
+		t.Fatalf("replacement order = %+v err=%v", orders, err)
 	}
 }
 

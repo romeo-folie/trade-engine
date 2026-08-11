@@ -337,8 +337,8 @@ func (f *fakeStore) CloseTradeRealizedWithIntent(
 
 func (f *fakeStore) UpdateOrderStopReplacement(
 	_ context.Context,
-	orderID, newBrokerOrderID string,
-	newStopPrice, newQuantity float64,
+	orderID, _, newBrokerOrderID string,
+	_, newStopPrice, newQuantity float64,
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
@@ -1997,7 +1997,7 @@ func TestLiveStore_NoDBPanicSafe(t *testing.T) {
 	if _, err := ls.InsertOrder(ctx, store.Order{}); err == nil {
 		t.Fatalf("InsertOrder(no DB): want error, got nil")
 	}
-	if err := ls.UpdateOrderStopReplacement(ctx, "o1", "broker-x", 1.0, 1.0, "pending", 0, 0, time.Time{}, store.ExitIntent{}); err == nil {
+	if err := ls.UpdateOrderStopReplacement(ctx, "o1", "broker-old", "broker-x", 0, 1.0, 1.0, "pending", 0, 0, time.Time{}, store.ExitIntent{}); err == nil {
 		t.Fatalf("UpdateOrderStopReplacement(no DB): want error, got nil")
 	}
 	if _, err := ls.CloseTradeRealizedWithIntent(ctx, "t1", 100, time.Time{}, store.ExitIntent{}); err == nil {

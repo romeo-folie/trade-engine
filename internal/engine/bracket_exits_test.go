@@ -25,6 +25,7 @@ type fakeBracketExec struct {
 	placed    []execution.OrderRequest
 	placeRes  execution.OrderResult
 	placeErr  error
+	onStatus  func(string)
 }
 
 func (f *fakeBracketExec) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
@@ -44,6 +45,9 @@ func (f *fakeBracketExec) CancelOrder(_ context.Context, id string) error {
 }
 
 func (f *fakeBracketExec) GetOrderStatus(_ context.Context, id string) (execution.OrderResult, error) {
+	if f.onStatus != nil {
+		f.onStatus(id)
+	}
 	if err, ok := f.statusErr[id]; ok {
 		return execution.OrderResult{}, err
 	}
@@ -149,6 +153,296 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 	}
 	if handled := e.reconcileBrokerExitTrade(ctx, trade, true); handled {
 		t.Fatal("polling a capped standalone stop must preserve software take-profit ownership")
+	}
+}
+
+func TestStartupReconcileAppliesWorkingCappedStopPartialAndFinalFill(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_CAPPED_LIVE_PARTIAL", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const brokerID = "capped-live-partial"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_CAPPED_LIVE_PARTIAL",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	partialAt := time.Date(2026, 8, 11, 14, 0, 0, 0, time.UTC)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		brokerID: {Status: "partial", FilledPrice: 96, FilledQty: 2, FilledAt: partialAt},
+	}}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), true); handled {
+		t.Fatal("working capped stop must preserve software take-profit ownership")
+	}
+	var quantity, realizedQty, realizedProceeds float64
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT quantity, realized_exit_qty, realized_exit_proceeds, status
+		FROM trades WHERE id=$1`, tradeID,
+	).Scan(&quantity, &realizedQty, &realizedProceeds, &status); err != nil {
+		t.Fatalf("load partially exited trade: %v", err)
+	}
+	if quantity != 3 || realizedQty != 2 || realizedProceeds != 192 || status != "open" {
+		t.Fatalf("partial trade = qty %.2f realized %.2f proceeds %.2f status %s; want 3, 2, 192, open",
+			quantity, realizedQty, realizedProceeds, status)
+	}
+
+	exec.statuses[brokerID] = execution.OrderResult{
+		Status: "filled", FilledPrice: 95, FilledQty: 5,
+		FilledAt: partialAt.Add(time.Minute),
+	}
+	if handled := e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), true); !handled {
+		t.Fatal("terminal capped stop fill must close the trade")
+	}
+	closed, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || closed == nil {
+		t.Fatalf("GetTradeByID: trade=%+v err=%v", closed, err)
+	}
+	if closed.Status != "closed" || closed.Quantity != 5 || closed.ExitPrice != 95 || closed.PnL != -25 {
+		t.Fatalf("closed trade = %+v; want qty 5, exit 95, pnl -25", closed)
+	}
+}
+
+func TestStartupReconcileDoesNotOverwriteConcurrentStopReplacement(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_CAPPED_REPLACE_RACE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const oldBrokerID = "capped-stop-old"
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: oldBrokerID, Ticker: "TEST_CAPPED_REPLACE_RACE",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	const replacementID = "capped-stop-replacement"
+	replaced := false
+	exec := &fakeBracketExec{
+		statusErr: map[string]error{oldBrokerID: execution.ErrOrderNotFound},
+		onStatus: func(id string) {
+			if id != oldBrokerID || replaced {
+				return
+			}
+			replaced = true
+			if updateErr := store.UpdateOrderStopReplacement(
+				ctx, orderID, oldBrokerID, replacementID, 0, 96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{},
+			); updateErr != nil {
+				t.Fatalf("replace stop during broker poll: %v", updateErr)
+			}
+		},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), true); handled {
+		t.Fatal("working capped replacement must preserve software take-profit ownership")
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("GetOrdersByTrade: orders=%+v err=%v", orders, err)
+	}
+	if orders[0].BrokerOrderID != replacementID || orders[0].Status != "pending" {
+		t.Fatalf("replacement row = %+v; want broker id %s pending", orders[0], replacementID)
+	}
+}
+
+func TestMonitorKeepsBrokerOwnershipWhenUncappedStopWasReplaced(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_UNCAPPED_REPLACE_RACE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 0, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const oldBrokerID = "uncapped-stop-old"
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: oldBrokerID, Ticker: "TEST_UNCAPPED_REPLACE_RACE",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	exec := &fakeBracketExec{
+		statusErr: map[string]error{oldBrokerID: execution.ErrOrderNotFound},
+		onStatus: func(id string) {
+			if id != oldBrokerID {
+				return
+			}
+			if updateErr := store.UpdateOrderStopReplacement(
+				ctx, orderID, oldBrokerID, "uncapped-stop-replacement", 0, 96, 5, "pending", 0, 0, time.Time{},
+				store.ExitIntent{Reason: store.ExitReasonStopLoss},
+			); updateErr != nil {
+				t.Fatalf("replace stop during broker poll: %v", updateErr)
+			}
+		},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("uncapped replacement stop must retain broker exit ownership")
+	}
+}
+
+func TestStartupReconcilePreservesPurgedProtectivePartialFill(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_PURGED_STOP_PARTIAL", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const brokerID = "purged-stop-partial"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_PURGED_STOP_PARTIAL",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		FilledPrice: 94, FilledQty: 2, Status: "partial", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	e := newBracketTestEngine(&fakeBracketExec{statusErr: map[string]error{brokerID: execution.ErrOrderNotFound}})
+	e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), true)
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 3 {
+		t.Fatalf("trade after purged partial = %+v err=%v; want remaining quantity 3", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].Status != "cancelled" || orders[0].FilledQty != 2 || orders[0].FilledPrice != 94 {
+		t.Fatalf("purged partial order = %+v err=%v; want durable 2 @ 94 cancelled", orders, err)
+	}
+}
+
+func TestProtectiveFillJoinsConcurrentExitClaim(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_STOP_FILL_EXISTING_CLAIM", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const brokerID = "stop-fill-existing-claim"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_STOP_FILL_EXISTING_CLAIM",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	trade := getTrade(t, tradeID)
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{
+		Reason: store.ExitReasonTakeProfit,
+	}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		brokerID: {Status: "filled", FilledPrice: 94, FilledQty: 5},
+	}}
+	e := newBracketTestEngine(exec)
+
+	if handled := e.reconcileBrokerExitTrade(ctx, trade, true); !handled {
+		t.Fatal("protective fill under an existing exit claim must be handled")
+	}
+	closed, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || closed == nil || closed.Status != "closed" || closed.ExitPrice != 94 {
+		t.Fatalf("claimed protective fill trade = %+v err=%v; want closed at 94", closed, err)
+	}
+	if closed.ExitReason != store.ExitReasonStopLoss {
+		t.Fatalf("exit reason = %q, want protective stop reason %q", closed.ExitReason, store.ExitReasonStopLoss)
+	}
+}
+
+func TestBracketFillKeepsClaimWhenLaterSiblingWasReplaced(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_BRACKET_PARTIAL_REPLACE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const parentID = "bracket-partial-replace-parent"
+	partialID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "bracket-partial-leg", ParentOrderID: parentID,
+		Ticker: "TEST_BRACKET_PARTIAL_REPLACE", Side: "sell", OrderType: "limit",
+		Quantity: 2, LimitPrice: 110, Status: "pending", IsTakeProfit: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder(partial): %v", err)
+	}
+	filledID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "bracket-filled-old", ParentOrderID: parentID,
+		Ticker: "TEST_BRACKET_PARTIAL_REPLACE", Side: "sell", OrderType: "stop",
+		Quantity: 3, StopPrice: 95, Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder(filled): %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"bracket-partial-leg": {Status: "filled", FilledPrice: 109, FilledQty: 2},
+		"bracket-filled-old":  {Status: "cancelled", FilledPrice: 94, FilledQty: 3},
+	}}
+	exec.onStatus = func(brokerOrderID string) {
+		if brokerOrderID != "bracket-filled-old" {
+			return
+		}
+		if updateErr := store.UpdateOrderStopReplacement(
+			ctx, filledID, "bracket-filled-old", "bracket-filled-replacement", 0, 96, 3, "pending", 0, 0, time.Time{},
+			store.ExitIntent{Reason: store.ExitReasonStopLoss},
+		); updateErr != nil {
+			t.Fatalf("UpdateOrderStopReplacement: %v", updateErr)
+		}
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), true); !handled {
+		t.Fatal("bracket reconciliation must retain ownership after a durable sibling fill")
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" || trade.Quantity != 3 {
+		t.Fatalf("trade after sibling replacement = %+v err=%v; want exiting with quantity 3", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	var partial store.Order
+	for _, order := range orders {
+		if order.ID == partialID {
+			partial = order
+		}
+	}
+	if partial.Status != "filled" || partial.FilledQty != 2 {
+		t.Fatalf("durable winning leg = %+v; want filled with two filled", partial)
 	}
 }
 
@@ -366,7 +660,7 @@ func TestReconcileBracket_RatchetedStopRetainsTrailingATRReason(t *testing.T) {
 		t.Fatalf("seed stale applied quantity: %v", err)
 	}
 	ratchetedID := slID + "-ratcheted"
-	if err := store.UpdateOrderStopReplacement(ctx, stopLeg.ID, ratchetedID, 97.5, 3, "pending", 0, 0, time.Time{}, intent); err != nil {
+	if err := store.UpdateOrderStopReplacement(ctx, stopLeg.ID, stopLeg.BrokerOrderID, ratchetedID, 1, 97.5, 3, "pending", 0, 0, time.Time{}, intent); err != nil {
 		t.Fatalf("tag ratcheted stop: %v", err)
 	}
 	legs, err = store.GetOrdersByTrade(ctx, tradeID)

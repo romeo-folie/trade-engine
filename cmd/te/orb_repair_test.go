@@ -117,6 +117,19 @@ func TestORBRepairPnLUsesLongOptionMultiplierForPut(t *testing.T) {
 	}
 }
 
+func TestORBRepairRejectsOptionCloseWithDefaultMultiplier(t *testing.T) {
+	trade := store.ORBTrade{
+		ID: "legacy-option", Side: "buy", FillPrice: 1.20, Qty: 2, Multiplier: 1,
+	}
+	if err := validateORBRepairCloseTarget(trade, orbTradeRepair{AssetClass: "option"}); err == nil {
+		t.Fatal("option close repair with migration-default multiplier was accepted")
+	}
+	trade.Multiplier = 100
+	if err := validateORBRepairCloseTarget(trade, orbTradeRepair{AssetClass: "option"}); err != nil {
+		t.Fatalf("option close repair with durable multiplier rejected: %v", err)
+	}
+}
+
 func TestValidateORBSessionRepairOwnership(t *testing.T) {
 	repair := orbSessionRepair{
 		SessionID: "session-1", AssetClass: "futures", OwnerScope: "futures_index_orb",

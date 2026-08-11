@@ -14,9 +14,10 @@ import (
 
 // fakeExitExecutor serves canned GetOrderStatus responses per broker order id.
 type fakeExitExecutor struct {
-	results map[string]execution.OrderResult
-	errs    map[string]error
-	calls   []string
+	results  map[string]execution.OrderResult
+	errs     map[string]error
+	calls    []string
+	onStatus func(string)
 }
 
 func TestExitReconcileTickerRunsWithoutOverlapAndStopsOnCancel(t *testing.T) {
@@ -216,6 +217,122 @@ func TestStartupExitReconcileBooksCappedStandaloneStop(t *testing.T) {
 	}
 }
 
+func TestStartupExitReconcileReportsProtectivePollFailure(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_BOOT_STOP_POLL_FAILURE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "boot-stop-poll-failure", Ticker: "TEST_BOOT_STOP_POLL_FAILURE",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	eng := newBracketTestEngine(&fakeBracketExec{statusErr: map[string]error{
+		"boot-stop-poll-failure": errors.New("temporary broker status failure"),
+	}})
+
+	if complete := eng.ReconcileExitsNow(ctx); complete {
+		t.Fatal("startup exit reconciliation reported success after a protective-leg poll failure")
+	}
+}
+
+func TestClaimedExitReconcileDoesNotApplyReplacedProtectiveFill(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_EXIT_RECON_REPLACE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "exit-recon-old-stop", Ticker: "TEST_EXIT_RECON_REPLACE",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonSellSignal}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	exec := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"exit-recon-old-stop": {Status: "filled", FilledPrice: 94, FilledQty: 5},
+	}}
+	exec.onStatus = func(brokerOrderID string) {
+		if brokerOrderID != "exit-recon-old-stop" {
+			return
+		}
+		if updateErr := store.UpdateOrderStopReplacement(
+			ctx, orderID, "exit-recon-old-stop", "exit-recon-new-stop", 0, 96, 5, "pending", 0, 0, time.Time{},
+			store.ExitIntent{Reason: store.ExitReasonStopLoss},
+		); updateErr != nil {
+			t.Fatalf("UpdateOrderStopReplacement: %v", updateErr)
+		}
+	}
+	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
+	if stats.Errors == 0 || len(stats.Closed) != 0 {
+		t.Fatalf("stale replacement reconcile stats = %+v; want retryable error and no close", stats)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" || trade.Quantity != 5 {
+		t.Fatalf("trade after stale fill = %+v err=%v; want unchanged exiting trade", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "exit-recon-new-stop" || orders[0].Status != "pending" {
+		t.Fatalf("replacement order after stale fill = %+v err=%v", orders, err)
+	}
+}
+
+func TestClaimedExitReconcileUsesPreClaimProtectiveIntent(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_EXIT_RECON_INTENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const brokerID = "exit-recon-intent-stop"
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_EXIT_RECON_INTENT",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true, ExitReason: store.ExitReasonStopLoss,
+		ExitEvidence: []byte(`{"stop_loss":95}`),
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	exec := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		brokerID: {Status: "filled", FilledPrice: 94, FilledQty: 5},
+	}}
+	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
+	if stats.Errors != 0 || len(stats.Closed) != 1 {
+		t.Fatalf("protective intent reconcile stats = %+v", stats)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" || trade.ExitReason != store.ExitReasonStopLoss {
+		t.Fatalf("protective intent trade = %+v err=%v", trade, err)
+	}
+}
+
 func TestReconcileExitsNowWithoutDBDoesNotPanic(t *testing.T) {
 	if store.IsConnected() {
 		t.Skip("requires disconnected store")
@@ -240,6 +357,9 @@ func (f *recoveryExitExecutor) GetWorkingOrders(context.Context) ([]execution.Wo
 
 func (f *fakeExitExecutor) GetOrderStatus(_ context.Context, brokerOrderID string) (execution.OrderResult, error) {
 	f.calls = append(f.calls, brokerOrderID)
+	if f.onStatus != nil {
+		f.onStatus(brokerOrderID)
+	}
 	if err, ok := f.errs[brokerOrderID]; ok {
 		return execution.OrderResult{}, err
 	}
@@ -356,6 +476,9 @@ func (f *fakeExitStore) UpdateOrderFillAt(ctx context.Context, id string, price,
 	}
 	return nil
 }
+func (f *fakeExitStore) UpdateOrderFillAtForBrokerOrder(ctx context.Context, id, _ string, price, qty float64, status string, filledAt time.Time) error {
+	return f.UpdateOrderFillAt(ctx, id, price, qty, status, filledAt)
+}
 func (f *fakeExitStore) ApplyPartialExit(
 	_ context.Context,
 	tradeID, orderID string,
@@ -391,6 +514,18 @@ func (f *fakeExitStore) ApplyPartialExitAt(
 		f.tradeFillAt[tradeID] = filledAt
 	}
 	return remaining, applied, err
+}
+func (f *fakeExitStore) ApplyPartialExitAtForBrokerOrder(
+	ctx context.Context, tradeID, orderID, _ string, price, cumulativeQty float64,
+	status string, filledAt time.Time,
+) (float64, float64, error) {
+	return f.ApplyPartialExitAt(ctx, tradeID, orderID, price, cumulativeQty, status, filledAt)
+}
+func (f *fakeExitStore) ApplyProtectiveExitAtForBrokerOrder(
+	ctx context.Context, tradeID, orderID, _ string, price, cumulativeQty float64,
+	status string, filledAt time.Time, intent store.ExitIntent,
+) (float64, float64, error) {
+	return f.ApplyPartialExitAt(ctx, tradeID, orderID, price, cumulativeQty, status, filledAt)
 }
 func (f *fakeExitStore) UpdateTradeExit(_ context.Context, id string, exit, pnl, pnlPct float64) error {
 	if f.tradeExitErr != nil {

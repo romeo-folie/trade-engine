@@ -35,7 +35,6 @@ WITH symbol_evidence AS (
                    THEN 'futures_index_orb'
            END AS owner_scope
     FROM symbol_evidence
-    WHERE symbol <> ''
     GROUP BY session_id
 ), repairable AS (
     SELECT s.id, i.owner_scope

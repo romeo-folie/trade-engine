@@ -121,6 +121,7 @@ type Engine struct {
 	lastDailySummaryUpdate time.Time
 	exitStartupMu          sync.Mutex
 	exitStartupPrepared    bool
+	positionExitMu         sync.Mutex // serializes protective reconciliation with software position exits
 
 	feedbackReviewer *feedback.Reviewer
 
@@ -2988,6 +2989,8 @@ func (e *Engine) checkExitResidue(ticker string) {
 }
 
 func (e *Engine) monitorPositions(ctx context.Context) {
+	e.positionExitMu.Lock()
+	defer e.positionExitMu.Unlock()
 	// Refresh portfolio state from executor positions.
 	e.refreshPortfolio(ctx)
 

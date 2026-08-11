@@ -155,7 +155,7 @@ type TradeStore interface {
 	UpdateOrderFill(ctx context.Context, orderID string, filledPrice, filledQty float64, status string) error
 	ApplyPartialExitAt(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (remaining, applied float64, err error)
 	UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error
-	UpdateOrderStopReplacement(ctx context.Context, orderID, newBrokerOrderID string, newStopPrice, newQuantity float64, status string, filledPrice, filledQty float64, filledAt time.Time, intent store.ExitIntent) error
+	UpdateOrderStopReplacement(ctx context.Context, orderID, expectedBrokerOrderID, newBrokerOrderID string, expectedFilledQty, newStopPrice, newQuantity float64, status string, filledPrice, filledQty float64, filledAt time.Time, intent store.ExitIntent) error
 	// CloseTradeRealizedWithIntent closes the trade after a confirmed market
 	// exit and returns lifecycle-cumulative P&L across earlier partial exits.
 	CloseTradeRealizedWithIntent(
@@ -855,7 +855,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 					}
 				}
 				if persistErr := m.store.UpdateOrderStopReplacement(
-					ctx, existing.ID, res.BrokerOrderID, newStop, existing.Quantity,
+					ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, newStop, existing.Quantity,
 					status, fillPrice, fillQty, res.FilledAt, intent,
 				); persistErr != nil {
 					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {
@@ -925,7 +925,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
 		if err := m.store.UpdateOrderStopReplacement(
-			ctx, existing.ID, res.BrokerOrderID, newStop, t.Quantity,
+			ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, newStop, t.Quantity,
 			status, fillPrice, fillQty, res.FilledAt, intent,
 		); err != nil {
 			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {

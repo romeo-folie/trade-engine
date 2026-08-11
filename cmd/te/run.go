@@ -997,7 +997,10 @@ Modes:
 		// Resolve broker-confirmed exits before comparing broker positions with
 		// DB ownership. Otherwise a stale exiting row can produce a false boot
 		// drift alert immediately before the exit sweep closes it.
-		eng.ReconcileExitsNow(ctx)
+		exitReconcileOK := eng.ReconcileExitsNow(ctx)
+		if !exitReconcileOK {
+			logger.Warn("startup exit reconciliation incomplete — deferring broker/DB drift comparison")
+		}
 
 		// Startup broker-vs-DB reconciler (Issue #313). Emits WARN per ticker
 		// where broker quantity diverges from summed DB open-trade quantity.
@@ -1008,16 +1011,12 @@ Modes:
 		// on every boot while bleeding −29%): it is alerted via Telegram, and
 		// with engine.adopt_broker_orphans the untracked positions are adopted
 		// as recovery trade rows so stops and analyst exits manage them again.
-		var drifts []engine.BrokerDrift
-		var reconcileOK bool
 		var brokerRecon execution.BrokerView
 		if bv, ok := broker.(execution.BrokerView); ok && bv != nil {
 			brokerRecon = bv
-			drifts, reconcileOK = engine.ReconcileBrokerVsDBWithStoreStatus(ctx, bv, 0)
-		} else {
+		} else if exitReconcileOK {
 			engine.ReconcileBrokerVsDBWithStoreStatus(ctx, nil, 0)
 		}
-		alertDrifts := engine.AlertableBrokerDrifts(drifts)
 		sendDriftAlert := func(alertCtx context.Context, items []engine.BrokerDrift, adopted []string) {
 			if tgBot == nil || len(items) == 0 {
 				return
@@ -1039,31 +1038,51 @@ Modes:
 				logger.Warn("telegram: failed to send drift alert", "err", err)
 			}
 		}
-		if len(alertDrifts) > 0 {
-			var adopted []string
-			if cfg.Engine.AdoptBrokerOrphans {
-				adopted = engine.AdoptBrokerOrphansWithStore(ctx, alertDrifts,
-					cfg.Risk.DefaultStopLossPct, cfg.Risk.DefaultTakeProfitPct)
-			}
-			sendDriftAlert(ctx, alertDrifts, adopted)
-		}
-
-		// Persist the boot reconciliation and keep it fresh in the background,
-		// so readers (TUI, web) can surface drift that develops between engine
-		// restarts. Newly alertable transitions notify once; adoption remains a
-		// boot-only policy decision.
-		// Persist only a reconcile that completed, so a failed boot check does
-		// not record the book as "in sync".
-		if reconcileOK {
-			engine.PersistReconciliation(ctx, drifts)
-		}
 		if brokerRecon != nil {
-			go engine.RunReconcileLoop(ctx, brokerRecon, engine.BrokerReconcileInterval, engine.ReconcileLoopOptions{
-				InitialDrifts: drifts,
-				OnNewDrifts: func(alertCtx context.Context, fresh []engine.BrokerDrift) {
-					sendDriftAlert(alertCtx, fresh, nil)
-				},
-			})
+			initializeBrokerReconciliation := func(reconcileCtx context.Context) ([]engine.BrokerDrift, bool) {
+				drifts, reconcileOK := engine.ReconcileBrokerVsDBWithStoreStatus(reconcileCtx, brokerRecon, 0)
+				if !reconcileOK {
+					return nil, false
+				}
+				alertDrifts := engine.AlertableBrokerDrifts(drifts)
+				if len(alertDrifts) > 0 {
+					var adopted []string
+					if cfg.Engine.AdoptBrokerOrphans {
+						adopted = engine.AdoptBrokerOrphansWithStore(reconcileCtx, alertDrifts,
+							cfg.Risk.DefaultStopLossPct, cfg.Risk.DefaultTakeProfitPct)
+					}
+					sendDriftAlert(reconcileCtx, alertDrifts, adopted)
+				}
+				engine.PersistReconciliation(reconcileCtx, drifts)
+				return drifts, true
+			}
+			startBrokerReconciliationLoop := func(reconcileCtx context.Context, initial []engine.BrokerDrift) {
+				engine.RunReconcileLoop(reconcileCtx, brokerRecon, engine.BrokerReconcileInterval, engine.ReconcileLoopOptions{
+					InitialDrifts: initial,
+					OnNewDrifts: func(alertCtx context.Context, fresh []engine.BrokerDrift) {
+						sendDriftAlert(alertCtx, fresh, nil)
+					},
+				})
+			}
+			if exitReconcileOK {
+				if initial, ok := initializeBrokerReconciliation(ctx); ok {
+					go startBrokerReconciliationLoop(ctx, initial)
+				} else {
+					go retryBrokerReconciliation(ctx, 5*time.Second, initializeBrokerReconciliation, startBrokerReconciliationLoop)
+				}
+			} else {
+				// A transient protective-order failure must defer drift comparison,
+				// not disable orphan adoption for the rest of this process. Retry in
+				// the background and start the normal drift loop once exit truth is
+				// complete.
+				go retryExitReconciliation(ctx, 5*time.Second, eng.ReconcileExitsNow, func(reconcileCtx context.Context) {
+					if initial, ok := initializeBrokerReconciliation(reconcileCtx); ok {
+						startBrokerReconciliationLoop(reconcileCtx, initial)
+						return
+					}
+					retryBrokerReconciliation(reconcileCtx, 5*time.Second, initializeBrokerReconciliation, startBrokerReconciliationLoop)
+				})
+			}
 		}
 
 		if err := eng.Run(ctx); err != nil {
@@ -1072,6 +1091,54 @@ Modes:
 		fmt.Println("TradeEngine stopped.")
 		return nil
 	},
+}
+
+func retryBrokerReconciliation(
+	ctx context.Context,
+	interval time.Duration,
+	reconcile func(context.Context) ([]engine.BrokerDrift, bool),
+	onComplete func(context.Context, []engine.BrokerDrift),
+) {
+	if interval <= 0 || reconcile == nil || onComplete == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if drifts, ok := reconcile(ctx); ok {
+				onComplete(ctx, drifts)
+				return
+			}
+		}
+	}
+}
+
+func retryExitReconciliation(
+	ctx context.Context,
+	interval time.Duration,
+	reconcile func(context.Context) bool,
+	onComplete func(context.Context),
+) {
+	if interval <= 0 || reconcile == nil || onComplete == nil {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if reconcile(ctx) {
+				onComplete(ctx)
+				return
+			}
+		}
+	}
 }
 
 func startDetachedRun() error {
