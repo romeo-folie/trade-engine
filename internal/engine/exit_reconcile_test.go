@@ -277,7 +277,11 @@ func TestStartupExitReconcileFinalizesFullyAppliedProtectiveFill(t *testing.T) {
 	}
 	exec := &fakeBracketExec{statusErr: map[string]error{brokerID: execution.ErrOrderNotFound}}
 	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
-	if stats.Errors != 0 || len(stats.Closed) != 1 {
+	targetClosed := false
+	for _, closed := range stats.Closed {
+		targetClosed = targetClosed || closed.TradeID == tradeID
+	}
+	if !targetClosed {
 		t.Fatalf("stats = %+v, want fully applied fill finalized", stats)
 	}
 	trade, err := store.GetTradeByID(ctx, tradeID)
@@ -297,6 +301,24 @@ func TestStartupClaimedExitTimeoutRemainsRetryable(t *testing.T) {
 	}
 	if !startupClaimedExitComplete(context.Background(), ExitReconcileStats{}) {
 		t.Fatal("clean claimed-exit sweep was not cached as complete")
+	}
+}
+
+func TestRequireStartupExitReconciliationBlocksIncompleteTruth(t *testing.T) {
+	if err := requireStartupExitReconciliation(context.Background(), time.Millisecond, func(context.Context) bool { return true }); err != nil {
+		t.Fatalf("clean reconciliation blocked startup: %v", err)
+	}
+	tries := 0
+	if err := requireStartupExitReconciliation(context.Background(), time.Millisecond, func(context.Context) bool {
+		tries++
+		return tries == 2
+	}); err != nil || tries != 2 {
+		t.Fatalf("transient reconciliation was not retried: tries=%d err=%v", tries, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := requireStartupExitReconciliation(ctx, time.Millisecond, func(context.Context) bool { return false }); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled startup returned %v, want context.Canceled", err)
 	}
 }
 
@@ -975,8 +997,8 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 
 	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
 
-	if stats.StillPending != 2 || stats.NotFound != 1 {
-		t.Fatalf("stats = %+v, want StillPending=2 NotFound=1", stats)
+	if stats.StillPending != 2 || stats.NotFound != 1 || stats.Errors != 1 {
+		t.Fatalf("stats = %+v, want StillPending=2 NotFound=1 Errors=1", stats)
 	}
 	if len(db.orderFills) != 0 || len(db.tradeExits) != 0 || len(db.orderStatus) != 0 {
 		t.Fatalf("no mutations expected; got fills=%v exits=%v status=%v",
@@ -1339,8 +1361,8 @@ func TestOrderlessRecoveryRetainsClaimForPreclaimPartialTerminalFill(t *testing.
 		t.Fatalf("preclaim partial fill was recovered a second time: released=%v closed=%v inserted=%v",
 			db.released, db.tradeExits, db.inserted)
 	}
-	if stats.NotFound != 1 || stats.Recovered != 0 {
-		t.Fatalf("stats = %+v, want one not-found and no recovery", stats)
+	if stats.NotFound != 1 || stats.Errors != 1 || stats.Recovered != 0 {
+		t.Fatalf("stats = %+v, want one unresolved not-found error and no recovery", stats)
 	}
 }
 

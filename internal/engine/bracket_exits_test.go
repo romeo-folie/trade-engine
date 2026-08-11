@@ -380,21 +380,21 @@ func TestStartupReconcilePreservesPurgedProtectivePartialFill(t *testing.T) {
 	}
 }
 
-func TestStartupReconcileTreatsPurgedCappedStopAsUnresolvedWithoutPositionProof(t *testing.T) {
+func TestStartupReconcileTreatsEveryPurgedProtectiveLegAsUnresolvedWithoutPositionProof(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
-		Ticker: "TEST_PURGED_CAPPED", Direction: "long", Strategy: "test",
-		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+		Ticker: "TEST_PURGED_PROTECTIVE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
 	})
 	if err != nil {
 		t.Fatalf("InsertTrade: %v", err)
 	}
-	const brokerID = "purged-capped-stop"
+	const brokerID = "purged-protective-stop"
 	if _, err := store.InsertOrder(ctx, store.Order{
-		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_PURGED_CAPPED",
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_PURGED_PROTECTIVE",
 		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
 		Status: "pending", IsStopLoss: true,
 	}); err != nil {
@@ -402,17 +402,17 @@ func TestStartupReconcileTreatsPurgedCappedStopAsUnresolvedWithoutPositionProof(
 	}
 	exec := &fakeBracketExec{statusErr: map[string]error{brokerID: execution.ErrOrderNotFound}}
 	e := newBracketTestEngine(exec)
-	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), true); !handled || reconcileErr == nil {
-		t.Fatalf("purged capped stop without position proof = handled %v err %v; want unresolved", handled, reconcileErr)
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false); !handled || reconcileErr == nil {
+		t.Fatalf("purged protective leg without position proof = handled %v err %v; want unresolved", handled, reconcileErr)
 	}
 	legs, err := store.OpenExitLegsForTrade(ctx, tradeID)
 	if err != nil || len(legs) != 1 || legs[0].Status != "pending" {
 		t.Fatalf("unresolved stop was terminalized: legs=%+v err=%v", legs, err)
 	}
 
-	exec.positions = []execution.Position{{Ticker: "TEST_PURGED_CAPPED", Quantity: 5, Side: "long"}}
-	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), true); handled || reconcileErr != nil {
-		t.Fatalf("purged capped stop with full holding proof = handled %v err %v; want safe software handoff", handled, reconcileErr)
+	exec.positions = []execution.Position{{Ticker: "TEST_PURGED_PROTECTIVE", Quantity: 5, Side: "long"}}
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false); handled || reconcileErr != nil {
+		t.Fatalf("purged protective leg with full holding proof = handled %v err %v; want safe software handoff", handled, reconcileErr)
 	}
 }
 

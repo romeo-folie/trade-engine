@@ -142,14 +142,14 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 						continue
 					}
 					_, ephemeralPaper := e.executor.(*execution.PaperExecutor)
-					if pollCappedStandalone && t.TakeProfit > 0 && leg.ParentOrderID == "" && !ephemeralPaper {
+					if !ephemeralPaper {
 						held, proofErr := e.brokerStillHoldsOwnedTickerQuantity(ctx, t.Ticker)
 						if proofErr != nil || !held {
 							if proofErr != nil {
-								return true, fmt.Errorf("purged capped stop %s has no durable fill and broker holdings proof failed: %w",
+								return true, fmt.Errorf("purged protective leg %s has no durable fill and broker holdings proof failed: %w",
 									leg.BrokerOrderID, proofErr)
 							}
-							return true, fmt.Errorf("purged capped stop %s has no durable fill and broker holdings do not prove cancellation",
+							return true, fmt.Errorf("purged protective leg %s has no durable fill and broker holdings do not prove cancellation",
 								leg.BrokerOrderID)
 						}
 					}

@@ -305,14 +305,32 @@ func TestGetPendingExitOrdersIncludesOnlyUnappliedPreClaimTerminalFill(t *testin
 		}
 		return false
 	}
+	claimOwned := func() bool {
+		owners, queryErr := store.GetDurableExitOrderOwnership(ctx)
+		if queryErr != nil {
+			t.Fatalf("GetDurableExitOrderOwnership: %v", queryErr)
+		}
+		for _, owner := range owners {
+			if owner.BrokerOrderID == "brk-xrc-unapplied" {
+				return owner.ClaimOwned
+			}
+		}
+		return false
+	}
 	if !contains() {
 		t.Fatal("pre-claim terminal row with unapplied fill was not sweepable")
+	}
+	if !claimOwned() {
+		t.Fatal("unapplied pre-claim terminal fill did not protect orderless recovery")
 	}
 	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET exit_fill_applied_qty=filled_qty WHERE id=$1`, orderID); err != nil {
 		t.Fatalf("mark fill applied: %v", err)
 	}
 	if contains() {
 		t.Fatal("fully applied pre-claim terminal row remained sweepable")
+	}
+	if claimOwned() {
+		t.Fatal("settled pre-claim terminal fill suppressed recovery of the current orderless claim")
 	}
 }
 

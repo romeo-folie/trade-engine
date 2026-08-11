@@ -287,7 +287,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		// Establish exit truth before the first trading tick. A stale exiting
 		// row must be finalized (and announced) before ownership gates evaluate
 		// new signals from the startup cycle.
-		e.ReconcileExitsNow(ctx)
+		if err := requireStartupExitReconciliation(ctx, 5*time.Second, e.ReconcileExitsNow); err != nil {
+			return err
+		}
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 		go e.runExitReconcileLoop(ctx)

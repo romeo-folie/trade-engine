@@ -687,9 +687,9 @@ type DurableExitOrderOwnership struct {
 	TradeQuantity float64
 	ExitClaimedAt *time.Time
 	// ClaimOwned is true when this order was created by the current exit claim,
-	// or when a terminal fill can account for shares already missing at the
-	// broker. Zero-fill pre-existing protective stops remain known broker IDs
-	// but do not strand orderless recovery.
+	// or when an unapplied terminal fill can account for shares already missing
+	// at the broker. Settled pre-existing protective stops remain known broker
+	// IDs but do not strand orderless recovery.
 	ClaimOwned bool
 }
 
@@ -700,17 +700,12 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		       CASE
 		         WHEN t.status='closed' THEN TRUE
 		         WHEN t.status='exiting'
-		              AND o.status='filled' THEN TRUE
+		              AND o.status IN ('filled','cancelled','rejected')
+		              AND (o.created_at >= t.exit_claimed_at OR
+		                   COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0)) THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status IN ('pending','partial')
 		              AND (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0) THEN TRUE
-		         WHEN t.status='exiting'
-		              AND o.status IN ('cancelled','rejected')
-		              AND COALESCE(o.filled_qty,0) > 0 THEN TRUE
-		         WHEN t.status='exiting'
-		              AND o.status IN ('cancelled','rejected')
-		              AND COALESCE(o.filled_qty,0) = 0
-		              AND o.created_at >= t.exit_claimed_at THEN TRUE
 		         ELSE FALSE
 		       END AS claim_owned
 		FROM orders o

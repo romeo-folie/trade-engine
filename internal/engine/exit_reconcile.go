@@ -261,12 +261,18 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		if err != nil {
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				stats.NotFound++
+				terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
+				if terminalStatus != "filled" && terminalStatus != "cancelled" && terminalStatus != "rejected" {
+					// A durable working order that vanished from broker lookup is
+					// unresolved, not proof that it never filled. Startup must retry
+					// instead of proceeding with unknown exit ownership.
+					stats.Errors++
+				}
 				if tradeState != nil {
 					// A terminal order can disappear from broker history after its
 					// fill. Re-apply the durable cumulative fill so a restart does
 					// not strand an exiting trade behind ClaimOwned. A filled row
 					// without a durable quantity is ambiguous and remains fail-closed.
-					terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
 					if terminalStatus == "filled" && p.RecordedFill <= 0 {
 						tradeState.canFinalize = false
 						stats.Errors++
@@ -914,6 +920,31 @@ func (e *Engine) ReconcileExitsNow(ctx context.Context) bool {
 
 func startupClaimedExitComplete(ctx context.Context, stats ExitReconcileStats) bool {
 	return stats.Errors == 0 && ctx.Err() == nil
+}
+
+func requireStartupExitReconciliation(
+	ctx context.Context,
+	interval time.Duration,
+	reconcile func(context.Context) bool,
+) error {
+	if reconcile(ctx) {
+		return nil
+	}
+	if interval <= 0 {
+		return errors.New("engine: startup exit reconciliation retry interval must be positive")
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if reconcile(ctx) {
+				return nil
+			}
+		}
+	}
 }
 
 func runExitReconcileTicker(ctx context.Context, interval time.Duration, sweep func(context.Context)) {
