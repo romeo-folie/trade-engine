@@ -777,7 +777,8 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		              o.is_stop_loss OR o.is_take_profit))
 		         OR (o.status IN ('filled','cancelled','rejected') AND
 		             (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
-		              o.created_at >= t.exit_claimed_at))
+		              o.created_at >= t.exit_claimed_at OR
+		              (t.quantity <= 0.000000001 AND COALESCE(o.filled_qty,0) > 0)))
 		          ))
 		        )
 		    AND COALESCE(o.broker_order_id,'') <> ''
@@ -812,7 +813,8 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		            o.is_stop_loss OR o.is_take_profit))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
 		           (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
-		            o.created_at >= t.exit_claimed_at))
+		            o.created_at >= t.exit_claimed_at OR
+		            (t.quantity <= 0.000000001 AND COALESCE(o.filled_qty,0) > 0)))
 		        ))
 		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''

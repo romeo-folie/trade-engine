@@ -2,6 +2,7 @@ package orb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -112,6 +113,16 @@ func (s *ORBScheduler) SetOptionsRouter(r *OptionsRouter) { s.optionsRouter = r 
 // otherwise a fresh entry is placed every tick (options have no broker bracket to
 // mark the ticker as entered). Aborts and broker failures are logged, never fatal.
 func (s *ORBScheduler) routeOptionsEntry(ctx context.Context, sessionID, ticker, side string, params BracketParams) (orderID, line string) {
+	var optionsSession *store.ORBSession
+	if s.db != nil {
+		var err error
+		optionsSession, err = s.optionsTradeSession(ctx, sessionID)
+		if err != nil {
+			slog.Error("orb options: cannot establish durable options session — order not placed",
+				"ticker", ticker, "side", side, "session_id", sessionID, "err", err)
+			return "", ""
+		}
+	}
 	res := s.optionsRouter.Route(ctx, params, s.now())
 	if !res.Placed {
 		slog.Info("orb options: entry not placed",
@@ -120,11 +131,16 @@ func (s *ORBScheduler) routeOptionsEntry(ctx context.Context, sessionID, ticker,
 			"delta", res.Decision.Delta, "dte", res.Decision.DTE, "spread_pct", res.Decision.SpreadPct)
 		return "", ""
 	}
+	if optionsSession == nil {
+		slog.Error("orb options: LIVE order not persisted — no durable options session",
+			"ticker", ticker, "side", side, "order_id", res.Order.BrokerOrderID)
+		return res.Order.BrokerOrderID, ""
+	}
 	orderID = res.Order.BrokerOrderID
 	oc := res.Contract
 	expiry := oc.Expiry
 	dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-		SessionID:  sessionID,
+		SessionID:  optionsSession.ID,
 		Ticker:     ticker,
 		Side:       side,
 		EntryStop:  params.EntryStop, // UNDERLYING levels — the #415 exit watcher reads these
@@ -163,6 +179,56 @@ func (s *ORBScheduler) routeOptionsEntry(ctx context.Context, sessionID, ticker,
 		strings.ToUpper(side), ticker, oc.OCCSymbol, res.Contracts, res.Mid,
 		res.Decision.Delta, res.Decision.IVRank, res.Decision.DTE)
 }
+
+func (s *ORBScheduler) optionsTradeSession(ctx context.Context, parentSessionID string) (*store.ORBSession, error) {
+	s.mu.Lock()
+	if s.session == nil || s.session.ID != parentSessionID {
+		s.mu.Unlock()
+		return nil, fmt.Errorf("active parent session %q is unavailable", parentSessionID)
+	}
+	date, sessionName := s.session.Date, optionsSessionName(s.session.SessionName)
+	s.mu.Unlock()
+
+	existing, err := store.GetORBSessionByDateOwned(ctx, s.db, date, sessionName, store.ORBOwnerOptions)
+	if err != nil {
+		return nil, err
+	}
+	if existing != nil {
+		if existing.Status != string(StateExecuting) {
+			if err := store.UpdateORBSession(ctx, s.db, existing.ID, string(StateExecuting), nil, nil); err != nil {
+				return nil, err
+			}
+			existing.Status = string(StateExecuting)
+		}
+		return existing, nil
+	}
+	created, err := store.CreateORBSessionOwned(ctx, s.db, date, sessionName, "option", store.ORBOwnerOptions)
+	if err == nil {
+		if err := store.UpdateORBSession(ctx, s.db, created.ID, string(StateExecuting), nil, nil); err != nil {
+			return nil, err
+		}
+		created.Status = string(StateExecuting)
+		return created, nil
+	}
+	// Another tick/process may have created the owner-qualified sibling after
+	// our lookup. Re-read before surfacing the uniqueness race.
+	existing, lookupErr := store.GetORBSessionByDateOwned(ctx, s.db, date, sessionName, store.ORBOwnerOptions)
+	if lookupErr == nil && existing != nil {
+		if existing.Status != string(StateExecuting) {
+			if updateErr := store.UpdateORBSession(ctx, s.db, existing.ID, string(StateExecuting), nil, nil); updateErr != nil {
+				return nil, updateErr
+			}
+			existing.Status = string(StateExecuting)
+		}
+		return existing, nil
+	}
+	if lookupErr != nil {
+		return nil, errors.Join(err, lookupErr)
+	}
+	return nil, err
+}
+
+func optionsSessionName(parent string) string { return parent + "-options" }
 
 // OptionRouteResult is the outcome of routing one breakout side.
 type OptionRouteResult struct {

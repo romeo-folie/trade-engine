@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -129,6 +130,29 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 				// A durable partial must remain sweepable until its quantity and
 				// terminal order state can be committed atomically below.
 				if leg.FilledQty <= 0 {
+					matches, matchErr := store.OrderBrokerIDMatches(ctx, leg.ID, leg.BrokerOrderID)
+					if matchErr != nil {
+						return true, matchErr
+					}
+					if !matches {
+						// A replacement may still be live at the broker. Poll its fresh
+						// ID on the next sweep without suppressing a capped software TP.
+						states = append(states, legState{leg: leg})
+						working++
+						continue
+					}
+					_, ephemeralPaper := e.executor.(*execution.PaperExecutor)
+					if pollCappedStandalone && t.TakeProfit > 0 && leg.ParentOrderID == "" && !ephemeralPaper {
+						held, proofErr := e.brokerStillHoldsOwnedTickerQuantity(ctx, t.Ticker)
+						if proofErr != nil || !held {
+							if proofErr != nil {
+								return true, fmt.Errorf("purged capped stop %s has no durable fill and broker holdings proof failed: %w",
+									leg.BrokerOrderID, proofErr)
+							}
+							return true, fmt.Errorf("purged capped stop %s has no durable fill and broker holdings do not prove cancellation",
+								leg.BrokerOrderID)
+						}
+					}
 					uErr := store.UpdateOrderStatusForBrokerOrder(ctx, leg.ID, leg.BrokerOrderID, "cancelled")
 					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
 						// The row now points at a replacement which may still be live.
@@ -342,6 +366,40 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		return false, pollErr
 	}
 	return ownsAllExits, pollErr
+}
+
+func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
+	positions, err := e.executor.GetPositions(ctx)
+	if err != nil {
+		return false, err
+	}
+	owned, err := store.GetOwnedPositionTrades(ctx)
+	if err != nil {
+		return false, err
+	}
+	var brokerQty, dbQty float64
+	for _, p := range positions {
+		if p.Ticker != ticker {
+			continue
+		}
+		qty := p.Quantity
+		if p.Side == "short" && qty > 0 {
+			qty = -qty
+		}
+		brokerQty += qty
+	}
+	for _, trade := range owned {
+		if trade.Ticker != ticker {
+			continue
+		}
+		qty := trade.Quantity
+		if trade.Direction == "short" {
+			qty = -qty
+		}
+		dbQty += qty
+	}
+	const tolerance = 0.01
+	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
 }
 
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own

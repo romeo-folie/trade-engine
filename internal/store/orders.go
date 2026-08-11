@@ -135,6 +135,18 @@ func UpdateOrderStatusForBrokerOrder(ctx context.Context, id, expectedBrokerOrde
 	return nil
 }
 
+// OrderBrokerIDMatches checks whether a poll result still belongs to the
+// durable broker order currently referenced by the row. Callers must still use
+// guarded mutations afterwards because a replacement can race this read.
+func OrderBrokerIDMatches(ctx context.Context, id, expectedBrokerOrderID string) (bool, error) {
+	var matches bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT COALESCE(broker_order_id,'')=$2 FROM orders WHERE id=$1`,
+		id, expectedBrokerOrderID,
+	).Scan(&matches)
+	return matches, err
+}
+
 // UpdateOrderFillAt persists broker execution time when the adapter supplies
 // it. A zero timestamp deliberately leaves an existing broker timestamp intact.
 func UpdateOrderFillAt(ctx context.Context, id string, filledPrice, filledQty float64, status string, filledAt time.Time) error {

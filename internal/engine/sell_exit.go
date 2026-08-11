@@ -25,6 +25,9 @@ import (
 // unconfirmed fills to broker truth afterwards, exactly like the software
 // stop/TP exit path.
 func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Signal) {
+	e.positionExitMu.Lock()
+	defer e.positionExitMu.Unlock()
+
 	blockSignal := func(reason, failedCheck string) {
 		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
 			logger.Warn("update signal status", "id", sigID, "err", err)

@@ -103,3 +103,49 @@ func TestMigration081BackfillsOnlyUnambiguousFuturesSessions(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateORBTradeRevalidatesSessionOwnerAfterRepairLock(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping store integration test")
+	}
+	ctx := context.Background()
+	db := store.GetDB()
+	session, err := store.CreateORBSession(ctx, db, time.Now().UTC(), "owner-race-"+time.Now().Format("150405.000000000"))
+	if err != nil {
+		t.Fatalf("CreateORBSession: %v", err)
+	}
+	t.Cleanup(func() { _, _ = db.Exec(context.Background(), `DELETE FROM orb_sessions WHERE id=$1`, session.ID) })
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		t.Fatalf("Begin repair transaction: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		UPDATE orb_sessions SET asset_class='futures', owner_scope='futures_index_orb'
+		WHERE id=$1`, session.ID); err != nil {
+		t.Fatalf("lock/update session owner: %v", err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, createErr := store.CreateORBTrade(ctx, db, store.ORBTrade{
+			SessionID: session.ID, Ticker: "AAPL", Side: "buy", Qty: 1,
+			Status: "pending", AssetClass: "equity", OwnerScope: store.ORBOwnerEquity,
+		})
+		result <- createErr
+	}()
+	select {
+	case createErr := <-result:
+		t.Fatalf("trade insert bypassed session repair lock: %v", createErr)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit session repair: %v", err)
+	}
+	if createErr := <-result; createErr == nil {
+		t.Fatal("trade insert accepted stale owner identity after session repair")
+	}
+	var count int
+	if err := db.QueryRow(ctx, `SELECT COUNT(*) FROM orb_trades WHERE session_id=$1`, session.ID).Scan(&count); err != nil || count != 0 {
+		t.Fatalf("mixed-owner trade rows = %d err=%v; want zero", count, err)
+	}
+}

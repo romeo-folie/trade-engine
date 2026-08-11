@@ -273,6 +273,16 @@ Modes:
 			fmt.Println("\nTradeEngine stopping...")
 			cancel()
 		}()
+		specializedMode := mode == "orb" || mode == "forex" || mode == "orb-forex" ||
+			mode == "orb-futures" || mode == "orb-futures-metals" || mode == "orb-newyork"
+		trailingStarted := false
+		if trailingMgr != nil && specializedMode {
+			// Specialized schedulers return before the normal-engine startup
+			// reconciliation gate and own their separate reconciliation flows.
+			eng.SetTrailingManagerAvailable(true)
+			go trailingMgr.Run(ctx)
+			trailingStarted = true
+		}
 
 		// ORB mode: run the ORB scheduler instead of the normal engine loop.
 		if mode == "orb" {
@@ -998,7 +1008,7 @@ Modes:
 				return ctx.Err()
 			}
 		}
-		if trailingMgr != nil {
+		if trailingMgr != nil && !trailingStarted {
 			// Manager.Run evaluates exits immediately. Start it only after event
 			// subscribers are registered and startup reconciliation has proved
 			// broker exit truth complete.

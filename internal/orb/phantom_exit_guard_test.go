@@ -30,7 +30,7 @@ func xagForexCfg() *config.ForexORBConfig {
 func seedFilledXAGTrade(t *testing.T, ctx context.Context, entryID, tpID, slID string) (sessionID, tradeID string) {
 	t.Helper()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now().UTC(), "london-test-"+entryID)
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now().UTC(), "london-test-"+entryID, "forex", store.ORBOwnerForex)
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}

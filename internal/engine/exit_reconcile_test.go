@@ -246,6 +246,46 @@ func TestStartupExitReconcileReportsProtectivePollFailure(t *testing.T) {
 	}
 }
 
+func TestStartupExitReconcileFinalizesFullyAppliedProtectiveFill(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_FULLY_APPLIED_STOP", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	const brokerID = "fully-applied-stop"
+	orderID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: "TEST_FULLY_APPLIED_STOP",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	if remaining, applied, err := store.ApplyPartialExitAtForBrokerOrder(
+		ctx, tradeID, orderID, brokerID, 95, 5, "filled", time.Now(),
+	); err != nil || remaining != 0 || applied != 5 {
+		t.Fatalf("apply full protective fill: remaining=%.2f applied=%.2f err=%v", remaining, applied, err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil || !claimed {
+		t.Fatalf("ClaimTradeExitWithIntent = %v, %v", claimed, err)
+	}
+	exec := &fakeBracketExec{statusErr: map[string]error{brokerID: execution.ErrOrderNotFound}}
+	stats := ReconcileExitOrderFillsWithStore(ctx, exec, 100)
+	if stats.Errors != 0 || len(stats.Closed) != 1 {
+		t.Fatalf("stats = %+v, want fully applied fill finalized", stats)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("trade after restart finalization = %+v err=%v", trade, err)
+	}
+}
+
 func TestStartupClaimedExitTimeoutRemainsRetryable(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

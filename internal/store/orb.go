@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -254,8 +255,25 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 	if trade.Strike != 0 {
 		strike = trade.Strike
 	}
+	ownerScope := DefaultORBOwnerScope(trade.OwnerScope, assetClass, trade.Ticker)
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx) // no-op after commit
+	var sessionAssetClass, sessionOwnerScope string
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(asset_class,'equity'), owner_scope
+		FROM orb_sessions WHERE id=$1 FOR SHARE`, trade.SessionID,
+	).Scan(&sessionAssetClass, &sessionOwnerScope); err != nil {
+		return "", fmt.Errorf("lock ORB session %s for trade insert: %w", trade.SessionID, err)
+	}
+	if sessionAssetClass != assetClass || sessionOwnerScope != ownerScope {
+		return "", fmt.Errorf("ORB trade identity %s/%s does not match session %s identity %s/%s",
+			assetClass, ownerScope, trade.SessionID, sessionAssetClass, sessionOwnerScope)
+	}
 	var id string
-	err := db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id, asset_class, underlying, expiry, strike, "right", occ_symbol, multiplier, owner_scope, conid, point_value, max_hold_minutes)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		RETURNING id`,
@@ -266,9 +284,15 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 		nullableString(trade.ScaleOutRole), parentID,
 		assetClass, nullableString(trade.Underlying), trade.Expiry,
 		strike, nullableString(trade.Right), nullableString(trade.OCCSymbol), multiplier,
-		DefaultORBOwnerScope(trade.OwnerScope, assetClass, trade.Ticker), nullableString(trade.ConID), nullablePositiveFloat(trade.PointValue), trade.MaxHoldMinutes,
+		ownerScope, nullableString(trade.ConID), nullablePositiveFloat(trade.PointValue), trade.MaxHoldMinutes,
 	).Scan(&id)
-	return id, err
+	if err != nil {
+		return "", err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // DefaultORBOwnerScope provides compatibility for legacy callers that omit an
