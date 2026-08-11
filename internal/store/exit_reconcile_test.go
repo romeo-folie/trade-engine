@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"math"
 	"reflect"
 	"testing"
@@ -865,7 +864,7 @@ func TestFinalizeTradeExitPreservesReasonEvidenceAndBrokerFillTime(t *testing.T)
 	}
 }
 
-func TestStopReplacementRejectsFillCommittedAfterSnapshot(t *testing.T) {
+func TestStopReplacementAdoptsFillCommittedAfterSnapshot(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
 		Ticker: "TEST_XRC_REPLACE_CAS", Direction: "long", Strategy: "test",
@@ -891,20 +890,21 @@ func TestStopReplacementRejectsFillCommittedAfterSnapshot(t *testing.T) {
 		ctx, orderID, "replace-cas-old", "replace-cas-new", 0, 5,
 		96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonStopLoss},
 	)
-	if !errors.Is(err, store.ErrOrderBrokerIDChanged) {
-		t.Fatalf("UpdateOrderStopReplacement after concurrent fill = %v, want change error", err)
+	if err != nil {
+		t.Fatalf("UpdateOrderStopReplacement after concurrent fill: %v", err)
 	}
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil || trade.Quantity != 3 {
-		t.Fatalf("trade after rejected replacement = %+v err=%v; want quantity 3", trade, err)
+		t.Fatalf("trade after adopted replacement = %+v err=%v; want quantity 3", trade, err)
 	}
 	orders, err := store.GetOrdersByTrade(ctx, tradeID)
-	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "replace-cas-old" || orders[0].FilledQty != 2 {
-		t.Fatalf("order after rejected replacement = %+v err=%v", orders, err)
+	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "replace-cas-new" ||
+		orders[0].Quantity != 3 || orders[0].FilledQty != 0 || orders[0].Status != "pending" {
+		t.Fatalf("order after adopted replacement = %+v err=%v", orders, err)
 	}
 }
 
-func TestStopReplacementRejectsAppliedDurableFillAfterSnapshot(t *testing.T) {
+func TestStopReplacementAdoptsAppliedDurableFillAfterSnapshot(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
 		Ticker: "TEST_XRC_APPLIED_CAS", Direction: "long", Strategy: "test",
@@ -933,12 +933,17 @@ func TestStopReplacementRejectsAppliedDurableFillAfterSnapshot(t *testing.T) {
 		ctx, orderID, "applied-cas-old", "applied-cas-new", 2, 5,
 		96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonStopLoss},
 	)
-	if !errors.Is(err, store.ErrOrderBrokerIDChanged) {
-		t.Fatalf("UpdateOrderStopReplacement after applied durable fill = %v, want change error", err)
+	if err != nil {
+		t.Fatalf("UpdateOrderStopReplacement after applied durable fill: %v", err)
 	}
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil || trade.Quantity != 3 {
-		t.Fatalf("trade after rejected replacement = %+v err=%v; want quantity 3", trade, err)
+		t.Fatalf("trade after adopted replacement = %+v err=%v; want quantity 3", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 || orders[0].BrokerOrderID != "applied-cas-new" ||
+		orders[0].Quantity != 3 || orders[0].FilledQty != 0 || orders[0].Status != "pending" {
+		t.Fatalf("order after adopted applied-fill replacement = %+v err=%v", orders, err)
 	}
 }
 

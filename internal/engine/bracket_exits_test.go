@@ -429,7 +429,7 @@ func TestStartupReconcileRetiresPurgedCappedPaperStop(t *testing.T) {
 		t.Fatalf("InsertTrade: %v", err)
 	}
 	if _, err := store.InsertOrder(ctx, store.Order{
-		TradeID: tradeID, BrokerOrderID: "old-paper-stop", Ticker: "TEST_PURGED_PAPER_STOP",
+		TradeID: tradeID, BrokerOrderID: "PAPER-000001", Ticker: "TEST_PURGED_PAPER_STOP",
 		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
 		Status: "pending", IsStopLoss: true,
 	}); err != nil {
@@ -438,6 +438,35 @@ func TestStartupReconcileRetiresPurgedCappedPaperStop(t *testing.T) {
 	e := newBracketTestEngine(execution.NewPaperExecutor())
 	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), true); handled || reconcileErr != nil {
 		t.Fatalf("purged paper stop = handled %v err %v; want safe software handoff", handled, reconcileErr)
+	}
+}
+
+func TestStartupReconcileDoesNotRetireBrokerStopThroughPaperFallback(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_PAPER_BROKER_STOP", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "alpaca-live-stop", Ticker: "TEST_PAPER_BROKER_STOP",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	e := newBracketTestEngine(execution.NewPaperExecutor())
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), true); !handled || reconcileErr == nil {
+		t.Fatalf("broker stop through paper fallback = handled %v err %v; want unresolved", handled, reconcileErr)
+	}
+	legs, err := store.OpenExitLegsForTrade(ctx, tradeID)
+	if err != nil || len(legs) != 1 || legs[0].Status != "pending" {
+		t.Fatalf("broker stop was terminalized through paper fallback: legs=%+v err=%v", legs, err)
 	}
 }
 
@@ -938,6 +967,48 @@ func TestReconcileBracket_PreviouslyAppliedPartialDoesNotCloseRemainder(t *testi
 	tr := getTrade(t, tradeID)
 	if tr.ID == "" || tr.Status != "open" || tr.Quantity != 4 {
 		t.Fatalf("trade after terminal partial = %+v; want open with quantity 4", tr)
+	}
+}
+
+func TestStartupReconcileFinalizesOpenTradeAfterTerminalFillWasApplied(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, _, slID := insertBracketFixture(t, fmt.Sprintf("TREC_%d", time.Now().UnixNano()), 3)
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	var stop store.Order
+	for _, order := range orders {
+		if order.BrokerOrderID == slID {
+			stop = order
+			break
+		}
+	}
+	if stop.ID == "" {
+		t.Fatal("stop leg not found")
+	}
+	filledAt := time.Date(2026, 8, 11, 15, 30, 0, 0, time.UTC)
+	remaining, applied, err := store.ApplyPartialExitAtForBrokerOrder(
+		ctx, tradeID, stop.ID, slID, 94, 3, "filled", filledAt,
+	)
+	if err != nil || remaining != 0 || applied != 3 {
+		t.Fatalf("seed terminal applied fill: remaining=%.2f applied=%.2f err=%v", remaining, applied, err)
+	}
+	if trade := getTrade(t, tradeID); trade.Status != "open" || trade.Quantity != 0 {
+		t.Fatalf("pre-recovery trade = %+v; want open zero-quantity crash state", trade)
+	}
+
+	exec := &fakeBracketExec{statusErr: map[string]error{slID: execution.ErrOrderNotFound}}
+	e := newBracketTestEngine(exec)
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), true); !handled || reconcileErr != nil {
+		t.Fatalf("startup terminal-fill recovery = handled %v err %v", handled, reconcileErr)
+	}
+	closed, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || closed == nil || closed.Status != "closed" || closed.ExitPrice != 94 || closed.PnL != -18 {
+		t.Fatalf("recovered trade = %+v err=%v; want closed at 94 with -18 pnl", closed, err)
 	}
 }
 

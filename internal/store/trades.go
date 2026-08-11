@@ -387,7 +387,10 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 // UpdateOrderStopReplacement atomically repoints an existing protective order
 // row and preserves any fill returned with the broker replacement. A terminal
 // order may be purged before the next sweep, so its execution truth must be
-// durable in the same write as its new broker id.
+// durable in the same write as its new broker id. If a concurrent reconciler
+// applied a fill while the broker replacement was in flight, adopt the live
+// replacement using the freshly locked trade remainder instead of rejecting
+// the write and leaving the position without durable stop coverage.
 func UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, expectedBrokerOrderID, newBrokerOrderID string,
@@ -414,10 +417,18 @@ func UpdateOrderStopReplacement(
 	); err != nil {
 		return err
 	}
-	if actualBrokerOrderID != expectedBrokerOrderID ||
-		math.Abs(actualFilledQty-expectedFilledQty) > 1e-9 ||
-		math.Abs(actualTradeQuantity-expectedTradeQuantity) > 1e-9 {
+	if actualBrokerOrderID != expectedBrokerOrderID {
 		return fmt.Errorf("%w: stop row %s or its trade changed while broker replacement was in flight", ErrOrderBrokerIDChanged, orderID)
+	}
+	if math.Abs(actualFilledQty-expectedFilledQty) > 1e-9 ||
+		math.Abs(actualTradeQuantity-expectedTradeQuantity) > 1e-9 {
+		if actualTradeQuantity <= 1e-9 {
+			return fmt.Errorf("%w: trade for stop row %s has no remaining position after concurrent fill", ErrOrderBrokerIDChanged, orderID)
+		}
+		// Replacing a partially-filled broker order preserves its unfilled
+		// remainder. Mirror that remainder here; the old order's applied fill
+		// is already represented in the trade's cumulative realization fields.
+		newQuantity = actualTradeQuantity
 	}
 	if _, err = tx.Exec(ctx, `
 		UPDATE orders

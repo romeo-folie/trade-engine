@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -101,7 +102,11 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 	t store.Trade,
 	pollCappedStandalone bool,
 ) (bool, error) {
-	all, err := store.OpenExitLegsForTrade(ctx, t.ID)
+	// Include terminal protective rows with durable fills. A crash can occur
+	// after their fill was applied to the trade but before the open trade was
+	// claimed and finalized; those rows are the only restart evidence capable
+	// of completing that transition.
+	all, err := store.ExitLegsForMarketExit(ctx, t.ID)
 	if err != nil {
 		// Unknown state: legs may be live at the broker. A software exit on
 		// top of a live leg double-sells, so skip this tick and retry.
@@ -141,8 +146,12 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 						working++
 						continue
 					}
-					_, ephemeralPaper := e.executor.(*execution.PaperExecutor)
-					if !ephemeralPaper {
+					_, paperExecutor := e.executor.(*execution.PaperExecutor)
+					ephemeralPaper := paperExecutor && strings.HasPrefix(leg.BrokerOrderID, "PAPER-")
+					// A zero remainder means another durable protective fill already
+					// accounted for the position; a purged zero-fill OCO sibling no
+					// longer needs holdings proof before finalization.
+					if !ephemeralPaper && t.Quantity > 1e-9 {
 						held, proofErr := e.brokerStillHoldsOwnedTickerQuantity(ctx, t.Ticker)
 						if proofErr != nil || !held {
 							if proofErr != nil {
