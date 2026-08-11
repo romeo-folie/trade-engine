@@ -3,10 +3,16 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
 )
+
+// ErrOrderBrokerIDChanged means an order row was repointed to a replacement
+// broker order after the caller loaded it. Pollers must not apply the stale
+// broker result to the replacement row.
+var ErrOrderBrokerIDChanged = errors.New("order broker id changed")
 
 // Order mirrors a row from the orders table.
 type Order struct {
@@ -102,10 +108,71 @@ func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty floa
 	return UpdateOrderFillAt(ctx, id, filledPrice, filledQty, status, time.Time{})
 }
 
+// UpdateOrderFillForBrokerOrder is UpdateOrderFill guarded by the broker id
+// that was polled. It prevents a concurrent stop replacement from being
+// overwritten by the stale predecessor's status.
+func UpdateOrderFillForBrokerOrder(
+	ctx context.Context,
+	id, expectedBrokerOrderID string,
+	filledPrice, filledQty float64,
+	status string,
+) error {
+	return updateOrderFillAt(ctx, id, expectedBrokerOrderID, filledPrice, filledQty, status, time.Time{})
+}
+
+// UpdateOrderStatusForBrokerOrder terminalizes the broker order that was
+// polled without discarding any durable fill price or quantity already stored.
+func UpdateOrderStatusForBrokerOrder(ctx context.Context, id, expectedBrokerOrderID, status string) error {
+	tag, err := GetDB().Exec(ctx, `
+		UPDATE orders SET status=$1, updated_at=NOW()
+		WHERE id=$2 AND broker_order_id=$3`, status, id, expectedBrokerOrderID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: order %s no longer references %s", ErrOrderBrokerIDChanged, id, expectedBrokerOrderID)
+	}
+	return nil
+}
+
+// OrderBrokerIDMatches checks whether a poll result still belongs to the
+// durable broker order currently referenced by the row. Callers must still use
+// guarded mutations afterwards because a replacement can race this read.
+func OrderBrokerIDMatches(ctx context.Context, id, expectedBrokerOrderID string) (bool, error) {
+	var matches bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT COALESCE(broker_order_id,'')=$2 FROM orders WHERE id=$1`,
+		id, expectedBrokerOrderID,
+	).Scan(&matches)
+	return matches, err
+}
+
 // UpdateOrderFillAt persists broker execution time when the adapter supplies
 // it. A zero timestamp deliberately leaves an existing broker timestamp intact.
 func UpdateOrderFillAt(ctx context.Context, id string, filledPrice, filledQty float64, status string, filledAt time.Time) error {
-	_, err := GetDB().Exec(ctx, `
+	return updateOrderFillAt(ctx, id, "", filledPrice, filledQty, status, filledAt)
+}
+
+// UpdateOrderFillAtForBrokerOrder is UpdateOrderFillAt guarded by the broker
+// id that produced the status response.
+func UpdateOrderFillAtForBrokerOrder(
+	ctx context.Context,
+	id, expectedBrokerOrderID string,
+	filledPrice, filledQty float64,
+	status string,
+	filledAt time.Time,
+) error {
+	return updateOrderFillAt(ctx, id, expectedBrokerOrderID, filledPrice, filledQty, status, filledAt)
+}
+
+func updateOrderFillAt(
+	ctx context.Context,
+	id, expectedBrokerOrderID string,
+	filledPrice, filledQty float64,
+	status string,
+	filledAt time.Time,
+) error {
+	tag, err := GetDB().Exec(ctx, `
 		UPDATE orders
 		SET filled_price=$1, filled_qty=$2, status=$3,
 		    filled_at=CASE
@@ -113,9 +180,16 @@ func UpdateOrderFillAt(ctx context.Context, id string, filledPrice, filledQty fl
 		        WHEN filled_at IS NULL THEN $4::timestamptz
 		        ELSE GREATEST(filled_at,$4::timestamptz)
 		    END, updated_at=NOW()
-		WHERE id=$5`,
-		filledPrice, filledQty, status, nullableTime(filledAt), id)
-	return err
+		WHERE id=$5
+		  AND ($6='' OR broker_order_id=$6)`,
+		filledPrice, filledQty, status, nullableTime(filledAt), id, expectedBrokerOrderID)
+	if err != nil {
+		return err
+	}
+	if expectedBrokerOrderID != "" && tag.RowsAffected() == 0 {
+		return fmt.Errorf("%w: order %s no longer references %s", ErrOrderBrokerIDChanged, id, expectedBrokerOrderID)
+	}
+	return nil
 }
 
 // ApplyPartialExit atomically advances an order's cumulative fill and reduces
@@ -143,6 +217,51 @@ func ApplyPartialExitAt(
 	status string,
 	filledAt time.Time,
 ) (remaining, applied float64, err error) {
+	return applyPartialExitAt(ctx, tradeID, orderID, "", filledPrice, cumulativeFilledQty, status, filledAt, nil)
+}
+
+// ApplyPartialExitAtForBrokerOrder is ApplyPartialExitAt guarded by the broker
+// id that produced the cumulative fill. The order row is locked before the id
+// comparison, so a concurrent replacement either happens wholly before this
+// transaction (and is rejected here) or waits until the fill is durable.
+func ApplyPartialExitAtForBrokerOrder(
+	ctx context.Context,
+	tradeID, orderID, expectedBrokerOrderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+	filledAt time.Time,
+) (remaining, applied float64, err error) {
+	return applyPartialExitAt(
+		ctx, tradeID, orderID, expectedBrokerOrderID,
+		filledPrice, cumulativeFilledQty, status, filledAt, nil,
+	)
+}
+
+// ApplyProtectiveExitAtForBrokerOrder atomically applies a broker fill and
+// replaces a previously claimed software intent with the protective outcome
+// that actually won the broker race.
+func ApplyProtectiveExitAtForBrokerOrder(
+	ctx context.Context,
+	tradeID, orderID, expectedBrokerOrderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+	filledAt time.Time,
+	intent ExitIntent,
+) (remaining, applied float64, err error) {
+	return applyPartialExitAt(
+		ctx, tradeID, orderID, expectedBrokerOrderID,
+		filledPrice, cumulativeFilledQty, status, filledAt, &intent,
+	)
+}
+
+func applyPartialExitAt(
+	ctx context.Context,
+	tradeID, orderID, expectedBrokerOrderID string,
+	filledPrice, cumulativeFilledQty float64,
+	status string,
+	filledAt time.Time,
+	intent *ExitIntent,
+) (remaining, applied float64, err error) {
 	if cumulativeFilledQty > 0 && filledPrice <= 0 {
 		return 0, 0, fmt.Errorf("partial exit fill price must be positive")
 	}
@@ -161,15 +280,24 @@ func ApplyPartialExitAt(
 		return 0, 0, err
 	}
 	var recorded, recordedPrice, appliedAlready, orderQuantity float64
+	var currentBrokerOrderID string
 	if err = tx.QueryRow(ctx, `
 		SELECT COALESCE(filled_qty,0), COALESCE(filled_price,0),
-		       COALESCE(exit_fill_applied_qty,0), quantity
+		       COALESCE(exit_fill_applied_qty,0), quantity,
+		       COALESCE(broker_order_id,'')
 		FROM orders
 		WHERE id=$1
 		FOR UPDATE`, orderID).Scan(
 		&recorded, &recordedPrice, &appliedAlready, &orderQuantity,
+		&currentBrokerOrderID,
 	); err != nil {
 		return 0, 0, err
+	}
+	if expectedBrokerOrderID != "" && currentBrokerOrderID != expectedBrokerOrderID {
+		return 0, 0, fmt.Errorf(
+			"%w: order %s references %s, polled %s",
+			ErrOrderBrokerIDChanged, orderID, currentBrokerOrderID, expectedBrokerOrderID,
+		)
 	}
 	observedFill := math.Max(appliedAlready, math.Max(recorded, cumulativeFilledQty))
 	if orderQuantity > 0 {
@@ -223,6 +351,16 @@ func ApplyPartialExitAt(
 		applied, tradeID, proceedsDelta, nullableTime(filledAt),
 	).Scan(&remaining); err != nil {
 		return 0, 0, err
+	}
+	if intent != nil && applied > 0 {
+		if _, err = tx.Exec(ctx, `
+			UPDATE trades
+			SET exit_reason=NULLIF($2,''), exit_evidence=$3::jsonb
+			WHERE id=$1 AND status='exiting'`,
+			tradeID, intent.Reason, nullableRawJSON(intent.Evidence),
+		); err != nil {
+			return 0, 0, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return 0, 0, err

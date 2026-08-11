@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math"
 	"time"
 )
@@ -386,17 +387,50 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 // UpdateOrderStopReplacement atomically repoints an existing protective order
 // row and preserves any fill returned with the broker replacement. A terminal
 // order may be purged before the next sweep, so its execution truth must be
-// durable in the same write as its new broker id.
+// durable in the same write as its new broker id. If a concurrent reconciler
+// applied a fill while the broker replacement was in flight, adopt the live
+// replacement using the freshly locked trade remainder instead of rejecting
+// the write and leaving the position without durable stop coverage.
 func UpdateOrderStopReplacement(
 	ctx context.Context,
-	orderID, newBrokerOrderID string,
-	newStopPrice, newQuantity float64,
+	orderID, expectedBrokerOrderID, newBrokerOrderID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
 	status string,
 	filledPrice, filledQty float64,
 	filledAt time.Time,
 	intent ExitIntent,
 ) error {
-	_, err := GetDB().Exec(ctx, `
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var actualBrokerOrderID string
+	var actualFilledQty, actualTradeQuantity float64
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(o.broker_order_id,''), COALESCE(o.filled_qty,0), t.quantity
+		FROM trades t
+		JOIN orders o ON o.trade_id=t.id
+		WHERE o.id=$1
+		FOR UPDATE OF t, o`, orderID).Scan(
+		&actualBrokerOrderID, &actualFilledQty, &actualTradeQuantity,
+	); err != nil {
+		return err
+	}
+	if actualBrokerOrderID != expectedBrokerOrderID {
+		return fmt.Errorf("%w: stop row %s or its trade changed while broker replacement was in flight", ErrOrderBrokerIDChanged, orderID)
+	}
+	if math.Abs(actualFilledQty-expectedFilledQty) > 1e-9 ||
+		math.Abs(actualTradeQuantity-expectedTradeQuantity) > 1e-9 {
+		if actualTradeQuantity <= 1e-9 {
+			return fmt.Errorf("%w: trade for stop row %s has no remaining position after concurrent fill", ErrOrderBrokerIDChanged, orderID)
+		}
+		// Replacing a partially-filled broker order preserves its unfilled
+		// remainder. Mirror that remainder here; the old order's applied fill
+		// is already represented in the trade's cumulative realization fields.
+		newQuantity = actualTradeQuantity
+	}
+	if _, err = tx.Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
@@ -412,8 +446,10 @@ func UpdateOrderStopReplacement(
 		WHERE id = $10`,
 		newStopPrice, newBrokerOrderID, newQuantity, status,
 		filledPrice, filledQty, nullableTime(filledAt), intent.Reason,
-		nullableRawJSON(intent.Evidence), orderID)
-	return err
+		nullableRawJSON(intent.Evidence), orderID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
@@ -623,25 +659,29 @@ func MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error {
 // PendingExitOrder is a pending exit order row joined with the trade fields
 // needed to recompute P&L once the broker confirms the fill.
 type PendingExitOrder struct {
-	OrderID          string
-	BrokerOrderID    string
-	Ticker           string
-	OrderStatus      string // broker order status last durably recorded in the DB
-	TradeID          string
-	Direction        string // long | short
-	EntryPrice       float64
-	Quantity         float64 // current trade quantity
-	OrderQuantity    float64 // lot quantity assigned to this broker order row
-	LimitPrice       float64 // fallback when a terminal limit fill omits price
-	StopPrice        float64 // fallback when a terminal stop fill omits price
-	RecordedFill     float64 // fill already durably assigned to this lot
-	RecordedPrice    float64 // fill price already durably assigned to this lot
-	RecordedFilledAt *time.Time
-	AggregateFill    float64 // fill assigned across every row sharing the broker id
-	ExitPrice        float64 // exit price currently recorded on the trade row
-	TradeStatus      string  // closed (price correction) | exiting (finalization)
-	ExitReason       string
-	ExitEvidence     json.RawMessage
+	OrderID           string
+	BrokerOrderID     string
+	Ticker            string
+	OrderStatus       string // broker order status last durably recorded in the DB
+	TradeID           string
+	Direction         string // long | short
+	EntryPrice        float64
+	Quantity          float64 // current trade quantity
+	OrderQuantity     float64 // lot quantity assigned to this broker order row
+	LimitPrice        float64 // fallback when a terminal limit fill omits price
+	StopPrice         float64 // fallback when a terminal stop fill omits price
+	RecordedFill      float64 // fill already durably assigned to this lot
+	RecordedPrice     float64 // fill price already durably assigned to this lot
+	RecordedFilledAt  *time.Time
+	AggregateFill     float64 // fill assigned across every row sharing the broker id
+	ExitPrice         float64 // exit price currently recorded on the trade row
+	TradeStatus       string  // closed (price correction) | exiting (finalization)
+	ExitReason        string
+	ExitEvidence      json.RawMessage
+	IsStopLoss        bool
+	IsTakeProfit      bool
+	OrderExitReason   string
+	OrderExitEvidence json.RawMessage
 }
 
 // DurableExitOrderOwnership is the complete broker-order identity set that
@@ -658,9 +698,9 @@ type DurableExitOrderOwnership struct {
 	TradeQuantity float64
 	ExitClaimedAt *time.Time
 	// ClaimOwned is true when this order was created by the current exit claim,
-	// or when a terminal fill can account for shares already missing at the
-	// broker. Zero-fill pre-existing protective stops remain known broker IDs
-	// but do not strand orderless recovery.
+	// or when an unapplied terminal fill can account for shares already missing
+	// at the broker. Settled pre-existing protective stops remain known broker
+	// IDs but do not strand orderless recovery.
 	ClaimOwned bool
 }
 
@@ -671,17 +711,12 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		       CASE
 		         WHEN t.status='closed' THEN TRUE
 		         WHEN t.status='exiting'
-		              AND o.status='filled' THEN TRUE
+		              AND o.status IN ('filled','cancelled','rejected')
+		              AND (o.created_at >= t.exit_claimed_at OR
+		                   COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0)) THEN TRUE
 		         WHEN t.status='exiting'
 		              AND o.status IN ('pending','partial')
 		              AND (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0) THEN TRUE
-		         WHEN t.status='exiting'
-		              AND o.status IN ('cancelled','rejected')
-		              AND COALESCE(o.filled_qty,0) > 0 THEN TRUE
-		         WHEN t.status='exiting'
-		              AND o.status IN ('cancelled','rejected')
-		              AND COALESCE(o.filled_qty,0) = 0
-		              AND o.created_at >= t.exit_claimed_at THEN TRUE
 		         ELSE FALSE
 		       END AS claim_owned
 		FROM orders o
@@ -693,7 +728,8 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
 		          (o.status IN ('pending','partial') AND
-		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
+		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0
+		            OR o.is_stop_loss OR o.is_take_profit))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
 		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
 		            o.created_at >= t.exit_claimed_at))
@@ -729,8 +765,10 @@ func GetDurableExitOrderOwnership(ctx context.Context) ([]DurableExitOrderOwners
 // the row must stay sweepable until the broker reports the fill complete.
 // Filled terminal rows are included regardless of claim time because a
 // protective stop may have filled just before the worker claimed the trade.
-// Zero-fill cancelled/rejected rows are included only when they belong to the
-// current exit claim, so stale rows cannot suppress orderless recovery.
+// Working protective rows remain eligible after a concurrent exit claim even
+// when they predate it: a stop can fill while the new owner is cancelling it.
+// Pre-claim terminal rows remain eligible only with unapplied durable fill
+// evidence; stale zero-fill cancellations must not suppress orderless recovery.
 func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, error) {
 	rows, err := GetDB().Query(ctx, `
 		WITH selected_trades AS (
@@ -741,10 +779,12 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		          (t.status='closed' AND o.status IN ('pending','partial'))
 		       OR (t.status='exiting' AND (
 		            (o.status IN ('pending','partial') AND
-		             (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
+		             (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0 OR
+		              o.is_stop_loss OR o.is_take_profit))
 		         OR (o.status IN ('filled','cancelled','rejected') AND
-		             (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
-		              o.created_at >= t.exit_claimed_at))
+		             (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
+		              o.created_at >= t.exit_claimed_at OR
+		              (t.quantity <= 0.000000001 AND COALESCE(o.filled_qty,0) > 0)))
 		          ))
 		        )
 		    AND COALESCE(o.broker_order_id,'') <> ''
@@ -765,7 +805,9 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		         WHERE allocated.broker_order_id=o.broker_order_id
 		       ),0),
 		       COALESCE(t.exit_price,0), t.status,
-		       COALESCE(t.exit_reason,''), t.exit_evidence
+		       COALESCE(t.exit_reason,''), t.exit_evidence,
+		       o.is_stop_loss, o.is_take_profit,
+		       COALESCE(o.exit_reason,''), o.exit_evidence
 		FROM orders o
 		JOIN trades t ON t.id = o.trade_id
 		JOIN selected_trades selected ON selected.id=t.id
@@ -773,10 +815,12 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		        (t.status='closed' AND o.status IN ('pending','partial'))
 		     OR (t.status='exiting' AND (
 		          (o.status IN ('pending','partial') AND
-		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0))
+		           (o.created_at >= t.exit_claimed_at OR COALESCE(o.filled_qty,0) > 0 OR
+		            o.is_stop_loss OR o.is_take_profit))
 		       OR (o.status IN ('filled','cancelled','rejected') AND
-		           (o.status='filled' OR COALESCE(o.filled_qty,0) > 0 OR
-		            o.created_at >= t.exit_claimed_at))
+		           (COALESCE(o.filled_qty,0) > COALESCE(o.exit_fill_applied_qty,0) OR
+		            o.created_at >= t.exit_claimed_at OR
+		            (t.quantity <= 0.000000001 AND COALESCE(o.filled_qty,0) > 0)))
 		        ))
 		      )
 		  AND COALESCE(o.broker_order_id,'') <> ''
@@ -797,7 +841,8 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 			&p.OrderQuantity, &p.LimitPrice, &p.StopPrice,
 			&p.RecordedFill, &p.RecordedPrice, &p.RecordedFilledAt,
 			&p.AggregateFill,
-			&p.ExitPrice, &p.TradeStatus, &p.ExitReason, &p.ExitEvidence); err != nil {
+			&p.ExitPrice, &p.TradeStatus, &p.ExitReason, &p.ExitEvidence,
+			&p.IsStopLoss, &p.IsTakeProfit, &p.OrderExitReason, &p.OrderExitEvidence); err != nil {
 			return nil, err
 		}
 		out = append(out, p)
@@ -878,10 +923,10 @@ func GetOrderlessExitingTrades(ctx context.Context, limit int) ([]Trade, error) 
 		  AND NOT EXISTS (
 		    SELECT 1 FROM orders o
 		    WHERE o.trade_id=t.id
-		      AND o.created_at >= t.exit_claimed_at
 		      AND COALESCE(o.broker_order_id,'') <> ''
 		      AND ((t.direction='long' AND o.side='sell')
 		        OR (t.direction='short' AND o.side='buy'))
+		      AND o.created_at >= t.exit_claimed_at
 		  )
 		ORDER BY t.exit_claimed_at
 		LIMIT $1`, limit)

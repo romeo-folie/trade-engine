@@ -121,6 +121,7 @@ type Engine struct {
 	lastDailySummaryUpdate time.Time
 	exitStartupMu          sync.Mutex
 	exitStartupPrepared    bool
+	positionExitMu         sync.Mutex // serializes protective reconciliation with software position exits
 
 	feedbackReviewer *feedback.Reviewer
 
@@ -286,7 +287,9 @@ func (e *Engine) Run(ctx context.Context) error {
 		// Establish exit truth before the first trading tick. A stale exiting
 		// row must be finalized (and announced) before ownership gates evaluate
 		// new signals from the startup cycle.
-		e.ReconcileExitsNow(ctx)
+		if err := requireStartupExitReconciliation(ctx, 5*time.Second, e.ReconcileExitsNow); err != nil {
+			return err
+		}
 		const cacheSweepInterval = 15 * time.Minute
 		go cache.NewSweeper(cacheSweepInterval).Run(ctx)
 		go e.runExitReconcileLoop(ctx)
@@ -2988,6 +2991,8 @@ func (e *Engine) checkExitResidue(ticker string) {
 }
 
 func (e *Engine) monitorPositions(ctx context.Context) {
+	e.positionExitMu.Lock()
+	defer e.positionExitMu.Unlock()
 	// Refresh portfolio state from executor positions.
 	e.refreshPortfolio(ctx)
 

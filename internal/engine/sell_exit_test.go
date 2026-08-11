@@ -152,7 +152,7 @@ func TestSellExit_LegCancelFailureBlocks(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
-	const ticker = "SLCF"
+	ticker := fmt.Sprintf("SLCF_%d", time.Now().UnixNano())
 	_, _, slID := insertBracketFixture(t, ticker, 3)
 	exec := &fakeBracketExec{
 		cancelErr: map[string]error{slID: fmt.Errorf("simulated cancel failure")},

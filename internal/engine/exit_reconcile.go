@@ -60,7 +60,10 @@ type exitReconcileStore interface {
 	// broker id would stamp the broker's AGGREGATE filled qty onto every
 	// lot's row.
 	UpdateOrderFillAt(ctx context.Context, orderID string, filledPrice, filledQty float64, status string, filledAt time.Time) error
+	UpdateOrderFillAtForBrokerOrder(ctx context.Context, orderID, expectedBrokerOrderID string, filledPrice, filledQty float64, status string, filledAt time.Time) error
 	ApplyPartialExitAt(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (remaining, applied float64, err error)
+	ApplyPartialExitAtForBrokerOrder(ctx context.Context, tradeID, orderID, expectedBrokerOrderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (remaining, applied float64, err error)
+	ApplyProtectiveExitAtForBrokerOrder(ctx context.Context, tradeID, orderID, expectedBrokerOrderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time, intent store.ExitIntent) (remaining, applied float64, err error)
 	UpdateTradeExitAt(ctx context.Context, id string, exitPrice, pnl, pnlPct float64, filledAt time.Time) error
 	UpdateTradeExitFilledAt(ctx context.Context, id string, filledAt time.Time) error
 	FinalizeTradeExit(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) (store.TradeRealization, error)
@@ -78,8 +81,17 @@ func (exitStoreAdapter) GetPendingExitOrders(ctx context.Context, limit int) ([]
 func (exitStoreAdapter) UpdateOrderFillAt(ctx context.Context, orderID string, filledPrice, filledQty float64, status string, filledAt time.Time) error {
 	return store.UpdateOrderFillAt(ctx, orderID, filledPrice, filledQty, status, filledAt)
 }
+func (exitStoreAdapter) UpdateOrderFillAtForBrokerOrder(ctx context.Context, orderID, expectedBrokerOrderID string, filledPrice, filledQty float64, status string, filledAt time.Time) error {
+	return store.UpdateOrderFillAtForBrokerOrder(ctx, orderID, expectedBrokerOrderID, filledPrice, filledQty, status, filledAt)
+}
 func (exitStoreAdapter) ApplyPartialExitAt(ctx context.Context, tradeID, orderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (float64, float64, error) {
 	return store.ApplyPartialExitAt(ctx, tradeID, orderID, filledPrice, cumulativeFilledQty, status, filledAt)
+}
+func (exitStoreAdapter) ApplyPartialExitAtForBrokerOrder(ctx context.Context, tradeID, orderID, expectedBrokerOrderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time) (float64, float64, error) {
+	return store.ApplyPartialExitAtForBrokerOrder(ctx, tradeID, orderID, expectedBrokerOrderID, filledPrice, cumulativeFilledQty, status, filledAt)
+}
+func (exitStoreAdapter) ApplyProtectiveExitAtForBrokerOrder(ctx context.Context, tradeID, orderID, expectedBrokerOrderID string, filledPrice, cumulativeFilledQty float64, status string, filledAt time.Time, intent store.ExitIntent) (float64, float64, error) {
+	return store.ApplyProtectiveExitAtForBrokerOrder(ctx, tradeID, orderID, expectedBrokerOrderID, filledPrice, cumulativeFilledQty, status, filledAt, intent)
 }
 func (exitStoreAdapter) UpdateTradeExitAt(ctx context.Context, id string, exitPrice, pnl, pnlPct float64, filledAt time.Time) error {
 	return store.UpdateTradeExitAt(ctx, id, exitPrice, pnl, pnlPct, filledAt)
@@ -160,8 +172,8 @@ func tradePnL(direction string, entryPrice, quantity, exitPrice float64) (pnl, p
 //   - cancelled/rejected → mark the order row; ERROR log. The trade row says
 //     closed but the broker never executed the exit — the position may still
 //     be live at the broker (ReconcileBrokerVsDB surfaces that side).
-//   - partial / still working → leave for the next sweep (filled-qty
-//     accounting is tracked in #363/#369).
+//   - partial / still working → durably apply any cumulative fill on an
+//     exiting trade, then leave the order sweepable for later fills.
 //   - not found at broker → leave pending, WARN. Alpaca purges terminal
 //     orders from lookup only long after our sweep cadence, so this is rare.
 //
@@ -188,6 +200,8 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 
 	remainingTerminalFill := make(map[string]float64)
 	terminalFillSeen := make(map[string]bool)
+	remainingWorkingFill := make(map[string]float64)
+	workingFillSeen := make(map[string]bool)
 	type terminalTradeState struct {
 		ticker      string
 		direction   string
@@ -210,6 +224,33 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		}
 		return s
 	}
+	applyExitingFill := func(p store.PendingExitOrder, fillPrice, cumulativeQty float64, status string, filledAt time.Time) (float64, float64, error) {
+		if p.IsStopLoss || p.IsTakeProfit {
+			reason := p.OrderExitReason
+			evidence := p.OrderExitEvidence
+			if reason == "" && p.ExitReason != "" {
+				// Software stop/TP orders predate order-level provenance. Their
+				// current trade claim is authoritative and carries trigger evidence.
+				reason = p.ExitReason
+				evidence = p.ExitEvidence
+			}
+			if reason == "" {
+				reason = store.ExitReasonStopLoss
+				if p.IsTakeProfit {
+					reason = store.ExitReasonTakeProfit
+				}
+			}
+			return db.ApplyProtectiveExitAtForBrokerOrder(
+				ctx, p.TradeID, p.OrderID, p.BrokerOrderID,
+				fillPrice, cumulativeQty, status, filledAt,
+				store.ExitIntent{Reason: reason, Evidence: evidence},
+			)
+		}
+		return db.ApplyPartialExitAtForBrokerOrder(
+			ctx, p.TradeID, p.OrderID, p.BrokerOrderID,
+			fillPrice, cumulativeQty, status, filledAt,
+		)
+	}
 	for _, p := range pending {
 		stats.Scanned++
 		var tradeState *terminalTradeState
@@ -220,12 +261,18 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		if err != nil {
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				stats.NotFound++
+				terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
+				if terminalStatus != "filled" && terminalStatus != "cancelled" && terminalStatus != "rejected" {
+					// A durable working order that vanished from broker lookup is
+					// unresolved, not proof that it never filled. Startup must retry
+					// instead of proceeding with unknown exit ownership.
+					stats.Errors++
+				}
 				if tradeState != nil {
 					// A terminal order can disappear from broker history after its
 					// fill. Re-apply the durable cumulative fill so a restart does
 					// not strand an exiting trade behind ClaimOwned. A filled row
 					// without a durable quantity is ambiguous and remains fail-closed.
-					terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
 					if terminalStatus == "filled" && p.RecordedFill <= 0 {
 						tradeState.canFinalize = false
 						stats.Errors++
@@ -250,8 +297,8 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 									"ticker", p.Ticker, "trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
 								continue
 							}
-							remaining, _, applyErr := db.ApplyPartialExitAt(
-								ctx, p.TradeID, p.OrderID, fillPrice, p.RecordedFill, terminalStatus, recordedFillTime(p.RecordedFilledAt),
+							remaining, _, applyErr := applyExitingFill(
+								p, fillPrice, p.RecordedFill, terminalStatus, recordedFillTime(p.RecordedFilledAt),
 							)
 							if applyErr != nil {
 								tradeState.canFinalize = false
@@ -309,8 +356,8 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				lotQty = p.Quantity
 			}
 			if p.TradeStatus == "exiting" {
-				remaining, _, err := db.ApplyPartialExitAt(
-					ctx, p.TradeID, p.OrderID, fillPrice, lotQty, "filled", res.FilledAt,
+				remaining, _, err := applyExitingFill(
+					p, fillPrice, lotQty, "filled", res.FilledAt,
 				)
 				if err != nil {
 					tradeState.canFinalize = false
@@ -384,9 +431,17 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				}
 			}
 			if p.TradeStatus == "exiting" {
-				remaining, _, err := db.ApplyPartialExitAt(
-					ctx, p.TradeID, p.OrderID, fillPrice, lotFill, terminalStatus, res.FilledAt,
-				)
+				remaining := tradeState.remaining
+				var err error
+				if lotFill > 0 {
+					remaining, _, err = applyExitingFill(
+						p, fillPrice, lotFill, terminalStatus, res.FilledAt,
+					)
+				} else {
+					err = db.UpdateOrderFillAtForBrokerOrder(
+						ctx, p.OrderID, p.BrokerOrderID, fillPrice, 0, terminalStatus, res.FilledAt,
+					)
+				}
 				if err != nil {
 					tradeState.canFinalize = false
 					stats.Errors++
@@ -428,9 +483,57 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 					"ticker", p.Ticker, "trade_id", p.TradeID,
 					"broker_order_id", p.BrokerOrderID, "broker_status", res.Status)
 			}
-		default: // pending / partial — leave for the next sweep
+		default: // pending / partial — persist any cumulative fill, then leave sweepable
 			if tradeState != nil {
 				tradeState.canFinalize = false
+				if res.FilledQty > 0 {
+					if !workingFillSeen[p.BrokerOrderID] {
+						// AggregateFill normally includes this row's RecordedFill, but
+						// fail safe if an older/custom store implementation omits it.
+						// Recorded-but-unapplied quantity already belongs to this lot;
+						// treating it as unallocated would add the cumulative fill twice.
+						durableAllocation := math.Max(p.AggregateFill, p.RecordedFill)
+						remainingWorkingFill[p.BrokerOrderID] = math.Max(0, res.FilledQty-durableAllocation)
+						workingFillSeen[p.BrokerOrderID] = true
+					}
+					lotCapacity := p.OrderQuantity
+					if lotCapacity <= 0 {
+						lotCapacity = p.Quantity
+					}
+					unallocatedLot := math.Max(0, lotCapacity-p.RecordedFill)
+					lotFillDelta := math.Min(unallocatedLot, remainingWorkingFill[p.BrokerOrderID])
+					remainingWorkingFill[p.BrokerOrderID] = math.Max(0, remainingWorkingFill[p.BrokerOrderID]-lotFillDelta)
+					lotFill := p.RecordedFill + lotFillDelta
+					if lotFill > 0 {
+						fillPrice := res.FilledPrice
+						if fillPrice <= 0 {
+							fillPrice = p.RecordedPrice
+						}
+						if fillPrice <= 0 {
+							if p.LimitPrice > 0 {
+								fillPrice = p.LimitPrice
+							} else {
+								fillPrice = p.StopPrice
+							}
+						}
+						if fillPrice <= 0 {
+							stats.Errors++
+							logger.Warn("exit reconcile: working partial has no fill price",
+								"trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
+						} else {
+							remaining, _, applyErr := applyExitingFill(
+								p, fillPrice, lotFill, execution.NormalizeOrderStatus(res.Status), res.FilledAt,
+							)
+							if applyErr != nil {
+								stats.Errors++
+								logger.Warn("exit reconcile: persist working partial exit",
+									"trade_id", p.TradeID, "order_id", p.OrderID, "err", applyErr)
+							} else {
+								tradeState.remaining = remaining
+							}
+						}
+					}
+				}
 			}
 			stats.StillPending++
 		}
@@ -589,6 +692,8 @@ func recoverOrderlessExits(
 			Quantity: t.Quantity, Status: w.Status,
 			IsStopLoss:   t.ExitReason == store.ExitReasonStopLoss || t.ExitReason == store.ExitReasonTrailingATR,
 			IsTakeProfit: t.ExitReason == store.ExitReasonTakeProfit,
+			ExitReason:   t.ExitReason,
+			ExitEvidence: t.ExitEvidence,
 		}); err != nil {
 			stats.Errors++
 			logger.Warn("exit reconcile: persist recovered working exit",
@@ -721,10 +826,41 @@ func (e *Engine) runExitReconcileSweep(ctx context.Context) ExitReconcileStats {
 }
 
 func (e *Engine) runExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
-	sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
+	return runExitReconcilePhases(
+		ctx,
+		5*time.Minute,
+		e.reconcileBrokerManagedExitFills,
+		func(claimedCtx context.Context) ExitReconcileStats {
+			return e.runClaimedExitReconcileSweepLimit(claimedCtx, limit)
+		},
+	)
+}
+
+func runExitReconcilePhases(
+	ctx context.Context,
+	phaseTimeout time.Duration,
+	brokerManaged func(context.Context) int,
+	claimed func(context.Context) ExitReconcileStats,
+) ExitReconcileStats {
+	// Protective bracket/standalone-stop fills normally belong to open trades,
+	// so book those first. Protective rows that raced with an exit claim are
+	// also selected by GetPendingExitOrders in the claimed phase below.
+	legCtx, cancelLegs := context.WithTimeout(ctx, phaseTimeout)
+	brokerManagedErrors := brokerManaged(legCtx)
+	cancelLegs()
+
+	// Give claimed exits their own budget. A large/slow protective-leg set must
+	// not consume the deadline and starve already-exiting trades every sweep.
+	claimedCtx, cancelClaimed := context.WithTimeout(ctx, phaseTimeout)
+	defer cancelClaimed()
+	stats := claimed(claimedCtx)
+	stats.Errors += brokerManagedErrors
+	return stats
+}
+
+func (e *Engine) runClaimedExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
 	stats := ReconcileExitOrderFillsWithStoreAndLoss(
-		sweepCtx, e.executor, limit, e.portfolio.RecordLoss,
+		ctx, e.executor, limit, e.portfolio.RecordLoss,
 	)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
@@ -732,22 +868,83 @@ func (e *Engine) runExitReconcileSweepLimit(ctx context.Context, limit int) Exit
 	return stats
 }
 
+func (e *Engine) reconcileBrokerManagedExitFills(ctx context.Context) int {
+	e.positionExitMu.Lock()
+	defer e.positionExitMu.Unlock()
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		logger.Warn("broker-managed exit reconcile: load open trades", "err", err)
+		return 1
+	}
+	errorsSeen := 0
+	for _, trade := range trades {
+		if _, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, trade, true); reconcileErr != nil {
+			errorsSeen++
+			logger.Warn("broker-managed exit reconcile: trade incomplete",
+				"trade_id", trade.ID, "ticker", trade.Ticker, "err", reconcileErr)
+		}
+	}
+	if ctx.Err() != nil {
+		errorsSeen++
+	}
+	return errorsSeen
+}
+
 // ReconcileExitsNow performs a bounded best-effort startup sweep. The command
 // invokes it before broker-drift alerting; Engine.Run invokes it as a safety
 // net for other callers before their first trading tick. Successful sweeps are
 // idempotent, while transient failures remain retryable by the safety call and
 // any backlog beyond the startup cap remains owned by the periodic reconciler.
-func (e *Engine) ReconcileExitsNow(ctx context.Context) {
+func (e *Engine) ReconcileExitsNow(ctx context.Context) bool {
 	if !store.IsConnected() {
-		return
+		return true
 	}
+	// Always retry broker-managed open legs on the Engine.Run safety call, even
+	// when the command's first pass completed its claimed-exit backlog. The leg
+	// status API is best effort and reconcileBracketTrade deliberately treats a
+	// transient broker read as unknown rather than closing from stale state.
+	legCtx, cancelLegs := context.WithTimeout(ctx, 5*time.Minute)
+	legErrors := e.reconcileBrokerManagedExitFills(legCtx)
+	cancelLegs()
 	e.exitStartupMu.Lock()
 	defer e.exitStartupMu.Unlock()
 	if e.exitStartupPrepared {
-		return
+		return legErrors == 0
 	}
-	stats := e.runExitReconcileSweepLimit(ctx, StartupExitReconcileBatch)
-	e.exitStartupPrepared = stats.Errors == 0
+	claimedCtx, cancelClaimed := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelClaimed()
+	stats := e.runClaimedExitReconcileSweepLimit(claimedCtx, StartupExitReconcileBatch)
+	e.exitStartupPrepared = startupClaimedExitComplete(claimedCtx, stats)
+	return legErrors == 0 && e.exitStartupPrepared
+}
+
+func startupClaimedExitComplete(ctx context.Context, stats ExitReconcileStats) bool {
+	return stats.Errors == 0 && ctx.Err() == nil
+}
+
+func requireStartupExitReconciliation(
+	ctx context.Context,
+	interval time.Duration,
+	reconcile func(context.Context) bool,
+) error {
+	if reconcile(ctx) {
+		return nil
+	}
+	if interval <= 0 {
+		return errors.New("engine: startup exit reconciliation retry interval must be positive")
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if reconcile(ctx) {
+				return nil
+			}
+		}
+	}
 }
 
 func runExitReconcileTicker(ctx context.Context, interval time.Duration, sweep func(context.Context)) {

@@ -815,6 +815,13 @@ func (s *ORBScheduler) tickIdle(ctx context.Context, et time.Time) error {
 	if err := store.MarkStaleORBSessionsDoneOwned(ctx, s.db, today, s.sessionName(), s.ownerScope()); err != nil {
 		slog.Warn("orb: mark stale sessions done failed", "err", err)
 	}
+	if s.optionsRouter != nil {
+		if err := store.MarkStaleORBSessionsDoneOwned(
+			ctx, s.db, today, optionsSessionName(s.sessionName()), store.ORBOwnerOptions,
+		); err != nil {
+			slog.Warn("orb: mark stale options sessions done failed", "err", err)
+		}
+	}
 
 	// Once per process lifetime: reconcile any filled-but-unclosed trades across
 	// all recent done sessions (up to 7 days) using the IBKR trades feed.
@@ -917,6 +924,21 @@ func (s *ORBScheduler) resumeSession(ctx context.Context, existing *store.ORBSes
 		trades, err := store.GetORBTrades(ctx, s.db, existing.ID)
 		if err != nil {
 			return fmt.Errorf("load orb trades for resume: %w", err)
+		}
+		if existing.OwnerScope != store.ORBOwnerOptions {
+			optionsSession, lookupErr := store.GetORBSessionByDateOwned(
+				ctx, s.db, existing.Date, optionsSessionName(existing.SessionName), store.ORBOwnerOptions,
+			)
+			if lookupErr != nil {
+				return fmt.Errorf("load options ORB sibling for resume: %w", lookupErr)
+			}
+			if optionsSession != nil {
+				optionTrades, tradeErr := store.GetORBTrades(ctx, s.db, optionsSession.ID)
+				if tradeErr != nil {
+					return fmt.Errorf("load options ORB sibling trades for resume: %w", tradeErr)
+				}
+				trades = append(trades, optionTrades...)
+			}
 		}
 		for _, t := range trades {
 			if t.OrderID == "" {
@@ -2277,10 +2299,21 @@ func (s *ORBScheduler) tickDone(ctx context.Context) error {
 
 		s.mu.Lock()
 		sessionID := s.session.ID
+		sessionDate := s.session.Date
+		sessionName := s.session.SessionName
 		s.mu.Unlock()
 
 		if err := store.UpdateORBSession(ctx, s.db, sessionID, "done", nil, nil); err != nil {
 			slog.Error("orb: update session to done failed", "err", err)
+		}
+		if optionSession, err := store.GetORBSessionByDateOwned(
+			ctx, s.db, sessionDate, optionsSessionName(sessionName), store.ORBOwnerOptions,
+		); err != nil {
+			slog.Warn("orb: load options sibling while completing session failed", "err", err)
+		} else if optionSession != nil {
+			if err := store.UpdateORBSession(ctx, s.db, optionSession.ID, "done", nil, nil); err != nil {
+				slog.Warn("orb: update options sibling to done failed", "err", err)
+			}
 		}
 		s.publish(events.PortfolioSnapshotTaken, events.PortfolioSnapshotPayload{})
 		s.notify(ctx, "ORB: Session complete for today.")

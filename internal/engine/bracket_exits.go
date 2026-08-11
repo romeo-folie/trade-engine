@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -63,6 +65,10 @@ func brokerManagedExitLegs(t store.Trade, legs []store.Order) []store.Order {
 	if t.TakeProfit > 0 {
 		return nil
 	}
+	return standaloneStopLegs(legs)
+}
+
+func standaloneStopLegs(legs []store.Order) []store.Order {
 	out := legs[:0:0]
 	for _, leg := range legs {
 		if leg.ParentOrderID == "" && leg.IsStopLoss {
@@ -79,36 +85,109 @@ func brokerManagedExitLegs(t store.Trade, legs []store.Order) []store.Order {
 // state. A false result means app-managed monitoring applies. Standalone stops
 // on trades with a software TP deliberately do not count.
 func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool {
-	all, err := store.OpenExitLegsForTrade(ctx, t.ID)
+	return e.reconcileBrokerExitTrade(ctx, t, false)
+}
+
+// reconcileBrokerExitTrade optionally polls standalone protective stops on
+// capped trades. Those stops must be checked for offline fills during startup,
+// but a still-working stop does not own the software take-profit and therefore
+// must not suppress app-managed monitoring.
+func (e *Engine) reconcileBrokerExitTrade(ctx context.Context, t store.Trade, pollCappedStandalone bool) bool {
+	handled, _ := e.reconcileBrokerExitTradeStatus(ctx, t, pollCappedStandalone)
+	return handled
+}
+
+func (e *Engine) reconcileBrokerExitTradeStatus(
+	ctx context.Context,
+	t store.Trade,
+	pollCappedStandalone bool,
+) (bool, error) {
+	// Include terminal protective rows with durable fills. A crash can occur
+	// after their fill was applied to the trade but before the open trade was
+	// claimed and finalized; those rows are the only restart evidence capable
+	// of completing that transition.
+	all, err := store.ExitLegsForMarketExit(ctx, t.ID)
 	if err != nil {
 		// Unknown state: legs may be live at the broker. A software exit on
 		// top of a live leg double-sells, so skip this tick and retry.
 		logger.Warn("bracket exits: leg lookup failed — skipping software exit this tick",
 			"trade_id", t.ID, "ticker", t.Ticker, "err", err)
-		return true
+		return true, err
 	}
 	legs := brokerManagedExitLegs(t, all)
+	ownsAllExits := len(legs) > 0
+	if len(legs) == 0 && pollCappedStandalone && t.TakeProfit > 0 {
+		legs = standaloneStopLegs(all)
+	}
 	if len(legs) == 0 {
-		return false
+		return false, nil
 	}
 
 	states := make([]legState, 0, len(legs))
 	working := 0
 	var filledIdx = -1
+	var pollErr error
 	for _, leg := range legs {
 		res, err := e.executor.GetOrderStatus(ctx, leg.BrokerOrderID)
 		if err != nil {
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				// Purged from the broker's lookup — terminal and gone.
-				if uErr := store.UpdateOrderFill(ctx, leg.ID, 0, 0, "cancelled"); uErr != nil {
-					logger.Warn("bracket exits: mark purged leg", "order_id", leg.ID, "err", uErr)
+				// A durable partial must remain sweepable until its quantity and
+				// terminal order state can be committed atomically below.
+				if leg.FilledQty <= 0 {
+					matches, matchErr := store.OrderBrokerIDMatches(ctx, leg.ID, leg.BrokerOrderID)
+					if matchErr != nil {
+						return true, matchErr
+					}
+					if !matches {
+						// A replacement may still be live at the broker. Poll its fresh
+						// ID on the next sweep without suppressing a capped software TP.
+						states = append(states, legState{leg: leg})
+						working++
+						continue
+					}
+					_, paperExecutor := e.executor.(*execution.PaperExecutor)
+					ephemeralPaper := paperExecutor && strings.HasPrefix(leg.BrokerOrderID, "PAPER-")
+					// A zero remainder means another durable protective fill already
+					// accounted for the position; a purged zero-fill OCO sibling no
+					// longer needs holdings proof before finalization.
+					if !ephemeralPaper && t.Quantity > 1e-9 {
+						held, proofErr := e.brokerStillHoldsOwnedTickerQuantity(ctx, t.Ticker)
+						if proofErr != nil || !held {
+							if proofErr != nil {
+								return true, fmt.Errorf("purged protective leg %s has no durable fill and broker holdings proof failed: %w",
+									leg.BrokerOrderID, proofErr)
+							}
+							return true, fmt.Errorf("purged protective leg %s has no durable fill and broker holdings do not prove cancellation",
+								leg.BrokerOrderID)
+						}
+					}
+					uErr := store.UpdateOrderStatusForBrokerOrder(ctx, leg.ID, leg.BrokerOrderID, "cancelled")
+					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
+						// The row now points at a replacement which may still be live.
+						// Retain broker ownership until a fresh snapshot polls that ID.
+						states = append(states, legState{leg: leg})
+						working++
+						continue
+					}
+					if uErr != nil {
+						logger.Warn("bracket exits: mark purged leg", "order_id", leg.ID, "err", uErr)
+						pollErr = errors.Join(pollErr, uErr)
+					}
 				}
-				states = append(states, legState{leg: leg})
+				res := execution.OrderResult{
+					Status: "cancelled", FilledPrice: leg.FilledPrice, FilledQty: leg.FilledQty,
+				}
+				if leg.FilledAt != nil {
+					res.FilledAt = *leg.FilledAt
+				}
+				states = append(states, legState{leg: leg, res: res, ok: true})
 				continue
 			}
 			// Transient broker error: assume the leg is still working.
 			logger.Warn("bracket exits: leg status check failed",
 				"trade_id", t.ID, "broker_order_id", leg.BrokerOrderID, "err", err)
+			pollErr = errors.Join(pollErr, err)
 			states = append(states, legState{leg: leg})
 			working++
 			continue
@@ -126,8 +205,76 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 	}
 
 	if filledIdx >= 0 {
-		e.closeBracketTrade(ctx, t, states, filledIdx)
-		return true
+		handled, closeErr := e.closeBracketTrade(ctx, t, states, filledIdx, ownsAllExits)
+		return handled, errors.Join(pollErr, closeErr)
+	}
+	if working > 0 {
+		// A working order may already have sold part of the position. Apply
+		// its cumulative fill now so startup broker/DB comparison sees the
+		// true remaining quantity rather than waiting for terminal status.
+		remaining := t.Quantity
+		latestIdx := -1
+		var latestFillAt time.Time
+		for i, s := range states {
+			if !s.ok || s.res.FilledQty <= 0 {
+				continue
+			}
+			var uErr error
+			remaining, _, uErr = store.ApplyPartialExitAtForBrokerOrder(
+				ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
+				fillPriceOf(s), s.res.FilledQty,
+				execution.NormalizeOrderStatus(s.res.Status), s.res.FilledAt,
+			)
+			if uErr != nil {
+				if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
+					logger.Info("bracket exits: ignored stale fill from replaced broker stop",
+						"trade_id", t.ID, "order_id", s.leg.ID,
+						"broker_order_id", s.leg.BrokerOrderID)
+					return true, nil
+				}
+				logger.Warn("bracket exits: apply live partial leg exit failed — retrying next sweep",
+					"trade_id", t.ID, "order_id", s.leg.ID, "err", uErr)
+				return true, uErr
+			}
+			if latestIdx < 0 || s.res.FilledAt.After(latestFillAt) {
+				latestIdx, latestFillAt = i, s.res.FilledAt
+			}
+		}
+		if remaining <= 1e-9 && latestIdx >= 0 {
+			// Some broker snapshots expose the full cumulative quantity before
+			// advancing status from partial to filled. Confirm every still-live
+			// leg is terminal before finalizing, or an OCO sibling could later
+			// over-sell the now-flat position.
+			for i := range states {
+				status := execution.NormalizeOrderStatus(states[i].res.Status)
+				if states[i].ok && (status == "filled" || status == "cancelled" || status == "rejected") {
+					continue
+				}
+				cancelErr := e.executor.CancelOrder(ctx, states[i].leg.BrokerOrderID)
+				confirmed, statusErr := e.executor.GetOrderStatus(ctx, states[i].leg.BrokerOrderID)
+				if errors.Is(statusErr, execution.ErrOrderNotFound) {
+					confirmed = execution.OrderResult{Status: "cancelled"}
+					statusErr = nil
+				}
+				if statusErr != nil {
+					return true, errors.Join(cancelErr, statusErr)
+				}
+				confirmedStatus := execution.NormalizeOrderStatus(confirmed.Status)
+				if confirmedStatus != "filled" && confirmedStatus != "cancelled" && confirmedStatus != "rejected" {
+					return true, fmt.Errorf("full cumulative bracket fill left leg %s %s after cancel: %w",
+						states[i].leg.BrokerOrderID, confirmedStatus, cancelErr)
+				}
+				if confirmed.FilledQty < states[i].res.FilledQty {
+					confirmed.FilledQty = states[i].res.FilledQty
+					confirmed.FilledPrice = states[i].res.FilledPrice
+					confirmed.FilledAt = states[i].res.FilledAt
+				}
+				states[i].res, states[i].ok = confirmed, true
+			}
+			handled, closeErr := e.closeBracketTrade(ctx, t, states, latestIdx, ownsAllExits)
+			return handled, errors.Join(pollErr, closeErr)
+		}
+		return ownsAllExits, pollErr
 	}
 	if working == 0 {
 		// All legs are terminal without a FULL fill while the trade is
@@ -136,52 +283,64 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 		// handing back to app-managed monitoring, or the software exit
 		// would later market-sell the stale full quantity (over-sell or
 		// broker-rejected order) and compute pnl on shares no longer held.
-		var partialQty, partialProceeds float64
+		var partialQty float64
 		for _, s := range states {
 			if s.ok && s.res.FilledQty > 0 {
 				partialQty += s.res.FilledQty
-				partialProceeds += s.res.FilledQty * fillPriceOf(s)
 			}
-		}
-		if partialQty > 0 && partialQty >= t.Quantity-1e-9 {
-			// The partials add up to the whole position — that IS the exit.
-			var filledAt time.Time
-			var filledLeg store.Order
-			for _, s := range states {
-				if s.ok && s.res.FilledQty > 0 && (filledLeg.ID == "" || s.res.FilledAt.After(filledAt)) {
-					filledAt, filledLeg = s.res.FilledAt, s.leg
-				}
-			}
-			e.bookBracketClose(ctx, t, partialProceeds/partialQty, partialQty,
-				"bracket legs partially filled to completion", filledAt, filledLeg)
-			return true
 		}
 		if partialQty > 0 {
 			remaining := t.Quantity
+			var filledAt time.Time
+			latestIdx := -1
 			for _, s := range states {
 				if !s.ok || s.res.FilledQty <= 0 {
 					continue
 				}
 				var uErr error
-				remaining, _, uErr = store.ApplyPartialExitAt(
-					ctx, t.ID, s.leg.ID, fillPriceOf(s), s.res.FilledQty,
+				remaining, _, uErr = store.ApplyPartialExitAtForBrokerOrder(
+					ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
+					fillPriceOf(s), s.res.FilledQty,
 					execution.NormalizeOrderStatus(s.res.Status), s.res.FilledAt,
 				)
 				if uErr != nil {
+					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
+						// A replacement may still be live at the broker. Keep exit
+						// ownership and poll the fresh ID on the next snapshot.
+						return true, nil
+					}
 					logger.Warn("bracket exits: atomically apply partial leg exit failed — retrying next sweep",
 						"trade_id", t.ID, "order_id", s.leg.ID, "err", uErr)
-					return true // order remains sweepable; quantity is unchanged
+					return true, uErr // order remains sweepable; quantity is unchanged
 				}
+			}
+			for i, s := range states {
+				if s.ok && s.res.FilledQty > 0 && (latestIdx < 0 || s.res.FilledAt.After(filledAt)) {
+					filledAt, latestIdx = s.res.FilledAt, i
+				}
+			}
+			if remaining <= 1e-9 {
+				// Decide completion from the durable post-application remainder,
+				// not by comparing cumulative broker fills with t.Quantity. The
+				// latter is already reduced when an earlier sweep persisted a
+				// working partial (for example, 6 filled leaves t.Quantity=4).
+				handled, closeErr := e.closeBracketTrade(
+					ctx, t, states, latestIdx, ownsAllExits,
+				)
+				return handled, errors.Join(pollErr, closeErr)
 			}
 			for _, s := range states {
 				if s.ok && s.res.FilledQty == 0 {
-					if uErr := store.UpdateOrderFill(
-						ctx, s.leg.ID, s.res.FilledPrice, 0,
+					if uErr := store.UpdateOrderFillForBrokerOrder(
+						ctx, s.leg.ID, s.leg.BrokerOrderID, s.res.FilledPrice, 0,
 						execution.NormalizeOrderStatus(s.res.Status),
 					); uErr != nil {
+						if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
+							return true, nil
+						}
 						logger.Warn("bracket exits: terminalize zero-fill leg",
 							"order_id", s.leg.ID, "err", uErr)
-						return true
+						return true, uErr
 					}
 				}
 			}
@@ -196,13 +355,16 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 				if !s.ok {
 					continue
 				}
-				if uErr := store.UpdateOrderFill(
-					ctx, s.leg.ID, s.res.FilledPrice, 0,
+				if uErr := store.UpdateOrderFillForBrokerOrder(
+					ctx, s.leg.ID, s.leg.BrokerOrderID, s.res.FilledPrice, 0,
 					execution.NormalizeOrderStatus(s.res.Status),
 				); uErr != nil {
+					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
+						return true, nil
+					}
 					logger.Warn("bracket exits: terminalize zero-fill leg",
 						"order_id", s.leg.ID, "err", uErr)
-					return true
+					return true, uErr
 				}
 			}
 		}
@@ -210,9 +372,43 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 		// app-managed monitoring, which resumes on this very sweep.
 		logger.Warn("bracket exits: all legs gone with trade still open — reverting to app-managed exits",
 			"trade_id", t.ID, "ticker", t.Ticker)
-		return false
+		return false, pollErr
 	}
-	return true
+	return ownsAllExits, pollErr
+}
+
+func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
+	positions, err := e.executor.GetPositions(ctx)
+	if err != nil {
+		return false, err
+	}
+	owned, err := store.GetOwnedPositionTrades(ctx)
+	if err != nil {
+		return false, err
+	}
+	var brokerQty, dbQty float64
+	for _, p := range positions {
+		if p.Ticker != ticker {
+			continue
+		}
+		qty := p.Quantity
+		if p.Side == "short" && qty > 0 {
+			qty = -qty
+		}
+		brokerQty += qty
+	}
+	for _, trade := range owned {
+		if trade.Ticker != ticker {
+			continue
+		}
+		qty := trade.Quantity
+		if trade.Direction == "short" {
+			qty = -qty
+		}
+		dbQty += qty
+	}
+	const tolerance = 0.01
+	return dbQty != 0 && brokerQty*dbQty > 0 && math.Abs(brokerQty-dbQty) <= tolerance, nil
 }
 
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own
@@ -233,73 +429,126 @@ func fillPriceOf(s legState) float64 {
 // shares — a take-profit that partially filled before the ratcheted stop
 // took out the remainder contributes its real proceeds instead of being
 // discarded as a zero-fill cancel (Codex P2 on #435).
-func (e *Engine) closeBracketTrade(ctx context.Context, t store.Trade, states []legState, filledIdx int) {
+func (e *Engine) closeBracketTrade(
+	ctx context.Context,
+	t store.Trade,
+	states []legState,
+	filledIdx int,
+	fallbackHandled bool,
+) (bool, error) {
 	filled := states[filledIdx]
-
-	var soldQty, proceeds float64
-	for i, s := range states {
-		qty := 0.0
-		switch {
-		case i == filledIdx:
-			qty = s.res.FilledQty
-			if qty == 0 {
-				qty = t.Quantity
-			}
-		case s.ok && s.res.FilledQty > 0:
-			qty = s.res.FilledQty // partial fill before the OCO cancel
-		}
-		if qty > 0 {
-			soldQty += qty
-			proceeds += qty * fillPriceOf(s)
-		}
-	}
-	if soldQty <= 0 { // defensive; filled leg always contributes above
-		soldQty = t.Quantity
-		proceeds = soldQty * fillPriceOf(filled)
-	}
-	exitPrice := proceeds / soldQty
-
 	exitReason := "stop-loss hit"
 	if filled.leg.IsTakeProfit {
 		exitReason = "take-profit hit"
 	}
+	intent := bracketExitIntent(filled.leg)
+	claimed, err := store.ClaimTradeExitWithIntent(ctx, t.ID, intent)
+	if err != nil {
+		logger.Warn("bracket exits: claim trade for broker fill", "trade_id", t.ID, "err", err)
+		return true, err
+	}
+	if !claimed {
+		// A software exit may have claimed while this broker poll was in
+		// flight. The protective fill still won the broker cancellation race;
+		// apply it under that durable claim instead of discarding it.
+		logger.Info("bracket exits: protective fill joined an existing exit claim",
+			"trade_id", t.ID, "broker_order_id", filled.leg.BrokerOrderID)
+	}
 
-	if !e.bookBracketClose(ctx, t, exitPrice, soldQty, exitReason, filled.res.FilledAt, filled.leg) {
-		return // leg row stays pending → retried next sweep
+	remaining := t.Quantity
+	fillPersisted := false
+	applyOrder := make([]int, 0, len(states))
+	applyOrder = append(applyOrder, filledIdx)
+	for i := range states {
+		if i != filledIdx {
+			applyOrder = append(applyOrder, i)
+		}
 	}
-	fq := filled.res.FilledQty
-	if fq == 0 {
-		fq = t.Quantity
-	}
-	if err := store.UpdateOrderFillAt(ctx, filled.leg.ID, fillPriceOf(filled), fq, "filled", filled.res.FilledAt); err != nil {
-		logger.Warn("bracket exits: persist leg fill", "order_id", filled.leg.ID, "err", err)
-	}
-	for i, s := range states {
-		if i == filledIdx {
+	// Validate and apply the winning leg first. Besides failing fast on a stale
+	// broker ID, this commits the protective intent in the same transaction as
+	// the fill that can make the trade finalizable.
+	for _, i := range applyOrder {
+		s := states[i]
+		if !s.ok {
 			continue
 		}
-		// Persist the sibling's real partial fill (if any) with its cancel.
-		var sq, sp float64
-		if s.ok {
-			sq, sp = s.res.FilledQty, s.res.FilledPrice
+		status := execution.NormalizeOrderStatus(s.res.Status)
+		cumulativeQty := s.res.FilledQty
+		if i == filledIdx && cumulativeQty <= 0 {
+			cumulativeQty = s.leg.Quantity
+			if cumulativeQty <= 0 {
+				cumulativeQty = t.Quantity
+			}
 		}
-		if err := store.UpdateOrderFillAt(ctx, s.leg.ID, sp, sq, "cancelled", s.res.FilledAt); err != nil {
-			logger.Warn("bracket exits: mark OCO sibling cancelled", "order_id", s.leg.ID, "err", err)
+		if cumulativeQty > 0 {
+			var applyErr error
+			if claimed {
+				remaining, _, applyErr = store.ApplyPartialExitAtForBrokerOrder(
+					ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
+					fillPriceOf(s), cumulativeQty, status, s.res.FilledAt,
+				)
+			} else {
+				remaining, _, applyErr = store.ApplyProtectiveExitAtForBrokerOrder(
+					ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
+					fillPriceOf(s), cumulativeQty, status, s.res.FilledAt, intent,
+				)
+			}
+			if applyErr != nil {
+				if errors.Is(applyErr, store.ErrOrderBrokerIDChanged) {
+					if claimed && !fillPersisted {
+						_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+					}
+					logger.Info("bracket exits: ignored stale terminal fill from replaced broker stop",
+						"trade_id", t.ID, "order_id", s.leg.ID,
+						"broker_order_id", s.leg.BrokerOrderID)
+					return fallbackHandled, nil
+				}
+				if claimed && !fillPersisted {
+					_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+				}
+				logger.Warn("bracket exits: apply terminal broker fill", "trade_id", t.ID, "order_id", s.leg.ID, "err", applyErr)
+				return true, applyErr
+			}
+			fillPersisted = true
+			continue
+		}
+		if status == "cancelled" || status == "rejected" {
+			if updateErr := store.UpdateOrderFillAtForBrokerOrder(
+				ctx, s.leg.ID, s.leg.BrokerOrderID,
+				s.res.FilledPrice, 0, status, s.res.FilledAt,
+			); updateErr != nil {
+				if errors.Is(updateErr, store.ErrOrderBrokerIDChanged) {
+					if claimed && !fillPersisted {
+						_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+					}
+					return fallbackHandled, nil
+				}
+				if claimed && !fillPersisted {
+					_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+				}
+				logger.Warn("bracket exits: terminalize zero-fill sibling", "order_id", s.leg.ID, "err", updateErr)
+				return true, updateErr
+			}
 		}
 	}
+	if remaining > 1e-9 {
+		if claimed && !fillPersisted {
+			_ = store.ReleaseTradeExitClaim(ctx, t.ID)
+		}
+		logger.Warn("bracket exits: terminal fills did not cover the tracked position",
+			"trade_id", t.ID, "ticker", t.Ticker, "remaining_qty", remaining)
+		return true, fmt.Errorf("terminal broker fills left %.8f shares unreconciled", remaining)
+	}
+	realized, err := store.FinalizeTradeExit(ctx, t.ID)
+	if err != nil {
+		logger.Warn("bracket exits: finalize broker-filled trade", "trade_id", t.ID, "err", err)
+		return true, err
+	}
+	e.recordBracketClose(t, realized, exitReason)
+	return true, nil
 }
 
-// bookBracketClose writes the trade close, records the loss cooldown, and
-// emits the same observability as the software exit path. Returns false when
-// the close could not be persisted (caller retries next sweep).
-func (e *Engine) bookBracketClose(
-	ctx context.Context,
-	t store.Trade,
-	exitPrice, soldQty float64,
-	exitReason string,
-	filledAt time.Time,
-	leg store.Order,
-) bool {
+func bracketExitIntent(leg store.Order) store.ExitIntent {
 	reasonCode := leg.ExitReason
 	evidence := make(map[string]any)
 	if len(leg.ExitEvidence) > 0 {
@@ -321,12 +570,10 @@ func (e *Engine) bookBracketClose(
 	evidence["broker_order_id"] = leg.BrokerOrderID
 	evidence["trigger_price"] = trigger
 	evidence["order_type"] = leg.OrderType
-	intent := newExitIntent(reasonCode, evidence)
-	realized, err := store.CloseTradeRealizedWithIntent(ctx, t.ID, exitPrice, filledAt, intent)
-	if err != nil {
-		logger.Warn("bracket exits: close trade", "trade_id", t.ID, "err", err)
-		return false
-	}
+	return newExitIntent(reasonCode, evidence)
+}
+
+func (e *Engine) recordBracketClose(t store.Trade, realized store.TradeRealization, exitReason string) {
 	if realized.PnL < 0 {
 		// Same cooldown bookkeeping as the software exit path — without it,
 		// risk.cooldown_after_loss never fires on bracket stop-outs.
@@ -344,7 +591,6 @@ func (e *Engine) bookBracketClose(
 	)
 	e.publishTradeClosed(realized)
 	e.checkExitResidue(t.Ticker)
-	return true
 }
 
 // cancelBracketLegsForTicker cancels every working exit leg across the

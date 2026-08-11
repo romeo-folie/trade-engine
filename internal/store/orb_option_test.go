@@ -21,7 +21,7 @@ func TestORBTrade_OptionRoundTrip(t *testing.T) {
 
 	// Dedicated session name: the test DB is shared and orb_sessions has a unique
 	// (date, session_name) constraint, so each test must use a distinct name.
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-roundtrip")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-roundtrip", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
@@ -78,8 +78,12 @@ func TestORBTrade_OptionRoundTrip(t *testing.T) {
 	}
 
 	// A plain equity trade must default cleanly — nothing option-specific set.
+	eqSess, err := store.CreateORBSession(ctx, db, time.Now(), "equity-roundtrip")
+	if err != nil {
+		t.Fatalf("CreateORBSession (equity): %v", err)
+	}
 	eqID, err := store.CreateORBTrade(ctx, db, store.ORBTrade{
-		SessionID: sess.ID, Ticker: "AAPL", Side: "buy",
+		SessionID: eqSess.ID, Ticker: "AAPL", Side: "buy",
 		EntryStop: 200.0, StopLoss: 198.0, TakeProfit: 206.0, Qty: 10, Status: "filled",
 	})
 	if err != nil {
@@ -146,7 +150,7 @@ func TestGetOpenFilledOptionTrades(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-openfilled")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-openfilled", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
@@ -168,7 +172,11 @@ func TestGetOpenFilledOptionTrades(t *testing.T) {
 		t.Fatalf("fill option trade: %v", err)
 	}
 	// A filled equity (must be excluded) and a pending option (must be excluded).
-	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{SessionID: sess.ID, Ticker: "AAPL", Side: "buy", Qty: 10, Status: "filled"})
+	eqSess, err := store.CreateORBSession(ctx, db, time.Now(), "equity-openfilled")
+	if err != nil {
+		t.Fatalf("CreateORBSession (equity): %v", err)
+	}
+	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{SessionID: eqSess.ID, Ticker: "AAPL", Side: "buy", Qty: 10, Status: "filled"})
 	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{SessionID: sess.ID, Ticker: "QQQ", Side: "buy", Qty: 1, Status: "pending", AssetClass: "option", OCCSymbol: "QQQ260717C00500000"})
 
 	trades, err := store.GetOpenFilledOptionTrades(ctx, db)
@@ -207,7 +215,7 @@ func TestOptionReconcileScoping(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-reconcile-scope")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-reconcile-scope", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
@@ -225,8 +233,12 @@ func TestOptionReconcileScoping(t *testing.T) {
 		AssetClass: "option", Underlying: "QQQ", Expiry: &exp, Strike: 500, Right: "P",
 		OCCSymbol: pendingOCC, Multiplier: 100,
 	})
+	eqSess, err := store.CreateORBSession(ctx, db, time.Now(), "equity-reconcile-scope")
+	if err != nil {
+		t.Fatalf("CreateORBSession (equity): %v", err)
+	}
 	eqID, _ := store.CreateORBTrade(ctx, db, store.ORBTrade{
-		SessionID: sess.ID, Ticker: "AAPLSCOPE", Side: "buy", Status: "filled", Qty: 10,
+		SessionID: eqSess.ID, Ticker: "AAPLSCOPE", Side: "buy", Status: "filled", Qty: 10,
 	})
 
 	// Managed quantities include both option OCCs (pending + filled).
@@ -269,7 +281,7 @@ func TestGetORBTrades_CarriesOptionIdentity(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-getorbtrades")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-getorbtrades", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
@@ -279,14 +291,23 @@ func TestGetORBTrades_CarriesOptionIdentity(t *testing.T) {
 		AssetClass: "option", Underlying: "SPY", Expiry: &exp, Strike: 551, Right: "C",
 		OCCSymbol: "SPY260717C00551000", Multiplier: 100,
 	})
+	eqSess, err := store.CreateORBSession(ctx, db, time.Now(), "equity-getorbtrades")
+	if err != nil {
+		t.Fatalf("CreateORBSession (equity): %v", err)
+	}
 	_, _ = store.CreateORBTrade(ctx, db, store.ORBTrade{
-		SessionID: sess.ID, Ticker: "AAPLTUI", Side: "buy", Status: "pending", Qty: 10,
+		SessionID: eqSess.ID, Ticker: "AAPLTUI", Side: "buy", Status: "pending", Qty: 10,
 	})
 
 	trades, err := store.GetORBTrades(ctx, db, sess.ID)
 	if err != nil {
 		t.Fatalf("GetORBTrades: %v", err)
 	}
+	equityTrades, err := store.GetORBTrades(ctx, db, eqSess.ID)
+	if err != nil {
+		t.Fatalf("GetORBTrades (equity): %v", err)
+	}
+	trades = append(trades, equityTrades...)
 	var opt, eq *store.ORBTrade
 	for i := range trades {
 		switch trades[i].Ticker {
@@ -328,7 +349,7 @@ func TestFillORBTradePartialByOrderID(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-partialfill")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-partialfill", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
@@ -362,7 +383,7 @@ func TestGetManagedOptionQuantities_SumsPerOCC(t *testing.T) {
 	}
 	ctx := context.Background()
 	db := store.GetDB()
-	sess, err := store.CreateORBSession(ctx, db, time.Now(), "opt-managedqty")
+	sess, err := store.CreateORBSessionOwned(ctx, db, time.Now(), "opt-managedqty", "option", store.ORBOwnerOptions)
 	if err != nil {
 		t.Fatalf("CreateORBSession: %v", err)
 	}
