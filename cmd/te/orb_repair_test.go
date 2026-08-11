@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -93,5 +94,59 @@ func TestValidateORBRepairPlanAllowsPendingIdentityOnly(t *testing.T) {
 	plan.Trades[0].Close = &orbRepairClose{ExitType: "broker_exit", ExitSource: "broker", ExitPrice: 1, ClosedAt: "2026-08-10T08:00:00Z", BrokerOrderID: "1"}
 	if err := validateORBRepairPlan(plan); err == nil {
 		t.Fatal("pending repair with close action accepted")
+	}
+}
+
+func TestORBRepairPnLUsesLongOptionMultiplierForPut(t *testing.T) {
+	trade := store.ORBTrade{Side: "sell", FillPrice: 1.20, Qty: 2, Multiplier: 100}
+	action := orbTradeRepair{
+		AssetClass: "option", PointValue: 1,
+		Close: &orbRepairClose{ExitPrice: 1.80},
+	}
+	if got, want := orbRepairPnL(trade, action), 120.0; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("option put repair P&L = %v, want %v", got, want)
+	}
+
+	trade = store.ORBTrade{Side: "sell", FillPrice: 54115, Qty: 3}
+	action = orbTradeRepair{
+		AssetClass: "futures", PointValue: 0.5,
+		Close: &orbRepairClose{ExitPrice: 54015},
+	}
+	if got, want := orbRepairPnL(trade, action), 150.0; math.Abs(got-want) > 1e-9 {
+		t.Fatalf("short futures repair P&L = %v, want %v", got, want)
+	}
+}
+
+func TestValidateORBSessionRepairOwnership(t *testing.T) {
+	repair := orbSessionRepair{
+		SessionID: "session-1", AssetClass: "futures", OwnerScope: "futures_index_orb",
+	}
+	trades := []store.ORBTrade{
+		{ID: "mnq", AssetClass: "futures", OwnerScope: "equity_orb"},
+		{ID: "mym", AssetClass: "futures", OwnerScope: "futures_index_orb"},
+	}
+	actions := map[string]orbTradeRepair{
+		"mnq": {AssetClass: "futures", OwnerScope: "futures_index_orb"},
+	}
+	if err := validateORBSessionRepairOwnership(repair, trades, actions); err != nil {
+		t.Fatalf("single-owner projected session rejected: %v", err)
+	}
+
+	trades = append(trades, store.ORBTrade{
+		ID: "mgc", AssetClass: "futures", OwnerScope: "futures_metals_orb",
+	})
+	if err := validateORBSessionRepairOwnership(repair, trades, actions); err == nil {
+		t.Fatal("mixed-owner session repair accepted")
+	}
+}
+
+func TestValidateORBRepairPlanAllowsSessionOnlyRepair(t *testing.T) {
+	plan := orbRepairPlan{Sessions: []orbSessionRepair{{
+		SessionID: "session-1", ExpectStatus: "scanning",
+		ExpectAssetClass: "futures", ExpectOwnerScope: "equity_orb",
+		AssetClass: "futures", OwnerScope: "futures_index_orb",
+	}}}
+	if err := validateORBRepairPlan(plan); err != nil {
+		t.Fatalf("session-only repair rejected: %v", err)
 	}
 }

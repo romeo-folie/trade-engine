@@ -721,15 +721,59 @@ func (e *Engine) runExitReconcileSweep(ctx context.Context) ExitReconcileStats {
 }
 
 func (e *Engine) runExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
-	sweepCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
-	defer cancel()
+	return runExitReconcilePhases(
+		ctx,
+		5*time.Minute,
+		e.reconcileBrokerManagedExitFills,
+		func(claimedCtx context.Context) ExitReconcileStats {
+			return e.runClaimedExitReconcileSweepLimit(claimedCtx, limit)
+		},
+	)
+}
+
+func runExitReconcilePhases(
+	ctx context.Context,
+	phaseTimeout time.Duration,
+	brokerManaged func(context.Context) int,
+	claimed func(context.Context) ExitReconcileStats,
+) ExitReconcileStats {
+	// Protective bracket/standalone-stop fills belong to open trades, so they
+	// are intentionally absent from GetPendingExitOrders. Book those first: the
+	// startup caller compares broker positions with DB ownership immediately
+	// after this sweep, including while the market is closed.
+	legCtx, cancelLegs := context.WithTimeout(ctx, phaseTimeout)
+	brokerManagedErrors := brokerManaged(legCtx)
+	cancelLegs()
+
+	// Give claimed exits their own budget. A large/slow protective-leg set must
+	// not consume the deadline and starve already-exiting trades every sweep.
+	claimedCtx, cancelClaimed := context.WithTimeout(ctx, phaseTimeout)
+	defer cancelClaimed()
+	stats := claimed(claimedCtx)
+	stats.Errors += brokerManagedErrors
+	return stats
+}
+
+func (e *Engine) runClaimedExitReconcileSweepLimit(ctx context.Context, limit int) ExitReconcileStats {
 	stats := ReconcileExitOrderFillsWithStoreAndLoss(
-		sweepCtx, e.executor, limit, e.portfolio.RecordLoss,
+		ctx, e.executor, limit, e.portfolio.RecordLoss,
 	)
 	for _, realized := range stats.Closed {
 		e.publishTradeClosed(realized)
 	}
 	return stats
+}
+
+func (e *Engine) reconcileBrokerManagedExitFills(ctx context.Context) int {
+	trades, err := store.GetOpenTrades(ctx)
+	if err != nil {
+		logger.Warn("broker-managed exit reconcile: load open trades", "err", err)
+		return 1
+	}
+	for _, trade := range trades {
+		e.reconcileBracketTrade(ctx, trade)
+	}
+	return 0
 }
 
 // ReconcileExitsNow performs a bounded best-effort startup sweep. The command
@@ -741,12 +785,21 @@ func (e *Engine) ReconcileExitsNow(ctx context.Context) {
 	if !store.IsConnected() {
 		return
 	}
+	// Always retry broker-managed open legs on the Engine.Run safety call, even
+	// when the command's first pass completed its claimed-exit backlog. The leg
+	// status API is best effort and reconcileBracketTrade deliberately treats a
+	// transient broker read as unknown rather than closing from stale state.
+	legCtx, cancelLegs := context.WithTimeout(ctx, 5*time.Minute)
+	e.reconcileBrokerManagedExitFills(legCtx)
+	cancelLegs()
 	e.exitStartupMu.Lock()
 	defer e.exitStartupMu.Unlock()
 	if e.exitStartupPrepared {
 		return
 	}
-	stats := e.runExitReconcileSweepLimit(ctx, StartupExitReconcileBatch)
+	claimedCtx, cancelClaimed := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancelClaimed()
+	stats := e.runClaimedExitReconcileSweepLimit(claimedCtx, StartupExitReconcileBatch)
 	e.exitStartupPrepared = stats.Errors == 0
 }
 

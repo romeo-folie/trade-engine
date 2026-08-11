@@ -60,6 +60,28 @@ func TestExitReconcileTickerRunsWithoutOverlapAndStopsOnCancel(t *testing.T) {
 	}
 }
 
+func TestExitReconcilePhasesHaveIndependentDeadlines(t *testing.T) {
+	claimedRan := false
+	stats := runExitReconcilePhases(
+		context.Background(),
+		5*time.Millisecond,
+		func(ctx context.Context) int {
+			<-ctx.Done()
+			return 1
+		},
+		func(ctx context.Context) ExitReconcileStats {
+			claimedRan = true
+			if err := ctx.Err(); err != nil {
+				t.Fatalf("claimed phase inherited expired leg context: %v", err)
+			}
+			return ExitReconcileStats{Scanned: 1}
+		},
+	)
+	if !claimedRan || stats.Scanned != 1 || stats.Errors != 1 {
+		t.Fatalf("independent phases = called %v stats %+v", claimedRan, stats)
+	}
+}
+
 func TestStartupExitReconcilePreventsFalseBrokerDrift(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
@@ -104,6 +126,59 @@ func TestStartupExitReconcilePreventsFalseBrokerDrift(t *testing.T) {
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil || trade.Status != "closed" {
 		t.Fatalf("startup exit trade = %+v err=%v, want closed", trade, err)
+	}
+}
+
+func TestStartupExitReconcileBooksProtectiveStopBeforeBrokerDrift(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_BOOT_STOP_DRIFT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 0, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "boot-protective-stop", Ticker: "TEST_BOOT_STOP_DRIFT",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	filledAt := time.Date(2026, 8, 10, 19, 56, 27, 0, time.UTC)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"boot-protective-stop": {
+			Status: "filled", FilledPrice: 94.75, FilledQty: 5, FilledAt: filledAt,
+		},
+	}}
+	eng := newBracketTestEngine(exec)
+
+	// This call is deliberately independent of market hours. cmd/te/run.go
+	// invokes it synchronously before its broker-vs-DB comparison.
+	eng.ReconcileExitsNow(ctx)
+	drifts, ok := ReconcileBrokerVsDBWithStoreStatus(ctx, &fakeBrokerView{}, 0)
+	if !ok {
+		t.Fatal("post-stop startup reconciliation did not complete")
+	}
+	for _, drift := range drifts {
+		if drift.Ticker == "TEST_BOOT_STOP_DRIFT" {
+			t.Fatalf("broker-filled protective stop still drifted: %+v", drift)
+		}
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("protective-stop trade = %+v err=%v, want closed", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil || len(orders) != 1 {
+		t.Fatalf("GetOrdersByTrade = %+v, %v", orders, err)
+	}
+	if orders[0].Status != "filled" || orders[0].FilledAt == nil || !orders[0].FilledAt.Equal(filledAt) {
+		t.Fatalf("protective stop = status %q filled_at %s, want filled at %s",
+			orders[0].Status, orders[0].FilledAt, filledAt)
 	}
 }
 
