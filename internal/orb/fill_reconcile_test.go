@@ -163,3 +163,15 @@ func TestFillReconcileKeepsFuturesExpiriesSeparate(t *testing.T) {
 		t.Fatalf("fill cost = %v; want new-expiry cost 43000", got)
 	}
 }
+
+func TestFilledSideIdentityKeepsFuturesExpiriesSeparate(t *testing.T) {
+	filled := []store.ORBTrade{{Ticker: "MYM", ConID: "old", Side: "buy"}}
+	filledSides := filledSidesByIdentity(filled)
+
+	if filledSides[positionIdentity("MYM", "new")]["buy"] {
+		t.Fatal("old-contract fill leaked into new-contract OCO identity")
+	}
+	if !filledSides[positionIdentity("MYM", "old")]["buy"] {
+		t.Fatal("old-contract fill missing from its exact OCO identity")
+	}
+}

@@ -1631,6 +1631,51 @@ func TestManager_StartupDeferralSeedsMissingOriginalStop(t *testing.T) {
 	}
 }
 
+// A transient broker failure during the startup sweep must not erase the
+// RequireFresh gate. The next ordinary tick may retry protection, but it must
+// not market-exit from the exact same observation that startup rejected.
+func TestManager_StartupDeferralSurvivesProtectiveStopFailure(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 200,
+	}
+	fp := &fakePrices{candles: makeFlatPriceCandles(110, candle(110, 110.5, 109.5, 110))}
+	fb := &fakeBroker{placeErr: errors.New("temporary broker failure")}
+	m := NewManager(Config{
+		Enabled: true, ATRMultiple: 0.1, Interval: time.Hour,
+		MarketOpen: alwaysOpenSession,
+	}, fs, fp, fb)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m.Run(ctx)
+
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("startup sweep status = %q, want open", got)
+	}
+	if _, ok := m.deferredATRExit["t1"]; !ok {
+		t.Fatal("startup broker failure lost ATR exit deferral")
+	}
+
+	// Let the protection retry succeed, but leave the provider observation
+	// unchanged. This tick must place only the original stop, never a market
+	// sell derived from the stale startup candle.
+	fb.placeErr = nil
+	m.UpdateAll(context.Background())
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("identical observation status = %q, want startup deferral to remain open", got)
+	}
+	if len(fb.placed) != 2 {
+		t.Fatalf("placement attempts = %+v, want failed startup seed plus successful retry", fb.placed)
+	}
+	for _, order := range fb.placed {
+		if order.Type != execution.OrderTypeStop || order.StopPrice != 95 {
+			t.Fatalf("placement attempts = %+v, want only original protective stops", fb.placed)
+		}
+	}
+}
+
 // The restart safety gate applies only to a crossed-band market exit. A normal
 // startup sweep must still ratchet broker protection immediately; otherwise
 // every restart creates an avoidable full-interval window at the stale stop.

@@ -178,6 +178,27 @@ func TestMatchExitsFromRecords_UniqueBrokerFlattenWinsAwayFromBracket(t *testing
 	}
 }
 
+func TestMatchExitsFromRecords_DurableTradeRejectsMissingConID(t *testing.T) {
+	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
+	filledAt := entryTime
+	trades := []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "old-contract", Side: "buy", Qty: 3,
+		FillPrice: 52874, TakeProfit: 53500, StopLoss: 52567, Status: "filled",
+		AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5,
+		CreatedAt: entryTime.Add(-time.Minute), FilledAt: &filledAt,
+	}}
+	records := []execution.IBKRTradeRecord{{
+		OrderID: "unknown-contract", Symbol: "MYM", Side: "sell",
+		Qty: 3, Price: 53500, FilledAt: entryTime.Add(time.Hour),
+	}}
+
+	s := &ORBScheduler{now: func() time.Time { return records[0].FilledAt.Add(time.Minute) }}
+	s.matchExitsFromRecords(context.Background(), trades, records)
+	if trades[0].Status != "filled" {
+		t.Fatalf("missing-ConID record changed durable trade status to %q; want filled", trades[0].Status)
+	}
+}
+
 func TestMatchExitsFromRecords_AmbiguousAwayFromBracketDoesNotGuess(t *testing.T) {
 	entryTime := time.Date(2026, 7, 14, 13, 0, 0, 0, time.UTC)
 	filledAt := entryTime

@@ -311,7 +311,9 @@ func (s *ORBScheduler) cancelBracketLegs(ctx context.Context, t store.ORBTrade) 
 		if o.Ticker != t.Ticker {
 			continue
 		}
-		if t.ConID != "" && o.Conid != "" && o.Conid != t.ConID {
+		// Durable futures rows require exact broker identity. A missing ConID is
+		// ambiguous, not permission to fall back to root ticker and price.
+		if t.ConID != "" && o.Conid != t.ConID {
 			continue
 		}
 		if _, skip := protected[o.OrderID]; skip {

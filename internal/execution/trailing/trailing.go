@@ -465,6 +465,23 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 			// hard stop instead, exactly as the EMA9 rule does. Capped trades
 			// stay app-managed: a standalone stop beside their software
 			// take-profit creates two exit owners and can double-sell.
+			// Record the deferral before any fallible persistence or broker work.
+			// Otherwise a transient startup error can return without RequireFresh,
+			// allowing the next ordinary tick to exit from the same observation.
+			if !wasDeferred {
+				message := "trailing-stop: trail crossed price outside regular session; deferring market exit"
+				if startupSweep {
+					message = "trailing-stop: trail crossed price during startup sweep; deferring market exit until next tick"
+				}
+				logger.Info(message,
+					"trade_id", t.ID,
+					"ticker", t.Ticker,
+					"trailing_stop", newStop,
+					"current_price", currentPrice,
+				)
+				m.deferredATRExit[t.ID] = atrExitDeferral{Observation: observation, RequireFresh: startupSweep}
+			}
+
 			// Persist the peak before the fallible seed, for the same reason as
 			// the disarmed branch above: a broker hiccup must never cost a high
 			// that already printed.
@@ -478,19 +495,6 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep boo
 				if err := m.ensureProtectiveStop(ctx, t); err != nil {
 					return fmt.Errorf("seed protective stop before deferral: %w", err)
 				}
-			}
-			if !wasDeferred {
-				message := "trailing-stop: trail crossed price outside regular session; deferring market exit"
-				if startupSweep {
-					message = "trailing-stop: trail crossed price during startup sweep; deferring market exit until next tick"
-				}
-				logger.Info(message,
-					"trade_id", t.ID,
-					"ticker", t.Ticker,
-					"trailing_stop", newStop,
-					"current_price", currentPrice,
-				)
-				m.deferredATRExit[t.ID] = atrExitDeferral{Observation: observation, RequireFresh: startupSweep}
 			}
 			return nil
 		}

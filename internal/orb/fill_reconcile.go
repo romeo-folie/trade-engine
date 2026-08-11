@@ -209,17 +209,11 @@ func (s *ORBScheduler) cancelStaleOCOLegs(ctx context.Context) {
 	filled = s.ownedTradeRows(filled)
 	pending = s.ownedTradeRows(pending)
 
-	filledSides := make(map[string]map[string]bool)
-	for _, t := range filled {
-		if filledSides[t.Ticker] == nil {
-			filledSides[t.Ticker] = make(map[string]bool)
-		}
-		filledSides[t.Ticker][strings.ToLower(t.Side)] = true
-	}
+	filledSides := filledSidesByIdentity(filled)
 
 	for i := range pending {
 		p := &pending[i]
-		if !filledSides[p.Ticker][oppositeSide(p.Side)] {
+		if !filledSides[positionIdentity(p.Ticker, p.ConID)][oppositeSide(p.Side)] {
 			continue // no filled winner on the opposite side — leave it working
 		}
 		if err := CancelOrder(ctx, s.executor, p.OrderID); err != nil {
@@ -238,6 +232,18 @@ func (s *ORBScheduler) cancelStaleOCOLegs(ctx context.Context) {
 		s.clearEntryID(p.Ticker, p.OrderID)
 		slog.Info("orb: fill reconcile: cancelled stale OCO leg", "ticker", p.Ticker, "side", p.Side)
 	}
+}
+
+func filledSidesByIdentity(filled []store.ORBTrade) map[string]map[string]bool {
+	filledSides := make(map[string]map[string]bool)
+	for _, t := range filled {
+		identity := positionIdentity(t.Ticker, t.ConID)
+		if filledSides[identity] == nil {
+			filledSides[identity] = make(map[string]bool)
+		}
+		filledSides[identity][strings.ToLower(t.Side)] = true
+	}
+	return filledSides
 }
 
 // matchOrphanEntries returns the pending ORB entry rows that account for a

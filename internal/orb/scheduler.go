@@ -2823,7 +2823,7 @@ func (s *ORBScheduler) matchExitsFromRecords(ctx context.Context, trades []store
 		eligible := make([]execution.IBKRTradeRecord, 0, 2)
 		for _, rec := range records {
 			identityMatches := rec.Symbol == t.Ticker
-			if t.ConID != "" && rec.Conid != "" {
+			if t.ConID != "" {
 				identityMatches = rec.Conid == t.ConID
 			}
 			if !identityMatches {

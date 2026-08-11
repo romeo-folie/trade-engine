@@ -234,11 +234,12 @@ func TestCancelBracketLegsUsesDurableContractIdentity(t *testing.T) {
 	exec := &flattenExec{working: []execution.WorkingOrder{
 		{OrderID: "old-sl", Ticker: "MYM", Conid: "old", StopPrice: 42000},
 		{OrderID: "new-sl", Ticker: "MYM", Conid: "new", StopPrice: 42000},
+		{OrderID: "unknown-sl", Ticker: "MYM", StopPrice: 42000},
 	}}
 	s := &ORBScheduler{executor: exec, orderIDs: make(map[string][2]string)}
 	s.cancelBracketLegs(context.Background(), store.ORBTrade{Ticker: "MYM", ConID: "old", StopLoss: 42000})
 	if len(exec.cancelled) != 1 || exec.cancelled[0] != "old-sl" {
-		t.Fatalf("cancelled = %v; want only old-contract leg", exec.cancelled)
+		t.Fatalf("cancelled = %v; want only exact old-contract leg", exec.cancelled)
 	}
 }
 
