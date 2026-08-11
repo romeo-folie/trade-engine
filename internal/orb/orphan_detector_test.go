@@ -72,6 +72,77 @@ func TestFindOrphanedPositions(t *testing.T) {
 	}
 }
 
+func TestFindORBRowHealthSurfacesFlatBrokerIdentityDefects(t *testing.T) {
+	rows := []store.ORBTrade{
+		{ID: "mym", Ticker: "MYM", Side: "buy", Qty: 3, FillPrice: 52874, OwnerScope: "futures_index_orb", AssetClass: "equity"},
+		{ID: "mnq", Ticker: "MNQ", Side: "sell", Qty: 1, FillPrice: 22000, OwnerScope: "futures_index_orb", AssetClass: "futures", PointValue: 2, ConID: "123"},
+		{ID: "legacy", Ticker: "ES", OwnerScope: "", AssetClass: "futures"},
+	}
+	got := findORBRowHealth(rows, "futures_index_orb", "futures")
+	codes := make(map[string]bool)
+	for _, f := range got {
+		codes[f.TradeID+"|"+f.Code] = true
+	}
+	for _, want := range []string{"mym|asset_owner_mismatch", "mym|point_value_missing", "mym|conid_missing", "legacy|owner_scope_invalid"} {
+		if !codes[want] {
+			t.Errorf("missing row-health finding %s; got %+v", want, got)
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("findings = %+v; want exactly four", got)
+	}
+}
+
+func TestFindORBRowHealthFlagsInvalidEntryEconomics(t *testing.T) {
+	rows := []store.ORBTrade{{ID: "bad", Ticker: "MNQ", OwnerScope: "futures_index_orb", AssetClass: "futures", PointValue: 2, ConID: "123"}}
+	got := findORBRowHealth(rows, "futures_index_orb", "futures")
+	if len(got) != 1 || got[0].Code != "entry_economics_invalid" {
+		t.Fatalf("findings = %+v; want entry_economics_invalid", got)
+	}
+}
+
+func TestPositionsForOwnedTradesUsesDurableConIDAfterDeconfiguration(t *testing.T) {
+	positions := []execution.Position{
+		{Ticker: "815824200", Quantity: 3},               // unresolved MYM contract
+		{Ticker: "MNQ", Quantity: 1},                     // legacy/configured symbol fallback
+		{Ticker: "MYM", ConID: "999999999", Quantity: 4}, // different expiry of same root
+		{Ticker: "GC", Quantity: 2},                      // unrelated account position
+	}
+	rows := []store.ORBTrade{
+		{Ticker: "MYM", ConID: "815824200", OwnerScope: "futures_index_orb", AssetClass: "futures"},
+		{Ticker: "MNQ", OwnerScope: "futures_index_orb", AssetClass: "futures"},
+	}
+
+	got := positionsForOwnedTrades(positions, rows)
+	if len(got) != 2 {
+		t.Fatalf("owned positions = %+v, want MYM and MNQ only", got)
+	}
+	if got[0].Ticker != "MYM" || got[0].Quantity != 3 {
+		t.Fatalf("conid position = %+v, want durable ticker MYM qty 3", got[0])
+	}
+	if got[1].Ticker != "MNQ" || got[1].Quantity != 1 {
+		t.Fatalf("ticker fallback position = %+v, want MNQ qty 1", got[1])
+	}
+}
+
+func TestLegacyForexPositionNormalizesBrokerConIDBeforeOrphanComparison(t *testing.T) {
+	filled := []store.ORBTrade{{Ticker: "EUR/USD", Side: "buy", Qty: 20000}}
+	positions := normalizeLegacyPositionIdentities(
+		[]execution.Position{
+			{Ticker: "EUR/USD", ConID: "12087792", Quantity: 20000},
+			{Ticker: "XAU/USD", ConID: "457480516", Quantity: 2},
+		},
+		filled,
+	)
+	if len(positions) != 2 || positions[0].ConID != "" {
+		t.Fatalf("legacy position = %+v; want ticker-keyed identity", positions)
+	}
+	got := findOrphanedPositions(positions, filled, orphanPositionTolerance)
+	if len(got) != 1 || got[0].Ticker != "XAU/USD" {
+		t.Fatalf("findings = %+v; want only unmatched XAU/USD preserved", got)
+	}
+}
+
 // A short managed by a matching short row is fully explained.
 // forexOnlyPositions must drop positions that aren't this scheduler's configured
 // forex/metals instruments — specifically a concurrent futures scheduler's
@@ -84,7 +155,7 @@ func TestForexOnlyPositions_ExcludesFutures(t *testing.T) {
 	positions := []execution.Position{
 		{Ticker: "XAU/USD", Quantity: -57}, // managed metals — kept
 		{Ticker: "793356217", Quantity: 6}, // MES front-month conid (unresolved futures) — dropped
-		{Ticker: "MES", Quantity: 6},        // even a resolved futures symbol isn't a forex instrument — dropped
+		{Ticker: "MES", Quantity: 6},       // even a resolved futures symbol isn't a forex instrument — dropped
 	}
 	got := s.forexOnlyPositions(positions)
 	if len(got) != 1 || got[0].Ticker != "XAU/USD" {

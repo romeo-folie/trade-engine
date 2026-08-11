@@ -100,6 +100,43 @@ func TestORBTrade_OptionRoundTrip(t *testing.T) {
 	}
 }
 
+func TestOpenFilledORBReaderPreservesDurableFuturesIdentity(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set")
+	}
+	ctx := context.Background()
+	sess, err := store.CreateORBSessionOwned(ctx, store.GetDB(), time.Now(), "futures-reader-identity", "futures", "futures_index_orb")
+	if err != nil {
+		t.Fatalf("CreateORBSessionOwned: %v", err)
+	}
+	id, err := store.CreateORBTrade(ctx, store.GetDB(), store.ORBTrade{
+		SessionID: sess.ID, Ticker: "MYM", Side: "buy", Qty: 3,
+		EntryStop: 52874, StopLoss: 52567, TakeProfit: 53500,
+		OrderID: "mym-reader-identity", Status: "pending", AssetClass: "futures",
+		OwnerScope: "futures_index_orb", ConID: "815824200", PointValue: 0.5,
+	})
+	if err != nil {
+		t.Fatalf("CreateORBTrade: %v", err)
+	}
+	if _, err := store.FillORBTradeByOrderID(ctx, store.GetDB(), "mym-reader-identity", 52874); err != nil {
+		t.Fatalf("FillORBTradeByOrderID: %v", err)
+	}
+	rows, err := store.GetOpenFilledORBTrades(ctx, store.GetDB())
+	if err != nil {
+		t.Fatalf("GetOpenFilledORBTrades: %v", err)
+	}
+	for _, row := range rows {
+		if row.ID != id {
+			continue
+		}
+		if row.AssetClass != "futures" || row.OwnerScope != "futures_index_orb" || row.ConID != "815824200" || row.PointValue != 0.5 {
+			t.Fatalf("reader lost durable identity: %+v", row)
+		}
+		return
+	}
+	t.Fatalf("created futures row %s not returned", id)
+}
+
 // TestGetOpenFilledOptionTrades verifies the dedicated reader returns filled
 // option trades with full contract identity + underlying levels (used by the
 // #415 exit watcher), and excludes non-option and non-filled rows.

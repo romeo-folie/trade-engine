@@ -125,6 +125,24 @@ func TestApiNotFound_returns404(t *testing.T) {
 	}
 }
 
+func TestORBSessionTodayRequiresOwnerForFutures(t *testing.T) {
+	srv := NewServer(Config{}, nil, nil)
+	for _, tc := range []struct {
+		name, target string
+	}{
+		{"missing owner", "/api/orb/session/today?session_name=futures"},
+		{"invalid owner", "/api/orb/session/today?session_name=futures&owner_scope=unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			srv.handleORBSessionToday(w, httptest.NewRequest(http.MethodGet, tc.target, nil))
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
 // ─── isNotFound ──────────────────────────────────────────────────────────────
 
 func TestIsNotFound(t *testing.T) {

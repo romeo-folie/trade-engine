@@ -220,7 +220,24 @@ type Manager struct {
 	deferredEMA map[string]time.Time
 	// deferredATRExit dedupes the "trail crossed price but the market is
 	// closed" log so an overnight defer doesn't emit one line per tick.
-	deferredATRExit map[string]struct{}
+	deferredATRExit map[string]atrExitDeferral
+}
+
+type trailingObservation struct {
+	Timestamp time.Time
+	Price     float64
+	ATR       float64
+}
+
+type atrExitDeferral struct {
+	Observation  trailingObservation
+	RequireFresh bool
+}
+
+func (o trailingObservation) advancedFrom(previous trailingObservation) bool {
+	return o.Timestamp.After(previous.Timestamp) ||
+		math.Abs(o.Price-previous.Price) > 1e-9 ||
+		math.Abs(o.ATR-previous.ATR) > 1e-9
 }
 
 // NewManager constructs a trailing-stop Manager.
@@ -238,7 +255,7 @@ func NewManager(cfg Config, ts TradeStore, prices PriceFetcher, exec execution.E
 		now:             time.Now,
 		marketOpen:      marketOpen,
 		deferredEMA:     make(map[string]time.Time),
-		deferredATRExit: make(map[string]struct{}),
+		deferredATRExit: make(map[string]atrExitDeferral),
 	}
 }
 
@@ -258,8 +275,11 @@ func (m *Manager) Run(ctx context.Context) {
 	)
 	ticker := time.NewTicker(m.cfg.Interval)
 	defer ticker.Stop()
-	// Run immediately so the first ratchet doesn't wait a full interval.
-	m.UpdateAll(ctx)
+	// Run immediately so the first ratchet doesn't wait a full interval. A
+	// crossed ATR band discovered by this startup sweep is re-validated on the
+	// first normal tick before it is allowed to submit a market exit. Broker
+	// protection remains live while that one-tick deferral is in effect.
+	m.updateAll(ctx, true)
 	for {
 		select {
 		case <-ctx.Done():
@@ -274,6 +294,14 @@ func (m *Manager) Run(ctx context.Context) {
 // up. Failures on a single trade are logged WARN and skipped so a bad row
 // never poisons the whole tick.
 func (m *Manager) UpdateAll(ctx context.Context) {
+	m.updateAll(ctx, false)
+}
+
+// updateAll performs one manager sweep. startupSweep is deliberately private
+// and passed by Run only for its immediate first pass: keeping it out of
+// Manager state means the very next interval tick necessarily resumes normal
+// crossed-band behaviour, without a restart flag that can become stale.
+func (m *Manager) updateAll(ctx context.Context, startupSweep bool) {
 	trades, err := m.store.GetOpenTrades(ctx)
 	if err != nil {
 		logger.Warn("trailing-stop: GetOpenTrades failed", "err", err)
@@ -285,7 +313,7 @@ func (m *Manager) UpdateAll(ctx context.Context) {
 			continue
 		}
 		active[t.ID] = true
-		if err := m.updateOne(ctx, t); err != nil {
+		if err := m.updateOne(ctx, t, startupSweep); err != nil {
 			logger.Warn("trailing-stop: update failed",
 				"trade_id", t.ID,
 				"ticker", t.Ticker,
@@ -329,17 +357,18 @@ func isLongStockTrade(t store.Trade) bool {
 // updateOne does a full trailing-stop tick for a single trade: fetches a
 // recent price + ATR, ratchets the high-water-mark, computes a new stop, and
 // places or replaces the broker STOP order.
-func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
+func (m *Manager) updateOne(ctx context.Context, t store.Trade, startupSweep bool) error {
 	if m.cfg.Rule == RuleEMA9 {
 		return m.updateOneEMA9(ctx, t)
 	}
 	if t.Quantity <= 0 {
 		return fmt.Errorf("non-positive quantity %f", t.Quantity)
 	}
-	currentPrice, atr, err := m.priceAndATR(ctx, t.Ticker)
+	observation, err := m.priceAndATR(ctx, t.Ticker)
 	if err != nil {
 		return fmt.Errorf("price/atr: %w", err)
 	}
+	currentPrice, atr := observation.Price, observation.ATR
 	if currentPrice <= 0 {
 		return errors.New("non-positive current price")
 	}
@@ -416,7 +445,10 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 	// sitting at the old price — exit at market immediately so the band's
 	// implied "we're done" actually plays out.
 	if newStop >= currentPrice {
-		if !m.marketOpen(m.now()) {
+		marketOpen := m.marketOpen(m.now())
+		deferred, wasDeferred := m.deferredATRExit[t.ID]
+		waitingForFresh := wasDeferred && deferred.RequireFresh && !observation.advancedFrom(deferred.Observation)
+		if startupSweep || !marketOpen || waitingForFresh {
 			// Same hazard the EMA9 rule guards against: a market sell
 			// submitted outside regular hours is a DAY order that sits queued
 			// until the next open, then fills on a decision derived from the
@@ -433,6 +465,23 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 			// hard stop instead, exactly as the EMA9 rule does. Capped trades
 			// stay app-managed: a standalone stop beside their software
 			// take-profit creates two exit owners and can double-sell.
+			// Record the deferral before any fallible persistence or broker work.
+			// Otherwise a transient startup error can return without RequireFresh,
+			// allowing the next ordinary tick to exit from the same observation.
+			if !wasDeferred {
+				message := "trailing-stop: trail crossed price outside regular session; deferring market exit"
+				if startupSweep {
+					message = "trailing-stop: trail crossed price during startup sweep; deferring market exit until next tick"
+				}
+				logger.Info(message,
+					"trade_id", t.ID,
+					"ticker", t.Ticker,
+					"trailing_stop", newStop,
+					"current_price", currentPrice,
+				)
+				m.deferredATRExit[t.ID] = atrExitDeferral{Observation: observation, RequireFresh: startupSweep}
+			}
+
 			// Persist the peak before the fallible seed, for the same reason as
 			// the disarmed branch above: a broker hiccup must never cost a high
 			// that already printed.
@@ -446,18 +495,6 @@ func (m *Manager) updateOne(ctx context.Context, t store.Trade) error {
 				if err := m.ensureProtectiveStop(ctx, t); err != nil {
 					return fmt.Errorf("seed protective stop before deferral: %w", err)
 				}
-			}
-			if _, deferred := m.deferredATRExit[t.ID]; !deferred {
-				logger.Info("trailing-stop: trail crossed price outside regular session; deferring market exit",
-					"trade_id", t.ID,
-					"ticker", t.Ticker,
-					"trailing_stop", newStop,
-					"current_price", currentPrice,
-				)
-				m.deferredATRExit[t.ID] = struct{}{}
-			}
-			if hwm != t.HighWaterMark {
-				return m.store.UpdateTradeTrailing(ctx, t.ID, 0, hwm)
 			}
 			return nil
 		}
@@ -637,16 +674,16 @@ func stopQuantityDiffers(existing *store.Order, quantity float64) bool {
 	return existing != nil && math.Abs(existing.Quantity-quantity) > 1e-9
 }
 
-// priceAndATR fetches recent 1h candles and returns (last close, ATR).
+// priceAndATR fetches recent 1h candles and returns the latest observation.
 // ATR honours the configured `risk.trailing_stop.atr_period` so the operator
 // knob actually flows through to the trailing band.
-func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, float64, error) {
+func (m *Manager) priceAndATR(ctx context.Context, ticker string) (trailingObservation, error) {
 	if m.prices == nil {
-		return 0, 0, errors.New("no price provider configured")
+		return trailingObservation{}, errors.New("no price provider configured")
 	}
 	candles, err := m.prices.FetchHistory(ctx, ticker, data.Timeframe1Hour, candleHistory)
 	if err != nil {
-		return 0, 0, err
+		return trailingObservation{}, err
 	}
 	// This path reads the provider directly and never touches the DB, so the
 	// UpsertCandles guard does not cover it (issue #519). A corrupt bar here
@@ -654,10 +691,11 @@ func (m *Manager) priceAndATR(ctx context.Context, ticker string) (float64, floa
 	// stop above the real market — closing a healthy position on bad data.
 	candles = sanitizeForTrailing(ticker, "1h", candles)
 	if len(candles) == 0 {
-		return 0, 0, errors.New("no candles returned")
+		return trailingObservation{}, errors.New("no candles returned")
 	}
 	atrVal := indicators.ComputeATR(candles, m.cfg.ATRPeriod)
-	return candles[len(candles)-1].Close, atrVal, nil
+	latest := candles[len(candles)-1]
+	return trailingObservation{Timestamp: latest.Timestamp, Price: latest.Close, ATR: atrVal}, nil
 }
 
 // sanitizeForTrailing drops corrupt bars before they reach ATR/EMA/high-water

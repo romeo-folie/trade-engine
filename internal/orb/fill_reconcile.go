@@ -79,7 +79,6 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 	// chain ages the parent order out) is recorded as filled from broker truth instead of
 	// being wrongly cancelled. Must cover futures too — they place the same brackets and hit
 	// the same not-found trap, and reverseConid now resolves their positions to symbols.
-	positions = s.ownedPositions(positions)
 	filled, err := store.GetOpenFilledORBTrades(ctx, s.db)
 	if err != nil {
 		slog.Warn("orb: fill reconcile: load filled trades failed", "err", err)
@@ -102,6 +101,11 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		return
 	}
 	cancelled = s.ownedTradeRows(cancelled)
+	identityRows := make([]store.ORBTrade, 0, len(filled)+len(pending)+len(cancelled))
+	identityRows = append(identityRows, filled...)
+	identityRows = append(identityRows, pending...)
+	identityRows = append(identityRows, cancelled...)
+	positions = positionsForOwnedTrades(positions, identityRows)
 	// Reuse the detector's residue math to find positions no filled row explains,
 	// then attribute each to the entry rows (pending OR wrongly-cancelled) that
 	// account for it. Match pending and cancelled candidates as SEPARATE
@@ -124,7 +128,7 @@ func (s *ORBScheduler) reconcileHeldPositionsToFilled(ctx context.Context) {
 		if len(entries) == 0 {
 			continue // no entry explains it — leave it for the alerting detector
 		}
-		fillPrice := math.Abs(avgCostFor(positions, f.Ticker))
+		fillPrice := math.Abs(avgCostFor(positions, f.Ticker, f.ConID))
 
 		// Record the fill on every matched row (a split bracket stores the runner
 		// and partial as separate same-side rows summing to the residue). Once
@@ -202,18 +206,14 @@ func (s *ORBScheduler) cancelStaleOCOLegs(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	filled = s.ownedTradeRows(filled)
+	pending = s.ownedTradeRows(pending)
 
-	filledSides := make(map[string]map[string]bool)
-	for _, t := range filled {
-		if filledSides[t.Ticker] == nil {
-			filledSides[t.Ticker] = make(map[string]bool)
-		}
-		filledSides[t.Ticker][strings.ToLower(t.Side)] = true
-	}
+	filledSides := filledSidesByIdentity(filled)
 
 	for i := range pending {
 		p := &pending[i]
-		if !filledSides[p.Ticker][oppositeSide(p.Side)] {
+		if !filledSides[positionIdentity(p.Ticker, p.ConID)][oppositeSide(p.Side)] {
 			continue // no filled winner on the opposite side — leave it working
 		}
 		if err := CancelOrder(ctx, s.executor, p.OrderID); err != nil {
@@ -234,6 +234,18 @@ func (s *ORBScheduler) cancelStaleOCOLegs(ctx context.Context) {
 	}
 }
 
+func filledSidesByIdentity(filled []store.ORBTrade) map[string]map[string]bool {
+	filledSides := make(map[string]map[string]bool)
+	for _, t := range filled {
+		identity := positionIdentity(t.Ticker, t.ConID)
+		if filledSides[identity] == nil {
+			filledSides[identity] = make(map[string]bool)
+		}
+		filledSides[identity][strings.ToLower(t.Side)] = true
+	}
+	return filledSides
+}
+
 // matchOrphanEntries returns the pending ORB entry rows that account for a
 // broker-truth orphan finding: same ticker and side (short position ⇒ 'sell'),
 // whose quantities together match the unaccounted residue. The whole same-side
@@ -248,7 +260,7 @@ func matchOrphanEntries(f orphanFinding, pending []store.ORBTrade, tolerance flo
 	var total float64
 	for i := range pending {
 		t := &pending[i]
-		if t.Ticker != f.Ticker || strings.EqualFold(t.Side, "sell") != wantSell {
+		if positionIdentity(t.Ticker, t.ConID) != positionIdentity(f.Ticker, f.ConID) || strings.EqualFold(t.Side, "sell") != wantSell {
 			continue
 		}
 		group = append(group, t)
@@ -287,10 +299,11 @@ func oppositeSide(side string) string {
 	return "buy"
 }
 
-// avgCostFor returns the broker's average cost for a ticker's position, or 0.
-func avgCostFor(positions []execution.Position, ticker string) float64 {
+// avgCostFor returns the broker's average cost for an exact persisted position
+// identity. ConID distinguishes futures expiries that share a root ticker.
+func avgCostFor(positions []execution.Position, ticker, conID string) float64 {
 	for _, p := range positions {
-		if p.Ticker == ticker {
+		if positionIdentity(p.Ticker, p.ConID) == positionIdentity(ticker, conID) {
 			return p.AvgCostBasis
 		}
 	}

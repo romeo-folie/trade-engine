@@ -20,6 +20,39 @@ type ORBSession struct {
 	Selected    []string
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+	AssetClass  string
+	OwnerScope  string
+}
+
+const (
+	ORBOwnerEquity        = "equity_orb"
+	ORBOwnerForex         = "forex_orb"
+	ORBOwnerFuturesIndex  = "futures_index_orb"
+	ORBOwnerFuturesMetals = "futures_metals_orb"
+	ORBOwnerOptions       = "options_orb"
+)
+
+// ORBOwnerAssetClass returns the asset class a durable owner is allowed to
+// manage. Keeping this mapping canonical prevents repair, alerting, and runtime
+// ownership checks from drifting independently.
+func ORBOwnerAssetClass(scope string) (string, bool) {
+	switch scope {
+	case ORBOwnerEquity:
+		return "equity", true
+	case ORBOwnerForex:
+		return "forex", true
+	case ORBOwnerFuturesIndex, ORBOwnerFuturesMetals:
+		return "futures", true
+	case ORBOwnerOptions:
+		return "option", true
+	default:
+		return "", false
+	}
+}
+
+func IsValidORBOwnerScope(scope string) bool {
+	_, ok := ORBOwnerAssetClass(scope)
+	return ok
 }
 
 // ORBTrade mirrors a row from the orb_trades table.
@@ -74,6 +107,15 @@ type ORBTrade struct {
 	Right      string // "C" | "P"
 	OCCSymbol  string
 	Multiplier int
+	// Durable lifecycle identity. OwnerScope survives instrument-config changes;
+	// ConID identifies the exact broker contract; PointValue is dollars per 1.0
+	// price move and may be fractional for futures (MYM = 0.50).
+	OwnerScope string
+	ConID      string
+	PointValue float64
+	// MaxHoldMinutes snapshots the launch-time exit policy. Nil identifies a
+	// legacy row whose policy was not persisted and may use config fallback.
+	MaxHoldMinutes *int
 	// ExitOrderID is the broker order id of the in-flight sell-to-close, persisted
 	// so restart recovery can poll it for the real fill (options only; empty until
 	// an exit is submitted). Cleared implicitly when the trade closes.
@@ -82,12 +124,20 @@ type ORBTrade struct {
 
 // CreateORBSession inserts a new ORB session for the given date and session name.
 func CreateORBSession(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName string) (*ORBSession, error) {
+	return CreateORBSessionOwned(ctx, db, date, sessionName, "equity", ORBOwnerEquity)
+}
+
+// CreateORBSessionOwned creates a session with durable asset/owner identity.
+// Existing callers use CreateORBSession and retain the equity defaults.
+func CreateORBSessionOwned(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName, assetClass, ownerScope string) (*ORBSession, error) {
 	var s ORBSession
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_sessions (date, session_name) VALUES ($1, $2)
-		RETURNING id, date, status, session_name, candidates, selected, created_at, updated_at`,
-		date, sessionName,
-	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
+		INSERT INTO orb_sessions (date, session_name, asset_class, owner_scope) VALUES ($1, $2, $3, $4)
+		RETURNING id, date, status, session_name, candidates, selected, created_at, updated_at,
+		          COALESCE(asset_class,'equity'), owner_scope`,
+		date, sessionName, assetClass, ownerScope,
+	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt,
+		&s.AssetClass, &s.OwnerScope)
 	if err != nil {
 		return nil, err
 	}
@@ -114,6 +164,13 @@ func UpdateORBSession(ctx context.Context, db *pgxpool.Pool, id, status string, 
 // pending trades in those sessions. Both updates run in a single transaction so the
 // session and trade state remain consistent.
 func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, cutoffDate time.Time, sessionName string) error {
+	return MarkStaleORBSessionsDoneOwned(ctx, db, cutoffDate, sessionName, "")
+}
+
+// MarkStaleORBSessionsDoneOwned limits the stale-session sweep to a durable
+// owner when ownerScope is non-empty. This keeps the index and metals futures
+// schedulers from expiring each other's pending orders.
+func MarkStaleORBSessionsDoneOwned(ctx context.Context, db *pgxpool.Pool, cutoffDate time.Time, sessionName, ownerScope string) error {
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return err
@@ -127,6 +184,7 @@ func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, cutoffDate 
 			WHERE status IN ('executing', 'range_watch', 'candidate_ready', 'scanning')
 			  AND date < $1::date
 			  AND session_name = $2
+			  AND ($3 = '' OR owner_scope = $3)
 			RETURNING id
 		)
 		UPDATE orb_trades
@@ -135,7 +193,7 @@ func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, cutoffDate 
 		    closed_at  = COALESCE(closed_at, NOW())
 		WHERE session_id IN (SELECT id FROM swept)
 		  AND status = 'pending'`,
-		cutoffDate.Format("2006-01-02"), sessionName)
+		cutoffDate.Format("2006-01-02"), sessionName, ownerScope)
 	if err != nil {
 		return err
 	}
@@ -145,11 +203,27 @@ func MarkStaleORBSessionsDone(ctx context.Context, db *pgxpool.Pool, cutoffDate 
 // GetORBSessionByDate retrieves the ORB session for a given date and session name.
 // Returns nil, nil when no session exists for that date/name combination.
 func GetORBSessionByDate(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName string) (*ORBSession, error) {
+	return getORBSessionByDateOwned(ctx, db, date, sessionName, "")
+}
+
+// GetORBSessionByDateOwned retrieves the session belonging to a durable owner.
+// The owner-qualified lookup is required for the two independent futures ORBs,
+// which intentionally share the historical session_name "futures".
+func GetORBSessionByDateOwned(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName, ownerScope string) (*ORBSession, error) {
+	return getORBSessionByDateOwned(ctx, db, date, sessionName, ownerScope)
+}
+
+func getORBSessionByDateOwned(ctx context.Context, db *pgxpool.Pool, date time.Time, sessionName, ownerScope string) (*ORBSession, error) {
 	var s ORBSession
 	err := db.QueryRow(ctx, `
-		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
-		FROM orb_sessions WHERE date=$1 AND session_name=$2`, date, sessionName,
-	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt)
+		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at,
+		       COALESCE(asset_class,'equity'), owner_scope
+		FROM orb_sessions
+		WHERE date=$1 AND session_name=$2 AND ($3 = '' OR owner_scope=$3)
+		ORDER BY created_at
+		LIMIT 1`, date, sessionName, ownerScope,
+	).Scan(&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected, &s.CreatedAt, &s.UpdatedAt,
+		&s.AssetClass, &s.OwnerScope)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -182,8 +256,8 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 	}
 	var id string
 	err := db.QueryRow(ctx, `
-		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id, asset_class, underlying, expiry, strike, "right", occ_symbol, multiplier)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+		INSERT INTO orb_trades (session_id, ticker, side, entry_stop, stop_loss, take_profit, qty, order_id, status, tp_order_id, sl_order_id, scale_out_role, scale_out_parent_id, asset_class, underlying, expiry, strike, "right", occ_symbol, multiplier, owner_scope, conid, point_value, max_hold_minutes)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
 		RETURNING id`,
 		trade.SessionID, trade.Ticker, trade.Side,
 		trade.EntryStop, trade.StopLoss, trade.TakeProfit,
@@ -192,8 +266,38 @@ func CreateORBTrade(ctx context.Context, db *pgxpool.Pool, trade ORBTrade) (stri
 		nullableString(trade.ScaleOutRole), parentID,
 		assetClass, nullableString(trade.Underlying), trade.Expiry,
 		strike, nullableString(trade.Right), nullableString(trade.OCCSymbol), multiplier,
+		DefaultORBOwnerScope(trade.OwnerScope, assetClass, trade.Ticker), nullableString(trade.ConID), nullablePositiveFloat(trade.PointValue), trade.MaxHoldMinutes,
 	).Scan(&id)
 	return id, err
+}
+
+// DefaultORBOwnerScope provides compatibility for legacy callers that omit an
+// owner. Runtime ORB placement supplies an explicit scope; ticker inference is
+// retained only for historical/store callers.
+func DefaultORBOwnerScope(scope, assetClass, ticker string) string {
+	if scope != "" {
+		return scope
+	}
+	switch assetClass {
+	case "forex":
+		return ORBOwnerForex
+	case "futures":
+		// Futures ownership must come from launch mode, not an extensible ticker
+		// list. Returning an invalid empty scope makes omitted ownership fail the
+		// DB constraint instead of silently assigning a new root to index ORB.
+		return ""
+	case "option":
+		return ORBOwnerOptions
+	default:
+		return ORBOwnerEquity
+	}
+}
+
+func nullablePositiveFloat(v float64) any {
+	if v <= 0 {
+		return nil
+	}
+	return v
 }
 
 // GetORBTradeByID returns a single ORB trade with full instrument identity,
@@ -213,7 +317,8 @@ func GetORBTradeByID(ctx context.Context, db *pgxpool.Pool, id string) (*ORBTrad
 		       created_at, filled_at, closed_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id,
 		       COALESCE(asset_class,'equity'), COALESCE(underlying,''), expiry,
-		       COALESCE(strike,0), COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1)
+		       COALESCE(strike,0), COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1),
+		       owner_scope, COALESCE(conid,''), COALESCE(point_value,0), max_hold_minutes
 		FROM orb_trades WHERE id=$1`, id,
 	).Scan(
 		&t.ID, &t.SessionID, &t.Ticker, &t.Side,
@@ -226,6 +331,7 @@ func GetORBTradeByID(ctx context.Context, db *pgxpool.Pool, id string) (*ORBTrad
 		&t.ScaleOutRole, &t.ScaleOutParentID,
 		&t.AssetClass, &t.Underlying, &t.Expiry,
 		&t.Strike, &t.Right, &t.OCCSymbol, &t.Multiplier,
+		&t.OwnerScope, &t.ConID, &t.PointValue, &t.MaxHoldMinutes,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -251,7 +357,7 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 		       created_at, filled_at, closed_at,
 		       COALESCE(underlying,''), expiry, COALESCE(strike,0),
 		       COALESCE("right",''), COALESCE(occ_symbol,''), COALESCE(multiplier,1),
-		       COALESCE(exit_order_id,'')
+		       COALESCE(exit_order_id,''), owner_scope, COALESCE(conid,''), COALESCE(point_value,0), max_hold_minutes
 		FROM orb_trades
 		WHERE status='filled' AND asset_class='option'
 		ORDER BY created_at ASC`)
@@ -273,7 +379,7 @@ func GetOpenFilledOptionTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrad
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.Underlying, &t.Expiry, &t.Strike,
 			&t.Right, &t.OCCSymbol, &t.Multiplier,
-			&t.ExitOrderID,
+			&t.ExitOrderID, &t.OwnerScope, &t.ConID, &t.PointValue, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -382,12 +488,23 @@ func FillORBTradePartialByOrderID(ctx context.Context, db *pgxpool.Pool, orderID
 // The WHERE clause guards on status='filled' so concurrent reconcilers cannot
 // overwrite an already-closed trade.
 func CloseORBTrade(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSource string, exitPrice, pnl float64) error {
-	_, err := db.Exec(ctx, `
+	_, err := CloseORBTradeIfFilled(ctx, db, id, exitType, exitSource, exitPrice, pnl)
+	return err
+}
+
+// CloseORBTradeIfFilled exposes whether the status='filled' compare-and-set
+// actually won. Reconciliation paths use this to avoid treating a failed or
+// lost durable close as successful in memory.
+func CloseORBTradeIfFilled(ctx context.Context, db *pgxpool.Pool, id, exitType, exitSource string, exitPrice, pnl float64) (bool, error) {
+	tag, err := db.Exec(ctx, `
 		UPDATE orb_trades
 		SET status='closed', exit_type=$1, exit_source=$2, exit_price=$3, pnl=$4, closed_at=NOW()
 		WHERE id=$5 AND status='filled'`,
 		exitType, exitSource, exitPrice, pnl, id)
-	return err
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
 // UpdateORBTradeStopLoss records a moved stop on a still-open trade (adaptive break-even /
@@ -472,7 +589,8 @@ func GetRecentORBSessionsPageAt(
 		offset = 0
 	}
 	rows, err := db.Query(ctx, `
-		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at
+		SELECT id, date, status, session_name, candidates, selected, created_at, updated_at,
+		       COALESCE(asset_class,'equity'), owner_scope
 		FROM orb_sessions
 		WHERE ($3::timestamptz IS NULL OR created_at <= $3)
 		ORDER BY date DESC, created_at DESC, id DESC
@@ -487,7 +605,7 @@ func GetRecentORBSessionsPageAt(
 		var s ORBSession
 		if err := rows.Scan(
 			&s.ID, &s.Date, &s.Status, &s.SessionName, &s.Candidates, &s.Selected,
-			&s.CreatedAt, &s.UpdatedAt,
+			&s.CreatedAt, &s.UpdatedAt, &s.AssetClass, &s.OwnerScope,
 		); err != nil {
 			return nil, err
 		}
@@ -527,7 +645,9 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), owner_scope, COALESCE(conid,''),
+		       COALESCE(point_value,0), COALESCE(multiplier,1), max_hold_minutes
 		FROM orb_trades ORDER BY created_at DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -546,6 +666,7 @@ func GetRecentORBTrades(ctx context.Context, db *pgxpool.Pool, limit int) ([]ORB
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OwnerScope, &t.ConID, &t.PointValue, &t.Multiplier, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -573,7 +694,9 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), owner_scope, COALESCE(conid,''),
+		       COALESCE(point_value,0), COALESCE(multiplier,1), max_hold_minutes
 		-- Options-ORB rows are excluded: they have their own reader
 		-- (GetOpenFilledOptionTrades) and exit path (#415); this keeps the
 		-- equity/forex/futures exit reconcilers from touching option trades.
@@ -596,6 +719,7 @@ func GetOpenFilledORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade, 
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OwnerScope, &t.ConID, &t.PointValue, &t.Multiplier, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -618,7 +742,9 @@ func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade,
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), owner_scope, COALESCE(conid,''),
+		       COALESCE(point_value,0), COALESCE(multiplier,1), max_hold_minutes
 		-- Options-ORB rows excluded (see GetOpenFilledORBTrades): the option entry
 		-- fill-poll is order-ID driven, and fill_reconcile/split-orphan sweeps are
 		-- forex-scoped, so options never need this reader.
@@ -641,6 +767,7 @@ func GetOpenPendingORBTrades(ctx context.Context, db *pgxpool.Pool) ([]ORBTrade,
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OwnerScope, &t.ConID, &t.PointValue, &t.Multiplier, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -664,7 +791,9 @@ func GetRecentlyCancelledORBTrades(ctx context.Context, db *pgxpool.Pool, since 
 		       COALESCE(tp_order_id,''), COALESCE(sl_order_id,''),
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at, stop_moved_at,
-		       COALESCE(scale_out_role,''), scale_out_parent_id
+		       COALESCE(scale_out_role,''), scale_out_parent_id,
+		       COALESCE(asset_class,'equity'), owner_scope, COALESCE(conid,''),
+		       COALESCE(point_value,0), COALESCE(multiplier,1), max_hold_minutes
 		FROM orb_trades WHERE status='cancelled' AND closed_at >= $1
 		ORDER BY closed_at`, since.UTC())
 	if err != nil {
@@ -684,6 +813,7 @@ func GetRecentlyCancelledORBTrades(ctx context.Context, db *pgxpool.Pool, since 
 			&t.ExitPrice, &t.ExitType, &t.ExitSource,
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt, &t.StopMovedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
+			&t.AssetClass, &t.OwnerScope, &t.ConID, &t.PointValue, &t.Multiplier, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}
@@ -834,7 +964,8 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 		       COALESCE(exit_price,0), COALESCE(exit_type,''), COALESCE(exit_source,''),
 		       created_at, filled_at, closed_at,
 		       COALESCE(scale_out_role,''), scale_out_parent_id,
-		       COALESCE(asset_class,'equity'), COALESCE(occ_symbol,''), COALESCE("right",''), COALESCE(strike,0)
+		       COALESCE(asset_class,'equity'), COALESCE(occ_symbol,''), COALESCE("right",''), COALESCE(strike,0),
+		       owner_scope, COALESCE(conid,''), COALESCE(point_value,0), COALESCE(multiplier,1), max_hold_minutes
 		FROM orb_trades WHERE session_id=$1
 		ORDER BY created_at`, sessionID)
 	if err != nil {
@@ -855,6 +986,7 @@ func GetORBTrades(ctx context.Context, db *pgxpool.Pool, sessionID string) ([]OR
 			&t.CreatedAt, &t.FilledAt, &t.ClosedAt,
 			&t.ScaleOutRole, &t.ScaleOutParentID,
 			&t.AssetClass, &t.OCCSymbol, &t.Right, &t.Strike,
+			&t.OwnerScope, &t.ConID, &t.PointValue, &t.Multiplier, &t.MaxHoldMinutes,
 		); err != nil {
 			return nil, err
 		}

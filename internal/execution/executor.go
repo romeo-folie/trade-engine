@@ -76,6 +76,9 @@ type OrderRequest struct {
 	// SecType overrides the IBKR security type for this order.
 	// "" defaults to "CASH" (forex). Use "CFD" for metals like XAU/USD.
 	SecType string // "" (default/CASH) | "CASH" (forex) | "CFD" (metals) | "OPT" (equity option)
+	// ContractID pins an IBKR order to the exact persisted contract. Lifecycle
+	// exits use it across futures rolls; empty keeps normal symbol resolution.
+	ContractID string
 
 	// Option carries the contract identity when SecType is "OPT"; nil otherwise.
 	// The broker adapter uses Option.OCCSymbol as the order's symbol and
@@ -123,6 +126,7 @@ type WorkingOrdersLister interface {
 // Position represents a current open position at the broker.
 type Position struct {
 	Ticker       string
+	ConID        string // exact broker contract id when available (IBKR)
 	Quantity     float64
 	AvgCostBasis float64 // per-share average entry price
 	CurrentPrice float64 // per-share current price (0 if broker doesn't provide)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
@@ -75,6 +76,7 @@ func (s *ORBScheduler) enforceTimeExits(ctx context.Context) {
 		slog.Warn("orb: time exit: load filled trades failed", "err", err)
 		return
 	}
+	trades = s.ownedTradeRows(trades)
 
 	s.flattenDueTimeExits(ctx, trades, s.now())
 }
@@ -94,14 +96,9 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 	due := make(map[string]bool)
 	for i := range trades {
 		t := trades[i]
-
-		// Only act on this scheduler's own instruments (forex/CFD or futures). The
-		// orb_trades table is shared: in orb-newyork mode an equities scheduler writes
-		// equity trades to the same table, and this scheduler must not hand those to its
-		// IBKR flatten/cancel path (wrong conid, invalid-symbol calls).
-		if !s.ownsInstrument(t.Ticker) {
-			continue
-		}
+		// The caller already scopes rows by durable owner. Do not reapply today's
+		// entry universe here: a removed instrument still needs lifecycle ownership
+		// until its position is terminal.
 
 		// A zero entry fill can't yield a meaningful PnL and signals a corrupt row;
 		// skip it (matches the bar-replay backstop's guard).
@@ -118,7 +115,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 		}
 		groups[key] = append(groups[key], t)
 
-		maxHold := s.effectiveMaxHoldMinutes(t.Ticker)
+		maxHold := s.maxHoldMinutesForTrade(t)
 		anchor := t.CreatedAt
 		if t.FilledAt != nil {
 			anchor = *t.FilledAt
@@ -137,7 +134,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 			// Ordinary trade, or a split leg whose sibling already closed (its shared stop was
 			// OCO-cancelled with it, so nothing else holds that price): flatten and cancel its
 			// legs inline, as before.
-			s.flattenAndRecordTimeExit(ctx, legs[0], s.effectiveMaxHoldMinutes(legs[0].Ticker), false)
+			s.flattenAndRecordTimeExit(ctx, legs[0], s.maxHoldMinutesForTrade(legs[0]), false)
 			continue
 		}
 		// Split-bracket group with >1 open leg: flatten every leg first (deferring leg
@@ -146,7 +143,7 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 		// shared stop while a leg might still hold a position.
 		allFlat := true
 		for _, t := range legs {
-			if !s.flattenAndRecordTimeExit(ctx, t, s.effectiveMaxHoldMinutes(t.Ticker), true) {
+			if !s.flattenAndRecordTimeExit(ctx, t, s.maxHoldMinutesForTrade(t), true) {
 				allFlat = false
 			}
 		}
@@ -159,6 +156,13 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 				"ticker", legs[0].Ticker, "legs", len(legs))
 		}
 	}
+}
+
+func (s *ORBScheduler) maxHoldMinutesForTrade(t store.ORBTrade) int {
+	if t.MaxHoldMinutes != nil {
+		return *t.MaxHoldMinutes
+	}
+	return s.effectiveMaxHoldMinutes(t.Ticker)
 }
 
 // flattenAndRecordTimeExit flattens a filled trade's position at market and records
@@ -179,6 +183,14 @@ func (s *ORBScheduler) flattenDueTimeExits(ctx context.Context, trades []store.O
 // group caller uses to decide it is safe to cancel the shared stop.
 func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORBTrade, maxHold int, deferCancel bool) bool {
 	secType := s.instrumentSecType(t.Ticker)
+	if strings.HasPrefix(t.OwnerScope, "futures_") || t.AssetClass == "futures" {
+		secType = "FUT"
+	}
+	pointValue, pvErr := s.pointValueForTrade(t)
+	if pvErr != nil {
+		slog.Error("orb: time exit: refusing flatten without durable P&L identity", "ticker", t.Ticker, "err", pvErr)
+		return false
+	}
 
 	// 1. Read the live position FIRST, while the bracket still protects it. Flatten
 	//    only this trade's quantity, bounded by the broker's net position, so forex
@@ -189,11 +201,8 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 		return false
 	}
 	var netQty float64
-	for _, p := range positions {
-		if p.Ticker == t.Ticker {
-			netQty = p.Quantity
-			break
-		}
+	for _, p := range positionsForOwnedTrades(positions, []store.ORBTrade{t}) {
+		netQty += p.Quantity
 	}
 
 	flattenSide := execution.OrderSideSell
@@ -217,12 +226,13 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 		"ticker", t.Ticker, "side", t.Side, "flatten_side", flattenSide, "qty", flattenQty,
 		"max_hold_min", maxHold, "entry_fill", t.FillPrice)
 	res, err := s.executor.PlaceOrder(ctx, execution.OrderRequest{
-		Ticker:   t.Ticker,
-		Side:     flattenSide,
-		Type:     execution.OrderTypeMarket,
-		Quantity: flattenQty,
-		SecType:  secType,
-		TradeID:  t.ID,
+		Ticker:     t.Ticker,
+		Side:       flattenSide,
+		Type:       execution.OrderTypeMarket,
+		Quantity:   flattenQty,
+		SecType:    secType,
+		ContractID: t.ConID,
+		TradeID:    t.ID,
 	})
 	if err != nil {
 		slog.Warn("orb: time exit: flatten order failed — will retry (legs intact)", "ticker", t.Ticker, "err", err)
@@ -254,7 +264,7 @@ func (s *ORBScheduler) flattenAndRecordTimeExit(ctx context.Context, t store.ORB
 	//    position was already partially reduced (a partial leg fill) — using t.Qty
 	//    there would overstate PnL by the t.Qty/flattenQty ratio. flattenQty is
 	//    bounded to t.Qty above, so this never inflates.
-	pnl := exitPnLF(t.Side, t.FillPrice, exitPrice, int(flattenQty), s.pointValueForTicker(t.Ticker))
+	pnl := exitPnLF(t.Side, t.FillPrice, exitPrice, int(flattenQty), pointValue)
 	if dbErr := store.CloseORBTrade(ctx, s.db, t.ID, "time_exit", "broker", exitPrice, pnl); dbErr != nil {
 		slog.Error("orb: time exit: close trade failed", "ticker", t.Ticker, "err", dbErr)
 		return true // position IS flat (flatten confirmed); the record retries next sweep
@@ -299,6 +309,11 @@ func (s *ORBScheduler) cancelBracketLegs(ctx context.Context, t store.ORBTrade) 
 	protected := s.protectedOrderIDs()
 	for _, o := range orders {
 		if o.Ticker != t.Ticker {
+			continue
+		}
+		// Durable futures rows require exact broker identity. A missing ConID is
+		// ambiguous, not permission to fall back to root ticker and price.
+		if t.ConID != "" && o.Conid != t.ConID {
 			continue
 		}
 		if _, skip := protected[o.OrderID]; skip {
@@ -466,9 +481,10 @@ func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
 		slog.Warn("orb: orphan leg: load filled trades failed", "err", err)
 		return
 	}
-	openTickers := make(map[string]struct{}, len(filled))
+	filled = s.ownedTradeRows(filled)
+	openIdentities := make(map[string]struct{}, len(filled))
 	for _, t := range filled {
-		openTickers[t.Ticker] = struct{}{}
+		openIdentities[positionIdentity(t.Ticker, t.ConID)] = struct{}{}
 	}
 
 	recent, err := store.GetRecentORBTrades(ctx, s.db, 500)
@@ -476,24 +492,27 @@ func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
 		slog.Warn("orb: orphan leg: load recent trades failed", "err", err)
 		return
 	}
+	recent = s.ownedTradeRows(recent)
 	cutoff := s.now().Add(-orphanLegLookback)
 	timeExitPrices := make(map[string][]float64)
 	for _, t := range recent {
-		if t.Status != "closed" || t.ExitType != "time_exit" || !s.ownsInstrument(t.Ticker) {
+		if t.Status != "closed" || t.ExitType != "time_exit" {
 			continue
 		}
 		if t.ClosedAt == nil || t.ClosedAt.Before(cutoff) {
 			continue
 		}
 		if t.TakeProfit > 0 {
-			timeExitPrices[t.Ticker] = append(timeExitPrices[t.Ticker], t.TakeProfit)
+			key := positionIdentity(t.Ticker, t.ConID)
+			timeExitPrices[key] = append(timeExitPrices[key], t.TakeProfit)
 		}
 		if t.StopLoss > 0 {
-			timeExitPrices[t.Ticker] = append(timeExitPrices[t.Ticker], t.StopLoss)
+			key := positionIdentity(t.Ticker, t.ConID)
+			timeExitPrices[key] = append(timeExitPrices[key], t.StopLoss)
 		}
 	}
 
-	cancel, ambiguous := s.classifyOrphanLegs(orders, openTickers, timeExitPrices, s.protectedOrderIDs())
+	cancel, ambiguous := s.classifyOrphanLegs(orders, openIdentities, timeExitPrices, s.protectedOrderIDs())
 	for _, id := range cancel {
 		if err := s.executor.CancelOrder(ctx, id); err != nil {
 			slog.Warn("orb: orphan leg: cancel failed — will retry next sweep", "order_id", id, "err", err)
@@ -520,23 +539,32 @@ func (s *ORBScheduler) reconcileOrphanedLegs(ctx context.Context) {
 // the decision logic is unit-tested directly.
 func (s *ORBScheduler) classifyOrphanLegs(
 	orders []execution.WorkingOrder,
-	openTickers map[string]struct{},
+	openIdentities map[string]struct{},
 	timeExitPrices map[string][]float64,
 	protected map[string]struct{},
 ) (cancel []string, ambiguous []execution.WorkingOrder) {
 	for _, o := range orders {
-		if !s.ownsInstrument(o.Ticker) {
-			continue
-		}
 		if _, p := protected[o.OrderID]; p {
 			continue
 		}
-		if _, open := openTickers[o.Ticker]; open {
+		key := positionIdentity(o.Ticker, o.Conid)
+		if _, open := openIdentities[key]; open {
+			continue // exact live contract always wins over legacy fallback evidence
+		}
+		legacyKey := positionIdentity(o.Ticker, "")
+		if _, known := timeExitPrices[key]; !known {
+			if _, legacy := timeExitPrices[legacyKey]; legacy {
+				key = legacyKey
+			} else {
+				continue // no persisted time-exit row proves this order is ours
+			}
+		}
+		if _, open := openIdentities[key]; open {
 			continue // a live filled trade may legitimately own a bracket leg here
 		}
 		// Idle ticker: no open filled trade, so no legitimate live bracket leg exists.
 		switch {
-		case orderMatchesPrices(o, timeExitPrices[o.Ticker]):
+		case orderMatchesPrices(o, timeExitPrices[key]):
 			cancel = append(cancel, o.OrderID) // proven stale time-exit leg
 		case !orderHasPrice(o):
 			ambiguous = append(ambiguous, o) // can't prove ownership → alert, don't cancel

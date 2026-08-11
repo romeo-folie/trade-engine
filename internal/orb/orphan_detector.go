@@ -24,6 +24,83 @@ const (
 	orphanPositionTolerance = 0.5
 )
 
+type orbRowHealthFinding struct {
+	TradeID string
+	Ticker  string
+	Code    string
+	Detail  string
+}
+
+func findORBRowHealth(rows []store.ORBTrade, ownerScope, assetClass string) []orbRowHealthFinding {
+	var out []orbRowHealthFinding
+	for _, t := range rows {
+		if !store.IsValidORBOwnerScope(t.OwnerScope) {
+			// Invalid ownership is global state. Assign it deterministically to
+			// the owner this row's persisted asset/ticker would otherwise use so
+			// concurrent schedulers do not emit duplicate alerts.
+			inferredOwner := store.DefaultORBOwnerScope("", t.AssetClass, t.Ticker)
+			if inferredOwner == "" && t.AssetClass == "futures" {
+				inferredOwner = store.ORBOwnerFuturesIndex // one deterministic global auditor
+			}
+			if inferredOwner != ownerScope {
+				continue
+			}
+			out = append(out, orbRowHealthFinding{t.ID, t.Ticker, "owner_scope_invalid", fmt.Sprintf("owner_scope=%q", t.OwnerScope)})
+			continue
+		}
+		if t.OwnerScope != ownerScope {
+			continue
+		}
+		if t.FillPrice <= 0 || t.Qty <= 0 || (t.Side != "buy" && t.Side != "sell") {
+			out = append(out, orbRowHealthFinding{t.ID, t.Ticker, "entry_economics_invalid",
+				fmt.Sprintf("side=%q fill_price=%v qty=%d", t.Side, t.FillPrice, t.Qty)})
+		}
+		if t.AssetClass != assetClass {
+			out = append(out, orbRowHealthFinding{t.ID, t.Ticker, "asset_owner_mismatch",
+				fmt.Sprintf("asset_class=%q owner_scope=%q", t.AssetClass, t.OwnerScope)})
+		}
+		if strings.HasPrefix(ownerScope, "futures_") && t.PointValue <= 0 {
+			out = append(out, orbRowHealthFinding{t.ID, t.Ticker, "point_value_missing", "futures close is blocked until point_value is repaired"})
+		}
+		if strings.HasPrefix(ownerScope, "futures_") && t.ConID == "" {
+			out = append(out, orbRowHealthFinding{t.ID, t.Ticker, "conid_missing", "deconfigured-contract recovery may require broker conid"})
+		}
+	}
+	return out
+}
+
+// detectUnhealthyORBRows surfaces DB-only stale/orphan rows even when the broker
+// is flat. The position-driven orphan detector cannot see that shape.
+func (s *ORBScheduler) detectUnhealthyORBRows(ctx context.Context) {
+	if s.db == nil || time.Since(s.lastRowHealthCheckAt) < orphanPositionCheckInterval {
+		return
+	}
+	s.lastRowHealthCheckAt = s.now()
+	rows, err := store.GetOpenFilledORBTrades(ctx, s.db)
+	if err != nil {
+		slog.Warn("orb: row health: load filled trades failed", "err", err)
+		return
+	}
+	findings := findORBRowHealth(rows, s.ownerScope(), s.tradeAssetClass())
+	current := make(map[string]struct{}, len(findings))
+	for _, f := range findings {
+		key := f.TradeID + "|" + f.Code
+		current[key] = struct{}{}
+		if _, seen := s.alertedRowHealth[key]; seen {
+			continue
+		}
+		s.alertedRowHealth[key] = struct{}{}
+		slog.Error("orb: filled-row identity is unhealthy — automatic close deferred",
+			"trade_id", f.TradeID, "ticker", f.Ticker, "code", f.Code, "detail", f.Detail)
+		s.notify(ctx, fmt.Sprintf("⚠️ *ORB row health*: `%s` (%s) — %s", f.Ticker, f.Code, f.Detail))
+	}
+	for key := range s.alertedRowHealth {
+		if _, still := current[key]; !still {
+			delete(s.alertedRowHealth, key)
+		}
+	}
+}
+
 // detectOrphanedPositions is a DETECTION-ONLY reconciler: it compares the
 // broker's open positions to the ORB trades the engine believes it is managing
 // (status='filled') and alerts on any broker position with no — or insufficient —
@@ -70,6 +147,8 @@ func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
 		slog.Warn("orb: orphan detector: load filled trades failed", "err", err)
 		return
 	}
+	filled = s.ownedTradeRows(filled)
+	positions = normalizeLegacyPositionIdentities(positions, filled)
 
 	findings := findOrphanedPositions(positions, filled, orphanPositionTolerance)
 	current := make(map[string]struct{}, len(findings))
@@ -101,6 +180,26 @@ func (s *ORBScheduler) detectOrphanedPositions(ctx context.Context) {
 	}
 }
 
+// normalizeLegacyPositionIdentities aligns broker positions with pre-migration
+// rows that lack ConID without dropping truly unmanaged positions. The orphan
+// detector must retain unmatched broker truth; filtering belongs only in
+// owner-specific lifecycle reconcilers.
+func normalizeLegacyPositionIdentities(positions []execution.Position, trades []store.ORBTrade) []execution.Position {
+	legacyTickers := make(map[string]struct{})
+	for _, t := range trades {
+		if t.ConID == "" {
+			legacyTickers[t.Ticker] = struct{}{}
+		}
+	}
+	out := append([]execution.Position(nil), positions...)
+	for i := range out {
+		if _, legacy := legacyTickers[out[i].Ticker]; legacy {
+			out[i].ConID = ""
+		}
+	}
+	return out
+}
+
 // forexOnlyPositions filters broker positions to this scheduler's configured
 // forex/metals instruments. On a shared IBKR broker, a concurrent futures
 // scheduler (orb-newyork) holds its own positions whose conids do NOT reverse-
@@ -118,23 +217,47 @@ func (s *ORBScheduler) forexOnlyPositions(positions []execution.Position) []exec
 	return scoped
 }
 
-// ownedPositions filters broker positions to instruments this scheduler manages in its
-// active mode — forex/CFD OR futures. The mode-agnostic counterpart of forexOnlyPositions,
-// used by the exit guard so a futures position (now resolved to its symbol by reverseConid,
-// not a raw conid) is counted against the managed budget rather than silently dropped.
-func (s *ORBScheduler) ownedPositions(positions []execution.Position) []execution.Position {
-	scoped := make([]execution.Position, 0, len(positions))
-	for _, p := range positions {
-		if s.ownsInstrument(p.Ticker) {
-			scoped = append(scoped, p)
+// positionsForOwnedTrades scopes broker truth to the durable rows being
+// reconciled, rather than today's entry configuration. ConID is preferred for
+// deconfigured contracts whose broker position no longer reverse-resolves to a
+// symbol after restart; ticker remains the legacy/configured fallback.
+func positionsForOwnedTrades(positions []execution.Position, trades []store.ORBTrade) []execution.Position {
+	legacyTickers := make(map[string]struct{}, len(trades))
+	conids := make(map[string]string, len(trades))
+	for _, t := range trades {
+		if t.ConID != "" {
+			conids[t.ConID] = t.Ticker
+		} else {
+			legacyTickers[t.Ticker] = struct{}{}
 		}
 	}
-	return scoped
+	out := make([]execution.Position, 0, len(positions))
+	for _, p := range positions {
+		brokerConID := p.ConID
+		if brokerConID == "" {
+			brokerConID = p.Ticker // legacy IBKR fakes/raw unresolved positions
+		}
+		if ticker, ok := conids[brokerConID]; ok {
+			p.Ticker = ticker
+			p.ConID = brokerConID
+			out = append(out, p)
+			continue
+		}
+		if _, ok := legacyTickers[p.Ticker]; ok {
+			// Legacy rows are keyed by ticker because they have no durable ConID.
+			// Normalize the broker position to the same identity; otherwise callers
+			// key it by the broker-supplied ConID and fail to see the held position.
+			p.ConID = ""
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // orphanFinding is one unmanaged broker position surfaced by the detector.
 type orphanFinding struct {
 	Ticker     string
+	ConID      string
 	BrokerQty  float64 // signed
 	ManagedQty float64 // signed, summed over filled ORB rows
 	Detail     string
@@ -154,27 +277,31 @@ func findOrphanedPositions(positions []execution.Position, filled []store.ORBTra
 		if strings.EqualFold(t.Side, "sell") {
 			q = -q
 		}
-		managed[t.Ticker] += q
+		managed[positionIdentity(t.Ticker, t.ConID)] += q
 	}
 
 	brokerQty := make(map[string]float64, len(positions))
+	brokerIdentity := make(map[string]execution.Position, len(positions))
 	for _, p := range positions {
 		if p.Ticker == "" || p.Quantity == 0 {
 			continue
 		}
-		brokerQty[p.Ticker] += p.Quantity
+		key := positionIdentity(p.Ticker, p.ConID)
+		brokerQty[key] += p.Quantity
+		brokerIdentity[key] = p
 	}
 
-	tickers := make([]string, 0, len(brokerQty))
-	for t := range brokerQty {
-		tickers = append(tickers, t)
+	identities := make([]string, 0, len(brokerQty))
+	for identity := range brokerQty {
+		identities = append(identities, identity)
 	}
-	sort.Strings(tickers)
+	sort.Strings(identities)
 
 	var out []orphanFinding
-	for _, ticker := range tickers {
-		bq := brokerQty[ticker]
-		mq := managed[ticker]
+	for _, identity := range identities {
+		position := brokerIdentity[identity]
+		bq := brokerQty[identity]
+		mq := managed[identity]
 		residue := math.Abs(bq) - math.Abs(mq)
 		sideFlip := mq != 0 && (bq < 0) != (mq < 0)
 		if residue <= tolerance && !sideFlip {
@@ -184,7 +311,7 @@ func findOrphanedPositions(positions []execution.Position, filled []store.ORBTra
 		if mq != 0 {
 			detail = fmt.Sprintf("managed=%.0f — %.0f unit(s) unaccounted", mq, math.Abs(residue))
 		}
-		out = append(out, orphanFinding{Ticker: ticker, BrokerQty: bq, ManagedQty: mq, Detail: detail})
+		out = append(out, orphanFinding{Ticker: position.Ticker, ConID: position.ConID, BrokerQty: bq, ManagedQty: mq, Detail: detail})
 	}
 	return out
 }

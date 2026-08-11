@@ -186,8 +186,8 @@ func TestClassifyOrphanLegs(t *testing.T) {
 		{OrderID: "unrelated", Ticker: "EUR/USD", Price: 1.30},     // idle ticker, non-matching price → leave alone
 		{OrderID: "equity", Ticker: "AAPL", Price: 1.12},           // not a forex instrument → skip
 	}
-	openTickers := map[string]struct{}{"GBP/USD": {}}
-	timeExitPrices := map[string][]float64{"EUR/USD": {1.12, 1.09}}
+	openTickers := map[string]struct{}{positionIdentity("GBP/USD", ""): {}}
+	timeExitPrices := map[string][]float64{positionIdentity("EUR/USD", ""): {1.12, 1.09}}
 	protected := map[string]struct{}{"protected": {}}
 
 	cancel, ambiguous := s.classifyOrphanLegs(orders, openTickers, timeExitPrices, protected)
@@ -203,6 +203,43 @@ func TestClassifyOrphanLegs(t *testing.T) {
 	}
 	if len(ambiguous) != 1 || ambiguous[0].OrderID != "noprice" {
 		t.Errorf("ambiguous = %v; want only [noprice]", ambiguous)
+	}
+}
+
+func TestClassifyOrphanLegsUsesDurableDeconfiguredContract(t *testing.T) {
+	s := &ORBScheduler{}
+	orders := []execution.WorkingOrder{
+		{OrderID: "old-leg", Ticker: "MYM", Conid: "old", StopPrice: 42000},
+		{OrderID: "new-leg", Ticker: "MYM", Conid: "new", StopPrice: 42000},
+	}
+	prices := map[string][]float64{positionIdentity("MYM", "old"): {42000}}
+	cancel, ambiguous := s.classifyOrphanLegs(orders, map[string]struct{}{}, prices, map[string]struct{}{})
+	if len(cancel) != 1 || cancel[0] != "old-leg" || len(ambiguous) != 0 {
+		t.Fatalf("cancel=%v ambiguous=%v; want only old contract leg", cancel, ambiguous)
+	}
+}
+
+func TestClassifyOrphanLegsProtectsExactOpenContractBeforeLegacyFallback(t *testing.T) {
+	s := &ORBScheduler{}
+	order := execution.WorkingOrder{OrderID: "new-live-sl", Ticker: "MYM", Conid: "new", StopPrice: 42000}
+	open := map[string]struct{}{positionIdentity("MYM", "new"): {}}
+	legacyPrices := map[string][]float64{positionIdentity("MYM", ""): {42000}}
+	cancel, ambiguous := s.classifyOrphanLegs([]execution.WorkingOrder{order}, open, legacyPrices, map[string]struct{}{})
+	if len(cancel) != 0 || len(ambiguous) != 0 {
+		t.Fatalf("cancel=%v ambiguous=%v; exact open contract must be protected", cancel, ambiguous)
+	}
+}
+
+func TestCancelBracketLegsUsesDurableContractIdentity(t *testing.T) {
+	exec := &flattenExec{working: []execution.WorkingOrder{
+		{OrderID: "old-sl", Ticker: "MYM", Conid: "old", StopPrice: 42000},
+		{OrderID: "new-sl", Ticker: "MYM", Conid: "new", StopPrice: 42000},
+		{OrderID: "unknown-sl", Ticker: "MYM", StopPrice: 42000},
+	}}
+	s := &ORBScheduler{executor: exec, orderIDs: make(map[string][2]string)}
+	s.cancelBracketLegs(context.Background(), store.ORBTrade{Ticker: "MYM", ConID: "old", StopLoss: 42000})
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != "old-sl" {
+		t.Fatalf("cancelled = %v; want only exact old-contract leg", exec.cancelled)
 	}
 }
 
@@ -421,6 +458,67 @@ func TestFlattenAndRecordTimeExit_BoundsQtyToNetPosition(t *testing.T) {
 	// the position naked.
 	if len(exec.cancelled) != 0 {
 		t.Errorf("cancelled %v legs on an unconfirmed flatten; want none (protection must be retained)", exec.cancelled)
+	}
+}
+
+func TestTimeExitDeconfiguredFutureUsesDurableContractIdentity(t *testing.T) {
+	exec := &flattenExec{
+		positions:    []execution.Position{{Ticker: "MYM", ConID: "815824200", Quantity: 3}},
+		statusResult: execution.OrderResult{Status: "pending"},
+	}
+	s := &ORBScheduler{executor: exec}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	trade := store.ORBTrade{ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, AssetClass: "futures", OwnerScope: "futures_index_orb", PointValue: 0.5}
+
+	s.flattenAndRecordTimeExit(ctx, trade, 240, false)
+	if len(exec.placed) != 1 {
+		t.Fatalf("placed %d orders; want exact-contract flatten", len(exec.placed))
+	}
+	got := exec.placed[0]
+	if got.SecType != "FUT" || got.ContractID != "815824200" {
+		t.Fatalf("flatten identity = secType %q conid %q; want FUT/815824200", got.SecType, got.ContractID)
+	}
+}
+
+func TestTimeExitSweepIncludesOwnedDeconfiguredFuture(t *testing.T) {
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	filledAt := now.Add(-2 * time.Minute)
+	exec := &flattenExec{
+		positions:    []execution.Position{{Ticker: "MYM", ConID: "815824200", Quantity: 3}},
+		statusResult: execution.OrderResult{Status: "pending"},
+	}
+	s := &ORBScheduler{executor: exec}
+	s.SetFuturesConfig(&config.FuturesORBConfig{
+		Enabled: true, MaxHoldMinutes: 1,
+		Instruments: []config.FuturesInstrument{{Symbol: "MNQ"}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	s.flattenDueTimeExits(ctx, []store.ORBTrade{{
+		ID: "mym", Ticker: "MYM", ConID: "815824200", Side: "buy", Qty: 3,
+		FillPrice: 52874, FilledAt: &filledAt, AssetClass: "futures",
+		OwnerScope: "futures_index_orb", PointValue: 0.5,
+	}}, now)
+	if len(exec.placed) != 1 {
+		t.Fatalf("placed %d orders; want deconfigured owned future flattened", len(exec.placed))
+	}
+	if got := exec.placed[0]; got.ContractID != "815824200" || got.SecType != "FUT" {
+		t.Fatalf("flatten identity = %+v; want exact deconfigured contract", got)
+	}
+}
+
+func TestTimeExitUsesPersistedHoldPolicyAfterDeconfiguration(t *testing.T) {
+	persisted := 240
+	s := &ORBScheduler{}
+	s.SetFuturesConfig(&config.FuturesORBConfig{Enabled: true, MaxHoldMinutes: 30})
+	trade := store.ORBTrade{Ticker: "MYM", MaxHoldMinutes: &persisted}
+	if got := s.maxHoldMinutesForTrade(trade); got != 240 {
+		t.Fatalf("max hold = %d, want persisted 240 instead of current default", got)
+	}
+	if got := s.maxHoldMinutesForTrade(store.ORBTrade{Ticker: "MYM"}); got != 30 {
+		t.Fatalf("legacy max hold fallback = %d, want current default 30", got)
 	}
 }
 
