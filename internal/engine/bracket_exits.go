@@ -63,6 +63,10 @@ func brokerManagedExitLegs(t store.Trade, legs []store.Order) []store.Order {
 	if t.TakeProfit > 0 {
 		return nil
 	}
+	return standaloneStopLegs(legs)
+}
+
+func standaloneStopLegs(legs []store.Order) []store.Order {
 	out := legs[:0:0]
 	for _, leg := range legs {
 		if leg.ParentOrderID == "" && leg.IsStopLoss {
@@ -79,6 +83,14 @@ func brokerManagedExitLegs(t store.Trade, legs []store.Order) []store.Order {
 // state. A false result means app-managed monitoring applies. Standalone stops
 // on trades with a software TP deliberately do not count.
 func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool {
+	return e.reconcileBrokerExitTrade(ctx, t, false)
+}
+
+// reconcileBrokerExitTrade optionally polls standalone protective stops on
+// capped trades. Those stops must be checked for offline fills during startup,
+// but a still-working stop does not own the software take-profit and therefore
+// must not suppress app-managed monitoring.
+func (e *Engine) reconcileBrokerExitTrade(ctx context.Context, t store.Trade, pollCappedStandalone bool) bool {
 	all, err := store.OpenExitLegsForTrade(ctx, t.ID)
 	if err != nil {
 		// Unknown state: legs may be live at the broker. A software exit on
@@ -88,6 +100,10 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 		return true
 	}
 	legs := brokerManagedExitLegs(t, all)
+	ownsAllExits := len(legs) > 0
+	if len(legs) == 0 && pollCappedStandalone && t.TakeProfit > 0 {
+		legs = standaloneStopLegs(all)
+	}
 	if len(legs) == 0 {
 		return false
 	}
@@ -212,7 +228,7 @@ func (e *Engine) reconcileBracketTrade(ctx context.Context, t store.Trade) bool 
 			"trade_id", t.ID, "ticker", t.Ticker)
 		return false
 	}
-	return true
+	return ownsAllExits
 }
 
 // fillPriceOf resolves a leg's fill price, falling back to the leg's own

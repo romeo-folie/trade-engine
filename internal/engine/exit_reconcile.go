@@ -771,7 +771,7 @@ func (e *Engine) reconcileBrokerManagedExitFills(ctx context.Context) int {
 		return 1
 	}
 	for _, trade := range trades {
-		e.reconcileBracketTrade(ctx, trade)
+		e.reconcileBrokerExitTrade(ctx, trade, true)
 	}
 	return 0
 }

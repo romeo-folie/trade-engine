@@ -140,10 +140,15 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 		t.Fatalf("InsertOrder: %v", err)
 	}
 
-	e := newBracketTestEngine(&fakeBracketExec{})
+	e := newBracketTestEngine(&fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"trail-1": {Status: "accepted"},
+	}})
 	trade := getTrade(t, tradeID)
 	if handled := e.reconcileBracketTrade(ctx, trade); handled {
 		t.Fatal("standalone trailing stop must not mark the trade broker-managed")
+	}
+	if handled := e.reconcileBrokerExitTrade(ctx, trade, true); handled {
+		t.Fatal("polling a capped standalone stop must preserve software take-profit ownership")
 	}
 }
 

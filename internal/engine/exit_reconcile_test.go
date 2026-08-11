@@ -182,6 +182,40 @@ func TestStartupExitReconcileBooksProtectiveStopBeforeBrokerDrift(t *testing.T) 
 	}
 }
 
+func TestStartupExitReconcileBooksCappedStandaloneStop(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_BOOT_CAPPED_STOP", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "boot-capped-stop", Ticker: "TEST_BOOT_CAPPED_STOP",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"boot-capped-stop": {
+			Status: "filled", FilledPrice: 94.50, FilledQty: 5,
+			FilledAt: time.Date(2026, 8, 10, 20, 0, 0, 0, time.UTC),
+		},
+	}}
+	eng := newBracketTestEngine(exec)
+
+	eng.ReconcileExitsNow(ctx)
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" {
+		t.Fatalf("capped protective-stop trade = %+v err=%v, want closed", trade, err)
+	}
+}
+
 func TestReconcileExitsNowWithoutDBDoesNotPanic(t *testing.T) {
 	if store.IsConnected() {
 		t.Skip("requires disconnected store")
