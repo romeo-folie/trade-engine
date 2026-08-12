@@ -66,7 +66,7 @@ func (liveStore) LinkReplacementOrderIntent(ctx context.Context, orderID, broker
 	if intent == nil {
 		return fmt.Errorf("replacement intent for broker order %s not found", brokerOrderID)
 	}
-	return store.RepointOrderStockIntent(ctx, orderID, intent.ID)
+	return store.RepointOrderStockIntentAndSupersede(ctx, orderID, intent.ID)
 }
 
 func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {

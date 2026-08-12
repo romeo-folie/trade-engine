@@ -252,6 +252,40 @@ func RepointOrderStockIntent(ctx context.Context, orderID, intentID string) erro
 	return err
 }
 
+// RepointOrderStockIntentAndSupersede advances the one mutable stop projection
+// to its accepted replacement and makes the preceding submit intent
+// non-replayable in the same transaction. The old intent keeps its broker id,
+// status, and attempts for fill-race audit, but Recovery must never submit it
+// again after the active order has moved on.
+func RepointOrderStockIntentAndSupersede(ctx context.Context, orderID, replacementIntentID string) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var predecessorIntentID string
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(stock_intent_id::text,'') FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&predecessorIntentID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE orders SET stock_intent_id=$2::uuid, updated_at=NOW() WHERE id=$1`, orderID, replacementIntentID); err != nil {
+		return err
+	}
+	if predecessorIntentID != "" && predecessorIntentID != replacementIntentID {
+		if _, err := tx.Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded', updated_at=NOW() WHERE id=$1::uuid AND purpose='submit'`, predecessorIntentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// SupersedeStockOrderIntent marks a successfully replaced predecessor as
+// non-replayable while retaining its broker audit record. It is idempotent for
+// crash recovery paths that find the replacement already linked.
+func SupersedeStockOrderIntent(ctx context.Context, intentID string) error {
+	_, err := GetDB().Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded', updated_at=NOW() WHERE id=$1::uuid AND purpose='submit'`, intentID)
+	return err
+}
+
 // GetRecoveredProtectiveStop finds the one active uncapped recovery stop
 // lineage for an entry intent, including a later resize generation.
 func GetRecoveredProtectiveStop(ctx context.Context, tradeID, entryIntentID string) (*Order, error) {

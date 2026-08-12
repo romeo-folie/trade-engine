@@ -590,7 +590,7 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
 		return err
 	}
-	return store.RepointOrderStockIntent(ctx, existing.ID, stopIntent.ID)
+	return store.RepointOrderStockIntentAndSupersede(ctx, existing.ID, stopIntent.ID)
 }
 
 func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent, operation, outcome string, res execution.OrderResult, errText string, submitted bool) error {
@@ -725,7 +725,8 @@ func (c *Coordinator) adoptLegacyStop(ctx context.Context, brokerOrderID string)
 	}
 	intent := &store.StockOrderIntent{ID: intentUUID(), IdempotencyKey: key, ClientOrderID: req.ClientOrderID,
 		TradeID: order.TradeID, Ticker: order.Ticker, Side: order.Side, OrderType: order.OrderType,
-		RequestedQty: order.Quantity, RequestPayload: payload, PayloadHash: fmt.Sprintf("%x", sha256.Sum256(payload)), Status: order.Status}
+		RequestedQty: order.Quantity, RequestPayload: payload, PayloadHash: fmt.Sprintf("%x", sha256.Sum256(payload)), Status: order.Status,
+		Purpose: "broker_projection"}
 	if err := store.CreateStockOrderIntent(ctx, *intent); err != nil {
 		return nil, fmt.Errorf("adopt legacy stop intent: %w", err)
 	}
@@ -823,6 +824,9 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		return execution.OrderResult{}, fmt.Errorf("load replacement projection: %w", err)
 	}
 	if order != nil && order.BrokerOrderID == res.BrokerOrderID {
+		if err := store.SupersedeStockOrderIntent(ctx, intent.ParentIntentID); err != nil {
+			return execution.OrderResult{}, fmt.Errorf("supersede already-linked replacement predecessor: %w", err)
+		}
 		return res, nil
 	}
 	order, err = store.GetOrderByStockIntentID(ctx, intent.ParentIntentID)
@@ -836,7 +840,7 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		return res, nil
 	}
 	if order.BrokerOrderID == res.BrokerOrderID {
-		if err := store.RepointOrderStockIntent(ctx, order.ID, intent.ID); err != nil {
+		if err := store.RepointOrderStockIntentAndSupersede(ctx, order.ID, intent.ID); err != nil {
 			return execution.OrderResult{}, fmt.Errorf("complete replacement intent repoint: %w", err)
 		}
 		return res, nil
@@ -846,7 +850,7 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		execution.NormalizeOrderStatus(res.Status), res.FilledPrice, res.FilledQty, res.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("project stock stop replacement: %w", err)
 	}
-	if err := store.RepointOrderStockIntent(ctx, order.ID, intent.ID); err != nil {
+	if err := store.RepointOrderStockIntentAndSupersede(ctx, order.ID, intent.ID); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("link stock stop replacement intent: %w", err)
 	}
 	return res, nil

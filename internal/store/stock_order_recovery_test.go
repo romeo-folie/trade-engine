@@ -21,6 +21,7 @@ import (
 type recoveryBroker struct {
 	posts     int
 	lookups   int
+	lookupIDs []string
 	posted    map[string]execution.OrderResult
 	lookup    map[string]execution.OrderResult
 	status    map[string]execution.OrderResult
@@ -50,6 +51,7 @@ func (b *recoveryBroker) PlaceOrder(_ context.Context, req execution.OrderReques
 }
 func (b *recoveryBroker) GetOrderByClientID(_ context.Context, id string) (execution.OrderResult, error) {
 	b.lookups++
+	b.lookupIDs = append(b.lookupIDs, id)
 	if res, ok := b.lookup[id]; ok {
 		return res, nil
 	}
@@ -1011,7 +1013,7 @@ func TestStockIntentRecoveryAfterTrailingCancelResubmitRepointIsClean(t *testing
 	if err := store.UpdateOrderStopReplacement(ctx, orderID, "stale-trail-stop", "fresh-trail-stop", 0, 2, 95, 2, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonTrailingATR}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RepointOrderStockIntent(ctx, orderID, child.ID); err != nil {
+	if err := store.RepointOrderStockIntentAndSupersede(ctx, orderID, child.ID); err != nil {
 		t.Fatal(err)
 	}
 	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "fresh-trail-stop", Status: "accepted"}
@@ -1027,6 +1029,10 @@ func TestStockIntentRecoveryAfterTrailingCancelResubmitRepointIsClean(t *testing
 	}
 	if got := countForIntent(t, "orders", child.ID); got != 1 || broker.posts != 1 {
 		t.Fatalf("fallback recovery duplicated projection: rows=%d posts=%d", got, broker.posts)
+	}
+	var parentPurpose string
+	if err := store.GetDB().QueryRow(ctx, `SELECT purpose FROM stock_order_intents WHERE id=$1::uuid`, parent.ID).Scan(&parentPurpose); err != nil || parentPurpose != "superseded" {
+		t.Fatalf("fallback predecessor purpose=%q err=%v", parentPurpose, err)
 	}
 }
 
@@ -1609,5 +1615,111 @@ func TestStockIntentAdoptsLegacyBracketStopForAtomicReplacement(t *testing.T) {
 	var intentID string
 	if err := store.GetDB().QueryRow(ctx, `SELECT stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&intentID); err != nil || intentID == "" {
 		t.Fatalf("legacy stop was not linked: %q %v", intentID, err)
+	}
+}
+
+func TestStockIntentLegacyStopAdoptionIsNeverReplayedAfterAmbiguousReplacement(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTLEGACYAMBIG")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLEGACYAMBIG", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-ambiguous-stop", Ticker: "RINTENTLEGACYAMBIG", Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.patchErr = errors.New("ambiguous patch response")
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "legacy-ambiguous-stop", 91); !errors.Is(err, execution.ErrAmbiguousStopReplacement) {
+		t.Fatalf("legacy ambiguous replacement=%v, want ambiguity", err)
+	}
+	var predecessorID, purpose string
+	if err := store.GetDB().QueryRow(ctx, `SELECT stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&predecessorID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT purpose FROM stock_order_intents WHERE id=$1::uuid`, predecessorID).Scan(&purpose); err != nil || purpose != "broker_projection" {
+		t.Fatalf("adopted legacy predecessor purpose=%q err=%v", purpose, err)
+	}
+	posts, patches := broker.posts, len(broker.patches)
+	if err := coordinator.Recover(ctx); err == nil {
+		t.Fatal("ambiguous replacement recovery unexpectedly resolved")
+	}
+	if broker.posts != posts {
+		t.Fatalf("recovery replayed adopted legacy submit: posts %d -> %d", posts, broker.posts)
+	}
+	if len(broker.patches) != patches+2 {
+		t.Fatalf("recovery replacement attempts=%d, want unresolved replacement retry only", len(broker.patches))
+	}
+	if got := countForIntent(t, "orders", predecessorID); got != 1 {
+		t.Fatalf("legacy adoption created duplicate stop projections=%d", got)
+	}
+}
+
+func TestStockIntentReplacementSupersedesPredecessorAfterRecoveryProjection(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTSUPERSEDE")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTSUPERSEDE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parentID, childID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4(), uuid_generate_v4()`).Scan(&parentID, &childID); err != nil {
+		t.Fatal(err)
+	}
+	parentReq := execution.OrderRequest{Ticker: "RINTENTSUPERSEDE", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 90, TradeID: tradeID, IntentKey: "protective-stop-supersede:" + tradeID, ClientOrderID: "supersede-parent"}
+	parentPayload, _ := json.Marshal(parentReq)
+	parent := store.StockOrderIntent{ID: parentID, IdempotencyKey: parentReq.IntentKey, ClientOrderID: "supersede-parent-" + parentID[:8], TradeID: tradeID, Ticker: parentReq.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: parentPayload, PayloadHash: "parent", Status: "pending"}
+	parentReq.ClientOrderID = parent.ClientOrderID
+	parentPayload, _ = json.Marshal(parentReq)
+	parent.RequestPayload = parentPayload
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "old-superseded-stop", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	childReq := execution.OrderRequest{Ticker: parent.Ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 91, TradeID: tradeID, IntentKey: "replace-supersede:" + tradeID, ClientOrderID: "supersede-child-" + childID[:8], ReplacesBrokerOrderID: "old-superseded-stop"}
+	childPayload, _ := json.Marshal(childReq)
+	child := store.StockOrderIntent{ID: childID, IdempotencyKey: childReq.IntentKey, ClientOrderID: childReq.ClientOrderID, TradeID: tradeID, ParentIntentID: parent.ID, Ticker: childReq.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: childPayload, PayloadHash: "child", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.lookup[parent.ClientOrderID] = execution.OrderResult{BrokerOrderID: "old-superseded-stop", Status: "accepted"}
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "new-active-stop", Status: "accepted"}
+	coordinator := stockorders.New(broker)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var purpose, linkedIntent string
+	if err := store.GetDB().QueryRow(ctx, `SELECT purpose FROM stock_order_intents WHERE id=$1::uuid`, parent.ID).Scan(&purpose); err != nil || purpose != "superseded" {
+		t.Fatalf("predecessor purpose=%q err=%v", purpose, err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&linkedIntent); err != nil || linkedIntent != child.ID {
+		t.Fatalf("active replacement link=%q err=%v", linkedIntent, err)
+	}
+	beforeLookups, beforeAttempts := len(broker.lookupIDs), countStockIntentAttempts(t, parent.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, clientID := range broker.lookupIDs[beforeLookups:] {
+		if clientID == parent.ClientOrderID {
+			t.Fatal("superseded predecessor replayed lookup")
+		}
+	}
+	if countStockIntentAttempts(t, parent.ID) != beforeAttempts {
+		t.Fatalf("superseded predecessor created attempt")
+	}
+	if got := countForIntent(t, "orders", parent.ID); got != 0 {
+		t.Fatalf("superseded predecessor retained obsolete projection=%d", got)
 	}
 }
