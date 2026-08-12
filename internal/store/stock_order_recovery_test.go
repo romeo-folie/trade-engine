@@ -117,6 +117,58 @@ func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
 	}
 }
 
+func TestStockIntentTerminalZeroFillCannotSatisfyRetry(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name, status string
+		postErr      error
+		lookup       *execution.OrderResult
+	}{
+		{"definitive rejected", "rejected", &execution.BrokerRequestError{StatusCode: 422, Message: "invalid order"}, nil},
+		{"cancelled lookup", "cancelled", nil, &execution.OrderResult{BrokerOrderID: "cancelled-entry", Status: "cancelled"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			signalID := insertRecoverySignal(t, "RINTENTTERMINAL"+tc.name[:1])
+			if err := store.UpdateSignalStatus(ctx, signalID, "approved", ""); err != nil {
+				t.Fatal(err)
+			}
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "accepted-entry", Status: "accepted"})
+			broker.postErr = tc.postErr
+			coordinator := stockorders.New(broker)
+			req := entryRequest(signalID, "RINTENTTERMINAL"+tc.name[:1], 1)
+			if tc.lookup != nil {
+				// First acceptance leaves the durable intent; the broker then
+				// reports its client id as terminal zero-fill on retry.
+				if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+					t.Fatal(err)
+				}
+				in := intentForKey(t, req.IntentKey)
+				broker.lookup[in.ClientOrderID] = *tc.lookup
+			} else {
+				if _, err := coordinator.PlaceOrder(ctx, req); err == nil {
+					t.Fatal("first definitive rejection unexpectedly succeeded")
+				}
+			}
+			if _, err := coordinator.PlaceOrder(ctx, req); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+				t.Fatalf("terminal retry error=%v, want ErrTerminalZeroFillPlacement", err)
+			}
+			if got := countForIntent(t, "trades", intentForKey(t, req.IntentKey).ID); got != 0 {
+				t.Fatalf("terminal retry projected %d trades", got)
+			}
+			if got := countForIntent(t, "orders", intentForKey(t, req.IntentKey).ID); got != 0 {
+				t.Fatalf("terminal retry projected %d orders", got)
+			}
+			var status string
+			if err := store.GetDB().QueryRow(ctx, `SELECT status FROM signals WHERE id=$1::uuid`, signalID).Scan(&status); err != nil || status != "approved" {
+				t.Fatalf("terminal retry signal status=%q err=%v", status, err)
+			}
+		})
+	}
+}
+
 func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {

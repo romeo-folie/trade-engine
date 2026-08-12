@@ -25,6 +25,12 @@ var ErrOrderNotFound = errors.New("execution: order not found at broker")
 // second live stop.
 var ErrAmbiguousStopReplacement = errors.New("execution: ambiguous stop replacement")
 
+// ErrTerminalZeroFillPlacement means an existing client order id is known by
+// the broker to be cancelled or rejected without a fill. It cannot satisfy a
+// fresh protective/entry request; callers may deliberately rotate to a new
+// deterministic generation after confirming that terminal state.
+var ErrTerminalZeroFillPlacement = errors.New("execution: terminal zero-fill placement")
+
 // BrokerRequestError preserves an adapter's definitive HTTP response. It lets
 // durable callers distinguish a broker-declared rejection from a transport or
 // 5xx ambiguity that must be looked up/replayed safely.

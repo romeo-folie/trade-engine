@@ -63,6 +63,9 @@ func (c *Coordinator) PlaceOrder(ctx context.Context, req execution.OrderRequest
 		if err := json.Unmarshal(existing.RequestPayload, &exact); err != nil {
 			return execution.OrderResult{}, err
 		}
+		if isTerminalZeroFill(existing.Status, existing.FilledQty) {
+			return execution.OrderResult{}, fmt.Errorf("%w: stock intent %s is %s", execution.ErrTerminalZeroFillPlacement, existing.ClientOrderID, existing.Status)
+		}
 		return c.submit(ctx, *existing, exact)
 	}
 	intent := store.StockOrderIntent{
@@ -82,6 +85,12 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 	if hasLookup {
 		if prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID); err == nil {
 			_ = c.record(ctx, intent, "lookup", "found", prior, "", false)
+			// Recovery must project an already-known terminal entry to close its
+			// order-only row. Fresh callers, by contrast, must rotate before a
+			// terminal zero-fill client id can satisfy their request.
+			if !isRecoveryContext(ctx) && isTerminalZeroFill(prior.Status, prior.FilledQty) {
+				return execution.OrderResult{}, fmt.Errorf("%w: broker client order %s is %s", execution.ErrTerminalZeroFillPlacement, intent.ClientOrderID, prior.Status)
+			}
 			return c.finishSubmit(ctx, intent, req, prior)
 		} else if !errors.Is(err, execution.ErrOrderNotFound) {
 			_ = c.record(ctx, intent, "lookup", "error", execution.OrderResult{}, err.Error(), false)
@@ -124,6 +133,18 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 	return execution.OrderResult{}, fmt.Errorf("stock order submit: %w", err)
 }
 
+func isTerminalZeroFill(status string, filledQty float64) bool {
+	status = execution.NormalizeOrderStatus(status)
+	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
+}
+
+type recoveryContextKey struct{}
+
+func isRecoveryContext(ctx context.Context) bool {
+	v, _ := ctx.Value(recoveryContextKey{}).(bool)
+	return v
+}
+
 func (c *Coordinator) finishSubmit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) (execution.OrderResult, error) {
 	if err := c.projectBracketChildren(ctx, intent, req, res); err != nil {
 		return execution.OrderResult{}, err
@@ -150,6 +171,7 @@ func (c *Coordinator) projectBracketChildren(ctx context.Context, parent store.S
 // Recover replays nonterminal persisted intents using their exact stored
 // payload and same client id. Callers run it before normal reconciliation.
 func (c *Coordinator) Recover(ctx context.Context) error {
+	ctx = context.WithValue(ctx, recoveryContextKey{}, true)
 	intents, err := store.ListRecoverableStockOrderIntents(ctx)
 	if err != nil {
 		return err

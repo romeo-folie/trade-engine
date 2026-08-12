@@ -11,6 +11,11 @@ import (
 
 var errProtectiveStopFilledDuringRollback = errors.New("protective stop filled before rollback completed")
 
+// Kept as a narrow seam for the post-acceptance rollback regression. Normal
+// production behavior is the store helper; the seam never changes execution
+// policy or broker-facing state.
+var insertUncappedProtectiveOrder = store.InsertOrderWithRetry
+
 // shouldPollEntryFill keeps tracking every broker order that can still add
 // fills. FilledPrice may already be nonzero for a partial fill, so status—not
 // price—is the completion signal.
@@ -53,7 +58,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 	}
 
 	intentKey := protectiveStopIntentKey(tradeID, stopPrice, quantity)
-	res, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
+	stopReq := execution.OrderRequest{
 		Ticker:      ticker,
 		Side:        execution.OrderSideSell,
 		Type:        execution.OrderTypeStop,
@@ -62,7 +67,21 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		TradeID:     tradeID,
 		IntentKey:   intentKey,
 		TimeInForce: "gtc", // uncapped entries are whole-share only
-	})
+	}
+	res, err := e.executor.PlaceOrder(ctx, stopReq)
+	if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		prior, lookupErr := store.GetStockOrderIntentByKey(ctx, intentKey)
+		if lookupErr != nil {
+			return fmt.Errorf("load terminal protective-stop intent: %w", lookupErr)
+		}
+		if prior == nil || prior.BrokerOrderID == "" || !isTerminalZeroFillStockIntent(prior.Status, prior.FilledQty) {
+			return fmt.Errorf("terminal protective-stop retry lacks confirmed broker generation: %w", err)
+		}
+		intentKey = protectiveStopRetryIntentKey(intentKey, prior.BrokerOrderID)
+		stopReq.IntentKey = intentKey
+		stopReq.ClientOrderID = ""
+		res, err = e.executor.PlaceOrder(ctx, stopReq)
+	}
 	if err != nil {
 		return fmt.Errorf("place protective stop: %w", err)
 	}
@@ -90,7 +109,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 			return fmt.Errorf("claim immediate protective-stop fill: %w", claimErr)
 		}
 	}
-	if _, err := store.InsertOrderWithRetry(ctx, store.Order{
+	if _, err := insertUncappedProtectiveOrder(ctx, store.Order{
 		TradeID:       tradeID,
 		BrokerOrderID: res.BrokerOrderID,
 		Ticker:        ticker,
@@ -148,6 +167,15 @@ func (e *Engine) ensureUncappedProtectiveStop(
 
 func protectiveStopIntentKey(tradeID string, stopPrice, quantity float64) string {
 	return "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f:%.8f", stopPrice, quantity)
+}
+
+func protectiveStopRetryIntentKey(previousKey, cancelledBrokerOrderID string) string {
+	return fmt.Sprintf("%s:retry:%s", previousKey, cancelledBrokerOrderID)
+}
+
+func isTerminalZeroFillStockIntent(status string, filledQty float64) bool {
+	status = execution.NormalizeOrderStatus(status)
+	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
 }
 
 // rollbackUnrecordedProtectiveStop prevents a broker-accepted stop whose DB

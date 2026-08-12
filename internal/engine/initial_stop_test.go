@@ -7,8 +7,51 @@ import (
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/stockorders"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+type protectiveRetryBroker struct {
+	posts      []execution.OrderRequest
+	lookup     map[string]execution.OrderResult
+	brokerToID map[string]string
+}
+
+func newProtectiveRetryBroker() *protectiveRetryBroker {
+	return &protectiveRetryBroker{lookup: map[string]execution.OrderResult{}, brokerToID: map[string]string{}}
+}
+
+func (b *protectiveRetryBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	b.posts = append(b.posts, req)
+	brokerID := "rollback-cancelled"
+	if len(b.posts) > 1 {
+		brokerID = "fresh-live-stop"
+	}
+	b.brokerToID[brokerID] = req.ClientOrderID
+	return execution.OrderResult{BrokerOrderID: brokerID, Status: "accepted"}, nil
+}
+func (b *protectiveRetryBroker) GetOrderByClientID(_ context.Context, id string) (execution.OrderResult, error) {
+	if res, ok := b.lookup[id]; ok {
+		return res, nil
+	}
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+func (b *protectiveRetryBroker) CancelOrder(_ context.Context, id string) error {
+	b.lookup[b.brokerToID[id]] = execution.OrderResult{BrokerOrderID: id, Status: "cancelled"}
+	return nil
+}
+func (b *protectiveRetryBroker) GetOrderStatus(_ context.Context, id string) (execution.OrderResult, error) {
+	return execution.OrderResult{BrokerOrderID: id, Status: "cancelled"}, nil
+}
+func (*protectiveRetryBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*protectiveRetryBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*protectiveRetryBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
 
 func TestEnsureUncappedProtectiveStopSeedsImmediately(t *testing.T) {
 	if !store.IsConnected() {
@@ -57,6 +100,55 @@ func TestEnsureUncappedProtectiveStopSeedsImmediately(t *testing.T) {
 	}
 	if len(exec.placed) != 1 {
 		t.Fatalf("idempotent ensure placed %d stops, want 1", len(exec.placed))
+	}
+}
+
+func TestEnsureUncappedProtectiveStopRollbackCancellationRotatesIntent(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "UCPRETRY", Direction: "long", Strategy: "momentum", EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newProtectiveRetryBroker()
+	e := newBracketTestEngine(stockorders.New(broker))
+	originalInsert := insertUncappedProtectiveOrder
+	insertCalls := 0
+	insertUncappedProtectiveOrder = func(ctx context.Context, order store.Order) (string, error) {
+		insertCalls++
+		if insertCalls == 1 {
+			return "", errors.New("simulated first protective projection failure")
+		}
+		return originalInsert(ctx, order)
+	}
+	defer func() { insertUncappedProtectiveOrder = originalInsert }()
+
+	if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCPRETRY", 5, 95); err == nil {
+		t.Fatal("first accepted stop should report projection failure after rollback")
+	}
+	if got := len(broker.posts); got != 1 {
+		t.Fatalf("first posts=%d, want 1", got)
+	}
+	if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCPRETRY", 5, 95); err != nil {
+		t.Fatalf("retry after confirmed cancellation: %v", err)
+	}
+	if got := len(broker.posts); got != 2 {
+		t.Fatalf("posts=%d, want original plus fresh generation", got)
+	}
+	baseKey := protectiveStopIntentKey(tradeID, 95, 5)
+	retryKey := protectiveStopRetryIntentKey(baseKey, "rollback-cancelled")
+	if broker.posts[0].IntentKey != baseKey || broker.posts[1].IntentKey != retryKey || broker.posts[0].ClientOrderID == broker.posts[1].ClientOrderID {
+		t.Fatalf("retry generation = %#v", broker.posts)
+	}
+	activeIntent, err := store.GetStockOrderIntentByKey(ctx, retryKey)
+	if err != nil || activeIntent == nil {
+		t.Fatalf("active retry intent=%#v err=%v", activeIntent, err)
+	}
+	var brokerID, intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE trade_id=$1::uuid AND status='pending'`, tradeID).Scan(&brokerID, &intentID); err != nil || brokerID != "fresh-live-stop" || intentID != activeIntent.ID {
+		t.Fatalf("active retry protection broker=%q intent=%q err=%v", brokerID, intentID, err)
 	}
 }
 
