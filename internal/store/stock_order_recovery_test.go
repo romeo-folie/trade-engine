@@ -2385,7 +2385,8 @@ func TestStockIntentReplacementRetainsPredecessorGTC(t *testing.T) {
 	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "gtc-old-stop", "pending", 0, 0, "", "", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "gtc-old-stop", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID}); err != nil {
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "gtc-old-stop", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
 		t.Fatal(err)
 	}
 	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "gtc-new-stop", Status: "done_for_day"})
@@ -2408,6 +2409,24 @@ func TestStockIntentReplacementRetainsPredecessorGTC(t *testing.T) {
 	}
 	if got := intentForKey(t, key); got.Status != "pending" {
 		t.Fatalf("GTC replacement status=%q, want pending", got.Status)
+	}
+	var brokerID, intentID, status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text, status FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if brokerID != "gtc-new-stop" || intentID != child.ID || status != "pending" {
+		t.Fatalf("GTC recovered replacement=%q/%q/%q, want gtc-new-stop/%s/pending", brokerID, intentID, status, child.ID)
+	}
+	beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, child.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var stopRows int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&stopRows); err != nil || stopRows != 1 {
+		t.Fatalf("replayed GTC replacement stop rows=%d err=%v, want one", stopRows, err)
+	}
+	if broker.lookups != beforeLookups+1 || countStockIntentAttempts(t, child.ID) != beforeAttempts+1 {
+		t.Fatal("replayed GTC replacement did not perform exactly one idempotent lookup/attempt")
 	}
 }
 
@@ -2638,13 +2657,17 @@ func TestStockIntentFallbackReplacementAdvancesProjectionAtomically(t *testing.T
 
 func TestStockIntentAdoptsLegacyTrailingStopProvenance(t *testing.T) {
 	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
 	signalID := insertRecoverySignal(t, "RINTENTLEGACYTRAIL")
 	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLEGACYTRAIL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 95})
 	if err != nil {
 		t.Fatal(err)
 	}
 	evidence := json.RawMessage(`{"trailing_stop":95,"atr":2}`)
-	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-trailing-stop", Ticker: "RINTENTLEGACYTRAIL", Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 95, Status: "pending", IsStopLoss: true, ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence}); err != nil {
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-trailing-stop", Ticker: "RINTENTLEGACYTRAIL", Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 95, Status: "pending", IsStopLoss: true, ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence})
+	if err != nil {
 		t.Fatal(err)
 	}
 	legacy, err := store.GetOrderByBrokerOrderID(ctx, "legacy-trailing-stop")
@@ -2656,10 +2679,83 @@ func TestStockIntentAdoptsLegacyTrailingStopProvenance(t *testing.T) {
 	if _, err := coordinator.ReplaceStopOrder(ctx, "legacy-trailing-stop", 96); err != nil {
 		t.Fatalf("replace adopted trailing stop: %v", err)
 	}
+	parent := intentForKey(t, "legacy-stop:"+orderID)
+	child := intentForKey(t, "replace:"+parent.IdempotencyKey+":96.00000000")
+	for _, intent := range []*store.StockOrderIntent{parent, child} {
+		var req execution.OrderRequest
+		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil || req.TimeInForce != "gtc" {
+			t.Fatalf("adopted whole-share stop request=%+v err=%v, want GTC", req, err)
+		}
+	}
 	var reason string
 	var gotEvidence json.RawMessage
 	if err := store.GetDB().QueryRow(ctx, `SELECT COALESCE(exit_reason,''), exit_evidence FROM orders WHERE trade_id=$1::uuid`, tradeID).Scan(&reason, &gotEvidence); err != nil || reason != store.ExitReasonTrailingATR || !sameJSON(t, gotEvidence, evidence) {
 		t.Fatalf("adopted replacement provenance=%q %s err=%v", reason, gotEvidence, err)
+	}
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "patched-1", Status: "done_for_day"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover adopted GTC replacement: %v", err)
+	}
+	var brokerID, intentID, status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text, status FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID, &status); err != nil {
+		t.Fatal(err)
+	}
+	if brokerID != "patched-1" || intentID != child.ID || status != "pending" {
+		t.Fatalf("adopted GTC recovery=%q/%q/%q, want patched-1/%s/pending", brokerID, intentID, status, child.ID)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countForIntent(t, "orders", child.ID); got != 1 {
+		t.Fatalf("replayed adopted GTC replacement projections=%d, want one", got)
+	}
+}
+
+func TestStockIntentAdoptsFractionalLegacyStopAsDay(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTLEGACYFRACTIONAL")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLEGACYFRACTIONAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1.5, StopLoss: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-fractional-stop", Ticker: "RINTENTLEGACYFRACTIONAL", Side: "sell", OrderType: "stop", Quantity: 1.5, StopPrice: 95, Status: "pending", IsStopLoss: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "legacy-fractional-stop", 96); err != nil {
+		t.Fatalf("replace adopted fractional stop: %v", err)
+	}
+	parent := intentForKey(t, "legacy-stop:"+orderID)
+	child := intentForKey(t, "replace:"+parent.IdempotencyKey+":96.00000000")
+	for _, intent := range []*store.StockOrderIntent{parent, child} {
+		var req execution.OrderRequest
+		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil || req.TimeInForce != "day" {
+			t.Fatalf("adopted fractional stop request=%+v err=%v, want DAY", req, err)
+		}
+	}
+	// DAY done_for_day is terminal: recovery must not repoint the mutable row
+	// to a stop that has already expired.
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "patched-1", Status: "done_for_day"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover adopted DAY replacement: %v", err)
+	}
+	if got := intentForKey(t, child.IdempotencyKey); got.Status != "cancelled" {
+		t.Fatalf("adopted DAY replacement status=%q, want cancelled", got.Status)
+	}
+	var brokerID, intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil {
+		t.Fatal(err)
+	}
+	if brokerID != "legacy-fractional-stop" || intentID != parent.ID {
+		t.Fatalf("terminal DAY replacement repointed mutable stop to %q/%q", brokerID, intentID)
+	}
+	if got := countForIntent(t, "orders", child.ID); got != 0 {
+		t.Fatalf("terminal DAY replacement projected %d duplicate stops", got)
 	}
 }
 

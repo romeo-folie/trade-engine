@@ -364,11 +364,11 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 		return fmt.Errorf("recovered market exit %s has fill without price", intent.ClientOrderID)
 	}
 	remaining, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, res.FilledPrice, allocatedFill,
-		execution.NormalizeOrderStatus(res.Status), res.FilledAt)
+		execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), res.FilledAt)
 	if err != nil {
 		return fmt.Errorf("apply recovered market exit fill: %w", err)
 	}
-	if execution.IsTerminalOrderStatus(res.Status) && remaining <= 1e-9 {
+	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) && remaining <= 1e-9 {
 		if _, err := store.FinalizeTradeExit(ctx, tradeID); err != nil {
 			return fmt.Errorf("finalize recovered market exit: %w", err)
 		}
@@ -532,7 +532,7 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 			TradeID: tradeID, BrokerOrderID: brokerID, Ticker: req.Ticker,
 			Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
 			FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
-			Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID,
+			Status: execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), StockIntentID: intent.ID,
 		}); err != nil {
 			return fmt.Errorf("project recovered stock order: %w", err)
 		}
@@ -540,7 +540,7 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 		return fmt.Errorf("attach recovered stock order: %w", err)
 	}
 	if brokerID != "" {
-		if err := store.ApplyEntryFill(ctx, tradeID, brokerID, res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status)); err != nil {
+		if err := store.ApplyEntryFill(ctx, tradeID, brokerID, res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)); err != nil {
 			return fmt.Errorf("apply recovered stock entry fill: %w", err)
 		}
 	}
@@ -699,13 +699,13 @@ func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, p
 		_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: tradeID, BrokerOrderID: stopRes.BrokerOrderID,
 			Ticker: req.Ticker, Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
 			Quantity: remainingQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
-			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatus(stopRes.Status), IsStopLoss: true,
+			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatusForTimeInForce(stopRes.Status, stopReq.TimeInForce), IsStopLoss: true,
 			ExitReason: requestExitIntent(stopReq).Reason, ExitEvidence: requestExitIntent(stopReq).Evidence, StockIntentID: stopIntent.ID})
 		return err
 	}
 	if err := store.UpdateOrderStopReplacementAndSupersede(ctx, existing.ID, existing.BrokerOrderID, stopRes.BrokerOrderID, stopIntent.ID,
 		existing.FilledQty, remainingQty, req.PolicyStopLoss, remainingQty,
-		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, requestExitIntent(stopReq)); err != nil {
+		execution.NormalizeOrderStatusForTimeInForce(stopRes.Status, stopReq.TimeInForce), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, requestExitIntent(stopReq)); err != nil {
 		return err
 	}
 	return nil
@@ -848,7 +848,8 @@ func (c *Coordinator) adoptLegacyStop(ctx context.Context, brokerOrderID string)
 	req := execution.OrderRequest{Ticker: order.Ticker, Side: execution.OrderSide(order.Side), Type: execution.OrderTypeStop,
 		Quantity: order.Quantity, StopPrice: order.StopPrice, TradeID: order.TradeID,
 		IntentKey: key, ClientOrderID: clientIDForKey(key),
-		ExitReason: order.ExitReason, ExitEvidence: order.ExitEvidence}
+		TimeInForce: standaloneStopTimeInForce(order.Quantity),
+		ExitReason:  order.ExitReason, ExitEvidence: order.ExitEvidence}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -996,13 +997,23 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 	}
 	if err := store.UpdateOrderStopReplacement(ctx, order.ID, req.ReplacesBrokerOrderID, res.BrokerOrderID,
 		order.FilledQty, req.Quantity, req.StopPrice, req.Quantity,
-		execution.NormalizeOrderStatus(res.Status), res.FilledPrice, res.FilledQty, res.FilledAt, requestExitIntent(req)); err != nil {
+		execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), res.FilledPrice, res.FilledQty, res.FilledAt, requestExitIntent(req)); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("project stock stop replacement: %w", err)
 	}
 	if err := store.RepointOrderStockIntentAndSupersede(ctx, order.ID, intent.ID); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("link stock stop replacement intent: %w", err)
 	}
 	return res, nil
+}
+
+// standaloneStopTimeInForce matches the broker policy used for standalone
+// protective stops: Alpaca permits fractional stop orders only as DAY, while
+// whole-share stops retain overnight protection as GTC.
+func standaloneStopTimeInForce(quantity float64) string {
+	if quantity != math.Trunc(quantity) {
+		return "day"
+	}
+	return "gtc"
 }
 
 func newClientOrderID() string { return clientIDPrefix + strings.ReplaceAll(intentUUID(), "-", "") }
