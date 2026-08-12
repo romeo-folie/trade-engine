@@ -276,15 +276,64 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 		}
 	}
 	if req.UncappedTakeProfit && res.FilledQty > 0 {
-		stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
-			Type: execution.OrderTypeStop, Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss,
-			TradeID: tradeID, TimeInForce: "gtc",
-			IntentKey: fmt.Sprintf("recovered-protective-stop:%s:%s:%.8f:%.8f", tradeID, parent.ID, req.PolicyStopLoss, res.FilledQty)}
-		if _, err := c.PlaceOrder(ctx, stopReq); err != nil {
+		if err := c.ensureRecoveredProtectiveStop(ctx, parent, req, res, tradeID); err != nil {
 			return fmt.Errorf("recover uncapped entry protective stop: %w", err)
 		}
 	}
 	return nil
+}
+
+// ensureRecoveredProtectiveStop maintains one active protection lineage for an
+// uncapped recovered entry. A cumulative entry fill can increase after a
+// restart: cancel and confirm the old generation before submitting the resized
+// one, so protected working quantity never exceeds the held position.
+func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, tradeID string) error {
+	existing, err := store.GetRecoveredProtectiveStop(ctx, tradeID, parent.ID)
+	if err != nil {
+		return err
+	}
+	if existing != nil && existing.Quantity == res.FilledQty && existing.StopPrice == req.PolicyStopLoss {
+		return nil
+	}
+	key := fmt.Sprintf("recovered-protective-stop:%s:%s:%.8f", tradeID, parent.ID, req.PolicyStopLoss)
+	if existing != nil {
+		if err := c.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
+			return fmt.Errorf("cancel prior recovered protective stop: %w", err)
+		}
+		status, err := c.GetOrderStatus(ctx, existing.BrokerOrderID)
+		if err != nil {
+			return fmt.Errorf("confirm cancellation of recovered protective stop: %w", err)
+		}
+		if normalized := execution.NormalizeOrderStatus(status.Status); normalized != "cancelled" && normalized != "rejected" {
+			return fmt.Errorf("recovered protective stop %s remains %s after cancel", existing.BrokerOrderID, status.Status)
+		}
+		key += fmt.Sprintf(":resize:%s:%.8f", existing.BrokerOrderID, res.FilledQty)
+	}
+	stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
+		Type: execution.OrderTypeStop, Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss,
+		TradeID: tradeID, TimeInForce: "gtc", IntentKey: key}
+	stopRes, err := c.PlaceOrder(ctx, stopReq)
+	if err != nil {
+		return err
+	}
+	stopIntent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil || stopIntent == nil {
+		return fmt.Errorf("load durable recovered protective stop intent: %w", err)
+	}
+	if existing == nil {
+		_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: tradeID, BrokerOrderID: stopRes.BrokerOrderID,
+			Ticker: req.Ticker, Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
+			Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
+			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatus(stopRes.Status), IsStopLoss: true,
+			StockIntentID: stopIntent.ID})
+		return err
+	}
+	if err := store.UpdateOrderStopReplacement(ctx, existing.ID, existing.BrokerOrderID, stopRes.BrokerOrderID,
+		existing.FilledQty, res.FilledQty, req.PolicyStopLoss, res.FilledQty,
+		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+		return err
+	}
+	return store.RepointOrderStockIntent(ctx, existing.ID, stopIntent.ID)
 }
 
 func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent, operation, outcome string, res execution.OrderResult, errText string, submitted bool) error {
@@ -396,7 +445,7 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if err == nil {
 			_ = c.record(ctx, intent, "replace_lookup", "found", prior, "", false)
-			return prior, nil
+			return c.projectReplacement(ctx, intent, req, prior)
 		}
 		if !errors.Is(err, execution.ErrOrderNotFound) {
 			_ = c.record(ctx, intent, "replace_lookup", "error", execution.OrderResult{}, err.Error(), false)
@@ -412,24 +461,14 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 	res, err := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 	if err == nil {
 		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
-		if intent.ParentIntentID != "" {
-			if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
-				return execution.OrderResult{}, fmt.Errorf("link stock replacement projection: %w", err)
-			}
-		}
-		return res, nil
+		return c.projectReplacement(ctx, intent, req, res)
 	}
 	_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	if hasLookup {
 		prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if lookupErr == nil {
 			_ = c.record(ctx, intent, "replace_lookup_after_ambiguous", "found", prior, "", true)
-			if intent.ParentIntentID != "" {
-				if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
-					return execution.OrderResult{}, fmt.Errorf("link recovered stock replacement projection: %w", err)
-				}
-			}
-			return prior, nil
+			return c.projectReplacement(ctx, intent, req, prior)
 		}
 		if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
 			return execution.OrderResult{}, fmt.Errorf("ambiguous stock stop replacement (%v); client-id lookup failed: %w", err, lookupErr)
@@ -437,17 +476,41 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		res, replayErr := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 		if replayErr == nil {
 			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
-			if intent.ParentIntentID != "" {
-				if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
-					return execution.OrderResult{}, fmt.Errorf("link replayed stock replacement projection: %w", err)
-				}
-			}
-			return res, nil
+			return c.projectReplacement(ctx, intent, req, res)
 		}
 		_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", replayErr)
 	}
 	return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", err)
+}
+
+// projectReplacement atomically advances the one mutable stop row after an
+// accepted PATCH (including lookup-only crash recovery). The predecessor
+// intent retains its broker id, so a fill race on that old id remains
+// independently reconcilable while the active row points at the replacement.
+func (c *Coordinator) projectReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) (execution.OrderResult, error) {
+	if intent.ParentIntentID == "" {
+		return res, nil
+	}
+	order, err := store.GetOrderByStockIntentID(ctx, intent.ParentIntentID)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("load predecessor replacement projection: %w", err)
+	}
+	if order == nil {
+		return execution.OrderResult{}, fmt.Errorf("missing predecessor order projection for replacement %s", intent.ClientOrderID)
+	}
+	if order.BrokerOrderID == res.BrokerOrderID && order.StockIntentID == intent.ID {
+		return res, nil
+	}
+	if err := store.UpdateOrderStopReplacement(ctx, order.ID, req.ReplacesBrokerOrderID, res.BrokerOrderID,
+		order.FilledQty, req.Quantity, req.StopPrice, req.Quantity,
+		execution.NormalizeOrderStatus(res.Status), res.FilledPrice, res.FilledQty, res.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+		return execution.OrderResult{}, fmt.Errorf("project stock stop replacement: %w", err)
+	}
+	if err := store.RepointOrderStockIntent(ctx, order.ID, intent.ID); err != nil {
+		return execution.OrderResult{}, fmt.Errorf("link stock stop replacement intent: %w", err)
+	}
+	return res, nil
 }
 
 func newClientOrderID() string { return clientIDPrefix + strings.ReplaceAll(intentUUID(), "-", "") }

@@ -154,6 +154,44 @@ func LinkReplacementStockIntent(ctx context.Context, predecessorIntentID, replac
 	return err
 }
 
+// RepointOrderStockIntent binds the mutable live order row to the next intent
+// generation after a confirmed cancel/resubmit or broker PATCH replacement.
+func RepointOrderStockIntent(ctx context.Context, orderID, intentID string) error {
+	_, err := GetDB().Exec(ctx, `UPDATE orders SET stock_intent_id=$2::uuid, updated_at=NOW() WHERE id=$1`, orderID, intentID)
+	return err
+}
+
+// GetRecoveredProtectiveStop finds the one active uncapped recovery stop
+// lineage for an entry intent, including a later resize generation.
+func GetRecoveredProtectiveStop(ctx context.Context, tradeID, entryIntentID string) (*Order, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT o.id, COALESCE(o.trade_id::text,''), COALESCE(o.broker_order_id,''),
+		       o.ticker, o.side, o.order_type, o.quantity, COALESCE(o.limit_price,0),
+		       COALESCE(o.stop_price,0), COALESCE(o.filled_price,0), COALESCE(o.filled_qty,0),
+		       o.status, o.is_stop_loss, o.is_take_profit, COALESCE(o.parent_order_id,''),
+		       o.filled_at, o.created_at, o.updated_at, COALESCE(o.stock_intent_id::text,'')
+		FROM orders o JOIN stock_order_intents i ON i.id=o.stock_intent_id
+		WHERE o.trade_id=$1::uuid
+		  AND i.idempotency_key LIKE ('recovered-protective-stop:%:' || $2 || ':%')
+		  AND o.status IN ('pending','partial')
+		ORDER BY o.updated_at DESC LIMIT 1`, tradeID, entryIntentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		return nil, nil
+	}
+	var o Order
+	if err := rows.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side, &o.OrderType,
+		&o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice, &o.FilledQty, &o.Status,
+		&o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID, &o.FilledAt, &o.CreatedAt,
+		&o.UpdatedAt, &o.StockIntentID); err != nil {
+		return nil, err
+	}
+	return &o, rows.Err()
+}
+
 // UpdateOrderFill sets filled_price, filled_qty, and status after a fill event.
 func UpdateOrderFill(ctx context.Context, id string, filledPrice, filledQty float64, status string) error {
 	return UpdateOrderFillAt(ctx, id, filledPrice, filledQty, status, time.Time{})
