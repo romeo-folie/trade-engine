@@ -164,6 +164,15 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    SELECT 1 FROM orders o
                    WHERE o.stock_intent_id=stock_order_intents.id AND o.trade_id=stock_order_intents.trade_id
                )))
+           -- Exit intents may have one projection per claimed trade (the
+           -- analyst aggregate case), so there is no single NOT EXISTS
+           -- predicate that can prove their projection is complete. Keep
+           -- them recoverable; their per-trade projection is idempotent.
+           OR (status='filled' AND order_type='market' AND (
+                  idempotency_key LIKE 'software-exit:%'
+               OR idempotency_key LIKE 'trailing-market-exit:%'
+               OR idempotency_key LIKE 'analyst-exit:%'
+           ))
            OR (status='filled' AND order_type='stop' AND trade_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id))
         )

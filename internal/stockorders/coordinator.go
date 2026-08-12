@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -27,6 +28,11 @@ const clientIDPrefix = "te-stock-"
 type Coordinator struct{ inner execution.Executor }
 
 func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inner} }
+
+// DurableStockOrderIntents marks this executor for callers that must not
+// continue with a legacy, unlinked projection when the post-submit intent
+// lookup is unavailable. Paper executors intentionally do not implement it.
+func (*Coordinator) DurableStockOrderIntents() bool { return true }
 
 func (c *Coordinator) BrokerName() string {
 	if named, ok := c.inner.(interface{ BrokerName() string }); ok {
@@ -179,16 +185,137 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 }
 
 func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
-	if req.Type != execution.OrderTypeMarket || req.TradeID == "" || !strings.Contains(intent.IdempotencyKey, "exit:") {
+	if req.Type != execution.OrderTypeMarket || !isRecoveredMarketExitKey(intent.IdempotencyKey) {
 		return nil
 	}
-	if existing, err := store.GetOrderByStockIntentID(ctx, intent.ID); err != nil {
+	if req.TradeID != "" {
+		existing, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, req.TradeID)
+		if err != nil {
+			return err
+		}
+		if existing != nil {
+			return nil
+		}
+		return c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, req.TradeID, req.Quantity, res.FilledQty)
+	}
+	if !strings.HasPrefix(intent.IdempotencyKey, "analyst-exit:") {
+		return nil
+	}
+	signalID, ok := analystExitSignalID(intent.IdempotencyKey, req.Ticker)
+	if !ok {
+		return fmt.Errorf("invalid analyst stock exit intent key %q", intent.IdempotencyKey)
+	}
+	trades, err := store.GetExitingTradesForSellSignal(ctx, req.Ticker, signalID)
+	if err != nil {
+		return fmt.Errorf("load claimed analyst exit trades: %w", err)
+	}
+	if len(trades) == 0 {
+		projected, err := store.CountOrdersForStockIntent(ctx, intent.ID)
+		if err != nil {
+			return fmt.Errorf("count analyst exit projections: %w", err)
+		}
+		if projected > 0 {
+			// A prior recovery finalized every claimed lot. The immutable intent
+			// remains selectable so it can heal a partial projection, but once
+			// every trade is closed there is deliberately no live claim to find.
+			return nil
+		}
+		return fmt.Errorf("analyst stock exit %s has no claimed trade links", intent.ClientOrderID)
+	}
+
+	// The broker's FilledQty is cumulative across the one aggregate order.
+	// First reserve every existing lot row's original capacity. This preserves
+	// allocation after a process dies halfway through projecting the lots, even
+	// if an earlier lot has since been fully closed and is absent from `trades`.
+	existingOrders, err := store.GetOrdersByStockIntent(ctx, intent.ID)
+	if err != nil {
+		return fmt.Errorf("load analyst exit projections: %w", err)
+	}
+	remainingFill := math.Max(0, res.FilledQty)
+	allocations := make(map[string]float64, len(trades))
+	for _, order := range existingOrders {
+		allocation := math.Min(math.Max(0, order.Quantity), remainingFill)
+		remainingFill -= allocation
+		allocations[order.TradeID] = allocation
+	}
+	for _, trade := range trades {
+		allocation, exists := allocations[trade.ID]
+		if !exists {
+			allocation = math.Min(math.Max(0, trade.Quantity), remainingFill)
+			remainingFill -= allocation
+		}
+		if err := c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, trade.ID, trade.Quantity, allocation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func isRecoveredMarketExitKey(key string) bool {
+	return strings.HasPrefix(key, "software-exit:") ||
+		strings.HasPrefix(key, "trailing-market-exit:") ||
+		strings.HasPrefix(key, "analyst-exit:")
+}
+
+func analystExitSignalID(key, ticker string) (string, bool) {
+	parts := strings.SplitN(strings.TrimPrefix(key, "analyst-exit:"), ":", 2)
+	return parts[0], len(parts) == 2 && parts[0] != "" && parts[1] == ticker
+}
+
+// projectRecoveredMarketExitAllocation completes one durable exit-order link.
+// It first writes the assigned broker cumulative fill and then atomically
+// applies it to the claimed trade. A retry sees the same row and is a no-op
+// once the trade has already been finalized.
+func (c *Coordinator) projectRecoveredMarketExitAllocation(
+	ctx context.Context,
+	intent store.StockOrderIntent,
+	req execution.OrderRequest,
+	res execution.OrderResult,
+	tradeID string,
+	quantity, allocatedFill float64,
+) error {
+	existing, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, tradeID)
+	if err != nil {
 		return err
-	} else if existing != nil {
+	}
+	orderID := ""
+	if existing != nil {
+		orderID = existing.ID
+	} else {
+		brokerID := res.BrokerOrderID
+		if brokerID == "" {
+			brokerID = intent.BrokerOrderID
+		}
+		if brokerID == "" {
+			return fmt.Errorf("recovered market exit %s has no broker order id", intent.ClientOrderID)
+		}
+		orderID, err = store.InsertOrderWithRetry(ctx, store.Order{
+			TradeID: tradeID, BrokerOrderID: brokerID, Ticker: req.Ticker,
+			Side: string(req.Side), OrderType: string(req.Type), Quantity: quantity,
+			FilledPrice: res.FilledPrice, FilledQty: allocatedFill, FilledAt: filledAtPtr(res.FilledAt),
+			Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("project recovered market exit order: %w", err)
+		}
+	}
+	if allocatedFill <= 0 {
 		return nil
 	}
-	_, err := store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: res.BrokerOrderID, Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty, FilledAt: filledAtPtr(res.FilledAt), Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID})
-	return err
+	if res.FilledPrice <= 0 {
+		return fmt.Errorf("recovered market exit %s has fill without price", intent.ClientOrderID)
+	}
+	remaining, _, err := store.ApplyPartialExitAt(ctx, tradeID, orderID, res.FilledPrice, allocatedFill,
+		execution.NormalizeOrderStatus(res.Status), res.FilledAt)
+	if err != nil {
+		return fmt.Errorf("apply recovered market exit fill: %w", err)
+	}
+	if execution.NormalizeOrderStatus(res.Status) == "filled" && remaining <= 1e-9 {
+		if _, err := store.FinalizeTradeExit(ctx, tradeID); err != nil {
+			return fmt.Errorf("finalize recovered market exit: %w", err)
+		}
+	}
+	return nil
 }
 
 func filledAtPtr(t time.Time) *time.Time {

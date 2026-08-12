@@ -132,6 +132,71 @@ func GetOrderByStockIntentID(ctx context.Context, intentID string) (*Order, erro
 	return &o, nil
 }
 
+// GetOrderByStockIntentAndTrade retrieves one allocation of an aggregate
+// durable stock intent. Unlike GetOrderByStockIntentID, it is safe for an
+// analyst exit that has one order row for each claimed trade.
+func GetOrderByStockIntentAndTrade(ctx context.Context, intentID, tradeID string) (*Order, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity, COALESCE(limit_price,0),
+		       COALESCE(stop_price,0), COALESCE(filled_price,0),
+		       COALESCE(filled_qty,0), status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''), filled_at, created_at, updated_at,
+		       COALESCE(stock_intent_id::text,'')
+		FROM orders
+		WHERE stock_intent_id=$1::uuid AND trade_id=$2::uuid
+		ORDER BY created_at LIMIT 1`, intentID, tradeID)
+	var o Order
+	if err := row.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side,
+		&o.OrderType, &o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice,
+		&o.FilledQty, &o.Status, &o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID,
+		&o.FilledAt, &o.CreatedAt, &o.UpdatedAt, &o.StockIntentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &o, nil
+}
+
+// CountOrdersForStockIntent reports all projection rows, including the
+// multiple per-trade rows of an aggregate analyst exit.
+func CountOrdersForStockIntent(ctx context.Context, intentID string) (int, error) {
+	var n int
+	err := GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE stock_intent_id=$1::uuid`, intentID).Scan(&n)
+	return n, err
+}
+
+// GetOrdersByStockIntent returns every projection allocation for a durable
+// intent in creation order. Aggregate exit recovery uses the recorded lot
+// capacities to retain its original cumulative-fill allocation after a crash.
+func GetOrdersByStockIntent(ctx context.Context, intentID string) ([]Order, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity, COALESCE(limit_price,0),
+		       COALESCE(stop_price,0), COALESCE(filled_price,0),
+		       COALESCE(filled_qty,0), status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''), filled_at, created_at, updated_at,
+		       COALESCE(stock_intent_id::text,'')
+		FROM orders WHERE stock_intent_id=$1::uuid ORDER BY created_at, id`, intentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Order
+	for rows.Next() {
+		var o Order
+		if err := rows.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side,
+			&o.OrderType, &o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice,
+			&o.FilledQty, &o.Status, &o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID,
+			&o.FilledAt, &o.CreatedAt, &o.UpdatedAt, &o.StockIntentID); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 func GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*Order, error) {
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''), ticker, side, order_type,

@@ -775,6 +775,11 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 	})
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100)}
 	fb := &fakeBroker{}
+	// The fallback's newly submitted durable intent is resolved by the live
+	// adapter after the broker returns its generated id. Pin that the mutable
+	// stop row advances to this intent rather than remaining attached to its
+	// cancelled predecessor.
+	fs.replacementIntentIDs["broker-1"] = "resubmitted-durable-intent"
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
 
 	m.UpdateAll(context.Background())
@@ -794,6 +799,9 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 	}
 	if stop.Quantity != 5 {
 		t.Fatalf("stored stop quantity = %v, want 5", stop.Quantity)
+	}
+	if stop.StockIntentID != "resubmitted-durable-intent" {
+		t.Fatalf("cancel-resubmit stop intent = %q, want repointed durable intent", stop.StockIntentID)
 	}
 }
 

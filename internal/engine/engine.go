@@ -6,6 +6,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -2503,8 +2504,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		return
 	}
 	stockIntentID, intentLookupErr := stockIntentIDForKeyStrict(ctx, orderReq.IntentKey)
-	if intentLookupErr != nil {
-		logger.Error("accepted stock order intent projection unavailable", "ticker", sig.Ticker, "err", intentLookupErr)
+	if projectionErr := durableStockIntentProjectionError(e.executor, stockIntentID, intentLookupErr); projectionErr != nil {
+		logger.Error("accepted stock order intent projection unavailable", "ticker", sig.Ticker, "intent_key", orderReq.IntentKey, "err", projectionErr)
 		return
 	}
 
@@ -2859,6 +2860,20 @@ func stockIntentIDForKeyStrict(ctx context.Context, key string) (string, error) 
 		return "", nil
 	}
 	return intent.ID, nil
+}
+
+// durableStockIntentProjectionError keeps an accepted broker order from being
+// projected as a legacy trade when the coordinator's immutable intent cannot
+// be read. Paper execution has no such intent and remains intentionally
+// unaffected.
+func durableStockIntentProjectionError(executor execution.Executor, intentID string, lookupErr error) error {
+	if lookupErr != nil {
+		return lookupErr
+	}
+	if durable, ok := executor.(interface{ DurableStockOrderIntents() bool }); ok && durable.DurableStockOrderIntents() && intentID == "" {
+		return errors.New("accepted stock order durable intent missing")
+	}
+	return nil
 }
 
 func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {

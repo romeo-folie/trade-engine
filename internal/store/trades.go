@@ -937,6 +937,35 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 	return scanTrades(rows)
 }
 
+// GetExitingTradesForSellSignal returns exactly the lots claimed by an
+// aggregate analyst SELL before its durable broker order was projected. The
+// signal id is stored in the claim evidence before submission, which makes
+// recovery precise even when another exit for the same ticker is in flight.
+func GetExitingTradesForSellSignal(ctx context.Context, ticker, signalID string) ([]Trade, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
+		       entry_price, COALESCE(exit_price,0),
+		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
+		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
+		FROM trades
+		WHERE status='exiting'
+		  AND ticker=$1
+		  AND direction='long'
+		  AND exit_reason=$2
+		  AND exit_evidence->>'signal_id'=$3
+		ORDER BY exit_claimed_at, id`, ticker, ExitReasonSellSignal, signalID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTrades(rows)
+}
+
 // GetOrderlessExitingTrades returns claimed trades whose claim has no exit
 // order created after it. These are the crash/failure window between winning
 // exit ownership and making the broker order identity durable.

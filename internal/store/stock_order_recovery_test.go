@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/stockorders"
@@ -168,6 +169,164 @@ func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 	}
 	if got := countForIntent(t, "orders", in.ID); got != 1 {
 		t.Fatalf("orders for intent = %d, want 1", got)
+	}
+}
+
+func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, key, ticker string
+	}{
+		{"software", "software-exit:%s:take-profit hit", "RINTENTSOFTEXIT"},
+		{"trailing", "trailing-market-exit:%s:3.00000000", "RINTENTTRAILEXIT"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			signalID := insertRecoverySignal(t, tc.ticker)
+			tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: tc.ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+				t.Fatalf("claim exit = %v, %v", claimed, err)
+			}
+			key := fmt.Sprintf(tc.key, tradeID)
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "accepted-" + tc.name, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			req := execution.OrderRequest{Ticker: tc.ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 3, TradeID: tradeID, IntentKey: key}
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, key)
+			broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "accepted-" + tc.name, Status: "filled", FilledPrice: 107, FilledQty: 3}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeID)
+			if err != nil || order == nil {
+				t.Fatalf("recovered exit order = %#v, %v", order, err)
+			}
+			if order.FilledQty != 3 || order.FilledPrice != 107 || order.StockIntentID != in.ID {
+				t.Fatalf("recovered exit allocation = %#v", order)
+			}
+			var qty float64
+			var status string
+			if err := store.GetDB().QueryRow(ctx, `SELECT quantity, status FROM trades WHERE id=$1::uuid`, tradeID).Scan(&qty, &status); err != nil || qty != 3 || status != "closed" {
+				t.Fatalf("recovered exit trade = qty %v status %q err %v", qty, status, err)
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := countForIntent(t, "orders", in.ID); got != 1 {
+				t.Fatalf("recovered exit rows after replay = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTANALYSTEXIT")
+	tradeA, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTANALYSTEXIT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tradeB, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTANALYSTEXIT", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	for _, tradeID := range []string{tradeA, tradeB} {
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit %s = %v, %v", tradeID, claimed, err)
+		}
+	}
+	if claimed, err := store.GetExitingTradesForSellSignal(ctx, "RINTENTANALYSTEXIT", signalID); err != nil || len(claimed) != 2 {
+		t.Fatalf("claimed aggregate exit links = %#v, %v", claimed, err)
+	}
+	key := "analyst-exit:" + signalID + ":RINTENTANALYSTEXIT"
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "accepted-aggregate-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{Ticker: "RINTENTANALYSTEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, IntentKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "accepted-aggregate-exit", Status: "filled", FilledPrice: 108, FilledQty: 5}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for tradeID, want := range map[string]float64{tradeA: 2, tradeB: 3} {
+		order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeID)
+		if err != nil || order == nil || order.FilledQty != want || order.FilledPrice != 108 {
+			t.Fatalf("aggregate allocation for %s = %#v, %v; want %v @ 108", tradeID, order, err, want)
+		}
+	}
+	var total float64
+	var rows int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(filled_qty),0) FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&rows, &total); err != nil || rows != 2 || total != 5 {
+		t.Fatalf("aggregate recovered rows=%d total=%v err=%v", rows, total, err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(filled_qty),0) FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&rows, &total); err != nil || rows != 2 || total != 5 {
+		t.Fatalf("aggregate replay rows=%d total=%v err=%v", rows, total, err)
+	}
+}
+
+func TestStockIntentRecoveryAfterTrailingCancelResubmitRepointIsClean(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTTRAILREPOINT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTTRAILREPOINT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "99999999-9999-4999-8999-999999999999", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "trail-parent", TradeID: tradeID, Ticker: "RINTENTTRAILREPOINT", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "stale-trail-stop", Ticker: "RINTENTTRAILREPOINT", Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// This models the trailing manager's cancel-confirm-resubmit fallback:
+	// the coordinator durably submits the new STOP and the manager mutates
+	// its one live order row before repointing it to that new intent.
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "fresh-trail-stop", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTTRAILREPOINT", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 95, TradeID: tradeID, IntentKey: "trailing-stop-fallback:" + tradeID}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	child := intentForKey(t, req.IntentKey)
+	if err := store.UpdateOrderStopReplacement(ctx, orderID, "stale-trail-stop", "fresh-trail-stop", 0, 2, 95, 2, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonTrailingATR}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RepointOrderStockIntent(ctx, orderID, child.ID); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "fresh-trail-stop", Status: "accepted"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var brokerID, intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil || brokerID != "fresh-trail-stop" || intentID != child.ID {
+		t.Fatalf("fallback repoint after recovery = broker %q intent %q err %v", brokerID, intentID, err)
+	}
+	if got := countForIntent(t, "orders", child.ID); got != 1 || broker.posts != 1 {
+		t.Fatalf("fallback recovery duplicated projection: rows=%d posts=%d", got, broker.posts)
 	}
 }
 
