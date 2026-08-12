@@ -756,6 +756,8 @@ type PendingExitOrder struct {
 	BrokerOrderID     string
 	Ticker            string
 	OrderStatus       string // broker order status last durably recorded in the DB
+	ParentOrderID     string // non-empty for a broker-resident bracket child
+	OrderType         string // market | limit | stop
 	TradeID           string
 	Direction         string // long | short
 	EntryPrice        float64
@@ -888,6 +890,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		  LIMIT $1
 		)
 		SELECT o.id, o.broker_order_id, o.ticker, o.status,
+		       COALESCE(o.parent_order_id,''), o.order_type,
 		       t.id, t.direction, t.entry_price, t.quantity,
 		       o.quantity, COALESCE(o.limit_price,0),
 		       COALESCE(o.stop_price,0), COALESCE(o.filled_qty,0),
@@ -930,6 +933,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 	for rows.Next() {
 		var p PendingExitOrder
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker, &p.OrderStatus,
+			&p.ParentOrderID, &p.OrderType,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
 			&p.OrderQuantity, &p.LimitPrice, &p.StopPrice,
 			&p.RecordedFill, &p.RecordedPrice, &p.RecordedFilledAt,

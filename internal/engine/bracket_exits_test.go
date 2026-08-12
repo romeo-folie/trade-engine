@@ -930,6 +930,67 @@ func TestReconcileBracket_LegsDeadWithPartial_ReducesQuantity(t *testing.T) {
 	}
 }
 
+func TestReconcileBracket_GTCDoneForDayRemainsBrokerManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "GTCDFD", 3)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		tpID: {Status: "done_for_day"},
+		slID: {Status: "done_for_day"},
+	}}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("GTC bracket legs reported done_for_day must remain broker-managed")
+	}
+	if len(exec.placed) != 0 {
+		t.Fatalf("software exit submissions = %d, want 0", len(exec.placed))
+	}
+	legs, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	for _, leg := range legs {
+		if leg.Status != "pending" {
+			t.Fatalf("GTC bracket leg %s status = %q, want pending", leg.BrokerOrderID, leg.Status)
+		}
+	}
+}
+
+func TestReconcileBrokerExit_FractionalDoneForDayTerminalizes(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "FRACDFD", Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 1.5, StopLoss: 95, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "frac-dfd", Ticker: "FRACDFD", Side: "sell",
+		OrderType: "stop", Quantity: 1.5, StopPrice: 95, Status: "pending", IsStopLoss: true,
+	}); err != nil {
+		t.Fatalf("InsertOrder: %v", err)
+	}
+	e := newBracketTestEngine(&fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"frac-dfd": {Status: "done_for_day"},
+	}})
+	if handled := e.reconcileBrokerExitTrade(ctx, getTrade(t, tradeID), false); handled {
+		t.Fatal("fractional DAY protective stop reported done_for_day must return to app-managed exits")
+	}
+	legs, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatalf("GetOrdersByTrade: %v", err)
+	}
+	if len(legs) != 1 || legs[0].Status != "cancelled" {
+		t.Fatalf("fractional DAY stop status = %+v, want cancelled", legs)
+	}
+}
+
 func TestReconcileBracket_PreviouslyAppliedPartialDoesNotCloseRemainder(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

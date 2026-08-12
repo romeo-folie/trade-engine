@@ -78,6 +78,26 @@ func standaloneStopLegs(legs []store.Order) []store.Order {
 	return out
 }
 
+// brokerManagedExitTimeInForce mirrors the stock exit submission policy.
+// Alpaca reports a resting GTC leg as done_for_day after the session; that
+// does not make the leg terminal, because it resumes on the next session.
+// Bracket children are GTC, as are whole-share protective stops. Fractional
+// protective stops are DAY-only and must retain the ordinary terminal meaning.
+func brokerManagedExitTimeInForce(parentOrderID, orderType string, isStopLoss, isTakeProfit bool, quantity float64) string {
+	if parentOrderID != "" && (isStopLoss || isTakeProfit) {
+		return "gtc"
+	}
+	if orderType == "stop" && isStopLoss && math.Abs(quantity-math.Trunc(quantity)) <= 1e-9 {
+		return "gtc"
+	}
+	return "day"
+}
+
+func normalizeBrokerExitStatus(leg store.Order, status string) string {
+	return execution.NormalizeOrderStatusForTimeInForce(status,
+		brokerManagedExitTimeInForce(leg.ParentOrderID, leg.OrderType, leg.IsStopLoss, leg.IsTakeProfit, leg.Quantity))
+}
+
 // reconcileBracketTrade books broker-side exit fills into the trades table and
 // reports whether the trade's exits are broker-resident this tick. A true
 // result means monitorPositions must not run its own price-compare exit: the
@@ -193,7 +213,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 			continue
 		}
 		states = append(states, legState{leg: leg, res: res, ok: true})
-		switch execution.NormalizeOrderStatus(res.Status) {
+		switch normalizeBrokerExitStatus(leg, res.Status) {
 		case "filled":
 			filledIdx = len(states) - 1
 		case "cancelled", "rejected":
@@ -223,7 +243,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 			remaining, _, uErr = store.ApplyPartialExitAtForBrokerOrder(
 				ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
 				fillPriceOf(s), s.res.FilledQty,
-				execution.NormalizeOrderStatus(s.res.Status), s.res.FilledAt,
+				normalizeBrokerExitStatus(s.leg, s.res.Status), s.res.FilledAt,
 			)
 			if uErr != nil {
 				if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
@@ -246,7 +266,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 			// leg is terminal before finalizing, or an OCO sibling could later
 			// over-sell the now-flat position.
 			for i := range states {
-				status := execution.NormalizeOrderStatus(states[i].res.Status)
+				status := normalizeBrokerExitStatus(states[i].leg, states[i].res.Status)
 				if states[i].ok && (status == "filled" || status == "cancelled" || status == "rejected") {
 					continue
 				}
@@ -259,7 +279,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 				if statusErr != nil {
 					return true, errors.Join(cancelErr, statusErr)
 				}
-				confirmedStatus := execution.NormalizeOrderStatus(confirmed.Status)
+				confirmedStatus := normalizeBrokerExitStatus(states[i].leg, confirmed.Status)
 				if confirmedStatus != "filled" && confirmedStatus != "cancelled" && confirmedStatus != "rejected" {
 					return true, fmt.Errorf("full cumulative bracket fill left leg %s %s after cancel: %w",
 						states[i].leg.BrokerOrderID, confirmedStatus, cancelErr)
@@ -301,7 +321,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 				remaining, _, uErr = store.ApplyPartialExitAtForBrokerOrder(
 					ctx, t.ID, s.leg.ID, s.leg.BrokerOrderID,
 					fillPriceOf(s), s.res.FilledQty,
-					execution.NormalizeOrderStatus(s.res.Status), s.res.FilledAt,
+					normalizeBrokerExitStatus(s.leg, s.res.Status), s.res.FilledAt,
 				)
 				if uErr != nil {
 					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
@@ -333,7 +353,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 				if s.ok && s.res.FilledQty == 0 {
 					if uErr := store.UpdateOrderFillForBrokerOrder(
 						ctx, s.leg.ID, s.leg.BrokerOrderID, s.res.FilledPrice, 0,
-						execution.NormalizeOrderStatus(s.res.Status),
+						normalizeBrokerExitStatus(s.leg, s.res.Status),
 					); uErr != nil {
 						if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
 							return true, nil
@@ -357,7 +377,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 				}
 				if uErr := store.UpdateOrderFillForBrokerOrder(
 					ctx, s.leg.ID, s.leg.BrokerOrderID, s.res.FilledPrice, 0,
-					execution.NormalizeOrderStatus(s.res.Status),
+					normalizeBrokerExitStatus(s.leg, s.res.Status),
 				); uErr != nil {
 					if errors.Is(uErr, store.ErrOrderBrokerIDChanged) {
 						return true, nil
@@ -472,7 +492,7 @@ func (e *Engine) closeBracketTrade(
 		if !s.ok {
 			continue
 		}
-		status := execution.NormalizeOrderStatus(s.res.Status)
+		status := normalizeBrokerExitStatus(s.leg, s.res.Status)
 		cumulativeQty := s.res.FilledQty
 		if i == filledIdx && cumulativeQty <= 0 {
 			cumulativeQty = s.leg.Quantity
@@ -674,7 +694,7 @@ func (e *Engine) cancelClaimedExitLegs(
 					"cancel_err", cancelErr, "status_err", statusErr)
 				return nil, 0, false, true
 			}
-			switch execution.NormalizeOrderStatus(res.Status) {
+			switch normalizeBrokerExitStatus(leg, res.Status) {
 			case "cancelled", "rejected":
 				if res.FilledQty > 0 {
 					fillPrice := res.FilledPrice
@@ -688,14 +708,14 @@ func (e *Engine) cancelClaimedExitLegs(
 					var err error
 					remaining, _, err = store.ApplyPartialExitAt(
 						ctx, t.ID, leg.ID, fillPrice, res.FilledQty,
-						execution.NormalizeOrderStatus(res.Status), res.FilledAt,
+						normalizeBrokerExitStatus(leg, res.Status), res.FilledAt,
 					)
 					if err != nil {
 						return nil, 0, false, false
 					}
 				} else if err := store.UpdateOrderFill(
 					ctx, leg.ID, res.FilledPrice, 0,
-					execution.NormalizeOrderStatus(res.Status),
+					normalizeBrokerExitStatus(leg, res.Status),
 				); err != nil {
 					return nil, 0, false, false
 				}
