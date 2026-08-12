@@ -30,15 +30,14 @@ func TestRuntimeOverridePrecedence(t *testing.T) {
 	}
 }
 
-func TestProtectDryRunStockExecutorOnlyWrapsStandardStockModes(t *testing.T) {
+func TestProtectDryRunStockExecutorWrapsEveryAlpacaStockMode(t *testing.T) {
 	broker := execution.NewPaperExecutor()
-	if _, ok := protectDryRunStockExecutor(broker, "paper", true).(*execution.ReadOnlyExecutor); !ok {
-		t.Fatal("standard stock dry-run did not receive read-only executor")
+	for _, mode := range []string{"manual", "auto", "paper", "orb", "orb-newyork"} {
+		if _, ok := protectDryRunStockExecutor(broker, true).(*execution.ReadOnlyExecutor); !ok {
+			t.Fatalf("%s dry-run did not receive read-only executor", mode)
+		}
 	}
-	if got := protectDryRunStockExecutor(broker, "orb", true); got != broker {
-		t.Fatal("ORB executor was changed by standard-stock dry-run protection")
-	}
-	if got := protectDryRunStockExecutor(broker, "paper", false); got != broker {
+	if got := protectDryRunStockExecutor(broker, false); got != broker {
 		t.Fatal("non-dry-run executor was changed")
 	}
 }
@@ -49,9 +48,24 @@ func (*namedExecutor) BrokerName() string { return "alpaca" }
 
 func TestBrokerNamePreservesDryRunAlpacaIdentity(t *testing.T) {
 	broker := &namedExecutor{Executor: execution.NewPaperExecutor()}
-	dryRun := protectDryRunStockExecutor(broker, "paper", true)
+	dryRun := protectDryRunStockExecutor(broker, true)
 	if got := brokerName(dryRun); got != "alpaca" {
 		t.Fatalf("brokerName(dry-run Alpaca) = %q, want alpaca", got)
+	}
+}
+
+func TestAlpacaBrokerViewSurvivesDryRunWrapping(t *testing.T) {
+	broker := execution.NewAlpacaBroker(config.StocksConfig{})
+	dryRun := protectDryRunStockExecutor(broker, true)
+	bv, ok := alpacaBrokerView(dryRun)
+	if !ok || bv == nil {
+		t.Fatal("dry-run Alpaca broker no longer supports history backfill")
+	}
+	if _, ok := any(bv).(*execution.ReadOnlyExecutor); !ok {
+		t.Fatalf("backfill view = %T, want read-only wrapped Alpaca", bv)
+	}
+	if _, ok := alpacaBrokerView(execution.NewPaperExecutor()); ok {
+		t.Fatal("non-Alpaca executor incorrectly selected for Alpaca backfill")
 	}
 }
 

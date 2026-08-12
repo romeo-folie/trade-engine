@@ -26,12 +26,11 @@ func resolveRunMode(ctx context.Context, yamlMode, cliMode string, lookup runtim
 	return mode, nil
 }
 
-func isStandardStockMode(mode string) bool {
-	return mode == "manual" || mode == "auto" || mode == "paper"
-}
-
-func protectDryRunStockExecutor(broker execution.Executor, mode string, dryRun bool) execution.Executor {
-	if dryRun && isStandardStockMode(mode) && broker != nil {
+// protectDryRunStockExecutor applies only to the shared Alpaca stock broker
+// variable. It therefore covers normal, ORB, and combined-New-York stock paths
+// without changing separately constructed IBKR brokers.
+func protectDryRunStockExecutor(broker execution.Executor, dryRun bool) execution.Executor {
+	if dryRun && broker != nil {
 		return execution.NewReadOnlyExecutor(broker)
 	}
 	return broker
@@ -46,4 +45,15 @@ func brokerName(broker execution.Executor) string {
 		return "ibkr"
 	}
 	return ""
+}
+
+// alpacaBrokerView returns the read-only BrokerView used by Alpaca history
+// backfill. It deliberately identifies the adapter through its stable name so
+// the dry-run wrapper does not disable this read-only startup work.
+func alpacaBrokerView(broker execution.Executor) (execution.BrokerView, bool) {
+	if brokerName(broker) != "alpaca" {
+		return nil, false
+	}
+	bv, ok := broker.(execution.BrokerView)
+	return bv, ok && bv != nil
 }

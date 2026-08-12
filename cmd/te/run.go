@@ -159,7 +159,7 @@ Modes:
 		if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.APIKey != "" {
 			broker = execution.NewAlpacaBroker(cfg.Markets.Stocks)
 		}
-		broker = protectDryRunStockExecutor(broker, mode, runDryRun || cfg.Engine.DryRun)
+		broker = protectDryRunStockExecutor(broker, runDryRun || cfg.Engine.DryRun)
 		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
 
 		// Tag portfolio snapshots with mode (live/paper) and broker name (Phase 18).
@@ -187,7 +187,7 @@ Modes:
 				go poller.Run(ctx)
 			}
 		}
-		if alpacaBroker, ok := broker.(*execution.AlpacaBroker); ok && alpacaBroker != nil {
+		if alpacaBroker, ok := alpacaBrokerView(broker); ok {
 			// One-time backfill runs in background; skips gracefully if DB unavailable.
 			go portfolio.Backfill(ctx, alpacaBroker, portfolioMode, portfolioBroker)
 		}

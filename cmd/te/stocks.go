@@ -56,14 +56,17 @@ func runStocksPreflight(_ *cobra.Command, _ []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	// DB availability must not consume the account API's timeout budget. Connect
+	// is globally synchronized and cleans up a failed candidate itself, so use a
+	// bounded independent context before creating the broker request context.
+	dbCtx, cancelDB := context.WithTimeout(context.Background(), 5*time.Second)
 	var lookup runtimeOverrideLookup
-	if err := store.Connect(ctx); err == nil {
+	if err := store.Connect(dbCtx); err == nil {
 		defer store.Close()
 		lookup = store.GetOverride
 	}
-	mode, err := resolveRunMode(ctx, cfg.Engine.Mode, "", lookup)
+	cancelDB()
+	mode, err := resolveRunMode(context.Background(), cfg.Engine.Mode, "", lookup)
 	if err != nil {
 		return err
 	}
@@ -80,6 +83,8 @@ func runStocksPreflight(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("Alpaca credentials are required; set %s and %s", cfg.Markets.Stocks.APIKeyEnv, cfg.Markets.Stocks.SecretEnv)
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	result, err := preflightStockAccount(ctx, cfg.Markets.Stocks, execution.NewAlpacaBroker(cfg.Markets.Stocks))
 	if err != nil {
 		return err
