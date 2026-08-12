@@ -913,6 +913,8 @@ Modes:
 				)
 				mscanner := &scanner.MarketScanner{
 					AlpacaClient:                 alpacaClient,
+					StockAssets:                  universeProvider,
+					StockSnapshots:               universeProvider,
 					DailyBars:                    universeProvider,
 					Analyzer:                     scanAnalyzer,
 					News:                         newsProvider,

@@ -1,13 +1,36 @@
 package scanner
 
 import (
+	"context"
+	"errors"
 	"math"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/data"
 )
+
+type politicalAssetProvider struct {
+	assets []data.StockAsset
+	err    error
+}
+
+func (p politicalAssetProvider) FetchStockAssets(context.Context) ([]data.StockAsset, error) {
+	return p.assets, p.err
+}
+
+type politicalSnapshotProvider struct {
+	result data.StockSnapshotBatchResult
+	err    error
+}
+
+func (p politicalSnapshotProvider) FetchStockSnapshots(
+	context.Context, []string, int,
+) (data.StockSnapshotBatchResult, error) {
+	return p.result, p.err
+}
 
 func TestMergePoliticalDisclosureCandidateCarriesEvidenceIntoPrompt(t *testing.T) {
 	existing := []SwingCandidate{{Ticker: "MSFT", Sources: []string{"mover"}}}
@@ -36,6 +59,65 @@ func TestStandaloneDisclosurePromptDoesNotInventMarketData(t *testing.T) {
 	_, prompt := BuildSwingPrompt(SwingCandidate{Ticker: "MSFT", Sources: []string{"political_disclosure"}}, .65)
 	if strings.Contains(prompt, "Price:        0.00") || !strings.Contains(prompt, "Market data:  unavailable") {
 		t.Fatalf("prompt = %s", prompt)
+	}
+}
+
+func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
+	daily := data.Candle{Close: 25, Volume: 100_000}
+	previous := data.Candle{Close: 20, Volume: 90_000}
+	scanner := &MarketScanner{
+		StockAssets: politicalAssetProvider{assets: []data.StockAsset{{
+			Symbol: "GOOD", Status: "active", AssetClass: "us_equity", Tradable: true,
+		}}},
+		StockSnapshots: politicalSnapshotProvider{result: data.StockSnapshotBatchResult{
+			Snapshots: map[string]data.StockSnapshotEvidence{
+				"GOOD": {Symbol: "GOOD", LatestTradePrice: 25, DailyBar: &daily, PreviousDailyBar: &previous},
+			},
+			Failures: map[string]error{},
+		}},
+	}
+	candidate := SwingCandidate{
+		Ticker: "GOOD", Sources: []string{"political_disclosure"},
+		SourceScores:                  map[string]float64{"political_disclosure": .8},
+		PoliticalDisclosureClaimToken: "claim", PoliticalDisclosureClaimCount: 2,
+		PoliticalDisclosureEvidence: "two filings", PoliticalDisclosureScore: .8,
+	}
+	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{candidate})
+	if len(got) != 1 || got[0].Price != 25 || got[0].Volume != 100_000 ||
+		got[0].DollarVolume != 2_500_000 || got[0].ChangePct != 25 {
+		t.Fatalf("hydrated = %+v", got)
+	}
+	claims := scannerSourcePromotionClaims(got[0])
+	if claims.PoliticalDisclosure == nil || claims.PoliticalDisclosure.ReportCount != 2 {
+		t.Fatalf("promotion claims = %+v", claims.PoliticalDisclosure)
+	}
+
+	bad := candidate
+	bad.Ticker = "IRA"
+	if got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{bad}); len(got) != 0 {
+		t.Fatalf("non-tradeable standalone candidate survived: %+v", got)
+	}
+}
+
+func TestPoliticalMarketProviderFailurePreservesOrdinaryCandidate(t *testing.T) {
+	scanner := &MarketScanner{
+		StockAssets:    politicalAssetProvider{err: errors.New("asset service unavailable")},
+		StockSnapshots: politicalSnapshotProvider{},
+	}
+	ordinary := SwingCandidate{Ticker: "GOOD", Price: 25, Volume: 100_000, Sources: []string{"mover"}}
+	disclosure := SwingCandidate{
+		Ticker: "GOOD", Sources: []string{"political_disclosure"},
+		SourceScores:                  map[string]float64{"political_disclosure": .8},
+		PoliticalDisclosureClaimToken: "claim", PoliticalDisclosureClaimCount: 1,
+		PoliticalDisclosureEvidence: "filing", PoliticalDisclosureScore: .8,
+	}
+	merged := mergePoliticalDisclosureCandidates([]SwingCandidate{ordinary}, []SwingCandidate{disclosure})
+	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), merged)
+	if len(got) != 1 || !hasSource(got[0].Sources, "mover") ||
+		hasSource(got[0].Sources, "political_disclosure") ||
+		got[0].PoliticalDisclosureClaimToken != "" || got[0].PoliticalDisclosureClaimCount != 0 ||
+		got[0].PoliticalDisclosureScore != 0 {
+		t.Fatalf("fallback = %+v", got)
 	}
 }
 

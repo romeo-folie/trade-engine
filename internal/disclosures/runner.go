@@ -193,11 +193,11 @@ func (r *Runner) syncHouse(
 		if processed >= limit || ctx.Err() != nil {
 			break
 		}
-		completed, err := store.PoliticalDisclosureReportCompleted(ctx, "house", filing.DocumentID)
+		terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "house", filing.DocumentID)
 		if err != nil {
 			return processed, err
 		}
-		if completed {
+		if terminal {
 			continue
 		}
 		processed++
@@ -256,11 +256,11 @@ func (r *Runner) syncSenate(
 			if processed >= limit || ctx.Err() != nil {
 				break
 			}
-			completed, err := store.PoliticalDisclosureReportCompleted(ctx, "senate", filing.ExternalID)
+			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "senate", filing.ExternalID)
 			if err != nil {
 				return processed, err
 			}
-			if completed {
+			if terminal {
 				continue
 			}
 			processed++
@@ -306,11 +306,11 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			if processed >= limit || ctx.Err() != nil {
 				break
 			}
-			completed, err := store.PoliticalDisclosureReportCompleted(ctx, "oge", filing.ExternalID)
+			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "oge", filing.ExternalID)
 			if err != nil {
 				return processed, err
 			}
-			if completed {
+			if terminal {
 				continue
 			}
 			processed++

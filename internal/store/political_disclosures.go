@@ -186,19 +186,23 @@ func GetPoliticalDisclosureReport(
 	return &report, rows.Err()
 }
 
-func PoliticalDisclosureReportCompleted(
+// PoliticalDisclosureReportTerminal reports whether a filing has reached a
+// durable extraction disposition. Failed filings remain visible for manual
+// review but are not retried on every sync, where they could otherwise consume
+// the bounded work budget forever and starve older filings.
+func PoliticalDisclosureReportTerminal(
 	ctx context.Context, source, externalID string,
 ) (bool, error) {
-	var completed bool
+	var terminal bool
 	err := GetDB().QueryRow(ctx, `
-		SELECT extraction_status IN ('completed', 'no_text')
+		SELECT extraction_status IN ('completed', 'no_text', 'failed')
 		FROM political_disclosure_reports
 		WHERE source=$1 AND external_id=$2`, source, externalID,
-	).Scan(&completed)
+	).Scan(&terminal)
 	if IsNoRows(err) {
 		return false, nil
 	}
-	return completed, err
+	return terminal, err
 }
 
 // SavePoliticalDisclosureReport replaces extracted child evidence atomically.

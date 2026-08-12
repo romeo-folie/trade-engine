@@ -122,11 +122,12 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 		if d.IsZero() {
 			d, _ = time.Parse("2006-01-02", row.DocDate)
 		}
-		if d.Before(since) {
+		filingDay := disclosureCalendarDay(d)
+		if filingDay.Before(disclosureCalendarDay(since)) {
 			beforeRange = true
 			continue
 		}
-		if d.After(until) {
+		if filingDay.After(disclosureCalendarDay(until)) {
 			continue
 		}
 		sum := sha256.Sum256([]byte(link))
@@ -135,6 +136,12 @@ func (c *OGEClient) ListFilingsPage(ctx context.Context, since, until time.Time,
 	}
 	return OGEFilingPage{Filings: out, RowCount: len(raw.Data), Total: raw.RecordsTotal, BeforeRange: beforeRange}, nil
 }
+
+func disclosureCalendarDay(value time.Time) time.Time {
+	year, month, day := value.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, time.UTC)
+}
+
 func (c *OGEClient) FetchPDF(ctx context.Context, f OGEFiling) ([]byte, error) {
 	const maxPDFSize = 25 << 20
 	if err := c.pacer.Wait(ctx, c.RequestDelay); err != nil {

@@ -71,6 +71,16 @@ func (c *SenateClient) ListPTRs(
 		}
 		return parseSenateSearchResponse(c.BaseURL, body)
 	}
+	body, err := c.searchPTRsHTTP(ctx, since, until, 0, maxReports)
+	if err != nil {
+		return nil, err
+	}
+	return parseSenateSearchResponse(c.BaseURL, body)
+}
+
+func (c *SenateClient) searchPTRsHTTP(
+	ctx context.Context, since, until time.Time, start, length int,
+) ([]byte, error) {
 	token := ""
 	var err error
 	if c.UseImportedSession {
@@ -86,8 +96,8 @@ func (c *SenateClient) ListPTRs(
 	}
 	form := url.Values{
 		"csrfmiddlewaretoken":  {token},
-		"start":                {"0"},
-		"length":               {strconv.Itoa(maxReports)},
+		"start":                {strconv.Itoa(start)},
+		"length":               {strconv.Itoa(length)},
 		"report_types":         {"[11]"},
 		"filer_types":          {"[]"},
 		"submitted_start_date": {since.Format("01/02/2006") + " 00:00:00"},
@@ -98,11 +108,7 @@ func (c *SenateClient) ListPTRs(
 		"first_name":           {""},
 		"last_name":            {""},
 	}
-	body, err := c.postForm(ctx, c.BaseURL+"/search/report/data/", form, token)
-	if err != nil {
-		return nil, err
-	}
-	return parseSenateSearchResponse(c.BaseURL, body)
+	return c.postForm(ctx, c.BaseURL+"/search/report/data/", form, token)
 }
 
 type SenateFilingPage struct {
@@ -116,20 +122,7 @@ func (c *SenateClient) ListPTRPage(ctx context.Context, since, until time.Time, 
 	if c.Transport != nil {
 		body, err = c.Transport.SearchPTRs(ctx, since, until, start, length)
 	} else {
-		// The HTTP fallback retains the existing agreement/session setup and is
-		// uncommon in production; request the prefix and slice the requested page.
-		var all []SenateFiling
-		all, err = c.ListPTRs(ctx, since, until, start+length)
-		if err == nil {
-			if start >= len(all) {
-				return SenateFilingPage{Total: len(all)}, nil
-			}
-			end := start + length
-			if end > len(all) {
-				end = len(all)
-			}
-			return SenateFilingPage{Filings: all[start:end], RowCount: end - start, Total: len(all)}, nil
-		}
+		body, err = c.searchPTRsHTTP(ctx, since, until, start, length)
 	}
 	if err != nil {
 		return SenateFilingPage{}, err

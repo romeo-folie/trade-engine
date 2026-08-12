@@ -72,6 +72,7 @@ type SwingCandidate struct {
 	// PoliticalDisclosureClaimToken fences all pending filing rows for this
 	// ticker that were claimed by the current scanner cycle.
 	PoliticalDisclosureClaimToken string
+	PoliticalDisclosureClaimCount int
 	PoliticalDisclosureEvidence   string
 	PoliticalDisclosureScore      float64
 	politicalDisclosureFallback   *SwingCandidate

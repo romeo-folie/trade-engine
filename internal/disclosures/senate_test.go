@@ -165,6 +165,43 @@ func TestSenateClientImportedBrowserSessionSkipsConsent(t *testing.T) {
 	}
 }
 
+func TestSenateClientImportedSessionPagePreservesServerTotal(t *testing.T) {
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		body, _ := io.ReadAll(req.Body)
+		values, _ := url.ParseQuery(string(body))
+		if values.Get("start") != "100" || values.Get("length") != "50" {
+			t.Fatalf("pagination form = %v", values)
+		}
+		return response(req, 200, `{"recordsFiltered":250,"data":[["Jane","Senator","Office","<a href='/search/view/ptr/page-123/'>PTR</a>","07/05/2026"]]}`, nil), nil
+	})
+	client, err := NewSenateClient("https://efdsearch.senate.gov", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTP.Transport = transport
+	cookies, err := ParseSenateBrowserCookies([]byte(`[
+		{"domain":"efdsearch.senate.gov","name":"csrftoken","value":"csrf-value","path":"/","secure":true},
+		{"domain":"efdsearch.senate.gov","name":"sessionid","value":"session-value","path":"/","secure":true}
+	]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.ImportBrowserSession(cookies, "Fixture Browser/1.0"); err != nil {
+		t.Fatal(err)
+	}
+	page, err := client.ListPTRPage(
+		context.Background(), time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC),
+		time.Date(2026, 8, 8, 0, 0, 0, 0, time.UTC), 100, 50,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Total != 250 || page.RowCount != 1 || len(page.Filings) != 1 ||
+		page.Filings[0].ExternalID != "page-123" {
+		t.Fatalf("page = %+v", page)
+	}
+}
+
 func TestSenateClientUsesBrowserTransport(t *testing.T) {
 	transport := &fixtureSenateTransport{
 		searchBody: []byte(`{"data":[["Jane","Senator","Office","<a href='/search/view/ptr/browser-123/'>PTR</a>","07/05/2026"]]}`),

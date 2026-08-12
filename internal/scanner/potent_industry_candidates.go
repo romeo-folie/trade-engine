@@ -209,7 +209,9 @@ func candidateAfterPromotionClaimLoss(
 		fallback.Sources = withoutSource(fallback.Sources, "political_disclosure")
 		delete(fallback.SourceScores, "political_disclosure")
 		fallback.PoliticalDisclosureClaimToken = ""
+		fallback.PoliticalDisclosureClaimCount = 0
 		fallback.PoliticalDisclosureEvidence = ""
+		fallback.PoliticalDisclosureScore = 0
 		fallback.politicalDisclosureFallback = nil
 		return fallback, len(fallback.Sources) > 0
 	default:
@@ -332,6 +334,7 @@ func scannerSourcePromotionClaims(
 	if candidate.PoliticalDisclosureClaimToken != "" {
 		claims.PoliticalDisclosure = &store.PoliticalDisclosurePromotionClaim{
 			Ticker: candidate.Ticker, Token: candidate.PoliticalDisclosureClaimToken,
+			ReportCount: candidate.PoliticalDisclosureClaimCount,
 		}
 	}
 	return claims

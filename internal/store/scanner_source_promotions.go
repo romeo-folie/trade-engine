@@ -47,8 +47,9 @@ type PremarketEpisodicPromotionClaim struct {
 }
 
 type PoliticalDisclosurePromotionClaim struct {
-	Ticker string
-	Token  string
+	Ticker      string
+	Token       string
+	ReportCount int
 }
 
 type ScannerSourcePromotionClaims struct {
@@ -146,7 +147,8 @@ func promoteScannerSourcesToWatchlist(
 	}
 	if claims.PoliticalDisclosure != nil &&
 		(claims.PoliticalDisclosure.Ticker != item.Ticker ||
-			strings.TrimSpace(claims.PoliticalDisclosure.Token) == "") {
+			strings.TrimSpace(claims.PoliticalDisclosure.Token) == "" ||
+			claims.PoliticalDisclosure.ReportCount <= 0) {
 		return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
 	}
 
@@ -272,10 +274,10 @@ func promoteScannerSourcesToWatchlist(
 		if err != nil {
 			return fmt.Errorf("lock political disclosure promotion: %w", err)
 		}
-		found := false
+		found := 0
 		valid := true
 		for rows.Next() {
-			found = true
+			found++
 			var token, status string
 			if err := rows.Scan(&token, &status); err != nil {
 				rows.Close()
@@ -288,7 +290,7 @@ func promoteScannerSourcesToWatchlist(
 		if err != nil {
 			return err
 		}
-		if !found || !valid {
+		if found != claim.ReportCount || !valid {
 			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 		}
 	}
@@ -403,7 +405,7 @@ func completeScannerSourcePromotionClaims(
 		if err != nil {
 			return fmt.Errorf("complete political disclosure watchlist promotion: %w", err)
 		}
-		if tag.RowsAffected() == 0 {
+		if tag.RowsAffected() != int64(claim.ReportCount) {
 			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 		}
 	}

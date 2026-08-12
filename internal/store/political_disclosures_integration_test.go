@@ -58,9 +58,9 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		detail.Transactions[0].Ticker != "TESTDISC" {
 		t.Fatalf("detail = %+v", detail)
 	}
-	completed, err := store.PoliticalDisclosureReportCompleted(ctx, report.Source, report.ExternalID)
-	if err != nil || !completed {
-		t.Fatalf("completed=%v err=%v", completed, err)
+	terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+	if err != nil || !terminal {
+		t.Fatalf("terminal=%v err=%v", terminal, err)
 	}
 	report2 := report
 	report2.ExternalID = "test-disclosure-claim-2"
@@ -85,12 +85,40 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		t.Fatalf("claimed = %+v", claimed)
 	}
 	item := store.WatchlistItem{Ticker: "TESTDISC", Platform: "stock", Strategies: []string{"political_disclosure"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
-	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "stale-token"}}, "stale", now)
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "stale-token", ReportCount: 2}}, "stale", now)
 	var claimErr *store.ScannerSourcePromotionClaimError
 	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
 		t.Fatalf("stale claim error = %v", err)
 	}
-	if err := store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token"}}, "fixture success", now); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='superseded', promotion_claim_token=NULL,
+			promotion_claimed_at=NULL
+		WHERE report_id=$1 AND ticker=$2`, claimed[0].ReportID, "TESTDISC"); err != nil {
+		t.Fatal(err)
+	}
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportCount: 2}}, "incomplete set", now)
+	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
+		t.Fatalf("incomplete multi-report claim error = %v", err)
+	}
+	var stillProcessing int
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT count(*) FROM political_disclosure_candidates
+		WHERE ticker=$1 AND promotion_status='processing'
+		  AND promotion_claim_token=$2`, "TESTDISC", "claim-token").Scan(&stillProcessing); err != nil {
+		t.Fatal(err)
+	}
+	if stillProcessing != 1 {
+		t.Fatalf("remaining processing rows after rollback = %d", stillProcessing)
+	}
+	if _, err := store.GetDB().Exec(ctx, `
+		UPDATE political_disclosure_candidates
+		SET promotion_status='processing', promotion_claim_token=$3,
+			promotion_claimed_at=$4
+		WHERE report_id=$1 AND ticker=$2`, claimed[0].ReportID, "TESTDISC", "claim-token", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportCount: 2}}, "fixture success", now); err != nil {
 		t.Fatal(err)
 	}
 	var promoted int
@@ -119,5 +147,29 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 	}
 	if len(again) != 0 {
 		t.Fatalf("terminal candidate was reclaimed: %+v", again)
+	}
+}
+
+func TestFailedPoliticalDisclosureReportIsTerminalForAutomaticSync(t *testing.T) {
+	ctx := context.Background()
+	report := store.PoliticalDisclosureReport{
+		Source: "oge", ExternalID: "test-terminal-failed-disclosure",
+		Chamber: "executive", FilerName: "Test Official",
+		ReportType: "periodic_transaction", FilingDate: time.Now().UTC(),
+		DocumentURL:      "https://example.test/failed.pdf",
+		ExtractionStatus: "failed", ExtractionError: "fixture extraction error",
+		RawMetadata: json.RawMessage(`{"fixture":true}`),
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(),
+			"DELETE FROM political_disclosure_reports WHERE source=$1 AND external_id=$2",
+			report.Source, report.ExternalID)
+	})
+	if err := store.SavePoliticalDisclosureReport(ctx, report); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := store.PoliticalDisclosureReportTerminal(ctx, report.Source, report.ExternalID)
+	if err != nil || !terminal {
+		t.Fatalf("terminal=%v err=%v", terminal, err)
 	}
 }

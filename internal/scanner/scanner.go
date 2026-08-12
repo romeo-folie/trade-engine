@@ -61,6 +61,8 @@ type Notifier interface {
 // watchlist of scanner-sourced tickers.
 type MarketScanner struct {
 	AlpacaClient    *data.AlpacaClient
+	StockAssets     data.AssetUniverseProvider
+	StockSnapshots  data.BulkStockSnapshotProvider
 	Analyzer        *analysis.Analyzer
 	News            data.NewsProvider
 	Fundamentals    CompanyFundamentalsProvider
@@ -297,6 +299,7 @@ func (s *MarketScanner) runScan(ctx context.Context) (scanErr error) {
 	candidates = mergePotentIndustryCandidates(candidates, industryCandidates)
 	candidates = mergePremarketEpisodicCandidates(candidates, premarketCandidates)
 	candidates = mergePoliticalDisclosureCandidates(candidates, politicalCandidates)
+	candidates = s.hydratePoliticalDisclosureMarketData(ctx, candidates)
 	promotionCapActive := s.Cfg.PromotionMaxPerIndustry > 0
 	if promotionCapActive {
 		if strings.TrimSpace(recorder.run.UniverseVersionID) == "" || !store.IsConnected() {
