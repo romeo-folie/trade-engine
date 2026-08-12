@@ -1009,6 +1009,99 @@ func TestStockIntentRecoveryProjectsTerminalMarketExitFills(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryReleasesTerminalZeroFillSingleMarketExit(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTZEROEXIT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTZEROEXIT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+		t.Fatalf("claim exit=%v err=%v", claimed, err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "zero-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTZEROEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 3, TradeID: tradeID, IntentKey: "software-exit:" + tradeID + ":zero"}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "zero-exit", Status: "cancelled"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeID)
+	if err != nil || order == nil || order.Status != "cancelled" || order.FilledQty != 0 {
+		t.Fatalf("terminal zero exit projection=%#v err=%v", order, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "open" || trade.ExitReason != "" {
+		t.Fatalf("terminal zero exit claim=%#v err=%v, want released open trade", trade, err)
+	}
+	if _, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, req.IntentKey); err != nil || retryKey == req.IntentKey {
+		t.Fatalf("resolve terminal zero exit retry=%q err=%v", retryKey, err)
+	}
+	beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+		t.Fatal("terminal zero single exit replayed lookup or attempt")
+	}
+}
+
+func TestStockIntentRecoveryReleasesTerminalZeroFillAggregateMarketExit(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTZEROAGGEXIT"
+	signalID := insertRecoverySignal(t, ticker)
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	var tradeIDs []string
+	for _, qty := range []float64{2, 3} {
+		tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: qty})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit=%v err=%v", claimed, err)
+		}
+		tradeIDs = append(tradeIDs, tradeID)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "zero-aggregate-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, IntentKey: "analyst-exit:" + signalID + ":" + ticker}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "zero-aggregate-exit", Status: "rejected"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, tradeID := range tradeIDs {
+		order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeID)
+		if err != nil || order == nil || order.Status != "rejected" || order.FilledQty != 0 {
+			t.Fatalf("terminal zero aggregate projection for %s=%#v err=%v", tradeID, order, err)
+		}
+		trade, err := store.GetTradeByID(ctx, tradeID)
+		if err != nil || trade == nil || trade.Status != "open" || trade.ExitReason != "" {
+			t.Fatalf("terminal zero aggregate claim for %s=%#v err=%v", tradeID, trade, err)
+		}
+	}
+	beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+		t.Fatal("terminal zero aggregate exit replayed lookup or attempt")
+	}
+}
+
 func TestStockIntentRecoveryProjectsTerminalAggregateMarketExitFills(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{"cancelled", "rejected"} {
@@ -1703,6 +1796,10 @@ func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing
 	order, err := store.GetOrderByStockIntentID(ctx, in.ID)
 	if err != nil || order == nil || order.Status != "cancelled" {
 		t.Fatalf("terminal zero order = %#v, %v", order, err)
+	}
+	var signalStatus string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM signals WHERE id=$1::uuid`, signalID).Scan(&signalStatus); err != nil || signalStatus != "rejected" {
+		t.Fatalf("terminal zero entry signal status=%q err=%v, want rejected", signalStatus, err)
 	}
 }
 

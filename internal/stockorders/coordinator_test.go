@@ -1,9 +1,38 @@
 package stockorders
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+type unavailableStoreBroker struct{ mutations int }
+
+func (b *unavailableStoreBroker) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+	b.mutations++
+	return execution.OrderResult{}, nil
+}
+func (b *unavailableStoreBroker) CancelOrder(context.Context, string) error {
+	b.mutations++
+	return nil
+}
+func (b *unavailableStoreBroker) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, nil
+}
+func (*unavailableStoreBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*unavailableStoreBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (b *unavailableStoreBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	b.mutations++
+	return execution.OrderResult{}, nil
+}
 
 func TestClientIDForKeyIsDeterministicAndBounded(t *testing.T) {
 	first := clientIDForKey("entry:signal-123")
@@ -15,6 +44,30 @@ func TestClientIDForKeyIsDeterministicAndBounded(t *testing.T) {
 	}
 	if !strings.HasPrefix(first, clientIDPrefix) || len(first) > 128 {
 		t.Fatalf("client id %q is not a valid bounded Alpaca key", first)
+	}
+}
+
+func TestCoordinatorFailsClosedWithoutDurableStore(t *testing.T) {
+	if store.IsConnected() {
+		t.Skip("requires disconnected store")
+	}
+	broker := &unavailableStoreBroker{}
+	coordinator := New(broker)
+	ctx := context.Background()
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{IntentKey: "entry:no-db"}); !errors.Is(err, ErrDurableStoreUnavailable) {
+		t.Fatalf("PlaceOrder error=%v, want durable-store error", err)
+	}
+	if err := coordinator.CancelOrder(ctx, "stock-order"); !errors.Is(err, ErrDurableStoreUnavailable) {
+		t.Fatalf("CancelOrder error=%v, want durable-store error", err)
+	}
+	if _, err := coordinator.ReplaceStopOrder(ctx, "stock-order", 99); !errors.Is(err, ErrDurableStoreUnavailable) {
+		t.Fatalf("ReplaceStopOrder error=%v, want durable-store error", err)
+	}
+	if err := coordinator.Recover(ctx); !errors.Is(err, ErrDurableStoreUnavailable) {
+		t.Fatalf("Recover error=%v, want durable-store error", err)
+	}
+	if broker.mutations != 0 {
+		t.Fatalf("durable-store failure mutated broker %d times", broker.mutations)
 	}
 }
 

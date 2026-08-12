@@ -2500,6 +2500,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
+		if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			if updateErr := store.UpdateSignalStatus(ctx, sigID, "rejected", "entry order terminal zero-fill without a broker fill"); updateErr != nil {
+				logger.Warn("reject terminal zero-fill entry signal", "ticker", sig.Ticker, "err", updateErr)
+			}
+		}
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
 	}

@@ -21,6 +21,12 @@ import (
 
 const clientIDPrefix = "te-stock-"
 
+// ErrDurableStoreUnavailable prevents a standard-stock broker mutation when
+// its pre-submit intent cannot be made durable. The engine may still start in
+// read-only/degraded mode without a database; it must never bypass this guard
+// and place an untracked stock order.
+var ErrDurableStoreUnavailable = errors.New("stockorders: durable store unavailable")
+
 // Coordinator is an execution.Executor that persists a pre-submit intent and
 // uses Alpaca's client_order_id lookup before any replay after an ambiguous
 // response. It is intentionally installed inside ReadOnlyExecutor, so dry-run
@@ -28,6 +34,13 @@ const clientIDPrefix = "te-stock-"
 type Coordinator struct{ inner execution.Executor }
 
 func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inner} }
+
+func requireDurableStore() error {
+	if !store.IsConnected() {
+		return ErrDurableStoreUnavailable
+	}
+	return nil
+}
 
 // DurableStockOrderIntents marks this executor for callers that must not
 // continue with a legacy, unlinked projection when the post-submit intent
@@ -42,6 +55,9 @@ func (c *Coordinator) BrokerName() string {
 }
 
 func (c *Coordinator) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	if err := requireDurableStore(); err != nil {
+		return execution.OrderResult{}, err
+	}
 	if req.IntentKey == "" {
 		return execution.OrderResult{}, errors.New("standard stock order missing durable intent key")
 	}
@@ -195,6 +211,9 @@ func (c *Coordinator) projectBracketChildren(ctx context.Context, parent store.S
 // Recover replays nonterminal persisted intents using their exact stored
 // payload and same client id. Callers run it before normal reconciliation.
 func (c *Coordinator) Recover(ctx context.Context) error {
+	if err := requireDurableStore(); err != nil {
+		return err
+	}
 	ctx = context.WithValue(ctx, recoveryContextKey{}, true)
 	intents, err := store.ListRecoverableStockOrderIntents(ctx)
 	if err != nil {
@@ -366,6 +385,15 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 		return err
 	}
 	if allocatedFill <= 0 {
+		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+			status := execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
+			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, status); err != nil {
+				return fmt.Errorf("terminalize recovered zero-fill market exit projection: %w", err)
+			}
+			if err := store.ReleaseTradeExitClaim(ctx, tradeID); err != nil {
+				return fmt.Errorf("release recovered zero-fill market exit claim: %w", err)
+			}
+		}
 		return nil
 	}
 	if res.FilledPrice <= 0 {
@@ -492,17 +520,21 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
 		return nil
 	}
-	if res.FilledQty <= 0 {
-		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
-			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)); err != nil {
-				return fmt.Errorf("terminalize recovered zero-fill entry projection: %w", err)
-			}
-		}
-		return nil
-	}
 	signalID := strings.TrimPrefix(intent.IdempotencyKey, "entry:")
 	if signalID == "" || strings.Contains(signalID, ":") {
 		return fmt.Errorf("invalid stock entry intent key %q", intent.IdempotencyKey)
+	}
+	if res.FilledQty <= 0 {
+		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+			status := execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
+			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, status); err != nil {
+				return fmt.Errorf("terminalize recovered zero-fill entry projection: %w", err)
+			}
+			if err := store.UpdateSignalStatus(ctx, signalID, "rejected", "entry order "+status+" without fill"); err != nil {
+				return fmt.Errorf("reject recovered zero-fill entry signal: %w", err)
+			}
+		}
+		return nil
 	}
 	sig, err := store.GetSignalByID(ctx, signalID)
 	if err != nil {
@@ -735,6 +767,9 @@ func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent,
 }
 
 func (c *Coordinator) CancelOrder(ctx context.Context, id string) error {
+	if err := requireDurableStore(); err != nil {
+		return err
+	}
 	return c.inner.CancelOrder(ctx, id)
 }
 func (c *Coordinator) GetOrderStatus(ctx context.Context, id string) (execution.OrderResult, error) {
@@ -782,6 +817,9 @@ func (c *Coordinator) GetWorkingOrders(ctx context.Context) ([]execution.Working
 	return l.GetWorkingOrders(ctx)
 }
 func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float64) (execution.OrderResult, error) {
+	if err := requireDurableStore(); err != nil {
+		return execution.OrderResult{}, err
+	}
 	predecessor, err := store.GetStockOrderIntentByBrokerOrderID(ctx, id)
 	if err != nil {
 		return execution.OrderResult{}, err
