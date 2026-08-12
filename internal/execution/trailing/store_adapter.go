@@ -69,6 +69,31 @@ func (liveStore) LinkReplacementOrderIntent(ctx context.Context, orderID, broker
 	return store.RepointOrderStockIntentAndSupersede(ctx, orderID, intent.ID)
 }
 
+// UpdateOrderStopReplacementAndLinkIntent commits the fallback replacement's
+// mutable order state and durable intent lineage as one unit.
+func (liveStore) UpdateOrderStopReplacementAndLinkIntent(
+	ctx context.Context,
+	orderID, expectedBrokerOrderID, newBrokerOrderID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string, filledPrice, filledQty float64, filledAt time.Time,
+	intent store.ExitIntent,
+) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	replacement, err := store.GetStockOrderIntentByBrokerOrderID(ctx, newBrokerOrderID)
+	if err != nil {
+		return err
+	}
+	if replacement == nil {
+		return fmt.Errorf("replacement intent for broker order %s not found", newBrokerOrderID)
+	}
+	return store.UpdateOrderStopReplacementAndSupersede(ctx,
+		orderID, expectedBrokerOrderID, newBrokerOrderID, replacement.ID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent)
+}
+
 func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	if !store.IsConnected() {
 		// Empty result + nil error: UpdateAll iterates zero trades, logs

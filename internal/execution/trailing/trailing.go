@@ -856,21 +856,12 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 							"trade_id", t.ID, "broker_order_id", res.BrokerOrderID)
 					}
 				}
-				if persistErr := m.store.UpdateOrderStopReplacement(
-					ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, t.Quantity, newStop, existing.Quantity,
-					status, fillPrice, fillQty, res.FilledAt, intent,
-				); persistErr != nil {
+				if persistErr := m.persistStopReplacement(ctx, existing, res.BrokerOrderID, t.Quantity, newStop, existing.Quantity,
+					status, fillPrice, fillQty, res.FilledAt, intent); persistErr != nil {
 					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, "", intent); rollbackErr != nil {
 						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
 					}
 					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
-				}
-				if linker, ok := m.store.(interface {
-					LinkReplacementOrderIntent(context.Context, string, string) error
-				}); ok {
-					if err := linker.LinkReplacementOrderIntent(ctx, existing.ID, res.BrokerOrderID); err != nil {
-						return fmt.Errorf("link replacement stop intent: %w", err)
-					}
 				}
 				if fillObserved {
 					return errStopFilledDuringRollback
@@ -966,21 +957,12 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 
 	if existing != nil {
 		// Repoint the existing row at the freshly-submitted broker id.
-		if err := m.store.UpdateOrderStopReplacement(
-			ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, t.Quantity, newStop, t.Quantity,
-			status, fillPrice, fillQty, res.FilledAt, intent,
-		); err != nil {
+		if err := m.persistStopReplacement(ctx, existing, res.BrokerOrderID, t.Quantity, newStop, t.Quantity,
+			status, fillPrice, fillQty, res.FilledAt, intent); err != nil {
 			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, "", intent); rollbackErr != nil {
 				return fmt.Errorf("persist replacement stop: %w; rollback: %v", err, rollbackErr)
 			}
 			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
-		}
-		if linker, ok := m.store.(interface {
-			LinkReplacementOrderIntent(context.Context, string, string) error
-		}); ok {
-			if err := linker.LinkReplacementOrderIntent(ctx, existing.ID, res.BrokerOrderID); err != nil {
-				return fmt.Errorf("link fallback replacement intent: %w", err)
-			}
 		}
 		if fillObserved {
 			return errStopFilledDuringRollback
@@ -1045,6 +1027,42 @@ func (m *Manager) resolveTerminalStopIntentKey(ctx context.Context, key string) 
 		return "", errors.New("terminal trailing intent has no retry generation key")
 	}
 	return retryKey, nil
+}
+
+// persistStopReplacement uses the store's combined durable write when it is
+// available. The production adapter atomically advances broker state, mutable
+// projection linkage, and predecessor intent retirement; lightweight stores
+// retain the compatibility two-step used by non-durable tests.
+func (m *Manager) persistStopReplacement(
+	ctx context.Context,
+	existing *store.Order,
+	newBrokerOrderID string,
+	expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent store.ExitIntent,
+) error {
+	if atomic, ok := m.store.(interface {
+		UpdateOrderStopReplacementAndLinkIntent(context.Context, string, string, string, float64, float64, float64, float64, string, float64, float64, time.Time, store.ExitIntent) error
+	}); ok {
+		return atomic.UpdateOrderStopReplacementAndLinkIntent(ctx,
+			existing.ID, existing.BrokerOrderID, newBrokerOrderID,
+			existing.FilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+			status, filledPrice, filledQty, filledAt, intent)
+	}
+	if err := m.store.UpdateOrderStopReplacement(ctx,
+		existing.ID, existing.BrokerOrderID, newBrokerOrderID,
+		existing.FilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent); err != nil {
+		return err
+	}
+	if linker, ok := m.store.(interface {
+		LinkReplacementOrderIntent(context.Context, string, string) error
+	}); ok {
+		return linker.LinkReplacementOrderIntent(ctx, existing.ID, newBrokerOrderID)
+	}
+	return nil
 }
 
 // stockIntentIDForAcceptedOrder makes trailing projections obey the durable

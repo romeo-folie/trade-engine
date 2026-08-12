@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -440,6 +442,62 @@ func UpdateOrderStopReplacement(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := updateOrderStopReplacementTx(ctx, tx, orderID, expectedBrokerOrderID, newBrokerOrderID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// UpdateOrderStopReplacementAndSupersede makes a fallback cancel/resubmit
+// durable in one transaction: the mutable stop row advances to the broker's
+// new id and replacement intent while its predecessor becomes non-replayable.
+// A crash therefore cannot leave the new broker id linked to the old intent.
+func UpdateOrderStopReplacementAndSupersede(
+	ctx context.Context,
+	orderID, expectedBrokerOrderID, newBrokerOrderID, replacementIntentID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent ExitIntent,
+) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var predecessorIntentID string
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(stock_intent_id::text,'') FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&predecessorIntentID); err != nil {
+		return err
+	}
+	if err := updateOrderStopReplacementTx(ctx, tx, orderID, expectedBrokerOrderID, newBrokerOrderID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE orders SET stock_intent_id=$2::uuid, updated_at=NOW() WHERE id=$1`, orderID, replacementIntentID); err != nil {
+		return err
+	}
+	if predecessorIntentID != "" && predecessorIntentID != replacementIntentID {
+		if _, err := tx.Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded', updated_at=NOW() WHERE id=$1::uuid AND purpose='submit'`, predecessorIntentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func updateOrderStopReplacementTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	orderID, expectedBrokerOrderID, newBrokerOrderID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent ExitIntent,
+) error {
 	var actualBrokerOrderID string
 	var actualFilledQty, actualTradeQuantity float64
 	if err := tx.QueryRow(ctx, `
@@ -465,7 +523,7 @@ func UpdateOrderStopReplacement(
 		// is already represented in the trade's cumulative realization fields.
 		newQuantity = actualTradeQuantity
 	}
-	if _, err = tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
@@ -484,7 +542,7 @@ func UpdateOrderStopReplacement(
 		nullableRawJSON(intent.Evidence), orderID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {

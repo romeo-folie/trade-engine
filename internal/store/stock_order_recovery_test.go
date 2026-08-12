@@ -1894,6 +1894,71 @@ func TestStockIntentReplacementRecoveryCompletesIntentOnlyCrash(t *testing.T) {
 	}
 }
 
+func TestStockIntentFallbackReplacementAdvancesProjectionAtomically(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTATOMICFALLBACK")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTATOMICFALLBACK", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "31313131-3131-4131-8131-313131313131", IdempotencyKey: "fallback-parent:" + tradeID, ClientOrderID: "fallback-parent", TradeID: tradeID, Ticker: "RINTENTATOMICFALLBACK", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "pending"}
+	child := store.StockOrderIntent{ID: "32323232-3232-4232-8232-323232323232", IdempotencyKey: "fallback-child:" + tradeID, ClientOrderID: "fallback-child", TradeID: tradeID, ParentIntentID: parent.ID, Ticker: parent.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "child", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "fallback-old", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95, Status: "pending", IsStopLoss: true, ExitReason: store.ExitReasonTrailingATR, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateOrderStopReplacementAndSupersede(ctx, orderID, "fallback-old", "fallback-new", child.ID, 0, 2, 97, 2, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonTrailingATR, Evidence: json.RawMessage(`{"trailing_stop":97}`)}); err != nil {
+		t.Fatal(err)
+	}
+	var brokerID, intentID, purpose string
+	var rows int
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil || brokerID != "fallback-new" || intentID != child.ID {
+		t.Fatalf("atomic fallback projection=%q/%q err=%v", brokerID, intentID, err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT purpose FROM stock_order_intents WHERE id=$1::uuid`, parent.ID).Scan(&purpose); err != nil || purpose != "superseded" {
+		t.Fatalf("atomic fallback predecessor purpose=%q err=%v", purpose, err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("atomic fallback rows=%d err=%v", rows, err)
+	}
+}
+
+func TestStockIntentAdoptsLegacyTrailingStopProvenance(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTLEGACYTRAIL")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLEGACYTRAIL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := json.RawMessage(`{"trailing_stop":95,"atr":2}`)
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-trailing-stop", Ticker: "RINTENTLEGACYTRAIL", Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 95, Status: "pending", IsStopLoss: true, ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence}); err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := store.GetOrderByBrokerOrderID(ctx, "legacy-trailing-stop")
+	if err != nil || legacy == nil || legacy.ExitReason != store.ExitReasonTrailingATR || !sameJSON(t, legacy.ExitEvidence, evidence) {
+		t.Fatalf("legacy lookup provenance=%#v err=%v", legacy, err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "legacy-trailing-stop", 96); err != nil {
+		t.Fatalf("replace adopted trailing stop: %v", err)
+	}
+	var reason string
+	var gotEvidence json.RawMessage
+	if err := store.GetDB().QueryRow(ctx, `SELECT COALESCE(exit_reason,''), exit_evidence FROM orders WHERE trade_id=$1::uuid`, tradeID).Scan(&reason, &gotEvidence); err != nil || reason != store.ExitReasonTrailingATR || !sameJSON(t, gotEvidence, evidence) {
+		t.Fatalf("adopted replacement provenance=%q %s err=%v", reason, gotEvidence, err)
+	}
+}
+
 func TestStockIntentAdoptsLegacyBracketStopForAtomicReplacement(t *testing.T) {
 	ctx := context.Background()
 	signalID := insertRecoverySignal(t, "RINTENTLEGACYBRACKET")
