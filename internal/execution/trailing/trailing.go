@@ -911,14 +911,16 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	}
 
 	stopReq := execution.OrderRequest{
-		Ticker:      t.Ticker,
-		Side:        side,
-		Type:        execution.OrderTypeStop,
-		Quantity:    t.Quantity,
-		StopPrice:   newStop,
-		TradeID:     t.ID,
-		TimeInForce: protectiveStopTIF(t.Quantity),
-		IntentKey:   trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
+		Ticker:       t.Ticker,
+		Side:         side,
+		Type:         execution.OrderTypeStop,
+		Quantity:     t.Quantity,
+		StopPrice:    newStop,
+		TradeID:      t.ID,
+		TimeInForce:  protectiveStopTIF(t.Quantity),
+		IntentKey:    trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
+		ExitReason:   intent.Reason,
+		ExitEvidence: intent.Evidence,
 	}
 	var res execution.OrderResult
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {

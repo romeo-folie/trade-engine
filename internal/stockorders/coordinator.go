@@ -56,15 +56,19 @@ func (c *Coordinator) PlaceOrder(ctx context.Context, req execution.OrderRequest
 	if existing, err := store.GetStockOrderIntentByKey(ctx, req.IntentKey); err != nil {
 		return execution.OrderResult{}, err
 	} else if existing != nil {
+		// Terminal zero-fill generations are retired. Their original payload
+		// may legitimately differ from the next market-exit tick's reference
+		// price or residual quantity, so report the rotation sentinel before
+		// enforcing the exact-payload replay contract.
+		if isTerminalZeroFill(existing.Status, existing.FilledQty) {
+			return execution.OrderResult{}, fmt.Errorf("%w: stock intent %s is %s", execution.ErrTerminalZeroFillPlacement, existing.ClientOrderID, existing.Status)
+		}
 		if existing.PayloadHash != hash {
 			return execution.OrderResult{}, fmt.Errorf("stock order intent key %q reused with different payload", req.IntentKey)
 		}
 		var exact execution.OrderRequest
 		if err := json.Unmarshal(existing.RequestPayload, &exact); err != nil {
 			return execution.OrderResult{}, err
-		}
-		if isTerminalZeroFill(existing.Status, existing.FilledQty) {
-			return execution.OrderResult{}, fmt.Errorf("%w: stock intent %s is %s", execution.ErrTerminalZeroFillPlacement, existing.ClientOrderID, existing.Status)
 		}
 		return c.submit(ctx, *existing, exact)
 	}
@@ -136,6 +140,13 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 func isTerminalZeroFill(status string, filledQty float64) bool {
 	status = execution.NormalizeOrderStatus(status)
 	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
+}
+
+func requestExitIntent(req execution.OrderRequest) store.ExitIntent {
+	if req.ExitReason == "" {
+		return store.ExitIntent{Reason: store.ExitReasonStopLoss}
+	}
+	return store.ExitIntent{Reason: req.ExitReason, Evidence: req.ExitEvidence}
 }
 
 type recoveryContextKey struct{}
@@ -360,7 +371,8 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 		orderID, err := store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: brokerID,
 			Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
 			StopPrice: req.StopPrice, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
-			Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true, StockIntentID: intent.ID})
+			Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true,
+			ExitReason: requestExitIntent(req).Reason, ExitEvidence: requestExitIntent(req).Evidence, StockIntentID: intent.ID})
 		if err != nil {
 			return err
 		}
@@ -375,7 +387,8 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 	if res.FilledPrice <= 0 {
 		return fmt.Errorf("recovered stop %s has fill without price", intent.ClientOrderID)
 	}
-	if _, err := store.ClaimTradeExitWithIntent(ctx, req.TradeID, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+	exitIntent := requestExitIntent(req)
+	if _, err := store.ClaimTradeExitWithIntent(ctx, req.TradeID, exitIntent); err != nil {
 		return fmt.Errorf("claim recovered stop exit: %w", err)
 	}
 	expectedBrokerID := existing.BrokerOrderID
@@ -384,7 +397,7 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 	}
 	remaining, _, err := store.ApplyProtectiveExitAtForBrokerOrder(ctx, req.TradeID, existing.ID, expectedBrokerID,
 		res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status), res.FilledAt,
-		store.ExitIntent{Reason: store.ExitReasonStopLoss})
+		exitIntent)
 	if err != nil {
 		return fmt.Errorf("apply recovered stop fill: %w", err)
 	}
@@ -564,7 +577,8 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 	}
 	stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
 		Type: execution.OrderTypeStop, Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss,
-		TradeID: tradeID, TimeInForce: "gtc", IntentKey: key}
+		TradeID: tradeID, TimeInForce: "gtc", IntentKey: key,
+		ExitReason: store.ExitReasonStopLoss, ExitEvidence: json.RawMessage(fmt.Sprintf(`{"stop_loss":%g}`, req.PolicyStopLoss))}
 	stopRes, err := c.PlaceOrder(ctx, stopReq)
 	if err != nil {
 		return err
@@ -578,12 +592,12 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 			Ticker: req.Ticker, Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
 			Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
 			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatus(stopRes.Status), IsStopLoss: true,
-			StockIntentID: stopIntent.ID})
+			ExitReason: requestExitIntent(stopReq).Reason, ExitEvidence: requestExitIntent(stopReq).Evidence, StockIntentID: stopIntent.ID})
 		return err
 	}
 	if err := store.UpdateOrderStopReplacement(ctx, existing.ID, existing.BrokerOrderID, stopRes.BrokerOrderID,
 		existing.FilledQty, res.FilledQty, req.PolicyStopLoss, res.FilledQty,
-		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, requestExitIntent(stopReq)); err != nil {
 		return err
 	}
 	return store.RepointOrderStockIntentAndSupersede(ctx, existing.ID, stopIntent.ID)
@@ -658,12 +672,18 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 			return execution.OrderResult{}, err
 		}
 	}
+	provenance := store.ExitIntent{Reason: store.ExitReasonStopLoss}
+	var predecessorRequest execution.OrderRequest
+	if err := json.Unmarshal(predecessor.RequestPayload, &predecessorRequest); err == nil {
+		provenance = requestExitIntent(predecessorRequest)
+	}
 	key := fmt.Sprintf("replace:%s:%.8f", predecessor.IdempotencyKey, px)
 	req := execution.OrderRequest{
 		Ticker: predecessor.Ticker, Side: execution.OrderSide(predecessor.Side),
 		Type: execution.OrderTypeStop, Quantity: predecessor.RequestedQty, StopPrice: px,
 		TradeID: predecessor.TradeID, IntentKey: key, ClientOrderID: clientIDForKey(key),
 		ReplacesBrokerOrderID: id,
+		ExitReason:            provenance.Reason, ExitEvidence: provenance.Evidence,
 	}
 	payload, err := json.Marshal(req)
 	if err != nil {
@@ -714,7 +734,8 @@ func (c *Coordinator) adoptLegacyStop(ctx context.Context, brokerOrderID string)
 	}
 	req := execution.OrderRequest{Ticker: order.Ticker, Side: execution.OrderSide(order.Side), Type: execution.OrderTypeStop,
 		Quantity: order.Quantity, StopPrice: order.StopPrice, TradeID: order.TradeID,
-		IntentKey: key, ClientOrderID: clientIDForKey(key)}
+		IntentKey: key, ClientOrderID: clientIDForKey(key),
+		ExitReason: order.ExitReason, ExitEvidence: order.ExitEvidence}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
@@ -843,7 +864,7 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 	}
 	if err := store.UpdateOrderStopReplacement(ctx, order.ID, req.ReplacesBrokerOrderID, res.BrokerOrderID,
 		order.FilledQty, req.Quantity, req.StopPrice, req.Quantity,
-		execution.NormalizeOrderStatus(res.Status), res.FilledPrice, res.FilledQty, res.FilledAt, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+		execution.NormalizeOrderStatus(res.Status), res.FilledPrice, res.FilledQty, res.FilledAt, requestExitIntent(req)); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("project stock stop replacement: %w", err)
 	}
 	if err := store.RepointOrderStockIntentAndSupersede(ctx, order.ID, intent.ID); err != nil {

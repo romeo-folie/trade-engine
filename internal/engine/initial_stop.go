@@ -69,6 +69,10 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		TradeID:     tradeID,
 		IntentKey:   intentKey,
 		TimeInForce: "gtc", // uncapped entries are whole-share only
+		ExitReason:  store.ExitReasonStopLoss,
+		ExitEvidence: newExitIntent(store.ExitReasonStopLoss, map[string]any{
+			"stop_loss": stopPrice,
+		}).Evidence,
 	}
 	var res execution.OrderResult
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {

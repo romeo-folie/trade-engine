@@ -189,6 +189,99 @@ func TestStockIntentTerminalZeroFillCannotSatisfyRetry(t *testing.T) {
 	}
 }
 
+func TestTerminalMarketExitIntentRotatesBeforePayloadValidation(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	signalID := insertRecoverySignal(t, "RINTENTEXITROTATE")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTEXITROTATE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := execution.OrderRequest{
+		Ticker: "RINTENTEXITROTATE", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+		Quantity: 5, ReferencePrice: 100, TradeID: tradeID, IntentKey: "software-exit:payload-rotate:test",
+	}
+	if _, err := coordinator.PlaceOrder(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	baseIntent := intentForKey(t, base.IntentKey)
+	if err := store.UpdateStockOrderIntentBroker(ctx, baseIntent.ClientOrderID, "terminal-exit", "cancelled", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	// A later tick can have a new observed price and a smaller residual
+	// quantity. The terminal generation must return the rotation sentinel,
+	// not reject that changed payload before a successor can be created.
+	changed := base
+	changed.Quantity, changed.ReferencePrice = 3, 101
+	if _, err := coordinator.PlaceOrder(ctx, changed); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		t.Fatalf("terminal changed-payload exit error=%v, want terminal sentinel", err)
+	}
+	_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, base.IntentKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed.IntentKey, changed.ClientOrderID = retryKey, ""
+	broker.postRes = execution.OrderResult{BrokerOrderID: "fresh-residual-exit", Status: "accepted"}
+	if _, err := coordinator.PlaceOrder(ctx, changed); err != nil {
+		t.Fatalf("place residual retry generation: %v", err)
+	}
+	if got := intentForKey(t, retryKey); got.RequestedQty != 3 || got.ClientOrderID == baseIntent.ClientOrderID {
+		t.Fatalf("retry intent=%#v, want new client id and residual quantity", got)
+	}
+
+	working := changed
+	working.IntentKey = "software-exit:payload-working:test"
+	working.Quantity, working.ReferencePrice = 5, 100
+	if _, err := coordinator.PlaceOrder(ctx, working); err != nil {
+		t.Fatal(err)
+	}
+	working.ReferencePrice = 102
+	if _, err := coordinator.PlaceOrder(ctx, working); err == nil || errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		t.Fatalf("working changed-payload exit error=%v, want immutable payload rejection", err)
+	}
+}
+
+func TestTerminalMarketExitPayloadRotationCoversTrailingAndAnalystKeys(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"trailing-market-exit:payload-rotate:2.00000000",
+		"analyst-exit:payload-rotate:RINTENTANALYSTROTATE",
+	} {
+		t.Run(key[:8], func(t *testing.T) {
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-" + key[:8], Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			base := execution.OrderRequest{Ticker: "RINTENTANALYSTROTATE", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 2, ReferencePrice: 100, IntentKey: key}
+			if _, err := coordinator.PlaceOrder(ctx, base); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, key)
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "terminal-"+key[:8], "rejected", 0, 0, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			changed := base
+			changed.Quantity, changed.ReferencePrice = 1, 101
+			if _, err := coordinator.PlaceOrder(ctx, changed); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+				t.Fatalf("changed terminal %s error=%v", key, err)
+			}
+			_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed.IntentKey, changed.ClientOrderID = retryKey, ""
+			if _, err := coordinator.PlaceOrder(ctx, changed); err != nil {
+				t.Fatalf("fresh %s generation: %v", key, err)
+			}
+		})
+	}
+}
+
 func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
@@ -347,6 +440,20 @@ func isRecoverableIntent(t *testing.T, intentID string) bool {
 		}
 	}
 	return false
+}
+
+func sameJSON(t *testing.T, got, want json.RawMessage) bool {
+	t.Helper()
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("unmarshal actual JSON %q: %v", got, err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("unmarshal expected JSON %q: %v", want, err)
+	}
+	gotBytes, _ := json.Marshal(gotValue)
+	wantBytes, _ := json.Marshal(wantValue)
+	return string(gotBytes) == string(wantBytes)
 }
 
 func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
@@ -951,7 +1058,8 @@ func TestTrailingManagerFollowsTerminalStopGenerations(t *testing.T) {
 	coordinator := stockorders.New(broker)
 	baseKey := "trailing-stop:" + tradeID + ":new:97.00000000:2.00000000"
 	stopRequest := func(key string) execution.OrderRequest {
-		return execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 97, TradeID: tradeID, TimeInForce: "gtc", IntentKey: key}
+		return execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 97, TradeID: tradeID, TimeInForce: "gtc", IntentKey: key,
+			ExitReason: store.ExitReasonTrailingATR, ExitEvidence: json.RawMessage(`{"trailing_stop":97}`)}
 	}
 	if _, err := coordinator.PlaceOrder(ctx, stopRequest(baseKey)); err != nil {
 		t.Fatalf("place base trailing generation: %v", err)
@@ -971,8 +1079,7 @@ func TestTrailingManagerFollowsTerminalStopGenerations(t *testing.T) {
 	terminalize := func(key, brokerID, status string) {
 		t.Helper()
 		intent := intentForKey(t, key)
-		broker.lookup[intent.ClientOrderID] = execution.OrderResult{BrokerOrderID: brokerID, Status: status}
-		if _, err := coordinator.PlaceOrder(ctx, stopRequest(key)); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, brokerID, execution.NormalizeOrderStatus(status), 0, 0, "", "", true); err != nil {
 			t.Fatalf("terminalize %q: %v", key, err)
 		}
 		if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET status='cancelled' WHERE stock_intent_id=$1::uuid`, intent.ID); err != nil {
@@ -1257,6 +1364,44 @@ func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
 	}
 	if got := countForIntent(t, "orders", in.ID); got != 1 {
 		t.Fatalf("replay duplicated recovered stop: %d", got)
+	}
+}
+
+func TestStockIntentRecoveryPreservesStandaloneStopProvenance(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTTRAILPROVENANCE")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTTRAILPROVENANCE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := json.RawMessage(`{"trailing_stop":95,"atr":2}`)
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "recovered-trailing-stop", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTTRAILPROVENANCE", Side: execution.OrderSideSell, Type: execution.OrderTypeStop,
+		Quantity: 2, StopPrice: 95, TradeID: tradeID, IntentKey: "protective-trailing:" + tradeID,
+		ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "recovered-trailing-stop", Status: "filled", FilledPrice: 94, FilledQty: 2}
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "recovered-trailing-stop", "filled", 94, 2, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var orderReason string
+	var orderEvidence json.RawMessage
+	if err := store.GetDB().QueryRow(ctx, `SELECT COALESCE(exit_reason,''), exit_evidence FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&orderReason, &orderEvidence); err != nil || orderReason != store.ExitReasonTrailingATR || !sameJSON(t, orderEvidence, evidence) {
+		t.Fatalf("recovered trailing order provenance=%q %s err=%v", orderReason, orderEvidence, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" || trade.ExitReason != store.ExitReasonTrailingATR || !sameJSON(t, trade.ExitEvidence, evidence) {
+		t.Fatalf("recovered trailing trade provenance=%#v err=%v", trade, err)
 	}
 }
 
@@ -1616,7 +1761,8 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := execution.OrderRequest{Ticker: "RINTENTREPLACE", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 5, StopPrice: 91, TradeID: tradeID, IntentKey: "replace:protective:91", ClientOrderID: "replacement-stop", ReplacesBrokerOrderID: "old-stop"}
+	evidence := json.RawMessage(`{"trailing_stop":91,"atr":2}`)
+	req := execution.OrderRequest{Ticker: "RINTENTREPLACE", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 5, StopPrice: 91, TradeID: tradeID, IntentKey: "replace:protective:91", ClientOrderID: "replacement-stop", ReplacesBrokerOrderID: "old-stop", ExitReason: store.ExitReasonTrailingATR, ExitEvidence: evidence}
 	payload, err := json.Marshal(req)
 	if err != nil {
 		t.Fatal(err)
@@ -1631,12 +1777,16 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	if err := coordinator.Recover(ctx); err != nil {
 		t.Fatalf("recover replacement: %v", err)
 	}
-	var brokerID, intentID string
-	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil {
+	var brokerID, intentID, exitReason string
+	var exitEvidence json.RawMessage
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text, COALESCE(exit_reason,''), exit_evidence FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID, &exitReason, &exitEvidence); err != nil {
 		t.Fatal(err)
 	}
 	if brokerID != "new-stop" || intentID != child.ID {
 		t.Fatalf("replacement projection = %s/%s", brokerID, intentID)
+	}
+	if exitReason != store.ExitReasonTrailingATR || !sameJSON(t, exitEvidence, evidence) {
+		t.Fatalf("replacement provenance = %q %s", exitReason, exitEvidence)
 	}
 	if _, err := coordinator.ReplaceStopOrder(ctx, "new-stop", 92); err != nil {
 		t.Fatalf("ratchet replacement: %v", err)

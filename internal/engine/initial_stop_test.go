@@ -256,6 +256,9 @@ func TestEnsureUncappedProtectiveStopSeedsImmediately(t *testing.T) {
 		req.Quantity != 5 || req.StopPrice != 95 || req.TimeInForce != "gtc" {
 		t.Fatalf("protective request = %+v", req)
 	}
+	if req.ExitReason != store.ExitReasonStopLoss {
+		t.Fatalf("durable protective request reason=%q, want stop_loss", req.ExitReason)
+	}
 	stop, err := store.LatestStopLossOrderForTrade(ctx, tradeID)
 	if err != nil || stop == nil {
 		t.Fatalf("LatestStopLossOrderForTrade: %v (nil=%v)", err, stop == nil)

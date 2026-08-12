@@ -4,6 +4,7 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -155,6 +156,12 @@ type OrderRequest struct {
 	PolicyStopLoss     float64
 	PolicyTakeProfit   float64
 	UncappedTakeProfit bool
+	// ExitReason and ExitEvidence are durable stock-order metadata for
+	// standalone protective stops. Broker adapters ignore them; the coordinator
+	// persists them in the immutable request so recovery retains the policy
+	// provenance that created the stop (for example trailing_atr vs stop_loss).
+	ExitReason   string
+	ExitEvidence json.RawMessage
 }
 
 // OrderResult is the immediate response from the broker.
