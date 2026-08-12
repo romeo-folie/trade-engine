@@ -139,10 +139,11 @@ func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	broker := newRecoveryBroker(execution.OrderResult{})
-	broker.patchErr = &execution.BrokerRequestError{StatusCode: 422, Message: "invalid stop"}
+	rejectErr := &execution.BrokerRequestError{StatusCode: 422, Message: "invalid stop"}
+	broker.patchErr = rejectErr
 	coordinator := stockorders.New(broker)
-	if _, err := coordinator.ReplaceStopOrder(ctx, "old-reject", 91); err == nil {
-		t.Fatal("expected definitive replacement rejection")
+	if _, err := coordinator.ReplaceStopOrder(ctx, "old-reject", 91); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) || !errors.Is(err, rejectErr) {
+		t.Fatalf("definitive replacement rejection=%v, want terminal sentinel and broker error", err)
 	}
 	var status string
 	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM stock_order_intents WHERE idempotency_key LIKE 'replace:legacy-stop:%'`).Scan(&status); err != nil || status != "rejected" {
@@ -204,6 +205,48 @@ func TestStockIntentTerminalZeroFillCannotSatisfyRetry(t *testing.T) {
 			var status string
 			if err := store.GetDB().QueryRow(ctx, `SELECT status FROM signals WHERE id=$1::uuid`, signalID).Scan(&status); err != nil || status != "approved" {
 				t.Fatalf("terminal retry signal status=%q err=%v", status, err)
+			}
+		})
+	}
+}
+
+func TestDefinitiveMarketExitRejectionAdvancesDurableGeneration(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, key string
+	}{
+		{"software", "software-exit:direct-reject:take-profit"},
+		{"analyst", "analyst-exit:direct-reject:REJECTEXIT"},
+		{"trailing", "trailing-market-exit:direct-reject:95.00000000"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rejectErr := &execution.BrokerRequestError{StatusCode: 422, Message: "market exit rejected"}
+			broker := newRecoveryBroker(execution.OrderResult{})
+			broker.postErr = rejectErr
+			coordinator := stockorders.New(broker)
+			req := execution.OrderRequest{Ticker: "REJECTEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 1, IntentKey: tc.key}
+			if _, err := coordinator.PlaceOrder(ctx, req); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) || !errors.Is(err, rejectErr) {
+				t.Fatalf("direct definitive rejection=%v, want terminal sentinel and broker error", err)
+			}
+			in := intentForKey(t, tc.key)
+			if in.Status != "rejected" || in.BrokerOrderID != "" || countForIntent(t, "orders", in.ID) != 0 {
+				t.Fatalf("direct rejected market intent=%#v, want terminal broker-less intent without projection", in)
+			}
+			_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, tc.key)
+			if err != nil || retryKey == tc.key {
+				t.Fatalf("resolve terminal market-exit retry=%q, %v", retryKey, err)
+			}
+			broker.postErr = nil
+			broker.postRes = execution.OrderResult{BrokerOrderID: "accepted-" + tc.name, Status: "accepted"}
+			req.IntentKey, req.ClientOrderID = retryKey, ""
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatalf("submit retry generation: %v", err)
+			}
+			if retry := intentForKey(t, retryKey); retry.Status != "pending" || retry.BrokerOrderID == "" {
+				t.Fatalf("retry market-exit intent=%#v, want accepted live successor", retry)
 			}
 		})
 	}

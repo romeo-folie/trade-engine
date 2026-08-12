@@ -109,7 +109,7 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 	}
 	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
 		_ = c.record(ctx, intent, "submit", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
-		return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", err)
+		return execution.OrderResult{}, terminalZeroFillRejectionError("stock order definitively rejected", err)
 	}
 	_ = c.record(ctx, intent, "submit", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	// A response failure may follow broker acceptance. Query by the durable id
@@ -129,7 +129,7 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		}
 		if execution.IsDefinitiveOrderRejection(replayErr) && !execution.IsDuplicateClientOrderError(replayErr) {
 			_ = c.record(ctx, intent, "exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
-			return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", replayErr)
+			return execution.OrderResult{}, terminalZeroFillRejectionError("stock order definitively rejected after exact replay", replayErr)
 		}
 		_ = c.record(ctx, intent, "exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock order submit: %w", replayErr)
@@ -145,6 +145,14 @@ func isTerminalZeroFill(status string, filledQty float64) bool {
 func isTerminalZeroFillForRequest(req execution.OrderRequest, res execution.OrderResult) bool {
 	status := execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
 	return res.FilledQty <= 0 && (status == "cancelled" || status == "rejected")
+}
+
+// terminalZeroFillRejectionError marks a broker-confirmed non-duplicate
+// rejection as a conclusively dead generation while preserving the broker
+// error for callers that need its HTTP/request context. Transport failures and
+// duplicate-client responses remain ambiguous and must not use this sentinel.
+func terminalZeroFillRejectionError(context string, err error) error {
+	return fmt.Errorf("%w: %s: %w", execution.ErrTerminalZeroFillPlacement, context, err)
 }
 
 func requestExitIntent(req execution.OrderRequest) store.ExitIntent {
@@ -912,7 +920,7 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 			return execution.OrderResult{}, fmt.Errorf("%w: recovery replacement predecessor unavailable: %v", execution.ErrAmbiguousStopReplacement, err)
 		}
 		_ = c.record(ctx, intent, "replace", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
-		return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", err)
+		return execution.OrderResult{}, terminalZeroFillRejectionError("stock stop replacement definitively rejected", err)
 	}
 	_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	if hasLookup {
