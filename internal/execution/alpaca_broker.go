@@ -491,7 +491,7 @@ func (b *AlpacaBroker) doURLWithRequestID(ctx context.Context, method, url strin
 
 	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB – equity history can exceed 8 KiB
 	if resp.StatusCode >= 400 {
-		return resp.Header.Get("X-Request-ID"), fmt.Errorf("alpaca %s %s → %d: %s", method, url, resp.StatusCode, bytes.TrimSpace(respBytes))
+		return resp.Header.Get("X-Request-ID"), &BrokerRequestError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("alpaca %s %s: %s", method, url, bytes.TrimSpace(respBytes))}
 	}
 	if out != nil && len(respBytes) > 0 {
 		return resp.Header.Get("X-Request-ID"), json.Unmarshal(respBytes, out)

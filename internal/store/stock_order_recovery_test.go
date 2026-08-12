@@ -23,6 +23,7 @@ type recoveryBroker struct {
 	cancels []string
 	patches []string
 	postRes execution.OrderResult
+	postErr error
 }
 
 func newRecoveryBroker(res execution.OrderResult) *recoveryBroker {
@@ -31,6 +32,9 @@ func newRecoveryBroker(res execution.OrderResult) *recoveryBroker {
 
 func (b *recoveryBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
 	b.posts++
+	if b.postErr != nil {
+		return execution.OrderResult{}, b.postErr
+	}
 	res := b.postRes
 	if res.BrokerOrderID == "" {
 		res.BrokerOrderID = fmt.Sprintf("broker-%d", b.posts)
@@ -169,6 +173,45 @@ func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing
 	order, err := store.GetOrderByStockIntentID(ctx, in.ID)
 	if err != nil || order == nil || order.Status != "cancelled" {
 		t.Fatalf("terminal zero order = %#v, %v", order, err)
+	}
+}
+
+func TestStockIntentDefinitiveRejectionIsTerminalButAmbiguityRecovers(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	rejectedSignal := insertRecoverySignal(t, "RINTENTREJECTED")
+	rejectedBroker := newRecoveryBroker(execution.OrderResult{})
+	rejectedBroker.postErr = &execution.BrokerRequestError{StatusCode: 422, Message: "insufficient buying power"}
+	rejected := stockorders.New(rejectedBroker)
+	req := entryRequest(rejectedSignal, "RINTENTREJECTED", 1)
+	if _, err := rejected.PlaceOrder(ctx, req); err == nil {
+		t.Fatal("expected definitive rejection")
+	}
+	in := intentForKey(t, req.IntentKey)
+	if in.Status != "rejected" {
+		t.Fatalf("definitive rejection status = %q", in.Status)
+	}
+	posts := rejectedBroker.posts
+	if err := rejected.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedBroker.posts != posts {
+		t.Fatal("terminal rejection replayed on recovery")
+	}
+
+	ambiguousSignal := insertRecoverySignal(t, "RINTENTAMBIGUOUS")
+	ambiguousBroker := newRecoveryBroker(execution.OrderResult{})
+	ambiguousBroker.postErr = errors.New("transport reset")
+	ambiguous := stockorders.New(ambiguousBroker)
+	ambiguousReq := entryRequest(ambiguousSignal, "RINTENTAMBIGUOUS", 1)
+	if _, err := ambiguous.PlaceOrder(ctx, ambiguousReq); err == nil {
+		t.Fatal("expected ambiguous submit error")
+	}
+	ambiguousIntent := intentForKey(t, ambiguousReq.IntentKey)
+	if ambiguousIntent.Status == "rejected" {
+		t.Fatal("transport ambiguity was terminalized")
 	}
 }
 
@@ -452,5 +495,31 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("stop rows=%d err=%v, want one", count, err)
+	}
+}
+
+func TestStockIntentAdoptsLegacyBracketStopForAtomicReplacement(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTLEGACYBRACKET")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLEGACYBRACKET", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "legacy-bracket-stop", ParentOrderID: "legacy-parent", Ticker: "RINTENTLEGACYBRACKET", Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 90, Status: "pending", IsStopLoss: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	coordinator := stockorders.New(broker)
+	res, err := coordinator.ReplaceStopOrder(ctx, "legacy-bracket-stop", 91)
+	if err != nil {
+		t.Fatalf("replace legacy bracket stop: %v", err)
+	}
+	if res.BrokerOrderID == "" || len(broker.patches) != 1 {
+		t.Fatalf("legacy replacement = %+v patches=%v", res, broker.patches)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&intentID); err != nil || intentID == "" {
+		t.Fatalf("legacy stop was not linked: %q %v", intentID, err)
 	}
 }

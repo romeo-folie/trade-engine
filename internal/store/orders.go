@@ -132,6 +132,25 @@ func GetOrderByStockIntentID(ctx context.Context, intentID string) (*Order, erro
 	return &o, nil
 }
 
+func GetOrderByBrokerOrderID(ctx context.Context, brokerOrderID string) (*Order, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''), ticker, side, order_type,
+		quantity, COALESCE(limit_price,0), COALESCE(stop_price,0), COALESCE(filled_price,0),
+		COALESCE(filled_qty,0), status, is_stop_loss, is_take_profit, COALESCE(parent_order_id,''),
+		filled_at, created_at, updated_at, COALESCE(stock_intent_id::text,'')
+		FROM orders WHERE broker_order_id=$1 ORDER BY created_at DESC LIMIT 1`, brokerOrderID)
+	var o Order
+	if err := row.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side, &o.OrderType,
+		&o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice, &o.FilledQty, &o.Status,
+		&o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID, &o.FilledAt, &o.CreatedAt, &o.UpdatedAt, &o.StockIntentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &o, nil
+}
+
 // UpdateOrderStatusByStockIntent terminalizes an order-only zero-fill entry.
 // It deliberately has no trade condition because no position was projected.
 func UpdateOrderStatusByStockIntent(ctx context.Context, intentID, status string) error {

@@ -87,6 +87,10 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		_ = c.record(ctx, intent, "submit", "accepted", res, "", true)
 		return c.finishSubmit(ctx, intent, req, res)
 	}
+	if execution.IsDefinitiveOrderRejection(err) {
+		_ = c.record(ctx, intent, "submit", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
+		return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", err)
+	}
 	_ = c.record(ctx, intent, "submit", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	// A response failure may follow broker acceptance. Query by the durable id
 	// before the one exact-payload replay; never use ticker/side attribution.
@@ -102,6 +106,10 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		if replayErr == nil {
 			_ = c.record(ctx, intent, "exact_replay", "accepted", res, "", true)
 			return c.finishSubmit(ctx, intent, req, res)
+		}
+		if execution.IsDefinitiveOrderRejection(replayErr) {
+			_ = c.record(ctx, intent, "exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
+			return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", replayErr)
 		}
 		_ = c.record(ctx, intent, "exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock order submit: %w", replayErr)
@@ -417,7 +425,10 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 		return execution.OrderResult{}, err
 	}
 	if predecessor == nil {
-		return execution.OrderResult{}, fmt.Errorf("durable stock intent missing for stop replacement %s", id)
+		predecessor, err = c.adoptLegacyStop(ctx, id)
+		if err != nil {
+			return execution.OrderResult{}, err
+		}
 	}
 	key := fmt.Sprintf("replace:%s:%.8f", predecessor.IdempotencyKey, px)
 	req := execution.OrderRequest{
@@ -454,6 +465,45 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 		return execution.OrderResult{}, fmt.Errorf("persist stock stop replacement intent before submit: %w", err)
 	}
 	return c.submitReplacement(ctx, *intent, req, false)
+}
+
+// adoptLegacyStop backfills the immutable predecessor intent for a stop row
+// created before durable stock intents existed. The stable row id is its
+// lineage key, so all later PATCH attempts retain one deterministic client id.
+func (c *Coordinator) adoptLegacyStop(ctx context.Context, brokerOrderID string) (*store.StockOrderIntent, error) {
+	order, err := store.GetOrderByBrokerOrderID(ctx, brokerOrderID)
+	if err != nil {
+		return nil, err
+	}
+	if order == nil || !order.IsStopLoss || order.OrderType != string(execution.OrderTypeStop) {
+		return nil, fmt.Errorf("durable stock intent missing for stop replacement %s", brokerOrderID)
+	}
+	key := "legacy-stop:" + order.ID
+	if existing, err := store.GetStockOrderIntentByKey(ctx, key); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, store.RepointOrderStockIntent(ctx, order.ID, existing.ID)
+	}
+	req := execution.OrderRequest{Ticker: order.Ticker, Side: execution.OrderSide(order.Side), Type: execution.OrderTypeStop,
+		Quantity: order.Quantity, StopPrice: order.StopPrice, TradeID: order.TradeID,
+		IntentKey: key, ClientOrderID: clientIDForKey(key)}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	intent := &store.StockOrderIntent{ID: intentUUID(), IdempotencyKey: key, ClientOrderID: req.ClientOrderID,
+		TradeID: order.TradeID, Ticker: order.Ticker, Side: order.Side, OrderType: order.OrderType,
+		RequestedQty: order.Quantity, RequestPayload: payload, PayloadHash: fmt.Sprintf("%x", sha256.Sum256(payload)), Status: order.Status}
+	if err := store.CreateStockOrderIntent(ctx, *intent); err != nil {
+		return nil, fmt.Errorf("adopt legacy stop intent: %w", err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, brokerOrderID, order.Status, order.FilledPrice, order.FilledQty, "", "", true); err != nil {
+		return nil, err
+	}
+	if err := store.RepointOrderStockIntent(ctx, order.ID, intent.ID); err != nil {
+		return nil, err
+	}
+	return intent, nil
 }
 
 func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, project bool) (execution.OrderResult, error) {

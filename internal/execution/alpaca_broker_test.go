@@ -112,6 +112,19 @@ func TestAlpacaReplaceStopOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
 	}
 }
 
+func TestAlpacaPlaceOrderClassifiesDefinitiveRejection(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		fmt.Fprintln(w, `{"code":40310000,"message":"insufficient buying power"}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	_, err := b.PlaceOrder(context.Background(), OrderRequest{Ticker: "SPY", Side: OrderSideBuy, Type: OrderTypeMarket, Quantity: 1})
+	if !IsDefinitiveOrderRejection(err) {
+		t.Fatalf("422 error not classified definitive: %v", err)
+	}
+}
+
 func TestAccountSnapshotCapturesAccountIdentityAndSafetyFields(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v2/account" {

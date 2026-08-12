@@ -5,6 +5,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -15,6 +16,30 @@ import (
 // terminal state (the order is effectively gone) rather than as an
 // uncertain status that blocks resubmission.
 var ErrOrderNotFound = errors.New("execution: order not found at broker")
+
+// BrokerRequestError preserves an adapter's definitive HTTP response. It lets
+// durable callers distinguish a broker-declared rejection from a transport or
+// 5xx ambiguity that must be looked up/replayed safely.
+type BrokerRequestError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *BrokerRequestError) Error() string {
+	return fmt.Sprintf("broker request failed with HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+// IsDefinitiveOrderRejection reports broker responses that conclusively mean
+// no order was accepted. 408/409/429 are deliberately excluded because they
+// can be retried or race broker state; transport and 5xx errors are ambiguous.
+func IsDefinitiveOrderRejection(err error) bool {
+	var requestErr *BrokerRequestError
+	if !errors.As(err, &requestErr) {
+		return false
+	}
+	return requestErr.StatusCode >= 400 && requestErr.StatusCode < 500 &&
+		requestErr.StatusCode != 408 && requestErr.StatusCode != 409 && requestErr.StatusCode != 429
+}
 
 // OrderSide identifies the direction of an order.
 type OrderSide string
