@@ -2907,6 +2907,75 @@ func TestTrailArmedRejectsUnusableInputs(t *testing.T) {
 	}
 }
 
+func TestSubmitOrReplaceStopSerializesRecoveryLifecycle(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "recovery-lock-trade", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, StopLoss: 95, Quantity: 2}
+	fs.trades[trade.ID] = trade
+	fs.orders["old-stop"] = store.Order{ID: "old-stop", TradeID: trade.ID, BrokerOrderID: "old-stop", Ticker: trade.Ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95, Status: "pending", IsStopLoss: true}
+	broker := &fakeBroker{}
+	manager := NewManager(Config{Enabled: true}, fs, &fakePrices{}, broker)
+
+	enteredRecovery := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	go func() {
+		recoveryDone <- store.WithTradeOrderLock(trade.ID, func() error {
+			close(enteredRecovery)
+			<-releaseRecovery
+			return nil
+		})
+	}()
+	<-enteredRecovery
+
+	trailingDone := make(chan error, 1)
+	go func() {
+		trailingDone <- manager.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97))
+	}()
+	// The recovery lifecycle owns the shared lock, so trailing cannot even
+	// read/cancel the old stop before recovery has finished its own
+	// lookup/cancel/submit/persist window.
+	select {
+	case err := <-trailingDone:
+		t.Fatalf("trailing lifecycle entered recovery window: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	broker.mu.Lock()
+	cancels, submissions := len(broker.cancelled), len(broker.placed)
+	broker.mu.Unlock()
+	if cancels != 0 || submissions != 0 {
+		t.Fatalf("trailing mutated broker during recovery window: cancels=%d submissions=%d", cancels, submissions)
+	}
+
+	close(releaseRecovery)
+	if err := <-recoveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-trailingDone; err != nil {
+		t.Fatal(err)
+	}
+	broker.mu.Lock()
+	cancels, submissions = len(broker.cancelled), len(broker.placed)
+	broker.mu.Unlock()
+	if cancels != 1 || submissions != 1 {
+		t.Fatalf("serialized trailing lifecycle broker calls: cancels=%d submissions=%d, want 1/1", cancels, submissions)
+	}
+	active, err := fs.LatestStopLossOrderForTrade(context.Background(), trade.ID)
+	if err != nil || active == nil || active.BrokerOrderID != "broker-1" || active.StopPrice != 97 {
+		t.Fatalf("active protective stop=%#v err=%v, want one broker-1 @ 97", active, err)
+	}
+	fs.mu.Lock()
+	var rows int
+	for _, order := range fs.orders {
+		if order.TradeID == trade.ID && order.IsStopLoss && (order.Status == "pending" || order.Status == "partial") {
+			rows++
+		}
+	}
+	fs.mu.Unlock()
+	if rows != 1 {
+		t.Fatalf("active protective rows=%d, want one", rows)
+	}
+}
+
 // The live regression this feature exists for: a position that ticks up ~1.5%
 // and pulls back must NOT be closed by the trail. Before the gate, the ratchet
 // ran from the first tick and a pullback of atr_multiple × ATR from a trivial

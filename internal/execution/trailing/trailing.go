@@ -821,6 +821,16 @@ func emaClose(candles []data.Candle, period int) float64 {
 // and a later price drop could over-exit / flip the account short. Instead
 // we surface the error and rely on the next tick to retry.
 func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newStop float64, intent store.ExitIntent) error {
+	// Recovery and uncapped-entry protection use this same per-trade lock.
+	// Hold it across the complete read/cancel/submit/persist lifecycle: locking
+	// only the final write would still allow two actors to derive different
+	// successor keys from the same stale stop row.
+	return store.WithTradeOrderLock(t.ID, func() error {
+		return m.submitOrReplaceStopLocked(ctx, t, newStop, intent)
+	})
+}
+
+func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, newStop float64, intent store.ExitIntent) error {
 	existing, err := m.store.LatestStopLossOrderForTrade(ctx, t.ID)
 	if err != nil {
 		return fmt.Errorf("lookup existing stop: %w", err)
