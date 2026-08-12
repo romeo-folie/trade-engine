@@ -16,12 +16,14 @@ import (
 )
 
 type Runner struct {
-	Cfg       config.DisclosuresConfig
-	House     *HouseClient
-	Senate    *SenateClient
-	OGE       *OGEClient
-	Extractor PDFExtractor
-	Now       func() time.Time
+	Cfg            config.DisclosuresConfig
+	House          *HouseClient
+	Senate         *SenateClient
+	OGE            *OGEClient
+	Extractor      PDFExtractor
+	Now            func() time.Time
+	reportTerminal func(context.Context, string, string) (bool, error)
+	persistReport  func(context.Context, Report) error
 }
 
 type SyncResult struct {
@@ -193,7 +195,7 @@ func (r *Runner) syncHouse(
 		if processed >= limit || ctx.Err() != nil {
 			break
 		}
-		terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "house", filing.DocumentID)
+		terminal, err := r.isReportTerminal(ctx, "house", filing.DocumentID)
 		if err != nil {
 			return processed, err
 		}
@@ -214,7 +216,7 @@ func (r *Runner) syncHouse(
 			continue
 		}
 		report := ParseHousePTR(filing, documentURL, pdfData, pages)
-		if err := saveReport(ctx, report); err != nil {
+		if err := r.saveReport(ctx, report); err != nil {
 			return processed, err
 		}
 	}
@@ -235,7 +237,7 @@ func (r *Runner) saveFailure(
 		DocumentURL: documentURL, ExtractionStatus: "failed",
 		ExtractionError: cause.Error(), RawMetadata: metadata,
 	}
-	if err := saveReport(ctx, report); err != nil {
+	if err := r.saveReport(ctx, report); err != nil {
 		slog.Warn("persist failed House disclosure extraction",
 			"document_id", filing.DocumentID, "err", err)
 	}
@@ -256,7 +258,7 @@ func (r *Runner) syncSenate(
 			if processed >= limit || ctx.Err() != nil {
 				break
 			}
-			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "senate", filing.ExternalID)
+			terminal, err := r.isReportTerminal(ctx, "senate", filing.ExternalID)
 			if err != nil {
 				return processed, err
 			}
@@ -274,12 +276,12 @@ func (r *Runner) syncSenate(
 					DocumentURL: filing.DocumentURL, ExtractionStatus: "failed",
 					ExtractionError: err.Error(),
 				}
-				if saveErr := saveReport(ctx, failed); saveErr != nil {
+				if saveErr := r.saveReport(ctx, failed); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
 			}
-			if err := saveReport(ctx, report); err != nil {
+			if err := r.saveReport(ctx, report); err != nil {
 				return processed, err
 			}
 		}
@@ -306,7 +308,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			if processed >= limit || ctx.Err() != nil {
 				break
 			}
-			terminal, err := store.PoliticalDisclosureReportTerminal(ctx, "oge", filing.ExternalID)
+			terminal, err := r.isReportTerminal(ctx, "oge", filing.ExternalID)
 			if err != nil {
 				return processed, err
 			}
@@ -317,7 +319,7 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			pdf, err := r.OGE.FetchPDF(ctx, filing)
 			if err != nil {
 				failures++
-				if saveErr := saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
@@ -325,12 +327,12 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 			pages, err := r.Extractor.Extract(pdf)
 			if err != nil {
 				failures++
-				if saveErr := saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
+				if saveErr := r.saveReport(ctx, Report{Source: "oge", ExternalID: filing.ExternalID, Chamber: "executive", FilerName: filing.FilerName, Office: filing.Office, ReportType: filing.ReportType, FilingDate: filing.FilingDate, DocumentURL: filing.DocumentURL, ContentHash: hashBytes(pdf), ExtractionStatus: "failed", ExtractionError: err.Error(), RawMetadata: filing.RawMetadata}); saveErr != nil {
 					return processed, saveErr
 				}
 				continue
 			}
-			if err := saveReport(ctx, ParseOGEPDF(filing, pdf, pages)); err != nil {
+			if err := r.saveReport(ctx, ParseOGEPDF(filing, pdf, pages)); err != nil {
 				return processed, err
 			}
 		}
@@ -345,7 +347,19 @@ func (r *Runner) syncOGE(ctx context.Context, since, until time.Time, limit int)
 	return processed, nil
 }
 
-func saveReport(ctx context.Context, report Report) error {
+func (r *Runner) isReportTerminal(
+	ctx context.Context, source, externalID string,
+) (bool, error) {
+	if r.reportTerminal != nil {
+		return r.reportTerminal(ctx, source, externalID)
+	}
+	return store.PoliticalDisclosureReportTerminal(ctx, source, externalID)
+}
+
+func (r *Runner) saveReport(ctx context.Context, report Report) error {
+	if r.persistReport != nil {
+		return r.persistReport(ctx, report)
+	}
 	stored := store.PoliticalDisclosureReport{
 		Source: report.Source, ExternalID: report.ExternalID,
 		Chamber: report.Chamber, FilerName: report.FilerName, Office: report.Office,

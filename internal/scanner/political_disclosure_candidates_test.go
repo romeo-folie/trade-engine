@@ -78,9 +78,10 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 	}
 	candidate := SwingCandidate{
 		Ticker: "GOOD", Sources: []string{"political_disclosure"},
-		SourceScores:                  map[string]float64{"political_disclosure": .8},
-		PoliticalDisclosureClaimToken: "claim", PoliticalDisclosureClaimCount: 2,
-		PoliticalDisclosureEvidence: "two filings", PoliticalDisclosureScore: .8,
+		SourceScores:                      map[string]float64{"political_disclosure": .8},
+		PoliticalDisclosureClaimToken:     "claim",
+		PoliticalDisclosureClaimReportIDs: []string{"report-1", "report-2"},
+		PoliticalDisclosureEvidence:       "two filings", PoliticalDisclosureScore: .8,
 	}
 	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), []SwingCandidate{candidate})
 	if len(got) != 1 || got[0].Price != 25 || got[0].Volume != 100_000 ||
@@ -88,7 +89,7 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 		t.Fatalf("hydrated = %+v", got)
 	}
 	claims := scannerSourcePromotionClaims(got[0])
-	if claims.PoliticalDisclosure == nil || claims.PoliticalDisclosure.ReportCount != 2 {
+	if claims.PoliticalDisclosure == nil || len(claims.PoliticalDisclosure.ReportIDs) != 2 {
 		t.Fatalf("promotion claims = %+v", claims.PoliticalDisclosure)
 	}
 
@@ -99,25 +100,23 @@ func TestHydratePoliticalDisclosureMarketData(t *testing.T) {
 	}
 }
 
-func TestPoliticalMarketProviderFailurePreservesOrdinaryCandidate(t *testing.T) {
+func TestPoliticalMarketProviderFailureDoesNotReturnUnhydratedCandidate(t *testing.T) {
 	scanner := &MarketScanner{
 		StockAssets:    politicalAssetProvider{err: errors.New("asset service unavailable")},
 		StockSnapshots: politicalSnapshotProvider{},
 	}
-	ordinary := SwingCandidate{Ticker: "GOOD", Price: 25, Volume: 100_000, Sources: []string{"mover"}}
 	disclosure := SwingCandidate{
 		Ticker: "GOOD", Sources: []string{"political_disclosure"},
-		SourceScores:                  map[string]float64{"political_disclosure": .8},
-		PoliticalDisclosureClaimToken: "claim", PoliticalDisclosureClaimCount: 1,
-		PoliticalDisclosureEvidence: "filing", PoliticalDisclosureScore: .8,
+		SourceScores:                      map[string]float64{"political_disclosure": .8},
+		PoliticalDisclosureClaimToken:     "claim",
+		PoliticalDisclosureClaimReportIDs: []string{"report-1"},
+		PoliticalDisclosureEvidence:       "filing", PoliticalDisclosureScore: .8,
 	}
-	merged := mergePoliticalDisclosureCandidates([]SwingCandidate{ordinary}, []SwingCandidate{disclosure})
-	got := scanner.hydratePoliticalDisclosureMarketData(context.Background(), merged)
-	if len(got) != 1 || !hasSource(got[0].Sources, "mover") ||
-		hasSource(got[0].Sources, "political_disclosure") ||
-		got[0].PoliticalDisclosureClaimToken != "" || got[0].PoliticalDisclosureClaimCount != 0 ||
-		got[0].PoliticalDisclosureScore != 0 {
-		t.Fatalf("fallback = %+v", got)
+	got := scanner.hydratePoliticalDisclosureMarketData(
+		context.Background(), []SwingCandidate{disclosure},
+	)
+	if len(got) != 0 {
+		t.Fatalf("unhydrated candidates = %+v", got)
 	}
 }
 

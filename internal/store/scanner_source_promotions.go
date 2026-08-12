@@ -47,9 +47,9 @@ type PremarketEpisodicPromotionClaim struct {
 }
 
 type PoliticalDisclosurePromotionClaim struct {
-	Ticker      string
-	Token       string
-	ReportCount int
+	Ticker    string
+	Token     string
+	ReportIDs []string
 }
 
 type ScannerSourcePromotionClaims struct {
@@ -148,7 +148,7 @@ func promoteScannerSourcesToWatchlist(
 	if claims.PoliticalDisclosure != nil &&
 		(claims.PoliticalDisclosure.Ticker != item.Ticker ||
 			strings.TrimSpace(claims.PoliticalDisclosure.Token) == "" ||
-			claims.PoliticalDisclosure.ReportCount <= 0) {
+			!completePoliticalDisclosureReportIDs(claims.PoliticalDisclosure.ReportIDs)) {
 		return fmt.Errorf("political disclosure watchlist promotion lineage is incomplete")
 	}
 
@@ -266,31 +266,34 @@ func promoteScannerSourcesToWatchlist(
 	}
 	if claim := claims.PoliticalDisclosure; claim != nil {
 		rows, err := tx.Query(ctx, `
-			SELECT COALESCE(promotion_claim_token,''), promotion_status
-			FROM political_disclosure_candidates
-			WHERE ticker=$1 AND promotion_status='processing'
-			  AND promotion_claim_token=$2
-			FOR UPDATE`, claim.Ticker, claim.Token)
+			SELECT c.report_id::text, COALESCE(c.promotion_claim_token,''),
+			       c.promotion_status
+			FROM political_disclosure_candidates c
+			JOIN unnest($2::text[]) expected(report_id)
+			  ON c.report_id=expected.report_id::uuid
+			WHERE c.ticker=$1
+			FOR UPDATE OF c`, claim.Ticker, claim.ReportIDs)
 		if err != nil {
 			return fmt.Errorf("lock political disclosure promotion: %w", err)
 		}
-		found := 0
+		found := make(map[string]struct{}, len(claim.ReportIDs))
 		valid := true
 		for rows.Next() {
-			found++
-			var token, status string
-			if err := rows.Scan(&token, &status); err != nil {
+			var reportID, token, status string
+			if err := rows.Scan(&reportID, &token, &status); err != nil {
 				rows.Close()
 				return err
 			}
-			valid = valid && token == claim.Token && status == "processing"
+			_, duplicate := found[reportID]
+			found[reportID] = struct{}{}
+			valid = valid && !duplicate && token == claim.Token && status == "processing"
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
 			return err
 		}
-		if found != claim.ReportCount || !valid {
+		if len(found) != len(claim.ReportIDs) || !valid {
 			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 		}
 	}
@@ -394,20 +397,42 @@ func completeScannerSourcePromotionClaims(
 	if claim := claims.PoliticalDisclosure; claim != nil {
 		tag, err := tx.Exec(ctx, `
 			UPDATE political_disclosure_candidates
-			SET promotion_status=$3, scanner_run_id=$4, promoted_at=$5,
-			    promotion_reason=$6, promotion_claim_token=NULL,
+			SET promotion_status=$4, scanner_run_id=$5, promoted_at=$6,
+			    promotion_reason=$7, promotion_claim_token=NULL,
 			    promotion_claimed_at=NULL
-			WHERE ticker=$1 AND promotion_status='processing'
-			  AND promotion_claim_token=$2`,
-			claim.Ticker, claim.Token, status, nullableUUID(item.ScannerRunID),
-			at, nullableString(reason),
+			WHERE ticker=$1
+			  AND report_id IN (
+			    SELECT report_id::uuid FROM unnest($2::text[]) expected(report_id)
+			  )
+			  AND promotion_status='processing'
+			  AND promotion_claim_token=$3`,
+			claim.Ticker, claim.ReportIDs, claim.Token, status,
+			nullableUUID(item.ScannerRunID), at, nullableString(reason),
 		)
 		if err != nil {
 			return fmt.Errorf("complete political disclosure watchlist promotion: %w", err)
 		}
-		if tag.RowsAffected() != int64(claim.ReportCount) {
+		if tag.RowsAffected() != int64(len(claim.ReportIDs)) {
 			return &ScannerSourcePromotionClaimError{Source: "political_disclosure"}
 		}
 	}
 	return nil
+}
+
+func completePoliticalDisclosureReportIDs(reportIDs []string) bool {
+	if len(reportIDs) == 0 {
+		return false
+	}
+	seen := make(map[string]struct{}, len(reportIDs))
+	for _, reportID := range reportIDs {
+		reportID = strings.TrimSpace(reportID)
+		if reportID == "" {
+			return false
+		}
+		if _, duplicate := seen[reportID]; duplicate {
+			return false
+		}
+		seen[reportID] = struct{}{}
+	}
+	return true
 }

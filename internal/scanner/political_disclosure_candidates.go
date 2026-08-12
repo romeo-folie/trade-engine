@@ -46,12 +46,14 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 	out := make([]SwingCandidate, 0, len(tickers))
 	for _, ticker := range tickers {
 		items := byTicker[ticker]
+		reportIDs := make([]string, 0, len(items))
 		parts := make([]string, 0, len(items))
 		var transactionParts []string
 		transactionCount := 0
 		purchaseCount := 0
 		latest := time.Time{}
 		for _, item := range items {
+			reportIDs = append(reportIDs, item.ReportID)
 			transactionCount += item.TransactionCount
 			if item.LatestTransaction.After(latest) {
 				latest = item.LatestTransaction
@@ -89,16 +91,16 @@ func (s *MarketScanner) politicalDisclosureCandidates(
 		)
 		out = append(out, SwingCandidate{
 			Ticker: ticker, Sources: []string{"political_disclosure"},
-			SourceScores:                  map[string]float64{"political_disclosure": disclosureScore},
-			PoliticalDisclosureClaimToken: token,
-			PoliticalDisclosureClaimCount: len(items),
+			SourceScores:                      map[string]float64{"political_disclosure": disclosureScore},
+			PoliticalDisclosureClaimToken:     token,
+			PoliticalDisclosureClaimReportIDs: reportIDs,
 			PoliticalDisclosureEvidence: disclosureEvidence(
 				transactionCount, parts, transactionParts,
 			),
 			PoliticalDisclosureScore: disclosureScore,
 		})
 	}
-	return out, nil
+	return s.hydratePoliticalDisclosureMarketData(ctx, out), nil
 }
 
 func scorePoliticalDisclosure(
@@ -161,7 +163,9 @@ func mergePoliticalDisclosureCandidates(
 		}
 		candidate.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
 		candidate.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
-		candidate.PoliticalDisclosureClaimCount = source.PoliticalDisclosureClaimCount
+		candidate.PoliticalDisclosureClaimReportIDs = append(
+			[]string(nil), source.PoliticalDisclosureClaimReportIDs...,
+		)
 		candidate.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
 		candidate.PoliticalDisclosureScore = source.PoliticalDisclosureScore
 	}
@@ -179,17 +183,19 @@ func attachPoliticalFallback(fallback *SwingCandidate, source SwingCandidate) {
 	}
 	copy.SourceScores["political_disclosure"] = source.PoliticalDisclosureScore
 	copy.PoliticalDisclosureClaimToken = source.PoliticalDisclosureClaimToken
-	copy.PoliticalDisclosureClaimCount = source.PoliticalDisclosureClaimCount
+	copy.PoliticalDisclosureClaimReportIDs = append(
+		[]string(nil), source.PoliticalDisclosureClaimReportIDs...,
+	)
 	copy.PoliticalDisclosureEvidence = source.PoliticalDisclosureEvidence
 	copy.PoliticalDisclosureScore = source.PoliticalDisclosureScore
 	fallback.politicalDisclosureFallback = &copy
 }
 
 // hydratePoliticalDisclosureMarketData prevents a filing-derived symbol from
-// bypassing the normal scanner's tradeability and liquidity evidence. Provider
-// failures remove the political lineage for this cycle and leave its claim for
-// the deferred release path; definitive asset/snapshot failures are terminally
-// recorded so malformed symbols do not churn forever.
+// leaving this source without the tradeability and liquidity evidence required
+// by the normal scanner. Provider failures release claims for a later attempt;
+// definitive asset/snapshot failures are terminally recorded so malformed
+// symbols do not churn forever.
 func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 	ctx context.Context, candidates []SwingCandidate,
 ) []SwingCandidate {
@@ -204,13 +210,15 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 	}
 	if s.StockAssets == nil || s.StockSnapshots == nil {
 		slog.Warn("scanner: political disclosure market-data providers unavailable")
-		return stripPoliticalDisclosureCandidates(candidates)
+		s.releasePoliticalDisclosureClaims(ctx, candidates)
+		return nil
 	}
 
 	assets, err := s.StockAssets.FetchStockAssets(ctx)
 	if err != nil {
 		slog.Warn("scanner: validate political disclosure assets", "err", err)
-		return stripPoliticalDisclosureCandidates(candidates)
+		s.releasePoliticalDisclosureClaims(ctx, candidates)
+		return nil
 	}
 	tradable := make(map[string]struct{}, len(assets))
 	for _, asset := range assets {
@@ -222,7 +230,8 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 	snapshots, err := s.StockSnapshots.FetchStockSnapshots(ctx, political, 100)
 	if err != nil {
 		slog.Warn("scanner: hydrate political disclosure snapshots", "err", err)
-		return stripPoliticalDisclosureCandidates(candidates)
+		s.releasePoliticalDisclosureClaims(ctx, candidates)
+		return nil
 	}
 
 	out := make([]SwingCandidate, 0, len(candidates))
@@ -234,26 +243,17 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 		if _, ok := tradable[candidate.Ticker]; !ok {
 			s.rejectPoliticalDisclosureMarketData(ctx, candidate,
 				"political disclosure symbol is not an active, tradeable US equity")
-			if fallback, ok := candidateAfterPromotionClaimLoss(candidate, "political_disclosure"); ok {
-				out = append(out, fallback)
-			}
 			continue
 		}
 		snapshot, ok := snapshots.Snapshots[candidate.Ticker]
 		if !ok {
 			if failure := snapshots.Failures[candidate.Ticker]; failure != nil {
-				slog.Warn("scanner: political disclosure snapshot unavailable",
-					"ticker", candidate.Ticker, "err", failure)
-				if fallback, keep := candidateAfterPromotionClaimLoss(candidate, "political_disclosure"); keep {
-					out = append(out, fallback)
-				}
+				s.releasePoliticalDisclosureMarketData(ctx, candidate,
+					fmt.Sprintf("political disclosure snapshot unavailable: %v", failure))
 				continue
 			}
 			s.rejectPoliticalDisclosureMarketData(ctx, candidate,
 				"political disclosure symbol has no current market snapshot")
-			if fallback, keep := candidateAfterPromotionClaimLoss(candidate, "political_disclosure"); keep {
-				out = append(out, fallback)
-			}
 			continue
 		}
 		hydratePoliticalSnapshot(&candidate, snapshot)
@@ -264,9 +264,6 @@ func (s *MarketScanner) hydratePoliticalDisclosureMarketData(
 				candidate.Price, candidate.Volume, candidate.DollarVolume,
 				pullbackMinDollarVolume,
 			))
-			if fallback, keep := candidateAfterPromotionClaimLoss(candidate, "political_disclosure"); keep {
-				out = append(out, fallback)
-			}
 			continue
 		}
 		out = append(out, candidate)
@@ -304,25 +301,19 @@ func hydratePoliticalSnapshot(candidate *SwingCandidate, snapshot data.StockSnap
 	}
 }
 
-func stripPoliticalDisclosureCandidates(candidates []SwingCandidate) []SwingCandidate {
-	out := make([]SwingCandidate, 0, len(candidates))
-	for _, candidate := range candidates {
-		if candidate.PoliticalDisclosureClaimToken == "" {
-			out = append(out, candidate)
-			continue
-		}
-		if fallback, ok := candidateAfterPromotionClaimLoss(candidate, "political_disclosure"); ok {
-			out = append(out, fallback)
-		}
-	}
-	return out
-}
-
 func (s *MarketScanner) rejectPoliticalDisclosureMarketData(
 	ctx context.Context, candidate SwingCandidate, reason string,
 ) {
 	s.markPoliticalDisclosureCandidate(ctx, candidate, "failed", "", reason)
 	slog.Warn("scanner: political disclosure candidate rejected",
+		"ticker", candidate.Ticker, "reason", reason)
+}
+
+func (s *MarketScanner) releasePoliticalDisclosureMarketData(
+	ctx context.Context, candidate SwingCandidate, reason string,
+) {
+	s.markPoliticalDisclosureCandidate(ctx, candidate, "pending", "", reason)
+	slog.Warn("scanner: political disclosure candidate released",
 		"ticker", candidate.Ticker, "reason", reason)
 }
 

@@ -71,17 +71,17 @@ type SwingCandidate struct {
 	PremarketEpisodicEvidence   string
 	// PoliticalDisclosureClaimToken fences all pending filing rows for this
 	// ticker that were claimed by the current scanner cycle.
-	PoliticalDisclosureClaimToken string
-	PoliticalDisclosureClaimCount int
-	PoliticalDisclosureEvidence   string
-	PoliticalDisclosureScore      float64
-	politicalDisclosureFallback   *SwingCandidate
-	UniverseVersionID             string
-	UniverseAsOf                  time.Time
-	RemovalStage                  string
-	FailureStage                  string
-	FailureReason                 string
-	News                          []SwingNewsItem
+	PoliticalDisclosureClaimToken     string
+	PoliticalDisclosureClaimReportIDs []string
+	PoliticalDisclosureEvidence       string
+	PoliticalDisclosureScore          float64
+	politicalDisclosureFallback       *SwingCandidate
+	UniverseVersionID                 string
+	UniverseAsOf                      time.Time
+	RemovalStage                      string
+	FailureStage                      string
+	FailureReason                     string
+	News                              []SwingNewsItem
 	// GraphContext, when set, explains why a knowledge-graph neighbour was surfaced
 	// (e.g. "TSMC (on watchlist) supplies_to this company"). Empty for screener
 	// candidates. Injected into the prompt so the LLM weighs the relational thesis.

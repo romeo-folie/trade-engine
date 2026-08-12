@@ -84,8 +84,9 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		claimed[0].PromotionClaimToken != "claim-token" {
 		t.Fatalf("claimed = %+v", claimed)
 	}
+	reportIDs := []string{claimed[0].ReportID, claimed[1].ReportID}
 	item := store.WatchlistItem{Ticker: "TESTDISC", Platform: "stock", Strategies: []string{"political_disclosure"}, Timeframes: []string{"1D"}, MinConfidence: .8, Source: "scanner"}
-	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "stale-token", ReportCount: 2}}, "stale", now)
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "stale-token", ReportIDs: reportIDs}}, "stale", now)
 	var claimErr *store.ScannerSourcePromotionClaimError
 	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
 		t.Fatalf("stale claim error = %v", err)
@@ -97,7 +98,7 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		WHERE report_id=$1 AND ticker=$2`, claimed[0].ReportID, "TESTDISC"); err != nil {
 		t.Fatal(err)
 	}
-	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportCount: 2}}, "incomplete set", now)
+	err = store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportIDs: reportIDs}}, "incomplete set", now)
 	if !errors.As(err, &claimErr) || claimErr.Source != "political_disclosure" {
 		t.Fatalf("incomplete multi-report claim error = %v", err)
 	}
@@ -118,7 +119,7 @@ func TestPoliticalDisclosurePersistenceAndClaimLifecycle(t *testing.T) {
 		WHERE report_id=$1 AND ticker=$2`, claimed[0].ReportID, "TESTDISC", "claim-token", now); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportCount: 2}}, "fixture success", now); err != nil {
+	if err := store.PromoteScannerSourcesToWatchlist(ctx, item, store.ScannerSourcePromotionClaims{PoliticalDisclosure: &store.PoliticalDisclosurePromotionClaim{Ticker: "TESTDISC", Token: "claim-token", ReportIDs: reportIDs}}, "fixture success", now); err != nil {
 		t.Fatal(err)
 	}
 	var promoted int
