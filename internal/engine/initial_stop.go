@@ -34,6 +34,16 @@ func (e *Engine) ensureUncappedProtectiveStop(
 	tradeID, ticker string,
 	quantity, stopPrice float64,
 ) error {
+	return store.WithTradeOrderLock(tradeID, func() error {
+		return e.ensureUncappedProtectiveStopLocked(ctx, tradeID, ticker, quantity, stopPrice)
+	})
+}
+
+func (e *Engine) ensureUncappedProtectiveStopLocked(
+	ctx context.Context,
+	tradeID, ticker string,
+	quantity, stopPrice float64,
+) error {
 	if quantity <= 0 {
 		return fmt.Errorf("protective stop requires positive quantity, got %f", quantity)
 	}
@@ -104,7 +114,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 	if err != nil {
 		return fmt.Errorf("resolve accepted protective-stop intent: %w", err)
 	}
-	status := execution.NormalizeOrderStatus(res.Status)
+	status := execution.NormalizeOrderStatusForTimeInForce(res.Status, stopReq.TimeInForce)
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {
 		fillQty = quantity
@@ -148,7 +158,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 			// Preserve the fill itself before returning. If the broker purges
 			// this terminal order before the next sweep, the reconciler can
 			// still replay the durable quantity, price, and execution time.
-			rollbackStatus := execution.NormalizeOrderStatus(rollbackRes.Status)
+			rollbackStatus := execution.NormalizeOrderStatusForTimeInForce(rollbackRes.Status, stopReq.TimeInForce)
 			if rollbackStatus == "" {
 				rollbackStatus = "filled"
 			}

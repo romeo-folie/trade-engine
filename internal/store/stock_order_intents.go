@@ -69,10 +69,14 @@ func ResolveStockOrderIntentRetryGeneration(ctx context.Context, baseKey string)
 		if !isTerminalZeroFillStockOrderIntent(intent) {
 			return intent, intent.IdempotencyKey, nil
 		}
-		if intent.BrokerOrderID == "" {
-			return nil, "", fmt.Errorf("terminal stock order intent %q has no broker order id", intent.IdempotencyKey)
+		terminalIdentity := intent.BrokerOrderID
+		if terminalIdentity == "" {
+			// A definitive pre-submit rejection has no broker order id, but it
+			// is still a durable terminal generation. Its immutable intent id
+			// yields a stable successor key across retries and restarts.
+			terminalIdentity = "intent-" + intent.ID
 		}
-		nextKey := StockOrderIntentRetryKey(intent.IdempotencyKey, intent.BrokerOrderID)
+		nextKey := StockOrderIntentRetryKey(intent.IdempotencyKey, terminalIdentity)
 		next, err := GetStockOrderIntentByKey(ctx, nextKey)
 		if err != nil {
 			return nil, "", err
@@ -253,19 +257,19 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    WHERE o.stock_intent_id=stock_order_intents.id
                      AND o.trade_id=stock_order_intents.trade_id
                      AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
-                     AND t.status='closed'
+                     AND (stock_order_intents.filled_qty < stock_order_intents.requested_qty - 0.000000001 OR t.status='closed')
                ))
                OR
                (trade_id IS NULL AND (
                    NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id)
                    OR COALESCE((SELECT SUM(COALESCE(o.filled_qty,0)) FROM orders o WHERE o.stock_intent_id=stock_order_intents.id),0)
                         < stock_order_intents.filled_qty - 0.000000001
-                   OR EXISTS (
+                   OR (stock_order_intents.filled_qty >= stock_order_intents.requested_qty - 0.000000001 AND EXISTS (
                        SELECT 1 FROM orders o
                        JOIN trades t ON t.id=o.trade_id
                        WHERE o.stock_intent_id=stock_order_intents.id
                          AND (COALESCE(o.filled_qty,0) < o.quantity - 0.000000001 OR t.status <> 'closed')
-                   )
+                   ))
                ))
            ))
            OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND order_type='stop' AND trade_id IS NOT NULL
@@ -275,7 +279,7 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    WHERE o.stock_intent_id=stock_order_intents.id
                      AND o.trade_id=stock_order_intents.trade_id
                      AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
-                     AND t.status='closed'
+                     AND (stock_order_intents.filled_qty < stock_order_intents.requested_qty - 0.000000001 OR t.status='closed')
                ))
            -- Same order-only completion rule for DAY/fractional standalone
            -- stops. done_for_day is normalized to cancelled before storage.

@@ -654,6 +654,110 @@ func TestStockIntentRecoveryAppliesCumulativeSingleMarketExitProjection(t *testi
 	}
 }
 
+func TestStockIntentRecoveryRetiresTerminalPartialExitAfterApplyingRemainder(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTTERMINALPARTIALEXIT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTTERMINALPARTIALEXIT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+		t.Fatalf("claim exit = %v, %v", claimed, err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-partial-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTTERMINALPARTIALEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, TradeID: tradeID, IntentKey: "software-exit:" + tradeID + ":terminal-partial"}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	result := execution.OrderResult{BrokerOrderID: "terminal-partial-exit", Status: "cancelled", FilledPrice: 105, FilledQty: 2}
+	broker.lookup[in.ClientOrderID] = result
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, result.BrokerOrderID, "cancelled", result.FilledPrice, result.FilledQty, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 210, "cancelled", "exiting")
+	if isRecoverableIntent(t, in.ID) {
+		t.Fatal("applied terminal partial exit remained recoverable")
+	}
+	lookups, attempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.lookups != lookups || countStockIntentAttempts(t, in.ID) != attempts {
+		t.Fatal("terminal partial exit replayed after its cumulative fill was applied")
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 210, "cancelled", "exiting")
+}
+
+func TestStockOrderIntentRetryGenerationUsesIntentIdentityWithoutBrokerID(t *testing.T) {
+	ctx := context.Background()
+	for _, prefix := range []string{"software-exit", "trailing-stop", "protective-stop"} {
+		t.Run(prefix, func(t *testing.T) {
+			key := prefix + ":no-broker:" + fmt.Sprint(time.Now().UnixNano())
+			var id string
+			if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()`).Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			in := store.StockOrderIntent{ID: id, IdempotencyKey: key, ClientOrderID: "no-broker-" + prefix, Ticker: "NOBROKER", Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: []byte(`{}`), PayloadHash: key, Status: "rejected"}
+			if prefix == "software-exit" {
+				in.OrderType = "market"
+			}
+			if err := store.CreateStockOrderIntent(ctx, in); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "", "rejected", 0, 0, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			_, retry, err := store.ResolveStockOrderIntentRetryGeneration(ctx, key)
+			if err != nil || retry != store.StockOrderIntentRetryKey(key, "intent-"+in.ID) {
+				t.Fatalf("retry=%q err=%v", retry, err)
+			}
+			_, again, err := store.ResolveStockOrderIntentRetryGeneration(ctx, key)
+			if err != nil || again != retry {
+				t.Fatalf("repeat retry=%q err=%v", again, err)
+			}
+		})
+	}
+}
+
+func TestTradeOrderLockSerializesRecoveryAndLiveStopWindows(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	second := make(chan struct{})
+	done := make(chan error, 2)
+	go func() {
+		done <- store.WithTradeOrderLock("lock-regression", func() error { close(entered); <-release; return nil })
+	}()
+	<-entered
+	go func() {
+		done <- store.WithTradeOrderLock("lock-regression", func() error { close(second); return nil })
+	}()
+	select {
+	case <-second:
+		t.Fatal("second protective lifecycle entered the cancel-to-submit window concurrently")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-second:
+	default:
+		t.Fatal("serialized second lifecycle never ran")
+	}
+}
+
 func assertCumulativeRecoveredExit(t *testing.T, intentID, tradeID string, wantFill, wantProceeds float64, wantOrderStatus, wantTradeStatus string) {
 	t.Helper()
 	order, err := store.GetOrderByStockIntentAndTrade(context.Background(), intentID, tradeID)

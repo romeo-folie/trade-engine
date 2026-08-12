@@ -470,8 +470,8 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 		return nil
 	}
 	if res.FilledQty <= 0 {
-		if execution.IsTerminalOrderStatus(res.Status) {
-			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatus(res.Status)); err != nil {
+		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)); err != nil {
 				return fmt.Errorf("terminalize recovered zero-fill entry projection: %w", err)
 			}
 		}
@@ -598,6 +598,12 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 // restart: cancel and confirm the old generation before submitting the resized
 // one, so protected working quantity never exceeds the held position.
 func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, tradeID string) error {
+	return store.WithTradeOrderLock(tradeID, func() error {
+		return c.ensureRecoveredProtectiveStopLocked(ctx, parent, req, res, tradeID)
+	})
+}
+
+func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, tradeID string) error {
 	trade, err := store.GetTradeByID(ctx, tradeID)
 	if err != nil {
 		return fmt.Errorf("load recovered protective-stop trade: %w", err)
