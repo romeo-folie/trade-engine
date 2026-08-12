@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -170,8 +171,31 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 		if err := c.projectRecoveredStandaloneStop(ctx, intent, req, res); err != nil {
 			return err
 		}
+		if err := c.projectRecoveredMarketExit(ctx, intent, req, res); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
+	if req.Type != execution.OrderTypeMarket || req.TradeID == "" || !strings.Contains(intent.IdempotencyKey, "exit:") {
+		return nil
+	}
+	if existing, err := store.GetOrderByStockIntentID(ctx, intent.ID); err != nil {
+		return err
+	} else if existing != nil {
+		return nil
+	}
+	_, err := store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: res.BrokerOrderID, Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty, FilledAt: filledAtPtr(res.FilledAt), Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID})
+	return err
+}
+
+func filledAtPtr(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
 
 // projectRecoveredStandaloneStop records an accepted normal protective or

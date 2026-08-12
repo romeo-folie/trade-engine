@@ -942,6 +942,13 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			}
 			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
 		}
+		if linker, ok := m.store.(interface {
+			LinkReplacementOrderIntent(context.Context, string, string) error
+		}); ok {
+			if err := linker.LinkReplacementOrderIntent(ctx, existing.ID, res.BrokerOrderID); err != nil {
+				return fmt.Errorf("link fallback replacement intent: %w", err)
+			}
+		}
 		if fillObserved {
 			return errStopFilledDuringRollback
 		}

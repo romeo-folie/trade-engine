@@ -2502,7 +2502,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
 	}
-	stockIntentID := stockIntentIDForKey(ctx, orderReq.IntentKey)
+	stockIntentID, intentLookupErr := stockIntentIDForKeyStrict(ctx, orderReq.IntentKey)
+	if intentLookupErr != nil {
+		logger.Error("accepted stock order intent projection unavailable", "ticker", sig.Ticker, "err", intentLookupErr)
+		return
+	}
 
 	// Mark signal as executed.
 	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
@@ -2844,6 +2848,17 @@ func stockIntentIDForKey(ctx context.Context, key string) string {
 		return ""
 	}
 	return intent.ID
+}
+
+func stockIntentIDForKeyStrict(ctx context.Context, key string) (string, error) {
+	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if intent == nil {
+		return "", nil
+	}
+	return intent.ID, nil
 }
 
 func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {
