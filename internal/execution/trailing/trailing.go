@@ -923,6 +923,24 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		return fmt.Errorf("place stop: %w", err)
 	}
 	status := execution.NormalizeOrderStatus(res.Status)
+	if isTerminalZeroFill(status, res.FilledQty) {
+		// A prior rollback can leave the deterministic intent bound to a
+		// confirmed-cancelled broker stop. That order is not protection for a
+		// new tick, so advance to a deterministic generation rather than let
+		// coordinator client-id lookup resurrect its terminal response.
+		if res.BrokerOrderID == "" {
+			return errors.New("terminal trailing stop has no broker id for retry generation")
+		}
+		retryReq := stopReq
+		retryReq.IntentKey = trailingStopRetryIntentKey(stopReq.IntentKey, res.BrokerOrderID)
+		retryReq.ClientOrderID = ""
+		res, err = m.exec.PlaceOrder(ctx, retryReq)
+		if err != nil {
+			return fmt.Errorf("place replacement stop generation: %w", err)
+		}
+		stopReq = retryReq
+		status = execution.NormalizeOrderStatus(res.Status)
+	}
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {
 		fillQty = t.Quantity
@@ -1034,6 +1052,14 @@ func trailingStopIntentKey(tradeID string, existing *store.Order, stopPrice, qua
 		predecessor = existing.BrokerOrderID
 	}
 	return fmt.Sprintf("trailing-stop:%s:%s:%.8f:%.8f", tradeID, predecessor, stopPrice, quantity)
+}
+
+func trailingStopRetryIntentKey(previousKey, cancelledBrokerOrderID string) string {
+	return fmt.Sprintf("%s:retry:%s", previousKey, cancelledBrokerOrderID)
+}
+
+func isTerminalZeroFill(status string, filledQty float64) bool {
+	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
 }
 
 func (m *Manager) rollbackUnrecordedStop(

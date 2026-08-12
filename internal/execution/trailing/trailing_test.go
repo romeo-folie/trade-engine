@@ -107,6 +107,7 @@ type fakeStore struct {
 	applied              map[string]float64
 	nextID               int
 	updateReplacementErr error
+	insertErr            error
 	stockIntentIDs       map[string]string
 	stockIntentErr       error
 	replacementIntentIDs map[string]string
@@ -230,6 +231,9 @@ func (f *fakeStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
 func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return "", f.insertErr
+	}
 	f.nextID++
 	id := "order-" + itoa(f.nextID)
 	o.ID = id
@@ -432,6 +436,7 @@ type fakeBroker struct {
 	nextFillPrice float64
 	nextFillQty   float64
 	nextStatus    string // optional override of "pending" on PlaceOrder
+	placeResults  []execution.OrderResult
 	placeErr      error
 }
 
@@ -446,6 +451,15 @@ func (b *fakeBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (
 	b.placed = append(b.placed, req)
 	if b.placeErr != nil {
 		return execution.OrderResult{}, b.placeErr
+	}
+	if len(b.placeResults) > 0 {
+		res := b.placeResults[0]
+		b.placeResults = b.placeResults[1:]
+		if res.BrokerOrderID == "" {
+			b.nextID++
+			res.BrokerOrderID = "broker-" + itoa(b.nextID)
+		}
+		return res, nil
 	}
 	b.nextID++
 	status := "pending"
@@ -1100,6 +1114,49 @@ func TestExitAndCloseDurableIntentLookupFailureWritesNoUnlinkedOrder(t *testing.
 	}
 	if got := fs.trades[trade.ID].Status; got != "exiting" {
 		t.Fatalf("accepted exit must retain claim, got status %q", got)
+	}
+}
+
+func TestManager_RollbackCancelledStopRotatesDurableGeneration(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, Quantity: 2, StopLoss: 90}
+	fs.trades[trade.ID] = trade
+	originalKey := trailingStopIntentKey(trade.ID, nil, 95, trade.Quantity)
+	retryKey := trailingStopRetryIntentKey(originalKey, "rollback-cancelled")
+	fs.stockIntentIDs[originalKey] = "cancelled-generation"
+	fs.stockIntentIDs[retryKey] = "active-generation"
+	fs.insertErr = errors.New("simulated projection write failure")
+	base := &fakeBroker{placeResults: []execution.OrderResult{
+		{BrokerOrderID: "rollback-cancelled", Status: "accepted"},
+		// Next identical tick: coordinator finds the old client id's
+		// confirmed cancellation, then manager must submit retryKey.
+		{BrokerOrderID: "rollback-cancelled", Status: "cancelled"},
+		{BrokerOrderID: "fresh-live-stop", Status: "pending"},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}})
+	if err := m.submitOrReplaceStop(context.Background(), trade, 95, stopExitIntent(95)); err == nil {
+		t.Fatal("first accepted stop should report projection failure after rollback")
+	}
+	if len(fs.orders) != 0 {
+		t.Fatalf("failed first projection persisted an order: %#v", fs.orders)
+	}
+	fs.insertErr = nil
+	if err := m.submitOrReplaceStop(context.Background(), trade, 95, stopExitIntent(95)); err != nil {
+		t.Fatalf("fresh generation after rollback: %v", err)
+	}
+	if len(base.placed) != 3 {
+		t.Fatalf("placements=%d, want accepted + cancelled lookup + fresh generation", len(base.placed))
+	}
+	if base.placed[1].IntentKey != originalKey || base.placed[2].IntentKey != retryKey {
+		t.Fatalf("retry intent keys = %q then %q; want %q then %q", base.placed[1].IntentKey, base.placed[2].IntentKey, originalKey, retryKey)
+	}
+	if len(fs.orders) != 1 {
+		t.Fatalf("active projections=%d, want one", len(fs.orders))
+	}
+	for _, order := range fs.orders {
+		if order.BrokerOrderID != "fresh-live-stop" || order.StockIntentID != "active-generation" || order.Status != "pending" {
+			t.Fatalf("active stop projection=%#v", order)
+		}
 	}
 }
 

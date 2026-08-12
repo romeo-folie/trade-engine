@@ -714,6 +714,14 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		return c.maybeProjectReplacement(ctx, intent, req, res, project)
 	}
 	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
+		if project {
+			// Recovery has already observed no client-id record for this
+			// persisted replacement. A 404 on its predecessor can mean the
+			// original PATCH won before the process died, not that this durable
+			// replacement was rejected. Retain it for a later client-id lookup.
+			_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
+			return execution.OrderResult{}, fmt.Errorf("%w: recovery replacement predecessor unavailable: %v", execution.ErrAmbiguousStopReplacement, err)
+		}
 		_ = c.record(ctx, intent, "replace", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", err)
 	}

@@ -172,6 +172,53 @@ func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing
 	}
 }
 
+func TestStockIntentRecoveryReplacementPredecessor404RemainsAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTRECOVER404")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTRECOVER404", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "88888888-8888-4888-8888-888888888888", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "recover-404-parent", TradeID: tradeID, Ticker: "RINTENTRECOVER404", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "recover-404-old", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := execution.OrderRequest{Ticker: parent.Ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 95, TradeID: tradeID, ReplacesBrokerOrderID: "recover-404-old", IntentKey: "replace:" + parent.IdempotencyKey + ":95.00000000", ClientOrderID: "recover-404-child"}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := store.StockOrderIntent{ID: "99999999-9999-4999-8999-999999999998", IdempotencyKey: req.IntentKey, ClientOrderID: req.ClientOrderID, TradeID: tradeID, ParentIntentID: parent.ID, Ticker: parent.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: payload, PayloadHash: "recover-404", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.patchErr = &execution.BrokerRequestError{StatusCode: 404, Message: "predecessor already replaced"}
+	coordinator := stockorders.New(broker)
+	if err := coordinator.Recover(ctx); !errors.Is(err, execution.ErrAmbiguousStopReplacement) {
+		t.Fatalf("recovery error = %v, want ambiguous replacement", err)
+	}
+	got := intentForKey(t, req.IntentKey)
+	if got.Status != "pending" {
+		t.Fatalf("recovery 404 terminalized intent=%q", got.Status)
+	}
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "recover-404-winner", Status: "accepted"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var brokerID, intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil || brokerID != "recover-404-winner" || intentID != child.ID {
+		t.Fatalf("recovered 404 replacement broker=%q intent=%q err=%v", brokerID, intentID, err)
+	}
+}
+
 func insertRecoverySignal(t *testing.T, ticker string) string {
 	t.Helper()
 	id, err := store.InsertSignal(context.Background(), store.Signal{
