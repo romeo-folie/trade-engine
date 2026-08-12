@@ -1,0 +1,4 @@
+# Trade-engine model routing. Keep this aligned with the mandatory rules in
+# ../AGENTS.md.
+model = "gpt-5.6-terra"
+review_model = "gpt-5.6-sol"

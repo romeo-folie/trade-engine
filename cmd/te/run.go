@@ -71,11 +71,34 @@ Modes:
 		if err != nil {
 			return err
 		}
+
+		// Resolve runtime values before validation so the final configuration uses
+		// the documented YAML → DB → CLI precedence.
+		startupCtx := context.Background()
+		var overrideLookup runtimeOverrideLookup
+		var dbUnavailableErr error
+		if err := store.Connect(startupCtx); err != nil {
+			dbUnavailableErr = err
+		} else {
+			defer store.Close()
+			overrideLookup = store.GetOverride
+		}
+		mode, err := resolveRunMode(startupCtx, cfg.Engine.Mode, runMode, overrideLookup)
+		if err != nil {
+			return err
+		}
+		cfg.Engine.Mode = mode
 		if errs := config.Validate(cfg); len(errs) > 0 {
 			for _, e := range errs {
 				fmt.Fprintf(os.Stderr, "config error: %s\n", e)
 			}
 			return fmt.Errorf("invalid configuration (%d error(s)); fix config before starting", len(errs))
+		}
+		if err := config.ValidateStockBrokerConfig(cfg.Markets.Stocks); err != nil {
+			return err
+		}
+		if err := config.ValidateStockWorkflowConfig(mode, cfg.Markets.Stocks); err != nil {
+			return err
 		}
 		if err := logger.InitWithRotation(cfg.Logging.Level, cfg.Logging.Format, logger.RotationConfig{
 			MaxSizeMB:  cfg.Logging.MaxSizeMB,
@@ -85,28 +108,16 @@ Modes:
 		}); err != nil {
 			return err
 		}
-
-		// CLI --mode flag overrides config.
-		mode := cfg.Engine.Mode
-		if runMode != "" {
-			mode = runMode
+		if dbUnavailableErr != nil {
+			logger.Warn("database unavailable — running without DB", "err", dbUnavailableErr.Error())
 		}
+
 		// CLI --session flag overrides forex_orb.session.
 		if runSession != "" {
 			cfg.ForexORB.Session = runSession
 		}
 		if runDryRun || cfg.Engine.DryRun {
 			logger.Info("dry-run mode — no orders will be placed")
-		}
-
-		// Connect to DB and check for a DB-level mode override.
-		if err := store.Connect(context.Background()); err != nil {
-			logger.Warn("database unavailable — running without DB", "err", err.Error())
-		} else {
-			defer store.Close()
-			if dbMode, ok, err := store.GetOverride(context.Background(), "engine.mode"); err == nil && ok {
-				mode = dbMode
-			}
 		}
 
 		// Write PID file.
@@ -142,11 +153,13 @@ Modes:
 			logger.Warn("news API key not set — news fetching disabled")
 		}
 
-		// Wire Alpaca broker if API key is set; otherwise PaperExecutor is used as fallback.
+		// Wire Alpaca broker only when stock execution is enabled; otherwise the
+		// engine's local PaperExecutor fallback remains in use.
 		var broker execution.Executor
-		if cfg.Markets.Stocks.APIKey != "" {
+		if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.APIKey != "" {
 			broker = execution.NewAlpacaBroker(cfg.Markets.Stocks)
 		}
+		broker = protectDryRunStockExecutor(broker, mode, runDryRun || cfg.Engine.DryRun)
 		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
 
 		// Tag portfolio snapshots with mode (live/paper) and broker name (Phase 18).
@@ -154,13 +167,7 @@ Modes:
 		if !cfg.Markets.Stocks.Paper {
 			portfolioMode = "live"
 		}
-		portfolioBroker := ""
-		switch broker.(type) {
-		case *execution.AlpacaBroker:
-			portfolioBroker = "alpaca"
-		case *execution.IBKRBroker:
-			portfolioBroker = "ibkr"
-		}
+		portfolioBroker := brokerName(broker)
 		eng.Portfolio().SetTags(portfolioMode, portfolioBroker)
 
 		// Graceful shutdown on SIGTERM / SIGINT.

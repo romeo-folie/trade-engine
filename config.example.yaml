@@ -168,7 +168,10 @@ models:
 markets:
   stocks:
     enabled: true
-    paper: true                # Paper trading on Alpaca sandbox
+    paper: true                # true = paper-api.alpaca.markets; false = api.alpaca.markets
+    # Optional: fail preflight if the configured credentials select another account.
+    # Use separate paper/live credentials through the env vars on each deployment.
+    expected_account_number: ""
     api_key_env: ALPACA_API_KEY
     secret_env: ALPACA_API_SECRET
     base_url: https://paper-api.alpaca.markets

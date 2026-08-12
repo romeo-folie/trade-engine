@@ -12,16 +12,28 @@ import (
 var ErrBrokerUnavailable = errors.New("broker view unavailable")
 
 // BrokerAccount is the canonical broker-side account snapshot used by the
-// portfolio web handlers. Fields are populated when the broker exposes them
-// and zero-valued otherwise — callers must tolerate zero values.
+// portfolio web handlers and stock preflight. Account identity deliberately
+// does not serialize: it is only displayed by the explicit local preflight
+// command.
 type BrokerAccount struct {
-	AccountID   string    `json:"account_id"`
-	Equity      float64   `json:"equity"`
-	LastEquity  float64   `json:"last_equity"` // previous trading day close
-	Cash        float64   `json:"cash"`
-	BuyingPower float64   `json:"buying_power"`
-	Currency    string    `json:"currency"`
-	FetchedAt   time.Time `json:"fetched_at"`
+	AccountID                string    `json:"-"`
+	AccountNumber            string    `json:"-"`
+	Status                   string    `json:"status"`
+	Equity                   float64   `json:"equity"`
+	LastEquity               float64   `json:"last_equity"` // previous trading day close
+	Cash                     float64   `json:"cash"`
+	BuyingPower              float64   `json:"buying_power"`
+	RegTBuyingPower          float64   `json:"regt_buying_power"`
+	DayTradingBuyingPower    float64   `json:"daytrading_buying_power"`
+	NonMarginableBuyingPower float64   `json:"non_marginable_buying_power"`
+	Multiplier               float64   `json:"multiplier"`
+	Currency                 string    `json:"currency"`
+	TradingBlocked           bool      `json:"trading_blocked"`
+	TransfersBlocked         bool      `json:"transfers_blocked"`
+	AccountBlocked           bool      `json:"account_blocked"`
+	TradeSuspendedByUser     bool      `json:"trade_suspended_by_user"`
+	ShortingEnabled          bool      `json:"shorting_enabled"`
+	FetchedAt                time.Time `json:"fetched_at"`
 }
 
 // BrokerPosition is the canonical broker-side open position.

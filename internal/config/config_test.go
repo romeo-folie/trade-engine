@@ -406,6 +406,76 @@ func TestValidateInvalidMode(t *testing.T) {
 	}
 }
 
+func TestValidateStockBrokerConfigPaperLiveHostMatrix(t *testing.T) {
+	tests := []struct {
+		name    string
+		paper   bool
+		baseURL string
+		wantErr bool
+	}{
+		{"paper canonical", true, AlpacaPaperTradingURL, false},
+		{"live canonical", false, AlpacaLiveTradingURL, false},
+		{"paper pointed live", true, AlpacaLiveTradingURL, true},
+		{"live pointed paper", false, AlpacaPaperTradingURL, true},
+		{"unknown host", true, "https://example.com", true},
+		{"non HTTPS", true, "http://paper-api.alpaca.markets", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateStockBrokerConfig(StocksConfig{Enabled: true, Paper: tt.paper, BaseURL: tt.baseURL})
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateStockBrokerConfig() error = %v, wantErr %t", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateStockBrokerConfigDisabledSkipsHostValidation(t *testing.T) {
+	if err := ValidateStockBrokerConfig(StocksConfig{Enabled: false, BaseURL: "not a URL"}); err != nil {
+		t.Fatalf("disabled stocks config rejected: %v", err)
+	}
+}
+
+func TestValidateStockWorkflowConfig(t *testing.T) {
+	if err := ValidateStockWorkflowConfig("paper", StocksConfig{Enabled: true, Paper: true}); err != nil {
+		t.Fatalf("paper workflow + paper Alpaca rejected: %v", err)
+	}
+	if err := ValidateStockWorkflowConfig("paper", StocksConfig{Enabled: true, Paper: false}); err == nil {
+		t.Fatal("paper workflow + live Alpaca accepted")
+	}
+	if err := ValidateStockWorkflowConfig("auto", StocksConfig{Enabled: true, Paper: true}); err != nil {
+		t.Fatalf("auto paper testing rejected: %v", err)
+	}
+	if err := ValidateStockWorkflowConfig("auto", StocksConfig{Enabled: true, Paper: false}); err != nil {
+		t.Fatalf("auto live execution rejected: %v", err)
+	}
+	for _, paper := range []bool{true, false} {
+		if err := ValidateStockWorkflowConfig("manual", StocksConfig{Enabled: true, Paper: paper}); err != nil {
+			t.Fatalf("manual paper=%t rejected: %v", paper, err)
+		}
+	}
+}
+
+func TestValidateStocksCredentialsRequireBothWhenEnabled(t *testing.T) {
+	keyEnv, secretEnv := "TE_TEST_ALPACA_KEY", "TE_TEST_ALPACA_SECRET"
+	t.Setenv(keyEnv, "")
+	t.Setenv(secretEnv, "")
+	cfg := Defaults()
+	cfg.Markets.Stocks.Enabled = true
+	cfg.Markets.Stocks.APIKeyEnv = keyEnv
+	cfg.Markets.Stocks.SecretEnv = secretEnv
+	errs := Validate(cfg)
+	if !containsStr(errs, keyEnv) || !containsStr(errs, secretEnv) {
+		t.Fatalf("missing stock credentials were not both reported: %v", errs)
+	}
+
+	cfg.Markets.Stocks.Enabled = false
+	errs = Validate(cfg)
+	if containsStr(errs, keyEnv) || containsStr(errs, secretEnv) {
+		t.Fatalf("disabled stocks still required credentials: %v", errs)
+	}
+}
+
 func TestValidateValidModes(t *testing.T) {
 	for _, mode := range []string{"manual", "auto", "paper", "orb", "forex", "orb-forex", "orb-futures", "orb-futures-metals", "orb-newyork"} {
 		cfg := Defaults()
