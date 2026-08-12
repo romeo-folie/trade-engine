@@ -27,6 +27,19 @@ type liveStore struct{}
 // Use in production wiring; unit tests should construct a fake instead.
 func LiveStore() TradeStore { return liveStore{} }
 
+// StockIntentIDForKey is an optional extension consumed only by standard-stock
+// durable execution; non-durable test stores need not implement it.
+func (liveStore) StockIntentIDForKey(ctx context.Context, key string) (string, error) {
+	if !store.IsConnected() {
+		return "", errStoreNotConnected
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil || intent == nil {
+		return "", err
+	}
+	return intent.ID, nil
+}
+
 func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	if !store.IsConnected() {
 		// Empty result + nil error: UpdateAll iterates zero trades, logs

@@ -149,6 +149,29 @@ func TestStockIntentRecoveryWorkingZeroFillCreatesNoPhantomTrade(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTTERMINALZERO")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-zero", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTTERMINALZERO", 1)
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	if _, err := store.InsertOrder(ctx, store.Order{BrokerOrderID: "terminal-zero", Ticker: req.Ticker, Side: "buy", OrderType: "market", Quantity: 1, Status: "pending", StockIntentID: in.ID}); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "terminal-zero", Status: "cancelled"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order, err := store.GetOrderByStockIntentID(ctx, in.ID)
+	if err != nil || order == nil || order.Status != "cancelled" {
+		t.Fatalf("terminal zero order = %#v, %v", order, err)
+	}
+}
+
 func TestStockIntentRecoveryPartialFillIsCumulativeAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	signalID := insertRecoverySignal(t, "RINTENTPARTIAL")
@@ -378,6 +401,12 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	}
 	if _, err := coordinator.ReplaceStopOrder(ctx, "new-stop", 92); err != nil {
 		t.Fatalf("ratchet replacement: %v", err)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID); err != nil {
+		t.Fatal(err)
+	}
+	if brokerID != "new-stop" {
+		t.Fatalf("direct replacement must leave mutable row for trailing owner, got %s", brokerID)
 	}
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&count); err != nil || count != 1 {

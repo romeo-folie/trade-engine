@@ -149,7 +149,7 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 		}
 		var res execution.OrderResult
 		if req.ReplacesBrokerOrderID != "" {
-			res, err = c.submitReplacement(ctx, intent, req)
+			res, err = c.submitReplacement(ctx, intent, req, true)
 		} else {
 			res, err = c.submit(ctx, intent, req)
 		}
@@ -167,7 +167,15 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 // process died before the normal engine persisted its projections. A working
 // zero-fill order remains order-only: it is not a trade or a phantom position.
 func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
-	if !strings.HasPrefix(intent.IdempotencyKey, "entry:") || res.FilledQty <= 0 {
+	if !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
+		return nil
+	}
+	if res.FilledQty <= 0 {
+		if execution.IsTerminalOrderStatus(res.Status) {
+			if err := store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatus(res.Status)); err != nil {
+				return fmt.Errorf("terminalize recovered zero-fill entry projection: %w", err)
+			}
+		}
 		return nil
 	}
 	signalID := strings.TrimPrefix(intent.IdempotencyKey, "entry:")
@@ -425,7 +433,7 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
 			return execution.OrderResult{}, err
 		}
-		return c.submitReplacement(ctx, *intent, req)
+		return c.submitReplacement(ctx, *intent, req, false)
 	}
 	intent = &store.StockOrderIntent{
 		ID: intentUUID(), IdempotencyKey: key, ClientOrderID: req.ClientOrderID,
@@ -436,16 +444,16 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 	if err := store.CreateStockOrderIntent(ctx, *intent); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("persist stock stop replacement intent before submit: %w", err)
 	}
-	return c.submitReplacement(ctx, *intent, req)
+	return c.submitReplacement(ctx, *intent, req, false)
 }
 
-func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest) (execution.OrderResult, error) {
+func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, project bool) (execution.OrderResult, error) {
 	lookup, hasLookup := c.inner.(execution.ClientOrderLookup)
 	if hasLookup {
 		prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if err == nil {
 			_ = c.record(ctx, intent, "replace_lookup", "found", prior, "", false)
-			return c.projectReplacement(ctx, intent, req, prior)
+			return c.maybeProjectReplacement(ctx, intent, req, prior, project)
 		}
 		if !errors.Is(err, execution.ErrOrderNotFound) {
 			_ = c.record(ctx, intent, "replace_lookup", "error", execution.OrderResult{}, err.Error(), false)
@@ -461,14 +469,14 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 	res, err := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 	if err == nil {
 		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
-		return c.projectReplacement(ctx, intent, req, res)
+		return c.maybeProjectReplacement(ctx, intent, req, res, project)
 	}
 	_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	if hasLookup {
 		prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if lookupErr == nil {
 			_ = c.record(ctx, intent, "replace_lookup_after_ambiguous", "found", prior, "", true)
-			return c.projectReplacement(ctx, intent, req, prior)
+			return c.maybeProjectReplacement(ctx, intent, req, prior, project)
 		}
 		if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
 			return execution.OrderResult{}, fmt.Errorf("ambiguous stock stop replacement (%v); client-id lookup failed: %w", err, lookupErr)
@@ -476,12 +484,19 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		res, replayErr := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 		if replayErr == nil {
 			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
-			return c.projectReplacement(ctx, intent, req, res)
+			return c.maybeProjectReplacement(ctx, intent, req, res, project)
 		}
 		_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", replayErr)
 	}
 	return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", err)
+}
+
+func (c *Coordinator) maybeProjectReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, project bool) (execution.OrderResult, error) {
+	if !project {
+		return res, nil
+	}
+	return c.projectReplacement(ctx, intent, req, res)
 }
 
 // projectReplacement atomically advances the one mutable stop row after an

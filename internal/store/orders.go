@@ -132,6 +132,13 @@ func GetOrderByStockIntentID(ctx context.Context, intentID string) (*Order, erro
 	return &o, nil
 }
 
+// UpdateOrderStatusByStockIntent terminalizes an order-only zero-fill entry.
+// It deliberately has no trade condition because no position was projected.
+func UpdateOrderStatusByStockIntent(ctx context.Context, intentID, status string) error {
+	_, err := GetDB().Exec(ctx, `UPDATE orders SET status=$2, updated_at=NOW() WHERE stock_intent_id=$1::uuid`, intentID, status)
+	return err
+}
+
 // AttachOrderToTradeByStockIntent completes an initially order-only entry
 // projection after the broker reports its first fill. It is intentionally
 // idempotent so replay never reassigns another trade's order.

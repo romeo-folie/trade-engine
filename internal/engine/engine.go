@@ -2524,6 +2524,10 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}); err != nil {
 			logger.Warn("insert unfilled entry intent projection", "ticker", sig.Ticker, "err", err)
 		}
+		// Keep the normal 3-second fill cadence even though there is no trade
+		// row yet. The coordinator turns the immutable intent into the one
+		// trade/order projection as soon as broker truth shows a fill.
+		e.pollUnfilledStockIntent(orderReq.IntentKey, result.BrokerOrderID)
 		return
 	}
 
@@ -2841,6 +2845,43 @@ func stockIntentIDForKey(ctx context.Context, key string) string {
 	}
 	return intent.ID
 }
+
+func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {
+	if brokerOrderID == "" {
+		return
+	}
+	recoverer, ok := e.executor.(interface{ Recover(context.Context) error })
+	if !ok {
+		return
+	}
+	go func() {
+		const retries = 40
+		for attempt := 0; attempt < retries; attempt++ {
+			time.Sleep(unfilledEntryPollDelay)
+			pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			status, err := e.executor.GetOrderStatus(pollCtx, brokerOrderID)
+			cancel()
+			if err != nil {
+				continue
+			}
+			if status.FilledQty <= 0 && !execution.IsTerminalOrderStatus(status.Status) {
+				continue
+			}
+			recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			err = recoverer.Recover(recoverCtx)
+			recoverCancel()
+			if err != nil {
+				logger.Warn("unfilled entry recovery", "intent_key", intentKey, "broker_order_id", brokerOrderID, "err", err)
+				continue
+			}
+			if execution.IsTerminalOrderStatus(status.Status) {
+				return
+			}
+		}
+	}()
+}
+
+var unfilledEntryPollDelay = 3 * time.Second
 
 // ApproveSignal approves a pending signal and executes it. Called from CLI / Telegram.
 func (e *Engine) ApproveSignal(ctx context.Context, sigID string) error {

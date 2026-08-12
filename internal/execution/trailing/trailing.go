@@ -894,7 +894,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		}
 	}
 
-	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
+	stopReq := execution.OrderRequest{
 		Ticker:      t.Ticker,
 		Side:        side,
 		Type:        execution.OrderTypeStop,
@@ -903,7 +903,8 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		TradeID:     t.ID,
 		TimeInForce: protectiveStopTIF(t.Quantity),
 		IntentKey:   trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
-	})
+	}
+	res, err := m.exec.PlaceOrder(ctx, stopReq)
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
@@ -942,6 +943,16 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		}
 		return nil
 	}
+	stockIntentID := ""
+	if lookup, ok := m.store.(interface {
+		StockIntentIDForKey(context.Context, string) (string, error)
+	}); ok {
+		var lookupErr error
+		stockIntentID, lookupErr = lookup.StockIntentIDForKey(ctx, stopReq.IntentKey)
+		if lookupErr != nil {
+			return fmt.Errorf("load trailing stop intent: %w", lookupErr)
+		}
+	}
 	_, err = m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,
 		BrokerOrderID: res.BrokerOrderID,
@@ -957,6 +968,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		ExitReason:    intent.Reason,
 		ExitEvidence:  intent.Evidence,
 		FilledAt:      timePtr(res.FilledAt),
+		StockIntentID: stockIntentID,
 	})
 	if err != nil {
 		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {

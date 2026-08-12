@@ -107,10 +107,15 @@ type fakeStore struct {
 	applied              map[string]float64
 	nextID               int
 	updateReplacementErr error
+	stockIntentIDs       map[string]string
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}}
+	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}}
+}
+
+func (f *fakeStore) StockIntentIDForKey(_ context.Context, key string) (string, error) {
+	return f.stockIntentIDs[key], nil
 }
 
 func (f *fakeStore) GetOpenTrades(_ context.Context) ([]store.Trade, error) {
@@ -721,6 +726,7 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	// Fewer than nine completed daily candles makes EMA calculation fail.
 	fp := &fakePrices{candles: dailyCloses(100, 101, 102)}
 	fb := &fakeBroker{}
+	fs.stockIntentIDs[trailingStopIntentKey("t1", nil, 95, 10)] = "durable-stop-intent"
 
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
 	m.now = func() time.Time {
@@ -738,6 +744,11 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
 	} else if stop.IntentKey == "" {
 		t.Fatal("protective stop must carry a durable intent key")
+	}
+	for _, order := range fs.orders {
+		if order.StockIntentID != "durable-stop-intent" {
+			t.Fatalf("standalone trailing stop intent link = %q", order.StockIntentID)
+		}
 	}
 }
 
