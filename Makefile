@@ -12,7 +12,6 @@ LOCAL_BIN_DIR ?= $(HOME)/.local/bin
 .PHONY: frontend-build
 frontend-build: ## Build the React frontend directly into the Go embed target
 	cd $(FRONTEND_DIR) && npm install --silent && npm run build
-	@touch $(EMBED_DIR)/.gitkeep
 	@echo "Frontend built → $(EMBED_DIR)"
 
 .PHONY: build
