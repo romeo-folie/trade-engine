@@ -938,6 +938,154 @@ func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T
 	}
 }
 
+func TestStockIntentRecoveryRepairsSparseAggregateAnalystExitProjections(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTSPARSEAGGEXIT"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeA, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tradeB, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	for _, tradeID := range []string{tradeA, tradeB} {
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit %s = %v, %v", tradeID, claimed, err)
+		}
+	}
+	claimed, err := store.GetExitingTradesForSellSignal(ctx, ticker, signalID)
+	if err != nil || len(claimed) != 2 {
+		t.Fatalf("claimed lots = %#v, %v", claimed, err)
+	}
+	key := "analyst-exit:" + signalID + ":" + ticker
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "sparse-aggregate-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 10, IntentKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+
+	// Simulate an insert crash after the later lot's projection was written but
+	// before the first lot existed. The recovery must still give the first lot
+	// all three shares from this cumulative snapshot.
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: claimed[1].ID, BrokerOrderID: "sparse-aggregate-exit", Ticker: ticker, Side: "sell", OrderType: "market", Quantity: 5, Status: "pending", StockIntentID: in.ID}); err != nil {
+		t.Fatal(err)
+	}
+	partial := execution.OrderResult{BrokerOrderID: "sparse-aggregate-exit", Status: "partially_filled", FilledPrice: 110, FilledQty: 3}
+	broker.lookup[in.ClientOrderID] = partial
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, partial.BrokerOrderID, "partial", partial.FilledPrice, partial.FilledQty, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, claimed[0].ID, 3, 330, "partial", "exiting")
+	assertUnfilledRecoveredExit(t, in.ID, claimed[1].ID)
+
+	// Replaying the identical broker snapshot must not book its P&L twice.
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, claimed[0].ID, 3, 330, "partial", "exiting")
+	assertUnfilledRecoveredExit(t, in.ID, claimed[1].ID)
+
+	// Later cumulative fills cross the lot boundary in the same original order.
+	partial.FilledQty = 7
+	broker.lookup[in.ClientOrderID] = partial
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, claimed[0].ID, 5, 550, "partial", "exiting")
+	assertCumulativeRecoveredExit(t, in.ID, claimed[1].ID, 2, 220, "partial", "exiting")
+
+	filled := partial
+	filled.Status, filled.FilledQty = "filled", 10
+	broker.lookup[in.ClientOrderID] = filled
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, claimed[0].ID, 5, 550, "filled", "closed")
+	assertCumulativeRecoveredExit(t, in.ID, claimed[1].ID, 5, 550, "filled", "closed")
+	if isRecoverableIntent(t, in.ID) {
+		t.Fatal("terminal sparse aggregate intent remained recoverable")
+	}
+}
+
+func assertUnfilledRecoveredExit(t *testing.T, intentID, tradeID string) {
+	t.Helper()
+	order, err := store.GetOrderByStockIntentAndTrade(context.Background(), intentID, tradeID)
+	if err != nil || order == nil || order.FilledQty != 0 {
+		t.Fatalf("unfilled recovered exit order = %#v, %v", order, err)
+	}
+	var realizedQty, realizedProceeds float64
+	var status string
+	if err := store.GetDB().QueryRow(context.Background(), `SELECT realized_exit_qty, realized_exit_proceeds, status FROM trades WHERE id=$1::uuid`, tradeID).Scan(&realizedQty, &realizedProceeds, &status); err != nil {
+		t.Fatal(err)
+	}
+	if realizedQty != 0 || realizedProceeds != 0 || status != "exiting" {
+		t.Fatalf("unfilled recovered exit realization = qty %v proceeds %v status %q", realizedQty, realizedProceeds, status)
+	}
+}
+
+func TestStockIntentRecoveryAllocatesMiddleSparseAggregateProjectionInClaimOrder(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTMIDDLESPARSEAGG"
+	signalID := insertRecoverySignal(t, ticker)
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	for i := 0; i < 3; i++ {
+		tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit %s = %v, %v", tradeID, claimed, err)
+		}
+	}
+	claimed, err := store.GetExitingTradesForSellSignal(ctx, ticker, signalID)
+	if err != nil || len(claimed) != 3 {
+		t.Fatalf("claimed lots = %#v, %v", claimed, err)
+	}
+	key := "analyst-exit:" + signalID + ":" + ticker
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "middle-sparse-aggregate", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 6, IntentKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+
+	// This explicitly models a failed middle insert followed by a later retry
+	// that persisted the third row. The missing middle row must still receive
+	// the next share, before the existing third row.
+	for _, trade := range []store.Trade{claimed[0], claimed[2]} {
+		if _, err := store.InsertOrder(ctx, store.Order{TradeID: trade.ID, BrokerOrderID: "middle-sparse-aggregate", Ticker: ticker, Side: "sell", OrderType: "market", Quantity: 2, Status: "pending", StockIntentID: in.ID}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	partial := execution.OrderResult{BrokerOrderID: "middle-sparse-aggregate", Status: "partially_filled", FilledPrice: 110, FilledQty: 3}
+	broker.lookup[in.ClientOrderID] = partial
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, partial.BrokerOrderID, "partial", partial.FilledPrice, partial.FilledQty, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []float64{2, 1, 0} {
+		order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, claimed[i].ID)
+		if err != nil || order == nil || order.FilledQty != want {
+			t.Fatalf("lot %d allocation = %#v, %v; want %v", i, order, err, want)
+		}
+	}
+}
+
 func TestStockIntentRecoveryCompletesPartialAggregateMarketExitProjection(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {

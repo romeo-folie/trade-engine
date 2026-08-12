@@ -260,28 +260,51 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 		return fmt.Errorf("analyst stock exit %s has no claimed trade links", intent.ClientOrderID)
 	}
 
-	// The broker's FilledQty is cumulative across the one aggregate order.
-	// First reserve every existing lot row's original capacity. This preserves
-	// allocation after a process dies halfway through projecting the lots, even
-	// if an earlier lot has since been fully closed and is absent from `trades`.
+	// The broker's FilledQty is cumulative across the one aggregate order. Build
+	// the complete live claim list in its original claim order before assigning
+	// any capacity. An existing projection for a later lot must not consume
+	// shares that belong to an earlier lot whose row was lost in a crash window.
 	existingOrders, err := store.GetOrdersByStockIntent(ctx, intent.ID)
 	if err != nil {
 		return fmt.Errorf("load analyst exit projections: %w", err)
 	}
-	remainingFill := math.Max(0, res.FilledQty)
-	allocations := make(map[string]float64, len(trades))
+	existingByTrade := make(map[string]store.Order, len(existingOrders))
 	for _, order := range existingOrders {
+		existingByTrade[order.TradeID] = order
+	}
+
+	// Make every currently claimed lot durable before applying this broker
+	// snapshot. This makes fill allocation independent of sparse inserts left by
+	// a process crash between individual projection rows.
+	for _, trade := range trades {
+		if _, exists := existingByTrade[trade.ID]; exists {
+			continue
+		}
+		if _, err := c.ensureRecoveredMarketExitProjection(ctx, intent, req, res, trade.ID, trade.Quantity); err != nil {
+			return err
+		}
+		existingByTrade[trade.ID] = store.Order{TradeID: trade.ID, Quantity: trade.Quantity}
+	}
+
+	// Fully closed lots no longer appear in `trades`; preserve their capacity
+	// ahead of the live claim list on a later cumulative broker snapshot.
+	liveTrades := make(map[string]struct{}, len(trades))
+	for _, trade := range trades {
+		liveTrades[trade.ID] = struct{}{}
+	}
+	remainingFill := math.Max(0, res.FilledQty)
+	for _, order := range existingOrders {
+		if _, live := liveTrades[order.TradeID]; live {
+			continue
+		}
 		allocation := math.Min(math.Max(0, order.Quantity), remainingFill)
 		remainingFill -= allocation
-		allocations[order.TradeID] = allocation
 	}
 	for _, trade := range trades {
-		allocation, exists := allocations[trade.ID]
-		if !exists {
-			allocation = math.Min(math.Max(0, trade.Quantity), remainingFill)
-			remainingFill -= allocation
-		}
-		if err := c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, trade.ID, trade.Quantity, allocation); err != nil {
+		quantity := existingByTrade[trade.ID].Quantity
+		allocation := math.Min(math.Max(0, quantity), remainingFill)
+		remainingFill -= allocation
+		if err := c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, trade.ID, quantity, allocation); err != nil {
 			return err
 		}
 	}
@@ -299,10 +322,9 @@ func analystExitSignalID(key, ticker string) (string, bool) {
 	return parts[0], len(parts) == 2 && parts[0] != "" && parts[1] == ticker
 }
 
-// projectRecoveredMarketExitAllocation completes one durable exit-order link.
-// It first writes the assigned broker cumulative fill and then atomically
-// applies it to the claimed trade. A retry sees the same row and is a no-op
-// once the trade has already been finalized.
+// projectRecoveredMarketExitAllocation completes one durable exit-order link
+// and atomically applies its assigned cumulative fill to the claimed trade. A
+// retry sees the same row and is a no-op once the trade has been finalized.
 func (c *Coordinator) projectRecoveredMarketExitAllocation(
 	ctx context.Context,
 	intent store.StockOrderIntent,
@@ -311,30 +333,9 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 	tradeID string,
 	quantity, allocatedFill float64,
 ) error {
-	existing, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, tradeID)
+	orderID, err := c.ensureRecoveredMarketExitProjection(ctx, intent, req, res, tradeID, quantity)
 	if err != nil {
 		return err
-	}
-	orderID := ""
-	if existing != nil {
-		orderID = existing.ID
-	} else {
-		brokerID := res.BrokerOrderID
-		if brokerID == "" {
-			brokerID = intent.BrokerOrderID
-		}
-		if brokerID == "" {
-			return fmt.Errorf("recovered market exit %s has no broker order id", intent.ClientOrderID)
-		}
-		orderID, err = store.InsertOrderWithRetry(ctx, store.Order{
-			TradeID: tradeID, BrokerOrderID: brokerID, Ticker: req.Ticker,
-			Side: string(req.Side), OrderType: string(req.Type), Quantity: quantity,
-			FilledPrice: res.FilledPrice, FilledQty: allocatedFill, FilledAt: filledAtPtr(res.FilledAt),
-			Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID,
-		})
-		if err != nil {
-			return fmt.Errorf("project recovered market exit order: %w", err)
-		}
 	}
 	if allocatedFill <= 0 {
 		return nil
@@ -353,6 +354,42 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 		}
 	}
 	return nil
+}
+
+// ensureRecoveredMarketExitProjection creates one per-lot order row without
+// consuming aggregate broker fill. Allocation happens only after every claimed
+// lot has a durable projection, so sparse crash states keep claim ordering.
+func (c *Coordinator) ensureRecoveredMarketExitProjection(
+	ctx context.Context,
+	intent store.StockOrderIntent,
+	req execution.OrderRequest,
+	res execution.OrderResult,
+	tradeID string,
+	quantity float64,
+) (string, error) {
+	existing, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, tradeID)
+	if err != nil {
+		return "", err
+	}
+	if existing != nil {
+		return existing.ID, nil
+	}
+	brokerID := res.BrokerOrderID
+	if brokerID == "" {
+		brokerID = intent.BrokerOrderID
+	}
+	if brokerID == "" {
+		return "", fmt.Errorf("recovered market exit %s has no broker order id", intent.ClientOrderID)
+	}
+	orderID, err := store.InsertOrderWithRetry(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: brokerID, Ticker: req.Ticker,
+		Side: string(req.Side), OrderType: string(req.Type), Quantity: quantity,
+		Status: "pending", StockIntentID: intent.ID,
+	})
+	if err != nil {
+		return "", fmt.Errorf("project recovered market exit order: %w", err)
+	}
+	return orderID, nil
 }
 
 func filledAtPtr(t time.Time) *time.Time {
