@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -168,9 +168,9 @@ func (b *AlpacaBroker) GetOrderByClientID(ctx context.Context, clientOrderID str
 			Type string `json:"type"`
 		} `json:"legs"`
 	}
-	requestID, err := b.doWithRequestID(ctx, http.MethodGet, "/v2/orders:by_client_order_id?client_order_id="+url.QueryEscape(clientOrderID), nil, &resp)
+	requestID, err := b.doWithRequestID(ctx, http.MethodGet, "/v2/orders:by_client_order_id?nested=true&client_order_id="+url.QueryEscape(clientOrderID), nil, &resp)
 	if err != nil {
-		if strings.Contains(err.Error(), "→ 404") {
+		if isBrokerNotFound(err) {
 			return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: %w", ErrOrderNotFound)
 		}
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: %w", err)
@@ -320,7 +320,7 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		// — sniff the 404 prefix to map onto the sentinel. Cleaner than
 		// punching the status code through `do`'s signature for one
 		// caller.
-		if strings.Contains(err.Error(), "→ 404") {
+		if isBrokerNotFound(err) {
 			return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus %s: %w", brokerOrderID, ErrOrderNotFound)
 		}
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: %w", err)
@@ -343,6 +343,11 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		FilledQty:     filledQty,
 		FilledAt:      filledAt,
 	}, nil
+}
+
+func isBrokerNotFound(err error) bool {
+	var requestErr *BrokerRequestError
+	return errors.As(err, &requestErr) && requestErr.StatusCode == http.StatusNotFound
 }
 
 // GetPositions returns all open positions from Alpaca.

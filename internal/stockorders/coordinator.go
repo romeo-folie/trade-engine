@@ -167,8 +167,37 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 		if err := c.projectRecoveredEntry(ctx, intent, req, res); err != nil {
 			return err
 		}
+		if err := c.projectRecoveredStandaloneStop(ctx, intent, req, res); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// projectRecoveredStandaloneStop records an accepted normal protective or
+// trailing stop if the process died between broker acceptance and order-row
+// persistence. It is intent-idempotent, so replay never creates duplicate
+// broker protection.
+func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
+	if req.Type != execution.OrderTypeStop || req.TradeID == "" || req.OrderClass != "" || req.ReplacesBrokerOrderID != "" {
+		return nil
+	}
+	existing, err := store.GetOrderByStockIntentID(ctx, intent.ID)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return nil
+	}
+	brokerID := res.BrokerOrderID
+	if brokerID == "" {
+		brokerID = intent.BrokerOrderID
+	}
+	_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: brokerID,
+		Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
+		StopPrice: req.StopPrice, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
+		Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true, StockIntentID: intent.ID})
+	return err
 }
 
 // projectRecoveredEntry completes only an accepted standard entry whose
@@ -530,6 +559,10 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
 		return c.maybeProjectReplacement(ctx, intent, req, res, project)
 	}
+	if execution.IsDefinitiveOrderRejection(err) {
+		_ = c.record(ctx, intent, "replace", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
+		return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", err)
+	}
 	_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
 	if hasLookup {
 		prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
@@ -544,6 +577,10 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		if replayErr == nil {
 			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
 			return c.maybeProjectReplacement(ctx, intent, req, res, project)
+		}
+		if execution.IsDefinitiveOrderRejection(replayErr) {
+			_ = c.record(ctx, intent, "replace_exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
+			return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", replayErr)
 		}
 		_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", replayErr)
@@ -574,6 +611,12 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		return execution.OrderResult{}, fmt.Errorf("missing predecessor order projection for replacement %s", intent.ClientOrderID)
 	}
 	if order.BrokerOrderID == res.BrokerOrderID && order.StockIntentID == intent.ID {
+		return res, nil
+	}
+	if order.BrokerOrderID == res.BrokerOrderID {
+		if err := store.RepointOrderStockIntent(ctx, order.ID, intent.ID); err != nil {
+			return execution.OrderResult{}, fmt.Errorf("complete replacement intent repoint: %w", err)
+		}
 		return res, nil
 	}
 	if err := store.UpdateOrderStopReplacement(ctx, order.ID, req.ReplacesBrokerOrderID, res.BrokerOrderID,

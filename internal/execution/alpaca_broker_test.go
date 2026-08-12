@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -72,7 +73,7 @@ func TestAlpacaPlaceOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
 
 func TestAlpacaGetOrderByClientID(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v2/orders:by_client_order_id" || r.URL.Query().Get("client_order_id") != "te-stock-abc" {
+		if r.URL.Path != "/v2/orders:by_client_order_id" || r.URL.Query().Get("client_order_id") != "te-stock-abc" || r.URL.Query().Get("nested") != "true" {
 			t.Fatalf("path/query = %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
 		fmt.Fprintln(w, `{"id":"broker-1","status":"filled","filled_avg_price":"10","filled_qty":"2","legs":[{"id":"tp-1","type":"limit"},{"id":"sl-1","type":"stop"}]}`)
@@ -83,6 +84,18 @@ func TestAlpacaGetOrderByClientID(t *testing.T) {
 	if err != nil || res.BrokerOrderID != "broker-1" || res.FilledQty != 2 ||
 		len(res.ChildOrderIDs) != 2 || res.ChildOrderIDs[0] != "tp-1" || res.ChildOrderIDs[1] != "sl-1" {
 		t.Fatalf("lookup = %+v, %v", res, err)
+	}
+}
+
+func TestAlpacaOrderLookupsMapStructured404ToNotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNotFound) }))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	if _, err := b.GetOrderByClientID(context.Background(), "missing"); !errors.Is(err, ErrOrderNotFound) {
+		t.Fatalf("client lookup error = %v", err)
+	}
+	if _, err := b.GetOrderStatus(context.Background(), "missing"); !errors.Is(err, ErrOrderNotFound) {
+		t.Fatalf("status lookup error = %v", err)
 	}
 }
 

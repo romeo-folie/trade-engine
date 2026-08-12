@@ -16,14 +16,15 @@ import (
 // coordinator must resolve, where a POST response was lost but Alpaca can find
 // the accepted order by its caller-provided client id.
 type recoveryBroker struct {
-	posts   int
-	posted  map[string]execution.OrderResult
-	lookup  map[string]execution.OrderResult
-	status  map[string]execution.OrderResult
-	cancels []string
-	patches []string
-	postRes execution.OrderResult
-	postErr error
+	posts    int
+	posted   map[string]execution.OrderResult
+	lookup   map[string]execution.OrderResult
+	status   map[string]execution.OrderResult
+	cancels  []string
+	patches  []string
+	postRes  execution.OrderResult
+	postErr  error
+	patchErr error
 }
 
 func newRecoveryBroker(res execution.OrderResult) *recoveryBroker {
@@ -71,9 +72,44 @@ func (*recoveryBroker) ReplaceStopOrder(context.Context, string, float64) (execu
 }
 func (b *recoveryBroker) ReplaceStopOrderWithClientID(_ context.Context, old string, _ float64, clientID string) (execution.OrderResult, error) {
 	b.patches = append(b.patches, old)
+	if b.patchErr != nil {
+		return execution.OrderResult{}, b.patchErr
+	}
 	res := execution.OrderResult{BrokerOrderID: "patched-" + fmt.Sprint(len(b.patches)), Status: "accepted"}
 	b.posted[clientID] = res
 	return res, nil
+}
+
+func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTREPLACEREJECT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTREPLACEREJECT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "old-reject", Ticker: "RINTENTREPLACEREJECT", Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true}); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.patchErr = &execution.BrokerRequestError{StatusCode: 422, Message: "invalid stop"}
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "old-reject", 91); err == nil {
+		t.Fatal("expected definitive replacement rejection")
+	}
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM stock_order_intents WHERE idempotency_key LIKE 'replace:legacy-stop:%'`).Scan(&status); err != nil || status != "rejected" {
+		t.Fatalf("replacement intent status=%q err=%v", status, err)
+	}
+	patches := len(broker.patches)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.patches) != patches {
+		t.Fatal("terminal replacement retried on recovery")
+	}
 }
 
 func insertRecoverySignal(t *testing.T, ticker string) string {
@@ -173,6 +209,37 @@ func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing
 	order, err := store.GetOrderByStockIntentID(ctx, in.ID)
 	if err != nil || order == nil || order.Status != "cancelled" {
 		t.Fatalf("terminal zero order = %#v, %v", order, err)
+	}
+}
+
+func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTRECOVERSTOP")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTRECOVERSTOP", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "recovered-stop", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTRECOVERSTOP", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 90, TradeID: tradeID, IntentKey: "protective-stop:" + tradeID}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countForIntent(t, "orders", in.ID); got != 1 {
+		t.Fatalf("recovered stop orders = %d", got)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countForIntent(t, "orders", in.ID); got != 1 {
+		t.Fatalf("replay duplicated recovered stop: %d", got)
 	}
 }
 
@@ -495,6 +562,44 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("stop rows=%d err=%v, want one", count, err)
+	}
+}
+
+func TestStockIntentReplacementRecoveryCompletesIntentOnlyCrash(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTREPLACECRASH")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTREPLACECRASH", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "33333333-3333-4333-8333-333333333333", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "crash-parent", TradeID: tradeID, Ticker: "RINTENTREPLACECRASH", Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: []byte(`{}`), PayloadHash: "p", Status: "rejected"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "old", "rejected", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "new", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 91, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := execution.OrderRequest{Ticker: parent.Ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 91, TradeID: tradeID, IntentKey: "replace-crash", ClientOrderID: "crash-replacement", ReplacesBrokerOrderID: "old"}
+	payload, _ := json.Marshal(req)
+	child := store.StockOrderIntent{ID: "44444444-4444-4444-8444-444444444444", IdempotencyKey: req.IntentKey, ClientOrderID: req.ClientOrderID, TradeID: tradeID, ParentIntentID: parent.ID, Ticker: parent.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: payload, PayloadHash: "c", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "new", Status: "accepted"}
+	if err := stockorders.New(broker).Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var got string
+	if err := store.GetDB().QueryRow(ctx, `SELECT stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&got); err != nil || got != child.ID {
+		t.Fatalf("repoint = %q %v", got, err)
 	}
 }
 
