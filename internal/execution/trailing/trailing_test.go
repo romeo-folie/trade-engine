@@ -736,6 +736,8 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	}
 	if stop := fb.placed[0]; stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
 		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	} else if stop.IntentKey == "" {
+		t.Fatal("protective stop must carry a durable intent key")
 	}
 }
 
@@ -761,6 +763,9 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 	}
 	if len(fb.placed) != 1 || fb.placed[0].Quantity != 5 {
 		t.Fatalf("replacement stop = %+v, want quantity 5", fb.placed)
+	}
+	if fb.placed[0].IntentKey == "" {
+		t.Fatal("cancel+resubmit stop must carry a durable intent key")
 	}
 	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
 	if err != nil || stop == nil {
@@ -2033,6 +2038,9 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
+	if len(fb.placed) != 1 || fb.placed[0].IntentKey == "" {
+		t.Fatalf("market exit must carry a durable intent key: %+v", fb.placed)
+	}
 
 	closed := fs.trades["t1"]
 	if closed.Status != "closed" {

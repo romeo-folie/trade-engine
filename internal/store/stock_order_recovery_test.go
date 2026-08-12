@@ -189,3 +189,111 @@ func TestStockIntentConcurrentSameTickerSignalsAndReplayDeduplicate(t *testing.T
 		}
 	}
 }
+
+func TestStockIntentRecoverySkipsBracketProjectionChildren(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTBRACKET")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "bracket-parent", Status: "accepted", ChildOrderIDs: []string{"bracket-tp", "bracket-sl"}})
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTBRACKET", 10)
+	req.OrderClass, req.TakeProfitPrice, req.StopLossPrice = "bracket", 120, 90
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatalf("place bracket: %v", err)
+	}
+	posts := broker.posts
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover bracket children: %v", err)
+	}
+	if broker.posts != posts {
+		t.Fatalf("recovery submitted a bracket child: posts %d -> %d", posts, broker.posts)
+	}
+	var n int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM stock_order_intents WHERE parent_intent_id=$1::uuid AND purpose='broker_projection'`, intentForKey(t, req.IntentKey).ID).Scan(&n); err != nil || n != 2 {
+		t.Fatalf("child projection count = %d, %v; want 2", n, err)
+	}
+}
+
+func TestStockIntentRecoveryFilledProjectionEligibility(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTDONE")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "done-entry", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTDONE", 1)
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "done-entry", Status: "filled", FilledPrice: 100, FilledQty: 1}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	intents, err := store.ListRecoverableStockOrderIntents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range intents {
+		if candidate.ID == in.ID {
+			t.Fatal("completed filled entry remained recoverable")
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET trade_id=NULL WHERE stock_intent_id=$1::uuid`, in.ID); err != nil {
+		t.Fatal(err)
+	}
+	intents, err = store.ListRecoverableStockOrderIntents(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range intents {
+		if candidate.ID == in.ID {
+			return
+		}
+	}
+	t.Fatal("partially projected filled entry was not recoverable")
+}
+
+func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
+	ctx := context.Background()
+	bracketSignal := insertRecoverySignal(t, "RINTENTRECOVERBRACKET")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "recovered-parent", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	bracket := entryRequest(bracketSignal, "RINTENTRECOVERBRACKET", 2)
+	bracket.OrderClass, bracket.TakeProfitPrice, bracket.StopLossPrice, bracket.PolicyTakeProfit, bracket.PolicyStopLoss = "bracket", 120, 90, 120, 90
+	if _, err := coordinator.PlaceOrder(ctx, bracket); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, bracket.IntentKey)
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "recovered-parent", Status: "filled", FilledPrice: 100, FilledQty: 2, ChildOrderIDs: []string{"recover-tp", "recover-sl"}}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countForIntent(t, "orders", in.ID); got != 1 {
+		t.Fatalf("parent orders=%d, want 1", got)
+	}
+	var children int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders o JOIN stock_order_intents i ON i.id=o.stock_intent_id WHERE i.parent_intent_id=$1::uuid`, in.ID).Scan(&children); err != nil || children != 2 {
+		t.Fatalf("bracket child orders=%d err=%v", children, err)
+	}
+
+	uncappedSignal := insertRecoverySignal(t, "RINTENTRECOVERUNCAP")
+	uncapped := entryRequest(uncappedSignal, "RINTENTRECOVERUNCAP", 3)
+	uncapped.PolicyStopLoss, uncapped.PolicyTakeProfit, uncapped.UncappedTakeProfit = 90, 120, true
+	if _, err := coordinator.PlaceOrder(ctx, uncapped); err != nil {
+		t.Fatal(err)
+	}
+	uncappedIntent := intentForKey(t, uncapped.IntentKey)
+	broker.lookup[uncappedIntent.ClientOrderID] = execution.OrderResult{BrokerOrderID: "uncapped-entry", Status: "filled", FilledPrice: 100, FilledQty: 3}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var takeProfit float64
+	if err := store.GetDB().QueryRow(ctx, `SELECT COALESCE(take_profit,0) FROM trades WHERE stock_intent_id=$1::uuid`, uncappedIntent.ID).Scan(&takeProfit); err != nil || takeProfit != 0 {
+		t.Fatalf("uncapped take profit=%v err=%v", takeProfit, err)
+	}
+	var stops int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM stock_order_intents WHERE idempotency_key LIKE 'recovered-protective-stop:%' AND trade_id=(SELECT id FROM trades WHERE stock_intent_id=$1::uuid)`, uncappedIntent.ID).Scan(&stops); err != nil || stops != 1 {
+		t.Fatalf("recovered protective stops=%d err=%v", stops, err)
+	}
+}

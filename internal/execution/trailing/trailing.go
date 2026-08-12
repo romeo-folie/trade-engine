@@ -902,6 +902,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		StopPrice:   newStop,
 		TradeID:     t.ID,
 		TimeInForce: protectiveStopTIF(t.Quantity),
+		IntentKey:   trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
 	})
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
@@ -970,6 +971,17 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		return fmt.Errorf("new stop became %s before providing coverage", status)
 	}
 	return nil
+}
+
+// trailingStopIntentKey names the one semantic replacement operation. The
+// predecessor broker id (when present), price and protected quantity mean a
+// replay is exact while a later ratchet gets its own durable intent.
+func trailingStopIntentKey(tradeID string, existing *store.Order, stopPrice, quantity float64) string {
+	predecessor := "new"
+	if existing != nil && existing.BrokerOrderID != "" {
+		predecessor = existing.BrokerOrderID
+	}
+	return fmt.Sprintf("trailing-stop:%s:%s:%.8f:%.8f", tradeID, predecessor, stopPrice, quantity)
 }
 
 func (m *Manager) rollbackUnrecordedStop(
@@ -1213,6 +1225,7 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePric
 		Quantity:       exitQty,
 		ReferencePrice: referencePrice,
 		TradeID:        t.ID,
+		IntentKey:      fmt.Sprintf("trailing-market-exit:%s:%.8f", t.ID, exitQty),
 	})
 	if err != nil {
 		return execution.OrderResult{}, 0, fmt.Errorf(

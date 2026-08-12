@@ -91,6 +91,12 @@ type OrderRequest struct {
 	// ReplacesBrokerOrderID marks a durable stop-replacement intent. It is
 	// coordinator metadata, never part of an Alpaca order payload.
 	ReplacesBrokerOrderID string
+	// Entry policy is durable coordinator metadata. Alpaca ignores these fields;
+	// they let recovery reproduce the trade's exit semantics after a broker
+	// acceptance before engine projection.
+	PolicyStopLoss     float64
+	PolicyTakeProfit   float64
+	UncappedTakeProfit bool
 }
 
 // OrderResult is the immediate response from the broker.

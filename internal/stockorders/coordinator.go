@@ -187,8 +187,8 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	}
 	tradeID, err := store.InsertTradeForStockIntent(ctx, store.Trade{
 		SignalID: sig.ID, Ticker: sig.Ticker, Direction: direction, Strategy: sig.Strategy,
-		EntryPrice: res.FilledPrice, Quantity: res.FilledQty, StopLoss: sig.StopLoss,
-		TakeProfit: sig.TakeProfit, EntrySetup: sig.EntrySetup,
+		EntryPrice: res.FilledPrice, Quantity: res.FilledQty, StopLoss: req.PolicyStopLoss,
+		TakeProfit: recoveredTakeProfit(req), EntrySetup: sig.EntrySetup,
 		EntrySetupEvidence: sig.EntrySetupEvidence, StockIntentID: intent.ID,
 	})
 	if err != nil {
@@ -220,6 +220,68 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if brokerID != "" {
 		if err := store.ApplyEntryFill(ctx, tradeID, brokerID, res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status)); err != nil {
 			return fmt.Errorf("apply recovered stock entry fill: %w", err)
+		}
+	}
+	if err := c.projectRecoveredEntryExits(ctx, intent, req, res, tradeID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func recoveredTakeProfit(req execution.OrderRequest) float64 {
+	if req.UncappedTakeProfit {
+		return 0
+	}
+	return req.PolicyTakeProfit
+}
+
+// projectRecoveredEntryExits restores only the broker-resident policy that
+// was part of the immutable entry request. Bracket children are projections of
+// the accepted parent; uncapped entries receive a standalone durable stop
+// before recovery reports success, so a filled position is never treated as
+// fully recovered without its required protection.
+func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, tradeID string) error {
+	if req.OrderClass == "bracket" && len(res.ChildOrderIDs) >= 2 && res.ChildOrderIDs[0] != "" && res.ChildOrderIDs[1] != "" {
+		legs := []struct {
+			role, brokerID, orderType string
+			price                     float64
+			stop, take                bool
+		}{
+			{"take-profit", res.ChildOrderIDs[0], string(execution.OrderTypeLimit), req.TakeProfitPrice, false, true},
+			{"stop-loss", res.ChildOrderIDs[1], string(execution.OrderTypeStop), req.StopLossPrice, true, false},
+		}
+		for _, leg := range legs {
+			childID, err := store.UpsertBracketChildIntent(ctx, parent.ID, tradeID, req.Ticker, leg.role, leg.brokerID, leg.orderType, req.Quantity, leg.price)
+			if err != nil {
+				return fmt.Errorf("project recovered bracket child intent: %w", err)
+			}
+			existing, err := store.GetOrderByStockIntentID(ctx, childID)
+			if err != nil {
+				return fmt.Errorf("load recovered bracket child projection: %w", err)
+			}
+			if existing == nil {
+				order := store.Order{TradeID: tradeID, BrokerOrderID: leg.brokerID, Ticker: req.Ticker,
+					Side: string(execution.OrderSideSell), OrderType: leg.orderType, Quantity: req.Quantity,
+					Status: "pending", IsStopLoss: leg.stop, IsTakeProfit: leg.take,
+					ParentOrderID: res.BrokerOrderID, StockIntentID: childID}
+				if leg.stop {
+					order.StopPrice = leg.price
+				} else {
+					order.LimitPrice = leg.price
+				}
+				if _, err := store.InsertOrderWithRetry(ctx, order); err != nil {
+					return fmt.Errorf("project recovered bracket child order: %w", err)
+				}
+			}
+		}
+	}
+	if req.UncappedTakeProfit && res.FilledQty > 0 {
+		stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
+			Type: execution.OrderTypeStop, Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss,
+			TradeID: tradeID, TimeInForce: "gtc",
+			IntentKey: fmt.Sprintf("recovered-protective-stop:%s:%s:%.8f:%.8f", tradeID, parent.ID, req.PolicyStopLoss, res.FilledQty)}
+		if _, err := c.PlaceOrder(ctx, stopReq); err != nil {
+			return fmt.Errorf("recover uncapped entry protective stop: %w", err)
 		}
 	}
 	return nil

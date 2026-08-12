@@ -2440,12 +2440,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 
 	orderReq := execution.OrderRequest{
-		Ticker:         sig.Ticker,
-		Side:           side,
-		Type:           execution.OrderTypeMarket,
-		Quantity:       qty,
-		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
-		IntentKey:      "entry:" + sigID,
+		Ticker:           sig.Ticker,
+		Side:             side,
+		Type:             execution.OrderTypeMarket,
+		Quantity:         qty,
+		ReferencePrice:   sig.SignalPrice, // paper executor fills at this price
+		IntentKey:        "entry:" + sigID,
+		PolicyStopLoss:   sig.StopLoss,
+		PolicyTakeProfit: sig.TakeProfit,
 	}
 
 	// The uncapped exit policy is active only with the trailing manager: this
@@ -2459,6 +2461,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	)
 	if uncapTakeProfit {
 		orderReq.Quantity = uncappedQty
+		orderReq.UncappedTakeProfit = true
 	} else if uncapRequested {
 		logger.Warn("exit policy: uncapped entry lacks a running trail, whole-share sizing, or a coherent hard stop; keeping baseline fixed take-profit",
 			"ticker", sig.Ticker,

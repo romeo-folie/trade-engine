@@ -16,6 +16,7 @@ type StockOrderIntent struct {
 	ClientOrderID   string
 	TradeID         string
 	ParentIntentID  string
+	Purpose         string
 	Ticker          string
 	Side            string
 	OrderType       string
@@ -38,16 +39,16 @@ func CreateStockOrderIntent(ctx context.Context, in StockOrderIntent) error {
 	_, err := GetDB().Exec(ctx, `
         INSERT INTO stock_order_intents (
             id, idempotency_key, client_order_id, trade_id, parent_intent_id, ticker, side,
-            order_type, requested_qty, request_payload, payload_hash, status
-        ) VALUES ($1,$2,$3,NULLIF($4,'')::uuid,NULLIF($5,'')::uuid,$6,$7,$8,$9,$10,$11,$12)`,
+            order_type, requested_qty, request_payload, payload_hash, status, purpose
+        ) VALUES ($1,$2,$3,NULLIF($4,'')::uuid,NULLIF($5,'')::uuid,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		in.ID, in.IdempotencyKey, in.ClientOrderID, in.TradeID, in.ParentIntentID, in.Ticker, in.Side,
-		in.OrderType, in.RequestedQty, in.RequestPayload, in.PayloadHash, in.Status)
+		in.OrderType, in.RequestedQty, in.RequestPayload, in.PayloadHash, in.Status, purposeOrSubmit(in.Purpose))
 	return err
 }
 
 func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderIntent, error) {
 	rows, err := GetDB().Query(ctx, `
-        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at
         FROM stock_order_intents WHERE idempotency_key=$1`, key)
 	if err != nil {
 		return nil, err
@@ -57,7 +58,7 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 		return nil, nil
 	}
 	var in StockOrderIntent
-	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
+	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &in, rows.Err()
@@ -94,11 +95,11 @@ func UpsertBracketChildIntent(ctx context.Context, parentIntentID, tradeID, tick
 		INSERT INTO stock_order_intents (
 			id, idempotency_key, client_order_id, trade_id, parent_intent_id,
 			ticker, side, order_type, requested_qty, request_payload, payload_hash,
-			broker_order_id, status, submitted_at
+			broker_order_id, status, submitted_at, purpose
 		) VALUES (
 			uuid_generate_v4(), $1, $2, NULLIF($3,'')::uuid, $4::uuid,
 			$5, 'sell', $6::order_type, $7, $8::jsonb, $9,
-			$10, 'pending', NOW()
+			$10, 'pending', NOW(), 'broker_projection'
 		)
 		ON CONFLICT (idempotency_key) DO UPDATE
 		SET broker_order_id=EXCLUDED.broker_order_id,
@@ -119,7 +120,7 @@ func RecordStockOrderAttempt(ctx context.Context, intentID, operation, outcome, 
 }
 
 func GetStockOrderIntentByBrokerOrderID(ctx context.Context, brokerOrderID string) (*StockOrderIntent, error) {
-	rows, err := GetDB().Query(ctx, `SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at FROM stock_order_intents WHERE broker_order_id=$1`, brokerOrderID)
+	rows, err := GetDB().Query(ctx, `SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose, ticker, side, order_type, requested_qty, request_payload, payload_hash, COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty, COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at, last_checked_at, created_at, updated_at FROM stock_order_intents WHERE broker_order_id=$1`, brokerOrderID)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +129,7 @@ func GetStockOrderIntentByBrokerOrderID(ctx context.Context, brokerOrderID strin
 		return nil, nil
 	}
 	var in StockOrderIntent
-	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
+	if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose, &in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash, &in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError, &in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
 		return nil, err
 	}
 	return &in, rows.Err()
@@ -150,14 +151,20 @@ func UpdateStockOrderIntentBroker(ctx context.Context, clientOrderID, brokerOrde
 
 func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, error) {
 	rows, err := GetDB().Query(ctx, `
-        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''),
+        SELECT id, idempotency_key, client_order_id, COALESCE(trade_id::text,''), COALESCE(parent_intent_id::text,''), purpose,
                ticker, side, order_type, requested_qty, request_payload, payload_hash,
                COALESCE(broker_order_id,''), status, COALESCE(filled_price,0), filled_qty,
                COALESCE(broker_error,''), COALESCE(broker_request_id,''), submitted_at,
                last_checked_at, created_at, updated_at
         FROM stock_order_intents
-        WHERE status IN ('pending','partial')
-           OR (status='filled' AND idempotency_key LIKE 'entry:%')
+        WHERE purpose='submit' AND (
+              status IN ('pending','partial')
+           OR (status='filled' AND idempotency_key LIKE 'entry:%'
+               AND (trade_id IS NULL OR NOT EXISTS (
+                   SELECT 1 FROM orders o
+                   WHERE o.stock_intent_id=stock_order_intents.id AND o.trade_id=stock_order_intents.trade_id
+               )))
+        )
         ORDER BY created_at`)
 	if err != nil {
 		return nil, err
@@ -166,7 +173,7 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
 	var out []StockOrderIntent
 	for rows.Next() {
 		var in StockOrderIntent
-		if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID,
+		if err := rows.Scan(&in.ID, &in.IdempotencyKey, &in.ClientOrderID, &in.TradeID, &in.ParentIntentID, &in.Purpose,
 			&in.Ticker, &in.Side, &in.OrderType, &in.RequestedQty, &in.RequestPayload, &in.PayloadHash,
 			&in.BrokerOrderID, &in.Status, &in.FilledPrice, &in.FilledQty, &in.BrokerError,
 			&in.BrokerRequestID, &in.SubmittedAt, &in.LastCheckedAt, &in.CreatedAt, &in.UpdatedAt); err != nil {
@@ -175,4 +182,11 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
 		out = append(out, in)
 	}
 	return out, rows.Err()
+}
+
+func purposeOrSubmit(purpose string) string {
+	if purpose == "" {
+		return "submit"
+	}
+	return purpose
 }
