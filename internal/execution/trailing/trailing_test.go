@@ -108,14 +108,24 @@ type fakeStore struct {
 	nextID               int
 	updateReplacementErr error
 	stockIntentIDs       map[string]string
+	replacementIntentIDs map[string]string
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}}
+	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}, replacementIntentIDs: map[string]string{}}
 }
 
 func (f *fakeStore) StockIntentIDForKey(_ context.Context, key string) (string, error) {
 	return f.stockIntentIDs[key], nil
+}
+
+func (f *fakeStore) LinkReplacementOrderIntent(_ context.Context, orderID, brokerOrderID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	o.StockIntentID = f.replacementIntentIDs[brokerOrderID]
+	f.orders[orderID] = o
+	return nil
 }
 
 func (f *fakeStore) GetOpenTrades(_ context.Context) ([]store.Trade, error) {
@@ -1305,10 +1315,12 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 		StopPrice:     95,
 		Status:        "pending",
 		IsStopLoss:    true,
+		StockIntentID: "predecessor-intent",
 	})
 
 	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
 	base := &fakeBroker{}
+	fs.replacementIntentIDs["broker-1"] = "replacement-intent"
 	fb := fakeBrokerWithReplace{fakeBroker: base}
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
@@ -1329,6 +1341,9 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 			t.Fatalf("orders row not repointed to new broker id: %+v", o)
 		}
 		if o.TradeID == "t1" {
+			if o.StockIntentID != "replacement-intent" {
+				t.Fatalf("replacement intent link = %q", o.StockIntentID)
+			}
 			if o.ExitReason != store.ExitReasonTrailingATR {
 				t.Fatalf("replacement exit reason = %q, want trailing_atr", o.ExitReason)
 			}

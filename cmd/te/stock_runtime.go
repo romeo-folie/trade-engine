@@ -10,6 +10,16 @@ import (
 
 type stockOrderRecoverer interface{ Recover(context.Context) error }
 
+// stockOrderRecoveryForStartup keeps DB-optional runtime modes from invoking
+// the durable coordinator before its store is connected.
+func stockOrderRecoveryForStartup(dbConnected bool, broker execution.Executor) stockOrderRecoverer {
+	if !dbConnected || broker == nil {
+		return nil
+	}
+	recoverer, _ := broker.(stockOrderRecoverer)
+	return recoverer
+}
+
 // recoverStockOrdersPeriodically is deliberately serial: the next tick cannot
 // start until the prior recovery finishes, avoiding overlapping replay scans.
 func recoverStockOrdersPeriodically(ctx context.Context, recoverer stockOrderRecoverer, interval time.Duration) {

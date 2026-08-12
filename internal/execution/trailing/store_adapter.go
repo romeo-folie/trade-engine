@@ -3,6 +3,7 @@ package trailing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -38,6 +39,23 @@ func (liveStore) StockIntentIDForKey(ctx context.Context, key string) (string, e
 		return "", err
 	}
 	return intent.ID, nil
+}
+
+// LinkReplacementOrderIntent advances durable intent lineage after the
+// trailing manager, which owns normal replacement projection, repoints the
+// broker order id.
+func (liveStore) LinkReplacementOrderIntent(ctx context.Context, orderID, brokerOrderID string) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, brokerOrderID)
+	if err != nil {
+		return err
+	}
+	if intent == nil {
+		return fmt.Errorf("replacement intent for broker order %s not found", brokerOrderID)
+	}
+	return store.RepointOrderStockIntent(ctx, orderID, intent.ID)
 }
 
 func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {

@@ -1014,7 +1014,7 @@ Modes:
 		// Resolve broker-confirmed exits before comparing broker positions with
 		// DB ownership. Otherwise a stale exiting row can produce a false boot
 		// drift alert immediately before the exit sweep closes it.
-		if recoverer, ok := broker.(interface{ Recover(context.Context) error }); ok {
+		if recoverer := stockOrderRecoveryForStartup(store.IsConnected(), broker); recoverer != nil {
 			if err := recoverer.Recover(ctx); err != nil {
 				return fmt.Errorf("startup stock order-intent recovery: %w", err)
 			}

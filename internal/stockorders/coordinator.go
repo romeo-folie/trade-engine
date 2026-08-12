@@ -300,6 +300,15 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 	if err != nil {
 		return err
 	}
+	// A normal engine projection may already have installed its uncapped hard
+	// stop before the process died. Adopt that live row instead of creating a
+	// second recovered-only lineage over the same shares.
+	if existing == nil {
+		existing, err = store.LatestStopLossOrderForTrade(ctx, tradeID)
+		if err != nil {
+			return fmt.Errorf("load normal protective stop for recovery: %w", err)
+		}
+	}
 	if existing != nil && existing.Quantity == res.FilledQty && existing.StopPrice == req.PolicyStopLoss {
 		return nil
 	}

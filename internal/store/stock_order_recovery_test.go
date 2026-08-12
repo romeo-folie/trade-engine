@@ -356,6 +356,47 @@ func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryAdoptsNormalUncappedProtectiveStop(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTADOPTSTOP")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "adopt-entry", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTADOPTSTOP", 3)
+	req.PolicyStopLoss, req.PolicyTakeProfit, req.UncappedTakeProfit = 90, 120, true
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	tradeID, err := store.InsertTradeForStockIntent(ctx, store.Trade{SignalID: signalID, Ticker: req.Ticker, Direction: "long", Strategy: "recovery-test", EntryPrice: 100, Quantity: 3, StopLoss: 90, StockIntentID: in.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AttachStockOrderIntentTradeByKey(ctx, req.IntentKey, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "adopt-entry", Ticker: req.Ticker, Side: "buy", OrderType: "market", Quantity: 3, FilledPrice: 100, FilledQty: 3, Status: "partial", StockIntentID: in.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "normal-stop", Ticker: req.Ticker, Side: "sell", OrderType: "stop", Quantity: 3, StopPrice: 90, Status: "pending", IsStopLoss: true}); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "adopt-entry", Status: "partially_filled", FilledPrice: 100, FilledQty: 3}
+	posts := broker.posts
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.posts != posts {
+		t.Fatalf("recovery created duplicate protective stop: posts %d -> %d", posts, broker.posts)
+	}
+	var active int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss AND status IN ('pending','partial')`, tradeID).Scan(&active); err != nil || active != 1 {
+		t.Fatalf("active protection = %d, %v", active, err)
+	}
+}
+
 func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	ctx := context.Background()
 	signalID := insertRecoverySignal(t, "RINTENTREPLACE")
