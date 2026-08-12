@@ -18,6 +18,13 @@ import (
 // uncertain status that blocks resubmission.
 var ErrOrderNotFound = errors.New("execution: order not found at broker")
 
+// ErrAmbiguousStopReplacement means a replace request may have succeeded but
+// the broker did not make its client-id lookup visible before the exact replay
+// found the predecessor gone. Callers must retain the old protection lineage
+// and let durable recovery resolve it; cancel+resubmit here could create a
+// second live stop.
+var ErrAmbiguousStopReplacement = errors.New("execution: ambiguous stop replacement")
+
 // BrokerRequestError preserves an adapter's definitive HTTP response. It lets
 // durable callers distinguish a broker-declared rejection from a transport or
 // 5xx ambiguity that must be looked up/replayed safely.

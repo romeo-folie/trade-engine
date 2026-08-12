@@ -878,6 +878,13 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 				}
 				return nil
 			}
+			if errors.Is(err, execution.ErrAmbiguousStopReplacement) {
+				// The coordinator retained a durable, unresolved replacement. The
+				// old broker id may already be gone because that first PATCH won,
+				// so cancel+resubmit here risks a second live stop. Recovery owns
+				// the client-id lookup and will project the winning broker order.
+				return fmt.Errorf("ambiguous stop replacement; refusing cancel+resubmit fallback: %w", err)
+			}
 			if existing.ParentOrderID != "" {
 				// Bracket child leg (#435): cancel+resubmit is FORBIDDEN —
 				// cancelling one OCO leg kills or orphans the sibling

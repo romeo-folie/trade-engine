@@ -17,15 +17,16 @@ import (
 // coordinator must resolve, where a POST response was lost but Alpaca can find
 // the accepted order by its caller-provided client id.
 type recoveryBroker struct {
-	posts    int
-	posted   map[string]execution.OrderResult
-	lookup   map[string]execution.OrderResult
-	status   map[string]execution.OrderResult
-	cancels  []string
-	patches  []string
-	postRes  execution.OrderResult
-	postErr  error
-	patchErr error
+	posts     int
+	posted    map[string]execution.OrderResult
+	lookup    map[string]execution.OrderResult
+	status    map[string]execution.OrderResult
+	cancels   []string
+	patches   []string
+	postRes   execution.OrderResult
+	postErr   error
+	patchErr  error
+	patchErrs []error
 }
 
 func newRecoveryBroker(res execution.OrderResult) *recoveryBroker {
@@ -73,6 +74,9 @@ func (*recoveryBroker) ReplaceStopOrder(context.Context, string, float64) (execu
 }
 func (b *recoveryBroker) ReplaceStopOrderWithClientID(_ context.Context, old string, _ float64, clientID string) (execution.OrderResult, error) {
 	b.patches = append(b.patches, old)
+	if n := len(b.patches); n <= len(b.patchErrs) && b.patchErrs[n-1] != nil {
+		return execution.OrderResult{}, b.patchErrs[n-1]
+	}
 	if b.patchErr != nil {
 		return execution.OrderResult{}, b.patchErr
 	}
@@ -113,6 +117,61 @@ func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
 	}
 }
 
+func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTAMBIGREPLACE")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTAMBIGREPLACE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "77777777-7777-4777-8777-777777777777", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "ambiguous-parent", TradeID: tradeID, Ticker: "RINTENTAMBIGREPLACE", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "ambiguous-old", "rejected", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "ambiguous-old", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.patchErrs = []error{
+		errors.New("PATCH response lost after broker acceptance"),
+		&execution.BrokerRequestError{StatusCode: 404, Message: "predecessor no longer exists"},
+	}
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "ambiguous-old", 95); !errors.Is(err, execution.ErrAmbiguousStopReplacement) {
+		t.Fatalf("replacement error = %v, want ambiguous replacement", err)
+	}
+	key := "replace:" + parent.IdempotencyKey + ":95.00000000"
+	child := intentForKey(t, key)
+	if child.Status != "pending" {
+		t.Fatalf("ambiguous replacement intent status=%q, want pending", child.Status)
+	}
+	if got := len(broker.patches); got != 2 {
+		t.Fatalf("replacement PATCH attempts=%d, want initial plus exact replay", got)
+	}
+
+	// The broker eventually exposes the order created by the first PATCH.
+	// Recovery resolves it by client id without a third PATCH and repoints the
+	// one mutable stop row to the durable replacement intent.
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "ambiguous-winner", Status: "accepted"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(broker.patches); got != 2 {
+		t.Fatalf("recovery replayed ambiguous PATCH: attempts=%d", got)
+	}
+	var brokerID, intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID); err != nil || brokerID != "ambiguous-winner" || intentID != child.ID {
+		t.Fatalf("recovered replacement = broker %q intent %q err %v", brokerID, intentID, err)
+	}
+}
+
 func insertRecoverySignal(t *testing.T, ticker string) string {
 	t.Helper()
 	id, err := store.InsertSignal(context.Background(), store.Signal{
@@ -150,7 +209,13 @@ func countForIntent(t *testing.T, table, intentID string) int {
 
 func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
 	signalID := insertRecoverySignal(t, "RINTENTACCEPT")
+	if err := store.UpdateSignalStatus(ctx, signalID, "pending", ""); err != nil {
+		t.Fatal(err)
+	}
 	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "accepted-entry", Status: "accepted"})
 	coordinator := stockorders.New(broker)
 	req := entryRequest(signalID, "RINTENTACCEPT", 10)
@@ -169,6 +234,16 @@ func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 	}
 	if got := countForIntent(t, "orders", in.ID); got != 1 {
 		t.Fatalf("orders for intent = %d, want 1", got)
+	}
+	var signalStatus string
+	if err := store.GetDB().QueryRow(ctx, `SELECT status FROM signals WHERE id=$1::uuid`, signalID).Scan(&signalStatus); err != nil || signalStatus != "executed" {
+		t.Fatalf("recovered entry signal status=%q err=%v, want executed", signalStatus, err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := countForIntent(t, "trades", in.ID); got != 1 {
+		t.Fatalf("repeated recovery trades for intent = %d, want 1", got)
 	}
 }
 

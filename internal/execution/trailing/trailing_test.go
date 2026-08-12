@@ -409,6 +409,7 @@ type fakeBroker struct {
 	cancelled      []string
 	supportReplace bool
 	failReplace    bool
+	replaceErr     error
 	nextID         int
 	// failCancel makes CancelOrder return an error — used to exercise the
 	// duplicate-stop safety path (P1: cancel-error must NOT submit a new
@@ -510,6 +511,9 @@ type fakeBrokerWithReplace struct{ *fakeBroker }
 func (b fakeBrokerWithReplace) ReplaceStopOrder(_ context.Context, brokerOrderID string, newStopPrice float64) (execution.OrderResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.replaceErr != nil {
+		return execution.OrderResult{}, b.replaceErr
+	}
 	if b.failReplace {
 		return execution.OrderResult{}, errors.New("simulated PATCH failure")
 	}
@@ -522,6 +526,31 @@ func (b fakeBrokerWithReplace) ReplaceStopOrder(_ context.Context, brokerOrderID
 		BrokerOrderID: "broker-" + itoa(b.nextID),
 		Status:        "pending",
 	}, nil
+}
+
+func TestManager_AmbiguousReplacementDoesNotFallBack(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 100,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "ambiguous-old-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
+	base := &fakeBroker{replaceErr: execution.ErrAmbiguousStopReplacement}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fakeBrokerWithReplace{fakeBroker: base})
+	m.UpdateAll(context.Background())
+
+	if len(base.cancelled) != 0 || len(base.placed) != 0 {
+		t.Fatalf("ambiguous replacement must not fall back: cancelled=%v placed=%v", base.cancelled, base.placed)
+	}
+	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || stop == nil || stop.BrokerOrderID != "ambiguous-old-stop" {
+		t.Fatalf("ambiguous replacement mutated live stop: %#v, %v", stop, err)
+	}
 }
 
 func itoa(n int) string {

@@ -421,6 +421,9 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if err := c.projectRecoveredEntryExits(ctx, intent, req, res, tradeID); err != nil {
 		return err
 	}
+	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		return fmt.Errorf("mark recovered stock entry signal executed: %w", err)
+	}
 	return nil
 }
 
@@ -722,21 +725,25 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 			return c.maybeProjectReplacement(ctx, intent, req, prior, project)
 		}
 		if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
-			return execution.OrderResult{}, fmt.Errorf("ambiguous stock stop replacement (%v); client-id lookup failed: %w", err, lookupErr)
+			return execution.OrderResult{}, fmt.Errorf("%w: client-id lookup after ambiguous replacement failed: %v", execution.ErrAmbiguousStopReplacement, lookupErr)
 		}
 		res, replayErr := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 		if replayErr == nil {
 			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
 			return c.maybeProjectReplacement(ctx, intent, req, res, project)
 		}
-		if execution.IsDefinitiveOrderRejection(replayErr) && !execution.IsDuplicateClientOrderError(replayErr) {
-			_ = c.record(ctx, intent, "replace_exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
-			return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", replayErr)
+		// The first PATCH may have replaced the predecessor before its response
+		// was lost. A transient client-id 404 followed by a replay 404 against
+		// that now-gone predecessor proves neither outcome; terminalizing it
+		// would invite the trailing manager to cancel+resubmit a second stop.
+		if errors.Is(replayErr, execution.ErrOrderNotFound) || execution.IsDefinitiveOrderRejection(replayErr) {
+			_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
+			return execution.OrderResult{}, fmt.Errorf("%w: first replacement response was ambiguous; exact replay failed: %v", execution.ErrAmbiguousStopReplacement, replayErr)
 		}
 		_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
-		return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", replayErr)
+		return execution.OrderResult{}, fmt.Errorf("%w: stock stop replacement: %v", execution.ErrAmbiguousStopReplacement, replayErr)
 	}
-	return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", err)
+	return execution.OrderResult{}, fmt.Errorf("%w: broker cannot resolve ambiguous replacement: %v", execution.ErrAmbiguousStopReplacement, err)
 }
 
 func (c *Coordinator) maybeProjectReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, project bool) (execution.OrderResult, error) {
