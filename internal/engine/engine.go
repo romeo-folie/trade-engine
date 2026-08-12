@@ -2503,8 +2503,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
 	}
-	stockIntentID, intentLookupErr := stockIntentIDForKeyStrict(ctx, orderReq.IntentKey)
-	if projectionErr := durableStockIntentProjectionError(e.executor, stockIntentID, intentLookupErr); projectionErr != nil {
+	stockIntentID, projectionErr := stockIntentIDForAcceptedOrder(ctx, e.executor, orderReq.IntentKey)
+	if projectionErr != nil {
 		logger.Error("accepted stock order intent projection unavailable", "ticker", sig.Ticker, "intent_key", orderReq.IntentKey, "err", projectionErr)
 		return
 	}
@@ -2839,41 +2839,34 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 }
 
-func stockIntentIDForKey(ctx context.Context, key string) string {
-	intent, err := store.GetStockOrderIntentByKey(ctx, key)
-	if err != nil {
-		logger.Warn("load stock order intent", "intent_key", key, "err", err)
-		return ""
-	}
-	if intent == nil {
-		return ""
-	}
-	return intent.ID
+// stockIntentIDForAcceptedOrder is the common post-acceptance projection
+// guard. A coordinator's durable intent must be present before any normal
+// engine path writes a trade/order row. Paper and legacy executors deliberately
+// remain intent-free.
+func stockIntentIDForAcceptedOrder(ctx context.Context, executor execution.Executor, key string) (string, error) {
+	return stockIntentIDForAcceptedOrderWithLookup(ctx, executor, key, store.GetStockOrderIntentByKey)
 }
 
-func stockIntentIDForKeyStrict(ctx context.Context, key string) (string, error) {
-	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+func stockIntentIDForAcceptedOrderWithLookup(
+	ctx context.Context,
+	executor execution.Executor,
+	key string,
+	lookup func(context.Context, string) (*store.StockOrderIntent, error),
+) (string, error) {
+	durable, ok := executor.(interface{ DurableStockOrderIntents() bool })
+	if !ok || !durable.DurableStockOrderIntents() {
+		// Paper and legacy broker paths did not create coordinator intents;
+		// do not turn their normal projection into a database lookup failure.
+		return "", nil
+	}
+	intent, err := lookup(ctx, key)
 	if err != nil {
 		return "", err
 	}
 	if intent == nil {
-		return "", nil
+		return "", errors.New("accepted stock order durable intent missing")
 	}
 	return intent.ID, nil
-}
-
-// durableStockIntentProjectionError keeps an accepted broker order from being
-// projected as a legacy trade when the coordinator's immutable intent cannot
-// be read. Paper execution has no such intent and remains intentionally
-// unaffected.
-func durableStockIntentProjectionError(executor execution.Executor, intentID string, lookupErr error) error {
-	if lookupErr != nil {
-		return lookupErr
-	}
-	if durable, ok := executor.(interface{ DurableStockOrderIntents() bool }); ok && durable.DurableStockOrderIntents() && intentID == "" {
-		return errors.New("accepted stock order durable intent missing")
-	}
-	return nil
 }
 
 func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {
@@ -3283,7 +3276,14 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 				result = filled
 			}
 		}
-		stockIntentID := stockIntentIDForKey(ctx, "software-exit:"+t.ID+":"+exitReason)
+		stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, "software-exit:"+t.ID+":"+exitReason)
+		if intentErr != nil {
+			// The broker accepted the market exit. Keep its claim and leave the
+			// durable coordinator recovery path to project it rather than write
+			// an unlinked legacy exit row.
+			logger.Error("accepted software exit intent projection unavailable", "trade_id", t.ID, "err", intentErr)
+			continue
+		}
 
 		exitOrder := store.Order{
 			TradeID:       t.ID,

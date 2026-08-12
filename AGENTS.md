@@ -10,11 +10,11 @@ Use `gpt-5.6-terra` for code implementation and fixes. If the active primary
 agent is not running Terra, delegate all code-writing work to a Terra agent and
 retain orchestration in the primary thread.
 
-Run every Codex built-in `/review` with `gpt-5.6-sol` at medium reasoning. Do
-not substitute a Terra review, a generic reviewer subagent, or GitHub Codex
-review for the required Sol-medium `/review`. The project Codex configuration
-pins the model defaults; this rule still applies if a session-level override
-would otherwise replace them.
+Run every Codex built-in `/review` with `gpt-5.3-codex-spark`. Do not
+substitute a Terra review, a generic reviewer subagent, or GitHub Codex review
+for the required local Spark `/review`. The project Codex configuration pins
+the model defaults; this rule still applies if a session-level override would
+otherwise replace them.
 
 ## Mandatory pre-push review
 

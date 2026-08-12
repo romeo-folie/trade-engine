@@ -124,17 +124,22 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		return
 	}
 
-	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
-		logger.Warn("update signal status", "id", sigID, "err", err)
-	}
-	e.costTracker.RecordTrade()
-
 	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
 		if res, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
 			result = res
 		}
 	}
-	stockIntentID := stockIntentIDForKey(ctx, "analyst-exit:"+sigID+":"+sig.Ticker)
+	stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, "analyst-exit:"+sigID+":"+sig.Ticker)
+	if intentErr != nil {
+		// The claimed lots remain owned while coordinator recovery resolves
+		// the accepted aggregate broker order. Do not insert unlinked rows.
+		logger.Error("accepted analyst exit intent projection unavailable", "ticker", sig.Ticker, "err", intentErr)
+		return
+	}
+	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
+		logger.Warn("update signal status", "id", sigID, "err", err)
+	}
+	e.costTracker.RecordTrade()
 
 	status := execution.NormalizeOrderStatus(result.Status)
 	fullFill := status == "filled" && result.FilledPrice > 0 &&

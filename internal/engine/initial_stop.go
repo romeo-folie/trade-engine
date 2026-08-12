@@ -66,7 +66,10 @@ func (e *Engine) ensureUncappedProtectiveStop(
 	if err != nil {
 		return fmt.Errorf("place protective stop: %w", err)
 	}
-	stockIntentID := stockIntentIDForKey(ctx, intentKey)
+	stockIntentID, err := stockIntentIDForAcceptedOrder(ctx, e.executor, intentKey)
+	if err != nil {
+		return fmt.Errorf("resolve accepted protective-stop intent: %w", err)
+	}
 	status := execution.NormalizeOrderStatus(res.Status)
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {

@@ -858,7 +858,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 					ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, t.Quantity, newStop, existing.Quantity,
 					status, fillPrice, fillQty, res.FilledAt, intent,
 				); persistErr != nil {
-					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {
+					if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, "", intent); rollbackErr != nil {
 						return fmt.Errorf("persist replaced stop: %w; rollback: %v", persistErr, rollbackErr)
 					}
 					return fmt.Errorf("persist replaced stop: %w (broker replacement cancelled)", persistErr)
@@ -944,7 +944,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			ctx, existing.ID, existing.BrokerOrderID, res.BrokerOrderID, existing.FilledQty, t.Quantity, newStop, t.Quantity,
 			status, fillPrice, fillQty, res.FilledAt, intent,
 		); err != nil {
-			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {
+			if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, "", intent); rollbackErr != nil {
 				return fmt.Errorf("persist replacement stop: %w; rollback: %v", err, rollbackErr)
 			}
 			return fmt.Errorf("persist replacement stop: %w (broker stop cancelled)", err)
@@ -964,15 +964,9 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		}
 		return nil
 	}
-	stockIntentID := ""
-	if lookup, ok := m.store.(interface {
-		StockIntentIDForKey(context.Context, string) (string, error)
-	}); ok {
-		var lookupErr error
-		stockIntentID, lookupErr = lookup.StockIntentIDForKey(ctx, stopReq.IntentKey)
-		if lookupErr != nil {
-			return fmt.Errorf("load trailing stop intent: %w", lookupErr)
-		}
+	stockIntentID, err := m.stockIntentIDForAcceptedOrder(ctx, stopReq.IntentKey)
+	if err != nil {
+		return fmt.Errorf("resolve accepted trailing stop intent: %w", err)
 	}
 	_, err = m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,
@@ -992,7 +986,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		StockIntentID: stockIntentID,
 	})
 	if err != nil {
-		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, intent); rollbackErr != nil {
+		if rollbackErr := m.rollbackUnrecordedStop(ctx, t, newStop, res.BrokerOrderID, stockIntentID, intent); rollbackErr != nil {
 			return fmt.Errorf("persist new stop: %w; rollback: %v", err, rollbackErr)
 		}
 		return fmt.Errorf("persist new stop: %w (broker stop cancelled)", err)
@@ -1004,6 +998,31 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		return fmt.Errorf("new stop became %s before providing coverage", status)
 	}
 	return nil
+}
+
+// stockIntentIDForAcceptedOrder makes trailing projections obey the durable
+// coordinator boundary. Paper/legacy executors intentionally remain
+// intent-free, while a coordinator must have a readable immutable intent
+// before this manager writes any projection row.
+func (m *Manager) stockIntentIDForAcceptedOrder(ctx context.Context, key string) (string, error) {
+	durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool })
+	if !ok || !durable.DurableStockOrderIntents() {
+		return "", nil
+	}
+	lookup, ok := m.store.(interface {
+		StockIntentIDForKey(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", errors.New("durable trailing executor has no intent lookup")
+	}
+	intentID, err := lookup.StockIntentIDForKey(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if intentID == "" {
+		return "", errors.New("accepted trailing order durable intent missing")
+	}
+	return intentID, nil
 }
 
 // trailingStopIntentKey names the one semantic replacement operation. The
@@ -1022,6 +1041,7 @@ func (m *Manager) rollbackUnrecordedStop(
 	t store.Trade,
 	stopPrice float64,
 	brokerOrderID string,
+	stockIntentID string,
 	intent store.ExitIntent,
 ) error {
 	cancelErr := m.exec.CancelOrder(ctx, brokerOrderID)
@@ -1033,6 +1053,11 @@ func (m *Manager) rollbackUnrecordedStop(
 		return fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
 	}
 	terminalStatus := execution.NormalizeOrderStatus(status.Status)
+	if durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool }); ok && durable.DurableStockOrderIntents() && stockIntentID == "" {
+		// The broker fill remains recoverable from its immutable intent. Do
+		// not turn this exceptional rollback path into an unlinked legacy row.
+		return errors.New("rollback stop durable intent unavailable")
+	}
 	switch terminalStatus {
 	case "cancelled", "rejected":
 		if status.FilledQty <= 0 {
@@ -1047,6 +1072,7 @@ func (m *Manager) rollbackUnrecordedStop(
 			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
 			FilledAt:   timePtr(status.FilledAt),
 			ExitReason: intent.Reason, ExitEvidence: intent.Evidence,
+			StockIntentID: stockIntentID,
 		}); err != nil {
 			return fmt.Errorf("%w; persist partial rollback stop: %v", errStopFilledDuringRollback, err)
 		}
@@ -1061,6 +1087,7 @@ func (m *Manager) rollbackUnrecordedStop(
 			FilledPrice: status.FilledPrice, FilledQty: status.FilledQty,
 			FilledAt:   timePtr(status.FilledAt),
 			ExitReason: intent.Reason, ExitEvidence: intent.Evidence,
+			StockIntentID: stockIntentID,
 		}); err != nil {
 			return fmt.Errorf("%w; persist filled rollback stop: %v", errStopFilledDuringRollback, err)
 		}
@@ -1108,6 +1135,11 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, referencePric
 	// persistence fails. Releasing it would let another worker submit a second
 	// full sell on its next stale/open read.
 	releaseClaim = false
+	intentKey := fmt.Sprintf("trailing-market-exit:%s:%.8f", t.ID, exitQty)
+	stockIntentID, err := m.stockIntentIDForAcceptedOrder(ctx, intentKey)
+	if err != nil {
+		return fmt.Errorf("resolve accepted trailing market-exit intent: %w", err)
+	}
 	if _, err := m.store.InsertOrder(ctx, store.Order{
 		TradeID:       t.ID,
 		BrokerOrderID: exitRes.BrokerOrderID,
@@ -1122,6 +1154,7 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, referencePric
 		ExitReason:    intent.Reason,
 		ExitEvidence:  intent.Evidence,
 		FilledAt:      timePtr(exitRes.FilledAt),
+		StockIntentID: stockIntentID,
 	}); err != nil {
 		return fmt.Errorf("record accepted market exit: %w", err)
 	}
