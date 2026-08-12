@@ -374,6 +374,9 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 		existing = &store.Order{ID: orderID, BrokerOrderID: brokerID}
 	}
 	if res.FilledQty <= 0 {
+		if execution.IsTerminalOrderStatus(res.Status) {
+			return store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatus(res.Status))
+		}
 		return nil
 	}
 	if res.FilledPrice <= 0 {

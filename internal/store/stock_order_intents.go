@@ -228,6 +228,15 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                      AND t.stock_intent_id=stock_order_intents.id
                      AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
                ))
+           -- A terminal zero-fill entry can still have an order-only row from
+           -- a crash between acceptance and terminal polling. Select it once
+           -- to persist the terminal order status, then it is complete.
+           OR (status='cancelled' AND filled_qty <= 0.000000001
+               AND idempotency_key LIKE 'entry:%' AND EXISTS (
+                   SELECT 1 FROM orders o
+                   WHERE o.stock_intent_id=stock_order_intents.id
+                     AND o.status IN ('pending','partial')
+               ))
            -- A filled exit stays recoverable only until every required
            -- projection is present, its cumulative fill is durably applied,
            -- and its trade is terminal. Aggregate analyst exits have one
@@ -267,6 +276,14 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                      AND o.trade_id=stock_order_intents.trade_id
                      AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
                      AND t.status='closed'
+               ))
+           -- Same order-only completion rule for DAY/fractional standalone
+           -- stops. done_for_day is normalized to cancelled before storage.
+           OR (status='cancelled' AND filled_qty <= 0.000000001
+               AND order_type='stop' AND trade_id IS NOT NULL AND EXISTS (
+                   SELECT 1 FROM orders o
+                   WHERE o.stock_intent_id=stock_order_intents.id
+                     AND o.status IN ('pending','partial')
                ))
         )
         ORDER BY created_at`)

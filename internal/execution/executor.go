@@ -227,7 +227,7 @@ func NormalizeOrderStatus(status string) string {
 		return "filled"
 	case "partially_filled":
 		return "partial"
-	case "cancelled", "canceled":
+	case "cancelled", "canceled", "done_for_day":
 		return "cancelled"
 	case "rejected", "expired":
 		return "rejected"
@@ -247,9 +247,7 @@ func IsTerminalOrderStatus(status string) bool {
 	case "filled", "cancelled", "rejected":
 		return true
 	}
-	// done_for_day: no more fills this session; the engine's day-TIF orders
-	// won't resume tomorrow, so treat as terminal for fill polling.
-	return status == "done_for_day"
+	return false
 }
 
 // AccountInfo contains the broker account's cash and portfolio equity.

@@ -1077,6 +1077,77 @@ func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing
 	}
 }
 
+func TestStockIntentDoneForDayTerminalizesOrderOnlyProjections(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		entry bool
+	}{
+		{"entry", true},
+		{"fractional day stop", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTDONE" + fmt.Sprintf("%d", time.Now().UnixNano())
+			signalID := insertRecoverySignal(t, ticker)
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "done-for-day-" + tc.name, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			var req execution.OrderRequest
+			if tc.entry {
+				req = entryRequest(signalID, ticker, 1)
+			} else {
+				tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1.5, StopLoss: 90})
+				if err != nil {
+					t.Fatal(err)
+				}
+				req = execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1.5, StopPrice: 90, TradeID: tradeID, TimeInForce: "day", IntentKey: "protective-stop-done:" + tradeID}
+			}
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, req.IntentKey)
+			if _, err := store.InsertOrder(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: "done-for-day-" + tc.name, Ticker: ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity, StopPrice: req.StopPrice, Status: "pending", IsStopLoss: !tc.entry, StockIntentID: in.ID}); err != nil {
+				t.Fatal(err)
+			}
+			broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "done-for-day-" + tc.name, Status: "done_for_day"}
+			if _, err := coordinator.PlaceOrder(ctx, req); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+				t.Fatalf("done_for_day client lookup result=%v, want ErrTerminalZeroFillPlacement", err)
+			}
+			in = intentForKey(t, req.IntentKey)
+			if in.Status != "cancelled" {
+				t.Fatalf("done_for_day intent status=%q, want cancelled", in.Status)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminal order-only projection was not recoverable")
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			order, err := store.GetOrderByStockIntentID(ctx, in.ID)
+			if err != nil || order == nil || order.Status != "cancelled" {
+				t.Fatalf("done_for_day projection=%#v err=%v", order, err)
+			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminalized done_for_day intent remained recoverable")
+			}
+			beforeLookups, beforeAttempts := len(broker.lookupIDs), countStockIntentAttempts(t, in.ID)
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			for _, clientID := range broker.lookupIDs[beforeLookups:] {
+				if clientID == in.ClientOrderID {
+					t.Fatal("terminalized done_for_day intent replayed broker lookup")
+				}
+			}
+			if got := countStockIntentAttempts(t, in.ID); got != beforeAttempts {
+				t.Fatalf("terminalized done_for_day intent created attempt: %d -> %d", beforeAttempts, got)
+			}
+		})
+	}
+}
+
 func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {

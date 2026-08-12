@@ -19,3 +19,9 @@ func TestIsTerminalOrderStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizeOrderStatusDoneForDayIsCancelled(t *testing.T) {
+	if got := NormalizeOrderStatus("done_for_day"); got != "cancelled" {
+		t.Fatalf("NormalizeOrderStatus(done_for_day)=%q, want cancelled", got)
+	}
+}
