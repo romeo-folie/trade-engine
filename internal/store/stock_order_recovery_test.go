@@ -33,6 +33,26 @@ type recoveryBroker struct {
 	patchErrs []error
 }
 
+// cancellationFillRecoveryBroker models a stop that fills while its cancel is
+// in flight. Cancel deliberately leaves the broker's terminal snapshot intact
+// so recovery must book that cumulative fill before resizing protection.
+type cancellationFillRecoveryBroker struct {
+	*recoveryBroker
+	cancelStatus map[string]execution.OrderResult
+}
+
+func (b *cancellationFillRecoveryBroker) CancelOrder(_ context.Context, id string) error {
+	b.cancels = append(b.cancels, id)
+	return nil
+}
+
+func (b *cancellationFillRecoveryBroker) GetOrderStatus(_ context.Context, id string) (execution.OrderResult, error) {
+	if res, ok := b.cancelStatus[id]; ok {
+		return res, nil
+	}
+	return b.recoveryBroker.GetOrderStatus(context.Background(), id)
+}
+
 func newRecoveryBroker(res execution.OrderResult) *recoveryBroker {
 	return &recoveryBroker{posted: map[string]execution.OrderResult{}, lookup: map[string]execution.OrderResult{}, status: map[string]execution.OrderResult{}, postRes: res}
 }
@@ -1737,6 +1757,121 @@ func TestStockIntentRecoveryAdoptsNormalUncappedProtectiveStop(t *testing.T) {
 	var active int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss AND status IN ('pending','partial')`, tradeID).Scan(&active); err != nil || active != 1 {
 		t.Fatalf("active protection = %d, %v", active, err)
+	}
+}
+
+func TestRecoveredProtectiveStopResizeAppliesCancellationRaceFill(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTCANCELRACE")
+	broker := &cancellationFillRecoveryBroker{
+		recoveryBroker: newRecoveryBroker(execution.OrderResult{BrokerOrderID: "entry-cancel-race", Status: "accepted"}),
+		cancelStatus:   map[string]execution.OrderResult{},
+	}
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTCANCELRACE", 10)
+	req.PolicyStopLoss, req.PolicyTakeProfit, req.UncappedTakeProfit = 95, 120, true
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	entry := intentForKey(t, req.IntentKey)
+	broker.lookup[entry.ClientOrderID] = execution.OrderResult{BrokerOrderID: "entry-cancel-race", Status: "filled", FilledPrice: 100, FilledQty: 10}
+	broker.postRes = execution.OrderResult{BrokerOrderID: "old-cancel-race-stop", Status: "accepted"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	entry = intentForKey(t, req.IntentKey)
+	tradeID := entry.TradeID
+	if tradeID == "" {
+		t.Fatal("recovered entry has no trade id")
+	}
+	old, err := store.GetRecoveredProtectiveStop(ctx, tradeID, entry.ID)
+	if err != nil || old == nil {
+		t.Fatalf("old recovered stop=%#v err=%v", old, err)
+	}
+	// The old generation covered only five shares when the entry's later
+	// cumulative fill reached ten. It sells two while cancellation is racing.
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET quantity=5 WHERE id=$1::uuid`, old.ID); err != nil {
+		t.Fatal(err)
+	}
+	broker.cancelStatus[old.BrokerOrderID] = execution.OrderResult{BrokerOrderID: old.BrokerOrderID, Status: "cancelled", FilledPrice: 94, FilledQty: 2}
+	broker.postRes = execution.OrderResult{BrokerOrderID: "resized-cancel-race-stop", Status: "accepted"}
+	// Keep the entry selectable, simulating its projection lagging the durable
+	// ten-share cumulative broker fill while the stop is being resized.
+	if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET status='partial', filled_qty=5 WHERE stock_intent_id=$1::uuid`, entry.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	active, err := store.GetRecoveredProtectiveStop(ctx, tradeID, entry.ID)
+	if err != nil || active == nil || active.BrokerOrderID != "resized-cancel-race-stop" || active.Quantity != 8 {
+		t.Fatalf("resized protective stop=%#v err=%v, want 8 shares", active, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 8 || trade.Status != "exiting" {
+		t.Fatalf("cancellation race trade=%#v err=%v", trade, err)
+	}
+	beforeOrders, beforePosts := countForIntent(t, "orders", active.StockIntentID), broker.posts
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	trade, _ = store.GetTradeByID(ctx, tradeID)
+	if trade.Quantity != 8 || broker.posts != beforePosts || countForIntent(t, "orders", active.StockIntentID) != beforeOrders {
+		t.Fatalf("cancellation race replay changed trade/posts/orders: trade=%#v posts=%d->%d orders=%d->%d", trade, beforePosts, broker.posts, beforeOrders, countForIntent(t, "orders", active.StockIntentID))
+	}
+}
+
+func TestRecoveredProtectiveStopDoesNotReplaceAfterCancellationFillClosesTrade(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTCANCELCLOSE")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTCANCELCLOSE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5, StopLoss: 95})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := entryRequest(signalID, "RINTENTCANCELCLOSE", 5)
+	req.PolicyStopLoss, req.UncappedTakeProfit = 95, true
+	req.ClientOrderID = "entry-cancel-close"
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: "41414141-4141-4141-8141-414141414141", IdempotencyKey: req.IntentKey, ClientOrderID: "entry-cancel-close", TradeID: tradeID, Ticker: req.Ticker, Side: "buy", OrderType: "market", RequestedQty: 5, RequestPayload: payload, PayloadHash: "entry", BrokerOrderID: "entry", Status: "filled", FilledPrice: 100, FilledQty: 5}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET stock_intent_id=$1::uuid WHERE id=$2::uuid`, parent.ID, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "entry", "filled", 100, 5, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AttachStockOrderIntentTradeByKey(ctx, req.IntentKey, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "entry", Ticker: parent.Ticker, Side: "buy", OrderType: "market", Quantity: 5, FilledPrice: 100, FilledQty: 4, Status: "partial", StockIntentID: parent.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "closing-stop", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 94, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID}); err != nil {
+		t.Fatal(err)
+	}
+	broker := &cancellationFillRecoveryBroker{recoveryBroker: newRecoveryBroker(execution.OrderResult{}), cancelStatus: map[string]execution.OrderResult{"closing-stop": {BrokerOrderID: "closing-stop", Status: "filled", FilledPrice: 94, FilledQty: 5}}}
+	coordinator := stockorders.New(broker)
+	broker.lookup[parent.ClientOrderID] = execution.OrderResult{BrokerOrderID: "entry", Status: "filled", FilledPrice: 100, FilledQty: 5}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.posts != 0 {
+		t.Fatalf("cancellation fill closed position but submitted %d replacements", broker.posts)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 0 || (trade.Status != "exiting" && trade.Status != "closed") {
+		t.Fatalf("cancellation closing trade=%#v err=%v", trade, err)
 	}
 }
 

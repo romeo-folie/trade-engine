@@ -293,7 +293,7 @@ func GetRecoveredProtectiveStop(ctx context.Context, tradeID, entryIntentID stri
 		SELECT o.id, COALESCE(o.trade_id::text,''), COALESCE(o.broker_order_id,''),
 		       o.ticker, o.side, o.order_type, o.quantity, COALESCE(o.limit_price,0),
 		       COALESCE(o.stop_price,0), COALESCE(o.filled_price,0), COALESCE(o.filled_qty,0),
-		       o.status, o.is_stop_loss, o.is_take_profit, COALESCE(o.parent_order_id,''),
+		       o.status, o.is_stop_loss, o.is_take_profit, COALESCE(o.exit_reason,''), o.exit_evidence, COALESCE(o.parent_order_id,''),
 		       o.filled_at, o.created_at, o.updated_at, COALESCE(o.stock_intent_id::text,'')
 		FROM orders o JOIN stock_order_intents i ON i.id=o.stock_intent_id
 		WHERE o.trade_id=$1::uuid
@@ -310,7 +310,7 @@ func GetRecoveredProtectiveStop(ctx context.Context, tradeID, entryIntentID stri
 	var o Order
 	if err := rows.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side, &o.OrderType,
 		&o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice, &o.FilledQty, &o.Status,
-		&o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID, &o.FilledAt, &o.CreatedAt,
+		&o.IsStopLoss, &o.IsTakeProfit, &o.ExitReason, &o.ExitEvidence, &o.ParentOrderID, &o.FilledAt, &o.CreatedAt,
 		&o.UpdatedAt, &o.StockIntentID); err != nil {
 		return nil, err
 	}

@@ -188,6 +188,17 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 		return err
 	}
 	for _, intent := range intents {
+		// A prior intent in this same recovery snapshot can advance a mutable
+		// stop row and supersede a later predecessor. Re-read it before acting
+		// so the stale snapshot cannot recreate an active old-generation stop.
+		current, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+		if err != nil {
+			return err
+		}
+		if current == nil || current.Purpose != "submit" {
+			continue
+		}
+		intent = *current
 		var req execution.OrderRequest
 		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
 			return fmt.Errorf("decode stock intent %s: %w", intent.ClientOrderID, err)
@@ -545,6 +556,14 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 // restart: cancel and confirm the old generation before submitting the resized
 // one, so protected working quantity never exceeds the held position.
 func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, tradeID string) error {
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil {
+		return fmt.Errorf("load recovered protective-stop trade: %w", err)
+	}
+	if trade == nil || trade.Status == "closed" || trade.Quantity <= 1e-9 {
+		return nil
+	}
+	desiredQty := trade.Quantity
 	existing, err := store.GetRecoveredProtectiveStop(ctx, tradeID, parent.ID)
 	if err != nil {
 		return err
@@ -558,10 +577,11 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 			return fmt.Errorf("load normal protective stop for recovery: %w", err)
 		}
 	}
-	if existing != nil && existing.Quantity == res.FilledQty && existing.StopPrice == req.PolicyStopLoss {
+	if existing != nil && existing.Quantity == desiredQty && existing.StopPrice == req.PolicyStopLoss {
 		return nil
 	}
 	key := fmt.Sprintf("recovered-protective-stop:%s:%s:%.8f", tradeID, parent.ID, req.PolicyStopLoss)
+	remainingQty := desiredQty
 	if existing != nil {
 		if err := c.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
 			return fmt.Errorf("cancel prior recovered protective stop: %w", err)
@@ -570,13 +590,38 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 		if err != nil {
 			return fmt.Errorf("confirm cancellation of recovered protective stop: %w", err)
 		}
-		if normalized := execution.NormalizeOrderStatus(status.Status); normalized != "cancelled" && normalized != "rejected" {
+		normalized := execution.NormalizeOrderStatus(status.Status)
+		if !execution.IsTerminalOrderStatus(status.Status) {
 			return fmt.Errorf("recovered protective stop %s remains %s after cancel", existing.BrokerOrderID, status.Status)
 		}
-		key += fmt.Sprintf(":resize:%s:%.8f", existing.BrokerOrderID, res.FilledQty)
+		exitIntent := store.ExitIntent{Reason: existing.ExitReason, Evidence: existing.ExitEvidence}
+		if exitIntent.Reason == "" {
+			exitIntent = store.ExitIntent{Reason: store.ExitReasonStopLoss}
+		}
+		if status.FilledQty > 0 {
+			if _, err := store.ClaimTradeExitWithIntent(ctx, tradeID, exitIntent); err != nil {
+				return fmt.Errorf("claim recovered protective-stop cancellation fill: %w", err)
+			}
+			remaining, _, err := store.ApplyProtectiveExitAtForBrokerOrder(ctx,
+				tradeID, existing.ID, existing.BrokerOrderID,
+				status.FilledPrice, status.FilledQty, normalized, status.FilledAt, exitIntent)
+			if err != nil {
+				return fmt.Errorf("apply recovered protective-stop cancellation fill: %w", err)
+			}
+			remainingQty = remaining
+		} else if err := store.UpdateOrderStatusForBrokerOrder(ctx, existing.ID, existing.BrokerOrderID, normalized); err != nil {
+			return fmt.Errorf("terminalize recovered protective stop after cancellation: %w", err)
+		}
+		if remainingQty <= 1e-9 {
+			// A cancellation can race a complete stop fill. Do not create a
+			// fresh protective order for a position that no longer exists; the
+			// durable exit reconciler/finalizer owns the terminal trade state.
+			return nil
+		}
+		key += fmt.Sprintf(":resize:%s:%.8f", existing.BrokerOrderID, remainingQty)
 	}
 	stopReq := execution.OrderRequest{Ticker: req.Ticker, Side: execution.OrderSideSell,
-		Type: execution.OrderTypeStop, Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss,
+		Type: execution.OrderTypeStop, Quantity: remainingQty, StopPrice: req.PolicyStopLoss,
 		TradeID: tradeID, TimeInForce: "gtc", IntentKey: key,
 		ExitReason: store.ExitReasonStopLoss, ExitEvidence: json.RawMessage(fmt.Sprintf(`{"stop_loss":%g}`, req.PolicyStopLoss))}
 	stopRes, err := c.PlaceOrder(ctx, stopReq)
@@ -590,17 +635,17 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 	if existing == nil {
 		_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: tradeID, BrokerOrderID: stopRes.BrokerOrderID,
 			Ticker: req.Ticker, Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeStop),
-			Quantity: res.FilledQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
+			Quantity: remainingQty, StopPrice: req.PolicyStopLoss, FilledPrice: stopRes.FilledPrice,
 			FilledQty: stopRes.FilledQty, Status: execution.NormalizeOrderStatus(stopRes.Status), IsStopLoss: true,
 			ExitReason: requestExitIntent(stopReq).Reason, ExitEvidence: requestExitIntent(stopReq).Evidence, StockIntentID: stopIntent.ID})
 		return err
 	}
-	if err := store.UpdateOrderStopReplacement(ctx, existing.ID, existing.BrokerOrderID, stopRes.BrokerOrderID,
-		existing.FilledQty, res.FilledQty, req.PolicyStopLoss, res.FilledQty,
+	if err := store.UpdateOrderStopReplacementAndSupersede(ctx, existing.ID, existing.BrokerOrderID, stopRes.BrokerOrderID, stopIntent.ID,
+		existing.FilledQty, remainingQty, req.PolicyStopLoss, remainingQty,
 		execution.NormalizeOrderStatus(stopRes.Status), stopRes.FilledPrice, stopRes.FilledQty, stopRes.FilledAt, requestExitIntent(stopReq)); err != nil {
 		return err
 	}
-	return store.RepointOrderStockIntentAndSupersede(ctx, existing.ID, stopIntent.ID)
+	return nil
 }
 
 func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent, operation, outcome string, res execution.OrderResult, errText string, submitted bool) error {
