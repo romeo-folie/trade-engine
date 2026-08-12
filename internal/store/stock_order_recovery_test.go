@@ -462,6 +462,202 @@ func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryProjectsTerminalPartialEntryFill(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{"cancelled", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTTERMINALENTRY" + status[:1]
+			signalID := insertRecoverySignal(t, ticker)
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-entry-" + status, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			req := entryRequest(signalID, ticker, 5)
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, req.IntentKey)
+			result := execution.OrderResult{BrokerOrderID: "terminal-entry-" + status, Status: status, FilledPrice: 101, FilledQty: 2}
+			broker.lookup[in.ClientOrderID] = result
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, result.BrokerOrderID, execution.NormalizeOrderStatus(status), result.FilledPrice, result.FilledQty, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminal partial entry without projection was not recoverable")
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := countForIntent(t, "trades", in.ID); got != 1 {
+				t.Fatalf("terminal partial entry trades=%d, want 1", got)
+			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("applied terminal partial entry remained recoverable")
+			}
+			beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+				t.Fatalf("completed terminal partial entry replayed lookup/attempt: lookups %d->%d attempts %d->%d", beforeLookups, broker.lookups, beforeAttempts, countStockIntentAttempts(t, in.ID))
+			}
+		})
+	}
+}
+
+func TestStockIntentRecoveryProjectsTerminalStopFill(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{"cancelled", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTTERMINALSTOP" + status[:1]
+			signalID := insertRecoverySignal(t, ticker)
+			tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 90})
+			if err != nil {
+				t.Fatal(err)
+			}
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-stop-" + status, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			req := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 90, TradeID: tradeID, IntentKey: "protective-stop-terminal:" + tradeID}
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, req.IntentKey)
+			result := execution.OrderResult{BrokerOrderID: "terminal-stop-" + status, Status: status, FilledPrice: 89, FilledQty: 2}
+			broker.lookup[in.ClientOrderID] = result
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, result.BrokerOrderID, execution.NormalizeOrderStatus(status), result.FilledPrice, result.FilledQty, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminal stop fill without projection was not recoverable")
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeID)
+			if err != nil || order == nil || order.FilledQty != 2 || order.Status != execution.NormalizeOrderStatus(status) {
+				t.Fatalf("terminal stop projection=%#v err=%v", order, err)
+			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("applied terminal stop remained recoverable")
+			}
+			beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+				t.Fatalf("completed terminal stop replayed lookup/attempt")
+			}
+		})
+	}
+}
+
+func TestStockIntentRecoveryProjectsTerminalMarketExitFills(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{"cancelled", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTTERMINALEXIT" + status[:1]
+			signalID := insertRecoverySignal(t, ticker)
+			tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 3})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+				t.Fatalf("claim exit=%v err=%v", claimed, err)
+			}
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-exit-" + status, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			req := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 3, TradeID: tradeID, IntentKey: "software-exit:" + tradeID + ":terminal"}
+			if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, req.IntentKey)
+			result := execution.OrderResult{BrokerOrderID: "terminal-exit-" + status, Status: status, FilledPrice: 105, FilledQty: 3}
+			broker.lookup[in.ClientOrderID] = result
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, result.BrokerOrderID, execution.NormalizeOrderStatus(status), result.FilledPrice, result.FilledQty, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminal market exit without projection was not recoverable")
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("finalized terminal market exit remained recoverable")
+			}
+			beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+				t.Fatalf("completed terminal market exit replayed lookup/attempt")
+			}
+		})
+	}
+}
+
+func TestStockIntentRecoveryProjectsTerminalAggregateMarketExitFills(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{"cancelled", "rejected"} {
+		t.Run(status, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTTERMINALAGG" + status[:1]
+			signalID := insertRecoverySignal(t, ticker)
+			tradeA, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tradeB, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+			if err != nil {
+				t.Fatal(err)
+			}
+			claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+			for _, tradeID := range []string{tradeA, tradeB} {
+				if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+					t.Fatalf("claim aggregate exit=%v err=%v", claimed, err)
+				}
+			}
+			broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "terminal-aggregate-" + status, Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			key := "analyst-exit:" + signalID + ":" + ticker
+			if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, IntentKey: key}); err != nil {
+				t.Fatal(err)
+			}
+			in := intentForKey(t, key)
+			result := execution.OrderResult{BrokerOrderID: "terminal-aggregate-" + status, Status: status, FilledPrice: 106, FilledQty: 5}
+			broker.lookup[in.ClientOrderID] = result
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, result.BrokerOrderID, execution.NormalizeOrderStatus(status), result.FilledPrice, result.FilledQty, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("terminal aggregate exit without allocation was not recoverable")
+			}
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("finalized terminal aggregate exit remained recoverable")
+			}
+			beforeLookups, beforeAttempts := broker.lookups, countStockIntentAttempts(t, in.ID)
+			if err := coordinator.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if broker.lookups != beforeLookups || countStockIntentAttempts(t, in.ID) != beforeAttempts {
+				t.Fatalf("completed terminal aggregate exit replayed lookup/attempt")
+			}
+		})
+	}
+}
+
 func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
@@ -945,11 +1141,18 @@ func TestStockIntentDefinitiveRejectionIsTerminalButAmbiguityRecovers(t *testing
 	}
 }
 
-type delayedDuplicateBroker struct{ lookups, posts int }
+type delayedDuplicateBroker struct {
+	lookups, posts int
+	message        string
+}
 
 func (b *delayedDuplicateBroker) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
 	b.posts++
-	return execution.OrderResult{}, &execution.BrokerRequestError{StatusCode: 422, Message: "duplicate client order id"}
+	message := b.message
+	if message == "" {
+		message = "duplicate client order id"
+	}
+	return execution.OrderResult{}, &execution.BrokerRequestError{StatusCode: 422, Message: message}
 }
 func (b *delayedDuplicateBroker) GetOrderByClientID(context.Context, string) (execution.OrderResult, error) {
 	b.lookups++
@@ -974,29 +1177,38 @@ func (*delayedDuplicateBroker) ReplaceStopOrder(context.Context, string, float64
 
 func TestStockIntentDuplicateClient422RemainsRecoverableUntilLookupFinds(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
-		t.Fatal(err)
-	}
-	signalID := insertRecoverySignal(t, "RINTENTDUPCLIENT")
-	b := &delayedDuplicateBroker{}
-	c := stockorders.New(b)
-	req := entryRequest(signalID, "RINTENTDUPCLIENT", 1)
-	if _, err := c.PlaceOrder(ctx, req); err == nil {
-		t.Fatal("duplicate response must remain ambiguous")
-	}
-	in := intentForKey(t, req.IntentKey)
-	if in.Status == "rejected" {
-		t.Fatal("duplicate client 422 terminalized intent")
-	}
-	if err := c.Recover(ctx); err != nil {
-		t.Fatal(err)
-	}
-	in = intentForKey(t, req.IntentKey)
-	if in.Status != "filled" {
-		t.Fatalf("later lookup status=%q", in.Status)
-	}
-	if got := countForIntent(t, "trades", in.ID); got != 1 {
-		t.Fatalf("late accepted projection trades=%d", got)
+	for _, tc := range []struct{ name, message string }{
+		{"duplicate", "duplicate client order id"},
+		{"already exists", "order with client_order_id replay-id already exists"},
+		{"must be unique", "client_order_id must be unique"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTDUPCLIENT" + tc.name[:1]
+			signalID := insertRecoverySignal(t, ticker)
+			b := &delayedDuplicateBroker{message: tc.message}
+			c := stockorders.New(b)
+			req := entryRequest(signalID, ticker, 1)
+			if _, err := c.PlaceOrder(ctx, req); err == nil {
+				t.Fatal("duplicate response must remain ambiguous")
+			}
+			in := intentForKey(t, req.IntentKey)
+			if in.Status == "rejected" {
+				t.Fatal("duplicate client 422 terminalized intent")
+			}
+			if err := c.Recover(ctx); err != nil {
+				t.Fatal(err)
+			}
+			in = intentForKey(t, req.IntentKey)
+			if in.Status != "filled" {
+				t.Fatalf("later lookup status=%q", in.Status)
+			}
+			if got := countForIntent(t, "trades", in.ID); got != 1 {
+				t.Fatalf("late accepted projection trades=%d", got)
+			}
+		})
 	}
 }
 

@@ -219,17 +219,21 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
         FROM stock_order_intents
         WHERE purpose='submit' AND (
               status IN ('pending','partial')
-           OR (status='filled' AND idempotency_key LIKE 'entry:%'
-               AND (trade_id IS NULL OR NOT EXISTS (
+           OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND idempotency_key LIKE 'entry:%'
+               AND NOT EXISTS (
                    SELECT 1 FROM orders o
-                   WHERE o.stock_intent_id=stock_order_intents.id AND o.trade_id=stock_order_intents.trade_id
-               )))
+                   JOIN trades t ON t.id=o.trade_id
+                   WHERE o.stock_intent_id=stock_order_intents.id
+                     AND o.trade_id=stock_order_intents.trade_id
+                     AND t.stock_intent_id=stock_order_intents.id
+                     AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
+               ))
            -- A filled exit stays recoverable only until every required
            -- projection is present, its cumulative fill is durably applied,
            -- and its trade is terminal. Aggregate analyst exits have one
            -- order row per claimed lot, so completion is based on their
            -- aggregate allocation and every linked lot rather than one row.
-           OR (status='filled' AND order_type='market' AND (
+           OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND order_type='market' AND (
                   idempotency_key LIKE 'software-exit:%'
                OR idempotency_key LIKE 'trailing-market-exit:%'
                OR idempotency_key LIKE 'analyst-exit:%'
@@ -255,8 +259,15 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    )
                ))
            ))
-           OR (status='filled' AND order_type='stop' AND trade_id IS NOT NULL
-               AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id))
+           OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND order_type='stop' AND trade_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM orders o
+                   JOIN trades t ON t.id=o.trade_id
+                   WHERE o.stock_intent_id=stock_order_intents.id
+                     AND o.trade_id=stock_order_intents.trade_id
+                     AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
+                     AND t.status='closed'
+               ))
         )
         ORDER BY created_at`)
 	if err != nil {

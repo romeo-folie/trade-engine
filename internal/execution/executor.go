@@ -59,9 +59,19 @@ func IsDefinitiveOrderRejection(err error) bool {
 // its prior accepted order has become visible to client-id lookup.
 func IsDuplicateClientOrderError(err error) bool {
 	var requestErr *BrokerRequestError
-	return errors.As(err, &requestErr) && requestErr.StatusCode == 422 &&
-		(strings.Contains(strings.ToLower(requestErr.Message), "client order") || strings.Contains(strings.ToLower(requestErr.Message), "client_order_id")) &&
-		strings.Contains(strings.ToLower(requestErr.Message), "duplicate")
+	if !errors.As(err, &requestErr) || requestErr.StatusCode != 422 {
+		return false
+	}
+	message := strings.ToLower(requestErr.Message)
+	hasClientOrderID := strings.Contains(message, "client_order_id") ||
+		strings.Contains(message, "client order id") ||
+		strings.Contains(message, "client order")
+	if !hasClientOrderID {
+		return false
+	}
+	return strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "must be unique")
 }
 
 // OrderSide identifies the direction of an order.

@@ -332,7 +332,7 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 	if err != nil {
 		return fmt.Errorf("apply recovered market exit fill: %w", err)
 	}
-	if execution.NormalizeOrderStatus(res.Status) == "filled" && remaining <= 1e-9 {
+	if execution.IsTerminalOrderStatus(res.Status) && remaining <= 1e-9 {
 		if _, err := store.FinalizeTradeExit(ctx, tradeID); err != nil {
 			return fmt.Errorf("finalize recovered market exit: %w", err)
 		}
@@ -359,18 +359,45 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		return nil
-	}
 	brokerID := res.BrokerOrderID
 	if brokerID == "" {
 		brokerID = intent.BrokerOrderID
 	}
-	_, err = store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: brokerID,
-		Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
-		StopPrice: req.StopPrice, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
-		Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true, StockIntentID: intent.ID})
-	return err
+	if existing == nil {
+		orderID, err := store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: brokerID,
+			Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
+			StopPrice: req.StopPrice, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
+			Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true, StockIntentID: intent.ID})
+		if err != nil {
+			return err
+		}
+		existing = &store.Order{ID: orderID, BrokerOrderID: brokerID}
+	}
+	if res.FilledQty <= 0 {
+		return nil
+	}
+	if res.FilledPrice <= 0 {
+		return fmt.Errorf("recovered stop %s has fill without price", intent.ClientOrderID)
+	}
+	if _, err := store.ClaimTradeExitWithIntent(ctx, req.TradeID, store.ExitIntent{Reason: store.ExitReasonStopLoss}); err != nil {
+		return fmt.Errorf("claim recovered stop exit: %w", err)
+	}
+	expectedBrokerID := existing.BrokerOrderID
+	if expectedBrokerID == "" {
+		expectedBrokerID = brokerID
+	}
+	remaining, _, err := store.ApplyProtectiveExitAtForBrokerOrder(ctx, req.TradeID, existing.ID, expectedBrokerID,
+		res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status), res.FilledAt,
+		store.ExitIntent{Reason: store.ExitReasonStopLoss})
+	if err != nil {
+		return fmt.Errorf("apply recovered stop fill: %w", err)
+	}
+	if execution.IsTerminalOrderStatus(res.Status) && remaining <= 1e-9 {
+		if _, err := store.FinalizeTradeExit(ctx, req.TradeID); err != nil {
+			return fmt.Errorf("finalize recovered stop fill: %w", err)
+		}
+	}
+	return nil
 }
 
 // projectRecoveredEntry completes only an accepted standard entry whose
