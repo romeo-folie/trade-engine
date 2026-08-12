@@ -919,11 +919,30 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		IntentKey:   trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
 	}
 	res, err := m.exec.PlaceOrder(ctx, stopReq)
+	rotatedTerminalGeneration := false
+	if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		cancelledBrokerID, resolveErr := m.terminalBrokerOrderIDForIntent(ctx, stopReq.IntentKey)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve terminal trailing stop generation: %w", resolveErr)
+		}
+		retryReq := stopReq
+		retryReq.IntentKey = trailingStopRetryIntentKey(stopReq.IntentKey, cancelledBrokerID)
+		retryReq.ClientOrderID = ""
+		res, err = m.exec.PlaceOrder(ctx, retryReq)
+		if err != nil {
+			return fmt.Errorf("place replacement stop generation: %w", err)
+		}
+		stopReq = retryReq
+		rotatedTerminalGeneration = true
+	}
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
 	status := execution.NormalizeOrderStatus(res.Status)
 	if isTerminalZeroFill(status, res.FilledQty) {
+		if rotatedTerminalGeneration {
+			return fmt.Errorf("fresh trailing stop generation is terminal zero-fill")
+		}
 		// A prior rollback can leave the deterministic intent bound to a
 		// confirmed-cancelled broker stop. That order is not protection for a
 		// new tick, so advance to a deterministic generation rather than let
@@ -939,6 +958,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 			return fmt.Errorf("place replacement stop generation: %w", err)
 		}
 		stopReq = retryReq
+		rotatedTerminalGeneration = true
 		status = execution.NormalizeOrderStatus(res.Status)
 	}
 	fillQty := res.FilledQty
@@ -1016,6 +1036,27 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		return fmt.Errorf("new stop became %s before providing coverage", status)
 	}
 	return nil
+}
+
+func (m *Manager) terminalBrokerOrderIDForIntent(ctx context.Context, key string) (string, error) {
+	durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool })
+	if !ok || !durable.DurableStockOrderIntents() {
+		return "", errors.New("terminal intent retry requires durable executor")
+	}
+	lookup, ok := m.store.(interface {
+		TerminalBrokerOrderIDForIntent(context.Context, string) (string, error)
+	})
+	if !ok {
+		return "", errors.New("durable trailing executor has no terminal intent lookup")
+	}
+	brokerID, err := lookup.TerminalBrokerOrderIDForIntent(ctx, key)
+	if err != nil {
+		return "", err
+	}
+	if brokerID == "" {
+		return "", errors.New("terminal trailing intent has no broker order id")
+	}
+	return brokerID, nil
 }
 
 // stockIntentIDForAcceptedOrder makes trailing projections obey the durable

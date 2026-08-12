@@ -164,14 +164,36 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    SELECT 1 FROM orders o
                    WHERE o.stock_intent_id=stock_order_intents.id AND o.trade_id=stock_order_intents.trade_id
                )))
-           -- Exit intents may have one projection per claimed trade (the
-           -- analyst aggregate case), so there is no single NOT EXISTS
-           -- predicate that can prove their projection is complete. Keep
-           -- them recoverable; their per-trade projection is idempotent.
+           -- A filled exit stays recoverable only until every required
+           -- projection is present, its cumulative fill is durably applied,
+           -- and its trade is terminal. Aggregate analyst exits have one
+           -- order row per claimed lot, so completion is based on their
+           -- aggregate allocation and every linked lot rather than one row.
            OR (status='filled' AND order_type='market' AND (
                   idempotency_key LIKE 'software-exit:%'
                OR idempotency_key LIKE 'trailing-market-exit:%'
                OR idempotency_key LIKE 'analyst-exit:%'
+           ) AND (
+               (trade_id IS NOT NULL AND NOT EXISTS (
+                   SELECT 1 FROM orders o
+                   JOIN trades t ON t.id=o.trade_id
+                   WHERE o.stock_intent_id=stock_order_intents.id
+                     AND o.trade_id=stock_order_intents.trade_id
+                     AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
+                     AND t.status='closed'
+               ))
+               OR
+               (trade_id IS NULL AND (
+                   NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id)
+                   OR COALESCE((SELECT SUM(COALESCE(o.filled_qty,0)) FROM orders o WHERE o.stock_intent_id=stock_order_intents.id),0)
+                        < stock_order_intents.filled_qty - 0.000000001
+                   OR EXISTS (
+                       SELECT 1 FROM orders o
+                       JOIN trades t ON t.id=o.trade_id
+                       WHERE o.stock_intent_id=stock_order_intents.id
+                         AND (COALESCE(o.filled_qty,0) < o.quantity - 0.000000001 OR t.status <> 'closed')
+                   )
+               ))
            ))
            OR (status='filled' AND order_type='stop' AND trade_id IS NOT NULL
                AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id))

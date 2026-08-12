@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/execution/trailing"
 	"github.com/romeo-folie/trade-engine/internal/stockorders"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -18,6 +20,7 @@ import (
 // the accepted order by its caller-provided client id.
 type recoveryBroker struct {
 	posts     int
+	lookups   int
 	posted    map[string]execution.OrderResult
 	lookup    map[string]execution.OrderResult
 	status    map[string]execution.OrderResult
@@ -46,6 +49,7 @@ func (b *recoveryBroker) PlaceOrder(_ context.Context, req execution.OrderReques
 	return res, nil
 }
 func (b *recoveryBroker) GetOrderByClientID(_ context.Context, id string) (execution.OrderResult, error) {
+	b.lookups++
 	if res, ok := b.lookup[id]; ok {
 		return res, nil
 	}
@@ -83,6 +87,20 @@ func (b *recoveryBroker) ReplaceStopOrderWithClientID(_ context.Context, old str
 	res := execution.OrderResult{BrokerOrderID: "patched-" + fmt.Sprint(len(b.patches)), Status: "accepted"}
 	b.posted[clientID] = res
 	return res, nil
+}
+
+type recoveryPrices struct{ candles []data.Candle }
+
+func (p recoveryPrices) FetchHistory(context.Context, string, data.Timeframe, int) ([]data.Candle, error) {
+	return append([]data.Candle(nil), p.candles...), nil
+}
+
+func stableRecoveryCandles(price float64) []data.Candle {
+	candles := make([]data.Candle, 50)
+	for i := range candles {
+		candles[i] = data.Candle{Open: price, High: price + 1, Low: price - 1, Close: price, Volume: 1000}
+	}
+	return candles
 }
 
 func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
@@ -306,6 +324,29 @@ func countForIntent(t *testing.T, table, intentID string) int {
 	return n
 }
 
+func countStockIntentAttempts(t *testing.T, intentID string) int {
+	t.Helper()
+	var n int
+	if err := store.GetDB().QueryRow(context.Background(), `SELECT COUNT(*) FROM stock_order_attempts WHERE intent_id=$1::uuid`, intentID).Scan(&n); err != nil {
+		t.Fatalf("count stock-order attempts: %v", err)
+	}
+	return n
+}
+
+func isRecoverableIntent(t *testing.T, intentID string) bool {
+	t.Helper()
+	intents, err := store.ListRecoverableStockOrderIntents(context.Background())
+	if err != nil {
+		t.Fatalf("list recoverable stock intents: %v", err)
+	}
+	for _, intent := range intents {
+		if intent.ID == intentID {
+			return true
+		}
+	}
+	return false
+}
+
 func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
@@ -375,6 +416,14 @@ func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
 			}
 			in := intentForKey(t, key)
 			broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "accepted-" + tc.name, Status: "filled", FilledPrice: 107, FilledQty: 3}
+			// The crash happened after the broker fill was made durable but
+			// before the local order/trade projection. This must be selected.
+			if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "accepted-"+tc.name, "filled", 107, 3, "", "", true); err != nil {
+				t.Fatal(err)
+			}
+			if !isRecoverableIntent(t, in.ID) {
+				t.Fatal("filled market exit without a projection was not recoverable")
+			}
 			if err := coordinator.Recover(ctx); err != nil {
 				t.Fatal(err)
 			}
@@ -390,11 +439,24 @@ func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
 			if err := store.GetDB().QueryRow(ctx, `SELECT quantity, status FROM trades WHERE id=$1::uuid`, tradeID).Scan(&qty, &status); err != nil || qty != 3 || status != "closed" {
 				t.Fatalf("recovered exit trade = qty %v status %q err %v", qty, status, err)
 			}
+			if isRecoverableIntent(t, in.ID) {
+				t.Fatal("fully projected market exit remained recoverable")
+			}
+			beforeLookups, beforeAttempts, beforeOrders := broker.lookups, countStockIntentAttempts(t, in.ID), countForIntent(t, "orders", in.ID)
 			if err := coordinator.Recover(ctx); err != nil {
 				t.Fatal(err)
 			}
 			if got := countForIntent(t, "orders", in.ID); got != 1 {
 				t.Fatalf("recovered exit rows after replay = %d, want 1", got)
+			}
+			if broker.lookups != beforeLookups {
+				t.Fatalf("completed market exit triggered broker lookup: %d -> %d", beforeLookups, broker.lookups)
+			}
+			if got := countStockIntentAttempts(t, in.ID); got != beforeAttempts {
+				t.Fatalf("completed market exit created an attempt: %d -> %d", beforeAttempts, got)
+			}
+			if got := countForIntent(t, "orders", in.ID); got != beforeOrders {
+				t.Fatalf("completed market exit created a projection: %d -> %d", beforeOrders, got)
 			}
 		})
 	}
@@ -431,6 +493,12 @@ func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T
 	}
 	in := intentForKey(t, key)
 	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "accepted-aggregate-exit", Status: "filled", FilledPrice: 108, FilledQty: 5}
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "accepted-aggregate-exit", "filled", 108, 5, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if !isRecoverableIntent(t, in.ID) {
+		t.Fatal("filled aggregate analyst exit without allocations was not recoverable")
+	}
 	if err := coordinator.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -445,11 +513,149 @@ func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(filled_qty),0) FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&rows, &total); err != nil || rows != 2 || total != 5 {
 		t.Fatalf("aggregate recovered rows=%d total=%v err=%v", rows, total, err)
 	}
+	if isRecoverableIntent(t, in.ID) {
+		t.Fatal("fully allocated analyst exit remained recoverable")
+	}
+	beforeLookups, beforeAttempts, beforeOrders := broker.lookups, countStockIntentAttempts(t, in.ID), rows
 	if err := coordinator.Recover(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(SUM(filled_qty),0) FROM orders WHERE stock_intent_id=$1::uuid`, in.ID).Scan(&rows, &total); err != nil || rows != 2 || total != 5 {
 		t.Fatalf("aggregate replay rows=%d total=%v err=%v", rows, total, err)
+	}
+	if broker.lookups != beforeLookups {
+		t.Fatalf("completed aggregate exit triggered broker lookup: %d -> %d", beforeLookups, broker.lookups)
+	}
+	if got := countStockIntentAttempts(t, in.ID); got != beforeAttempts {
+		t.Fatalf("completed aggregate exit created an attempt: %d -> %d", beforeAttempts, got)
+	}
+	if rows != beforeOrders {
+		t.Fatalf("completed aggregate exit created allocations: %d -> %d", beforeOrders, rows)
+	}
+}
+
+func TestStockIntentRecoveryCompletesPartialAggregateMarketExitProjection(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTPARTIALAGGEXIT")
+	tradeA, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTPARTIALAGGEXIT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tradeB, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTPARTIALAGGEXIT", Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	for _, tradeID := range []string{tradeA, tradeB} {
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit %s = %v, %v", tradeID, claimed, err)
+		}
+	}
+	key := "analyst-exit:" + signalID + ":RINTENTPARTIALAGGEXIT"
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "partial-aggregate-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{Ticker: "RINTENTPARTIALAGGEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, IntentKey: key}); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+
+	// Simulate the process dying after it durably allocated the first lot, but
+	// before it wrote or applied the second. The closed lot is no longer in the
+	// sell-signal query, so recovery must preserve its capacity and allocate the
+	// remaining broker fill to the still-exiting lot.
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeA, BrokerOrderID: "partial-aggregate-exit", Ticker: "RINTENTPARTIALAGGEXIT", Side: "sell", OrderType: "market", Quantity: 2, FilledPrice: 108, FilledQty: 2, Status: "filled", StockIntentID: in.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.ApplyPartialExit(ctx, tradeA, orderID, 108, 2, "filled"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FinalizeTradeExit(ctx, tradeA); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "partial-aggregate-exit", Status: "filled", FilledPrice: 108, FilledQty: 5}
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "partial-aggregate-exit", "filled", 108, 5, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if !isRecoverableIntent(t, in.ID) {
+		t.Fatal("partially projected aggregate exit was not recoverable")
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order, err := store.GetOrderByStockIntentAndTrade(ctx, in.ID, tradeB)
+	if err != nil || order == nil || order.FilledQty != 3 {
+		t.Fatalf("recovered second aggregate allocation = %#v, %v; want 3", order, err)
+	}
+	if isRecoverableIntent(t, in.ID) {
+		t.Fatal("completed partial aggregate projection remained recoverable")
+	}
+	beforeLookups, beforeAttempts, beforeOrders := broker.lookups, countStockIntentAttempts(t, in.ID), countForIntent(t, "orders", in.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.lookups != beforeLookups {
+		t.Fatalf("completed partial aggregate exit triggered broker lookup: %d -> %d", beforeLookups, broker.lookups)
+	}
+	if got := countStockIntentAttempts(t, in.ID); got != beforeAttempts {
+		t.Fatalf("completed partial aggregate exit created an attempt: %d -> %d", beforeAttempts, got)
+	}
+	if got := countForIntent(t, "orders", in.ID); got != beforeOrders {
+		t.Fatalf("completed partial aggregate exit created allocations: %d -> %d", beforeOrders, got)
+	}
+}
+
+func TestTrailingManagerRotatesCoordinatorTerminalStopGeneration(t *testing.T) {
+	ctx := context.Background()
+	for _, terminalStatus := range []string{"cancelled", "rejected", "expired"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+				t.Fatal(err)
+			}
+			ticker := "RINTENTTRAIL" + terminalStatus
+			signalID := insertRecoverySignal(t, ticker)
+			tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 95, HighWaterMark: 100})
+			if err != nil {
+				t.Fatal(err)
+			}
+			broker := newRecoveryBroker(execution.OrderResult{Status: "accepted"})
+			coordinator := stockorders.New(broker)
+			originalKey := "trailing-stop:" + tradeID + ":new:97.00000000:2.00000000"
+			original := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 97, TradeID: tradeID, TimeInForce: "gtc", IntentKey: originalKey}
+			if _, err := coordinator.PlaceOrder(ctx, original); err != nil {
+				t.Fatalf("place first trailing generation: %v", err)
+			}
+			old := intentForKey(t, originalKey)
+			broker.lookup[old.ClientOrderID] = execution.OrderResult{BrokerOrderID: "terminal-" + terminalStatus, Status: terminalStatus}
+			if _, err := coordinator.PlaceOrder(ctx, original); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+				t.Fatalf("coordinator terminal result = %v, want ErrTerminalZeroFillPlacement", err)
+			}
+
+			manager := trailing.NewManager(
+				trailing.Config{Enabled: true, ATRMultiple: 1.5, MarketOpen: func(time.Time) bool { return true }},
+				trailing.LiveStore(), recoveryPrices{candles: stableRecoveryCandles(100)}, coordinator,
+			)
+			manager.UpdateAll(ctx)
+
+			retryKey := originalKey + ":retry:terminal-" + terminalStatus
+			fresh := intentForKey(t, retryKey)
+			if fresh.ClientOrderID == old.ClientOrderID || fresh.BrokerOrderID == "" || fresh.Status != "pending" {
+				t.Fatalf("fresh stop generation = %#v, old client=%q", fresh, old.ClientOrderID)
+			}
+			order, err := store.GetOrderByStockIntentAndTrade(ctx, fresh.ID, tradeID)
+			if err != nil || order == nil {
+				t.Fatalf("fresh trailing stop projection = %#v, %v", order, err)
+			}
+			if order.BrokerOrderID != fresh.BrokerOrderID || order.Status != "pending" || !order.IsStopLoss {
+				t.Fatalf("fresh trailing stop projection = %#v", order)
+			}
+			if got := countForIntent(t, "orders", old.ID); got != 0 {
+				t.Fatalf("terminal generation retained a live projection: %d", got)
+			}
+		})
 	}
 }
 
