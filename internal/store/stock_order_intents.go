@@ -203,7 +203,17 @@ func UpdateStockOrderIntentBroker(ctx context.Context, clientOrderID, brokerOrde
 	_, err := GetDB().Exec(ctx, `
         UPDATE stock_order_intents
         SET broker_order_id=COALESCE(NULLIF($2,''), broker_order_id),
-            status=$3, filled_price=$4, filled_qty=$5,
+            -- Error-only attempt records carry an empty broker result. Keep
+            -- the last observed lifecycle and cumulative fill rather than
+            -- regressing a durable partial fill to pending/zero.
+            status=CASE WHEN $7 <> '' AND $3 IN ('pending','partial') AND $2='' AND $4::numeric IS NULL AND $5=0 THEN status ELSE $3::order_status END,
+            filled_price=CASE
+                WHEN $4 IS NULL THEN filled_price
+                WHEN $5 < filled_qty THEN filled_price
+                WHEN $4 = 0 AND filled_price IS NOT NULL THEN filled_price
+                ELSE $4
+            END,
+            filled_qty=GREATEST(filled_qty, $5),
             broker_request_id=COALESCE(NULLIF($6,''), broker_request_id),
             broker_error=NULLIF($7,''),
             submitted_at=CASE WHEN $8 THEN COALESCE(submitted_at, NOW()) ELSE submitted_at END,

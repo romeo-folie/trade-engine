@@ -696,6 +696,57 @@ func TestStockIntentRecoveryRetiresTerminalPartialExitAfterApplyingRemainder(t *
 	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 210, "cancelled", "exiting")
 }
 
+func TestStockIntentBrokerErrorRecordPreservesPartialProgress(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTPRESERVEPARTIAL")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTPRESERVEPARTIAL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+		t.Fatalf("claim exit = %v, %v", claimed, err)
+	}
+	key := "software-exit:" + tradeID + ":preserve-partial"
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "preserve-partial", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTPRESERVEPARTIAL", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, TradeID: tradeID, IntentKey: key}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+	if err := store.UpdateStockOrderIntentBroker(ctx, in.ClientOrderID, "preserve-partial", "partial", 101, 2, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	// A transient client-id lookup error returns an empty OrderResult. Its
+	// attempt record must not erase the durable broker progress.
+	delete(broker.lookup, in.ClientOrderID)
+	delete(broker.posted, in.ClientOrderID)
+	broker.postErr = errors.New("transient broker failure")
+	if _, err := coordinator.PlaceOrder(ctx, req); err == nil {
+		t.Fatal("transient replay unexpectedly succeeded")
+	}
+	in = intentForKey(t, key)
+	if in.Status != "partial" || in.FilledQty != 2 || in.FilledPrice != 101 {
+		t.Fatalf("error record regressed broker progress: %#v", in)
+	}
+
+	// A later successful lookup must be able to recover the preserved
+	// cumulative fill exactly once.
+	broker.postErr = nil
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "preserve-partial", Status: "partially_filled", FilledPrice: 101, FilledQty: 2}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 202, "partial", "exiting")
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 202, "partial", "exiting")
+}
+
 func TestStockOrderIntentRetryGenerationUsesIntentIdentityWithoutBrokerID(t *testing.T) {
 	ctx := context.Background()
 	for _, prefix := range []string{"software-exit", "trailing-stop", "protective-stop"} {
