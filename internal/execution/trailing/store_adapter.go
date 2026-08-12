@@ -41,21 +41,15 @@ func (liveStore) StockIntentIDForKey(ctx context.Context, key string) (string, e
 	return intent.ID, nil
 }
 
-// TerminalBrokerOrderIDForIntent returns the broker id of a confirmed
-// zero-fill terminal generation, allowing the manager to make one fresh,
-// deterministic retry instead of treating cancelled protection as live.
-func (liveStore) TerminalBrokerOrderIDForIntent(ctx context.Context, key string) (string, error) {
+// ResolveStockOrderIntentRetryGeneration follows durable terminal stop
+// generations and returns either the already-existing active generation or
+// one fresh deterministic successor key.
+func (liveStore) ResolveStockOrderIntentRetryGeneration(ctx context.Context, key string) (string, error) {
 	if !store.IsConnected() {
 		return "", errStoreNotConnected
 	}
-	intent, err := store.GetStockOrderIntentByKey(ctx, key)
-	if err != nil || intent == nil {
-		return "", err
-	}
-	if intent.FilledQty > 0 || (intent.Status != "cancelled" && intent.Status != "rejected") {
-		return "", fmt.Errorf("stock intent %s is not terminal zero-fill", key)
-	}
-	return intent.BrokerOrderID, nil
+	_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, key)
+	return retryKey, err
 }
 
 // LinkReplacementOrderIntent advances durable intent lineage after the

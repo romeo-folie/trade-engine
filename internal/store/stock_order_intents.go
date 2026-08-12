@@ -35,6 +35,66 @@ type StockOrderIntent struct {
 	UpdatedAt       time.Time
 }
 
+// maxStockOrderIntentRetryGenerations bounds traversal of terminal stop
+// generations. Each successor key is derived from its immediate predecessor's
+// durable broker id, so a cycle is not expected; the limit still turns corrupt
+// or manually-created lineage into a safe error instead of an unbounded DB
+// walk.
+const maxStockOrderIntentRetryGenerations = 32
+
+// ResolveStockOrderIntentRetryGeneration returns the durable generation that
+// should be submitted after baseKey is rejected as terminal zero-fill. If the
+// latest generation is terminal, SubmitKey is the next deterministic key. If a
+// newer generation already exists but is pending/accepted/ambiguous, SubmitKey
+// replays that exact generation rather than creating a second live stop.
+//
+// A successor must be exactly "<prior key>:retry:<prior broker id>". This
+// makes lineage self-validating and keeps a stale base key from cycling back
+// to an earlier client id after several cancellations.
+func ResolveStockOrderIntentRetryGeneration(ctx context.Context, baseKey string) (latest *StockOrderIntent, submitKey string, err error) {
+	key := baseKey
+	seen := make(map[string]struct{}, maxStockOrderIntentRetryGenerations)
+	for generation := 0; generation < maxStockOrderIntentRetryGenerations; generation++ {
+		if _, duplicate := seen[key]; duplicate {
+			return nil, "", fmt.Errorf("stock order intent retry lineage cycles at %q", key)
+		}
+		seen[key] = struct{}{}
+		intent, err := GetStockOrderIntentByKey(ctx, key)
+		if err != nil {
+			return nil, "", err
+		}
+		if intent == nil {
+			return nil, "", fmt.Errorf("stock order intent retry generation %q is missing", key)
+		}
+		if !isTerminalZeroFillStockOrderIntent(intent) {
+			return intent, intent.IdempotencyKey, nil
+		}
+		if intent.BrokerOrderID == "" {
+			return nil, "", fmt.Errorf("terminal stock order intent %q has no broker order id", intent.IdempotencyKey)
+		}
+		nextKey := StockOrderIntentRetryKey(intent.IdempotencyKey, intent.BrokerOrderID)
+		next, err := GetStockOrderIntentByKey(ctx, nextKey)
+		if err != nil {
+			return nil, "", err
+		}
+		if next == nil {
+			return intent, nextKey, nil
+		}
+		key = next.IdempotencyKey
+	}
+	return nil, "", fmt.Errorf("stock order intent retry lineage exceeds %d generations from %q", maxStockOrderIntentRetryGenerations, baseKey)
+}
+
+// StockOrderIntentRetryKey advances a terminal generation without ever
+// reusing its client id.
+func StockOrderIntentRetryKey(previousKey, terminalBrokerOrderID string) string {
+	return fmt.Sprintf("%s:retry:%s", previousKey, terminalBrokerOrderID)
+}
+
+func isTerminalZeroFillStockOrderIntent(intent *StockOrderIntent) bool {
+	return intent != nil && intent.FilledQty <= 0 && (intent.Status == "cancelled" || intent.Status == "rejected" || intent.Status == "expired")
+}
+
 func CreateStockOrderIntent(ctx context.Context, in StockOrderIntent) error {
 	_, err := GetDB().Exec(ctx, `
         INSERT INTO stock_order_intents (

@@ -73,6 +73,8 @@ const (
 var errStopFilledDuringRollback = errors.New("stop filled before rollback completed")
 var errExitClaimMustRemain = errors.New("partial broker exit is durable; exit claim must remain")
 
+const maxTerminalStopGenerationSubmissions = 32
+
 var newYorkLocation = func() *time.Location {
 	loc, err := time.LoadLocation("America/New_York")
 	if err != nil {
@@ -918,49 +920,33 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		TimeInForce: protectiveStopTIF(t.Quantity),
 		IntentKey:   trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
 	}
-	res, err := m.exec.PlaceOrder(ctx, stopReq)
-	rotatedTerminalGeneration := false
-	if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
-		cancelledBrokerID, resolveErr := m.terminalBrokerOrderIDForIntent(ctx, stopReq.IntentKey)
+	var res execution.OrderResult
+	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
+		res, err = m.exec.PlaceOrder(ctx, stopReq)
+		status := execution.NormalizeOrderStatus(res.Status)
+		if err == nil && !isTerminalZeroFill(status, res.FilledQty) {
+			break
+		}
+		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			break
+		}
+		retryKey, resolveErr := m.resolveTerminalStopIntentKey(ctx, stopReq.IntentKey)
 		if resolveErr != nil {
 			return fmt.Errorf("resolve terminal trailing stop generation: %w", resolveErr)
 		}
-		retryReq := stopReq
-		retryReq.IntentKey = trailingStopRetryIntentKey(stopReq.IntentKey, cancelledBrokerID)
-		retryReq.ClientOrderID = ""
-		res, err = m.exec.PlaceOrder(ctx, retryReq)
-		if err != nil {
-			return fmt.Errorf("place replacement stop generation: %w", err)
+		if retryKey == stopReq.IntentKey {
+			return errors.New("terminal trailing stop generation resolver did not advance")
 		}
-		stopReq = retryReq
-		rotatedTerminalGeneration = true
+		stopReq.IntentKey = retryKey
+		stopReq.ClientOrderID = ""
+		if generation == maxTerminalStopGenerationSubmissions-1 {
+			return fmt.Errorf("trailing stop remained terminal through %d generations", maxTerminalStopGenerationSubmissions)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
 	status := execution.NormalizeOrderStatus(res.Status)
-	if isTerminalZeroFill(status, res.FilledQty) {
-		if rotatedTerminalGeneration {
-			return fmt.Errorf("fresh trailing stop generation is terminal zero-fill")
-		}
-		// A prior rollback can leave the deterministic intent bound to a
-		// confirmed-cancelled broker stop. That order is not protection for a
-		// new tick, so advance to a deterministic generation rather than let
-		// coordinator client-id lookup resurrect its terminal response.
-		if res.BrokerOrderID == "" {
-			return errors.New("terminal trailing stop has no broker id for retry generation")
-		}
-		retryReq := stopReq
-		retryReq.IntentKey = trailingStopRetryIntentKey(stopReq.IntentKey, res.BrokerOrderID)
-		retryReq.ClientOrderID = ""
-		res, err = m.exec.PlaceOrder(ctx, retryReq)
-		if err != nil {
-			return fmt.Errorf("place replacement stop generation: %w", err)
-		}
-		stopReq = retryReq
-		rotatedTerminalGeneration = true
-		status = execution.NormalizeOrderStatus(res.Status)
-	}
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {
 		fillQty = t.Quantity
@@ -1038,25 +1024,25 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	return nil
 }
 
-func (m *Manager) terminalBrokerOrderIDForIntent(ctx context.Context, key string) (string, error) {
+func (m *Manager) resolveTerminalStopIntentKey(ctx context.Context, key string) (string, error) {
 	durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool })
 	if !ok || !durable.DurableStockOrderIntents() {
 		return "", errors.New("terminal intent retry requires durable executor")
 	}
 	lookup, ok := m.store.(interface {
-		TerminalBrokerOrderIDForIntent(context.Context, string) (string, error)
+		ResolveStockOrderIntentRetryGeneration(context.Context, string) (string, error)
 	})
 	if !ok {
-		return "", errors.New("durable trailing executor has no terminal intent lookup")
+		return "", errors.New("durable trailing executor has no terminal intent generation resolver")
 	}
-	brokerID, err := lookup.TerminalBrokerOrderIDForIntent(ctx, key)
+	retryKey, err := lookup.ResolveStockOrderIntentRetryGeneration(ctx, key)
 	if err != nil {
 		return "", err
 	}
-	if brokerID == "" {
-		return "", errors.New("terminal trailing intent has no broker order id")
+	if retryKey == "" {
+		return "", errors.New("terminal trailing intent has no retry generation key")
 	}
-	return brokerID, nil
+	return retryKey, nil
 }
 
 // stockIntentIDForAcceptedOrder makes trailing projections obey the durable
@@ -1096,7 +1082,7 @@ func trailingStopIntentKey(tradeID string, existing *store.Order, stopPrice, qua
 }
 
 func trailingStopRetryIntentKey(previousKey, cancelledBrokerOrderID string) string {
-	return fmt.Sprintf("%s:retry:%s", previousKey, cancelledBrokerOrderID)
+	return store.StockOrderIntentRetryKey(previousKey, cancelledBrokerOrderID)
 }
 
 func isTerminalZeroFill(status string, filledQty float64) bool {

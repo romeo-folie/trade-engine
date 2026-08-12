@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -50,6 +51,53 @@ func (*protectiveRetryBroker) GetAccount(context.Context) (execution.AccountInfo
 	return execution.AccountInfo{}, nil
 }
 func (*protectiveRetryBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
+
+type terminalGenerationBroker struct {
+	posts      []execution.OrderRequest
+	lookup     map[string]execution.OrderResult
+	brokerToID map[string]string
+	statuses   []string
+}
+
+func newTerminalGenerationBroker(statuses ...string) *terminalGenerationBroker {
+	return &terminalGenerationBroker{lookup: map[string]execution.OrderResult{}, brokerToID: map[string]string{}, statuses: statuses}
+}
+
+func (b *terminalGenerationBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	b.posts = append(b.posts, req)
+	brokerID := fmt.Sprintf("terminal-generation-%d", len(b.posts))
+	b.brokerToID[brokerID] = req.ClientOrderID
+	return execution.OrderResult{BrokerOrderID: brokerID, Status: "accepted"}, nil
+}
+func (b *terminalGenerationBroker) GetOrderByClientID(_ context.Context, id string) (execution.OrderResult, error) {
+	if res, ok := b.lookup[id]; ok {
+		return res, nil
+	}
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+func (b *terminalGenerationBroker) CancelOrder(_ context.Context, brokerID string) error {
+	status := "cancelled"
+	if n := len(b.lookup); n < len(b.statuses) {
+		status = b.statuses[n]
+	}
+	b.lookup[b.brokerToID[brokerID]] = execution.OrderResult{BrokerOrderID: brokerID, Status: status}
+	return nil
+}
+func (b *terminalGenerationBroker) GetOrderStatus(_ context.Context, brokerID string) (execution.OrderResult, error) {
+	if res, ok := b.lookup[b.brokerToID[brokerID]]; ok {
+		return res, nil
+	}
+	return execution.OrderResult{BrokerOrderID: brokerID, Status: "pending"}, nil
+}
+func (*terminalGenerationBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*terminalGenerationBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*terminalGenerationBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
 	return execution.OrderResult{}, errors.New("unused")
 }
 
@@ -149,6 +197,64 @@ func TestEnsureUncappedProtectiveStopRollbackCancellationRotatesIntent(t *testin
 	var brokerID, intentID string
 	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text FROM orders WHERE trade_id=$1::uuid AND status='pending'`, tradeID).Scan(&brokerID, &intentID); err != nil || brokerID != "fresh-live-stop" || intentID != activeIntent.ID {
 		t.Fatalf("active retry protection broker=%q intent=%q err=%v", brokerID, intentID, err)
+	}
+}
+
+func TestEnsureUncappedProtectiveStopFollowsTerminalGenerations(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "UCMULTIGEN", Direction: "long", Strategy: "momentum", EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newTerminalGenerationBroker("cancelled", "rejected", "expired")
+	e := newBracketTestEngine(stockorders.New(broker))
+	originalInsert := insertUncappedProtectiveOrder
+	insertCalls := 0
+	insertUncappedProtectiveOrder = func(ctx context.Context, order store.Order) (string, error) {
+		insertCalls++
+		if insertCalls <= 3 {
+			return "", fmt.Errorf("simulated protective projection failure %d", insertCalls)
+		}
+		return originalInsert(ctx, order)
+	}
+	defer func() { insertUncappedProtectiveOrder = originalInsert }()
+
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCMULTIGEN", 5, 95); err == nil {
+			t.Fatalf("terminal generation %d unexpectedly projected", attempt)
+		}
+	}
+	if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCMULTIGEN", 5, 95); err != nil {
+		t.Fatalf("fourth generation should provide live protection: %v", err)
+	}
+	if got := len(broker.posts); got != 4 {
+		t.Fatalf("stop submissions=%d, want four distinct generations", got)
+	}
+	key := protectiveStopIntentKey(tradeID, 95, 5)
+	activeKey := ""
+	for i, req := range broker.posts {
+		if req.IntentKey != key {
+			t.Fatalf("generation %d key=%q, want %q", i+1, req.IntentKey, key)
+		}
+		if i > 0 && req.ClientOrderID == broker.posts[i-1].ClientOrderID {
+			t.Fatalf("generation %d reused client id %q", i+1, req.ClientOrderID)
+		}
+		if i == len(broker.posts)-1 {
+			activeKey = key
+		}
+		key = protectiveStopRetryIntentKey(key, fmt.Sprintf("terminal-generation-%d", i+1))
+	}
+	active, err := store.GetStockOrderIntentByKey(ctx, activeKey)
+	if err != nil || active == nil || active.Status != "pending" || active.BrokerOrderID != "terminal-generation-4" {
+		t.Fatalf("active protective generation=%#v err=%v", active, err)
+	}
+	var rows int
+	var linkedIntent string
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(MAX(stock_intent_id::text),'') FROM orders WHERE trade_id=$1::uuid AND status='pending'`, tradeID).Scan(&rows, &linkedIntent); err != nil || rows != 1 || linkedIntent != active.ID {
+		t.Fatalf("live protective rows=%d intent=%q err=%v, want one linked to %q", rows, linkedIntent, err, active.ID)
 	}
 }
 

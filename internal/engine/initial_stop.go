@@ -11,6 +11,8 @@ import (
 
 var errProtectiveStopFilledDuringRollback = errors.New("protective stop filled before rollback completed")
 
+const maxTerminalStopGenerationSubmissions = 32
+
 // Kept as a narrow seam for the post-acceptance rollback regression. Normal
 // production behavior is the store helper; the seam never changes execution
 // policy or broker-facing state.
@@ -68,19 +70,28 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		IntentKey:   intentKey,
 		TimeInForce: "gtc", // uncapped entries are whole-share only
 	}
-	res, err := e.executor.PlaceOrder(ctx, stopReq)
-	if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
-		prior, lookupErr := store.GetStockOrderIntentByKey(ctx, intentKey)
-		if lookupErr != nil {
-			return fmt.Errorf("load terminal protective-stop intent: %w", lookupErr)
+	var res execution.OrderResult
+	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
+		res, err = e.executor.PlaceOrder(ctx, stopReq)
+		if err == nil && !isTerminalZeroFillStockIntent(res.Status, res.FilledQty) {
+			break
 		}
-		if prior == nil || prior.BrokerOrderID == "" || !isTerminalZeroFillStockIntent(prior.Status, prior.FilledQty) {
-			return fmt.Errorf("terminal protective-stop retry lacks confirmed broker generation: %w", err)
+		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			break
 		}
-		intentKey = protectiveStopRetryIntentKey(intentKey, prior.BrokerOrderID)
+		_, retryKey, resolveErr := store.ResolveStockOrderIntentRetryGeneration(ctx, intentKey)
+		if resolveErr != nil {
+			return fmt.Errorf("resolve terminal protective-stop generation: %w", resolveErr)
+		}
+		if retryKey == intentKey {
+			return errors.New("terminal protective-stop generation resolver did not advance")
+		}
+		intentKey = retryKey
 		stopReq.IntentKey = intentKey
 		stopReq.ClientOrderID = ""
-		res, err = e.executor.PlaceOrder(ctx, stopReq)
+		if generation == maxTerminalStopGenerationSubmissions-1 {
+			return fmt.Errorf("protective stop remained terminal through %d generations", maxTerminalStopGenerationSubmissions)
+		}
 	}
 	if err != nil {
 		return fmt.Errorf("place protective stop: %w", err)
@@ -170,7 +181,7 @@ func protectiveStopIntentKey(tradeID string, stopPrice, quantity float64) string
 }
 
 func protectiveStopRetryIntentKey(previousKey, cancelledBrokerOrderID string) string {
-	return fmt.Sprintf("%s:retry:%s", previousKey, cancelledBrokerOrderID)
+	return store.StockOrderIntentRetryKey(previousKey, cancelledBrokerOrderID)
 }
 
 func isTerminalZeroFillStockIntent(status string, filledQty float64) bool {

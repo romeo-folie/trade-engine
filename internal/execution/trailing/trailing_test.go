@@ -110,15 +110,23 @@ type fakeStore struct {
 	insertErr            error
 	stockIntentIDs       map[string]string
 	stockIntentErr       error
+	stockIntentRetryKeys map[string]string
 	replacementIntentIDs map[string]string
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}, replacementIntentIDs: map[string]string{}}
+	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}, stockIntentRetryKeys: map[string]string{}, replacementIntentIDs: map[string]string{}}
 }
 
 func (f *fakeStore) StockIntentIDForKey(_ context.Context, key string) (string, error) {
 	return f.stockIntentIDs[key], f.stockIntentErr
+}
+
+func (f *fakeStore) ResolveStockOrderIntentRetryGeneration(_ context.Context, key string) (string, error) {
+	if f.stockIntentErr != nil {
+		return "", f.stockIntentErr
+	}
+	return f.stockIntentRetryKeys[key], nil
 }
 
 func (f *fakeStore) LinkReplacementOrderIntent(_ context.Context, orderID, brokerOrderID string) error {
@@ -1125,6 +1133,7 @@ func TestManager_RollbackCancelledStopRotatesDurableGeneration(t *testing.T) {
 	retryKey := trailingStopRetryIntentKey(originalKey, "rollback-cancelled")
 	fs.stockIntentIDs[originalKey] = "cancelled-generation"
 	fs.stockIntentIDs[retryKey] = "active-generation"
+	fs.stockIntentRetryKeys[originalKey] = retryKey
 	fs.insertErr = errors.New("simulated projection write failure")
 	base := &fakeBroker{placeResults: []execution.OrderResult{
 		{BrokerOrderID: "rollback-cancelled", Status: "accepted"},

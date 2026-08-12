@@ -659,6 +659,130 @@ func TestTrailingManagerRotatesCoordinatorTerminalStopGeneration(t *testing.T) {
 	}
 }
 
+func TestTrailingManagerFollowsTerminalStopGenerations(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTTRAILMULTIGEN"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 95, HighWaterMark: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	baseKey := "trailing-stop:" + tradeID + ":new:97.00000000:2.00000000"
+	stopRequest := func(key string) execution.OrderRequest {
+		return execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 97, TradeID: tradeID, TimeInForce: "gtc", IntentKey: key}
+	}
+	if _, err := coordinator.PlaceOrder(ctx, stopRequest(baseKey)); err != nil {
+		t.Fatalf("place base trailing generation: %v", err)
+	}
+	base := intentForKey(t, baseKey)
+	broker.lookup[base.ClientOrderID] = execution.OrderResult{BrokerOrderID: "terminal-base", Status: "cancelled"}
+	if _, err := coordinator.PlaceOrder(ctx, stopRequest(baseKey)); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		t.Fatalf("terminal base result=%v, want ErrTerminalZeroFillPlacement", err)
+	}
+
+	manager := trailing.NewManager(
+		trailing.Config{Enabled: true, ATRMultiple: 1.5, MarketOpen: func(time.Time) bool { return true }},
+		trailing.LiveStore(), recoveryPrices{candles: stableRecoveryCandles(100)}, coordinator,
+	)
+	manager.UpdateAll(ctx) // terminal base -> child 1
+	firstKey := store.StockOrderIntentRetryKey(baseKey, "terminal-base")
+	terminalize := func(key, brokerID, status string) {
+		t.Helper()
+		intent := intentForKey(t, key)
+		broker.lookup[intent.ClientOrderID] = execution.OrderResult{BrokerOrderID: brokerID, Status: status}
+		if _, err := coordinator.PlaceOrder(ctx, stopRequest(key)); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			t.Fatalf("terminalize %q: %v", key, err)
+		}
+		if _, err := store.GetDB().Exec(ctx, `UPDATE orders SET status='cancelled' WHERE stock_intent_id=$1::uuid`, intent.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	terminalize(firstKey, "terminal-rejected", "rejected")
+	manager.UpdateAll(ctx) // terminal child 1 -> child 2
+	secondKey := store.StockOrderIntentRetryKey(firstKey, "terminal-rejected")
+	terminalize(secondKey, "terminal-expired", "expired")
+	manager.UpdateAll(ctx) // terminal child 2 -> child 3, which stays live
+	thirdKey := store.StockOrderIntentRetryKey(secondKey, "terminal-expired")
+
+	if got := len(broker.posted); got != 4 {
+		t.Fatalf("broker generations=%d, want base plus three distinct successors", got)
+	}
+	keys := []string{baseKey, firstKey, secondKey, thirdKey}
+	clients := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		intent := intentForKey(t, key)
+		if _, duplicate := clients[intent.ClientOrderID]; duplicate {
+			t.Fatalf("generation %q reused client id %q", key, intent.ClientOrderID)
+		}
+		clients[intent.ClientOrderID] = struct{}{}
+	}
+	active := intentForKey(t, thirdKey)
+	if active.Status != "pending" || active.BrokerOrderID == "" {
+		t.Fatalf("active trailing generation=%#v", active)
+	}
+	order, err := store.GetOrderByStockIntentAndTrade(ctx, active.ID, tradeID)
+	if err != nil || order == nil || order.Status != "pending" || !order.IsStopLoss || order.BrokerOrderID != active.BrokerOrderID {
+		t.Fatalf("active trailing stop projection=%#v err=%v", order, err)
+	}
+	var pending int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND status='pending' AND is_stop_loss`, tradeID).Scan(&pending); err != nil || pending != 1 {
+		t.Fatalf("live trailing stops=%d err=%v, want exactly one", pending, err)
+	}
+}
+
+func TestStockOrderIntentRetryGenerationDoesNotAdvanceAmbiguousSuccessor(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTAMBIGGEN")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTAMBIGGEN", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "base-stop", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	baseKey := "protective-stop:" + tradeID + ":90.00000000:1.00000000"
+	request := func(key string) execution.OrderRequest {
+		return execution.OrderRequest{Ticker: "RINTENTAMBIGGEN", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 90, TradeID: tradeID, TimeInForce: "gtc", IntentKey: key}
+	}
+	if _, err := coordinator.PlaceOrder(ctx, request(baseKey)); err != nil {
+		t.Fatal(err)
+	}
+	base := intentForKey(t, baseKey)
+	broker.lookup[base.ClientOrderID] = execution.OrderResult{BrokerOrderID: "base-terminal", Status: "cancelled"}
+	if _, err := coordinator.PlaceOrder(ctx, request(baseKey)); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		t.Fatalf("terminal base result=%v", err)
+	}
+	childKey := store.StockOrderIntentRetryKey(baseKey, "base-terminal")
+	broker.postErr = errors.New("ambiguous broker response")
+	if _, err := coordinator.PlaceOrder(ctx, request(childKey)); err == nil {
+		t.Fatal("ambiguous child submission unexpectedly succeeded")
+	}
+	child := intentForKey(t, childKey)
+	if child.Status != "pending" {
+		t.Fatalf("ambiguous child status=%q, want pending", child.Status)
+	}
+	latest, submitKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, baseKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if latest == nil || latest.ID != child.ID || submitKey != childKey {
+		t.Fatalf("ambiguous successor resolution latest=%#v submit=%q, want child %q", latest, submitKey, childKey)
+	}
+	grandchild := store.StockOrderIntentRetryKey(childKey, child.BrokerOrderID)
+	if grandchild != "" {
+		if next, err := store.GetStockOrderIntentByKey(ctx, grandchild); err != nil || next != nil {
+			t.Fatalf("ambiguous successor advanced to %#v, err=%v", next, err)
+		}
+	}
+}
+
 func TestStockIntentRecoveryAfterTrailingCancelResubmitRepointIsClean(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
