@@ -1504,6 +1504,50 @@ func TestStockIntentTerminalZeroFillTerminalizesOrderOnlyProjections(t *testing.
 	}
 }
 
+func TestStockIntentRecoveryKeepsGTCDoneForDayProtectiveStopWorking(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTGTCDONE"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "gtc-done-stop", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 90, TradeID: tradeID, TimeInForce: "gtc", IntentKey: "protective-stop-gtc-done:" + tradeID}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "gtc-done-stop", Ticker: ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: in.ID}); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "gtc-done-stop", Status: "done_for_day"}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatalf("GTC done_for_day retry should retain coverage, got %v", err)
+	}
+	in = intentForKey(t, req.IntentKey)
+	if in.Status != "pending" {
+		t.Fatalf("GTC done_for_day intent status=%q, want pending", in.Status)
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	order, err := store.GetOrderByStockIntentID(ctx, in.ID)
+	if err != nil || order == nil || order.Status != "pending" {
+		t.Fatalf("GTC done_for_day stop projection=%#v err=%v", order, err)
+	}
+	if !isRecoverableIntent(t, in.ID) {
+		t.Fatal("GTC done_for_day protection was retired from recovery")
+	}
+	if broker.posts != 1 {
+		t.Fatalf("GTC done_for_day retried submission %d times, want 1", broker.posts)
+	}
+}
+
 func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
@@ -2083,6 +2127,102 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	var count int
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss`, tradeID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("stop rows=%d err=%v, want one", count, err)
+	}
+}
+
+func TestStockIntentRecoveryTerminalReplacementLookupFallsBackToFreshProtection(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTTERMINALREPLACE"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, StopLoss: 95, HighWaterMark: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentReq := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 2, StopPrice: 95, TradeID: tradeID, TimeInForce: "gtc", IntentKey: "protective-stop-terminal-replace:" + tradeID, ClientOrderID: "terminal-replace-parent"}
+	parentPayload, err := json.Marshal(parentReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()`).Scan(&parentID); err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: parentID, IdempotencyKey: parentReq.IntentKey, ClientOrderID: "terminal-replace-parent", TradeID: tradeID, Ticker: ticker, Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: parentPayload, PayloadHash: "terminal-replace-parent", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "old-terminal-replace-stop", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "old-terminal-replace-stop", Ticker: ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "fresh-terminal-replace-stop", Status: "accepted"})
+	broker.lookup[parent.ClientOrderID] = execution.OrderResult{BrokerOrderID: "old-terminal-replace-stop", Status: "accepted"}
+	coordinator := stockorders.New(broker)
+	// The broker accepted the PATCH, but the process died before the caller
+	// could repoint the mutable stop row. Direct replacement persists the child
+	// intent but deliberately leaves projection to the caller, giving us that
+	// exact crash window.
+	if _, err := coordinator.ReplaceStopOrder(ctx, "old-terminal-replace-stop", 97); err != nil {
+		t.Fatalf("create crash-window replacement intent: %v", err)
+	}
+	childKey := "replace:" + parent.IdempotencyKey + ":97.00000000"
+	child := intentForKey(t, childKey)
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "cancelled-terminal-replace-stop", Status: "cancelled"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover crash-before-projection terminal replacement: %v", err)
+	}
+	child = intentForKey(t, childKey)
+	if child.Status != "cancelled" {
+		t.Fatalf("terminal replacement intent status=%q, want cancelled", child.Status)
+	}
+	if got := countForIntent(t, "orders", child.ID); got != 0 {
+		t.Fatalf("terminal replacement projected %d stop rows", got)
+	}
+	// Recovery integration tests share the database. Keep this manager pass
+	// scoped to the crash-window trade so unrelated earlier fixtures cannot
+	// generate broker calls on this test's fake executor.
+	if _, err := store.GetDB().Exec(ctx, `UPDATE trades SET status='closed' WHERE id <> $1::uuid AND status='open'`, tradeID); err != nil {
+		t.Fatal(err)
+	}
+	patchesBeforeFallback := len(broker.patches)
+
+	// The next manager pass retries the same stop level. The coordinator returns
+	// ErrTerminalZeroFillPlacement, which drives the established
+	// cancel-confirm-resubmit fallback instead of claiming that the cancelled
+	// child became the live mutable stop.
+	manager := trailing.NewManager(
+		trailing.Config{Enabled: true, ATRMultiple: 1.5, MarketOpen: func(time.Time) bool { return true }},
+		trailing.LiveStore(), recoveryPrices{candles: stableRecoveryCandles(100)}, coordinator,
+	)
+	manager.UpdateAll(ctx)
+	if got := len(broker.patches); got != patchesBeforeFallback {
+		t.Fatalf("terminal replacement lookup retried PATCH: %d -> %d", patchesBeforeFallback, got)
+	}
+	if broker.posts != 1 {
+		t.Fatalf("fallback fresh protection submissions=%d, want 1", broker.posts)
+	}
+	var brokerID, intentID, status, parentPurpose string
+	if err := store.GetDB().QueryRow(ctx, `SELECT broker_order_id, stock_intent_id::text, status FROM orders WHERE id=$1::uuid`, orderID).Scan(&brokerID, &intentID, &status); err != nil {
+		t.Fatal(err)
+	}
+	freshKey := "trailing-stop:" + tradeID + ":old-terminal-replace-stop:97.00000000:2.00000000"
+	fresh := intentForKey(t, freshKey)
+	if brokerID != fresh.BrokerOrderID || intentID != fresh.ID || status != "pending" {
+		t.Fatalf("fallback stop projection=%q/%q/%q, want %q/%q/pending", brokerID, intentID, status, fresh.BrokerOrderID, fresh.ID)
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT purpose FROM stock_order_intents WHERE id=$1::uuid`, parent.ID).Scan(&parentPurpose); err != nil || parentPurpose != "superseded" {
+		t.Fatalf("old mutable stop lineage purpose=%q err=%v", parentPurpose, err)
+	}
+	var liveStops int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid AND is_stop_loss AND status IN ('pending','partial')`, tradeID).Scan(&liveStops); err != nil || liveStops != 1 {
+		t.Fatalf("live stop rows=%d err=%v, want one", liveStops, err)
 	}
 }
 

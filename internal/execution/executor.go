@@ -244,6 +244,18 @@ func NormalizeOrderStatus(status string) string {
 	}
 }
 
+// NormalizeOrderStatusForTimeInForce preserves a GTC order through Alpaca's
+// end-of-session done_for_day snapshot. Alpaca can emit that transient state
+// while a GTC protective order remains live for the next session; storing it
+// as cancelled would retire the only broker protection and invite a duplicate
+// replacement. DAY/default orders retain the ordinary terminal mapping.
+func NormalizeOrderStatusForTimeInForce(status, timeInForce string) string {
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
+		return "pending"
+	}
+	return NormalizeOrderStatus(status)
+}
+
 // IsTerminalOrderStatus reports whether a broker order status is final — the
 // order will receive no further fills. A fill PRICE appearing is NOT terminal:
 // a partially_filled fractional order has a price while more fills are coming,
@@ -255,6 +267,16 @@ func IsTerminalOrderStatus(status string) bool {
 		return true
 	}
 	return false
+}
+
+// IsTerminalOrderStatusForTimeInForce is the request-aware counterpart to
+// IsTerminalOrderStatus. Use it for broker order lifecycle projection where
+// the original time-in-force is available.
+func IsTerminalOrderStatusForTimeInForce(status, timeInForce string) bool {
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
+		return false
+	}
+	return IsTerminalOrderStatus(status)
 }
 
 // AccountInfo contains the broker account's cash and portfolio equity.

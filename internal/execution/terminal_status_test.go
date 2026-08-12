@@ -25,3 +25,18 @@ func TestNormalizeOrderStatusDoneForDayIsCancelled(t *testing.T) {
 		t.Fatalf("NormalizeOrderStatus(done_for_day)=%q, want cancelled", got)
 	}
 }
+
+func TestDoneForDayGTCProtectionRemainsWorking(t *testing.T) {
+	if got := NormalizeOrderStatusForTimeInForce("done_for_day", "gtc"); got != "pending" {
+		t.Fatalf("GTC done_for_day status=%q, want pending", got)
+	}
+	if IsTerminalOrderStatusForTimeInForce("done_for_day", "gtc") {
+		t.Fatal("GTC done_for_day must not terminalize protective coverage")
+	}
+	if got := NormalizeOrderStatusForTimeInForce("done_for_day", "day"); got != "cancelled" {
+		t.Fatalf("DAY done_for_day status=%q, want cancelled", got)
+	}
+	if !IsTerminalOrderStatusForTimeInForce("done_for_day", "day") {
+		t.Fatal("DAY done_for_day must remain terminal")
+	}
+}

@@ -92,7 +92,7 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 			// Recovery must project an already-known terminal entry to close its
 			// order-only row. Fresh callers, by contrast, must rotate before a
 			// terminal zero-fill client id can satisfy their request.
-			if !isRecoveryContext(ctx) && isTerminalZeroFill(prior.Status, prior.FilledQty) {
+			if !isRecoveryContext(ctx) && isTerminalZeroFillForRequest(req, prior) {
 				return execution.OrderResult{}, fmt.Errorf("%w: broker client order %s is %s", execution.ErrTerminalZeroFillPlacement, intent.ClientOrderID, prior.Status)
 			}
 			return c.finishSubmit(ctx, intent, req, prior)
@@ -140,6 +140,11 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 func isTerminalZeroFill(status string, filledQty float64) bool {
 	status = execution.NormalizeOrderStatus(status)
 	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
+}
+
+func isTerminalZeroFillForRequest(req execution.OrderRequest, res execution.OrderResult) bool {
+	status := execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
+	return res.FilledQty <= 0 && (status == "cancelled" || status == "rejected")
 }
 
 func requestExitIntent(req execution.OrderRequest) store.ExitIntent {
@@ -419,7 +424,7 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 		orderID, err := store.InsertOrderWithRetry(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: brokerID,
 			Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
 			StopPrice: req.StopPrice, FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
-			Status: execution.NormalizeOrderStatus(res.Status), IsStopLoss: true,
+			Status: execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), IsStopLoss: true,
 			ExitReason: requestExitIntent(req).Reason, ExitEvidence: requestExitIntent(req).Evidence, StockIntentID: intent.ID})
 		if err != nil {
 			return err
@@ -427,8 +432,8 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 		existing = &store.Order{ID: orderID, BrokerOrderID: brokerID}
 	}
 	if res.FilledQty <= 0 {
-		if execution.IsTerminalOrderStatus(res.Status) {
-			return store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatus(res.Status))
+		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+			return store.UpdateOrderStatusByStockIntent(ctx, intent.ID, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce))
 		}
 		return nil
 	}
@@ -444,12 +449,12 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 		expectedBrokerID = brokerID
 	}
 	remaining, _, err := store.ApplyProtectiveExitAtForBrokerOrder(ctx, req.TradeID, existing.ID, expectedBrokerID,
-		res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status), res.FilledAt,
+		res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), res.FilledAt,
 		exitIntent)
 	if err != nil {
 		return fmt.Errorf("apply recovered stop fill: %w", err)
 	}
-	if execution.IsTerminalOrderStatus(res.Status) && remaining <= 1e-9 {
+	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) && remaining <= 1e-9 {
 		if _, err := store.FinalizeTradeExit(ctx, req.TradeID); err != nil {
 			return fmt.Errorf("finalize recovered stop fill: %w", err)
 		}
@@ -687,6 +692,10 @@ func (c *Coordinator) ensureRecoveredProtectiveStop(ctx context.Context, parent 
 
 func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent, operation, outcome string, res execution.OrderResult, errText string, submitted bool) error {
 	status := execution.NormalizeOrderStatus(res.Status)
+	var req execution.OrderRequest
+	if err := json.Unmarshal(intent.RequestPayload, &req); err == nil {
+		status = execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
+	}
 	if res.Status == "" {
 		status = intent.Status
 	}
@@ -844,6 +853,14 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if err == nil {
 			_ = c.record(ctx, intent, "replace_lookup", "found", prior, "", false)
+			if isTerminalZeroFillForRequest(req, prior) && !project {
+				// A replacement client id proves that this PATCH generation was
+				// attempted, but its terminal zero-fill result cannot provide
+				// protection. Let the trailing manager take its established
+				// cancel-and-resubmit path instead of repointing the mutable stop
+				// row to a cancelled broker id.
+				return execution.OrderResult{}, fmt.Errorf("%w: replacement client order %s is %s", execution.ErrTerminalZeroFillPlacement, intent.ClientOrderID, prior.Status)
+			}
 			return c.maybeProjectReplacement(ctx, intent, req, prior, project)
 		}
 		if !errors.Is(err, execution.ErrOrderNotFound) {
@@ -879,6 +896,9 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
 		if lookupErr == nil {
 			_ = c.record(ctx, intent, "replace_lookup_after_ambiguous", "found", prior, "", true)
+			if isTerminalZeroFillForRequest(req, prior) && !project {
+				return execution.OrderResult{}, fmt.Errorf("%w: replacement client order %s is %s", execution.ErrTerminalZeroFillPlacement, intent.ClientOrderID, prior.Status)
+			}
 			return c.maybeProjectReplacement(ctx, intent, req, prior, project)
 		}
 		if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
@@ -905,6 +925,14 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 
 func (c *Coordinator) maybeProjectReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult, project bool) (execution.OrderResult, error) {
 	if !project {
+		return res, nil
+	}
+	// A recovery lookup can find a replacement generation that the broker
+	// already cancelled/rejected before this process could repoint the mutable
+	// predecessor row. It is not a successful replacement projection; leave the
+	// predecessor untouched so the manager can safely cancel/confirm and submit
+	// a fresh generation on its next protection pass.
+	if isTerminalZeroFillForRequest(req, res) {
 		return res, nil
 	}
 	return c.projectReplacement(ctx, intent, req, res)
