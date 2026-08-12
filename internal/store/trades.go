@@ -55,6 +55,10 @@ type Trade struct {
 	// used by the trailing-stop manager (#322). 0 when the manager has not
 	// yet observed the trade (column is NULL in DB).
 	HighWaterMark float64
+	// StockIntentID ties a standard-stock trade to the immutable broker intent
+	// that caused it. It makes crash recovery upsert one trade, not infer one
+	// from a ticker.
+	StockIntentID string
 }
 
 // InsertTrade creates a new open trade record and returns its UUID.
@@ -76,6 +80,37 @@ func InsertTrade(ctx context.Context, t Trade) (string, error) {
 		nullableFloat(t.StopLoss), nullableFloat(t.TakeProfit),
 		nullableString(t.ModelProvider), nullableString(t.ModelName),
 		entrySetup, nullableString(t.EntrySetupEvidence),
+	).Scan(&id)
+	return id, err
+}
+
+// InsertTradeForStockIntent creates (or returns) the one trade projected from
+// a durable standard-stock entry intent. The unique partial index makes a
+// recovery replay safe even if the process crashed after this insert.
+func InsertTradeForStockIntent(ctx context.Context, t Trade) (string, error) {
+	if t.StockIntentID == "" {
+		return InsertTrade(ctx, t)
+	}
+	entrySetup := t.EntrySetup
+	if entrySetup == "" {
+		entrySetup = EntrySetupStandard
+	}
+	var id string
+	err := GetDB().QueryRow(ctx, `
+		INSERT INTO trades (
+			signal_id, ticker, direction, strategy,
+			entry_price, quantity, stop_loss, take_profit,
+			status, model_provider, model_name, entry_setup, entry_setup_evidence,
+			stock_intent_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$11,$12,$13::uuid)
+		ON CONFLICT (stock_intent_id) WHERE stock_intent_id IS NOT NULL
+		DO UPDATE SET stock_intent_id=EXCLUDED.stock_intent_id
+		RETURNING id`,
+		nullableString(t.SignalID), t.Ticker, t.Direction, t.Strategy,
+		t.EntryPrice, t.Quantity,
+		nullableFloat(t.StopLoss), nullableFloat(t.TakeProfit),
+		nullableString(t.ModelProvider), nullableString(t.ModelName),
+		entrySetup, nullableString(t.EntrySetupEvidence), t.StockIntentID,
 	).Scan(&id)
 	return id, err
 }

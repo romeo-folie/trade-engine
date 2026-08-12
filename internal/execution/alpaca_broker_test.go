@@ -48,6 +48,70 @@ func TestGetAccount_DayPnL(t *testing.T) {
 	}
 }
 
+func TestAlpacaPlaceOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
+	var clientID string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		clientID, _ = body["client_order_id"].(string)
+		w.Header().Set("X-Request-ID", "req-123")
+		fmt.Fprintln(w, `{"id":"broker-1","status":"accepted","filled_avg_price":"","filled_qty":""}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	res, err := b.PlaceOrder(context.Background(), OrderRequest{Ticker: "SPY", Side: OrderSideBuy, Type: OrderTypeMarket, Quantity: 1, ClientOrderID: "te-stock-abc"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clientID != "te-stock-abc" || res.RequestID != "req-123" {
+		t.Fatalf("client/request ids = %q/%q", clientID, res.RequestID)
+	}
+}
+
+func TestAlpacaGetOrderByClientID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/orders:by_client_order_id" || r.URL.Query().Get("client_order_id") != "te-stock-abc" {
+			t.Fatalf("path/query = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		fmt.Fprintln(w, `{"id":"broker-1","status":"filled","filled_avg_price":"10","filled_qty":"2","legs":[{"id":"tp-1","type":"limit"},{"id":"sl-1","type":"stop"}]}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	res, err := b.GetOrderByClientID(context.Background(), "te-stock-abc")
+	if err != nil || res.BrokerOrderID != "broker-1" || res.FilledQty != 2 ||
+		len(res.ChildOrderIDs) != 2 || res.ChildOrderIDs[0] != "tp-1" || res.ChildOrderIDs[1] != "sl-1" {
+		t.Fatalf("lookup = %+v, %v", res, err)
+	}
+}
+
+func TestAlpacaReplaceStopOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/v2/orders/old-stop" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["client_order_id"] != "te-stock-replacement" {
+			t.Fatalf("client_order_id = %#v", body["client_order_id"])
+		}
+		w.Header().Set("X-Request-ID", "replace-request")
+		fmt.Fprintln(w, `{"id":"new-stop","status":"accepted","filled_avg_price":"","filled_qty":""}`)
+	}))
+	defer ts.Close()
+	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	res, err := b.ReplaceStopOrderWithClientID(context.Background(), "old-stop", 99.25, "te-stock-replacement")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.BrokerOrderID != "new-stop" || res.RequestID != "replace-request" {
+		t.Fatalf("replacement = %+v", res)
+	}
+}
+
 func TestAccountSnapshotCapturesAccountIdentityAndSafetyFields(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/v2/account" {

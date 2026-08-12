@@ -119,3 +119,10 @@ func (e *ReadOnlyExecutor) GetOptionSnapshots(ctx context.Context, symbols []str
 	}
 	return provider.GetOptionSnapshots(ctx, symbols)
 }
+
+func (e *ReadOnlyExecutor) Recover(ctx context.Context) error {
+	// Recovery can replay a previously accepted-but-unprojected mutation. It
+	// must therefore be treated as a mutation itself: dry-run deliberately
+	// neither creates intents nor sends a broker request.
+	return nil
+}

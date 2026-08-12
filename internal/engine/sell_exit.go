@@ -112,6 +112,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		Type:           execution.OrderTypeMarket,
 		Quantity:       totalQty,
 		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
+		IntentKey:      "analyst-exit:" + sigID + ":" + sig.Ticker,
 	})
 	if err != nil {
 		// Broker POST/response failures are ambiguous: the order may have
@@ -133,6 +134,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			result = res
 		}
 	}
+	stockIntentID := stockIntentIDForKey(ctx, "analyst-exit:"+sigID+":"+sig.Ticker)
 
 	status := execution.NormalizeOrderStatus(result.Status)
 	fullFill := status == "filled" && result.FilledPrice > 0 &&
@@ -152,6 +154,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			Quantity:      lotQuantity,
 			Status:        status,
 			FilledAt:      filledAtPtr(result.FilledAt),
+			StockIntentID: stockIntentID,
 		}
 		if fullFill {
 			exitOrder.FilledPrice = result.FilledPrice

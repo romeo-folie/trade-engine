@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ErrOrderBrokerIDChanged means an order row was repointed to a replacement
@@ -40,6 +42,7 @@ type Order struct {
 	FilledAt      *time.Time
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+	StockIntentID string
 }
 
 // InsertOrder creates a new order record and returns its UUID. Fill columns
@@ -54,8 +57,8 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 			trade_id, broker_order_id, ticker, side, order_type,
 			quantity, limit_price, stop_price, status,
 			is_stop_loss, is_take_profit, filled_price, filled_qty,
-			parent_order_id, filled_at, exit_reason, exit_evidence
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+			parent_order_id, filled_at, exit_reason, exit_evidence, stock_intent_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,NULLIF($18,'')::uuid)
 		RETURNING id`,
 		nullableString(o.TradeID), nullableString(o.BrokerOrderID),
 		o.Ticker, o.Side, o.OrderType,
@@ -63,7 +66,7 @@ func InsertOrder(ctx context.Context, o Order) (string, error) {
 		o.Status, o.IsStopLoss, o.IsTakeProfit,
 		nullableFloat(o.FilledPrice), nullableFloat(o.FilledQty),
 		nullableString(o.ParentOrderID), nullableTimePtr(o.FilledAt),
-		nullableString(o.ExitReason), nullableRawJSON(o.ExitEvidence),
+		nullableString(o.ExitReason), nullableRawJSON(o.ExitEvidence), o.StockIntentID,
 	).Scan(&id)
 	return id, err
 }
@@ -101,6 +104,54 @@ func InsertOrderWithRetry(ctx context.Context, o Order) (string, error) {
 		}
 	}
 	return "", err
+}
+
+// GetOrderByStockIntentID returns the existing projection for an immutable
+// stock intent. It is used by recovery to complete a broker-accepted entry
+// without creating a second order row.
+func GetOrderByStockIntentID(ctx context.Context, intentID string) (*Order, error) {
+	row := GetDB().QueryRow(ctx, `
+		SELECT id, COALESCE(trade_id::text,''), COALESCE(broker_order_id,''),
+		       ticker, side, order_type, quantity, COALESCE(limit_price,0),
+		       COALESCE(stop_price,0), COALESCE(filled_price,0),
+		       COALESCE(filled_qty,0), status, is_stop_loss, is_take_profit,
+		       COALESCE(parent_order_id,''), filled_at, created_at, updated_at,
+		       COALESCE(stock_intent_id::text,'')
+		FROM orders WHERE stock_intent_id=$1::uuid
+		ORDER BY created_at LIMIT 1`, intentID)
+	var o Order
+	if err := row.Scan(&o.ID, &o.TradeID, &o.BrokerOrderID, &o.Ticker, &o.Side,
+		&o.OrderType, &o.Quantity, &o.LimitPrice, &o.StopPrice, &o.FilledPrice,
+		&o.FilledQty, &o.Status, &o.IsStopLoss, &o.IsTakeProfit, &o.ParentOrderID,
+		&o.FilledAt, &o.CreatedAt, &o.UpdatedAt, &o.StockIntentID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &o, nil
+}
+
+// AttachOrderToTradeByStockIntent completes an initially order-only entry
+// projection after the broker reports its first fill. It is intentionally
+// idempotent so replay never reassigns another trade's order.
+func AttachOrderToTradeByStockIntent(ctx context.Context, intentID, tradeID string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE orders SET trade_id=$2::uuid, updated_at=NOW()
+		WHERE stock_intent_id=$1::uuid
+		  AND (trade_id IS NULL OR trade_id=$2::uuid)`, intentID, tradeID)
+	return err
+}
+
+// LinkReplacementStockIntent keeps the mutable stop-order projection attached
+// to its new immutable replacement intent. The old intent retains its broker
+// id/status for a fill that raced the PATCH; only the live order row advances.
+func LinkReplacementStockIntent(ctx context.Context, predecessorIntentID, replacementIntentID, predecessorBrokerOrderID string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE orders SET stock_intent_id=$2::uuid, updated_at=NOW()
+		WHERE stock_intent_id=$1::uuid AND broker_order_id=$3`,
+		predecessorIntentID, replacementIntentID, predecessorBrokerOrderID)
+	return err
 }
 
 // UpdateOrderFill sets filled_price, filled_qty, and status after a fill event.

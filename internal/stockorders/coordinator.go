@@ -1,0 +1,405 @@
+// Package stockorders makes standard stock broker submissions durable and
+// idempotent. It deliberately wraps only the normal stock engine; ORB/options,
+// IBKR, and paper simulation retain their own lifecycles.
+package stockorders
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/store"
+)
+
+const clientIDPrefix = "te-stock-"
+
+// Coordinator is an execution.Executor that persists a pre-submit intent and
+// uses Alpaca's client_order_id lookup before any replay after an ambiguous
+// response. It is intentionally installed inside ReadOnlyExecutor, so dry-run
+// rejects mutation before an intent can be written.
+type Coordinator struct{ inner execution.Executor }
+
+func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inner} }
+
+func (c *Coordinator) BrokerName() string {
+	if named, ok := c.inner.(interface{ BrokerName() string }); ok {
+		return named.BrokerName()
+	}
+	return ""
+}
+
+func (c *Coordinator) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	if req.IntentKey == "" {
+		return execution.OrderResult{}, errors.New("standard stock order missing durable intent key")
+	}
+	if req.ClientOrderID == "" {
+		req.ClientOrderID = clientIDForKey(req.IntentKey)
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("marshal stock order intent: %w", err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	if existing, err := store.GetStockOrderIntentByKey(ctx, req.IntentKey); err != nil {
+		return execution.OrderResult{}, err
+	} else if existing != nil {
+		if existing.PayloadHash != hash {
+			return execution.OrderResult{}, fmt.Errorf("stock order intent key %q reused with different payload", req.IntentKey)
+		}
+		var exact execution.OrderRequest
+		if err := json.Unmarshal(existing.RequestPayload, &exact); err != nil {
+			return execution.OrderResult{}, err
+		}
+		return c.submit(ctx, *existing, exact)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentUUID(), ClientOrderID: req.ClientOrderID, TradeID: req.TradeID,
+		IdempotencyKey: req.IntentKey,
+		Ticker:         req.Ticker, Side: string(req.Side), OrderType: string(req.Type),
+		RequestedQty: req.Quantity, RequestPayload: payload, PayloadHash: hash, Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		return execution.OrderResult{}, fmt.Errorf("persist stock order intent before submit: %w", err)
+	}
+	return c.submit(ctx, intent, req)
+}
+
+func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest) (execution.OrderResult, error) {
+	lookup, hasLookup := c.inner.(execution.ClientOrderLookup)
+	if hasLookup {
+		if prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID); err == nil {
+			_ = c.record(ctx, intent, "lookup", "found", prior, "", false)
+			return c.finishSubmit(ctx, intent, req, prior)
+		} else if !errors.Is(err, execution.ErrOrderNotFound) {
+			_ = c.record(ctx, intent, "lookup", "error", execution.OrderResult{}, err.Error(), false)
+			return execution.OrderResult{}, fmt.Errorf("lookup stock order client id before submit: %w", err)
+		}
+	}
+
+	res, err := c.inner.PlaceOrder(ctx, req)
+	if err == nil {
+		_ = c.record(ctx, intent, "submit", "accepted", res, "", true)
+		return c.finishSubmit(ctx, intent, req, res)
+	}
+	_ = c.record(ctx, intent, "submit", "ambiguous", execution.OrderResult{}, err.Error(), true)
+	// A response failure may follow broker acceptance. Query by the durable id
+	// before the one exact-payload replay; never use ticker/side attribution.
+	if hasLookup {
+		if prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID); lookupErr == nil {
+			_ = c.record(ctx, intent, "lookup_after_ambiguous_submit", "found", prior, "", true)
+			return c.finishSubmit(ctx, intent, req, prior)
+		} else if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
+			_ = c.record(ctx, intent, "lookup_after_ambiguous_submit", "error", execution.OrderResult{}, lookupErr.Error(), true)
+			return execution.OrderResult{}, fmt.Errorf("ambiguous stock order submit (%v); client-id lookup failed: %w", err, lookupErr)
+		}
+		res, replayErr := c.inner.PlaceOrder(ctx, req)
+		if replayErr == nil {
+			_ = c.record(ctx, intent, "exact_replay", "accepted", res, "", true)
+			return c.finishSubmit(ctx, intent, req, res)
+		}
+		_ = c.record(ctx, intent, "exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
+		return execution.OrderResult{}, fmt.Errorf("stock order submit: %w", replayErr)
+	}
+	return execution.OrderResult{}, fmt.Errorf("stock order submit: %w", err)
+}
+
+func (c *Coordinator) finishSubmit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) (execution.OrderResult, error) {
+	if err := c.projectBracketChildren(ctx, intent, req, res); err != nil {
+		return execution.OrderResult{}, err
+	}
+	return res, nil
+}
+
+// projectBracketChildren persists broker-created bracket legs as an intent
+// family immediately after their parent is known. It is safe to replay after
+// a projection failure because its child idempotency keys are parent-derived.
+func (c *Coordinator) projectBracketChildren(ctx context.Context, parent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
+	if req.OrderClass != "bracket" || len(res.ChildOrderIDs) < 2 || res.ChildOrderIDs[0] == "" || res.ChildOrderIDs[1] == "" {
+		return nil
+	}
+	if _, err := store.UpsertBracketChildIntent(ctx, parent.ID, parent.TradeID, req.Ticker, "take-profit", res.ChildOrderIDs[0], string(execution.OrderTypeLimit), req.Quantity, req.TakeProfitPrice); err != nil {
+		return fmt.Errorf("project take-profit child intent: %w", err)
+	}
+	if _, err := store.UpsertBracketChildIntent(ctx, parent.ID, parent.TradeID, req.Ticker, "stop-loss", res.ChildOrderIDs[1], string(execution.OrderTypeStop), req.Quantity, req.StopLossPrice); err != nil {
+		return fmt.Errorf("project stop-loss child intent: %w", err)
+	}
+	return nil
+}
+
+// Recover replays nonterminal persisted intents using their exact stored
+// payload and same client id. Callers run it before normal reconciliation.
+func (c *Coordinator) Recover(ctx context.Context) error {
+	intents, err := store.ListRecoverableStockOrderIntents(ctx)
+	if err != nil {
+		return err
+	}
+	for _, intent := range intents {
+		var req execution.OrderRequest
+		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+			return fmt.Errorf("decode stock intent %s: %w", intent.ClientOrderID, err)
+		}
+		if req.ClientOrderID != intent.ClientOrderID {
+			return fmt.Errorf("stock intent %s payload client id mismatch", intent.ClientOrderID)
+		}
+		var res execution.OrderResult
+		if req.ReplacesBrokerOrderID != "" {
+			res, err = c.submitReplacement(ctx, intent, req)
+		} else {
+			res, err = c.submit(ctx, intent, req)
+		}
+		if err != nil {
+			return err
+		}
+		if err := c.projectRecoveredEntry(ctx, intent, req, res); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// projectRecoveredEntry completes only an accepted standard entry whose
+// process died before the normal engine persisted its projections. A working
+// zero-fill order remains order-only: it is not a trade or a phantom position.
+func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
+	if !strings.HasPrefix(intent.IdempotencyKey, "entry:") || res.FilledQty <= 0 {
+		return nil
+	}
+	signalID := strings.TrimPrefix(intent.IdempotencyKey, "entry:")
+	if signalID == "" || strings.Contains(signalID, ":") {
+		return fmt.Errorf("invalid stock entry intent key %q", intent.IdempotencyKey)
+	}
+	sig, err := store.GetSignalByID(ctx, signalID)
+	if err != nil {
+		return fmt.Errorf("load signal for recovered stock entry: %w", err)
+	}
+	if sig == nil {
+		return fmt.Errorf("signal %s missing for recovered stock entry", signalID)
+	}
+	direction := "long"
+	if req.Side == execution.OrderSideSell {
+		direction = "short"
+	}
+	tradeID, err := store.InsertTradeForStockIntent(ctx, store.Trade{
+		SignalID: sig.ID, Ticker: sig.Ticker, Direction: direction, Strategy: sig.Strategy,
+		EntryPrice: res.FilledPrice, Quantity: res.FilledQty, StopLoss: sig.StopLoss,
+		TakeProfit: sig.TakeProfit, EntrySetup: sig.EntrySetup,
+		EntrySetupEvidence: sig.EntrySetupEvidence, StockIntentID: intent.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("project recovered stock trade: %w", err)
+	}
+	if err := store.AttachStockOrderIntentTradeByKey(ctx, intent.IdempotencyKey, tradeID); err != nil {
+		return fmt.Errorf("attach recovered stock intent: %w", err)
+	}
+	order, err := store.GetOrderByStockIntentID(ctx, intent.ID)
+	if err != nil {
+		return fmt.Errorf("load recovered stock order projection: %w", err)
+	}
+	brokerID := res.BrokerOrderID
+	if brokerID == "" {
+		brokerID = intent.BrokerOrderID
+	}
+	if order == nil {
+		if _, err := store.InsertOrderWithRetry(ctx, store.Order{
+			TradeID: tradeID, BrokerOrderID: brokerID, Ticker: req.Ticker,
+			Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity,
+			FilledPrice: res.FilledPrice, FilledQty: res.FilledQty,
+			Status: execution.NormalizeOrderStatus(res.Status), StockIntentID: intent.ID,
+		}); err != nil {
+			return fmt.Errorf("project recovered stock order: %w", err)
+		}
+	} else if err := store.AttachOrderToTradeByStockIntent(ctx, intent.ID, tradeID); err != nil {
+		return fmt.Errorf("attach recovered stock order: %w", err)
+	}
+	if brokerID != "" {
+		if err := store.ApplyEntryFill(ctx, tradeID, brokerID, res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatus(res.Status)); err != nil {
+			return fmt.Errorf("apply recovered stock entry fill: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Coordinator) record(ctx context.Context, intent store.StockOrderIntent, operation, outcome string, res execution.OrderResult, errText string, submitted bool) error {
+	status := execution.NormalizeOrderStatus(res.Status)
+	if res.Status == "" {
+		status = intent.Status
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, res.BrokerOrderID, status, res.FilledPrice, res.FilledQty, res.RequestID, errText, submitted); err != nil {
+		return err
+	}
+	return store.RecordStockOrderAttempt(ctx, intent.ID, operation, outcome, res.BrokerOrderID, res.RequestID, errText)
+}
+
+func (c *Coordinator) CancelOrder(ctx context.Context, id string) error {
+	return c.inner.CancelOrder(ctx, id)
+}
+func (c *Coordinator) GetOrderStatus(ctx context.Context, id string) (execution.OrderResult, error) {
+	return c.inner.GetOrderStatus(ctx, id)
+}
+func (c *Coordinator) GetPositions(ctx context.Context) ([]execution.Position, error) {
+	return c.inner.GetPositions(ctx)
+}
+func (c *Coordinator) GetAccount(ctx context.Context) (execution.AccountInfo, error) {
+	return c.inner.GetAccount(ctx)
+}
+func (c *Coordinator) AccountSnapshot(ctx context.Context) (execution.BrokerAccount, error) {
+	b, ok := c.inner.(execution.BrokerView)
+	if !ok {
+		return execution.BrokerAccount{}, execution.ErrBrokerUnavailable
+	}
+	return b.AccountSnapshot(ctx)
+}
+func (c *Coordinator) PositionsSnapshot(ctx context.Context) ([]execution.BrokerPosition, error) {
+	b, ok := c.inner.(execution.BrokerView)
+	if !ok {
+		return nil, execution.ErrBrokerUnavailable
+	}
+	return b.PositionsSnapshot(ctx)
+}
+func (c *Coordinator) EquityCurve(ctx context.Context, p, tf string) (execution.EquityHistory, error) {
+	b, ok := c.inner.(execution.BrokerView)
+	if !ok {
+		return execution.EquityHistory{}, execution.ErrBrokerUnavailable
+	}
+	return b.EquityCurve(ctx, p, tf)
+}
+func (c *Coordinator) RecentFills(ctx context.Context) ([]execution.BrokerOrder, error) {
+	b, ok := c.inner.(execution.BrokerView)
+	if !ok {
+		return nil, execution.ErrBrokerUnavailable
+	}
+	return b.RecentFills(ctx)
+}
+func (c *Coordinator) GetWorkingOrders(ctx context.Context) ([]execution.WorkingOrder, error) {
+	l, ok := c.inner.(execution.WorkingOrdersLister)
+	if !ok {
+		return nil, execution.ErrBrokerUnavailable
+	}
+	return l.GetWorkingOrders(ctx)
+}
+func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float64) (execution.OrderResult, error) {
+	predecessor, err := store.GetStockOrderIntentByBrokerOrderID(ctx, id)
+	if err != nil {
+		return execution.OrderResult{}, err
+	}
+	if predecessor == nil {
+		return execution.OrderResult{}, fmt.Errorf("durable stock intent missing for stop replacement %s", id)
+	}
+	key := fmt.Sprintf("replace:%s:%.8f", predecessor.IdempotencyKey, px)
+	req := execution.OrderRequest{
+		Ticker: predecessor.Ticker, Side: execution.OrderSide(predecessor.Side),
+		Type: execution.OrderTypeStop, Quantity: predecessor.RequestedQty, StopPrice: px,
+		TradeID: predecessor.TradeID, IntentKey: key, ClientOrderID: clientIDForKey(key),
+		ReplacesBrokerOrderID: id,
+	}
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("marshal stock stop replacement intent: %w", err)
+	}
+	hash := fmt.Sprintf("%x", sha256.Sum256(payload))
+	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil {
+		return execution.OrderResult{}, err
+	}
+	if intent != nil {
+		if intent.PayloadHash != hash {
+			return execution.OrderResult{}, fmt.Errorf("stock replacement intent key %q reused with different payload", key)
+		}
+		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+			return execution.OrderResult{}, err
+		}
+		return c.submitReplacement(ctx, *intent, req)
+	}
+	intent = &store.StockOrderIntent{
+		ID: intentUUID(), IdempotencyKey: key, ClientOrderID: req.ClientOrderID,
+		TradeID: predecessor.TradeID, ParentIntentID: predecessor.ID,
+		Ticker: req.Ticker, Side: string(req.Side), OrderType: string(req.Type),
+		RequestedQty: req.Quantity, RequestPayload: payload, PayloadHash: hash, Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, *intent); err != nil {
+		return execution.OrderResult{}, fmt.Errorf("persist stock stop replacement intent before submit: %w", err)
+	}
+	return c.submitReplacement(ctx, *intent, req)
+}
+
+func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest) (execution.OrderResult, error) {
+	lookup, hasLookup := c.inner.(execution.ClientOrderLookup)
+	if hasLookup {
+		prior, err := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
+		if err == nil {
+			_ = c.record(ctx, intent, "replace_lookup", "found", prior, "", false)
+			return prior, nil
+		}
+		if !errors.Is(err, execution.ErrOrderNotFound) {
+			_ = c.record(ctx, intent, "replace_lookup", "error", execution.OrderResult{}, err.Error(), false)
+			return execution.OrderResult{}, fmt.Errorf("lookup stock replacement client id before submit: %w", err)
+		}
+	}
+	replacer, ok := c.inner.(interface {
+		ReplaceStopOrderWithClientID(context.Context, string, float64, string) (execution.OrderResult, error)
+	})
+	if !ok {
+		return execution.OrderResult{}, fmt.Errorf("stock broker cannot durably replace stop")
+	}
+	res, err := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
+	if err == nil {
+		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
+		if intent.ParentIntentID != "" {
+			if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
+				return execution.OrderResult{}, fmt.Errorf("link stock replacement projection: %w", err)
+			}
+		}
+		return res, nil
+	}
+	_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
+	if hasLookup {
+		prior, lookupErr := lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
+		if lookupErr == nil {
+			_ = c.record(ctx, intent, "replace_lookup_after_ambiguous", "found", prior, "", true)
+			if intent.ParentIntentID != "" {
+				if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
+					return execution.OrderResult{}, fmt.Errorf("link recovered stock replacement projection: %w", err)
+				}
+			}
+			return prior, nil
+		}
+		if !errors.Is(lookupErr, execution.ErrOrderNotFound) {
+			return execution.OrderResult{}, fmt.Errorf("ambiguous stock stop replacement (%v); client-id lookup failed: %w", err, lookupErr)
+		}
+		res, replayErr := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
+		if replayErr == nil {
+			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
+			if intent.ParentIntentID != "" {
+				if err := store.LinkReplacementStockIntent(ctx, intent.ParentIntentID, intent.ID, req.ReplacesBrokerOrderID); err != nil {
+					return execution.OrderResult{}, fmt.Errorf("link replayed stock replacement projection: %w", err)
+				}
+			}
+			return res, nil
+		}
+		_ = c.record(ctx, intent, "replace_exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
+		return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", replayErr)
+	}
+	return execution.OrderResult{}, fmt.Errorf("stock stop replacement: %w", err)
+}
+
+func newClientOrderID() string { return clientIDPrefix + strings.ReplaceAll(intentUUID(), "-", "") }
+func clientIDForKey(key string) string {
+	sum := sha256.Sum256([]byte(key))
+	return clientIDPrefix + hex.EncodeToString(sum[:16])
+}
+func intentUUID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand: " + err.Error())
+	}
+	b[6] = b[6]&0x0f | 0x40
+	b[8] = b[8]&0x3f | 0x80
+	h := hex.EncodeToString(b)
+	return h[:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:]
+}

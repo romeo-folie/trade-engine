@@ -59,11 +59,13 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		Quantity:    quantity,
 		StopPrice:   stopPrice,
 		TradeID:     tradeID,
+		IntentKey:   "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f", stopPrice),
 		TimeInForce: "gtc", // uncapped entries are whole-share only
 	})
 	if err != nil {
 		return fmt.Errorf("place protective stop: %w", err)
 	}
+	stockIntentID := stockIntentIDForKey(ctx, "protective-stop:"+tradeID+":"+fmt.Sprintf("%.8f", stopPrice))
 	status := execution.NormalizeOrderStatus(res.Status)
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {
@@ -99,6 +101,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		ExitReason:    stopIntent.Reason,
 		ExitEvidence:  stopIntent.Evidence,
 		FilledAt:      filledAtPtr(res.FilledAt),
+		StockIntentID: stockIntentID,
 	}); err != nil {
 		rollbackRes, rollbackErr :=
 			rollbackUnrecordedProtectiveStop(ctx, e.executor, res.BrokerOrderID)
@@ -119,6 +122,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 				FilledPrice: rollbackRes.FilledPrice, FilledQty: rollbackRes.FilledQty,
 				FilledAt:   filledAtPtr(rollbackRes.FilledAt),
 				ExitReason: stopIntent.Reason, ExitEvidence: stopIntent.Evidence,
+				StockIntentID: stockIntentID,
 			}); persistErr != nil {
 				return fmt.Errorf("record protective stop: %w; rollback fill also unpersisted: %v", err, persistErr)
 			}

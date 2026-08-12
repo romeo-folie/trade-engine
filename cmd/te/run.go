@@ -29,6 +29,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/orb"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/scanner"
+	"github.com/romeo-folie/trade-engine/internal/stockorders"
 	"github.com/romeo-folie/trade-engine/internal/store"
 	swinguniverse "github.com/romeo-folie/trade-engine/internal/universe"
 	"github.com/romeo-folie/trade-engine/internal/web"
@@ -158,6 +159,12 @@ Modes:
 		var broker execution.Executor
 		if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.APIKey != "" {
 			broker = execution.NewAlpacaBroker(cfg.Markets.Stocks)
+		}
+		// Standard stock mutations run through the durable coordinator. Keep the
+		// dry-run wrapper outermost so it cannot create an intent. ORB/options
+		// have their independent lifecycle and are intentionally excluded.
+		if broker != nil && isStandardStockMode(mode) {
+			broker = stockorders.New(broker)
 		}
 		broker = protectDryRunStockExecutor(broker, runDryRun || cfg.Engine.DryRun)
 		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
@@ -1007,6 +1014,12 @@ Modes:
 		// Resolve broker-confirmed exits before comparing broker positions with
 		// DB ownership. Otherwise a stale exiting row can produce a false boot
 		// drift alert immediately before the exit sweep closes it.
+		if recoverer, ok := broker.(interface{ Recover(context.Context) error }); ok {
+			if err := recoverer.Recover(ctx); err != nil {
+				return fmt.Errorf("startup stock order-intent recovery: %w", err)
+			}
+			go recoverStockOrdersPeriodically(ctx, recoverer, time.Minute)
+		}
 		exitReconcileOK := eng.ReconcileExitsNow(ctx)
 		if !exitReconcileOK {
 			logger.Warn("startup exit reconciliation incomplete — blocking trading until broker exit truth is complete")

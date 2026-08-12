@@ -2445,6 +2445,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Type:           execution.OrderTypeMarket,
 		Quantity:       qty,
 		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
+		IntentKey:      "entry:" + sigID,
 	}
 
 	// The uncapped exit policy is active only with the trailing manager: this
@@ -2498,10 +2499,29 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
 	}
+	stockIntentID := stockIntentIDForKey(ctx, orderReq.IntentKey)
 
 	// Mark signal as executed.
 	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
 		logger.Warn("update signal status", "id", sigID, "err", err)
+	}
+	// A working entry is not a position. Persist its requested quantity under
+	// the durable intent, but do not create a zero-quantity trade that would
+	// be mistaken for a live holding after restart. Recovery projects the one
+	// trade only once broker truth reports a cumulative fill.
+	if stockIntentID != "" && result.FilledQty <= 0 {
+		if _, err := store.InsertOrderWithRetry(ctx, store.Order{
+			BrokerOrderID: result.BrokerOrderID,
+			Ticker:        sig.Ticker,
+			Side:          string(side),
+			OrderType:     string(execution.OrderTypeMarket),
+			Quantity:      orderReq.Quantity,
+			Status:        execution.NormalizeOrderStatus(result.Status),
+			StockIntentID: stockIntentID,
+		}); err != nil {
+			logger.Warn("insert unfilled entry intent projection", "ticker", sig.Ticker, "err", err)
+		}
+		return
 	}
 
 	// Create trade record.
@@ -2522,10 +2542,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		EntrySetupEvidence: sig.EntrySetupEvidence,
 		Status:             "open",
 	}
-	tradeID, err := store.InsertTrade(ctx, trade)
+	trade.StockIntentID = stockIntentID
+	tradeID, err := store.InsertTradeForStockIntent(ctx, trade)
 	if err != nil {
 		logger.Warn("insert trade", "ticker", sig.Ticker, "err", err)
 		return
+	}
+	// The durable intent predates the broker request; once this entry becomes
+	// a trade, make that relationship explicit on both projections. Recovery
+	// can then find the one order/trade to update instead of inferring by
+	// ticker when a response was accepted before these writes completed.
+	if stockIntentID != "" {
+		if err := store.AttachStockOrderIntentTradeByKey(ctx, orderReq.IntentKey, tradeID); err != nil {
+			logger.Warn("attach entry stock intent to trade", "trade_id", tradeID, "err", err)
+		}
 	}
 
 	// Cost tracking: a trade was executed (#177).
@@ -2538,10 +2568,11 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Ticker:        sig.Ticker,
 		Side:          string(side),
 		OrderType:     string(execution.OrderTypeMarket),
-		Quantity:      result.FilledQty,
+		Quantity:      orderReq.Quantity,
 		FilledPrice:   result.FilledPrice,
 		FilledQty:     result.FilledQty,
 		Status:        execution.NormalizeOrderStatus(result.Status),
+		StockIntentID: stockIntentID,
 	}
 	if _, err := store.InsertOrder(ctx, entryOrder); err != nil {
 		logger.Warn("insert entry order", "tradeID", tradeID, "err", err)
@@ -2605,6 +2636,24 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					ExitReason:   store.ExitReasonStopLoss,
 					ExitEvidence: newExitIntent(store.ExitReasonStopLoss, map[string]any{"stop_loss": sig.StopLoss}).Evidence,
 				},
+			}
+			for i := range legRows {
+				if stockIntentID != "" {
+					role, price := "take-profit", legRows[i].LimitPrice
+					if legRows[i].IsStopLoss {
+						role, price = "stop-loss", legRows[i].StopPrice
+					}
+					childIntentID, err := store.UpsertBracketChildIntent(
+						ctx, stockIntentID, tradeID, sig.Ticker, role,
+						legRows[i].BrokerOrderID, legRows[i].OrderType, legRows[i].Quantity, price,
+					)
+					if err != nil {
+						logger.Warn("persist bracket child intent", "trade_id", tradeID,
+							"broker_order_id", legRows[i].BrokerOrderID, "err", err)
+					} else {
+						legRows[i].StockIntentID = childIntentID
+					}
+				}
 			}
 			for _, leg := range legRows {
 				if _, err := store.InsertOrder(ctx, leg); err != nil {
@@ -2776,6 +2825,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			)
 		}()
 	}
+}
+
+func stockIntentIDForKey(ctx context.Context, key string) string {
+	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil {
+		logger.Warn("load stock order intent", "intent_key", key, "err", err)
+		return ""
+	}
+	if intent == nil {
+		return ""
+	}
+	return intent.ID
 }
 
 // ApproveSignal approves a pending signal and executes it. Called from CLI / Telegram.
@@ -3133,6 +3194,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			Quantity:       t.Quantity,
 			ReferencePrice: currentPrice,
 			TradeID:        t.ID,
+			IntentKey:      "software-exit:" + t.ID + ":" + exitReason,
 		})
 		if err != nil {
 			// A POST can fail after broker acceptance. Retain ownership and
@@ -3147,6 +3209,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 				result = filled
 			}
 		}
+		stockIntentID := stockIntentIDForKey(ctx, "software-exit:"+t.ID+":"+exitReason)
 
 		exitOrder := store.Order{
 			TradeID:       t.ID,
@@ -3160,6 +3223,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			Status:        execution.NormalizeOrderStatus(result.Status),
 			IsStopLoss:    exitReason == "stop-loss hit",
 			IsTakeProfit:  exitReason == "take-profit hit",
+			StockIntentID: stockIntentID,
 		}
 		exitOrder.FilledPrice = result.FilledPrice
 		if _, err := store.InsertOrderWithRetry(ctx, exitOrder); err != nil {

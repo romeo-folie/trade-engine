@@ -84,6 +84,13 @@ type OrderRequest struct {
 	// The broker adapter uses Option.OCCSymbol as the order's symbol and
 	// Quantity as the number of contracts.
 	Option *OptionContract
+	// ClientOrderID is Alpaca's caller-supplied idempotency key. The durable
+	// stock-order coordinator assigns it before a broker request.
+	ClientOrderID string
+	IntentKey     string // stable engine operation key; never serialized to Alpaca
+	// ReplacesBrokerOrderID marks a durable stop-replacement intent. It is
+	// coordinator metadata, never part of an Alpaca order payload.
+	ReplacesBrokerOrderID string
 }
 
 // OrderResult is the immediate response from the broker.
@@ -96,6 +103,13 @@ type OrderResult struct {
 	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
 	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
 	ChildOrderIDs []string
+	RequestID     string // Alpaca X-Request-ID, for audit/support correlation
+}
+
+// ClientOrderLookup is the optional broker capability used after an ambiguous
+// submit. It identifies engine-owned activity without ticker/side inference.
+type ClientOrderLookup interface {
+	GetOrderByClientID(ctx context.Context, clientOrderID string) (OrderResult, error)
 }
 
 // WorkingOrder is a live (unfilled / still-working) order at the broker.

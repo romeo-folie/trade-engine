@@ -8,6 +8,28 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
+type stockOrderRecoverer interface{ Recover(context.Context) error }
+
+// recoverStockOrdersPeriodically is deliberately serial: the next tick cannot
+// start until the prior recovery finishes, avoiding overlapping replay scans.
+func recoverStockOrdersPeriodically(ctx context.Context, recoverer stockOrderRecoverer, interval time.Duration) {
+	if recoverer == nil || interval <= 0 {
+		return
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			recoveryCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			_ = recoverer.Recover(recoveryCtx)
+			cancel()
+		}
+	}
+}
+
 type runtimeOverrideLookup func(context.Context, string) (string, bool, error)
 
 const preflightDBTimeout = 5 * time.Second
@@ -44,6 +66,10 @@ func protectDryRunStockExecutor(broker execution.Executor, dryRun bool) executio
 		return execution.NewReadOnlyExecutor(broker)
 	}
 	return broker
+}
+
+func isStandardStockMode(mode string) bool {
+	return mode == "manual" || mode == "auto" || mode == "paper"
 }
 
 func brokerName(broker execution.Executor) string {
