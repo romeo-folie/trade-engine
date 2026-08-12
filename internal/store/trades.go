@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
@@ -90,15 +91,24 @@ func InsertTrade(ctx context.Context, t Trade) (string, error) {
 // a durable standard-stock entry intent. The unique partial index makes a
 // recovery replay safe even if the process crashed after this insert.
 func InsertTradeForStockIntent(ctx context.Context, t Trade) (string, error) {
+	id, _, err := EnsureTradeForStockIntent(ctx, t)
+	return id, err
+}
+
+// EnsureTradeForStockIntent reports whether this call created the durable
+// trade projection. Recovery uses that fact for process-local effects: an
+// existing trade can outlive a transient failure to attach the intent's
+// convenience trade_id link and must not emit TradeExecuted a second time.
+func EnsureTradeForStockIntent(ctx context.Context, t Trade) (id string, created bool, err error) {
 	if t.StockIntentID == "" {
-		return InsertTrade(ctx, t)
+		id, err := InsertTrade(ctx, t)
+		return id, err == nil, err
 	}
 	entrySetup := t.EntrySetup
 	if entrySetup == "" {
 		entrySetup = EntrySetupStandard
 	}
-	var id string
-	err := GetDB().QueryRow(ctx, `
+	err = GetDB().QueryRow(ctx, `
 		INSERT INTO trades (
 			signal_id, ticker, direction, strategy,
 			entry_price, quantity, stop_loss, take_profit,
@@ -106,7 +116,7 @@ func InsertTradeForStockIntent(ctx context.Context, t Trade) (string, error) {
 			stock_intent_id
 		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$11,$12,$13::uuid)
 		ON CONFLICT (stock_intent_id) WHERE stock_intent_id IS NOT NULL
-		DO UPDATE SET stock_intent_id=EXCLUDED.stock_intent_id
+		DO NOTHING
 		RETURNING id`,
 		nullableString(t.SignalID), t.Ticker, t.Direction, t.Strategy,
 		t.EntryPrice, t.Quantity,
@@ -114,7 +124,16 @@ func InsertTradeForStockIntent(ctx context.Context, t Trade) (string, error) {
 		nullableString(t.ModelProvider), nullableString(t.ModelName),
 		entrySetup, nullableString(t.EntrySetupEvidence), t.StockIntentID,
 	).Scan(&id)
-	return id, err
+	if err == nil {
+		return id, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", false, err
+	}
+	err = GetDB().QueryRow(ctx,
+		`SELECT id FROM trades WHERE stock_intent_id=$1::uuid`, t.StockIntentID,
+	).Scan(&id)
+	return id, false, err
 }
 
 // CancelUnfilledTrade marks an open, zero-quantity trade row cancelled — the
@@ -425,9 +444,10 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 // row and preserves any fill returned with the broker replacement. A terminal
 // order may be purged before the next sweep, so its execution truth must be
 // durable in the same write as its new broker id. If a concurrent reconciler
-// applied a fill while the broker replacement was in flight, adopt the live
-// replacement using the freshly locked trade remainder instead of rejecting
-// the write and leaving the position without durable stop coverage.
+// applied an exit fill while the broker replacement was in flight, shrink the
+// projection to the freshly locked trade remainder instead of rejecting the
+// live replacement. A concurrent entry fill does not enlarge the broker order,
+// so its submitted quantity remains unchanged and the entry poll can resize it.
 func UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, expectedBrokerOrderID, newBrokerOrderID string,
@@ -518,10 +538,15 @@ func updateOrderStopReplacementTx(
 		if actualTradeQuantity <= 1e-9 {
 			return fmt.Errorf("%w: trade for stop row %s has no remaining position after concurrent fill", ErrOrderBrokerIDChanged, orderID)
 		}
-		// Replacing a partially-filled broker order preserves its unfilled
-		// remainder. Mirror that remainder here; the old order's applied fill
-		// is already represented in the trade's cumulative realization fields.
-		newQuantity = actualTradeQuantity
+		// A concurrent exit fill can shrink the position while a price-only
+		// broker replacement is in flight. Adopt that smaller remainder because
+		// the predecessor cannot protect more shares than are still held. A
+		// concurrent entry fill can also grow the trade, but it does not enlarge
+		// the broker replacement; retaining its actual submitted quantity lets
+		// the entry fill poll detect and perform the required resize.
+		if actualTradeQuantity < expectedTradeQuantity-1e-9 {
+			newQuantity = math.Min(newQuantity, actualTradeQuantity)
+		}
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE orders

@@ -733,7 +733,7 @@ func TestManager_EMA9PreCloseIgnoresCurrentPartialDailyBar(t *testing.T) {
 		Close:     50,
 	})
 	fp := &fakePrices{candles: candles}
-	fb := &fakeBroker{}
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{}}
 
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
 	m.now = func() time.Time {
@@ -836,7 +836,7 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 		Status: "pending", IsStopLoss: true,
 	})
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100)}
-	fb := &fakeBroker{}
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{}}
 	// The fallback's newly submitted durable intent is resolved by the live
 	// adapter after the broker returns its generated id. Pin that the mutable
 	// stop row advances to this intent rather than remaining attached to its
@@ -1241,8 +1241,41 @@ func TestCancelAndConfirmRejectsStopFillRace(t *testing.T) {
 	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "filled"}}
 	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
 
-	if err := m.cancelAndConfirm(context.Background(), "hard-stop"); err == nil {
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop", "gtc"); err == nil {
 		t.Fatal("filled stop must abort cancel-and-resubmit")
+	}
+}
+
+func TestCancelAndConfirmRejectsGTCDoneForDay(t *testing.T) {
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "done_for_day"}}
+	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
+
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop", "gtc"); err == nil {
+		t.Fatal("GTC done-for-day stop must not be considered cancelled")
+	}
+}
+
+func TestManager_MarketExitFailsClosedWhenGTCBracketLegReportsDoneForDayAfterCancel(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, StopLoss: 95, Quantity: 5}
+	fs.trades[trade.ID] = trade
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "gtc-bracket-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95, Status: "pending",
+		IsStopLoss: true, ParentOrderID: "bracket-parent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBroker{statusOverride: map[string]string{"gtc-bracket-stop": "done_for_day"}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+	if err := m.exitAndClose(context.Background(), trade, 90, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true); err == nil {
+		t.Fatal("market exit proceeded while GTC bracket stop remained live")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted despite live GTC bracket stop: %+v", fb.placed)
+	}
+	if got := fs.trades[trade.ID].Status; got != "open" {
+		t.Fatalf("trade status=%q, want open after an unconfirmed cancellation", got)
 	}
 }
 
@@ -1301,7 +1334,9 @@ func TestManager_EMA9IgnoresClosePredatingTrade(t *testing.T) {
 		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
 	}
 
-	m.UpdateAll(context.Background())
+	for attempt := 0; attempt < 3 && len(fb.placed) < 3; attempt++ {
+		m.UpdateAll(context.Background())
+	}
 	if fs.trades["t1"].Status != "open" {
 		t.Fatal("pre-entry EMA close must not churn the new trade")
 	}
@@ -1490,7 +1525,7 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
 	base := &fakeBroker{}
 	fs.replacementIntentIDs["broker-1"] = "replacement-intent"
-	fb := fakeBrokerWithReplace{fakeBroker: base}
+	fb := durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}}
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
 	m.UpdateAll(context.Background())
@@ -1520,6 +1555,36 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 			if err := json.Unmarshal(o.ExitEvidence, &evidence); err != nil || evidence["trailing_stop"] == nil {
 				t.Fatalf("replacement evidence = %s, err=%v", o.ExitEvidence, err)
 			}
+		}
+	}
+}
+
+func TestManager_PersistStopReplacementSkipsIntentLinkForLegacyExecutor(t *testing.T) {
+	fs := newFakeStore()
+	orderID, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-pre", Ticker: "AAPL", Side: "sell",
+		OrderType: "stop", Quantity: 10, StopPrice: 95, Status: "pending", IsStopLoss: true,
+		StockIntentID: "legacy-predecessor",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.replacementIntentIDs["broker-new"] = "must-not-be-linked"
+	m := NewManager(Config{}, fs, &fakePrices{}, &fakeBroker{})
+	if err := m.persistStopReplacement(context.Background(), &store.Order{
+		ID: orderID, BrokerOrderID: "broker-pre", Quantity: 10,
+	}, "broker-new", 10, 98, 10, "pending", 0, 0, time.Time{}, store.ExitIntent{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range fs.orders {
+		if order.ID != orderID {
+			continue
+		}
+		if order.BrokerOrderID != "broker-new" {
+			t.Fatalf("legacy replacement broker id=%q, want broker-new", order.BrokerOrderID)
+		}
+		if order.StockIntentID != "legacy-predecessor" {
+			t.Fatalf("legacy replacement linked durable intent %q", order.StockIntentID)
 		}
 	}
 }
@@ -2274,41 +2339,57 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 	}
 }
 
-func TestManager_MarketExitRotatesTerminalIntentGenerations(t *testing.T) {
+func TestManager_MarketExitDefersAfterFreshTerminalGeneration(t *testing.T) {
 	fs := newFakeStore()
 	fs.trades["t1"] = store.Trade{
 		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
 		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
 	}
 	baseKey := "trailing-market-exit:t1:10.00000000"
-	key1 := baseKey + ":retry:terminal-1"
-	key2 := key1 + ":retry:terminal-2"
-	fs.stockIntentRetryKeys[baseKey] = key1
-	fs.stockIntentRetryKeys[key1] = key2
-	fs.stockIntentIDs[key2] = "intent-live"
-
 	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeResults: []execution.OrderResult{
 		{BrokerOrderID: "terminal-1", Status: "cancelled"},
-		{BrokerOrderID: "terminal-2", Status: "rejected"},
-		{BrokerOrderID: "live", Status: "filled", FilledPrice: 120, FilledQty: 10},
 	}}}
 	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
 	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
 
-	if got := len(fb.placed); got != 3 {
-		t.Fatalf("market-exit posts=%d, want terminal generations plus live fill", got)
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("market-exit posts=%d, want one fresh terminal generation", got)
 	}
-	for i, want := range []string{baseKey, key1, key2} {
-		if got := fb.placed[i].IntentKey; got != want {
-			t.Fatalf("market-exit generation %d key=%q, want %q", i, got, want)
-		}
+	if got := fb.placed[0].IntentKey; got != baseKey {
+		t.Fatalf("market-exit key=%q, want %q", got, baseKey)
 	}
-	if fs.trades["t1"].Status != "closed" {
-		t.Fatalf("trailing terminal-generation exit left trade %q", fs.trades["t1"].Status)
+	if fs.trades["t1"].Status != "open" {
+		t.Fatalf("fresh terminal market exit must release claim, got %q", fs.trades["t1"].Status)
 	}
-	if got := len(fs.orders); got != 1 {
-		t.Fatalf("trailing terminal-generation exit stored %d orders, want one", got)
+	if got := len(fs.orders); got != 0 {
+		t.Fatalf("fresh terminal market exit stored %d orders, want none", got)
+	}
+}
+
+func TestManager_MarketExitDefersAfterFreshDefinitiveRejection(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	freshRejection := errors.Join(
+		execution.ErrFreshTerminalZeroFillPlacement,
+		execution.ErrTerminalZeroFillPlacement,
+	)
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeErr: freshRejection}}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("fresh definitive market-exit rejection posted %d orders in one tick, want one", got)
+	}
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("fresh definitive market-exit rejection must release claim, got %q", got)
+	}
+	if got := len(fs.orders); got != 0 {
+		t.Fatalf("fresh definitive market-exit rejection stored %d orders, want none", got)
 	}
 }
 
@@ -2702,6 +2783,28 @@ func TestReplaceStopImmediateFillPersistsBrokerTruth(t *testing.T) {
 	}
 	if fs.trades[trade.ID].Status != "exiting" || fs.trades[trade.ID].ExitReason != store.ExitReasonStopLoss {
 		t.Fatalf("replacement fill claim = %+v", fs.trades[trade.ID])
+	}
+}
+
+func TestSubmitStopFreshDefinitiveRejectionDoesNotFanOut(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 10,
+	}
+	freshRejection := errors.Join(
+		execution.ErrFreshTerminalZeroFillPlacement,
+		execution.ErrTerminalZeroFillPlacement,
+	)
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeErr: freshRejection}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97))
+	if !errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+		t.Fatalf("stop placement error = %v, want fresh-terminal sentinel", err)
+	}
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("fresh definitive stop rejection posted %d orders in one tick, want one", got)
 	}
 }
 

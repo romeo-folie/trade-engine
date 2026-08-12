@@ -31,9 +31,35 @@ var ErrDurableStoreUnavailable = errors.New("stockorders: durable store unavaila
 // uses Alpaca's client_order_id lookup before any replay after an ambiguous
 // response. It is intentionally installed inside ReadOnlyExecutor, so dry-run
 // rejects mutation before an intent can be written.
-type Coordinator struct{ inner execution.Executor }
+// RecoveryObserver restores in-process effects that cannot be reconstructed
+// from the durable projections alone. It is optional so the coordinator stays
+// usable by non-engine callers and tests.
+type RecoveryObserver interface {
+	RecoveredStockEntry(context.Context, string)
+	RecoveredStockExit(context.Context, store.TradeRealization)
+}
+
+type Coordinator struct {
+	inner    execution.Executor
+	observer RecoveryObserver
+}
 
 func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inner} }
+
+// SetRecoveryObserver wires the engine lifecycle effects for projections that
+// recovery completes after a process restart.
+func (c *Coordinator) SetRecoveryObserver(observer RecoveryObserver) { c.observer = observer }
+
+func (c *Coordinator) recoveredClose(ctx context.Context, tradeID string) error {
+	realized, err := store.FinalizeTradeExit(ctx, tradeID)
+	if err != nil {
+		return err
+	}
+	if realized.JustClosed && c.observer != nil {
+		c.observer.RecoveredStockExit(ctx, realized)
+	}
+	return nil
+}
 
 func requireDurableStore() error {
 	if !store.IsConnected() {
@@ -115,6 +141,16 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		} else if !errors.Is(err, execution.ErrOrderNotFound) {
 			_ = c.record(ctx, intent, "lookup", "error", execution.OrderResult{}, err.Error(), false)
 			return execution.OrderResult{}, fmt.Errorf("lookup stock order client id before submit: %w", err)
+		} else if execution.IsTerminalOrderStatusForTimeInForce(intent.Status, req.TimeInForce) && intent.BrokerOrderID != "" {
+			// Alpaca can purge a terminal client-id record before recovery runs.
+			// The durable terminal snapshot is sufficient to finish its missing
+			// projections, but never use a 404 to submit a second broker order.
+			prior := execution.OrderResult{BrokerOrderID: intent.BrokerOrderID, Status: intent.Status, FilledPrice: intent.FilledPrice, FilledQty: intent.FilledQty}
+			_ = c.record(ctx, intent, "lookup", "purged_terminal", prior, "", false)
+			return c.finishSubmit(ctx, intent, req, prior)
+		} else if intent.BrokerOrderID != "" || (intent.SubmittedAt != nil && !isRecoveryContext(ctx)) {
+			_ = c.record(ctx, intent, "lookup", "missing_after_submit", execution.OrderResult{}, err.Error(), false)
+			return execution.OrderResult{}, fmt.Errorf("stock order %s was submitted but its client id is unavailable", intent.ClientOrderID)
 		}
 	}
 
@@ -124,7 +160,9 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		return c.finishSubmit(ctx, intent, req, res)
 	}
 	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
-		_ = c.record(ctx, intent, "submit", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
+		if recordErr := c.record(ctx, intent, "submit", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true); recordErr != nil {
+			return execution.OrderResult{}, fmt.Errorf("persist definitive stock order rejection: %w", recordErr)
+		}
 		return execution.OrderResult{}, terminalZeroFillRejectionError("stock order definitively rejected", err)
 	}
 	_ = c.record(ctx, intent, "submit", "ambiguous", execution.OrderResult{}, err.Error(), true)
@@ -144,7 +182,9 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 			return c.finishSubmit(ctx, intent, req, res)
 		}
 		if execution.IsDefinitiveOrderRejection(replayErr) && !execution.IsDuplicateClientOrderError(replayErr) {
-			_ = c.record(ctx, intent, "exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
+			if recordErr := c.record(ctx, intent, "exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true); recordErr != nil {
+				return execution.OrderResult{}, fmt.Errorf("persist definitive replay rejection: %w", recordErr)
+			}
 			return execution.OrderResult{}, terminalZeroFillRejectionError("stock order definitively rejected after exact replay", replayErr)
 		}
 		_ = c.record(ctx, intent, "exact_replay", "ambiguous", execution.OrderResult{}, replayErr.Error(), true)
@@ -168,7 +208,7 @@ func isTerminalZeroFillForRequest(req execution.OrderRequest, res execution.Orde
 // error for callers that need its HTTP/request context. Transport failures and
 // duplicate-client responses remain ambiguous and must not use this sentinel.
 func terminalZeroFillRejectionError(context string, err error) error {
-	return fmt.Errorf("%w: %s: %w", execution.ErrTerminalZeroFillPlacement, context, err)
+	return fmt.Errorf("%w: %w: %s: %w", execution.ErrFreshTerminalZeroFillPlacement, execution.ErrTerminalZeroFillPlacement, context, err)
 }
 
 func requestExitIntent(req execution.OrderRequest) store.ExitIntent {
@@ -219,45 +259,65 @@ func (c *Coordinator) Recover(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var recoveryErrors []error
 	for _, intent := range intents {
-		// A prior intent in this same recovery snapshot can advance a mutable
-		// stop row and supersede a later predecessor. Re-read it before acting
-		// so the stale snapshot cannot recreate an active old-generation stop.
-		current, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
-		if err != nil {
-			return err
-		}
-		if current == nil || current.Purpose != "submit" {
-			continue
-		}
-		intent = *current
-		var req execution.OrderRequest
-		if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
-			return fmt.Errorf("decode stock intent %s: %w", intent.ClientOrderID, err)
-		}
-		if req.ClientOrderID != intent.ClientOrderID {
-			return fmt.Errorf("stock intent %s payload client id mismatch", intent.ClientOrderID)
-		}
-		var res execution.OrderResult
-		if req.ReplacesBrokerOrderID != "" {
-			res, err = c.submitReplacement(ctx, intent, req, true)
-		} else {
-			res, err = c.submit(ctx, intent, req)
-		}
-		if err != nil {
-			return err
-		}
-		if err := c.projectRecoveredEntry(ctx, intent, req, res); err != nil {
-			return err
-		}
-		if err := c.projectRecoveredStandaloneStop(ctx, intent, req, res); err != nil {
-			return err
-		}
-		if err := c.projectRecoveredMarketExit(ctx, intent, req, res); err != nil {
-			return err
+		if err := c.recoverIntent(ctx, intent); err != nil {
+			recoveryErrors = append(recoveryErrors, fmt.Errorf("recover stock intent %s: %w", intent.ClientOrderID, err))
 		}
 	}
-	return nil
+	return errors.Join(recoveryErrors...)
+}
+
+// recoverIntent isolates one immutable intent so a poisoned generation cannot
+// prevent later, unrelated entries or exits from being reconciled in the same
+// periodic pass.
+func (c *Coordinator) recoverIntent(ctx context.Context, intent store.StockOrderIntent) error {
+	// A prior intent in this same recovery snapshot can advance a mutable stop
+	// row and supersede a later predecessor. Re-read it before acting so the
+	// stale snapshot cannot recreate an active old-generation stop.
+	current, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+	if err != nil {
+		return err
+	}
+	if current == nil || current.Purpose != "submit" {
+		return nil
+	}
+	intent = *current
+	var req execution.OrderRequest
+	if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+		return fmt.Errorf("decode stock intent %s: %w", intent.ClientOrderID, err)
+	}
+	if req.ClientOrderID != intent.ClientOrderID {
+		return fmt.Errorf("stock intent %s payload client id mismatch", intent.ClientOrderID)
+	}
+	if req.Type == execution.OrderTypeStop && req.TradeID != "" {
+		return store.WithTradeOrderLock(req.TradeID, func() error {
+			return c.recoverIntentLocked(ctx, intent, req)
+		})
+	}
+	return c.recoverIntentLocked(ctx, intent, req)
+}
+
+// recoverIntentLocked submits and projects one intent. Stop intents enter via
+// the per-trade lock above so recovery cannot race the live stop lifecycle.
+func (c *Coordinator) recoverIntentLocked(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest) error {
+	var res execution.OrderResult
+	var err error
+	if req.ReplacesBrokerOrderID != "" {
+		res, err = c.submitReplacement(ctx, intent, req, true)
+	} else {
+		res, err = c.submit(ctx, intent, req)
+	}
+	if err != nil {
+		return err
+	}
+	if err := c.projectRecoveredEntry(ctx, intent, req, res); err != nil {
+		return err
+	}
+	if err := c.projectRecoveredStandaloneStop(ctx, intent, req, res); err != nil {
+		return err
+	}
+	return c.projectRecoveredMarketExit(ctx, intent, req, res)
 }
 
 func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) error {
@@ -287,7 +347,28 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 			// A prior recovery finalized every claimed lot. The immutable intent
 			// remains selectable so it can heal a partial projection, but once
 			// every trade is closed there is deliberately no live claim to find.
+			if res.FilledQty <= 0 && execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+				status := execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)
+				if err := store.UpdateSignalStatus(ctx, signalID, "rejected", "sell order "+status+" without a broker fill"); err != nil {
+					return fmt.Errorf("reject recovered zero-fill analyst exit signal: %w", err)
+				}
+				return nil
+			}
+			if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+				return fmt.Errorf("mark recovered analyst exit signal executed: %w", err)
+			}
 			return nil
+		}
+		if res.FilledQty <= 0 && execution.IsTerminalOrderStatus(res.Status) {
+			signal, signalErr := store.GetSignalByID(ctx, signalID)
+			if signalErr != nil {
+				return fmt.Errorf("load terminal analyst exit signal: %w", signalErr)
+			}
+			if signal != nil && signal.Status == "executed" {
+				// A newer retry already completed this signal. The retired
+				// terminal generation has no remaining claim to release.
+				return nil
+			}
 		}
 		return fmt.Errorf("analyst stock exit %s has no claimed trade links", intent.ClientOrderID)
 	}
@@ -339,6 +420,15 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 		if err := c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, trade.ID, quantity, allocation); err != nil {
 			return err
 		}
+	}
+	if res.FilledQty <= 0 && execution.IsTerminalOrderStatus(res.Status) {
+		if err := store.UpdateSignalStatus(ctx, signalID, "rejected", "sell order "+execution.NormalizeOrderStatus(res.Status)+" without a broker fill"); err != nil {
+			return fmt.Errorf("reject recovered zero-fill analyst exit signal: %w", err)
+		}
+		return nil
+	}
+	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
+		return fmt.Errorf("mark recovered analyst exit signal executed: %w", err)
 	}
 	return nil
 }
@@ -405,7 +495,7 @@ func (c *Coordinator) projectRecoveredMarketExitAllocation(
 		return fmt.Errorf("apply recovered market exit fill: %w", err)
 	}
 	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) && remaining <= 1e-9 {
-		if _, err := store.FinalizeTradeExit(ctx, tradeID); err != nil {
+		if err := c.recoveredClose(ctx, tradeID); err != nil {
 			return fmt.Errorf("finalize recovered market exit: %w", err)
 		}
 	}
@@ -505,9 +595,16 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 	if err != nil {
 		return fmt.Errorf("apply recovered stop fill: %w", err)
 	}
-	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) && remaining <= 1e-9 {
-		if _, err := store.FinalizeTradeExit(ctx, req.TradeID); err != nil {
-			return fmt.Errorf("finalize recovered stop fill: %w", err)
+	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
+		if remaining <= 1e-9 {
+			if err := c.recoveredClose(ctx, req.TradeID); err != nil {
+				return fmt.Errorf("finalize recovered stop fill: %w", err)
+			}
+		} else if err := store.ReleaseTradeExitClaim(ctx, req.TradeID); err != nil {
+			// This stop is terminal, so it can no longer own the residual shares.
+			// Releasing its claim lets normal reconciliation immediately restore
+			// protection or submit the next exit generation.
+			return fmt.Errorf("release terminal recovered partial-stop claim: %w", err)
 		}
 	}
 	return nil
@@ -547,7 +644,10 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if req.Side == execution.OrderSideSell {
 		direction = "short"
 	}
-	tradeID, err := store.InsertTradeForStockIntent(ctx, store.Trade{
+	// The intent's convenience trade link can lag the actual projection after
+	// a transient attach failure. Let the idempotent trade insert report whether
+	// this call really created the row before deciding to emit process effects.
+	tradeID, newProjection, err := store.EnsureTradeForStockIntent(ctx, store.Trade{
 		SignalID: sig.ID, Ticker: sig.Ticker, Direction: direction, Strategy: sig.Strategy,
 		EntryPrice: res.FilledPrice, Quantity: res.FilledQty, StopLoss: req.PolicyStopLoss,
 		TakeProfit: recoveredTakeProfit(req), EntrySetup: sig.EntrySetup,
@@ -562,6 +662,10 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	order, err := store.GetOrderByStockIntentID(ctx, intent.ID)
 	if err != nil {
 		return fmt.Errorf("load recovered stock order projection: %w", err)
+	}
+	recordedEntryQty := 0.0
+	if order != nil {
+		recordedEntryQty = order.FilledQty
 	}
 	brokerID := res.BrokerOrderID
 	if brokerID == "" {
@@ -579,18 +683,64 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	} else if err := store.AttachOrderToTradeByStockIntent(ctx, intent.ID, tradeID); err != nil {
 		return fmt.Errorf("attach recovered stock order: %w", err)
 	}
+	exitOwned := false
 	if brokerID != "" {
+		trade, err := store.GetTradeByID(ctx, tradeID)
+		if err != nil {
+			return fmt.Errorf("load recovered stock entry trade: %w", err)
+		}
+		if trade == nil {
+			return fmt.Errorf("recovered stock entry trade %s is missing", tradeID)
+		}
+		if trade.Status != "open" {
+			exitOwned = true
+			// Once an exit owns this trade, a still-working entry must not be
+			// allowed to add shares behind that exit. Cancel first and use the
+			// terminal broker snapshot below, so no later fill can become an
+			// unprotected position.
+			terminal, err := c.cancelRecoveredEntryAfterExitOwnership(ctx, brokerID)
+			if err != nil {
+				return fmt.Errorf("cancel recovered entry after exit ownership: %w", err)
+			}
+			res = terminal
+			if trade.Status == "closed" && res.FilledQty > recordedEntryQty+1e-9 {
+				return fmt.Errorf("recovered entry %s filled after its trade closed; cancellation confirmed but reconciliation is required", intent.ClientOrderID)
+			}
+		}
 		if err := store.ApplyEntryFill(ctx, tradeID, brokerID, res.FilledPrice, res.FilledQty, execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce)); err != nil {
 			return fmt.Errorf("apply recovered stock entry fill: %w", err)
 		}
 	}
-	if err := c.projectRecoveredEntryExits(ctx, intent, req, res, tradeID); err != nil {
-		return err
+	if !exitOwned {
+		if err := c.projectRecoveredEntryExits(ctx, intent, req, res, tradeID); err != nil {
+			return err
+		}
 	}
 	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
 		return fmt.Errorf("mark recovered stock entry signal executed: %w", err)
 	}
+	if newProjection && c.observer != nil {
+		c.observer.RecoveredStockEntry(ctx, intent.IdempotencyKey)
+	}
 	return nil
+}
+
+// cancelRecoveredEntryAfterExitOwnership proves that a residual entry cannot
+// fill after an exit has taken the trade. Cancellation responses are not
+// authoritative (an already-terminal Alpaca order can reject DELETE), so the
+// follow-up status read is required and is persisted through GetOrderStatus.
+func (c *Coordinator) cancelRecoveredEntryAfterExitOwnership(ctx context.Context, brokerOrderID string) (execution.OrderResult, error) {
+	if err := c.CancelOrder(ctx, brokerOrderID); err != nil {
+		// Status confirmation below decides whether the entry is actually dead.
+	}
+	res, err := c.GetOrderStatus(ctx, brokerOrderID)
+	if err != nil {
+		return execution.OrderResult{}, err
+	}
+	if !execution.IsTerminalOrderStatus(res.Status) {
+		return execution.OrderResult{}, fmt.Errorf("entry broker order %s remains %s after cancel", brokerOrderID, res.Status)
+	}
+	return res, nil
 }
 
 func recoveredTakeProfit(req execution.OrderRequest) float64 {
@@ -663,7 +813,7 @@ func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, p
 	if err != nil {
 		return fmt.Errorf("load recovered protective-stop trade: %w", err)
 	}
-	if trade == nil || trade.Status == "closed" || trade.Quantity <= 1e-9 {
+	if trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
 		return nil
 	}
 	desiredQty := trade.Quantity
@@ -680,22 +830,71 @@ func (c *Coordinator) ensureRecoveredProtectiveStopLocked(ctx context.Context, p
 			return fmt.Errorf("load normal protective stop for recovery: %w", err)
 		}
 	}
-	if existing != nil && existing.Quantity == desiredQty && existing.StopPrice == req.PolicyStopLoss {
+	if existing == nil {
+		unprojected, err := store.ListUnprojectedStockStopIntents(ctx, tradeID)
+		if err != nil {
+			return fmt.Errorf("load unprojected protective stop intents: %w", err)
+		}
+		for _, candidate := range unprojected {
+			var stopReq execution.OrderRequest
+			if err := json.Unmarshal(candidate.RequestPayload, &stopReq); err != nil {
+				return fmt.Errorf("decode unprojected protective stop intent: %w", err)
+			}
+			if err := c.recoverIntentLocked(ctx, candidate, stopReq); err != nil {
+				return fmt.Errorf("project protective stop before recovery fallback: %w", err)
+			}
+			trade, err = store.GetTradeByID(ctx, tradeID)
+			if err != nil {
+				return fmt.Errorf("reload recovered protective-stop trade: %w", err)
+			}
+			if trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
+				return nil
+			}
+			desiredQty = trade.Quantity
+			existing, err = store.GetOrderByStockIntentID(ctx, candidate.ID)
+			if err != nil {
+				return fmt.Errorf("load projected protective stop intent: %w", err)
+			}
+			if existing != nil && existing.Status != "pending" && existing.Status != "partial" {
+				existing = nil
+			}
+			if existing != nil {
+				break
+			}
+		}
+	}
+	if existing != nil && math.Abs(existing.Quantity-desiredQty) <= 1e-9 &&
+		existing.StopPrice >= req.PolicyStopLoss-1e-9 {
 		return nil
 	}
 	key := fmt.Sprintf("recovered-protective-stop:%s:%s:%.8f", tradeID, parent.ID, req.PolicyStopLoss)
 	remainingQty := desiredQty
 	if existing != nil {
-		if err := c.CancelOrder(ctx, existing.BrokerOrderID); err != nil {
-			return fmt.Errorf("cancel prior recovered protective stop: %w", err)
-		}
-		status, err := c.GetOrderStatus(ctx, existing.BrokerOrderID)
-		if err != nil {
-			return fmt.Errorf("confirm cancellation of recovered protective stop: %w", err)
-		}
-		normalized := execution.NormalizeOrderStatus(status.Status)
-		if !execution.IsTerminalOrderStatus(status.Status) {
-			return fmt.Errorf("recovered protective stop %s remains %s after cancel", existing.BrokerOrderID, status.Status)
+		cancelErr := c.CancelOrder(ctx, existing.BrokerOrderID)
+		status, statusErr := c.GetOrderStatus(ctx, existing.BrokerOrderID)
+		stopTIF := standaloneStopTimeInForce(existing.Quantity)
+		normalized := "cancelled"
+		if statusErr != nil {
+			if !errors.Is(statusErr, execution.ErrOrderNotFound) {
+				return fmt.Errorf("confirm cancellation of recovered protective stop: cancel=%v status=%w", cancelErr, statusErr)
+			}
+			// A purged broker id is terminal. Preserve any cumulative fill
+			// already recorded locally, then replace protection for the durable
+			// residual position.
+			status = execution.OrderResult{
+				BrokerOrderID: existing.BrokerOrderID,
+				Status:        normalized,
+				FilledPrice:   existing.FilledPrice,
+				FilledQty:     existing.FilledQty,
+			}
+			if existing.FilledAt != nil {
+				status.FilledAt = *existing.FilledAt
+			}
+		} else {
+			normalized = execution.NormalizeOrderStatusForTimeInForce(status.Status, stopTIF)
+			if !execution.IsTerminalOrderStatusForTimeInForce(status.Status, stopTIF) {
+				return fmt.Errorf("recovered protective stop %s remains %s after cancel: cancel=%v", existing.BrokerOrderID, status.Status, cancelErr)
+			}
 		}
 		exitIntent := store.ExitIntent{Reason: existing.ExitReason, Evidence: existing.ExitEvidence}
 		if exitIntent.Reason == "" {
@@ -773,7 +972,20 @@ func (c *Coordinator) CancelOrder(ctx context.Context, id string) error {
 	return c.inner.CancelOrder(ctx, id)
 }
 func (c *Coordinator) GetOrderStatus(ctx context.Context, id string) (execution.OrderResult, error) {
-	return c.inner.GetOrderStatus(ctx, id)
+	res, err := c.inner.GetOrderStatus(ctx, id)
+	if err != nil {
+		return res, err
+	}
+	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, id)
+	if err != nil {
+		return res, fmt.Errorf("load durable stock intent for broker status %s: %w", id, err)
+	}
+	if intent != nil {
+		if err := c.record(ctx, *intent, "status_poll", "observed", res, "", false); err != nil {
+			return res, fmt.Errorf("persist durable stock intent status %s: %w", id, err)
+		}
+	}
+	return res, nil
 }
 func (c *Coordinator) GetPositions(ctx context.Context) ([]execution.Position, error) {
 	return c.inner.GetPositions(ctx)
@@ -835,6 +1047,9 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 	if err := json.Unmarshal(predecessor.RequestPayload, &predecessorRequest); err == nil {
 		provenance = requestExitIntent(predecessorRequest)
 	}
+	if predecessorRequest.TimeInForce == "" {
+		predecessorRequest.TimeInForce = bracketChildTimeInForce(*predecessor)
+	}
 	key := fmt.Sprintf("replace:%s:%.8f", predecessor.IdempotencyKey, px)
 	req := execution.OrderRequest{
 		Ticker: predecessor.Ticker, Side: execution.OrderSide(predecessor.Side),
@@ -872,6 +1087,23 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 		return execution.OrderResult{}, fmt.Errorf("persist stock stop replacement intent before submit: %w", err)
 	}
 	return c.submitReplacement(ctx, *intent, req, false)
+}
+
+// bracketChildTimeInForce reads the compact broker-projection payload rather
+// than assuming it has the shape of an OrderRequest. Existing projections were
+// GTC bracket legs too, so retain that invariant for rows written before the
+// field was added.
+func bracketChildTimeInForce(intent store.StockOrderIntent) string {
+	var metadata struct {
+		TimeInForce string `json:"time_in_force"`
+	}
+	if err := json.Unmarshal(intent.RequestPayload, &metadata); err == nil && metadata.TimeInForce != "" {
+		return metadata.TimeInForce
+	}
+	if intent.Purpose == "broker_projection" && strings.HasPrefix(intent.IdempotencyKey, "bracket-child:") {
+		return "gtc"
+	}
+	return ""
 }
 
 // adoptLegacyStop backfills the immutable predecessor intent for a stop row
@@ -943,19 +1175,34 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 	if !ok {
 		return execution.OrderResult{}, fmt.Errorf("stock broker cannot durably replace stop")
 	}
+	// Do not send another PATCH after an earlier one lost its result. A missing
+	// client-id response does not prove the first replacement lost, and a second
+	// one could create another live protective stop. The marker is committed
+	// before the request so the ambiguity survives a crash immediately after it.
+	hadPriorAmbiguity, err := store.HasAmbiguousStockOrderAttempt(ctx, intent.ID)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("check replacement ambiguity history before submit: %w", err)
+	}
+	if hadPriorAmbiguity {
+		return execution.OrderResult{}, fmt.Errorf("%w: prior replacement submission remains unresolved", execution.ErrAmbiguousStopReplacement)
+	}
+	if err := store.RecordStockOrderAttempt(ctx, intent.ID, "replace_submission", "submitting", "", "", ""); err != nil {
+		return execution.OrderResult{}, fmt.Errorf("record replacement submission before broker request: %w", err)
+	}
 	res, err := replacer.ReplaceStopOrderWithClientID(ctx, req.ReplacesBrokerOrderID, req.StopPrice, intent.ClientOrderID)
 	if err == nil {
 		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
 		return c.maybeProjectReplacement(ctx, intent, req, res, project)
 	}
 	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
-		if project {
+		if project || hadPriorAmbiguity {
 			// Recovery has already observed no client-id record for this
-			// persisted replacement. A 404 on its predecessor can mean the
-			// original PATCH won before the process died, not that this durable
-			// replacement was rejected. Retain it for a later client-id lookup.
+			// persisted replacement. The same is true of a normal retry after a
+			// prior ambiguous PATCH: a 404 on its predecessor can mean that first
+			// PATCH won before its response was lost, not that this generation was
+			// rejected. Retain it for a later client-id lookup.
 			_ = c.record(ctx, intent, "replace", "ambiguous", execution.OrderResult{}, err.Error(), true)
-			return execution.OrderResult{}, fmt.Errorf("%w: recovery replacement predecessor unavailable: %v", execution.ErrAmbiguousStopReplacement, err)
+			return execution.OrderResult{}, fmt.Errorf("%w: replacement predecessor unavailable after ambiguous submission: %v", execution.ErrAmbiguousStopReplacement, err)
 		}
 		_ = c.record(ctx, intent, "replace", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
 		return execution.OrderResult{}, terminalZeroFillRejectionError("stock stop replacement definitively rejected", err)
@@ -1041,8 +1288,61 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		}
 		return res, nil
 	}
+	// A replacement response can be visible even though the predecessor filled
+	// while its PATCH was in flight. Reconcile that old broker identity before
+	// overwriting the sole mutable order row; otherwise the fill would become
+	// unreachable once the predecessor intent is superseded.
+	expectedFilledQty, expectedTradeQty := order.FilledQty, req.Quantity
+	predecessor, err := c.GetOrderStatus(ctx, order.BrokerOrderID)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("confirm predecessor stop before replacement projection: %w", err)
+	}
+	if predecessor.FilledQty > 0 {
+		predecessorIntent := store.ExitIntent{Reason: order.ExitReason, Evidence: order.ExitEvidence}
+		if predecessorIntent.Reason == "" {
+			predecessorIntent = requestExitIntent(req)
+		}
+		if _, err := store.ClaimTradeExitWithIntent(ctx, order.TradeID, predecessorIntent); err != nil {
+			return execution.OrderResult{}, fmt.Errorf("claim predecessor replacement fill: %w", err)
+		}
+		remaining, _, err := store.ApplyProtectiveExitAtForBrokerOrder(ctx,
+			order.TradeID, order.ID, order.BrokerOrderID,
+			predecessor.FilledPrice, predecessor.FilledQty,
+			execution.NormalizeOrderStatusForTimeInForce(predecessor.Status, req.TimeInForce), predecessor.FilledAt,
+			predecessorIntent)
+		if err != nil {
+			return execution.OrderResult{}, fmt.Errorf("apply predecessor replacement fill: %w", err)
+		}
+		if execution.IsTerminalOrderStatusForTimeInForce(predecessor.Status, req.TimeInForce) {
+			if remaining <= 1e-9 {
+				if err := c.recoveredClose(ctx, order.TradeID); err != nil {
+					return execution.OrderResult{}, fmt.Errorf("finalize predecessor replacement fill: %w", err)
+				}
+				// The PATCH may already have created a replacement stop even though
+				// the predecessor flattened the position in the same race. Do not
+				// retain a sell order with no shares behind it.
+				_ = c.CancelOrder(ctx, res.BrokerOrderID)
+				replacementStatus, err := c.GetOrderStatus(ctx, res.BrokerOrderID)
+				if err != nil {
+					return execution.OrderResult{}, fmt.Errorf("confirm replacement after predecessor flattened trade: %w", err)
+				}
+				if !execution.IsTerminalOrderStatusForTimeInForce(replacementStatus.Status, req.TimeInForce) {
+					return execution.OrderResult{}, fmt.Errorf("replacement stop %s remains %s after predecessor flattened trade", res.BrokerOrderID, replacementStatus.Status)
+				}
+				if replacementStatus.FilledQty > 0 {
+					return execution.OrderResult{}, fmt.Errorf("replacement stop %s filled after predecessor flattened trade", res.BrokerOrderID)
+				}
+				if err := store.SupersedeStockOrderIntent(ctx, intent.ID); err != nil {
+					return execution.OrderResult{}, fmt.Errorf("retire replacement after predecessor flattened trade: %w", err)
+				}
+				return res, nil
+			} else if err := store.ReleaseTradeExitClaim(ctx, order.TradeID); err != nil {
+				return execution.OrderResult{}, fmt.Errorf("release terminal predecessor replacement claim: %w", err)
+			}
+		}
+	}
 	if err := store.UpdateOrderStopReplacement(ctx, order.ID, req.ReplacesBrokerOrderID, res.BrokerOrderID,
-		order.FilledQty, req.Quantity, req.StopPrice, req.Quantity,
+		expectedFilledQty, expectedTradeQty, req.StopPrice, req.Quantity,
 		execution.NormalizeOrderStatusForTimeInForce(res.Status, req.TimeInForce), res.FilledPrice, res.FilledQty, res.FilledAt, requestExitIntent(req)); err != nil {
 		return execution.OrderResult{}, fmt.Errorf("project stock stop replacement: %w", err)
 	}

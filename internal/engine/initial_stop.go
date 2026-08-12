@@ -86,11 +86,25 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 	}
 	var res execution.OrderResult
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
+		existingIntent, lookupErr := store.GetStockOrderIntentByKey(ctx, intentKey)
+		if lookupErr != nil {
+			return fmt.Errorf("load protective-stop generation before submit: %w", lookupErr)
+		}
 		res, err = e.executor.PlaceOrder(ctx, stopReq)
-		if err == nil && !isTerminalZeroFillStockIntent(res.Status, res.FilledQty, stopReq.TimeInForce) {
-			break
+		if err == nil {
+			if !isTerminalZeroFillStockIntent(res.Status, res.FilledQty, stopReq.TimeInForce) {
+				break
+			}
+			return fmt.Errorf("fresh protective stop %s finished %s without a fill", intentKey, res.Status)
 		}
 		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			break
+		}
+		if existingIntent == nil {
+			// This call created and terminalized the first generation. Retrying
+			// the identical rejected payload cannot restore protection and may
+			// exhaust the broker's rate limit; the next engine attempt can decide
+			// whether changed state warrants a fresh generation.
 			break
 		}
 		_, retryKey, resolveErr := store.ResolveStockOrderIntentRetryGeneration(ctx, intentKey)
@@ -152,7 +166,7 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 		StockIntentID: stockIntentID,
 	}); err != nil {
 		rollbackRes, rollbackErr :=
-			rollbackUnrecordedProtectiveStop(ctx, e.executor, res.BrokerOrderID)
+			rollbackUnrecordedProtectiveStop(ctx, e.executor, res.BrokerOrderID, stopReq.TimeInForce)
 		if rollbackRes.FilledQty > 0 {
 			_, _ = store.ClaimTradeExitWithIntent(ctx, tradeID, stopIntent)
 			// Preserve the fill itself before returning. If the broker purges
@@ -210,6 +224,7 @@ func rollbackUnrecordedProtectiveStop(
 	ctx context.Context,
 	executor execution.Executor,
 	brokerOrderID string,
+	timeInForce string,
 ) (execution.OrderResult, error) {
 	cancelErr := executor.CancelOrder(ctx, brokerOrderID)
 	status, statusErr := executor.GetOrderStatus(ctx, brokerOrderID)
@@ -219,7 +234,7 @@ func rollbackUnrecordedProtectiveStop(
 		}
 		return execution.OrderResult{}, fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
 	}
-	switch execution.NormalizeOrderStatus(status.Status) {
+	switch execution.NormalizeOrderStatusForTimeInForce(status.Status, timeInForce) {
 	case "cancelled", "rejected":
 		return status, nil
 	case "filled":
@@ -241,7 +256,9 @@ func (e *Engine) cancelProtectiveStopForResize(
 			return 0, fmt.Errorf("confirm protective-stop cancellation: cancel=%v status=%w", cancelErr, statusErr)
 		}
 	} else {
-		switch execution.NormalizeOrderStatus(status.Status) {
+		// Uncapped entries use whole-share GTC protection, so a session-end
+		// done_for_day response is not confirmation that this stop is gone.
+		switch execution.NormalizeOrderStatusForTimeInForce(status.Status, "gtc") {
 		case "cancelled", "rejected":
 			if status.FilledQty > 0 {
 				fillPrice := status.FilledPrice

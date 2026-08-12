@@ -275,7 +275,7 @@ func TestSellExit_OrderErrorKeepsClaimForRecovery(t *testing.T) {
 	}
 }
 
-func TestSellExit_DefinitiveCoordinatorRejectionRotatesAndCloses(t *testing.T) {
+func TestSellExit_DefinitiveCoordinatorRejectionRotatesOnNextAttemptAndCloses(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
@@ -288,6 +288,22 @@ func TestSellExit_DefinitiveCoordinatorRejectionRotatesAndCloses(t *testing.T) {
 	broker := &definitiveThenFilledExitBroker{err: &execution.BrokerRequestError{StatusCode: 422, Message: "market exit rejected"}}
 	e := newBracketTestEngine(stockorders.New(broker))
 	sigID := insertSellSignal(t, ticker)
+	e.executeSellExit(ctx, sigID, store.Signal{ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 119, Confidence: 0.7})
+	if len(broker.posts) != 1 {
+		t.Fatalf("fresh definitive rejection submitted %d orders in one attempt, want one", len(broker.posts))
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "open" || trade.Quantity != 3 {
+		t.Fatalf("fresh definitive rejection trade=%#v err=%v, want released open position", trade, err)
+	}
+	if got := signalStatus(t, sigID); got != "blocked" {
+		t.Fatalf("first-attempt signal status=%q, want blocked", got)
+	}
+
+	// The next engine attempt reuses the semantic key, observes the durable
+	// terminal generation without reaching the broker, and submits exactly one
+	// successor. Persistent broker restrictions are therefore paced across
+	// ticks instead of producing multiple fresh orders in one tick.
 	e.executeSellExit(ctx, sigID, store.Signal{ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 119, Confidence: 0.7})
 
 	if len(broker.posts) != 2 || broker.posts[0].ClientOrderID == broker.posts[1].ClientOrderID {
@@ -306,7 +322,7 @@ func TestSellExit_DefinitiveCoordinatorRejectionRotatesAndCloses(t *testing.T) {
 	if err != nil || retry == nil || retry.Status != "filled" || retry.BrokerOrderID != "accepted-retry-exit" {
 		t.Fatalf("accepted retry intent=%#v err=%v", retry, err)
 	}
-	trade, err := store.GetTradeByID(ctx, tradeID)
+	trade, err = store.GetTradeByID(ctx, tradeID)
 	if err != nil || trade == nil || trade.Status != "closed" || trade.Quantity != 3 {
 		t.Fatalf("retried definitive analyst exit trade=%#v err=%v", trade, err)
 	}

@@ -32,6 +32,13 @@ var ErrAmbiguousStopReplacement = errors.New("execution: ambiguous stop replacem
 // deterministic generation after confirming that terminal state.
 var ErrTerminalZeroFillPlacement = errors.New("execution: terminal zero-fill placement")
 
+// ErrFreshTerminalZeroFillPlacement marks a broker-confirmed rejection from
+// the submission attempted in this call. It also wraps
+// ErrTerminalZeroFillPlacement, but callers use this marker to pace retry
+// generation rotation across scheduling ticks instead of sending a second
+// fresh order immediately.
+var ErrFreshTerminalZeroFillPlacement = errors.New("execution: fresh terminal zero-fill placement")
+
 // BrokerRequestError preserves an adapter's definitive HTTP response. It lets
 // durable callers distinguish a broker-declared rejection from a transport or
 // 5xx ambiguity that must be looked up/replayed safely.

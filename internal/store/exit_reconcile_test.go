@@ -947,6 +947,63 @@ func TestStopReplacementAdoptsAppliedDurableFillAfterSnapshot(t *testing.T) {
 	}
 }
 
+func TestStopReplacementDoesNotInflateAfterConcurrentEntryFill(t *testing.T) {
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_XRC_ENTRY_GROWTH", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 5,
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "entry-growth", Ticker: "TEST_XRC_ENTRY_GROWTH",
+		Side: "buy", OrderType: "market", Quantity: 10, FilledPrice: 100,
+		FilledQty: 5, Status: "partial",
+	}); err != nil {
+		t.Fatalf("InsertOrder(entry): %v", err)
+	}
+	stopID, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "entry-growth-stop-old", Ticker: "TEST_XRC_ENTRY_GROWTH",
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	if err != nil {
+		t.Fatalf("InsertOrder(stop): %v", err)
+	}
+	// The price-only PATCH was submitted for five shares. Before its result is
+	// persisted, the entry accumulates another five-share fill.
+	if err := store.ApplyEntryFill(ctx, tradeID, "entry-growth", 100, 10, "filled"); err != nil {
+		t.Fatalf("ApplyEntryFill: %v", err)
+	}
+	if err := store.UpdateOrderStopReplacement(
+		ctx, stopID, "entry-growth-stop-old", "entry-growth-stop-new", 0, 5,
+		96, 5, "pending", 0, 0, time.Time{}, store.ExitIntent{Reason: store.ExitReasonStopLoss},
+	); err != nil {
+		t.Fatalf("UpdateOrderStopReplacement after entry growth: %v", err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 10 {
+		t.Fatalf("trade after concurrent entry fill = %+v err=%v; want quantity 10", trade, err)
+	}
+	orders, err := store.GetOrdersByTrade(ctx, tradeID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, order := range orders {
+		if order.ID == stopID {
+			found = true
+			if order.BrokerOrderID != "entry-growth-stop-new" || order.Quantity != 5 {
+				t.Fatalf("replacement stop = %+v, want broker quantity 5", order)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("replacement stop row is missing")
+	}
+}
+
 func TestStopReplacementMatchesNullBrokerIDSnapshot(t *testing.T) {
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{

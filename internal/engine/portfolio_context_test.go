@@ -3,9 +3,23 @@ package engine
 import (
 	"testing"
 
+	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+func TestBuildRiskInputPendingEntryUsesReferenceCostBasis(t *testing.T) {
+	in := buildRiskInput(config.RiskConfig{}, "BUY", "HIMS", 0.9, 1, 90, 130, 120,
+		portfolio.State{TotalValue: 10_000}, []store.Trade{
+			{Ticker: "HIMS", Direction: "long", Quantity: 10, EntryPrice: 100, Status: "open"},
+			// A working durable entry is not yet a database trade, but it must
+			// contribute its immutable reference price to pyramid gain checks.
+			{Ticker: "HIMS", Direction: "long", Quantity: 10, EntryPrice: 200, Status: "open"},
+		})
+	if in.LongAvgEntryPrice != 150 {
+		t.Fatalf("pending-entry weighted cost basis = %v, want 150", in.LongAvgEntryPrice)
+	}
+}
 
 // TestBuildPortfolioContext maps tracker positions into the analysis request,
 // skipping zero-quantity phantoms; a populated tracker never falls back.

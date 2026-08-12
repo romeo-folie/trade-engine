@@ -134,6 +134,10 @@ type Engine struct {
 	// the alt timeframe before reading. Defaults to fetchAndStoreCandles;
 	// tests override it to avoid network/DB.
 	multiTFCandleFetcher func(ctx context.Context, ticker string, tf data.Timeframe)
+
+	// recoveredEntryEffects keeps asynchronous polling and coordinator startup
+	// recovery from publishing the same in-process entry event twice.
+	recoveredEntryEffects sync.Map
 }
 
 // BatchFlusher is implemented by notify.TelegramBot when batch mode is enabled.
@@ -2023,6 +2027,18 @@ func (e *Engine) generateSignal(
 			return
 		}
 	}
+	if resp.Action == "BUY" && openTradesErr == nil {
+		openTrades, openTradesErr = withWorkingStockEntryReservations(ctx, openTrades)
+		if openTradesErr != nil {
+			sig.Status = "blocked"
+			sig.BlockReason = "unable to verify working stock entries (DB error)"
+			if _, err := store.InsertSignal(ctx, sig); err != nil {
+				logger.Warn("store blocked signal", "ticker", ticker, "err", err)
+			}
+			logger.Warn("signal blocked", "ticker", ticker, "reason", sig.BlockReason, "err", openTradesErr)
+			return
+		}
+	}
 	if resp.Action == "BUY" && tickerHasExitingLongIn(openTrades, ticker) {
 		sig.Status = "blocked"
 		sig.BlockReason = "prior long exit is still reconciling"
@@ -2378,6 +2394,13 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"ticker", sig.Ticker, "reason", reason, "err", err)
 			return
 		}
+		openTrades, err = withWorkingStockEntryReservations(ctx, openTrades)
+		if err != nil {
+			reason := "pullback execution risk re-check failed: unable to verify working stock entries"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("pullback execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
 		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
 			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, mark,
 			e.portfolio.CurrentState(), openTrades)
@@ -2406,6 +2429,13 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
 			return
 		}
+		owned, err = withWorkingStockEntryReservations(ctx, owned)
+		if err != nil {
+			reason := "unable to verify working stock entries (DB error)"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
 		if tickerHasExitingLongIn(owned, sig.Ticker) {
 			reason := "prior long exit is still reconciling"
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
@@ -2413,6 +2443,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
 				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
 				BlockReason: reason, FailedCheck: "exit_ownership",
+			})
+			return
+		}
+		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
+			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
+			e.portfolio.CurrentState(), owned)
+		if results, passed := risk.CheckAll(riskIn); !passed {
+			reason := "execution risk re-check failed: " + risk.BlockReason(results)
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: risk.BlockReason(results),
 			})
 			return
 		}
@@ -2665,11 +2708,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 						legRows[i].BrokerOrderID, legRows[i].OrderType, legRows[i].Quantity, price,
 					)
 					if err != nil {
-						logger.Warn("persist bracket child intent", "trade_id", tradeID,
+						// The broker has already created this leg, but without its
+						// durable child identity we must not write an unlinked order
+						// row. Recovery will replay the parent projection instead.
+						logger.Error("persist bracket child intent; deferring leg projection", "trade_id", tradeID,
 							"broker_order_id", legRows[i].BrokerOrderID, "err", err)
-					} else {
-						legRows[i].StockIntentID = childIntentID
+						return
 					}
+					legRows[i].StockIntentID = childIntentID
 				}
 			}
 			for _, leg := range legRows {
@@ -2869,31 +2915,55 @@ func (e *Engine) placeMarketExitWithTerminalRetries(
 		res, err := e.executor.PlaceOrder(ctx, req)
 		return res, req.IntentKey, false, err
 	}
-
-	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
-		res, err := e.executor.PlaceOrder(ctx, req)
-		terminalZero := err == nil && isTerminalZeroFillStockIntent(res.Status, res.FilledQty, req.TimeInForce)
-		if err == nil && !terminalZero {
-			return res, req.IntentKey, false, nil
-		}
-		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
-			return execution.OrderResult{}, req.IntentKey, false, err
-		}
-
-		_, retryKey, resolveErr := store.ResolveStockOrderIntentRetryGeneration(ctx, req.IntentKey)
-		if resolveErr != nil {
-			return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("resolve terminal market-exit generation: %w", resolveErr)
-		}
-		if retryKey == req.IntentKey {
-			return execution.OrderResult{}, req.IntentKey, true, errors.New("terminal market-exit generation resolver did not advance")
-		}
-		req.IntentKey = retryKey
-		req.ClientOrderID = ""
-		if generation == maxTerminalStopGenerationSubmissions-1 {
-			return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("market exit remained terminal through %d generations", maxTerminalStopGenerationSubmissions)
-		}
+	// A terminal partial fill consumes part of the position and releases the
+	// claim for its residual. That residual must use a fresh immutable payload,
+	// not the completed generation whose quantity no longer matches.
+	partialRetryKey, resolveErr := store.ResolveTerminalPartialStockOrderIntentRetryGeneration(ctx, req.IntentKey)
+	if resolveErr != nil {
+		return execution.OrderResult{}, req.IntentKey, false, fmt.Errorf("resolve terminal partial market-exit generation: %w", resolveErr)
 	}
-	return execution.OrderResult{}, req.IntentKey, true, errors.New("unreachable terminal market-exit generation state")
+	if partialRetryKey != req.IntentKey {
+		req.IntentKey, req.ClientOrderID = partialRetryKey, ""
+	}
+
+	res, err := e.executor.PlaceOrder(ctx, req)
+	if err == nil {
+		// A new terminal-zero result is durably recorded and is deliberately
+		// handed back to the next scheduled exit attempt. Do not burn an
+		// unbounded chain of client ids while a broker-side restriction persists.
+		if isTerminalZeroFillStockIntent(res.Status, res.FilledQty, req.TimeInForce) {
+			return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("market exit completed terminally without a fill")
+		}
+		return res, req.IntentKey, false, nil
+	}
+	if !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		return execution.OrderResult{}, req.IntentKey, false, err
+	}
+	if errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+		// The just-created generation was conclusively rejected. Keep the
+		// release/retry cadence at one broker submission per engine tick rather
+		// than immediately creating a second order under the same restriction.
+		return execution.OrderResult{}, req.IntentKey, true, err
+	}
+
+	// This invocation did not reach the broker: its prior generation is known
+	// terminal. Advance once, then make at most one fresh broker request.
+	_, retryKey, resolveErr := store.ResolveStockOrderIntentRetryGeneration(ctx, req.IntentKey)
+	if resolveErr != nil {
+		return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("resolve terminal market-exit generation: %w", resolveErr)
+	}
+	if retryKey == req.IntentKey {
+		return execution.OrderResult{}, req.IntentKey, true, errors.New("terminal market-exit generation resolver did not advance")
+	}
+	req.IntentKey, req.ClientOrderID = retryKey, ""
+	res, err = e.executor.PlaceOrder(ctx, req)
+	if err != nil {
+		return execution.OrderResult{}, req.IntentKey, errors.Is(err, execution.ErrTerminalZeroFillPlacement), err
+	}
+	if isTerminalZeroFillStockIntent(res.Status, res.FilledQty, req.TimeInForce) {
+		return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("replacement market exit completed terminally without a fill")
+	}
+	return res, req.IntentKey, false, nil
 }
 
 func stockIntentIDForAcceptedOrderWithLookup(
@@ -2926,10 +2996,12 @@ func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {
 	if !ok {
 		return
 	}
+	pollDelay := unfilledEntryPollDelay
 	go func() {
 		const retries = 40
+		effectsEmitted := false
 		for attempt := 0; attempt < retries; attempt++ {
-			time.Sleep(unfilledEntryPollDelay)
+			time.Sleep(pollDelay)
 			pollCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			status, err := e.executor.GetOrderStatus(pollCtx, brokerOrderID)
 			cancel()
@@ -2941,16 +3013,75 @@ func (e *Engine) pollUnfilledStockIntent(intentKey, brokerOrderID string) {
 			}
 			recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 10*time.Second)
 			err = recoverer.Recover(recoverCtx)
-			recoverCancel()
 			if err != nil {
+				recoverCancel()
 				logger.Warn("unfilled entry recovery", "intent_key", intentKey, "broker_order_id", brokerOrderID, "err", err)
 				continue
 			}
+			if !effectsEmitted {
+				effectsEmitted = e.emitRecoveredEntryEffects(recoverCtx, intentKey)
+			}
+			recoverCancel()
 			if execution.IsTerminalOrderStatus(status.Status) {
 				return
 			}
 		}
+		e.cancelTimedOutStockIntent(intentKey, brokerOrderID, recoverer)
 	}()
+}
+
+// emitRecoveredEntryEffects restores the in-process observability effects for
+// an entry that was accepted with no fill and later projected by recovery. The
+// trade itself is durable; the cost counter and event bus are not, so publish
+// them once from the poller that observed the completed projection.
+func (e *Engine) emitRecoveredEntryEffects(ctx context.Context, intentKey string) bool {
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil || intent.TradeID == "" {
+		return false
+	}
+	trade, err := store.GetTradeByID(ctx, intent.TradeID)
+	if err != nil || trade == nil {
+		return false
+	}
+	if _, alreadyEmitted := e.recoveredEntryEffects.LoadOrStore(intent.ID, struct{}{}); alreadyEmitted {
+		return false
+	}
+	if e.costTracker != nil {
+		e.costTracker.RecordTrade()
+	}
+	if e.bus != nil {
+		e.bus.Publish(events.TradeExecuted, events.TradeExecutedPayload{
+			TradeID:       trade.ID,
+			SignalID:      trade.SignalID,
+			Ticker:        trade.Ticker,
+			Direction:     trade.Direction,
+			EntryPrice:    trade.EntryPrice,
+			Quantity:      trade.Quantity,
+			Strategy:      trade.Strategy,
+			EntrySetup:    trade.EntrySetup,
+			SetupEvidence: trade.EntrySetupEvidence,
+		})
+	}
+	return true
+}
+
+// RecoveredStockEntry implements stockorders.RecoveryObserver.
+func (e *Engine) RecoveredStockEntry(ctx context.Context, intentKey string) {
+	e.emitRecoveredEntryEffects(ctx, intentKey)
+}
+
+// RecoveredStockExit implements stockorders.RecoveryObserver. Recovery owns
+// durable state; the engine owns the process-local cooldown and event bus.
+func (e *Engine) RecoveredStockExit(_ context.Context, realized store.TradeRealization) {
+	if !realized.JustClosed {
+		return
+	}
+	if realized.PnL < 0 && e.portfolio != nil {
+		e.portfolio.RecordLoss()
+	}
+	if e.bus != nil {
+		e.publishTradeClosed(realized)
+	}
 }
 
 var unfilledEntryPollDelay = 3 * time.Second
@@ -3580,6 +3711,12 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 				"id", sig.ID, "ticker", sig.Ticker, "err", otErr)
 			continue
 		}
+		openTrades, otErr = withWorkingStockEntryReservations(ctx, openTrades)
+		if otErr != nil {
+			logger.Warn("deferred signal: working stock entries unavailable — retrying next tick",
+				"id", sig.ID, "ticker", sig.Ticker, "err", otErr)
+			continue
+		}
 		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
 			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
 			e.portfolio.CurrentState(), openTrades)
@@ -3743,6 +3880,19 @@ func (e *Engine) pullbackExecutionEvidence(
 	}
 	evidence.Mark = refreshed.Ask
 	return evidence, nil
+}
+
+// withWorkingStockEntryReservations makes accepted entries that have not yet
+// produced a trade visible to every BUY risk pass.  The reservation is not a
+// persisted trade (there may still be zero broker fill), but it prevents a
+// working market entry from leaving a hole in the position-cap and
+// per-ticker ownership checks.
+func withWorkingStockEntryReservations(ctx context.Context, openTrades []store.Trade) ([]store.Trade, error) {
+	reservations, err := store.GetWorkingStockEntryReservations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return append(openTrades, reservations...), nil
 }
 
 // buildRiskInput assembles risk.CheckInput for a signal against a portfolio

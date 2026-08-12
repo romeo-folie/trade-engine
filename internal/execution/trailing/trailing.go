@@ -907,7 +907,7 @@ func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, 
 		// Fallback: cancel, CONFIRM cancellation, then resubmit. If we
 		// can't confirm the prior stop is gone, bail out — placing a new
 		// stop now risks two live stops on the same position.
-		if err := m.cancelAndConfirm(ctx, existing.BrokerOrderID); err != nil {
+		if err := m.cancelAndConfirm(ctx, existing.BrokerOrderID, stopTIF); err != nil {
 			return fmt.Errorf("cancel of stale stop unconfirmed; refusing to submit duplicate stop: %w", err)
 		}
 	}
@@ -932,6 +932,11 @@ func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, 
 			break
 		}
 		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			break
+		}
+		if errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+			// This generation reached the broker and was conclusively rejected.
+			// Leave the next deterministic generation to a later manager tick.
 			break
 		}
 		retryKey, resolveErr := m.resolveTerminalStopIntentKey(ctx, stopReq.IntentKey)
@@ -1054,13 +1059,16 @@ func (m *Manager) persistStopReplacement(
 	filledAt time.Time,
 	intent store.ExitIntent,
 ) error {
-	if atomic, ok := m.store.(interface {
-		UpdateOrderStopReplacementAndLinkIntent(context.Context, string, string, string, float64, float64, float64, float64, string, float64, float64, time.Time, store.ExitIntent) error
-	}); ok {
-		return atomic.UpdateOrderStopReplacementAndLinkIntent(ctx,
-			existing.ID, existing.BrokerOrderID, newBrokerOrderID,
-			existing.FilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
-			status, filledPrice, filledQty, filledAt, intent)
+	durable, _ := m.exec.(interface{ DurableStockOrderIntents() bool })
+	if durable != nil && durable.DurableStockOrderIntents() {
+		if atomic, ok := m.store.(interface {
+			UpdateOrderStopReplacementAndLinkIntent(context.Context, string, string, string, float64, float64, float64, float64, string, float64, float64, time.Time, store.ExitIntent) error
+		}); ok {
+			return atomic.UpdateOrderStopReplacementAndLinkIntent(ctx,
+				existing.ID, existing.BrokerOrderID, newBrokerOrderID,
+				existing.FilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+				status, filledPrice, filledQty, filledAt, intent)
+		}
 	}
 	if err := m.store.UpdateOrderStopReplacement(ctx,
 		existing.ID, existing.BrokerOrderID, newBrokerOrderID,
@@ -1068,10 +1076,12 @@ func (m *Manager) persistStopReplacement(
 		status, filledPrice, filledQty, filledAt, intent); err != nil {
 		return err
 	}
-	if linker, ok := m.store.(interface {
-		LinkReplacementOrderIntent(context.Context, string, string) error
-	}); ok {
-		return linker.LinkReplacementOrderIntent(ctx, existing.ID, newBrokerOrderID)
+	if durable != nil && durable.DurableStockOrderIntents() {
+		if linker, ok := m.store.(interface {
+			LinkReplacementOrderIntent(context.Context, string, string) error
+		}); ok {
+			return linker.LinkReplacementOrderIntent(ctx, existing.ID, newBrokerOrderID)
+		}
 	}
 	return nil
 }
@@ -1136,7 +1146,8 @@ func (m *Manager) rollbackUnrecordedStop(
 		}
 		return fmt.Errorf("cancel=%v status=%w", cancelErr, statusErr)
 	}
-	terminalStatus := execution.NormalizeOrderStatus(status.Status)
+	stopTIF := protectiveStopTIF(t.Quantity)
+	terminalStatus := execution.NormalizeOrderStatusForTimeInForce(status.Status, stopTIF)
 	if durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool }); ok && durable.DurableStockOrderIntents() && stockIntentID == "" {
 		// The broker fill remains recoverable from its immutable intent. Do
 		// not turn this exceptional rollback path into an unlinked legacy row.
@@ -1313,7 +1324,7 @@ func timeValue(t *time.Time) time.Time {
 // This is the load-bearing safety check that prevents double-stop
 // submission during the cancel+resubmit fallback path. Never short-circuit
 // or relax this without re-doing the duplicate-stop analysis.
-func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) error {
+func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID, timeInForce string) error {
 	cancelErr := m.exec.CancelOrder(ctx, brokerOrderID)
 	// Independent of cancel success, query status: a 404 / "order not found"
 	// is fine (it's gone), a "filled" / "cancelled" is fine (terminal).
@@ -1336,7 +1347,7 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 		// refuse the duplicate-submission risk.
 		return fmt.Errorf("cancel reported success but status check failed: %w", statusErr)
 	}
-	switch execution.NormalizeOrderStatus(status.Status) {
+	switch execution.NormalizeOrderStatusForTimeInForce(status.Status, timeInForce) {
 	case "cancelled", "rejected":
 		return nil
 	case "filled":
@@ -1391,6 +1402,21 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePric
 		terminalZero := err == nil && isTerminalZeroFill(res.Status, res.FilledQty)
 		if err == nil && !terminalZero {
 			return res, exitQty, req.IntentKey, nil
+		}
+		if terminalZero {
+			// This was a freshly submitted market exit, not the replay of an
+			// historical terminal key. It is conclusively dead, so let the
+			// caller release its claim; the next manager tick can rotate the
+			// retired durable key and submit one fresh generation.
+			return execution.OrderResult{}, 0, "", fmt.Errorf(
+				"freshly submitted trailing market exit %s finished %s without a fill",
+				req.IntentKey, res.Status,
+			)
+		}
+		if errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+			// A definitive fresh rejection is safe to release, but must not
+			// consume a chain of successor client IDs in this manager tick.
+			return execution.OrderResult{}, 0, "", err
 		}
 		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
 			return execution.OrderResult{}, 0, "", fmt.Errorf(
@@ -1475,7 +1501,7 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 				errExitClaimMustRemain, leg.BrokerOrderID, statusErr,
 			)
 		}
-		brokerStatus := execution.NormalizeOrderStatus(status.Status)
+		brokerStatus := execution.NormalizeOrderStatusForTimeInForce(status.Status, exitLegTimeInForce(leg))
 		if brokerStatus != "filled" && brokerStatus != "cancelled" && brokerStatus != "rejected" {
 			return 0, fmt.Errorf(
 				"%w: terminal exit leg %s has non-terminal broker status %s",
@@ -1542,7 +1568,8 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 			return 0, fmt.Errorf("confirm cancellation of exit leg %s: cancel=%v status=%w",
 				leg.BrokerOrderID, cancelErr, statusErr)
 		}
-		switch execution.NormalizeOrderStatus(status.Status) {
+		legStatus := execution.NormalizeOrderStatusForTimeInForce(status.Status, exitLegTimeInForce(leg))
+		switch legStatus {
 		case "cancelled", "rejected":
 			if status.FilledQty > 0 {
 				fillPrice := status.FilledPrice
@@ -1556,7 +1583,7 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 				var applied float64
 				remaining, applied, err = m.store.ApplyPartialExitAt(
 					ctx, t.ID, leg.ID, fillPrice, status.FilledQty,
-					execution.NormalizeOrderStatus(status.Status), status.FilledAt,
+					legStatus, status.FilledAt,
 				)
 				if err != nil {
 					return 0, fmt.Errorf("%w: persist partial exit-leg fill: %v",
@@ -1565,7 +1592,7 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 				_ = applied
 			} else if err := m.store.UpdateOrderFill(
 				ctx, leg.ID, status.FilledPrice, 0,
-				execution.NormalizeOrderStatus(status.Status),
+				legStatus,
 			); err != nil {
 				return 0, fmt.Errorf("persist terminal exit-leg status: %w", err)
 			}
@@ -1584,6 +1611,19 @@ func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade
 			errExitClaimMustRemain)
 	}
 	return remaining, nil
+}
+
+// exitLegTimeInForce mirrors the durable stock-order policy for the one path
+// that must cancel existing protection before placing a market exit. A GTC
+// bracket leg reported as done_for_day is still live and must fail closed.
+func exitLegTimeInForce(leg store.Order) string {
+	if leg.ParentOrderID != "" && (leg.IsStopLoss || leg.IsTakeProfit) {
+		return "gtc"
+	}
+	if leg.IsStopLoss && (leg.OrderType == "stop" || leg.OrderType == "stop_limit") && math.Abs(leg.Quantity-math.Trunc(leg.Quantity)) <= 1e-9 {
+		return "gtc"
+	}
+	return "day"
 }
 
 // brokerTickDecimals returns the price-tick precision for the ticker. US

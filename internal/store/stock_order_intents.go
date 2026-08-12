@@ -89,6 +89,37 @@ func ResolveStockOrderIntentRetryGeneration(ctx context.Context, baseKey string)
 	return nil, "", fmt.Errorf("stock order intent retry lineage exceeds %d generations from %q", maxStockOrderIntentRetryGenerations, baseKey)
 }
 
+// ResolveTerminalPartialStockOrderIntentRetryGeneration advances only a
+// terminal market-exit generation that already applied some fill. The residual
+// position is a distinct broker order and therefore cannot reuse the original
+// immutable payload or client id.
+func ResolveTerminalPartialStockOrderIntentRetryGeneration(ctx context.Context, baseKey string) (string, error) {
+	key := baseKey
+	for generation := 0; generation < maxStockOrderIntentRetryGenerations; generation++ {
+		intent, err := GetStockOrderIntentByKey(ctx, key)
+		if err != nil {
+			return "", err
+		}
+		if intent == nil || !isTerminalPartialStockOrderIntent(intent) {
+			return key, nil
+		}
+		identity := intent.BrokerOrderID
+		if identity == "" {
+			identity = "intent-" + intent.ID
+		}
+		nextKey := StockOrderIntentRetryKey(intent.IdempotencyKey, identity)
+		next, err := GetStockOrderIntentByKey(ctx, nextKey)
+		if err != nil {
+			return "", err
+		}
+		if next == nil {
+			return nextKey, nil
+		}
+		key = next.IdempotencyKey
+	}
+	return "", fmt.Errorf("stock order intent terminal partial retry lineage exceeds %d generations from %q", maxStockOrderIntentRetryGenerations, baseKey)
+}
+
 // StockOrderIntentRetryKey advances a terminal generation without ever
 // reusing its client id.
 func StockOrderIntentRetryKey(previousKey, terminalBrokerOrderID string) string {
@@ -97,6 +128,11 @@ func StockOrderIntentRetryKey(previousKey, terminalBrokerOrderID string) string 
 
 func isTerminalZeroFillStockOrderIntent(intent *StockOrderIntent) bool {
 	return intent != nil && intent.FilledQty <= 0 && (intent.Status == "cancelled" || intent.Status == "rejected" || intent.Status == "expired")
+}
+
+func isTerminalPartialStockOrderIntent(intent *StockOrderIntent) bool {
+	return intent != nil && intent.FilledQty > 0 && intent.FilledQty < intent.RequestedQty-0.000000001 &&
+		(intent.Status == "cancelled" || intent.Status == "rejected" || intent.Status == "expired")
 }
 
 func CreateStockOrderIntent(ctx context.Context, in StockOrderIntent) error {
@@ -149,26 +185,44 @@ func UpsertBracketChildIntent(ctx context.Context, parentIntentID, tradeID, tick
 	payload, err := json.Marshal(map[string]any{
 		"parent_intent_id": parentIntentID, "role": role, "ticker": ticker,
 		"broker_order_id": brokerOrderID, "order_type": orderType,
-		"requested_qty": quantity, "price": price,
+		"requested_qty": quantity, "price": price, "time_in_force": "gtc",
 	})
 	if err != nil {
 		return "", err
 	}
 	var id string
 	err = GetDB().QueryRow(ctx, `
-		INSERT INTO stock_order_intents (
+		WITH RECURSIVE upserted AS (
+			INSERT INTO stock_order_intents (
 			id, idempotency_key, client_order_id, trade_id, parent_intent_id,
 			ticker, side, order_type, requested_qty, request_payload, payload_hash,
 			broker_order_id, status, submitted_at, purpose
-		) VALUES (
+			) VALUES (
 			uuid_generate_v4(), $1, $2, NULLIF($3,'')::uuid, $4::uuid,
 			$5, 'sell', $6::order_type, $7, $8::jsonb, $9,
 			$10, 'pending', NOW(), 'broker_projection'
+			)
+			ON CONFLICT (idempotency_key) DO UPDATE
+			SET trade_id=COALESCE(stock_order_intents.trade_id, EXCLUDED.trade_id),
+			    updated_at=NOW()
+			RETURNING id
+		), lineage(id, depth) AS (
+			SELECT id, 0 FROM upserted
+			UNION ALL
+			SELECT child.id, lineage.depth + 1
+			FROM stock_order_intents child
+			JOIN lineage ON child.parent_intent_id=lineage.id
+		), active_lineage AS (
+			SELECT lineage.id
+			FROM lineage
+			JOIN orders ON orders.stock_intent_id=lineage.id
+			ORDER BY lineage.depth DESC
+			LIMIT 1
 		)
-		ON CONFLICT (idempotency_key) DO UPDATE
-		SET broker_order_id=EXCLUDED.broker_order_id,
-		    trade_id=EXCLUDED.trade_id, updated_at=NOW()
-		RETURNING id`,
+		SELECT COALESCE(
+			(SELECT id FROM active_lineage),
+			(SELECT id FROM upserted)
+		)`,
 		key, key, tradeID, parentIntentID, ticker, orderType, quantity,
 		string(payload), key, brokerOrderID,
 	).Scan(&id)
@@ -181,6 +235,24 @@ func RecordStockOrderAttempt(ctx context.Context, intentID, operation, outcome, 
         VALUES ($1::uuid,$2,$3,NULLIF($4,''),NULLIF($5,''),NULLIF($6,''))`,
 		intentID, operation, outcome, brokerOrderID, requestID, errText)
 	return err
+}
+
+// HasAmbiguousStockOrderAttempt reports whether the most recent replacement
+// submission has an unknown outcome. The pre-submission marker is written
+// before PATCH, so a process/database failure after the broker request cannot
+// erase the fact that the predecessor may already have been replaced.
+func HasAmbiguousStockOrderAttempt(ctx context.Context, intentID string) (bool, error) {
+	var found bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT COALESCE((
+			SELECT outcome IN ('submitting','ambiguous')
+			FROM stock_order_attempts
+			WHERE intent_id=$1::uuid
+			  AND operation IN ('replace_submission','replace')
+			ORDER BY created_at DESC, id DESC
+			LIMIT 1
+		), FALSE)`, intentID).Scan(&found)
+	return found, err
 }
 
 func GetStockOrderIntentByBrokerOrderID(ctx context.Context, brokerOrderID string) (*StockOrderIntent, error) {
@@ -199,14 +271,73 @@ func GetStockOrderIntentByBrokerOrderID(ctx context.Context, brokerOrderID strin
 	return &in, rows.Err()
 }
 
+// ListUnprojectedStockStopIntents returns durable stops whose broker state was
+// recorded before their local order row. Positive fills sort first so recovery
+// reduces the trade before deciding whether residual fallback protection is
+// needed; accepted working stops are then projected instead of duplicated.
+func ListUnprojectedStockStopIntents(ctx context.Context, tradeID string) ([]StockOrderIntent, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT i.idempotency_key
+		FROM stock_order_intents i
+		WHERE i.trade_id=$1::uuid
+		  AND i.purpose='submit'
+		  AND i.side='sell'
+		  AND i.order_type IN ('stop','stop_limit')
+		  AND (
+		      i.status IN ('pending','partial')
+		      OR (i.status IN ('filled','cancelled','rejected') AND i.filled_qty > 0.000000001)
+		  )
+		  AND NOT EXISTS (
+			  SELECT 1 FROM orders o WHERE o.stock_intent_id=i.id
+		  )
+		ORDER BY CASE WHEN i.filled_qty > 0.000000001 THEN 0 ELSE 1 END,
+		         i.created_at`, tradeID)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	out := make([]StockOrderIntent, 0, len(keys))
+	for _, key := range keys {
+		intent, err := GetStockOrderIntentByKey(ctx, key)
+		if err != nil {
+			return nil, err
+		}
+		if intent != nil {
+			out = append(out, *intent)
+		}
+	}
+	return out, nil
+}
+
 func UpdateStockOrderIntentBroker(ctx context.Context, clientOrderID, brokerOrderID, status string, filledPrice, filledQty float64, requestID, errText string, submitted bool) error {
 	_, err := GetDB().Exec(ctx, `
         UPDATE stock_order_intents
         SET broker_order_id=COALESCE(NULLIF($2,''), broker_order_id),
-            -- Error-only attempt records carry an empty broker result. Keep
-            -- the last observed lifecycle and cumulative fill rather than
-            -- regressing a durable partial fill to pending/zero.
-            status=CASE WHEN $7 <> '' AND $3 IN ('pending','partial') AND $2='' AND $4::numeric IS NULL AND $5=0 THEN status ELSE $3::order_status END,
+		    -- Lifecycle snapshots can arrive out of order. Once terminal, an
+		    -- intent must never be regressed by an older working snapshot; a
+		    -- later terminal snapshot is still allowed to record the broker's
+		    -- final outcome (for example, a cancellation that raced a fill).
+		    status=CASE
+		        WHEN status IN ('filled','cancelled','rejected') AND $3 IN ('pending','partial') THEN status
+		        -- Error-only attempt records carry an empty broker result. Keep
+		        -- the last observed lifecycle and cumulative fill rather than
+		        -- regressing a durable partial fill to pending/zero.
+		        WHEN $7 <> '' AND $3 IN ('pending','partial') AND $2='' AND $4::numeric IS NULL AND $5=0 THEN status
+		        ELSE $3::order_status
+		    END,
             filled_price=CASE
                 WHEN $4 IS NULL THEN filled_price
                 WHEN $5 < filled_qty THEN filled_price
@@ -234,29 +365,117 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
         WHERE purpose='submit' AND (
               status IN ('pending','partial')
            OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND idempotency_key LIKE 'entry:%'
-               AND NOT EXISTS (
-                   SELECT 1 FROM orders o
-                   JOIN trades t ON t.id=o.trade_id
-                   WHERE o.stock_intent_id=stock_order_intents.id
-                     AND o.trade_id=stock_order_intents.trade_id
-                     AND t.stock_intent_id=stock_order_intents.id
-                     AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
-               ))
-           -- A terminal zero-fill entry can still have an order-only row from
-           -- a crash between acceptance and terminal polling. Select it once
-           -- to persist the terminal order status, then it is complete.
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM orders o
+                       JOIN trades t ON t.id=o.trade_id
+                       WHERE o.stock_intent_id=stock_order_intents.id
+                         AND o.trade_id=stock_order_intents.trade_id
+                         AND t.stock_intent_id=stock_order_intents.id
+                         AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
+                   )
+                   -- Bracket children are broker-created projections, so only
+                   -- their durable parent can restore a child row that was
+                   -- lost after the parent projection otherwise completed.
+	                   OR (
+	                       COALESCE(stock_order_intents.request_payload->>'OrderClass','') = 'bracket'
+                       AND (
+                           SELECT COUNT(*)
+                           FROM stock_order_intents child
+                           WHERE child.parent_intent_id=stock_order_intents.id
+                             AND child.purpose='broker_projection'
+                             AND EXISTS (
+                                 WITH RECURSIVE replacement_lineage(id) AS (
+                                     SELECT child.id
+                                     UNION ALL
+                                     SELECT replacement.id
+                                     FROM stock_order_intents replacement
+                                     JOIN replacement_lineage lineage ON lineage.id=replacement.parent_intent_id
+                                 )
+                                 SELECT 1 FROM orders child_order
+                                 JOIN replacement_lineage lineage ON lineage.id=child_order.stock_intent_id
+                             )
+                       ) < 2
+	                   )
+	                   -- An uncapped entry is not complete until its standalone
+	                   -- protective stop covers the durable position. Without
+	                   -- this, a crash after the entry projection but before stop
+	                   -- submission would leave a live position unprotected.
+	                   OR (
+	                       COALESCE(stock_order_intents.request_payload->>'UncappedTakeProfit','false') = 'true'
+	                       AND EXISTS (
+	                           SELECT 1 FROM trades protected_trade
+	                           WHERE protected_trade.id=stock_order_intents.trade_id
+	                             AND protected_trade.status='open'
+	                       )
+	                       AND NOT EXISTS (
+	                           SELECT 1 FROM orders stop_order
+	                           JOIN trades protected_trade ON protected_trade.id=stop_order.trade_id
+	                           WHERE stop_order.trade_id=stock_order_intents.trade_id
+	                             AND stop_order.is_stop_loss
+	                             AND stop_order.order_type IN ('stop','stop_limit')
+	                             AND stop_order.status IN ('pending','partial')
+	                             AND ABS(stop_order.quantity-protected_trade.quantity) <= 0.000000001
+	                             -- A trailing manager may already have ratcheted
+	                             -- the sell stop above the immutable policy floor.
+	                             -- That is stronger protection, not a mismatch.
+	                             AND stop_order.stop_price >= COALESCE(NULLIF(stock_order_intents.request_payload->>'PolicyStopLoss','')::numeric,0) - 0.000000001
+	                       )
+	                   )
+	                   -- A completed fill must also finish the signal lifecycle.
+	                   -- Keep the intent selectable if a crash happened after its
+	                   -- projections but before that final update.
+	                   OR NOT EXISTS (
+	                       SELECT 1 FROM signals signal
+	                       WHERE signal.id::text=substring(stock_order_intents.idempotency_key from 7)
+	                         AND signal.status='executed'
+	                   )
+	               ))
+           -- A terminal zero-fill entry can have no projection at all, or an
+           -- order-only row, after a crash between acceptance and terminal
+           -- polling. Select it once to reject the signal and persist the
+           -- terminal order status when present.
            OR (status IN ('cancelled','rejected') AND filled_qty <= 0.000000001
-               AND idempotency_key LIKE 'entry:%' AND EXISTS (
-                   SELECT 1 FROM orders o
-                   WHERE o.stock_intent_id=stock_order_intents.id
-                     AND o.status IN ('pending','partial')
+               AND idempotency_key LIKE 'entry:%'
+               -- A locally definitive rejection has no broker order to project;
+               -- only a broker-identified terminal order can be the crash case.
+               AND broker_order_id IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM signals signal
+                   WHERE signal.id::text=substring(stock_order_intents.idempotency_key from 7)
+                     AND signal.status='rejected'
+               )
+               AND (
+                   NOT EXISTS (
+                       SELECT 1 FROM orders o
+                       WHERE o.stock_intent_id=stock_order_intents.id
+                   )
+                   OR EXISTS (
+                       SELECT 1 FROM orders o
+                       WHERE o.stock_intent_id=stock_order_intents.id
+                         AND o.status IN ('pending','partial')
+                   )
                ))
            -- A filled exit stays recoverable only until every required
            -- projection is present, its cumulative fill is durably applied,
            -- and its trade is terminal. Aggregate analyst exits have one
            -- order row per claimed lot, so completion is based on their
            -- aggregate allocation and every linked lot rather than one row.
-           OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND order_type='market' AND (
+           OR (status IN ('filled','cancelled','rejected')
+               AND (filled_qty > 0 OR (
+                   status IN ('cancelled','rejected') AND filled_qty <= 0.000000001
+	                   -- A locally definitive rejection has no broker order
+	                   -- to recover. Replaying it after its caller rotates a
+	                   -- successor could create a second live exit.
+	                   AND COALESCE(broker_order_id,'') <> ''
+                   -- Once a successor exists it owns the same claimed lots;
+                   -- never reopen the retired generation after rotation.
+                   AND NOT EXISTS (
+                       SELECT 1 FROM stock_order_intents newer
+                       WHERE newer.idempotency_key LIKE stock_order_intents.idempotency_key || ':retry:%'
+                   )
+               ))
+               AND order_type='market' AND (
                   idempotency_key LIKE 'software-exit:%'
                OR idempotency_key LIKE 'trailing-market-exit:%'
                OR idempotency_key LIKE 'analyst-exit:%'
@@ -270,18 +489,23 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                      AND (stock_order_intents.filled_qty < stock_order_intents.requested_qty - 0.000000001 OR t.status='closed')
                ))
                OR
-               (trade_id IS NULL AND (
-                   NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id)
+	               (trade_id IS NULL AND (
+	                   NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id)
                    OR COALESCE((SELECT SUM(COALESCE(o.filled_qty,0)) FROM orders o WHERE o.stock_intent_id=stock_order_intents.id),0)
                         < stock_order_intents.filled_qty - 0.000000001
                    OR (stock_order_intents.filled_qty >= stock_order_intents.requested_qty - 0.000000001 AND EXISTS (
                        SELECT 1 FROM orders o
                        JOIN trades t ON t.id=o.trade_id
                        WHERE o.stock_intent_id=stock_order_intents.id
-                         AND (COALESCE(o.filled_qty,0) < o.quantity - 0.000000001 OR t.status <> 'closed')
-                   ))
-               ))
-           ))
+	                         AND (COALESCE(o.filled_qty,0) < o.quantity - 0.000000001 OR t.status <> 'closed')
+	                   ))
+	               ))
+	               OR (trade_id IS NULL AND idempotency_key LIKE 'analyst-exit:%' AND NOT EXISTS (
+	                   SELECT 1 FROM signals signal
+	                   WHERE signal.id::text=split_part(stock_order_intents.idempotency_key, ':', 2)
+	                     AND signal.status IN ('executed','rejected')
+	               ))
+	           ))
            OR (status IN ('filled','cancelled','rejected') AND filled_qty > 0 AND order_type='stop' AND trade_id IS NOT NULL
                AND NOT EXISTS (
                    SELECT 1 FROM orders o
@@ -289,7 +513,11 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    WHERE o.stock_intent_id=stock_order_intents.id
                      AND o.trade_id=stock_order_intents.trade_id
                      AND COALESCE(o.filled_qty,0) >= stock_order_intents.filled_qty - 0.000000001
-                     AND (stock_order_intents.filled_qty < stock_order_intents.requested_qty - 0.000000001 OR t.status='closed')
+	                     -- A terminal partial stop cannot protect a residual
+	                     -- position. Keep it recoverable while its exit claim
+	                     -- is still held, so a transient failure after applying
+	                     -- the fill can retry ReleaseTradeExitClaim.
+                     AND ((stock_order_intents.filled_qty < stock_order_intents.requested_qty - 0.000000001 AND t.status='open') OR t.status='closed')
                ))
            -- Same order-only completion rule for DAY/fractional standalone
            -- stops. done_for_day is normalized to cancelled before storage.
@@ -317,6 +545,45 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
 		out = append(out, in)
 	}
 	return out, rows.Err()
+}
+
+// GetWorkingStockEntryReservations returns accepted-or-ambiguous entries that
+// have not yet been projected to a trade.  They are deliberately represented
+// as in-memory long positions for entry risk checks: a zero-fill market order
+// is not a holding, but it can fill at any time and must consume the same
+// position capacity until broker truth makes it terminal or recovery creates
+// its durable trade projection.
+func GetWorkingStockEntryReservations(ctx context.Context) ([]Trade, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT ticker, side, requested_qty,
+		       COALESCE(NULLIF(request_payload->>'ReferencePrice','')::numeric, 0)
+		FROM stock_order_intents
+		WHERE purpose='submit'
+		  AND idempotency_key LIKE 'entry:%'
+		  AND trade_id IS NULL
+		  AND status IN ('pending','partial')
+		ORDER BY created_at`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var reservations []Trade
+	for rows.Next() {
+		var ticker, side string
+		var quantity, referencePrice float64
+		if err := rows.Scan(&ticker, &side, &quantity, &referencePrice); err != nil {
+			return nil, err
+		}
+		direction := "long"
+		if side == "sell" {
+			direction = "short"
+		}
+		reservations = append(reservations, Trade{
+			Ticker: ticker, Direction: direction, Quantity: quantity, EntryPrice: referencePrice, Status: "open",
+		})
+	}
+	return reservations, rows.Err()
 }
 
 func purposeOrSubmit(purpose string) string {

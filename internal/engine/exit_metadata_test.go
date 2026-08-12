@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/events"
+	"github.com/romeo-folie/trade-engine/internal/portfolio"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -40,5 +42,31 @@ func TestPublishTradeClosedUsesCommittedTransitionAsEventGate(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("committed close transition emitted no event")
+	}
+}
+
+func TestRecoveredStockExitRestoresCloseEffects(t *testing.T) {
+	bus := events.New()
+	tracker := portfolio.NewTracker(time.Hour)
+	engine := &Engine{bus: bus, portfolio: tracker}
+	sub := bus.Subscribe(events.TradeClosed)
+	defer bus.Unsubscribe(sub)
+
+	engine.RecoveredStockExit(context.Background(), store.TradeRealization{
+		TradeID: "recovered-close", Ticker: "RCV", Direction: "long",
+		EntryPrice: 100, ExitPrice: 95, PnL: -5, PnLPct: -5,
+		JustClosed: true,
+	})
+	if tracker.CurrentState().LastLossAt.IsZero() {
+		t.Fatal("recovered losing close did not record the loss cooldown")
+	}
+	select {
+	case event := <-sub.C:
+		payload, ok := event.Payload.(events.TradeClosedPayload)
+		if !ok || payload.TradeID != "recovered-close" {
+			t.Fatalf("recovered close event=%#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovered close did not publish TradeClosed")
 	}
 }

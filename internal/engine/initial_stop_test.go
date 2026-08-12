@@ -133,7 +133,12 @@ func TestMonitorPositionsRotatesTerminalSoftwareExitGenerations(t *testing.T) {
 		t.Fatal(err)
 	}
 	e := newBracketTestEngine(coordinator)
-	e.monitorPositions(ctx)
+	// Each monitor tick may submit at most one fresh generation. Persistent
+	// terminal broker responses are paced across ticks rather than consuming
+	// an unbounded retry lineage in one scheduling cycle.
+	for attempt := 0; attempt < 3 && len(broker.posts) < 4; attempt++ {
+		e.monitorPositions(ctx)
+	}
 
 	if got := len(broker.posts); got != 4 {
 		t.Fatalf("market-exit submissions=%d, want terminal generations plus live fill", got)
@@ -167,6 +172,28 @@ func TestMonitorPositionsRotatesTerminalSoftwareExitGenerations(t *testing.T) {
 	e.monitorPositions(ctx)
 	if got := len(broker.posts); got != 4 {
 		t.Fatalf("closed trade replayed market exit: %d submissions", got)
+	}
+}
+
+func TestMarketExitFreshDefinitiveRejectionWaitsForNextTick(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	broker := &marketExitGenerationBroker{
+		statuses: []string{"accepted"},
+		err:      &execution.BrokerRequestError{StatusCode: 422, Message: "market exit rejected"},
+	}
+	coordinator := stockorders.New(broker)
+	e := newBracketTestEngine(coordinator)
+	_, _, terminalZero, err := e.placeMarketExitWithTerminalRetries(context.Background(), execution.OrderRequest{
+		Ticker: "FRESHREJECT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+		Quantity: 1, IntentKey: "software-exit:fresh-rejection:take-profit",
+	})
+	if !terminalZero || !errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+		t.Fatalf("fresh definitive exit result terminal=%v err=%v", terminalZero, err)
+	}
+	if len(broker.posts) != 1 {
+		t.Fatalf("fresh definitive exit submissions=%d, want one", len(broker.posts))
 	}
 }
 
@@ -385,6 +412,49 @@ func TestEnsureUncappedProtectiveStopFollowsTerminalGenerations(t *testing.T) {
 	var linkedIntent string
 	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*), COALESCE(MAX(stock_intent_id::text),'') FROM orders WHERE trade_id=$1::uuid AND status='pending'`, tradeID).Scan(&rows, &linkedIntent); err != nil || rows != 1 || linkedIntent != active.ID {
 		t.Fatalf("live protective rows=%d intent=%q err=%v, want one linked to %q", rows, linkedIntent, err, active.ID)
+	}
+}
+
+type definitiveStopRejector struct{ calls int }
+
+func (b *definitiveStopRejector) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+	b.calls++
+	return execution.OrderResult{}, &execution.BrokerRequestError{StatusCode: 422, Message: "invalid protective stop"}
+}
+func (*definitiveStopRejector) CancelOrder(context.Context, string) error { return nil }
+func (*definitiveStopRejector) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+func (*definitiveStopRejector) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*definitiveStopRejector) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*definitiveStopRejector) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
+
+func TestEnsureUncappedProtectiveStopDoesNotRetryFreshDefinitiveRejection(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: "UCREJECT", Direction: "long", Strategy: "momentum", EntryPrice: 100, Quantity: 5, StopLoss: 95, Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := &definitiveStopRejector{}
+	e := newBracketTestEngine(stockorders.New(broker))
+	if err := e.ensureUncappedProtectiveStop(ctx, tradeID, "UCREJECT", 5, 95); err == nil {
+		t.Fatal("fresh definitive rejection unexpectedly succeeded")
+	}
+	if got := broker.calls; got != 1 {
+		t.Fatalf("fresh definitive rejection submitted %d stops, want one", got)
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, protectiveStopIntentKey(tradeID, 95, 5))
+	if err != nil || intent == nil || intent.Status != "rejected" {
+		t.Fatalf("rejected protective intent=%#v err=%v", intent, err)
 	}
 }
 
@@ -666,6 +736,11 @@ func TestRollbackUnrecordedProtectiveStop(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "GTC done-for-day remains working",
+			status:  execution.OrderResult{Status: "done_for_day"},
+			wantErr: true,
+		},
+		{
 			name:    "order filled during rollback",
 			status:  execution.OrderResult{Status: "filled"},
 			wantErr: true,
@@ -682,7 +757,7 @@ func TestRollbackUnrecordedProtectiveStop(t *testing.T) {
 			if tt.statusErr != nil {
 				exec.statusErr["stop-1"] = tt.statusErr
 			}
-			_, err := rollbackUnrecordedProtectiveStop(context.Background(), exec, "stop-1")
+			_, err := rollbackUnrecordedProtectiveStop(context.Background(), exec, "stop-1", "gtc")
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("rollback error = %v, wantErr %v", err, tt.wantErr)
 			}

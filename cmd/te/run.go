@@ -168,6 +168,9 @@ Modes:
 		}
 		broker = protectDryRunStockExecutor(broker, runDryRun || cfg.Engine.DryRun)
 		eng := engine.New(cfg, marketProvider, newsProvider, broker, mode)
+		if coordinator, ok := broker.(*stockorders.Coordinator); ok {
+			coordinator.SetRecoveryObserver(eng)
+		}
 
 		// Tag portfolio snapshots with mode (live/paper) and broker name (Phase 18).
 		portfolioMode := "paper"
