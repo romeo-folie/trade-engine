@@ -323,8 +323,23 @@ func isRecoveredMarketExitKey(key string) bool {
 }
 
 func analystExitSignalID(key, ticker string) (string, bool) {
-	parts := strings.SplitN(strings.TrimPrefix(key, "analyst-exit:"), ":", 2)
-	return parts[0], len(parts) == 2 && parts[0] != "" && parts[1] == ticker
+	key, ok := strings.CutPrefix(key, "analyst-exit:")
+	if !ok || ticker == "" {
+		return "", false
+	}
+	parts := strings.Split(key, ":")
+	if len(parts) < 2 || parts[0] == "" || parts[1] != ticker {
+		return "", false
+	}
+	// Terminal zero-fill retries append `:retry:<terminal identity>` to the
+	// preceding immutable key. Accept any number of complete generations, but
+	// never attribute a malformed suffix to this signal's claimed lots.
+	for i := 2; i < len(parts); i += 2 {
+		if i+1 >= len(parts) || parts[i] != "retry" || parts[i+1] == "" {
+			return "", false
+		}
+	}
+	return parts[0], true
 }
 
 // projectRecoveredMarketExitAllocation completes one durable exit-order link

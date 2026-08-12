@@ -1093,6 +1093,83 @@ func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T
 	}
 }
 
+func TestStockIntentRecoveryProjectsAcceptedAnalystExitRetryGeneration(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	ticker := "RINTENTANALYSTRETRYRECOVERY"
+	signalID := insertRecoverySignal(t, ticker)
+	tradeA, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tradeB, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: ticker, Direction: "long", Strategy: "test", EntryPrice: 101, Quantity: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := store.ExitIntent{Reason: store.ExitReasonSellSignal, Evidence: json.RawMessage(fmt.Sprintf(`{"signal_id":%q}`, signalID))}
+	for _, tradeID := range []string{tradeA, tradeB} {
+		if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, claim); err != nil || !claimed {
+			t.Fatalf("claim aggregate exit %s = %v, %v", tradeID, claimed, err)
+		}
+	}
+
+	baseKey := "analyst-exit:" + signalID + ":" + ticker
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "analyst-base", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	baseReq := execution.OrderRequest{Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, IntentKey: baseKey}
+	if _, err := coordinator.PlaceOrder(ctx, baseReq); err != nil {
+		t.Fatal(err)
+	}
+	base := intentForKey(t, baseKey)
+	broker.lookup[base.ClientOrderID] = execution.OrderResult{BrokerOrderID: "analyst-base", Status: "cancelled"}
+	if _, err := coordinator.PlaceOrder(ctx, baseReq); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+		t.Fatalf("terminal base result=%v, want ErrTerminalZeroFillPlacement", err)
+	}
+	_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, baseKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retryKey == baseKey {
+		t.Fatal("terminal analyst exit did not advance to a retry key")
+	}
+
+	// The retry is accepted, but the process dies before the engine can create
+	// any claimed-lot order rows. Recovery must attribute its retry lineage to
+	// the original signal and project the aggregate fill exactly once.
+	broker.postRes = execution.OrderResult{BrokerOrderID: "analyst-retry", Status: "accepted"}
+	retryReq := baseReq
+	retryReq.IntentKey, retryReq.ClientOrderID = retryKey, ""
+	if _, err := coordinator.PlaceOrder(ctx, retryReq); err != nil {
+		t.Fatalf("submit accepted analyst retry: %v", err)
+	}
+	retry := intentForKey(t, retryKey)
+	if got := countForIntent(t, "orders", retry.ID); got != 0 {
+		t.Fatalf("accepted retry unexpectedly projected %d orders", got)
+	}
+	broker.lookup[retry.ClientOrderID] = execution.OrderResult{BrokerOrderID: "analyst-retry", Status: "filled", FilledPrice: 108, FilledQty: 5}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("recover accepted analyst retry: %v", err)
+	}
+	for tradeID, wantQty := range map[string]float64{tradeA: 2, tradeB: 3} {
+		order, err := store.GetOrderByStockIntentAndTrade(ctx, retry.ID, tradeID)
+		if err != nil || order == nil || order.FilledQty != wantQty || order.FilledPrice != 108 {
+			t.Fatalf("retry allocation for %s = %#v, %v; want %v @ 108", tradeID, order, err, wantQty)
+		}
+	}
+	if isRecoverableIntent(t, retry.ID) {
+		t.Fatal("fully allocated analyst retry remained recoverable")
+	}
+	beforeLookups, beforeAttempts, beforeOrders := broker.lookups, countStockIntentAttempts(t, retry.ID), countForIntent(t, "orders", retry.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatalf("replay accepted analyst retry recovery: %v", err)
+	}
+	if broker.lookups != beforeLookups || countStockIntentAttempts(t, retry.ID) != beforeAttempts || countForIntent(t, "orders", retry.ID) != beforeOrders {
+		t.Fatal("completed analyst retry recovery replayed its broker lookup, attempt, or allocation")
+	}
+}
+
 func TestStockIntentRecoveryRepairsSparseAggregateAnalystExitProjections(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
