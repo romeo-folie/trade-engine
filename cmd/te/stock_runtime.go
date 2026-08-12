@@ -3,11 +3,14 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
 )
 
 type runtimeOverrideLookup func(context.Context, string) (string, bool, error)
+
+const preflightDBTimeout = 5 * time.Second
 
 // resolveRunMode applies the documented YAML → DB → CLI precedence for the
 // engine mode. Stock environment selection stays in markets.stocks.paper.
@@ -24,6 +27,13 @@ func resolveRunMode(ctx context.Context, yamlMode, cliMode string, lookup runtim
 		mode = cliMode
 	}
 	return mode, nil
+}
+
+// resolvePreflightMode keeps the optional database override lookup inside the
+// preflight database deadline. A connected-but-stalled database must not delay
+// the independent Alpaca account request indefinitely.
+func resolvePreflightMode(ctx context.Context, yamlMode string, lookup runtimeOverrideLookup) (string, error) {
+	return resolveRunMode(ctx, yamlMode, "", lookup)
 }
 
 // protectDryRunStockExecutor applies only to the shared Alpaca stock broker

@@ -30,6 +30,34 @@ func TestRuntimeOverridePrecedence(t *testing.T) {
 	}
 }
 
+func TestResolvePreflightModeBoundsDatabaseOverrideLookup(t *testing.T) {
+	dbCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	mode, err := resolvePreflightMode(dbCtx, "manual", func(ctx context.Context, key string) (string, bool, error) {
+		if key != "engine.mode" {
+			t.Fatalf("override key = %q, want engine.mode", key)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) <= 0 || time.Until(deadline) > time.Second {
+			t.Fatalf("lookup context deadline = %v (ok=%t), want active bounded deadline", deadline, ok)
+		}
+		return "auto", true, nil
+	})
+	if err != nil || mode != "auto" {
+		t.Fatalf("resolvePreflightMode = %q, %v; want auto, nil", mode, err)
+	}
+}
+
+func TestResolvePreflightModePreservesConnectedDatabaseLookupErrors(t *testing.T) {
+	want := context.DeadlineExceeded
+	_, err := resolvePreflightMode(context.Background(), "manual", func(context.Context, string) (string, bool, error) {
+		return "", false, want
+	})
+	if !errors.Is(err, want) {
+		t.Fatalf("resolvePreflightMode error = %v, want wrapping %v", err, want)
+	}
+}
+
 func TestProtectDryRunStockExecutorWrapsEveryAlpacaStockMode(t *testing.T) {
 	broker := execution.NewPaperExecutor()
 	for _, mode := range []string{"manual", "auto", "paper", "orb", "orb-newyork"} {

@@ -59,14 +59,14 @@ func runStocksPreflight(_ *cobra.Command, _ []string) error {
 	// DB availability must not consume the account API's timeout budget. Connect
 	// is globally synchronized and cleans up a failed candidate itself, so use a
 	// bounded independent context before creating the broker request context.
-	dbCtx, cancelDB := context.WithTimeout(context.Background(), 5*time.Second)
+	dbCtx, cancelDB := context.WithTimeout(context.Background(), preflightDBTimeout)
 	var lookup runtimeOverrideLookup
 	if err := store.Connect(dbCtx); err == nil {
 		defer store.Close()
 		lookup = store.GetOverride
 	}
+	mode, err := resolvePreflightMode(dbCtx, cfg.Engine.Mode, lookup)
 	cancelDB()
-	mode, err := resolveRunMode(context.Background(), cfg.Engine.Mode, "", lookup)
 	if err != nil {
 		return err
 	}
