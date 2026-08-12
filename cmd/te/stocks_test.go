@@ -69,6 +69,16 @@ func TestAlpacaBrokerViewSurvivesDryRunWrapping(t *testing.T) {
 	}
 }
 
+func TestDryRunAlpacaRetainsOptionDataForOptionsORB(t *testing.T) {
+	dryRun := protectDryRunStockExecutor(execution.NewAlpacaBroker(config.StocksConfig{}), true)
+	if _, ok := dryRun.(interface {
+		GetOptionChain(context.Context, string, execution.OptionChainFilter) ([]execution.OptionSnapshot, error)
+		GetOptionSnapshots(context.Context, []string) ([]execution.OptionSnapshot, error)
+	}); !ok {
+		t.Fatal("dry-run Alpaca no longer exposes read-only option data needed by options-ORB")
+	}
+}
+
 type preflightSpy struct {
 	account execution.BrokerAccount
 	err     error

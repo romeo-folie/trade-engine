@@ -1368,8 +1368,12 @@ func wireOptionsORB(scheduler *orb.ORBScheduler, optCfg config.OptionsORBConfig,
 	if !optCfg.Enabled {
 		return
 	}
-	if ab, ok := broker.(*execution.AlpacaBroker); ok {
-		scheduler.SetupOptionsORB(optCfg, ab)
+	optionData, ok := broker.(interface {
+		GetOptionChain(context.Context, string, execution.OptionChainFilter) ([]execution.OptionSnapshot, error)
+		GetOptionSnapshots(context.Context, []string) ([]execution.OptionSnapshot, error)
+	})
+	if ok {
+		scheduler.SetupOptionsORB(optCfg, optionData, optionData, broker)
 		logger.Info("options-ORB enabled",
 			"underlyings", optCfg.Underlyings, "premium_budget", optCfg.PremiumBudget)
 	} else {

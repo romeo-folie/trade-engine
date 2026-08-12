@@ -9,6 +9,8 @@ import (
 type readOnlySpy struct {
 	accountCalls int
 	ordersCalls  int
+	chainCalls   int
+	snapCalls    int
 }
 
 func (*readOnlySpy) PlaceOrder(context.Context, OrderRequest) (OrderResult, error) {
@@ -32,6 +34,14 @@ func (*readOnlySpy) RecentFills(context.Context) ([]BrokerOrder, error) { return
 func (s *readOnlySpy) GetWorkingOrders(context.Context) ([]WorkingOrder, error) {
 	s.ordersCalls++
 	return []WorkingOrder{{OrderID: "read-only"}}, nil
+}
+func (s *readOnlySpy) GetOptionChain(context.Context, string, OptionChainFilter) ([]OptionSnapshot, error) {
+	s.chainCalls++
+	return []OptionSnapshot{{OCCSymbol: "SPY260814C00500000"}}, nil
+}
+func (s *readOnlySpy) GetOptionSnapshots(context.Context, []string) ([]OptionSnapshot, error) {
+	s.snapCalls++
+	return []OptionSnapshot{{OCCSymbol: "SPY260814C00500000"}}, nil
 }
 
 func TestReadOnlyExecutorBlocksEveryBrokerMutation(t *testing.T) {
@@ -71,5 +81,13 @@ func TestReadOnlyExecutorForwardsBrokerReads(t *testing.T) {
 	orders, err := lister.GetWorkingOrders(context.Background())
 	if err != nil || len(orders) != 1 || inner.ordersCalls != 1 {
 		t.Fatalf("GetWorkingOrders = %+v, %v (calls=%d)", orders, err, inner.ordersCalls)
+	}
+	chain, err := readOnly.GetOptionChain(context.Background(), "SPY", OptionChainFilter{})
+	if err != nil || len(chain) != 1 || inner.chainCalls != 1 {
+		t.Fatalf("GetOptionChain = %+v, %v (calls=%d)", chain, err, inner.chainCalls)
+	}
+	snaps, err := readOnly.GetOptionSnapshots(context.Background(), []string{"SPY260814C00500000"})
+	if err != nil || len(snaps) != 1 || inner.snapCalls != 1 {
+		t.Fatalf("GetOptionSnapshots = %+v, %v (calls=%d)", snaps, err, inner.snapCalls)
 	}
 }
