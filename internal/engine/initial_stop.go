@@ -52,6 +52,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		}
 	}
 
+	intentKey := "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f:%.8f", stopPrice, quantity)
 	res, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:      ticker,
 		Side:        execution.OrderSideSell,
@@ -59,13 +60,13 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		Quantity:    quantity,
 		StopPrice:   stopPrice,
 		TradeID:     tradeID,
-		IntentKey:   "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f", stopPrice),
+		IntentKey:   intentKey,
 		TimeInForce: "gtc", // uncapped entries are whole-share only
 	})
 	if err != nil {
 		return fmt.Errorf("place protective stop: %w", err)
 	}
-	stockIntentID := stockIntentIDForKey(ctx, "protective-stop:"+tradeID+":"+fmt.Sprintf("%.8f", stopPrice))
+	stockIntentID := stockIntentIDForKey(ctx, intentKey)
 	status := execution.NormalizeOrderStatus(res.Status)
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {

@@ -107,7 +107,7 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 			_ = c.record(ctx, intent, "exact_replay", "accepted", res, "", true)
 			return c.finishSubmit(ctx, intent, req, res)
 		}
-		if execution.IsDefinitiveOrderRejection(replayErr) {
+		if execution.IsDefinitiveOrderRejection(replayErr) && !execution.IsDuplicateClientOrderError(replayErr) {
 			_ = c.record(ctx, intent, "exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
 			return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", replayErr)
 		}
@@ -559,7 +559,7 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 		_ = c.record(ctx, intent, "replace", "accepted", res, "", true)
 		return c.maybeProjectReplacement(ctx, intent, req, res, project)
 	}
-	if execution.IsDefinitiveOrderRejection(err) {
+	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
 		_ = c.record(ctx, intent, "replace", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", err)
 	}
@@ -578,7 +578,7 @@ func (c *Coordinator) submitReplacement(ctx context.Context, intent store.StockO
 			_ = c.record(ctx, intent, "replace_exact_replay", "accepted", res, "", true)
 			return c.maybeProjectReplacement(ctx, intent, req, res, project)
 		}
-		if execution.IsDefinitiveOrderRejection(replayErr) {
+		if execution.IsDefinitiveOrderRejection(replayErr) && !execution.IsDuplicateClientOrderError(replayErr) {
 			_ = c.record(ctx, intent, "replace_exact_replay", "rejected", execution.OrderResult{Status: "rejected"}, replayErr.Error(), true)
 			return execution.OrderResult{}, fmt.Errorf("stock stop replacement definitively rejected: %w", replayErr)
 		}
@@ -603,7 +603,14 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 	if intent.ParentIntentID == "" {
 		return res, nil
 	}
-	order, err := store.GetOrderByStockIntentID(ctx, intent.ParentIntentID)
+	order, err := store.GetOrderByStockIntentID(ctx, intent.ID)
+	if err != nil {
+		return execution.OrderResult{}, fmt.Errorf("load replacement projection: %w", err)
+	}
+	if order != nil && order.BrokerOrderID == res.BrokerOrderID {
+		return res, nil
+	}
+	order, err = store.GetOrderByStockIntentID(ctx, intent.ParentIntentID)
 	if err != nil {
 		return execution.OrderResult{}, fmt.Errorf("load predecessor replacement projection: %w", err)
 	}

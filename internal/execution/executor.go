@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,15 @@ func IsDefinitiveOrderRejection(err error) bool {
 	}
 	return requestErr.StatusCode >= 400 && requestErr.StatusCode < 500 &&
 		requestErr.StatusCode != 408 && requestErr.StatusCode != 409 && requestErr.StatusCode != 429
+}
+
+// IsDuplicateClientOrderError is ambiguous: Alpaca can reject a replay before
+// its prior accepted order has become visible to client-id lookup.
+func IsDuplicateClientOrderError(err error) bool {
+	var requestErr *BrokerRequestError
+	return errors.As(err, &requestErr) && requestErr.StatusCode == 422 &&
+		(strings.Contains(strings.ToLower(requestErr.Message), "client order") || strings.Contains(strings.ToLower(requestErr.Message), "client_order_id")) &&
+		strings.Contains(strings.ToLower(requestErr.Message), "duplicate")
 }
 
 // OrderSide identifies the direction of an order.

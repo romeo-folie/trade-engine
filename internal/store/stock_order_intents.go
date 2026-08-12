@@ -164,6 +164,8 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                    SELECT 1 FROM orders o
                    WHERE o.stock_intent_id=stock_order_intents.id AND o.trade_id=stock_order_intents.trade_id
                )))
+           OR (status='filled' AND order_type='stop' AND trade_id IS NOT NULL
+               AND NOT EXISTS (SELECT 1 FROM orders o WHERE o.stock_intent_id=stock_order_intents.id))
         )
         ORDER BY created_at`)
 	if err != nil {
