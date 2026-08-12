@@ -282,6 +282,61 @@ func TestStockIntentDefinitiveRejectionIsTerminalButAmbiguityRecovers(t *testing
 	}
 }
 
+type delayedDuplicateBroker struct{ lookups, posts int }
+
+func (b *delayedDuplicateBroker) PlaceOrder(context.Context, execution.OrderRequest) (execution.OrderResult, error) {
+	b.posts++
+	return execution.OrderResult{}, &execution.BrokerRequestError{StatusCode: 422, Message: "duplicate client order id"}
+}
+func (b *delayedDuplicateBroker) GetOrderByClientID(context.Context, string) (execution.OrderResult, error) {
+	b.lookups++
+	if b.lookups < 3 {
+		return execution.OrderResult{}, execution.ErrOrderNotFound
+	}
+	return execution.OrderResult{BrokerOrderID: "late-accepted", Status: "filled", FilledPrice: 100, FilledQty: 1}, nil
+}
+func (*delayedDuplicateBroker) CancelOrder(context.Context, string) error { return nil }
+func (*delayedDuplicateBroker) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, nil
+}
+func (*delayedDuplicateBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*delayedDuplicateBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*delayedDuplicateBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, nil
+}
+
+func TestStockIntentDuplicateClient422RemainsRecoverableUntilLookupFinds(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTDUPCLIENT")
+	b := &delayedDuplicateBroker{}
+	c := stockorders.New(b)
+	req := entryRequest(signalID, "RINTENTDUPCLIENT", 1)
+	if _, err := c.PlaceOrder(ctx, req); err == nil {
+		t.Fatal("duplicate response must remain ambiguous")
+	}
+	in := intentForKey(t, req.IntentKey)
+	if in.Status == "rejected" {
+		t.Fatal("duplicate client 422 terminalized intent")
+	}
+	if err := c.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	in = intentForKey(t, req.IntentKey)
+	if in.Status != "filled" {
+		t.Fatalf("later lookup status=%q", in.Status)
+	}
+	if got := countForIntent(t, "trades", in.ID); got != 1 {
+		t.Fatalf("late accepted projection trades=%d", got)
+	}
+}
+
 func TestStockIntentRecoveryPartialFillIsCumulativeAndIdempotent(t *testing.T) {
 	ctx := context.Background()
 	signalID := insertRecoverySignal(t, "RINTENTPARTIAL")

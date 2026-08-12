@@ -87,7 +87,7 @@ func (c *Coordinator) submit(ctx context.Context, intent store.StockOrderIntent,
 		_ = c.record(ctx, intent, "submit", "accepted", res, "", true)
 		return c.finishSubmit(ctx, intent, req, res)
 	}
-	if execution.IsDefinitiveOrderRejection(err) {
+	if execution.IsDefinitiveOrderRejection(err) && !execution.IsDuplicateClientOrderError(err) {
 		_ = c.record(ctx, intent, "submit", "rejected", execution.OrderResult{Status: "rejected"}, err.Error(), true)
 		return execution.OrderResult{}, fmt.Errorf("stock order definitively rejected: %w", err)
 	}

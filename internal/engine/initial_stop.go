@@ -52,7 +52,7 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		}
 	}
 
-	intentKey := "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f:%.8f", stopPrice, quantity)
+	intentKey := protectiveStopIntentKey(tradeID, stopPrice, quantity)
 	res, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
 		Ticker:      ticker,
 		Side:        execution.OrderSideSell,
@@ -141,6 +141,10 @@ func (e *Engine) ensureUncappedProtectiveStop(
 		return fmt.Errorf("protective stop became %s before providing coverage", status)
 	}
 	return nil
+}
+
+func protectiveStopIntentKey(tradeID string, stopPrice, quantity float64) string {
+	return "protective-stop:" + tradeID + ":" + fmt.Sprintf("%.8f:%.8f", stopPrice, quantity)
 }
 
 // rollbackUnrecordedProtectiveStop prevents a broker-accepted stop whose DB
