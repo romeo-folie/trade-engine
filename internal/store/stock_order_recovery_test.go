@@ -2234,6 +2234,55 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	}
 }
 
+func TestStockIntentReplacementRetainsPredecessorGTC(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTREPLACEGTC")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTREPLACEGTC", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1, StopLoss: 90})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentReq := execution.OrderRequest{Ticker: "RINTENTREPLACEGTC", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 90, TradeID: tradeID, TimeInForce: "gtc", IntentKey: "protective-stop-gtc-replace:" + tradeID, ClientOrderID: "gtc-replace-parent"}
+	payload, err := json.Marshal(parentReq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()`).Scan(&parentID); err != nil {
+		t.Fatal(err)
+	}
+	parent := store.StockOrderIntent{ID: parentID, IdempotencyKey: parentReq.IntentKey, ClientOrderID: parentReq.ClientOrderID, TradeID: tradeID, Ticker: parentReq.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: payload, PayloadHash: "gtc-parent", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "gtc-old-stop", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "gtc-old-stop", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID}); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "gtc-new-stop", Status: "done_for_day"})
+	coordinator := stockorders.New(broker)
+	if _, err := coordinator.ReplaceStopOrder(ctx, "gtc-old-stop", 91); err != nil {
+		t.Fatal(err)
+	}
+	key := "replace:" + parent.IdempotencyKey + ":91.00000000"
+	child := intentForKey(t, key)
+	var childReq execution.OrderRequest
+	if err := json.Unmarshal(child.RequestPayload, &childReq); err != nil || childReq.TimeInForce != "gtc" {
+		t.Fatalf("replacement request=%+v err=%v, want GTC", childReq, err)
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded' WHERE id NOT IN ($1::uuid,$2::uuid)`, parent.ID, child.ID); err != nil {
+		t.Fatal(err)
+	}
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "gtc-new-stop", Status: "done_for_day"}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := intentForKey(t, key); got.Status != "pending" {
+		t.Fatalf("GTC replacement status=%q, want pending", got.Status)
+	}
+}
+
 func TestStockIntentRecoveryTerminalReplacementLookupFallsBackToFreshProtection(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {

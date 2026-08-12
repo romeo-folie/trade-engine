@@ -827,13 +827,14 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	}
 
 	side := execution.OrderSideSell // long-only scope: exit a long via SELL
+	stopTIF := protectiveStopTIF(t.Quantity)
 	if existing != nil && existing.BrokerOrderID != "" {
 		quantityChanged := stopQuantityDiffers(existing, t.Quantity)
 		// Replace path — atomic on the broker side, no double-stop window.
 		if replacer, ok := m.exec.(execution.StopOrderReplacer); ok && !quantityChanged {
 			res, err := replacer.ReplaceStopOrder(ctx, existing.BrokerOrderID, newStop)
 			if err == nil {
-				status := execution.NormalizeOrderStatus(res.Status)
+				status := execution.NormalizeOrderStatusForTimeInForce(res.Status, stopTIF)
 				fillQty := res.FilledQty
 				if status == "filled" && fillQty <= 0 {
 					fillQty = existing.Quantity
@@ -908,7 +909,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 		Quantity:     t.Quantity,
 		StopPrice:    newStop,
 		TradeID:      t.ID,
-		TimeInForce:  protectiveStopTIF(t.Quantity),
+		TimeInForce:  stopTIF,
 		IntentKey:    trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
 		ExitReason:   intent.Reason,
 		ExitEvidence: intent.Evidence,
@@ -916,7 +917,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	var res execution.OrderResult
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
 		res, err = m.exec.PlaceOrder(ctx, stopReq)
-		status := execution.NormalizeOrderStatus(res.Status)
+		status := execution.NormalizeOrderStatusForTimeInForce(res.Status, stopReq.TimeInForce)
 		if err == nil && !isTerminalZeroFill(status, res.FilledQty) {
 			break
 		}
@@ -939,7 +940,7 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	if err != nil {
 		return fmt.Errorf("place stop: %w", err)
 	}
-	status := execution.NormalizeOrderStatus(res.Status)
+	status := execution.NormalizeOrderStatusForTimeInForce(res.Status, stopReq.TimeInForce)
 	fillQty := res.FilledQty
 	if status == "filled" && fillQty <= 0 {
 		fillQty = t.Quantity

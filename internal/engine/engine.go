@@ -2867,7 +2867,7 @@ func (e *Engine) placeMarketExitWithTerminalRetries(
 
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
 		res, err := e.executor.PlaceOrder(ctx, req)
-		terminalZero := err == nil && isTerminalZeroFillStockIntent(res.Status, res.FilledQty)
+		terminalZero := err == nil && isTerminalZeroFillStockIntent(res.Status, res.FilledQty, req.TimeInForce)
 		if err == nil && !terminalZero {
 			return res, req.IntentKey, false, nil
 		}

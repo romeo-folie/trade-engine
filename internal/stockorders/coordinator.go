@@ -780,6 +780,7 @@ func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float6
 		Type: execution.OrderTypeStop, Quantity: predecessor.RequestedQty, StopPrice: px,
 		TradeID: predecessor.TradeID, IntentKey: key, ClientOrderID: clientIDForKey(key),
 		ReplacesBrokerOrderID: id,
+		TimeInForce:           predecessorRequest.TimeInForce,
 		ExitReason:            provenance.Reason, ExitEvidence: provenance.Evidence,
 	}
 	payload, err := json.Marshal(req)

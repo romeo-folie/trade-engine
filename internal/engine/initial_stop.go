@@ -87,7 +87,7 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 	var res execution.OrderResult
 	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
 		res, err = e.executor.PlaceOrder(ctx, stopReq)
-		if err == nil && !isTerminalZeroFillStockIntent(res.Status, res.FilledQty) {
+		if err == nil && !isTerminalZeroFillStockIntent(res.Status, res.FilledQty, stopReq.TimeInForce) {
 			break
 		}
 		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
@@ -198,8 +198,8 @@ func protectiveStopRetryIntentKey(previousKey, cancelledBrokerOrderID string) st
 	return store.StockOrderIntentRetryKey(previousKey, cancelledBrokerOrderID)
 }
 
-func isTerminalZeroFillStockIntent(status string, filledQty float64) bool {
-	status = execution.NormalizeOrderStatus(status)
+func isTerminalZeroFillStockIntent(status string, filledQty float64, timeInForce string) bool {
+	status = execution.NormalizeOrderStatusForTimeInForce(status, timeInForce)
 	return filledQty <= 0 && (status == "cancelled" || status == "rejected")
 }
 

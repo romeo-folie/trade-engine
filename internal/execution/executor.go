@@ -234,12 +234,8 @@ func NormalizeOrderStatus(status string) string {
 		return "filled"
 	case "partially_filled":
 		return "partial"
-	case "cancelled", "canceled":
+	case "cancelled", "canceled", "done_for_day":
 		return "cancelled"
-	case "done_for_day":
-		// Callers that do not retain TIF must fail safe for protective GTC
-		// orders. TIF-aware lifecycle paths map known DAY orders to cancelled.
-		return "pending"
 	case "rejected", "expired":
 		return "rejected"
 	default:
@@ -254,10 +250,7 @@ func NormalizeOrderStatus(status string) string {
 // as cancelled would retire the only broker protection and invite a duplicate
 // replacement. DAY/default orders retain the ordinary terminal mapping.
 func NormalizeOrderStatusForTimeInForce(status, timeInForce string) string {
-	if status == "done_for_day" {
-		if strings.EqualFold(timeInForce, "day") || timeInForce == "" {
-			return "cancelled"
-		}
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
 		return "pending"
 	}
 	return NormalizeOrderStatus(status)
@@ -280,8 +273,8 @@ func IsTerminalOrderStatus(status string) bool {
 // IsTerminalOrderStatus. Use it for broker order lifecycle projection where
 // the original time-in-force is available.
 func IsTerminalOrderStatusForTimeInForce(status, timeInForce string) bool {
-	if status == "done_for_day" {
-		return strings.EqualFold(timeInForce, "day") || timeInForce == ""
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
+		return false
 	}
 	return IsTerminalOrderStatus(status)
 }
