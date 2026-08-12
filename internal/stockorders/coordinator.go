@@ -211,13 +211,6 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 		return nil
 	}
 	if req.TradeID != "" {
-		existing, err := store.GetOrderByStockIntentAndTrade(ctx, intent.ID, req.TradeID)
-		if err != nil {
-			return err
-		}
-		if existing != nil {
-			return nil
-		}
 		return c.projectRecoveredMarketExitAllocation(ctx, intent, req, res, req.TradeID, req.Quantity, res.FilledQty)
 	}
 	if !strings.HasPrefix(intent.IdempotencyKey, "analyst-exit:") {

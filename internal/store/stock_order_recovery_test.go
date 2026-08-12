@@ -107,7 +107,7 @@ func stableRecoveryCandles(price float64) []data.Candle {
 
 func TestStockIntentDefinitiveReplacementRejectionIsTerminal(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTREPLACEREJECT")
@@ -148,7 +148,7 @@ func TestStockIntentTerminalZeroFillCannotSatisfyRetry(t *testing.T) {
 		{"cancelled lookup", "cancelled", nil, &execution.OrderResult{BrokerOrderID: "cancelled-entry", Status: "cancelled"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			signalID := insertRecoverySignal(t, "RINTENTTERMINAL"+tc.name[:1])
@@ -191,7 +191,7 @@ func TestStockIntentTerminalZeroFillCannotSatisfyRetry(t *testing.T) {
 
 func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTAMBIGREPLACE")
@@ -199,7 +199,7 @@ func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent := store.StockOrderIntent{ID: "77777777-7777-4777-8777-777777777777", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "ambiguous-parent", TradeID: tradeID, Ticker: "RINTENTAMBIGREPLACE", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
+	parent := store.StockOrderIntent{ID: "77777777-7777-4777-8777-777777777777", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "ambiguous-parent", TradeID: tradeID, Purpose: "superseded", Ticker: "RINTENTAMBIGREPLACE", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
 	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +246,7 @@ func TestStockIntentAmbiguousReplacementDoesNotTerminalizeAndRecovers(t *testing
 
 func TestStockIntentRecoveryReplacementPredecessor404RemainsAmbiguous(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTRECOVER404")
@@ -254,7 +254,7 @@ func TestStockIntentRecoveryReplacementPredecessor404RemainsAmbiguous(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent := store.StockOrderIntent{ID: "88888888-8888-4888-8888-888888888888", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "recover-404-parent", TradeID: tradeID, Ticker: "RINTENTRECOVER404", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
+	parent := store.StockOrderIntent{ID: "88888888-8888-4888-8888-888888888888", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "recover-404-parent", TradeID: tradeID, Purpose: "superseded", Ticker: "RINTENTRECOVER404", Side: "sell", OrderType: "stop", RequestedQty: 2, RequestPayload: []byte(`{}`), PayloadHash: "parent", Status: "rejected"}
 	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
 		t.Fatal(err)
 	}
@@ -351,7 +351,7 @@ func isRecoverableIntent(t *testing.T, intentID string) bool {
 
 func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTACCEPT")
@@ -391,7 +391,7 @@ func TestStockIntentRecoveryAcceptedBeforeProjectionFailure(t *testing.T) {
 
 func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -464,11 +464,90 @@ func TestStockIntentRecoveryProjectsSingleTradeMarketExitFill(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryAppliesCumulativeSingleMarketExitProjection(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTCUMULATIVEEXIT")
+	tradeID, err := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTCUMULATIVEEXIT", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed, err := store.ClaimTradeExitWithIntent(ctx, tradeID, store.ExitIntent{Reason: store.ExitReasonTakeProfit}); err != nil || !claimed {
+		t.Fatalf("claim exit = %v, %v", claimed, err)
+	}
+
+	key := "software-exit:" + tradeID + ":cumulative"
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "cumulative-exit", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTCUMULATIVEEXIT", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket, Quantity: 5, TradeID: tradeID, IntentKey: key}
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, key)
+	// Simulate a crash after the durable order projection was inserted but
+	// before its broker cumulative fill was applied to the trade.
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "cumulative-exit", Ticker: req.Ticker, Side: "sell", OrderType: "market", Quantity: 5, Status: "pending", StockIntentID: in.ID}); err != nil {
+		t.Fatal(err)
+	}
+
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "cumulative-exit", Status: "partially_filled", FilledPrice: 105, FilledQty: 2}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 210, "partial", "exiting")
+
+	// A repeated poll with the same cumulative quantity must not apply the
+	// first two shares a second time.
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 2, 210, "partial", "exiting")
+
+	broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "cumulative-exit", Status: "filled", FilledPrice: 106, FilledQty: 5}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertCumulativeRecoveredExit(t, in.ID, tradeID, 5, 530, "filled", "closed")
+	if isRecoverableIntent(t, in.ID) {
+		t.Fatal("completed cumulative market exit remained recoverable")
+	}
+	beforeLookups, beforeAttempts := len(broker.lookupIDs), countStockIntentAttempts(t, in.ID)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, clientID := range broker.lookupIDs[beforeLookups:] {
+		if clientID == in.ClientOrderID {
+			t.Fatal("completed cumulative market exit replayed broker lookup")
+		}
+	}
+	if got := countStockIntentAttempts(t, in.ID); got != beforeAttempts {
+		t.Fatalf("completed cumulative market exit created attempt: %d -> %d", beforeAttempts, got)
+	}
+}
+
+func assertCumulativeRecoveredExit(t *testing.T, intentID, tradeID string, wantFill, wantProceeds float64, wantOrderStatus, wantTradeStatus string) {
+	t.Helper()
+	order, err := store.GetOrderByStockIntentAndTrade(context.Background(), intentID, tradeID)
+	if err != nil || order == nil || order.FilledQty != wantFill || order.Status != wantOrderStatus {
+		t.Fatalf("recovered cumulative exit order = %#v, %v", order, err)
+	}
+	var realizedQty, realizedProceeds float64
+	var tradeStatus string
+	if err := store.GetDB().QueryRow(context.Background(), `SELECT realized_exit_qty, realized_exit_proceeds, status FROM trades WHERE id=$1::uuid`, tradeID).Scan(&realizedQty, &realizedProceeds, &tradeStatus); err != nil {
+		t.Fatal(err)
+	}
+	if realizedQty != wantFill || realizedProceeds != wantProceeds || tradeStatus != wantTradeStatus {
+		t.Fatalf("recovered cumulative exit realization = qty %v proceeds %v status %q, want %v %v %q", realizedQty, realizedProceeds, tradeStatus, wantFill, wantProceeds, wantTradeStatus)
+	}
+}
+
 func TestStockIntentRecoveryProjectsTerminalPartialEntryFill(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{"cancelled", "rejected"} {
 		t.Run(status, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTTERMINALENTRY" + status[:1]
@@ -512,7 +591,7 @@ func TestStockIntentRecoveryProjectsTerminalStopFill(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{"cancelled", "rejected"} {
 		t.Run(status, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTTERMINALSTOP" + status[:1]
@@ -561,7 +640,7 @@ func TestStockIntentRecoveryProjectsTerminalMarketExitFills(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []string{"cancelled", "rejected"} {
 		t.Run(status, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTTERMINALEXIT" + status[:1]
@@ -609,7 +688,7 @@ func TestStockIntentRecoveryProjectsTerminalAggregateMarketExitFills(t *testing.
 	ctx := context.Background()
 	for _, status := range []string{"cancelled", "rejected"} {
 		t.Run(status, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTTERMINALAGG" + status[:1]
@@ -662,7 +741,7 @@ func TestStockIntentRecoveryProjectsTerminalAggregateMarketExitFills(t *testing.
 
 func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTANALYSTEXIT")
@@ -734,7 +813,7 @@ func TestStockIntentRecoveryProjectsAggregateAnalystExitAllocations(t *testing.T
 
 func TestStockIntentRecoveryCompletesPartialAggregateMarketExitProjection(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTPARTIALAGGEXIT")
@@ -810,7 +889,7 @@ func TestTrailingManagerRotatesCoordinatorTerminalStopGeneration(t *testing.T) {
 	ctx := context.Background()
 	for _, terminalStatus := range []string{"cancelled", "rejected", "expired"} {
 		t.Run(terminalStatus, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTTRAIL" + terminalStatus
@@ -859,7 +938,7 @@ func TestTrailingManagerRotatesCoordinatorTerminalStopGeneration(t *testing.T) {
 
 func TestTrailingManagerFollowsTerminalStopGenerations(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	ticker := "RINTENTTRAILMULTIGEN"
@@ -935,7 +1014,7 @@ func TestTrailingManagerFollowsTerminalStopGenerations(t *testing.T) {
 
 func TestStockOrderIntentRetryGenerationDoesNotAdvanceAmbiguousSuccessor(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTAMBIGGEN")
@@ -983,7 +1062,7 @@ func TestStockOrderIntentRetryGenerationDoesNotAdvanceAmbiguousSuccessor(t *test
 
 func TestStockIntentRecoveryAfterTrailingCancelResubmitRepointIsClean(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTTRAILREPOINT")
@@ -1077,17 +1156,19 @@ func TestStockIntentRecoveryTerminalZeroFillClosesOrderOnlyProjection(t *testing
 	}
 }
 
-func TestStockIntentDoneForDayTerminalizesOrderOnlyProjections(t *testing.T) {
+func TestStockIntentTerminalZeroFillTerminalizesOrderOnlyProjections(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name  string
-		entry bool
+		name, brokerStatus, storedStatus string
+		entry                            bool
 	}{
-		{"entry", true},
-		{"fractional day stop", false},
+		{"done-for-day entry", "done_for_day", "cancelled", true},
+		{"done-for-day fractional stop", "done_for_day", "cancelled", false},
+		{"rejected entry", "rejected", "rejected", true},
+		{"rejected standalone stop", "rejected", "rejected", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTDONE" + fmt.Sprintf("%d", time.Now().UnixNano())
@@ -1111,13 +1192,13 @@ func TestStockIntentDoneForDayTerminalizesOrderOnlyProjections(t *testing.T) {
 			if _, err := store.InsertOrder(ctx, store.Order{TradeID: req.TradeID, BrokerOrderID: "done-for-day-" + tc.name, Ticker: ticker, Side: string(req.Side), OrderType: string(req.Type), Quantity: req.Quantity, StopPrice: req.StopPrice, Status: "pending", IsStopLoss: !tc.entry, StockIntentID: in.ID}); err != nil {
 				t.Fatal(err)
 			}
-			broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "done-for-day-" + tc.name, Status: "done_for_day"}
+			broker.lookup[in.ClientOrderID] = execution.OrderResult{BrokerOrderID: "done-for-day-" + tc.name, Status: tc.brokerStatus}
 			if _, err := coordinator.PlaceOrder(ctx, req); !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
-				t.Fatalf("done_for_day client lookup result=%v, want ErrTerminalZeroFillPlacement", err)
+				t.Fatalf("%s client lookup result=%v, want ErrTerminalZeroFillPlacement", tc.brokerStatus, err)
 			}
 			in = intentForKey(t, req.IntentKey)
-			if in.Status != "cancelled" {
-				t.Fatalf("done_for_day intent status=%q, want cancelled", in.Status)
+			if in.Status != tc.storedStatus {
+				t.Fatalf("%s intent status=%q, want %q", tc.brokerStatus, in.Status, tc.storedStatus)
 			}
 			if !isRecoverableIntent(t, in.ID) {
 				t.Fatal("terminal order-only projection was not recoverable")
@@ -1126,8 +1207,8 @@ func TestStockIntentDoneForDayTerminalizesOrderOnlyProjections(t *testing.T) {
 				t.Fatal(err)
 			}
 			order, err := store.GetOrderByStockIntentID(ctx, in.ID)
-			if err != nil || order == nil || order.Status != "cancelled" {
-				t.Fatalf("done_for_day projection=%#v err=%v", order, err)
+			if err != nil || order == nil || order.Status != tc.storedStatus {
+				t.Fatalf("%s projection=%#v err=%v", tc.brokerStatus, order, err)
 			}
 			if isRecoverableIntent(t, in.ID) {
 				t.Fatal("terminalized done_for_day intent remained recoverable")
@@ -1150,7 +1231,7 @@ func TestStockIntentDoneForDayTerminalizesOrderOnlyProjections(t *testing.T) {
 
 func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTRECOVERSTOP")
@@ -1181,7 +1262,7 @@ func TestStockIntentRecoveryProjectsAcceptedStandaloneStop(t *testing.T) {
 
 func TestStockIntentDefinitiveRejectionIsTerminalButAmbiguityRecovers(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	rejectedSignal := insertRecoverySignal(t, "RINTENTREJECTED")
@@ -1260,7 +1341,7 @@ func TestStockIntentDuplicateClient422RemainsRecoverableUntilLookupFinds(t *test
 		{"must be unique", "client_order_id must be unique"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+			if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 				t.Fatal(err)
 			}
 			ticker := "RINTENTDUPCLIENT" + tc.name[:1]
@@ -1349,7 +1430,7 @@ func TestStockIntentConcurrentSameTickerSignalsAndReplayDeduplicate(t *testing.T
 
 func TestStockIntentRecoverySkipsBracketProjectionChildren(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTBRACKET")
@@ -1475,7 +1556,7 @@ func TestStockIntentRecoveryRestoresBracketAndUncappedPolicy(t *testing.T) {
 
 func TestStockIntentRecoveryAdoptsNormalUncappedProtectiveStop(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTADOPTSTOP")
@@ -1528,7 +1609,7 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	if err := store.UpdateStockOrderIntentBroker(ctx, parent.ClientOrderID, "old-stop", "pending", 0, 0, "", "", true); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected' WHERE id=$1::uuid`, parent.ID); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded' WHERE id=$1::uuid`, parent.ID); err != nil {
 		t.Fatal(err)
 	}
 	orderID, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "old-stop", Ticker: "RINTENTREPLACE", Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 90, Status: "pending", IsStopLoss: true, StockIntentID: parent.ID})
@@ -1574,7 +1655,7 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 
 func TestStockIntentRecoveryAlreadyLinkedReplacementIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTLINKEDREPLACE")
@@ -1604,7 +1685,7 @@ func TestStockIntentRecoveryAlreadyLinkedReplacementIsIdempotent(t *testing.T) {
 
 func TestStockIntentFilledStandaloneStopMissingProjectionRecovers(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTFILLEDSTOP")
@@ -1627,7 +1708,7 @@ func TestStockIntentFilledStandaloneStopMissingProjectionRecovers(t *testing.T) 
 
 func TestStockIntentReplacementRecoveryCompletesIntentOnlyCrash(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTREPLACECRASH")
@@ -1635,7 +1716,7 @@ func TestStockIntentReplacementRecoveryCompletesIntentOnlyCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent := store.StockOrderIntent{ID: "33333333-3333-4333-8333-333333333333", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "crash-parent", TradeID: tradeID, Ticker: "RINTENTREPLACECRASH", Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: []byte(`{}`), PayloadHash: "p", Status: "rejected"}
+	parent := store.StockOrderIntent{ID: "33333333-3333-4333-8333-333333333333", IdempotencyKey: "protective-stop:" + tradeID, ClientOrderID: "crash-parent", TradeID: tradeID, Purpose: "superseded", Ticker: "RINTENTREPLACECRASH", Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: []byte(`{}`), PayloadHash: "p", Status: "rejected"}
 	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
 		t.Fatal(err)
 	}
@@ -1691,7 +1772,7 @@ func TestStockIntentAdoptsLegacyBracketStopForAtomicReplacement(t *testing.T) {
 
 func TestStockIntentLegacyStopAdoptionIsNeverReplayedAfterAmbiguousReplacement(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTLEGACYAMBIG")
@@ -1733,7 +1814,7 @@ func TestStockIntentLegacyStopAdoptionIsNeverReplayedAfterAmbiguousReplacement(t
 
 func TestStockIntentReplacementSupersedesPredecessorAfterRecoveryProjection(t *testing.T) {
 	ctx := context.Background()
-	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
 	}
 	signalID := insertRecoverySignal(t, "RINTENTSUPERSEDE")
