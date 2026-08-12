@@ -31,9 +31,16 @@ func (p marketDataPricer) UnderlyingPrice(ctx context.Context, underlying string
 	return 0, false
 }
 
-// chainQuoter adapts the Alpaca broker's option chain to the OptionQuoter the
-// time exit uses: it returns the mid of a specific contract by OCC symbol.
-type chainQuoter struct{ broker *execution.AlpacaBroker }
+// optionSnapshotsProvider is the read-only option quote surface required by
+// the exit manager. *execution.AlpacaBroker and ReadOnlyExecutor both satisfy
+// it, so dry-run retains market data without retaining a raw order adapter.
+type optionSnapshotsProvider interface {
+	GetOptionSnapshots(ctx context.Context, occSymbols []string) ([]execution.OptionSnapshot, error)
+}
+
+// chainQuoter adapts option snapshots to the OptionQuoter the time exit uses:
+// it returns the mid of a specific contract by OCC symbol.
+type chainQuoter struct{ broker optionSnapshotsProvider }
 
 func (c chainQuoter) OptionMid(ctx context.Context, _underlying, occSymbol string) (float64, bool) {
 	if c.broker == nil {
@@ -58,9 +65,10 @@ func (c chainQuoter) OptionMid(ctx context.Context, _underlying, occSymbol strin
 }
 
 // SetupOptionsORB constructs the options-ORB router and app-managed exit manager
-// from config and wires them onto the scheduler. broker must be the Alpaca broker
-// (options chain + order access). No-op when options-ORB is disabled or the broker
-// is not Alpaca — leaving the equity/forex/futures path untouched.
+// from config and wires them onto the scheduler. chain and snapshots are
+// read-only Alpaca option-data capabilities, while placer is the execution path
+// used for all option entries and exits. Keeping them separate ensures dry-run
+// never exposes a raw Alpaca mutation path to the router or exit manager.
 //
 // The earnings provider is store-backed (earnings_calendar, migration 045): it answers
 // the earnings-blackout gate from the shared table populated by `te earnings sync`
@@ -72,8 +80,13 @@ func (c chainQuoter) OptionMid(ctx context.Context, _underlying, occSymbol strin
 // until that table is seeded. Run `te options backfill-iv` before/daily alongside the
 // session (e.g. from te-switch) to populate it — otherwise options-ORB places zero
 // trades even with a valid OPRA feed.
-func (s *ORBScheduler) SetupOptionsORB(cfg config.OptionsORBConfig, broker *execution.AlpacaBroker) {
-	if !cfg.Enabled || broker == nil {
+func (s *ORBScheduler) SetupOptionsORB(
+	cfg config.OptionsORBConfig,
+	chain options.ChainProvider,
+	snapshots optionSnapshotsProvider,
+	placer execution.Executor,
+) {
+	if !cfg.Enabled || chain == nil || snapshots == nil || placer == nil {
 		return
 	}
 	ivrank := options.NewIVRankService(options.NewStoreIVStore(s.db), cfg.IVLookbackDays, cfg.IVMinSamples)
@@ -85,10 +98,10 @@ func (s *ORBScheduler) SetupOptionsORB(cfg config.OptionsORBConfig, broker *exec
 		SpreadPctCeiling:     cfg.SpreadPctCeiling,
 		EarningsBlackoutDays: cfg.EarningsBlackoutDays,
 		ETFUnderlyings:       cfg.ETFUnderlyings,
-	}, broker, ivrank, earnings.NewStoreProvider(s.db, nil))
+	}, chain, ivrank, earnings.NewStoreProvider(s.db, nil))
 
-	s.SetOptionsRouter(NewOptionsRouter(gates, broker, cfg.Underlyings, cfg.PremiumBudget, cfg.MaxLossPerTrade))
-	s.SetOptionExitManager(NewOptionExitManager(marketDataPricer{md: s.marketData}, chainQuoter{broker: broker}, broker, cfg.TimeExitMinutes))
+	s.SetOptionsRouter(NewOptionsRouter(gates, placer, cfg.Underlyings, cfg.PremiumBudget, cfg.MaxLossPerTrade))
+	s.SetOptionExitManager(NewOptionExitManager(marketDataPricer{md: s.marketData}, chainQuoter{broker: snapshots}, placer, cfg.TimeExitMinutes))
 	if s.alertedOrphanOptions == nil {
 		s.alertedOrphanOptions = make(map[string]struct{})
 	}

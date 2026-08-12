@@ -48,6 +48,67 @@ func TestGetAccount_DayPnL(t *testing.T) {
 	}
 }
 
+func TestAccountSnapshotCapturesAccountIdentityAndSafetyFields(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v2/account" {
+			t.Fatalf("request = %s %s, want GET /v2/account", r.Method, r.URL.Path)
+		}
+		fmt.Fprintln(w, `{
+            "id":"internal-id", "account_number":"PA123", "status":"ACTIVE",
+            "cash":"0", "equity":"100.50", "last_equity":"99.25",
+            "buying_power":"200", "regt_buying_power":"190",
+            "daytrading_buying_power":"400", "non_marginable_buying_power":"100",
+            "multiplier":"2", "currency":"USD", "trading_blocked":false,
+            "transfers_blocked":true, "account_blocked":false,
+            "trade_suspended_by_user":false, "shorting_enabled":true
+        }`)
+	}))
+	defer ts.Close()
+
+	broker := &AlpacaBroker{apiKey: "k", secret: "s", baseURL: ts.URL, httpClient: ts.Client()}
+	account, err := broker.AccountSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("AccountSnapshot: %v", err)
+	}
+	if account.AccountNumber != "PA123" || account.Status != "ACTIVE" || account.Cash != 0 ||
+		account.RegTBuyingPower != 190 || account.DayTradingBuyingPower != 400 ||
+		account.NonMarginableBuyingPower != 100 || account.Multiplier != 2 || !account.TransfersBlocked || !account.ShortingEnabled {
+		t.Fatalf("unexpected snapshot: %+v", account)
+	}
+	if account.FetchedAt.IsZero() {
+		t.Fatal("FetchedAt is zero")
+	}
+	encoded, err := json.Marshal(account)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded) == "" || containsJSONField(encoded, "account_id") || containsJSONField(encoded, "account_number") {
+		t.Fatalf("account identity leaked from normal JSON: %s", encoded)
+	}
+}
+
+func TestAccountSnapshotRejectsMalformedOrNonFiniteRequiredValues(t *testing.T) {
+	for _, value := range []string{"", "not-a-number", "NaN", "+Inf", "-Inf"} {
+		t.Run(fmt.Sprintf("cash=%q", value), func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprintf(w, `{"cash":%q,"equity":"100","buying_power":"100"}`, value)
+			}))
+			defer ts.Close()
+			broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+			if _, err := broker.AccountSnapshot(context.Background()); err == nil {
+				t.Fatal("AccountSnapshot accepted invalid cash")
+			}
+		})
+	}
+}
+
+func containsJSONField(encoded []byte, field string) bool {
+	var decoded map[string]any
+	_ = json.Unmarshal(encoded, &decoded)
+	_, ok := decoded[field]
+	return ok
+}
+
 func TestGetOrderStatusReturnsBrokerFillTime(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintln(w, `{"id":"o-1","status":"filled","filled_avg_price":"95.25","filled_qty":"10","filled_at":"2026-08-01T14:05:02Z"}`)

@@ -59,6 +59,9 @@ func NewAlpacaBroker(cfg config.StocksConfig) *AlpacaBroker {
 	}
 }
 
+// BrokerName identifies this adapter without exposing its credentials or URL.
+func (*AlpacaBroker) BrokerName() string { return "alpaca" }
+
 // PlaceOrder submits a market or limit order to Alpaca.
 func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderResult, error) {
 	if req.SecType == "OPT" {

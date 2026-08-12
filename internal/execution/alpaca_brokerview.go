@@ -3,8 +3,11 @@ package execution
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -15,51 +18,102 @@ import (
 // AccountSnapshot fetches the canonical account state from /v2/account.
 func (b *AlpacaBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, error) {
 	var resp struct {
-		ID          string `json:"id"`
-		Equity      string `json:"equity"`
-		LastEquity  string `json:"last_equity"`
-		Cash        string `json:"cash"`
-		BuyingPower string `json:"buying_power"`
-		Currency    string `json:"currency"`
+		ID                       string `json:"id"`
+		AccountNumber            string `json:"account_number"`
+		Status                   string `json:"status"`
+		Equity                   string `json:"equity"`
+		LastEquity               string `json:"last_equity"`
+		Cash                     string `json:"cash"`
+		BuyingPower              string `json:"buying_power"`
+		RegTBuyingPower          string `json:"regt_buying_power"`
+		DayTradingBuyingPower    string `json:"daytrading_buying_power"`
+		NonMarginableBuyingPower string `json:"non_marginable_buying_power"`
+		Multiplier               string `json:"multiplier"`
+		Currency                 string `json:"currency"`
+		TradingBlocked           bool   `json:"trading_blocked"`
+		TransfersBlocked         bool   `json:"transfers_blocked"`
+		AccountBlocked           bool   `json:"account_blocked"`
+		TradeSuspendedByUser     bool   `json:"trade_suspended_by_user"`
+		ShortingEnabled          bool   `json:"shorting_enabled"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
 		return BrokerAccount{}, fmt.Errorf("alpaca AccountSnapshot: %w", err)
 	}
 
-	parse := func(label, s string) (float64, error) {
-		v, err := parseFloat(s)
-		if err != nil {
-			return 0, fmt.Errorf("alpaca AccountSnapshot: parse %s %q: %w", label, s, err)
-		}
-		return v, nil
-	}
-
-	equity, err := parse("equity", resp.Equity)
+	equity, err := parseRequiredFiniteAccountFloat("equity", resp.Equity)
 	if err != nil {
 		return BrokerAccount{}, err
 	}
-	lastEquity, err := parse("last_equity", resp.LastEquity)
+	lastEquity, err := parseOptionalFiniteAccountFloat("last_equity", resp.LastEquity)
 	if err != nil {
 		return BrokerAccount{}, err
 	}
-	cash, err := parse("cash", resp.Cash)
+	cash, err := parseRequiredFiniteAccountFloat("cash", resp.Cash)
 	if err != nil {
 		return BrokerAccount{}, err
 	}
-	buyingPower, err := parse("buying_power", resp.BuyingPower)
+	buyingPower, err := parseRequiredFiniteAccountFloat("buying_power", resp.BuyingPower)
+	if err != nil {
+		return BrokerAccount{}, err
+	}
+	regTBuyingPower, err := parseOptionalFiniteAccountFloat("regt_buying_power", resp.RegTBuyingPower)
+	if err != nil {
+		return BrokerAccount{}, err
+	}
+	dayTradingBuyingPower, err := parseOptionalFiniteAccountFloat("daytrading_buying_power", resp.DayTradingBuyingPower)
+	if err != nil {
+		return BrokerAccount{}, err
+	}
+	nonMarginableBuyingPower, err := parseOptionalFiniteAccountFloat("non_marginable_buying_power", resp.NonMarginableBuyingPower)
+	if err != nil {
+		return BrokerAccount{}, err
+	}
+	multiplier, err := parseOptionalFiniteAccountFloat("multiplier", resp.Multiplier)
 	if err != nil {
 		return BrokerAccount{}, err
 	}
 
 	return BrokerAccount{
-		AccountID:   resp.ID,
-		Equity:      equity,
-		LastEquity:  lastEquity,
-		Cash:        cash,
-		BuyingPower: buyingPower,
-		Currency:    resp.Currency,
-		FetchedAt:   time.Now().UTC(),
+		AccountID:                resp.ID,
+		AccountNumber:            resp.AccountNumber,
+		Status:                   resp.Status,
+		Equity:                   equity,
+		LastEquity:               lastEquity,
+		Cash:                     cash,
+		BuyingPower:              buyingPower,
+		RegTBuyingPower:          regTBuyingPower,
+		DayTradingBuyingPower:    dayTradingBuyingPower,
+		NonMarginableBuyingPower: nonMarginableBuyingPower,
+		Multiplier:               multiplier,
+		Currency:                 resp.Currency,
+		TradingBlocked:           resp.TradingBlocked,
+		TransfersBlocked:         resp.TransfersBlocked,
+		AccountBlocked:           resp.AccountBlocked,
+		TradeSuspendedByUser:     resp.TradeSuspendedByUser,
+		ShortingEnabled:          resp.ShortingEnabled,
+		FetchedAt:                time.Now().UTC(),
 	}, nil
+}
+
+func parseRequiredFiniteAccountFloat(label, raw string) (float64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, fmt.Errorf("alpaca AccountSnapshot: %s is required", label)
+	}
+	return parseOptionalFiniteAccountFloat(label, raw)
+}
+
+func parseOptionalFiniteAccountFloat(label, raw string) (float64, error) {
+	if strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("alpaca AccountSnapshot: parse %s %q: %w", label, raw, err)
+	}
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, fmt.Errorf("alpaca AccountSnapshot: %s %q must be finite", label, raw)
+	}
+	return v, nil
 }
 
 // PositionsSnapshot fetches all open positions from /v2/positions and returns

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -1523,19 +1524,70 @@ type NewsAPIConfig struct {
 }
 
 type StocksConfig struct {
-	Enabled   bool   `yaml:"enabled"`
-	Paper     bool   `yaml:"paper"`
-	APIKeyEnv string `yaml:"api_key_env"`
-	APIKey    string `yaml:"-" json:"-"`
-	SecretEnv string `yaml:"secret_env"`
-	Secret    string `yaml:"-" json:"-"`
-	BaseURL   string `yaml:"base_url"`
-	DataURL   string `yaml:"data_url"`
+	Enabled               bool   `yaml:"enabled"`
+	Paper                 bool   `yaml:"paper"`
+	ExpectedAccountNumber string `yaml:"expected_account_number"`
+	APIKeyEnv             string `yaml:"api_key_env"`
+	APIKey                string `yaml:"-" json:"-"`
+	SecretEnv             string `yaml:"secret_env"`
+	Secret                string `yaml:"-" json:"-"`
+	BaseURL               string `yaml:"base_url"`
+	DataURL               string `yaml:"data_url"`
 	// OptionFeed selects the Alpaca options market-data feed: "opra" (real-time,
 	// requires the Algo Trader Plus subscription) or "indicative" (free, 15-min
 	// delayed). Empty defaults to "indicative". Options-ORB (issue #414) requires
 	// "opra" to trade the open; the adapter logs when it falls back to indicative.
 	OptionFeed string `yaml:"option_feed"`
+}
+
+const (
+	// AlpacaPaperTradingURL and AlpacaLiveTradingURL are the only trading hosts
+	// accepted for stock execution. Keeping the environment and host paired
+	// prevents paper credentials from silently being sent to a custom or live
+	// endpoint (and vice versa).
+	AlpacaPaperTradingURL = "https://paper-api.alpaca.markets"
+	AlpacaLiveTradingURL  = "https://api.alpaca.markets"
+)
+
+// ValidateStockBrokerConfig verifies the effective stock execution environment.
+// Call it after runtime overrides have been applied, rather than while reading
+// YAML, because a DB override may deliberately switch paper/live at startup.
+func ValidateStockBrokerConfig(stocks StocksConfig) error {
+	if !stocks.Enabled {
+		return nil
+	}
+
+	baseURL, err := url.Parse(strings.TrimSpace(stocks.BaseURL))
+	if err != nil || baseURL.Scheme != "https" || baseURL.Host == "" ||
+		baseURL.User != nil || (baseURL.Path != "" && baseURL.Path != "/") ||
+		baseURL.RawQuery != "" || baseURL.Fragment != "" {
+		return fmt.Errorf("markets.stocks.base_url must be a canonical HTTPS Alpaca trading host, got %q", stocks.BaseURL)
+	}
+
+	expected := AlpacaLiveTradingURL
+	if stocks.Paper {
+		expected = AlpacaPaperTradingURL
+	}
+	expectedURL, _ := url.Parse(expected)
+	if !strings.EqualFold(baseURL.Host, expectedURL.Host) {
+		environment := "live"
+		if stocks.Paper {
+			environment = "paper"
+		}
+		return fmt.Errorf("markets.stocks.paper=%t requires the %s Alpaca host %s, got %q", stocks.Paper, environment, expected, stocks.BaseURL)
+	}
+	return nil
+}
+
+// ValidateStockWorkflowConfig verifies the one unsafe engine/environment
+// pairing. Engine paper mode is a paper workflow, so it must not point at a
+// live Alpaca account. Auto mode deliberately remains valid with either
+// environment: it is used for both paper testing and live execution.
+func ValidateStockWorkflowConfig(mode string, stocks StocksConfig) error {
+	if stocks.Enabled && mode == "paper" && !stocks.Paper {
+		return fmt.Errorf("engine.mode=paper requires markets.stocks.paper=true")
+	}
+	return nil
 }
 
 // ── Strategies ────────────────────────────────────────────────────────────────
@@ -2751,8 +2803,11 @@ func Validate(cfg *Config) []string {
 		}
 	}
 
-	if cfg.Markets.Stocks.APIKeyEnv != "" && os.Getenv(cfg.Markets.Stocks.APIKeyEnv) == "" {
+	if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.APIKeyEnv != "" && os.Getenv(cfg.Markets.Stocks.APIKeyEnv) == "" {
 		errs = append(errs, fmt.Sprintf("env var %s (markets.stocks.api_key_env) is not set", cfg.Markets.Stocks.APIKeyEnv))
+	}
+	if cfg.Markets.Stocks.Enabled && cfg.Markets.Stocks.SecretEnv != "" && os.Getenv(cfg.Markets.Stocks.SecretEnv) == "" {
+		errs = append(errs, fmt.Sprintf("env var %s (markets.stocks.secret_env) is not set", cfg.Markets.Stocks.SecretEnv))
 	}
 
 	if cfg.Markets.News.ExtractionEnabled {
