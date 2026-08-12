@@ -565,6 +565,59 @@ func TestStockIntentRecoveryLookupProjectsReplacementOrder(t *testing.T) {
 	}
 }
 
+func TestStockIntentRecoveryAlreadyLinkedReplacementIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTLINKEDREPLACE")
+	tradeID, _ := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTLINKEDREPLACE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1})
+	parent := store.StockOrderIntent{ID: "55555555-5555-4555-8555-555555555555", IdempotencyKey: "parent-linked", ClientOrderID: "parent-linked-id", TradeID: tradeID, Ticker: "RINTENTLINKEDREPLACE", Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: []byte(`{}`), PayloadHash: "p", Status: "rejected"}
+	if err := store.CreateStockOrderIntent(ctx, parent); err != nil {
+		t.Fatal(err)
+	}
+	req := execution.OrderRequest{Ticker: parent.Ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 91, TradeID: tradeID, IntentKey: "linked-replacement", ClientOrderID: "linked-replacement-id", ReplacesBrokerOrderID: "old-linked"}
+	payload, _ := json.Marshal(req)
+	child := store.StockOrderIntent{ID: "66666666-6666-4666-8666-666666666666", IdempotencyKey: req.IntentKey, ClientOrderID: req.ClientOrderID, TradeID: tradeID, ParentIntentID: parent.ID, Ticker: parent.Ticker, Side: "sell", OrderType: "stop", RequestedQty: 1, RequestPayload: payload, PayloadHash: "c", Status: "pending"}
+	if err := store.CreateStockOrderIntent(ctx, child); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.InsertOrder(ctx, store.Order{TradeID: tradeID, BrokerOrderID: "new-linked", Ticker: parent.Ticker, Side: "sell", OrderType: "stop", Quantity: 1, StopPrice: 91, Status: "pending", IsStopLoss: true, StockIntentID: child.ID}); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.lookup[child.ClientOrderID] = execution.OrderResult{BrokerOrderID: "new-linked", Status: "accepted"}
+	if err := stockorders.New(broker).Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(broker.patches) != 0 {
+		t.Fatal("already-linked replacement was resubmitted")
+	}
+}
+
+func TestStockIntentFilledStandaloneStopMissingProjectionRecovers(t *testing.T) {
+	ctx := context.Background()
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
+		t.Fatal(err)
+	}
+	signalID := insertRecoverySignal(t, "RINTENTFILLEDSTOP")
+	tradeID, _ := store.InsertTrade(ctx, store.Trade{SignalID: signalID, Ticker: "RINTENTFILLEDSTOP", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 1})
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "filled-stop", Status: "filled", FilledPrice: 90, FilledQty: 1})
+	c := stockorders.New(broker)
+	req := execution.OrderRequest{Ticker: "RINTENTFILLEDSTOP", Side: execution.OrderSideSell, Type: execution.OrderTypeStop, Quantity: 1, StopPrice: 90, TradeID: tradeID, IntentKey: "protective-stop-filled:" + tradeID}
+	if _, err := c.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	in := intentForKey(t, req.IntentKey)
+	if err := c.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	o, err := store.GetOrderByStockIntentID(ctx, in.ID)
+	if err != nil || o == nil || o.Status != "filled" || o.FilledQty != 1 {
+		t.Fatalf("filled stop projection=%#v err=%v", o, err)
+	}
+}
+
 func TestStockIntentReplacementRecoveryCompletesIntentOnlyCrash(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected'`); err != nil {
