@@ -1176,7 +1176,7 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, referencePric
 		}
 	}()
 
-	exitRes, exitQty, err := m.exitAtMarket(ctx, t, referencePrice)
+	exitRes, exitQty, intentKey, err := m.exitAtMarket(ctx, t, referencePrice)
 	if err != nil {
 		if errors.Is(err, errExitClaimMustRemain) {
 			releaseClaim = false
@@ -1188,7 +1188,6 @@ func (m *Manager) exitAndClose(ctx context.Context, t store.Trade, referencePric
 	// persistence fails. Releasing it would let another worker submit a second
 	// full sell on its next stale/open read.
 	releaseClaim = false
-	intentKey := fmt.Sprintf("trailing-market-exit:%s:%.8f", t.ID, exitQty)
 	stockIntentID, err := m.stockIntentIDForAcceptedOrder(ctx, intentKey)
 	if err != nil {
 		return fmt.Errorf("resolve accepted trailing market-exit intent: %w", err)
@@ -1326,7 +1325,7 @@ func (m *Manager) cancelAndConfirm(ctx context.Context, brokerOrderID string) er
 // Returns the broker's OrderResult so the caller can use the actual
 // FilledPrice/FilledQty for trade close + pnl. Mirrors the field set
 // engine.monitorPositions persists on its non-trailing exit path.
-func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePrice float64) (execution.OrderResult, float64, error) {
+func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePrice float64) (execution.OrderResult, float64, string, error) {
 	// Cancel every working exit leg first — not just the latest stop. For
 	// bracket-managed trades the stop AND take-profit legs each hold the
 	// trade's shares at the broker; a market sell with either leg still
@@ -1335,9 +1334,9 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePric
 	// retry on the next manager tick unless every leg is confirmed gone.
 	exitQty, err := m.cancelExitLegsForMarketExit(ctx, t)
 	if err != nil {
-		return execution.OrderResult{}, 0, err
+		return execution.OrderResult{}, 0, "", err
 	}
-	res, err := m.exec.PlaceOrder(ctx, execution.OrderRequest{
+	req := execution.OrderRequest{
 		Ticker:         t.Ticker,
 		Side:           execution.OrderSideSell,
 		Type:           execution.OrderTypeMarket,
@@ -1345,13 +1344,42 @@ func (m *Manager) exitAtMarket(ctx context.Context, t store.Trade, referencePric
 		ReferencePrice: referencePrice,
 		TradeID:        t.ID,
 		IntentKey:      fmt.Sprintf("trailing-market-exit:%s:%.8f", t.ID, exitQty),
-	})
-	if err != nil {
-		return execution.OrderResult{}, 0, fmt.Errorf(
-			"%w: ambiguous market-sell placement: %v", errExitClaimMustRemain, err,
-		)
 	}
-	return res, exitQty, nil
+	durable, ok := m.exec.(interface{ DurableStockOrderIntents() bool })
+	if !ok || !durable.DurableStockOrderIntents() {
+		res, err := m.exec.PlaceOrder(ctx, req)
+		if err != nil {
+			return execution.OrderResult{}, 0, "", fmt.Errorf(
+				"%w: ambiguous market-sell placement: %v", errExitClaimMustRemain, err,
+			)
+		}
+		return res, exitQty, req.IntentKey, nil
+	}
+	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
+		res, err := m.exec.PlaceOrder(ctx, req)
+		terminalZero := err == nil && isTerminalZeroFill(res.Status, res.FilledQty)
+		if err == nil && !terminalZero {
+			return res, exitQty, req.IntentKey, nil
+		}
+		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			return execution.OrderResult{}, 0, "", fmt.Errorf(
+				"%w: ambiguous market-sell placement: %v", errExitClaimMustRemain, err,
+			)
+		}
+		retryKey, resolveErr := m.resolveTerminalStopIntentKey(ctx, req.IntentKey)
+		if resolveErr != nil {
+			return execution.OrderResult{}, 0, "", fmt.Errorf("resolve terminal trailing market-exit generation: %w", resolveErr)
+		}
+		if retryKey == req.IntentKey {
+			return execution.OrderResult{}, 0, "", errors.New("terminal trailing market-exit generation resolver did not advance")
+		}
+		req.IntentKey = retryKey
+		req.ClientOrderID = ""
+		if generation == maxTerminalStopGenerationSubmissions-1 {
+			return execution.OrderResult{}, 0, "", fmt.Errorf("trailing market exit remained terminal through %d generations", maxTerminalStopGenerationSubmissions)
+		}
+	}
+	return execution.OrderResult{}, 0, "", errors.New("unreachable terminal trailing market-exit generation state")
 }
 
 func (m *Manager) cancelExitLegsForMarketExit(ctx context.Context, t store.Trade) (float64, error) {

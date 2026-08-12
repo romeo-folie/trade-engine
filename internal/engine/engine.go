@@ -2847,6 +2847,50 @@ func stockIntentIDForAcceptedOrder(ctx context.Context, executor execution.Execu
 	return stockIntentIDForAcceptedOrderWithLookup(ctx, executor, key, store.GetStockOrderIntentByKey)
 }
 
+// placeMarketExitWithTerminalRetries advances only durable terminal zero-fill
+// generations. A terminal client id can never become live again, so replaying
+// the base key would otherwise repeatedly return ErrTerminalZeroFillPlacement
+// while the just-released trade claim is immediately reacquired.
+//
+// Ambiguous failures intentionally do not rotate: the same client id may
+// already identify a broker-accepted order, and the durable reconciler must
+// keep ownership until that ambiguity is resolved.
+func (e *Engine) placeMarketExitWithTerminalRetries(
+	ctx context.Context,
+	req execution.OrderRequest,
+) (execution.OrderResult, string, bool, error) {
+	durable, ok := e.executor.(interface{ DurableStockOrderIntents() bool })
+	if !ok || !durable.DurableStockOrderIntents() {
+		res, err := e.executor.PlaceOrder(ctx, req)
+		return res, req.IntentKey, false, err
+	}
+
+	for generation := 0; generation < maxTerminalStopGenerationSubmissions; generation++ {
+		res, err := e.executor.PlaceOrder(ctx, req)
+		terminalZero := err == nil && isTerminalZeroFillStockIntent(res.Status, res.FilledQty)
+		if err == nil && !terminalZero {
+			return res, req.IntentKey, false, nil
+		}
+		if err != nil && !errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
+			return execution.OrderResult{}, req.IntentKey, false, err
+		}
+
+		_, retryKey, resolveErr := store.ResolveStockOrderIntentRetryGeneration(ctx, req.IntentKey)
+		if resolveErr != nil {
+			return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("resolve terminal market-exit generation: %w", resolveErr)
+		}
+		if retryKey == req.IntentKey {
+			return execution.OrderResult{}, req.IntentKey, true, errors.New("terminal market-exit generation resolver did not advance")
+		}
+		req.IntentKey = retryKey
+		req.ClientOrderID = ""
+		if generation == maxTerminalStopGenerationSubmissions-1 {
+			return execution.OrderResult{}, req.IntentKey, true, fmt.Errorf("market exit remained terminal through %d generations", maxTerminalStopGenerationSubmissions)
+		}
+	}
+	return execution.OrderResult{}, req.IntentKey, true, errors.New("unreachable terminal market-exit generation state")
+}
+
 func stockIntentIDForAcceptedOrderWithLookup(
 	ctx context.Context,
 	executor execution.Executor,
@@ -3254,7 +3298,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 		if t.Direction == "short" {
 			exitSide = execution.OrderSideBuy
 		}
-		result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
+		exitReq := execution.OrderRequest{
 			Ticker:         t.Ticker,
 			Side:           exitSide,
 			Type:           execution.OrderTypeMarket,
@@ -3262,8 +3306,14 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 			ReferencePrice: currentPrice,
 			TradeID:        t.ID,
 			IntentKey:      "software-exit:" + t.ID + ":" + exitReason,
-		})
+		}
+		result, intentKey, terminalZero, err := e.placeMarketExitWithTerminalRetries(ctx, exitReq)
 		if err != nil {
+			if terminalZero {
+				if releaseErr := store.ReleaseTradeExitClaim(ctx, t.ID); releaseErr != nil {
+					logger.Warn("release terminal software exit claim", "trade_id", t.ID, "err", releaseErr)
+				}
+			}
 			// A POST can fail after broker acceptance. Retain ownership and
 			// let aged orderless-exit recovery inspect broker truth.
 			logger.Warn("exit order placement ambiguous — claim retained",
@@ -3276,7 +3326,7 @@ func (e *Engine) monitorPositions(ctx context.Context) {
 				result = filled
 			}
 		}
-		stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, "software-exit:"+t.ID+":"+exitReason)
+		stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, intentKey)
 		if intentErr != nil {
 			// The broker accepted the market exit. Keep its claim and leave the
 			// durable coordinator recovery path to project it rather than write

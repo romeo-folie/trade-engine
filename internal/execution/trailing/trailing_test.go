@@ -537,6 +537,10 @@ type durableFakeBrokerWithReplace struct{ fakeBrokerWithReplace }
 
 func (durableFakeBrokerWithReplace) DurableStockOrderIntents() bool { return true }
 
+type durableMarketExitBroker struct{ *fakeBroker }
+
+func (*durableMarketExitBroker) DurableStockOrderIntents() bool { return true }
+
 func (b fakeBrokerWithReplace) ReplaceStopOrder(_ context.Context, brokerOrderID string, newStopPrice float64) (execution.OrderResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -2267,6 +2271,44 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 	}
 	if marketOrder.Quantity != 10 {
 		t.Fatalf("order.quantity: got %v want 10", marketOrder.Quantity)
+	}
+}
+
+func TestManager_MarketExitRotatesTerminalIntentGenerations(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	baseKey := "trailing-market-exit:t1:10.00000000"
+	key1 := baseKey + ":retry:terminal-1"
+	key2 := key1 + ":retry:terminal-2"
+	fs.stockIntentRetryKeys[baseKey] = key1
+	fs.stockIntentRetryKeys[key1] = key2
+	fs.stockIntentIDs[key2] = "intent-live"
+
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeResults: []execution.OrderResult{
+		{BrokerOrderID: "terminal-1", Status: "cancelled"},
+		{BrokerOrderID: "terminal-2", Status: "rejected"},
+		{BrokerOrderID: "live", Status: "filled", FilledPrice: 120, FilledQty: 10},
+	}}}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if got := len(fb.placed); got != 3 {
+		t.Fatalf("market-exit posts=%d, want terminal generations plus live fill", got)
+	}
+	for i, want := range []string{baseKey, key1, key2} {
+		if got := fb.placed[i].IntentKey; got != want {
+			t.Fatalf("market-exit generation %d key=%q, want %q", i, got, want)
+		}
+	}
+	if fs.trades["t1"].Status != "closed" {
+		t.Fatalf("trailing terminal-generation exit left trade %q", fs.trades["t1"].Status)
+	}
+	if got := len(fs.orders); got != 1 {
+		t.Fatalf("trailing terminal-generation exit stored %d orders, want one", got)
 	}
 }
 

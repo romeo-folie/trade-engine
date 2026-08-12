@@ -106,15 +106,19 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	}
 	totalQty = remainingQty
 
-	result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
+	exitReq := execution.OrderRequest{
 		Ticker:         sig.Ticker,
 		Side:           execution.OrderSideSell,
 		Type:           execution.OrderTypeMarket,
 		Quantity:       totalQty,
 		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
 		IntentKey:      "analyst-exit:" + sigID + ":" + sig.Ticker,
-	})
+	}
+	result, intentKey, terminalZero, err := e.placeMarketExitWithTerminalRetries(ctx, exitReq)
 	if err != nil {
+		if terminalZero {
+			releaseClaims()
+		}
 		// Broker POST/response failures are ambiguous: the order may have
 		// been accepted before the transport failed. Keep every claim so
 		// orderless-exit recovery can inspect working orders/positions.
@@ -129,7 +133,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			result = res
 		}
 	}
-	stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, "analyst-exit:"+sigID+":"+sig.Ticker)
+	stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, intentKey)
 	if intentErr != nil {
 		// The claimed lots remain owned while coordinator recovery resolves
 		// the accepted aggregate broker order. Do not insert unlinked rows.

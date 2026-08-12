@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/stockorders"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -59,6 +61,131 @@ type terminalGenerationBroker struct {
 	lookup     map[string]execution.OrderResult
 	brokerToID map[string]string
 	statuses   []string
+}
+
+// marketExitGenerationBroker returns a succession of terminal zero-fill
+// market responses before a live fill. It deliberately has no client-id
+// lookup result, so each retry must be a freshly generated durable intent.
+type marketExitGenerationBroker struct {
+	posts    []execution.OrderRequest
+	statuses []string
+	err      error
+}
+
+func (b *marketExitGenerationBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	b.posts = append(b.posts, req)
+	if b.err != nil {
+		return execution.OrderResult{}, b.err
+	}
+	status := b.statuses[len(b.posts)-1]
+	res := execution.OrderResult{BrokerOrderID: fmt.Sprintf("market-exit-generation-%d", len(b.posts)), Status: status}
+	if status == "filled" {
+		res.FilledPrice, res.FilledQty = 120, req.Quantity
+	}
+	return res, nil
+}
+func (*marketExitGenerationBroker) GetOrderByClientID(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+func (*marketExitGenerationBroker) CancelOrder(context.Context, string) error { return nil }
+func (*marketExitGenerationBroker) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
+func (*marketExitGenerationBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*marketExitGenerationBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*marketExitGenerationBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
+
+func TestMonitorPositionsRotatesTerminalSoftwareExitGenerations(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	ticker := fmt.Sprintf("EXITTGEN%d", time.Now().UnixNano())
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: ticker, Direction: "long", Strategy: "momentum",
+		EntryPrice: 100, Quantity: 3, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertCandles(ctx, []data.Candle{{
+		Ticker: ticker, Timeframe: data.Timeframe5Min, Timestamp: time.Now().UTC(),
+		Open: 120, High: 121, Low: 119, Close: 120, Volume: 1000,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	broker := &marketExitGenerationBroker{statuses: []string{"cancelled", "rejected", "expired", "filled"}}
+	coordinator := stockorders.New(broker)
+	baseKey := "software-exit:" + tradeID + ":take-profit hit"
+	// The first market exit reached the broker but finished zero-fill. This
+	// simulates the released-claim retry where the stale base key now returns
+	// ErrTerminalZeroFillPlacement before the engine can submit again.
+	if _, err := coordinator.PlaceOrder(ctx, execution.OrderRequest{
+		Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+		Quantity: 3, ReferencePrice: 120, TradeID: tradeID, IntentKey: baseKey,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e := newBracketTestEngine(coordinator)
+	e.monitorPositions(ctx)
+
+	if got := len(broker.posts); got != 4 {
+		t.Fatalf("market-exit submissions=%d, want terminal generations plus live fill", got)
+	}
+	key := baseKey
+	seenClients := map[string]bool{}
+	for i, req := range broker.posts {
+		if req.IntentKey != key {
+			t.Fatalf("generation %d key=%q, want %q", i, req.IntentKey, key)
+		}
+		if req.ClientOrderID == "" || seenClients[req.ClientOrderID] {
+			t.Fatalf("generation %d reused/omitted client id: %q", i, req.ClientOrderID)
+		}
+		seenClients[req.ClientOrderID] = true
+		key = store.StockOrderIntentRetryKey(key, fmt.Sprintf("market-exit-generation-%d", i+1))
+	}
+	finalIntent, err := store.GetStockOrderIntentByKey(ctx, broker.posts[len(broker.posts)-1].IntentKey)
+	if err != nil || finalIntent == nil {
+		t.Fatalf("final market-exit intent=%#v err=%v", finalIntent, err)
+	}
+	var rows int
+	if err := store.GetDB().QueryRow(ctx, `SELECT COUNT(*) FROM orders WHERE trade_id=$1::uuid`, tradeID).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("final market-exit orders=%d err=%v, want one", rows, err)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" || trade.Quantity != 3 {
+		t.Fatalf("terminal software exit trade=%#v err=%v", trade, err)
+	}
+	// A closed trade is no longer eligible for a fresh claim or a duplicate
+	// market exit on the next monitor pass.
+	e.monitorPositions(ctx)
+	if got := len(broker.posts); got != 4 {
+		t.Fatalf("closed trade replayed market exit: %d submissions", got)
+	}
+}
+
+func TestMarketExitAmbiguityDoesNotRotateIntentGeneration(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	broker := &marketExitGenerationBroker{statuses: []string{"filled"}, err: errors.New("response lost")}
+	e := newBracketTestEngine(stockorders.New(broker))
+	_, key, terminalZero, err := e.placeMarketExitWithTerminalRetries(context.Background(), execution.OrderRequest{
+		Ticker: "EXITAMBIG", Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
+		Quantity: 1, IntentKey: "software-exit:ambiguous:test",
+	})
+	if err == nil || terminalZero {
+		t.Fatalf("ambiguous exit err=%v terminal=%v, want nonterminal error", err, terminalZero)
+	}
+	if key != "software-exit:ambiguous:test" || len(broker.posts) != 2 {
+		t.Fatalf("ambiguous exit rotated key=%q posts=%d, want exact replay only", key, len(broker.posts))
+	}
 }
 
 func newTerminalGenerationBroker(statuses ...string) *terminalGenerationBroker {
