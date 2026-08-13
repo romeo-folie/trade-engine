@@ -199,6 +199,131 @@ func TestWorkingBrokerStopCoversTradeRequiresAnActiveFullStop(t *testing.T) {
 	}
 }
 
+func TestBrokerStopSnapshotUnknown(t *testing.T) {
+	if !brokerStopSnapshotUnknown([]legState{{leg: store.Order{IsStopLoss: true}}}) {
+		t.Fatal("unreadable stop snapshot must remain unknown")
+	}
+	if brokerStopSnapshotUnknown([]legState{{ok: true, leg: store.Order{IsStopLoss: true}, res: execution.OrderResult{Status: "accepted"}}}) {
+		t.Fatal("readable stop snapshot must not remain unknown")
+	}
+}
+
+func TestReconcileBracket_LegacyTradeWithoutIntentRemainsApplicationManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_NO_INTENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	e := newBracketTestEngine(&fakeBracketExec{})
+	e.cfg.Risk.BracketExitsEnabled = true
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); handled {
+		t.Fatal("legacy trade without a broker-protection intent must retain application-managed exits")
+	}
+}
+
+func TestCancelLegacyBrokerHeldEntry_GTCDoneForDayRemainsWorking(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:gtc-legacy-" + intentID
+	clientOrderID := "gtc-legacy-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "GTCLEGACY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, Ticker: "GTCLEGACY",
+		Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "gtc-legacy", BrokerOrderID: "gtc-legacy-parent", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "gtc-legacy-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatalf("record accepted legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"gtc-legacy-parent": {Status: "done_for_day"},
+	}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intent.IdempotencyKey)
+	if got := len(exec.cancelled); got != 3 {
+		t.Fatalf("cancellation attempts = %d, want 3 while GTC parent remains done_for_day", got)
+	}
+	updated, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+	if err != nil || updated == nil || updated.Status != "pending" {
+		t.Fatalf("GTC legacy intent = %+v err=%v, want pending", updated, err)
+	}
+}
+
+func TestReconcileBracket_UnknownStrictStopSnapshotRetriesWithoutContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "STRICT_UNKNOWN_STOP", 2)
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:strict-unknown-" + intentID
+	clientOrderID := "strict-unknown-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "STRICT_UNKNOWN_STOP", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID,
+		TimeInForce: "gtc", RequireBrokerProtection: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "STRICT_UNKNOWN_STOP", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "strict-unknown", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup strict intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "strict-unknown-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record strict intent: %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses:  map[string]execution.OrderResult{tpID: {Status: "accepted", Quantity: 2, RemainingQty: 2}},
+		statusErr: map[string]error{slID: fmt.Errorf("transient stop status failure")},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("unknown strict stop snapshot must retain broker ownership")
+	}
+	if len(exec.cancelled) != 0 {
+		t.Fatalf("containment cancellations = %v, want no flatten on unknown stop snapshot", exec.cancelled)
+	}
+}
+
 func TestBrokerSnapshotRemainingTradeQtyAccountsForNewPartialTakeProfit(t *testing.T) {
 	states := []legState{
 		{ok: true, leg: store.Order{IsTakeProfit: true, FilledQty: 1}, res: execution.OrderResult{FilledQty: 3}},

@@ -174,6 +174,13 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 			"intent_key", intentKey, "err", err)
 		return
 	}
+	var req execution.OrderRequest
+	if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+		logger.Error("broker protection: decode legacy broker-held entry request",
+			"intent_key", intentKey, "err", err)
+		return
+	}
+	timeInForce := req.TimeInForce
 
 	var terminal execution.OrderResult
 	confirmed := false
@@ -192,7 +199,7 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 		if err != nil {
 			continue
 		}
-		if !execution.IsTerminalOrderStatus(status.Status) {
+		if !execution.IsTerminalOrderStatusForTimeInForce(status.Status, timeInForce) {
 			continue
 		}
 		terminal = status
@@ -205,7 +212,7 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 		return
 	}
 	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, intent.BrokerOrderID,
-		execution.NormalizeOrderStatus(terminal.Status), terminal.FilledPrice, terminal.FilledQty,
+		execution.NormalizeOrderStatusForTimeInForce(terminal.Status, timeInForce), terminal.FilledPrice, terminal.FilledQty,
 		terminal.RequestID, "", false); err != nil {
 		logger.Error("broker protection: persist retired legacy entry", "intent_key", intentKey, "err", err)
 		return

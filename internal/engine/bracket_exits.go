@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -141,7 +142,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		legs = standaloneStopLegs(all)
 	}
 	if len(legs) == 0 {
-		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr != nil && bracketPolicyEnabled {
+		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr != nil && bracketPolicyEnabled && !errors.Is(policyErr, pgx.ErrNoRows) {
 			// A strict entry with an unreadable policy may still have live,
 			// unprojected broker children. Do not let software exits race them.
 			logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
@@ -243,6 +244,11 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		return handled, errors.Join(pollErr, closeErr)
 	}
 	if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr == nil && required && parentID != "" {
+		if brokerStopSnapshotUnknown(states) {
+			// A failed stop lookup is not evidence that protection disappeared.
+			// Keep broker ownership and retry before taking a destructive action.
+			return true, pollErr
+		}
 		if !workingBrokerStopCoversTrade(states, brokerSnapshotRemainingTradeQty(t.Quantity, states)) {
 			// A live TP is not downside protection. Retain broker ownership and
 			// safely contain the position rather than handing it to the candle
@@ -419,6 +425,15 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		return false, pollErr
 	}
 	return ownsAllExits, pollErr
+}
+
+func brokerStopSnapshotUnknown(states []legState) bool {
+	for _, state := range states {
+		if state.leg.IsStopLoss && !state.ok {
+			return true
+		}
+	}
+	return false
 }
 
 // brokerSnapshotRemainingTradeQty anticipates cumulative broker fills that
