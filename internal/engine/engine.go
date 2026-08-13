@@ -3286,9 +3286,44 @@ func (e *Engine) PreparedStockEntryNeedsAdmission(ctx context.Context, intentKey
 		}
 		return
 	}
+	if e.preparedEntryPredatesBrokerProtection(ctx, intentKey) {
+		// Recovery has just proved this prepared generation never reached the
+		// broker. It cannot be replayed after the operator enables strict
+		// protection, because its immutable request deliberately lacks that
+		// requirement. Retire only with that broker-miss proof, then let the
+		// queued signal create a fresh protected successor on its next pass.
+		reason := "broker confirmed entry absent; prepared generation predates the required broker-protection policy"
+		if err := store.RetirePreparedStockEntryAfterBrokerMiss(ctx, intentKey, reason); err != nil {
+			logger.Warn("retire legacy prepared stock entry after broker miss", "intent_key", intentKey, "err", err)
+			return
+		}
+	}
 	if err := store.QueueSignalForDeferredExecution(ctx, signalID); err != nil {
 		logger.Warn("queue prepared stock entry for fresh admission", "intent_key", intentKey, "err", err)
 	}
+}
+
+// preparedEntryPredatesBrokerProtection identifies a legacy immutable request
+// that can no longer be safely replayed under the currently enabled strict
+// admission policy. Its caller is invoked only after client-ID recovery has
+// confirmed the prepared generation is absent at the broker.
+func (e *Engine) preparedEntryPredatesBrokerProtection(ctx context.Context, intentKey string) bool {
+	if e.cfg == nil || !e.cfg.Risk.BracketExitsEnabled {
+		return false
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil {
+		if err != nil {
+			logger.Warn("load prepared stock entry policy after broker miss", "intent_key", intentKey, "err", err)
+		}
+		return false
+	}
+	var req execution.OrderRequest
+	if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+		logger.Warn("decode prepared stock entry policy after broker miss", "intent_key", intentKey, "err", err)
+		return false
+	}
+	return !req.RequireBrokerProtection
 }
 
 func terminalPreparedEntrySignal(sig *store.Signal, now time.Time) bool {

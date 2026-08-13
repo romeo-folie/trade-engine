@@ -645,6 +645,69 @@ func TestPreparedEntryObserverQueuesFreshAdmissionWithoutReleasingReservation(t 
 	t.Fatal("prepared entry was not queued for fresh admission")
 }
 
+func TestPreparedEntryObserverRetiresLegacyGenerationWhenStrictPolicyEnabled(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("integration database unavailable")
+	}
+	ctx := context.Background()
+	signalID, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "PREPLEGACY", Action: "BUY", Strategy: "test", SignalPrice: 100,
+		StopLoss: 90, TakeProfit: 120, Confidence: .9, SizePct: 1, Status: "approved",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentKey := "entry:" + signalID
+	request := execution.OrderRequest{
+		Ticker: "PREPLEGACY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 1, IntentKey: intentKey, ClientOrderID: "legacy-prepared-" + strings.ReplaceAll(signalID, "-", ""),
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: request.ClientOrderID,
+		Ticker: request.Ticker, Side: "buy", OrderType: "market", RequestedQty: request.Quantity,
+		RequestPayload: payload, PayloadHash: "legacy-prepared-policy", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `UPDATE stock_order_intents SET purpose='superseded' WHERE id=$1::uuid`, intentID)
+	})
+
+	engine := &Engine{cfg: &config.Config{}}
+	engine.cfg.Risk.BracketExitsEnabled = true
+	engine.PreparedStockEntryNeedsAdmission(ctx, intentKey)
+
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil || intent.Status != "rejected" {
+		t.Fatalf("legacy prepared intent = %#v err=%v, want retired", intent, err)
+	}
+	if active, err := store.HasPreparedStockEntry(ctx, signalID); err != nil || active {
+		t.Fatalf("legacy prepared reservation remains active: active=%v err=%v", active, err)
+	}
+	signal, err := store.GetSignalByID(ctx, signalID)
+	if err != nil || signal == nil || signal.Status != "pending" {
+		t.Fatalf("signal after retiring legacy prepared generation = %#v err=%v, want queued pending", signal, err)
+	}
+	deferred, err := store.GetDeferredSignals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, queued := range deferred {
+		if queued.ID == signalID {
+			return
+		}
+	}
+	t.Fatal("signal was not queued for a fresh strict admission")
+}
+
 func TestExpiredSignalRetiresPreparedEntryOnlyAfterBrokerMissCallback(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("integration database unavailable")
