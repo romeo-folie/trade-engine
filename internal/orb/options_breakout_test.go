@@ -3,6 +3,7 @@ package orb
 import (
 	"context"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func TestAppendForcedOptionsUnderlyings(t *testing.T) {
 	router := NewOptionsRouter(rEngine(nil, nil, 40, true), &rPlacer{}, []string{"SPY", "IWM", "NVDA"}, 500, 0)
 
 	t.Run("injects missing, dedups an organic candidate", func(t *testing.T) {
-		// SPY already present as an organic gap candidate; must not be duplicated.
+		// SPY already present in restored candidate state; must not be duplicated.
 		scored := []ScoredCandidate{{Gap: data.GapCandidate{Ticker: "SPY", GapPct: 3.1}, Score: ORBAnalysisResult{Action: "trade", Conviction: 0.9}}}
 		got := appendForcedOptionsUnderlyings(scored, router)
 		if len(got) != 3 {
@@ -39,12 +40,11 @@ func TestAppendForcedOptionsUnderlyings(t *testing.T) {
 	})
 
 	t.Run("organic non-trade score is force-upgraded to trade", func(t *testing.T) {
-		// SPY gaps and the LLM says "skip" — it must still be watched (configured by rule),
-		// so its action is upgraded to trade while gap%/conviction/reasoning are preserved.
+		// A restored SPY candidate must still be watched because it is configured by rule.
 		scored := []ScoredCandidate{{Gap: data.GapCandidate{Ticker: "SPY", GapPct: 4.0}, Score: ORBAnalysisResult{Action: "skip", Conviction: 0.2, Reasoning: "no catalyst"}}}
 		got := appendForcedOptionsUnderlyings(scored, router)
 		i := indexOfTicker(got, "SPY")
-		if i < 0 || !isTradeAction(got[i].Score.Action) {
+		if i < 0 || !strings.EqualFold(got[i].Score.Action, "trade") {
 			t.Fatalf("SPY organic skip not force-upgraded to trade: %+v", got)
 		}
 		if got[i].Score.Reasoning != "no catalyst" || got[i].Gap.GapPct != 4.0 {
@@ -127,39 +127,9 @@ func TestCandlesAfter(t *testing.T) {
 	}
 }
 
-func TestOptionsScoringCutoffReached(t *testing.T) {
-	// Equities open = 09:30 ET (570 min); the cutoff is buffer minutes before that. Derive the
-	// boundary from the const so this stays correct if the buffer is retuned.
-	const openMin = 9*60 + 30
-	cutoffMin := openMin - optionsScanCutoffBufferMin // minutes-of-day at/after which scoring stops
-	etAt := func(minOfDay int) time.Time {
-		return time.Date(2026, 7, 14, minOfDay/60, minOfDay%60, 0, 0, nyLoc)
-	}
-	cases := []struct {
-		name string
-		now  time.Time
-		want bool
-	}{
-		{"well before open — keep scoring", etAt(9*60 + 5), false},
-		{"one minute before cutoff — keep scoring", etAt(cutoffMin - 1), false},
-		{"at the cutoff — stop", etAt(cutoffMin), true},
-		{"past open — stop", etAt(openMin + 15), true},
-	}
-	for _, c := range cases {
-		if got := optionsScoringCutoffReached(c.now, nyLoc, openMin); got != c.want {
-			t.Errorf("%s: optionsScoringCutoffReached(%s) = %v; want %v", c.name, c.now.Format("15:04"), got, c.want)
-		}
-	}
-	// A UTC instant must be compared in the session tz, not by its own clock: 09:29 ET is past
-	// any cutoff ≤ 3 min before the 09:30 open.
-	if !optionsScoringCutoffReached(time.Date(2026, 7, 14, 13, 29, 0, 0, time.UTC), nyLoc, openMin) {
-		t.Error("13:29 UTC = 09:29 ET should be past the cutoff")
-	}
-}
-
 // --- optionsBreakoutEntry (no DB touched on the no-breakout / gate-abort paths) ---
 
-// breakoutScheduler wires a scheduler for optionsBreakoutEntry unit tests: equities
+// breakoutScheduler wires a scheduler for optionsBreakoutEntry unit tests: New York
 // session (nyLoc, 09:30 open), now() at 10:00 ET so the 10:30 entry deadline is open.
 func breakoutScheduler(md data.MarketDataProvider, router *OptionsRouter) *ORBScheduler {
 	return &ORBScheduler{
@@ -196,6 +166,29 @@ func TestOptionsBreakoutEntry_NoBreakoutKeepsWatching(t *testing.T) {
 	}
 	if placer.calls != 0 {
 		t.Errorf("placer called %d times without a breakout", placer.calls)
+	}
+}
+
+func TestTickExecuting_LegacyEquityCandidateCannotPlaceStockOrder(t *testing.T) {
+	buf := NewRangeBuffer("LEGACY", 1)
+	buf.Add(data.Candle{Timestamp: time.Now(), High: 101, Low: 100, Close: 100.5})
+	exec := &flattenExec{}
+	s := &ORBScheduler{
+		cfg:              config.ORBConfig{RangeMinutes: 1, RiskReward: 2},
+		executor:         exec,
+		session:          &store.ORBSession{ID: "legacy-equity"},
+		rangeBuffers:     map[string]*RangeBuffer{"LEGACY": buf},
+		orderIDs:         make(map[string][2]string),
+		scaleOutEntryIDs: make(map[string][2]string),
+	}
+	// A resumed legacy session can still contain a persisted equity candidate.
+	// With no options router or forex/futures config, it must be ignored rather
+	// than falling through to the retired direct-stock bracket path.
+	if err := s.tickExecuting(context.Background()); err != nil {
+		t.Fatalf("tickExecuting: %v", err)
+	}
+	if len(exec.placed) != 0 {
+		t.Fatalf("legacy equity candidate placed stock order: %+v", exec.placed)
 	}
 }
 

@@ -101,7 +101,7 @@ func TestResolvePreflightModePreservesConnectedDatabaseLookupErrors(t *testing.T
 
 func TestProtectDryRunStockExecutorWrapsEveryAlpacaStockMode(t *testing.T) {
 	broker := execution.NewPaperExecutor()
-	for _, mode := range []string{"manual", "auto", "paper", "orb", "orb-newyork"} {
+	for _, mode := range []string{"manual", "auto", "paper", "orb-options", "orb-newyork"} {
 		if _, ok := protectDryRunStockExecutor(broker, true).(*execution.ReadOnlyExecutor); !ok {
 			t.Fatalf("%s dry-run did not receive read-only executor", mode)
 		}

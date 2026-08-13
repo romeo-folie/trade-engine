@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # te-switch.sh — stop the running engine and restart in the specified mode
 #
-# Usage: te-switch.sh [orb|forex|orb-forex|orb-newyork|regular] [--session london|newyork]
+# Usage: te-switch.sh [orb-options|forex|orb-forex|orb-newyork|regular] [--session london|newyork]
 #
 # For forex, if --session is omitted the script picks the session automatically
 # based on current UTC hour:
@@ -10,7 +10,7 @@
 #
 # orb-forex remains accepted as a compatibility alias for forex.
 #
-# orb-newyork runs equities ORB (Alpaca) and forex NY ORB (IBKR) concurrently
+# orb-newyork runs options ORB (Alpaca) and forex NY ORB (IBKR) concurrently
 # in a single process. Starts 30 min before NY open (13:30 UTC).
 #
 # IBKR re-authentication runs before every mode switch so the gateway is
@@ -116,7 +116,7 @@ GATEWAY_URL="${IBKR_GATEWAY_URL:-}"
 [ -n "$GATEWAY_URL" ] || GATEWAY_URL="https://localhost:5000"
 
 # needs_ibkr: modes that require a live, authenticated IBKR gateway session.
-# Equities-only modes (orb, regular) trade via Alpaca and must NOT be gated on
+# Alpaca-only modes (orb-options, regular) must NOT be gated on
 # IBKR auth — gating them would block a healthy equities launch on an unrelated
 # gateway outage.
 needs_ibkr() {
@@ -200,13 +200,13 @@ echo "[te-switch] Stopping any running engine instance..."
 sleep 5
 
 case "$MODE" in
-  orb)
-    echo "[te-switch] Starting in ORB mode (equities)..."
+  orb-options)
+    echo "[te-switch] Starting in options ORB mode..."
     prep_options_orb
-    ./te run --mode orb --detach
+    ./te run --mode orb-options --detach
     ;;
   orb-newyork)
-    echo "[te-switch] Starting in ORB-NewYork mode (equities + forex)..."
+    echo "[te-switch] Starting in ORB-NewYork mode (options + forex)..."
     prep_options_orb
     ./te run --mode orb-newyork --detach
     ;;

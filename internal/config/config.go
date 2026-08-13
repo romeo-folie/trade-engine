@@ -34,7 +34,6 @@ type Config struct {
 	Embeddings       EmbeddingsConfig       `yaml:"embeddings"`
 	Analysis         AnalysisConfig         `yaml:"analysis"`
 	Cost             CostConfig             `yaml:"cost"`
-	ORB              ORBConfig              `yaml:"orb"`
 	ForexORB         ForexORBConfig         `yaml:"forex_orb"`
 	CurrencyStrength CurrencyStrengthConfig `yaml:"currency_strength"`
 	FuturesORB       FuturesORBConfig       `yaml:"futures_orb"`
@@ -69,22 +68,15 @@ type CacheConfig struct {
 	OrdersTTLSec    int `yaml:"orders_ttl_sec"`    // default 10
 }
 
-// ORBConfig controls the Opening Range Breakout operating mode (Phase 15).
+// ORBConfig is the shared scheduler input assembled from a concrete ORB
+// strategy configuration. It is intentionally not a top-level YAML section.
 type ORBConfig struct {
-	Enabled                 bool    `yaml:"enabled"`
-	Mode                    string  `yaml:"mode"`                      // "paper" | "live"
-	GapThresholdPct         float64 `yaml:"gap_threshold_pct"`         // minimum gap % (e.g. 3.0)
-	MinPrice                float64 `yaml:"min_price"`                 // drop gap movers trading below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.
-	MinDollarVolume         float64 `yaml:"min_dollar_volume"`         // drop gap movers whose price×volume is below this before scoring (default 0 = off). Snapshot volume is iex-only and under-reports consolidated liquidity, so a hard floor can drop genuinely liquid names — only enable on a SIP-backed deployment.
-	MaxCandidates           int     `yaml:"max_candidates"`            // 1–5 (how many scored candidates to actually trade)
-	MaxScanCandidates       int     `yaml:"max_scan_candidates"`       // how many top gap movers to LLM-score per scan (caps rate-limited LLM calls; 0 = default 15). Gap movers are ranked liquidity-first (|gap%| × log10 dollar-volume), so this keeps the most tradeable ones.
-	ScanConfidenceThreshold float64 `yaml:"scan_confidence_threshold"` // min aggregated analyst conviction for a gap candidate to be tradeable (0 = default 0.68). The equities scan aggregates whatever analysts are reachable by confidence — no arbiter required — so scoring survives a provider/arbiter outage.
-	RangeMinutes            int     `yaml:"range_minutes"`             // 5 or 15
-	RiskReward              float64 `yaml:"risk_reward"`               // e.g. 2.0
-	MaxRiskPct              float64 `yaml:"max_risk_pct"`              // max loss per trade as % of portfolio
-	MaxPositionPct          float64 `yaml:"max_position_pct"`          // max notional per trade as % of portfolio (e.g. 10.0)
-	NewsLookbackHours       int     `yaml:"news_lookback_hours"`       // e.g. 24
-	ScanCadenceMinutes      int     `yaml:"scan_cadence_minutes"`      // minimum minutes between pre-market scans (default 2)
+	Enabled        bool
+	MaxCandidates  int
+	RangeMinutes   int
+	RiskReward     float64
+	MaxRiskPct     float64
+	MaxPositionPct float64
 }
 
 // CostConfig controls the user-facing cost profile and budget guardrails.
@@ -1109,14 +1101,13 @@ func (c FuturesORBConfig) AsForexConfig() ForexORBConfig {
 	}
 }
 
-// OptionsORBConfig configures options-ORB: running the existing ORB signal on a
-// curated set of underlyings but executing via long single-leg equity options on
-// Alpaca. Default-off. The gate thresholds mirror internal/options.GateConfig; the
-// sizing/exit knobs feed the router and app-managed exit manager.
+// OptionsORBConfig configures the explicit options-only ORB runner: fixed
+// underlyings execute as long single-leg equity options on Alpaca. Default-off.
+// The gate thresholds mirror internal/options.GateConfig; sizing/exit knobs feed
+// the router and app-managed exit manager.
 type OptionsORBConfig struct {
 	Enabled bool `yaml:"enabled"`
-	// Underlyings is the set of options-mode symbols. A ticker outside this set runs
-	// the normal equity/forex/futures bracket path unchanged.
+	// Underlyings is the fixed, rule-based set of options-mode symbols.
 	Underlyings []string `yaml:"underlyings"`
 	// ETFUnderlyings are earnings-free (SPY/QQQ) and exempt from the earnings gate.
 	// A single-name underlying not listed here is subject to the earnings blackout,
@@ -1127,6 +1118,8 @@ type OptionsORBConfig struct {
 	// Sizing (dollars).
 	PremiumBudget   float64 `yaml:"premium_budget"`     // premium to deploy per trade
 	MaxLossPerTrade float64 `yaml:"max_loss_per_trade"` // hard cap on premium at risk (0 = none)
+	RangeMinutes    int     `yaml:"range_minutes"`      // opening range, 5 or 15 minutes
+	RiskReward      float64 `yaml:"risk_reward"`        // underlying target multiple, >= 1.5
 
 	// Gate thresholds (see internal/options.GateConfig defaults).
 	IVRankCeiling        float64 `yaml:"iv_rank_ceiling"`        // default 70
@@ -1444,13 +1437,12 @@ type GraphNeighborsConfig struct {
 
 // FeedbackConfig controls the automated feedback pipeline (Phase 17).
 type FeedbackConfig struct {
-	Enabled             bool                  `yaml:"enabled"`
-	ReviewTimeUTC       string                `yaml:"review_time_utc"`
-	Windows             []int                 `yaml:"windows"`
-	PromptEnrichment    bool                  `yaml:"prompt_enrichment"`
-	ORBPromptEnrichment bool                  `yaml:"orb_prompt_enrichment"`
-	Thresholds          FeedbackThresholds    `yaml:"thresholds"`
-	ORBAutoThrottle     ORBAutoThrottleConfig `yaml:"orb_auto_throttle"`
+	Enabled          bool                  `yaml:"enabled"`
+	ReviewTimeUTC    string                `yaml:"review_time_utc"`
+	Windows          []int                 `yaml:"windows"`
+	PromptEnrichment bool                  `yaml:"prompt_enrichment"`
+	Thresholds       FeedbackThresholds    `yaml:"thresholds"`
+	ORBAutoThrottle  ORBAutoThrottleConfig `yaml:"orb_auto_throttle"`
 }
 
 // ORBAutoThrottleConfig closes the feedback loop on ORB forex position sizing: it derives a
@@ -2200,11 +2192,11 @@ func Validate(cfg *Config) []string {
 
 	validModes := map[string]bool{
 		"manual": true, "auto": true, "paper": true,
-		"orb": true, "forex": true, "orb-forex": true,
-		"orb-futures": true, "orb-futures-metals": true, "orb-newyork": true,
+		"forex": true, "orb-forex": true, "orb-futures": true,
+		"orb-futures-metals": true, "orb-newyork": true, "orb-options": true,
 	}
 	if !validModes[cfg.Engine.Mode] {
-		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper|orb|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork, got %q", cfg.Engine.Mode))
+		errs = append(errs, fmt.Sprintf("engine.mode must be one of manual|auto|paper|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork|orb-options, got %q", cfg.Engine.Mode))
 	}
 
 	if cfg.Engine.LogTimezone != "" {
@@ -2841,34 +2833,15 @@ func Validate(cfg *Config) []string {
 		errs = append(errs, fmt.Sprintf("env var %s (database.url_env) is not set", dbEnv))
 	}
 
-	// ── ORB validation ──────────────────────────────────────────────────────
-	if cfg.ORB.Enabled {
-		if cfg.ORB.GapThresholdPct <= 0 {
-			errs = append(errs, "orb.gap_threshold_pct must be > 0")
+	if cfg.OptionsORB.Enabled {
+		if len(cfg.OptionsORB.Underlyings) == 0 {
+			errs = append(errs, "options_orb.underlyings must not be empty when enabled")
 		}
-		if cfg.ORB.RangeMinutes != 5 && cfg.ORB.RangeMinutes != 15 {
-			errs = append(errs, "orb.range_minutes must be 5 or 15")
+		if cfg.OptionsORB.RangeMinutes != 5 && cfg.OptionsORB.RangeMinutes != 15 {
+			errs = append(errs, "options_orb.range_minutes must be 5 or 15")
 		}
-		if cfg.ORB.MaxCandidates < 1 || cfg.ORB.MaxCandidates > 5 {
-			errs = append(errs, "orb.max_candidates must be 1-5")
-		}
-		// Analyst confidences are on a 0-1 scale, so a threshold > 1 (e.g. the typo 68
-		// for 0.68) can never pass and would silently skip EVERY candidate. 0 means "use
-		// the default"; anything else must be in (0, 1].
-		if cfg.ORB.ScanConfidenceThreshold < 0 || cfg.ORB.ScanConfidenceThreshold > 1 {
-			errs = append(errs, fmt.Sprintf("orb.scan_confidence_threshold must be in [0,1] (0 = default 0.68); got %.3f", cfg.ORB.ScanConfidenceThreshold))
-		}
-		if cfg.ORB.RiskReward < 1.5 {
-			errs = append(errs, "orb.risk_reward must be >= 1.5")
-		}
-		if cfg.ORB.MaxPositionPct <= 0 || cfg.ORB.MaxPositionPct > 50.0 {
-			errs = append(errs, fmt.Sprintf("orb.max_position_pct must be > 0 and <= 50 (got %.1f)", cfg.ORB.MaxPositionPct))
-		}
-		if cfg.ORB.MaxRiskPct <= 0 || cfg.ORB.MaxRiskPct > 5.0 {
-			errs = append(errs, "orb.max_risk_pct must be > 0 and <= 5.0")
-		}
-		if cfg.ORB.Mode != "paper" && cfg.ORB.Mode != "live" {
-			errs = append(errs, "orb.mode must be paper or live")
+		if cfg.OptionsORB.RiskReward < 1.5 {
+			errs = append(errs, "options_orb.risk_reward must be >= 1.5")
 		}
 	}
 

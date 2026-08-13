@@ -484,7 +484,8 @@ func (c *Coordinator) projectRecoveredMarketExit(ctx context.Context, intent sto
 func isRecoveredMarketExitKey(key string) bool {
 	return strings.HasPrefix(key, "software-exit:") ||
 		strings.HasPrefix(key, "trailing-market-exit:") ||
-		strings.HasPrefix(key, "analyst-exit:")
+		strings.HasPrefix(key, "analyst-exit:") ||
+		strings.HasPrefix(key, "broker-protection-flatten:")
 }
 
 func analystExitSignalID(key, ticker string) (string, bool) {

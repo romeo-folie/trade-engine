@@ -12,12 +12,13 @@ import (
 )
 
 const (
-	ExitReasonStopLoss    = "stop_loss"
-	ExitReasonTakeProfit  = "take_profit"
-	ExitReasonSellSignal  = "sell_signal"
-	ExitReasonTrailingATR = "trailing_atr"
-	ExitReasonEMA9Close   = "ema9_close"
-	ExitReasonRecovery    = "broker_recovery"
+	ExitReasonStopLoss                = "stop_loss"
+	ExitReasonTakeProfit              = "take_profit"
+	ExitReasonSellSignal              = "sell_signal"
+	ExitReasonTrailingATR             = "trailing_atr"
+	ExitReasonEMA9Close               = "ema9_close"
+	ExitReasonRecovery                = "broker_recovery"
+	ExitReasonBrokerProtectionFailure = "broker_protection_failure"
 )
 
 // ExitIntent is the durable policy decision that initiated an exit. Evidence

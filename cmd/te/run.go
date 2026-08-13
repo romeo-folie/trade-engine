@@ -57,12 +57,12 @@ Modes:
   manual     — signals are queued as pending; require approval
   auto       — signals that pass risk checks execute automatically
   paper      — paper trades on Alpaca paper API (default)
-  orb             — Opening Range Breakout mode (LLM-enhanced gap-and-go)
+  orb-options     — Options Opening Range Breakout via Alpaca
   forex           — Forex strategies via IBKR Client Portal (ORB + optional currency strength)
   orb-forex       — Backward-compatible alias for forex
   orb-futures     — Equity index futures ORB via IBKR (ES/NQ/YM/RTY; requires markets.ibkr.enabled=true)
   orb-futures-metals — Metals futures ORB via IBKR (GC/SI on COMEX; requires markets.ibkr.enabled=true)
-  orb-newyork     — Combined equities + forex ORB for the NY session (Alpaca + IBKR; requires both configured)`,
+  orb-newyork     — Combined options + forex ORB for the NY session (optional index futures)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if runDetach {
 			return startDetachedRun()
@@ -290,7 +290,7 @@ Modes:
 			fmt.Println("\nTradeEngine stopping...")
 			cancel()
 		}()
-		specializedMode := mode == "orb" || mode == "forex" || mode == "orb-forex" ||
+		specializedMode := mode == "orb-options" || mode == "forex" || mode == "orb-forex" ||
 			mode == "orb-futures" || mode == "orb-futures-metals" || mode == "orb-newyork"
 		trailingStarted := false
 		if trailingMgr != nil && specializedMode {
@@ -301,10 +301,10 @@ Modes:
 			trailingStarted = true
 		}
 
-		// ORB mode: run the ORB scheduler instead of the normal engine loop.
-		if mode == "orb" {
-			if !cfg.ORB.Enabled {
-				return fmt.Errorf("ORB mode is disabled in config — set orb.enabled: true")
+		// Options ORB runs fixed configured underlyings and never places a stock bracket.
+		if mode == "orb-options" {
+			if !cfg.OptionsORB.Enabled {
+				return fmt.Errorf("orb-options mode is disabled in config — set options_orb.enabled: true")
 			}
 
 			alpacaClient, ok := marketProvider.(*data.AlpacaClient)
@@ -313,7 +313,6 @@ Modes:
 			}
 
 			orbBus := events.New()
-			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
 			var orbNotifier orb.Notifier
 			if tgBot != nil {
 				orbNotifier = &orbTelegramNotifier{bot: tgBot}
@@ -321,7 +320,7 @@ Modes:
 
 			orbPortfolio := newDBPortfolioValuer(100_000)
 			orbScheduler := orb.NewORBScheduler(
-				cfg.ORB, store.GetDB(), alpacaClient, analyzer,
+				optionsSchedulerConfig(cfg.OptionsORB), store.GetDB(), alpacaClient,
 				broker, orbPortfolio, orbNotifier,
 			)
 			if newsProvider != nil {
@@ -337,15 +336,15 @@ Modes:
 					}
 				}()
 			}
-			// Options-ORB also runs in the standalone equities mode.
+			// Options ORB owns this standalone scheduler.
 			wireOptionsORB(orbScheduler, cfg.OptionsORB, broker)
 
-			logger.Info("ORB scheduler starting")
-			fmt.Println("ORB mode active. Waiting for pre-market scan window...")
+			logger.Info("options ORB scheduler starting")
+			fmt.Println("Options ORB mode active. Waiting for market open...")
 			if err := orbScheduler.Run(ctx); err != nil && err != context.Canceled {
 				return fmt.Errorf("orb scheduler: %w", err)
 			}
-			fmt.Println("TradeEngine (ORB) stopped.")
+			fmt.Println("TradeEngine (options ORB) stopped.")
 			return nil
 		}
 
@@ -409,7 +408,6 @@ Modes:
 			if cfg.ForexORB.Enabled {
 				// Create event bus/analyzer/notification adapter for ORB.
 				orbBus := events.New()
-				analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
 				var orbNotifier orb.Notifier
 				if tgBot != nil {
 					orbNotifier = &orbTelegramNotifier{bot: tgBot}
@@ -417,7 +415,6 @@ Modes:
 
 				orbCfg := config.ORBConfig{
 					Enabled:        cfg.ForexORB.Enabled,
-					Mode:           "paper",
 					MaxCandidates:  len(cfg.ForexORB.Instruments),
 					RangeMinutes:   cfg.ForexORB.RangeMinutes,
 					RiskReward:     cfg.ForexORB.RiskReward,
@@ -425,7 +422,7 @@ Modes:
 					MaxPositionPct: cfg.ForexORB.MaxPositionPct,
 				}
 				orbScheduler := orb.NewORBScheduler(
-					orbCfg, store.GetDB(), ibkrData, analyzer,
+					orbCfg, store.GetDB(), ibkrData,
 					ibkrBroker, newDBPortfolioValuer(100_000), orbNotifier,
 				)
 				forexScanner := &orb.ForexCandidateScanner{
@@ -576,7 +573,6 @@ Modes:
 
 			// 5. Create event bus and analyzer.
 			orbBus := events.New()
-			analyzer := analysis.NewAnalyzer(cfg.Models, orbBus)
 
 			// 6. Create notification adapter.
 			var orbNotifier orb.Notifier
@@ -590,7 +586,6 @@ Modes:
 			// 8. Build ORBConfig shim for the scheduler.
 			orbCfg := config.ORBConfig{
 				Enabled:        true,
-				Mode:           "paper",
 				MaxCandidates:  len(futuresCfg.Instruments),
 				RangeMinutes:   futuresCfg.RangeMinutes,
 				RiskReward:     futuresCfg.RiskReward,
@@ -600,7 +595,7 @@ Modes:
 
 			// 9. Create ORB scheduler with IBKR components.
 			orbScheduler := orb.NewORBScheduler(
-				orbCfg, store.GetDB(), ibkrData, analyzer,
+				orbCfg, store.GetDB(), ibkrData,
 				ibkrBroker, orbPortfolio, orbNotifier,
 			)
 
@@ -642,7 +637,7 @@ Modes:
 			return nil
 		}
 
-		// ORB-NewYork mode: run equities ORB (Alpaca) and forex ORB (IBKR, newyork
+		// ORB-NewYork mode: run options ORB (Alpaca) and forex ORB (IBKR, newyork
 		// session) concurrently. Both schedulers share only the DB connection.
 		// Starts 30 min before NY open (13:30 UTC); both sessions open together.
 		if mode == "orb-newyork" {
@@ -663,8 +658,8 @@ Modes:
 			if cfg.Markets.IBKR.AccountID == "" {
 				return fmt.Errorf("orb-newyork mode requires markets.ibkr.account_id to be set")
 			}
-			if !cfg.ORB.Enabled {
-				return fmt.Errorf("orb-newyork mode requires orb.enabled=true")
+			if !cfg.OptionsORB.Enabled {
+				return fmt.Errorf("orb-newyork mode requires options_orb.enabled=true")
 			}
 
 			// 2. Set up IBKR broker (shared by the forex scheduler).
@@ -705,27 +700,23 @@ Modes:
 
 			ibkrData := data.NewIBKRClient(cfg.Markets.IBKR.GatewayURL, cfg.Markets.IBKR.InsecureTLS)
 
-			// 3. Build equities ORB scheduler (Alpaca data + broker).
-			equitiesBus := events.New()
-			equitiesAnalyzer := analysis.NewAnalyzer(cfg.Models, equitiesBus)
-			var equitiesNotifier orb.Notifier
+			// 3. Build options ORB scheduler (Alpaca data + broker).
+			optionsBus := events.New()
+			var optionsNotifier orb.Notifier
 			if tgBot != nil {
-				equitiesNotifier = &orbTelegramNotifier{bot: tgBot}
+				optionsNotifier = &orbTelegramNotifier{bot: tgBot}
 			}
-			equitiesScheduler := orb.NewORBScheduler(
-				cfg.ORB, store.GetDB(), alpacaClient, equitiesAnalyzer,
-				broker, newDBPortfolioValuer(100_000), equitiesNotifier,
+			optionsScheduler := orb.NewORBScheduler(
+				optionsSchedulerConfig(cfg.OptionsORB), store.GetDB(), alpacaClient,
+				broker, newDBPortfolioValuer(100_000), optionsNotifier,
 			)
-			if newsProvider != nil {
-				equitiesScheduler.SetNewsProvider(newsProvider)
-			}
-			equitiesScheduler.SetBus(equitiesBus)
+			optionsScheduler.SetBus(optionsBus)
 			// A single Reviewer covers both schedulers — it queries all trades
 			// globally and is not scoped to a bus. Running two would duplicate
 			// flag computation and event publishing.
 			if cfg.Feedback.Enabled {
-				equitiesScheduler.SetFeedbackConfig(&cfg.Feedback)
-				reviewer := feedback.NewReviewer(cfg.Feedback, equitiesBus, store.GetDB())
+				optionsScheduler.SetFeedbackConfig(&cfg.Feedback)
+				reviewer := feedback.NewReviewer(cfg.Feedback, optionsBus, store.GetDB())
 				go func() {
 					if err := reviewer.Run(ctx); err != nil && err != context.Canceled {
 						fmt.Printf("feedback reviewer: %v\n", err)
@@ -733,22 +724,17 @@ Modes:
 				}()
 			}
 
-			// Options-ORB (issue #418): when enabled and the broker is Alpaca, execute
-			// the configured underlyings via long options on the equities/newyork
-			// session. No-op otherwise — the equity bracket path is unchanged.
-			wireOptionsORB(equitiesScheduler, cfg.OptionsORB, broker)
+			wireOptionsORB(optionsScheduler, cfg.OptionsORB, broker)
 
 			// 4. Build forex ORB scheduler (IBKR data + broker, newyork session).
 			cfg.ForexORB.Session = "newyork"
 			forexBus := events.New()
-			forexAnalyzer := analysis.NewAnalyzer(cfg.Models, forexBus)
 			var forexNotifier orb.Notifier
 			if tgBot != nil {
 				forexNotifier = &orbTelegramNotifier{bot: tgBot}
 			}
 			forexORBCfg := config.ORBConfig{
 				Enabled:        cfg.ForexORB.Enabled,
-				Mode:           "paper",
 				MaxCandidates:  len(cfg.ForexORB.Instruments),
 				RangeMinutes:   cfg.ForexORB.RangeMinutes,
 				RiskReward:     cfg.ForexORB.RiskReward,
@@ -756,7 +742,7 @@ Modes:
 				MaxPositionPct: cfg.ForexORB.MaxPositionPct,
 			}
 			forexScheduler := orb.NewORBScheduler(
-				forexORBCfg, store.GetDB(), ibkrData, forexAnalyzer,
+				forexORBCfg, store.GetDB(), ibkrData,
 				ibkrBroker, newDBPortfolioValuer(100_000), forexNotifier,
 			)
 			forexScanner := &orb.ForexCandidateScanner{
@@ -775,26 +761,24 @@ Modes:
 			}
 
 			// 5. Optionally build a futures ORB scheduler (micro index futures via
-			// IBKR) alongside equities+forex. Index futures open at 09:30 ET — the
+			// IBKR) alongside options+forex. Index futures open at 09:30 ET — the
 			// same NY open as this mode — so they belong in this process rather than a
 			// colliding cron slot (te-switch runs one engine at a time). Opt-in via
 			// futures_orb.enabled; reuses the IBKR broker/data already set up above. A
 			// conid warm-up failure is NON-fatal: it disables futures for the session
-			// but never takes down the equities/forex bot.
+			// but never takes down the options/forex bot.
 			var futuresScheduler *orb.ORBScheduler
 			if cfg.FuturesORB.Enabled {
 				if err := ibkrBroker.WarmFuturesConidCache(ctx, cfg.FuturesORB.Instruments); err != nil {
 					logger.Warn("orb-newyork: futures conid warm-up failed — futures disabled this session", "err", err.Error())
 				} else {
 					futuresBus := events.New()
-					futuresAnalyzer := analysis.NewAnalyzer(cfg.Models, futuresBus)
 					var futuresNotifier orb.Notifier
 					if tgBot != nil {
 						futuresNotifier = &orbTelegramNotifier{bot: tgBot}
 					}
 					futuresORBCfg := config.ORBConfig{
 						Enabled:        true,
-						Mode:           "paper",
 						MaxCandidates:  len(cfg.FuturesORB.Instruments),
 						RangeMinutes:   cfg.FuturesORB.RangeMinutes,
 						RiskReward:     cfg.FuturesORB.RiskReward,
@@ -802,7 +786,7 @@ Modes:
 						MaxPositionPct: cfg.FuturesORB.MaxPositionPct,
 					}
 					futuresScheduler = orb.NewORBScheduler(
-						futuresORBCfg, store.GetDB(), ibkrData, futuresAnalyzer,
+						futuresORBCfg, store.GetDB(), ibkrData,
 						// Match standalone orb-futures: size risk/margin caps off the
 						// configured initial capital, not a hard-coded $100k, so combined
 						// and standalone modes size futures identically.
@@ -829,7 +813,7 @@ Modes:
 
 			// 6. Run the schedulers concurrently. A fatal error in any one cancels the
 			// shared context, which unblocks the others via their ctx.Done() check.
-			domains := "equities + forex"
+			domains := "options + forex"
 			if futuresScheduler != nil {
 				domains += " + futures"
 			}
@@ -837,8 +821,8 @@ Modes:
 			fmt.Printf("ORB-NewYork mode active (%s). Waiting for pre-market scan window...\n", domains)
 			eg, egCtx := errgroup.WithContext(ctx)
 			eg.Go(func() error {
-				if err := equitiesScheduler.Run(egCtx); err != nil && err != context.Canceled {
-					return fmt.Errorf("equities orb: %w", err)
+				if err := optionsScheduler.Run(egCtx); err != nil && err != context.Canceled {
+					return fmt.Errorf("options orb: %w", err)
 				}
 				return nil
 			})
@@ -1384,10 +1368,8 @@ func newDBPortfolioValuer(defaultValue float64) *dbPortfolioValuer {
 	}
 }
 
-// wireOptionsORB enables options-ORB on an equities ORB scheduler when configured
-// and the stocks broker is Alpaca. Called from EVERY equities entrypoint (--mode
-// orb and orb-newyork) so no run mode silently ignores options_orb config and
-// places stock brackets on configured underlyings.
+// wireOptionsORB enables options-ORB on an options scheduler when configured
+// and the stocks broker is Alpaca. It is called from explicit options entrypoints.
 func wireOptionsORB(scheduler *orb.ORBScheduler, optCfg config.OptionsORBConfig, broker execution.Executor) {
 	if !optCfg.Enabled {
 		return
@@ -1402,6 +1384,17 @@ func wireOptionsORB(scheduler *orb.ORBScheduler, optCfg config.OptionsORBConfig,
 			"underlyings", optCfg.Underlyings, "premium_budget", optCfg.PremiumBudget)
 	} else {
 		logger.Warn("options-ORB enabled but stocks broker is not Alpaca; skipping")
+	}
+}
+
+func optionsSchedulerConfig(cfg config.OptionsORBConfig) config.ORBConfig {
+	return config.ORBConfig{
+		Enabled:        cfg.Enabled,
+		MaxCandidates:  len(cfg.Underlyings),
+		RangeMinutes:   cfg.RangeMinutes,
+		RiskReward:     cfg.RiskReward,
+		MaxRiskPct:     1,
+		MaxPositionPct: 100,
 	}
 }
 
@@ -1458,7 +1451,7 @@ func (n *orbTelegramNotifier) Notify(ctx context.Context, msg string) error {
 }
 
 func init() {
-	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|orb|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork)")
+	runCmd.Flags().StringVar(&runMode, "mode", "", "Override engine mode (manual|auto|paper|forex|orb-forex|orb-futures|orb-futures-metals|orb-newyork|orb-options)")
 	runCmd.Flags().StringVar(&runSession, "session", "", "Override forex_orb.session (london|newyork)")
 	runCmd.Flags().BoolVar(&runDryRun, "dry-run", false, "Dry run — no orders placed")
 	runCmd.Flags().BoolVar(&runDetach, "detach", false, "Run engine in background and return immediately")

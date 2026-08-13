@@ -44,7 +44,7 @@ internal/
   analysis/          — Multi-model ensemble analysis (Claude · GPT-4o · Gemini · Ollama)
   risk/              — 7-check risk manager (confidence, R/R, position size, drawdown, …)
   execution/         — PaperExecutor + AlpacaBroker + IBKRBroker executors
-  orb/               — Opening Range Breakout strategy (equities + forex/CFD)
+  orb/               — Shared ORB lifecycle for options, forex, and futures
   feedback/          — Performance feedback pipeline (nightly review + prompt enrichment)
   portfolio/         — Portfolio tracker + position monitoring
   tui/               — Bubble Tea terminal dashboard
@@ -214,10 +214,9 @@ TE=/path/to/scripts/te-switch.sh
 # Starts 30 min before NY open (13:00 UTC).
 30 12 * * 1-5  $TE forex --session newyork
 
-# ── Equities ORB (optional) ──────────────────────────────────────
-# Pre-market gap scanning starts at 10:00 UTC (6 AM ET).
-# Market open is 13:30 UTC (9:30 AM ET). Auto-exits by 14:30 UTC.
-0 10 * * 1-5  $TE orb
+# ── Options ORB (optional) ───────────────────────────────────────
+# Fixed configured underlyings; no direct-equity ORB entries.
+0 13 * * 1-5  $TE orb-options
 
 # ── Standard mode: US equities session ───────────────────────────
 # Runs the full analysis pipeline (ensemble LLM, risk checks, execution).
@@ -233,8 +232,7 @@ TE=/path/to/scripts/te-switch.sh
 - `te-switch.sh` runs `te stop` + waits 5 seconds before starting each mode, preventing process collisions.
 - For `forex`, if `--session` is omitted, the script auto-detects from UTC hour (before 12:00 = london, after = newyork). `orb-forex` remains accepted as a compatibility alias.
 - Forex mode requires IBKR Client Portal Gateway running on the host. See `markets.ibkr` in config.
-- Equities ORB (`orb`) uses Alpaca. It can run concurrently with forex mode since they use different brokers.
-- Standard mode and equities ORB should not overlap — standard mode starts after ORB's 14:30 UTC cutoff.
+- Options ORB (`orb-options`) uses Alpaca option data and can run alongside forex because they use different brokers.
 - The feedback reviewer runs inside whichever process is active at `feedback.review_time_utc` (default 18:00 UTC).
 
 ## CLI Reference
@@ -258,7 +256,7 @@ te logs search <query>               Search the engine log
 te notify test                       Send an ungated Telegram API connectivity test
 ```
 
-Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb`,
+Supported `te run --mode` values are `manual`, `auto`, `paper`, `orb-options`,
 `forex` (`orb-forex` compatibility alias), `orb-futures`,
 `orb-futures-metals`, and `orb-newyork`. Forex mode accepts
 `--session london|newyork`.

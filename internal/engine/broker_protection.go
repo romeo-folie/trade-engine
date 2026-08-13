@@ -13,6 +13,8 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+var brokerProtectionVerificationRetryDelay = 2 * time.Second
+
 // containUnprotectedBrokerEntry stops a bracket parent before flattening an
 // accepted position that has not obtained verifiable broker protection. Alpaca
 // keeps bracket children held until the parent has fully filled, so flattening
@@ -60,7 +62,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		if !e.cancelBrokerBracketChildren(ctx, tradeID, status.ChildOrders) {
 			return
 		}
-		intent := newExitIntent(store.ExitReasonStopLoss, map[string]any{
+		intent := newExitIntent(store.ExitReasonBrokerProtectionFailure, map[string]any{
 			"broker_protection_failure": reason,
 			"entry_broker_order_id":     entryBrokerOrderID,
 		})
@@ -83,7 +85,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 			Ticker: ticker, Side: execution.OrderSideSell, Type: execution.OrderTypeMarket,
 			Quantity: quantity, ReferencePrice: status.FilledPrice, TradeID: tradeID,
 			IntentKey:  "broker-protection-flatten:" + tradeID,
-			ExitReason: store.ExitReasonStopLoss, ExitEvidence: intent.Evidence,
+			ExitReason: store.ExitReasonBrokerProtectionFailure, ExitEvidence: intent.Evidence,
 		}
 		result, intentKey, terminalZero, err := e.placeMarketExitWithTerminalRetries(ctx, exitReq)
 		if err != nil {
@@ -103,7 +105,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 			Side: string(execution.OrderSideSell), OrderType: string(execution.OrderTypeMarket),
 			Quantity: quantity, FilledPrice: result.FilledPrice, FilledQty: result.FilledQty,
 			FilledAt: filledAtPtr(result.FilledAt), Status: execution.NormalizeOrderStatus(result.Status),
-			IsStopLoss: true, StockIntentID: stockIntentID, ExitReason: store.ExitReasonStopLoss,
+			StockIntentID: stockIntentID, ExitReason: store.ExitReasonBrokerProtectionFailure,
 			ExitEvidence: intent.Evidence,
 		}); err != nil {
 			logger.Error("broker protection: persist accepted flatten", "trade_id", tradeID, "err", err)
@@ -297,6 +299,9 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 				logger.Warn("broker protection: fresh parent snapshot unavailable; retrying",
 					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
 					"attempt", attempt+1, "err", err)
+				if !waitForBrokerProtectionRetry(ctx) {
+					return
+				}
 				continue
 			}
 			trade, err := store.GetTradeByID(ctx, tradeID)
@@ -304,6 +309,9 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 				logger.Warn("broker protection: trade projection unavailable; retrying verification",
 					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
 					"attempt", attempt+1, "err", err)
+				if !waitForBrokerProtectionRetry(ctx) {
+					return
+				}
 				continue
 			}
 			// The broker's cumulative parent fill is newer than the asynchronous
@@ -313,6 +321,15 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 			state := brokerBracketProtectionState(status, heldQty)
 			if state.UnprotectedQty <= 1e-9 {
 				return
+			}
+			if attempt < 2 {
+				logger.Info("broker protection: bracket unprotected; re-verifying",
+					"trade_id", tradeID, "attempt", attempt+1, "status", status.Status,
+					"transient", brokerBracketProtectionTransient(status))
+				if !waitForBrokerProtectionRetry(ctx) {
+					return
+				}
+				continue
 			}
 			logger.Error("broker protection: containment required", "trade_id", tradeID,
 				"held_qty", state.HeldQty, "working_entry_qty", state.WorkingEntryQty,
@@ -324,6 +341,31 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 		logger.Error("broker protection: verification remains uncertain; retaining broker ownership",
 			"trade_id", tradeID, "broker_order_id", entryBrokerOrderID)
 	}()
+}
+
+func waitForBrokerProtectionRetry(ctx context.Context) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(brokerProtectionVerificationRetryDelay):
+		return true
+	}
+}
+
+// brokerBracketProtectionTransient reports expected Alpaca bracket transitions.
+// A partial parent keeps its children held until the parent completes; neither
+// snapshot proves a broken bracket, so verification gives the broker a bounded
+// opportunity to activate the stop before containment cancels the parent.
+func brokerBracketProtectionTransient(result execution.OrderResult) bool {
+	if result.Status == "partial" || (result.Quantity > 0 && result.FilledQty+1e-9 < result.Quantity) {
+		return true
+	}
+	for _, child := range result.ChildOrders {
+		if (child.Type == "stop" || child.Type == "stop_limit") && child.Status == "held" {
+			return true
+		}
+	}
+	return false
 }
 
 func brokerCoverageHeldQty(localQty float64, parent execution.OrderResult) float64 {
