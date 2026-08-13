@@ -3,7 +3,7 @@
 # Fields ending in _env reference environment variable names — set those vars in your shell.
 
 engine:
-  mode: auto                   # manual | auto | paper | orb | forex | orb-futures | orb-futures-metals | orb-newyork
+  mode: paper                  # manual | auto | paper | orb | forex | orb-futures | orb-futures-metals | orb-newyork
   tick_interval_sec: 3600      # Analysis interval (seconds). 3600=1h recommended for daily-candle strategy; 300=5min for intraday
   max_watchlist: 50            # Maximum concurrent watchlist items
   dry_run: false               # If true, no orders placed regardless of mode
@@ -168,13 +168,13 @@ models:
 markets:
   stocks:
     enabled: true
-    paper: false               # Live Alpaca account
-    # Set this to the expected live account number before deployment; preflight
-    # rejects credentials that resolve to another account.
+    paper: true                # true = paper-api.alpaca.markets; false = api.alpaca.markets
+    # Optional: fail preflight if the configured credentials select another account.
+    # Use separate paper/live credentials through the env vars on each deployment.
     expected_account_number: ""
-    api_key_env: ALPACA_LIVE_API_KEY
-    secret_env: ALPACA_LIVE_API_SECRET
-    base_url: https://api.alpaca.markets
+    api_key_env: ALPACA_API_KEY
+    secret_env: ALPACA_API_SECRET
+    base_url: https://paper-api.alpaca.markets
     data_url: https://data.alpaca.markets
     option_feed: indicative     # options chain feed: "opra" (real-time, needs Algo Trader Plus) | "indicative" (free, 15-min delayed). options-ORB requires opra.
 
@@ -475,7 +475,7 @@ embeddings:
 # ── ORB (Opening Range Breakout) mode ────────────────────────────────────────
 # Phase 15: LLM-enhanced gap-and-go strategy. Run with `te run --mode orb`.
 orb:
-  enabled: false               # Set to true to enable ORB mode
+  enabled: false               # Disabled: equity ORB entries were consistently late/chasing; retain other ORB modes separately
   mode: paper                  # paper | live
   gap_threshold_pct: 3.0       # Minimum gap % to qualify as candidate
   min_price: 5.0               # Drop gap movers below this $ price before scoring (omit for default 5.0; explicit 0 disables). Kills sub-$5 penny stocks / warrants that dominate a %-ranked movers list.

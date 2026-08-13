@@ -106,6 +106,19 @@ func (t *Tracker) Update(positions []ExecPosition, cashBalance, totalEquity, day
 	}
 }
 
+// SetPeakValue installs the authoritative account-scoped high-water mark.
+// Unlike Update's normal ratchet, an operator-confirmed capital reset may
+// intentionally lower this value. Callers must have already validated it
+// against durable broker-account state.
+func (t *Tracker) SetPeakValue(peak float64) {
+	if peak <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.state.PeakValue = peak
+	t.mu.Unlock()
+}
+
 // RecordLoss marks the timestamp of the most-recent losing trade close.
 func (t *Tracker) RecordLoss() {
 	t.mu.Lock()

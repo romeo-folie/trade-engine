@@ -1877,7 +1877,11 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// persisted new-stock-risk control immediately before releasing its
 			// bracket parent to the broker. Exits use separate paths and remain
 			// unaffected by this entry-only gate.
-			if enabled, err := store.StockBuyEntriesEnabled(ctx); err != nil {
+			if !store.IsConnected() {
+				slog.Error("orb: buy control unavailable; refusing stock entry", "ticker", ticker,
+					"err", "database not connected")
+				continue
+			} else if enabled, err := store.StockBuyEntriesEnabled(ctx); err != nil {
 				slog.Error("orb: buy control unavailable; refusing stock entry", "ticker", ticker, "err", err)
 				continue
 			} else if !enabled {

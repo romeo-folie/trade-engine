@@ -126,10 +126,6 @@ type OrderRequest struct {
 	// market order. Live broker adapters deliberately never serialize it.
 	ReferencePrice float64
 	TradeID        string // internal trade UUID for linkage
-	// PositionIntent communicates close-only semantics where a broker supports
-	// it (Alpaca accepts sell_to_close). It is empty for ordinary entries and
-	// intentionally ignored by adapters without an equivalent capability.
-	PositionIntent string
 
 	// Bracket order fields (Phase 15 ORB). When OrderClass is "bracket",
 	// the broker submits a parent + take-profit + stop-loss as one atomic order.

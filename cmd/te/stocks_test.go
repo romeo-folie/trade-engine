@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"math"
 	"testing"
 	"time"
 
@@ -27,6 +28,46 @@ func TestRuntimeOverridePrecedence(t *testing.T) {
 	}
 	if mode != "paper" {
 		t.Fatalf("mode = %q, want CLI override paper", mode)
+	}
+}
+
+func TestValidRiskBaselineEquity(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		equity float64
+		want   bool
+	}{
+		{name: "positive", equity: 1_000, want: true},
+		{name: "zero", equity: 0},
+		{name: "negative", equity: -1},
+		{name: "nan", equity: math.NaN()},
+		{name: "positive infinity", equity: math.Inf(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := validRiskBaselineEquity(tc.equity); got != tc.want {
+				t.Fatalf("validRiskBaselineEquity(%v) = %t, want %t", tc.equity, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestRiskBaselineEquityMatchesSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		requested float64
+		snapshot  float64
+		want      bool
+	}{
+		{name: "exact", requested: 1_000, snapshot: 1_000, want: true},
+		{name: "cent rounding", requested: 1_000.001, snapshot: 1_000, want: true},
+		{name: "operator typo", requested: 1_100, snapshot: 1_000},
+		{name: "invalid broker equity", requested: 1_000, snapshot: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := riskBaselineEquityMatchesSnapshot(tc.requested, tc.snapshot); got != tc.want {
+				t.Fatalf("riskBaselineEquityMatchesSnapshot(%v, %v) = %t, want %t", tc.requested, tc.snapshot, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -120,8 +161,9 @@ func (s *preflightSpy) AccountSnapshot(context.Context) (execution.BrokerAccount
 
 func activeAccount() execution.BrokerAccount {
 	return execution.BrokerAccount{
-		AccountNumber: "PA123", Status: "ACTIVE", Cash: 0, Equity: 100,
-		BuyingPower: 100, FetchedAt: time.Now().UTC(),
+		AccountID: "account-id", AccountNumber: "PA123", Status: "ACTIVE", Currency: "USD", Cash: 0, Equity: 100,
+		BuyingPower: 100, LastEquity: 100, Multiplier: 1, CashAvailable: true, BuyingPowerAvailable: true,
+		LastEquityAvailable: true, MultiplierAvailable: true, FetchedAt: time.Now().UTC(),
 	}
 }
 
@@ -134,7 +176,7 @@ func TestPreflightReadsOnlyAccountSnapshot(t *testing.T) {
 	if spy.calls != 1 {
 		t.Fatalf("AccountSnapshot calls = %d, want 1", spy.calls)
 	}
-	if result.Environment != "paper" || result.AccountNumber != "PA123" || result.Cash != 0 {
+	if result.Environment != "paper" || result.AccountID != "account-id" || result.AccountNumber != "PA123" || result.Cash != 0 {
 		t.Fatalf("unexpected preflight result: %+v", result)
 	}
 }
@@ -149,6 +191,7 @@ func TestPreflightRejectsUnsafeAccount(t *testing.T) {
 		{"expected account mismatch", config.StocksConfig{ExpectedAccountNumber: "PA999"}, activeAccount(), nil},
 		{"inactive", config.StocksConfig{}, execution.BrokerAccount{AccountNumber: "PA123", Status: "INACTIVE"}, nil},
 		{"trading blocked", config.StocksConfig{}, execution.BrokerAccount{AccountNumber: "PA123", Status: "ACTIVE", TradingBlocked: true}, nil},
+		{"missing admission balance metadata", config.StocksConfig{}, func() execution.BrokerAccount { a := activeAccount(); a.LastEquityAvailable = false; return a }(), nil},
 		{"timeout", config.StocksConfig{}, execution.BrokerAccount{}, context.DeadlineExceeded},
 	}
 	for _, tt := range tests {

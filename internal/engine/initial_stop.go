@@ -77,7 +77,6 @@ func (e *Engine) ensureUncappedProtectiveStopLocked(
 		Quantity:    quantity,
 		StopPrice:   stopPrice,
 		TradeID:     tradeID,
-		PositionIntent: "sell_to_close",
 		IntentKey:   intentKey,
 		TimeInForce: "gtc", // uncapped entries are whole-share only
 		ExitReason:  store.ExitReasonStopLoss,

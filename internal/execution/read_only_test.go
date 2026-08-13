@@ -9,6 +9,7 @@ import (
 type readOnlySpy struct {
 	accountCalls int
 	ordersCalls  int
+	lookupCalls  int
 	chainCalls   int
 	snapCalls    int
 }
@@ -34,6 +35,10 @@ func (*readOnlySpy) RecentFills(context.Context) ([]BrokerOrder, error) { return
 func (s *readOnlySpy) GetWorkingOrders(context.Context) ([]WorkingOrder, error) {
 	s.ordersCalls++
 	return []WorkingOrder{{OrderID: "read-only"}}, nil
+}
+func (s *readOnlySpy) GetOrderByClientID(context.Context, string) (OrderResult, error) {
+	s.lookupCalls++
+	return OrderResult{BrokerOrderID: "by-client"}, nil
 }
 func (s *readOnlySpy) GetOptionChain(context.Context, string, OptionChainFilter) ([]OptionSnapshot, error) {
 	s.chainCalls++
@@ -81,6 +86,13 @@ func TestReadOnlyExecutorForwardsBrokerReads(t *testing.T) {
 	orders, err := lister.GetWorkingOrders(context.Background())
 	if err != nil || len(orders) != 1 || inner.ordersCalls != 1 {
 		t.Fatalf("GetWorkingOrders = %+v, %v (calls=%d)", orders, err, inner.ordersCalls)
+	}
+	lookup, ok := any(readOnly).(ClientOrderLookup)
+	if !ok {
+		t.Fatal("ReadOnlyExecutor does not preserve ClientOrderLookup")
+	}
+	if result, err := lookup.GetOrderByClientID(context.Background(), "client-1"); err != nil || result.BrokerOrderID != "by-client" || inner.lookupCalls != 1 {
+		t.Fatalf("GetOrderByClientID = %+v, %v (calls=%d)", result, err, inner.lookupCalls)
 	}
 	chain, err := readOnly.GetOptionChain(context.Background(), "SPY", OptionChainFilter{})
 	if err != nil || len(chain) != 1 || inner.chainCalls != 1 {

@@ -81,6 +81,16 @@ To resume only after investigating the reason:
 Do not use a mode change as an emergency exit control; it changes more than the
 buy gate and does not replace broker reconciliation.
 
+After a confirmed paper-account reset, deposit, or withdrawal, reset the
+account-scoped drawdown high-water mark with the `Account ID` shown by preflight:
+
+```sh
+./te risk reset-baseline --account-id <alpaca-account-id> --equity <current-equity>
+```
+
+This is intentionally manual. A balance loss can look like a withdrawal, and
+the engine must never silently clear a real drawdown circuit breaker.
+
 For a loopback-only operator dashboard, `GET /api/system/status` exposes the
 same readiness state (workflow, environment, masked broker account, buying
 power availability, reconciliation snapshot, and buy control). `GET`/`POST

@@ -1116,6 +1116,13 @@ func (c *Coordinator) GetWorkingOrders(ctx context.Context) ([]execution.Working
 	}
 	return l.GetWorkingOrders(ctx)
 }
+func (c *Coordinator) GetOrderByClientID(ctx context.Context, clientOrderID string) (execution.OrderResult, error) {
+	lookup, ok := c.inner.(execution.ClientOrderLookup)
+	if !ok {
+		return execution.OrderResult{}, execution.ErrBrokerUnavailable
+	}
+	return lookup.GetOrderByClientID(ctx, clientOrderID)
+}
 func (c *Coordinator) StockAssetSnapshot(ctx context.Context, symbol string) (execution.StockAsset, error) {
 	provider, ok := c.inner.(execution.StockAssetProvider)
 	if !ok {
