@@ -59,12 +59,17 @@ func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inn
 func (c *Coordinator) SetRecoveryObserver(observer RecoveryObserver) { c.observer = observer }
 
 func (c *Coordinator) recoveredClose(ctx context.Context, tradeID string) error {
-	var realized store.TradeRealization
-	err := store.WithTradeOrderLock(tradeID, func() error {
-		var finalizeErr error
-		realized, finalizeErr = store.FinalizeTradeExit(ctx, tradeID)
-		return finalizeErr
+	return store.WithTradeOrderLock(tradeID, func() error {
+		return c.recoveredCloseLocked(ctx, tradeID)
 	})
+}
+
+// recoveredCloseLocked completes a terminal stop while the caller already
+// owns the per-trade lifecycle lock. Recovery and trailing replacement both
+// enter that lock before applying a protective fill; acquiring it again here
+// would deadlock the same goroutine.
+func (c *Coordinator) recoveredCloseLocked(ctx context.Context, tradeID string) error {
+	realized, err := store.FinalizeTradeExit(ctx, tradeID)
 	if err != nil {
 		return err
 	}
@@ -640,7 +645,7 @@ func (c *Coordinator) projectRecoveredStandaloneStop(ctx context.Context, intent
 	}
 	if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
 		if remaining <= 1e-9 {
-			if err := c.recoveredClose(ctx, req.TradeID); err != nil {
+			if err := c.recoveredCloseLocked(ctx, req.TradeID); err != nil {
 				return fmt.Errorf("finalize recovered stop fill: %w", err)
 			}
 		} else if err := store.ReleaseTradeExitClaim(ctx, req.TradeID); err != nil {
@@ -1405,7 +1410,7 @@ func (c *Coordinator) projectReplacement(ctx context.Context, intent store.Stock
 		}
 		if execution.IsTerminalOrderStatusForTimeInForce(predecessor.Status, req.TimeInForce) {
 			if remaining <= 1e-9 {
-				if err := c.recoveredClose(ctx, order.TradeID); err != nil {
+				if err := c.recoveredCloseLocked(ctx, order.TradeID); err != nil {
 					return execution.OrderResult{}, fmt.Errorf("finalize predecessor replacement fill: %w", err)
 				}
 				// The PATCH may already have created a replacement stop even though

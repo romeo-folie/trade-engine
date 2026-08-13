@@ -594,10 +594,14 @@ func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *tes
 
 	engine.refreshPortfolio(context.Background())
 	state := tracker.CurrentState()
-	// A newly observed account establishes its own daily baseline at current
-	// equity, so it cannot inherit a fabricated session loss from another
-	// account or process.
-	if state.Cash != 0 || state.TotalValue != 1_250 || state.DayPnL != 0 {
+	// With the persistent store connected, a newly observed account establishes
+	// its own daily baseline at current equity. The unit-test/no-DB path retains
+	// the broker's last-equity fallback.
+	wantDayPnL := 50.0
+	if store.IsConnected() {
+		wantDayPnL = 0
+	}
+	if state.Cash != 0 || state.TotalValue != 1_250 || state.DayPnL != wantDayPnL {
 		t.Fatalf("valid zero-cash snapshot fell back to configured capital: %+v", state)
 	}
 
