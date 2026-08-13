@@ -2527,11 +2527,30 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// meet the protected-entry invariant.
 	strictBracketPolicy := !replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.BracketExitsEnabled
 	if replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.BracketExitsEnabled && !orderReq.RequireBrokerProtection {
+		if admission.BrokerHeldReplay {
+			// A pre-policy working BUY cannot be replayed under the strict
+			// invariant. Retire its broker order first; a cancellation-race fill
+			// is projected by recovery and then contained under the active policy.
+			e.cancelLegacyBrokerHeldEntry(ctx, intentKey)
+			return
+		}
 		reason := "prepared entry predates the required broker-protection policy"
 		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason,
 			"intent_key", orderReq.IntentKey)
 		return
+	}
+	if strictBracketPolicy {
+		if _, paper := e.executor.(*execution.PaperExecutor); paper {
+			reason := "broker protection requires an Alpaca bracket-capable executor; the local paper executor cannot simulate broker children"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "broker protection",
+			})
+			return
+		}
 	}
 
 	// The uncapped exit policy is active only with the trailing manager: this

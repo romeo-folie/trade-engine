@@ -122,6 +122,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 	t store.Trade,
 	pollCappedStandalone bool,
 ) (bool, error) {
+	bracketPolicyEnabled := e.cfg != nil && e.cfg.Risk.BracketExitsEnabled
 	// Include terminal protective rows with durable fills. A crash can occur
 	// after their fill was applied to the trade but before the open trade was
 	// claimed and finalized; those rows are the only restart evidence capable
@@ -140,7 +141,13 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		legs = standaloneStopLegs(all)
 	}
 	if len(legs) == 0 {
-		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr == nil && required && parentID != "" {
+		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr != nil && bracketPolicyEnabled {
+			// A strict entry with an unreadable policy may still have live,
+			// unprojected broker children. Do not let software exits race them.
+			logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
+				"trade_id", t.ID, "ticker", t.Ticker, "err", policyErr)
+			return true, policyErr
+		} else if policyErr == nil && required && parentID != "" {
 			// A strict protected entry must never be handed to software exits
 			// merely because child projection failed or the broker legs vanished.
 			e.containUnprotectedBrokerEntryAsync(t.ID, parentID, t.Ticker,

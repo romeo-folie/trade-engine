@@ -229,13 +229,20 @@ func TestContainUnprotectedBrokerEntryCancelsParentBeforeDurableFlatten(t *testi
 		t.Fatalf("InsertOrder(entry): %v", err)
 	}
 	exec := &fakeBracketExec{
-		statuses: map[string]execution.OrderResult{parentID: {Status: "filled"}},
+		statuses: map[string]execution.OrderResult{
+			parentID: {Status: "filled", ChildOrders: []execution.OrderLeg{
+				{BrokerOrderID: "unprojected-tp", Type: "limit", Status: "accepted", Quantity: 2, RemainingQty: 2},
+				{BrokerOrderID: "unprojected-sl", Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2},
+			}},
+			"unprojected-tp": {Status: "cancelled"},
+			"unprojected-sl": {Status: "cancelled"},
+		},
 		placeRes: execution.OrderResult{BrokerOrderID: "containment-exit", Status: "accepted"},
 	}
 	e := newBracketTestEngine(exec)
 	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "TEST_UNPROTECTED_BRACKET", "missing stop")
-	if len(exec.cancelled) != 1 || exec.cancelled[0] != parentID {
-		t.Fatalf("cancelled = %v, want parent cancellation before flatten", exec.cancelled)
+	if got, want := exec.cancelled, []string{parentID, "unprojected-tp", "unprojected-sl"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("cancelled = %v, want parent and every unprojected child before flatten", got)
 	}
 	if len(exec.placed) != 1 || exec.placed[0].Side != execution.OrderSideSell || exec.placed[0].Quantity != 2 {
 		t.Fatalf("containment flatten = %+v", exec.placed)

@@ -138,6 +138,12 @@ func TestBrokerBracketProtectionRequiresActiveWholeShareStop(t *testing.T) {
 	}, 5) {
 		t.Fatal("active whole-share stop covering the position was rejected")
 	}
+	if !brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "done_for_day", Quantity: 5, RemainingQty: 5}},
+	}, 5) {
+		t.Fatal("GTC stop reported done_for_day must remain active protection")
+	}
 }
 
 func TestBrokerBracketProtectionStateDistinguishesHeldAndActiveCoverage(t *testing.T) {

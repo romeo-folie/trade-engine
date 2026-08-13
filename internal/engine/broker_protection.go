@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -40,12 +41,22 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 				return
 			}
 		}
-		if !execution.IsTerminalOrderStatus(status.Status) {
+		// Strict bracket parents are GTC. Alpaca reports a resting GTC order
+		// as done_for_day outside the session; it remains eligible to resume
+		// and must not be treated as safely cancelled.
+		if !execution.IsTerminalOrderStatusForTimeInForce(status.Status, "gtc") {
 			continue
 		}
 
 		trade, err := store.GetTradeByID(ctx, tradeID)
 		if err != nil || trade == nil || trade.Status != "open" || trade.Quantity <= 1e-9 {
+			return
+		}
+		// The parent snapshot is the only authoritative source for bracket
+		// children when projection failed. Clear it before claiming the trade:
+		// if confirmation is uncertain, leave the trade open so the next sweep
+		// can retry instead of stranding it under an exit claim.
+		if !e.cancelBrokerBracketChildren(ctx, status.ChildOrders) {
 			return
 		}
 		intent := newExitIntent(store.ExitReasonStopLoss, map[string]any{
@@ -104,12 +115,113 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		"trade_id", tradeID, "broker_order_id", entryBrokerOrderID, "reason", reason)
 }
 
+// cancelBrokerBracketChildren cancels and confirms every child reported by a
+// nested bracket-parent snapshot. The local projection can be incomplete
+// precisely when this containment path is needed, so local orders alone are
+// not a sufficient cancellation inventory.
+func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, children []execution.OrderLeg) bool {
+	for _, child := range children {
+		if child.BrokerOrderID == "" {
+			continue
+		}
+		if err := e.executor.CancelOrder(ctx, child.BrokerOrderID); err != nil {
+			logger.Warn("broker protection: cancel broker child before containment",
+				"broker_order_id", child.BrokerOrderID, "err", err)
+		}
+		status, err := e.executor.GetOrderStatus(ctx, child.BrokerOrderID)
+		if errors.Is(err, execution.ErrOrderNotFound) {
+			continue
+		}
+		if err != nil {
+			logger.Warn("broker protection: cannot confirm broker child cancellation",
+				"broker_order_id", child.BrokerOrderID, "err", err)
+			return false
+		}
+		// A filled or partially filled unprojected child changes the held
+		// quantity, which cannot safely be inferred from the parent alone.
+		// Keep this trade out of a market flatten until reconciliation projects
+		// the broker fill; that is safer than risking an over-sell.
+		if status.FilledQty > 1e-9 || execution.NormalizeOrderStatusForTimeInForce(status.Status, "gtc") == "filled" {
+			logger.Warn("broker protection: broker child filled during containment; awaiting reconciliation",
+				"broker_order_id", child.BrokerOrderID, "filled_qty", status.FilledQty)
+			return false
+		}
+		if !execution.IsTerminalOrderStatusForTimeInForce(status.Status, "gtc") {
+			logger.Warn("broker protection: broker child remains live after cancellation",
+				"broker_order_id", child.BrokerOrderID, "status", status.Status)
+			return false
+		}
+	}
+	return true
+}
+
 func (e *Engine) containUnprotectedBrokerEntryAsync(tradeID, entryBrokerOrderID, ticker, reason string) {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		e.containUnprotectedBrokerEntry(ctx, tradeID, entryBrokerOrderID, ticker, reason)
 	}()
+}
+
+// cancelLegacyBrokerHeldEntry retires a working BUY that was accepted before
+// broker protection became mandatory. It does not mark the signal terminal
+// until broker truth is terminal: recovery owns a cancellation-race fill and
+// applies the currently active strict policy to it.
+func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey string) {
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil || intent.BrokerOrderID == "" {
+		logger.Error("broker protection: cannot locate legacy broker-held entry",
+			"intent_key", intentKey, "err", err)
+		return
+	}
+
+	var terminal execution.OrderResult
+	confirmed := false
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := e.executor.CancelOrder(ctx, intent.BrokerOrderID); err != nil {
+			logger.Debug("broker protection: cancel legacy broker-held entry",
+				"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID,
+				"attempt", attempt+1, "err", err)
+		}
+		status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)
+		if errors.Is(err, execution.ErrOrderNotFound) {
+			terminal = execution.OrderResult{BrokerOrderID: intent.BrokerOrderID, Status: "cancelled"}
+			confirmed = true
+			break
+		}
+		if err != nil {
+			continue
+		}
+		if !execution.IsTerminalOrderStatus(status.Status) {
+			continue
+		}
+		terminal = status
+		confirmed = true
+		break
+	}
+	if !confirmed {
+		logger.Error("broker protection: legacy broker-held entry remains unresolved; retaining durable reservation",
+			"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID)
+		return
+	}
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, intent.BrokerOrderID,
+		execution.NormalizeOrderStatus(terminal.Status), terminal.FilledPrice, terminal.FilledQty,
+		terminal.RequestID, "", false); err != nil {
+		logger.Error("broker protection: persist retired legacy entry", "intent_key", intentKey, "err", err)
+		return
+	}
+	recoverer, ok := e.executor.(interface{ Recover(context.Context) error })
+	if !ok {
+		logger.Error("broker protection: legacy entry has no durable recovery executor", "intent_key", intentKey)
+		return
+	}
+	if err := recoverer.Recover(ctx); err != nil {
+		logger.Error("broker protection: recover retired legacy entry", "intent_key", intentKey, "err", err)
+		return
+	}
+	// Recovery normally invokes this observer. Invoke it again defensively for
+	// executor implementations that project but do not publish observers.
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
 }
 
 // verifyOrContainBrokerEntry gives a sparse placement response one fresh
@@ -171,7 +283,7 @@ func brokerBracketProtectionState(result execution.OrderResult, heldQty float64)
 		if child.Type != "stop" && child.Type != "stop_limit" {
 			continue
 		}
-		if child.Status == "held" || execution.IsTerminalOrderStatus(child.Status) || child.RemainingQty <= 0 {
+		if child.Status == "held" || execution.IsTerminalOrderStatusForTimeInForce(child.Status, "gtc") || child.RemainingQty <= 0 {
 			continue
 		}
 		// Only the still-working remainder protects the position. A partially
@@ -205,7 +317,9 @@ func (e *Engine) containRecoveredUnprotectedBracket(ctx context.Context, intentK
 		return
 	}
 	var req execution.OrderRequest
-	if json.Unmarshal(intent.RequestPayload, &req) != nil || !req.RequireBrokerProtection {
+	bracketPolicyEnabled := e.cfg != nil && e.cfg.Risk.BracketExitsEnabled
+	if json.Unmarshal(intent.RequestPayload, &req) != nil ||
+		(!req.RequireBrokerProtection && !bracketPolicyEnabled) {
 		return
 	}
 	status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)
