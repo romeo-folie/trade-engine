@@ -232,6 +232,16 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 		logger.Error("broker protection: persist retired legacy entry", "intent_key", intentKey, "err", err)
 		return
 	}
+	// If the cancellation race filled, later generic recovery must not revert to
+	// the legacy request's app-managed policy when this immediate Recover is
+	// transiently unavailable. Record the current strict-policy obligation next
+	// to the immutable original intent before attempting recovery.
+	if terminal.FilledQty > 0 {
+		if err := store.RequireBrokerProtectionForStockEntry(ctx, intent.ID); err != nil {
+			logger.Error("broker protection: persist legacy fill containment obligation", "intent_key", intentKey, "err", err)
+			return
+		}
+	}
 	recoverer, ok := e.executor.(interface{ Recover(context.Context) error })
 	if !ok {
 		logger.Error("broker protection: legacy entry has no durable recovery executor", "intent_key", intentKey)
@@ -400,8 +410,11 @@ func (e *Engine) containRecoveredUnprotectedBracketWithPolicy(ctx context.Contex
 		return
 	}
 	var req execution.OrderRequest
-	if json.Unmarshal(intent.RequestPayload, &req) != nil ||
-		(!req.RequireBrokerProtection && !forceProtection) {
+	if json.Unmarshal(intent.RequestPayload, &req) != nil {
+		return
+	}
+	required, _, policyErr := store.StockEntryBrokerProtection(ctx, intent.TradeID)
+	if policyErr != nil || (!required && !forceProtection) {
 		return
 	}
 	status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)

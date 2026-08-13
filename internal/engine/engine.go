@@ -2703,6 +2703,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
+		// Coordinators can return an accepted broker result with a local
+		// projection error. Strict brackets must start durable recovery from that
+		// identity immediately, before the parent can fill further with held legs.
+		if orderReq.RequireBrokerProtection && result.BrokerOrderID != "" {
+			e.recoverAndVerifyAcceptedBrokerEntryAsync(orderReq.IntentKey)
+		}
 		if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
 			if updateErr := store.UpdateSignalStatus(ctx, sigID, "rejected", "entry order terminal zero-fill without a broker fill"); updateErr != nil {
 				logger.Warn("reject terminal zero-fill entry signal", "ticker", sig.Ticker, "err", updateErr)
@@ -2891,6 +2897,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					legRows[i].StockIntentID = childIntentID
 				}
 			}
+			for i := range legRows {
+				applyBracketChildSnapshot(&legRows[i], result.ChildOrders)
+			}
 			for _, leg := range legRows {
 				if _, err := store.InsertOrder(ctx, leg); err != nil {
 					logger.Warn("insert bracket leg order", "tradeID", tradeID,
@@ -3069,6 +3078,26 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"protected_qty", lastProtectedQty,
 			)
 		}()
+	}
+}
+
+// applyBracketChildSnapshot preserves an already-reported broker execution
+// while the normal accepted-order path creates its local child projection. A
+// later direct child lookup may be purged, so a pending zero-fill row would
+// otherwise lose the only authoritative cumulative fill.
+func applyBracketChildSnapshot(order *store.Order, children []execution.OrderLeg) {
+	for _, child := range children {
+		if child.BrokerOrderID != order.BrokerOrderID || child.FilledQty <= 0 {
+			continue
+		}
+		order.FilledPrice = child.FilledPrice
+		order.FilledQty = child.FilledQty
+		order.Status = execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc")
+		if !child.FilledAt.IsZero() {
+			filledAt := child.FilledAt
+			order.FilledAt = &filledAt
+		}
+		return
 	}
 }
 

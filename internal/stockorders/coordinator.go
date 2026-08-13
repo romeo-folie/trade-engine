@@ -235,7 +235,10 @@ func isRecoveryContext(ctx context.Context) bool {
 
 func (c *Coordinator) finishSubmit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) (execution.OrderResult, error) {
 	if err := c.projectBracketChildren(ctx, intent, req, res); err != nil {
-		return execution.OrderResult{}, err
+		// The broker has already accepted this parent. Preserve its identity for
+		// callers so strict-entry recovery can verify or contain it immediately
+		// even when the local child projection failed.
+		return res, err
 	}
 	return res, nil
 }

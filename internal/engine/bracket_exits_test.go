@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -28,6 +29,12 @@ type fakeBracketExec struct {
 	onStatus    func(string)
 	positions   []execution.Position
 	positionErr error
+}
+
+type recoverFailureBracketExec struct{ *fakeBracketExec }
+
+func (*recoverFailureBracketExec) Recover(context.Context) error {
+	return errors.New("transient recovery failure")
 }
 
 func (f *fakeBracketExec) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
@@ -535,6 +542,66 @@ func TestCancelLegacyBrokerHeldEntry_PurgedParentRemainsRecoverable(t *testing.T
 	updated, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
 	if err != nil || updated == nil || updated.Status != "pending" {
 		t.Fatalf("purged legacy intent = %+v err=%v, want pending for recovery", updated, err)
+	}
+}
+
+func TestCancelLegacyBrokerHeldEntry_PersistsContainmentAfterRecoveryFailure(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_FORCE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	intentKey := "entry:legacy-force-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "LEGACY_FORCE", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: "legacy-force-" + intentID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: "legacy-force-" + intentID, TradeID: tradeID,
+		Ticker: "LEGACY_FORCE", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "legacy-force", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE parent_intent_id=$1::uuid`, intent.ID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID)
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "legacy-force-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	exec := &recoverFailureBracketExec{fakeBracketExec: &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"legacy-force-parent": {Status: "filled", Quantity: 2, FilledQty: 2, FilledPrice: 100},
+	}}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intentKey)
+	required, brokerID, err := store.StockEntryBrokerProtection(ctx, tradeID)
+	if err != nil || !required || brokerID != "legacy-force-parent" {
+		t.Fatalf("durable legacy containment policy = required:%v broker:%q err:%v", required, brokerID, err)
+	}
+}
+
+func TestApplyBracketChildSnapshotPersistsFill(t *testing.T) {
+	filledAt := time.Date(2026, time.August, 13, 11, 0, 0, 0, time.UTC)
+	order := store.Order{BrokerOrderID: "filled-take-profit", Status: "pending"}
+	applyBracketChildSnapshot(&order, []execution.OrderLeg{{
+		BrokerOrderID: "filled-take-profit", Status: "filled", FilledQty: 1, FilledPrice: 120, FilledAt: filledAt,
+	}})
+	if order.FilledQty != 1 || order.FilledPrice != 120 || order.Status != "filled" || order.FilledAt == nil || !order.FilledAt.Equal(filledAt) {
+		t.Fatalf("persisted child snapshot = %+v", order)
 	}
 }
 

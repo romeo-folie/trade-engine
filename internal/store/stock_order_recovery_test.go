@@ -35,6 +35,35 @@ type recoveryBroker struct {
 	patchErrs []error
 }
 
+type projectionFailureBroker struct {
+	*recoveryBroker
+	poisonID string
+	setupErr error
+}
+
+func (b *projectionFailureBroker) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	parent, err := store.GetStockOrderIntentByKey(ctx, req.IntentKey)
+	if err != nil || parent == nil {
+		b.setupErr = fmt.Errorf("load accepted parent: %w", err)
+		return execution.OrderResult{}, b.setupErr
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&b.poisonID); err != nil {
+		b.setupErr = err
+		return execution.OrderResult{}, err
+	}
+	childKey := "bracket-child:" + parent.ID + ":take-profit"
+	b.setupErr = store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: b.poisonID, IdempotencyKey: "poison:" + b.poisonID, ClientOrderID: childKey,
+		Ticker: req.Ticker, Side: "sell", OrderType: "limit", RequestedQty: req.Quantity,
+		RequestPayload: []byte(`{}`), PayloadHash: "poison", Status: "pending",
+	})
+	if b.setupErr != nil {
+		return execution.OrderResult{}, b.setupErr
+	}
+	result, err := b.recoveryBroker.PlaceOrder(ctx, req)
+	return result, err
+}
+
 type recoveryEffectsRecorder struct {
 	entries  []string
 	closes   []store.TradeRealization
@@ -3035,6 +3064,33 @@ func TestStockIntentRecoveryRestoresMissingBracketChildProjection(t *testing.T) 
 	}
 	if filledQty != 1 || filledPrice != 120 || status != "filled" {
 		t.Fatalf("restored take-profit fill=%v @ %v status=%q, want 1 @ 120 filled", filledQty, filledPrice, status)
+	}
+}
+
+func TestStockIntentProjectionFailurePreservesAcceptedBrokerResult(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTPROJECTIONFAIL")
+	broker := &projectionFailureBroker{
+		recoveryBroker: newRecoveryBroker(execution.OrderResult{
+			BrokerOrderID: "accepted-before-projection", Status: "accepted",
+			ChildOrderIDs: []string{"projection-failure-tp", "projection-failure-sl"},
+		}),
+	}
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTPROJECTIONFAIL", 2)
+	req.OrderClass, req.TimeInForce, req.TakeProfitPrice, req.StopLossPrice = "bracket", "gtc", 120, 90
+	result, err := coordinator.PlaceOrder(ctx, req)
+	if err == nil {
+		t.Fatal("expected duplicate child client id projection to fail")
+	}
+	if broker.setupErr != nil {
+		t.Fatalf("failed to create projection conflict: %v", broker.setupErr)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, broker.poisonID)
+	})
+	if result.BrokerOrderID != "accepted-before-projection" {
+		t.Fatalf("accepted result = %+v; broker identity was lost", result)
 	}
 }
 

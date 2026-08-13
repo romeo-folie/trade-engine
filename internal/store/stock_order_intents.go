@@ -191,11 +191,17 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 // policy without guessing from mutable exit-leg rows.
 func StockEntryBrokerProtection(ctx context.Context, tradeID string) (required bool, brokerOrderID string, err error) {
 	var raw json.RawMessage
+	var forced bool
 	err = GetDB().QueryRow(ctx, `
-		SELECT request_payload, COALESCE(broker_order_id,'')
-		FROM stock_order_intents
-		WHERE trade_id=$1::uuid AND purpose='submit' AND side='buy'
-		ORDER BY created_at DESC LIMIT 1`, tradeID).Scan(&raw, &brokerOrderID)
+		SELECT entry.request_payload, COALESCE(entry.broker_order_id,''),
+		       EXISTS (
+		           SELECT 1 FROM stock_order_intents override
+		           WHERE override.parent_intent_id=entry.id
+		             AND override.purpose='broker_protection_override'
+		       )
+		FROM stock_order_intents entry
+		WHERE entry.trade_id=$1::uuid AND entry.purpose='submit' AND entry.side='buy'
+		ORDER BY entry.created_at DESC LIMIT 1`, tradeID).Scan(&raw, &brokerOrderID, &forced)
 	if err != nil {
 		return false, "", err
 	}
@@ -205,7 +211,46 @@ func StockEntryBrokerProtection(ctx context.Context, tradeID string) (required b
 	if err := json.Unmarshal(raw, &policy); err != nil {
 		return false, "", err
 	}
-	return policy.RequireBrokerProtection, brokerOrderID, nil
+	return policy.RequireBrokerProtection || forced, brokerOrderID, nil
+}
+
+// RequireBrokerProtectionForStockEntry records that a legacy broker-held
+// entry must be contained if it filled during its retirement. The original
+// submit request remains immutable; this durable child is an explicit policy
+// migration that later recovery can honor after an immediate Recover fails.
+func RequireBrokerProtectionForStockEntry(ctx context.Context, parentIntentID string) error {
+	const purpose = "broker_protection_override"
+	key := "broker-protection:" + parentIntentID
+	payload, err := json.Marshal(map[string]bool{"require_broker_protection": true})
+	if err != nil {
+		return err
+	}
+	result, err := GetDB().Exec(ctx, `
+		INSERT INTO stock_order_intents (
+			id, idempotency_key, client_order_id, parent_intent_id,
+			ticker, side, order_type, requested_qty, request_payload,
+			payload_hash, status, purpose
+		)
+		SELECT uuid_generate_v4(), $1, $1, entry.id,
+		       entry.ticker, entry.side, entry.order_type, entry.requested_qty,
+		       $2::jsonb, $1, 'pending', $3
+		FROM stock_order_intents entry
+		WHERE entry.id=$4::uuid AND entry.purpose='submit'
+		ON CONFLICT (idempotency_key) DO NOTHING`, key, string(payload), purpose, parentIntentID)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() == 0 {
+		// A duplicate is the successful idempotent case. A missing parent is not.
+		var exists bool
+		if err := GetDB().QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM stock_order_intents WHERE idempotency_key=$1)`, key).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			return fmt.Errorf("stock entry intent %s not found for broker-protection override", parentIntentID)
+		}
+	}
+	return nil
 }
 
 // HasPreparedStockEntry reports whether a signal owns a pending entry intent
