@@ -243,7 +243,7 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 	}
 	// Recovery normally invokes this observer. Invoke it again defensively for
 	// executor implementations that project but do not publish observers.
-	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	e.containRecoveredUnprotectedBracketForced(ctx, intentKey)
 }
 
 // verifyOrContainBrokerEntry gives a sparse placement response one fresh
@@ -384,14 +384,24 @@ func brokerBracketProtectionVerified(result execution.OrderResult, heldQty float
 // out of application-managed monitoring when broker protection cannot be
 // verified from the nested parent snapshot.
 func (e *Engine) containRecoveredUnprotectedBracket(ctx context.Context, intentKey string) {
+	e.containRecoveredUnprotectedBracketWithPolicy(ctx, intentKey, false)
+}
+
+// containRecoveredUnprotectedBracketForced is used only after a pre-policy
+// broker-held entry was explicitly cancelled under the current strict policy.
+// Ordinary recovery must honor the immutable request flag instead.
+func (e *Engine) containRecoveredUnprotectedBracketForced(ctx context.Context, intentKey string) {
+	e.containRecoveredUnprotectedBracketWithPolicy(ctx, intentKey, true)
+}
+
+func (e *Engine) containRecoveredUnprotectedBracketWithPolicy(ctx context.Context, intentKey string, forceProtection bool) {
 	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
 	if err != nil || intent == nil || intent.TradeID == "" || intent.BrokerOrderID == "" {
 		return
 	}
 	var req execution.OrderRequest
-	bracketPolicyEnabled := e.cfg != nil && e.cfg.Risk.BracketExitsEnabled
 	if json.Unmarshal(intent.RequestPayload, &req) != nil ||
-		(!req.RequireBrokerProtection && !bracketPolicyEnabled) {
+		(!req.RequireBrokerProtection && !forceProtection) {
 		return
 	}
 	status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)

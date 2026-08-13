@@ -304,6 +304,58 @@ func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *test
 	}
 }
 
+func TestContainRecoveredUnprotectedBracket_LegacyIntentStaysApplicationManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_RECOVERY", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:legacy-recovery-" + intentID
+	clientOrderID := "legacy-recovery-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "LEGACY_RECOVERY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "LEGACY_RECOVERY", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "legacy-recovery", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "legacy-recovery-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"legacy-recovery-parent": {Status: "filled", Quantity: 2, FilledQty: 2},
+	}}
+	e := newBracketTestEngine(exec)
+	e.cfg.Risk.BracketExitsEnabled = true
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("legacy recovery must remain application-managed; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
 func TestReconcileBracket_LegacyTradeWithoutIntentRemainsApplicationManaged(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
