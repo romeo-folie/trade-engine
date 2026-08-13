@@ -165,6 +165,11 @@ func TestAccountSnapshotCapturesAccountIdentityAndSafetyFields(t *testing.T) {
 		account.NonMarginableBuyingPower != 100 || account.Multiplier != 2 || !account.TransfersBlocked || !account.ShortingEnabled {
 		t.Fatalf("unexpected snapshot: %+v", account)
 	}
+	if !account.LastEquityAvailable || !account.CashAvailable || !account.BuyingPowerAvailable ||
+		!account.MultiplierAvailable || !account.RegTBuyingPowerAvailable ||
+		!account.DayTradingBuyingPowerAvailable || !account.NonMarginableBuyingPowerAvailable {
+		t.Fatalf("snapshot lost field presence: %+v", account)
+	}
 	if account.FetchedAt.IsZero() {
 		t.Fatal("FetchedAt is zero")
 	}
@@ -174,6 +179,63 @@ func TestAccountSnapshotCapturesAccountIdentityAndSafetyFields(t *testing.T) {
 	}
 	if string(encoded) == "" || containsJSONField(encoded, "account_id") || containsJSONField(encoded, "account_number") {
 		t.Fatalf("account identity leaked from normal JSON: %s", encoded)
+	}
+}
+
+func TestStockAssetSnapshotUsesExactSymbolEndpoint(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/v2/assets/AAPL" {
+			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
+		}
+		fmt.Fprintln(w, `{"symbol":"AAPL","status":"active","class":"us_equity","tradable":true,"marginable":true,"fractionable":true}`)
+	}))
+	defer ts.Close()
+	broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	asset, err := broker.StockAssetSnapshot(context.Background(), " aapl ")
+	if err != nil || asset.Symbol != "AAPL" || !asset.Tradable || !asset.Marginable || !asset.Fractionable || asset.FetchedAt.IsZero() {
+		t.Fatalf("StockAssetSnapshot = %+v, %v", asset, err)
+	}
+}
+
+func TestStockAssetSnapshotRejectsMissingCapabilityBooleans(t *testing.T) {
+	for _, omitted := range []string{"tradable", "marginable", "fractionable"} {
+		t.Run(omitted, func(t *testing.T) {
+			payload := map[string]any{
+				"symbol": "AAPL", "status": "active", "class": "us_equity",
+				"tradable": true, "marginable": true, "fractionable": true,
+			}
+			delete(payload, omitted)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(payload)
+			}))
+			defer ts.Close()
+			broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+			if _, err := broker.StockAssetSnapshot(context.Background(), "AAPL"); err == nil {
+				t.Fatalf("missing %s passed", omitted)
+			}
+		})
+	}
+}
+
+func TestAccountSnapshotRejectsMissingRestrictionBooleans(t *testing.T) {
+	for _, omitted := range []string{"trading_blocked", "account_blocked", "trade_suspended_by_user"} {
+		t.Run(omitted, func(t *testing.T) {
+			payload := map[string]any{
+				"id": "id", "account_number": "PA123", "status": "ACTIVE", "currency": "USD",
+				"cash": "0", "equity": "100", "last_equity": "99", "buying_power": "100",
+				"regt_buying_power": "100", "non_marginable_buying_power": "100", "multiplier": "2",
+				"trading_blocked": false, "account_blocked": false, "trade_suspended_by_user": false,
+			}
+			delete(payload, omitted)
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(payload)
+			}))
+			defer ts.Close()
+			broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+			if _, err := broker.AccountSnapshot(context.Background()); err == nil {
+				t.Fatalf("missing %s passed", omitted)
+			}
+		})
 	}
 }
 

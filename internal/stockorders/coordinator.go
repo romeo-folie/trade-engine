@@ -37,6 +37,7 @@ var ErrDurableStoreUnavailable = errors.New("stockorders: durable store unavaila
 type RecoveryObserver interface {
 	RecoveredStockEntry(context.Context, string)
 	RecoveredStockExit(context.Context, store.TradeRealization)
+	PreparedStockEntryNeedsAdmission(context.Context, string)
 }
 
 type Coordinator struct {
@@ -303,7 +304,34 @@ func (c *Coordinator) recoverIntent(ctx context.Context, intent store.StockOrder
 func (c *Coordinator) recoverIntentLocked(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest) error {
 	var res execution.OrderResult
 	var err error
-	if req.ReplacesBrokerOrderID != "" {
+	if strings.HasPrefix(intent.IdempotencyKey, "entry:") && intent.BrokerOrderID == "" {
+		// Generic recovery has no fresh account/asset/ask admission context. A
+		// prepared entry may still have reached Alpaca before its local attempt
+		// record committed, so recovery always performs the harmless client-ID
+		// lookup. A miss remains prepared (or ambiguous) and is never POSTed
+		// again here without engine re-admission.
+		lookup, ok := c.inner.(execution.ClientOrderLookup)
+		if !ok {
+			return fmt.Errorf("ambiguous stock entry %s requires client-id lookup", intent.ClientOrderID)
+		}
+		res, err = lookup.GetOrderByClientID(ctx, intent.ClientOrderID)
+		if errors.Is(err, execution.ErrOrderNotFound) {
+			if intent.SubmittedAt == nil {
+				if c.observer != nil {
+					c.observer.PreparedStockEntryNeedsAdmission(ctx, intent.IdempotencyKey)
+				}
+				return nil
+			}
+			return fmt.Errorf("ambiguous stock entry %s remains unavailable by client id", intent.ClientOrderID)
+		}
+		if err != nil {
+			return fmt.Errorf("lookup ambiguous stock entry %s: %w", intent.ClientOrderID, err)
+		}
+		if err := c.record(ctx, intent, "recovery_lookup", "found", res, "", false); err != nil {
+			return err
+		}
+		res, err = c.finishSubmit(ctx, intent, req, res)
+	} else if req.ReplacesBrokerOrderID != "" {
 		res, err = c.submitReplacement(ctx, intent, req, true)
 	} else {
 		res, err = c.submit(ctx, intent, req)
@@ -617,9 +645,9 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 	if !strings.HasPrefix(intent.IdempotencyKey, "entry:") {
 		return nil
 	}
-	signalID := strings.TrimPrefix(intent.IdempotencyKey, "entry:")
-	if signalID == "" || strings.Contains(signalID, ":") {
-		return fmt.Errorf("invalid stock entry intent key %q", intent.IdempotencyKey)
+	signalID, err := stockEntrySignalID(intent.IdempotencyKey)
+	if err != nil {
+		return err
 	}
 	if res.FilledQty <= 0 {
 		if execution.IsTerminalOrderStatusForTimeInForce(res.Status, req.TimeInForce) {
@@ -723,6 +751,20 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 		c.observer.RecoveredStockEntry(ctx, intent.IdempotencyKey)
 	}
 	return nil
+}
+
+func stockEntrySignalID(key string) (string, error) {
+	if !strings.HasPrefix(key, "entry:") {
+		return "", fmt.Errorf("invalid stock entry intent key %q", key)
+	}
+	remainder := strings.TrimPrefix(key, "entry:")
+	if retryAt := strings.Index(remainder, ":retry:"); retryAt >= 0 {
+		remainder = remainder[:retryAt]
+	}
+	if remainder == "" || strings.Contains(remainder, ":") {
+		return "", fmt.Errorf("invalid stock entry intent key %q", key)
+	}
+	return remainder, nil
 }
 
 // cancelRecoveredEntryAfterExitOwnership proves that a residual entry cannot
@@ -1027,6 +1069,13 @@ func (c *Coordinator) GetWorkingOrders(ctx context.Context) ([]execution.Working
 		return nil, execution.ErrBrokerUnavailable
 	}
 	return l.GetWorkingOrders(ctx)
+}
+func (c *Coordinator) StockAssetSnapshot(ctx context.Context, symbol string) (execution.StockAsset, error) {
+	provider, ok := c.inner.(execution.StockAssetProvider)
+	if !ok {
+		return execution.StockAsset{}, execution.ErrBrokerUnavailable
+	}
+	return provider.StockAssetSnapshot(ctx, symbol)
 }
 func (c *Coordinator) ReplaceStopOrder(ctx context.Context, id string, px float64) (execution.OrderResult, error) {
 	if err := requireDurableStore(); err != nil {

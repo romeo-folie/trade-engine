@@ -23,6 +23,11 @@ type CheckInput struct {
 	StopLoss    float64 // price
 	TakeProfit  float64 // price
 	SignalPrice float64
+	// ProposedQuantity/ProposedNotional describe the exact, broker-serialized
+	// entry after precision and order-shape transformations. They are optional
+	// so signal-generation and backtest checks retain their legacy derivation.
+	ProposedQuantity float64
+	ProposedNotional float64
 
 	// Portfolio state
 	PortfolioValue float64
@@ -261,11 +266,25 @@ func checkPositionSize(in CheckInput) CheckResult {
 	if in.Action != "BUY" {
 		return pass(name)
 	}
-	if in.SizePct <= in.Cfg.MaxPositionPct {
+	positionPct := in.SizePct
+	exactProposal := false
+	if in.ProposedQuantity > 0 && in.PortfolioValue > 0 {
+		exactProposal = true
+		notional := in.ProposedNotional
+		if notional <= 0 {
+			notional = in.ProposedQuantity * in.SignalPrice
+		}
+		positionPct = notional / in.PortfolioValue * 100
+	}
+	if positionPct <= in.Cfg.MaxPositionPct {
 		return pass(name)
 	}
-	return fail(name, fmt.Sprintf("size_pct %.1f%% > max %.1f%%",
-		in.SizePct, in.Cfg.MaxPositionPct))
+	if !exactProposal {
+		return fail(name, fmt.Sprintf("size_pct %.1f%% > max %.1f%%",
+			in.SizePct, in.Cfg.MaxPositionPct))
+	}
+	return fail(name, fmt.Sprintf("position size %.2f%% > max %.2f%%",
+		positionPct, in.Cfg.MaxPositionPct))
 }
 
 // checkMaxDollarRisk enforces a hard cap on per-trade dollar at risk
@@ -311,7 +330,10 @@ func checkMaxDollarRisk(in CheckInput) CheckResult {
 	if math.Abs(in.SignalPrice-in.StopLoss) < epsilon {
 		return fail(name, "stop-loss equals signal price (zero risk, invalid)")
 	}
-	qty := (in.SizePct / 100) * in.Cash / in.SignalPrice
+	qty := in.ProposedQuantity
+	if qty <= 0 {
+		qty = (in.SizePct / 100) * in.Cash / in.SignalPrice
+	}
 	dollarAtRisk := qty * math.Abs(in.SignalPrice-in.StopLoss)
 	riskPct := dollarAtRisk / in.PortfolioValue * 100
 	if riskPct <= in.Cfg.MaxDollarRiskPct {

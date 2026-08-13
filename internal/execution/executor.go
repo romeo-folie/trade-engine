@@ -198,6 +198,7 @@ type WorkingOrder struct {
 	OrderID      string
 	TradeID      string  // client/order reference supplied when the order was placed
 	Ticker       string  // resolved symbol when the broker provides one (else raw conid)
+	AssetClass   string  // Alpaca: "us_equity" | "us_option"; empty when unavailable
 	Conid        string  // IBKR contract id (empty for non-IBKR brokers)
 	Side         string  // "buy" | "sell"
 	Status       string  // normalized: pending | partial (only working orders are returned)

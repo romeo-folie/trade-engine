@@ -123,6 +123,13 @@ type Engine struct {
 	exitStartupMu          sync.Mutex
 	exitStartupPrepared    bool
 	positionExitMu         sync.Mutex // serializes protective reconciliation with software position exits
+	// stockEntryAdmissionMu serializes only standard-stock BUY admission and
+	// immediate durable submission. Risk-reducing SELL/protection paths never
+	// take it.
+	stockEntryAdmissionMu sync.Mutex
+	stockAccountPeakMu    sync.Mutex
+	stockAccountPeak      float64
+	stockAccountPeakID    string
 
 	feedbackReviewer *feedback.Reviewer
 
@@ -2404,7 +2411,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
 			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, mark,
 			e.portfolio.CurrentState(), openTrades)
-		if results, passed := risk.CheckAll(riskIn); !passed {
+		if results, passed := risk.CheckEntryQuality(riskIn); !passed {
 			reason := "pullback execution risk re-check failed: " + risk.BlockReason(results)
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 			logger.Warn("pullback execution blocked",
@@ -2446,33 +2453,49 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			})
 			return
 		}
-		riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
-			sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
-			e.portfolio.CurrentState(), owned)
-		if results, passed := risk.CheckAll(riskIn); !passed {
-			reason := "execution risk re-check failed: " + risk.BlockReason(results)
-			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
-			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
-			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
-				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
-				BlockReason: reason, FailedCheck: risk.BlockReason(results),
-			})
-			return
-		}
 	}
 
-	// Size: use signal's size_pct of portfolio cash.
+	intentKey := "entry:" + sigID
+	admission, existingRequest, effectiveIntentKey, releaseAdmission, err := e.beginStockEntryAdmission(
+		ctx, intentKey, sig.Ticker, sig.SizePct,
+	)
+	if err != nil {
+		if errors.Is(err, errStockEntryIntentComplete) {
+			return
+		}
+		if fromQueue && existingRequest != nil {
+			if queueErr := store.QueueSignalForDeferredExecution(ctx, sigID); queueErr != nil {
+				logger.Warn("keep prepared stock entry queued after temporary admission failure", "id", sigID, "err", queueErr)
+			}
+			logger.Warn("prepared stock entry admission unavailable — retrying on a later tick", "ticker", sig.Ticker, "err", err)
+			return
+		}
+		reason := "unable to verify durable entry replay"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+		return
+	}
+	defer releaseAdmission()
+	intentKey = effectiveIntentKey
+
 	pState := e.portfolio.CurrentState()
-	positionValue := pState.Cash * (sig.SizePct / 100)
-	qty := positionValue / sig.SignalPrice
+	qty := admission.Quantity
+	if admission.BrokerAuthoritative {
+		sig.SignalPrice = admission.Ask
+		if err := store.UpdateSignalPrice(ctx, sigID, sig.SignalPrice); err != nil {
+			logger.Warn("update signal with fresh broker ask", "id", sigID, "err", err)
+		}
+	} else {
+		positionValue := pState.Cash * (sig.SizePct / 100)
+		qty = positionValue / sig.SignalPrice
+	}
 	if qty <= 0 {
-		reason := fmt.Sprintf("zero quantity (cash=%.2f size_pct=%.2f signal_price=%.4f)", pState.Cash, sig.SizePct, sig.SignalPrice)
+		reason := fmt.Sprintf("zero quantity (size_pct=%.2f signal_price=%.4f)", sig.SizePct, sig.SignalPrice)
 		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
 			logger.Warn("update signal status", "id", sigID, "err", err)
 		}
 		logger.Warn("signal execution skipped — zero quantity",
 			"ticker", sig.Ticker,
-			"cash", pState.Cash,
 			"size_pct", sig.SizePct,
 			"signal_price", sig.SignalPrice,
 		)
@@ -2489,21 +2512,28 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		Type:             execution.OrderTypeMarket,
 		Quantity:         qty,
 		ReferencePrice:   sig.SignalPrice, // paper executor fills at this price
-		IntentKey:        "entry:" + sigID,
+		IntentKey:        intentKey,
 		PolicyStopLoss:   sig.StopLoss,
 		PolicyTakeProfit: sig.TakeProfit,
+	}
+	replayingExisting := existingRequest != nil
+	if replayingExisting {
+		orderReq = *existingRequest
+		hydrateStockEntryReplayPolicy(&sig, orderReq)
 	}
 
 	// The uncapped exit policy is active only with the trailing manager: this
 	// guarantees the position retains a broker hard stop while the selected
 	// trail owns the winning exit. Keeping the manager requirement here makes
 	// an accidentally-partial config fail safe to the existing fixed TP.
-	uncapRequested := side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
+	uncapRequested := !replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
 	uncapTakeProfit, uncappedQty := resolveUncappedEntry(
 		e.cfg.Risk, side, qty, sig.SignalPrice, sig.StopLoss,
 		e.trailingManagerAvailable,
 	)
-	if uncapTakeProfit {
+	if replayingExisting {
+		uncapTakeProfit = orderReq.UncappedTakeProfit
+	} else if uncapTakeProfit {
 		orderReq.Quantity = uncappedQty
 		orderReq.UncappedTakeProfit = true
 	} else if uncapRequested {
@@ -2520,8 +2550,8 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// stop, GTC so the legs survive the session close. Whole shares only —
 	// Alpaca rejects fractional complex orders — so sub-one-share sizings
 	// fall back to the plain market entry with app-managed exits.
-	bracketed := false
-	if stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
+	bracketed, mayBuildBracket := stockEntryBracketReplayState(replayingExisting, orderReq)
+	if mayBuildBracket && stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
 		if whole := math.Floor(qty); whole >= 1 {
 			orderReq.Quantity = whole
 			orderReq.OrderClass = "bracket"
@@ -2541,6 +2571,70 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		)
 	}
 
+	// Run the complete release gate against the exact quantity and fresh ask
+	// after bracket/uncapped transformations. Signal-generation checks omit
+	// ProposedQuantity and retain their legacy early-screening behavior.
+	owned := []store.Trade(nil)
+	if store.IsConnected() && !admission.BrokerHeldReplay {
+		owned, err = store.GetOwnedPositionTrades(ctx)
+		if err != nil {
+			reason := "unable to verify open positions for final entry risk check"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+			return
+		}
+		if admission.BrokerAuthoritative {
+			owned = append(owned, reservationTrades(admission.Reservations, intentKey)...)
+			owned = append(owned, manualWorkingEntryTrades(admission.WorkingOrders, admission.Reservations, admission.Ask)...)
+		} else {
+			owned, err = withWorkingStockEntryReservations(ctx, owned)
+			if err != nil {
+				reason := "unable to verify working stock entries for final risk check"
+				_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+				logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
+				return
+			}
+		}
+	}
+	riskState := brokerStockRiskState(pState, admission)
+	riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
+		sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
+		riskState, owned)
+	if riskIn.HoldsLong && !replayingExisting {
+		sig.StopLoss = pyramidTightenedStop(
+			sig.StopLoss, riskIn.LongMaxStop, riskIn.LongAvgEntryPrice, sig.SignalPrice,
+		)
+		orderReq.PolicyStopLoss = sig.StopLoss
+		if orderReq.OrderClass == "bracket" {
+			orderReq.StopLossPrice = sig.StopLoss
+		}
+		riskIn.StopLoss = sig.StopLoss
+	}
+	riskIn.ProposedQuantity = orderReq.Quantity
+	riskIn.ProposedNotional = orderReq.Quantity * sig.SignalPrice
+	if admission.BrokerAuthoritative && !admission.BrokerHeldReplay && riskIn.ProposedNotional > admission.RemainingCapacity+1e-7 {
+		reason := "exact entry quantity exceeds available buying power"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+		return
+	}
+	if results, passed := checkStockEntryReleaseRisk(admission, riskIn); !passed {
+		reason := "execution risk re-check failed: " + risk.BlockReason(results)
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: risk.BlockReason(results),
+		})
+		return
+	}
+
+	if err := validateStockAdmissionFreshness(admission, time.Now().UTC()); err != nil {
+		reason := err.Error()
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
+		return
+	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
 		if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
@@ -3070,6 +3164,63 @@ func (e *Engine) RecoveredStockEntry(ctx context.Context, intentKey string) {
 	e.emitRecoveredEntryEffects(ctx, intentKey)
 }
 
+// PreparedStockEntryNeedsAdmission keeps a client-ID-missing prepared entry
+// reserved, but makes its owning signal retryable by the normal serialized,
+// fresh broker-admission path. Generic recovery itself never sends the POST.
+func (e *Engine) PreparedStockEntryNeedsAdmission(ctx context.Context, intentKey string) {
+	signalID, ok := preparedEntrySignalID(intentKey)
+	if !ok {
+		logger.Warn("cannot queue prepared stock entry with invalid intent key", "intent_key", intentKey)
+		return
+	}
+	sig, err := store.GetSignalByID(ctx, signalID)
+	if err != nil {
+		logger.Warn("load prepared stock entry signal after broker miss", "intent_key", intentKey, "err", err)
+		return
+	}
+	terminalReason := ""
+	if sig == nil {
+		terminalReason = "broker confirmed entry absent and owning signal is missing"
+	} else if terminalPreparedEntrySignal(sig, time.Now()) {
+		terminalReason = "broker confirmed entry absent after owning signal became terminal"
+	}
+	if terminalReason != "" {
+		if err := store.RetirePreparedStockEntryAfterBrokerMiss(ctx, intentKey, terminalReason); err != nil {
+			logger.Warn("retire prepared stock entry after broker miss", "intent_key", intentKey, "err", err)
+		}
+		return
+	}
+	if err := store.QueueSignalForDeferredExecution(ctx, signalID); err != nil {
+		logger.Warn("queue prepared stock entry for fresh admission", "intent_key", intentKey, "err", err)
+	}
+}
+
+func terminalPreparedEntrySignal(sig *store.Signal, now time.Time) bool {
+	if sig == nil {
+		return true
+	}
+	if !sig.ExpiresAt.IsZero() && now.After(sig.ExpiresAt) {
+		return true
+	}
+	switch sig.Status {
+	case "executed", "rejected", "expired", "stale":
+		return true
+	default:
+		return false
+	}
+}
+
+func preparedEntrySignalID(intentKey string) (string, bool) {
+	if !strings.HasPrefix(intentKey, "entry:") {
+		return "", false
+	}
+	remainder := strings.TrimPrefix(intentKey, "entry:")
+	if retryAt := strings.Index(remainder, ":retry:"); retryAt >= 0 {
+		remainder = remainder[:retryAt]
+	}
+	return remainder, remainder != "" && !strings.Contains(remainder, ":")
+}
+
 // RecoveredStockExit implements stockorders.RecoveryObserver. Recovery owns
 // durable state; the engine owns the process-local cooldown and event bus.
 func (e *Engine) RecoveredStockExit(_ context.Context, realized store.TradeRealization) {
@@ -3169,8 +3320,30 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	var cash float64
 	var totalEquity float64
 	var dayPnL float64
+	brokerAuthoritative := brokerName(e.executor) == "alpaca"
 
-	if acct, err := e.executor.GetAccount(ctx); err != nil {
+	if brokerAuthoritative {
+		view, ok := e.executor.(interface {
+			AccountSnapshot(context.Context) (execution.BrokerAccount, error)
+		})
+		if !ok {
+			logger.Warn("broker account snapshot unavailable for portfolio refresh")
+			return
+		}
+		acct, err := view.AccountSnapshot(ctx)
+		if err != nil {
+			logger.Warn("get broker account for portfolio refresh", "err", err)
+			return
+		}
+		if err := validateBrokerPortfolioAccount(acct, e.cfg.Markets.Stocks.ExpectedAccountNumber, time.Now().UTC()); err != nil {
+			logger.Warn("invalid broker account for portfolio refresh", "err", err)
+			return
+		}
+		e.updateStockAccountPeak(acct.AccountID, acct.Equity)
+		cash = acct.Cash
+		totalEquity = acct.Equity
+		dayPnL = acct.Equity - acct.LastEquity
+	} else if acct, err := e.executor.GetAccount(ctx); err != nil {
 		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
 	} else {
 		cash = acct.Cash
@@ -3178,9 +3351,10 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		dayPnL = acct.DayPnL
 	}
 
-	if dayPnL == 0 {
-		// Local fallback: sum realized P&L from trades closed today (only when
-		// the broker does not provide it to avoid unnecessary DB load).
+	if shouldLoadLocalRealizedPnL(store.IsConnected(), brokerAuthoritative, dayPnL) {
+		// Realized P&L is independent of Alpaca's equity-last_equity movement,
+		// which also contains unrealized gains/losses and transfers. Preserve the
+		// legacy fallback for non-authoritative brokers that report no day P&L.
 		closedTrades, _ := store.GetRecentTrades(ctx, 100)
 		today := time.Now().UTC().Truncate(24 * time.Hour)
 		for _, t := range closedTrades {
@@ -3190,7 +3364,7 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		}
 	}
 
-	if cash == 0 {
+	if cash == 0 && !brokerAuthoritative {
 		// Local fallback: initial_capital minus cost basis of open positions.
 		cash = e.cfg.Engine.InitialCapital
 		for _, p := range positions {
@@ -3201,7 +3375,7 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 		}
 	}
 
-	if totalEquity == 0 {
+	if totalEquity == 0 && !brokerAuthoritative {
 		totalEquity = cash
 		for _, p := range positions {
 			totalEquity += p.CurrentValue
@@ -3209,6 +3383,10 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	}
 
 	e.portfolio.Update(eps, cash, totalEquity, dayPnL, realizedToday)
+}
+
+func shouldLoadLocalRealizedPnL(storeConnected, brokerAuthoritative bool, dayPnL float64) bool {
+	return storeConnected && (brokerAuthoritative || dayPnL == 0)
 }
 
 // ─── Phase 4: Position monitoring (4.7) ───────────────────────────────────────
@@ -3652,9 +3830,6 @@ func (e *Engine) updateDailySummary(ctx context.Context) {
 // against CURRENT state: cash, open-position count, daily loss, and
 // cooldown may all have changed in the tick since the signal was generated.
 func (e *Engine) processDeferredSignals(ctx context.Context) {
-	if !e.cfg.Risk.EntryGates.FirstTickDefer {
-		return
-	}
 	mode := e.Mode()
 	if mode != "auto" && mode != "paper" {
 		return
@@ -3670,7 +3845,33 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 			continue // defensive: only BUYs are ever deferred
 		}
 		if !sig.ExpiresAt.IsZero() && now.After(sig.ExpiresAt) {
+			// A prepared intent can have reached the broker before the local
+			// attempt marker committed. Signal expiry is not broker truth, so its
+			// reservation must survive for exact client-ID recovery.
 			continue // the expiry loop owns time-outs
+		}
+		prepared, preparedErr := store.HasPreparedStockEntry(ctx, sig.ID)
+		if preparedErr != nil {
+			logger.Warn("deferred signal: prepared intent lookup failed", "id", sig.ID, "err", preparedErr)
+			continue
+		}
+		if prepared {
+			// This is crash recovery, not first-tick confirmation. The durable
+			// intent already occupies its own risk slot, so skip the legacy
+			// hold/precheck and let executeSignal's self-excluding fresh admission
+			// perform the one complete release gate.
+			e.executeSignal(ctx, sig.ID, sig, true)
+			// Admission failures report their reason by blocking the signal. The
+			// prepared reservation is still unresolved broker state, so make that
+			// signal retryable until recovery either finds the order or confirms a
+			// broker miss after the signal becomes terminal.
+			if err := store.QueueSignalForDeferredExecution(ctx, sig.ID); err != nil {
+				logger.Warn("requeue prepared stock entry after admission attempt", "id", sig.ID, "err", err)
+			}
+			continue
+		}
+		if !deferredSignalPathEnabled(e.cfg.Risk.EntryGates.FirstTickDefer, false) {
+			continue
 		}
 		// Confirm against a LIVE quote, not the candle store: this sweep runs
 		// before the tick's candle refresh, so the freshest stored candle is
@@ -3741,6 +3942,10 @@ func (e *Engine) processDeferredSignals(ctx context.Context) {
 		// Released from the deferred queue after first-tick confirmation.
 		e.executeSignal(ctx, sig.ID, sig, true)
 	}
+}
+
+func deferredSignalPathEnabled(firstTickDefer, preparedRecovery bool) bool {
+	return preparedRecovery || firstTickDefer
 }
 
 // freshStockMark returns the freshest available stock mark: a live quote mid

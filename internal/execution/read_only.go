@@ -97,6 +97,14 @@ func (e *ReadOnlyExecutor) GetWorkingOrders(ctx context.Context) ([]WorkingOrder
 	return lister.GetWorkingOrders(ctx)
 }
 
+func (e *ReadOnlyExecutor) StockAssetSnapshot(ctx context.Context, symbol string) (StockAsset, error) {
+	provider, ok := e.inner.(StockAssetProvider)
+	if !ok {
+		return StockAsset{}, ErrBrokerUnavailable
+	}
+	return provider.StockAssetSnapshot(ctx, symbol)
+}
+
 // GetOptionChain and GetOptionSnapshots preserve Alpaca's option-market-data
 // reads for option selection and exit pricing. They expose no mutation path;
 // option order placement remains blocked by PlaceOrder above.
