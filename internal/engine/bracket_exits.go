@@ -243,7 +243,16 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		handled, closeErr := e.closeBracketTrade(ctx, t, states, filledIdx, ownsAllExits)
 		return handled, errors.Join(pollErr, closeErr)
 	}
-	if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr == nil && required && parentID != "" {
+	required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID)
+	if policyErr != nil && bracketPolicyEnabled && !errors.Is(policyErr, pgx.ErrNoRows) {
+		// This path is reached when projected legs have all become terminal.
+		// A transient policy read is still not proof that a strict entry can
+		// safely hand ownership back to application-managed exits.
+		logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", policyErr)
+		return true, errors.Join(pollErr, policyErr)
+	}
+	if policyErr == nil && required && parentID != "" {
 		if brokerStopSnapshotUnknown(states) {
 			// A failed stop lookup is not evidence that protection disappeared.
 			// Keep broker ownership and retry before taking a destructive action.

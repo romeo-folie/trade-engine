@@ -223,6 +223,31 @@ func TestCancelBrokerBracketChildren_RetainsParentReportedFillWhenLookupMisses(t
 	}
 }
 
+func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *testing.T) {
+	checks := make(chan struct{}, 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			"healthy-parent": {
+				Status: "filled", Quantity: 2, FilledQty: 2,
+				ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+			},
+		},
+		onStatus: func(string) { checks <- struct{}{} },
+	}
+	e := newBracketTestEngine(exec)
+	e.verifyOrContainBrokerEntryAsync("missing-trade", "healthy-parent", "TEST", 2)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-checks:
+		case <-time.After(time.Second):
+			t.Fatalf("verification attempt %d did not run", i+1)
+		}
+	}
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("unknown trade projection must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
 func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

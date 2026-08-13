@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
@@ -247,22 +248,72 @@ func (e *Engine) verifyOrContainBrokerEntryAsync(tradeID, entryBrokerOrderID, ti
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		status, err := e.executor.GetOrderStatus(ctx, entryBrokerOrderID)
-		reason := "fresh broker protection snapshot is unavailable"
-		if err == nil {
-			trade, tradeErr := store.GetTradeByID(ctx, tradeID)
-			if tradeErr == nil && trade != nil {
-				state := brokerBracketProtectionState(status, trade.Quantity)
-				if state.UnprotectedQty <= 1e-9 {
-					return
-				}
-				logger.Error("broker protection: containment required", "trade_id", tradeID,
-					"held_qty", state.HeldQty, "working_entry_qty", state.WorkingEntryQty,
-					"protected_qty", state.ProtectedQty, "unprotected_qty", state.UnprotectedQty)
+		for attempt := 0; attempt < 3; attempt++ {
+			status, err := e.executor.GetOrderStatus(ctx, entryBrokerOrderID)
+			if err != nil {
+				logger.Warn("broker protection: fresh parent snapshot unavailable; retrying",
+					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
+					"attempt", attempt+1, "err", err)
+				continue
 			}
-			reason = brokerProtectionFailureReason(status, requestedQty)
+			trade, err := store.GetTradeByID(ctx, tradeID)
+			if err != nil || trade == nil {
+				logger.Warn("broker protection: trade projection unavailable; retrying verification",
+					"trade_id", tradeID, "broker_order_id", entryBrokerOrderID,
+					"attempt", attempt+1, "err", err)
+				continue
+			}
+			// The broker's cumulative parent fill is newer than the asynchronous
+			// local projection. Coverage must include either value's larger held
+			// quantity so a newly filled remainder cannot be left unprotected.
+			heldQty := brokerCoverageHeldQty(trade.Quantity, status)
+			state := brokerBracketProtectionState(status, heldQty)
+			if state.UnprotectedQty <= 1e-9 {
+				return
+			}
+			logger.Error("broker protection: containment required", "trade_id", tradeID,
+				"held_qty", state.HeldQty, "working_entry_qty", state.WorkingEntryQty,
+				"protected_qty", state.ProtectedQty, "unprotected_qty", state.UnprotectedQty)
+			e.containUnprotectedBrokerEntry(ctx, tradeID, entryBrokerOrderID, ticker,
+				brokerProtectionFailureReason(status, requestedQty))
+			return
 		}
-		e.containUnprotectedBrokerEntry(ctx, tradeID, entryBrokerOrderID, ticker, reason)
+		logger.Error("broker protection: verification remains uncertain; retaining broker ownership",
+			"trade_id", tradeID, "broker_order_id", entryBrokerOrderID)
+	}()
+}
+
+func brokerCoverageHeldQty(localQty float64, parent execution.OrderResult) float64 {
+	return math.Max(localQty, parent.FilledQty)
+}
+
+// recoverAndVerifyAcceptedBrokerEntryAsync closes the post-acceptance gap
+// before the local trade/child projections complete. Strict entries are
+// durable before the broker request, so recovery can create or attach the
+// trade and then apply the same broker-coverage verification.
+func (e *Engine) recoverAndVerifyAcceptedBrokerEntryAsync(intentKey string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		recoverer, ok := e.executor.(interface{ Recover(context.Context) error })
+		if !ok {
+			logger.Error("broker protection: accepted strict entry has no durable recovery executor",
+				"intent_key", intentKey)
+			return
+		}
+		for attempt := 0; attempt < 3; attempt++ {
+			if err := recoverer.Recover(ctx); err != nil {
+				logger.Warn("broker protection: recover accepted strict entry before verification",
+					"intent_key", intentKey, "attempt", attempt+1, "err", err)
+				continue
+			}
+			e.containRecoveredUnprotectedBracket(ctx, intentKey)
+			return
+		}
+		// Retain the durable intent for the coordinator's next recovery sweep;
+		// an unverified strict entry must never be downgraded to app ownership.
+		logger.Error("broker protection: accepted strict entry recovery remains uncertain",
+			"intent_key", intentKey)
 	}()
 }
 

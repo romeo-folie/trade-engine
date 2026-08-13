@@ -2711,6 +2711,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
 	}
+	// A strict entry is durable before this broker request, but its local
+	// trade/child projections below can still fail. Ensure every early return
+	// after acceptance immediately enters durable recovery and broker coverage
+	// verification instead of leaving a partial parent to keep filling.
+	strictBrokerVerificationPending := orderReq.RequireBrokerProtection &&
+		!brokerBracketProtectionVerified(result, result.FilledQty)
+	if strictBrokerVerificationPending {
+		defer func() {
+			if strictBrokerVerificationPending {
+				e.recoverAndVerifyAcceptedBrokerEntryAsync(orderReq.IntentKey)
+			}
+		}()
+	}
 	stockIntentID, projectionErr := stockIntentIDForAcceptedOrder(ctx, e.executor, orderReq.IntentKey)
 	if projectionErr != nil {
 		logger.Error("accepted stock order intent projection unavailable", "ticker", sig.Ticker, "intent_key", orderReq.IntentKey, "err", projectionErr)
@@ -2897,8 +2910,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			}
 		}
 	}
-	if orderReq.RequireBrokerProtection && !brokerBracketProtectionVerified(result, trade.Quantity) {
+	if strictBrokerVerificationPending {
 		e.verifyOrContainBrokerEntryAsync(tradeID, result.BrokerOrderID, sig.Ticker, orderReq.Quantity)
+		strictBrokerVerificationPending = false
 	}
 
 	logger.Info("trade opened",

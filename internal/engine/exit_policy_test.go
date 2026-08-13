@@ -170,6 +170,20 @@ func TestBrokerBracketProtectionStateDistinguishesHeldAndActiveCoverage(t *testi
 	}
 }
 
+func TestBrokerCoverageHeldQtyUsesFreshParentFill(t *testing.T) {
+	parent := execution.OrderResult{Status: "filled", Quantity: 5, FilledQty: 5}
+	if got := brokerCoverageHeldQty(2, parent); got != 5 {
+		t.Fatalf("held quantity = %v, want broker's newer cumulative fill of 5", got)
+	}
+	state := brokerBracketProtectionState(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+	}, brokerCoverageHeldQty(2, parent))
+	if state.UnprotectedQty != 3 {
+		t.Fatalf("fresh broker fill must expose 3 uncovered shares, state=%+v", state)
+	}
+}
+
 func TestSellExitConfidenceGate(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
