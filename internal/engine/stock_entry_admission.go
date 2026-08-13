@@ -33,9 +33,11 @@ type stockEntryAdmission struct {
 	Quantity            float64
 	RemainingCapacity   float64
 	PeakEquity          float64
+	DailyBaseline       float64
 	Reservations        []store.ActiveStockEntryReservation
 	BrokerHeldReplay    bool
 	WorkingOrders       []execution.WorkingOrder
+	BrokerPositions     []execution.BrokerPosition
 }
 
 func (e *Engine) beginStockEntryAdmission(
@@ -120,6 +122,12 @@ func (e *Engine) prepareStockEntryAdmission(
 	if !ok {
 		return stockEntryAdmission{}, errorsForAdmission("broker working orders are unavailable")
 	}
+	positionView, ok := e.executor.(interface {
+		PositionsSnapshot(context.Context) ([]execution.BrokerPosition, error)
+	})
+	if !ok {
+		return stockEntryAdmission{}, errorsForAdmission("broker position snapshot is unavailable")
+	}
 	if !store.IsConnected() {
 		return stockEntryAdmission{}, errorsForAdmission("durable stock entry reservations are unavailable")
 	}
@@ -138,6 +146,10 @@ func (e *Engine) prepareStockEntryAdmission(
 	account, err := accountView.AccountSnapshot(ctx)
 	if err != nil {
 		return stockEntryAdmission{}, fmt.Errorf("stock entry admission: fetch account: %w", err)
+	}
+	positions, err := positionView.PositionsSnapshot(ctx)
+	if err != nil {
+		return stockEntryAdmission{}, fmt.Errorf("stock entry admission: fetch positions: %w", err)
 	}
 	reservations, err := store.ListActiveStockEntryReservations(ctx)
 	if err != nil {
@@ -169,7 +181,10 @@ func (e *Engine) prepareStockEntryAdmission(
 	}
 
 	var quantity float64
-	brokerHeldReplay := existing != nil && existingEntryBrokerHeld(intentKey, reservations, working)
+	brokerHeldReplay, err := e.existingEntryBrokerReplay(ctx, intentKey, existing, reservations, working)
+	if err != nil {
+		return stockEntryAdmission{}, err
+	}
 	if existing != nil {
 		quantity = existing.Quantity
 		if !asset.Fractionable && quantity != math.Floor(quantity) {
@@ -180,6 +195,15 @@ func (e *Engine) prepareStockEntryAdmission(
 		if err != nil {
 			return stockEntryAdmission{}, err
 		}
+		// A small account can have a valid positive allocation that rounds to
+		// zero only because this asset is whole-share-only. Permit exactly one
+		// share, never a fractional fallback, and only when the resulting
+		// notional itself fits the configured position cap and fresh capacity.
+		// The final release gate still applies the exact stop-distance dollar
+		// risk check before the broker request is sent.
+		if minimumWholeShareAllowed(quantity, asset.Fractionable, sizePct, ask, account.Equity, capacity, e.cfg.Risk.MaxPositionPct) {
+			quantity = 1
+		}
 	}
 	if !finitePositive(quantity) {
 		return stockEntryAdmission{}, errorsForAdmission("available buying power produces zero quantity")
@@ -188,14 +212,18 @@ func (e *Engine) prepareStockEntryAdmission(
 		return stockEntryAdmission{}, errorsForAdmission("exact entry quantity exceeds available buying power")
 	}
 
-	e.updateStockAccountPeak(account.AccountID, account.Equity)
-	peak := e.stockPeak(account.AccountID)
+	peakEquity, peakObservedAt := e.updateStockAccountPeak(account.AccountID, account.Equity, account.FetchedAt)
+	baseline, err := store.ObserveAccountRiskBaselineWithPeak(ctx, account.AccountID, account.Equity, peakEquity, account.LastEquity, account.FetchedAt, peakObservedAt)
+	if err != nil {
+		return stockEntryAdmission{}, fmt.Errorf("stock entry admission: persist account risk baseline: %w", err)
+	}
 	return stockEntryAdmission{
 		BrokerAuthoritative: true,
 		Account:             account, Asset: asset, Ask: ask, QuoteAt: quote.Timestamp, Quantity: quantity,
 		RemainingCapacity: capacity,
-		PeakEquity:        peak, Reservations: reservations, BrokerHeldReplay: brokerHeldReplay,
-		WorkingOrders: working,
+		PeakEquity:        baseline.PeakEquity, DailyBaseline: baseline.LastEquity,
+		Reservations: reservations, BrokerHeldReplay: brokerHeldReplay,
+		WorkingOrders: working, BrokerPositions: positions,
 	}, nil
 }
 
@@ -271,17 +299,73 @@ func existingEntryBrokerHeld(
 	return false
 }
 
-func (e *Engine) updateStockAccountPeak(accountID string, equity float64) {
+// existingEntryBrokerReplay identifies a durable entry that must be handed
+// back to the coordinator rather than re-admitted as a new BUY. A working
+// order is enough to prove that case. When the order has raced from working to
+// filled (or another terminal state), ask the broker by client ID before
+// applying fresh-entry risk or pause gates. The coordinator then records the
+// broker truth and projects any missing local trade or protective stop.
+func (e *Engine) existingEntryBrokerReplay(
+	ctx context.Context,
+	intentKey string,
+	existing *execution.OrderRequest,
+	reservations []store.ActiveStockEntryReservation,
+	working []execution.WorkingOrder,
+) (bool, error) {
+	if existing == nil {
+		return false, nil
+	}
+	if existingEntryBrokerHeld(intentKey, reservations, working) {
+		return true, nil
+	}
+
+	var reservation *store.ActiveStockEntryReservation
+	for i := range reservations {
+		if reservations[i].IdempotencyKey == intentKey {
+			reservation = &reservations[i]
+			break
+		}
+	}
+	if reservation == nil {
+		return false, errorsForAdmission("durable entry replay has no active reservation")
+	}
+	lookup, ok := e.executor.(execution.ClientOrderLookup)
+	if !ok {
+		return false, errorsForAdmission("broker client-id lookup is unavailable for durable entry replay")
+	}
+	if _, err := lookup.GetOrderByClientID(ctx, existing.ClientOrderID); err == nil {
+		return true, nil
+	} else if !errors.Is(err, execution.ErrOrderNotFound) {
+		return false, fmt.Errorf("stock entry admission: look up durable entry by client ID: %w", err)
+	}
+
+	// A submitted intent whose client ID is temporarily unavailable is
+	// ambiguous. Preserve the replay path so the coordinator can fail closed
+	// instead of allowing a second BUY to be admitted and submitted.
+	if reservation.SubmittedAt != nil || reservation.BrokerOrderID != "" {
+		return true, nil
+	}
+	return false, nil
+}
+
+func (e *Engine) updateStockAccountPeak(accountID string, equity float64, observedTimes ...time.Time) (float64, time.Time) {
+	observedAt := time.Now().UTC()
+	if len(observedTimes) > 0 && !observedTimes[0].IsZero() {
+		observedAt = observedTimes[0]
+	}
 	e.stockAccountPeakMu.Lock()
 	defer e.stockAccountPeakMu.Unlock()
 	if e.stockAccountPeakID != accountID {
 		e.stockAccountPeakID = accountID
 		e.stockAccountPeak = equity
-		return
+		e.stockAccountPeakAt = observedAt
+		return e.stockAccountPeak, e.stockAccountPeakAt
 	}
 	if equity > e.stockAccountPeak {
 		e.stockAccountPeak = equity
+		e.stockAccountPeakAt = observedAt
 	}
+	return e.stockAccountPeak, e.stockAccountPeakAt
 }
 
 func (e *Engine) stockPeak(accountID string) float64 {
@@ -414,26 +498,8 @@ func validateStockAccount(account execution.BrokerAccount, marginable bool, expe
 }
 
 func validateBrokerPortfolioAccount(account execution.BrokerAccount, expectedAccountNumber string, now time.Time) error {
-	if err := validateAdmissionTimestamp("account", account.FetchedAt, now); err != nil {
-		return err
-	}
-	if !strings.EqualFold(account.Status, "active") || !strings.EqualFold(account.Currency, "USD") ||
-		account.TradingBlocked || account.AccountBlocked || account.TradeSuspendedByUser {
-		return errorsForAdmission("account is not active, unrestricted, and USD-denominated")
-	}
-	if strings.TrimSpace(account.AccountID) == "" || strings.TrimSpace(account.AccountNumber) == "" {
-		return errorsForAdmission("account identity is missing")
-	}
-	if expected := strings.TrimSpace(expectedAccountNumber); expected != "" && account.AccountNumber != expected {
-		return errorsForAdmission("connected account does not match expected_account_number")
-	}
-	if !account.CashAvailable || !account.BuyingPowerAvailable || !account.MultiplierAvailable ||
-		!finiteNonNegative(account.Equity) || !finite(account.Cash) ||
-		!finiteNonNegative(account.BuyingPower) || !finite(account.Multiplier) || account.Multiplier <= 0 {
-		return errorsForAdmission("account equity, cash, buying power, or multiplier is invalid")
-	}
-	if !account.LastEquityAvailable || !finiteNonNegative(account.LastEquity) {
-		return errorsForAdmission("account last_equity is missing or invalid")
+	if err := execution.ValidateBrokerAccount(account, expectedAccountNumber, now); err != nil {
+		return errorsForAdmission(err.Error())
 	}
 	return nil
 }
@@ -477,6 +543,11 @@ func sizeStockEntry(equity, sizePct, capacity, ask float64, fractionable bool) (
 	return floorStockQuantity(math.Min(desiredNotional, capacity)/ask, fractionable), nil
 }
 
+func minimumWholeShareAllowed(quantity float64, fractionable bool, sizePct, ask, equity, capacity, maxPositionPct float64) bool {
+	return quantity <= 0 && !fractionable && sizePct > 0 && ask > 0 &&
+		maxPositionPct > 0 && ask <= equity*maxPositionPct/100+1e-9 && ask <= capacity+1e-9
+}
+
 func finite(v float64) bool            { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 func finitePositive(v float64) bool    { return finite(v) && v > 0 }
 func finiteNonNegative(v float64) bool { return finite(v) && v >= 0 }
@@ -503,8 +574,12 @@ func brokerStockRiskState(current portfolio.State, admission stockEntryAdmission
 	current.TotalValue = admission.Account.Equity
 	current.Cash = admission.Account.Cash
 	current.PeakValue = admission.PeakEquity
-	// RealizedPnLDay intentionally remains local realized P&L. Alpaca's
-	// equity-last_equity includes unrealized movement and transfers.
+	// The persisted account-scoped daily reference captures both realized and
+	// unrealized loss. It therefore remains correct across restarts instead of
+	// resetting to a process-local realized-P&L counter.
+	if admission.DailyBaseline > 0 {
+		current.RealizedPnLDay = admission.Account.Equity - admission.DailyBaseline
+	}
 	return current
 }
 
@@ -539,4 +614,168 @@ func reservationTrades(reservations []store.ActiveStockEntryReservation, exclude
 		})
 	}
 	return trades
+}
+
+// attachedReservationNotional accounts for the unfilled remainder of an entry
+// that already has an attached trade. The trade supplies position ownership;
+// this helper supplies only the still-working exposure, so it cannot inflate
+// the position count or per-ticker lot count.
+func attachedReservationNotional(reservations []store.ActiveStockEntryReservation, excludeKey, ticker string, mark float64) float64 {
+	if mark <= 0 {
+		return 0
+	}
+	var notional float64
+	for _, reservation := range reservations {
+		if reservation.IdempotencyKey == excludeKey || reservation.TradeID == "" ||
+			!strings.EqualFold(reservation.Ticker, ticker) || reservation.RemainingQty <= 0 {
+			continue
+		}
+		notional += reservation.RemainingQty * mark
+	}
+	return notional
+}
+
+func brokerLongNotional(positions []execution.BrokerPosition, ticker string, mark float64) float64 {
+	if mark <= 0 {
+		return 0
+	}
+	var quantity float64
+	for _, position := range positions {
+		if strings.EqualFold(position.Symbol, ticker) && !strings.EqualFold(position.Side, "short") && position.Quantity > 0 {
+			quantity += position.Quantity
+		}
+	}
+	return quantity * mark
+}
+
+// brokerLongPosition returns Alpaca's aggregate long for ticker. Broker
+// positions are authoritative at entry release: a manual or otherwise
+// unadopted holding must still be treated as an existing pyramid position.
+// The boolean pair distinguishes no position from a malformed position whose
+// missing average entry makes a safe pyramid-gain check impossible.
+func brokerLongPosition(positions []execution.BrokerPosition, ticker string) (quantity, averageEntry float64, found, valid bool) {
+	var costBasis float64
+	for _, position := range positions {
+		if !strings.EqualFold(position.Symbol, ticker) || strings.EqualFold(position.Side, "short") || position.Quantity <= 0 {
+			continue
+		}
+		found = true
+		if !finitePositive(position.AvgEntryPrice) {
+			return 0, 0, true, false
+		}
+		quantity += position.Quantity
+		costBasis += position.Quantity * position.AvgEntryPrice
+	}
+	if !found {
+		return 0, 0, false, true
+	}
+	return quantity, costBasis / quantity, true, true
+}
+
+// mergeBrokerLongOccupancy makes broker truth part of every position budget,
+// not only target-ticker notional. Alpaca aggregates one holding per symbol,
+// so a broker position overlays a filled local lot for that ticker instead of
+// adding a second position. Pending reservations are not positions yet, so an
+// otherwise-unrepresented broker holding consumes its own slot alongside them.
+func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerPosition, target string, durableOwned []store.Trade) error {
+	if in == nil {
+		return nil
+	}
+	if in.OpenByTicker == nil {
+		in.OpenByTicker = make(map[string]int)
+	}
+	filledLongs := make(map[string]struct{})
+	for _, trade := range durableOwned {
+		if strings.EqualFold(trade.Direction, "long") && trade.Quantity > 0 {
+			filledLongs[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
+		}
+	}
+	for _, position := range positions {
+		symbol := strings.TrimSpace(position.Symbol)
+		if symbol == "" {
+			return errorsForAdmission("broker position has no symbol for capacity check")
+		}
+		if !finite(position.Quantity) || math.Abs(position.Quantity) <= 1e-9 {
+			return errorsForAdmission("broker position has invalid quantity for capacity check")
+		}
+		if strings.EqualFold(position.Side, "short") {
+			if strings.EqualFold(symbol, target) {
+				return errorsForAdmission("broker holds a short position in the requested BUY ticker")
+			}
+			// Shorts consume overall capacity but must not influence BUY-only
+			// pyramid ownership or per-ticker long limits.
+			key, count := riskInputTickerCount(in.OpenByTicker, symbol)
+			if count == 0 {
+				in.OpenByTicker[symbol] = 1
+				in.OpenPositions++
+			} else if key != symbol {
+				in.OpenByTicker[key] = count
+			}
+			continue
+		}
+		if !strings.EqualFold(position.Side, "long") {
+			return errorsForAdmission("broker position has invalid side for capacity check")
+		}
+		if position.Quantity <= 0 {
+			return errorsForAdmission("broker long position has invalid quantity for capacity check")
+		}
+		key, count := riskInputTickerCount(in.OpenByTicker, symbol)
+		_, representedByFilledLot := filledLongs[strings.ToUpper(symbol)]
+		if !representedByFilledLot {
+			// A broker-only long and a pending BUY are distinct future lots. Do
+			// not let the pending reservation hide the existing broker holding.
+			in.OpenByTicker[key] = count + 1
+			in.OpenPositions++
+		} else if count == 0 {
+			in.OpenByTicker[symbol] = 1
+			in.OpenPositions++
+		} else if key != symbol {
+			// Preserve the map's existing casing so later risk checks observe
+			// the same local count rather than creating a duplicate key.
+			in.OpenByTicker[key] = count
+		}
+	}
+	quantity, averageEntry, found, valid := brokerLongPosition(positions, target)
+	if found && !valid {
+		return errorsForAdmission("unable to verify broker-held position cost basis for pyramid risk check")
+	}
+	if found {
+		in.HoldsLong = true
+		// A broker snapshot can lag local durable fill projection. Preserve the
+		// more conservative ownership values: a larger quantity and higher cost
+		// basis cannot make a pyramid appear safer than either source does.
+		in.LongQuantity = math.Max(in.LongQuantity, quantity)
+		in.LongAvgEntryPrice = math.Max(in.LongAvgEntryPrice, averageEntry)
+	}
+	return nil
+}
+
+func riskInputTickerCount(counts map[string]int, ticker string) (string, int) {
+	for key, count := range counts {
+		if strings.EqualFold(key, ticker) {
+			return key, count
+		}
+	}
+	return ticker, 0
+}
+
+func pendingStockEntryNotional(
+	reservations []store.ActiveStockEntryReservation,
+	working []execution.WorkingOrder,
+	excludeKey, ticker string,
+	mark float64,
+) float64 {
+	var notional float64
+	for _, trade := range reservationTrades(reservations, excludeKey) {
+		if strings.EqualFold(trade.Ticker, ticker) {
+			notional += trade.Quantity * mark
+		}
+	}
+	notional += attachedReservationNotional(reservations, excludeKey, ticker, mark)
+	for _, trade := range manualWorkingEntryTrades(working, reservations, mark) {
+		if strings.EqualFold(trade.Ticker, ticker) {
+			notional += trade.Quantity * mark
+		}
+	}
+	return notional
 }

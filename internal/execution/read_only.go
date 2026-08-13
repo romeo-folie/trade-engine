@@ -97,6 +97,17 @@ func (e *ReadOnlyExecutor) GetWorkingOrders(ctx context.Context) ([]WorkingOrder
 	return lister.GetWorkingOrders(ctx)
 }
 
+// GetOrderByClientID forwards the read-only broker lookup used to resolve an
+// ambiguous durable submit. It has no mutation path, so it remains available
+// while dry-run blocks order placement.
+func (e *ReadOnlyExecutor) GetOrderByClientID(ctx context.Context, clientOrderID string) (OrderResult, error) {
+	lookup, ok := e.inner.(ClientOrderLookup)
+	if !ok {
+		return OrderResult{}, ErrBrokerUnavailable
+	}
+	return lookup.GetOrderByClientID(ctx, clientOrderID)
+}
+
 func (e *ReadOnlyExecutor) StockAssetSnapshot(ctx context.Context, symbol string) (StockAsset, error) {
 	provider, ok := e.inner.(StockAssetProvider)
 	if !ok {

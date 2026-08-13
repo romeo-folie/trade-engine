@@ -129,6 +129,7 @@ type Engine struct {
 	stockEntryAdmissionMu sync.Mutex
 	stockAccountPeakMu    sync.Mutex
 	stockAccountPeak      float64
+	stockAccountPeakAt    time.Time
 	stockAccountPeakID    string
 
 	feedbackReviewer *feedback.Reviewer
@@ -2628,6 +2629,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// after bracket/uncapped transformations. Signal-generation checks omit
 	// ProposedQuantity and retain their legacy early-screening behavior.
 	owned := []store.Trade(nil)
+	var durableOwned []store.Trade
 	if store.IsConnected() && !admission.BrokerHeldReplay {
 		owned, err = store.GetOwnedPositionTrades(ctx)
 		if err != nil {
@@ -2636,6 +2638,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
 			return
 		}
+		durableOwned = append(durableOwned, owned...)
 		if admission.BrokerAuthoritative {
 			owned = append(owned, reservationTrades(admission.Reservations, intentKey)...)
 			owned = append(owned, manualWorkingEntryTrades(admission.WorkingOrders, admission.Reservations, admission.Ask)...)
@@ -2653,6 +2656,30 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	riskIn := buildRiskInput(e.cfg.Risk, sig.Action, sig.Ticker,
 		sig.Confidence, sig.SizePct, sig.StopLoss, sig.TakeProfit, sig.SignalPrice,
 		riskState, owned)
+	// A partially filled entry has an attached trade for the filled shares, so
+	// reservationTrades deliberately omits its remaining working shares to avoid
+	// counting a second position. Its unfilled remainder is still live exposure
+	// if it fills, however, and must count toward the aggregate ticker cap.
+	riskIn.ExistingTickerNotional += attachedReservationNotional(
+		admission.Reservations, intentKey, sig.Ticker, sig.SignalPrice,
+	)
+	if admission.BrokerAuthoritative && !admission.BrokerHeldReplay {
+		// Broker positions include manual/unadopted shares, but the snapshot can
+		// predate local fill projection. The local risk input already includes
+		// every pending reservation, so compare it with the broker holding plus
+		// that same pending exposure instead of adding pending shares twice.
+		riskIn.ExistingTickerNotional = mergedTickerExposure(
+			riskIn.ExistingTickerNotional,
+			brokerLongNotional(admission.BrokerPositions, sig.Ticker, sig.SignalPrice),
+			pendingStockEntryNotional(admission.Reservations, admission.WorkingOrders, intentKey, sig.Ticker, sig.SignalPrice),
+		)
+		if err := mergeBrokerLongOccupancy(&riskIn, admission.BrokerPositions, sig.Ticker, durableOwned); err != nil {
+			reason := err.Error()
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			return
+		}
+	}
 	if riskIn.HoldsLong && !replayingExisting {
 		sig.StopLoss = pyramidTightenedStop(
 			sig.StopLoss, riskIn.LongMaxStop, riskIn.LongAvgEntryPrice, sig.SignalPrice,
@@ -2700,6 +2727,27 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
 		return
+	}
+	// Admission identifies whether this is a client-ID replay of an order the
+	// broker already holds. A pause blocks fresh submissions, but it must never
+	// abandon that already-live order before its trade/protection projection.
+	if !admission.BrokerHeldReplay {
+		if enabled, reason := buyEntriesEnabled(ctx); !enabled {
+			if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+				logger.Warn("update signal status", "id", sigID, "err", err)
+			}
+			// A client-ID miss is not proof that a prepared order never reached
+			// the broker: a crash can occur after acceptance but before its
+			// attempt marker commits. Keep that reservation recoverable so a
+			// late broker fill is still projected and protected; the pause
+			// prevents a fresh release on every retry.
+			logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "buy_control",
+			})
+			return
+		}
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
@@ -3079,6 +3127,14 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			)
 		}()
 	}
+}
+
+// mergedTickerExposure preserves the complete local projection (held shares
+// plus every reservation) unless the broker snapshot reports a larger holding.
+// In the latter case, only pending shares are added to broker exposure because
+// those fills cannot yet appear in the broker position snapshot.
+func mergedTickerExposure(localExposure, brokerExposure, pendingExposure float64) float64 {
+	return math.Max(localExposure, brokerExposure+pendingExposure)
 }
 
 // applyBracketChildSnapshot preserves an already-reported broker execution
@@ -3480,6 +3536,8 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	var cash float64
 	var totalEquity float64
 	var dayPnL float64
+	var dailyBaselineKnown bool
+	var persistedPeak float64
 	brokerAuthoritative := brokerName(e.executor) == "alpaca"
 
 	if brokerAuthoritative {
@@ -3499,10 +3557,26 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 			logger.Warn("invalid broker account for portfolio refresh", "err", err)
 			return
 		}
-		e.updateStockAccountPeak(acct.AccountID, acct.Equity)
+		peakEquity, peakObservedAt := e.updateStockAccountPeak(acct.AccountID, acct.Equity, acct.FetchedAt)
+		if store.IsConnected() {
+			baseline, baselineErr := store.ObserveAccountRiskBaselineWithPeak(ctx, acct.AccountID, acct.Equity, peakEquity, acct.LastEquity, acct.FetchedAt, peakObservedAt)
+			if baselineErr != nil {
+				logger.Warn("persist broker account risk baseline", "account_id", acct.AccountID, "err", baselineErr)
+			} else {
+				persistedPeak = baseline.PeakEquity
+				if baseline.LastEquity > 0 {
+					// Make dashboard and in-process risk telemetry use the same
+					// account-scoped daily baseline as final BUY admission.
+					dayPnL = acct.Equity - baseline.LastEquity
+					dailyBaselineKnown = true
+				}
+			}
+		}
 		cash = acct.Cash
 		totalEquity = acct.Equity
-		dayPnL = acct.Equity - acct.LastEquity
+		if !dailyBaselineKnown {
+			dayPnL = acct.Equity - acct.LastEquity
+		}
 	} else if acct, err := e.executor.GetAccount(ctx); err != nil {
 		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
 	} else {
@@ -3543,6 +3617,12 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	}
 
 	e.portfolio.Update(eps, cash, totalEquity, dayPnL, realizedToday)
+	if persistedPeak > 0 {
+		// Update normally only ratchets upward. The persisted baseline is the
+		// authoritative account-scoped peak and can intentionally be lower
+		// after an operator-confirmed deposit, withdrawal, or reset.
+		e.portfolio.SetPeakValue(persistedPeak)
+	}
 }
 
 func shouldLoadLocalRealizedPnL(storeConnected, brokerAuthoritative bool, dayPnL float64) bool {
@@ -4271,6 +4351,7 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 	var holdsLong bool
 	var longQuantity float64
 	var longCostBasis float64 // sum of qty * entry_price across open longs
+	var longNotional float64  // mark-to-market long exposure in the target ticker
 	var longMaxStop float64   // canonical (highest) existing stop across open longs
 	positions := make(map[string]struct{}, len(openTrades))
 	byTicker := make(map[string]int, len(openTrades))
@@ -4285,6 +4366,10 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 			holdsLong = true
 			longQuantity += t.Quantity
 			longCostBasis += t.Quantity * t.EntryPrice
+			// Use the signal's current mark rather than cost basis. A winner can
+			// grow past its original allocation before a pyramid attempt; only
+			// current notional enforces the promised combined exposure cap.
+			longNotional += t.Quantity * signalPrice
 			if t.StopLoss > longMaxStop {
 				longMaxStop = t.StopLoss
 			}
@@ -4295,25 +4380,26 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 		longAvgEntry = longCostBasis / longQuantity
 	}
 	return risk.CheckInput{
-		Cfg:               cfg,
-		Action:            action,
-		Ticker:            ticker,
-		Confidence:        confidence,
-		SizePct:           sizePct,
-		StopLoss:          stopLoss,
-		TakeProfit:        takeProfit,
-		SignalPrice:       signalPrice,
-		PortfolioValue:    pState.TotalValue,
-		Cash:              pState.Cash,
-		OpenPositions:     len(positions),
-		OpenByTicker:      byTicker,
-		DailyPnL:          pState.RealizedPnLDay,
-		PeakValue:         pState.PeakValue,
-		LastLossAt:        pState.LastLossAt,
-		HoldsLong:         holdsLong,
-		LongQuantity:      longQuantity,
-		LongAvgEntryPrice: longAvgEntry,
-		LongMaxStop:       longMaxStop,
+		Cfg:                    cfg,
+		Action:                 action,
+		Ticker:                 ticker,
+		Confidence:             confidence,
+		SizePct:                sizePct,
+		StopLoss:               stopLoss,
+		TakeProfit:             takeProfit,
+		SignalPrice:            signalPrice,
+		PortfolioValue:         pState.TotalValue,
+		Cash:                   pState.Cash,
+		OpenPositions:          len(positions),
+		OpenByTicker:           byTicker,
+		DailyPnL:               pState.RealizedPnLDay,
+		PeakValue:              pState.PeakValue,
+		LastLossAt:             pState.LastLossAt,
+		HoldsLong:              holdsLong,
+		LongQuantity:           longQuantity,
+		LongAvgEntryPrice:      longAvgEntry,
+		LongMaxStop:            longMaxStop,
+		ExistingTickerNotional: longNotional,
 	}
 }
 

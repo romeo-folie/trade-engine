@@ -53,6 +53,15 @@ func TestTrackerPeakValue(t *testing.T) {
 	}
 }
 
+func TestTrackerSetPeakValueAcceptsAuthoritativeReset(t *testing.T) {
+	tr := NewTracker(time.Hour)
+	tr.Update(nil, 2000, 10000, 0, 0)
+	tr.SetPeakValue(500)
+	if got := tr.CurrentState().PeakValue; got != 500 {
+		t.Fatalf("PeakValue after authoritative reset = %.2f, want 500", got)
+	}
+}
+
 func TestRecordLoss(t *testing.T) {
 	tr := NewTracker(time.Hour)
 	before := time.Now()

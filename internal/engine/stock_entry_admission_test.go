@@ -165,6 +165,26 @@ func TestSizeStockEntryRepresentativeBalances(t *testing.T) {
 	}
 }
 
+func TestMinimumWholeShareAllowedOnlyForValidSmallAccountRoundDown(t *testing.T) {
+	if !minimumWholeShareAllowed(0, false, 1, 15, 1_000, 20, 20) {
+		t.Fatal("valid $15 whole-share minimum did not pass $200 cap/capacity")
+	}
+	for _, tc := range []struct {
+		name                               string
+		qty, ask, equity, capacity, maxPct float64
+		fractionable                       bool
+	}{
+		{"already sized", 1, 15, 1_000, 20, 20, false},
+		{"fractionable", 0, 15, 1_000, 20, 20, true},
+		{"over position cap", 0, 201, 1_000, 300, 20, false},
+		{"over capacity", 0, 15, 1_000, 14, 20, false},
+	} {
+		if minimumWholeShareAllowed(tc.qty, tc.fractionable, 1, tc.ask, tc.equity, tc.capacity, tc.maxPct) {
+			t.Fatalf("%s: invalid one-share minimum passed", tc.name)
+		}
+	}
+}
+
 func TestFiveConcurrentStockEntryWorkersCannotReuseFunds(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("integration database unavailable")
@@ -410,6 +430,87 @@ func TestExistingBrokerHeldEntryDoesNotRequireUnheldBuyingPower(t *testing.T) {
 	}
 }
 
+func TestExistingEntryBrokerReplayUsesClientLookupAfterWorkingOrderFills(t *testing.T) {
+	broker := &concurrentAdmissionBroker{byClient: map[string]execution.OrderResult{
+		"te-stock-existing": {BrokerOrderID: "broker-existing", Status: "filled", FilledQty: 5},
+	}}
+	engine := &Engine{executor: broker}
+	now := time.Now().UTC()
+	replayed, err := engine.existingEntryBrokerReplay(context.Background(), "entry:existing", &execution.OrderRequest{
+		ClientOrderID: "te-stock-existing",
+	}, []store.ActiveStockEntryReservation{{
+		IdempotencyKey: "entry:existing", ClientOrderID: "te-stock-existing", SubmittedAt: &now,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("existingEntryBrokerReplay error: %v", err)
+	}
+	if !replayed {
+		t.Fatal("broker-filled durable entry was re-admitted as a fresh BUY")
+	}
+}
+
+func TestExistingEntryBrokerReplayFailsClosedWhenSubmittedEntryCannotBeFound(t *testing.T) {
+	broker := &concurrentAdmissionBroker{byClient: make(map[string]execution.OrderResult)}
+	engine := &Engine{executor: broker}
+	now := time.Now().UTC()
+	replayed, err := engine.existingEntryBrokerReplay(context.Background(), "entry:existing", &execution.OrderRequest{
+		ClientOrderID: "te-stock-existing",
+	}, []store.ActiveStockEntryReservation{{
+		IdempotencyKey: "entry:existing", ClientOrderID: "te-stock-existing", SubmittedAt: &now,
+	}}, nil)
+	if err != nil {
+		t.Fatalf("existingEntryBrokerReplay error: %v", err)
+	}
+	if !replayed {
+		t.Fatal("ambiguous submitted entry was re-admitted as a fresh BUY")
+	}
+}
+
+func TestPausedPreparedEntryKeepsReservationRecoverableAfterBrokerMiss(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("integration database unavailable")
+	}
+	ctx := context.Background()
+	signalID, err := store.InsertSignal(ctx, store.Signal{
+		Ticker: "PAUSEDPREP", Action: "BUY", Strategy: "test", SignalPrice: 100,
+		StopLoss: 90, TakeProfit: 120, Confidence: .9, SizePct: 1, Status: "blocked",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentKey := "entry:" + signalID
+	request := execution.OrderRequest{
+		Ticker: "PAUSEDPREP", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 1, IntentKey: intentKey, ClientOrderID: "paused-prepared-" + strings.ReplaceAll(signalID, "-", ""),
+	}
+	payload, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: request.ClientOrderID,
+		Ticker: request.Ticker, Side: "buy", OrderType: "market", RequestedQty: request.Quantity,
+		RequestPayload: payload, PayloadHash: "paused-prepared", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `UPDATE stock_order_intents SET purpose='superseded' WHERE id=$1::uuid`, intentID)
+	})
+
+	if active, err := store.HasPreparedStockEntry(ctx, signalID); err != nil || !active {
+		t.Fatalf("paused prepared reservation is not recoverable: active=%v err=%v", active, err)
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil || intent.Status != "pending" {
+		t.Fatalf("paused prepared intent = %#v err=%v, want pending", intent, err)
+	}
+}
+
 func TestAttachedPartialReservationDoesNotConsumeSecondTickerSlot(t *testing.T) {
 	reservations := []store.ActiveStockEntryReservation{
 		{IdempotencyKey: "entry:partial", TradeID: "trade-one", Ticker: "AAPL", RemainingQty: 5, ReferencePrice: 100},
@@ -418,6 +519,107 @@ func TestAttachedPartialReservationDoesNotConsumeSecondTickerSlot(t *testing.T) 
 	trades := reservationTrades(reservations, "")
 	if len(trades) != 1 || trades[0].Ticker != "MSFT" {
 		t.Fatalf("attached partial created a second occupancy row: %+v", trades)
+	}
+	if got := attachedReservationNotional(reservations, "", "aapl", 120); got != 600 {
+		t.Fatalf("attached partial exposure = %.2f, want 600", got)
+	}
+	if got := attachedReservationNotional(reservations, "entry:partial", "AAPL", 120); got != 0 {
+		t.Fatalf("replayed entry counted its own remainder: %.2f", got)
+	}
+	if got := brokerLongNotional([]execution.BrokerPosition{{Symbol: "AAPL", Side: "long", Quantity: 5}, {Symbol: "AAPL", Side: "short", Quantity: 3}}, "AAPL", 120); got != 600 {
+		t.Fatalf("broker long exposure = %.2f, want 600", got)
+	}
+	if got := pendingStockEntryNotional(reservations, nil, "", "AAPL", 120); got != 600 {
+		t.Fatalf("pending entry exposure = %.2f, want 600", got)
+	}
+}
+
+func TestMergedTickerExposureDoesNotDoubleCountPendingEntries(t *testing.T) {
+	// Local exposure already includes the 200 pending shares. A stale broker
+	// snapshot with 300 held shares may add those pending shares once, not twice.
+	if got := mergedTickerExposure(500, 300, 200); got != 500 {
+		t.Fatalf("complete local exposure = %.2f, want 500", got)
+	}
+	if got := mergedTickerExposure(400, 500, 200); got != 700 {
+		t.Fatalf("stale local fill merge = %.2f, want 700", got)
+	}
+}
+
+func TestBrokerLongPositionSuppliesPyramidOwnershipForUnadoptedLong(t *testing.T) {
+	quantity, averageEntry, found, valid := brokerLongPosition([]execution.BrokerPosition{{
+		Symbol: "AAPL", Side: "long", Quantity: 5, AvgEntryPrice: 100,
+	}}, "AAPL")
+	if !found || !valid || quantity != 5 || averageEntry != 100 {
+		t.Fatalf("broker long context = (%.2f, %.2f, %t, %t)", quantity, averageEntry, found, valid)
+	}
+	in := buildRiskInput(config.RiskConfig{PyramidEnabled: false}, "BUY", "AAPL", .9, 1, 95, 120, 110,
+		portfolio.State{TotalValue: 1_000}, nil)
+	in.HoldsLong = found
+	in.LongQuantity = quantity
+	in.LongAvgEntryPrice = averageEntry
+	in.OpenPositions = 1
+	in.OpenByTicker = map[string]int{"AAPL": 1}
+	if results, passed := risk.CheckAll(in); passed || !strings.Contains(risk.BlockReason(results), "pyramid_disabled") {
+		t.Fatalf("unadopted broker long bypassed pyramid policy: passed=%t results=%+v", passed, results)
+	}
+}
+
+func TestBrokerLongPositionFailsClosedWithoutAverageEntry(t *testing.T) {
+	_, _, found, valid := brokerLongPosition([]execution.BrokerPosition{{
+		Symbol: "AAPL", Side: "long", Quantity: 5,
+	}}, "AAPL")
+	if !found || valid {
+		t.Fatalf("missing broker cost basis = found %t, valid %t; want true, false", found, valid)
+	}
+}
+
+func TestMergeBrokerLongOccupancyIncludesUnadoptedSymbols(t *testing.T) {
+	in := buildRiskInput(config.RiskConfig{}, "BUY", "NVDA", .9, 1, 95, 120, 110,
+		portfolio.State{TotalValue: 1_000}, []store.Trade{{Ticker: "MSFT", Direction: "long", Quantity: 1, EntryPrice: 100}})
+	if err := mergeBrokerLongOccupancy(&in, []execution.BrokerPosition{
+		{Symbol: "MSFT", Side: "long", Quantity: 1, AvgEntryPrice: 100},
+		{Symbol: "AAPL", Side: "long", Quantity: 1, AvgEntryPrice: 200},
+		{Symbol: "NVDA", Side: "long", Quantity: 2, AvgEntryPrice: 100},
+	}, "NVDA", []store.Trade{{Ticker: "MSFT", Direction: "long", Quantity: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if in.OpenPositions != 3 || in.OpenByTicker["MSFT"] != 1 || in.OpenByTicker["AAPL"] != 1 || in.OpenByTicker["NVDA"] != 1 {
+		t.Fatalf("broker occupancy = positions:%d by_ticker:%+v", in.OpenPositions, in.OpenByTicker)
+	}
+	if !in.HoldsLong || in.LongQuantity != 2 || in.LongAvgEntryPrice != 100 {
+		t.Fatalf("target broker pyramid context = %+v", in)
+	}
+	if err := mergeBrokerLongOccupancy(&in, []execution.BrokerPosition{{Symbol: "TSLA", Side: "short", Quantity: -1}}, "NVDA", nil); err != nil {
+		t.Fatal(err)
+	}
+	if in.OpenPositions != 4 {
+		t.Fatalf("broker short did not consume overall capacity: %+v", in)
+	}
+	local := risk.CheckInput{HoldsLong: true, LongQuantity: 3, LongAvgEntryPrice: 125}
+	if err := mergeBrokerLongOccupancy(&local, []execution.BrokerPosition{{Symbol: "NVDA", Side: "long", Quantity: 2, AvgEntryPrice: 100}}, "NVDA", nil); err != nil {
+		t.Fatal(err)
+	}
+	if local.LongQuantity != 3 || local.LongAvgEntryPrice != 125 {
+		t.Fatalf("stale broker snapshot overwrote fresher local pyramid basis: %+v", local)
+	}
+	for _, position := range []execution.BrokerPosition{
+		{Symbol: "BADQ", Side: "long", Quantity: math.NaN()},
+		{Symbol: "BADS", Side: "unknown", Quantity: 1},
+	} {
+		if err := mergeBrokerLongOccupancy(&risk.CheckInput{}, []execution.BrokerPosition{position}, "NVDA", nil); err == nil {
+			t.Fatalf("malformed broker position passed admission: %+v", position)
+		}
+	}
+
+	pending := risk.CheckInput{OpenPositions: 1, OpenByTicker: map[string]int{"AAPL": 1}}
+	if err := mergeBrokerLongOccupancy(&pending, []execution.BrokerPosition{{Symbol: "AAPL", Side: "long", Quantity: 1, AvgEntryPrice: 100}}, "NVDA", nil); err != nil {
+		t.Fatal(err)
+	}
+	if pending.OpenPositions != 2 || pending.OpenByTicker["AAPL"] != 2 {
+		t.Fatalf("broker long was collapsed into pending BUY: %+v", pending)
+	}
+	if err := mergeBrokerLongOccupancy(&risk.CheckInput{}, []execution.BrokerPosition{{Symbol: "NVDA", Side: "short", Quantity: -1}}, "NVDA", nil); err == nil {
+		t.Fatal("target broker short did not block BUY admission")
 	}
 }
 
@@ -564,6 +766,7 @@ func TestStockAccountPeakPreservesSameAccountTrackerHighAndRejectsCrossAccountPe
 func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *testing.T) {
 	now := time.Now().UTC()
 	valid := validAdmissionAccount(now)
+	valid.AccountID = fmt.Sprintf("refresh-test-%d", time.Now().UnixNano())
 	valid.Equity = 1_250
 	valid.LastEquity = 1_200
 	exec := &portfolioAlpacaExecutor{account: valid}
@@ -589,6 +792,7 @@ func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *tes
 func TestRefreshPortfolioMaintainsAccountScopedBrokerPeak(t *testing.T) {
 	now := time.Now().UTC()
 	account := validAdmissionAccount(now)
+	account.AccountID = fmt.Sprintf("refresh-peak-test-%d", time.Now().UnixNano())
 	account.Equity, account.LastEquity = 10_000, 10_000
 	exec := &portfolioAlpacaExecutor{account: account}
 	engine := &Engine{cfg: &config.Config{}, executor: exec, portfolio: portfolio.NewTracker(time.Hour)}
@@ -596,7 +800,7 @@ func TestRefreshPortfolioMaintainsAccountScopedBrokerPeak(t *testing.T) {
 	exec.account.Equity, exec.account.LastEquity = 8_000, 8_000
 	exec.account.FetchedAt = time.Now().UTC()
 	engine.refreshPortfolio(context.Background())
-	if peak := engine.stockPeak("account-id"); peak != 10_000 {
+	if peak := engine.stockPeak(account.AccountID); peak != 10_000 {
 		t.Fatalf("same-account refresh peak = %.2f, want 10000", peak)
 	}
 	exec.account.AccountID, exec.account.AccountNumber = "new-id", "PA999"

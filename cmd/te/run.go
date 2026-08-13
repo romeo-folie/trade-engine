@@ -1300,6 +1300,14 @@ var statusCmd = &cobra.Command{
 				} else {
 					fmt.Printf("Mode:      %s (config)\n", cfg.Engine.Mode)
 				}
+				if control, controlErr := store.GetBuyControl(ctx, store.BuyControlStocks); controlErr != nil {
+					fmt.Printf("New buys:  ✗ status unavailable (%v)\n", controlErr)
+				} else if control.Enabled {
+					fmt.Println("New buys:  enabled")
+				} else {
+					fmt.Printf("New buys:  paused (by %s at %s)\n", control.UpdatedBy,
+						control.UpdatedAt.UTC().Format(time.RFC3339))
+				}
 			}
 		}
 		return nil

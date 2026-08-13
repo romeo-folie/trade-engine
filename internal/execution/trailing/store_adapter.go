@@ -104,6 +104,13 @@ func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	return store.GetOpenTrades(ctx)
 }
 
+func (liveStore) GetTradeByID(ctx context.Context, id string) (*store.Trade, error) {
+	if !store.IsConnected() {
+		return nil, errStoreNotConnected
+	}
+	return store.GetTradeByID(ctx, id)
+}
+
 func (liveStore) UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error {
 	if !store.IsConnected() {
 		return errStoreNotConnected

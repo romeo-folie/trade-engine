@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -33,6 +32,7 @@ markets.stocks.paper or credentials, before starting a paper or live engine.`,
 
 type stockPreflightResult struct {
 	Environment              string    `json:"environment"`
+	AccountID                string    `json:"account_id"`
 	AccountNumber            string    `json:"account_number"`
 	Status                   string    `json:"status"`
 	Cash                     float64   `json:"cash"`
@@ -105,17 +105,8 @@ func preflightStockAccount(ctx context.Context, stocks config.StocksConfig, brok
 	if err != nil {
 		return stockPreflightResult{}, fmt.Errorf("read Alpaca account: %w", err)
 	}
-	if strings.TrimSpace(account.AccountNumber) == "" {
-		return stockPreflightResult{}, fmt.Errorf("Alpaca account response did not include an account number")
-	}
-	if expected := strings.TrimSpace(stocks.ExpectedAccountNumber); expected != "" && account.AccountNumber != expected {
-		return stockPreflightResult{}, fmt.Errorf("Alpaca account mismatch: configured expected account number does not match the connected account")
-	}
-	if !strings.EqualFold(strings.TrimSpace(account.Status), "ACTIVE") {
-		return stockPreflightResult{}, fmt.Errorf("Alpaca account is not active (status %q)", account.Status)
-	}
-	if account.TradingBlocked || account.AccountBlocked || account.TradeSuspendedByUser {
-		return stockPreflightResult{}, fmt.Errorf("Alpaca account cannot trade (trading_blocked=%t account_blocked=%t trade_suspended_by_user=%t)", account.TradingBlocked, account.AccountBlocked, account.TradeSuspendedByUser)
+	if err := execution.ValidateBrokerAccount(account, stocks.ExpectedAccountNumber, time.Now().UTC()); err != nil {
+		return stockPreflightResult{}, fmt.Errorf("validate Alpaca account: %w", err)
 	}
 
 	environment := "live"
@@ -124,6 +115,7 @@ func preflightStockAccount(ctx context.Context, stocks config.StocksConfig, brok
 	}
 	return stockPreflightResult{
 		Environment:              environment,
+		AccountID:                account.AccountID,
 		AccountNumber:            account.AccountNumber,
 		Status:                   account.Status,
 		Cash:                     account.Cash,
@@ -146,6 +138,7 @@ func printStockPreflight(result stockPreflightResult) {
 	fmt.Printf("Alpaca stock preflight: OK\n")
 	fmt.Printf("  Environment: %s\n", result.Environment)
 	fmt.Printf("  Account:     %s (%s)\n", result.AccountNumber, result.Status)
+	fmt.Printf("  Account ID:  %s\n", result.AccountID)
 	fmt.Printf("  Cash:        %.2f\n", result.Cash)
 	fmt.Printf("  Equity:      %.2f\n", result.Equity)
 	fmt.Printf("  Buying power: %.2f (Reg-T %.2f, day-trading %.2f, non-marginable %.2f)\n",

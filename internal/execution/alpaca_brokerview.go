@@ -18,6 +18,10 @@ import (
 
 // AccountSnapshot fetches the canonical account state from /v2/account.
 func (b *AlpacaBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, error) {
+	// This timestamp represents when the observation began, not when a slow
+	// response happened to arrive. Risk-baseline ordering must be able to reject
+	// a pre-reset account response that completes after an operator reset.
+	observedAt := time.Now().UTC()
 	var resp struct {
 		ID                       string `json:"id"`
 		AccountNumber            string `json:"account_number"`
@@ -102,7 +106,7 @@ func (b *AlpacaBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, erro
 		AccountBlocked:                    *resp.AccountBlocked,
 		TradeSuspendedByUser:              *resp.TradeSuspendedByUser,
 		ShortingEnabled:                   resp.ShortingEnabled,
-		FetchedAt:                         time.Now().UTC(),
+		FetchedAt:                         observedAt,
 	}, nil
 }
 

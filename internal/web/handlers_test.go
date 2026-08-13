@@ -2,6 +2,7 @@ package web
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -431,8 +433,13 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	}
 
 	var resp struct {
-		Version  string  `json:"version"`
-		Drawdown float64 `json:"drawdown"`
+		Version             string  `json:"version"`
+		Drawdown            float64 `json:"drawdown"`
+		BuyEntriesEnabled   bool    `json:"buy_entries_enabled"`
+		BuyControlAvailable bool    `json:"buy_control_available"`
+		Readiness           struct {
+			Reasons []string `json:"reasons"`
+		} `json:"readiness"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal failed: %v", err)
@@ -444,6 +451,118 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	// drawdown should be 0.0 when not connected
 	if resp.Drawdown != 0.0 {
 		t.Errorf("expected drawdown 0.0, got %f", resp.Drawdown)
+	}
+	if resp.BuyEntriesEnabled || resp.BuyControlAvailable {
+		t.Error("new buys and their control must be unavailable without a database")
+	}
+	for _, reason := range resp.Readiness.Reasons {
+		if reason == "new stock buys are paused" {
+			t.Fatal("unavailable buy control was reported as an operator pause")
+		}
+	}
+	if maskAccountNumber("PA123456") != "••••3456" || maskAccountNumber("123") != "123" {
+		t.Error("account masking must retain only the last four characters")
+	}
+}
+
+func TestHandleSystemStatus_RejectsAccountThatEntryAdmissionWouldReject(t *testing.T) {
+	account := execution.BrokerAccount{
+		AccountID: "account-id", AccountNumber: "account-number", Status: "ACTIVE", Currency: "USD",
+		Equity: 1_000, LastEquity: 1_000, Cash: 1_000, BuyingPower: 1_000, Multiplier: 1,
+		CashAvailable: true, BuyingPowerAvailable: true, MultiplierAvailable: true, LastEquityAvailable: true,
+		FetchedAt: time.Now().UTC().Add(-time.Minute),
+	}
+	srv := NewServer(Config{}, nil, nil)
+	srv.SetBrokerView(stubCache(&stubBrokerView{account: account}))
+
+	w := httptest.NewRecorder()
+	srv.handleSystemStatus(w, httptest.NewRequest(http.MethodGet, "/api/system/status", nil))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	var response struct {
+		Readiness struct {
+			BrokerAccount struct {
+				Available bool `json:"available"`
+			} `json:"broker_account"`
+			Reasons []string `json:"reasons"`
+		} `json:"readiness"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Readiness.BrokerAccount.Available {
+		t.Fatal("readiness reported a mismatched broker account as available")
+	}
+	if !strings.Contains(strings.Join(response.Readiness.Reasons, " "), "snapshot is stale") {
+		t.Fatalf("readiness reasons = %v, want stale-account failure", response.Readiness.Reasons)
+	}
+}
+
+func TestParseBuyControlRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantEnable bool
+		wantSource string
+		wantErr    bool
+	}{
+		{name: "explicit false", body: `{"enabled":false}`, wantEnable: false, wantSource: "web"},
+		{name: "explicit true with source", body: `{"enabled":true,"source":"operator"}`, wantEnable: true, wantSource: "operator"},
+		{name: "missing enabled", body: `{"source":"operator"}`, wantErr: true},
+		{name: "unknown field", body: `{"enabled":true,"enabeld":false}`, wantErr: true},
+		{name: "multiple values", body: `{"enabled":true} {"enabled":false}`, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gotEnabled, gotSource, err := parseBuyControlRequest(strings.NewReader(tc.body))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("parseBuyControlRequest error = nil")
+				}
+				return
+			}
+			if err != nil || gotEnabled != tc.wantEnable || gotSource != tc.wantSource {
+				t.Fatalf("parseBuyControlRequest = (%t, %q, %v), want (%t, %q, nil)", gotEnabled, gotSource, err, tc.wantEnable, tc.wantSource)
+			}
+		})
+	}
+}
+
+func TestAPIBadRequest(t *testing.T) {
+	w := httptest.NewRecorder()
+	apiBadRequest(w, "invalid buy control payload", errors.New("missing enabled"))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusBadRequest)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("invalid JSON response: %v", err)
+	}
+	if body["error"] != "invalid buy control payload" {
+		t.Fatalf("error = %q", body["error"])
+	}
+}
+
+func TestBuyControlOriginProtection(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "http://localhost:8080/api/system/buys", strings.NewReader(`{"enabled":true}`))
+	r.RemoteAddr = "127.0.0.1:12345"
+	r.Header.Set("Origin", "https://attacker.example")
+	if isSameOriginOrNonBrowser(r) {
+		t.Fatal("cross-origin browser POST was accepted")
+	}
+	r.Header.Set("Origin", "http://localhost:8080")
+	if !isSameOriginOrNonBrowser(r) {
+		t.Fatal("same-origin browser POST was rejected")
+	}
+	r.Host = "attacker.example"
+	r.Header.Set("Origin", "http://attacker.example")
+	if isSameOriginOrNonBrowser(r) {
+		t.Fatal("DNS-rebound browser POST was accepted")
+	}
+	r.Host = "localhost:8080"
+	r.Header.Del("Origin")
+	if !isSameOriginOrNonBrowser(r) {
+		t.Fatal("non-browser local POST was rejected")
 	}
 }
 

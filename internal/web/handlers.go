@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/romeo-folie/trade-engine/internal/analysis/cache"
 	"github.com/romeo-folie/trade-engine/internal/config"
+	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
@@ -52,6 +56,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/portfolio/positions", s.handlePortfolioPositions)
 	mux.HandleFunc("/api/system/cache", s.handleSystemCache)
 	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
+	mux.HandleFunc("/api/system/buys", s.handleSystemBuys)
 	mux.HandleFunc("/api/system/config", s.handleSystemConfig)
 	mux.HandleFunc("/api/system/restart", s.handleSystemRestart)
 	mux.HandleFunc("/api/orb/sessions", s.handleORBSessions)
@@ -1296,6 +1301,20 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 
 	var peak float64
 	var drawdown float64
+	// New stock entries require a durable buy control. Until it is read
+	// successfully, represent the same fail-closed state used by admission.
+	buyEntriesEnabled := false
+	buyControlAvailable := false
+	buyControlSource := "unavailable"
+	buyControlUpdatedAt := ""
+	readinessReasons := make([]string, 0)
+	environment := "live"
+	if cfg.Markets.Stocks.Paper {
+		environment = "paper"
+	}
+	readiness := map[string]any{
+		"workflow": cfg.Engine.Mode, "environment": environment,
+	}
 	if store.IsConnected() {
 		_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
 
@@ -1303,7 +1322,76 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		if peak > 0 && snap != nil && snap.TotalValue < peak {
 			drawdown = (peak - snap.TotalValue) / peak
 		}
+		if control, err := store.GetBuyControl(ctx, store.BuyControlStocks); err == nil {
+			buyEntriesEnabled = control.Enabled
+			buyControlAvailable = true
+			buyControlSource = "default"
+			if control.UpdatedBy != "" {
+				buyControlSource = control.UpdatedBy
+			}
+			if !control.UpdatedAt.IsZero() {
+				buyControlUpdatedAt = control.UpdatedAt.UTC().Format(time.RFC3339)
+			}
+		} else {
+			// Execution fails closed on this same error. Do not let readiness
+			// claim that entries are enabled when the release gate rejects them.
+			buyEntriesEnabled = false
+			buyControlAvailable = false
+			buyControlSource = "unavailable"
+			readinessReasons = append(readinessReasons, "buy control unavailable: "+err.Error())
+		}
+		if raw, ok, err := store.GetEngineState(ctx, store.EngineStateBrokerDrift); err == nil && ok && raw != "" {
+			var reconciliation map[string]any
+			if json.Unmarshal([]byte(raw), &reconciliation) == nil {
+				readiness["reconciliation"] = reconciliation
+			}
+		}
+	} else {
+		readinessReasons = append(readinessReasons, "buy control unavailable: database not connected")
 	}
+	readiness["buy_entries_enabled"] = buyEntriesEnabled
+	readiness["buy_control_available"] = buyControlAvailable
+	if buyControlAvailable && !buyEntriesEnabled {
+		readinessReasons = append(readinessReasons, "new stock buys are paused")
+	}
+	if s.brokerView == nil {
+		readiness["broker_account"] = map[string]any{"available": false}
+		readinessReasons = append(readinessReasons, "broker account snapshot unavailable")
+	} else if account, err := s.brokerView.AccountSnapshot(ctx); err != nil {
+		readiness["broker_account"] = map[string]any{"available": false}
+		readinessReasons = append(readinessReasons, "broker account snapshot failed")
+	} else {
+		accountErr := execution.ValidateBrokerAccount(account, cfg.Markets.Stocks.ExpectedAccountNumber, time.Now().UTC())
+		readiness["broker_account"] = map[string]any{
+			"available": accountErr == nil, "account_number": maskAccountNumber(account.AccountNumber),
+			"fetched_at":             account.FetchedAt.UTC().Format(time.RFC3339),
+			"buying_power_available": account.BuyingPowerAvailable,
+			"buying_power":           account.BuyingPower,
+			"trading_blocked":        account.TradingBlocked || account.AccountBlocked || account.TradeSuspendedByUser,
+		}
+		if accountErr != nil {
+			readinessReasons = append(readinessReasons, "broker account is not ready: "+accountErr.Error())
+		} else {
+			// A broker account is authoritative for live readiness. Never retain
+			// the earlier global portfolio-snapshot drawdown while its account
+			// baseline is still being initialized after a migration or account
+			// switch.
+			drawdown = 0
+		}
+		if accountErr == nil && store.IsConnected() {
+			if baseline, baselineErr := store.GetAccountRiskBaseline(ctx, account.AccountID); baselineErr != nil {
+				readinessReasons = append(readinessReasons, "account risk baseline unavailable: "+baselineErr.Error())
+			} else if baseline != nil && baseline.PeakEquity > 0 {
+				// This mirrors final stock-entry admission, including a manual
+				// capital reset or account switch, rather than mixing in older
+				// snapshots from another account.
+				drawdown = math.Max(0, (baseline.PeakEquity-account.Equity)/baseline.PeakEquity)
+			} else {
+				readinessReasons = append(readinessReasons, "account risk baseline is initializing")
+			}
+		}
+	}
+	readiness["reasons"] = readinessReasons
 
 	// Next engine run-cycle time, published by the engine loop to engine_state.
 	// Empty when the engine has not scheduled yet (e.g. DB down or no run loop).
@@ -1319,15 +1407,106 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, map[string]any{
-		"version":           "2.1.0",
-		"mode":              strings.ToUpper(cfg.Engine.Mode),
-		"tick_interval_sec": cfg.Engine.TickIntervalSec,
-		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
-		"uptime_seconds":    uptimeSec,
-		"drawdown":          drawdown,
-		"next_cycle_at":     nextCycleAt,
-		"next_cycle_in_sec": nextCycleInSec,
+		"version":                "2.1.0",
+		"mode":                   strings.ToUpper(cfg.Engine.Mode),
+		"tick_interval_sec":      cfg.Engine.TickIntervalSec,
+		"tick_interval_min":      float64(cfg.Engine.TickIntervalSec) / 60.0,
+		"uptime_seconds":         uptimeSec,
+		"drawdown":               drawdown,
+		"next_cycle_at":          nextCycleAt,
+		"next_cycle_in_sec":      nextCycleInSec,
+		"buy_entries_enabled":    buyEntriesEnabled,
+		"buy_control_available":  buyControlAvailable,
+		"buy_control_source":     buyControlSource,
+		"buy_control_updated_at": buyControlUpdatedAt,
+		"readiness":              readiness,
 	})
+}
+
+func maskAccountNumber(accountNumber string) string {
+	accountNumber = strings.TrimSpace(accountNumber)
+	if len(accountNumber) <= 4 {
+		return accountNumber
+	}
+	return "••••" + accountNumber[len(accountNumber)-4:]
+}
+
+// GET /api/system/buys reports the persisted control. POST changes it only for
+// a loopback operator; the engine observes the resulting state immediately
+// before each BUY, without a restart. Exits are deliberately outside this API.
+func (s *Server) handleSystemBuys(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	switch r.Method {
+	case http.MethodGet:
+		control, err := store.GetBuyControl(ctx, store.BuyControlStocks)
+		if err != nil {
+			apiError(w, "read buy control", err)
+			return
+		}
+		jsonResponse(w, map[string]any{
+			"enabled": control.Enabled, "updated_by": control.UpdatedBy, "updated_at": control.UpdatedAt,
+		})
+	case http.MethodPost:
+		if !isLoopback(r) {
+			http.Error(w, "forbidden: buy control requires local connection", http.StatusForbidden)
+			return
+		}
+		if !isSameOriginOrNonBrowser(r) {
+			http.Error(w, "forbidden: buy control requires same-origin request", http.StatusForbidden)
+			return
+		}
+		enabled, source, err := parseBuyControlRequest(r.Body)
+		if err != nil {
+			apiBadRequest(w, "invalid buy control payload", err)
+			return
+		}
+		if err := store.SetBuyControl(ctx, store.BuyControlStocks, enabled, source); err != nil {
+			apiError(w, "set buy control", err)
+			return
+		}
+		control, err := store.GetBuyControl(ctx, store.BuyControlStocks)
+		if err != nil {
+			apiError(w, "read updated buy control", err)
+			return
+		}
+		jsonResponse(w, map[string]any{
+			"enabled": control.Enabled, "updated_by": control.UpdatedBy, "updated_at": control.UpdatedAt,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
+}
+
+// parseBuyControlRequest distinguishes an explicit false from a missing value;
+// silently treating a malformed request as false could unexpectedly pause buys.
+func parseBuyControlRequest(body io.Reader) (bool, string, error) {
+	var request struct {
+		Enabled *bool  `json:"enabled"`
+		Source  string `json:"source"`
+	}
+	decoder := json.NewDecoder(body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&request); err != nil {
+		return false, "", err
+	}
+	if request.Enabled == nil {
+		return false, "", fmt.Errorf("enabled is required")
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		if err == nil {
+			return false, "", fmt.Errorf("buy control payload must contain one JSON value")
+		}
+		return false, "", err
+	}
+	if source := strings.TrimSpace(request.Source); source != "" {
+		return *request.Enabled, source, nil
+	}
+	return *request.Enabled, "web", nil
 }
 
 // POST /api/system/restart — restricted to loopback callers.
@@ -1805,13 +1984,21 @@ func jsonResponse(w http.ResponseWriter, v any) {
 }
 
 func apiError(w http.ResponseWriter, msg string, err error) {
+	apiErrorStatus(w, msg, err, http.StatusInternalServerError)
+}
+
+func apiBadRequest(w http.ResponseWriter, msg string, err error) {
+	apiErrorStatus(w, msg, err, http.StatusBadRequest)
+}
+
+func apiErrorStatus(w http.ResponseWriter, msg string, err error, status int) {
 	errStr := ""
 	if err != nil {
 		errStr = err.Error()
 	}
 	logger.Warn("web: api error", "msg", msg, "err", errStr)
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusInternalServerError)
+	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
@@ -1859,6 +2046,46 @@ func isLoopback(r *http.Request) bool {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// isSameOriginOrNonBrowser rejects browser requests from another site. The
+// destination Host must itself be loopback before it is compared with Origin:
+// otherwise a DNS-rebound hostname could satisfy both the TCP-peer and
+// same-origin checks. Command-line operators do not normally send Origin, so
+// preserve that local workflow once the destination is established as local.
+func isSameOriginOrNonBrowser(r *http.Request) bool {
+	if !isLoopbackHost(r.Host) {
+		return false
+	}
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+		return false
+	}
+	if r.TLS != nil {
+		return u.Scheme == "https"
+	}
+	return u.Scheme == "http"
+}
+
+// isLoopbackHost accepts only literal loopback hosts and localhost. It does
+// not resolve arbitrary DNS names, which prevents DNS rebinding from turning a
+// browser request to an attacker-controlled hostname into a local control API
+// request.
+func isLoopbackHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = hostport
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()

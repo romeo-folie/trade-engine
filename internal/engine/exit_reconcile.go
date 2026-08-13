@@ -72,6 +72,13 @@ type exitReconcileStore interface {
 	MarkOrderStatus(ctx context.Context, brokerOrderID, status string) error
 }
 
+// tradeOrderLockingExitStore is implemented by the production adapter. Tests
+// and alternate stores can remain lightweight while production holds the same
+// lifecycle lock used by trailing and protective-stop mutations.
+type tradeOrderLockingExitStore interface {
+	WithTradeOrderLock(ctx context.Context, tradeID string, fn func() error) error
+}
+
 // exitStoreAdapter adapts the package-level store funcs to exitReconcileStore.
 type exitStoreAdapter struct{}
 
@@ -100,7 +107,16 @@ func (exitStoreAdapter) UpdateTradeExitFilledAt(ctx context.Context, id string, 
 	return store.UpdateTradeExitFilledAt(ctx, id, filledAt)
 }
 func (exitStoreAdapter) FinalizeTradeExit(ctx context.Context, id string, _, _, _ float64) (store.TradeRealization, error) {
-	return store.FinalizeTradeExit(ctx, id)
+	var realized store.TradeRealization
+	err := store.WithTradeOrderLock(id, func() error {
+		var finalizeErr error
+		realized, finalizeErr = store.FinalizeTradeExit(ctx, id)
+		return finalizeErr
+	})
+	return realized, err
+}
+func (exitStoreAdapter) WithTradeOrderLock(_ context.Context, id string, fn func() error) error {
+	return store.WithTradeOrderLock(id, fn)
 }
 func (exitStoreAdapter) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
 	return store.UpdateExitingTradeQuantity(ctx, id, quantity)
@@ -234,31 +250,47 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		return s
 	}
 	applyExitingFill := func(p store.PendingExitOrder, fillPrice, cumulativeQty float64, status string, filledAt time.Time) (float64, float64, error) {
-		if p.IsStopLoss || p.IsTakeProfit {
-			reason := p.OrderExitReason
-			evidence := p.OrderExitEvidence
-			if reason == "" && p.ExitReason != "" {
-				// Software stop/TP orders predate order-level provenance. Their
-				// current trade claim is authoritative and carries trigger evidence.
-				reason = p.ExitReason
-				evidence = p.ExitEvidence
-			}
-			if reason == "" {
-				reason = store.ExitReasonStopLoss
-				if p.IsTakeProfit {
-					reason = store.ExitReasonTakeProfit
+		var remaining, applied float64
+		apply := func() error {
+			var err error
+			if p.IsStopLoss || p.IsTakeProfit {
+				reason := p.OrderExitReason
+				evidence := p.OrderExitEvidence
+				if reason == "" && p.ExitReason != "" {
+					// Software stop/TP orders predate order-level provenance. Their
+					// current trade claim is authoritative and carries trigger evidence.
+					reason = p.ExitReason
+					evidence = p.ExitEvidence
 				}
+				if reason == "" {
+					reason = store.ExitReasonStopLoss
+					if p.IsTakeProfit {
+						reason = store.ExitReasonTakeProfit
+					}
+				}
+				remaining, applied, err = db.ApplyProtectiveExitAtForBrokerOrder(
+					ctx, p.TradeID, p.OrderID, p.BrokerOrderID,
+					fillPrice, cumulativeQty, status, filledAt,
+					store.ExitIntent{Reason: reason, Evidence: evidence},
+				)
+				return err
 			}
-			return db.ApplyProtectiveExitAtForBrokerOrder(
+			remaining, applied, err = db.ApplyPartialExitAtForBrokerOrder(
 				ctx, p.TradeID, p.OrderID, p.BrokerOrderID,
 				fillPrice, cumulativeQty, status, filledAt,
-				store.ExitIntent{Reason: reason, Evidence: evidence},
 			)
+			return err
 		}
-		return db.ApplyPartialExitAtForBrokerOrder(
-			ctx, p.TradeID, p.OrderID, p.BrokerOrderID,
-			fillPrice, cumulativeQty, status, filledAt,
-		)
+		if locker, ok := db.(tradeOrderLockingExitStore); ok {
+			if err := locker.WithTradeOrderLock(ctx, p.TradeID, apply); err != nil {
+				return 0, 0, err
+			}
+			return remaining, applied, nil
+		}
+		if err := apply(); err != nil {
+			return 0, 0, err
+		}
+		return remaining, applied, nil
 	}
 	for _, p := range pending {
 		stats.Scanned++

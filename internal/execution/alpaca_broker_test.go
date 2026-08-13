@@ -57,6 +57,9 @@ func TestAlpacaPlaceOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
 			t.Fatal(err)
 		}
 		clientID, _ = body["client_order_id"].(string)
+		if _, present := body["position_intent"]; present {
+			t.Error("stock order unexpectedly contained option-only position_intent")
+		}
 		w.Header().Set("X-Request-ID", "req-123")
 		fmt.Fprintln(w, `{"id":"broker-1","status":"accepted","filled_avg_price":"","filled_qty":""}`)
 	}))
