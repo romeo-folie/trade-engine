@@ -404,6 +404,44 @@ func TestReconcileBracket_PolicyReadFailureRetainsBrokerOwnershipAfterAdmissionD
 	}
 }
 
+func TestReconcileBracket_MissingProjectionVerifiesHealthyStrictParent(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_HEALTHY_PARENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := stockEntryBrokerProtection
+	stockEntryBrokerProtection = func(context.Context, string) (bool, string, error) {
+		return true, "healthy-missing-projection-parent", nil
+	}
+	t.Cleanup(func() { stockEntryBrokerProtection = original })
+	checked := make(chan struct{}, 1)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"healthy-missing-projection-parent": {
+			Status: "filled", Quantity: 2, FilledQty: 2,
+			ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+		},
+	}, onStatus: func(string) { checked <- struct{}{} }}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("strict trade with missing local legs must retain broker ownership")
+	}
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("missing projection did not verify the broker parent")
+	}
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("healthy broker bracket was contained: cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
 func TestCancelLegacyBrokerHeldEntry_GTCDoneForDayRemainsWorking(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

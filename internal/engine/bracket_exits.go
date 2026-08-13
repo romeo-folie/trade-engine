@@ -155,8 +155,9 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		} else if policyErr == nil && required && parentID != "" {
 			// A strict protected entry must never be handed to software exits
 			// merely because child projection failed or the broker legs vanished.
-			e.containUnprotectedBrokerEntryAsync(t.ID, parentID, t.Ticker,
-				"no broker-resident protection legs are available")
+			// A fresh parent snapshot can still prove the broker stop is healthy
+			// when a transient local child write is the only missing projection.
+			e.verifyOrContainBrokerEntryAsync(t.ID, parentID, t.Ticker, t.Quantity)
 			return true, nil
 		}
 		return false, nil
@@ -264,10 +265,10 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		}
 		if !workingBrokerStopCoversTrade(states, brokerSnapshotRemainingTradeQty(t.Quantity, states)) {
 			// A live TP is not downside protection. Retain broker ownership and
-			// safely contain the position rather than handing it to the candle
-			// monitor when its stop is held, missing, rejected, or too small.
-			e.containUnprotectedBrokerEntryAsync(t.ID, parentID, t.Ticker,
-				"broker stop is missing, inactive, or does not cover the held quantity")
+			// verify the parent snapshot before containing the position. The
+			// projected legs can be stale or incomplete even while its broker
+			// stop covers the full current holding.
+			e.verifyOrContainBrokerEntryAsync(t.ID, parentID, t.Ticker, t.Quantity)
 			return true, pollErr
 		}
 	}

@@ -205,6 +205,8 @@ type OrderLeg struct {
 	Quantity      float64
 	RemainingQty  float64
 	FilledQty     float64
+	FilledPrice   float64
+	FilledAt      time.Time
 	LimitPrice    float64
 	StopPrice     float64
 }

@@ -818,6 +818,7 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 			{"stop-loss", res.ChildOrderIDs[1], string(execution.OrderTypeStop), req.StopLossPrice, true, false},
 		}
 		for _, leg := range legs {
+			child := recoveredBracketChild(res.ChildOrders, leg.brokerID)
 			childID, err := store.UpsertBracketChildIntent(ctx, parent.ID, tradeID, req.Ticker, leg.role, leg.brokerID, leg.orderType, req.Quantity, leg.price)
 			if err != nil {
 				return fmt.Errorf("project recovered bracket child intent: %w", err)
@@ -831,6 +832,19 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 					Side: string(execution.OrderSideSell), OrderType: leg.orderType, Quantity: req.Quantity,
 					Status: "pending", IsStopLoss: leg.stop, IsTakeProfit: leg.take,
 					ParentOrderID: res.BrokerOrderID, StockIntentID: childID}
+				if child != nil && child.FilledQty > 0 {
+					// Persist this nested snapshot before the parent becomes terminal
+					// and ceases to be recoverable. A later direct child lookup may
+					// already be purged; bracket reconciliation will atomically apply
+					// this durable cumulative fill to the trade.
+					order.FilledPrice = child.FilledPrice
+					order.FilledQty = child.FilledQty
+					order.Status = execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc")
+					if !child.FilledAt.IsZero() {
+						filledAt := child.FilledAt
+						order.FilledAt = &filledAt
+					}
+				}
 				if leg.stop {
 					order.StopPrice = leg.price
 				} else {
@@ -845,6 +859,15 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 	if req.UncappedTakeProfit && res.FilledQty > 0 {
 		if err := c.ensureRecoveredProtectiveStop(ctx, parent, req, res, tradeID); err != nil {
 			return fmt.Errorf("recover uncapped entry protective stop: %w", err)
+		}
+	}
+	return nil
+}
+
+func recoveredBracketChild(children []execution.OrderLeg, brokerOrderID string) *execution.OrderLeg {
+	for i := range children {
+		if children[i].BrokerOrderID == brokerOrderID {
+			return &children[i]
 		}
 	}
 	return nil

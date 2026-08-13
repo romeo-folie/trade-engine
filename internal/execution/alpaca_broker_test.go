@@ -286,7 +286,7 @@ func TestGetOrderStatusReturnsNestedBracketCoverage(t *testing.T) {
 		fmt.Fprintln(w, `{
 			"id":"parent-1","status":"filled","qty":"5","filled_qty":"5",
 			"legs":[
-				{"id":"tp-1","type":"limit","status":"new","qty":"3","filled_qty":"2","limit_price":"110"},
+				{"id":"tp-1","type":"limit","status":"new","qty":"3","filled_qty":"2","filled_avg_price":"109.75","filled_at":"2026-08-13T10:00:00Z","limit_price":"110"},
 				{"id":"sl-1","type":"stop","status":"new","qty":"3","filled_qty":"0","stop_price":"95"}
 			]
 		}`)
@@ -304,6 +304,10 @@ func TestGetOrderStatusReturnsNestedBracketCoverage(t *testing.T) {
 	stop := result.ChildOrders[1]
 	if stop.BrokerOrderID != "sl-1" || stop.Quantity != 3 || stop.RemainingQty != 3 || stop.StopPrice != 95 {
 		t.Fatalf("stop leg = %+v", stop)
+	}
+	tp := result.ChildOrders[0]
+	if tp.FilledQty != 2 || tp.FilledPrice != 109.75 || tp.FilledAt.IsZero() {
+		t.Fatalf("take-profit fill = %+v", tp)
 	}
 }
 
