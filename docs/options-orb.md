@@ -7,7 +7,9 @@ Alpaca instead of shares. A long breakout buys a call, a short breakout buys a p
 (flattened before the close), so there is no overnight, assignment, or expiration
 risk.
 
-It attaches to the equities/newyork ORB scheduler and is **default-off**.
+Run it explicitly with `te run --mode orb-options`, or alongside New York forex
+and optional futures with `te run --mode orb-newyork`. It is **default-off** and
+does not attach to a direct-equity scheduler.
 
 ## Prerequisites
 
@@ -71,7 +73,8 @@ See `options_orb:` in `config.example.yaml`. Enable with `options_orb.enabled:
 true` and `markets.stocks.option_feed: opra`. Key knobs: `underlyings`,
 `premium_budget`, `max_loss_per_trade`, the gate thresholds (`iv_rank_ceiling`,
 `max_dte`, `delta_min/max`, `spread_pct_ceiling`), `time_exit_minutes`, and the IV
-window (`iv_lookback_days`, `iv_min_samples`).
+window (`iv_lookback_days`, `iv_min_samples`), plus the breakout controls
+`range_minutes` and `risk_reward`.
 
 **Validate in paper first.** Real-money enablement should wait until a paper
 forward test shows clean contract identity, broker-truth reconciliation with no

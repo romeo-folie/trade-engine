@@ -99,3 +99,9 @@ func TestAnalystExitSignalIDAcceptsOnlyValidatedRetryLineage(t *testing.T) {
 		})
 	}
 }
+
+func TestIsRecoveredMarketExitKey_BrokerProtectionFlatten(t *testing.T) {
+	if !isRecoveredMarketExitKey("broker-protection-flatten:trade-123") {
+		t.Fatal("broker-protection flatten must be recognized as a recovered market exit")
+	}
+}

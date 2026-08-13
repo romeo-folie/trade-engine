@@ -143,7 +143,7 @@ func runOptionsBacktest(ctx context.Context) error {
 	ivstore := options.NewStoreIVStore(store.GetDB())
 
 	rcfg := optionsBacktestConfig(cfg)
-	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct        // exit models a market-sell receiving the bid
+	rcfg.Replay.ModeledSpreadPct = btOptSpreadPct       // exit models a market-sell receiving the bid
 	rcfg.IVHistoryFloor = data.AlpacaOptionHistoryStart // don't seed IV before Alpaca has data
 
 	// Strategy-lever overrides (>0 wins over the config/default), for tuning sweeps.
@@ -249,7 +249,7 @@ func runOptionsBacktest(ctx context.Context) error {
 	return nil
 }
 
-// optionsBacktestConfig maps the live options_orb + equities ORB config onto the
+// optionsBacktestConfig maps the live options_orb config onto the
 // backtest runner config, so a backtest is driven by the SAME knobs production is.
 func optionsBacktestConfig(cfg *config.Config) optionsreplay.RunnerConfig {
 	o := cfg.OptionsORB
@@ -269,11 +269,11 @@ func optionsBacktestConfig(cfg *config.Config) optionsreplay.RunnerConfig {
 			TimeExitMinutes: o.TimeExitMinutes,
 		},
 		Assemble: optionsreplay.AssembleConfig{
-			RangeMinutes:    cfg.ORB.RangeMinutes,
+			RangeMinutes:    o.RangeMinutes,
 			EntryWindowMins: 60,
 			SessionOpenET:   "09:30",
 			SessionEndET:    "15:50", // matches the live options flatten cutoff
-			RiskReward:      cfg.ORB.RiskReward,
+			RiskReward:      o.RiskReward,
 		},
 		IVLookbackDays: o.IVLookbackDays,
 		IVMinSamples:   o.IVMinSamples,

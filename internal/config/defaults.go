@@ -306,19 +306,6 @@ func Defaults() *Config {
 			// in Load) so first-run saves write the correct profile-driven value.
 			CacheTTLMin: 0,
 		},
-		ORB: ORBConfig{
-			Mode:               "paper",
-			GapThresholdPct:    2.5,
-			MinPrice:           5.0, // no penny stocks / warrants
-			MinDollarVolume:    0,   // off by default: snapshot volume is iex-only and under-reports consolidated liquidity (see GapScreen.MinDollarVolume). Enable on SIP deployments.
-			MaxCandidates:      2,
-			RangeMinutes:       15,
-			RiskReward:         2.0,
-			MaxRiskPct:         1.0,
-			MaxPositionPct:     10.0, // hard cap: notional <= 10% of portfolio per trade
-			NewsLookbackHours:  24,
-			ScanCadenceMinutes: 2,
-		},
 		ForexORB: ForexORBConfig{
 			Enabled: false,
 			Instruments: []Instrument{
@@ -336,6 +323,10 @@ func Defaults() *Config {
 			ATRTimeframe:   "1h", // hourly ATR for the range-quality filter (range_atr_ratio)
 			TrendTimeframe: "1h", // hourly EMA for the direction-eligibility trend filter
 			TrendEMAPeriod: 20,
+		},
+		OptionsORB: OptionsORBConfig{
+			RangeMinutes: 15,
+			RiskReward:   2.0,
 		},
 		CurrencyStrength: CurrencyStrengthConfig{
 			Enabled:          false,
@@ -532,11 +523,10 @@ func Defaults() *Config {
 			},
 		},
 		Feedback: FeedbackConfig{
-			Enabled:             false,
-			ReviewTimeUTC:       "18:00",
-			Windows:             []int{1, 7, 30},
-			PromptEnrichment:    true,
-			ORBPromptEnrichment: true,
+			Enabled:          false,
+			ReviewTimeUTC:    "18:00",
+			Windows:          []int{1, 7, 30},
+			PromptEnrichment: true,
 			Thresholds: FeedbackThresholds{
 				ModelWinRateMin:       0.40,
 				ModelMinTrades:        20,

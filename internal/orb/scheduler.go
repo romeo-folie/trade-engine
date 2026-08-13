@@ -11,15 +11,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/romeo-folie/trade-engine/internal/analysis"
-	"github.com/romeo-folie/trade-engine/internal/analysis/depth"
-	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/engine"
 	"github.com/romeo-folie/trade-engine/internal/events"
 	"github.com/romeo-folie/trade-engine/internal/execution"
-	"github.com/romeo-folie/trade-engine/internal/feedback"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
@@ -36,27 +32,6 @@ var nyLoc = func() *time.Location {
 	}
 	return loc
 }()
-
-// maxNewsPerTicker caps the number of news items passed to the LLM per candidate.
-// Limits context window usage while keeping the most recent catalyst signals.
-const maxNewsPerTicker = 10
-
-// defaultMaxScanCandidates caps how many top gap movers the equities ORB scan
-// LLM-scores when config leaves max_scan_candidates unset. Bounds rate-limited
-// model calls so the scan finishes before the opening range forms.
-const defaultMaxScanCandidates = 15
-
-// optionsScanCutoffBufferMin is how many minutes before session open the LLM scoring
-// loop stops when options-ORB is enabled, so the time-critical force-watched underlyings
-// are committed to candidate_ready before open even if provider rate limits stall scoring.
-// Only the inject+filter+advance work (sub-second) runs after this point; gapper scoring
-// is best-effort enrichment. Decouples options-ORB reliability from LLM latency.
-//
-// The check is between loop iterations, so at most ONE in-flight AnalyzeAnalysts call can
-// overrun past the cutoff. Sized to cover that: the per-provider analyst timeout is ≤90s
-// (models.*.timeout_sec) plus news-fetch overhead, so 3 minutes leaves a comfortable margin
-// before open even if a slow scoring call starts just before the cutoff trips.
-const optionsScanCutoffBufferMin = 3
 
 // marketOpenMinutes is the Eastern Time minute-of-day when the US equity market opens (9:30 AM ET).
 const marketOpenMinutes = 9*60 + 30
@@ -112,7 +87,6 @@ type ORBScheduler struct {
 	cfg                     config.ORBConfig
 	db                      *pgxpool.Pool
 	marketData              data.MarketDataProvider
-	analyzer                *analysis.Analyzer
 	executor                execution.Executor
 	portfolio               PortfolioValuer
 	notifier                Notifier
@@ -189,7 +163,6 @@ func NewORBScheduler(
 	cfg config.ORBConfig,
 	db *pgxpool.Pool,
 	marketData data.MarketDataProvider,
-	analyzer *analysis.Analyzer,
 	executor execution.Executor,
 	portfolio PortfolioValuer,
 	notifier Notifier,
@@ -198,7 +171,6 @@ func NewORBScheduler(
 		cfg:                    cfg,
 		db:                     db,
 		marketData:             marketData,
-		analyzer:               analyzer,
 		executor:               executor,
 		portfolio:              portfolio,
 		notifier:               notifier,
@@ -316,7 +288,7 @@ func (s *ORBScheduler) isForexMode() bool {
 }
 
 // sessionName returns the session name used as the uniqueness key for orb_sessions.
-// Equities ORB uses "" (the default). Forex ORB uses the configured session name.
+// Options ORB uses "" (the default). Forex ORB uses the configured session name.
 // Futures ORB uses "futures" — distinct from all forex session names ("london", "newyork", "both", "").
 func (s *ORBScheduler) sessionName() string {
 	if s.isFuturesMode() {
@@ -1047,7 +1019,7 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 
 	// 2. Scan Cadence: minimize LLM costs by only scanning every N minutes.
 	// The scheduler ticks every 30s, but gap movers and news don't shift that fast.
-	cadence := time.Duration(s.cfg.ScanCadenceMinutes) * time.Minute
+	cadence := 30 * time.Second
 	if !s.lastScan.IsZero() && sessionNow.Sub(s.lastScan) < cadence {
 		return nil
 	}
@@ -1058,133 +1030,6 @@ func (s *ORBScheduler) tickScanning(ctx context.Context, et time.Time) error {
 		scored, err = s.scanner.ScanCandidates(ctx)
 		if err != nil {
 			return fmt.Errorf("scan candidates: %w", err)
-		}
-	} else {
-		// Inline equities scanning: gap movers + LLM scoring
-		alpacaClient, ok := s.marketData.(*data.AlpacaClient)
-		if !ok {
-			return fmt.Errorf("equities scanning requires AlpacaClient as MarketDataProvider; set a CandidateScanner for other providers")
-		}
-		gaps, gapErr := data.FetchGapMovers(ctx, alpacaClient, data.GapScreen{
-			MinGapPct:       s.cfg.GapThresholdPct,
-			MinPrice:        s.cfg.MinPrice,
-			MinDollarVolume: s.cfg.MinDollarVolume,
-			RankByLiquidity: true,
-		})
-		if gapErr != nil {
-			return fmt.Errorf("scan gap movers: %w", gapErr)
-		}
-		s.lastScan = sessionNow
-
-		// No early return on an empty gap universe: the options-ORB force-watch below must
-		// still run (SPY/IWM/NVDA don't gap, so the scan never surfaces them), and the cap
-		// and scoring loop are both no-ops on an empty slice. When options-ORB is disabled
-		// this still ends the same way — `selected` stays empty and the len(selected)==0
-		// guard below returns nil.
-
-		// Cap how many gap movers get LLM-scored. This is the production equities
-		// path (te run --mode orb / orb-newyork construct the scheduler without a
-		// CandidateScanner), so the cap MUST live here too — not only in
-		// EquitiesCandidateScanner. FetchGapMovers ranks liquidity-first (|gap%| ×
-		// log10 dollar-volume) after applying the price/volume floors, so we keep the
-		// most tradeable movers and bound the rate-limited model calls; a large gap
-		// universe otherwise sprays dozens of calls into the pre-open window and
-		// stalls on the provider quota, finishing after the range opens.
-		maxScan := s.cfg.MaxScanCandidates
-		if maxScan <= 0 {
-			maxScan = defaultMaxScanCandidates
-		}
-		if len(gaps) > maxScan {
-			slog.Info("orb: gap universe capped for scoring", "found", len(gaps), "scoring", maxScan)
-			gaps = gaps[:maxScan]
-		}
-
-		// When options-ORB is enabled its force-watched underlyings are time-critical: they
-		// must reach candidate_ready before session open (they're injected below) or their
-		// opening range is missed and the whole options session is skipped. LLM gapper scoring
-		// can run long under provider rate limits, so bound the loop to stop a safety margin
-		// before open — the forced basket is committed regardless; gapper scoring is best-effort.
-		forceWatch := len(s.optionsRouter.Underlyings()) > 0
-
-		// LLM-score each candidate
-		for _, gap := range gaps {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			if forceWatch && optionsScoringCutoffReached(s.now(), sessionTZ, openMinutes) {
-				slog.Warn("orb: bounding LLM scoring to commit options force-watch before open",
-					"scored", len(scored), "unscored_remaining", len(gaps)-len(scored))
-				break
-			}
-			// Fetch recent news for this ticker to give the LLM catalyst context.
-			// Without news, catalyst_type/catalyst_quality are unreliable since the
-			// model can only see gap magnitude and pre-market volume.
-			var newsItems []prompts.ORBNewsItem
-			if s.news != nil {
-				since := s.now().Add(-time.Duration(s.cfg.NewsLookbackHours) * time.Hour)
-				rawNews, newsErr := s.news.FetchNews(ctx, gap.Ticker, since)
-				if newsErr != nil {
-					slog.Warn("orb: news fetch failed", "ticker", gap.Ticker, "err", newsErr)
-				} else {
-					// Cap to most recent N items to avoid context window blowout on
-					// high-volume tickers. FetchNews returns newest-first, so a simple
-					// slice preserves recency ordering.
-					if len(rawNews) > maxNewsPerTicker {
-						rawNews = rawNews[:maxNewsPerTicker]
-					}
-					for _, n := range rawNews {
-						sentiment := "NEUTRAL"
-						if n.SentimentScore > sentimentPositiveThreshold {
-							sentiment = "POSITIVE"
-						} else if n.SentimentScore < sentimentNegativeThreshold {
-							sentiment = "NEGATIVE"
-						}
-						newsItems = append(newsItems, prompts.ORBNewsItem{
-							Headline:    n.Headline,
-							Sentiment:   sentiment,
-							PublishedAt: n.PublishedAt,
-						})
-					}
-				}
-			}
-
-			var orbPerfCtx string
-			if s.feedbackCfg != nil && s.feedbackCfg.Enabled && s.feedbackCfg.ORBPromptEnrichment {
-				if pc, err := feedback.GetORBPerformanceContext(ctx, gap.Ticker, ""); err == nil {
-					orbPerfCtx = pc
-				}
-			}
-			sysPrompt, userMsg := prompts.BuildORBPrompt(
-				prompts.ORBCandidate{
-					Ticker:        gap.Ticker,
-					GapPct:        gap.GapPct,
-					PreMarketVol:  gap.PreMarketVol,
-					PreMarketLast: gap.PreMarketLast,
-					PriorClose:    gap.PriorClose,
-				},
-				newsItems,
-				orbPerfCtx,
-			)
-
-			// Score with the analysts DIRECTLY (no arbiter) and aggregate by confidence,
-			// so a gap candidate is selectable with however many analysts are reachable
-			// (even one) — the equities scan must not go dark when the arbiter is
-			// unconfigured/out-of-credits or a provider is throttled. Errors only when
-			// EVERY analyst failed.
-			analystResults, analyzeErr := s.analyzer.AnalyzeAnalysts(ctx, analysis.AnalysisRequest{
-				Ticker:             gap.Ticker,
-				CustomSystemPrompt: sysPrompt,
-				CustomUserMessage:  userMsg,
-			}, depth.ImpactScore{Score: 1.0, Depth: 3})
-			if analyzeErr != nil {
-				slog.Error("orb: LLM scoring failed — no analysts available", "ticker", gap.Ticker, "err", analyzeErr)
-				continue
-			}
-
-			// Winning-action mean over the successful analysts, gated on the confidence
-			// threshold. parseORBResult (inside) pulls the ORB-specific catalyst/risks fields.
-			result := aggregateORBScore(analystResults, s.scanConfidenceThreshold())
-			scored = append(scored, ScoredCandidate{Gap: gap, Score: result, AssetClass: "equity"})
 		}
 	}
 	s.lastScan = sessionNow
@@ -1446,7 +1291,6 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 
 	s.mu.Lock()
 	sessionID := s.session.ID
-	candidates := s.candidates
 	s.mu.Unlock()
 
 	// Don't open a new ORB position on a ticker that still holds an unexited filled
@@ -1851,92 +1695,6 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 					})
 				}
 			}
-		} else {
-			// Equities: single side from the pre-market gap direction. (Futures no longer
-			// reach here — they route through the dual-sided/gated forex path above via
-			// effectiveInstrument; the old long-only gap-sign futures placement is gone.)
-			side := "buy"
-			for _, sc := range candidates {
-				if sc.Gap.Ticker == ticker && sc.Gap.GapPct < 0 {
-					side = "sell"
-				}
-			}
-
-			params := ComputeBracket(r, side, portfolioVal, s.cfg)
-
-			if params.Qty == 0 {
-				slog.Warn("orb: skipping — position size too small", "ticker", ticker)
-				continue
-			}
-
-			// NOTE: options-router underlyings are intercepted earlier (before the
-			// forex/equities split, via optionsBreakoutEntry, which decides call/put from a
-			// dual-sided breakout rather than gap sign) so they never reach this stock-bracket
-			// placement; the old options hook here is therefore removed as dead code.
-			// Equities ORB bypasses Engine.executeSignal, so enforce the same
-			// persisted new-stock-risk control immediately before releasing its
-			// bracket parent to the broker. Exits use separate paths and remain
-			// unaffected by this entry-only gate.
-			if !store.IsConnected() {
-				slog.Error("orb: buy control unavailable; refusing stock entry", "ticker", ticker,
-					"err", "database not connected")
-				continue
-			} else if enabled, err := store.StockBuyEntriesEnabled(ctx); err != nil {
-				slog.Error("orb: buy control unavailable; refusing stock entry", "ticker", ticker, "err", err)
-				continue
-			} else if !enabled {
-				slog.Info("orb: new stock buys paused; skipping entry", "ticker", ticker)
-				continue
-			}
-			orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, params)
-			if err != nil {
-				slog.Error("orb: place bracket failed", "ticker", ticker, "err", err)
-				continue
-			}
-			if side == "sell" {
-				s.orderIDs[ticker] = [2]string{"", orderID}
-			} else {
-				s.orderIDs[ticker] = [2]string{orderID, ""}
-			}
-			s.publish(events.TradeSimulated, events.TradeExecutedPayload{
-				Ticker:    ticker,
-				Direction: side,
-				Strategy:  "orb",
-			})
-			s.publish(events.ORBTradeUpdate, events.ORBTradeUpdatePayload{
-				OrderID: orderID,
-				Ticker:  ticker,
-				Side:    side,
-				Status:  "pending",
-			})
-			dbID, err := store.CreateORBTrade(ctx, s.db, store.ORBTrade{
-				SessionID:      sessionID,
-				Ticker:         ticker,
-				Side:           side,
-				EntryStop:      params.EntryStop,
-				StopLoss:       params.StopLoss,
-				TakeProfit:     params.TakeProfit,
-				Qty:            params.Qty,
-				OrderID:        orderID,
-				Status:         "pending",
-				TpOrderID:      tpID,
-				SlOrderID:      slID,
-				AssetClass:     s.tradeAssetClass(),
-				OwnerScope:     s.ownerScope(),
-				PointValue:     1,
-				MaxHoldMinutes: s.persistedMaxHoldMinutes(ticker),
-			})
-			if err != nil {
-				slog.Error("orb: store trade failed", "ticker", ticker, "err", err)
-			} else {
-				s.trackedTrades[orderID] = &trackedTrade{
-					dbID: dbID, tpOrderID: tpID, slOrderID: slID,
-					side: side, ticker: ticker, qty: params.Qty,
-					entryStop: params.EntryStop, pointValue: 1,
-				}
-			}
-			msgs = append(msgs, fmt.Sprintf("  %s %s: entry=%.4f stop=%.4f target=%.4f qty=%d",
-				strings.ToUpper(side), ticker, params.EntryStop, params.StopLoss, params.TakeProfit, params.Qty))
 		}
 	}
 
@@ -3006,51 +2764,6 @@ func (s *ORBScheduler) backfillRecentExits(ctx context.Context) bool {
 		}
 	}
 	return allOK
-}
-
-// orbRawResponse is the full JSON schema returned by the ORB custom system prompt.
-// The confidence field was previously named "conviction" — it is now "confidence"
-// so that extractAnalysisJSON maps it to AnalysisResponse.Confidence, enabling
-// the ensemble fast-path when all analysts unanimously agree.
-type orbRawResponse struct {
-	Action          string   `json:"action"`
-	Confidence      float64  `json:"confidence"`
-	CatalystType    string   `json:"catalyst_type"`
-	CatalystQuality string   `json:"catalyst_quality"`
-	Reasoning       string   `json:"reasoning"`
-	Risks           []string `json:"risks"`
-}
-
-// parseORBResult extracts the full ORB analysis result from the raw LLM response.
-// Falls back to the standard AnalysisResponse fields when the raw JSON cannot be
-// parsed (e.g. the arbiter returned a transformed response).
-func parseORBResult(rawResponse string, fallback analysis.AnalysisResponse) ORBAnalysisResult {
-	// Strip markdown fences if present
-	raw := strings.TrimSpace(rawResponse)
-	raw = strings.TrimPrefix(raw, "```json")
-	raw = strings.TrimPrefix(raw, "```")
-	raw = strings.TrimSuffix(raw, "```")
-	raw = strings.TrimSpace(raw)
-
-	var parsed orbRawResponse
-	if err := json.Unmarshal([]byte(raw), &parsed); err == nil &&
-		(parsed.Action == "trade" || parsed.Action == "skip") {
-		return ORBAnalysisResult{
-			Action:          parsed.Action,
-			Conviction:      parsed.Confidence,
-			CatalystType:    parsed.CatalystType,
-			CatalystQuality: parsed.CatalystQuality,
-			Reasoning:       parsed.Reasoning,
-			Risks:           parsed.Risks,
-		}
-	}
-
-	// Fallback: map standard AnalysisResponse fields
-	return ORBAnalysisResult{
-		Action:     string(fallback.Action),
-		Conviction: fallback.Confidence,
-		Reasoning:  fallback.Reasoning,
-	}
 }
 
 // IsTradingDay checks if the given time falls on a trading day.

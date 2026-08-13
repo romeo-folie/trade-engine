@@ -477,7 +477,7 @@ func TestValidateStocksCredentialsRequireBothWhenEnabled(t *testing.T) {
 }
 
 func TestValidateValidModes(t *testing.T) {
-	for _, mode := range []string{"manual", "auto", "paper", "orb", "forex", "orb-forex", "orb-futures", "orb-futures-metals", "orb-newyork"} {
+	for _, mode := range []string{"manual", "auto", "paper", "forex", "orb-forex", "orb-futures", "orb-futures-metals", "orb-newyork", "orb-options"} {
 		cfg := Defaults()
 		cfg.Engine.Mode = mode
 		errs := Validate(cfg)
@@ -978,98 +978,26 @@ func TestAnalystNodeIDIsStableAcrossRegistryAndLegacyConfigs(t *testing.T) {
 	}
 }
 
-// ── ORB validation tests ──────────────────────────────────────────────────
-
-func TestValidateORBInvalidRangeMinutes(t *testing.T) {
+func TestValidateOptionsORB(t *testing.T) {
 	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.RangeMinutes = 10
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.range_minutes") {
-		t.Errorf("expected orb.range_minutes error, got: %v", errs)
+	cfg.OptionsORB.Enabled = true
+	cfg.OptionsORB.Underlyings = []string{"SPY"}
+	if errs := Validate(cfg); containsStr(errs, "options_orb") {
+		t.Fatalf("unexpected options ORB validation error: %v", errs)
 	}
-}
-
-func TestValidateORBInvalidRiskReward(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.RiskReward = 1.0
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.risk_reward") {
-		t.Errorf("expected orb.risk_reward error, got: %v", errs)
+	cfg.OptionsORB.RangeMinutes = 10
+	if !containsStr(Validate(cfg), "options_orb.range_minutes") {
+		t.Fatalf("expected options range validation error")
 	}
-}
-
-func TestValidateORBInvalidMaxCandidates(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.MaxCandidates = 0
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.max_candidates") {
-		t.Errorf("expected orb.max_candidates error, got: %v", errs)
+	cfg.OptionsORB.RangeMinutes = 15
+	cfg.OptionsORB.RiskReward = 1
+	if !containsStr(Validate(cfg), "options_orb.risk_reward") {
+		t.Fatalf("expected options risk/reward validation error")
 	}
-	cfg.ORB.MaxCandidates = 6
-	errs = Validate(cfg)
-	if !containsStr(errs, "orb.max_candidates") {
-		t.Errorf("expected orb.max_candidates error for 6, got: %v", errs)
-	}
-}
-
-func TestValidateORBInvalidMaxRiskPct(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.MaxRiskPct = 0
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.max_risk_pct") {
-		t.Errorf("expected orb.max_risk_pct error, got: %v", errs)
-	}
-	cfg.ORB.MaxRiskPct = 6.0
-	errs = Validate(cfg)
-	if !containsStr(errs, "orb.max_risk_pct") {
-		t.Errorf("expected orb.max_risk_pct error for 6.0, got: %v", errs)
-	}
-}
-
-func TestValidateORBInvalidMode(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.Mode = "invalid"
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.mode") {
-		t.Errorf("expected orb.mode error, got: %v", errs)
-	}
-}
-
-func TestValidateORBInvalidGapThreshold(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	cfg.ORB.GapThresholdPct = -1.0
-	errs := Validate(cfg)
-	if !containsStr(errs, "orb.gap_threshold_pct") {
-		t.Errorf("expected orb.gap_threshold_pct error, got: %v", errs)
-	}
-}
-
-func TestValidateORBValidDefaults(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = true
-	errs := Validate(cfg)
-	for _, e := range errs {
-		if strings.Contains(e, "orb.") {
-			t.Errorf("unexpected ORB validation error with defaults: %s", e)
-		}
-	}
-}
-
-func TestValidateORBDisabledSkipsValidation(t *testing.T) {
-	cfg := Defaults()
-	cfg.ORB.Enabled = false
-	cfg.ORB.RangeMinutes = 99 // invalid but should not matter
-	errs := Validate(cfg)
-	for _, e := range errs {
-		if strings.Contains(e, "orb.") {
-			t.Errorf("ORB disabled but got validation error: %s", e)
-		}
+	cfg.OptionsORB.RiskReward = 2
+	cfg.OptionsORB.Underlyings = nil
+	if !containsStr(Validate(cfg), "options_orb.underlyings") {
+		t.Fatalf("expected options underlyings validation error")
 	}
 }
 
@@ -1112,31 +1040,6 @@ func TestValidateCurrencyStrengthTimesMustBeOrdered(t *testing.T) {
 	errs := Validate(cfg)
 	if !containsStr(errs, "currency_strength times") {
 		t.Errorf("expected currency_strength time-order error, got: %v", errs)
-	}
-}
-
-func TestDefaultsORBConfig(t *testing.T) {
-	cfg := Defaults()
-	if cfg.ORB.Mode != "paper" {
-		t.Errorf("default orb.mode = %q, want paper", cfg.ORB.Mode)
-	}
-	if cfg.ORB.GapThresholdPct != 2.5 {
-		t.Errorf("default orb.gap_threshold_pct = %f, want 2.5", cfg.ORB.GapThresholdPct)
-	}
-	if cfg.ORB.MaxCandidates != 2 {
-		t.Errorf("default orb.max_candidates = %d, want 2", cfg.ORB.MaxCandidates)
-	}
-	if cfg.ORB.RangeMinutes != 15 {
-		t.Errorf("default orb.range_minutes = %d, want 15", cfg.ORB.RangeMinutes)
-	}
-	if cfg.ORB.RiskReward != 2.0 {
-		t.Errorf("default orb.risk_reward = %f, want 2.0", cfg.ORB.RiskReward)
-	}
-	if cfg.ORB.MaxRiskPct != 1.0 {
-		t.Errorf("default orb.max_risk_pct = %f, want 1.0", cfg.ORB.MaxRiskPct)
-	}
-	if cfg.ORB.ScanCadenceMinutes != 2 {
-		t.Errorf("default orb.scan_cadence_minutes = %d, want 2", cfg.ORB.ScanCadenceMinutes)
 	}
 }
 
@@ -1252,38 +1155,6 @@ func TestValidateForexMaxNotionalUSD(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected a max_notional_usd error for the non-USD-quoted pair; got %v", errs)
-	}
-}
-
-// TestValidate_ScanConfidenceThreshold guards the Codex #442 P2: a threshold > 1 (the
-// typo 68 for 0.68) can never pass the 0-1 analyst-confidence gate and would silently
-// skip every ORB candidate — so it must fail startup. 0 (= use default) stays valid.
-func TestValidate_ScanConfidenceThreshold(t *testing.T) {
-	base := func() *Config {
-		c := Defaults()
-		c.ORB.Enabled = true
-		c.ORB.GapThresholdPct = 3.0
-		c.ORB.RangeMinutes = 15
-		c.ORB.MaxCandidates = 2
-		c.ORB.RiskReward = 2.0
-		c.ORB.MaxPositionPct = 20
-		c.ORB.MaxRiskPct = 1.0
-		c.ORB.Mode = "paper"
-		return c
-	}
-	for _, v := range []float64{0, 0.68, 1.0} { // 0 = default; in-range OK
-		c := base()
-		c.ORB.ScanConfidenceThreshold = v
-		if containsStr(Validate(c), "scan_confidence_threshold") {
-			t.Errorf("valid threshold %.2f was flagged: %v", v, Validate(c))
-		}
-	}
-	for _, v := range []float64{68, 1.5, -0.1} { // out of [0,1] must error
-		c := base()
-		c.ORB.ScanConfidenceThreshold = v
-		if !containsStr(Validate(c), "scan_confidence_threshold") {
-			t.Errorf("out-of-range threshold %.2f was NOT flagged", v)
-		}
 	}
 }
 

@@ -14,33 +14,26 @@ import (
 
 // appendForcedOptionsUnderlyings injects the options-router underlyings into the scan
 // result as synthetic candidates. Options-mode symbols (e.g. SPY/IWM/NVDA) are FIXED,
-// rule-based ORB targets — they rarely gap, so the LLM gap scan never surfaces them.
-// Injecting them here (every scan, independent of the gap scan) is what makes the live
-// path watch them the way the backtest (optionsreplay.AssembleSignals) does, even on a
-// day with zero gap movers or when the LLM scorer is rate-limited.
+// rule-based ORB targets. Injecting them here makes the live path watch them the
+// same way as the backtest (optionsreplay.AssembleSignals).
 //
 // They are added to the persisted `scored` set — NOT just `selected` — because a
 // mid-session resume rehydrates s.candidates from `scored`; injecting only into
 // `selected` would silently drop the force-watch after a restart. Conviction 0 and a
-// zero GapPct are deliberate: the gap-sign direction consumer never sees these tickers
-// (tickExecuting intercepts options-router tickers before the gap-sign branch), and the
-// dual-sided breakout entry decides call vs put from the actual breakout.
+// zero GapPct are deliberate: the dual-sided breakout entry decides call vs put
+// from the actual breakout.
 //
 // No-op when options-ORB is disabled: Underlyings() is nil-safe and returns nil on a
 // nil router, leaving the equity/forex/futures scan path byte-identical.
 func appendForcedOptionsUnderlyings(scored []ScoredCandidate, router *OptionsRouter) []ScoredCandidate {
 	for _, u := range router.Underlyings() {
 		if i := indexOfTicker(scored, u); i >= 0 {
-			// The gap scan already surfaced this underlying. Force it to "trade" regardless
-			// of the LLM's action: a configured options underlying is watched BY RULE, so an
-			// organic "skip"/"HOLD" score must not drop it from the selected filter below (its
-			// gap%/conviction/reasoning are left intact for display). Already-"trade" is a no-op.
-			if !isTradeAction(scored[i].Score.Action) {
+			// A configured options underlying is watched by rule; retain the option
+			// identity if a restored candidate already exists.
+			if !strings.EqualFold(scored[i].Score.Action, "trade") && !strings.EqualFold(scored[i].Score.Action, "buy") {
 				scored[i].Score.Action = "trade"
 			}
-			// This underlying is watched for options execution regardless of how the
-			// gap scan surfaced it, so tag it "option" for the UI (overriding any
-			// "equity" tag from the gapper path).
+			// Tag restored candidates as options for the UI.
 			scored[i].AssetClass = "option"
 			continue
 		}
@@ -166,16 +159,6 @@ func (s *ORBScheduler) optionsBreakoutEntry(ctx context.Context, sessionID, tick
 		})
 	}
 	return true, line
-}
-
-// optionsScoringCutoffReached reports whether the equities LLM scoring loop should stop
-// early (leaving optionsScanCutoffBufferMin before session open) so the time-critical
-// options force-watch reaches candidate_ready before open. now is compared in the session
-// timezone against openMinutes (minutes-of-day, session-local).
-func optionsScoringCutoffReached(now time.Time, tz *time.Location, openMinutes int) bool {
-	n := now.In(tz)
-	h, m, _ := n.Clock()
-	return h*60+m >= openMinutes-optionsScanCutoffBufferMin
 }
 
 func optionsAttemptedKey(sessionID string) string { return "options_attempted:" + sessionID }

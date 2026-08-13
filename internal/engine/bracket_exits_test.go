@@ -27,6 +27,7 @@ type fakeBracketExec struct {
 	placeRes    execution.OrderResult
 	placeErr    error
 	onStatus    func(string)
+	onPlace     func(execution.OrderRequest)
 	positions   []execution.Position
 	positionErr error
 }
@@ -42,6 +43,9 @@ func (f *fakeBracketExec) PlaceOrder(_ context.Context, req execution.OrderReque
 		return execution.OrderResult{}, f.placeErr
 	}
 	f.placed = append(f.placed, req)
+	if f.onPlace != nil {
+		f.onPlace(req)
+	}
 	return f.placeRes, nil
 }
 
@@ -234,6 +238,9 @@ func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *te
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
+	originalDelay := brokerProtectionVerificationRetryDelay
+	brokerProtectionVerificationRetryDelay = 0
+	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
 	checks := make(chan struct{}, 3)
 	exec := &fakeBracketExec{
 		statuses: map[string]execution.OrderResult{
@@ -255,6 +262,105 @@ func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *te
 	}
 	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
 		t.Fatalf("unknown trade projection must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
+func TestBrokerBracketProtectionTransient(t *testing.T) {
+	for _, result := range []execution.OrderResult{
+		{Status: "partial", Quantity: 2, FilledQty: 1},
+		{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held"}}},
+	} {
+		if !brokerBracketProtectionTransient(result) {
+			t.Fatalf("expected transitional bracket state: %+v", result)
+		}
+	}
+	if brokerBracketProtectionTransient(execution.OrderResult{Status: "filled", Quantity: 2, FilledQty: 2}) {
+		t.Fatal("missing terminal stop is persistent evidence, not a transition")
+	}
+}
+
+func TestVerifyBrokerEntry_TransientSnapshotsActivateWithoutContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	originalDelay := brokerProtectionVerificationRetryDelay
+	brokerProtectionVerificationRetryDelay = 0
+	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
+	for _, first := range []execution.OrderResult{
+		{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
+		{Status: "partial", Quantity: 2, FilledQty: 1, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
+	} {
+		tradeID, _, _ := insertBracketFixture(t, "VERIFY_TRANSITION", 2)
+		checks := make(chan struct{}, 2)
+		exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{"parent": first}}
+		calls := 0
+		exec.onStatus = func(id string) {
+			if id != "parent" {
+				return
+			}
+			calls++
+			if calls == 1 {
+				checks <- struct{}{}
+				return
+			}
+			exec.statuses["parent"] = execution.OrderResult{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}}}
+			checks <- struct{}{}
+		}
+		e := newBracketTestEngine(exec)
+		e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_TRANSITION", 2)
+		for i := 0; i < 2; i++ {
+			select {
+			case <-checks:
+			case <-time.After(time.Second):
+				t.Fatal("verification did not re-read parent")
+			}
+		}
+		if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+			t.Fatalf("transition contained: cancels=%v placements=%v", exec.cancelled, exec.placed)
+		}
+	}
+}
+
+func TestVerifyBrokerEntry_PersistentMissingStopContainsWithDistinctReason(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	originalDelay := brokerProtectionVerificationRetryDelay
+	brokerProtectionVerificationRetryDelay = 0
+	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
+	tradeID, _, _ := insertBracketFixture(t, "VERIFY_PERSISTENT", 2)
+	checks := make(chan struct{}, 3)
+	flattened := make(chan execution.OrderRequest, 1)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{"parent": {Status: "filled", Quantity: 2, FilledQty: 2}},
+		placeRes: execution.OrderResult{BrokerOrderID: "flatten", Status: "accepted"},
+		onPlace:  func(req execution.OrderRequest) { flattened <- req },
+	}
+	exec.onStatus = func(id string) {
+		if id == "parent" {
+			checks <- struct{}{}
+		}
+	}
+	e := newBracketTestEngine(exec)
+	e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_PERSISTENT", 2)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-checks:
+		case <-time.After(time.Second):
+			t.Fatal("persistent state was not re-verified")
+		}
+	}
+	var containment execution.OrderRequest
+	select {
+	case containment = <-flattened:
+	case <-time.After(time.Second):
+		t.Fatal("persistent missing stop was not flattened")
+	}
+	if len(exec.cancelled) == 0 {
+		t.Fatal("persistent missing stop was not contained")
+	}
+	if len(exec.placed) != 1 || containment.ExitReason != store.ExitReasonBrokerProtectionFailure {
+		t.Fatalf("containment request = %+v", containment)
 	}
 }
 
