@@ -15,6 +15,11 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
 
+// stockEntryBrokerProtection is a package variable so reconciliation tests can
+// exercise a transient durable-policy read failure without taking down the
+// shared database pool.
+var stockEntryBrokerProtection = store.StockEntryBrokerProtection
+
 // Broker-resident bracket exits (#435). The execution study measured the
 // stock path's hourly candle-close stop checks costing ~1.5%/trade: 49 of 53
 // stop breaches happened intraday where a broker-resident stop would have
@@ -123,7 +128,6 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 	t store.Trade,
 	pollCappedStandalone bool,
 ) (bool, error) {
-	bracketPolicyEnabled := e.cfg != nil && e.cfg.Risk.BracketExitsEnabled
 	// Include terminal protective rows with durable fills. A crash can occur
 	// after their fill was applied to the trade but before the open trade was
 	// claimed and finalized; those rows are the only restart evidence capable
@@ -142,7 +146,7 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		legs = standaloneStopLegs(all)
 	}
 	if len(legs) == 0 {
-		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr != nil && bracketPolicyEnabled && !errors.Is(policyErr, pgx.ErrNoRows) {
+		if required, parentID, policyErr := stockEntryBrokerProtection(ctx, t.ID); policyErr != nil && !errors.Is(policyErr, pgx.ErrNoRows) {
 			// A strict entry with an unreadable policy may still have live,
 			// unprojected broker children. Do not let software exits race them.
 			logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
@@ -243,8 +247,8 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		handled, closeErr := e.closeBracketTrade(ctx, t, states, filledIdx, ownsAllExits)
 		return handled, errors.Join(pollErr, closeErr)
 	}
-	required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID)
-	if policyErr != nil && bracketPolicyEnabled && !errors.Is(policyErr, pgx.ErrNoRows) {
+	required, parentID, policyErr := stockEntryBrokerProtection(ctx, t.ID)
+	if policyErr != nil && !errors.Is(policyErr, pgx.ErrNoRows) {
 		// This path is reached when projected legs have all become terminal.
 		// A transient policy read is still not proof that a strict entry can
 		// safely hand ownership back to application-managed exits.

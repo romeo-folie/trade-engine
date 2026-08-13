@@ -375,6 +375,35 @@ func TestReconcileBracket_LegacyTradeWithoutIntentRemainsApplicationManaged(t *t
 	}
 }
 
+func TestReconcileBracket_PolicyReadFailureRetainsBrokerOwnershipAfterAdmissionDisabled(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_POLICY_READ_FAILURE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+
+	original := stockEntryBrokerProtection
+	stockEntryBrokerProtection = func(context.Context, string) (bool, string, error) {
+		return false, "", fmt.Errorf("transient policy read failure")
+	}
+	t.Cleanup(func() { stockEntryBrokerProtection = original })
+
+	e := newBracketTestEngine(&fakeBracketExec{})
+	// This flag only governs admission of new bracket entries. An existing
+	// strict trade cannot safely fall back to software exits while its durable
+	// ownership policy is temporarily unreadable.
+	e.cfg.Risk.BracketExitsEnabled = false
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false); !handled || reconcileErr == nil {
+		t.Fatalf("policy read failure after admission disabled = handled %v err %v; want broker ownership retained", handled, reconcileErr)
+	}
+}
+
 func TestCancelLegacyBrokerHeldEntry_GTCDoneForDayRemainsWorking(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
