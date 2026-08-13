@@ -173,7 +173,7 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, tradeID string
 // child's direct endpoint after a fill, leaving this parent response as the
 // only evidence capable of reducing the durable trade quantity.
 func persistParentReportedBracketChildFill(ctx context.Context, tradeID string, child execution.OrderLeg) error {
-	if child.BrokerOrderID == "" || child.FilledQty <= 0 {
+	if tradeID == "" || child.BrokerOrderID == "" || child.FilledQty <= 0 {
 		return nil
 	}
 	order, err := store.GetOrderByBrokerOrderID(ctx, child.BrokerOrderID)
