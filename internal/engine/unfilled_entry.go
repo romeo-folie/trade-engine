@@ -14,6 +14,94 @@ import (
 // variable so tests can shrink it.
 var unfilledCancelRetryDelay = 5 * time.Second
 
+type stockIntentRecoverer interface {
+	Recover(context.Context) error
+}
+
+// cancelTimedOutStockIntent closes the order-only durable entry window after
+// its two-minute fill poll expires. There may be no trade row yet, so terminal
+// broker truth is written to the intent and recovery owns the signal/order
+// projection. A late fill is recovered instead of being discarded.
+func (e *Engine) cancelTimedOutStockIntent(intentKey, brokerOrderID string, recoverer stockIntentRecoverer) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var terminal execution.OrderResult
+	confirmed := false
+	for attempt := 0; attempt < 3 && !confirmed; attempt++ {
+		if attempt > 0 {
+			time.Sleep(unfilledCancelRetryDelay)
+		}
+		if err := e.executor.CancelOrder(ctx, brokerOrderID); err != nil {
+			logger.Debug("unfilled stock intent: broker cancel attempt",
+				"intent_key", intentKey, "broker_order_id", brokerOrderID,
+				"attempt", attempt+1, "err", err)
+		}
+		status, err := e.executor.GetOrderStatus(ctx, brokerOrderID)
+		if err != nil {
+			if !errors.Is(err, execution.ErrOrderNotFound) {
+				continue
+			}
+			// A successful cancel followed by 404 means the order is gone. Make
+			// that terminal fact durable so recovery can retire the reservation.
+			terminal = execution.OrderResult{BrokerOrderID: brokerOrderID, Status: "cancelled"}
+			confirmed = true
+			break
+		}
+		terminal = status
+		if execution.IsTerminalOrderStatus(status.Status) {
+			confirmed = true
+			continue
+		}
+		if status.FilledQty > 0 {
+			// A cancel request is not terminal broker truth. Project the
+			// cumulative fill now so it is owned and protected, then keep
+			// cancelling until the remaining BUY quantity is confirmed dead.
+			if err := e.projectTimedOutStockIntentSnapshot(ctx, intentKey, brokerOrderID, status, recoverer); err != nil {
+				logger.Warn("unfilled stock intent: project interim cancellation fill",
+					"intent_key", intentKey, "broker_order_id", brokerOrderID, "err", err)
+			}
+		}
+	}
+	if !confirmed {
+		logger.Error("unfilled stock intent: could not confirm broker order terminal",
+			"intent_key", intentKey, "broker_order_id", brokerOrderID)
+		return
+	}
+
+	if err := e.projectTimedOutStockIntentSnapshot(ctx, intentKey, brokerOrderID, terminal, recoverer); err != nil {
+		logger.Warn("unfilled stock intent: recover terminal entry",
+			"intent_key", intentKey, "broker_order_id", brokerOrderID, "err", err)
+	}
+}
+
+func (e *Engine) projectTimedOutStockIntentSnapshot(
+	ctx context.Context,
+	intentKey, brokerOrderID string,
+	snapshot execution.OrderResult,
+	recoverer stockIntentRecoverer,
+) error {
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil {
+		if err == nil {
+			err = errors.New("durable stock intent is missing")
+		}
+		return err
+	}
+	status := execution.NormalizeOrderStatus(snapshot.Status)
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, brokerOrderID,
+		status, snapshot.FilledPrice, snapshot.FilledQty, snapshot.RequestID, "", false); err != nil {
+		return err
+	}
+	if err := recoverer.Recover(ctx); err != nil {
+		return err
+	}
+	if snapshot.FilledQty > 0 {
+		e.emitRecoveredEntryEffects(ctx, intentKey)
+	}
+	return nil
+}
+
 // cancelUnfilledEntry cleans up an entry whose broker order died or went
 // permanently silent with ZERO fill, so the qty-0 trade row never occupies a
 // position slot (#437 — the after-hours zero-entry rows).

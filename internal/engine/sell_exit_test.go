@@ -2,13 +2,46 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/execution"
+	"github.com/romeo-folie/trade-engine/internal/stockorders"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+// definitiveThenFilledExitBroker rejects the first request before creating a
+// broker order, then accepts and fills the durable successor generation.
+type definitiveThenFilledExitBroker struct {
+	posts []execution.OrderRequest
+	err   error
+}
+
+func (b *definitiveThenFilledExitBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	b.posts = append(b.posts, req)
+	if len(b.posts) == 1 {
+		return execution.OrderResult{}, b.err
+	}
+	return execution.OrderResult{BrokerOrderID: "accepted-retry-exit", Status: "filled", FilledPrice: 120, FilledQty: req.Quantity}, nil
+}
+func (*definitiveThenFilledExitBroker) GetOrderByClientID(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, execution.ErrOrderNotFound
+}
+func (*definitiveThenFilledExitBroker) CancelOrder(context.Context, string) error { return nil }
+func (*definitiveThenFilledExitBroker) GetOrderStatus(context.Context, string) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
+func (*definitiveThenFilledExitBroker) GetPositions(context.Context) ([]execution.Position, error) {
+	return nil, nil
+}
+func (*definitiveThenFilledExitBroker) GetAccount(context.Context) (execution.AccountInfo, error) {
+	return execution.AccountInfo{}, nil
+}
+func (*definitiveThenFilledExitBroker) ReplaceStopOrder(context.Context, string, float64) (execution.OrderResult, error) {
+	return execution.OrderResult{}, errors.New("unused")
+}
 
 func insertSellSignal(t *testing.T, ticker string) string {
 	t.Helper()
@@ -239,5 +272,61 @@ func TestSellExit_OrderErrorKeepsClaimForRecovery(t *testing.T) {
 	}
 	if got := signalStatus(t, sigID); got != "blocked" {
 		t.Fatalf("signal status = %s, want blocked", got)
+	}
+}
+
+func TestSellExit_DefinitiveCoordinatorRejectionRotatesOnNextAttemptAndCloses(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	ticker := fmt.Sprintf("SLDR_%d", time.Now().UnixNano())
+	tradeID, err := store.InsertTrade(ctx, store.Trade{Ticker: ticker, Direction: "long", Strategy: "momentum", EntryPrice: 100, Quantity: 3, Status: "open"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := &definitiveThenFilledExitBroker{err: &execution.BrokerRequestError{StatusCode: 422, Message: "market exit rejected"}}
+	e := newBracketTestEngine(stockorders.New(broker))
+	sigID := insertSellSignal(t, ticker)
+	e.executeSellExit(ctx, sigID, store.Signal{ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 119, Confidence: 0.7})
+	if len(broker.posts) != 1 {
+		t.Fatalf("fresh definitive rejection submitted %d orders in one attempt, want one", len(broker.posts))
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "open" || trade.Quantity != 3 {
+		t.Fatalf("fresh definitive rejection trade=%#v err=%v, want released open position", trade, err)
+	}
+	if got := signalStatus(t, sigID); got != "blocked" {
+		t.Fatalf("first-attempt signal status=%q, want blocked", got)
+	}
+
+	// The next engine attempt reuses the semantic key, observes the durable
+	// terminal generation without reaching the broker, and submits exactly one
+	// successor. Persistent broker restrictions are therefore paced across
+	// ticks instead of producing multiple fresh orders in one tick.
+	e.executeSellExit(ctx, sigID, store.Signal{ID: sigID, Ticker: ticker, Action: "SELL", SignalPrice: 119, Confidence: 0.7})
+
+	if len(broker.posts) != 2 || broker.posts[0].ClientOrderID == broker.posts[1].ClientOrderID {
+		t.Fatalf("definitive rejection did not advance client generation: %+v", broker.posts)
+	}
+	baseKey := "analyst-exit:" + sigID + ":" + ticker
+	base, err := store.GetStockOrderIntentByKey(ctx, baseKey)
+	if err != nil || base == nil || base.Status != "rejected" || base.BrokerOrderID != "" {
+		t.Fatalf("rejected base intent=%#v err=%v", base, err)
+	}
+	_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, baseKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry, err := store.GetStockOrderIntentByKey(ctx, retryKey)
+	if err != nil || retry == nil || retry.Status != "filled" || retry.BrokerOrderID != "accepted-retry-exit" {
+		t.Fatalf("accepted retry intent=%#v err=%v", retry, err)
+	}
+	trade, err = store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "closed" || trade.Quantity != 3 {
+		t.Fatalf("retried definitive analyst exit trade=%#v err=%v", trade, err)
+	}
+	if got := signalStatus(t, sigID); got != "executed" {
+		t.Fatalf("signal status=%q, want executed", got)
 	}
 }

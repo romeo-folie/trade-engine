@@ -3,9 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -55,6 +58,10 @@ type Trade struct {
 	// used by the trailing-stop manager (#322). 0 when the manager has not
 	// yet observed the trade (column is NULL in DB).
 	HighWaterMark float64
+	// StockIntentID ties a standard-stock trade to the immutable broker intent
+	// that caused it. It makes crash recovery upsert one trade, not infer one
+	// from a ticker.
+	StockIntentID string
 }
 
 // InsertTrade creates a new open trade record and returns its UUID.
@@ -78,6 +85,55 @@ func InsertTrade(ctx context.Context, t Trade) (string, error) {
 		entrySetup, nullableString(t.EntrySetupEvidence),
 	).Scan(&id)
 	return id, err
+}
+
+// InsertTradeForStockIntent creates (or returns) the one trade projected from
+// a durable standard-stock entry intent. The unique partial index makes a
+// recovery replay safe even if the process crashed after this insert.
+func InsertTradeForStockIntent(ctx context.Context, t Trade) (string, error) {
+	id, _, err := EnsureTradeForStockIntent(ctx, t)
+	return id, err
+}
+
+// EnsureTradeForStockIntent reports whether this call created the durable
+// trade projection. Recovery uses that fact for process-local effects: an
+// existing trade can outlive a transient failure to attach the intent's
+// convenience trade_id link and must not emit TradeExecuted a second time.
+func EnsureTradeForStockIntent(ctx context.Context, t Trade) (id string, created bool, err error) {
+	if t.StockIntentID == "" {
+		id, err := InsertTrade(ctx, t)
+		return id, err == nil, err
+	}
+	entrySetup := t.EntrySetup
+	if entrySetup == "" {
+		entrySetup = EntrySetupStandard
+	}
+	err = GetDB().QueryRow(ctx, `
+		INSERT INTO trades (
+			signal_id, ticker, direction, strategy,
+			entry_price, quantity, stop_loss, take_profit,
+			status, model_provider, model_name, entry_setup, entry_setup_evidence,
+			stock_intent_id
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'open',$9,$10,$11,$12,$13::uuid)
+		ON CONFLICT (stock_intent_id) WHERE stock_intent_id IS NOT NULL
+		DO NOTHING
+		RETURNING id`,
+		nullableString(t.SignalID), t.Ticker, t.Direction, t.Strategy,
+		t.EntryPrice, t.Quantity,
+		nullableFloat(t.StopLoss), nullableFloat(t.TakeProfit),
+		nullableString(t.ModelProvider), nullableString(t.ModelName),
+		entrySetup, nullableString(t.EntrySetupEvidence), t.StockIntentID,
+	).Scan(&id)
+	if err == nil {
+		return id, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return "", false, err
+	}
+	err = GetDB().QueryRow(ctx,
+		`SELECT id FROM trades WHERE stock_intent_id=$1::uuid`, t.StockIntentID,
+	).Scan(&id)
+	return id, false, err
 }
 
 // CancelUnfilledTrade marks an open, zero-quantity trade row cancelled — the
@@ -388,9 +444,10 @@ func LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*Order, e
 // row and preserves any fill returned with the broker replacement. A terminal
 // order may be purged before the next sweep, so its execution truth must be
 // durable in the same write as its new broker id. If a concurrent reconciler
-// applied a fill while the broker replacement was in flight, adopt the live
-// replacement using the freshly locked trade remainder instead of rejecting
-// the write and leaving the position without durable stop coverage.
+// applied an exit fill while the broker replacement was in flight, shrink the
+// projection to the freshly locked trade remainder instead of rejecting the
+// live replacement. A concurrent entry fill does not enlarge the broker order,
+// so its submitted quantity remains unchanged and the entry poll can resize it.
 func UpdateOrderStopReplacement(
 	ctx context.Context,
 	orderID, expectedBrokerOrderID, newBrokerOrderID string,
@@ -405,6 +462,62 @@ func UpdateOrderStopReplacement(
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
+	if err := updateOrderStopReplacementTx(ctx, tx, orderID, expectedBrokerOrderID, newBrokerOrderID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// UpdateOrderStopReplacementAndSupersede makes a fallback cancel/resubmit
+// durable in one transaction: the mutable stop row advances to the broker's
+// new id and replacement intent while its predecessor becomes non-replayable.
+// A crash therefore cannot leave the new broker id linked to the old intent.
+func UpdateOrderStopReplacementAndSupersede(
+	ctx context.Context,
+	orderID, expectedBrokerOrderID, newBrokerOrderID, replacementIntentID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent ExitIntent,
+) error {
+	tx, err := GetDB().Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	var predecessorIntentID string
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(stock_intent_id::text,'') FROM orders WHERE id=$1 FOR UPDATE`, orderID).Scan(&predecessorIntentID); err != nil {
+		return err
+	}
+	if err := updateOrderStopReplacementTx(ctx, tx, orderID, expectedBrokerOrderID, newBrokerOrderID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE orders SET stock_intent_id=$2::uuid, updated_at=NOW() WHERE id=$1`, orderID, replacementIntentID); err != nil {
+		return err
+	}
+	if predecessorIntentID != "" && predecessorIntentID != replacementIntentID {
+		if _, err := tx.Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded', updated_at=NOW() WHERE id=$1::uuid AND purpose='submit'`, predecessorIntentID); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func updateOrderStopReplacementTx(
+	ctx context.Context,
+	tx pgx.Tx,
+	orderID, expectedBrokerOrderID, newBrokerOrderID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string,
+	filledPrice, filledQty float64,
+	filledAt time.Time,
+	intent ExitIntent,
+) error {
 	var actualBrokerOrderID string
 	var actualFilledQty, actualTradeQuantity float64
 	if err := tx.QueryRow(ctx, `
@@ -425,12 +538,17 @@ func UpdateOrderStopReplacement(
 		if actualTradeQuantity <= 1e-9 {
 			return fmt.Errorf("%w: trade for stop row %s has no remaining position after concurrent fill", ErrOrderBrokerIDChanged, orderID)
 		}
-		// Replacing a partially-filled broker order preserves its unfilled
-		// remainder. Mirror that remainder here; the old order's applied fill
-		// is already represented in the trade's cumulative realization fields.
-		newQuantity = actualTradeQuantity
+		// A concurrent exit fill can shrink the position while a price-only
+		// broker replacement is in flight. Adopt that smaller remainder because
+		// the predecessor cannot protect more shares than are still held. A
+		// concurrent entry fill can also grow the trade, but it does not enlarge
+		// the broker replacement; retaining its actual submitted quantity lets
+		// the entry fill poll detect and perform the required resize.
+		if actualTradeQuantity < expectedTradeQuantity-1e-9 {
+			newQuantity = math.Min(newQuantity, actualTradeQuantity)
+		}
 	}
-	if _, err = tx.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		UPDATE orders
 		SET stop_price = $1,
 		    broker_order_id = COALESCE(NULLIF($2, ''), broker_order_id),
@@ -449,7 +567,7 @@ func UpdateOrderStopReplacement(
 		nullableRawJSON(intent.Evidence), orderID); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func CloseTrade(ctx context.Context, id string, exitPrice, pnl, pnlPct float64) error {
@@ -663,6 +781,8 @@ type PendingExitOrder struct {
 	BrokerOrderID     string
 	Ticker            string
 	OrderStatus       string // broker order status last durably recorded in the DB
+	ParentOrderID     string // non-empty for a broker-resident bracket child
+	OrderType         string // market | limit | stop
 	TradeID           string
 	Direction         string // long | short
 	EntryPrice        float64
@@ -795,6 +915,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 		  LIMIT $1
 		)
 		SELECT o.id, o.broker_order_id, o.ticker, o.status,
+		       COALESCE(o.parent_order_id,''), o.order_type,
 		       t.id, t.direction, t.entry_price, t.quantity,
 		       o.quantity, COALESCE(o.limit_price,0),
 		       COALESCE(o.stop_price,0), COALESCE(o.filled_qty,0),
@@ -837,6 +958,7 @@ func GetPendingExitOrders(ctx context.Context, limit int) ([]PendingExitOrder, e
 	for rows.Next() {
 		var p PendingExitOrder
 		if err := rows.Scan(&p.OrderID, &p.BrokerOrderID, &p.Ticker, &p.OrderStatus,
+			&p.ParentOrderID, &p.OrderType,
 			&p.TradeID, &p.Direction, &p.EntryPrice, &p.Quantity,
 			&p.OrderQuantity, &p.LimitPrice, &p.StopPrice,
 			&p.RecordedFill, &p.RecordedPrice, &p.RecordedFilledAt,
@@ -895,6 +1017,35 @@ func GetOwnedPositionTrades(ctx context.Context) ([]Trade, error) {
 		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
 		FROM trades WHERE status IN ('open','exiting')
 		ORDER BY opened_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanTrades(rows)
+}
+
+// GetExitingTradesForSellSignal returns exactly the lots claimed by an
+// aggregate analyst SELL before its durable broker order was projected. The
+// signal id is stored in the claim evidence before submission, which makes
+// recovery precise even when another exit for the same ticker is in flight.
+func GetExitingTradesForSellSignal(ctx context.Context, ticker, signalID string) ([]Trade, error) {
+	rows, err := GetDB().Query(ctx, `
+		SELECT id, COALESCE(signal_id::text,''), ticker, direction, strategy,
+		       entry_price, COALESCE(exit_price,0),
+		       quantity, COALESCE(stop_loss,0), COALESCE(take_profit,0),
+		       COALESCE(pnl,0), COALESCE(pnl_pct,0), status,
+		       COALESCE(model_provider,''), COALESCE(model_name,''),
+		       entry_setup, COALESCE(entry_setup_evidence,''),
+		       opened_at, COALESCE(closed_at, opened_at), created_at,
+		       COALESCE(high_water_mark,0), exit_claimed_at,
+		       COALESCE(exit_reason,''), exit_evidence, exit_filled_at
+		FROM trades
+		WHERE status='exiting'
+		  AND ticker=$1
+		  AND direction='long'
+		  AND exit_reason=$2
+		  AND exit_evidence->>'signal_id'=$3
+		ORDER BY exit_claimed_at, id`, ticker, ExitReasonSellSignal, signalID)
 	if err != nil {
 		return nil, err
 	}

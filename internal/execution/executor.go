@@ -4,7 +4,10 @@ package execution
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -15,6 +18,69 @@ import (
 // terminal state (the order is effectively gone) rather than as an
 // uncertain status that blocks resubmission.
 var ErrOrderNotFound = errors.New("execution: order not found at broker")
+
+// ErrAmbiguousStopReplacement means a replace request may have succeeded but
+// the broker did not make its client-id lookup visible before the exact replay
+// found the predecessor gone. Callers must retain the old protection lineage
+// and let durable recovery resolve it; cancel+resubmit here could create a
+// second live stop.
+var ErrAmbiguousStopReplacement = errors.New("execution: ambiguous stop replacement")
+
+// ErrTerminalZeroFillPlacement means an existing client order id is known by
+// the broker to be cancelled or rejected without a fill. It cannot satisfy a
+// fresh protective/entry request; callers may deliberately rotate to a new
+// deterministic generation after confirming that terminal state.
+var ErrTerminalZeroFillPlacement = errors.New("execution: terminal zero-fill placement")
+
+// ErrFreshTerminalZeroFillPlacement marks a broker-confirmed rejection from
+// the submission attempted in this call. It also wraps
+// ErrTerminalZeroFillPlacement, but callers use this marker to pace retry
+// generation rotation across scheduling ticks instead of sending a second
+// fresh order immediately.
+var ErrFreshTerminalZeroFillPlacement = errors.New("execution: fresh terminal zero-fill placement")
+
+// BrokerRequestError preserves an adapter's definitive HTTP response. It lets
+// durable callers distinguish a broker-declared rejection from a transport or
+// 5xx ambiguity that must be looked up/replayed safely.
+type BrokerRequestError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *BrokerRequestError) Error() string {
+	return fmt.Sprintf("broker request failed with HTTP %d: %s", e.StatusCode, e.Message)
+}
+
+// IsDefinitiveOrderRejection reports broker responses that conclusively mean
+// no order was accepted. 408/409/429 are deliberately excluded because they
+// can be retried or race broker state; transport and 5xx errors are ambiguous.
+func IsDefinitiveOrderRejection(err error) bool {
+	var requestErr *BrokerRequestError
+	if !errors.As(err, &requestErr) {
+		return false
+	}
+	return requestErr.StatusCode >= 400 && requestErr.StatusCode < 500 &&
+		requestErr.StatusCode != 408 && requestErr.StatusCode != 409 && requestErr.StatusCode != 429
+}
+
+// IsDuplicateClientOrderError is ambiguous: Alpaca can reject a replay before
+// its prior accepted order has become visible to client-id lookup.
+func IsDuplicateClientOrderError(err error) bool {
+	var requestErr *BrokerRequestError
+	if !errors.As(err, &requestErr) || requestErr.StatusCode != 422 {
+		return false
+	}
+	message := strings.ToLower(requestErr.Message)
+	hasClientOrderID := strings.Contains(message, "client_order_id") ||
+		strings.Contains(message, "client order id") ||
+		strings.Contains(message, "client order")
+	if !hasClientOrderID {
+		return false
+	}
+	return strings.Contains(message, "duplicate") ||
+		strings.Contains(message, "already exists") ||
+		strings.Contains(message, "must be unique")
+}
 
 // OrderSide identifies the direction of an order.
 type OrderSide string
@@ -84,6 +150,25 @@ type OrderRequest struct {
 	// The broker adapter uses Option.OCCSymbol as the order's symbol and
 	// Quantity as the number of contracts.
 	Option *OptionContract
+	// ClientOrderID is Alpaca's caller-supplied idempotency key. The durable
+	// stock-order coordinator assigns it before a broker request.
+	ClientOrderID string
+	IntentKey     string // stable engine operation key; never serialized to Alpaca
+	// ReplacesBrokerOrderID marks a durable stop-replacement intent. It is
+	// coordinator metadata, never part of an Alpaca order payload.
+	ReplacesBrokerOrderID string
+	// Entry policy is durable coordinator metadata. Alpaca ignores these fields;
+	// they let recovery reproduce the trade's exit semantics after a broker
+	// acceptance before engine projection.
+	PolicyStopLoss     float64
+	PolicyTakeProfit   float64
+	UncappedTakeProfit bool
+	// ExitReason and ExitEvidence are durable stock-order metadata for
+	// standalone protective stops. Broker adapters ignore them; the coordinator
+	// persists them in the immutable request so recovery retains the policy
+	// provenance that created the stop (for example trailing_atr vs stop_loss).
+	ExitReason   string
+	ExitEvidence json.RawMessage
 }
 
 // OrderResult is the immediate response from the broker.
@@ -96,6 +181,13 @@ type OrderResult struct {
 	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
 	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
 	ChildOrderIDs []string
+	RequestID     string // Alpaca X-Request-ID, for audit/support correlation
+}
+
+// ClientOrderLookup is the optional broker capability used after an ambiguous
+// submit. It identifies engine-owned activity without ticker/side inference.
+type ClientOrderLookup interface {
+	GetOrderByClientID(ctx context.Context, clientOrderID string) (OrderResult, error)
 }
 
 // WorkingOrder is a live (unfilled / still-working) order at the broker.
@@ -149,7 +241,7 @@ func NormalizeOrderStatus(status string) string {
 		return "filled"
 	case "partially_filled":
 		return "partial"
-	case "cancelled", "canceled":
+	case "cancelled", "canceled", "done_for_day":
 		return "cancelled"
 	case "rejected", "expired":
 		return "rejected"
@@ -157,6 +249,18 @@ func NormalizeOrderStatus(status string) string {
 		// pending_new, accepted, accepted_for_bidding, held, new, etc.
 		return "pending"
 	}
+}
+
+// NormalizeOrderStatusForTimeInForce preserves a GTC order through Alpaca's
+// end-of-session done_for_day snapshot. Alpaca can emit that transient state
+// while a GTC protective order remains live for the next session; storing it
+// as cancelled would retire the only broker protection and invite a duplicate
+// replacement. DAY/default orders retain the ordinary terminal mapping.
+func NormalizeOrderStatusForTimeInForce(status, timeInForce string) string {
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
+		return "pending"
+	}
+	return NormalizeOrderStatus(status)
 }
 
 // IsTerminalOrderStatus reports whether a broker order status is final — the
@@ -169,9 +273,17 @@ func IsTerminalOrderStatus(status string) bool {
 	case "filled", "cancelled", "rejected":
 		return true
 	}
-	// done_for_day: no more fills this session; the engine's day-TIF orders
-	// won't resume tomorrow, so treat as terminal for fill polling.
-	return status == "done_for_day"
+	return false
+}
+
+// IsTerminalOrderStatusForTimeInForce is the request-aware counterpart to
+// IsTerminalOrderStatus. Use it for broker order lifecycle projection where
+// the original time-in-force is available.
+func IsTerminalOrderStatusForTimeInForce(status, timeInForce string) bool {
+	if status == "done_for_day" && strings.EqualFold(timeInForce, "gtc") {
+		return false
+	}
+	return IsTerminalOrderStatus(status)
 }
 
 // AccountInfo contains the broker account's cash and portfolio equity.

@@ -18,11 +18,26 @@ var (
 	// supported: callers may retain the pointer returned by GetDB for the
 	// lifetime of the process, so replacing and closing it would invalidate
 	// concurrent users.
-	lifecycleMu sync.Mutex
-	poolMu      sync.RWMutex
-	pool        *pgxpool.Pool
-	poolDSN     string
+	lifecycleMu     sync.Mutex
+	poolMu          sync.RWMutex
+	pool            *pgxpool.Pool
+	poolDSN         string
+	tradeOrderLocks sync.Map // map[trade UUID]*sync.Mutex; protects one local stop lineage
 )
+
+// WithTradeOrderLock serializes protective-stop lifecycle work for one trade.
+// Recovery and the live entry path share this process-wide seam, so neither can
+// observe the other between cancelling an old stop and persisting its successor.
+func WithTradeOrderLock(tradeID string, fn func() error) error {
+	if tradeID == "" {
+		return fn()
+	}
+	value, _ := tradeOrderLocks.LoadOrStore(tradeID, &sync.Mutex{})
+	mu := value.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+	return fn()
+}
 
 // Connect initialises the global connection pool from DATABASE_URL. It is
 // idempotent while connected; changing DATABASE_URL requires an explicit Close

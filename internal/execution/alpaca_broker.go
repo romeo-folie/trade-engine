@@ -4,12 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
+	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/config"
@@ -78,6 +79,9 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		"type":          string(req.Type),
 		"time_in_force": tif,
 	}
+	if req.ClientOrderID != "" {
+		body["client_order_id"] = req.ClientOrderID
+	}
 	// Market orders must not include price fields — Alpaca returns 422 if they are present.
 	if req.Type != OrderTypeMarket {
 		if req.LimitPrice > 0 {
@@ -108,7 +112,8 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 			Type string `json:"type"` // "limit" (take-profit) | "stop" (stop-loss)
 		} `json:"legs"`
 	}
-	if err := b.do(ctx, http.MethodPost, "/v2/orders", body, &resp); err != nil {
+	requestID, err := b.doWithRequestID(ctx, http.MethodPost, "/v2/orders", body, &resp)
+	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: %w", err)
 	}
 
@@ -126,6 +131,7 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		Status:        resp.Status,
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
+		RequestID:     requestID,
 	}
 	result.FilledAt, _ = time.Parse(time.RFC3339, resp.FilledAt)
 	// Bracket child legs, ordered [take-profit, stop-loss] per the
@@ -144,6 +150,52 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 		if tpID != "" && slID != "" {
 			result.ChildOrderIDs = []string{tpID, slID}
 		}
+	}
+	return result, nil
+}
+
+// GetOrderByClientID looks up an order by the immutable client id supplied by
+// the durable order-intent coordinator after an ambiguous submit.
+func (b *AlpacaBroker) GetOrderByClientID(ctx context.Context, clientOrderID string) (OrderResult, error) {
+	var resp struct {
+		ID          string `json:"id"`
+		Status      string `json:"status"`
+		FilledAvgPx string `json:"filled_avg_price"`
+		FilledQty   string `json:"filled_qty"`
+		FilledAt    string `json:"filled_at"`
+		Legs        []struct {
+			ID   string `json:"id"`
+			Type string `json:"type"`
+		} `json:"legs"`
+	}
+	requestID, err := b.doWithRequestID(ctx, http.MethodGet, "/v2/orders:by_client_order_id?nested=true&client_order_id="+url.QueryEscape(clientOrderID), nil, &resp)
+	if err != nil {
+		if isBrokerNotFound(err) {
+			return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: %w", ErrOrderNotFound)
+		}
+		return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: %w", err)
+	}
+	price, err := parseFloat(resp.FilledAvgPx)
+	if err != nil {
+		return OrderResult{}, err
+	}
+	qty, err := parseFloat(resp.FilledQty)
+	if err != nil {
+		return OrderResult{}, err
+	}
+	filledAt, _ := time.Parse(time.RFC3339, resp.FilledAt)
+	result := OrderResult{BrokerOrderID: resp.ID, Status: resp.Status, FilledPrice: price, FilledQty: qty, FilledAt: filledAt, RequestID: requestID}
+	var tpID, slID string
+	for _, leg := range resp.Legs {
+		switch leg.Type {
+		case "limit":
+			tpID = leg.ID
+		case "stop", "stop_limit":
+			slID = leg.ID
+		}
+	}
+	if tpID != "" && slID != "" {
+		result.ChildOrderIDs = []string{tpID, slID}
 	}
 	return result, nil
 }
@@ -205,8 +257,18 @@ func (b *AlpacaBroker) CancelOrder(ctx context.Context, brokerOrderID string) er
 // trailing-stop manager (#322) to walk the stop up without having to cancel
 // and resubmit. Alpaca returns a fresh order id on success.
 func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID string, newStopPrice float64) (OrderResult, error) {
+	return b.ReplaceStopOrderWithClientID(ctx, brokerOrderID, newStopPrice, "")
+}
+
+// ReplaceStopOrderWithClientID assigns the replacement order its own durable
+// Alpaca client id. The predecessor remains independently reconcilable because
+// Alpaca can fill it while the PATCH is in flight.
+func (b *AlpacaBroker) ReplaceStopOrderWithClientID(ctx context.Context, brokerOrderID string, newStopPrice float64, clientOrderID string) (OrderResult, error) {
 	body := map[string]any{
 		"stop_price": fmt.Sprintf("%.4f", newStopPrice),
+	}
+	if clientOrderID != "" {
+		body["client_order_id"] = clientOrderID
 	}
 	var resp struct {
 		ID          string `json:"id"`
@@ -215,7 +277,8 @@ func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID strin
 		FilledQty   string `json:"filled_qty"`
 		FilledAt    string `json:"filled_at"`
 	}
-	if err := b.do(ctx, http.MethodPatch, "/v2/orders/"+brokerOrderID, body, &resp); err != nil {
+	requestID, err := b.doWithRequestID(ctx, http.MethodPatch, "/v2/orders/"+brokerOrderID, body, &resp)
+	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca ReplaceStopOrder: %w", err)
 	}
 	filledPrice, err := parseFloat(resp.FilledAvgPx)
@@ -233,6 +296,7 @@ func (b *AlpacaBroker) ReplaceStopOrder(ctx context.Context, brokerOrderID strin
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
 		FilledAt:      filledAt,
+		RequestID:     requestID,
 	}, nil
 }
 
@@ -256,7 +320,7 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		// — sniff the 404 prefix to map onto the sentinel. Cleaner than
 		// punching the status code through `do`'s signature for one
 		// caller.
-		if strings.Contains(err.Error(), "→ 404") {
+		if isBrokerNotFound(err) {
 			return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus %s: %w", brokerOrderID, ErrOrderNotFound)
 		}
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: %w", err)
@@ -279,6 +343,11 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 		FilledQty:     filledQty,
 		FilledAt:      filledAt,
 	}, nil
+}
+
+func isBrokerNotFound(err error) bool {
+	var requestErr *BrokerRequestError
+	return errors.As(err, &requestErr) && requestErr.StatusCode == http.StatusNotFound
 }
 
 // GetPositions returns all open positions from Alpaca.
@@ -382,6 +451,10 @@ func (b *AlpacaBroker) do(ctx context.Context, method, path string, body any, ou
 	return b.doURL(ctx, method, b.baseURL+path, body, out)
 }
 
+func (b *AlpacaBroker) doWithRequestID(ctx context.Context, method, path string, body any, out any) (string, error) {
+	return b.doURLWithRequestID(ctx, method, b.baseURL+path, body, out)
+}
+
 // doData issues a request against the market-data host (b.dataURL) — options
 // chain snapshots live there, not on the trading base URL.
 func (b *AlpacaBroker) doData(ctx context.Context, method, path string, body any, out any) error {
@@ -391,18 +464,23 @@ func (b *AlpacaBroker) doData(ctx context.Context, method, path string, body any
 // doURL is the shared HTTP core, parameterized by full URL so trading-host and
 // data-host requests reuse the same auth, error handling, and body decoding.
 func (b *AlpacaBroker) doURL(ctx context.Context, method, url string, body any, out any) error {
+	_, err := b.doURLWithRequestID(ctx, method, url, body, out)
+	return err
+}
+
+func (b *AlpacaBroker) doURLWithRequestID(ctx context.Context, method, url string, body any, out any) (string, error) {
 	var bodyReader io.Reader
 	if body != nil {
 		bs, err := json.Marshal(body)
 		if err != nil {
-			return fmt.Errorf("marshal: %w", err)
+			return "", fmt.Errorf("marshal: %w", err)
 		}
 		bodyReader = bytes.NewReader(bs)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req.Header.Set("APCA-API-KEY-ID", b.apiKey)
 	req.Header.Set("APCA-API-SECRET-KEY", b.secret)
@@ -412,16 +490,16 @@ func (b *AlpacaBroker) doURL(ctx context.Context, method, url string, body any, 
 
 	resp, err := b.httpClient.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
 	respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1 MiB – equity history can exceed 8 KiB
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("alpaca %s %s → %d: %s", method, url, resp.StatusCode, bytes.TrimSpace(respBytes))
+		return resp.Header.Get("X-Request-ID"), &BrokerRequestError{StatusCode: resp.StatusCode, Message: fmt.Sprintf("alpaca %s %s: %s", method, url, bytes.TrimSpace(respBytes))}
 	}
 	if out != nil && len(respBytes) > 0 {
-		return json.Unmarshal(respBytes, out)
+		return resp.Header.Get("X-Request-ID"), json.Unmarshal(respBytes, out)
 	}
-	return nil
+	return resp.Header.Get("X-Request-ID"), nil
 }

@@ -3,6 +3,7 @@ package trailing
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
@@ -26,6 +27,72 @@ type liveStore struct{}
 // LiveStore returns a TradeStore backed by the package-level store helpers.
 // Use in production wiring; unit tests should construct a fake instead.
 func LiveStore() TradeStore { return liveStore{} }
+
+// StockIntentIDForKey is an optional extension consumed only by standard-stock
+// durable execution; non-durable test stores need not implement it.
+func (liveStore) StockIntentIDForKey(ctx context.Context, key string) (string, error) {
+	if !store.IsConnected() {
+		return "", errStoreNotConnected
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, key)
+	if err != nil || intent == nil {
+		return "", err
+	}
+	return intent.ID, nil
+}
+
+// ResolveStockOrderIntentRetryGeneration follows durable terminal stop
+// generations and returns either the already-existing active generation or
+// one fresh deterministic successor key.
+func (liveStore) ResolveStockOrderIntentRetryGeneration(ctx context.Context, key string) (string, error) {
+	if !store.IsConnected() {
+		return "", errStoreNotConnected
+	}
+	_, retryKey, err := store.ResolveStockOrderIntentRetryGeneration(ctx, key)
+	return retryKey, err
+}
+
+// LinkReplacementOrderIntent advances durable intent lineage after the
+// trailing manager, which owns normal replacement projection, repoints the
+// broker order id.
+func (liveStore) LinkReplacementOrderIntent(ctx context.Context, orderID, brokerOrderID string) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	intent, err := store.GetStockOrderIntentByBrokerOrderID(ctx, brokerOrderID)
+	if err != nil {
+		return err
+	}
+	if intent == nil {
+		return fmt.Errorf("replacement intent for broker order %s not found", brokerOrderID)
+	}
+	return store.RepointOrderStockIntentAndSupersede(ctx, orderID, intent.ID)
+}
+
+// UpdateOrderStopReplacementAndLinkIntent commits the fallback replacement's
+// mutable order state and durable intent lineage as one unit.
+func (liveStore) UpdateOrderStopReplacementAndLinkIntent(
+	ctx context.Context,
+	orderID, expectedBrokerOrderID, newBrokerOrderID string,
+	expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity float64,
+	status string, filledPrice, filledQty float64, filledAt time.Time,
+	intent store.ExitIntent,
+) error {
+	if !store.IsConnected() {
+		return errStoreNotConnected
+	}
+	replacement, err := store.GetStockOrderIntentByBrokerOrderID(ctx, newBrokerOrderID)
+	if err != nil {
+		return err
+	}
+	if replacement == nil {
+		return fmt.Errorf("replacement intent for broker order %s not found", newBrokerOrderID)
+	}
+	return store.UpdateOrderStopReplacementAndSupersede(ctx,
+		orderID, expectedBrokerOrderID, newBrokerOrderID, replacement.ID,
+		expectedFilledQty, expectedTradeQuantity, newStopPrice, newQuantity,
+		status, filledPrice, filledQty, filledAt, intent)
+}
 
 func (liveStore) GetOpenTrades(ctx context.Context) ([]store.Trade, error) {
 	if !store.IsConnected() {

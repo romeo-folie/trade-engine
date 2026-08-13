@@ -107,10 +107,35 @@ type fakeStore struct {
 	applied              map[string]float64
 	nextID               int
 	updateReplacementErr error
+	insertErr            error
+	stockIntentIDs       map[string]string
+	stockIntentErr       error
+	stockIntentRetryKeys map[string]string
+	replacementIntentIDs map[string]string
 }
 
 func newFakeStore() *fakeStore {
-	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}}
+	return &fakeStore{trades: map[string]store.Trade{}, orders: map[string]store.Order{}, applied: map[string]float64{}, stockIntentIDs: map[string]string{}, stockIntentRetryKeys: map[string]string{}, replacementIntentIDs: map[string]string{}}
+}
+
+func (f *fakeStore) StockIntentIDForKey(_ context.Context, key string) (string, error) {
+	return f.stockIntentIDs[key], f.stockIntentErr
+}
+
+func (f *fakeStore) ResolveStockOrderIntentRetryGeneration(_ context.Context, key string) (string, error) {
+	if f.stockIntentErr != nil {
+		return "", f.stockIntentErr
+	}
+	return f.stockIntentRetryKeys[key], nil
+}
+
+func (f *fakeStore) LinkReplacementOrderIntent(_ context.Context, orderID, brokerOrderID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o := f.orders[orderID]
+	o.StockIntentID = f.replacementIntentIDs[brokerOrderID]
+	f.orders[orderID] = o
+	return nil
 }
 
 func (f *fakeStore) GetOpenTrades(_ context.Context) ([]store.Trade, error) {
@@ -214,6 +239,9 @@ func (f *fakeStore) ReleaseTradeExitClaim(_ context.Context, id string) error {
 func (f *fakeStore) InsertOrder(_ context.Context, o store.Order) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.insertErr != nil {
+		return "", f.insertErr
+	}
 	f.nextID++
 	id := "order-" + itoa(f.nextID)
 	o.ID = id
@@ -394,6 +422,7 @@ type fakeBroker struct {
 	cancelled      []string
 	supportReplace bool
 	failReplace    bool
+	replaceErr     error
 	nextID         int
 	// failCancel makes CancelOrder return an error — used to exercise the
 	// duplicate-stop safety path (P1: cancel-error must NOT submit a new
@@ -415,6 +444,7 @@ type fakeBroker struct {
 	nextFillPrice float64
 	nextFillQty   float64
 	nextStatus    string // optional override of "pending" on PlaceOrder
+	placeResults  []execution.OrderResult
 	placeErr      error
 }
 
@@ -429,6 +459,15 @@ func (b *fakeBroker) PlaceOrder(_ context.Context, req execution.OrderRequest) (
 	b.placed = append(b.placed, req)
 	if b.placeErr != nil {
 		return execution.OrderResult{}, b.placeErr
+	}
+	if len(b.placeResults) > 0 {
+		res := b.placeResults[0]
+		b.placeResults = b.placeResults[1:]
+		if res.BrokerOrderID == "" {
+			b.nextID++
+			res.BrokerOrderID = "broker-" + itoa(b.nextID)
+		}
+		return res, nil
 	}
 	b.nextID++
 	status := "pending"
@@ -492,9 +531,22 @@ func (b *fakeBroker) GetAccount(_ context.Context) (execution.AccountInfo, error
 // fakeBrokerWithReplace embeds fakeBroker and adds StopOrderReplacer support.
 type fakeBrokerWithReplace struct{ *fakeBroker }
 
+// durableFakeBrokerWithReplace stands in for the coordinator wrapper in
+// manager tests. It makes post-acceptance projections require their intent.
+type durableFakeBrokerWithReplace struct{ fakeBrokerWithReplace }
+
+func (durableFakeBrokerWithReplace) DurableStockOrderIntents() bool { return true }
+
+type durableMarketExitBroker struct{ *fakeBroker }
+
+func (*durableMarketExitBroker) DurableStockOrderIntents() bool { return true }
+
 func (b fakeBrokerWithReplace) ReplaceStopOrder(_ context.Context, brokerOrderID string, newStopPrice float64) (execution.OrderResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.replaceErr != nil {
+		return execution.OrderResult{}, b.replaceErr
+	}
 	if b.failReplace {
 		return execution.OrderResult{}, errors.New("simulated PATCH failure")
 	}
@@ -507,6 +559,31 @@ func (b fakeBrokerWithReplace) ReplaceStopOrder(_ context.Context, brokerOrderID
 		BrokerOrderID: "broker-" + itoa(b.nextID),
 		Status:        "pending",
 	}, nil
+}
+
+func TestManager_AmbiguousReplacementDoesNotFallBack(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 95, Quantity: 10, HighWaterMark: 100,
+	}
+	_, _ = fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "ambiguous-old-stop", Ticker: "AAPL",
+		Side: "sell", OrderType: "stop", Quantity: 10, StopPrice: 95,
+		Status: "pending", IsStopLoss: true,
+	})
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
+	base := &fakeBroker{replaceErr: execution.ErrAmbiguousStopReplacement}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fakeBrokerWithReplace{fakeBroker: base})
+	m.UpdateAll(context.Background())
+
+	if len(base.cancelled) != 0 || len(base.placed) != 0 {
+		t.Fatalf("ambiguous replacement must not fall back: cancelled=%v placed=%v", base.cancelled, base.placed)
+	}
+	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
+	if err != nil || stop == nil || stop.BrokerOrderID != "ambiguous-old-stop" {
+		t.Fatalf("ambiguous replacement mutated live stop: %#v, %v", stop, err)
+	}
 }
 
 func itoa(n int) string {
@@ -656,7 +733,7 @@ func TestManager_EMA9PreCloseIgnoresCurrentPartialDailyBar(t *testing.T) {
 		Close:     50,
 	})
 	fp := &fakePrices{candles: candles}
-	fb := &fakeBroker{}
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{}}
 
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
 	m.now = func() time.Time {
@@ -721,8 +798,9 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	// Fewer than nine completed daily candles makes EMA calculation fail.
 	fp := &fakePrices{candles: dailyCloses(100, 101, 102)}
 	fb := &fakeBroker{}
+	fs.stockIntentIDs[trailingStopIntentKey("t1", nil, 95, 10)] = "durable-stop-intent"
 
-	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
+	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: fb}})
 	m.now = func() time.Time {
 		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
 	}
@@ -736,6 +814,13 @@ func TestManager_EMA9SeedsHardStopBeforeRequiringHistory(t *testing.T) {
 	}
 	if stop := fb.placed[0]; stop.StopPrice != 95 || stop.TimeInForce != "gtc" {
 		t.Fatalf("protective order = %+v, want GTC stop at 95", stop)
+	} else if stop.IntentKey == "" {
+		t.Fatal("protective stop must carry a durable intent key")
+	}
+	for _, order := range fs.orders {
+		if order.StockIntentID != "durable-stop-intent" {
+			t.Fatalf("standalone trailing stop intent link = %q", order.StockIntentID)
+		}
 	}
 }
 
@@ -751,7 +836,12 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 		Status: "pending", IsStopLoss: true,
 	})
 	fp := &fakePrices{candles: dailyCloses(100, 100, 100, 100, 100, 100, 100, 100, 100)}
-	fb := &fakeBroker{}
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{}}
+	// The fallback's newly submitted durable intent is resolved by the live
+	// adapter after the broker returns its generated id. Pin that the mutable
+	// stop row advances to this intent rather than remaining attached to its
+	// cancelled predecessor.
+	fs.replacementIntentIDs["broker-1"] = "resubmitted-durable-intent"
 	m := NewManager(Config{Enabled: true, Rule: RuleEMA9}, fs, fp, fb)
 
 	m.UpdateAll(context.Background())
@@ -762,12 +852,18 @@ func TestManager_EMA9ResizesHardStopWhenTradeQuantityGrows(t *testing.T) {
 	if len(fb.placed) != 1 || fb.placed[0].Quantity != 5 {
 		t.Fatalf("replacement stop = %+v, want quantity 5", fb.placed)
 	}
+	if fb.placed[0].IntentKey == "" {
+		t.Fatal("cancel+resubmit stop must carry a durable intent key")
+	}
 	stop, err := fs.LatestStopLossOrderForTrade(context.Background(), "t1")
 	if err != nil || stop == nil {
 		t.Fatalf("LatestStopLossOrderForTrade: %v (nil=%v)", err, stop == nil)
 	}
 	if stop.Quantity != 5 {
 		t.Fatalf("stored stop quantity = %v, want 5", stop.Quantity)
+	}
+	if stop.StockIntentID != "resubmitted-durable-intent" {
+		t.Fatalf("cancel-resubmit stop intent = %q, want repointed durable intent", stop.StockIntentID)
 	}
 }
 
@@ -978,6 +1074,105 @@ func TestExitAndClosePaperExecutorUsesReferencePrice(t *testing.T) {
 	}
 }
 
+func TestExitAndCloseDurableMarketExitLinksImmediateAndPendingProjections(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status           string
+		filledPrice, qty float64
+		wantOrderStatus  string
+		wantTradeStatus  string
+	}{
+		{"immediate fill", "filled", 91, 2, "filled", "closed"},
+		{"pending", "pending", 0, 0, "pending", "exiting"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeStore()
+			trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, Quantity: 2}
+			fs.trades[trade.ID] = trade
+			base := &fakeBroker{nextStatus: tc.status, nextFillPrice: tc.filledPrice, nextFillQty: tc.qty}
+			exec := durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}}
+			key := "trailing-market-exit:t1:2.00000000"
+			fs.stockIntentIDs[key] = "durable-market-exit"
+			m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, exec)
+			if err := m.exitAndClose(context.Background(), trade, 91, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, false); err != nil {
+				t.Fatal(err)
+			}
+			var order store.Order
+			for _, o := range fs.orders {
+				order = o
+			}
+			if order.StockIntentID != "durable-market-exit" || order.Status != tc.wantOrderStatus {
+				t.Fatalf("durable trailing order = %#v", order)
+			}
+			if got := fs.trades[trade.ID].Status; got != tc.wantTradeStatus {
+				t.Fatalf("trade status=%q, want %q", got, tc.wantTradeStatus)
+			}
+		})
+	}
+}
+
+func TestExitAndCloseDurableIntentLookupFailureWritesNoUnlinkedOrder(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, Quantity: 2}
+	fs.trades[trade.ID] = trade
+	fs.stockIntentErr = errors.New("intent store unavailable")
+	base := &fakeBroker{nextStatus: "filled", nextFillPrice: 91, nextFillQty: 2}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}})
+	if err := m.exitAndClose(context.Background(), trade, 91, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, false); err == nil {
+		t.Fatal("expected durable intent lookup failure")
+	}
+	if len(fs.orders) != 0 {
+		t.Fatalf("lookup failure wrote unlinked market order: %#v", fs.orders)
+	}
+	if got := fs.trades[trade.ID].Status; got != "exiting" {
+		t.Fatalf("accepted exit must retain claim, got status %q", got)
+	}
+}
+
+func TestManager_RollbackCancelledStopRotatesDurableGeneration(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, Quantity: 2, StopLoss: 90}
+	fs.trades[trade.ID] = trade
+	originalKey := trailingStopIntentKey(trade.ID, nil, 95, trade.Quantity)
+	retryKey := trailingStopRetryIntentKey(originalKey, "rollback-cancelled")
+	fs.stockIntentIDs[originalKey] = "cancelled-generation"
+	fs.stockIntentIDs[retryKey] = "active-generation"
+	fs.stockIntentRetryKeys[originalKey] = retryKey
+	fs.insertErr = errors.New("simulated projection write failure")
+	base := &fakeBroker{placeResults: []execution.OrderResult{
+		{BrokerOrderID: "rollback-cancelled", Status: "accepted"},
+		// Next identical tick: coordinator finds the old client id's
+		// confirmed cancellation, then manager must submit retryKey.
+		{BrokerOrderID: "rollback-cancelled", Status: "cancelled"},
+		{BrokerOrderID: "fresh-live-stop", Status: "pending"},
+	}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}})
+	if err := m.submitOrReplaceStop(context.Background(), trade, 95, stopExitIntent(95)); err == nil {
+		t.Fatal("first accepted stop should report projection failure after rollback")
+	}
+	if len(fs.orders) != 0 {
+		t.Fatalf("failed first projection persisted an order: %#v", fs.orders)
+	}
+	fs.insertErr = nil
+	if err := m.submitOrReplaceStop(context.Background(), trade, 95, stopExitIntent(95)); err != nil {
+		t.Fatalf("fresh generation after rollback: %v", err)
+	}
+	if len(base.placed) != 3 {
+		t.Fatalf("placements=%d, want accepted + cancelled lookup + fresh generation", len(base.placed))
+	}
+	if base.placed[1].IntentKey != originalKey || base.placed[2].IntentKey != retryKey {
+		t.Fatalf("retry intent keys = %q then %q; want %q then %q", base.placed[1].IntentKey, base.placed[2].IntentKey, originalKey, retryKey)
+	}
+	if len(fs.orders) != 1 {
+		t.Fatalf("active projections=%d, want one", len(fs.orders))
+	}
+	for _, order := range fs.orders {
+		if order.BrokerOrderID != "fresh-live-stop" || order.StockIntentID != "active-generation" || order.Status != "pending" {
+			t.Fatalf("active stop projection=%#v", order)
+		}
+	}
+}
+
 func TestExitAndCloseRetainsClaimWhenCancelledLegFlattensTrade(t *testing.T) {
 	fs := newFakeStore()
 	trade := store.Trade{
@@ -1046,8 +1241,41 @@ func TestCancelAndConfirmRejectsStopFillRace(t *testing.T) {
 	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "filled"}}
 	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
 
-	if err := m.cancelAndConfirm(context.Background(), "hard-stop"); err == nil {
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop", "gtc"); err == nil {
 		t.Fatal("filled stop must abort cancel-and-resubmit")
+	}
+}
+
+func TestCancelAndConfirmRejectsGTCDoneForDay(t *testing.T) {
+	fb := &fakeBroker{statusOverride: map[string]string{"hard-stop": "done_for_day"}}
+	m := NewManager(Config{Enabled: true}, newFakeStore(), &fakePrices{}, fb)
+
+	if err := m.cancelAndConfirm(context.Background(), "hard-stop", "gtc"); err == nil {
+		t.Fatal("GTC done-for-day stop must not be considered cancelled")
+	}
+}
+
+func TestManager_MarketExitFailsClosedWhenGTCBracketLegReportsDoneForDayAfterCancel(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, StopLoss: 95, Quantity: 5}
+	fs.trades[trade.ID] = trade
+	if _, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: trade.ID, BrokerOrderID: "gtc-bracket-stop", Ticker: trade.Ticker,
+		Side: "sell", OrderType: "stop", Quantity: 5, StopPrice: 95, Status: "pending",
+		IsStopLoss: true, ParentOrderID: "bracket-parent",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fb := &fakeBroker{statusOverride: map[string]string{"gtc-bracket-stop": "done_for_day"}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+	if err := m.exitAndClose(context.Background(), trade, 90, store.ExitIntent{Reason: store.ExitReasonTrailingATR}, true); err == nil {
+		t.Fatal("market exit proceeded while GTC bracket stop remained live")
+	}
+	if len(fb.placed) != 0 {
+		t.Fatalf("market exit submitted despite live GTC bracket stop: %+v", fb.placed)
+	}
+	if got := fs.trades[trade.ID].Status; got != "open" {
+		t.Fatalf("trade status=%q, want open after an unconfirmed cancellation", got)
 	}
 }
 
@@ -1106,7 +1334,9 @@ func TestManager_EMA9IgnoresClosePredatingTrade(t *testing.T) {
 		return time.Date(2026, time.July, 24, 10, 0, 0, 0, newYorkLocation)
 	}
 
-	m.UpdateAll(context.Background())
+	for attempt := 0; attempt < 3 && len(fb.placed) < 3; attempt++ {
+		m.UpdateAll(context.Background())
+	}
 	if fs.trades["t1"].Status != "open" {
 		t.Fatal("pre-entry EMA close must not churn the new trade")
 	}
@@ -1289,11 +1519,13 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 		StopPrice:     95,
 		Status:        "pending",
 		IsStopLoss:    true,
+		StockIntentID: "predecessor-intent",
 	})
 
 	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(108, 110, 107, 110))}
 	base := &fakeBroker{}
-	fb := fakeBrokerWithReplace{fakeBroker: base}
+	fs.replacementIntentIDs["broker-1"] = "replacement-intent"
+	fb := durableFakeBrokerWithReplace{fakeBrokerWithReplace{fakeBroker: base}}
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 1.5}, fs, fp, fb)
 	m.UpdateAll(context.Background())
@@ -1313,6 +1545,9 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 			t.Fatalf("orders row not repointed to new broker id: %+v", o)
 		}
 		if o.TradeID == "t1" {
+			if o.StockIntentID != "replacement-intent" {
+				t.Fatalf("replacement intent link = %q", o.StockIntentID)
+			}
 			if o.ExitReason != store.ExitReasonTrailingATR {
 				t.Fatalf("replacement exit reason = %q, want trailing_atr", o.ExitReason)
 			}
@@ -1320,6 +1555,36 @@ func TestManager_ReplacesViaPATCH(t *testing.T) {
 			if err := json.Unmarshal(o.ExitEvidence, &evidence); err != nil || evidence["trailing_stop"] == nil {
 				t.Fatalf("replacement evidence = %s, err=%v", o.ExitEvidence, err)
 			}
+		}
+	}
+}
+
+func TestManager_PersistStopReplacementSkipsIntentLinkForLegacyExecutor(t *testing.T) {
+	fs := newFakeStore()
+	orderID, err := fs.InsertOrder(context.Background(), store.Order{
+		TradeID: "t1", BrokerOrderID: "broker-pre", Ticker: "AAPL", Side: "sell",
+		OrderType: "stop", Quantity: 10, StopPrice: 95, Status: "pending", IsStopLoss: true,
+		StockIntentID: "legacy-predecessor",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.replacementIntentIDs["broker-new"] = "must-not-be-linked"
+	m := NewManager(Config{}, fs, &fakePrices{}, &fakeBroker{})
+	if err := m.persistStopReplacement(context.Background(), &store.Order{
+		ID: orderID, BrokerOrderID: "broker-pre", Quantity: 10,
+	}, "broker-new", 10, 98, 10, "pending", 0, 0, time.Time{}, store.ExitIntent{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range fs.orders {
+		if order.ID != orderID {
+			continue
+		}
+		if order.BrokerOrderID != "broker-new" {
+			t.Fatalf("legacy replacement broker id=%q, want broker-new", order.BrokerOrderID)
+		}
+		if order.StockIntentID != "legacy-predecessor" {
+			t.Fatalf("legacy replacement linked durable intent %q", order.StockIntentID)
 		}
 	}
 }
@@ -2033,6 +2298,9 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 
 	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
 	m.UpdateAll(context.Background())
+	if len(fb.placed) != 1 || fb.placed[0].IntentKey == "" {
+		t.Fatalf("market exit must carry a durable intent key: %+v", fb.placed)
+	}
 
 	closed := fs.trades["t1"]
 	if closed.Status != "closed" {
@@ -2068,6 +2336,60 @@ func TestManager_MarketExitUsesBrokerFilledPrice(t *testing.T) {
 	}
 	if marketOrder.Quantity != 10 {
 		t.Fatalf("order.quantity: got %v want 10", marketOrder.Quantity)
+	}
+}
+
+func TestManager_MarketExitDefersAfterFreshTerminalGeneration(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	baseKey := "trailing-market-exit:t1:10.00000000"
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeResults: []execution.OrderResult{
+		{BrokerOrderID: "terminal-1", Status: "cancelled"},
+	}}}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("market-exit posts=%d, want one fresh terminal generation", got)
+	}
+	if got := fb.placed[0].IntentKey; got != baseKey {
+		t.Fatalf("market-exit key=%q, want %q", got, baseKey)
+	}
+	if fs.trades["t1"].Status != "open" {
+		t.Fatalf("fresh terminal market exit must release claim, got %q", fs.trades["t1"].Status)
+	}
+	if got := len(fs.orders); got != 0 {
+		t.Fatalf("fresh terminal market exit stored %d orders, want none", got)
+	}
+}
+
+func TestManager_MarketExitDefersAfterFreshDefinitiveRejection(t *testing.T) {
+	fs := newFakeStore()
+	fs.trades["t1"] = store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, StopLoss: 109, Quantity: 10, HighWaterMark: 200,
+	}
+	freshRejection := errors.Join(
+		execution.ErrFreshTerminalZeroFillPlacement,
+		execution.ErrTerminalZeroFillPlacement,
+	)
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeErr: freshRejection}}
+	fp := &fakePrices{candles: makeFlatPriceCandles(100, candle(100, 100.5, 99.5, 100))}
+	m := NewManager(Config{Enabled: true, ATRMultiple: 0.1, MarketOpen: alwaysOpenSession}, fs, fp, fb)
+	m.UpdateAll(context.Background())
+
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("fresh definitive market-exit rejection posted %d orders in one tick, want one", got)
+	}
+	if got := fs.trades["t1"].Status; got != "open" {
+		t.Fatalf("fresh definitive market-exit rejection must release claim, got %q", got)
+	}
+	if got := len(fs.orders); got != 0 {
+		t.Fatalf("fresh definitive market-exit rejection stored %d orders, want none", got)
 	}
 }
 
@@ -2412,7 +2734,7 @@ func TestRollbackUnrecordedStopPersistsBrokerFillTruth(t *testing.T) {
 	}}
 	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
 
-	err := m.rollbackUnrecordedStop(context.Background(), fs.trades["t1"], 95, "broker-rollback", stopExitIntent(95))
+	err := m.rollbackUnrecordedStop(context.Background(), fs.trades["t1"], 95, "broker-rollback", "", stopExitIntent(95))
 	if !errors.Is(err, errStopFilledDuringRollback) {
 		t.Fatalf("rollback error = %v, want fill sentinel", err)
 	}
@@ -2461,6 +2783,28 @@ func TestReplaceStopImmediateFillPersistsBrokerTruth(t *testing.T) {
 	}
 	if fs.trades[trade.ID].Status != "exiting" || fs.trades[trade.ID].ExitReason != store.ExitReasonStopLoss {
 		t.Fatalf("replacement fill claim = %+v", fs.trades[trade.ID])
+	}
+}
+
+func TestSubmitStopFreshDefinitiveRejectionDoesNotFanOut(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
+		EntryPrice: 100, Quantity: 10,
+	}
+	freshRejection := errors.Join(
+		execution.ErrFreshTerminalZeroFillPlacement,
+		execution.ErrTerminalZeroFillPlacement,
+	)
+	fb := &durableMarketExitBroker{fakeBroker: &fakeBroker{placeErr: freshRejection}}
+	m := NewManager(Config{Enabled: true}, fs, &fakePrices{}, fb)
+
+	err := m.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97))
+	if !errors.Is(err, execution.ErrFreshTerminalZeroFillPlacement) {
+		t.Fatalf("stop placement error = %v, want fresh-terminal sentinel", err)
+	}
+	if got := len(fb.placed); got != 1 {
+		t.Fatalf("fresh definitive stop rejection posted %d orders in one tick, want one", got)
 	}
 }
 
@@ -2663,6 +3007,75 @@ func TestTrailArmedRejectsUnusableInputs(t *testing.T) {
 	}
 	if TrailArmed(100, 0, 5) {
 		t.Error("armed with no high-water mark yet")
+	}
+}
+
+func TestSubmitOrReplaceStopSerializesRecoveryLifecycle(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{ID: "recovery-lock-trade", Ticker: "AAPL", Direction: "long", Status: "open", EntryPrice: 100, StopLoss: 95, Quantity: 2}
+	fs.trades[trade.ID] = trade
+	fs.orders["old-stop"] = store.Order{ID: "old-stop", TradeID: trade.ID, BrokerOrderID: "old-stop", Ticker: trade.Ticker, Side: "sell", OrderType: "stop", Quantity: 2, StopPrice: 95, Status: "pending", IsStopLoss: true}
+	broker := &fakeBroker{}
+	manager := NewManager(Config{Enabled: true}, fs, &fakePrices{}, broker)
+
+	enteredRecovery := make(chan struct{})
+	releaseRecovery := make(chan struct{})
+	recoveryDone := make(chan error, 1)
+	go func() {
+		recoveryDone <- store.WithTradeOrderLock(trade.ID, func() error {
+			close(enteredRecovery)
+			<-releaseRecovery
+			return nil
+		})
+	}()
+	<-enteredRecovery
+
+	trailingDone := make(chan error, 1)
+	go func() {
+		trailingDone <- manager.submitOrReplaceStop(context.Background(), trade, 97, stopExitIntent(97))
+	}()
+	// The recovery lifecycle owns the shared lock, so trailing cannot even
+	// read/cancel the old stop before recovery has finished its own
+	// lookup/cancel/submit/persist window.
+	select {
+	case err := <-trailingDone:
+		t.Fatalf("trailing lifecycle entered recovery window: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	broker.mu.Lock()
+	cancels, submissions := len(broker.cancelled), len(broker.placed)
+	broker.mu.Unlock()
+	if cancels != 0 || submissions != 0 {
+		t.Fatalf("trailing mutated broker during recovery window: cancels=%d submissions=%d", cancels, submissions)
+	}
+
+	close(releaseRecovery)
+	if err := <-recoveryDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-trailingDone; err != nil {
+		t.Fatal(err)
+	}
+	broker.mu.Lock()
+	cancels, submissions = len(broker.cancelled), len(broker.placed)
+	broker.mu.Unlock()
+	if cancels != 1 || submissions != 1 {
+		t.Fatalf("serialized trailing lifecycle broker calls: cancels=%d submissions=%d, want 1/1", cancels, submissions)
+	}
+	active, err := fs.LatestStopLossOrderForTrade(context.Background(), trade.ID)
+	if err != nil || active == nil || active.BrokerOrderID != "broker-1" || active.StopPrice != 97 {
+		t.Fatalf("active protective stop=%#v err=%v, want one broker-1 @ 97", active, err)
+	}
+	fs.mu.Lock()
+	var rows int
+	for _, order := range fs.orders {
+		if order.TradeID == trade.ID && order.IsStopLoss && (order.Status == "pending" || order.Status == "partial") {
+			rows++
+		}
+	}
+	fs.mu.Unlock()
+	if rows != 1 {
+		t.Fatalf("active protective rows=%d, want one", rows)
 	}
 }
 

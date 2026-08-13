@@ -1006,6 +1006,38 @@ func TestExitReconcileLeavesWorkingAndUnknownOrders(t *testing.T) {
 	}
 }
 
+func TestExitReconcileDoneForDayRespectsStockExitTimeInForce(t *testing.T) {
+	gtc := store.PendingExitOrder{
+		OrderID: "gtc-stop-row", BrokerOrderID: "gtc-stop", Ticker: "AAPL",
+		TradeID: "gtc-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 3, OrderQuantity: 3, TradeStatus: "exiting",
+		OrderType: "stop", IsStopLoss: true,
+	}
+	day := store.PendingExitOrder{
+		OrderID: "day-stop-row", BrokerOrderID: "day-stop", Ticker: "AAPL",
+		TradeID: "day-trade", Direction: "long", EntryPrice: 100,
+		Quantity: 1.5, OrderQuantity: 1.5, TradeStatus: "exiting",
+		OrderType: "stop", IsStopLoss: true,
+	}
+	db := newFakeExitStore(gtc, day)
+	ex := &fakeExitExecutor{results: map[string]execution.OrderResult{
+		"gtc-stop": {Status: "done_for_day"},
+		"day-stop": {Status: "done_for_day"},
+	}}
+
+	stats := ReconcileExitOrderFills(context.Background(), ex, db, 0)
+
+	if stats.StillPending != 1 || stats.Terminal != 1 || stats.Errors != 0 {
+		t.Fatalf("stats = %+v, want one GTC pending and one DAY terminal", stats)
+	}
+	if _, persisted := db.orderStatus[gtc.OrderID]; persisted {
+		t.Fatalf("GTC done_for_day order persisted as %q, want no terminal update", db.orderStatus[gtc.OrderID])
+	}
+	if got := db.orderStatus[day.OrderID]; got != "cancelled" {
+		t.Fatalf("fractional DAY done_for_day status = %q, want cancelled", got)
+	}
+}
+
 func TestClaimedExitReconcilePersistsWorkingProtectivePartial(t *testing.T) {
 	p := store.PendingExitOrder{
 		OrderID: "partial-stop-row", BrokerOrderID: "partial-stop", Ticker: "AAPL",

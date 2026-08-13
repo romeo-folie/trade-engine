@@ -106,14 +106,19 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 	}
 	totalQty = remainingQty
 
-	result, err := e.executor.PlaceOrder(ctx, execution.OrderRequest{
+	exitReq := execution.OrderRequest{
 		Ticker:         sig.Ticker,
 		Side:           execution.OrderSideSell,
 		Type:           execution.OrderTypeMarket,
 		Quantity:       totalQty,
 		ReferencePrice: sig.SignalPrice, // paper executor fills at this price
-	})
+		IntentKey:      "analyst-exit:" + sigID + ":" + sig.Ticker,
+	}
+	result, intentKey, terminalZero, err := e.placeMarketExitWithTerminalRetries(ctx, exitReq)
 	if err != nil {
+		if terminalZero {
+			releaseClaims()
+		}
 		// Broker POST/response failures are ambiguous: the order may have
 		// been accepted before the transport failed. Keep every claim so
 		// orderless-exit recovery can inspect working orders/positions.
@@ -123,16 +128,22 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 		return
 	}
 
-	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
-		logger.Warn("update signal status", "id", sigID, "err", err)
-	}
-	e.costTracker.RecordTrade()
-
 	if result.FilledPrice == 0 && result.BrokerOrderID != "" {
 		if res, ok := e.pollExitFill(ctx, result.BrokerOrderID); ok {
 			result = res
 		}
 	}
+	stockIntentID, intentErr := stockIntentIDForAcceptedOrder(ctx, e.executor, intentKey)
+	if intentErr != nil {
+		// The claimed lots remain owned while coordinator recovery resolves
+		// the accepted aggregate broker order. Do not insert unlinked rows.
+		logger.Error("accepted analyst exit intent projection unavailable", "ticker", sig.Ticker, "err", intentErr)
+		return
+	}
+	if err := store.UpdateSignalStatus(ctx, sigID, "executed", ""); err != nil {
+		logger.Warn("update signal status", "id", sigID, "err", err)
+	}
+	e.costTracker.RecordTrade()
 
 	status := execution.NormalizeOrderStatus(result.Status)
 	fullFill := status == "filled" && result.FilledPrice > 0 &&
@@ -152,6 +163,7 @@ func (e *Engine) executeSellExit(ctx context.Context, sigID string, sig store.Si
 			Quantity:      lotQuantity,
 			Status:        status,
 			FilledAt:      filledAtPtr(result.FilledAt),
+			StockIntentID: stockIntentID,
 		}
 		if fullFill {
 			exitOrder.FilledPrice = result.FilledPrice

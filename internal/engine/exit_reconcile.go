@@ -148,6 +148,15 @@ func recordedFillTime(t *time.Time) time.Time {
 	return *t
 }
 
+// normalizePendingExitStatus keeps a broker-resident stock exit pending when
+// Alpaca reports its GTC leg as done_for_day between sessions. The persisted
+// order metadata lets this recovery path follow the same policy as submission
+// without changing generic DAY-order normalization (including ORB exits).
+func normalizePendingExitStatus(p store.PendingExitOrder, status string) string {
+	return execution.NormalizeOrderStatusForTimeInForce(status,
+		brokerManagedExitTimeInForce(p.ParentOrderID, p.OrderType, p.IsStopLoss, p.IsTakeProfit, p.OrderQuantity))
+}
+
 // tradePnL computes P&L and P&L% for a trade closed at exitPrice, mirroring
 // the sign convention used by the close paths in monitorPositions and the
 // trailing-stop manager.
@@ -261,7 +270,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 		if err != nil {
 			if errors.Is(err, execution.ErrOrderNotFound) {
 				stats.NotFound++
-				terminalStatus := execution.NormalizeOrderStatus(p.OrderStatus)
+				terminalStatus := normalizePendingExitStatus(p, p.OrderStatus)
 				if terminalStatus != "filled" && terminalStatus != "cancelled" && terminalStatus != "rejected" {
 					// A durable working order that vanished from broker lookup is
 					// unresolved, not proof that it never filled. Startup must retry
@@ -329,7 +338,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 			continue
 		}
 
-		switch execution.NormalizeOrderStatus(res.Status) {
+		switch normalizePendingExitStatus(p, res.Status) {
 		case "filled":
 			fillPrice := res.FilledPrice
 			if fillPrice <= 0 {
@@ -400,7 +409,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 				stats.Confirmed++
 			}
 		case "cancelled", "rejected":
-			terminalStatus := execution.NormalizeOrderStatus(res.Status)
+			terminalStatus := normalizePendingExitStatus(p, res.Status)
 			if !terminalFillSeen[p.BrokerOrderID] {
 				// Broker FilledQty is cumulative for the shared aggregate
 				// order. Subtract allocations already stored on every lot,
@@ -522,7 +531,7 @@ func ReconcileExitOrderFills(ctx context.Context, executor exitReconcileExecutor
 								"trade_id", p.TradeID, "broker_order_id", p.BrokerOrderID)
 						} else {
 							remaining, _, applyErr := applyExitingFill(
-								p, fillPrice, lotFill, execution.NormalizeOrderStatus(res.Status), res.FilledAt,
+								p, fillPrice, lotFill, normalizePendingExitStatus(p, res.Status), res.FilledAt,
 							)
 							if applyErr != nil {
 								stats.Errors++
