@@ -124,6 +124,14 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, children []exe
 		if child.BrokerOrderID == "" {
 			continue
 		}
+		// The nested parent snapshot can report a child fill even after the
+		// child's own endpoint has been purged. Never flatten against the
+		// stale local trade quantity in that case.
+		if child.FilledQty > 1e-9 || execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc") == "filled" {
+			logger.Warn("broker protection: parent reports broker child fill during containment; awaiting reconciliation",
+				"broker_order_id", child.BrokerOrderID, "filled_qty", child.FilledQty)
+			return false
+		}
 		if err := e.executor.CancelOrder(ctx, child.BrokerOrderID); err != nil {
 			logger.Warn("broker protection: cancel broker child before containment",
 				"broker_order_id", child.BrokerOrderID, "err", err)
@@ -331,8 +339,11 @@ func (e *Engine) containRecoveredUnprotectedBracket(ctx context.Context, intentK
 	}
 	status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)
 	if err != nil {
-		e.containUnprotectedBrokerEntryAsync(intent.TradeID, intent.BrokerOrderID, intent.Ticker,
-			"fresh broker protection snapshot is unavailable during recovery")
+		// A transient parent lookup says nothing about an existing bracket's
+		// coverage. Recovery will revisit this durable intent; do not turn an
+		// unknown snapshot into a destructive containment attempt.
+		logger.Warn("broker protection: cannot verify recovered bracket; retaining broker ownership",
+			"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID, "err", err)
 		return
 	}
 	trade, err := store.GetTradeByID(ctx, intent.TradeID)

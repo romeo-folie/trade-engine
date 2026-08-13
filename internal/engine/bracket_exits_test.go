@@ -208,6 +208,74 @@ func TestBrokerStopSnapshotUnknown(t *testing.T) {
 	}
 }
 
+func TestCancelBrokerBracketChildren_RetainsParentReportedFillWhenLookupMisses(t *testing.T) {
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"filled-child": execution.ErrOrderNotFound,
+	}}
+	e := newBracketTestEngine(exec)
+	if e.cancelBrokerBracketChildren(context.Background(), []execution.OrderLeg{{
+		BrokerOrderID: "filled-child", Status: "filled", FilledQty: 1,
+	}}) {
+		t.Fatal("parent-reported child fill must block containment until reconciliation")
+	}
+	if len(exec.cancelled) != 0 {
+		t.Fatalf("cancellations = %v, want none after parent reports a child fill", exec.cancelled)
+	}
+}
+
+func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_UNKNOWN_PARENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:strict-unknown-parent-" + intentID
+	clientOrderID := "strict-unknown-parent-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "STRICT_UNKNOWN_PARENT", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID,
+		TimeInForce: "gtc", RequireBrokerProtection: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "STRICT_UNKNOWN_PARENT", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "strict-unknown-parent", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup strict intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "strict-unknown-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record strict intent: %v", err)
+	}
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"strict-unknown-parent": fmt.Errorf("transient parent status failure"),
+	}}
+	e := newBracketTestEngine(exec)
+	e.cfg.Risk.BracketExitsEnabled = true
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("unknown parent snapshot must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
 func TestReconcileBracket_LegacyTradeWithoutIntentRemainsApplicationManaged(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
