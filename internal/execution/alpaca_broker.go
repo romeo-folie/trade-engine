@@ -217,14 +217,15 @@ func formatAlpacaStockPrice(price float64) string {
 // symbol. Implements WorkingOrdersLister.
 func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, error) {
 	var resp []struct {
-		ID        string `json:"id"`
-		Symbol    string `json:"symbol"`
-		Side      string `json:"side"`
-		Status    string `json:"status"`
-		Qty       string `json:"qty"`
-		FilledQty string `json:"filled_qty"`
-		LimitPx   string `json:"limit_price"`
-		ClientID  string `json:"client_order_id"`
+		ID         string `json:"id"`
+		Symbol     string `json:"symbol"`
+		AssetClass string `json:"asset_class"`
+		Side       string `json:"side"`
+		Status     string `json:"status"`
+		Qty        string `json:"qty"`
+		FilledQty  string `json:"filled_qty"`
+		LimitPx    string `json:"limit_price"`
+		ClientID   string `json:"client_order_id"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/orders?status=open&nested=false&limit=500", nil, &resp); err != nil {
 		return nil, fmt.Errorf("alpaca GetWorkingOrders: %w", err)
@@ -238,6 +239,7 @@ func (b *AlpacaBroker) GetWorkingOrders(ctx context.Context) ([]WorkingOrder, er
 			OrderID:      o.ID,
 			TradeID:      o.ClientID,
 			Ticker:       o.Symbol,
+			AssetClass:   o.AssetClass,
 			Side:         o.Side,
 			Status:       NormalizeOrderStatus(o.Status),
 			RemainingQty: qty - filled,

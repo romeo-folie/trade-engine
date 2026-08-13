@@ -35,6 +35,27 @@ type StockOrderIntent struct {
 	UpdatedAt       time.Time
 }
 
+// ActiveStockEntryReservation is the restart-safe admission projection for a
+// nonterminal entry intent. FilledQty is cumulative broker truth; RemainingQty
+// is only the still-working portion and therefore never double counts a trade
+// created for a partial fill.
+type ActiveStockEntryReservation struct {
+	IntentID       string
+	IdempotencyKey string
+	ClientOrderID  string
+	BrokerOrderID  string
+	TradeID        string
+	Ticker         string
+	Status         string
+	RequestedQty   float64
+	FilledQty      float64
+	RemainingQty   float64
+	ReferencePrice float64
+	BrokerError    string
+	SubmittedAt    *time.Time
+	CreatedAt      time.Time
+}
+
 // maxStockOrderIntentRetryGenerations bounds traversal of terminal stop
 // generations. Each successor key is derived from its immediate predecessor's
 // durable broker id, so a cycle is not expected; the limit still turns corrupt
@@ -162,6 +183,32 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 		return nil, err
 	}
 	return &in, rows.Err()
+}
+
+// HasPreparedStockEntry reports whether a signal owns a pending entry intent
+// that has no recorded broker submission or identity.
+func HasPreparedStockEntry(ctx context.Context, signalID string) (bool, error) {
+	var found bool
+	err := GetDB().QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM stock_order_intents
+			WHERE idempotency_key LIKE 'entry:' || $1 || '%'
+			  AND purpose='submit' AND status='pending'
+			  AND submitted_at IS NULL AND broker_order_id IS NULL
+		)`, signalID).Scan(&found)
+	return found, err
+}
+
+// RetirePreparedStockEntryAfterBrokerMiss releases one never-recorded entry
+// generation. Callers must invoke it only immediately after an exact client-ID
+// lookup returned not found and the owning signal is independently terminal.
+func RetirePreparedStockEntryAfterBrokerMiss(ctx context.Context, intentKey, reason string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE stock_order_intents
+		SET status='rejected', broker_error=$2, last_checked_at=NOW(), updated_at=NOW()
+		WHERE idempotency_key=$1 AND purpose='submit' AND status='pending'
+		  AND submitted_at IS NULL AND broker_order_id IS NULL`, intentKey, reason)
+	return err
 }
 
 func AttachStockOrderIntentTrade(ctx context.Context, clientOrderID, tradeID string) error {
@@ -427,7 +474,7 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
 	                   -- projections but before that final update.
 	                   OR NOT EXISTS (
 	                       SELECT 1 FROM signals signal
-	                       WHERE signal.id::text=substring(stock_order_intents.idempotency_key from 7)
+	                       WHERE signal.id::text=split_part(substring(stock_order_intents.idempotency_key from 7), ':retry:', 1)
 	                         AND signal.status='executed'
 	                   )
 	               ))
@@ -442,7 +489,7 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
                AND broker_order_id IS NOT NULL
                AND NOT EXISTS (
                    SELECT 1 FROM signals signal
-                   WHERE signal.id::text=substring(stock_order_intents.idempotency_key from 7)
+	                   WHERE signal.id::text=split_part(substring(stock_order_intents.idempotency_key from 7), ':retry:', 1)
                      AND signal.status='rejected'
                )
                AND (
@@ -547,43 +594,72 @@ func ListRecoverableStockOrderIntents(ctx context.Context) ([]StockOrderIntent, 
 	return out, rows.Err()
 }
 
-// GetWorkingStockEntryReservations returns accepted-or-ambiguous entries that
-// have not yet been projected to a trade.  They are deliberately represented
-// as in-memory long positions for entry risk checks: a zero-fill market order
-// is not a holding, but it can fill at any time and must consume the same
-// position capacity until broker truth makes it terminal or recovery creates
-// its durable trade projection.
-func GetWorkingStockEntryReservations(ctx context.Context) ([]Trade, error) {
+// ListActiveStockEntryReservations returns every nonterminal standard-stock
+// entry, including prepared/ambiguous intents and partial entries already
+// attached to a trade. The projection is reconstructed directly from durable
+// intents after restart.
+func ListActiveStockEntryReservations(ctx context.Context) ([]ActiveStockEntryReservation, error) {
 	rows, err := GetDB().Query(ctx, `
-		SELECT ticker, side, requested_qty,
-		       COALESCE(NULLIF(request_payload->>'ReferencePrice','')::numeric, 0)
+		SELECT id::text, idempotency_key, client_order_id,
+		       COALESCE(broker_order_id,''), COALESCE(trade_id::text,''),
+		       ticker, status, requested_qty, filled_qty,
+		       GREATEST(requested_qty-filled_qty, 0),
+		       COALESCE(NULLIF(request_payload->>'ReferencePrice','')::numeric, 0),
+		       COALESCE(broker_error,''), submitted_at, created_at
 		FROM stock_order_intents
 		WHERE purpose='submit'
 		  AND idempotency_key LIKE 'entry:%'
-		  AND trade_id IS NULL
+		  AND side='buy'
 		  AND status IN ('pending','partial')
+		  AND requested_qty-filled_qty > 0.000000001
 		ORDER BY created_at`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var reservations []Trade
+	var reservations []ActiveStockEntryReservation
 	for rows.Next() {
-		var ticker, side string
-		var quantity, referencePrice float64
-		if err := rows.Scan(&ticker, &side, &quantity, &referencePrice); err != nil {
+		var reservation ActiveStockEntryReservation
+		if err := rows.Scan(
+			&reservation.IntentID, &reservation.IdempotencyKey,
+			&reservation.ClientOrderID, &reservation.BrokerOrderID,
+			&reservation.TradeID, &reservation.Ticker, &reservation.Status,
+			&reservation.RequestedQty, &reservation.FilledQty,
+			&reservation.RemainingQty, &reservation.ReferencePrice,
+			&reservation.BrokerError, &reservation.SubmittedAt,
+			&reservation.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
-		direction := "long"
-		if side == "sell" {
-			direction = "short"
-		}
-		reservations = append(reservations, Trade{
-			Ticker: ticker, Direction: direction, Quantity: quantity, EntryPrice: referencePrice, Status: "open",
-		})
+		reservations = append(reservations, reservation)
 	}
 	return reservations, rows.Err()
+}
+
+// GetWorkingStockEntryReservations preserves the risk-check adapter while the
+// typed projection above remains the source of reservation truth.
+func GetWorkingStockEntryReservations(ctx context.Context) ([]Trade, error) {
+	active, err := ListActiveStockEntryReservations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	reservations := make([]Trade, 0, len(active))
+	for _, reservation := range active {
+		// Callers of this legacy risk adapter already supply durable owned
+		// trades. An attached partial entry is represented by that trade; only
+		// its remainder belongs in the typed admission ledger above, not as a
+		// second synthetic position row here.
+		if reservation.TradeID != "" {
+			continue
+		}
+		reservations = append(reservations, Trade{
+			Ticker: reservation.Ticker, Direction: "long",
+			Quantity: reservation.RemainingQty, EntryPrice: reservation.ReferencePrice,
+			Status: "open",
+		})
+	}
+	return reservations, nil
 }
 
 func purposeOrSubmit(purpose string) string {

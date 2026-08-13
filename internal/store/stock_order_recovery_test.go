@@ -36,12 +36,16 @@ type recoveryBroker struct {
 }
 
 type recoveryEffectsRecorder struct {
-	entries []string
-	closes  []store.TradeRealization
+	entries  []string
+	closes   []store.TradeRealization
+	prepared []string
 }
 
 func (r *recoveryEffectsRecorder) RecoveredStockEntry(_ context.Context, intentKey string) {
 	r.entries = append(r.entries, intentKey)
+}
+func (r *recoveryEffectsRecorder) PreparedStockEntryNeedsAdmission(_ context.Context, intentKey string) {
+	r.prepared = append(r.prepared, intentKey)
 }
 
 func (r *recoveryEffectsRecorder) RecoveredStockExit(_ context.Context, realized store.TradeRealization) {
@@ -2177,7 +2181,119 @@ func TestStockIntentRecoveryWorkingZeroFillCreatesNoPhantomTrade(t *testing.T) {
 	}
 }
 
-func TestStockIntentRecoveryRetriesAmbiguousEntryWithoutBrokerIdentity(t *testing.T) {
+func TestStockIntentRecoveryNeverSubmitsPreparedEntryWithoutAdmission(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTPREPAREDADMISSION")
+	key := "entry:" + signalID
+	clientID := "te-stock-prepared-admission"
+	req := entryRequest(signalID, "RINTENTPREPAREDADMISSION", 1)
+	req.ClientOrderID = clientID
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: key, ClientOrderID: clientID,
+		Ticker: req.Ticker, Side: "buy", OrderType: "market", RequestedQty: 1,
+		RequestPayload: payload, PayloadHash: "prepared-admission", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "must-not-post", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	effects := &recoveryEffectsRecorder{}
+	coordinator.SetRecoveryObserver(effects)
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.posts != 0 || broker.lookups != 1 {
+		t.Fatalf("generic recovery released prepared entry: posts=%d lookups=%d", broker.posts, broker.lookups)
+	}
+	intent := intentForKey(t, key)
+	if intent.SubmittedAt != nil || intent.BrokerOrderID != "" || intent.Status != "pending" {
+		t.Fatalf("prepared entry changed during generic recovery: %+v", intent)
+	}
+	if len(effects.prepared) != 1 || effects.prepared[0] != key {
+		t.Fatalf("prepared admission callbacks = %v", effects.prepared)
+	}
+	if err := store.QueueSignalForDeferredExecution(ctx, signalID); err != nil {
+		t.Fatal(err)
+	}
+	deferred, err := store.GetDeferredSignals(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued := false
+	for _, signal := range deferred {
+		if signal.ID == signalID {
+			queued = true
+		}
+	}
+	if !queued {
+		t.Fatal("prepared entry signal was not eligible for fresh deferred admission")
+	}
+	for _, status := range []string{"blocked", "stale", "expired", "rejected"} {
+		if err := store.UpdateSignalStatus(ctx, signalID, status, "terminal test decision"); err != nil {
+			t.Fatal(err)
+		}
+		reservations, err := store.ListActiveStockEntryReservations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, reservation := range reservations {
+			if reservation.IntentID == intent.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s signal decision retired an ambiguous prepared reservation", status)
+		}
+	}
+}
+
+func TestStockIntentRecoveryHealsPreparedEntryFoundByClientIDWithoutPosting(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTPREPAREDFOUND")
+	key := "entry:" + signalID
+	clientID := "te-stock-prepared-found"
+	req := entryRequest(signalID, "RINTENTPREPAREDFOUND", 1)
+	req.ClientOrderID = clientID
+	payload, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: key, ClientOrderID: clientID,
+		Ticker: req.Ticker, Side: "buy", OrderType: "market", RequestedQty: 1,
+		RequestPayload: payload, PayloadHash: "prepared-found", Status: "pending",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	broker := newRecoveryBroker(execution.OrderResult{})
+	broker.lookup[clientID] = execution.OrderResult{BrokerOrderID: "found-prepared", Status: "accepted"}
+	if err := stockorders.New(broker).Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if broker.posts != 0 || broker.lookups != 1 {
+		t.Fatalf("prepared recovery posted instead of lookup: posts=%d lookups=%d", broker.posts, broker.lookups)
+	}
+	intent := intentForKey(t, key)
+	if intent.BrokerOrderID != "found-prepared" || intent.SubmittedAt != nil {
+		t.Fatalf("prepared broker truth not healed: %+v", intent)
+	}
+}
+
+func TestStockIntentRecoveryDoesNotReplayAmbiguousEntryWithoutBrokerIdentity(t *testing.T) {
 	ctx := context.Background()
 	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status='rejected', purpose='superseded'`); err != nil {
 		t.Fatal(err)
@@ -2195,12 +2311,12 @@ func TestStockIntentRecoveryRetriesAmbiguousEntryWithoutBrokerIdentity(t *testin
 		t.Fatalf("ambiguous intent=%#v, want submitted without broker identity", in)
 	}
 	broker.postErr = nil
-	if err := coordinator.Recover(ctx); err != nil {
-		t.Fatalf("recovery did not replay unidentified ambiguous entry: %v", err)
+	if err := coordinator.Recover(ctx); err == nil {
+		t.Fatal("recovery accepted unresolved ambiguous entry")
 	}
 	in = intentForKey(t, req.IntentKey)
-	if in.BrokerOrderID != "recovered-entry" || broker.posts != 3 {
-		t.Fatalf("recovered ambiguous intent=%#v posts=%d, want exact third replay", in, broker.posts)
+	if in.BrokerOrderID != "" || broker.posts != 2 {
+		t.Fatalf("recovery replayed ambiguous intent=%#v posts=%d", in, broker.posts)
 	}
 }
 
@@ -2641,6 +2757,49 @@ func TestStockIntentRecoveryPartialFillIsCumulativeAndIdempotent(t *testing.T) {
 	if requested != 10 || filled != 5 || held != 5 {
 		t.Fatalf("requested/filled/held = %.2f/%.2f/%.2f, want 10/5/5", requested, filled, held)
 	}
+	reservations, err := store.ListActiveStockEntryReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, reservation := range reservations {
+		if reservation.IntentID == in.ID {
+			found = true
+			if reservation.TradeID == "" || reservation.RequestedQty != 10 ||
+				reservation.FilledQty != 5 || reservation.RemainingQty != 5 {
+				t.Fatalf("partial reservation = %+v", reservation)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("attached partial entry missing from active reservations")
+	}
+	legacyReservations, err := store.GetWorkingStockEntryReservations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, reservation := range legacyReservations {
+		if reservation.Ticker == req.Ticker {
+			t.Fatalf("attached partial entry double-counted by legacy risk adapter: %+v", reservation)
+		}
+	}
+	for _, terminal := range []string{"cancelled", "rejected"} {
+		if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET status=$2::order_status WHERE id=$1::uuid`, in.ID, terminal); err != nil {
+			t.Fatal(err)
+		}
+		reservations, err = store.ListActiveStockEntryReservations(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, reservation := range reservations {
+			if reservation.IntentID == in.ID {
+				t.Fatalf("%s entry retained active reservation: %+v", terminal, reservation)
+			}
+		}
+	}
+	if _, err := store.GetDB().Exec(ctx, `UPDATE stock_order_intents SET purpose='superseded' WHERE id=$1::uuid`, in.ID); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStockIntentConcurrentSameTickerSignalsAndReplayDeduplicate(t *testing.T) {
@@ -2730,6 +2889,28 @@ func TestStockIntentRecoveryFilledProjectionEligibility(t *testing.T) {
 		}
 	}
 	t.Fatal("partially projected filled entry was not recoverable")
+}
+
+func TestStockIntentRecoveryCompletedEntryRetryIsNotRecoverable(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTDONERETRY")
+	broker := newRecoveryBroker(execution.OrderResult{BrokerOrderID: "done-entry-retry", Status: "accepted"})
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTDONERETRY", 1)
+	req.IntentKey += ":retry:terminal-base"
+	if _, err := coordinator.PlaceOrder(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	intent := intentForKey(t, req.IntentKey)
+	broker.lookup[intent.ClientOrderID] = execution.OrderResult{
+		BrokerOrderID: "done-entry-retry", Status: "filled", FilledPrice: 100, FilledQty: 1,
+	}
+	if err := coordinator.Recover(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if isRecoverableIntent(t, intent.ID) {
+		t.Fatal("completed filled entry retry remained recoverable")
+	}
 }
 
 func TestStockIntentRecoveryDoesNotReemitExistingTradeProjection(t *testing.T) {

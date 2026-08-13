@@ -91,6 +91,17 @@ func UpdateSignalStatus(ctx context.Context, id, status, blockReason string) err
 	return err
 }
 
+// QueueSignalForDeferredExecution makes an approved, pending, or temporarily
+// blocked BUY retryable by the normal fresh engine admission path without
+// changing its strategy data.
+func QueueSignalForDeferredExecution(ctx context.Context, id string) error {
+	_, err := GetDB().Exec(ctx, `
+		UPDATE signals
+		SET status='pending', deferred=TRUE, block_reason=NULL, updated_at=NOW()
+		WHERE id=$1::uuid AND action='BUY' AND status IN ('pending','approved','blocked')`, id)
+	return err
+}
+
 // UpdateSignalPrice updates the signal_price for a signal.
 func UpdateSignalPrice(ctx context.Context, id string, price float64) error {
 	_, err := GetDB().Exec(ctx, `

@@ -123,7 +123,7 @@ func TestConfidenceTiered_MidRR_PassesAtTierFloor(t *testing.T) {
 // rather than a confidence reason that masks the real cause (#317 review).
 func TestConfidenceTiered_BelowMinRR_DefersToRiskRewardCheck(t *testing.T) {
 	in := baseInput()
-	in.Cfg = tieredCfg() // MinRiskReward = 1.4
+	in.Cfg = tieredCfg()  // MinRiskReward = 1.4
 	in.TakeProfit = 105.0 // reward=5, risk=5 → R:R = 1.0 (below MinRiskReward)
 
 	// High confidence is irrelevant — pass either way.
@@ -988,11 +988,11 @@ func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
 	in := baseInput()
 	in.Action = "SELL"
 	in.HoldsLong = true
-	in.OpenPositions = in.Cfg.MaxOpenPositions + 5           // over budget
-	in.OpenByTicker = map[string]int{in.Ticker: 99}          // over per-ticker cap
-	in.DailyPnL = -1e9                                       // daily-loss pause tripped
-	in.PeakValue = in.PortfolioValue * 100                   // drawdown stop tripped
-	in.LastLossAt = time.Now()                               // cooldown active
+	in.OpenPositions = in.Cfg.MaxOpenPositions + 5  // over budget
+	in.OpenByTicker = map[string]int{in.Ticker: 99} // over per-ticker cap
+	in.DailyPnL = -1e9                              // daily-loss pause tripped
+	in.PeakValue = in.PortfolioValue * 100          // drawdown stop tripped
+	in.LastLossAt = time.Now()                      // cooldown active
 
 	for _, check := range []struct {
 		name string
@@ -1008,4 +1008,33 @@ func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
 			t.Fatalf("%s must pass for a SELL exit, failed with: %s", check.name, r.Reason)
 		}
 	}
+}
+
+func TestExactProposedQuantityDrivesReleaseRisk(t *testing.T) {
+	t.Run("exact notional overrides stale size percent", func(t *testing.T) {
+		in := baseInput()
+		in.PortfolioValue = 1_000
+		in.SizePct = 1
+		in.Cfg.MaxPositionPct = 5
+		in.SignalPrice = 100
+		in.ProposedQuantity = 0.6
+		in.ProposedNotional = 60
+		if result := checkPositionSize(in); result.Passed {
+			t.Fatalf("exact 6%% notional passed 5%% cap: %+v", result)
+		}
+	})
+
+	t.Run("post-rounding quantity drives dollar risk", func(t *testing.T) {
+		in := baseInput()
+		in.PortfolioValue = 1_000
+		in.Cash = 1_000
+		in.SizePct = 1 // stale derivation would be only 0.1 shares
+		in.SignalPrice = 100
+		in.StopLoss = 90
+		in.Cfg.MaxDollarRiskPct = 0.5
+		in.ProposedQuantity = 1 // exact risk is $10 = 1%
+		if result := checkMaxDollarRisk(in); result.Passed {
+			t.Fatalf("exact submitted quantity did not drive dollar-risk gate: %+v", result)
+		}
+	})
 }

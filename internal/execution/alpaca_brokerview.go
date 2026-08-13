@@ -2,6 +2,7 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -30,14 +31,17 @@ func (b *AlpacaBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, erro
 		NonMarginableBuyingPower string `json:"non_marginable_buying_power"`
 		Multiplier               string `json:"multiplier"`
 		Currency                 string `json:"currency"`
-		TradingBlocked           bool   `json:"trading_blocked"`
+		TradingBlocked           *bool  `json:"trading_blocked"`
 		TransfersBlocked         bool   `json:"transfers_blocked"`
-		AccountBlocked           bool   `json:"account_blocked"`
-		TradeSuspendedByUser     bool   `json:"trade_suspended_by_user"`
+		AccountBlocked           *bool  `json:"account_blocked"`
+		TradeSuspendedByUser     *bool  `json:"trade_suspended_by_user"`
 		ShortingEnabled          bool   `json:"shorting_enabled"`
 	}
 	if err := b.do(ctx, http.MethodGet, "/v2/account", nil, &resp); err != nil {
 		return BrokerAccount{}, fmt.Errorf("alpaca AccountSnapshot: %w", err)
+	}
+	if resp.TradingBlocked == nil || resp.AccountBlocked == nil || resp.TradeSuspendedByUser == nil {
+		return BrokerAccount{}, fmt.Errorf("alpaca AccountSnapshot: required account restriction fields are missing")
 	}
 
 	equity, err := parseRequiredFiniteAccountFloat("equity", resp.Equity)
@@ -74,24 +78,61 @@ func (b *AlpacaBroker) AccountSnapshot(ctx context.Context) (BrokerAccount, erro
 	}
 
 	return BrokerAccount{
-		AccountID:                resp.ID,
-		AccountNumber:            resp.AccountNumber,
-		Status:                   resp.Status,
-		Equity:                   equity,
-		LastEquity:               lastEquity,
-		Cash:                     cash,
-		BuyingPower:              buyingPower,
-		RegTBuyingPower:          regTBuyingPower,
-		DayTradingBuyingPower:    dayTradingBuyingPower,
-		NonMarginableBuyingPower: nonMarginableBuyingPower,
-		Multiplier:               multiplier,
-		Currency:                 resp.Currency,
-		TradingBlocked:           resp.TradingBlocked,
-		TransfersBlocked:         resp.TransfersBlocked,
-		AccountBlocked:           resp.AccountBlocked,
-		TradeSuspendedByUser:     resp.TradeSuspendedByUser,
-		ShortingEnabled:          resp.ShortingEnabled,
-		FetchedAt:                time.Now().UTC(),
+		AccountID:                         resp.ID,
+		AccountNumber:                     resp.AccountNumber,
+		Status:                            resp.Status,
+		Equity:                            equity,
+		LastEquity:                        lastEquity,
+		Cash:                              cash,
+		BuyingPower:                       buyingPower,
+		RegTBuyingPower:                   regTBuyingPower,
+		DayTradingBuyingPower:             dayTradingBuyingPower,
+		NonMarginableBuyingPower:          nonMarginableBuyingPower,
+		LastEquityAvailable:               strings.TrimSpace(resp.LastEquity) != "",
+		CashAvailable:                     strings.TrimSpace(resp.Cash) != "",
+		BuyingPowerAvailable:              strings.TrimSpace(resp.BuyingPower) != "",
+		RegTBuyingPowerAvailable:          strings.TrimSpace(resp.RegTBuyingPower) != "",
+		DayTradingBuyingPowerAvailable:    strings.TrimSpace(resp.DayTradingBuyingPower) != "",
+		NonMarginableBuyingPowerAvailable: strings.TrimSpace(resp.NonMarginableBuyingPower) != "",
+		Multiplier:                        multiplier,
+		MultiplierAvailable:               strings.TrimSpace(resp.Multiplier) != "",
+		Currency:                          resp.Currency,
+		TradingBlocked:                    *resp.TradingBlocked,
+		TransfersBlocked:                  resp.TransfersBlocked,
+		AccountBlocked:                    *resp.AccountBlocked,
+		TradeSuspendedByUser:              *resp.TradeSuspendedByUser,
+		ShortingEnabled:                   resp.ShortingEnabled,
+		FetchedAt:                         time.Now().UTC(),
+	}, nil
+}
+
+// StockAssetSnapshot fetches exact-symbol trading metadata from Alpaca's
+// trading host. This deliberately avoids a cached universe snapshot at entry
+// admission time.
+func (b *AlpacaBroker) StockAssetSnapshot(ctx context.Context, symbol string) (StockAsset, error) {
+	var resp struct {
+		Symbol       string `json:"symbol"`
+		Status       string `json:"status"`
+		Class        string `json:"class"`
+		Tradable     *bool  `json:"tradable"`
+		Marginable   *bool  `json:"marginable"`
+		Fractionable *bool  `json:"fractionable"`
+	}
+	symbol = strings.ToUpper(strings.TrimSpace(symbol))
+	if symbol == "" {
+		return StockAsset{}, errors.New("alpaca StockAssetSnapshot: symbol is required")
+	}
+	if err := b.do(ctx, http.MethodGet, "/v2/assets/"+url.PathEscape(symbol), nil, &resp); err != nil {
+		return StockAsset{}, fmt.Errorf("alpaca StockAssetSnapshot: %w", err)
+	}
+	if resp.Tradable == nil || resp.Marginable == nil || resp.Fractionable == nil {
+		return StockAsset{}, fmt.Errorf("alpaca StockAssetSnapshot: required asset capability fields are missing")
+	}
+	return StockAsset{
+		Symbol: strings.ToUpper(strings.TrimSpace(resp.Symbol)), Status: resp.Status,
+		AssetClass: resp.Class, Tradable: *resp.Tradable, Marginable: *resp.Marginable,
+		Fractionable: *resp.Fractionable, TradableAvailable: true,
+		MarginableAvailable: true, FractionableAvailable: true, FetchedAt: time.Now().UTC(),
 	}, nil
 }
 

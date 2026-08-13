@@ -16,24 +16,53 @@ var ErrBrokerUnavailable = errors.New("broker view unavailable")
 // does not serialize: it is only displayed by the explicit local preflight
 // command.
 type BrokerAccount struct {
-	AccountID                string    `json:"-"`
-	AccountNumber            string    `json:"-"`
-	Status                   string    `json:"status"`
-	Equity                   float64   `json:"equity"`
-	LastEquity               float64   `json:"last_equity"` // previous trading day close
-	Cash                     float64   `json:"cash"`
-	BuyingPower              float64   `json:"buying_power"`
-	RegTBuyingPower          float64   `json:"regt_buying_power"`
-	DayTradingBuyingPower    float64   `json:"daytrading_buying_power"`
-	NonMarginableBuyingPower float64   `json:"non_marginable_buying_power"`
-	Multiplier               float64   `json:"multiplier"`
-	Currency                 string    `json:"currency"`
-	TradingBlocked           bool      `json:"trading_blocked"`
-	TransfersBlocked         bool      `json:"transfers_blocked"`
-	AccountBlocked           bool      `json:"account_blocked"`
-	TradeSuspendedByUser     bool      `json:"trade_suspended_by_user"`
-	ShortingEnabled          bool      `json:"shorting_enabled"`
-	FetchedAt                time.Time `json:"fetched_at"`
+	AccountID                         string    `json:"-"`
+	AccountNumber                     string    `json:"-"`
+	Status                            string    `json:"status"`
+	Equity                            float64   `json:"equity"`
+	LastEquity                        float64   `json:"last_equity"` // previous trading day close
+	Cash                              float64   `json:"cash"`
+	BuyingPower                       float64   `json:"buying_power"`
+	RegTBuyingPower                   float64   `json:"regt_buying_power"`
+	DayTradingBuyingPower             float64   `json:"daytrading_buying_power"`
+	NonMarginableBuyingPower          float64   `json:"non_marginable_buying_power"`
+	LastEquityAvailable               bool      `json:"-"`
+	CashAvailable                     bool      `json:"-"`
+	BuyingPowerAvailable              bool      `json:"-"`
+	RegTBuyingPowerAvailable          bool      `json:"-"`
+	DayTradingBuyingPowerAvailable    bool      `json:"-"`
+	NonMarginableBuyingPowerAvailable bool      `json:"-"`
+	Multiplier                        float64   `json:"multiplier"`
+	MultiplierAvailable               bool      `json:"-"`
+	Currency                          string    `json:"currency"`
+	TradingBlocked                    bool      `json:"trading_blocked"`
+	TransfersBlocked                  bool      `json:"transfers_blocked"`
+	AccountBlocked                    bool      `json:"account_blocked"`
+	TradeSuspendedByUser              bool      `json:"trade_suspended_by_user"`
+	ShortingEnabled                   bool      `json:"shorting_enabled"`
+	FetchedAt                         time.Time `json:"fetched_at"`
+}
+
+// StockAsset is the broker's admission-grade metadata for one equity symbol.
+// Entry sizing uses it to select the applicable buying-power field and the
+// exact quantity precision accepted by the broker.
+type StockAsset struct {
+	Symbol                string
+	Status                string
+	AssetClass            string
+	Tradable              bool
+	Marginable            bool
+	Fractionable          bool
+	TradableAvailable     bool
+	MarginableAvailable   bool
+	FractionableAvailable bool
+	FetchedAt             time.Time
+}
+
+// StockAssetProvider is the optional read-only capability used immediately
+// before a standard-stock BUY is released.
+type StockAssetProvider interface {
+	StockAssetSnapshot(ctx context.Context, symbol string) (StockAsset, error)
 }
 
 // BrokerPosition is the canonical broker-side open position.
