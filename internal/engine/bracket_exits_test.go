@@ -371,6 +371,54 @@ func TestCancelLegacyBrokerHeldEntry_GTCDoneForDayRemainsWorking(t *testing.T) {
 	}
 }
 
+func TestCancelLegacyBrokerHeldEntry_PurgedParentRemainsRecoverable(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:purged-legacy-" + intentID
+	clientOrderID := "purged-legacy-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "PURGEDLEGACY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, Ticker: "PURGEDLEGACY",
+		Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "purged-legacy", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "purged-legacy-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatalf("record accepted legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"purged-legacy-parent": execution.ErrOrderNotFound,
+	}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intent.IdempotencyKey)
+	if got := len(exec.cancelled); got != 3 {
+		t.Fatalf("cancellation attempts = %d, want 3 while fill remains unknown", got)
+	}
+	updated, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+	if err != nil || updated == nil || updated.Status != "pending" {
+		t.Fatalf("purged legacy intent = %+v err=%v, want pending for recovery", updated, err)
+	}
+}
+
 func TestReconcileBracket_UnknownStrictStopSnapshotRetriesWithoutContainment(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

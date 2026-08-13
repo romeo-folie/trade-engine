@@ -201,9 +201,15 @@ func (e *Engine) cancelLegacyBrokerHeldEntry(ctx context.Context, intentKey stri
 		}
 		status, err := e.executor.GetOrderStatus(ctx, intent.BrokerOrderID)
 		if errors.Is(err, execution.ErrOrderNotFound) {
-			terminal = execution.OrderResult{BrokerOrderID: intent.BrokerOrderID, Status: "cancelled"}
-			confirmed = true
-			break
+			// A purged parent may have filled during the cancellation race. Unlike
+			// an exit sibling, this entry's fill cannot be inferred from a local
+			// trade or order row, so a 404 is not proof of a zero-fill cancel.
+			// Keep the durable reservation for recovery rather than losing an
+			// unprojected, now-unprotected position.
+			logger.Warn("broker protection: legacy entry lookup purged before fill confirmation",
+				"intent_key", intentKey, "broker_order_id", intent.BrokerOrderID,
+				"attempt", attempt+1)
+			continue
 		}
 		if err != nil {
 			continue
