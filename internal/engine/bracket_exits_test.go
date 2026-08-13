@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -28,6 +29,12 @@ type fakeBracketExec struct {
 	onStatus    func(string)
 	positions   []execution.Position
 	positionErr error
+}
+
+type recoverFailureBracketExec struct{ *fakeBracketExec }
+
+func (*recoverFailureBracketExec) Recover(context.Context) error {
+	return errors.New("transient recovery failure")
 }
 
 func (f *fakeBracketExec) PlaceOrder(_ context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
@@ -155,6 +162,591 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 	}
 	if handled := e.reconcileBrokerExitTrade(ctx, trade, true); handled {
 		t.Fatal("polling a capped standalone stop must preserve software take-profit ownership")
+	}
+}
+
+func TestWorkingBrokerStopCoversTradeRequiresAnActiveFullStop(t *testing.T) {
+	tests := []struct {
+		name   string
+		states []legState
+		want   bool
+	}{
+		{
+			name: "held child is inactive",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "held", Quantity: 5, RemainingQty: 5,
+			}}},
+		},
+		{
+			name: "take profit alone is insufficient",
+			states: []legState{{ok: true, leg: store.Order{IsTakeProfit: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 5, RemainingQty: 5,
+			}}},
+		},
+		{
+			name: "undersized active stop",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 4, RemainingQty: 4,
+			}}},
+		},
+		{
+			name: "full active stop",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 5, RemainingQty: 5,
+			}}},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workingBrokerStopCoversTrade(tc.states, 5); got != tc.want {
+				t.Fatalf("covered = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBrokerStopSnapshotUnknown(t *testing.T) {
+	if !brokerStopSnapshotUnknown([]legState{{leg: store.Order{IsStopLoss: true}}}) {
+		t.Fatal("unreadable stop snapshot must remain unknown")
+	}
+	if brokerStopSnapshotUnknown([]legState{{ok: true, leg: store.Order{IsStopLoss: true}, res: execution.OrderResult{Status: "accepted"}}}) {
+		t.Fatal("readable stop snapshot must not remain unknown")
+	}
+}
+
+func TestCancelBrokerBracketChildren_RetainsParentReportedFillWhenLookupMisses(t *testing.T) {
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"filled-child": execution.ErrOrderNotFound,
+	}}
+	e := newBracketTestEngine(exec)
+	if e.cancelBrokerBracketChildren(context.Background(), "", []execution.OrderLeg{{
+		BrokerOrderID: "filled-child", Status: "filled", FilledQty: 1,
+	}}) {
+		t.Fatal("parent-reported child fill must block containment until reconciliation")
+	}
+	if len(exec.cancelled) != 0 {
+		t.Fatalf("cancellations = %v, want none after parent reports a child fill", exec.cancelled)
+	}
+}
+
+func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	checks := make(chan struct{}, 3)
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			"healthy-parent": {
+				Status: "filled", Quantity: 2, FilledQty: 2,
+				ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+			},
+		},
+		onStatus: func(string) { checks <- struct{}{} },
+	}
+	e := newBracketTestEngine(exec)
+	e.verifyOrContainBrokerEntryAsync("missing-trade", "healthy-parent", "TEST", 2)
+	for i := 0; i < 3; i++ {
+		select {
+		case <-checks:
+		case <-time.After(time.Second):
+			t.Fatalf("verification attempt %d did not run", i+1)
+		}
+	}
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("unknown trade projection must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
+func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_UNKNOWN_PARENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:strict-unknown-parent-" + intentID
+	clientOrderID := "strict-unknown-parent-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "STRICT_UNKNOWN_PARENT", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID,
+		TimeInForce: "gtc", RequireBrokerProtection: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "STRICT_UNKNOWN_PARENT", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "strict-unknown-parent", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup strict intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "strict-unknown-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record strict intent: %v", err)
+	}
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"strict-unknown-parent": fmt.Errorf("transient parent status failure"),
+	}}
+	e := newBracketTestEngine(exec)
+	e.cfg.Risk.BracketExitsEnabled = true
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("unknown parent snapshot must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
+func TestContainRecoveredUnprotectedBracket_LegacyIntentStaysApplicationManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_RECOVERY", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:legacy-recovery-" + intentID
+	clientOrderID := "legacy-recovery-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "LEGACY_RECOVERY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "LEGACY_RECOVERY", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "legacy-recovery", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "legacy-recovery-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"legacy-recovery-parent": {Status: "filled", Quantity: 2, FilledQty: 2},
+	}}
+	e := newBracketTestEngine(exec)
+	e.cfg.Risk.BracketExitsEnabled = true
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("legacy recovery must remain application-managed; cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
+func TestReconcileBracket_LegacyTradeWithoutIntentRemainsApplicationManaged(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_NO_INTENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	e := newBracketTestEngine(&fakeBracketExec{})
+	e.cfg.Risk.BracketExitsEnabled = true
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); handled {
+		t.Fatal("legacy trade without a broker-protection intent must retain application-managed exits")
+	}
+}
+
+func TestReconcileBracket_PolicyReadFailureRetainsBrokerOwnershipAfterAdmissionDisabled(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_POLICY_READ_FAILURE", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+
+	original := stockEntryBrokerProtection
+	stockEntryBrokerProtection = func(context.Context, string) (bool, string, error) {
+		return false, "", fmt.Errorf("transient policy read failure")
+	}
+	t.Cleanup(func() { stockEntryBrokerProtection = original })
+
+	e := newBracketTestEngine(&fakeBracketExec{})
+	// This flag only governs admission of new bracket entries. An existing
+	// strict trade cannot safely fall back to software exits while its durable
+	// ownership policy is temporarily unreadable.
+	e.cfg.Risk.BracketExitsEnabled = false
+	if handled, reconcileErr := e.reconcileBrokerExitTradeStatus(ctx, getTrade(t, tradeID), false); !handled || reconcileErr == nil {
+		t.Fatalf("policy read failure after admission disabled = handled %v err %v; want broker ownership retained", handled, reconcileErr)
+	}
+}
+
+func TestReconcileBracket_MissingProjectionVerifiesHealthyStrictParent(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "STRICT_HEALTHY_PARENT", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := stockEntryBrokerProtection
+	stockEntryBrokerProtection = func(context.Context, string) (bool, string, error) {
+		return true, "healthy-missing-projection-parent", nil
+	}
+	t.Cleanup(func() { stockEntryBrokerProtection = original })
+	checked := make(chan struct{}, 1)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"healthy-missing-projection-parent": {
+			Status: "filled", Quantity: 2, FilledQty: 2,
+			ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+		},
+	}, onStatus: func(string) { checked <- struct{}{} }}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("strict trade with missing local legs must retain broker ownership")
+	}
+	select {
+	case <-checked:
+	case <-time.After(time.Second):
+		t.Fatal("missing projection did not verify the broker parent")
+	}
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("healthy broker bracket was contained: cancellations=%v placements=%v", exec.cancelled, exec.placed)
+	}
+}
+
+func TestCancelLegacyBrokerHeldEntry_GTCDoneForDayRemainsWorking(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:gtc-legacy-" + intentID
+	clientOrderID := "gtc-legacy-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "GTCLEGACY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, Ticker: "GTCLEGACY",
+		Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "gtc-legacy", BrokerOrderID: "gtc-legacy-parent", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "gtc-legacy-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatalf("record accepted legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"gtc-legacy-parent": {Status: "done_for_day"},
+	}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intent.IdempotencyKey)
+	if got := len(exec.cancelled); got != 3 {
+		t.Fatalf("cancellation attempts = %d, want 3 while GTC parent remains done_for_day", got)
+	}
+	updated, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+	if err != nil || updated == nil || updated.Status != "pending" {
+		t.Fatalf("GTC legacy intent = %+v err=%v, want pending", updated, err)
+	}
+}
+
+func TestCancelLegacyBrokerHeldEntry_PurgedParentRemainsRecoverable(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:purged-legacy-" + intentID
+	clientOrderID := "purged-legacy-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "PURGEDLEGACY", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, Ticker: "PURGEDLEGACY",
+		Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "purged-legacy", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup legacy intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "purged-legacy-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatalf("record accepted legacy intent: %v", err)
+	}
+	exec := &fakeBracketExec{statusErr: map[string]error{
+		"purged-legacy-parent": execution.ErrOrderNotFound,
+	}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intent.IdempotencyKey)
+	if got := len(exec.cancelled); got != 3 {
+		t.Fatalf("cancellation attempts = %d, want 3 while fill remains unknown", got)
+	}
+	updated, err := store.GetStockOrderIntentByKey(ctx, intent.IdempotencyKey)
+	if err != nil || updated == nil || updated.Status != "pending" {
+		t.Fatalf("purged legacy intent = %+v err=%v, want pending for recovery", updated, err)
+	}
+}
+
+func TestCancelLegacyBrokerHeldEntry_PersistsContainmentAfterRecoveryFailure(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "LEGACY_FORCE", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 2, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatal(err)
+	}
+	intentKey := "entry:legacy-force-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "LEGACY_FORCE", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: "legacy-force-" + intentID, TimeInForce: "gtc",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: "legacy-force-" + intentID, TradeID: tradeID,
+		Ticker: "LEGACY_FORCE", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "legacy-force", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE parent_intent_id=$1::uuid`, intent.ID)
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID)
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "legacy-force-parent", "pending", 0, 0, "", "", true); err != nil {
+		t.Fatal(err)
+	}
+	exec := &recoverFailureBracketExec{fakeBracketExec: &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"legacy-force-parent": {Status: "filled", Quantity: 2, FilledQty: 2, FilledPrice: 100},
+	}}}
+	e := newBracketTestEngine(exec)
+	e.cancelLegacyBrokerHeldEntry(ctx, intentKey)
+	required, brokerID, err := store.StockEntryBrokerProtection(ctx, tradeID)
+	if err != nil || !required || brokerID != "legacy-force-parent" {
+		t.Fatalf("durable legacy containment policy = required:%v broker:%q err:%v", required, brokerID, err)
+	}
+}
+
+func TestApplyBracketChildSnapshotPersistsFill(t *testing.T) {
+	filledAt := time.Date(2026, time.August, 13, 11, 0, 0, 0, time.UTC)
+	order := store.Order{BrokerOrderID: "filled-take-profit", Status: "pending"}
+	applyBracketChildSnapshot(&order, []execution.OrderLeg{{
+		BrokerOrderID: "filled-take-profit", Status: "filled", FilledQty: 1, FilledPrice: 120, FilledAt: filledAt,
+	}})
+	if order.FilledQty != 1 || order.FilledPrice != 120 || order.Status != "filled" || order.FilledAt == nil || !order.FilledAt.Equal(filledAt) {
+		t.Fatalf("persisted child snapshot = %+v", order)
+	}
+}
+
+func TestContainUnprotectedBrokerEntry_PersistsParentOnlyFillForProjectedChild(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "PARENT_ONLY_CHILD_FILL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := "parent-only-fill-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "PARENT_ONLY_CHILD_FILL", Side: "buy", OrderType: "market",
+		Quantity: 5, FilledPrice: 100, FilledQty: 5, Status: "filled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "parent-only-tp", Ticker: "PARENT_ONLY_CHILD_FILL", Side: "sell", OrderType: "limit",
+		Quantity: 5, LimitPrice: 120, Status: "pending", IsTakeProfit: true, ParentOrderID: parentID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		parentID: {Status: "filled", FilledPrice: 100, FilledQty: 5, ChildOrders: []execution.OrderLeg{
+			{BrokerOrderID: "parent-only-tp", Type: "limit", Status: "filled", FilledQty: 2, FilledPrice: 120},
+		}},
+	}}
+	e := newBracketTestEngine(exec)
+	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "PARENT_ONLY_CHILD_FILL", "missing stop")
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 3 {
+		t.Fatalf("parent-only fill trade = %#v err=%v, want remaining quantity 3", trade, err)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, "parent-only-tp")
+	if err != nil || child == nil || child.FilledQty != 2 || child.FilledPrice != 120 || child.Status != "filled" {
+		t.Fatalf("parent-only fill order = %#v err=%v", child, err)
+	}
+}
+
+func TestReconcileBracket_UnknownStrictStopSnapshotRetriesWithoutContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, tpID, slID := insertBracketFixture(t, "STRICT_UNKNOWN_STOP", 2)
+	var intentID string
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&intentID); err != nil {
+		t.Fatalf("create intent UUID: %v", err)
+	}
+	intentKey := "entry:strict-unknown-" + intentID
+	clientOrderID := "strict-unknown-client-" + intentID
+	request, err := json.Marshal(execution.OrderRequest{
+		Ticker: "STRICT_UNKNOWN_STOP", Side: execution.OrderSideBuy, Type: execution.OrderTypeMarket,
+		Quantity: 2, IntentKey: intentKey, ClientOrderID: clientOrderID,
+		TimeInForce: "gtc", RequireBrokerProtection: true,
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	intent := store.StockOrderIntent{
+		ID: intentID, IdempotencyKey: intentKey, ClientOrderID: clientOrderID, TradeID: tradeID,
+		Ticker: "STRICT_UNKNOWN_STOP", Side: "buy", OrderType: "market", RequestedQty: 2,
+		RequestPayload: request, PayloadHash: "strict-unknown", Status: "pending",
+	}
+	if err := store.CreateStockOrderIntent(ctx, intent); err != nil {
+		t.Fatalf("CreateStockOrderIntent: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := store.GetDB().Exec(ctx, `DELETE FROM stock_order_intents WHERE id=$1::uuid`, intent.ID); err != nil {
+			t.Errorf("cleanup strict intent: %v", err)
+		}
+	})
+	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "strict-unknown-parent", "filled", 100, 2, "", "", true); err != nil {
+		t.Fatalf("record strict intent: %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses:  map[string]execution.OrderResult{tpID: {Status: "accepted", Quantity: 2, RemainingQty: 2}},
+		statusErr: map[string]error{slID: fmt.Errorf("transient stop status failure")},
+	}
+	e := newBracketTestEngine(exec)
+	if handled := e.reconcileBracketTrade(ctx, getTrade(t, tradeID)); !handled {
+		t.Fatal("unknown strict stop snapshot must retain broker ownership")
+	}
+	if len(exec.cancelled) != 0 {
+		t.Fatalf("containment cancellations = %v, want no flatten on unknown stop snapshot", exec.cancelled)
+	}
+}
+
+func TestBrokerSnapshotRemainingTradeQtyAccountsForNewPartialTakeProfit(t *testing.T) {
+	states := []legState{
+		{ok: true, leg: store.Order{IsTakeProfit: true, FilledQty: 1}, res: execution.OrderResult{FilledQty: 3}},
+		{ok: true, leg: store.Order{IsStopLoss: true, FilledQty: 0}, res: execution.OrderResult{FilledQty: 0}},
+	}
+	if got := brokerSnapshotRemainingTradeQty(5, states); got != 3 {
+		t.Fatalf("remaining quantity = %v, want 3 after cumulative TP fill", got)
+	}
+}
+
+func TestContainUnprotectedBrokerEntryCancelsParentBeforeDurableFlatten(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_UNPROTECTED_BRACKET", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	parentID := "unprotected-parent-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "TEST_UNPROTECTED_BRACKET",
+		Side: "buy", OrderType: "market", Quantity: 2, Status: "filled",
+	}); err != nil {
+		t.Fatalf("InsertOrder(entry): %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{
+			parentID: {Status: "filled", ChildOrders: []execution.OrderLeg{
+				{BrokerOrderID: "unprojected-tp", Type: "limit", Status: "accepted", Quantity: 2, RemainingQty: 2},
+				{BrokerOrderID: "unprojected-sl", Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2},
+			}},
+			"unprojected-tp": {Status: "cancelled"},
+			"unprojected-sl": {Status: "cancelled"},
+		},
+		placeRes: execution.OrderResult{BrokerOrderID: "containment-exit", Status: "accepted"},
+	}
+	e := newBracketTestEngine(exec)
+	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "TEST_UNPROTECTED_BRACKET", "missing stop")
+	if got, want := exec.cancelled, []string{parentID, "unprojected-tp", "unprojected-sl"}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+		t.Fatalf("cancelled = %v, want parent and every unprojected child before flatten", got)
+	}
+	if len(exec.placed) != 1 || exec.placed[0].Side != execution.OrderSideSell || exec.placed[0].Quantity != 2 {
+		t.Fatalf("containment flatten = %+v", exec.placed)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" {
+		t.Fatalf("contained trade = %+v err=%v; want exiting", trade, err)
 	}
 }
 

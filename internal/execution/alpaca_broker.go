@@ -104,12 +104,20 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	var resp struct {
 		ID          string `json:"id"`
 		Status      string `json:"status"`
+		Qty         string `json:"qty"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
 		FilledAt    string `json:"filled_at"`
 		Legs        []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"` // "limit" (take-profit) | "stop" (stop-loss)
+			ID          string `json:"id"`
+			Type        string `json:"type"` // "limit" (take-profit) | "stop" (stop-loss)
+			Status      string `json:"status"`
+			Qty         string `json:"qty"`
+			FilledQty   string `json:"filled_qty"`
+			FilledAvgPx string `json:"filled_avg_price"`
+			FilledAt    string `json:"filled_at"`
+			LimitPrice  string `json:"limit_price"`
+			StopPrice   string `json:"stop_price"`
 		} `json:"legs"`
 	}
 	requestID, err := b.doWithRequestID(ctx, http.MethodPost, "/v2/orders", body, &resp)
@@ -125,10 +133,16 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse filled_qty %q: %w", resp.FilledQty, err)
 	}
+	quantity, err := parseFloat(resp.Qty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse qty %q: %w", resp.Qty, err)
+	}
 
 	result := OrderResult{
 		BrokerOrderID: resp.ID,
 		Status:        resp.Status,
+		Quantity:      quantity,
+		RemainingQty:  math.Max(0, quantity-filledQty),
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
 		RequestID:     requestID,
@@ -140,6 +154,21 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if len(resp.Legs) > 0 {
 		var tpID, slID string
 		for _, leg := range resp.Legs {
+			qty, qtyErr := parseFloat(leg.Qty)
+			filled, filledErr := parseFloat(leg.FilledQty)
+			filledPrice, filledPriceErr := parseFloat(leg.FilledAvgPx)
+			limit, limitErr := parseFloat(leg.LimitPrice)
+			stop, stopErr := parseFloat(leg.StopPrice)
+			if qtyErr != nil || filledErr != nil || filledPriceErr != nil || limitErr != nil || stopErr != nil {
+				return OrderResult{}, fmt.Errorf("alpaca PlaceOrder: parse bracket child %s quantities/prices", leg.ID)
+			}
+			result.ChildOrders = append(result.ChildOrders, OrderLeg{
+				BrokerOrderID: leg.ID, Type: leg.Type, Status: leg.Status,
+				Quantity: qty, RemainingQty: math.Max(0, qty-filled), FilledQty: filled,
+				FilledPrice: filledPrice,
+				LimitPrice:  limit, StopPrice: stop,
+			})
+			result.ChildOrders[len(result.ChildOrders)-1].FilledAt, _ = time.Parse(time.RFC3339, leg.FilledAt)
 			switch leg.Type {
 			case "limit":
 				tpID = leg.ID
@@ -160,12 +189,20 @@ func (b *AlpacaBroker) GetOrderByClientID(ctx context.Context, clientOrderID str
 	var resp struct {
 		ID          string `json:"id"`
 		Status      string `json:"status"`
+		Qty         string `json:"qty"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
 		FilledAt    string `json:"filled_at"`
 		Legs        []struct {
-			ID   string `json:"id"`
-			Type string `json:"type"`
+			ID          string `json:"id"`
+			Type        string `json:"type"`
+			Status      string `json:"status"`
+			Qty         string `json:"qty"`
+			FilledQty   string `json:"filled_qty"`
+			FilledAvgPx string `json:"filled_avg_price"`
+			FilledAt    string `json:"filled_at"`
+			LimitPrice  string `json:"limit_price"`
+			StopPrice   string `json:"stop_price"`
 		} `json:"legs"`
 	}
 	requestID, err := b.doWithRequestID(ctx, http.MethodGet, "/v2/orders:by_client_order_id?nested=true&client_order_id="+url.QueryEscape(clientOrderID), nil, &resp)
@@ -183,10 +220,29 @@ func (b *AlpacaBroker) GetOrderByClientID(ctx context.Context, clientOrderID str
 	if err != nil {
 		return OrderResult{}, err
 	}
+	orderQty, err := parseFloat(resp.Qty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: parse qty %q: %w", resp.Qty, err)
+	}
 	filledAt, _ := time.Parse(time.RFC3339, resp.FilledAt)
-	result := OrderResult{BrokerOrderID: resp.ID, Status: resp.Status, FilledPrice: price, FilledQty: qty, FilledAt: filledAt, RequestID: requestID}
+	result := OrderResult{BrokerOrderID: resp.ID, Status: resp.Status, Quantity: orderQty, RemainingQty: math.Max(0, orderQty-qty), FilledPrice: price, FilledQty: qty, FilledAt: filledAt, RequestID: requestID}
 	var tpID, slID string
 	for _, leg := range resp.Legs {
+		legQty, qtyErr := parseFloat(leg.Qty)
+		legFilled, filledErr := parseFloat(leg.FilledQty)
+		legFilledPrice, filledPriceErr := parseFloat(leg.FilledAvgPx)
+		limit, limitErr := parseFloat(leg.LimitPrice)
+		stop, stopErr := parseFloat(leg.StopPrice)
+		if qtyErr != nil || filledErr != nil || filledPriceErr != nil || limitErr != nil || stopErr != nil {
+			return OrderResult{}, fmt.Errorf("alpaca GetOrderByClientID: parse bracket child %s quantities/prices", leg.ID)
+		}
+		result.ChildOrders = append(result.ChildOrders, OrderLeg{
+			BrokerOrderID: leg.ID, Type: leg.Type, Status: leg.Status,
+			Quantity: legQty, RemainingQty: math.Max(0, legQty-legFilled), FilledQty: legFilled,
+			FilledPrice: legFilledPrice,
+			LimitPrice:  limit, StopPrice: stop,
+		})
+		result.ChildOrders[len(result.ChildOrders)-1].FilledAt, _ = time.Parse(time.RFC3339, leg.FilledAt)
 		switch leg.Type {
 		case "limit":
 			tpID = leg.ID
@@ -313,11 +369,23 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 	var resp struct {
 		ID          string `json:"id"`
 		Status      string `json:"status"`
+		Qty         string `json:"qty"`
 		FilledAvgPx string `json:"filled_avg_price"`
 		FilledQty   string `json:"filled_qty"`
 		FilledAt    string `json:"filled_at"`
+		Legs        []struct {
+			ID          string `json:"id"`
+			Type        string `json:"type"`
+			Status      string `json:"status"`
+			Qty         string `json:"qty"`
+			FilledQty   string `json:"filled_qty"`
+			FilledAvgPx string `json:"filled_avg_price"`
+			FilledAt    string `json:"filled_at"`
+			LimitPrice  string `json:"limit_price"`
+			StopPrice   string `json:"stop_price"`
+		} `json:"legs"`
 	}
-	if err := b.do(ctx, http.MethodGet, "/v2/orders/"+brokerOrderID, nil, &resp); err != nil {
+	if err := b.do(ctx, http.MethodGet, "/v2/orders/"+brokerOrderID+"?nested=true", nil, &resp); err != nil {
 		// `do` formats 4xx responses as "alpaca METHOD path → CODE: body"
 		// — sniff the 404 prefix to map onto the sentinel. Cleaner than
 		// punching the status code through `do`'s signature for one
@@ -336,15 +404,48 @@ func (b *AlpacaBroker) GetOrderStatus(ctx context.Context, brokerOrderID string)
 	if err != nil {
 		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse filled_qty %q: %w", resp.FilledQty, err)
 	}
+	quantity, err := parseFloat(resp.Qty)
+	if err != nil {
+		return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse qty %q: %w", resp.Qty, err)
+	}
 	filledAt, _ := time.Parse(time.RFC3339, resp.FilledAt)
-
-	return OrderResult{
+	result := OrderResult{
 		BrokerOrderID: resp.ID,
 		Status:        resp.Status,
+		Quantity:      quantity,
+		RemainingQty:  math.Max(0, quantity-filledQty),
 		FilledPrice:   filledPrice,
 		FilledQty:     filledQty,
 		FilledAt:      filledAt,
-	}, nil
+	}
+	var tpID, slID string
+	for _, leg := range resp.Legs {
+		qty, qtyErr := parseFloat(leg.Qty)
+		filled, filledErr := parseFloat(leg.FilledQty)
+		filledPrice, filledPriceErr := parseFloat(leg.FilledAvgPx)
+		limit, limitErr := parseFloat(leg.LimitPrice)
+		stop, stopErr := parseFloat(leg.StopPrice)
+		if qtyErr != nil || filledErr != nil || filledPriceErr != nil || limitErr != nil || stopErr != nil {
+			return OrderResult{}, fmt.Errorf("alpaca GetOrderStatus: parse bracket child %s quantities/prices", leg.ID)
+		}
+		result.ChildOrders = append(result.ChildOrders, OrderLeg{
+			BrokerOrderID: leg.ID, Type: leg.Type, Status: leg.Status,
+			Quantity: qty, RemainingQty: math.Max(0, qty-filled), FilledQty: filled,
+			FilledPrice: filledPrice,
+			LimitPrice:  limit, StopPrice: stop,
+		})
+		result.ChildOrders[len(result.ChildOrders)-1].FilledAt, _ = time.Parse(time.RFC3339, leg.FilledAt)
+		switch leg.Type {
+		case "limit":
+			tpID = leg.ID
+		case "stop", "stop_limit":
+			slID = leg.ID
+		}
+	}
+	if tpID != "" && slID != "" {
+		result.ChildOrderIDs = []string{tpID, slID}
+	}
+	return result, nil
 }
 
 func isBrokerNotFound(err error) bool {

@@ -40,6 +40,13 @@ type RecoveryObserver interface {
 	PreparedStockEntryNeedsAdmission(context.Context, string)
 }
 
+// ProtectionRecoveryObserver is intentionally optional so recovery can notify
+// an engine about a pre-existing protected-entry projection without replaying
+// its one-time trade-open side effects.
+type ProtectionRecoveryObserver interface {
+	RecoveredStockEntryProtection(context.Context, string)
+}
+
 type Coordinator struct {
 	inner    execution.Executor
 	observer RecoveryObserver
@@ -228,7 +235,10 @@ func isRecoveryContext(ctx context.Context) bool {
 
 func (c *Coordinator) finishSubmit(ctx context.Context, intent store.StockOrderIntent, req execution.OrderRequest, res execution.OrderResult) (execution.OrderResult, error) {
 	if err := c.projectBracketChildren(ctx, intent, req, res); err != nil {
-		return execution.OrderResult{}, err
+		// The broker has already accepted this parent. Preserve its identity for
+		// callers so strict-entry recovery can verify or contain it immediately
+		// even when the local child projection failed.
+		return res, err
 	}
 	return res, nil
 }
@@ -744,6 +754,9 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 			return err
 		}
 	}
+	if observer, ok := c.observer.(ProtectionRecoveryObserver); ok {
+		observer.RecoveredStockEntryProtection(ctx, intent.IdempotencyKey)
+	}
 	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
 		return fmt.Errorf("mark recovered stock entry signal executed: %w", err)
 	}
@@ -808,6 +821,7 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 			{"stop-loss", res.ChildOrderIDs[1], string(execution.OrderTypeStop), req.StopLossPrice, true, false},
 		}
 		for _, leg := range legs {
+			child := recoveredBracketChild(res.ChildOrders, leg.brokerID)
 			childID, err := store.UpsertBracketChildIntent(ctx, parent.ID, tradeID, req.Ticker, leg.role, leg.brokerID, leg.orderType, req.Quantity, leg.price)
 			if err != nil {
 				return fmt.Errorf("project recovered bracket child intent: %w", err)
@@ -821,6 +835,19 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 					Side: string(execution.OrderSideSell), OrderType: leg.orderType, Quantity: req.Quantity,
 					Status: "pending", IsStopLoss: leg.stop, IsTakeProfit: leg.take,
 					ParentOrderID: res.BrokerOrderID, StockIntentID: childID}
+				if child != nil && child.FilledQty > 0 {
+					// Persist this nested snapshot before the parent becomes terminal
+					// and ceases to be recoverable. A later direct child lookup may
+					// already be purged; bracket reconciliation will atomically apply
+					// this durable cumulative fill to the trade.
+					order.FilledPrice = child.FilledPrice
+					order.FilledQty = child.FilledQty
+					order.Status = execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc")
+					if !child.FilledAt.IsZero() {
+						filledAt := child.FilledAt
+						order.FilledAt = &filledAt
+					}
+				}
 				if leg.stop {
 					order.StopPrice = leg.price
 				} else {
@@ -835,6 +862,15 @@ func (c *Coordinator) projectRecoveredEntryExits(ctx context.Context, parent sto
 	if req.UncappedTakeProfit && res.FilledQty > 0 {
 		if err := c.ensureRecoveredProtectiveStop(ctx, parent, req, res, tradeID); err != nil {
 			return fmt.Errorf("recover uncapped entry protective stop: %w", err)
+		}
+	}
+	return nil
+}
+
+func recoveredBracketChild(children []execution.OrderLeg, brokerOrderID string) *execution.OrderLeg {
+	for i := range children {
+		if children[i].BrokerOrderID == brokerOrderID {
+			return &children[i]
 		}
 	}
 	return nil

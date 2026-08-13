@@ -45,11 +45,35 @@ func resolveUncappedEntry(
 }
 
 func stockBracketEligible(risk config.RiskConfig, side execution.OrderSide, signalPrice, stopLoss, takeProfit float64, uncapped bool) bool {
-	return !uncapped &&
-		risk.BracketExitsEnabled &&
-		side == execution.OrderSideBuy &&
-		stopLoss > 0 && takeProfit > 0 &&
-		stopLoss < signalPrice && takeProfit > signalPrice
+	if uncapped || !risk.BracketExitsEnabled || side != execution.OrderSideBuy {
+		return false
+	}
+	_, _, ok := normalizedStockBracketPrices(signalPrice, stopLoss, takeProfit)
+	return ok
+}
+
+// normalizedStockBracketPrices applies Alpaca's minimum price increment before
+// deciding whether a proposed bracket is coherent. Checking raw model prices
+// is insufficient: two distinct values can collapse to the same broker price.
+func normalizedStockBracketPrices(signalPrice, stopLoss, takeProfit float64) (float64, float64, bool) {
+	if !finitePositive(signalPrice) || !finitePositive(stopLoss) || !finitePositive(takeProfit) {
+		return 0, 0, false
+	}
+	stopLoss = roundStockOrderPrice(stopLoss)
+	takeProfit = roundStockOrderPrice(takeProfit)
+	if !finitePositive(stopLoss) || !finitePositive(takeProfit) ||
+		stopLoss >= signalPrice || takeProfit <= signalPrice || takeProfit <= stopLoss {
+		return 0, 0, false
+	}
+	return stopLoss, takeProfit, true
+}
+
+func roundStockOrderPrice(price float64) float64 {
+	scale := 100.0
+	if price < 1 {
+		scale = 10_000
+	}
+	return math.Round(price*scale) / scale
 }
 
 func persistedTakeProfit(modelTakeProfit float64, uncapped bool) float64 {

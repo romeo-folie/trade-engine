@@ -2522,15 +2522,49 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		hydrateStockEntryReplayPolicy(&sig, orderReq)
 	}
 
+	// The initial broker-protection policy is deliberately fixed brackets. An
+	// uncapped entry installs a standalone stop only after a fill, so it cannot
+	// meet the protected-entry invariant.
+	strictBracketPolicy := !replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.BracketExitsEnabled
+	if replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.BracketExitsEnabled && !orderReq.RequireBrokerProtection {
+		if admission.BrokerHeldReplay {
+			// A pre-policy working BUY cannot be replayed under the strict
+			// invariant. Retire its broker order first; a cancellation-race fill
+			// is projected by recovery and then contained under the active policy.
+			e.cancelLegacyBrokerHeldEntry(ctx, intentKey)
+			return
+		}
+		reason := "prepared entry predates the required broker-protection policy"
+		_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason,
+			"intent_key", orderReq.IntentKey)
+		return
+	}
+	if strictBracketPolicy {
+		if _, paper := e.executor.(*execution.PaperExecutor); paper {
+			reason := "broker protection requires an Alpaca bracket-capable executor; the local paper executor cannot simulate broker children"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "broker protection",
+			})
+			return
+		}
+	}
+
 	// The uncapped exit policy is active only with the trailing manager: this
 	// guarantees the position retains a broker hard stop while the selected
 	// trail owns the winning exit. Keeping the manager requirement here makes
 	// an accidentally-partial config fail safe to the existing fixed TP.
-	uncapRequested := !replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
+	uncapRequested := !strictBracketPolicy && !replayingExisting && side == execution.OrderSideBuy && e.cfg.Risk.UncapTakeProfit
 	uncapTakeProfit, uncappedQty := resolveUncappedEntry(
 		e.cfg.Risk, side, qty, sig.SignalPrice, sig.StopLoss,
 		e.trailingManagerAvailable,
 	)
+	if strictBracketPolicy {
+		uncapTakeProfit = false
+	}
 	if replayingExisting {
 		uncapTakeProfit = orderReq.UncappedTakeProfit
 	} else if uncapTakeProfit {
@@ -2545,13 +2579,35 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		)
 	}
 
-	// Broker-resident bracket exits (#435, see bracket_exits.go). BUYs with a
-	// coherent stop/target become one atomic bracket: entry + TP limit + SL
-	// stop, GTC so the legs survive the session close. Whole shares only —
-	// Alpaca rejects fractional complex orders — so sub-one-share sizings
-	// fall back to the plain market entry with app-managed exits.
+	// Broker-resident bracket exits (#541). With this policy enabled, every
+	// admitted BUY is a valid whole-share bracket. There is no app-managed
+	// fallback for a fractional or malformed protected entry.
 	bracketed, mayBuildBracket := stockEntryBracketReplayState(replayingExisting, orderReq)
-	if mayBuildBracket && stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
+	if strictBracketPolicy {
+		stopLoss, takeProfit, eligible := normalizedStockBracketPrices(sig.SignalPrice, sig.StopLoss, sig.TakeProfit)
+		whole := math.Floor(qty)
+		if !eligible || whole < 1 {
+			reason := "broker protection requires a compatible whole-share bracket"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason,
+				"qty", qty, "stop_loss", sig.StopLoss, "take_profit", sig.TakeProfit)
+			e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+				Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+				BlockReason: reason, FailedCheck: "broker protection",
+			})
+			return
+		}
+		sig.StopLoss, sig.TakeProfit = stopLoss, takeProfit
+		orderReq.Quantity = whole
+		orderReq.OrderClass = "bracket"
+		orderReq.TakeProfitPrice = takeProfit
+		orderReq.StopLossPrice = stopLoss
+		orderReq.PolicyTakeProfit = takeProfit
+		orderReq.PolicyStopLoss = stopLoss
+		orderReq.RequireBrokerProtection = true
+		orderReq.TimeInForce = "gtc"
+		bracketed = true
+	} else if mayBuildBracket && stockBracketEligible(e.cfg.Risk, side, sig.SignalPrice, sig.StopLoss, sig.TakeProfit, uncapTakeProfit) {
 		if whole := math.Floor(qty); whole >= 1 {
 			orderReq.Quantity = whole
 			orderReq.OrderClass = "bracket"
@@ -2559,9 +2615,6 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			orderReq.StopLossPrice = sig.StopLoss
 			orderReq.TimeInForce = "gtc"
 			bracketed = true
-		} else {
-			logger.Warn("bracket exits: sized under one whole share — falling back to app-managed exits",
-				"ticker", sig.Ticker, "qty", qty)
 		}
 	}
 	if uncapTakeProfit {
@@ -2610,6 +2663,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 		riskIn.StopLoss = sig.StopLoss
 	}
+	if orderReq.RequireBrokerProtection {
+		stopLoss, takeProfit, eligible := normalizedStockBracketPrices(sig.SignalPrice, sig.StopLoss, sig.TakeProfit)
+		if !eligible {
+			reason := "broker protection parameters became incompatible after final risk sizing"
+			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
+			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+			return
+		}
+		sig.StopLoss, sig.TakeProfit = stopLoss, takeProfit
+		orderReq.PolicyStopLoss, orderReq.PolicyTakeProfit = stopLoss, takeProfit
+		orderReq.StopLossPrice, orderReq.TakeProfitPrice = stopLoss, takeProfit
+		riskIn.StopLoss, riskIn.TakeProfit = stopLoss, takeProfit
+	}
 	riskIn.ProposedQuantity = orderReq.Quantity
 	riskIn.ProposedNotional = orderReq.Quantity * sig.SignalPrice
 	if admission.BrokerAuthoritative && !admission.BrokerHeldReplay && riskIn.ProposedNotional > admission.RemainingCapacity+1e-7 {
@@ -2637,6 +2703,12 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
+		// Coordinators can return an accepted broker result with a local
+		// projection error. Strict brackets must start durable recovery from that
+		// identity immediately, before the parent can fill further with held legs.
+		if orderReq.RequireBrokerProtection && result.BrokerOrderID != "" {
+			e.recoverAndVerifyAcceptedBrokerEntryAsync(orderReq.IntentKey)
+		}
 		if errors.Is(err, execution.ErrTerminalZeroFillPlacement) {
 			if updateErr := store.UpdateSignalStatus(ctx, sigID, "rejected", "entry order terminal zero-fill without a broker fill"); updateErr != nil {
 				logger.Warn("reject terminal zero-fill entry signal", "ticker", sig.Ticker, "err", updateErr)
@@ -2644,6 +2716,19 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		}
 		logger.Warn("order placement failed", "ticker", sig.Ticker, "err", err)
 		return
+	}
+	// A strict entry is durable before this broker request, but its local
+	// trade/child projections below can still fail. Ensure every early return
+	// after acceptance immediately enters durable recovery and broker coverage
+	// verification instead of leaving a partial parent to keep filling.
+	strictBrokerVerificationPending := orderReq.RequireBrokerProtection &&
+		!brokerBracketProtectionVerified(result, result.FilledQty)
+	if strictBrokerVerificationPending {
+		defer func() {
+			if strictBrokerVerificationPending {
+				e.recoverAndVerifyAcceptedBrokerEntryAsync(orderReq.IntentKey)
+			}
+		}()
 	}
 	stockIntentID, projectionErr := stockIntentIDForAcceptedOrder(ctx, e.executor, orderReq.IntentKey)
 	if projectionErr != nil {
@@ -2812,6 +2897,9 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 					legRows[i].StockIntentID = childIntentID
 				}
 			}
+			for i := range legRows {
+				applyBracketChildSnapshot(&legRows[i], result.ChildOrders)
+			}
 			for _, leg := range legRows {
 				if _, err := store.InsertOrder(ctx, leg); err != nil {
 					logger.Warn("insert bracket leg order", "tradeID", tradeID,
@@ -2822,9 +2910,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 				"trade_id", tradeID, "ticker", sig.Ticker,
 				"take_profit", sig.TakeProfit, "stop_loss", sig.StopLoss)
 		} else {
-			logger.Warn("bracket requested but broker returned no child legs — exits remain app-managed",
-				"trade_id", tradeID, "ticker", sig.Ticker)
+			if orderReq.RequireBrokerProtection {
+				logger.Error("broker protection: bracket response omitted child legs — containing entry",
+					"trade_id", tradeID, "ticker", sig.Ticker)
+			} else {
+				logger.Warn("bracket requested but broker returned no child legs — exits remain app-managed",
+					"trade_id", tradeID, "ticker", sig.Ticker)
+			}
 		}
+	}
+	if strictBrokerVerificationPending {
+		e.verifyOrContainBrokerEntryAsync(tradeID, result.BrokerOrderID, sig.Ticker, orderReq.Quantity)
+		strictBrokerVerificationPending = false
 	}
 
 	logger.Info("trade opened",
@@ -2984,6 +3081,26 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	}
 }
 
+// applyBracketChildSnapshot preserves an already-reported broker execution
+// while the normal accepted-order path creates its local child projection. A
+// later direct child lookup may be purged, so a pending zero-fill row would
+// otherwise lose the only authoritative cumulative fill.
+func applyBracketChildSnapshot(order *store.Order, children []execution.OrderLeg) {
+	for _, child := range children {
+		if child.BrokerOrderID != order.BrokerOrderID || child.FilledQty <= 0 {
+			continue
+		}
+		order.FilledPrice = child.FilledPrice
+		order.FilledQty = child.FilledQty
+		order.Status = execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc")
+		if !child.FilledAt.IsZero() {
+			filledAt := child.FilledAt
+			order.FilledAt = &filledAt
+		}
+		return
+	}
+}
+
 // stockIntentIDForAcceptedOrder is the common post-acceptance projection
 // guard. A coordinator's durable intent must be present before any normal
 // engine path writes a trade/order row. Paper and legacy executors deliberately
@@ -3137,6 +3254,7 @@ func (e *Engine) emitRecoveredEntryEffects(ctx context.Context, intentKey string
 	if err != nil || trade == nil {
 		return false
 	}
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
 	if _, alreadyEmitted := e.recoveredEntryEffects.LoadOrStore(intent.ID, struct{}{}); alreadyEmitted {
 		return false
 	}
@@ -3162,6 +3280,13 @@ func (e *Engine) emitRecoveredEntryEffects(ctx context.Context, intentKey string
 // RecoveredStockEntry implements stockorders.RecoveryObserver.
 func (e *Engine) RecoveredStockEntry(ctx context.Context, intentKey string) {
 	e.emitRecoveredEntryEffects(ctx, intentKey)
+}
+
+// RecoveredStockEntryProtection is separate from RecoveredStockEntry because
+// recovery may revisit a pre-existing trade solely to verify broker coverage;
+// that must not emit a second TradeExecuted event or charge a second trade.
+func (e *Engine) RecoveredStockEntryProtection(ctx context.Context, intentKey string) {
+	e.containRecoveredUnprotectedBracket(ctx, intentKey)
 }
 
 // PreparedStockEntryNeedsAdmission keeps a client-ID-missing prepared entry
@@ -3190,9 +3315,44 @@ func (e *Engine) PreparedStockEntryNeedsAdmission(ctx context.Context, intentKey
 		}
 		return
 	}
+	if e.preparedEntryPredatesBrokerProtection(ctx, intentKey) {
+		// Recovery has just proved this prepared generation never reached the
+		// broker. It cannot be replayed after the operator enables strict
+		// protection, because its immutable request deliberately lacks that
+		// requirement. Retire only with that broker-miss proof, then let the
+		// queued signal create a fresh protected successor on its next pass.
+		reason := "broker confirmed entry absent; prepared generation predates the required broker-protection policy"
+		if err := store.RetirePreparedStockEntryAfterBrokerMiss(ctx, intentKey, reason); err != nil {
+			logger.Warn("retire legacy prepared stock entry after broker miss", "intent_key", intentKey, "err", err)
+			return
+		}
+	}
 	if err := store.QueueSignalForDeferredExecution(ctx, signalID); err != nil {
 		logger.Warn("queue prepared stock entry for fresh admission", "intent_key", intentKey, "err", err)
 	}
+}
+
+// preparedEntryPredatesBrokerProtection identifies a legacy immutable request
+// that can no longer be safely replayed under the currently enabled strict
+// admission policy. Its caller is invoked only after client-ID recovery has
+// confirmed the prepared generation is absent at the broker.
+func (e *Engine) preparedEntryPredatesBrokerProtection(ctx context.Context, intentKey string) bool {
+	if e.cfg == nil || !e.cfg.Risk.BracketExitsEnabled {
+		return false
+	}
+	intent, err := store.GetStockOrderIntentByKey(ctx, intentKey)
+	if err != nil || intent == nil {
+		if err != nil {
+			logger.Warn("load prepared stock entry policy after broker miss", "intent_key", intentKey, "err", err)
+		}
+		return false
+	}
+	var req execution.OrderRequest
+	if err := json.Unmarshal(intent.RequestPayload, &req); err != nil {
+		logger.Warn("decode prepared stock entry policy after broker miss", "intent_key", intentKey, "err", err)
+		return false
+	}
+	return !req.RequireBrokerProtection
 }
 
 func terminalPreparedEntrySignal(sig *store.Signal, now time.Time) bool {

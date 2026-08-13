@@ -1695,8 +1695,9 @@ type RiskConfig struct {
 	// orders (GTC, whole shares): the take-profit and stop-loss live at the
 	// broker and fire intrabar, instead of the engine's hourly candle-close
 	// checks (measured ~1.5%/trade of exit slippage, PR #433 study).
-	// Requires stop_loss AND take_profit on the signal; entries sized under
-	// one whole share fall back to app-managed exits. Default off.
+	// Requires stop_loss AND take_profit on the signal. Enabled entries are
+	// whole-share only and reject rather than falling back to application-only
+	// protection. Default off.
 	BracketExitsEnabled bool `yaml:"bracket_exits_enabled"`
 
 	// EntryGates are evidence-driven entry-quality filters from the execution

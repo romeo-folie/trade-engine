@@ -35,6 +35,35 @@ type recoveryBroker struct {
 	patchErrs []error
 }
 
+type projectionFailureBroker struct {
+	*recoveryBroker
+	poisonID string
+	setupErr error
+}
+
+func (b *projectionFailureBroker) PlaceOrder(ctx context.Context, req execution.OrderRequest) (execution.OrderResult, error) {
+	parent, err := store.GetStockOrderIntentByKey(ctx, req.IntentKey)
+	if err != nil || parent == nil {
+		b.setupErr = fmt.Errorf("load accepted parent: %w", err)
+		return execution.OrderResult{}, b.setupErr
+	}
+	if err := store.GetDB().QueryRow(ctx, `SELECT uuid_generate_v4()::text`).Scan(&b.poisonID); err != nil {
+		b.setupErr = err
+		return execution.OrderResult{}, err
+	}
+	childKey := "bracket-child:" + parent.ID + ":take-profit"
+	b.setupErr = store.CreateStockOrderIntent(ctx, store.StockOrderIntent{
+		ID: b.poisonID, IdempotencyKey: "poison:" + b.poisonID, ClientOrderID: childKey,
+		Ticker: req.Ticker, Side: "sell", OrderType: "limit", RequestedQty: req.Quantity,
+		RequestPayload: []byte(`{}`), PayloadHash: "poison", Status: "pending",
+	})
+	if b.setupErr != nil {
+		return execution.OrderResult{}, b.setupErr
+	}
+	result, err := b.recoveryBroker.PlaceOrder(ctx, req)
+	return result, err
+}
+
 type recoveryEffectsRecorder struct {
 	entries  []string
 	closes   []store.TradeRealization
@@ -2983,6 +3012,10 @@ func TestStockIntentRecoveryRestoresMissingBracketChildProjection(t *testing.T) 
 	broker.lookup[parent.ClientOrderID] = execution.OrderResult{
 		BrokerOrderID: "bracket-parent", Status: "filled", FilledPrice: 100, FilledQty: 2,
 		ChildOrderIDs: []string{"bracket-tp", "bracket-sl"},
+		ChildOrders: []execution.OrderLeg{
+			{BrokerOrderID: "bracket-tp", Type: "limit", Status: "filled", Quantity: 2, FilledQty: 1, FilledPrice: 120},
+			{BrokerOrderID: "bracket-sl", Type: "stop", Status: "cancelled", Quantity: 2},
+		},
 	}
 	if err := coordinator.Recover(ctx); err != nil {
 		t.Fatal(err)
@@ -3018,6 +3051,46 @@ func TestStockIntentRecoveryRestoresMissingBracketChildProjection(t *testing.T) 
 		JOIN stock_order_intents i ON i.id=o.stock_intent_id
 		WHERE i.parent_intent_id=$1::uuid`, parent.ID).Scan(&children); err != nil || children != 2 {
 		t.Fatalf("restored bracket child orders=%d err=%v, want 2", children, err)
+	}
+	var filledQty, filledPrice float64
+	var status string
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT o.filled_qty, o.filled_price, o.status
+		FROM orders o
+		JOIN stock_order_intents i ON i.id=o.stock_intent_id
+		WHERE i.parent_intent_id=$1::uuid AND o.broker_order_id='bracket-tp'`, parent.ID,
+	).Scan(&filledQty, &filledPrice, &status); err != nil {
+		t.Fatalf("load restored take-profit projection: %v", err)
+	}
+	if filledQty != 1 || filledPrice != 120 || status != "filled" {
+		t.Fatalf("restored take-profit fill=%v @ %v status=%q, want 1 @ 120 filled", filledQty, filledPrice, status)
+	}
+}
+
+func TestStockIntentProjectionFailurePreservesAcceptedBrokerResult(t *testing.T) {
+	ctx := context.Background()
+	signalID := insertRecoverySignal(t, "RINTENTPROJECTIONFAIL")
+	broker := &projectionFailureBroker{
+		recoveryBroker: newRecoveryBroker(execution.OrderResult{
+			BrokerOrderID: "accepted-before-projection", Status: "accepted",
+			ChildOrderIDs: []string{"projection-failure-tp", "projection-failure-sl"},
+		}),
+	}
+	coordinator := stockorders.New(broker)
+	req := entryRequest(signalID, "RINTENTPROJECTIONFAIL", 2)
+	req.OrderClass, req.TimeInForce, req.TakeProfitPrice, req.StopLossPrice = "bracket", "gtc", 120, 90
+	result, err := coordinator.PlaceOrder(ctx, req)
+	if err == nil {
+		t.Fatal("expected duplicate child client id projection to fail")
+	}
+	if broker.setupErr != nil {
+		t.Fatalf("failed to create projection conflict: %v", broker.setupErr)
+	}
+	t.Cleanup(func() {
+		_, _ = store.GetDB().Exec(context.Background(), `DELETE FROM stock_order_intents WHERE id=$1::uuid`, broker.poisonID)
+	})
+	if result.BrokerOrderID != "accepted-before-projection" {
+		t.Fatalf("accepted result = %+v; broker identity was lost", result)
 	}
 }
 

@@ -163,6 +163,10 @@ type OrderRequest struct {
 	PolicyStopLoss     float64
 	PolicyTakeProfit   float64
 	UncappedTakeProfit bool
+	// RequireBrokerProtection marks an entry whose accepted shares must be
+	// covered by a broker-resident stop. It is durable so replay/recovery never
+	// silently downgrades a protected entry to application-managed exits.
+	RequireBrokerProtection bool
 	// ExitReason and ExitEvidence are durable stock-order metadata for
 	// standalone protective stops. Broker adapters ignore them; the coordinator
 	// persists them in the immutable request so recovery retains the policy
@@ -174,14 +178,37 @@ type OrderRequest struct {
 // OrderResult is the immediate response from the broker.
 type OrderResult struct {
 	BrokerOrderID string
-	Status        string  // pending | filled | partial | cancelled
-	FilledPrice   float64 // 0 if not yet filled
-	FilledQty     float64
-	FilledAt      time.Time // zero when the broker does not supply execution time
+	Status        string // pending | filled | partial | cancelled
+	// Quantity and RemainingQty are broker-authoritative order quantities. They
+	// are needed to prove that a live protective stop covers the shares the
+	// broker still holds, rather than merely proving that a local leg row exists.
+	Quantity     float64
+	RemainingQty float64
+	FilledPrice  float64 // 0 if not yet filled
+	FilledQty    float64
+	FilledAt     time.Time // zero when the broker does not supply execution time
 	// ChildOrderIDs holds the TP and stop-loss order IDs for bracket orders
 	// (index 0 = take-profit, index 1 = stop-loss). Empty for single-leg orders.
 	ChildOrderIDs []string
-	RequestID     string // Alpaca X-Request-ID, for audit/support correlation
+	// ChildOrders retains the broker's nested bracket-leg state when available.
+	// ChildOrderIDs is kept for existing callers that only need durable identity.
+	ChildOrders []OrderLeg
+	RequestID   string // Alpaca X-Request-ID, for audit/support correlation
+}
+
+// OrderLeg is one broker-reported child of a complex order, such as the
+// take-profit or stop-loss side of an Alpaca bracket.
+type OrderLeg struct {
+	BrokerOrderID string
+	Type          string
+	Status        string
+	Quantity      float64
+	RemainingQty  float64
+	FilledQty     float64
+	FilledPrice   float64
+	FilledAt      time.Time
+	LimitPrice    float64
+	StopPrice     float64
 }
 
 // ClientOrderLookup is the optional broker capability used after an ambiguous

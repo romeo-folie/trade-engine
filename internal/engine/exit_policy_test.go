@@ -107,6 +107,83 @@ func TestUncappedEntryRequiresCoherentHardStop(t *testing.T) {
 	}
 }
 
+func TestNormalizedStockBracketPricesRejectsUnsafeBrokerRoundedLevels(t *testing.T) {
+	// These model values are distinct but both become $10.00 at Alpaca's
+	// two-decimal increment, so accepting them would submit an incoherent leg.
+	if _, _, ok := normalizedStockBracketPrices(10, 9.9951, 10.0049); ok {
+		t.Fatal("broker-rounded equal stop/target levels must be rejected")
+	}
+	stop, target, ok := normalizedStockBracketPrices(10.01, 9.994, 10.026)
+	if !ok || stop != 9.99 || target != 10.03 {
+		t.Fatalf("normalized bracket = stop %.4f target %.4f ok %v", stop, target, ok)
+	}
+}
+
+func TestBrokerBracketProtectionRequiresActiveWholeShareStop(t *testing.T) {
+	if brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "partial", Quantity: 5, FilledQty: 2,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 5, RemainingQty: 5}},
+	}, 2) {
+		t.Fatal("held child must not protect a partial bracket parent")
+	}
+	if brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 4, RemainingQty: 4}},
+	}, 5) {
+		t.Fatal("undersized stop must not count as protection")
+	}
+	if !brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 5, RemainingQty: 5}},
+	}, 5) {
+		t.Fatal("active whole-share stop covering the position was rejected")
+	}
+	if !brokerBracketProtectionVerified(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "done_for_day", Quantity: 5, RemainingQty: 5}},
+	}, 5) {
+		t.Fatal("GTC stop reported done_for_day must remain active protection")
+	}
+}
+
+func TestBrokerBracketProtectionStateDistinguishesHeldAndActiveCoverage(t *testing.T) {
+	partial := brokerBracketProtectionState(execution.OrderResult{
+		Status: "partial", Quantity: 5, RemainingQty: 3, FilledQty: 2,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 5, RemainingQty: 5}},
+	}, 2)
+	if partial.HeldQty != 2 || partial.WorkingEntryQty != 3 || partial.ProtectedQty != 0 || partial.UnprotectedQty != 2 {
+		t.Fatalf("partial protection state = %+v", partial)
+	}
+	active := brokerBracketProtectionState(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "new", Quantity: 3, RemainingQty: 3}},
+	}, 3)
+	if active.ProtectedQty != 3 || active.UnprotectedQty != 0 {
+		t.Fatalf("active protection state = %+v", active)
+	}
+	partialStop := brokerBracketProtectionState(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "partial", Quantity: 5, RemainingQty: 2, FilledQty: 3}},
+	}, 5)
+	if partialStop.ProtectedQty != 2 || partialStop.UnprotectedQty != 3 {
+		t.Fatalf("partially filled stop state = %+v", partialStop)
+	}
+}
+
+func TestBrokerCoverageHeldQtyUsesFreshParentFill(t *testing.T) {
+	parent := execution.OrderResult{Status: "filled", Quantity: 5, FilledQty: 5}
+	if got := brokerCoverageHeldQty(2, parent); got != 5 {
+		t.Fatalf("held quantity = %v, want broker's newer cumulative fill of 5", got)
+	}
+	state := brokerBracketProtectionState(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}},
+	}, brokerCoverageHeldQty(2, parent))
+	if state.UnprotectedQty != 3 {
+		t.Fatalf("fresh broker fill must expose 3 uncovered shares, state=%+v", state)
+	}
+}
+
 func TestSellExitConfidenceGate(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

@@ -9,10 +9,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/romeo-folie/trade-engine/internal/execution"
 	"github.com/romeo-folie/trade-engine/internal/logger"
 	"github.com/romeo-folie/trade-engine/internal/store"
 )
+
+// stockEntryBrokerProtection is a package variable so reconciliation tests can
+// exercise a transient durable-policy read failure without taking down the
+// shared database pool.
+var stockEntryBrokerProtection = store.StockEntryBrokerProtection
 
 // Broker-resident bracket exits (#435). The execution study measured the
 // stock path's hourly candle-close stop checks costing ~1.5%/trade: 49 of 53
@@ -140,6 +146,20 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		legs = standaloneStopLegs(all)
 	}
 	if len(legs) == 0 {
+		if required, parentID, policyErr := stockEntryBrokerProtection(ctx, t.ID); policyErr != nil && !errors.Is(policyErr, pgx.ErrNoRows) {
+			// A strict entry with an unreadable policy may still have live,
+			// unprojected broker children. Do not let software exits race them.
+			logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
+				"trade_id", t.ID, "ticker", t.Ticker, "err", policyErr)
+			return true, policyErr
+		} else if policyErr == nil && required && parentID != "" {
+			// A strict protected entry must never be handed to software exits
+			// merely because child projection failed or the broker legs vanished.
+			// A fresh parent snapshot can still prove the broker stop is healthy
+			// when a transient local child write is the only missing projection.
+			e.verifyOrContainBrokerEntryAsync(t.ID, parentID, t.Ticker, t.Quantity)
+			return true, nil
+		}
 		return false, nil
 	}
 
@@ -227,6 +247,30 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 	if filledIdx >= 0 {
 		handled, closeErr := e.closeBracketTrade(ctx, t, states, filledIdx, ownsAllExits)
 		return handled, errors.Join(pollErr, closeErr)
+	}
+	required, parentID, policyErr := stockEntryBrokerProtection(ctx, t.ID)
+	if policyErr != nil && !errors.Is(policyErr, pgx.ErrNoRows) {
+		// This path is reached when projected legs have all become terminal.
+		// A transient policy read is still not proof that a strict entry can
+		// safely hand ownership back to application-managed exits.
+		logger.Warn("bracket exits: strict policy lookup failed — retaining broker ownership",
+			"trade_id", t.ID, "ticker", t.Ticker, "err", policyErr)
+		return true, errors.Join(pollErr, policyErr)
+	}
+	if policyErr == nil && required && parentID != "" {
+		if brokerStopSnapshotUnknown(states) {
+			// A failed stop lookup is not evidence that protection disappeared.
+			// Keep broker ownership and retry before taking a destructive action.
+			return true, pollErr
+		}
+		if !workingBrokerStopCoversTrade(states, brokerSnapshotRemainingTradeQty(t.Quantity, states)) {
+			// A live TP is not downside protection. Retain broker ownership and
+			// verify the parent snapshot before containing the position. The
+			// projected legs can be stale or incomplete even while its broker
+			// stop covers the full current holding.
+			e.verifyOrContainBrokerEntryAsync(t.ID, parentID, t.Ticker, t.Quantity)
+			return true, pollErr
+		}
 	}
 	if working > 0 {
 		// A working order may already have sold part of the position. Apply
@@ -395,6 +439,53 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		return false, pollErr
 	}
 	return ownsAllExits, pollErr
+}
+
+func brokerStopSnapshotUnknown(states []legState) bool {
+	for _, state := range states {
+		if state.leg.IsStopLoss && !state.ok {
+			return true
+		}
+	}
+	return false
+}
+
+// brokerSnapshotRemainingTradeQty anticipates cumulative broker fills that
+// will be atomically applied later in this sweep. This avoids treating a stop
+// that Alpaca correctly reduced after a TP partial as too small merely because
+// the local trade row has not yet caught up.
+func brokerSnapshotRemainingTradeQty(currentQty float64, states []legState) float64 {
+	remaining := currentQty
+	for _, state := range states {
+		if !state.ok || state.res.FilledQty <= state.leg.FilledQty {
+			continue
+		}
+		remaining -= state.res.FilledQty - state.leg.FilledQty
+	}
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func workingBrokerStopCoversTrade(states []legState, heldQty float64) bool {
+	for _, state := range states {
+		if !state.leg.IsStopLoss || !state.ok {
+			continue
+		}
+		status := normalizeBrokerExitStatus(state.leg, state.res.Status)
+		if status == "cancelled" || status == "rejected" || status == "filled" || state.res.Status == "held" {
+			continue
+		}
+		qty := state.res.RemainingQty
+		if qty <= 0 && state.res.Quantity == 0 {
+			qty = state.leg.Quantity
+		}
+		if qty+1e-9 >= heldQty {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {
