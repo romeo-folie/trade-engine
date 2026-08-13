@@ -224,6 +224,9 @@ func TestCancelBrokerBracketChildren_RetainsParentReportedFillWhenLookupMisses(t
 }
 
 func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
 	checks := make(chan struct{}, 3)
 	exec := &fakeBracketExec{
 		statuses: map[string]execution.OrderResult{
