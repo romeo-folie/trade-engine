@@ -57,7 +57,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 		// children when projection failed. Clear it before claiming the trade:
 		// if confirmation is uncertain, leave the trade open so the next sweep
 		// can retry instead of stranding it under an exit claim.
-		if !e.cancelBrokerBracketChildren(ctx, status.ChildOrders) {
+		if !e.cancelBrokerBracketChildren(ctx, tradeID, status.ChildOrders) {
 			return
 		}
 		intent := newExitIntent(store.ExitReasonStopLoss, map[string]any{
@@ -120,7 +120,7 @@ func (e *Engine) containUnprotectedBrokerEntry(ctx context.Context, tradeID, ent
 // nested bracket-parent snapshot. The local projection can be incomplete
 // precisely when this containment path is needed, so local orders alone are
 // not a sufficient cancellation inventory.
-func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, children []execution.OrderLeg) bool {
+func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, tradeID string, children []execution.OrderLeg) bool {
 	for _, child := range children {
 		if child.BrokerOrderID == "" {
 			continue
@@ -129,6 +129,10 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, children []exe
 		// child's own endpoint has been purged. Never flatten against the
 		// stale local trade quantity in that case.
 		if child.FilledQty > 1e-9 || execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc") == "filled" {
+			if err := persistParentReportedBracketChildFill(ctx, tradeID, child); err != nil {
+				logger.Warn("broker protection: persist parent-reported child fill", "trade_id", tradeID,
+					"broker_order_id", child.BrokerOrderID, "err", err)
+			}
 			logger.Warn("broker protection: parent reports broker child fill during containment; awaiting reconciliation",
 				"broker_order_id", child.BrokerOrderID, "filled_qty", child.FilledQty)
 			return false
@@ -162,6 +166,29 @@ func (e *Engine) cancelBrokerBracketChildren(ctx context.Context, children []exe
 		}
 	}
 	return true
+}
+
+// persistParentReportedBracketChildFill applies a nested parent snapshot to an
+// already-projected child row before containment defers. Alpaca can purge the
+// child's direct endpoint after a fill, leaving this parent response as the
+// only evidence capable of reducing the durable trade quantity.
+func persistParentReportedBracketChildFill(ctx context.Context, tradeID string, child execution.OrderLeg) error {
+	if child.BrokerOrderID == "" || child.FilledQty <= 0 {
+		return nil
+	}
+	order, err := store.GetOrderByBrokerOrderID(ctx, child.BrokerOrderID)
+	if err != nil || order == nil {
+		return err
+	}
+	if order.TradeID != tradeID {
+		return fmt.Errorf("broker child is linked to trade %s", order.TradeID)
+	}
+	_, _, err = store.ApplyPartialExitAtForBrokerOrder(
+		ctx, tradeID, order.ID, child.BrokerOrderID,
+		child.FilledPrice, child.FilledQty,
+		execution.NormalizeOrderStatusForTimeInForce(child.Status, "gtc"), child.FilledAt,
+	)
+	return err
 }
 
 func (e *Engine) containUnprotectedBrokerEntryAsync(tradeID, entryBrokerOrderID, ticker, reason string) {

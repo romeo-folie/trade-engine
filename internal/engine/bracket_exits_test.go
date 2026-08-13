@@ -220,7 +220,7 @@ func TestCancelBrokerBracketChildren_RetainsParentReportedFillWhenLookupMisses(t
 		"filled-child": execution.ErrOrderNotFound,
 	}}
 	e := newBracketTestEngine(exec)
-	if e.cancelBrokerBracketChildren(context.Background(), []execution.OrderLeg{{
+	if e.cancelBrokerBracketChildren(context.Background(), "", []execution.OrderLeg{{
 		BrokerOrderID: "filled-child", Status: "filled", FilledQty: 1,
 	}}) {
 		t.Fatal("parent-reported child fill must block containment until reconciliation")
@@ -602,6 +602,48 @@ func TestApplyBracketChildSnapshotPersistsFill(t *testing.T) {
 	}})
 	if order.FilledQty != 1 || order.FilledPrice != 120 || order.Status != "filled" || order.FilledAt == nil || !order.FilledAt.Equal(filledAt) {
 		t.Fatalf("persisted child snapshot = %+v", order)
+	}
+}
+
+func TestContainUnprotectedBrokerEntry_PersistsParentOnlyFillForProjectedChild(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "PARENT_ONLY_CHILD_FILL", Direction: "long", Strategy: "test", EntryPrice: 100, Quantity: 5, Status: "open",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentID := "parent-only-fill-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "PARENT_ONLY_CHILD_FILL", Side: "buy", OrderType: "market",
+		Quantity: 5, FilledPrice: 100, FilledQty: 5, Status: "filled",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: "parent-only-tp", Ticker: "PARENT_ONLY_CHILD_FILL", Side: "sell", OrderType: "limit",
+		Quantity: 5, LimitPrice: 120, Status: "pending", IsTakeProfit: true, ParentOrderID: parentID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		parentID: {Status: "filled", FilledPrice: 100, FilledQty: 5, ChildOrders: []execution.OrderLeg{
+			{BrokerOrderID: "parent-only-tp", Type: "limit", Status: "filled", FilledQty: 2, FilledPrice: 120},
+		}},
+	}}
+	e := newBracketTestEngine(exec)
+	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "PARENT_ONLY_CHILD_FILL", "missing stop")
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Quantity != 3 {
+		t.Fatalf("parent-only fill trade = %#v err=%v, want remaining quantity 3", trade, err)
+	}
+	child, err := store.GetOrderByBrokerOrderID(ctx, "parent-only-tp")
+	if err != nil || child == nil || child.FilledQty != 2 || child.FilledPrice != 120 || child.Status != "filled" {
+		t.Fatalf("parent-only fill order = %#v err=%v", child, err)
 	}
 }
 
