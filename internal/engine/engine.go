@@ -2629,6 +2629,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 	// after bracket/uncapped transformations. Signal-generation checks omit
 	// ProposedQuantity and retain their legacy early-screening behavior.
 	owned := []store.Trade(nil)
+	var durableOwned []store.Trade
 	if store.IsConnected() && !admission.BrokerHeldReplay {
 		owned, err = store.GetOwnedPositionTrades(ctx)
 		if err != nil {
@@ -2637,6 +2638,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason, "err", err)
 			return
 		}
+		durableOwned = append(durableOwned, owned...)
 		if admission.BrokerAuthoritative {
 			owned = append(owned, reservationTrades(admission.Reservations, intentKey)...)
 			owned = append(owned, manualWorkingEntryTrades(admission.WorkingOrders, admission.Reservations, admission.Ask)...)
@@ -2671,7 +2673,7 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 			brokerLongNotional(admission.BrokerPositions, sig.Ticker, sig.SignalPrice),
 			pendingStockEntryNotional(admission.Reservations, admission.WorkingOrders, intentKey, sig.Ticker, sig.SignalPrice),
 		)
-		if err := mergeBrokerLongOccupancy(&riskIn, admission.BrokerPositions, sig.Ticker); err != nil {
+		if err := mergeBrokerLongOccupancy(&riskIn, admission.BrokerPositions, sig.Ticker, durableOwned); err != nil {
 			reason := err.Error()
 			_ = store.UpdateSignalStatus(ctx, sigID, "blocked", reason)
 			logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)

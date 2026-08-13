@@ -580,7 +580,7 @@ func TestMergeBrokerLongOccupancyIncludesUnadoptedSymbols(t *testing.T) {
 		{Symbol: "MSFT", Side: "long", Quantity: 1, AvgEntryPrice: 100},
 		{Symbol: "AAPL", Side: "long", Quantity: 1, AvgEntryPrice: 200},
 		{Symbol: "NVDA", Side: "long", Quantity: 2, AvgEntryPrice: 100},
-	}, "NVDA"); err != nil {
+	}, "NVDA", []store.Trade{{Ticker: "MSFT", Direction: "long", Quantity: 1}}); err != nil {
 		t.Fatal(err)
 	}
 	if in.OpenPositions != 3 || in.OpenByTicker["MSFT"] != 1 || in.OpenByTicker["AAPL"] != 1 || in.OpenByTicker["NVDA"] != 1 {
@@ -589,14 +589,14 @@ func TestMergeBrokerLongOccupancyIncludesUnadoptedSymbols(t *testing.T) {
 	if !in.HoldsLong || in.LongQuantity != 2 || in.LongAvgEntryPrice != 100 {
 		t.Fatalf("target broker pyramid context = %+v", in)
 	}
-	if err := mergeBrokerLongOccupancy(&in, []execution.BrokerPosition{{Symbol: "TSLA", Side: "short", Quantity: -1}}, "NVDA"); err != nil {
+	if err := mergeBrokerLongOccupancy(&in, []execution.BrokerPosition{{Symbol: "TSLA", Side: "short", Quantity: -1}}, "NVDA", nil); err != nil {
 		t.Fatal(err)
 	}
 	if in.OpenPositions != 4 {
 		t.Fatalf("broker short did not consume overall capacity: %+v", in)
 	}
 	local := risk.CheckInput{HoldsLong: true, LongQuantity: 3, LongAvgEntryPrice: 125}
-	if err := mergeBrokerLongOccupancy(&local, []execution.BrokerPosition{{Symbol: "NVDA", Side: "long", Quantity: 2, AvgEntryPrice: 100}}, "NVDA"); err != nil {
+	if err := mergeBrokerLongOccupancy(&local, []execution.BrokerPosition{{Symbol: "NVDA", Side: "long", Quantity: 2, AvgEntryPrice: 100}}, "NVDA", nil); err != nil {
 		t.Fatal(err)
 	}
 	if local.LongQuantity != 3 || local.LongAvgEntryPrice != 125 {
@@ -606,9 +606,20 @@ func TestMergeBrokerLongOccupancyIncludesUnadoptedSymbols(t *testing.T) {
 		{Symbol: "BADQ", Side: "long", Quantity: math.NaN()},
 		{Symbol: "BADS", Side: "unknown", Quantity: 1},
 	} {
-		if err := mergeBrokerLongOccupancy(&risk.CheckInput{}, []execution.BrokerPosition{position}, "NVDA"); err == nil {
+		if err := mergeBrokerLongOccupancy(&risk.CheckInput{}, []execution.BrokerPosition{position}, "NVDA", nil); err == nil {
 			t.Fatalf("malformed broker position passed admission: %+v", position)
 		}
+	}
+
+	pending := risk.CheckInput{OpenPositions: 1, OpenByTicker: map[string]int{"AAPL": 1}}
+	if err := mergeBrokerLongOccupancy(&pending, []execution.BrokerPosition{{Symbol: "AAPL", Side: "long", Quantity: 1, AvgEntryPrice: 100}}, "NVDA", nil); err != nil {
+		t.Fatal(err)
+	}
+	if pending.OpenPositions != 2 || pending.OpenByTicker["AAPL"] != 2 {
+		t.Fatalf("broker long was collapsed into pending BUY: %+v", pending)
+	}
+	if err := mergeBrokerLongOccupancy(&risk.CheckInput{}, []execution.BrokerPosition{{Symbol: "NVDA", Side: "short", Quantity: -1}}, "NVDA", nil); err == nil {
+		t.Fatal("target broker short did not block BUY admission")
 	}
 }
 

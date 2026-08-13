@@ -674,14 +674,21 @@ func brokerLongPosition(positions []execution.BrokerPosition, ticker string) (qu
 
 // mergeBrokerLongOccupancy makes broker truth part of every position budget,
 // not only target-ticker notional. Alpaca aggregates one holding per symbol,
-// so a broker position overlays local lots for that ticker instead of adding a
-// second position; an otherwise-unrepresented broker symbol consumes one slot.
-func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerPosition, target string) error {
+// so a broker position overlays a filled local lot for that ticker instead of
+// adding a second position. Pending reservations are not positions yet, so an
+// otherwise-unrepresented broker holding consumes its own slot alongside them.
+func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerPosition, target string, durableOwned []store.Trade) error {
 	if in == nil {
 		return nil
 	}
 	if in.OpenByTicker == nil {
 		in.OpenByTicker = make(map[string]int)
+	}
+	filledLongs := make(map[string]struct{})
+	for _, trade := range durableOwned {
+		if strings.EqualFold(trade.Direction, "long") && trade.Quantity > 0 {
+			filledLongs[strings.ToUpper(strings.TrimSpace(trade.Ticker))] = struct{}{}
+		}
 	}
 	for _, position := range positions {
 		symbol := strings.TrimSpace(position.Symbol)
@@ -692,6 +699,9 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 			return errorsForAdmission("broker position has invalid quantity for capacity check")
 		}
 		if strings.EqualFold(position.Side, "short") {
+			if strings.EqualFold(symbol, target) {
+				return errorsForAdmission("broker holds a short position in the requested BUY ticker")
+			}
 			// Shorts consume overall capacity but must not influence BUY-only
 			// pyramid ownership or per-ticker long limits.
 			key, count := riskInputTickerCount(in.OpenByTicker, symbol)
@@ -710,7 +720,13 @@ func mergeBrokerLongOccupancy(in *risk.CheckInput, positions []execution.BrokerP
 			return errorsForAdmission("broker long position has invalid quantity for capacity check")
 		}
 		key, count := riskInputTickerCount(in.OpenByTicker, symbol)
-		if count == 0 {
+		_, representedByFilledLot := filledLongs[strings.ToUpper(symbol)]
+		if !representedByFilledLot {
+			// A broker-only long and a pending BUY are distinct future lots. Do
+			// not let the pending reservation hide the existing broker holding.
+			in.OpenByTicker[key] = count + 1
+			in.OpenPositions++
+		} else if count == 0 {
 			in.OpenByTicker[symbol] = 1
 			in.OpenPositions++
 		} else if key != symbol {
