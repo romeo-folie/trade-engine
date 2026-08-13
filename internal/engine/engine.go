@@ -2337,6 +2337,18 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		return
 	}
 
+	if enabled, reason := buyEntriesEnabled(ctx); !enabled {
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Warn("signal execution blocked", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "buy_control",
+		})
+		return
+	}
+
 	// A pullback entry's edge and risk are anchored to the signal-session low.
 	// Revalidate against a fresh mark immediately before sizing/order placement:
 	// LLM latency, manual approval, or a restart may otherwise leave an already
@@ -3480,6 +3492,7 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 	var cash float64
 	var totalEquity float64
 	var dayPnL float64
+	var dailyBaselineKnown bool
 	brokerAuthoritative := brokerName(e.executor) == "alpaca"
 
 	if brokerAuthoritative {
@@ -3500,9 +3513,22 @@ func (e *Engine) refreshPortfolio(ctx context.Context) {
 			return
 		}
 		e.updateStockAccountPeak(acct.AccountID, acct.Equity)
+		if store.IsConnected() {
+			baseline, baselineErr := store.ObserveAccountRiskBaseline(ctx, acct.AccountID, acct.Equity, acct.LastEquity, time.Now())
+			if baselineErr != nil {
+				logger.Warn("persist broker account risk baseline", "account_id", acct.AccountID, "err", baselineErr)
+			} else if baseline.LastEquity > 0 {
+				// Make dashboard and in-process risk telemetry use the same
+				// account-scoped daily baseline as final BUY admission.
+				dayPnL = acct.Equity - baseline.LastEquity
+				dailyBaselineKnown = true
+			}
+		}
 		cash = acct.Cash
 		totalEquity = acct.Equity
-		dayPnL = acct.Equity - acct.LastEquity
+		if !dailyBaselineKnown {
+			dayPnL = acct.Equity - acct.LastEquity
+		}
 	} else if acct, err := e.executor.GetAccount(ctx); err != nil {
 		logger.Warn("get broker account for portfolio refresh — falling back to local derivation", "err", err)
 	} else {
@@ -4271,6 +4297,7 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 	var holdsLong bool
 	var longQuantity float64
 	var longCostBasis float64 // sum of qty * entry_price across open longs
+	var longNotional float64  // mark-to-market long exposure in the target ticker
 	var longMaxStop float64   // canonical (highest) existing stop across open longs
 	positions := make(map[string]struct{}, len(openTrades))
 	byTicker := make(map[string]int, len(openTrades))
@@ -4285,6 +4312,10 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 			holdsLong = true
 			longQuantity += t.Quantity
 			longCostBasis += t.Quantity * t.EntryPrice
+			// Use the signal's current mark rather than cost basis. A winner can
+			// grow past its original allocation before a pyramid attempt; only
+			// current notional enforces the promised combined exposure cap.
+			longNotional += t.Quantity * signalPrice
 			if t.StopLoss > longMaxStop {
 				longMaxStop = t.StopLoss
 			}
@@ -4295,25 +4326,26 @@ func buildRiskInput(cfg config.RiskConfig, action, ticker string, confidence, si
 		longAvgEntry = longCostBasis / longQuantity
 	}
 	return risk.CheckInput{
-		Cfg:               cfg,
-		Action:            action,
-		Ticker:            ticker,
-		Confidence:        confidence,
-		SizePct:           sizePct,
-		StopLoss:          stopLoss,
-		TakeProfit:        takeProfit,
-		SignalPrice:       signalPrice,
-		PortfolioValue:    pState.TotalValue,
-		Cash:              pState.Cash,
-		OpenPositions:     len(positions),
-		OpenByTicker:      byTicker,
-		DailyPnL:          pState.RealizedPnLDay,
-		PeakValue:         pState.PeakValue,
-		LastLossAt:        pState.LastLossAt,
-		HoldsLong:         holdsLong,
-		LongQuantity:      longQuantity,
-		LongAvgEntryPrice: longAvgEntry,
-		LongMaxStop:       longMaxStop,
+		Cfg:                    cfg,
+		Action:                 action,
+		Ticker:                 ticker,
+		Confidence:             confidence,
+		SizePct:                sizePct,
+		StopLoss:               stopLoss,
+		TakeProfit:             takeProfit,
+		SignalPrice:            signalPrice,
+		PortfolioValue:         pState.TotalValue,
+		Cash:                   pState.Cash,
+		OpenPositions:          len(positions),
+		OpenByTicker:           byTicker,
+		DailyPnL:               pState.RealizedPnLDay,
+		PeakValue:              pState.PeakValue,
+		LastLossAt:             pState.LastLossAt,
+		HoldsLong:              holdsLong,
+		LongQuantity:           longQuantity,
+		LongAvgEntryPrice:      longAvgEntry,
+		LongMaxStop:            longMaxStop,
+		ExistingTickerNotional: longNotional,
 	}
 }
 

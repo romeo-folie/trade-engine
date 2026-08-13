@@ -165,6 +165,26 @@ func TestSizeStockEntryRepresentativeBalances(t *testing.T) {
 	}
 }
 
+func TestMinimumWholeShareAllowedOnlyForValidSmallAccountRoundDown(t *testing.T) {
+	if !minimumWholeShareAllowed(0, false, 1, 15, 1_000, 20, 20) {
+		t.Fatal("valid $15 whole-share minimum did not pass $200 cap/capacity")
+	}
+	for _, tc := range []struct {
+		name                               string
+		qty, ask, equity, capacity, maxPct float64
+		fractionable                       bool
+	}{
+		{"already sized", 1, 15, 1_000, 20, 20, false},
+		{"fractionable", 0, 15, 1_000, 20, 20, true},
+		{"over position cap", 0, 201, 1_000, 300, 20, false},
+		{"over capacity", 0, 15, 1_000, 14, 20, false},
+	} {
+		if minimumWholeShareAllowed(tc.qty, tc.fractionable, 1, tc.ask, tc.equity, tc.capacity, tc.maxPct) {
+			t.Fatalf("%s: invalid one-share minimum passed", tc.name)
+		}
+	}
+}
+
 func TestFiveConcurrentStockEntryWorkersCannotReuseFunds(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("integration database unavailable")
@@ -564,6 +584,7 @@ func TestStockAccountPeakPreservesSameAccountTrackerHighAndRejectsCrossAccountPe
 func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *testing.T) {
 	now := time.Now().UTC()
 	valid := validAdmissionAccount(now)
+	valid.AccountID = fmt.Sprintf("refresh-test-%d", time.Now().UnixNano())
 	valid.Equity = 1_250
 	valid.LastEquity = 1_200
 	exec := &portfolioAlpacaExecutor{account: valid}
@@ -573,7 +594,10 @@ func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *tes
 
 	engine.refreshPortfolio(context.Background())
 	state := tracker.CurrentState()
-	if state.Cash != 0 || state.TotalValue != 1_250 || state.DayPnL != 50 {
+	// A newly observed account establishes its own daily baseline at current
+	// equity, so it cannot inherit a fabricated session loss from another
+	// account or process.
+	if state.Cash != 0 || state.TotalValue != 1_250 || state.DayPnL != 0 {
 		t.Fatalf("valid zero-cash snapshot fell back to configured capital: %+v", state)
 	}
 
@@ -589,6 +613,7 @@ func TestRefreshPortfolioPreservesZeroCashAndRejectsInvalidBrokerSnapshot(t *tes
 func TestRefreshPortfolioMaintainsAccountScopedBrokerPeak(t *testing.T) {
 	now := time.Now().UTC()
 	account := validAdmissionAccount(now)
+	account.AccountID = fmt.Sprintf("refresh-peak-test-%d", time.Now().UnixNano())
 	account.Equity, account.LastEquity = 10_000, 10_000
 	exec := &portfolioAlpacaExecutor{account: account}
 	engine := &Engine{cfg: &config.Config{}, executor: exec, portfolio: portfolio.NewTracker(time.Hour)}
@@ -596,7 +621,7 @@ func TestRefreshPortfolioMaintainsAccountScopedBrokerPeak(t *testing.T) {
 	exec.account.Equity, exec.account.LastEquity = 8_000, 8_000
 	exec.account.FetchedAt = time.Now().UTC()
 	engine.refreshPortfolio(context.Background())
-	if peak := engine.stockPeak("account-id"); peak != 10_000 {
+	if peak := engine.stockPeak(account.AccountID); peak != 10_000 {
 		t.Fatalf("same-account refresh peak = %.2f, want 10000", peak)
 	}
 	exec.account.AccountID, exec.account.AccountNumber = "new-id", "PA999"

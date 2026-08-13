@@ -980,6 +980,22 @@ func TestPositionSize_SellSkipsSizeCap(t *testing.T) {
 	assertPasses(t, checkPositionSize, in)
 }
 
+func TestCombinedTickerExposureCapsPyramidTotal(t *testing.T) {
+	in := baseInput()
+	in.PortfolioValue = 1_000
+	in.Cash = 1_000
+	in.Cfg.MaxPositionPct = 20
+	in.ExistingTickerNotional = 150
+	in.ProposedNotional = 60
+	result := checkCombinedTickerExposure(in)
+	if result.Passed {
+		t.Fatalf("$210 combined ticker exposure passed $200 cap: %+v", result)
+	}
+
+	in.ProposedNotional = 50
+	assertPasses(t, checkCombinedTickerExposure, in)
+}
+
 func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
 	// Since #436 a SELL is a close-only exit that strictly reduces risk.
 	// Capacity and trading-pause gates exist to limit NEW risk — blocking
@@ -999,6 +1015,7 @@ func TestExitGates_SellBypassesCapacityAndPauseGates(t *testing.T) {
 		fn   func(CheckInput) CheckResult
 	}{
 		{"max_open_positions", checkMaxOpenPositions},
+		{"combined_ticker_exposure", checkCombinedTickerExposure},
 		{"max_per_ticker", checkMaxPerTicker},
 		{"daily_loss_limit", checkDailyLossLimit},
 		{"max_drawdown", checkMaxDrawdown},

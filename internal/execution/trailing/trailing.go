@@ -145,6 +145,10 @@ type PriceFetcher interface {
 // uses the package-level store helpers; tests inject a fake.
 type TradeStore interface {
 	GetOpenTrades(ctx context.Context) ([]store.Trade, error)
+	// GetTradeByID reloads the durable lifecycle state immediately before a
+	// protective order mutation. The list used to start a trailing tick can be
+	// stale by the time it reaches the broker.
+	GetTradeByID(ctx context.Context, id string) (*store.Trade, error)
 	UpdateTradeTrailing(ctx context.Context, id string, stopLoss, highWaterMark float64) error
 	LatestStopLossOrderForTrade(ctx context.Context, tradeID string) (*store.Order, error)
 	// ExitLegsForMarketExit returns one DB snapshot containing both working
@@ -826,8 +830,63 @@ func (m *Manager) submitOrReplaceStop(ctx context.Context, t store.Trade, newSto
 	// only the final write would still allow two actors to derive different
 	// successor keys from the same stale stop row.
 	return store.WithTradeOrderLock(t.ID, func() error {
-		return m.submitOrReplaceStopLocked(ctx, t, newStop, intent)
+		// A broker stop can fill and be reconciled after updateAll read t but
+		// before this lifecycle obtains the lock. Never turn that old snapshot
+		// into a new full-quantity SELL: that was the LUNR short incident.
+		fresh, err := m.store.GetTradeByID(ctx, t.ID)
+		if err != nil {
+			return fmt.Errorf("reload trade before protective stop: %w", err)
+		}
+		if fresh == nil || !isLongStockTrade(*fresh) || fresh.Quantity <= 1e-9 {
+			logger.Info("trailing-stop: skip protective mutation for non-open long trade",
+				"trade_id", t.ID, "ticker", t.Ticker)
+			return nil
+		}
+		brokerQty, brokerVerified, verifyErr := m.brokerLongQuantity(ctx, fresh.Ticker)
+		if verifyErr != nil {
+			return fmt.Errorf("verify broker position before protective stop: %w", verifyErr)
+		}
+		if brokerVerified {
+			if brokerQty <= 1e-9 {
+				logger.Warn("trailing-stop: broker holds no long position; refusing protective sell",
+					"trade_id", fresh.ID, "ticker", fresh.Ticker)
+				return nil
+			}
+			fresh.Quantity = math.Min(fresh.Quantity, brokerQty)
+		}
+		// The pre-lock snapshot may also predate another ratchet. Preserve the
+		// durable floor so this delayed tick can never widen an already-raised
+		// stop.
+		newStop = math.Max(newStop, fresh.StopLoss)
+		return m.submitOrReplaceStopLocked(ctx, *fresh, newStop, intent)
 	})
+}
+
+// brokerLongQuantity obtains a just-in-time position check where the executor
+// can provide broker truth. Paper execution deliberately has no such source,
+// so its DB-backed simulation continues unchanged. A live broker read failure
+// fails closed: a delayed trailing tick must not guess that shares still exist.
+func (m *Manager) brokerLongQuantity(ctx context.Context, ticker string) (quantity float64, verified bool, err error) {
+	view, ok := m.exec.(execution.BrokerView)
+	if !ok {
+		return 0, false, nil
+	}
+	positions, err := view.PositionsSnapshot(ctx)
+	if errors.Is(err, execution.ErrBrokerUnavailable) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, true, err
+	}
+	for _, position := range positions {
+		if !strings.EqualFold(position.Symbol, ticker) || strings.EqualFold(position.Side, "short") {
+			continue
+		}
+		if position.Quantity > 0 {
+			quantity += position.Quantity
+		}
+	}
+	return quantity, true, nil
 }
 
 func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, newStop float64, intent store.ExitIntent) error {
@@ -919,6 +978,7 @@ func (m *Manager) submitOrReplaceStopLocked(ctx context.Context, t store.Trade, 
 		Quantity:     t.Quantity,
 		StopPrice:    newStop,
 		TradeID:      t.ID,
+		PositionIntent: "sell_to_close",
 		TimeInForce:  stopTIF,
 		IntentKey:    trailingStopIntentKey(t.ID, existing, newStop, t.Quantity),
 		ExitReason:   intent.Reason,

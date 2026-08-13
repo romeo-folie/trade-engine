@@ -52,6 +52,7 @@ func (s *Server) registerAPIHandlers(mux *http.ServeMux) {
 	mux.HandleFunc("/api/portfolio/positions", s.handlePortfolioPositions)
 	mux.HandleFunc("/api/system/cache", s.handleSystemCache)
 	mux.HandleFunc("/api/system/status", s.handleSystemStatus)
+	mux.HandleFunc("/api/system/buys", s.handleSystemBuys)
 	mux.HandleFunc("/api/system/config", s.handleSystemConfig)
 	mux.HandleFunc("/api/system/restart", s.handleSystemRestart)
 	mux.HandleFunc("/api/orb/sessions", s.handleORBSessions)
@@ -1296,6 +1297,17 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 
 	var peak float64
 	var drawdown float64
+	buyEntriesEnabled := true
+	buyControlSource := "default"
+	buyControlUpdatedAt := ""
+	readinessReasons := make([]string, 0)
+	environment := "live"
+	if cfg.Markets.Stocks.Paper {
+		environment = "paper"
+	}
+	readiness := map[string]any{
+		"workflow": cfg.Engine.Mode, "environment": environment,
+	}
 	if store.IsConnected() {
 		_ = store.GetDB().QueryRow(ctx, "SELECT COALESCE(MAX(total_value),0) FROM portfolio_snapshots").Scan(&peak)
 
@@ -1303,7 +1315,45 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		if peak > 0 && snap != nil && snap.TotalValue < peak {
 			drawdown = (peak - snap.TotalValue) / peak
 		}
+		if control, err := store.GetBuyControl(ctx, store.BuyControlStocks); err == nil {
+			buyEntriesEnabled = control.Enabled
+			if control.UpdatedBy != "" {
+				buyControlSource = control.UpdatedBy
+			}
+			if !control.UpdatedAt.IsZero() {
+				buyControlUpdatedAt = control.UpdatedAt.UTC().Format(time.RFC3339)
+			}
+		}
+		if raw, ok, err := store.GetEngineState(ctx, store.EngineStateBrokerDrift); err == nil && ok && raw != "" {
+			var reconciliation map[string]any
+			if json.Unmarshal([]byte(raw), &reconciliation) == nil {
+				readiness["reconciliation"] = reconciliation
+			}
+		}
 	}
+	readiness["buy_entries_enabled"] = buyEntriesEnabled
+	if !buyEntriesEnabled {
+		readinessReasons = append(readinessReasons, "new stock buys are paused")
+	}
+	if s.brokerView == nil {
+		readiness["broker_account"] = map[string]any{"available": false}
+		readinessReasons = append(readinessReasons, "broker account snapshot unavailable")
+	} else if account, err := s.brokerView.AccountSnapshot(ctx); err != nil {
+		readiness["broker_account"] = map[string]any{"available": false}
+		readinessReasons = append(readinessReasons, "broker account snapshot failed")
+	} else {
+		readiness["broker_account"] = map[string]any{
+			"available": true, "account_number": maskAccountNumber(account.AccountNumber),
+			"fetched_at":             account.FetchedAt.UTC().Format(time.RFC3339),
+			"buying_power_available": account.BuyingPowerAvailable,
+			"buying_power":           account.BuyingPower,
+			"trading_blocked":        account.TradingBlocked || account.AccountBlocked || account.TradeSuspendedByUser,
+		}
+		if account.TradingBlocked || account.AccountBlocked || account.TradeSuspendedByUser {
+			readinessReasons = append(readinessReasons, "broker account is trading-blocked")
+		}
+	}
+	readiness["reasons"] = readinessReasons
 
 	// Next engine run-cycle time, published by the engine loop to engine_state.
 	// Empty when the engine has not scheduled yet (e.g. DB down or no run loop).
@@ -1319,15 +1369,80 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonResponse(w, map[string]any{
-		"version":           "2.1.0",
-		"mode":              strings.ToUpper(cfg.Engine.Mode),
-		"tick_interval_sec": cfg.Engine.TickIntervalSec,
-		"tick_interval_min": float64(cfg.Engine.TickIntervalSec) / 60.0,
-		"uptime_seconds":    uptimeSec,
-		"drawdown":          drawdown,
-		"next_cycle_at":     nextCycleAt,
-		"next_cycle_in_sec": nextCycleInSec,
+		"version":                "2.1.0",
+		"mode":                   strings.ToUpper(cfg.Engine.Mode),
+		"tick_interval_sec":      cfg.Engine.TickIntervalSec,
+		"tick_interval_min":      float64(cfg.Engine.TickIntervalSec) / 60.0,
+		"uptime_seconds":         uptimeSec,
+		"drawdown":               drawdown,
+		"next_cycle_at":          nextCycleAt,
+		"next_cycle_in_sec":      nextCycleInSec,
+		"buy_entries_enabled":    buyEntriesEnabled,
+		"buy_control_source":     buyControlSource,
+		"buy_control_updated_at": buyControlUpdatedAt,
+		"readiness":              readiness,
 	})
+}
+
+func maskAccountNumber(accountNumber string) string {
+	accountNumber = strings.TrimSpace(accountNumber)
+	if len(accountNumber) <= 4 {
+		return accountNumber
+	}
+	return "••••" + accountNumber[len(accountNumber)-4:]
+}
+
+// GET /api/system/buys reports the persisted control. POST changes it only for
+// a loopback operator; the engine observes the resulting state immediately
+// before each BUY, without a restart. Exits are deliberately outside this API.
+func (s *Server) handleSystemBuys(w http.ResponseWriter, r *http.Request) {
+	if !store.IsConnected() {
+		apiError(w, "database not connected", nil)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	switch r.Method {
+	case http.MethodGet:
+		control, err := store.GetBuyControl(ctx, store.BuyControlStocks)
+		if err != nil {
+			apiError(w, "read buy control", err)
+			return
+		}
+		jsonResponse(w, map[string]any{
+			"enabled": control.Enabled, "updated_by": control.UpdatedBy, "updated_at": control.UpdatedAt,
+		})
+	case http.MethodPost:
+		if !isLoopback(r) {
+			http.Error(w, "forbidden: buy control requires local connection", http.StatusForbidden)
+			return
+		}
+		var request struct {
+			Enabled bool   `json:"enabled"`
+			Source  string `json:"source"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			apiError(w, "invalid buy control payload", err)
+			return
+		}
+		if strings.TrimSpace(request.Source) == "" {
+			request.Source = "web"
+		}
+		if err := store.SetBuyControl(ctx, store.BuyControlStocks, request.Enabled, request.Source); err != nil {
+			apiError(w, "set buy control", err)
+			return
+		}
+		control, err := store.GetBuyControl(ctx, store.BuyControlStocks)
+		if err != nil {
+			apiError(w, "read updated buy control", err)
+			return
+		}
+		jsonResponse(w, map[string]any{
+			"enabled": control.Enabled, "updated_by": control.UpdatedBy, "updated_at": control.UpdatedAt,
+		})
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // POST /api/system/restart — restricted to loopback callers.

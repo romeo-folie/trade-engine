@@ -547,6 +547,27 @@ func (e *Engine) closeBracketTrade(
 	filledIdx int,
 	fallbackHandled bool,
 ) (bool, error) {
+	var handled bool
+	err := store.WithTradeOrderLock(t.ID, func() error {
+		var closeErr error
+		handled, closeErr = e.closeBracketTradeLocked(ctx, t, states, filledIdx, fallbackHandled)
+		return closeErr
+	})
+	return handled, err
+}
+
+// closeBracketTradeLocked is the terminal side of the same per-trade
+// lifecycle lock used by initial-stop, recovery, and trailing mutations. A
+// filled stop must either finish reconciliation before a trailing worker can
+// inspect the trade, or wait for that worker to complete its fresh-state
+// check; otherwise a stale tick can submit a successor SELL after the fill.
+func (e *Engine) closeBracketTradeLocked(
+	ctx context.Context,
+	t store.Trade,
+	states []legState,
+	filledIdx int,
+	fallbackHandled bool,
+) (bool, error) {
 	filled := states[filledIdx]
 	exitReason := "stop-loss hit"
 	if filled.leg.IsTakeProfit {

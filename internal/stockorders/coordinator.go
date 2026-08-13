@@ -59,7 +59,12 @@ func New(inner execution.Executor) *Coordinator { return &Coordinator{inner: inn
 func (c *Coordinator) SetRecoveryObserver(observer RecoveryObserver) { c.observer = observer }
 
 func (c *Coordinator) recoveredClose(ctx context.Context, tradeID string) error {
-	realized, err := store.FinalizeTradeExit(ctx, tradeID)
+	var realized store.TradeRealization
+	err := store.WithTradeOrderLock(tradeID, func() error {
+		var finalizeErr error
+		realized, finalizeErr = store.FinalizeTradeExit(ctx, tradeID)
+		return finalizeErr
+	})
 	if err != nil {
 		return err
 	}

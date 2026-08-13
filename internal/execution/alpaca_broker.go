@@ -82,6 +82,9 @@ func (b *AlpacaBroker) PlaceOrder(ctx context.Context, req OrderRequest) (OrderR
 	if req.ClientOrderID != "" {
 		body["client_order_id"] = req.ClientOrderID
 	}
+	if req.PositionIntent != "" {
+		body["position_intent"] = req.PositionIntent
+	}
 	// Market orders must not include price fields — Alpaca returns 422 if they are present.
 	if req.Type != OrderTypeMarket {
 		if req.LimitPrice > 0 {

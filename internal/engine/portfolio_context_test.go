@@ -19,6 +19,9 @@ func TestBuildRiskInputPendingEntryUsesReferenceCostBasis(t *testing.T) {
 	if in.LongAvgEntryPrice != 150 {
 		t.Fatalf("pending-entry weighted cost basis = %v, want 150", in.LongAvgEntryPrice)
 	}
+	if in.ExistingTickerNotional != 2_400 {
+		t.Fatalf("ticker mark-to-market exposure = %v, want 2400", in.ExistingTickerNotional)
+	}
 }
 
 // TestBuildPortfolioContext maps tracker positions into the analysis request,

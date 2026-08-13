@@ -50,24 +50,28 @@ func TestGetAccount_DayPnL(t *testing.T) {
 }
 
 func TestAlpacaPlaceOrderUsesClientIDAndCapturesRequestID(t *testing.T) {
-	var clientID string
+	var clientID, positionIntent string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatal(err)
 		}
 		clientID, _ = body["client_order_id"].(string)
+		positionIntent, _ = body["position_intent"].(string)
 		w.Header().Set("X-Request-ID", "req-123")
 		fmt.Fprintln(w, `{"id":"broker-1","status":"accepted","filled_avg_price":"","filled_qty":""}`)
 	}))
 	defer ts.Close()
 	b := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
-	res, err := b.PlaceOrder(context.Background(), OrderRequest{Ticker: "SPY", Side: OrderSideBuy, Type: OrderTypeMarket, Quantity: 1, ClientOrderID: "te-stock-abc"})
+	res, err := b.PlaceOrder(context.Background(), OrderRequest{Ticker: "SPY", Side: OrderSideBuy, Type: OrderTypeMarket, Quantity: 1, ClientOrderID: "te-stock-abc", PositionIntent: "buy_to_open"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if clientID != "te-stock-abc" || res.RequestID != "req-123" {
 		t.Fatalf("client/request ids = %q/%q", clientID, res.RequestID)
+	}
+	if positionIntent != "buy_to_open" {
+		t.Fatalf("position_intent = %q", positionIntent)
 	}
 }
 

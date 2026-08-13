@@ -33,6 +33,7 @@ type stockEntryAdmission struct {
 	Quantity            float64
 	RemainingCapacity   float64
 	PeakEquity          float64
+	DailyBaseline       float64
 	Reservations        []store.ActiveStockEntryReservation
 	BrokerHeldReplay    bool
 	WorkingOrders       []execution.WorkingOrder
@@ -180,6 +181,15 @@ func (e *Engine) prepareStockEntryAdmission(
 		if err != nil {
 			return stockEntryAdmission{}, err
 		}
+		// A small account can have a valid positive allocation that rounds to
+		// zero only because this asset is whole-share-only. Permit exactly one
+		// share, never a fractional fallback, and only when the resulting
+		// notional itself fits the configured position cap and fresh capacity.
+		// The final release gate still applies the exact stop-distance dollar
+		// risk check before the broker request is sent.
+		if minimumWholeShareAllowed(quantity, asset.Fractionable, sizePct, ask, account.Equity, capacity, e.cfg.Risk.MaxPositionPct) {
+			quantity = 1
+		}
 	}
 	if !finitePositive(quantity) {
 		return stockEntryAdmission{}, errorsForAdmission("available buying power produces zero quantity")
@@ -188,13 +198,16 @@ func (e *Engine) prepareStockEntryAdmission(
 		return stockEntryAdmission{}, errorsForAdmission("exact entry quantity exceeds available buying power")
 	}
 
-	e.updateStockAccountPeak(account.AccountID, account.Equity)
-	peak := e.stockPeak(account.AccountID)
+	baseline, err := store.ObserveAccountRiskBaseline(ctx, account.AccountID, account.Equity, account.LastEquity, now)
+	if err != nil {
+		return stockEntryAdmission{}, fmt.Errorf("stock entry admission: persist account risk baseline: %w", err)
+	}
 	return stockEntryAdmission{
 		BrokerAuthoritative: true,
 		Account:             account, Asset: asset, Ask: ask, QuoteAt: quote.Timestamp, Quantity: quantity,
 		RemainingCapacity: capacity,
-		PeakEquity:        peak, Reservations: reservations, BrokerHeldReplay: brokerHeldReplay,
+		PeakEquity:        baseline.PeakEquity, DailyBaseline: baseline.LastEquity,
+		Reservations: reservations, BrokerHeldReplay: brokerHeldReplay,
 		WorkingOrders: working,
 	}, nil
 }
@@ -477,6 +490,11 @@ func sizeStockEntry(equity, sizePct, capacity, ask float64, fractionable bool) (
 	return floorStockQuantity(math.Min(desiredNotional, capacity)/ask, fractionable), nil
 }
 
+func minimumWholeShareAllowed(quantity float64, fractionable bool, sizePct, ask, equity, capacity, maxPositionPct float64) bool {
+	return quantity <= 0 && !fractionable && sizePct > 0 && ask > 0 &&
+		maxPositionPct > 0 && ask <= equity*maxPositionPct/100+1e-9 && ask <= capacity+1e-9
+}
+
 func finite(v float64) bool            { return !math.IsNaN(v) && !math.IsInf(v, 0) }
 func finitePositive(v float64) bool    { return finite(v) && v > 0 }
 func finiteNonNegative(v float64) bool { return finite(v) && v >= 0 }
@@ -503,8 +521,12 @@ func brokerStockRiskState(current portfolio.State, admission stockEntryAdmission
 	current.TotalValue = admission.Account.Equity
 	current.Cash = admission.Account.Cash
 	current.PeakValue = admission.PeakEquity
-	// RealizedPnLDay intentionally remains local realized P&L. Alpaca's
-	// equity-last_equity includes unrealized movement and transfers.
+	// The persisted account-scoped daily reference captures both realized and
+	// unrealized loss. It therefore remains correct across restarts instead of
+	// resetting to a process-local realized-P&L counter.
+	if admission.DailyBaseline > 0 {
+		current.RealizedPnLDay = admission.Account.Equity - admission.DailyBaseline
+	}
 	return current
 }
 

@@ -148,6 +148,16 @@ func (f *fakeStore) GetOpenTrades(_ context.Context) ([]store.Trade, error) {
 	return out, nil
 }
 
+func (f *fakeStore) GetTradeByID(_ context.Context, id string) (*store.Trade, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	t, ok := f.trades[id]
+	if !ok {
+		return nil, nil
+	}
+	return &t, nil
+}
+
 func (f *fakeStore) UpdateTradeTrailing(_ context.Context, id string, stopLoss, hwm float64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -526,6 +536,31 @@ func (b *fakeBroker) GetPositions(_ context.Context) ([]execution.Position, erro
 
 func (b *fakeBroker) GetAccount(_ context.Context) (execution.AccountInfo, error) {
 	return execution.AccountInfo{}, nil
+}
+
+// brokerViewFake adds an authoritative broker-position snapshot to the normal
+// order fake. It models the live executor path; plain fakeBroker intentionally
+// remains DB-only to model paper execution.
+type brokerViewFake struct {
+	*fakeBroker
+	positions   []execution.BrokerPosition
+	positionErr error
+}
+
+func (b *brokerViewFake) AccountSnapshot(context.Context) (execution.BrokerAccount, error) {
+	return execution.BrokerAccount{}, execution.ErrBrokerUnavailable
+}
+
+func (b *brokerViewFake) PositionsSnapshot(context.Context) ([]execution.BrokerPosition, error) {
+	return b.positions, b.positionErr
+}
+
+func (b *brokerViewFake) EquityCurve(context.Context, string, string) (execution.EquityHistory, error) {
+	return execution.EquityHistory{}, execution.ErrBrokerUnavailable
+}
+
+func (b *brokerViewFake) RecentFills(context.Context) ([]execution.BrokerOrder, error) {
+	return nil, execution.ErrBrokerUnavailable
 }
 
 // fakeBrokerWithReplace embeds fakeBroker and adds StopOrderReplacer support.
@@ -2792,6 +2827,7 @@ func TestSubmitStopFreshDefinitiveRejectionDoesNotFanOut(t *testing.T) {
 		ID: "t1", Ticker: "AAPL", Direction: "long", Status: "open",
 		EntryPrice: 100, Quantity: 10,
 	}
+	fs.trades[trade.ID] = trade
 	freshRejection := errors.Join(
 		execution.ErrFreshTerminalZeroFillPlacement,
 		execution.ErrTerminalZeroFillPlacement,
@@ -3076,6 +3112,58 @@ func TestSubmitOrReplaceStopSerializesRecoveryLifecycle(t *testing.T) {
 	fs.mu.Unlock()
 	if rows != 1 {
 		t.Fatalf("active protective rows=%d, want one", rows)
+	}
+}
+
+// A trailing tick starts from the open-trade snapshot. If the broker stop
+// fills while that tick is computing its ATR, reconciliation closes the trade
+// before the tick reaches its own protective-stop mutation. The stale snapshot
+// must not create a successor SELL order: doing so can open an unintended
+// short once the original long is already flat (the LUNR incident).
+func TestSubmitOrReplaceStopDoesNotResubmitAfterTerminalClose(t *testing.T) {
+	fs := newFakeStore()
+	stale := store.Trade{
+		ID: "terminal-race-trade", Ticker: "LUNR", Direction: "long", Status: "open",
+		EntryPrice: 15.92, StopLoss: 15.60, Quantity: 114,
+	}
+	fs.trades[stale.ID] = stale
+	broker := &fakeBroker{}
+	manager := NewManager(Config{Enabled: true}, fs, &fakePrices{}, broker)
+
+	// This is the reconciliation step that occurs after the trailing worker
+	// read stale, but before it acquires the order-lifecycle lock.
+	closed := stale
+	closed.Status = "closed"
+	closed.Quantity = 0
+	fs.trades[stale.ID] = closed
+
+	if err := manager.submitOrReplaceStop(context.Background(), stale, 15.60, stopExitIntent(15.60)); err != nil {
+		t.Fatalf("submitOrReplaceStop after terminal close: %v", err)
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if len(broker.placed) != 0 {
+		t.Fatalf("protective successor sells=%d, want 0 after terminal close: %#v", len(broker.placed), broker.placed)
+	}
+}
+
+func TestSubmitOrReplaceStopRefusesSellWhenBrokerLongIsGone(t *testing.T) {
+	fs := newFakeStore()
+	trade := store.Trade{
+		ID: "broker-flat-trade", Ticker: "LUNR", Direction: "long", Status: "open",
+		EntryPrice: 15.92, StopLoss: 15.60, Quantity: 114,
+	}
+	fs.trades[trade.ID] = trade
+	broker := &brokerViewFake{fakeBroker: &fakeBroker{}}
+	manager := NewManager(Config{Enabled: true}, fs, &fakePrices{}, broker)
+
+	if err := manager.submitOrReplaceStop(context.Background(), trade, 15.60, stopExitIntent(15.60)); err != nil {
+		t.Fatalf("submitOrReplaceStop with flat broker position: %v", err)
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if len(broker.placed) != 0 {
+		t.Fatalf("protective successor sells=%d, want 0 with no broker-held long", len(broker.placed))
 	}
 }
 

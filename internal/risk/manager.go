@@ -28,6 +28,10 @@ type CheckInput struct {
 	// so signal-generation and backtest checks retain their legacy derivation.
 	ProposedQuantity float64
 	ProposedNotional float64
+	// ExistingTickerNotional is the current long exposure in Ticker. Together
+	// with ProposedNotional it keeps pyramids within the configured aggregate
+	// ticker cap rather than validating each add in isolation.
+	ExistingTickerNotional float64
 
 	// Portfolio state
 	PortfolioValue float64
@@ -88,6 +92,7 @@ func CheckAll(in CheckInput) ([]CheckResult, bool) {
 		checkConfidenceTiered,  // #339 — replaces checkConfidence
 		checkRiskReward,
 		checkPositionSize,
+		checkCombinedTickerExposure,
 		checkMaxDollarRisk, // #335
 		checkMaxOpenPositions,
 		checkMaxPerTicker, // #312 (Epic A)
@@ -285,6 +290,29 @@ func checkPositionSize(in CheckInput) CheckResult {
 	}
 	return fail(name, fmt.Sprintf("position size %.2f%% > max %.2f%%",
 		positionPct, in.Cfg.MaxPositionPct))
+}
+
+// checkCombinedTickerExposure applies MaxPositionPct to the total long
+// exposure after a BUY. Without it, two individually-valid entries can exceed
+// the intended per-ticker allocation.
+func checkCombinedTickerExposure(in CheckInput) CheckResult {
+	const name = "combined_ticker_exposure"
+	if in.Action != "BUY" || in.Cfg.MaxPositionPct <= 0 || in.PortfolioValue <= 0 {
+		return pass(name)
+	}
+	proposed := in.ProposedNotional
+	if proposed <= 0 {
+		proposed = in.Cash * in.SizePct / 100
+	}
+	if proposed <= 0 {
+		return pass(name)
+	}
+	combinedPct := (in.ExistingTickerNotional + proposed) / in.PortfolioValue * 100
+	if combinedPct <= in.Cfg.MaxPositionPct+1e-9 {
+		return pass(name)
+	}
+	return fail(name, fmt.Sprintf("combined %s exposure %.2f%% > limit %.2f%%",
+		in.Ticker, combinedPct, in.Cfg.MaxPositionPct))
 }
 
 // checkMaxDollarRisk enforces a hard cap on per-trade dollar at risk

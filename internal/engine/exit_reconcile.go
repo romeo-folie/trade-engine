@@ -100,7 +100,13 @@ func (exitStoreAdapter) UpdateTradeExitFilledAt(ctx context.Context, id string, 
 	return store.UpdateTradeExitFilledAt(ctx, id, filledAt)
 }
 func (exitStoreAdapter) FinalizeTradeExit(ctx context.Context, id string, _, _, _ float64) (store.TradeRealization, error) {
-	return store.FinalizeTradeExit(ctx, id)
+	var realized store.TradeRealization
+	err := store.WithTradeOrderLock(id, func() error {
+		var finalizeErr error
+		realized, finalizeErr = store.FinalizeTradeExit(ctx, id)
+		return finalizeErr
+	})
+	return realized, err
 }
 func (exitStoreAdapter) UpdateExitingTradeQuantity(ctx context.Context, id string, quantity float64) error {
 	return store.UpdateExitingTradeQuantity(ctx, id, quantity)

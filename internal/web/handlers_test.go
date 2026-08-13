@@ -431,8 +431,9 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	}
 
 	var resp struct {
-		Version  string  `json:"version"`
-		Drawdown float64 `json:"drawdown"`
+		Version           string  `json:"version"`
+		Drawdown          float64 `json:"drawdown"`
+		BuyEntriesEnabled bool    `json:"buy_entries_enabled"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("json.Unmarshal failed: %v", err)
@@ -444,6 +445,12 @@ func TestHandleSystemStatus_Structure(t *testing.T) {
 	// drawdown should be 0.0 when not connected
 	if resp.Drawdown != 0.0 {
 		t.Errorf("expected drawdown 0.0, got %f", resp.Drawdown)
+	}
+	if !resp.BuyEntriesEnabled {
+		t.Error("new buys should default to enabled when no persisted control exists")
+	}
+	if maskAccountNumber("PA123456") != "••••3456" || maskAccountNumber("123") != "123" {
+		t.Error("account masking must retain only the last four characters")
 	}
 }
 

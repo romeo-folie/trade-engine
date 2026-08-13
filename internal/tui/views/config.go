@@ -70,8 +70,32 @@ func FetchConfigData(ctx context.Context, currentMode string) ConfigData {
 		Items:      buildConfigItems(cfg, mode, modeSource),
 		LastUpdate: time.Now(),
 	}
+	if store.IsConnected() {
+		if control, err := store.GetBuyControl(ctx, store.BuyControlStocks); err != nil {
+			data.LoadError = "buy control unavailable: " + err.Error()
+		} else {
+			value := "enabled"
+			if !control.Enabled {
+				value = "paused"
+			}
+			source := "default"
+			if !control.UpdatedAt.IsZero() {
+				source = fmt.Sprintf("%s · %s", control.UpdatedBy, control.UpdatedAt.UTC().Format(time.RFC3339))
+			}
+			data.Items = append(data.Items, ConfigItem{
+				Key: "runtime.buy_control", Label: "RUNTIME · New Stock Buys", Value: value,
+				Kind: "readonly", Source: source,
+				Description: "Persistent operator control. Exits and protective stops remain active when paused.",
+			})
+		}
+	}
 	if overrideErr != nil {
-		data.LoadError = "mode override unavailable: " + overrideErr.Error()
+		message := "mode override unavailable: " + overrideErr.Error()
+		if data.LoadError != "" {
+			data.LoadError += "; " + message
+		} else {
+			data.LoadError = message
+		}
 	}
 	return data
 }
