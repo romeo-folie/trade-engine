@@ -185,6 +185,29 @@ func GetStockOrderIntentByKey(ctx context.Context, key string) (*StockOrderInten
 	return &in, rows.Err()
 }
 
+// StockEntryBrokerProtection returns whether the durable entry that owns a
+// trade requires broker-resident protection, plus its parent broker order ID.
+// Keeping the query here lets reconciliation enforce the immutable admission
+// policy without guessing from mutable exit-leg rows.
+func StockEntryBrokerProtection(ctx context.Context, tradeID string) (required bool, brokerOrderID string, err error) {
+	var raw json.RawMessage
+	err = GetDB().QueryRow(ctx, `
+		SELECT request_payload, COALESCE(broker_order_id,'')
+		FROM stock_order_intents
+		WHERE trade_id=$1::uuid AND purpose='submit' AND side='buy'
+		ORDER BY created_at DESC LIMIT 1`, tradeID).Scan(&raw, &brokerOrderID)
+	if err != nil {
+		return false, "", err
+	}
+	var policy struct {
+		RequireBrokerProtection bool
+	}
+	if err := json.Unmarshal(raw, &policy); err != nil {
+		return false, "", err
+	}
+	return policy.RequireBrokerProtection, brokerOrderID, nil
+}
+
 // HasPreparedStockEntry reports whether a signal owns a pending entry intent
 // that has no recorded broker submission or identity.
 func HasPreparedStockEntry(ctx context.Context, signalID string) (bool, error) {

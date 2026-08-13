@@ -278,6 +278,35 @@ func TestGetOrderStatusReturnsBrokerFillTime(t *testing.T) {
 	}
 }
 
+func TestGetOrderStatusReturnsNestedBracketCoverage(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/orders/parent-1" || r.URL.Query().Get("nested") != "true" {
+			t.Fatalf("path/query = %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		fmt.Fprintln(w, `{
+			"id":"parent-1","status":"filled","qty":"5","filled_qty":"5",
+			"legs":[
+				{"id":"tp-1","type":"limit","status":"new","qty":"3","filled_qty":"2","limit_price":"110"},
+				{"id":"sl-1","type":"stop","status":"new","qty":"3","filled_qty":"0","stop_price":"95"}
+			]
+		}`)
+	}))
+	defer ts.Close()
+
+	broker := &AlpacaBroker{baseURL: ts.URL, httpClient: ts.Client()}
+	result, err := broker.GetOrderStatus(context.Background(), "parent-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Quantity != 5 || result.RemainingQty != 0 || len(result.ChildOrders) != 2 {
+		t.Fatalf("nested result = %+v", result)
+	}
+	stop := result.ChildOrders[1]
+	if stop.BrokerOrderID != "sl-1" || stop.Quantity != 3 || stop.RemainingQty != 3 || stop.StopPrice != 95 {
+		t.Fatalf("stop leg = %+v", stop)
+	}
+}
+
 // TestPlaceOrder_BracketLegsAndTIF exercises the #435 bracket path: the
 // request must carry order_class/take_profit/stop_loss and the overridden
 // time_in_force, and the response's child legs must come back as

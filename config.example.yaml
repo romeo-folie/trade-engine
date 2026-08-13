@@ -315,7 +315,7 @@ risk:
                                # Below it the original protective stop owns the exit. rule "atr" only.
   uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
   exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
-  bracket_exits_enabled: false # Stock BUYs as broker bracket orders (GTC, whole shares): TP/SL fire intrabar at the broker instead of hourly candle-close checks (#435). Default off.
+  bracket_exits_enabled: false # Stock BUYs require whole-share GTC broker brackets: TP/SL fire intrabar; sub-share or invalid protection is rejected (#541). Default off.
   # Evidence-driven entry-quality gates. All default off and BUY-only. Legacy
   # filters fail open on missing evidence; pullback is an additive setup path.
   entry_gates:

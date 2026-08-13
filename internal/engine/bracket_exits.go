@@ -140,6 +140,13 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		legs = standaloneStopLegs(all)
 	}
 	if len(legs) == 0 {
+		if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr == nil && required && parentID != "" {
+			// A strict protected entry must never be handed to software exits
+			// merely because child projection failed or the broker legs vanished.
+			e.containUnprotectedBrokerEntryAsync(t.ID, parentID, t.Ticker,
+				"no broker-resident protection legs are available")
+			return true, nil
+		}
 		return false, nil
 	}
 
@@ -227,6 +234,16 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 	if filledIdx >= 0 {
 		handled, closeErr := e.closeBracketTrade(ctx, t, states, filledIdx, ownsAllExits)
 		return handled, errors.Join(pollErr, closeErr)
+	}
+	if required, parentID, policyErr := store.StockEntryBrokerProtection(ctx, t.ID); policyErr == nil && required && parentID != "" {
+		if !workingBrokerStopCoversTrade(states, brokerSnapshotRemainingTradeQty(t.Quantity, states)) {
+			// A live TP is not downside protection. Retain broker ownership and
+			// safely contain the position rather than handing it to the candle
+			// monitor when its stop is held, missing, rejected, or too small.
+			e.containUnprotectedBrokerEntryAsync(t.ID, parentID, t.Ticker,
+				"broker stop is missing, inactive, or does not cover the held quantity")
+			return true, pollErr
+		}
 	}
 	if working > 0 {
 		// A working order may already have sold part of the position. Apply
@@ -395,6 +412,44 @@ func (e *Engine) reconcileBrokerExitTradeStatus(
 		return false, pollErr
 	}
 	return ownsAllExits, pollErr
+}
+
+// brokerSnapshotRemainingTradeQty anticipates cumulative broker fills that
+// will be atomically applied later in this sweep. This avoids treating a stop
+// that Alpaca correctly reduced after a TP partial as too small merely because
+// the local trade row has not yet caught up.
+func brokerSnapshotRemainingTradeQty(currentQty float64, states []legState) float64 {
+	remaining := currentQty
+	for _, state := range states {
+		if !state.ok || state.res.FilledQty <= state.leg.FilledQty {
+			continue
+		}
+		remaining -= state.res.FilledQty - state.leg.FilledQty
+	}
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+func workingBrokerStopCoversTrade(states []legState, heldQty float64) bool {
+	for _, state := range states {
+		if !state.leg.IsStopLoss || !state.ok {
+			continue
+		}
+		status := normalizeBrokerExitStatus(state.leg, state.res.Status)
+		if status == "cancelled" || status == "rejected" || status == "filled" || state.res.Status == "held" {
+			continue
+		}
+		qty := state.res.RemainingQty
+		if qty <= 0 && state.res.Quantity == 0 {
+			qty = state.leg.Quantity
+		}
+		if qty+1e-9 >= heldQty {
+			return true
+		}
+	}
+	return false
 }
 
 func (e *Engine) brokerStillHoldsOwnedTickerQuantity(ctx context.Context, ticker string) (bool, error) {

@@ -158,6 +158,94 @@ func TestReconcileBracket_StandaloneStopIsNotBrokerManaged(t *testing.T) {
 	}
 }
 
+func TestWorkingBrokerStopCoversTradeRequiresAnActiveFullStop(t *testing.T) {
+	tests := []struct {
+		name   string
+		states []legState
+		want   bool
+	}{
+		{
+			name: "held child is inactive",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "held", Quantity: 5, RemainingQty: 5,
+			}}},
+		},
+		{
+			name: "take profit alone is insufficient",
+			states: []legState{{ok: true, leg: store.Order{IsTakeProfit: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 5, RemainingQty: 5,
+			}}},
+		},
+		{
+			name: "undersized active stop",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 4, RemainingQty: 4,
+			}}},
+		},
+		{
+			name: "full active stop",
+			states: []legState{{ok: true, leg: store.Order{IsStopLoss: true, Quantity: 5}, res: execution.OrderResult{
+				Status: "accepted", Quantity: 5, RemainingQty: 5,
+			}}},
+			want: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workingBrokerStopCoversTrade(tc.states, 5); got != tc.want {
+				t.Fatalf("covered = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBrokerSnapshotRemainingTradeQtyAccountsForNewPartialTakeProfit(t *testing.T) {
+	states := []legState{
+		{ok: true, leg: store.Order{IsTakeProfit: true, FilledQty: 1}, res: execution.OrderResult{FilledQty: 3}},
+		{ok: true, leg: store.Order{IsStopLoss: true, FilledQty: 0}, res: execution.OrderResult{FilledQty: 0}},
+	}
+	if got := brokerSnapshotRemainingTradeQty(5, states); got != 3 {
+		t.Fatalf("remaining quantity = %v, want 3 after cumulative TP fill", got)
+	}
+}
+
+func TestContainUnprotectedBrokerEntryCancelsParentBeforeDurableFlatten(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	ctx := context.Background()
+	tradeID, err := store.InsertTrade(ctx, store.Trade{
+		Ticker: "TEST_UNPROTECTED_BRACKET", Direction: "long", Strategy: "test",
+		EntryPrice: 100, Quantity: 2, StopLoss: 95, TakeProfit: 110, Status: "open",
+	})
+	if err != nil {
+		t.Fatalf("InsertTrade: %v", err)
+	}
+	parentID := "unprotected-parent-" + tradeID[:8]
+	if _, err := store.InsertOrder(ctx, store.Order{
+		TradeID: tradeID, BrokerOrderID: parentID, Ticker: "TEST_UNPROTECTED_BRACKET",
+		Side: "buy", OrderType: "market", Quantity: 2, Status: "filled",
+	}); err != nil {
+		t.Fatalf("InsertOrder(entry): %v", err)
+	}
+	exec := &fakeBracketExec{
+		statuses: map[string]execution.OrderResult{parentID: {Status: "filled"}},
+		placeRes: execution.OrderResult{BrokerOrderID: "containment-exit", Status: "accepted"},
+	}
+	e := newBracketTestEngine(exec)
+	e.containUnprotectedBrokerEntry(ctx, tradeID, parentID, "TEST_UNPROTECTED_BRACKET", "missing stop")
+	if len(exec.cancelled) != 1 || exec.cancelled[0] != parentID {
+		t.Fatalf("cancelled = %v, want parent cancellation before flatten", exec.cancelled)
+	}
+	if len(exec.placed) != 1 || exec.placed[0].Side != execution.OrderSideSell || exec.placed[0].Quantity != 2 {
+		t.Fatalf("containment flatten = %+v", exec.placed)
+	}
+	trade, err := store.GetTradeByID(ctx, tradeID)
+	if err != nil || trade == nil || trade.Status != "exiting" {
+		t.Fatalf("contained trade = %+v err=%v; want exiting", trade, err)
+	}
+}
+
 func TestStartupReconcileAppliesWorkingCappedStopPartialAndFinalFill(t *testing.T) {
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")

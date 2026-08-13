@@ -40,6 +40,13 @@ type RecoveryObserver interface {
 	PreparedStockEntryNeedsAdmission(context.Context, string)
 }
 
+// ProtectionRecoveryObserver is intentionally optional so recovery can notify
+// an engine about a pre-existing protected-entry projection without replaying
+// its one-time trade-open side effects.
+type ProtectionRecoveryObserver interface {
+	RecoveredStockEntryProtection(context.Context, string)
+}
+
 type Coordinator struct {
 	inner    execution.Executor
 	observer RecoveryObserver
@@ -743,6 +750,9 @@ func (c *Coordinator) projectRecoveredEntry(ctx context.Context, intent store.St
 		if err := c.projectRecoveredEntryExits(ctx, intent, req, res, tradeID); err != nil {
 			return err
 		}
+	}
+	if observer, ok := c.observer.(ProtectionRecoveryObserver); ok {
+		observer.RecoveredStockEntryProtection(ctx, intent.IdempotencyKey)
 	}
 	if err := store.UpdateSignalStatus(ctx, signalID, "executed", ""); err != nil {
 		return fmt.Errorf("mark recovered stock entry signal executed: %w", err)
