@@ -24,6 +24,10 @@ func TestBuyControlPersistsOperatorAudit(t *testing.T) {
 	if control.Enabled || control.UpdatedBy != "test-operator" || control.UpdatedAt.IsZero() {
 		t.Fatalf("persisted buy control = %+v", control)
 	}
+	enabled, err := store.StockBuyEntriesEnabled(ctx)
+	if err != nil || enabled {
+		t.Fatalf("shared stock-buy gate = enabled:%t err:%v, want disabled/nil", enabled, err)
+	}
 }
 
 func TestAccountRiskBaselineIsAccountScopedAndKeepsPeak(t *testing.T) {

@@ -2713,6 +2713,20 @@ func (e *Engine) executeSignal(ctx context.Context, sigID string, sig store.Sign
 		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
 		return
 	}
+	// Admission can take long enough for an operator to pause new risk while a
+	// signal is in flight. Re-read the persisted control at the actual broker
+	// release boundary; the earlier check avoids needless admission work.
+	if enabled, reason := buyEntriesEnabled(ctx); !enabled {
+		if err := store.UpdateSignalStatus(ctx, sigID, "blocked", reason); err != nil {
+			logger.Warn("update signal status", "id", sigID, "err", err)
+		}
+		logger.Warn("signal execution blocked before broker release", "ticker", sig.Ticker, "reason", reason)
+		e.bus.Publish(events.SignalBlocked, events.SignalBlockedPayload{
+			Ticker: sig.Ticker, Action: sig.Action, Confidence: sig.Confidence,
+			BlockReason: reason, FailedCheck: "buy_control",
+		})
+		return
+	}
 	result, err := e.executor.PlaceOrder(ctx, orderReq)
 	if err != nil {
 		// Coordinators can return an accepted broker result with a local

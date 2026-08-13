@@ -1873,6 +1873,17 @@ func (s *ORBScheduler) tickExecuting(ctx context.Context) error {
 			// forex/equities split, via optionsBreakoutEntry, which decides call/put from a
 			// dual-sided breakout rather than gap sign) so they never reach this stock-bracket
 			// placement; the old options hook here is therefore removed as dead code.
+			// Equities ORB bypasses Engine.executeSignal, so enforce the same
+			// persisted new-stock-risk control immediately before releasing its
+			// bracket parent to the broker. Exits use separate paths and remain
+			// unaffected by this entry-only gate.
+			if enabled, err := store.StockBuyEntriesEnabled(ctx); err != nil {
+				slog.Error("orb: buy control unavailable; refusing stock entry", "ticker", ticker, "err", err)
+				continue
+			} else if !enabled {
+				slog.Info("orb: new stock buys paused; skipping entry", "ticker", ticker)
+				continue
+			}
 			orderID, tpID, slID, err := PlaceBracket(ctx, s.executor, params)
 			if err != nil {
 				slog.Error("orb: place bracket failed", "ticker", ticker, "err", err)

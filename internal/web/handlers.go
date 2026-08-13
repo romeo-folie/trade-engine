@@ -1298,6 +1298,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 	var peak float64
 	var drawdown float64
 	buyEntriesEnabled := true
+	buyControlAvailable := true
 	buyControlSource := "default"
 	buyControlUpdatedAt := ""
 	readinessReasons := make([]string, 0)
@@ -1323,6 +1324,13 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 			if !control.UpdatedAt.IsZero() {
 				buyControlUpdatedAt = control.UpdatedAt.UTC().Format(time.RFC3339)
 			}
+		} else {
+			// Execution fails closed on this same error. Do not let readiness
+			// claim that entries are enabled when the release gate rejects them.
+			buyEntriesEnabled = false
+			buyControlAvailable = false
+			buyControlSource = "unavailable"
+			readinessReasons = append(readinessReasons, "buy control unavailable: "+err.Error())
 		}
 		if raw, ok, err := store.GetEngineState(ctx, store.EngineStateBrokerDrift); err == nil && ok && raw != "" {
 			var reconciliation map[string]any
@@ -1332,6 +1340,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	readiness["buy_entries_enabled"] = buyEntriesEnabled
+	readiness["buy_control_available"] = buyControlAvailable
 	if !buyEntriesEnabled {
 		readinessReasons = append(readinessReasons, "new stock buys are paused")
 	}
@@ -1378,6 +1387,7 @@ func (s *Server) handleSystemStatus(w http.ResponseWriter, r *http.Request) {
 		"next_cycle_at":          nextCycleAt,
 		"next_cycle_in_sec":      nextCycleInSec,
 		"buy_entries_enabled":    buyEntriesEnabled,
+		"buy_control_available":  buyControlAvailable,
 		"buy_control_source":     buyControlSource,
 		"buy_control_updated_at": buyControlUpdatedAt,
 		"readiness":              readiness,

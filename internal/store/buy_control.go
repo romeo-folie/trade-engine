@@ -17,6 +17,21 @@ type BuyControl struct {
 	UpdatedBy string
 }
 
+// StockBuyEntriesEnabled is the shared release gate for every new stock
+// position. It deliberately leaves exits untouched and preserves legacy
+// non-database modes; broker-backed paths have a durable store and fail closed
+// when its control cannot be read.
+func StockBuyEntriesEnabled(ctx context.Context) (bool, error) {
+	if !IsConnected() {
+		return true, nil
+	}
+	control, err := GetBuyControl(ctx, BuyControlStocks)
+	if err != nil {
+		return false, err
+	}
+	return control.Enabled, nil
+}
+
 // GetBuyControl returns an enabled default when the operator has never set a
 // control for this scope. The default preserves existing installs while still
 // making an explicit pause survive every process restart.
