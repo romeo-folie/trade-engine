@@ -3,7 +3,7 @@
 # Fields ending in _env reference environment variable names — set those vars in your shell.
 
 engine:
-  mode: paper                  # manual | auto | paper | orb | forex | orb-futures | orb-futures-metals | orb-newyork
+  mode: auto                   # manual | auto | paper | orb | forex | orb-futures | orb-futures-metals | orb-newyork
   tick_interval_sec: 3600      # Analysis interval (seconds). 3600=1h recommended for daily-candle strategy; 300=5min for intraday
   max_watchlist: 50            # Maximum concurrent watchlist items
   dry_run: false               # If true, no orders placed regardless of mode
@@ -168,13 +168,13 @@ models:
 markets:
   stocks:
     enabled: true
-    paper: true                # true = paper-api.alpaca.markets; false = api.alpaca.markets
-    # Optional: fail preflight if the configured credentials select another account.
-    # Use separate paper/live credentials through the env vars on each deployment.
+    paper: false               # Live Alpaca account
+    # Set this to the expected live account number before deployment; preflight
+    # rejects credentials that resolve to another account.
     expected_account_number: ""
-    api_key_env: ALPACA_API_KEY
-    secret_env: ALPACA_API_SECRET
-    base_url: https://paper-api.alpaca.markets
+    api_key_env: ALPACA_LIVE_API_KEY
+    secret_env: ALPACA_LIVE_API_SECRET
+    base_url: https://api.alpaca.markets
     data_url: https://data.alpaca.markets
     option_feed: indicative     # options chain feed: "opra" (real-time, needs Algo Trader Plus) | "indicative" (free, 15-min delayed). options-ORB requires opra.
 
@@ -279,42 +279,40 @@ strategies:
     min_sentiment: 0.6
     max_age_hours: 48
 risk:
-  confidence_threshold: 0.55   # Static floor used when confidence_tiers is empty
+  confidence_threshold: 0.72   # Static floor used when confidence_tiers is empty
   # Tiered confidence by R:R (#317): the first tier whose rr_min is <= the
   # trade's R:R applies. Declare tiers in descending rr_min order.
   # An empty/omitted list falls back to confidence_threshold only.
   confidence_tiers:
     - rr_min: 2.0
-      conf_min: 0.52
-    - rr_min: 1.4
-      conf_min: 0.58
-    - rr_min: 1.1
-      conf_min: 0.62
-  min_risk_reward: 1.2         # Minimum R:R ratio required (#317: 1.5 → 1.4 → 1.2 in feat/reduce-wait-bias)
-  max_position_pct: 5.0        # Max % of portfolio per position
-  max_open_positions: 20
-  max_per_ticker: 4            # Cap open positions per ticker (same direction); 0 disables (#312)
-  max_dollar_risk_pct: 1.0     # Hard cap on per-trade $-at-risk (qty × |entry − stop|) as % of equity; 0 disables (#320)
-  pyramid_enabled: false       # Allow BUY on existing long up >= pyramid_min_gain_pct (#324). Default off — safe rollout.
-  pyramid_min_gain_pct: 5.0    # Minimum unrealised gain (%) on the open long for a pyramid add (#324)
-  daily_loss_limit_pct: 3.0    # Pause engine if daily loss exceeds this
-  max_drawdown_pct: 15.0       # Emergency stop if drawdown exceeds this
-  cooldown_after_loss_min: 60  # Minutes to pause trading after a losing trade
+      conf_min: 0.70
+    - rr_min: 1.5
+      conf_min: 0.72
+  min_risk_reward: 1.5         # Minimum R:R ratio required
+  max_position_pct: 20.0       # Max % of portfolio per position
+  max_open_positions: 10
+  max_per_ticker: 2            # Cap open positions per ticker (same direction); 0 disables (#312)
+  max_dollar_risk_pct: 0.5     # Hard cap on per-trade $-at-risk (qty × |entry − stop|) as % of equity; 0 disables (#320)
+  pyramid_enabled: true        # Allow BUY on existing long up >= pyramid_min_gain_pct (#324)
+  pyramid_min_gain_pct: 2.5    # Minimum unrealised gain (%) on the open long for a pyramid add (#324)
+  daily_loss_limit_pct: 2.0    # Pause engine if daily loss exceeds this
+  max_drawdown_pct: 10.0       # Emergency stop if drawdown exceeds this
+  cooldown_after_loss_min: 15  # Minutes to pause trading after a losing trade
   default_stop_loss_pct: 2.0
   default_take_profit_pct: 4.0
   signal_expiry_min: 120       # Discard pending signals older than this
   stale_price_move_pct: 2.0    # Cancel signal if price moved >X% since generation
   trailing_stop:               # Server-side trailing stop manager (#322)
-    enabled: false             # Opt-in; disabled by default
+    enabled: true
     rule: atr                  # atr = hourly broker-stop ratchet; ema9 = exit on daily close below daily 9-EMA
     atr_multiple: 1.5          # new_stop = hwm - atr_multiple * ATR (absolute-price ATR)
     interval_sec: 60           # Recompute cadence
     atr_period: 14             # Wilder ATR lookback in 1h candles
-    activate_at_gain_pct: 0    # Withhold the trail until PEAK gain from entry hits this % (0 = trail from the first tick).
+    activate_at_gain_pct: 5.0  # Withhold the trail until PEAK gain from entry hits this % (0 = trail from the first tick).
                                # Latches on the high-water mark, so once earned the trail stays on through a pullback.
                                # Below it the original protective stop owns the exit. rule "atr" only.
-  uncap_take_profit: false     # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
-  exit_conf_min: 0.0           # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
+  uncap_take_profit: true      # With trailing_stop enabled, omit fixed TP and let the selected trail own winning exits
+  exit_conf_min: 0.72          # Minimum analyst SELL confidence to close a long; 0 preserves current behavior
   bracket_exits_enabled: false # Stock BUYs require whole-share GTC broker brackets: TP/SL fire intrabar; sub-share or invalid protection is rejected (#541). Default off.
   # Evidence-driven entry-quality gates. All default off and BUY-only. Legacy
   # filters fail open on missing evidence; pullback is an additive setup path.

@@ -32,7 +32,7 @@ risk:
   pyramid_min_gain_pct: 2.5
   daily_loss_limit_pct: 2.0
   max_drawdown_pct: 10.0
-  cooldown_after_loss_min: 60
+  cooldown_after_loss_min: 15
   default_stop_loss_pct: 2.0
   default_take_profit_pct: 4.0
   trailing_stop:
