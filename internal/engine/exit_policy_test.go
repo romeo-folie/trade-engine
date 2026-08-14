@@ -146,13 +146,20 @@ func TestBrokerBracketProtectionRequiresActiveWholeShareStop(t *testing.T) {
 	}
 }
 
-func TestBrokerBracketProtectionStateDistinguishesHeldAndActiveCoverage(t *testing.T) {
+func TestBrokerBracketProtectionStateDistinguishesHeldPartialAndFilledCoverage(t *testing.T) {
 	partial := brokerBracketProtectionState(execution.OrderResult{
 		Status: "partial", Quantity: 5, RemainingQty: 3, FilledQty: 2,
 		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 5, RemainingQty: 5}},
 	}, 2)
 	if partial.HeldQty != 2 || partial.WorkingEntryQty != 3 || partial.ProtectedQty != 0 || partial.UnprotectedQty != 2 {
 		t.Fatalf("partial protection state = %+v", partial)
+	}
+	heldFilled := brokerBracketProtectionState(execution.OrderResult{
+		Status: "filled", Quantity: 5, FilledQty: 5,
+		ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 5, RemainingQty: 5}},
+	}, 5)
+	if heldFilled.ProtectedQty != 5 || heldFilled.UnprotectedQty != 0 {
+		t.Fatalf("held stop after filled parent must remain protected, state = %+v", heldFilled)
 	}
 	active := brokerBracketProtectionState(execution.OrderResult{
 		Status: "filled", Quantity: 5, FilledQty: 5,

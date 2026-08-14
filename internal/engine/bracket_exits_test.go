@@ -241,7 +241,7 @@ func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *te
 	originalDelay := brokerProtectionVerificationRetryDelay
 	brokerProtectionVerificationRetryDelay = 0
 	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
-	checks := make(chan struct{}, 3)
+	checks := make(chan struct{}, brokerProtectionVerificationAttempts)
 	exec := &fakeBracketExec{
 		statuses: map[string]execution.OrderResult{
 			"healthy-parent": {
@@ -253,7 +253,7 @@ func TestVerifyBrokerEntry_RetriesUnknownTradeProjectionWithoutContainment(t *te
 	}
 	e := newBracketTestEngine(exec)
 	e.verifyOrContainBrokerEntryAsync("missing-trade", "healthy-parent", "TEST", 2)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < brokerProtectionVerificationAttempts; i++ {
 		select {
 		case <-checks:
 		case <-time.After(time.Second):
@@ -286,38 +286,83 @@ func TestVerifyBrokerEntry_TransientSnapshotsActivateWithoutContainment(t *testi
 	originalDelay := brokerProtectionVerificationRetryDelay
 	brokerProtectionVerificationRetryDelay = 0
 	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
-	for _, first := range []execution.OrderResult{
-		{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
-		{Status: "partial", Quantity: 2, FilledQty: 1, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
+	for _, tc := range []struct {
+		name   string
+		first  execution.OrderResult
+		checks int
+	}{
+		{
+			name: "filled parent held stop is broker resident protection",
+			first: execution.OrderResult{Status: "filled", Quantity: 2, FilledQty: 2,
+				ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
+			checks: 1,
+		},
+		{
+			name: "partial parent is rechecked until its stop activates",
+			first: execution.OrderResult{Status: "partial", Quantity: 2, FilledQty: 1,
+				ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "held", Quantity: 2, RemainingQty: 2}}},
+			checks: 2,
+		},
 	} {
-		tradeID, _, _ := insertBracketFixture(t, "VERIFY_TRANSITION", 2)
-		checks := make(chan struct{}, 2)
-		exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{"parent": first}}
-		calls := 0
-		exec.onStatus = func(id string) {
-			if id != "parent" {
-				return
-			}
-			calls++
-			if calls == 1 {
+		t.Run(tc.name, func(t *testing.T) {
+			tradeID, _, _ := insertBracketFixture(t, "VERIFY_TRANSITION", 2)
+			checks := make(chan struct{}, tc.checks)
+			exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{"parent": tc.first}}
+			calls := 0
+			exec.onStatus = func(id string) {
+				if id != "parent" {
+					return
+				}
+				calls++
+				if calls == 1 {
+					checks <- struct{}{}
+					return
+				}
+				exec.statuses["parent"] = execution.OrderResult{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}}}
 				checks <- struct{}{}
-				return
 			}
-			exec.statuses["parent"] = execution.OrderResult{Status: "filled", Quantity: 2, FilledQty: 2, ChildOrders: []execution.OrderLeg{{Type: "stop", Status: "accepted", Quantity: 2, RemainingQty: 2}}}
-			checks <- struct{}{}
-		}
-		e := newBracketTestEngine(exec)
-		e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_TRANSITION", 2)
-		for i := 0; i < 2; i++ {
-			select {
-			case <-checks:
-			case <-time.After(time.Second):
-				t.Fatal("verification did not re-read parent")
+			e := newBracketTestEngine(exec)
+			e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_TRANSITION", 2)
+			for i := 0; i < tc.checks; i++ {
+				select {
+				case <-checks:
+				case <-time.After(time.Second):
+					t.Fatal("verification did not re-read parent")
+				}
 			}
+			if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+				t.Fatalf("transition contained: cancels=%v placements=%v", exec.cancelled, exec.placed)
+			}
+		})
+	}
+}
+
+func TestVerifyBrokerEntry_DirectWorkingStopPreventsContainment(t *testing.T) {
+	if !store.IsConnected() {
+		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
+	}
+	originalDelay := brokerProtectionVerificationRetryDelay
+	brokerProtectionVerificationRetryDelay = 0
+	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
+	tradeID, _, _ := insertBracketFixture(t, "VERIFY_DIRECT_STOP", 2)
+	checks := make(chan struct{}, brokerProtectionVerificationAttempts+1)
+	exec := &fakeBracketExec{statuses: map[string]execution.OrderResult{
+		"parent": {Status: "filled", Quantity: 2, FilledQty: 2,
+			ChildOrders: []execution.OrderLeg{{BrokerOrderID: "stop", Type: "stop", Status: "cancelled", Quantity: 2}}},
+		"stop": {Status: "held", Quantity: 2, RemainingQty: 2},
+	}}
+	exec.onStatus = func(id string) { checks <- struct{}{} }
+	e := newBracketTestEngine(exec)
+	e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_DIRECT_STOP", 2)
+	for i := 0; i < brokerProtectionVerificationAttempts+1; i++ {
+		select {
+		case <-checks:
+		case <-time.After(time.Second):
+			t.Fatal("direct stop verification did not complete")
 		}
-		if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
-			t.Fatalf("transition contained: cancels=%v placements=%v", exec.cancelled, exec.placed)
-		}
+	}
+	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
+		t.Fatalf("newer direct working stop was contained: cancels=%v placements=%v", exec.cancelled, exec.placed)
 	}
 }
 
@@ -329,7 +374,7 @@ func TestVerifyBrokerEntry_PersistentMissingStopContainsWithDistinctReason(t *te
 	brokerProtectionVerificationRetryDelay = 0
 	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
 	tradeID, _, _ := insertBracketFixture(t, "VERIFY_PERSISTENT", 2)
-	checks := make(chan struct{}, 3)
+	checks := make(chan struct{}, brokerProtectionVerificationAttempts)
 	flattened := make(chan execution.OrderRequest, 1)
 	exec := &fakeBracketExec{
 		statuses: map[string]execution.OrderResult{"parent": {Status: "filled", Quantity: 2, FilledQty: 2}},
@@ -343,7 +388,7 @@ func TestVerifyBrokerEntry_PersistentMissingStopContainsWithDistinctReason(t *te
 	}
 	e := newBracketTestEngine(exec)
 	e.verifyOrContainBrokerEntryAsync(tradeID, "parent", "VERIFY_PERSISTENT", 2)
-	for i := 0; i < 3; i++ {
+	for i := 0; i < brokerProtectionVerificationAttempts; i++ {
 		select {
 		case <-checks:
 		case <-time.After(time.Second):
@@ -368,6 +413,9 @@ func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *test
 	if !store.IsConnected() {
 		t.Skip("DATABASE_URL not set; skipping DB-backed engine test")
 	}
+	originalDelay := brokerProtectionVerificationRetryDelay
+	brokerProtectionVerificationRetryDelay = 0
+	t.Cleanup(func() { brokerProtectionVerificationRetryDelay = originalDelay })
 	ctx := context.Background()
 	tradeID, err := store.InsertTrade(ctx, store.Trade{
 		Ticker: "STRICT_UNKNOWN_PARENT", Direction: "long", Strategy: "test",
@@ -406,12 +454,24 @@ func TestContainRecoveredUnprotectedBracket_RetriesUnknownParentSnapshot(t *test
 	if err := store.UpdateStockOrderIntentBroker(ctx, intent.ClientOrderID, "strict-unknown-parent", "filled", 100, 2, "", "", true); err != nil {
 		t.Fatalf("record strict intent: %v", err)
 	}
+	checks := make(chan struct{}, brokerProtectionVerificationAttempts)
 	exec := &fakeBracketExec{statusErr: map[string]error{
 		"strict-unknown-parent": fmt.Errorf("transient parent status failure"),
+	}, onStatus: func(id string) {
+		if id == "strict-unknown-parent" {
+			checks <- struct{}{}
+		}
 	}}
 	e := newBracketTestEngine(exec)
 	e.cfg.Risk.BracketExitsEnabled = true
 	e.containRecoveredUnprotectedBracket(ctx, intentKey)
+	for i := 0; i < brokerProtectionVerificationAttempts; i++ {
+		select {
+		case <-checks:
+		case <-time.After(time.Second):
+			t.Fatal("recovered bracket was not routed through the verifier")
+		}
+	}
 	if len(exec.cancelled) != 0 || len(exec.placed) != 0 {
 		t.Fatalf("unknown parent snapshot must retry without containment; cancellations=%v placements=%v", exec.cancelled, exec.placed)
 	}
