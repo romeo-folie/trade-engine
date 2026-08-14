@@ -286,6 +286,18 @@ func TestAnalysis_InsertAndQuery(t *testing.T) {
 
 func TestAnalysis_TimeframeWorkflowRoundTrip(t *testing.T) {
 	ctx := context.Background()
+	var hasSignalAnalysisIndex bool
+	if err := store.GetDB().QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_indexes
+			WHERE schemaname = current_schema()
+			  AND indexname = 'idx_signals_analysis_ids_gin'
+		)`).Scan(&hasSignalAnalysisIndex); err != nil {
+		t.Fatalf("inspect signal analysis index: %v", err)
+	}
+	if !hasSignalAnalysisIndex {
+		t.Fatal("idx_signals_analysis_ids_gin is missing")
+	}
 	wf := store.TimeframeWorkflowAudit{
 		Version: 1, RoutingSource: "profile", Mode: "enforce",
 		Primary:      store.TimeframePassAudit{Timeframe: "1d", Action: "BUY", Confidence: .82, SelectedLens: "momentum"},

@@ -820,7 +820,7 @@ func GetAnalysisDetail(ctx context.Context, id string) (*AnalysisSummary, error)
 		LEFT JOIN LATERAL (
 			SELECT action, status, block_reason, entry_setup, entry_setup_evidence, entry_gate_decisions
 			FROM signals
-			WHERE a.id = ANY(analysis_ids)
+			WHERE analysis_ids @> ARRAY[a.id]
 			ORDER BY created_at DESC
 			LIMIT 1
 		) sig ON TRUE
