@@ -3,10 +3,15 @@
 package prompts
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // ─── Input types (decoupled from data/store packages) ────────────────────────
@@ -76,10 +81,11 @@ type SimilarPastSetup struct {
 // scanner's candidateStrategies), which are not lenses and must never be
 // offered to an analyst as one.
 var analysisLenses = map[string]bool{
-	"trend_following": true,
-	"mean_reversion":  true,
-	"momentum":        true,
-	"news_sentiment":  true,
+	"trend_following":   true,
+	"mean_reversion":    true,
+	"momentum":          true,
+	"news_sentiment":    true,
+	"pullback_strength": true,
 }
 
 // defaultLens matches the engine's historical fallback for a watchlist row
@@ -240,6 +246,14 @@ STRATEGY GUIDANCE — news_sentiment:
 - Sentiment must be CONFIRMED by the price/volume response, not assumed from the headline alone. A bullish headline with flat or fading volume is a warning, not an entry.
 - Weigh source credibility: multiple independent credible sources beat one aggregator restating the same item.`
 
+const pullbackStrengthGuidance = `
+
+STRATEGY GUIDANCE — pullback_strength:
+- The PULLBACK STRENGTH section is a deterministic daily evaluation, not a thesis supplied by the scanner or a pattern for you to infer from a few candles.
+- Select this lens only when its stated daily structure supports the current regime. Cite the named support, reclaim, and low-of-day invalidation in your reasoning.
+- “Qualified: yes” reports that the deterministic setup passed at the observed daily mark. It does not by itself require a BUY; assess broader regime and risk/reward as usual.
+- “Qualified: no” means the named failed check prevented qualification at that mark. Do not reinterpret or waive that check. A separate deterministic entry gate remains authoritative for every eventual pullback-strength trade.`
+
 // lensGuidance returns the per-lens decision blocks for every admissible lens.
 // Guidance is attached when a lens is a CANDIDATE (not merely when it is the
 // configured primary), because the analyst may now select any of them.
@@ -248,6 +262,9 @@ func lensGuidance(lenses []string) string {
 	for _, lens := range lenses {
 		if lens == "news_sentiment" {
 			b.WriteString(newsSentimentGuidance)
+		}
+		if lens == "pullback_strength" {
+			b.WriteString(pullbackStrengthGuidance)
 		}
 	}
 	return b.String()
@@ -360,6 +377,30 @@ func BuildStockPrompt(
 	performanceContext string,
 	momentumPlay bool,
 ) (systemPrompt, userMessage string) {
+	return BuildStockPromptWithDiscoveryContext(
+		ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, momentumPlay, nil,
+	)
+}
+
+// BuildStockPromptWithDiscoveryContext extends the standard prompt with a
+// scanner-owned, structured provenance block. The older builder remains for
+// callers that have no scanner contract.
+func BuildStockPromptWithDiscoveryContext(
+	ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	momentumPlay bool,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContexts ...*pullback.PromptContext,
+) (systemPrompt, userMessage string) {
 	lenses := Lenses(strategies)
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
@@ -368,7 +409,11 @@ func BuildStockPrompt(
 	} else {
 		systemPrompt = buildSystem(contract, exitOverride, lenses)
 	}
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
+	var pullbackContext *pullback.PromptContext
+	if len(pullbackContexts) > 0 {
+		pullbackContext = pullbackContexts[0]
+	}
+	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext)
 	return
 }
 
@@ -461,11 +506,15 @@ func buildUser(
 	knowledgeContext string,
 	similarSetups []SimilarPastSetup,
 	performanceContext string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContext *pullback.PromptContext,
 ) string {
 	var b strings.Builder
 
 	// Market data section
 	b.WriteString(fmt.Sprintf("## TICKER: %s | TIMEFRAME: %s\n\n", ticker, timeframe))
+	writeDiscoveryContext(&b, discoveryContext)
+	writePullbackContext(&b, pullbackContext)
 	// The R:R self-filter in every system prompt computes against
 	// "signal_price", which was otherwise never supplied — models had to guess
 	// it meant the latest close. Define it explicitly.
@@ -603,6 +652,103 @@ func buildUser(
 
 	b.WriteString("\nRespond with ONLY the JSON object.")
 	return b.String()
+}
+
+// writeDiscoveryContext renders scanner evidence as compact, structured
+// context. It is deliberately separate from the candidate-lens contract:
+// provenance explains why the ticker was discovered but never authorises a
+// new strategy.
+func writeDiscoveryContext(b *strings.Builder, context *tradeprofile.DiscoveryContext) {
+	if context == nil {
+		return
+	}
+	canonical, err := context.Canonicalize()
+	if err != nil {
+		return
+	}
+	b.WriteString("### DISCOVERY CONTEXT\n")
+	b.WriteString("Scanner provenance only; use it as evidence, not as an execution lens.\n")
+	b.WriteString("Sources: " + strings.Join(canonical.Sources, ", ") + "\n")
+	b.WriteString("Thesis: " + truncateStr(canonical.Thesis, 320) + "\n")
+	for _, source := range canonical.Sources {
+		evidence := canonical.EvidenceBySource[source]
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, evidence); err != nil {
+			continue
+		}
+		b.WriteString(fmt.Sprintf("Evidence[%s]: %s\n", source, truncateStr(compact.String(), 600)))
+	}
+	b.WriteString("\n")
+}
+
+// writePullbackContext renders the evaluator's daily facts without turning
+// them into a model-controlled entry rule. The execution gate independently
+// re-evaluates these facts immediately before a pullback entry.
+func writePullbackContext(b *strings.Builder, context *pullback.PromptContext) {
+	if context == nil {
+		return
+	}
+	b.WriteString("### PULLBACK STRENGTH (DETERMINISTIC DAILY EVALUATION)\n")
+	b.WriteString("Evaluator-owned facts for lens selection only; deterministic entry qualification is rechecked before execution.\n")
+	b.WriteString(fmt.Sprintf("Qualified: %t | failed check: %s\n", context.Qualified, valueOrUnknown(context.FailedCheck)))
+	b.WriteString("Evaluator outcome: " + valueOrUnknown(context.Reason) + "\n")
+	b.WriteString(fmt.Sprintf("Signal session: %s | mark/open/low: %s / %s / %s\n",
+		formatPromptTime(context.SignalSession), formatPromptPrice(context.SignalPrice),
+		formatPromptPrice(context.SessionOpen), formatPromptPrice(context.SessionLow)))
+	b.WriteString(fmt.Sprintf("Momentum (1M/3M/6M): %s / %s / %s | EMA9/EMA21: %s / %s\n",
+		formatPromptPct(context.Return1M), formatPromptPct(context.Return3M), formatPromptPct(context.Return6M),
+		formatPromptPrice(context.EMA9), formatPromptPrice(context.EMA21)))
+	b.WriteString(fmt.Sprintf("Consolidation: %s sessions (%s to %s); higher low=%t; range narrower=%t (%s early → %s recent)\n",
+		formatPromptSessions(context.ConsolidationSessions), formatPromptTime(context.ConsolidationStart), formatPromptTime(context.ConsolidationEnd),
+		context.ConsolidationHigherLow, context.ConsolidationRangeNarrower,
+		formatPromptPct(context.EarlyRangePct), formatPromptPct(context.RecentRangePct)))
+	b.WriteString(fmt.Sprintf("AVWAP definition: %s\n", valueOrUnknown(context.AVWAPDefinition)))
+	b.WriteString(fmt.Sprintf("AVWAPs: swing-high %s (anchor %s); swing-low %s (anchor %s)\n",
+		formatPromptPrice(context.AVWAPHigh), formatPromptTime(context.AVWAPHighAnchor),
+		formatPromptPrice(context.AVWAPLow), formatPromptTime(context.AVWAPLowAnchor)))
+	b.WriteString(fmt.Sprintf("Support components: horizontal=%s; selected AVWAP=%s + %s=%s; tolerance=%s; effective support=%s\n",
+		formatPromptPrice(context.HorizontalSupport), formatPromptPrice(context.StackedAVWAP),
+		valueOrUnknown(context.StackedCompanionKind), formatPromptPrice(context.StackedCompanion),
+		formatPromptPct(context.SupportTolerancePct), formatPromptPrice(context.Support)))
+	b.WriteString(fmt.Sprintf("Signal checks: flushed into support=%t; positive reclaim=%t\n", context.FlushedIntoSupport, context.PositiveReclaim))
+	b.WriteString(fmt.Sprintf("Low-of-day stop: %s (%s risk; maximum %s); execution invalidation: %s\n\n",
+		formatPromptPrice(context.StopLoss), formatPromptPct(context.StopWidthPct), formatPromptPct(context.MaxStopWidthPct),
+		valueOrUnknown(context.ExecutionInvalidation)))
+}
+
+func formatPromptTime(v time.Time) string {
+	if v.IsZero() {
+		return "not evaluated"
+	}
+	return v.UTC().Format("2006-01-02")
+}
+
+func formatPromptPrice(v float64) string {
+	if v <= 0 {
+		return "not evaluated"
+	}
+	return fmt.Sprintf("$%.2f", v)
+}
+
+func formatPromptSessions(v int) string {
+	if v <= 0 {
+		return "not evaluated"
+	}
+	return fmt.Sprintf("%d", v)
+}
+
+func formatPromptPct(v float64) string {
+	if math.IsInf(v, 0) || math.IsNaN(v) {
+		return "not evaluated"
+	}
+	return fmt.Sprintf("%.2f%%", v)
+}
+
+func valueOrUnknown(v string) string {
+	if strings.TrimSpace(v) == "" {
+		return "none"
+	}
+	return v
 }
 
 // truncateStr truncates s to at most n runes, appending "…" if truncated.

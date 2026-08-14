@@ -7,6 +7,7 @@ package pullback
 import (
 	"fmt"
 	"math"
+	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/data"
 	"github.com/romeo-folie/trade-engine/internal/indicators"
@@ -37,16 +38,50 @@ type Result struct {
 	Reason      string
 	FailedCheck string
 
-	Return1M     float64
-	Return3M     float64
-	Return6M     float64
-	EMA9         float64
-	EMA21        float64
-	AVWAPHigh    float64
-	AVWAPLow     float64
-	Support      float64
-	StopLoss     float64
-	StopWidthPct float64
+	// SignalSession is the daily bar the deterministic evaluator treated as
+	// the live signal session. The remaining fields make its conclusion
+	// inspectable by prompts and audit tooling; they do not participate in
+	// execution unless Eligible is true.
+	SignalSession time.Time
+	SignalPrice   float64
+	SessionOpen   float64
+	SessionLow    float64
+
+	Return1M  float64
+	Return3M  float64
+	Return6M  float64
+	EMA9      float64
+	EMA21     float64
+	AVWAPHigh float64
+	AVWAPLow  float64
+	// AVWAPHighAnchor and AVWAPLowAnchor identify the consolidation swing
+	// high/low from which their respective AVWAPs are calculated.
+	AVWAPHighAnchor time.Time
+	AVWAPLowAnchor  time.Time
+	// AVWAPDefinition documents the calculation for consumers that must not
+	// reverse engineer it from an opaque price value.
+	AVWAPDefinition string
+
+	ConsolidationSessions      int
+	ConsolidationStart         time.Time
+	ConsolidationEnd           time.Time
+	ConsolidationHigherLow     bool
+	ConsolidationRangeNarrower bool
+	EarlyRangePct              float64
+	RecentRangePct             float64
+
+	HorizontalSupport     float64
+	SupportTolerancePct   float64
+	StackedAVWAP          float64
+	StackedCompanion      float64
+	StackedCompanionKind  string
+	Support               float64
+	FlushedIntoSupport    bool
+	PositiveReclaim       bool
+	StopLoss              float64
+	StopWidthPct          float64
+	MaxStopWidthPct       float64
+	ExecutionInvalidation string
 }
 
 // Evaluate treats the final candle as the signal session and all preceding
@@ -68,9 +103,15 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 	}
 
 	r := Result{
-		Return1M: horizonReturn(signalPrice, history, oneMonthSessions),
-		Return3M: horizonReturn(signalPrice, history, threeMonthSessions),
-		Return6M: horizonReturn(signalPrice, history, sixMonthSessions),
+		SignalSession:       session.Timestamp,
+		SignalPrice:         signalPrice,
+		SessionOpen:         session.Open,
+		SessionLow:          session.Low,
+		SupportTolerancePct: cfg.SupportTolerancePct,
+		MaxStopWidthPct:     cfg.MaxStopWidthPct,
+		Return1M:            horizonReturn(signalPrice, history, oneMonthSessions),
+		Return3M:            horizonReturn(signalPrice, history, threeMonthSessions),
+		Return6M:            horizonReturn(signalPrice, history, sixMonthSessions),
 	}
 	if maxFloat(r.Return1M, r.Return3M, r.Return6M) < cfg.MinMomentumReturnPct {
 		r.Reason = fmt.Sprintf(
@@ -98,13 +139,20 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 
 	consolidation := history[len(history)-cfg.ConsolidationSessions:]
 	half := len(consolidation) / 2
-	if minLow(consolidation[half:]) <= minLow(consolidation[:half]) {
+	r.ConsolidationSessions = len(consolidation)
+	r.ConsolidationStart = consolidation[0].Timestamp
+	r.ConsolidationEnd = consolidation[len(consolidation)-1].Timestamp
+	r.ConsolidationHigherLow = minLow(consolidation[half:]) > minLow(consolidation[:half])
+	if !r.ConsolidationHigherLow {
 		r.Reason = "pullback strength: consolidation has not formed a higher low"
 		r.FailedCheck = "higher_low"
 		return r
 	}
 	quarter := max(5, len(consolidation)/4)
-	if averageRangePct(consolidation[len(consolidation)-quarter:]) >= averageRangePct(consolidation[:quarter]) {
+	r.EarlyRangePct = averageRangePct(consolidation[:quarter]) * 100
+	r.RecentRangePct = averageRangePct(consolidation[len(consolidation)-quarter:]) * 100
+	r.ConsolidationRangeNarrower = r.RecentRangePct < r.EarlyRangePct
+	if !r.ConsolidationRangeNarrower {
 		r.Reason = "pullback strength: consolidation range is not narrowing"
 		r.FailedCheck = "narrowing_range"
 		return r
@@ -115,6 +163,9 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 	withSession := appendCopy(history, session)
 	r.AVWAPHigh = anchoredVWAP(withSession, base+highAnchor)
 	r.AVWAPLow = anchoredVWAP(withSession, base+lowAnchor)
+	r.AVWAPHighAnchor = consolidation[highAnchor].Timestamp
+	r.AVWAPLowAnchor = consolidation[lowAnchor].Timestamp
+	r.AVWAPDefinition = "volume-weighted average of typical price ((high + low + close) / 3) from the named consolidation swing through the signal session"
 	if r.AVWAPHigh <= 0 || r.AVWAPLow <= 0 {
 		r.Reason = "pullback strength: anchored VWAP unavailable (volume missing)"
 		r.FailedCheck = "avwap"
@@ -123,6 +174,7 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 
 	tolerance := cfg.SupportTolerancePct / 100
 	horizontal := minLow(consolidation[len(consolidation)-quarter:])
+	r.HorizontalSupport = horizontal
 	avwap, companion, stacked := selectStack(
 		[]float64{r.AVWAPHigh, r.AVWAPLow},
 		[]float64{r.EMA9, horizontal},
@@ -136,8 +188,16 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 		r.FailedCheck = "stacked_support"
 		return r
 	}
+	r.StackedAVWAP = avwap
+	r.StackedCompanion = companion
+	if companion == r.EMA9 {
+		r.StackedCompanionKind = "EMA9"
+	} else {
+		r.StackedCompanionKind = "horizontal support"
+	}
 	r.Support = math.Max(avwap, companion)
-	if session.Low > r.Support*(1+tolerance) {
+	r.FlushedIntoSupport = session.Low <= r.Support*(1+tolerance)
+	if !r.FlushedIntoSupport {
 		r.Reason = fmt.Sprintf(
 			"pullback strength: session low %.2f did not flush into stacked support %.2f",
 			session.Low, r.Support,
@@ -145,7 +205,8 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 		r.FailedCheck = "flush"
 		return r
 	}
-	if signalPrice < r.Support || signalPrice <= session.Open {
+	r.PositiveReclaim = signalPrice >= r.Support && signalPrice > session.Open
+	if !r.PositiveReclaim {
 		r.Reason = fmt.Sprintf(
 			"pullback strength: no positive reclaim (price %.2f, open %.2f, support %.2f)",
 			signalPrice, session.Open, r.Support,
@@ -156,6 +217,7 @@ func Evaluate(candles []data.Candle, signalPrice float64, cfg Config) Result {
 
 	r.StopLoss = session.Low
 	r.StopWidthPct = (signalPrice - r.StopLoss) / signalPrice * 100
+	r.ExecutionInvalidation = ValidateExecutionMark(signalPrice, r.StopLoss, cfg.MaxStopWidthPct)
 	if r.StopWidthPct <= 0 || r.StopWidthPct > cfg.MaxStopWidthPct {
 		r.Reason = fmt.Sprintf(
 			"pullback strength: low-of-day stop is %.2f%% wide (max %.2f%%)",

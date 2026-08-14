@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 var (
@@ -33,6 +34,13 @@ type WatchlistItem struct {
 	// prompt can carry the origin thesis. Empty for manual/config items and
 	// plain screener finds.
 	GraphContext string
+	// DiscoveryContext is the versioned scanner provenance contract. Nil keeps
+	// legacy rows on their existing graph_context/strategies compatibility path.
+	DiscoveryContext *tradeprofile.DiscoveryContext
+	// ExecutionProfile is the versioned bounded lens/timeframe contract for a
+	// scanner promotion. It intentionally remains separate from Strategies,
+	// which is retained for legacy configuration and entry tags.
+	ExecutionProfile *tradeprofile.ExecutionProfile
 	// ScannerRunID links scanner-sourced rows to their prospective universe
 	// snapshot. Empty for manual/config watchlist items.
 	ScannerRunID string
@@ -135,25 +143,51 @@ func addWatchlistItem(
 	ctx context.Context, db watchlistExecer, item WatchlistItem,
 	preserveActive bool,
 ) error {
+	if (item.DiscoveryContext == nil) != (item.ExecutionProfile == nil) {
+		return errors.New("watchlist discovery context and execution profile must be supplied together")
+	}
 	if item.Platform == "" {
 		item.Platform = "stock"
 	}
 	if item.Source == "" {
 		item.Source = "manual"
 	}
+	if item.Source == "scanner" && item.DiscoveryContext != nil && item.ScannerRunID == "" {
+		return errors.New("scanner watchlist discovery context and execution profile require scanner run ID")
+	}
+	discoveryContext, err := tradeprofile.MarshalDiscoveryContext(item.DiscoveryContext)
+	if err != nil {
+		return fmt.Errorf("marshal watchlist discovery context: %w", err)
+	}
+	executionProfile, err := tradeprofile.MarshalExecutionProfile(item.ExecutionProfile)
+	if err != nil {
+		return fmt.Errorf("marshal watchlist execution profile: %w", err)
+	}
 	tag, err := db.Exec(ctx, `
 		INSERT INTO watchlist (
 			ticker, platform, strategies, timeframes, min_confidence, source,
-			graph_context, scanner_run_id, active, expires_at
+			graph_context, discovery_context, execution_profile, scanner_run_id,
+			active, expires_at
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, true, $11)
 		ON CONFLICT (ticker, platform) DO UPDATE SET
 			strategies     = EXCLUDED.strategies,
 			timeframes     = EXCLUDED.timeframes,
 			min_confidence = EXCLUDED.min_confidence,
-			source         = EXCLUDED.source,
-			graph_context  = EXCLUDED.graph_context,
-			scanner_run_id = EXCLUDED.scanner_run_id,
+			source = CASE
+				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.source
+				ELSE EXCLUDED.source
+			END,
+			graph_context = CASE
+				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.graph_context
+				ELSE EXCLUDED.graph_context
+			END,
+			discovery_context = COALESCE(EXCLUDED.discovery_context, watchlist.discovery_context),
+			execution_profile = COALESCE(EXCLUDED.execution_profile, watchlist.execution_profile),
+			scanner_run_id = CASE
+				WHEN EXCLUDED.discovery_context IS NULL THEN watchlist.scanner_run_id
+				ELSE EXCLUDED.scanner_run_id
+			END,
 			active         = true,
 			expires_at     = EXCLUDED.expires_at,
 			pullback_requalification_required = false,
@@ -161,17 +195,17 @@ func addWatchlistItem(
 		WHERE NOT (
 			watchlist.pullback_requalification_required
 			AND EXCLUDED.source = 'scanner'
-			AND NOT $10
+			AND NOT $12
 		)
 		AND NOT (
-			$11
+			$13
 			AND watchlist.active
 			AND (watchlist.expires_at IS NULL OR watchlist.expires_at > NOW())
 		)
 	`,
 		item.Ticker, item.Platform, item.Strategies, item.Timeframes,
 		item.MinConfidence, item.Source, nullableString(item.GraphContext),
-		nullableString(item.ScannerRunID), item.ExpiresAt,
+		discoveryContext, executionProfile, nullableString(item.ScannerRunID), item.ExpiresAt,
 		item.PullbackRequalificationComplete, preserveActive,
 	)
 	if err != nil {
@@ -219,7 +253,7 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 	q := `
 		SELECT id, ticker, platform, strategies, timeframes,
 		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
-		       COALESCE(scanner_run_id::text, ''), active, expires_at,
+		       discovery_context, execution_profile, COALESCE(scanner_run_id::text, ''), active, expires_at,
 		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 	`
@@ -237,13 +271,18 @@ func GetWatchlistItems(ctx context.Context, activeOnly bool) ([]WatchlistItem, e
 	var items []WatchlistItem
 	for rows.Next() {
 		var w WatchlistItem
+		var discoveryContext, executionProfile []byte
 		if err := rows.Scan(
 			&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-			&w.MinConfidence, &w.Source, &w.GraphContext, &w.ScannerRunID,
+			&w.MinConfidence, &w.Source, &w.GraphContext, &discoveryContext, &executionProfile,
+			&w.ScannerRunID,
 			&w.Active, &w.ExpiresAt,
 			&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 		); err != nil {
 			return nil, err
+		}
+		if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
+			return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
 		}
 		items = append(items, w)
 	}
@@ -259,16 +298,17 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 	row := GetDB().QueryRow(ctx, `
 		SELECT id, ticker, platform, strategies, timeframes,
 		       COALESCE(min_confidence, 0), source, COALESCE(graph_context, ''),
-		       COALESCE(scanner_run_id::text, ''), active, expires_at,
+		       discovery_context, execution_profile, COALESCE(scanner_run_id::text, ''), active, expires_at,
 		       pullback_requalification_required, created_at, updated_at
 		FROM watchlist
 		WHERE ticker = $1 AND platform = $2
 	`, ticker, platform)
 
 	var w WatchlistItem
+	var discoveryContext, executionProfile []byte
 	err := row.Scan(
 		&w.ID, &w.Ticker, &w.Platform, &w.Strategies, &w.Timeframes,
-		&w.MinConfidence, &w.Source, &w.GraphContext, &w.ScannerRunID,
+		&w.MinConfidence, &w.Source, &w.GraphContext, &discoveryContext, &executionProfile, &w.ScannerRunID,
 		&w.Active, &w.ExpiresAt,
 		&w.PullbackRequalificationRequired, &w.CreatedAt, &w.UpdatedAt,
 	)
@@ -278,7 +318,25 @@ func GetWatchlistItem(ctx context.Context, ticker, platform string) (*WatchlistI
 		}
 		return nil, err
 	}
+	if err := decodeWatchlistContracts(&w, discoveryContext, executionProfile); err != nil {
+		return nil, fmt.Errorf("decode watchlist %s/%s contracts: %w", w.Ticker, w.Platform, err)
+	}
 	return &w, nil
+}
+
+func decodeWatchlistContracts(
+	item *WatchlistItem, discoveryContext, executionProfile []byte,
+) error {
+	var err error
+	item.DiscoveryContext, err = tradeprofile.DecodeDiscoveryContext(discoveryContext)
+	if err != nil {
+		return fmt.Errorf("decode watchlist discovery context: %w", err)
+	}
+	item.ExecutionProfile, err = tradeprofile.DecodeExecutionProfile(executionProfile)
+	if err != nil {
+		return fmt.Errorf("decode watchlist execution profile: %w", err)
+	}
+	return nil
 }
 
 // CountActiveScannerItems returns how many scanner-sourced items are currently

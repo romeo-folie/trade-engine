@@ -7,7 +7,12 @@
 // in PR #334 — never drop it.
 package prompts
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
+)
 
 // rrSelfFilter is the literal R:R guidance sentence required by PR #334.
 // Tests assert this exact string is present in every role prompt.
@@ -149,6 +154,29 @@ func BuildRolePrompt(
 	similarSetups []SimilarPastSetup,
 	performanceContext string,
 ) (systemPrompt, userMessage string) {
+	return BuildRolePromptWithDiscoveryContext(
+		role, ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, nil,
+	)
+}
+
+// BuildRolePromptWithDiscoveryContext is the scanner-aware variant used by
+// the sequential specialist path. Keep BuildRolePrompt as the compatibility
+// entry point for direct callers and existing tools.
+func BuildRolePromptWithDiscoveryContext(
+	role, ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContexts ...*pullback.PromptContext,
+) (systemPrompt, userMessage string) {
 	contract := lensContract(strategies)
 	exitOverride := ExitOnlyOverride(strategies)
 	switch role {
@@ -163,7 +191,11 @@ func BuildRolePrompt(
 	default:
 		return "", ""
 	}
-	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext)
+	var pullbackContext *pullback.PromptContext
+	if len(pullbackContexts) > 0 {
+		pullbackContext = pullbackContexts[0]
+	}
+	userMessage = buildUser(ticker, timeframe, candles, ind, news, portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext)
 	return
 }
 
@@ -182,10 +214,43 @@ func BuildRiskManagerReviewPrompt(
 	performanceContext string,
 	directionalFindings string,
 ) (systemPrompt, userMessage string) {
+	return BuildRiskManagerReviewPromptWithDiscoveryContext(
+		ticker, strategies, timeframe, candles, ind, news, portfolio,
+		knowledgeContext, similarSetups, performanceContext, directionalFindings, nil,
+	)
+}
+
+// BuildRiskManagerReviewPromptWithDiscoveryContext keeps the final specialist
+// review on the same structured scanner provenance as its directional inputs.
+func BuildRiskManagerReviewPromptWithDiscoveryContext(
+	ticker string,
+	strategies []string,
+	timeframe string,
+	candles []Candle,
+	ind Indicators,
+	news []NewsItem,
+	portfolio Portfolio,
+	knowledgeContext string,
+	similarSetups []SimilarPastSetup,
+	performanceContext string,
+	directionalFindings string,
+	discoveryContext *tradeprofile.DiscoveryContext,
+	pullbackContexts ...*pullback.PromptContext,
+) (systemPrompt, userMessage string) {
 	systemPrompt, userMessage = BuildRolePrompt(
 		"risk_manager", ticker, strategies, timeframe, candles, ind, news,
 		portfolio, knowledgeContext, similarSetups, performanceContext,
 	)
+	var pullbackContext *pullback.PromptContext
+	if len(pullbackContexts) > 0 {
+		pullbackContext = pullbackContexts[0]
+	}
+	if discoveryContext != nil || pullbackContext != nil {
+		systemPrompt, userMessage = BuildRolePromptWithDiscoveryContext(
+			"risk_manager", ticker, strategies, timeframe, candles, ind, news,
+			portfolio, knowledgeContext, similarSetups, performanceContext, discoveryContext, pullbackContext,
+		)
+	}
 	if systemPrompt == "" || userMessage == "" {
 		return "", ""
 	}

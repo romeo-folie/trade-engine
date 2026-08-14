@@ -6,6 +6,7 @@ import (
 	"github.com/romeo-folie/trade-engine/internal/analysis/prompts"
 	"github.com/romeo-folie/trade-engine/internal/config"
 	"github.com/romeo-folie/trade-engine/internal/risk"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // TestWidestHistoryWindow: with every admissible lens now selectable by the
@@ -68,6 +69,35 @@ func TestWidestHistoryWindow(t *testing.T) {
 					tc.primary, tc.strategies, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestPullbackLensAdmissiblePrefersExecutionProfile(t *testing.T) {
+	profile := &tradeprofile.ExecutionProfile{
+		Version:          tradeprofile.ExecutionProfileVersion,
+		RecommendedLens:  "momentum",
+		AdmissibleLenses: []string{"momentum", "pullback_strength"},
+		PrimaryTimeframe: "1D",
+		ScorerRationale:  "Momentum leadership permits a qualified pullback entry.",
+	}
+	if !pullbackLensAdmissible([]string{"momentum"}, profile) {
+		t.Fatal("profile-admissible pullback lens did not request deterministic prompt facts")
+	}
+	profile.AdmissibleLenses = []string{"momentum"}
+	if pullbackLensAdmissible([]string{"pullback_strength"}, profile) {
+		t.Fatal("valid profile must bound prompt context even when legacy strategies include pullback")
+	}
+}
+
+func TestSelectedPullbackLensCannotBypassQualification(t *testing.T) {
+	if !selectedPullbackLens(true, "momentum", "pullback_strength", []string{"momentum", "pullback_strength"}) {
+		t.Fatal("selected profile pullback lens did not require deterministic qualification")
+	}
+	if selectedPullbackLens(true, "momentum", "pullback_strength", []string{"momentum"}) {
+		t.Fatal("unoffered pullback selection must not activate a gate")
+	}
+	if selectedPullbackLens(false, "pullback_strength", "pullback_strength", []string{"pullback_strength"}) {
+		t.Fatal("disabled pullback gate must not activate qualification")
 	}
 }
 

@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -11,25 +13,29 @@ import (
 
 // StoredAnalysis is a row from the analyses table.
 type StoredAnalysis struct {
-	ID            string
-	Ticker        string
-	Strategy      string
-	Action        string
-	Confidence    float64
-	SizePct       float64
-	StopLoss      float64
-	TakeProfit    float64
-	Reasoning     string
-	RawResponse   string
-	RawPrompt     string
-	PromptHash    string
-	ModelProvider string
-	ModelName     string
-	InputTokens   int
-	OutputTokens  int
-	LatencyMs     int64
-	Indicators    []byte // JSONB
-	CreatedAt     time.Time
+	ID                  string
+	Ticker              string
+	Strategy            string
+	Action              string
+	Confidence          float64
+	SizePct             float64
+	StopLoss            float64
+	TakeProfit          float64
+	Reasoning           string
+	RawResponse         string
+	RawPrompt           string
+	PromptHash          string
+	ModelProvider       string
+	ModelName           string
+	InputTokens         int
+	OutputTokens        int
+	LatencyMs           int64
+	Indicators          []byte // JSONB
+	SelectedLens        string
+	RejectedLenses      []byte // JSONB
+	Regime              string
+	LensSelectionStatus string
+	CreatedAt           time.Time
 }
 
 // InsertAnalysis persists a completed analysis record and returns its UUID.
@@ -46,6 +52,35 @@ func InsertAnalysisWithScannerRun(
 	meta analysis.ModelCallMeta,
 	scannerRunID string,
 ) (string, error) {
+	return InsertAnalysisWithScannerRunAudit(ctx, ticker, strategy, resp, meta, scannerRunID, AnalysisAudit{
+		SelectionStatus: analysis.LensSelectionAbsent,
+	})
+}
+
+// AnalysisAudit is the validated final lens-selection record persisted beside
+// an analysis. It deliberately lives on analyses, not signals or gates: those
+// execution decisions are PR 2 work.
+type AnalysisAudit struct {
+	SelectedLens    string
+	RejectedLenses  map[string]string
+	Regime          string
+	SelectionStatus analysis.LensSelectionStatus
+}
+
+// InsertAnalysisWithScannerRunAudit persists a completed analysis with its
+// optional scanner lineage and validated selection audit.
+func InsertAnalysisWithScannerRunAudit(
+	ctx context.Context,
+	ticker, strategy string,
+	resp analysis.AnalysisResponse,
+	meta analysis.ModelCallMeta,
+	scannerRunID string,
+	audit AnalysisAudit,
+) (string, error) {
+	selectedLens, rejectedLenses, regime, status, err := analysisAuditValues(audit)
+	if err != nil {
+		return "", err
+	}
 	q := `
 		INSERT INTO analyses (
 			ticker, strategy, action, confidence, size_pct,
@@ -53,23 +88,26 @@ func InsertAnalysisWithScannerRun(
 			raw_response, raw_prompt, prompt_hash,
 			model_provider, model_name,
 			token_count_input, token_count_output, latency_ms,
-			indicators, scanner_run_id
+			indicators, scanner_run_id,
+			selected_lens, rejected_lenses, regime, lens_selection_status
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
 			$9, $10, $11,
 			$12, $13,
 			$14, $15, $16,
-			$17, $18
+			$17, $18,
+			$19, $20, $21, $22
 		) RETURNING id`
 	var id string
-	err := GetDB().QueryRow(ctx, q,
+	err = GetDB().QueryRow(ctx, q,
 		ticker, strategy, string(resp.Action), resp.Confidence, resp.SizePct,
 		nullableFloat(resp.StopLoss), nullableFloat(resp.TakeProfit), resp.Reasoning,
 		meta.RawResponse, meta.RawPrompt, meta.PromptHash,
 		meta.Provider, meta.Model,
 		meta.InputTokens, meta.OutputTokens, meta.LatencyMs,
 		meta.IndicatorJSON, nullableString(scannerRunID),
+		selectedLens, rejectedLenses, regime, status,
 	).Scan(&id)
 	return id, err
 }
@@ -81,10 +119,15 @@ type EnsembleRecord struct {
 	FastPathed      bool
 	DissentSummary  string
 	ScannerRunID    string
+	Audit           AnalysisAudit
 }
 
 // InsertEnsembleAnalysis persists an ensemble analysis record (Phase 12).
 func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp analysis.AnalysisResponse, meta analysis.ModelCallMeta, ensemble EnsembleRecord) (string, error) {
+	selectedLens, rejectedLenses, regime, status, err := analysisAuditValues(ensemble.Audit)
+	if err != nil {
+		return "", err
+	}
 	q := `
 		INSERT INTO analyses (
 			ticker, strategy, action, confidence, size_pct,
@@ -94,7 +137,8 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			token_count_input, token_count_output, latency_ms,
 			indicators,
 			ensemble_results, arbiter_response, fast_pathed, dissent_summary,
-			scanner_run_id
+			scanner_run_id,
+			selected_lens, rejected_lenses, regime, lens_selection_status
 		) VALUES (
 			$1, $2, $3, $4, $5,
 			$6, $7, $8,
@@ -102,10 +146,11 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 			$12, $13,
 			$14, $15, $16,
 			$17,
-			$18, $19, $20, $21, $22
+			$18, $19, $20, $21, $22,
+			$23, $24, $25, $26
 		) RETURNING id`
 	var id string
-	err := GetDB().QueryRow(ctx, q,
+	err = GetDB().QueryRow(ctx, q,
 		ticker, strategy, string(resp.Action), resp.Confidence, resp.SizePct,
 		nullableFloat(resp.StopLoss), nullableFloat(resp.TakeProfit), resp.Reasoning,
 		meta.RawResponse, meta.RawPrompt, meta.PromptHash,
@@ -114,8 +159,22 @@ func InsertEnsembleAnalysis(ctx context.Context, ticker, strategy string, resp a
 		meta.IndicatorJSON,
 		ensemble.EnsembleResults, ensemble.ArbiterResponse, ensemble.FastPathed,
 		nullableString(ensemble.DissentSummary), nullableString(ensemble.ScannerRunID),
+		selectedLens, rejectedLenses, regime, status,
 	).Scan(&id)
 	return id, err
+}
+
+func analysisAuditValues(audit AnalysisAudit) (selectedLens, rejectedLenses, regime, status any, err error) {
+	if audit.SelectionStatus == "" {
+		audit.SelectionStatus = analysis.LensSelectionAbsent
+	}
+	if len(audit.RejectedLenses) > 0 {
+		rejectedLenses, err = json.Marshal(audit.RejectedLenses)
+		if err != nil {
+			return nil, nil, nil, nil, fmt.Errorf("marshal rejected lenses: %w", err)
+		}
+	}
+	return nullableString(audit.SelectedLens), rejectedLenses, nullableString(audit.Regime), string(audit.SelectionStatus), nil
 }
 
 // ModelPerformanceRow is a row from the model_performance_detail view.
@@ -511,7 +570,9 @@ func GetAnalysesByTicker(ctx context.Context, ticker string, limit int) ([]Store
 		       COALESCE(raw_response, ''), COALESCE(raw_prompt, ''), prompt_hash,
 		       model_provider, model_name,
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       COALESCE(indicators, '{}'), created_at
+		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
+		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
+		       COALESCE(lens_selection_status, ''), created_at
 		FROM analyses
 		WHERE ticker = $1
 		ORDER BY created_at DESC
@@ -532,7 +593,9 @@ func GetAnalysisByID(ctx context.Context, id string) (*StoredAnalysis, error) {
 		       COALESCE(raw_response, ''), COALESCE(raw_prompt, ''), prompt_hash,
 		       model_provider, model_name,
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       COALESCE(indicators, '{}'), created_at
+		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
+		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
+		       COALESCE(lens_selection_status, ''), created_at
 		FROM analyses
 		WHERE id = $1`
 	rows, err := GetDB().Query(ctx, q, id)
@@ -555,7 +618,9 @@ func GetRecentAnalyses(ctx context.Context, limit int) ([]StoredAnalysis, error)
 		       COALESCE(raw_response, ''), COALESCE(raw_prompt, ''), prompt_hash,
 		       model_provider, model_name,
 		       COALESCE(token_count_input, 0), COALESCE(token_count_output, 0), COALESCE(latency_ms, 0),
-		       COALESCE(indicators, '{}'), created_at
+		       COALESCE(indicators, '{}'), COALESCE(selected_lens, ''),
+		       COALESCE(rejected_lenses, '{}'), COALESCE(regime, ''),
+		       COALESCE(lens_selection_status, ''), created_at
 		FROM analyses
 		ORDER BY created_at DESC
 		LIMIT $1`
@@ -577,7 +642,8 @@ func scanAnalyses(rows pgx.Rows) ([]StoredAnalysis, error) {
 			&a.RawResponse, &a.RawPrompt, &a.PromptHash,
 			&a.ModelProvider, &a.ModelName,
 			&a.InputTokens, &a.OutputTokens, &a.LatencyMs,
-			&a.Indicators, &a.CreatedAt,
+			&a.Indicators, &a.SelectedLens, &a.RejectedLenses, &a.Regime,
+			&a.LensSelectionStatus, &a.CreatedAt,
 		); err != nil {
 			return nil, err
 		}

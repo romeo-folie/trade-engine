@@ -8,6 +8,9 @@ package analysis
 import (
 	"context"
 	"time"
+
+	"github.com/romeo-folie/trade-engine/internal/strategy/pullback"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // Action represents a trade recommendation from a model.
@@ -36,6 +39,18 @@ type AnalysisRequest struct {
 	// an identity to advocate for. Empty falls back to Strategy.
 	Strategies []string
 	Timeframe  string
+
+	// DiscoveryContext records why scanner promotion found this ticker. It is
+	// prompt context only: source labels must never become execution lenses.
+	DiscoveryContext *tradeprofile.DiscoveryContext
+	// ExecutionProfile is the scanner-owned, bounded analytical menu. When it
+	// is valid it supersedes legacy Strategies for prompt lens selection; the
+	// latter remains intact for engine compatibility and entry-gate tags.
+	ExecutionProfile *tradeprofile.ExecutionProfile
+	// PullbackContext is the evaluator-owned daily evidence supplied only when
+	// pullback_strength is an admissible lens. It informs lens selection but
+	// cannot override the deterministic execution gate.
+	PullbackContext *pullback.PromptContext
 
 	// Market data — recent candles, most recent first.
 	RecentCandles []CandleSnapshot
@@ -82,6 +97,11 @@ type AnalysisRequest struct {
 // AnalysisRequest without the watchlist list (tests, one-off tooling) therefore
 // keep single-lens behaviour instead of silently dropping to defaultLens.
 func (r AnalysisRequest) LensSet() []string {
+	if r.ExecutionProfile != nil {
+		if profile, err := r.ExecutionProfile.Canonicalize(); err == nil {
+			return append([]string(nil), profile.AdmissibleLenses...)
+		}
+	}
 	if len(r.Strategies) > 0 {
 		return r.Strategies
 	}

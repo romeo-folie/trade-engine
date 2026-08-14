@@ -3,11 +3,13 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sort"
 	"time"
 
 	"github.com/romeo-folie/trade-engine/internal/store"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 type scanRecorder struct {
@@ -388,6 +390,37 @@ func (r *scanRecorder) fallbackScored(
 	} else {
 		snapshot.FinalStage = "below_conviction"
 	}
+}
+
+// setTradeProfile records the same canonical pair that will be promoted to the
+// live watchlist. Fallback paths call it again only after their source lineage
+// and scorer result replace the failed claimed source.
+func (r *scanRecorder) setTradeProfile(
+	c SwingCandidate,
+	discovery *tradeprofile.DiscoveryContext,
+	profile *tradeprofile.ExecutionProfile,
+) error {
+	if (discovery == nil) != (profile == nil) {
+		return fmt.Errorf("discovery context and execution profile must be supplied together")
+	}
+	if discovery == nil {
+		return nil
+	}
+	canonicalDiscovery, err := discovery.Canonicalize()
+	if err != nil {
+		return fmt.Errorf("canonicalize discovery context: %w", err)
+	}
+	canonicalProfile, err := profile.Canonicalize()
+	if err != nil {
+		return fmt.Errorf("canonicalize execution profile: %w", err)
+	}
+	snapshot := r.candidates[c.Ticker]
+	if snapshot == nil {
+		return nil
+	}
+	snapshot.DiscoveryContext = &canonicalDiscovery
+	snapshot.ExecutionProfile = &canonicalProfile
+	return nil
 }
 
 func (r *scanRecorder) selected(selected []scoredCandidate) {

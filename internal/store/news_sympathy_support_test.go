@@ -140,8 +140,8 @@ func TestWatchlistGraphContext_RoundTrip(t *testing.T) {
 		t.Error("added item not returned by GetWatchlistItems")
 	}
 
-	// Re-add without context (e.g. later plain screener re-add) must clear it —
-	// the origin thesis belongs to the sourcing event, not the ticker forever.
+	// Re-add without a replacement discovery/execution pair preserves the
+	// scanner provenance envelope rather than partially erasing its thesis.
 	if err := store.AddWatchlistItem(ctx, store.WatchlistItem{
 		Ticker: ticker, Platform: "stock", Strategies: []string{"momentum"},
 		Timeframes: []string{"1H"}, Source: "scanner", ExpiresAt: &exp,
@@ -149,8 +149,8 @@ func TestWatchlistGraphContext_RoundTrip(t *testing.T) {
 		t.Fatalf("re-add: %v", err)
 	}
 	item, _ = store.GetWatchlistItem(ctx, ticker, "stock")
-	if item.GraphContext != "" {
-		t.Errorf("re-add without context must clear GraphContext, got %q", item.GraphContext)
+	if item.GraphContext != origin {
+		t.Errorf("re-add without replacement profile must preserve GraphContext, got %q", item.GraphContext)
 	}
 }
 
@@ -254,7 +254,7 @@ func TestAddWatchlistItemUnlessActiveReplacesExpiredItem(t *testing.T) {
 		t.Fatalf("read replacement: %v (item=%v)", err, got)
 	}
 	if len(got.Strategies) != 1 || got.Strategies[0] != "breakout" ||
-		got.ScannerRunID != "00000000-0000-0000-0000-000000000494" {
+		got.ScannerRunID != "00000000-0000-0000-0000-000000000493" {
 		t.Fatalf("expired item was not replaced by fallback: %+v", got)
 	}
 }

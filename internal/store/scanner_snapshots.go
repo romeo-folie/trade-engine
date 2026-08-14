@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/romeo-folie/trade-engine/internal/tradeprofile"
 )
 
 // ScannerRun captures the configuration and aggregate outcome of one scan.
@@ -40,9 +42,14 @@ type ScannerRun struct {
 
 // ScannerCandidateSnapshot records every stage reached by a sourced candidate.
 type ScannerCandidateSnapshot struct {
-	ScannerRunID              string
-	Ticker                    string
-	Sources                   []string
+	ScannerRunID string
+	Ticker       string
+	Sources      []string
+	// DiscoveryContext and ExecutionProfile are immutable copies of the
+	// scanner contracts at scan completion. They deliberately do not follow
+	// later live-watchlist refreshes.
+	DiscoveryContext          *tradeprofile.DiscoveryContext
+	ExecutionProfile          *tradeprofile.ExecutionProfile
 	GraphContext              string
 	WeeklyLeaderEvidence      string
 	PotentIndustryEvidence    string
@@ -233,6 +240,22 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 	defer tx.Rollback(ctx) //nolint:errcheck
 
 	for _, c := range candidates {
+		if (c.DiscoveryContext == nil) != (c.ExecutionProfile == nil) {
+			return fmt.Errorf("scanner snapshot %s discovery context and execution profile must be supplied together", c.Ticker)
+		}
+		if c.DiscoveryContext != nil {
+			if err := validateScannerSnapshotSources(c.Sources, c.DiscoveryContext.Sources); err != nil {
+				return fmt.Errorf("scanner snapshot %s: %w", c.Ticker, err)
+			}
+		}
+		discoveryContext, err := tradeprofile.MarshalDiscoveryContext(c.DiscoveryContext)
+		if err != nil {
+			return fmt.Errorf("marshal scanner snapshot discovery context for %s: %w", c.Ticker, err)
+		}
+		executionProfile, err := tradeprofile.MarshalExecutionProfile(c.ExecutionProfile)
+		if err != nil {
+			return fmt.Errorf("marshal scanner snapshot execution profile for %s: %w", c.Ticker, err)
+		}
 		if c.Sources == nil {
 			c.Sources = []string{}
 		}
@@ -266,11 +289,12 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 					strategies, final_stage, source_scores, universe_member, sector,
 					industry, taxonomy_status, taxonomy_as_of, taxonomy_provider,
 				taxonomy_evidence, removal_stage, failure_stage, failure_reason,
-				promotion_evidence
+				promotion_evidence, discovery_context, execution_profile
 				) VALUES (
 					$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,
 					$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,
-					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51
+					$35,$36,$37,$38,$39,$40,$41,$42,$43,$44,$45,$46,$47,$48,$49,$50,$51,
+					$52,$53
 				)`,
 			c.ScannerRunID, c.Ticker, c.Sources, nullableString(c.GraphContext),
 			nullableString(c.WeeklyLeaderEvidence),
@@ -294,6 +318,7 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 			nonNilJSON(c.TaxonomyEvidence), nullableString(c.RemovalStage),
 			nullableString(c.FailureStage), nullableString(c.FailureReason),
 			nonNilJSON(c.PromotionEvidence),
+			discoveryContext, executionProfile,
 		)
 		if err != nil {
 			return err
@@ -314,6 +339,30 @@ func FinishScannerRun(ctx context.Context, run ScannerRun, candidates []ScannerC
 		return err
 	}
 	return tx.Commit(ctx)
+}
+
+func validateScannerSnapshotSources(legacySources, discoverySources []string) error {
+	legacy, err := tradeprofile.CanonicalizeSources(legacySources)
+	if err != nil {
+		return fmt.Errorf("canonicalize legacy sources: %w", err)
+	}
+	discovery, err := tradeprofile.CanonicalizeSources(discoverySources)
+	if err != nil {
+		return fmt.Errorf("canonicalize discovery context sources: %w", err)
+	}
+	if len(legacy) != len(discovery) {
+		return errors.New("legacy sources do not match discovery context sources")
+	}
+	seen := make(map[string]struct{}, len(legacy))
+	for _, source := range legacy {
+		seen[source] = struct{}{}
+	}
+	for _, source := range discovery {
+		if _, ok := seen[source]; !ok {
+			return errors.New("legacy sources do not match discovery context sources")
+		}
+	}
+	return nil
 }
 
 // ScannerFunnel summarizes exact scan-to-signal-to-trade conversion.

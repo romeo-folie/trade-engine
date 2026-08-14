@@ -118,10 +118,10 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 
 	for _, rp := range directional {
 		rp := rp
-		sys, user := prompts.BuildRolePrompt(
+		sys, user := prompts.BuildRolePromptWithDiscoveryContext(
 			rp.role, req.Ticker, req.LensSet(), req.Timeframe,
 			promptCandles, promptInd, promptNews, promptPortfolio,
-			req.KnowledgeContext, promptSimilar, req.PerformanceContext,
+			req.KnowledgeContext, promptSimilar, req.PerformanceContext, req.DiscoveryContext, req.PullbackContext,
 		)
 		if sys == "" || user == "" {
 			logger.Warn("specialist role builder returned empty prompt — skipping", "role", rp.role)
@@ -200,11 +200,11 @@ func (a *Analyzer) AnalyzeSpecialist(ctx context.Context, req AnalysisRequest, _
 		})
 	}
 
-	sys, user := prompts.BuildRiskManagerReviewPrompt(
+	sys, user := prompts.BuildRiskManagerReviewPromptWithDiscoveryContext(
 		req.Ticker, req.LensSet(), req.Timeframe,
 		promptCandles, promptInd, promptNews, promptPortfolio,
 		req.KnowledgeContext, promptSimilar, req.PerformanceContext,
-		formatDirectionalFindings(results),
+		formatDirectionalFindings(results), req.DiscoveryContext, req.PullbackContext,
 	)
 	if sys == "" || user == "" {
 		return AnalyzeResult{AnalystResults: projectSpecialistResults(results)},
