@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  decisionSummary,
   formatIndicator,
   shouldShowEntryChecks,
   titleCase,
@@ -65,4 +66,26 @@ test('entry checks appear only for BUY analyses that have decisions', () => {
   assert.equal(shouldShowEntryChecks('HOLD', 2), false);
   assert.equal(shouldShowEntryChecks('SELL', 2), false);
   assert.equal(shouldShowEntryChecks('BUY', 0), false);
+});
+
+test('specialist decision summary shows the final risk-manager rationale once', () => {
+  const persisted = [
+    '[technical] BUY — Trend and momentum align. (conf 0.82)',
+    '[sentiment] HOLD — Catalyst is stale. (conf 0.65)',
+    '[risk_manager] WAIT — Entry is too extended relative to the invalidation. (conf 0.78)',
+    '[specialist] resolved by mandatory risk-manager review → WAIT',
+  ].join('\n');
+
+  assert.equal(
+    decisionSummary(persisted),
+    'Entry is too extended relative to the invalidation.',
+  );
+  assert.equal(
+    decisionSummary(persisted, undefined, [{
+      role: 'risk_manager',
+      description: 'Fresh risk-manager rationale.',
+    }]),
+    'Fresh risk-manager rationale.',
+  );
+  assert.equal(decisionSummary(persisted, 'Arbiter synthesis.'), 'Arbiter synthesis.');
 });

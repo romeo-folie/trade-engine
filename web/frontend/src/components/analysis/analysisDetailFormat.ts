@@ -15,3 +15,35 @@ export function formatIndicator(value: number | undefined, digits = 2): string {
 export function shouldShowEntryChecks(action: string | undefined, checkCount: number): boolean {
   return action?.toUpperCase() === 'BUY' && checkCount > 0;
 }
+
+interface DecisionAnalyst {
+  role?: string;
+  description?: string;
+}
+
+export function decisionSummary(
+  persistedReasoning: string,
+  arbiterReasoning?: string,
+  analysts: DecisionAnalyst[] = [],
+): string {
+  if (arbiterReasoning?.trim()) return arbiterReasoning.trim();
+
+  const riskManager = analysts.find(
+    analyst => analyst.role?.toLowerCase() === 'risk_manager' && analyst.description?.trim(),
+  );
+  if (riskManager?.description) return riskManager.description.trim();
+
+  // Specialist persistence contains one line per role followed by a resolution
+  // marker. Surface only the final risk-manager rationale here; the complete
+  // role explanations remain available in the collapsed analyst cards.
+  const riskLine = persistedReasoning
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line.startsWith('[risk_manager]'));
+  if (riskLine) {
+    const withoutPrefix = riskLine.replace(/^\[risk_manager\]\s+\S+\s+[—-]\s+/, '');
+    return withoutPrefix.replace(/\s+\(conf\s+[\d.]+\)$/, '').trim();
+  }
+
+  return persistedReasoning;
+}

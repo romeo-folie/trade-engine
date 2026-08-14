@@ -4,7 +4,7 @@ import { ChamferedBox } from '../common/ChamferedBox';
 import CornerCard from '../CornerCard';
 import { colors } from '../../styles/tokens';
 import { verdictColor } from '../../utils/verdict';
-import { formatIndicator, shouldShowEntryChecks, titleCase } from './analysisDetailFormat';
+import { decisionSummary, formatIndicator, shouldShowEntryChecks, titleCase } from './analysisDetailFormat';
 import styles from './AnalysisModal.module.css';
 
 const ANALYST_PALETTE = [
@@ -190,7 +190,11 @@ export default function AnalysisModal({ analysis, onClose }: AnalysisModalProps)
   const confPct = (analysis.Confidence * 100).toFixed(0);
   const action = analysis.Action.toUpperCase();
   const analystResults = detail?.AnalystResults ?? [];
-  const decisionReasoning = detail?.ArbiterReasoning || analysis.Reasoning;
+  const decisionReasoning = decisionSummary(
+    analysis.Reasoning,
+    detail?.ArbiterReasoning,
+    analystResults,
+  );
   const rejectedLenses = Object.entries(detail?.RejectedLenses ?? {});
   const availableEntryChecks = detail?.EntryGateDecisions ?? [];
   const entryChecks = shouldShowEntryChecks(detail?.RelatedSignalAction, availableEntryChecks.length)
